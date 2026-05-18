@@ -137,3 +137,39 @@ if grep -q "CANT_BACKUP_ANYMORE" "$shorten_edit_log"; then
   echo "failed-prefix replay could not rewind retained proof history" >&2
   exit 1
 fi
+
+unsolved_project=$tmpdir/unsolved-project
+mkdir -p "$unsolved_project/src"
+cp "$project/holproject.toml" "$unsolved_project/holproject.toml"
+cat > "$unsolved_project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Theorem unsolved_finish_replay:
+  T
+Proof
+  ALL_TAC >> FAIL_TAC "saved failed-prefix before unsolved suffix"
+QED
+val _ = export_theory();
+SML
+
+unsolved_first_log=$tmpdir/unsolved-first.log
+if (cd "$unsolved_project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build ATheory) > "$unsolved_first_log" 2>&1; then
+  echo "expected unsolved replay seed to fail" >&2
+  exit 1
+fi
+require_grep "saved failed-prefix before unsolved suffix" "$unsolved_first_log"
+
+python3 - <<PY
+from pathlib import Path
+path = Path("$unsolved_project/src/AScript.sml")
+path.write_text(path.read_text().replace('FAIL_TAC "saved failed-prefix before unsolved suffix"', 'ALL_TAC'))
+PY
+unsolved_edit_log=$tmpdir/unsolved-edit.log
+if (cd "$unsolved_project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build ATheory) > "$unsolved_edit_log" 2>&1; then
+  echo "expected failed-prefix replay with unsolved suffix to fail" >&2
+  exit 1
+fi
+require_grep "from: failed-prefix checkpoint in unsolved_finish_replay" "$unsolved_edit_log"
+require_grep "no theorem proved" "$unsolved_edit_log"
+require_grep "failed tactic top input goal:" "$unsolved_edit_log"
+require_grep "failed tactic input goals: 1" "$unsolved_edit_log"
