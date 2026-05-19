@@ -1895,25 +1895,34 @@ fun write_theory_script policy project base_context plan keys input_key toolchai
          write_preload plan node deps_loaded deps_ok preload;
          write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_text 0 checkpoints terminations);
          {context = base_context, files = [preload, staged_script], failure_checkpoints = []})
+      fun run_from_failed_prefix {checkpoint, step_count, prefix_text} =
+        let
+          val path = #failed_prefix_path checkpoint
+          val _ = write_text staged_script (failed_prefix_resume_source policy timeout_marker plan_only_marker source_text checkpoints terminations checkpoint step_count prefix_text)
+          val _ = failed_prefix_resume_message node source_text checkpoint prefix_text
+        in
+          {context = HolState path, files = [staged_script], failure_checkpoints = [path, deps_loaded]}
+        end
+      fun run_from_replay {boundary, path, safe_name, failure_checkpoints} =
+        let
+          val _ = write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_text boundary checkpoints terminations)
+          val _ = theorem_context_resume_message node source_text safe_name boundary
+        in
+          {context = HolState path, files = [staged_script], failure_checkpoints = failure_checkpoints @ [deps_loaded]}
+        end
+      fun failed_prefix_at_least_as_late failed NONE = true
+        | failed_prefix_at_least_as_late failed (SOME replay) =
+            #boundary (#checkpoint failed) >= #boundary replay
+      val failed_prefix = if goalfrag_enabled policy then best_failed_prefix_checkpoint checkpoints else NONE
+      val replay = replay_candidate project node checkpoints
     in
-      case if goalfrag_enabled policy then best_failed_prefix_checkpoint checkpoints else NONE of
-          SOME {checkpoint, step_count, prefix_text} =>
-            let
-              val path = #failed_prefix_path checkpoint
-              val _ = write_text staged_script (failed_prefix_resume_source policy timeout_marker plan_only_marker source_text checkpoints terminations checkpoint step_count prefix_text)
-              val _ = failed_prefix_resume_message node source_text checkpoint prefix_text
-            in
-              {context = HolState path, files = [staged_script], failure_checkpoints = [path, deps_loaded]}
-            end
+      case failed_prefix of
+          SOME failed =>
+            if failed_prefix_at_least_as_late failed replay then run_from_failed_prefix failed
+            else (case replay of SOME replay' => run_from_replay replay' | NONE => run_from_failed_prefix failed)
         | NONE =>
-            case replay_candidate project node checkpoints of
-                SOME {boundary, path, safe_name, failure_checkpoints} =>
-                  let
-                    val _ = write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_text boundary checkpoints terminations)
-                    val _ = theorem_context_resume_message node source_text safe_name boundary
-                  in
-                    {context = HolState path, files = [staged_script], failure_checkpoints = failure_checkpoints @ [deps_loaded]}
-                  end
+            case replay of
+                SOME replay' => run_from_replay replay'
               | NONE =>
                   if deps_checkpoint_exists deps_loaded deps_key then run_from_deps_checkpoint ()
                   else run_from_fresh_preload ()

@@ -175,3 +175,59 @@ require_grep "> 7 | QED" "$unsolved_edit_log"
 require_grep "no theorem proved" "$unsolved_edit_log"
 require_grep "failed tactic top input goal:" "$unsolved_edit_log"
 require_grep "failed tactic input goals: 1" "$unsolved_edit_log"
+
+stale_project=$tmpdir/stale-prefix-project
+mkdir -p "$stale_project/src"
+cp "$project/holproject.toml" "$stale_project/holproject.toml"
+cat > "$stale_project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Theorem first_stale_prefix:
+  T
+Proof
+  ALL_TAC >> FAIL_TAC "seed stale failed prefix"
+QED
+Theorem second_replay_target:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+val _ = raise Fail "late non-proof failure";
+SML
+
+stale_first_log=$tmpdir/stale-first.log
+if (cd "$stale_project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build ATheory) > "$stale_first_log" 2>&1; then
+  echo "expected stale-prefix seed to fail" >&2
+  exit 1
+fi
+require_grep "seed stale failed prefix" "$stale_first_log"
+
+python3 - <<PY
+from pathlib import Path
+path = Path("$stale_project/src/AScript.sml")
+path.write_text(path.read_text().replace('FAIL_TAC "seed stale failed prefix"', 'ACCEPT_TAC TRUTH'))
+PY
+stale_second_log=$tmpdir/stale-second.log
+if (cd "$stale_project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build ATheory) > "$stale_second_log" 2>&1; then
+  echo "expected late non-proof failure after stale-prefix replay" >&2
+  exit 1
+fi
+require_grep "from: failed-prefix checkpoint in first_stale_prefix" "$stale_second_log"
+require_grep "late non-proof failure" "$stale_second_log"
+
+python3 - <<PY
+from pathlib import Path
+path = Path("$stale_project/src/AScript.sml")
+path.write_text(path.read_text().replace('late non-proof failure', 'late non-proof failure edited'))
+PY
+stale_third_log=$tmpdir/stale-third.log
+if (cd "$stale_project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build ATheory) > "$stale_third_log" 2>&1; then
+  echo "expected edited late non-proof failure" >&2
+  exit 1
+fi
+require_grep "from: theorem-context checkpoint after second_replay_target" "$stale_third_log"
+if grep -q "from: failed-prefix checkpoint in first_stale_prefix" "$stale_third_log"; then
+  echo "stale earlier failed-prefix outranked later theorem-context checkpoint" >&2
+  exit 1
+fi
+require_grep "late non-proof failure edited" "$stale_third_log"
