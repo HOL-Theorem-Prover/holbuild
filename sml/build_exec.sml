@@ -1841,7 +1841,8 @@ fun failed_prefix_resume_source policy timeout_marker plan_only_marker source ch
       String.concat
         [source_slice (#theorem_start checkpoint) (#tactic_start checkpoint),
          "(ACCEPT_TAC (", finish_failed_prefix_call, "))",
-         source_slice (#tactic_end checkpoint) (#boundary checkpoint)]
+         source_slice (#tactic_end checkpoint) (#boundary checkpoint),
+         "\n"]
     val replay_block =
       if #kind checkpoint = "resume" then resume_replay_block else theorem_save_line
     val suffix =
@@ -2434,15 +2435,18 @@ fun build_theory_node (options : build_options) tc project base_context plan key
                 theory_checkpoints_for_node policy project plan keys toolchain_key node source_text boundaries errors
         val termination_diagnostics = termination_diagnostics_for_node policy node source_text
       in
-        ((build_theory cache_allowed policy tc project base_context plan keys toolchain_key node source_text theorem_checkpoints termination_diagnostics;
-          remove_failed_prefix_checkpoints theorem_checkpoints;
-          write_metadata policy project plan keys input_key toolchain_key node metadata_checkpoints;
-          HolbuildStatus.Built)
-         handle RetryInvalidCheckpoint =>
-           (build_theory cache_allowed policy tc project base_context plan keys toolchain_key node source_text theorem_checkpoints termination_diagnostics;
-            remove_failed_prefix_checkpoints theorem_checkpoints;
-            write_metadata policy project plan keys input_key toolchain_key node metadata_checkpoints;
-            HolbuildStatus.Built))
+        let
+          fun build_after_checkpoint_retries retries_left =
+            ((build_theory cache_allowed policy tc project base_context plan keys toolchain_key node source_text theorem_checkpoints termination_diagnostics;
+              remove_failed_prefix_checkpoints theorem_checkpoints;
+              write_metadata policy project plan keys input_key toolchain_key node metadata_checkpoints;
+              HolbuildStatus.Built)
+             handle RetryInvalidCheckpoint =>
+               if retries_left <= 0 then raise RetryInvalidCheckpoint
+               else build_after_checkpoint_retries (retries_left - 1))
+        in
+          build_after_checkpoint_retries (length theorem_checkpoints + 1)
+        end
         handle GoalfragPlanPrinted => HolbuildStatus.Inspected
       end
   end

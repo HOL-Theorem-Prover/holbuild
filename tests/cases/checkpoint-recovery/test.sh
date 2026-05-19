@@ -122,6 +122,60 @@ val _ = raise Fail "expected non-goal failure after first";
 SML
 }
 
+write_bad_after_three_source() {
+  cat > "$project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+
+Theorem first:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+
+Theorem second:
+  T
+Proof
+  ACCEPT_TAC first
+QED
+
+Theorem third:
+  T
+Proof
+  ACCEPT_TAC second
+QED
+
+val _ = raise Fail "expected failure after three contexts";
+SML
+}
+
+write_good_three_source() {
+  cat > "$project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+
+Theorem first:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+
+Theorem second:
+  T
+Proof
+  ACCEPT_TAC first
+QED
+
+Theorem third:
+  T
+Proof
+  ACCEPT_TAC second
+QED
+
+val _ = export_theory();
+SML
+}
+
 assert_no_checkpoints() {
   # checkpoints now persist after successful builds for incremental rebuilds.
   # This function is kept as a no-op for compatibility with existing test structure;
@@ -140,6 +194,16 @@ force_rebuild() {
 first_context_path() {
   find "$project/.holbuild/checkpoints/checkpointrecovery/src/AScript.sml.theorems" \
     -path '*/first_context.save' -print -quit
+}
+
+second_context_path() {
+  find "$project/.holbuild/checkpoints/checkpointrecovery/src/AScript.sml.theorems" \
+    -path '*/second_context.save' -print -quit
+}
+
+third_context_path() {
+  find "$project/.holbuild/checkpoints/checkpointrecovery/src/AScript.sml.theorems" \
+    -path '*/third_context.save' -print -quit
 }
 
 first_deps_path() {
@@ -337,6 +401,32 @@ if grep -q "Couldn't load HOL base-state\|Unable to load header" "$corrupt_log";
 fi
 require_file "$project/.holbuild/obj/src/ATheory.dat"
 # checkpoints persist after successful corrupt-checkpoint rebuild for incremental rebuilds
+
+rm -rf "$project/.holbuild/checkpoints"
+write_bad_after_three_source
+if (cd "$project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build ATheory) > "$tmpdir/multi-corrupt-seed.log" 2>&1; then
+  echo "expected three-context seed failure" >&2
+  exit 1
+fi
+multi_corrupt_second=$(second_context_path)
+multi_corrupt_third=$(third_context_path)
+printf 'not a valid second checkpoint\n' > "$multi_corrupt_second"
+printf 'not a valid third checkpoint\n' > "$multi_corrupt_third"
+write_good_three_source
+force_rebuild
+multi_corrupt_log=$tmpdir/multi-corrupt.log
+(cd "$project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build ATheory) > "$multi_corrupt_log" 2>&1
+require_grep "from: theorem-context checkpoint after third" "$multi_corrupt_log"
+require_grep "from: theorem-context checkpoint after second" "$multi_corrupt_log"
+if [[ $(grep -c "discarding invalid checkpoint after HOL state load failure" "$multi_corrupt_log") -lt 2 ]]; then
+  echo "multiple invalid checkpoints were not retried in one build" >&2
+  exit 1
+fi
+if grep -q "RetryInvalidCheckpoint\|Couldn't load HOL base-state\|Unable to load header" "$multi_corrupt_log"; then
+  echo "multi-corrupt checkpoint retry leaked internal/load failure" >&2
+  exit 1
+fi
+require_file "$project/.holbuild/obj/src/ATheory.dat"
 
 run_expect_suffix_failure "$tmpdir/corrupt-deps-seed.log"
 corrupt_deps=$(first_deps_path)
