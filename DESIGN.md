@@ -619,9 +619,9 @@ executable proof step, and to the conservative whole-tactic path used for
 attributed/opaque proof cases. The default theorem instrumentation engine is holbuild's
 proof IR: it still uses HOLSource parser recovery, but lowers `HOLSourceAST.exp`
 directly instead of using `TacticParse`/`goalFrag` as the executable semantics.
-`--goalfrag` selects the legacy GoalFrag/proof-manager path for comparison/debugging.
-The old `--new-ir` build flag is accepted as a deprecated no-op because proof IR is
-now the default. The CLI default is 2.5 seconds per tactic step for the root package;
+`--goalfrag` is deprecated and selects the legacy GoalFrag/proof-manager path only
+for comparison/debugging. The old `--new-ir` build flag is accepted as a deprecated
+no-op because proof IR is now the default. The CLI default is 2.5 seconds per tactic step for the root package;
 `--tactic-timeout SECONDS` changes that root-package timeout, and
 `--tactic-timeout 0` disables it. Dependency package builds use no tactic timeout,
 so a consumer's proof-debug timeout does not make dependency builds fail.

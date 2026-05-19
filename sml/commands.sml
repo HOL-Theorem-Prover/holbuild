@@ -84,7 +84,8 @@ fun split_flags args =
         | "--skip-goalfrag" :: xs =>
             loop dry force use_cache skip_checkpoints false false tactic_timeout tactic_timeout_set goalfrag_plan goalfrag_trace repl_on_failure retain_debug_artifacts strict_parse xs
         | "--goalfrag" :: xs =>
-            loop dry force use_cache skip_checkpoints true false tactic_timeout tactic_timeout_set goalfrag_plan goalfrag_trace repl_on_failure retain_debug_artifacts strict_parse xs
+            (warn "--goalfrag is deprecated; proof IR is the default, use --goalfrag only for legacy GoalFrag debugging";
+             loop dry force use_cache skip_checkpoints true false tactic_timeout tactic_timeout_set goalfrag_plan goalfrag_trace repl_on_failure retain_debug_artifacts strict_parse xs)
         | "--new-ir" :: xs =>
             (warn "--new-ir is deprecated and has no effect; proof IR is the default";
              loop dry force use_cache skip_checkpoints goalfrag true tactic_timeout tactic_timeout_set goalfrag_plan goalfrag_trace repl_on_failure retain_debug_artifacts strict_parse xs)

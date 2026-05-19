@@ -145,9 +145,9 @@ a build but are removed after successful artifact/metadata writes.
 The default theorem instrumentation engine is holbuild's proof IR: it parses tactic
 syntax from `HOLSourceAST` directly instead of using HOL `goalFrag`, while preserving
 HOL parser recovery and exact tactic/list-tactic runtime boundaries for recognized
-constructs. `--goalfrag` selects the legacy GoalFrag engine for comparison/debugging.
-The old `--new-ir` build flag is accepted as a deprecated no-op because proof IR is
-now the default. By default, holbuild preserves HOL parser recovery: recovered
+constructs. `--goalfrag` is deprecated and selects the legacy GoalFrag engine only
+for comparison/debugging. The old `--new-ir` build flag is accepted as a deprecated
+no-op because proof IR is now the default. By default, holbuild preserves HOL parser recovery: recovered
 proof boundaries are instrumented where possible, and unknown/recovered source
 regions pass through to HOL. `--strict-parse` instead treats HOLSourceParser
 parse recovery as a build error before running HOL.

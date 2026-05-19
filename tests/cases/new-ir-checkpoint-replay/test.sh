@@ -100,10 +100,11 @@ Theorem partial:
 Proof
   CONJ_TAC >- ACCEPT_TAC TRUTH >- suspend "right"
 QED
-Resume partial[right]:
+Resume partial[right,smlname=partial_right_resume]:
   slow_tac >> slow_tac >> FAIL_TAC "resume suffix failure"
 QED
 Finalise partial
+val _ = concl partial_right_resume;
 val _ = export_theory();
 SML
 

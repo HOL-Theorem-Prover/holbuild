@@ -271,3 +271,8 @@ deprecated_new_ir_log=$tmpdir/deprecated-new-ir.log
 (cd "$project" && "$HOLBUILD_BIN" --verbose --holdir "$HOLDIR" build --new-ir ATheory) > "$deprecated_new_ir_log" 2>&1
 require_grep "new-ir is deprecated and has no effect; proof IR is the default" "$deprecated_new_ir_log"
 require_grep "ATheory is up to date" "$deprecated_new_ir_log"
+
+deprecated_goalfrag_log=$tmpdir/deprecated-goalfrag.log
+(cd "$project" && "$HOLBUILD_BIN" --verbose --holdir "$HOLDIR" build --goalfrag ATheory) > "$deprecated_goalfrag_log" 2>&1
+require_grep "goalfrag is deprecated; proof IR is the default" "$deprecated_goalfrag_log"
+require_grep "ATheory is up to date" "$deprecated_goalfrag_log"
