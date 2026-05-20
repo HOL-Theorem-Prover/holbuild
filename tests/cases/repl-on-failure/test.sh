@@ -60,7 +60,7 @@ if ! grep -q -- "--json does not support --repl-on-failure" "$json_log"; then
 fi
 
 repl_log=$tmpdir/repl.log
-if printf 'val _ = OS.Process.exit OS.Process.success;\n' |
+if printf 'val _ = (proofManagerLib.p(); print "P_OK\\n"); val _ = OS.Process.exit OS.Process.success;\n' |
    "$HOLBUILD_BIN" --holdir "$HOLDIR" build --repl-on-failure --force --no-cache ATheory >"$repl_log" 2>&1; then
   echo "expected failing proof to keep build exit status failed after repl exits" >&2
   exit 1
@@ -72,6 +72,16 @@ if ! grep -q "starting HOL repl from failed-prefix checkpoint" "$repl_log"; then
 fi
 if ! grep -q "checkpoint: .*fail_thm_failed_prefix.save" "$repl_log"; then
   echo "missing failed-prefix checkpoint path" >&2
+  cat "$repl_log" >&2
+  exit 1
+fi
+if ! grep -q "failed proof state loaded; run p();" "$repl_log"; then
+  echo "missing failed proof-state bootstrap message" >&2
+  cat "$repl_log" >&2
+  exit 1
+fi
+if ! grep -q "P_OK" "$repl_log"; then
+  echo "p() did not work in failure repl" >&2
   cat "$repl_log" >&2
   exit 1
 fi

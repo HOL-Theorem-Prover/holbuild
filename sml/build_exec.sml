@@ -1937,22 +1937,61 @@ fun failed_prefix_resume_source policy timeout_marker plan_only_marker source ch
     prelude ^ replay_block ^ suffix
   end
 
+datatype failure_repl_checkpoint =
+  FailedPrefixRepl of HolbuildTheoryCheckpoints.checkpoint * string
+| OtherReplCheckpoint of string * string
+
 fun failure_repl_checkpoint theorem_checkpoints failure_checkpoints deps_loaded =
   case best_failed_prefix_checkpoint theorem_checkpoints of
-      SOME {checkpoint, ...} => SOME ("failed-prefix", #failed_prefix_path checkpoint)
+      SOME {checkpoint, ...} => SOME (FailedPrefixRepl (checkpoint, #failed_prefix_path checkpoint))
     | NONE =>
         case List.find checkpoint_exists failure_checkpoints of
-            SOME path => SOME ("checkpoint", path)
-          | NONE => if checkpoint_exists deps_loaded then SOME ("deps-loaded", deps_loaded) else NONE
+            SOME path => SOME (OtherReplCheckpoint ("checkpoint", path))
+          | NONE => if checkpoint_exists deps_loaded then SOME (OtherReplCheckpoint ("deps-loaded", deps_loaded)) else NONE
 
-fun run_failure_repl tc policy theorem_checkpoints failure_checkpoints deps_loaded =
+fun failure_repl_checkpoint_kind (FailedPrefixRepl _) = "failed-prefix"
+  | failure_repl_checkpoint_kind (OtherReplCheckpoint (kind, _)) = kind
+
+fun failure_repl_checkpoint_path (FailedPrefixRepl (_, path)) = path
+  | failure_repl_checkpoint_path (OtherReplCheckpoint (_, path)) = path
+
+fun proof_ir_failed_prefix_repl_bootstrap () =
+  String.concatWith "\n"
+    ["val _ =",
+     "  (HolbuildProofRuntime.install_repl_proof_state();",
+     "   print \"holbuild: failed proof state loaded; run p(); or proofManagerLib.p(); to inspect it.\\n\")",
+     "  handle e =>",
+     "    print (\"holbuild: could not install failed proof state in proof manager: \" ^ General.exnMessage e ^ \"\\n\");"] ^ "\n"
+
+fun goalfrag_failed_prefix_repl_bootstrap () =
+  "val _ = print \"holbuild: failed proof state loaded; run p(); or proofManagerLib.p(); to inspect it.\\n\";\n"
+
+fun failure_repl_bootstrap_source policy checkpoint =
+  case checkpoint of
+      FailedPrefixRepl _ =>
+        if proof_ir_enabled policy then proof_ir_failed_prefix_repl_bootstrap ()
+        else goalfrag_failed_prefix_repl_bootstrap ()
+    | OtherReplCheckpoint _ =>
+        "val _ = print \"holbuild: loaded checkpoint has no active proof state.\\n\";\n"
+
+fun write_failure_repl_bootstrap stage policy checkpoint =
+  let val path = Path.concat(stage, "holbuild-failure-repl.sml")
+  in
+    write_text path (failure_repl_bootstrap_source policy checkpoint);
+    path
+  end
+
+fun run_failure_repl tc policy theorem_checkpoints failure_checkpoints deps_loaded stage =
   if not (repl_on_failure policy) then ()
   else
     case failure_repl_checkpoint theorem_checkpoints failure_checkpoints deps_loaded of
         NONE => HolbuildStatus.message_stderr "holbuild: --repl-on-failure requested, but no valid checkpoint is available\n"
-      | SOME (kind, path) =>
+      | SOME checkpoint =>
           let
-            val argv = HolbuildToolchain.hol_subcommand_argv tc "repl" @ ["--noconfig", "--holstate", path]
+            val kind = failure_repl_checkpoint_kind checkpoint
+            val path = failure_repl_checkpoint_path checkpoint
+            val bootstrap = write_failure_repl_bootstrap stage policy checkpoint
+            val argv = HolbuildToolchain.hol_subcommand_argv tc "repl" @ ["--noconfig", "--holstate", path, bootstrap]
             val _ = HolbuildStatus.message_stderr
                       (String.concat ["holbuild: starting HOL repl from ", kind,
                                       " checkpoint\ncheckpoint: ", path, "\n"])
@@ -2168,7 +2207,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
               if file_exists timeout_marker then tactic_timeout_error ()
               else if null theorem_checkpoints andalso null termination_diagnostics then Error msg
               else checkpoint_failure_error msg
-            val _ = run_failure_repl tc policy theorem_checkpoints (#failure_checkpoints run_spec) deps_loaded
+            val _ = run_failure_repl tc policy theorem_checkpoints (#failure_checkpoints run_spec) deps_loaded stage
             val _ = cleanup_json_stage stage
           in
             raise failure_error

@@ -192,6 +192,11 @@ fun current_history () =
       SOME history => history
     | NONE => raise Fail "proof IR goal history is not initialized"
 
+fun install_repl_proof_state () =
+  (proofManagerLib.add
+     (Manager.PF (Manager.GOALSTACK (current_history()), Manager.id_tacm));
+   ())
+
 fun set_history history = proof_history_ref := SOME history
 fun clear_history () = proof_history_ref := NONE
 
