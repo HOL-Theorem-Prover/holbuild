@@ -48,10 +48,6 @@ first_timing=$tmpdir/first.tool-timing
 require_grep "holbuild checkpoint kind=deps_loaded share=false" "$first_log"
 require_grep "holbuild checkpoint kind=final_context share=false" "$first_log"
 require_grep $'^phase\tname=build\.keys\tstatus=ok\tms=' "$first_timing"
-require_grep $'^phase\tname=build\.keys\.external\.source_hash\tstatus=ok\tms=.*\tcount=' "$first_timing"
-require_grep $'^phase\tname=build\.keys\.external\.dep_cache\tstatus=ok\tms=.*\tcount=' "$first_timing"
-require_grep $'^phase\tname=build\.keys\.external\.theory_stamp\tstatus=ok\tms=.*\tcount=' "$first_timing"
-require_grep $'^phase\tname=build\.keys\.external\.lib_artifact\tstatus=ok\tms=.*\tcount=' "$first_timing"
 
 coarse_timing=$tmpdir/coarse.tool-timing
 (cd "$project" && HOLBUILD_TIMING_LOG="$coarse_timing" "$HOLBUILD_BIN" --holdir "$HOLDIR" build --dry-run ATheory) > /dev/null

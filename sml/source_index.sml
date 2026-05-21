@@ -21,7 +21,8 @@ type source =
     source_path : string,
     relative_path : string,
     artifacts : artifacts,
-    policy : HolbuildProject.action_policy }
+    policy : HolbuildProject.action_policy,
+    bare : bool }
 
 type t = source list
 
@@ -75,6 +76,23 @@ fun sml_artifacts root rel =
 fun sig_artifacts root rel =
   { generated = [], objects = [obj_path root rel ".ui"], theory_data = [] }
 
+fun read_prefix path max_chars =
+  let
+    val ins = TextIO.openIn path
+    val text = TextIO.inputN (ins, max_chars) before TextIO.closeIn ins
+  in text end
+  handle _ => ""
+
+fun contains_substring needle haystack =
+  let
+    val n = size needle
+    val h = size haystack
+    fun at i = i + n <= h andalso String.substring(haystack, i, n) = needle
+    fun loop i = i + n <= h andalso (at i orelse loop (i + 1))
+  in n = 0 orelse loop 0 end
+
+fun source_bare_marker path = contains_substring "[bare]" (read_prefix path 2048)
+
 fun make_source package policies kind logical_name source_path relative_path artifacts =
   {package = package,
    kind = kind,
@@ -82,7 +100,8 @@ fun make_source package policies kind logical_name source_path relative_path art
    source_path = source_path,
    relative_path = relative_path,
    artifacts = artifacts,
-   policy = HolbuildProject.action_policy_for policies logical_name}
+   policy = HolbuildProject.action_policy_for policies logical_name,
+   bare = source_bare_marker source_path}
 
 fun generated_theory_artifact file =
   has_suffix "Theory.sml" file orelse
@@ -99,17 +118,24 @@ fun classify package source_root artifact_root policies abs_path =
       let
         val theory = drop_suffix "Script.sml" file ^ "Theory"
       in
-        SOME (make_source package policies TheoryScript theory abs_path rel
+        if package = "HOL" andalso HolbuildBootstrap.is_bare_theory theory then NONE
+        else SOME (make_source package policies TheoryScript theory abs_path rel
                             (theory_artifacts artifact_root rel theory))
       end
     else if has_suffix ".sml" file then
       let val logical = drop_suffix ".sml" file
-      in SOME (make_source package policies Sml logical abs_path rel
-                           (sml_artifacts artifact_root rel)) end
+      in
+        if package = "HOL" andalso HolbuildBootstrap.is_bare_module logical then NONE
+        else SOME (make_source package policies Sml logical abs_path rel
+                           (sml_artifacts artifact_root rel))
+      end
     else if has_suffix ".sig" file then
       let val logical = drop_suffix ".sig" file
-      in SOME (make_source package policies Sig logical abs_path rel
-                           (sig_artifacts artifact_root rel)) end
+      in
+        if package = "HOL" andalso HolbuildBootstrap.is_bare_module logical then NONE
+        else SOME (make_source package policies Sig logical abs_path rel
+                           (sig_artifacts artifact_root rel))
+      end
     else NONE
   end
 
@@ -184,11 +210,12 @@ fun compare_source (a : source, b : source) =
     | order => order
 
 fun compatible_same_name (a : source) (b : source) =
-  #package a = #package b andalso
-  (case (#kind a, #kind b) of
-       (Sml, Sig) => true
-     | (Sig, Sml) => true
-     | _ => false)
+  (#package a = "HOL" orelse #package b = "HOL") orelse
+  (#package a = #package b andalso
+   (case (#kind a, #kind b) of
+        (Sml, Sig) => true
+      | (Sig, Sml) => true
+      | _ => false))
 
 fun by_logical sources =
   let
@@ -236,6 +263,7 @@ fun validate_action_policies package_name policies sources =
 fun scan_member name source_root artifact_root policies excludes (member, acc) =
   if is_dir member then scan_dir name source_root artifact_root policies excludes member acc
   else if is_readable member then scan_file name source_root artifact_root policies excludes member acc
+  else if name = "HOL" then acc
   else raise Error ("member does not exist: " ^ member)
 
 fun discover_package package acc =
@@ -281,10 +309,11 @@ fun print_list label values =
       [] => ()
     | _ => print ("  " ^ label ^ ": " ^ String.concatWith ", " values ^ "\n")
 
-fun describe_source ({package, kind, logical_name, relative_path,
+fun describe_source ({package, kind, logical_name, relative_path, bare,
                       artifacts = {generated, objects, theory_data}, ...} : source) =
   (print (logical_name ^ " (" ^ kind_string kind ^ ", package " ^ package ^ ")\n");
    print ("  source: " ^ package ^ ":" ^ relative_path ^ "\n");
+   if bare then print "  bare: true\n" else ();
    print_list "generated" generated;
    print_list "objects" objects;
    print_list "theory_data" theory_data)
@@ -328,9 +357,17 @@ fun roots_for_package sources package =
     (HolbuildProject.package_roots package)
 
 fun default_targets sources project =
-  List.concat
-    (map (roots_for_package sources)
-         (List.filter (fn package => not (null (HolbuildProject.package_roots package)))
-                      (HolbuildProject.packages project)))
+  let
+    val rooted =
+      List.concat
+        (map (roots_for_package sources)
+             (List.filter (fn package => not (null (HolbuildProject.package_roots package)))
+                          (HolbuildProject.packages project)))
+  in
+    if not (null rooted) then rooted
+    else
+      map #logical_name
+        (List.filter (fn source => #package source <> "HOL") sources)
+  end
 
 end

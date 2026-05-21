@@ -13,12 +13,11 @@ The current implementation intentionally focuses on:
 - reuses HOL's existing SML TOML parser from `$HOLDIR/tools/Holmake/toml`
 - accepts logical build targets such as `MyTheory`, not object filenames such as `MyTheory.uo`
 - owns source discovery and maps outputs to project-level `.holbuild/`
-- infers theory/module dependencies with HOL/Holdep machinery over the resolved project graph and orders build plans
+- infers theory/module dependencies by running HOL's Holdep and mapping resolved dependency files into the project graph
 - parses transitive dependency manifests and local `.holconfig.toml` path overrides
 - materializes dependency plans under project `.holbuild/deps/<package>/`
-- rejects duplicate logical theory/module names across the resolved graph, except
-  local `.sig`/`.sml` companion pairs
-- includes project `load "Module"` SML/SIG dependencies in build plans and internal load manifests
+- rejects duplicate logical theory/module names across the resolved graph; a same-package `.sig`/`.sml` pair is one module interface/implementation pair
+- includes Holdep-resolved project SML/SIG dependencies in build plans and internal load manifests
 - records generated theory ML dependencies from HOL theory metadata in internal load manifests
 - rejects source-level `use "file"` in project build actions; declare/load project modules instead
 - supports per-action policy for explicit logical dependencies/loadable modules, extra dependencies, cache disabling, and always-rerun actions
@@ -237,9 +236,10 @@ The override changes only where the package is found locally. The package still
 needs its own `holproject.toml` or an explicit shim manifest from the consumer.
 HOL itself is implicit: the selected HOL checkout is chosen by `--holdir`,
 `HOLBUILD_HOLDIR`, or `HOLDIR`, with `src` and `examples` available for dependency
-resolution and `hol.state0`/`--bare` as the bootstrap boundary. Ordinary projects
-should not declare HOL as a manifest dependency or provide shims for HOL example
-subtrees.
+resolution and `hol.state0`/`--bare` as the bootstrap boundary. The implicit HOL
+package excludes selftests and developer throwaway examples so they do not clutter
+the logical target namespace. Ordinary projects should not declare HOL as a
+manifest dependency or provide shims for HOL example subtrees.
 
 There is no `.holpath`, ambient `HOLPATH`, or user-facing include-path schema in
 project mode; dependency locations are resolved through manifests plus local
@@ -274,8 +274,8 @@ move under a project-level `.holbuild/` directory. The top-level directory is no
 `.hol/objs` directories written by holbuild are nested compatibility remap copies
 inside `.holbuild/`, not the project state root. `.uo` and `.ui` files are internal
 ML artifacts; users should request logical targets only. The current implementation rejects
-ambiguous graphs where two sources export the same logical theory/module name;
-the intended exception is a same-package `.sig`/`.sml` companion pair. The
+ambiguous graphs where two packages export the same logical theory/module name;
+a same-package `.sig`/`.sml` pair is treated as one module interface/implementation pair. The
 current implementation also writes auxiliary `HOLFileSys` remap copies under `.hol/objs` for
 path-sensitive internal loads while preserving canonical artifacts in the project
 layout.
@@ -294,13 +294,13 @@ always_reexecute = true
 # impure = true is shorthand for no cache and always re-execute
 ```
 
-`holbuild` uses HOL's `Holdep` machinery to infer normal source dependencies
-from old-style `load`/`open` usage and HOLSource headers. `deps` names additional
-logical project dependencies when source-level imports are insufficient or
-intentionally absent; every listed name must resolve in the manifest/source
-graph. `loads` names additional loadable module/library stems for source-implicit
-predecessors; matching project modules are resolved in the DAG, otherwise the
-name is loaded from the configured HOL toolchain context. `extra_deps` are
+`holbuild` uses HOL's `Holdep.main` as the source-dependency authority and maps
+Holdep's resolved dependency files back into the manifest/source graph. It does
+not add graph edges by independently scanning `load`/`open` tokens or guessing
+signature companions. `deps` and `loads` name additional explicit logical/loadable
+predecessors when source-level imports are insufficient or intentionally absent;
+every listed name must resolve to the bare bootstrap environment or a source in
+the manifest graph. `extra_deps` are
 package-root-relative filesystem dependencies, such as files, directories, or
 simple globs, whose expanded contents are hashed into the action key. Source
 files may also declare source-file-relative extra dependencies with a static

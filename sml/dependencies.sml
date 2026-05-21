@@ -11,10 +11,11 @@ type t =
   { loads : string list,
     uses : string list,
     extra_deps : string list,
-    holdep_mentions : string list }
+    holdep_mentions : string list,
+    resolved_files : string list }
 
-val cache_version = "holbuild-dependencies-cache-v2"
-val extractor_version = "holsource-fileToReader+holdep-tokens+extra-deps-v1"
+val cache_version = "holbuild-dependencies-cache-v3"
+val extractor_version = "holdep-main-resolved-files-v1"
 
 fun has_suffix suffix s =
   let
@@ -184,7 +185,7 @@ fun extract_string_list_args keyword tokens =
     loop tokens []
   end
 
-fun extract_uncached path =
+fun extract_uncached_with_includes includes path =
   let
     val tokens = tokenize (read_all path)
     val loads = extract_string_args "load" tokens
@@ -193,7 +194,8 @@ fun extract_uncached path =
   in
     {loads = sort_unique loads, uses = sort_unique uses,
      extra_deps = sort_unique extra_deps,
-     holdep_mentions = holdep_mentions path}
+     holdep_mentions = holdep_mentions path,
+     resolved_files = resolved_holdep_deps includes path}
   end
 
 fun line_value prefix line =
@@ -215,7 +217,8 @@ fun read_cache cache_path source_hash =
             SOME {loads = values "load=" rest,
                   uses = values "use=" rest,
                   extra_deps = values "extra_dep=" rest,
-                  holdep_mentions = values "mention=" rest}
+                  holdep_mentions = values "mention=" rest,
+                  resolved_files = values "resolved_file=" rest}
           else NONE
       | _ => NONE
   end
@@ -228,7 +231,7 @@ fun ensure_dir path =
 
 fun ensure_parent path = ensure_dir (Path.dir path)
 
-fun cache_text source_hash ({loads, uses, extra_deps, holdep_mentions} : t) =
+fun cache_text source_hash ({loads, uses, extra_deps, holdep_mentions, resolved_files} : t) =
   String.concatWith "\n"
     ([cache_version,
       "extractor=" ^ extractor_version,
@@ -236,7 +239,8 @@ fun cache_text source_hash ({loads, uses, extra_deps, holdep_mentions} : t) =
      map (fn value => "load=" ^ value) loads @
      map (fn value => "use=" ^ value) uses @
      map (fn value => "extra_dep=" ^ value) extra_deps @
-     map (fn value => "mention=" ^ value) holdep_mentions) ^ "\n"
+     map (fn value => "mention=" ^ value) holdep_mentions @
+     map (fn value => "resolved_file=" ^ value) resolved_files) ^ "\n"
 
 fun write_cache cache_path source_hash deps =
   let
@@ -252,16 +256,22 @@ fun write_cache cache_path source_hash deps =
     ()
   end
 
-fun extract_cached_with_hash {cache_path, source_path, source_hash} =
+fun extract_cached_with_hash_and_includes {cache_path, source_path, source_hash, includes} =
   case read_cache cache_path source_hash of
       SOME deps => deps
     | NONE =>
         let
-          val deps = extract_uncached source_path
+          val deps = extract_uncached_with_includes includes source_path
           val _ = write_cache cache_path source_hash deps handle _ => ()
         in
           deps
         end
+
+fun extract_cached_with_hash args =
+  extract_cached_with_hash_and_includes {cache_path = #cache_path args,
+                                         source_path = #source_path args,
+                                         source_hash = #source_hash args,
+                                         includes = []}
 
 fun extract_cached {cache_path, source_path} =
   extract_cached_with_hash {cache_path = cache_path,
@@ -284,7 +294,7 @@ fun external_cache_path root source_hash =
 
 fun extract_global_cached_with_hash {source_path, source_hash} =
   case cache_root () of
-      NONE => extract_uncached source_path
+      NONE => extract_uncached_with_includes [] source_path
     | SOME root =>
         extract_cached_with_hash {cache_path = external_cache_path root source_hash,
                                   source_path = source_path,
@@ -294,9 +304,9 @@ fun extract_global_cached source_path =
   extract_global_cached_with_hash {source_path = source_path,
                                    source_hash = HolbuildHash.file_sha1 source_path}
 
-fun extract path = extract_uncached path
+fun extract path = extract_uncached_with_includes [] path
 
-fun describe ({loads, uses, extra_deps, holdep_mentions} : t) =
+fun describe ({loads, uses, extra_deps, holdep_mentions, resolved_files} : t) =
   let
     fun line label values =
       case values of
@@ -306,7 +316,8 @@ fun describe ({loads, uses, extra_deps, holdep_mentions} : t) =
     line "loads" loads;
     line "uses" uses;
     line "extra deps" extra_deps;
-    line "Holdep mentions" holdep_mentions
+    line "Holdep mentions" holdep_mentions;
+    line "Holdep resolved files" resolved_files
   end
 
 end

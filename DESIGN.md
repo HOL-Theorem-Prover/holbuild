@@ -96,7 +96,11 @@ Non-bare theory scripts are ordinary source actions too; they receive the normal
 full-HOL environment by implicit dependencies on the HOL sources that construct
 it rather than by starting from `hol.state`. Empirically, in current HOL checkouts
 `load "bossLib"; load "holTheory"; open bossLib` from `hol --bare` reproduces
-the same loaded-module set and theory ancestry as normal full HOL startup. Thus
+the same loaded-module set and theory ancestry as normal full HOL startup.
+Holbuild materializes this as a managed standard-environment checkpoint keyed by
+the bare toolchain plus the source-built `bossLib` and `holTheory` action keys.
+This recovers the performance role
+of `hol.state` without making a prebuilt full heap the semantic boundary.
 `hol.state` is a compatibility/distribution artifact, not the semantic dependency
 boundary for source builds.
 
@@ -108,9 +112,9 @@ should not silently depend on a stale configured heap from before the pull.
 
 The root-HOL transition should be explicit rather than inferred from existing
 Holmakefiles. The selected HOL checkout is an implicit package with source
-members `src` and `examples` and no default roots. External HOL theory
-dependencies should become normal resolved package nodes with the same action-key
-and cache rules as user packages; they should not be satisfied by loading a
+members `src` and `examples` and no default roots. HOL theory/library
+dependencies become normal resolved package nodes with the same action-key and
+cache rules as user packages; they should not be satisfied by loading a
 configured full HOL heap. Any non-HOL dependency subtree that cannot yet be
 expressed by the manifest model should use an explicit shim/adaptor package
 boundary, not Holmakefile interpretation in project mode.
@@ -229,15 +233,15 @@ always_reexecute = true
 impure = true
 ```
 
-Source dependencies are inferred with HOL's existing `Holdep` machinery over the
-resolved manifest package roots and the configured HOL toolchain objects, so
-normal old-style `load`/`open` usage and HOLSource headers become graph edges
-without user-facing include paths. `deps` names additional logical project
-dependencies when source-level imports are insufficient or intentionally absent;
-every listed dependency must resolve to a source in the manifest graph. `loads`
-names additional loadable module/library stems for source-implicit predecessors;
-matching project modules are resolved in the DAG, otherwise the name is loaded
-from the configured HOL toolchain context. `extra_deps` are filesystem
+Source dependencies are inferred by running HOL's existing `Holdep.main` over the
+resolved manifest package roots and mapping Holdep's resolved dependency files
+back into the source index. Holbuild must not add ad-hoc hard edges from token
+mentions, custom `open` scanning, HOLSource header parsing, or guessed `.sig`
+companions. `deps` and `loads` name additional explicit logical/loadable
+predecessors when source-level imports are insufficient or intentionally absent;
+every listed dependency must resolve to either the bare bootstrap environment or
+a source in the manifest graph. They are not satisfied from a prebuilt full HOL
+state. `extra_deps` are filesystem
 dependencies whose expanded contents are hashed into the action key. Manifest
 entries are package-root-relative; source files may also declare source-file-relative
 extra dependencies with static literal `holbuild_extra_deps [...]` annotations.
@@ -248,7 +252,7 @@ are staged so matching relative filesystem reads work during the action.
 checkpoint replay for the action. `impure = true`
 is a conservative shorthand for no cache and always re-execute. These fields are
 intended for audited exceptions such as generated data, root-HOL SML modules with
-explicit predecessor requirements, source-implicit external libraries, or
+explicit predecessor requirements, or
 tool/example side effects; they are not include paths and do not make arbitrary
 `use "file"` directives resolvable.
 
@@ -273,9 +277,8 @@ This rejection is intentional. HOL/PolyML process state has global theory and ML
 module names; two packages exporting different `FooTheory` or `Foo` modules
 cannot safely coexist by relying on load-path order. `holbuild` should reject the
 resolved graph before build execution instead of choosing whichever artifact
-happens to appear first. The only same-logical-name exception in v1 is a local
-`.sig`/`.sml` companion pair for the same package/module, which together describe
-one module artifact.
+happens to appear first. A same-package `.sig`/`.sml` pair is one module
+interface/implementation pair, not a cross-package ambiguity.
 
 ## Parallel builds
 
@@ -327,14 +330,13 @@ project/.holbuild/
 Path-sensitive files are generated or rebased for this local layout. Older HOL
 `Theory.sml` files may contain paths and are rebased when installed; newer HOL
 `Theory.sml` files locate their adjacent `.dat` file and are copied unchanged.
-Project SML/SIG modules are
-built as internal load manifests: `load "Module"`, `open Module`, and qualified
-module references are resolved through HOL's `Holdep` scanner against the project
-graph plus the configured HOL toolchain objects, not against ambient include
-paths. Generated theory modules also get internal load manifests from HOL's
-recorded theory metadata (`Theory.current_ML_deps` /
-`Theory.add_ML_dependency`), so legitimate generated
-`local open ...` dependencies are preserved without parsing generated SML text.
+Project SML/SIG modules are built from Holdep-resolved predecessor files mapped
+back into the source graph. Holbuild does not infer extra module dependencies
+from `open` tokens, qualified references, or guessed signature companions.
+Generated theory modules also get internal load manifests from HOL's recorded
+theory metadata (`Theory.current_ML_deps` / `Theory.add_ML_dependency`), so
+legitimate generated dependencies are preserved without parsing generated SML
+text.
 Source-level `use "file"` is rejected in project build actions in v1 because it
 is an arbitrary path/input outside the resolved package graph; declare a project
 module and `load` it instead. Generated HOL source is modeled by manifest
@@ -342,9 +344,9 @@ module and `load` it instead. Generated HOL source is modeled by manifest
 outputs are visible source-tree files (commonly under `gen/`), may be overwritten,
 and are scanned/hashed as ordinary sources after generation. Generator keys decide
 whether to rerun the generator; theory/action keys still use the actual generated
-source bytes. `.sml` files get a `.uo` plus an empty companion `.ui` unless a real
-`.sig` companion exists, and same-name signatures are implicit dependencies of
-their implementation. HOL's current
+source bytes. `.sml` files get a `.uo` plus a `.ui` load artifact as required by HOL's loader;
+any dependency between an implementation and a signature is whatever Holdep
+reports, not a holbuild guess. HOL's current
 `HOLFileSys` remaps `.uo`/`.ui` and files ending in
 `Theory.dat`/`.sml`/`.sig` through `.hol/objs`, so a project-level layout may
 need auxiliary internal load paths or rewritten non-semantic load copies while

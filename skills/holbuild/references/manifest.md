@@ -62,9 +62,9 @@ Each ordinary dependency must resolve to a manifest:
 
 HOL itself is implicit: every project has an implicit HOL source package selected
 by `--holdir`, `HOLBUILD_HOLDIR`, or `HOLDIR`. That package exposes `src` and
-`examples` for dependency resolution, uses no default roots, and treats
-`hol.state0`/`--bare` as the bootstrap boundary. Do not declare HOL with
-`[dependencies.HOLDIR]`.
+`examples` for dependency resolution, uses no default roots, excludes selftests
+and developer throwaway examples, and treats `hol.state0`/`--bare` as the
+bootstrap boundary. Do not declare HOL with `[dependencies.HOLDIR]`.
 
 Dependency `name` in `[dependencies.X]` must match the `project.name` in the resolved manifest. Mismatch is an error.
 
@@ -90,7 +90,7 @@ Recognized source files:
 - `*.sml` → SML module, logical name = filename minus `.sml`
 - `*.sig` → signature, logical name = filename minus `.sig`
 
-A `.sig`/`.sml` pair with the same base name in the same package is a companion pair (one module), not a conflict.
+A `.sig`/`.sml` pair with the same base name in the same package is one SML module interface/implementation pair, not a cross-package conflict.
 
 ## HOLSource headers
 
@@ -101,7 +101,7 @@ Theory Foo
 Ancestors Bar
 ```
 
-These are picked up by the Holdep scanner alongside `load`/`open` for dependency inference. `Ancestors` declares direct theory predecessors; `Theory` declares the theory name (redundant with `new_theory` but used by Holdep).
+These are interpreted by HOL's `Holdep.main`; holbuild uses Holdep's resolved dependency files as the dependency graph rather than independently scanning `load`/`open` tokens. `Ancestors` declares direct theory predecessors; `Theory` declares the theory name (redundant with `new_theory` but used by Holdep).
 
 ## `[[generate]]` source generation
 
@@ -118,7 +118,7 @@ Rules:
 
 ## Duplicate logical names
 
-One logical name → one resolved artifact across the entire build graph. Two packages exporting `FooTheory` or `Foo` module is an error. The only exception: same-package `.sig`/`.sml` companion pair.
+One logical name → one resolved artifact across the entire build graph. Two packages exporting `FooTheory` or `Foo` module is an error. A same-package `.sig`/`.sml` pair is one SML module interface/implementation pair and is not treated as a cross-package conflict.
 
 ## Action policies
 

@@ -41,10 +41,12 @@ name = "HOL"
 [build]
 members = ["src", "examples"]
 # no roots
+# default excludes: selftests and developer throwaway examples
 ```
 
-No excludes are part of the desired semantic model; add them only for concrete
-conflicts or intentionally unbuildable fixtures discovered in practice.
+The implicit package excludes selftests and developer throwaway examples by
+default, since those files are not intended downstream dependencies and otherwise
+clutter the logical namespace.
 
 The bootstrap boundary is `hol.state0`, used through `hol --bare`. The bare heap
 provides the primitive theory base (`minTheory`, `boolTheory`) and the SML modules
@@ -61,8 +63,10 @@ open bossLib;
 ```
 
 from a bare session reproduces the loaded-module set and theory ancestry of a
-normal full HOL session. Thus `bossLib` plus `holTheory` are the implicit
-standard-environment dependencies for non-bare theories.
+normal full HOL session. Thus `bossLib` plus `holTheory` are the source-built
+standard-environment roots for non-bare theories. Holbuild stores this as a
+managed checkpoint keyed by their action keys plus the bare toolchain key so
+repeated non-bare builds do not pay the full startup cost repeatedly.
 
 ## Local overrides
 
