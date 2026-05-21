@@ -439,11 +439,17 @@ fun top_goal_state_from_text text =
   case find_substring goal_state_start_marker text of
       NONE => NONE
     | SOME start =>
-        let val content_start = skip_line_break text (start + size goal_state_start_marker)
+        let
+          val content_start = skip_line_break text (start + size goal_state_start_marker)
+          val rest = String.extract(text, content_start, NONE)
         in
-          case find_substring goal_state_end_marker (String.extract(text, content_start, NONE)) of
-              NONE => NONE
-            | SOME rel_end => SOME (String.substring(text, content_start, rel_end))
+          case find_substring goal_state_end_marker rest of
+              SOME rel_end =>
+                SOME {top_goal = String.substring(text, content_start, rel_end), marker_truncated = false}
+            | NONE =>
+                SOME {top_goal = String.substring(text, content_start,
+                                                  Int.min(goal_state_limit, size text - content_start)),
+                      marker_truncated = true}
         end
 
 fun remaining_goals_from_text text = marker_line_after remaining_goals_marker text
@@ -465,7 +471,10 @@ fun read_goal_state path =
   in
     case top_goal_state_from_text text of
         NONE => NONE
-      | SOME top_goal => SOME {remaining_goals = remaining_goals_from_text text, top_goal = top_goal}
+      | SOME {top_goal, marker_truncated} =>
+          SOME {remaining_goals = remaining_goals_from_text text,
+                top_goal = top_goal,
+                marker_truncated = marker_truncated}
   end
 
 fun find_failed_fragment_label lines =
@@ -514,14 +523,15 @@ fun all_goals_log_summary log_available (SOME n) =
 fun truncation_summary log_available preview =
   if log_available then
     String.concat ["top goal exceeded 4 KiB; showing first ",
-                   Int.toString (size preview), " bytes; full top goal is in the instrumented log above\n"]
+                   Int.toString (size preview), " bytes; full top goal is in the instrumented log referenced below\n"]
   else
     String.concat ["top goal exceeded 4 KiB; showing first ",
                    Int.toString (size preview), " bytes\n"]
 
-fun goal_state_summary log_available {remaining_goals, top_goal} =
+fun goal_state_summary log_available {remaining_goals, top_goal, marker_truncated} =
   let
-    val (truncated, preview) = truncate_goal_state top_goal
+    val (text_truncated, preview) = truncate_goal_state top_goal
+    val truncated = marker_truncated orelse text_truncated
     val truncation_line = if truncated then truncation_summary log_available preview else ""
   in
     String.concat

@@ -11,6 +11,7 @@ tmpdir=$(make_temp_dir)
 cleanup() { rm -rf "$tmpdir"; }
 trap cleanup EXIT
 export HOLBUILD_CACHE="$tmpdir/cache"
+repo_root=$(cd "$SCRIPT_DIR/../../.." && pwd)
 
 project=$tmpdir/project
 mkdir -p "$project/src"
@@ -368,7 +369,7 @@ require_grep "failed tactic top input goal:" "$failure_log"
 require_grep "plan position: 00 tactic FAIL_TAC" "$failure_log"
 require_grep "failed tactic input goals: 1" "$failure_log"
 require_grep "top goal exceeded 4 KiB" "$failure_log"
-require_grep "full top goal is in the instrumented log above" "$failure_log"
+require_grep "full top goal is in the instrumented log referenced below" "$failure_log"
 require_grep "theorem: b_thm (line " "$failure_log"
 require_grep "proof: line " "$failure_log"
 require_grep "source: .*AScript.sml:" "$failure_log"
@@ -381,6 +382,40 @@ require_grep "holbuild plan position: 00 tactic FAIL_TAC" "$failure_child_log"
 require_grep "holbuild failed tactic input goal count: 1" "$failure_child_log"
 require_grep "holbuild failed tactic top input goal:" "$failure_child_log"
 require_grep "holbuild end failed tactic top input goal" "$failure_child_log"
+
+synthetic_large_goal_log=$tmpdir/synthetic-large-goal.log
+python3 - <<PY
+from pathlib import Path
+Path("$synthetic_large_goal_log").write_text(
+    "holbuild failed tactic input goal count: 1\n"
+    "holbuild failed tactic top input goal:\n" +
+    "p" * 70000 + "\n")
+PY
+synthetic_large_goal_check=$tmpdir/synthetic-large-goal-check.sml
+cat > "$synthetic_large_goal_check" <<SML
+OS.FileSys.chDir "$repo_root";
+use "sml/holbuild-script.sml";
+fun require_substring needle text =
+  if String.isSubstring needle text then ()
+  else (TextIO.output(TextIO.stdErr, "missing substring: " ^ needle ^ "\\n");
+        OS.Process.exit OS.Process.failure);
+val summary =
+  case HolbuildTheoryDiagnostics.summarize_goal_state_with_log_reference true "$synthetic_large_goal_log" of
+      SOME text => text
+    | NONE => (TextIO.output(TextIO.stdErr, "missing large-goal summary\\n");
+               OS.Process.exit OS.Process.failure);
+val _ = require_substring "failed tactic input goals: 1" summary;
+val _ = require_substring "top goal exceeded 4 KiB; showing first 4096 bytes" summary;
+val _ = require_substring "full top goal is in the instrumented log referenced below" summary;
+val log_reference =
+  HolbuildBuildExec.retained_log_reference
+    (SOME (HolbuildBuildExec.RetainedLog "$synthetic_large_goal_log"));
+val _ = require_substring "instrumented log warning: log is " log_reference;
+val _ = require_substring "do not read the whole log" log_reference;
+val _ = require_substring "only read targeted ranges if explicitly needed" log_reference;
+val _ = OS.Process.exit OS.Process.success;
+SML
+HOLBUILD_HOLDIR="$HOLDIR" HOLDIR="$HOLDIR" poly < "$synthetic_large_goal_check" > "$tmpdir/synthetic-large-goal-check.log" 2>&1
 
 multi_goal_project=$tmpdir/multi-goal-project
 mkdir -p "$multi_goal_project/src"

@@ -982,11 +982,24 @@ fun goalfrag_trace_output project node input_key stage =
     (stage_build_output stage)
     (retained_goalfrag_trace_log project node input_key)
 
+val large_log_warning_threshold = 65536
+
+fun retained_log_is_large path = file_size path > Position.fromInt large_log_warning_threshold
+
+fun retained_log_warning path =
+  String.concat ["instrumented log warning: log is ", Position.toString (file_size path),
+                 " bytes (>64 KiB); do not read the whole log. Use the summary above; ",
+                 "only read targeted ranges if explicitly needed.\n"]
+
 fun retained_log_reference output =
   if HolbuildStatus.json_mode () then ""
   else
     case output of
-        SOME (RetainedLog path) => "instrumented log: " ^ path ^ "\n"
+        SOME (RetainedLog path) =>
+          if retained_log_is_large path then
+            String.concat [retained_log_warning path, "instrumented log: ", path, "\n"]
+          else
+            String.concat ["instrumented log: ", path, "\n"]
       | _ => ""
 
 fun captured_output_path_option output = Option.map captured_output_path output
