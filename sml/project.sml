@@ -84,11 +84,11 @@ fun absolute_from_cwd path =
 
 fun set_source_dir path = source_dir_ref := SOME (absolute_from_cwd path)
 
-fun reserved_holdir_dependency name = name = "HOLDIR"
+fun reserved_hol_dependency name = name = "HOLDIR" orelse name = "HOL"
 
 fun require_not_reserved_dependency (Dependency {name, ...}) =
-  if reserved_holdir_dependency name then
-    die "do not declare [dependencies.HOLDIR]; HOL sources are implicit via --holdir/HOLBUILD_HOLDIR/HOLDIR"
+  if reserved_hol_dependency name then
+    die ("do not declare [dependencies." ^ name ^ "]; HOL sources are implicit via --holdir/HOLBUILD_HOLDIR/HOLDIR")
   else ()
 
 fun original_dir () =

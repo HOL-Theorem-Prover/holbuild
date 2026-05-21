@@ -2,7 +2,7 @@
 
 HOL itself is implicit in project mode. The selected checkout is chosen by
 `--holdir`, `HOLBUILD_HOLDIR`, or `HOLDIR`; users do not declare
-`[dependencies.HOLDIR]`.
+`[dependencies.HOLDIR]` or `[dependencies.HOL]`.
 
 The intended implicit package is deliberately simple:
 

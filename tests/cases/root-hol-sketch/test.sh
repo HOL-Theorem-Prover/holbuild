@@ -42,3 +42,17 @@ if (cd "$bad" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) >"$tmpdir/bad.out" 
   exit 1
 fi
 require_grep 'do not declare \[dependencies.HOLDIR\]' "$tmpdir/bad.err"
+
+bad_hol=$tmpdir/bad-hol
+mkdir -p "$bad_hol"
+cat > "$bad_hol/holproject.toml" <<TOML
+[project]
+name = "bad_hol_dep"
+
+[dependencies.HOL]
+TOML
+if (cd "$bad_hol" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) >"$tmpdir/bad-hol.out" 2>"$tmpdir/bad-hol.err"; then
+  echo "explicit dependencies.HOL unexpectedly succeeded" >&2
+  exit 1
+fi
+require_grep 'do not declare \[dependencies.HOL\]' "$tmpdir/bad-hol.err"

@@ -239,7 +239,8 @@ HOL itself is implicit: the selected HOL checkout is chosen by `--holdir`,
 resolution and `hol.state0`/`--bare` as the bootstrap boundary. The implicit HOL
 package excludes selftests and developer throwaway examples so they do not clutter
 the logical target namespace. Ordinary projects should not declare HOL as a
-manifest dependency or provide shims for HOL example subtrees.
+manifest dependency (`[dependencies.HOLDIR]` or `[dependencies.HOL]`) or provide
+shims for HOL example subtrees.
 
 There is no `.holpath`, ambient `HOLPATH`, or user-facing include-path schema in
 project mode; dependency locations are resolved through manifests plus local

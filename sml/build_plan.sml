@@ -188,10 +188,21 @@ fun bootstrap_provided name = HolbuildBootstrap.is_bare_logical name
 
 fun provided_for node name = bootstrap_provided name
 
+fun needs_standard_env_dependency node =
+  let val source = source_of node
+  in
+    #package source <> "HOL" andalso
+    not (#bare source) andalso
+    #kind source <> HolbuildSourceIndex.Sig
+  end
+
+fun standard_env_dependency_names node =
+  if needs_standard_env_dependency node then ["bossLib", "holTheory"] else []
+
 fun direct_dependency_names node =
   unique_strings
     (List.filter (fn name => not (provided_for node name))
-       (declared_dependency_names node @ declared_load_names node))
+       (standard_env_dependency_names node @ declared_dependency_names node @ declared_load_names node))
 
 fun unique_nodes nodes =
   let
@@ -517,219 +528,8 @@ fun extra_dep_lines label base decls =
     List.concat (map line decls)
   end
 
-fun read_text path =
-  let
-    val input = TextIO.openIn path
-      handle e => raise Error ("could not read " ^ path ^ ": " ^ General.exnMessage e)
-  in
-    TextIO.inputAll input before TextIO.closeIn input
-    handle e => (TextIO.closeIn input; raise e)
-  end
-
-fun resolved_link_path path =
-  if FS.isLink path handle OS.SysErr _ => false then
-    let val target = FS.readLink path
-    in
-      normalize_path
-        (if Path.isAbsolute target then target else Path.concat(Path.dir path, target))
-    end
-  else normalize_path path
-
-fun first_readable_path paths = List.find readable paths
-
-fun external_artifact_path_in dirs name =
-  first_readable_path
-    (List.concat
-       (map (fn dir => [Path.concat(dir, name ^ ".uo"),
-                        Path.concat(dir, name ^ ".ui")])
-            dirs))
-
-fun string_has_suffix suffix text =
-  let
-    val n = size text
-    val m = size suffix
-  in
-    n >= m andalso String.substring(text, n - m, m) = suffix
-  end
-
-fun drop_object_suffix path =
-  if string_has_suffix ".uo" path then String.substring(path, 0, size path - 3)
-  else if string_has_suffix ".ui" path then String.substring(path, 0, size path - 3)
-  else path
-
-fun source_dir_for_object_stem stem =
-  let
-    val object_dir = Path.dir stem
-    val hol_dir = Path.dir object_dir
-  in
-    if Path.file object_dir = "objs" andalso Path.file hol_dir = ".hol" then
-      SOME (Path.dir hol_dir)
-    else NONE
-  end
-
-fun external_object_id kind name = kind ^ ":" ^ name
-
-fun external_memo_id dirs kind name =
-  String.concatWith "\030" dirs ^ "\029" ^ external_object_id kind name
-
-fun external_source_candidates stem name =
-  case source_dir_for_object_stem stem of
-      SOME dir => [Path.concat(dir, name ^ ".sig"), Path.concat(dir, name ^ ".sml")]
-    | NONE => [stem ^ ".sig", stem ^ ".sml"]
-
-type external_timing =
-  { enabled : bool,
-    artifact_lookup_time : Time.time ref,
-    artifact_lookup_count : int ref,
-    source_hash_time : Time.time ref,
-    source_hash_count : int ref,
-    dep_cache_time : Time.time ref,
-    dep_cache_count : int ref,
-    theory_stamp_time : Time.time ref,
-    theory_stamp_count : int ref,
-    lib_artifact_time : Time.time ref,
-    lib_artifact_count : int ref }
-
-fun new_external_timing () =
-  {enabled = HolbuildToolchain.timing_detail_at 1,
-   artifact_lookup_time = ref (Time.fromMilliseconds 0),
-   artifact_lookup_count = ref 0,
-   source_hash_time = ref (Time.fromMilliseconds 0),
-   source_hash_count = ref 0,
-   dep_cache_time = ref (Time.fromMilliseconds 0),
-   dep_cache_count = ref 0,
-   theory_stamp_time = ref (Time.fromMilliseconds 0),
-   theory_stamp_count = ref 0,
-   lib_artifact_time = ref (Time.fromMilliseconds 0),
-   lib_artifact_count = ref 0}
-
-fun add_elapsed time_ref elapsed = time_ref := Time.+(!time_ref, elapsed)
-
-fun measure_external (timing : external_timing) time_ref count_ref f =
-  if #enabled timing then
-    let
-      val start = Time.now ()
-      val result = f ()
-      val finish = Time.now ()
-      val _ = add_elapsed time_ref (Time.-(finish, start))
-      val _ = count_ref := !count_ref + 1
-    in
-      result
-    end
-  else f ()
-
-fun emit_external_timing (timing : external_timing) =
-  let
-    fun emit name time_ref count_ref =
-      if #enabled timing andalso !count_ref > 0 then
-        HolbuildToolchain.record_phase_detail 1 name (!time_ref)
-          ["count=" ^ Int.toString (!count_ref)]
-      else ()
-  in
-    emit "build.keys.external.artifact_lookup" (#artifact_lookup_time timing) (#artifact_lookup_count timing);
-    emit "build.keys.external.source_hash" (#source_hash_time timing) (#source_hash_count timing);
-    emit "build.keys.external.dep_cache" (#dep_cache_time timing) (#dep_cache_count timing);
-    emit "build.keys.external.theory_stamp" (#theory_stamp_time timing) (#theory_stamp_count timing);
-    emit "build.keys.external.lib_artifact" (#lib_artifact_time timing) (#lib_artifact_count timing)
-  end
-
-fun external_source_deps_with timing path =
-  let
-    val source_hash =
-      measure_external timing (#source_hash_time timing) (#source_hash_count timing)
-        (fn () => HolbuildHash.file_sha1 path)
-  in
-    measure_external timing (#dep_cache_time timing) (#dep_cache_count timing)
-      (fn () => HolbuildDependencies.extract_global_cached_with_hash
-                  {source_path = path, source_hash = source_hash})
-  end
-  handle HolbuildDependencies.Error msg => raise Error msg
-
-fun external_dependency_names_with timing sources =
-  let
-    fun deps_for_source path =
-      let val deps = external_source_deps_with timing path
-      in #loads deps @ #holdep_mentions deps end
-  in
-    unique_strings (List.concat (map deps_for_source sources))
-  end
-
-fun external_dependency_kind name = if theory_name name then "theory" else "lib"
-
-(* External HOL objects are loaded from HOLDIR/sigobj, so their keys must reflect
-   what HOL will load.  For theories, Holmake's .cachekey and the .dat hash are
-   both acceptable semantic boundaries; recording both when available is stricter
-   and catches stale/divergent stamps.  For ML libs there is no Holmake stamp, so
-   the compiled artifact hash is the correctness fallback, with source-derived
-   load deps included to track theories loaded by that artifact.  If an object is
-   not in sigobj, treat it as part of the hol.state bootstrap boundary. *)
-fun external_key_lookup_with_timing timing toolchain_key =
-  let
-    val memo = ref ([] : (string * string) list)
-    fun memoized id = Option.map #2 (List.find (fn (key, _) => key = id) (!memo))
-    fun remember id value = (memo := (id, value) :: !memo; value)
-    fun in_stack id stack = List.exists (fn active => active = id) stack
-    fun cachekey_line cachekey =
-      "cachekey=" ^ String.translate (fn #"\n" => " " | c => str c) (read_text cachekey)
-    fun artifact_line artifact = "artifact-sha1=" ^ file_hash artifact
-    fun dat_line dat = "dat-sha1=" ^ file_hash dat
-    fun theory_key_lines cachekey dat =
-      (if readable cachekey then [cachekey_line cachekey] else []) @
-      (if readable dat then [dat_line dat] else [])
-    fun dependency_lines dirs stack deps =
-      map (fn dep =>
-             "dep=" ^ dep ^ "@" ^ compute dirs stack (external_dependency_kind dep) dep)
-          deps
-    and lib_key_lines dirs stack artifact stem name =
-      let
-        val sources = List.filter readable (external_source_candidates stem name)
-        val artifact_key =
-          measure_external timing (#lib_artifact_time timing) (#lib_artifact_count timing)
-            (fn () => artifact_line artifact)
-      in
-        artifact_key :: dependency_lines dirs stack (external_dependency_names_with timing sources)
-      end
-    and compute dirs stack kind name =
-      let val id = external_memo_id dirs kind name
-      in
-        case memoized id of
-            SOME key => key
-          | NONE =>
-              if in_stack id stack then "cycle:" ^ external_object_id kind name
-              else remember id (compute_uncached dirs (id :: stack) kind name)
-      end
-    and compute_uncached dirs stack kind name =
-      case measure_external timing (#artifact_lookup_time timing) (#artifact_lookup_count timing)
-             (fn () => external_artifact_path_in dirs name) of
-          NONE => toolchain_key
-        | SOME artifact =>
-            let
-              val resolved = resolved_link_path artifact
-              val stem = drop_object_suffix resolved
-              val cachekey = stem ^ ".cachekey"
-              val dat = stem ^ ".dat"
-              val key_lines =
-                if kind = "theory" then
-                  measure_external timing (#theory_stamp_time timing) (#theory_stamp_count timing)
-                    (fn () => theory_key_lines cachekey dat)
-                else lib_key_lines dirs stack resolved stem name
-              val _ =
-                if null key_lines then
-                  raise Error ("could not derive key for external HOL " ^ kind ^ " " ^ name)
-                else ()
-              val text = String.concatWith "\n"
-                           (["holbuild-external-source-v1",
-                             "kind=" ^ kind,
-                             "name=" ^ name] @ key_lines) ^ "\n"
-            in
-              HolbuildHash.string_sha1 text
-            end
-  in
-    fn node => fn kind => fn name => compute (external_dirs_of node) [] kind name
-  end
-
 fun external_key_lookup toolchain_key =
-  external_key_lookup_with_timing (new_external_timing ()) toolchain_key
+  fn _ => fn _ => fn _ => toolchain_key
 
 fun bool_text true = "true"
   | bool_text false = "false"
@@ -806,16 +606,12 @@ fun add_input_key config_lines_for_node toolchain_key nodes (node, keys) =
 
 fun compute_input_keys_with lookup config_lines_for_node toolchain_key nodes =
   let
-    val external_timing = new_external_timing ()
-    val external_key = external_key_lookup_with_timing external_timing toolchain_key
-    val keys =
-      List.foldl
-        (fn (node, keys) =>
-            add_input_key_with lookup config_lines_for_node toolchain_key external_key nodes (node, keys))
-        [] nodes
-    val _ = emit_external_timing external_timing
+    val external_key = external_key_lookup toolchain_key
   in
-    keys
+    List.foldl
+      (fn (node, keys) =>
+          add_input_key_with lookup config_lines_for_node toolchain_key external_key nodes (node, keys))
+      [] nodes
   end
 
 fun input_keys_with lookup config_lines_for_node toolchain_key nodes =

@@ -67,7 +67,7 @@ All under `.holbuild/`: `gen/` (generated theory files), `obj/` (artifacts), `de
 - `--tactic-timeout` applies only to root package; dependencies build with no timeout
 - Default parser policy is HOL-compatible recovery: keep recovered theorem instrumentation and pass unknown/recovered source through; use `--strict-parse` only when parser recovery should be fatal
 - Proof engine/checkpoint/timeout/trace flags are execution/debug policy, not final artifact action-key inputs
-- The selected HOL checkout is implicit (`--holdir`/`HOLBUILD_HOLDIR`/`HOLDIR`), with `src` and `examples` available as normal sources; do not declare `[dependencies.HOLDIR]`
+- The selected HOL checkout is implicit (`--holdir`/`HOLBUILD_HOLDIR`/`HOLDIR`), with `src` and `examples` available as normal sources; do not declare `[dependencies.HOLDIR]` or `[dependencies.HOL]`
 - `.holconfig.toml [overrides.X].path` masks `[dependencies.X].path`; masked env vars are not expanded. Explicit `manifest` fields still apply.
 
 ## References

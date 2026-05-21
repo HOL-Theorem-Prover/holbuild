@@ -210,23 +210,12 @@ fun direct_external_loads plan node =
     (HolbuildBuildPlan.direct_external_theories plan node @
      HolbuildBuildPlan.direct_external_libs plan node)
 
-fun standard_env_lines node =
-  let val source = HolbuildBuildPlan.source_of node
-  in
-    case #kind source of
-        HolbuildSourceIndex.Sig => []
-      | _ =>
-          if #package source = "HOL" orelse #bare source then []
-          else ["load \"bossLib\";", "load \"holTheory\";", "open bossLib;"]
-  end
-
 fun preload_lines plan node =
   let
     val external_deps = HolbuildBuildPlan.direct_external_theories plan node
     val external_libs = HolbuildBuildPlan.direct_external_libs plan node
     val project_deps = HolbuildBuildPlan.direct_project_deps plan node
   in
-    standard_env_lines node @
     map load_theory_line external_deps @
     map load_project_line external_libs @
     List.concat (map project_preload_lines project_deps)
@@ -941,35 +930,6 @@ fun ensure_standard_env_context_from_sources tc project toolchain_key keys plan 
            remove_tree stage;
            SOME (HolState output))
       end
-
-fun ensure_standard_env_context tc project toolchain_key =
-  let
-    val key = standard_env_key toolchain_key ["legacy-installed"]
-    val output = standard_env_path project key
-    val stage = Path.concat(Path.concat(project_artifact_root project, ".holbuild/stage"), "standard-env")
-    val loader = Path.concat(stage, "holbuild-save-standard-env.sml")
-  in
-    if standard_env_exists output key then HolState output
-    else
-      (ensure_dir stage;
-       ensure_parent output;
-       write_standard_env_loader ["load \"bossLib\";", "load \"holTheory\";"] output (standard_env_ok_text key) loader;
-       run_hol_files_to_log tc stage stage (toolchain_base_context tc) [loader]
-         "holbuild-standard-env.log"
-         "hol run failed while creating standard HOL environment checkpoint";
-       remove_tree stage;
-       HolState output)
-  end
-
-fun build_base_context options tc project toolchain_key plan =
-  if #skip_checkpoints options then toolchain_base_context tc
-  else if List.exists (fn node => #package (HolbuildBuildPlan.source_of node) = "HOL") plan then
-    toolchain_base_context tc
-  else if List.exists (fn node => #package (HolbuildBuildPlan.source_of node) <> "HOL" andalso
-                                not (#bare (HolbuildBuildPlan.source_of node)) andalso
-                                #kind (HolbuildBuildPlan.source_of node) <> HolbuildSourceIndex.Sig) plan then
-    ensure_standard_env_context tc project toolchain_key
-  else toolchain_base_context tc
 
 val cache_sml_token = "__HOLBUILD_THEORY_DAT_LOAD__"
 
@@ -2978,8 +2938,7 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
           val needs_std = List.exists needs_nonbare_standard_env std_plan
         in
           if null bare_plan then
-            let val context = build_base_context options tc project toolchain_key plan
-            in build_nodes status options tc project context plan keys toolchain_key jobs end
+            build_nodes status options tc project bare plan keys toolchain_key jobs
           else
             (build_nodes status options tc project bare bare_plan keys toolchain_key jobs;
              if #skip_checkpoints options orelse not needs_std then

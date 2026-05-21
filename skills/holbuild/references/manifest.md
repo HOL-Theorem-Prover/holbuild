@@ -64,7 +64,8 @@ HOL itself is implicit: every project has an implicit HOL source package selecte
 by `--holdir`, `HOLBUILD_HOLDIR`, or `HOLDIR`. That package exposes `src` and
 `examples` for dependency resolution, uses no default roots, excludes selftests
 and developer throwaway examples, and treats `hol.state0`/`--bare` as the
-bootstrap boundary. Do not declare HOL with `[dependencies.HOLDIR]`.
+bootstrap boundary. Do not declare HOL with `[dependencies.HOLDIR]` or
+`[dependencies.HOL]`.
 
 Dependency `name` in `[dependencies.X]` must match the `project.name` in the resolved manifest. Mismatch is an error.
 

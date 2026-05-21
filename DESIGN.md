@@ -76,8 +76,8 @@ HOLBUILD_HOLDIR / HOLDIR
 
 This keeps ordinary dependency resolution explicit while recognizing that every
 HOL project is already parameterized by a HOL checkout/toolchain. Users should
-not need to declare a special `[dependencies.HOLDIR]` entry for ordinary HOL
-sources.
+not need to declare a special `[dependencies.HOLDIR]` or `[dependencies.HOL]`
+entry for ordinary HOL sources.
 
 ## Root HOL
 
