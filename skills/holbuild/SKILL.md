@@ -67,7 +67,8 @@ All under `.holbuild/`: `gen/` (generated theory files), `obj/` (artifacts), `de
 - `--tactic-timeout` applies only to root package; dependencies build with no timeout
 - Default parser policy is HOL-compatible recovery: keep recovered theorem instrumentation and pass unknown/recovered source through; use `--strict-parse` only when parser recovery should be fatal
 - Proof engine/checkpoint/timeout/trace flags are execution/debug policy, not final artifact action-key inputs
-- The selected HOL checkout is implicit (`--holdir`/`HOLBUILD_HOLDIR`/`HOLDIR`), with `src` and `examples` available as normal sources; do not declare `[dependencies.HOLDIR]` or `[dependencies.HOL]`
+- Reserved dependency `[dependencies.HOLDIR]` uses holbuild's built-in root-HOL manifest; no shim needed for core HOL sources
+- HOL examples/tests are intentionally outside built-in `HOLDIR`; declare example subtrees (e.g. `keccakTheory`) as separate shimmed dependencies
 - `.holconfig.toml [overrides.X].path` masks `[dependencies.X].path`; masked env vars are not expanded. Explicit `manifest` fields still apply.
 
 ## References
@@ -77,5 +78,5 @@ All under `.holbuild/`: `gen/` (generated theory files), `obj/` (artifacts), `de
 - [local-config.md](references/local-config.md) — `.holconfig.toml` overrides, excludes, jobs, timeout
 - [build-model.md](references/build-model.md) — dependency inference, action keys, invalidation, cache, write locks, gc
 - [checkpoints-goalfrag.md](references/checkpoints-goalfrag.md) — proof IR/GoalFrag, checkpoint lifecycle, tactic timeouts, replay, env vars
-- [dependencies.md](references/dependencies.md) — declaring deps, implicit HOL checkout, shim manifests, transitive resolution
+- [dependencies.md](references/dependencies.md) — declaring deps, built-in HOLDIR, shim manifests, transitive resolution
 - [heaps-and-run.md](references/heaps-and-run.md) — `[[heap]]` exports; `run`/`repl` prototype status

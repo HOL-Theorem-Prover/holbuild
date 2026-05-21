@@ -1,13 +1,12 @@
 # Dependency management
 
-## Declaring ordinary dependencies
+## Declaring dependencies
 
 ```toml
 # holproject.toml
 [dependencies.foo]
 git = "https://github.com/acme/foo"
 rev = "abc123"
-path = "../foo"
 ```
 
 Fields per dependency:
@@ -19,54 +18,55 @@ Fields per dependency:
 | `path` | No | Local path to dependency root (relative to manifest dir; `$VAR`/`${VAR}` expanded only when no override masks it) |
 | `manifest` | No | Explicit manifest file path when dep lacks `holproject.toml` (relative to consumer manifest dir; env expanded when present) |
 
-Ordinary dependencies need a local `path` or `.holconfig.toml` override and must
-resolve to a manifest. HOL itself is the implicit exception described below.
+At least `path` (or a `.holconfig.toml` override) must resolve for the dependency to be found locally, except reserved `[dependencies.HOLDIR]`.
 
-## Implicit HOL checkout
+## Built-in HOLDIR dependency
 
-HOL itself is not an ordinary manifest dependency that users must declare. Every
-project is parameterized by a selected HOL checkout:
-
-1. `--holdir PATH`
-2. `HOLBUILD_HOLDIR`
-3. `HOLDIR`
-
-That checkout supplies both the HOL executable/toolchain and an implicit source
-package. The implicit package exposes:
+The dependency key `HOLDIR` is reserved. If `[dependencies.HOLDIR]` has no explicit `manifest`, holbuild uses a built-in manifest:
 
 ```toml
+[dependencies.HOLDIR]
+# no path/manifest needed for the built-in manifest case
+```
+
+The package root defaults to the configured HOL tree (`--holdir`,
+`HOLBUILD_HOLDIR`, or `HOLDIR`) unless a local `path`/override is provided. This
+avoids maintaining a shim manifest for HOL itself.
+
+Scope: the built-in `HOLDIR` manifest is for root HOL sources, not every file in
+the HOL checkout. It deliberately excludes examples, tests, manuals, and
+non-default tool variants. If a build fails with an undeclared example structure
+such as:
+
+```text
+Structure (keccakTheory) has not been declared
+```
+
+declare the example subtree as a separate dependency:
+
+```toml
+# holproject.toml
+[dependencies.HOLDIR]
+
+[dependencies.HOL_keccak]
+path = "$HOLDIR/examples/Crypto/Keccak"
+manifest = "shims/keccak.toml"
+```
+
+```toml
+# shims/keccak.toml
 [project]
-name = "HOL"
+name = "HOL_keccak"
 
 [build]
-members = ["src", "examples"]
-# no roots
-# default excludes: selftests and developer throwaway examples
+members = ["."]
+
+[dependencies.HOLDIR]
 ```
 
-The implicit package excludes selftests and developer throwaway examples by
-default, since those files are not intended downstream dependencies and otherwise
-clutter the logical namespace.
-
-The bootstrap boundary is `hol.state0`, used through `hol --bare`. The bare heap
-provides the primitive theory base (`minTheory`, `boolTheory`) and the SML modules
-reported by `Meta.loaded ()` in a bare session. Other HOL sources should be
-available as normal holbuild targets.
-
-For non-bare theory scripts, holbuild reconstructs the normal full HOL environment
-from source-built dependencies rather than starting from `hol.state`:
-
-```sml
-load "bossLib";
-load "holTheory";
-open bossLib;
-```
-
-from a bare session reproduces the loaded-module set and theory ancestry of a
-normal full HOL session. Thus `bossLib` plus `holTheory` are the source-built
-standard-environment roots for non-bare theories. Holbuild stores this as a
-managed checkpoint keyed by their action keys plus the bare toolchain key so
-repeated non-bare builds do not pay the full startup cost repeatedly.
+Downstream packages can depend on `HOL_keccak` directly or get it transitively
+from another dependency's manifest. The same pattern applies to other HOL example
+subtrees until they grow their own `holproject.toml` files.
 
 ## Local overrides
 
@@ -88,33 +88,59 @@ and any env vars in that manifest path must be set.
 
 ## Shim manifests
 
-Use `manifest = "shim.toml"` when a dependency subtree does not carry its own
-`holproject.toml` yet.
+When a dependency doesn't have its own `holproject.toml`:
 
 ```toml
-[dependencies.foo]
-path = "../legacy-foo"
-manifest = "shims/foo.toml"
+# holproject.toml consumer side
+[dependencies.legacy_lib]
+path = "../legacy-lib"
+manifest = "shim.toml"
 ```
 
-The shim manifest is resolved relative to the consumer manifest; the dependency
-root remains `../legacy-foo`.
+```toml
+# shim.toml at the dependency or consumer
+[project]
+name = "legacy_lib"
 
-## Resolution order
+[build]
+members = ["src"]
+```
 
-Intended model:
+The `manifest` path is resolved relative to the consumer's manifest directory.
 
-1. Discover the root project manifest.
-2. Add the implicit HOL package selected by `--holdir` / env.
-3. Resolve ordinary dependency roots and manifests.
-4. Build one global source index from the root project, ordinary dependencies,
-   and the implicit HOL package.
-5. Treat bare-heap-provided HOL theories/modules as already available; build all
-   other reachable HOL sources normally.
+## Dependency resolution flow
 
-## Duplicate logical names
+1. Parse `holproject.toml` and `.holconfig.toml`; dependency `path`/`manifest` strings are stored raw until resolution
+2. For each dependency root: check override path → fallback to declared path → reserved `HOLDIR` configured tree. Only the selected root path is env-expanded.
+3. Find manifest: built-in `HOLDIR` manifest → `manifest` field (if set, env-expanded even when the root path came from an override) → dependency's own `holproject.toml` → error
+4. Validate: dependency manifest `project.name` must match dependency key name
+5. Resolve dependency's own dependencies recursively (transitive closure)
+6. Each package gets artifacts under the root project's `.holbuild/deps/<package-name>/`
+7. Build the full resolved graph
 
-One logical name must resolve to one artifact in a requested build graph. If the
-implicit HOL package and a user package define the same logical theory/module,
-holbuild should report a clear conflict unless a future explicit opt-out/exclude
-mechanism removes one side.
+## Transitive dependencies
+
+Dependencies of dependencies are resolved automatically. No need to declare transitive deps in the root project — they're discovered through the dependency's own manifest.
+
+## Duplicate name rejection
+
+The resolved graph must have exactly one artifact per logical name. If two packages (even transitively) export the same `FooTheory` or `Foo` module, holbuild rejects the graph before building.
+
+Same-package `.sig`/`.sml` companion pairs are the only exception.
+
+## Source-level imports
+
+`load "Foo"` and `open Foo` in source files are resolved against:
+1. Project graph (matched by logical name)
+2. HOL toolchain `sigobj/` (external toolchain libraries)
+
+If a `load` directive can't be resolved to either, it's an error. Unresolved `[actions.*].deps` entries are also errors.
+
+## Dependency build policy
+
+Dependencies build with default settings:
+- Goalfrag enabled
+- No tactic timeout (consumer's `--tactic-timeout` does not affect dependencies)
+- Checkpoints enabled (unless `--skip-checkpoints` globally)
+
+Dependencies' artifact roots are under the root project's `.holbuild/deps/<package>/`, not inside the dependency's own directory.

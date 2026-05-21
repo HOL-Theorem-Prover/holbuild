@@ -11,11 +11,10 @@ type t =
   { loads : string list,
     uses : string list,
     extra_deps : string list,
-    holdep_mentions : string list,
-    resolved_files : string list }
+    holdep_mentions : string list }
 
-val cache_version = "holbuild-dependencies-cache-v4"
-val extractor_version = "holdep-main-resolved-files-v2"
+val cache_version = "holbuild-dependencies-cache-v2"
+val extractor_version = "holsource-fileToReader+holdep-tokens+extra-deps-v1"
 
 fun has_suffix suffix s =
   let
@@ -50,7 +49,17 @@ fun normalize_dep_path source_path dep =
   normalize_path
     (if absolute_path dep then dep else Path.concat(Path.dir source_path, dep))
 
-fun holdep_mentions _ = []
+fun holdep_mentions path =
+  let
+    val reader = HOLSource.fileToReader {quietOpen = false, print = fn _ => ()} path
+    val mentions = Holdep_tokens.reader_deps (path, #read reader)
+  in
+    sort_unique (Binarymap.foldl (fn (name, _, acc) => name :: acc) [] mentions)
+  end
+  handle Holdep_tokens.LEX_ERROR msg =>
+    raise Error ("Holdep failed for " ^ path ^ ": " ^ msg)
+       | e as IO.Io _ =>
+    raise Error ("Holdep failed for " ^ path ^ ": " ^ General.exnMessage e)
 
 fun resolved_holdep_deps includes path =
   let
@@ -175,7 +184,7 @@ fun extract_string_list_args keyword tokens =
     loop tokens []
   end
 
-fun extract_uncached_with_includes includes path =
+fun extract_uncached path =
   let
     val tokens = tokenize (read_all path)
     val loads = extract_string_args "load" tokens
@@ -184,8 +193,7 @@ fun extract_uncached_with_includes includes path =
   in
     {loads = sort_unique loads, uses = sort_unique uses,
      extra_deps = sort_unique extra_deps,
-     holdep_mentions = holdep_mentions path,
-     resolved_files = resolved_holdep_deps includes path}
+     holdep_mentions = holdep_mentions path}
   end
 
 fun line_value prefix line =
@@ -194,7 +202,7 @@ fun line_value prefix line =
 
 fun values prefix lines = List.mapPartial (line_value prefix) lines
 
-fun read_cache cache_path source_hash includes =
+fun read_cache cache_path source_hash =
   let
     val text = read_all cache_path
     val lines = String.tokens (fn c => c = #"\n") text
@@ -203,13 +211,11 @@ fun read_cache cache_path source_hash includes =
         version :: extractor :: hash_line :: rest =>
           if version = cache_version andalso
              extractor = "extractor=" ^ extractor_version andalso
-             hash_line = "source_sha1=" ^ source_hash andalso
-             values "include=" rest = includes then
+             hash_line = "source_sha1=" ^ source_hash then
             SOME {loads = values "load=" rest,
                   uses = values "use=" rest,
                   extra_deps = values "extra_dep=" rest,
-                  holdep_mentions = values "mention=" rest,
-                  resolved_files = values "resolved_file=" rest}
+                  holdep_mentions = values "mention=" rest}
           else NONE
       | _ => NONE
   end
@@ -222,24 +228,22 @@ fun ensure_dir path =
 
 fun ensure_parent path = ensure_dir (Path.dir path)
 
-fun cache_text source_hash includes ({loads, uses, extra_deps, holdep_mentions, resolved_files} : t) =
+fun cache_text source_hash ({loads, uses, extra_deps, holdep_mentions} : t) =
   String.concatWith "\n"
     ([cache_version,
       "extractor=" ^ extractor_version,
       "source_sha1=" ^ source_hash] @
-     map (fn inc => "include=" ^ inc) includes @
      map (fn value => "load=" ^ value) loads @
      map (fn value => "use=" ^ value) uses @
      map (fn value => "extra_dep=" ^ value) extra_deps @
-     map (fn value => "mention=" ^ value) holdep_mentions @
-     map (fn value => "resolved_file=" ^ value) resolved_files) ^ "\n"
+     map (fn value => "mention=" ^ value) holdep_mentions) ^ "\n"
 
-fun write_cache cache_path source_hash includes deps =
+fun write_cache cache_path source_hash deps =
   let
     val tmp = cache_path ^ ".tmp"
     val _ = ensure_parent cache_path
     val out = TextIO.openOut tmp
-    val _ = (TextIO.output(out, cache_text source_hash includes deps); TextIO.closeOut out)
+    val _ = (TextIO.output(out, cache_text source_hash deps); TextIO.closeOut out)
             handle e => (TextIO.closeOut out; raise e)
     val _ = OS.FileSys.remove cache_path handle OS.SysErr _ => ()
     val _ = OS.FileSys.rename {old = tmp, new = cache_path}
@@ -248,25 +252,16 @@ fun write_cache cache_path source_hash includes deps =
     ()
   end
 
-fun extract_cached_with_hash_and_includes {cache_path, source_path, source_hash, includes} =
-  let val includes = sort_unique includes
-  in
-    case read_cache cache_path source_hash includes of
-        SOME deps => deps
-      | NONE =>
-          let
-            val deps = extract_uncached_with_includes includes source_path
-            val _ = write_cache cache_path source_hash includes deps handle _ => ()
-          in
-            deps
-          end
-  end
-
-fun extract_cached_with_hash args =
-  extract_cached_with_hash_and_includes {cache_path = #cache_path args,
-                                         source_path = #source_path args,
-                                         source_hash = #source_hash args,
-                                         includes = []}
+fun extract_cached_with_hash {cache_path, source_path, source_hash} =
+  case read_cache cache_path source_hash of
+      SOME deps => deps
+    | NONE =>
+        let
+          val deps = extract_uncached source_path
+          val _ = write_cache cache_path source_hash deps handle _ => ()
+        in
+          deps
+        end
 
 fun extract_cached {cache_path, source_path} =
   extract_cached_with_hash {cache_path = cache_path,
@@ -289,7 +284,7 @@ fun external_cache_path root source_hash =
 
 fun extract_global_cached_with_hash {source_path, source_hash} =
   case cache_root () of
-      NONE => extract_uncached_with_includes [] source_path
+      NONE => extract_uncached source_path
     | SOME root =>
         extract_cached_with_hash {cache_path = external_cache_path root source_hash,
                                   source_path = source_path,
@@ -299,9 +294,9 @@ fun extract_global_cached source_path =
   extract_global_cached_with_hash {source_path = source_path,
                                    source_hash = HolbuildHash.file_sha1 source_path}
 
-fun extract path = extract_uncached_with_includes [] path
+fun extract path = extract_uncached path
 
-fun describe ({loads, uses, extra_deps, resolved_files, ...} : t) =
+fun describe ({loads, uses, extra_deps, holdep_mentions} : t) =
   let
     fun line label values =
       case values of
@@ -311,7 +306,7 @@ fun describe ({loads, uses, extra_deps, resolved_files, ...} : t) =
     line "loads" loads;
     line "uses" uses;
     line "extra deps" extra_deps;
-    line "Holdep resolved files" resolved_files
+    line "Holdep mentions" holdep_mentions
   end
 
 end

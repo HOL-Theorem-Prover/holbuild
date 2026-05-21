@@ -57,6 +57,11 @@ val _ = export_theory();
 SML
 
 (cd "$project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build --dry-run ATheory) > "$tmpdir/dry.log"
+require_grep "external theories: .*arithmeticTheory" "$tmpdir/dry.log"
+require_grep "external theories: .*stringTheory" "$tmpdir/dry.log"
+require_grep "external libs: .*cv_transLib" "$tmpdir/dry.log"
+require_grep "external libs: .*monadsyntax" "$tmpdir/dry.log"
+require_grep "external libs: .*numLib" "$tmpdir/dry.log"
 if grep -q "ignore_grammar\|qualified\|identifier" "$tmpdir/dry.log"; then
   echo "HOLSource header/body qualifier or Type declaration was misclassified" >&2
   exit 1
@@ -66,6 +71,12 @@ fi
 require_file "$project/.holbuild/obj/src/ATheory.sml"
 require_file "$project/.holbuild/obj/src/ATheory.dat"
 require_file "$project/.holbuild/obj/src/BTheory.dat"
+require_grep "numLib" "$project/.holbuild/obj/src/AScript.uo"
+require_grep "monadsyntax" "$project/.holbuild/obj/src/AScript.uo"
+require_grep "cv_transLib" "$project/.holbuild/obj/src/AScript.uo"
+require_grep "arithmeticTheory" "$project/.holbuild/obj/src/ATheory.uo"
+require_grep "monadsyntax" "$project/.holbuild/obj/src/ATheory.uo"
+require_grep "cv_primTheory" "$project/.holbuild/obj/src/ATheory.uo"
 if grep -q "\.holbuild/stage" "$project/.holbuild/obj/src/ATheory.uo"; then
   echo "transient stage path leaked into generated theory load manifest" >&2
   exit 1
@@ -91,6 +102,8 @@ rm -rf "$project/.holbuild"
 # leak transient stage paths into generated sources/load manifests.
 require_grep "ATheory restored from cache" "$tmpdir/cache.log"
 require_file "$project/.holbuild/obj/src/ATheory.dat"
+require_grep "monadsyntax" "$project/.holbuild/obj/src/ATheory.uo"
+require_grep "cv_primTheory" "$project/.holbuild/obj/src/ATheory.uo"
 if grep -q "\.holbuild/stage" "$project/.holbuild/obj/src/ATheory.uo"; then
   echo "cache restore leaked transient stage path into generated theory load manifest" >&2
   exit 1

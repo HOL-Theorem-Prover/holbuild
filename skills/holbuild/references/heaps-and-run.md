@@ -17,8 +17,8 @@ holbuild heap main
 
 Heap export flow:
 1. Build declared `objects` with the full build pipeline (default proof IR theorem instrumentation, checkpoints unless skipped by policy, default root timeout 2.5s)
-2. Start from the bare bootstrap context (`hol.state0` / `hol --bare`)
-3. Load the source-built standard HOL environment and generated theory modules in build-graph order
+2. Start from base `hol.state` context
+3. Load external theories and generated theory modules in build-graph order
 4. Save heap with `PolyML.SaveState.saveChild`
 5. Output written to the declared `output` path
 

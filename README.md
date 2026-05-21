@@ -13,11 +13,12 @@ The current implementation intentionally focuses on:
 - reuses HOL's existing SML TOML parser from `$HOLDIR/tools/Holmake/toml`
 - accepts logical build targets such as `MyTheory`, not object filenames such as `MyTheory.uo`
 - owns source discovery and maps outputs to project-level `.holbuild/`
-- infers theory/module dependencies by running HOL's Holdep and mapping resolved dependency files into the project graph
+- infers theory/module dependencies with HOL/Holdep machinery over the resolved project graph and orders build plans
 - parses transitive dependency manifests and local `.holconfig.toml` path overrides
 - materializes dependency plans under project `.holbuild/deps/<package>/`
-- rejects duplicate logical theory/module names across the resolved graph; a same-package `.sig`/`.sml` pair is one module interface/implementation pair
-- includes Holdep-resolved project SML/SIG dependencies in build plans and internal load manifests
+- rejects duplicate logical theory/module names across the resolved graph, except
+  local `.sig`/`.sml` companion pairs
+- includes project `load "Module"` SML/SIG dependencies in build plans and internal load manifests
 - records generated theory ML dependencies from HOL theory metadata in internal load manifests
 - rejects source-level `use "file"` in project build actions; declare/load project modules instead
 - supports per-action policy for explicit logical dependencies/loadable modules, extra dependencies, cache disabling, and always-rerun actions
@@ -34,14 +35,14 @@ The current implementation intentionally focuses on:
 - exposes `holbuild gc` for project-local residue cleanup plus global-cache GC with a 7-day default retention policy
 - does not delegate build semantics to Holmake
 - treats `.uo`/`.ui` as internal ML artifacts, never user-requestable targets
-- delegates project-context execution to `$HOLDIR/bin/hol run` / `hol repl`
+- delegates execution to `$HOLDIR/bin/hol run` / `hol repl` for now
 
-Holbuild requires a HOL checkout or installation selected by `--holdir`,
-`HOLBUILD_HOLDIR`, or `HOLDIR`. That checkout supplies both the command-line HOL
-toolchain and an implicit HOL source package. HOL source builds use
-`$HOLDIR/bin/hol.state0` through `hol --bare` as the bootstrap boundary; the full
-HOL environment is reconstructed as ordinary source-built dependencies. See
-`DESIGN.md`.
+The external implementation requires a HOL checkout or installation via `HOLDIR` so it
+can reuse HOL tooling. Current code still starts actions from `$HOLDIR/bin/hol.state`
+and includes that heap in the toolchain key; it does not create a project-local
+copy under `.holbuild/checkpoints/_base`. The target design replaces this
+configured seed with bootstrap/checkpoint state that `hol build` can rebuild or
+restore hermetically under `.holbuild/` after `git pull`. See `DESIGN.md`.
 
 ## Current validation status
 
@@ -71,11 +72,10 @@ make HOLDIR=/path/to/HOL install
 
 This installs only the `holbuild` executable to `$HOME/.local/bin/holbuild` by
 default. Override with `PREFIX`, `BINDIR`, or `DESTDIR` if needed. Runtime HOL
-selection uses `--holdir PATH`, `HOLBUILD_HOLDIR`, or `HOLDIR`.
+selection still uses `--holdir PATH`, `HOLBUILD_HOLDIR`, or `HOLDIR`.
 
 The compiler loads HOL's existing SML TOML parser from `$(HOLDIR)` and embeds it
-in `bin/holbuild`. Runtime source builds use the selected checkout independently
-of the checkout used to compile the executable. Tests live under `tests/cases/*/test.sh` so they can move into
+in `bin/holbuild`. Tests live under `tests/cases/*/test.sh` so they can move into
 HOL's selftest layout with minimal reshaping; `tests/run.sh` is the repo-local
 runner and can run cases in parallel with `HOLBUILD_TEST_JOBS`. Current cases
 cover simple theory builds, package overrides, local build excludes, build roots,
@@ -233,18 +233,38 @@ exclude = ["worktrees/*"]
 ```
 
 The override changes only where the package is found locally. The package still
-needs its own `holproject.toml` or an explicit shim manifest from the consumer.
-HOL itself is implicit: the selected HOL checkout is chosen by `--holdir`,
-`HOLBUILD_HOLDIR`, or `HOLDIR`, with `src` and `examples` available for dependency
-resolution and `hol.state0`/`--bare` as the bootstrap boundary. The implicit HOL
-package excludes selftests and developer throwaway examples so they do not clutter
-the logical target namespace. Ordinary projects should not declare HOL as a
-manifest dependency (`[dependencies.HOLDIR]` or `[dependencies.HOL]`) or provide
-shims for HOL example subtrees.
+needs its own `holproject.toml` or an explicit shim manifest from the consumer,
+except for the reserved `[dependencies.HOLDIR]` package, which uses holbuild's
+built-in root-HOL manifest and the runtime `--holdir`/`HOLBUILD_HOLDIR` path.
+The built-in `HOLDIR` manifest intentionally models the root HOL sources only;
+it excludes examples, tests, manuals, and non-default tool variants. If a project
+needs a HOL example theory such as `keccakTheory` from
+`$HOLDIR/examples/Crypto/Keccak`, declare that subtree as a separate dependency:
 
-There is no `.holpath`, ambient `HOLPATH`, or user-facing include-path schema in
-project mode; dependency locations are resolved through manifests plus local
-overrides and the selected implicit HOL checkout. An
+```toml
+# holproject.toml
+[dependencies.HOLDIR]
+
+[dependencies.HOL_keccak]
+path = "$HOLDIR/examples/Crypto/Keccak"
+manifest = "shims/keccak.toml"
+```
+
+```toml
+# shims/keccak.toml
+[project]
+name = "HOL_keccak"
+
+[build]
+members = ["."]
+
+[dependencies.HOLDIR]
+```
+
+A downstream package can depend on `HOL_keccak` directly, or inherit it
+transitively through another dependency's manifest. There is no `.holpath`,
+ambient `HOLPATH`, or user-facing include-path schema in project mode;
+dependency locations are resolved through manifests plus local overrides. An
 `[overrides.foo].path` takes precedence over `[dependencies.foo].path`; when an
 override exists, the manifest's `path` field is not env-expanded, so local
 config can mask a committed `path = "$FOO"` even when `FOO` is unset. Explicit
@@ -275,8 +295,8 @@ move under a project-level `.holbuild/` directory. The top-level directory is no
 `.hol/objs` directories written by holbuild are nested compatibility remap copies
 inside `.holbuild/`, not the project state root. `.uo` and `.ui` files are internal
 ML artifacts; users should request logical targets only. The current implementation rejects
-ambiguous graphs where two packages export the same logical theory/module name;
-a same-package `.sig`/`.sml` pair is treated as one module interface/implementation pair. The
+ambiguous graphs where two sources export the same logical theory/module name;
+the intended exception is a same-package `.sig`/`.sml` companion pair. The
 current implementation also writes auxiliary `HOLFileSys` remap copies under `.hol/objs` for
 path-sensitive internal loads while preserving canonical artifacts in the project
 layout.
@@ -295,13 +315,13 @@ always_reexecute = true
 # impure = true is shorthand for no cache and always re-execute
 ```
 
-`holbuild` uses HOL's `Holdep.main` as the source-dependency authority and maps
-Holdep's resolved dependency files back into the manifest/source graph. It does
-not add graph edges by independently scanning `load`/`open` tokens or guessing
-signature companions. `deps` and `loads` name additional explicit logical/loadable
-predecessors when source-level imports are insufficient or intentionally absent;
-every listed name must resolve to the bare bootstrap environment or a source in
-the manifest graph. `extra_deps` are
+`holbuild` uses HOL's `Holdep` machinery to infer normal source dependencies
+from old-style `load`/`open` usage and HOLSource headers. `deps` names additional
+logical project dependencies when source-level imports are insufficient or
+intentionally absent; every listed name must resolve in the manifest/source
+graph. `loads` names additional loadable module/library stems for source-implicit
+predecessors; matching project modules are resolved in the DAG, otherwise the
+name is loaded from the configured HOL toolchain context. `extra_deps` are
 package-root-relative filesystem dependencies, such as files, directories, or
 simple globs, whose expanded contents are hashed into the action key. Source
 files may also declare source-file-relative extra dependencies with a static

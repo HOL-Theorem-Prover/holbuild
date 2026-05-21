@@ -8,9 +8,10 @@ Before source discovery, holbuild runs stale `[[generate]]` steps in dependency 
 
 holbuild infers source dependencies from the resolved project graph:
 
-1. **Holdep resolved dependencies** — holbuild runs `Holdep.main` and maps its resolved dependency files back into the source index. Holbuild does not add ad-hoc edges from token mentions, `open` scanning, HOLSource parsing, or `.sig` companions.
+1. **Holdep scanning** — `load "X"` / `open X` in source, plus `HOLSource` headers (e.g. `Theory Foo` / `Ancestors Bar`), resolved against the project graph + HOL toolchain `sigobj/`
 2. **Action `deps`** — explicit logical dependencies declared in `[actions.*]`
-3. **Action `loads`** — explicit loadable module stems declared in `[actions.*]`
+3. **Action `loads`** — explicit loadable module stems; resolved in project DAG first, then HOL toolchain
+4. **Companion signatures** — `Foo.sml` implicitly depends on same-package `Foo.sig`
 
 Unresolved `load` directives or `deps` entries → build error.
 
@@ -31,7 +32,7 @@ Build order: dependencies loaded first, then dependents. Parallel-ready: `-jN` w
 | `FooScript.sml` | `FooTheory` | `FooTheory.sig`, `FooTheory.sml` | `FooScript.uo`, `FooTheory.ui`, `FooTheory.uo` | `FooTheory.dat` |
 | `Foo.sml` (no sig) | `Foo` | — | `Foo.ui`, `Foo.uo` | — |
 | `Foo.sig` | `Foo` | — | `Foo.ui` | — |
-| `Foo.sml` + `Foo.sig` | `Foo` (interface + implementation) | — | `Foo.ui`, `Foo.uo` | — |
+| `Foo.sml` + `Foo.sig` | `Foo` (companion pair) | — | `Foo.ui`, `Foo.uo` | — |
 
 All artifact paths are under `.holbuild/`, with `HOLFileSys` remap copies under nested `.hol/objs/`.
 
@@ -49,7 +50,7 @@ hash(
   dependency input keys (recursively),
   declared action policy (deps, loads, extra_deps, cache, always_reexecute),
   extra dependency hashes,
-  toolchain key (hol binary + hol.state0/bare bootstrap hashes)
+  toolchain key (hol binary + hol.state hashes)
 )
 ```
 

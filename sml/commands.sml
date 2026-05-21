@@ -458,7 +458,7 @@ fun hol_args_for_project tc project subcommand user_args =
     val context = HolbuildToolchain.write_run_context project
     val heap_args =
       case HolbuildProject.abs_run_heap project of
-          NONE => ["--bare"]
+          NONE => ["--holstate", HolbuildToolchain.base_state tc]
         | SOME heap => ["--holstate", heap]
   in
     HolbuildToolchain.hol_subcommand_argv tc subcommand @ heap_args @ [context] @ user_args

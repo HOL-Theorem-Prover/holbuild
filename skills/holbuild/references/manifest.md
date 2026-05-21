@@ -55,17 +55,15 @@ Tables validated: `[holbuild]`, `[project]`, `[build]`, `[run]`, `[dependencies.
 
 ## Dependency resolution
 
-Each ordinary dependency must resolve to a manifest:
-1. If `manifest` field is set, that file is used — dependency's own `holproject.toml` is **never consulted**. This remains true when `.holconfig.toml` overrides the dependency root path.
-2. Otherwise, tries `holproject.toml` in the dependency's directory
-3. If neither exists, build fails with a "no manifest" error
-
-HOL itself is implicit: every project has an implicit HOL source package selected
-by `--holdir`, `HOLBUILD_HOLDIR`, or `HOLDIR`. That package exposes `src` and
-`examples` for dependency resolution, uses no default roots, excludes selftests
-and developer throwaway examples, and treats `hol.state0`/`--bare` as the
-bootstrap boundary. Do not declare HOL with `[dependencies.HOLDIR]` or
-`[dependencies.HOL]`.
+Each dependency must resolve to a manifest:
+1. Reserved `[dependencies.HOLDIR]` with no `manifest` uses holbuild's built-in
+   root-HOL manifest; the package root defaults to
+   `--holdir`/`HOLBUILD_HOLDIR`/`HOLDIR` unless `path`/override is set. This
+   built-in manifest excludes HOL examples/tests; model example subtrees such as
+   `$HOLDIR/examples/Crypto/Keccak` as separate dependencies with shim manifests.
+2. If `manifest` field is set, that file is used — dependency's own `holproject.toml` is **never consulted**. This remains true when `.holconfig.toml` overrides the dependency root path.
+3. Otherwise, tries `holproject.toml` in the dependency's directory
+4. If neither exists, build fails with a "no manifest" error
 
 Dependency `name` in `[dependencies.X]` must match the `project.name` in the resolved manifest. Mismatch is an error.
 
@@ -91,7 +89,7 @@ Recognized source files:
 - `*.sml` → SML module, logical name = filename minus `.sml`
 - `*.sig` → signature, logical name = filename minus `.sig`
 
-A `.sig`/`.sml` pair with the same base name in the same package is one SML module interface/implementation pair, not a cross-package conflict.
+A `.sig`/`.sml` pair with the same base name in the same package is a companion pair (one module), not a conflict.
 
 ## HOLSource headers
 
@@ -102,7 +100,7 @@ Theory Foo
 Ancestors Bar
 ```
 
-These are interpreted by HOL's `Holdep.main`; holbuild uses Holdep's resolved dependency files as the dependency graph rather than independently scanning `load`/`open` tokens. `Ancestors` declares direct theory predecessors; `Theory` declares the theory name (redundant with `new_theory` but used by Holdep).
+These are picked up by the Holdep scanner alongside `load`/`open` for dependency inference. `Ancestors` declares direct theory predecessors; `Theory` declares the theory name (redundant with `new_theory` but used by Holdep).
 
 ## `[[generate]]` source generation
 
@@ -119,7 +117,7 @@ Rules:
 
 ## Duplicate logical names
 
-One logical name → one resolved artifact across the entire build graph. Two packages exporting `FooTheory` or `Foo` module is an error. A same-package `.sig`/`.sml` pair is one SML module interface/implementation pair and is not treated as a cross-package conflict.
+One logical name → one resolved artifact across the entire build graph. Two packages exporting `FooTheory` or `Foo` module is an error. The only exception: same-package `.sig`/`.sml` companion pair.
 
 ## Action policies
 

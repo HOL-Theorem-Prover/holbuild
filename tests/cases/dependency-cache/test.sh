@@ -35,14 +35,14 @@ val _ = export_theory();
 SML
 
 (cd "$project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build --dry-run ATheory) > "$tmpdir/first.log"
+require_grep "external theories: .*arithmeticTheory" "$tmpdir/first.log"
 cache_file="$project/.holbuild/obj/src/AScript.uo.deps"
 require_file "$cache_file"
-require_grep "resolved_file=.*arithmeticTheory.uo" "$cache_file"
-require_grep "include=" "$cache_file"
+require_grep "mention=arithmeticTheory" "$cache_file"
 
 cat > "$project/src/AScript.sml" <<'SML'
 Theory A
-Ancestors arithmetic list
+Ancestors arithmetic string
 
 Theorem a:
   1 + 1 = 2
@@ -54,9 +54,11 @@ val _ = export_theory();
 SML
 
 (cd "$project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build --dry-run ATheory) > "$tmpdir/second.log"
-require_grep "resolved_file=.*listTheory.uo" "$cache_file"
+require_grep "external theories: .*arithmeticTheory" "$tmpdir/second.log"
+require_grep "external theories: .*stringTheory" "$tmpdir/second.log"
+require_grep "mention=stringTheory" "$cache_file"
 
 printf 'not a valid dependency cache\n' > "$cache_file"
 (cd "$project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build --dry-run ATheory) > "$tmpdir/corrupt.log"
-require_grep "holbuild-dependencies-cache-v4" "$cache_file"
-require_grep "resolved_file=.*listTheory.uo" "$cache_file"
+require_grep "external theories: .*stringTheory" "$tmpdir/corrupt.log"
+require_grep "holbuild-dependencies-cache-v2" "$cache_file"

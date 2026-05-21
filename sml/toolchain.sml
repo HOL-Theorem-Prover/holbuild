@@ -14,7 +14,6 @@ fun executable {holdir, ...} parts =
 fun hol tc = executable tc ["bin", "hol"]
 fun holmake tc = executable tc ["bin", "Holmake"]
 fun base_state tc = executable tc ["bin", "hol.state"]
-fun base_state0 tc = executable tc ["bin", "hol.state0"]
 
 fun poly_runtime_args ({maxheap, ...} : t) =
   case maxheap of
@@ -253,7 +252,7 @@ fun toolchain_key tc =
     (String.concatWith "\n"
        ["holbuild-toolchain-v1",
         "hol=" ^ file_hash (hol tc),
-        "base_state0=" ^ file_hash (base_state0 tc)] ^ "\n")
+        "base_state=" ^ file_hash (base_state tc)] ^ "\n")
 
 fun sml_string s =
   "\"" ^ String.translate
