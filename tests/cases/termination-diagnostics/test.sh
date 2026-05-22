@@ -61,6 +61,10 @@ cat > "$success_project/src/AScript.sml" <<'SML'
 open HolKernel Parse boolLib bossLib;
 val _ = new_theory "A";
 
+Definition simple_def:
+  simple = 1
+End
+
 Definition test_def:
   test n = if n = 0 then 0 else test (n - 1)
 Termination
@@ -76,3 +80,50 @@ require_grep "ATheory built" "$success_log"
 require_file "$success_project/.holbuild/obj/src/AScript.uo"
 require_file "$success_project/.holbuild/obj/src/ATheory.uo"
 require_file "$success_project/.holbuild/obj/src/ATheory.dat"
+if ! find "$success_project/.holbuild/checkpoints" -path '*.decls/*/proof_ir_v3/*/simple_def_context.save' -print -quit | grep -q .; then
+  echo "missing definition-context checkpoint for successful non-termination definition" >&2
+  exit 1
+fi
+if ! find "$success_project/.holbuild/checkpoints" -path '*.decls/*/proof_ir_v3/*/test_def_context.save' -print -quit | grep -q .; then
+  echo "missing definition-context checkpoint for successful termination definition" >&2
+  exit 1
+fi
+
+resume_project=$tmpdir/resume-project
+mkdir -p "$resume_project/src"
+cp "$project/holproject.toml" "$resume_project/holproject.toml"
+cat > "$resume_project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+
+Definition first_def:
+  first n = if n = 0 then 0 else first (n - 1)
+Termination
+  WF_REL_TAC `measure I` >> simp[]
+End
+
+Definition second_def:
+  second n = if n = 0 then 0 else second (n - 1)
+Termination
+  FAIL_TAC "expected second termination failure"
+End
+
+val _ = export_theory();
+SML
+
+resume_first_log=$tmpdir/resume-first.log
+if (cd "$resume_project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build ATheory) > "$resume_first_log" 2>&1; then
+  echo "expected second termination proof failure" >&2
+  exit 1
+fi
+require_grep "termination: second_def (line " "$resume_first_log"
+require_grep "expected second termination failure" "$resume_first_log"
+require_file "$(find "$resume_project/.holbuild/checkpoints" -path '*.decls/*/proof_ir_v3/*/first_def_context.save' -print -quit)"
+
+resume_second_log=$tmpdir/resume-second.log
+if (cd "$resume_project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build ATheory) > "$resume_second_log" 2>&1; then
+  echo "expected repeated second termination proof failure" >&2
+  exit 1
+fi
+require_grep "from: definition-context checkpoint after first_def" "$resume_second_log"
+require_grep "termination: second_def (line " "$resume_second_log"

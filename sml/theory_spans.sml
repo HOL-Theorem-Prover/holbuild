@@ -73,6 +73,23 @@ fun slice text start stop =
     raise HolbuildTheoryCheckpoints.Error "AST termination report span is outside source text"
   else String.substring(text, start, stop - start)
 
+fun declaration_boundaries source result =
+  let
+    fun declaration {definition_, name, stop} =
+      {name = name,
+       safe_name = HolbuildTheoryCheckpoints.safe_name name,
+       definition_start = definition_,
+       boundary = HolbuildTheoryCheckpoints.statement_boundary source stop}
+    fun loop acc =
+      case #parseDec result () of
+          NONE => rev acc
+        | SOME (HOLSourceAST.HOLDefinition {definition_, id = (_, name), stop, ...}) =>
+            loop (declaration {definition_ = definition_, name = name, stop = stop} :: acc)
+        | SOME _ => loop acc
+  in
+    loop []
+  end
+
 fun termination_diagnostics source result =
   let
     fun quote_start (SOME colon) _ _ = colon + 1
@@ -147,6 +164,20 @@ fun scan source_path source_text =
 
 fun scan_strict source_path source_text =
   scan_with_error_handler source_path source_text (raise_parse_error source_path source_text)
+
+fun scan_declarations_with_error_handler source_path source_text parse_error =
+  let
+    val result = HOLSourceParser.parseSML source_path (parser_reader source_text)
+                   parse_error HOLSourceParser.initialScope
+  in
+    declaration_boundaries source_text result
+  end
+
+fun scan_declarations source_path source_text =
+  scan_declarations_with_error_handler source_path source_text ignore_parse_error
+
+fun scan_declarations_strict source_path source_text =
+  scan_declarations_with_error_handler source_path source_text (raise_parse_error source_path source_text)
 
 fun scan_terminations_with_error_handler source_path source_text parse_error =
   let

@@ -21,6 +21,14 @@ type termination = {name : string, safe_name : string, definition_start : int,
                     quote_start : int, quote_end : int, quote_text : string,
                     tactic_start : int, tactic_end : int, tactic_text : string}
 
+type declaration = {name : string, safe_name : string, definition_start : int, boundary : int}
+
+type declaration_checkpoint = {name : string, safe_name : string,
+                               definition_start : int, boundary : int,
+                               prefix_hash : string,
+                               context_path : string, context_ok : string,
+                               deps_key : string, checkpoint_key : string}
+
 fun is_ident c = Char.isAlphaNum c orelse c = #"_" orelse c = #"'"
 
 fun starts_with text i needle =
@@ -132,6 +140,14 @@ fun begin_termination_line ({name, definition_start, quote_text, ...} : terminat
      HolbuildToolchain.sml_string quote_text,
      ";\n"]
 
+fun save_declaration_context_line ({safe_name, context_path, context_ok, ...} : declaration_checkpoint) =
+  String.concat
+    ["\nval _ = HolbuildCheckpointSaveRuntime.save_checkpoint {label = ",
+     HolbuildToolchain.sml_string ("definition_context:" ^ safe_name),
+     ", default_share = false, path = ", HolbuildToolchain.sml_string context_path,
+     ", ok_text = ", HolbuildToolchain.sml_string context_ok,
+     ", depth = length (PolyML.SaveState.showHierarchy())};\n"]
+
 fun runtime_lines lines =
   String.concat (map (fn line => line ^ "\n") lines)
 
@@ -199,6 +215,10 @@ fun proof_ir_helper_path () =
 fun checkpoint_save_runtime_helper_path () =
   OS.Path.concat(HolbuildRuntimePaths.source_root, "sml/checkpoint_save_runtime.sml")
 
+fun declaration_checkpoint_runtime_prelude [] = ""
+  | declaration_checkpoint_runtime_prelude _ =
+      runtime_lines ["use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";"]
+
 fun runtime_install_lines {checkpoint_enabled, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} =
   if new_ir then
     ["use " ^ HolbuildToolchain.sml_string (proof_ir_helper_path ()) ^ ";",
@@ -262,10 +282,12 @@ fun runtime_reinstall_prelude {checkpoint_enabled, tactic_timeout, timeout_marke
 
 datatype instrument_event =
   CheckpointEvent of checkpoint
+| DeclarationCheckpointEvent of declaration_checkpoint
 | TerminationEvent of termination
 
-fun instrument ({source, start_offset, checkpoints, terminations, save_checkpoints, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} :
+fun instrument ({source, start_offset, checkpoints, declaration_checkpoints, terminations, save_checkpoints, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} :
                 {source : string, start_offset : int, checkpoints : checkpoint list,
+                 declaration_checkpoints : declaration_checkpoint list,
                  terminations : termination list, save_checkpoints : bool,
                  tactic_timeout : real option, timeout_marker : string option,
                  plan_theorem : string option, trace_all : bool,
@@ -274,10 +296,13 @@ fun instrument ({source, start_offset, checkpoints, terminations, save_checkpoin
     val n = size source
     fun source_slice i j = String.substring(source, i, j - i)
     fun active_checkpoint ({boundary, ...} : checkpoint) = boundary > start_offset
+    fun active_declaration_checkpoint ({boundary, ...} : declaration_checkpoint) = boundary > start_offset
     fun active_termination ({definition_start, ...} : termination) = definition_start >= start_offset
     val active_checkpoints = List.filter active_checkpoint checkpoints
+    val active_declaration_checkpoints = List.filter active_declaration_checkpoint declaration_checkpoints
     val active_terminations = List.filter active_termination terminations
     fun event_start (CheckpointEvent ({theorem_start, ...} : checkpoint)) = theorem_start
+      | event_start (DeclarationCheckpointEvent ({boundary, ...} : declaration_checkpoint)) = boundary
       | event_start (TerminationEvent ({definition_start, ...} : termination)) = definition_start
     fun insert_event event [] = [event]
       | insert_event event (current :: rest) =
@@ -285,7 +310,9 @@ fun instrument ({source, start_offset, checkpoints, terminations, save_checkpoin
           else current :: insert_event event rest
     fun sorted_events () =
       List.foldl (fn (event, events) => insert_event event events) []
-        (map CheckpointEvent active_checkpoints @ map TerminationEvent active_terminations)
+        (map CheckpointEvent active_checkpoints @
+         map DeclarationCheckpointEvent active_declaration_checkpoints @
+         map TerminationEvent active_terminations)
     fun runtime_config () =
       {checkpoint_enabled = save_checkpoints,
        tactic_timeout = tactic_timeout,
@@ -296,6 +323,7 @@ fun instrument ({source, start_offset, checkpoints, terminations, save_checkpoin
        new_ir = new_ir}
     fun prelude () =
       runtime_prelude (runtime_config ()) active_checkpoints ^
+      declaration_checkpoint_runtime_prelude (if null active_checkpoints then active_declaration_checkpoints else []) ^
       termination_runtime_prelude active_terminations
     fun loop pos events acc =
       case events of
@@ -309,6 +337,13 @@ fun instrument ({source, start_offset, checkpoints, terminations, save_checkpoin
                  source_slice theorem_start boundary ::
                  begin_theorem_line checkpoint ::
                  source_slice pos theorem_start ::
+                 acc)
+        | DeclarationCheckpointEvent (declaration_checkpoint as {boundary, ...}) :: rest =>
+            if boundary <= start_offset orelse boundary < pos then loop pos rest acc
+            else
+              loop boundary rest
+                (save_declaration_context_line declaration_checkpoint ::
+                 source_slice pos boundary ::
                  acc)
         | TerminationEvent (termination as {definition_start, ...}) :: rest =>
             if definition_start < pos then loop pos rest acc
