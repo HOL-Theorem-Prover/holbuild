@@ -80,8 +80,8 @@ require_grep "ATheory built" "$success_log"
 require_file "$success_project/.holbuild/obj/src/AScript.uo"
 require_file "$success_project/.holbuild/obj/src/ATheory.uo"
 require_file "$success_project/.holbuild/obj/src/ATheory.dat"
-if ! find "$success_project/.holbuild/checkpoints" -path '*.decls/*/proof_ir_v3/*/simple_def_context.save' -print -quit | grep -q .; then
-  echo "missing definition-context checkpoint for successful non-termination definition" >&2
+if find "$success_project/.holbuild/checkpoints" -path '*.decls/*/proof_ir_v3/*/simple_def_context.save' -print -quit | grep -q .; then
+  echo "unexpected definition-context checkpoint for non-termination definition" >&2
   exit 1
 fi
 if ! find "$success_project/.holbuild/checkpoints" -path '*.decls/*/proof_ir_v3/*/test_def_context.save' -print -quit | grep -q .; then

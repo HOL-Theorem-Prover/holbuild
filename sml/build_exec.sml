@@ -1567,10 +1567,6 @@ fun discover_theorem_boundaries_strict source_path source_text =
   HolbuildTheorySpans.scan_strict source_path source_text
   handle HolbuildTheoryCheckpoints.Error msg => raise Error msg
 
-fun discover_declarations_strict source_path source_text =
-  HolbuildTheorySpans.scan_declarations_strict source_path source_text
-  handle HolbuildTheoryCheckpoints.Error msg => raise Error msg
-
 fun discover_termination_diagnostics_strict source_path source_text =
   HolbuildTheorySpans.scan_terminations_strict source_path source_text
   handle HolbuildTheoryCheckpoints.Error msg => raise Error msg
@@ -1652,8 +1648,8 @@ fun theorem_checkpoint_specs proof_engine project node deps_key source boundarie
           end)
       boundaries
 
-fun declaration_checkpoint_specs proof_engine project node deps_key source declarations =
-  map (fn ({name, safe_name, definition_start, boundary} : HolbuildTheoryCheckpoints.declaration) =>
+fun declaration_checkpoint_specs proof_engine project node deps_key source terminations =
+  map (fn ({name, safe_name, definition_start, boundary, ...} : HolbuildTheoryCheckpoints.termination) =>
           let
             val prefix_hash = HolbuildTheoryCheckpoints.prefix_hash source boundary
             val checkpoint_key = declaration_checkpoint_key {name = name, safe_name = safe_name,
@@ -1669,7 +1665,7 @@ fun declaration_checkpoint_specs proof_engine project node deps_key source decla
              deps_key = deps_key,
              checkpoint_key = checkpoint_key}
           end)
-      declarations
+      terminations
 
 fun dependency_context_key toolchain_key plan keys node =
   let
@@ -2565,14 +2561,6 @@ fun theory_checkpoints_for_node policy project plan keys toolchain_key node sour
              "; building without goalfrag/checkpoints for this theory\n" ^ msg);
        [])
 
-fun declarations_for_node policy node source_text =
-  if not (checkpoint_enabled policy) orelse not (goalfrag_enabled policy) then []
-  else discover_declarations_strict (source_file node) source_text
-    handle Error msg =>
-      (warn ("could not safely discover definitions for " ^ logical_name node ^
-             "; building without definition checkpoints for this theory\n" ^ msg);
-       [])
-
 fun termination_diagnostics_for_node policy node source_text =
   if not (goalfrag_enabled policy) then []
   else discover_termination_diagnostics_strict (source_file node) source_text
@@ -2581,14 +2569,14 @@ fun termination_diagnostics_for_node policy node source_text =
              "; building without termination goal diagnostics for this theory\n" ^ msg);
        [])
 
-fun declaration_checkpoints_for_node policy project plan keys toolchain_key node source_text declarations =
+fun declaration_checkpoints_for_node policy project plan keys toolchain_key node source_text terminations =
   if not (checkpoint_enabled policy) orelse not (goalfrag_enabled policy) then []
   else
     let val deps_key = dependency_context_key toolchain_key plan keys node
-    in declaration_checkpoint_specs (proof_engine policy) project node deps_key source_text declarations end
+    in declaration_checkpoint_specs (proof_engine policy) project node deps_key source_text terminations end
     handle Error msg =>
-      (warn ("could not safely create definition checkpoints for " ^ logical_name node ^
-             "; building without definition checkpoints for this theory\n" ^ msg);
+      (warn ("could not safely create termination-definition checkpoints for " ^ logical_name node ^
+             "; building without termination-definition checkpoints for this theory\n" ^ msg);
        [])
 
 fun build_theory_node (options : build_options) tc project base_context plan keys toolchain_key node input_key =
@@ -2627,10 +2615,9 @@ fun build_theory_node (options : build_options) tc project base_context plan key
               NONE => []
             | SOME {boundaries, errors} =>
                 theory_checkpoints_for_node policy project plan keys toolchain_key node source_text boundaries errors
-        val declarations = declarations_for_node policy node source_text
         val termination_diagnostics = termination_diagnostics_for_node policy node source_text
         val declaration_checkpoints =
-          declaration_checkpoints_for_node policy project plan keys toolchain_key node source_text declarations
+          declaration_checkpoints_for_node policy project plan keys toolchain_key node source_text termination_diagnostics
       in
         let
           fun build_after_checkpoint_retries retries_left =

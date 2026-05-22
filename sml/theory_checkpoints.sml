@@ -21,8 +21,6 @@ type termination = {name : string, safe_name : string, definition_start : int,
                     quote_start : int, quote_end : int, quote_text : string,
                     tactic_start : int, tactic_end : int, tactic_text : string}
 
-type declaration = {name : string, safe_name : string, definition_start : int, boundary : int}
-
 type declaration_checkpoint = {name : string, safe_name : string,
                                definition_start : int, boundary : int,
                                prefix_hash : string,
