@@ -237,10 +237,11 @@ exclude = ["worktrees/*"]
 The override changes only where the package is found locally. The package still
 needs its own `holproject.toml` or an explicit shim manifest from the consumer.
 HOL itself is implicit: the selected HOL checkout is chosen by `--holdir`,
-`HOLBUILD_HOLDIR`, or `HOLDIR`, with `src` and `examples` available for dependency
-resolution and `hol.state0`/`--bare` as the bootstrap boundary. The implicit HOL
-package excludes selftests and developer throwaway examples so they do not clutter
-the logical target namespace. Ordinary projects should not declare HOL as a
+`HOLBUILD_HOLDIR`, or `HOLDIR`, with a source package drawn from `src` and
+`examples` and `hol.state0`/`--bare` as the bootstrap boundary. The default HOL
+package selects the stdknl/no-tracing/PolyML source view and excludes selftests,
+developer throwaway directories, and duplicate example families that should be
+separate packages if needed later. Ordinary projects should not declare HOL as a
 manifest dependency (`[dependencies.HOLDIR]` or `[dependencies.HOL]`) or provide
 shims for HOL example subtrees.
 

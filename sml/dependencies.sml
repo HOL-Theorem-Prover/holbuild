@@ -41,14 +41,6 @@ fun insert_sorted item items =
 
 fun sort_unique items = List.foldl (fn (item, acc) => insert_sorted item acc) [] items
 
-fun normalize_path path = Path.mkCanonical path handle Path.InvalidArc => path
-
-fun absolute_path path = Path.isAbsolute path handle Path.InvalidArc => false
-
-fun normalize_dep_path source_path dep =
-  normalize_path
-    (if absolute_path dep then dep else Path.concat(Path.dir source_path, dep))
-
 fun holdep_mentions path =
   let
     val reader = HOLSource.fileToReader {quietOpen = false, print = fn _ => ()} path
@@ -131,8 +123,6 @@ fun tokenize text =
   in
     loop 0 []
   end
-
-fun theory_name s = has_suffix "Theory" s andalso size s > size "Theory"
 
 fun extract_string_args keyword tokens =
   let

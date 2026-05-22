@@ -141,9 +141,10 @@ The same token pass found non-script examples and libraries with literal/dynamic
 effects. A root-HOL manifest should classify such tooling/examples/tests
 explicitly instead of treating them as pure cacheable theory-script actions.
 
-The implicit HOL package should initially be as simple as possible. It should
-make all of `src` and `examples` visible and add excludes only in response to
-concrete discovery/planning problems:
+The implicit HOL package is treated as an ordinary holbuild package with a
+package-wide logical namespace. It uses the selected checkout's standard Poly/ML,
+stdknl, no-tracing source view and excludes duplicate/developer/example variant
+families that should eventually become separate packages when needed:
 
 ```toml
 [project]
@@ -153,6 +154,7 @@ version = "implicit"
 [build]
 members = ["src", "examples"]
 # no roots: the package is available for dependency resolution, not built by default
+# default excludes select stdknl/no-tracing/poly and remove duplicate example families
 ```
 
 Attempting to source-build core theories against `$HOLDIR/bin/hol.state` is
@@ -331,9 +333,11 @@ project/.holbuild/
 Path-sensitive files are generated or rebased for this local layout. Older HOL
 `Theory.sml` files may contain paths and are rebased when installed; newer HOL
 `Theory.sml` files locate their adjacent `.dat` file and are copied unchanged.
-Project SML/SIG modules are built from Holdep-resolved predecessor files mapped
-back into the source graph. Holbuild does not infer extra module dependencies
-from `open` tokens, qualified references, or guessed signature companions.
+Project SML/SIG modules are built from logical predecessor names reported by
+`Holdep_tokens.reader_deps` and resolved in the package index. Holbuild does not
+use Holmake include paths, prebuilt object directories, `open` tokens, qualified
+references, or cross-package guessed signature companions as graph semantics.
+Same-package `.sig`/`.sml` pairs are one module interface/implementation pair.
 Generated theory modules also get internal load manifests from HOL's recorded
 theory metadata (`Theory.current_ML_deps` / `Theory.add_ML_dependency`), so
 legitimate generated dependencies are preserved without parsing generated SML
@@ -346,8 +350,8 @@ outputs are visible source-tree files (commonly under `gen/`), may be overwritte
 and are scanned/hashed as ordinary sources after generation. Generator keys decide
 whether to rerun the generator; theory/action keys still use the actual generated
 source bytes. `.sml` files get a `.uo` plus a `.ui` load artifact as required by HOL's loader;
-any dependency between an implementation and a signature is whatever Holdep
-reports, not a holbuild guess. HOL's current
+same-package implementations depend on their matching signatures when present.
+HOL's current
 `HOLFileSys` remaps `.uo`/`.ui` and files ending in
 `Theory.dat`/`.sml`/`.sig` through `.hol/objs`, so a project-level layout may
 need auxiliary internal load paths or rewritten non-semantic load copies while

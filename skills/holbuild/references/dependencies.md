@@ -41,12 +41,14 @@ name = "HOL"
 [build]
 members = ["src", "examples"]
 # no roots
-# default excludes: selftests and developer throwaway examples
+# default excludes: selftests, developer throwaway directories,
+# unselected stdknl/tracing/PolyML variants, and duplicate example families
 ```
 
-The implicit package excludes selftests and developer throwaway examples by
-default, since those files are not intended downstream dependencies and otherwise
-clutter the logical namespace.
+The implicit package defaults to the stdknl/no-tracing/PolyML source view and
+excludes selftests, developer throwaway directories, and duplicate example
+families by default. Those excluded examples can later be modeled as separate
+packages with their own namespaces when downstream projects need them.
 
 The bootstrap boundary is `hol.state0`, used through `hol --bare`. The bare heap
 provides the primitive theory base (`minTheory`, `boolTheory`) and the SML modules
