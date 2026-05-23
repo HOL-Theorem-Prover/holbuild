@@ -378,15 +378,17 @@ fun holmake_rule_info holmakefile =
     val old = FS.getDir ()
     fun restore () = FS.chDir old handle OS.SysErr _ => ()
     fun die msg = raise Error msg
-    val _ = FS.chDir dir
-    val result =
-      (SOME (ReadHMF.diagread {warn = fn _ => (), info = fn _ => (), die = die}
-                            holmakefile (Holmake_types.base_environment ()))
-       handle _ => NONE)
+    fun parse () =
+      ReadHMF.diagread {warn = fn _ => (), info = fn _ => (), die = die}
+                       holmakefile (Holmake_types.base_environment ())
   in
-    restore (); result
+    (FS.chDir dir;
+     parse () before restore ())
+    handle e =>
+      (restore ();
+       raise Error ("could not read HOL Holmakefile dependency metadata from " ^
+                    holmakefile ^ ": " ^ General.exnMessage e))
   end
-  handle e => (raise e)
 
 fun holmake_deps_for_source sources source =
   let
@@ -394,22 +396,22 @@ fun holmake_deps_for_source sources source =
   in
     if not (is_implicit_hol_package (#package source)) orelse not (is_readable hmf) then []
     else
-      case holmake_rule_info hmf of
-          NONE => []
-        | SOME (env, ruledb, _) =>
-            (case Holmake_types.get_rule_info ruledb env (source_target_name source) of
-                 NONE => []
-               | SOME {dependencies, ...} =>
-                   sort_by String.compare
-                     (List.mapPartial
-                        (fn dep =>
-                            case dep_logical dep of
-                                NONE => NONE
-                              | SOME logical =>
-                                  if logical = #logical_name source then NONE
-                                  else if source_logical_in_package (#package source) sources logical then SOME logical
-                                  else NONE)
-                        dependencies))
+      let val (env, ruledb, _) = holmake_rule_info hmf
+      in
+        case Holmake_types.get_rule_info ruledb env (source_target_name source) of
+            NONE => []
+          | SOME {dependencies, ...} =>
+              sort_by String.compare
+                (List.mapPartial
+                   (fn dep =>
+                       case dep_logical dep of
+                           NONE => NONE
+                         | SOME logical =>
+                             if logical = #logical_name source then NONE
+                             else if source_logical_in_package (#package source) sources logical then SOME logical
+                             else NONE)
+                   dependencies)
+      end
   end
 
 fun add_holmake_deps sources =

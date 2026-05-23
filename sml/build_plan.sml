@@ -255,31 +255,35 @@ fun phase_lookup ({name_index, ...} : phase) = indexed_nodes_named name_index
 fun direct_phase_deps phase node =
   direct_project_deps_with (phase_lookup phase) (phase_nodes phase) node
 
-fun direct_unresolved_declared_deps_with lookup node =
+fun direct_unresolved_dependency_names_with lookup node =
   let
     fun known name = provided_for node name orelse not (null (lookup name))
+    val source = source_of node
+    val source_mentions =
+      if is_implicit_hol_source source then [] else #holdep_mentions (deps_of node)
+    val names = standard_env_dependency_names node @ declared_dependency_names node @
+                declared_load_names node @ #holmake_deps source @ source_mentions
   in
-    List.filter (fn name => not (known name))
-      (declared_dependency_names node @ declared_load_names node)
+    List.filter (fn name => not (known name)) names
   end
 
-fun direct_unresolved_declared_deps plan node =
-  direct_unresolved_declared_deps_with (lookup plan) node
+fun direct_unresolved_dependency_names plan node =
+  direct_unresolved_dependency_names_with (lookup plan) node
 
-fun reject_unresolved_declared_deps_with lookup plan =
+fun reject_unresolved_dependencies_with lookup plan =
   let
-    fun check_declared_deps node =
-      case direct_unresolved_declared_deps_with lookup node of
+    fun check_deps node =
+      case direct_unresolved_dependency_names_with lookup node of
           [] => ()
         | dep :: _ =>
-            raise Error ("unresolved action dependency " ^ dep ^ " in " ^
+            raise Error ("unresolved dependency " ^ dep ^ " in " ^
                          package node ^ ":" ^ relative_path node)
   in
-    List.app check_declared_deps plan
+    List.app check_deps plan
   end
 
-fun reject_unresolved_declared_deps plan phase_nodes =
-  reject_unresolved_declared_deps_with (lookup plan) phase_nodes
+fun reject_unresolved_dependencies plan phase_nodes =
+  reject_unresolved_dependencies_with (lookup plan) phase_nodes
 
 fun reject_source_uses plan =
   let
@@ -323,7 +327,7 @@ fun topo_sort_with lookup nodes roots =
     val order = List.foldl (fn (root, acc) => visit [] root acc) [] roots
     val plan = rev order
   in
-    reject_unresolved_declared_deps_with lookup plan;
+    reject_unresolved_dependencies_with lookup plan;
     reject_source_uses plan;
     plan
   end

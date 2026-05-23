@@ -13,7 +13,7 @@ holbuild infers source dependencies from the resolved project graph:
 3. **Action `deps`** — explicit logical dependencies declared in `[actions.*]`
 4. **Action `loads`** — explicit loadable module stems declared in `[actions.*]`
 
-Unresolved action `loads` or `deps` entries → build error.
+Unresolved ordinary-package Holdep mentions, action `loads`, or action `deps` entries → build error. The implicit `HOL` package may still ignore unresolved HOL-internal object/tool prerequisites rather than satisfying them from prebuilt object directories.
 
 ## Source `use "file"` is rejected
 

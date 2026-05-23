@@ -145,7 +145,27 @@ missing_dep_project="$tmpdir/missing_declared_dep"
 make_theory_project "$missing_dep_project" '[actions.ATheory]
 deps = ["Missing"]'
 if (cd "$missing_dep_project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build ATheory) > "$tmpdir/missing-dep.log" 2>&1; then
-  echo "unresolved action dependency was accepted" >&2
+  echo "unresolved dependency was accepted" >&2
   exit 1
 fi
-require_grep "unresolved action dependency Missing" "$tmpdir/missing-dep.log"
+require_grep "unresolved dependency Missing" "$tmpdir/missing-dep.log"
+
+missing_holdep_project="$tmpdir/missing_holdep_dep"
+mkdir -p "$missing_holdep_project/src"
+cat > "$missing_holdep_project/holproject.toml" <<'TOML'
+[project]
+name = "missing-holdep"
+
+[build]
+members = ["src"]
+TOML
+cat > "$missing_holdep_project/src/Bad.sml" <<'SML'
+(* [bare] *)
+open Missing;
+structure Bad = struct end
+SML
+if (cd "$missing_holdep_project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build --dry-run Bad) > "$tmpdir/missing-holdep.log" 2>&1; then
+  echo "unresolved Holdep dependency was accepted" >&2
+  exit 1
+fi
+require_grep "unresolved dependency Missing" "$tmpdir/missing-holdep.log"

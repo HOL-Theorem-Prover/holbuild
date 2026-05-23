@@ -244,9 +244,10 @@ impure = true
 
 For ordinary packages, source dependencies are inferred with HOL's existing
 `HOLSource.fileToReader` plus `Holdep_tokens.reader_deps` and resolved through
-holbuild's package-wide logical-name index. Holbuild must not use Holmake
-`INCLUDES`, `$HOLDIR/sigobj`, prebuilt object files, custom `open` scanning,
-custom `load` scanning, HOLSource header parsing, or cross-package guessed
+holbuild's package-wide logical-name index. Mentioned names must resolve to the
+bare bootstrap environment or a source in the manifest graph. Holbuild must not
+use Holmake `INCLUDES`, `$HOLDIR/sigobj`, prebuilt object files, custom `open`
+scanning, custom `load` scanning, HOLSource header parsing, or cross-package guessed
 `.sig` companions as graph semantics. The implicit `HOL` package has one extra
 source-metadata input: explicit local Holmakefile `.uo`/`.ui` rule prerequisites
 are read with HOL's Holmakefile parser and resolved back to source nodes in the
@@ -574,9 +575,9 @@ syntactic checkpoint:    if the action changed, where can replay resume?
 A retained/debug checkpoint is replay-eligible only under the same resolved
 dependency context, toolchain/base context, and checkpoint schema. Raw `.save`
 bytes are diagnostic only and must not be used as stable semantic keys. The
-default build does not retain successful checkpoints or materialize checkpoints
-from the global cache; cache restore recreates only logical theory artifacts and
-internal load manifests.
+default build retains successful local checkpoints for incremental proof replay,
+while global cache restore recreates only logical theory artifacts and internal
+load manifests. Retention and size bounds are enforced by `holbuild gc`.
 
 Proof-edit incrementality should not key failed-prefix checkpoints by the full
 proof body hash. That would invalidate exactly the state a proof author needs

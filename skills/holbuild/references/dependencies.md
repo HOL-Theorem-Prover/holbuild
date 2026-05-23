@@ -32,9 +32,10 @@ Holdep_tokens.reader_deps
 ```
 
 The returned logical mentions are resolved through holbuild's package index.
-Holbuild does not use Holmake `INCLUDES`, `$HOLDIR/sigobj`, prebuilt objects, or
-holbuild-owned parsing of SML/HOL imports as ordinary source graph semantics. In
-particular, holbuild does not scan `load`, `open`, script headers, or qualified
+Mentioned names must resolve to the bare bootstrap environment or a source in
+that index. Holbuild does not use Holmake `INCLUDES`, `$HOLDIR/sigobj`, prebuilt
+objects, or holbuild-owned parsing of SML/HOL imports as ordinary source graph
+semantics. In particular, holbuild does not scan `load`, `open`, script headers, or qualified
 references itself.
 
 The implicit `HOL` package has one additional source-metadata input: explicit

@@ -300,9 +300,10 @@ always_reexecute = true
 
 For ordinary packages, `holbuild` uses HOL's `HOLSource.fileToReader` plus
 `Holdep_tokens.reader_deps` to find source-level logical dependencies, then
-resolves those names through the holbuild package index. It does not use Holmake
-`INCLUDES`, `$HOLDIR/sigobj`, prebuilt object files, or holbuild-owned parsing of
-SML/HOL syntax for ordinary source graph semantics. For the implicit `HOL`
+resolves those names through the holbuild package index. Mentioned names must
+resolve to the bare bootstrap environment or a source in the manifest graph. It
+does not use Holmake `INCLUDES`, `$HOLDIR/sigobj`, prebuilt object files, or
+holbuild-owned parsing of SML/HOL syntax for ordinary source graph semantics. For the implicit `HOL`
 package only, holbuild also reads explicit local Holmakefile `.uo`/`.ui` rule
 prerequisites and resolves them through the same HOL package index; unresolved
 object prerequisites are ignored rather than satisfied from `sigobj` or prebuilt
