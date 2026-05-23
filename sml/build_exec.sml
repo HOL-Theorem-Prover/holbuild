@@ -301,7 +301,7 @@ fun project_artifact_root project = HolbuildProject.artifact_root project
 fun source_artifact_root node = #artifact_root (HolbuildBuildPlan.source_of node)
 
 fun state_artifact_root project node =
-  if HolbuildBuildPlan.package node = "HOL" then source_artifact_root node
+  if HolbuildBuildPlan.is_implicit_hol_node node then source_artifact_root node
   else project_artifact_root project
 
 fun stage_dir_for_node project node input_key =
@@ -386,7 +386,7 @@ fun object_state_base node =
     | [] => raise Error ("node has no object artifact for checkpoint state: " ^ logical_name node)
 
 fun checkpoint_base (project : HolbuildProject.t) node =
-  if HolbuildBuildPlan.package node = "HOL" then object_state_base node ^ ".checkpoints"
+  if HolbuildBuildPlan.is_implicit_hol_node node then object_state_base node ^ ".checkpoints"
   else
     Path.concat(Path.concat(Path.concat(project_artifact_root project, ".holbuild/checkpoints"),
                             HolbuildBuildPlan.package node),
@@ -894,10 +894,9 @@ fun standard_env_exists path key =
 
 fun find_unique_logical plan name =
   let
-    fun named node = HolbuildBuildPlan.logical_name node = name
     fun loadable node = #kind (HolbuildBuildPlan.source_of node) <> HolbuildSourceIndex.Sig
   in
-    case List.filter loadable (List.filter named (HolbuildBuildPlan.nodes plan)) of
+    case List.filter loadable (HolbuildBuildPlan.lookup plan name) of
         [node] => SOME node
       | [] => NONE
       | _ => raise Error ("multiple standard-env candidates for " ^ name)
@@ -1100,7 +1099,7 @@ fun cleanup_json_stage stage =
 fun cache_root () = HolbuildCache.cache_root ()
 
 fun cache_root_for_node node =
-  if HolbuildBuildPlan.package node = "HOL" then hol_cache_root () else cache_root ()
+  if HolbuildBuildPlan.is_implicit_hol_node node then hol_cache_root () else cache_root ()
 
 fun file_hash_matches path hash =
   file_exists path andalso file_hash path = hash
@@ -1412,7 +1411,7 @@ fun publish_theory_cache project plan node input_key staged_sig published_sml st
   end
 
 fun project_node_named plan name =
-  List.find (fn candidate => HolbuildBuildPlan.logical_name candidate = name) (HolbuildBuildPlan.nodes plan)
+  List.find (fn candidate => HolbuildBuildPlan.logical_name candidate = name) (HolbuildBuildPlan.selected_nodes plan)
 
 fun mldep_load_stem plan dep =
   case project_node_named plan dep of
@@ -1443,7 +1442,7 @@ fun holfs_unmapped_theory_artifact path =
 
 fun generated_holdep_mldeps plan tc path =
   let
-    fun planned name = List.exists (fn node => HolbuildBuildPlan.logical_name node = name) (HolbuildBuildPlan.nodes plan)
+    fun planned name = List.exists (fn node => HolbuildBuildPlan.logical_name node = name) (HolbuildBuildPlan.selected_nodes plan)
   in
     unique_strings (List.filter planned (HolbuildDependencies.holdep_mentions (holfs_unmapped_theory_artifact path)))
   end
@@ -1546,7 +1545,7 @@ fun metadata_path (project : HolbuildProject.t) node =
   let
     val source = HolbuildBuildPlan.source_of node
   in
-    if #package source = "HOL" then
+    if HolbuildBuildPlan.is_implicit_hol_source source then
       (case #objects (#artifacts source) of
            object :: _ => object ^ ".key"
          | [] => #source_path source ^ ".holbuild-key")
@@ -2254,7 +2253,7 @@ fun has_signature_companion plan node =
   List.exists
     (fn candidate => same_package_logical candidate node andalso
                      #kind (HolbuildBuildPlan.source_of candidate) = HolbuildSourceIndex.Sig)
-    (HolbuildBuildPlan.nodes plan)
+    (HolbuildBuildPlan.selected_nodes plan)
 
 fun write_empty_ui_if_needed plan node =
   if has_signature_companion plan node then ()
@@ -2618,10 +2617,10 @@ fun report_up_to_date_node status project keys node =
   end
 
 fun all_nodes_up_to_date options project plan keys toolchain_key =
-  List.all (node_is_up_to_date options project plan keys toolchain_key) (HolbuildBuildPlan.nodes plan)
+  List.all (node_is_up_to_date options project plan keys toolchain_key) (HolbuildBuildPlan.selected_nodes plan)
 
 fun report_all_up_to_date status project keys plan =
-  List.app (report_up_to_date_node status project keys) (HolbuildBuildPlan.nodes plan)
+  List.app (report_up_to_date_node status project keys) (HolbuildBuildPlan.selected_nodes plan)
 
 fun build_one status options tc project base_context plan keys toolchain_key node =
   let
@@ -2666,23 +2665,6 @@ fun build_serial status options tc project base_context universe phase_plan keys
     loop phase_plan
   end
 
-fun node_done done node = List.exists (fn k => k = HolbuildBuildPlan.key node) done
-
-fun deps_done plan done node =
-  List.all (node_done done) (HolbuildBuildPlan.direct_project_deps plan node)
-
-fun find_ready plan done pending =
-  let
-    fun loop prefix rest =
-      case rest of
-          [] => NONE
-        | node :: suffix =>
-            if deps_done plan done node then SOME (node, rev prefix @ suffix)
-            else loop (node :: prefix) suffix
-  in
-    loop [] pending
-  end
-
 fun build_error_message e =
   case e of
       Error msg => msg
@@ -2702,8 +2684,8 @@ fun build_parallel status options tc project base_context universe phase_plan ke
        duplicates the unchanged-prefix work before any parallel worker can run. *)
     val node_count = length phase_plan
     val nodes = Vector.fromList phase_plan
+    val phase = HolbuildBuildPlan.phase phase_plan
     val key_index = HolbuildBuildPlan.build_key_index phase_plan
-    val lookup = HolbuildBuildPlan.indexed_nodes_named (HolbuildBuildPlan.build_name_index phase_plan)
     val remaining_deps = Array.array (node_count, 0)
     val dependents = Array.array (node_count, [] : int list)
     val ready = ref ([] : int list)
@@ -2722,7 +2704,7 @@ fun build_parallel status options tc project base_context universe phase_plan ke
     fun add_ready id = ready := id :: !ready
 
     fun register_node (id, node) =
-      let val deps = HolbuildBuildPlan.direct_project_deps_with lookup phase_plan node
+      let val deps = HolbuildBuildPlan.direct_phase_deps phase node
       in
         Array.update (remaining_deps, id, length deps);
         if null deps then add_ready id else ();
@@ -2748,7 +2730,7 @@ fun build_parallel status options tc project base_context universe phase_plan ke
       else
         let
           val node = Vector.sub (nodes, id)
-          val deps = HolbuildBuildPlan.direct_project_deps_with lookup phase_plan node
+          val deps = HolbuildBuildPlan.direct_phase_deps phase node
           val _ = Array.update (priority_focus, id, true)
           val _ = priority_focus_remaining := !priority_focus_remaining + 1
         in
@@ -2982,7 +2964,7 @@ fun unique_nodes nodes =
   rev (List.foldl (fn (node, kept) => if node_member node kept then kept else node :: kept) [] nodes)
 
 fun find_logical_nodes plan name =
-  List.filter (fn node => HolbuildBuildPlan.logical_name node = name) (HolbuildBuildPlan.nodes plan)
+  List.filter (fn node => HolbuildBuildPlan.logical_name node = name) (HolbuildBuildPlan.selected_nodes plan)
 
 fun standard_env_root_nodes plan =
   find_logical_nodes plan "bossLib" @ find_logical_nodes plan "holTheory"
@@ -2995,7 +2977,7 @@ fun explicitly_bare_node node = #bare (HolbuildBuildPlan.source_of node)
 fun bare_phase_nodes plan =
   let
     val std_roots = standard_env_root_nodes plan
-    val bare_roots = List.filter explicitly_bare_node (HolbuildBuildPlan.nodes plan)
+    val bare_roots = List.filter explicitly_bare_node (HolbuildBuildPlan.selected_nodes plan)
   in
     closure_for_roots plan (std_roots @ bare_roots)
   end
@@ -3038,6 +3020,8 @@ fun closure_function plan =
 
 type auto_context_candidate = {root : HolbuildBuildPlan.node, contents : HolbuildBuildPlan.node list, users : int, size : int, score : int}
 
+(* Automatic contexts are chosen from the current execution phase, but their
+   contents are semantic dependency closures in the full indexed universe. *)
 fun auto_context_candidates universe phase_nodes =
   if length phase_nodes < 100 then []
   else
@@ -3097,7 +3081,7 @@ fun local_auto_context_path project key =
   Path.concat(Path.concat(Path.concat(project_artifact_root project, ".holbuild/checkpoints"), "_contexts"),
               key ^ ".save")
 
-fun hol_only_nodes nodes = List.all (fn node => HolbuildBuildPlan.package node = "HOL") nodes
+fun hol_only_nodes nodes = List.all HolbuildBuildPlan.is_implicit_hol_node nodes
 
 fun auto_context_path project key contents =
   if hol_only_nodes contents then global_checkpoint_path "contexts" key
@@ -3188,7 +3172,7 @@ fun describe_auto_contexts (options : build_options) plan =
   if (not (#auto_contexts options)) orelse #skip_checkpoints options orelse not (HolbuildStatus.verbose_mode ()) then ()
   else
     let
-      val contexts = selected_auto_contexts plan (HolbuildBuildPlan.nodes plan)
+      val contexts = selected_auto_contexts plan (HolbuildBuildPlan.selected_nodes plan)
       fun line (candidate : auto_context_candidate) =
         HolbuildStatus.message_stderr
           ("holbuild: automatic execution context candidate " ^ context_name (#root candidate) ^
@@ -3210,16 +3194,16 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
     val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project) toolchain_key plan
   in
     let
-      val status = HolbuildStatus.create {total = length (HolbuildBuildPlan.nodes plan), jobs = jobs}
+      val status = HolbuildStatus.create {total = length (HolbuildBuildPlan.selected_nodes plan), jobs = jobs}
       fun run () =
         let
           val bare = toolchain_base_context tc
           val bare_plan = bare_phase_nodes plan
-          val std_plan = without_nodes bare_plan (HolbuildBuildPlan.nodes plan)
+          val std_plan = without_nodes bare_plan (HolbuildBuildPlan.selected_nodes plan)
           val needs_std = List.exists needs_nonbare_standard_env std_plan
         in
           if null bare_plan then
-            build_with_auto_contexts status options tc project bare plan (HolbuildBuildPlan.nodes plan) keys toolchain_key jobs
+            build_with_auto_contexts status options tc project bare plan (HolbuildBuildPlan.selected_nodes plan) keys toolchain_key jobs
           else
             (build_with_auto_contexts status options tc project bare plan bare_plan keys toolchain_key jobs;
              if #skip_checkpoints options orelse not needs_std then
@@ -3245,7 +3229,7 @@ fun heap_theory_load_lines node =
 fun write_heap_loader plan output path =
   let
     val lines =
-      List.concat (map heap_theory_load_lines (HolbuildBuildPlan.nodes plan)) @
+      List.concat (map heap_theory_load_lines (HolbuildBuildPlan.selected_nodes plan)) @
       [checkpoint_save_runtime_line (),
        save_heap_line {label = "heap", share_common_data = false,
                        output = output, ok_text = checkpoint_ok_v1 ()}]

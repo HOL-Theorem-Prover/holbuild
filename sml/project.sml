@@ -84,7 +84,9 @@ fun absolute_from_cwd path =
 
 fun set_source_dir path = source_dir_ref := SOME (absolute_from_cwd path)
 
-fun reserved_hol_dependency name = name = "HOLDIR" orelse name = "HOL"
+val implicit_hol_package_name = "HOL"
+
+fun reserved_hol_dependency name = name = "HOLDIR" orelse name = implicit_hol_package_name
 
 fun require_not_reserved_dependency (Dependency {name, ...}) =
   if reserved_hol_dependency name then
@@ -748,7 +750,7 @@ fun implicit_hol_package _ =
         | NONE => die "set --holdir, HOLBUILD_HOLDIR, or HOLDIR"
     val manifest = Path.concat(holdir, "holproject.toml")
   in
-    Package {name = "HOL", root = holdir, manifest = manifest,
+    Package {name = implicit_hol_package_name, root = holdir, manifest = manifest,
              members = implicit_hol_members, excludes = implicit_hol_excludes, roots = [],
              artifact_root = implicit_hol_artifact_root holdir,
              action_policies = implicit_hol_action_policies, generators = []}
@@ -774,8 +776,8 @@ fun packages (project : t) =
       List.foldl (add_dependency current_project) state (#dependencies current_project)
     val root_package = project_package project
     val hol_package = implicit_hol_package artifact_parent
-    val _ = if package_name root_package = "HOL" then die "project.name HOL is reserved for the implicit HOL checkout" else ()
-    val (_, packages) = add_project project (["HOL", package_name root_package], [hol_package, root_package])
+    val _ = if package_name root_package = implicit_hol_package_name then die "project.name HOL is reserved for the implicit HOL checkout" else ()
+    val (_, packages) = add_project project ([implicit_hol_package_name, package_name root_package], [hol_package, root_package])
   in
     rev packages
   end

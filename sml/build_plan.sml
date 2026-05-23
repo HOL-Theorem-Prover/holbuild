@@ -22,6 +22,10 @@ fun source_hash_of ({source, source_hash, ...} : node) =
         let val hash = HolbuildHash.file_sha1 (#source_path source)
         in source_hash := SOME hash; hash end
 
+val implicit_hol_package_name = HolbuildProject.implicit_hol_package_name
+
+fun is_implicit_hol_source source = #package source = implicit_hol_package_name
+
 fun dependency_cache_path source =
   case #objects (#artifacts source) of
       object :: _ => object ^ ".deps"
@@ -34,7 +38,7 @@ fun deps_of (node as {source, deps, ...} : node) =
       let
         val source_hash = source_hash_of node
         val value0 =
-          if #package source = "HOL" then
+          if is_implicit_hol_source source then
             HolbuildDependencies.extract_global_cached_with_hash
               {source_path = #source_path source, source_hash = source_hash}
           else
@@ -43,6 +47,8 @@ fun deps_of (node as {source, deps, ...} : node) =
                source_path = #source_path source,
                source_hash = source_hash}
       in deps := SOME value0; value0 end
+fun is_implicit_hol_node node = is_implicit_hol_source (source_of node)
+
 fun logical_name node = #logical_name (source_of node)
 fun package node = #package (source_of node)
 fun relative_path node = #relative_path (source_of node)
@@ -62,9 +68,10 @@ fun nodes_named nodes name = List.filter (has_logical_name name) nodes
 
 type name_index = (string * node list) Vector.vector
 
-type t = {nodes : node list, name_index : name_index}
+type t = {selected : node list, universe : node list, name_index : name_index}
 
-fun nodes ({nodes, ...} : t) = nodes
+fun selected_nodes ({selected, ...} : t) = selected
+fun universe_nodes ({universe, ...} : t) = universe
 
 fun split_pairs xs =
   let
@@ -162,19 +169,6 @@ fun indexed_key_id index node_key =
     search 0 (Vector.length index - 1)
   end
 
-fun selected_nodes nodes targets =
-  case targets of
-      [] => nodes
-    | _ =>
-      let
-        fun find target =
-          case nodes_named nodes target of
-              [] => raise Error ("unknown build target: " ^ target)
-            | matches => matches
-      in
-        List.concat (map find targets)
-      end
-
 fun theory_name name =
   let val suffix = "Theory"
       val n = size name
@@ -196,7 +190,7 @@ fun provided_for node name = bootstrap_provided name
 fun needs_standard_env_dependency node =
   let val source = source_of node
   in
-    #package source <> "HOL" andalso
+    not (is_implicit_hol_source source) andalso
     not (#bare source) andalso
     #kind source <> HolbuildSourceIndex.Sig
   end
@@ -221,8 +215,8 @@ fun describe_node node = package node ^ ":" ^ relative_path node
 
 fun conflict_if_hol_shadow name matches =
   let
-    val hol = List.filter (fn node => package node = "HOL") matches
-    val non_hol = List.filter (fn node => package node <> "HOL") matches
+    val hol = List.filter is_implicit_hol_node matches
+    val non_hol = List.filter (fn node => not (is_implicit_hol_node node)) matches
   in
     if null hol orelse null non_hol then matches
     else raise Error ("logical name " ^ name ^ " is defined both by the implicit HOL checkout and another package: " ^
@@ -250,7 +244,16 @@ fun direct_project_deps_with lookup nodes node =
   end
 
 fun direct_project_deps plan node =
-  direct_project_deps_with (lookup plan) (nodes plan) node
+  direct_project_deps_with (lookup plan) (universe_nodes plan) node
+
+type phase = {nodes : node list, name_index : name_index}
+
+fun phase nodes = {nodes = nodes, name_index = build_name_index nodes}
+fun phase_nodes ({nodes, ...} : phase) = nodes
+fun phase_lookup ({name_index, ...} : phase) = indexed_nodes_named name_index
+
+fun direct_phase_deps phase node =
+  direct_project_deps_with (phase_lookup phase) (phase_nodes phase) node
 
 fun direct_unresolved_declared_deps_with lookup node =
   let
@@ -326,7 +329,7 @@ fun topo_sort_with lookup nodes roots =
   end
 
 fun topo_sort plan roots =
-  topo_sort_with (lookup plan) (nodes plan) roots
+  topo_sort_with (lookup plan) (universe_nodes plan) roots
 
 fun transitive_project_deps plan node = topo_sort plan (direct_project_deps plan node)
 
@@ -349,7 +352,7 @@ fun plan holdir sources targets =
                      | matches => matches)
                  targets)
   in
-    {nodes = topo_sort_with lookup nodes roots, name_index = index}
+    {selected = topo_sort_with lookup nodes roots, universe = nodes, name_index = index}
   end
 
 fun kind_name source = HolbuildSourceIndex.kind_string (#kind source)
@@ -476,13 +479,13 @@ fun action_text_with lookup config_lines_for_node toolchain_key nodes keys node 
   end
 
 fun action_text config_lines_for_node toolchain_key plan keys node =
-  action_text_with (lookup plan) config_lines_for_node toolchain_key (nodes plan) keys node
+  action_text_with (lookup plan) config_lines_for_node toolchain_key (universe_nodes plan) keys node
 
 fun add_input_key_with lookup config_lines_for_node toolchain_key nodes (node, keys) =
   (key node, hash_text (action_text_with lookup config_lines_for_node toolchain_key nodes keys node)) :: keys
 
 fun add_input_key config_lines_for_node toolchain_key plan (node, keys) =
-  add_input_key_with (lookup plan) config_lines_for_node toolchain_key (nodes plan) (node, keys)
+  add_input_key_with (lookup plan) config_lines_for_node toolchain_key (universe_nodes plan) (node, keys)
 
 fun compute_input_keys_with lookup config_lines_for_node toolchain_key nodes =
   List.foldl
@@ -494,7 +497,7 @@ fun input_keys_with lookup config_lines_for_node toolchain_key nodes =
     (fn () => compute_input_keys_with lookup config_lines_for_node toolchain_key nodes)
 
 fun input_keys config_lines_for_node toolchain_key plan =
-  input_keys_with (lookup plan) config_lines_for_node toolchain_key (nodes plan)
+  input_keys_with (lookup plan) config_lines_for_node toolchain_key (selected_nodes plan)
 
 fun input_key_for keys node = lookup_key keys node
 
@@ -505,7 +508,7 @@ fun print_project_deps_with lookup nodes node =
                      String.concatWith ", " (map logical_name deps) ^ "\n")
 
 fun print_project_deps plan node =
-  print_project_deps_with (lookup plan) (nodes plan) node
+  print_project_deps_with (lookup plan) (universe_nodes plan) node
 
 fun describe_node_with lookup nodes keys node =
   (HolbuildSourceIndex.describe_source (source_of node);
@@ -513,12 +516,12 @@ fun describe_node_with lookup nodes keys node =
    print_project_deps_with lookup nodes node)
 
 fun describe_node plan keys node =
-  describe_node_with (lookup plan) (nodes plan) keys node
+  describe_node_with (lookup plan) (universe_nodes plan) keys node
 
 fun describe config_lines_for_node toolchain_key plan =
   let
     val lookup = lookup plan
-    val nodes = nodes plan
+    val nodes = selected_nodes plan
     val keys = input_keys_with lookup config_lines_for_node toolchain_key nodes
   in
     List.app (describe_node_with lookup nodes keys) nodes

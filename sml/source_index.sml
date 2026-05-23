@@ -7,6 +7,10 @@ structure FS = OS.FileSys
 exception Error of string
 exception ErrorWithDebugArtifacts of string * HolbuildStatus.debug_artifacts
 
+val implicit_hol_package_name = HolbuildProject.implicit_hol_package_name
+
+fun is_implicit_hol_package package = package = implicit_hol_package_name
+
 datatype kind = TheoryScript | Sml | Sig
 
 type artifacts =
@@ -118,21 +122,21 @@ fun classify package source_root artifact_root policies abs_path =
       let
         val theory = drop_suffix "Script.sml" file ^ "Theory"
       in
-        if package = "HOL" andalso HolbuildBootstrap.is_bare_theory theory then NONE
+        if is_implicit_hol_package package andalso HolbuildBootstrap.is_bare_theory theory then NONE
         else SOME (make_source package artifact_root policies TheoryScript theory abs_path rel
                             (theory_artifacts artifact_root rel theory))
       end
     else if has_suffix ".sml" file then
       let val logical = drop_suffix ".sml" file
       in
-        if package = "HOL" andalso HolbuildBootstrap.is_bare_module logical then NONE
+        if is_implicit_hol_package package andalso HolbuildBootstrap.is_bare_module logical then NONE
         else SOME (make_source package artifact_root policies Sml logical abs_path rel
                            (sml_artifacts artifact_root rel))
       end
     else if has_suffix ".sig" file then
       let val logical = drop_suffix ".sig" file
       in
-        if package = "HOL" andalso HolbuildBootstrap.is_bare_module logical then NONE
+        if is_implicit_hol_package package andalso HolbuildBootstrap.is_bare_module logical then NONE
         else SOME (make_source package artifact_root policies Sig logical abs_path rel
                            (sig_artifacts artifact_root rel))
       end
@@ -210,6 +214,11 @@ fun compare_logical (a : source, b : source) =
       EQUAL => compare_source(a, b)
     | order => order
 
+fun compare_source_path (a : source, b : source) =
+  case String.compare(normalize_path (#source_path a), normalize_path (#source_path b)) of
+      EQUAL => compare_source(a, b)
+    | order => order
+
 fun compatible_same_name sources =
   case sources of
       [a, b] =>
@@ -271,12 +280,43 @@ fun sort_by compare sources =
 
 fun sort_sources sources = sort_by compare_source sources
 
+fun validate_unique_source_paths sources =
+  let
+    fun source_id source = normalize_path (#source_path source)
+    fun duplicate_error path group =
+      raise Error ("source path appears in multiple package members: " ^ path ^ " as " ^
+                   String.concatWith " and "
+                     (map (fn source => #package source ^ ":" ^ #relative_path source) (rev group)))
+    fun finish path group =
+      case group of
+          [] => ()
+        | [_] => ()
+        | _ => duplicate_error path group
+    fun loop current group rest =
+      case rest of
+          [] => finish current group
+        | source :: sources' =>
+            let val path = source_id source
+            in
+              if path = current then loop current (source :: group) sources'
+              else (finish current group; loop path [source] sources')
+            end
+  in
+    case sources of
+        [] => ()
+      | source :: rest => loop (source_id source) [source] rest
+  end
+
 fun by_logical sources =
   let val logical_sorted = sort_by compare_logical sources
   in validate_logical_uniqueness logical_sorted; sources end
 
+fun by_source_path sources =
+  let val path_sorted = sort_by compare_source_path sources
+  in validate_unique_source_paths path_sorted; sources end
+
 fun validate_action_policies package_name policies sources =
-  if package_name = "HOL" then () else
+  if is_implicit_hol_package package_name then () else
   let
     fun has_logical logical =
       List.exists
@@ -296,7 +336,7 @@ fun validate_action_policies package_name policies sources =
 fun scan_member name source_root artifact_root policies excludes (member, acc) =
   if is_dir member then scan_dir name source_root artifact_root policies excludes member acc
   else if is_readable member then scan_file name source_root artifact_root policies excludes member acc
-  else if name = "HOL" then acc
+  else if is_implicit_hol_package name then acc
   else raise Error ("member does not exist: " ^ member)
 
 fun discover_package package acc =
@@ -313,23 +353,24 @@ fun discover_package package acc =
     val members =
       map (fn member => HolbuildProject.abs_under source_root member)
         (HolbuildProject.package_members package)
-    val sources =
+    val package_sources =
       List.foldl
         (scan_member name source_root artifact_root policies excludes)
-        acc
+        []
         members
-    val _ = validate_action_policies name policies sources
+    val _ = validate_action_policies name policies package_sources
   in
-    sources
+    package_sources @ acc
   end
 
 fun discover (project : HolbuildProject.t) =
   by_logical
-    (sort_sources
+    (by_source_path
+      (sort_sources
        (List.foldl
           (fn (package, acc) => discover_package package acc)
           []
-          (HolbuildProject.packages project)))
+          (HolbuildProject.packages project))))
 
 fun kind_string kind =
   case kind of
@@ -400,7 +441,7 @@ fun default_targets sources project =
     if not (null rooted) then rooted
     else
       map #logical_name
-        (List.filter (fn source => #package source <> "HOL") sources)
+        (List.filter (fn source => not (is_implicit_hol_package (#package source))) sources)
   end
 
 end
