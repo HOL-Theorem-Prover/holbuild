@@ -21,7 +21,49 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-polyml
+        id: polyml
+
+      - uses: ./.github/actions/setup-hol4
+        id: hol4
+        with:
+          hol4-ref: ${{ inputs.hol4-ref || 'master' }}
+          polyml-rev: ${{ steps.polyml.outputs.polyml-rev }}
+
+      - name: Build holbuild
+        run: make HOLDIR="$HOLDIR"
+
+      - name: Configure holbuild test cache
+        run: echo "HOLBUILD_CACHE=$HOME/.cache/holbuild" >> "$GITHUB_ENV"
+
+      - name: Restore holbuild global cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/holbuild
+          key: holbuild-test-global-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ steps.hol4.outputs.hol4-rev }}-${{ github.sha }}
+          restore-keys: |
+            holbuild-test-global-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ steps.hol4.outputs.hol4-rev }}-
+            holbuild-test-global-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-
+            holbuild-test-global-${{ runner.os }}-
+
+      - name: Prewarm holbuild global cache
+        env:
+          TMPDIR: ${{ runner.temp }}
+          HOLBUILD_TEST_JOBS: 1
+          HOLBUILD_TEST_SHARD_INDEX: 0
+          HOLBUILD_TEST_SHARD_COUNT: 1
+          HOLBUILD_TEST_PREWARM: 1
+          HOLBUILD_TEST_PREWARM_ONLY: 1
+        run: tests/run.sh
+
   tests:
+    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
@@ -51,9 +93,8 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.cache/holbuild
-          key: holbuild-test-global-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ steps.hol4.outputs.hol4-rev }}-shard-${{ matrix.shard-index }}-${{ github.sha }}
+          key: holbuild-test-global-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ steps.hol4.outputs.hol4-rev }}-${{ github.sha }}
           restore-keys: |
-            holbuild-test-global-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ steps.hol4.outputs.hol4-rev }}-shard-${{ matrix.shard-index }}-
             holbuild-test-global-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ steps.hol4.outputs.hol4-rev }}-
             holbuild-test-global-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-
             holbuild-test-global-${{ runner.os }}-
@@ -64,5 +105,5 @@ jobs:
           HOLBUILD_TEST_JOBS: ${{ inputs.test-jobs || '1' }}
           HOLBUILD_TEST_SHARD_INDEX: ${{ matrix.shard-index }}
           HOLBUILD_TEST_SHARD_COUNT: ${{ matrix.shard-count }}
-          HOLBUILD_TEST_PREWARM: 1
+          HOLBUILD_TEST_PREWARM: 0
         run: make HOLDIR="$HOLDIR" test
