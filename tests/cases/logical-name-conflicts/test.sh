@@ -120,3 +120,17 @@ val _ = new_theory "Foo";
 val _ = export_theory();
 SML
 expect_dry_run_failure duplicate_theory "duplicate logical name FooTheory"
+
+mkdir -p "$tmpdir/duplicate_source_path/src"
+make_root_manifest duplicate_source_path
+cat > "$tmpdir/duplicate_source_path/holproject.toml" <<'TOML'
+[project]
+name = "root"
+
+[build]
+members = ["src", "src/Foo.sml"]
+TOML
+cat > "$tmpdir/duplicate_source_path/src/Foo.sml" <<'SML'
+structure Foo = struct val x = 1 end
+SML
+expect_dry_run_failure duplicate_source_path "source path appears in multiple package members"

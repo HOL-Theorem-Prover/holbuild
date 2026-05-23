@@ -29,6 +29,11 @@ if grep -q 'dependency: HOLDIR' "$tmpdir/context.log"; then
 fi
 (cd "$project" && HOLDIR="$HOLDIR" "$HOLBUILD_BIN" build --dry-run) > "$tmpdir/dry.log"
 
+(cd "$project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build --dry-run NumRelNorms) > "$tmpdir/numrelnorms-dry.log"
+require_grep "NumRelNorms (sml, package HOL)" "$tmpdir/numrelnorms-dry.log"
+require_grep "holmake deps: .*GenRelNorm" "$tmpdir/numrelnorms-dry.log"
+require_grep "GenRelNorm" "$tmpdir/numrelnorms-dry.log"
+
 bad=$tmpdir/bad
 mkdir -p "$bad"
 cat > "$bad/holproject.toml" <<TOML

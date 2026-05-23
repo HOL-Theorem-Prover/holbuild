@@ -16,21 +16,20 @@ export HOLBUILD_CACHE="$tmpdir/cache"
 
 fake_holdir=$tmpdir/fake-hol
 mkdir -p "$fake_holdir/bin" "$fake_holdir/sigobj" "$fake_holdir/src/ext/.hol/objs"
-printf 'fake hol executable\n' > "$fake_holdir/bin/hol"
+printf '#!/usr/bin/env sh\necho fake hol should not execute >&2\nexit 127\n' > "$fake_holdir/bin/hol"
 printf 'fake hol state\n' > "$fake_holdir/bin/hol.state"
 printf 'fake hol state0\n' > "$fake_holdir/bin/hol.state0"
 chmod +x "$fake_holdir/bin/hol"
 
 cat > "$fake_holdir/src/ext/ExtLib.sml" <<'SML'
-val _ = load "ExtDepTheory";
-fun ext_value () = 1;
+structure ExtLib = struct
+  fun ext_value () = 1
+end
 SML
-printf 'ext-lib-artifact-v1\n' > "$fake_holdir/src/ext/.hol/objs/ExtLib.uo"
+printf 'ext-lib-prebuilt-v1\n' > "$fake_holdir/src/ext/.hol/objs/ExtLib.uo"
 ln -s "$fake_holdir/src/ext/.hol/objs/ExtLib.uo" "$fake_holdir/sigobj/ExtLib.uo"
-printf 'ext-dep-theory-artifact-v1\n' > "$fake_holdir/src/ext/.hol/objs/ExtDepTheory.uo"
-printf 'ext-dep-dat-v1\n' > "$fake_holdir/src/ext/.hol/objs/ExtDepTheory.dat"
-printf 'ext-dep-cachekey-v1\n' > "$fake_holdir/src/ext/.hol/objs/ExtDepTheory.cachekey"
-ln -s "$fake_holdir/src/ext/.hol/objs/ExtDepTheory.uo" "$fake_holdir/sigobj/ExtDepTheory.uo"
+printf 'only-prebuilt-v1\n' > "$fake_holdir/sigobj/OnlyPrebuilt.uo"
+printf 'only-prebuilt-v1\n' > "$fake_holdir/src/ext/.hol/objs/OnlyPrebuilt.uo"
 
 project=$tmpdir/project
 mkdir -p "$project/src"
@@ -42,6 +41,7 @@ name = "external-key-test"
 members = ["src"]
 
 [actions.BTheory]
+deps = ["ExtLib"]
 loads = ["ExtLib"]
 TOML
 cat > "$project/src/BScript.sml" <<'SML'
@@ -74,9 +74,37 @@ if [[ "$b_key_v1" == "$b_key_v2" ]]; then
   exit 1
 fi
 
-printf 'changed theory compiled object bytes\n' > "$fake_holdir/src/ext/.hol/objs/ExtDepTheory.uo"
+printf 'changed prebuilt object bytes\n' > "$fake_holdir/src/ext/.hol/objs/ExtLib.uo"
+printf 'changed sigobj bytes\n' > "$fake_holdir/sigobj/ExtLib.uo"
 b_key_after_artifact_change=$(input_key_for BTheory)
 if [[ "$b_key_after_artifact_change" != "$b_key_v2" ]]; then
-  echo "source-mode implicit HOL key should not hash prebuilt .uo/.ui artifact bytes" >&2
+  echo "source-mode implicit HOL key should not hash prebuilt .uo/.ui/sigobj artifact bytes" >&2
   exit 1
 fi
+
+prebuilt_only_project=$tmpdir/prebuilt-only-project
+mkdir -p "$prebuilt_only_project/src"
+cat > "$prebuilt_only_project/holproject.toml" <<'TOML'
+[project]
+name = "prebuilt-only-test"
+
+[build]
+members = ["src"]
+
+[actions.BTheory]
+deps = ["OnlyPrebuilt"]
+loads = ["OnlyPrebuilt"]
+TOML
+cat > "$prebuilt_only_project/src/BScript.sml" <<'SML'
+(* [bare] *)
+open HolKernel Parse boolLib;
+val _ = load "OnlyPrebuilt";
+val _ = new_theory "B";
+val _ = export_theory();
+SML
+prebuilt_only_log=$tmpdir/prebuilt-only.log
+if (cd "$prebuilt_only_project" && "$HOLBUILD_BIN" --holdir "$fake_holdir" build --dry-run BTheory) > "$prebuilt_only_log" 2>&1; then
+  echo "prebuilt-only HOL object was accepted as a source dependency" >&2
+  exit 1
+fi
+require_grep "OnlyPrebuilt" "$prebuilt_only_log"

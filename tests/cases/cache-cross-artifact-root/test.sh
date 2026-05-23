@@ -56,7 +56,7 @@ require_grep "BTheory built" "$first_log"
 
 second_log=$tmpdir/second.log
 (cd "$second" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" --holdir "$HOLDIR" build BTheory) > "$second_log" 2>&1
-require_grep "cache hit: ATheory source/dependency key=" "$second_log"
+require_cache_hit_key ATheory "$second_log" >/dev/null
 require_grep "cache hit: BTheory parent-output key=" "$second_log"
 require_grep "ATheory restored from cache" "$second_log"
 require_grep "BTheory restored from cache" "$second_log"

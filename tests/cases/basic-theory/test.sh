@@ -82,7 +82,8 @@ require_grep "artifact-root: $tmpdir" "$source_dir_context_log"
 source_dir_env_log=$tmpdir/source-dir-env.log
 rm -rf "$tmpdir/.holbuild"
 (cd "$tmpdir" && HOLBUILD_CACHE_TRACE=1 HOLBUILD_SOURCE_DIR="$project" "$HOLBUILD_BIN" --holdir "$HOLDIR" build ATheory) > "$source_dir_env_log"
-require_grep "cache hit: ATheory source/dependency key=" "$source_dir_env_log"
+source_dir_cache_key=$(require_cache_hit_key ATheory "$source_dir_env_log")
+require_file "$HOLBUILD_CACHE/actions/$source_dir_cache_key/manifest"
 require_grep "ATheory restored from cache" "$source_dir_env_log"
 require_file "$tmpdir/.holbuild/obj/src/ATheory.dat"
 if strings -a "$tmpdir/.holbuild/obj/src/ATheory.dat" | grep -q '\.holbuild.*stage'; then
@@ -110,17 +111,20 @@ stale_hash_log=$tmpdir/stale-output-hash.log
 (cd "$project" && "$HOLBUILD_BIN" --verbose --holdir "$HOLDIR" build ATheory) > "$stale_hash_log"
 require_grep "ATheory is up to date" "$stale_hash_log"
 
-input_key=$(grep '^input_key=' "$project/.holbuild/dep/basic/src/AScript.sml.key" | cut -d= -f2)
-cache_manifest="$HOLBUILD_CACHE/actions/$input_key/manifest"
+rm -rf "$project/.holbuild"
+cache_log=$tmpdir/cache-restore.log
+(cd "$project" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" --holdir "$HOLDIR" build ATheory) > "$cache_log"
+cache_key=$(require_cache_hit_key ATheory "$cache_log")
+cache_manifest="$HOLBUILD_CACHE/actions/$cache_key/manifest"
 require_file "$cache_manifest"
 touch -d '10 days ago' "$cache_manifest"
 cache_hit_marker=$tmpdir/cache-hit-marker
 touch -d '1 minute ago' "$cache_hit_marker"
 
 rm -rf "$project/.holbuild"
-cache_log=$tmpdir/cache-restore.log
+cache_log=$tmpdir/cache-restore-after-touch.log
 (cd "$project" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" --holdir "$HOLDIR" build ATheory) > "$cache_log"
-require_grep "cache hit: ATheory source/dependency key=$input_key" "$cache_log"
+require_grep "cache hit: ATheory .* key=$cache_key" "$cache_log"
 require_grep "ATheory restored from cache" "$cache_log"
 require_file "$project/.holbuild/obj/src/ATheory.sig"
 require_file "$project/.holbuild/obj/src/ATheory.sml"
@@ -132,7 +136,7 @@ if [[ ! "$cache_manifest" -nt "$cache_hit_marker" ]]; then
   exit 1
 fi
 require_file "$cache_manifest"
-printf 'mldep /stale/.holbuild/stage/%s/ATheory\n' "$input_key" >> "$cache_manifest"
+printf 'mldep /stale/.holbuild/stage/%s/ATheory\n' "$cache_key" >> "$cache_manifest"
 rm -rf "$project/.holbuild"
 stale_cache_log=$tmpdir/stale-cache-manifest.log
 (cd "$project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build ATheory) > "$stale_cache_log" 2>&1
@@ -159,7 +163,7 @@ if (cd "$project" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" --holdir "$HOLDIR" b
   echo "source failure key probe unexpectedly succeeded" >&2
   exit 1
 fi
-bad_key=$(awk '/cache miss: ATheory (source\/dependency|parent-output) key=.*\(no manifest\)/ {sub(/^.* key=/, ""); sub(/ .*/, ""); print; exit}' "$probe_log")
+bad_key=$(awk '/cache miss: ATheory (source\/dependency|parent-output|path-dependent parent-output) key=.*\(no manifest\)/ {sub(/^.* key=/, ""); sub(/ .*/, ""); print; exit}' "$probe_log")
 [[ -n "$bad_key" ]] || { echo "could not determine ATheory cache key" >&2; cat "$probe_log" >&2; exit 1; }
 bad_manifest="$HOLBUILD_CACHE/actions/$bad_key/manifest"
 mkdir -p "$(dirname "$bad_manifest")"
