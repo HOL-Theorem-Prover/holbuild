@@ -148,9 +148,7 @@ check_case() {
   fi
 }
 
-check_case mixed_suite 'val bad_tac = fn g => ([g], fn _ => TRUTH);
-
-Theorem existential_name_provider:
+check_case initial_success_suite 'Theorem existential_name_provider:
   ?sab:bool. sab
 Proof
   qexists_tac `T` >> simp[]
@@ -205,15 +203,17 @@ Proof
   ALL_TAC >- (ALL_TAC >> ACCEPT_TAC TRUTH)
 QED
 
-Theorem branch_then1_lhs_sequence_success:
+'
+
+check_case branch_then1_lhs_sequence_failure 'Theorem thm:
   ((T ∨ T) ⇒ T) ∧ T
 Proof
   CONJ_TAC
   >- (ALL_TAC >> strip_tac >- ACCEPT_TAC TRUTH >> ACCEPT_TAC TRUTH)
   >- ACCEPT_TAC TRUTH
-QED
+QED'
 
-Theorem branch_suffix_reverse_success:
+check_case remaining_success_suite 'Theorem branch_suffix_reverse_success:
   ((T ∧ T) ∧ (T ∧ T)) ∧ T
 Proof
   CONJ_TAC
@@ -500,11 +500,17 @@ Proof
   >> ACCEPT_TAC TRUTH
 QED
 
-Theorem invalid_intermediate:
+'
+
+check_case invalid_intermediate_failure 'val bad_tac = fn g => ([g], fn _ => TRUTH);
+
+Theorem thm:
   T
 Proof
   bad_tac >> ACCEPT_TAC TRUTH
-QED
+QED'
+
+check_case invalid_intermediate_then1_failure 'val bad_tac = fn g => ([g], fn _ => TRUTH);
 
 Theorem invalid_intermediate_then1:
   T ∧ T
@@ -512,13 +518,15 @@ Proof
   CONJ_TAC >- (bad_tac >> ACCEPT_TAC TRUTH) >- ACCEPT_TAC TRUTH
 QED
 
-Theorem then_suffix_after_solved:
+'
+
+check_case then_suffix_after_solved_failure 'Theorem thm:
   T
 Proof
   ACCEPT_TAC TRUTH >> FAIL_TAC "should be skipped over []"
-QED
+QED'
 
-Theorem parser_recovery:
+check_case parser_recovery_failure 'Theorem parser_recovery:
   T
 Proof
   ( ACCEPT_TAC TRUTH
