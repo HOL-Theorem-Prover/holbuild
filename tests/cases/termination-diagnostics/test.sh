@@ -119,6 +119,20 @@ fi
 require_grep "termination: second_def (line " "$resume_first_log"
 require_grep "expected second termination failure" "$resume_first_log"
 require_file "$(find "$resume_project/.holbuild/checkpoints" -path '*.decls/*/proof_ir_v3/*/first_def_context.save' -print -quit)"
+rm -rf "$resume_project/.holbuild/checkpoints/termination-diagnostics/src/AScript.sml.decls"
+
+resume_missing_decl_log=$tmpdir/resume-missing-decl-dir.log
+if (cd "$resume_project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build ATheory) > "$resume_missing_decl_log" 2>&1; then
+  echo "expected second termination proof failure after removing definition checkpoint dirs" >&2
+  exit 1
+fi
+require_grep "from: deps-loaded checkpoint" "$resume_missing_decl_log"
+require_grep "termination: second_def (line " "$resume_missing_decl_log"
+if grep -q "No such file or directory" "$resume_missing_decl_log"; then
+  echo "definition checkpoint save failed to recreate parent dirs" >&2
+  exit 1
+fi
+require_file "$(find "$resume_project/.holbuild/checkpoints" -path '*.decls/*/proof_ir_v3/*/first_def_context.save' -print -quit)"
 
 resume_second_log=$tmpdir/resume-second.log
 if (cd "$resume_project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build ATheory) > "$resume_second_log" 2>&1; then

@@ -2061,23 +2061,27 @@ fun write_theory_script policy project base_context plan keys input_key toolchai
       val deps_key = dependency_context_key toolchain_key plan keys node
       val deps_loaded = deps_loaded_path project node deps_key
       val deps_ok = deps_checkpoint_ok_text deps_key
+      fun ensure_source_checkpoint_parents () =
+        (List.app (fn {context_path, end_of_proof_path, failed_prefix_path, ...} =>
+                     (ensure_parent context_path; ensure_parent end_of_proof_path; ensure_parent failed_prefix_path))
+                  checkpoints;
+         List.app (fn {context_path, ...} => ensure_parent context_path) declaration_checkpoints)
       fun run_from_deps_checkpoint () =
-        (write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_text 0 checkpoints declaration_checkpoints terminations);
+        (ensure_source_checkpoint_parents ();
+         write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_text 0 checkpoints declaration_checkpoints terminations);
          deps_loaded_resume_message node;
          {context = HolState deps_loaded, files = [staged_script], failure_checkpoints = [deps_loaded]})
       fun run_from_fresh_preload () =
         (remove_theorem_checkpoints_for_deps project node deps_key;
          remove_declaration_checkpoints_for_deps project node deps_key;
-         List.app (fn {context_path, end_of_proof_path, failed_prefix_path, ...} =>
-                     (ensure_parent context_path; ensure_parent end_of_proof_path; ensure_parent failed_prefix_path))
-                  checkpoints;
-         List.app (fn {context_path, ...} => ensure_parent context_path) declaration_checkpoints;
+         ensure_source_checkpoint_parents ();
          write_preload plan node deps_loaded deps_ok preload;
          write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_text 0 checkpoints declaration_checkpoints terminations);
          {context = base_context, files = [preload, staged_script], failure_checkpoints = []})
       fun run_from_failed_prefix {checkpoint, step_count, prefix_text} =
         let
           val path = #failed_prefix_path checkpoint
+          val _ = ensure_source_checkpoint_parents ()
           val _ = write_text staged_script (failed_prefix_resume_source policy timeout_marker plan_only_marker source_text checkpoints declaration_checkpoints terminations checkpoint step_count prefix_text)
           val _ = failed_prefix_resume_message node source_text checkpoint prefix_text
         in
@@ -2085,6 +2089,7 @@ fun write_theory_script policy project base_context plan keys input_key toolchai
         end
       fun run_from_replay {boundary, path, safe_name, kind, failure_checkpoints} =
         let
+          val _ = ensure_source_checkpoint_parents ()
           val _ = write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_text boundary checkpoints declaration_checkpoints terminations)
           val _ = source_context_resume_message node source_text kind safe_name boundary
         in
