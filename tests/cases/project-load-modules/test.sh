@@ -24,6 +24,9 @@ members = ["src"]
 [actions.Baz]
 deps = ["Foo"]
 loads = ["numLib"]
+
+[run]
+loads = ["ATheory"]
 TOML
 cat > "$project/src/Foo.sig" <<'SML'
 signature FOO = sig
@@ -115,11 +118,10 @@ if grep -q ".holbuild/obj/src/Bar\|.holbuild/obj/src/Baz\|.holbuild/obj/src/Quux
   exit 1
 fi
 
-cat > "$tmpdir/load-internal-theory.sml" <<SML
-load "$project/.holbuild/obj/src/ATheory";
+cat > "$tmpdir/load-internal-theory.sml" <<'SML'
 val _ = ATheory.a_thm;
 SML
-"$HOLDIR/bin/hol" run --noconfig --holstate "$HOLDIR/bin/hol.state" "$tmpdir/load-internal-theory.sml"
+(cd "$project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" run "$tmpdir/load-internal-theory.sml") > "$tmpdir/load-internal-theory.log" 2>&1
 
 second_log=$tmpdir/second.log
 (cd "$project" && "$HOLBUILD_BIN" --verbose --holdir "$HOLDIR" build ATheory) > "$second_log"
