@@ -10,7 +10,6 @@ source "$SCRIPT_DIR/../../lib.sh"
 tmpdir=$(make_temp_dir)
 cleanup() { rm -rf "$tmpdir"; }
 trap cleanup EXIT
-export HOLBUILD_CACHE="$tmpdir/cache"
 
 make_project() {
   local project=$1
@@ -31,6 +30,11 @@ open HolKernel Parse boolLib bossLib;
 val _ = new_theory "A";
 $body
 val _ = export_theory();
+val _ =
+  List.app
+    (fn (thm_name, th) =>
+        print ("@@DUMP@@" ^ thm_name ^ "\t" ^ Parse.term_to_string (Thm.concl th) ^ "\n"))
+    (DB.theorems "A");
 SML
 }
 
@@ -49,61 +53,10 @@ run_new_ir() {
   (cd "$project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build --force --skip-checkpoints --tactic-timeout 60 ATheory) > "$log" 2>&1
 }
 
-copy_hol_run_artifacts() {
-  local project=$1
-  local dest=$2
-  mkdir -p "$dest"
-  cp "$project/.hol/objs"/ATheory.{dat,sml,sig} "$dest/"
-}
-
-prepare_load_root() {
-  local artifacts=$1
-  local root=$2
-  mkdir -p "$root"
-  cp "$artifacts"/ATheory.{dat,sig} "$root/"
-  sed -E \
-    "s#holpathdb\.subst_pathvars \"[^\"]*ATheory\.dat\"#holpathdb.subst_pathvars \"$root/ATheory.dat\"#" \
-    "$artifacts/ATheory.sml" > "$root/ATheory.sml"
-}
-
-# Dump the direct HOLSource result by loading its exported artifacts back into
-# the same prebuilt HOL state that produced them.  This side intentionally tests
-# HOL's normal script semantics.
-dump_hol_run_summary() {
-  local name=$1
-  local artifacts=$2
-  local log=$3
-  local dump=$4
-  local root=$tmpdir/$name.hol-run.loadroot
-  local script=$tmpdir/$name.hol-run.dump-ATheory.sml
-  prepare_load_root "$artifacts" "$root"
-  cat > "$script" <<SML
-open HolKernel Parse boolLib bossLib;
-val _ = let val out = HOLFileSys.openOut "$root/ATheory.ui" in HOLFileSys.output(out, "$root/ATheory.sig\n"); HOLFileSys.closeOut out end;
-val _ = let val out = HOLFileSys.openOut "$root/ATheory.uo" in HOLFileSys.output(out, "$root/ATheory.sml\n"); HOLFileSys.closeOut out end;
-val result =
-  (load "$root/ATheory";
-   SOME (DB.theorems "A"))
-  handle e => (print ("@@DUMP_ERROR@@ " ^ General.exnMessage e ^ "\\n"); NONE);
-val _ =
-  case result of
-    NONE => OS.Process.exit OS.Process.failure
-  | SOME thms =>
-      (List.app
-         (fn (thm_name, th) =>
-             print ("@@DUMP@@" ^ thm_name ^ "\t" ^ Parse.term_to_string (Thm.concl th) ^ "\\n"))
-         thms;
-       OS.Process.exit OS.Process.success);
-SML
-  "$HOLDIR/bin/hol" --noconfig --holstate "$HOLDIR/bin/hol.state" < "$script" > "$log" 2>&1
-  if ! grep '^@@DUMP@@' "$log" | sed 's/^@@DUMP@@//' | LC_ALL=C sort -t $'\t' -k1,1 > "$dump"; then
-    :
-  fi
-  if [[ ! -s "$dump" ]]; then
-    echo "empty HOL-run theory summary for $artifacts" >&2
-    tail -80 "$log" >&2
-    exit 1
-  fi
+extract_theory_summary() {
+  local log=$1
+  local dump=$2
+  awk '/^@@DUMP@@/ { sub(/^@@DUMP@@/, ""); print }' "$log" | LC_ALL=C sort -t $'\t' -k1,1 > "$dump"
 }
 
 # Dump the holbuild result through holbuild's own run context.  Loading
@@ -124,10 +77,16 @@ val _ =
         print ("@@DUMP@@" ^ thm_name ^ "\t" ^ Parse.term_to_string (Thm.concl th) ^ "\n"))
     thms;
 SML
+  set +e
   (cd "$project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" run .holbuild-dump-ATheory.sml) > "$log" 2>&1
-  if ! grep '^@@DUMP@@' "$log" | sed 's/^@@DUMP@@//' | LC_ALL=C sort -t $'\t' -k1,1 > "$dump"; then
-    :
+  local status=$?
+  set -e
+  if [[ "$status" != 0 ]]; then
+    echo "holbuild theory summary command failed for $project" >&2
+    tail -80 "$log" >&2
+    exit 1
   fi
+  extract_theory_summary "$log" "$dump"
   if [[ ! -s "$dump" ]]; then
     echo "empty holbuild theory summary for $project" >&2
     tail -80 "$log" >&2
@@ -137,11 +96,16 @@ SML
 
 compare_success_summaries() {
   local name=$1
-  local hol_artifacts=$2
+  local hol_log=$2
   local project=$3
   local hol_dump=$tmpdir/$name.hol-run.ATheory.summary
   local ir_dump=$tmpdir/$name.new-ir.ATheory.summary
-  dump_hol_run_summary "$name" "$hol_artifacts" "$tmpdir/$name.hol-run.dump.log" "$hol_dump"
+  extract_theory_summary "$hol_log" "$hol_dump"
+  if [[ ! -s "$hol_dump" ]]; then
+    echo "empty direct HOL theory summary for $name" >&2
+    tail -80 "$hol_log" >&2
+    exit 1
+  fi
   dump_holbuild_summary "$name" "$project" "$tmpdir/$name.new-ir.dump.log" "$ir_dump"
   if ! cmp -s "$hol_dump" "$ir_dump"; then
     echo "exported ATheory theorem summary mismatch for $name" >&2
@@ -156,16 +120,12 @@ check_case() {
   local project=$tmpdir/$name
   local hol_log=$tmpdir/$name.hol-run.log
   local ir_log=$tmpdir/$name.new-ir.log
-  local hol_artifacts=$tmpdir/$name.hol-run-artifacts
   make_project "$project" "$body"
 
   set +e
   run_hol_run "$project" "$hol_log"
   local hol_status=$?
   set -e
-  if [[ "$hol_status" == 0 ]]; then
-    copy_hol_run_artifacts "$project" "$hol_artifacts"
-  fi
 
   rm -rf "$project/.hol" "$project/.holbuild" "$project"/src/ATheory.{sig,sml,dat,ui,uo}
 
@@ -184,7 +144,7 @@ check_case() {
   fi
 
   if [[ "$hol_status" == 0 ]]; then
-    compare_success_summaries "$name" "$hol_artifacts" "$project"
+    compare_success_summaries "$name" "$hol_log" "$project"
   fi
 }
 
