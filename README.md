@@ -146,8 +146,8 @@ created during a build and removed after successful artifact/metadata writes;
 reusable proof-replay or shared-context checkpoints may be retained according to
 checkpoint policy and later bounded by `holbuild gc`.
 `--skip-goalfrag` opts out of modern theorem instrumentation.
-`--no-auto-contexts` disables automatic shared execution-context checkpoints;
-it is intended for debugging, not normal builds.
+`--no-auto-intermediate-closures` disables automatic shared intermediate-closure
+checkpoints; it is intended for debugging, not normal builds.
 The default theorem instrumentation engine is holbuild's proof IR: it parses tactic
 syntax from `HOLSourceAST` directly instead of using HOL `goalFrag`, while preserving
 HOL parser recovery and exact tactic/list-tactic runtime boundaries for recognized
