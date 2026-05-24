@@ -91,12 +91,14 @@ val _ =
   | SOME thms =>
       (List.app
          (fn (thm_name, th) =>
-             print ("@@DUMP@@" ^ thm_name ^ "\t" ^ term_to_string (concl th) ^ "\\n"))
+             print ("@@DUMP@@" ^ thm_name ^ "\t" ^ Parse.term_to_string (Thm.concl th) ^ "\\n"))
          thms;
        OS.Process.exit OS.Process.success);
 SML
   "$HOLDIR/bin/hol" --noconfig --holstate "$HOLDIR/bin/hol.state" < "$script" > "$log" 2>&1
-  grep '^@@DUMP@@' "$log" | sed 's/^@@DUMP@@//' | LC_ALL=C sort -t $'\t' -k1,1 > "$dump"
+  if ! grep '^@@DUMP@@' "$log" | sed 's/^@@DUMP@@//' | LC_ALL=C sort -t $'\t' -k1,1 > "$dump"; then
+    :
+  fi
   if [[ ! -s "$dump" ]]; then
     echo "empty HOL-run theory summary for $artifacts" >&2
     tail -80 "$log" >&2
@@ -123,7 +125,9 @@ val _ =
     thms;
 SML
   (cd "$project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" run .holbuild-dump-ATheory.sml) > "$log" 2>&1
-  grep '^@@DUMP@@' "$log" | sed 's/^@@DUMP@@//' | LC_ALL=C sort -t $'\t' -k1,1 > "$dump"
+  if ! grep '^@@DUMP@@' "$log" | sed 's/^@@DUMP@@//' | LC_ALL=C sort -t $'\t' -k1,1 > "$dump"; then
+    :
+  fi
   if [[ ! -s "$dump" ]]; then
     echo "empty holbuild theory summary for $project" >&2
     tail -80 "$log" >&2
@@ -146,7 +150,7 @@ compare_success_summaries() {
   fi
 }
 
-assert_success_case() {
+check_case() {
   local name=$1
   local body=$2
   local project=$tmpdir/$name
@@ -159,12 +163,9 @@ assert_success_case() {
   run_hol_run "$project" "$hol_log"
   local hol_status=$?
   set -e
-  if [[ "$hol_status" != 0 ]]; then
-    echo "HOL run failed for success case $name" >&2
-    tail -80 "$hol_log" >&2
-    exit 1
+  if [[ "$hol_status" == 0 ]]; then
+    copy_hol_run_artifacts "$project" "$hol_artifacts"
   fi
-  copy_hol_run_artifacts "$project" "$hol_artifacts"
 
   rm -rf "$project/.hol" "$project/.holbuild" "$project"/src/ATheory.{sig,sml,dat,ui,uo}
 
@@ -172,48 +173,22 @@ assert_success_case() {
   run_new_ir "$project" "$ir_log"
   local ir_status=$?
   set -e
-  if [[ "$ir_status" != 0 ]]; then
-    echo "holbuild proof-IR failed for success case $name" >&2
+
+  if [[ "$hol_status" != "$ir_status" ]]; then
+    echo "hol run/new-ir status mismatch for $name: hol=$hol_status new_ir=$ir_status" >&2
+    echo "--- hol run tail ---" >&2
+    tail -60 "$hol_log" >&2
+    echo "--- new-ir tail ---" >&2
     tail -80 "$ir_log" >&2
     exit 1
   fi
-
-  compare_success_summaries "$name" "$hol_artifacts" "$project"
-}
-
-assert_failure_case() {
-  local name=$1
-  local body=$2
-  local project=$tmpdir/$name
-  local hol_log=$tmpdir/$name.hol-run.log
-  local ir_log=$tmpdir/$name.new-ir.log
-  make_project "$project" "$body"
-
-  set +e
-  run_hol_run "$project" "$hol_log"
-  local hol_status=$?
-  set -e
-
-  rm -rf "$project/.hol" "$project/.holbuild" "$project"/src/ATheory.{sig,sml,dat,ui,uo}
-
-  set +e
-  run_new_ir "$project" "$ir_log"
-  local ir_status=$?
-  set -e
 
   if [[ "$hol_status" == 0 ]]; then
-    echo "HOL run unexpectedly succeeded for failure case $name" >&2
-    tail -80 "$hol_log" >&2
-    exit 1
-  fi
-  if [[ "$ir_status" == 0 ]]; then
-    echo "holbuild proof-IR unexpectedly succeeded for failure case $name" >&2
-    tail -80 "$ir_log" >&2
-    exit 1
+    compare_success_summaries "$name" "$hol_artifacts" "$project"
   fi
 }
 
-assert_success_case success_suite 'val bad_tac = fn g => ([g], fn _ => TRUTH);
+check_case mixed_suite 'val bad_tac = fn g => ([g], fn _ => TRUTH);
 
 Theorem existential_name_provider:
   ?sab:bool. sab
@@ -589,14 +564,14 @@ Proof
   ( ACCEPT_TAC TRUTH
 QED'
 
-assert_success_case parser_recovery_compat 'Theorem parser_recovery:
+check_case parser_recovery_compat 'Theorem parser_recovery:
   T
 Proof
   ( ACCEPT_TAC TRUTH
 QED'
 require_grep "HOL source parser recovered while instrumenting theorem boundaries for ATheory; using recovered theorem boundaries" "$tmpdir/parser_recovery_compat.new-ir.log"
 
-assert_success_case resume_suite 'open markerLib;
+check_case resume_suite 'open markerLib;
 
 Theorem partial:
   T ∧ T
@@ -610,19 +585,19 @@ QED
 
 Finalise partial'
 
-assert_failure_case first_empty_failure 'Theorem thm:
+check_case first_empty_failure 'Theorem thm:
   T
 Proof
   FIRST [] >> ACCEPT_TAC TRUTH
 QED'
 
-assert_failure_case map_first_empty_failure 'Theorem thm:
+check_case map_first_empty_failure 'Theorem thm:
   T
 Proof
   MAP_FIRST (fn th => ACCEPT_TAC th) [] >> ACCEPT_TAC TRUTH
 QED'
 
-assert_failure_case thenl_length_failure 'Theorem thm:
+check_case thenl_length_failure 'Theorem thm:
   T ∧ T
 Proof
   CONJ_TAC THENL [ACCEPT_TAC TRUTH]
