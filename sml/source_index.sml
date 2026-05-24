@@ -63,8 +63,7 @@ fun dat_path root rel name = theory_obj_path root rel name ".dat"
 
 fun theory_artifacts root rel theory =
   { generated = [theory_obj_path root rel theory ".sig",
-                 theory_obj_path root rel theory ".sml",
-                 theory_obj_path root rel theory ".txt"],
+                 theory_obj_path root rel theory ".sml"],
     objects = [obj_path root rel ".uo", theory_obj_path root rel theory ".ui",
                theory_obj_path root rel theory ".uo"],
     theory_data = [dat_path root rel theory] }
@@ -86,8 +85,7 @@ fun make_source package policies kind logical_name source_path relative_path art
 
 fun generated_theory_artifact file =
   has_suffix "Theory.sml" file orelse
-  has_suffix "Theory.sig" file orelse
-  has_suffix "Theory.txt" file
+  has_suffix "Theory.sig" file
 
 fun classify package source_root artifact_root policies abs_path =
   let

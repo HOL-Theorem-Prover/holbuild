@@ -36,7 +36,7 @@ printf 'ok\n' > "$project/.holbuild/checkpoints/pkg/src/theory.deps/key/deps_loa
 printf 'meta\n' > "$project/.holbuild/checkpoints/pkg/src/theory.deps/key/deps_loaded.save.meta"
 printf 'prefix\n' > "$project/.holbuild/checkpoints/pkg/src/theory.deps/key/deps_loaded.save.prefix"
 printf 'tmp\n' > "$cache/tmp/old/file"
-printf 'holbuild-cache-action-v1\nblob dat deadbeef\n' > "$cache/actions/old/manifest"
+printf 'holbuild-cache-action-v2\nblob dat deadbeef\n' > "$cache/actions/old/manifest"
 printf 'blob\n' > "$cache/blobs/deadbeef"
 
 gc_log=$tmpdir/gc.log

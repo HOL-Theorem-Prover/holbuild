@@ -293,8 +293,7 @@ fun write_plain_final_context_loader {sig_path, sml_path, path, mldeps_report} =
 fun generated_outputs node =
   let val generated = #generated (source_artifacts node)
   in {sig_path = one_with_suffix ".sig" generated,
-      sml_path = one_with_suffix ".sml" generated,
-      txt_path = one_with_suffix ".txt" generated}
+      sml_path = one_with_suffix ".sml" generated}
   end
 
 fun theory_outputs node =
@@ -323,7 +322,6 @@ fun retained_goalfrag_trace_log project node input_key =
   Path.concat(log_dir project, input_key ^ "-" ^ logical_name node ^ "-goalfrag-trace.log")
 
 fun staged_theory_file stage node ext = Path.concat(Path.concat(stage, ".hol/objs"), logical_name node ^ ext)
-fun staged_theory_doc_file stage node = Path.concat(stage, logical_name node ^ ".txt")
 fun staged_dat_reference stage node = Path.concat(stage, logical_name node ^ ".dat")
 
 fun canonical_path path = Path.mkCanonical path handle Path.InvalidArc => path
@@ -1077,16 +1075,15 @@ fun cache_blob root path =
     hash
   end
 
-fun cache_manifest_text {input_key, sig_hash, sml_hash, txt_hash, dat_hash, mldeps} =
+fun cache_manifest_text {input_key, sig_hash, sml_hash, dat_hash, mldeps} =
   String.concatWith "\n"
-    (["holbuild-cache-action-v1",
+    (["holbuild-cache-action-v2",
       "input_key=" ^ input_key,
       "kind=theory",
       "mldeps"] @
      map (fn dep => "mldep " ^ dep) mldeps @
      ["blob sig " ^ sig_hash,
       "blob sml " ^ sml_hash,
-      "blob txt " ^ txt_hash,
       "blob dat " ^ dat_hash]) ^ "\n"
 
 fun cache_manifest_lines text = String.tokens (fn c => c = #"\n") text
@@ -1109,7 +1106,7 @@ fun require_sha1 role hash =
   if valid_sha1_text hash then hash
   else raise Error ("cache manifest invalid " ^ role ^ " blob hash: " ^ hash)
 
-fun known_blob_role role = role = "sig" orelse role = "sml" orelse role = "sml-template" orelse role = "txt" orelse role = "dat"
+fun known_blob_role role = role = "sig" orelse role = "sml" orelse role = "sml-template" orelse role = "dat"
 
 fun add_manifest_blob role hash blobs =
   if not (known_blob_role role) then
@@ -1177,7 +1174,7 @@ fun add_mldep dep deps =
   else dep :: deps
 
 fun parse_cache_manifest_line input_key line (saw_header, saw_input, saw_kind, saw_mldeps, blobs, mldeps) =
-  if line = "holbuild-cache-action-v1" then
+  if line = "holbuild-cache-action-v2" then
     if saw_header then raise Error "cache manifest duplicate header"
     else (true, saw_input, saw_kind, saw_mldeps, blobs, mldeps)
   else if line = "input_key=" ^ input_key then
@@ -1214,7 +1211,6 @@ fun cache_manifest_blobs_from_lines input_key lines =
     in
       {sig_hash = blob_from_manifest "sig" blobs,
        sml_hash = sml_blob_from_manifest blobs,
-       txt_hash = blob_from_manifest "txt" blobs,
        dat_hash = blob_from_manifest "dat" blobs,
        mldeps = stable_mldeps}
     end
@@ -1226,21 +1222,19 @@ fun cache_manifest_blobs root input_key =
 
 fun cache_entry_usable root input_key text =
   let
-    val {sig_hash, sml_hash, txt_hash, dat_hash, ...} =
+    val {sig_hash, sml_hash, dat_hash, ...} =
       cache_manifest_blobs_from_lines input_key (cache_manifest_lines text)
   in
     file_hash_matches (HolbuildCache.blob_path root sig_hash) sig_hash andalso
     file_hash_matches (HolbuildCache.blob_path root sml_hash) sml_hash andalso
-    file_hash_matches (HolbuildCache.blob_path root txt_hash) txt_hash andalso
     file_hash_matches (HolbuildCache.blob_path root dat_hash) dat_hash
   end
   handle _ => false
 
-fun cache_manifest_output_summary {sig_hash, sml_hash, txt_hash, dat_hash, mldeps} =
+fun cache_manifest_output_summary {sig_hash, sml_hash, dat_hash, mldeps} =
   String.concat
     ["sig=", sig_hash,
      " sml=", sml_hash,
-     " txt=", txt_hash,
      " dat=", dat_hash,
      " mldeps=", Int.toString (length mldeps)]
 
@@ -1330,15 +1324,14 @@ fun theory_cache_keys project plan node input_key =
 fun cache_warning_subject node =
   String.concat [logical_name node, " (", source_file node, ")"]
 
-fun publish_cache_manifest root cache_key subject staged_sig published_sml published_txt staged_dat cache_mldeps =
+fun publish_cache_manifest root cache_key subject staged_sig published_sml staged_dat cache_mldeps =
   let
     val manifest_path = HolbuildCache.action_manifest root cache_key
     val sig_hash = cache_blob root staged_sig
     val sml_hash = cache_blob root published_sml
-    val txt_hash = cache_blob root published_txt
     val dat_hash = cache_blob root staged_dat
     val manifest = cache_manifest_text {input_key = cache_key, sig_hash = sig_hash,
-                                        sml_hash = sml_hash, txt_hash = txt_hash,
+                                        sml_hash = sml_hash,
                                         dat_hash = dat_hash,
                                         mldeps = cache_mldeps}
     val existing = current_metadata manifest_path
@@ -1353,7 +1346,7 @@ fun publish_cache_manifest root cache_key subject staged_sig published_sml publi
       | NONE => write_text manifest_path manifest
   end
 
-fun publish_theory_cache project plan node input_key staged_sig published_sml published_txt staged_dat mldeps =
+fun publish_theory_cache project plan node input_key staged_sig published_sml staged_dat mldeps =
   let
     val root = cache_root ()
     val _ = HolbuildCache.ensure_layout root
@@ -1363,7 +1356,7 @@ fun publish_theory_cache project plan node input_key staged_sig published_sml pu
     val cache_key = if path_dependent then path_dependent_cache_key project context_key else context_key
     fun drop_stale_manifest key = remove_file (HolbuildCache.action_manifest root key)
     val subject = cache_warning_subject node
-    fun publish () = publish_cache_manifest root cache_key subject staged_sig published_sml published_txt staged_dat cache_mldeps
+    fun publish () = publish_cache_manifest root cache_key subject staged_sig published_sml staged_dat cache_mldeps
     fun skip_locked_publish () = ()
   in
     ((if cache_key <> input_key then
@@ -1458,12 +1451,10 @@ fun write_local_theory_manifests plan node mldeps =
 fun remove_failed_cache_outputs project node =
   let
     val {sig_path, sml_path, data_path, script_uo, theory_ui, theory_uo} = theory_outputs node
-    val {txt_path, ...} = generated_outputs node
     val paths =
       [data_path, hfs_remapped_path data_path,
        sig_path, hfs_remapped_path sig_path,
        sml_path, hfs_remapped_path sml_path,
-       txt_path, hfs_remapped_path txt_path,
        script_uo, hfs_remapped_path script_uo,
        theory_ui, hfs_remapped_path theory_ui,
        theory_uo, hfs_remapped_path theory_uo]
@@ -1496,17 +1487,14 @@ fun materialize_theory_cache_key project plan input_key cache_key node =
       case transient_stage_mldep_in_manifest manifest_text of
           SOME dep => transient_cache_manifest_error root cache_key manifest manifest_text dep
         | NONE => ()
-    val {sig_hash, sml_hash, txt_hash, dat_hash, mldeps} =
+    val {sig_hash, sml_hash, dat_hash, mldeps} =
       cache_manifest_blobs_from_lines cache_key (cache_manifest_lines manifest_text)
     val {sig_path, sml_path, data_path, ...} = theory_outputs node
-    val {txt_path, ...} = generated_outputs node
     fun install () =
       (copy_blob root dat_hash data_path;
        copy_blob root dat_hash (hfs_remapped_path data_path);
        copy_blob root sig_hash sig_path;
        copy_blob root sig_hash (hfs_remapped_path sig_path);
-       copy_blob root txt_hash txt_path;
-       copy_blob root txt_hash (hfs_remapped_path txt_path);
        copy_blob root sml_hash sml_path;
        write_text sml_path (replace_all cache_sml_token data_path (read_text sml_path));
        write_text (hfs_remapped_path sml_path) (read_text sml_path);
@@ -2130,7 +2118,6 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
     val {sig_path, sml_path, data_path, script_uo, theory_ui, theory_uo} = theory_outputs node
     val staged_sig = staged_theory_file stage node ".sig"
     val staged_sml = staged_theory_file stage node ".sml"
-    val staged_txt = staged_theory_doc_file stage node
     val staged_dat = staged_theory_file stage node ".dat"
     val _ = remove_tree stage
     val _ = ensure_dir stage
@@ -2287,11 +2274,8 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
       else ()
     val _ = copy_binary staged_dat data_path
     val _ = copy_binary staged_dat (hfs_remapped_path data_path)
-    val {txt_path, ...} = generated_outputs node
     val _ = copy_binary staged_sig sig_path
     val _ = copy_binary staged_sig (hfs_remapped_path sig_path)
-    val _ = copy_binary staged_txt txt_path
-    val _ = copy_binary staged_txt (hfs_remapped_path txt_path)
     val dat_replacements = stage_dat_replacements stage node data_path
     val _ = copy_rewriting_path {src = staged_sml, dst = sml_path,
                                  replacements = dat_replacements}
@@ -2300,7 +2284,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
                                   generated_holdep_mldeps plan tc staged_sml)
     val _ =
       if cache_allowed then
-        publish_theory_cache project plan node input_key staged_sig sml_path txt_path staged_dat mldeps
+        publish_theory_cache project plan node input_key staged_sig sml_path staged_dat mldeps
       else ()
   in
     write_local_theory_manifests plan node mldeps;
