@@ -1867,6 +1867,35 @@ fun source_location_text source_path source_text offset =
     String.concat [source_path, ":", Int.toString line, ":", Int.toString col]
   end
 
+fun trim_left s =
+  let
+    val n = size s
+    fun loop i =
+      if i >= n then ""
+      else
+        let val c = String.sub(s, i)
+        in
+          if c = #" " orelse c = #"\t" orelse c = #"\r" then loop (i + 1)
+          else String.extract(s, i, NONE)
+        end
+  in loop 0 end
+
+fun starts_with prefix s =
+  size s >= size prefix andalso String.substring(s, 0, size prefix) = prefix
+
+fun theory_header_line source_text =
+  List.find (fn line => starts_with "Theory " (trim_left line))
+            (String.fields (fn c => c = #"\n") source_text)
+
+fun modern_theory_export_footer source_text =
+  case theory_header_line source_text of
+      NONE => ""
+    | SOME line =>
+        if String.isSubstring "[no_sig_docs]" line then
+          "\nval _ = Feedback.set_trace \"TheoryPP.include_html_docs\" 0 before Theory.export_theory();\n"
+        else
+          "\nval _ = Theory.export_theory();\n"
+
 fun checkpoint_resume_message node lines =
   HolbuildStatus.message_stdout
     (String.concat ("resuming " ^ logical_name node ^ "\n" :: map (fn line => "  " ^ line ^ "\n") lines))
@@ -1950,7 +1979,7 @@ fun failed_prefix_resume_source policy timeout_marker plan_only_marker source ch
          plan_only_marker = plan_only_marker,
          new_ir = proof_ir_enabled policy}
   in
-    prelude ^ replay_block ^ suffix
+    prelude ^ replay_block ^ suffix ^ modern_theory_export_footer source
   end
 
 datatype failure_repl_checkpoint =
@@ -2047,7 +2076,8 @@ fun write_theory_script policy project base_context plan keys input_key toolchai
         end
       fun run_from_replay {boundary, path, safe_name, failure_checkpoints} =
         let
-          val _ = write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_text boundary checkpoints terminations)
+          val _ = write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_text boundary checkpoints terminations ^
+                                            modern_theory_export_footer source_text)
           val _ = theorem_context_resume_message node source_text safe_name boundary
         in
           {context = HolState path, files = [staged_script], failure_checkpoints = failure_checkpoints @ [deps_loaded]}
