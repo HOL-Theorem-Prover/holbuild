@@ -88,9 +88,10 @@ package.
 
 The target bootstrap boundary is `HOLDIR/bin/hol.state0`, used through HOL's
 `--bare` mode. The bare heap provides the kernel/parser/loader infrastructure,
-the primitive `min`/`bool` theory base, and the SML modules already reported by
-`Meta.loaded ()` in a bare session. Everything else under the selected HOL
-checkout should be modeled as source or cacheable holbuild output.
+the primitive `min`/`bool` theory base, modules reported by `Meta.loaded ()` in a
+bare session, and a small explicitly modeled bootstrap-support set such as
+`CompilerSpecific`. Everything else under the selected HOL checkout should be
+modeled as source or cacheable holbuild output.
 
 Non-bare theory scripts are ordinary source actions too; they receive the normal
 full-HOL environment by implicit dependencies on the HOL sources that construct
@@ -104,9 +105,10 @@ of `hol.state` without making a prebuilt full heap the semantic boundary.
 `hol.state` is a compatibility/distribution artifact, not the semantic dependency
 boundary for source builds.
 
-Target workflow: after `git pull` in a HOL checkout, `hol build` should be able
-to rebuild any invalidated bootstrap/base context hermetically into the checkout's
-own `.holbuild/` state, or restore a validated equivalent from the global cache.
+Target future in-tree workflow: after `git pull` in a HOL checkout, `hol build`
+should be able to rebuild any invalidated bootstrap/base context hermetically
+into the checkout's own `.holbuild/` state, or restore a validated equivalent
+from the global cache.
 It should not require the user to run a separate global HOL rebuild first, and it
 should not silently depend on a stale configured heap from before the pull.
 
@@ -274,6 +276,14 @@ tool/example side effects; they are not include paths and do not make arbitrary
 
 ## Dependency resolution
 
+Script execution dependencies and generated-theory load dependencies are
+distinct. Script execution dependencies are source-level dependencies inferred
+from `HOLSource.fileToReader` plus `Holdep_tokens.reader_deps`, plus manifest
+action policy and implicit-HOL Holmakefile rule imports. Generated `FooTheory`
+load dependencies are not inferred by scanning generated `FooTheory.sml`; they
+come from HOL-exported metadata: theory parents via `Theory.parents "Foo"` and ML
+deps via `Theory.current_ML_deps()`.
+
 Resolution happens before cache lookup.
 
 ```text
@@ -354,10 +364,11 @@ cross-package guessed signature companions as graph semantics. The implicit
 `HOL` package additionally imports explicit local Holmakefile rule prerequisites
 as source metadata, again resolving only through the package index.
 Same-package `.sig`/`.sml` pairs are one module interface/implementation pair.
-Generated theory modules also get internal load manifests from HOL's recorded
-theory metadata (`Theory.current_ML_deps` / `Theory.add_ML_dependency`), so
-legitimate generated dependencies are preserved without parsing generated SML
-text.
+Generated theory modules get internal load manifests from HOL-exported metadata,
+not from scanning generated `*Theory.sml`: exported theory parents come from
+`Theory.parents "<thy>"`, and ML dependencies come from `Theory.current_ML_deps()` /
+`Theory.add_ML_dependency`. This preserves legitimate generated dependencies
+without approximating generated SML text.
 Source-level `use "file"` is rejected in project build actions in v1 because it
 is an arbitrary path/input outside the resolved package graph; declare a project
 module and `load` it instead. Generated HOL source is modeled by manifest

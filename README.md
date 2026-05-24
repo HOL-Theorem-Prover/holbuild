@@ -13,12 +13,14 @@ The current implementation intentionally focuses on:
 - reuses HOL's existing SML TOML parser from `$HOLDIR/tools/Holmake/toml`
 - accepts logical build targets such as `MyTheory`, not object filenames such as `MyTheory.uo`
 - owns source discovery and maps outputs to project-level `.holbuild/`
-- infers ordinary theory/module dependencies with HOL's source reader and Holdep lexer, resolving names through the project graph
+- treats the selected HOL checkout as an implicit source package named `HOL`, selected by `--holdir`, `HOLBUILD_HOLDIR`, or `HOLDIR`
+- source-builds HOL dependencies from `hol.state0` / `hol --bare`, not from prebuilt `hol.state`, `$HOLDIR/sigobj`, `.hol/objs`, or Holmake include paths
+- infers ordinary theory/module dependencies with `HOLSource.fileToReader` plus `Holdep_tokens.reader_deps`, resolving names through the project graph
 - parses transitive dependency manifests and local `.holconfig.toml` path overrides
 - materializes dependency plans under project `.holbuild/deps/<package>/`
 - rejects duplicate logical theory/module names across the resolved graph and duplicate physical source paths across package members; a same-package `.sig`/`.sml` pair is one module interface/implementation pair
 - includes Holdep-token project SML/SIG dependencies in build plans and internal load manifests
-- records generated theory ML dependencies from HOL theory metadata in internal load manifests
+- records generated theory load dependencies from HOL metadata: exported parents via `Theory.parents` plus ML deps via `Theory.current_ML_deps()`
 - rejects source-level `use "file"` in project build actions; declare/load project modules instead
 - supports per-action policy for explicit logical dependencies/loadable modules, extra dependencies, cache disabling, and always-rerun actions
 - computes current-format source/resolved-dependency input keys for planned actions
@@ -139,8 +141,10 @@ or `--quiet` to suppress per-node success lines. `--maxheap MB` and
 `run`/`repl`, matching HOL's requirement that runtime options precede the
 subcommand.
 `--skip-checkpoints` disables theory checkpoint `.save`/`.ok` creation without
-disabling proof instrumentation. By default checkpoints may be created during
-a build but are removed after successful artifact/metadata writes.
+disabling proof instrumentation. By default, transient build checkpoints may be
+created during a build and removed after successful artifact/metadata writes;
+reusable proof-replay or shared-context checkpoints may be retained according to
+checkpoint policy and later bounded by `holbuild gc`.
 `--skip-goalfrag` opts out of modern theorem instrumentation.
 `--no-auto-contexts` disables automatic shared execution-context checkpoints;
 it is intended for debugging, not normal builds.
