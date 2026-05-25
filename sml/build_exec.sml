@@ -1060,6 +1060,23 @@ fun timeout_equal (NONE, NONE) = true
   | timeout_equal (SOME a, SOME b) = Real.== (a, b)
   | timeout_equal _ = false
 
+(* Older cache/checkpoint/action metadata predates explicit proof-timeout
+   fields. Those artifacts were produced under the historical CLI default. *)
+val legacy_default_proof_timeout = SOME 2.5
+
+fun legacy_proof_timeout lines field_name =
+  let
+    val prefix = field_name ^ "="
+    fun line_timeout line =
+      if String.isPrefix prefix line then
+        parse_timeout_text (String.extract(line, size prefix, NONE))
+      else NONE
+  in
+    case first_some line_timeout lines of
+        SOME timeout => timeout
+      | NONE => legacy_default_proof_timeout
+  end
+
 fun file_hash_matches path hash =
   file_exists path andalso file_hash path = hash
   handle _ => false
@@ -1221,17 +1238,7 @@ fun cache_manifest_blobs root input_key =
   let val manifest = HolbuildCache.action_manifest root input_key
   in cache_manifest_blobs_from_lines input_key (cache_manifest_lines (read_text manifest)) end
 
-fun cache_manifest_proof_timeout lines =
-  let
-    fun line_timeout line =
-      if String.isPrefix "proof-timeout=" line then
-        parse_timeout_text (String.extract(line, size "proof-timeout=", NONE))
-      else NONE
-  in
-    case first_some line_timeout lines of
-        SOME timeout => timeout
-      | NONE => NONE
-  end
+fun cache_manifest_proof_timeout lines = legacy_proof_timeout lines "proof-timeout"
 
 fun cache_manifest_proof_timeout_text input_key text =
   (cache_manifest_blobs_from_lines input_key (cache_manifest_lines text);
@@ -1750,14 +1757,8 @@ fun deps_checkpoint_exists path deps_key =
 
 fun checkpoint_proof_timeout path =
   case current_metadata (path ^ ".ok") of
-      NONE => NONE
-    | SOME text =>
-        case metadata_value "proof_timeout" (metadata_lines text) of
-            NONE => NONE
-          | SOME value =>
-              case parse_timeout_text value of
-                  SOME timeout => timeout
-                | NONE => NONE
+      NONE => legacy_default_proof_timeout
+    | SOME text => legacy_proof_timeout (metadata_lines text) "proof_timeout"
 
 fun checkpoint_timeout_satisfies requested_timeout path =
   timeout_satisfies requested_timeout (checkpoint_proof_timeout path)
@@ -2493,13 +2494,7 @@ fun metadata_input_key_matches input_key text =
       SOME old_key => old_key = input_key
     | NONE => false
 
-fun metadata_proof_timeout text =
-  case metadata_value "proof_timeout" (metadata_lines text) of
-      NONE => NONE
-    | SOME value =>
-        case parse_timeout_text value of
-            SOME timeout => timeout
-          | NONE => NONE
+fun metadata_proof_timeout text = legacy_proof_timeout (metadata_lines text) "proof_timeout"
 
 fun metadata_timeout_satisfies policy node text =
   case #kind (HolbuildBuildPlan.source_of node) of

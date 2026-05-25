@@ -84,6 +84,23 @@ if grep -q "tactic_timeout=\|goalfrag=" "$project/.holbuild/dep/dep/src/AScript.
   exit 1
 fi
 
+python3 - "$HOLBUILD_CACHE" <<'PY'
+import pathlib
+import sys
+for manifest in pathlib.Path(sys.argv[1]).glob('actions/*/manifest'):
+    lines = [line for line in manifest.read_text().splitlines() if not line.startswith('proof-timeout=')]
+    manifest.write_text('\n'.join(lines) + '\n')
+PY
+rm -rf "$project/.holbuild"
+legacy_cache_log=$tmpdir/legacy-cache.log
+(cd "$project" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" --holdir "$HOLDIR" build --tactic-timeout 180 BTheory) > "$legacy_cache_log" 2>&1
+require_file "$project/.holbuild/deps/dep/obj/src/ATheory.dat"
+require_file "$project/.holbuild/obj/src/BTheory.dat"
+if grep -q "insufficient tactic-timeout contract" "$legacy_cache_log"; then
+  echo "legacy cache manifest without proof-timeout did not satisfy larger timeout" >&2
+  exit 1
+fi
+
 root_timeout_project=$tmpdir/root-timeout
 mkdir -p "$root_timeout_project/src"
 cat > "$root_timeout_project/holproject.toml" <<'TOML'
