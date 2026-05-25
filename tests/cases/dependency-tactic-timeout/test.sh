@@ -58,20 +58,23 @@ val _ = export_theory();
 SML
 
 build_log=$tmpdir/build.log
-(cd "$project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build --tactic-timeout 0.1 BTheory) > "$build_log" 2>&1
+if (cd "$project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build --tactic-timeout 0.1 BTheory) > "$build_log" 2>&1; then
+  echo "dependency package ignored entry closure tactic timeout" >&2
+  exit 1
+fi
+require_grep "tactic timed out after 0.1s while building ATheory: slow_tac" "$build_log"
+
+passing_build_log=$tmpdir/passing-build.log
+(cd "$project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build --tactic-timeout 1.0 BTheory) > "$passing_build_log" 2>&1
 require_file "$project/.holbuild/deps/dep/obj/src/ATheory.dat"
 require_file "$project/.holbuild/obj/src/BTheory.dat"
 if grep -q "tactic_timeout=\|goalfrag=" "$project/.holbuild/dep/dep/src/AScript.sml.key" "$project/.holbuild/dep/consumer/src/BScript.sml.key"; then
   echo "execution policy leaked into final action metadata" >&2
   exit 1
 fi
-if grep -q "tactic timed out while building ATheory" "$build_log"; then
-  echo "dependency package used root tactic timeout" >&2
-  exit 1
-fi
 
 changed_root_timeout_log=$tmpdir/changed-root-timeout.log
-(cd "$project" && "$HOLBUILD_BIN" --verbose --holdir "$HOLDIR" build --tactic-timeout 0.2 BTheory) > "$changed_root_timeout_log" 2>&1
+(cd "$project" && "$HOLBUILD_BIN" --verbose --holdir "$HOLDIR" build --tactic-timeout 2.0 BTheory) > "$changed_root_timeout_log" 2>&1
 require_grep "ATheory is up to date" "$changed_root_timeout_log"
 require_grep "BTheory is up to date" "$changed_root_timeout_log"
 if grep -q "tactic_timeout=\|goalfrag=" "$project/.holbuild/dep/dep/src/AScript.sml.key" "$project/.holbuild/dep/consumer/src/BScript.sml.key"; then

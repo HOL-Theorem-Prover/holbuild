@@ -94,6 +94,19 @@ roots = "MainTheory"
 TOML
 expect_context_failure bad_roots_type "roots must be a string array"
 
+make_project bad_root_timeout
+cat > "$tmpdir/bad_root_timeout/holproject.toml" <<'TOML'
+[project]
+name = "bad_root_timeout"
+
+[build]
+roots = ["src/MainScript.sml"]
+
+[build.root_tactic_timeouts]
+"src/OtherScript.sml" = 10
+TOML
+expect_context_failure bad_root_timeout "build.root_tactic_timeouts references unknown root: src/OtherScript.sml"
+
 make_project absolute_member
 cat > "$tmpdir/absolute_member/holproject.toml" <<'TOML'
 [project]

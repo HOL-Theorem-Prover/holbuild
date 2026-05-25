@@ -80,11 +80,11 @@ require_grep "ATheory built" "$success_log"
 require_file "$success_project/.holbuild/obj/src/AScript.uo"
 require_file "$success_project/.holbuild/obj/src/ATheory.uo"
 require_file "$success_project/.holbuild/obj/src/ATheory.dat"
-if find "$success_project/.holbuild/checkpoints" -path '*.decls/*/proof_ir_v3/*/simple_def_context.save' -print -quit | grep -q .; then
+if find "$success_project/.holbuild/checkpoints" -path '*.decls/*/proof_ir_v3*/*/simple_def_context.save' -print -quit | grep -q .; then
   echo "unexpected definition-context checkpoint for non-termination definition" >&2
   exit 1
 fi
-if ! find "$success_project/.holbuild/checkpoints" -path '*.decls/*/proof_ir_v3/*/test_def_context.save' -print -quit | grep -q .; then
+if ! find "$success_project/.holbuild/checkpoints" -path '*.decls/*/proof_ir_v3*/*/test_def_context.save' -print -quit | grep -q .; then
   echo "missing definition-context checkpoint for successful termination definition" >&2
   exit 1
 fi
@@ -118,7 +118,7 @@ if (cd "$resume_project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build ATheory) > 
 fi
 require_grep "termination: second_def (line " "$resume_first_log"
 require_grep "expected second termination failure" "$resume_first_log"
-require_file "$(find "$resume_project/.holbuild/checkpoints" -path '*.decls/*/proof_ir_v3/*/first_def_context.save' -print -quit)"
+require_file "$(find "$resume_project/.holbuild/checkpoints" -path '*.decls/*/proof_ir_v3*/*/first_def_context.save' -print -quit)"
 rm -rf "$resume_project/.holbuild/checkpoints/termination-diagnostics/src/AScript.sml.decls"
 
 resume_missing_decl_log=$tmpdir/resume-missing-decl-dir.log
@@ -132,7 +132,7 @@ if grep -q "No such file or directory" "$resume_missing_decl_log"; then
   echo "definition checkpoint save failed to recreate parent dirs" >&2
   exit 1
 fi
-require_file "$(find "$resume_project/.holbuild/checkpoints" -path '*.decls/*/proof_ir_v3/*/first_def_context.save' -print -quit)"
+require_file "$(find "$resume_project/.holbuild/checkpoints" -path '*.decls/*/proof_ir_v3*/*/first_def_context.save' -print -quit)"
 
 resume_second_log=$tmpdir/resume-second.log
 if (cd "$resume_project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build ATheory) > "$resume_second_log" 2>&1; then

@@ -143,6 +143,76 @@ fun reject_object_targets targets = List.app reject_object_target targets
 fun default_build_targets project index targets =
   if null targets then HolbuildSourceIndex.default_targets index project else targets
 
+fun timeout_min (NONE, timeout) = timeout
+  | timeout_min (timeout, NONE) = timeout
+  | timeout_min (SOME a, SOME b) = SOME (Real.min(a, b))
+
+fun add_node_timeout node timeout acc =
+  let val node_key = HolbuildBuildPlan.key node
+      fun insert entries =
+        case entries of
+            [] => [(node_key, timeout)]
+          | (key, old_timeout) :: rest =>
+              if key = node_key then (key, timeout_min (old_timeout, timeout)) :: rest
+              else (key, old_timeout) :: insert rest
+  in
+    insert acc
+  end
+
+fun entry_root_timeout project cli_timeout default_timeout root =
+  case cli_timeout of
+      SOME timeout => timeout
+    | NONE =>
+        case HolbuildProject.root_tactic_timeout_for project root of
+            SOME timeout => timeout
+          | NONE => default_timeout
+
+fun implicit_entry_roots package index =
+  List.map
+    (fn source => (#relative_path source, #logical_name source))
+    (List.filter
+       (fn source => #package source = HolbuildProject.package_name package andalso
+                     #kind source = HolbuildSourceIndex.TheoryScript)
+       index)
+
+fun entry_roots project index =
+  let
+    val package = HolbuildProject.project_package project
+    val roots = HolbuildProject.package_roots package
+  in
+    if null roots then implicit_entry_roots package index
+    else ListPair.zip (roots, HolbuildSourceIndex.roots_for_package index package)
+  end
+
+fun node_named_in_plan plan logical =
+  case List.filter (fn node => HolbuildBuildPlan.logical_name node = logical) plan of
+      [] => NONE
+    | node :: _ => SOME node
+
+fun add_entry_closure_timeout plan (logical, timeout) acc =
+  case node_named_in_plan plan logical of
+      NONE => acc
+    | SOME root =>
+        List.foldl (fn (node, acc') => add_node_timeout node timeout acc')
+                   acc
+                   (HolbuildBuildPlan.transitive_project_deps plan root @ [root])
+
+fun plan_tactic_timeouts plan timeout =
+  List.foldl (fn (node, acc) => add_node_timeout node timeout acc) [] plan
+
+fun entry_tactic_timeouts project index entry_plan cli_timeout default_timeout =
+  let
+    val entries = entry_roots project index
+    val constrained_entries =
+      map (fn (root, logical) =>
+             (logical, entry_root_timeout project cli_timeout default_timeout root))
+          entries
+  in
+    List.foldl (fn (entry, acc) => add_entry_closure_timeout entry_plan entry acc)
+               []
+               constrained_entries
+  end
+
 fun source_key source =
   #package source ^ "\000" ^ #relative_path source ^ "\000" ^ #logical_name source
 
@@ -371,18 +441,20 @@ fun build tc cli_jobs args =
       else if not goalfrag andalso (Option.isSome goalfrag_plan orelse goalfrag_trace) then
         raise Error "--goalfrag-plan/--goalfrag-trace require theorem instrumentation; remove --skip-goalfrag"
       else ()
-    fun build_options_for force_targets =
+    fun default_tactic_timeout () =
+      case #build_tactic_timeout project of
+          NONE => SOME 2.5
+        | some => some
+    fun build_options_for index entry_plan plan force_targets =
       {use_cache = use_cache,
        force = force,
        force_targets = force_targets,
        skip_checkpoints = skip_checkpoints,
        goalfrag = goalfrag,
        new_ir = new_ir,
-       tactic_timeout =
-         if tactic_timeout_set then tactic_timeout
-         else (case #build_tactic_timeout project of
-                 NONE => SOME 2.5
-               | some => some),
+       node_tactic_timeouts =
+         if tactic_timeout_set then plan_tactic_timeouts plan tactic_timeout
+         else entry_tactic_timeouts project index entry_plan NONE (default_tactic_timeout ()),
        goalfrag_plan = goalfrag_plan,
        goalfrag_trace = goalfrag_trace,
        repl_on_failure = repl_on_failure,
@@ -394,23 +466,25 @@ fun build tc cli_jobs args =
         val targets = timed_phase "targets.default" (fn () => default_build_targets project index requested_targets)
         val _ = reject_object_targets targets
         val plan = timed_phase "build.plan" (fn () => HolbuildBuildPlan.plan (#holdir tc) index targets)
+        val entry_targets = map #2 (entry_roots project index)
+        val entry_plan = timed_phase "entry_timeout.plan" (fn () => HolbuildBuildPlan.plan (#holdir tc) index entry_targets)
         val _ = if null requested_targets andalso not (null targets) then
                   warn_unreachable_root_scripts project index plan
                 else ()
         val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
       in
-        (targets, plan, toolchain_key)
+        (index, targets, entry_plan, plan, toolchain_key)
       end
     fun describe_dry_run () =
-      let val (force_targets, plan, toolchain_key) = prepare_plan ()
-          val build_options = build_options_for force_targets
+      let val (index, force_targets, entry_plan, plan, toolchain_key) = prepare_plan ()
+          val build_options = build_options_for index entry_plan plan force_targets
       in
         timed_phase "dry_run.describe"
           (fn () => HolbuildBuildPlan.describe (HolbuildBuildExec.build_config_lines_for_node build_options project) toolchain_key plan)
       end
     fun execute_build () =
-      let val (force_targets, plan, toolchain_key) = prepare_plan ()
-          val build_options = build_options_for force_targets
+      let val (index, force_targets, entry_plan, plan, toolchain_key) = prepare_plan ()
+          val build_options = build_options_for index entry_plan plan force_targets
       in
         timed_phase "build.execute"
           (fn () => HolbuildBuildExec.build build_options tc project plan toolchain_key jobs)
@@ -445,7 +519,7 @@ fun build_heap tc cli_jobs target =
         val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
         val output_path = HolbuildProject.abs_under (#root project) output
       in
-        HolbuildBuildExec.build {use_cache = true, force = HolbuildBuildExec.ForceNone, force_targets = [], skip_checkpoints = false, goalfrag = true, new_ir = true, tactic_timeout = SOME 2.5, goalfrag_plan = NONE, goalfrag_trace = false, repl_on_failure = false, strict_parse = false}
+        HolbuildBuildExec.build {use_cache = true, force = HolbuildBuildExec.ForceNone, force_targets = [], skip_checkpoints = false, goalfrag = true, new_ir = true, node_tactic_timeouts = entry_tactic_timeouts project index plan NONE (SOME 2.5), goalfrag_plan = NONE, goalfrag_trace = false, repl_on_failure = false, strict_parse = false}
                                tc project plan toolchain_key jobs;
         HolbuildBuildExec.export_heap tc project plan output_path
       end

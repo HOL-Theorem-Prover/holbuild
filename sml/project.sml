@@ -6,6 +6,8 @@ structure FS = OS.FileSys
 
 datatype heap = Heap of {name : string, output : string, objects : string list}
 
+type root_tactic_timeout = {root : string, timeout : real option}
+
 datatype extra_input = ExtraInput of {path : string, absolute_path : string}
 
 datatype action_policy =
@@ -59,6 +61,7 @@ type t =
     members : string list,
     excludes : string list,
     roots : string list,
+    root_tactic_timeouts : root_tactic_timeout list,
     dependencies : dependency list,
     overrides : override list,
     local_build_excludes : string list,
@@ -157,11 +160,27 @@ fun int_at table key =
     | SOME (TOML.INTEGER n) => SOME n
     | SOME _ => die (key_text key ^ " must be an integer")
 
-fun real_at table key =
+fun real_value context value =
+  case value of
+      TOML.FLOAT r => r
+    | TOML.INTEGER n =>
+        (case Real.fromString (IntInf.toString n) of
+             SOME r => r
+           | NONE => die (context ^ " is too large"))
+    | _ => die (context ^ " must be a non-negative number")
+
+fun tactic_timeout_value context value =
+  let val seconds = real_value context value
+  in
+    if seconds < 0.0 then die (context ^ " must be a non-negative number")
+    else if seconds <= 0.0 then NONE
+    else SOME seconds
+  end
+
+fun tactic_timeout_at context table key =
   case lookup table key of
       NONE => NONE
-    | SOME (TOML.FLOAT r) => SOME r
-    | SOME _ => die (key_text key ^ " must be a real number")
+    | SOME value => tactic_timeout_value context value
 
 fun positive_int_field context n =
   if n >= IntInf.fromInt 1 then
@@ -373,7 +392,7 @@ fun validate_manifest_table table =
               ["holbuild", "project", "build", "dependencies", "run", "heap", "actions", "generate"] table
     val _ = Option.app (require_known_fields "project" ["name", "version"])
               (table_field table ["project"])
-    val _ = Option.app (require_known_fields "build" ["members", "exclude", "roots", "tactic_timeout"])
+    val _ = Option.app (require_known_fields "build" ["members", "exclude", "roots", "tactic_timeout", "root_tactic_timeouts"])
               (table_field table ["build"])
     val _ = Option.app (require_known_fields "run" ["heap", "loads"])
               (table_field table ["run"])
@@ -460,12 +479,31 @@ fun local_build_jobs table =
 fun local_build_tactic_timeout table =
   case table_field table ["build"] of
       NONE => NONE
-    | SOME build => real_at build ["tactic_timeout"]
+    | SOME build => tactic_timeout_at ".holconfig.toml build.tactic_timeout" build ["tactic_timeout"]
 
 fun build_tactic_timeout_from_manifest build =
   case build of
       NONE => NONE
-    | SOME t => real_at t ["tactic_timeout"]
+    | SOME t => tactic_timeout_at "build.tactic_timeout" t ["tactic_timeout"]
+
+fun root_tactic_timeouts_from_manifest build =
+  case build of
+      NONE => []
+    | SOME t =>
+        case table_field t ["root_tactic_timeouts"] of
+            NONE => []
+          | SOME entries =>
+              map (fn (root, value) =>
+                      {root = package_relative_path "build.root_tactic_timeouts" root,
+                       timeout = tactic_timeout_value ("build.root_tactic_timeouts." ^ root) value})
+                  entries
+
+fun validate_root_tactic_timeouts roots timeouts =
+  List.app
+    (fn {root, ...} =>
+        if member root roots then ()
+        else die ("build.root_tactic_timeouts references unknown root: " ^ root))
+    timeouts
 
 fun parse_local_config root =
   let val config = Path.concat(root, ".holconfig.toml")
@@ -497,6 +535,8 @@ fun parse_table_at table {manifest, root, artifact_root, local_config} =
     val members = package_relative_paths "build.members" (build_strings "members" ["."])
     val excludes = package_relative_paths "build.exclude" (build_strings "exclude" []) @ build_excludes
     val roots = package_relative_paths "build.roots" (build_strings "roots" [])
+    val root_tactic_timeouts = root_tactic_timeouts_from_manifest build
+    val _ = validate_root_tactic_timeouts roots root_tactic_timeouts
     val manifest_timeout = build_tactic_timeout_from_manifest build
   in
     { root = root,
@@ -507,6 +547,7 @@ fun parse_table_at table {manifest, root, artifact_root, local_config} =
       members = members,
       excludes = excludes,
       roots = roots,
+      root_tactic_timeouts = root_tactic_timeouts,
       dependencies = dependencies_at table,
       overrides = overrides,
       local_build_excludes = build_excludes,
@@ -570,6 +611,9 @@ fun package_members (Package {members, ...}) = members
 fun package_excludes (Package {excludes, ...}) = excludes
 fun package_roots (Package {roots, ...}) = roots
 fun package_artifact_root (Package {artifact_root, ...}) = artifact_root
+fun root_tactic_timeouts ({root_tactic_timeouts, ...} : t) = root_tactic_timeouts
+fun root_tactic_timeout_for ({root_tactic_timeouts, ...} : t) root =
+  Option.map #timeout (List.find (fn entry => #root entry = root) root_tactic_timeouts)
 fun package_generators (Package {generators, ...}) = generators
 fun artifact_root ({artifact_root, ...} : t) = artifact_root
 fun build_roots ({roots, ...} : t) = roots
@@ -724,7 +768,7 @@ fun packages (project : t) =
 
 fun describe (project : t) =
   let
-    val {root, artifact_root, manifest, name, version, members, excludes, roots, dependencies,
+    val {root, artifact_root, manifest, name, version, members, excludes, roots, root_tactic_timeouts, dependencies,
          overrides, local_build_excludes, local_build_jobs, build_tactic_timeout, run_heap, run_loads, heaps, action_policies, generators} = project
     fun opt label value =
       case value of NONE => () | SOME s => print (label ^ s ^ "\n")
@@ -737,6 +781,10 @@ fun describe (project : t) =
     print ("members: " ^ String.concatWith ", " members ^ "\n");
     print ("exclude: " ^ String.concatWith ", " excludes ^ "\n");
     print ("roots: " ^ String.concatWith ", " roots ^ "\n");
+    List.app (fn {root, timeout} =>
+                print ("root tactic_timeout: " ^ root ^ " = " ^
+                       (case timeout of NONE => "none" | SOME t => Real.toString t) ^ "\n"))
+             root_tactic_timeouts;
     List.app (fn dep => print ("dependency: " ^ dependency_to_string project dep ^ "\n")) dependencies;
     List.app (fn override => print ("override: " ^ override_to_string override ^ "\n")) overrides;
     Option.app (fn jobs => print ("local build.jobs: " ^ Int.toString jobs ^ "\n")) local_build_jobs;

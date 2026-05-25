@@ -621,10 +621,18 @@ proof IR: it still uses HOLSource parser recovery, but lowers `HOLSourceAST.exp`
 directly instead of using `TacticParse`/`goalFrag` as the executable semantics.
 `--goalfrag` is deprecated and selects the legacy GoalFrag/proof-manager path only
 for comparison/debugging. The old `--new-ir` build flag is accepted as a deprecated
-no-op because proof IR is now the default. The CLI default is 2.5 seconds per tactic step for the root package;
-`--tactic-timeout SECONDS` changes that root-package timeout, and
-`--tactic-timeout 0` disables it. Dependency package builds use no tactic timeout,
-so a consumer's proof-debug timeout does not make dependency builds fail.
+no-op because proof IR is now the default. The CLI default is 2.5 seconds per tactic step;
+`--tactic-timeout SECONDS` overrides all manifest timeout policy for the invocation, and
+`--tactic-timeout 0` disables it. Without a CLI override, `[build].tactic_timeout` sets
+the package default and `[build.root_tactic_timeouts]` may set per-entry-point timeout
+contracts keyed by `[build].roots` source paths. Entry-point contracts apply to the full
+build dependency closure. If multiple declared entry points can reach the same script, the
+script uses the minimum effective timeout. This timeout is a property of the declared entry
+point graph, not of the current request, except that `--tactic-timeout` overrides every entry
+point timeout for the invocation. Timeout policy is not part of final artifact action keys,
+but local metadata/cache records the timeout a successful build satisfied; a success under
+60s may satisfy a later 180s request, while a success under 180s does not satisfy a later
+60s request.
 `execution-plan THEORY:THEOREM`, `goalfrag-plan THEORY:THEOREM`, and
 `--goalfrag-trace` are debugging/inspection paths. `holbuild execution-plan
 THEORY:THEOREM` is static inspection for the proof IR: it discovers sources,

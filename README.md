@@ -151,9 +151,12 @@ no-op because proof IR is now the default. By default, holbuild preserves HOL pa
 proof boundaries are instrumented where possible, and unknown/recovered source
 regions pass through to HOL. `--strict-parse` instead treats HOLSourceParser
 parse recovery as a build error before running HOL.
-`--tactic-timeout SECONDS` sets the root-project per-tactic proof timeout; the default
-is 2.5 seconds, and `0` disables the timeout. Dependency packages build with no tactic
-timeout. `execution-plan THEORY:THEOREM` statically prints the proof-IR plan for one
+`--tactic-timeout SECONDS` overrides the per-tactic proof timeout for this invocation;
+the default is 2.5 seconds, and `0` disables the timeout. Manifest entry points may
+set `[build.root_tactic_timeouts]` by root source path. An entry-point timeout applies
+to that entry point's full dependency closure; if several declared entry points can reach
+a script, the script uses the minimum effective timeout. `--tactic-timeout`
+overrides entry-point settings. `execution-plan THEORY:THEOREM` statically prints the proof-IR plan for one
 theorem and exits without building. `goalfrag-plan THEORY:THEOREM` does the same for
 the legacy GoalFrag step IR; `goalfrag-plan --new-ir THEORY:THEOREM` is a deprecated
 alias for `execution-plan`. Each numbered line is one executable tactic/list-tactic operation;
@@ -276,7 +279,10 @@ package-root-relative source paths for default entry points when `holbuild build
 has no CLI target; root source paths must be
 discoverable through `[build].members`. `[build].members` remains the source
 discovery scope. When roots are configured, no-target `build` warns about
-discoverable theory scripts outside the roots' dependency closure.
+discoverable theory scripts outside the roots' dependency closure. Optional
+`[build.root_tactic_timeouts]` entries are keyed by those same root source paths,
+and set entry-point timeout contracts for each root's dependency closure; shared
+closure nodes use the minimum timeout from all declared roots that can reach them.
 `[build].exclude` may explicitly remove package-root-relative globbed
 paths from source discovery; it is for keeping tests/tool variants out of a build
 package, not for changing load resolution. Generated `*Theory.sml` and

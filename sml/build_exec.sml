@@ -1037,6 +1037,29 @@ fun cleanup_json_stage stage =
 
 fun cache_root () = HolbuildCache.cache_root ()
 
+fun timeout_text NONE = "none"
+  | timeout_text (SOME seconds) = Real.toString seconds
+
+fun parse_timeout_text text =
+  if text = "none" then SOME NONE
+  else Option.map SOME (Real.fromString text)
+
+fun timeout_satisfies requested built =
+  case requested of
+      NONE => true
+    | SOME requested_seconds =>
+        case built of
+            SOME built_seconds => built_seconds <= requested_seconds
+          | NONE => false
+
+fun timeout_min (NONE, timeout) = timeout
+  | timeout_min (timeout, NONE) = timeout
+  | timeout_min (SOME a, SOME b) = SOME (Real.min(a, b))
+
+fun timeout_equal (NONE, NONE) = true
+  | timeout_equal (SOME a, SOME b) = Real.== (a, b)
+  | timeout_equal _ = false
+
 fun file_hash_matches path hash =
   file_exists path andalso file_hash path = hash
   handle _ => false
@@ -1050,11 +1073,12 @@ fun cache_blob root path =
     hash
   end
 
-fun cache_manifest_text {input_key, sig_hash, sml_hash, dat_hash, mldeps} =
+fun cache_manifest_text {input_key, sig_hash, sml_hash, dat_hash, mldeps, proof_timeout} =
   String.concatWith "\n"
     (["holbuild-cache-action-v2",
       "input_key=" ^ input_key,
       "kind=theory",
+      "proof-timeout=" ^ timeout_text proof_timeout,
       "mldeps"] @
      map (fn dep => "mldep " ^ dep) mldeps @
      ["blob sig " ^ sig_hash,
@@ -1165,6 +1189,8 @@ fun parse_cache_manifest_line input_key line (saw_header, saw_input, saw_kind, s
   else if line = "mldeps" then
     if saw_mldeps then raise Error "cache manifest duplicate mldeps marker"
     else (saw_header, saw_input, saw_kind, true, blobs, mldeps)
+  else if String.isPrefix "proof-timeout=" line then
+    (saw_header, saw_input, saw_kind, saw_mldeps, blobs, mldeps)
   else
     case String.tokens Char.isSpace line of
         ["mldep", dep] => (saw_header, saw_input, saw_kind, saw_mldeps, blobs, add_mldep dep mldeps)
@@ -1194,6 +1220,32 @@ fun cache_manifest_blobs_from_lines input_key lines =
 fun cache_manifest_blobs root input_key =
   let val manifest = HolbuildCache.action_manifest root input_key
   in cache_manifest_blobs_from_lines input_key (cache_manifest_lines (read_text manifest)) end
+
+fun cache_manifest_proof_timeout lines =
+  let
+    fun line_timeout line =
+      if String.isPrefix "proof-timeout=" line then
+        parse_timeout_text (String.extract(line, size "proof-timeout=", NONE))
+      else NONE
+  in
+    case first_some line_timeout lines of
+        SOME timeout => timeout
+      | NONE => NONE
+  end
+
+fun cache_manifest_proof_timeout_text input_key text =
+  (cache_manifest_blobs_from_lines input_key (cache_manifest_lines text);
+   cache_manifest_proof_timeout (cache_manifest_lines text))
+
+fun cache_manifest_outputs_equal input_key left right =
+  let
+    val left_blobs = cache_manifest_blobs_from_lines input_key (cache_manifest_lines left)
+    val right_blobs = cache_manifest_blobs_from_lines input_key (cache_manifest_lines right)
+  in
+    #sig_hash left_blobs = #sig_hash right_blobs andalso
+    #sml_hash left_blobs = #sml_hash right_blobs andalso
+    #dat_hash left_blobs = #dat_hash right_blobs
+  end
 
 fun cache_entry_usable root input_key text =
   let
@@ -1299,29 +1351,40 @@ fun theory_cache_keys project plan node input_key =
 fun cache_warning_subject node =
   String.concat [logical_name node, " (", source_file node, ")"]
 
-fun publish_cache_manifest root cache_key subject staged_sig published_sml staged_dat cache_mldeps =
+fun publish_cache_manifest root cache_key subject staged_sig published_sml staged_dat cache_mldeps proof_timeout =
   let
     val manifest_path = HolbuildCache.action_manifest root cache_key
     val sig_hash = cache_blob root staged_sig
     val sml_hash = cache_blob root published_sml
     val dat_hash = cache_blob root staged_dat
-    val manifest = cache_manifest_text {input_key = cache_key, sig_hash = sig_hash,
-                                        sml_hash = sml_hash,
-                                        dat_hash = dat_hash,
-                                        mldeps = cache_mldeps}
+    fun manifest_with timeout =
+      cache_manifest_text {input_key = cache_key, sig_hash = sig_hash,
+                           sml_hash = sml_hash,
+                           dat_hash = dat_hash,
+                           mldeps = cache_mldeps,
+                           proof_timeout = timeout}
+    val manifest = manifest_with proof_timeout
     val existing = current_metadata manifest_path
+    fun publish_same_outputs old =
+      let val old_timeout = cache_manifest_proof_timeout_text cache_key old
+          val best_timeout = timeout_min (old_timeout, proof_timeout)
+      in
+        if timeout_equal (old_timeout, best_timeout) then HolbuildCache.touch manifest_path
+        else write_text manifest_path (manifest_with best_timeout)
+      end
   in
     case existing of
         SOME old =>
           if old = manifest then HolbuildCache.touch manifest_path
           else if cache_entry_usable root cache_key old then
-            cache_conflict_warning cache_key manifest_path subject old manifest
+            if cache_manifest_outputs_equal cache_key old manifest then publish_same_outputs old
+            else cache_conflict_warning cache_key manifest_path subject old manifest
           else
             write_text manifest_path manifest
       | NONE => write_text manifest_path manifest
   end
 
-fun publish_theory_cache project plan node input_key staged_sig published_sml staged_dat mldeps =
+fun publish_theory_cache project plan node input_key proof_timeout staged_sig published_sml staged_dat mldeps =
   let
     val root = cache_root ()
     val _ = HolbuildCache.ensure_layout root
@@ -1331,7 +1394,7 @@ fun publish_theory_cache project plan node input_key staged_sig published_sml st
     val cache_key = if path_dependent then path_dependent_cache_key project context_key else context_key
     fun drop_stale_manifest key = remove_file (HolbuildCache.action_manifest root key)
     val subject = cache_warning_subject node
-    fun publish () = publish_cache_manifest root cache_key subject staged_sig published_sml staged_dat cache_mldeps
+    fun publish () = publish_cache_manifest root cache_key subject staged_sig published_sml staged_dat cache_mldeps proof_timeout
     fun skip_locked_publish () = ()
   in
     ((if cache_key <> input_key then
@@ -1454,7 +1517,7 @@ fun cache_key_role project plan node input_key cache_key =
     else "cache key"
   end
 
-fun materialize_theory_cache_key project plan input_key cache_key node =
+fun materialize_theory_cache_key project plan input_key requested_timeout cache_key node =
   let
     val root = cache_root ()
     val manifest = HolbuildCache.action_manifest root cache_key
@@ -1467,8 +1530,14 @@ fun materialize_theory_cache_key project plan input_key cache_key node =
       case transient_stage_mldep_in_manifest manifest_text of
           SOME dep => transient_cache_manifest_error root cache_key manifest manifest_text dep
         | NONE => ()
+    val manifest_lines = cache_manifest_lines manifest_text
     val {sig_hash, sml_hash, dat_hash, mldeps} =
-      cache_manifest_blobs_from_lines cache_key (cache_manifest_lines manifest_text)
+      cache_manifest_blobs_from_lines cache_key manifest_lines
+    val proof_timeout = cache_manifest_proof_timeout manifest_lines
+    val _ =
+      if timeout_satisfies requested_timeout proof_timeout then ()
+      else raise Error ("cache entry built with insufficient tactic-timeout contract: built " ^
+                        timeout_text proof_timeout ^ ", requested " ^ timeout_text requested_timeout)
     val {sig_path, sml_path, data_path, ...} = theory_outputs node
     fun install () =
       (copy_blob root dat_hash data_path;
@@ -1493,8 +1562,8 @@ fun materialize_theory_cache_key project plan input_key cache_key node =
                warn ("cache entry unusable for " ^ logical_name node ^ ": " ^ General.exnMessage e);
                false)
 
-fun materialize_theory_cache _ project plan input_key node =
-  List.exists (fn cache_key => materialize_theory_cache_key project plan input_key cache_key node)
+fun materialize_theory_cache _ project plan input_key requested_timeout node =
+  List.exists (fn cache_key => materialize_theory_cache_key project plan input_key requested_timeout cache_key node)
               (theory_cache_keys project plan node input_key)
 
 fun metadata_path (project : HolbuildProject.t) node =
@@ -1562,15 +1631,18 @@ fun declaration_checkpoint_key {name, safe_name, boundary, deps_key, proof_engin
         "proof_engine=" ^ proof_engine,
         "prefix_key=" ^ prefix_hash] ^ "\n")
 
-fun checkpoint_context_ok kind deps_key proof_engine prefix_hash checkpoint_key =
+fun proof_timeout_field proof_timeout = ("proof_timeout", timeout_text proof_timeout)
+
+fun checkpoint_context_ok kind deps_key proof_engine proof_timeout prefix_hash checkpoint_key =
   checkpoint_ok_text kind
     [("deps_key", deps_key),
      ("proof_engine", proof_engine),
+     proof_timeout_field proof_timeout,
      ("prefix_key", prefix_hash),
      ("checkpoint_key", checkpoint_key)]
 
-fun theorem_checkpoint_ok kind deps_key proof_engine prefix_hash checkpoint_key =
-  checkpoint_context_ok kind deps_key proof_engine prefix_hash checkpoint_key
+fun theorem_checkpoint_ok kind deps_key proof_engine proof_timeout prefix_hash checkpoint_key =
+  checkpoint_context_ok kind deps_key proof_engine proof_timeout prefix_hash checkpoint_key
 
 fun theorem_header_hash source theorem_start tactic_start =
   HolbuildToolchain.hash_text (String.substring(source, theorem_start, tactic_start - theorem_start))
@@ -1580,16 +1652,17 @@ fun pre_theorem_hash source theorem_start =
 
 fun failed_prefix_diagnostic_key proof_engine = proof_engine ^ ":finish_goal_state_v2"
 
-fun failed_prefix_ok proof_engine deps_key safe_name pre_hash header_hash =
+fun failed_prefix_ok proof_engine proof_timeout deps_key safe_name pre_hash header_hash =
   checkpoint_ok_text "failed_prefix"
     [("deps_key", deps_key),
      ("proof_engine", proof_engine),
+     proof_timeout_field proof_timeout,
      ("safe_name", safe_name),
      ("pre_theorem_key", pre_hash),
      ("header_key", header_hash),
      ("failure_diagnostic_key", failed_prefix_diagnostic_key proof_engine)]
 
-fun theorem_checkpoint_specs proof_engine project node deps_key source boundaries =
+fun theorem_checkpoint_specs proof_engine proof_timeout project node deps_key source boundaries =
   map (fn {kind, name, safe_name, theorem_start, theorem_stop, boundary, tactic_start,
            tactic_end, tactic_text, has_proof_attrs, prefix_hash} =>
           let
@@ -1606,17 +1679,17 @@ fun theorem_checkpoint_specs proof_engine project node deps_key source boundarie
              tactic_text = tactic_text, has_proof_attrs = has_proof_attrs,
              prefix_hash = prefix_hash,
              context_path = theorem_context_path project node deps_key proof_engine prefix_hash safe_name,
-             context_ok = theorem_checkpoint_ok "theorem_context" deps_key proof_engine prefix_hash checkpoint_key,
+             context_ok = theorem_checkpoint_ok "theorem_context" deps_key proof_engine proof_timeout prefix_hash checkpoint_key,
              end_of_proof_path = theorem_end_of_proof_path project node deps_key proof_engine prefix_hash safe_name,
-             end_of_proof_ok = theorem_checkpoint_ok "end_of_proof" deps_key proof_engine prefix_hash checkpoint_key,
+             end_of_proof_ok = theorem_checkpoint_ok "end_of_proof" deps_key proof_engine proof_timeout prefix_hash checkpoint_key,
              failed_prefix_path = theorem_failed_prefix_path project node deps_key proof_engine safe_name,
-             failed_prefix_ok = failed_prefix_ok proof_engine deps_key safe_name pre_hash header_hash,
+             failed_prefix_ok = failed_prefix_ok proof_engine proof_timeout deps_key safe_name pre_hash header_hash,
              deps_key = deps_key,
              checkpoint_key = checkpoint_key}
           end)
       boundaries
 
-fun declaration_checkpoint_specs proof_engine project node deps_key source terminations =
+fun declaration_checkpoint_specs proof_engine proof_timeout project node deps_key source terminations =
   map (fn ({name, safe_name, definition_start, boundary, ...} : HolbuildTheoryCheckpoints.termination) =>
           let
             val prefix_hash = HolbuildTheoryCheckpoints.prefix_hash source boundary
@@ -1629,7 +1702,7 @@ fun declaration_checkpoint_specs proof_engine project node deps_key source termi
              definition_start = definition_start, boundary = boundary,
              prefix_hash = prefix_hash,
              context_path = declaration_context_path project node deps_key proof_engine prefix_hash safe_name,
-             context_ok = checkpoint_context_ok "definition_context" deps_key proof_engine prefix_hash checkpoint_key,
+             context_ok = checkpoint_context_ok "definition_context" deps_key proof_engine proof_timeout prefix_hash checkpoint_key,
              deps_key = deps_key,
              checkpoint_key = checkpoint_key}
           end)
@@ -1675,7 +1748,21 @@ fun deps_checkpoint_ok_text deps_key =
 fun deps_checkpoint_exists path deps_key =
   checkpoint_ok_matches path [("kind", "deps_loaded"), ("deps_key", deps_key)]
 
-fun theorem_context_checkpoint_exists project node checkpoint =
+fun checkpoint_proof_timeout path =
+  case current_metadata (path ^ ".ok") of
+      NONE => NONE
+    | SOME text =>
+        case metadata_value "proof_timeout" (metadata_lines text) of
+            NONE => NONE
+          | SOME value =>
+              case parse_timeout_text value of
+                  SOME timeout => timeout
+                | NONE => NONE
+
+fun checkpoint_timeout_satisfies requested_timeout path =
+  timeout_satisfies requested_timeout (checkpoint_proof_timeout path)
+
+fun theorem_context_checkpoint_exists requested_timeout project node checkpoint =
   let val deps_loaded = deps_loaded_path project node (#deps_key checkpoint)
   in
     deps_checkpoint_exists deps_loaded (#deps_key checkpoint) andalso
@@ -1683,10 +1770,11 @@ fun theorem_context_checkpoint_exists project node checkpoint =
       [("kind", "theorem_context"),
        ("deps_key", #deps_key checkpoint),
        ("prefix_key", #prefix_hash checkpoint),
-       ("checkpoint_key", #checkpoint_key checkpoint)]
+       ("checkpoint_key", #checkpoint_key checkpoint)] andalso
+    checkpoint_timeout_satisfies requested_timeout (#context_path checkpoint)
   end
 
-fun declaration_context_checkpoint_exists project node checkpoint =
+fun declaration_context_checkpoint_exists requested_timeout project node checkpoint =
   let val deps_loaded = deps_loaded_path project node (#deps_key checkpoint)
   in
     deps_checkpoint_exists deps_loaded (#deps_key checkpoint) andalso
@@ -1694,40 +1782,41 @@ fun declaration_context_checkpoint_exists project node checkpoint =
       [("kind", "definition_context"),
        ("deps_key", #deps_key checkpoint),
        ("prefix_key", #prefix_hash checkpoint),
-       ("checkpoint_key", #checkpoint_key checkpoint)]
+       ("checkpoint_key", #checkpoint_key checkpoint)] andalso
+    checkpoint_timeout_satisfies requested_timeout (#context_path checkpoint)
   end
 
 fun theorem_replay_failure_checkpoints checkpoint =
   [#context_path checkpoint, #end_of_proof_path checkpoint]
 
-fun theorem_replay_candidates project node checkpoints =
+fun theorem_replay_candidates requested_timeout project node checkpoints =
   List.mapPartial
     (fn checkpoint =>
-        if theorem_context_checkpoint_exists project node checkpoint then
+        if theorem_context_checkpoint_exists requested_timeout project node checkpoint then
           SOME {boundary = #boundary checkpoint, path = #context_path checkpoint,
                 safe_name = #safe_name checkpoint, kind = "theorem-context",
                 failure_checkpoints = theorem_replay_failure_checkpoints checkpoint}
         else NONE)
     checkpoints
 
-fun declaration_replay_candidates project node checkpoints =
+fun declaration_replay_candidates requested_timeout project node checkpoints =
   List.mapPartial
     (fn checkpoint =>
-        if declaration_context_checkpoint_exists project node checkpoint then
+        if declaration_context_checkpoint_exists requested_timeout project node checkpoint then
           SOME {boundary = #boundary checkpoint, path = #context_path checkpoint,
                 safe_name = #safe_name checkpoint, kind = "definition-context",
                 failure_checkpoints = [#context_path checkpoint]}
         else NONE)
     checkpoints
 
-fun replay_candidates project node theorem_checkpoints declaration_checkpoints =
-  theorem_replay_candidates project node theorem_checkpoints @
-  declaration_replay_candidates project node declaration_checkpoints
+fun replay_candidates requested_timeout project node theorem_checkpoints declaration_checkpoints =
+  theorem_replay_candidates requested_timeout project node theorem_checkpoints @
+  declaration_replay_candidates requested_timeout project node declaration_checkpoints
 
 fun later_candidate (a, b) = if #boundary a >= #boundary b then a else b
 
-fun best_replay_candidate project node theorem_checkpoints declaration_checkpoints =
-  case replay_candidates project node theorem_checkpoints declaration_checkpoints of
+fun best_replay_candidate requested_timeout project node theorem_checkpoints declaration_checkpoints =
+  case replay_candidates requested_timeout project node theorem_checkpoints declaration_checkpoints of
       [] => NONE
     | first :: rest => SOME (List.foldl later_candidate first rest)
 
@@ -1746,8 +1835,20 @@ fun failed_prefix_metadata path =
 
 fun failed_prefix_text path = current_metadata (path ^ ".prefix")
 
-fun failed_prefix_checkpoint checkpoint =
-  if checkpoint_ok_text_matches (#failed_prefix_path checkpoint) (#failed_prefix_ok checkpoint) then
+fun without_proof_timeout text =
+  String.concatWith "\n"
+    (List.filter (fn line => not (String.isPrefix "proof_timeout=" line))
+                 (metadata_lines text)) ^ "\n"
+
+fun checkpoint_ok_text_matches_ordered requested_timeout path expected_text =
+  checkpoint_exists path andalso
+  (case current_metadata (path ^ ".ok") of
+       SOME text => without_proof_timeout text = without_proof_timeout expected_text andalso
+                    checkpoint_timeout_satisfies requested_timeout path
+     | NONE => false)
+
+fun failed_prefix_checkpoint requested_timeout checkpoint =
+  if checkpoint_ok_text_matches_ordered requested_timeout (#failed_prefix_path checkpoint) (#failed_prefix_ok checkpoint) then
     case (failed_prefix_metadata (#failed_prefix_path checkpoint),
           failed_prefix_text (#failed_prefix_path checkpoint)) of
         (SOME step_count, SOME prefix_text) =>
@@ -1764,14 +1865,14 @@ fun remove_failed_prefix_checkpoints checkpoints =
 fun later_failed_prefix_candidate (a, b) =
   if #boundary (#checkpoint a) >= #boundary (#checkpoint b) then a else b
 
-fun best_failed_prefix_checkpoint checkpoints =
-  case List.mapPartial failed_prefix_checkpoint checkpoints of
+fun best_failed_prefix_checkpoint requested_timeout checkpoints =
+  case List.mapPartial (failed_prefix_checkpoint requested_timeout) checkpoints of
       [] => NONE
     | first :: rest => SOME (List.foldl later_failed_prefix_candidate first rest)
 
 datatype force_level = ForceNone | ForceTargets | ForceProject | ForceAll
 
-type build_options = {use_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, goalfrag : bool, new_ir : bool, tactic_timeout : real option, goalfrag_plan : string option, goalfrag_trace : bool, repl_on_failure : bool, strict_parse : bool}
+type build_options = {use_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, goalfrag : bool, new_ir : bool, node_tactic_timeouts : (string * real option) list, goalfrag_plan : string option, goalfrag_trace : bool, repl_on_failure : bool, strict_parse : bool}
 
 datatype checkpoint_policy =
   CheckpointPolicy of {checkpoint : bool, goalfrag : bool, new_ir : bool, tactic_timeout : real option, goalfrag_plan : string option, goalfrag_trace : bool, repl_on_failure : bool}
@@ -1789,9 +1890,6 @@ fun repl_on_failure (CheckpointPolicy {repl_on_failure, ...}) = repl_on_failure
 
 fun goalfrag_plan_only (CheckpointPolicy {goalfrag_plan = SOME _, goalfrag_trace = false, ...}) = true
   | goalfrag_plan_only _ = false
-
-fun timeout_text NONE = "none"
-  | timeout_text (SOME seconds) = Real.toString seconds
 
 fun bool_text true = "true"
   | bool_text false = "false"
@@ -1825,8 +1923,8 @@ fun instrumented_source policy timeout_marker plan_only_marker source_text start
        new_ir = proof_ir_enabled policy}
   else plain_source_from_checkpoint source_text start_offset
 
-fun replay_candidate project node theorem_checkpoints declaration_checkpoints =
-  best_replay_candidate project node theorem_checkpoints declaration_checkpoints
+fun replay_candidate policy project node theorem_checkpoints declaration_checkpoints =
+  best_replay_candidate (tactic_timeout policy) project node theorem_checkpoints declaration_checkpoints
 
 fun common_prefix_size old_text new_text =
   let
@@ -1960,8 +2058,8 @@ datatype failure_repl_checkpoint =
   FailedPrefixRepl of HolbuildTheoryCheckpoints.checkpoint * string
 | OtherReplCheckpoint of string * string
 
-fun failure_repl_checkpoint theorem_checkpoints failure_checkpoints deps_loaded =
-  case best_failed_prefix_checkpoint theorem_checkpoints of
+fun failure_repl_checkpoint policy theorem_checkpoints failure_checkpoints deps_loaded =
+  case best_failed_prefix_checkpoint (tactic_timeout policy) theorem_checkpoints of
       SOME {checkpoint, ...} => SOME (FailedPrefixRepl (checkpoint, #failed_prefix_path checkpoint))
     | NONE =>
         case List.find checkpoint_exists failure_checkpoints of
@@ -2003,7 +2101,7 @@ fun write_failure_repl_bootstrap stage policy checkpoint =
 fun run_failure_repl tc policy theorem_checkpoints failure_checkpoints deps_loaded stage =
   if not (repl_on_failure policy) then ()
   else
-    case failure_repl_checkpoint theorem_checkpoints failure_checkpoints deps_loaded of
+    case failure_repl_checkpoint policy theorem_checkpoints failure_checkpoints deps_loaded of
         NONE => HolbuildStatus.message_stderr "holbuild: --repl-on-failure requested, but no valid checkpoint is available\n"
       | SOME checkpoint =>
           let
@@ -2065,8 +2163,8 @@ fun write_theory_script policy project base_context plan keys input_key toolchai
       fun failed_prefix_at_least_as_late failed NONE = true
         | failed_prefix_at_least_as_late failed (SOME replay) =
             #boundary (#checkpoint failed) >= #boundary replay
-      val failed_prefix = if goalfrag_enabled policy then best_failed_prefix_checkpoint checkpoints else NONE
-      val replay = replay_candidate project node checkpoints declaration_checkpoints
+      val failed_prefix = if goalfrag_enabled policy then best_failed_prefix_checkpoint (tactic_timeout policy) checkpoints else NONE
+      val replay = replay_candidate policy project node checkpoints declaration_checkpoints
     in
       case failed_prefix of
           SOME failed =>
@@ -2263,7 +2361,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
                                   generated_holdep_mldeps plan tc staged_sml)
     val _ =
       if cache_allowed then
-        publish_theory_cache project plan node input_key staged_sig sml_path staged_dat mldeps
+        publish_theory_cache project plan node input_key (tactic_timeout policy) staged_sig sml_path staged_dat mldeps
       else ()
   in
     write_local_theory_manifests plan node mldeps;
@@ -2353,6 +2451,11 @@ fun theorem_boundary_line ({safe_name, prefix_hash, context_path, end_of_proof_p
 fun theorem_boundary_lines theorem_checkpoints =
   map theorem_boundary_line theorem_checkpoints
 
+fun proof_timeout_lines checkpoint_policy node =
+  case #kind (HolbuildBuildPlan.source_of node) of
+      HolbuildSourceIndex.TheoryScript => ["proof_timeout=" ^ timeout_text (tactic_timeout checkpoint_policy)]
+    | _ => []
+
 fun metadata_core_lines checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints =
   let
     val source = HolbuildBuildPlan.source_of node
@@ -2365,6 +2468,7 @@ fun metadata_core_lines checkpoint_policy project plan keys input_key toolchain_
      "logical=" ^ #logical_name source,
      "source=" ^ #relative_path source] @
     dependency_context_lines plan keys toolchain_key node @
+    proof_timeout_lines checkpoint_policy node @
     action_policy_lines node @
     checkpoint_lines checkpoint_policy project node @
     theorem_boundary_lines theorem_checkpoints
@@ -2388,6 +2492,20 @@ fun metadata_input_key_matches input_key text =
   case metadata_value "input_key" (metadata_lines text) of
       SOME old_key => old_key = input_key
     | NONE => false
+
+fun metadata_proof_timeout text =
+  case metadata_value "proof_timeout" (metadata_lines text) of
+      NONE => NONE
+    | SOME value =>
+        case parse_timeout_text value of
+            SOME timeout => timeout
+          | NONE => NONE
+
+fun metadata_timeout_satisfies policy node text =
+  case #kind (HolbuildBuildPlan.source_of node) of
+      HolbuildSourceIndex.TheoryScript =>
+        timeout_satisfies (tactic_timeout policy) (metadata_proof_timeout text)
+    | _ => true
 
 (* Up-to-date is intentionally a cheap semantic check. The input_key already
    commits to source hash, dependency keys, toolchain key, and declared action
@@ -2453,7 +2571,8 @@ fun theory_parent_hashes_match plan node =
 fun up_to_date checkpoint_policy project plan _ input_key _ node _ =
   List.all (output_exists_for_node node) (output_paths checkpoint_policy project node) andalso
   (case current_metadata (metadata_path project node) of
-       SOME text => metadata_input_key_matches input_key text
+       SOME text => metadata_input_key_matches input_key text andalso
+                    metadata_timeout_satisfies checkpoint_policy node text
      | NONE => false) andalso
   theory_parent_hashes_match plan node
 
@@ -2477,14 +2596,19 @@ fun force_node ({force, force_targets, ...} : build_options) project node =
     | ForceProject => root_package_node project node
     | ForceAll => true
 
-fun effective_tactic_timeout goalfrag root_package tactic_timeout =
-  if goalfrag andalso root_package then tactic_timeout else NONE
+fun assoc_timeout _ [] = NONE
+  | assoc_timeout node_key ((key, timeout) :: rest) =
+      if key = node_key then timeout else assoc_timeout node_key rest
 
-fun checkpoint_policy_for_node ({skip_checkpoints, goalfrag, new_ir, tactic_timeout, goalfrag_plan, goalfrag_trace, repl_on_failure, ...} : build_options) project node =
+fun effective_tactic_timeout goalfrag node_timeout =
+  if goalfrag then node_timeout else NONE
+
+fun checkpoint_policy_for_node ({skip_checkpoints, goalfrag, new_ir, node_tactic_timeouts, goalfrag_plan, goalfrag_trace, repl_on_failure, ...} : build_options) project node =
   CheckpointPolicy {checkpoint = not skip_checkpoints,
                     goalfrag = goalfrag,
                     new_ir = new_ir,
-                    tactic_timeout = effective_tactic_timeout goalfrag (root_package_node project node) tactic_timeout,
+                    tactic_timeout = effective_tactic_timeout goalfrag
+                                      (assoc_timeout (HolbuildBuildPlan.key node) node_tactic_timeouts),
                     goalfrag_plan = if goalfrag then goalfrag_plan else NONE,
                     goalfrag_trace = goalfrag andalso goalfrag_trace,
                     repl_on_failure = repl_on_failure}
@@ -2522,7 +2646,7 @@ fun theory_checkpoints_for_node policy project plan keys toolchain_key node sour
                        logical_name node ^ "; using recovered theorem boundaries\n" ^
                        String.concatWith "\n" errors)
     in
-      theorem_checkpoint_specs (proof_engine policy) project node deps_key source_text boundaries
+      theorem_checkpoint_specs (proof_engine policy) (tactic_timeout policy) project node deps_key source_text boundaries
     end
     handle Error msg =>
       (warn ("could not safely instrument theorem boundaries for " ^ logical_name node ^
@@ -2541,7 +2665,7 @@ fun declaration_checkpoints_for_node policy project plan keys toolchain_key node
   if not (checkpoint_enabled policy) orelse not (goalfrag_enabled policy) then []
   else
     let val deps_key = dependency_context_key toolchain_key plan keys node
-    in declaration_checkpoint_specs (proof_engine policy) project node deps_key source_text terminations end
+    in declaration_checkpoint_specs (proof_engine policy) (tactic_timeout policy) project node deps_key source_text terminations end
     handle Error msg =>
       (warn ("could not safely create termination-definition checkpoints for " ^ logical_name node ^
              "; building without termination-definition checkpoints for this theory\n" ^ msg);
@@ -2559,7 +2683,7 @@ fun build_theory_node (options : build_options) tc project base_context plan key
     val cache_allowed = #use_cache options andalso cache_enabled node
     val cache_restore_allowed = cache_allowed andalso not forced
     fun materialize_valid_cache () =
-      materialize_theory_cache tc project plan input_key node andalso
+      materialize_theory_cache tc project plan input_key (tactic_timeout policy) node andalso
       (if theory_parent_hashes_match plan node then true
        else (remove_failed_cache_outputs project node; false))
   in
