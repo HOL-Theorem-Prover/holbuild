@@ -1426,15 +1426,20 @@ fun write_local_theory_manifests plan node mldeps =
 fun remove_failed_cache_outputs project node =
   let
     val {sig_path, sml_path, data_path, script_uo, theory_ui, theory_uo} = theory_outputs node
-    val paths =
-      [data_path, hfs_remapped_path data_path,
-       sig_path, hfs_remapped_path sig_path,
-       sml_path, hfs_remapped_path sml_path,
-       script_uo, hfs_remapped_path script_uo,
+    (* Invalidate HOL load manifests before removing their targets.  If another
+       reader observes the artifact directory while we discard a bad cache entry,
+       it should see the theory as unavailable, not a .uo that still points at a
+       now-missing generated Theory.sml. *)
+    val manifest_paths =
+      [script_uo, hfs_remapped_path script_uo,
        theory_ui, hfs_remapped_path theory_ui,
        theory_uo, hfs_remapped_path theory_uo]
+    val payload_paths =
+      [data_path, hfs_remapped_path data_path,
+       sig_path, hfs_remapped_path sig_path,
+       sml_path, hfs_remapped_path sml_path]
   in
-    List.app remove_file paths;
+    List.app remove_file (manifest_paths @ payload_paths);
     remove_checkpoint_family project node
   end
 
