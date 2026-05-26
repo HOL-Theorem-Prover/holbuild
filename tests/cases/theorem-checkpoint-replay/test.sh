@@ -1032,27 +1032,17 @@ QED
 val _ = export_theory();
 SML
 malformed_log=$tmpdir/malformed.log
-(cd "$malformed_project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build ATheory) > "$malformed_log" 2>&1
+if (cd "$malformed_project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build ATheory) > "$malformed_log" 2>&1; then
+  echo "expected malformed parser-recovery project to fail" >&2
+  exit 1
+fi
 require_grep "HOL source parser recovered while instrumenting theorem boundaries for ATheory; using recovered theorem boundaries" "$malformed_log"
 require_grep "HOL source parse error:" "$malformed_log"
 require_grep "expected 'QED'" "$malformed_log"
 require_grep "source: .*AScript.sml:" "$malformed_log"
-require_grep "ATheory built" "$malformed_log"
-require_file "$malformed_project/.holbuild/obj/src/ATheory.sig"
-if grep -q 'Fail "malformed"\|instrumented log:' "$malformed_log"; then
-  echo "parser-recovery fell through to instrumented-script failure" >&2
-  exit 1
-fi
-
-strict_parse_log=$tmpdir/strict-parse.log
-if (cd "$malformed_project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build --strict-parse ATheory) > "$strict_parse_log" 2>&1; then
-  echo "expected --strict-parse to reject HOLSourceParser recovery" >&2
-  exit 1
-fi
-require_grep "HOL source parse error:" "$strict_parse_log"
-require_grep "expected 'QED'" "$strict_parse_log"
-if grep -q "ATheory built" "$strict_parse_log"; then
-  echo "--strict-parse should not run/build recovered parser source" >&2
+require_grep "hol run failed while building theory script" "$malformed_log"
+if grep -q "ATheory built" "$malformed_log"; then
+  echo "malformed parser-recovery project was reported as built" >&2
   exit 1
 fi
 

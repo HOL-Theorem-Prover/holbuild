@@ -43,16 +43,9 @@ Proof
   CONJ_TAC >- ACCEPT_TAC TRUTH >- ACCEPT_TAC TRUTH
 QED
 
-Theorem parser_recovery:
-  T
-Proof
-  ( ACCEPT_TAC TRUTH
-QED
-
 val _ = export_theory();
 SML
   (cd "$project" && HOLBUILD_ECHO_CHILD_LOGS=1 "$HOLBUILD_BIN" --holdir "$HOLDIR" build --skip-checkpoints --tactic-timeout 60) > "$tmpdir/new-ir.out" 2>&1
-  require_grep "parse error: expected closing parenthesis" "$tmpdir/new-ir.out"
   require_file "$project/.holbuild/obj/src/ATheory.dat"
 }
 
@@ -129,21 +122,6 @@ Proof
   \\ FIRST [ACCEPT_TAC TRUTH, DISCH_TAC \\ FIRST_ASSUM ACCEPT_TAC]
 QED
 
-Theorem qed_closes_branch:
-  T /\ T
-Proof
-  CONJ_TAC
-  >- ACCEPT_TAC TRUTH
-  >> (
-    ACCEPT_TAC TRUTH
-QED
-
-Theorem minimal_parser_recovery:
-  T
-Proof
-  ( ACCEPT_TAC TRUTH
-QED
-
 Theorem chained_then1_plain:
   T /\ T /\ T
 Proof
@@ -156,7 +134,6 @@ QED
 val _ = export_theory();
 SML
   (cd "$project" && HOLBUILD_ECHO_CHILD_LOGS=1 "$HOLBUILD_BIN" --holdir "$HOLDIR" build --goalfrag --skip-checkpoints --tactic-timeout 60) > "$tmpdir/success.goalfrag.out" 2>&1
-  require_grep "parse error: expected closing parenthesis" "$tmpdir/success.goalfrag.out"
   require_file "$project/.holbuild/obj/src/ATheory.sig"
   require_file "$project/.holbuild/obj/src/ATheory.sml"
   require_file "$project/.holbuild/obj/src/ATheory.dat"
@@ -165,6 +142,48 @@ SML
   (cd "$project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" goalfrag-plan ATheory:chained_then1_plain) > "$tmpdir/chained_then1.plan.out" 2>&1
   require_grep 'plain rpt CONJ_TAC' "$tmpdir/chained_then1.plan.out"
   (cd "$project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build --force --skip-goalfrag --skip-checkpoints) > "$tmpdir/success.plain.out" 2>&1
+}
+
+expect_parse_recovery_fails() {
+  local name=$1
+  local mode=$2
+  local project=$tmpdir/$name
+  make_project "$project"
+  cat > "$project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+
+Theorem parser_recovery:
+  T
+Proof
+  ( ACCEPT_TAC TRUTH
+QED
+
+val _ = export_theory();
+SML
+  case "$mode" in
+    new-ir)
+      if (cd "$project" && HOLBUILD_ECHO_CHILD_LOGS=1 "$HOLBUILD_BIN" --holdir "$HOLDIR" build --skip-checkpoints --tactic-timeout 60) > "$tmpdir/$name.out" 2>&1; then
+        echo "expected parser recovery build to fail for $name" >&2
+        exit 1
+      fi
+      ;;
+    goalfrag)
+      if (cd "$project" && HOLBUILD_ECHO_CHILD_LOGS=1 "$HOLBUILD_BIN" --holdir "$HOLDIR" build --goalfrag --skip-checkpoints --tactic-timeout 60) > "$tmpdir/$name.out" 2>&1; then
+        echo "expected GoalFrag parser recovery build to fail for $name" >&2
+        exit 1
+      fi
+      ;;
+    *) echo "unknown parser recovery mode: $mode" >&2; exit 2 ;;
+  esac
+  require_grep "HOL source parser recovered while instrumenting theorem boundaries" "$tmpdir/$name.out"
+  require_grep "parse error: expected closing parenthesis" "$tmpdir/$name.out"
+  require_grep "source: .*AScript.sml:" "$tmpdir/$name.out"
+  require_grep "hol run failed while building theory script" "$tmpdir/$name.out"
+  if grep -q "ATheory built" "$tmpdir/$name.out"; then
+    echo "malformed parser-recovery source was reported as built for $name" >&2
+    exit 1
+  fi
 }
 
 expect_both_fail() {
@@ -231,6 +250,8 @@ SML
 
 run_new_ir_smoke_project
 run_goalfrag_success_project
+expect_parse_recovery_fails parser-recovery-new-ir new-ir
+expect_parse_recovery_fails parser-recovery-goalfrag goalfrag
 run_repeated_label_source_location_project
 
 expect_both_fail first_empty_then 'Theorem first_empty_then:
