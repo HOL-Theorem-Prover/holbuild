@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      hol4-ref:
+        description: 'HOL4 git ref to test against; defaults to PINS/hol.txt'
+        required: false
+        default: ''
+      test-jobs:
+        description: 'Number of holbuild test cases to run concurrently'
+        required: false
+        default: '4'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Read HOL4 pin
+        id: hol4-pin
+        run: echo "hol4-ref=$(tr -d '[:space:]' < PINS/hol.txt)" >> "$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/setup-polyml
+        id: polyml
+
+      - uses: ./.github/actions/setup-hol4
+        id: hol4
+        with:
+          hol4-ref: ${{ inputs.hol4-ref || steps.hol4-pin.outputs.hol4-ref }}
+          polyml-rev: ${{ steps.polyml.outputs.polyml-rev }}
+
+      - name: Build holbuild
+        run: make HOLDIR="$HOLDIR"
+
+      - name: Configure holbuild test cache
+        run: echo "HOLBUILD_CACHE=$HOME/.cache/holbuild" >> "$GITHUB_ENV"
+
+      - name: Restore holbuild global cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/holbuild
+          key: holbuild-test-global-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ steps.hol4.outputs.hol4-rev }}-${{ github.sha }}
+          restore-keys: |
+            holbuild-test-global-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ steps.hol4.outputs.hol4-rev }}-
+            holbuild-test-global-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-
+            holbuild-test-global-${{ runner.os }}-
+
+      - name: Run tests
+        env:
+          TMPDIR: ${{ runner.temp }}
+          HOLBUILD_TEST_JOBS: ${{ inputs.test-jobs || '4' }}
+        run: make HOLDIR="$HOLDIR" test

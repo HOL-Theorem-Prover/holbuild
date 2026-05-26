@@ -18,7 +18,6 @@ if [[ "$HOLBUILD_TEST_JOBS" -lt 1 ]]; then
   echo "HOLBUILD_TEST_JOBS must be a positive integer" >&2
   exit 2
 fi
-
 test_tmp_root=${TMPDIR:-"$ROOT/scratch/tmp"}
 mkdir -p "$test_tmp_root"
 log_dir=$(mktemp -d "$test_tmp_root/holbuild-test-logs.XXXXXX")
@@ -153,6 +152,7 @@ run_case() {
 start_case() {
   local test_script=$1
   local name=$2
+  echo "START $name"
   run_case "$test_script" "$name" &
   running_pids+=("$!")
   running_names+=("$name")
@@ -207,13 +207,16 @@ wait_all() {
   done
 }
 
+selected_count=0
 for test_script in "$ROOT"/tests/cases/*/test.sh; do
   name=$(basename "$(dirname "$test_script")")
+  selected_count=$((selected_count + 1))
   start_case "$test_script" "$name"
   if [[ ${#running_pids[@]} -ge "$HOLBUILD_TEST_JOBS" ]]; then
     wait_one
   fi
 done
+echo "selected $selected_count test case(s)"
 wait_all
 
 print_timing_summary() {
