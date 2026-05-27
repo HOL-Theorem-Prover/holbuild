@@ -16,8 +16,7 @@ The current implementation intentionally focuses on:
 - infers theory/module dependencies with HOL/Holdep machinery over the resolved project graph and orders build plans
 - parses transitive dependency manifests and local `.holconfig.toml` path overrides
 - materializes dependency plans under project `.holbuild/deps/<package>/`
-- rejects duplicate logical theory/module names across the resolved graph, except
-  local `.sig`/`.sml` companion pairs
+- rejects duplicate logical theory/module names across the resolved graph; a same-package `.sig`/`.sml` pair is one module interface/implementation pair
 - includes project `load "Module"` SML/SIG dependencies in build plans and internal load manifests
 - records generated theory ML dependencies from HOL theory metadata in internal load manifests
 - rejects source-level `use "file"` in project build actions; declare/load project modules instead
@@ -28,14 +27,14 @@ The current implementation intentionally focuses on:
 - records local action metadata and skips unchanged actions
 - publishes/restores simple theory semantic artifacts through the global cache
 - includes the configured toolchain/base context in current action keys
-- creates transient local theory checkpoints while building: dependencies-loaded and final-context checkpoints when checkpointing is enabled, plus theorem end-of-proof/context and failed-prefix proof-navigation checkpoints when theorem instrumentation is enabled; successful builds remove them after writing logical artifacts and metadata
+- creates local theory checkpoints while building: dependencies-loaded and final-context checkpoints when checkpointing is enabled, plus theorem context/end-of-proof and failed-prefix proof-navigation checkpoints when theorem instrumentation is enabled; successful builds retain reusable checkpoints for incremental proof replay and clear stale failed-prefix checkpoints, while `holbuild gc` bounds old checkpoint families
 - runs modern theorem proofs through holbuild's proof IR runtime by default, with tactic parsing/step planning, proof-history execution, checkpoint saves, timeout handling, and diagnostics kept out of generated per-theory source; the legacy HOL `goalFrag` runtime remains available with `--goalfrag`
 - keeps proof instrumentation separate from checkpoint creation; `--skip-checkpoints` avoids theory `.save` files entirely, `--skip-goalfrag` opts out of theorem instrumentation but can still use non-theorem dependency/final-context checkpoints, and `--tactic-timeout SECONDS` controls the root-project per-tactic proof timeout (default 2.5s; `0` disables it)
 - exports explicit project heap targets from `[[heap]]` entries using local SaveState
 - exposes `holbuild gc` for project-local residue cleanup plus global-cache GC with a 7-day default retention policy
 - does not delegate build semantics to Holmake
 - treats `.uo`/`.ui` as internal ML artifacts, never user-requestable targets
-- delegates execution to `$HOLDIR/bin/hol run` / `hol repl` for now
+- delegates project-context execution to `$HOLDIR/bin/hol run` / `hol repl`
 
 The external implementation requires a HOL checkout or installation via `HOLDIR` so it
 can reuse HOL tooling. Current code still starts actions from `$HOLDIR/bin/hol.state`
@@ -139,8 +138,10 @@ or `--quiet` to suppress per-node success lines. `--maxheap MB` and
 `run`/`repl`, matching HOL's requirement that runtime options precede the
 subcommand.
 `--skip-checkpoints` disables theory checkpoint `.save`/`.ok` creation without
-disabling proof instrumentation. By default checkpoints may be created during
-a build but are removed after successful artifact/metadata writes.
+disabling proof instrumentation. By default, checkpoints may be created during
+a build; successful builds retain reusable checkpoints for incremental proof
+replay, clear stale failed-prefix checkpoints, and rely on `holbuild gc` to bound
+old checkpoint families.
 `--skip-goalfrag` opts out of modern theorem instrumentation.
 The default theorem instrumentation engine is holbuild's proof IR: it parses tactic
 syntax from `HOLSourceAST` directly instead of using HOL `goalFrag`, while preserving
@@ -301,7 +302,7 @@ move under a project-level `.holbuild/` directory. The top-level directory is no
 inside `.holbuild/`, not the project state root. `.uo` and `.ui` files are internal
 ML artifacts; users should request logical targets only. The current implementation rejects
 ambiguous graphs where two sources export the same logical theory/module name;
-the intended exception is a same-package `.sig`/`.sml` companion pair. The
+a same-package `.sig`/`.sml` pair is one module interface/implementation pair. The
 current implementation also writes auxiliary `HOLFileSys` remap copies under `.hol/objs` for
 path-sensitive internal loads while preserving canonical artifacts in the project
 layout.

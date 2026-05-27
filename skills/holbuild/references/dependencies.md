@@ -126,7 +126,7 @@ Dependencies of dependencies are resolved automatically. No need to declare tran
 
 The resolved graph must have exactly one artifact per logical name. If two packages (even transitively) export the same `FooTheory` or `Foo` module, holbuild rejects the graph before building.
 
-Same-package `.sig`/`.sml` companion pairs are the only exception.
+A same-package `.sig`/`.sml` pair is one SML module interface/implementation pair and is not a cross-package ambiguity.
 
 ## Source-level imports
 

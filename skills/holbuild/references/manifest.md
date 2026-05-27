@@ -89,7 +89,7 @@ Recognized source files:
 - `*.sml` → SML module, logical name = filename minus `.sml`
 - `*.sig` → signature, logical name = filename minus `.sig`
 
-A `.sig`/`.sml` pair with the same base name in the same package is a companion pair (one module), not a conflict.
+A `.sig`/`.sml` pair with the same base name in the same package is one SML module interface/implementation pair, not a conflict.
 
 ## HOLSource headers
 
@@ -117,7 +117,7 @@ Rules:
 
 ## Duplicate logical names
 
-One logical name → one resolved artifact across the entire build graph. Two packages exporting `FooTheory` or `Foo` module is an error. The only exception: same-package `.sig`/`.sml` companion pair.
+One logical name → one resolved artifact across the entire build graph. Two packages exporting `FooTheory` or `Foo` module is an error. A same-package `.sig`/`.sml` pair is one SML module interface/implementation pair and is not a cross-package conflict.
 
 ## Action policies
 

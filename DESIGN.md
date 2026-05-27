@@ -32,7 +32,7 @@ must name a supported schema:
 schema = 1
 ```
 
-Omitting `[holbuild]` currently means schema 1 for transition convenience.
+Omitting `[holbuild]` means schema 1.
 
 Package roots are declared by one of:
 
@@ -264,9 +264,8 @@ This rejection is intentional. HOL/PolyML process state has global theory and ML
 module names; two packages exporting different `FooTheory` or `Foo` modules
 cannot safely coexist by relying on load-path order. `holbuild` should reject the
 resolved graph before build execution instead of choosing whichever artifact
-happens to appear first. The only same-logical-name exception in v1 is a local
-`.sig`/`.sml` companion pair for the same package/module, which together describe
-one module artifact.
+happens to appear first. A same-package `.sig`/`.sml` pair is one SML module
+interface/implementation pair, not a cross-package ambiguity.
 
 ## Parallel builds
 
