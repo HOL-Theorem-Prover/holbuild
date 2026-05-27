@@ -26,7 +26,7 @@ fun add_root_node_timeout project timeout (node, acc) =
   if root_package_node project node then add_node_timeout node timeout acc else acc
 
 fun plan_timeouts project plan timeout =
-  List.foldl (add_root_node_timeout project timeout) [] plan
+  List.foldl (add_root_node_timeout project timeout) [] (HolbuildBuildPlan.selected_nodes plan)
 
 fun source_entry source = (#relative_path source, #logical_name source)
 
@@ -52,7 +52,7 @@ fun entry_timeout project default_timeout root =
     | NONE => default_timeout
 
 fun node_named plan logical =
-  case List.filter (fn node => HolbuildBuildPlan.logical_name node = logical) plan of
+  case List.filter (fn node => HolbuildBuildPlan.logical_name node = logical) (HolbuildBuildPlan.selected_nodes plan) of
       [] => NONE
     | node :: _ => SOME node
 

@@ -1415,7 +1415,8 @@ fun publish_theory_cache project plan node input_key proof_timeout staged_sig pu
   end
 
 fun project_node_named plan name =
-  List.find (fn candidate => HolbuildBuildPlan.logical_name candidate = name) plan
+  List.find (fn candidate => HolbuildBuildPlan.logical_name candidate = name)
+            (HolbuildBuildPlan.universe_nodes plan)
 
 fun mldep_load_stem plan dep =
   case project_node_named plan dep of
@@ -1440,7 +1441,7 @@ fun generated_holdep_stem plan tc dep =
     val sigobj = Path.concat(#holdir tc, "sigobj")
     fun same_load_stem node = same_path (load_stem node) stem
   in
-    case List.find same_load_stem plan of
+    case List.find same_load_stem (HolbuildBuildPlan.selected_nodes plan) of
         SOME node => HolbuildBuildPlan.logical_name node
       | NONE => if same_path (Path.dir stem) sigobj then Path.file stem else stem
   end
@@ -1456,7 +1457,7 @@ fun holfs_unmapped_theory_artifact path =
   end
 
 fun generated_holdep_include_dirs tc plan =
-  unique_strings (Path.concat(#holdir tc, "sigobj") :: map (Path.dir o load_stem) plan)
+  unique_strings (Path.concat(#holdir tc, "sigobj") :: map (Path.dir o load_stem) (HolbuildBuildPlan.selected_nodes plan))
 
 fun generated_holdep_mldeps plan tc path =
   let
@@ -2377,7 +2378,7 @@ fun has_signature_companion plan node =
   List.exists
     (fn candidate => same_package_logical candidate node andalso
                      #kind (HolbuildBuildPlan.source_of candidate) = HolbuildSourceIndex.Sig)
-    plan
+    (HolbuildBuildPlan.universe_nodes plan)
 
 fun write_empty_ui_if_needed plan node =
   if has_signature_companion plan node then ()
@@ -2760,10 +2761,11 @@ fun report_up_to_date_node status project keys node =
   end
 
 fun all_nodes_up_to_date options project plan keys toolchain_key =
-  List.all (node_is_up_to_date options project plan keys toolchain_key) plan
+  List.all (node_is_up_to_date options project plan keys toolchain_key)
+           (HolbuildBuildPlan.selected_nodes plan)
 
 fun report_all_up_to_date status project keys plan =
-  List.app (report_up_to_date_node status project keys) plan
+  List.app (report_up_to_date_node status project keys) (HolbuildBuildPlan.selected_nodes plan)
 
 fun build_one status options tc project base_context plan keys toolchain_key node =
   let
@@ -2805,7 +2807,7 @@ fun build_serial status options tc project base_context plan keys toolchain_key 
               HolbuildStatus.Inspected => ()
             | _ => loop rest
   in
-    loop plan
+    loop (HolbuildBuildPlan.selected_nodes plan)
   end
 
 fun node_done done node = List.exists (fn k => k = HolbuildBuildPlan.key node) done
@@ -2842,10 +2844,10 @@ fun build_parallel status options tc project base_context plan keys toolchain_ke
        edges once, then release dependents by decrementing remaining_dep counts.
        Do not add a serial all-up-to-date preflight in front of this path; that
        duplicates the unchanged-prefix work before any parallel worker can run. *)
-    val node_count = length plan
-    val nodes = Vector.fromList plan
-    val key_index = HolbuildBuildPlan.build_key_index plan
-    val lookup = HolbuildBuildPlan.indexed_nodes_named (HolbuildBuildPlan.build_name_index plan)
+    val selected = HolbuildBuildPlan.selected_nodes plan
+    val node_count = length selected
+    val nodes = Vector.fromList selected
+    val key_index = HolbuildBuildPlan.build_key_index selected
     val remaining_deps = Array.array (node_count, 0)
     val dependents = Array.array (node_count, [] : int list)
     val ready = ref ([] : int list)
@@ -2864,7 +2866,7 @@ fun build_parallel status options tc project base_context plan keys toolchain_ke
     fun add_ready id = ready := id :: !ready
 
     fun register_node (id, node) =
-      let val deps = HolbuildBuildPlan.direct_project_deps_with lookup plan node
+      let val deps = HolbuildBuildPlan.direct_project_deps plan node
       in
         Array.update (remaining_deps, id, length deps);
         if null deps then add_ready id else ();
@@ -2890,7 +2892,7 @@ fun build_parallel status options tc project base_context plan keys toolchain_ke
       else
         let
           val node = Vector.sub (nodes, id)
-          val deps = HolbuildBuildPlan.direct_project_deps_with lookup plan node
+          val deps = HolbuildBuildPlan.direct_project_deps plan node
           val _ = Array.update (priority_focus, id, true)
           val _ = priority_focus_remaining := !priority_focus_remaining + 1
         in
@@ -3115,7 +3117,7 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
     val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project) toolchain_key plan
   in
     let
-      val status = HolbuildStatus.create {total = length plan, jobs = jobs}
+      val status = HolbuildStatus.create {total = length (HolbuildBuildPlan.selected_nodes plan), jobs = jobs}
       fun run () =
         if jobs <= 1 then build_serial status options tc project base_context plan keys toolchain_key
         else build_parallel status options tc project base_context plan keys toolchain_key jobs
@@ -3126,7 +3128,7 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
   end
 
 fun heap_external_theories plan =
-  unique_strings (List.concat (map (HolbuildBuildPlan.direct_external_theories plan) plan))
+  unique_strings (List.concat (map (HolbuildBuildPlan.direct_external_theories plan) (HolbuildBuildPlan.selected_nodes plan)))
 
 fun heap_theory_load_lines node =
   case #kind (HolbuildBuildPlan.source_of node) of
@@ -3139,7 +3141,7 @@ fun write_heap_loader plan output path =
   let
     val lines =
       map load_theory_line (heap_external_theories plan) @
-      List.concat (map heap_theory_load_lines plan) @
+      List.concat (map heap_theory_load_lines (HolbuildBuildPlan.selected_nodes plan)) @
       [checkpoint_save_runtime_line (),
        save_heap_line {label = "heap", share_common_data = false,
                        output = output, ok_text = checkpoint_ok_v1 ()}]

@@ -12,8 +12,6 @@ type node =
     source_hash : string option ref,
     external_dirs : string list }
 
-type t = node list
-
 type keyed_node = {node : node, input_key : string}
 
 fun source_of ({source, ...} : node) = source
@@ -136,6 +134,12 @@ fun build_key_index nodes =
     Vector.fromList (sort_pairs compare_pair_key (enumerate 0 nodes))
   end
 
+type t = {universe : node list, selected : node list, name_index : name_index}
+
+fun universe_nodes ({universe, ...} : t) = universe
+fun selected_nodes ({selected, ...} : t) = selected
+fun lookup ({name_index, ...} : t) = indexed_nodes_named name_index
+
 fun indexed_key_id index node_key =
   let
     fun search lo hi =
@@ -154,13 +158,13 @@ fun indexed_key_id index node_key =
     search 0 (Vector.length index - 1)
   end
 
-fun selected_nodes nodes targets =
+fun target_roots lookup nodes targets =
   case targets of
       [] => nodes
     | _ =>
       let
         fun find target =
-          case nodes_named nodes target of
+          case lookup target of
               [] => raise Error ("unknown build target: " ^ target)
             | matches => matches
       in
@@ -258,8 +262,8 @@ fun direct_project_deps_with lookup nodes node =
                      direct_holdep_project_deps_with lookup node))
   end
 
-fun direct_project_deps nodes node =
-  direct_project_deps_with (nodes_named nodes) nodes node
+fun direct_project_deps plan node =
+  direct_project_deps_with (lookup plan) (universe_nodes plan) node
 
 fun direct_external_theories_with lookup node =
   let
@@ -271,8 +275,8 @@ fun direct_external_theories_with lookup node =
                       (loaded_theories @ holdep_theories))
   end
 
-fun direct_external_theories nodes node =
-  direct_external_theories_with (nodes_named nodes) node
+fun direct_external_theories plan node =
+  direct_external_theories_with (lookup plan) node
 
 fun direct_external_libs_with lookup node =
   let
@@ -284,8 +288,8 @@ fun direct_external_libs_with lookup node =
          (declared_load_names node @ holdep_libs @ raw_external_load_names_with lookup node))
   end
 
-fun direct_external_libs nodes node =
-  direct_external_libs_with (nodes_named nodes) node
+fun direct_external_libs plan node =
+  direct_external_libs_with (lookup plan) node
 
 fun direct_unresolved_loads_with lookup node =
   let
@@ -296,8 +300,8 @@ fun direct_unresolved_loads_with lookup node =
     List.filter unresolved (#loads (deps_of node))
   end
 
-fun direct_unresolved_loads nodes node =
-  direct_unresolved_loads_with (nodes_named nodes) node
+fun direct_unresolved_loads plan node =
+  direct_unresolved_loads_with (lookup plan) node
 
 fun direct_unresolved_declared_deps_with lookup node =
   let
@@ -306,8 +310,8 @@ fun direct_unresolved_declared_deps_with lookup node =
     List.filter (fn name => not (known name)) (declared_dependency_names node)
   end
 
-fun direct_unresolved_declared_deps nodes node =
-  direct_unresolved_declared_deps_with (nodes_named nodes) node
+fun direct_unresolved_declared_deps plan node =
+  direct_unresolved_declared_deps_with (lookup plan) node
 
 fun reject_unresolved_loads_with lookup plan =
   let
@@ -380,17 +384,18 @@ fun topo_sort_with lookup nodes roots =
 fun topo_sort nodes roots =
   topo_sort_with (nodes_named nodes) nodes roots
 
-fun transitive_project_deps nodes node = topo_sort nodes (direct_project_deps nodes node)
+fun transitive_project_deps plan node =
+  topo_sort_with (lookup plan) (universe_nodes plan) (direct_project_deps plan node)
 
-fun closure_external_theories nodes node =
+fun closure_external_theories plan node =
   unique_strings
-    (List.concat (map (direct_external_theories nodes)
-       (transitive_project_deps nodes node @ [node])))
+    (List.concat (map (direct_external_theories plan)
+       (transitive_project_deps plan node @ [node])))
 
-fun closure_external_libs nodes node =
+fun closure_external_libs plan node =
   unique_strings
-    (List.concat (map (direct_external_libs nodes)
-       (transitive_project_deps nodes node @ [node])))
+    (List.concat (map (direct_external_libs plan)
+       (transitive_project_deps plan node @ [node])))
 
 fun make_node external_dirs source =
   {source = source,
@@ -404,16 +409,10 @@ fun plan holdir sources targets =
     val nodes = map (make_node external_dirs) sources
     val index = build_name_index nodes
     val lookup = indexed_nodes_named index
-    val roots =
-      case targets of
-          [] => nodes
-        | _ => List.concat (map (fn target =>
-                   case lookup target of
-                       [] => raise Error ("unknown build target: " ^ target)
-                     | matches => matches)
-                 targets)
+    val roots = target_roots lookup nodes targets
+    val selected = topo_sort_with lookup nodes roots
   in
-    topo_sort_with lookup nodes roots
+    {universe = nodes, selected = selected, name_index = index}
   end
 
 fun kind_name source = HolbuildSourceIndex.kind_string (#kind source)
@@ -759,9 +758,9 @@ fun action_text_with lookup config_lines_for_node toolchain_key external_key nod
     String.concatWith "\n" lines ^ "\n"
   end
 
-fun action_text config_lines_for_node toolchain_key nodes keys node =
+fun action_text config_lines_for_node toolchain_key plan keys node =
   let val external_key = external_key_lookup toolchain_key
-  in action_text_with (nodes_named nodes) config_lines_for_node toolchain_key external_key nodes keys node end
+  in action_text_with (lookup plan) config_lines_for_node toolchain_key external_key (universe_nodes plan) keys node end
 
 fun add_input_key_with lookup config_lines_for_node toolchain_key external_key nodes (node, keys) =
   (key node, hash_text (action_text_with lookup config_lines_for_node toolchain_key external_key nodes keys node)) :: keys
@@ -788,8 +787,8 @@ fun input_keys_with lookup config_lines_for_node toolchain_key nodes =
   HolbuildToolchain.time_phase "build.keys"
     (fn () => compute_input_keys_with lookup config_lines_for_node toolchain_key nodes)
 
-fun input_keys config_lines_for_node toolchain_key nodes =
-  input_keys_with (nodes_named nodes) config_lines_for_node toolchain_key nodes
+fun input_keys config_lines_for_node toolchain_key plan =
+  input_keys_with (lookup plan) config_lines_for_node toolchain_key (selected_nodes plan)
 
 fun input_key_for keys node = lookup_key keys node
 
@@ -798,16 +797,16 @@ fun print_external_deps_with lookup node =
       [] => ()
     | deps => print ("  external theories: " ^ String.concatWith ", " deps ^ "\n")
 
-fun print_external_deps nodes node =
-  print_external_deps_with (nodes_named nodes) node
+fun print_external_deps plan node =
+  print_external_deps_with (lookup plan) node
 
 fun print_external_libs_with lookup node =
   case direct_external_libs_with lookup node of
       [] => ()
     | deps => print ("  external libs: " ^ String.concatWith ", " deps ^ "\n")
 
-fun print_external_libs nodes node =
-  print_external_libs_with (nodes_named nodes) node
+fun print_external_libs plan node =
+  print_external_libs_with (lookup plan) node
 
 fun print_project_deps_with lookup nodes node =
   case direct_project_deps_with lookup nodes node of
@@ -815,8 +814,8 @@ fun print_project_deps_with lookup nodes node =
     | deps => print ("  project deps: " ^
                      String.concatWith ", " (map logical_name deps) ^ "\n")
 
-fun print_project_deps nodes node =
-  print_project_deps_with (nodes_named nodes) nodes node
+fun print_project_deps plan node =
+  print_project_deps_with (lookup plan) (universe_nodes plan) node
 
 fun describe_node_with lookup nodes keys node =
   (HolbuildSourceIndex.describe_source (source_of node);
@@ -825,15 +824,15 @@ fun describe_node_with lookup nodes keys node =
    print_external_deps_with lookup node;
    print_external_libs_with lookup node)
 
-fun describe_node nodes keys node =
-  describe_node_with (nodes_named nodes) nodes keys node
+fun describe_node plan keys node =
+  describe_node_with (lookup plan) (universe_nodes plan) keys node
 
-fun describe config_lines_for_node toolchain_key nodes =
+fun describe config_lines_for_node toolchain_key plan =
   let
-    val lookup = indexed_nodes_named (build_name_index nodes)
-    val keys = input_keys_with lookup config_lines_for_node toolchain_key nodes
+    val nodes = selected_nodes plan
+    val keys = input_keys config_lines_for_node toolchain_key plan
   in
-    List.app (describe_node_with lookup nodes keys) nodes
+    List.app (describe_node_with (lookup plan) (universe_nodes plan) keys) nodes
   end
 
 end

@@ -158,7 +158,7 @@ fun root_warning_source rooted_packages built_keys source =
 fun warn_unreachable_root_scripts project index plan =
   let
     val rooted_packages = rooted_package_names project
-    val built_keys = map (source_key o HolbuildBuildPlan.source_of) plan
+    val built_keys = map (source_key o HolbuildBuildPlan.source_of) (HolbuildBuildPlan.selected_nodes plan)
     val unreachable = List.filter (root_warning_source rooted_packages built_keys) index
     fun describe source = #package source ^ ":" ^ #relative_path source ^ " (" ^ #logical_name source ^ ")"
     val limit = 20
