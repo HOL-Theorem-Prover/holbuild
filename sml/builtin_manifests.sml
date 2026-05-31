@@ -94,6 +94,7 @@ val holdir_manifest_text =
      "  \"src/emit/MLton/*\",",
      "  \"src/portableML/mlton/*\",",
      "  \"src/portableML/mosml/*\",",
+     "  \"src/simp/src/mosml/*\",",
      "  \"src/tracing/no/*\",",
      "  \"src/num/reduce/conv-old/*\",",
      "]",
