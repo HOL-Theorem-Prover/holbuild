@@ -35,7 +35,7 @@ require_grep "KernelTypes (sml, package HOLDIR)" "$tmpdir/dry.log"
 require_grep "boolTheory (theory, package HOLDIR)" "$tmpdir/dry.log"
 require_grep "listTheory (theory, package HOLDIR)" "$tmpdir/dry.log"
 
-if grep -Eq 'source: HOLDIR:.*/selftest\.sml|source: HOLDIR:.*/examples/|source: HOLDIR:.*/tests/|source: HOLDIR:.*/theory_tests/|source: HOLDIR:src/emit/MLton/|source: HOLDIR:src/portableML/(mlton|mosml)/|source: HOLDIR:src/tracing/no/|source: HOLDIR:src/num/reduce/conv-old/' "$tmpdir/dry.log"; then
+if grep -Eq 'source: HOLDIR:.*/selftest\.sml|source: HOLDIR:.*/examples/|source: HOLDIR:.*/tests/|source: HOLDIR:.*/theory_tests/|source: HOLDIR:src/emit/MLton/|source: HOLDIR:src/portableML/(mlton|mosml)/|source: HOLDIR:src/simp/src/mosml/|source: HOLDIR:src/tracing/no/|source: HOLDIR:src/num/reduce/conv-old/' "$tmpdir/dry.log"; then
   echo "root-HOL sketch included an excluded source" >&2
   exit 1
 fi
