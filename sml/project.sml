@@ -725,7 +725,7 @@ fun action_policy_for policies logical =
 fun dependency_path_context name = "dependencies." ^ name ^ ".path"
 fun dependency_manifest_context name = "dependencies." ^ name ^ ".manifest"
 
-fun dependency_local_path ({root, overrides, ...} : t) (Dependency {name, source}) =
+fun dependency_local_path (project as {root, overrides, ...} : t) (Dependency {name, source}) =
   Option.map (abs_under root)
     (case override_path overrides name of
          SOME override => SOME override
@@ -733,7 +733,9 @@ fun dependency_local_path ({root, overrides, ...} : t) (Dependency {name, source
            case source of
                LegacyPathSource {path = SOME p, ...} => SOME (expand_env (dependency_path_context name) p)
              | LegacyPathSource {path = NONE, ...} => if builtin_holdir_dependency name then !holdir_ref else NONE
-             | _ => NONE)
+             | GitSource _ => SOME (Path.concat(Path.concat(Path.concat(#artifact_root project, ".holbuild"), "src"), name))
+             | FromSource {from, path, ...} =>
+                 SOME (Path.concat(Path.concat(Path.concat(Path.concat(#artifact_root project, ".holbuild"), "src"), from), path)))
 
 fun dependency_manifest (project as {manifest = project_manifest, ...} : t) dep =
   case dep of
@@ -745,11 +747,13 @@ fun dependency_manifest (project as {manifest = project_manifest, ...} : t) dep 
         else
           Option.map (fn path => Path.concat(path, "holproject.toml"))
             (dependency_local_path project dep)
+    | Dependency {name, source = GitSource _, ...} =>
+        SOME (Path.concat(Path.concat(Path.concat(Path.concat(#artifact_root project, ".holbuild"), "src"), name),
+                          "holproject.toml"))
     | Dependency {source = FromSource {from, path, manifest}, ...} =>
         SOME (Path.concat(abs_under (Path.concat(Path.concat(#artifact_root project, ".holbuild"), "src"))
                                     (Path.concat(from, path)),
                           manifest))
-    | Dependency {source = GitSource _, ...} => NONE
 
 fun heap_to_string (Heap {name, output, objects}) =
   name ^ " -> " ^ output ^ " [" ^ String.concatWith ", " objects ^ "]"
@@ -782,7 +786,28 @@ fun project_package ({root, artifact_root, manifest, name, members, excludes, ro
            action_policies = action_policies,
            generators = generators}
 
-fun dependency_project (project : t) (dep as Dependency {name, ...}) =
+fun without_dependencies (project : t) : t =
+  { root = #root project,
+    artifact_root = #artifact_root project,
+    manifest = #manifest project,
+    name = #name project,
+    version = #version project,
+    members = #members project,
+    excludes = #excludes project,
+    roots = #roots project,
+    root_tactic_timeouts = #root_tactic_timeouts project,
+    dependencies = [],
+    overrides = #overrides project,
+    local_build_excludes = #local_build_excludes project,
+    local_build_jobs = #local_build_jobs project,
+    build_tactic_timeout = #build_tactic_timeout project,
+    run_heap = #run_heap project,
+    run_loads = #run_loads project,
+    heaps = #heaps project,
+    action_policies = #action_policies project,
+    generators = #generators project }
+
+fun dependency_project (project : t) (dep as Dependency {name, source}) =
   let
     val dep_root =
       case dependency_local_path project dep of
@@ -798,11 +823,19 @@ fun dependency_project (project : t) (dep as Dependency {name, ...}) =
         (if readable dep_manifest then ()
          else die ("dependency " ^ name ^ " manifest not found: " ^ dep_manifest);
          parse_at)
-    val dep_project = parse_dep {manifest = dep_manifest, root = dep_root, artifact_root = dep_root,
-                                 local_config = LocalConfig {overrides = #overrides project,
-                                                             build_excludes = #local_build_excludes project,
-                                                             build_jobs = #local_build_jobs project,
-                                                             build_tactic_timeout = #build_tactic_timeout project}}
+    val dep_artifact_root =
+      case source of
+          LegacyPathSource _ => dep_root
+        | _ => Path.concat(Path.concat(Path.concat(#artifact_root project, ".holbuild"), "packages"), name)
+    val parsed_project = parse_dep {manifest = dep_manifest, root = dep_root, artifact_root = dep_artifact_root,
+                                    local_config = LocalConfig {overrides = #overrides project,
+                                                                build_excludes = #local_build_excludes project,
+                                                                build_jobs = #local_build_jobs project,
+                                                                build_tactic_timeout = #build_tactic_timeout project}}
+    val dep_project =
+      case source of
+          LegacyPathSource _ => parsed_project
+        | _ => without_dependencies parsed_project
     val declared_name = #name dep_project
     val _ =
       case declared_name of
@@ -819,7 +852,10 @@ fun dependency_package artifact_parent project (dep as Dependency {name, ...}) =
     val dep_project = dependency_project project dep
     val dep_root = valOf (dependency_local_path project dep)
     val dep_manifest = valOf (dependency_manifest project dep)
-    val artifact_root = Path.concat(Path.concat(artifact_parent, ".holbuild/deps"), name)
+    val artifact_root =
+      case dep of
+          Dependency {source = LegacyPathSource _, ...} => Path.concat(Path.concat(artifact_parent, ".holbuild/deps"), name)
+        | _ => Path.concat(Path.concat(Path.concat(artifact_parent, ".holbuild"), "packages"), name)
   in
     (Package {name = name, root = dep_root, manifest = dep_manifest,
               members = #members dep_project, excludes = #excludes dep_project,
@@ -859,6 +895,9 @@ fun describe (project : t) =
          overrides, local_build_excludes, local_build_jobs, build_tactic_timeout, run_heap, run_loads, heaps, action_policies, generators} = project
     fun opt label value =
       case value of NONE => () | SOME s => print (label ^ s ^ "\n")
+    fun describe_package (Package {name, root, manifest, artifact_root, ...}) =
+      print ("package: " ^ name ^ " [root=" ^ root ^ ", manifest=" ^ manifest ^
+             ", artifact-root=" ^ artifact_root ^ "]\n")
   in
     print ("manifest: " ^ manifest ^ "\n");
     print ("root: " ^ root ^ "\n");
@@ -872,6 +911,7 @@ fun describe (project : t) =
                 print ("root tactic_timeout: " ^ root ^ " = " ^
                        (case timeout of NONE => "none" | SOME t => Real.toString t) ^ "\n"))
              root_tactic_timeouts;
+    List.app describe_package (packages project);
     List.app (fn dep => print ("dependency: " ^ dependency_to_string project dep ^ "\n")) dependencies;
     List.app (fn override => print ("override: " ^ override_to_string override ^ "\n")) overrides;
     Option.app (fn jobs => print ("local build.jobs: " ^ Int.toString jobs ^ "\n")) local_build_jobs;

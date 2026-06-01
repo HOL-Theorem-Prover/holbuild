@@ -60,7 +60,9 @@ TOML
 
 (cd "$project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/context1.log"
 require_grep 'dependency: dep \[git=' "$tmpdir/context1.log"
-require_grep "dependency: subdep \[from=dep, path=subdir, manifest=sub.manifest.toml, resolved-manifest=$project/.holbuild/src/dep/subdir/sub.manifest.toml" "$tmpdir/context1.log"
+require_grep "package: dep \[root=$project/.holbuild/src/dep, manifest=$project/.holbuild/src/dep/holproject.toml, artifact-root=$project/.holbuild/packages/dep\]" "$tmpdir/context1.log"
+require_grep "package: subdep \[root=$project/.holbuild/src/dep/subdir, manifest=$project/.holbuild/src/dep/subdir/sub.manifest.toml, artifact-root=$project/.holbuild/packages/subdep\]" "$tmpdir/context1.log"
+require_grep "dependency: subdep \[from=dep, path=subdir, manifest=sub.manifest.toml, local=$project/.holbuild/src/dep/subdir, resolved-manifest=$project/.holbuild/src/dep/subdir/sub.manifest.toml" "$tmpdir/context1.log"
 [ "$(git -C "$project/.holbuild/src/dep" rev-parse HEAD)" = "$rev1" ]
 require_grep '^one$' "$project/.holbuild/src/dep/value.txt"
 
@@ -114,6 +116,57 @@ if (cd "$bad_name" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/bad
   exit 1
 fi
 require_grep 'dependencies.../dep must be a safe dependency name' "$tmpdir/bad-name.log"
+
+no_manifest_repo=$tmpdir/no-manifest-repo
+mkdir -p "$no_manifest_repo"
+git -C "$no_manifest_repo" init -q
+git_identity "$no_manifest_repo"
+echo content > "$no_manifest_repo/file.txt"
+git -C "$no_manifest_repo" add .
+git -C "$no_manifest_repo" commit -q -m initial
+no_manifest_rev=$(git -C "$no_manifest_repo" rev-parse HEAD)
+no_manifest_project=$tmpdir/no-manifest-project
+mkdir -p "$no_manifest_project"
+cat > "$no_manifest_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[project]
+name = "no-manifest-project"
+
+[dependencies.dep]
+git = "$no_manifest_repo"
+rev = "$no_manifest_rev"
+TOML
+if (cd "$no_manifest_project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/no-manifest.log" 2>&1; then
+  echo "missing git manifest unexpectedly accepted" >&2
+  exit 1
+fi
+require_grep 'dependency dep manifest not found:' "$tmpdir/no-manifest.log"
+
+missing_from_manifest=$tmpdir/missing-from-manifest
+mkdir -p "$missing_from_manifest"
+cat > "$missing_from_manifest/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[project]
+name = "missing-from-manifest"
+
+[dependencies.dep]
+git = "$repo"
+rev = "$rev1"
+
+[dependencies.subdep]
+from = "dep"
+path = "subdir"
+manifest = "missing.toml"
+TOML
+if (cd "$missing_from_manifest" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/missing-from-manifest.log" 2>&1; then
+  echo "missing from manifest unexpectedly accepted" >&2
+  exit 1
+fi
+require_grep 'dependency subdep manifest not found:' "$tmpdir/missing-from-manifest.log"
 
 unknown_from=$tmpdir/unknown-from
 mkdir -p "$unknown_from"

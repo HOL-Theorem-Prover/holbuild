@@ -54,6 +54,10 @@ cat > "$schema2_repo/holproject.toml" <<'TOML'
 [project]
 name = "hol"
 TOML
+cat > "$schema2_repo/holexamples.manifest.toml" <<'TOML'
+[project]
+name = "holexamples"
+TOML
 git -C "$schema2_repo" add .
 git -C "$schema2_repo" commit -q -m initial
 schema2_rev=$(git -C "$schema2_repo" rev-parse HEAD)
@@ -72,7 +76,7 @@ git = "$schema2_repo"
 rev = "$schema2_rev"
 TOML
 (cd "$tmpdir/valid_schema2_git" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/valid_schema2_git.log"
-require_grep "dependency: hol \[git=$schema2_repo, rev=$schema2_rev\]" "$tmpdir/valid_schema2_git.log"
+require_grep "dependency: hol \[git=$schema2_repo, rev=$schema2_rev" "$tmpdir/valid_schema2_git.log"
 
 make_project valid_schema2_from
 cat > "$tmpdir/valid_schema2_from/holproject.toml" <<TOML
