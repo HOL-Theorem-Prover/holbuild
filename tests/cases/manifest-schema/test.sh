@@ -44,8 +44,22 @@ TOML
 require_grep "name: valid" "$tmpdir/valid.log"
 require_grep "roots: src/MainScript.sml" "$tmpdir/valid.log"
 
+schema2_repo=$tmpdir/schema2-repo
+mkdir -p "$schema2_repo"
+git -C "$schema2_repo" init -q
+git -C "$schema2_repo" config user.email test@example.com
+git -C "$schema2_repo" config user.name 'Holbuild Test'
+git -C "$schema2_repo" config commit.gpgsign false
+cat > "$schema2_repo/holproject.toml" <<'TOML'
+[project]
+name = "hol"
+TOML
+git -C "$schema2_repo" add .
+git -C "$schema2_repo" commit -q -m initial
+schema2_rev=$(git -C "$schema2_repo" rev-parse HEAD)
+
 make_project valid_schema2_git
-cat > "$tmpdir/valid_schema2_git/holproject.toml" <<'TOML'
+cat > "$tmpdir/valid_schema2_git/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 required_version = ">=0.2"
@@ -54,11 +68,11 @@ required_version = ">=0.2"
 name = "valid_schema2_git"
 
 [dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "abcdef"
+git = "$schema2_repo"
+rev = "$schema2_rev"
 TOML
 (cd "$tmpdir/valid_schema2_git" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/valid_schema2_git.log"
-require_grep "dependency: hol \[git=https://github.com/HOL-Theorem-Prover/HOL.git, rev=abcdef\]" "$tmpdir/valid_schema2_git.log"
+require_grep "dependency: hol \[git=$schema2_repo, rev=$schema2_rev\]" "$tmpdir/valid_schema2_git.log"
 
 make_project valid_schema2_from
 cat > "$tmpdir/valid_schema2_from/holproject.toml" <<'TOML'
