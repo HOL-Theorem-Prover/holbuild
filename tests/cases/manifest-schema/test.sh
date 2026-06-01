@@ -75,12 +75,16 @@ TOML
 require_grep "dependency: hol \[git=$schema2_repo, rev=$schema2_rev\]" "$tmpdir/valid_schema2_git.log"
 
 make_project valid_schema2_from
-cat > "$tmpdir/valid_schema2_from/holproject.toml" <<'TOML'
+cat > "$tmpdir/valid_schema2_from/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [project]
 name = "valid_schema2_from"
+
+[dependencies.hol]
+git = "$schema2_repo"
+rev = "$schema2_rev"
 
 [dependencies.holexamples]
 from = "hol"

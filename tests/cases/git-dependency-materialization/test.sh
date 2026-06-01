@@ -26,6 +26,11 @@ cat > "$repo/holproject.toml" <<'TOML'
 [project]
 name = "dep"
 TOML
+mkdir -p "$repo/subdir"
+cat > "$repo/subdir/sub.manifest.toml" <<'TOML'
+[project]
+name = "subdep"
+TOML
 echo one > "$repo/value.txt"
 git -C "$repo" add .
 git -C "$repo" commit -q -m one
@@ -46,10 +51,16 @@ name = "project"
 [dependencies.dep]
 git = "$repo"
 rev = "$rev1"
+
+[dependencies.subdep]
+from = "dep"
+path = "subdir"
+manifest = "sub.manifest.toml"
 TOML
 
 (cd "$project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/context1.log"
 require_grep 'dependency: dep \[git=' "$tmpdir/context1.log"
+require_grep "dependency: subdep \[from=dep, path=subdir, manifest=sub.manifest.toml, resolved-manifest=$project/.holbuild/src/dep/subdir/sub.manifest.toml" "$tmpdir/context1.log"
 [ "$(git -C "$project/.holbuild/src/dep" rev-parse HEAD)" = "$rev1" ]
 require_grep '^one$' "$project/.holbuild/src/dep/value.txt"
 
@@ -102,7 +113,80 @@ if (cd "$bad_name" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/bad
   echo "unsafe name unexpectedly accepted" >&2
   exit 1
 fi
-require_grep 'unsafe dependency name for materialization' "$tmpdir/bad-name.log"
+require_grep 'dependencies.../dep must be a safe dependency name' "$tmpdir/bad-name.log"
+
+unknown_from=$tmpdir/unknown-from
+mkdir -p "$unknown_from"
+cat > "$unknown_from/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[project]
+name = "unknown-from"
+
+[dependencies.subdep]
+from = "missing"
+path = "."
+manifest = "sub.manifest.toml"
+TOML
+if (cd "$unknown_from" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/unknown-from.log" 2>&1; then
+  echo "unknown from unexpectedly accepted" >&2
+  exit 1
+fi
+require_grep 'dependencies.subdep from dependency is unknown: missing' "$tmpdir/unknown-from.log"
+
+from_from=$tmpdir/from-from
+mkdir -p "$from_from"
+cat > "$from_from/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[project]
+name = "from-from"
+
+[dependencies.a]
+from = "b"
+path = "."
+manifest = "a.toml"
+
+[dependencies.b]
+from = "dep"
+path = "."
+manifest = "b.toml"
+
+[dependencies.dep]
+git = "$repo"
+rev = "$rev1"
+TOML
+if (cd "$from_from" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/from-from.log" 2>&1; then
+  echo "from-from unexpectedly accepted" >&2
+  exit 1
+fi
+require_grep 'dependencies.a from dependency must refer to a direct git dependency: b' "$tmpdir/from-from.log"
+
+bad_from_path=$tmpdir/bad-from-path
+mkdir -p "$bad_from_path"
+cat > "$bad_from_path/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[project]
+name = "bad-from-path"
+
+[dependencies.dep]
+git = "$repo"
+rev = "$rev1"
+
+[dependencies.subdep]
+from = "dep"
+path = "../escape"
+manifest = "sub.manifest.toml"
+TOML
+if (cd "$bad_from_path" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/bad-from-path.log" 2>&1; then
+  echo "bad from path unexpectedly accepted" >&2
+  exit 1
+fi
+require_grep 'dependencies.subdep.path must be package-root-relative' "$tmpdir/bad-from-path.log"
 
 missing=$tmpdir/missing
 mkdir -p "$missing"

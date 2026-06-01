@@ -299,6 +299,15 @@ fun package_relative_path field path =
 
 fun package_relative_paths field paths = map (package_relative_path field) paths
 
+fun safe_materialized_dependency_name name =
+  size name > 0 andalso
+  List.all (fn c => Char.isAlphaNum c orelse c = #"_" orelse c = #"." orelse c = #"-")
+           (String.explode name)
+
+fun require_safe_materialized_dependency_name context name =
+  if safe_materialized_dependency_name name then ()
+  else die (context ^ " must be a safe dependency name: " ^ name)
+
 fun named_table_entries table key =
   case table_field table key of
       NONE => []
@@ -398,7 +407,10 @@ fun validate_dependency_table schema (name, table) =
          | (SOME _, NONE, _, _, _) => die (context ^ " with git requires rev")
          | (NONE, SOME _, _, _, _) => die (context ^ " with rev requires git")
          | (SOME _, SOME _, _, _, _) => die (context ^ " git dependency may only contain git and rev")
-         | (NONE, NONE, SOME _, SOME _, SOME _) => ()
+         | (NONE, NONE, SOME from, SOME path, SOME manifest) =>
+             (require_safe_materialized_dependency_name (context ^ ".from") from;
+              ignore (package_relative_path (context ^ ".path") path);
+              ignore (package_relative_path (context ^ ".manifest") manifest))
          | (NONE, NONE, SOME _, _, _) => die (context ^ " with from requires path and manifest")
          | (NONE, NONE, NONE, SOME _, _) => die (context ^ " path dependencies are not supported in schema 2")
          | (NONE, NONE, NONE, NONE, SOME _) => die (context ^ " manifest requires from in schema 2")
@@ -475,6 +487,25 @@ fun parse_dependency schema (name, table) =
 fun dependencies_at table =
   let val schema = schema_version table
   in map (parse_dependency schema) (named_table_entries table ["dependencies"]) end
+
+fun dependency_name (Dependency {name, ...}) = name
+
+fun validate_schema2_dependency_refs deps =
+  let
+    fun source_for name =
+      Option.map (fn Dependency {source, ...} => source)
+        (List.find (fn dep => dependency_name dep = name) deps)
+    fun validate_one (Dependency {name, source = FromSource {from, ...}}) =
+          (case source_for from of
+               SOME (GitSource _) => ()
+             | SOME _ => die ("dependencies." ^ name ^ " from dependency must refer to a direct git dependency: " ^ from)
+             | NONE => die ("dependencies." ^ name ^ " from dependency is unknown: " ^ from))
+      | validate_one (Dependency {name, source = GitSource _, ...}) =
+          require_safe_materialized_dependency_name ("dependencies." ^ name) name
+      | validate_one _ = ()
+  in
+    List.app validate_one deps
+  end
 
 fun parse_action_policy root (logical, table) =
   let
@@ -577,10 +608,13 @@ fun parse_table_at table {manifest, root, artifact_root, local_config} =
     val root_tactic_timeouts = root_tactic_timeouts_from_manifest build
     val _ = validate_root_tactic_timeouts roots root_tactic_timeouts
     val manifest_timeout = build_tactic_timeout_from_manifest build
+    val schema = schema_version table
+    val dependencies = dependencies_at table
     val _ =
-      if schema_version table = 2 andalso not (null overrides) then
+      if schema = 2 andalso not (null overrides) then
         die "local dependency overrides are not supported in schema 2"
       else ()
+    val _ = if schema = 2 then validate_schema2_dependency_refs dependencies else ()
   in
     { root = root,
       artifact_root = artifact_root,
@@ -591,7 +625,7 @@ fun parse_table_at table {manifest, root, artifact_root, local_config} =
       excludes = excludes,
       roots = roots,
       root_tactic_timeouts = root_tactic_timeouts,
-      dependencies = dependencies_at table,
+      dependencies = dependencies,
       overrides = overrides,
       local_build_excludes = build_excludes,
       local_build_jobs = build_jobs,
@@ -711,9 +745,10 @@ fun dependency_manifest (project as {manifest = project_manifest, ...} : t) dep 
         else
           Option.map (fn path => Path.concat(path, "holproject.toml"))
             (dependency_local_path project dep)
-    | Dependency {source = FromSource {manifest, ...}, ...} =>
-        SOME (abs_under (manifest_root project_manifest)
-                (expand_env (dependency_manifest_context "from") manifest))
+    | Dependency {source = FromSource {from, path, manifest}, ...} =>
+        SOME (Path.concat(abs_under (Path.concat(Path.concat(#artifact_root project, ".holbuild"), "src"))
+                                    (Path.concat(from, path)),
+                          manifest))
     | Dependency {source = GitSource _, ...} => NONE
 
 fun heap_to_string (Heap {name, output, objects}) =
