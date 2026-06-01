@@ -334,22 +334,7 @@ fun load_project () =
   HolbuildProject.discover ()
   handle HolbuildProject.Error msg => raise Error msg
 
-fun materialize_schema2_git_dependencies project =
-  let
-    fun one (HolbuildProject.Dependency {name, source = HolbuildProject.GitSource {git, rev}}) =
-          ignore (HolbuildGitCache.materialize {name = name, git = git, rev = rev,
-                                                artifact_root = HolbuildProject.artifact_root project})
-      | one _ = ()
-  in
-    List.app one (#dependencies project)
-  end
-
-fun context () =
-  let val project = load_project ()
-  in
-    materialize_schema2_git_dependencies project;
-    HolbuildProject.describe project
-  end
+fun context () = HolbuildProject.describe (load_project ())
 
 fun timed_phase name f = HolbuildToolchain.time_phase name f
 
