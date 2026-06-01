@@ -67,6 +67,7 @@ use_hol("src/portableML/poly/w64-SHA1.ML");
 
 use "sml/hash.sml";
 use "sml/builtin_manifests.sml";
+use "sml/git_cache.sml";
 use "sml/project.sml";
 use "sml/toolchain.sml";
 use "sml/status.sml";
@@ -81,7 +82,6 @@ use "sml/theory_diagnostics.sml";
 use "sml/project_lock.sml";
 use "sml/theory_spans.sml";
 use "sml/cache.sml";
-use "sml/git_cache.sml";
 use "sml/build_exec.sml";
 use "sml/tactic_timeout_policy.sml";
 use "sml/goalfrag_plan.sml";

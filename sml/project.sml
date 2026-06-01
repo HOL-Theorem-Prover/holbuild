@@ -54,7 +54,9 @@ datatype package =
 type t =
   { root : string,
     artifact_root : string,
+    graph_artifact_root : string,
     manifest : string,
+    schema : int,
     name : string option,
     version : string option,
     members : string list,
@@ -590,7 +592,7 @@ fun parse_local_config root =
     else LocalConfig {overrides = [], build_excludes = [], build_jobs = NONE, build_tactic_timeout = NONE}
   end
 
-fun parse_table_at table {manifest, root, artifact_root, local_config} =
+fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, local_config} =
   let
     val _ = validate_manifest_table table
     val project = table_field table ["project"]
@@ -618,7 +620,9 @@ fun parse_table_at table {manifest, root, artifact_root, local_config} =
   in
     { root = root,
       artifact_root = artifact_root,
+      graph_artifact_root = graph_artifact_root,
       manifest = manifest,
+      schema = schema,
       name = Option.mapPartial (fn t => string_field t "name") project,
       version = Option.mapPartial (fn t => string_field t "version") project,
       members = members,
@@ -647,7 +651,7 @@ fun parse manifest =
     val root = manifest_root manifest
     val local_config = parse_local_config root
   in
-    parse_at {manifest = manifest, root = root, artifact_root = root, local_config = local_config}
+    parse_at {manifest = manifest, root = root, artifact_root = root, graph_artifact_root = root, local_config = local_config}
   end
 
 fun discover () =
@@ -660,7 +664,7 @@ fun discover () =
             val artifact_root' = if artifact_root = "" then root else artifact_root
             val local_config = parse_local_config root
           in
-            parse_at {manifest = manifest, root = root, artifact_root = artifact_root', local_config = local_config}
+            parse_at {manifest = manifest, root = root, artifact_root = artifact_root', graph_artifact_root = artifact_root', local_config = local_config}
           end
       | NONE => die "no holproject.toml found in --source-dir/current directory or parents"
   end
@@ -725,7 +729,7 @@ fun action_policy_for policies logical =
 fun dependency_path_context name = "dependencies." ^ name ^ ".path"
 fun dependency_manifest_context name = "dependencies." ^ name ^ ".manifest"
 
-fun dependency_local_path (project as {root, overrides, ...} : t) (Dependency {name, source}) =
+fun dependency_local_path (project as {root, overrides, graph_artifact_root, ...} : t) (Dependency {name, source}) =
   Option.map (abs_under root)
     (case override_path overrides name of
          SOME override => SOME override
@@ -733,11 +737,11 @@ fun dependency_local_path (project as {root, overrides, ...} : t) (Dependency {n
            case source of
                LegacyPathSource {path = SOME p, ...} => SOME (expand_env (dependency_path_context name) p)
              | LegacyPathSource {path = NONE, ...} => if builtin_holdir_dependency name then !holdir_ref else NONE
-             | GitSource _ => SOME (Path.concat(Path.concat(Path.concat(#artifact_root project, ".holbuild"), "src"), name))
+             | GitSource _ => SOME (Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), name))
              | FromSource {from, path, ...} =>
-                 SOME (Path.concat(Path.concat(Path.concat(Path.concat(#artifact_root project, ".holbuild"), "src"), from), path)))
+                 SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path)))
 
-fun dependency_manifest (project as {manifest = project_manifest, ...} : t) dep =
+fun dependency_manifest (project as {manifest = project_manifest, graph_artifact_root, ...} : t) dep =
   case dep of
       Dependency {name, source = LegacyPathSource {manifest = SOME manifest, ...}} =>
         SOME (abs_under (manifest_root project_manifest)
@@ -748,10 +752,10 @@ fun dependency_manifest (project as {manifest = project_manifest, ...} : t) dep 
           Option.map (fn path => Path.concat(path, "holproject.toml"))
             (dependency_local_path project dep)
     | Dependency {name, source = GitSource _, ...} =>
-        SOME (Path.concat(Path.concat(Path.concat(Path.concat(#artifact_root project, ".holbuild"), "src"), name),
+        SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), name),
                           "holproject.toml"))
     | Dependency {source = FromSource {from, path, manifest}, ...} =>
-        SOME (Path.concat(abs_under (Path.concat(Path.concat(#artifact_root project, ".holbuild"), "src"))
+        SOME (Path.concat(abs_under (Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"))
                                     (Path.concat(from, path)),
                           manifest))
 
@@ -779,36 +783,20 @@ fun dependency_to_string project (dep as Dependency {name, source}) =
 
 fun override_to_string (Override {name, path}) = name ^ " -> " ^ path
 
-fun project_package ({root, artifact_root, manifest, name, members, excludes, roots, action_policies, generators, ...} : t) =
+fun project_package ({root, artifact_root, graph_artifact_root, manifest, name, members, excludes, roots, action_policies, generators, ...} : t) =
   Package {name = Option.getOpt(name, "root"), root = root, manifest = manifest,
            members = members, excludes = excludes, roots = roots,
-           artifact_root = Path.concat(artifact_root, ".holbuild"),
+           artifact_root = if artifact_root = graph_artifact_root then Path.concat(artifact_root, ".holbuild") else artifact_root,
            action_policies = action_policies,
            generators = generators}
 
-fun without_dependencies (project : t) : t =
-  { root = #root project,
-    artifact_root = #artifact_root project,
-    manifest = #manifest project,
-    name = #name project,
-    version = #version project,
-    members = #members project,
-    excludes = #excludes project,
-    roots = #roots project,
-    root_tactic_timeouts = #root_tactic_timeouts project,
-    dependencies = [],
-    overrides = #overrides project,
-    local_build_excludes = #local_build_excludes project,
-    local_build_jobs = #local_build_jobs project,
-    build_tactic_timeout = #build_tactic_timeout project,
-    run_heap = #run_heap project,
-    run_loads = #run_loads project,
-    heaps = #heaps project,
-    action_policies = #action_policies project,
-    generators = #generators project }
-
 fun dependency_project (project : t) (dep as Dependency {name, source}) =
   let
+    val _ =
+      case source of
+          GitSource {git, rev} => ignore (HolbuildGitCache.materialize {name = name, git = git, rev = rev,
+                                                                        artifact_root = #graph_artifact_root project})
+        | _ => ()
     val dep_root =
       case dependency_local_path project dep of
           SOME path => path
@@ -826,16 +814,13 @@ fun dependency_project (project : t) (dep as Dependency {name, source}) =
     val dep_artifact_root =
       case source of
           LegacyPathSource _ => dep_root
-        | _ => Path.concat(Path.concat(Path.concat(#artifact_root project, ".holbuild"), "packages"), name)
-    val parsed_project = parse_dep {manifest = dep_manifest, root = dep_root, artifact_root = dep_artifact_root,
-                                    local_config = LocalConfig {overrides = #overrides project,
+        | _ => Path.concat(Path.concat(Path.concat(#graph_artifact_root project, ".holbuild"), "packages"), name)
+    val dep_project = parse_dep {manifest = dep_manifest, root = dep_root, artifact_root = dep_artifact_root,
+                                 graph_artifact_root = #graph_artifact_root project,
+                                 local_config = LocalConfig {overrides = #overrides project,
                                                                 build_excludes = #local_build_excludes project,
-                                                                build_jobs = #local_build_jobs project,
-                                                                build_tactic_timeout = #build_tactic_timeout project}}
-    val dep_project =
-      case source of
-          LegacyPathSource _ => parsed_project
-        | _ => without_dependencies parsed_project
+                                                             build_jobs = #local_build_jobs project,
+                                                             build_tactic_timeout = #build_tactic_timeout project}}
     val declared_name = #name dep_project
     val _ =
       case declared_name of
@@ -865,34 +850,47 @@ fun dependency_package artifact_parent project (dep as Dependency {name, ...}) =
      dep_project)
   end
 
+fun same_dependency_source (GitSource a, GitSource b) = #git a = #git b andalso #rev a = #rev b
+  | same_dependency_source (FromSource a, FromSource b) =
+      #from a = #from b andalso #path a = #path b andalso #manifest a = #manifest b
+  | same_dependency_source (LegacyPathSource a, LegacyPathSource b) = #path a = #path b andalso #manifest a = #manifest b
+  | same_dependency_source _ = false
+
 fun packages (project : t) =
   let
-    val artifact_parent = artifact_root project
-    fun seen name names = List.exists (fn n => n = name) names
-    fun add_dependency parent_project (dep, (names, packages)) =
-      let val name = dependency_name dep
-      in
-        if seen name names then (names, packages)
-        else
-          let
-            val (package, dep_project) = dependency_package artifact_parent parent_project dep
-            val (names', packages') = add_project dep_project (name :: names, package :: packages)
-          in
-            (names', packages')
-          end
-      end
+    val artifact_parent = #graph_artifact_root project
+    fun seen_source name seen =
+      Option.map #2 (List.find (fn (n, _) => n = name) seen)
+    fun add_dependency parent_project (dep as Dependency {name, source}, (seen, packages)) =
+      case seen_source name seen of
+          SOME previous =>
+            if same_dependency_source (previous, source) then (seen, packages)
+            else die ("conflicting dependency " ^ name)
+        | NONE =>
+            let
+              val (package, dep_project) = dependency_package artifact_parent parent_project dep
+              val (seen', packages') = add_project dep_project ((name, source) :: seen, package :: packages)
+            in
+              (seen', packages')
+            end
     and add_project current_project state =
       List.foldl (add_dependency current_project) state (#dependencies current_project)
     val root_package = project_package project
-    val (_, packages) = add_project project ([package_name root_package], [root_package])
+    val (_, packages) = add_project project ([], [root_package])
+    val result = rev packages
+    val hol_count = length (List.filter (fn package => package_name package = "hol") result)
+    val _ =
+      if #schema project = 2 andalso hol_count <> 1 then
+        die ("schema 2 dependency graph must contain exactly one hol dependency")
+      else ()
   in
-    rev packages
+    result
   end
 
 fun describe (project : t) =
   let
     val {root, artifact_root, manifest, name, version, members, excludes, roots, root_tactic_timeouts, dependencies,
-         overrides, local_build_excludes, local_build_jobs, build_tactic_timeout, run_heap, run_loads, heaps, action_policies, generators} = project
+         overrides, local_build_excludes, local_build_jobs, build_tactic_timeout, run_heap, run_loads, heaps, action_policies, generators, ...} = project
     fun opt label value =
       case value of NONE => () | SOME s => print (label ^ s ^ "\n")
     fun describe_package (Package {name, root, manifest, artifact_root, ...}) =

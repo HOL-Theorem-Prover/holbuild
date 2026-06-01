@@ -39,6 +39,18 @@ echo two > "$repo/value.txt"
 git -C "$repo" commit -q -am two
 rev2=$(git -C "$repo" rev-parse HEAD)
 
+hol_repo=$tmpdir/hol-repo
+mkdir -p "$hol_repo"
+git -C "$hol_repo" init -q
+git_identity "$hol_repo"
+cat > "$hol_repo/holproject.toml" <<'TOML'
+[project]
+name = "hol"
+TOML
+git -C "$hol_repo" add .
+git -C "$hol_repo" commit -q -m hol
+hol_rev=$(git -C "$hol_repo" rev-parse HEAD)
+
 project=$tmpdir/project
 mkdir -p "$project"
 cat > "$project/holproject.toml" <<TOML
@@ -47,6 +59,10 @@ schema = 2
 
 [project]
 name = "project"
+
+[dependencies.hol]
+git = "$hol_repo"
+rev = "$hol_rev"
 
 [dependencies.dep]
 git = "$repo"
@@ -87,6 +103,10 @@ schema = 2
 
 [project]
 name = "bad-short"
+
+[dependencies.hol]
+git = "$hol_repo"
+rev = "$hol_rev"
 
 [dependencies.dep]
 git = "$repo"
@@ -134,6 +154,10 @@ schema = 2
 [project]
 name = "no-manifest-project"
 
+[dependencies.hol]
+git = "$hol_repo"
+rev = "$hol_rev"
+
 [dependencies.dep]
 git = "$no_manifest_repo"
 rev = "$no_manifest_rev"
@@ -152,6 +176,10 @@ schema = 2
 
 [project]
 name = "missing-from-manifest"
+
+[dependencies.hol]
+git = "$hol_repo"
+rev = "$hol_rev"
 
 [dependencies.dep]
 git = "$repo"
@@ -207,6 +235,10 @@ from = "dep"
 path = "."
 manifest = "b.toml"
 
+[dependencies.hol]
+git = "$hol_repo"
+rev = "$hol_rev"
+
 [dependencies.dep]
 git = "$repo"
 rev = "$rev1"
@@ -225,6 +257,10 @@ schema = 2
 
 [project]
 name = "bad-from-path"
+
+[dependencies.hol]
+git = "$hol_repo"
+rev = "$hol_rev"
 
 [dependencies.dep]
 git = "$repo"
@@ -250,6 +286,10 @@ schema = 2
 
 [project]
 name = "missing"
+
+[dependencies.hol]
+git = "$hol_repo"
+rev = "$hol_rev"
 
 [dependencies.dep]
 git = "$repo"

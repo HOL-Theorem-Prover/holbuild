@@ -12,9 +12,17 @@ fun quote s = HolbuildHash.quote s
 
 fun path_exists path = FS.access(path, []) handle OS.SysErr _ => false
 
-fun ensure_dir path = HolbuildCache.ensure_dir path
+fun ensure_dir path =
+  if path = "" orelse path = "." then ()
+  else if path_exists path then ()
+  else (ensure_dir (Path.dir path); FS.mkDir path handle OS.SysErr _ => ())
 
-fun remove_tree path = HolbuildCache.remove_tree path
+fun remove_tree path =
+  if path = "" orelse path = "." orelse path = "/" then
+    die ("refusing to remove unsafe path: " ^ path)
+  else
+    let val status = OS.Process.system ("rm -rf " ^ quote path)
+    in if OS.Process.isSuccess status then () else die ("failed to remove path: " ^ path) end
 
 fun is_safe_name name =
   size name > 0 andalso
@@ -59,9 +67,20 @@ fun trim text =
     if r < l then "" else String.substring(text, l, r - l + 1)
   end
 
+fun cache_root () =
+  case OS.Process.getEnv "HOLBUILD_CACHE" of
+      SOME path => path
+    | NONE =>
+      case OS.Process.getEnv "XDG_CACHE_HOME" of
+          SOME base => Path.concat(base, "holbuild")
+        | NONE =>
+          case OS.Process.getEnv "HOME" of
+              SOME home => Path.concat(Path.concat(home, ".cache"), "holbuild")
+            | NONE => die "set HOME, XDG_CACHE_HOME, or HOLBUILD_CACHE"
+
 fun cache_remote_dir git =
   let
-    val root = HolbuildCache.cache_root ()
+    val root = cache_root ()
     val remotes = Path.concat(Path.concat(root, "git"), "remotes")
     val hash = HolbuildHash.string_sha1 git
   in
