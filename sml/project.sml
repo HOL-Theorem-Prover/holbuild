@@ -393,7 +393,10 @@ fun validate_schema table =
     | SOME holbuild =>
         (require_known_fields "holbuild" ["schema", "required_version"] holbuild;
          ignore (schema_version table);
-         Option.app (fn _ => ()) (string_at holbuild ["required_version"]))
+         case string_at holbuild ["required_version"] of
+             NONE => ()
+           | SOME "" => ()
+           | SOME _ => die "holbuild.required_version is recognized but not implemented yet")
 
 fun validate_dependency_table schema (name, table) =
   let

@@ -63,7 +63,7 @@ name = "root"
 git = "$a"
 rev = "$a_rev"
 TOML
-(cd "$root" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/root.log"
+(cd "$root" && "$HOLBUILD_BIN" context) > "$tmpdir/root.log"
 require_grep "package: a \[root=$root/.holbuild/src/a" "$tmpdir/root.log"
 require_grep "package: b \[root=$root/.holbuild/src/b" "$tmpdir/root.log"
 require_grep "package: hol \[root=$root/.holbuild/src/hol" "$tmpdir/root.log"
@@ -92,7 +92,7 @@ p='$nohol/holproject.toml'
 s=open(p).read().replace('$b', '$plain').replace('$b_rev', '$plain_rev')
 open(p,'w').write(s)
 PY
-if (cd "$nohol" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/nohol.log" 2>&1; then
+if (cd "$nohol" && "$HOLBUILD_BIN" context) > "$tmpdir/nohol.log" 2>&1; then
   echo "missing hol unexpectedly accepted" >&2
   exit 1
 fi
@@ -132,7 +132,7 @@ rev = "$a_rev"
 git = "$c"
 rev = "$c_rev"
 TOML
-if (cd "$conflict" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/conflict.log" 2>&1; then
+if (cd "$conflict" && "$HOLBUILD_BIN" context) > "$tmpdir/conflict.log" 2>&1; then
   echo "conflict unexpectedly accepted" >&2
   exit 1
 fi

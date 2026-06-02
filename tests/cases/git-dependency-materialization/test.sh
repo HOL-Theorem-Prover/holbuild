@@ -71,7 +71,7 @@ path = "subdir"
 manifest = "sub.manifest.toml"
 TOML
 
-(cd "$project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/context1.log"
+(cd "$project" && "$HOLBUILD_BIN" context) > "$tmpdir/context1.log"
 require_grep 'dependency: dep \[git=' "$tmpdir/context1.log"
 require_grep "package: dep \[root=$project/.holbuild/src/dep, manifest=$project/.holbuild/src/dep/holproject.toml, artifact-root=$project/.holbuild/packages/dep\]" "$tmpdir/context1.log"
 require_grep "package: subdep \[root=$project/.holbuild/src/dep/subdir, manifest=$project/.holbuild/src/dep/subdir/sub.manifest.toml, artifact-root=$project/.holbuild/packages/subdep\]" "$tmpdir/context1.log"
@@ -79,7 +79,7 @@ require_grep "dependency: subdep \[from=dep, path=subdir, manifest=sub.manifest.
 [ "$(git -C "$project/.holbuild/src/dep" rev-parse HEAD)" = "$rev1" ]
 require_grep '^one$' "$project/.holbuild/src/dep/value.txt"
 
-(cd "$project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/context2.log"
+(cd "$project" && "$HOLBUILD_BIN" context) > "$tmpdir/context2.log"
 [ "$(git -C "$project/.holbuild/src/dep" rev-parse HEAD)" = "$rev1" ]
 
 python3 - "$project/holproject.toml" "$rev1" "$rev2" <<'PY'
@@ -88,7 +88,7 @@ path, old, new = sys.argv[1:]
 text = open(path).read().replace(old, new)
 open(path, 'w').write(text)
 PY
-(cd "$project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/context3.log"
+(cd "$project" && "$HOLBUILD_BIN" context) > "$tmpdir/context3.log"
 [ "$(git -C "$project/.holbuild/src/dep" rev-parse HEAD)" = "$rev2" ]
 require_grep '^two$' "$project/.holbuild/src/dep/value.txt"
 
@@ -109,7 +109,7 @@ rev = "$hol_rev"
 git = "$repo"
 rev = "${rev1:0:12}"
 TOML
-if (cd "$bad_short" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/bad-short.log" 2>&1; then
+if (cd "$bad_short" && "$HOLBUILD_BIN" context) > "$tmpdir/bad-short.log" 2>&1; then
   echo "short rev unexpectedly accepted" >&2
   exit 1
 fi
@@ -128,7 +128,7 @@ name = "bad-name"
 git = "$repo"
 rev = "$rev1"
 TOML
-if (cd "$bad_name" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/bad-name.log" 2>&1; then
+if (cd "$bad_name" && "$HOLBUILD_BIN" context) > "$tmpdir/bad-name.log" 2>&1; then
   echo "unsafe name unexpectedly accepted" >&2
   exit 1
 fi
@@ -159,7 +159,7 @@ rev = "$hol_rev"
 git = "$no_manifest_repo"
 rev = "$no_manifest_rev"
 TOML
-if (cd "$no_manifest_project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/no-manifest.log" 2>&1; then
+if (cd "$no_manifest_project" && "$HOLBUILD_BIN" context) > "$tmpdir/no-manifest.log" 2>&1; then
   echo "missing git manifest unexpectedly accepted" >&2
   exit 1
 fi
@@ -187,7 +187,7 @@ from = "dep"
 path = "subdir"
 manifest = "missing.toml"
 TOML
-if (cd "$missing_from_manifest" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/missing-from-manifest.log" 2>&1; then
+if (cd "$missing_from_manifest" && "$HOLBUILD_BIN" context) > "$tmpdir/missing-from-manifest.log" 2>&1; then
   echo "missing from manifest unexpectedly accepted" >&2
   exit 1
 fi
@@ -207,7 +207,7 @@ from = "missing"
 path = "."
 manifest = "sub.manifest.toml"
 TOML
-if (cd "$unknown_from" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/unknown-from.log" 2>&1; then
+if (cd "$unknown_from" && "$HOLBUILD_BIN" context) > "$tmpdir/unknown-from.log" 2>&1; then
   echo "unknown from unexpectedly accepted" >&2
   exit 1
 fi
@@ -240,7 +240,7 @@ rev = "$hol_rev"
 git = "$repo"
 rev = "$rev1"
 TOML
-if (cd "$from_from" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/from-from.log" 2>&1; then
+if (cd "$from_from" && "$HOLBUILD_BIN" context) > "$tmpdir/from-from.log" 2>&1; then
   echo "from-from unexpectedly accepted" >&2
   exit 1
 fi
@@ -268,7 +268,7 @@ from = "dep"
 path = "../escape"
 manifest = "sub.manifest.toml"
 TOML
-if (cd "$bad_from_path" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/bad-from-path.log" 2>&1; then
+if (cd "$bad_from_path" && "$HOLBUILD_BIN" context) > "$tmpdir/bad-from-path.log" 2>&1; then
   echo "bad from path unexpectedly accepted" >&2
   exit 1
 fi
@@ -292,7 +292,7 @@ rev = "$hol_rev"
 git = "$repo"
 rev = "$missing_rev"
 TOML
-if (cd "$missing" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/missing.log" 2>&1; then
+if (cd "$missing" && "$HOLBUILD_BIN" context) > "$tmpdir/missing.log" 2>&1; then
   echo "missing rev unexpectedly accepted" >&2
   exit 1
 fi

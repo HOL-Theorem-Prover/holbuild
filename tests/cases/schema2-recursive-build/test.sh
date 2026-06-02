@@ -110,6 +110,31 @@ git = "$a"
 rev = "$a_rev"
 TOML
 
+context_log=$tmpdir/context.log
+(cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" "$HOLBUILD_BIN" context) > "$context_log"
+require_grep "package: hol \[root=$root/.holbuild/src/hol" "$context_log"
+if [ -e "$root/.holbuild/src/hol/configured" ] || [ -e "$root/.holbuild/src/hol/built" ]; then
+  echo "schema 2 context unexpectedly built HOL" >&2
+  exit 1
+fi
+if (cd "$root" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/context-holdir.log" 2>&1; then
+  echo "schema 2 context unexpectedly accepted --holdir" >&2
+  exit 1
+fi
+require_grep 'not supported for schema 2 projects' "$tmpdir/context-holdir.log"
+
+if (cd "$root" && "$HOLBUILD_BIN" --holdir "$HOLDIR" run) > "$tmpdir/run-holdir.log" 2>&1; then
+  echo "schema 2 run unexpectedly accepted --holdir" >&2
+  exit 1
+fi
+require_grep 'not supported for schema 2 projects' "$tmpdir/run-holdir.log"
+
+if (cd "$root" && "$HOLBUILD_BIN" --holdir "$HOLDIR" heap fake) > "$tmpdir/heap-holdir.log" 2>&1; then
+  echo "schema 2 heap unexpectedly accepted --holdir" >&2
+  exit 1
+fi
+require_grep 'not supported for schema 2 projects' "$tmpdir/heap-holdir.log"
+
 dry_log=$tmpdir/dry.log
 (cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" "$HOLBUILD_BIN" build --dry-run Foo) > "$dry_log"
 require_grep "Foo (sml, package b)" "$dry_log"

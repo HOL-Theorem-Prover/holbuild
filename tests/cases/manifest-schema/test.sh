@@ -66,7 +66,6 @@ make_project valid_schema2_git
 cat > "$tmpdir/valid_schema2_git/holproject.toml" <<TOML
 [holbuild]
 schema = 2
-required_version = ">=0.2"
 
 [project]
 name = "valid_schema2_git"
@@ -75,7 +74,7 @@ name = "valid_schema2_git"
 git = "$schema2_repo"
 rev = "$schema2_rev"
 TOML
-(cd "$tmpdir/valid_schema2_git" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/valid_schema2_git.log"
+(cd "$tmpdir/valid_schema2_git" && "$HOLBUILD_BIN" context) > "$tmpdir/valid_schema2_git.log"
 require_grep "dependency: hol \[git=$schema2_repo, rev=$schema2_rev" "$tmpdir/valid_schema2_git.log"
 
 make_project valid_schema2_from
@@ -95,7 +94,7 @@ from = "hol"
 path = "."
 manifest = "holexamples.manifest.toml"
 TOML
-(cd "$tmpdir/valid_schema2_from" && "$HOLBUILD_BIN" --holdir "$HOLDIR" context) > "$tmpdir/valid_schema2_from.log"
+(cd "$tmpdir/valid_schema2_from" && "$HOLBUILD_BIN" context) > "$tmpdir/valid_schema2_from.log"
 require_grep "dependency: holexamples \[from=hol, path=., manifest=holexamples.manifest.toml" "$tmpdir/valid_schema2_from.log"
 
 make_project unknown_top
@@ -198,6 +197,17 @@ path = "../dep"
 branch = "main"
 TOML
 expect_context_failure bad_dependency "unknown field in dependencies.dep: branch"
+
+make_project required_version_unimplemented
+cat > "$tmpdir/required_version_unimplemented/holproject.toml" <<'TOML'
+[holbuild]
+schema = 2
+required_version = ">=0.2"
+
+[project]
+name = "required_version_unimplemented"
+TOML
+expect_context_failure required_version_unimplemented "holbuild.required_version is recognized but not implemented yet"
 
 make_project schema2_missing_rev
 cat > "$tmpdir/schema2_missing_rev/holproject.toml" <<'TOML'
