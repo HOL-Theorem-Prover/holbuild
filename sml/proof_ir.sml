@@ -183,6 +183,8 @@ fun step_kind (StepTactic _) = "tactic"
   | step_kind (StepBranchList _) = "branch_list_suffix"
   | step_kind (StepPlain _) = "plain"
 
+fun step_signature proof_step = (step_kind proof_step, step_program proof_step)
+
 fun tactic_end (TacThen []) = 0
   | tactic_end (TacThen xs) = tactic_end (List.last xs)
   | tactic_end (TacThenLT (_, l)) = list_tactic_end l

@@ -82,6 +82,55 @@ require_grep "from: failed-prefix checkpoint in slow_prefix_failure" "$fixed_log
 require_grep "ATheory built" "$fixed_log"
 require_file "$project/.holbuild/obj/src/ATheory.dat"
 
+prefix_edit_project=$tmpdir/prefix-edit-project
+mkdir -p "$prefix_edit_project/src"
+cp "$project/holproject.toml" "$prefix_edit_project/holproject.toml"
+cat > "$prefix_edit_project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Theorem replay_after_prefix_edit:
+  !i:int. T
+Proof
+  strip_tac >>
+  Cases_on `i < 0`
+  >- (
+    sg `0 <= -i` >- intLib.ARITH_TAC >>
+    NO_TAC
+  )
+  >> NO_TAC
+QED
+val _ = export_theory();
+SML
+
+prefix_edit_first_log=$tmpdir/prefix-edit-first.log
+if (cd "$prefix_edit_project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build ATheory) > "$prefix_edit_first_log" 2>&1; then
+  echo "expected prefix-edit replay seed to fail" >&2
+  exit 1
+fi
+require_grep "plan position: 04 branch_suffix" "$prefix_edit_first_log"
+require_file "$(find "$prefix_edit_project/.holbuild/checkpoints" -name '*replay_after_prefix_edit_failed_prefix.save' -print -quit)"
+
+python3 - <<PY
+from pathlib import Path
+path = Path("$prefix_edit_project/src/AScript.sml")
+path.write_text(path.read_text().replace('strip_tac >>', 'ALL_TAC >> strip_tac >>'))
+PY
+prefix_edit_second_log=$tmpdir/prefix-edit-second.log
+if (cd "$prefix_edit_project" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build ATheory) > "$prefix_edit_second_log" 2>&1; then
+  echo "expected edited prefix proof still to fail at NO_TAC" >&2
+  exit 1
+fi
+require_grep "from: failed-prefix checkpoint in replay_after_prefix_edit" "$prefix_edit_second_log"
+if grep -q "fragment: >> strip_tac" "$prefix_edit_second_log"; then
+  echo "failed-prefix replay after prefix edit resumed from an inconsistent proof state" >&2
+  exit 1
+fi
+if grep -q "branch suffix without active branch" "$prefix_edit_second_log"; then
+  echo "failed-prefix replay after prefix edit lost branch state" >&2
+  exit 1
+fi
+require_grep "plan position: 05 branch_suffix" "$prefix_edit_second_log"
+
 resume_project=$tmpdir/resume-project
 resume_counter=$tmpdir/resume-count.txt
 mkdir -p "$resume_project/src"

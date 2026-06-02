@@ -78,6 +78,47 @@ fun write_text_file path text =
   let val out = TextIO.openOut path
   in TextIO.output(out, text); TextIO.closeOut out end
 
+fun take_at_most n xs =
+  let
+    fun loop 0 _ acc = rev acc
+      | loop _ [] acc = rev acc
+      | loop k (x :: rest) acc = loop (k - 1) rest (x :: acc)
+  in loop (Int.max(0, n)) xs [] end
+
+fun encode_step_signature proof_step =
+  let val (kind, program) = HolbuildProofIr.step_signature proof_step
+  in kind ^ "\t" ^ String.toString program ^ "\n" end
+
+fun save_failed_prefix_steps path tactic_text step_count =
+  let
+    val plan = HolbuildProofIr.steps tactic_text
+    val text = String.concat (map encode_step_signature (take_at_most step_count plan))
+  in write_text_file (path ^ ".steps") text end
+  handle _ => ()
+
+fun decode_step_signature line =
+  case String.fields (fn c => c = #"\t") line of
+      kind :: rest =>
+        let val encoded_program = String.concatWith "\t" rest
+        in Option.map (fn program => (kind, program)) (String.fromString encoded_program) end
+    | [] => NONE
+
+fun read_failed_prefix_steps path =
+  let
+    val input = TextIO.openIn (path ^ ".steps")
+    fun loop acc =
+      case TextIO.inputLine input of
+          NONE => (TextIO.closeIn input; SOME (rev acc))
+        | SOME line =>
+            let val trimmed = String.substring(line, 0, Int.max(0, size line - (if size line > 0 andalso String.sub(line, size line - 1) = #"\n" then 1 else 0)))
+            in
+              case decode_step_signature trimmed of
+                  SOME sig_pair => loop (sig_pair :: acc)
+                | NONE => (TextIO.closeIn input; NONE)
+            end
+  in loop [] end
+  handle _ => NONE
+
 fun save_failed_prefix_checkpoint () =
   case !theorem_info_ref of
       NONE => ()
@@ -101,6 +142,7 @@ fun save_failed_prefix_checkpoint () =
             val _ = save_checkpoint "failed_prefix" false failed_prefix_path failed_prefix_ok depth
             val _ = write_text_file (failed_prefix_path ^ ".meta") meta_text
             val _ = write_text_file (failed_prefix_path ^ ".prefix") prefix_text
+            val _ = save_failed_prefix_steps failed_prefix_path (!active_tactic_text_ref) step_count
           in () end
 
 fun restore_failed_prefix_checkpoint_info (name, tactic_text, failed_prefix_path, failed_prefix_ok) =
@@ -738,6 +780,30 @@ fun step_count_at_prefix common_bytes plan =
     loop 0 plan
   end
 
+fun common_step_prefix old_signatures new_plan =
+  let
+    fun loop n [] _ = n
+      | loop n _ [] = n
+      | loop n (old :: old_rest) (new :: new_rest) =
+          if old = HolbuildProofIr.step_signature new then loop (n + 1) old_rest new_rest else n
+  in loop 0 old_signatures new_plan end
+
+fun safe_failed_prefix_skip old_prefix_text old_step_count tactic_text failed_prefix_path plan =
+  case read_failed_prefix_steps failed_prefix_path of
+      SOME old_signatures => common_step_prefix (take_at_most old_step_count old_signatures) plan
+    | NONE =>
+        (* Compatibility with old checkpoints that lack step signatures: only
+           trust the old byte-prefix heuristic when the saved prefix is still a
+           literal prefix of the new tactic text. Otherwise restart from the
+           theorem goal by rewinding the retained history to step 0. *)
+        if String.isPrefix old_prefix_text tactic_text then
+          step_count_at_prefix (size old_prefix_text) plan
+        else 0
+
+fun prefix_end_after_steps 0 _ = 0
+  | prefix_end_after_steps _ [] = 0
+  | prefix_end_after_steps n plan = HolbuildProofIr.step_end (List.last (take_at_most n plan))
+
 fun finish_failed_prefix name old_prefix_text old_step_count tactic_text failed_prefix_path failed_prefix_ok =
   let
     val old_resume_active = !failed_prefix_resume_active_ref
@@ -752,8 +818,7 @@ fun finish_failed_prefix name old_prefix_text old_step_count tactic_text failed_
           val _ = ensure_history_limit (Int.max(length plan + 1, old_step_count + 1))
           val _ = trace_plan name plan
           val _ = stop_after_plan_if_requested ()
-          val common_bytes = common_prefix_size old_prefix_text tactic_text
-          val skip_count = step_count_at_prefix common_bytes plan
+          val skip_count = safe_failed_prefix_skip old_prefix_text old_step_count tactic_text failed_prefix_path plan
           val backup_count = Int.max(0, old_step_count - skip_count)
           val _ =
             (backup_n backup_count
@@ -763,7 +828,7 @@ fun finish_failed_prefix name old_prefix_text old_step_count tactic_text failed_
                                           " proof IR steps; checkpoint history retained fewer steps than its metadata step_count=",
                                           Int.toString old_step_count]))
           val _ = successful_step_count_ref := skip_count
-          val _ = successful_prefix_end_ref := common_bytes
+          val _ = successful_prefix_end_ref := prefix_end_after_steps skip_count plan
           val _ = run_steps_from skip_count (display_index_at_count skip_count plan) (drop_steps skip_count plan)
           val th = history_top_thm (project_history goalStack.initial_goal)
                    handle e => (ignore (print_finish_goal_state name); raise e)
