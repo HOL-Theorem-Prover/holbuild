@@ -577,15 +577,17 @@ fun effective_toolchain holdir maxheap =
   end
 
 fun context_toolchain holdir maxheap =
-  case holdir of
-      NONE => {holdir = "", maxheap = maxheap}
-    | SOME h =>
-        let val project = load_project ()
-        in
-          if HolbuildProject.schema project = 2 then
-            raise Error "--holdir is not supported for schema 2 projects; use dependencies.hol"
-          else {holdir = h, maxheap = maxheap}
-        end
+  let val project = load_project ()
+  in
+    if HolbuildProject.schema project = 2 then
+      (case holdir of
+           SOME _ => raise Error "--holdir is not supported for schema 2 projects; use dependencies.hol"
+         | NONE => {holdir = "", maxheap = maxheap})
+    else
+      let val tc = {holdir = runtime_holdir holdir, maxheap = maxheap}
+          val _ = HolbuildProject.set_holdir (#holdir tc)
+      in tc end
+  end
 
 fun dispatch_with_options {holdir, source_dir, jobs, maxheap, json, verbosity} args =
   (HolbuildStatus.set_json_mode json;
