@@ -89,7 +89,6 @@ fun entry_dir_for_key k = Path.concat(toolchains_dir (), k)
 fun holdir_for_key k = Path.concat(entry_dir_for_key k, "hol")
 fun manifest_for_key k = Path.concat(entry_dir_for_key k, "manifest")
 fun ok_for_key k = Path.concat(entry_dir_for_key k, "build.ok")
-fun tmp_root () = Path.concat(toolchains_dir (), "tmp")
 fun locks_dir () = Path.concat(cache_root (), "locks")
 fun lock_dir k = Path.concat(locks_dir (), "hol-toolchain-" ^ k ^ ".lock")
 
@@ -135,26 +134,26 @@ fun write_file path text =
 
 fun build_entry req k =
   let
-    val tmpbase = Path.concat(tmp_root (), k ^ "-" ^ HolbuildHash.string_sha1 (Time.toString (Time.now ())))
-    val tmphol = Path.concat(tmpbase, "hol")
     val final = entry_dir_for_key k
+    val hol = holdir_for_key k
     val material = key_material req
     fun build () =
-      (ensure_dir (tmp_root ());
-       if path_exists tmpbase then remove_tree tmpbase else ();
-       run_in_dir (tmp_root ()) ("git clone " ^ quote (#git req) ^ " " ^ quote tmphol);
-       run_in_dir tmphol ("git checkout --detach " ^ quote (#rev req));
-       run_in_dir tmphol (quote (poly_command ()) ^ " --script tools/smart-configure.sml");
-       run_in_dir tmphol "bin/build";
-       if built tmphol then () else die ("HOL build did not produce bin/hol, bin/build, and bin/hol.state in " ^ tmphol);
-       if clean tmphol then () else die ("HOL build left dirty checkout: " ^ tmphol ^ "\n" ^ dirty_status tmphol);
-       write_file (Path.concat(tmpbase, "manifest")) (material ^ "\nkey=" ^ k ^ "\n");
-       write_file (Path.concat(tmpbase, "build.ok")) "ok\n";
-       if path_exists final then die ("HOL toolchain cache entry appeared during build: " ^ final)
-       else FS.rename {old = tmpbase, new = final};
-       holdir_for_key k)
+      (ensure_dir (toolchains_dir ());
+       if path_exists final then
+         die ("incomplete HOL toolchain cache entry: " ^ final ^ "\nremove it with: rm -rf " ^ quote final)
+       else ();
+       ensure_dir final;
+       run_in_dir final ("git clone " ^ quote (#git req) ^ " " ^ quote hol);
+       run_in_dir hol ("git checkout --detach " ^ quote (#rev req));
+       run_in_dir hol (quote (poly_command ()) ^ " --script tools/smart-configure.sml");
+       run_in_dir hol "bin/build";
+       if built hol then () else die ("HOL build did not produce bin/hol, bin/build, and bin/hol.state in " ^ hol);
+       if clean hol then () else die ("HOL build left dirty checkout: " ^ hol ^ "\n" ^ dirty_status hol);
+       write_file (manifest_for_key k) (material ^ "\nkey=" ^ k ^ "\n");
+       write_file (ok_for_key k) "ok\n";
+       hol)
   in
-    build () handle Error msg => die (msg ^ "\nfailed HOL build left at: " ^ tmpbase)
+    build () handle Error msg => die (msg ^ "\nfailed HOL build left at: " ^ final)
   end
 
 fun ensure_built req =

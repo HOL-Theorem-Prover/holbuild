@@ -23,6 +23,7 @@ cat > "$hol/.gitignore" <<'EOF_IGNORE'
 /bin/hol.state
 /configured
 /built
+/built-at
 EOF_IGNORE
 cat > "$hol/tools/smart-configure.sml" <<'SML'
 (* fake configure script; HOLBUILD_POLY fixture handles it *)
@@ -31,6 +32,7 @@ cat > "$hol/bin/build" <<'SH'
 #!/usr/bin/env sh
 set -eu
 touch built
+pwd > built-at
 cat > bin/hol <<'HOL'
 #!/usr/bin/env sh
 exit 0
@@ -148,6 +150,7 @@ require_file "$shared_hol/configured"
 require_file "$shared_hol/built"
 require_file "$shared_hol/bin/hol"
 require_file "$shared_hol/bin/hol.state"
+require_grep "^$shared_hol$" "$shared_hol/built-at"
 rm "$shared_hol/configured" "$shared_hol/built"
 (cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" "$HOLBUILD_BIN" buildhol) > "$tmpdir/buildhol.log"
 require_grep "$shared_hol" "$tmpdir/buildhol.log"
