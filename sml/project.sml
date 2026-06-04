@@ -765,10 +765,8 @@ fun dependency_manifest (project as {manifest = project_manifest, graph_artifact
         if schema2_hol_dependency dep then SOME (builtin_holdir_manifest ())
         else SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), name),
                                "holproject.toml"))
-    | Dependency {source = FromSource {from, path, manifest}, ...} =>
-        SOME (Path.concat(abs_under (Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"))
-                                    (Path.concat(from, path)),
-                          manifest))
+    | Dependency {source = FromSource {manifest, ...}, ...} =>
+        SOME (abs_under (manifest_root project_manifest) manifest)
 
 fun heap_to_string (Heap {name, output, objects}) =
   name ^ " -> " ^ output ^ " [" ^ String.concatWith ", " objects ^ "]"

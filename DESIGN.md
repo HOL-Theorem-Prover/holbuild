@@ -103,7 +103,9 @@ Supported dependency forms are deliberately narrow:
 
 - `git` + `rev`, where `rev` is a lowercase 40-character commit hash
 - `from` + `path` + `manifest`, where `from` names a direct git dependency in
-  the same manifest and the paths are relative without `..`
+  the same manifest, `path` selects a source subtree inside that checkout, and
+  `manifest` is a shim manifest relative to the declaring package's manifest
+  root. Both paths are relative and cannot contain `..`.
 
 Schema 2 rejects path dependencies, local overrides, git manifests, branches,
 tags, ranges, registry names, and multiple versions. `[holbuild].required_version`
@@ -121,9 +123,11 @@ Dependency package build artifacts live separately under:
 <root>/.holbuild/packages/<package>
 ```
 
-Nested dependency manifests use the root graph materialization directory, not the
-parent package artifact directory, so resolving `a -> b` creates
+Nested dependency source checkouts use the root graph materialization directory,
+not the parent package artifact directory, so resolving `a -> b` creates
 `<root>/.holbuild/src/b`, never `<root>/.holbuild/packages/a/.holbuild/src/b`.
+For `from` dependencies, the source root is under `.holbuild/src/<from>/<path>`,
+but the shim manifest is read from the package that declares the dependency.
 
 The reserved schema 2 `hol` package is the project HOL toolchain. It is
 materialized as `.holbuild/src/hol`; upstream HOL does not need a

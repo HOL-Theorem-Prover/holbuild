@@ -68,7 +68,7 @@ Schema 1 root artifacts live under `.holbuild/`: `gen/`, `obj/`, `dep/`, `checkp
 - Proof engine/checkpoint/timeout/trace flags are execution/debug policy, not final artifact action-key inputs
 - Schema 1 reserved dependency `[dependencies.HOLDIR]` uses holbuild's built-in root-HOL manifest; no shim needed for core HOL sources
 - Schema 2 requires exactly one `[dependencies.hol]` exact git rev; it is materialized at `.holbuild/src/hol`, uses a built-in manifest, rejects `--holdir`, and is built on demand with `${HOLBUILD_POLY:-poly}`
-- Schema 2 supports exact git `rev` hashes and `from/path/manifest` deps only; no ranges, tags, branches, lockfile, local overrides, or multiple versions yet
+- Schema 2 supports exact git `rev` hashes and `from/path/manifest` deps only; `from.path` selects source inside the referenced checkout and `manifest` is a shim relative to the declaring package. No ranges, tags, branches, lockfile, local overrides, or multiple versions yet
 - HOL examples/tests are intentionally outside built-in HOL manifests; declare example subtrees (e.g. `keccakTheory`) as separate shimmed/from dependencies
 - `.holconfig.toml [overrides.X].path` masks `[dependencies.X].path`; masked env vars are not expanded. Explicit `manifest` fields still apply.
 

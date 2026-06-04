@@ -50,6 +50,10 @@ hol_rev=$(git -C "$hol_repo" rev-parse HEAD)
 
 project=$tmpdir/project
 mkdir -p "$project"
+cat > "$project/sub.manifest.toml" <<'TOML'
+[project]
+name = "subdep"
+TOML
 cat > "$project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
@@ -74,8 +78,8 @@ TOML
 (cd "$project" && "$HOLBUILD_BIN" context) > "$tmpdir/context1.log"
 require_grep 'dependency: dep \[git=' "$tmpdir/context1.log"
 require_grep "package: dep \[root=$project/.holbuild/src/dep, manifest=$project/.holbuild/src/dep/holproject.toml, artifact-root=$project/.holbuild/packages/dep\]" "$tmpdir/context1.log"
-require_grep "package: subdep \[root=$project/.holbuild/src/dep/subdir, manifest=$project/.holbuild/src/dep/subdir/sub.manifest.toml, artifact-root=$project/.holbuild/packages/subdep\]" "$tmpdir/context1.log"
-require_grep "dependency: subdep \[from=dep, path=subdir, manifest=sub.manifest.toml, local=$project/.holbuild/src/dep/subdir, resolved-manifest=$project/.holbuild/src/dep/subdir/sub.manifest.toml" "$tmpdir/context1.log"
+require_grep "package: subdep \[root=$project/.holbuild/src/dep/subdir, manifest=$project/sub.manifest.toml, artifact-root=$project/.holbuild/packages/subdep\]" "$tmpdir/context1.log"
+require_grep "dependency: subdep \[from=dep, path=subdir, manifest=sub.manifest.toml, local=$project/.holbuild/src/dep/subdir, resolved-manifest=$project/sub.manifest.toml" "$tmpdir/context1.log"
 [ "$(git -C "$project/.holbuild/src/dep" rev-parse HEAD)" = "$rev1" ]
 require_grep '^one$' "$project/.holbuild/src/dep/value.txt"
 

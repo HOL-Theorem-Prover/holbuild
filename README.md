@@ -224,7 +224,9 @@ There are no branches, tags, version ranges, registry, solver, lockfile, local
 overrides, or multiple versions of one package yet. Git dependencies use `git` +
 `rev`; `manifest` is not allowed on git dependencies. `from` dependencies use
 `from` + `path` + `manifest`; `from` must refer to a direct git dependency in the
-same manifest, and `path`/`manifest` must be relative paths without `..`.
+same manifest. The `path` selects a source subtree inside the `from` checkout,
+while `manifest` is a shim manifest path relative to the declaring package's
+manifest root. Both paths must be relative and contain no `..`.
 
 For each root project graph, sources and build artifacts are separated:
 
