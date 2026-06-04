@@ -71,7 +71,7 @@ fun trim text =
   in if r < l then "" else String.substring(text, l, r - l + 1) end
 
 fun poly_command () = Option.getOpt(OS.Process.getEnv "HOLBUILD_POLY", "poly")
-fun poly_version () = trim (command_output (quote (poly_command ()) ^ " --version"))
+fun poly_version () = trim (command_output (quote (poly_command ()) ^ " -v"))
 
 fun key_material {git, rev} =
   let val _ = validate_git git

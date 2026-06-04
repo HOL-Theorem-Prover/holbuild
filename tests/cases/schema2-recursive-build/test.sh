@@ -47,7 +47,7 @@ mkdir -p "$fakebin"
 cat > "$fakebin/poly" <<'SH'
 #!/usr/bin/env sh
 set -eu
-if [ "${1:-}" = "--version" ]; then
+if [ "${1:-}" = "-v" ]; then
   echo "Fake Poly/ML 1.0"
   exit 0
 fi
