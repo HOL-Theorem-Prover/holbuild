@@ -68,7 +68,7 @@ use_hol("src/portableML/poly/w64-SHA1.ML");
 use "sml/hash.sml";
 use "sml/builtin_manifests.sml";
 use "sml/git_cache.sml";
-use "sml/hol_toolchain_build.sml";
+use "sml/hol_shared_cache.sml";
 use "sml/project.sml";
 use "sml/toolchain.sml";
 use "sml/status.sml";

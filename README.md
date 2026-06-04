@@ -122,8 +122,9 @@ bin/holbuild heap main
 
 For schema 1 projects, `--holdir PATH` can be used instead of `HOLBUILD_HOLDIR`
 at runtime for HOL commands. For schema 2 projects, HOL is resolved from the
-reserved `dependencies.hol` package, `--holdir` is rejected, and `${HOLBUILD_POLY:-poly}`
-is used to configure/build that project HOL on demand. `holbuild context` may
+reserved `dependencies.hol` package, `--holdir` is rejected, and built HOL trees
+are shared under `$HOLBUILD_CACHE/hol-toolchains`. `${HOLBUILD_POLY:-poly}` is
+used to configure/build HOL on demand. `holbuild context` may
 materialize dependency sources but does not build HOL. `--source-dir PATH` or
 `HOLBUILD_SOURCE_DIR` selects the project source
 root for manifest discovery while `.holbuild` artifacts are written under the shell's
@@ -193,10 +194,10 @@ semantics. A root-HOL manifest sketch lives under `examples/root-hol/`.
 ## Schema 2 dependency-managed projects
 
 Schema 2 makes HOL itself an exact git dependency. Every resolved schema 2 graph
-must contain exactly one package named `hol`; that checkout is materialized under
-`.holbuild/src/hol`, built in place on demand by HOL-using commands, and used as
-`HOLDIR`. Upstream HOL does not need a `holproject.toml`; holbuild uses a built-in
-manifest for the reserved `hol` package.
+must contain exactly one package named `hol`; that dependency is materialized and
+built under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol` and used as `HOLDIR`.
+Upstream HOL does not need a `holproject.toml`; holbuild uses a built-in manifest
+for the reserved `hol` package.
 
 ```toml
 [holbuild]
@@ -235,10 +236,12 @@ For each root project graph, sources and build artifacts are separated:
 .holbuild/packages/<package>  # package build artifacts
 ```
 
-The reserved `hol` source checkout is special in v1: it is built in place under
-`.holbuild/src/hol` by running `${HOLBUILD_POLY:-poly} --script tools/smart-configure.sml`
-and then `bin/build`. A dirty `hol` checkout is rejected. Future work may add a
-shared global HOL build cache.
+The reserved `hol` source checkout is special in v1: it is shared globally under
+`$HOLBUILD_CACHE/hol-toolchains/<key>/hol` and built there by running
+`${HOLBUILD_POLY:-poly} --script tools/smart-configure.sml` and then `bin/build`.
+A dirty or incomplete cached HOL checkout is rejected until the user removes that
+cache entry. Use `holbuild buildhol` to warm this cache explicitly, for example in
+CI; normal HOL-using commands do this automatically.
 
 `[holbuild].required_version` is recognized but not implemented; non-empty values
 are currently rejected.

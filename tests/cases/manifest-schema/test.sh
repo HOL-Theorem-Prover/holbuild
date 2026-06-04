@@ -57,6 +57,7 @@ TOML
 git -C "$schema2_repo" add .
 git -C "$schema2_repo" commit -q -m initial
 schema2_rev=$(git -C "$schema2_repo" rev-parse HEAD)
+export HOLBUILD_CANONICAL_HOL_GIT="$schema2_repo"
 
 make_project valid_schema2_git
 cat > "$tmpdir/valid_schema2_git/holproject.toml" <<TOML

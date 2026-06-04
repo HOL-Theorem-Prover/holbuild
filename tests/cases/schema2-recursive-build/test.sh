@@ -40,12 +40,17 @@ echo fake-state > bin/hol.state
 SH
 chmod +x "$hol/bin/build"
 hol_rev=$(commit_repo "$hol")
+export HOLBUILD_CANONICAL_HOL_GIT="$hol"
 
 fakebin=$tmpdir/fakebin
 mkdir -p "$fakebin"
 cat > "$fakebin/poly" <<'SH'
 #!/usr/bin/env sh
 set -eu
+if [ "${1:-}" = "--version" ]; then
+  echo "Fake Poly/ML 1.0"
+  exit 0
+fi
 touch configured
 SH
 chmod +x "$fakebin/poly"
@@ -112,8 +117,8 @@ TOML
 
 context_log=$tmpdir/context.log
 (cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" "$HOLBUILD_BIN" context) > "$context_log"
-require_grep "package: hol \[root=$root/.holbuild/src/hol" "$context_log"
-if [ -e "$root/.holbuild/src/hol/configured" ] || [ -e "$root/.holbuild/src/hol/built" ]; then
+require_grep "package: hol \[root=$HOLBUILD_CACHE/hol-toolchains/" "$context_log"
+if find "$HOLBUILD_CACHE/hol-toolchains" -name configured -o -name built 2>/dev/null | grep -q .; then
   echo "schema 2 context unexpectedly built HOL" >&2
   exit 1
 fi
@@ -138,13 +143,16 @@ require_grep 'not supported for schema 2 projects' "$tmpdir/heap-holdir.log"
 dry_log=$tmpdir/dry.log
 (cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" "$HOLBUILD_BIN" build --dry-run Foo) > "$dry_log"
 require_grep "Foo (sml, package b)" "$dry_log"
-require_file "$root/.holbuild/src/hol/configured"
-require_file "$root/.holbuild/src/hol/built"
-require_file "$root/.holbuild/src/hol/bin/hol"
-require_file "$root/.holbuild/src/hol/bin/hol.state"
-rm "$root/.holbuild/src/hol/configured" "$root/.holbuild/src/hol/built"
+shared_hol=$(find "$HOLBUILD_CACHE/hol-toolchains" -path '*/hol' -type d | head -1)
+require_file "$shared_hol/configured"
+require_file "$shared_hol/built"
+require_file "$shared_hol/bin/hol"
+require_file "$shared_hol/bin/hol.state"
+rm "$shared_hol/configured" "$shared_hol/built"
+(cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" "$HOLBUILD_BIN" buildhol) > "$tmpdir/buildhol.log"
+require_grep "$shared_hol" "$tmpdir/buildhol.log"
 (cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" "$HOLBUILD_BIN" build --dry-run Foo) > "$tmpdir/dry2.log"
-if [ -e "$root/.holbuild/src/hol/configured" ] || [ -e "$root/.holbuild/src/hol/built" ]; then
+if [ -e "$shared_hol/configured" ] || [ -e "$shared_hol/built" ]; then
   echo "already-built schema 2 HOL was rebuilt" >&2
   exit 1
 fi
@@ -155,12 +163,12 @@ if (cd "$root" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build --dry-run Foo) > "$tm
 fi
 require_grep 'not supported for schema 2 projects' "$tmpdir/holdir.log"
 
-echo dirty >> "$root/.holbuild/src/hol/bin/build"
+echo dirty >> "$shared_hol/bin/build"
 if (cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" "$HOLBUILD_BIN" build --dry-run Foo) > "$tmpdir/dirty.log" 2>&1; then
   echo "dirty HOL checkout unexpectedly accepted" >&2
   exit 1
 fi
-require_grep 'HOL checkout is dirty' "$tmpdir/dirty.log"
+require_grep 'dirty HOL toolchain cache entry' "$tmpdir/dirty.log"
 
 [ -d "$root/.holbuild/src/b/.git" ]
 [ ! -d "$root/.holbuild/src/b/.holbuild" ]

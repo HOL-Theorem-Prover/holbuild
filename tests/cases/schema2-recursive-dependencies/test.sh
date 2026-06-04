@@ -31,6 +31,7 @@ TOML
 
 hol=$tmpdir/hol
 hol_rev=$(make_repo "$hol" hol)
+export HOLBUILD_CANONICAL_HOL_GIT="$hol"
 
 b=$tmpdir/b
 b_rev=$(make_repo "$b" b "
@@ -66,7 +67,7 @@ TOML
 (cd "$root" && "$HOLBUILD_BIN" context) > "$tmpdir/root.log"
 require_grep "package: a \[root=$root/.holbuild/src/a" "$tmpdir/root.log"
 require_grep "package: b \[root=$root/.holbuild/src/b" "$tmpdir/root.log"
-require_grep "package: hol \[root=$root/.holbuild/src/hol" "$tmpdir/root.log"
+require_grep "package: hol \[root=$HOLBUILD_CACHE/hol-toolchains/" "$tmpdir/root.log"
 [ -d "$root/.holbuild/src/b/.git" ]
 [ ! -d "$root/.holbuild/packages/a/.holbuild/src/b" ]
 

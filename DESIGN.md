@@ -130,11 +130,12 @@ For `from` dependencies, the source root is under `.holbuild/src/<from>/<path>`,
 but the shim manifest is read from the package that declares the dependency.
 
 The reserved schema 2 `hol` package is the project HOL toolchain. It is
-materialized as `.holbuild/src/hol`; upstream HOL does not need a
+materialized and built at a canonical shared cache path
+`$HOLBUILD_CACHE/hol-toolchains/<key>/hol`; upstream HOL does not need a
 `holproject.toml`, because holbuild uses its built-in HOL manifest for package
-metadata. `context` resolves/materializes sources but does not build HOL. Commands
-that need HOL reject `--holdir`, use `.holbuild/src/hol` as `HOLDIR`, and build it
-on demand in place with:
+metadata. `context` resolves the path but does not build HOL. Commands that need
+HOL reject `--holdir`, use the shared cached tree as `HOLDIR`, and build it on
+demand with:
 
 ```sh
 ${HOLBUILD_POLY:-poly} --script tools/smart-configure.sml
@@ -142,10 +143,10 @@ bin/build
 ```
 
 A built HOL checkout is expected to contain `bin/hol`, `bin/build`, and
-`bin/hol.state`, and must be git-clean ignoring ignored build products. v1 builds
-HOL per root project for simplicity and isolation. Future optimization may add a
-global shared HOL build cache keyed by HOL URL/rev, platform, Poly/ML, and build
-configuration.
+`bin/hol.state`, and must be git-clean ignoring ignored build products. If a
+shared cache entry is dirty or incomplete, holbuild refuses to use it until the
+user removes it manually. The cache key includes the canonical HOL repository,
+revision, Poly/ML command/version, build arguments, and cache format version.
 
 ## Root HOL
 

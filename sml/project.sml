@@ -704,8 +704,15 @@ fun root_tactic_timeout_for ({root_tactic_timeouts, ...} : t) root =
 fun package_generators (Package {generators, ...}) = generators
 fun artifact_root ({artifact_root, ...} : t) = artifact_root
 fun schema ({schema, ...} : t) = schema
-fun project_hol_dir ({graph_artifact_root, schema, ...} : t) =
-  if schema = 2 then SOME (Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), "hol"))
+fun hol_dependency ({dependencies, ...} : t) =
+  List.find (fn Dependency {name, ...} => name = "hol") dependencies
+
+fun project_hol_dir (project as {schema, ...} : t) =
+  if schema = 2 then
+    case hol_dependency project of
+        SOME (Dependency {source = GitSource {git, rev}, ...}) =>
+          SOME (HolbuildHolSharedCache.holdir_for {git = git, rev = rev})
+      | _ => NONE
   else NONE
 fun build_roots ({roots, ...} : t) = roots
 fun package_action_policies (Package {action_policies, ...}) = action_policies
@@ -747,9 +754,15 @@ fun dependency_local_path (project as {root, overrides, graph_artifact_root, ...
            case source of
                LegacyPathSource {path = SOME p, ...} => SOME (expand_env (dependency_path_context name) p)
              | LegacyPathSource {path = NONE, ...} => if builtin_holdir_dependency name then !holdir_ref else NONE
-             | GitSource _ => SOME (Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), name))
+             | GitSource {git, rev} =>
+                 if name = "hol" then SOME (HolbuildHolSharedCache.holdir_for {git = git, rev = rev})
+                 else SOME (Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), name))
              | FromSource {from, path, ...} =>
-                 SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path)))
+                 (case hol_dependency project of
+                      SOME (Dependency {name = "hol", source = GitSource {git, rev}}) =>
+                        if from = "hol" then SOME (Path.concat(HolbuildHolSharedCache.holdir_for {git = git, rev = rev}, path))
+                        else SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path))
+                    | _ => SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path))))
 
 fun dependency_manifest (project as {manifest = project_manifest, graph_artifact_root, ...} : t) dep =
   case dep of
@@ -803,8 +816,10 @@ fun dependency_project (project : t) (dep as Dependency {name, source}) =
   let
     val _ =
       case source of
-          GitSource {git, rev} => ignore (HolbuildGitCache.materialize {name = name, git = git, rev = rev,
-                                                                        artifact_root = #graph_artifact_root project})
+          GitSource {git, rev} =>
+            if schema2_hol_dependency dep then ()
+            else ignore (HolbuildGitCache.materialize {name = name, git = git, rev = rev,
+                                                       artifact_root = #graph_artifact_root project})
         | _ => ()
     val dep_root =
       case dependency_local_path project dep of
@@ -839,6 +854,26 @@ fun dependency_project (project : t) (dep as Dependency {name, source}) =
             else die ("dependency " ^ name ^ " manifest declares project.name = " ^ actual)
   in
     dep_project
+  end
+
+fun resolved_hol_dependency project =
+  let
+    fun seen name names = List.exists (fn n => n = name) names
+    fun search_project names p =
+      case hol_dependency p of
+          SOME dep => SOME dep
+        | NONE => search_deps names p (#dependencies p)
+    and search_deps names parent deps =
+      case deps of
+          [] => NONE
+        | (dep as Dependency {name, ...}) :: rest =>
+            if seen name names then search_deps names parent rest
+            else
+              (case search_project (name :: names) (dependency_project parent dep) of
+                   SOME hol => SOME hol
+                 | NONE => search_deps (name :: names) parent rest)
+  in
+    search_project [] project
   end
 
 fun dependency_package artifact_parent project (dep as Dependency {name, ...}) =

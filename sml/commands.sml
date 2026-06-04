@@ -22,9 +22,10 @@ fun usage () = print
   \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--holdir PATH] [--maxheap MB] [-jN] heap NAME\n\
   \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--holdir PATH] [--maxheap MB] run [ARG ...]\n\
   \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--holdir PATH] [--maxheap MB] repl [ARG ...]\n\
+  \  holbuild [--source-dir PATH] buildhol\n\
   \  holbuild gc [--retention-days DAYS] [--max-checkpoints-gb GB] [--cache-dir PATH] [--clean-only|--cache-only]\n\n\
   \Schema 1 HOL is found from --holdir, HOLBUILD_HOLDIR, or HOLDIR. Schema 2\n\
-  \rejects --holdir and uses dependencies.hol, building it with ${HOLBUILD_POLY:-poly}.\n\
+  \rejects --holdir and uses dependencies.hol, sharing built HOL trees in the global cache.\n\
   \Project sources are found from --source-dir, HOLBUILD_SOURCE_DIR, or cwd.\n\
   \-j/--jobs controls build parallelism. Default is .holconfig.toml [build].jobs,\n\
   \or max(1, detected processor count / 2). --maxheap/--max-heap passes Poly/ML\n\
@@ -565,10 +566,10 @@ fun effective_toolchain holdir maxheap =
       in case holdir of
            SOME _ => raise Error "--holdir is not supported for schema 2 projects; use dependencies.hol"
          | NONE =>
-             case HolbuildProject.project_hol_dir project of
-                 SOME h => (HolbuildHolToolchainBuild.ensure_built h;
-                            {holdir = h, maxheap = maxheap})
-               | NONE => raise Error "schema 2 project has no dependencies.hol"
+             case HolbuildProject.resolved_hol_dependency project of
+                 SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev}, ...}) =>
+                   {holdir = HolbuildHolSharedCache.ensure_built {git = git, rev = rev}, maxheap = maxheap}
+               | _ => raise Error "schema 2 project has no dependencies.hol"
       end
     else
       let val tc = {holdir = runtime_holdir holdir, maxheap = maxheap}
@@ -589,6 +590,26 @@ fun context_toolchain holdir maxheap =
       in tc end
   end
 
+fun buildhol holdir maxheap =
+  let
+    val project = load_project ()
+    val _ =
+      case holdir of
+          SOME _ => raise Error "--holdir is not supported for schema 2 projects; use dependencies.hol"
+        | NONE => ()
+    val _ =
+      if HolbuildProject.schema project = 2 then ()
+      else raise Error "buildhol is only supported for schema 2 projects"
+    val _ = HolbuildProject.packages project
+    val holdir =
+      case HolbuildProject.resolved_hol_dependency project of
+          SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev}, ...}) =>
+            HolbuildHolSharedCache.ensure_built {git = git, rev = rev}
+        | _ => raise Error "schema 2 project has no dependencies.hol"
+  in
+    print (holdir ^ "\n")
+  end
+
 fun dispatch_with_options {holdir, source_dir, jobs, maxheap, json, verbosity} args =
   (HolbuildStatus.set_json_mode json;
    HolbuildStatus.set_verbosity verbosity;
@@ -597,6 +618,7 @@ fun dispatch_with_options {holdir, source_dir, jobs, maxheap, json, verbosity} a
    case args of
        "gc" :: rest => (reject_json "gc"; gc rest)
      | "cache" :: rest => (reject_json "cache"; HolbuildCache.dispatch rest)
+     | "buildhol" :: [] => buildhol holdir maxheap
      | [] => dispatch (context_toolchain holdir maxheap) jobs args
      | "context" :: _ => dispatch (context_toolchain holdir maxheap) jobs args
      | _ => dispatch (effective_toolchain holdir maxheap) jobs args)
@@ -627,7 +649,7 @@ fun main raw_args =
        | HolbuildBuildPlan.Error msg => err msg
        | HolbuildBuildExec.Error msg => err msg
        | HolbuildBuildExec.ErrorWithDebugArtifacts (msg, artifacts) => err_with_debug_artifacts msg artifacts
-       | HolbuildHolToolchainBuild.Error msg => err msg
+       | HolbuildHolSharedCache.Error msg => err msg
        | HolbuildCache.Error msg => err msg
        | e => if is_broken_pipe e then OS.Process.exit OS.Process.success
               else err (General.exnMessage e)
