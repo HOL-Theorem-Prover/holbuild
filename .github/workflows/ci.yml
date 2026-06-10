@@ -37,18 +37,22 @@ jobs:
       - name: Configure holbuild test cache
         run: echo "HOLBUILD_CACHE=$HOME/.cache/holbuild" >> "$GITHUB_ENV"
 
-      - name: Restore holbuild global cache
-        uses: actions/cache@v5
+      - name: Restore HOL toolchain cache
+        id: hol-toolchain-cache
+        uses: actions/cache/restore@v5
         with:
-          path: ~/.cache/holbuild
-          key: holbuild-test-global-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ inputs.hol4-ref || steps.hol4-pin.outputs.hol4-ref }}-${{ github.sha }}
-          restore-keys: |
-            holbuild-test-global-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ inputs.hol4-ref || steps.hol4-pin.outputs.hol4-ref }}-
-            holbuild-test-global-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-
-            holbuild-test-global-${{ runner.os }}-
+          path: ~/.cache/holbuild/hol-toolchains
+          key: hol-toolchains-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ inputs.hol4-ref || steps.hol4-pin.outputs.hol4-ref }}-v1
 
       - name: Setup schema2 HOL cache
         run: tools/setup-hol-toolchain-cache.sh "${{ inputs.hol4-ref || steps.hol4-pin.outputs.hol4-ref }}" >> "$GITHUB_ENV"
+
+      - name: Save HOL toolchain cache
+        if: steps.hol-toolchain-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ~/.cache/holbuild/hol-toolchains
+          key: hol-toolchains-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ inputs.hol4-ref || steps.hol4-pin.outputs.hol4-ref }}-v1
 
       - name: Build holbuild
         run: make HOLDIR="$HOLDIR"
