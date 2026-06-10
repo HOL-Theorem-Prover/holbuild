@@ -13,9 +13,9 @@ and cacheable builds that never require users to reason about the cache.
 - The source tree is user-owned; build products live under project `.holbuild/`.
 - Target build contexts should be produced by holbuild from declared sources,
   predecessor checkpoints, or validated shared dependency state. The external
-  prototype still starts child HOL actions from the configured `HOLDIR/bin/hol.state`
-  and keys that seed in the toolchain; eliminating that bootstrap dependency is a
-  root-HOL transition goal, not current behavior.
+  implementation currently starts child HOL actions from the project HOL declared
+  by `[dependencies.hol]` and keys that base state in the toolchain; eliminating
+  the prebuilt-base dependency is a root-HOL transition goal, not current behavior.
 - The cache is an optional accelerator. Local `.holbuild/` is the authoritative
   materialized build view.
 - When unsure, rebuild. A bad cache hit is worse than a missed cache hit.
@@ -24,15 +24,13 @@ and cacheable builds that never require users to reason about the cache.
 
 Every package in the resolved graph has a manifest. A source file can enter the
 build graph only through a declared package root. Manifests are schema-checked:
-unknown fields in recognized tables are rejected, and an optional schema marker
-must name a supported schema:
+unknown fields in recognized tables are rejected, and the schema marker is
+required. The only supported schema is currently schema 2:
 
 ```toml
 [holbuild]
-schema = 1
+schema = 2
 ```
-
-Omitting `[holbuild]` means schema 1.
 
 Package roots are declared by one of:
 
@@ -42,45 +40,28 @@ Package roots are declared by one of:
 - the built-in/root HOL manifest
 
 Committed manifests describe what dependency is required. They should not rely on
-ambient search paths such as `HOLPATH`. Per-user local paths are supplied by an
-uncommitted `.holconfig.toml` override file instead:
+ambient search paths such as `HOLPATH`, `HOLDIR`, or user include paths. Schema 2
+uses exact git commits plus explicit shim manifests for subtrees that do not have
+their own `holproject.toml`:
 
 ```toml
-# holproject.toml
 [dependencies.foo]
 git = "https://github.com/acme/foo"
-rev = "abc123"
+rev = "0123456789abcdef0123456789abcdef01234567"
+
+[dependencies.keccak]
+from = "hol"
+path = "examples/Crypto/Keccak"
+manifest = "shims/keccak.toml"
 ```
 
-```toml
-# .holconfig.toml, not committed
-[overrides.foo]
-path = "../foo-dev"
-```
+Local dependency overrides and schema 1 path dependencies are intentionally not
+part of the current model. `.holconfig.toml` remains schema-checked for local
+build settings such as jobs, excludes, and tactic timeout.
 
-An override changes where package `foo` is found on this machine; it does not
-change the package identity. The override path must still validate as `foo`,
-either by containing `foo`'s `holproject.toml` or by using the configured shim
-manifest for that dependency. Dependency `path`/`manifest` and local override
-`path` fields support `$VAR` / `${VAR}` environment substitution so worktrees can
-share committed shims without copying machine-specific `.holconfig.toml`; unset
-variables are hard errors. Local config is schema-checked too; unknown fields in
-`.holconfig.toml` are errors rather than silently ignored.
+## Dependency-managed mode
 
-Transition rule:
-
-```text
-if dependency X has no holproject.toml, the consumer must provide a shim manifest
-until X adopts one; the reserved dependency HOLDIR is the exception and resolves
-through holbuild's built-in root-HOL manifest plus the configured --holdir path
-```
-
-This keeps resolution explicit without requiring `holbuild` to understand every
-legacy `Holmakefile`, while avoiding per-consumer HOLDIR shim manifests.
-
-## Schema 2 dependency-managed mode
-
-Schema 2 is the first dependency-managed manifest format. It has intentionally no
+Schema 2 is the dependency-managed manifest format. It has intentionally no
 solver: dependencies are exact git commits, and duplicate package names must
 resolve to the same source or resolution fails. A resolved schema 2 graph must
 contain exactly one package named `hol`.
@@ -134,7 +115,7 @@ materialized and built at a canonical shared cache path
 `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`; upstream HOL does not need a
 `holproject.toml`, because holbuild uses its built-in HOL manifest for package
 metadata. `context` resolves the path but does not build HOL. Commands that need
-HOL reject `--holdir`, use the shared cached tree as `HOLDIR`, and build it on
+HOL use the shared cached tree as the project HOL toolchain and build it on
 demand with:
 
 ```sh
@@ -148,14 +129,38 @@ shared cache entry is dirty or incomplete, holbuild refuses to use it until the
 user removes it manually. The cache key includes the canonical HOL repository,
 revision, Poly/ML command/version, build arguments, and cache format version.
 
+## Main binary and project-HOL helper direction
+
+The intended split is that `bin/holbuild` becomes a portable build coordinator,
+not a HOL program. It should own manifest parsing, schema 2 resolution, cache
+management, scheduling, artifact movement, and process orchestration. HOL-specific
+source understanding should be supplied by the project HOL declared in
+`[dependencies.hol]`.
+
+The planned helper is a project-HOL-dependent executable built once per project
+HOL/toolchain, for example with HOL heap/executable support after the shared HOL
+cache entry exists. Its cache key should include the project HOL key, helper
+source/protocol version, and holbuild version. The helper owns HOLSource parsing,
+Holdep-compatible dependency extraction, theorem/resume boundary discovery,
+`TacticParse` tactic decomposition, and proof-IR/GoalFrag plan generation. The
+main binary communicates with it through a stable external protocol such as JSONL
+or line records rather than shared SML datatypes.
+
+This split lets the main binary shed compile-time dependencies on `TacticParse`,
+`HOLSourceParser`, `HOLSourceAST`, `HOLSource.fileToReader`, `Holdep`, and HOL
+load-plan metadata. It also aligns project analysis with schema 2: the HOL used
+to understand project sources is the HOL declared by the project, not the HOL
+checkout used to compile the holbuild executable.
+
 ## Root HOL
 
 Root HOL should be built through holbuild's own model, using an in-tree or
 default HOL manifest. HOL is not permanently treated as an opaque legacy build.
-The prototype still requires `HOLDIR` so it can reuse HOL implementation pieces
-while the model is incubated. That is a host/tool dependency, not the final
-semantic state model. During the transition, holbuild starts target actions from
-`HOLDIR/bin/hol.state` directly and includes that heap in the toolchain key; it
+The current external implementation still requires a HOL checkout at compile time
+so it can reuse HOL implementation pieces. That is a build-time host/tool
+dependency, not a project semantic state model. During the transition, holbuild
+starts target actions from the project HOL's `bin/hol.state` and includes that
+heap in the toolchain key; it
 does not copy it into a project-local `_base` checkpoint. The target model
 replaces this configured seed with declared bootstrap contexts. Root HOL and user
 dependencies should be ordinary manifest-resolved package nodes whose contexts
@@ -170,7 +175,7 @@ It should not require the user to run a separate global HOL rebuild first, and i
 should not silently depend on a stale configured heap from before the pull.
 
 The root-HOL transition should be explicit rather than inferred from existing
-Holmakefiles. The current prototype reserves package identity `HOLDIR` for the
+Holmakefiles. The current prototype reserves package identity `hol` for the
 built-in root-HOL manifest, enumerates major source roots as normal manifest
 members, and declares bootstrap/tool phases as manifest concepts rather than as
 ambient directory conventions. External HOL theory dependencies should
@@ -185,7 +190,7 @@ root HOL cannot rely on load-path order to distinguish two `FooTheory` or `Foo`
 modules. If historical layout contains such ambiguity, the transition has to make
 that identity explicit or keep the subtree outside project mode until resolved.
 
-A source audit of `$HOLDIR/src` with `HOLSourceParser` plus a
+A source audit of a HOL `src` tree with `HOLSourceParser` plus a
 comment/string-aware token pass parsed all 1166 non-generated `.sml` files and
 found 356 theory scripts. The scripts contain 23,179 modern
 `Theorem ... Proof ... QED` declarations, 1,701 simple `Theorem name = thm`
@@ -208,8 +213,8 @@ non-build tooling/examples/tests behind explicit package/action boundaries.
 `examples/root-hol/holproject.toml` is the current sketch: it enumerates HOL
 `src/*` members, excludes selftests/examples/tool variants that collide on
 logical names, and dry-run planned 1461 HOL package nodes in the audited checkout.
-A follow-up regression test dry-runs that sketch against `$HOLDIR`. Attempting to
-source-build core theories against `$HOLDIR/bin/hol.state` is intentionally wrong:
+A follow-up regression test dry-runs that sketch against a HOL checkout. Attempting to
+source-build core theories against an already-built `bin/hol.state` is intentionally wrong:
 that state already contains those theories. Executable root-HOL bootstrap needs
 manifest-level bootstrap/checkpoint phases that holbuild can rebuild or restore
 on demand, not any preconfigured global HOL heap.

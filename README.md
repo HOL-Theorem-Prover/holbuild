@@ -10,12 +10,12 @@ The current implementation intentionally focuses on:
 
 - reads and schema-checks the nearest `holproject.toml`
 - establishes a shared project context for `build`, `run`, and `repl`
-- reuses HOL's existing SML TOML parser from `$HOLDIR/tools/Holmake/toml`
+- currently reuses HOL's existing SML TOML parser at compile time
 - accepts logical build targets such as `MyTheory`, not object filenames such as `MyTheory.uo`
 - owns source discovery and maps outputs to project-level `.holbuild/`
 - infers theory/module dependencies with HOL/Holdep machinery over the resolved project graph and orders build plans
-- parses transitive dependency manifests and local `.holconfig.toml` path overrides
-- materializes dependency plans under project `.holbuild/deps/<package>/`
+- parses transitive schema 2 dependency manifests
+- materializes dependency sources under project `.holbuild/src/<package>/` and package artifacts under `.holbuild/packages/<package>/`
 - rejects duplicate logical theory/module names across the resolved graph; a same-package `.sig`/`.sml` pair is one module interface/implementation pair
 - includes project `load "Module"` SML/SIG dependencies in build plans and internal load manifests
 - records generated theory ML dependencies from HOL theory metadata in internal load manifests
@@ -34,14 +34,16 @@ The current implementation intentionally focuses on:
 - exposes `holbuild gc` for project-local residue cleanup plus global-cache GC with a 7-day default retention policy
 - does not delegate build semantics to Holmake
 - treats `.uo`/`.ui` as internal ML artifacts, never user-requestable targets
-- delegates project-context execution to `$HOLDIR/bin/hol run` / `hol repl`
+- delegates project-context execution to the manifest-declared project HOL from `[dependencies.hol]`
 
-The external implementation requires a HOL checkout or installation via `HOLDIR` so it
-can reuse HOL tooling. Current code still starts actions from `$HOLDIR/bin/hol.state`
-and includes that heap in the toolchain key; it does not create a project-local
-copy under `.holbuild/checkpoints/_base`. The target design replaces this
-configured seed with bootstrap/checkpoint state that `hol build` can rebuild or
-restore hermetically under `.holbuild/` after `git pull`. See `DESIGN.md`.
+Projects are schema 2 only and must declare exactly one `[dependencies.hol]` git
+revision. Commands that need HOL build or reuse that declared HOL under
+`$HOLBUILD_CACHE/hol-toolchains/<key>/hol`; `--holdir`, `HOLDIR`,
+`HOLBUILD_HOLDIR`, schema 1, and `[dependencies.HOLDIR]` are no longer supported
+as project/runtime configuration. The external implementation still needs a HOL
+checkout via `make HOLDIR=...` to compile `bin/holbuild`; this is a temporary
+build-time implementation dependency, not a runtime project selector. See
+`DESIGN.md`.
 
 ## Current validation status
 
@@ -70,15 +72,16 @@ make HOLDIR=/path/to/HOL install
 ```
 
 This installs only the `holbuild` executable to `$HOME/.local/bin/holbuild` by
-default. Override with `PREFIX`, `BINDIR`, or `DESTDIR` if needed. Schema 1
-projects select runtime HOL with `--holdir PATH`, `HOLBUILD_HOLDIR`, or `HOLDIR`.
-Schema 2 projects select HOL from `dependencies.hol`; `--holdir` is rejected.
+default. Override with `PREFIX`, `BINDIR`, or `DESTDIR` if needed.
 
+The `HOLDIR` passed to `make` is currently only for compiling/testing holbuild
+itself. Project commands do not accept `--holdir` and never use `HOLDIR` or
+`HOLBUILD_HOLDIR` to select a runtime HOL; they use manifest `dependencies.hol`.
 The compiler loads HOL's existing SML TOML parser from `$(HOLDIR)` and embeds it
 in `bin/holbuild`. Tests live under `tests/cases/*/test.sh` so they can move into
 HOL's selftest layout with minimal reshaping; `tests/run.sh` is the repo-local
 runner and can run cases in parallel with `HOLBUILD_TEST_JOBS`. Current cases
-cover simple theory builds, package overrides, local build excludes, build roots,
+cover simple theory builds, schema 2 dependency resolution, local build excludes, build roots,
 cross-package SML load resolution, dependency cycle rejection, conservative
 invalidation, checkpoint replay/recovery, process cleanup on interrupt,
 logical-name conflict rejection, cache restoration/corruption/concurrency/GC,
@@ -89,7 +92,6 @@ timeout policy, and generated theory dependency/path stability.
 ## Usage
 
 ```sh
-export HOLBUILD_HOLDIR=/path/to/HOL
 bin/holbuild build MyTheory
 bin/holbuild -j4 build MyTheory
 bin/holbuild --maxheap 4096 build MyTheory
@@ -120,12 +122,11 @@ bin/holbuild repl
 bin/holbuild heap main
 ```
 
-For schema 1 projects, `--holdir PATH` can be used instead of `HOLBUILD_HOLDIR`
-at runtime for HOL commands. For schema 2 projects, HOL is resolved from the
-reserved `dependencies.hol` package, `--holdir` is rejected, and built HOL trees
-are shared under `$HOLBUILD_CACHE/hol-toolchains`. `${HOLBUILD_POLY:-poly}` is
-used to configure/build HOL on demand. `holbuild context` may
-materialize dependency sources but does not build HOL. `--source-dir PATH` or
+HOL is resolved from the reserved `dependencies.hol` package, and built HOL
+trees are shared under `$HOLBUILD_CACHE/hol-toolchains`. `${HOLBUILD_POLY:-poly}`
+is used to configure/build HOL on demand. `holbuild buildhol` warms this cache
+explicitly; normal HOL-using commands do this automatically. `holbuild context`
+may materialize dependency sources but does not build HOL. `--source-dir PATH` or
 `HOLBUILD_SOURCE_DIR` selects the project source
 root for manifest discovery while `.holbuild` artifacts are written under the shell's
 current directory. `-jN`, `-j N`, or `--jobs N` controls build parallelism for `build`
@@ -187,17 +188,19 @@ toolchain.
 
 See `DESIGN.md` for the intended long-term model: manifest-based package
 resolution, project-local `.holbuild/` materialization, action-key invalidation,
-root-HOL migration through an explicit/default HOL manifest, and an optional
-global cache that can share validated dependency state without changing build
-semantics. A root-HOL manifest sketch lives under `examples/root-hol/`.
+project-HOL resolution through the manifest-declared `dependencies.hol`, and an
+optional global cache that can share validated dependency state without changing
+build semantics. A historical root-HOL manifest sketch lives under
+`examples/root-hol/`.
 
-## Schema 2 dependency-managed projects
+## Dependency-managed projects
 
-Schema 2 makes HOL itself an exact git dependency. Every resolved schema 2 graph
-must contain exactly one package named `hol`; that dependency is materialized and
-built under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol` and used as `HOLDIR`.
-Upstream HOL does not need a `holproject.toml`; holbuild uses a built-in manifest
-for the reserved `hol` package.
+holbuild supports schema 2 projects only. HOL itself is an exact git dependency.
+Every resolved graph must contain exactly one package named `hol`; that dependency
+is materialized and built under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol` and
+used as the project HOL toolchain. Upstream HOL does not need a
+`holproject.toml`; holbuild uses a built-in manifest for the reserved `hol`
+package.
 
 ```toml
 [holbuild]
@@ -220,9 +223,9 @@ path = "."
 manifest = "holexamples.manifest.toml"
 ```
 
-Schema 2 currently supports only exact lowercase 40-character git commit hashes.
+Dependency management currently supports only exact lowercase 40-character git commit hashes.
 There are no branches, tags, version ranges, registry, solver, lockfile, local
-overrides, or multiple versions of one package yet. Git dependencies use `git` +
+overrides, path dependencies, or multiple versions of one package yet. Git dependencies use `git` +
 `rev`; `manifest` is not allowed on git dependencies. `from` dependencies use
 `from` + `path` + `manifest`; `from` must refer to a direct git dependency in the
 same manifest. The `path` selects a source subtree inside the `from` checkout,
@@ -246,109 +249,48 @@ CI; normal HOL-using commands do this automatically.
 `[holbuild].required_version` is recognized but not implemented; non-empty values
 are currently rejected.
 
-## Example schema 1 `holproject.toml`
+## Local configuration and source selection
+
+Local `.holconfig.toml` may set workstation build settings such as jobs, excludes,
+and tactic timeout:
 
 ```toml
-[holbuild]
-schema = 1
-
-[project]
-name = "example"
-version = "0.1.0"
-
-[build]
-members = ["src", "examples"]
-roots = ["src/MainScript.sml"]
-exclude = ["*/selftest.sml", "*/examples/*"]
-
-[dependencies.foo]
-git = "https://github.com/acme/foo"
-rev = "abc123"
-
-[actions.MyTheory]
-deps = ["MyProjectLib"]
-loads = ["SomeExternalLib"]
-extra_deps = ["data/table.txt"]
-cache = false
-
-[run]
-heap = "build/main.heap"
-loads = ["MyProjectLib"]
-
-[[heap]]
-name = "main"
-output = "build/main.heap"
-objects = ["MyProjectLib"]
-```
-
-## Local dependency overrides
-
-Use an uncommitted `.holconfig.toml` when a declared dependency lives at a
-different local path on your machine or when a workstation needs local build
-settings:
-
-```toml
-[overrides.foo]
-path = "../foo-dev"
-
 [build]
 jobs = 16
 exclude = ["worktrees/*"]
+tactic_timeout = 10.0
 ```
 
-The override changes only where the package is found locally. The package still
-needs its own `holproject.toml` or an explicit shim manifest from the consumer,
-except for the reserved `[dependencies.HOLDIR]` package, which uses holbuild's
-built-in root-HOL manifest and the runtime `--holdir`/`HOLBUILD_HOLDIR` path.
-The built-in `HOLDIR` manifest intentionally models the root HOL sources only;
-it excludes examples, tests, manuals, and non-default tool variants. If a project
-needs a HOL example theory such as `keccakTheory` from
-`$HOLDIR/examples/Crypto/Keccak`, declare that subtree as a separate dependency:
+Local dependency overrides are no longer supported. Dependency locations are part
+of schema 2 manifests and are resolved through exact git revisions plus
+`from/path/manifest` shim dependencies. There is no `.holpath`, ambient
+`HOLPATH`, user-facing include-path schema, `[dependencies.HOLDIR]`, or runtime
+`--holdir` selection in project mode.
+
+For HOL example theories such as `keccakTheory`, declare a `from = "hol"`
+dependency with a shim manifest:
 
 ```toml
-# holproject.toml
-[dependencies.HOLDIR]
-
-[dependencies.HOL_keccak]
-path = "$HOLDIR/examples/Crypto/Keccak"
+[dependencies.keccak]
+from = "hol"
+path = "examples/Crypto/Keccak"
 manifest = "shims/keccak.toml"
 ```
 
-```toml
-# shims/keccak.toml
-[project]
-name = "HOL_keccak"
-
-[build]
-members = ["."]
-
-[dependencies.HOLDIR]
-```
-
-A downstream package can depend on `HOL_keccak` directly, or inherit it
-transitively through another dependency's manifest. There is no `.holpath`,
-ambient `HOLPATH`, or user-facing include-path schema in project mode;
-dependency locations are resolved through manifests plus local overrides. An
-`[overrides.foo].path` takes precedence over `[dependencies.foo].path`; when an
-override exists, the manifest's `path` field is not env-expanded, so local
-config can mask a committed `path = "$FOO"` even when `FOO` is unset. Explicit
-`[dependencies.foo].manifest` entries are still used with an overridden path and
-their env refs must expand. Path fields for dependency manifests/paths and local
-override paths support only `$VAR` and `${VAR}` environment variable
-substitution; unset variables are errors. `[build].roots` lists
-package-root-relative source paths for default entry points when `holbuild build`
-has no CLI target; root source paths must be
-discoverable through `[build].members`. `[build].members` remains the source
-discovery scope. When roots are configured, no-target `build` warns about
-discoverable theory scripts outside the roots' dependency closure. Optional
+`[build].roots` lists package-root-relative source paths for default entry points
+when `holbuild build` has no CLI target; root source paths must be discoverable
+through `[build].members`. `[build].members` remains the source discovery scope.
+When roots are configured, no-target `build` warns about discoverable theory
+scripts outside the roots' dependency closure. Optional
 `[build.root_tactic_timeouts]` entries are keyed by those same root source paths,
-and set entry-point timeout contracts for each root's root-package dependency closure;
-shared root-package closure nodes use the minimum timeout from all declared roots that can reach them.
-`[build].exclude` may explicitly remove package-root-relative globbed
-paths from source discovery; it is for keeping tests/tool variants out of a build
-package, not for changing load resolution. Generated `*Theory.sml` and
-`*Theory.sig` files are ignored automatically. Both `holproject.toml` and
-`.holconfig.toml` reject unknown fields in recognized tables so typos fail early.
+and set entry-point timeout contracts for each root's root-package dependency
+closure; shared root-package closure nodes use the minimum timeout from all
+declared roots that can reach them. `[build].exclude` may explicitly remove
+package-root-relative globbed paths from source discovery; it is for keeping
+tests/tool variants out of a build package, not for changing load resolution.
+Generated `*Theory.sml` and `*Theory.sig` files are ignored automatically. Both
+`holproject.toml` and `.holconfig.toml` reject unknown fields in recognized tables
+so typos fail early.
 
 ## Notes
 

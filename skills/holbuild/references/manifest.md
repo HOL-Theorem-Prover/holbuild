@@ -2,13 +2,19 @@
 
 ## Schema
 
+holbuild currently supports schema 2 only. The schema marker is required.
+
 ```toml
 [holbuild]
-schema = 1   # currently only schema 1
+schema = 2
 
 [project]
 name = "myproject"     # required for dependencies; optional for root
 version = "0.1.0"      # optional
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "<exact-40-character-commit>"
 
 [build]
 members = ["src", "lib"]   # source dirs/files relative to package root. Default: ["."]
@@ -18,9 +24,12 @@ tactic_timeout = 60.0            # root-package per-step timeout; CLI/local conf
 
 [dependencies.depname]
 git = "https://github.com/org/dep"
-rev = "abc123"          # git commit
-path = "../dep"         # local path (or use .holconfig.toml override)
-manifest = "shim.toml"  # explicit manifest (if set, dep's own holproject.toml is not used)
+rev = "0123456789abcdef0123456789abcdef01234567"
+
+[dependencies.subtree]
+from = "hol"
+path = "examples/Crypto/Keccak"
+manifest = "shims/keccak.toml"
 
 # [run] — prototype, not yet functional for consumers
 # heap = "build/main.heap"
@@ -55,25 +64,38 @@ Tables validated: `[holbuild]`, `[project]`, `[build]`, `[run]`, `[dependencies.
 
 ## Dependency resolution
 
-Each dependency must resolve to a manifest:
-1. Reserved `[dependencies.HOLDIR]` with no `manifest` uses holbuild's built-in
-   root-HOL manifest; the package root defaults to
-   `--holdir`/`HOLBUILD_HOLDIR`/`HOLDIR` unless `path`/override is set. This
-   built-in manifest excludes HOL examples/tests; model example subtrees such as
-   `$HOLDIR/examples/Crypto/Keccak` as separate dependencies with shim manifests.
-2. If `manifest` field is set, that file is used — dependency's own `holproject.toml` is **never consulted**. This remains true when `.holconfig.toml` overrides the dependency root path.
-3. Otherwise, tries `holproject.toml` in the dependency's directory
-4. If neither exists, build fails with a "no manifest" error
+Every resolved graph must contain exactly one package named `hol`, declared as an exact git dependency. Upstream HOL does not need a manifest; holbuild uses a built-in manifest for package metadata and builds/reuses the declared HOL under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`.
 
-Dependency `name` in `[dependencies.X]` must match the `project.name` in the resolved manifest. Mismatch is an error.
+Schema 2 dependency forms:
+
+1. Direct git dependencies:
+   ```toml
+   [dependencies.foo]
+   git = "https://github.com/acme/foo"
+   rev = "0123456789abcdef0123456789abcdef01234567"
+   ```
+   Direct git dependencies must have their own `holproject.toml`; `manifest` is not allowed here.
+
+2. Subtree/shim dependencies:
+   ```toml
+   [dependencies.keccak]
+   from = "hol"
+   path = "examples/Crypto/Keccak"
+   manifest = "shims/keccak.toml"
+   ```
+   `from` names a direct git dependency in the same manifest, `path` selects a subtree inside that checkout, and `manifest` is relative to the declaring package's manifest directory.
+
+Dependency `name` in `[dependencies.X]` must match `project.name` in the resolved manifest when the manifest declares a name. Mismatch is an error, except for the built-in `hol` manifest.
+
+Unsupported: schema 1, `[dependencies.HOLDIR]`, path dependencies, local dependency overrides, dependency path environment expansion, branches/tags/ranges, registries, lockfiles, solvers, and multiple versions of one package.
 
 ## Path rules
 
 - `build.members`, `build.exclude`, `build.roots`, `actions.*.extra_deps`, `generate.*.inputs`, `generate.*.outputs` — **package-root-relative**
 - Absolute paths and `..` components are rejected in those package-relative fields
-- Dependency `path` and `manifest` in `[dependencies.*]` are resolved relative to the *consumer's* manifest directory
-- `.holconfig.toml [overrides.X].path` takes precedence over `[dependencies.X].path`; masked dependency paths are not env-expanded
-- Dependency `path`/`manifest` and `.holconfig.toml` override paths support `$VAR` and `${VAR}` environment expansion; unset vars are errors
+- `dependencies.*.path` and `dependencies.*.manifest` are allowed only in `from/path/manifest` dependencies
+- `from` dependency `path` and `manifest` fields must be relative and contain no `..`
+- Direct git dependencies cannot specify `path` or `manifest`
 
 ## Source discovery
 

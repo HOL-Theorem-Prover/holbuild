@@ -25,8 +25,15 @@ Never request `.uo`/`.ui`/`.dat` — use logical names like `FooTheory`.
 ## Minimal project
 
 ```toml
+[holbuild]
+schema = 2
+
 [project]
 name = "myproject"
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "<exact-40-char-commit>"
 
 [build]
 members = ["src"]
@@ -38,7 +45,6 @@ members = ["src"]
 
 | Flag | Effect |
 |------|--------|
-| `--holdir PATH` | Schema 1 HOL checkout/install; fallback envs: `HOLBUILD_HOLDIR`, `HOLDIR`. Rejected for schema 2 projects, which use `dependencies.hol`. |
 | `--source-dir PATH` | Source tree for manifest discovery; artifacts still under the shell cwd `.holbuild/` |
 | `-jN` / `--jobs N` | Parallel workers (default: `.holconfig.toml [build].jobs` or `max(1, nproc/2)`) |
 | `--force=theory` / `--force-theory` | Rebuild only requested/default target nodes from source; deps still use up-to-date/cache |
@@ -56,7 +62,7 @@ members = ["src"]
 
 ## Output layout
 
-Schema 1 root artifacts live under `.holbuild/`: `gen/`, `obj/`, `dep/`, `checkpoints/`, `heap/`, `logs/`, `stage/`, `locks/`. Schema 2 dependency sources live under `.holbuild/src/<pkg>` and dependency package artifacts under `.holbuild/packages/<pkg>`.
+Root project artifacts live under `.holbuild/`: `gen/`, `obj/`, `dep/`, `checkpoints/`, `heap/`, `logs/`, `stage/`, `locks/`. Dependency sources live under `.holbuild/src/<pkg>` and dependency package artifacts under `.holbuild/packages/<pkg>`. The declared project HOL is shared under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`.
 
 ## Key constraints
 
@@ -66,11 +72,10 @@ Schema 1 root artifacts live under `.holbuild/`: `gen/`, `obj/`, `dep/`, `checkp
 - `--tactic-timeout` applies only to root package; dependencies build with no timeout
 - HOL source parse errors are build failures; holbuild may still use parser recovery internally for best-effort instrumentation and diagnostics
 - Proof engine/checkpoint/timeout/trace flags are execution/debug policy, not final artifact action-key inputs
-- Schema 1 reserved dependency `[dependencies.HOLDIR]` uses holbuild's built-in root-HOL manifest; no shim needed for core HOL sources
-- Schema 2 requires exactly one `[dependencies.hol]` exact git rev; it uses a built-in manifest, rejects `--holdir`, and builds/reuses shared HOL under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol` with `${HOLBUILD_POLY:-poly}`. `holbuild buildhol` warms this cache.
+- Manifests must be schema 2 and the resolved graph must contain exactly one `[dependencies.hol]` exact git rev; it uses a built-in manifest and builds/reuses shared HOL under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol` with `${HOLBUILD_POLY:-poly}`. `holbuild buildhol` warms this cache.
+- `--holdir`, `HOLDIR`, `HOLBUILD_HOLDIR`, schema 1, path dependencies, and local dependency overrides are no longer supported for project toolchains/dependencies.
 - Schema 2 supports exact git `rev` hashes and `from/path/manifest` deps only; `from.path` selects source inside the referenced checkout and `manifest` is a shim relative to the declaring package. No ranges, tags, branches, lockfile, local overrides, or multiple versions yet
 - HOL examples/tests are intentionally outside built-in HOL manifests; declare example subtrees (e.g. `keccakTheory`) as separate shimmed/from dependencies
-- `.holconfig.toml [overrides.X].path` masks `[dependencies.X].path`; masked env vars are not expanded. Explicit `manifest` fields still apply.
 
 ## References
 
@@ -79,5 +84,5 @@ Schema 1 root artifacts live under `.holbuild/`: `gen/`, `obj/`, `dep/`, `checkp
 - [local-config.md](references/local-config.md) — `.holconfig.toml` overrides, excludes, jobs, timeout
 - [build-model.md](references/build-model.md) — dependency inference, action keys, invalidation, cache, write locks, gc
 - [checkpoints-goalfrag.md](references/checkpoints-goalfrag.md) — proof IR/GoalFrag, checkpoint lifecycle, tactic timeouts, replay, env vars
-- [dependencies.md](references/dependencies.md) — declaring deps, built-in HOLDIR, shim manifests, transitive resolution
+- [dependencies.md](references/dependencies.md) — declaring schema 2 deps, project HOL, shim manifests, transitive resolution
 - [heaps-and-run.md](references/heaps-and-run.md) — `[[heap]]` exports; `run`/`repl` prototype status

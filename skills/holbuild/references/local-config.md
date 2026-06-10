@@ -1,29 +1,15 @@
 # .holconfig.toml local config
 
-Uncommitted per-user overrides. Lives at the project root. Schema-checked — unknown fields are errors.
+Uncommitted per-user build settings. Lives at the project root. Schema-checked — unknown fields are errors.
 
 ```toml
-[overrides.depname]
-path = "../dep-dev"    # local override for dependency "depname"; $VAR/${VAR} allowed
-
 [build]
 exclude = ["worktrees/*"]   # appends to manifest excludes
 jobs = 16                   # default -j when not specified on CLI
 tactic_timeout = 30.0       # root-package per-step timeout (overrides manifest [build].tactic_timeout)
 ```
 
-## Override semantics
-
-`[overrides.X]` changes where package `X` is found locally. It does **not** change the package identity — the override path must still contain `X`'s manifest (own `holproject.toml` or consumer-supplied shim).
-
-Overrides take priority over `[dependencies.X].path` from the manifest. If an
-override exists, the manifest `path` is not expanded at all, so a committed
-`path = "$SOME_DEP"` can be masked locally even when `SOME_DEP` is unset.
-Override paths support `$VAR` and `${VAR}` expansion; unset variables are errors.
-
-An override changes only the dependency root. It does not mask an explicit
-`[dependencies.X].manifest`; consumer-relative shim manifests still apply and
-their environment references must expand.
+Dependency overrides are no longer supported. Project/dependency locations are part of schema 2 manifests and are resolved through exact git revisions plus `from/path/manifest` shim dependencies.
 
 ## Build excludes
 
@@ -37,4 +23,4 @@ Tactic-timeout priority for root-package theorem instrumentation: CLI `--tactic-
 
 ## Not committed
 
-`.holconfig.toml` is for local machine setup. Add to `.gitignore`. It references local paths and workstation preferences that don't belong in version control.
+`.holconfig.toml` is for local machine build preferences that don't belong in version control. Add to `.gitignore` when used.

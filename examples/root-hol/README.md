@@ -1,59 +1,44 @@
 # Root HOL manifest sketch
 
-This directory sketches how root HOL can enter project mode without interpreting
-Holmakefiles.
+This directory is a historical/root-HOL planning sketch. It shows how selected
+HOL source roots might enter project mode without interpreting Holmakefiles.
 
-`holproject.toml` is intended to be read with package root equal to a HOL
-checkout/install root. It enumerates explicit `src/*` members and excludes known
-non-build/test/tooling variants that currently collide on logical names or have
-side effects.
+Schema 1, `[dependencies.HOLDIR]`, `--holdir`, `HOLDIR`, and
+`HOLBUILD_HOLDIR` are no longer supported project/runtime mechanisms. Current
+projects declare HOL through schema 2 `[dependencies.hol]`; holbuild uses a
+built-in manifest for that reserved `hol` package and builds/reuses the declared
+HOL under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`.
 
-The current sketch is a planning boundary, not a bootstrap recipe. The actual
-reserved `HOLDIR` dependency uses the equivalent manifest compiled into holbuild,
-so users only set `--holdir`, `HOLBUILD_HOLDIR`, or `HOLDIR`; no HOLDIR shim
-manifest file is required.
-
-This manifest deliberately excludes `$HOLDIR/examples`, tests, manuals, and
+The sketch manifest deliberately excludes HOL examples, tests, manuals, and
 non-default tool variants. Example theories are separate package boundaries. For
-example, code that needs `keccakTheory` should declare a shimmed dependency on
-`$HOLDIR/examples/Crypto/Keccak` rather than expecting it from
-`[dependencies.HOLDIR]`:
+example, code that needs `keccakTheory` should declare a schema 2 `from = "hol"`
+dependency with a shim manifest:
 
 ```toml
 # consumer holproject.toml
-[dependencies.HOLDIR]
+[holbuild]
+schema = 2
 
-[dependencies.HOL_keccak]
-path = "$HOLDIR/examples/Crypto/Keccak"
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "<exact-40-character-commit>"
+
+[dependencies.keccak]
+from = "hol"
+path = "examples/Crypto/Keccak"
 manifest = "shims/keccak.toml"
 ```
 
 ```toml
 # shims/keccak.toml
+[holbuild]
+schema = 2
+
 [project]
-name = "HOL_keccak"
+name = "keccak"
 
 [build]
 members = ["."]
-
-[dependencies.HOLDIR]
-```
-
-Probe shape:
-
-```sh
-tmp=$(mktemp -d)
-cat > "$tmp/holproject.toml" <<EOF
-[project]
-name = "probe"
-
-[build]
-members = []
-
-[dependencies.HOLDIR]
-EOF
-
-(cd "$tmp" && /path/to/holbuild --holdir "$HOLDIR" build --dry-run)
 ```
 
 Last audit result: with the exclude list in this sketch, dry-run planning over

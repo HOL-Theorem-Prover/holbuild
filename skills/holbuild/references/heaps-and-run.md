@@ -32,6 +32,6 @@ These commands generate `.holbuild/holbuild-run-context.sml`, add built project 
 
 `holbuild repl` uses an interactive HOL process runner so stdin/stdout stay attached to the terminal.
 
-Global flags apply: `--holdir`, `--source-dir`, and `--maxheap`/`--max-heap`.
+Global flags apply: `--source-dir` and `--maxheap`/`--max-heap`. `heap`, `run`, and `repl` use the manifest-declared project HOL from `[dependencies.hol]`; use `holbuild buildhol` to warm that shared cache explicitly if desired.
 
 For proof failures during builds, prefer `holbuild build --repl-on-failure TARGET`: it serializes the build and starts `hol repl` from the newest failed-prefix checkpoint, falling back to replay/deps-loaded checkpoint. It requires checkpoints and is not supported with `--json`.

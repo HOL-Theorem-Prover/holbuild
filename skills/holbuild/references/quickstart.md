@@ -2,21 +2,30 @@
 
 ## Prerequisites
 
-A HOL4 checkout or installation. Select it with `--holdir PATH`, `HOLBUILD_HOLDIR`, or `HOLDIR`.
+Projects must use `holproject.toml` schema 2 and declare the project HOL toolchain as `[dependencies.hol]`. Commands that need HOL build or reuse that declared HOL under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`.
 
-## Build holbuild
+Building the current external `holbuild` executable still requires a HOL checkout at compile time:
 
 ```sh
 make HOLDIR=/path/to/HOL
 make HOLDIR=/path/to/HOL test
 ```
 
+That `HOLDIR` is only a temporary implementation input for compiling/testing `holbuild`; it is not a project/runtime configuration mechanism. `holbuild` commands no longer support `--holdir`, `HOLDIR`, or `HOLBUILD_HOLDIR`.
+
 ## Minimal project
 
 ```toml
 # holproject.toml
+[holbuild]
+schema = 2
+
 [project]
 name = "myproject"
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "<exact-40-character-commit>"
 
 [build]
 members = ["src"]
@@ -25,8 +34,10 @@ members = ["src"]
 With `src/FooScript.sml` containing a standard theory script, build with:
 
 ```sh
-holbuild --holdir /path/to/HOL build FooTheory
+holbuild build FooTheory
 ```
+
+Use `holbuild buildhol` to warm the declared project-HOL cache explicitly, for example in CI. Normal HOL-using commands do this automatically.
 
 ## Core workflow
 
@@ -34,8 +45,9 @@ holbuild --holdir /path/to/HOL build FooTheory
 holbuild build FooTheory                 # build one target
 holbuild build Foo BarTheory             # build multiple targets
 holbuild build                           # build all, or roots if configured
-holbuild build --dry-run FooTheory       # show plan without building
-holbuild context                         # show manifest info
+holbuild build --dry-run FooTheory       # show plan
+holbuild context                         # show manifest info/cache paths
+holbuild buildhol                        # prebuild/reuse dependencies.hol
 holbuild execution-plan FooTheory:thm    # static proof-IR plan
 holbuild goalfrag-plan FooTheory:thm     # static legacy GoalFrag plan
 holbuild build --force --goalfrag-trace FooTheory
@@ -45,7 +57,6 @@ holbuild --json build --retain-debug-artifacts FooTheory  # also retain/report f
 
 ## Global flags
 
-- `--holdir PATH` — HOL checkout/install; fallback envs: `HOLBUILD_HOLDIR`, `HOLDIR`
 - `--source-dir PATH` — source tree for manifest discovery; `.holbuild/` artifacts are written under the shell cwd
 - `--maxheap MB` / `--max-heap MB` — pass Poly/ML max heap to child HOL processes
 - `-jN` / `--jobs N` — parallel workers. Default: `.holconfig.toml [build].jobs` or `max(1, nproc/2)`
@@ -78,7 +89,7 @@ holbuild gc                                      # project clean + global cache 
 holbuild gc --retention-days 30                 # custom retention
 holbuild gc --max-checkpoints-gb 10             # size cap for project checkpoints
 holbuild gc --clean-only                        # project .holbuild residue only
-holbuild gc --cache-only --cache-dir /path      # global cache only; no project/HOLDIR needed
+holbuild gc --cache-only --cache-dir /path      # global cache only; no project HOL needed
 holbuild cache gc                               # legacy cache-only form still exists
 ```
 
@@ -93,7 +104,11 @@ holbuild cache gc                               # legacy cache-only form still e
   logs/         retained failure/trace logs
   stage/        temporary build staging
   locks/        project write/gc lock
+  src/          materialized dependency sources
+  packages/     dependency package artifacts
 ```
+
+The declared project HOL is shared under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`.
 
 Never request `.uo`/`.ui`/`.dat` as build targets — use logical names like `FooTheory`.
 
