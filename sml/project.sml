@@ -31,7 +31,6 @@ datatype generator =
 datatype dependency_source =
     GitSource of {git : string, rev : string}
   | FromSource of {from : string, path : string, manifest : string}
-  | LegacyPathSource of {path : string option, manifest : string option}
 
 datatype dependency = Dependency of {name : string, source : dependency_source}
 
@@ -78,23 +77,12 @@ exception Error of string
 
 fun die msg = raise Error msg
 
-val holdir_ref : string option ref = ref NONE
 val source_dir_ref : string option ref = ref NONE
-
-fun set_holdir path = holdir_ref := SOME path
 
 fun absolute_from_cwd path =
   Path.mkAbsolute {path = path, relativeTo = FS.getDir ()}
 
 fun set_source_dir path = source_dir_ref := SOME (absolute_from_cwd path)
-
-fun builtin_holdir_dependency name = name = "HOLDIR"
-
-fun builtin_holdir_manifest () = HolbuildBuiltinManifests.holdir_manifest_name
-
-fun uses_builtin_holdir_manifest (Dependency {name, source = LegacyPathSource {manifest = NONE, ...}}) =
-      builtin_holdir_dependency name
-  | uses_builtin_holdir_manifest _ = false
 
 fun schema2_hol_dependency (Dependency {name = "hol", source = GitSource _}) = true
   | schema2_hol_dependency _ = false
@@ -378,14 +366,13 @@ fun generators_at table =
 
 fun schema_version table =
   case table_field table ["holbuild"] of
-      NONE => 1
+      NONE => die "holproject.toml must declare [holbuild] schema = 2"
     | SOME holbuild =>
         case int_at holbuild ["schema"] of
-            NONE => 1
+            NONE => die "holproject.toml must declare [holbuild] schema = 2"
           | SOME n =>
-              if n = IntInf.fromInt 1 then 1
-              else if n = IntInf.fromInt 2 then 2
-              else die ("unsupported holproject schema: " ^ IntInf.toString n)
+              if n = IntInf.fromInt 2 then 2
+              else die "only holproject schema 2 is supported"
 
 fun validate_schema table =
   case table_field table ["holbuild"] of
@@ -398,7 +385,7 @@ fun validate_schema table =
            | SOME "" => ()
            | SOME _ => die "holbuild.required_version is recognized but not implemented yet")
 
-fun validate_dependency_table schema (name, table) =
+fun validate_dependency_table (name, table) =
   let
     val context = "dependencies." ^ name
     val path = string_field table "path"
@@ -407,22 +394,20 @@ fun validate_dependency_table schema (name, table) =
     val rev = string_field table "rev"
     val from = string_field table "from"
   in
-    if schema = 1 then require_known_fields context ["path", "manifest", "git", "rev"] table
-    else
-      (require_known_fields context ["git", "rev", "from", "path", "manifest"] table;
-       case (git, rev, from, path, manifest) of
-           (SOME _, SOME _, NONE, NONE, NONE) => ()
-         | (SOME _, NONE, _, _, _) => die (context ^ " with git requires rev")
-         | (NONE, SOME _, _, _, _) => die (context ^ " with rev requires git")
-         | (SOME _, SOME _, _, _, _) => die (context ^ " git dependency may only contain git and rev")
-         | (NONE, NONE, SOME from, SOME path, SOME manifest) =>
-             (require_safe_materialized_dependency_name (context ^ ".from") from;
-              ignore (package_relative_path (context ^ ".path") path);
-              ignore (package_relative_path (context ^ ".manifest") manifest))
-         | (NONE, NONE, SOME _, _, _) => die (context ^ " with from requires path and manifest")
-         | (NONE, NONE, NONE, SOME _, _) => die (context ^ " path dependencies are not supported in schema 2")
-         | (NONE, NONE, NONE, NONE, SOME _) => die (context ^ " manifest requires from in schema 2")
-         | (NONE, NONE, NONE, NONE, NONE) => die (context ^ " must specify either git/rev or from/path/manifest"))
+    require_known_fields context ["git", "rev", "from", "path", "manifest"] table;
+    case (git, rev, from, path, manifest) of
+        (SOME _, SOME _, NONE, NONE, NONE) => ()
+      | (SOME _, NONE, _, _, _) => die (context ^ " with git requires rev")
+      | (NONE, SOME _, _, _, _) => die (context ^ " with rev requires git")
+      | (SOME _, SOME _, _, _, _) => die (context ^ " git dependency may only contain git and rev")
+      | (NONE, NONE, SOME from, SOME path, SOME manifest) =>
+          (require_safe_materialized_dependency_name (context ^ ".from") from;
+           ignore (package_relative_path (context ^ ".path") path);
+           ignore (package_relative_path (context ^ ".manifest") manifest))
+      | (NONE, NONE, SOME _, _, _) => die (context ^ " with from requires path and manifest")
+      | (NONE, NONE, NONE, SOME _, _) => die (context ^ " path dependencies are not supported")
+      | (NONE, NONE, NONE, NONE, SOME _) => die (context ^ " manifest requires from")
+      | (NONE, NONE, NONE, NONE, NONE) => die (context ^ " must specify either git/rev or from/path/manifest")
   end
 
 fun validate_action_table (logical, table) =
@@ -444,8 +429,8 @@ fun validate_manifest_table table =
               (table_field table ["build"])
     val _ = Option.app (require_known_fields "run" ["heap", "loads"])
               (table_field table ["run"])
-    val schema = schema_version table
-    val _ = List.app (validate_dependency_table schema) (named_table_entries table ["dependencies"])
+    val _ = ignore (schema_version table)
+    val _ = List.app validate_dependency_table (named_table_entries table ["dependencies"])
     val _ = List.app validate_action_table (named_table_entries table ["actions"])
     val _ =
       case lookup table ["generate"] of
@@ -476,25 +461,20 @@ fun validate_local_config_table table =
    Option.app validate_local_build_table (table_field table ["build"]);
    List.app validate_override_table (named_table_entries table ["overrides"]))
 
-fun parse_dependency schema (name, table) =
+fun parse_dependency (name, table) =
   let
     val source =
-      if schema = 1 then
-        LegacyPathSource {path = string_field table "path", manifest = string_field table "manifest"}
-      else
-        case (string_field table "git", string_field table "rev", string_field table "from",
-              string_field table "path", string_field table "manifest") of
-            (SOME git, SOME rev, NONE, NONE, NONE) => GitSource {git = git, rev = rev}
-          | (NONE, NONE, SOME from, SOME path, SOME manifest) =>
-              FromSource {from = from, path = path, manifest = manifest}
-          | _ => die ("invalid dependency form for dependencies." ^ name)
+      case (string_field table "git", string_field table "rev", string_field table "from",
+            string_field table "path", string_field table "manifest") of
+          (SOME git, SOME rev, NONE, NONE, NONE) => GitSource {git = git, rev = rev}
+        | (NONE, NONE, SOME from, SOME path, SOME manifest) =>
+            FromSource {from = from, path = path, manifest = manifest}
+        | _ => die ("invalid dependency form for dependencies." ^ name)
   in
     Dependency {name = name, source = source}
   end
 
-fun dependencies_at table =
-  let val schema = schema_version table
-  in map (parse_dependency schema) (named_table_entries table ["dependencies"]) end
+fun dependencies_at table = map parse_dependency (named_table_entries table ["dependencies"])
 
 fun dependency_name (Dependency {name, ...}) = name
 
@@ -510,7 +490,6 @@ fun validate_schema2_dependency_refs deps =
              | NONE => die ("dependencies." ^ name ^ " from dependency is unknown: " ^ from))
       | validate_one (Dependency {name, source = GitSource _, ...}) =
           require_safe_materialized_dependency_name ("dependencies." ^ name) name
-      | validate_one _ = ()
   in
     List.app validate_one deps
   end
@@ -619,10 +598,10 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
     val schema = schema_version table
     val dependencies = dependencies_at table
     val _ =
-      if schema = 2 andalso not (null overrides) then
-        die "local dependency overrides are not supported in schema 2"
+      if not (null overrides) then
+        die "local dependency overrides are not supported"
       else ()
-    val _ = if schema = 2 then validate_schema2_dependency_refs dependencies else ()
+    val _ = validate_schema2_dependency_refs dependencies
   in
     { root = root,
       artifact_root = artifact_root,
@@ -707,13 +686,11 @@ fun schema ({schema, ...} : t) = schema
 fun hol_dependency ({dependencies, ...} : t) =
   List.find (fn Dependency {name, ...} => name = "hol") dependencies
 
-fun project_hol_dir (project as {schema, ...} : t) =
-  if schema = 2 then
-    case hol_dependency project of
-        SOME (Dependency {source = GitSource {git, rev}, ...}) =>
-          SOME (HolbuildHolSharedCache.holdir_for {git = git, rev = rev})
-      | _ => NONE
-  else NONE
+fun project_hol_dir project =
+  case hol_dependency project of
+      SOME (Dependency {source = GitSource {git, rev}, ...}) =>
+        SOME (HolbuildHolSharedCache.holdir_for {git = git, rev = rev})
+    | _ => NONE
 fun build_roots ({roots, ...} : t) = roots
 fun package_action_policies (Package {action_policies, ...}) = action_policies
 
@@ -746,36 +723,22 @@ fun action_policy_for policies logical =
 fun dependency_path_context name = "dependencies." ^ name ^ ".path"
 fun dependency_manifest_context name = "dependencies." ^ name ^ ".manifest"
 
-fun dependency_local_path (project as {root, overrides, graph_artifact_root, ...} : t) (Dependency {name, source}) =
-  Option.map (abs_under root)
-    (case override_path overrides name of
-         SOME override => SOME override
-       | NONE =>
-           case source of
-               LegacyPathSource {path = SOME p, ...} => SOME (expand_env (dependency_path_context name) p)
-             | LegacyPathSource {path = NONE, ...} => if builtin_holdir_dependency name then !holdir_ref else NONE
-             | GitSource {git, rev} =>
-                 if name = "hol" then SOME (HolbuildHolSharedCache.holdir_for {git = git, rev = rev})
-                 else SOME (Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), name))
-             | FromSource {from, path, ...} =>
-                 (case hol_dependency project of
-                      SOME (Dependency {name = "hol", source = GitSource {git, rev}}) =>
-                        if from = "hol" then SOME (Path.concat(HolbuildHolSharedCache.holdir_for {git = git, rev = rev}, path))
-                        else SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path))
-                    | _ => SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path))))
+fun dependency_local_path (project as {graph_artifact_root, ...} : t) (Dependency {name, source}) =
+  case source of
+      GitSource {git, rev} =>
+        if name = "hol" then SOME (HolbuildHolSharedCache.holdir_for {git = git, rev = rev})
+        else SOME (Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), name))
+    | FromSource {from, path, ...} =>
+        (case hol_dependency project of
+             SOME (Dependency {name = "hol", source = GitSource {git, rev}}) =>
+               if from = "hol" then SOME (Path.concat(HolbuildHolSharedCache.holdir_for {git = git, rev = rev}, path))
+               else SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path))
+           | _ => SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path)))
 
-fun dependency_manifest (project as {manifest = project_manifest, graph_artifact_root, ...} : t) dep =
+fun dependency_manifest ({manifest = project_manifest, graph_artifact_root, ...} : t) dep =
   case dep of
-      Dependency {name, source = LegacyPathSource {manifest = SOME manifest, ...}} =>
-        SOME (abs_under (manifest_root project_manifest)
-                (expand_env (dependency_manifest_context name) manifest))
-    | Dependency {name, source = LegacyPathSource {manifest = NONE, ...}} =>
-        if builtin_holdir_dependency name then SOME (builtin_holdir_manifest ())
-        else
-          Option.map (fn path => Path.concat(path, "holproject.toml"))
-            (dependency_local_path project dep)
-    | dep as Dependency {name, source = GitSource _, ...} =>
-        if schema2_hol_dependency dep then SOME (builtin_holdir_manifest ())
+      dep as Dependency {name, source = GitSource _, ...} =>
+        if schema2_hol_dependency dep then SOME (HolbuildBuiltinManifests.holdir_manifest_name)
         else SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), name),
                                "holproject.toml"))
     | Dependency {source = FromSource {manifest, ...}, ...} =>
@@ -793,8 +756,7 @@ fun dependency_to_string project (dep as Dependency {name, source}) =
     val resolved_manifest = dependency_manifest project dep
     val source_fields =
       case source of
-          LegacyPathSource {path, manifest} => field "path" path @ field "manifest" manifest
-        | GitSource {git, rev} => ["git=" ^ git, "rev=" ^ rev]
+          GitSource {git, rev} => ["git=" ^ git, "rev=" ^ rev]
         | FromSource {from, path, manifest} => ["from=" ^ from, "path=" ^ path, "manifest=" ^ manifest]
     val fields =
       source_fields @ field "override" override @ field "local" local_path @
@@ -830,15 +792,13 @@ fun dependency_project (project : t) (dep as Dependency {name, source}) =
           SOME manifest => manifest
         | NONE => die ("dependency " ^ name ^ " has no manifest")
     val parse_dep =
-      if uses_builtin_holdir_manifest dep orelse schema2_hol_dependency dep then parse_builtin_holdir_at
+      if schema2_hol_dependency dep then parse_builtin_holdir_at
       else
         (if readable dep_manifest then ()
          else die ("dependency " ^ name ^ " manifest not found: " ^ dep_manifest);
          parse_at)
     val dep_artifact_root =
-      case source of
-          LegacyPathSource _ => dep_root
-        | _ => Path.concat(Path.concat(Path.concat(#graph_artifact_root project, ".holbuild"), "packages"), name)
+      Path.concat(Path.concat(Path.concat(#graph_artifact_root project, ".holbuild"), "packages"), name)
     val dep_project = parse_dep {manifest = dep_manifest, root = dep_root, artifact_root = dep_artifact_root,
                                  graph_artifact_root = #graph_artifact_root project,
                                  local_config = LocalConfig {overrides = #overrides project,
@@ -882,9 +842,7 @@ fun dependency_package artifact_parent project (dep as Dependency {name, ...}) =
     val dep_root = valOf (dependency_local_path project dep)
     val dep_manifest = valOf (dependency_manifest project dep)
     val artifact_root =
-      case dep of
-          Dependency {source = LegacyPathSource _, ...} => Path.concat(Path.concat(artifact_parent, ".holbuild/deps"), name)
-        | _ => Path.concat(Path.concat(Path.concat(artifact_parent, ".holbuild"), "packages"), name)
+      Path.concat(Path.concat(Path.concat(artifact_parent, ".holbuild"), "packages"), name)
   in
     (Package {name = name, root = dep_root, manifest = dep_manifest,
               members = #members dep_project, excludes = #excludes dep_project,
@@ -897,7 +855,6 @@ fun dependency_package artifact_parent project (dep as Dependency {name, ...}) =
 fun same_dependency_source (GitSource a, GitSource b) = #git a = #git b andalso #rev a = #rev b
   | same_dependency_source (FromSource a, FromSource b) =
       #from a = #from b andalso #path a = #path b andalso #manifest a = #manifest b
-  | same_dependency_source (LegacyPathSource a, LegacyPathSource b) = #path a = #path b andalso #manifest a = #manifest b
   | same_dependency_source _ = false
 
 fun packages (project : t) =
@@ -924,8 +881,8 @@ fun packages (project : t) =
     val result = rev packages
     val hol_count = length (List.filter (fn package => package_name package = "hol") result)
     val _ =
-      if #schema project = 2 andalso hol_count <> 1 then
-        die ("schema 2 dependency graph must contain exactly one hol dependency")
+      if hol_count <> 1 then
+        die "dependency graph must contain exactly one hol dependency"
       else ()
   in
     result

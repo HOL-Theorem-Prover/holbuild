@@ -15,17 +15,18 @@ fun warn msg = HolbuildStatus.message_stderr ("holbuild: warning: " ^ msg ^ "\n"
 fun usage () = print
   "holbuild: experimental project-aware build frontend for HOL4\n\n\
   \Usage:\n\
-  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--holdir PATH] [--maxheap MB] [-jN] context\n\
-  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--holdir PATH] [--maxheap MB] [-jN] execution-plan THEORY:THEOREM\n\
-  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--holdir PATH] [--maxheap MB] [-jN] goalfrag-plan THEORY:THEOREM\n\
-  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--holdir PATH] [--maxheap MB] [-jN] build [--dry-run] [--force[=theory|project|full]] [--no-cache] [--skip-checkpoints] [--skip-goalfrag] [--goalfrag] [--tactic-timeout SECONDS] [--goalfrag-plan THEORY:THEOREM] [--goalfrag-trace] [--repl-on-failure] [--retain-debug-artifacts] [TARGET ...]\n\
-  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--holdir PATH] [--maxheap MB] [-jN] heap NAME\n\
-  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--holdir PATH] [--maxheap MB] run [ARG ...]\n\
-  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--holdir PATH] [--maxheap MB] repl [ARG ...]\n\
+  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--maxheap MB] [-jN] context\n\
+  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--maxheap MB] [-jN] execution-plan THEORY:THEOREM\n\
+  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--maxheap MB] [-jN] goalfrag-plan THEORY:THEOREM\n\
+  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--maxheap MB] [-jN] build [--dry-run] [--force[=theory|project|full]] [--no-cache] [--skip-checkpoints] [--skip-goalfrag] [--goalfrag] [--tactic-timeout SECONDS] [--goalfrag-plan THEORY:THEOREM] [--goalfrag-trace] [--repl-on-failure] [--retain-debug-artifacts] [TARGET ...]\n\
+  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--maxheap MB] [-jN] heap NAME\n\
+  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--maxheap MB] run [ARG ...]\n\
+  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--maxheap MB] repl [ARG ...]\n\
   \  holbuild [--source-dir PATH] buildhol\n\
   \  holbuild gc [--retention-days DAYS] [--max-checkpoints-gb GB] [--cache-dir PATH] [--clean-only|--cache-only]\n\n\
-  \Schema 1 HOL is found from --holdir, HOLBUILD_HOLDIR, or HOLDIR. Schema 2\n\
-  \rejects --holdir and uses dependencies.hol, sharing built HOL trees in the global cache.\n\
+  \Projects must use schema 2 and declare dependencies.hol. Commands that need HOL\n\
+  \build/reuse the declared HOL tree in the global cache. --holdir/HOLDIR are no\n\
+  \longer supported.\n\
   \Project sources are found from --source-dir, HOLBUILD_SOURCE_DIR, or cwd.\n\
   \-j/--jobs controls build parallelism. Default is .holconfig.toml [build].jobs,\n\
   \or max(1, detected processor count / 2). --maxheap/--max-heap passes Poly/ML\n\
@@ -321,17 +322,6 @@ fun effective_jobs (project : HolbuildProject.t) cli_jobs =
       SOME jobs => jobs
     | NONE => Option.getOpt (#local_build_jobs project, default_jobs ())
 
-fun runtime_holdir cline_holdir =
-  case cline_holdir of
-      SOME h => h
-    | NONE =>
-      case OS.Process.getEnv "HOLBUILD_HOLDIR" of
-          SOME h => h
-        | NONE =>
-          case OS.Process.getEnv "HOLDIR" of
-              SOME h => h
-            | NONE => raise Error "set --holdir, HOLBUILD_HOLDIR, or HOLDIR"
-
 fun load_project () =
   HolbuildProject.discover ()
   handle HolbuildProject.Error msg => raise Error msg
@@ -557,55 +547,46 @@ fun gc args =
     ()
   end
 
+fun reject_holdir holdir =
+  case holdir of
+      SOME _ => raise Error "--holdir is no longer supported; declare dependencies.hol"
+    | NONE => ()
+
+fun require_schema2 project =
+  if HolbuildProject.schema project = 2 then ()
+  else raise Error "only holproject schema 2 is supported"
+
+fun project_hol_holdir project =
+  (HolbuildProject.packages project;
+   case HolbuildProject.resolved_hol_dependency project of
+       SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev}, ...}) =>
+         HolbuildHolSharedCache.ensure_built {git = git, rev = rev}
+     | _ => raise Error "schema 2 project has no dependencies.hol")
+
 fun effective_toolchain holdir maxheap =
   let
     val project = load_project ()
+    val _ = reject_holdir holdir
+    val _ = require_schema2 project
   in
-    if HolbuildProject.schema project = 2 then
-      let val _ = HolbuildProject.packages project
-      in case holdir of
-           SOME _ => raise Error "--holdir is not supported for schema 2 projects; use dependencies.hol"
-         | NONE =>
-             case HolbuildProject.resolved_hol_dependency project of
-                 SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev}, ...}) =>
-                   {holdir = HolbuildHolSharedCache.ensure_built {git = git, rev = rev}, maxheap = maxheap}
-               | _ => raise Error "schema 2 project has no dependencies.hol"
-      end
-    else
-      let val tc = {holdir = runtime_holdir holdir, maxheap = maxheap}
-          val _ = HolbuildProject.set_holdir (#holdir tc)
-      in tc end
+    {holdir = project_hol_holdir project, maxheap = maxheap}
   end
 
 fun context_toolchain holdir maxheap =
-  let val project = load_project ()
+  let
+    val project = load_project ()
+    val _ = reject_holdir holdir
+    val _ = require_schema2 project
   in
-    if HolbuildProject.schema project = 2 then
-      (case holdir of
-           SOME _ => raise Error "--holdir is not supported for schema 2 projects; use dependencies.hol"
-         | NONE => {holdir = "", maxheap = maxheap})
-    else
-      let val tc = {holdir = runtime_holdir holdir, maxheap = maxheap}
-          val _ = HolbuildProject.set_holdir (#holdir tc)
-      in tc end
+    {holdir = "", maxheap = maxheap}
   end
 
 fun buildhol holdir maxheap =
   let
     val project = load_project ()
-    val _ =
-      case holdir of
-          SOME _ => raise Error "--holdir is not supported for schema 2 projects; use dependencies.hol"
-        | NONE => ()
-    val _ =
-      if HolbuildProject.schema project = 2 then ()
-      else raise Error "buildhol is only supported for schema 2 projects"
-    val _ = HolbuildProject.packages project
-    val holdir =
-      case HolbuildProject.resolved_hol_dependency project of
-          SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev}, ...}) =>
-            HolbuildHolSharedCache.ensure_built {git = git, rev = rev}
-        | _ => raise Error "schema 2 project has no dependencies.hol"
+    val _ = reject_holdir holdir
+    val _ = require_schema2 project
+    val holdir = project_hol_holdir project
   in
     print (holdir ^ "\n")
   end

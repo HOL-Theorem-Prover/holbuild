@@ -10,7 +10,7 @@ val holdir_manifest_text =
      "# no HOLDIR manifest/shim file is required.",
      "",
      "[holbuild]",
-     "schema = 1",
+     "schema = 2",
      "",
      "[project]",
      "name = \"HOLDIR\"",
