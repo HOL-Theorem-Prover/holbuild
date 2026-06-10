@@ -201,6 +201,7 @@ mkdir -p "$no_cache_publish_project/src"
 cp "$project/holproject.toml" "$no_cache_publish_project/holproject.toml"
 cp "$project/src/AScript.sml" "$no_cache_publish_project/src/AScript.sml"
 no_cache_publish_cache=$tmpdir/no-cache-publish-cache
+link_hol_toolchain_cache "$no_cache_publish_cache"
 no_cache_publish_log=$tmpdir/no-cache-publish.log
 (cd "$no_cache_publish_project" && HOLBUILD_CACHE="$no_cache_publish_cache" "$HOLBUILD_BIN" build --no-cache ATheory) > "$no_cache_publish_log"
 rm -rf "$no_cache_publish_project/.holbuild"

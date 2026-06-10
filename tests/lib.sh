@@ -44,11 +44,16 @@ init_git_repo() {
   git -C "$dir" rev-parse HEAD
 }
 
-use_case_cache() {
+link_hol_toolchain_cache() {
   local cache=$1
   mkdir -p "$cache"
   if [[ -n "${HOLBUILD_TEST_GLOBAL_CACHE:-}" && -d "$HOLBUILD_TEST_GLOBAL_CACHE/hol-toolchains" && ! -e "$cache/hol-toolchains" ]]; then
     ln -s "$HOLBUILD_TEST_GLOBAL_CACHE/hol-toolchains" "$cache/hol-toolchains"
   fi
+}
+
+use_case_cache() {
+  local cache=$1
+  link_hol_toolchain_cache "$cache"
   export HOLBUILD_CACHE="$cache"
 }
