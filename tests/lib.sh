@@ -17,3 +17,29 @@ require_grep() {
 make_temp_dir() {
   mktemp -d "${TMPDIR:-/tmp}/holbuild-test.XXXXXX"
 }
+
+holbuild_pinned_hol_rev() {
+  tr -d '[:space:]' < "${HOLBUILD_ROOT:?HOLBUILD_ROOT not set}/PINS/hol.txt"
+}
+
+write_schema2_prelude() {
+  cat <<TOML
+[holbuild]
+schema = 2
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+TOML
+}
+
+init_git_repo() {
+  local dir=$1
+  git -C "$dir" init -q
+  git -C "$dir" config user.email test@example.invalid
+  git -C "$dir" config user.name "holbuild test"
+  git -C "$dir" add .
+  git -C "$dir" commit -q -m init
+  git -C "$dir" rev-parse HEAD
+}
