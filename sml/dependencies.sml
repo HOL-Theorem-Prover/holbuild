@@ -200,63 +200,90 @@ fun extract_textual path =
      holdep_mentions = holdep_mentions path}
   end
 
-fun parse_analyser_response response_path source_path =
+fun empty_deps () = {loads = [], uses = [], extra_deps = [], holdep_mentions = []} : t
+
+fun add_response_field source_path field value ({loads, uses, extra_deps, holdep_mentions} : t) =
+  case field of
+      "load" => {loads = value :: loads, uses = uses, extra_deps = extra_deps, holdep_mentions = holdep_mentions}
+    | "use" => {loads = loads, uses = value :: uses, extra_deps = extra_deps, holdep_mentions = holdep_mentions}
+    | "extra-dep" => {loads = loads, uses = uses, extra_deps = value :: extra_deps, holdep_mentions = holdep_mentions}
+    | "mention" => {loads = loads, uses = uses, extra_deps = extra_deps, holdep_mentions = value :: holdep_mentions}
+    | _ => raise Error ("bad analyser response field for " ^ source_path ^ ": " ^ field)
+
+fun finish_deps ({loads, uses, extra_deps, holdep_mentions} : t) =
+  {loads = sort_unique loads, uses = sort_unique uses,
+   extra_deps = sort_unique extra_deps,
+   holdep_mentions = sort_unique holdep_mentions}
+
+fun assoc id pairs =
+  case pairs of
+      [] => NONE
+    | (k, v) :: rest => if k = id then SOME v else assoc id rest
+
+fun parse_analyser_response response_path id_paths =
   let
     val lines = String.tokens (fn c => c = #"\n") (read_all response_path)
-    fun add field value ({loads, uses, extra_deps, holdep_mentions} : t) =
-      case field of
-          "load" => {loads = value :: loads, uses = uses, extra_deps = extra_deps, holdep_mentions = holdep_mentions}
-        | "use" => {loads = loads, uses = value :: uses, extra_deps = extra_deps, holdep_mentions = holdep_mentions}
-        | "extra-dep" => {loads = loads, uses = uses, extra_deps = value :: extra_deps, holdep_mentions = holdep_mentions}
-        | "mention" => {loads = loads, uses = uses, extra_deps = extra_deps, holdep_mentions = value :: holdep_mentions}
-        | _ => raise Error ("bad analyser response field for " ^ source_path ^ ": " ^ field)
-    fun loop rest in_file acc =
+    fun source_for id = Option.getOpt(assoc id id_paths, "file " ^ id)
+    fun put id deps acc =
+      let fun go pairs =
+            case pairs of
+                [] => [(id, deps)]
+              | (k, v) :: rest => if k = id then (id, deps) :: rest else (k, v) :: go rest
+      in go acc end
+    fun current id acc = Option.getOpt(assoc id acc, empty_deps ())
+    fun loop rest current_id acc =
       case rest of
-          [] => raise Error ("analyser response missing end for " ^ source_path)
+          [] => raise Error "analyser response missing end"
         | line :: more =>
             (case HolbuildAnalysisProtocol.split line of
                  ["version", v] =>
-                   if v = HolbuildAnalysisProtocol.protocol_version then loop more in_file acc
+                   if v = HolbuildAnalysisProtocol.protocol_version then loop more current_id acc
                    else raise Error ("unsupported analyser protocol version: " ^ v)
-               | ["ok"] => loop more in_file acc
-               | ["begin-file", "1"] => loop more true acc
-               | ["end-file", "1"] => loop more false acc
-               | ["end"] => acc
-               | [field, value] => if in_file then loop more true (add field value acc) else loop more false acc
-               | _ => raise Error ("bad analyser response line for " ^ source_path ^ ": " ^ line))
-    val result = loop lines false {loads = [], uses = [], extra_deps = [], holdep_mentions = []}
+               | ["ok"] => loop more current_id acc
+               | ["begin-file", id] => loop more (SOME id) (put id (current id acc) acc)
+               | ["end-file", id] => loop more NONE acc
+               | ["end"] => map (fn (id, deps) => (id, finish_deps deps)) acc
+               | [field, value] =>
+                   (case current_id of
+                        SOME id => loop more current_id (put id (add_response_field (source_for id) field value (current id acc)) acc)
+                      | NONE => loop more current_id acc)
+               | _ => raise Error ("bad analyser response line: " ^ line))
   in
-    {loads = sort_unique (#loads result), uses = sort_unique (#uses result),
-     extra_deps = sort_unique (#extra_deps result),
-     holdep_mentions = sort_unique (#holdep_mentions result)}
+    loop lines NONE []
   end
 
-fun extract_with_analyser analyser source_path =
+fun write_file path text =
+  let val out = TextIO.openOut path
+  in TextIO.output(out, text); TextIO.closeOut out end
+
+fun run_analyser_batch analyser files =
   let
     val req = OS.FileSys.tmpName ()
     val resp = OS.FileSys.tmpName ()
+    fun file_line (id, path) = HolbuildAnalysisProtocol.join ["file", id, path, "deps"]
     val request = String.concatWith "\n"
-      [HolbuildAnalysisProtocol.join ["version", HolbuildAnalysisProtocol.protocol_version],
-       HolbuildAnalysisProtocol.join ["command", "analyse"],
-       HolbuildAnalysisProtocol.join ["file", "1", source_path, "deps"],
-       HolbuildAnalysisProtocol.join ["end"]] ^ "\n"
+      ([HolbuildAnalysisProtocol.join ["version", HolbuildAnalysisProtocol.protocol_version],
+        HolbuildAnalysisProtocol.join ["command", "analyse"]] @
+       map file_line files @
+       [HolbuildAnalysisProtocol.join ["end"]]) ^ "\n"
     val _ = write_file req request
     val status = OS.Process.system (HolbuildHash.quote analyser ^ " --request " ^ HolbuildHash.quote req ^
                                     " --response " ^ HolbuildHash.quote resp)
     val _ = OS.FileSys.remove req handle OS.SysErr _ => ()
   in
     if OS.Process.isSuccess status then
-      let val deps = parse_analyser_response resp source_path
+      let val deps = parse_analyser_response resp files
           val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
       in deps end
     else
       let val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
-      in raise Error ("holbuild-hol-analyser failed for " ^ source_path) end
+      in raise Error "holbuild-hol-analyser failed" end
   end
 
-and write_file path text =
-  let val out = TextIO.openOut path
-  in TextIO.output(out, text); TextIO.closeOut out end
+fun extract_with_analyser analyser source_path =
+  case assoc "1" (run_analyser_batch analyser [("1", source_path)]) of
+      SOME deps => deps
+    | NONE => raise Error ("holbuild-hol-analyser returned no result for " ^ source_path)
 
 fun extract_uncached path =
   case !analyser_path of
@@ -329,6 +356,34 @@ fun extract_cached_with_hash {cache_path, source_path, source_hash} =
         in
           deps
         end
+
+fun prefetch_cached_with_hash requests =
+  let
+    fun enumerate i xs =
+      case xs of
+          [] => []
+        | x :: rest => (Int.toString i, x) :: enumerate (i + 1) rest
+    fun cached_or_missing ((id, req as {cache_path, source_path, source_hash}), (cached, missing)) =
+      case read_cache cache_path source_hash of
+          SOME deps => ((id, deps) :: cached, missing)
+        | NONE => (cached, (id, req) :: missing)
+    val (_, missing) = List.foldl cached_or_missing ([], []) (enumerate 1 requests)
+  in
+    case (!analyser_path, missing) of
+        (_, []) => ()
+      | (NONE, _) => ()
+      | (SOME analyser, _) =>
+          let
+            val files = map (fn (id, {source_path, ...}) => (id, source_path)) (rev missing)
+            val results = run_analyser_batch analyser files
+            fun store (id, deps) =
+              case assoc id missing of
+                  SOME {cache_path, source_hash, ...} => (write_cache cache_path source_hash deps handle _ => ())
+                | NONE => ()
+          in
+            List.app store results
+          end
+  end
 
 fun extract_cached {cache_path, source_path} =
   extract_cached_with_hash {cache_path = cache_path,

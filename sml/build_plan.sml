@@ -409,6 +409,10 @@ fun plan holdir sources targets =
             else HolbuildDependencies.set_analyser_path (HolbuildHolSharedCache.analyser_path_for_holdir holdir)
     val external_dirs = [normalize_path (Path.concat(holdir, "sigobj"))]
     val nodes = map (make_node external_dirs) sources
+    val _ = HolbuildDependencies.prefetch_cached_with_hash
+              (map (fn node => {cache_path = dependency_cache_path (source_of node),
+                                source_path = #source_path (source_of node),
+                                source_hash = source_hash_of node}) nodes)
     val index = build_name_index nodes
     val lookup = indexed_nodes_named index
     val roots = target_roots lookup nodes targets
