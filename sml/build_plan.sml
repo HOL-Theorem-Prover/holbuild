@@ -640,13 +640,49 @@ fun external_sources_for_name dirs name =
 
 fun prefetch_external_dependency_sources_with lookup nodes =
   let
-    fun paths_for_node node =
-      let val names = direct_external_libs_with lookup node @ direct_external_theories_with lookup node
-      in List.concat (map (external_sources_for_name (external_dirs_of node)) names) end
-    val paths = unique_strings (List.concat (map paths_for_node nodes))
+    fun item_id (dirs, name) = String.concatWith "\030" dirs ^ "\029" ^ name
+    fun seen item seen_ids = member (item_id item) seen_ids
+    fun add_unseen (item, items) =
+      if List.exists (fn existing => item_id existing = item_id item) items then items else item :: items
+    fun source_requests paths =
+      map (fn path => {source_path = path, source_hash = HolbuildHash.file_sha1 path}) paths
+    fun deps_for_path path =
+      let val source_hash = HolbuildHash.file_sha1 path
+      in HolbuildDependencies.extract_global_cached_with_hash {source_path = path, source_hash = source_hash} end
+    fun deps_names deps = #loads deps @ #holdep_mentions deps
+    fun names_for_sources paths = unique_strings (List.concat (map (deps_names o deps_for_path) paths))
+    fun follow_names dirs names =
+      List.filter (fn (_, name) => Option.isSome (external_artifact_path_in dirs name))
+        (map (fn name => (dirs, name)) names)
+    fun initial_items_for_node node =
+      let val dirs = external_dirs_of node
+          val names = direct_external_libs_with lookup node @ direct_external_theories_with lookup node
+      in map (fn name => (dirs, name)) names end
+    fun loop seen_ids pending =
+      case pending of
+          [] => ()
+        | _ =>
+            let
+              val fresh = List.filter (fn item => not (seen item seen_ids)) pending
+              val seen_ids' = List.foldl (fn (item, acc) => item_id item :: acc) seen_ids fresh
+              val paths = unique_strings (List.concat (map (fn (dirs, name) => external_sources_for_name dirs name) fresh))
+              val _ = HolbuildDependencies.prefetch_global_cached_with_hash (source_requests paths)
+              val next =
+                List.foldl
+                  (fn ((dirs, name), acc) =>
+                      let
+                        val source_paths = external_sources_for_name dirs name
+                        val names = names_for_sources source_paths
+                      in
+                        List.foldl add_unseen acc (follow_names dirs names)
+                      end)
+                  [] fresh
+            in
+              loop seen_ids' next
+            end
+    val initial = List.foldl add_unseen [] (List.concat (map initial_items_for_node nodes))
   in
-    HolbuildDependencies.prefetch_global_cached_with_hash
-      (map (fn path => {source_path = path, source_hash = HolbuildHash.file_sha1 path}) paths)
+    loop [] initial
   end
   handle HolbuildDependencies.Error msg => raise Error msg
 
