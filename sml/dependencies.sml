@@ -412,6 +412,16 @@ fun extract_global_cached_with_hash {source_path, source_hash} =
                                   source_path = source_path,
                                   source_hash = source_hash}
 
+fun prefetch_global_cached_with_hash requests =
+  case cache_root () of
+      NONE => ()
+    | SOME root =>
+        prefetch_cached_with_hash
+          (map (fn {source_path, source_hash} =>
+                  {cache_path = external_cache_path root source_hash,
+                   source_path = source_path,
+                   source_hash = source_hash}) requests)
+
 fun extract_global_cached source_path =
   extract_global_cached_with_hash {source_path = source_path,
                                    source_hash = HolbuildHash.file_sha1 source_path}

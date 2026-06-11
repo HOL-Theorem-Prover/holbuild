@@ -627,6 +627,29 @@ fun external_dependency_names_with timing sources =
 
 fun external_dependency_kind name = if theory_name name then "theory" else "lib"
 
+fun external_sources_for_name dirs name =
+  case external_artifact_path_in dirs name of
+      NONE => []
+    | SOME artifact =>
+        let
+          val resolved = resolved_link_path artifact
+          val stem = drop_object_suffix resolved
+        in
+          List.filter readable (external_source_candidates stem name)
+        end
+
+fun prefetch_external_dependency_sources_with lookup nodes =
+  let
+    fun paths_for_node node =
+      let val names = direct_external_libs_with lookup node @ direct_external_theories_with lookup node
+      in List.concat (map (external_sources_for_name (external_dirs_of node)) names) end
+    val paths = unique_strings (List.concat (map paths_for_node nodes))
+  in
+    HolbuildDependencies.prefetch_global_cached_with_hash
+      (map (fn path => {source_path = path, source_hash = HolbuildHash.file_sha1 path}) paths)
+  end
+  handle HolbuildDependencies.Error msg => raise Error msg
+
 (* External HOL objects are loaded from HOLDIR/sigobj, so their keys must reflect
    what HOL will load.  For theories, Holmake's .cachekey and the .dat hash are
    both acceptable semantic boundaries; recording both when available is stricter
@@ -777,6 +800,7 @@ fun add_input_key config_lines_for_node toolchain_key nodes (node, keys) =
 
 fun compute_input_keys_with lookup config_lines_for_node toolchain_key nodes =
   let
+    val _ = prefetch_external_dependency_sources_with lookup nodes
     val external_timing = new_external_timing ()
     val external_key = external_key_lookup_with_timing external_timing toolchain_key
     val keys =
