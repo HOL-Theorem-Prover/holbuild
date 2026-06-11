@@ -101,7 +101,7 @@ fun analyser_dir_for_key k ak = Path.concat(analysers_dir_for_key k, ak)
 fun analyser_bin_for_key k ak = Path.concat(Path.concat(analyser_dir_for_key k ak, "bin"), "holbuild-hol-analyser")
 fun analyser_ok_for_key k ak = Path.concat(analyser_dir_for_key k ak, "build.ok")
 fun analyser_manifest_for_key k ak = Path.concat(analyser_dir_for_key k ak, "manifest")
-fun locks_dir () = Path.concat(cache_root (), "locks")
+fun locks_dir () = Path.concat(toolchains_dir (), ".locks")
 fun lock_dir k = Path.concat(locks_dir (), "hol-toolchain-" ^ k ^ ".lock")
 
 fun holdir_for req = holdir_for_key (key req)
@@ -132,11 +132,16 @@ fun validate_entry req k =
   end
 
 fun acquire_lock k =
-  let val l = lock_dir k
+  let
+    val l = lock_dir k
+    fun wait 0 = die ("HOL toolchain cache is locked: " ^ l)
+      | wait n =
+          (FS.mkDir l; l)
+          handle OS.SysErr _ =>
+            (ignore (OS.Process.system "sleep 1"); wait (n - 1))
   in
     ensure_dir (locks_dir ());
-    (FS.mkDir l; l)
-    handle OS.SysErr _ => die ("HOL toolchain cache is locked: " ^ l)
+    wait 120
   end
 fun release_lock l = FS.rmDir l handle OS.SysErr _ => ()
 
