@@ -1,165 +1,120 @@
 structure HolbuildTheorySpans =
 struct
 
-fun bool_digit true = "1"
-  | bool_digit false = "0"
+structure P = HolbuildAnalysisProtocol
 
-fun proof_unit_report_line kind name theorem_start theorem_stop tactic_start tactic_end has_attrs =
-  String.concatWith "\t"
-    [kind, name, Int.toString theorem_start, Int.toString theorem_stop,
-     Int.toString tactic_start, Int.toString tactic_end, bool_digit has_attrs]
+fun read_all path =
+  let val input = TextIO.openIn path
+  in TextIO.inputAll input before TextIO.closeIn input end
 
-fun attr_args NONE = []
-  | attr_args (SOME {attrs, ...}) = #args attrs
+fun write_file path text =
+  let val out = TextIO.openOut path
+  in TextIO.output(out, text); TextIO.closeOut out end
 
-fun resume_label_and_attrs id attrs =
+fun int field text =
+  case Int.fromString text of
+      SOME n => n
+    | NONE => raise HolbuildTheoryCheckpoints.Error ("bad analyser " ^ field ^ ": " ^ text)
+
+fun analyser () =
+  case HolbuildDependencies.current_analyser_path () of
+      SOME path => path
+    | NONE => raise HolbuildTheoryCheckpoints.Error "internal error: HOL analyser is not configured"
+
+fun run want source_path =
   let
-    val args = attr_args attrs
-    val (label, rest) =
-      case args of
-          {key, bind = NONE} :: rest => (#2 key, rest)
-        | _ => ("", args)
-    fun is_smlname {key = (_, "smlname"), ...} = true
-      | is_smlname _ = false
-    val proof_attrs = List.filter (not o is_smlname) rest
-    val suffix = if label = "" then "" else "[" ^ label ^ "]"
+    val req = OS.FileSys.tmpName ()
+    val resp = OS.FileSys.tmpName ()
+    val err = OS.FileSys.tmpName ()
+    val request = String.concatWith "\n"
+      [P.join ["version", P.protocol_version],
+       P.join ["command", "analyse"],
+       P.join ["file", "1", source_path, want],
+       P.join ["end"]] ^ "\n"
+    val _ = write_file req request
+    val status = OS.Process.system (HolbuildHash.quote (analyser ()) ^ " --request " ^ HolbuildHash.quote req ^
+                                    " --response " ^ HolbuildHash.quote resp ^ " 2> " ^ HolbuildHash.quote err)
+    val stderr = read_all err handle _ => ""
+    val _ = OS.FileSys.remove req handle OS.SysErr _ => ()
+    val _ = OS.FileSys.remove err handle OS.SysErr _ => ()
   in
-    {name = id ^ suffix, has_attrs = not (null proof_attrs)}
+    if OS.Process.isSuccess status then
+      let val lines = String.tokens (fn c => c = #"\n") (read_all resp)
+          val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
+      in lines end
+    else
+      let val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
+      in raise HolbuildTheoryCheckpoints.Error ("holbuild-hol-analyser failed for " ^ source_path ^
+                                                (if stderr = "" then "" else "\n" ^ stderr)) end
   end
 
-fun theorem_report_lines result =
+fun parse_boundary fields =
+  case fields of
+      ["boundary", kind, name, safe_name, theorem_start, theorem_stop, boundary,
+       tactic_start, tactic_end, has_attrs, prefix_hash, tactic_text] =>
+        {kind = kind, name = name, safe_name = safe_name,
+         theorem_start = int "theorem_start" theorem_start,
+         theorem_stop = int "theorem_stop" theorem_stop,
+         boundary = int "boundary" boundary,
+         tactic_start = int "tactic_start" tactic_start,
+         tactic_end = int "tactic_end" tactic_end,
+         tactic_text = tactic_text,
+         has_proof_attrs = has_attrs = "1",
+         prefix_hash = prefix_hash}
+    | _ => raise HolbuildTheoryCheckpoints.Error "bad analyser boundary record"
+
+fun parse_termination fields =
+  case fields of
+      ["termination", name, safe_name, definition_start, definition_stop, boundary,
+       quote_start, quote_end, tactic_start, tactic_end, quote_text, tactic_text] =>
+        {name = name, safe_name = safe_name,
+         definition_start = int "definition_start" definition_start,
+         definition_stop = int "definition_stop" definition_stop,
+         boundary = int "boundary" boundary,
+         quote_start = int "quote_start" quote_start,
+         quote_end = int "quote_end" quote_end,
+         quote_text = quote_text,
+         tactic_start = int "tactic_start" tactic_start,
+         tactic_end = int "tactic_end" tactic_end,
+         tactic_text = tactic_text}
+    | _ => raise HolbuildTheoryCheckpoints.Error "bad analyser termination record"
+
+fun response_records want source_path =
   let
-    fun loop acc =
-      case #parseDec result () of
-          NONE => rev acc
-        | SOME (HOLSourceAST.HOLTheoremDecl {theorem_, id = (_, name), proof_, tac, stop, ...}) =>
-            let
-              val (tactic_start, tactic_end) = HOLSourceAST.expSpan tac
-              val has_attrs = case proof_ of SOME {attrs = SOME _, ...} => true | _ => false
-              val line = proof_unit_report_line "theorem" name theorem_ stop tactic_start tactic_end has_attrs
-            in
-              loop (line :: acc)
-            end
-        | SOME (HOLSourceAST.HOLResume {resume_, id = (_, id_name), attrs, tac, stop, ...}) =>
-            let
-              val (tactic_start, tactic_end) = HOLSourceAST.expSpan tac
-              val {name, has_attrs} = resume_label_and_attrs id_name attrs
-              val line = proof_unit_report_line "resume" name resume_ stop tactic_start tactic_end has_attrs
-            in
-              loop (line :: acc)
-            end
-        | SOME _ => loop acc
+    fun loop lines in_file acc errors =
+      case lines of
+          [] => raise HolbuildTheoryCheckpoints.Error "analyser response missing end"
+        | line :: rest =>
+            (case P.split line of
+                 ["version", v] =>
+                   if v = P.protocol_version then loop rest in_file acc errors
+                   else raise HolbuildTheoryCheckpoints.Error ("unsupported analyser protocol version: " ^ v)
+               | ["ok"] => loop rest in_file acc errors
+               | ["begin-file", "1"] => loop rest true acc errors
+               | ["end-file", "1"] => loop rest false acc errors
+               | ["end"] => (rev acc, rev errors)
+               | ["parse-error", text] => if in_file then loop rest in_file acc (text :: errors) else loop rest in_file acc errors
+               | fields => if in_file then loop rest in_file (fields :: acc) errors else loop rest in_file acc errors)
   in
-    loop []
+    loop (run want source_path) false [] []
   end
 
-fun qdecl_start (HOLSourceAST.QuoteLiteral (pos, _)) = pos
-  | qdecl_start (HOLSourceAST.QuoteAntiq {caret_, ...}) = caret_
-  | qdecl_start (HOLSourceAST.DefinitionLabel {left, ...}) = left
+fun scan source_path _ =
+  let val (records, _) = response_records "boundaries" source_path
+  in map parse_boundary records end
 
-fun qdecl_stop (HOLSourceAST.QuoteLiteral (pos, value)) = pos + size value
-  | qdecl_stop (HOLSourceAST.QuoteAntiq {exp, ...}) = #2 (HOLSourceAST.expSpan exp)
-  | qdecl_stop (HOLSourceAST.DefinitionLabel {stop, ...}) = stop
+fun scan_strict source_path _ =
+  let val (records, _) = response_records "boundaries-strict" source_path
+  in map parse_boundary records end
 
-fun first_qdecl_start [] fallback = fallback
-  | first_qdecl_start (q :: _) _ = qdecl_start q
+fun scan_with_recovery source_path _ =
+  let val (records, errors) = response_records "boundaries-recovering" source_path
+  in {boundaries = map parse_boundary records, errors = errors} end
 
-fun last_qdecl_stop [] fallback = fallback
-  | last_qdecl_stop [q] _ = qdecl_stop q
-  | last_qdecl_stop (_ :: rest) fallback = last_qdecl_stop rest fallback
+fun scan_terminations_strict source_path _ =
+  let val (records, _) = response_records "terminations-strict" source_path
+  in map parse_termination records end
 
-fun slice text start stop =
-  if start < 0 orelse stop < start orelse stop > size text then
-    raise HolbuildTheoryCheckpoints.Error "AST termination report span is outside source text"
-  else String.substring(text, start, stop - start)
-
-fun termination_diagnostics source result =
-  let
-    fun quote_start (SOME colon) _ _ = colon + 1
-      | quote_start NONE quote fallback = first_qdecl_start quote fallback
-    fun quote_end quote fallback = last_qdecl_stop quote fallback
-    fun diagnostic {definition_, name, colon, quote, termination_, tac, stop} =
-      let
-        val qstart = quote_start colon quote definition_
-        val qend = Int.min(termination_, quote_end quote termination_)
-        val (tactic_start, tactic_end) = HOLSourceAST.expSpan tac
-        val boundary = HolbuildTheoryCheckpoints.statement_boundary source stop
-      in
-        {name = name, safe_name = HolbuildTheoryCheckpoints.safe_name name,
-         definition_start = definition_, definition_stop = stop, boundary = boundary,
-         quote_start = qstart, quote_end = qend,
-         quote_text = slice source qstart qend,
-         tactic_start = tactic_start, tactic_end = tactic_end,
-         tactic_text = slice source tactic_start tactic_end}
-      end
-    fun loop acc =
-      case #parseDec result () of
-          NONE => rev acc
-        | SOME (HOLSourceAST.HOLDefinition {definition_, id = (_, name), colon, quote,
-                                            termination = SOME {termination_, tac}, stop, ...}) =>
-            loop (diagnostic {definition_ = definition_, name = name,
-                              colon = colon, quote = quote,
-                              termination_ = termination_, tac = tac,
-                              stop = stop} :: acc)
-        | SOME _ => loop acc
-  in
-    loop []
-  end
-
-fun parser_reader source_text =
-  let val fed = ref false
-  in fn _ => if !fed then "" else (fed := true; source_text) end
-
-fun ignore_parse_error _ _ _ = ()
-
-fun parse_error_text source_path source_text loc span msg =
-  (HolbuildTheoryDiagnostics.parse_error source_path source_text loc span msg; "")
-  handle Fail text => text
-
-fun raise_parse_error source_path source_text loc span msg =
-  raise HolbuildTheoryCheckpoints.Error
-    (parse_error_text source_path source_text loc span msg)
-
-fun scan_with_error_handler source_path source_text parse_error =
-  let
-    val result = HOLSourceParser.parseSML source_path (parser_reader source_text)
-                   parse_error HOLSourceParser.initialScope
-    val report = String.concatWith "\n" (theorem_report_lines result) ^ "\n"
-  in
-    HolbuildTheoryCheckpoints.discover_from_report {source = source_text, report = report}
-  end
-
-fun scan_with_recovery source_path source_text =
-  let
-    val errors = ref []
-    fun record_parse_error loc span msg =
-      errors := parse_error_text source_path source_text loc span msg :: !errors
-    val result = HOLSourceParser.parseSML source_path (parser_reader source_text)
-                   record_parse_error HOLSourceParser.initialScope
-    val report = String.concatWith "\n" (theorem_report_lines result) ^ "\n"
-    val boundaries = HolbuildTheoryCheckpoints.discover_from_report {source = source_text, report = report}
-  in
-    {boundaries = boundaries, errors = rev (!errors)}
-  end
-
-fun scan source_path source_text =
-  scan_with_error_handler source_path source_text ignore_parse_error
-
-fun scan_strict source_path source_text =
-  scan_with_error_handler source_path source_text (raise_parse_error source_path source_text)
-
-fun scan_terminations_with_error_handler source_path source_text parse_error =
-  let
-    val result = HOLSourceParser.parseSML source_path (parser_reader source_text)
-                   parse_error HOLSourceParser.initialScope
-  in
-    termination_diagnostics source_text result
-  end
-
-fun scan_terminations source_path source_text =
-  scan_terminations_with_error_handler source_path source_text ignore_parse_error
-
-fun scan_terminations_strict source_path source_text =
-  scan_terminations_with_error_handler source_path source_text (raise_parse_error source_path source_text)
+fun scan_terminations source_path source_text = scan_terminations_strict source_path source_text
 
 end

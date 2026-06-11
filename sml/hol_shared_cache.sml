@@ -12,8 +12,10 @@ val build_args = ""
 val analyser_format_version = "holbuild-hol-analyser-v1"
 val analyser_protocol_version = "1"
 val analyser_source_files =
-  ["analysis_protocol.sml",
+  ["../hash.sml",
+   "analysis_protocol.sml",
    "dependency_extract.sml",
+   "theory_span_extract.sml",
    "analyser_main.sml",
    "holbuild-hol-analyser-script.sml"]
 

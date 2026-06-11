@@ -13,10 +13,12 @@ fun analyser_src () =
 
 val compile_time_holdir = compile_holdir ();
 val source_dir = analyser_src ();
+val source_root = OS.Path.dir (OS.Path.dir source_dir);
 
 fun path_join (a, b) = OS.Path.concat(a, b);
 fun use_hol rel = use (path_join(compile_time_holdir, rel));
 fun use_src rel = use (path_join(source_dir, rel));
+fun use_root rel = use (path_join(source_root, rel));
 
 fun load_poly_hol_context () =
   let val origdir = OS.FileSys.getDir ()
@@ -29,13 +31,35 @@ fun load_poly_hol_context () =
 load_poly_hol_context ();
 Meta.quiet_load := true;
 
+fun quiet_holsource_use raw_file =
+  let
+    val file = holpathdb.subst_pathvars raw_file
+    val reader = HOLSource.fileToReader {quietOpen = false, print = fn _ => ()} file
+    fun line () = #line (#fileline reader ()) + 1
+  in
+    while not (#eof reader ()) do
+      PolyML.compiler
+        (#read reader,
+         [PolyML.Compiler.CPFileName file,
+          PolyML.Compiler.CPLineNo line,
+          PolyML.Compiler.CPOutStream (fn _ => ())])
+        ()
+  end;
+
+Meta.loadPlan quiet_holsource_use "TacticParse";
+
 use_hol("tools/Holmake/deps/Holdep_tokens.sig");
 use_hol("tools/Holmake/deps/Holdep_tokens.sml");
 use_hol("tools/Holmake/deps/Holdep.sig");
 use_hol("tools/Holmake/deps/Holdep.sml");
 
+use_hol("src/portableML/poly/SHA1_ML.sig");
+use_hol("src/portableML/poly/w64-SHA1.ML");
+use_root "sml/hash.sml";
+
 use_src "analysis_protocol.sml";
 use_src "dependency_extract.sml";
+use_src "theory_span_extract.sml";
 use_src "analyser_main.sml";
 
 fun main () = OS.Process.exit (HolbuildAnalyserMain.main (CommandLine.arguments()))

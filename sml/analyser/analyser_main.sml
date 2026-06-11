@@ -3,6 +3,7 @@ struct
 
 structure P = HolbuildAnalysisProtocol
 structure D = HolbuildAnalyserDependencyExtract
+structure S = HolbuildAnalyserTheorySpanExtract
 
 exception Error of string
 
@@ -44,11 +45,40 @@ fun emit_deps ({loads, uses, extra_deps, holdep_mentions} : D.t) =
   map (fn x => P.join ["extra-dep", x]) extra_deps @
   map (fn x => P.join ["mention", x]) holdep_mentions
 
+fun read_all_file path =
+  let val input = TextIO.openIn path
+  in TextIO.inputAll input before TextIO.closeIn input end
+
+fun emit_boundary ({kind, name, safe_name, theorem_start, theorem_stop, boundary, tactic_start,
+                    tactic_end, tactic_text, has_proof_attrs, prefix_hash} : S.boundary) =
+  P.join ["boundary", kind, name, safe_name, Int.toString theorem_start, Int.toString theorem_stop,
+          Int.toString boundary, Int.toString tactic_start, Int.toString tactic_end,
+          if has_proof_attrs then "1" else "0", prefix_hash, tactic_text]
+
+fun emit_termination ({name, safe_name, definition_start, definition_stop, boundary, quote_start,
+                       quote_end, quote_text, tactic_start, tactic_end, tactic_text} : S.termination) =
+  P.join ["termination", name, safe_name, Int.toString definition_start, Int.toString definition_stop,
+          Int.toString boundary, Int.toString quote_start, Int.toString quote_end,
+          Int.toString tactic_start, Int.toString tactic_end, quote_text, tactic_text]
+
+fun span_lines path wants =
+  let val text = read_all_file path
+  in
+    if member "boundaries-recovering" wants then
+      let val {boundaries, errors} = S.scan_recovering path text
+      in map emit_boundary boundaries @ map (fn e => P.join ["parse-error", e]) errors end
+    else if member "boundaries-strict" wants then map emit_boundary (S.scan_strict path text)
+    else if member "boundaries" wants then map emit_boundary (S.scan path text)
+    else if member "terminations-strict" wants then map emit_termination (S.scan_terminations_strict path text)
+    else []
+  end
+
 fun analyse_file ({id, path, wants} : file_req) =
   let
     val deps_lines = if null wants orelse member "deps" wants then emit_deps (D.extract path) else []
+    val span_lines = span_lines path wants
   in
-    P.join ["begin-file", id] :: deps_lines @ [P.join ["end-file", id]]
+    P.join ["begin-file", id] :: deps_lines @ span_lines @ [P.join ["end-file", id]]
   end
 
 fun response files =
@@ -70,6 +100,7 @@ fun main args =
           ((write_file resp (response (parse_request req)); OS.Process.success)
            handle Error msg => (TextIO.output(TextIO.stdErr, msg ^ "\n"); OS.Process.failure)
                 | D.Error msg => (TextIO.output(TextIO.stdErr, msg ^ "\n"); OS.Process.failure)
+                | S.Error msg => (TextIO.output(TextIO.stdErr, msg ^ "\n"); OS.Process.failure)
                 | e => (TextIO.output(TextIO.stdErr, General.exnMessage e ^ "\n"); OS.Process.failure))
       | _ => (TextIO.output(TextIO.stdErr, "usage: holbuild-hol-analyser --request FILE --response FILE\n"); OS.Process.failure)
 

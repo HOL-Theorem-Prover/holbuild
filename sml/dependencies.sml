@@ -19,6 +19,7 @@ val analyser_path : string option ref = ref NONE
 
 fun set_analyser_path path = analyser_path := SOME path
 fun clear_analyser_path () = analyser_path := NONE
+fun current_analyser_path () = !analyser_path
 
 fun has_suffix suffix s =
   let
