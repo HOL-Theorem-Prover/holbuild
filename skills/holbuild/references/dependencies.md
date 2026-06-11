@@ -19,7 +19,7 @@ The `hol` dependency is special:
 - it uses an exact commit hash, not a branch/tag/range
 - upstream HOL does not need a `holproject.toml`; holbuild uses its built-in HOL manifest for package metadata
 - built HOL trees are shared under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`
-- `${HOLBUILD_POLY:-poly} --script tools/smart-configure.sml` and `bin/build` are used to build a missing shared entry
+- `${HOLBUILD_POLY:-poly} --script tools/smart-configure.sml` and `bin/build --no-helpdocs` are used to build a missing shared entry
 - dirty, broken, or incomplete shared HOL entries are rejected until removed manually
 
 Use `holbuild buildhol` to warm this cache explicitly. Normal commands that need HOL build/reuse it automatically.
