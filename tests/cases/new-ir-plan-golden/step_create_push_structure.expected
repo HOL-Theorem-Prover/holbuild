@@ -1,0 +1,314 @@
+holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml (309 steps)
+  00 simp[step_create_def]
+  01 >> strip_tac
+  02 >> qmatch_asmsub_abbrev_tac`pop_stack n`
+  03 >> `preserves_same_frame (pop_stack n)`
+  04   >- simp[]
+  05 >> drule_at (Pat`bind`) bind_psf_grows_extract
+  06 >> simp[]
+  07 >> qpat_x_assum`_ = (_,_)`kall_tac
+  08 >> strip_tac
+  09 >> gvs[]
+  10 >> `sm.contexts ≠ []`
+  11   >- strip_tac >> gvs[same_frame_rel_def]
+  12 >> `LENGTH sm.contexts = LENGTH s.contexts`
+  13   >- gvs[same_frame_rel_def]
+  14 >> drule_at (Pat`bind`) bind_psf_grows_extract
+  15 >> simp[]
+  16 >> qpat_x_assum`_ sm = (_,_)`kall_tac
+  17 >> strip_tac
+  18 >> gvs[]
+  19 >> rename1`same_frame_rel sm s2`
+  20 >> `same_frame_rel s s2`
+  21   >- metis_tac[same_frame_rel_trans]
+  22 >> `s2.contexts ≠ [] ∧ LENGTH s2.contexts = LENGTH s.contexts`
+  23   >- rpt strip_tac >> gvs[same_frame_rel_def]
+  24 >> gvs[ignore_bind_def]
+  25 >> drule_at (Pat`bind`) bind_psf_grows_extract
+  26 >> simp[]
+  27 >> qpat_x_assum`_ _ = (_,_)`kall_tac
+  28 >> strip_tac
+  29 >> gvs[]
+  30 >> rename1`same_frame_rel s2 s3`
+  31 >> `same_frame_rel s s3`
+  32   >- metis_tac[same_frame_rel_trans]
+  33 >> `s3.contexts ≠ [] ∧ LENGTH s3.contexts = LENGTH s.contexts`
+  34   >- rpt strip_tac >> gvs[same_frame_rel_def]
+  35 >> drule_at (Pat`bind`) bind_psf_grows_extract
+  36 >> simp[]
+  37 >> qpat_x_assum`_ _ = (_,_)`kall_tac
+  38 >> strip_tac
+  39 >> gvs[]
+  40 >> rename1`same_frame_rel s3 s4`
+  41 >> `same_frame_rel s s4`
+  42   >- metis_tac[same_frame_rel_trans]
+  43 >> `s4.contexts ≠ [] ∧ LENGTH s4.contexts = LENGTH s.contexts`
+  44   >- rpt strip_tac >> gvs[same_frame_rel_def]
+  45 >> drule_at (Pat`bind`) bind_psf_grows_extract
+  46 >> simp[]
+  47 >> qpat_x_assum`_ _ = (_,_)`kall_tac
+  48 >> strip_tac
+  49 >> gvs[]
+  50 >> rename1`same_frame_rel s4 s5`
+  51 >> `same_frame_rel s s5`
+  52   >- metis_tac[same_frame_rel_trans]
+  53 >> `s5.contexts ≠ [] ∧ LENGTH s5.contexts = LENGTH s.contexts`
+  54   >- rpt strip_tac >> gvs[same_frame_rel_def]
+  55 >> drule_at (Pat`bind`) bind_psf_grows_extract
+  56 >> simp[]
+  57 >> qpat_x_assum`_ _ = (_,_)`kall_tac
+  58 >> strip_tac
+  59 >> gvs[]
+  60 >> rename1`same_frame_rel s5 s6`
+  61 >> `same_frame_rel s s6`
+  62   >- metis_tac[same_frame_rel_trans]
+  63 >> `s6.contexts ≠ [] ∧ LENGTH s6.contexts = LENGTH s.contexts`
+  64   >- rpt strip_tac >> gvs[same_frame_rel_def]
+  65 >> drule_at (Pat`bind`) bind_psf_grows_extract
+  66 >> simp[]
+  67 >> qpat_x_assum`_ _ = (_,_)`kall_tac
+  68 >> strip_tac
+  69 >> gvs[]
+  70 >> rename1`same_frame_rel s6 s7`
+  71 >> `same_frame_rel s s7`
+  72   >- metis_tac[same_frame_rel_trans]
+  73 >> `s7.contexts ≠ [] ∧ LENGTH s7.contexts = LENGTH s.contexts`
+  74   >- rpt strip_tac >> gvs[same_frame_rel_def]
+  75 >> drule_at (Pat`bind`) bind_psf_grows_extract
+  76 >> simp[]
+  77 >> qpat_x_assum`_ _ = (_,_)`kall_tac
+  78 >> strip_tac
+  79 >> gvs[]
+  80 >> rename1`same_frame_rel s7 s8`
+  81 >> `same_frame_rel s s8`
+  82   >- metis_tac[same_frame_rel_trans]
+  83 >> `s8.contexts ≠ [] ∧ LENGTH s8.contexts = LENGTH s.contexts`
+  84   >- rpt strip_tac >> gvs[same_frame_rel_def]
+  85 >> drule_at (Pat`bind`) bind_psf_grows_extract
+  86 >> simp[]
+  87 >> qpat_x_assum`_ _ = (_,_)`kall_tac
+  88 >> strip_tac
+  89 >> gvs[]
+  90 >> rename1`same_frame_rel s8 s9`
+  91 >> `same_frame_rel s s9`
+  92   >- metis_tac[same_frame_rel_trans]
+  93 >> `s9.contexts ≠ [] ∧ LENGTH s9.contexts = LENGTH s.contexts`
+  94   >- rpt strip_tac >> gvs[same_frame_rel_def]
+  95 >> drule_at (Pat`bind`) bind_psf_grows_extract
+  96 >> simp[]
+  97 >> qpat_x_assum`_ _ = (_,_)`kall_tac
+  98 >> strip_tac
+  99 >> gvs[]
+  100 >> rename1`same_frame_rel s9 s0`
+  101 >> `same_frame_rel s s0`
+  102   >- metis_tac[same_frame_rel_trans]
+  103 >> `s0.contexts ≠ [] ∧ LENGTH s0.contexts = LENGTH s.contexts`
+  104   >- rpt strip_tac >> gvs[same_frame_rel_def]
+  105 >> drule_at (Pat`bind`) bind_psf_grows_extract
+  106 >> simp[]
+  107 >> qpat_x_assum`_ _ = (_,_)`kall_tac
+  108 >> strip_tac
+  109 >> gvs[]
+  110 >> rename1`same_frame_rel s0 sa`
+  111 >> `same_frame_rel s sa`
+  112   >- metis_tac[same_frame_rel_trans]
+  113 >> `sa.contexts ≠ [] ∧ LENGTH sa.contexts = LENGTH s.contexts`
+  114   >- rpt strip_tac >> gvs[same_frame_rel_def]
+  115 >> drule_at (Pat`bind`) bind_psf_grows_extract
+  116 >> simp[]
+  117 >> qpat_x_assum`_ _ = (_,_)`kall_tac
+  118 >> strip_tac
+  119 >> gvs[]
+  120 >> rename1`same_frame_rel sa sb`
+  121 >> `same_frame_rel s sb`
+  122   >- metis_tac[same_frame_rel_trans]
+  123 >> `sb.contexts ≠ [] ∧ LENGTH sb.contexts = LENGTH s.contexts`
+  124   >- rpt strip_tac >> gvs[same_frame_rel_def]
+  125 >> drule_at (Pat`bind`) bind_psf_grows_extract
+  126 >> simp[]
+  127 >> qpat_x_assum`_ _ = (_,_)`kall_tac
+  128 >> strip_tac
+  129 >> gvs[]
+  130 >> rename1`same_frame_rel sb sc`
+  131 >> `same_frame_rel s sc`
+  132   >- metis_tac[same_frame_rel_trans]
+  133 >> `sc.contexts ≠ [] ∧ LENGTH sc.contexts = LENGTH s.contexts`
+  134   >- rpt strip_tac >> gvs[same_frame_rel_def]
+  135 >> drule_at (Pat`bind`) bind_psf_grows_extract
+  136 >> simp[]
+  137 >> qpat_x_assum`_ _ = (_,_)`kall_tac
+  138 >> strip_tac
+  139 >> gvs[]
+  140 >> rename1`same_frame_rel sc sd`
+  141 >> `same_frame_rel s sd`
+  142   >- metis_tac[same_frame_rel_trans]
+  143 >> `sd.contexts ≠ [] ∧ LENGTH sd.contexts = LENGTH s.contexts`
+  144   >- rpt strip_tac >> gvs[same_frame_rel_def]
+  145 >> drule_at (Pat`bind`) bind_psf_grows_extract
+  146 >> simp[]
+  147 >> qpat_x_assum`_ _ = (_,_)`kall_tac
+  148 >> strip_tac
+  149 >> gvs[]
+  150 >> rename1`same_frame_rel sd se`
+  151 >> `same_frame_rel s se`
+  152   >- metis_tac[same_frame_rel_trans]
+  153 >> `se.contexts ≠ [] ∧ LENGTH se.contexts = LENGTH s.contexts`
+  154   >- rpt strip_tac >> gvs[same_frame_rel_def]
+  155 >> gvs[Ntimes COND_RATOR 2]
+  156 >> qmatch_asmsub_abbrev_tac`COND bbb _ _ = (_, _)`
+  157 >> qpat_x_assum`COND bbb _ _ = _`mp_tac
+  158 >> IF_CASES_TAC
+  159 >- strip_tac
+  160    >> drule_at (Pat`_ = (_, s')`) psf_imp_length_contexts_preserved
+  161    >> simp[]
+  162    >- solved
+  163 >> IF_CASES_TAC
+  164 >- strip_tac
+  165    >> drule (REWRITE_RULE[length_preserves_def] length_preserves_abort_create_exists)
+  166    >> simp[]
+  167    >- solved
+  168 >> strip_tac
+  169 >> drule_all proceed_create_push_structure
+  170 >> strip_tac
+  171 >> `TL se.contexts = TL s.contexts`
+  172   >- gvs[same_frame_rel_def]
+  173 >> gvs[]
+  174 >> conj_asm1_tac
+  175 >- qpat_x_assum`same_frame_rel s se`mp_tac
+  176    >> simp[same_frame_rel_def]
+  177    >> strip_tac
+  178    >> Cases_on`s'.contexts`
+  179    >> gvs[]
+  180    >> Cases_on`t`
+  181    >> gvs[]
+  182    >> Cases_on`se.contexts`
+  183    >> gvs[]
+  184    >- solved
+  185 >> rewrite_tac[Ntimes CONJ_ASSOC 3]
+  186 >> conj_tac
+  187 >> list_tac REVERSE_LT
+  188 >- qpat_x_assum `proceed_create _ _ _ _ _ se = _` mp_tac
+  189    >> rewrite_tac[proceed_create_def]
+  190    >> simp[ignore_bind_def, bind_def, update_accounts_def, return_def,
+          get_rollback_def, get_original_def, set_original_def, fail_def]
+  191    >> strip_tac
+  192    >> gvs[]
+  193    >> drule push_context_effect
+  194    >> strip_tac
+  195    >> gvs[]
+  196    >> simp[lookup_storage_def, lookup_account_def]
+  197    >> qmatch_goalsub_abbrev_tac`SND (EL _ (slc uc _))`
+  198    >> qmatch_goalsub_abbrev_tac`(SND (EL _ icc)).accounts _`
+  199    >> gvs[push_context_def,return_def,execution_state_component_equality]
+  200    >> gvs[account_already_created_def,lookup_account_def]
+  201    >> Cases_on`s.contexts`
+  202 >- gvs[]
+  203    >> simp[]
+  204    >> Cases_on`se.contexts`
+  205 >- gvs[]
+  206    >> simp[Abbr`slc`]
+  207    >> gvs[set_last_accounts_def]
+  208    >> simp[EL_SNOC]
+  209    >> simp[Abbr`icc`]
+  210    >> qmatch_goalsub_abbrev_tac`EL (LENGTH t) (SNOC sn fr)`
+  211    >> `LENGTH fr = LENGTH t` by simp[Abbr`fr`]
+  212    >> pop_assum(SUBST1_TAC o SYM)
+  213    >> simp[EL_LENGTH_SNOC,Abbr`sn`]
+  214    >> gvs[Abbr`fr`]
+  215    >> `SND h = SND h'` by (
+      qpat_x_assum`same_frame_rel s se`mp_tac >>
+      simp[same_frame_rel_def]
+  216    >> simp[initial_msg_params_def]
+  217    >> qspec_then`t`FULL_STRUCT_CASES_TAC SNOC_CASES >> gvs[]
+  218    >> list_tac REVERSE_LT
+  219 >- simp[LAST_CONS_SNOC, FRONT_CONS_SNOC]
+  220    >> conj_tac
+  221 >- Cases
+  222    >> simp[EL_SNOC]
+  223    >- solved
+  224    >> simp[Abbr`uc`, update_account_def, APPLY_UPDATE_THM]
+  225    >> gen_tac
+  226    >> simp[LAST_CONS_SNOC]
+  227    >- solved
+  228    >> simp[Abbr`uc`, lookup_account_def, update_account_def, APPLY_UPDATE_THM]
+  229    >- solved
+  230 >> simp[GSYM CONJ_ASSOC]
+  231 >> conj_tac
+  232 >> list_tac REVERSE_LT
+  233 >- reverse conj_tac
+  234 >- metis_tac[SUBSET_TRANS, same_frame_rel_def]
+  235    >> qpat_x_assum`same_frame_rel s se`mp_tac
+  236    >> simp[same_frame_rel_def]
+  237    >> strip_tac
+  238    >> Cases_on`s.contexts`
+  239 >- gvs[]
+  240    >> simp[]
+  241    >> Cases_on`s'.contexts`
+  242 >- gvs[]
+  243    >> simp[]
+  244    >> Cases_on`t'`
+  245 >- gvs[]
+  246    >> simp[]
+  247    >> Cases_on`se.contexts`
+  248 >- gvs[]
+  249    >> fs[]
+  250    >- solved
+  251 >> qpat_x_assum `proceed_create _ _ _ _ _ se = _` mp_tac
+  252 >> simp[proceed_create_def]
+  253 >> simp[ignore_bind_def, bind_def, update_accounts_def, return_def,
+          get_rollback_def, get_original_def, set_original_def, fail_def]
+  254 >> strip_tac
+  255 >> gvs[]
+  256 >> drule push_context_effect
+  257 >> strip_tac
+  258 >> gvs[]
+  259 >> rpt strip_tac
+  260 >> `i < LENGTH se.contexts`
+  261   >- gvs[same_frame_rel_def]
+  262 >> simp[set_last_accounts_def]
+  263 >> qmatch_goalsub_abbrev_tac`SNOC new`
+  264 >> qhdtm_x_assum`push_context` kall_tac
+  265 >> qpat_x_assum`_ = TL s.contexts`mp_tac
+  266 >> simp[LIST_EQ_REWRITE]
+  267 >> rewrite_tac[GSYM EL]
+  268 >> Cases_on`i=0`
+  269 >- Cases_on`FRONT se.contexts = []`
+  270 >- gvs[]
+  271    >> gvs[Abbr`new`]
+  272    >> Cases_on`se.contexts`
+  273    >> gvs[]
+  274    >> Cases_on`s.contexts`
+  275    >> gvs[]
+  276    >> qpat_x_assum`same_frame_rel s se`mp_tac
+  277    >> simp[same_frame_rel_def]
+  278    >- solved
+  279    >> rewrite_tac[GSYM EL]
+  280    >> DEP_REWRITE_TAC[EL_SNOC]
+  281    >> simp[LENGTH_FRONT]
+  282    >> simp[PRE_SUB1]
+  283    >> Cases_on`se.contexts`
+  284    >> gvs[]
+  285    >> Cases_on`s.contexts`
+  286    >> gvs[]
+  287    >> Cases_on`t`
+  288    >> gvs[]
+  289    >> qpat_x_assum`same_frame_rel s se`mp_tac
+  290    >> simp[same_frame_rel_def]
+  291    >- solved
+  292 >> Cases_on`i = LENGTH s.contexts - 1`
+  293 >- `i = LENGTH (FRONT se.contexts)`
+  294 >- simp[LENGTH_FRONT]
+  295    >> pop_assum SUBST1_TAC
+  296    >> simp[EL_LENGTH_SNOC]
+  297    >> simp[Abbr`new`, LENGTH_FRONT, GSYM LAST_EL]
+  298    >> simp[LAST_EL]
+  299    >> strip_tac
+  300    >> AP_TERM_TAC
+  301    >> AP_TERM_TAC
+  302    >> first_x_assum(qspec_then`PRE i`mp_tac)
+  303    >> simp[PRE_SUB1,ADD1]
+  304    >- solved
+  305 >> strip_tac
+  306 >> simp[EL_SNOC, LENGTH_FRONT, EL_FRONT, NULL_EQ]
+  307 >> first_x_assum(qspec_then`PRE i`mp_tac)
+  308 >> simp[ADD1, PRE_SUB1]

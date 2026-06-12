@@ -45,6 +45,17 @@ check_plan() {
   fi
 }
 
+check_plan_file() {
+  local theorem=$1
+  local expected=$2
+  local actual=$tmpdir/$theorem.actual
+  (cd "$project" && "$HOLBUILD_BIN" execution-plan ATheory:"$theorem") > "$actual" 2>&1
+  if ! diff -u "$expected" "$actual"; then
+    echo "new-ir plan mismatch for $theorem" >&2
+    exit 1
+  fi
+}
+
 cat >> "$project/src/AScript.sml" <<'SML'
 Theorem thenl_literal_plan:
   T /\ T
@@ -639,4 +650,146 @@ holbuild proof-ir plan ATheory:select_then1_plan source=src/AScript.sml (3 steps
   00 CONJ_TAC
   01 >> list_tac Q.SELECT_GOALS_LT_THEN1 [`T`] (ACCEPT_TAC TRUTH)
   02 >> ACCEPT_TAC TRUTH
+EXPECTED
+
+cat >> "$project/src/AScript.sml" <<'SML'
+Theorem grouped_prefix_plan:
+  T
+Proof
+  rpt gen_tac >> strip_tac >> qpat_x_assum `step s = _` mp_tac >> simp[]
+QED
+SML
+check_plan grouped_prefix_plan <<'EXPECTED'
+holbuild proof-ir plan ATheory:grouped_prefix_plan source=src/AScript.sml (4 steps)
+  00 rpt gen_tac
+  01 >> strip_tac
+  02 >> qpat_x_assum `step s = _` mp_tac
+  03 >> simp[]
+EXPECTED
+
+cat >> "$project/src/AScript.sml" <<'SML'
+Theorem first_try_repeat_plan:
+  T
+Proof
+  FIRST [NO_TAC, TRY NO_TAC, REPEAT NO_TAC, ACCEPT_TAC TRUTH]
+QED
+SML
+check_plan first_try_repeat_plan <<'EXPECTED'
+holbuild proof-ir plan ATheory:first_try_repeat_plan source=src/AScript.sml (8 steps)
+  00 FIRST
+  01   NO_TAC
+  02   |
+  03   TRY NO_TAC
+  04   |
+  05   REPEAT NO_TAC
+  06   |
+  07   ACCEPT_TAC TRUTH
+EXPECTED
+
+cat >> "$project/src/AScript.sml" <<'SML'
+Theorem nth_goal_expr_plan:
+  T /\ T /\ T
+Proof
+  rpt CONJ_TAC >>> NTH_GOAL (ACCEPT_TAC TRUTH) (1 + 1) >>> TACS_TO_LT [ACCEPT_TAC TRUTH, ACCEPT_TAC TRUTH]
+QED
+SML
+check_plan nth_goal_expr_plan <<'EXPECTED'
+holbuild proof-ir plan ATheory:nth_goal_expr_plan source=src/AScript.sml (3 steps)
+  00 rpt CONJ_TAC
+  01 >> list_tac NTH_GOAL (ACCEPT_TAC TRUTH) (1 + 1)
+  02 >> list_tac TACS_TO_LT [ACCEPT_TAC TRUTH, ACCEPT_TAC TRUTH]
+EXPECTED
+
+cat >> "$project/src/AScript.sml" <<'SML'
+Theorem split_expr_plan:
+  T /\ T
+Proof
+  CONJ_TAC >>> SPLIT_LT (1 + 0) (TACS_TO_LT [ACCEPT_TAC TRUTH], TACS_TO_LT [ACCEPT_TAC TRUTH])
+QED
+SML
+check_plan split_expr_plan <<'EXPECTED'
+holbuild proof-ir plan ATheory:split_expr_plan source=src/AScript.sml (2 steps)
+  00 CONJ_TAC
+  01 >> list_tac SPLIT_LT (1 + 0) (TACS_TO_LT [ACCEPT_TAC TRUTH], TACS_TO_LT [ACCEPT_TAC TRUTH])
+EXPECTED
+
+cat "$SCRIPT_DIR/../goalfrag-plan-golden/step_create_push_structure.sml" >> "$project/src/AScript.sml"
+check_plan_file step_create_push_structure "$SCRIPT_DIR/step_create_push_structure.expected"
+
+cat >> "$project/src/AScript.sml" <<'SML'
+Theorem reverse_thenl_gap_plan:
+  T
+Proof
+  CONJ_TAC
+  \\ Tactical.REVERSE (TRY CONJ_TAC) THENL
+     [ACCEPT_TAC TRUTH, ACCEPT_TAC TRUTH, ACCEPT_TAC TRUTH]
+QED
+SML
+check_plan reverse_thenl_gap_plan <<'EXPECTED'
+holbuild proof-ir plan ATheory:reverse_thenl_gap_plan source=src/AScript.sml (3 steps)
+  00 CONJ_TAC
+  01 >> Tactical.REVERSE (TRY CONJ_TAC)
+  02 >| [...]
+EXPECTED
+
+cat >> "$project/src/AScript.sml" <<'SML'
+Theorem map_aliases_gap_plan:
+  T /\ T
+Proof
+  CONJ_TAC
+  >- MAP_EVERY (fn th => ACCEPT_TAC th) [TRUTH]
+  >> MAP_FIRST (fn th => ACCEPT_TAC th) [TRUTH]
+QED
+SML
+check_plan map_aliases_gap_plan <<'EXPECTED'
+holbuild proof-ir plan ATheory:map_aliases_gap_plan source=src/AScript.sml (5 steps)
+  00 CONJ_TAC
+  01 >- (fn th => ACCEPT_TAC th) TRUTH
+  02    >- solved
+  03 >> FIRST
+  04   (fn th => ACCEPT_TAC th) TRUTH
+EXPECTED
+
+cat >> "$project/src/AScript.sml" <<'SML'
+Theorem nested_combinators_gap_plan:
+  T /\ T /\ T
+Proof
+  rpt strip_tac
+  >> CONJ_TAC
+  >- (TRY CONJ_TAC >> ACCEPT_TAC TRUTH)
+  >> reverse CONJ_TAC
+  >- (sg `T` >- ACCEPT_TAC TRUTH >> ACCEPT_TAC TRUTH)
+  >> ACCEPT_TAC TRUTH
+QED
+SML
+check_plan nested_combinators_gap_plan <<'EXPECTED'
+holbuild proof-ir plan ATheory:nested_combinators_gap_plan source=src/AScript.sml (12 steps)
+  00 rpt strip_tac
+  01 >> CONJ_TAC
+  02 >- TRY CONJ_TAC
+  03    >> ACCEPT_TAC TRUTH
+  04    >- solved
+  05 >> CONJ_TAC
+  06 >> list_tac REVERSE_LT
+  07 >- `T`
+  08 >- ACCEPT_TAC TRUTH
+  09    >> ACCEPT_TAC TRUTH
+  10    >- solved
+  11 >> ACCEPT_TAC TRUTH
+EXPECTED
+
+cat >> "$project/src/AScript.sml" <<'SML'
+Theorem no_lt_orelse_gap_plan:
+  T
+Proof
+  ALL_TAC >>> (NO_LT ORELSE_LT TACS_TO_LT [ACCEPT_TAC TRUTH])
+QED
+SML
+check_plan no_lt_orelse_gap_plan <<'EXPECTED'
+holbuild proof-ir plan ATheory:no_lt_orelse_gap_plan source=src/AScript.sml (5 steps)
+  00 ALL_TAC
+  01 >> list_tac ORELSE_LT
+  02   NO_LT
+  03   |
+  04   TACS_TO_LT [ACCEPT_TAC TRUTH]
 EXPECTED
