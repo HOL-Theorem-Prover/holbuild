@@ -2017,24 +2017,18 @@ fun failed_prefix_resume_source policy timeout_marker plan_only_marker source ch
        trace_all = goalfrag_trace policy,
        plan_only_marker = plan_only_marker,
        new_ir = proof_ir_enabled policy}
-    val prelude =
-      if proof_ir_enabled policy then
-        HolbuildTheoryCheckpoints.runtime_reinstall_prelude runtime_config
-      else
-        HolbuildTheoryCheckpoints.runtime_prelude runtime_config [checkpoint]
+    val prelude = HolbuildTheoryCheckpoints.runtime_reinstall_prelude runtime_config
     fun source_slice start stop = String.substring(source, start, stop - start)
     val theorem_binding = #safe_name checkpoint
     val finish_failed_prefix_call =
       String.concat
-        [(if proof_ir_enabled policy then "HolbuildProofRuntime.finish_failed_prefix " else "HolbuildGoalfragRuntime.finish_failed_prefix "),
+        ["HolbuildProofRuntime.finish_failed_prefix ",
          HolbuildToolchain.sml_string (#name checkpoint), " ",
          HolbuildToolchain.sml_string prefix_text, " ",
          Int.toString step_count, " ",
          HolbuildToolchain.sml_string (#tactic_text checkpoint),
-         (if proof_ir_enabled policy then
-            " " ^ HolbuildToolchain.sml_string (#failed_prefix_path checkpoint) ^
-            " " ^ HolbuildToolchain.sml_string (#failed_prefix_ok checkpoint)
-          else "")]
+         " " ^ HolbuildToolchain.sml_string (#failed_prefix_path checkpoint) ^
+         " " ^ HolbuildToolchain.sml_string (#failed_prefix_ok checkpoint)]
     val theorem_save_line =
       String.concat
         ["val ", theorem_binding, " = Theory.save_thm(",
@@ -2097,14 +2091,9 @@ fun proof_ir_failed_prefix_repl_bootstrap () =
      "  handle e =>",
      "    print (\"holbuild: could not install failed proof state in proof manager: \" ^ General.exnMessage e ^ \"\\n\");"] ^ "\n"
 
-fun goalfrag_failed_prefix_repl_bootstrap () =
-  "val _ = print \"holbuild: failed proof state loaded; run p(); or proofManagerLib.p(); to inspect it.\\n\";\n"
-
 fun failure_repl_bootstrap_source policy checkpoint =
   case checkpoint of
-      FailedPrefixRepl _ =>
-        if proof_ir_enabled policy then proof_ir_failed_prefix_repl_bootstrap ()
-        else goalfrag_failed_prefix_repl_bootstrap ()
+      FailedPrefixRepl _ => proof_ir_failed_prefix_repl_bootstrap ()
     | OtherReplCheckpoint _ =>
         "val _ = print \"holbuild: loaded checkpoint has no active proof state.\\n\";\n"
 

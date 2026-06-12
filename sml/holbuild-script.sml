@@ -45,8 +45,6 @@ fun quiet_holsource_use raw_file =
         ()
   end;
 
-Meta.loadPlan quiet_holsource_use "TacticParse";
-
 use_hol("tools/Holmake/toml/TOMLvalue_dtype.sml");
 use_hol("tools/Holmake/toml/TOMLvalue.sig");
 use_hol("tools/Holmake/toml/TOMLvalue.sml");
@@ -64,6 +62,9 @@ use_hol("tools/Holmake/util/terminal_primitives.sig");
 use_hol("tools/Holmake/util/poly-terminal-prims.ML");
 use_hol("src/portableML/poly/SHA1_ML.sig");
 use_hol("src/portableML/poly/w64-SHA1.ML");
+use_hol("src/portableML/poly/ConcIsaLib.sml");
+use_hol("src/portableML/Redblackset.sig");
+use_hol("src/portableML/Redblackset.sml");
 
 use "sml/hash.sml";
 use "sml/builtin_manifests.sml";
@@ -86,8 +87,7 @@ use "sml/theory_spans.sml";
 use "sml/cache.sml";
 use "sml/build_exec.sml";
 use "sml/tactic_timeout_policy.sml";
-use "sml/goalfrag_plan.sml";
-use "sml/proof_ir.sml";
+use "sml/proof_ir_types.sml";
 use "sml/commands.sml";
 
 fun main () = HolbuildCommands.main (CommandLine.arguments())

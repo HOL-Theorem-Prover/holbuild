@@ -13,7 +13,7 @@ fun read_all path =
 
 fun plan_text {name, tactic_start, tactic_end, tactic_text} =
   {name = name, tactic_start = tactic_start, tactic_end = tactic_end,
-   steps = HolbuildProofIr.steps tactic_text}
+   steps = HolbuildProofIrPlanner.steps tactic_text}
   handle e => raise Error ("proof IR extraction failed for " ^ name ^ ": " ^ General.exnMessage e)
 
 fun plans path =

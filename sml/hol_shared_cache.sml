@@ -16,6 +16,7 @@ val analyser_source_files =
    "analysis_protocol.sml",
    "dependency_extract.sml",
    "theory_span_extract.sml",
+   "../proof_ir_types.sml",
    "../proof_ir.sml",
    "proof_ir_extract.sml",
    "analyser_main.sml",

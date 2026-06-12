@@ -154,9 +154,7 @@ fun runtime_lines lines =
   String.concat (map (fn line => line ^ "\n") lines)
 
 val runtime_load_lines =
-  ["load \"HOLSourceParser\";",
-   "load \"TacticParse\";",
-   "load \"smlExecute\";",
+  ["load \"smlExecute\";",
    "load \"smlTimeout\";"]
 
 val termination_runtime_lines =
@@ -198,21 +196,13 @@ fun option_real_sml NONE = "NONE : real option"
 fun option_string_sml NONE = "NONE : string option"
   | option_string_sml (SOME s) = "SOME " ^ HolbuildToolchain.sml_string s
 
-fun runtime_helper_path () =
-  case OS.Process.getEnv "HOLBUILD_GOALFRAG_RUNTIME" of
-      SOME path => path
-    | NONE => OS.Path.concat(HolbuildRuntimePaths.source_root, "sml/goalfrag_runtime.sml")
-
 fun proof_ir_runtime_helper_path () =
   case OS.Process.getEnv "HOLBUILD_PROOF_IR_RUNTIME" of
       SOME path => path
     | NONE => OS.Path.concat(HolbuildRuntimePaths.source_root, "sml/proof_runtime.sml")
 
-fun goalfrag_plan_helper_path () =
-  OS.Path.concat(HolbuildRuntimePaths.source_root, "sml/goalfrag_plan.sml")
-
 fun proof_ir_helper_path () =
-  OS.Path.concat(HolbuildRuntimePaths.source_root, "sml/proof_ir.sml")
+  OS.Path.concat(HolbuildRuntimePaths.source_root, "sml/proof_ir_types.sml")
 
 fun checkpoint_save_runtime_helper_path () =
   OS.Path.concat(HolbuildRuntimePaths.source_root, "sml/checkpoint_save_runtime.sml")
@@ -222,32 +212,18 @@ fun declaration_checkpoint_runtime_prelude [] = ""
       runtime_lines ["use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";"]
 
 fun runtime_install_lines {checkpoint_enabled, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} =
-  if new_ir then
-    ["use " ^ HolbuildToolchain.sml_string (proof_ir_helper_path ()) ^ ";",
-     "use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";",
-     "use " ^ HolbuildToolchain.sml_string (proof_ir_runtime_helper_path ()) ^ ";",
-     "val _ = HolbuildProofRuntime.install {checkpoint_enabled = " ^
-       (if checkpoint_enabled then "true" else "false") ^
-       ", tactic_timeout = " ^ option_real_sml tactic_timeout ^
-       ", timeout_marker = " ^ option_string_sml timeout_marker ^
-       ", plan_theorem = " ^ option_string_sml plan_theorem ^
-       ", trace_all = " ^ (if trace_all then "true" else "false") ^
-       ", plan_only_marker = " ^ option_string_sml plan_only_marker ^ "};",
-     "val holbuild_begin_theorem = HolbuildProofRuntime.begin_theorem;",
-     "val holbuild_save_theorem_context = HolbuildProofRuntime.save_theorem_context;"]
-  else
-    ["use " ^ HolbuildToolchain.sml_string (goalfrag_plan_helper_path ()) ^ ";",
-     "use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";",
-     "use " ^ HolbuildToolchain.sml_string (runtime_helper_path ()) ^ ";",
-     "val _ = HolbuildGoalfragRuntime.install {checkpoint_enabled = " ^
-       (if checkpoint_enabled then "true" else "false") ^
-       ", tactic_timeout = " ^ option_real_sml tactic_timeout ^
-       ", timeout_marker = " ^ option_string_sml timeout_marker ^
-       ", plan_theorem = " ^ option_string_sml plan_theorem ^
-       ", trace_all = " ^ (if trace_all then "true" else "false") ^
-       ", plan_only_marker = " ^ option_string_sml plan_only_marker ^ "};",
-     "val holbuild_begin_theorem = HolbuildGoalfragRuntime.begin_theorem;",
-     "val holbuild_save_theorem_context = HolbuildGoalfragRuntime.save_theorem_context;"]
+  ["use " ^ HolbuildToolchain.sml_string (proof_ir_helper_path ()) ^ ";",
+   "use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";",
+   "use " ^ HolbuildToolchain.sml_string (proof_ir_runtime_helper_path ()) ^ ";",
+   "val _ = HolbuildProofRuntime.install {checkpoint_enabled = " ^
+     (if checkpoint_enabled then "true" else "false") ^
+     ", tactic_timeout = " ^ option_real_sml tactic_timeout ^
+     ", timeout_marker = " ^ option_string_sml timeout_marker ^
+     ", plan_theorem = " ^ option_string_sml plan_theorem ^
+     ", trace_all = " ^ (if trace_all then "true" else "false") ^
+     ", plan_only_marker = " ^ option_string_sml plan_only_marker ^ "};",
+   "val holbuild_begin_theorem = HolbuildProofRuntime.begin_theorem;",
+   "val holbuild_save_theorem_context = HolbuildProofRuntime.save_theorem_context;"]
 
 
 fun runtime_prelude _ [] = ""
@@ -256,28 +232,16 @@ fun runtime_prelude _ [] = ""
 fun runtime_reinstall_prelude {checkpoint_enabled, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} =
   let
     val install =
-      if new_ir then
-        ["use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";",
-         "val _ = HolbuildProofRuntime.install {checkpoint_enabled = " ^
-           (if checkpoint_enabled then "true" else "false") ^
-           ", tactic_timeout = " ^ option_real_sml tactic_timeout ^
-           ", timeout_marker = " ^ option_string_sml timeout_marker ^
-           ", plan_theorem = " ^ option_string_sml plan_theorem ^
-           ", trace_all = " ^ (if trace_all then "true" else "false") ^
-           ", plan_only_marker = " ^ option_string_sml plan_only_marker ^ "};",
-         "val holbuild_begin_theorem = HolbuildProofRuntime.begin_theorem;",
-         "val holbuild_save_theorem_context = HolbuildProofRuntime.save_theorem_context;"]
-      else
-        ["use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";",
-         "val _ = HolbuildGoalfragRuntime.install {checkpoint_enabled = " ^
-           (if checkpoint_enabled then "true" else "false") ^
-           ", tactic_timeout = " ^ option_real_sml tactic_timeout ^
-           ", timeout_marker = " ^ option_string_sml timeout_marker ^
-           ", plan_theorem = " ^ option_string_sml plan_theorem ^
-           ", trace_all = " ^ (if trace_all then "true" else "false") ^
-           ", plan_only_marker = " ^ option_string_sml plan_only_marker ^ "};",
-         "val holbuild_begin_theorem = HolbuildGoalfragRuntime.begin_theorem;",
-         "val holbuild_save_theorem_context = HolbuildGoalfragRuntime.save_theorem_context;"]
+      ["use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";",
+       "val _ = HolbuildProofRuntime.install {checkpoint_enabled = " ^
+         (if checkpoint_enabled then "true" else "false") ^
+         ", tactic_timeout = " ^ option_real_sml tactic_timeout ^
+         ", timeout_marker = " ^ option_string_sml timeout_marker ^
+         ", plan_theorem = " ^ option_string_sml plan_theorem ^
+         ", trace_all = " ^ (if trace_all then "true" else "false") ^
+         ", plan_only_marker = " ^ option_string_sml plan_only_marker ^ "};",
+       "val holbuild_begin_theorem = HolbuildProofRuntime.begin_theorem;",
+       "val holbuild_save_theorem_context = HolbuildProofRuntime.save_theorem_context;"]
   in
     runtime_lines install
   end

@@ -301,18 +301,12 @@ fun analyser_proof_ir_plan_for_boundary (boundary : HolbuildTheoryCheckpoints.bo
   end
 
 fun print_static_goalfrag_plan project new_ir source theorem boundary_opt =
-  (print (if new_ir then
-            let val plan = analyser_proof_ir_plan_for_boundary (case boundary_opt of SOME b => b | NONE => raise Error "internal error: missing proof-IR boundary")
-            in
-              "holbuild proof-ir plan " ^ #logical_name source ^ ":" ^ theorem ^ " source=" ^ #relative_path source ^
-              " (" ^ Int.toString (HolbuildProofIr.display_step_count plan) ^ " steps)\n" ^
-              HolbuildProofIr.format_plan_lines plan
-            end
-          else
-            HolbuildGoalfragPlan.format_tactic {theory = #logical_name source,
-                                                theorem = theorem,
-                                                source = #relative_path source}
-              (#tactic_text (case boundary_opt of SOME b => b | NONE => raise Error "internal error: missing goalfrag boundary")));
+  (print (let val plan = analyser_proof_ir_plan_for_boundary (case boundary_opt of SOME b => b | NONE => raise Error "internal error: missing proof-IR boundary")
+          in
+            "holbuild proof-ir plan " ^ #logical_name source ^ ":" ^ theorem ^ " source=" ^ #relative_path source ^
+            " (" ^ Int.toString (HolbuildProofIr.display_step_count plan) ^ " steps)\n" ^
+            HolbuildProofIr.format_plan_lines plan
+          end);
    TextIO.flushOut TextIO.stdOut)
 
 fun find_theory_source index theory =

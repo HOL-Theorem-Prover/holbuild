@@ -142,7 +142,8 @@ fun save_failed_prefix_checkpoint () =
             val _ = save_checkpoint "failed_prefix" false failed_prefix_path failed_prefix_ok depth
             val _ = write_text_file (failed_prefix_path ^ ".meta") meta_text
             val _ = write_text_file (failed_prefix_path ^ ".prefix") prefix_text
-            val _ = save_failed_prefix_steps failed_prefix_path (Option.getOpt(!active_plan_ref, HolbuildProofIr.steps (!active_tactic_text_ref))) step_count
+            val plan = case !active_plan_ref of SOME p => p | NONE => raise Fail "internal error: proof-IR plan is not installed"
+            val _ = save_failed_prefix_steps failed_prefix_path plan step_count
           in () end
 
 fun restore_failed_prefix_checkpoint_info (name, tactic_text, failed_prefix_path, failed_prefix_ok) =
@@ -749,7 +750,7 @@ fun with_theorem_trace name f =
 fun proof_ir_prove name end_path end_ok checkpoint_depth g original_tac tactic_text =
   let
     val _ = active_tactic_text_ref := tactic_text
-    val plan = Option.getOpt(!active_plan_ref, HolbuildProofIr.steps tactic_text)
+    val plan = case !active_plan_ref of SOME p => p | NONE => raise Fail "internal error: proof-IR plan is not installed"
     val _ = trace_plan name plan
     val _ = stop_after_plan_if_requested ()
   in
@@ -839,7 +840,7 @@ fun finish_failed_prefix name old_prefix_text old_step_count tactic_text failed_
        with_theorem_trace name (fn () =>
         let
           val _ = active_tactic_text_ref := tactic_text
-          val plan = Option.getOpt(!active_plan_ref, HolbuildProofIr.steps tactic_text)
+          val plan = case !active_plan_ref of SOME p => p | NONE => raise Fail "internal error: proof-IR plan is not installed"
           val _ = ensure_history_limit (Int.max(length plan + 1, old_step_count + 1))
           val _ = trace_plan name plan
           val _ = stop_after_plan_if_requested ()

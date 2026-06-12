@@ -56,6 +56,7 @@ use_hol("tools/Holmake/deps/Holdep.sml");
 use_hol("src/portableML/poly/SHA1_ML.sig");
 use_hol("src/portableML/poly/w64-SHA1.ML");
 use_root "sml/hash.sml";
+use_root "sml/proof_ir_types.sml";
 use_root "sml/proof_ir.sml";
 
 use_src "analysis_protocol.sml";
