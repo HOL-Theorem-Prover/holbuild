@@ -1675,7 +1675,11 @@ fun failed_prefix_ok proof_engine proof_timeout deps_key safe_name pre_hash head
      ("header_key", header_hash),
      ("failure_diagnostic_key", failed_prefix_diagnostic_key proof_engine)]
 
-fun theorem_checkpoint_specs proof_engine proof_timeout project node deps_key source boundaries =
+fun theorem_checkpoint_specs proof_engine proof_timeout project node deps_key source proof_ir_plans boundaries =
+  let
+    fun proof_ir_plan_for name =
+      case List.find (fn (n, _) => n = name) proof_ir_plans of SOME (_, expr) => SOME expr | NONE => NONE
+  in
   map (fn {kind, name, safe_name, theorem_start, theorem_stop, boundary, tactic_start,
            tactic_end, tactic_text, has_proof_attrs, prefix_hash} =>
           let
@@ -1698,9 +1702,11 @@ fun theorem_checkpoint_specs proof_engine proof_timeout project node deps_key so
              failed_prefix_path = theorem_failed_prefix_path project node deps_key proof_engine safe_name,
              failed_prefix_ok = failed_prefix_ok proof_engine proof_timeout deps_key safe_name pre_hash header_hash,
              deps_key = deps_key,
-             checkpoint_key = checkpoint_key}
+             checkpoint_key = checkpoint_key,
+             proof_ir_plan = proof_ir_plan_for name}
           end)
       boundaries
+  end
 
 fun declaration_checkpoint_specs proof_engine proof_timeout project node deps_key source terminations =
   map (fn ({name, safe_name, definition_start, boundary, ...} : HolbuildTheoryCheckpoints.termination) =>
@@ -2041,8 +2047,12 @@ fun failed_prefix_resume_source policy timeout_marker plan_only_marker source ch
          "(ACCEPT_TAC (", finish_failed_prefix_call, "))",
          source_slice (#tactic_end checkpoint) (#boundary checkpoint),
          "\n"]
+    val plan_line =
+      case #proof_ir_plan checkpoint of
+          SOME expr => "val _ = HolbuildProofRuntime.set_theorem_plan (SOME (" ^ expr ^ "));\n"
+        | NONE => ""
     val replay_block =
-      if #kind checkpoint = "resume" then resume_replay_block else theorem_save_line
+      plan_line ^ (if #kind checkpoint = "resume" then resume_replay_block else theorem_save_line)
     val suffix =
       HolbuildTheoryCheckpoints.instrument
         {source = source,
@@ -2630,6 +2640,40 @@ fun build_config_lines_for_node options project node =
     | HolbuildSourceIndex.Sml => policy_config_lines no_checkpoint_policy
     | HolbuildSourceIndex.Sig => policy_config_lines no_checkpoint_policy
 
+fun write_temp_text path text =
+  let val out = TextIO.openOut path
+  in TextIO.output(out, text); TextIO.closeOut out end
+
+fun analyser_proof_ir_plan_sml_for_source source_path =
+  case HolbuildDependencies.current_analyser_path () of
+      NONE => []
+    | SOME analyser =>
+        let
+          val req = OS.FileSys.tmpName ()
+          val resp = OS.FileSys.tmpName ()
+          val request = String.concatWith "\n"
+            [HolbuildAnalysisProtocol.join ["version", HolbuildAnalysisProtocol.protocol_version],
+             HolbuildAnalysisProtocol.join ["command", "analyse"],
+             HolbuildAnalysisProtocol.join ["file", "1", source_path, "proof-ir"],
+             HolbuildAnalysisProtocol.join ["end"]] ^ "\n"
+          val _ = write_temp_text req request
+          val status = OS.Process.system (HolbuildHash.quote analyser ^ " --request " ^ HolbuildHash.quote req ^
+                                          " --response " ^ HolbuildHash.quote resp)
+          val _ = OS.FileSys.remove req handle OS.SysErr _ => ()
+          val text = if OS.Process.isSuccess status then read_text resp
+                     else (OS.FileSys.remove resp handle OS.SysErr _ => ();
+                           raise Error "holbuild-hol-analyser failed")
+          val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
+          val lines = String.tokens (fn c => c = #"\n") text
+          fun loop rest acc =
+            case rest of
+                [] => rev acc
+              | line :: more =>
+                  (case HolbuildAnalysisProtocol.split line of
+                       "begin-proof-ir" :: name :: _ :: _ :: expr :: _ => loop more ((name, expr) :: acc)
+                     | _ => loop more acc)
+        in loop lines [] end
+
 fun source_boundaries_for_node node source_text =
   SOME (discover_theorem_boundaries_recovering (source_file node) source_text)
   handle Error msg =>
@@ -2642,6 +2686,7 @@ fun theory_checkpoints_for_node policy project plan keys toolchain_key node sour
   else
     let
       val deps_key = dependency_context_key toolchain_key plan keys node
+      val proof_ir_plans = if proof_ir_enabled policy then analyser_proof_ir_plan_sml_for_source (source_file node) else []
       val _ =
         case errors of
             [] => ()
@@ -2649,7 +2694,7 @@ fun theory_checkpoints_for_node policy project plan keys toolchain_key node sour
                        logical_name node ^ "; using recovered theorem boundaries\n" ^
                        String.concatWith "\n" errors)
     in
-      theorem_checkpoint_specs (proof_engine policy) (tactic_timeout policy) project node deps_key source_text boundaries
+      theorem_checkpoint_specs (proof_engine policy) (tactic_timeout policy) project node deps_key source_text proof_ir_plans boundaries
     end
     handle Error msg =>
       (warn ("could not safely instrument theorem boundaries for " ^ logical_name node ^

@@ -14,7 +14,8 @@ type checkpoint = {kind : string, name : string, safe_name : string, theorem_sta
                    context_path : string, context_ok : string,
                    end_of_proof_path : string, end_of_proof_ok : string,
                    failed_prefix_path : string, failed_prefix_ok : string,
-                   deps_key : string, checkpoint_key : string}
+                   deps_key : string, checkpoint_key : string,
+                   proof_ir_plan : string option}
 
 type termination = {name : string, safe_name : string, definition_start : int,
                     definition_stop : int, boundary : int,
@@ -115,9 +116,12 @@ fun discover_from_report {source, report} : boundary list =
 fun begin_theorem_line ({kind, name, tactic_text, context_path, context_ok,
                          end_of_proof_path, end_of_proof_ok,
                          failed_prefix_path, failed_prefix_ok,
-                         has_proof_attrs, ...} : checkpoint) =
+                         has_proof_attrs, proof_ir_plan, ...} : checkpoint) =
   String.concat
-    ["val _ = holbuild_begin_theorem(",
+    [(case proof_ir_plan of
+          SOME expr => "val _ = HolbuildProofRuntime.set_theorem_plan (SOME (" ^ expr ^ "));\n"
+        | NONE => ""),
+     "val _ = holbuild_begin_theorem(",
      HolbuildToolchain.sml_string kind, ", ",
      HolbuildToolchain.sml_string name, ", ",
      HolbuildToolchain.sml_string tactic_text, ", ",

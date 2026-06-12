@@ -310,7 +310,7 @@ fun analyser_proof_ir_plan project source theorem =
           [] => found
         | line :: more =>
             (case HolbuildAnalysisProtocol.split line of
-                 ["begin-proof-ir", name, _, _] => loop more (SOME name) [] found
+                 "begin-proof-ir" :: name :: _ => loop more (SOME name) [] found
                | ["end-proof-ir", name] =>
                    let val found' = if name = theorem then SOME (rev acc) else found
                    in loop more NONE [] found' end

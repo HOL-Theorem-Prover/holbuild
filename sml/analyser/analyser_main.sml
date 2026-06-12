@@ -66,6 +66,48 @@ fun branch_phase_text HolbuildProofIr.BranchStart = "start"
   | branch_phase_text HolbuildProofIr.BranchSuffix = "suffix"
   | branch_phase_text HolbuildProofIr.BranchClose = "close"
 
+fun sml_string s = "\"" ^ String.toString s ^ "\""
+fun sml_bool true = "true" | sml_bool false = "false"
+fun sml_int n = Int.toString n
+fun sml_list xs = "[" ^ String.concatWith ", " xs ^ "]"
+fun sml_branch_phase HolbuildProofIr.BranchStart = "HolbuildProofIr.BranchStart"
+  | sml_branch_phase HolbuildProofIr.BranchSuffix = "HolbuildProofIr.BranchSuffix"
+  | sml_branch_phase HolbuildProofIr.BranchClose = "HolbuildProofIr.BranchClose"
+
+fun step_sml step =
+  case step of
+      HolbuildProofIr.StepTactic {start_pos, end_pos, label, program} =>
+        "HolbuildProofIr.StepTactic {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
+        ", label=" ^ sml_string label ^ ", program=" ^ sml_string program ^ "}"
+    | HolbuildProofIr.StepList {start_pos, end_pos, label, program} =>
+        "HolbuildProofIr.StepList {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
+        ", label=" ^ sml_string label ^ ", program=" ^ sml_string program ^ "}"
+    | HolbuildProofIr.StepChoice {start_pos, end_pos, label, program, alternatives} =>
+        "HolbuildProofIr.StepChoice {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
+        ", label=" ^ sml_string label ^ ", program=" ^ sml_string program ^ ", alternatives=" ^ sml_list (map sml_string alternatives) ^ "}"
+    | HolbuildProofIr.StepListChoice {start_pos, end_pos, label, program, alternatives} =>
+        "HolbuildProofIr.StepListChoice {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
+        ", label=" ^ sml_string label ^ ", program=" ^ sml_string program ^ ", alternatives=" ^ sml_list (map sml_string alternatives) ^ "}"
+    | HolbuildProofIr.StepThen1 {start_pos, end_pos, first_label, label, list_suffix, first_program, second_program} =>
+        "HolbuildProofIr.StepThen1 {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
+        ", first_label=" ^ sml_string first_label ^ ", label=" ^ sml_string label ^ ", list_suffix=" ^ sml_bool list_suffix ^
+        ", first_program=" ^ sml_string first_program ^ ", second_program=" ^ sml_string second_program ^ "}"
+    | HolbuildProofIr.StepGentleThen1 {start_pos, end_pos, label, list_suffix, first_program, second_program} =>
+        "HolbuildProofIr.StepGentleThen1 {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
+        ", label=" ^ sml_string label ^ ", list_suffix=" ^ sml_bool list_suffix ^
+        ", first_program=" ^ sml_string first_program ^ ", second_program=" ^ sml_string second_program ^ "}"
+    | HolbuildProofIr.StepBranch {start_pos, end_pos, label, program, phase} =>
+        "HolbuildProofIr.StepBranch {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
+        ", label=" ^ sml_string label ^ ", program=" ^ sml_string program ^ ", phase=" ^ sml_branch_phase phase ^ "}"
+    | HolbuildProofIr.StepBranchList {start_pos, end_pos, label, program} =>
+        "HolbuildProofIr.StepBranchList {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
+        ", label=" ^ sml_string label ^ ", program=" ^ sml_string program ^ "}"
+    | HolbuildProofIr.StepPlain {start_pos, end_pos, label, program} =>
+        "HolbuildProofIr.StepPlain {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
+        ", label=" ^ sml_string label ^ ", program=" ^ sml_string program ^ "}"
+
+fun plan_sml steps = sml_list (map step_sml steps)
+
 fun emit_step step =
   case step of
       HolbuildProofIr.StepTactic {start_pos, end_pos, label, program} =>
@@ -90,7 +132,7 @@ fun emit_step step =
         P.join ["proof-step", "plain", Int.toString start_pos, Int.toString end_pos, label, program]
 
 fun emit_proof_plan ({name, tactic_start, tactic_end, steps} : PI.theorem_plan) =
-  P.join ["begin-proof-ir", name, Int.toString tactic_start, Int.toString tactic_end] ::
+  P.join ["begin-proof-ir", name, Int.toString tactic_start, Int.toString tactic_end, plan_sml steps] ::
   map emit_step steps @
   [P.join ["end-proof-ir", name]]
 
