@@ -190,16 +190,18 @@ Proof
 QED
 SML
 check_plan reverse_suffix_branch_plan <<'EXPECTED'
-holbuild proof-ir plan ATheory:reverse_suffix_branch_plan source=src/AScript.sml (9 steps)
+holbuild proof-ir plan ATheory:reverse_suffix_branch_plan source=src/AScript.sml (11 steps)
   00 CONJ_TAC
   01 >> CONJ_TAC
   02 >> list_tac REVERSE_LT
   03 >- ACCEPT_TAC TRUTH
-  04 >> simp[GSYM CONJ_ASSOC]
-  05 >> CONJ_TAC
-  06 >> list_tac REVERSE_LT
-  07 >- ACCEPT_TAC TRUTH
-  08 >> ACCEPT_TAC TRUTH
+  04    >- solved
+  05 >> simp[GSYM CONJ_ASSOC]
+  06 >> CONJ_TAC
+  07 >> list_tac REVERSE_LT
+  08 >- ACCEPT_TAC TRUTH
+  09    >- solved
+  10 >> ACCEPT_TAC TRUTH
 EXPECTED
 
 cat >> "$project/src/AScript.sml" <<'SML'

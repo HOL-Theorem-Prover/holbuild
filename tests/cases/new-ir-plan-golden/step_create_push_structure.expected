@@ -217,7 +217,7 @@ holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml
   214    >> gvs[Abbr`fr`]
   215    >> `SND h = SND h'` by (
       qpat_x_assum`same_frame_rel s se`mp_tac >>
-      simp[same_frame_rel_def]
+      simp[same_frame_rel_def] )
   216    >> simp[initial_msg_params_def]
   217    >> qspec_then`t`FULL_STRUCT_CASES_TAC SNOC_CASES >> gvs[]
   218    >> list_tac REVERSE_LT
