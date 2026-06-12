@@ -633,6 +633,8 @@ and branch_steps source rhs =
           List.concat (map (branch_suffix_steps source) rest) @
           [branch_step sp "   >- solved" BranchClose "Tactical.ALL_TAC"]
         end
+    | TacRepairGroup (sp, inner) =>
+        branch_start_steps source inner @ [branch_step sp "   >- solved" BranchClose "Tactical.ALL_TAC"]
     | _ =>
         [list_step (tactic_span rhs) (">- " ^ source_text source (tactic_span rhs))
            ("Tactical.NTH_GOAL (Tactical.THEN(" ^ tactic_program source rhs ^ ", Tactical.NO_TAC)) 1")]

@@ -996,7 +996,7 @@ if (cd "$close_paren_failure_project" && "$HOLBUILD_BIN" build ATheory) > "$clos
   echo "expected close-paren branch proof to fail build" >&2
   exit 1
 fi
-require_grep "fragment: close_paren" "$close_paren_failure_log"
+require_grep "fragment: branch close" "$close_paren_failure_log"
 require_grep "source: .*AScript.sml:7:6-9:4" "$close_paren_failure_log"
 python3 - <<PY
 from pathlib import Path

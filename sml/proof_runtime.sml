@@ -268,9 +268,32 @@ fun alpha_convert_to_goal g th =
 
 fun history_top_thm g = alpha_convert_to_goal g (project_history goalStack.extract_thm)
 
+fun trim_left s =
+  let
+    val n = size s
+    fun loop i = if i >= n orelse not (Char.isSpace (String.sub(s, i))) then i else loop (i + 1)
+    val i = loop 0
+  in String.extract(s, i, NONE) end
+
+fun drop_prefix prefix s =
+  if String.isPrefix prefix s then SOME (String.extract(s, size prefix, NONE)) else NONE
+
+fun diagnostic_fragment_label label =
+  let val s = trim_left label
+  in
+    if s = ">- solved" then "branch close"
+    else
+      case drop_prefix ">> " s of
+          SOME rest => rest
+        | NONE =>
+          case drop_prefix ">- " s of
+              SOME rest => rest
+            | NONE => s
+  end
+
 fun print_goal_state label goals =
   TextIO.output(TextIO.stdErr,
-    String.concat ["\nholbuild goal state at failed fragment: ", label,
+    String.concat ["\nholbuild goal state at failed fragment: ", diagnostic_fragment_label label,
                    failed_theorem_line (),
                    failed_step_end_line (),
                    failed_step_span_line (),
