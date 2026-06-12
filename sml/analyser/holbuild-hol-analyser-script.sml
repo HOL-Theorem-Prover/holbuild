@@ -56,10 +56,12 @@ use_hol("tools/Holmake/deps/Holdep.sml");
 use_hol("src/portableML/poly/SHA1_ML.sig");
 use_hol("src/portableML/poly/w64-SHA1.ML");
 use_root "sml/hash.sml";
+use_root "sml/proof_ir.sml";
 
 use_src "analysis_protocol.sml";
 use_src "dependency_extract.sml";
 use_src "theory_span_extract.sml";
+use_src "proof_ir_extract.sml";
 use_src "analyser_main.sml";
 
 fun main () = OS.Process.exit (HolbuildAnalyserMain.main (CommandLine.arguments()))

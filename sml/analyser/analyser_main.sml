@@ -4,6 +4,7 @@ struct
 structure P = HolbuildAnalysisProtocol
 structure D = HolbuildAnalyserDependencyExtract
 structure S = HolbuildAnalyserTheorySpanExtract
+structure PI = HolbuildAnalyserProofIrExtract
 
 exception Error of string
 
@@ -61,6 +62,41 @@ fun emit_termination ({name, safe_name, definition_start, definition_stop, bound
           Int.toString boundary, Int.toString quote_start, Int.toString quote_end,
           Int.toString tactic_start, Int.toString tactic_end, quote_text, tactic_text]
 
+fun branch_phase_text HolbuildProofIr.BranchStart = "start"
+  | branch_phase_text HolbuildProofIr.BranchSuffix = "suffix"
+  | branch_phase_text HolbuildProofIr.BranchClose = "close"
+
+fun emit_step step =
+  case step of
+      HolbuildProofIr.StepTactic {start_pos, end_pos, label, program} =>
+        P.join ["proof-step", "tactic", Int.toString start_pos, Int.toString end_pos, label, program]
+    | HolbuildProofIr.StepList {start_pos, end_pos, label, program} =>
+        P.join ["proof-step", "list", Int.toString start_pos, Int.toString end_pos, label, program]
+    | HolbuildProofIr.StepChoice {start_pos, end_pos, label, program, alternatives} =>
+        P.join (["proof-step", "choice", Int.toString start_pos, Int.toString end_pos, label, program] @ alternatives)
+    | HolbuildProofIr.StepListChoice {start_pos, end_pos, label, program, alternatives} =>
+        P.join (["proof-step", "list-choice", Int.toString start_pos, Int.toString end_pos, label, program] @ alternatives)
+    | HolbuildProofIr.StepThen1 {start_pos, end_pos, first_label, label, list_suffix, first_program, second_program} =>
+        P.join ["proof-step", "then1", Int.toString start_pos, Int.toString end_pos, label,
+                if list_suffix then "1" else "0", first_label, first_program, second_program]
+    | HolbuildProofIr.StepGentleThen1 {start_pos, end_pos, label, list_suffix, first_program, second_program} =>
+        P.join ["proof-step", "gentle-then1", Int.toString start_pos, Int.toString end_pos, label,
+                if list_suffix then "1" else "0", first_program, second_program]
+    | HolbuildProofIr.StepBranch {start_pos, end_pos, label, program, phase} =>
+        P.join ["proof-step", "branch", Int.toString start_pos, Int.toString end_pos, label, program, branch_phase_text phase]
+    | HolbuildProofIr.StepBranchList {start_pos, end_pos, label, program} =>
+        P.join ["proof-step", "branch-list", Int.toString start_pos, Int.toString end_pos, label, program]
+    | HolbuildProofIr.StepPlain {start_pos, end_pos, label, program} =>
+        P.join ["proof-step", "plain", Int.toString start_pos, Int.toString end_pos, label, program]
+
+fun emit_proof_plan ({name, tactic_start, tactic_end, steps} : PI.theorem_plan) =
+  P.join ["begin-proof-ir", name, Int.toString tactic_start, Int.toString tactic_end] ::
+  map emit_step steps @
+  [P.join ["end-proof-ir", name]]
+
+fun proof_ir_lines path wants =
+  if member "proof-ir" wants then List.concat (map emit_proof_plan (PI.plans path)) else []
+
 fun span_lines path wants =
   let val text = read_all_file path
   in
@@ -77,8 +113,9 @@ fun analyse_file ({id, path, wants} : file_req) =
   let
     val deps_lines = if null wants orelse member "deps" wants then emit_deps (D.extract path) else []
     val span_lines = span_lines path wants
+    val proof_ir_lines = proof_ir_lines path wants
   in
-    P.join ["begin-file", id] :: deps_lines @ span_lines @ [P.join ["end-file", id]]
+    P.join ["begin-file", id] :: deps_lines @ span_lines @ proof_ir_lines @ [P.join ["end-file", id]]
   end
 
 fun response files =
@@ -101,6 +138,7 @@ fun main args =
            handle Error msg => (TextIO.output(TextIO.stdErr, msg ^ "\n"); OS.Process.failure)
                 | D.Error msg => (TextIO.output(TextIO.stdErr, msg ^ "\n"); OS.Process.failure)
                 | S.Error msg => (TextIO.output(TextIO.stdErr, msg ^ "\n"); OS.Process.failure)
+                | PI.Error msg => (TextIO.output(TextIO.stdErr, msg ^ "\n"); OS.Process.failure)
                 | e => (TextIO.output(TextIO.stdErr, General.exnMessage e ^ "\n"); OS.Process.failure))
       | _ => (TextIO.output(TextIO.stdErr, "usage: holbuild-hol-analyser --request FILE --response FILE\n"); OS.Process.failure)
 

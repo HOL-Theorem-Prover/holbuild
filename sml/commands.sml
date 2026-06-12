@@ -209,12 +209,135 @@ fun theorem_match theorem source =
       | _ => raise Error ("duplicate theorem in " ^ describe_source source ^ ": " ^ theorem)
   end
 
-fun print_static_goalfrag_plan new_ir source theorem boundary =
-  (print ((if new_ir then HolbuildProofIr.format_tactic else HolbuildGoalfragPlan.format_tactic)
-            {theory = #logical_name source,
-             theorem = theorem,
-             source = #relative_path source}
-            (#tactic_text boundary));
+fun write_text_file path text =
+  let val out = TextIO.openOut path
+  in TextIO.output(out, text); TextIO.closeOut out end
+
+val proof_ir_plan_cache_version = "holbuild-proof-ir-plan-cache-v1"
+
+fun proof_ir_cache_path project source =
+  OS.Path.concat(#artifact_root project,
+    OS.Path.concat("dep", OS.Path.concat("proof-ir", HolbuildHash.string_sha1 (#package source ^ ":" ^ #relative_path source) ^ ".resp")))
+
+fun run_analyser_for_proof_ir source_path =
+  case HolbuildDependencies.current_analyser_path () of
+      NONE => raise Error "internal error: HOL analyser is not configured"
+    | SOME analyser =>
+        let
+          val req = OS.FileSys.tmpName ()
+          val resp = OS.FileSys.tmpName ()
+          val request = String.concatWith "\n"
+            [HolbuildAnalysisProtocol.join ["version", HolbuildAnalysisProtocol.protocol_version],
+             HolbuildAnalysisProtocol.join ["command", "analyse"],
+             HolbuildAnalysisProtocol.join ["file", "1", source_path, "proof-ir"],
+             HolbuildAnalysisProtocol.join ["end"]] ^ "\n"
+          val _ = write_text_file req request
+          val status = OS.Process.system (HolbuildHash.quote analyser ^ " --request " ^ HolbuildHash.quote req ^
+                                          " --response " ^ HolbuildHash.quote resp)
+          val _ = OS.FileSys.remove req handle OS.SysErr _ => ()
+          val text = if OS.Process.isSuccess status then read_text resp
+                     else (OS.FileSys.remove resp handle OS.SysErr _ => ();
+                           raise Error "holbuild-hol-analyser failed")
+          val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
+        in text end
+
+fun bool_field "1" = true
+  | bool_field "0" = false
+  | bool_field s = raise Error ("bad proof-ir boolean field: " ^ s)
+
+fun phase_field "start" = HolbuildProofIr.BranchStart
+  | phase_field "suffix" = HolbuildProofIr.BranchSuffix
+  | phase_field "close" = HolbuildProofIr.BranchClose
+  | phase_field s = raise Error ("bad proof-ir branch phase: " ^ s)
+
+fun int_field s =
+  case Int.fromString s of SOME n => n | NONE => raise Error ("bad proof-ir integer field: " ^ s)
+
+fun parse_proof_step fields =
+  case fields of
+      ["proof-step", "tactic", a, b, label, program] =>
+        HolbuildProofIr.StepTactic {start_pos = int_field a, end_pos = int_field b, label = label, program = program}
+    | ["proof-step", "list", a, b, label, program] =>
+        HolbuildProofIr.StepList {start_pos = int_field a, end_pos = int_field b, label = label, program = program}
+    | "proof-step" :: "choice" :: a :: b :: label :: program :: alternatives =>
+        HolbuildProofIr.StepChoice {start_pos = int_field a, end_pos = int_field b, label = label, program = program, alternatives = alternatives}
+    | "proof-step" :: "list-choice" :: a :: b :: label :: program :: alternatives =>
+        HolbuildProofIr.StepListChoice {start_pos = int_field a, end_pos = int_field b, label = label, program = program, alternatives = alternatives}
+    | ["proof-step", "then1", a, b, label, list_suffix, first_label, first_program, second_program] =>
+        HolbuildProofIr.StepThen1 {start_pos = int_field a, end_pos = int_field b, label = label,
+                                   list_suffix = bool_field list_suffix, first_label = first_label,
+                                   first_program = first_program, second_program = second_program}
+    | ["proof-step", "gentle-then1", a, b, label, list_suffix, first_program, second_program] =>
+        HolbuildProofIr.StepGentleThen1 {start_pos = int_field a, end_pos = int_field b, label = label,
+                                         list_suffix = bool_field list_suffix,
+                                         first_program = first_program, second_program = second_program}
+    | ["proof-step", "branch", a, b, label, program, phase] =>
+        HolbuildProofIr.StepBranch {start_pos = int_field a, end_pos = int_field b, label = label, program = program,
+                                    phase = phase_field phase}
+    | ["proof-step", "branch-list", a, b, label, program] =>
+        HolbuildProofIr.StepBranchList {start_pos = int_field a, end_pos = int_field b, label = label, program = program}
+    | ["proof-step", "plain", a, b, label, program] =>
+        HolbuildProofIr.StepPlain {start_pos = int_field a, end_pos = int_field b, label = label, program = program}
+    | _ => raise Error ("bad proof-ir step response")
+
+fun cached_proof_ir_response project source =
+  let
+    val cache_path = proof_ir_cache_path project source
+    val source_hash = HolbuildHash.file_sha1 (#source_path source)
+    fun valid text =
+      case String.tokens (fn c => c = #"\n") text of
+          version :: hash_line :: rest =>
+            if version = proof_ir_plan_cache_version andalso hash_line = "source_sha1=" ^ source_hash then
+              SOME (String.concatWith "\n" rest ^ "\n")
+            else NONE
+        | _ => NONE
+  in
+    case valid (read_text cache_path) handle _ => NONE of
+        SOME text => text
+      | NONE =>
+          let
+            val text = run_analyser_for_proof_ir (#source_path source)
+            val cache_text = proof_ir_plan_cache_version ^ "\nsource_sha1=" ^ source_hash ^ "\n" ^ text
+            val _ = (HolbuildDependencies.ensure_parent cache_path; write_text_file cache_path cache_text) handle _ => ()
+          in text end
+  end
+
+fun analyser_proof_ir_plan project source theorem =
+  let
+    val lines = String.tokens (fn c => c = #"\n") (cached_proof_ir_response project source)
+    fun loop rest active acc found =
+      case rest of
+          [] => found
+        | line :: more =>
+            (case HolbuildAnalysisProtocol.split line of
+                 ["begin-proof-ir", name, _, _] => loop more (SOME name) [] found
+               | ["end-proof-ir", name] =>
+                   let val found' = if name = theorem then SOME (rev acc) else found
+                   in loop more NONE [] found' end
+               | fields as "proof-step" :: _ =>
+                   (case active of
+                        SOME _ => loop more active (parse_proof_step fields :: acc) found
+                      | NONE => loop more active acc found)
+               | _ => loop more active acc found)
+  in
+    case loop lines NONE [] NONE of
+        SOME steps => steps
+      | NONE => raise Error ("theorem not found for --goalfrag-plan: " ^ #logical_name source ^ ":" ^ theorem)
+  end
+
+fun print_static_goalfrag_plan project new_ir source theorem boundary_opt =
+  (print (if new_ir then
+            let val plan = analyser_proof_ir_plan project source theorem
+            in
+              "holbuild proof-ir plan " ^ #logical_name source ^ ":" ^ theorem ^ " source=" ^ #relative_path source ^
+              " (" ^ Int.toString (HolbuildProofIr.display_step_count plan) ^ " steps)\n" ^
+              HolbuildProofIr.format_plan_lines plan
+            end
+          else
+            HolbuildGoalfragPlan.format_tactic {theory = #logical_name source,
+                                                theorem = theorem,
+                                                source = #relative_path source}
+              (#tactic_text (case boundary_opt of SOME b => b | NONE => raise Error "internal error: missing goalfrag boundary")));
    TextIO.flushOut TextIO.stdOut)
 
 fun find_theory_source index theory =
@@ -235,9 +358,9 @@ fun print_goalfrag_plan_selector new_ir project selector =
     val {theory, theorem} = parse_goalfrag_selector selector
     val index = HolbuildSourceIndex.discover project
     val source = find_theory_source index theory
-    val boundary = find_theorem_in_source theorem source
   in
-    print_static_goalfrag_plan new_ir source theorem boundary
+    if new_ir then print_static_goalfrag_plan project true source theorem NONE
+    else print_static_goalfrag_plan project false source theorem (SOME (find_theorem_in_source theorem source))
   end
 
 fun positive_int label text =
