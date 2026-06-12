@@ -186,13 +186,13 @@ includes = ["src"]
 TOML
 expect_context_failure no_paths_includes "unknown field in holproject.toml: paths"
 
-cat > "$tmpdir/bad_type/holproject.toml" <<'TOML'
+cat > "$tmpdir/bad_type/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = 123
@@ -210,14 +210,14 @@ TOML
 expect_context_failure bad_dependency "unknown field in dependencies.dep: branch"
 
 make_project required_version_unimplemented
-cat > "$tmpdir/required_version_unimplemented/holproject.toml" <<'TOML'
+cat > "$tmpdir/required_version_unimplemented/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 required_version = ">=0.2"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "required_version_unimplemented"

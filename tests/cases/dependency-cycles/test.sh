@@ -27,13 +27,13 @@ expect_build_failure() {
 make_project() {
   local project=$1
   mkdir -p "$tmpdir/$project/src"
-  cat > "$tmpdir/$project/holproject.toml" <<'TOML'
+  cat > "$tmpdir/$project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "cycles"

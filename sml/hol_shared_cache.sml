@@ -8,7 +8,7 @@ exception Error of string
 
 val format_version = "holbuild-hol-toolchain-v1"
 val default_canonical_git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-val build_args = ""
+val build_args = "--no-helpdocs"
 val analyser_format_version = "holbuild-hol-analyser-v1"
 val analyser_protocol_version = "1"
 val analyser_source_files =
@@ -218,7 +218,7 @@ fun build_entry req k =
        run_in_dir final ("git clone " ^ quote (#git req) ^ " " ^ quote hol);
        run_in_dir hol ("git checkout --detach " ^ quote (#rev req));
        run_in_dir hol (quote (poly_command ()) ^ " --script tools/smart-configure.sml");
-       run_in_dir hol "bin/build";
+       run_in_dir hol ("bin/build " ^ build_args);
        if built hol then () else die ("HOL build did not produce bin/hol, bin/build, and bin/hol.state in " ^ hol);
        if clean hol then () else die ("HOL build left dirty checkout: " ^ hol ^ "\n" ^ dirty_status hol);
        write_file (manifest_for_key k) (material ^ "\nkey=" ^ k ^ "\n");

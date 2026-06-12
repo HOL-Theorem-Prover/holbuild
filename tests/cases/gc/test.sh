@@ -21,13 +21,13 @@ mkdir -p \
   "$cache/actions/old" \
   "$cache/blobs"
 
-cat > "$project/holproject.toml" <<'TOML'
+cat > "$project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "gc"
@@ -70,13 +70,13 @@ fi
 clean_only_project=$tmpdir/clean-only-project
 clean_only_cache=$tmpdir/clean-only-cache
 mkdir -p "$clean_only_project/.holbuild/stage/old" "$clean_only_cache/tmp/old"
-cat > "$clean_only_project/holproject.toml" <<'TOML'
+cat > "$clean_only_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "gc-clean-only"
@@ -103,13 +103,13 @@ mkdir -p \
   "$budget_project/src" \
   "$budget_family.deps/old-deps-key" \
   "$budget_family.theorems/old-deps-key/proof_ir_v3/old-prefix"
-cat > "$budget_project/holproject.toml" <<'TOML'
+cat > "$budget_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "checkpoint-budget"

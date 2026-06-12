@@ -42,7 +42,7 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ~/.cache/holbuild/hol-toolchains
-          key: hol-toolchains-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ inputs.hol4-ref || steps.hol4-pin.outputs.hol4-ref }}-v1
+          key: hol-toolchains-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ inputs.hol4-ref || steps.hol4-pin.outputs.hol4-ref }}-v2
 
       - name: Setup schema2 HOL cache
         run: tools/setup-hol-toolchain-cache.sh "${{ inputs.hol4-ref || steps.hol4-pin.outputs.hol4-ref }}" >> "$GITHUB_ENV"
@@ -52,7 +52,7 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: ~/.cache/holbuild/hol-toolchains
-          key: hol-toolchains-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ inputs.hol4-ref || steps.hol4-pin.outputs.hol4-ref }}-v1
+          key: hol-toolchains-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ inputs.hol4-ref || steps.hol4-pin.outputs.hol4-ref }}-v2
 
       - name: Build holbuild
         run: make HOLDIR="$HOLDIR"

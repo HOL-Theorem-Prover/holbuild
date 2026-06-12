@@ -241,7 +241,7 @@ For each root project graph, sources and build artifacts are separated:
 
 The reserved `hol` source checkout is special in v1: it is shared globally under
 `$HOLBUILD_CACHE/hol-toolchains/<key>/hol` and built there by running
-`${HOLBUILD_POLY:-poly} --script tools/smart-configure.sml` and then `bin/build`.
+`${HOLBUILD_POLY:-poly} --script tools/smart-configure.sml` and then `bin/build --no-helpdocs`.
 A dirty or incomplete cached HOL checkout is rejected until the user removes that
 cache entry. Use `holbuild buildhol` to warm this cache explicitly, for example in
 CI; normal HOL-using commands do this automatically.

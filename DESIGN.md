@@ -120,7 +120,7 @@ demand with:
 
 ```sh
 ${HOLBUILD_POLY:-poly} --script tools/smart-configure.sml
-bin/build
+bin/build --no-helpdocs
 ```
 
 A built HOL checkout is expected to contain `bin/hol`, `bin/build`, and

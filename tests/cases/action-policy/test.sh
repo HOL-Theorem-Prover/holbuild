@@ -22,7 +22,7 @@ schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "$(basename "$project")"
@@ -78,13 +78,13 @@ require_grep "extra_dep=extra.txt@" "$compat_project/.holbuild/dep/extra_inputs_
 
 source_extra_project="$tmpdir/source_extra_policy"
 mkdir -p "$source_extra_project/src" "$source_extra_project/data"
-cat > "$source_extra_project/holproject.toml" <<'TOML'
+cat > "$source_extra_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "source_extra_policy"

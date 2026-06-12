@@ -16,13 +16,13 @@ project=$tmpdir/project
 counter=$tmpdir/slow-prefix-count.txt
 mkdir -p "$project/src"
 touch "$counter"
-cat > "$project/holproject.toml" <<'TOML'
+cat > "$project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "new-ir-replay"

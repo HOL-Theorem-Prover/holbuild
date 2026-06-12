@@ -33,13 +33,13 @@ project=$tmpdir/project
 mkdir -p "$dep/src" "$project/src"
 export HOLBUILD_FORCE_DEP="$dep"
 
-cat > "$dep/holproject.toml" <<'TOML'
+cat > "$dep/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "dep"

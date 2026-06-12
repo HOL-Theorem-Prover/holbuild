@@ -31,6 +31,7 @@ SML
 cat > "$hol/bin/build" <<'SH'
 #!/usr/bin/env sh
 set -eu
+[ "$#" -eq 1 ] && [ "$1" = "--no-helpdocs" ]
 touch built
 pwd > built-at
 cat > bin/hol <<'HOL'

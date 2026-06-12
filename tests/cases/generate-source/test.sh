@@ -14,13 +14,13 @@ use_case_cache "$tmpdir/cache"
 
 project=$tmpdir/project
 mkdir -p "$project/data" "$project/scripts" "$project/src"
-cat > "$project/holproject.toml" <<'TOML'
+cat > "$project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "generated_source"
@@ -109,13 +109,13 @@ fi
 
 bad_project=$tmpdir/bad-project
 mkdir -p "$bad_project/scripts"
-cat > "$bad_project/holproject.toml" <<'TOML'
+cat > "$bad_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "bad_generated_source"
@@ -140,13 +140,13 @@ require_grep "did not produce declared output: gen/MissingScript.sml" "$bad_log"
 
 unknown_dep_project=$tmpdir/unknown-dep-project
 mkdir -p "$unknown_dep_project"
-cat > "$unknown_dep_project/holproject.toml" <<'TOML'
+cat > "$unknown_dep_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "unknown_dep"
@@ -169,13 +169,13 @@ require_grep "generator gen depends on unknown generator missing" "$unknown_dep_
 
 cycle_project=$tmpdir/cycle-project
 mkdir -p "$cycle_project"
-cat > "$cycle_project/holproject.toml" <<'TOML'
+cat > "$cycle_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "cycle"

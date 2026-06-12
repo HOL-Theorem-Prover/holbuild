@@ -15,13 +15,13 @@ use_case_cache "$tmpdir/cache"
 make_project() {
   local project=$1
   mkdir -p "$project/src"
-  cat > "$project/holproject.toml" <<'TOML'
+  cat > "$project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "concurrent"
@@ -100,13 +100,13 @@ parent_sensitive_source=$tmpdir/parent-sensitive-source
 parent_sensitive_a1=$tmpdir/parent-sensitive-a1
 parent_sensitive_a2=$tmpdir/parent-sensitive-a2
 mkdir -p "$parent_sensitive_source/src" "$parent_sensitive_a1" "$parent_sensitive_a2"
-cat > "$parent_sensitive_source/holproject.toml" <<'TOML'
+cat > "$parent_sensitive_source/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "parentsensitive"

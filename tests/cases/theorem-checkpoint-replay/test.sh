@@ -15,13 +15,13 @@ repo_root=$(cd "$SCRIPT_DIR/../../.." && pwd)
 
 project=$tmpdir/project
 mkdir -p "$project/src"
-cat > "$project/holproject.toml" <<'TOML'
+cat > "$project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "replay"
@@ -426,13 +426,13 @@ HOLBUILD_HOLDIR="$HOLDIR" HOLDIR="$HOLDIR" poly < "$synthetic_large_goal_check" 
 
 multi_goal_project=$tmpdir/multi-goal-project
 mkdir -p "$multi_goal_project/src"
-cat > "$multi_goal_project/holproject.toml" <<'TOML'
+cat > "$multi_goal_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "multi-goal"
@@ -474,13 +474,13 @@ require_grep "holbuild end all failed tactic input goals" "$multi_goal_child_log
 
 branch_input_project=$tmpdir/branch-input-project
 mkdir -p "$branch_input_project/src"
-cat > "$branch_input_project/holproject.toml" <<'TOML'
+cat > "$branch_input_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "branch-input"
@@ -524,13 +524,13 @@ fi
 
 multi_goal_large_project=$tmpdir/multi-goal-large-project
 mkdir -p "$multi_goal_large_project/src"
-cat > "$multi_goal_large_project/holproject.toml" <<'TOML'
+cat > "$multi_goal_large_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "multi-goal-large"
@@ -719,13 +719,13 @@ failed_root_project=$tmpdir/failed-root-project
 failed_root_counter=$tmpdir/failed-root-dep-count.txt
 mkdir -p "$failed_root_project/src"
 touch "$failed_root_counter"
-cat > "$failed_root_project/holproject.toml" <<'TOML'
+cat > "$failed_root_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "failed-root"
@@ -774,13 +774,13 @@ require_grep "from: failed-prefix checkpoint in b_thm" "$failed_root_again_log"
 
 changed_prefix_project=$tmpdir/changed-prefix-project
 mkdir -p "$changed_prefix_project/src"
-cat > "$changed_prefix_project/holproject.toml" <<'TOML'
+cat > "$changed_prefix_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "changed-prefix"
@@ -832,13 +832,13 @@ priority_project=$tmpdir/priority-project
 priority_counter=$tmpdir/priority-counter.txt
 mkdir -p "$priority_project/src"
 touch "$priority_counter"
-cat > "$priority_project/holproject.toml" <<'TOML'
+cat > "$priority_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "priority"
@@ -889,13 +889,13 @@ always_context_project=$tmpdir/always-context-project
 always_context_counter=$tmpdir/always-context-counter.txt
 mkdir -p "$always_context_project/src"
 touch "$always_context_counter"
-cat > "$always_context_project/holproject.toml" <<'TOML'
+cat > "$always_context_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "bf0dec986904cecbd1a1c6bce62ccf1c256eaca1"
+rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
 name = "always-context"
