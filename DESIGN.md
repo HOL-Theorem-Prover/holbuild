@@ -90,7 +90,7 @@ Supported dependency forms are deliberately narrow:
 
 Schema 2 rejects path dependencies, local overrides, git manifests, branches,
 tags, ranges, registry names, and multiple versions. `[holbuild].required_version`
-is reserved and currently rejected when non-empty.
+is an optional `MAJOR.MINOR.PATCH` minimum holbuild version check.
 
 For a root project, all dependency source checkouts are materialized once under:
 

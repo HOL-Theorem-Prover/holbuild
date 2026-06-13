@@ -205,6 +205,7 @@ package.
 ```toml
 [holbuild]
 schema = 2
+required_version = "0.6.0"
 
 [project]
 name = "example"
@@ -246,8 +247,9 @@ A dirty or incomplete cached HOL checkout is rejected until the user removes tha
 cache entry. Use `holbuild buildhol` to warm this cache explicitly, for example in
 CI; normal HOL-using commands do this automatically.
 
-`[holbuild].required_version` is recognized but not implemented; non-empty values
-are currently rejected.
+`[holbuild].required_version` is optional. When present, it must be a semantic
+version `MAJOR.MINOR.PATCH` and means this project requires at least that
+holbuild version.
 
 ## Local configuration and source selection
 

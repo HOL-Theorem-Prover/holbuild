@@ -39,8 +39,9 @@ init_git_repo() {
   git -C "$dir" init -q
   git -C "$dir" config user.email test@example.invalid
   git -C "$dir" config user.name "holbuild test"
+  git -C "$dir" config commit.gpgsign false
   git -C "$dir" add .
-  git -C "$dir" commit -q -m init
+  git -C "$dir" commit -q --no-gpg-sign -m init
   git -C "$dir" rev-parse HEAD
 }
 

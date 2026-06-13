@@ -383,7 +383,9 @@ fun validate_schema table =
          case string_at holbuild ["required_version"] of
              NONE => ()
            | SOME "" => ()
-           | SOME _ => die "holbuild.required_version is recognized but not implemented yet")
+           | SOME required =>
+               (HolbuildVersion.require_at_least required
+                handle HolbuildVersion.Error msg => die ("invalid holbuild.required_version: " ^ msg)))
 
 fun validate_dependency_table (name, table) =
   let

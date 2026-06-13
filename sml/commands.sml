@@ -15,6 +15,7 @@ fun warn msg = HolbuildStatus.message_stderr ("holbuild: warning: " ^ msg ^ "\n"
 fun usage () = print
   "holbuild: experimental project-aware build frontend for HOL4\n\n\
   \Usage:\n\
+  \  holbuild --version\n\
   \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--maxheap MB] [-jN] context\n\
   \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--maxheap MB] [-jN] execution-plan THEORY:THEOREM\n\
   \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--maxheap MB] [-jN] build [--dry-run] [--force[=theory|project|full]] [--no-cache] [--skip-checkpoints] [--skip-proof-steps] [--tactic-timeout SECONDS] [--trace-steps] [--repl-on-failure] [--retain-debug-artifacts] [TARGET ...]\n\
@@ -711,7 +712,9 @@ fun main raw_args =
   (let
      val _ = HolbuildStatus.set_json_mode (List.exists (fn s => s = "--json") raw_args)
      val _ =
-       if List.exists (fn s => s = "--help" orelse s = "-h" orelse s = "help") raw_args
+       if raw_args = ["--version"] then
+         (print ("holbuild " ^ HolbuildVersion.version ^ "\n"); OS.Process.exit OS.Process.success)
+       else if List.exists (fn s => s = "--help" orelse s = "-h" orelse s = "help") raw_args
        then (usage (); OS.Process.exit OS.Process.success)
        else ()
      val (options, args) = parse_global_options raw_args

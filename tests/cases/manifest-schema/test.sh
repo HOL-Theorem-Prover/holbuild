@@ -12,6 +12,9 @@ cleanup() { rm -rf "$tmpdir"; }
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
+"$HOLBUILD_BIN" --version > "$tmpdir/version.log"
+require_grep "^holbuild 0.6.0$" "$tmpdir/version.log"
+
 make_project() {
   local name=$1
   mkdir -p "$tmpdir/$name/src"
@@ -209,20 +212,50 @@ branch = "main"
 TOML
 expect_context_failure bad_dependency "unknown field in dependencies.dep: branch"
 
-make_project required_version_unimplemented
-cat > "$tmpdir/required_version_unimplemented/holproject.toml" <<TOML
+make_project required_version_current
+cat > "$tmpdir/required_version_current/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+required_version = "0.6.0"
+
+[dependencies.hol]
+git = "$schema2_repo"
+rev = "$schema2_rev"
+
+[project]
+name = "required_version_current"
+TOML
+(cd "$tmpdir/required_version_current" && "$HOLBUILD_BIN" context) > "$tmpdir/required_version_current.log"
+
+make_project required_version_future
+cat > "$tmpdir/required_version_future/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+required_version = "0.6.1"
+
+[dependencies.hol]
+git = "$schema2_repo"
+rev = "$schema2_rev"
+
+[project]
+name = "required_version_future"
+TOML
+expect_context_failure required_version_future "project requires holbuild >= 0.6.1, but this is holbuild 0.6.0"
+
+make_project required_version_invalid
+cat > "$tmpdir/required_version_invalid/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 required_version = ">=0.2"
 
 [dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+git = "$schema2_repo"
+rev = "$schema2_rev"
 
 [project]
-name = "required_version_unimplemented"
+name = "required_version_invalid"
 TOML
-expect_context_failure required_version_unimplemented "holbuild.required_version is recognized but not implemented yet"
+expect_context_failure required_version_invalid "invalid holbuild.required_version: expected MAJOR.MINOR.PATCH, got '>=0.2'"
 
 make_project schema2_missing_rev
 write_manifest schema2_missing_rev <<'TOML'
