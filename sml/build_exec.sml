@@ -932,12 +932,17 @@ fun find_substring needle haystack =
 fun hol_state_load_failure text =
   Option.isSome (find_substring "Couldn't load HOL base-state" text)
 
+fun holbuild_runtime_missing_failure text =
+  Option.isSome (find_substring "Structure (HolbuildRuntime) has not been declared" text)
+
 (* Defensive recovery for already-invalid checkpoint artifacts. Holbuild should
    preserve parent/child heap families atomically; this path is not a substitute
    for that invariant. It keeps old/manual/interrupted artifacts from surfacing
-   as source proof failures. *)
+   as source proof failures.  A stale/manual checkpoint can load as a valid
+   PolyML heap while still missing holbuild's runtime prelude; retry that case
+   from a fresh dependency context too. *)
 fun invalid_checkpoint_retryable base_context run_context msg =
-  hol_state_load_failure msg andalso
+  (hol_state_load_failure msg orelse holbuild_runtime_missing_failure msg) andalso
   hol_context_path run_context <> hol_context_path base_context
 
 fun theorem_context_or_end_path path
