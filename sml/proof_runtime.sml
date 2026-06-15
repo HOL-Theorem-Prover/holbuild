@@ -251,9 +251,16 @@ fun init_history g limit =
   set_history (History.new_history {obj = goalStack.new_goal g Lib.I,
                                     limit = Int.max(15, limit)})
 
-fun append_history f =
-  set_history (Lib.with_flag (goalStack.chatting, false)
-                 (fn () => History.apply f (current_history())) ())
+fun apply_history f =
+  Lib.with_flag (goalStack.chatting, false)
+    (fn () => History.apply f (current_history())) ()
+
+fun append_history f = set_history (apply_history f)
+
+fun append_history_with_timeout label f =
+  let val new_history = with_tactic_timeout label apply_history f
+  in set_history new_history end
+
 fun ensure_history_limit limit = set_history (History.set_limit (current_history()) (Int.max(15, limit)))
 
 fun history_top_goals () = project_history goalStack.top_goals
@@ -361,7 +368,7 @@ fun apply_tactic_step label program =
     val input_goals = top_input_goals()
     val tactic = compile_tactic label program
   in
-    with_tactic_timeout label (fn () => append_history (goalStack.expandf tactic)) ()
+    append_history_with_timeout label (goalStack.expandf tactic)
     handle e => report_step_failure_with_goals label input_goals e
   end
 
@@ -378,7 +385,7 @@ fun apply_list_tactic_step label program =
       val input_goals = history_top_goals()
       val list_tactic = compile_list_tactic label program
     in
-      with_tactic_timeout label (fn () => append_history (goalStack.expand_listf list_tactic)) ()
+      append_history_with_timeout label (goalStack.expand_listf list_tactic)
       handle e => report_step_failure_with_goals label input_goals e
     end
 
@@ -451,8 +458,7 @@ fun apply_then1_step label false first_program second_program =
         val first_tactic = compile_tactic label first_program
         val second_tactic = compile_tactic label second_program
       in
-        with_tactic_timeout label
-          (fn () => append_history (goalStack.expandf (Tactical.THEN1(first_tactic, second_tactic)))) ()
+        append_history_with_timeout label (goalStack.expandf (Tactical.THEN1(first_tactic, second_tactic)))
         handle e => report_step_failure_with_goals label input_goals e
       end
   | apply_then1_step label true first_program second_program =
@@ -463,8 +469,7 @@ fun apply_then1_step label false first_program second_program =
           val first_tactic = compile_tactic label first_program
           val second_tactic = compile_tactic label second_program
         in
-          with_tactic_timeout label
-            (fn () => append_history (goalStack.expand_listf (Tactical.ALLGOALS (Tactical.THEN1(first_tactic, second_tactic))))) ()
+          append_history_with_timeout label (goalStack.expand_listf (Tactical.ALLGOALS (Tactical.THEN1(first_tactic, second_tactic))))
           handle e => report_step_failure_with_goals label input_goals e
         end
 
@@ -474,8 +479,7 @@ fun apply_gentle_then1_step label false first_program second_program =
         val first_tactic = compile_tactic label first_program
         val second_tactic = compile_tactic label second_program
       in
-        with_tactic_timeout label
-          (fn () => append_history (goalStack.expandf (gentle_then1 first_tactic second_tactic))) ()
+        append_history_with_timeout label (goalStack.expandf (gentle_then1 first_tactic second_tactic))
         handle e => report_step_failure_with_goals label input_goals e
       end
   | apply_gentle_then1_step label true first_program second_program =
@@ -486,8 +490,7 @@ fun apply_gentle_then1_step label false first_program second_program =
           val first_tactic = compile_tactic label first_program
           val second_tactic = compile_tactic label second_program
         in
-          with_tactic_timeout label
-            (fn () => append_history (goalStack.expand_listf (Tactical.ALLGOALS (gentle_then1 first_tactic second_tactic)))) ()
+          append_history_with_timeout label (goalStack.expand_listf (Tactical.ALLGOALS (gentle_then1 first_tactic second_tactic)))
           handle e => report_step_failure_with_goals label input_goals e
         end
 
@@ -538,8 +541,7 @@ fun apply_branch_start_step label program =
     val tail_count = before_count - 1
   in
     if before_count <= 0 then raise Fail ("branch start with no open goals: " ^ label) else ();
-    (with_tactic_timeout label
-       (fn () => append_history (goalStack.expand_listf (Tactical.NTH_GOAL tactic 1))) ();
+    (append_history_with_timeout label (goalStack.expand_listf (Tactical.NTH_GOAL tactic 1));
      push_branch_tail_count tail_count)
     handle e => report_step_failure_with_goals label input_goals e
   end
@@ -553,8 +555,7 @@ fun apply_branch_suffix_list_tactic label list_tactic =
     (if generated_count = 0 then
        (if total_count = 0 then () else append_history (goalStack.expand_listf Tactical.ALL_LT))
      else
-       with_tactic_timeout label
-         (fn () => append_history (goalStack.expand_listf scoped_list_tactic)) ())
+       append_history_with_timeout label (goalStack.expand_listf scoped_list_tactic))
     handle e => report_step_failure_with_goals label input_goals e
   end
 
