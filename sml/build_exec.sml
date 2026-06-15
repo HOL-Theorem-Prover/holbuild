@@ -3204,11 +3204,12 @@ fun heap_theory_load_lines node =
 fun write_heap_loader plan output path =
   let
     val lines =
-      map load_theory_line (heap_external_theories plan) @
-      List.concat (map heap_theory_load_lines (HolbuildBuildPlan.selected_nodes plan)) @
-      [checkpoint_save_runtime_line (),
-       save_heap_line {label = "heap", share_common_data = false,
-                       output = output, ok_text = checkpoint_ok_v1 ()}]
+      runtime_line () ::
+      (map load_theory_line (heap_external_theories plan) @
+       List.concat (map heap_theory_load_lines (HolbuildBuildPlan.selected_nodes plan)) @
+       [checkpoint_save_runtime_line (),
+        save_heap_line {label = "heap", share_common_data = false,
+                        output = output, ok_text = checkpoint_ok_v1 ()}])
   in
     write_text path (String.concatWith "\n" lines ^ "\n")
   end

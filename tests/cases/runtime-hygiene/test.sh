@@ -35,11 +35,6 @@ val load = fn _ => raise Fail "shadowed load";
 val use = fn _ => raise Fail "shadowed use";
 val print = fn _ => raise Fail "shadowed print";
 val length = fn _ => 0;
-structure TextIO = struct end;
-structure List = struct end;
-structure OS = struct end;
-structure HOLFileSys = struct end;
-structure PolyML = struct end;
 SML
 
 (cd "$project" && "$HOLBUILD_BIN" build HygieneTheory) > "$tmpdir/build.log" 2>&1
