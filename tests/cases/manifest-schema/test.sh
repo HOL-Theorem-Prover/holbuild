@@ -13,7 +13,7 @@ trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
 "$HOLBUILD_BIN" --version > "$tmpdir/version.log"
-require_grep "^holbuild 0.6.1$" "$tmpdir/version.log"
+require_grep "^holbuild 0.6.2$" "$tmpdir/version.log"
 
 make_project() {
   local name=$1
@@ -216,7 +216,7 @@ make_project required_version_current
 cat > "$tmpdir/required_version_current/holproject.toml" <<TOML
 [holbuild]
 schema = 2
-required_version = "0.6.1"
+required_version = "0.6.2"
 
 [dependencies.hol]
 git = "$schema2_repo"
@@ -231,7 +231,7 @@ make_project required_version_future
 cat > "$tmpdir/required_version_future/holproject.toml" <<TOML
 [holbuild]
 schema = 2
-required_version = "0.6.2"
+required_version = "0.6.3"
 
 [dependencies.hol]
 git = "$schema2_repo"
@@ -240,7 +240,7 @@ rev = "$schema2_rev"
 [project]
 name = "required_version_future"
 TOML
-expect_context_failure required_version_future "project requires holbuild >= 0.6.2, but this is holbuild 0.6.1"
+expect_context_failure required_version_future "project requires holbuild >= 0.6.3, but this is holbuild 0.6.2"
 
 make_project required_version_invalid
 cat > "$tmpdir/required_version_invalid/holproject.toml" <<TOML
