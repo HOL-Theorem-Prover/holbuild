@@ -129,11 +129,17 @@ fun write_object_manifest path lines =
 fun dependency_sml dep = one_with_suffix ".sml" (#generated (source_artifacts dep))
 fun dependency_sig dep = one_with_suffix ".sig" (#generated (source_artifacts dep))
 
-fun load_theory_line name = "load " ^ HolbuildToolchain.sml_string name ^ ";"
+fun runtime_helper_path () =
+  Path.concat(HolbuildRuntimePaths.source_root, "sml/holbuild_runtime.sml")
+
+fun runtime_line () =
+  "use " ^ HolbuildToolchain.sml_string (runtime_helper_path ()) ^ ";"
+
+fun load_theory_line name = "HolbuildRuntime.load " ^ HolbuildToolchain.sml_string name ^ ";"
 
 fun use_generated_lines dep =
-  ["use " ^ HolbuildToolchain.sml_string (dependency_sig dep) ^ ";",
-   "use " ^ HolbuildToolchain.sml_string (dependency_sml dep) ^ ";"]
+  ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (dependency_sig dep) ^ ";",
+   "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (dependency_sml dep) ^ ";"]
 
 fun drop_suffix suffix path =
   if has_suffix suffix path then String.substring(path, 0, size path - size suffix)
@@ -171,7 +177,7 @@ fun project_theory_load_stems deps =
 
 fun fakeload_line name = "Meta.fakeload " ^ HolbuildToolchain.sml_string name ^ ";"
 
-fun load_project_line dep = "load " ^ HolbuildToolchain.sml_string dep ^ ";"
+fun load_project_line dep = "HolbuildRuntime.load " ^ HolbuildToolchain.sml_string dep ^ ";"
 
 fun project_preload_lines dep =
   case #kind (HolbuildBuildPlan.source_of dep) of
@@ -191,7 +197,7 @@ fun checkpoint_save_runtime_helper_path () =
   Path.concat(HolbuildRuntimePaths.source_root, "sml/checkpoint_save_runtime.sml")
 
 fun checkpoint_save_runtime_line () =
-  "use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";"
+  "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";"
 
 (* PolyML child heaps remember their parent-chain filenames. The shared runtime
    helper saves checkpoints directly to the final .save path and publishes .ok
@@ -203,7 +209,7 @@ fun save_heap_line {label, share_common_data, output, ok_text} =
      ", default_share = ", if share_common_data then "true" else "false",
      ", path = ", HolbuildToolchain.sml_string output,
      ", ok_text = ", HolbuildToolchain.sml_string ok_text,
-     ", depth = length (PolyML.SaveState.showHierarchy())};"]
+     ", depth = HolbuildRuntime.save_hierarchy_depth ()};"]
 
 fun direct_external_loads plan node =
   unique_strings
@@ -223,16 +229,17 @@ fun preload_lines plan node =
 
 fun write_preload plan node deps_loaded deps_ok path =
   let
-    val lines = preload_lines plan node @
-                [checkpoint_save_runtime_line (),
-                 save_heap_line {label = "deps_loaded", share_common_data = true,
-                                 output = deps_loaded, ok_text = deps_ok}]
+    val lines = runtime_line () ::
+                (preload_lines plan node @
+                 [checkpoint_save_runtime_line (),
+                  save_heap_line {label = "deps_loaded", share_common_data = true,
+                                  output = deps_loaded, ok_text = deps_ok}])
   in
     write_text path (String.concatWith "\n" lines ^ "\n")
   end
 
 fun write_plain_preload plan node path =
-  write_text path (String.concatWith "\n" (preload_lines plan node) ^ "\n")
+  write_text path (String.concatWith "\n" (runtime_line () :: preload_lines plan node) ^ "\n")
 
 fun generated_metadata_report_lines {theory_name, parents_report, mldeps_report} =
   let
@@ -240,27 +247,23 @@ fun generated_metadata_report_lines {theory_name, parents_report, mldeps_report}
       case parents_report of
           NONE => []
         | SOME report_path =>
-            ["val holbuild_parents_out = TextIO.openOut " ^ HolbuildToolchain.sml_string report_path ^ ";",
-             "val _ = (List.app (fn s => TextIO.output(holbuild_parents_out, s ^ \"\\n\")) (Theory.parents \"-\"); TextIO.closeOut holbuild_parents_out);"]
+            ["val _ = HolbuildRuntime.write_parent_report " ^ HolbuildToolchain.sml_string report_path ^ ";"]
     val mldep_lines =
       case mldeps_report of
           NONE => []
         | SOME report_path =>
-            ["val holbuild_mldeps_out = TextIO.openOut " ^ HolbuildToolchain.sml_string report_path ^ ";",
-             "val _ = (List.app (fn s => TextIO.output(holbuild_mldeps_out, s ^ \"\\n\")) (Theory.current_ML_deps()); TextIO.closeOut holbuild_mldeps_out);"]
+            ["val _ = HolbuildRuntime.write_mldeps_report " ^ HolbuildToolchain.sml_string report_path ^ ";"]
   in
     parent_lines @ mldep_lines
   end
 
 fun export_theory_if_needed_line sig_path =
-  "val _ = if OS.FileSys.access(" ^ HolbuildToolchain.sml_string sig_path ^
-  ", [OS.FileSys.A_READ]) then () else export_theory();"
+  "val _ = HolbuildRuntime.export_theory_if_needed " ^ HolbuildToolchain.sml_string sig_path ^ ";"
 
 fun write_manifest_line path lines =
   String.concat
-    ["val _ = let val out = HOLFileSys.openOut ", HolbuildToolchain.sml_string path,
-     " in HOLFileSys.output(out, ", HolbuildToolchain.sml_string (String.concatWith "\n" lines ^ "\n"),
-     "); HOLFileSys.closeOut out end;"]
+    ["val _ = HolbuildRuntime.write_manifest ", HolbuildToolchain.sml_string path,
+     " ", HolbuildToolchain.sml_list lines, ";"]
 
 fun hfs_unmapped_path path =
   let
@@ -286,7 +289,7 @@ fun final_context_loader_lines {theory_name, sig_path, sml_path, parents_report,
     [export_theory_if_needed_line sig_path,
      write_manifest_line ui_path [load_sig_path],
      write_manifest_line uo_path [load_sml_path],
-     "load " ^ HolbuildToolchain.sml_string stem ^ ";"]
+     "HolbuildRuntime.load " ^ HolbuildToolchain.sml_string stem ^ ";"]
   end
 
 fun write_final_context_loader {theory_name, sig_path, sml_path, output, path, parents_report, mldeps_report} =
@@ -929,12 +932,17 @@ fun find_substring needle haystack =
 fun hol_state_load_failure text =
   Option.isSome (find_substring "Couldn't load HOL base-state" text)
 
+fun holbuild_runtime_missing_failure text =
+  Option.isSome (find_substring "Structure (HolbuildRuntime) has not been declared" text)
+
 (* Defensive recovery for already-invalid checkpoint artifacts. Holbuild should
    preserve parent/child heap families atomically; this path is not a substitute
    for that invariant. It keeps old/manual/interrupted artifacts from surfacing
-   as source proof failures. *)
+   as source proof failures.  A stale/manual checkpoint can load as a valid
+   PolyML heap while still missing holbuild's runtime prelude; retry that case
+   from a fresh dependency context too. *)
 fun invalid_checkpoint_retryable base_context run_context msg =
-  hol_state_load_failure msg andalso
+  (hol_state_load_failure msg orelse holbuild_runtime_missing_failure msg) andalso
   hol_context_path run_context <> hol_context_path base_context
 
 fun theorem_context_or_end_path path
@@ -1919,7 +1927,7 @@ fun policy_config_lines _ =
 
 fun plain_source_from_checkpoint source_text start_offset =
   if start_offset <= 0 then source_text
-  else "val _ = Tactical.restore_prover();\n" ^ String.extract(source_text, start_offset, NONE)
+  else "val _ = HolbuildRuntime.restore_prover();\n" ^ String.extract(source_text, start_offset, NONE)
 
 fun instrumented_source policy timeout_marker plan_only_marker source_text start_offset checkpoints declaration_checkpoints terminations =
   if goalfrag_enabled policy then
@@ -2031,7 +2039,7 @@ fun failed_prefix_resume_source policy timeout_marker plan_only_marker source ch
          " " ^ HolbuildToolchain.sml_string (#failed_prefix_ok checkpoint)]
     val theorem_save_line =
       String.concat
-        ["val ", theorem_binding, " = Theory.save_thm(",
+        ["val ", theorem_binding, " = HolbuildRuntime.save_thm(",
          HolbuildToolchain.sml_string (#name checkpoint), ", ",
          finish_failed_prefix_call,
          ");\n"]
@@ -2087,15 +2095,15 @@ fun proof_ir_failed_prefix_repl_bootstrap () =
   String.concatWith "\n"
     ["val _ =",
      "  (HolbuildProofRuntime.install_repl_proof_state();",
-     "   print \"holbuild: failed proof state loaded; run p(); or proofManagerLib.p(); to inspect it.\\n\")",
+     "   HolbuildRuntime.print \"holbuild: failed proof state loaded; run p(); or proofManagerLib.p(); to inspect it.\\n\")",
      "  handle e =>",
-     "    print (\"holbuild: could not install failed proof state in proof manager: \" ^ General.exnMessage e ^ \"\\n\");"] ^ "\n"
+     "    HolbuildRuntime.print (\"holbuild: could not install failed proof state in proof manager: \" ^ General.exnMessage e ^ \"\\n\");"] ^ "\n"
 
 fun failure_repl_bootstrap_source policy checkpoint =
   case checkpoint of
       FailedPrefixRepl _ => proof_ir_failed_prefix_repl_bootstrap ()
     | OtherReplCheckpoint _ =>
-        "val _ = print \"holbuild: loaded checkpoint has no active proof state.\\n\";\n"
+        "val _ = HolbuildRuntime.print \"holbuild: loaded checkpoint has no active proof state.\\n\";\n"
 
 fun write_failure_repl_bootstrap stage policy checkpoint =
   let val path = Path.concat(stage, "holbuild-failure-repl.sml")
@@ -3201,11 +3209,12 @@ fun heap_theory_load_lines node =
 fun write_heap_loader plan output path =
   let
     val lines =
-      map load_theory_line (heap_external_theories plan) @
-      List.concat (map heap_theory_load_lines (HolbuildBuildPlan.selected_nodes plan)) @
-      [checkpoint_save_runtime_line (),
-       save_heap_line {label = "heap", share_common_data = false,
-                       output = output, ok_text = checkpoint_ok_v1 ()}]
+      runtime_line () ::
+      (map load_theory_line (heap_external_theories plan) @
+       List.concat (map heap_theory_load_lines (HolbuildBuildPlan.selected_nodes plan)) @
+       [checkpoint_save_runtime_line (),
+        save_heap_line {label = "heap", share_common_data = false,
+                        output = output, ok_text = checkpoint_ok_v1 ()}])
   in
     write_text path (String.concatWith "\n" lines ^ "\n")
   end

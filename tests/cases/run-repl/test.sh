@@ -49,7 +49,7 @@ require_grep "REPL_SMOKE_OK" "$repl_log"
 context="$project/.holbuild/holbuild-run-context.sml"
 require_file "$context"
 require_grep "loadPath :=" "$context"
-require_grep "load \"ATheory\"" "$context"
+require_grep "HolbuildRuntime.load \"ATheory\"" "$context"
 
 run_script=$tmpdir/run-smoke.sml
 cat > "$run_script" <<'SML'

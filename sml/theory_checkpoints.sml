@@ -148,18 +148,18 @@ fun save_declaration_context_line ({safe_name, context_path, context_ok, ...} : 
      HolbuildToolchain.sml_string ("definition_context:" ^ safe_name),
      ", default_share = false, path = ", HolbuildToolchain.sml_string context_path,
      ", ok_text = ", HolbuildToolchain.sml_string context_ok,
-     ", depth = length (PolyML.SaveState.showHierarchy())};\n"]
+     ", depth = HolbuildRuntime.save_hierarchy_depth ()};\n"]
 
 fun runtime_lines lines =
   String.concat (map (fn line => line ^ "\n") lines)
 
 val runtime_load_lines =
-  ["load \"smlExecute\";",
-   "load \"smlTimeout\";"]
+  ["HolbuildRuntime.load \"smlExecute\";",
+   "HolbuildRuntime.load \"smlTimeout\";"]
 
 val termination_runtime_lines =
-  ["load \"Defn\";",
-   "load \"proofManagerLib\";",
+  ["HolbuildRuntime.load \"Defn\";",
+   "HolbuildRuntime.load \"proofManagerLib\";",
    "structure HolbuildTerminationDiagnosticsRuntime = struct",
    "exception Rollback",
    "fun print_line text = (TextIO.output(TextIO.stdOut, text ^ \"\\n\"); TextIO.flushOut TextIO.stdOut)",
@@ -209,12 +209,12 @@ fun checkpoint_save_runtime_helper_path () =
 
 fun declaration_checkpoint_runtime_prelude [] = ""
   | declaration_checkpoint_runtime_prelude _ =
-      runtime_lines ["use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";"]
+      runtime_lines ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";"]
 
 fun runtime_install_lines {checkpoint_enabled, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} =
-  ["use " ^ HolbuildToolchain.sml_string (proof_ir_helper_path ()) ^ ";",
-   "use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";",
-   "use " ^ HolbuildToolchain.sml_string (proof_ir_runtime_helper_path ()) ^ ";",
+  ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (proof_ir_helper_path ()) ^ ";",
+   "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";",
+   "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (proof_ir_runtime_helper_path ()) ^ ";",
    "val _ = HolbuildProofRuntime.install {checkpoint_enabled = " ^
      (if checkpoint_enabled then "true" else "false") ^
      ", tactic_timeout = " ^ option_real_sml tactic_timeout ^
@@ -232,7 +232,7 @@ fun runtime_prelude _ [] = ""
 fun runtime_reinstall_prelude {checkpoint_enabled, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} =
   let
     val install =
-      ["use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";",
+      ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";",
        "val _ = HolbuildProofRuntime.install {checkpoint_enabled = " ^
          (if checkpoint_enabled then "true" else "false") ^
          ", tactic_timeout = " ^ option_real_sml tactic_timeout ^

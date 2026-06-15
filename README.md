@@ -16,6 +16,10 @@ exact git revisions.
 manifests only. The manifest format and CLI may still change before any future
 upstreaming into HOL.
 
+`holbuild` reserves top-level SML identifiers beginning with `Holbuild` for its
+own generated code and runtime support. User project code should not define
+values, structures, signatures, or functors with that prefix.
+
 ## Install from source
 
 You need Poly/ML and a HOL source checkout. The HOL checkout used here does not
@@ -57,7 +61,7 @@ Create `holproject.toml` in the root of your HOL project:
 ```toml
 [holbuild]
 schema = 2
-required_version = "0.6.0"  # optional
+required_version = "0.6.1"  # optional
 
 [project]
 name = "example"
@@ -158,7 +162,7 @@ working directory.
 ```toml
 [holbuild]
 schema = 2
-required_version = "0.6.0"
+required_version = "0.6.1"
 ```
 
 `schema = 2` is required. `required_version` is optional. If present, it must be
@@ -414,13 +418,13 @@ Maintainer checklist:
 4. Create and push an annotated tag:
 
    ```sh
-   git tag -a v0.6.0 -m "holbuild v0.6.0"
-   git push origin v0.6.0
+   git tag -a v0.6.1 -m "holbuild v0.6.1"
+   git push origin v0.6.1
    ```
 
 5. Create a GitHub Release from that tag:
    - GitHub repository → Releases → Draft a new release.
-   - Select the tag, for example `v0.6.0`.
+   - Select the tag, for example `v0.6.1`.
    - Use the tag as the title.
    - Summarise user-visible changes.
 
