@@ -16,6 +16,10 @@ exact git revisions.
 manifests only. The manifest format and CLI may still change before any future
 upstreaming into HOL.
 
+`holbuild` reserves top-level SML identifiers beginning with `Holbuild` for its
+own generated code and runtime support. User project code should not define
+values, structures, signatures, or functors with that prefix.
+
 ## Install from source
 
 You need Poly/ML and a HOL source checkout. The HOL checkout used here does not
