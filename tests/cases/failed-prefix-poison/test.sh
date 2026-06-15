@@ -74,12 +74,11 @@ if [[ -z "$fp" || ! -e "$fp.ok" ]]; then
   exit 1
 fi
 
-# Deliberately poison the failed-prefix metadata: make holbuild load the
-# checkpoint but replay the proof from step 0 against the saved post-prefix
-# proof state. A robust build should discard/ignore a failed failed-prefix
-# resume and retry from a safe checkpoint/fresh preload.
-printf 'step_count=0\nprefix_end=0\n' > "$fp.meta"
-printf '' > "$fp.prefix"
+# Deliberately poison the failed-prefix metadata: claim far more retained
+# proof-IR history than the checkpoint actually contains. A robust build
+# should discard/ignore a failed failed-prefix resume and retry from a safe
+# checkpoint/fresh preload.
+printf 'step_count=999\nprefix_end=0\n' > "$fp.meta"
 
 write_good_source
 retry_log=$tmpdir/retry.log

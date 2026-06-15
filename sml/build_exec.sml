@@ -2164,7 +2164,7 @@ fun write_theory_script policy project base_context plan keys input_key toolchai
           val _ = write_text staged_script (failed_prefix_resume_source policy timeout_marker plan_only_marker source_text checkpoints declaration_checkpoints terminations checkpoint step_count prefix_text)
           val _ = failed_prefix_resume_message node source_text checkpoint prefix_text
         in
-          {context = HolState path, files = [staged_script], failure_checkpoints = [path, deps_loaded], failed_prefix_context = SOME path}
+          {context = HolState path, files = [staged_script], failure_checkpoints = [path, deps_loaded], failed_prefix_context = SOME (path, step_count)}
         end
       fun run_from_replay {boundary, path, safe_name, kind, failure_checkpoints} =
         let
@@ -2284,10 +2284,20 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
     fun discard_failed_prefix_after_resume_failure () =
       case #failed_prefix_context run_spec of
           NONE => false
-        | SOME path =>
-            (remove_checkpoint path;
-             warn ("discarding failed-prefix checkpoint after failed resume: " ^ path);
-             true)
+        | SOME (path, _) =>
+            let
+              val failure_output = checkpoint_failure_output project node input_key stage
+              val failure_text =
+                case captured_output_path_option failure_output of
+                    NONE => ""
+                  | SOME output_path => read_text output_path handle _ => ""
+            in
+              if String.isSubstring "failed-prefix checkpoint cannot rewind" failure_text then
+                (remove_checkpoint path;
+                 warn ("discarding failed-prefix checkpoint after failed resume: " ^ path);
+                 true)
+              else false
+            end
     fun checkpoint_failure_error msg =
       let
         val failure_output = checkpoint_failure_output project node input_key stage
