@@ -2,8 +2,8 @@ structure HolbuildRuntime =
 struct
   val load = Meta.load
   val use = use
-  val print = print
-  val export_theory = export_theory
+  val print = TextIO.print
+  val export_theory = Theory.export_theory
   val restore_prover = Tactical.restore_prover
   val save_thm = Theory.save_thm
 
