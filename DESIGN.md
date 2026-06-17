@@ -556,8 +556,8 @@ hol build --gc
 
 GC should remove stale tmp dirs, remove old action manifests by refreshed mtime,
 mark blobs still reachable from non-expired manifests, and sweep old unreferenced
-blobs. Races with builds should degrade to cache misses and source rebuilds. The prototype
-uses a cache-local `locks/gc.lock` directory to avoid concurrent GC runs.
+blobs. Races with builds should degrade to cache misses and source rebuilds. Cache GC
+uses a cache-local POSIX file lock at `locks/gc.lock` to avoid concurrent GC runs.
 
 ## Heaps and checkpoints
 

@@ -106,4 +106,4 @@ GC:
 
 ## Project write lock
 
-`build`, `heap`, and project-clean `gc` take a coarse project write lock at `.holbuild/locks/project.lock`. Concurrent holbuild processes mutating the same `.holbuild/` are serialized. Stale locks (same host, dead PID) are auto-removed. Permission errors report the lock path.
+`build`, `heap`, and project-clean `gc` take a coarse POSIX project write lock at `.holbuild/locks/project.lock`. Concurrent holbuild processes mutating the same `.holbuild/` are serialized. Obsolete directory-style lock paths are removed/replaced during migration. Permission errors report the lock path.

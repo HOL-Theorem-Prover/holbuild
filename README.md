@@ -88,7 +88,7 @@ holbuild build
 the default roots. You can also build a specific logical target:
 
 ```sh
-holbuild build Example
+holbuild build ExampleTheory
 ```
 
 The target is the logical theory/module name, not an object filename.
