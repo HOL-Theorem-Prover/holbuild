@@ -92,8 +92,13 @@ fi
 require_grep "unknown build root: missing-root:src/MainScript.sml" "$tmpdir/missing-root.log"
 
 (cd "$project" && "$HOLBUILD_BIN" build) > "$tmpdir/default.log" 2> "$tmpdir/default.err"
-require_grep "discoverable theory script(s) are not reachable from build.roots" "$tmpdir/default.err"
-require_grep "unreachable: build-roots:src/ExtraScript.sml (ExtraTheory)" "$tmpdir/default.err"
+if grep -q "discoverable theory script(s) are not reachable from build.roots" "$tmpdir/default.err"; then
+  echo "unreachable root warnings should be opt-in" >&2
+  exit 1
+fi
+(cd "$project" && "$HOLBUILD_BIN" build --dry-run --warn-unreachable) > "$tmpdir/warn-unreachable.log" 2> "$tmpdir/warn-unreachable.err"
+require_grep "discoverable theory script(s) are not reachable from build.roots" "$tmpdir/warn-unreachable.err"
+require_grep "unreachable: build-roots:src/ExtraScript.sml (ExtraTheory)" "$tmpdir/warn-unreachable.err"
 require_file "$project/.holbuild/obj/src/DepTheory.dat"
 require_file "$project/.holbuild/obj/src/MainTheory.dat"
 if [[ -e "$project/.holbuild/obj/src/ExtraTheory.dat" ]]; then

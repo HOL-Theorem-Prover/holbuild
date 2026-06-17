@@ -20,7 +20,7 @@ rev = "<exact-40-character-commit>"
 [build]
 members = ["src", "lib"]   # source dirs/files relative to package root. Default: ["."]
 exclude = ["*/selftest.sml", "*/examples/*"]  # glob patterns, package-root-relative
-roots = ["src/MainScript.sml"]  # default build roots when no CLI target given
+roots = ["src/MainScript.sml"]  # default build roots when no CLI target given; use build --warn-unreachable to audit omitted scripts
 tactic_timeout = 60.0            # root-package per-step timeout; CLI/local config override
 
 [dependencies.depname]

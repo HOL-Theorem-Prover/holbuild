@@ -237,7 +237,8 @@ tactic_timeout = 10.0
 - `members` tells `holbuild` where to discover source files.
 - `exclude` removes package-root-relative glob matches from discovery.
 - `roots` are the default entry points when `holbuild build` is run with no
-  target.
+  target. Use `holbuild build --warn-unreachable` to report discoverable theory
+  scripts that are outside the root dependency closure.
 - `tactic_timeout` sets the default root-project proof-step timeout in seconds.
   The built-in default is `2.5`; `0` disables the timeout.
 - `root_tactic_timeouts` lets individual root source files set timeout contracts
