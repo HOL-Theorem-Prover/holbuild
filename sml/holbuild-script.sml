@@ -1,11 +1,3 @@
-fun compile_hol_source () =
-  case OS.Process.getEnv "HOL_SOURCE" of
-      SOME h => h
-    | NONE =>
-      raise Fail "set HOL_SOURCE=/path/to/HOL source checkout when compiling holbuild";
-
-val compile_time_hol_source = compile_hol_source ();
-
 structure HolbuildRuntimePaths =
 struct
   val source_root = OS.FileSys.getDir ()
@@ -13,7 +5,9 @@ end
 
 fun path_join (a, b) = OS.Path.concat(a, b);
 
-fun use_hol rel = use (path_join(compile_time_hol_source, rel));
+val vendored_hol_source = path_join(HolbuildRuntimePaths.source_root, "vendor/hol");
+
+fun use_hol rel = use (path_join(vendored_hol_source, rel));
 
 use_hol("tools-poly/poly/Binarymap.sig");
 use_hol("tools-poly/poly/Binarymap.sml");

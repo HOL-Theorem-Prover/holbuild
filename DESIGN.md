@@ -156,9 +156,9 @@ checkout used to compile the holbuild executable.
 
 Root HOL should be built through holbuild's own model, using an in-tree or
 default HOL manifest. HOL is not permanently treated as an opaque legacy build.
-The current external implementation still requires a HOL checkout at compile time
-so it can reuse HOL implementation pieces. That is a build-time host/tool
-dependency, not a project semantic state model. During the transition, holbuild
+The current external implementation vendors the small set of HOL implementation
+pieces needed to compile the holbuild executable under `vendor/hol`. That is a
+build-time host/tool dependency, not a project semantic state model. During the transition, holbuild
 starts target actions from the project HOL's `bin/hol.state` and includes that
 heap in the toolchain key; it
 does not copy it into a project-local `_base` checkpoint. The target model

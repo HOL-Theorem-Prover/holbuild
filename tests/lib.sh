@@ -19,7 +19,7 @@ make_temp_dir() {
 }
 
 holbuild_pinned_hol_rev() {
-  tr -d '[:space:]' < "${HOLBUILD_ROOT:?HOLBUILD_ROOT not set}/PINS/hol.txt"
+  tr -d '[:space:]' < "${HOLBUILD_ROOT:?HOLBUILD_ROOT not set}/vendor/hol/REV"
 }
 
 write_schema2_prelude() {

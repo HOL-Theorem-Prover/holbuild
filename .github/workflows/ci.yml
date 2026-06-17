@@ -7,10 +7,6 @@ on:
     branches: [master]
   workflow_dispatch:
     inputs:
-      hol4-ref:
-        description: 'HOL4 git ref to test against; defaults to PINS/hol.txt'
-        required: false
-        default: ''
       test-jobs:
         description: 'Number of holbuild test cases to run concurrently'
         required: false
@@ -29,7 +25,7 @@ jobs:
 
       - name: Read HOL4 pin
         id: hol4-pin
-        run: echo "hol4-ref=$(tr -d '[:space:]' < PINS/hol.txt)" >> "$GITHUB_OUTPUT"
+        run: echo "hol4-ref=$(tr -d '[:space:]' < vendor/hol/REV)" >> "$GITHUB_OUTPUT"
 
       - uses: ./.github/actions/setup-polyml
         id: polyml
@@ -37,52 +33,28 @@ jobs:
       - name: Configure holbuild test cache
         run: echo "HOLBUILD_CACHE=$HOME/.cache/holbuild" >> "$GITHUB_ENV"
 
-      - name: Restore HOL source cache
-        id: hol-source-cache
-        uses: actions/cache/restore@v5
-        with:
-          path: .ci/HOL-source
-          key: hol-source-${{ steps.hol4-pin.outputs.hol4-ref }}
-
-      - name: Checkout HOL source pin
-        run: |
-          mkdir -p .ci
-          if [ ! -d .ci/HOL-source/.git ]; then
-            git clone https://github.com/HOL-Theorem-Prover/HOL.git .ci/HOL-source
-          fi
-          git -C .ci/HOL-source fetch --quiet origin "${{ steps.hol4-pin.outputs.hol4-ref }}"
-          git -C .ci/HOL-source checkout --quiet "${{ steps.hol4-pin.outputs.hol4-ref }}"
-          test "$(git -C .ci/HOL-source rev-parse HEAD)" = "${{ steps.hol4-pin.outputs.hol4-ref }}"
-
-      - name: Save HOL source cache
-        if: steps.hol-source-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
-        with:
-          path: .ci/HOL-source
-          key: hol-source-${{ steps.hol4-pin.outputs.hol4-ref }}
-
       - name: Restore HOL toolchain cache
         id: hol-toolchain-cache
         uses: actions/cache/restore@v5
         with:
           path: ~/.cache/holbuild/hol-toolchains
-          key: hol-toolchains-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ inputs.hol4-ref || steps.hol4-pin.outputs.hol4-ref }}-v2
+          key: hol-toolchains-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ steps.hol4-pin.outputs.hol4-ref }}-v2
 
       - name: Setup schema2 HOL cache
-        run: tools/setup-hol-toolchain-cache.sh "${{ inputs.hol4-ref || steps.hol4-pin.outputs.hol4-ref }}" >> "$GITHUB_ENV"
+        run: tools/setup-hol-toolchain-cache.sh "${{ steps.hol4-pin.outputs.hol4-ref }}" >> "$GITHUB_ENV"
 
       - name: Save HOL toolchain cache
         if: steps.hol-toolchain-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
         with:
           path: ~/.cache/holbuild/hol-toolchains
-          key: hol-toolchains-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ inputs.hol4-ref || steps.hol4-pin.outputs.hol4-ref }}-v2
+          key: hol-toolchains-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ steps.hol4-pin.outputs.hol4-ref }}-v2
 
       - name: Build holbuild
-        run: make HOL_SOURCE="$PWD/.ci/HOL-source"
+        run: make
 
       - name: Run tests
         env:
           TMPDIR: ${{ runner.temp }}
           HOLBUILD_TEST_JOBS: ${{ inputs.test-jobs || '4' }}
-        run: make HOL_SOURCE="$PWD/.ci/HOL-source" HOLDIR="$HOLDIR" test
+        run: make HOLDIR="$HOLDIR" test

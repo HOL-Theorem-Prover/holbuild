@@ -22,16 +22,11 @@ values, structures, signatures, or functors with that prefix.
 
 ## Install from source
 
-You need Poly/ML and a HOL source checkout. The HOL checkout used here does not
-need to be built; it is only used to compile the `holbuild` executable.
-
-The checkout must be at the revision pinned in `PINS/hol.txt`:
+You need Poly/ML. The small set of HOL source files needed to compile the
+`holbuild` executable is vendored under `vendor/hol`.
 
 ```sh
-git clone https://github.com/HOL-Theorem-Prover/HOL.git /path/to/HOL-source
-git -C /path/to/HOL-source checkout "$(cat PINS/hol.txt)"
-
-make HOL_SOURCE=/path/to/HOL-source
+make
 ```
 
 Check the resulting binary:
@@ -43,7 +38,14 @@ bin/holbuild --version
 Optional install:
 
 ```sh
-make HOL_SOURCE=/path/to/HOL-source install
+make install
+```
+
+Maintainers can update the pinned HOL revision and refresh the vendored HOL
+source files with:
+
+```sh
+tools/update-vendored-hol.sh [--from /path/to/HOL-checkout] <40-char-HOL-commit>
 ```
 
 By default this installs to:
@@ -392,17 +394,11 @@ holbuild build
 Do not pass `HOLDIR` to choose the project HOL. The project HOL is selected by
 `[dependencies.hol]`.
 
-If CI builds `holbuild` from source, provide the pinned source-only HOL checkout:
-
-```sh
-git clone https://github.com/HOL-Theorem-Prover/HOL.git .ci/HOL-source
-git -C .ci/HOL-source checkout "$(cat PINS/hol.txt)"
-make HOL_SOURCE="$PWD/.ci/HOL-source"
-```
+If CI builds `holbuild` from source, no separate HOL source checkout is needed;
+run `make`. The pinned HOL revision is recorded in `vendor/hol/REV`.
 
 Useful caches:
 
-- `.ci/HOL-source`, keyed by `PINS/hol.txt`, if building `holbuild` from source.
 - `$HOLBUILD_CACHE/hol-toolchains`, keyed by the project HOL revision and Poly/ML
   version.
 
@@ -411,11 +407,11 @@ Useful caches:
 Repository tests need a built HOL checkout as test input:
 
 ```sh
-make HOL_SOURCE=/path/to/HOL-source HOLDIR=/path/to/built/HOL test
+make HOLDIR=/path/to/built/HOL test
 ```
 
-The source checkout used by `HOL_SOURCE` and the built checkout used by `HOLDIR`
-may be the same directory if that checkout is also at `PINS/hol.txt` and built.
+The built checkout used by `HOLDIR` must be at the revision recorded in
+`vendor/hol/REV`.
 
 ## Release process
 

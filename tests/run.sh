@@ -13,10 +13,10 @@ if [[ -z "$HOLDIR" ]]; then
   exit 2
 fi
 
-pinned_hol_rev=$(tr -d '[:space:]' < "$ROOT/PINS/hol.txt")
+pinned_hol_rev=$(tr -d '[:space:]' < "$ROOT/vendor/hol/REV")
 holdir_rev=$(git -C "$HOLDIR" rev-parse HEAD)
 if [[ "$holdir_rev" != "$pinned_hol_rev" ]]; then
-  echo "HOLDIR rev $holdir_rev does not match PINS/hol.txt $pinned_hol_rev" >&2
+  echo "HOLDIR rev $holdir_rev does not match vendor/hol/REV $pinned_hol_rev" >&2
   exit 2
 fi
 

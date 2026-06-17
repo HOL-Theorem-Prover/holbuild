@@ -4,14 +4,14 @@
 
 Projects must use `holproject.toml` schema 2 and declare the project HOL toolchain as `[dependencies.hol]`. Commands that need HOL build or reuse that declared HOL under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`.
 
-Building the current external `holbuild` executable still requires a HOL checkout at compile time:
+Building the current external `holbuild` executable requires Poly/ML; the small set of HOL source files needed at compile time is vendored under `vendor/hol`:
 
 ```sh
-make HOLDIR=/path/to/HOL
-make HOLDIR=/path/to/HOL test
+make
+make HOLDIR=/path/to/built/HOL test
 ```
 
-That `HOLDIR` is only a temporary implementation input for compiling/testing `holbuild`; it is not a project/runtime configuration mechanism. `holbuild` commands no longer support `--holdir`, `HOLDIR`, or `HOLBUILD_HOLDIR`.
+That `HOLDIR` is only a test input for holbuild's own test suite; it is not a project/runtime configuration mechanism. `holbuild` commands no longer support `--holdir`, `HOLDIR`, or `HOLBUILD_HOLDIR`.
 
 ## Minimal project
 
