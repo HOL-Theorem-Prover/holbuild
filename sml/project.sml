@@ -378,14 +378,14 @@ fun validate_schema table =
   case table_field table ["holbuild"] of
       NONE => ()
     | SOME holbuild =>
-        (require_known_fields "holbuild" ["schema", "required_version"] holbuild;
+        (require_known_fields "holbuild" ["schema", "minimum_version"] holbuild;
          ignore (schema_version table);
-         case string_at holbuild ["required_version"] of
+         case string_at holbuild ["minimum_version"] of
              NONE => ()
            | SOME "" => ()
            | SOME required =>
                (HolbuildVersion.require_at_least required
-                handle HolbuildVersion.Error msg => die ("invalid holbuild.required_version: " ^ msg)))
+                handle HolbuildVersion.Error msg => die ("invalid holbuild.minimum_version: " ^ msg)))
 
 fun validate_dependency_table (name, table) =
   let
