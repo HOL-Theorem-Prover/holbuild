@@ -250,6 +250,26 @@ require_file "$no_export_project/.holbuild/obj/src/ATheory.sig"
 require_file "$no_export_project/.holbuild/obj/src/ATheory.sml"
 require_file "$no_export_project/.holbuild/obj/src/ATheory.dat"
 
+child_failure_project=$tmpdir/child-failure-project
+mkdir -p "$child_failure_project/src"
+cp "$project/holproject.toml" "$child_failure_project/holproject.toml"
+cat > "$child_failure_project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+val _ = print "child failure debug marker\n";
+val _ = raise Fail "forced child failure";
+SML
+child_failure_log=$tmpdir/child-failure.log
+if (cd "$child_failure_project" && "$HOLBUILD_BIN" build ATheory) > "$child_failure_log" 2>&1; then
+  echo "expected child failure build to fail" >&2
+  exit 1
+fi
+require_grep "end child log tail" "$child_failure_log"
+require_grep "child log: .*\.holbuild/logs/.*-ATheory-child-failure\.log" "$child_failure_log"
+retained_child_log=$(awk '/child log: / { path=$0; sub(/^child log: /, "", path) } END { print path }' "$child_failure_log")
+require_file "$retained_child_log"
+require_grep "child failure debug marker" "$retained_child_log"
+
 skip_project=$tmpdir/skip-project
 mkdir -p "$skip_project/src"
 cp "$project/holproject.toml" "$skip_project/holproject.toml"

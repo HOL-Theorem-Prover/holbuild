@@ -340,6 +340,9 @@ fun log_dir (project : HolbuildProject.t) = Path.concat(project_artifact_root pr
 fun retained_checkpoint_failure_log project node input_key =
   Path.concat(log_dir project, input_key ^ "-" ^ logical_name node ^ "-instrumented-failure.log")
 
+fun retained_child_failure_log project node input_key =
+  Path.concat(log_dir project, input_key ^ "-" ^ logical_name node ^ "-child-failure.log")
+
 fun retained_goalfrag_trace_log project node input_key =
   Path.concat(log_dir project, input_key ^ "-" ^ logical_name node ^ "-goalfrag-trace.log")
 
@@ -861,6 +864,11 @@ fun tail_text path =
       text
     end
 
+fun preserve_child_log src NONE = src
+  | preserve_child_log src (SOME dst) =
+      if HolbuildStatus.json_mode () andalso not (HolbuildStatus.retain_debug_artifacts ()) then src
+      else (ensure_parent dst; copy_binary src dst; dst) handle _ => src
+
 fun child_log_detail path =
   if file_exists path then
     if HolbuildStatus.json_mode () then
@@ -870,10 +878,10 @@ fun child_log_detail path =
          "--- end child log tail ---"]
     else
       String.concatWith "\n"
-        ["child log: " ^ path,
-         "--- child log tail ---",
+        ["--- child log tail ---",
          tail_text path,
-         "--- end child log tail ---"]
+         "--- end child log tail ---",
+         "child log: " ^ path]
   else if HolbuildStatus.json_mode () then
     "child log was not created"
   else
@@ -888,7 +896,7 @@ fun cache_trace line =
 fun hol_run_file_arg stage file =
   if canonical_path (Path.dir file) = canonical_path stage then Path.file file else file
 
-fun run_hol_files_to_log tc stage workdir context files log_name error_message =
+fun run_hol_files_to_log tc stage workdir context files log_name retained_failure_log error_message =
   let
     val log = Path.concat(stage, log_name)
     val file_args = map (hol_run_file_arg workdir) files
@@ -900,9 +908,12 @@ fun run_hol_files_to_log tc stage workdir context files log_name error_message =
     if HolbuildToolchain.success status then
       if echo_child_logs () then HolbuildStatus.message_stdout (read_text log handle _ => "") else ()
     else
-      raise Error (String.concatWith "\n"
-        [error_message,
-         child_log_detail log])
+      let val detail_log = preserve_child_log log retained_failure_log
+      in
+        raise Error (String.concatWith "\n"
+          [error_message,
+           child_log_detail detail_log])
+      end
   end
 
 fun toolchain_base_context tc = HolState (HolbuildToolchain.base_state tc)
@@ -2357,6 +2368,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
         (#context run_spec)
         (#files run_spec @ [final_loader])
         "holbuild-build.log"
+        (SOME (retained_child_failure_log project node input_key))
         "hol run failed while building theory script"
       handle Error msg =>
         if invalid_checkpoint_retryable base_context (#context run_spec) msg then
@@ -3255,6 +3267,7 @@ fun export_heap tc (project : HolbuildProject.t) plan output =
     write_heap_loader plan output loader;
     run_hol_files_to_log tc stage stage base_context [loader]
       "holbuild-heap.log"
+      NONE
       ("hol run failed while exporting heap: " ^ output);
     remove_tree stage
   end

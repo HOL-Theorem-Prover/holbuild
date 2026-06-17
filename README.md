@@ -330,6 +330,10 @@ holbuild build --skip-checkpoints MyTheory
 - `--skip-proof-steps` opts out of proof-step execution.
 - `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation.
 
+When a child HOL process fails, holbuild retains the full child log under
+`.holbuild/logs/`, prints the log tail, and leaves the retained `child log:` path
+as the final line of the failure detail.
+
 Compatibility aliases:
 
 - `--skip-goalfrag` warns and behaves like `--skip-proof-steps`.
