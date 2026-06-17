@@ -38,15 +38,8 @@ fun remove_tree path =
   else ignore (OS.Process.system ("rm -rf " ^ quote path))
 
 fun cache_root () =
-  case OS.Process.getEnv "HOLBUILD_CACHE" of
-      SOME path => path
-    | NONE =>
-      case OS.Process.getEnv "XDG_CACHE_HOME" of
-          SOME base => Path.concat(base, "holbuild")
-        | NONE =>
-          case OS.Process.getEnv "HOME" of
-              SOME home => Path.concat(Path.concat(home, ".cache"), "holbuild")
-            | NONE => die "set HOME, XDG_CACHE_HOME, or HOLBUILD_CACHE"
+  HolbuildCacheConfig.cache_root ()
+  handle HolbuildCacheConfig.Error msg => die msg
 
 fun canonical_git () = Option.getOpt(OS.Process.getEnv "HOLBUILD_CANONICAL_HOL_GIT", default_canonical_git)
 

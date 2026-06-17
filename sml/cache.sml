@@ -22,15 +22,8 @@ fun ensure_dir path =
   else (ensure_dir (Path.dir path); FS.mkDir path handle OS.SysErr _ => ())
 
 fun cache_root () =
-  case OS.Process.getEnv "HOLBUILD_CACHE" of
-      SOME path => path
-    | NONE =>
-      case OS.Process.getEnv "XDG_CACHE_HOME" of
-          SOME base => Path.concat(base, "holbuild")
-        | NONE =>
-          case OS.Process.getEnv "HOME" of
-              SOME home => Path.concat(Path.concat(home, ".cache"), "holbuild")
-            | NONE => raise Error "set HOME, XDG_CACHE_HOME, or HOLBUILD_CACHE"
+  HolbuildCacheConfig.cache_root ()
+  handle HolbuildCacheConfig.Error msg => raise Error msg
 
 fun actions_dir root = Path.concat(root, "actions")
 fun blobs_dir root = Path.concat(root, "blobs")
@@ -298,20 +291,19 @@ fun parse_days text =
 
 fun parse_gc_args args =
   let
-    fun loop root days rest =
+    fun loop days rest =
       case rest of
-          [] => (root, days)
-        | "--cache-dir" :: path :: xs => loop (SOME path) days xs
-        | "--retention-days" :: n :: xs => loop root (parse_days n) xs
-        | "--days" :: n :: xs => loop root (parse_days n) xs
+          [] => days
+        | "--retention-days" :: n :: xs => loop (parse_days n) xs
+        | "--days" :: n :: xs => loop (parse_days n) xs
         | arg :: _ => raise Error ("unknown cache gc option: " ^ arg)
   in
-    loop NONE default_retention_days args
+    loop default_retention_days args
   end
 
 fun gc args =
-  let val (root, days) = parse_gc_args args
-  in gc_root (Option.getOpt(root, cache_root ())) days end
+  let val days = parse_gc_args args
+  in gc_root (cache_root ()) days end
 
 fun dispatch args =
   case args of

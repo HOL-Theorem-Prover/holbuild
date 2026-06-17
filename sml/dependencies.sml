@@ -367,16 +367,7 @@ fun extract_cached {cache_path, source_path} =
                             source_path = source_path,
                             source_hash = HolbuildHash.file_sha1 source_path}
 
-fun cache_root () =
-  case OS.Process.getEnv "HOLBUILD_CACHE" of
-      SOME path => SOME path
-    | NONE =>
-        (case OS.Process.getEnv "XDG_CACHE_HOME" of
-             SOME base => SOME (Path.concat(base, "holbuild"))
-           | NONE =>
-               case OS.Process.getEnv "HOME" of
-                   SOME home => SOME (Path.concat(Path.concat(home, ".cache"), "holbuild"))
-                 | NONE => NONE)
+fun cache_root () = HolbuildCacheConfig.cache_root_option ()
 
 fun external_cache_path root source_hash =
   Path.concat(root, Path.concat("deps", Path.concat("external", source_hash ^ ".deps")))

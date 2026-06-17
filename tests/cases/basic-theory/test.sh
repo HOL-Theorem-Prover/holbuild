@@ -213,6 +213,26 @@ if grep -q "ATheory restored from cache" "$no_cache_after_log"; then
 fi
 require_file "$no_cache_publish_project/.holbuild/obj/src/ATheory.dat"
 
+cache_dir_option_project=$tmpdir/cache-dir-option-project
+cache_dir_option_cache=$tmpdir/cache-dir-option-cache
+cache_dir_option_ignored_cache=$tmpdir/cache-dir-option-ignored-cache
+mkdir -p "$cache_dir_option_project/src"
+link_hol_toolchain_cache "$cache_dir_option_cache"
+cp "$project/holproject.toml" "$cache_dir_option_project/holproject.toml"
+cp "$project/src/AScript.sml" "$cache_dir_option_project/src/AScript.sml"
+cache_dir_option_log=$tmpdir/cache-dir-option.log
+(cd "$cache_dir_option_project" && HOLBUILD_CACHE="$cache_dir_option_ignored_cache" \
+  "$HOLBUILD_BIN" build --cache-dir "$cache_dir_option_cache" ATheory) > "$cache_dir_option_log"
+if ! find "$cache_dir_option_cache/actions" -mindepth 2 -maxdepth 2 -name manifest -print -quit | grep -q .; then
+  echo "--cache-dir build did not publish to selected cache" >&2
+  exit 1
+fi
+if [[ -d "$cache_dir_option_ignored_cache/actions" ]] && find "$cache_dir_option_ignored_cache/actions" -mindepth 2 -maxdepth 2 -name manifest -print -quit | grep -q .; then
+  echo "--cache-dir build used HOLBUILD_CACHE instead of selected cache" >&2
+  exit 1
+fi
+require_file "$cache_dir_option_project/.holbuild/obj/src/ATheory.dat"
+
 no_export_project=$tmpdir/no-export-project
 mkdir -p "$no_export_project/src"
 cp "$project/holproject.toml" "$no_export_project/holproject.toml"

@@ -89,7 +89,7 @@ Supported dependency forms are deliberately narrow:
   root. Both paths are relative and cannot contain `..`.
 
 Schema 2 rejects path dependencies, local overrides, git manifests, branches,
-tags, ranges, registry names, and multiple versions. `[holbuild].required_version`
+tags, ranges, registry names, and multiple versions. `[holbuild].minimum_version`
 is an optional `MAJOR.MINOR.PATCH` minimum holbuild version check.
 
 For a root project, all dependency source checkouts are materialized once under:
@@ -537,7 +537,7 @@ Expose one user-facing maintenance command:
 ```text
 holbuild gc
 holbuild gc --retention-days 7
-holbuild gc --cache-dir /path/to/cache
+holbuild --cache-dir /path/to/cache gc
 holbuild gc --clean-only
 holbuild gc --cache-only
 ```
@@ -546,7 +546,7 @@ By default `holbuild gc` takes the project lock, removes stale project-local
 `.holbuild/stage`, `.holbuild/logs`, and checkpoint artifacts, then runs global
 cache GC. `--clean-only` skips cache GC. `--cache-only` skips project discovery
 and locking, so it works without a HOL toolchain. The cache root is
-`$HOLBUILD_CACHE`, else `$XDG_CACHE_HOME/holbuild`, else `$HOME/.cache/holbuild`.
+`--cache-dir`, else `$HOLBUILD_CACHE`, else `$XDG_CACHE_HOME/holbuild`, else `$HOME/.cache/holbuild`.
 
 Future in-tree spelling may be:
 
@@ -556,8 +556,8 @@ hol build --gc
 
 GC should remove stale tmp dirs, remove old action manifests by refreshed mtime,
 mark blobs still reachable from non-expired manifests, and sweep old unreferenced
-blobs. Races with builds should degrade to cache misses and source rebuilds. The prototype
-uses a cache-local `locks/gc.lock` directory to avoid concurrent GC runs.
+blobs. Races with builds should degrade to cache misses and source rebuilds. Cache GC
+uses a cache-local POSIX file lock at `locks/gc.lock` to avoid concurrent GC runs.
 
 ## Heaps and checkpoints
 

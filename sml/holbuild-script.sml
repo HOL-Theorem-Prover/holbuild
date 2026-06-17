@@ -31,6 +31,7 @@ use_hol("src/portableML/Redblackset.sml");
 use "sml/hash.sml";
 use "sml/version.sml";
 use "sml/builtin_manifests.sml";
+use "sml/cache_config.sml";
 use "sml/git_cache.sml";
 use "sml/file_lock.sml";
 use "sml/hol_shared_cache.sml";

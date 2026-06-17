@@ -146,4 +146,3 @@ With `--json`, failures are emitted as structured `error`/`node_failed` JSONL ev
 | `HOLBUILD_STATUS` | `1`/`true` = enable status display, `0`/`false` = disable |
 | `HOLBUILD_TIMING_LOG` | Path for structured timing data (tool + coarse phase lines, including `build.keys` action-key computation) |
 | `HOLBUILD_TIMING_DETAIL` | Optional timing coarseness: unset/`coarse` logs coarse phases only; `fine` adds aggregate subphase lines; `trace` is reserved for future per-item detail |
-| `HOLBUILD_GOALFRAG_RUNTIME` | Override path to legacy `goalfrag_runtime.sml` |

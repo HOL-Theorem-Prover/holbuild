@@ -57,6 +57,7 @@ holbuild --json build --retain-debug-artifacts FooTheory  # also retain/report f
 ## Global flags
 
 - `--source-dir PATH` — source tree for manifest discovery; `.holbuild/` artifacts are written under the shell cwd
+- `--cache-dir PATH` — override the global cache directory for this command
 - `--maxheap MB` / `--max-heap MB` — pass Poly/ML max heap to child HOL processes
 - `-jN` / `--jobs N` — parallel workers. Default: `.holconfig.toml [build].jobs` or `max(1, nproc/2)`
 - `--json` — newline-delimited streaming JSON `message`, `node_started`, `node_finished`, `node_failed`, `build_finished`, and `error` events on stdout (build only; no retained log paths by default; not dry-run/plan/trace/repl-on-failure)
@@ -88,7 +89,7 @@ holbuild gc                                      # project clean + global cache 
 holbuild gc --retention-days 30                 # custom retention
 holbuild gc --max-checkpoints-gb 10             # size cap for project checkpoints
 holbuild gc --clean-only                        # project .holbuild residue only
-holbuild gc --cache-only --cache-dir /path      # global cache only; no project HOL needed
+holbuild --cache-dir /path gc --cache-only      # global cache only; no project HOL needed
 holbuild cache gc                               # legacy cache-only form still exists
 ```
 

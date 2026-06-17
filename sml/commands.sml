@@ -16,19 +16,20 @@ fun usage () = print
   "holbuild: experimental project-aware build frontend for HOL4\n\n\
   \Usage:\n\
   \  holbuild --version\n\
-  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--maxheap MB] [-jN] context\n\
-  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--maxheap MB] [-jN] execution-plan THEORY:THEOREM\n\
-  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--maxheap MB] [-jN] build [--dry-run] [--force[=theory|project|full]] [--no-cache] [--skip-checkpoints] [--skip-proof-steps] [--tactic-timeout SECONDS] [--trace-steps] [--repl-on-failure] [--retain-debug-artifacts] [TARGET ...]\n\
-  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] clean THEORY...\n\
-  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--maxheap MB] [-jN] heap NAME\n\
-  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--maxheap MB] run [ARG ...]\n\
-  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--maxheap MB] repl [ARG ...]\n\
-  \  holbuild [--source-dir PATH] buildhol\n\
-  \  holbuild gc [--retention-days DAYS] [--max-checkpoints-gb GB] [--cache-dir PATH] [--clean-only|--cache-only]\n\n\
+  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--cache-dir PATH] [--maxheap MB] [-jN] context\n\
+  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--cache-dir PATH] [--maxheap MB] [-jN] execution-plan THEORY:THEOREM\n\
+  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--cache-dir PATH] [--maxheap MB] [-jN] build [--dry-run] [--force[=theory|project|full]] [--no-cache] [--skip-checkpoints] [--skip-proof-steps] [--tactic-timeout SECONDS] [--trace-steps] [--repl-on-failure] [--retain-debug-artifacts] [TARGET ...]\n\
+  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--cache-dir PATH] clean THEORY...\n\
+  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--cache-dir PATH] [--maxheap MB] [-jN] heap NAME\n\
+  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--cache-dir PATH] [--maxheap MB] run [ARG ...]\n\
+  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--cache-dir PATH] [--maxheap MB] repl [ARG ...]\n\
+  \  holbuild [--source-dir PATH] [--cache-dir PATH] buildhol\n\
+  \  holbuild [--cache-dir PATH] gc [--retention-days DAYS] [--max-checkpoints-gb GB] [--clean-only|--cache-only]\n\n\
   \Projects must use schema 2 and declare dependencies.hol. Commands that need HOL\n\
   \build/reuse the declared HOL tree in the global cache. --holdir/HOLDIR are no\n\
   \longer supported.\n\
   \Project sources are found from --source-dir, HOLBUILD_SOURCE_DIR, or cwd.\n\
+  \--cache-dir overrides HOLBUILD_CACHE/XDG_CACHE_HOME/HOME for the global cache.\n\
   \-j/--jobs controls build parallelism. Default is .holconfig.toml [build].jobs,\n\
   \or max(1, detected processor count / 2). --maxheap/--max-heap passes Poly/ML\n\
   \maximum heap size in MB to child HOL processes. --json emits newline-delimited\n\
@@ -346,45 +347,49 @@ fun verbosity_value text =
 
 fun parse_global_options args =
   let
-    fun loop holdir source_dir jobs maxheap json verbosity rest =
+    fun loop holdir source_dir cache_dir jobs maxheap json verbosity rest =
       case rest of
-          [] => ({holdir = holdir, source_dir = source_dir, jobs = jobs, maxheap = maxheap, json = json, verbosity = verbosity}, [])
-        | "--json" :: xs => loop holdir source_dir jobs maxheap true verbosity xs
-        | "--quiet" :: xs => loop holdir source_dir jobs maxheap json HolbuildStatus.Quiet xs
-        | "--verbose" :: xs => loop holdir source_dir jobs maxheap json HolbuildStatus.Verbose xs
-        | "--verbosity" :: level :: xs => loop holdir source_dir jobs maxheap json (verbosity_value level) xs
-        | "--holdir" :: path :: xs => loop (SOME path) source_dir jobs maxheap json verbosity xs
-        | "--source-dir" :: path :: xs => loop holdir (SOME path) jobs maxheap json verbosity xs
-        | "--jobs" :: n :: xs => loop holdir source_dir (SOME (positive_int "--jobs" n)) maxheap json verbosity xs
-        | "-j" :: n :: xs => loop holdir source_dir (SOME (positive_int "-j" n)) maxheap json verbosity xs
-        | "--maxheap" :: n :: xs => loop holdir source_dir jobs (SOME (positive_int "--maxheap" n)) json verbosity xs
-        | "--max-heap" :: n :: xs => loop holdir source_dir jobs (SOME (positive_int "--max-heap" n)) json verbosity xs
+          [] => ({holdir = holdir, source_dir = source_dir, cache_dir = cache_dir, jobs = jobs, maxheap = maxheap, json = json, verbosity = verbosity}, [])
+        | "--json" :: xs => loop holdir source_dir cache_dir jobs maxheap true verbosity xs
+        | "--quiet" :: xs => loop holdir source_dir cache_dir jobs maxheap json HolbuildStatus.Quiet xs
+        | "--verbose" :: xs => loop holdir source_dir cache_dir jobs maxheap json HolbuildStatus.Verbose xs
+        | "--verbosity" :: level :: xs => loop holdir source_dir cache_dir jobs maxheap json (verbosity_value level) xs
+        | "--holdir" :: path :: xs => loop (SOME path) source_dir cache_dir jobs maxheap json verbosity xs
+        | "--source-dir" :: path :: xs => loop holdir (SOME path) cache_dir jobs maxheap json verbosity xs
+        | "--cache-dir" :: path :: xs => loop holdir source_dir (SOME path) jobs maxheap json verbosity xs
+        | "--jobs" :: n :: xs => loop holdir source_dir cache_dir (SOME (positive_int "--jobs" n)) maxheap json verbosity xs
+        | "-j" :: n :: xs => loop holdir source_dir cache_dir (SOME (positive_int "-j" n)) maxheap json verbosity xs
+        | "--maxheap" :: n :: xs => loop holdir source_dir cache_dir jobs (SOME (positive_int "--maxheap" n)) json verbosity xs
+        | "--max-heap" :: n :: xs => loop holdir source_dir cache_dir jobs (SOME (positive_int "--max-heap" n)) json verbosity xs
         | "--verbosity" :: [] => raise Error "--verbosity requires LEVEL"
         | "--holdir" :: [] => raise Error "--holdir requires PATH"
         | "--source-dir" :: [] => raise Error "--source-dir requires PATH"
+        | "--cache-dir" :: [] => raise Error "--cache-dir requires PATH"
         | "--jobs" :: [] => raise Error "--jobs requires N"
         | "-j" :: [] => raise Error "-j requires N"
         | "--maxheap" :: [] => raise Error "--maxheap requires MB"
         | "--max-heap" :: [] => raise Error "--max-heap requires MB"
         | arg :: xs =>
             if String.isPrefix "--verbosity=" arg then
-              loop holdir source_dir jobs maxheap json (verbosity_value (String.extract (arg, size "--verbosity=", NONE))) xs
+              loop holdir source_dir cache_dir jobs maxheap json (verbosity_value (String.extract (arg, size "--verbosity=", NONE))) xs
             else if String.isPrefix "--holdir=" arg then
-              loop (SOME (String.extract (arg, size "--holdir=", NONE))) source_dir jobs maxheap json verbosity xs
+              loop (SOME (String.extract (arg, size "--holdir=", NONE))) source_dir cache_dir jobs maxheap json verbosity xs
             else if String.isPrefix "--source-dir=" arg then
-              loop holdir (SOME (String.extract (arg, size "--source-dir=", NONE))) jobs maxheap json verbosity xs
+              loop holdir (SOME (String.extract (arg, size "--source-dir=", NONE))) cache_dir jobs maxheap json verbosity xs
+            else if String.isPrefix "--cache-dir=" arg then
+              loop holdir source_dir (SOME (String.extract (arg, size "--cache-dir=", NONE))) jobs maxheap json verbosity xs
             else if String.isPrefix "--jobs=" arg then
-              loop holdir source_dir (SOME (positive_int "--jobs" (String.extract (arg, size "--jobs=", NONE)))) maxheap json verbosity xs
+              loop holdir source_dir cache_dir (SOME (positive_int "--jobs" (String.extract (arg, size "--jobs=", NONE)))) maxheap json verbosity xs
             else if String.isPrefix "--maxheap=" arg then
-              loop holdir source_dir jobs (SOME (positive_int "--maxheap" (String.extract (arg, size "--maxheap=", NONE)))) json verbosity xs
+              loop holdir source_dir cache_dir jobs (SOME (positive_int "--maxheap" (String.extract (arg, size "--maxheap=", NONE)))) json verbosity xs
             else if String.isPrefix "--max-heap=" arg then
-              loop holdir source_dir jobs (SOME (positive_int "--max-heap" (String.extract (arg, size "--max-heap=", NONE)))) json verbosity xs
+              loop holdir source_dir cache_dir jobs (SOME (positive_int "--max-heap" (String.extract (arg, size "--max-heap=", NONE)))) json verbosity xs
             else if String.isPrefix "-j" arg andalso size arg > 2 then
-              loop holdir source_dir (SOME (positive_int "-j" (String.extract (arg, 2, NONE)))) maxheap json verbosity xs
+              loop holdir source_dir cache_dir (SOME (positive_int "-j" (String.extract (arg, 2, NONE)))) maxheap json verbosity xs
             else
-              let val (opts, args') = loop holdir source_dir jobs maxheap json verbosity xs in (opts, arg :: args') end
+              let val (opts, args') = loop holdir source_dir cache_dir jobs maxheap json verbosity xs in (opts, arg :: args') end
   in
-    loop NONE NONE NONE NONE false HolbuildStatus.Normal args
+    loop NONE NONE NONE NONE NONE false HolbuildStatus.Normal args
   end
 
 fun with_input path f =
@@ -622,29 +627,28 @@ fun dispatch tc jobs args =
 
 fun parse_gc_args args =
   let
-    fun result root days max_checkpoints_gb clean_only cache_only =
+    fun result days max_checkpoints_gb clean_only cache_only =
       case (clean_only, cache_only) of
           (true, true) => raise Error "--clean-only and --cache-only are mutually exclusive"
-        | (true, false) => (root, days, max_checkpoints_gb, true, false)
-        | (false, true) => (root, days, max_checkpoints_gb, false, true)
-        | (false, false) => (root, days, max_checkpoints_gb, true, true)
-    fun loop root days max_checkpoints_gb clean_only cache_only rest =
+        | (true, false) => (days, max_checkpoints_gb, true, false)
+        | (false, true) => (days, max_checkpoints_gb, false, true)
+        | (false, false) => (days, max_checkpoints_gb, true, true)
+    fun loop days max_checkpoints_gb clean_only cache_only rest =
       case rest of
-          [] => result root days max_checkpoints_gb clean_only cache_only
-        | "--cache-dir" :: path :: xs => loop (SOME path) days max_checkpoints_gb clean_only cache_only xs
-        | "--retention-days" :: n :: xs => loop root (HolbuildCache.parse_days n) max_checkpoints_gb clean_only cache_only xs
-        | "--days" :: n :: xs => loop root (HolbuildCache.parse_days n) max_checkpoints_gb clean_only cache_only xs
+          [] => result days max_checkpoints_gb clean_only cache_only
+        | "--retention-days" :: n :: xs => loop (HolbuildCache.parse_days n) max_checkpoints_gb clean_only cache_only xs
+        | "--days" :: n :: xs => loop (HolbuildCache.parse_days n) max_checkpoints_gb clean_only cache_only xs
         | "--max-checkpoints-gb" :: n :: xs =>
             (case Int.fromString n of
-                 SOME gb => if gb >= 0 then loop root days gb clean_only cache_only xs
+                 SOME gb => if gb >= 0 then loop days gb clean_only cache_only xs
                             else raise Error "--max-checkpoints-gb must be non-negative"
                | NONE => raise Error "--max-checkpoints-gb requires an integer")
         | "--max-checkpoints-gb" :: [] => raise Error "--max-checkpoints-gb requires GB"
-        | "--clean-only" :: xs => loop root days max_checkpoints_gb true cache_only xs
-        | "--cache-only" :: xs => loop root days max_checkpoints_gb clean_only true xs
+        | "--clean-only" :: xs => loop days max_checkpoints_gb true cache_only xs
+        | "--cache-only" :: xs => loop days max_checkpoints_gb clean_only true xs
         | arg :: _ => raise Error ("unknown gc option: " ^ arg)
   in
-    loop NONE HolbuildCache.default_retention_days HolbuildBuildExec.default_max_checkpoints_gb false false args
+    loop HolbuildCache.default_retention_days HolbuildBuildExec.default_max_checkpoints_gb false false args
   end
 
 fun run_project_gc (days, max_checkpoints_gb) =
@@ -657,9 +661,9 @@ fun run_project_gc (days, max_checkpoints_gb) =
 
 fun gc args =
   let
-    val (cache_root, days, max_checkpoints_gb, clean_project, clean_cache) = parse_gc_args args
+    val (days, max_checkpoints_gb, clean_project, clean_cache) = parse_gc_args args
     val _ = if clean_project then run_project_gc (days, max_checkpoints_gb) else ()
-    val _ = if clean_cache then HolbuildCache.gc_root (Option.getOpt(cache_root, HolbuildCache.cache_root ())) days else ()
+    val _ = if clean_cache then HolbuildCache.gc_root (HolbuildCache.cache_root ()) days else ()
   in
     ()
   end
@@ -713,11 +717,12 @@ fun removed_goalfrag_build_arg arg =
 
 fun trace_steps_build_arg arg = arg = "--trace-steps" orelse arg = "--goalfrag-trace"
 
-fun dispatch_with_options {holdir, source_dir, jobs, maxheap, json, verbosity} args =
+fun dispatch_with_options {holdir, source_dir, cache_dir, jobs, maxheap, json, verbosity} args =
   (HolbuildStatus.set_json_mode json;
    HolbuildStatus.set_verbosity verbosity;
    HolbuildStatus.set_retain_debug_artifacts false;
    Option.app HolbuildProject.set_source_dir source_dir;
+   Option.app HolbuildCacheConfig.set_cache_root cache_dir;
    case args of
        "gc" :: rest => (reject_json "gc"; gc rest)
      | "cache" :: rest => (reject_json "cache"; HolbuildCache.dispatch rest)
@@ -766,6 +771,7 @@ fun main raw_args =
        | HolbuildBuildExec.ErrorWithDebugArtifacts (msg, artifacts) => err_with_debug_artifacts msg artifacts
        | HolbuildHolSharedCache.Error msg => err msg
        | HolbuildCache.Error msg => err msg
+       | HolbuildCacheConfig.Error msg => err msg
        | e => if is_broken_pipe e then OS.Process.exit OS.Process.success
               else err (General.exnMessage e)
 

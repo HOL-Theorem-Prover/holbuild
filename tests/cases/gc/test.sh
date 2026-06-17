@@ -47,8 +47,8 @@ printf 'holbuild-cache-action-v2\nblob dat deadbeef\n' > "$cache/actions/old/man
 printf 'blob\n' > "$cache/blobs/deadbeef"
 
 gc_log=$tmpdir/gc.log
-(cd "$project" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$cache" \
-  "$HOLBUILD_BIN" gc --retention-days 0 --cache-dir "$cache") > "$gc_log" 2>&1
+(cd "$project" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$tmpdir/ignored-cache" \
+  "$HOLBUILD_BIN" --cache-dir "$cache" gc --retention-days 0) > "$gc_log" 2>&1
 
 require_grep "project clean: removed" "$gc_log"
 require_grep "checkpoint_gb_initial=" "$gc_log"
@@ -86,8 +86,8 @@ members = []
 TOML
 printf 'stage residue\n' > "$clean_only_project/.holbuild/stage/old/file"
 printf 'cache residue\n' > "$clean_only_cache/tmp/old/file"
-(cd "$clean_only_project" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$clean_only_cache" \
-  "$HOLBUILD_BIN" gc --clean-only --retention-days 0 --cache-dir "$clean_only_cache") > "$tmpdir/clean-only.log" 2>&1
+(cd "$clean_only_project" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$tmpdir/ignored-clean-only-cache" \
+  "$HOLBUILD_BIN" --cache-dir "$clean_only_cache" gc --clean-only --retention-days 0) > "$tmpdir/clean-only.log" 2>&1
 require_grep "project clean: removed" "$tmpdir/clean-only.log"
 require_grep "checkpoint_gb_before=" "$tmpdir/clean-only.log"
 if grep -q "cache gc:" "$tmpdir/clean-only.log"; then

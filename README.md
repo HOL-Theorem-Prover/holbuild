@@ -63,7 +63,7 @@ Create `holproject.toml` in the root of your HOL project:
 ```toml
 [holbuild]
 schema = 2
-required_version = "0.6.2"  # optional
+minimum_version = "<MAJOR.MINOR.PATCH>"  # optional minimum holbuild version
 
 [project]
 name = "example"
@@ -88,7 +88,7 @@ holbuild build
 the default roots. You can also build a specific logical target:
 
 ```sh
-holbuild build Example
+holbuild build ExampleTheory
 ```
 
 The target is the logical theory/module name, not an object filename.
@@ -110,6 +110,7 @@ That revision is the HOL toolchain used to analyse and build the project.
 $HOLBUILD_CACHE/hol-toolchains/<key>/hol
 ```
 
+`--cache-dir PATH` overrides the global cache location for a command.
 `HOLBUILD_CACHE` defaults to the platform cache directory, normally:
 
 ```text
@@ -148,6 +149,7 @@ Common options:
 holbuild -j4 build MyTheory
 holbuild --maxheap 4096 build MyTheory
 holbuild --source-dir /path/to/project build MyTheory
+holbuild --cache-dir /path/to/cache build MyTheory
 holbuild build --force=project MyTheory
 holbuild build --no-cache MyTheory
 holbuild clean MyTheory && holbuild build --no-cache MyTheory
@@ -173,10 +175,10 @@ working directory.
 ```toml
 [holbuild]
 schema = 2
-required_version = "0.6.2"
+minimum_version = "<MAJOR.MINOR.PATCH>"
 ```
 
-`schema = 2` is required. `required_version` is optional. If present, it must be
+`schema = 2` is required. `minimum_version` is optional. If present, it must be
 a semantic version `MAJOR.MINOR.PATCH` and means "this project requires at least
 this holbuild version".
 
@@ -359,7 +361,7 @@ Clean old project and cache state with:
 ```sh
 holbuild gc
 holbuild gc --clean-only
-holbuild gc --cache-only
+holbuild --cache-dir /path/to/cache gc --cache-only
 ```
 
 `gc --clean-only` skips the global cache. `gc --cache-only` skips project
@@ -419,17 +421,17 @@ Maintainer checklist:
 
 1. Ensure CI is green on `master`.
 2. Bump `HolbuildVersion.version` in `sml/version.sml` if needed.
-3. Update documentation examples if the version changed.
-4. Create and push an annotated tag:
+3. Create and push an annotated tag:
 
    ```sh
-   git tag -a v0.6.2 -m "holbuild v0.6.2"
-   git push origin v0.6.2
+   version=X.Y.Z
+   git tag -a "v$version" -m "holbuild v$version"
+   git push origin "v$version"
    ```
 
-5. Create a GitHub Release from that tag:
+4. Create a GitHub Release from that tag:
    - GitHub repository → Releases → Draft a new release.
-   - Select the tag, for example `v0.6.2`.
+   - Select the tag, for example `vX.Y.Z`.
    - Use the tag as the title.
    - Summarise user-visible changes.
 
