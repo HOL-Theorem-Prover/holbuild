@@ -56,6 +56,7 @@ require_grep $'^phase\tname=build\.keys\.external\.source_hash\tstatus=ok\tms=.*
 require_grep $'^phase\tname=build\.keys\.external\.dep_cache\tstatus=ok\tms=.*\tcount=' "$first_timing"
 require_grep $'^phase\tname=build\.keys\.external\.theory_stamp\tstatus=ok\tms=.*\tcount=' "$first_timing"
 require_grep $'^phase\tname=build\.keys\.external\.lib_artifact\tstatus=ok\tms=.*\tcount=' "$first_timing"
+require_file "$project/.holbuild/logs/current/basic/ATheory/build.log"
 
 coarse_timing=$tmpdir/coarse.tool-timing
 (cd "$project" && HOLBUILD_TIMING_LOG="$coarse_timing" "$HOLBUILD_BIN" build --dry-run ATheory) > /dev/null
@@ -265,7 +266,7 @@ if (cd "$child_failure_project" && "$HOLBUILD_BIN" build ATheory) > "$child_fail
   exit 1
 fi
 require_grep "end child log tail" "$child_failure_log"
-require_grep "child log: .*\.holbuild/logs/.*-ATheory-child-failure\.log" "$child_failure_log"
+require_grep "child log: .*\.holbuild/logs/current/basic/ATheory/build\.log" "$child_failure_log"
 retained_child_log=$(awk '/child log: / { path=$0; sub(/^child log: /, "", path) } END { print path }' "$child_failure_log")
 require_file "$retained_child_log"
 require_grep "child failure debug marker" "$retained_child_log"

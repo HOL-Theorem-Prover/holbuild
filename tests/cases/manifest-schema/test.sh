@@ -128,7 +128,7 @@ TOML
 (cd "$tmpdir/valid_schema2_from" && "$HOLBUILD_BIN" context) > "$tmpdir/valid_schema2_from.log"
 require_grep "dependency: holexamples \[from=hol, path=., manifest=holexamples.manifest.toml" "$tmpdir/valid_schema2_from.log"
 
-for case in unknown_top typo_build bad_exclude_type bad_roots_type bad_root_timeout absolute_member parent_exclude no_paths_includes bad_type bad_action_field bad_action_type bad_action_deps_type bad_action_loads_type bad_action_abs_input bad_action_abs_dep bad_generate_field bad_generate_command_type bad_generate_abs_output; do
+for case in unknown_top typo_build bad_exclude_type bad_roots_type bad_root_timeout absolute_member parent_exclude no_paths_includes bad_type bad_project_name bad_action_field bad_action_type bad_action_deps_type bad_action_loads_type bad_action_abs_input bad_action_abs_dep bad_generate_field bad_generate_command_type bad_generate_abs_output; do
   make_project "$case"
 done
 
@@ -203,6 +203,19 @@ rev = "$(holbuild_pinned_hol_rev)"
 name = 123
 TOML
 expect_context_failure bad_type "name must be a string"
+
+cat > "$tmpdir/bad_project_name/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "../bad"
+TOML
+expect_context_failure bad_project_name "project.name must be a safe dependency name"
 
 make_project bad_dependency
 write_manifest bad_dependency <<'TOML'

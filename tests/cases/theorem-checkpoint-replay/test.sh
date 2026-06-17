@@ -216,7 +216,7 @@ if grep -q "holbuild proof-ir plan theorem=\|holbuild proof-ir before theorem=" 
   exit 1
 fi
 require_grep "proof step trace log:" "$trace_log"
-trace_child_log=$(find "$trace_project/.holbuild/logs" -name '*-ATheory-goalfrag-trace.log' -print -quit)
+trace_child_log="$trace_project/.holbuild/logs/current/replay/ATheory/proof-trace.log"
 require_file "$trace_child_log"
 require_grep "holbuild proof-ir plan theorem=a_thm steps=" "$trace_child_log"
 require_grep "holbuild proof-ir plan theorem=b_thm steps=" "$trace_child_log"
@@ -353,7 +353,7 @@ require_grep "proof: line " "$failure_log"
 require_grep "source: .*AScript.sml:" "$failure_log"
 require_grep "child failure:" "$failure_log"
 require_grep "FAIL_TAC \"expected failure\"" "$failure_log"
-failure_child_log=$(find "$failure_project/.holbuild/logs" -name '*-ATheory-instrumented-failure.log' -print -quit)
+failure_child_log="$failure_project/.holbuild/logs/current/replay/ATheory/instrumented-failure.log"
 require_file "$failure_child_log"
 require_grep "holbuild goal state at failed fragment" "$failure_child_log"
 require_grep "holbuild plan position: 00 tactic FAIL_TAC" "$failure_child_log"
@@ -434,7 +434,7 @@ if grep -q "holbuild all failed tactic input goals:" "$multi_goal_log"; then
   echo "parent output should not include full all-goals log" >&2
   exit 1
 fi
-multi_goal_child_log=$(find "$multi_goal_project/.holbuild/logs" -name '*-ATheory-instrumented-failure.log' -print -quit)
+multi_goal_child_log="$multi_goal_project/.holbuild/logs/current/multi-goal/ATheory/instrumented-failure.log"
 require_file "$multi_goal_child_log"
 require_grep "holbuild failed tactic input goal count: 2" "$multi_goal_child_log"
 require_grep "holbuild failed tactic top input goal:" "$multi_goal_child_log"
@@ -483,7 +483,7 @@ if grep -q "failed tactic input goals: 3" "$branch_input_log"; then
   echo "branch suffix reported unrelated tail goal as failed tactic input" >&2
   exit 1
 fi
-branch_input_child_log=$(find "$branch_input_project/.holbuild/logs" -name '*-ATheory-instrumented-failure.log' -print -quit)
+branch_input_child_log="$branch_input_project/.holbuild/logs/current/branch-input/ATheory/instrumented-failure.log"
 require_file "$branch_input_child_log"
 require_grep "holbuild failed tactic input goal count: 2" "$branch_input_child_log"
 require_grep "holbuild goal 1 of 2:" "$branch_input_child_log"
@@ -529,7 +529,7 @@ if (cd "$multi_goal_large_project" && "$HOLBUILD_BIN" build ATheory) > "$multi_g
   echo "expected large multi-goal proof to fail build" >&2
   exit 1
 fi
-multi_goal_large_child_log=$(find "$multi_goal_large_project/.holbuild/logs" -name '*-ATheory-instrumented-failure.log' -print -quit)
+multi_goal_large_child_log="$multi_goal_large_project/.holbuild/logs/current/multi-goal-large/ATheory/instrumented-failure.log"
 require_file "$multi_goal_large_child_log"
 require_grep "holbuild all failed tactic input goals:" "$multi_goal_large_child_log"
 require_grep "holbuild failed tactic input goals truncated after 4096 bytes" "$multi_goal_large_child_log"

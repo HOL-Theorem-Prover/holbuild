@@ -293,7 +293,7 @@ fun package_relative_path field path =
 fun package_relative_paths field paths = map (package_relative_path field) paths
 
 fun safe_materialized_dependency_name name =
-  size name > 0 andalso
+  size name > 0 andalso name <> "." andalso name <> ".." andalso
   List.all (fn c => Char.isAlphaNum c orelse c = #"_" orelse c = #"." orelse c = #"-")
            (String.explode name)
 
@@ -610,7 +610,10 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
       graph_artifact_root = graph_artifact_root,
       manifest = manifest,
       schema = schema,
-      name = Option.mapPartial (fn t => string_field t "name") project,
+      name = Option.mapPartial (fn t =>
+               Option.map (fn name =>
+                 (require_safe_materialized_dependency_name "project.name" name; name))
+                 (string_field t "name")) project,
       version = Option.mapPartial (fn t => string_field t "version") project,
       members = members,
       excludes = excludes,

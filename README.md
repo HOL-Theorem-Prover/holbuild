@@ -330,9 +330,11 @@ holbuild build --skip-checkpoints MyTheory
 - `--skip-proof-steps` opts out of proof-step execution.
 - `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation.
 
-When a child HOL process fails, holbuild retains the full child log under
-`.holbuild/logs/`, prints the log tail, and leaves the retained `child log:` path
-as the final line of the failure detail.
+For source-executed theory builds, holbuild writes a live child log at
+`.holbuild/logs/current/<package>/<logical>/build.log`. You can inspect it during
+a long build with `tail -f`; after the child exits, the same path is kept as the
+latest log. Up-to-date and cache-restored targets do not produce a new log; use
+`--force --no-cache` to regenerate one.
 
 Compatibility aliases:
 
