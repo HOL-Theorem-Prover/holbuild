@@ -157,7 +157,8 @@ TOML
 context_log=$tmpdir/context.log
 (cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" "$HOLBUILD_BIN" context) > "$context_log"
 require_grep "package: hol \[root=$HOLBUILD_CACHE/hol-toolchains/" "$context_log"
-if find -L "$HOLBUILD_CACHE/hol-toolchains" \( -name configured -o -name built \) 2>/dev/null | grep -q .; then
+shared_hol_from_context=$(awk -F'root=' '/package: hol / { split($2, parts, ","); print parts[1]; exit }' "$context_log")
+if find -L "$shared_hol_from_context" \( -name configured -o -name built \) 2>/dev/null | grep -q .; then
   echo "schema 2 context unexpectedly built HOL" >&2
   exit 1
 fi
@@ -179,20 +180,27 @@ if (cd "$root" && "$HOLBUILD_BIN" --holdir "$HOLDIR" heap fake) > "$tmpdir/heap-
 fi
 require_grep 'no longer supported' "$tmpdir/heap-holdir.log"
 
+toolchain_entry=${shared_hol_from_context%/hol}
+stale_lock="$HOLBUILD_CACHE/hol-toolchains/.locks/hol-toolchain-$(basename "$toolchain_entry").lock"
+mkdir -p "$stale_lock"
+
 dry_log=$tmpdir/dry.log
-(cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" "$HOLBUILD_BIN" build --dry-run Foo) > "$dry_log"
+(cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" "$HOLBUILD_BIN" build --dry-run Foo) > "$dry_log" 2>&1
+require_grep "removing obsolete directory HOL toolchain lock" "$dry_log"
 require_grep "Foo (sml, package b)" "$dry_log"
-configured_marker=$(find -L "$HOLBUILD_CACHE/hol-toolchains" -path '*/hol/configured' -type f -print -quit)
-if [[ -z "$configured_marker" ]]; then
-  echo "fake HOL configure marker was not created" >&2
-  exit 1
-fi
-shared_hol=$(dirname "$configured_marker")
+[[ -f "$stale_lock" ]] || { echo "toolchain lock was not recreated as a file" >&2; exit 1; }
+[[ ! -e "$stale_lock.owner" ]] || { echo "toolchain lock owner survived successful bootstrap" >&2; exit 1; }
+shared_hol=$shared_hol_from_context
 require_file "$shared_hol/configured"
 require_file "$shared_hol/built"
 require_file "$shared_hol/bin/hol"
 require_file "$shared_hol/bin/hol.state"
-require_grep "^$shared_hol$" "$shared_hol/built-at"
+shared_hol_real=$(cd "$shared_hol" && pwd -P)
+built_at=$(cat "$shared_hol/built-at")
+if [[ "$built_at" != "$shared_hol" && "$built_at" != "$shared_hol_real" ]]; then
+  echo "unexpected fake HOL build directory: $built_at" >&2
+  exit 1
+fi
 rm "$shared_hol/configured" "$shared_hol/built"
 (cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" "$HOLBUILD_BIN" buildhol) > "$tmpdir/buildhol.log"
 require_grep "$shared_hol" "$tmpdir/buildhol.log"

@@ -108,6 +108,9 @@ fun analyser_ok_for_key k ak = Path.concat(analyser_dir_for_key k ak, "build.ok"
 fun analyser_manifest_for_key k ak = Path.concat(analyser_dir_for_key k ak, "manifest")
 fun locks_dir () = Path.concat(toolchains_dir (), ".locks")
 fun lock_dir k = Path.concat(locks_dir (), "hol-toolchain-" ^ k ^ ".lock")
+fun lock_owner_path lock = lock ^ ".owner"
+
+datatype toolchain_lock = ToolchainLock of HolbuildFileLock.t
 
 fun holdir_for req = holdir_for_key (key req)
 
@@ -136,19 +139,54 @@ fun validate_entry req k =
       end
   end
 
+fun current_lock_owner lock = SOME (HolbuildFileLock.read_text (lock_owner_path lock)) handle _ => NONE
+
+fun lock_owner () =
+  String.concatWith "\n"
+    ["holbuild-hol-toolchain-lock-v1",
+     "command=bootstrap HOL toolchain",
+     "pid=" ^ HolbuildFileLock.current_pid_text (),
+     "cwd=" ^ FS.getDir (),
+     "host=" ^ HolbuildFileLock.current_host (),
+     "started=" ^ Time.toString (Time.now ())] ^ "\n"
+
+fun unavailable_lock_owner () =
+  String.concatWith "\n"
+    ["holbuild-hol-toolchain-lock-v1",
+     "command=unknown",
+     "pid=unknown",
+     "cwd=unknown"] ^ "\n"
+
+fun toolchain_lock_error lock owner =
+  Error ("HOL toolchain cache is locked\n" ^
+         "lock: " ^ lock ^ "\n" ^
+         "owner: " ^ HolbuildFileLock.owner_summary owner)
+
+fun try_acquire_lock_path lock =
+  HolbuildFileLock.try_acquire_path {path = lock, obsolete_kind = SOME "HOL toolchain"}
+  handle HolbuildFileLock.Error msg => raise Error ("could not acquire HOL toolchain cache lock: " ^ msg)
+
 fun acquire_lock k =
   let
-    val l = lock_dir k
-    fun wait 0 = die ("HOL toolchain cache is locked: " ^ l)
+    val lock_path = lock_dir k
+    fun acquired lock =
+      ((HolbuildFileLock.write_text (lock_owner_path lock_path) (lock_owner ());
+        ToolchainLock lock)
+       handle e => (HolbuildFileLock.release lock; raise e))
+    fun wait 0 =
+          let val owner = Option.getOpt(current_lock_owner lock_path, unavailable_lock_owner ())
+          in raise toolchain_lock_error lock_path owner end
       | wait n =
-          (FS.mkDir l; l)
-          handle OS.SysErr _ =>
-            (ignore (OS.Process.system "sleep 1"); wait (n - 1))
+          case try_acquire_lock_path lock_path of
+              SOME lock => acquired lock
+            | NONE => (ignore (OS.Process.system "sleep 1"); wait (n - 1))
   in
-    ensure_dir (locks_dir ());
     wait 120
   end
-fun release_lock l = FS.rmDir l handle OS.SysErr _ => ()
+
+fun release_lock (ToolchainLock lock) =
+  (HolbuildFileLock.remove_file (lock_owner_path (HolbuildFileLock.path lock));
+   HolbuildFileLock.release lock)
 
 fun write_file path text =
   let val out = TextIO.openOut path

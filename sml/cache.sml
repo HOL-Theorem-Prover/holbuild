@@ -169,10 +169,10 @@ fun remove_stale_children cutoff dir =
     0
     (children dir)
 
-fun remove_stale_action_locks cutoff dir =
+fun remove_obsolete_action_lock_dirs cutoff dir =
   List.foldl
     (fn (path, removed) =>
-        if has_prefix "action-" (Path.file path) andalso stale cutoff path then
+        if has_prefix "action-" (Path.file path) andalso (FS.isDir path handle OS.SysErr _ => false) andalso stale cutoff path then
           (remove_tree path; removed + 1)
         else removed)
     0
@@ -193,69 +193,52 @@ fun locks_dir root = Path.concat(root, "locks")
 fun gc_lock_path root = Path.concat(locks_dir root, "gc.lock")
 fun gc_lock_owner_path lock = lock ^ ".owner"
 
-fun path_is_dir path = FS.isDir path handle OS.SysErr _ => false
-
-fun remove_obsolete_gc_lock_dir lock =
-  if path_is_dir lock then
-    (HolbuildStatus.message_stderr
-       ("holbuild: warning: removing obsolete directory cache gc lock: " ^ lock ^ "\n");
-     remove_tree lock)
-  else ()
-
-datatype gc_lock = GcLock of {fd : Posix.IO.file_desc, lock : string}
+datatype gc_lock = GcLock of HolbuildFileLock.t
 
 fun gc_lock_owner () =
   String.concatWith "\n"
     ["holbuild-cache-gc-lock-v1",
      "command=cache gc",
-     "pid=" ^ HolbuildProjectLock.current_pid_text (),
-     "pid_ns=" ^ HolbuildProjectLock.current_pid_namespace (),
-     "starttime=" ^ HolbuildProjectLock.proc_starttime "self",
-     "boot_id=" ^ HolbuildProjectLock.current_boot_id (),
+     "pid=" ^ HolbuildFileLock.current_pid_text (),
+     "pid_ns=" ^ HolbuildFileLock.current_pid_namespace (),
+     "starttime=" ^ HolbuildFileLock.proc_starttime "self",
+     "boot_id=" ^ HolbuildFileLock.current_boot_id (),
      "cwd=" ^ FS.getDir (),
-     "host=" ^ HolbuildProjectLock.current_host (),
+     "host=" ^ HolbuildFileLock.current_host (),
      "started=" ^ Time.toString (Time.now ())] ^ "\n"
 
 fun current_gc_lock_owner lock =
-  SOME (HolbuildProjectLock.read_text (gc_lock_owner_path lock)) handle _ => NONE
+  SOME (HolbuildFileLock.read_text (gc_lock_owner_path lock)) handle _ => NONE
 
-fun unavailable_gc_lock_owner fd =
+fun unavailable_gc_lock_owner () =
   String.concatWith "\n"
     ["holbuild-cache-gc-lock-v1",
      "command=cache gc",
-     "pid=" ^ Option.getOpt(HolbuildProjectLock.blocking_lock_owner fd, "unknown"),
+     "pid=unknown",
      "cwd=unknown"] ^ "\n"
 
 fun cache_gc_lock_error lock owner =
   Error ("cache gc already running\n" ^
          "lock: " ^ lock ^ "\n" ^
-         "owner: " ^ HolbuildProjectLock.owner_summary owner)
+         "owner: " ^ HolbuildFileLock.owner_summary owner)
 
 fun acquire_lock root =
-  let
-    val lock = gc_lock_path root
+  let val lock_path = gc_lock_path root
   in
-    (ensure_dir (locks_dir root);
-     remove_obsolete_gc_lock_dir lock;
-     let
-       val fd = HolbuildProjectLock.open_project_lock_file lock
-       val _ = HolbuildProjectLock.set_close_on_exec fd
-     in
-       if HolbuildProjectLock.try_lock_fd fd then
-         ((HolbuildProjectLock.write_text (gc_lock_owner_path lock) (gc_lock_owner ());
-           GcLock {fd = fd, lock = lock})
-          handle e => (HolbuildProjectLock.close_fd fd; raise e))
-       else
-         let val owner = Option.getOpt(current_gc_lock_owner lock, unavailable_gc_lock_owner fd)
-         in HolbuildProjectLock.close_fd fd; raise cache_gc_lock_error lock owner end
-     end)
-    handle OS.SysErr (msg, _) =>
-      raise Error ("could not acquire cache gc lock: " ^ lock ^ ": " ^ msg)
+    case HolbuildFileLock.try_acquire_path {path = lock_path, obsolete_kind = SOME "cache gc"} of
+        SOME lock =>
+          ((HolbuildFileLock.write_text (gc_lock_owner_path lock_path) (gc_lock_owner ());
+            GcLock lock)
+           handle e => (HolbuildFileLock.release lock; raise e))
+      | NONE =>
+          let val owner = Option.getOpt(current_gc_lock_owner lock_path, unavailable_gc_lock_owner ())
+          in raise cache_gc_lock_error lock_path owner end
   end
+  handle HolbuildFileLock.Error msg => raise Error ("could not acquire cache gc lock: " ^ msg)
 
-fun release_gc_lock (GcLock {fd, lock}) =
-  (HolbuildProjectLock.remove_file (gc_lock_owner_path lock);
-   HolbuildProjectLock.close_fd fd)
+fun release_gc_lock (GcLock lock) =
+  (HolbuildFileLock.remove_file (gc_lock_owner_path (HolbuildFileLock.path lock));
+   HolbuildFileLock.release lock)
 
 fun with_lock root f =
   let val lock = acquire_lock root
@@ -264,22 +247,23 @@ fun with_lock root f =
     handle e => (release_gc_lock lock; raise e)
   end
 
-fun release_dir_lock lock = FS.rmDir lock handle OS.SysErr _ => ()
+datatype action_lock_handle = ActionLockHandle of HolbuildFileLock.t
 
 fun action_lock root key = Path.concat(locks_dir root, "action-" ^ key ^ ".lock")
 
 fun try_acquire_action_lock root key =
-  let val lock = action_lock root key
-  in
-    ensure_dir (locks_dir root);
-    (FS.mkDir lock; SOME lock) handle OS.SysErr _ => NONE
-  end
+  (case HolbuildFileLock.try_acquire_path {path = action_lock root key, obsolete_kind = SOME "action cache"} of
+       SOME lock => SOME (ActionLockHandle lock)
+     | NONE => NONE)
+  handle HolbuildFileLock.Error _ => NONE
+
+fun release_action_lock (ActionLockHandle lock) = HolbuildFileLock.release lock
 
 fun with_action_publish_lock root key publish skip =
   case try_acquire_action_lock root key of
       SOME lock =>
-        ((publish () before release_dir_lock lock)
-         handle e => (release_dir_lock lock; raise e))
+        ((publish () before release_action_lock lock)
+         handle e => (release_action_lock lock; raise e))
     | NONE => skip ()
 
 fun gc_root root days =
@@ -294,7 +278,7 @@ fun gc_root root days =
       fun run () =
         let
           val tmp_removed = remove_stale_children cutoff tmp_dir
-          val lock_removed = remove_stale_action_locks cutoff (locks_dir root)
+          val lock_removed = remove_obsolete_action_lock_dirs cutoff (locks_dir root)
           val (live_blobs, actions_removed) = collect_live_actions cutoff actions_dir
           val blobs_removed = sweep_blobs cutoff live_blobs blobs_dir
         in

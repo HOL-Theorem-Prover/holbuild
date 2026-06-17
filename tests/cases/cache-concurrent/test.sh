@@ -78,8 +78,8 @@ run_parallel_builds publish "${projects[@]}"
 
 manifest_count=$(find "$HOLBUILD_CACHE/actions" -mindepth 2 -maxdepth 2 -name manifest | wc -l | tr -d ' ')
 [[ "$manifest_count" = "1" ]] || { echo "expected one cache manifest, found $manifest_count" >&2; exit 1; }
-if [[ -d "$HOLBUILD_CACHE/locks" ]] && find "$HOLBUILD_CACHE/locks" -mindepth 1 -maxdepth 1 -name 'action-*.lock' | grep -q .; then
-  echo "stale action cache lock left behind" >&2
+if [[ -d "$HOLBUILD_CACHE/locks" ]] && find "$HOLBUILD_CACHE/locks" -mindepth 1 -maxdepth 1 -type d -name 'action-*.lock' | grep -q .; then
+  echo "stale action cache lock directory left behind" >&2
   exit 1
 fi
 
