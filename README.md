@@ -414,14 +414,14 @@ Useful caches:
 
 ## Running holbuild's own tests
 
-Repository tests need a built HOL checkout as test input:
+Repository tests resolve the schema 2 HOL toolchain cache automatically:
 
 ```sh
-make HOLDIR=/path/to/built/HOL test
+make test
 ```
 
-The built checkout used by `HOLDIR` must be at the revision recorded in
-`vendor/hol/REV`.
+To reuse an explicit checkout instead, pass `HOLDIR=/path/to/built/HOL`. The
+checkout must be at the revision recorded in `vendor/hol/REV`.
 
 ## Release process
 

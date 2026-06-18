@@ -3,17 +3,55 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 HOLBUILD_BIN=${HOLBUILD_BIN:-"$ROOT/bin/holbuild"}
-HOLDIR=${HOLDIR:-${HOLBUILD_HOLDIR:-}}
 HOLBUILD_TEST_JOBS=${HOLBUILD_TEST_JOBS:-1}
 export HOLBUILD_ROOT="$ROOT"
 export HOLBUILD_TEST_GLOBAL_CACHE="${HOLBUILD_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/holbuild}"
 
-if [[ -z "$HOLDIR" ]]; then
-  echo "Set HOLDIR=/path/to/HOL or HOLBUILD_HOLDIR" >&2
-  exit 2
-fi
-
 pinned_hol_rev=$(tr -d '[:space:]' < "$ROOT/vendor/hol/REV")
+
+write_toolchain_manifest() {
+  local manifest=$1
+  local hol_git=${HOLBUILD_CANONICAL_HOL_GIT:-https://github.com/HOL-Theorem-Prover/HOL.git}
+  cat > "$manifest" <<TOML
+[holbuild]
+schema = 2
+
+[dependencies.hol]
+git = "$hol_git"
+rev = "$pinned_hol_rev"
+
+[project]
+name = "holbuild-test-toolchain"
+TOML
+}
+
+cached_schema2_holdir() {
+  local tmp output status
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/holbuild-test-toolchain.XXXXXX")
+  write_toolchain_manifest "$tmp/holproject.toml"
+  set +e
+  output=$(cd "$tmp" && "$HOLBUILD_BIN" buildhol 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  if [[ $status -ne 0 ]]; then
+    printf '%s\n' "$output" >&2
+    return "$status"
+  fi
+  printf '%s\n' "$output" | tail -n 1
+}
+
+resolve_holdir() {
+  local configured=${HOLDIR:-${HOLBUILD_HOLDIR:-}}
+  if [[ -n "$configured" ]]; then
+    printf '%s\n' "$configured"
+    return 0
+  fi
+  echo "HOLDIR not set; resolving schema 2 HOL toolchain cache" >&2
+  cached_schema2_holdir
+}
+
+HOLDIR=$(resolve_holdir)
 holdir_rev=$(git -C "$HOLDIR" rev-parse HEAD)
 if [[ "$holdir_rev" != "$pinned_hol_rev" ]]; then
   echo "HOLDIR rev $holdir_rev does not match vendor/hol/REV $pinned_hol_rev" >&2
@@ -39,6 +77,7 @@ declare -a completed_names=()
 declare -a completed_durations=()
 declare -a completed_summaries=()
 declare -a failed_names=()
+fail_fast_triggered=0
 
 now_ms() { date +%s%3N; }
 
@@ -208,11 +247,33 @@ wait_one() {
   fi
   cat "$log_dir/$name.log"
   remove_running_at "$index"
+  return "$status"
+}
+
+terminate_running() {
+  local pid
+  for pid in "${running_pids[@]}"; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  sleep 1
+  for pid in "${running_pids[@]}"; do
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+}
+
+stop_after_failure() {
+  if [[ $fail_fast_triggered -eq 0 ]]; then
+    fail_fast_triggered=1
+    echo "stopping after first failed test" >&2
+    terminate_running
+  fi
 }
 
 wait_all() {
   while [[ ${#running_pids[@]} -gt 0 ]]; do
-    wait_one
+    if ! wait_one; then
+      stop_after_failure
+    fi
   done
 }
 
@@ -222,10 +283,13 @@ for test_script in "$ROOT"/tests/cases/*/test.sh; do
   selected_count=$((selected_count + 1))
   start_case "$test_script" "$name"
   if [[ ${#running_pids[@]} -ge "$HOLBUILD_TEST_JOBS" ]]; then
-    wait_one
+    if ! wait_one; then
+      stop_after_failure
+      break
+    fi
   fi
 done
-echo "selected $selected_count test case(s)"
+echo "started $selected_count test case(s)"
 wait_all
 
 print_timing_summary() {
