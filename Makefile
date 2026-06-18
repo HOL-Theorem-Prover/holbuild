@@ -2,7 +2,7 @@ HOLDIR ?= $(HOLBUILD_HOLDIR)
 POLYC ?= polyc
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
-VENDORED_HOL_FILES := $(shell sed 's#^#vendor/hol/#' vendor/hol/FILES)
+VENDORED_HOL_FILES := $(shell sed 's|^|vendor/hol/|' vendor/hol/FILES)
 
 .PHONY: all check-vendored-hol install uninstall test clean
 
