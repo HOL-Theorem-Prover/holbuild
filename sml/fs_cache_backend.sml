@@ -1,4 +1,4 @@
-structure HolbuildFSCacheBackend =
+structure HolbuildFSCacheBackend : HOLBUILD_FS_CACHE_BACKEND =
 struct
 
 structure Path = OS.Path
@@ -95,6 +95,10 @@ fun blob_path cache hash = Path.concat(blobs_dir cache, hash)
 fun ensure_layout cache =
   (ensure_dir (actions_dir cache); ensure_dir (blobs_dir cache); ensure_dir (tmp_dir cache))
 
+fun write_action cache {key, text} = write_text (action_manifest cache key) text
+
+fun remove_action cache key = remove_file (action_manifest cache key)
+
 fun touch_action cache key = FS.setTime(action_manifest cache key, NONE) handle OS.SysErr _ => ()
 
 fun get_action cache key =
@@ -107,7 +111,7 @@ fun put_action cache {key, text} =
         SOME old =>
           if old = text then HolbuildCacheBackend.AlreadyPresent
           else HolbuildCacheBackend.Conflict path
-      | NONE => (write_text path text; HolbuildCacheBackend.Published)
+      | NONE => (write_action cache {key = key, text = text}; HolbuildCacheBackend.Published)
   end
 
 fun has_blob cache hash = file_hash_matches (blob_path cache hash) hash

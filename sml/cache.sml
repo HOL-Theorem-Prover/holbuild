@@ -38,6 +38,9 @@ fun ensure_layout root = HolbuildFSCacheBackend.ensure_layout (filesystem_cache 
 
 fun get_action root key = HolbuildFSCacheBackend.get_action (filesystem_cache root) key
 fun put_action root request = HolbuildFSCacheBackend.put_action (filesystem_cache root) request
+fun write_action root request = HolbuildFSCacheBackend.write_action (filesystem_cache root) request
+fun remove_action root key = HolbuildFSCacheBackend.remove_action (filesystem_cache root) key
+fun touch_action root key = HolbuildFSCacheBackend.touch_action (filesystem_cache root) key
 fun has_blob root hash = HolbuildFSCacheBackend.has_blob (filesystem_cache root) hash
 fun fetch_blob root request = HolbuildFSCacheBackend.fetch_blob (filesystem_cache root) request
 fun publish_blob root request = HolbuildFSCacheBackend.publish_blob (filesystem_cache root) request
