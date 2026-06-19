@@ -266,7 +266,7 @@ force_rebuild
 fixed_log=$tmpdir/fixed.log
 (cd "$project" && "$HOLBUILD_BIN" build ATheory) > "$fixed_log" 2>&1
 require_grep "from: failed-prefix checkpoint in second" "$fixed_log"
-if grep -q "parent for this saved state\|goalfrag/checkpoint run failed" "$fixed_log"; then
+if grep -q "parent for this saved state\|proof_steps/checkpoint run failed" "$fixed_log"; then
   echo "suffix recovery hit checkpoint parent mismatch/instrumentation failure" >&2
   exit 1
 fi

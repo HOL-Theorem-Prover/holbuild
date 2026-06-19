@@ -90,7 +90,7 @@ new_input_key=$(grep '^input_key=' "$metadata")
 [[ "$old_input_key" != "$new_input_key" ]] || { echo "source edit did not change input key" >&2; exit 1; }
 # The rebuild should succeed; the planted old-format invalid checkpoints
 # should not cause build failures or crashes.
-if grep -q "goalfrag/checkpoint run failed" "$rebuild_log"; then
+if grep -q "proof_steps/checkpoint run failed" "$rebuild_log"; then
   echo "old-format invalid checkpoint files caused build failure" >&2
   exit 1
 fi

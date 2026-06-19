@@ -89,42 +89,43 @@ fun step_sml step =
     | HolbuildProofIr.StepList {start_pos, end_pos, label, program} =>
         "HolbuildProofIr.StepList {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
         ", label=" ^ sml_string label ^ ", program=" ^ sml_string program ^ "}"
-    | HolbuildProofIr.StepChoice {start_pos, end_pos, label, program, alternatives} =>
-        "HolbuildProofIr.StepChoice {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
-        ", label=" ^ sml_string label ^ ", program=" ^ sml_string program ^ ", alternatives=" ^ sml_list (map sml_string alternatives) ^ "}"
-    | HolbuildProofIr.StepListChoice {start_pos, end_pos, label, program, alternatives} =>
-        "HolbuildProofIr.StepListChoice {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
-        ", label=" ^ sml_string label ^ ", program=" ^ sml_string program ^ ", alternatives=" ^ sml_list (map sml_string alternatives) ^ "}"
     | HolbuildProofIr.StepEach {start_pos, end_pos, body} =>
         "HolbuildProofIr.StepEach {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
         ", body=" ^ plan_sml body ^ "}"
-    | HolbuildProofIr.StepSelectFirstSolve {start_pos, end_pos, body} =>
-        "HolbuildProofIr.StepSelectFirstSolve {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
-        ", body=" ^ plan_sml body ^ "}"
+    | HolbuildProofIr.StepSelect {start_pos, end_pos, selector, mode, body} =>
+        "HolbuildProofIr.StepSelect {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
+        ", selector=" ^ selector_sml selector ^ ", mode=" ^ mode_sml mode ^ ", body=" ^ plan_sml body ^ "}"
     | HolbuildProofIr.StepCases {start_pos, end_pos, cases} =>
         "HolbuildProofIr.StepCases {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
         ", cases=" ^ sml_list (map plan_sml cases) ^ "}"
-    | HolbuildProofIr.StepPlain {start_pos, end_pos, label, program} =>
-        "HolbuildProofIr.StepPlain {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
-        ", label=" ^ sml_string label ^ ", program=" ^ sml_string program ^ "}"
+    | HolbuildProofIr.StepChoice {start_pos, end_pos, alternatives} =>
+        "HolbuildProofIr.StepChoice {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
+        ", alternatives=" ^ sml_list (map plan_sml alternatives) ^ "}"
+    | HolbuildProofIr.StepRepeat {start_pos, end_pos, body} =>
+        "HolbuildProofIr.StepRepeat {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
+        ", body=" ^ plan_sml body ^ "}"
+    | HolbuildProofIr.StepTry {start_pos, end_pos, body} =>
+        "HolbuildProofIr.StepTry {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
+        ", body=" ^ plan_sml body ^ "}"
 
 and plan_sml steps = sml_list (map step_sml steps)
+and selector_sml HolbuildProofIr.SelectFirst = "HolbuildProofIr.SelectFirst"
+  | selector_sml (HolbuildProofIr.SelectMatchingFirst pats) = "HolbuildProofIr.SelectMatchingFirst " ^ sml_string pats
+  | selector_sml (HolbuildProofIr.SelectMatchingAll pats) = "HolbuildProofIr.SelectMatchingAll " ^ sml_string pats
+and mode_sml HolbuildProofIr.SelectSolve = "HolbuildProofIr.SelectSolve"
+  | mode_sml HolbuildProofIr.SelectKeep = "HolbuildProofIr.SelectKeep"
 
 fun emit_step step =
   case step of
       HolbuildProofIr.StepTactic {start_pos, end_pos, label, program} =>
-        [P.join ["proof-step", "tactic", Int.toString start_pos, Int.toString end_pos, label, program]]
+        [P.join ["proof-step", "step", Int.toString start_pos, Int.toString end_pos, label, program]]
     | HolbuildProofIr.StepList {start_pos, end_pos, label, program} =>
-        [P.join ["proof-step", "list", Int.toString start_pos, Int.toString end_pos, label, program]]
-    | HolbuildProofIr.StepChoice {start_pos, end_pos, label, program, alternatives} =>
-        [P.join (["proof-step", "choice", Int.toString start_pos, Int.toString end_pos, label, program] @ alternatives)]
-    | HolbuildProofIr.StepListChoice {start_pos, end_pos, label, program, alternatives} =>
-        [P.join (["proof-step", "list-choice", Int.toString start_pos, Int.toString end_pos, label, program] @ alternatives)]
+        [P.join ["proof-step", "list-step", Int.toString start_pos, Int.toString end_pos, label, program]]
     | HolbuildProofIr.StepEach {start_pos, end_pos, body} =>
         P.join ["proof-step", "each", Int.toString start_pos, Int.toString end_pos] :: emit_steps body @
         [P.join ["proof-step", "end", Int.toString start_pos, Int.toString end_pos]]
-    | HolbuildProofIr.StepSelectFirstSolve {start_pos, end_pos, body} =>
-        P.join ["proof-step", "select-first-solve", Int.toString start_pos, Int.toString end_pos] :: emit_steps body @
+    | HolbuildProofIr.StepSelect {start_pos, end_pos, selector, mode, body} =>
+        P.join ["proof-step", "select", Int.toString start_pos, Int.toString end_pos, HolbuildProofIr.selector_text selector, HolbuildProofIr.mode_text mode] :: emit_steps body @
         [P.join ["proof-step", "end", Int.toString start_pos, Int.toString end_pos]]
     | HolbuildProofIr.StepCases {start_pos, end_pos, cases} =>
         let
@@ -136,8 +137,15 @@ fun emit_step step =
           List.concat (map emit_case indexed) @
           [P.join ["proof-step", "end", Int.toString start_pos, Int.toString end_pos]]
         end
-    | HolbuildProofIr.StepPlain {start_pos, end_pos, label, program} =>
-        [P.join ["proof-step", "plain", Int.toString start_pos, Int.toString end_pos, label, program]]
+    | HolbuildProofIr.StepChoice {start_pos, end_pos, alternatives} =>
+        let
+          fun emit_alt (i, body) = P.join ["proof-step", "alternative", Int.toString start_pos, Int.toString end_pos, Int.toString i] :: emit_steps body
+          val indexed = ListPair.zip (List.tabulate(length alternatives, fn i => i + 1), alternatives)
+        in P.join ["proof-step", "choice", Int.toString start_pos, Int.toString end_pos] :: List.concat (map emit_alt indexed) @ [P.join ["proof-step", "end", Int.toString start_pos, Int.toString end_pos]] end
+    | HolbuildProofIr.StepRepeat {start_pos, end_pos, body} =>
+        P.join ["proof-step", "repeat", Int.toString start_pos, Int.toString end_pos] :: emit_steps body @ [P.join ["proof-step", "end", Int.toString start_pos, Int.toString end_pos]]
+    | HolbuildProofIr.StepTry {start_pos, end_pos, body} =>
+        P.join ["proof-step", "try", Int.toString start_pos, Int.toString end_pos] :: emit_steps body @ [P.join ["proof-step", "end", Int.toString start_pos, Int.toString end_pos]]
 and emit_steps steps = List.concat (map emit_step steps)
 
 fun emit_proof_plan ({name, tactic_start, tactic_end, steps} : PI.theorem_plan) =

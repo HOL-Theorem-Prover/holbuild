@@ -319,10 +319,3 @@ deprecated_new_ir_log=$tmpdir/deprecated-new-ir.log
 (cd "$project" && "$HOLBUILD_BIN" --verbose build --new-ir ATheory) > "$deprecated_new_ir_log" 2>&1
 require_grep "new-ir is deprecated and has no effect; proof IR is the default" "$deprecated_new_ir_log"
 require_grep "ATheory is up to date" "$deprecated_new_ir_log"
-
-removed_goalfrag_log=$tmpdir/removed-goalfrag.log
-if (cd "$project" && "$HOLBUILD_BIN" --verbose build --goalfrag ATheory) > "$removed_goalfrag_log" 2>&1; then
-  echo "expected removed --goalfrag to fail" >&2
-  exit 1
-fi
-require_grep "goalfrag has been removed; proof steps are enabled by default" "$removed_goalfrag_log"

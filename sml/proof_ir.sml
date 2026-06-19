@@ -490,15 +490,15 @@ fun tactic_step source tactic =
 fun list_step sp label program =
   StepList {start_pos = #1 sp, end_pos = #2 sp, label = label, program = program}
 
-fun choice_step sp label program alternatives =
-  StepChoice {start_pos = #1 sp, end_pos = #2 sp, label = label, program = program, alternatives = alternatives}
-
-fun list_choice_step sp label program alternatives =
-  StepListChoice {start_pos = #1 sp, end_pos = #2 sp, label = label, program = program, alternatives = alternatives}
+fun choice_step sp alternatives =
+  StepChoice {start_pos = #1 sp, end_pos = #2 sp, alternatives = alternatives}
 
 fun each_step sp body = StepEach {start_pos = #1 sp, end_pos = #2 sp, body = body}
-fun select_first_solve_step sp body = StepSelectFirstSolve {start_pos = #1 sp, end_pos = #2 sp, body = body}
+fun select_step sp selector mode body = StepSelect {start_pos = #1 sp, end_pos = #2 sp, selector = selector, mode = mode, body = body}
+fun select_first_solve_step sp body = select_step sp SelectFirst SelectSolve body
 fun cases_step sp cases = StepCases {start_pos = #1 sp, end_pos = #2 sp, cases = cases}
+fun repeat_step sp body = StepRepeat {start_pos = #1 sp, end_pos = #2 sp, body = body}
+fun try_step sp body = StepTry {start_pos = #1 sp, end_pos = #2 sp, body = body}
 
 fun suffices_tactic_program source q = "Q_TAC SUFF_TAC " ^ source_text source q
 
@@ -527,11 +527,14 @@ and plan_tactic source tactic =
     | TacThenLT (lhs, lt) => plan_tactic source lhs @ plan_list_tactic source ">>>" lt
     | TacReverse (sp, inner) =>
         plan_tactic source inner @ plan_list_tactic source ">>>" (LtReverse sp)
-    | TacOrelse xs => [choice_step (tactic_span tactic) "ORELSE" (tactic_program source tactic) (map (tactic_label source) xs)]
-    | TacTry (_, t) => [choice_step (tactic_span tactic) "TRY" (tactic_program source tactic) [tactic_label source t, "ALL_TAC"]]
-    | TacFirst (_, xs) => [choice_step (tactic_span tactic) "FIRST" (tactic_program source tactic) (map (tactic_label source) xs)]
-    | TacFirstProve (_, xs) => [choice_step (tactic_span tactic) "FIRST_PROVE" (tactic_program source tactic) (map (tactic_label source) xs)]
-    | TacMapFirst (_, xs) => [choice_step (tactic_span tactic) "FIRST" (tactic_program source tactic) (map (tactic_label source) xs)]
+    | TacOrelse xs => [choice_step (tactic_span tactic) (map (plan_tactic source) xs)]
+    | TacTry (_, t) => [try_step (tactic_span tactic) (plan_tactic source t)]
+    | TacRepeat (sp, t) => [repeat_step sp (plan_tactic source t)]
+    | TacFirst (_, xs) => [choice_step (tactic_span tactic) (map (plan_tactic source) xs)]
+    | TacFirstProve (_, xs) =>
+        [choice_step (tactic_span tactic)
+           (map (fn x => [select_first_solve_step (tactic_span x) (plan_tactic source x)]) xs)]
+    | TacMapFirst (_, xs) => [choice_step (tactic_span tactic) (map (plan_tactic source) xs)]
     | TacSufficesBy (q, rhs) =>
         let val sp = (#1 q, #2 q)
         in
@@ -592,13 +595,13 @@ and plan_list_tactic source prefix lt =
         [list_step (list_tactic_span lt) (">> list_tac " ^ list_tactic_label source lt) (list_tactic_program source lt)]
     | LtRepeat _ =>
         [list_step (list_tactic_span lt) (">> list_tac " ^ list_tactic_label source lt) (list_tactic_program source lt)]
-    | LtOrelse xs =>
-        [list_choice_step (list_tactic_span lt) (">> list_tac ORELSE_LT") (list_tactic_program source lt) (map (list_tactic_label source) xs)]
+    | LtOrelse _ =>
+        [list_step (list_tactic_span lt) (">> list_tac " ^ list_tactic_label source lt) (list_tactic_program source lt)]
     | LtSelectGoal sp => [list_step (list_tactic_span lt) (">> list_tac Q.SELECT_GOAL_LT " ^ source_text source sp) (list_tactic_program source lt)]
     | LtSelectGoals sp => [list_step (list_tactic_span lt) (">> list_tac Q.SELECT_GOALS_LT " ^ source_text source sp) (list_tactic_program source lt)]
     | LtQSelectThen (pats, body) =>
         [list_step (list_tactic_span lt)
-           (">> list_tac Q.SELECT_GOALS_LT_THEN1 " ^ source_text source pats ^ " (" ^ tactic_label source body ^ ")")
+           (">> list-step Q.SELECT_GOALS_LT_THEN1 " ^ source_text source pats ^ " (" ^ tactic_label source body ^ ")")
            (list_tactic_program source lt)]
     | LtSelectThen (selector, body) =>
         [list_step (list_tactic_span lt)
@@ -628,13 +631,13 @@ and list_tactic_label source lt =
 
 fun span_text source (start, stop) = String.substring(source, start, stop - start)
 
-fun plain_steps source =
-  [StepPlain {start_pos = 0, end_pos = size source,
-              label = trim_space source, program = source}]
+fun opaque_steps source =
+  [StepTactic {start_pos = 0, end_pos = size source,
+               label = trim_space source, program = parenthesize source}]
 
 fun steps source =
   (plan_tactic source (parse_tactic_ast (parse_tactic_expr source))
-   handle _ => plain_steps source)
+   handle _ => opaque_steps source)
 
 
 end

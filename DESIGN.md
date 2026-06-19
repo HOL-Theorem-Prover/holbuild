@@ -621,18 +621,19 @@ internal load manifests.
 Proof-edit incrementality should not key failed-prefix checkpoints by the full
 proof body hash. That would invalidate exactly the state a proof author needs
 after editing a failing suffix. Instead, a failed proof-IR proof may retain a
-proof-navigation checkpoint plus metadata containing the raw source bytes from
-the theorem/proof start through the last successful executable boundary, the
-number of successful proof-IR steps, the executed step signatures, and the
-initial theorem goal/statement fingerprint. On the next rebuild, holbuild
-compares the retained signatures and/or raw byte prefix with the current theorem
-source, loads the failed-prefix checkpoint, rewinds only to a balanced structural
-boundary, and replays the edited suffix. Rewinding to balanced boundaries is
-important because repeated/focused regions such as `each` and `cases` have
-dynamic proof-manager history that is not a one-to-one encoding of static plan
-indices. Hashes remain guardrails for dependency context and initial goal
-compatibility; current proof-IR shape plus raw byte-prefix comparison decides the
-usable proof prefix.
+proof-navigation checkpoint plus metadata for the last successful executable
+boundary. Resume identity is structural rather than purely numeric: executable
+steps have paths in the nested Proof-IR tree, and dynamic nodes may record the
+choices/iterations needed to make such paths meaningful. On the next rebuild,
+holbuild compares retained signatures with the current proof-IR and resumes only
+at a valid boundary for the surrounding structure. `select` and `cases` bodies
+are resumable directly; `each` is resumable inside the body when dynamic execution
+selected exactly one goal and otherwise resumes before the `each`. `choice`,
+`try`, and `repeat` are represented structurally so future dynamic metadata can
+resume inside the selected alternative/iteration without changing the static IR.
+Hashes remain guardrails for dependency context and initial goal compatibility;
+current proof-IR shape plus retained boundary metadata decides the usable proof
+prefix.
 
 The implementation currently instruments AST `HOLTheoremDecl` declarations, i.e.
 modern goal/proof forms such as `Theorem ... Proof ... QED`. It parses the HOL
@@ -645,18 +646,18 @@ runtime installation/configuration, theorem boundary calls, and original source
 slices.
 
 Proof IR is the executable stepping IR. Holbuild maintains a small semantic
-tactic/list-tactic AST for planning and lowers it to a holbuild-owned proof step
-list. Atomic tactic leaves execute as `step`; atomic list-tactic leaves execute
-as `list-step`. Structural tactic syntax is represented compositionally: `>>`
-with a compound RHS uses `each ... end`, `>-`/`THEN1` uses `select first solve
-... end`, and `THENL`/`>|` uses `cases ... case n ... end`. The runtime executes
-these structures with an explicit focus stack over the proof-manager goal list,
-so nested branch bodies keep per-inner-step timeout, checkpoint, and failure
-attribution. Avoid name-based tactic heuristics for atomicity: opaque tactic
-calls are leaves, and structural decomposition should be justified by parsed
-tactic/list-tactic syntax. Dynamic controls such as `TRY`, `ORELSE`, and `FIRST`
-are still represented as atomic choice/list-choice steps pending a future
-structural dynamic-control IR.
+tactic/list-tactic AST for planning and lowers it to a holbuild-owned structural
+proof plan. Atomic tactic leaves execute as `step`; atomic list-tactic leaves
+execute as `list-step`. Structural tactic syntax is represented compositionally:
+`>>` with a compound RHS uses `each ... end`, `>-`/`THEN1` uses `select first
+solve ... end`, matching selectors use `select matching-* solve ... end`,
+`THENL`/`>|` uses `cases ... case n ... end`, dynamic alternatives use `choice
+... alternative n ... end`, repetition uses `repeat ... end`, and `TRY` is `try
+... end`. The runtime executes these structures with a focus over the
+proof-manager goal list, so nested bodies keep per-inner-step timeout,
+checkpoint, and failure attribution. Avoid name-based tactic heuristics for
+atomicity: opaque tactic calls are leaves, and structural decomposition should be
+justified by parsed tactic/list-tactic syntax.
 
 Attributed proofs and declarations with no parsed tactic body use a conservative
 whole-tactic prover path. Normal theorem bodies should not fall back to timing the
@@ -690,8 +691,7 @@ When proof steps are enabled, holbuild applies a tactic timeout to each
 executable proof step, and to the conservative whole-tactic path used for
 attributed/opaque proof cases. The proof-step engine is holbuild's proof IR: it still
 uses HOLSource parser recovery, but lowers `HOLSourceAST.exp` directly.
-`--goalfrag` and `goalfrag-plan` have been removed. The old `--new-ir` build flag is
-accepted as a deprecated no-op because proof IR is now the default. The CLI default is
+The old `--new-ir` build flag is accepted as a deprecated no-op because proof IR is now the default. The CLI default is
 2.5 seconds per tactic step;
 `--tactic-timeout SECONDS` overrides all manifest timeout policy for the invocation, and
 `--tactic-timeout 0` disables it. Without a CLI override, `[build].tactic_timeout` sets

@@ -340,15 +340,7 @@ latest log. Up-to-date and cache-restored targets do not produce a new log; use
 
 Compatibility aliases:
 
-- `--skip-goalfrag` warns and behaves like `--skip-proof-steps`.
-- `--goalfrag-trace` warns and behaves like `--trace-steps`.
 - `--new-ir` is accepted as a deprecated no-op.
-
-Removed legacy interfaces:
-
-- `goalfrag-plan`
-- `--goalfrag`
-- `--goalfrag-plan`
 
 ## Caches and cleanup
 

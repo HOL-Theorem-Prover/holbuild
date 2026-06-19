@@ -186,29 +186,29 @@ second_log=$tmpdir/second.log
 (cd "$project" && "$HOLBUILD_BIN" --verbose build ATheory) > "$second_log"
 require_grep "ATheory is up to date" "$second_log"
 
-same_artifact_skip_goalfrag_log=$tmpdir/same-artifact-skip-goalfrag.log
-(cd "$project" && "$HOLBUILD_BIN" --verbose build --skip-proof-steps ATheory) > "$same_artifact_skip_goalfrag_log"
-require_grep "ATheory is up to date" "$same_artifact_skip_goalfrag_log"
+same_artifact_skip_proof_steps_log=$tmpdir/same-artifact-skip-proof_steps.log
+(cd "$project" && "$HOLBUILD_BIN" --verbose build --skip-proof-steps ATheory) > "$same_artifact_skip_proof_steps_log"
+require_grep "ATheory is up to date" "$same_artifact_skip_proof_steps_log"
 
 trace_project=$tmpdir/trace-project
 mkdir -p "$trace_project/src"
 cp "$project/holproject.toml" "$trace_project/holproject.toml"
 cp "$project/src/AScript.sml" "$trace_project/src/AScript.sml"
-plan_log=$tmpdir/goalfrag-plan.log
+plan_log=$tmpdir/proof_steps-plan.log
 (cd "$trace_project" && "$HOLBUILD_BIN" execution-plan ATheory:b_thm) > "$plan_log" 2>&1
 require_grep "holbuild proof-ir plan ATheory:b_thm source=src/AScript.sml (" "$plan_log"
 require_grep "^[[:space:]]*00 .*CONJ_TAC" "$plan_log"
 require_grep "^[[:space:]]*[0-9][0-9][[:space:]]*>-" "$plan_log"
 require_grep "^[[:space:]]*[0-9][0-9] .*ACCEPT_TAC TRUTH" "$plan_log"
 if grep -q "open_\|close_\|next_" "$plan_log"; then
-  echo "goalfrag plan leaked structural IR names" >&2
+  echo "proof_steps plan leaked structural IR names" >&2
   exit 1
 fi
-if grep -q "holbuild goalfrag before theorem=b_thm\|elapsed_ms=\|ATheory built\|ATheory inspected\|resuming ATheory" "$plan_log"; then
+if grep -q "holbuild proof_steps before theorem=b_thm\|elapsed_ms=\|ATheory built\|ATheory inspected\|resuming ATheory" "$plan_log"; then
   echo "execution-plan executed the build instead of statically printing the plan" >&2
   exit 1
 fi
-trace_log=$tmpdir/goalfrag-trace.log
+trace_log=$tmpdir/proof_steps-trace.log
 (cd "$trace_project" && "$HOLBUILD_BIN" build --force --trace-steps ATheory) > "$trace_log" 2>&1
 require_grep "ATheory built" "$trace_log"
 if grep -q "holbuild proof-ir plan theorem=\|holbuild proof-ir before theorem=" "$trace_log"; then
@@ -222,7 +222,7 @@ require_grep "holbuild proof-ir plan theorem=a_thm steps=" "$trace_child_log"
 require_grep "holbuild proof-ir plan theorem=b_thm steps=" "$trace_child_log"
 require_grep "holbuild proof-ir before theorem=b_thm step=0" "$trace_child_log"
 if grep -q '^[0-9][0-9]* subgoals:$' "$trace_child_log"; then
-  echo "goalfrag child log leaked interactive goal-stack progress" >&2
+  echo "proof_steps child log leaked interactive goal-stack progress" >&2
   exit 1
 fi
 require_grep "holbuild proof-ir after theorem=b_thm step=0.*elapsed_ms=" "$trace_child_log"
@@ -234,15 +234,15 @@ if grep -q "ATheory is up to date\|ATheory restored from cache" "$force_log"; th
   exit 1
 fi
 
-skip_goalfrag_project=$tmpdir/skip-goalfrag-project
-mkdir -p "$skip_goalfrag_project/src"
-cp "$project/holproject.toml" "$skip_goalfrag_project/holproject.toml"
-cp "$project/src/AScript.sml" "$skip_goalfrag_project/src/AScript.sml"
-(cd "$skip_goalfrag_project" && "$HOLBUILD_BIN" build --skip-proof-steps ATheory)
-require_file "$skip_goalfrag_project/.holbuild/obj/src/ATheory.sig"
-require_file "$skip_goalfrag_project/.holbuild/obj/src/ATheory.sml"
-require_file "$skip_goalfrag_project/.holbuild/obj/src/ATheory.dat"
-if grep -q "theorem_boundary a_thm" "$skip_goalfrag_project/.holbuild/dep/replay/src/AScript.sml.key"; then
+skip_proof_steps_project=$tmpdir/skip-proof_steps-project
+mkdir -p "$skip_proof_steps_project/src"
+cp "$project/holproject.toml" "$skip_proof_steps_project/holproject.toml"
+cp "$project/src/AScript.sml" "$skip_proof_steps_project/src/AScript.sml"
+(cd "$skip_proof_steps_project" && "$HOLBUILD_BIN" build --skip-proof-steps ATheory)
+require_file "$skip_proof_steps_project/.holbuild/obj/src/ATheory.sig"
+require_file "$skip_proof_steps_project/.holbuild/obj/src/ATheory.sml"
+require_file "$skip_proof_steps_project/.holbuild/obj/src/ATheory.dat"
+if grep -q "theorem_boundary a_thm" "$skip_proof_steps_project/.holbuild/dep/replay/src/AScript.sml.key"; then
   echo "--skip-proof-steps should not create theorem boundaries" >&2
   exit 1
 fi
@@ -281,7 +281,7 @@ PY
 plain_replay_log=$tmpdir/plain-replay.log
 (cd "$plain_replay_project" && "$HOLBUILD_BIN" build --skip-proof-steps --no-cache ATheory) > "$plain_replay_log" 2>&1
 if grep -q "from: theorem-context checkpoint after a_thm" "$plain_replay_log"; then
-  echo "--skip-proof-steps reused goalfrag theorem checkpoint" >&2
+  echo "--skip-proof-steps reused proof_steps theorem checkpoint" >&2
   exit 1
 fi
 require_grep "ATheory built" "$plain_replay_log"
@@ -1142,16 +1142,16 @@ if grep -q "plain-source fallback disabled" "$timeout_log"; then
   exit 1
 fi
 
-goalfrag_shorten_project=$tmpdir/goalfrag-shorten-project
-goalfrag_shorten_counter=$tmpdir/goalfrag-shorten-count.txt
-mkdir -p "$goalfrag_shorten_project/src"
-touch "$goalfrag_shorten_counter"
-cp "$project/holproject.toml" "$goalfrag_shorten_project/holproject.toml"
+proof_steps_shorten_project=$tmpdir/proof_steps-shorten-project
+proof_steps_shorten_counter=$tmpdir/proof_steps-shorten-count.txt
+mkdir -p "$proof_steps_shorten_project/src"
+touch "$proof_steps_shorten_counter"
+cp "$project/holproject.toml" "$proof_steps_shorten_project/holproject.toml"
 python3 - <<PY
 from pathlib import Path
-project = Path("$goalfrag_shorten_project")
-counter = Path("$goalfrag_shorten_counter")
-long_prefix = " >> ".join(["slow_tac"] + ["ALL_TAC"] * 20 + ['FAIL_TAC "goalfrag long suffix failure"'])
+project = Path("$proof_steps_shorten_project")
+counter = Path("$proof_steps_shorten_counter")
+long_prefix = " >> ".join(["slow_tac"] + ["ALL_TAC"] * 20 + ['FAIL_TAC "proof_steps long suffix failure"'])
 (project / "src" / "AScript.sml").write_text(f'''open HolKernel Parse boolLib bossLib;
 val _ = new_theory "A";
 val slow_prefix_counter = "{counter}";
@@ -1159,7 +1159,7 @@ fun bump_counter () =
   let val out = TextIO.openAppend slow_prefix_counter
   in TextIO.output(out, "x"); TextIO.closeOut out end;
 fun slow_tac g = (bump_counter(); ALL_TAC g);
-Theorem shortened_goalfrag_replay:
+Theorem shortened_proof_steps_replay:
   T
 Proof
   {long_prefix}
@@ -1168,17 +1168,17 @@ val _ = export_theory();
 ''')
 PY
 
-goalfrag_shorten_first_log=$tmpdir/goalfrag-shorten-first.log
-if (cd "$goalfrag_shorten_project" && "$HOLBUILD_BIN" build ATheory) > "$goalfrag_shorten_first_log" 2>&1; then
-  echo "expected goalfrag shortened replay first build to fail" >&2
+proof_steps_shorten_first_log=$tmpdir/proof_steps-shorten-first.log
+if (cd "$proof_steps_shorten_project" && "$HOLBUILD_BIN" build ATheory) > "$proof_steps_shorten_first_log" 2>&1; then
+  echo "expected proof_steps shortened replay first build to fail" >&2
   exit 1
 fi
-goalfrag_shorten_first_count=$(wc -c < "$goalfrag_shorten_counter" | tr -d ' ')
-[[ "$goalfrag_shorten_first_count" = "1" ]] || { echo "expected goalfrag shortened replay first run to execute slow prefix once, got $goalfrag_shorten_first_count" >&2; exit 1; }
-require_grep "goalfrag long suffix failure" "$goalfrag_shorten_first_log"
+proof_steps_shorten_first_count=$(wc -c < "$proof_steps_shorten_counter" | tr -d ' ')
+[[ "$proof_steps_shorten_first_count" = "1" ]] || { echo "expected proof_steps shortened replay first run to execute slow prefix once, got $proof_steps_shorten_first_count" >&2; exit 1; }
+require_grep "proof_steps long suffix failure" "$proof_steps_shorten_first_log"
 python3 - <<PY
 from pathlib import Path
-prefix_paths = list(Path("$goalfrag_shorten_project/.holbuild/checkpoints").glob("**/*shortened_goalfrag_replay_failed_prefix.save.prefix"))
+prefix_paths = list(Path("$proof_steps_shorten_project/.holbuild/checkpoints").glob("**/*shortened_proof_steps_replay_failed_prefix.save.prefix"))
 if len(prefix_paths) != 1:
     raise SystemExit(f"expected one failed-prefix .prefix file, got {prefix_paths}")
 prefix_paths[0].write_text("slow_tac")
@@ -1186,36 +1186,36 @@ PY
 
 python3 - <<PY
 from pathlib import Path
-path = Path("$goalfrag_shorten_project/src/AScript.sml")
+path = Path("$proof_steps_shorten_project/src/AScript.sml")
 text = path.read_text()
 proof = text.index('Proof')
 start = text.index('slow_tac', proof)
 end = text.index('QED', start)
-path.write_text(text[:start] + 'slow_tac >> FAIL_TAC "goalfrag short suffix failure"\n' + text[end:])
+path.write_text(text[:start] + 'slow_tac >> FAIL_TAC "proof_steps short suffix failure"\n' + text[end:])
 PY
-goalfrag_shorten_edit_log=$tmpdir/goalfrag-shorten-edit.log
-if (cd "$goalfrag_shorten_project" && "$HOLBUILD_BIN" build ATheory) > "$goalfrag_shorten_edit_log" 2>&1; then
-  echo "expected goalfrag shortened replay edited build to fail" >&2
+proof_steps_shorten_edit_log=$tmpdir/proof_steps-shorten-edit.log
+if (cd "$proof_steps_shorten_project" && "$HOLBUILD_BIN" build ATheory) > "$proof_steps_shorten_edit_log" 2>&1; then
+  echo "expected proof_steps shortened replay edited build to fail" >&2
   exit 1
 fi
-goalfrag_shorten_edit_count=$(wc -c < "$goalfrag_shorten_counter" | tr -d ' ')
-[[ "$goalfrag_shorten_edit_count" = "1" ]] || { echo "goalfrag shortened replay reran unchanged slow prefix; count $goalfrag_shorten_edit_count" >&2; exit 1; }
-require_grep "from: failed-prefix checkpoint in shortened_goalfrag_replay" "$goalfrag_shorten_edit_log"
-require_grep "goalfrag short suffix failure" "$goalfrag_shorten_edit_log"
-if grep -q "CANT_BACKUP_ANYMORE" "$goalfrag_shorten_edit_log"; then
-  echo "goalfrag failed-prefix replay could not rewind retained proof history" >&2
+proof_steps_shorten_edit_count=$(wc -c < "$proof_steps_shorten_counter" | tr -d ' ')
+[[ "$proof_steps_shorten_edit_count" = "1" ]] || { echo "proof_steps shortened replay reran unchanged slow prefix; count $proof_steps_shorten_edit_count" >&2; exit 1; }
+require_grep "from: failed-prefix checkpoint in shortened_proof_steps_replay" "$proof_steps_shorten_edit_log"
+require_grep "proof_steps short suffix failure" "$proof_steps_shorten_edit_log"
+if grep -q "CANT_BACKUP_ANYMORE" "$proof_steps_shorten_edit_log"; then
+  echo "proof_steps failed-prefix replay could not rewind retained proof history" >&2
   exit 1
 fi
 
-goalfrag_resume_project=$tmpdir/goalfrag-resume-project
-goalfrag_resume_counter=$tmpdir/goalfrag-resume-count.txt
-mkdir -p "$goalfrag_resume_project/src"
-touch "$goalfrag_resume_counter"
-cp "$project/holproject.toml" "$goalfrag_resume_project/holproject.toml"
-cat > "$goalfrag_resume_project/src/AScript.sml" <<SML
+proof_steps_resume_project=$tmpdir/proof_steps-resume-project
+proof_steps_resume_counter=$tmpdir/proof_steps-resume-count.txt
+mkdir -p "$proof_steps_resume_project/src"
+touch "$proof_steps_resume_counter"
+cp "$project/holproject.toml" "$proof_steps_resume_project/holproject.toml"
+cat > "$proof_steps_resume_project/src/AScript.sml" <<SML
 open HolKernel Parse boolLib bossLib markerLib;
 val _ = new_theory "A";
-val slow_prefix_counter = "$goalfrag_resume_counter";
+val slow_prefix_counter = "$proof_steps_resume_counter";
 fun bump_counter () =
   let val out = TextIO.openAppend slow_prefix_counter
   in TextIO.output(out, "x"); TextIO.closeOut out end;
@@ -1225,33 +1225,33 @@ Theorem partial:
 Proof
   CONJ_TAC >- ACCEPT_TAC TRUTH >- suspend "right"
 QED
-Resume partial[right,smlname=partial_right_goalfrag]:
-  slow_tac >> slow_tac >> FAIL_TAC "goalfrag resume suffix failure"
+Resume partial[right,smlname=partial_right_proof_steps]:
+  slow_tac >> slow_tac >> FAIL_TAC "proof_steps resume suffix failure"
 QED
 Finalise partial
-val _ = concl partial_right_goalfrag;
+val _ = concl partial_right_proof_steps;
 val _ = export_theory();
 SML
 
-goalfrag_resume_first_log=$tmpdir/goalfrag-resume-first.log
-if (cd "$goalfrag_resume_project" && "$HOLBUILD_BIN" build ATheory) > "$goalfrag_resume_first_log" 2>&1; then
-  echo "expected first GoalFrag Resume proof to fail" >&2
+proof_steps_resume_first_log=$tmpdir/proof_steps-resume-first.log
+if (cd "$proof_steps_resume_project" && "$HOLBUILD_BIN" build ATheory) > "$proof_steps_resume_first_log" 2>&1; then
+  echo "expected first ProofSteps Resume proof to fail" >&2
   exit 1
 fi
-goalfrag_resume_first_count=$(wc -c < "$goalfrag_resume_counter" | tr -d ' ')
-[[ "$goalfrag_resume_first_count" = "2" ]] || { echo "expected first GoalFrag Resume run to execute slow prefix twice, got $goalfrag_resume_first_count" >&2; exit 1; }
-require_grep "goalfrag resume suffix failure" "$goalfrag_resume_first_log"
-require_file "$(find "$goalfrag_resume_project/.holbuild/checkpoints" -name '*partial_right__failed_prefix.save' -print -quit)"
+proof_steps_resume_first_count=$(wc -c < "$proof_steps_resume_counter" | tr -d ' ')
+[[ "$proof_steps_resume_first_count" = "2" ]] || { echo "expected first ProofSteps Resume run to execute slow prefix twice, got $proof_steps_resume_first_count" >&2; exit 1; }
+require_grep "proof_steps resume suffix failure" "$proof_steps_resume_first_log"
+require_file "$(find "$proof_steps_resume_project/.holbuild/checkpoints" -name '*partial_right__failed_prefix.save' -print -quit)"
 
 python3 - <<PY
 from pathlib import Path
-path = Path("$goalfrag_resume_project/src/AScript.sml")
-path.write_text(path.read_text().replace('FAIL_TAC "goalfrag resume suffix failure"', 'ACCEPT_TAC TRUTH'))
+path = Path("$proof_steps_resume_project/src/AScript.sml")
+path.write_text(path.read_text().replace('FAIL_TAC "proof_steps resume suffix failure"', 'ACCEPT_TAC TRUTH'))
 PY
-goalfrag_resume_fixed_log=$tmpdir/goalfrag-resume-fixed.log
-(cd "$goalfrag_resume_project" && "$HOLBUILD_BIN" build ATheory) > "$goalfrag_resume_fixed_log" 2>&1
-goalfrag_resume_fixed_count=$(wc -c < "$goalfrag_resume_counter" | tr -d ' ')
-[[ "$goalfrag_resume_fixed_count" = "2" ]] || { echo "GoalFrag Resume failed-prefix replay reran unchanged slow prefix after suffix fix; count $goalfrag_resume_fixed_count" >&2; exit 1; }
-require_grep "from: failed-prefix checkpoint in partial_right_" "$goalfrag_resume_fixed_log"
-require_grep "ATheory built" "$goalfrag_resume_fixed_log"
-require_file "$goalfrag_resume_project/.holbuild/obj/src/ATheory.dat"
+proof_steps_resume_fixed_log=$tmpdir/proof_steps-resume-fixed.log
+(cd "$proof_steps_resume_project" && "$HOLBUILD_BIN" build ATheory) > "$proof_steps_resume_fixed_log" 2>&1
+proof_steps_resume_fixed_count=$(wc -c < "$proof_steps_resume_counter" | tr -d ' ')
+[[ "$proof_steps_resume_fixed_count" = "2" ]] || { echo "ProofSteps Resume failed-prefix replay reran unchanged slow prefix after suffix fix; count $proof_steps_resume_fixed_count" >&2; exit 1; }
+require_grep "from: failed-prefix checkpoint in partial_right_" "$proof_steps_resume_fixed_log"
+require_grep "ATheory built" "$proof_steps_resume_fixed_log"
+require_file "$proof_steps_resume_project/.holbuild/obj/src/ATheory.dat"
