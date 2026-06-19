@@ -58,6 +58,14 @@ Proof
   (CONJ_TAC >- ACCEPT_TAC TRUTH >> ACCEPT_TAC TRUTH)
 QED
 
+Theorem suffix_each_leaves_subgoals_success:
+  (T /\ T) /\ (T /\ T)
+Proof
+  CONJ_TAC >>
+  CONJ_TAC >>
+  ACCEPT_TAC TRUTH
+QED
+
 Theorem branch_suffix_compound_each_success:
   ((T /\ T) /\ T) /\ T
 Proof
@@ -78,6 +86,13 @@ Theorem thenl_cases_success:
   T /\ T
 Proof
   CONJ_TAC >| [ACCEPT_TAC TRUTH, ACCEPT_TAC TRUTH]
+QED
+
+Theorem thenl_cases_leave_subgoals_success:
+  (T /\ T) /\ (T /\ T)
+Proof
+  CONJ_TAC >| [CONJ_TAC, CONJ_TAC] >>
+  ACCEPT_TAC TRUTH
 QED
 
 Theorem by_sugar_success:

@@ -513,6 +513,22 @@ fun close_focus label HolbuildProofIr.SelectKeep = pop_branch_tail_count label
         else raise Fail "selected goals were not solved"
       end
 
+fun reorder_focused_front_after label front_count middle_count =
+  if front_count = 0 orelse middle_count = 0 then ()
+  else
+    let
+      fun reorder goals =
+        let
+          val (front, rest) = Lib.split_after front_count goals
+          val (middle, tail) = Lib.split_after middle_count rest
+          fun validate thms =
+            let
+              val (middle_thms, rest_thms) = Lib.split_after middle_count thms
+              val (front_thms, tail_thms) = Lib.split_after front_count rest_thms
+            in front_thms @ middle_thms @ tail_thms end
+        in (middle @ front @ tail, validate) end
+    in apply_focus_list_tactic label reorder end
+
 fun step proof_step =
   case proof_step of
       HolbuildProofIr.StepTactic {label, program, ...} => apply_tactic_step label program
@@ -577,6 +593,28 @@ fun trace_after status elapsed index proof_step =
               " elapsed_ms=", fmt_ms elapsed,
               " goals=", Int.toString (current_goal_count()),
               " label=", display_label (HolbuildProofIr.step_label proof_step), "\n"]
+
+fun runtime_state_snapshot () =
+  {history = current_history(),
+   current_path = !current_path_ref,
+   successful_path = !successful_path_ref,
+   successful_count = !successful_step_count_ref,
+   successful_end = !successful_prefix_end_ref,
+   events = !dynamic_events_ref,
+   branch_tail_counts = !branch_tail_count_ref,
+   reverse_group_lengths = !reverse_group_lengths_ref}
+
+fun restore_runtime_state {history, current_path, successful_path, successful_count,
+                           successful_end, events, branch_tail_counts,
+                           reverse_group_lengths} =
+  (set_history history;
+   current_path_ref := current_path;
+   successful_path_ref := successful_path;
+   successful_step_count_ref := successful_count;
+   successful_prefix_end_ref := successful_end;
+   dynamic_events_ref := events;
+   branch_tail_count_ref := branch_tail_counts;
+   reverse_group_lengths_ref := reverse_group_lengths)
 
 fun with_expected_failures_suppressed f =
   let val old = !suppress_expected_failure_diagnostics_ref
@@ -661,89 +699,82 @@ fun run_structural_steps display_index steps =
     and run_each d path proof_step body =
       let
         val count = focused_goal_count "each"
-        fun loop iter 0 = ()
-          | loop iter n =
-              (push_first_focus "each";
-               run_list (d + 1) (path @ [HolbuildProofIr.PathEach iter]) 0 body;
-               with_plan_position (d + HolbuildProofIr.display_line_count proof_step - 1) "end" "end" (HolbuildProofIr.step_end proof_step, HolbuildProofIr.step_end proof_step)
-                 (fn () => close_focus "each" HolbuildProofIr.SelectSolve);
-               loop (iter + 1) (n - 1))
+        fun run_one_each iter remaining =
+          let
+            val _ = push_first_focus "each"
+            val result = (run_list (d + 1) (path @ [HolbuildProofIr.PathEach iter]) 0 body; NONE) handle e => SOME e
+          in
+            case result of
+                SOME e => (pop_branch_tail_count "each" handle _ => (); raise e)
+              | NONE =>
+                  let val generated = focused_goal_count "each"
+                  in close_focus "each" HolbuildProofIr.SelectKeep;
+                     reorder_focused_front_after "each" generated (remaining - 1)
+                  end
+          end
+        fun loop _ 0 = ()
+          | loop iter remaining = (run_one_each iter remaining; loop (iter + 1) (remaining - 1))
       in loop 0 count; d + HolbuildProofIr.display_line_count proof_step end
     and run_cases d path proof_step cases =
       let
-        fun loop _ [] = ()
-          | loop n (body :: rest) =
-              let val label = "case " ^ Int.toString n
-              in push_first_focus label;
-                 run_list (d + 2) (path @ [HolbuildProofIr.PathCase n]) 0 body;
-                 with_plan_position (d + HolbuildProofIr.display_line_count proof_step - 1) "end" "end" (HolbuildProofIr.step_end proof_step, HolbuildProofIr.step_end proof_step)
-                   (fn () => close_focus label HolbuildProofIr.SelectSolve);
-                 loop (n + 1) rest
-              end
-      in loop 1 cases; d + HolbuildProofIr.display_line_count proof_step end
+        val count = focused_goal_count "cases"
+        val case_count = length cases
+        val _ = if case_count = count then ()
+                else raise Fail (String.concat ["case count mismatch: ", Int.toString case_count,
+                                                " cases for ", Int.toString count, " focused goals"])
+        fun run_one_case n remaining body =
+          let
+            val label = "case " ^ Int.toString n
+            val _ = push_first_focus label
+            val result = (run_list (d + 2) (path @ [HolbuildProofIr.PathCase n]) 0 body; NONE) handle e => SOME e
+          in
+            case result of
+                SOME e => (pop_branch_tail_count label handle _ => (); raise e)
+              | NONE =>
+                  let val generated = focused_goal_count label
+                  in close_focus label HolbuildProofIr.SelectKeep;
+                     reorder_focused_front_after label generated (remaining - 1)
+                  end
+          end
+        fun loop _ _ [] = ()
+          | loop n remaining (body :: rest) =
+              (run_one_case n remaining body; loop (n + 1) (remaining - 1) rest)
+      in loop 1 count cases; d + HolbuildProofIr.display_line_count proof_step end
     and run_choice d path proof_step label alternatives =
       let
         fun attempt _ [] last = (case last of SOME e => raise e | NONE => raise Fail ("choice has no alternatives: " ^ label))
           | attempt n (body :: rest) _ =
-              let val saved = current_history()
-                  val saved_path = !current_path_ref
-                  val saved_success = !successful_path_ref
-                  val saved_count = !successful_step_count_ref
-                  val saved_end = !successful_prefix_end_ref
-                  val saved_events = !dynamic_events_ref
+              let val saved = runtime_state_snapshot()
                   val result = (with_expected_failures_suppressed (fn () => run_list (d + 2) (path @ [HolbuildProofIr.PathAlternative n]) 0 body); NONE) handle e => SOME e
               in
                 case result of
                     NONE => dynamic_events_ref := HolbuildProofIr.ChoiceEvent (path, n) :: !dynamic_events_ref
                   | SOME e =>
-                      (set_history saved;
-                       current_path_ref := saved_path;
-                       successful_path_ref := saved_success;
-                       successful_step_count_ref := saved_count;
-                       successful_prefix_end_ref := saved_end;
-                       dynamic_events_ref := saved_events;
+                      (restore_runtime_state saved;
                        attempt (n + 1) rest (SOME e))
               end
       in attempt 1 alternatives NONE; d + HolbuildProofIr.display_line_count proof_step end
     and run_try d path proof_step body =
-      let val saved = current_history()
-          val saved_path = !current_path_ref
-          val saved_success = !successful_path_ref
-          val saved_count = !successful_step_count_ref
-          val saved_end = !successful_prefix_end_ref
-          val saved_events = !dynamic_events_ref
+      let val saved = runtime_state_snapshot()
           val result = (with_expected_failures_suppressed (fn () => run_list (d + 1) (path @ [HolbuildProofIr.PathTry]) 0 body); NONE) handle e => SOME e
       in (case result of
               NONE => dynamic_events_ref := HolbuildProofIr.TryEvent (path, true) :: !dynamic_events_ref
             | SOME _ =>
-                (set_history saved;
-                 current_path_ref := saved_path;
-                 successful_path_ref := saved_success;
-                 successful_step_count_ref := saved_count;
-                 successful_prefix_end_ref := saved_end;
-                 dynamic_events_ref := HolbuildProofIr.TryEvent (path, false) :: saved_events));
+                (restore_runtime_state saved;
+                 dynamic_events_ref := HolbuildProofIr.TryEvent (path, false) :: !dynamic_events_ref));
          d + HolbuildProofIr.display_line_count proof_step end
     and run_repeat d path proof_step body =
       let
         fun loop iter =
           if iter > 10000 then raise Fail "repeat proof step exceeded iteration guard"
           else let val before = current_goal_count()
-                   val saved = current_history()
-                   val saved_path = !current_path_ref
-                   val saved_success = !successful_path_ref
-                   val saved_count = !successful_step_count_ref
-                   val saved_end = !successful_prefix_end_ref
-                   val saved_events = !dynamic_events_ref
+                   val saved = runtime_state_snapshot()
                    val result = (with_expected_failures_suppressed (fn () => run_list (d + 1) (path @ [HolbuildProofIr.PathRepeat iter]) 0 body); NONE) handle e => SOME e
                    val after = current_goal_count()
                in case result of
                       SOME _ =>
-                        (set_history saved;
-                         current_path_ref := saved_path;
-                         successful_path_ref := saved_success;
-                         successful_step_count_ref := saved_count;
-                         successful_prefix_end_ref := saved_end;
-                         dynamic_events_ref := HolbuildProofIr.RepeatStopEvent (path, iter) :: saved_events)
+                        (restore_runtime_state saved;
+                         dynamic_events_ref := HolbuildProofIr.RepeatStopEvent (path, iter) :: !dynamic_events_ref)
                     | NONE =>
                         if after = before then dynamic_events_ref := HolbuildProofIr.RepeatStopEvent (path, iter) :: !dynamic_events_ref
                         else (dynamic_events_ref := HolbuildProofIr.RepeatIterEvent (path, iter) :: !dynamic_events_ref; loop (iter + 1))
