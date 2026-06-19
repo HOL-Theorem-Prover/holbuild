@@ -496,11 +496,9 @@ fun choice_step sp label program alternatives =
 fun list_choice_step sp label program alternatives =
   StepListChoice {start_pos = #1 sp, end_pos = #2 sp, label = label, program = program, alternatives = alternatives}
 
-fun each_begin sp = StepEachBegin {start_pos = #1 sp, end_pos = #2 sp}
-fun select_first_solve_begin sp = StepSelectFirstSolveBegin {start_pos = #1 sp, end_pos = #2 sp}
-fun cases_begin sp = StepCasesBegin {start_pos = #1 sp, end_pos = #2 sp}
-fun case_step sp index = StepCase {start_pos = #1 sp, end_pos = #2 sp, index = index}
-fun end_step sp = StepEnd {start_pos = #1 sp, end_pos = #2 sp}
+fun each_step sp body = StepEach {start_pos = #1 sp, end_pos = #2 sp, body = body}
+fun select_first_solve_step sp body = StepSelectFirstSolve {start_pos = #1 sp, end_pos = #2 sp, body = body}
+fun cases_step sp cases = StepCases {start_pos = #1 sp, end_pos = #2 sp, cases = cases}
 
 fun suffices_tactic_program source q = "Q_TAC SUFF_TAC " ^ source_text source q
 
@@ -514,7 +512,7 @@ fun needs_structured_each tactic =
     | _ => false
 
 fun suffix_plan source tactic =
-  if needs_structured_each tactic then each_begin (tactic_span tactic) :: plan_tactic source tactic @ [end_step (tactic_span tactic)]
+  if needs_structured_each tactic then [each_step (tactic_span tactic) (plan_tactic source tactic)]
   else plan_tactic source tactic
 and plan_tactic source tactic =
   case tactic of
@@ -522,19 +520,10 @@ and plan_tactic source tactic =
     | TacThen (first :: rest) => plan_tactic source first @ List.concat (map (suffix_plan source) rest)
     | TacThen1 (lhs, rhs) =>
         plan_tactic source lhs @
-        [select_first_solve_begin (tactic_span rhs)] @
-        plan_tactic source rhs @
-        [end_step (tactic_span rhs)]
+        [select_first_solve_step (tactic_span rhs) (plan_tactic source rhs)]
     | TacThenL (lhs, branches) =>
-        let
-          fun branch_steps (i, branch) = case_step (tactic_span branch) i :: plan_tactic source branch
-          val indexed = ListPair.zip (List.tabulate(length branches, fn i => i + 1), branches)
-        in
-          plan_tactic source lhs @
-          [cases_begin (tactic_span tactic)] @
-          List.concat (map branch_steps indexed) @
-          [end_step (tactic_span tactic)]
-        end
+        plan_tactic source lhs @
+        [cases_step (tactic_span tactic) (map (plan_tactic source) branches)]
     | TacThenLT (lhs, lt) => plan_tactic source lhs @ plan_list_tactic source ">>>" lt
     | TacReverse (sp, inner) =>
         plan_tactic source inner @ plan_list_tactic source ">>>" (LtReverse sp)
@@ -549,9 +538,7 @@ and plan_tactic source tactic =
           [StepTactic {start_pos = #1 q, end_pos = #2 q,
                        label = "qsuff_tac " ^ source_text source q,
                        program = suffices_tactic_program source q},
-           select_first_solve_begin (tactic_span rhs)] @
-          plan_tactic source rhs @
-          [end_step (tactic_span rhs)]
+           select_first_solve_step (tactic_span rhs) (plan_tactic source rhs)]
         end
     | TacRepairGroup (_, inner) => plan_tactic source inner
     | _ => [tactic_step source tactic]

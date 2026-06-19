@@ -247,29 +247,70 @@ fun run_analyser_for_proof_ir_text {name, tactic_start, tactic_end, tactic_text}
 fun int_field s =
   case Int.fromString s of SOME n => n | NONE => raise Error ("bad proof-ir integer field: " ^ s)
 
+datatype parsed_proof_step =
+    ParsedStep of HolbuildProofIr.step
+  | ParsedEachBegin of int * int
+  | ParsedSelectFirstSolveBegin of int * int
+  | ParsedCasesBegin of int * int
+  | ParsedCase of int * int * int
+  | ParsedEnd of int * int
+
 fun parse_proof_step fields =
   case fields of
       ["proof-step", "tactic", a, b, label, program] =>
-        HolbuildProofIr.StepTactic {start_pos = int_field a, end_pos = int_field b, label = label, program = program}
+        ParsedStep (HolbuildProofIr.StepTactic {start_pos = int_field a, end_pos = int_field b, label = label, program = program})
     | ["proof-step", "list", a, b, label, program] =>
-        HolbuildProofIr.StepList {start_pos = int_field a, end_pos = int_field b, label = label, program = program}
+        ParsedStep (HolbuildProofIr.StepList {start_pos = int_field a, end_pos = int_field b, label = label, program = program})
     | "proof-step" :: "choice" :: a :: b :: label :: program :: alternatives =>
-        HolbuildProofIr.StepChoice {start_pos = int_field a, end_pos = int_field b, label = label, program = program, alternatives = alternatives}
+        ParsedStep (HolbuildProofIr.StepChoice {start_pos = int_field a, end_pos = int_field b, label = label, program = program, alternatives = alternatives})
     | "proof-step" :: "list-choice" :: a :: b :: label :: program :: alternatives =>
-        HolbuildProofIr.StepListChoice {start_pos = int_field a, end_pos = int_field b, label = label, program = program, alternatives = alternatives}
-    | ["proof-step", "each", a, b] =>
-        HolbuildProofIr.StepEachBegin {start_pos = int_field a, end_pos = int_field b}
-    | ["proof-step", "select-first-solve", a, b] =>
-        HolbuildProofIr.StepSelectFirstSolveBegin {start_pos = int_field a, end_pos = int_field b}
-    | ["proof-step", "cases", a, b] =>
-        HolbuildProofIr.StepCasesBegin {start_pos = int_field a, end_pos = int_field b}
-    | ["proof-step", "case", a, b, index] =>
-        HolbuildProofIr.StepCase {start_pos = int_field a, end_pos = int_field b, index = int_field index}
-    | ["proof-step", "end", a, b] =>
-        HolbuildProofIr.StepEnd {start_pos = int_field a, end_pos = int_field b}
+        ParsedStep (HolbuildProofIr.StepListChoice {start_pos = int_field a, end_pos = int_field b, label = label, program = program, alternatives = alternatives})
+    | ["proof-step", "each", a, b] => ParsedEachBegin (int_field a, int_field b)
+    | ["proof-step", "select-first-solve", a, b] => ParsedSelectFirstSolveBegin (int_field a, int_field b)
+    | ["proof-step", "cases", a, b] => ParsedCasesBegin (int_field a, int_field b)
+    | ["proof-step", "case", a, b, index] => ParsedCase (int_field a, int_field b, int_field index)
+    | ["proof-step", "end", a, b] => ParsedEnd (int_field a, int_field b)
     | ["proof-step", "plain", a, b, label, program] =>
-        HolbuildProofIr.StepPlain {start_pos = int_field a, end_pos = int_field b, label = label, program = program}
+        ParsedStep (HolbuildProofIr.StepPlain {start_pos = int_field a, end_pos = int_field b, label = label, program = program})
     | _ => raise Error ("bad proof-ir step response")
+
+fun parse_structured_plan tokens =
+  let
+    fun parse_until_end acc [] = (rev acc, [])
+      | parse_until_end acc (ParsedEnd _ :: rest) = (rev acc, rest)
+      | parse_until_end acc (ParsedStep step :: rest) = parse_until_end (step :: acc) rest
+      | parse_until_end acc (ParsedEachBegin (a, b) :: rest) =
+          let val (body, rest') = parse_until_end [] rest
+          in parse_until_end (HolbuildProofIr.StepEach {start_pos = a, end_pos = b, body = body} :: acc) rest' end
+      | parse_until_end acc (ParsedSelectFirstSolveBegin (a, b) :: rest) =
+          let val (body, rest') = parse_until_end [] rest
+          in parse_until_end (HolbuildProofIr.StepSelectFirstSolve {start_pos = a, end_pos = b, body = body} :: acc) rest' end
+      | parse_until_end acc (ParsedCasesBegin (a, b) :: rest) =
+          let
+            fun cases bodies (ParsedEnd _ :: xs) = (rev bodies, xs)
+              | cases bodies (ParsedCase _ :: xs) =
+                  let val (body, xs') = parse_case_body [] xs
+                  in cases (body :: bodies) xs' end
+              | cases _ [] = raise Error "unterminated proof-ir cases"
+              | cases _ _ = raise Error "proof-ir cases expected case marker"
+            and parse_case_body acc [] = raise Error "unterminated proof-ir case"
+              | parse_case_body acc (tokens as ParsedCase _ :: _) = (rev acc, tokens)
+              | parse_case_body acc (tokens as ParsedEnd _ :: _) = (rev acc, tokens)
+              | parse_case_body acc (ParsedStep step :: rest) = parse_case_body (step :: acc) rest
+              | parse_case_body acc (ParsedEachBegin (c, d) :: rest) =
+                  let val (body, rest') = parse_until_end [] rest
+                  in parse_case_body (HolbuildProofIr.StepEach {start_pos = c, end_pos = d, body = body} :: acc) rest' end
+              | parse_case_body acc (ParsedSelectFirstSolveBegin (c, d) :: rest) =
+                  let val (body, rest') = parse_until_end [] rest
+                  in parse_case_body (HolbuildProofIr.StepSelectFirstSolve {start_pos = c, end_pos = d, body = body} :: acc) rest' end
+              | parse_case_body acc (ParsedCasesBegin (c, d) :: rest) =
+                  let val (cs, rest') = cases [] rest
+                  in parse_case_body (HolbuildProofIr.StepCases {start_pos = c, end_pos = d, cases = cs} :: acc) rest' end
+            val (cs, rest') = cases [] rest
+          in parse_until_end (HolbuildProofIr.StepCases {start_pos = a, end_pos = b, cases = cs} :: acc) rest' end
+      | parse_until_end _ (ParsedCase _ :: _) = raise Error "proof-ir case outside cases"
+    val (plan, rest) = parse_until_end [] tokens
+  in if null rest then plan else raise Error "trailing proof-ir end" end
 
 fun analyser_proof_ir_plan_for_boundary (boundary : HolbuildTheoryCheckpoints.boundary) =
   let
@@ -290,7 +331,7 @@ fun analyser_proof_ir_plan_for_boundary (boundary : HolbuildTheoryCheckpoints.bo
                | _ => loop more active acc found)
   in
     case loop lines false [] NONE of
-        SOME steps => steps
+        SOME steps => parse_structured_plan steps
       | NONE => raise Error ("proof-IR plan missing for execution-plan theorem: " ^ name)
   end
 

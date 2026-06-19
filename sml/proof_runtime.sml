@@ -143,7 +143,7 @@ fun save_failed_prefix_checkpoint () =
             val _ = write_text_file (failed_prefix_path ^ ".meta") meta_text
             val _ = write_text_file (failed_prefix_path ^ ".prefix") prefix_text
             val plan = case !active_plan_ref of SOME p => p | NONE => raise Fail "internal error: proof-IR plan is not installed"
-            val _ = save_failed_prefix_steps failed_prefix_path plan step_count
+            val _ = save_failed_prefix_steps failed_prefix_path (HolbuildProofIr.flat_steps plan) step_count
           in () end
 
 fun restore_failed_prefix_checkpoint_info (name, tactic_text, failed_prefix_path, failed_prefix_ok) =
@@ -243,6 +243,9 @@ fun install_repl_proof_state () =
    ())
 
 fun set_history history = proof_history_ref := SOME history
+
+fun backup_n 0 = ()
+  | backup_n n = (set_history (History.undo (current_history())); backup_n (n - 1))
 fun clear_history () = proof_history_ref := NONE
 
 fun project_history f = History.project f (current_history())
@@ -440,11 +443,9 @@ fun step proof_step =
     | HolbuildProofIr.StepList {label, program, ...} => apply_list_tactic_step label program
     | HolbuildProofIr.StepChoice {label, program, ...} => apply_tactic_step label program
     | HolbuildProofIr.StepListChoice {label, program, ...} => apply_list_tactic_step label program
-    | HolbuildProofIr.StepEachBegin _ => raise Fail "each begin is handled by the structural proof-IR interpreter"
-    | HolbuildProofIr.StepSelectFirstSolveBegin _ => apply_select_first_solve_begin "select first solve"
-    | HolbuildProofIr.StepCasesBegin _ => raise Fail "cases begin is handled by the structural proof-IR interpreter"
-    | HolbuildProofIr.StepCase _ => raise Fail "case marker is handled by the structural proof-IR interpreter"
-    | HolbuildProofIr.StepEnd _ => apply_structural_end "end"
+    | HolbuildProofIr.StepEach _ => raise Fail "each is handled by the structural proof-IR interpreter"
+    | HolbuildProofIr.StepSelectFirstSolve _ => raise Fail "select is handled by the structural proof-IR interpreter"
+    | HolbuildProofIr.StepCases _ => raise Fail "cases is handled by the structural proof-IR interpreter"
     | HolbuildProofIr.StepPlain _ => raise Fail "plain proof step must cover the whole theorem"
 
 fun inspection_matches wanted name =
@@ -501,37 +502,6 @@ fun trace_after status elapsed index proof_step =
               " goals=", Int.toString (current_goal_count()),
               " label=", display_label (HolbuildProofIr.step_label proof_step), "\n"]
 
-fun split_structural_body opener rest =
-  let
-    fun is_open step =
-      case step of
-          HolbuildProofIr.StepEachBegin _ => true
-        | HolbuildProofIr.StepSelectFirstSolveBegin _ => true
-        | HolbuildProofIr.StepCasesBegin _ => true
-        | _ => false
-    fun loop _ acc [] = raise Fail "unterminated structural proof step"
-      | loop depth acc (step :: xs) =
-          (case step of
-               HolbuildProofIr.StepEnd _ =>
-                 if depth = 0 then (rev acc, xs)
-                 else loop (depth - 1) (step :: acc) xs
-             | _ => loop (if is_open step then depth + 1 else depth) (step :: acc) xs)
-  in loop 0 [] rest end
-
-fun case_bodies_with_offsets steps =
-  let
-    fun flush NONE acc = acc
-      | flush (SOME (_, start_offset, body)) acc = (start_offset, rev body) :: acc
-    fun loop _ current acc [] = rev (flush current acc)
-      | loop offset current acc (step :: rest) =
-          (case step of
-               HolbuildProofIr.StepCase _ => loop (offset + 1) (SOME (step, offset + 1, [])) (flush current acc) rest
-             | _ =>
-                 (case current of
-                      NONE => loop (offset + 1) current acc rest
-                    | SOME (case_step, start_offset, body) => loop (offset + 1) (SOME (case_step, start_offset, step :: body)) acc rest))
-  in loop 0 NONE [] steps end
-
 fun run_maybe_traced_step index display_index proof_step =
   let
     val old_failed_step_end = !failed_step_end_ref
@@ -564,10 +534,9 @@ fun run_maybe_traced_step index display_index proof_step =
 fun run_steps_from_at _ _ [] = ()
   | run_steps_from_at index display_index (proof_step :: rest) =
       (case proof_step of
-           HolbuildProofIr.StepEachBegin _ =>
+           HolbuildProofIr.StepEach {body, ...} =>
              let
-               val (body, rest') = split_structural_body proof_step rest
-               val consumed = 2 + length body
+               val consumed = HolbuildProofIr.display_line_count proof_step
                val parent = current_focus_bounds()
                val original_n = current_focus_count()
                fun iter j acc =
@@ -581,35 +550,59 @@ fun run_steps_from_at _ _ [] = ()
                      val gen = current_focus_count()
                      val _ = (case !focus_stack_ref of _ :: rest => focus_stack_ref := rest | [] => raise Fail "each frame underflow")
                    in iter (j + 1) (acc + gen) end
+               val result = (iter 0 0; NONE) handle e => SOME e
+               val _ = case result of NONE => () | SOME e => (backup_n (Int.max(0, !successful_step_count_ref - index)) handle _ => (); successful_step_count_ref := index; raise e)
              in
-               iter 0 0;
-               successful_step_count_ref := index + consumed;
+               successful_step_count_ref := index + 1;
                successful_prefix_end_ref := HolbuildProofIr.step_end proof_step;
-               run_steps_from_at (index + consumed) (display_index + consumed) rest'
+               run_steps_from_at (index + 1) (display_index + consumed) rest
              end
-         | HolbuildProofIr.StepCasesBegin _ =>
+         | HolbuildProofIr.StepSelectFirstSolve {body, ...} =>
              let
-               val (body, rest') = split_structural_body proof_step rest
-               val consumed = 2 + length body
-               val bodies = case_bodies_with_offsets body
+               val consumed = HolbuildProofIr.display_line_count proof_step
+               val _ = apply_select_first_solve_begin "select first solve"
+               val body_result = (run_steps_from_at (index + 1) (display_index + 1) body; NONE) handle e => SOME e
+               val _ = case body_result of NONE => () | SOME e => (backup_n (Int.max(0, !successful_step_count_ref - index)) handle _ => (); successful_step_count_ref := index; raise e)
+               val old_failed_step_end = !failed_step_end_ref
+               val old_failed_step_span = !failed_step_span_ref
+               val old_failed_plan_position = !failed_plan_position_ref
+               val _ = failed_step_end_ref := SOME (HolbuildProofIr.step_end proof_step)
+               val _ = failed_step_span_ref := SOME (HolbuildProofIr.step_start proof_step, HolbuildProofIr.step_end proof_step)
+               val _ = failed_plan_position_ref := SOME (display_index + consumed - 1, "end", "end")
+               val result = (apply_structural_end "end"; NONE) handle e => SOME e
+               val _ = (failed_step_end_ref := old_failed_step_end;
+                        failed_step_span_ref := old_failed_step_span;
+                        failed_plan_position_ref := old_failed_plan_position)
+               val _ = case result of NONE => () | SOME e => raise e
+             in
+               successful_step_count_ref := index + 1;
+               successful_prefix_end_ref := HolbuildProofIr.step_end proof_step;
+               run_steps_from_at (index + 1) (display_index + consumed) rest
+             end
+         | HolbuildProofIr.StepCases {cases = bodies, ...} =>
+             let
+               val consumed = HolbuildProofIr.display_line_count proof_step
                val parent = current_focus_bounds()
                val original_n = current_focus_count()
                val _ = if length bodies = original_n then () else raise Fail "cases length mismatch"
-               fun iter j acc [] = ()
-                 | iter j acc ((body_offset, case_body) :: more) =
+               fun display_offset upto =
+                 2 + upto + List.foldl (fn (body, n) => n + HolbuildProofIr.display_step_count body) 0 (List.take(bodies, upto))
+               fun iter _ _ [] = ()
+                 | iter j acc (case_body :: more) =
                    let
                      val remaining = original_n - j - 1
                      val frame = {prefix = #prefix parent + acc, suffix = #suffix parent + remaining, kind = CaseFrame}
                      val _ = focus_stack_ref := frame :: !focus_stack_ref
-                     val _ = run_steps_from_at (index + 1 + body_offset) (display_index + 1 + body_offset) case_body
+                     val _ = run_steps_from_at (index + 1) (display_index + display_offset j) case_body
                      val gen = current_focus_count()
                      val _ = (case !focus_stack_ref of _ :: rest => focus_stack_ref := rest | [] => raise Fail "case frame underflow")
                    in iter (j + 1) (acc + gen) more end
+               val result = (iter 0 0 bodies; NONE) handle e => SOME e
+               val _ = case result of NONE => () | SOME e => (backup_n (Int.max(0, !successful_step_count_ref - index)) handle _ => (); successful_step_count_ref := index; raise e)
              in
-               iter 0 0 bodies;
-               successful_step_count_ref := index + consumed;
+               successful_step_count_ref := index + 1;
                successful_prefix_end_ref := HolbuildProofIr.step_end proof_step;
-               run_steps_from_at (index + consumed) (display_index + consumed) rest'
+               run_steps_from_at (index + 1) (display_index + consumed) rest
              end
          | _ =>
              (successful_step_count_ref := index;
@@ -648,9 +641,6 @@ datatype 'a traced_result = TraceOk of 'a | TraceError of exn
 fun run_whole_tactic g label tac =
   with_tactic_timeout label (fn () => Tactical.TAC_PROOF(g, tac)) ()
   handle e => (init_history g 15; print_goal_state label; clear_history (); raise e)
-
-fun backup_n 0 = ()
-  | backup_n n = (set_history (History.undo (current_history())); backup_n (n - 1))
 
 fun drop_all () = clear_history ()
 
@@ -743,30 +733,20 @@ fun common_step_prefix old_signatures new_plan =
 
 fun balanced_structural_prefix_count wanted plan =
   let
-    fun is_open step =
-      case step of
-          HolbuildProofIr.StepEachBegin _ => true
-        | HolbuildProofIr.StepSelectFirstSolveBegin _ => true
-        | HolbuildProofIr.StepCasesBegin _ => true
-        | _ => false
-    fun is_close step =
-      case step of HolbuildProofIr.StepEnd _ => true | _ => false
-    fun loop _ _ best [] = best
-      | loop i depth best (step :: rest) =
-          if i >= wanted then best
-          else
-            let
-              val depth' = if is_open step then depth + 1 else if is_close step then Int.max(0, depth - 1) else depth
-              val i' = i + 1
-              val best' = if depth' = 0 then i' else best
-            in loop i' depth' best' rest end
-  in loop 0 0 0 plan end
+    fun loop _ count [] = count
+      | loop used count (step :: rest) =
+          let val step_flat = length (HolbuildProofIr.flat_steps [step])
+          in
+            if used + step_flat <= wanted then loop (used + step_flat) (count + 1) rest
+            else count
+          end
+  in loop 0 0 plan end
 
 fun safe_failed_prefix_skip old_prefix_text old_step_count tactic_text failed_prefix_path plan =
   let
     val raw_skip =
       case read_failed_prefix_steps failed_prefix_path of
-          SOME old_signatures => common_step_prefix (take_at_most old_step_count old_signatures) plan
+          SOME old_signatures => balanced_structural_prefix_count (common_step_prefix (take_at_most old_step_count old_signatures) (HolbuildProofIr.flat_steps plan)) plan
         | NONE =>
             (* Compatibility with old checkpoints that lack step signatures: only
                trust the old byte-prefix heuristic when the saved prefix is still a
