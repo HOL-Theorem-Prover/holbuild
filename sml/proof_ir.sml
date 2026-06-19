@@ -383,9 +383,7 @@ fun tactic_program source tactic =
     | TacApply (f, arg) => parenthesize (source_text source f) ^ " " ^ parenthesize (source_text source arg)
     | TacMapEvery _ => parenthesize (source_text source (tactic_span tactic))
     | TacMapFirst (_, ts) => "Tactical.FIRST [" ^ String.concatWith ", " (map (tactic_program source) ts) ^ "]"
-    | TacSufficesBy (q, rhs) =>
-        "HolbuildProofRuntime.gentle_then1 (Q_TAC SUFF_TAC " ^ source_text source q ^
-        ") (Tactical.THEN(" ^ tactic_program source rhs ^ ", Tactical.NO_TAC))"
+    | TacSufficesBy _ => parenthesize (source_text source (tactic_span tactic))
     | TacRepairGroup (_, t) => tactic_program source t
     | TacAtomic (_, sp) => parenthesize (source_text source sp)
 and list_tactic_program source lt =
@@ -498,99 +496,13 @@ fun choice_step sp label program alternatives =
 fun list_choice_step sp label program alternatives =
   StepListChoice {start_pos = #1 sp, end_pos = #2 sp, label = label, program = program, alternatives = alternatives}
 
-fun then1_step sp first_label label list_suffix first_program second_program =
-  StepThen1 {start_pos = #1 sp, end_pos = #2 sp, first_label = first_label, label = label,
-             list_suffix = list_suffix, first_program = first_program, second_program = second_program}
-
-fun gentle_then1_step sp label list_suffix first_program second_program =
-  StepGentleThen1 {start_pos = #1 sp, end_pos = #2 sp, label = label, list_suffix = list_suffix,
-                   first_program = first_program, second_program = second_program}
-
-fun branch_step sp label phase program =
-  StepBranch {start_pos = #1 sp, end_pos = #2 sp, label = label, program = program, phase = phase}
-
-fun branch_list_step sp label program =
-  StepBranchList {start_pos = #1 sp, end_pos = #2 sp, label = label, program = program}
-
 fun each_begin sp = StepEachBegin {start_pos = #1 sp, end_pos = #2 sp}
 fun select_first_solve_begin sp = StepSelectFirstSolveBegin {start_pos = #1 sp, end_pos = #2 sp}
 fun cases_begin sp = StepCasesBegin {start_pos = #1 sp, end_pos = #2 sp}
 fun case_step sp index = StepCase {start_pos = #1 sp, end_pos = #2 sp, index = index}
 fun end_step sp = StepEnd {start_pos = #1 sp, end_pos = #2 sp}
 
-fun allgoals_step source tactic =
-  let val label = ">> " ^ tactic_label source tactic
-  in list_step (tactic_span tactic) label ("Tactical.ALLGOALS(" ^ tactic_program source tactic ^ ")") end
-
-fun allgoals_choice_step source label tactic alternatives =
-  list_choice_step (tactic_span tactic) label ("Tactical.ALLGOALS(" ^ tactic_program source tactic ^ ")") alternatives
-
-fun allgoals_reverse_steps source sp inner =
-  [list_step (tactic_span inner)
-     (">> " ^ tactic_label source inner)
-     ("HolbuildProofRuntime.recording_allgoals(" ^ tactic_program source inner ^ ")"),
-   list_step sp ">> list_tac REVERSE_LT" "HolbuildProofRuntime.reverse_recorded_groups"]
-
 fun suffices_tactic_program source q = "Q_TAC SUFF_TAC " ^ source_text source q
-
-fun suffices_branch_step source q rhs list_suffix =
-  gentle_then1_step (tactic_span rhs) ("  >- " ^ tactic_label source rhs) list_suffix
-    (suffices_tactic_program source q)
-    ("Tactical.THEN(" ^ tactic_program source rhs ^ ", Tactical.NO_TAC)")
-
-fun suffix_then1_step source lhs rhs =
-  then1_step (tactic_span (TacThen1 (lhs, rhs)))
-    (">> " ^ tactic_label source lhs)
-    ("  >- " ^ tactic_label source rhs)
-    true
-    (tactic_program source lhs)
-    (tactic_program source rhs)
-
-fun suffix_steps source tactic =
-  case tactic of
-      TacThen1 (lhs, rhs) => [suffix_then1_step source lhs rhs]
-    | TacSufficesBy (q, rhs) =>
-        [suffices_branch_step source q rhs true]
-    | TacOrelse xs => [allgoals_choice_step source ">> ORELSE" tactic (map (tactic_label source) xs)]
-    | TacTry (_, t) => [allgoals_choice_step source ">> TRY" tactic [tactic_label source t, "ALL_TAC"]]
-    | TacFirst (_, xs) => [allgoals_choice_step source ">> FIRST" tactic (map (tactic_label source) xs)]
-    | TacFirstProve (_, xs) => [allgoals_choice_step source ">> FIRST_PROVE" tactic (map (tactic_label source) xs)]
-    | TacMapFirst (_, xs) => [allgoals_choice_step source ">> FIRST" tactic (map (tactic_label source) xs)]
-    | TacReverse (sp, inner) => allgoals_reverse_steps source sp inner
-    | _ => [allgoals_step source tactic]
-
-fun branch_suffix_reverse_steps source sp inner =
-  [branch_list_step (tactic_span inner)
-     ("   >> " ^ tactic_label source inner)
-     ("HolbuildProofRuntime.recording_allgoals(" ^ tactic_program source inner ^ ")"),
-   branch_list_step sp "   >> list_tac REVERSE_LT" "HolbuildProofRuntime.reverse_recorded_groups"]
-
-fun branch_suffix_steps source tactic =
-  case tactic of
-      TacReverse (sp, inner) => branch_suffix_reverse_steps source sp inner
-    | _ => [branch_step (tactic_span tactic) ("   >> " ^ tactic_label source tactic) BranchSuffix (tactic_program source tactic)]
-
-fun branch_start_steps source tactic =
-  case tactic of
-      TacThen (first :: rest) =>
-        branch_start_steps source first @ List.concat (map (branch_suffix_steps source) rest)
-    | TacThen1 (lhs, rhs) => branch_start_steps source lhs @ branch_steps source rhs
-    | TacRepairGroup (_, inner) => branch_start_steps source inner
-    | _ => [branch_step (tactic_span tactic) (">- " ^ tactic_label source tactic) BranchStart (tactic_program source tactic)]
-and branch_steps source rhs =
-  case rhs of
-      TacThen (first :: rest) =>
-        let val sp = tactic_span rhs
-        in
-          branch_start_steps source first @
-          List.concat (map (branch_suffix_steps source) rest) @
-          [branch_step sp "   >- solved" BranchClose "Tactical.ALL_TAC"]
-        end
-    | TacRepairGroup (sp, inner) =>
-        branch_start_steps source inner @ [branch_step sp "   >- solved" BranchClose "Tactical.ALL_TAC"]
-    | _ =>
-        [list_step (tactic_span rhs) (">- " ^ source_text source (tactic_span rhs))
-           ("Tactical.NTH_GOAL (Tactical.THEN(" ^ tactic_program source rhs ^ ", Tactical.NO_TAC)) 1")]
 
 fun needs_structured_each tactic =
   case tactic of

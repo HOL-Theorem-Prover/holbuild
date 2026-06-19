@@ -31,7 +31,6 @@ val failed_plan_position_ref = ref NONE : (int * string * string) option ref
 val compiled_tactic_ref = ref Tactical.ALL_TAC
 val compiled_list_tactic_ref = ref Tactical.ALL_LT
 val proof_history_ref = ref (NONE : goalStack.gstk History.history option)
-val branch_tail_count_ref = ref ([] : int list)
 datatype focus_frame_kind = SelectSolveFrame | EachFrame | CaseFrame
 val focus_stack_ref = ref ([] : {prefix : int, suffix : int, kind : focus_frame_kind} list)
 val reverse_group_lengths_ref = ref (NONE : int list option)
@@ -415,25 +414,6 @@ fun apply_list_tactic_step label program =
     let val list_tactic = compile_list_tactic label program
     in apply_focused_list_tactic label list_tactic end
 
-fun gentle_then1 tac1 tac2 goal =
-  let
-    fun chop 0 front rest = (List.rev front, rest)
-      | chop n front (x :: xs) = chop (n - 1) (x :: front) xs
-      | chop _ _ [] = raise Fail "gentle_then1 validation underflow"
-    val (subgoals, validation) = tac1 goal
-  in
-    case subgoals of
-        [] => ([], validation)
-      | head :: tail =>
-          let val (head_goals, head_validation) = tac2 head
-          in
-            (head_goals @ tail,
-             fn thms =>
-               let val (head_thms, tail_thms) = chop (length head_goals) [] thms
-               in validation (head_validation head_thms :: tail_thms) end)
-          end
-  end
-
 fun recording_allgoals tactic goals =
   let
     val results = map tactic goals
@@ -478,140 +458,6 @@ fun reverse_recorded_groups goals =
           (List.concat (map rev goal_groups), validate)
         end
 
-fun apply_then1_step label false first_program second_program =
-      let
-        val input_goals = top_input_goals()
-        val first_tactic = compile_tactic label first_program
-        val second_tactic = compile_tactic label second_program
-      in
-        append_history_with_timeout label (goalStack.expandf (Tactical.THEN1(first_tactic, second_tactic)))
-        handle e => report_step_failure_with_goals label input_goals e
-      end
-  | apply_then1_step label true first_program second_program =
-      if no_open_goals () then ()
-      else
-        let
-          val input_goals = history_top_goals()
-          val first_tactic = compile_tactic label first_program
-          val second_tactic = compile_tactic label second_program
-        in
-          append_history_with_timeout label (goalStack.expand_listf (Tactical.ALLGOALS (Tactical.THEN1(first_tactic, second_tactic))))
-          handle e => report_step_failure_with_goals label input_goals e
-        end
-
-fun apply_gentle_then1_step label false first_program second_program =
-      let
-        val input_goals = top_input_goals()
-        val first_tactic = compile_tactic label first_program
-        val second_tactic = compile_tactic label second_program
-      in
-        append_history_with_timeout label (goalStack.expandf (gentle_then1 first_tactic second_tactic))
-        handle e => report_step_failure_with_goals label input_goals e
-      end
-  | apply_gentle_then1_step label true first_program second_program =
-      if no_open_goals () then ()
-      else
-        let
-          val input_goals = history_top_goals()
-          val first_tactic = compile_tactic label first_program
-          val second_tactic = compile_tactic label second_program
-        in
-          append_history_with_timeout label (goalStack.expand_listf (Tactical.ALLGOALS (gentle_then1 first_tactic second_tactic)))
-          handle e => report_step_failure_with_goals label input_goals e
-        end
-
-fun current_goal_total () = length (history_top_goals()) handle _ => 0
-
-fun current_branch_tail_count label =
-  case !branch_tail_count_ref of
-      [] => raise Fail ("branch suffix without active branch: " ^ label)
-    | tail_count :: _ => tail_count
-
-fun history_is_proved () =
-  ((project_history goalStack.extract_thm; true) handle _ => false)
-
-fun branch_goal_snapshot label =
-  let
-    val tail_count = current_branch_tail_count label
-    fun snapshot goals =
-      let
-        val total_count = length goals
-        val generated_count = total_count - tail_count
-      in
-        if generated_count < 0 then
-          raise Fail ("branch tail count exceeds open goals: " ^ label)
-        else {goals = goals, total_count = total_count, generated_count = generated_count}
-      end
-  in
-    snapshot (history_top_goals())
-    handle e =>
-      if tail_count = 0 andalso history_is_proved () then
-        {goals = [], total_count = 0, generated_count = 0}
-      else raise e
-  end
-
-fun push_branch_tail_count tail_count =
-  branch_tail_count_ref := tail_count :: !branch_tail_count_ref
-
-fun pop_branch_tail_count label =
-  case !branch_tail_count_ref of
-      [] => raise Fail ("branch close without active branch: " ^ label)
-    | _ :: rest => branch_tail_count_ref := rest
-
-fun apply_branch_start_step label program =
-  let
-    val goals = history_top_goals()
-    val before_count = length goals
-    val input_goals = take_goals 1 goals
-    val tactic = compile_tactic label program
-    val tail_count = before_count - 1
-  in
-    if before_count <= 0 then raise Fail ("branch start with no open goals: " ^ label) else ();
-    (append_history_with_timeout label (goalStack.expand_listf (Tactical.NTH_GOAL tactic 1));
-     push_branch_tail_count tail_count)
-    handle e => report_step_failure_with_goals label input_goals e
-  end
-
-fun apply_branch_suffix_list_tactic label list_tactic =
-  let
-    val {goals, total_count, generated_count} = branch_goal_snapshot label
-    val input_goals = take_goals generated_count goals
-    val scoped_list_tactic = Tactical.SPLIT_LT generated_count (list_tactic, Tactical.ALL_LT)
-  in
-    (if generated_count = 0 then
-       (if total_count = 0 then () else append_history (goalStack.expand_listf Tactical.ALL_LT))
-     else
-       append_history_with_timeout label (goalStack.expand_listf scoped_list_tactic))
-    handle e => report_step_failure_with_goals label input_goals e
-  end
-
-fun apply_branch_suffix_step label program =
-  let val tactic = compile_tactic label program
-  in apply_branch_suffix_list_tactic label (Tactical.ALLGOALS tactic) end
-
-fun apply_branch_list_suffix_step label program =
-  let val list_tactic = compile_list_tactic label program
-  in apply_branch_suffix_list_tactic label list_tactic end
-
-fun apply_branch_close_step label =
-  let
-    val {goals, total_count, generated_count} = branch_goal_snapshot label
-    val input_goals = take_goals generated_count goals
-  in
-    (if generated_count = 0 then
-       (if total_count = 0 then () else append_history (goalStack.expand_listf Tactical.ALL_LT);
-        pop_branch_tail_count label)
-     else
-       raise Fail "selected goals were not solved")
-    handle e => report_step_failure_with_goals label input_goals e
-  end
-
-fun apply_branch_step label program phase =
-  case phase of
-      HolbuildProofIr.BranchStart => apply_branch_start_step label program
-    | HolbuildProofIr.BranchSuffix => apply_branch_suffix_step label program
-    | HolbuildProofIr.BranchClose => apply_branch_close_step label
-
 fun apply_tactic_step label program =
   let val tactic = compile_tactic label program
   in apply_focused_list_tactic label (Tactical.ALLGOALS tactic) end
@@ -648,12 +494,6 @@ fun step proof_step =
     | HolbuildProofIr.StepList {label, program, ...} => apply_list_tactic_step label program
     | HolbuildProofIr.StepChoice {label, program, ...} => apply_tactic_step label program
     | HolbuildProofIr.StepListChoice {label, program, ...} => apply_list_tactic_step label program
-    | HolbuildProofIr.StepThen1 {label, list_suffix, first_program, second_program, ...} =>
-        apply_then1_step label list_suffix first_program second_program
-    | HolbuildProofIr.StepGentleThen1 {label, list_suffix, first_program, second_program, ...} =>
-        apply_gentle_then1_step label list_suffix first_program second_program
-    | HolbuildProofIr.StepBranch {label, program, phase, ...} => apply_branch_step label program phase
-    | HolbuildProofIr.StepBranchList {label, program, ...} => apply_branch_list_suffix_step label program
     | HolbuildProofIr.StepEachBegin _ => apply_each_begin ()
     | HolbuildProofIr.StepSelectFirstSolveBegin _ => apply_select_first_solve_begin "select first solve"
     | HolbuildProofIr.StepCasesBegin _ => apply_cases_begin ()
@@ -732,44 +572,6 @@ fun split_structural_body opener rest =
              | _ => loop (if is_open step then depth + 1 else depth) (step :: acc) xs)
   in loop 0 [] rest end
 
-fun join_then [] = "Tactical.ALL_TAC"
-  | join_then [x] = x
-  | join_then (x :: xs) = List.foldl (fn (rhs, lhs) => "Tactical.THEN(" ^ lhs ^ ", " ^ rhs ^ ")") x xs
-
-fun body_tactic_program steps =
-  let
-    fun add_tactic program acc = program :: acc
-    fun go acc [] = rev acc
-      | go acc (step :: rest) =
-          (case step of
-               HolbuildProofIr.StepTactic {program, ...} => go (add_tactic program acc) rest
-             | HolbuildProofIr.StepSelectFirstSolveBegin _ =>
-                 let
-                   val (body, rest') = split_structural_body step rest
-                   val rhs = body_tactic_program body
-                 in
-                   case acc of
-                       lhs :: acc_tail => go ("Tactical.THEN1(" ^ lhs ^ ", " ^ rhs ^ ")" :: acc_tail) rest'
-                     | [] => raise Fail "select first solve without preceding tactic in structured body"
-                 end
-             | HolbuildProofIr.StepEachBegin _ =>
-                 let val (_, rest') = split_structural_body step rest
-                 in raise Fail "nested each tactic program is not implemented" end
-             | HolbuildProofIr.StepCasesBegin _ =>
-                 raise Fail "cases inside tactic program is not implemented"
-             | HolbuildProofIr.StepEnd _ => raise Fail "unexpected end in tactic program"
-             | HolbuildProofIr.StepCase _ => raise Fail "unexpected case in tactic program"
-             | _ => go (add_tactic (HolbuildProofIr.step_program step) acc) rest)
-  in join_then (go [] steps) end
-
-fun apply_structured_each_step label body =
-  let
-    val list_tactic = compile_list_tactic label ("Tactical.ALLGOALS(" ^ body_tactic_program body ^ ")")
-  in
-    if not (null (!branch_tail_count_ref)) then apply_branch_suffix_list_tactic label list_tactic
-    else apply_list_tactic_step label ("Tactical.ALLGOALS(" ^ body_tactic_program body ^ ")")
-  end
-
 fun case_bodies_with_offsets steps =
   let
     fun flush NONE acc = acc
@@ -785,12 +587,6 @@ fun case_bodies_with_offsets steps =
   in loop 0 NONE [] steps end
 
 fun case_bodies steps = map #2 (case_bodies_with_offsets steps)
-
-fun apply_structured_cases_step label body =
-  let
-    val programs = map body_tactic_program (case_bodies body)
-    val program = "Tactical.NULL_OK_LT (Tactical.TACS_TO_LT [" ^ String.concatWith ", " programs ^ "])"
-  in apply_list_tactic_step label program end
 
 fun run_maybe_traced_step index display_index proof_step =
   let
@@ -889,7 +685,6 @@ fun drop_steps 0 steps = steps
 fun run_steps steps =
   (successful_step_count_ref := 0;
    successful_prefix_end_ref := 0;
-   branch_tail_count_ref := [];
    focus_stack_ref := [];
    reverse_group_lengths_ref := NONE;
    run_steps_from 0 0 steps)

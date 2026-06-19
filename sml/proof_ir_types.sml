@@ -1,17 +1,11 @@
 structure HolbuildProofIr =
 struct
 
-datatype branch_phase = BranchStart | BranchSuffix | BranchClose
-
 datatype step =
     StepTactic of {start_pos : int, end_pos : int, label : string, program : string}
   | StepList of {start_pos : int, end_pos : int, label : string, program : string}
   | StepChoice of {start_pos : int, end_pos : int, label : string, program : string, alternatives : string list}
   | StepListChoice of {start_pos : int, end_pos : int, label : string, program : string, alternatives : string list}
-  | StepThen1 of {start_pos : int, end_pos : int, first_label : string, label : string, list_suffix : bool, first_program : string, second_program : string}
-  | StepGentleThen1 of {start_pos : int, end_pos : int, label : string, list_suffix : bool, first_program : string, second_program : string}
-  | StepBranch of {start_pos : int, end_pos : int, label : string, program : string, phase : branch_phase}
-  | StepBranchList of {start_pos : int, end_pos : int, label : string, program : string}
   | StepEachBegin of {start_pos : int, end_pos : int}
   | StepSelectFirstSolveBegin of {start_pos : int, end_pos : int}
   | StepCasesBegin of {start_pos : int, end_pos : int}
@@ -23,10 +17,6 @@ fun step_start (StepTactic {start_pos, ...}) = start_pos
   | step_start (StepList {start_pos, ...}) = start_pos
   | step_start (StepChoice {start_pos, ...}) = start_pos
   | step_start (StepListChoice {start_pos, ...}) = start_pos
-  | step_start (StepThen1 {start_pos, ...}) = start_pos
-  | step_start (StepGentleThen1 {start_pos, ...}) = start_pos
-  | step_start (StepBranch {start_pos, ...}) = start_pos
-  | step_start (StepBranchList {start_pos, ...}) = start_pos
   | step_start (StepEachBegin {start_pos, ...}) = start_pos
   | step_start (StepSelectFirstSolveBegin {start_pos, ...}) = start_pos
   | step_start (StepCasesBegin {start_pos, ...}) = start_pos
@@ -38,10 +28,6 @@ fun step_end (StepTactic {end_pos, ...}) = end_pos
   | step_end (StepList {end_pos, ...}) = end_pos
   | step_end (StepChoice {end_pos, ...}) = end_pos
   | step_end (StepListChoice {end_pos, ...}) = end_pos
-  | step_end (StepThen1 {end_pos, ...}) = end_pos
-  | step_end (StepGentleThen1 {end_pos, ...}) = end_pos
-  | step_end (StepBranch {end_pos, ...}) = end_pos
-  | step_end (StepBranchList {end_pos, ...}) = end_pos
   | step_end (StepEachBegin {end_pos, ...}) = end_pos
   | step_end (StepSelectFirstSolveBegin {end_pos, ...}) = end_pos
   | step_end (StepCasesBegin {end_pos, ...}) = end_pos
@@ -53,10 +39,6 @@ fun step_label (StepTactic {label, ...}) = label
   | step_label (StepList {label, ...}) = label
   | step_label (StepChoice {label, ...}) = label
   | step_label (StepListChoice {label, ...}) = label
-  | step_label (StepThen1 {label, ...}) = label
-  | step_label (StepGentleThen1 {label, ...}) = label
-  | step_label (StepBranch {label, ...}) = label
-  | step_label (StepBranchList {label, ...}) = label
   | step_label (StepEachBegin _) = "each"
   | step_label (StepSelectFirstSolveBegin _) = "select first solve"
   | step_label (StepCasesBegin _) = "cases"
@@ -68,14 +50,6 @@ fun step_program (StepTactic {program, ...}) = program
   | step_program (StepList {program, ...}) = program
   | step_program (StepChoice {program, ...}) = program
   | step_program (StepListChoice {program, ...}) = program
-  | step_program (StepThen1 {list_suffix, first_program, second_program, ...}) =
-      let val tactic = "Tactical.THEN1(" ^ first_program ^ ", " ^ second_program ^ ")"
-      in if list_suffix then "Tactical.ALLGOALS (" ^ tactic ^ ")" else tactic end
-  | step_program (StepGentleThen1 {list_suffix, first_program, second_program, ...}) =
-      let val tactic = "HolbuildProofRuntime.gentle_then1 (" ^ first_program ^ ") (" ^ second_program ^ ")"
-      in if list_suffix then "Tactical.ALLGOALS (" ^ tactic ^ ")" else tactic end
-  | step_program (StepBranch {program, ...}) = program
-  | step_program (StepBranchList {program, ...}) = program
   | step_program (StepEachBegin _) = "<each>"
   | step_program (StepSelectFirstSolveBegin _) = "<select first solve>"
   | step_program (StepCasesBegin _) = "<cases>"
@@ -86,15 +60,7 @@ fun step_program (StepTactic {program, ...}) = program
 fun step_kind (StepTactic _) = "step"
   | step_kind (StepList _) = "list-step"
   | step_kind (StepChoice _) = "choice"
-  | step_kind (StepListChoice _) = "list_choice"
-  | step_kind (StepThen1 {list_suffix = true, ...}) = "list_then1"
-  | step_kind (StepThen1 _) = "then1"
-  | step_kind (StepGentleThen1 {list_suffix = true, ...}) = "list_gentle_then1"
-  | step_kind (StepGentleThen1 _) = "gentle_then1"
-  | step_kind (StepBranch {phase = BranchStart, ...}) = "branch_start"
-  | step_kind (StepBranch {phase = BranchSuffix, ...}) = "branch_suffix"
-  | step_kind (StepBranch {phase = BranchClose, ...}) = "branch_close"
-  | step_kind (StepBranchList _) = "branch_list_suffix"
+  | step_kind (StepListChoice _) = "list-choice"
   | step_kind (StepEachBegin _) = "each"
   | step_kind (StepSelectFirstSolveBegin _) = "select"
   | step_kind (StepCasesBegin _) = "cases"
@@ -129,8 +95,6 @@ fun format_step i depth step =
   case step of
       StepChoice {label, alternatives, ...} => format_choice_lines i label alternatives
     | StepListChoice {label, alternatives, ...} => format_choice_lines i label alternatives
-    | StepThen1 {first_label, ...} => format_line i depth first_label
-    | StepGentleThen1 {first_program, ...} => format_line i depth (">> " ^ first_program)
     | StepTactic {label, ...} => format_line i depth ("step " ^ label)
     | StepList {label, ...} => format_line i depth ("list-step " ^ label)
     | StepEachBegin _ => format_line i depth "each"
@@ -139,7 +103,6 @@ fun format_step i depth step =
     | StepCase {index, ...} => format_line i depth ("case " ^ Int.toString index)
     | StepEnd _ => format_line i depth "end"
     | StepPlain {label, ...} => format_line i depth ("plain " ^ label)
-    | _ => format_line i depth (step_label step)
 
 fun format_plan_lines steps =
   let
@@ -167,6 +130,5 @@ fun format_plan_lines steps =
   in loop 0 [] steps end
 
 fun display_step_count plan = length plan
-
 
 end

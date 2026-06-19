@@ -77,17 +77,9 @@ fun emit_termination ({name, safe_name, definition_start, definition_stop, bound
           Int.toString boundary, Int.toString quote_start, Int.toString quote_end,
           Int.toString tactic_start, Int.toString tactic_end, quote_text, tactic_text]
 
-fun branch_phase_text HolbuildProofIr.BranchStart = "start"
-  | branch_phase_text HolbuildProofIr.BranchSuffix = "suffix"
-  | branch_phase_text HolbuildProofIr.BranchClose = "close"
-
 fun sml_string s = "\"" ^ String.toString s ^ "\""
-fun sml_bool true = "true" | sml_bool false = "false"
 fun sml_int n = Int.toString n
 fun sml_list xs = "[" ^ String.concatWith ", " xs ^ "]"
-fun sml_branch_phase HolbuildProofIr.BranchStart = "HolbuildProofIr.BranchStart"
-  | sml_branch_phase HolbuildProofIr.BranchSuffix = "HolbuildProofIr.BranchSuffix"
-  | sml_branch_phase HolbuildProofIr.BranchClose = "HolbuildProofIr.BranchClose"
 
 fun step_sml step =
   case step of
@@ -103,20 +95,6 @@ fun step_sml step =
     | HolbuildProofIr.StepListChoice {start_pos, end_pos, label, program, alternatives} =>
         "HolbuildProofIr.StepListChoice {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
         ", label=" ^ sml_string label ^ ", program=" ^ sml_string program ^ ", alternatives=" ^ sml_list (map sml_string alternatives) ^ "}"
-    | HolbuildProofIr.StepThen1 {start_pos, end_pos, first_label, label, list_suffix, first_program, second_program} =>
-        "HolbuildProofIr.StepThen1 {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
-        ", first_label=" ^ sml_string first_label ^ ", label=" ^ sml_string label ^ ", list_suffix=" ^ sml_bool list_suffix ^
-        ", first_program=" ^ sml_string first_program ^ ", second_program=" ^ sml_string second_program ^ "}"
-    | HolbuildProofIr.StepGentleThen1 {start_pos, end_pos, label, list_suffix, first_program, second_program} =>
-        "HolbuildProofIr.StepGentleThen1 {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
-        ", label=" ^ sml_string label ^ ", list_suffix=" ^ sml_bool list_suffix ^
-        ", first_program=" ^ sml_string first_program ^ ", second_program=" ^ sml_string second_program ^ "}"
-    | HolbuildProofIr.StepBranch {start_pos, end_pos, label, program, phase} =>
-        "HolbuildProofIr.StepBranch {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
-        ", label=" ^ sml_string label ^ ", program=" ^ sml_string program ^ ", phase=" ^ sml_branch_phase phase ^ "}"
-    | HolbuildProofIr.StepBranchList {start_pos, end_pos, label, program} =>
-        "HolbuildProofIr.StepBranchList {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
-        ", label=" ^ sml_string label ^ ", program=" ^ sml_string program ^ "}"
     | HolbuildProofIr.StepEachBegin {start_pos, end_pos} =>
         "HolbuildProofIr.StepEachBegin {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^ "}"
     | HolbuildProofIr.StepSelectFirstSolveBegin {start_pos, end_pos} =>
@@ -143,16 +121,6 @@ fun emit_step step =
         P.join (["proof-step", "choice", Int.toString start_pos, Int.toString end_pos, label, program] @ alternatives)
     | HolbuildProofIr.StepListChoice {start_pos, end_pos, label, program, alternatives} =>
         P.join (["proof-step", "list-choice", Int.toString start_pos, Int.toString end_pos, label, program] @ alternatives)
-    | HolbuildProofIr.StepThen1 {start_pos, end_pos, first_label, label, list_suffix, first_program, second_program} =>
-        P.join ["proof-step", "then1", Int.toString start_pos, Int.toString end_pos, label,
-                if list_suffix then "1" else "0", first_label, first_program, second_program]
-    | HolbuildProofIr.StepGentleThen1 {start_pos, end_pos, label, list_suffix, first_program, second_program} =>
-        P.join ["proof-step", "gentle-then1", Int.toString start_pos, Int.toString end_pos, label,
-                if list_suffix then "1" else "0", first_program, second_program]
-    | HolbuildProofIr.StepBranch {start_pos, end_pos, label, program, phase} =>
-        P.join ["proof-step", "branch", Int.toString start_pos, Int.toString end_pos, label, program, branch_phase_text phase]
-    | HolbuildProofIr.StepBranchList {start_pos, end_pos, label, program} =>
-        P.join ["proof-step", "branch-list", Int.toString start_pos, Int.toString end_pos, label, program]
     | HolbuildProofIr.StepEachBegin {start_pos, end_pos} =>
         P.join ["proof-step", "each", Int.toString start_pos, Int.toString end_pos]
     | HolbuildProofIr.StepSelectFirstSolveBegin {start_pos, end_pos} =>

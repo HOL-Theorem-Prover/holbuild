@@ -244,15 +244,6 @@ fun run_analyser_for_proof_ir_text {name, tactic_start, tactic_end, tactic_text}
           val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
         in text end
 
-fun bool_field "1" = true
-  | bool_field "0" = false
-  | bool_field s = raise Error ("bad proof-ir boolean field: " ^ s)
-
-fun phase_field "start" = HolbuildProofIr.BranchStart
-  | phase_field "suffix" = HolbuildProofIr.BranchSuffix
-  | phase_field "close" = HolbuildProofIr.BranchClose
-  | phase_field s = raise Error ("bad proof-ir branch phase: " ^ s)
-
 fun int_field s =
   case Int.fromString s of SOME n => n | NONE => raise Error ("bad proof-ir integer field: " ^ s)
 
@@ -266,19 +257,6 @@ fun parse_proof_step fields =
         HolbuildProofIr.StepChoice {start_pos = int_field a, end_pos = int_field b, label = label, program = program, alternatives = alternatives}
     | "proof-step" :: "list-choice" :: a :: b :: label :: program :: alternatives =>
         HolbuildProofIr.StepListChoice {start_pos = int_field a, end_pos = int_field b, label = label, program = program, alternatives = alternatives}
-    | ["proof-step", "then1", a, b, label, list_suffix, first_label, first_program, second_program] =>
-        HolbuildProofIr.StepThen1 {start_pos = int_field a, end_pos = int_field b, label = label,
-                                   list_suffix = bool_field list_suffix, first_label = first_label,
-                                   first_program = first_program, second_program = second_program}
-    | ["proof-step", "gentle-then1", a, b, label, list_suffix, first_program, second_program] =>
-        HolbuildProofIr.StepGentleThen1 {start_pos = int_field a, end_pos = int_field b, label = label,
-                                         list_suffix = bool_field list_suffix,
-                                         first_program = first_program, second_program = second_program}
-    | ["proof-step", "branch", a, b, label, program, phase] =>
-        HolbuildProofIr.StepBranch {start_pos = int_field a, end_pos = int_field b, label = label, program = program,
-                                    phase = phase_field phase}
-    | ["proof-step", "branch-list", a, b, label, program] =>
-        HolbuildProofIr.StepBranchList {start_pos = int_field a, end_pos = int_field b, label = label, program = program}
     | ["proof-step", "each", a, b] =>
         HolbuildProofIr.StepEachBegin {start_pos = int_field a, end_pos = int_field b}
     | ["proof-step", "select-first-solve", a, b] =>
