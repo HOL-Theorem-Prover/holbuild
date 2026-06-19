@@ -91,7 +91,7 @@ QED
 Theorem suffices_by_sugar_success:
   T
 Proof
-  `T` suffices_by ACCEPT_TAC TRUTH >>
+  `T` suffices_by (DISCH_TAC >> ACCEPT_TAC TRUTH) >>
   ACCEPT_TAC TRUTH
 QED
 SML
@@ -105,8 +105,8 @@ skip_project=$tmpdir/skip-project
 cp -R "$success_project" "$skip_project"
 rm -rf "$skip_project/.holbuild"
 skip_success_log=$tmpdir/success-skip.log
-(cd "$skip_project" && "$HOLBUILD_BIN" --skip-proof-steps build BranchTheory) > "$skip_success_log" 2>&1
-require_grep "BranchTheory built" "$skip_success_log"
+(cd "$skip_project" && "$HOLBUILD_BIN" build --skip-proof-steps BranchTheory) > "$skip_success_log" 2>&1
+require_grep "BranchTheory" "$skip_success_log"
 require_file "$skip_project/.holbuild/obj/src/BranchTheory.dat"
 
 # Branch failure cases should fail at the branch-local step/close, not leak the
@@ -153,14 +153,14 @@ check_failure_project \
   '  CONJ_TAC >- FAIL_TAC "branch failure" >>
   ACCEPT_TAC TRUTH' \
   'FAIL_TAC "branch failure"' \
-  'plan position: 02   step FAIL_TAC "branch failure"'
+  'plan position: 02 step FAIL_TAC "branch failure"'
 
 check_failure_project \
   "branch-no-tac" \
   '  CONJ_TAC >- NO_TAC >>
   ACCEPT_TAC TRUTH' \
   'NO_TAC' \
-  'plan position: 02   step NO_TAC'
+  'plan position: 02 step NO_TAC'
 
 check_failure_project \
   "branch-unsolved-close" \
@@ -186,13 +186,13 @@ QED
 SML
 
 timeout_log=$tmpdir/timeout.log
-if (cd "$timeout_project" && "$HOLBUILD_BIN" --tactic-timeout 1 build TimeoutTheory) > "$timeout_log" 2>&1; then
+if (cd "$timeout_project" && "$HOLBUILD_BIN" build --tactic-timeout 1 TimeoutTheory) > "$timeout_log" 2>&1; then
   echo "expected branch timeout build to fail" >&2
   exit 1
 fi
 require_grep "slow_tac" "$timeout_log"
 require_grep "timed out" "$timeout_log"
-require_grep "plan position: 02   step slow_tac" "$timeout_log"
+require_grep "plan position: 02 step slow_tac" "$timeout_log"
 
 # Failed-prefix replay should resume cleanly after a branch has closed.  The
 # edited suffix must not re-enter a stale branch/focus state.

@@ -32,6 +32,7 @@ val compiled_tactic_ref = ref Tactical.ALL_TAC
 val compiled_list_tactic_ref = ref Tactical.ALL_LT
 val proof_history_ref = ref (NONE : goalStack.gstk History.history option)
 val branch_tail_count_ref = ref ([] : int list)
+val structural_frame_ref = ref ([] : string list)
 val reverse_group_lengths_ref = ref (NONE : int list option)
 
 fun env_bool name =
@@ -363,15 +364,6 @@ fun compile_list_tactic label program =
   else
     raise Fail ("list tactic fragment did not compile: " ^ label)
 
-fun apply_tactic_step label program =
-  let
-    val input_goals = top_input_goals()
-    val tactic = compile_tactic label program
-  in
-    append_history_with_timeout label (goalStack.expandf tactic)
-    handle e => report_step_failure_with_goals label input_goals e
-  end
-
 fun no_open_goals () =
   ((history_top_goals (); false)
    handle _ => true)
@@ -576,7 +568,7 @@ fun apply_branch_close_step label =
        (if total_count = 0 then () else append_history (goalStack.expand_listf Tactical.ALL_LT);
         pop_branch_tail_count label)
      else
-       raise Fail "THEN1 first subgoal not solved by branch tactic")
+       raise Fail "selected goals were not solved")
     handle e => report_step_failure_with_goals label input_goals e
   end
 
@@ -585,6 +577,49 @@ fun apply_branch_step label program phase =
       HolbuildProofIr.BranchStart => apply_branch_start_step label program
     | HolbuildProofIr.BranchSuffix => apply_branch_suffix_step label program
     | HolbuildProofIr.BranchClose => apply_branch_close_step label
+
+fun apply_tactic_step label program =
+  if not (null (!branch_tail_count_ref)) then
+    let val tactic = compile_tactic label program
+    in apply_branch_suffix_list_tactic label (Tactical.ALLGOALS tactic) end
+  else if no_open_goals () then ()
+  else
+    let
+      val input_goals = history_top_goals()
+      val tactic = compile_tactic label program
+    in
+      append_history_with_timeout label (goalStack.expand_listf (Tactical.ALLGOALS tactic))
+      handle e => report_step_failure_with_goals label input_goals e
+    end
+
+fun push_structural_frame name = structural_frame_ref := name :: !structural_frame_ref
+
+fun pop_structural_frame label =
+  case !structural_frame_ref of
+      [] => raise Fail ("structural end without active frame: " ^ label)
+    | frame :: rest => (structural_frame_ref := rest; frame)
+
+fun apply_select_first_solve_begin label =
+  let
+    val goals = history_top_goals()
+    val before_count = length goals
+    val tail_count = before_count - 1
+  in
+    if before_count <= 0 then raise Fail ("select first solve with no open goals: " ^ label) else ();
+    push_branch_tail_count tail_count;
+    push_structural_frame "select"
+  end
+
+fun apply_each_begin () = push_structural_frame "each"
+fun apply_cases_begin () = push_structural_frame "cases"
+fun apply_case_step _ = ()
+
+fun apply_structural_end label =
+  case pop_structural_frame label of
+      "select" => apply_branch_close_step label
+    | "each" => ()
+    | "cases" => ()
+    | _ => ()
 
 fun step proof_step =
   case proof_step of
@@ -598,11 +633,11 @@ fun step proof_step =
         apply_gentle_then1_step label list_suffix first_program second_program
     | HolbuildProofIr.StepBranch {label, program, phase, ...} => apply_branch_step label program phase
     | HolbuildProofIr.StepBranchList {label, program, ...} => apply_branch_list_suffix_step label program
-    | HolbuildProofIr.StepEachBegin _ => raise Fail "structured each proof step is not implemented yet"
-    | HolbuildProofIr.StepSelectFirstSolveBegin _ => raise Fail "structured select proof step is not implemented yet"
-    | HolbuildProofIr.StepCasesBegin _ => raise Fail "structured cases proof step is not implemented yet"
-    | HolbuildProofIr.StepCase _ => raise Fail "structured case proof step is not implemented yet"
-    | HolbuildProofIr.StepEnd _ => raise Fail "structured end proof step is not implemented yet"
+    | HolbuildProofIr.StepEachBegin _ => apply_each_begin ()
+    | HolbuildProofIr.StepSelectFirstSolveBegin _ => apply_select_first_solve_begin "select first solve"
+    | HolbuildProofIr.StepCasesBegin _ => apply_cases_begin ()
+    | HolbuildProofIr.StepCase {index, ...} => apply_case_step index
+    | HolbuildProofIr.StepEnd _ => apply_structural_end "end"
     | HolbuildProofIr.StepPlain _ => raise Fail "plain proof step must cover the whole theorem"
 
 fun inspection_matches wanted name =
@@ -708,6 +743,7 @@ fun run_steps steps =
   (successful_step_count_ref := 0;
    successful_prefix_end_ref := 0;
    branch_tail_count_ref := [];
+   structural_frame_ref := [];
    reverse_group_lengths_ref := NONE;
    run_steps_from 0 0 steps)
 
@@ -820,17 +856,43 @@ fun common_step_prefix old_signatures new_plan =
           if old = HolbuildProofIr.step_signature new then loop (n + 1) old_rest new_rest else n
   in loop 0 old_signatures new_plan end
 
+fun balanced_structural_prefix_count wanted plan =
+  let
+    fun is_open step =
+      case step of
+          HolbuildProofIr.StepEachBegin _ => true
+        | HolbuildProofIr.StepSelectFirstSolveBegin _ => true
+        | HolbuildProofIr.StepCasesBegin _ => true
+        | _ => false
+    fun is_close step =
+      case step of HolbuildProofIr.StepEnd _ => true | _ => false
+    fun loop _ _ best [] = best
+      | loop i depth best (step :: rest) =
+          if i >= wanted then best
+          else
+            let
+              val depth' = if is_open step then depth + 1 else if is_close step then Int.max(0, depth - 1) else depth
+              val i' = i + 1
+              val best' = if depth' = 0 then i' else best
+            in loop i' depth' best' rest end
+  in loop 0 0 0 plan end
+
 fun safe_failed_prefix_skip old_prefix_text old_step_count tactic_text failed_prefix_path plan =
-  case read_failed_prefix_steps failed_prefix_path of
-      SOME old_signatures => common_step_prefix (take_at_most old_step_count old_signatures) plan
-    | NONE =>
-        (* Compatibility with old checkpoints that lack step signatures: only
-           trust the old byte-prefix heuristic when the saved prefix is still a
-           literal prefix of the new tactic text. Otherwise restart from the
-           theorem goal by rewinding the retained history to step 0. *)
-        if String.isPrefix old_prefix_text tactic_text then
-          step_count_at_prefix (size old_prefix_text) plan
-        else 0
+  let
+    val raw_skip =
+      case read_failed_prefix_steps failed_prefix_path of
+          SOME old_signatures => common_step_prefix (take_at_most old_step_count old_signatures) plan
+        | NONE =>
+            (* Compatibility with old checkpoints that lack step signatures: only
+               trust the old byte-prefix heuristic when the saved prefix is still a
+               literal prefix of the new tactic text. Otherwise restart from the
+               theorem goal by rewinding the retained history to step 0. *)
+            if String.isPrefix old_prefix_text tactic_text then
+              step_count_at_prefix (size old_prefix_text) plan
+            else 0
+  in
+    balanced_structural_prefix_count raw_skip plan
+  end
 
 fun prefix_end_after_steps 0 _ = 0
   | prefix_end_after_steps _ [] = 0

@@ -83,8 +83,8 @@ fun step_program (StepTactic {program, ...}) = program
   | step_program (StepEnd _) = "<end>"
   | step_program (StepPlain {program, ...}) = program
 
-fun step_kind (StepTactic _) = "tactic"
-  | step_kind (StepList _) = "list_tactic"
+fun step_kind (StepTactic _) = "step"
+  | step_kind (StepList _) = "list-step"
   | step_kind (StepChoice _) = "choice"
   | step_kind (StepListChoice _) = "list_choice"
   | step_kind (StepThen1 {list_suffix = true, ...}) = "list_then1"
