@@ -1891,7 +1891,11 @@ fun failed_prefix_metadata path =
                    if String.isPrefix prefix line then SOME (String.extract(line, size prefix, NONE)) else NONE)
                    lines
               end
-        in Option.mapPartial Int.fromString (value "step_count") end
+        in
+          case value "proof_ir_failed_prefix_version" of
+              SOME "1" => Option.mapPartial Int.fromString (value "step_count")
+            | _ => NONE
+        end
 
 fun failed_prefix_text path = current_metadata (path ^ ".prefix")
 
