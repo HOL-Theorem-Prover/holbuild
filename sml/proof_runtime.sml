@@ -580,25 +580,16 @@ fun apply_branch_close_step label =
     handle e => report_step_failure_with_goals label input_goals e
   end
 
-fun apply_branch_step label program phase =
-  case phase of
-      HolbuildProofIr.BranchStart => apply_branch_start_step label program
-    | HolbuildProofIr.BranchSuffix => apply_branch_suffix_step label program
-    | HolbuildProofIr.BranchClose => apply_branch_close_step label
-
 fun step proof_step =
   case proof_step of
       HolbuildProofIr.StepTactic {label, program, ...} => apply_tactic_step label program
     | HolbuildProofIr.StepList {label, program, ...} => apply_list_tactic_step label program
-    | HolbuildProofIr.StepChoice {label, program, ...} => apply_tactic_step label program
-    | HolbuildProofIr.StepListChoice {label, program, ...} => apply_list_tactic_step label program
-    | HolbuildProofIr.StepThen1 {label, list_suffix, first_program, second_program, ...} =>
-        apply_then1_step label list_suffix first_program second_program
-    | HolbuildProofIr.StepGentleThen1 {label, list_suffix, first_program, second_program, ...} =>
-        apply_gentle_then1_step label list_suffix first_program second_program
-    | HolbuildProofIr.StepBranch {label, program, phase, ...} => apply_branch_step label program phase
-    | HolbuildProofIr.StepBranchList {label, program, ...} => apply_branch_list_suffix_step label program
-    | HolbuildProofIr.StepPlain _ => raise Fail "plain proof step must cover the whole theorem"
+    | HolbuildProofIr.StepEach _ => raise Fail "structural proof-ir runtime not implemented yet: each"
+    | HolbuildProofIr.StepSelect _ => raise Fail "structural proof-ir runtime not implemented yet: select"
+    | HolbuildProofIr.StepCases _ => raise Fail "structural proof-ir runtime not implemented yet: cases"
+    | HolbuildProofIr.StepChoice _ => raise Fail "structural proof-ir runtime not implemented yet: choice"
+    | HolbuildProofIr.StepRepeat _ => raise Fail "structural proof-ir runtime not implemented yet: repeat"
+    | HolbuildProofIr.StepTry _ => raise Fail "structural proof-ir runtime not implemented yet: try"
 
 fun inspection_matches wanted name =
   case wanted of NONE => false | SOME selected => selected = name
@@ -755,27 +746,7 @@ fun proof_ir_prove name end_path end_ok checkpoint_depth g original_tac tactic_t
     val _ = trace_plan name plan
     val _ = stop_after_plan_if_requested ()
   in
-    case plan of
-        [plain_step as HolbuildProofIr.StepPlain {label, ...}] =>
-          let
-            val old_failed_step_span = !failed_step_span_ref
-            val old_failed_plan_position = !failed_plan_position_ref
-            val _ = failed_step_span_ref := SOME (HolbuildProofIr.step_start plain_step,
-                                                  HolbuildProofIr.step_end plain_step)
-            val _ = failed_plan_position_ref := SOME (0, HolbuildProofIr.step_kind plain_step, label)
-            val result = TraceOk (atomic_prove label g original_tac)
-                         handle e => TraceError e
-            val _ = failed_step_span_ref := old_failed_step_span
-            val _ = failed_plan_position_ref := old_failed_plan_position
-          in
-            case result of
-                TraceError e => raise e
-              | TraceOk th =>
-                  let val _ = save_checkpoint "end_of_proof" false end_path end_ok checkpoint_depth
-                  in th end
-          end
-      | _ =>
-          let
+    let
             val _ = init_history g (length plan + 1)
             val _ = run_steps plan
             val th = history_top_thm g

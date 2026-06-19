@@ -244,44 +244,85 @@ fun run_analyser_for_proof_ir_text {name, tactic_start, tactic_end, tactic_text}
           val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
         in text end
 
-fun bool_field "1" = true
-  | bool_field "0" = false
-  | bool_field s = raise Error ("bad proof-ir boolean field: " ^ s)
-
-fun phase_field "start" = HolbuildProofIr.BranchStart
-  | phase_field "suffix" = HolbuildProofIr.BranchSuffix
-  | phase_field "close" = HolbuildProofIr.BranchClose
-  | phase_field s = raise Error ("bad proof-ir branch phase: " ^ s)
-
 fun int_field s =
   case Int.fromString s of SOME n => n | NONE => raise Error ("bad proof-ir integer field: " ^ s)
 
-fun parse_proof_step fields =
-  case fields of
-      ["proof-step", "tactic", a, b, label, program] =>
-        HolbuildProofIr.StepTactic {start_pos = int_field a, end_pos = int_field b, label = label, program = program}
-    | ["proof-step", "list", a, b, label, program] =>
-        HolbuildProofIr.StepList {start_pos = int_field a, end_pos = int_field b, label = label, program = program}
-    | "proof-step" :: "choice" :: a :: b :: label :: program :: alternatives =>
-        HolbuildProofIr.StepChoice {start_pos = int_field a, end_pos = int_field b, label = label, program = program, alternatives = alternatives}
-    | "proof-step" :: "list-choice" :: a :: b :: label :: program :: alternatives =>
-        HolbuildProofIr.StepListChoice {start_pos = int_field a, end_pos = int_field b, label = label, program = program, alternatives = alternatives}
-    | ["proof-step", "then1", a, b, label, list_suffix, first_label, first_program, second_program] =>
-        HolbuildProofIr.StepThen1 {start_pos = int_field a, end_pos = int_field b, label = label,
-                                   list_suffix = bool_field list_suffix, first_label = first_label,
-                                   first_program = first_program, second_program = second_program}
-    | ["proof-step", "gentle-then1", a, b, label, list_suffix, first_program, second_program] =>
-        HolbuildProofIr.StepGentleThen1 {start_pos = int_field a, end_pos = int_field b, label = label,
-                                         list_suffix = bool_field list_suffix,
-                                         first_program = first_program, second_program = second_program}
-    | ["proof-step", "branch", a, b, label, program, phase] =>
-        HolbuildProofIr.StepBranch {start_pos = int_field a, end_pos = int_field b, label = label, program = program,
-                                    phase = phase_field phase}
-    | ["proof-step", "branch-list", a, b, label, program] =>
-        HolbuildProofIr.StepBranchList {start_pos = int_field a, end_pos = int_field b, label = label, program = program}
-    | ["proof-step", "plain", a, b, label, program] =>
-        HolbuildProofIr.StepPlain {start_pos = int_field a, end_pos = int_field b, label = label, program = program}
-    | _ => raise Error ("bad proof-ir step response")
+fun parse_selector ["first"] = HolbuildProofIr.SelectFirst
+  | parse_selector ["matching-first", pats] = HolbuildProofIr.SelectMatchingFirst pats
+  | parse_selector ["matching-all", pats] = HolbuildProofIr.SelectMatchingAll pats
+  | parse_selector _ = raise Error "bad proof-ir selector"
+
+fun parse_mode "solve" = HolbuildProofIr.SelectSolve
+  | parse_mode "keep" = HolbuildProofIr.SelectKeep
+  | parse_mode s = raise Error ("bad proof-ir select mode: " ^ s)
+
+fun parse_proof_steps fieldss =
+  let
+    fun parse_body stops rest acc =
+      case rest of
+          [] => if List.exists (fn s => s = "end") stops then raise Error "unterminated proof-ir block" else (rev acc, [])
+        | fields :: more =>
+            (case fields of
+                 ["proof-step", "end"] =>
+                   if List.exists (fn s => s = "end") stops then (rev acc, more)
+                   else raise Error "proof-ir end outside block"
+               | ["proof-step", "case", _] =>
+                   if List.exists (fn s => s = "case") stops then (rev acc, rest)
+                   else raise Error "proof-ir case outside cases"
+               | ["proof-step", "alternative", _] =>
+                   if List.exists (fn s => s = "alternative") stops then (rev acc, rest)
+                   else raise Error "proof-ir alternative outside choice"
+               | ["proof-step", "step", a, b, label, program] =>
+                   parse_body stops more (HolbuildProofIr.StepTactic {start_pos = int_field a, end_pos = int_field b, label = label, program = program} :: acc)
+               | ["proof-step", "list-step", a, b, label, program] =>
+                   parse_body stops more (HolbuildProofIr.StepList {start_pos = int_field a, end_pos = int_field b, label = label, program = program} :: acc)
+               | ["proof-step", "each", a, b] =>
+                   let val (body, rest') = parse_body ["end"] more []
+                   in parse_body stops rest' (HolbuildProofIr.StepEach {start_pos = int_field a, end_pos = int_field b, body = body} :: acc) end
+               | "proof-step" :: "select" :: a :: b :: restfields =>
+                   let
+                     val (sel_fields, mode_text) =
+                       case restfields of
+                           [sel, mode] => ([sel], mode)
+                         | [sel, pats, mode] => ([sel, pats], mode)
+                         | _ => raise Error "bad proof-ir select response"
+                     val (body, rest') = parse_body ["end"] more []
+                   in parse_body stops rest' (HolbuildProofIr.StepSelect {start_pos = int_field a, end_pos = int_field b, selector = parse_selector sel_fields, mode = parse_mode mode_text, body = body} :: acc) end
+               | ["proof-step", "cases", a, b] =>
+                   let
+                     fun parse_cases n rest cases =
+                       (case rest of
+                            ["proof-step", "end"] :: more' => (rev cases, more')
+                          | ["proof-step", "case", k] :: more' =>
+                              if int_field k <> n then raise Error "proof-ir case ordering error"
+                              else let val (body, rest'') = parse_body ["case", "end"] more' []
+                                   in parse_cases (n + 1) rest'' (body :: cases) end
+                          | _ => raise Error "bad proof-ir cases block")
+                     val (cases, rest') = parse_cases 1 more []
+                   in parse_body stops rest' (HolbuildProofIr.StepCases {start_pos = int_field a, end_pos = int_field b, cases = cases} :: acc) end
+               | ["proof-step", "choice", a, b, label] =>
+                   let
+                     fun parse_alts n rest alts =
+                       (case rest of
+                            ["proof-step", "end"] :: more' => (rev alts, more')
+                          | ["proof-step", "alternative", k] :: more' =>
+                              if int_field k <> n then raise Error "proof-ir alternative ordering error"
+                              else let val (body, rest'') = parse_body ["alternative", "end"] more' []
+                                   in parse_alts (n + 1) rest'' (body :: alts) end
+                          | _ => raise Error "bad proof-ir choice block")
+                     val (alts, rest') = parse_alts 1 more []
+                   in parse_body stops rest' (HolbuildProofIr.StepChoice {start_pos = int_field a, end_pos = int_field b, label = label, alternatives = alts} :: acc) end
+               | ["proof-step", "repeat", a, b] =>
+                   let val (body, rest') = parse_body ["end"] more []
+                   in parse_body stops rest' (HolbuildProofIr.StepRepeat {start_pos = int_field a, end_pos = int_field b, body = body} :: acc) end
+               | ["proof-step", "try", a, b] =>
+                   let val (body, rest') = parse_body ["end"] more []
+                   in parse_body stops rest' (HolbuildProofIr.StepTry {start_pos = int_field a, end_pos = int_field b, body = body} :: acc) end
+               | _ => raise Error "bad proof-ir step response")
+    val (steps, rest) = parse_body [] fieldss []
+  in
+    case rest of [] => steps | _ => raise Error "unexpected proof-ir parser residue"
+  end
 
 fun analyser_proof_ir_plan_for_boundary (boundary : HolbuildTheoryCheckpoints.boundary) =
   let
@@ -295,9 +336,9 @@ fun analyser_proof_ir_plan_for_boundary (boundary : HolbuildTheoryCheckpoints.bo
         | line :: more =>
             (case HolbuildAnalysisProtocol.split line of
                  ["begin-proof-ir", "0", _, _, _, _] => loop more true [] found
-               | ["end-proof-ir", "0"] => loop more false [] (SOME (rev acc))
+               | ["end-proof-ir", "0"] => loop more false [] (SOME (parse_proof_steps (rev acc)))
                | fields as "proof-step" :: _ =>
-                   if active then loop more active (parse_proof_step fields :: acc) found
+                   if active then loop more active (fields :: acc) found
                    else loop more active acc found
                | _ => loop more active acc found)
   in
