@@ -252,7 +252,7 @@ and parse_select_then1 left right whole =
     | _ => atomic whole
 and flatten_then e =
   case strip_closed_parens e of
-      SOME inner => flatten_then inner
+      SOME inner => [TacRepairGroup (span e, parse_tactic_ast inner)]
     | NONE =>
         (case e of
              Infix {left, id = (_, opn), right} =>
@@ -501,6 +501,19 @@ fun by_tactic_program source q = "sg " ^ source_text source q
 fun branch_steps source rhs =
   select_first_solve_step (tactic_span rhs) (plan_tactic source rhs)
 
+and needs_each_suffix tactic =
+  case tactic of
+      TacThen xs => List.exists needs_each_suffix xs
+    | TacThen1 _ => true
+    | TacSufficesBy _ => true
+    | TacTry _ => true
+    | TacOrelse _ => true
+    | TacFirst _ => true
+    | TacFirstProve _ => true
+    | TacMapFirst _ => true
+    | TacRepairGroup (_, inner) => needs_each_suffix inner
+    | _ => false
+
 and suffix_steps source tactic =
   case tactic of
       TacThen1 (lhs, rhs) => [each_step (tactic_span tactic) (plan_tactic source lhs @ [branch_steps source rhs])]
@@ -513,6 +526,9 @@ and suffix_steps source tactic =
     | TacFirst _ => [each_step (tactic_span tactic) (plan_tactic source tactic)]
     | TacFirstProve _ => [each_step (tactic_span tactic) (plan_tactic source tactic)]
     | TacMapFirst _ => [each_step (tactic_span tactic) (plan_tactic source tactic)]
+    | TacRepairGroup (_, inner) =>
+        if needs_each_suffix inner then [each_step (tactic_span tactic) (plan_tactic source inner)]
+        else plan_tactic source inner
     | _ => plan_tactic source tactic
 
 and plan_tactic source tactic =

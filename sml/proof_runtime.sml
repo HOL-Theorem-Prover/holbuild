@@ -862,9 +862,10 @@ fun with_plan_position display_index kind label span f =
                       failed_step_span_ref := old_failed_step_span;
                       failed_plan_position_ref := old_failed_plan_position)
     val result = (f (); NONE) handle e => SOME e
-    val _ = restore ()
   in
-    case result of NONE => () | SOME e => raise e
+    case result of
+        NONE => (restore (); ())
+      | SOME e => raise e
   end
 
 fun run_maybe_traced_step index display_index proof_step =
@@ -1237,6 +1238,7 @@ fun proof_ir_prove name end_path end_ok checkpoint_depth g original_tac tactic_t
     let
             val _ = init_history g (HolbuildProofIr.display_step_count plan + 1)
             val _ = run_steps plan
+                     handle e => (ignore (print_finish_goal_state name); raise e)
             val th = history_top_thm g
                      handle e => (ignore (print_finish_goal_state name); raise e)
             val _ = save_checkpoint "end_of_proof" false end_path end_ok checkpoint_depth
