@@ -463,6 +463,11 @@ and list_tactic_span lt =
 
 fun tactic_label source (TacThen []) = "ALL_TAC"
   | tactic_label source (TacApply (f, arg)) = source_text source f ^ " " ^ source_text source arg
+  | tactic_label source (TacMapFirst (f, ts)) =
+      let
+        fun arg_text (TacApply (_, arg)) = source_text source arg
+          | arg_text t = tactic_label source t
+      in "MAP_FIRST " ^ source_text source f ^ " [" ^ String.concatWith ", " (map arg_text ts) ^ "]" end
   | tactic_label source (TacSubgoal sp) = "sg " ^ source_text source sp
   | tactic_label source (TacRepairGroup (_, inner)) = tactic_label source inner
   | tactic_label source tactic = source_text source (tactic_span tactic)
@@ -525,7 +530,7 @@ and plan_tactic source tactic =
     | TacRepeat _ => [tactic_step source tactic]
     | TacFirst (_, xs) => [choice_step (tactic_span tactic) (tactic_label source tactic) (map (fn t => plan_tactic source t) xs)]
     | TacFirstProve (_, xs) => [choice_step (tactic_span tactic) (tactic_label source tactic) (map (fn t => plan_tactic source t) xs)]
-    | TacMapFirst (_, xs) => [choice_step (tactic_span tactic) (source_text source (tactic_span tactic)) (map (fn t => plan_tactic source t) xs)]
+    | TacMapFirst (_, xs) => [choice_step (tactic_span tactic) (tactic_label source tactic) (map (fn t => plan_tactic source t) xs)]
     | TacSufficesBy (q, rhs) =>
         [StepTactic {start_pos = #1 q, end_pos = #2 q, label = suffices_tactic_program source q, program = suffices_tactic_program source q},
          branch_steps source rhs]
@@ -582,7 +587,7 @@ and plan_list_tactic source prefix lt =
     | LtRepeat _ =>
         [list_step (list_tactic_span lt) (list_tactic_label source lt) (list_tactic_program source lt)]
     | LtOrelse _ =>
-        [list_step (list_tactic_span lt) (source_text source (list_tactic_span lt)) (list_tactic_program source lt)]
+        [list_step (list_tactic_span lt) (list_tactic_label source lt) (list_tactic_program source lt)]
     | LtSelectGoal sp =>
         [StepSelect {start_pos = #1 sp, end_pos = #2 sp,
                      selector = SelectMatchingFirst (source_text source sp),
@@ -618,6 +623,7 @@ and list_tactic_label source lt =
     | LtTry _ => source_text source (list_tactic_span lt)
     | LtRepeat _ => source_text source (list_tactic_span lt)
     | LtFirstLT t => "FIRST_LT " ^ tactic_label source t
+    | LtOrelse xs => String.concatWith " ORELSE_LT " (map (list_tactic_label source) xs)
     | LtRepairGroup (_, inner) => list_tactic_label source inner
     | _ => source_text source (list_tactic_span lt)
 
