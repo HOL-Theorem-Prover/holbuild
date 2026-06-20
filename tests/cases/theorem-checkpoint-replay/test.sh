@@ -689,8 +689,10 @@ PY
 slow_prefix_changed_log=$tmpdir/slow-prefix-changed.log
 (cd "$slow_prefix_project" && "$HOLBUILD_BIN" build ATheory) > "$slow_prefix_changed_log" 2>&1
 changed_slow_count=$(wc -c < "$slow_prefix_counter" | tr -d ' ')
-[[ "$changed_slow_count" = "3" ]] || { echo "failed-prefix replay reran unchanged slow prefix after mid-proof edit; count $changed_slow_count" >&2; exit 1; }
+[[ "$changed_slow_count" = "4" ]] || { echo "expected stale failed-prefix replay to fall back and rerun edited proof; count $changed_slow_count" >&2; exit 1; }
 require_grep "from: failed-prefix checkpoint in slow_prefix_failure" "$slow_prefix_changed_log"
+require_grep "discarding failed-prefix checkpoint after failed resume" "$slow_prefix_changed_log"
+require_grep "from: deps-loaded checkpoint" "$slow_prefix_changed_log"
 require_grep "ATheory built" "$slow_prefix_changed_log"
 
 failed_root_project=$tmpdir/failed-root-project
