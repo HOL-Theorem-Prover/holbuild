@@ -161,11 +161,12 @@ repeat_limit_project=$tmpdir/repeat-limit-project
 cp -R "$success_project" "$repeat_limit_project"
 rm -rf "$repeat_limit_project/.holbuild"
 repeat_limit_log=$tmpdir/repeat-limit.log
-if (cd "$repeat_limit_project" && HOLBUILD_PROOF_IR_REPEAT_LIMIT=1 "$HOLBUILD_BIN" build --force BranchTheory) > "$repeat_limit_log" 2>&1; then
-  echo "expected repeat limit build to fail" >&2
+(cd "$repeat_limit_project" && HOLBUILD_PROOF_IR_REPEAT_LIMIT=1 "$HOLBUILD_BIN" build --force BranchTheory) > "$repeat_limit_log" 2>&1
+require_grep "BranchTheory built" "$repeat_limit_log"
+if grep -q 'proof-ir repeat exceeded' "$repeat_limit_log"; then
+  echo "tactic-level rpt unexpectedly used structural repeat limit" >&2
   exit 1
 fi
-require_grep 'proof-ir repeat exceeded 1 successful iterations; possible nonterminating rpt' "$repeat_limit_log"
 
 check_failure_project() {
   local name=$1
