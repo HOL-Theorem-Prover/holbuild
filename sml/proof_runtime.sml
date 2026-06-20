@@ -741,42 +741,78 @@ fun run_maybe_traced_step index display_index proof_step =
       (HolbuildProofIr.step_start proof_step, HolbuildProofIr.step_end proof_step) traced
   end
 
-fun run_structural_steps display_index steps =
+fun run_structural_steps_with_resume resume_after_path display_index steps =
   let
+    val resume_reached_ref = ref (Option.isNone resume_after_path)
+    fun target_in_path path =
+      case resume_after_path of
+          NONE => false
+        | SOME target => path_has_prefix path target
+    fun before_resume_leaf path =
+      case resume_after_path of
+          NONE => false
+        | SOME target => path = target
+    fun require_resume_supported path =
+      let
+        fun unsupported component =
+          case component of
+              HolbuildProofIr.PathEach _ => true
+            | HolbuildProofIr.PathCase _ => true
+            | HolbuildProofIr.PathAlternative _ => true
+            | HolbuildProofIr.PathTry => true
+            | HolbuildProofIr.PathRepeat _ => true
+            | _ => false
+      in
+        if List.exists unsupported path then
+          raise Fail "structural failed-prefix continuation for each/cases/dynamic paths is not implemented yet"
+        else ()
+      end
+    val _ = case resume_after_path of NONE => () | SOME path => require_resume_supported path
     fun run_list _ _ _ [] = ()
       | run_list d path i (proof_step :: rest) =
           let val next = run_one d (path @ [HolbuildProofIr.PathStep i]) proof_step
           in run_list next path (i + 1) rest end
+    and skip_or_enter_structural d path proof_step enter =
+      if !resume_reached_ref then enter ()
+      else if target_in_path path then enter ()
+      else d + HolbuildProofIr.display_line_count proof_step
     and run_leaf d path proof_step =
-      let val n = !successful_step_count_ref
-          val old_path = !current_path_ref
-          val _ = current_path_ref := path
-          val result = (run_maybe_traced_step n d proof_step; NONE) handle e => SOME e
-          val _ = current_path_ref := old_path
-      in
-        case result of
-            SOME e => raise e
-          | NONE =>
-              (successful_step_count_ref := n + 1;
-               successful_prefix_end_ref := HolbuildProofIr.step_end proof_step;
-               successful_path_ref := path;
-               d + HolbuildProofIr.display_line_count proof_step)
-      end
+      if not (!resume_reached_ref) then
+        if before_resume_leaf path then (resume_reached_ref := true; d + HolbuildProofIr.display_line_count proof_step)
+        else d + HolbuildProofIr.display_line_count proof_step
+      else
+        let val n = !successful_step_count_ref
+            val old_path = !current_path_ref
+            val _ = current_path_ref := path
+            val result = (run_maybe_traced_step n d proof_step; NONE) handle e => SOME e
+            val _ = current_path_ref := old_path
+        in
+          case result of
+              SOME e => raise e
+            | NONE =>
+                (successful_step_count_ref := n + 1;
+                 successful_prefix_end_ref := HolbuildProofIr.step_end proof_step;
+                 successful_path_ref := path;
+                 d + HolbuildProofIr.display_line_count proof_step)
+        end
     and run_select d path proof_step mode body =
-      let
-        val label = HolbuildProofIr.step_label proof_step
-        val close_display = d + HolbuildProofIr.display_line_count proof_step - 1
-        val _ = push_first_focus label
-        val result = (run_list (d + 1) (path @ [HolbuildProofIr.PathSelect]) 0 body; NONE) handle e => SOME e
-      in
-        case result of
-            SOME e => (pop_branch_tail_count label handle _ => (); raise e)
-          | NONE =>
-              (with_plan_position close_display "end" "end" (HolbuildProofIr.step_end proof_step, HolbuildProofIr.step_end proof_step)
-                 (fn () => close_focus label mode);
-               d + HolbuildProofIr.display_line_count proof_step)
-      end
+      skip_or_enter_structural d path proof_step (fn () =>
+        let
+          val label = HolbuildProofIr.step_label proof_step
+          val close_display = d + HolbuildProofIr.display_line_count proof_step - 1
+          val entering_from_resume = not (!resume_reached_ref)
+          val _ = if entering_from_resume then () else push_first_focus label
+          val result = (run_list (d + 1) (path @ [HolbuildProofIr.PathSelect]) 0 body; NONE) handle e => SOME e
+        in
+          case result of
+              SOME e => (pop_branch_tail_count label handle _ => (); raise e)
+            | NONE =>
+                (with_plan_position close_display "end" "end" (HolbuildProofIr.step_end proof_step, HolbuildProofIr.step_end proof_step)
+                   (fn () => close_focus label mode);
+                 d + HolbuildProofIr.display_line_count proof_step)
+        end)
     and run_each d path proof_step body =
+      skip_or_enter_structural d path proof_step (fn () =>
       let
         val count = focused_goal_count "each"
         fun run_one_each iter remaining =
@@ -794,8 +830,9 @@ fun run_structural_steps display_index steps =
           end
         fun loop _ 0 = ()
           | loop iter remaining = (run_one_each iter remaining; loop (iter + 1) (remaining - 1))
-      in loop 0 count; d + HolbuildProofIr.display_line_count proof_step end
+      in loop 0 count; d + HolbuildProofIr.display_line_count proof_step end)
     and run_cases d path proof_step cases =
+      skip_or_enter_structural d path proof_step (fn () =>
       let
         val count = focused_goal_count "cases"
         val case_count = length cases
@@ -819,8 +856,9 @@ fun run_structural_steps display_index steps =
         fun loop _ _ [] = ()
           | loop n remaining (body :: rest) =
               (run_one_case n remaining body; loop (n + 1) (remaining - 1) rest)
-      in loop 1 count cases; d + HolbuildProofIr.display_line_count proof_step end
+      in loop 1 count cases; d + HolbuildProofIr.display_line_count proof_step end)
     and run_choice d path proof_step label alternatives =
+      skip_or_enter_structural d path proof_step (fn () =>
       let
         fun attempt _ [] last = (case last of SOME e => raise e | NONE => raise Fail ("choice has no alternatives: " ^ label))
           | attempt n (body :: rest) _ =
@@ -833,8 +871,9 @@ fun run_structural_steps display_index steps =
                       (restore_runtime_state saved;
                        attempt (n + 1) rest (SOME e))
               end
-      in attempt 1 alternatives NONE; d + HolbuildProofIr.display_line_count proof_step end
+      in attempt 1 alternatives NONE; d + HolbuildProofIr.display_line_count proof_step end)
     and run_try d path proof_step body =
+      skip_or_enter_structural d path proof_step (fn () =>
       let val saved = runtime_state_snapshot()
           val result = (with_expected_failures_suppressed (fn () => run_list (d + 1) (path @ [HolbuildProofIr.PathTry]) 0 body); NONE) handle e => SOME e
       in (case result of
@@ -842,8 +881,9 @@ fun run_structural_steps display_index steps =
             | SOME _ =>
                 (restore_runtime_state saved;
                  dynamic_events_ref := HolbuildProofIr.TryEvent (path, false) :: !dynamic_events_ref));
-         d + HolbuildProofIr.display_line_count proof_step end
+         d + HolbuildProofIr.display_line_count proof_step end)
     and run_repeat d path proof_step body =
+      skip_or_enter_structural d path proof_step (fn () =>
       let
         val limit = repeat_iteration_limit()
         val span = (HolbuildProofIr.step_start proof_step, HolbuildProofIr.step_end proof_step)
@@ -862,7 +902,7 @@ fun run_structural_steps display_index steps =
                         (dynamic_events_ref := HolbuildProofIr.RepeatIterEvent (path, iter) :: !dynamic_events_ref;
                          loop (iter + 1))
                end
-      in loop 0; d + HolbuildProofIr.display_line_count proof_step end
+      in loop 0; d + HolbuildProofIr.display_line_count proof_step end)
     and run_one d path proof_step =
       case proof_step of
           HolbuildProofIr.StepTactic _ => run_leaf d path proof_step
@@ -873,9 +913,16 @@ fun run_structural_steps display_index steps =
         | HolbuildProofIr.StepChoice {label, alternatives, ...} => run_choice d path proof_step label alternatives
         | HolbuildProofIr.StepTry {body, ...} => run_try d path proof_step body
         | HolbuildProofIr.StepRepeat {body, ...} => run_repeat d path proof_step body
-  in run_list display_index [] 0 steps end
+  in
+    run_list display_index [] 0 steps;
+    case resume_after_path of
+        SOME _ => if !resume_reached_ref then () else raise Fail "failed-prefix proof path is not present in current proof-ir plan"
+      | NONE => ()
+  end
 
-fun run_steps_from_path display_index steps = run_structural_steps display_index steps
+fun run_structural_steps display_index steps = run_structural_steps_with_resume NONE display_index steps
+
+fun run_steps_from_path path display_index steps = run_structural_steps_with_resume (SOME path) display_index steps
 
 fun run_steps steps =
   (successful_step_count_ref := 0;
@@ -996,9 +1043,8 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
           val _ = successful_path_ref := #path metadata
           val _ = dynamic_events_ref := #events metadata
           val _ =
-            if #step_count metadata = 0 then run_steps_from_path 0 plan
-            else raise Fail (String.concat ["structural failed-prefix continuation is not implemented yet; saved proof path display index=",
-                                            HolbuildProofIr.format_index resume_display])
+            if #step_count metadata = 0 then run_structural_steps 0 plan
+            else run_steps_from_path (#path metadata) resume_display plan
           val th = history_top_thm (project_history goalStack.initial_goal)
                    handle e => (ignore (print_finish_goal_state name); raise e)
           val _ = drop_all()
