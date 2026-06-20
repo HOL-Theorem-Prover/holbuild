@@ -143,7 +143,7 @@ HOL/toolchain, for example with HOL heap/executable support after the shared HOL
 cache entry exists. Its cache key should include the project HOL key, helper
 source/protocol version, and holbuild version. The helper owns HOLSource parsing,
 Holdep-compatible dependency extraction, theorem/resume boundary discovery,
-`TacticParse` tactic decomposition, and proof-IR/GoalFrag plan generation. The
+`TacticParse` tactic decomposition, and Proof-IR plan generation. The
 main binary communicates with it through a stable external protocol such as JSONL
 or line records rather than shared SML datatypes.
 
@@ -620,46 +620,35 @@ internal load manifests.
 
 Proof-edit incrementality should not key failed-prefix checkpoints by the full
 proof body hash. That would invalidate exactly the state a proof author needs
-after editing a failing suffix. Instead, a failed goalfrag proof may retain a
-proof-navigation checkpoint plus metadata containing the raw source bytes from
-the theorem/proof start through the last successful fragment boundary, the number
-of successful goalfrag history steps, and the initial theorem goal/statement
-fingerprint. On the next rebuild, holbuild compares the retained raw byte prefix
-with the current theorem source, chooses the last current fragment boundary whose
-raw bytes still match, loads the failed-prefix checkpoint, calls goalfrag
-`backup_n` for the difference between saved and current common-prefix step
-counts, and replays the edited suffix. Hashes remain guardrails for dependency
-context and initial goal compatibility; raw byte-prefix comparison decides the
-usable proof prefix.
+after editing a failing suffix. Instead, a failed proof-step run may retain a
+proof-navigation checkpoint plus versioned metadata describing the last trusted
+structural Proof-IR boundary: successful path, leaf count, source end, focused
+state, dynamic replay events, and a leaf signature. On the next rebuild,
+holbuild restores the checkpoint, validates that metadata against the current
+Proof-IR plan, reconstructs the remaining continuation from the current plan, and
+continues from the restored HOL proof state. Hashes remain guardrails for
+dependency context and initial goal compatibility; structural path/signature
+validation decides whether the saved proof prefix is usable.
 
 The prototype currently instruments AST `HOLTheoremDecl` declarations, i.e.
 modern goal/proof forms such as `Theorem ... Proof ... QED`. It parses the HOL
 source AST before expansion to ML, uses theorem/tactic spans to insert a theorem
-marker before expansion, then runs ordinary proof bodies through a shared SML
-goalfrag runtime helper. That helper owns tactic parsing, step planning,
-proof-manager/`goalFrag` execution, timeout wrappers, checkpoint saves, prover
-hook state, and failure diagnostics. Generated per-theory source contains only
-loads, runtime installation/configuration, theorem boundary calls, and original
-source slices.
+marker before expansion, then runs ordinary proof bodies through the shared SML
+Proof-IR runtime. That runtime owns tactic parsing, structural step planning,
+timeout wrappers, checkpoint saves, prover hook state, failed-prefix replay, and
+failure diagnostics. Generated per-theory source contains only loads, runtime
+installation/configuration, theorem boundary calls, and original source slices.
 
-GoalFrag is the executable stepping IR. Holbuild does not maintain a second
-semantic tactic AST for proof execution. The runtime lowers HOL's `TacticParse`
-AST through `TacticParse.linearize` into a thin, holbuild-owned `goalfrag_step`
-list: open/mid/close structural operations, ordinary tactic `expand`, list-tactic
-`expand_list`, and temporary select markers that are merged into the surrounding
-branch shape. Each step carries the raw source label and source end position used
-for timeout messages, failed-fragment source context, and failed-prefix replay.
-Execution then dispatches directly to `goalFrag.open_*`, `goalFrag.next_*`,
-`goalFrag.close_*`, `goalFrag.expand`, or `goalFrag.expand_list`. Normal tactic
-chains such as `A >> B >> C` should stay as independent `expand` steps; ordinary
-branch/list/select syntax should introduce GoalFrag structure. Avoid name-based
-tactic heuristics for atomicity: opaque tactic calls are leaves, and
+Proof IR is the executable stepping IR. Holbuild lowers parsed tactic structure
+into a holbuild-owned structural plan whose leaves are executable tactic or
+list-tactic fragments and whose internal nodes model HOL tactic/list-tactic
+control (`each`, `select`, `cases`, `choice`, `repeat`, and `try`). Each leaf
+carries the raw source label, source span, and executable SML fragment used for
+timeout messages, failed-fragment source context, and failed-prefix replay.
+Normal tactic chains such as `A >> B >> C` should stay as independent leaf steps;
+ordinary branch/list/select syntax should introduce Proof-IR structure. Avoid
+name-based tactic heuristics for atomicity: opaque tactic calls are leaves, and
 shape-specific merging should be justified by the parsed branch/list/select form.
-Current compatibility exceptions are `REVERSE` combined with branch/list forms
-and `THENL`/`TACS_TO_LT` list tacticals, which are still kept grouped because
-fully structural replay can trip GoalFrag validation shape accounting even when
-all goals are solved; treat these as narrow runtime limitations to remove, not as
-precedent for broad branch-body atomicity.
 
 Attributed proofs and declarations with no parsed tactic body use a conservative
 whole-tactic prover path. Normal theorem bodies should not fall back to timing the
@@ -740,13 +729,14 @@ debugging mode that retains durable failure logs and reports them as
 not final artifact semantics. They must not be included in the final theory
 action key or local metadata comparison for `.uo/.ui/.dat`: switching
 `--skip-proof-steps`, `--skip-checkpoints`, or root tactic timeout should not rebuild
-an otherwise up-to-date semantic artifact. If goalfrag execution and plain source
-execution produce different final artifacts or success/failure behavior, that is
-an instrumentation bug to fix, not a separate artifact identity. Checkpoint
-validity remains separate and is represented by checkpoint paths plus `.ok`
-metadata keyed by dependency context and source prefix. On timeout, holbuild
-reports the timed-out tactic and does not retry the script through the plain
-non-goalfrag fallback, since that would remove the only timeout guard. Current
+an otherwise up-to-date semantic artifact. If proof-step execution and plain
+source execution produce different final artifacts or success/failure behavior,
+that is an instrumentation bug to fix, not a separate artifact identity.
+Checkpoint validity remains separate and is represented by checkpoint paths plus
+`.ok` metadata keyed by dependency context and source prefix. On timeout,
+holbuild reports the timed-out tactic and does not retry the script through the
+plain non-instrumented fallback, since that would remove the only timeout guard.
+Current
 production dogfooding has shown that some legitimate root-project simplification
 steps exceed 30s; use `--tactic-timeout 0` for full semantic production builds
 and a larger finite timeout such as 60s for root timeout smoke testing when

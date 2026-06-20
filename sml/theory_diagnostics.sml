@@ -630,7 +630,7 @@ fun failed_trace_theorem lines =
       [] => NONE
     | failed => field_after "theorem" (List.last failed)
 
-fun summarize_goalfrag_trace path =
+fun summarize_trace_steps path =
   let
     val lines = String.fields (fn c => c = #"\n") (read_text path)
     val trace_lines = List.filter proof_trace_line lines
