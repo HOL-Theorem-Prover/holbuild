@@ -91,7 +91,7 @@ SML
 check_plan allgoals_plan <<'EXPECTED'
 holbuild proof-ir plan ATheory:allgoals_plan source=src/AScript.sml (2 steps)
   00 step CONJ_TAC
-  01 list-step >> list_tac ALLGOALS (ACCEPT_TAC TRUTH)
+  01 list-step ALLGOALS (ACCEPT_TAC TRUTH)
 EXPECTED
 
 cat >> "$project/src/AScript.sml" <<'SML'
@@ -104,7 +104,7 @@ SML
 check_plan tacs_to_lt_plan <<'EXPECTED'
 holbuild proof-ir plan ATheory:tacs_to_lt_plan source=src/AScript.sml (2 steps)
   00 step CONJ_TAC
-  01 list-step >> list_tac TACS_TO_LT [ACCEPT_TAC TRUTH, ACCEPT_TAC TRUTH]
+  01 list-step TACS_TO_LT [ACCEPT_TAC TRUTH, ACCEPT_TAC TRUTH]
 EXPECTED
 
 cat >> "$project/src/AScript.sml" <<'SML'
@@ -120,9 +120,9 @@ SML
 check_plan selectors_plan <<'EXPECTED'
 holbuild proof-ir plan ATheory:selectors_plan source=src/AScript.sml (4 steps)
   00 step rpt CONJ_TAC
-  01 list-step >> list_tac NTH_GOAL (ACCEPT_TAC TRUTH) 2
-  02 list-step >> list_tac LASTGOAL (ACCEPT_TAC TRUTH)
-  03 list-step >> list_tac HEADGOAL (ACCEPT_TAC TRUTH)
+  01 list-step NTH_GOAL (ACCEPT_TAC TRUTH) 2
+  02 list-step LASTGOAL (ACCEPT_TAC TRUTH)
+  03 list-step HEADGOAL (ACCEPT_TAC TRUTH)
 EXPECTED
 
 cat >> "$project/src/AScript.sml" <<'SML'
@@ -136,7 +136,7 @@ SML
 check_plan split_first_lt_plan <<'EXPECTED'
 holbuild proof-ir plan ATheory:split_first_lt_plan source=src/AScript.sml (2 steps)
   00 step CONJ_TAC
-  01 list-step >> list_tac SPLIT_LT 1 (TACS_TO_LT [ACCEPT_TAC TRUTH], FIRST_LT ACCEPT_TAC TRUTH)
+  01 list-step SPLIT_LT 1 (TACS_TO_LT [ACCEPT_TAC TRUTH], FIRST_LT ACCEPT_TAC TRUTH)
 EXPECTED
 
 cat >> "$project/src/AScript.sml" <<'SML'
@@ -360,7 +360,7 @@ Proof
 QED
 SML
 check_plan nested_branch_by_plan <<'EXPECTED'
-holbuild proof-ir plan ATheory:nested_branch_by_plan source=src/AScript.sml (17 steps)
+holbuild proof-ir plan ATheory:nested_branch_by_plan source=src/AScript.sml (15 steps)
   00 step CONJ_TAC
   01 select first solve
   02   step sg `T`
@@ -456,7 +456,7 @@ SML
 check_plan orelse_lt_plan <<'EXPECTED'
 holbuild proof-ir plan ATheory:orelse_lt_plan source=src/AScript.sml (2 steps)
   00 step CONJ_TAC
-  01 list-step ORELSE_LT
+  01 list-step NO_LT ORELSE_LT TACS_TO_LT [ACCEPT_TAC TRUTH, ACCEPT_TAC TRUTH]
 EXPECTED
 
 cat >> "$project/src/AScript.sml" <<'SML'
@@ -472,7 +472,7 @@ holbuild proof-ir plan ATheory:every_first_plan source=src/AScript.sml (11 steps
   01   step NO_TAC
   02 end
   03 each
-  04   choice FIRST
+  04   choice FIRST [NO_TAC, ACCEPT_TAC TRUTH]
   05     alternative 1
   06       step NO_TAC
   07     alternative 2
@@ -490,7 +490,7 @@ QED
 SML
 check_plan first_prove_plan <<'EXPECTED'
 holbuild proof-ir plan ATheory:first_prove_plan source=src/AScript.sml (6 steps)
-  00 choice FIRST_PROVE
+  00 choice FIRST_PROVE [NO_TAC, ACCEPT_TAC TRUTH]
   01   alternative 1
   02     step NO_TAC
   03   alternative 2
@@ -590,7 +590,7 @@ QED
 SML
 check_plan orelse_plan <<'EXPECTED'
 holbuild proof-ir plan ATheory:orelse_plan source=src/AScript.sml (6 steps)
-  00 choice ORELSE
+  00 choice NO_TAC ORELSE ACCEPT_TAC TRUTH
   01   alternative 1
   02     step NO_TAC
   03   alternative 2
@@ -735,7 +735,7 @@ QED
 SML
 check_plan first_try_repeat_plan <<'EXPECTED'
 holbuild proof-ir plan ATheory:first_try_repeat_plan source=src/AScript.sml (12 steps)
-  00 choice FIRST
+  00 choice FIRST [NO_TAC, TRY NO_TAC, REPEAT NO_TAC, ACCEPT_TAC TRUTH]
   01   alternative 1
   02     step NO_TAC
   03   alternative 2
