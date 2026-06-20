@@ -578,12 +578,18 @@ and plan_list_tactic source prefix lt =
         [list_step (list_tactic_span lt) (">> list_tac " ^ list_tactic_label source lt) (list_tactic_program source lt)]
     | LtOrelse _ =>
         [list_step (list_tactic_span lt) (">> list_tac ORELSE_LT") (list_tactic_program source lt)]
-    | LtSelectGoal sp => [list_step (list_tactic_span lt) (">> list_tac Q.SELECT_GOAL_LT " ^ source_text source sp) (list_tactic_program source lt)]
-    | LtSelectGoals sp => [list_step (list_tactic_span lt) (">> list_tac Q.SELECT_GOALS_LT " ^ source_text source sp) (list_tactic_program source lt)]
+    | LtSelectGoal sp =>
+        [StepSelect {start_pos = #1 sp, end_pos = #2 sp,
+                     selector = SelectMatchingFirst (source_text source sp),
+                     mode = SelectKeep, body = []}]
+    | LtSelectGoals sp =>
+        [StepSelect {start_pos = #1 sp, end_pos = #2 sp,
+                     selector = SelectMatchingAll (source_text source sp),
+                     mode = SelectKeep, body = []}]
     | LtQSelectThen (pats, body) =>
-        [list_step (list_tactic_span lt)
-           (">> list_tac Q.SELECT_GOALS_LT_THEN1 " ^ source_text source pats ^ " (" ^ tactic_label source body ^ ")")
-           (list_tactic_program source lt)]
+        [StepSelect {start_pos = #1 pats, end_pos = #2 (tactic_span body),
+                     selector = SelectMatchingAll (source_text source pats),
+                     mode = SelectSolve, body = plan_tactic source body}]
     | LtSelectThen (selector, body) =>
         [list_step (list_tactic_span lt)
            (">> list_tac SELECT_LT_THEN (" ^ tactic_label source selector ^ ") (" ^ tactic_label source body ^ ")")

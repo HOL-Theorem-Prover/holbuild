@@ -628,11 +628,52 @@ fun pop_branch_tail_count label =
       [] => raise Fail ("focus close without active focus: " ^ label)
     | _ :: rest => branch_tail_count_ref := rest
 
-fun push_first_focus label =
+fun selector_program HolbuildProofIr.SelectFirst = NONE
+  | selector_program (HolbuildProofIr.SelectMatchingFirst pats) = SOME ("Q.RENAME_TAC " ^ pats)
+  | selector_program (HolbuildProofIr.SelectMatchingAll pats) = SOME ("Q.RENAME_TAC " ^ pats)
+
+fun matching_selector_count label selector goals =
+  case selector_program selector of
+      NONE => if null goals then NONE else SOME 1
+    | SOME program =>
+        let
+          val tac = compile_tactic label program
+          fun loop [] count = SOME count
+            | loop (g :: rest) count =
+                if Option.isSome (Lib.total tac g) then
+                  (case selector of
+                       HolbuildProofIr.SelectMatchingFirst _ => SOME 1
+                     | HolbuildProofIr.SelectMatchingAll _ => loop rest (count + 1)
+                     | _ => loop rest (count + 1))
+                else loop rest count
+        in
+          case selector of
+              HolbuildProofIr.SelectMatchingFirst _ =>
+                if List.exists (fn g => Option.isSome (Lib.total tac g)) goals then SOME 1 else NONE
+            | HolbuildProofIr.SelectMatchingAll _ => loop goals 0
+            | _ => loop goals 0
+        end
+
+fun selector_list_tactic HolbuildProofIr.SelectFirst = NONE
+  | selector_list_tactic (HolbuildProofIr.SelectMatchingFirst pats) = SOME ("Tactical.FIRST_LT (Q.RENAME_TAC " ^ pats ^ ")")
+  | selector_list_tactic (HolbuildProofIr.SelectMatchingAll pats) = SOME ("Tactical.SELECT_LT (Q.RENAME_TAC " ^ pats ^ ")")
+
+fun push_select_focus label selector =
   let
-    val {generated_count, tail_count, ...} = active_focus_snapshot label
-    val _ = if generated_count <= 0 then raise Fail ("select with no focused goals: " ^ label) else ()
-  in push_branch_tail_count (tail_count + generated_count - 1) end
+    val {goals, generated_count, tail_count, ...} = active_focus_snapshot label
+    val focused_goals = take_goals generated_count goals
+    val selected_count =
+      case matching_selector_count label selector focused_goals of
+          SOME n => n
+        | NONE => raise Fail ("select with no matching focused goals: " ^ label)
+    val _ =
+      case selector_list_tactic selector of
+          NONE => ()
+        | SOME program =>
+            apply_focus_list_tactic label (compile_list_tactic label program)
+  in push_branch_tail_count (tail_count + generated_count - selected_count); selected_count end
+
+fun push_first_focus label = push_select_focus label HolbuildProofIr.SelectFirst
 
 fun focused_goal_count label = #generated_count (active_focus_snapshot label)
 
@@ -887,14 +928,14 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
                 (record_successful_leaf path proof_step;
                  d + HolbuildProofIr.display_line_count proof_step)
         end
-    and run_select d path proof_step mode body =
+    and run_select d path proof_step selector mode body =
       skip_or_enter_structural d path proof_step (fn () =>
         let
           val label = HolbuildProofIr.step_label proof_step
           val close_display = d + HolbuildProofIr.display_line_count proof_step - 1
           val entering_from_resume = not (!resume_reached_ref)
-          val _ = if entering_from_resume then () else push_first_focus label
-          val result = (run_list (d + 1) (path @ [HolbuildProofIr.PathSelect]) 0 body; NONE) handle e => SOME e
+          val selected_count = if entering_from_resume then 1 else push_select_focus label selector
+          val result = ((if selected_count = 0 then () else run_list (d + 1) (path @ [HolbuildProofIr.PathSelect]) 0 body); NONE) handle e => SOME e
         in
           case result of
               SOME e => (pop_branch_tail_count label handle _ => (); raise e)
@@ -1058,7 +1099,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
       case proof_step of
           HolbuildProofIr.StepTactic _ => run_leaf d path proof_step
         | HolbuildProofIr.StepList _ => run_leaf d path proof_step
-        | HolbuildProofIr.StepSelect {mode, body, ...} => run_select d path proof_step mode body
+        | HolbuildProofIr.StepSelect {selector, mode, body, ...} => run_select d path proof_step selector mode body
         | HolbuildProofIr.StepEach {body, ...} => run_each d path proof_step body
         | HolbuildProofIr.StepCases {cases, ...} => run_cases d path proof_step cases
         | HolbuildProofIr.StepChoice {label, alternatives, ...} => run_choice d path proof_step label alternatives
