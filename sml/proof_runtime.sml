@@ -33,7 +33,11 @@ val current_frames_ref = ref ([] : structural_frame list)
 val successful_frames_ref = ref ([] : structural_frame list)
 val resume_frames_ref = ref ([] : structural_frame list)
 val successful_branch_tail_counts_ref = ref ([] : int list)
+(* Frame stacks are stored innermost-first, matching current_frames_ref push/pop order.
+   Dynamic events are accumulated newest-first internally; metadata stores them in
+   chronological order and resume_events_ref consumes that chronological stream. *)
 val dynamic_events_ref = ref ([] : HolbuildProofIr.dynamic_event list)
+val resume_events_ref = ref ([] : HolbuildProofIr.dynamic_event list)
 val failed_step_end_ref = ref NONE : int option ref
 val failed_step_span_ref = ref NONE : (int * int) option ref
 val failed_plan_position_ref = ref NONE : (int * string * string) option ref
@@ -56,13 +60,23 @@ fun env_bool name =
     | SOME "no" => SOME false
     | _ => NONE
 
+fun all_digits text =
+  size text > 0 andalso List.all Char.isDigit (String.explode text)
+
+fun strict_nonnegative_int text =
+  if all_digits text then Int.fromString text else NONE
+
+fun strict_positive_int text =
+  case strict_nonnegative_int text of
+      SOME n => if n > 0 then SOME n else NONE
+    | NONE => NONE
+
 fun env_positive_int name =
   case OS.Process.getEnv name of
       NONE => NONE
     | SOME value =>
-        (case Int.fromString value of
-             SOME n => if n > 0 then SOME n
-                       else raise Fail (name ^ " must be a positive integer")
+        (case strict_positive_int value of
+             SOME n => SOME n
            | NONE => raise Fail (name ^ " must be a positive integer"))
 
 fun repeat_iteration_limit () =
@@ -133,8 +147,8 @@ fun parse_int_list_text "" = SOME []
       let
         fun loop [] acc = SOME (rev acc)
           | loop (part :: rest) acc =
-              case Int.fromString part of
-                  SOME n => loop rest (n :: acc)
+              case strict_nonnegative_int part of
+                  SOME n => if n >= 0 then loop rest (n :: acc) else NONE
                 | NONE => NONE
       in loop (String.fields (fn c => c = #",") text) [] end
 
@@ -149,11 +163,11 @@ fun parse_path_component text =
     | "try" => SOME HolbuildProofIr.PathTry
     | _ =>
         (case String.fields (fn c => c = #":") text of
-             ["step", n] => Option.map HolbuildProofIr.PathStep (Int.fromString n)
-           | ["each", n] => Option.map HolbuildProofIr.PathEach (Int.fromString n)
-           | ["case", n] => Option.map HolbuildProofIr.PathCase (Int.fromString n)
-           | ["alternative", n] => Option.map HolbuildProofIr.PathAlternative (Int.fromString n)
-           | ["repeat", n] => Option.map HolbuildProofIr.PathRepeat (Int.fromString n)
+             ["step", n] => Option.map HolbuildProofIr.PathStep (strict_nonnegative_int n)
+           | ["each", n] => Option.map HolbuildProofIr.PathEach (strict_nonnegative_int n)
+           | ["case", n] => Option.map HolbuildProofIr.PathCase (strict_positive_int n)
+           | ["alternative", n] => Option.map HolbuildProofIr.PathAlternative (strict_positive_int n)
+           | ["repeat", n] => Option.map HolbuildProofIr.PathRepeat (strict_nonnegative_int n)
            | _ => NONE)
 
 fun parse_path_text "" = SOME []
@@ -169,11 +183,11 @@ fun parse_path_text "" = SOME []
 fun parse_structural_frame_text text =
   case String.fields (fn c => c = #"\t") text of
       ["each", path_text', iter_text, remaining_text] =>
-        (case (parse_path_text path_text', Int.fromString iter_text, Int.fromString remaining_text) of
+        (case (parse_path_text path_text', strict_nonnegative_int iter_text, strict_positive_int remaining_text) of
              (SOME path, SOME iter, SOME remaining) => SOME (EachFrame (path, iter, remaining))
            | _ => NONE)
     | ["case", path_text', n_text, remaining_text] =>
-        (case (parse_path_text path_text', Int.fromString n_text, Int.fromString remaining_text) of
+        (case (parse_path_text path_text', strict_positive_int n_text, strict_positive_int remaining_text) of
              (SOME path, SOME n, SOME remaining) => SOME (CaseFrame (path, n, remaining))
            | _ => NONE)
     | _ => NONE
@@ -181,7 +195,7 @@ fun parse_structural_frame_text text =
 fun parse_dynamic_event_text text =
   case String.fields (fn c => c = #"\t") text of
       ["choice", path_text', n_text] =>
-        (case (parse_path_text path_text', Int.fromString n_text) of
+        (case (parse_path_text path_text', strict_positive_int n_text) of
              (SOME path, SOME n) => SOME (HolbuildProofIr.ChoiceEvent (path, n))
            | _ => NONE)
     | ["try", path_text', taken_text] =>
@@ -190,11 +204,11 @@ fun parse_dynamic_event_text text =
            | (SOME path, "0") => SOME (HolbuildProofIr.TryEvent (path, false))
            | _ => NONE)
     | ["repeat-iter", path_text', n_text] =>
-        (case (parse_path_text path_text', Int.fromString n_text) of
+        (case (parse_path_text path_text', strict_nonnegative_int n_text) of
              (SOME path, SOME n) => SOME (HolbuildProofIr.RepeatIterEvent (path, n))
            | _ => NONE)
     | ["repeat-stop", path_text', n_text] =>
-        (case (parse_path_text path_text', Int.fromString n_text) of
+        (case (parse_path_text path_text', strict_nonnegative_int n_text) of
              (SOME path, SOME n) => SOME (HolbuildProofIr.RepeatStopEvent (path, n))
            | _ => NONE)
     | _ => NONE
@@ -278,7 +292,7 @@ fun save_failed_prefix_checkpoint () =
                               "prefix_end=", Int.toString prefix_end, "\n",
                               "path=", path_text (!successful_path_ref), "\n",
                               "focus=", int_list_text (!successful_branch_tail_counts_ref), "\n"] @
-                             map (fn frame => "frame=" ^ structural_frame_text frame ^ "\n") (rev (!successful_frames_ref)) @
+                             map (fn frame => "frame=" ^ structural_frame_text frame ^ "\n") (!successful_frames_ref) @
                              map (fn event => "event=" ^ dynamic_event_text event ^ "\n") (rev (!dynamic_events_ref)))
             val _ =
               (case !proof_history_ref of
@@ -722,12 +736,13 @@ fun runtime_state_snapshot () =
    successful_count = !successful_step_count_ref,
    successful_end = !successful_prefix_end_ref,
    events = !dynamic_events_ref,
+   resume_events = !resume_events_ref,
    branch_tail_counts = !branch_tail_count_ref,
    reverse_group_lengths = !reverse_group_lengths_ref}
 
 fun restore_runtime_state {history, current_path, successful_path, current_frames,
                            successful_frames, resume_frames, successful_branch_tail_counts, successful_count,
-                           successful_end, events, branch_tail_counts,
+                           successful_end, events, resume_events, branch_tail_counts,
                            reverse_group_lengths} =
   (set_history history;
    current_path_ref := current_path;
@@ -739,6 +754,7 @@ fun restore_runtime_state {history, current_path, successful_path, current_frame
    successful_step_count_ref := successful_count;
    successful_prefix_end_ref := successful_end;
    dynamic_events_ref := events;
+   resume_events_ref := resume_events;
    branch_tail_count_ref := branch_tail_counts;
    reverse_group_lengths_ref := reverse_group_lengths)
 
@@ -804,6 +820,15 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
       case resume_after_path of
           SOME target => if path_has_prefix path target then SOME (List.drop(target, length path)) else NONE
         | NONE => NONE
+    fun emit_event event = dynamic_events_ref := event :: !dynamic_events_ref
+    fun consume_resume_event expected =
+      let
+        fun loop [] seen = false
+          | loop (event :: rest) seen =
+              if event = expected then (resume_events_ref := rev seen @ rest; true)
+              else loop rest (event :: seen)
+      in loop (!resume_events_ref) [] end
+    fun replay_or_emit event = if consume_resume_event event then () else emit_event event
     fun run_list _ _ _ [] = ()
       | run_list d path i (proof_step :: rest) =
           let val next = run_one d (path @ [HolbuildProofIr.PathStep i]) proof_step
@@ -932,7 +957,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
                   val result = (with_expected_failures_suppressed (fn () => run_list (d + 2) (path @ [HolbuildProofIr.PathAlternative n]) 0 body); NONE) handle e => SOME e
               in
                 case result of
-                    NONE => dynamic_events_ref := HolbuildProofIr.ChoiceEvent (path, n) :: !dynamic_events_ref
+                    NONE => replay_or_emit (HolbuildProofIr.ChoiceEvent (path, n))
                   | SOME e =>
                       (restore_runtime_state saved;
                        attempt (n + 1) rest (SOME e))
@@ -943,7 +968,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
                SOME (HolbuildProofIr.PathAlternative n :: _) =>
                  (case nth_body n alternatives of
                       SOME body => (run_list (d + 2) (path @ [HolbuildProofIr.PathAlternative n]) 0 body;
-                                    dynamic_events_ref := HolbuildProofIr.ChoiceEvent (path, n) :: !dynamic_events_ref)
+                                    replay_or_emit (HolbuildProofIr.ChoiceEvent (path, n)))
                     | NONE => raise Fail "failed-prefix choice alternative is not present in current proof-ir plan")
              | _ => attempt 1 alternatives NONE)
         else attempt 1 alternatives NONE;
@@ -956,14 +981,14 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
         if not (!resume_reached_ref) andalso
            (case resume_child_after path of SOME (HolbuildProofIr.PathTry :: _) => true | _ => false) then
           (run_list (d + 1) (path @ [HolbuildProofIr.PathTry]) 0 body;
-           dynamic_events_ref := HolbuildProofIr.TryEvent (path, true) :: !dynamic_events_ref)
+           replay_or_emit (HolbuildProofIr.TryEvent (path, true)))
         else
           let val result = (with_expected_failures_suppressed (fn () => run_list (d + 1) (path @ [HolbuildProofIr.PathTry]) 0 body); NONE) handle e => SOME e
           in case result of
-                 NONE => dynamic_events_ref := HolbuildProofIr.TryEvent (path, true) :: !dynamic_events_ref
+                 NONE => replay_or_emit (HolbuildProofIr.TryEvent (path, true))
                | SOME _ =>
                    (restore_runtime_state saved;
-                    dynamic_events_ref := HolbuildProofIr.TryEvent (path, false) :: !dynamic_events_ref)
+                    replay_or_emit (HolbuildProofIr.TryEvent (path, false)))
           end;
         d + HolbuildProofIr.display_line_count proof_step
       end)
@@ -982,15 +1007,15 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
                in case result of
                       SOME _ =>
                         (restore_runtime_state saved;
-                         dynamic_events_ref := HolbuildProofIr.RepeatStopEvent (path, iter) :: !dynamic_events_ref)
+                         replay_or_emit (HolbuildProofIr.RepeatStopEvent (path, iter)))
                     | NONE =>
-                        (dynamic_events_ref := HolbuildProofIr.RepeatIterEvent (path, iter) :: !dynamic_events_ref;
+                        (replay_or_emit (HolbuildProofIr.RepeatIterEvent (path, iter));
                          loop (iter + 1))
                end
         fun resume_loop iter =
           if iter >= limit then guard_failure()
           else (run_list (d + 1) (path @ [HolbuildProofIr.PathRepeat iter]) 0 body;
-                dynamic_events_ref := HolbuildProofIr.RepeatIterEvent (path, iter) :: !dynamic_events_ref;
+                replay_or_emit (HolbuildProofIr.RepeatIterEvent (path, iter));
                 loop (iter + 1))
       in
         if not (!resume_reached_ref) then
@@ -1031,6 +1056,7 @@ fun run_steps steps =
    resume_frames_ref := [];
    successful_branch_tail_counts_ref := [];
    dynamic_events_ref := [];
+   resume_events_ref := [];
    suppress_expected_failure_diagnostics_ref := false;
    branch_tail_count_ref := [];
    reverse_group_lengths_ref := NONE;
@@ -1119,12 +1145,59 @@ fun parse_failed_prefix_metadata text =
                  parse_events event_texts [],
                  parse_frames frame_texts []) of
                (SOME count_text, SOME end_text, SOME path_text', SOME focus_text, SOME events, SOME frames) =>
-                 (case (Int.fromString count_text, Int.fromString end_text, parse_path_text path_text', parse_int_list_text focus_text) of
+                 (case (strict_nonnegative_int count_text, strict_nonnegative_int end_text, parse_path_text path_text', parse_int_list_text focus_text) of
                       (SOME step_count, SOME prefix_end, SOME path, SOME focus) =>
                         SOME {step_count = step_count, prefix_end = prefix_end, path = path, focus = focus, events = events, frames = frames}
                     | _ => NONE)
              | _ => NONE)
       | _ => NONE
+  end
+
+fun validate_failed_prefix_metadata plan (metadata : {step_count : int, prefix_end : int, path : HolbuildProofIr.proof_path,
+                                               focus : int list, events : HolbuildProofIr.dynamic_event list,
+                                               frames : structural_frame list}) =
+  let
+    val path = #path metadata
+    val _ = if #step_count metadata >= 0 andalso #prefix_end metadata >= 0 then ()
+            else raise Fail "invalid proof-ir failed-prefix metadata: negative step_count or prefix_end"
+    val _ = if #step_count metadata <> 0 orelse
+               (path = [] andalso #focus metadata = [] andalso #frames metadata = [] andalso #events metadata = []) then ()
+            else raise Fail "invalid proof-ir failed-prefix metadata: nonempty zero-step state"
+    val _ = if #step_count metadata = 0 andalso path = [] then ()
+            else case path_display_index plan path of
+                     SOME _ => ()
+                   | NONE => raise Fail "failed-prefix proof path is not present in current proof-ir plan"
+    fun validate_focus [] = ()
+      | validate_focus (n :: rest) =
+          if n >= 0 then validate_focus rest
+          else raise Fail "invalid proof-ir failed-prefix metadata: negative focus count"
+    fun validate_frame frame =
+      case frame of
+          EachFrame (frame_path, iter, remaining) =>
+            if path_has_prefix frame_path path andalso iter >= 0 andalso remaining > 0 then ()
+            else raise Fail "invalid proof-ir failed-prefix metadata: stale each frame"
+        | CaseFrame (frame_path, n, remaining) =>
+            if path_has_prefix frame_path path andalso n > 0 andalso remaining > 0 then ()
+            else raise Fail "invalid proof-ir failed-prefix metadata: stale case frame"
+    fun event_path_exists event_path = Option.isSome (path_display_index plan event_path)
+    fun validate_event event =
+      case event of
+          HolbuildProofIr.ChoiceEvent (event_path, n) =>
+            if n > 0 andalso event_path_exists event_path then ()
+            else raise Fail "invalid proof-ir failed-prefix metadata: stale choice event"
+        | HolbuildProofIr.TryEvent (event_path, _) =>
+            if event_path_exists event_path then ()
+            else raise Fail "invalid proof-ir failed-prefix metadata: stale try event"
+        | HolbuildProofIr.RepeatIterEvent (event_path, n) =>
+            if n >= 0 andalso event_path_exists event_path then ()
+            else raise Fail "invalid proof-ir failed-prefix metadata: stale repeat event"
+        | HolbuildProofIr.RepeatStopEvent (event_path, n) =>
+            if n >= 0 andalso event_path_exists event_path then ()
+            else raise Fail "invalid proof-ir failed-prefix metadata: stale repeat event"
+  in
+    validate_focus (#focus metadata);
+    List.app validate_frame (#frames metadata);
+    List.app validate_event (#events metadata)
   end
 
 fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path failed_prefix_ok =
@@ -1143,12 +1216,14 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
                 SOME m => m
               | NONE => raise Fail "invalid proof-ir failed-prefix metadata"
           val _ = ensure_history_limit (HolbuildProofIr.display_step_count plan + 1)
+          val _ = validate_failed_prefix_metadata plan metadata
           val _ = trace_plan name plan
           val _ = stop_after_plan_if_requested ()
           val resume_display =
-            case path_display_index plan (#path metadata) of
-                SOME d => d
-              | NONE => raise Fail "failed-prefix proof path is not present in current proof-ir plan"
+            if #step_count metadata = 0 andalso #path metadata = [] then 0
+            else case path_display_index plan (#path metadata) of
+                     SOME d => d
+                   | NONE => raise Fail "failed-prefix proof path is not present in current proof-ir plan"
           val _ = successful_step_count_ref := #step_count metadata
           val _ = successful_prefix_end_ref := #prefix_end metadata
           val _ = successful_path_ref := #path metadata
@@ -1157,7 +1232,8 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
           val _ = resume_frames_ref := #frames metadata
           val _ = branch_tail_count_ref := #focus metadata
           val _ = successful_branch_tail_counts_ref := #focus metadata
-          val _ = dynamic_events_ref := #events metadata
+          val _ = dynamic_events_ref := rev (#events metadata)
+          val _ = resume_events_ref := #events metadata
           val _ =
             if #step_count metadata = 0 then run_structural_steps 0 plan
             else run_steps_from_path (#path metadata) resume_display plan

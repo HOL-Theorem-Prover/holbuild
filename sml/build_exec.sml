@@ -1879,6 +1879,12 @@ fun best_replay_candidate requested_timeout project node theorem_checkpoints dec
       [] => NONE
     | first :: rest => SOME (List.foldl later_candidate first rest)
 
+fun strict_nonnegative_int_text text =
+  size text > 0 andalso List.all Char.isDigit (String.explode text)
+
+fun strict_nonnegative_int text =
+  if strict_nonnegative_int_text text then Int.fromString text else NONE
+
 fun failed_prefix_metadata path =
   case current_metadata (path ^ ".meta") of
       NONE => NONE
@@ -1894,7 +1900,7 @@ fun failed_prefix_metadata path =
           case (value "proof_ir_failed_prefix_version", value "step_count", value "prefix_end", value "path", value "focus") of
               (SOME "1", SOME step_count_text, SOME _, SOME _, SOME _) =>
                 Option.map (fn step_count => {step_count = step_count, metadata_text = text})
-                  (Int.fromString step_count_text)
+                  (strict_nonnegative_int step_count_text)
             | _ => NONE
         end
 
