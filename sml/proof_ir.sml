@@ -132,9 +132,9 @@ fun tactic_end (TacThen []) = 0
   | tactic_end (TacReverse (sp, _)) = span_end sp
   | tactic_end (TacSubgoal sp) = span_end sp
   | tactic_end (TacApply (_, arg)) = span_end arg
-  | tactic_end (TacMapEvery (_, [])) = 0
+  | tactic_end (TacMapEvery (f, [])) = span_end f
   | tactic_end (TacMapEvery (_, args)) = span_end (List.last args)
-  | tactic_end (TacMapFirst (_, [])) = 0
+  | tactic_end (TacMapFirst (f, [])) = span_end f
   | tactic_end (TacMapFirst (_, ts)) = tactic_end (List.last ts)
   | tactic_end (TacSufficesBy (_, t)) = tactic_end t
   | tactic_end (TacRepairGroup (sp, _)) = span_end sp
@@ -217,7 +217,8 @@ and parse_map_every whole f xs =
     | NONE => atomic whole)
 and parse_map_first whole f xs =
   (case list_elems xs of
-      SOME args => TacMapFirst (span f, map (fn arg => TacApply (span f, span arg)) args)
+      SOME [] => atomic whole
+    | SOME args => TacMapFirst (span f, map (fn arg => TacApply (span f, span arg)) args)
     | NONE => atomic whole)
 and parse_tactic_infix left opn right whole =
   case opn of
@@ -486,7 +487,7 @@ fun cases_step sp cases = StepCases {start_pos = #1 sp, end_pos = #2 sp, cases =
 
 fun choice_step sp label alternatives = StepChoice {start_pos = #1 sp, end_pos = #2 sp, label = label, alternatives = alternatives}
 
-fun repeat_step sp body = StepRepeat {start_pos = #1 sp, end_pos = #2 sp, body = body}
+fun repeat_step (sp : int * int) body = StepRepeat {start_pos = #1 sp, end_pos = #2 sp, body = body}
 fun try_step sp body = StepTry {start_pos = #1 sp, end_pos = #2 sp, body = body}
 
 fun suffices_tactic_program source q = "qsuff_tac " ^ source_text source q
@@ -502,6 +503,11 @@ and suffix_steps source tactic =
         [each_step (tactic_span tactic)
            [StepTactic {start_pos = #1 q, end_pos = #2 q, label = suffices_tactic_program source q, program = suffices_tactic_program source q},
             branch_steps source rhs]]
+    | TacTry _ => [each_step (tactic_span tactic) (plan_tactic source tactic)]
+    | TacOrelse _ => [each_step (tactic_span tactic) (plan_tactic source tactic)]
+    | TacFirst _ => [each_step (tactic_span tactic) (plan_tactic source tactic)]
+    | TacFirstProve _ => [each_step (tactic_span tactic) (plan_tactic source tactic)]
+    | TacMapFirst _ => [each_step (tactic_span tactic) (plan_tactic source tactic)]
     | _ => plan_tactic source tactic
 
 and plan_tactic source tactic =
@@ -515,12 +521,12 @@ and plan_tactic source tactic =
     | TacThenLT (lhs, lt) => plan_tactic source lhs @ plan_list_tactic source ">>>" lt
     | TacReverse (sp, inner) =>
         plan_tactic source inner @ plan_list_tactic source ">>>" (LtReverse sp)
-    | TacOrelse xs => [choice_step (tactic_span tactic) "ORELSE" (map (fn t => plan_tactic source t) xs)]
+    | TacOrelse xs => [choice_step (tactic_span tactic) (tactic_label source tactic) (map (fn t => plan_tactic source t) xs)]
     | TacTry (_, t) => [try_step (tactic_span tactic) (plan_tactic source t)]
-    | TacRepeat (_, t) => [repeat_step (tactic_span tactic) (plan_tactic source t)]
-    | TacFirst (_, xs) => [choice_step (tactic_span tactic) "FIRST" (map (fn t => plan_tactic source t) xs)]
-    | TacFirstProve (_, xs) => [choice_step (tactic_span tactic) "FIRST_PROVE" (map (fn t => plan_tactic source t) xs)]
-    | TacMapFirst (_, xs) => [choice_step (tactic_span tactic) "FIRST" (map (fn t => plan_tactic source t) xs)]
+    | TacRepeat _ => [tactic_step source tactic]
+    | TacFirst (_, xs) => [choice_step (tactic_span tactic) (tactic_label source tactic) (map (fn t => plan_tactic source t) xs)]
+    | TacFirstProve (_, xs) => [choice_step (tactic_span tactic) (tactic_label source tactic) (map (fn t => plan_tactic source t) xs)]
+    | TacMapFirst (_, xs) => [choice_step (tactic_span tactic) (source_text source (tactic_span tactic)) (map (fn t => plan_tactic source t) xs)]
     | TacSufficesBy (q, rhs) =>
         [StepTactic {start_pos = #1 q, end_pos = #2 q, label = suffices_tactic_program source q, program = suffices_tactic_program source q},
          branch_steps source rhs]

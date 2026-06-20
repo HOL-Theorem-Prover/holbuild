@@ -649,6 +649,13 @@ Normal tactic chains such as `A >> B >> C` should stay as independent leaf steps
 ordinary branch/list/select syntax should introduce Proof-IR structure. Avoid
 name-based tactic heuristics for atomicity: opaque tactic calls are leaves, and
 shape-specific merging should be justified by the parsed branch/list/select form.
+Tactic-level `REPEAT`/`rpt` currently remains an opaque tactic leaf even though
+`repeat` is part of the protocol/runtime vocabulary: HOL `REPEAT tac` recursively
+repeats per generated goal via `THEN`, so a correct structural implementation
+needs repeat traversal/frame metadata for failed-prefix resume. Until that is
+implemented, keeping tactic repeats opaque preserves HOL execution semantics and
+safe leaf-level checkpointing. List-level `REPEAT_LT` likewise remains an opaque
+list-step.
 
 Attributed proofs and declarations with no parsed tactic body use a conservative
 whole-tactic prover path. Normal theorem bodies should not fall back to timing the
