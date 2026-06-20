@@ -197,9 +197,17 @@ cp "$project/src/AScript.sml" "$trace_project/src/AScript.sml"
 plan_log=$tmpdir/goalfrag-plan.log
 (cd "$trace_project" && "$HOLBUILD_BIN" execution-plan ATheory:b_thm) > "$plan_log" 2>&1
 require_grep "holbuild proof-ir plan ATheory:b_thm source=src/AScript.sml (" "$plan_log"
-require_grep "^[[:space:]]*00 .*CONJ_TAC" "$plan_log"
-require_grep "^[[:space:]]*[0-9][0-9][[:space:]]*>-" "$plan_log"
-require_grep "^[[:space:]]*[0-9][0-9] .*ACCEPT_TAC TRUTH" "$plan_log"
+require_grep "^[[:space:]]*00 step CONJ_TAC" "$plan_log"
+require_grep "^[[:space:]]*01 select first solve" "$plan_log"
+require_grep "^[[:space:]]*02[[:space:]]*step ACCEPT_TAC TRUTH" "$plan_log"
+require_grep "^[[:space:]]*03 end" "$plan_log"
+require_grep "^[[:space:]]*04 select first solve" "$plan_log"
+require_grep "^[[:space:]]*05[[:space:]]*step ACCEPT_TAC TRUTH" "$plan_log"
+require_grep "^[[:space:]]*06 end" "$plan_log"
+if grep -q "^[[:space:]]*[0-9][0-9][[:space:]]*>-" "$plan_log"; then
+  echo "execution-plan used legacy branch display" >&2
+  exit 1
+fi
 if grep -q "open_\|close_\|next_" "$plan_log"; then
   echo "goalfrag plan leaked structural IR names" >&2
   exit 1
