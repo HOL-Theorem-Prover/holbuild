@@ -148,7 +148,7 @@ fun parse_int_list_text "" = SOME []
         fun loop [] acc = SOME (rev acc)
           | loop (part :: rest) acc =
               case strict_nonnegative_int part of
-                  SOME n => if n >= 0 then loop rest (n :: acc) else NONE
+                  SOME n => loop rest (n :: acc)
                 | NONE => NONE
       in loop (String.fields (fn c => c = #",") text) [] end
 
@@ -814,21 +814,54 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
       case resume_after_path of
           NONE => false
         | SOME target => path = target
-    fun require_resume_supported _ = ()
-    val _ = case resume_after_path of NONE => () | SOME path => require_resume_supported path
     fun resume_child_after path =
       case resume_after_path of
           SOME target => if path_has_prefix path target then SOME (List.drop(target, length path)) else NONE
         | NONE => NONE
     fun emit_event event = dynamic_events_ref := event :: !dynamic_events_ref
-    fun consume_resume_event expected =
-      let
-        fun loop [] seen = false
-          | loop (event :: rest) seen =
-              if event = expected then (resume_events_ref := rev seen @ rest; true)
-              else loop rest (event :: seen)
-      in loop (!resume_events_ref) [] end
-    fun replay_or_emit event = if consume_resume_event event then () else emit_event event
+    fun replay_active () = not (!resume_reached_ref)
+    fun require_replay_event expected =
+      case !resume_events_ref of
+          event :: rest =>
+            if event = expected then resume_events_ref := rest
+            else raise Fail (String.concat ["proof-ir dynamic replay mismatch: expected ",
+                                            dynamic_event_text expected,
+                                            ", found ", dynamic_event_text event])
+        | [] =>
+            raise Fail ("proof-ir dynamic replay mismatch: missing " ^ dynamic_event_text expected)
+    fun event_path event =
+      case event of
+          HolbuildProofIr.ChoiceEvent (p, _) => p
+        | HolbuildProofIr.TryEvent (p, _) => p
+        | HolbuildProofIr.RepeatIterEvent (p, _) => p
+        | HolbuildProofIr.RepeatStopEvent (p, _) => p
+    fun replay_event_is_resume_ancestor event =
+      case resume_after_path of
+          SOME target => path_has_prefix (event_path event) target
+        | NONE => false
+    fun record_or_replay_event event =
+      case !resume_events_ref of
+          expected :: _ =>
+            if expected = event then require_replay_event event
+            else if replay_active() then require_replay_event event
+            else (resume_events_ref := []; emit_event event)
+        | [] => if replay_active() then require_replay_event event else emit_event event
+    fun finish_resume_boundary () =
+      (resume_reached_ref := true;
+       resume_events_ref := List.filter replay_event_is_resume_ancestor (!resume_events_ref))
+    fun push_structural_frame frame = current_frames_ref := frame :: !current_frames_ref
+    fun pop_structural_frame expected label =
+      case !current_frames_ref of
+          frame :: rest =>
+            if frame = expected then current_frames_ref := rest
+            else raise Fail ("proof-ir structural frame mismatch while closing " ^ label)
+        | [] => raise Fail ("proof-ir structural frame underflow while closing " ^ label)
+    fun record_successful_leaf path proof_step =
+      (successful_step_count_ref := !successful_step_count_ref + 1;
+       successful_prefix_end_ref := HolbuildProofIr.step_end proof_step;
+       successful_path_ref := path;
+       successful_frames_ref := !current_frames_ref;
+       successful_branch_tail_counts_ref := !branch_tail_count_ref)
     fun run_list _ _ _ [] = ()
       | run_list d path i (proof_step :: rest) =
           let val next = run_one d (path @ [HolbuildProofIr.PathStep i]) proof_step
@@ -839,7 +872,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
       else d + HolbuildProofIr.display_line_count proof_step
     and run_leaf d path proof_step =
       if not (!resume_reached_ref) then
-        if before_resume_leaf path then (resume_reached_ref := true; d + HolbuildProofIr.display_line_count proof_step)
+        if before_resume_leaf path then (finish_resume_boundary(); d + HolbuildProofIr.display_line_count proof_step)
         else d + HolbuildProofIr.display_line_count proof_step
       else
         let val n = !successful_step_count_ref
@@ -851,11 +884,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
           case result of
               SOME e => raise e
             | NONE =>
-                (successful_step_count_ref := n + 1;
-                 successful_prefix_end_ref := HolbuildProofIr.step_end proof_step;
-                 successful_path_ref := path;
-                 successful_frames_ref := !current_frames_ref;
-                 successful_branch_tail_counts_ref := !branch_tail_count_ref;
+                (record_successful_leaf path proof_step;
                  d + HolbuildProofIr.display_line_count proof_step)
         end
     and run_select d path proof_step mode body =
@@ -886,15 +915,15 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
             val frame = EachFrame (path, iter, remaining)
             val entering_from_resume = not (!resume_reached_ref) andalso Option.isSome resume_frame andalso
                                        (case resume_frame of SOME (EachFrame (_, iter', r)) => iter' = iter andalso r = remaining | _ => false)
-            val _ = current_frames_ref := frame :: !current_frames_ref
+            val _ = if entering_from_resume then () else push_structural_frame frame
             val _ = if entering_from_resume then () else push_first_focus "each"
             val result = (run_list (d + 1) (path @ [HolbuildProofIr.PathEach iter]) 0 body; NONE) handle e => SOME e
           in
             case result of
-                SOME e => (current_frames_ref := List.tl (!current_frames_ref); (pop_branch_tail_count "each" handle _ => ()); raise e)
+                SOME e => (pop_structural_frame frame "each"; (pop_branch_tail_count "each" handle _ => ()); raise e)
               | NONE =>
                   let val generated = focused_goal_count "each"
-                  in current_frames_ref := List.tl (!current_frames_ref);
+                  in pop_structural_frame frame "each";
                      close_focus "each" HolbuildProofIr.SelectKeep;
                      reorder_focused_front_after "each" generated (remaining - 1)
                   end
@@ -922,15 +951,15 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
             val frame = CaseFrame (path, n, remaining)
             val entering_from_resume = not (!resume_reached_ref) andalso Option.isSome resume_frame andalso
                                        (case resume_frame of SOME (CaseFrame (_, n', r)) => n' = n andalso r = remaining | _ => false)
-            val _ = current_frames_ref := frame :: !current_frames_ref
+            val _ = if entering_from_resume then () else push_structural_frame frame
             val _ = if entering_from_resume then () else push_first_focus label
             val result = (run_list (d + 2) (path @ [HolbuildProofIr.PathCase n]) 0 body; NONE) handle e => SOME e
           in
             case result of
-                SOME e => (current_frames_ref := List.tl (!current_frames_ref); (pop_branch_tail_count label handle _ => ()); raise e)
+                SOME e => (pop_structural_frame frame label; (pop_branch_tail_count label handle _ => ()); raise e)
               | NONE =>
                   let val generated = focused_goal_count label
-                  in current_frames_ref := List.tl (!current_frames_ref);
+                  in pop_structural_frame frame label;
                      close_focus label HolbuildProofIr.SelectKeep;
                      reorder_focused_front_after label generated (remaining - 1)
                   end
@@ -957,7 +986,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
                   val result = (with_expected_failures_suppressed (fn () => run_list (d + 2) (path @ [HolbuildProofIr.PathAlternative n]) 0 body); NONE) handle e => SOME e
               in
                 case result of
-                    NONE => replay_or_emit (HolbuildProofIr.ChoiceEvent (path, n))
+                    NONE => record_or_replay_event (HolbuildProofIr.ChoiceEvent (path, n))
                   | SOME e =>
                       (restore_runtime_state saved;
                        attempt (n + 1) rest (SOME e))
@@ -968,7 +997,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
                SOME (HolbuildProofIr.PathAlternative n :: _) =>
                  (case nth_body n alternatives of
                       SOME body => (run_list (d + 2) (path @ [HolbuildProofIr.PathAlternative n]) 0 body;
-                                    replay_or_emit (HolbuildProofIr.ChoiceEvent (path, n)))
+                                    record_or_replay_event (HolbuildProofIr.ChoiceEvent (path, n)))
                     | NONE => raise Fail "failed-prefix choice alternative is not present in current proof-ir plan")
              | _ => attempt 1 alternatives NONE)
         else attempt 1 alternatives NONE;
@@ -981,14 +1010,14 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
         if not (!resume_reached_ref) andalso
            (case resume_child_after path of SOME (HolbuildProofIr.PathTry :: _) => true | _ => false) then
           (run_list (d + 1) (path @ [HolbuildProofIr.PathTry]) 0 body;
-           replay_or_emit (HolbuildProofIr.TryEvent (path, true)))
+           record_or_replay_event (HolbuildProofIr.TryEvent (path, true)))
         else
           let val result = (with_expected_failures_suppressed (fn () => run_list (d + 1) (path @ [HolbuildProofIr.PathTry]) 0 body); NONE) handle e => SOME e
           in case result of
-                 NONE => replay_or_emit (HolbuildProofIr.TryEvent (path, true))
+                 NONE => record_or_replay_event (HolbuildProofIr.TryEvent (path, true))
                | SOME _ =>
                    (restore_runtime_state saved;
-                    replay_or_emit (HolbuildProofIr.TryEvent (path, false)))
+                    record_or_replay_event (HolbuildProofIr.TryEvent (path, false)))
           end;
         d + HolbuildProofIr.display_line_count proof_step
       end)
@@ -1007,15 +1036,15 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
                in case result of
                       SOME _ =>
                         (restore_runtime_state saved;
-                         replay_or_emit (HolbuildProofIr.RepeatStopEvent (path, iter)))
+                         record_or_replay_event (HolbuildProofIr.RepeatStopEvent (path, iter)))
                     | NONE =>
-                        (replay_or_emit (HolbuildProofIr.RepeatIterEvent (path, iter));
+                        (record_or_replay_event (HolbuildProofIr.RepeatIterEvent (path, iter));
                          loop (iter + 1))
                end
         fun resume_loop iter =
           if iter >= limit then guard_failure()
           else (run_list (d + 1) (path @ [HolbuildProofIr.PathRepeat iter]) 0 body;
-                replay_or_emit (HolbuildProofIr.RepeatIterEvent (path, iter));
+                record_or_replay_event (HolbuildProofIr.RepeatIterEvent (path, iter));
                 loop (iter + 1))
       in
         if not (!resume_reached_ref) then
@@ -1171,32 +1200,87 @@ fun validate_failed_prefix_metadata plan (metadata : {step_count : int, prefix_e
       | validate_focus (n :: rest) =
           if n >= 0 then validate_focus rest
           else raise Fail "invalid proof-ir failed-prefix metadata: negative focus count"
+    fun step_at_path target =
+      let
+        fun nth 0 (x :: _) = SOME x
+          | nth n (_ :: rest) = if n > 0 then nth (n - 1) rest else NONE
+          | nth _ [] = NONE
+        fun find_steps steps [] = NONE
+          | find_steps steps [HolbuildProofIr.PathStep i] = nth i steps
+          | find_steps steps (HolbuildProofIr.PathStep i :: rest) =
+              (case nth i steps of
+                   SOME step => find_in_step step rest
+                 | NONE => NONE)
+          | find_steps _ _ = NONE
+        and find_in_step step rest =
+          case (step, rest) of
+              (HolbuildProofIr.StepSelect {body, ...}, HolbuildProofIr.PathSelect :: more) => find_steps body more
+            | (HolbuildProofIr.StepEach {body, ...}, HolbuildProofIr.PathEach _ :: more) => find_steps body more
+            | (HolbuildProofIr.StepCases {cases, ...}, HolbuildProofIr.PathCase n :: more) =>
+                if n > 0 then (case nth (n - 1) cases of SOME body => find_steps body more | NONE => NONE) else NONE
+            | (HolbuildProofIr.StepChoice {alternatives, ...}, HolbuildProofIr.PathAlternative n :: more) =>
+                if n > 0 then (case nth (n - 1) alternatives of SOME body => find_steps body more | NONE => NONE) else NONE
+            | (HolbuildProofIr.StepTry {body, ...}, HolbuildProofIr.PathTry :: more) => find_steps body more
+            | (HolbuildProofIr.StepRepeat {body, ...}, HolbuildProofIr.PathRepeat _ :: more) => find_steps body more
+            | _ => NONE
+      in find_steps plan target end
+    fun node_at_path target =
+      case step_at_path target of
+          SOME step => SOME step
+        | NONE =>
+            (case rev target of
+                 HolbuildProofIr.PathSelect :: rest => step_at_path (rev rest)
+               | HolbuildProofIr.PathEach _ :: rest => step_at_path (rev rest)
+               | HolbuildProofIr.PathCase _ :: rest => step_at_path (rev rest)
+               | HolbuildProofIr.PathAlternative _ :: rest => step_at_path (rev rest)
+               | HolbuildProofIr.PathTry :: rest => step_at_path (rev rest)
+               | HolbuildProofIr.PathRepeat _ :: rest => step_at_path (rev rest)
+               | _ => NONE)
+    fun frame_path_matches_path frame_path component_ok =
+      path_has_prefix frame_path path andalso
+      (case List.drop(path, length frame_path) of
+           component :: _ => component_ok component
+         | [] => false)
     fun validate_frame frame =
       case frame of
           EachFrame (frame_path, iter, remaining) =>
-            if path_has_prefix frame_path path andalso iter >= 0 andalso remaining > 0 then ()
+            if iter >= 0 andalso remaining > 0 andalso
+               (case node_at_path frame_path of SOME (HolbuildProofIr.StepEach _) => true | _ => false) andalso
+               frame_path_matches_path frame_path (fn HolbuildProofIr.PathEach n => n = iter | _ => false) then ()
             else raise Fail "invalid proof-ir failed-prefix metadata: stale each frame"
         | CaseFrame (frame_path, n, remaining) =>
-            if path_has_prefix frame_path path andalso n > 0 andalso remaining > 0 then ()
+            if n > 0 andalso remaining > 0 andalso
+               (case node_at_path frame_path of SOME (HolbuildProofIr.StepCases _) => true | _ => false) andalso
+               frame_path_matches_path frame_path (fn HolbuildProofIr.PathCase n' => n' = n | _ => false) then ()
             else raise Fail "invalid proof-ir failed-prefix metadata: stale case frame"
-    fun event_path_exists event_path = Option.isSome (path_display_index plan event_path)
     fun validate_event event =
       case event of
           HolbuildProofIr.ChoiceEvent (event_path, n) =>
-            if n > 0 andalso event_path_exists event_path then ()
+            if n > 0 andalso (case node_at_path event_path of SOME (HolbuildProofIr.StepChoice _) => true | _ => false) then ()
             else raise Fail "invalid proof-ir failed-prefix metadata: stale choice event"
         | HolbuildProofIr.TryEvent (event_path, _) =>
-            if event_path_exists event_path then ()
+            if (case node_at_path event_path of SOME (HolbuildProofIr.StepTry _) => true | _ => false) then ()
             else raise Fail "invalid proof-ir failed-prefix metadata: stale try event"
         | HolbuildProofIr.RepeatIterEvent (event_path, n) =>
-            if n >= 0 andalso event_path_exists event_path then ()
+            if n >= 0 andalso (case node_at_path event_path of SOME (HolbuildProofIr.StepRepeat _) => true | _ => false) then ()
             else raise Fail "invalid proof-ir failed-prefix metadata: stale repeat event"
         | HolbuildProofIr.RepeatStopEvent (event_path, n) =>
-            if n >= 0 andalso event_path_exists event_path then ()
+            if n >= 0 andalso (case node_at_path event_path of SOME (HolbuildProofIr.StepRepeat _) => true | _ => false) then ()
             else raise Fail "invalid proof-ir failed-prefix metadata: stale repeat event"
+    fun validate_frame_order [] = ()
+      | validate_frame_order [_] = ()
+      | validate_frame_order (inner :: outer :: rest) =
+          let
+            fun frame_path frame =
+              case frame of EachFrame (p, _, _) => p | CaseFrame (p, _, _) => p
+          in
+            if path_has_prefix (frame_path outer) (frame_path inner) then validate_frame_order (outer :: rest)
+            else raise Fail "invalid proof-ir failed-prefix metadata: inconsistent frame stack order"
+          end
   in
     validate_focus (#focus metadata);
     List.app validate_frame (#frames metadata);
+    validate_frame_order (#frames metadata);
     List.app validate_event (#events metadata)
   end
 
