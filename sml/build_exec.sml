@@ -2287,18 +2287,23 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
     fun discard_loaded_checkpoint_after_load_failure () =
       remove_loaded_checkpoint_descendants project node deps_key deps_loaded theorem_checkpoints declaration_checkpoints
         (hol_context_path (#context run_spec))
-    fun discard_failed_prefix_after_resume_failure () =
+    fun discard_failed_prefix_after_resume_failure msg =
       case #failed_prefix_context run_spec of
           NONE => false
         | SOME (path, _) =>
             let
               val failure_output = checkpoint_failure_output project node input_key stage
-              val failure_text =
+              val output_text =
                 case captured_output_path_option failure_output of
                     NONE => ""
                   | SOME output_path => read_text output_path handle _ => ""
+              val failure_text = msg ^ "\n" ^ output_text
             in
-              if String.isSubstring "failed-prefix checkpoint cannot rewind" failure_text then
+              if List.exists (fn marker => String.isSubstring marker failure_text)
+                   ["failed-prefix checkpoint cannot rewind",
+                    "failed-prefix proof path is not present in current proof-ir plan",
+                    "invalid proof-ir failed-prefix metadata",
+                    "proof-ir dynamic replay mismatch"] then
                 (remove_checkpoint path;
                  warn ("discarding failed-prefix checkpoint after failed resume: " ^ path);
                  true)
@@ -2368,7 +2373,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
           in
             raise RetryInvalidCheckpoint
           end
-        else if discard_failed_prefix_after_resume_failure () then
+        else if discard_failed_prefix_after_resume_failure msg then
           raise RetryInvalidCheckpoint
         else
           let

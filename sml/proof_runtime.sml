@@ -1454,7 +1454,7 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
           val _ = resume_events_ref := #events metadata
           val _ =
             if #step_count metadata = 0 then run_structural_steps 0 plan
-            else run_steps_from_path (#path metadata) resume_display plan
+            else run_steps_from_path (#path metadata) 0 plan
           val th = history_top_thm (project_history goalStack.initial_goal)
                    handle e => (ignore (print_finish_goal_state name); raise e)
           val _ = drop_all()
