@@ -64,6 +64,8 @@ fun precedence (ExpEmpty _) = 10
   | precedence (App _) = 9
   | precedence _ = 0
 
+datatype subgoal_kind = PlainSubgoal | BySubgoal
+
 datatype tactic =
     TacThen of tactic list
   | TacThenLT of tactic * list_tactic
@@ -79,7 +81,7 @@ datatype tactic =
   | TacTry of (int * int) * tactic
   | TacRepeat of (int * int) * tactic
   | TacReverse of (int * int) * tactic
-  | TacSubgoal of int * int
+  | TacSubgoal of subgoal_kind * (int * int)
   | TacMapEvery of (int * int) * (int * int) list
   | TacApply of (int * int) * (int * int)
   | TacMapFirst of (int * int) * tactic list
@@ -130,7 +132,7 @@ fun tactic_end (TacThen []) = 0
   | tactic_end (TacTry (sp, _)) = span_end sp
   | tactic_end (TacRepeat (sp, _)) = span_end sp
   | tactic_end (TacReverse (sp, _)) = span_end sp
-  | tactic_end (TacSubgoal sp) = span_end sp
+  | tactic_end (TacSubgoal (_, sp)) = span_end sp
   | tactic_end (TacApply (_, arg)) = span_end arg
   | tactic_end (TacMapEvery (f, [])) = span_end f
   | tactic_end (TacMapEvery (_, args)) = span_end (List.last args)
@@ -182,8 +184,8 @@ fun parse_tactic_ast e =
            | _ => parse_tactic_app e)
 and parse_tactic_app e =
   case app_name e of
-      SOME ("sg", [x]) => TacSubgoal (span x)
-    | SOME ("subgoal", [x]) => TacSubgoal (span x)
+      SOME ("sg", [x]) => TacSubgoal (PlainSubgoal, span x)
+    | SOME ("subgoal", [x]) => TacSubgoal (PlainSubgoal, span x)
     | SOME ("ALL_TAC", []) => TacThen []
     | SOME ("all_tac", []) => TacThen []
     | SOME ("EVERY", [xs]) => parse_every e xs
@@ -231,7 +233,7 @@ and parse_tactic_infix left opn right whole =
     | ">|" => parse_thenl left right whole
     | ">-" => TacThen1 (parse_tactic_ast left, parse_branch_rhs_ast right)
     | "THEN1" => TacThen1 (parse_tactic_ast left, parse_branch_rhs_ast right)
-    | "by" => TacThen1 (TacSubgoal (span left), parse_branch_rhs_ast right)
+    | "by" => TacThen1 (TacSubgoal (BySubgoal, span left), parse_branch_rhs_ast right)
     | "suffices_by" => TacSufficesBy (span left, parse_branch_rhs_ast right)
     | "ORELSE" => TacOrelse (flatten_orelse left @ flatten_orelse right)
     | ">~" => TacThenLT (parse_tactic_ast left, LtSelectGoal (span right))
@@ -366,7 +368,8 @@ fun tactic_program source tactic =
     | TacTry (_, t) => "Tactical.TRY(" ^ tactic_program source t ^ ")"
     | TacRepeat (_, t) => "Tactical.REPEAT(" ^ tactic_program source t ^ ")"
     | TacReverse (_, t) => "Tactical.REVERSE(" ^ tactic_program source t ^ ")"
-    | TacSubgoal sp => "sg " ^ source_text source sp
+    | TacSubgoal (PlainSubgoal, sp) => "sg " ^ source_text source sp
+    | TacSubgoal (BySubgoal, sp) => "BasicProvers.byA (" ^ source_text source sp ^ ", Tactical.ALL_TAC)"
     | TacApply (f, arg) => parenthesize (source_text source f) ^ " " ^ parenthesize (source_text source arg)
     | TacMapEvery _ => parenthesize (source_text source (tactic_span tactic))
     | TacMapFirst (_, ts) => "Tactical.FIRST [" ^ String.concatWith ", " (map (tactic_program source) ts) ^ "]"
@@ -421,7 +424,7 @@ and tactic_span tactic =
     | TacTry (sp, _) => sp
     | TacRepeat (sp, _) => sp
     | TacReverse (sp, _) => sp
-    | TacSubgoal sp => sp
+    | TacSubgoal (_, sp) => sp
     | TacApply (f, arg) => (#1 f, #2 arg)
     | TacMapEvery (f, []) => f
     | TacMapEvery (f, xs) => (#1 f, #2 (List.last xs))
@@ -468,7 +471,8 @@ fun tactic_label source (TacThen []) = "ALL_TAC"
         fun arg_text (TacApply (_, arg)) = source_text source arg
           | arg_text t = tactic_label source t
       in "MAP_FIRST " ^ source_text source f ^ " [" ^ String.concatWith ", " (map arg_text ts) ^ "]" end
-  | tactic_label source (TacSubgoal sp) = "sg " ^ source_text source sp
+  | tactic_label source (TacSubgoal (PlainSubgoal, sp)) = "sg " ^ source_text source sp
+  | tactic_label source (TacSubgoal (BySubgoal, sp)) = "by-subgoal " ^ source_text source sp
   | tactic_label source (TacRepairGroup (_, inner)) = tactic_label source inner
   | tactic_label source tactic = source_text source (tactic_span tactic)
 
