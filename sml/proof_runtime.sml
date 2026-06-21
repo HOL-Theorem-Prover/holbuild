@@ -844,7 +844,7 @@ fun inspection_matches wanted name =
   case wanted of NONE => false | SOME selected => selected = name
 
 fun trace_enabled () =
-  !trace_active_ref orelse Option.getOpt(env_bool "HOLBUILD_GOALFRAG_TRACE", false)
+  !trace_active_ref orelse Option.getOpt(env_bool "HOLBUILD_PROOF_STEPS_TRACE", false)
 
 fun plan_enabled () =
   !plan_active_ref orelse trace_enabled ()

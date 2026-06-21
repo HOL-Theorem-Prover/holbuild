@@ -508,7 +508,6 @@ fun repeat_step (sp : int * int) body = StepRepeat {start_pos = #1 sp, end_pos =
 fun try_step sp body = StepTry {start_pos = #1 sp, end_pos = #2 sp, body = body}
 
 fun suffices_tactic_program source q = "qsuff_tac " ^ source_text source q
-fun by_tactic_program source q = "sg " ^ source_text source q
 
 fun branch_steps source rhs =
   select_first_solve_step (tactic_span rhs) (plan_tactic source rhs)

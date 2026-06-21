@@ -731,8 +731,11 @@ sequencing preserves the usual per-goal `THEN` semantics. The explicit `each` is
 needed only when holbuild has decomposed the RHS into Proof-IR control such as
 `try`, `choice`, or assertion/branch structure. For example,
 `CONJ_TAC >> simp[] >> `F` by tac >> rw[]` should plan as an atomic `simp[]`
-step followed by an `each` block containing `sg `F`` and its solving branch, then
-an atomic `rw[]` step. The `each` makes the assertion-and-branch body run once for
+step followed by an `each` block containing a `by` assertion step and its solving
+branch, then an atomic `rw[]` step.  The assertion step must use HOL's `by`
+subgoal construction semantics (currently via `BasicProvers.byA`), not explicit
+`sg`, because infix `by` has special handling for some goal shapes such as
+wildcard equality-chain assertions. The `each` makes the assertion-and-branch body run once for
 each goal produced by the preceding tactics rather than once over the aggregate
 focused goal list. A future optimization may elide or fast-path `each` when the
 runtime (or static planning) knows there is exactly one focused goal, but any such
@@ -741,7 +744,9 @@ The goal is that a developer can debug a divergence by inspecting the plan and
 knowing the HOL tactic combinator semantics.
 
 `--trace-steps` executes the build and records runtime plans plus before/after
-trace lines for all instrumented proofs in the child log. On failure, holbuild
+trace lines for all instrumented proofs in the child log. The internal proof-step
+trace can also be forced with `HOLBUILD_PROOF_STEPS_TRACE=1` for debugging.
+On failure, holbuild
 prints the failed theorem's trace excerpt with per-fragment elapsed time and
 open-goal counts. Use `--force` with trace when the artifact is already up to date
 and you need source execution; `--force` bypasses local up-to-date checks and
