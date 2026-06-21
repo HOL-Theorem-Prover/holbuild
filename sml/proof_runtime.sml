@@ -308,6 +308,19 @@ fun step_at_path plan target =
         | _ => NONE
   in find_steps plan target end
 
+fun node_at_path plan target =
+  case step_at_path plan target of
+      SOME step => SOME step
+    | NONE =>
+        (case rev target of
+             HolbuildProofIr.PathSelect :: rest => step_at_path plan (rev rest)
+           | HolbuildProofIr.PathEach _ :: rest => step_at_path plan (rev rest)
+           | HolbuildProofIr.PathCase _ :: rest => step_at_path plan (rev rest)
+           | HolbuildProofIr.PathAlternative _ :: rest => step_at_path plan (rev rest)
+           | HolbuildProofIr.PathTry :: rest => step_at_path plan (rev rest)
+           | HolbuildProofIr.PathRepeat _ :: rest => step_at_path plan (rev rest)
+           | _ => NONE)
+
 fun step_signature_text step =
   HolbuildProofIr.step_kind step ^ "\t" ^ String.toString (HolbuildProofIr.step_program step)
 
@@ -1384,7 +1397,7 @@ fun parse_failed_prefix_metadata text =
   in
     case metadata_value "proof_ir_failed_prefix_version" lines of
         SOME version =>
-          if version = "1" orelse version = "2" orelse version = "3" then
+          if version = "1" orelse version = "3" then
             (case (metadata_value "step_count" lines,
                    metadata_value "prefix_end" lines,
                    metadata_value "path" lines,
@@ -1401,7 +1414,7 @@ fun parse_failed_prefix_metadata text =
                                   SOME text => parse_step_signature_text text
                                 | NONE => NONE
                           in
-                            if (version = "2" orelse version = "3") andalso step_count > 0 andalso not (Option.isSome leaf_signature) then NONE
+                            if version = "3" andalso step_count > 0 andalso not (Option.isSome leaf_signature) then NONE
                             else SOME {step_count = step_count, prefix_end = prefix_end, path = path, focus = focus,
                                        leaf_signature = leaf_signature, events = events, frames = frames,
                                        leaves = if version = "3" then leaves else []}
@@ -1449,42 +1462,7 @@ fun validate_failed_prefix_metadata plan (metadata : {step_count : int, prefix_e
       | validate_focus (n :: rest) =
           if n >= 0 then validate_focus rest
           else raise Fail "invalid proof-ir failed-prefix metadata: negative focus count"
-    fun step_at_path target =
-      let
-        fun nth 0 (x :: _) = SOME x
-          | nth n (_ :: rest) = if n > 0 then nth (n - 1) rest else NONE
-          | nth _ [] = NONE
-        fun find_steps steps [] = NONE
-          | find_steps steps [HolbuildProofIr.PathStep i] = nth i steps
-          | find_steps steps (HolbuildProofIr.PathStep i :: rest) =
-              (case nth i steps of
-                   SOME step => find_in_step step rest
-                 | NONE => NONE)
-          | find_steps _ _ = NONE
-        and find_in_step step rest =
-          case (step, rest) of
-              (HolbuildProofIr.StepSelect {body, ...}, HolbuildProofIr.PathSelect :: more) => find_steps body more
-            | (HolbuildProofIr.StepEach {body, ...}, HolbuildProofIr.PathEach _ :: more) => find_steps body more
-            | (HolbuildProofIr.StepCases {cases, ...}, HolbuildProofIr.PathCase n :: more) =>
-                if n > 0 then (case nth (n - 1) cases of SOME body => find_steps body more | NONE => NONE) else NONE
-            | (HolbuildProofIr.StepChoice {alternatives, ...}, HolbuildProofIr.PathAlternative n :: more) =>
-                if n > 0 then (case nth (n - 1) alternatives of SOME body => find_steps body more | NONE => NONE) else NONE
-            | (HolbuildProofIr.StepTry {body, ...}, HolbuildProofIr.PathTry :: more) => find_steps body more
-            | (HolbuildProofIr.StepRepeat {body, ...}, HolbuildProofIr.PathRepeat _ :: more) => find_steps body more
-            | _ => NONE
-      in find_steps plan target end
-    fun node_at_path target =
-      case step_at_path target of
-          SOME step => SOME step
-        | NONE =>
-            (case rev target of
-                 HolbuildProofIr.PathSelect :: rest => step_at_path (rev rest)
-               | HolbuildProofIr.PathEach _ :: rest => step_at_path (rev rest)
-               | HolbuildProofIr.PathCase _ :: rest => step_at_path (rev rest)
-               | HolbuildProofIr.PathAlternative _ :: rest => step_at_path (rev rest)
-               | HolbuildProofIr.PathTry :: rest => step_at_path (rev rest)
-               | HolbuildProofIr.PathRepeat _ :: rest => step_at_path (rev rest)
-               | _ => NONE)
+    fun current_node_at_path target = node_at_path plan target
     fun frame_path_matches_path frame_path component_ok =
       path_has_prefix frame_path path andalso
       (case List.drop(path, length frame_path) of
@@ -1494,27 +1472,27 @@ fun validate_failed_prefix_metadata plan (metadata : {step_count : int, prefix_e
       case frame of
           EachFrame (frame_path, iter, remaining) =>
             if iter >= 0 andalso remaining > 0 andalso
-               (case node_at_path frame_path of SOME (HolbuildProofIr.StepEach _) => true | _ => false) andalso
+               (case current_node_at_path frame_path of SOME (HolbuildProofIr.StepEach _) => true | _ => false) andalso
                frame_path_matches_path frame_path (fn HolbuildProofIr.PathEach n => n = iter | _ => false) then ()
             else raise Fail "invalid proof-ir failed-prefix metadata: stale each frame"
         | CaseFrame (frame_path, n, remaining) =>
             if n > 0 andalso remaining > 0 andalso
-               (case node_at_path frame_path of SOME (HolbuildProofIr.StepCases _) => true | _ => false) andalso
+               (case current_node_at_path frame_path of SOME (HolbuildProofIr.StepCases _) => true | _ => false) andalso
                frame_path_matches_path frame_path (fn HolbuildProofIr.PathCase n' => n' = n | _ => false) then ()
             else raise Fail "invalid proof-ir failed-prefix metadata: stale case frame"
     fun validate_event event =
       case event of
           HolbuildProofIr.ChoiceEvent (event_path, n) =>
-            if n > 0 andalso (case node_at_path event_path of SOME (HolbuildProofIr.StepChoice _) => true | _ => false) then ()
+            if n > 0 andalso (case current_node_at_path event_path of SOME (HolbuildProofIr.StepChoice _) => true | _ => false) then ()
             else raise Fail "invalid proof-ir failed-prefix metadata: stale choice event"
         | HolbuildProofIr.TryEvent (event_path, _) =>
-            if (case node_at_path event_path of SOME (HolbuildProofIr.StepTry _) => true | _ => false) then ()
+            if (case current_node_at_path event_path of SOME (HolbuildProofIr.StepTry _) => true | _ => false) then ()
             else raise Fail "invalid proof-ir failed-prefix metadata: stale try event"
         | HolbuildProofIr.RepeatIterEvent (event_path, n) =>
-            if n >= 0 andalso (case node_at_path event_path of SOME (HolbuildProofIr.StepRepeat _) => true | _ => false) then ()
+            if n >= 0 andalso (case current_node_at_path event_path of SOME (HolbuildProofIr.StepRepeat _) => true | _ => false) then ()
             else raise Fail "invalid proof-ir failed-prefix metadata: stale repeat event"
         | HolbuildProofIr.RepeatStopEvent (event_path, n) =>
-            if n >= 0 andalso (case node_at_path event_path of SOME (HolbuildProofIr.StepRepeat _) => true | _ => false) then ()
+            if n >= 0 andalso (case current_node_at_path event_path of SOME (HolbuildProofIr.StepRepeat _) => true | _ => false) then ()
             else raise Fail "invalid proof-ir failed-prefix metadata: stale repeat event"
     fun validate_frame_order [] = ()
       | validate_frame_order [_] = ()

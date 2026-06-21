@@ -175,6 +175,7 @@ fun atomic e = TacAtomic (precedence e, span e)
 fun list_atomic e = LtAtomic (precedence e, span e)
 
 fun tactic_is_identity (TacThen []) = true
+  | tactic_is_identity (TacRepairGroup (_, t)) = tactic_is_identity t
   | tactic_is_identity _ = false
 
 fun drop_identity_tactics ts = List.filter (fn t => not (tactic_is_identity t)) ts
