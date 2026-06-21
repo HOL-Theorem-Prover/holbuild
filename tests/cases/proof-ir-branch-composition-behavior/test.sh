@@ -112,6 +112,25 @@ Proof
   >- ACCEPT_TAC TRUTH
 QED
 
+Theorem thenl_suffix_each_success:
+  (T /\ (0 = 0)) /\ ((1 = 1) /\ T)
+Proof
+  CONJ_TAC >>
+  (CONJ_TAC >| [ALL_TAC, ALL_TAC])
+  >- ACCEPT_TAC TRUTH
+  >- REFL_TAC
+  >- REFL_TAC
+  >- ACCEPT_TAC TRUTH
+QED
+
+Theorem by_wildcard_eq_success:
+  T
+Proof
+  `T = T` by REFL_TAC >>
+  `_ = T` by REFL_TAC >>
+  ACCEPT_TAC TRUTH
+QED
+
 Theorem each_preserve_residual_order_success:
   (T /\ (0 = 0)) /\ ((1 = 1) /\ T)
 Proof

@@ -3,7 +3,7 @@ holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml
   01 step strip_tac
   02 step qmatch_asmsub_abbrev_tac`pop_stack n`
   03 each
-  04   step sg `preserves_same_frame (pop_stack n)`
+  04   step by-subgoal `preserves_same_frame (pop_stack n)`
   05   select first solve
   06     step simp[]
   07   end
@@ -14,14 +14,14 @@ holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml
   12 step strip_tac
   13 step gvs[]
   14 each
-  15   step sg `sm.contexts ≠ []`
+  15   step by-subgoal `sm.contexts ≠ []`
   16   select first solve
   17     step strip_tac
   18     step gvs[same_frame_rel_def]
   19   end
   20 end
   21 each
-  22   step sg `LENGTH sm.contexts = LENGTH s.contexts`
+  22   step by-subgoal `LENGTH sm.contexts = LENGTH s.contexts`
   23   select first solve
   24     step gvs[same_frame_rel_def]
   25   end
@@ -33,13 +33,13 @@ holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml
   31 step gvs[]
   32 step rename1`same_frame_rel sm s2`
   33 each
-  34   step sg `same_frame_rel s s2`
+  34   step by-subgoal `same_frame_rel s s2`
   35   select first solve
   36     step metis_tac[same_frame_rel_trans]
   37   end
   38 end
   39 each
-  40   step sg `s2.contexts ≠ [] ∧ LENGTH s2.contexts = LENGTH s.contexts`
+  40   step by-subgoal `s2.contexts ≠ [] ∧ LENGTH s2.contexts = LENGTH s.contexts`
   41   select first solve
   42     step rpt strip_tac
   43     step gvs[same_frame_rel_def]
@@ -53,13 +53,13 @@ holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml
   51 step gvs[]
   52 step rename1`same_frame_rel s2 s3`
   53 each
-  54   step sg `same_frame_rel s s3`
+  54   step by-subgoal `same_frame_rel s s3`
   55   select first solve
   56     step metis_tac[same_frame_rel_trans]
   57   end
   58 end
   59 each
-  60   step sg `s3.contexts ≠ [] ∧ LENGTH s3.contexts = LENGTH s.contexts`
+  60   step by-subgoal `s3.contexts ≠ [] ∧ LENGTH s3.contexts = LENGTH s.contexts`
   61   select first solve
   62     step rpt strip_tac
   63     step gvs[same_frame_rel_def]
@@ -72,13 +72,13 @@ holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml
   70 step gvs[]
   71 step rename1`same_frame_rel s3 s4`
   72 each
-  73   step sg `same_frame_rel s s4`
+  73   step by-subgoal `same_frame_rel s s4`
   74   select first solve
   75     step metis_tac[same_frame_rel_trans]
   76   end
   77 end
   78 each
-  79   step sg `s4.contexts ≠ [] ∧ LENGTH s4.contexts = LENGTH s.contexts`
+  79   step by-subgoal `s4.contexts ≠ [] ∧ LENGTH s4.contexts = LENGTH s.contexts`
   80   select first solve
   81     step rpt strip_tac
   82     step gvs[same_frame_rel_def]
@@ -91,13 +91,13 @@ holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml
   89 step gvs[]
   90 step rename1`same_frame_rel s4 s5`
   91 each
-  92   step sg `same_frame_rel s s5`
+  92   step by-subgoal `same_frame_rel s s5`
   93   select first solve
   94     step metis_tac[same_frame_rel_trans]
   95   end
   96 end
   97 each
-  98   step sg `s5.contexts ≠ [] ∧ LENGTH s5.contexts = LENGTH s.contexts`
+  98   step by-subgoal `s5.contexts ≠ [] ∧ LENGTH s5.contexts = LENGTH s.contexts`
   99   select first solve
   100     step rpt strip_tac
   101     step gvs[same_frame_rel_def]
@@ -110,13 +110,13 @@ holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml
   108 step gvs[]
   109 step rename1`same_frame_rel s5 s6`
   110 each
-  111   step sg `same_frame_rel s s6`
+  111   step by-subgoal `same_frame_rel s s6`
   112   select first solve
   113     step metis_tac[same_frame_rel_trans]
   114   end
   115 end
   116 each
-  117   step sg `s6.contexts ≠ [] ∧ LENGTH s6.contexts = LENGTH s.contexts`
+  117   step by-subgoal `s6.contexts ≠ [] ∧ LENGTH s6.contexts = LENGTH s.contexts`
   118   select first solve
   119     step rpt strip_tac
   120     step gvs[same_frame_rel_def]
@@ -129,13 +129,13 @@ holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml
   127 step gvs[]
   128 step rename1`same_frame_rel s6 s7`
   129 each
-  130   step sg `same_frame_rel s s7`
+  130   step by-subgoal `same_frame_rel s s7`
   131   select first solve
   132     step metis_tac[same_frame_rel_trans]
   133   end
   134 end
   135 each
-  136   step sg `s7.contexts ≠ [] ∧ LENGTH s7.contexts = LENGTH s.contexts`
+  136   step by-subgoal `s7.contexts ≠ [] ∧ LENGTH s7.contexts = LENGTH s.contexts`
   137   select first solve
   138     step rpt strip_tac
   139     step gvs[same_frame_rel_def]
@@ -148,13 +148,13 @@ holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml
   146 step gvs[]
   147 step rename1`same_frame_rel s7 s8`
   148 each
-  149   step sg `same_frame_rel s s8`
+  149   step by-subgoal `same_frame_rel s s8`
   150   select first solve
   151     step metis_tac[same_frame_rel_trans]
   152   end
   153 end
   154 each
-  155   step sg `s8.contexts ≠ [] ∧ LENGTH s8.contexts = LENGTH s.contexts`
+  155   step by-subgoal `s8.contexts ≠ [] ∧ LENGTH s8.contexts = LENGTH s.contexts`
   156   select first solve
   157     step rpt strip_tac
   158     step gvs[same_frame_rel_def]
@@ -167,13 +167,13 @@ holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml
   165 step gvs[]
   166 step rename1`same_frame_rel s8 s9`
   167 each
-  168   step sg `same_frame_rel s s9`
+  168   step by-subgoal `same_frame_rel s s9`
   169   select first solve
   170     step metis_tac[same_frame_rel_trans]
   171   end
   172 end
   173 each
-  174   step sg `s9.contexts ≠ [] ∧ LENGTH s9.contexts = LENGTH s.contexts`
+  174   step by-subgoal `s9.contexts ≠ [] ∧ LENGTH s9.contexts = LENGTH s.contexts`
   175   select first solve
   176     step rpt strip_tac
   177     step gvs[same_frame_rel_def]
@@ -186,13 +186,13 @@ holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml
   184 step gvs[]
   185 step rename1`same_frame_rel s9 s0`
   186 each
-  187   step sg `same_frame_rel s s0`
+  187   step by-subgoal `same_frame_rel s s0`
   188   select first solve
   189     step metis_tac[same_frame_rel_trans]
   190   end
   191 end
   192 each
-  193   step sg `s0.contexts ≠ [] ∧ LENGTH s0.contexts = LENGTH s.contexts`
+  193   step by-subgoal `s0.contexts ≠ [] ∧ LENGTH s0.contexts = LENGTH s.contexts`
   194   select first solve
   195     step rpt strip_tac
   196     step gvs[same_frame_rel_def]
@@ -205,13 +205,13 @@ holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml
   203 step gvs[]
   204 step rename1`same_frame_rel s0 sa`
   205 each
-  206   step sg `same_frame_rel s sa`
+  206   step by-subgoal `same_frame_rel s sa`
   207   select first solve
   208     step metis_tac[same_frame_rel_trans]
   209   end
   210 end
   211 each
-  212   step sg `sa.contexts ≠ [] ∧ LENGTH sa.contexts = LENGTH s.contexts`
+  212   step by-subgoal `sa.contexts ≠ [] ∧ LENGTH sa.contexts = LENGTH s.contexts`
   213   select first solve
   214     step rpt strip_tac
   215     step gvs[same_frame_rel_def]
@@ -224,13 +224,13 @@ holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml
   222 step gvs[]
   223 step rename1`same_frame_rel sa sb`
   224 each
-  225   step sg `same_frame_rel s sb`
+  225   step by-subgoal `same_frame_rel s sb`
   226   select first solve
   227     step metis_tac[same_frame_rel_trans]
   228   end
   229 end
   230 each
-  231   step sg `sb.contexts ≠ [] ∧ LENGTH sb.contexts = LENGTH s.contexts`
+  231   step by-subgoal `sb.contexts ≠ [] ∧ LENGTH sb.contexts = LENGTH s.contexts`
   232   select first solve
   233     step rpt strip_tac
   234     step gvs[same_frame_rel_def]
@@ -243,13 +243,13 @@ holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml
   241 step gvs[]
   242 step rename1`same_frame_rel sb sc`
   243 each
-  244   step sg `same_frame_rel s sc`
+  244   step by-subgoal `same_frame_rel s sc`
   245   select first solve
   246     step metis_tac[same_frame_rel_trans]
   247   end
   248 end
   249 each
-  250   step sg `sc.contexts ≠ [] ∧ LENGTH sc.contexts = LENGTH s.contexts`
+  250   step by-subgoal `sc.contexts ≠ [] ∧ LENGTH sc.contexts = LENGTH s.contexts`
   251   select first solve
   252     step rpt strip_tac
   253     step gvs[same_frame_rel_def]
@@ -262,13 +262,13 @@ holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml
   260 step gvs[]
   261 step rename1`same_frame_rel sc sd`
   262 each
-  263   step sg `same_frame_rel s sd`
+  263   step by-subgoal `same_frame_rel s sd`
   264   select first solve
   265     step metis_tac[same_frame_rel_trans]
   266   end
   267 end
   268 each
-  269   step sg `sd.contexts ≠ [] ∧ LENGTH sd.contexts = LENGTH s.contexts`
+  269   step by-subgoal `sd.contexts ≠ [] ∧ LENGTH sd.contexts = LENGTH s.contexts`
   270   select first solve
   271     step rpt strip_tac
   272     step gvs[same_frame_rel_def]
@@ -281,13 +281,13 @@ holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml
   279 step gvs[]
   280 step rename1`same_frame_rel sd se`
   281 each
-  282   step sg `same_frame_rel s se`
+  282   step by-subgoal `same_frame_rel s se`
   283   select first solve
   284     step metis_tac[same_frame_rel_trans]
   285   end
   286 end
   287 each
-  288   step sg `se.contexts ≠ [] ∧ LENGTH se.contexts = LENGTH s.contexts`
+  288   step by-subgoal `se.contexts ≠ [] ∧ LENGTH se.contexts = LENGTH s.contexts`
   289   select first solve
   290     step rpt strip_tac
   291     step gvs[same_frame_rel_def]
@@ -312,7 +312,7 @@ holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml
   310 step drule_all proceed_create_push_structure
   311 step strip_tac
   312 each
-  313   step sg `TL se.contexts = TL s.contexts`
+  313   step by-subgoal `TL se.contexts = TL s.contexts`
   314   select first solve
   315     step gvs[same_frame_rel_def]
   316   end
@@ -362,7 +362,7 @@ holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml
   359   step simp[Abbr`icc`]
   360   step qmatch_goalsub_abbrev_tac`EL (LENGTH t) (SNOC sn fr)`
   361   each
-  362     step sg `LENGTH fr = LENGTH t`
+  362     step by-subgoal `LENGTH fr = LENGTH t`
   363     select first solve
   364       step simp[Abbr`fr`]
   365     end
@@ -371,7 +371,7 @@ holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml
   368   step simp[EL_LENGTH_SNOC,Abbr`sn`]
   369   step gvs[Abbr`fr`]
   370   each
-  371     step sg `SND h = SND h'`
+  371     step by-subgoal `SND h = SND h'`
   372     select first solve
   373       step qpat_x_assum`same_frame_rel s se`mp_tac
   374       step simp[same_frame_rel_def]
@@ -434,7 +434,7 @@ holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml
   430 step gvs[]
   431 step rpt strip_tac
   432 each
-  433   step sg `i < LENGTH se.contexts`
+  433   step by-subgoal `i < LENGTH se.contexts`
   434   select first solve
   435     step gvs[same_frame_rel_def]
   436   end
@@ -473,7 +473,7 @@ holbuild proof-ir plan ATheory:step_create_push_structure source=src/AScript.sml
   469 end
   470 step Cases_on`i = LENGTH s.contexts - 1`
   471 select first solve
-  472   step sg `i = LENGTH (FRONT se.contexts)`
+  472   step by-subgoal `i = LENGTH (FRONT se.contexts)`
   473   select first solve
   474     step simp[LENGTH_FRONT]
   475   end

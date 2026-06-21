@@ -82,6 +82,21 @@ Proof
   CONJ_TAC >| [ACCEPT_TAC TRUTH, ACCEPT_TAC TRUTH]
 QED
 
+Theorem thenl_suffix_each_plan:
+  (T /\ T) /\ (T /\ T)
+Proof
+  CONJ_TAC >>
+  (CONJ_TAC >| [ALL_TAC, ALL_TAC])
+QED
+
+Theorem by_wildcard_eq_plan:
+  T
+Proof
+  `T = T` by REFL_TAC >>
+  `_ = T` by REFL_TAC >>
+  ACCEPT_TAC TRUTH
+QED
+
 Theorem by_sugar_plan:
   T
 Proof
@@ -197,9 +212,38 @@ holbuild proof-ir plan BranchTheory:thenl_cases_plan source=src/BranchScript.sml
   06 end
 EXPECTED
 
+check_plan thenl_suffix_each_plan <<'EXPECTED'
+holbuild proof-ir plan BranchTheory:thenl_suffix_each_plan source=src/BranchScript.sml (10 steps)
+  00 step CONJ_TAC
+  01 each
+  02   step CONJ_TAC
+  03   cases
+  04     case 1
+  05       step ALL_TAC
+  06     case 2
+  07       step ALL_TAC
+  08   end
+  09 end
+EXPECTED
+
+check_plan by_wildcard_eq_plan <<'EXPECTED'
+holbuild proof-ir plan BranchTheory:by_wildcard_eq_plan source=src/BranchScript.sml (11 steps)
+  00 step by-subgoal `T = T`
+  01 select first solve
+  02   step REFL_TAC
+  03 end
+  04 each
+  05   step by-subgoal `_ = T`
+  06   select first solve
+  07     step REFL_TAC
+  08   end
+  09 end
+  10 step ACCEPT_TAC TRUTH
+EXPECTED
+
 check_plan by_sugar_plan <<'EXPECTED'
 holbuild proof-ir plan BranchTheory:by_sugar_plan source=src/BranchScript.sml (4 steps)
-  00 step sg `T`
+  00 step by-subgoal `T`
   01 select first solve
   02   step ACCEPT_TAC TRUTH
   03 end

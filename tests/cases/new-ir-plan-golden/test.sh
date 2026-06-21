@@ -341,7 +341,7 @@ check_plan suffix_by_plan <<'EXPECTED'
 holbuild proof-ir plan ATheory:suffix_by_plan source=src/AScript.sml (8 steps)
   00 step ALL_TAC
   01 each
-  02   step sg `T`
+  02   step by-subgoal `T`
   03   select first solve
   04     step ACCEPT_TAC TRUTH
   05   end
@@ -363,7 +363,7 @@ check_plan nested_branch_by_plan <<'EXPECTED'
 holbuild proof-ir plan ATheory:nested_branch_by_plan source=src/AScript.sml (15 steps)
   00 step CONJ_TAC
   01 select first solve
-  02   step sg `T`
+  02   step by-subgoal `T`
   03   select first solve
   04     step ACCEPT_TAC TRUTH
   05   end
