@@ -34,7 +34,9 @@ val successful_frames_ref = ref ([] : structural_frame list)
 val resume_frames_ref = ref ([] : structural_frame list)
 val successful_branch_tail_counts_ref = ref ([] : int list)
 type leaf_snapshot = {count : int, prefix_end : int, path : HolbuildProofIr.proof_path,
-                      focus : int list, sig_text : string * string}
+                      focus : int list, frames : structural_frame list,
+                      events : HolbuildProofIr.dynamic_event list,
+                      sig_text : string * string}
 val successful_leaf_snapshots_ref = ref ([] : leaf_snapshot list)
 (* Frame stacks are stored innermost-first, matching current_frames_ref push/pop order.
    Dynamic events are accumulated newest-first internally; metadata stores them in
@@ -309,9 +311,16 @@ fun step_at_path plan target =
 fun step_signature_text step =
   HolbuildProofIr.step_kind step ^ "\t" ^ String.toString (HolbuildProofIr.step_program step)
 
-fun leaf_snapshot_text ({count, prefix_end, path, focus, sig_text = (kind, program)} : leaf_snapshot) =
+fun encode_metadata_list xs = String.toString (String.concatWith "|" xs)
+fun decode_metadata_list text =
+  Option.map (fn decoded => if decoded = "" then [] else String.fields (fn c => c = #"|") decoded)
+             (String.fromString text)
+
+fun leaf_snapshot_text ({count, prefix_end, path, focus, frames, events, sig_text = (kind, program)} : leaf_snapshot) =
   String.concat [Int.toString count, "\t", Int.toString prefix_end, "\t",
                  path_text path, "\t", int_list_text focus, "\t",
+                 encode_metadata_list (map structural_frame_text frames), "\t",
+                 encode_metadata_list (map dynamic_event_text events), "\t",
                  kind, "\t", String.toString program]
 
 fun parse_step_signature_text text =
@@ -321,13 +330,39 @@ fun parse_step_signature_text text =
 
 fun parse_leaf_snapshot_text text =
   case String.fields (fn c => c = #"\t") text of
-      count_text :: end_text :: path_text' :: focus_text :: kind :: rest =>
+      count_text :: end_text :: path_text' :: focus_text :: frames_text :: events_text :: kind :: rest =>
+        (case (strict_positive_int count_text, strict_nonnegative_int end_text,
+               parse_path_text path_text', parse_int_list_text focus_text,
+               decode_metadata_list frames_text, decode_metadata_list events_text,
+               String.fromString (String.concatWith "\t" rest)) of
+             (SOME count, SOME prefix_end, SOME path, SOME focus, SOME frame_texts, SOME event_texts, SOME program) =>
+               let
+                 fun parse_frames [] acc = SOME (rev acc)
+                   | parse_frames (frame_text :: more) acc =
+                       (case parse_structural_frame_text frame_text of
+                            SOME frame => parse_frames more (frame :: acc)
+                          | NONE => NONE)
+                 fun parse_events [] acc = SOME (rev acc)
+                   | parse_events (event_text :: more) acc =
+                       (case parse_dynamic_event_text event_text of
+                            SOME event => parse_events more (event :: acc)
+                          | NONE => NONE)
+               in
+                 case (parse_frames frame_texts [], parse_events event_texts []) of
+                     (SOME frames, SOME events) =>
+                       SOME ({count = count, prefix_end = prefix_end, path = path,
+                              focus = focus, frames = frames, events = events,
+                              sig_text = (kind, program)} : leaf_snapshot)
+                   | _ => NONE
+               end
+           | _ => NONE)
+    | count_text :: end_text :: path_text' :: focus_text :: kind :: rest =>
         (case (strict_positive_int count_text, strict_nonnegative_int end_text,
                parse_path_text path_text', parse_int_list_text focus_text,
                String.fromString (String.concatWith "\t" rest)) of
              (SOME count, SOME prefix_end, SOME path, SOME focus, SOME program) =>
                SOME ({count = count, prefix_end = prefix_end, path = path,
-                      focus = focus, sig_text = (kind, program)} : leaf_snapshot)
+                      focus = focus, frames = [], events = [], sig_text = (kind, program)} : leaf_snapshot)
            | _ => NONE)
     | _ => NONE
 
@@ -1003,7 +1038,10 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
         successful_frames_ref := !current_frames_ref;
         successful_branch_tail_counts_ref := !branch_tail_count_ref;
         successful_leaf_snapshots_ref := {count = count, prefix_end = prefix_end, path = path,
-                                          focus = !branch_tail_count_ref, sig_text = sig_text} ::
+                                          focus = !branch_tail_count_ref,
+                                          frames = !current_frames_ref,
+                                          events = rev (!dynamic_events_ref),
+                                          sig_text = sig_text} ::
                                          !successful_leaf_snapshots_ref
       end
     fun run_list _ _ _ [] = ()
@@ -1506,10 +1544,10 @@ fun salvage_failed_prefix_metadata plan metadata =
           SOME step => SOME (HolbuildProofIr.step_kind step, HolbuildProofIr.step_program step,
                              HolbuildProofIr.step_end step)
         | NONE => NONE
-    fun valid_leaf ({count, path, sig_text, ...} : leaf_snapshot) expected_count =
+    fun valid_leaf ({count, prefix_end, path, sig_text, ...} : leaf_snapshot) expected_count =
       count = expected_count andalso
       (case current_signature path of
-           SOME (kind, program, _) => sig_text = (kind, program)
+           SOME (kind, program, current_end) => prefix_end = current_end andalso sig_text = (kind, program)
          | NONE => false)
     fun loop _ [] last = last
       | loop expected (leaf :: rest) last =
@@ -1520,11 +1558,11 @@ fun salvage_failed_prefix_metadata plan metadata =
     case loop 1 leaves NONE of
         NONE => {step_count = 0, prefix_end = 0, path = [], focus = [], leaf_signature = NONE,
                  events = [], frames = [], leaves = leaves}
-      | SOME ({count, path, focus, sig_text, ...} : leaf_snapshot) =>
+      | SOME ({count, path, focus, frames, events, sig_text, ...} : leaf_snapshot) =>
           (case current_signature path of
                SOME (_, _, current_end) =>
                  {step_count = count, prefix_end = current_end, path = path, focus = focus,
-                  leaf_signature = SOME sig_text, events = [], frames = [], leaves = leaves}
+                  leaf_signature = SOME sig_text, events = events, frames = frames, leaves = leaves}
              | NONE => {step_count = 0, prefix_end = 0, path = [], focus = [], leaf_signature = NONE,
                          events = [], frames = [], leaves = leaves})
   end

@@ -143,6 +143,7 @@ fun tactic_end (TacThen []) = 0
   | tactic_end (TacAtomic (_, sp)) = span_end sp
 and list_tactic_end (LtThenLT []) = 0
   | list_tactic_end (LtThenLT xs) = list_tactic_end (List.last xs)
+  | list_tactic_end (LtThen (lt, [])) = list_tactic_end lt
   | list_tactic_end (LtThen (_, ts)) = tactic_end (List.last ts)
   | list_tactic_end (LtTacsToLT []) = 0
   | list_tactic_end (LtTacsToLT ts) = tactic_end (List.last ts)
@@ -381,6 +382,7 @@ and list_tactic_program source lt =
   case lt of
       LtThenLT [] => "Tactical.ALL_LT"
     | LtThenLT xs => join_program "Tactical.THEN_LT" (map (list_tactic_program source) xs) "Tactical.ALL_LT"
+    | LtThen (lt, []) => list_tactic_program source lt
     | LtThen (lt, ts) => join_program "Tactical.THEN" (list_tactic_program source lt :: map (tactic_program source) ts) "Tactical.ALL_LT"
     | LtTacsToLT ts => "Tactical.TACS_TO_LT [" ^ String.concatWith ", " (map (tactic_program source) ts) ^ "]"
     | LtNullOk (_, lt) => "Tactical.NULL_OK_LT(" ^ list_tactic_program source lt ^ ")"
@@ -437,6 +439,7 @@ and list_tactic_span lt =
   case lt of
       LtThenLT [] => (0, 0)
     | LtThenLT xs => (#1 (list_tactic_span (hd xs)), #2 (list_tactic_span (List.last xs)))
+    | LtThen (lt, []) => list_tactic_span lt
     | LtThen (lt, ts) => (#1 (list_tactic_span lt), #2 (tactic_span (List.last ts)))
     | LtTacsToLT [] => (0, 0)
     | LtTacsToLT ts => (#1 (tactic_span (hd ts)), #2 (tactic_span (List.last ts)))
