@@ -523,9 +523,16 @@ fun print_finish_goal_state name =
     val old_failed_step_end = !failed_step_end_ref
     val old_failed_step_span = !failed_step_span_ref
     val tactic_end = size (!active_tactic_text_ref)
-    val _ = failed_step_end_ref := SOME tactic_end
-    val _ = failed_step_span_ref := SOME (tactic_end, tactic_end)
-    val result = (print_current_goal_state (name ^ " finish"); true) handle e => (failed_step_end_ref := old_failed_step_end; failed_step_span_ref := old_failed_step_span; raise e)
+    val has_specific_span = Option.isSome old_failed_step_span
+    val _ = if has_specific_span then () else failed_step_end_ref := SOME tactic_end
+    val _ = if has_specific_span then () else failed_step_span_ref := SOME (tactic_end, tactic_end)
+    val label =
+      if has_specific_span then
+        (case !failed_plan_position_ref of
+             SOME (_, _, plan_label) => plan_label
+           | NONE => name ^ " finish")
+      else name ^ " finish"
+    val result = (print_current_goal_state label; true) handle e => (failed_step_end_ref := old_failed_step_end; failed_step_span_ref := old_failed_step_span; raise e)
     val _ = failed_step_end_ref := old_failed_step_end
     val _ = failed_step_span_ref := old_failed_step_span
   in
@@ -987,7 +994,10 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
           case result of
               SOME e => ((if entering_from_resume then () else (pop_branch_tail_count label handle _ => ())); raise e)
             | NONE =>
-                (with_plan_position close_display "end" "end" (HolbuildProofIr.step_end proof_step, HolbuildProofIr.step_end proof_step)
+                (with_plan_position close_display "end" (case mode of HolbuildProofIr.SelectSolve => ">- solved" | _ => "end")
+                   (case mode of
+                        HolbuildProofIr.SelectSolve => (HolbuildProofIr.step_start proof_step, HolbuildProofIr.step_end proof_step)
+                      | _ => (HolbuildProofIr.step_end proof_step, HolbuildProofIr.step_end proof_step))
                    (fn () => close_focus label mode);
                  d + HolbuildProofIr.display_line_count proof_step)
         end)
