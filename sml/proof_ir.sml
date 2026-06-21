@@ -174,6 +174,11 @@ and list_tactic_end (LtThenLT []) = 0
 fun atomic e = TacAtomic (precedence e, span e)
 fun list_atomic e = LtAtomic (precedence e, span e)
 
+fun tactic_is_identity (TacThen []) = true
+  | tactic_is_identity _ = false
+
+fun drop_identity_tactics ts = List.filter (fn t => not (tactic_is_identity t)) ts
+
 fun parse_tactic_ast e =
   case strip_closed_parens e of
       SOME inner => parse_tactic_ast inner
@@ -310,9 +315,9 @@ and parse_list_tactic_infix left opn right whole =
   case opn of
       ">>>" => LtThenLT (flatten_thenlt left @ flatten_thenlt right)
     | "THEN_LT" => LtThenLT (flatten_thenlt left @ flatten_thenlt right)
-    | ">>" => LtThen (parse_list_tactic_ast left, flatten_then right)
-    | "\\\\" => LtThen (parse_list_tactic_ast left, flatten_then right)
-    | "THEN" => LtThen (parse_list_tactic_ast left, flatten_then right)
+    | ">>" => LtThen (parse_list_tactic_ast left, drop_identity_tactics (flatten_then right))
+    | "\\\\" => LtThen (parse_list_tactic_ast left, drop_identity_tactics (flatten_then right))
+    | "THEN" => LtThen (parse_list_tactic_ast left, drop_identity_tactics (flatten_then right))
     | "ORELSE_LT" => LtOrelse (flatten_orelse_lt left @ flatten_orelse_lt right)
     | _ => list_atomic whole
 and flatten_thenlt e =
