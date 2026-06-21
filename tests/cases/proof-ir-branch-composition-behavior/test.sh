@@ -131,6 +131,17 @@ Proof
   ACCEPT_TAC TRUTH
 QED
 
+Theorem by_wildcard_eq_chain_finisher_success:
+  1 + 1 = SUC 1
+Proof
+  `1 + 1 = 2` by EVAL_TAC >>
+  `_ = SUC 1` by EVAL_TAC >>
+  (fn g as (asl, _) =>
+     if length asl = 1 then ALL_TAC g
+     else FAIL_TAC "by chain should leave exactly one assumption" g) >>
+  pop_assum ACCEPT_TAC
+QED
+
 Theorem each_preserve_residual_order_success:
   (T /\ (0 = 0)) /\ ((1 = 1) /\ T)
 Proof
