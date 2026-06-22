@@ -30,6 +30,11 @@ jobs:
       - uses: ./.github/actions/setup-polyml
         id: polyml
 
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y inotify-tools
+
       - name: Configure holbuild test cache
         run: echo "HOLBUILD_CACHE=$HOME/.cache/holbuild" >> "$GITHUB_ENV"
 

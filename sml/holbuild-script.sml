@@ -56,6 +56,7 @@ use "sml/cache.sml";
 use "sml/build_exec.sml";
 use "sml/tactic_timeout_policy.sml";
 use "sml/proof_ir_types.sml";
+use "sml/watch.sml";
 use "sml/commands.sml";
 
 fun main () = HolbuildCommands.main (CommandLine.arguments())

@@ -696,6 +696,7 @@ fun dependency_name (Dependency {name, ...}) = name
 
 fun package_name (Package {name, ...}) = name
 fun package_root (Package {root, ...}) = root
+fun package_manifest (Package {manifest, ...}) = manifest
 fun package_members (Package {members, ...}) = members
 fun package_excludes (Package {excludes, ...}) = excludes
 fun package_roots (Package {roots, ...}) = roots
