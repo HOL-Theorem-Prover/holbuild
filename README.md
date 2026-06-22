@@ -134,6 +134,7 @@ holbuild context
 holbuild build
 holbuild build MyTheory
 holbuild build --dry-run MyTheory
+holbuild build --watch MyTheory
 holbuild clean MyTheory
 holbuild execution-plan MyTheory:my_theorem
 holbuild heap main
@@ -156,6 +157,11 @@ holbuild clean MyTheory && holbuild build --no-cache MyTheory
 holbuild build --tactic-timeout 5 MyTheory
 holbuild --json build MyTheory
 ```
+
+`holbuild build --watch MyTheory` runs an initial build, then watches project
+inputs with `inotifywait` and rebuilds after changes. Watch mode currently
+requires `inotifywait` from `inotify-tools` and does not support `--json`,
+`--dry-run`, or `--repl-on-failure`.
 
 `holbuild clean MyTheory` removes project-local generated artifacts, dependency
 metadata, and checkpoints for the named theory target. This is primarily a
