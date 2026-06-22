@@ -27,7 +27,7 @@ uninstall:
 	rm -f "$(DESTDIR)$(BINDIR)/holbuild"
 
 test: bin/holbuild
-	HOLDIR="$(HOLDIR)" tests/run.sh
+	HOLDIR="$(HOLDIR)" tests/run.sh $(TESTS)
 
 clean:
 	rm -f bin/holbuild

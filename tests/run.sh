@@ -277,9 +277,34 @@ wait_all() {
   done
 }
 
+declare -a selected_test_scripts=()
+declare -a selected_test_names=()
+
+if [[ $# -gt 0 ]]; then
+  for name in "$@"; do
+    test_script="$ROOT/tests/cases/$name/test.sh"
+    if [[ ! -f "$test_script" ]]; then
+      echo "unknown test case: $name" >&2
+      echo "available test cases:" >&2
+      for case_dir in "$ROOT"/tests/cases/*; do
+        [[ -f "$case_dir/test.sh" ]] && echo "  $(basename "$case_dir")" >&2
+      done
+      exit 2
+    fi
+    selected_test_scripts+=("$test_script")
+    selected_test_names+=("$name")
+  done
+else
+  for test_script in "$ROOT"/tests/cases/*/test.sh; do
+    selected_test_scripts+=("$test_script")
+    selected_test_names+=("$(basename "$(dirname "$test_script")")")
+  done
+fi
+
 selected_count=0
-for test_script in "$ROOT"/tests/cases/*/test.sh; do
-  name=$(basename "$(dirname "$test_script")")
+for i in "${!selected_test_scripts[@]}"; do
+  test_script=${selected_test_scripts[$i]}
+  name=${selected_test_names[$i]}
   selected_count=$((selected_count + 1))
   start_case "$test_script" "$name"
   if [[ ${#running_pids[@]} -ge "$HOLBUILD_TEST_JOBS" ]]; then
