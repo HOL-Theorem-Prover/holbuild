@@ -1,0 +1,63 @@
+name: 'Setup tracing Poly/ML'
+description: 'Builds/restores the Poly/ML fork required by HOL --trknl and exposes its poly executable'
+
+inputs:
+  polyml-repo:
+    description: 'Poly/ML fork repository to use'
+    required: false
+    default: 'https://github.com/digama0/polyml.git'
+  polyml-ref:
+    description: 'Poly/ML fork ref to use'
+    required: false
+    default: 'refs/heads/exportSmall'
+
+outputs:
+  polyml-rev:
+    description: 'Resolved tracing Poly/ML git revision'
+    value: ${{ steps.version.outputs.polyml-rev }}
+  polyml-bin:
+    description: 'Path to the tracing Poly/ML poly executable'
+    value: ${{ steps.paths.outputs.polyml-bin }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Resolve tracing Poly/ML version
+      id: version
+      shell: bash
+      env:
+        POLYML_REPO: ${{ inputs.polyml-repo }}
+        POLYML_REF: ${{ inputs.polyml-ref }}
+      run: |
+        rev=$(git ls-remote "$POLYML_REPO" "$POLYML_REF" | cut -f1)
+        if [[ -z "$rev" ]]; then
+          echo "Could not resolve tracing Poly/ML ref: $POLYML_REPO $POLYML_REF" >&2
+          exit 1
+        fi
+        echo "polyml-rev=$rev" >> "$GITHUB_OUTPUT"
+
+    - name: Cache tracing Poly/ML
+      uses: actions/cache@v5
+      id: cache-polyml
+      with:
+        path: ~/polyml-trknl-install
+        key: polyml-trknl-${{ runner.os }}-${{ steps.version.outputs.polyml-rev }}
+
+    - name: Build tracing Poly/ML
+      if: steps.cache-polyml.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        POLYML_REPO: ${{ inputs.polyml-repo }}
+        POLYML_REV: ${{ steps.version.outputs.polyml-rev }}
+      run: |
+        git clone "$POLYML_REPO" polyml-trknl
+        cd polyml-trknl
+        git checkout --detach "$POLYML_REV"
+        ./configure --prefix="$HOME/polyml-trknl-install"
+        make
+        make install
+
+    - name: Expose tracing Poly/ML path
+      id: paths
+      shell: bash
+      run: echo "polyml-bin=$HOME/polyml-trknl-install/bin/poly" >> "$GITHUB_OUTPUT"

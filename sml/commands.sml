@@ -87,7 +87,7 @@ fun buildhol_help () = print
   \  holbuild [GLOBAL OPTIONS] buildhol [--trknl]\n\n\
   \Build/reuse the declared HOL tree and print its path.\n\n\
   \Options:\n\
-  \  --trknl    Build/reuse HOL with the tracing kernel\n\n\
+  \  --trknl    Build/reuse HOL with the tracing kernel; requires a tracing-capable Poly/ML (set HOLBUILD_POLY)\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun heap_help () = print

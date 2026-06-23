@@ -12,6 +12,15 @@ cleanup() { rm -rf "$tmpdir"; }
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
+if [[ -z "${HOLBUILD_TRKNL_POLY:-}" ]]; then
+  echo "SKIP trknl: HOLBUILD_TRKNL_POLY is not set"
+  exit 0
+fi
+
+trknl_holbuild() {
+  HOLBUILD_POLY="$HOLBUILD_TRKNL_POLY" "$HOLBUILD_BIN" "$@"
+}
+
 project=$tmpdir/project
 mkdir -p "$project/src"
 cat > "$project/holproject.toml" <<TOML
@@ -33,7 +42,7 @@ trace="$project/.holbuild/obj/src/ATheory.tr.gz"
 remapped="$project/.holbuild/obj/src/.hol/objs/ATheory.tr.gz"
 
 first_log=$tmpdir/first.log
-(cd "$project" && "$HOLBUILD_BIN" build --trknl ATheory) > "$first_log" 2>&1
+(cd "$project" && trknl_holbuild build --trknl ATheory) > "$first_log" 2>&1
 require_file "$trace"
 require_file "$remapped"
 if [[ ! -s "$trace" ]]; then
@@ -42,12 +51,12 @@ if [[ ! -s "$trace" ]]; then
 fi
 
 second_log=$tmpdir/second.log
-(cd "$project" && "$HOLBUILD_BIN" --verbose build --trknl ATheory) > "$second_log" 2>&1
+(cd "$project" && trknl_holbuild --verbose build --trknl ATheory) > "$second_log" 2>&1
 require_grep "ATheory is up to date" "$second_log"
 
 rm -f "$trace" "$remapped"
 missing_trace_log=$tmpdir/missing-trace.log
-(cd "$project" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" build --trknl ATheory) > "$missing_trace_log" 2>&1
+(cd "$project" && HOLBUILD_CACHE_TRACE=1 trknl_holbuild build --trknl ATheory) > "$missing_trace_log" 2>&1
 require_file "$trace"
 require_file "$remapped"
 if ! grep -q "ATheory restored from cache\|ATheory built" "$missing_trace_log"; then

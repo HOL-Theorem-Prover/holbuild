@@ -133,6 +133,18 @@ To build that HOL toolchain ahead of time, for example in CI, run:
 holbuild buildhol
 ```
 
+Proof-tracing builds use HOL's tracing kernel:
+
+```sh
+holbuild buildhol --trknl
+holbuild build --trknl MyTheory
+```
+
+`--trknl` requires a Poly/ML build with tracing-kernel support. Set
+`HOLBUILD_POLY=/path/to/poly` when warming or using the traced toolchain. Traced
+HOL toolchains are cached separately from ordinary HOL toolchains, and traced
+project builds track `.tr.gz` theory outputs.
+
 ## Common commands
 
 `build` is the default command, so it can usually be omitted:
