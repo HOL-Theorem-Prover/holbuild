@@ -47,6 +47,7 @@ key_material() {
   printf 'rev=%s\n' "$rev"
   printf 'poly=%s\n' "$poly"
   printf 'poly_version=%s\n' "$poly_version"
+  printf 'kernel_variant=stdknl\n'
   printf 'build_args=--no-helpdocs\n'
 }
 
