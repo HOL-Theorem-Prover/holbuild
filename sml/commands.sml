@@ -12,30 +12,140 @@ fun err msg = err_with_debug_artifacts msg HolbuildStatus.no_debug_artifacts
 
 fun warn msg = HolbuildStatus.message_stderr ("holbuild: warning: " ^ msg ^ "\n")
 
-fun usage () = print
+fun global_help () = print
   "holbuild: experimental project-aware build frontend for HOL4\n\n\
   \Usage:\n\
-  \  holbuild --version\n\
-  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--cache-dir PATH] [--maxheap MB] [-jN] context\n\
-  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--cache-dir PATH] [--maxheap MB] [-jN] execution-plan THEORY:THEOREM\n\
-  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--cache-dir PATH] [--maxheap MB] [-jN] build [--watch] [--dry-run] [--force[=theory|project|full]] [--no-cache] [--skip-checkpoints] [--skip-proof-steps] [--tactic-timeout SECONDS] [--trace-steps] [--repl-on-failure] [--retain-debug-artifacts] [--warn-unreachable] [TARGET ...]\n\
-  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--cache-dir PATH] clean THEORY...\n\
-  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--cache-dir PATH] [--maxheap MB] [-jN] heap NAME\n\
-  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--cache-dir PATH] [--maxheap MB] run [ARG ...]\n\
-  \  holbuild [--json] [--quiet|--verbose|--verbosity LEVEL] [--source-dir PATH] [--cache-dir PATH] [--maxheap MB] repl [ARG ...]\n\
-  \  holbuild [--source-dir PATH] [--cache-dir PATH] buildhol\n\
-  \  holbuild [--cache-dir PATH] gc [--retention-days DAYS] [--max-checkpoints-gb GB] [--clean-only|--cache-only]\n\n\
-  \Projects must use schema 2 and declare dependencies.hol. Commands that need HOL\n\
-  \build/reuse the declared HOL tree in the global cache. --holdir/HOLDIR are no\n\
-  \longer supported.\n\
-  \Project sources are found from --source-dir, HOLBUILD_SOURCE_DIR, or cwd.\n\
-  \--cache-dir overrides HOLBUILD_CACHE/XDG_CACHE_HOME/HOME for the global cache.\n\
-  \-j/--jobs controls build parallelism. Default is .holconfig.toml [build].jobs,\n\
-  \or max(1, detected processor count / 2). --maxheap/--max-heap passes Poly/ML\n\
-  \maximum heap size in MB to child HOL processes. --json emits newline-delimited\n\
-  \JSON for build status, messages, and errors. Non-TTY normal output suppresses\n\
-  \unchanged node lines; --verbose logs node starts, all finishes, and per-node\n\
-  \elapsed times; --quiet suppresses per-node success lines.\n"
+  \  holbuild [GLOBAL OPTIONS] [build] [TARGET ...]\n\
+  \  holbuild [GLOBAL OPTIONS] COMMAND [ARGS]\n\
+  \  holbuild --version\n\n\
+  \Primary command:\n\
+  \  [build] [TARGET ...]        Build project targets\n\n\
+  \Project interaction:\n\
+  \  repl [ARG ...]              Start HOL REPL with project context\n\
+  \  run [ARG ...]               Run HOL with project context\n\
+  \  context                     Show resolved project context\n\n\
+  \Inspection and advanced commands:\n\
+  \  execution-plan T:THM        Inspect proof-step execution plan\n\
+  \  buildhol                    Build/reuse declared HOL and print its path\n\
+  \  heap NAME                   Build a configured heap\n\
+  \  clean THEORY...             Remove local build outputs\n\
+  \  gc                          Remove stale project/cache state\n\n\
+  \Global options:\n\
+  \  --source-dir PATH\n\
+  \  --cache-dir PATH\n\
+  \  --json\n\
+  \  --quiet, --verbose, --verbosity LEVEL\n\
+  \  -j N, -jN, --jobs N\n\
+  \  --maxheap MB, --max-heap MB\n\n\
+  \Use `holbuild COMMAND --help` for command-specific help.\n"
+
+fun build_help () = print
+  "Usage:\n\
+  \  holbuild [GLOBAL OPTIONS] [build] [OPTIONS] [TARGET ...]\n\n\
+  \Build project targets. With no TARGET, build the project's default targets.\n\n\
+  \Options:\n\
+  \  --watch\n\
+  \  --dry-run\n\
+  \  --force[=theory|project|full]\n\
+  \  --no-cache\n\
+  \  --skip-checkpoints\n\
+  \  --skip-proof-steps\n\
+  \  --tactic-timeout SECONDS\n\
+  \  --trace-steps\n\
+  \  --repl-on-failure\n\
+  \  --retain-debug-artifacts\n\
+  \  --warn-unreachable\n\n\
+  \Global options: see `holbuild --help`.\n"
+
+fun context_help () = print
+  "Usage:\n\
+  \  holbuild [GLOBAL OPTIONS] context\n\n\
+  \Show resolved project context.\n\n\
+  \Global options: see `holbuild --help`.\n"
+
+fun repl_help () = print
+  "Usage:\n\
+  \  holbuild [GLOBAL OPTIONS] repl [ARG ...]\n\n\
+  \Start HOL REPL with project context. Extra arguments are passed to HOL.\n\n\
+  \Global options: see `holbuild --help`.\n"
+
+fun run_help () = print
+  "Usage:\n\
+  \  holbuild [GLOBAL OPTIONS] run [ARG ...]\n\n\
+  \Run HOL with project context. Extra arguments are passed to HOL.\n\n\
+  \Global options: see `holbuild --help`.\n"
+
+fun execution_plan_help () = print
+  "Usage:\n\
+  \  holbuild [GLOBAL OPTIONS] execution-plan THEORY:THEOREM\n\n\
+  \Inspect the proof-step execution plan for a theorem.\n\n\
+  \Global options: see `holbuild --help`.\n"
+
+fun buildhol_help () = print
+  "Usage:\n\
+  \  holbuild [GLOBAL OPTIONS] buildhol\n\n\
+  \Build/reuse the declared HOL tree and print its path.\n\n\
+  \Global options: see `holbuild --help`.\n"
+
+fun heap_help () = print
+  "Usage:\n\
+  \  holbuild [GLOBAL OPTIONS] heap NAME\n\n\
+  \Build a configured heap.\n\n\
+  \Global options: see `holbuild --help`.\n"
+
+fun clean_help () = print
+  "Usage:\n\
+  \  holbuild [GLOBAL OPTIONS] clean THEORY...\n\n\
+  \Remove local build outputs for theories. Subsequent builds may restore outputs\n\
+  \from the global cache.\n\n\
+  \Global options: see `holbuild --help`.\n"
+
+fun gc_help () = print
+  "Usage:\n\
+  \  holbuild [GLOBAL OPTIONS] gc [OPTIONS]\n\n\
+  \Remove stale project/cache state.\n\n\
+  \Options:\n\
+  \  --retention-days DAYS\n\
+  \  --max-checkpoints-gb GB\n\
+  \  --clean-only\n\
+  \  --cache-only\n\n\
+  \Global options: see `holbuild --help`.\n"
+
+fun cache_help () = print
+  "`holbuild cache gc` is deprecated; use `holbuild gc --cache-only`.\n"
+
+fun help_arg arg = arg = "--help" orelse arg = "-h"
+fun has_help_arg args = List.exists help_arg args
+
+fun known_command command =
+  command = "build" orelse command = "context" orelse command = "repl" orelse
+  command = "run" orelse command = "execution-plan" orelse command = "buildhol" orelse
+  command = "heap" orelse command = "clean" orelse command = "gc" orelse
+  command = "cache" orelse command = "goalfrag-plan"
+
+fun command_help command =
+  case command of
+      "build" => build_help ()
+    | "context" => context_help ()
+    | "repl" => repl_help ()
+    | "run" => run_help ()
+    | "execution-plan" => execution_plan_help ()
+    | "buildhol" => buildhol_help ()
+    | "heap" => heap_help ()
+    | "clean" => clean_help ()
+    | "gc" => gc_help ()
+    | "cache" => cache_help ()
+    | "goalfrag-plan" => raise Error "goalfrag-plan has been removed; use execution-plan THEORY:THEOREM"
+    | _ => raise Error ("unknown command: " ^ command)
+
+fun maybe_handle_command_help args =
+  case args of
+      [] => false
+    | command :: rest =>
+        if has_help_arg rest then
+          if known_command command then (command_help command; true)
+          else raise Error ("unknown command: " ^ command)
+        else false
 
 fun nonnegative_real label text =
   case Real.fromString text of
@@ -731,7 +841,7 @@ fun reject_json command =
 
 fun dispatch tc jobs args =
   case args of
-      [] => (reject_json "context"; context ())
+      [] => build tc jobs []
     | "context" :: [] => (reject_json "context"; context ())
     | "execution-plan" :: rest => (reject_json "execution-plan"; execution_plan_command tc rest)
     | "goalfrag-plan" :: rest => removed_legacy_plan_command tc rest
@@ -741,7 +851,8 @@ fun dispatch tc jobs args =
     | "heap" :: _ => raise Error "usage: holbuild heap NAME"
     | "run" :: rest => (reject_json "run"; run_hol tc "run" rest)
     | "repl" :: rest => (reject_json "repl"; repl_hol tc rest)
-    | cmd :: _ => raise Error ("unknown command: " ^ cmd)
+    | cmd :: _ => if known_command cmd then raise Error ("unknown command: " ^ cmd)
+                  else build tc jobs args
 
 fun parse_gc_args args =
   let
@@ -841,11 +952,15 @@ fun dispatch_with_options {holdir, source_dir, cache_dir, jobs, maxheap, json, v
    HolbuildStatus.set_retain_debug_artifacts false;
    Option.app HolbuildProject.set_source_dir source_dir;
    Option.app HolbuildCacheConfig.set_cache_root cache_dir;
+   if args = ["--help"] orelse args = ["-h"] then global_help ()
+   else if maybe_handle_command_help args then () else
    case args of
        "gc" :: rest => (reject_json "gc"; gc rest)
      | "cache" :: rest => (reject_json "cache"; HolbuildCache.dispatch rest)
      | "buildhol" :: [] => buildhol holdir maxheap
+     | "buildhol" :: _ => raise Error "usage: holbuild buildhol"
      | "goalfrag-plan" :: _ => raise Error "goalfrag-plan has been removed; use execution-plan THEORY:THEOREM"
+     | [] => dispatch (effective_toolchain holdir maxheap) jobs args
      | "build" :: rest =>
          if List.exists removed_legacy_proof_step_build_arg rest then
            (case List.find removed_legacy_proof_step_build_arg rest of
@@ -855,7 +970,6 @@ fun dispatch_with_options {holdir, source_dir, cache_dir, jobs, maxheap, json, v
          else if json andalso List.exists trace_steps_build_arg rest then
            raise Error "--json does not support --trace-steps until structured proof-step trace events exist"
          else dispatch (effective_toolchain holdir maxheap) jobs args
-     | [] => dispatch (context_toolchain holdir maxheap) jobs args
      | "context" :: _ => dispatch (context_toolchain holdir maxheap) jobs args
      | _ => dispatch (effective_toolchain holdir maxheap) jobs args)
 
@@ -878,8 +992,8 @@ fun main raw_args =
      val _ =
        if raw_args = ["--version"] then
          (print ("holbuild " ^ HolbuildVersion.version ^ "\n"); OS.Process.exit OS.Process.success)
-       else if List.exists (fn s => s = "--help" orelse s = "-h" orelse s = "help") raw_args
-       then (usage (); OS.Process.exit OS.Process.success)
+       else if raw_args = ["--help"] orelse raw_args = ["-h"]
+       then (global_help (); OS.Process.exit OS.Process.success)
        else ()
      val (options, args) = parse_global_options raw_args
    in

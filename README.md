@@ -80,18 +80,25 @@ roots = ["src/ExampleScript.sml"]
 Then run:
 
 ```sh
-holbuild context
-holbuild build
+holbuild
 ```
 
-`holbuild context` shows how the project is resolved. `holbuild build` builds
-the default roots. You can also build a specific logical target:
+With no explicit command, `holbuild` builds the default roots. You can also build
+a specific logical target:
 
 ```sh
-holbuild build ExampleTheory
+holbuild ExampleTheory
 ```
 
-The target is the logical theory/module name, not an object filename.
+The target is the logical theory/module name, not an object filename. The
+explicit `build` command remains accepted, for example `holbuild build` and
+`holbuild build ExampleTheory`.
+
+To inspect how the project is resolved, run:
+
+```sh
+holbuild context
+```
 
 ## How HOL is selected
 
@@ -128,35 +135,63 @@ holbuild buildhol
 
 ## Common commands
 
+`build` is the default command, so it can usually be omitted:
+
+```sh
+holbuild                 # build default roots
+holbuild MyTheory        # build one logical target
+holbuild build MyTheory  # equivalent explicit form
+```
+
+Other useful commands:
+
 ```sh
 holbuild --version
-holbuild context
-holbuild build
-holbuild build MyTheory
-holbuild build --dry-run MyTheory
-holbuild build --watch MyTheory
-holbuild clean MyTheory
-holbuild execution-plan MyTheory:my_theorem
-holbuild heap main
-holbuild run script.sml
+holbuild --help
 holbuild repl
+holbuild run script.sml
+holbuild context
+holbuild execution-plan MyTheory:my_theorem
 holbuild buildhol
+holbuild heap main
+holbuild clean MyTheory
 holbuild gc
 ```
 
-Common options:
+Global options go before the command, or before the target list when using the
+default build command:
 
 ```sh
-holbuild -j4 build MyTheory
-holbuild --maxheap 4096 build MyTheory
-holbuild --source-dir /path/to/project build MyTheory
-holbuild --cache-dir /path/to/cache build MyTheory
-holbuild build --force=project MyTheory
-holbuild build --no-cache MyTheory
-holbuild clean MyTheory && holbuild build --no-cache MyTheory
-holbuild build --tactic-timeout 5 MyTheory
-holbuild --json build MyTheory
+holbuild -j4 MyTheory
+holbuild --maxheap 4096 MyTheory
+holbuild --source-dir /path/to/project MyTheory
+holbuild --cache-dir /path/to/cache MyTheory
+holbuild --json MyTheory
 ```
+
+Build-specific options follow the `build` command. If you omit `build`, put the
+option before the targets:
+
+```sh
+holbuild build --force=project MyTheory
+holbuild --no-cache MyTheory
+holbuild --tactic-timeout 5 MyTheory
+holbuild --watch MyTheory
+holbuild --dry-run MyTheory
+holbuild clean MyTheory && holbuild --no-cache MyTheory
+```
+
+Common global options:
+
+- `--source-dir PATH`: project source directory. Defaults to
+  `HOLBUILD_SOURCE_DIR` or the current working directory.
+- `--cache-dir PATH`: global cache directory. Overrides `HOLBUILD_CACHE` and the
+  platform default cache location.
+- `--json`: emit newline-delimited JSON where supported.
+- `--quiet`, `--verbose`, `--verbosity LEVEL`: adjust status output.
+- `-j N`, `-jN`, `--jobs N`: build parallelism.
+- `--maxheap MB`, `--max-heap MB`: Poly/ML maximum heap size for child HOL
+  processes.
 
 `holbuild build --watch MyTheory` runs an initial build, then watches project
 inputs with `inotifywait` and rebuilds after changes. Watch mode currently
