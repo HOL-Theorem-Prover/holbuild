@@ -4,7 +4,18 @@ struct
 structure Path = OS.Path
 structure FS = OS.FileSys
 
-type t = {holdir : string, maxheap : int option}
+datatype kernel_variant = StandardKernel | TracingKernel
+
+type t = {holdir : string, maxheap : int option, kernel_variant : kernel_variant}
+
+fun kernel_variant_name StandardKernel = "stdknl"
+  | kernel_variant_name TracingKernel = "trknl"
+
+fun kernel_variant_build_args StandardKernel = []
+  | kernel_variant_build_args TracingKernel = ["--trknl"]
+
+fun kernel_variant_tracing TracingKernel = true
+  | kernel_variant_tracing StandardKernel = false
 
 exception Error of string
 
@@ -251,6 +262,7 @@ fun toolchain_key tc =
   hash_text
     (String.concatWith "\n"
        ["holbuild-toolchain-v1",
+        "kernel_variant=" ^ kernel_variant_name (#kernel_variant tc),
         "hol=" ^ file_hash (hol tc),
         "base_state=" ^ file_hash (base_state tc)] ^ "\n")
 

@@ -78,14 +78,19 @@ fun trim text =
 fun poly_command () = Option.getOpt(OS.Process.getEnv "HOLBUILD_POLY", "poly")
 fun poly_version () = trim (command_output (quote (poly_command ()) ^ " -v"))
 
-fun key_material {git, rev} =
+fun build_args_for kernel_variant =
+  String.concatWith " " (build_args :: HolbuildToolchain.kernel_variant_build_args kernel_variant)
+
+fun key_material {git, rev, kernel_variant} =
   let val _ = validate_git git
       val poly = poly_command ()
       val version = poly_version ()
   in
     String.concatWith "\n"
       [format_version, "git=" ^ git, "rev=" ^ rev, "poly=" ^ poly,
-       "poly_version=" ^ version, "build_args=" ^ build_args]
+       "poly_version=" ^ version,
+       "kernel_variant=" ^ HolbuildToolchain.kernel_variant_name kernel_variant,
+       "build_args=" ^ build_args_for kernel_variant]
   end
 
 fun key req = HolbuildHash.string_sha1 (key_material req)
@@ -250,7 +255,7 @@ fun build_entry req k =
        run_in_dir final ("git clone " ^ quote (#git req) ^ " " ^ quote hol);
        run_in_dir hol ("git checkout --detach " ^ quote (#rev req));
        run_in_dir hol (quote (poly_command ()) ^ " --script tools/smart-configure.sml");
-       run_in_dir hol ("bin/build " ^ build_args);
+       run_in_dir hol ("bin/build " ^ build_args_for (#kernel_variant req));
        if built hol then () else die ("HOL build did not produce bin/hol, bin/build, and bin/hol.state in " ^ hol);
        if clean hol then () else die ("HOL build left dirty checkout: " ^ hol ^ "\n" ^ dirty_status hol);
        write_file (manifest_for_key k) (material ^ "\nkey=" ^ k ^ "\n");

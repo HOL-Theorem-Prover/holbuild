@@ -54,7 +54,8 @@ fun build_help () = print
   \  --trace-steps\n\
   \  --repl-on-failure\n\
   \  --retain-debug-artifacts\n\
-  \  --warn-unreachable\n\n\
+  \  --warn-unreachable\n\
+  \  --trknl\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun context_help () = print
@@ -83,8 +84,10 @@ fun execution_plan_help () = print
 
 fun buildhol_help () = print
   "Usage:\n\
-  \  holbuild [GLOBAL OPTIONS] buildhol\n\n\
+  \  holbuild [GLOBAL OPTIONS] buildhol [--trknl]\n\n\
   \Build/reuse the declared HOL tree and print its path.\n\n\
+  \Options:\n\
+  \  --trknl    Build/reuse HOL with the tracing kernel\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun heap_help () = print
@@ -220,6 +223,8 @@ fun split_flags args =
             loop dry watch force use_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure true warn_unreachable xs
         | "--warn-unreachable" :: xs =>
             loop dry watch force use_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts true xs
+        | "--trknl" :: xs =>
+            loop dry watch force use_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
         | "--tactic-timeout" :: seconds :: xs =>
             loop dry watch force use_cache skip_checkpoints proof_steps new_ir (tactic_timeout_value seconds) true execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
         | "--tactic-timeout" :: [] => raise Error "--tactic-timeout requires SECONDS"
@@ -255,7 +260,8 @@ fun has_suffix suffix s =
 
 fun reject_object_target target =
   if has_suffix ".uo" target orelse has_suffix ".ui" target orelse
-     has_suffix ".dat" target orelse has_suffix ".art" target then
+     has_suffix ".dat" target orelse has_suffix ".tr.gz" target orelse
+     has_suffix ".art" target then
     raise Error ("build targets are logical names, not object files: " ^ target)
   else ()
 
@@ -632,7 +638,8 @@ fun build_once tc cli_jobs ({dry_run, watch, force, use_cache, skip_checkpoints,
          else HolbuildTacticTimeoutPolicy.entry_timeouts project index entry_plan (default_tactic_timeout ()),
        execution_plan = execution_plan,
        trace_steps = trace_steps,
-       repl_on_failure = repl_on_failure}
+       repl_on_failure = repl_on_failure,
+       trknl = HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)}
     fun prepare_plan () =
       let
         val index = timed_phase "source.discover" (fn () => HolbuildSourceIndex.discover project)
@@ -906,21 +913,24 @@ fun require_schema2 project =
   if HolbuildProject.schema project = 2 then ()
   else raise Error "only holproject schema 2 is supported"
 
-fun project_hol_holdir project =
+fun project_hol_holdir kernel_variant project =
   (HolbuildProject.packages project;
    case HolbuildProject.resolved_hol_dependency project of
        SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev}, ...}) =>
-         HolbuildHolSharedCache.ensure_built {git = git, rev = rev}
+         HolbuildHolSharedCache.ensure_built {git = git, rev = rev, kernel_variant = kernel_variant}
      | _ => raise Error "schema 2 project has no dependencies.hol")
 
-fun effective_toolchain holdir maxheap =
+fun effective_toolchain_for kernel_variant holdir maxheap =
   let
     val project = load_project ()
     val _ = reject_holdir holdir
     val _ = require_schema2 project
   in
-    {holdir = project_hol_holdir project, maxheap = maxheap}
+    {holdir = project_hol_holdir kernel_variant project, maxheap = maxheap, kernel_variant = kernel_variant}
   end
+
+fun effective_toolchain holdir maxheap = effective_toolchain_for HolbuildToolchain.StandardKernel holdir maxheap
+fun tracing_toolchain holdir maxheap = effective_toolchain_for HolbuildToolchain.TracingKernel holdir maxheap
 
 fun context_toolchain holdir maxheap =
   let
@@ -928,15 +938,22 @@ fun context_toolchain holdir maxheap =
     val _ = reject_holdir holdir
     val _ = require_schema2 project
   in
-    {holdir = "", maxheap = maxheap}
+    {holdir = "", maxheap = maxheap, kernel_variant = HolbuildToolchain.StandardKernel}
   end
 
-fun buildhol holdir maxheap =
+fun parse_buildhol_args args =
+  case args of
+      [] => HolbuildToolchain.StandardKernel
+    | ["--trknl"] => HolbuildToolchain.TracingKernel
+    | _ => raise Error "usage: holbuild buildhol [--trknl]"
+
+fun buildhol holdir maxheap args =
   let
     val project = load_project ()
     val _ = reject_holdir holdir
     val _ = require_schema2 project
-    val holdir = project_hol_holdir project
+    val kernel_variant = parse_buildhol_args args
+    val holdir = project_hol_holdir kernel_variant project
   in
     print (holdir ^ "\n")
   end
@@ -957,8 +974,7 @@ fun dispatch_with_options {holdir, source_dir, cache_dir, jobs, maxheap, json, v
    case args of
        "gc" :: rest => (reject_json "gc"; gc rest)
      | "cache" :: rest => (reject_json "cache"; HolbuildCache.dispatch rest)
-     | "buildhol" :: [] => buildhol holdir maxheap
-     | "buildhol" :: _ => raise Error "usage: holbuild buildhol"
+     | "buildhol" :: rest => buildhol holdir maxheap rest
      | "goalfrag-plan" :: _ => raise Error "goalfrag-plan has been removed; use execution-plan THEORY:THEOREM"
      | [] => dispatch (effective_toolchain holdir maxheap) jobs args
      | "build" :: rest =>
@@ -969,9 +985,12 @@ fun dispatch_with_options {holdir, source_dir, cache_dir, jobs, maxheap, json, v
               | NONE => dispatch (effective_toolchain holdir maxheap) jobs args)
          else if json andalso List.exists trace_steps_build_arg rest then
            raise Error "--json does not support --trace-steps until structured proof-step trace events exist"
+         else if List.exists (fn arg => arg = "--trknl") rest then dispatch (tracing_toolchain holdir maxheap) jobs args
          else dispatch (effective_toolchain holdir maxheap) jobs args
      | "context" :: _ => dispatch (context_toolchain holdir maxheap) jobs args
-     | _ => dispatch (effective_toolchain holdir maxheap) jobs args)
+     | _ =>
+         if List.exists (fn arg => arg = "--trknl") args then dispatch (tracing_toolchain holdir maxheap) jobs args
+         else dispatch (effective_toolchain holdir maxheap) jobs args)
 
 fun is_broken_pipe (IO.Io {cause = OS.SysErr (msg, _), ...}) = msg = "Broken pipe"
   | is_broken_pipe _ = false
