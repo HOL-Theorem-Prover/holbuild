@@ -688,6 +688,9 @@ executing a theory action, then removes them after successful artifact/metadata
 writes: `deps_loaded` after loading resolved dependencies, theorem proof states
 for modern AST `Theorem ... Proof ... QED` declarations, failed-prefix
 proof-navigation state after instrumented proof failures, and a final post-export context.
+The project-local checkpoint budget defaults to 5 GiB and can be configured with
+`.holconfig.toml`'s local `[build].checkpoint_limit_gb`; old checkpoint families
+are evicted when the budget is exceeded.
 `--skip-checkpoints` disables all `.save`/`.ok` creation while still running
 modern theorem proofs through the selected instrumentation runtime. `--skip-proof-steps`
 opts out of theorem instrumentation: with checkpoints still enabled, the build can

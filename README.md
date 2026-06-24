@@ -414,7 +414,9 @@ holbuild --cache-dir /path/to/cache gc --cache-only
 ```
 
 `gc --clean-only` skips the global cache. `gc --cache-only` skips project
-locking/discovery and does not require a HOL toolchain.
+locking/discovery and does not require a HOL toolchain. Project checkpoint GC
+uses `.holconfig.toml`'s `[build].checkpoint_limit_gb` unless overridden with
+`--max-checkpoints-gb`.
 
 ## Local configuration
 
@@ -423,12 +425,15 @@ Local machine settings may go in `.holconfig.toml`:
 ```toml
 [build]
 jobs = 16
+checkpoint_limit_gb = 20
 exclude = ["worktrees/*"]
 tactic_timeout = 10.0
 ```
 
-This is for workstation settings, not dependency overrides. Dependency locations
-belong in `holproject.toml`.
+This is for workstation settings, not dependency overrides. `build.jobs` sets
+local default parallelism, and `build.checkpoint_limit_gb` sets the local
+checkpoint storage budget in GiB; the built-in checkpoint budget default is 5.
+Dependency locations belong in `holproject.toml`.
 
 Unknown fields in recognised `holproject.toml` and `.holconfig.toml` tables are
 errors.

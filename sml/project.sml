@@ -36,7 +36,7 @@ datatype dependency = Dependency of {name : string, source : dependency_source}
 
 datatype override = Override of {name : string, path : string}
 
-datatype local_config = LocalConfig of {overrides : override list, build_excludes : string list, build_jobs : int option, build_tactic_timeout : real option}
+datatype local_config = LocalConfig of {overrides : override list, build_excludes : string list, build_jobs : int option, build_tactic_timeout : real option, checkpoint_limit_gb : int option}
 
 datatype package =
   Package of
@@ -67,6 +67,7 @@ type t =
     local_build_excludes : string list,
     local_build_jobs : int option,
     build_tactic_timeout : real option,
+    checkpoint_limit_gb : int option,
     run_heap : string option,
     run_loads : string list,
     heaps : heap list,
@@ -474,7 +475,7 @@ fun validate_override_table (name, table) =
   require_known_fields ("overrides." ^ name) ["path"] table
 
 fun validate_local_build_table table =
-  require_known_fields ".holconfig.toml build" ["exclude", "jobs", "tactic_timeout"] table
+  require_known_fields ".holconfig.toml build" ["exclude", "jobs", "tactic_timeout", "checkpoint_limit_gb"] table
 
 fun validate_local_config_table table =
   (require_known_fields ".holconfig.toml" ["overrides", "build"] table;
@@ -563,6 +564,11 @@ fun build_tactic_timeout_from_manifest build =
       NONE => NONE
     | SOME t => tactic_timeout_at "build.tactic_timeout" t ["tactic_timeout"]
 
+fun local_checkpoint_limit_gb table =
+  case table_field table ["build"] of
+      NONE => NONE
+    | SOME build => Option.map (positive_int_field ".holconfig.toml build.checkpoint_limit_gb") (int_at build ["checkpoint_limit_gb"])
+
 fun root_tactic_timeouts_from_manifest build =
   case build of
       NONE => []
@@ -592,9 +598,10 @@ fun parse_local_config root =
         LocalConfig {overrides = overrides_at table,
                      build_excludes = local_build_excludes table,
                      build_jobs = local_build_jobs table,
-                     build_tactic_timeout = local_build_tactic_timeout table}
+                     build_tactic_timeout = local_build_tactic_timeout table,
+                     checkpoint_limit_gb = local_checkpoint_limit_gb table}
       end
-    else LocalConfig {overrides = [], build_excludes = [], build_jobs = NONE, build_tactic_timeout = NONE}
+    else LocalConfig {overrides = [], build_excludes = [], build_jobs = NONE, build_tactic_timeout = NONE, checkpoint_limit_gb = NONE}
   end
 
 fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, local_config} =
@@ -608,7 +615,7 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
       case build of
           NONE => default
         | SOME t => Option.getOpt(string_array_field_opt t name, default)
-    val LocalConfig {overrides, build_excludes, build_jobs, build_tactic_timeout} = local_config
+    val LocalConfig {overrides, build_excludes, build_jobs, build_tactic_timeout, checkpoint_limit_gb} = local_config
     val members = package_relative_paths "build.members" (build_strings "members" ["."])
     val excludes = package_relative_paths "build.exclude" (build_strings "exclude" []) @ build_excludes
     val roots = package_relative_paths "build.roots" (build_strings "roots" [])
@@ -642,6 +649,7 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
       local_build_excludes = build_excludes,
       local_build_jobs = build_jobs,
       build_tactic_timeout = case build_tactic_timeout of NONE => manifest_timeout | some => some,
+      checkpoint_limit_gb = checkpoint_limit_gb,
       run_heap = Option.mapPartial (fn t => string_field t "heap") run,
       run_loads = from run (fn t => string_array_field t "loads") [],
       heaps = heaps_at table,
@@ -716,6 +724,7 @@ fun project_hol_dir project =
         SOME (HolbuildHolSharedCache.holdir_for {git = git, rev = rev})
     | _ => NONE
 fun build_roots ({roots, ...} : t) = roots
+fun checkpoint_limit_gb ({checkpoint_limit_gb, ...} : t) = checkpoint_limit_gb
 fun package_action_policies (Package {action_policies, ...}) = action_policies
 
 fun generator_name (Generator {name, ...}) = name
@@ -828,7 +837,8 @@ fun dependency_project (project : t) (dep as Dependency {name, source}) =
                                  local_config = LocalConfig {overrides = #overrides project,
                                                                 build_excludes = #local_build_excludes project,
                                                              build_jobs = #local_build_jobs project,
-                                                             build_tactic_timeout = #build_tactic_timeout project}}
+                                                             build_tactic_timeout = #build_tactic_timeout project,
+                                                             checkpoint_limit_gb = #checkpoint_limit_gb project}}
     val declared_name = #name dep_project
     val _ =
       case declared_name of

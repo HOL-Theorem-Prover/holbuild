@@ -3195,15 +3195,19 @@ fun build_parallel status options tc project base_context plan keys toolchain_ke
     wait_workers ()
   end
 
+fun project_checkpoint_limit_gb project =
+  Option.getOpt(HolbuildProject.checkpoint_limit_gb project, default_max_checkpoints_gb)
+
 fun enforce_checkpoint_budget project =
   let
-    val max_bytes = gb_to_bytes default_max_checkpoints_gb
+    val checkpoint_limit_gb = project_checkpoint_limit_gb project
+    val max_bytes = gb_to_bytes checkpoint_limit_gb
     val eviction = evict_oldest_checkpoints_with_stats (project_state_dir project "checkpoints") max_bytes
     val {before_bytes, after_bytes, evicted, ...} = eviction
   in
     if before_bytes > max_bytes orelse evicted > 0 then
       warn ("checkpoint budget: " ^ checkpoint_eviction_text eviction ^
-            " checkpoint_limit_gb=" ^ Int.toString default_max_checkpoints_gb)
+            " checkpoint_limit_gb=" ^ Int.toString checkpoint_limit_gb)
     else ();
     if after_bytes > max_bytes then
       warn ("checkpoint budget still exceeds limit after eviction; check permissions or oversized live families")

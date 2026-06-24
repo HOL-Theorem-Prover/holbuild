@@ -869,7 +869,7 @@ fun parse_gc_args args =
         | "--days" :: n :: xs => loop (HolbuildCache.parse_days n) max_checkpoints_gb clean_only cache_only xs
         | "--max-checkpoints-gb" :: n :: xs =>
             (case Int.fromString n of
-                 SOME gb => if gb >= 0 then loop days gb clean_only cache_only xs
+                 SOME gb => if gb >= 0 then loop days (SOME gb) clean_only cache_only xs
                             else raise Error "--max-checkpoints-gb must be non-negative"
                | NONE => raise Error "--max-checkpoints-gb requires an integer")
         | "--max-checkpoints-gb" :: [] => raise Error "--max-checkpoints-gb requires GB"
@@ -877,12 +877,13 @@ fun parse_gc_args args =
         | "--cache-only" :: xs => loop days max_checkpoints_gb clean_only true xs
         | arg :: _ => raise Error ("unknown gc option: " ^ arg)
   in
-    loop HolbuildCache.default_retention_days HolbuildBuildExec.default_max_checkpoints_gb false false args
+    loop HolbuildCache.default_retention_days NONE false false args
   end
 
-fun run_project_gc (days, max_checkpoints_gb) =
+fun run_project_gc (days, max_checkpoints_gb_option) =
   let
     val project = load_project ()
+    val max_checkpoints_gb = Option.getOpt(max_checkpoints_gb_option, HolbuildBuildExec.project_checkpoint_limit_gb project)
     fun clean_project () = HolbuildBuildExec.clean_project project days max_checkpoints_gb
   in
     HolbuildBuildExec.with_project_lock project "gc" clean_project

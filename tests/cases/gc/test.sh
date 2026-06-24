@@ -117,12 +117,16 @@ name = "checkpoint-budget"
 [build]
 members = ["src"]
 TOML
+cat > "$budget_project/.holconfig.toml" <<'TOML'
+[build]
+checkpoint_limit_gb = 1
+TOML
 cat > "$budget_project/src/BadScript.sml" <<'SML'
 open HolKernel Parse boolLib bossLib;
 val _ = new_theory "Bad";
 val _ = raise Fail "forced failure after stale checkpoint budget fixture";
 SML
-truncate -s 6G "$budget_family.deps/old-deps-key/deps_loaded.save"
+truncate -s 2G "$budget_family.deps/old-deps-key/deps_loaded.save"
 printf 'ok\n' > "$budget_family.deps/old-deps-key/deps_loaded.save.ok"
 printf 'child\n' > "$budget_family.theorems/old-deps-key/proof_ir_v3/old-prefix/first_context.save"
 printf 'child ok\n' > "$budget_family.theorems/old-deps-key/proof_ir_v3/old-prefix/first_context.save.ok"
@@ -138,7 +142,7 @@ fi
 require_grep "checkpoint budget: .*evicted=" "$tmpdir/budget.log"
 require_grep "checkpoint_gb_before=" "$tmpdir/budget.log"
 require_grep "checkpoint_gb_after=" "$tmpdir/budget.log"
-require_grep "checkpoint_limit_gb=5" "$tmpdir/budget.log"
+require_grep "checkpoint_limit_gb=1" "$tmpdir/budget.log"
 if [[ -e "$budget_family.deps/old-deps-key" || -e "$budget_family.theorems/old-deps-key" ]]; then
   echo "checkpoint budget evicted stale parent/child heap family only partially" >&2
   exit 1
