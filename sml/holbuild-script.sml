@@ -37,6 +37,7 @@ use "sml/file_lock.sml";
 use "sml/cache_backend.sml";
 use "sml/fs_cache_backend.sml";
 use "sml/cache_transfer.sml";
+use "sml/cache_archive.sml";
 use "sml/hol_shared_cache.sml";
 use "sml/project.sml";
 use "sml/toolchain.sml";
