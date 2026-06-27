@@ -421,6 +421,10 @@ area plus `project/` and `deps/<package>/` package views for the exported action
 manifests. `import` hydrates the global cache; a later `holbuild build MyTheory`
 materialises outputs through the normal cache-restore path.
 
+Use `holbuild export --metadata-out MyTheory.hbx.json` to write a registry
+metadata sidecar for static hosting or GitHub Releases; see
+[`docs/hbx-registry.md`](docs/hbx-registry.md).
+
 Clean old project and cache state with:
 
 ```sh
