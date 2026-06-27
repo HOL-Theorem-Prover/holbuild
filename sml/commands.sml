@@ -118,7 +118,7 @@ fun cache_help () = print
 
 fun export_help () = print
   "Usage:\n\
-  \  holbuild [GLOBAL OPTIONS] export [--build] -o FILE [TARGET ...]\n\n\
+  \  holbuild [GLOBAL OPTIONS] export [--build] -o FILE [--metadata-out FILE] [TARGET ...]\n\n\
   \Export cached build outputs for targets. With --build, build targets first.\n\n\
   \Global options: see `holbuild --help`.\n"
 
@@ -801,30 +801,34 @@ fun hbx_export_metadata project =
      hol_rev = hol_rev} : HolbuildCacheArchive.metadata
   end
 
-datatype export_args = ExportArgs of {build_first : bool, output : string, targets : string list}
+datatype export_args = ExportArgs of {build_first : bool, output : string, metadata_out : string option, targets : string list}
 
 fun parse_export_args args =
   let
-    fun done build_first output targets =
+    fun done build_first output metadata_out targets =
       case output of
-          SOME path => ExportArgs {build_first = build_first, output = path, targets = rev targets}
-        | NONE => raise Error "usage: holbuild export [--build] -o FILE [TARGET ...]"
-    fun loop build_first output targets rest =
+          SOME path => ExportArgs {build_first = build_first, output = path, metadata_out = metadata_out, targets = rev targets}
+        | NONE => raise Error "usage: holbuild export [--build] -o FILE [--metadata-out FILE] [TARGET ...]"
+    fun loop build_first output metadata_out targets rest =
       case rest of
-          [] => done build_first output targets
-        | "--build" :: xs => loop true output targets xs
-        | "-o" :: path :: xs => loop build_first (SOME path) targets xs
-        | "--output" :: path :: xs => loop build_first (SOME path) targets xs
+          [] => done build_first output metadata_out targets
+        | "--build" :: xs => loop true output metadata_out targets xs
+        | "-o" :: path :: xs => loop build_first (SOME path) metadata_out targets xs
+        | "--output" :: path :: xs => loop build_first (SOME path) metadata_out targets xs
+        | "--metadata-out" :: path :: xs => loop build_first output (SOME path) targets xs
         | "-o" :: [] => raise Error "export -o requires FILE"
         | "--output" :: [] => raise Error "export --output requires FILE"
+        | "--metadata-out" :: [] => raise Error "export --metadata-out requires FILE"
         | arg :: xs =>
             if String.isPrefix "--output=" arg then
-              loop build_first (SOME (String.extract(arg, size "--output=", NONE))) targets xs
+              loop build_first (SOME (String.extract(arg, size "--output=", NONE))) metadata_out targets xs
+            else if String.isPrefix "--metadata-out=" arg then
+              loop build_first output (SOME (String.extract(arg, size "--metadata-out=", NONE))) targets xs
             else if String.isPrefix "--" arg then
               raise Error ("unknown export option: " ^ arg)
-            else loop build_first output (arg :: targets) xs
+            else loop build_first output metadata_out (arg :: targets) xs
   in
-    loop false NONE [] args
+    loop false NONE NONE [] args
   end
 
 fun root_package_name project =
@@ -904,9 +908,77 @@ fun fs_cache_source cache : HolbuildCacheTransfer.source =
   {get_action = HolbuildFSCacheBackend.get_action cache,
    fetch_blob = HolbuildFSCacheBackend.fetch_blob cache}
 
+fun first_token text =
+  case String.tokens Char.isSpace text of
+      token :: _ => SOME token
+    | [] => NONE
+
+fun file_sha256 path =
+  case command_output ("sha256sum " ^ HolbuildHash.quote path) of
+      SOME text => first_token text
+    | NONE => NONE
+
+fun file_size_string path = Position.toString (OS.FileSys.fileSize path)
+
+fun json_escape text =
+  let
+    fun escape_char c =
+      case c of
+          #"\\" => "\\\\"
+        | #"\"" => "\\\""
+        | #"\n" => "\\n"
+        | #"\r" => "\\r"
+        | #"\t" => "\\t"
+        | _ => if Char.ord c < 32 then "" else str c
+  in
+    "\"" ^ String.translate escape_char text ^ "\""
+  end
+
+fun json_string_field name value = json_escape name ^ ": " ^ json_escape value
+fun json_int_field name value = json_escape name ^ ": " ^ Int.toString value
+fun json_raw_field name value = json_escape name ^ ": " ^ value
+fun json_array_field name values =
+  json_escape name ^ ": [" ^ String.concatWith ", " (map json_escape values) ^ "]"
+
+fun optional_json_string_field name value =
+  case value of
+      SOME text => [json_string_field name text]
+    | NONE => []
+
+fun export_metadata_json {archive_path, targets, action_count, metadata} =
+  let
+    val sha256 =
+      case file_sha256 archive_path of
+          SOME hash => hash
+        | NONE => raise Error ("could not compute sha256 for " ^ archive_path)
+    val {created_at, source_repo, source_rev, hol_repo, hol_rev} : HolbuildCacheArchive.metadata = metadata
+    val fields =
+      [json_string_field "format" "holbuild-hbx-metadata-v1",
+       json_string_field "archive_format" HolbuildCacheArchive.format,
+       json_string_field "archive" (OS.Path.file archive_path),
+       json_string_field "sha256" sha256,
+       json_raw_field "size" (file_size_string archive_path),
+       json_array_field "targets" targets,
+       json_int_field "action_count" action_count,
+       json_string_field "holbuild_version" HolbuildVersion.version] @
+      optional_json_string_field "created_at" created_at @
+      optional_json_string_field "source_repo" source_repo @
+      optional_json_string_field "source_rev" source_rev @
+      optional_json_string_field "hol_repo" hol_repo @
+      optional_json_string_field "hol_rev" hol_rev
+  in
+    "{\n  " ^ String.concatWith ",\n  " fields ^ "\n}\n"
+  end
+
+fun write_export_metadata {path, archive_path, targets, action_count, metadata} =
+  write_text_file path (export_metadata_json {archive_path = archive_path,
+                                              targets = targets,
+                                              action_count = action_count,
+                                              metadata = metadata})
+
 fun export_archive tc jobs args =
   let
-    val ExportArgs {build_first, output, targets} = parse_export_args args
+    val ExportArgs {build_first, output, metadata_out, targets} = parse_export_args args
     val _ = if build_first then build tc jobs targets else ()
     val project = timed_phase "project.discover" load_project
     val index = timed_phase "source.discover" (fn () => HolbuildSourceIndex.discover project)
@@ -927,6 +999,11 @@ fun export_archive tc jobs args =
                                         entries = entries,
                                         targets = targets,
                                         metadata = metadata};
+    Option.app (fn path => write_export_metadata {path = path,
+                                                  archive_path = output,
+                                                  targets = targets,
+                                                  action_count = length entries,
+                                                  metadata = metadata}) metadata_out;
     print ("exported " ^ Int.toString (length entries) ^ " cache action(s) to " ^ output ^ "\n")
   end
 

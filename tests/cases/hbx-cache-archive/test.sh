@@ -74,10 +74,31 @@ require_grep "BTheory built" "$build_log"
 require_grep "ATheory built" "$build_log"
 
 archive=$tmpdir/a.hbx
+metadata=$tmpdir/a.hbx.json
 export_log=$tmpdir/export.log
-(cd "$project" && HOLBUILD_CACHE="$source_cache" "$HOLBUILD_BIN" export -o "$archive" ATheory) > "$export_log" 2>&1
+(cd "$project" && HOLBUILD_CACHE="$source_cache" "$HOLBUILD_BIN" export -o "$archive" --metadata-out "$metadata" ATheory) > "$export_log" 2>&1
 require_file "$archive"
+require_file "$metadata"
 require_grep "exported 2 cache action" "$export_log"
+python3 - "$metadata" "$archive" "$(sha256sum "$archive" | awk '{print $1}')" "$(holbuild_pinned_hol_rev)" <<'PY'
+import json
+import os
+import sys
+
+metadata_path, archive_path, sha256, hol_rev = sys.argv[1:]
+with open(metadata_path, encoding="utf-8") as f:
+    metadata = json.load(f)
+assert metadata["format"] == "holbuild-hbx-metadata-v1"
+assert metadata["archive_format"] == "holbuild-hbx-v1"
+assert metadata["archive"] == os.path.basename(archive_path)
+assert metadata["sha256"] == sha256
+assert metadata["size"] == os.path.getsize(archive_path)
+assert metadata["targets"] == ["ATheory"]
+assert metadata["action_count"] == 2
+assert metadata["hol_repo"] == "https://github.com/HOL-Theorem-Prover/HOL.git"
+assert metadata["hol_rev"] == hol_rev
+assert metadata["created_at"].endswith("Z")
+PY
 
 build_archive=$tmpdir/build.hbx
 build_export_log=$tmpdir/export-build.log
