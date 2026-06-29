@@ -61,6 +61,39 @@ fun write_text path text =
 fun temp_path label =
   Path.concat(Path.dir (FS.tmpName ()), "holbuild-remote-cache-" ^ label ^ "-" ^ Path.file (FS.tmpName ()))
 
+fun curl_config_arg () =
+  case OS.Process.getEnv "HOLBUILD_REMOTE_CACHE_CURL_CONFIG" of
+      SOME path => " --config " ^ quote path
+    | NONE => ""
+
+fun redact_userinfo url =
+  let
+    val marker = "://"
+    val marker_len = size marker
+    val url_len = size url
+    fun marker_at i = i + marker_len <= url_len andalso String.substring(url, i, marker_len) = marker
+    fun find_marker i =
+      if i + marker_len > url_len then NONE
+      else if marker_at i then SOME i else find_marker (i + 1)
+    fun slash_or_end i =
+      if i >= url_len orelse String.sub(url, i) = #"/" then i else slash_or_end (i + 1)
+    fun at_before limit i =
+      if i >= limit then NONE
+      else if String.sub(url, i) = #"@" then SOME i else at_before limit (i + 1)
+  in
+    case find_marker 0 of
+        NONE => url
+      | SOME scheme_end =>
+          let
+            val auth_start = scheme_end + marker_len
+            val path_start = slash_or_end auth_start
+          in
+            case at_before path_start auth_start of
+                NONE => url
+              | SOME at => String.substring(url, 0, auth_start) ^ "<redacted>@" ^ String.extract(url, at + 1, NONE)
+          end
+  end
+
 fun read_first_token path =
   case String.tokens Char.isSpace (read_text path) of
       token :: _ => token
@@ -69,16 +102,17 @@ fun read_first_token path =
 fun curl_get {url, dst} =
   let
     val code = temp_path "code"
-    val command = "curl -sS -L --max-time " ^ curl_max_time_seconds ^ " -o " ^ quote dst ^
+    val display_url = redact_userinfo url
+    val command = "curl -q -sS -L --max-time " ^ curl_max_time_seconds ^ curl_config_arg () ^ " -o " ^ quote dst ^
                   " -w '%{http_code}' " ^ quote url ^ " > " ^ quote code
     val status = OS.Process.system command
     val http_code = if path_exists code then read_first_token code else "000"
     val _ = remove_file code
   in
-    if not (OS.Process.isSuccess status) then HolbuildCacheBackend.Corrupt ("curl GET failed: " ^ url)
+    if not (OS.Process.isSuccess status) then HolbuildCacheBackend.Corrupt ("curl GET failed: " ^ display_url)
     else if http_code = "200" then HolbuildCacheBackend.Hit
     else if http_code = "404" then HolbuildCacheBackend.Miss
-    else HolbuildCacheBackend.Corrupt ("HTTP " ^ http_code ^ " from " ^ url)
+    else HolbuildCacheBackend.Corrupt ("HTTP " ^ http_code ^ " from " ^ display_url)
   end
   handle e => (HolbuildCacheBackend.Corrupt (General.exnMessage e))
 
@@ -89,7 +123,8 @@ fun curl_put {url, src} =
   let
     val code = temp_path "code"
     val body = temp_path "body"
-    val command = "curl -sS -L --max-time " ^ curl_max_time_seconds ^ " -T " ^ quote src ^
+    val display_url = redact_userinfo url
+    val command = "curl -q -sS -L --max-time " ^ curl_max_time_seconds ^ curl_config_arg () ^ " -T " ^ quote src ^
                   " -o " ^ quote body ^ " -w '%{http_code}' " ^ quote url ^
                   " > " ^ quote code
     val status = OS.Process.system command
@@ -97,9 +132,9 @@ fun curl_put {url, src} =
     val _ = remove_file code
     val _ = remove_file body
   in
-    if not (OS.Process.isSuccess status) then HolbuildCacheBackend.Conflict ("curl PUT failed: " ^ url)
+    if not (OS.Process.isSuccess status) then HolbuildCacheBackend.Conflict ("curl PUT failed: " ^ display_url)
     else if successful_put_code http_code then HolbuildCacheBackend.Published
-    else HolbuildCacheBackend.Conflict ("HTTP " ^ http_code ^ " from " ^ url)
+    else HolbuildCacheBackend.Conflict ("HTTP " ^ http_code ^ " from " ^ display_url)
   end
   handle e => (HolbuildCacheBackend.Conflict (General.exnMessage e))
 

@@ -426,6 +426,25 @@ The remote endpoint stores content blobs under `/cas/<sha256>` and holbuild
 cache metadata under `/ac/<action-key>`. This is a live accelerator, not remote
 execution and not an immutable release registry.
 
+For private caches, put credentials in local/CI configuration, not in
+`holproject.toml`. `bazel-remote` supports HTTP Basic Auth; the safest holbuild
+path is to pass curl a config file:
+
+```sh
+cat > "$RUNNER_TEMP/holbuild-remote-cache.curl" <<'EOF'
+user = "build-user:secret-password"
+EOF
+chmod 600 "$RUNNER_TEMP/holbuild-remote-cache.curl"
+HOLBUILD_REMOTE_CACHE_CURL_CONFIG="$RUNNER_TEMP/holbuild-remote-cache.curl" \
+  holbuild --remote-cache https://cache.example.org build MyTheory
+```
+
+The URL form `https://user:password@cache.example.org` also works with curl, but
+can expose credentials via process listings or shell history; prefer the config
+file form for CI and shared machines. holbuild redacts URL userinfo in its own
+remote-cache diagnostics, but it cannot hide secrets from the operating system if
+they are passed as command-line arguments.
+
 Portable build-output archives use the same cache representation:
 
 ```sh
