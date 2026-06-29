@@ -99,11 +99,21 @@ fun read_first_token path =
       token :: _ => token
     | [] => ""
 
+fun remove_file_before result path = (remove_file path; result)
+
+fun command_success command = OS.Process.isSuccess (OS.Process.system command)
+
+fun zstd_compress src dst =
+  command_success ("zstd -q -f -T0 -o " ^ quote dst ^ " " ^ quote src)
+
+fun zstd_content_headers size =
+  " -H 'Content-Encoding: zstd' -H " ^ quote ("X-Digest-SizeBytes: " ^ size)
+
 fun curl_get {url, dst} =
   let
     val code = temp_path "code"
     val display_url = redact_userinfo url
-    val command = "curl -q -sS -L --max-time " ^ curl_max_time_seconds ^ curl_config_arg () ^ " -o " ^ quote dst ^
+    val command = "curl -q -sS -L --compressed --max-time " ^ curl_max_time_seconds ^ curl_config_arg () ^ " -o " ^ quote dst ^
                   " -w '%{http_code}' " ^ quote url ^ " > " ^ quote code
     val status = OS.Process.system command
     val http_code = if path_exists code then read_first_token code else "000"
@@ -119,12 +129,12 @@ fun curl_get {url, dst} =
 fun successful_put_code code =
   code = "200" orelse code = "201" orelse code = "204"
 
-fun curl_put {url, src} =
+fun curl_put_with_headers headers {url, src} =
   let
     val code = temp_path "code"
     val body = temp_path "body"
     val display_url = redact_userinfo url
-    val command = "curl -q -sS -L --max-time " ^ curl_max_time_seconds ^ curl_config_arg () ^ " -T " ^ quote src ^
+    val command = "curl -q -sS -L --max-time " ^ curl_max_time_seconds ^ curl_config_arg () ^ headers ^ " -T " ^ quote src ^
                   " -o " ^ quote body ^ " -w '%{http_code}' " ^ quote url ^
                   " > " ^ quote code
     val status = OS.Process.system command
@@ -137,6 +147,19 @@ fun curl_put {url, src} =
     else HolbuildCacheBackend.Conflict ("HTTP " ^ http_code ^ " from " ^ display_url)
   end
   handle e => (HolbuildCacheBackend.Conflict (General.exnMessage e))
+
+fun curl_put request = curl_put_with_headers "" request
+
+fun curl_put_zstd {url, src, size} =
+  let val compressed = temp_path "zstd-put"
+  in
+    if zstd_compress src compressed then
+      curl_put_with_headers (zstd_content_headers size) {url = url, src = compressed}
+      before remove_file compressed
+    else
+      remove_file_before (curl_put {url = url, src = src}) compressed
+  end
+  handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
 fun action_url cache key = base_url cache ^ "/ac/" ^ key
 fun cas_url cache sha256 = base_url cache ^ "/cas/" ^ sha256
@@ -287,7 +310,7 @@ fun publish_blob cache {hash, src} =
     val _ =
       if sha1 = hash then ()
       else raise Error ("blob SHA1 mismatch: expected " ^ hash ^ " got " ^ sha1)
-    val result = curl_put {url = cas_url cache sha256, src = src}
+    val result = curl_put_zstd {url = cas_url cache sha256, src = src, size = size}
   in
     case result of
         HolbuildCacheBackend.Published => (remember_blob cache {sha1 = hash, sha256 = sha256, size = size}; result)
