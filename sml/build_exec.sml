@@ -1368,6 +1368,46 @@ fun copy_blob root hash dst =
     | HolbuildCacheBackend.Miss => raise Error ("cache blob missing: " ^ hash)
     | HolbuildCacheBackend.Corrupt detail => raise Error ("cache blob missing or corrupt: " ^ hash ^ " (" ^ detail ^ ")")
 
+fun fs_cache_destination cache : HolbuildCacheTransfer.destination =
+  {put_action = HolbuildFSCacheBackend.put_action cache,
+   publish_blob = HolbuildFSCacheBackend.publish_blob cache}
+
+fun remote_cache_source_with_action remote key manifest : HolbuildCacheTransfer.source =
+  {get_action = fn requested => if requested = key then SOME manifest else HolbuildRemoteCache.get_action remote requested,
+   fetch_blob = HolbuildRemoteCache.fetch_blob remote}
+
+fun hydrate_remote_cache_key root key =
+  case HolbuildRemoteCacheConfig.url () of
+      NONE => false
+    | SOME url =>
+        let
+          val remote = HolbuildRemoteCache.remote url
+          val local_cache = HolbuildFSCacheBackend.filesystem root
+        in
+          case HolbuildRemoteCache.get_action remote key of
+              NONE => (cache_trace ("remote cache miss: " ^ key); false)
+            | SOME manifest =>
+                let
+                  val _ = HolbuildFSCacheBackend.ensure_layout local_cache
+                  val _ = HolbuildCacheTransfer.copy_entry
+                            {source = remote_cache_source_with_action remote key manifest,
+                             destination = fs_cache_destination local_cache,
+                             tmp_dir = HolbuildFSCacheBackend.tmp_dir local_cache}
+                            key
+                in
+                  cache_trace ("remote cache hydrated: " ^ key);
+                  true
+                end
+        end
+        handle e =>
+          (warn ("remote cache entry unusable for " ^ key ^ ": " ^ General.exnMessage e);
+           false)
+
+fun ensure_local_cache_entry root key =
+  case HolbuildCache.get_action root key of
+      SOME text => SOME text
+    | NONE => if hydrate_remote_cache_key root key then HolbuildCache.get_action root key else NONE
+
 fun file_strings path =
   let
     val tmp = FS.tmpName ()
@@ -1583,7 +1623,7 @@ fun materialize_theory_cache_key project plan input_key requested_timeout cache_
     val manifest = HolbuildCache.action_manifest root cache_key
     val role = cache_key_role project plan node input_key cache_key
     val manifest_text =
-      case HolbuildCache.get_action root cache_key of
+      case ensure_local_cache_entry root cache_key of
           SOME text => text
         | NONE => (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ role ^ "=" ^ cache_key ^ " (no manifest)");
                    raise Error "cache entry not found")
