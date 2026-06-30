@@ -423,8 +423,10 @@ HOLBUILD_REMOTE_CACHE_URL=http://cache.example.org holbuild build MyTheory
 
 Remote cache misses or errors fall back to the local cache/source build path.
 The remote endpoint stores content blobs under `/cas/<sha256>` and holbuild
-cache metadata under `/ac/<action-key>`. This is a live accelerator, not remote
-execution and not an immutable release registry.
+cache metadata under `/ac/<action-key>`. CAS transfers use zstd compression when
+supported by the server; action metadata stays small and is sent uncompressed.
+This is a live accelerator, not remote execution and not an immutable release
+registry.
 
 For private caches, put credentials in local/CI configuration, not in
 `holproject.toml`. `bazel-remote` supports HTTP Basic Auth; the safest holbuild

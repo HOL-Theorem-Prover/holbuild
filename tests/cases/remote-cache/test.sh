@@ -23,7 +23,9 @@ write_server() {
 import http.server
 import os
 import pathlib
+import subprocess
 import sys
+import tempfile
 import urllib.parse
 
 root = pathlib.Path(sys.argv[1]).resolve()
@@ -38,6 +40,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return None
         return root / path
 
+    def zstd_compress(self, data):
+        return subprocess.check_output(['zstd', '-q', '-c'], input=data)
+
+    def zstd_decompress(self, data):
+        return subprocess.check_output(['zstd', '-q', '-d', '-c'], input=data)
+
+    def accepts_zstd(self):
+        return 'zstd' in self.headers.get('Accept-Encoding', '')
+
     def do_GET(self):
         path = self.object_path()
         if path is None:
@@ -47,7 +58,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
         data = path.read_bytes()
+        compressed = self.accepts_zstd() and '/cas/' in self.path
+        if compressed:
+            data = self.zstd_compress(data)
         self.send_response(200)
+        if compressed:
+            self.send_header('Content-Encoding', 'zstd')
         self.send_header('Content-Length', str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -57,8 +73,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path is None:
             return
         length = int(self.headers.get('Content-Length', '0'))
+        data = self.rfile.read(length)
+        if self.headers.get('Content-Encoding') == 'zstd':
+            data = self.zstd_decompress(data)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(self.rfile.read(length))
+        path.write_bytes(data)
         self.send_response(201)
         self.end_headers()
 
