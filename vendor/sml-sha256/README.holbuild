@@ -1,0 +1,8 @@
+Vendored from https://github.com/diku-dk/sml-sha256 for holbuild SHA256 support.
+
+Upstream commit: 3649dee949913441e11330c1f5d96c4bbde462bc
+License: MIT; see LICENSE and AUTHORS in this directory.
+
+Only the library source files needed by holbuild are vendored. The upstream
+package is an smlpkg package; holbuild loads these files directly from
+sml/holbuild-script.sml instead.

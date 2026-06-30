@@ -55,6 +55,17 @@ use_hol("tools/Holmake/deps/Holdep.sml");
 
 use_hol("src/portableML/poly/SHA1_ML.sig");
 use_hol("src/portableML/poly/w64-SHA1.ML");
+use_root "vendor/sml-sha256/lib/from-string.sig";
+use_root "vendor/sml-sha256/lib/from-string.sml";
+use_root "vendor/sml-sha256/lib/bytestring.sig";
+use_root "vendor/sml-sha256/lib/bytestring.sml";
+use_root "vendor/sml-sha256/lib/convert-word.sml";
+use_root "vendor/sml-sha256/lib/susp.sig";
+use_root "vendor/sml-sha256/lib/susp.sml";
+use_root "vendor/sml-sha256/lib/stream.sig";
+use_root "vendor/sml-sha256/lib/stream.sml";
+use_root "vendor/sml-sha256/lib/sha256.sig";
+use_root "vendor/sml-sha256/lib/sha256.sml";
 use_root "sml/hash.sml";
 use_root "sml/proof_ir_types.sml";
 use_root "sml/proof_ir.sml";

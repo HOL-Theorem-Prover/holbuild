@@ -28,6 +28,18 @@ use_hol("src/portableML/poly/ConcIsaLib.sml");
 use_hol("src/portableML/Redblackset.sig");
 use_hol("src/portableML/Redblackset.sml");
 
+use "vendor/sml-sha256/lib/from-string.sig";
+use "vendor/sml-sha256/lib/from-string.sml";
+use "vendor/sml-sha256/lib/bytestring.sig";
+use "vendor/sml-sha256/lib/bytestring.sml";
+use "vendor/sml-sha256/lib/convert-word.sml";
+use "vendor/sml-sha256/lib/susp.sig";
+use "vendor/sml-sha256/lib/susp.sml";
+use "vendor/sml-sha256/lib/stream.sig";
+use "vendor/sml-sha256/lib/stream.sml";
+use "vendor/sml-sha256/lib/sha256.sig";
+use "vendor/sml-sha256/lib/sha256.sml";
+
 use "sml/hash.sml";
 use "sml/version.sml";
 use "sml/builtin_manifests.sml";

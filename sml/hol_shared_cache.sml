@@ -13,6 +13,17 @@ val analyser_format_version = "holbuild-hol-analyser-v1"
 val analyser_protocol_version = "1"
 val analyser_source_files =
   ["../hash.sml",
+   "../../vendor/sml-sha256/lib/from-string.sig",
+   "../../vendor/sml-sha256/lib/from-string.sml",
+   "../../vendor/sml-sha256/lib/bytestring.sig",
+   "../../vendor/sml-sha256/lib/bytestring.sml",
+   "../../vendor/sml-sha256/lib/convert-word.sml",
+   "../../vendor/sml-sha256/lib/susp.sig",
+   "../../vendor/sml-sha256/lib/susp.sml",
+   "../../vendor/sml-sha256/lib/stream.sig",
+   "../../vendor/sml-sha256/lib/stream.sml",
+   "../../vendor/sml-sha256/lib/sha256.sig",
+   "../../vendor/sml-sha256/lib/sha256.sml",
    "analysis_protocol.sml",
    "dependency_extract.sml",
    "theory_span_extract.sml",
