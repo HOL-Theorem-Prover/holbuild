@@ -1368,9 +1368,17 @@ fun copy_blob root hash dst =
     | HolbuildCacheBackend.Miss => raise Error ("cache blob missing: " ^ hash)
     | HolbuildCacheBackend.Corrupt detail => raise Error ("cache blob missing or corrupt: " ^ hash ^ " (" ^ detail ^ ")")
 
+fun fs_cache_source cache : HolbuildCacheTransfer.source =
+  {get_action = HolbuildFSCacheBackend.get_action cache,
+   fetch_blob = HolbuildFSCacheBackend.fetch_blob cache}
+
 fun fs_cache_destination cache : HolbuildCacheTransfer.destination =
   {put_action = HolbuildFSCacheBackend.put_action cache,
    publish_blob = HolbuildFSCacheBackend.publish_blob cache}
+
+fun remote_cache_destination remote : HolbuildCacheTransfer.destination =
+  {put_action = HolbuildRemoteCache.put_action remote,
+   publish_blob = HolbuildRemoteCache.publish_blob remote}
 
 fun remote_cache_source_with_action remote key manifest : HolbuildCacheTransfer.source =
   {get_action = fn requested => if requested = key then SOME manifest else HolbuildRemoteCache.get_action remote requested,
@@ -1407,6 +1415,28 @@ fun ensure_local_cache_entry root key =
   case HolbuildCache.get_action root key of
       SOME text => SOME text
     | NONE => if hydrate_remote_cache_key root key then HolbuildCache.get_action root key else NONE
+
+fun publish_remote_cache_key root key =
+  case HolbuildRemoteCacheConfig.url () of
+      NONE => ()
+    | SOME url =>
+        let
+          val local_cache = HolbuildFSCacheBackend.filesystem root
+          val remote = HolbuildRemoteCache.remote url
+          val _ = HolbuildCacheTransfer.copy_entry
+                    {source = fs_cache_source local_cache,
+                     destination = remote_cache_destination remote,
+                     tmp_dir = HolbuildFSCacheBackend.tmp_dir local_cache}
+                    key
+        in
+          cache_trace ("remote cache published: " ^ key)
+        end
+        handle e => warn ("could not publish remote cache entry " ^ key ^ ": " ^ General.exnMessage e)
+
+fun publish_remote_cache_key_if_usable root key =
+  case HolbuildCache.get_action root key of
+      SOME manifest => if cache_entry_usable root key manifest then publish_remote_cache_key root key else ()
+    | NONE => ()
 
 fun file_strings path =
   let
@@ -1528,7 +1558,8 @@ fun publish_theory_cache project plan node input_key proof_timeout staged_sig pu
      (if cache_key <> context_key then
         HolbuildCache.with_action_publish_lock root context_key (fn () => drop_stale_manifest context_key) skip_locked_publish
       else ());
-     HolbuildCache.with_action_publish_lock root cache_key publish skip_locked_publish)
+     HolbuildCache.with_action_publish_lock root cache_key publish skip_locked_publish;
+     if path_dependent then () else publish_remote_cache_key_if_usable root cache_key)
     handle e => warn ("could not publish cache entry: " ^ General.exnMessage e)
   end
 
