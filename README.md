@@ -168,6 +168,7 @@ holbuild -j4 MyTheory
 holbuild --maxheap 4096 MyTheory
 holbuild --source-dir /path/to/project MyTheory
 holbuild --cache-dir /path/to/cache MyTheory
+holbuild --remote-cache http://cache.example.org MyTheory
 holbuild --json MyTheory
 ```
 
@@ -189,6 +190,8 @@ Common global options:
   `HOLBUILD_SOURCE_DIR` or the current working directory.
 - `--cache-dir PATH`: global cache directory. Overrides `HOLBUILD_CACHE` and the
   platform default cache location.
+- `--remote-cache URL`: optional Bazel-style HTTP remote cache endpoint. Also
+  configurable with `HOLBUILD_REMOTE_CACHE_URL`.
 - `--json`: emit newline-delimited JSON where supported.
 - `--quiet`, `--verbose`, `--verbosity LEVEL`: adjust status output.
 - `-j N`, `-jN`, `--jobs N`: build parallelism.
@@ -410,6 +413,37 @@ $HOLBUILD_CACHE/hol-toolchains/       # built HOL toolchains and analysers
 The global build cache stores selected semantic artefacts such as `Theory.sig`,
 `Theory.sml`, and `Theory.dat` by action key. Cache hits materialise validated
 artefacts into the local `.holbuild/` tree.
+
+A build can also consult and publish to one Bazel-style HTTP remote cache:
+
+```sh
+holbuild --remote-cache http://cache.example.org build MyTheory
+HOLBUILD_REMOTE_CACHE_URL=http://cache.example.org holbuild build MyTheory
+```
+
+Remote cache misses or errors fall back to the local cache/source build path.
+The remote endpoint stores content blobs under `/cas/<sha256>` and holbuild
+cache metadata under `/ac/<action-key>`. This is a live accelerator, not remote
+execution and not an immutable release registry.
+
+For private caches, put credentials in local/CI configuration, not in
+`holproject.toml`. `bazel-remote` supports HTTP Basic Auth; the safest holbuild
+path is to pass curl a config file:
+
+```sh
+cat > "$RUNNER_TEMP/holbuild-remote-cache.curl" <<'EOF'
+user = "build-user:secret-password"
+EOF
+chmod 600 "$RUNNER_TEMP/holbuild-remote-cache.curl"
+HOLBUILD_REMOTE_CACHE_CURL_CONFIG="$RUNNER_TEMP/holbuild-remote-cache.curl" \
+  holbuild --remote-cache https://cache.example.org build MyTheory
+```
+
+The URL form `https://user:password@cache.example.org` also works with curl, but
+can expose credentials via process listings or shell history; prefer the config
+file form for CI and shared machines. holbuild redacts URL userinfo in its own
+remote-cache diagnostics, but it cannot hide secrets from the operating system if
+they are passed as command-line arguments.
 
 Portable build-output archives use the same cache representation:
 
