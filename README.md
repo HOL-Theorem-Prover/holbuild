@@ -248,6 +248,22 @@ git = "https://github.com/acme/foo"
 rev = "0123456789abcdef0123456789abcdef01234567"
 ```
 
+A git dependency may also name prebuilt HBX cache archives for that exact source
+revision. holbuild still materializes the git source; the HBX archive is only a
+cache accelerator/fallback and is imported into the global cache before building
+that dependency.
+
+```toml
+[dependencies.foo]
+git = "https://github.com/acme/foo"
+rev = "0123456789abcdef0123456789abcdef01234567"
+hbx = { url = "https://github.com/acme/foo/releases/download/v1/foo.hbx", sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }
+```
+
+Local archives may be relative to the manifest and omit `sha256`; remote
+`http://`/`https://` archives require `sha256`. Multiple archives can be listed
+with an array of strings/tables.
+
 A dependency may also refer to a subdirectory of another direct dependency, using
 a shim manifest:
 
@@ -261,10 +277,10 @@ manifest = "shims/keccak.toml"
 Current dependency limits:
 
 - `rev` must be an exact lowercase 40-character commit hash.
-- Branches, tags, version ranges, registries, solvers, lockfiles, path
-  dependencies, local overrides, and multiple versions of one package are not
-  supported.
-- Direct git dependencies use only `git` and `rev`.
+- Branches, tags, version ranges, hbx-as-source packages, registries, solvers,
+  lockfiles, path dependencies, local overrides, and multiple versions of one
+  package are not supported.
+- Direct git dependencies use `git`, `rev`, and optional `hbx` cache archives.
 - Subtree dependencies use `from`, `path`, and `manifest`.
 - `path` and `manifest` must be relative and must not contain `..`.
 

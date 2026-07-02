@@ -28,8 +28,10 @@ datatype generator =
       outputs : string list,
       deps : string list }
 
+datatype hbx_archive = HbxArchive of {url : string, sha256 : string option}
+
 datatype dependency_source =
-    GitSource of {git : string, rev : string}
+    GitSource of {git : string, rev : string, hbx_archives : hbx_archive list}
   | FromSource of {from : string, path : string, manifest : string}
 
 datatype dependency = Dependency of {name : string, source : dependency_source}
@@ -447,6 +449,56 @@ fun validate_schema table =
          ignore (schema_version table);
          validate_required_version holbuild)
 
+fun valid_sha256 text =
+  size text = 64 andalso List.all HolbuildHash.is_hex (String.explode text)
+
+fun remote_hbx_url url = String.isPrefix "https://" url orelse String.isPrefix "http://" url
+
+fun hbx_archives_at context table =
+  let
+    fun require_nonempty url = if url = "" then die (context ^ ".hbx.url must not be empty") else url
+    fun validate_local_path url =
+      if remote_hbx_url url orelse Path.isAbsolute url then ()
+      else ignore (package_relative_path (context ^ ".hbx.url") url)
+    fun validate_sha sha =
+      if valid_sha256 sha then String.map Char.toLower sha
+      else die (context ^ ".hbx.sha256 must be a 64-character hex sha256")
+    fun make url sha256 =
+      let
+        val url = require_nonempty url
+        val sha256 = Option.map validate_sha sha256
+        val _ = validate_local_path url
+        val _ =
+          if remote_hbx_url url then
+            case sha256 of
+                SOME _ => ()
+              | NONE => die (context ^ ".hbx.sha256 is required for remote hbx")
+          else ()
+      in
+        HbxArchive {url = url, sha256 = sha256}
+      end
+    fun table_archive hbx =
+      let
+        val _ = require_known_fields (context ^ ".hbx") ["url", "sha256"] hbx
+        val url =
+          case string_field hbx "url" of
+              SOME text => text
+            | NONE => die (context ^ ".hbx requires url")
+      in
+        make url (string_field hbx "sha256")
+      end
+    fun archive_value value =
+      case value of
+          TOML.STRING url => make url NONE
+        | TOML.TABLE hbx => table_archive hbx
+        | _ => die (context ^ ".hbx must be a string, table, or array of strings/tables")
+  in
+    case lookup table ["hbx"] of
+        NONE => []
+      | SOME (TOML.ARRAY values) => map archive_value values
+      | SOME value => [archive_value value]
+  end
+
 fun validate_dependency_table (name, table) =
   let
     val context = "dependencies." ^ name
@@ -455,17 +507,22 @@ fun validate_dependency_table (name, table) =
     val git = string_field table "git"
     val rev = string_field table "rev"
     val from = string_field table "from"
+    val hbx_archives = hbx_archives_at context table
   in
-    require_known_fields context ["git", "rev", "from", "path", "manifest"] table;
+    require_known_fields context ["git", "rev", "from", "path", "manifest", "hbx"] table;
     case (git, rev, from, path, manifest) of
-        (SOME _, SOME _, NONE, NONE, NONE) => ()
+        (SOME _, SOME _, NONE, NONE, NONE) =>
+          if name = "hol" andalso not (null hbx_archives) then
+            die "dependencies.hol hbx archives are not supported"
+          else ()
       | (SOME _, NONE, _, _, _) => die (context ^ " with git requires rev")
       | (NONE, SOME _, _, _, _) => die (context ^ " with rev requires git")
-      | (SOME _, SOME _, _, _, _) => die (context ^ " git dependency may only contain git and rev")
+      | (SOME _, SOME _, _, _, _) => die (context ^ " git dependency may only contain git, rev, and hbx")
       | (NONE, NONE, SOME from, SOME path, SOME manifest) =>
-          (require_safe_materialized_dependency_name (context ^ ".from") from;
-           ignore (package_relative_path (context ^ ".path") path);
-           ignore (package_relative_path (context ^ ".manifest") manifest))
+          if not (null hbx_archives) then die (context ^ " hbx is only supported with git dependencies")
+          else (require_safe_materialized_dependency_name (context ^ ".from") from;
+                ignore (package_relative_path (context ^ ".path") path);
+                ignore (package_relative_path (context ^ ".manifest") manifest))
       | (NONE, NONE, SOME _, _, _) => die (context ^ " with from requires path and manifest")
       | (NONE, NONE, NONE, SOME _, _) => die (context ^ " path dependencies are not supported")
       | (NONE, NONE, NONE, NONE, SOME _) => die (context ^ " manifest requires from")
@@ -525,10 +582,13 @@ fun validate_local_config_table table =
 
 fun parse_dependency (name, table) =
   let
+    val context = "dependencies." ^ name
+    val hbx_archives = hbx_archives_at context table
     val source =
       case (string_field table "git", string_field table "rev", string_field table "from",
             string_field table "path", string_field table "manifest") of
-          (SOME git, SOME rev, NONE, NONE, NONE) => GitSource {git = git, rev = rev}
+          (SOME git, SOME rev, NONE, NONE, NONE) =>
+            GitSource {git = git, rev = rev, hbx_archives = hbx_archives}
         | (NONE, NONE, SOME from, SOME path, SOME manifest) =>
             FromSource {from = from, path = path, manifest = manifest}
         | _ => die ("invalid dependency form for dependencies." ^ name)
@@ -777,7 +837,7 @@ fun hol_dependency ({dependencies, ...} : t) =
 
 fun project_hol_dir project =
   case hol_dependency project of
-      SOME (Dependency {source = GitSource {git, rev}, ...}) =>
+      SOME (Dependency {source = GitSource {git, rev, ...}, ...}) =>
         SOME (HolbuildHolSharedCache.holdir_for {git = git, rev = rev})
     | _ => NONE
 fun build_roots ({roots, ...} : t) = roots
@@ -815,12 +875,12 @@ fun dependency_manifest_context name = "dependencies." ^ name ^ ".manifest"
 
 fun dependency_local_path (project as {graph_artifact_root, ...} : t) (Dependency {name, source}) =
   case source of
-      GitSource {git, rev} =>
+      GitSource {git, rev, ...} =>
         if name = "hol" then SOME (HolbuildHolSharedCache.holdir_for {git = git, rev = rev})
         else SOME (Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), name))
     | FromSource {from, path, ...} =>
         (case hol_dependency project of
-             SOME (Dependency {name = "hol", source = GitSource {git, rev}}) =>
+             SOME (Dependency {name = "hol", source = GitSource {git, rev, ...}}) =>
                if from = "hol" then SOME (Path.concat(HolbuildHolSharedCache.holdir_for {git = git, rev = rev}, path))
                else SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path))
            | _ => SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path)))
@@ -841,12 +901,15 @@ fun dependency_to_string project (dep as Dependency {name, source}) =
   let
     fun field label value =
       case value of NONE => [] | SOME s => [label ^ "=" ^ s]
+    fun hbx_fields (HbxArchive {url, sha256}) =
+      ["hbx=" ^ url] @ field "hbx.sha256" sha256
     val override = override_path (#overrides project) name
     val local_path = dependency_local_path project dep
     val resolved_manifest = dependency_manifest project dep
     val source_fields =
       case source of
-          GitSource {git, rev} => ["git=" ^ git, "rev=" ^ rev]
+          GitSource {git, rev, hbx_archives} =>
+            ["git=" ^ git, "rev=" ^ rev] @ List.concat (map hbx_fields hbx_archives)
         | FromSource {from, path, manifest} => ["from=" ^ from, "path=" ^ path, "manifest=" ^ manifest]
     val fields =
       source_fields @ field "override" override @ field "local" local_path @
@@ -864,14 +927,133 @@ fun project_package ({root, artifact_root, graph_artifact_root, manifest, name, 
            action_policies = action_policies,
            generators = generators}
 
+fun path_exists path = FS.access(path, []) handle OS.SysErr _ => false
+
+fun ensure_dir path =
+  if path = "" orelse path = "." then ()
+  else if path_exists path then ()
+  else (ensure_dir (Path.dir path); FS.mkDir path handle OS.SysErr _ => ())
+
+fun ensure_parent path = ensure_dir (Path.dir path)
+
+fun remove_file path = FS.remove path handle OS.SysErr _ => ()
+
+fun first_token text =
+  case String.tokens Char.isSpace text of
+      token :: _ => SOME token
+    | [] => NONE
+
+fun command_output command =
+  let
+    val output = FS.tmpName ()
+    val status = OS.Process.system (command ^ " > " ^ HolbuildHash.quote output ^ " 2>/dev/null")
+    val text = if OS.Process.isSuccess status then first_token (HolbuildHash.read_all output) else NONE
+    val _ = remove_file output
+  in
+    text
+  end
+  handle _ => NONE
+
+fun file_sha256 path = command_output ("sha256sum " ^ HolbuildHash.quote path)
+
+fun require_hbx_sha256 dep_name archive_path expected =
+  case file_sha256 archive_path of
+      SOME actual =>
+        let val actual = String.map Char.toLower actual
+        in
+          if actual = expected then ()
+          else die ("hbx sha256 mismatch for dependencies." ^ dep_name ^ ".hbx: expected " ^ expected ^ ", got " ^ actual)
+        end
+    | NONE => die ("could not compute sha256 for hbx archive: " ^ archive_path)
+
+fun run_command command error =
+  if OS.Process.isSuccess (OS.Process.system command) then () else die error
+
+fun hbx_download_dir (project : t) =
+  Path.concat(Path.concat(#graph_artifact_root project, ".holbuild"), "hbx")
+
+fun hbx_download_path project dep_name url sha256 =
+  let
+    val key =
+      case sha256 of
+          SOME hash => String.substring(hash, 0, 16)
+        | NONE => String.substring(HolbuildHash.string_sha1 url, 0, 16)
+  in
+    Path.concat(hbx_download_dir project, dep_name ^ "-" ^ key ^ ".hbx")
+  end
+
+fun download_hbx url destination =
+  let
+    val tmp = destination ^ ".tmp"
+    val _ = ensure_parent destination
+    val _ = remove_file tmp
+    val command = "curl -fsSL --retry 3 -o " ^ HolbuildHash.quote tmp ^ " " ^ HolbuildHash.quote url
+    fun install () =
+      (run_command command ("could not download hbx archive: " ^ url);
+       FS.rename {old = tmp, new = destination}
+       handle OS.SysErr (msg, _) => die ("could not install hbx archive " ^ destination ^ ": " ^ msg))
+  in
+    install () handle e => (remove_file tmp; raise e)
+  end
+
+fun local_hbx_path (project : t) url =
+  if Path.isAbsolute url then url else abs_under (manifest_root (#manifest project)) url
+
+fun resolve_hbx_archive project dep_name (HbxArchive {url, sha256}) =
+  let
+    val archive_path =
+      if remote_hbx_url url then
+        let val destination = hbx_download_path project dep_name url sha256
+        in
+          case sha256 of
+              SOME expected =>
+                if path_exists destination andalso
+                   (file_sha256 destination = SOME expected handle _ => false) then destination
+                else (download_hbx url destination; destination)
+            | NONE => (download_hbx url destination; destination)
+        end
+      else local_hbx_path project url
+    val _ = Option.app (require_hbx_sha256 dep_name archive_path) sha256
+  in
+    archive_path
+  end
+
+fun fs_cache_destination cache : HolbuildCacheTransfer.destination =
+  {put_action = HolbuildFSCacheBackend.put_action cache,
+   publish_blob = HolbuildFSCacheBackend.publish_blob cache}
+
+fun import_hbx_archive archive_path =
+  let
+    val destination = HolbuildFSCacheBackend.default () handle HolbuildFSCacheBackend.Error msg => die msg
+    val _ = HolbuildFSCacheBackend.ensure_layout destination
+    fun copy {source, keys} =
+      ignore (HolbuildCacheTransfer.copy_entries
+                {source = source,
+                 destination = fs_cache_destination destination,
+                 tmp_dir = HolbuildFSCacheBackend.tmp_dir destination}
+                keys)
+  in
+    HolbuildCacheArchive.with_entries {archive_path = archive_path, f = copy}
+  end
+  handle HolbuildCacheArchive.Error msg => die msg
+       | HolbuildCacheTransfer.Error msg => die msg
+       | HolbuildFSCacheBackend.Error msg => die msg
+
+fun import_dependency_hbx_archive project dep_name archive =
+  import_hbx_archive (resolve_hbx_archive project dep_name archive)
+
+fun import_dependency_hbx_archives project dep_name archives =
+  List.app (import_dependency_hbx_archive project dep_name) archives
+
 fun dependency_project (project : t) (dep as Dependency {name, source}) =
   let
     val _ =
       case source of
-          GitSource {git, rev} =>
+          GitSource {git, rev, hbx_archives} =>
             if schema2_hol_dependency dep then ()
-            else ignore (HolbuildGitCache.materialize {name = name, git = git, rev = rev,
-                                                       artifact_root = #graph_artifact_root project})
+            else (ignore (HolbuildGitCache.materialize {name = name, git = git, rev = rev,
+                                                        artifact_root = #graph_artifact_root project});
+                  import_dependency_hbx_archives project name hbx_archives)
         | _ => ()
     val dep_root =
       case dependency_local_path project dep of

@@ -28,6 +28,23 @@ git -C "$hol_repo" commit -q -m hol
 hol_rev=$(git -C "$hol_repo" rev-parse HEAD)
 export HOLBUILD_CANONICAL_HOL_GIT="$hol_repo"
 
+hbx_action_key=1234567890abcdef1234567890abcdef12345678
+hbx_stage=$tmpdir/hbx-stage
+hbx_archive=$tmpdir/dep-cache.hbx
+mkdir -p "$hbx_stage/holbuild-cache/actions/$hbx_action_key"
+cat > "$hbx_stage/holbuild-cache/manifest" <<EOF
+holbuild-hbx-v1
+created_by=holbuild test
+target_count=0
+action_count=1
+action $hbx_action_key
+EOF
+cat > "$hbx_stage/holbuild-cache/actions/$hbx_action_key/manifest" <<'EOF'
+holbuild-cache-entry-v1
+EOF
+tar -C "$hbx_stage" -cf "$hbx_archive" holbuild-cache
+hbx_sha=$(sha256sum "$hbx_archive" | awk '{print $1}')
+
 repo=$tmpdir/dep-repo
 mkdir -p "$repo"
 git -C "$repo" init -q
@@ -90,6 +107,7 @@ rev = "$hol_rev"
 [dependencies.dep]
 git = "$repo"
 rev = "$rev1"
+hbx = { url = "$hbx_archive", sha256 = "$hbx_sha" }
 
 [dependencies.subdep]
 from = "dep"
@@ -99,6 +117,8 @@ TOML
 
 (cd "$project" && "$HOLBUILD_BIN" context) > "$tmpdir/context1.log"
 require_grep 'dependency: dep \[git=' "$tmpdir/context1.log"
+require_grep "hbx=$hbx_archive" "$tmpdir/context1.log"
+require_file "$HOLBUILD_CACHE/actions/$hbx_action_key/manifest"
 require_grep "package: dep \[root=$project/.holbuild/src/dep, manifest=$project/.holbuild/src/dep/holproject.toml, artifact-root=$project/.holbuild/packages/dep\]" "$tmpdir/context1.log"
 require_grep "package: subdep \[root=$project/.holbuild/src/dep/subdir, manifest=$project/sub.manifest.toml, artifact-root=$project/.holbuild/packages/subdep\]" "$tmpdir/context1.log"
 require_grep "dependency: subdep \[from=dep, path=subdir, manifest=sub.manifest.toml, local=$project/.holbuild/src/dep/subdir, resolved-manifest=$project/sub.manifest.toml" "$tmpdir/context1.log"

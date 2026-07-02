@@ -379,7 +379,57 @@ git = "https://example.com/dep.git"
 rev = "abcdef"
 manifest = "dep.manifest.toml"
 TOML
-expect_context_failure schema2_git_manifest "dependencies.dep git dependency may only contain git and rev"
+expect_context_failure schema2_git_manifest "dependencies.dep git dependency may only contain git, rev, and hbx"
+
+make_project schema2_remote_hbx_missing_sha
+write_manifest schema2_remote_hbx_missing_sha <<'TOML'
+
+[dependencies.dep]
+git = "https://example.com/dep.git"
+rev = "abcdef"
+hbx = "https://example.com/dep.hbx"
+TOML
+expect_context_failure schema2_remote_hbx_missing_sha "dependencies.dep.hbx.sha256 is required for remote hbx"
+
+make_project schema2_bad_hbx_sha
+write_manifest schema2_bad_hbx_sha <<'TOML'
+
+[dependencies.dep]
+git = "https://example.com/dep.git"
+rev = "abcdef"
+hbx = { url = "dep.hbx", sha256 = "not-a-sha" }
+TOML
+expect_context_failure schema2_bad_hbx_sha "dependencies.dep.hbx.sha256 must be a 64-character hex sha256"
+
+make_project schema2_from_hbx
+write_manifest schema2_from_hbx <<'TOML'
+
+[dependencies.dep]
+git = "https://example.com/dep.git"
+rev = "abcdef"
+
+[dependencies.subdep]
+from = "dep"
+path = "subdir"
+manifest = "sub.toml"
+hbx = "subdep.hbx"
+TOML
+expect_context_failure schema2_from_hbx "dependencies.subdep hbx is only supported with git dependencies"
+
+make_project schema2_hol_hbx
+cat > "$tmpdir/schema2_hol_hbx/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[project]
+name = "schema2_hol_hbx"
+
+[dependencies.hol]
+git = "$schema2_repo"
+rev = "$schema2_rev"
+hbx = "hol.hbx"
+TOML
+expect_context_failure schema2_hol_hbx "dependencies.hol hbx archives are not supported"
 
 make_project schema2_override
 write_manifest schema2_override <<'TOML'

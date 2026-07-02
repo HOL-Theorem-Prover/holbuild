@@ -791,7 +791,7 @@ fun current_utc_timestamp () =
 
 fun hol_dependency_metadata project =
   case HolbuildProject.resolved_hol_dependency project of
-      SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev}, ...}) =>
+      SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev, ...}, ...}) =>
         {hol_repo = SOME git, hol_rev = SOME rev}
     | _ => {hol_repo = NONE, hol_rev = NONE}
 
@@ -1220,7 +1220,7 @@ fun require_schema2 project =
 fun project_hol_holdir project =
   (HolbuildProject.packages project;
    case HolbuildProject.resolved_hol_dependency project of
-       SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev}, ...}) =>
+       SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev, ...}, ...}) =>
          HolbuildHolSharedCache.ensure_built {git = git, rev = rev}
      | _ => raise Error "schema 2 project has no dependencies.hol")
 
