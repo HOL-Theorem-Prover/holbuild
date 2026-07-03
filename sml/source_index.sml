@@ -139,6 +139,10 @@ fun excluded excludes exclude_globs rel = path_excluded excludes rel orelse glob
 
 fun skip_dir name = String.isPrefix "." name orelse name = "_build"
 
+fun contains_manifest path =
+  FS.access(Path.concat(path, "holproject.toml"), [FS.A_READ])
+  handle OS.SysErr _ => false
+
 fun list_dir path =
   let
     val stream = FS.openDir path
@@ -170,7 +174,7 @@ fun scan_dir package source_root artifact_root policies excludes exclude_globs p
       in
         if is_link path' then acc
         else if is_dir path' then
-          if skip_dir name orelse not (is_readable path') orelse
+          if skip_dir name orelse not (is_readable path') orelse contains_manifest path' orelse
              excluded excludes exclude_globs (relative_path source_root path') then acc
           else scan_dir package source_root artifact_root policies excludes exclude_globs path' acc
         else if String.isPrefix "." name then acc
