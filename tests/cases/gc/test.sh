@@ -148,6 +148,56 @@ if [[ -e "$budget_family.deps/old-deps-key" || -e "$budget_family.theorems/old-d
   exit 1
 fi
 
+mid_project=$tmpdir/mid-budget-project
+mid_family="$mid_project/.holbuild/checkpoints/mid-budget/src/generated"
+mkdir -p "$mid_project/src" "$mid_family.deps/key"
+cat > "$mid_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "mid-budget"
+
+[build]
+members = ["src"]
+TOML
+cat > "$mid_project/.holconfig.toml" <<'TOML'
+[build]
+checkpoint_limit_gb = 1
+jobs = 1
+TOML
+cat > "$mid_project/src/FirstScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "First";
+val _ = export_theory();
+val _ = OS.Process.system "truncate -s 2G $mid_family.deps/key/deps_loaded.save";
+val out = TextIO.openOut "$mid_family.deps/key/deps_loaded.save.ok";
+val _ = (TextIO.output(out, "ok\\n"); TextIO.closeOut out);
+SML
+cat > "$mid_project/src/SecondScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Second";
+val _ = load "FirstTheory";
+val _ =
+  if OS.FileSys.access("$mid_family.deps/key/deps_loaded.save.ok", []) then
+    raise Fail "mid-build checkpoint budget was not enforced"
+  else raise Fail "forced failure after mid-build budget check";
+SML
+if (cd "$mid_project" && "$HOLBUILD_BIN" build SecondTheory) > "$tmpdir/mid-budget.log" 2>&1; then
+  echo "mid-build checkpoint budget fixture unexpectedly succeeded" >&2
+  exit 1
+fi
+require_grep "checkpoint budget: .*evicted=" "$tmpdir/mid-budget.log"
+require_grep "forced failure after mid-build budget check" "$tmpdir/mid-budget.log"
+if grep -q "mid-build checkpoint budget was not enforced" "$tmpdir/mid-budget.log"; then
+  echo "checkpoint budget was not enforced between serial nodes" >&2
+  exit 1
+fi
+
 if (cd "$project" && "$HOLBUILD_BIN" gc --clean-only --cache-only) > "$tmpdir/bad-flags.log" 2>&1; then
   echo "gc accepted mutually exclusive flags" >&2
   exit 1

@@ -702,7 +702,9 @@ val default_max_checkpoints_gb = 5
 
 fun gb_to_bytes gb = IntInf.fromInt gb * 1073741824
 
-fun evict_oldest_checkpoints dir max_bytes =
+fun string_member x xs = List.exists (fn y => x = y) xs
+
+fun evict_oldest_checkpoints_excluding dir max_bytes protected_bases =
   if max_bytes <= 0 then 0
   else
     let
@@ -712,7 +714,9 @@ fun evict_oldest_checkpoints dir max_bytes =
       if total <= max_bytes then 0
       else
         let
-          val sorted = sort_families_by_mtime_ascending families
+          val evictable = List.filter (fn ({base, ...} : checkpoint_family) =>
+                                          not (string_member base protected_bases)) families
+          val sorted = sort_families_by_mtime_ascending evictable
           fun evict remaining freed removed =
             case remaining of
                 [] => removed
@@ -730,19 +734,25 @@ fun evict_oldest_checkpoints dir max_bytes =
         end
     end
 
+fun evict_oldest_checkpoints dir max_bytes =
+  evict_oldest_checkpoints_excluding dir max_bytes []
+
 type checkpoint_eviction =
   {before_bytes : IntInf.int, after_bytes : IntInf.int,
    max_bytes : IntInf.int, evicted : int}
 
-fun evict_oldest_checkpoints_with_stats dir max_bytes =
+fun evict_oldest_checkpoints_with_stats_excluding dir max_bytes protected_bases =
   let
     val before_bytes = checkpoint_bytes dir
-    val evicted = evict_oldest_checkpoints dir max_bytes
+    val evicted = evict_oldest_checkpoints_excluding dir max_bytes protected_bases
     val after_bytes = checkpoint_bytes dir
   in
     {before_bytes = before_bytes, after_bytes = after_bytes,
      max_bytes = max_bytes, evicted = evicted}
   end
+
+fun evict_oldest_checkpoints_with_stats dir max_bytes =
+  evict_oldest_checkpoints_with_stats_excluding dir max_bytes []
 
 fun checkpoint_eviction_text ({before_bytes, after_bytes, max_bytes, evicted} : checkpoint_eviction) =
   "checkpoint_gb_before=" ^ gb_decimal_text before_bytes ^
@@ -2976,6 +2986,44 @@ fun build_one status options tc project base_context plan keys toolchain_key nod
     outcome
   end
 
+fun project_checkpoint_limit_gb project =
+  Option.getOpt(HolbuildProject.checkpoint_limit_gb project, default_max_checkpoints_gb)
+
+fun enforce_checkpoint_budget_excluding project protected_bases =
+  let
+    val checkpoint_limit_gb = project_checkpoint_limit_gb project
+    val max_bytes = gb_to_bytes checkpoint_limit_gb
+    val eviction = evict_oldest_checkpoints_with_stats_excluding
+                     (project_state_dir project "checkpoints") max_bytes protected_bases
+    val {before_bytes, after_bytes, evicted, ...} = eviction
+  in
+    if before_bytes > max_bytes orelse evicted > 0 then
+      warn ("checkpoint budget: " ^ checkpoint_eviction_text eviction ^
+            " checkpoint_limit_gb=" ^ Int.toString checkpoint_limit_gb)
+    else ();
+    if after_bytes > max_bytes then
+      warn ("checkpoint budget still exceeds limit after eviction; check permissions or oversized live families")
+    else ()
+  end
+
+fun enforce_checkpoint_budget project = enforce_checkpoint_budget_excluding project []
+
+fun protected_checkpoint_bases_for_nodes project plan nodes =
+  let
+    fun add_base node protected =
+      let val base = checkpoint_base project node
+      in if string_member base protected then protected else base :: protected end
+    fun add_node node protected =
+      let val protected' = add_base node protected
+      in
+        List.foldl (fn (dep, acc) => add_node dep acc)
+                   protected'
+                   (HolbuildBuildPlan.direct_project_deps plan node)
+      end
+  in
+    List.foldl (fn (node, protected) => add_node node protected) [] nodes
+  end
+
 fun build_serial status options tc project base_context plan keys toolchain_key =
   let
     fun error_message e =
@@ -3003,7 +3051,8 @@ fun build_serial status options tc project base_context plan keys toolchain_key 
       | loop (node :: rest) =
           case one node of
               HolbuildStatus.Inspected => ()
-            | _ => loop rest
+            | _ => (enforce_checkpoint_budget_excluding project [];
+                    loop rest)
   in
     loop (HolbuildBuildPlan.selected_nodes plan)
   end
@@ -3055,6 +3104,7 @@ fun build_parallel status options tc project base_context plan keys toolchain_ke
     val priority_running = ref 0
     val completed = ref 0
     val active = ref jobs
+    val active_nodes = Array.array (node_count, false)
     val stopped = ref false
     val failure = ref (NONE : (string * HolbuildStatus.debug_artifacts) option)
     val failed_prefix_priority = Array.array (node_count, NONE : bool option)
@@ -3156,6 +3206,7 @@ fun build_parallel status options tc project base_context plan keys toolchain_ke
               case pop_ready () of
                   SOME (id, priority) =>
                     (running := !running + 1;
+                     Array.update (active_nodes, id, true);
                      if priority then priority_running := !priority_running + 1 else ();
                      SOME id)
                 | NONE =>
@@ -3184,14 +3235,34 @@ fun build_parallel status options tc project base_context plan keys toolchain_ke
       (finish_priority_focus id;
        if failed_prefix_priority_node id then priority_running := !priority_running - 1 else ())
 
+    fun active_nodes_snapshot_locked () =
+      let
+        fun loop i acc =
+          if i >= node_count then acc
+          else loop (i + 1) (if Array.sub (active_nodes, i) then Vector.sub (nodes, i) :: acc else acc)
+      in
+        loop 0 []
+      end
+
+    fun active_protected_bases_locked () =
+      protected_checkpoint_bases_for_nodes project plan (active_nodes_snapshot_locked ())
+
     fun finish_success id =
       with_lock
         (fn () =>
-            (running := !running - 1;
-             finish_priority id;
-             completed := !completed + 1;
-             if !stopped then () else List.app release_dependent (Array.sub (dependents, id));
-             signal ()))
+            let
+              val _ = running := !running - 1
+              val _ = Array.update (active_nodes, id, false)
+              val _ = finish_priority id
+              val _ = completed := !completed + 1
+              val finished_node = Vector.sub (nodes, id)
+              val _ = if !stopped then () else List.app release_dependent (Array.sub (dependents, id))
+              val protected = protected_checkpoint_bases_for_nodes
+                                project plan (finished_node :: active_nodes_snapshot_locked ())
+            in
+              signal ();
+              protected
+            end)
 
     fun finish_inspected id =
       let
@@ -3200,6 +3271,7 @@ fun build_parallel status options tc project base_context plan keys toolchain_ke
             (fn () =>
                 let
                   val _ = running := !running - 1
+                  val _ = Array.update (active_nodes, id, false)
                   val _ = finish_priority id
                   val _ = completed := !completed + 1
                   val first = not (!stopped)
@@ -3213,7 +3285,7 @@ fun build_parallel status options tc project base_context plan keys toolchain_ke
       end
 
     fun finish_cancelled_after_stop id =
-      with_lock (fn () => (running := !running - 1; finish_priority id; signal ()))
+      with_lock (fn () => (running := !running - 1; Array.update (active_nodes, id, false); finish_priority id; signal ()))
 
     fun finish_failure id msg artifacts =
       let
@@ -3222,6 +3294,7 @@ fun build_parallel status options tc project base_context plan keys toolchain_ke
             (fn () =>
                 let
                   val _ = running := !running - 1
+                  val _ = Array.update (active_nodes, id, false)
                   val _ = finish_priority id
                   val first =
                     if !stopped then false
@@ -3250,7 +3323,7 @@ fun build_parallel status options tc project base_context plan keys toolchain_ke
                 in
                   ((case build_one status options tc project base_context plan keys toolchain_key node of
                         HolbuildStatus.Inspected => finish_inspected id
-                      | _ => finish_success id;
+                      | _ => enforce_checkpoint_budget_excluding project (finish_success id);
                     loop ())
                    handle e =>
                      if stop_requested () then
@@ -3291,25 +3364,6 @@ fun build_parallel status options tc project base_context plan keys toolchain_ke
     List.app (fn _ => ignore (Thread.fork (worker, [])))
              (List.tabulate (jobs, fn i => i));
     wait_workers ()
-  end
-
-fun project_checkpoint_limit_gb project =
-  Option.getOpt(HolbuildProject.checkpoint_limit_gb project, default_max_checkpoints_gb)
-
-fun enforce_checkpoint_budget project =
-  let
-    val checkpoint_limit_gb = project_checkpoint_limit_gb project
-    val max_bytes = gb_to_bytes checkpoint_limit_gb
-    val eviction = evict_oldest_checkpoints_with_stats (project_state_dir project "checkpoints") max_bytes
-    val {before_bytes, after_bytes, evicted, ...} = eviction
-  in
-    if before_bytes > max_bytes orelse evicted > 0 then
-      warn ("checkpoint budget: " ^ checkpoint_eviction_text eviction ^
-            " checkpoint_limit_gb=" ^ Int.toString checkpoint_limit_gb)
-    else ();
-    if after_bytes > max_bytes then
-      warn ("checkpoint budget still exceeds limit after eviction; check permissions or oversized live families")
-    else ()
   end
 
 fun build (options : build_options) tc project plan toolchain_key jobs =
