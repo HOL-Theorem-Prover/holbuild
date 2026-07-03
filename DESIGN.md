@@ -614,9 +614,9 @@ syntactic checkpoint:    if the action changed, where can replay resume?
 A retained/debug checkpoint is replay-eligible only under the same resolved
 dependency context, toolchain/base context, and checkpoint schema. Raw `.save`
 bytes are diagnostic only and must not be used as stable semantic keys. The
-default build does not retain successful checkpoints or materialize checkpoints
-from the global cache; cache restore recreates only logical theory artifacts and
-internal load manifests.
+default build may retain successful local checkpoints for proof-edit resume, but
+does not materialize checkpoints from the global cache; cache restore recreates
+only logical theory artifacts and internal load manifests.
 
 Proof-edit incrementality should not key failed-prefix checkpoints by the full
 proof body hash. That would invalidate exactly the state a proof author needs
@@ -684,13 +684,18 @@ successor-ready contexts, and are not used for dependency replay.
 
 Proof instrumentation is separable from PolyML checkpoint creation and
 retention. By default, holbuild may create several local checkpoint classes while
-executing a theory action, then removes them after successful artifact/metadata
-writes: `deps_loaded` after loading resolved dependencies, theorem proof states
-for modern AST `Theorem ... Proof ... QED` declarations, failed-prefix
-proof-navigation state after instrumented proof failures, and a final post-export context.
+executing a theory action: `deps_loaded` after loading resolved dependencies,
+theorem context/end-of-proof states for modern AST `Theorem ... Proof ... QED`
+declarations, failed-prefix proof-navigation state after instrumented proof
+failures, and a final post-export context. Successful builds remove stale
+failed-prefix checkpoints for the rebuilt source but retain reusable dependency
+and theorem checkpoints for proof-edit resume until they are replaced or evicted.
 The project-local checkpoint budget defaults to 5 GiB and can be configured with
 `.holconfig.toml`'s local `[build].checkpoint_limit_gb`; old checkpoint families
-are evicted when the budget is exceeded.
+are evicted when the budget is exceeded at build start/end and between completed
+build nodes. Mid-build eviction excludes checkpoint families that may be referenced
+by currently running PolyML child heaps, so the effective floor is the size of the
+live protected family set.
 `--skip-checkpoints` disables all `.save`/`.ok` creation while still running
 modern theorem proofs through the selected instrumentation runtime. `--skip-proof-steps`
 opts out of theorem instrumentation: with checkpoints still enabled, the build can

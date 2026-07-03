@@ -47,33 +47,60 @@ fun begin_replacement path =
    remove_file (ok_path path);
    remove_file path)
 
+fun checkpoint_io_failure e =
+  case e of
+      IO.Io _ => true
+    | OS.SysErr _ => true
+    | _ => false
+
+fun warn_checkpoint_failure label path e =
+  TextIO.output
+    (TextIO.stdErr,
+     String.concat ["holbuild: warning: dropping checkpoint kind=", label,
+                    " path=", path,
+                    " error=", General.exnMessage e, "\n"])
+
+fun discard_checkpoint path =
+  (remove_file (ok_tmp_path path);
+   remove_file (ok_path path);
+   remove_file path)
+
 fun save_checkpoint ({label, default_share, path, ok_text, depth} :
                      {label : string, default_share : bool, path : string,
                       ok_text : string, depth : int}) =
   let
-    val share = Option.getOpt(env_bool "HOLBUILD_SHARE_COMMON_DATA", default_share)
-    val timing = Option.getOpt(env_bool "HOLBUILD_CHECKPOINT_TIMING", false)
-    val t0 = Time.now()
-    val _ = begin_replacement path
-    val _ = if share then PolyML.shareCommonData PolyML.rootFunction else ()
-    val t1 = Time.now()
-    val _ = PolyML.SaveState.saveChild(path, depth)
-    val t2 = Time.now()
-    val _ = write_text_atomically (ok_path path) ok_text
-    val _ =
-      if timing then
-        TextIO.output
-          (TextIO.stdErr,
-           String.concat ["holbuild checkpoint kind=", label,
-                          " share=", bool_text share,
-                          " depth=", Int.toString depth,
-                          " share_s=", fmt_time (seconds (t0, t1)),
-                          " save_s=", fmt_time (seconds (t1, t2)),
-                          " size=", Position.toString (OS.FileSys.fileSize path),
-                          " path=", path, "\n"])
-      else ()
+    fun save () =
+      let
+        val share = Option.getOpt(env_bool "HOLBUILD_SHARE_COMMON_DATA", default_share)
+        val timing = Option.getOpt(env_bool "HOLBUILD_CHECKPOINT_TIMING", false)
+        val t0 = Time.now()
+        val _ = begin_replacement path
+        val _ = if share then PolyML.shareCommonData PolyML.rootFunction else ()
+        val t1 = Time.now()
+        val _ = PolyML.SaveState.saveChild(path, depth)
+        val t2 = Time.now()
+        val _ = write_text_atomically (ok_path path) ok_text
+        val _ =
+          if timing then
+            TextIO.output
+              (TextIO.stdErr,
+               String.concat ["holbuild checkpoint kind=", label,
+                              " share=", bool_text share,
+                              " depth=", Int.toString depth,
+                              " share_s=", fmt_time (seconds (t0, t1)),
+                              " save_s=", fmt_time (seconds (t1, t2)),
+                              " size=", Position.toString (OS.FileSys.fileSize path),
+                              " path=", path, "\n"])
+          else ()
+      in
+        ()
+      end
   in
-    ()
+    save ()
+    handle e =>
+      if checkpoint_io_failure e then
+        (discard_checkpoint path; warn_checkpoint_failure label path e)
+      else raise e
   end
 
 end
