@@ -3383,43 +3383,41 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
     end
   end
 
-fun heap_external_theories plan =
-  unique_strings (List.concat (map (HolbuildBuildPlan.direct_external_theories plan) (HolbuildBuildPlan.selected_nodes plan)))
-
-fun heap_theory_load_lines node =
+fun buildheap_arg heap_kind node =
   case #kind (HolbuildBuildPlan.source_of node) of
-      HolbuildSourceIndex.TheoryScript => [load_project_line (load_stem node)]
-    | _ =>
-      raise Error ("heap objects currently must be theory targets: " ^
-                   HolbuildBuildPlan.logical_name node)
+      HolbuildSourceIndex.TheoryScript => load_stem node
+    | HolbuildSourceIndex.Sml => load_stem node
+    | HolbuildSourceIndex.Sig =>
+      (case heap_kind of
+           HolbuildProject.ExecutableImage _ => #source_path (HolbuildBuildPlan.source_of node)
+         | HolbuildProject.HeapImage =>
+           raise Error ("heap objects cannot be signature targets: " ^
+                        HolbuildBuildPlan.logical_name node))
 
-fun write_heap_loader plan output path =
-  let
-    val lines =
-      runtime_line () ::
-      (map load_theory_line (heap_external_theories plan) @
-       List.concat (map heap_theory_load_lines (HolbuildBuildPlan.selected_nodes plan)) @
-       [checkpoint_save_runtime_line (),
-        save_heap_line {label = "heap", share_common_data = false,
-                        output = output, ok_text = checkpoint_ok_v1 ()}])
-  in
-    write_text path (String.concatWith "\n" lines ^ "\n")
-  end
+fun buildheap_args heap_kind plan = map (buildheap_arg heap_kind) (HolbuildBuildPlan.selected_nodes plan)
 
-fun export_heap tc (project : HolbuildProject.t) plan output =
+fun export_heap tc (project : HolbuildProject.t) plan output heap_kind =
   let
-    val base_context = toolchain_base_context tc
     val stage = Path.concat(Path.concat(project_artifact_root project, ".holbuild/stage"), "heap")
-    val loader = Path.concat(stage, "holbuild-save-heap.sml")
+    val log = Path.concat(stage, "holbuild-heap.log")
+    val base_args = HolbuildToolchain.hol_subcommand_argv tc "buildheap" @
+                    ["--noconfig", "--holstate", HolbuildToolchain.base_state tc, "-F"]
+    val exe_args =
+      case heap_kind of
+          HolbuildProject.HeapImage => []
+        | HolbuildProject.ExecutableImage {main} => ["--exe=" ^ main]
+    val argv = base_args @ exe_args @ ["-o", output] @ buildheap_args heap_kind plan
+    val _ = ensure_dir stage
+    val _ = ensure_parent output
+    val status = HolbuildToolchain.run_in_dir_to_file (#root project) argv log
   in
-    ensure_dir stage;
-    ensure_parent output;
-    write_heap_loader plan output loader;
-    run_hol_files_to_log tc stage stage base_context [loader]
-      "holbuild-heap.log"
-      NONE
-      ("hol run failed while exporting heap: " ^ output);
-    remove_tree stage
+    if HolbuildToolchain.success status then
+      (if echo_child_logs () then HolbuildStatus.message_stdout (read_text log handle _ => "") else ();
+       remove_tree stage)
+    else
+      raise Error (String.concatWith "\n"
+        ["hol buildheap failed while exporting heap: " ^ output,
+         child_log_detail log])
   end
 
 end
