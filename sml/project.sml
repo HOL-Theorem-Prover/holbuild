@@ -4,7 +4,9 @@ struct
 structure Path = OS.Path
 structure FS = OS.FileSys
 
-datatype heap = Heap of {name : string, output : string, objects : string list}
+datatype heap_kind = HeapImage | ExecutableImage of {main : string}
+
+datatype heap = Heap of {name : string, output : string, objects : string list, kind : heap_kind}
 
 type root_tactic_timeout = {root : string, timeout : real option}
 
@@ -356,29 +358,63 @@ fun named_table_entries table key =
           map one entries
         end
 
-fun parse_heap value =
+fun parse_image_entry section kind value =
   case value of
       TOML.TABLE table =>
         let
           val name =
             case string_field table "name" of
                 SOME s => s
-              | NONE => die "[[heap]] entry requires name"
+              | NONE => die ("[[" ^ section ^ "]] entry requires name")
           val output =
             case string_field table "output" of
                 SOME s => s
-              | NONE => die "[[heap]] entry requires output"
+              | NONE => die ("[[" ^ section ^ "]] entry requires output")
           val objects = string_array_field table "objects"
         in
-          Heap {name = name, output = output, objects = objects}
+          Heap {name = name, output = output, objects = objects, kind = kind table}
         end
-    | _ => die "heap entries must be tables"
+    | _ => die (section ^ " entries must be tables")
 
-fun heaps_at table =
+fun parse_heap value = parse_image_entry "heap" (fn _ => HeapImage) value
+
+fun parse_executable value =
+  parse_image_entry "executable"
+    (fn table => ExecutableImage {main = Option.getOpt (string_field table "main", "main")})
+    value
+
+fun heap_entries_at table =
   case lookup table ["heap"] of
       NONE => []
     | SOME (TOML.ARRAY values) => map parse_heap values
     | SOME _ => die "heap must be an array of tables"
+
+fun executable_entries_at table =
+  case lookup table ["executable"] of
+      NONE => []
+    | SOME (TOML.ARRAY values) => map parse_executable values
+    | SOME _ => die "executable must be an array of tables"
+
+fun reject_duplicate_heap_names heaps =
+  let
+    fun name_of (Heap {name, ...}) = name
+    fun seen name values = List.exists (fn value => value = name) values
+    fun loop names rest =
+      case rest of
+          [] => ()
+        | heap :: more =>
+          let val name = name_of heap
+          in
+            if seen name names then die ("duplicate heap/executable target name: " ^ name)
+            else loop (name :: names) more
+          end
+  in
+    loop [] heaps
+  end
+
+fun heaps_at table =
+  let val heaps = heap_entries_at table @ executable_entries_at table
+  in reject_duplicate_heap_names heaps; heaps end
 
 fun parse_generator value =
   case value of
@@ -484,7 +520,7 @@ fun validate_generate_entry value =
 fun validate_manifest_table table =
   let
     val _ = require_known_fields "holproject.toml"
-              ["holbuild", "project", "build", "dependencies", "run", "heap", "actions", "generate"] table
+              ["holbuild", "project", "build", "dependencies", "run", "heap", "executable", "actions", "generate"] table
     val _ = Option.app (require_known_fields "project" ["name", "version"])
               (table_field table ["project"])
     val _ = Option.app (require_known_fields "build" ["members", "exclude", "exclude_globs", "roots", "tactic_timeout", "root_tactic_timeouts"])
@@ -499,15 +535,20 @@ fun validate_manifest_table table =
           NONE => ()
         | SOME (TOML.ARRAY values) => List.app validate_generate_entry values
         | SOME _ => die "generate must be an array of tables"
-    fun validate_heap_entry value =
+    fun validate_image_entry section fields value =
       case value of
-          TOML.TABLE heap => require_known_fields "heap" ["name", "output", "objects"] heap
-        | _ => die "heap entries must be tables"
+          TOML.TABLE image => require_known_fields section fields image
+        | _ => die (section ^ " entries must be tables")
     val _ =
       case lookup table ["heap"] of
           NONE => ()
-        | SOME (TOML.ARRAY values) => List.app validate_heap_entry values
+        | SOME (TOML.ARRAY values) => List.app (validate_image_entry "heap" ["name", "output", "objects"]) values
         | SOME _ => die "heap must be an array of tables"
+    val _ =
+      case lookup table ["executable"] of
+          NONE => ()
+        | SOME (TOML.ARRAY values) => List.app (validate_image_entry "executable" ["name", "output", "objects", "main"]) values
+        | SOME _ => die "executable must be an array of tables"
   in
     validate_schema table
   end
@@ -834,8 +875,11 @@ fun dependency_manifest ({manifest = project_manifest, graph_artifact_root, ...}
     | Dependency {source = FromSource {manifest, ...}, ...} =>
         SOME (abs_under (manifest_root project_manifest) manifest)
 
-fun heap_to_string (Heap {name, output, objects}) =
-  name ^ " -> " ^ output ^ " [" ^ String.concatWith ", " objects ^ "]"
+fun heap_kind_to_string HeapImage = "heap"
+  | heap_kind_to_string (ExecutableImage {main}) = "executable main=" ^ main
+
+fun heap_to_string (Heap {name, output, objects, kind}) =
+  name ^ " (" ^ heap_kind_to_string kind ^ ") -> " ^ output ^ " [" ^ String.concatWith ", " objects ^ "]"
 
 fun dependency_to_string project (dep as Dependency {name, source}) =
   let

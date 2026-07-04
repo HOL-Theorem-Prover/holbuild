@@ -154,6 +154,7 @@ holbuild context
 holbuild execution-plan MyTheory:my_theorem
 holbuild buildhol
 holbuild heap main
+holbuild executable runtests
 holbuild export -o build-output.hbx MyTheory
 holbuild import build-output.hbx
 holbuild clean MyTheory
@@ -348,14 +349,24 @@ name = "main"
 output = "build/main.heap"
 objects = ["MainTheory"]
 
+[[executable]]
+name = "runtests"
+output = "tests/runtests.exe"
+objects = ["runtests"]
+main = "main"
+
 [run]
 heap = "build/main.heap"
 loads = ["MyLib"]
 ```
 
-`holbuild heap main` builds the listed logical objects, loads generated theory
-modules, and saves the heap. `holbuild run` and `holbuild repl` create a project
-run context under `.holbuild/` before loading `[run].loads` and user arguments.
+`holbuild heap main` builds the listed logical objects and uses HOL `buildheap`
+to save the heap. `[[heap]].objects` may name theory and SML logical targets.
+`holbuild executable runtests` builds the listed logical objects and uses HOL
+`buildheap --exe=<main>` to produce an executable; `main` defaults to `"main"`
+and executable objects may also include signature targets. `holbuild run` and
+`holbuild repl` create a project run context under `.holbuild/` before loading
+`[run].loads` and user arguments.
 
 ## Proof steps and checkpoints
 

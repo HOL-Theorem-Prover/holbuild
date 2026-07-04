@@ -28,6 +28,7 @@ fun global_help () = print
   \  execution-plan T:THM        Inspect proof-step execution plan\n\
   \  buildhol                    Build/reuse declared HOL and print its path\n\
   \  heap NAME                   Build a configured heap\n\
+  \  executable NAME             Build a configured executable heap\n\
   \  clean THEORY...             Remove local build outputs\n\
   \  export -o FILE [TARGET ...]  Export cached build outputs\n\
   \  import FILE                  Import cached build outputs\n\
@@ -96,6 +97,12 @@ fun heap_help () = print
   \Build a configured heap.\n\n\
   \Global options: see `holbuild --help`.\n"
 
+fun executable_help () = print
+  "Usage:\n\
+  \  holbuild [GLOBAL OPTIONS] executable NAME\n\n\
+  \Build a configured executable heap.\n\n\
+  \Global options: see `holbuild --help`.\n"
+
 fun clean_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] clean THEORY...\n\n\
@@ -135,7 +142,7 @@ fun has_help_arg args = List.exists help_arg args
 fun known_command command =
   command = "build" orelse command = "context" orelse command = "repl" orelse
   command = "run" orelse command = "execution-plan" orelse command = "buildhol" orelse
-  command = "heap" orelse command = "clean" orelse command = "export" orelse
+  command = "heap" orelse command = "executable" orelse command = "clean" orelse command = "export" orelse
   command = "import" orelse command = "gc" orelse command = "cache" orelse
   command = "goalfrag-plan"
 
@@ -148,6 +155,7 @@ fun command_help command =
     | "execution-plan" => execution_plan_help ()
     | "buildhol" => buildhol_help ()
     | "heap" => heap_help ()
+    | "executable" => executable_help ()
     | "clean" => clean_help ()
     | "export" => export_help ()
     | "import" => import_help ()
@@ -1076,23 +1084,32 @@ fun clean_targets args =
     HolbuildBuildExec.with_project_lock project "clean" execute_clean
   end
 
-fun heap_named project target =
+fun heap_kind_name HolbuildProject.HeapImage = "heap"
+  | heap_kind_name (HolbuildProject.ExecutableImage _) = "executable"
+
+fun heap_kind_matches "heap" HolbuildProject.HeapImage = true
+  | heap_kind_matches "executable" (HolbuildProject.ExecutableImage _) = true
+  | heap_kind_matches _ _ = false
+
+fun heap_named project command target =
   let
     fun matches (HolbuildProject.Heap {name, ...}) = name = target
   in
     case List.find matches (#heaps project) of
-        SOME heap => heap
-      | NONE => raise Error ("unknown heap target: " ^ target)
+        SOME (heap as HolbuildProject.Heap {kind, ...}) =>
+        if heap_kind_matches command kind then heap
+        else raise Error (target ^ " is a " ^ heap_kind_name kind ^ " target, not a " ^ command ^ " target")
+      | NONE => raise Error ("unknown " ^ command ^ " target: " ^ target)
   end
 
-fun build_heap tc cli_jobs target =
+fun build_heap_kind tc cli_jobs command target =
   let
     val project = timed_phase "project.discover" load_project
     val jobs = effective_jobs project cli_jobs
     fun execute_heap () =
       let
-        val HolbuildProject.Heap {output, objects, ...} = heap_named project target
-        val _ = if null objects then raise Error ("heap target has no objects: " ^ target) else ()
+        val HolbuildProject.Heap {output, objects, kind, ...} = heap_named project command target
+        val _ = if null objects then raise Error (command ^ " target has no objects: " ^ target) else ()
         val index = timed_phase "source.discover" (fn () => HolbuildSourceIndex.discover project)
         val plan = timed_phase "build.plan" (fn () => HolbuildBuildPlan.plan (#holdir tc) index objects)
         val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
@@ -1100,11 +1117,14 @@ fun build_heap tc cli_jobs target =
       in
         HolbuildBuildExec.build {use_cache = true, force = HolbuildBuildExec.ForceNone, force_targets = [], skip_checkpoints = false, proof_steps = true, new_ir = true, node_tactic_timeouts = HolbuildTacticTimeoutPolicy.entry_timeouts project index plan (SOME 2.5), execution_plan = NONE, trace_steps = false, repl_on_failure = false}
                                tc project plan toolchain_key jobs;
-        HolbuildBuildExec.export_heap tc project plan output_path
+        HolbuildBuildExec.export_heap tc project plan output_path kind
       end
   in
-    HolbuildBuildExec.with_project_lock project ("heap " ^ target) execute_heap
+    HolbuildBuildExec.with_project_lock project (command ^ " " ^ target) execute_heap
   end
+
+fun build_heap tc cli_jobs target = build_heap_kind tc cli_jobs "heap" target
+fun build_executable tc cli_jobs target = build_heap_kind tc cli_jobs "executable" target
 
 fun hol_args_for_project tc project subcommand user_args =
   let
@@ -1157,6 +1177,8 @@ fun dispatch tc jobs args =
     | "clean" :: rest => (reject_json "clean"; clean_targets rest)
     | "heap" :: [target] => (reject_json "heap"; build_heap tc jobs target)
     | "heap" :: _ => raise Error "usage: holbuild heap NAME"
+    | "executable" :: [target] => (reject_json "executable"; build_executable tc jobs target)
+    | "executable" :: _ => raise Error "usage: holbuild executable NAME"
     | "run" :: rest => (reject_json "run"; run_hol tc "run" rest)
     | "repl" :: rest => (reject_json "repl"; repl_hol tc rest)
     | "export" :: rest => (reject_json "export"; export_archive tc jobs rest)

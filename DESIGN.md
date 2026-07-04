@@ -571,10 +571,11 @@ artifacts:
 ```
 
 Explicit heap targets are requested with `holbuild heap NAME` from `[[heap]]`
-manifest entries. They are exported artifacts, not the normal incremental-build
-primitive: holbuild first builds the declared logical objects, then starts from
-the resolved holbuild-produced base context, loads generated theory modules in
-resolved build-graph order, and saves the requested heap with PolyML SaveState.
+manifest entries. Executable heap targets are requested with `holbuild executable
+NAME` from `[[executable]]` manifest entries. They are exported artifacts, not
+the normal incremental-build primitive: holbuild first builds the declared
+logical objects, then invokes HOL's public `buildheap` command on the selected
+object stems. Executable targets add `--exe=<main>`.
 
 Heaps requested by users remain project-local exported artifacts. Checkpoints are
 transient build/debug state. Normal successful theory builds may create them
@@ -584,10 +585,8 @@ breadcrumbs for an already-resolved graph, not retained outputs.
 
 `holbuild` should not use `hol buildheap` as the normal incremental-build
 primitive. `buildheap` snapshots a process after loading a closure of `.uo`
-modules. In holbuild, loading ancestors in resolved topological order naturally
-constructs the same dependency context inside the build process; any checkpoint
-after that load is just another syntactic checkpoint, not a separate closure
-cache concept.
+modules, and holbuild uses it only for explicit exported heap/executable
+artifacts after the relevant logical targets have already been built.
 
 The relevant checkpointing model is the `Holmake --dumpheap` design: while a
 theory script executes, the prover/runtime saves PolyML states at syntactic
