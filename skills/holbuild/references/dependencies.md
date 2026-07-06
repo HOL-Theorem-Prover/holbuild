@@ -79,12 +79,11 @@ holbuild no longer supports:
 - `[dependencies.HOLDIR]`
 - `--holdir`, `HOLDIR`, or `HOLBUILD_HOLDIR` as project/runtime HOL selection
 - path dependencies
-- local dependency overrides in `.holconfig.toml`
 - dependency path environment expansion
 - branch/tag/range version specifications
 - lockfiles, registries, solvers, or multiple versions of one package
 
-`.holconfig.toml` still supports local build settings such as `[build].jobs`, `[build].exclude`, and `[build].tactic_timeout`, but not dependency overrides.
+`.holconfig.toml` supports local build settings such as `[build].jobs`, `[build].exclude`, and `[build].tactic_timeout`. It also supports `[overrides.NAME] path = "..."` for workstation-local dependency source directories and `[overrides.NAME] git = "..."` for alternate git sources checked out at the manifest `rev`. Overrides apply during recursive dependency resolution and do not change the committed manifest's dependency identity.
 
 ## Dependency resolution flow
 

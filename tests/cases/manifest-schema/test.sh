@@ -381,14 +381,14 @@ manifest = "dep.manifest.toml"
 TOML
 expect_context_failure schema2_git_manifest "dependencies.dep git dependency may only contain git and rev"
 
-make_project schema2_override
-write_manifest schema2_override <<'TOML'
+make_project schema2_hol_override
+write_manifest schema2_hol_override <<'TOML'
 TOML
-cat > "$tmpdir/schema2_override/.holconfig.toml" <<'TOML'
-[overrides.dep]
-path = "../dep"
+cat > "$tmpdir/schema2_hol_override/.holconfig.toml" <<'TOML'
+[overrides.hol]
+path = "../hol"
 TOML
-expect_context_failure schema2_override "local dependency overrides are not supported"
+expect_context_failure schema2_hol_override "dependencies.hol cannot be overridden"
 
 write_manifest bad_action_field <<'TOML'
 

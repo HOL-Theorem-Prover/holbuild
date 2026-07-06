@@ -262,9 +262,8 @@ manifest = "shims/keccak.toml"
 Current dependency limits:
 
 - `rev` must be an exact lowercase 40-character commit hash.
-- Branches, tags, version ranges, registries, solvers, lockfiles, path
-  dependencies, local overrides, and multiple versions of one package are not
-  supported.
+- Branches, tags, version ranges, registries, solvers, lockfiles, manifest path
+  dependencies, and multiple versions of one package are not supported.
 - Direct git dependencies use only `git` and `rev`.
 - Subtree dependencies use `from`, `path`, and `manifest`.
 - `path` and `manifest` must be relative and must not contain `..`.
@@ -500,12 +499,26 @@ checkpoint_limit_gb = 20
 exclude = ["worktrees"]
 exclude_globs = ["scratch/*"]
 tactic_timeout = 10.0
+
+[overrides.foo]
+path = "../foo"
+
+[overrides.bar]
+git = "$BAR_REPO"
 ```
 
-This is for workstation settings, not dependency overrides. `build.jobs` sets
-local default parallelism, and `build.checkpoint_limit_gb` sets the local
-checkpoint storage budget in GiB; the built-in checkpoint budget default is 5.
-Dependency locations belong in `holproject.toml`.
+`build.jobs` sets local default parallelism, and `build.checkpoint_limit_gb`
+sets the local checkpoint storage budget in GiB; the built-in checkpoint budget
+default is 5.
+
+`[overrides.NAME]` maps a declared dependency to local workstation source. Use
+`path` to read an existing checkout directly, or `git` to replace the dependency
+git source while still checking out the manifest's exact `rev`. Override values
+may use environment variables. Local relative paths are resolved from the project
+root; URL-like git remotes are left unchanged. Overrides apply during recursive
+dependency resolution too, so a dependency declared by another dependency can be
+supplied from disk. Overridden dependencies still need a matching `project.name`
+in their `holproject.toml`; `dependencies.hol` cannot be overridden this way.
 
 Unknown fields in recognised `holproject.toml` and `.holconfig.toml` tables are
 errors.

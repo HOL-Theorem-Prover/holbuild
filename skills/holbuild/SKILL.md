@@ -75,8 +75,8 @@ Root project artifacts live under `.holbuild/`: `gen/`, `obj/`, `dep/`, `checkpo
 - HOL source parse errors are build failures; holbuild may still use parser recovery internally for best-effort instrumentation and diagnostics
 - Proof engine/checkpoint/timeout/trace flags are execution/debug policy, not final artifact action-key inputs
 - Manifests must be schema 2 and the resolved graph must contain exactly one `[dependencies.hol]` exact git rev; it uses a built-in manifest and builds/reuses shared HOL under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol` with `${HOLBUILD_POLY:-poly}`. `holbuild buildhol` warms this cache.
-- `--holdir`, `HOLDIR`, `HOLBUILD_HOLDIR`, schema 1, path dependencies, and local dependency overrides are no longer supported for project toolchains/dependencies.
-- Schema 2 supports exact git `rev` hashes and `from/path/manifest` deps only; in a `from` dependency, `path` selects source inside the referenced checkout and `manifest` is a shim relative to the declaring package. No ranges, tags, branches, lockfile, local overrides, or multiple versions yet
+- `--holdir`, `HOLDIR`, `HOLBUILD_HOLDIR`, schema 1, and manifest path dependencies are no longer supported for project toolchains/dependencies.
+- Schema 2 manifests support exact git `rev` hashes and `from/path/manifest` deps only; in a `from` dependency, `path` selects source inside the referenced checkout and `manifest` is a shim relative to the declaring package. No ranges, tags, branches, lockfile, or multiple versions yet. Workstation-local source overrides are configured in `.holconfig.toml [overrides.NAME]` with either `path` or `git` and apply during recursive dependency resolution.
 - HOL examples/tests are intentionally outside built-in HOL manifests; declare example subtrees (e.g. `keccakTheory`) as separate shimmed/from dependencies
 
 ## References
