@@ -59,7 +59,51 @@ require_grep "cache gc: removed" "$gc_log"
 [[ ! -e "$project/.holbuild/stage/old-stage" ]] || { echo "gc left stale stage dir" >&2; exit 1; }
 [[ ! -e "$project/.holbuild/logs/old.log" ]] || { echo "gc left stale log" >&2; exit 1; }
 if find "$project/.holbuild/checkpoints" -type f -print -quit 2>/dev/null | grep -q .; then
-  echo "gc left stale checkpoint artifacts" >&2
+  if find "$project/.holbuild/checkpoints" -type f \
+      ! -name .index-v1 ! -name .index-v1.tmp -print -quit 2>/dev/null | grep -q .; then
+    echo "gc left stale checkpoint artifacts" >&2
+    exit 1
+  fi
+fi
+require_file "$project/.holbuild/checkpoints/.index-v1"
+require_grep "holbuild-checkpoint-index-v1" "$project/.holbuild/checkpoints/.index-v1"
+printf 'not an index\n' > "$project/.holbuild/checkpoints/.index-v1"
+(cd "$project" && "$HOLBUILD_BIN" gc --clean-only --retention-days 0) > "$tmpdir/corrupt-index-gc.log" 2>&1
+require_grep "holbuild-checkpoint-index-v1" "$project/.holbuild/checkpoints/.index-v1"
+
+index_budget_project=$tmpdir/index-budget-project
+index_budget_family="$index_budget_project/.holbuild/checkpoints/index-budget/src/OldScript.sml"
+mkdir -p "$index_budget_project/.holbuild/checkpoints/index-budget/src/OldScript.sml.deps/old"
+cat > "$index_budget_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "index-budget"
+
+[build]
+members = []
+TOML
+cat > "$index_budget_project/.holconfig.toml" <<'TOML'
+[build]
+checkpoint_limit_gb = 1
+TOML
+truncate -s 2G "$index_budget_family.deps/old/deps_loaded.save"
+printf 'ok\n' > "$index_budget_family.deps/old/deps_loaded.save.ok"
+cat > "$index_budget_project/.holbuild/checkpoints/.index-v1" <<EOF_INDEX
+holbuild-checkpoint-index-v1
+root=$index_budget_project/.holbuild/checkpoints
+created_by=holbuild
+family	$index_budget_family	1	2147483651
+EOF_INDEX
+(cd "$index_budget_project" && "$HOLBUILD_BIN" build) > "$tmpdir/index-budget.log" 2>&1
+require_grep "checkpoint budget: .*evicted=" "$tmpdir/index-budget.log"
+if [[ -e "$index_budget_family.deps/old" ]]; then
+  echo "index-based checkpoint budget did not evict stale indexed family" >&2
   exit 1
 fi
 [[ ! -e "$cache/tmp/old" ]] || { echo "gc left stale cache tmp" >&2; exit 1; }
@@ -149,8 +193,8 @@ if [[ -e "$budget_family.deps/old-deps-key" || -e "$budget_family.theorems/old-d
 fi
 
 mid_project=$tmpdir/mid-budget-project
-mid_family="$mid_project/.holbuild/checkpoints/mid-budget/src/generated"
-mkdir -p "$mid_project/src" "$mid_family.deps/key"
+mid_family="$mid_project/.holbuild/checkpoints/mid-budget-generated/src/generated"
+mkdir -p "$mid_project/src"
 cat > "$mid_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
@@ -174,7 +218,7 @@ cat > "$mid_project/src/FirstScript.sml" <<SML
 open HolKernel Parse boolLib bossLib;
 val _ = new_theory "First";
 val _ = export_theory();
-val _ = OS.Process.system "truncate -s 2G $mid_family.deps/key/deps_loaded.save";
+val _ = OS.Process.system "mkdir -p $mid_family.deps/key && truncate -s 2G $mid_family.deps/key/deps_loaded.save";
 val out = TextIO.openOut "$mid_family.deps/key/deps_loaded.save.ok";
 val _ = (TextIO.output(out, "ok\\n"); TextIO.closeOut out);
 SML
@@ -195,6 +239,96 @@ require_grep "checkpoint budget: .*evicted=" "$tmpdir/mid-budget.log"
 require_grep "forced failure after mid-build budget check" "$tmpdir/mid-budget.log"
 if grep -q "mid-build checkpoint budget was not enforced" "$tmpdir/mid-budget.log"; then
   echo "checkpoint budget was not enforced between serial nodes" >&2
+  exit 1
+fi
+
+protected_project=$tmpdir/protected-active-project
+protected_slow_family="$protected_project/.holbuild/checkpoints/protected-active/src/SlowScript.sml"
+protected_live="$protected_slow_family.deps/live/deps_loaded.save"
+mkdir -p "$protected_project/src" "$protected_slow_family.deps/seed"
+cat > "$protected_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "protected-active"
+
+[build]
+members = ["src"]
+TOML
+cat > "$protected_project/.holconfig.toml" <<'TOML'
+[build]
+checkpoint_limit_gb = 1
+jobs = 3
+TOML
+printf 'seed\n' > "$protected_slow_family.deps/seed/deps_loaded.save"
+printf 'ok\n' > "$protected_slow_family.deps/seed/deps_loaded.save.ok"
+cat > "$protected_project/src/SlowScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Slow";
+val _ = export_theory();
+val _ = OS.Process.system "mkdir -p $protected_slow_family.deps/live && truncate -s 2G $protected_live && printf ok > $protected_live.ok";
+val _ = OS.Process.sleep (Time.fromSeconds 6);
+SML
+cat > "$protected_project/src/FastScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Fast";
+val _ = OS.Process.sleep (Time.fromSeconds 2);
+val _ = export_theory();
+SML
+cat > "$protected_project/src/ThirdScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Third";
+val _ = load "FastTheory";
+val _ =
+  if OS.FileSys.access("$protected_live.ok", []) then
+    raise Fail "protected active family survived"
+  else
+    raise Fail "protected active family was evicted";
+SML
+if (cd "$protected_project" && "$HOLBUILD_BIN" build --force=project --no-cache) > "$tmpdir/protected-active.log" 2>&1; then
+  echo "protected active family fixture unexpectedly succeeded" >&2
+  exit 1
+fi
+require_grep "checkpoint budget: .*checkpoint_limit_gb=1" "$tmpdir/protected-active.log"
+require_grep "protected active family survived" "$tmpdir/protected-active.log"
+if grep -q "protected active family was evicted" "$tmpdir/protected-active.log"; then
+  echo "checkpoint budget evicted an active protected family" >&2
+  exit 1
+fi
+
+scan_project=$tmpdir/scan-project
+mkdir -p "$scan_project/src"
+cat > "$scan_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "scan-project"
+
+[build]
+members = ["src"]
+TOML
+cat > "$scan_project/src/ScanScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Scan";
+val _ = export_theory();
+SML
+(cd "$scan_project" && "$HOLBUILD_BIN" build ScanTheory) > "$tmpdir/scan-first.log" 2>&1
+require_file "$scan_project/.holbuild/checkpoints/.index-v1"
+scan_counter=$tmpdir/checkpoint-scan-counter.log
+rm -f "$scan_counter"
+(cd "$scan_project" && HOLBUILD_CHECKPOINT_SCAN_COUNTER="$scan_counter" "$HOLBUILD_BIN" build ScanTheory) > "$tmpdir/scan-second.log" 2>&1
+if [[ -s "$scan_counter" ]]; then
+  echo "up-to-date build performed recursive checkpoint scan despite valid index" >&2
   exit 1
 fi
 
