@@ -1604,14 +1604,6 @@ fun cache_manifest_outputs_equal input_key left right =
     #dat_hash left_blobs = #dat_hash right_blobs
   end
 
-fun cache_manifest_load_metadata_equal input_key text parents mldeps =
-  let
-    val manifest = cache_manifest_blobs_from_lines input_key (cache_manifest_lines text)
-  in
-    #parents manifest = parents andalso #mldeps manifest = mldeps
-  end
-  handle _ => false
-
 fun cache_entry_usable root input_key text =
   let
     val {sig_hash, sml_hash, dat_hash, ...} =
@@ -1824,17 +1816,6 @@ fun publish_cache_manifest root cache_key subject staged_sig published_sml stage
       | NONE => put_new_manifest manifest
   end
 
-fun touch_existing_cache_manifest_if_current root cache_key cache_parents cache_mldeps proof_timeout =
-  case HolbuildCache.get_action root cache_key of
-      SOME old =>
-        if cache_entry_usable root cache_key old andalso
-           cache_manifest_load_metadata_equal cache_key old cache_parents cache_mldeps andalso
-           timeout_satisfies proof_timeout (cache_manifest_proof_timeout_text cache_key old) then
-          (HolbuildCache.touch_action root cache_key; true)
-        else false
-    | NONE => false
-  handle _ => false
-
 fun publish_theory_cache project plan node input_key proof_timeout staged_sig published_sml staged_dat {parents, mldeps} =
   let
     val root = cache_root ()
@@ -1847,8 +1828,7 @@ fun publish_theory_cache project plan node input_key proof_timeout staged_sig pu
     fun drop_stale_manifest key = HolbuildCache.remove_action root key
     val subject = cache_warning_subject node
     fun publish () =
-      if touch_existing_cache_manifest_if_current root cache_key cache_parents cache_mldeps proof_timeout then ()
-      else publish_cache_manifest root cache_key subject staged_sig published_sml staged_dat cache_parents cache_mldeps proof_timeout
+      publish_cache_manifest root cache_key subject staged_sig published_sml staged_dat cache_parents cache_mldeps proof_timeout
     fun skip_locked_publish () = ()
   in
     ((if cache_key <> input_key then
