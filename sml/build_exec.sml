@@ -704,6 +704,29 @@ fun gb_to_bytes gb = IntInf.fromInt gb * 1073741824
 
 fun string_member x xs = List.exists (fn y => x = y) xs
 
+fun evict_checkpoint_families_excluding dir families total max_bytes protected_bases =
+  if total <= max_bytes then 0
+  else
+    let
+      val evictable = List.filter (fn ({base, ...} : checkpoint_family) =>
+                                      not (string_member base protected_bases)) families
+      val sorted = sort_families_by_mtime_ascending evictable
+      fun evict remaining freed removed =
+        case remaining of
+            [] => removed
+          | ({base, bytes, ...} : checkpoint_family) :: rest =>
+              let val freed' = freed + bytes
+              in
+                remove_checkpoint_family_base base;
+                if total - freed' <= max_bytes then removed + 1
+                else evict rest freed' (removed + 1)
+              end
+      val evicted = evict sorted 0 0
+      val _ = if evicted = 0 then () else remove_empty_dirs dir
+    in
+      evicted
+    end
+
 fun evict_oldest_checkpoints_excluding dir max_bytes protected_bases =
   if max_bytes <= 0 then 0
   else
@@ -711,27 +734,7 @@ fun evict_oldest_checkpoints_excluding dir max_bytes protected_bases =
       val families = collect_checkpoint_families dir
       val total = total_checkpoint_bytes families
     in
-      if total <= max_bytes then 0
-      else
-        let
-          val evictable = List.filter (fn ({base, ...} : checkpoint_family) =>
-                                          not (string_member base protected_bases)) families
-          val sorted = sort_families_by_mtime_ascending evictable
-          fun evict remaining freed removed =
-            case remaining of
-                [] => removed
-              | ({base, bytes, ...} : checkpoint_family) :: rest =>
-                  let val freed' = freed + bytes
-                  in
-                    remove_checkpoint_family_base base;
-                    if total - freed' <= max_bytes then removed + 1
-                    else evict rest freed' (removed + 1)
-                  end
-          val evicted = evict sorted 0 0
-          val _ = remove_empty_dirs dir
-        in
-          evicted
-        end
+      evict_checkpoint_families_excluding dir families total max_bytes protected_bases
     end
 
 fun evict_oldest_checkpoints dir max_bytes =
@@ -743,9 +746,12 @@ type checkpoint_eviction =
 
 fun evict_oldest_checkpoints_with_stats_excluding dir max_bytes protected_bases =
   let
-    val before_bytes = checkpoint_bytes dir
-    val evicted = evict_oldest_checkpoints_excluding dir max_bytes protected_bases
-    val after_bytes = checkpoint_bytes dir
+    val families = collect_checkpoint_families dir
+    val before_bytes = total_checkpoint_bytes families
+    val evicted =
+      if max_bytes <= 0 then 0
+      else evict_checkpoint_families_excluding dir families before_bytes max_bytes protected_bases
+    val after_bytes = if evicted = 0 then before_bytes else checkpoint_bytes dir
   in
     {before_bytes = before_bytes, after_bytes = after_bytes,
      max_bytes = max_bytes, evicted = evicted}
@@ -2986,6 +2992,14 @@ fun build_one status options tc project base_context plan keys toolchain_key nod
     outcome
   end
 
+fun outcome_may_create_checkpoints options project node outcome =
+  case outcome of
+      HolbuildStatus.Built =>
+        (case #kind (HolbuildBuildPlan.source_of node) of
+             HolbuildSourceIndex.TheoryScript => checkpoint_enabled (checkpoint_policy_for_node options project node)
+           | _ => false)
+    | _ => false
+
 fun project_checkpoint_limit_gb project =
   Option.getOpt(HolbuildProject.checkpoint_limit_gb project, default_max_checkpoints_gb)
 
@@ -3051,8 +3065,11 @@ fun build_serial status options tc project base_context plan keys toolchain_key 
       | loop (node :: rest) =
           case one node of
               HolbuildStatus.Inspected => ()
-            | _ => (enforce_checkpoint_budget_excluding project [];
-                    loop rest)
+            | outcome =>
+                (if outcome_may_create_checkpoints options project node outcome then
+                   enforce_checkpoint_budget_excluding project []
+                 else ();
+                 loop rest)
   in
     loop (HolbuildBuildPlan.selected_nodes plan)
   end
@@ -3323,7 +3340,13 @@ fun build_parallel status options tc project base_context plan keys toolchain_ke
                 in
                   ((case build_one status options tc project base_context plan keys toolchain_key node of
                         HolbuildStatus.Inspected => finish_inspected id
-                      | _ => enforce_checkpoint_budget_excluding project (finish_success id);
+                      | outcome =>
+                          let val protected = finish_success id
+                          in
+                            if outcome_may_create_checkpoints options project node outcome then
+                              enforce_checkpoint_budget_excluding project protected
+                            else ()
+                          end;
                     loop ())
                    handle e =>
                      if stop_requested () then
