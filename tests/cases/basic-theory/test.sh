@@ -56,12 +56,21 @@ require_grep $'^phase\tname=build\.keys\.external\.source_hash\tstatus=ok\tms=.*
 require_grep $'^phase\tname=build\.keys\.external\.dep_cache\tstatus=ok\tms=.*\tcount=' "$first_timing"
 require_grep $'^phase\tname=build\.keys\.external\.theory_stamp\tstatus=ok\tms=.*\tcount=' "$first_timing"
 require_grep $'^phase\tname=build\.keys\.external\.lib_artifact\tstatus=ok\tms=.*\tcount=' "$first_timing"
+require_grep $'^phase\tname=build\.exec\.node\.analyse_boundaries\tstatus=ok\tms=' "$first_timing"
+require_grep $'^phase\tname=build\.exec\.node\.analyse_terminations\tstatus=ok\tms=' "$first_timing"
+require_grep $'^phase\tname=build\.exec\.node\.child_run\tstatus=ok\tms=' "$first_timing"
+require_grep $'^phase\tname=build\.exec\.checkpoint_budget\tstatus=ok\tms=' "$first_timing"
+require_grep $'^phase\tname=build\.exec\.publish_cache\tstatus=ok\tms=' "$first_timing"
 require_file "$project/.holbuild/logs/current/basic/ATheory/build.log"
 
 coarse_timing=$tmpdir/coarse.tool-timing
 (cd "$project" && HOLBUILD_TIMING_LOG="$coarse_timing" "$HOLBUILD_BIN" build --dry-run ATheory) > /dev/null
 if grep -q 'build\.keys\.external' "$coarse_timing"; then
   echo "fine-grained external timing should require HOLBUILD_TIMING_DETAIL=fine" >&2
+  exit 1
+fi
+if grep -q 'build\.exec\.node\|build\.exec\.checkpoint_budget\|build\.exec\.publish_cache' "$coarse_timing"; then
+  echo "fine-grained execution timing should require HOLBUILD_TIMING_DETAIL=fine" >&2
   exit 1
 fi
 

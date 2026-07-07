@@ -9,6 +9,10 @@ exception ErrorWithDebugArtifacts of string * HolbuildStatus.debug_artifacts
 exception ExecutionPlanPrinted
 exception RetryInvalidCheckpoint
 
+fun detail_time_phase name f =
+  if HolbuildToolchain.timing_detail_at 1 then HolbuildToolchain.time_phase name f
+  else f ()
+
 fun has_suffix suffix s =
   let
     val n = size s
@@ -850,13 +854,33 @@ fun gb_decimal_text bytes =
 
 fun sort_families_by_mtime_ascending families =
   let
-    fun insert x [] = [x]
-      | insert (x as {mtime = x_mtime, ...} : checkpoint_family)
-               ((y as {mtime = y_mtime, ...} : checkpoint_family) :: rest) =
-          if Time.<=(x_mtime, y_mtime) then x :: y :: rest
-          else y :: insert x rest
+    fun split xs =
+      let
+        fun loop left right rest =
+          case rest of
+              [] => (left, right)
+            | [x] => (x :: left, right)
+            | x :: y :: more => loop (x :: left) (y :: right) more
+      in
+        loop [] [] xs
+      end
+    fun merge left right =
+      case (left, right) of
+          ([], _) => right
+        | (_, []) => left
+        | ((x as {mtime = x_mtime, ...} : checkpoint_family) :: xs,
+           (y as {mtime = y_mtime, ...} : checkpoint_family) :: ys) =>
+            if Time.<=(x_mtime, y_mtime) then x :: merge xs right
+            else y :: merge left ys
+    fun sort xs =
+      case xs of
+          [] => []
+        | [_] => xs
+        | _ =>
+            let val (left, right) = split xs
+            in merge (sort left) (sort right) end
   in
-    List.foldl (fn (family, sorted) => insert family sorted) [] families
+    sort families
   end
 
 fun remove_stale_checkpoint_families cutoff dir =
@@ -1001,6 +1025,39 @@ fun file_exists path = FS.access(path, [FS.A_READ]) handle OS.SysErr _ => false
 fun checkpoint_exists path = file_exists path andalso file_exists (checkpoint_ok_path path)
 
 fun file_hash path = HolbuildHash.file_sha1 path
+
+type file_hash_cache = {entries : (string * string option) list ref, mutex : Mutex.mutex}
+
+fun new_file_hash_cache () =
+  {entries = ref [], mutex = Mutex.mutex ()}
+
+fun with_file_hash_cache_lock (cache : file_hash_cache) f =
+  (Mutex.lock (#mutex cache); f () before Mutex.unlock (#mutex cache))
+  handle e => (Mutex.unlock (#mutex cache); raise e)
+
+fun cached_file_hash cache path =
+  let
+    fun lookup entries =
+      case List.find (fn (candidate, _) => candidate = path) entries of
+          SOME (_, value) => SOME value
+        | NONE => NONE
+    fun remember value =
+      with_file_hash_cache_lock cache
+        (fn () =>
+            case lookup (!(#entries cache)) of
+                SOME old => old
+              | NONE => (#entries cache := (path, value) :: !(#entries cache); value))
+  in
+    case with_file_hash_cache_lock cache (fn () => lookup (!(#entries cache))) of
+        SOME value => value
+      | NONE =>
+          remember (SOME (file_hash path) handle _ => NONE)
+  end
+
+fun invalidate_cached_file_hash cache path =
+  with_file_hash_cache_lock cache
+    (fn () => #entries cache := List.filter (fn (candidate, _) => candidate <> path)
+                                            (!(#entries cache)))
 
 fun normalize_path path = Path.mkCanonical path handle Path.InvalidArc => path
 
@@ -1551,6 +1608,14 @@ fun cache_manifest_outputs_equal input_key left right =
     #dat_hash left_blobs = #dat_hash right_blobs
   end
 
+fun cache_manifest_load_metadata_equal input_key text parents mldeps =
+  let
+    val manifest = cache_manifest_blobs_from_lines input_key (cache_manifest_lines text)
+  in
+    #parents manifest = parents andalso #mldeps manifest = mldeps
+  end
+  handle _ => false
+
 fun cache_entry_usable root input_key text =
   let
     val {sig_hash, sml_hash, dat_hash, ...} =
@@ -1763,6 +1828,17 @@ fun publish_cache_manifest root cache_key subject staged_sig published_sml stage
       | NONE => put_new_manifest manifest
   end
 
+fun touch_existing_cache_manifest_if_current root cache_key cache_parents cache_mldeps proof_timeout =
+  case HolbuildCache.get_action root cache_key of
+      SOME old =>
+        if cache_entry_usable root cache_key old andalso
+           cache_manifest_load_metadata_equal cache_key old cache_parents cache_mldeps andalso
+           timeout_satisfies proof_timeout (cache_manifest_proof_timeout_text cache_key old) then
+          (HolbuildCache.touch_action root cache_key; true)
+        else false
+    | NONE => false
+  handle _ => false
+
 fun publish_theory_cache project plan node input_key proof_timeout staged_sig published_sml staged_dat {parents, mldeps} =
   let
     val root = cache_root ()
@@ -1774,7 +1850,9 @@ fun publish_theory_cache project plan node input_key proof_timeout staged_sig pu
     val cache_key = if path_dependent then path_dependent_cache_key project context_key else context_key
     fun drop_stale_manifest key = HolbuildCache.remove_action root key
     val subject = cache_warning_subject node
-    fun publish () = publish_cache_manifest root cache_key subject staged_sig published_sml staged_dat cache_parents cache_mldeps proof_timeout
+    fun publish () =
+      if touch_existing_cache_manifest_if_current root cache_key cache_parents cache_mldeps proof_timeout then ()
+      else publish_cache_manifest root cache_key subject staged_sig published_sml staged_dat cache_parents cache_mldeps proof_timeout
     fun skip_locked_publish () = ()
   in
     ((if cache_key <> input_key then
@@ -1968,6 +2046,10 @@ fun discover_theorem_boundaries_strict source_path source_text =
 
 fun discover_termination_diagnostics_strict source_path source_text =
   HolbuildTheorySpans.scan_terminations_strict source_path source_text
+  handle HolbuildTheoryCheckpoints.Error msg => raise Error msg
+
+fun discover_boundaries_and_terminations source_path source_text =
+  HolbuildTheorySpans.scan_boundaries_and_terminations_recovering_strict source_path source_text
   handle HolbuildTheoryCheckpoints.Error msg => raise Error msg
 
 fun theorem_checkpoint_key {kind, name, safe_name, boundary, deps_key, proof_engine, prefix_hash} =
@@ -2661,12 +2743,14 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
     val build_log = Path.concat(stage, "holbuild-build.log")
     val _ =
       (validate_hol_context (#context run_spec);
-       run_hol_files_to_log tc stage stage
-         (#context run_spec)
-         (#files run_spec @ [final_loader])
-         "holbuild-build.log"
-         (SOME (current_build_log project node))
-         "hol run failed while building theory script")
+       detail_time_phase "build.exec.node.child_run"
+         (fn () =>
+             run_hol_files_to_log tc stage stage
+               (#context run_spec)
+               (#files run_spec @ [final_loader])
+               "holbuild-build.log"
+               (SOME (current_build_log project node))
+               "hol run failed while building theory script"))
       handle Error msg =>
         if invalid_checkpoint_retryable base_context (#context run_spec) msg then
           let
@@ -2735,7 +2819,9 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
                                                            mldeps_report = mldeps_report}
     val _ =
       if cache_allowed then
-        publish_theory_cache project plan node input_key (tactic_timeout policy) staged_sig sml_path staged_dat generated_metadata
+        detail_time_phase "build.exec.publish_cache"
+          (fn () => publish_theory_cache project plan node input_key (tactic_timeout policy)
+                                      staged_sig sml_path staged_dat generated_metadata)
       else ()
   in
     write_local_theory_manifests plan node generated_metadata;
@@ -2918,31 +3004,37 @@ fun project_theory_deps plan node =
     (fn dep => #kind (HolbuildBuildPlan.source_of dep) = HolbuildSourceIndex.TheoryScript)
     (HolbuildBuildPlan.direct_project_deps plan node)
 
-fun theory_parent_hash_matches dat_text dep =
+fun theory_parent_hash_matches dat_hash_cache dat_text dep =
   let
     val parent_name = theory_name_from_logical (logical_name dep)
-    val parent_hash = file_hash (#data_path (theory_outputs dep))
   in
-    case theory_dat_parent_hash dat_text parent_name of
-        NONE => true
-      | SOME recorded_hash => recorded_hash = parent_hash
+    case (theory_dat_parent_hash dat_text parent_name,
+          cached_file_hash dat_hash_cache (#data_path (theory_outputs dep))) of
+        (NONE, _) => true
+      | (SOME recorded_hash, SOME parent_hash) => recorded_hash = parent_hash
+      | (SOME _, NONE) => false
   end
 
-fun theory_parent_hashes_match plan node =
-  case #kind (HolbuildBuildPlan.source_of node) of
-      HolbuildSourceIndex.TheoryScript =>
-        let val dat_text = read_text (#data_path (theory_outputs node))
-        in List.all (theory_parent_hash_matches dat_text) (project_theory_deps plan node) end
-    | _ => true
-  handle _ => false
+fun theory_parent_hashes_match dat_hash_cache plan node =
+  detail_time_phase "build.exec.node.parent_hash_check"
+    (fn () =>
+        (case #kind (HolbuildBuildPlan.source_of node) of
+             HolbuildSourceIndex.TheoryScript =>
+               let val dat_text = read_text (#data_path (theory_outputs node))
+               in List.all (theory_parent_hash_matches dat_hash_cache dat_text)
+                           (project_theory_deps plan node) end
+           | _ => true)
+        handle _ => false)
 
-fun up_to_date checkpoint_policy project plan _ input_key _ node _ =
-  List.all (output_exists_for_node node) (output_paths checkpoint_policy project node) andalso
-  (case current_metadata (metadata_path project node) of
-       SOME text => metadata_input_key_matches input_key text andalso
-                    metadata_timeout_satisfies checkpoint_policy node text
-     | NONE => false) andalso
-  theory_parent_hashes_match plan node
+fun up_to_date dat_hash_cache checkpoint_policy project plan _ input_key _ node _ =
+  detail_time_phase "build.exec.node.up_to_date"
+    (fn () =>
+        List.all (output_exists_for_node node) (output_paths checkpoint_policy project node) andalso
+        (case current_metadata (metadata_path project node) of
+             SOME text => metadata_input_key_matches input_key text andalso
+                          metadata_timeout_satisfies checkpoint_policy node text
+           | NONE => false) andalso
+        theory_parent_hashes_match dat_hash_cache plan node)
 
 fun write_metadata checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints =
   write_text (metadata_path project node)
@@ -3040,7 +3132,8 @@ fun analyser_proof_ir_plan_sml_for_boundaries (boundaries : HolbuildTheoryCheckp
         in List.tabulate(expected, require) end
 
 fun source_boundaries_for_node node source_text =
-  SOME (discover_theorem_boundaries_recovering (source_file node) source_text)
+  SOME (detail_time_phase "build.exec.node.analyse_boundaries"
+          (fn () => discover_theorem_boundaries_recovering (source_file node) source_text))
   handle Error msg =>
     (warn ("could not safely instrument theorem boundaries for " ^ logical_name node ^
            "; building without proof steps/checkpoints for this theory\n" ^ msg);
@@ -3051,7 +3144,12 @@ fun theory_checkpoints_for_node policy project plan keys toolchain_key node sour
   else
     let
       val deps_key = dependency_context_key toolchain_key plan keys node
-      val proof_ir_plans = if proof_ir_enabled policy then analyser_proof_ir_plan_sml_for_boundaries boundaries else map (fn _ => NONE) boundaries
+      val proof_ir_plans =
+        if null boundaries then []
+        else if proof_ir_enabled policy then
+          detail_time_phase "build.exec.node.proof_ir_plan"
+            (fn () => analyser_proof_ir_plan_sml_for_boundaries boundaries)
+        else map (fn _ => NONE) boundaries
       val _ =
         case errors of
             [] => ()
@@ -3070,11 +3168,31 @@ fun theory_checkpoints_for_node policy project plan keys toolchain_key node sour
 
 fun termination_diagnostics_for_node policy node source_text =
   if not (proof_steps_enabled policy) then []
-  else discover_termination_diagnostics_strict (source_file node) source_text
+  else detail_time_phase "build.exec.node.analyse_terminations"
+         (fn () => discover_termination_diagnostics_strict (source_file node) source_text)
     handle Error msg =>
       (warn ("could not safely instrument termination diagnostics for " ^ logical_name node ^
              "; building without termination goal diagnostics for this theory\n" ^ msg);
        [])
+
+fun source_spans_for_node policy node source_text =
+  if proof_steps_enabled policy then
+    let
+      val combined =
+        detail_time_phase "build.exec.node.analyse_boundaries"
+          (fn () =>
+              detail_time_phase "build.exec.node.analyse_terminations"
+                (fn () => discover_boundaries_and_terminations (source_file node) source_text))
+    in
+      {source_boundaries = SOME {boundaries = #boundaries combined, errors = #errors combined},
+       termination_diagnostics = #terminations combined}
+    end
+    handle Error _ =>
+      {source_boundaries = source_boundaries_for_node node source_text,
+       termination_diagnostics = termination_diagnostics_for_node policy node source_text}
+  else
+    {source_boundaries = source_boundaries_for_node node source_text,
+     termination_diagnostics = []}
 
 fun declaration_checkpoints_for_node policy project plan keys toolchain_key node source_text terminations =
   if not (checkpoint_enabled policy) orelse not (proof_steps_enabled policy) then []
@@ -3086,7 +3204,7 @@ fun declaration_checkpoints_for_node policy project plan keys toolchain_key node
              "; building without termination-definition checkpoints for this theory\n" ^ msg);
        [])
 
-fun build_theory_node (options : build_options) tc project base_context plan keys toolchain_key node input_key =
+fun build_theory_node dat_hash_cache (options : build_options) tc project base_context plan keys toolchain_key node input_key =
   let
     val policy = checkpoint_policy_for_node options project node
     val metadata_checkpoints = []
@@ -3094,29 +3212,33 @@ fun build_theory_node (options : build_options) tc project base_context plan key
     val forced = force_node options project node
     val cache_allowed = #use_cache options andalso cache_enabled node
     val cache_restore_allowed = cache_allowed andalso not forced
+    fun invalidate_node_dat_hash () =
+      invalidate_cached_file_hash dat_hash_cache (#data_path (theory_outputs node))
     fun materialize_valid_cache () =
       materialize_theory_cache tc project plan input_key (tactic_timeout policy) node andalso
-      (if theory_parent_hashes_match plan node then true
+      (if theory_parent_hashes_match dat_hash_cache plan node then true
        else (remove_failed_cache_outputs project node; false))
   in
     if not forced andalso not (always_reexecute node) andalso
-       up_to_date policy project plan keys input_key toolchain_key node metadata_checkpoints then
+       up_to_date dat_hash_cache policy project plan keys input_key toolchain_key node metadata_checkpoints then
       (remove_tree_if_exists stage;
        HolbuildStatus.UpToDate)
     else if cache_restore_allowed andalso materialize_valid_cache () then
       (remove_tree stage;
+       invalidate_node_dat_hash ();
        write_metadata policy project plan keys input_key toolchain_key node metadata_checkpoints;
        HolbuildStatus.Restored)
     else
       let
         val source_text = read_text (source_file node)
-        val source_boundaries = source_boundaries_for_node node source_text
+        val source_spans = source_spans_for_node policy node source_text
+        val source_boundaries = #source_boundaries source_spans
         val theorem_checkpoints =
           case source_boundaries of
               NONE => []
             | SOME {boundaries, errors} =>
                 theory_checkpoints_for_node policy project plan keys toolchain_key node source_text boundaries errors
-        val termination_diagnostics = termination_diagnostics_for_node policy node source_text
+        val termination_diagnostics = #termination_diagnostics source_spans
         val declaration_checkpoints =
           declaration_checkpoints_for_node policy project plan keys toolchain_key node source_text termination_diagnostics
       in
@@ -3124,6 +3246,7 @@ fun build_theory_node (options : build_options) tc project base_context plan key
           fun build_after_checkpoint_retries retries_left =
             ((build_theory cache_allowed policy tc project base_context plan keys toolchain_key node source_text theorem_checkpoints declaration_checkpoints termination_diagnostics;
               remove_failed_prefix_checkpoints theorem_checkpoints;
+              invalidate_node_dat_hash ();
               write_metadata policy project plan keys input_key toolchain_key node metadata_checkpoints;
               HolbuildStatus.Built)
              handle RetryInvalidCheckpoint =>
@@ -3136,22 +3259,22 @@ fun build_theory_node (options : build_options) tc project base_context plan key
       end
   end
 
-fun build_node options tc project base_context plan keys toolchain_key node =
+fun build_node dat_hash_cache options tc project base_context plan keys toolchain_key node =
   let val input_key = HolbuildBuildPlan.input_key_for keys node
   in
     case #kind (HolbuildBuildPlan.source_of node) of
         HolbuildSourceIndex.TheoryScript =>
-          build_theory_node options tc project base_context plan keys toolchain_key node input_key
+          build_theory_node dat_hash_cache options tc project base_context plan keys toolchain_key node input_key
       | HolbuildSourceIndex.Sml =>
           if not (force_node options project node) andalso not (always_reexecute node) andalso
-             up_to_date no_checkpoint_policy project plan keys input_key toolchain_key node [] then
+             up_to_date dat_hash_cache no_checkpoint_policy project plan keys input_key toolchain_key node [] then
             HolbuildStatus.UpToDate
           else (build_sml_like plan node ".uo";
                 write_metadata no_checkpoint_policy project plan keys input_key toolchain_key node [];
                 HolbuildStatus.Built)
       | HolbuildSourceIndex.Sig =>
           if not (force_node options project node) andalso not (always_reexecute node) andalso
-             up_to_date no_checkpoint_policy project plan keys input_key toolchain_key node [] then
+             up_to_date dat_hash_cache no_checkpoint_policy project plan keys input_key toolchain_key node [] then
             HolbuildStatus.UpToDate
           else (build_sml_like plan node ".ui";
                 write_metadata no_checkpoint_policy project plan keys input_key toolchain_key node [];
@@ -3166,7 +3289,7 @@ fun node_policy options project node =
 
 fun node_is_up_to_date options project plan keys toolchain_key node =
   not (force_node options project node) andalso not (always_reexecute node) andalso
-  up_to_date (node_policy options project node)
+  up_to_date (new_file_hash_cache ()) (node_policy options project node)
              project plan keys (HolbuildBuildPlan.input_key_for keys node)
              toolchain_key node []
 
@@ -3190,12 +3313,12 @@ fun all_nodes_up_to_date options project plan keys toolchain_key =
 fun report_all_up_to_date status project keys plan =
   List.app (report_up_to_date_node status project keys) (HolbuildBuildPlan.selected_nodes plan)
 
-fun build_one status options tc project base_context plan keys toolchain_key node =
+fun build_one dat_hash_cache status options tc project base_context plan keys toolchain_key node =
   let
     val key = HolbuildBuildPlan.key node
     val label = HolbuildBuildPlan.logical_name node
     val _ = HolbuildStatus.start_node status key label
-    val outcome = build_node options tc project base_context plan keys toolchain_key node
+    val outcome = build_node dat_hash_cache options tc project base_context plan keys toolchain_key node
   in
     HolbuildStatus.finish_node status key label outcome;
     outcome
@@ -3307,42 +3430,48 @@ fun enforce_checkpoint_index_locked (state : checkpoint_budget_state) index prot
   end
 
 fun enforce_checkpoint_budget_state_excluding state protected_bases =
-  with_checkpoint_budget_lock state
+  detail_time_phase "build.exec.checkpoint_budget"
     (fn () =>
-        let
-          val final_index = enforce_checkpoint_index_locked state (!(#index state)) protected_bases
-        in
-          #index state := final_index;
-          #watch state := checkpoint_watch_snapshot (#checkpoint_dir state) (#families final_index)
-        end)
+        with_checkpoint_budget_lock state
+          (fn () =>
+              let
+                val final_index = enforce_checkpoint_index_locked state (!(#index state)) protected_bases
+              in
+                #index state := final_index;
+                #watch state := checkpoint_watch_snapshot (#checkpoint_dir state) (#families final_index)
+              end))
 
 fun refresh_checkpoint_budget_after_node state project node protected_bases =
-  with_checkpoint_budget_lock state
+  detail_time_phase "build.exec.checkpoint_budget"
     (fn () =>
-        let
-          val dir = #checkpoint_dir state
-          val base = checkpoint_base project node
-          val current_index = !(#index state)
-          val index' =
-            if checkpoint_out_of_family_change dir (#families current_index) (package node) base (!(#watch state)) then
-              rebuild_checkpoint_index dir
-            else refresh_index_family current_index base
-          val final_index = enforce_checkpoint_index_locked state index' protected_bases
-        in
-          #index state := final_index;
-          #watch state := checkpoint_watch_snapshot dir (#families final_index)
-        end)
+        with_checkpoint_budget_lock state
+          (fn () =>
+              let
+                val dir = #checkpoint_dir state
+                val base = checkpoint_base project node
+                val current_index = !(#index state)
+                val index' =
+                  if checkpoint_out_of_family_change dir (#families current_index) (package node) base (!(#watch state)) then
+                    rebuild_checkpoint_index dir
+                  else refresh_index_family current_index base
+                val final_index = enforce_checkpoint_index_locked state index' protected_bases
+              in
+                #index state := final_index;
+                #watch state := checkpoint_watch_snapshot dir (#families final_index)
+              end))
 
 fun enforce_checkpoint_budget_excluding project protected_bases =
-  let
-    val checkpoint_limit_gb = project_checkpoint_limit_gb project
-    val max_bytes = gb_to_bytes checkpoint_limit_gb
-    val eviction = evict_oldest_checkpoints_with_stats_excluding
-                     (project_state_dir project "checkpoints") max_bytes protected_bases
-    val {before_bytes, after_bytes, evicted, ...} = eviction
-  in
-    checkpoint_budget_warnings checkpoint_limit_gb eviction
-  end
+  detail_time_phase "build.exec.checkpoint_budget"
+    (fn () =>
+        let
+          val checkpoint_limit_gb = project_checkpoint_limit_gb project
+          val max_bytes = gb_to_bytes checkpoint_limit_gb
+          val eviction = evict_oldest_checkpoints_with_stats_excluding
+                         (project_state_dir project "checkpoints") max_bytes protected_bases
+          val {before_bytes, after_bytes, evicted, ...} = eviction
+        in
+          checkpoint_budget_warnings checkpoint_limit_gb eviction
+        end)
 
 fun enforce_checkpoint_budget project = enforce_checkpoint_budget_excluding project []
 
@@ -3362,7 +3491,7 @@ fun protected_checkpoint_bases_for_nodes project plan nodes =
     List.foldl (fn (node, protected) => add_node node protected) [] nodes
   end
 
-fun build_serial status options tc project base_context plan keys toolchain_key budget_state =
+fun build_serial dat_hash_cache status options tc project base_context plan keys toolchain_key budget_state =
   let
     fun error_message e =
       case e of
@@ -3374,7 +3503,7 @@ fun build_serial status options tc project base_context plan keys toolchain_key 
           ErrorWithDebugArtifacts (_, artifacts) => artifacts
         | _ => HolbuildStatus.no_debug_artifacts
     fun one node =
-      build_one status options tc project base_context plan keys toolchain_key node
+      build_one dat_hash_cache status options tc project base_context plan keys toolchain_key node
       handle e =>
         let
           val msg = error_message e
@@ -3426,7 +3555,7 @@ fun build_error_debug_artifacts e =
       ErrorWithDebugArtifacts (_, artifacts) => artifacts
     | _ => HolbuildStatus.no_debug_artifacts
 
-fun build_parallel status options tc project base_context plan keys toolchain_key jobs budget_state =
+fun build_parallel dat_hash_cache status options tc project base_context plan keys toolchain_key jobs budget_state =
   let
     (* Keep scheduler state explicit and reusable: precompute reverse dependency
        edges once, then release dependents by decrementing remaining_dep counts.
@@ -3451,6 +3580,36 @@ fun build_parallel status options tc project base_context plan keys toolchain_ke
     val failed_prefix_priority = Array.array (node_count, NONE : bool option)
 
     fun node_id node = HolbuildBuildPlan.indexed_key_id key_index (HolbuildBuildPlan.key node)
+
+    val protected_bases_cache = Array.array (node_count, NONE : string list option)
+
+    fun add_unique_base (base, bases) =
+      if string_member base bases then bases else base :: bases
+
+    fun add_bases (bases, acc) = List.foldl add_unique_base acc bases
+
+    fun protected_bases_for_id id =
+      case Array.sub (protected_bases_cache, id) of
+          SOME bases => bases
+        | NONE =>
+            let
+              val node = Vector.sub (nodes, id)
+              val deps = HolbuildBuildPlan.direct_project_deps plan node
+              val bases =
+                List.foldl
+                  (fn (dep, acc) => add_bases (protected_bases_for_id (node_id dep), acc))
+                  [checkpoint_base project node]
+                  deps
+            in
+              Array.update (protected_bases_cache, id, SOME bases);
+              bases
+            end
+
+    fun precompute_protected_bases id =
+      if id >= node_count then ()
+      else (ignore (protected_bases_for_id id); precompute_protected_bases (id + 1))
+
+    val _ = precompute_protected_bases 0
 
     fun add_ready id = ready := id :: !ready
 
@@ -3576,17 +3735,17 @@ fun build_parallel status options tc project base_context plan keys toolchain_ke
       (finish_priority_focus id;
        if failed_prefix_priority_node id then priority_running := !priority_running - 1 else ())
 
-    fun active_nodes_snapshot_locked () =
+    fun active_node_ids_snapshot_locked () =
       let
         fun loop i acc =
           if i >= node_count then acc
-          else loop (i + 1) (if Array.sub (active_nodes, i) then Vector.sub (nodes, i) :: acc else acc)
+          else loop (i + 1) (if Array.sub (active_nodes, i) then i :: acc else acc)
       in
         loop 0 []
       end
 
-    fun active_protected_bases_locked () =
-      protected_checkpoint_bases_for_nodes project plan (active_nodes_snapshot_locked ())
+    fun protected_bases_for_ids ids =
+      List.foldl (fn (id, acc) => add_bases (protected_bases_for_id id, acc)) [] ids
 
     fun finish_success id =
       with_lock
@@ -3596,10 +3755,8 @@ fun build_parallel status options tc project base_context plan keys toolchain_ke
               val _ = Array.update (active_nodes, id, false)
               val _ = finish_priority id
               val _ = completed := !completed + 1
-              val finished_node = Vector.sub (nodes, id)
               val _ = if !stopped then () else List.app release_dependent (Array.sub (dependents, id))
-              val protected = protected_checkpoint_bases_for_nodes
-                                project plan (finished_node :: active_nodes_snapshot_locked ())
+              val protected = protected_bases_for_ids (id :: active_node_ids_snapshot_locked ())
             in
               signal ();
               protected
@@ -3662,7 +3819,7 @@ fun build_parallel status options tc project base_context plan keys toolchain_ke
             | SOME id =>
                 let val node = Vector.sub (nodes, id)
                 in
-                  ((case build_one status options tc project base_context plan keys toolchain_key node of
+                  ((case build_one dat_hash_cache status options tc project base_context plan keys toolchain_key node of
                         HolbuildStatus.Inspected => finish_inspected id
                       | outcome =>
                           let val protected = finish_success id
@@ -3719,12 +3876,13 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
     val _ = enforce_checkpoint_budget_state_excluding budget_state []
     val base_context = toolchain_base_context tc
     val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project) toolchain_key plan
+    val dat_hash_cache = new_file_hash_cache ()
   in
     let
       val status = HolbuildStatus.create {total = length (HolbuildBuildPlan.selected_nodes plan), jobs = jobs}
       fun run () =
-        if jobs <= 1 then build_serial status options tc project base_context plan keys toolchain_key budget_state
-        else build_parallel status options tc project base_context plan keys toolchain_key jobs budget_state
+        if jobs <= 1 then build_serial dat_hash_cache status options tc project base_context plan keys toolchain_key budget_state
+        else build_parallel dat_hash_cache status options tc project base_context plan keys toolchain_key jobs budget_state
     in
       (run (); HolbuildStatus.finish status; enforce_checkpoint_budget_state_excluding budget_state [])
       handle e => (HolbuildStatus.finish status; enforce_checkpoint_budget_state_excluding budget_state []; raise e)

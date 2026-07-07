@@ -176,15 +176,20 @@ fun emit_proof_plan_with_id id ({name, tactic_start, tactic_end, steps} : PI.the
   [P.join ["end-proof-ir", id]]
 
 fun span_lines path wants =
-  let val text = read_all_file path
+  let
+    val text = read_all_file path
+    val boundary_lines =
+      if member "boundaries-recovering" wants then
+        let val {boundaries, errors} = S.scan_recovering path text
+        in map emit_boundary boundaries @ map (fn e => P.join ["parse-error", e]) errors end
+      else if member "boundaries-strict" wants then map emit_boundary (S.scan_strict path text)
+      else if member "boundaries" wants then map emit_boundary (S.scan path text)
+      else []
+    val termination_lines =
+      if member "terminations-strict" wants then map emit_termination (S.scan_terminations_strict path text)
+      else []
   in
-    if member "boundaries-recovering" wants then
-      let val {boundaries, errors} = S.scan_recovering path text
-      in map emit_boundary boundaries @ map (fn e => P.join ["parse-error", e]) errors end
-    else if member "boundaries-strict" wants then map emit_boundary (S.scan_strict path text)
-    else if member "boundaries" wants then map emit_boundary (S.scan path text)
-    else if member "terminations-strict" wants then map emit_termination (S.scan_terminations_strict path text)
-    else []
+    boundary_lines @ termination_lines
   end
 
 fun analyse_file ({id, path, wants} : file_req) =
