@@ -91,7 +91,7 @@ Schema 2 dependency forms:
 
 Dependency `name` in `[dependencies.X]` must match `project.name` in the resolved manifest when the manifest declares a name. Mismatch is an error, except for the built-in `hol` manifest.
 
-Unsupported: schema 1, `[dependencies.HOLDIR]`, path dependencies, local dependency overrides, dependency path environment expansion, branches/tags/ranges, registries, lockfiles, solvers, and multiple versions of one package.
+Unsupported: schema 1, `[dependencies.HOLDIR]`, manifest path dependencies, dependency path environment expansion, branches/tags/ranges, registries, lockfiles, solvers, and multiple versions of one package. Local `path`/`git` source overrides are available in `.holconfig.toml`, not in committed manifests.
 
 ## Path rules
 

@@ -8,9 +8,15 @@ exclude = ["worktrees"]       # appends to manifest path/subtree excludes
 exclude_globs = ["scratch/*"] # appends to manifest glob excludes
 jobs = 16                     # default -j when not specified on CLI
 tactic_timeout = 30.0       # root-package per-step timeout (overrides manifest [build].tactic_timeout)
+
+[overrides.foo]
+path = "../foo"             # local dependency source directory
+
+[overrides.bar]
+git = "$BAR_REPO"           # local/alternate git source; manifest rev is retained
 ```
 
-Dependency overrides are no longer supported. Project/dependency locations are part of schema 2 manifests and are resolved through exact git revisions plus `from/path/manifest` shim dependencies.
+Dependency overrides are local-only source substitutions. The committed manifest still declares the dependency with exact `git`/`rev`. `.holconfig.toml [overrides.NAME].path` makes holbuild read that dependency from the given directory instead of materializing it from git. `.holconfig.toml [overrides.NAME].git` replaces the dependency git source while retaining the manifest `rev`. Environment variables are expanded; local relative paths are resolved from the project root; URL-like git remotes are left unchanged. Overrides are carried through recursive dependency resolution. `dependencies.hol` cannot be overridden this way.
 
 ## Build excludes
 

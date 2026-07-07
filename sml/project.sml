@@ -36,7 +36,9 @@ datatype dependency_source =
 
 datatype dependency = Dependency of {name : string, source : dependency_source}
 
-datatype override = Override of {name : string, path : string}
+datatype override =
+    OverridePath of {name : string, path : string}
+  | OverrideGit of {name : string, git : string}
 
 datatype local_config = LocalConfig of {overrides : override list, build_excludes : string list, build_exclude_globs : string list, build_jobs : int option, build_tactic_timeout : real option, checkpoint_limit_gb : int option}
 
@@ -345,6 +347,12 @@ fun require_safe_materialized_dependency_name context name =
   if safe_materialized_dependency_name name then ()
   else die (context ^ " must be a safe dependency name: " ^ name)
 
+fun is_hex c = Char.isDigit c orelse (#"a" <= c andalso c <= #"f")
+
+fun validate_git_rev rev =
+  if size rev = 40 andalso List.all is_hex (String.explode rev) then ()
+  else die ("git dependency rev must be a full 40-character lowercase hex commit: " ^ rev)
+
 fun named_table_entries table key =
   case table_field table key of
       NONE => []
@@ -494,7 +502,7 @@ fun validate_dependency_table (name, table) =
   in
     require_known_fields context ["git", "rev", "from", "path", "manifest"] table;
     case (git, rev, from, path, manifest) of
-        (SOME _, SOME _, NONE, NONE, NONE) => ()
+        (SOME _, SOME rev, NONE, NONE, NONE) => validate_git_rev rev
       | (SOME _, NONE, _, _, _) => die (context ^ " with git requires rev")
       | (NONE, SOME _, _, _, _) => die (context ^ " with rev requires git")
       | (SOME _, SOME _, _, _, _) => die (context ^ " git dependency may only contain git and rev")
@@ -554,7 +562,15 @@ fun validate_manifest_table table =
   end
 
 fun validate_override_table (name, table) =
-  require_known_fields ("overrides." ^ name) ["path"] table
+  (require_safe_materialized_dependency_name ("overrides." ^ name) name;
+   if name = "hol" then die "dependencies.hol cannot be overridden; use dependencies.hol.git with a local path and HOLBUILD_CANONICAL_HOL_GIT"
+   else ();
+   require_known_fields ("overrides." ^ name) ["path", "git"] table;
+   case (string_field table "path", string_field table "git") of
+       (SOME _, NONE) => ()
+     | (NONE, SOME _) => ()
+     | (SOME _, SOME _) => die ("overrides." ^ name ^ " must specify only one of path or git")
+     | (NONE, NONE) => die ("overrides." ^ name ^ " requires path or git"))
 
 fun validate_local_build_table table =
   require_known_fields ".holconfig.toml build" ["exclude", "exclude_globs", "jobs", "tactic_timeout", "checkpoint_limit_gb"] table
@@ -619,12 +635,34 @@ fun parse_action_policy root (logical, table) =
 fun action_policies_at root table =
   map (parse_action_policy root) (named_table_entries table ["actions"])
 
-fun parse_override (name, table) =
-  case path_string_field ("overrides." ^ name) table "path" of
-      SOME path => Override {name = name, path = path}
-    | NONE => die ("[overrides." ^ name ^ "] requires path")
+fun override_abs root path =
+  let val raw = if Path.isAbsolute path then path else Path.concat(root, path)
+  in Path.mkCanonical raw handle Path.InvalidArc => raw end
 
-fun overrides_at table = map parse_override (named_table_entries table ["overrides"])
+fun starts_with prefix s =
+  let val n = size prefix
+  in size s >= n andalso String.substring(s, 0, n) = prefix end
+
+fun contains c s = CharVector.exists (fn c' => c' = c) s
+
+fun remote_git_like git =
+  contains #":" git andalso not (starts_with "." git) andalso not (starts_with "/" git)
+
+fun local_git_abs root git =
+  if Path.isAbsolute git then override_abs root git
+  else if starts_with "http://" git orelse starts_with "https://" git orelse
+          starts_with "ssh://" git orelse starts_with "git://" git orelse
+          starts_with "file://" git orelse remote_git_like git then git
+  else override_abs root git
+
+fun parse_override root (name, table) =
+  case (path_string_field ("overrides." ^ name) table "path",
+        path_string_field ("overrides." ^ name) table "git") of
+      (SOME path, NONE) => OverridePath {name = name, path = override_abs root path}
+    | (NONE, SOME git) => OverrideGit {name = name, git = local_git_abs root git}
+    | _ => die ("[overrides." ^ name ^ "] requires path or git")
+
+fun overrides_at root table = map (parse_override root) (named_table_entries table ["overrides"])
 
 fun local_build_excludes table =
   case table_field table ["build"] of
@@ -686,7 +724,7 @@ fun parse_local_config root =
         val _ = validate_local_config_table table
         val (build_excludes, build_exclude_globs) = local_build_excludes table
       in
-        LocalConfig {overrides = overrides_at table,
+        LocalConfig {overrides = overrides_at root table,
                      build_excludes = build_excludes,
                      build_exclude_globs = build_exclude_globs,
                      build_jobs = local_build_jobs table,
@@ -719,10 +757,6 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
     val manifest_timeout = build_tactic_timeout_from_manifest build
     val schema = schema_version table
     val dependencies = dependencies_at table
-    val _ =
-      if not (null overrides) then
-        die "local dependency overrides are not supported"
-      else ()
     val _ = validate_schema2_dependency_refs dependencies
   in
     { root = root,
@@ -790,11 +824,24 @@ fun abs_run_heap ({root, run_heap, ...} : t) = Option.map (abs_under root) run_h
 
 fun override_path overrides name =
   let
-    fun matches (Override {name = name', ...}) = name = name'
+    fun matches (OverridePath {name = name', ...}) = name = name'
+      | matches (OverrideGit {name = name', ...}) = name = name'
   in
     case List.find matches overrides of
-        SOME (Override {path, ...}) => SOME path
+        SOME (OverridePath {path, ...}) => SOME path
       | NONE => NONE
+      | SOME (OverrideGit _) => NONE
+  end
+
+fun override_git overrides name =
+  let
+    fun matches (OverridePath {name = name', ...}) = name = name'
+      | matches (OverrideGit {name = name', ...}) = name = name'
+  in
+    case List.find matches overrides of
+        SOME (OverrideGit {git, ...}) => SOME git
+      | NONE => NONE
+      | SOME (OverridePath _) => NONE
   end
 
 fun dependency_name (Dependency {name, ...}) = name
@@ -855,23 +902,29 @@ fun dependency_path_context name = "dependencies." ^ name ^ ".path"
 fun dependency_manifest_context name = "dependencies." ^ name ^ ".manifest"
 
 fun dependency_local_path (project as {graph_artifact_root, ...} : t) (Dependency {name, source}) =
-  case source of
-      GitSource {git, rev} =>
-        if name = "hol" then SOME (HolbuildHolSharedCache.holdir_for {git = git, rev = rev})
-        else SOME (Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), name))
-    | FromSource {from, path, ...} =>
-        (case hol_dependency project of
-             SOME (Dependency {name = "hol", source = GitSource {git, rev}}) =>
-               if from = "hol" then SOME (Path.concat(HolbuildHolSharedCache.holdir_for {git = git, rev = rev}, path))
-               else SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path))
-           | _ => SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path)))
+  case override_path (#overrides project) name of
+      SOME path => SOME path
+    | NONE =>
+        case source of
+            GitSource {git, rev} =>
+              if name = "hol" then SOME (HolbuildHolSharedCache.holdir_for {git = git, rev = rev})
+              else SOME (Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), name))
+          | FromSource {from, path, ...} =>
+              (case hol_dependency project of
+                   SOME (Dependency {name = "hol", source = GitSource {git, rev}}) =>
+                     if from = "hol" then SOME (Path.concat(HolbuildHolSharedCache.holdir_for {git = git, rev = rev}, path))
+                     else SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path))
+                 | _ => SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path)))
 
-fun dependency_manifest ({manifest = project_manifest, graph_artifact_root, ...} : t) dep =
+fun dependency_manifest (project as {manifest = project_manifest, graph_artifact_root, ...} : t) dep =
   case dep of
       dep as Dependency {name, source = GitSource _, ...} =>
         if schema2_hol_dependency dep then SOME (HolbuildBuiltinManifests.holdir_manifest_name)
-        else SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), name),
-                               "holproject.toml"))
+        else
+          (case override_path (#overrides project) name of
+               SOME path => SOME (Path.concat(path, "holproject.toml"))
+             | NONE => SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), name),
+                                         "holproject.toml")))
     | Dependency {source = FromSource {manifest, ...}, ...} =>
         SOME (abs_under (manifest_root project_manifest) manifest)
 
@@ -886,6 +939,7 @@ fun dependency_to_string project (dep as Dependency {name, source}) =
     fun field label value =
       case value of NONE => [] | SOME s => [label ^ "=" ^ s]
     val override = override_path (#overrides project) name
+    val override_git_value = override_git (#overrides project) name
     val local_path = dependency_local_path project dep
     val resolved_manifest = dependency_manifest project dep
     val source_fields =
@@ -893,13 +947,14 @@ fun dependency_to_string project (dep as Dependency {name, source}) =
           GitSource {git, rev} => ["git=" ^ git, "rev=" ^ rev]
         | FromSource {from, path, manifest} => ["from=" ^ from, "path=" ^ path, "manifest=" ^ manifest]
     val fields =
-      source_fields @ field "override" override @ field "local" local_path @
+      source_fields @ field "override" override @ field "override-git" override_git_value @ field "local" local_path @
       field "resolved-manifest" resolved_manifest
   in
     name ^ " [" ^ String.concatWith ", " fields ^ "]"
   end
 
-fun override_to_string (Override {name, path}) = name ^ " -> " ^ path
+fun override_to_string (OverridePath {name, path}) = name ^ " path -> " ^ path
+  | override_to_string (OverrideGit {name, git}) = name ^ " git -> " ^ git
 
 fun project_package ({root, artifact_root, graph_artifact_root, manifest, name, members, excludes, exclude_globs, roots, action_policies, generators, ...} : t) =
   Package {name = Option.getOpt(name, "root"), root = root, manifest = manifest,
@@ -913,9 +968,11 @@ fun dependency_project (project : t) (dep as Dependency {name, source}) =
     val _ =
       case source of
           GitSource {git, rev} =>
-            if schema2_hol_dependency dep then ()
-            else ignore (HolbuildGitCache.materialize {name = name, git = git, rev = rev,
-                                                       artifact_root = #graph_artifact_root project})
+            if schema2_hol_dependency dep orelse Option.isSome (override_path (#overrides project) name) then ()
+            else
+              let val effective_git = Option.getOpt(override_git (#overrides project) name, git)
+              in ignore (HolbuildGitCache.materialize {name = name, git = effective_git, rev = rev,
+                                                       artifact_root = #graph_artifact_root project}) end
         | _ => ()
     val dep_root =
       case dependency_local_path project dep of
