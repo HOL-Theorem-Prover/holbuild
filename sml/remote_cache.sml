@@ -62,7 +62,7 @@ fun temp_path label =
   Path.concat(Path.dir (FS.tmpName ()), "holbuild-remote-cache-" ^ label ^ "-" ^ Path.file (FS.tmpName ()))
 
 fun curl_config_arg () =
-  case OS.Process.getEnv "HOLBUILD_REMOTE_CACHE_CURL_CONFIG" of
+  case HolbuildRemoteCacheConfig.curl_config () of
       SOME path => " --config " ^ quote path
     | NONE => ""
 

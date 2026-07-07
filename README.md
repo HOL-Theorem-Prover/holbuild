@@ -192,7 +192,8 @@ Common global options:
 - `--cache-dir PATH`: global cache directory. Overrides `HOLBUILD_CACHE` and the
   platform default cache location.
 - `--remote-cache URL`: optional Bazel-style HTTP remote cache endpoint. Also
-  configurable with `HOLBUILD_REMOTE_CACHE_URL`.
+  configurable with `HOLBUILD_REMOTE_CACHE_URL` or project-local
+  `.holconfig.toml`.
 - `--json`: emit newline-delimited JSON where supported.
 - `--quiet`, `--verbose`, `--verbosity LEVEL`: adjust status output.
 - `-j N`, `-jN`, `--jobs N`: build parallelism.
@@ -429,6 +430,9 @@ A build can also consult and publish to one Bazel-style HTTP remote cache:
 ```sh
 holbuild --remote-cache http://cache.example.org build MyTheory
 HOLBUILD_REMOTE_CACHE_URL=http://cache.example.org holbuild build MyTheory
+# or in project-local .holconfig.toml:
+# [remote_cache]
+# url = "http://cache.example.org"
 ```
 
 Remote cache misses or errors fall back to the local cache/source build path.
@@ -439,8 +443,10 @@ This is a live accelerator, not remote execution and not an immutable release
 registry.
 
 For private caches, put credentials in local/CI configuration, not in
-`holproject.toml`. `bazel-remote` supports HTTP Basic Auth; the safest holbuild
-path is to pass curl a config file:
+`holproject.toml`. CLI `--remote-cache` overrides `HOLBUILD_REMOTE_CACHE_URL`,
+which overrides `.holconfig.toml`'s `[remote_cache].url`. `bazel-remote`
+supports HTTP Basic Auth; the safest holbuild path is to pass curl a config
+file:
 
 ```sh
 cat > "$RUNNER_TEMP/holbuild-remote-cache.curl" <<'EOF'
@@ -450,6 +456,9 @@ chmod 600 "$RUNNER_TEMP/holbuild-remote-cache.curl"
 HOLBUILD_REMOTE_CACHE_CURL_CONFIG="$RUNNER_TEMP/holbuild-remote-cache.curl" \
   holbuild --remote-cache https://cache.example.org build MyTheory
 ```
+
+`HOLBUILD_REMOTE_CACHE_CURL_CONFIG` overrides `.holconfig.toml`'s
+`[remote_cache].curl_config`.
 
 The URL form `https://user:password@cache.example.org` also works with curl, but
 can expose credentials via process listings or shell history; prefer the config
@@ -499,6 +508,10 @@ checkpoint_limit_gb = 20
 exclude = ["worktrees"]
 exclude_globs = ["scratch/*"]
 tactic_timeout = 10.0
+
+[remote_cache]
+url = "https://cache.example.org"
+curl_config = "/path/to/holbuild-remote-cache.curl"
 
 [overrides.foo]
 path = "../foo"

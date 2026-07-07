@@ -139,8 +139,10 @@ write_project "$second"
 
 first_cache=$tmpdir/cache-first
 second_cache=$tmpdir/cache-second
+third_cache=$tmpdir/cache-third
 link_hol_toolchain_cache "$first_cache"
 link_hol_toolchain_cache "$second_cache"
+link_hol_toolchain_cache "$third_cache"
 
 first_log=$tmpdir/first.log
 (cd "$first" && HOLBUILD_CACHE="$first_cache" HOLBUILD_CACHE_TRACE=1 \
@@ -158,5 +160,23 @@ require_grep "ATheory restored from cache" "$second_log"
 if grep -q "ATheory built" "$second_log"; then
   echo "second build rebuilt instead of restoring from remote cache" >&2
   cat "$second_log" >&2
+  exit 1
+fi
+
+third=$tmpdir/third
+write_project "$third"
+cat > "$third/.holconfig.toml" <<TOML
+[remote_cache]
+url = "$remote_url"
+TOML
+third_log=$tmpdir/third.log
+(cd "$third" && HOLBUILD_CACHE="$third_cache" HOLBUILD_CACHE_TRACE=1 \
+  "$HOLBUILD_BIN" build ATheory) > "$third_log" 2>&1
+require_grep "remote cache hydrated:" "$third_log"
+require_grep "cache hit: ATheory" "$third_log"
+require_grep "ATheory restored from cache" "$third_log"
+if grep -q "ATheory built" "$third_log"; then
+  echo "third build ignored .holconfig.toml remote cache default" >&2
+  cat "$third_log" >&2
   exit 1
 fi
