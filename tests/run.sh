@@ -229,9 +229,13 @@ running_index_for_pid() {
 }
 
 wait_one() {
-  local completed_pid
+  local completed_pid=""
   local status=0
   wait -n -p completed_pid "${running_pids[@]}" || status=$?
+  if [[ -z "$completed_pid" ]]; then
+    echo "wait did not report a completed test pid" >&2
+    return 2
+  fi
 
   local index
   index=$(running_index_for_pid "$completed_pid")
@@ -259,6 +263,22 @@ terminate_running() {
   for pid in "${running_pids[@]}"; do
     kill -KILL "$pid" 2>/dev/null || true
   done
+
+  local i name duration summary
+  for i in "${!running_pids[@]}"; do
+    pid=${running_pids[$i]}
+    name=${running_names[$i]}
+    wait "$pid" 2>/dev/null || true
+    duration=$(cat "$log_dir/$name.duration" 2>/dev/null || echo 0)
+    summary=$(cat "$log_dir/$name.summary" 2>/dev/null || true)
+    completed_names+=("$name")
+    completed_durations+=("$duration")
+    completed_summaries+=("$summary")
+    cat "$log_dir/$name.log" 2>/dev/null || true
+    echo "ABORT $name (fail-fast)"
+  done
+  running_pids=()
+  running_names=()
 }
 
 stop_after_failure() {

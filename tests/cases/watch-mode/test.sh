@@ -26,11 +26,22 @@ command -v inotifywait >/dev/null || {
 
 project=$tmpdir/project
 mkdir -p "$project"
-cat > "$project/holproject.toml" <<TOML
+write_project_file() {
+  cat > "$project/holproject.toml" <<TOML
 $(write_schema2_prelude)
 [project]
 name = "watch-mode"
 TOML
+}
+
+write_bad_project_file() {
+  cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "watch-mode"
+unknown = "invalid"
+TOML
+}
 
 write_good_source() {
   cat > "$project/AScript.sml" <<'SML'
@@ -102,6 +113,7 @@ wait_for_exit() {
   return 1
 }
 
+write_project_file
 write_good_source
 watch_log=$tmpdir/watch.log
 (trap - INT; cd "$project" && exec "$WATCH_HOLBUILD_BIN" build --watch ATheory) >"$watch_log" 2>&1 &
@@ -120,12 +132,21 @@ echo "(* edit one *)" >> "$project/AScript.sml"
 wait_for_count "waiting for changes" "$watch_log" 2 45
 sleep 1
 
-write_bad_source
+write_bad_project_file
 wait_for_count "waiting for changes" "$watch_log" 3 45
+require_grep "build failed:" "$watch_log"
+sleep 1
+
+write_project_file
+wait_for_count "waiting for changes" "$watch_log" 4 45
+sleep 1
+
+write_bad_source
+wait_for_count "waiting for changes" "$watch_log" 5 45
 sleep 1
 
 write_good_source
-wait_for_count "waiting for changes" "$watch_log" 4 45
+wait_for_count "waiting for changes" "$watch_log" 6 45
 
 kill -INT "$watch_pid"
 wait_for_exit "$watch_pid" 10

@@ -619,9 +619,12 @@ fun configure_analyser_for_toolchain ({holdir, ...} : HolbuildToolchain.t) =
   if holdir = "" then HolbuildDependencies.clear_analyser_path ()
   else HolbuildDependencies.set_analyser_path (HolbuildHolSharedCache.analyser_path_for_holdir holdir)
 
-fun build_once tc cli_jobs ({dry_run, watch, force, use_cache, skip_checkpoints, proof_steps, new_ir, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable}, targets) =
+fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_cache, skip_checkpoints, proof_steps, new_ir, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable}, targets) =
   let
-    val project = timed_phase "project.discover" load_project
+    val project =
+      case prepared of
+          SOME {project, ...} => project
+        | NONE => timed_phase "project.discover" load_project
     val _ = HolbuildStatus.set_retain_debug_artifacts retain_debug_artifacts
     val jobs = if repl_on_failure then 1 else effective_jobs project cli_jobs
     val _ =
@@ -665,7 +668,10 @@ fun build_once tc cli_jobs ({dry_run, watch, force, use_cache, skip_checkpoints,
        repl_on_failure = repl_on_failure}
     fun prepare_plan () =
       let
-        val index = timed_phase "source.discover" (fn () => HolbuildSourceIndex.discover project)
+        val index =
+          case prepared of
+              SOME {index, ...} => index
+            | NONE => timed_phase "source.discover" (fn () => HolbuildSourceIndex.discover project)
         val requested_targets = targets
         val targets = timed_phase "targets.default" (fn () => default_build_targets project index requested_targets)
         val _ = reject_object_targets targets
@@ -698,6 +704,8 @@ fun build_once tc cli_jobs ({dry_run, watch, force, use_cache, skip_checkpoints,
     else HolbuildBuildExec.with_project_lock project "build" execute_build
   end
 
+fun build_once tc cli_jobs parsed = build_once_with_prepared tc cli_jobs NONE parsed
+
 fun build_iteration_error_message exn =
   case exn of
       Error msg => SOME msg
@@ -717,33 +725,38 @@ fun build_iteration_error_message exn =
     | HolbuildWatch.Error msg => SOME msg
     | _ => NONE
 
-fun current_watch_paths previous =
+fun current_watch_state previous_paths =
   let
     val project = timed_phase "watch.project.discover" load_project
     val index = timed_phase "watch.source.discover" (fn () => HolbuildSourceIndex.discover project)
+    val paths = HolbuildWatch.watch_paths project index
   in
-    HolbuildWatch.watch_paths project index
+    {prepared = SOME {project = project, index = index, paths = paths}, paths = paths}
   end
   handle exn =>
-    case (build_iteration_error_message exn, previous) of
-        (SOME msg, SOME paths) => (warn ("could not recompute watch set: " ^ msg); paths)
+    case (build_iteration_error_message exn, previous_paths) of
+        (SOME msg, SOME paths) =>
+          (warn ("could not recompute watch set: " ^ msg);
+           {prepared = NONE, paths = paths})
       | (SOME msg, NONE) => raise Error ("could not compute watch set: " ^ msg)
       | (NONE, _) => raise exn
 
 fun build_watch tc cli_jobs parsed =
   let
     val _ = HolbuildWatch.ensure_inotifywait ()
-    fun attempt () =
-      (build_once tc cli_jobs parsed; ())
+    fun attempt prepared =
+      (build_once_with_prepared tc cli_jobs prepared parsed; ())
       handle exn =>
         case build_iteration_error_message exn of
             SOME msg => warn ("build failed: " ^ msg)
           | NONE => raise exn
     fun loop previous_paths =
       let
-        val before_paths = current_watch_paths previous_paths
-        val _ = attempt ()
-        val paths = current_watch_paths (SOME before_paths)
+        val {prepared, paths = before_paths} = current_watch_state previous_paths
+        val _ = attempt prepared
+        (* Recompute the watch set after the build so inputs created during the
+           build are watched immediately, not only after the next change. *)
+        val {prepared = _, paths} = current_watch_state (SOME before_paths)
         val _ = warn ("watching " ^ Int.toString (length paths) ^ " project path(s); waiting for changes")
         val _ = HolbuildWatch.wait_for_change paths
       in

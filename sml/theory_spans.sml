@@ -21,7 +21,7 @@ fun analyser () =
       SOME path => path
     | NONE => raise HolbuildTheoryCheckpoints.Error "internal error: HOL analyser is not configured"
 
-fun run want source_path =
+fun run wants source_path =
   let
     val req = OS.FileSys.tmpName ()
     val resp = OS.FileSys.tmpName ()
@@ -29,7 +29,7 @@ fun run want source_path =
     val request = String.concatWith "\n"
       [P.join ["version", P.protocol_version],
        P.join ["command", "analyse"],
-       P.join ["file", "1", source_path, want],
+       P.join (["file", "1", source_path] @ wants),
        P.join ["end"]] ^ "\n"
     val _ = write_file req request
     val status = OS.Process.system (HolbuildHash.quote (analyser ()) ^ " --request " ^ HolbuildHash.quote req ^
@@ -79,7 +79,7 @@ fun parse_termination fields =
          tactic_text = tactic_text}
     | _ => raise HolbuildTheoryCheckpoints.Error "bad analyser termination record"
 
-fun response_records want source_path =
+fun response_records wants source_path =
   let
     fun loop lines in_file acc errors =
       case lines of
@@ -96,24 +96,44 @@ fun response_records want source_path =
                | ["parse-error", text] => if in_file then loop rest in_file acc (text :: errors) else loop rest in_file acc errors
                | fields => if in_file then loop rest in_file (fields :: acc) errors else loop rest in_file acc errors)
   in
-    loop (run want source_path) false [] []
+    loop (run wants source_path) false [] []
   end
 
+fun boundary_record fields =
+  case fields of
+      "boundary" :: _ => true
+    | _ => false
+
+fun termination_record fields =
+  case fields of
+      "termination" :: _ => true
+    | _ => false
+
 fun scan source_path _ =
-  let val (records, _) = response_records "boundaries" source_path
+  let val (records, _) = response_records ["boundaries"] source_path
   in map parse_boundary records end
 
 fun scan_strict source_path _ =
-  let val (records, _) = response_records "boundaries-strict" source_path
+  let val (records, _) = response_records ["boundaries-strict"] source_path
   in map parse_boundary records end
 
 fun scan_with_recovery source_path _ =
-  let val (records, errors) = response_records "boundaries-recovering" source_path
-  in {boundaries = map parse_boundary records, errors = errors} end
+  let val (records, errors) = response_records ["boundaries-recovering"] source_path
+  in {boundaries = map parse_boundary (List.filter boundary_record records),
+      errors = errors} end
 
 fun scan_terminations_strict source_path _ =
-  let val (records, _) = response_records "terminations-strict" source_path
-  in map parse_termination records end
+  let val (records, _) = response_records ["terminations-strict"] source_path
+  in map parse_termination (List.filter termination_record records) end
+
+fun scan_boundaries_and_terminations_recovering_strict source_path _ =
+  let val (records, errors) =
+        response_records ["boundaries-recovering", "terminations-strict"] source_path
+  in
+    {boundaries = map parse_boundary (List.filter boundary_record records),
+     errors = errors,
+     terminations = map parse_termination (List.filter termination_record records)}
+  end
 
 fun scan_terminations source_path source_text = scan_terminations_strict source_path source_text
 
