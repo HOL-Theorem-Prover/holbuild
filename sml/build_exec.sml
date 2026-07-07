@@ -599,37 +599,42 @@ fun checkpoint_save_artifact_base path =
   else if has_suffix ".save" path then SOME path
   else NONE
 
+fun checkpoint_marker_base path =
+  let val name = Path.file path
+  in
+    if has_suffix ".deps" name then
+      SOME (Path.concat(Path.dir path, drop_suffix ".deps" name))
+    else if has_suffix ".theorems" name then
+      SOME (Path.concat(Path.dir path, drop_suffix ".theorems" name))
+    else if has_suffix ".decls" name then
+      SOME (Path.concat(Path.dir path, drop_suffix ".decls" name))
+    else if has_suffix ".final_context.save.ok.tmp" name then
+      SOME (Path.concat(Path.dir path, drop_suffix ".final_context.save.ok.tmp" name))
+    else if has_suffix ".final_context.save.ok.bak" name then
+      SOME (Path.concat(Path.dir path, drop_suffix ".final_context.save.ok.bak" name))
+    else if has_suffix ".final_context.save.ok" name then
+      SOME (Path.concat(Path.dir path, drop_suffix ".final_context.save.ok" name))
+    else if has_suffix ".final_context.save.tmp" name then
+      SOME (Path.concat(Path.dir path, drop_suffix ".final_context.save.tmp" name))
+    else if has_suffix ".final_context.save.bak" name then
+      SOME (Path.concat(Path.dir path, drop_suffix ".final_context.save.bak" name))
+    else if has_suffix ".final_context.save.meta" name then
+      SOME (Path.concat(Path.dir path, drop_suffix ".final_context.save.meta" name))
+    else if has_suffix ".final_context.save.prefix" name then
+      SOME (Path.concat(Path.dir path, drop_suffix ".final_context.save.prefix" name))
+    else if has_suffix ".final_context.save" name then
+      SOME (Path.concat(Path.dir path, drop_suffix ".final_context.save" name))
+    else NONE
+  end
+
 fun checkpoint_family_base path =
   let
     fun marker_base current =
-      let val name = Path.file current
-      in
-        if has_suffix ".deps" name then
-          SOME (Path.concat(Path.dir current, drop_suffix ".deps" name))
-        else if has_suffix ".theorems" name then
-          SOME (Path.concat(Path.dir current, drop_suffix ".theorems" name))
-        else if has_suffix ".decls" name then
-          SOME (Path.concat(Path.dir current, drop_suffix ".decls" name))
-        else if has_suffix ".final_context.save.ok.tmp" name then
-          SOME (Path.concat(Path.dir current, drop_suffix ".final_context.save.ok.tmp" name))
-        else if has_suffix ".final_context.save.ok.bak" name then
-          SOME (Path.concat(Path.dir current, drop_suffix ".final_context.save.ok.bak" name))
-        else if has_suffix ".final_context.save.ok" name then
-          SOME (Path.concat(Path.dir current, drop_suffix ".final_context.save.ok" name))
-        else if has_suffix ".final_context.save.tmp" name then
-          SOME (Path.concat(Path.dir current, drop_suffix ".final_context.save.tmp" name))
-        else if has_suffix ".final_context.save.bak" name then
-          SOME (Path.concat(Path.dir current, drop_suffix ".final_context.save.bak" name))
-        else if has_suffix ".final_context.save.meta" name then
-          SOME (Path.concat(Path.dir current, drop_suffix ".final_context.save.meta" name))
-        else if has_suffix ".final_context.save.prefix" name then
-          SOME (Path.concat(Path.dir current, drop_suffix ".final_context.save.prefix" name))
-        else if has_suffix ".final_context.save" name then
-          SOME (Path.concat(Path.dir current, drop_suffix ".final_context.save" name))
-        else
-          let val parent = Path.dir current
-          in if parent = current then NONE else marker_base parent end
-      end
+      case checkpoint_marker_base current of
+          SOME base => SOME base
+        | NONE =>
+            let val parent = Path.dir current
+            in if parent = current then NONE else marker_base parent end
   in
     case marker_base path of
         SOME base => SOME base
@@ -749,14 +754,25 @@ fun remove_index_family ({dir, families, ...} : checkpoint_index) base =
     dir
     (List.filter (fn ({base = family_base, ...} : checkpoint_family) => family_base <> base) families)
 
-fun refresh_index_family (index as {dir, ...} : checkpoint_index) base =
-  let
-    val without = remove_index_family index base
-  in
-    case collect_checkpoint_family base of
-        NONE => without
-      | SOME family => checkpoint_index_with_families dir (family :: #families without)
-  end
+fun insert_index_family ({dir, families, ...} : checkpoint_index)
+                        (family as {base, ...} : checkpoint_family) =
+  checkpoint_index_with_families
+    dir
+    (family :: List.filter (fn ({base = family_base, ...} : checkpoint_family) => family_base <> base) families)
+
+fun checkpoint_family_root_exists base =
+  List.exists path_exists (checkpoint_family_artifact_roots base)
+
+fun merge_checkpoint_family_measurements index measurements =
+  List.foldl
+    (fn ((base, family_opt), acc) =>
+        case family_opt of
+            NONE => remove_index_family acc base
+          | SOME family =>
+              if checkpoint_family_root_exists base then insert_index_family acc family
+              else remove_index_family acc base)
+    index
+    measurements
 
 fun parse_index_root line =
   let val prefix = "root="
@@ -3319,39 +3335,19 @@ fun outcome_may_create_checkpoints options project node outcome =
 fun project_checkpoint_limit_gb project =
   Option.getOpt(HolbuildProject.checkpoint_limit_gb project, default_max_checkpoints_gb)
 
-type checkpoint_watch_snapshot = (string * Time.time option) list
+type checkpoint_watch = (string, Time.time option) Binarymap.dict
 
 type checkpoint_budget_state =
   {checkpoint_dir : string,
    checkpoint_limit_gb : int,
    max_bytes : Position.int,
    index : checkpoint_index ref,
-   watch : checkpoint_watch_snapshot ref,
+   watch : checkpoint_watch ref,
+   index_bases : (string, unit) Binarymap.dict ref,
+   refreshed : bool ref,
    mutex : Mutex.mutex}
 
 fun checkpoint_dir_mtime path = SOME (FS.modTime path) handle OS.SysErr _ => NONE
-
-fun checkpoint_family_watch_dirs ({base, ...} : checkpoint_family) =
-  [Path.dir base, base ^ ".theorems", base ^ ".decls", base ^ ".deps"]
-
-(* A completed node only indexes its own checkpoint family incrementally, but a
-   build can also create checkpoint families that belong to no scheduled node
-   (e.g. generated theories).  This snapshot lets refresh detect such
-   out-of-family changes on disk and fall back to a full rescan so the budget is
-   still enforced against them. *)
-fun checkpoint_watch_snapshot dir families =
-  let
-    val top_dirs = if path_exists dir then dir :: List.filter is_dir (children dir) else [dir]
-    val family_dirs = List.concat (map checkpoint_family_watch_dirs families)
-    val dirs = map (fn path => path) (unique_strings (top_dirs @ List.filter is_dir family_dirs))
-  in
-    map (fn path => (path, checkpoint_dir_mtime path)) dirs
-  end
-
-fun snapshot_mtime path snapshot =
-  case List.find (fn (candidate, _) => candidate = path) snapshot of
-      SOME (_, mtime) => mtime
-    | NONE => NONE
 
 fun same_mtime pair =
     case pair of
@@ -3362,17 +3358,73 @@ fun same_mtime pair =
              | _ => false)
       | _ => false
 
-fun checkpoint_out_of_family_change dir families node_package node_base previous =
+fun family_base_ancestors dir base =
   let
-    val after = checkpoint_watch_snapshot dir families
-    val node_package_dir = Path.concat(dir, node_package)
-    val node_family_dirs = checkpoint_family_watch_dirs {base = node_base, mtime = Time.zeroTime, bytes = 0}
-    val paths = unique_strings (map (fn (path, _) => path) previous @ map (fn (path, _) => path) after)
-    fun relevant path = path <> dir andalso path <> node_package_dir
-                         andalso not (string_member path node_family_dirs)
-    fun changed path = not (same_mtime (snapshot_mtime path previous, snapshot_mtime path after))
+    val start = Path.dir base
+    fun loop current acc =
+      if current = dir then current :: acc
+      else if path_under_dir current dir then
+        let val parent = Path.dir current
+        in if parent = current then acc else loop parent (current :: acc) end
+      else acc
   in
-    List.exists (fn path => relevant path andalso changed path) paths
+    loop start []
+  end
+
+fun binarymap_in_domain (dict, key) =
+  case Binarymap.peek (dict, key) of
+      SOME _ => true
+    | NONE => false
+
+fun watch_insert_dir path watch =
+  if binarymap_in_domain (watch, path) then watch
+  else Binarymap.insert (watch, path, checkpoint_dir_mtime path)
+
+(* Watch the checkpoint root and the ancestor closure of indexed family bases.
+   Creating a new family normally bumps one of these directories.  A family
+   planted under a pre-existing family-less deep directory can be missed until
+   the end-of-build full rebuild; real theory layouts create families at member
+   granularity, and generated top-level/member dirs still bump a watched
+   ancestor. *)
+fun watch_from_families dir families =
+  let
+    val empty = Binarymap.mkDict String.compare
+    val with_root = watch_insert_dir dir empty
+    fun add_family ({base, ...} : checkpoint_family, watch) =
+      List.foldl (fn (path, acc) => watch_insert_dir path acc) watch (family_base_ancestors dir base)
+  in
+    List.foldl add_family with_root families
+  end
+
+fun bases_set_of families =
+  List.foldl
+    (fn ({base, ...} : checkpoint_family, acc) => Binarymap.insert (acc, base, ()))
+    (Binarymap.mkDict String.compare)
+    families
+
+fun changed_watch_dirs (watch : checkpoint_watch) =
+  Binarymap.foldl
+    (fn (path, previous, changed) =>
+        if same_mtime (previous, checkpoint_dir_mtime path) then changed else path :: changed)
+    []
+    watch
+
+(* Enumerate candidate family bases reachable under root without summing file
+   sizes.  Stop at the first checkpoint marker subtree so this remains a shallow
+   directory walk rather than a recursive byte scan. *)
+fun shallow_family_bases root =
+  let
+    fun walk path acc =
+      if not (path_exists path) then acc
+      else
+        case checkpoint_marker_base path of
+            SOME base => base :: acc
+          | NONE =>
+              if FS.isDir path handle OS.SysErr _ => false then
+                List.foldl (fn (child, bases) => walk child bases) acc (children path)
+              else acc
+  in
+    unique_strings (walk root [])
   end
 
 fun checkpoint_budget_warnings checkpoint_limit_gb
@@ -3402,7 +3454,9 @@ fun create_checkpoint_budget_state project =
      checkpoint_limit_gb = checkpoint_limit_gb,
      max_bytes = gb_to_bytes checkpoint_limit_gb,
      index = ref index,
-     watch = ref (checkpoint_watch_snapshot checkpoint_dir (#families index)),
+     watch = ref (watch_from_families checkpoint_dir (#families index)),
+     index_bases = ref (bases_set_of (#families index)),
+     refreshed = ref false,
      mutex = Mutex.mutex ()}
   end
 
@@ -3443,7 +3497,8 @@ fun enforce_checkpoint_budget_state_excluding state protected_bases =
                 val final_index = enforce_checkpoint_index_locked state (!(#index state)) protected_bases
               in
                 #index state := final_index;
-                #watch state := checkpoint_watch_snapshot (#checkpoint_dir state) (#families final_index)
+                #index_bases state := bases_set_of (#families final_index);
+                #watch state := watch_from_families (#checkpoint_dir state) (#families final_index)
               end))
         handle e => warn_checkpoint_budget_error e)
 
@@ -3458,28 +3513,40 @@ fun rebuild_and_enforce_checkpoint_budget_state_excluding state protected_bases 
                 val final_index = enforce_checkpoint_index_locked state index' protected_bases
               in
                 #index state := final_index;
-                #watch state := checkpoint_watch_snapshot dir (#families final_index)
+                #index_bases state := bases_set_of (#families final_index);
+                #watch state := watch_from_families dir (#families final_index)
               end))
         handle e => warn_checkpoint_budget_error e)
 
 fun refresh_checkpoint_budget_after_node state project node protected_bases =
   detail_time_phase "build.exec.checkpoint_budget"
     (fn () =>
-        (with_checkpoint_budget_lock state
-          (fn () =>
-              let
-                val dir = #checkpoint_dir state
-                val base = checkpoint_base project node
-                val current_index = !(#index state)
-                val index' =
-                  if checkpoint_out_of_family_change dir (#families current_index) (package node) base (!(#watch state)) then
-                    rebuild_checkpoint_index dir
-                  else refresh_index_family current_index base
-                val final_index = enforce_checkpoint_index_locked state index' protected_bases
-              in
-                #index state := final_index;
-                #watch state := checkpoint_watch_snapshot dir (#families final_index)
-              end))
+        (let
+           val dir = #checkpoint_dir state
+           val base = checkpoint_base project node
+           val changed = changed_watch_dirs (!(#watch state))
+           val known = !(#index_bases state)
+           val discovered =
+             List.filter
+               (fn candidate =>
+                   not (binarymap_in_domain (known, candidate)) orelse
+                   string_member candidate protected_bases)
+               (List.concat (map shallow_family_bases changed))
+           val measure_bases = unique_strings (base :: discovered)
+           val measurements = map (fn candidate => (candidate, collect_checkpoint_family candidate)) measure_bases
+         in
+           with_checkpoint_budget_lock state
+             (fn () =>
+                 let
+                   val index' = merge_checkpoint_family_measurements (!(#index state)) measurements
+                   val final_index = enforce_checkpoint_index_locked state index' protected_bases
+                 in
+                   #index state := final_index;
+                   #index_bases state := bases_set_of (#families final_index);
+                   #watch state := watch_from_families dir (#families final_index);
+                   #refreshed state := true
+                 end)
+         end)
         handle e => warn_checkpoint_budget_error e)
 
 fun build_serial dat_hash_cache status options tc project base_context plan keys toolchain_key budget_state =
@@ -3883,7 +3950,10 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
         else build_parallel dat_hash_cache status options tc project base_context plan keys toolchain_key jobs budget_state
     in
       (run (); HolbuildStatus.finish status;
-       enforce_checkpoint_budget_state_excluding budget_state [];
+       if !(#refreshed budget_state) then
+         rebuild_and_enforce_checkpoint_budget_state_excluding budget_state []
+       else
+         enforce_checkpoint_budget_state_excluding budget_state [];
        clear_checkpoint_index_dirty budget_state)
       handle e => (HolbuildStatus.finish status;
                    rebuild_and_enforce_checkpoint_budget_state_excluding budget_state [];

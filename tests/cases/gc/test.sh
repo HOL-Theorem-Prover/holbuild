@@ -422,6 +422,49 @@ if [[ -s "$scan_counter" ]]; then
   exit 1
 fi
 
+perf_scan_project=$tmpdir/perf-scan-project
+mkdir -p "$perf_scan_project/src1" "$perf_scan_project/src2"
+cat > "$perf_scan_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "perf-scan-project"
+
+[build]
+members = ["src1", "src2"]
+TOML
+for theory in PerfA PerfB; do
+  cat > "$perf_scan_project/src1/${theory}Script.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "$theory";
+val _ = export_theory();
+SML
+done
+for theory in PerfC PerfD; do
+  cat > "$perf_scan_project/src2/${theory}Script.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "$theory";
+val _ = export_theory();
+SML
+done
+perf_scan_counter=$tmpdir/perf-checkpoint-scan-counter.log
+rm -f "$perf_scan_counter"
+(cd "$perf_scan_project" && HOLBUILD_CHECKPOINT_SCAN_COUNTER="$perf_scan_counter" \
+  "$HOLBUILD_BIN" build --force=project --no-cache) > "$tmpdir/perf-scan.log" 2>&1
+perf_scan_count=0
+if [[ -f "$perf_scan_counter" ]]; then
+  perf_scan_count=$(wc -l < "$perf_scan_counter")
+fi
+if (( perf_scan_count > 3 )); then
+  echo "checkpoint budget performed too many recursive scans on a forced build: $perf_scan_count" >&2
+  exit 1
+fi
+
 if (cd "$project" && "$HOLBUILD_BIN" gc --clean-only --cache-only) > "$tmpdir/bad-flags.log" 2>&1; then
   echo "gc accepted mutually exclusive flags" >&2
   exit 1
