@@ -752,8 +752,11 @@ fun build_watch tc cli_jobs parsed =
           | NONE => raise exn
     fun loop previous_paths =
       let
-        val {prepared, paths} = current_watch_state previous_paths
+        val {prepared, paths = before_paths} = current_watch_state previous_paths
         val _ = attempt prepared
+        (* Recompute the watch set after the build so inputs created during the
+           build are watched immediately, not only after the next change. *)
+        val {prepared = _, paths} = current_watch_state (SOME before_paths)
         val _ = warn ("watching " ^ Int.toString (length paths) ^ " project path(s); waiting for changes")
         val _ = HolbuildWatch.wait_for_change paths
       in

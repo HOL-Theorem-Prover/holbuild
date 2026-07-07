@@ -274,14 +274,11 @@ fun build_direct_project_deps_cache_with lookup nodes =
     (sort_pairs compare_pair_key
        (map (fn node => (key node, direct_project_deps_with lookup nodes node)) nodes))
 
-fun build_direct_project_deps_cache plan =
-  build_direct_project_deps_cache_with (lookup plan) (universe_nodes plan)
-
 fun direct_project_deps_cached cache node =
   let
     val node_key = key node
     fun search lo hi =
-      if lo > hi then raise Error ("internal missing direct dependency cache key: " ^ node_key)
+      if lo > hi then NONE
       else
         let
           val mid = (lo + hi) div 2
@@ -290,14 +287,18 @@ fun direct_project_deps_cached cache node =
           case String.compare(node_key, candidate) of
               LESS => search lo (mid - 1)
             | GREATER => search (mid + 1) hi
-            | EQUAL => deps
+            | EQUAL => SOME deps
         end
   in
     search 0 (Vector.length cache - 1)
   end
 
+(* The cache only covers selected (reachable) nodes; any other node falls back to
+   the lazy computation so an unrelated broken source cannot abort planning. *)
 fun direct_project_deps plan node =
-  direct_project_deps_cached (direct_project_deps_cache plan) node
+  case direct_project_deps_cached (direct_project_deps_cache plan) node of
+      SOME deps => deps
+    | NONE => direct_project_deps_with (lookup plan) (universe_nodes plan) node
 
 fun direct_external_theories_with lookup node =
   let
@@ -451,7 +452,7 @@ fun plan holdir sources targets =
     val lookup = indexed_nodes_named index
     val roots = target_roots lookup nodes targets
     val selected = topo_sort_with lookup nodes roots
-    val direct_project_deps_cache = build_direct_project_deps_cache_with lookup nodes
+    val direct_project_deps_cache = build_direct_project_deps_cache_with lookup selected
   in
     {universe = nodes, selected = selected, name_index = index,
      direct_project_deps_cache = direct_project_deps_cache}

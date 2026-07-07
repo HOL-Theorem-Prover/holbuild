@@ -726,6 +726,8 @@ fun checkpoint_index_path dir = Path.concat(dir, ".index-v1")
 
 fun checkpoint_index_tmp_path dir = Path.concat(dir, ".index-v1.tmp")
 
+fun checkpoint_index_dirty_path dir = Path.concat(dir, ".index-dirty")
+
 fun checkpoint_index_with_families dir families =
   {dir = dir, families = families, total_bytes = total_checkpoint_bytes families}
 
@@ -770,9 +772,9 @@ fun parse_index_family_line line =
         (case (String.fromString base_text,
                IntInf.fromString mtime_text,
                IntInf.fromString bytes_text) of
-             (SOME base, SOME mtime_seconds, SOME bytes) =>
+             (SOME base, SOME mtime_nanos, SOME bytes) =>
                if bytes < 0 then NONE
-               else SOME ({base = base, mtime = Time.fromSeconds mtime_seconds, bytes = bytes} : checkpoint_family)
+               else SOME ({base = base, mtime = Time.fromNanoseconds mtime_nanos, bytes = bytes} : checkpoint_family)
            | _ => NONE)
     | _ => NONE
 
@@ -817,7 +819,7 @@ fun checkpoint_index_text ({dir, families, ...} : checkpoint_index) =
     fun family_line ({base, mtime, bytes} : checkpoint_family) =
       String.concat
         ["family\t", String.toString base, "\t",
-         IntInf.toString (Time.toSeconds mtime), "\t",
+         IntInf.toString (Time.toNanoseconds mtime), "\t",
          IntInf.toString bytes]
   in
     String.concatWith "\n"
@@ -919,42 +921,6 @@ fun gb_to_bytes gb = IntInf.fromInt gb * 1073741824
 
 fun string_member x xs = List.exists (fn y => x = y) xs
 
-fun evict_checkpoint_families_excluding dir families total max_bytes protected_bases =
-  if total <= max_bytes then 0
-  else
-    let
-      val evictable = List.filter (fn ({base, ...} : checkpoint_family) =>
-                                      not (string_member base protected_bases)) families
-      val sorted = sort_families_by_mtime_ascending evictable
-      fun evict remaining freed removed =
-        case remaining of
-            [] => removed
-          | ({base, bytes, ...} : checkpoint_family) :: rest =>
-              let val freed' = freed + bytes
-              in
-                remove_checkpoint_family_base base;
-                if total - freed' <= max_bytes then removed + 1
-                else evict rest freed' (removed + 1)
-              end
-      val evicted = evict sorted 0 0
-      val _ = if evicted = 0 then () else remove_empty_dirs_excluding protected_bases dir
-    in
-      evicted
-    end
-
-fun evict_oldest_checkpoints_excluding dir max_bytes protected_bases =
-  if max_bytes <= 0 then 0
-  else
-    let
-      val families = collect_checkpoint_families dir
-      val total = total_checkpoint_bytes families
-    in
-      evict_checkpoint_families_excluding dir families total max_bytes protected_bases
-    end
-
-fun evict_oldest_checkpoints dir max_bytes =
-  evict_oldest_checkpoints_excluding dir max_bytes []
-
 type checkpoint_eviction =
   {before_bytes : IntInf.int, after_bytes : IntInf.int,
    max_bytes : IntInf.int, evicted : int}
@@ -979,14 +945,14 @@ fun evict_from_index_excluding (index as {dir, families, total_bytes} : checkpoi
               if before_bytes - freed' <= max_bytes then (freed', removed', removed_bases')
               else evict rest freed' removed' removed_bases'
             end
+    val over_budget = not (max_bytes <= 0 orelse before_bytes <= max_bytes)
     val (freed, evicted, removed_bases) =
-      if max_bytes <= 0 orelse before_bytes <= max_bytes then (0 : Position.int, 0, [])
-      else evict sorted 0 0 []
+      if over_budget then evict sorted 0 0 [] else (0 : Position.int, 0, [])
     val families' =
       List.filter (fn ({base, ...} : checkpoint_family) => not (string_member base removed_bases)) families
     val after_bytes = before_bytes - freed
     val index' = {dir = dir, families = families', total_bytes = after_bytes}
-    val _ = if evicted = 0 then () else remove_empty_dirs_excluding protected_bases dir
+    val _ = if over_budget then remove_empty_dirs_excluding protected_bases dir else ()
   in
     (index', {before_bytes = before_bytes, after_bytes = after_bytes,
               max_bytes = max_bytes, evicted = evicted})
@@ -994,15 +960,10 @@ fun evict_from_index_excluding (index as {dir, families, total_bytes} : checkpoi
 
 fun evict_oldest_checkpoints_with_stats_excluding dir max_bytes protected_bases =
   let
-    val families = collect_checkpoint_families dir
-    val before_bytes = total_checkpoint_bytes families
-    val evicted =
-      if max_bytes <= 0 then 0
-      else evict_checkpoint_families_excluding dir families before_bytes max_bytes protected_bases
-    val after_bytes = if evicted = 0 then before_bytes else checkpoint_bytes dir
+    val (_, eviction) =
+      evict_from_index_excluding (rebuild_checkpoint_index dir) max_bytes protected_bases
   in
-    {before_bytes = before_bytes, after_bytes = after_bytes,
-     max_bytes = max_bytes, evicted = evicted}
+    eviction
   end
 
 fun evict_oldest_checkpoints_with_stats dir max_bytes =
@@ -1027,6 +988,7 @@ fun clean_project project days max_checkpoints_gb =
     val checkpoint_removed = remove_stale_checkpoint_families cutoff checkpoint_dir
     val eviction = evict_oldest_checkpoints_with_stats checkpoint_dir (gb_to_bytes max_checkpoints_gb)
     val _ = write_checkpoint_index_atomically (rebuild_checkpoint_index checkpoint_dir)
+    val _ = remove_file (checkpoint_index_dirty_path checkpoint_dir)
   in
     print ("project clean: removed stage=" ^ Int.toString stage_removed ^
            " logs=" ^ Int.toString log_removed ^
@@ -1042,38 +1004,40 @@ fun checkpoint_exists path = file_exists path andalso file_exists (checkpoint_ok
 
 fun file_hash path = HolbuildHash.file_sha1 path
 
-type file_hash_cache = {entries : (string * string option) list ref, mutex : Mutex.mutex}
+type file_hash_cache = {entries : (string, string) Binarymap.dict ref, mutex : Mutex.mutex}
 
 fun new_file_hash_cache () =
-  {entries = ref [], mutex = Mutex.mutex ()}
+  {entries = ref (Binarymap.mkDict String.compare), mutex = Mutex.mutex ()}
 
 fun with_file_hash_cache_lock (cache : file_hash_cache) f =
   (Mutex.lock (#mutex cache); f () before Mutex.unlock (#mutex cache))
   handle e => (Mutex.unlock (#mutex cache); raise e)
 
-fun cached_file_hash cache path =
-  let
-    fun lookup entries =
-      case List.find (fn (candidate, _) => candidate = path) entries of
-          SOME (_, value) => SOME value
-        | NONE => NONE
-    fun remember value =
-      with_file_hash_cache_lock cache
-        (fn () =>
-            case lookup (!(#entries cache)) of
-                SOME old => old
-              | NONE => (#entries cache := (path, value) :: !(#entries cache); value))
-  in
-    case with_file_hash_cache_lock cache (fn () => lookup (!(#entries cache))) of
-        SOME value => value
-      | NONE =>
-          remember (SOME (file_hash path) handle _ => NONE)
-  end
+(* Only successful hashes are memoized.  A failed hash (missing/unreadable file)
+   returns NONE but is not stored, so a transient failure is retried on the next
+   lookup rather than poisoning every later up-to-date check of the same path. *)
+fun cached_file_hash (cache : file_hash_cache) path =
+  case with_file_hash_cache_lock cache
+         (fn () => Binarymap.peek (!(#entries cache), path)) of
+      SOME hash => SOME hash
+    | NONE =>
+        (case (SOME (file_hash path) handle _ => NONE) of
+             NONE => NONE
+           | SOME hash =>
+               with_file_hash_cache_lock cache
+                 (fn () =>
+                     case Binarymap.peek (!(#entries cache), path) of
+                         SOME existing => SOME existing
+                       | NONE =>
+                           (#entries cache := Binarymap.insert (!(#entries cache), path, hash);
+                            SOME hash)))
 
-fun invalidate_cached_file_hash cache path =
+fun invalidate_cached_file_hash (cache : file_hash_cache) path =
   with_file_hash_cache_lock cache
-    (fn () => #entries cache := List.filter (fn (candidate, _) => candidate <> path)
-                                            (!(#entries cache)))
+    (fn () =>
+        case Binarymap.peek (!(#entries cache), path) of
+            NONE => ()
+          | SOME _ => #entries cache := #1 (Binarymap.remove (!(#entries cache), path)))
 
 fun normalize_path path = Path.mkCanonical path handle Path.InvalidArc => path
 
@@ -3024,11 +2988,15 @@ fun theory_parent_hash_matches dat_hash_cache dat_text dep =
   let
     val parent_name = theory_name_from_logical (logical_name dep)
   in
-    case (theory_dat_parent_hash dat_text parent_name,
-          cached_file_hash dat_hash_cache (#data_path (theory_outputs dep))) of
-        (NONE, _) => true
-      | (SOME recorded_hash, SOME parent_hash) => recorded_hash = parent_hash
-      | (SOME _, NONE) => false
+    (* A parent whose data file cannot be hashed (missing/unreadable) makes the
+       node not up to date, matching the old eager-hash behaviour.  Only a
+       readable parent lets a missing recorded hash count as a match. *)
+    case cached_file_hash dat_hash_cache (#data_path (theory_outputs dep)) of
+        NONE => false
+      | SOME parent_hash =>
+          (case theory_dat_parent_hash dat_text parent_name of
+               NONE => true
+             | SOME recorded_hash => recorded_hash = parent_hash)
   end
 
 fun theory_parent_hashes_match dat_hash_cache plan node =
@@ -3366,6 +3334,11 @@ fun checkpoint_dir_mtime path = SOME (FS.modTime path) handle OS.SysErr _ => NON
 fun checkpoint_family_watch_dirs ({base, ...} : checkpoint_family) =
   [Path.dir base, base ^ ".theorems", base ^ ".decls", base ^ ".deps"]
 
+(* A completed node only indexes its own checkpoint family incrementally, but a
+   build can also create checkpoint families that belong to no scheduled node
+   (e.g. generated theories).  This snapshot lets refresh detect such
+   out-of-family changes on disk and fall back to a full rescan so the budget is
+   still enforced against them. *)
 fun checkpoint_watch_snapshot dir families =
   let
     val top_dirs = if path_exists dir then dir :: List.filter is_dir (children dir) else [dir]
@@ -3416,7 +3389,14 @@ fun create_checkpoint_budget_state project =
   let
     val checkpoint_dir = project_state_dir project "checkpoints"
     val checkpoint_limit_gb = project_checkpoint_limit_gb project
-    val index = load_or_rebuild_checkpoint_index checkpoint_dir
+    val dirty_path = checkpoint_index_dirty_path checkpoint_dir
+    (* If the previous build was hard-killed mid-flight the marker is still
+       present and the persisted index may under-count on-disk families; rebuild
+       from disk in that case so the budget is enforced against ground truth. *)
+    val index =
+      if path_exists dirty_path then rebuild_checkpoint_index checkpoint_dir
+      else load_or_rebuild_checkpoint_index checkpoint_dir
+    val _ = (ensure_parent dirty_path; write_text dirty_path "building\n") handle _ => ()
   in
     {checkpoint_dir = checkpoint_dir,
      checkpoint_limit_gb = checkpoint_limit_gb,
@@ -3425,6 +3405,12 @@ fun create_checkpoint_budget_state project =
      watch = ref (checkpoint_watch_snapshot checkpoint_dir (#families index)),
      mutex = Mutex.mutex ()}
   end
+
+fun clear_checkpoint_index_dirty (state : checkpoint_budget_state) =
+  remove_file (checkpoint_index_dirty_path (#checkpoint_dir state))
+
+fun warn_checkpoint_budget_error e =
+  warn ("checkpoint budget maintenance failed: " ^ General.exnMessage e)
 
 fun with_checkpoint_budget_lock (state : checkpoint_budget_state) f =
   (Mutex.lock (#mutex state); f () before Mutex.unlock (#mutex state))
@@ -3440,7 +3426,10 @@ fun enforce_checkpoint_index_locked (state : checkpoint_budget_state) index prot
       if evicted > 0 andalso after_bytes > max_bytes then
         rebuild_checkpoint_index (#checkpoint_dir state)
       else evicted_index
+    (* Persisting the index must never fail the build: eviction already happened
+       and the in-memory index is returned regardless. *)
     val _ = write_checkpoint_index_atomically final_index
+            handle e => warn ("could not persist checkpoint index: " ^ General.exnMessage e)
   in
     final_index
   end
@@ -3448,7 +3437,7 @@ fun enforce_checkpoint_index_locked (state : checkpoint_budget_state) index prot
 fun enforce_checkpoint_budget_state_excluding state protected_bases =
   detail_time_phase "build.exec.checkpoint_budget"
     (fn () =>
-        with_checkpoint_budget_lock state
+        (with_checkpoint_budget_lock state
           (fn () =>
               let
                 val final_index = enforce_checkpoint_index_locked state (!(#index state)) protected_bases
@@ -3456,11 +3445,12 @@ fun enforce_checkpoint_budget_state_excluding state protected_bases =
                 #index state := final_index;
                 #watch state := checkpoint_watch_snapshot (#checkpoint_dir state) (#families final_index)
               end))
+        handle e => warn_checkpoint_budget_error e)
 
 fun rebuild_and_enforce_checkpoint_budget_state_excluding state protected_bases =
   detail_time_phase "build.exec.checkpoint_budget"
     (fn () =>
-        with_checkpoint_budget_lock state
+        (with_checkpoint_budget_lock state
           (fn () =>
               let
                 val dir = #checkpoint_dir state
@@ -3470,11 +3460,12 @@ fun rebuild_and_enforce_checkpoint_budget_state_excluding state protected_bases 
                 #index state := final_index;
                 #watch state := checkpoint_watch_snapshot dir (#families final_index)
               end))
+        handle e => warn_checkpoint_budget_error e)
 
 fun refresh_checkpoint_budget_after_node state project node protected_bases =
   detail_time_phase "build.exec.checkpoint_budget"
     (fn () =>
-        with_checkpoint_budget_lock state
+        (with_checkpoint_budget_lock state
           (fn () =>
               let
                 val dir = #checkpoint_dir state
@@ -3489,37 +3480,7 @@ fun refresh_checkpoint_budget_after_node state project node protected_bases =
                 #index state := final_index;
                 #watch state := checkpoint_watch_snapshot dir (#families final_index)
               end))
-
-fun enforce_checkpoint_budget_excluding project protected_bases =
-  detail_time_phase "build.exec.checkpoint_budget"
-    (fn () =>
-        let
-          val checkpoint_limit_gb = project_checkpoint_limit_gb project
-          val max_bytes = gb_to_bytes checkpoint_limit_gb
-          val eviction = evict_oldest_checkpoints_with_stats_excluding
-                         (project_state_dir project "checkpoints") max_bytes protected_bases
-          val {before_bytes, after_bytes, evicted, ...} = eviction
-        in
-          checkpoint_budget_warnings checkpoint_limit_gb eviction
-        end)
-
-fun enforce_checkpoint_budget project = enforce_checkpoint_budget_excluding project []
-
-fun protected_checkpoint_bases_for_nodes project plan nodes =
-  let
-    fun add_base node protected =
-      let val base = checkpoint_base project node
-      in if string_member base protected then protected else base :: protected end
-    fun add_node node protected =
-      let val protected' = add_base node protected
-      in
-        List.foldl (fn (dep, acc) => add_node dep acc)
-                   protected'
-                   (HolbuildBuildPlan.direct_project_deps plan node)
-      end
-  in
-    List.foldl (fn (node, protected) => add_node node protected) [] nodes
-  end
+        handle e => warn_checkpoint_budget_error e)
 
 fun build_serial dat_hash_cache status options tc project base_context plan keys toolchain_key budget_state =
   let
@@ -3921,8 +3882,13 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
         if jobs <= 1 then build_serial dat_hash_cache status options tc project base_context plan keys toolchain_key budget_state
         else build_parallel dat_hash_cache status options tc project base_context plan keys toolchain_key jobs budget_state
     in
-      (run (); HolbuildStatus.finish status; enforce_checkpoint_budget_state_excluding budget_state [])
-      handle e => (HolbuildStatus.finish status; rebuild_and_enforce_checkpoint_budget_state_excluding budget_state []; raise e)
+      (run (); HolbuildStatus.finish status;
+       enforce_checkpoint_budget_state_excluding budget_state [];
+       clear_checkpoint_index_dirty budget_state)
+      handle e => (HolbuildStatus.finish status;
+                   rebuild_and_enforce_checkpoint_budget_state_excluding budget_state [];
+                   clear_checkpoint_index_dirty budget_state;
+                   raise e)
     end
   end
 
