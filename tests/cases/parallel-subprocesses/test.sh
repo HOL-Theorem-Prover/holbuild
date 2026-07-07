@@ -28,7 +28,6 @@ name = "parallel_subprocesses"
 [build]
 members = ["src"]
 TOML
-
 child_log=$project/child.log
 : > "$child_log"
 for i in 1 2 3 4 5 6; do
@@ -81,7 +80,6 @@ name = "parallel_failure_cleanup"
 [build]
 members = ["src"]
 TOML
-
 fail_child_log=$fail_project/child.log
 cat > "$fail_project/src/SlowScript.sml" <<SML
 open HolKernel Parse boolLib bossLib;
@@ -119,3 +117,44 @@ if grep -q "END slow" "$fail_child_log" 2>/dev/null; then
   cat "$fail_child_log" >&2
   exit 1
 fi
+
+exit_project=$tmpdir/parallel-exit-project
+mkdir -p "$exit_project/src"
+cat > "$exit_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "parallel_exit"
+
+[build]
+members = ["src"]
+TOML
+cat > "$exit_project/.holconfig.toml" <<TOML
+[build]
+checkpoint_limit_gb = 1
+TOML
+for i in 1 2 3; do
+  cat > "$exit_project/src/Exit${i}Script.sml" <<SML
+Theory Exit${i}
+
+Theorem exit${i}_thm:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+SML
+done
+
+if ! (cd "$exit_project" && timeout 30 "$HOLBUILD_BIN" -j3 build --force=project --no-cache) > "$tmpdir/parallel-exit.log" 2>&1; then
+  echo "parallel checkpoint-enabled build did not exit cleanly" >&2
+  cat "$tmpdir/parallel-exit.log" >&2
+  exit 1
+fi
+for i in 1 2 3; do
+  require_file "$exit_project/.holbuild/obj/src/Exit${i}Theory.dat"
+done

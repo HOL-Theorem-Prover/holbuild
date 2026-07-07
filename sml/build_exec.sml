@@ -3868,22 +3868,29 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
       if !active = 0 then ()
       else (ConditionVar.wait (cv, mutex); wait_workers_locked ())
 
-    fun wait_workers () =
-      let
-        val result =
-          (lock (); wait_workers_locked (); !failure before unlock ())
-          handle e => (unlock (); raise e)
-      in
-        case result of
-            NONE => ()
-          | SOME (msg, artifacts) =>
-              if HolbuildStatus.debug_artifacts_empty artifacts then raise Error msg
-              else raise ErrorWithDebugArtifacts (msg, artifacts)
-      end
+    fun wait_workers_result () =
+      (lock (); wait_workers_locked (); !failure before unlock ())
+      handle e => (unlock (); raise e)
+
+    fun wait_worker_threads threads =
+      if List.exists Thread.isActive threads then
+        (OS.Process.sleep (Time.fromReal 0.05); wait_worker_threads threads)
+      else ()
+
+    fun raise_failure result =
+      case result of
+          NONE => ()
+        | SOME (msg, artifacts) =>
+            if HolbuildStatus.debug_artifacts_empty artifacts then raise Error msg
+            else raise ErrorWithDebugArtifacts (msg, artifacts)
   in
-    List.app (fn _ => ignore (Thread.fork (worker, [])))
-             (List.tabulate (jobs, fn i => i));
-    wait_workers ()
+    let
+      val threads = List.tabulate (jobs, fn _ => Thread.fork (worker, []))
+      val result = wait_workers_result ()
+      val _ = wait_worker_threads threads
+    in
+      raise_failure result
+    end
   end
 
 fun build (options : build_options) tc project plan toolchain_key jobs =
