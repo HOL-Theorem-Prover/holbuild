@@ -486,3 +486,21 @@ cat > "$tmpdir/bad_local_jobs_value/.holconfig.toml" <<'TOML'
 jobs = 0
 TOML
 expect_context_failure bad_local_jobs_value ".holconfig.toml build.jobs must be a positive integer"
+
+make_project bad_local_remote_cache_field
+write_manifest bad_local_remote_cache_field <<'TOML'
+TOML
+cat > "$tmpdir/bad_local_remote_cache_field/.holconfig.toml" <<'TOML'
+[remote_cache]
+endpoint = "https://cache.example.org"
+TOML
+expect_context_failure bad_local_remote_cache_field "unknown field in .holconfig.toml remote_cache: endpoint"
+
+make_project bad_local_remote_cache_url_type
+write_manifest bad_local_remote_cache_url_type <<'TOML'
+TOML
+cat > "$tmpdir/bad_local_remote_cache_url_type/.holconfig.toml" <<'TOML'
+[remote_cache]
+url = 7
+TOML
+expect_context_failure bad_local_remote_cache_url_type "url must be a string"

@@ -607,8 +607,13 @@ fun effective_jobs (project : HolbuildProject.t) cli_jobs =
       SOME jobs => jobs
     | NONE => Option.getOpt (#local_build_jobs project, default_jobs ())
 
+fun apply_project_local_remote_cache_config (project : HolbuildProject.t) =
+  (HolbuildRemoteCacheConfig.set_local_url (HolbuildProject.remote_cache_url project);
+   HolbuildRemoteCacheConfig.set_local_curl_config (HolbuildProject.remote_cache_curl_config project);
+   project)
+
 fun load_project () =
-  HolbuildProject.discover ()
+  apply_project_local_remote_cache_config (HolbuildProject.discover ())
   handle HolbuildProject.Error msg => raise Error msg
 
 fun context () = HolbuildProject.describe (load_project ())
