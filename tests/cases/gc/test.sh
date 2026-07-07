@@ -192,6 +192,36 @@ if [[ -e "$budget_family.deps/old-deps-key" || -e "$budget_family.theorems/old-d
   exit 1
 fi
 
+failure_index_project=$tmpdir/failure-index-project
+mkdir -p "$failure_index_project/src"
+cat > "$failure_index_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "checkpoint-failure-index"
+
+[build]
+members = ["src"]
+TOML
+cat > "$failure_index_project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+val first = Q.store_thm ("first", `T`, rw []);
+val bad = Q.store_thm ("bad", `T`, ALL_TAC THEN FAIL_TAC "forced checkpoint index failure");
+val _ = export_theory ();
+SML
+if (cd "$failure_index_project" && "$HOLBUILD_BIN" build ATheory) > "$tmpdir/failure-index.log" 2>&1; then
+  echo "checkpoint failure index fixture unexpectedly succeeded" >&2
+  exit 1
+fi
+require_file "$failure_index_project/.holbuild/checkpoints/.index-v1"
+require_grep "checkpoint-failure-index/src/AScript.sml" "$failure_index_project/.holbuild/checkpoints/.index-v1"
+
 mid_project=$tmpdir/mid-budget-project
 mid_family="$mid_project/.holbuild/checkpoints/mid-budget-generated/src/generated"
 mkdir -p "$mid_project/src"

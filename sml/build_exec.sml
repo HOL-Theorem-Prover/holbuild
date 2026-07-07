@@ -3457,6 +3457,20 @@ fun enforce_checkpoint_budget_state_excluding state protected_bases =
                 #watch state := checkpoint_watch_snapshot (#checkpoint_dir state) (#families final_index)
               end))
 
+fun rebuild_and_enforce_checkpoint_budget_state_excluding state protected_bases =
+  detail_time_phase "build.exec.checkpoint_budget"
+    (fn () =>
+        with_checkpoint_budget_lock state
+          (fn () =>
+              let
+                val dir = #checkpoint_dir state
+                val index' = rebuild_checkpoint_index dir
+                val final_index = enforce_checkpoint_index_locked state index' protected_bases
+              in
+                #index state := final_index;
+                #watch state := checkpoint_watch_snapshot dir (#families final_index)
+              end))
+
 fun refresh_checkpoint_budget_after_node state project node protected_bases =
   detail_time_phase "build.exec.checkpoint_budget"
     (fn () =>
@@ -3908,7 +3922,7 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
         else build_parallel dat_hash_cache status options tc project base_context plan keys toolchain_key jobs budget_state
     in
       (run (); HolbuildStatus.finish status; enforce_checkpoint_budget_state_excluding budget_state [])
-      handle e => (HolbuildStatus.finish status; enforce_checkpoint_budget_state_excluding budget_state []; raise e)
+      handle e => (HolbuildStatus.finish status; rebuild_and_enforce_checkpoint_budget_state_excluding budget_state []; raise e)
     end
   end
 

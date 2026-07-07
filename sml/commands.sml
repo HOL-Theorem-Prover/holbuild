@@ -725,38 +725,39 @@ fun build_iteration_error_message exn =
     | HolbuildWatch.Error msg => SOME msg
     | _ => NONE
 
-fun current_watch_state previous =
+fun current_watch_state previous_paths =
   let
     val project = timed_phase "watch.project.discover" load_project
     val index = timed_phase "watch.source.discover" (fn () => HolbuildSourceIndex.discover project)
     val paths = HolbuildWatch.watch_paths project index
   in
-    {project = project, index = index, paths = paths}
+    {prepared = SOME {project = project, index = index, paths = paths}, paths = paths}
   end
   handle exn =>
-    case (build_iteration_error_message exn, previous) of
-        (SOME msg, SOME state) => (warn ("could not recompute watch set: " ^ msg); state)
+    case (build_iteration_error_message exn, previous_paths) of
+        (SOME msg, SOME paths) =>
+          (warn ("could not recompute watch set: " ^ msg);
+           {prepared = NONE, paths = paths})
       | (SOME msg, NONE) => raise Error ("could not compute watch set: " ^ msg)
       | (NONE, _) => raise exn
 
 fun build_watch tc cli_jobs parsed =
   let
     val _ = HolbuildWatch.ensure_inotifywait ()
-    fun attempt state =
-      (build_once_with_prepared tc cli_jobs (SOME state) parsed; ())
+    fun attempt prepared =
+      (build_once_with_prepared tc cli_jobs prepared parsed; ())
       handle exn =>
         case build_iteration_error_message exn of
             SOME msg => warn ("build failed: " ^ msg)
           | NONE => raise exn
-    fun loop previous_state =
+    fun loop previous_paths =
       let
-        val state = current_watch_state previous_state
-        val _ = attempt state
-        val paths = #paths state
+        val {prepared, paths} = current_watch_state previous_paths
+        val _ = attempt prepared
         val _ = warn ("watching " ^ Int.toString (length paths) ^ " project path(s); waiting for changes")
         val _ = HolbuildWatch.wait_for_change paths
       in
-        loop (SOME state)
+        loop (SOME paths)
       end
   in
     loop NONE
