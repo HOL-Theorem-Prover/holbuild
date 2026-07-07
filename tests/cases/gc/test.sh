@@ -301,6 +301,66 @@ if grep -q "protected active family was evicted" "$tmpdir/protected-active.log";
   exit 1
 fi
 
+protected_empty_project=$tmpdir/protected-empty-active-project
+protected_empty_slow_family="$protected_empty_project/.holbuild/checkpoints/protected-empty-active/src/SlowScript.sml"
+protected_empty_old_family="$protected_empty_project/.holbuild/checkpoints/protected-empty-active/src/OldScript.sml"
+protected_empty_live_dir="$protected_empty_slow_family.deps/live"
+mkdir -p "$protected_empty_project/src" "$protected_empty_old_family.deps/old"
+cat > "$protected_empty_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "protected-empty-active"
+
+[build]
+members = ["src"]
+TOML
+cat > "$protected_empty_project/.holconfig.toml" <<'TOML'
+[build]
+checkpoint_limit_gb = 1
+jobs = 3
+TOML
+truncate -s 2G "$protected_empty_old_family.deps/old/deps_loaded.save"
+printf 'ok\n' > "$protected_empty_old_family.deps/old/deps_loaded.save.ok"
+cat > "$protected_empty_project/src/SlowScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Slow";
+val _ = export_theory();
+val _ = OS.Process.system "mkdir -p $protected_empty_live_dir";
+val _ = OS.Process.sleep (Time.fromSeconds 6);
+SML
+cat > "$protected_empty_project/src/FastScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Fast";
+val _ = OS.Process.sleep (Time.fromSeconds 2);
+val _ = export_theory();
+SML
+cat > "$protected_empty_project/src/ThirdScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Third";
+val _ = load "FastTheory";
+val _ =
+  if OS.FileSys.isDir "$protected_empty_live_dir" then
+    raise Fail "protected active empty family survived"
+  else
+    raise Fail "protected active empty family was pruned";
+SML
+if (cd "$protected_empty_project" && "$HOLBUILD_BIN" build --force=project --no-cache) > "$tmpdir/protected-empty-active.log" 2>&1; then
+  echo "protected empty active family fixture unexpectedly succeeded" >&2
+  exit 1
+fi
+require_grep "checkpoint budget: .*checkpoint_limit_gb=1" "$tmpdir/protected-empty-active.log"
+require_grep "protected active empty family survived" "$tmpdir/protected-empty-active.log"
+if grep -q "protected active empty family was pruned" "$tmpdir/protected-empty-active.log"; then
+  echo "checkpoint budget pruned an active protected empty family" >&2
+  exit 1
+fi
+
 scan_project=$tmpdir/scan-project
 mkdir -p "$scan_project/src"
 cat > "$scan_project/holproject.toml" <<TOML

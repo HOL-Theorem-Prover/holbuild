@@ -567,11 +567,27 @@ fun checkpoint_clean_artifact path =
 
 fun remove_empty_dir path = FS.rmDir path handle OS.SysErr _ => ()
 
-fun remove_empty_dirs dir =
+fun protected_checkpoint_artifact_roots base =
+  [base ^ ".theorems", base ^ ".decls", base ^ ".deps",
+   base ^ ".final_context.save"]
+
+fun path_in_or_at_dir path dir =
+  path = dir orelse path_under_dir path dir
+
+fun protected_empty_checkpoint_dir protected_bases path =
+  List.exists
+    (fn base => List.exists (path_in_or_at_dir path)
+                            (protected_checkpoint_artifact_roots base))
+    protected_bases
+
+fun remove_empty_dirs_excluding protected_bases dir =
   if not (path_exists dir) orelse not (FS.isDir dir handle OS.SysErr _ => false) then ()
+  else if protected_empty_checkpoint_dir protected_bases dir then ()
   else
-    (List.app remove_empty_dirs (children dir);
-     remove_empty_dir dir)
+    (List.app (remove_empty_dirs_excluding protected_bases) (children dir);
+     if protected_empty_checkpoint_dir protected_bases dir then () else remove_empty_dir dir)
+
+fun remove_empty_dirs dir = remove_empty_dirs_excluding [] dir
 
 fun checkpoint_save_artifact_base path =
   if has_suffix ".save.ok.tmp" path then SOME (drop_suffix ".ok.tmp" path)
@@ -921,7 +937,7 @@ fun evict_checkpoint_families_excluding dir families total max_bytes protected_b
                 else evict rest freed' (removed + 1)
               end
       val evicted = evict sorted 0 0
-      val _ = if evicted = 0 then () else remove_empty_dirs dir
+      val _ = if evicted = 0 then () else remove_empty_dirs_excluding protected_bases dir
     in
       evicted
     end
@@ -970,7 +986,7 @@ fun evict_from_index_excluding (index as {dir, families, total_bytes} : checkpoi
       List.filter (fn ({base, ...} : checkpoint_family) => not (string_member base removed_bases)) families
     val after_bytes = before_bytes - freed
     val index' = {dir = dir, families = families', total_bytes = after_bytes}
-    val _ = if evicted = 0 then () else remove_empty_dirs dir
+    val _ = if evicted = 0 then () else remove_empty_dirs_excluding protected_bases dir
   in
     (index', {before_bytes = before_bytes, after_bytes = after_bytes,
               max_bytes = max_bytes, evicted = evicted})
