@@ -154,3 +154,132 @@ STAT_CACHE_TEST_TMP="$tmpdir" "${HOLBUILD_POLY:-poly}" < "$tmpdir/stat-cache-tes
 }
 
 grep -q "stat-cache unit tests passed" "$tmpdir/stat-cache-test.log"
+
+stat_cache_field() {
+  local field=$1
+  local path=$2
+  awk -v field="$field" '
+    /^phase/ {
+      saw = 0
+      value = ""
+      for (i = 1; i <= NF; i++) {
+        if ($i == "name=build.stat_cache") saw = 1
+        if (index($i, field "=") == 1) value = substr($i, length(field) + 2)
+      }
+      if (saw && value != "") {
+        print value
+        found = 1
+      }
+    }
+    END { if (!found) exit 1 }
+  ' "$path" | tail -n 1
+}
+
+json_field() {
+  local field=$1
+  local path=$2
+  python3 - "$field" "$path" <<'PY'
+import json
+import sys
+
+field, path = sys.argv[1:]
+finished = []
+with open(path) as handle:
+    for line in handle:
+        if line.startswith("{"):
+            event = json.loads(line)
+            if event.get("event") == "build_finished":
+                finished.append(event)
+if not finished:
+    raise SystemExit("missing build_finished event")
+print(finished[-1].get(field))
+PY
+}
+
+assert_json_field() {
+  local field=$1
+  local expected=$2
+  local path=$3
+  local actual
+  actual=$(json_field "$field" "$path")
+  [[ "$actual" == "$expected" ]] || {
+    echo "expected $field=$expected in $path, got $actual" >&2
+    exit 1
+  }
+}
+
+project=$tmpdir/project
+mkdir -p "$project/src"
+use_case_cache "$tmpdir/cache"
+cat > "$project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "statcache"
+
+[build]
+members = ["src"]
+TOML
+cat > "$project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+val a_thm = store_thm("a_thm", ``T``, ACCEPT_TAC TRUTH);
+val _ = export_theory();
+SML
+cat > "$project/src/BScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+open ATheory;
+val _ = new_theory "B";
+val b_thm = store_thm("b_thm", ``T``, ACCEPT_TAC ATheory.a_thm);
+val _ = export_theory();
+SML
+
+first_timing=$tmpdir/first.timing
+(cd "$project" && HOLBUILD_TIMING_LOG="$first_timing" HOLBUILD_TIMING_DETAIL=fine "$HOLBUILD_BIN" build BTheory) > "$tmpdir/first.log" 2>&1
+require_file "$project/.holbuild/stat-cache"
+first_recomputes=$(stat_cache_field recomputes "$first_timing")
+if [[ "$first_recomputes" -le 0 ]]; then
+  echo "first build did not populate stat-cache recompute counters" >&2
+  exit 1
+fi
+
+keys_before=$tmpdir/keys-before
+second_timing=$tmpdir/second.timing
+second_json=$tmpdir/second.json
+(cd "$project" && HOLBUILD_DUMP_KEYS="$keys_before" HOLBUILD_TIMING_LOG="$second_timing" HOLBUILD_TIMING_DETAIL=fine "$HOLBUILD_BIN" --json build BTheory) > "$second_json" 2>&1
+assert_json_field built 0 "$second_json"
+assert_json_field from_cache 0 "$second_json"
+assert_json_field unchanged 2 "$second_json"
+second_hits=$(stat_cache_field hits "$second_timing")
+second_recomputes=$(stat_cache_field recomputes "$second_timing")
+if [[ "$second_hits" -le 0 || "$second_recomputes" -ne 0 ]]; then
+  echo "second no-op should hit stat cache without recomputes; hits=$second_hits recomputes=$second_recomputes" >&2
+  exit 1
+fi
+
+nostat_keys=$tmpdir/keys-nostat
+nostat_timing=$tmpdir/nostat.timing
+nostat_json=$tmpdir/nostat.json
+(cd "$project" && HOLBUILD_DUMP_KEYS="$nostat_keys" HOLBUILD_TIMING_LOG="$nostat_timing" HOLBUILD_TIMING_DETAIL=fine "$HOLBUILD_BIN" --json build --no-stat-cache BTheory) > "$nostat_json" 2>&1
+assert_json_field built 0 "$nostat_json"
+assert_json_field from_cache 0 "$nostat_json"
+assert_json_field unchanged 2 "$nostat_json"
+if [[ "$(stat_cache_field enabled "$nostat_timing")" != "false" ]]; then
+  echo "--no-stat-cache did not report disabled counters" >&2
+  exit 1
+fi
+diff -u "$keys_before" "$nostat_keys"
+
+cat >> "$project/src/AScript.sml" <<'SML'
+val _ = print "";
+SML
+edit_json=$tmpdir/edit.json
+(cd "$project" && "$HOLBUILD_BIN" --json build --no-cache BTheory) > "$edit_json" 2>&1
+assert_json_field built 2 "$edit_json"
+assert_json_field from_cache 0 "$edit_json"
+assert_json_field unchanged 0 "$edit_json"

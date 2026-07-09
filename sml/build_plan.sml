@@ -22,7 +22,7 @@ fun source_hash_of ({source, source_hash, ...} : node) =
   case !source_hash of
       SOME hash => hash
     | NONE =>
-        let val hash = HolbuildHash.file_sha1 (#source_path source)
+        let val hash = HolbuildStatCache.file_sha1 (HolbuildStatCache.current_instance ()) (#source_path source)
         in source_hash := SOME hash; hash end
 
 fun dependency_cache_path source =

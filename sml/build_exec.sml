@@ -1018,7 +1018,7 @@ fun file_exists path = FS.access(path, [FS.A_READ]) handle OS.SysErr _ => false
 
 fun checkpoint_exists path = file_exists path andalso file_exists (checkpoint_ok_path path)
 
-fun file_hash path = HolbuildHash.file_sha1 path
+fun file_hash path = HolbuildStatCache.file_sha1 (HolbuildStatCache.current_instance ()) path
 
 type file_hash_cache = {entries : (string, string) Binarymap.dict ref, mutex : Mutex.mutex}
 
@@ -1037,7 +1037,7 @@ fun cached_file_hash (cache : file_hash_cache) path =
          (fn () => Binarymap.peek (!(#entries cache), path)) of
       SOME hash => SOME hash
     | NONE =>
-        (case (SOME (file_hash path) handle _ => NONE) of
+        (case (SOME (HolbuildStatCache.file_sha1 (HolbuildStatCache.current_instance ()) path) handle _ => NONE) of
              NONE => NONE
            | SOME hash =>
                with_file_hash_cache_lock cache
