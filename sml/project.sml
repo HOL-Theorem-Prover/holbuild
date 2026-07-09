@@ -994,6 +994,8 @@ fun project_package ({root, artifact_root, graph_artifact_root, manifest, name, 
            action_policies = action_policies,
            generators = generators}
 
+fun root_package_name project = package_name (project_package project)
+
 fun dependency_project (project : t) (dep as Dependency {name, source}) =
   let
     val _ =

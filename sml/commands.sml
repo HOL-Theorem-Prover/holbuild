@@ -288,7 +288,11 @@ fun reject_object_target target =
 fun reject_object_targets targets = List.app reject_object_target targets
 
 fun default_build_targets project index targets =
-  if null targets then HolbuildSourceIndex.default_targets index project else targets
+  if not (null targets) then targets
+  else
+    case HolbuildSourceIndex.default_targets index project of
+        [] => HolbuildSourceIndex.root_package_targets index project
+      | default_targets => default_targets
 
 fun source_key source =
   #package source ^ "\000" ^ #relative_path source ^ "\000" ^ #logical_name source

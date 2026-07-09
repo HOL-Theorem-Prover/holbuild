@@ -341,4 +341,11 @@ fun default_targets sources project =
          (List.filter (fn package => not (null (HolbuildProject.package_roots package)))
                       (HolbuildProject.packages project)))
 
+fun root_package_targets sources project =
+  let val root_name = HolbuildProject.root_package_name project
+  in
+    map (fn (source : source) => #logical_name source)
+      (List.filter (fn (source : source) => #package source = root_name) sources)
+  end
+
 end
