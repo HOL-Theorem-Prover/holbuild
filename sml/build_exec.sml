@@ -64,6 +64,10 @@ fun copy_binary src dst =
     handle e => (close_input (); close_output (); remove_file tmp; raise e)
   end
 
+fun link_or_copy {src, dst} =
+  HolbuildCache.link_or_copy {src = src, dst = dst}
+  handle HolbuildCache.Error msg => raise Error msg
+
 fun read_text path =
   let val input = TextIO.openIn path
   in TextIO.inputAll input before TextIO.closeIn input end
@@ -1965,12 +1969,12 @@ fun materialize_theory_cache_key verify_cache project plan input_key requested_t
     val {sig_path, sml_path, data_path, ...} = theory_outputs node
     fun install () =
       (copy_blob verify_cache root dat_hash data_path;
-       copy_blob verify_cache root dat_hash (hfs_remapped_path data_path);
+       link_or_copy {src = data_path, dst = hfs_remapped_path data_path};
        copy_blob verify_cache root sig_hash sig_path;
-       copy_blob verify_cache root sig_hash (hfs_remapped_path sig_path);
+       link_or_copy {src = sig_path, dst = hfs_remapped_path sig_path};
        copy_blob verify_cache root sml_hash sml_path;
        write_text sml_path (replace_all cache_sml_token data_path (read_text sml_path));
-       write_text (hfs_remapped_path sml_path) (read_text sml_path);
+       link_or_copy {src = sml_path, dst = hfs_remapped_path sml_path};
        write_local_theory_manifests plan node {parents = parents, mldeps = mldeps};
        HolbuildCache.touch_action root cache_key;
        cache_trace ("cache hit: " ^ logical_name node ^ " " ^ role ^ "=" ^ cache_key);
@@ -2322,7 +2326,7 @@ fun best_failed_prefix_checkpoint requested_timeout checkpoints =
 
 datatype force_level = ForceNone | ForceTargets | ForceProject | ForceAll
 
-type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, proof_steps : bool, new_ir : bool, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool}
+type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, proof_steps : bool, new_ir : bool, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool}
 
 datatype checkpoint_policy =
   CheckpointPolicy of {checkpoint : bool, proof_steps : bool, new_ir : bool, tactic_timeout : real option, execution_plan : string option, trace_steps : bool, repl_on_failure : bool}
@@ -2803,13 +2807,13 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
              | SOME output => HolbuildStatus.message_stdout ("proof step trace log: " ^ captured_output_path output ^ "\n"))
       else ()
     val _ = copy_binary staged_dat data_path
-    val _ = copy_binary staged_dat (hfs_remapped_path data_path)
+    val _ = link_or_copy {src = data_path, dst = hfs_remapped_path data_path}
     val _ = copy_binary staged_sig sig_path
-    val _ = copy_binary staged_sig (hfs_remapped_path sig_path)
+    val _ = link_or_copy {src = sig_path, dst = hfs_remapped_path sig_path}
     val dat_replacements = stage_dat_replacements stage node data_path
     val _ = copy_rewriting_path {src = staged_sml, dst = sml_path,
                                  replacements = dat_replacements}
-    val _ = copy_binary sml_path (hfs_remapped_path sml_path)
+    val _ = link_or_copy {src = sml_path, dst = hfs_remapped_path sml_path}
     val generated_metadata = read_generated_load_metadata {parents_report = parents_report,
                                                            mldeps_report = mldeps_report}
     val _ =
@@ -2859,7 +2863,25 @@ fun output_paths _ _ node =
     data_paths @ map hfs_remapped_path data_paths
   end
 
-fun output_hash_line path = "output-sha1=" ^ path ^ " " ^ file_hash path
+fun output_hash_line path hash = "output-sha1=" ^ path ^ " " ^ hash
+
+fun output_hash_lines_for_paths paths =
+  let
+    val canonical_hashes = map (fn path => (path, file_hash path)) paths
+    fun canonical_line (path, hash) = output_hash_line path hash
+    fun remap_line (path, hash) = output_hash_line (hfs_remapped_path path) hash
+  in
+    map canonical_line canonical_hashes @ map remap_line canonical_hashes
+  end
+
+fun output_hash_lines _ _ node =
+  let
+    val artifacts = source_artifacts node
+  in
+    output_hash_lines_for_paths (#generated artifacts) @
+    output_hash_lines_for_paths (#objects artifacts) @
+    output_hash_lines_for_paths (#theory_data artifacts)
+  end
 
 fun theory_name_from_logical logical =
   if has_suffix "Theory" logical then drop_suffix "Theory" logical else logical
@@ -3018,10 +3040,10 @@ fun lines_text lines = String.concatWith "\n" lines ^ "\n"
 fun metadata_core_text checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints =
   lines_text (metadata_core_lines checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints)
 
-fun metadata_text checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints =
+fun metadata_text emit_output_hashes checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints =
   lines_text
     (metadata_core_lines checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints @
-     map output_hash_line (output_paths checkpoint_policy project node))
+     (if emit_output_hashes then output_hash_lines checkpoint_policy project node else []))
 
 fun semantic_metadata_text text =
   lines_text (List.filter (fn line => not (String.isPrefix "output-sha1=" line))
@@ -3051,9 +3073,9 @@ fun output_exists_for_node node path =
       HolbuildSourceIndex.TheoryScript => file_nonempty path
     | _ => file_exists path
 
-fun write_metadata checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints =
+fun write_metadata emit_output_hashes checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints =
   write_text (metadata_path project node)
-             (metadata_text checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints)
+             (metadata_text emit_output_hashes checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints)
 
 fun metadata_has_parent_hashes lines =
   metadata_value "parent_hashes" lines = SOME "v1"
@@ -3124,7 +3146,7 @@ fun theory_parent_hashes_match dat_hash_cache plan node metadata_text =
            | _ => true)
         handle _ => false)
 
-fun up_to_date dat_hash_cache checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints =
+fun up_to_date dat_hash_cache emit_output_hashes checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints =
   detail_time_phase "build.exec.node.up_to_date"
     (fn () =>
         List.all (output_exists_for_node node) (output_paths checkpoint_policy project node) andalso
@@ -3138,7 +3160,7 @@ fun up_to_date dat_hash_cache checkpoint_policy project plan keys input_key tool
                    metadata_ok andalso theory_parent_hashes_match dat_hash_cache plan node (SOME text)
                  val _ =
                    if parents_ok andalso theory_parent_metadata_needs_refresh node text then
-                     write_metadata checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints
+                     write_metadata emit_output_hashes checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints
                    else ()
                in
                  metadata_ok andalso parents_ok
@@ -3325,13 +3347,13 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
        else (remove_failed_cache_outputs project node; false))
   in
     if not forced andalso not (always_reexecute node) andalso
-       up_to_date dat_hash_cache policy project plan keys input_key toolchain_key node metadata_checkpoints then
+       up_to_date dat_hash_cache (#emit_output_hashes options) policy project plan keys input_key toolchain_key node metadata_checkpoints then
       (remove_tree_if_exists stage;
        HolbuildStatus.UpToDate)
     else if cache_restore_allowed andalso materialize_valid_cache () then
       (remove_tree stage;
        invalidate_node_dat_hash ();
-       write_metadata policy project plan keys input_key toolchain_key node metadata_checkpoints;
+       write_metadata (#emit_output_hashes options) policy project plan keys input_key toolchain_key node metadata_checkpoints;
        HolbuildStatus.Restored)
     else
       let
@@ -3352,7 +3374,7 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
             ((build_theory cache_allowed policy tc project base_context plan keys toolchain_key node source_text theorem_checkpoints declaration_checkpoints termination_diagnostics;
               remove_failed_prefix_checkpoints theorem_checkpoints;
               invalidate_node_dat_hash ();
-              write_metadata policy project plan keys input_key toolchain_key node metadata_checkpoints;
+              write_metadata (#emit_output_hashes options) policy project plan keys input_key toolchain_key node metadata_checkpoints;
               HolbuildStatus.Built)
              handle RetryInvalidCheckpoint =>
                if retries_left <= 0 then raise RetryInvalidCheckpoint
@@ -3372,17 +3394,17 @@ fun build_node dat_hash_cache options tc project base_context plan keys toolchai
           build_theory_node dat_hash_cache options tc project base_context plan keys toolchain_key node input_key
       | HolbuildSourceIndex.Sml =>
           if not (force_node options project node) andalso not (always_reexecute node) andalso
-             up_to_date dat_hash_cache no_checkpoint_policy project plan keys input_key toolchain_key node [] then
+             up_to_date dat_hash_cache (#emit_output_hashes options) no_checkpoint_policy project plan keys input_key toolchain_key node [] then
             HolbuildStatus.UpToDate
           else (build_sml_like plan node ".uo";
-                write_metadata no_checkpoint_policy project plan keys input_key toolchain_key node [];
+                write_metadata (#emit_output_hashes options) no_checkpoint_policy project plan keys input_key toolchain_key node [];
                 HolbuildStatus.Built)
       | HolbuildSourceIndex.Sig =>
           if not (force_node options project node) andalso not (always_reexecute node) andalso
-             up_to_date dat_hash_cache no_checkpoint_policy project plan keys input_key toolchain_key node [] then
+             up_to_date dat_hash_cache (#emit_output_hashes options) no_checkpoint_policy project plan keys input_key toolchain_key node [] then
             HolbuildStatus.UpToDate
           else (build_sml_like plan node ".ui";
-                write_metadata no_checkpoint_policy project plan keys input_key toolchain_key node [];
+                write_metadata (#emit_output_hashes options) no_checkpoint_policy project plan keys input_key toolchain_key node [];
                 HolbuildStatus.Built)
   end
 
@@ -3394,7 +3416,7 @@ fun node_policy options project node =
 
 fun node_is_up_to_date options project plan keys toolchain_key node =
   not (force_node options project node) andalso not (always_reexecute node) andalso
-  up_to_date (new_file_hash_cache ()) (node_policy options project node)
+  up_to_date (new_file_hash_cache ()) (#emit_output_hashes options) (node_policy options project node)
              project plan keys (HolbuildBuildPlan.input_key_for keys node)
              toolchain_key node []
 

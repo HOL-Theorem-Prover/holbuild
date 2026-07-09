@@ -60,6 +60,7 @@ fun build_help () = print
   \  --trace-steps\n\
   \  --repl-on-failure\n\
   \  --retain-debug-artifacts\n\
+  \  --emit-output-hashes\n\
   \  --warn-unreachable\n\n\
   \Global options: see `holbuild --help`.\n"
 
@@ -198,6 +199,17 @@ fun force_level_value text =
 
 fun split_flags args =
   let
+    fun extract_emit_output_hashes rest =
+      let
+        fun loop emit acc xs =
+          case xs of
+              [] => (emit, rev acc)
+            | "--emit-output-hashes" :: ys => loop true acc ys
+            | y :: ys => loop emit (y :: acc) ys
+      in
+        loop false [] rest
+      end
+    val (emit_output_hashes, build_args) = extract_emit_output_hashes args
     fun loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable rest =
       case rest of
           [] => ({dry_run = dry, watch = watch, force = force, use_cache = use_cache,
@@ -211,7 +223,8 @@ fun split_flags args =
                   trace_steps = trace_steps,
                   repl_on_failure = repl_on_failure,
                   retain_debug_artifacts = retain_debug_artifacts,
-                  warn_unreachable = warn_unreachable}, [])
+                  warn_unreachable = warn_unreachable,
+                  emit_output_hashes = emit_output_hashes}, [])
         | "--dry-run" :: xs =>
             loop true watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
         | "--watch" :: xs =>
@@ -276,7 +289,7 @@ fun split_flags args =
               let val (flags, ys) = loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
               in (flags, x :: ys) end
   in
-    loop false false HolbuildBuildExec.ForceNone true false false false true true NONE false NONE false false false false args
+    loop false false HolbuildBuildExec.ForceNone true false false false true true NONE false NONE false false false false build_args
   end
 
 fun has_suffix suffix s =
@@ -668,7 +681,7 @@ fun finish_stat_cache instance_opt =
       | NONE => ());
    HolbuildStatCache.clear_current_instance ())
 
-fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, proof_steps, new_ir, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable}, targets) =
+fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, proof_steps, new_ir, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes}, targets) =
   let
     val project =
       case prepared of
@@ -716,7 +729,8 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
          else HolbuildTacticTimeoutPolicy.entry_timeouts project index entry_plan (default_tactic_timeout ()),
        execution_plan = execution_plan,
        trace_steps = trace_steps,
-       repl_on_failure = repl_on_failure}
+       repl_on_failure = repl_on_failure,
+       emit_output_hashes = emit_output_hashes}
     fun prepare_plan () =
       let
         val index =
@@ -933,7 +947,8 @@ fun export_build_options project index entry_plan plan =
      node_tactic_timeouts = HolbuildTacticTimeoutPolicy.entry_timeouts project index entry_plan (default_tactic_timeout ()),
      execution_plan = NONE,
      trace_steps = false,
-     repl_on_failure = false}
+     repl_on_failure = false,
+     emit_output_hashes = false}
   end
 
 fun theory_node node =
@@ -1185,7 +1200,7 @@ fun build_heap_kind tc cli_jobs command target =
         val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
         val output_path = HolbuildProject.abs_under (#root project) output
       in
-        HolbuildBuildExec.build {use_cache = true, verify_cache = false, force = HolbuildBuildExec.ForceNone, force_targets = [], skip_checkpoints = false, proof_steps = true, new_ir = true, node_tactic_timeouts = HolbuildTacticTimeoutPolicy.entry_timeouts project index plan (SOME 2.5), execution_plan = NONE, trace_steps = false, repl_on_failure = false}
+        HolbuildBuildExec.build {use_cache = true, verify_cache = false, force = HolbuildBuildExec.ForceNone, force_targets = [], skip_checkpoints = false, proof_steps = true, new_ir = true, node_tactic_timeouts = HolbuildTacticTimeoutPolicy.entry_timeouts project index plan (SOME 2.5), execution_plan = NONE, trace_steps = false, repl_on_failure = false, emit_output_hashes = false}
                                tc project plan toolchain_key jobs;
         HolbuildBuildExec.export_heap tc project plan output_path kind
       end
