@@ -8,9 +8,7 @@ exception Error of string
 
 val format_version = "holbuild-hol-toolchain-v1"
 val default_canonical_git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-val build_sequence = "upto-hol"
-val build_sequence_path = "tools/sequences/" ^ build_sequence
-val build_args = "--no-helpdocs --seq=" ^ build_sequence_path
+val toolchain_config = HolbuildHolToolchainConfig.default
 val analyser_format_version = "holbuild-hol-analyser-v1"
 val analyser_protocol_version = "1"
 val analyser_source_files =
@@ -97,9 +95,9 @@ fun key_material {git, rev} =
       val version = poly_version ()
   in
     String.concatWith "\n"
-      [format_version, "git=" ^ git, "rev=" ^ rev, "poly=" ^ poly,
-       "poly_version=" ^ version, "build_sequence=" ^ build_sequence,
-       "build_args=" ^ build_args]
+      ([format_version, "git=" ^ git, "rev=" ^ rev, "poly=" ^ poly,
+        "poly_version=" ^ version] @
+       HolbuildHolToolchainConfig.key_material_fields toolchain_config)
   end
 
 fun key req = HolbuildHash.string_sha1 (key_material req)
@@ -130,11 +128,14 @@ fun dirty_status holdir = trim (command_output ("git -C " ^ quote holdir ^ " sta
 fun clean holdir = dirty_status holdir = ""
 
 fun require_build_sequence holdir =
-  let val path = Path.concat(Path.concat(Path.concat(holdir, "tools"), "sequences"), build_sequence)
-  in
-    if readable path then ()
-    else die ("selected HOL revision does not provide tools/sequences/" ^ build_sequence)
-  end
+  case HolbuildHolToolchainConfig.required_sequence_file toolchain_config of
+      NONE => ()
+    | SOME rel =>
+        let val path = Path.concat(holdir, rel)
+        in
+          if readable path then ()
+          else die ("selected HOL revision does not provide " ^ rel)
+        end
 
 fun validate_entry req k =
   let val dir = entry_dir_for_key k
@@ -272,7 +273,7 @@ fun build_entry req k =
        run_in_dir hol ("git checkout --detach " ^ quote (#rev req));
        require_build_sequence hol;
        run_in_dir hol (quote (poly_command ()) ^ " --script tools/smart-configure.sml");
-       run_in_dir hol ("bin/build " ^ build_args);
+       run_in_dir hol ("bin/build " ^ HolbuildHolToolchainConfig.build_args_text toolchain_config);
        if built hol then () else die ("HOL build did not produce bin/hol, bin/build, and bin/hol.state in " ^ hol);
        if clean hol then () else die ("HOL build left dirty checkout: " ^ hol ^ "\n" ^ dirty_status hol);
        write_file (manifest_for_key k) (material ^ "\nkey=" ^ k ^ "\n");

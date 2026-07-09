@@ -48,6 +48,8 @@ key_material() {
   printf 'poly=%s\n' "$poly"
   printf 'poly_version=%s\n' "$poly_version"
   printf 'build_sequence=upto-hol\n'
+  printf 'build_sequence_file=tools/sequences/upto-hol\n'
+  printf 'no_helpdocs=true\n'
   printf 'build_args=--no-helpdocs --seq=tools/sequences/upto-hol\n'
 }
 

@@ -6,8 +6,9 @@
 val format_version = "holbuild-hol-toolchain-v1"
 val default_canonical_git = "https://github.com/HOL-Theorem-Prover/HOL.git"
 val build_sequence = "upto-hol"
-val build_sequence_path = "tools/sequences/" ^ build_sequence
-val build_args = "--no-helpdocs --seq=" ^ build_sequence_path
+val build_sequence_file = "tools/sequences/" ^ build_sequence
+val no_helpdocs = true
+val build_args = "--no-helpdocs --seq=" ^ build_sequence_file
 
 fun quote s =
   "'" ^ String.translate (fn #"'" => "'\\''" | c => str c) s ^ "'"
@@ -45,6 +46,8 @@ fun key_material rev =
   String.concatWith "\n"
     [format_version, "git=" ^ canonical_git (), "rev=" ^ rev, "poly=" ^ poly_command (),
      "poly_version=" ^ poly_version (), "build_sequence=" ^ build_sequence,
+     "build_sequence_file=" ^ build_sequence_file,
+     "no_helpdocs=" ^ Bool.toString no_helpdocs,
      "build_args=" ^ build_args]
 
 fun sha1 text =
