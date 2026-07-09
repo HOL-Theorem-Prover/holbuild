@@ -17,7 +17,7 @@ hol=$tmpdir/hol
 mkdir -p "$hol"
 git -C "$hol" init -q
 git_identity "$hol"
-mkdir -p "$hol/bin" "$hol/tools"
+mkdir -p "$hol/bin" "$hol/tools" "$hol/tools/sequences"
 cat > "$hol/.gitignore" <<'EOF_IGNORE'
 /bin/hol
 /bin/hol.state
@@ -28,10 +28,11 @@ EOF_IGNORE
 cat > "$hol/tools/smart-configure.sml" <<'SML'
 (* fake configure script; HOLBUILD_POLY fixture handles it *)
 SML
+printf 'fake upto-hol sequence\n' > "$hol/tools/sequences/upto-hol"
 cat > "$hol/bin/build" <<'SH'
 #!/usr/bin/env sh
 set -eu
-[ "$#" -eq 1 ] && [ "$1" = "--no-helpdocs" ]
+[ "$#" -eq 2 ] && [ "$1" = "--no-helpdocs" ] && [ "$2" = "--seq=upto-hol" ]
 touch built
 pwd > built-at
 cat > bin/hol <<'HOL'

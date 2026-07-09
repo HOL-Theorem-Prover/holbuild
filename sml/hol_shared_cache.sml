@@ -8,7 +8,8 @@ exception Error of string
 
 val format_version = "holbuild-hol-toolchain-v1"
 val default_canonical_git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-val build_args = "--no-helpdocs"
+val build_sequence = "upto-hol"
+val build_args = "--no-helpdocs --seq=" ^ build_sequence
 val analyser_format_version = "holbuild-hol-analyser-v1"
 val analyser_protocol_version = "1"
 val analyser_source_files =
@@ -96,7 +97,8 @@ fun key_material {git, rev} =
   in
     String.concatWith "\n"
       [format_version, "git=" ^ git, "rev=" ^ rev, "poly=" ^ poly,
-       "poly_version=" ^ version, "build_args=" ^ build_args]
+       "poly_version=" ^ version, "build_sequence=" ^ build_sequence,
+       "build_args=" ^ build_args]
   end
 
 fun key req = HolbuildHash.string_sha1 (key_material req)
@@ -125,6 +127,13 @@ fun built holdir =
 
 fun dirty_status holdir = trim (command_output ("git -C " ^ quote holdir ^ " status --porcelain --ignored=no"))
 fun clean holdir = dirty_status holdir = ""
+
+fun require_build_sequence holdir =
+  let val path = Path.concat(Path.concat(Path.concat(holdir, "tools"), "sequences"), build_sequence)
+  in
+    if readable path then ()
+    else die ("selected HOL revision does not provide tools/sequences/" ^ build_sequence)
+  end
 
 fun validate_entry req k =
   let val dir = entry_dir_for_key k
@@ -260,6 +269,7 @@ fun build_entry req k =
        ensure_dir final;
        run_in_dir final ("git clone " ^ quote (#git req) ^ " " ^ quote hol);
        run_in_dir hol ("git checkout --detach " ^ quote (#rev req));
+       require_build_sequence hol;
        run_in_dir hol (quote (poly_command ()) ^ " --script tools/smart-configure.sml");
        run_in_dir hol ("bin/build " ^ build_args);
        if built hol then () else die ("HOL build did not produce bin/hol, bin/build, and bin/hol.state in " ^ hol);
