@@ -45,8 +45,26 @@ jobs:
           path: ~/.cache/holbuild/hol-toolchains
           key: hol-toolchains-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ steps.hol4-pin.outputs.hol4-ref }}-v2
 
+      - name: Build holbuild
+        run: make
+
       - name: Setup schema2 HOL cache
-        run: tools/setup-hol-toolchain-cache.sh "${{ steps.hol4-pin.outputs.hol4-ref }}" >> "$GITHUB_ENV"
+        run: |
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          cat > "$tmp/holproject.toml" <<EOF
+          [holbuild]
+          schema = 2
+
+          [dependencies.hol]
+          git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+          rev = "${{ steps.hol4-pin.outputs.hol4-ref }}"
+
+          [project]
+          name = "ci-toolchain"
+          EOF
+          holdir=$(cd "$tmp" && "$GITHUB_WORKSPACE/bin/holbuild" buildhol | tail -n 1)
+          echo "HOLDIR=$holdir" >> "$GITHUB_ENV"
 
       - name: Save HOL toolchain cache
         if: steps.hol-toolchain-cache.outputs.cache-hit != 'true'
@@ -54,9 +72,6 @@ jobs:
         with:
           path: ~/.cache/holbuild/hol-toolchains
           key: hol-toolchains-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ steps.hol4-pin.outputs.hol4-ref }}-v2
-
-      - name: Build holbuild
-        run: make
 
       - name: Run tests
         env:
