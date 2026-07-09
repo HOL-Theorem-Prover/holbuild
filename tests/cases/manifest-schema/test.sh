@@ -145,7 +145,7 @@ TOML
 (cd "$tmpdir/valid_schema2_from" && "$HOLBUILD_BIN" context) > "$tmpdir/valid_schema2_from.log"
 require_grep "dependency: holexamples \[from=hol, path=., manifest=holexamples.manifest.toml" "$tmpdir/valid_schema2_from.log"
 
-for case in unknown_top typo_build bad_group_field bad_group_entry_type bad_group_empty bad_group_name_at bad_group_name_slash bad_group_name_colon bad_group_name_space bad_group_abs_include bad_group_parent_include bad_root_groups_type bad_root_groups_unknown bad_exclude_type bad_exclude_globs_type bad_exclude_trailing_slash bad_exclude_dot bad_roots_type bad_root_timeout absolute_member parent_exclude no_paths_includes bad_type bad_project_name bad_action_field bad_action_type bad_action_deps_type bad_action_loads_type bad_action_abs_input bad_action_abs_dep bad_generate_field bad_generate_command_type bad_generate_abs_output; do
+for case in unknown_top typo_build bad_group_field bad_group_entry_type bad_group_empty bad_group_name_at bad_group_name_slash bad_group_name_colon bad_group_name_space bad_group_abs_include bad_group_parent_include bad_root_groups_type bad_root_groups_unknown bad_exclude_type bad_exclude_globs_type bad_exclude_trailing_slash bad_exclude_dot bad_roots_type bad_root_timeout bad_root_timeout_group absolute_member parent_exclude no_paths_includes bad_type bad_project_name bad_action_field bad_action_type bad_action_deps_type bad_action_loads_type bad_action_abs_input bad_action_abs_dep bad_generate_field bad_generate_command_type bad_generate_abs_output; do
   make_project "$case"
 done
 
@@ -285,6 +285,20 @@ roots = ["src/MainScript.sml"]
 "src/OtherScript.sml" = 10
 TOML
 expect_context_failure bad_root_timeout "build.root_tactic_timeouts references unknown root: src/OtherScript.sml"
+
+write_manifest bad_root_timeout_group <<'TOML'
+
+[build]
+roots = ["@generated"]
+
+[build.groups.generated]
+include_globs = ["src/*Script.sml"]
+allow_empty = true
+
+[build.root_tactic_timeouts]
+"@generated" = 0.1
+TOML
+expect_context_failure bad_root_timeout_group "build.root_tactic_timeouts must reference a concrete root, not a group: @generated"
 
 write_manifest absolute_member <<'TOML'
 

@@ -822,7 +822,9 @@ fun validate_root_tactic_timeouts roots root_groups groups timeouts =
   in
     List.app
       (fn {root, ...} =>
-          if known_root root then ()
+          if is_group_reference root then
+            die ("build.root_tactic_timeouts must reference a concrete root, not a group: " ^ root)
+          else if known_root root then ()
           else die ("build.root_tactic_timeouts references unknown root: " ^ root))
       timeouts
   end
