@@ -383,7 +383,43 @@ require_file "$image_project/runtests.exe"
 "$image_project/runtests.exe" > "$tmpdir/image-group.exe.out"
 require_grep "group executable ok" "$tmpdir/image-group.exe.out"
 
-# 9. warn-unreachable treats root_groups as roots: omitted scripts warn, group members do not.
+# 9. Explicit heap/executable object order is preserved when no group token is present.
+order_project=$tmpdir/order-image
+mkdir -p "$order_project/src"
+{
+  write_manifest_prelude
+  cat <<'TOML'
+[project]
+name = "order-image"
+
+[build]
+members = ["src"]
+
+[[executable]]
+name = "ordered"
+output = "ordered.exe"
+objects = ["State", "InitB", "InitA", "ordered_runner"]
+TOML
+} > "$order_project/holproject.toml"
+cat > "$order_project/src/State.sml" <<'SML'
+structure OrderState = struct
+  val events = ref ([] : string list);
+end;
+SML
+cat > "$order_project/src/InitB.sml" <<'SML'
+val _ = OrderState.events := !OrderState.events @ ["B"];
+SML
+cat > "$order_project/src/InitA.sml" <<'SML'
+val _ = OrderState.events := !OrderState.events @ ["A"];
+SML
+cat > "$order_project/src/ordered_runner.sml" <<'SML'
+fun main () = print (String.concat (!OrderState.events) ^ "\n");
+SML
+(cd "$order_project" && "$HOLBUILD_BIN" executable ordered) > "$tmpdir/order-image.exe" 2>&1
+"$order_project/ordered.exe" > "$tmpdir/order-image.out"
+require_grep "^BA$" "$tmpdir/order-image.out"
+
+# 10. warn-unreachable treats root_groups as roots: omitted scripts warn, group members do not.
 warn_project=$tmpdir/warn-group
 mkdir -p "$warn_project/gen" "$warn_project/src"
 {
@@ -431,7 +467,7 @@ write_theory "$empty_warn_project/src/OmittedScript.sml" Omitted
 require_grep "discoverable theory script(s) are not reachable from build.roots" "$tmpdir/empty-warn-group.err"
 require_grep "unreachable: empty-warn-group:src/OmittedScript.sml (OmittedTheory)" "$tmpdir/empty-warn-group.err"
 
-# 10. Group expansion happens after generators run, so newly generated sources are included.
+# 11. Group expansion happens after generators run, so newly generated sources are included.
 generate_project=$tmpdir/generate-group
 mkdir -p "$generate_project/scripts"
 {

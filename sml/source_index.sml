@@ -413,7 +413,7 @@ fun group_token_name token =
 fun is_group_token token = size token > 0 andalso String.sub(token, 0) = #"@"
 
 fun expand_group_tokens sources package tokens =
-  sort_unique_strings
+  unique_strings
     (List.concat
        (map (fn token =>
                if is_group_token token then resolve_group_ref sources package (group_token_name token)
