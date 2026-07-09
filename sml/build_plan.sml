@@ -152,6 +152,10 @@ type t =
 fun universe_nodes ({universe, ...} : t) = universe
 fun selected_nodes ({selected, ...} : t) = selected
 fun lookup ({name_index, ...} : t) = indexed_nodes_named name_index
+fun node_named ({name_index, ...} : t) name =
+  case indexed_nodes_named name_index name of
+      node :: _ => SOME node
+    | [] => NONE
 fun universe_key_index ({universe_key_index, ...} : t) = universe_key_index
 fun direct_project_deps_cache ({direct_project_deps_cache, ...} : t) = direct_project_deps_cache
 fun deps_closure_cache ({deps_closure_cache, ...} : t) = deps_closure_cache

@@ -1857,8 +1857,7 @@ fun publish_theory_cache project plan node input_key proof_timeout staged_sig pu
   end
 
 fun project_node_named plan name =
-  List.find (fn candidate => HolbuildBuildPlan.logical_name candidate = name)
-            (HolbuildBuildPlan.universe_nodes plan)
+  HolbuildBuildPlan.node_named plan name
 
 fun mldep_load_stem plan dep =
   case project_node_named plan dep of
@@ -2832,7 +2831,7 @@ fun has_signature_companion plan node =
   List.exists
     (fn candidate => same_package_logical candidate node andalso
                      #kind (HolbuildBuildPlan.source_of candidate) = HolbuildSourceIndex.Sig)
-    (HolbuildBuildPlan.universe_nodes plan)
+    (HolbuildBuildPlan.lookup plan (HolbuildBuildPlan.logical_name node))
 
 fun write_empty_ui_if_needed plan node =
   if has_signature_companion plan node then ()
