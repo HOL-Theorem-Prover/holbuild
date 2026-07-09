@@ -46,11 +46,15 @@ fun package node = #package (source_of node)
 fun relative_path node = #relative_path (source_of node)
 fun key ({key, ...} : node) = key
 
-fun member value values = List.exists (fn x => x = value) values
-
-fun add_unique (value, values) = if member value values then values else value :: values
-
-fun unique_strings values = rev (List.foldl add_unique [] values)
+fun unique_strings values =
+  let
+    fun add (value, (seen, kept)) =
+      if Binaryset.member(seen, value) then (seen, kept)
+      else (Binaryset.add(seen, value), value :: kept)
+    val (_, kept) = List.foldl add (Binaryset.empty String.compare, []) values
+  in
+    rev kept
+  end
 
 fun normalize_path path = Path.mkCanonical path handle Path.InvalidArc => path
 
@@ -212,10 +216,15 @@ fun direct_dependency_names node =
 
 fun unique_nodes nodes =
   let
-    fun add (node, kept) =
-      if member (key node) (map key kept) then kept else node :: kept
+    fun add (node, (seen, kept)) =
+      let val node_key = key node
+      in
+        if Binaryset.member(seen, node_key) then (seen, kept)
+        else (Binaryset.add(seen, node_key), node :: kept)
+      end
+    val (_, kept) = List.foldl add (Binaryset.empty String.compare, []) nodes
   in
-    rev (List.foldl add [] nodes)
+    rev kept
   end
 
 fun direct_holdep_project_deps_with lookup node =
@@ -537,14 +546,7 @@ fun path_has_glob path =
 
 fun join root rel = if rel = "" then root else Path.concat(root, rel)
 
-fun sort_strings xs =
-  let
-    fun insert x [] = [x]
-      | insert x (y :: ys) =
-          if String.compare(x, y) = LESS then x :: y :: ys else y :: insert x ys
-  in
-    List.foldl (fn (x, acc) => insert x acc) [] xs
-  end
+fun sort_strings xs = sort_pairs String.compare xs
 
 fun files_under abs rel =
   if is_dir abs then
