@@ -11,6 +11,8 @@ fun use_hol rel = use (path_join(vendored_hol_source, rel));
 
 use_hol("tools-poly/poly/Binarymap.sig");
 use_hol("tools-poly/poly/Binarymap.sml");
+use_hol("tools-poly/poly/Binaryset.sig");
+use_hol("tools-poly/poly/Binaryset.sml");
 use_hol("tools/Holmake/toml/TOMLvalue_dtype.sml");
 use_hol("tools/Holmake/toml/TOMLvalue.sig");
 use_hol("tools/Holmake/toml/TOMLvalue.sml");

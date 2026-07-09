@@ -1,5 +1,7 @@
 tools-poly/poly/Binarymap.sig
 tools-poly/poly/Binarymap.sml
+tools-poly/poly/Binaryset.sig
+tools-poly/poly/Binaryset.sml
 tools/Holmake/toml/TOMLvalue_dtype.sml
 tools/Holmake/toml/TOMLvalue.sig
 tools/Holmake/toml/TOMLvalue.sml

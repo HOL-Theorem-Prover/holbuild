@@ -3739,6 +3739,9 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
     val completed = ref 0
     val active = ref jobs
     val active_nodes = Array.array (node_count, false)
+    fun int_compare (left : int, right : int) =
+      if left < right then LESS else if left > right then GREATER else EQUAL
+    val active_ids : int Binaryset.set ref = ref (Binaryset.empty int_compare)
     val stopped = ref false
     val failure = ref (NONE : (string * HolbuildStatus.debug_artifacts) option)
     val failed_prefix_priority = Array.array (node_count, NONE : bool option)
@@ -3747,12 +3750,15 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
 
     fun node_id node = HolbuildBuildPlan.indexed_key_id key_index (HolbuildBuildPlan.key node)
 
-    val protected_bases_cache = Array.array (node_count, NONE : string list option)
+    fun node_may_create_checkpoints node =
+      case #kind (HolbuildBuildPlan.source_of node) of
+          HolbuildSourceIndex.TheoryScript => checkpoint_enabled (checkpoint_policy_for_node options project node)
+        | _ => false
 
-    fun add_unique_base (base, bases) =
-      if string_member base bases then bases else base :: bases
+    val checkpoints_possible = List.exists node_may_create_checkpoints selected
 
-    fun add_bases (bases, acc) = List.foldl add_unique_base acc bases
+    val empty_protected_bases : string Binaryset.set = Binaryset.empty String.compare
+    val protected_bases_cache = Array.array (node_count, NONE : string Binaryset.set option)
 
     fun protected_bases_for_id id =
       case Array.sub (protected_bases_cache, id) of
@@ -3763,8 +3769,8 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
               val deps = HolbuildBuildPlan.direct_project_deps plan node
               val bases =
                 List.foldl
-                  (fn (dep, acc) => add_bases (protected_bases_for_id (node_id dep), acc))
-                  [checkpoint_base project node]
+                  (fn (dep, acc) => Binaryset.union (protected_bases_for_id (node_id dep), acc))
+                  (Binaryset.add (empty_protected_bases, checkpoint_base project node))
                   deps
             in
               Array.update (protected_bases_cache, id, SOME bases);
@@ -3775,7 +3781,15 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
       if id >= node_count then ()
       else (ignore (protected_bases_for_id id); precompute_protected_bases (id + 1))
 
-    val _ = precompute_protected_bases 0
+    val _ = if checkpoints_possible then precompute_protected_bases 0 else ()
+
+    fun mark_active_node id =
+      (Array.update (active_nodes, id, true);
+       active_ids := Binaryset.add (!active_ids, id))
+
+    fun clear_active_node id =
+      (Array.update (active_nodes, id, false);
+       active_ids := (Binaryset.delete (!active_ids, id) handle Binaryset.NotFound => !active_ids))
 
     fun failed_prefix_priority_node id =
       case Array.sub (failed_prefix_priority, id) of
@@ -3892,7 +3906,7 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
               case pop_ready () of
                   SOME (id, priority) =>
                     (running := !running + 1;
-                     Array.update (active_nodes, id, true);
+                     mark_active_node id;
                      if priority then priority_running := !priority_running + 1 else ();
                      SOME id)
                 | NONE =>
@@ -3922,27 +3936,29 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
        if failed_prefix_priority_node id then priority_running := !priority_running - 1 else ())
 
     fun active_node_ids_snapshot_locked () =
-      let
-        fun loop i acc =
-          if i >= node_count then acc
-          else loop (i + 1) (if Array.sub (active_nodes, i) then i :: acc else acc)
-      in
-        loop 0 []
-      end
+      Binaryset.listItems (!active_ids)
 
     fun protected_bases_for_ids ids =
-      List.foldl (fn (id, acc) => add_bases (protected_bases_for_id id, acc)) [] ids
+      Binaryset.listItems
+        (List.foldl
+           (fn (id, acc) => Binaryset.union (protected_bases_for_id id, acc))
+           empty_protected_bases
+           ids)
 
-    fun finish_success id =
+    fun protected_bases_after_success_locked id collect_protected =
+      if collect_protected then protected_bases_for_ids (id :: active_node_ids_snapshot_locked ())
+      else []
+
+    fun finish_success id collect_protected =
       with_lock
         (fn () =>
             let
               val _ = running := !running - 1
-              val _ = Array.update (active_nodes, id, false)
+              val _ = clear_active_node id
               val _ = finish_priority id
               val _ = completed := !completed + 1
               val _ = if !stopped then () else List.app release_dependent (Array.sub (dependents, id))
-              val protected = protected_bases_for_ids (id :: active_node_ids_snapshot_locked ())
+              val protected = protected_bases_after_success_locked id collect_protected
             in
               signal ();
               protected
@@ -3955,7 +3971,7 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
             (fn () =>
                 let
                   val _ = running := !running - 1
-                  val _ = Array.update (active_nodes, id, false)
+                  val _ = clear_active_node id
                   val _ = finish_priority id
                   val _ = completed := !completed + 1
                   val first = not (!stopped)
@@ -3969,7 +3985,7 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
       end
 
     fun finish_cancelled_after_stop id =
-      with_lock (fn () => (running := !running - 1; Array.update (active_nodes, id, false); finish_priority id; signal ()))
+      with_lock (fn () => (running := !running - 1; clear_active_node id; finish_priority id; signal ()))
 
     fun finish_failure id msg artifacts =
       let
@@ -3978,7 +3994,7 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
             (fn () =>
                 let
                   val _ = running := !running - 1
-                  val _ = Array.update (active_nodes, id, false)
+                  val _ = clear_active_node id
                   val _ = finish_priority id
                   val first =
                     if !stopped then false
@@ -4008,9 +4024,13 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
                   ((case build_one dat_hash_cache status options tc project base_context plan keys toolchain_key node of
                         HolbuildStatus.Inspected => finish_inspected id
                       | outcome =>
-                          let val protected = finish_success id
+                          let
+                            val collect_protected =
+                              checkpoints_possible andalso
+                              outcome_may_create_checkpoints options project node outcome
+                            val protected = finish_success id collect_protected
                           in
-                            if outcome_may_create_checkpoints options project node outcome then
+                            if collect_protected then
                               refresh_checkpoint_budget_after_node budget_state project node protected
                             else ()
                           end;
