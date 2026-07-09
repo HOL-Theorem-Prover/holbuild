@@ -3915,12 +3915,62 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
     end
   end
 
+fun write_text_atomic path text =
+  let
+    val tmp = path ^ ".tmp"
+    val out = TextIO.openOut tmp
+      handle e => raise Error ("could not write " ^ tmp ^ ": " ^ General.exnMessage e)
+    fun close () = TextIO.closeOut out handle _ => ()
+    fun remove_tmp () = FS.remove tmp handle _ => ()
+  in
+    (TextIO.output(out, text);
+     TextIO.closeOut out;
+     FS.rename {old = tmp, new = path}
+       handle e => (remove_tmp ();
+                    raise Error ("could not replace " ^ path ^ ": " ^ General.exnMessage e)))
+    handle e => (close (); remove_tmp (); raise e)
+  end
+
+fun dump_key_row toolchain_key plan keys node =
+  let
+    val key = HolbuildBuildPlan.key node
+    val input_key = HolbuildBuildPlan.input_key_for keys node
+    val dependency_key =
+      case #kind (HolbuildBuildPlan.source_of node) of
+          HolbuildSourceIndex.TheoryScript =>
+            SOME (dependency_context_key toolchain_key plan keys node)
+        | _ => NONE
+    val line =
+      case dependency_key of
+          SOME deps_key => String.concat [key, "\t", input_key, "\t", deps_key]
+        | NONE => String.concat [key, "\t", input_key]
+  in
+    (key, line)
+  end
+
+fun compare_dump_rows ((left, _), (right, _)) = String.compare(left, right)
+
+fun dump_keys_if_requested toolchain_key plan keys =
+  case OS.Process.getEnv "HOLBUILD_DUMP_KEYS" of
+      NONE => ()
+    | SOME path =>
+        let
+          val rows =
+            HolbuildBuildPlan.sort_pairs compare_dump_rows
+              (map (dump_key_row toolchain_key plan keys)
+                   (HolbuildBuildPlan.selected_nodes plan))
+          val text = String.concat (map (fn (_, line) => line ^ "\n") rows)
+        in
+          write_text_atomic path text
+        end
+
 fun build (options : build_options) tc project plan toolchain_key jobs =
   let
     val budget_state = create_checkpoint_budget_state project
     val _ = enforce_checkpoint_budget_state_excluding budget_state []
     val base_context = toolchain_base_context tc
     val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project) toolchain_key plan
+    val _ = dump_keys_if_requested toolchain_key plan keys
     val dat_hash_cache = new_file_hash_cache ()
   in
     let
