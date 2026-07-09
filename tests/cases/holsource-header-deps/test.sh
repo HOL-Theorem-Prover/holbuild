@@ -8,7 +8,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
-cleanup() { rm -rf "$tmpdir"; }
+cleanup() { cleanup_temp_dir "$tmpdir"; }
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
@@ -31,10 +31,10 @@ members = ["src"]
 TOML
 cat > "$project/src/AScript.sml" <<'SML'
 Theory A
-Ancestors arithmetic[qualified, ignore_grammar] string
+Ancestors arithmetic[qualified, ignore_grammar] list
 Libs numLib monadsyntax cv_transLib
 
-Type identifier = “:string”;
+Type identifier = “:num”;
 
 Datatype:
   colour = Red | Blue
@@ -65,7 +65,7 @@ SML
 
 (cd "$project" && "$HOLBUILD_BIN" build --dry-run ATheory) > "$tmpdir/dry.log"
 require_grep "external theories: .*arithmeticTheory" "$tmpdir/dry.log"
-require_grep "external theories: .*stringTheory" "$tmpdir/dry.log"
+require_grep "external theories: .*listTheory" "$tmpdir/dry.log"
 require_grep "external libs: .*cv_transLib" "$tmpdir/dry.log"
 require_grep "external libs: .*monadsyntax" "$tmpdir/dry.log"
 require_grep "external libs: .*numLib" "$tmpdir/dry.log"
