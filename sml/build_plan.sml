@@ -730,9 +730,14 @@ fun external_sources_for_name dirs name =
 fun prefetch_external_dependency_sources_with lookup nodes =
   let
     fun item_id (dirs, name) = String.concatWith "\030" dirs ^ "\029" ^ name
-    fun seen item seen_ids = member (item_id item) seen_ids
-    fun add_unseen (item, items) =
-      if List.exists (fn existing => item_id existing = item_id item) items then items else item :: items
+    val empty_item_ids = Binaryset.empty String.compare
+    fun add_unseen (item, (items, ids)) =
+      let val id = item_id item
+      in
+        if Binaryset.member (ids, id) then (items, ids)
+        else (item :: items, Binaryset.add (ids, id))
+      end
+    fun unseen_items items = #1 (List.foldl add_unseen ([], empty_item_ids) items)
     fun source_requests paths =
       map (fn path => {source_path = path, source_hash = HolbuildHash.file_sha1 path}) paths
     fun deps_for_path path =
@@ -752,12 +757,12 @@ fun prefetch_external_dependency_sources_with lookup nodes =
           [] => ()
         | _ =>
             let
-              val fresh = List.filter (fn item => not (seen item seen_ids)) pending
-              val seen_ids' = List.foldl (fn (item, acc) => item_id item :: acc) seen_ids fresh
+              val (fresh, seen_ids') =
+                List.foldl add_unseen ([], seen_ids) pending
               val paths = unique_strings (List.concat (map (fn (dirs, name) => external_sources_for_name dirs name) fresh))
               val _ = HolbuildDependencies.prefetch_global_cached_with_hash (source_requests paths)
               val next =
-                List.foldl
+                #1 (List.foldl
                   (fn ((dirs, name), acc) =>
                       let
                         val source_paths = external_sources_for_name dirs name
@@ -765,13 +770,13 @@ fun prefetch_external_dependency_sources_with lookup nodes =
                       in
                         List.foldl add_unseen acc (follow_names dirs names)
                       end)
-                  [] fresh
+                  ([], empty_item_ids) fresh)
             in
               loop seen_ids' next
             end
-    val initial = List.foldl add_unseen [] (List.concat (map initial_items_for_node nodes))
+    val initial = unseen_items (List.concat (map initial_items_for_node nodes))
   in
-    loop [] initial
+    loop empty_item_ids initial
   end
   handle HolbuildDependencies.Error msg => raise Error msg
 
@@ -784,9 +789,9 @@ fun prefetch_external_dependency_sources_with lookup nodes =
    not in sigobj, treat it as part of the hol.state bootstrap boundary. *)
 fun external_key_lookup_with_timing timing toolchain_key =
   let
-    val memo = ref ([] : (string * string) list)
-    fun memoized id = Option.map #2 (List.find (fn (key, _) => key = id) (!memo))
-    fun remember id value = (memo := (id, value) :: !memo; value)
+    val memo = ref (Binarymap.mkDict String.compare : (string, string) Binarymap.dict)
+    fun memoized id = Binarymap.peek (!memo, id)
+    fun remember id value = (memo := Binarymap.insert (!memo, id, value); value)
     fun in_stack id stack = List.exists (fn active => active = id) stack
     fun cachekey_line cachekey =
       "cachekey=" ^ String.translate (fn #"\n" => " " | c => str c) (read_text cachekey)
