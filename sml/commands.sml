@@ -288,7 +288,8 @@ fun reject_object_target target =
 fun reject_object_targets targets = List.app reject_object_target targets
 
 fun default_build_targets project index targets =
-  if null targets then HolbuildSourceIndex.default_targets index project else targets
+  if null targets then HolbuildSourceIndex.default_targets index project
+  else HolbuildSourceIndex.expand_group_tokens index (HolbuildProject.project_package project) targets
 
 fun source_key source =
   #package source ^ "\000" ^ #relative_path source ^ "\000" ^ #logical_name source
@@ -296,9 +297,14 @@ fun source_key source =
 fun key_member key keys = List.exists (fn k => k = key) keys
 
 fun rooted_package_names project =
-  map HolbuildProject.package_name
-    (List.filter (fn package => not (null (HolbuildProject.package_roots package)))
-                 (HolbuildProject.packages project))
+  let
+    fun has_rooted_targets package =
+      not (null (HolbuildProject.package_roots package)) orelse
+      not (null (HolbuildProject.package_root_groups package))
+  in
+    map HolbuildProject.package_name
+      (List.filter has_rooted_targets (HolbuildProject.packages project))
+  end
 
 fun root_warning_source rooted_packages built_keys source =
   #kind source = HolbuildSourceIndex.TheoryScript andalso
@@ -1127,8 +1133,9 @@ fun build_heap_kind tc cli_jobs command target =
     fun execute_heap () =
       let
         val HolbuildProject.Heap {output, objects, kind, ...} = heap_named project command target
-        val _ = if null objects then raise Error (command ^ " target has no objects: " ^ target) else ()
         val index = timed_phase "source.discover" (fn () => HolbuildSourceIndex.discover project)
+        val objects = HolbuildSourceIndex.expand_group_tokens index (HolbuildProject.project_package project) objects
+        val _ = if null objects then raise Error (command ^ " target has no objects: " ^ target) else ()
         val plan = timed_phase "build.plan" (fn () => HolbuildBuildPlan.plan (#holdir tc) index objects)
         val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
         val output_path = HolbuildProject.abs_under (#root project) output
