@@ -258,6 +258,30 @@ if [[ -d "$empty_ok/.holbuild/obj" ]] && find "$empty_ok/.holbuild/obj" -type f 
   echo "allow_empty group unexpectedly built object files" >&2
   exit 1
 fi
+empty_with_sources=$tmpdir/empty-with-sources
+mkdir -p "$empty_with_sources/src"
+{
+  write_manifest_prelude
+  cat <<'TOML'
+[project]
+name = "empty-with-sources"
+
+[build]
+members = ["src"]
+root_groups = ["empty"]
+
+[build.groups.empty]
+include_globs = ["gen/*Script.sml"]
+allow_empty = true
+TOML
+} > "$empty_with_sources/holproject.toml"
+write_theory "$empty_with_sources/src/SurpriseScript.sml" Surprise
+(cd "$empty_with_sources" && "$HOLBUILD_BIN" build --dry-run) > "$tmpdir/empty-with-sources.dry" 2>&1
+require_no_grep "SurpriseTheory (theory, package empty-with-sources)" "$tmpdir/empty-with-sources.dry"
+(cd "$empty_with_sources" && "$HOLBUILD_BIN" build --dry-run @empty) > "$tmpdir/empty-with-sources-cli.dry" 2>&1
+require_no_grep "SurpriseTheory (theory, package empty-with-sources)" "$tmpdir/empty-with-sources-cli.dry"
+(cd "$empty_with_sources" && "$HOLBUILD_BIN" build) > "$tmpdir/empty-with-sources.build" 2>&1
+require_no_file "$empty_with_sources/.holbuild/obj/src/SurpriseTheory.dat"
 
 # 7. Undefined group references are rejected in root_groups, CLI targets, and heap objects.
 undefined_root=$tmpdir/undefined-root
