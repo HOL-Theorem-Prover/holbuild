@@ -7,7 +7,8 @@ structure FS = OS.FileSys
 exception Error of string
 
 type node =
-  { source : HolbuildSourceIndex.source,
+  { key : string,
+    source : HolbuildSourceIndex.source,
     deps : HolbuildDependencies.t option ref,
     source_hash : string option ref,
     external_dirs : string list }
@@ -42,7 +43,7 @@ fun external_dirs_of ({external_dirs, ...} : node) = external_dirs
 fun logical_name node = #logical_name (source_of node)
 fun package node = #package (source_of node)
 fun relative_path node = #relative_path (source_of node)
-fun key node = package node ^ "\000" ^ relative_path node ^ "\000" ^ logical_name node
+fun key ({key, ...} : node) = key
 
 fun member value values = List.exists (fn x => x = value) values
 
@@ -433,7 +434,8 @@ fun closure_external_libs plan node =
        (transitive_project_deps plan node @ [node])))
 
 fun make_node external_dirs source =
-  {source = source,
+  {key = #package source ^ "\000" ^ #relative_path source ^ "\000" ^ #logical_name source,
+   source = source,
    deps = ref NONE,
    source_hash = ref NONE,
    external_dirs = external_dirs}
