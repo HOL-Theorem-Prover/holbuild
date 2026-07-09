@@ -105,6 +105,45 @@ SML
 (cd "$project" && "$HOLBUILD_BIN" build BTheory) > "$tmpdir/initial.log" 2>&1
 require_file "$project/.holbuild/obj/src/ATheory.dat"
 require_file "$project/.holbuild/obj/src/BTheory.dat"
+b_metadata=$(find "$project/.holbuild/dep" -type f -path "*/src/BScript.sml.key" -print -quit)
+if [[ -z "$b_metadata" ]]; then
+  echo "missing BTheory metadata" >&2
+  exit 1
+fi
+require_file "$b_metadata"
+require_grep "^parent_hashes=v1$" "$b_metadata"
+if ! grep -Eq '^parent_dat=A [0-9a-f]{40}$' "$b_metadata"; then
+  echo "BTheory metadata did not record A parent hash" >&2
+  exit 1
+fi
+
+python3 - <<PY
+from pathlib import Path
+path = Path("$b_metadata")
+lines = [
+    line for line in path.read_text().splitlines()
+    if line != "parent_hashes=v1" and not line.startswith("parent_dat=")
+]
+path.write_text("\\n".join(lines) + "\\n")
+PY
+old_noop_log=$tmpdir/old-noop.json
+(cd "$project" && "$HOLBUILD_BIN" --json build BTheory) > "$old_noop_log" 2>&1
+python3 - <<PY
+import json
+from pathlib import Path
+events = [json.loads(line) for line in Path("$old_noop_log").read_text().splitlines() if line.startswith("{")]
+finished = [event for event in events if event.get("event") == "build_finished"]
+if not finished:
+    raise SystemExit("no build_finished event in old-format no-op log")
+event = finished[-1]
+if event.get("built") != 0 or event.get("from_cache") != 0 or event.get("unchanged") != 2:
+    raise SystemExit(f"old-format metadata no-op counts were not 0 built / 0 restored / 2 unchanged: {event}")
+PY
+require_grep "^parent_hashes=v1$" "$b_metadata"
+if ! grep -Eq '^parent_dat=A [0-9a-f]{40}$' "$b_metadata"; then
+  echo "old-format metadata fallback did not refresh BTheory parent hash metadata" >&2
+  exit 1
+fi
 
 noop_log=$tmpdir/noop.json
 (cd "$project" && "$HOLBUILD_BIN" --json build BTheory) > "$noop_log" 2>&1
@@ -154,11 +193,13 @@ PY
 python3 - <<PY
 from pathlib import Path
 import re
-path = Path("$project/.holbuild/obj/src/BTheory.dat")
+path = Path("$b_metadata")
 text = path.read_text()
-changed = re.sub(r'\("A"\s*\.\s*"[0-9a-f]{40}"\)', '("A" .\n   "0000000000000000000000000000000000000000")', text, count=1)
+changed = re.sub(r'^parent_dat=A [0-9a-f]{40}$',
+                 'parent_dat=A 0000000000000000000000000000000000000000',
+                 text, count=1, flags=re.MULTILINE)
 if changed == text:
-    raise SystemExit('BTheory.dat did not record A parent hash')
+    raise SystemExit('BTheory metadata did not record A parent hash')
 path.write_text(changed)
 PY
 
@@ -166,25 +207,6 @@ stale_log=$tmpdir/stale.log
 (cd "$project" && "$HOLBUILD_BIN" build --no-cache BTheory) > "$stale_log" 2>&1
 require_grep "BTheory built" "$stale_log"
 if grep -q "BTheory is up to date\|link_parents" "$stale_log"; then
-  echo "stale local theory parent hash was accepted" >&2
-  exit 1
-fi
-
-python3 - <<PY
-from pathlib import Path
-import re
-path = Path("$project/.holbuild/obj/src/BTheory.dat")
-text = path.read_text()
-changed = re.sub(r'\("A"\s*\.\s*"[0-9a-f]{40}"\)', '("A" .\n   "0000000000000000000000000000000000000000")', text, count=1)
-if changed == text:
-    raise SystemExit('BTheory.dat did not record A parent hash after rebuild')
-path.write_text(changed)
-PY
-
-rebuild_log=$tmpdir/rebuild.log
-(cd "$project" && "$HOLBUILD_BIN" build --no-cache BTheory) > "$rebuild_log" 2>&1
-require_grep "BTheory built" "$rebuild_log"
-if grep -q "BTheory is up to date\|link_parents" "$rebuild_log"; then
-  echo "stale theory parent hash was accepted" >&2
+  echo "stale theory parent metadata hash was accepted" >&2
   exit 1
 fi

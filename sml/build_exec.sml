@@ -2842,6 +2842,89 @@ fun output_paths _ _ node =
 
 fun output_hash_line path = "output-sha1=" ^ path ^ " " ^ file_hash path
 
+fun theory_name_from_logical logical =
+  if has_suffix "Theory" logical then drop_suffix "Theory" logical else logical
+
+fun project_theory_deps plan node =
+  List.filter
+    (fn dep => #kind (HolbuildBuildPlan.source_of dep) = HolbuildSourceIndex.TheoryScript)
+    (HolbuildBuildPlan.direct_project_deps plan node)
+
+fun insert_first_string_dict (dict, key, value) =
+  case Binarymap.peek (dict, key) of
+      SOME _ => dict
+    | NONE => Binarymap.insert (dict, key, value)
+
+fun parse_dat_parent_hashes dat_text =
+  let
+    val n = size dat_text
+    val empty = Binarymap.mkDict String.compare
+    fun whitespace c = c = #" " orelse c = #"\n" orelse c = #"\t" orelse c = #"\r"
+    fun skip_ws i = if i < n andalso whitespace (String.sub(dat_text, i)) then skip_ws (i + 1) else i
+    fun scan_quote i =
+      if i >= n then NONE
+      else if String.sub(dat_text, i) = #"\"" then SOME i
+      else scan_quote (i + 1)
+    fun parse_pair start dict =
+      let
+        val key_start = start + 2
+      in
+        case scan_quote key_start of
+            NONE => (dict, n)
+          | SOME key_end =>
+              let
+                val dot = skip_ws (key_end + 1)
+                val quote = skip_ws (dot + 1)
+                val next = key_end + 1
+              in
+                if dot < n andalso String.sub(dat_text, dot) = #"." andalso
+                   quote < n andalso String.sub(dat_text, quote) = #"\"" andalso
+                   quote + 41 <= n then
+                  let
+                    val hash = String.substring(dat_text, quote + 1, 40)
+                    val valid_hash = valid_sha1_text hash
+                    val dict' =
+                      if valid_hash then
+                        insert_first_string_dict
+                          (dict,
+                           String.substring(dat_text, key_start, key_end - key_start),
+                           hash)
+                      else dict
+                  in
+                    (dict', if valid_hash then quote + 41 else quote + 1)
+                  end
+                else
+                  (dict, next)
+              end
+      end
+    fun loop i dict =
+      if i + 1 >= n then dict
+      else if String.sub(dat_text, i) = #"(" andalso String.sub(dat_text, i + 1) = #"\"" then
+        let val (dict', next) = parse_pair i dict
+        in loop next dict' end
+      else
+        loop (i + 1) dict
+  in
+    loop 0 empty
+  end
+
+fun parent_hash_metadata_lines plan node =
+  case #kind (HolbuildBuildPlan.source_of node) of
+      HolbuildSourceIndex.TheoryScript =>
+        let
+          val parent_hashes = parse_dat_parent_hashes (read_text (#data_path (theory_outputs node)))
+          fun parent_line dep =
+            let val parent_name = theory_name_from_logical (logical_name dep)
+            in
+              case Binarymap.peek (parent_hashes, parent_name) of
+                  NONE => NONE
+                | SOME hash => SOME ("parent_dat=" ^ parent_name ^ " " ^ hash)
+            end
+        in
+          "parent_hashes=v1" :: List.mapPartial parent_line (project_theory_deps plan node)
+        end
+    | _ => []
+
 fun checkpoint_lines _ _ _ = []
 
 fun dependency_context_lines plan keys toolchain_key node =
@@ -2904,6 +2987,7 @@ fun metadata_core_lines checkpoint_policy project plan keys input_key toolchain_
      "logical=" ^ #logical_name source,
      "source=" ^ #relative_path source] @
     dependency_context_lines plan keys toolchain_key node @
+    parent_hash_metadata_lines plan node @
     proof_timeout_lines checkpoint_policy node @
     action_policy_lines node @
     checkpoint_lines checkpoint_policy project node @
@@ -2948,69 +3032,37 @@ fun output_exists_for_node node path =
       HolbuildSourceIndex.TheoryScript => file_nonempty path
     | _ => file_exists path
 
-fun theory_name_from_logical logical =
-  if has_suffix "Theory" logical then drop_suffix "Theory" logical else logical
+fun write_metadata checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints =
+  write_text (metadata_path project node)
+             (metadata_text checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints)
 
-fun parse_dat_parent_hashes dat_text =
-  let
-    val n = size dat_text
-    val empty = Binarymap.mkDict String.compare
-    fun whitespace c = c = #" " orelse c = #"\n" orelse c = #"\t" orelse c = #"\r"
-    fun skip_ws i = if i < n andalso whitespace (String.sub(dat_text, i)) then skip_ws (i + 1) else i
-    fun scan_quote i =
-      if i >= n then NONE
-      else if String.sub(dat_text, i) = #"\"" then SOME i
-      else scan_quote (i + 1)
-    fun insert_first (dict, key, value) =
-      case Binarymap.peek (dict, key) of
-          SOME _ => dict
-        | NONE => Binarymap.insert (dict, key, value)
-    fun parse_pair start dict =
-      let
-        val key_start = start + 2
-      in
-        case scan_quote key_start of
-            NONE => (dict, n)
-          | SOME key_end =>
-              let
-                val dot = skip_ws (key_end + 1)
-                val quote = skip_ws (dot + 1)
-                val next = key_end + 1
-              in
-                if dot < n andalso String.sub(dat_text, dot) = #"." andalso
-                   quote < n andalso String.sub(dat_text, quote) = #"\"" andalso
-                   quote + 41 <= n then
-                  let
-                    val hash = String.substring(dat_text, quote + 1, 40)
-                    val valid_hash = valid_sha1_text hash
-                    val dict' =
-                      if valid_hash then
-                        insert_first (dict,
-                                      String.substring(dat_text, key_start, key_end - key_start),
-                                      hash)
-                      else dict
-                  in
-                    (dict', if valid_hash then quote + 41 else quote + 1)
-                  end
-                else
-                  (dict, next)
-              end
-      end
-    fun loop i dict =
-      if i + 1 >= n then dict
-      else if String.sub(dat_text, i) = #"(" andalso String.sub(dat_text, i + 1) = #"\"" then
-        let val (dict', next) = parse_pair i dict
-        in loop next dict' end
-      else
-        loop (i + 1) dict
+fun metadata_has_parent_hashes lines =
+  metadata_value "parent_hashes" lines = SOME "v1"
+
+fun theory_parent_metadata_needs_refresh node text =
+  case #kind (HolbuildBuildPlan.source_of node) of
+      HolbuildSourceIndex.TheoryScript => not (metadata_has_parent_hashes (metadata_lines text))
+    | _ => false
+
+fun parse_parent_dat_metadata_line line =
+  let val prefix = "parent_dat="
   in
-    loop 0 empty
+    if String.isPrefix prefix line then
+      case String.tokens (fn c => c = #" ") (String.extract(line, size prefix, NONE)) of
+          [parent_name, hash] =>
+            if valid_sha1_text hash then SOME (parent_name, hash) else NONE
+        | _ => NONE
+    else NONE
   end
 
-fun project_theory_deps plan node =
-  List.filter
-    (fn dep => #kind (HolbuildBuildPlan.source_of dep) = HolbuildSourceIndex.TheoryScript)
-    (HolbuildBuildPlan.direct_project_deps plan node)
+fun metadata_parent_hashes lines =
+  List.foldl
+    (fn (line, dict) =>
+        case parse_parent_dat_metadata_line line of
+            NONE => dict
+          | SOME (parent_name, hash) => insert_first_string_dict (dict, parent_name, hash))
+    (Binarymap.mkDict String.compare)
+    lines
 
 fun theory_parent_hash_matches dat_hash_cache parent_hashes dep =
   let
@@ -3027,30 +3079,52 @@ fun theory_parent_hash_matches dat_hash_cache parent_hashes dep =
              | SOME recorded_hash => recorded_hash = parent_hash)
   end
 
-fun theory_parent_hashes_match dat_hash_cache plan node =
+fun child_dat_parent_hashes_match dat_hash_cache plan node =
+  let val parent_hashes = parse_dat_parent_hashes (read_text (#data_path (theory_outputs node)))
+  in List.all (theory_parent_hash_matches dat_hash_cache parent_hashes)
+              (project_theory_deps plan node) end
+
+fun metadata_parent_hashes_match dat_hash_cache plan node text =
+  let val lines = metadata_lines text
+  in
+    if metadata_has_parent_hashes lines then
+      List.all (theory_parent_hash_matches dat_hash_cache (metadata_parent_hashes lines))
+               (project_theory_deps plan node)
+    else
+      child_dat_parent_hashes_match dat_hash_cache plan node
+  end
+
+fun theory_parent_hashes_match dat_hash_cache plan node metadata_text =
   detail_time_phase "build.exec.node.parent_hash_check"
     (fn () =>
         (case #kind (HolbuildBuildPlan.source_of node) of
              HolbuildSourceIndex.TheoryScript =>
-               let val parent_hashes = parse_dat_parent_hashes (read_text (#data_path (theory_outputs node)))
-               in List.all (theory_parent_hash_matches dat_hash_cache parent_hashes)
-                           (project_theory_deps plan node) end
+               (case metadata_text of
+                    SOME text => metadata_parent_hashes_match dat_hash_cache plan node text
+                  | NONE => child_dat_parent_hashes_match dat_hash_cache plan node)
            | _ => true)
         handle _ => false)
 
-fun up_to_date dat_hash_cache checkpoint_policy project plan _ input_key _ node _ =
+fun up_to_date dat_hash_cache checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints =
   detail_time_phase "build.exec.node.up_to_date"
     (fn () =>
         List.all (output_exists_for_node node) (output_paths checkpoint_policy project node) andalso
-        (case current_metadata (metadata_path project node) of
-             SOME text => metadata_input_key_matches input_key text andalso
-                          metadata_timeout_satisfies checkpoint_policy node text
-           | NONE => false) andalso
-        theory_parent_hashes_match dat_hash_cache plan node)
-
-fun write_metadata checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints =
-  write_text (metadata_path project node)
-             (metadata_text checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints)
+        case current_metadata (metadata_path project node) of
+             SOME text =>
+               let
+                 val metadata_ok =
+                   metadata_input_key_matches input_key text andalso
+                   metadata_timeout_satisfies checkpoint_policy node text
+                 val parents_ok =
+                   metadata_ok andalso theory_parent_hashes_match dat_hash_cache plan node (SOME text)
+                 val _ =
+                   if parents_ok andalso theory_parent_metadata_needs_refresh node text then
+                     write_metadata checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints
+                   else ()
+               in
+                 metadata_ok andalso parents_ok
+               end
+           | NONE => false)
 
 fun root_package_name project =
   HolbuildProject.package_name (HolbuildProject.project_package project)
@@ -3228,7 +3302,7 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
       invalidate_cached_file_hash dat_hash_cache (#data_path (theory_outputs node))
     fun materialize_valid_cache () =
       materialize_theory_cache tc project plan input_key (tactic_timeout policy) node andalso
-      (if theory_parent_hashes_match dat_hash_cache plan node then true
+      (if theory_parent_hashes_match dat_hash_cache plan node NONE then true
        else (remove_failed_cache_outputs project node; false))
   in
     if not forced andalso not (always_reexecute node) andalso
