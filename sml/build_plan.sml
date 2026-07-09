@@ -137,17 +137,25 @@ fun build_key_index nodes =
   end
 
 type direct_project_deps_cache = (string * node list) Vector.vector
+type deps_closure_cache = node list option array ref
+type dependency_context_key_cache = (string * string) option array ref
 
 type t =
   {universe : node list,
    selected : node list,
    name_index : name_index,
-   direct_project_deps_cache : direct_project_deps_cache}
+   universe_key_index : key_index,
+   direct_project_deps_cache : direct_project_deps_cache,
+   deps_closure_cache : deps_closure_cache,
+   dependency_context_key_cache : dependency_context_key_cache}
 
 fun universe_nodes ({universe, ...} : t) = universe
 fun selected_nodes ({selected, ...} : t) = selected
 fun lookup ({name_index, ...} : t) = indexed_nodes_named name_index
+fun universe_key_index ({universe_key_index, ...} : t) = universe_key_index
 fun direct_project_deps_cache ({direct_project_deps_cache, ...} : t) = direct_project_deps_cache
+fun deps_closure_cache ({deps_closure_cache, ...} : t) = deps_closure_cache
+fun dependency_context_key_cache ({dependency_context_key_cache, ...} : t) = dependency_context_key_cache
 
 fun indexed_key_id index node_key =
   let
@@ -388,7 +396,7 @@ fun cycle_message path node =
   "dependency cycle: " ^
   String.concatWith " -> " (rev (logical_name node :: map logical_name path))
 
-fun topo_sort_with lookup nodes roots =
+fun topo_sort_with_deps lookup nodes direct_deps roots =
   let
     val key_index = build_key_index nodes
     val visited = Array.array (length nodes, false)
@@ -402,7 +410,7 @@ fun topo_sort_with lookup nodes roots =
         else
           let
             val _ = Array.update(active, id, true)
-            val deps = direct_project_deps_with lookup nodes node
+            val deps = direct_deps node
             val order' = List.foldl (fn (dep, acc) => visit (node :: active_path) dep acc) order deps
             val _ = Array.update(active, id, false)
             val _ = Array.update(visited, id, true)
@@ -418,11 +426,42 @@ fun topo_sort_with lookup nodes roots =
     plan
   end
 
+fun topo_sort_with lookup nodes roots =
+  topo_sort_with_deps lookup nodes (direct_project_deps_with lookup nodes) roots
+
 fun topo_sort nodes roots =
   topo_sort_with (nodes_named nodes) nodes roots
 
+fun plan_node_id plan node = indexed_key_id (universe_key_index plan) (key node)
+
 fun transitive_project_deps plan node =
-  topo_sort_with (lookup plan) (universe_nodes plan) (direct_project_deps plan node)
+  case direct_project_deps_cached (direct_project_deps_cache plan) node of
+      NONE => topo_sort_with (lookup plan) (universe_nodes plan) (direct_project_deps plan node)
+    | SOME roots =>
+        let
+          val cache = !(deps_closure_cache plan)
+          val id = plan_node_id plan node
+        in
+          case Array.sub(cache, id) of
+              SOME deps => deps
+            | NONE =>
+                let
+                  val deps = topo_sort_with_deps (lookup plan) (universe_nodes plan)
+                               (direct_project_deps plan) roots
+                in
+                  Array.update(cache, id, SOME deps);
+                  deps
+                end
+        end
+
+fun cached_dependency_context_key plan node context_id =
+  case Array.sub(!(dependency_context_key_cache plan), plan_node_id plan node) of
+      SOME (cached_context_id, value) =>
+        if cached_context_id = context_id then SOME value else NONE
+    | NONE => NONE
+
+fun remember_dependency_context_key plan node context_id value =
+  Array.update(!(dependency_context_key_cache plan), plan_node_id plan node, SOME (context_id, value))
 
 fun closure_external_theories plan node =
   unique_strings
@@ -455,10 +494,16 @@ fun plan holdir sources targets =
     val lookup = indexed_nodes_named index
     val roots = target_roots lookup nodes targets
     val selected = topo_sort_with lookup nodes roots
+    val universe_key_index = build_key_index nodes
     val direct_project_deps_cache = build_direct_project_deps_cache_with lookup selected
+    val deps_closure_cache = ref (Array.array(length nodes, NONE : node list option))
+    val dependency_context_key_cache = ref (Array.array(length nodes, NONE : (string * string) option))
   in
     {universe = nodes, selected = selected, name_index = index,
-     direct_project_deps_cache = direct_project_deps_cache}
+     universe_key_index = universe_key_index,
+     direct_project_deps_cache = direct_project_deps_cache,
+     deps_closure_cache = deps_closure_cache,
+     dependency_context_key_cache = dependency_context_key_cache}
   end
 
 fun kind_name source = HolbuildSourceIndex.kind_string (#kind source)
