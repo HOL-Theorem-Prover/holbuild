@@ -17,7 +17,7 @@ hol=$tmpdir/hol
 mkdir -p "$hol"
 git -C "$hol" init -q
 git_identity "$hol"
-mkdir -p "$hol/bin" "$hol/tools" "$hol/tools/sequences"
+mkdir -p "$hol/bin" "$hol/tools" "$hol/tools/build" "$hol/tools/sequences"
 cat > "$hol/.gitignore" <<'EOF_IGNORE'
 /bin/hol
 /bin/hol.state
@@ -28,6 +28,7 @@ EOF_IGNORE
 cat > "$hol/tools/smart-configure.sml" <<'SML'
 (* fake configure script; HOLBUILD_POLY fixture handles it *)
 SML
+printf '#include sequences/upto-hol\n' > "$hol/tools/build/build-sequence"
 printf 'fake upto-hol sequence\n' > "$hol/tools/sequences/upto-hol"
 cat > "$hol/bin/build" <<'SH'
 #!/usr/bin/env sh

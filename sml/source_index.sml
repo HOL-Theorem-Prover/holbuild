@@ -248,31 +248,26 @@ fun scan_member name source_root artifact_root policies excludes exclude_globs (
 fun discover_package package acc =
   let
     val name = HolbuildProject.package_name package
+    val source_root = HolbuildProject.package_root package
+    val artifact_root = HolbuildProject.package_artifact_root package
+    val policies = HolbuildProject.package_action_policies package
+    val excludes = HolbuildProject.package_excludes package
+    val exclude_globs = HolbuildProject.package_exclude_globs package
+    val _ = HolbuildGenerators.run_package package
+            handle HolbuildGenerators.Error msg => raise Error msg
+                 | HolbuildGenerators.ErrorWithDebugArtifacts (msg, artifacts) =>
+                     raise ErrorWithDebugArtifacts (msg, artifacts)
+    val members =
+      map (fn member => HolbuildProject.abs_under source_root member)
+        (HolbuildProject.package_members package)
+    val sources =
+      List.foldl
+        (scan_member name source_root artifact_root policies excludes exclude_globs)
+        acc
+        members
+    val _ = validate_action_policies name policies sources
   in
-    if name = "hol" then acc
-    else
-      let
-        val source_root = HolbuildProject.package_root package
-        val artifact_root = HolbuildProject.package_artifact_root package
-        val policies = HolbuildProject.package_action_policies package
-        val excludes = HolbuildProject.package_excludes package
-        val exclude_globs = HolbuildProject.package_exclude_globs package
-        val _ = HolbuildGenerators.run_package package
-                handle HolbuildGenerators.Error msg => raise Error msg
-                     | HolbuildGenerators.ErrorWithDebugArtifacts (msg, artifacts) =>
-                         raise ErrorWithDebugArtifacts (msg, artifacts)
-        val members =
-          map (fn member => HolbuildProject.abs_under source_root member)
-            (HolbuildProject.package_members package)
-        val sources =
-          List.foldl
-            (scan_member name source_root artifact_root policies excludes exclude_globs)
-            acc
-            members
-        val _ = validate_action_policies name policies sources
-      in
-        sources
-      end
+    sources
   end
 
 fun discover (project : HolbuildProject.t) =

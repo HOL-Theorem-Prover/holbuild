@@ -811,7 +811,8 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
 fun parse_at args = parse_table_at (TOML.fromFile (#manifest args)) args
 
 fun parse_builtin_holdir_at args =
-  parse_table_at (TOML.fromString HolbuildBuiltinManifests.holdir_manifest_text) args
+  parse_table_at (TOML.fromString (HolbuildBuiltinManifests.holdir_manifest_text (#root args))) args
+  handle HolbuildBuiltinManifests.Error msg => die msg
 
 fun parse manifest =
   let

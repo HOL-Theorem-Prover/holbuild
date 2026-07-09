@@ -42,6 +42,7 @@ use "vendor/sml-sha256/lib/sha256.sml";
 
 use "sml/hash.sml";
 use "sml/version.sml";
+use "sml/hol_toolchain_config.sml";
 use "sml/builtin_manifests.sml";
 use "sml/cache_config.sml";
 use "sml/remote_cache_config.sml";
@@ -52,7 +53,6 @@ use "sml/fs_cache_backend.sml";
 use "sml/cache_transfer.sml";
 use "sml/remote_cache.sml";
 use "sml/cache_archive.sml";
-use "sml/hol_toolchain_config.sml";
 use "sml/hol_shared_cache.sml";
 use "sml/project.sml";
 use "sml/toolchain.sml";
