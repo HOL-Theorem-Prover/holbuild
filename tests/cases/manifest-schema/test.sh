@@ -57,6 +57,23 @@ TOML
 require_grep "name: valid" "$tmpdir/valid.log"
 require_grep "roots: src/MainScript.sml" "$tmpdir/valid.log"
 
+make_project valid_groups_context
+write_manifest valid_groups_context <<'TOML'
+
+[build]
+root_groups = ["@fixtures"]
+
+[build.groups.fixtures]
+include = ["src/generated"]
+include_globs = ["gen/*Script.sml"]
+exclude = ["src/generated/SkipScript.sml"]
+exclude_globs = ["gen/*ExperimentalScript.sml"]
+allow_empty = true
+TOML
+(cd "$tmpdir/valid_groups_context" && "$HOLBUILD_BIN" context) > "$tmpdir/valid_groups_context.log"
+require_grep "root_groups: fixtures" "$tmpdir/valid_groups_context.log"
+require_grep 'group: fixtures include=src/generated include_globs=gen/\*Script.sml exclude=src/generated/SkipScript.sml exclude_globs=gen/\*ExperimentalScript.sml allow_empty=true' "$tmpdir/valid_groups_context.log"
+
 make_project schema1_rejected
 cat > "$tmpdir/schema1_rejected/holproject.toml" <<'TOML'
 [holbuild]
@@ -128,7 +145,7 @@ TOML
 (cd "$tmpdir/valid_schema2_from" && "$HOLBUILD_BIN" context) > "$tmpdir/valid_schema2_from.log"
 require_grep "dependency: holexamples \[from=hol, path=., manifest=holexamples.manifest.toml" "$tmpdir/valid_schema2_from.log"
 
-for case in unknown_top typo_build bad_exclude_type bad_exclude_globs_type bad_exclude_trailing_slash bad_exclude_dot bad_roots_type bad_root_timeout absolute_member parent_exclude no_paths_includes bad_type bad_project_name bad_action_field bad_action_type bad_action_deps_type bad_action_loads_type bad_action_abs_input bad_action_abs_dep bad_generate_field bad_generate_command_type bad_generate_abs_output; do
+for case in unknown_top typo_build bad_group_field bad_group_entry_type bad_group_empty bad_group_name_at bad_group_name_slash bad_group_name_colon bad_group_name_space bad_group_abs_include bad_group_parent_include bad_root_groups_type bad_root_groups_unknown bad_exclude_type bad_exclude_globs_type bad_exclude_trailing_slash bad_exclude_dot bad_roots_type bad_root_timeout absolute_member parent_exclude no_paths_includes bad_type bad_project_name bad_action_field bad_action_type bad_action_deps_type bad_action_loads_type bad_action_abs_input bad_action_abs_dep bad_generate_field bad_generate_command_type bad_generate_abs_output; do
   make_project "$case"
 done
 
@@ -145,6 +162,84 @@ write_manifest typo_build <<'TOML'
 member = ["src"]
 TOML
 expect_context_failure typo_build "unknown field in build: member"
+
+write_manifest bad_group_field <<'TOML'
+
+[build.groups.fixtures]
+include = ["src"]
+extra = true
+TOML
+expect_context_failure bad_group_field "unknown field in build.groups.fixtures: extra"
+
+write_manifest bad_group_entry_type <<'TOML'
+
+[build.groups]
+fixtures = "not a table"
+TOML
+expect_context_failure bad_group_entry_type "build.groups.fixtures must be a table"
+
+write_manifest bad_group_empty <<'TOML'
+
+[build.groups.empty]
+exclude = ["src/generated"]
+TOML
+expect_context_failure bad_group_empty "group empty: needs a non-empty include or include_globs"
+
+write_manifest bad_group_name_at <<'TOML'
+
+[build.groups."bad@name"]
+include = ["src"]
+TOML
+expect_context_failure bad_group_name_at "invalid group name \"bad@name\": use \[A-Za-z0-9_-\]"
+
+write_manifest bad_group_name_slash <<'TOML'
+
+[build.groups."bad/name"]
+include = ["src"]
+TOML
+expect_context_failure bad_group_name_slash "invalid group name \"bad/name\": use \[A-Za-z0-9_-\]"
+
+write_manifest bad_group_name_colon <<'TOML'
+
+[build.groups."bad:name"]
+include = ["src"]
+TOML
+expect_context_failure bad_group_name_colon "invalid group name \"bad:name\": use \[A-Za-z0-9_-\]"
+
+write_manifest bad_group_name_space <<'TOML'
+
+[build.groups."bad name"]
+include = ["src"]
+TOML
+expect_context_failure bad_group_name_space "invalid group name \"bad name\": use \[A-Za-z0-9_-\]"
+
+write_manifest bad_group_abs_include <<'TOML'
+
+[build.groups.fixtures]
+include = ["/tmp/generated"]
+TOML
+expect_context_failure bad_group_abs_include "build.groups.fixtures.include must be package-root-relative: /tmp/generated"
+
+write_manifest bad_group_parent_include <<'TOML'
+
+[build.groups.fixtures]
+include = ["../generated"]
+TOML
+expect_context_failure bad_group_parent_include "build.groups.fixtures.include must be package-root-relative: ../generated"
+
+write_manifest bad_root_groups_type <<'TOML'
+
+[build]
+root_groups = "fixtures"
+TOML
+expect_context_failure bad_root_groups_type "root_groups must be a string array"
+
+write_manifest bad_root_groups_unknown <<'TOML'
+
+[build]
+root_groups = ["missing"]
+TOML
+expect_context_failure bad_root_groups_unknown "unknown group in build.root_groups: missing"
 
 write_manifest bad_exclude_type <<'TOML'
 
