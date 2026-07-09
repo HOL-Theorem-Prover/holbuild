@@ -95,3 +95,100 @@ require_grep "tactic timed out after 0.1s while building DepTheory: slow_tac" "$
 (cd "$project" && "$HOLBUILD_BIN" build --tactic-timeout 1.0 ATheory BTheory) > "$tmpdir/cli-override.log" 2>&1
 require_file "$project/.holbuild/obj/src/ATheory.dat"
 require_file "$project/.holbuild/obj/src/BTheory.dat"
+
+root_groups_project=$tmpdir/root-groups
+mkdir -p "$root_groups_project/gen"
+cat > "$root_groups_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "root-groups-timeout"
+
+[build]
+members = ["gen"]
+root_groups = ["generated"]
+tactic_timeout = 1.0
+
+[build.groups.generated]
+include_globs = ["gen/*Script.sml"]
+
+[build.root_tactic_timeouts]
+"gen/GroupScript.sml" = 0.1
+TOML
+
+cat > "$root_groups_project/gen/GroupScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Group";
+fun slow_tac g = (OS.Process.sleep (Time.fromReal 0.45); ACCEPT_TAC TRUTH g);
+Theorem group_slow:
+  T
+Proof
+  slow_tac
+QED
+val _ = export_theory();
+SML
+
+if (cd "$root_groups_project" && "$HOLBUILD_BIN" build) > "$tmpdir/root-groups.log" 2>&1; then
+  echo "root_groups default build ignored root_tactic_timeouts" >&2
+  exit 1
+fi
+require_grep "tactic timed out after 0.1s while building GroupTheory: slow_tac" "$tmpdir/root-groups.log"
+
+roots_group_project=$tmpdir/roots-group
+mkdir -p "$roots_group_project/gen"
+cat > "$roots_group_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "roots-group-timeout"
+
+[build]
+members = ["gen"]
+roots = ["@generated"]
+tactic_timeout = 1.0
+
+[build.groups.generated]
+include_globs = ["gen/*Script.sml"]
+
+[build.root_tactic_timeouts]
+"gen/BetaScript.sml" = 0.1
+TOML
+
+cat > "$roots_group_project/gen/AlphaScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Alpha";
+Theorem alpha_fast:
+  T
+Proof
+  simp[]
+QED
+val _ = export_theory();
+SML
+
+cat > "$roots_group_project/gen/BetaScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Beta";
+fun slow_tac g = (OS.Process.sleep (Time.fromReal 0.45); ACCEPT_TAC TRUTH g);
+Theorem beta_slow:
+  T
+Proof
+  slow_tac
+QED
+val _ = export_theory();
+SML
+
+if (cd "$roots_group_project" && "$HOLBUILD_BIN" build) > "$tmpdir/roots-group.log" 2>&1; then
+  echo "roots @group build ignored grouped root_tactic_timeouts" >&2
+  exit 1
+fi
+require_grep "tactic timed out after 0.1s while building BetaTheory: slow_tac" "$tmpdir/roots-group.log"

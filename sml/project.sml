@@ -780,12 +780,52 @@ fun root_tactic_timeouts_from_manifest build =
                        timeout = tactic_timeout_value ("build.root_tactic_timeouts." ^ root) value})
                   entries
 
-fun validate_root_tactic_timeouts roots timeouts =
-  List.app
-    (fn {root, ...} =>
-        if member root roots then ()
-        else die ("build.root_tactic_timeouts references unknown root: " ^ root))
-    timeouts
+fun glob_match pattern text =
+  let
+    val pn = size pattern
+    val tn = size text
+    fun match p t =
+      if p = pn then t = tn
+      else
+        case String.sub(pattern, p) of
+            #"*" => match (p + 1) t orelse (t < tn andalso match p (t + 1))
+          | #"?" => t < tn andalso match (p + 1) (t + 1)
+          | c => t < tn andalso c = String.sub(text, t) andalso match (p + 1) (t + 1)
+  in
+    match 0 0
+  end
+
+fun path_matches paths globs rel =
+  List.exists (fn path => rel = path orelse String.isPrefix (path ^ "/") rel) paths orelse
+  List.exists (fn pattern => glob_match pattern rel) globs
+
+fun group_matches_root root (Group {includes, include_globs, excludes, exclude_globs, ...}) =
+  path_matches includes include_globs root andalso
+  not (path_matches excludes exclude_globs root)
+
+fun group_named groups name =
+  List.find (fn Group {name = group_name, ...} => group_name = name) groups
+
+fun referenced_root_group_names roots root_groups =
+  root_groups @ map strip_group_reference (List.filter is_group_reference roots)
+
+fun validate_root_tactic_timeouts roots root_groups groups timeouts =
+  let
+    val referenced_groups = referenced_root_group_names roots root_groups
+    fun root_in_group root name =
+      case group_named groups name of
+          NONE => false
+        | SOME group => group_matches_root root group
+    fun known_root root =
+      member root roots orelse
+      List.exists (root_in_group root) referenced_groups
+  in
+    List.app
+      (fn {root, ...} =>
+          if known_root root then ()
+          else die ("build.root_tactic_timeouts references unknown root: " ^ root))
+      timeouts
+  end
 
 fun build_roots_from_manifest build_strings =
   let
@@ -878,8 +918,8 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
     val root_groups = build_root_groups_from_manifest build_strings
     val groups = groups_at table
     val root_tactic_timeouts = root_tactic_timeouts_from_manifest build
-    val _ = validate_root_tactic_timeouts roots root_tactic_timeouts
     val _ = validate_root_groups root_groups groups
+    val _ = validate_root_tactic_timeouts roots root_groups groups root_tactic_timeouts
     val manifest_timeout = build_tactic_timeout_from_manifest build
     val schema = schema_version table
     val dependencies = dependencies_at table

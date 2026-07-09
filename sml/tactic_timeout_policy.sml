@@ -41,9 +41,10 @@ fun declared_entries project index =
   let
     val package = HolbuildProject.project_package project
     val roots = HolbuildProject.package_roots package
+    val root_groups = HolbuildProject.package_root_groups package
   in
-    if null roots then implicit_entries package index
-    else ListPair.zip (roots, HolbuildSourceIndex.roots_for_package index package)
+    if null roots andalso null root_groups then implicit_entries package index
+    else HolbuildSourceIndex.declared_root_entries index package
   end
 
 fun entry_timeout project default_timeout root =

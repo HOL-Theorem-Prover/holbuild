@@ -388,6 +388,21 @@ fun lookup_group package name =
 
 fun resolve_group_ref sources package name = group_members sources package (lookup_group package name)
 
+fun group_member_sources sources package name =
+  let
+    val package_name = HolbuildProject.package_name package
+    val members = resolve_group_ref sources package name
+    fun source_for_logical logical =
+      case List.filter
+             (fn source => #package source = package_name andalso
+                           #logical_name source = logical)
+             sources of
+          [] => raise Error ("group member disappeared: " ^ package_name ^ ":" ^ logical)
+        | source :: _ => source
+  in
+    map source_for_logical members
+  end
+
 fun group_token_name token =
   let val name = String.extract(token, 1, NONE)
   in
@@ -413,11 +428,31 @@ fun root_for_package sources package root =
       | [source] => [#logical_name source]
       | _ => raise Error ("ambiguous build root: " ^ HolbuildProject.package_name package ^ ":" ^ root)
 
+fun source_entry source = (#relative_path source, #logical_name source)
+
+fun root_entries_for_package_root sources package root =
+  if is_group_token root then
+    map source_entry (group_member_sources sources package (group_token_name root))
+  else
+    case List.filter (fn source => source_matches_root package source root) sources of
+        [] => raise Error ("unknown build root: " ^ HolbuildProject.package_name package ^ ":" ^ root)
+      | [source] => [source_entry source]
+      | _ => raise Error ("ambiguous build root: " ^ HolbuildProject.package_name package ^ ":" ^ root)
+
 fun roots_for_package sources package =
   List.concat (map (root_for_package sources package) (HolbuildProject.package_roots package))
 
 fun root_groups_for_package sources package =
   List.concat (map (resolve_group_ref sources package) (HolbuildProject.package_root_groups package))
+
+fun root_group_entries_for_package sources package =
+  List.concat (map (fn group => map source_entry (group_member_sources sources package group))
+                   (HolbuildProject.package_root_groups package))
+
+fun declared_root_entries sources package =
+  List.concat (map (root_entries_for_package_root sources package)
+                   (HolbuildProject.package_roots package)) @
+  root_group_entries_for_package sources package
 
 fun default_package_targets sources package =
   roots_for_package sources package @ root_groups_for_package sources package
