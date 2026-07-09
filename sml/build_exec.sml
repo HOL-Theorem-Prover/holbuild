@@ -2951,28 +2951,60 @@ fun output_exists_for_node node path =
 fun theory_name_from_logical logical =
   if has_suffix "Theory" logical then drop_suffix "Theory" logical else logical
 
-fun theory_dat_parent_hash dat_text parent_name =
+fun parse_dat_parent_hashes dat_text =
   let
-    val marker = "(\"" ^ parent_name ^ "\""
     val n = size dat_text
+    val empty = Binarymap.mkDict String.compare
     fun whitespace c = c = #" " orelse c = #"\n" orelse c = #"\t" orelse c = #"\r"
     fun skip_ws i = if i < n andalso whitespace (String.sub(dat_text, i)) then skip_ws (i + 1) else i
-    fun parse_hash start =
+    fun scan_quote i =
+      if i >= n then NONE
+      else if String.sub(dat_text, i) = #"\"" then SOME i
+      else scan_quote (i + 1)
+    fun insert_first (dict, key, value) =
+      case Binarymap.peek (dict, key) of
+          SOME _ => dict
+        | NONE => Binarymap.insert (dict, key, value)
+    fun parse_pair start dict =
       let
-        val dot = skip_ws (start + size marker)
-        val quote = skip_ws (dot + 1)
+        val key_start = start + 2
       in
-        if dot < n andalso String.sub(dat_text, dot) = #"." andalso
-           quote < n andalso String.sub(dat_text, quote) = #"\"" andalso
-           quote + 41 <= n then
-          let val hash = String.substring(dat_text, quote + 1, 40)
-          in if valid_sha1_text hash then SOME hash else NONE end
-        else NONE
+        case scan_quote key_start of
+            NONE => (dict, n)
+          | SOME key_end =>
+              let
+                val dot = skip_ws (key_end + 1)
+                val quote = skip_ws (dot + 1)
+                val next = key_end + 1
+              in
+                if dot < n andalso String.sub(dat_text, dot) = #"." andalso
+                   quote < n andalso String.sub(dat_text, quote) = #"\"" andalso
+                   quote + 41 <= n then
+                  let
+                    val hash = String.substring(dat_text, quote + 1, 40)
+                    val valid_hash = valid_sha1_text hash
+                    val dict' =
+                      if valid_hash then
+                        insert_first (dict,
+                                      String.substring(dat_text, key_start, key_end - key_start),
+                                      hash)
+                      else dict
+                  in
+                    (dict', if valid_hash then quote + 41 else quote + 1)
+                  end
+                else
+                  (dict, next)
+              end
       end
+    fun loop i dict =
+      if i + 1 >= n then dict
+      else if String.sub(dat_text, i) = #"(" andalso String.sub(dat_text, i + 1) = #"\"" then
+        let val (dict', next) = parse_pair i dict
+        in loop next dict' end
+      else
+        loop (i + 1) dict
   in
-    case find_substring marker dat_text of
-        NONE => NONE
-      | SOME start => parse_hash start
+    loop 0 empty
   end
 
 fun project_theory_deps plan node =
@@ -2980,7 +3012,7 @@ fun project_theory_deps plan node =
     (fn dep => #kind (HolbuildBuildPlan.source_of dep) = HolbuildSourceIndex.TheoryScript)
     (HolbuildBuildPlan.direct_project_deps plan node)
 
-fun theory_parent_hash_matches dat_hash_cache dat_text dep =
+fun theory_parent_hash_matches dat_hash_cache parent_hashes dep =
   let
     val parent_name = theory_name_from_logical (logical_name dep)
   in
@@ -2990,7 +3022,7 @@ fun theory_parent_hash_matches dat_hash_cache dat_text dep =
     case cached_file_hash dat_hash_cache (#data_path (theory_outputs dep)) of
         NONE => false
       | SOME parent_hash =>
-          (case theory_dat_parent_hash dat_text parent_name of
+          (case Binarymap.peek (parent_hashes, parent_name) of
                NONE => true
              | SOME recorded_hash => recorded_hash = parent_hash)
   end
@@ -3000,8 +3032,8 @@ fun theory_parent_hashes_match dat_hash_cache plan node =
     (fn () =>
         (case #kind (HolbuildBuildPlan.source_of node) of
              HolbuildSourceIndex.TheoryScript =>
-               let val dat_text = read_text (#data_path (theory_outputs node))
-               in List.all (theory_parent_hash_matches dat_hash_cache dat_text)
+               let val parent_hashes = parse_dat_parent_hashes (read_text (#data_path (theory_outputs node)))
+               in List.all (theory_parent_hash_matches dat_hash_cache parent_hashes)
                            (project_theory_deps plan node) end
            | _ => true)
         handle _ => false)
