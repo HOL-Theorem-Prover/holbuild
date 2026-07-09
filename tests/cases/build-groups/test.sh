@@ -409,6 +409,28 @@ require_grep "unreachable: warn-group:src/OmittedScript.sml (OmittedTheory)" "$t
 require_no_grep "WarnOne" "$tmpdir/warn-group.err"
 require_no_grep "WarnTwo" "$tmpdir/warn-group.err"
 
+empty_warn_project=$tmpdir/empty-warn-group
+mkdir -p "$empty_warn_project/gen" "$empty_warn_project/src"
+{
+  write_manifest_prelude
+  cat <<'TOML'
+[project]
+name = "empty-warn-group"
+
+[build]
+members = ["gen", "src"]
+root_groups = ["generated"]
+
+[build.groups.generated]
+include_globs = ["gen/*Script.sml"]
+allow_empty = true
+TOML
+} > "$empty_warn_project/holproject.toml"
+write_theory "$empty_warn_project/src/OmittedScript.sml" Omitted
+(cd "$empty_warn_project" && "$HOLBUILD_BIN" build --dry-run --warn-unreachable) > "$tmpdir/empty-warn-group.out" 2> "$tmpdir/empty-warn-group.err"
+require_grep "discoverable theory script(s) are not reachable from build.roots" "$tmpdir/empty-warn-group.err"
+require_grep "unreachable: empty-warn-group:src/OmittedScript.sml (OmittedTheory)" "$tmpdir/empty-warn-group.err"
+
 # 10. Group expansion happens after generators run, so newly generated sources are included.
 generate_project=$tmpdir/generate-group
 mkdir -p "$generate_project/scripts"
