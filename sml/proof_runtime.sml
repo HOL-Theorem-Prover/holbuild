@@ -104,6 +104,82 @@ fun write_timeout_marker label seconds =
            TextIO.closeOut out
         end
 
+(* Minimal local string compiler used for proof-fragment compilation.  This is
+   equivalent to the small quse_string helper holbuild previously loaded from
+   HOL's src/AI/sml_inspection/smlExecute, without depending on that
+   post-upto-hol source package at runtime. *)
+fun quse_string s =
+  let
+    val stream = TextIO.openString (HOLSource.fromString {quietOpen = false, print = fn _ => ()} s)
+    fun infn () = TextIO.input1 stream
+  in
+    (while not (TextIO.endOfStream stream) do PolyML.compiler (infn, []) ();
+     TextIO.closeIn stream;
+     true)
+    handle Interrupt => (TextIO.closeIn stream; raise Interrupt)
+         | _ => (TextIO.closeIn stream; false)
+  end
+
+exception FunctionTimeout
+
+datatype 'a timeout_result = TimeoutResult of 'a | TimeoutException of exn
+
+fun capture_timeout f x = TimeoutResult (f x)
+  handle Interrupt => raise Interrupt | e => TimeoutException e
+
+fun release_timeout (TimeoutResult y) = y
+  | release_timeout (TimeoutException e) = raise e
+
+val timeout_attrib_async =
+  [Thread.InterruptState Thread.InterruptAsynchOnce,
+   Thread.EnableBroadcastInterrupt true]
+
+val timeout_attrib_sync =
+  [Thread.InterruptState Thread.InterruptSynch,
+   Thread.EnableBroadcastInterrupt true]
+
+fun interruptkill worker =
+  let
+    open Thread
+    val _ = interrupt worker handle Thread _ => ()
+    fun loop n =
+      if not (isActive worker) then ()
+      else if n > 0 then loop (n - 1)
+      else (Feedback.HOL_WARNING "HolbuildProofRuntime" "interruptkill" "thread killed";
+            kill worker)
+  in
+    loop 100000000
+  end
+
+(* Local timeout helper adapted from HOL's smlTimeout.  Keeping this here avoids
+   making holbuild's theorem runtime depend on src/AI/sml_inspection being built
+   into the shared HOL toolchain. *)
+fun timeout seconds f x =
+  let
+    val m = Mutex.mutex ()
+    val curattrib = Thread.getAttributes ()
+    val _ = Thread.setAttributes timeout_attrib_sync
+    val _ = Mutex.lock m
+    val c = ConditionVar.conditionVar ()
+    val resultref = ref NONE
+    fun worker_fun () =
+      (resultref := SOME (capture_timeout f x);
+       Thread.setAttributes timeout_attrib_sync;
+       Mutex.lock m; ConditionVar.signal c; Mutex.unlock m)
+    val worker = Thread.fork (worker_fun, timeout_attrib_async)
+    val completed = ConditionVar.waitUntil (c, m, Time.now () + Time.fromReal seconds)
+    val _ = Mutex.unlock m
+    val _ = Thread.setAttributes curattrib
+    val _ = if completed then () else interruptkill worker
+    val result =
+      case !resultref of
+          NONE => TimeoutException FunctionTimeout
+        | SOME (TimeoutException Interrupt) => TimeoutException FunctionTimeout
+        | SOME r => r
+  in
+    release_timeout result
+  end
+
 fun timeout_message label seconds =
   String.concat ["holbuild tactic timeout after ", Real.toString seconds, "s: ", label]
 
@@ -111,8 +187,8 @@ fun with_tactic_timeout label f x =
   case !tactic_timeout_ref of
       NONE => f x
     | SOME seconds =>
-        (smlTimeout.timeout seconds f x
-         handle smlTimeout.FunctionTimeout =>
+        (timeout seconds f x
+         handle FunctionTimeout =>
            (write_timeout_marker label seconds;
             raise Fail (timeout_message label seconds)))
 
@@ -634,13 +710,13 @@ fun take_goals n goals =
 fun top_input_goals () = take_goals 1 (history_top_goals())
 
 fun compile_tactic label program =
-  if smlExecute.quse_string ("HolbuildProofRuntime.compiled_tactic_ref := (" ^ program ^ ");") then
+  if quse_string ("HolbuildProofRuntime.compiled_tactic_ref := (" ^ program ^ ");") then
     !compiled_tactic_ref
   else
     raise Fail ("tactic fragment did not compile: " ^ label)
 
 fun compile_list_tactic label program =
-  if smlExecute.quse_string ("HolbuildProofRuntime.compiled_list_tactic_ref := (" ^ program ^ ");") then
+  if quse_string ("HolbuildProofRuntime.compiled_list_tactic_ref := (" ^ program ^ ");") then
     !compiled_list_tactic_ref
   else
     raise Fail ("list tactic fragment did not compile: " ^ label)

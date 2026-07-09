@@ -1,4 +1,5 @@
 HOLDIR ?= $(HOLBUILD_HOLDIR)
+HOLBUILD_KEEP_TEST_LOGS ?=
 POLYC ?= polyc
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -28,7 +29,7 @@ uninstall:
 	rm -f "$(DESTDIR)$(BINDIR)/holbuild"
 
 test: bin/holbuild
-	HOLDIR="$(HOLDIR)" tests/run.sh $(TESTS)
+	HOLBUILD_KEEP_TEST_LOGS="$(HOLBUILD_KEEP_TEST_LOGS)" HOLDIR="$(HOLDIR)" tests/run.sh $(TESTS)
 
 clean:
 	rm -f bin/holbuild

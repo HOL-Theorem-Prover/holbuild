@@ -68,7 +68,14 @@ fi
 test_tmp_root=${TMPDIR:-"$ROOT/scratch/tmp"}
 mkdir -p "$test_tmp_root"
 log_dir=$(mktemp -d "$test_tmp_root/holbuild-test-logs.XXXXXX")
-cleanup() { rm -rf "$log_dir"; }
+keep_logs=${HOLBUILD_KEEP_TEST_LOGS:-}
+cleanup() {
+  if [[ -n "$keep_logs" && "$keep_logs" != 0 && "$keep_logs" != false ]]; then
+    echo "keeping holbuild test logs: $log_dir" >&2
+  else
+    rm -rf "$log_dir"
+  fi
+}
 trap cleanup EXIT
 
 declare -a running_pids=()

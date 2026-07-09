@@ -18,6 +18,16 @@ make_temp_dir() {
   mktemp -d "${TMPDIR:-/tmp}/holbuild-test.XXXXXX"
 }
 
+cleanup_temp_dir() {
+  local dir=$1
+  local keep=${HOLBUILD_KEEP_TEST_LOGS:-}
+  if [[ -n "$keep" && "$keep" != 0 && "$keep" != false ]]; then
+    echo "keeping holbuild test temp dir: $dir" >&2
+  else
+    rm -rf "$dir"
+  fi
+}
+
 holbuild_pinned_hol_rev() {
   tr -d '[:space:]' < "${HOLBUILD_ROOT:?HOLBUILD_ROOT not set}/vendor/hol/REV"
 }
