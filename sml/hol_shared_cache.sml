@@ -105,6 +105,8 @@ fun toolchains_dir () = Path.concat(cache_root (), "hol-toolchains")
 fun entry_dir_for_key k = Path.concat(toolchains_dir (), k)
 fun holdir_for_key k = Path.concat(entry_dir_for_key k, "hol")
 fun manifest_for_key k = Path.concat(entry_dir_for_key k, "manifest")
+fun hol_source_manifest_for_key k = Path.concat(entry_dir_for_key k, "hol-source.manifest.toml")
+fun hol_source_members_for_key k = Path.concat(entry_dir_for_key k, "hol-source.members")
 fun ok_for_key k = Path.concat(entry_dir_for_key k, "build.ok")
 fun analysers_dir_for_key k = Path.concat(entry_dir_for_key k, "analysers")
 fun analyser_dir_for_key k ak = Path.concat(analysers_dir_for_key k, ak)
@@ -118,6 +120,7 @@ fun lock_owner_path lock = lock ^ ".owner"
 datatype toolchain_lock = ToolchainLock of HolbuildFileLock.t
 
 fun holdir_for req = holdir_for_key (key req)
+fun hol_source_manifest_for_holdir holdir = Path.concat(Path.dir holdir, "hol-source.manifest.toml")
 
 fun built holdir =
   executable (Path.concat(holdir, "bin/hol")) andalso
@@ -136,6 +139,15 @@ fun require_build_sequence holdir =
           if readable path then ()
           else die ("selected HOL revision does not provide " ^ rel)
         end
+
+fun generate_hol_source_manifest k =
+  HolbuildHolSourceManifest.generate
+    {holdir = holdir_for_key k,
+     manifest_path = hol_source_manifest_for_key k,
+     members_path = hol_source_members_for_key k}
+  handle HolbuildHolSourceManifest.Error msg => die msg
+
+fun hol_source_manifest_built k = readable (hol_source_manifest_for_key k)
 
 fun validate_entry req k =
   let val dir = entry_dir_for_key k
@@ -275,6 +287,7 @@ fun build_entry req k =
        run_in_dir hol (quote (poly_command ()) ^ " --script tools/smart-configure.sml");
        run_in_dir hol ("bin/build " ^ HolbuildHolToolchainConfig.build_args_text toolchain_config);
        if built hol then () else die ("HOL build did not produce bin/hol, bin/build, and bin/hol.state in " ^ hol);
+       generate_hol_source_manifest k;
        if clean hol then () else die ("HOL build left dirty checkout: " ^ hol ^ "\n" ^ dirty_status hol);
        write_file (manifest_for_key k) (material ^ "\nkey=" ^ k ^ "\n");
        write_file (ok_for_key k) "ok\n";
@@ -289,11 +302,12 @@ fun ensure_built req =
     val k = HolbuildHash.string_sha1 material
     val ak = analyser_key ()
   in
-    if validate_entry req k andalso analyser_built k ak then holdir_for_key k
+    if validate_entry req k andalso hol_source_manifest_built k andalso analyser_built k ak then holdir_for_key k
     else
       let val l = acquire_lock k
       in
         ((if validate_entry req k then holdir_for_key k else build_entry req k;
+          if hol_source_manifest_built k then () else generate_hol_source_manifest k;
           ignore (build_analyser k);
           holdir_for_key k)
          before release_lock l)

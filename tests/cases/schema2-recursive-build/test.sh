@@ -20,6 +20,7 @@ git_identity "$hol"
 mkdir -p "$hol/bin" "$hol/tools" "$hol/tools/build" "$hol/tools/sequences" "$hol/src/post"
 cat > "$hol/.gitignore" <<'EOF_IGNORE'
 /bin/hol
+/bin/Holmake
 /bin/hol.state
 /sigobj
 /configured
@@ -48,6 +49,11 @@ cat > bin/hol <<'HOL'
 exit 0
 HOL
 chmod +x bin/hol
+cat > bin/Holmake <<'HOLMAKE'
+#!/usr/bin/env sh
+exit 0
+HOLMAKE
+chmod +x bin/Holmake
 echo fake-state > bin/hol.state
 SH
 chmod +x "$hol/bin/build"
