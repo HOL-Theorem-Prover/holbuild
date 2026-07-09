@@ -14,6 +14,7 @@ type node =
     external_dirs : string list }
 
 type keyed_node = {node : node, input_key : string}
+type keys = (string, string) Binarymap.dict
 
 fun source_of ({source, ...} : node) = source
 
@@ -806,9 +807,9 @@ fun bool_text true = "true"
 fun hash_text text = HolbuildHash.string_sha1 text
 
 fun lookup_key keys dep =
-  case List.find (fn (dep_key, _) => dep_key = key dep) keys of
-      SOME (_, input_key) => input_key
-    | NONE => raise Error ("missing action key for dependency: " ^ logical_name dep)
+  Binarymap.find (keys, key dep)
+  handle Binarymap.NotFound =>
+    raise Error ("missing action key for dependency: " ^ logical_name dep)
 
 fun action_text_with lookup config_lines_for_node toolchain_key external_key nodes keys node =
   let
@@ -867,7 +868,9 @@ fun action_text config_lines_for_node toolchain_key plan keys node =
   in action_text_with (lookup plan) config_lines_for_node toolchain_key external_key (universe_nodes plan) keys node end
 
 fun add_input_key_with lookup config_lines_for_node toolchain_key external_key nodes (node, keys) =
-  (key node, hash_text (action_text_with lookup config_lines_for_node toolchain_key external_key nodes keys node)) :: keys
+  Binarymap.insert
+    (keys, key node,
+     hash_text (action_text_with lookup config_lines_for_node toolchain_key external_key nodes keys node))
 
 fun add_input_key config_lines_for_node toolchain_key nodes (node, keys) =
   let val external_key = external_key_lookup toolchain_key
@@ -882,7 +885,7 @@ fun compute_input_keys_with lookup config_lines_for_node toolchain_key nodes =
       List.foldl
         (fn (node, keys) =>
             add_input_key_with lookup config_lines_for_node toolchain_key external_key nodes (node, keys))
-        [] nodes
+        (Binarymap.mkDict String.compare) nodes
     val _ = emit_external_timing external_timing
   in
     keys
