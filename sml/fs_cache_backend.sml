@@ -79,6 +79,23 @@ fun copy_binary src dst =
     handle e => (close_input (); close_output (); remove_file tmp; raise e)
   end
 
+fun link_or_copy {src, dst} =
+  let
+    val _ = ensure_parent dst
+    val tmp = temp_near dst
+    fun cleanup () = remove_file tmp
+    fun fallback () = (cleanup (); copy_binary src dst)
+    val command =
+      "cp --reflink=auto -- " ^ HolbuildHash.quote src ^ " " ^ HolbuildHash.quote tmp
+  in
+    if OS.Process.isSuccess (OS.Process.system command) then
+      (rename_replace {old = tmp, new = dst}
+       handle e => (cleanup (); raise e))
+    else fallback ()
+  end
+  handle Error msg => raise Error msg
+       | e => raise Error ("could not link or copy " ^ src ^ " to " ^ dst ^ ": " ^ General.exnMessage e)
+
 fun file_hash_matches path hash =
   path_exists path andalso HolbuildHash.file_sha1 path = hash
   handle _ => false
@@ -119,18 +136,18 @@ fun put_action cache policy {key, text} =
       | NONE => (write_action cache {key = key, text = text}; HolbuildCacheBackend.Published)
   end
 
-fun has_blob cache hash = file_hash_matches (blob_path cache hash) hash
+fun has_blob cache hash = path_exists (blob_path cache hash)
+
+fun verify_blob cache hash = file_hash_matches (blob_path cache hash) hash
 
 (* dst is a local filesystem path where the caller wants the blob materialized. *)
 fun fetch_blob cache {hash, dst} =
   let val blob = blob_path cache hash
   in
     if not (path_exists blob) then HolbuildCacheBackend.Miss
-    else if not (file_hash_matches blob hash) then HolbuildCacheBackend.Corrupt blob
     else
-      (copy_binary blob dst;
-       if file_hash_matches dst hash then HolbuildCacheBackend.Hit
-       else HolbuildCacheBackend.Corrupt dst)
+      (link_or_copy {src = blob, dst = dst};
+       HolbuildCacheBackend.Hit)
   end
   handle Error msg => HolbuildCacheBackend.Corrupt msg
        | e => HolbuildCacheBackend.Corrupt (General.exnMessage e)
@@ -142,7 +159,7 @@ fun publish_blob cache {hash, src} =
     if has_blob cache hash then HolbuildCacheBackend.AlreadyPresent
     else
       (copy_binary src blob;
-       if has_blob cache hash then HolbuildCacheBackend.Published
+       if path_exists blob then HolbuildCacheBackend.Published
        else HolbuildCacheBackend.Conflict blob)
   end
   handle Error msg => HolbuildCacheBackend.Conflict msg

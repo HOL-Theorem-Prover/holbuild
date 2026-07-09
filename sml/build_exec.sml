@@ -1640,11 +1640,25 @@ fun cache_conflict_warning cache_key manifest_path subject old_manifest new_mani
     warn ("cache entry already exists with different outputs for " ^ subject ^ ": " ^ cache_key ^
           "\n  existing cache entry: " ^ manifest_path)
 
-fun copy_blob root hash dst =
-  case HolbuildCache.fetch_blob root {hash = hash, dst = dst} of
-      HolbuildCacheBackend.Hit => ()
-    | HolbuildCacheBackend.Miss => raise Error ("cache blob missing: " ^ hash)
-    | HolbuildCacheBackend.Corrupt detail => raise Error ("cache blob missing or corrupt: " ^ hash ^ " (" ^ detail ^ ")")
+fun file_hash_matches path hash =
+  HolbuildHash.file_sha1 path = hash
+  handle _ => false
+
+fun copy_blob verify_cache root hash dst =
+  let
+    val _ =
+      if verify_cache andalso not (HolbuildCache.verify_blob root hash) then
+        raise Error ("cache blob missing or corrupt: " ^ hash)
+      else ()
+  in
+    case HolbuildCache.fetch_blob root {hash = hash, dst = dst} of
+        HolbuildCacheBackend.Hit =>
+          if verify_cache andalso not (file_hash_matches dst hash) then
+            raise Error ("cache blob materialized corrupt: " ^ hash)
+          else ()
+      | HolbuildCacheBackend.Miss => raise Error ("cache blob missing: " ^ hash)
+      | HolbuildCacheBackend.Corrupt detail => raise Error ("cache blob missing or corrupt: " ^ hash ^ " (" ^ detail ^ ")")
+  end
 
 fun fs_cache_source cache : HolbuildCacheTransfer.source =
   {get_action = HolbuildFSCacheBackend.get_action cache,
@@ -1927,7 +1941,7 @@ fun cache_key_role project plan node input_key cache_key =
     else "cache key"
   end
 
-fun materialize_theory_cache_key project plan input_key requested_timeout cache_key node =
+fun materialize_theory_cache_key verify_cache project plan input_key requested_timeout cache_key node =
   let
     val root = cache_root ()
     val manifest = HolbuildCache.action_manifest root cache_key
@@ -1951,11 +1965,11 @@ fun materialize_theory_cache_key project plan input_key requested_timeout cache_
                         timeout_text proof_timeout ^ ", requested " ^ timeout_text requested_timeout)
     val {sig_path, sml_path, data_path, ...} = theory_outputs node
     fun install () =
-      (copy_blob root dat_hash data_path;
-       copy_blob root dat_hash (hfs_remapped_path data_path);
-       copy_blob root sig_hash sig_path;
-       copy_blob root sig_hash (hfs_remapped_path sig_path);
-       copy_blob root sml_hash sml_path;
+      (copy_blob verify_cache root dat_hash data_path;
+       copy_blob verify_cache root dat_hash (hfs_remapped_path data_path);
+       copy_blob verify_cache root sig_hash sig_path;
+       copy_blob verify_cache root sig_hash (hfs_remapped_path sig_path);
+       copy_blob verify_cache root sml_hash sml_path;
        write_text sml_path (replace_all cache_sml_token data_path (read_text sml_path));
        write_text (hfs_remapped_path sml_path) (read_text sml_path);
        write_local_theory_manifests plan node {parents = parents, mldeps = mldeps};
@@ -1973,8 +1987,8 @@ fun materialize_theory_cache_key project plan input_key requested_timeout cache_
                warn ("cache entry unusable for " ^ logical_name node ^ ": " ^ General.exnMessage e);
                false)
 
-fun materialize_theory_cache _ project plan input_key requested_timeout node =
-  List.exists (fn cache_key => materialize_theory_cache_key project plan input_key requested_timeout cache_key node)
+fun materialize_theory_cache verify_cache project plan input_key requested_timeout node =
+  List.exists (fn cache_key => materialize_theory_cache_key verify_cache project plan input_key requested_timeout cache_key node)
               (theory_cache_keys project plan node input_key)
 
 fun metadata_path (project : HolbuildProject.t) node =
@@ -2309,7 +2323,7 @@ fun best_failed_prefix_checkpoint requested_timeout checkpoints =
 
 datatype force_level = ForceNone | ForceTargets | ForceProject | ForceAll
 
-type build_options = {use_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, proof_steps : bool, new_ir : bool, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool}
+type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, proof_steps : bool, new_ir : bool, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool}
 
 datatype checkpoint_policy =
   CheckpointPolicy of {checkpoint : bool, proof_steps : bool, new_ir : bool, tactic_timeout : real option, execution_plan : string option, trace_steps : bool, repl_on_failure : bool}
@@ -3307,7 +3321,7 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
     fun invalidate_node_dat_hash () =
       invalidate_cached_file_hash dat_hash_cache (#data_path (theory_outputs node))
     fun materialize_valid_cache () =
-      materialize_theory_cache tc project plan input_key (tactic_timeout policy) node andalso
+      materialize_theory_cache (#verify_cache options) project plan input_key (tactic_timeout policy) node andalso
       (if theory_parent_hashes_match dat_hash_cache plan node NONE then true
        else (remove_failed_cache_outputs project node; false))
   in

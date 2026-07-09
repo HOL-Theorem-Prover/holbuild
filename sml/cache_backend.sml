@@ -51,6 +51,10 @@ sig
   val action_manifest : t -> string -> string
   val blob_path : t -> string -> string
 
+  val copy_binary : string -> string -> unit
+  val link_or_copy : {src : string, dst : string} -> unit
+  val verify_blob : t -> string -> bool
+
   val ensure_layout : t -> unit
   val write_action : t -> {key : string, text : string} -> unit
   val remove_action : t -> string -> unit
