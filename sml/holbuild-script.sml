@@ -29,6 +29,8 @@ use_hol("src/portableML/poly/w64-SHA1.ML");
 use_hol("src/portableML/poly/ConcIsaLib.sml");
 use_hol("src/portableML/Redblackset.sig");
 use_hol("src/portableML/Redblackset.sml");
+use_hol("src/portableML/Redblackmap.sig");
+use_hol("src/portableML/Redblackmap.sml");
 
 use "vendor/sml-sha256/lib/from-string.sig";
 use "vendor/sml-sha256/lib/from-string.sml";

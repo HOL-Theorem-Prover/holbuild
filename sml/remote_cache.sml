@@ -7,7 +7,8 @@ structure FS = OS.FileSys
 exception Error of string
 
 type blob_entry = {sha1 : string, sha256 : string, size : string}
-datatype t = RemoteCache of {base_url : string, blobs : blob_entry list ref}
+type blob_map = (string, blob_entry) Redblackmap.dict
+datatype t = RemoteCache of {base_url : string, blobs : blob_map ref}
 
 val metadata_header = "holbuild-remote-cache-action-v1"
 val manifest_marker = "manifest-text-v1\n"
@@ -26,7 +27,10 @@ fun trim_trailing_slashes url =
     if n = 0 then url else String.substring(url, 0, n)
   end
 
-fun remote url = RemoteCache {base_url = trim_trailing_slashes url, blobs = ref []}
+fun empty_blob_map () = Redblackmap.mkDict String.compare
+
+fun remote url =
+  RemoteCache {base_url = trim_trailing_slashes url, blobs = ref (empty_blob_map ())}
 
 fun base_url (RemoteCache {base_url, ...}) = base_url
 fun blob_map (RemoteCache {blobs, ...}) = blobs
@@ -167,14 +171,14 @@ fun action_url cache key = base_url cache ^ "/ac/" ^ key
 fun cas_url cache sha256 = base_url cache ^ "/cas/" ^ sha256
 
 fun lookup_blob cache sha1 =
-  List.find (fn {sha1 = existing, ...} => existing = sha1) (!(blob_map cache))
+  Redblackmap.peek (!(blob_map cache), sha1)
 
 fun remember_blob cache entry =
   let
     val blobs = blob_map cache
     val {sha1, ...} = entry
   in
-    blobs := entry :: List.filter (fn {sha1 = existing, ...} => existing <> sha1) (!blobs)
+    blobs := Redblackmap.insert (!blobs, sha1, entry)
   end
 
 fun split_at_marker text =

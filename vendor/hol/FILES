@@ -18,3 +18,5 @@ src/portableML/poly/w64-SHA1.ML
 src/portableML/poly/ConcIsaLib.sml
 src/portableML/Redblackset.sig
 src/portableML/Redblackset.sml
+src/portableML/Redblackmap.sig
+src/portableML/Redblackmap.sml
