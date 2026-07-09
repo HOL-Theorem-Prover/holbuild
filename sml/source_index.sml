@@ -436,7 +436,7 @@ fun root_entries_for_package_root sources package root =
   else
     case List.filter (fn source => source_matches_root package source root) sources of
         [] => raise Error ("unknown build root: " ^ HolbuildProject.package_name package ^ ":" ^ root)
-      | [source] => [source_entry source]
+      | [source] => [(root, #logical_name source)]
       | _ => raise Error ("ambiguous build root: " ^ HolbuildProject.package_name package ^ ":" ^ root)
 
 fun roots_for_package sources package =

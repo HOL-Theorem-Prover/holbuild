@@ -28,10 +28,10 @@ name = "entry-timeouts"
 
 [build]
 members = ["src"]
-roots = ["src/AScript.sml", "src/BScript.sml"]
+roots = ["src/AScript", "src/BScript.sml"]
 
 [build.root_tactic_timeouts]
-"src/AScript.sml" = 0.1
+"src/AScript" = 0.1
 "src/BScript.sml" = 1.0
 TOML
 
@@ -72,7 +72,7 @@ val _ = export_theory();
 SML
 
 (cd "$project" && "$HOLBUILD_BIN" context) > "$tmpdir/context.log"
-require_grep "root tactic_timeout: src/AScript.sml = 0.1" "$tmpdir/context.log"
+require_grep "root tactic_timeout: src/AScript = 0.1" "$tmpdir/context.log"
 require_grep "root tactic_timeout: src/BScript.sml = 1" "$tmpdir/context.log"
 
 if (cd "$project" && "$HOLBUILD_BIN" build BTheory) > "$tmpdir/b.log" 2>&1; then
