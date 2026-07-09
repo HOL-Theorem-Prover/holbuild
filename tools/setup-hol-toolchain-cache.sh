@@ -48,7 +48,7 @@ key_material() {
   printf 'poly=%s\n' "$poly"
   printf 'poly_version=%s\n' "$poly_version"
   printf 'build_sequence=upto-hol\n'
-  printf 'build_args=--no-helpdocs --seq=upto-hol\n'
+  printf 'build_args=--no-helpdocs --seq=tools/sequences/upto-hol\n'
 }
 
 if valid_entry; then
@@ -72,7 +72,7 @@ if [[ ! -r "$holdir/tools/sequences/upto-hol" ]]; then
   exit 1
 fi
 (cd "$holdir" && "$poly" --script tools/smart-configure.sml) >&2
-(cd "$holdir" && bin/build --no-helpdocs --seq=upto-hol) >&2
+(cd "$holdir" && bin/build --no-helpdocs --seq=tools/sequences/upto-hol) >&2
 
 if ! [[ -x "$holdir/bin/hol" && -x "$holdir/bin/build" && -r "$holdir/bin/hol.state" ]]; then
   echo "HOL build did not produce bin/hol, bin/build, and bin/hol.state in $holdir" >&2

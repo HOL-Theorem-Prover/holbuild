@@ -32,7 +32,7 @@ printf 'fake upto-hol sequence\n' > "$hol/tools/sequences/upto-hol"
 cat > "$hol/bin/build" <<'SH'
 #!/usr/bin/env sh
 set -eu
-[ "$#" -eq 2 ] && [ "$1" = "--no-helpdocs" ] && [ "$2" = "--seq=upto-hol" ]
+[ "$#" -eq 2 ] && [ "$1" = "--no-helpdocs" ] && [ "$2" = "--seq=tools/sequences/upto-hol" ]
 touch built
 pwd > built-at
 cat > bin/hol <<'HOL'

@@ -9,7 +9,8 @@ exception Error of string
 val format_version = "holbuild-hol-toolchain-v1"
 val default_canonical_git = "https://github.com/HOL-Theorem-Prover/HOL.git"
 val build_sequence = "upto-hol"
-val build_args = "--no-helpdocs --seq=" ^ build_sequence
+val build_sequence_path = "tools/sequences/" ^ build_sequence
+val build_args = "--no-helpdocs --seq=" ^ build_sequence_path
 val analyser_format_version = "holbuild-hol-analyser-v1"
 val analyser_protocol_version = "1"
 val analyser_source_files =
