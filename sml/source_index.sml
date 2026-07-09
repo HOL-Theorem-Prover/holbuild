@@ -87,9 +87,8 @@ fun generated_theory_artifact file =
   has_suffix "Theory.sml" file orelse
   has_suffix "Theory.sig" file
 
-fun classify package source_root artifact_root policies abs_path =
+fun classify package artifact_root policies abs_path rel =
   let
-    val rel = relative_path source_root abs_path
     val file = filename rel
   in
     if generated_theory_artifact file then NONE
@@ -157,15 +156,14 @@ fun list_dir path =
 
 fun list_dir_if_readable path = list_dir path handle Error _ => []
 
-fun has_source_path path sources =
-  let val path = normalize_path path
-  in List.exists (fn source : source => normalize_path (#source_path source) = path) sources end
-
 fun scan_file package source_root artifact_root policies excludes exclude_globs path acc =
-  if excluded excludes exclude_globs (relative_path source_root path) then acc
-  else case classify package source_root artifact_root policies path of
+  let val rel = relative_path source_root path
+  in
+    if excluded excludes exclude_globs rel then acc
+    else case classify package artifact_root policies path rel of
       NONE => acc
-    | SOME source => if has_source_path path acc then acc else source :: acc
+    | SOME source => source :: acc
+  end
 
 fun scan_dir package source_root artifact_root policies excludes exclude_globs path acc =
   let
@@ -190,6 +188,35 @@ fun compare_source (a : source, b : source) =
       EQUAL => String.compare(#relative_path a, #relative_path b)
     | order => order
 
+fun split xs =
+  let
+    fun loop left right rest =
+      case rest of
+          [] => (left, right)
+        | [x] => (x :: left, right)
+        | x :: y :: zs => loop (x :: left) (y :: right) zs
+  in
+    loop [] [] xs
+  end
+
+fun merge compare left right =
+  case (left, right) of
+      ([], _) => right
+    | (_, []) => left
+    | (l :: ls, r :: rs) =>
+        if compare (l, r) <> GREATER then
+          l :: merge compare ls right
+        else
+          r :: merge compare left rs
+
+fun msort compare xs =
+  case xs of
+      [] => []
+    | [_] => xs
+    | _ =>
+      let val (left, right) = split xs
+      in merge compare (msort compare left) (msort compare right) end
+
 fun compatible_same_name (a : source) (b : source) =
   #package a = #package b andalso
   (case (#kind a, #kind b) of
@@ -197,31 +224,37 @@ fun compatible_same_name (a : source) (b : source) =
      | (Sig, Sml) => true
      | _ => false)
 
-fun by_logical sources =
+fun by_logical (sources : source list) =
   let
-    fun conflicts source other =
-      #logical_name source = #logical_name other andalso
-      not (compatible_same_name source other)
+    fun conflicts source other = not (compatible_same_name source other)
     fun insert (source, seen) =
-      case List.find (conflicts source) seen of
-          NONE => source :: seen
-        | SOME other =>
-            raise Error ("duplicate logical name " ^ #logical_name source ^ ": " ^
-                         #package other ^ ":" ^ #relative_path other ^ " and " ^
-                         #package source ^ ":" ^ #relative_path source)
+      case Binarymap.peek (seen, #logical_name source) of
+          NONE => Binarymap.insert (seen, #logical_name source, [source])
+        | SOME same_name =>
+          case List.find (conflicts source) same_name of
+              NONE => Binarymap.insert (seen, #logical_name source, source :: same_name)
+            | SOME other =>
+                raise Error ("duplicate logical name " ^ #logical_name source ^ ": " ^
+                             #package other ^ ":" ^ #relative_path other ^ " and " ^
+                             #package source ^ ":" ^ #relative_path source)
   in
-    ignore (List.foldl insert [] sources);
+    ignore (List.foldl insert (Binarymap.mkDict String.compare) sources);
     sources
   end
 
-fun insert_sorted source sources =
-  case sources of
-      [] => [source]
-    | x :: xs =>
-        if compare_source(source, x) = LESS then source :: sources
-        else x :: insert_sorted source xs
+fun dedup_sources sources =
+  let
+    fun insert (source : source, (seen, acc)) =
+      let val path = normalize_path (#source_path source)
+      in
+        if Redblackset.member (seen, path) then (seen, acc)
+        else (Redblackset.add (seen, path), source :: acc)
+      end
+  in
+    #2 (List.foldr insert (Redblackset.empty String.compare, []) sources)
+  end
 
-fun sort_sources sources = List.foldl (fn (source, acc) => insert_sorted source acc) [] sources
+fun sort_sources sources = msort compare_source sources
 
 fun validate_action_policies package_name policies sources =
   let
@@ -278,10 +311,11 @@ fun discover_package package acc =
 fun discover (project : HolbuildProject.t) =
   by_logical
     (sort_sources
-       (List.foldl
-          (fn (package, acc) => discover_package package acc)
-          []
-          (HolbuildProject.packages project)))
+       (dedup_sources
+          (List.foldl
+             (fn (package, acc) => discover_package package acc)
+             []
+             (HolbuildProject.packages project))))
 
 fun kind_string kind =
   case kind of
