@@ -3712,23 +3712,6 @@ fun build_serial dat_hash_cache status options tc project base_context plan keys
     loop (HolbuildBuildPlan.selected_nodes plan)
   end
 
-fun node_done done node = List.exists (fn k => k = HolbuildBuildPlan.key node) done
-
-fun deps_done plan done node =
-  List.all (node_done done) (HolbuildBuildPlan.direct_project_deps plan node)
-
-fun find_ready plan done pending =
-  let
-    fun loop prefix rest =
-      case rest of
-          [] => NONE
-        | node :: suffix =>
-            if deps_done plan done node then SOME (node, rev prefix @ suffix)
-            else loop (node :: prefix) suffix
-  in
-    loop [] pending
-  end
-
 fun build_error_message e =
   case e of
       Error msg => msg

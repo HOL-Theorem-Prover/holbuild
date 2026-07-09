@@ -476,16 +476,6 @@ fun cached_dependency_context_key plan node context_id =
 fun remember_dependency_context_key plan node context_id value =
   Array.update(!(dependency_context_key_cache plan), plan_node_id plan node, SOME (context_id, value))
 
-fun closure_external_theories plan node =
-  unique_strings
-    (List.concat (map (direct_external_theories plan)
-       (transitive_project_deps plan node @ [node])))
-
-fun closure_external_libs plan node =
-  unique_strings
-    (List.concat (map (direct_external_libs plan)
-       (transitive_project_deps plan node @ [node])))
-
 fun make_node external_dirs source =
   {key = #package source ^ "\000" ^ #relative_path source ^ "\000" ^ #logical_name source,
    source = source,
