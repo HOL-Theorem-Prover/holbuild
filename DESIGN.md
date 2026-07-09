@@ -266,6 +266,15 @@ glob filter for excluding tests, examples, or platform variants from a package
 boundary; neither setting adds search paths or changes dependency resolution. Generated theory artifacts matching
 `*Theory.sml` and `*Theory.sig` are ignored by source discovery by default.
 
+Build groups (`[build.groups.NAME]`, referenced as `@name` or via
+`[build].root_groups`) are phony-target grouping metadata. They expand only after
+`[[generate]]` outputs are current and source discovery has scanned the package,
+so group membership is just a set of ordinary discovered logical build nodes.
+Holbuild schedules those nodes directly and does not synthesize, load, or export
+an aggregate HOL theory for the group. This avoids the common aggregate-theory
+workaround for generated fixture suites, where a wide `Ancestors` theory exists
+only to pull the suite into the build but still pays HOL theory load/export costs.
+
 Standard theory convention:
 
 ```text
