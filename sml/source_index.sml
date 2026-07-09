@@ -137,6 +137,27 @@ fun path_excluded excludes rel =
 
 fun excluded excludes exclude_globs rel = path_excluded excludes rel orelse glob_excluded exclude_globs rel
 
+fun insert_unique_string (value, values) =
+  case values of
+      [] => [value]
+    | x :: xs =>
+        (case String.compare(value, x) of
+             LESS => value :: values
+           | EQUAL => values
+           | GREATER => x :: insert_unique_string (value, xs))
+
+fun sort_unique_strings values = List.foldl insert_unique_string [] values
+
+fun unique_strings values =
+  let
+    fun add (value, (seen, acc)) =
+      if List.exists (fn existing => existing = value) seen then (seen, acc)
+      else (value :: seen, value :: acc)
+    val (_, acc) = List.foldl add ([], []) values
+  in
+    rev acc
+  end
+
 fun skip_dir name = String.isPrefix "." name orelse name = "_build"
 
 fun contains_manifest path =
@@ -331,19 +352,84 @@ fun source_matches_root package (source : source) root =
   List.exists (fn rel => rel = #relative_path source)
     (root_candidate_paths (HolbuildProject.package_root package) root)
 
+fun group_members sources package group =
+  let
+    val package_name = HolbuildProject.package_name package
+    val group_name = HolbuildProject.group_name group
+    val includes = HolbuildProject.group_includes group
+    val include_globs = HolbuildProject.group_include_globs group
+    val excludes = HolbuildProject.group_excludes group
+    val exclude_globs = HolbuildProject.group_exclude_globs group
+    fun matches paths globs rel = excluded paths globs rel
+    fun source_member (source : source) =
+      let val rel = #relative_path source
+      in
+        #package source = package_name andalso
+        matches includes include_globs rel andalso
+        not (matches excludes exclude_globs rel)
+      end
+    val members =
+      sort_unique_strings
+        (map (fn source : source => #logical_name source)
+             (List.filter source_member sources))
+  in
+    case members of
+        [] =>
+          if HolbuildProject.group_allow_empty group then []
+          else raise Error ("group " ^ package_name ^ ":" ^ group_name ^ " matched no sources")
+      | _ => members
+  end
+
+fun lookup_group package name =
+  case List.find (fn group => HolbuildProject.group_name group = name)
+                 (HolbuildProject.package_groups package) of
+      SOME group => group
+    | NONE => raise Error ("unknown group: " ^ HolbuildProject.package_name package ^ ":" ^ name)
+
+fun resolve_group_ref sources package name = group_members sources package (lookup_group package name)
+
+fun group_token_name token =
+  let val name = String.extract(token, 1, NONE)
+  in
+    if HolbuildProject.valid_group_name name then name
+    else raise Error ("invalid group reference \"" ^ token ^ "\"")
+  end
+
+fun is_group_token token = size token > 0 andalso String.sub(token, 0) = #"@"
+
+fun expand_group_tokens sources package tokens =
+  sort_unique_strings
+    (List.concat
+       (map (fn token =>
+               if is_group_token token then resolve_group_ref sources package (group_token_name token)
+               else [token])
+            tokens))
+
+fun root_for_package sources package root =
+  if is_group_token root then resolve_group_ref sources package (group_token_name root)
+  else
+    case List.filter (fn source => source_matches_root package source root) sources of
+        [] => raise Error ("unknown build root: " ^ HolbuildProject.package_name package ^ ":" ^ root)
+      | [source] => [#logical_name source]
+      | _ => raise Error ("ambiguous build root: " ^ HolbuildProject.package_name package ^ ":" ^ root)
+
 fun roots_for_package sources package =
-  map
-    (fn root =>
-       case List.filter (fn source => source_matches_root package source root) sources of
-           [] => raise Error ("unknown build root: " ^ HolbuildProject.package_name package ^ ":" ^ root)
-         | [source] => #logical_name source
-         | _ => raise Error ("ambiguous build root: " ^ HolbuildProject.package_name package ^ ":" ^ root))
-    (HolbuildProject.package_roots package)
+  List.concat (map (root_for_package sources package) (HolbuildProject.package_roots package))
+
+fun root_groups_for_package sources package =
+  List.concat (map (resolve_group_ref sources package) (HolbuildProject.package_root_groups package))
+
+fun default_package_targets sources package =
+  roots_for_package sources package @ root_groups_for_package sources package
+
+fun package_has_default_targets package =
+  not (null (HolbuildProject.package_roots package)) orelse
+  not (null (HolbuildProject.package_root_groups package))
 
 fun default_targets sources project =
-  List.concat
-    (map (roots_for_package sources)
-         (List.filter (fn package => not (null (HolbuildProject.package_roots package)))
-                      (HolbuildProject.packages project)))
+  unique_strings
+    (List.concat
+       (map (default_package_targets sources)
+            (List.filter package_has_default_targets (HolbuildProject.packages project))))
 
 end
