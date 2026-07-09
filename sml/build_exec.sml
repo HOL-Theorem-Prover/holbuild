@@ -3731,6 +3731,7 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
     val remaining_deps = Array.array (node_count, 0)
     val dependents = Array.array (node_count, [] : int list)
     val ready = ref ([] : int list)
+    val priority_ready_count = ref 0
     val mutex = Mutex.mutex ()
     val cv = ConditionVar.conditionVar ()
     val running = ref 0
@@ -3776,7 +3777,21 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
 
     val _ = precompute_protected_bases 0
 
-    fun add_ready id = ready := id :: !ready
+    fun failed_prefix_priority_node id =
+      case Array.sub (failed_prefix_priority, id) of
+          SOME value => value
+        | NONE =>
+            let val value =
+                  failed_prefix_priority_enabled andalso
+                  (node_has_failed_prefix_checkpoint project (Vector.sub (nodes, id))
+                   handle _ => false)
+            in Array.update (failed_prefix_priority, id, SOME value); value end
+
+    fun add_ready id =
+      (if failed_prefix_priority_node id then
+         priority_ready_count := !priority_ready_count + 1
+       else ();
+       ready := id :: !ready)
 
     fun register_node (id, node) =
       let val deps = HolbuildBuildPlan.direct_project_deps plan node
@@ -3830,16 +3845,6 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
     fun lock () = Mutex.lock mutex
     fun unlock () = Mutex.unlock mutex
 
-    fun failed_prefix_priority_node id =
-      case Array.sub (failed_prefix_priority, id) of
-          SOME value => value
-        | NONE =>
-            let val value =
-                  failed_prefix_priority_enabled andalso
-                  (node_has_failed_prefix_checkpoint project (Vector.sub (nodes, id))
-                   handle _ => false)
-            in Array.update (failed_prefix_priority, id, SOME value); value end
-
     fun pop_matching_ready matches prefix rest =
       case rest of
           [] => NONE
@@ -3849,6 +3854,9 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
 
     fun priority_focus_node id = Array.sub (priority_focus, id)
 
+    fun note_ready_pop priority =
+      if priority then priority_ready_count := !priority_ready_count - 1 else ()
+
     fun pop_ready () =
       case !ready of
           [] => NONE
@@ -3856,15 +3864,24 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
             if !priority_mode andalso !priority_focus_remaining > 0 then
               (case pop_matching_ready priority_focus_node [] (id :: rest) of
                    SOME (focus_id, remaining) =>
-                     (ready := remaining; SOME (focus_id, failed_prefix_priority_node focus_id))
+                     let val priority = failed_prefix_priority_node focus_id
+                     in
+                       ready := remaining;
+                       note_ready_pop priority;
+                       SOME (focus_id, priority)
+                     end
                  | NONE => NONE)
             else
               (priority_mode := false;
-               case pop_matching_ready failed_prefix_priority_node [] (id :: rest) of
-                   SOME (priority_id, remaining) => (ready := remaining; SOME (priority_id, true))
-                 | NONE =>
-                     if !priority_running > 0 then NONE
-                     else (ready := rest; SOME (id, false)))
+               if !priority_ready_count > 0 then
+                 case pop_matching_ready failed_prefix_priority_node [] (id :: rest) of
+                     SOME (priority_id, remaining) =>
+                       (ready := remaining; note_ready_pop true; SOME (priority_id, true))
+                   | NONE =>
+                       if !priority_running > 0 then NONE
+                       else (ready := rest; SOME (id, false))
+               else if !priority_running > 0 then NONE
+               else (ready := rest; SOME (id, false)))
 
     fun next_work_locked () =
       case !failure of
