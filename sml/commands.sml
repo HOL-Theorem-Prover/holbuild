@@ -682,7 +682,9 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
         val _ = reject_object_targets targets
         val plan = timed_phase "build.plan" (fn () => HolbuildBuildPlan.plan (#holdir tc) index targets)
         val entry_targets = map #2 (HolbuildTacticTimeoutPolicy.declared_entries project index)
-        val entry_plan = timed_phase "entry_timeout.plan" (fn () => HolbuildBuildPlan.plan (#holdir tc) index entry_targets)
+        val entry_plan =
+          if null requested_targets then plan
+          else timed_phase "entry_timeout.plan" (fn () => HolbuildBuildPlan.plan (#holdir tc) index entry_targets)
         val _ = if warn_unreachable andalso null requested_targets andalso not (null targets) then
                   warn_unreachable_root_scripts project index plan
                 else ()
