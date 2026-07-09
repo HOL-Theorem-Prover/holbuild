@@ -110,12 +110,31 @@ git = "https://github.com/HOL-Theorem-Prover/HOL.git"
 rev = "0123456789abcdef0123456789abcdef01234567"
 ```
 
-That revision is the HOL toolchain used to analyse and build the project.
+That revision is the HOL checkout used to analyse and build the project.
 `holbuild` builds or reuses it under:
 
 ```text
 $HOLBUILD_CACHE/hol-toolchains/<key>/hol
 ```
+
+For schema 2 projects, the shared HOL toolchain is warmed with HOL's reduced
+`upto-hol` build sequence rather than a full default HOL build:
+
+```sh
+bin/build --no-helpdocs --seq=tools/sequences/upto-hol
+```
+
+This produces the standard HOL executable, `hol.state`, Holmake, and the base
+`sigobj` context needed by normal project builds. Source directories that would
+be reached by HOL's default build after this reduced toolchain sequence are
+exposed as an implicit package named `hol` and built by holbuild on demand. The
+generated implicit HOL source manifest is cached next to the shared toolchain as
+`hol-source.manifest.toml` with a companion `hol-source.members` file.
+
+While HOL issue https://github.com/HOL-Theorem-Prover/HOL/issues/2021 remains
+unfixed, holbuild uses a narrow temporary parser for Holmake `--json` target
+lines when generating that manifest. This is intended to be replaced by proper
+JSON parsing once the pinned HOL revision provides valid Holmake JSON output.
 
 `--cache-dir PATH` overrides the global cache location for a command.
 `HOLBUILD_CACHE` defaults to the platform cache directory, normally:
