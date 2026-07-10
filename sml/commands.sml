@@ -287,12 +287,18 @@ fun reject_object_target target =
 
 fun reject_object_targets targets = List.app reject_object_target targets
 
+fun project_has_default_targets project =
+  List.exists HolbuildSourceIndex.package_has_default_targets (HolbuildProject.packages project)
+
 fun default_build_targets project index targets =
-  if not (null targets) then targets
+  if null targets then HolbuildSourceIndex.default_targets index project
+  else HolbuildSourceIndex.expand_group_tokens index (HolbuildProject.project_package project) targets
+
+fun build_target_plan holdir project index requested_targets targets =
+  if null requested_targets andalso null targets andalso not (project_has_default_targets project) then
+    HolbuildBuildPlan.plan_targets holdir index (HolbuildSourceIndex.root_package_targets index project)
   else
-    case HolbuildSourceIndex.default_targets index project of
-        [] => HolbuildSourceIndex.root_package_targets index project
-      | default_targets => default_targets
+    HolbuildBuildPlan.plan_targets holdir index targets
 
 fun source_key source =
   #package source ^ "\000" ^ #relative_path source ^ "\000" ^ #logical_name source
@@ -300,9 +306,14 @@ fun source_key source =
 fun key_member key keys = List.exists (fn k => k = key) keys
 
 fun rooted_package_names project =
-  map HolbuildProject.package_name
-    (List.filter (fn package => not (null (HolbuildProject.package_roots package)))
-                 (HolbuildProject.packages project))
+  let
+    fun has_rooted_targets package =
+      not (null (HolbuildProject.package_roots package)) orelse
+      not (null (HolbuildProject.package_root_groups package))
+  in
+    map HolbuildProject.package_name
+      (List.filter has_rooted_targets (HolbuildProject.packages project))
+  end
 
 fun root_warning_source rooted_packages built_keys source =
   #kind source = HolbuildSourceIndex.TheoryScript andalso
@@ -684,10 +695,10 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
         val requested_targets = targets
         val targets = timed_phase "targets.default" (fn () => default_build_targets project index requested_targets)
         val _ = reject_object_targets targets
-        val plan = timed_phase "build.plan" (fn () => HolbuildBuildPlan.plan (#holdir tc) index targets)
+        val plan = timed_phase "build.plan" (fn () => build_target_plan (#holdir tc) project index requested_targets targets)
         val entry_targets = map #2 (HolbuildTacticTimeoutPolicy.declared_entries project index)
-        val entry_plan = timed_phase "entry_timeout.plan" (fn () => HolbuildBuildPlan.plan (#holdir tc) index entry_targets)
-        val _ = if warn_unreachable andalso null requested_targets andalso not (null targets) then
+        val entry_plan = timed_phase "entry_timeout.plan" (fn () => HolbuildBuildPlan.plan_targets (#holdir tc) index entry_targets)
+        val _ = if warn_unreachable andalso null requested_targets then
                   warn_unreachable_root_scripts project index plan
                 else ()
         val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
@@ -1013,15 +1024,15 @@ fun write_export_metadata {path, archive_path, targets, action_count, metadata} 
 
 fun export_archive tc jobs args =
   let
-    val ExportArgs {build_first, output, metadata_out, targets} = parse_export_args args
-    val _ = if build_first then build tc jobs targets else ()
+    val ExportArgs {build_first, output, metadata_out, targets = requested_targets} = parse_export_args args
+    val _ = if build_first then build tc jobs requested_targets else ()
     val project = timed_phase "project.discover" load_project
     val index = timed_phase "source.discover" (fn () => HolbuildSourceIndex.discover project)
-    val targets = timed_phase "targets.default" (fn () => default_build_targets project index targets)
+    val targets = timed_phase "targets.default" (fn () => default_build_targets project index requested_targets)
     val _ = reject_object_targets targets
-    val plan = timed_phase "build.plan" (fn () => HolbuildBuildPlan.plan (#holdir tc) index targets)
+    val plan = timed_phase "build.plan" (fn () => build_target_plan (#holdir tc) project index requested_targets targets)
     val entry_targets = map #2 (HolbuildTacticTimeoutPolicy.declared_entries project index)
-    val entry_plan = timed_phase "entry_timeout.plan" (fn () => HolbuildBuildPlan.plan (#holdir tc) index entry_targets)
+    val entry_plan = timed_phase "entry_timeout.plan" (fn () => HolbuildBuildPlan.plan_targets (#holdir tc) index entry_targets)
     val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
     val options = export_build_options project index entry_plan plan
     val keys = HolbuildBuildPlan.input_keys (HolbuildBuildExec.build_config_lines_for_node options project) toolchain_key plan
@@ -1085,7 +1096,7 @@ fun clean_targets args =
     fun execute_clean () =
       let
         val index = timed_phase "source.discover" (fn () => HolbuildSourceIndex.discover project)
-        val plan = timed_phase "build.plan" (fn () => HolbuildBuildPlan.plan "" index args)
+        val plan = timed_phase "build.plan" (fn () => HolbuildBuildPlan.plan_targets "" index args)
         fun target_nodes target =
           case HolbuildBuildPlan.lookup plan target of
               [] => raise Error ("unknown clean target: " ^ target)
@@ -1131,9 +1142,10 @@ fun build_heap_kind tc cli_jobs command target =
     fun execute_heap () =
       let
         val HolbuildProject.Heap {output, objects, kind, ...} = heap_named project command target
-        val _ = if null objects then raise Error (command ^ " target has no objects: " ^ target) else ()
         val index = timed_phase "source.discover" (fn () => HolbuildSourceIndex.discover project)
-        val plan = timed_phase "build.plan" (fn () => HolbuildBuildPlan.plan (#holdir tc) index objects)
+        val objects = HolbuildSourceIndex.expand_group_tokens index (HolbuildProject.project_package project) objects
+        val _ = if null objects then raise Error (command ^ " target has no objects: " ^ target) else ()
+        val plan = timed_phase "build.plan" (fn () => HolbuildBuildPlan.plan_targets (#holdir tc) index objects)
         val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
         val output_path = HolbuildProject.abs_under (#root project) output
       in

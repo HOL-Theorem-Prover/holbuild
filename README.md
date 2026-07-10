@@ -292,11 +292,19 @@ Current dependency limits:
 
 ```toml
 [build]
-members = ["src", "lib"]
+members = ["src", "lib", "gen"]
 exclude = ["src/generated", "src/OneOff.sml"]
 exclude_globs = ["*/selftest.sml", "*/examples/*"]
 roots = ["src/MainScript.sml"]
+root_groups = ["@generated"]
 tactic_timeout = 10.0
+
+[build.groups.generated]
+include = ["gen/fixtures"]
+include_globs = ["gen/*Script.sml"]
+exclude = ["gen/fixtures/known-broken"]
+exclude_globs = ["gen/*ExperimentalScript.sml"]
+allow_empty = false
 
 [build.root_tactic_timeouts]
 "src/SlowScript.sml" = 60.0
@@ -309,15 +317,32 @@ tactic_timeout = 10.0
   directory entry excludes its subtree, and a file entry excludes just that file.
 - `exclude_globs` removes package-root-relative glob matches from discovery.
   Deprecated glob patterns in `exclude` are still accepted with a warning.
-- `roots` are package-root-relative source paths used as the default entry
-  points when `holbuild build` is run with no target. Each root must name a
-  source discovered through `members` and not removed by `exclude` or
-  `exclude_globs`; the `.sml` suffix may be omitted. If no package in the
-  dependency graph declares roots, `holbuild build` defaults to all discovered
-  sources in the root project package only. Dependency packages, including the
-  implicit `hol` package, are not default-built merely because they have
-  members. Use `holbuild build --warn-unreachable` to report discoverable theory
-  scripts that are outside the root dependency closure.
+- `roots` are the default entry points when `holbuild build` is run with no
+  target. Entries may be package-root-relative source paths or `@name` build
+  group references. Source-path roots must name sources discovered through
+  `members` and not removed by `exclude` or `exclude_globs`; the `.sml` suffix
+  may be omitted. If no package in the dependency graph declares roots or root
+  groups, `holbuild build` defaults to all discovered sources in the root project
+  package only. Dependency packages, including the implicit `hol` package, are
+  not default-built merely because they have members. Use `holbuild build
+  --warn-unreachable` to report discoverable theory scripts that are outside the
+  root dependency closure.
+- `root_groups` adds build groups to the default build. Group names may use the
+  uniform `@name` form (`"@generated"`) or the bare form (`"generated"`).
+- `[build.groups.NAME]` defines a build-system-only group; `NAME` is the group
+  name used by `@NAME`. `include` and
+  `exclude` are concrete package-root-relative paths; a directory entry matches
+  its whole subtree. `include_globs` and `exclude_globs` use the same glob
+  dialect as `build.exclude_globs`: `*` and `?` only, `*` crosses `/`, no `**`,
+  and no character classes. `allow_empty` is optional and defaults to `false`.
+- `@name` is the group-reference syntax (`@` followed by a group name) accepted
+  by `holbuild build @name`, `[build].roots`, `[build].root_groups`,
+  `[[heap]].objects`, and `[[executable]].objects`. It is not accepted in
+  `[actions.*].deps` or `[actions.*].loads`, which remain real dependency/load
+  edges.
+- A build group has phony-target semantics: it expands after generation and
+  source discovery into ordinary logical targets, builds those targets only, and
+  creates no aggregate HOL theory to load or export.
 - `tactic_timeout` sets the default root-project proof-step timeout in seconds.
   The built-in default is `2.5`; `0` disables the timeout.
 - `root_tactic_timeouts` lets individual root source files set timeout contracts

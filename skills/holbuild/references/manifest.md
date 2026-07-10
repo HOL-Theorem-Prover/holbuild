@@ -18,11 +18,19 @@ git = "https://github.com/HOL-Theorem-Prover/HOL.git"
 rev = "<exact-40-character-commit>"
 
 [build]
-members = ["src", "lib"]   # source dirs/files relative to package root. Default: ["."]
+members = ["src", "lib", "gen"]   # source dirs/files relative to package root. Default: ["."]
 exclude = ["src/generated", "src/OneOff.sml"]  # concrete package-relative paths/subtrees
 exclude_globs = ["*/selftest.sml", "*/examples/*"]  # glob patterns, package-root-relative
-roots = ["src/MainScript.sml"]  # default build roots when no CLI target given; use build --warn-unreachable to audit omitted scripts
+roots = ["src/MainScript.sml"]  # default roots; @name refs build groups are also accepted
+root_groups = ["@generated"]  # additional default build groups; bare names also accepted
 tactic_timeout = 60.0            # root-package per-step timeout; CLI/local config override
+
+[build.groups.generated]
+include = ["gen/fixtures"]       # concrete package-relative paths/subtrees
+include_globs = ["gen/*Script.sml"]
+exclude = ["gen/fixtures/known-broken"]
+exclude_globs = ["gen/*ExperimentalScript.sml"]
+allow_empty = false              # optional; default false
 
 [dependencies.depname]
 git = "https://github.com/org/dep"
@@ -47,7 +55,7 @@ deps = []  # optional names of earlier [[generate]] steps
 [[heap]]
 name = "main"
 output = "build/main.heap"  # heap output path, package-root-relative
-objects = ["MainTheory"]    # logical targets to build before saving heap
+objects = ["MainTheory", "@generated"]  # logical targets/groups to build before saving heap
 
 [actions.TargetName]
 deps = ["OtherTheory"]            # extra logical project dependencies
@@ -64,7 +72,7 @@ Unknown fields in recognized tables are **errors**, not silently ignored. This c
 
 `[holbuild].minimum_version` (or its alias `[holbuild].required_version`), when present, must be a semantic version `MAJOR.MINOR.PATCH` and requires the running holbuild version to be at least that version. Set only one of them.
 
-Tables validated: `[holbuild]`, `[project]`, `[build]`, `[run]`, `[dependencies.*]`, `[actions.*]`, `[[generate]]`, `[[heap]]`.
+Tables validated: `[holbuild]`, `[project]`, `[build]` (including `root_groups` and `groups`), `[build.groups.*]`, `[run]`, `[dependencies.*]`, `[actions.*]`, `[[generate]]`, `[[heap]]`, `[[executable]]`.
 
 ## Dependency resolution
 
@@ -95,7 +103,7 @@ Unsupported: schema 1, `[dependencies.HOLDIR]`, manifest path dependencies, depe
 
 ## Path rules
 
-- `build.members`, `build.exclude`, `build.exclude_globs`, `build.roots`, `actions.*.extra_deps`, `generate.*.inputs`, `generate.*.outputs` — **package-root-relative**
+- `build.members`, `build.exclude`, `build.exclude_globs`, `build.roots`, `build.groups.*.include`, `build.groups.*.include_globs`, `build.groups.*.exclude`, `build.groups.*.exclude_globs`, `actions.*.extra_deps`, `generate.*.inputs`, `generate.*.outputs` — **package-root-relative**
 - Absolute paths and `..` components are rejected in those package-relative fields
 - `dependencies.*.path` and `dependencies.*.manifest` are allowed only in `from/path/manifest` dependencies
 - `from` dependency `path` and `manifest` fields must be relative and contain no `..`
@@ -116,6 +124,32 @@ Recognized source files:
 - `*.sig` → signature, logical name = filename minus `.sig`
 
 A `.sig`/`.sml` pair with the same base name in the same package is one SML module interface/implementation pair, not a conflict.
+
+## Build groups
+
+Build groups are phony-target grouping metadata. After `[[generate]]` steps run and source discovery has indexed the package, a group expands to the matching discovered sources' logical targets. The group itself creates no aggregate HOL theory, generated theory artifact, load, or export.
+
+```toml
+[build]
+roots = ["src/MainScript.sml"]
+root_groups = ["@generated"]
+
+[build.groups.generated]
+include = ["gen/fixtures"]
+include_globs = ["gen/*Script.sml"]
+exclude = ["gen/fixtures/known-broken"]
+exclude_globs = ["gen/*ExperimentalScript.sml"]
+allow_empty = false
+```
+
+Group names are the table names under `[build.groups]` and are referenced as `@NAME`.
+
+Fields:
+- `include`, `exclude`: concrete package-root-relative paths. A directory entry matches its whole subtree.
+- `include_globs`, `exclude_globs`: package-root-relative glob patterns using the same dialect as `build.exclude_globs` (`*`/`?` only; `*` crosses `/`; no `**`; no character classes).
+- `allow_empty`: optional boolean, default `false`; when false, a referenced group that matches no sources is an error.
+
+A `@name` token (`@` followed by a group name) references a group. It is accepted by CLI build targets (`holbuild build @generated`), `[build].roots`, `[build].root_groups` (bare names are also accepted there), `[[heap]].objects`, and `[[executable]].objects`. It is not accepted in `[actions.*].deps` or `[actions.*].loads`, which remain real dependency/load edges.
 
 ## HOLSource headers
 
