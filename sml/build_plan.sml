@@ -167,7 +167,7 @@ fun indexed_key_id index node_key =
 
 fun target_roots lookup nodes targets =
   case targets of
-      [] => nodes
+      [] => []
     | _ =>
       let
         fun find target =

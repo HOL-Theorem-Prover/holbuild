@@ -302,13 +302,21 @@ tactic_timeout = 10.0
 "src/SlowScript.sml" = 60.0
 ```
 
-- `members` tells `holbuild` where to discover source files.
+- `members` tells `holbuild` where to discover source files. Membership makes a
+  source available as a logical target and as a dependency of other targets, but
+  does not by itself make the source part of the default build.
 - `exclude` removes concrete package-root-relative paths from discovery; a
   directory entry excludes its subtree, and a file entry excludes just that file.
 - `exclude_globs` removes package-root-relative glob matches from discovery.
   Deprecated glob patterns in `exclude` are still accepted with a warning.
-- `roots` are the default entry points when `holbuild build` is run with no
-  target. Use `holbuild build --warn-unreachable` to report discoverable theory
+- `roots` are package-root-relative source paths used as the default entry
+  points when `holbuild build` is run with no target. Each root must name a
+  source discovered through `members` and not removed by `exclude` or
+  `exclude_globs`; the `.sml` suffix may be omitted. If no package in the
+  dependency graph declares roots, `holbuild build` defaults to all discovered
+  sources in the root project package only. Dependency packages, including the
+  implicit `hol` package, are not default-built merely because they have
+  members. Use `holbuild build --warn-unreachable` to report discoverable theory
   scripts that are outside the root dependency closure.
 - `tactic_timeout` sets the default root-project proof-step timeout in seconds.
   The built-in default is `2.5`; `0` disables the timeout.
