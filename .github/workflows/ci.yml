@@ -52,17 +52,17 @@ jobs:
         run: |
           tmp=$(mktemp -d)
           trap 'rm -rf "$tmp"' EXIT
-          cat > "$tmp/holproject.toml" <<EOF
-[holbuild]
-schema = 2
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "${{ steps.hol4-pin.outputs.hol4-ref }}"
-
-[project]
-name = "ci-toolchain"
-EOF
+          {
+            echo '[holbuild]'
+            echo 'schema = 2'
+            echo
+            echo '[dependencies.hol]'
+            echo 'git = "https://github.com/HOL-Theorem-Prover/HOL.git"'
+            echo 'rev = "${{ steps.hol4-pin.outputs.hol4-ref }}"'
+            echo
+            echo '[project]'
+            echo 'name = "ci-toolchain"'
+          } > "$tmp/holproject.toml"
           holdir=$(cd "$tmp" && "$GITHUB_WORKSPACE/bin/holbuild" buildhol | tail -n 1)
           echo "HOLDIR=$holdir" >> "$GITHUB_ENV"
 
