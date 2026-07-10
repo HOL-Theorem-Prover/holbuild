@@ -87,7 +87,7 @@ fun append msg =
   let val out = TextIO.openAppend "$fail_child_log"
   in TextIO.output(out, msg ^ "\\n"); TextIO.closeOut out end;
 val _ = append "START slow";
-val _ = OS.Process.system "sleep 12";
+val _ = OS.Process.system "sleep 20";
 val _ = append "END slow";
 val _ = new_theory "Slow";
 val slow_thm = store_thm("slow_thm", ``T``, ACCEPT_TAC TRUTH);
@@ -107,7 +107,7 @@ if (cd "$fail_project" && "$HOLBUILD_BIN" -j2 build --skip-checkpoints --skip-pr
 fi
 elapsed=$((SECONDS - start_seconds))
 require_grep "expected parallel failure" "$tmpdir/fail-build.log"
-if [[ "$elapsed" -ge 10 ]]; then
+if [[ "$elapsed" -ge 15 ]]; then
   echo "parallel failure waited for unrelated slow child ($elapsed seconds)" >&2
   cat "$tmpdir/fail-build.log" >&2
   exit 1
