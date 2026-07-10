@@ -27,6 +27,7 @@ name = "dependency-cache"
 
 [build]
 members = ["src"]
+roots = ["src/AScript.sml"]
 TOML
 cat > "$project/src/AScript.sml" <<'SML'
 Theory A
