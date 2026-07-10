@@ -165,10 +165,12 @@ fun indexed_key_id index node_key =
     search 0 (Vector.length index - 1)
   end
 
-fun target_roots lookup nodes targets =
-  case targets of
-      [] => nodes
-    | _ =>
+datatype target_selection = AllTargets | SelectedTargets of string list
+
+fun target_roots lookup nodes selection =
+  case selection of
+      AllTargets => nodes
+    | SelectedTargets targets =>
       let
         fun find target =
           case lookup target of
@@ -438,7 +440,7 @@ fun make_node external_dirs source =
    source_hash = ref NONE,
    external_dirs = external_dirs}
 
-fun plan holdir sources targets =
+fun plan_selection holdir sources selection =
   let
     val _ = if holdir = "" then HolbuildDependencies.clear_analyser_path ()
             else HolbuildDependencies.set_analyser_path (HolbuildHolSharedCache.analyser_path_for_holdir holdir)
@@ -450,13 +452,21 @@ fun plan holdir sources targets =
                                 source_hash = source_hash_of node}) nodes)
     val index = build_name_index nodes
     val lookup = indexed_nodes_named index
-    val roots = target_roots lookup nodes targets
+    val roots = target_roots lookup nodes selection
     val selected = topo_sort_with lookup nodes roots
     val direct_project_deps_cache = build_direct_project_deps_cache_with lookup selected
   in
     {universe = nodes, selected = selected, name_index = index,
      direct_project_deps_cache = direct_project_deps_cache}
   end
+
+fun plan_all holdir sources = plan_selection holdir sources AllTargets
+
+fun plan_targets holdir sources targets = plan_selection holdir sources (SelectedTargets targets)
+
+fun plan holdir sources targets =
+  if null targets then plan_all holdir sources
+  else plan_targets holdir sources targets
 
 fun kind_name source = HolbuildSourceIndex.kind_string (#kind source)
 
