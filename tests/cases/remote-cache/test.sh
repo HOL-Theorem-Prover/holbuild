@@ -30,6 +30,7 @@ import urllib.parse
 
 root = pathlib.Path(sys.argv[1]).resolve()
 port_file = pathlib.Path(sys.argv[2])
+request_log = pathlib.Path(sys.argv[3])
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def object_path(self):
@@ -49,7 +50,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def accepts_zstd(self):
         return 'zstd' in self.headers.get('Accept-Encoding', '')
 
+    def log_request_path(self):
+        with request_log.open('a') as log:
+            log.write(urllib.parse.urlparse(self.path).path + '\n')
+
     def do_GET(self):
+        self.log_request_path()
         path = self.object_path()
         if path is None:
             return
@@ -69,6 +75,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_PUT(self):
+        self.log_request_path()
         path = self.object_path()
         if path is None:
             return
@@ -94,8 +101,9 @@ start_server() {
   local root=$1
   local script=$tmpdir/server.py
   local port_file=$tmpdir/server.port
+  request_log=$tmpdir/request-paths.log
   write_server "$script"
-  python3 "$script" "$root" "$port_file" &
+  python3 "$script" "$root" "$port_file" "$request_log" &
   server_pid=$!
   for _ in {1..50}; do
     [[ -s "$port_file" ]] && break
@@ -126,6 +134,26 @@ Proof
   simp[]
 QED
 SML
+}
+
+assert_server_action_paths() {
+  python3 - "$request_log" <<'PY'
+import pathlib
+import re
+import sys
+
+paths = pathlib.Path(sys.argv[1]).read_text().splitlines()
+action_paths = [path for path in paths if path.startswith("/ac/")]
+if not action_paths:
+    raise SystemExit("remote cache server observed no action-cache requests")
+invalid_paths = [path for path in action_paths
+                 if re.fullmatch(r"/ac/[a-f0-9]{64}", path) is None]
+if invalid_paths:
+    raise SystemExit(
+        "remote cache server observed invalid action-cache paths: "
+        + ", ".join(invalid_paths)
+    )
+PY
 }
 
 remote_root=$tmpdir/remote
@@ -180,3 +208,5 @@ if grep -q "ATheory built" "$third_log"; then
   cat "$third_log" >&2
   exit 1
 fi
+
+assert_server_action_paths
