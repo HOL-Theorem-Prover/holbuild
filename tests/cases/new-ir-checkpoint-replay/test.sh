@@ -8,7 +8,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
-cleanup() { rm -rf "$tmpdir"; }
+cleanup() { cleanup_temp_dir "$tmpdir"; }
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
@@ -96,12 +96,12 @@ cat > "$prefix_edit_project/src/AScript.sml" <<'SML'
 open HolKernel Parse boolLib bossLib;
 val _ = new_theory "A";
 Theorem replay_after_prefix_edit:
-  !i:int. T
+  !i:num. T
 Proof
   strip_tac >>
-  Cases_on `i < 0`
+  Cases_on `i = 0`
   >- (
-    sg `T` >- simp[] >>
+    sg `1 = 1` >- simp[] >>
     NO_TAC
   )
   >> NO_TAC
