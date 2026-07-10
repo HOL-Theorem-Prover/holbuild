@@ -440,19 +440,52 @@ fun make_node external_dirs source =
    source_hash = ref NONE,
    external_dirs = external_dirs}
 
+fun prefetch_node_dependencies nodes =
+  HolbuildDependencies.prefetch_cached_with_hash
+    (map (fn node => {cache_path = dependency_cache_path (source_of node),
+                     source_path = #source_path (source_of node),
+                     source_hash = source_hash_of node}) nodes)
+
+(* Dependency extraction is relatively expensive, so batch it one reachable
+   frontier at a time instead of prefetching every source in the universe.
+   Mark a frontier expanded before following its edges so cycles terminate;
+   topo_sort_with subsequently provides the usual cycle diagnostics and order. *)
+fun prefetch_reachable_dependencies lookup nodes roots =
+  let
+    val key_index = build_key_index nodes
+    val expanded = Array.array(length nodes, false)
+    fun take_fresh frontier =
+      let
+        fun take ([], acc) = rev acc
+          | take (node :: rest, acc) =
+              let val id = indexed_key_id key_index (key node)
+              in
+                if Array.sub(expanded, id) then take (rest, acc)
+                else (Array.update(expanded, id, true); take (rest, node :: acc))
+              end
+      in
+        take (frontier, [])
+      end
+    fun loop frontier =
+      case take_fresh frontier of
+          [] => ()
+        | fresh =>
+            (prefetch_node_dependencies fresh;
+             loop (List.concat (map (direct_project_deps_with lookup nodes) fresh)))
+  in
+    loop roots
+  end
+
 fun plan_selection holdir sources selection =
   let
     val _ = if holdir = "" then HolbuildDependencies.clear_analyser_path ()
             else HolbuildDependencies.set_analyser_path (HolbuildHolSharedCache.analyser_path_for_holdir holdir)
     val external_dirs = [normalize_path (Path.concat(holdir, "sigobj"))]
     val nodes = map (make_node external_dirs) sources
-    val _ = HolbuildDependencies.prefetch_cached_with_hash
-              (map (fn node => {cache_path = dependency_cache_path (source_of node),
-                                source_path = #source_path (source_of node),
-                                source_hash = source_hash_of node}) nodes)
     val index = build_name_index nodes
     val lookup = indexed_nodes_named index
     val roots = target_roots lookup nodes selection
+    val _ = prefetch_reachable_dependencies lookup nodes roots
     val selected = topo_sort_with lookup nodes roots
     val direct_project_deps_cache = build_direct_project_deps_cache_with lookup selected
   in

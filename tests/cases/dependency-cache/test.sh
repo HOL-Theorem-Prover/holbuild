@@ -27,6 +27,7 @@ name = "dependency-cache"
 
 [build]
 members = ["src"]
+roots = ["src/AScript.sml"]
 TOML
 cat > "$project/src/AScript.sml" <<'SML'
 Theory A
@@ -40,11 +41,27 @@ QED
 
 val _ = export_theory();
 SML
+cat > "$project/src/UnusedScript.sml" <<'SML'
+Theory Unused
+
+Theorem unused:
+  T
+Proof
+  simp[]
+QED
+
+val _ = export_theory();
+SML
 
 (cd "$project" && "$HOLBUILD_BIN" build --dry-run ATheory) > "$tmpdir/first.log"
 require_grep "external theories: .*arithmeticTheory" "$tmpdir/first.log"
 cache_file="$project/.holbuild/obj/src/AScript.uo.deps"
+unused_cache_file="$project/.holbuild/obj/src/UnusedScript.uo.deps"
 require_file "$cache_file"
+if [[ -e "$unused_cache_file" ]]; then
+  echo "dependency analysis cached an unreachable source" >&2
+  exit 1
+fi
 require_grep "mention=arithmeticTheory" "$cache_file"
 
 cat > "$project/src/AScript.sml" <<'SML'
