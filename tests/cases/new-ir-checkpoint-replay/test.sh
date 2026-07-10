@@ -101,7 +101,7 @@ Proof
   strip_tac >>
   Cases_on `i < 0`
   >- (
-    sg `0 <= -i` >- intLib.ARITH_TAC >>
+    sg `T` >- simp[] >>
     NO_TAC
   )
   >> NO_TAC
