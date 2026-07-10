@@ -17,10 +17,12 @@ hol=$tmpdir/hol
 mkdir -p "$hol"
 git -C "$hol" init -q
 git_identity "$hol"
-mkdir -p "$hol/bin" "$hol/tools"
+mkdir -p "$hol/bin" "$hol/tools" "$hol/tools/build" "$hol/tools/sequences" "$hol/src/post" "$hol/src/n-bit"
 cat > "$hol/.gitignore" <<'EOF_IGNORE'
 /bin/hol
+/bin/Holmake
 /bin/hol.state
+/sigobj
 /configured
 /built
 /built-at
@@ -28,17 +30,43 @@ EOF_IGNORE
 cat > "$hol/tools/smart-configure.sml" <<'SML'
 (* fake configure script; HOLBUILD_POLY fixture handles it *)
 SML
+printf '#include sequences/upto-hol\nsrc/post\n' > "$hol/tools/build/build-sequence"
+printf 'fake upto-hol sequence\n' > "$hol/tools/sequences/upto-hol"
+cat > "$hol/src/post/PostScript.sml" <<'SML'
+val _ = new_theory "Post";
+val _ = export_theory();
+SML
+cat > "$hol/src/n-bit/wordsScript.sml" <<'SML'
+val _ = new_theory "words";
+val _ = export_theory();
+SML
 cat > "$hol/bin/build" <<'SH'
 #!/usr/bin/env sh
 set -eu
-[ "$#" -eq 1 ] && [ "$1" = "--no-helpdocs" ]
+[ "$#" -eq 2 ] && [ "$1" = "--no-helpdocs" ] && [ "$2" = "--seq=tools/sequences/upto-hol" ]
 touch built
 pwd > built-at
+mkdir -p sigobj
+: > sigobj/BaseTheory.uo
 cat > bin/hol <<'HOL'
 #!/usr/bin/env sh
 exit 0
 HOL
 chmod +x bin/hol
+cat > bin/Holmake <<'HOLMAKE'
+#!/usr/bin/env sh
+set -eu
+holdir=$(cd "$(dirname "$0")/.." && pwd)
+cat <<EOF
+[
+{
+  "target" : "$holdir/src/n-bit/wordsScript.sml",
+  "command" : "fake	command"
+}
+]
+EOF
+HOLMAKE
+chmod +x bin/Holmake
 echo fake-state > bin/hol.state
 SH
 chmod +x "$hol/bin/build"
@@ -141,7 +169,7 @@ TOML
 a_rev=$(commit_repo "$a")
 
 root=$tmpdir/root
-mkdir -p "$root"
+mkdir -p "$root/src"
 cat > "$root/holproject.toml" <<TOML
 [holbuild]
 schema = 2
@@ -152,7 +180,14 @@ name = "root"
 [dependencies.a]
 git = "$a"
 rev = "$a_rev"
+
+[actions.ATheory]
+loads = ["BaseTheory"]
 TOML
+cat > "$root/src/AScript.sml" <<'SML'
+val _ = new_theory "A";
+val _ = export_theory();
+SML
 
 context_log=$tmpdir/context.log
 (cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" "$HOLBUILD_BIN" context) > "$context_log"
@@ -188,6 +223,14 @@ dry_log=$tmpdir/dry.log
 (cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" "$HOLBUILD_BIN" build --dry-run Foo) > "$dry_log" 2>&1
 require_grep "removing obsolete directory HOL toolchain lock" "$dry_log"
 require_grep "Foo (sml, package b)" "$dry_log"
+(cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" "$HOLBUILD_BIN" build --dry-run wordsTheory) > "$tmpdir/words-hol-source.log" 2>&1
+require_grep "wordsTheory (theory, package hol)" "$tmpdir/words-hol-source.log"
+(cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" "$HOLBUILD_BIN" build --dry-run ATheory) > "$tmpdir/base-external.log" 2>&1
+require_grep "ATheory (theory, package root)" "$tmpdir/base-external.log"
+if grep -q "BaseTheory (theory, package hol)" "$tmpdir/base-external.log"; then
+  echo "toolchain sigobj theory was unexpectedly discovered as HOL source" >&2
+  exit 1
+fi
 [[ -f "$stale_lock" ]] || { echo "toolchain lock was not recreated as a file" >&2; exit 1; }
 [[ ! -e "$stale_lock.owner" ]] || { echo "toolchain lock owner survived successful bootstrap" >&2; exit 1; }
 shared_hol=$shared_hol_from_context

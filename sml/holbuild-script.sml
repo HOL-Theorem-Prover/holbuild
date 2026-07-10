@@ -42,7 +42,9 @@ use "vendor/sml-sha256/lib/sha256.sml";
 
 use "sml/hash.sml";
 use "sml/version.sml";
+use "sml/hol_toolchain_config.sml";
 use "sml/builtin_manifests.sml";
+use "sml/hol_source_manifest.sml";
 use "sml/cache_config.sml";
 use "sml/remote_cache_config.sml";
 use "sml/git_cache.sml";

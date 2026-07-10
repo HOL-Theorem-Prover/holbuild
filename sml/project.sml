@@ -963,7 +963,16 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
 fun parse_at args = parse_table_at (TOML.fromFile (#manifest args)) args
 
 fun parse_builtin_holdir_at args =
-  parse_table_at (TOML.fromString HolbuildBuiltinManifests.holdir_manifest_text) args
+  let
+    val cached_manifest = HolbuildHolSharedCache.hol_source_manifest_for_holdir (#root args)
+    val text =
+      if readable cached_manifest then
+        let val input = TextIO.openIn cached_manifest
+        in TextIO.inputAll input before TextIO.closeIn input end
+      else HolbuildBuiltinManifests.empty_hol_manifest_text
+  in
+    parse_table_at (TOML.fromString text) args
+  end
 
 fun parse manifest =
   let
@@ -1148,6 +1157,8 @@ fun project_package ({root, artifact_root, graph_artifact_root, manifest, name, 
            artifact_root = if artifact_root = graph_artifact_root then Path.concat(artifact_root, ".holbuild") else artifact_root,
            action_policies = action_policies,
            generators = generators}
+
+fun root_package_name project = package_name (project_package project)
 
 fun dependency_project (project : t) (dep as Dependency {name, source}) =
   let

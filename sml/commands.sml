@@ -296,7 +296,7 @@ fun default_build_targets project index targets =
 
 fun build_target_plan holdir project index requested_targets targets =
   if null requested_targets andalso null targets andalso not (project_has_default_targets project) then
-    HolbuildBuildPlan.plan_all holdir index
+    HolbuildBuildPlan.plan_targets holdir index (HolbuildSourceIndex.root_package_targets index project)
   else
     HolbuildBuildPlan.plan_targets holdir index targets
 

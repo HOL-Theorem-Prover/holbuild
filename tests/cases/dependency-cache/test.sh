@@ -8,7 +8,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
-cleanup() { rm -rf "$tmpdir"; }
+cleanup() { cleanup_temp_dir "$tmpdir"; }
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
@@ -66,7 +66,7 @@ require_grep "mention=arithmeticTheory" "$cache_file"
 
 cat > "$project/src/AScript.sml" <<'SML'
 Theory A
-Ancestors arithmetic string
+Ancestors arithmetic list
 
 Theorem a:
   1 + 1 = 2
@@ -79,10 +79,10 @@ SML
 
 (cd "$project" && "$HOLBUILD_BIN" build --dry-run ATheory) > "$tmpdir/second.log"
 require_grep "external theories: .*arithmeticTheory" "$tmpdir/second.log"
-require_grep "external theories: .*stringTheory" "$tmpdir/second.log"
-require_grep "mention=stringTheory" "$cache_file"
+require_grep "external theories: .*listTheory" "$tmpdir/second.log"
+require_grep "mention=listTheory" "$cache_file"
 
 printf 'not a valid dependency cache\n' > "$cache_file"
 (cd "$project" && "$HOLBUILD_BIN" build --dry-run ATheory) > "$tmpdir/corrupt.log"
-require_grep "external theories: .*stringTheory" "$tmpdir/corrupt.log"
+require_grep "external theories: .*listTheory" "$tmpdir/corrupt.log"
 require_grep "holbuild-dependencies-cache-v2" "$cache_file"

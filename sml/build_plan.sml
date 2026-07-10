@@ -497,10 +497,6 @@ fun plan_all holdir sources = plan_selection holdir sources AllTargets
 
 fun plan_targets holdir sources targets = plan_selection holdir sources (SelectedTargets targets)
 
-fun plan holdir sources targets =
-  if null targets then plan_all holdir sources
-  else plan_targets holdir sources targets
-
 fun kind_name source = HolbuildSourceIndex.kind_string (#kind source)
 
 fun readable path = OS.FileSys.access(path, [OS.FileSys.A_READ]) handle OS.SysErr _ => false

@@ -110,12 +110,31 @@ git = "https://github.com/HOL-Theorem-Prover/HOL.git"
 rev = "0123456789abcdef0123456789abcdef01234567"
 ```
 
-That revision is the HOL toolchain used to analyse and build the project.
+That revision is the HOL checkout used to analyse and build the project.
 `holbuild` builds or reuses it under:
 
 ```text
 $HOLBUILD_CACHE/hol-toolchains/<key>/hol
 ```
+
+For schema 2 projects, the shared HOL toolchain is warmed with HOL's reduced
+`upto-hol` build sequence rather than a full default HOL build:
+
+```sh
+bin/build --no-helpdocs --seq=tools/sequences/upto-hol
+```
+
+This produces the standard HOL executable, `hol.state`, Holmake, and the base
+`sigobj` context needed by normal project builds. Source directories that would
+be reached by HOL's default build after this reduced toolchain sequence are
+exposed as an implicit package named `hol` and built by holbuild on demand. The
+generated implicit HOL source manifest is cached next to the shared toolchain as
+`hol-source.manifest.toml` with a companion `hol-source.members` file.
+
+While HOL issue https://github.com/HOL-Theorem-Prover/HOL/issues/2021 remains
+unfixed, holbuild uses a narrow temporary parser for Holmake `--json` target
+lines when generating that manifest. This is intended to be replaced by proper
+JSON parsing once the pinned HOL revision provides valid Holmake JSON output.
 
 `--cache-dir PATH` overrides the global cache location for a command.
 `HOLBUILD_CACHE` defaults to the platform cache directory, normally:
@@ -291,15 +310,23 @@ allow_empty = false
 "src/SlowScript.sml" = 60.0
 ```
 
-- `members` tells `holbuild` where to discover source files.
+- `members` tells `holbuild` where to discover source files. Membership makes a
+  source available as a logical target and as a dependency of other targets, but
+  does not by itself make the source part of the default build.
 - `exclude` removes concrete package-root-relative paths from discovery; a
   directory entry excludes its subtree, and a file entry excludes just that file.
 - `exclude_globs` removes package-root-relative glob matches from discovery.
   Deprecated glob patterns in `exclude` are still accepted with a warning.
 - `roots` are the default entry points when `holbuild build` is run with no
   target. Entries may be package-root-relative source paths or `@name` build
-  group references. Use `holbuild build --warn-unreachable` to report
-  discoverable theory scripts that are outside the root dependency closure.
+  group references. Source-path roots must name sources discovered through
+  `members` and not removed by `exclude` or `exclude_globs`; the `.sml` suffix
+  may be omitted. If no package in the dependency graph declares roots or root
+  groups, `holbuild build` defaults to all discovered sources in the root project
+  package only. Dependency packages, including the implicit `hol` package, are
+  not default-built merely because they have members. Use `holbuild build
+  --warn-unreachable` to report discoverable theory scripts that are outside the
+  root dependency closure.
 - `root_groups` adds build groups to the default build. Group names may use the
   uniform `@name` form (`"@generated"`) or the bare form (`"generated"`).
 - `[build.groups.NAME]` defines a build-system-only group; `NAME` is the group

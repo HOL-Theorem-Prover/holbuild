@@ -153,9 +153,7 @@ fun save_declaration_context_line ({safe_name, context_path, context_ok, ...} : 
 fun runtime_lines lines =
   String.concat (map (fn line => line ^ "\n") lines)
 
-val runtime_load_lines =
-  ["HolbuildRuntime.load \"smlExecute\";",
-   "HolbuildRuntime.load \"smlTimeout\";"]
+val runtime_load_lines = []
 
 val termination_runtime_lines =
   ["HolbuildRuntime.load \"Defn\";",
