@@ -66,7 +66,8 @@ SML
 (cd "$project" && "$HOLBUILD_BIN" build --dry-run ATheory) > "$tmpdir/dry.log"
 require_grep "external theories: .*arithmeticTheory" "$tmpdir/dry.log"
 require_grep "external theories: .*listTheory" "$tmpdir/dry.log"
-require_grep "external libs: .*cv_transLib" "$tmpdir/dry.log"
+require_grep "cv_transLib (sml, package hol)" "$tmpdir/dry.log"
+require_grep "project deps: .*cv_transLib" "$tmpdir/dry.log"
 require_grep "external libs: .*monadsyntax" "$tmpdir/dry.log"
 require_grep "external libs: .*numLib" "$tmpdir/dry.log"
 if grep -q "ignore_grammar\|qualified\|identifier" "$tmpdir/dry.log"; then
