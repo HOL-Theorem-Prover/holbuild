@@ -8,7 +8,9 @@ exception Error of string
 
 val format_version = "holbuild-hol-toolchain-v1"
 val default_canonical_git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-val toolchain_config = HolbuildHolToolchainConfig.default
+val standard_kernel = HolbuildHolToolchainConfig.StandardKernel
+
+fun toolchain_config kernel_variant = HolbuildHolToolchainConfig.config kernel_variant
 val analyser_format_version = "holbuild-hol-analyser-v1"
 val analyser_protocol_version = "1"
 val analyser_source_files =
@@ -89,7 +91,7 @@ fun trim text =
 fun poly_command () = Option.getOpt(OS.Process.getEnv "HOLBUILD_POLY", "poly")
 fun poly_version () = trim (command_output (quote (poly_command ()) ^ " -v"))
 
-fun key_material {git, rev} =
+fun key_material {git, rev, kernel_variant} =
   let val _ = validate_git git
       val poly = poly_command ()
       val version = poly_version ()
@@ -97,10 +99,11 @@ fun key_material {git, rev} =
     String.concatWith "\n"
       ([format_version, "git=" ^ git, "rev=" ^ rev, "poly=" ^ poly,
         "poly_version=" ^ version] @
-       HolbuildHolToolchainConfig.key_material_fields toolchain_config)
+       HolbuildHolToolchainConfig.key_material_fields (toolchain_config kernel_variant))
   end
 
 fun key req = HolbuildHash.string_sha1 (key_material req)
+fun standard_request {git, rev} = {git = git, rev = rev, kernel_variant = standard_kernel}
 fun toolchains_dir () = Path.concat(cache_root (), "hol-toolchains")
 fun entry_dir_for_key k = Path.concat(toolchains_dir (), k)
 fun holdir_for_key k = Path.concat(entry_dir_for_key k, "hol")
@@ -119,7 +122,8 @@ fun lock_owner_path lock = lock ^ ".owner"
 
 datatype toolchain_lock = ToolchainLock of HolbuildFileLock.t
 
-fun holdir_for req = holdir_for_key (key req)
+fun holdir_for_with_kernel req = holdir_for_key (key req)
+fun holdir_for req = holdir_for_with_kernel (standard_request req)
 fun hol_source_manifest_for_holdir holdir = Path.concat(Path.dir holdir, "hol-source.manifest.toml")
 
 fun built holdir =
@@ -130,8 +134,8 @@ fun built holdir =
 fun dirty_status holdir = trim (command_output ("git -C " ^ quote holdir ^ " status --porcelain --ignored=no"))
 fun clean holdir = dirty_status holdir = ""
 
-fun require_build_sequence holdir =
-  case HolbuildHolToolchainConfig.required_sequence_file toolchain_config of
+fun require_build_sequence kernel_variant holdir =
+  case HolbuildHolToolchainConfig.required_sequence_file (toolchain_config kernel_variant) of
       NONE => ()
     | SOME rel =>
         let val path = Path.concat(holdir, rel)
@@ -283,9 +287,11 @@ fun build_entry req k =
        ensure_dir final;
        run_in_dir final ("git clone " ^ quote (#git req) ^ " " ^ quote hol);
        run_in_dir hol ("git checkout --detach " ^ quote (#rev req));
-       require_build_sequence hol;
+       require_build_sequence (#kernel_variant req) hol;
        run_in_dir hol (quote (poly_command ()) ^ " --script tools/smart-configure.sml");
-       run_in_dir hol ("bin/build " ^ HolbuildHolToolchainConfig.build_args_text toolchain_config);
+       run_in_dir hol
+         ("bin/build " ^
+          HolbuildHolToolchainConfig.build_args_text (toolchain_config (#kernel_variant req)));
        if built hol then () else die ("HOL build did not produce bin/hol, bin/build, and bin/hol.state in " ^ hol);
        generate_hol_source_manifest k;
        if clean hol then () else die ("HOL build left dirty checkout: " ^ hol ^ "\n" ^ dirty_status hol);
@@ -296,7 +302,7 @@ fun build_entry req k =
     build () handle Error msg => die (msg ^ "\nfailed HOL build left at: " ^ final)
   end
 
-fun ensure_built req =
+fun ensure_built_with_kernel req =
   let
     val material = key_material req
     val k = HolbuildHash.string_sha1 material
@@ -314,5 +320,7 @@ fun ensure_built req =
         handle e => (release_lock l; raise e)
       end
   end
+
+fun ensure_built req = ensure_built_with_kernel (standard_request req)
 
 end
