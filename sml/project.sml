@@ -4,52 +4,18 @@ struct
 structure Path = OS.Path
 structure FS = OS.FileSys
 
-datatype heap_kind = HeapImage | ExecutableImage of {main : string}
+datatype heap_kind = datatype HolbuildPackageDefinition.heap_kind
+datatype heap = datatype HolbuildPackageDefinition.heap
+type root_tactic_timeout = HolbuildPackageDefinition.root_tactic_timeout
+datatype extra_input = datatype HolbuildPackageDefinition.extra_input
+datatype action_policy = datatype HolbuildPackageDefinition.action_policy
+datatype generator = datatype HolbuildPackageDefinition.generator
+datatype group = datatype HolbuildPackageDefinition.group
+datatype dependency_source = datatype HolbuildPackageDefinition.dependency_source
+datatype dependency = datatype HolbuildPackageDefinition.dependency
 
-datatype heap = Heap of {name : string, output : string, objects : string list, kind : heap_kind}
-
-type root_tactic_timeout = {root : string, timeout : real option}
-
-datatype extra_input = ExtraInput of {path : string, absolute_path : string}
-
-datatype action_policy =
-  ActionPolicy of
-    { logical : string,
-      deps : string list,
-      loads : string list,
-      extra_inputs : extra_input list,
-      impure : bool,
-      cache : bool,
-      always_reexecute : bool }
-
-datatype generator =
-  Generator of
-    { name : string,
-      command : string list,
-      inputs : string list,
-      outputs : string list,
-      deps : string list }
-
-datatype group =
-  Group of
-    { name : string,
-      includes : string list,
-      include_globs : string list,
-      excludes : string list,
-      exclude_globs : string list,
-      allow_empty : bool }
-
-datatype dependency_source =
-    GitSource of {git : string, rev : string}
-  | FromSource of {from : string, path : string, manifest : string}
-
-datatype dependency = Dependency of {name : string, source : dependency_source}
-
-datatype override =
-    OverridePath of {name : string, path : string}
-  | OverrideGit of {name : string, git : string}
-
-datatype local_config = LocalConfig of {overrides : override list, build_excludes : string list, build_exclude_globs : string list, build_jobs : int option, build_tactic_timeout : real option, checkpoint_limit_gb : int option, remote_cache_url : string option, remote_cache_curl_config : string option}
+datatype override = datatype HolbuildLocalConfig.override
+datatype local_config = datatype HolbuildLocalConfig.t
 
 datatype package =
   Package of
@@ -66,11 +32,15 @@ datatype package =
       action_policies : action_policy list,
       generators : generator list }
 
+(* Transitional resolved-project record. The duplicated definition/local fields
+   keep existing callers behaviorally unchanged while later #131 phases migrate
+   them to package-definition and invocation-config accessors. *)
 type t =
   { root : string,
     artifact_root : string,
     graph_artifact_root : string,
     manifest : string,
+    definition : HolbuildPackageDefinition.t,
     schema : int,
     name : string option,
     version : string option,
@@ -82,6 +52,7 @@ type t =
     groups : group list,
     root_tactic_timeouts : root_tactic_timeout list,
     dependencies : dependency list,
+    local_config : HolbuildLocalConfig.t,
     overrides : override list,
     local_build_excludes : string list,
     local_build_exclude_globs : string list,
@@ -879,25 +850,18 @@ fun validate_root_groups root_groups groups =
   end
 
 fun parse_local_config root =
-  let val config = Path.concat(root, ".holconfig.toml")
-  in
-    if readable config then
-      let
-        val table = TOML.fromFile config
-        val _ = validate_local_config_table table
-        val (build_excludes, build_exclude_globs) = local_build_excludes table
-      in
-        LocalConfig {overrides = overrides_at root table,
-                     build_excludes = build_excludes,
-                     build_exclude_globs = build_exclude_globs,
-                     build_jobs = local_build_jobs table,
-                     build_tactic_timeout = local_build_tactic_timeout table,
-                     checkpoint_limit_gb = local_checkpoint_limit_gb table,
-                     remote_cache_url = local_remote_cache_url table,
-                     remote_cache_curl_config = local_remote_cache_curl_config table}
-      end
-    else LocalConfig {overrides = [], build_excludes = [], build_exclude_globs = [], build_jobs = NONE, build_tactic_timeout = NONE, checkpoint_limit_gb = NONE, remote_cache_url = NONE, remote_cache_curl_config = NONE}
-  end
+  HolbuildLocalConfig.parse
+    {config_path = Path.concat(root, ".holconfig.toml"),
+     readable = readable,
+     parse_file = TOML.fromFile,
+     validate = validate_local_config_table,
+     parse_overrides = overrides_at root,
+     parse_build_excludes = local_build_excludes,
+     parse_build_jobs = local_build_jobs,
+     parse_build_tactic_timeout = local_build_tactic_timeout,
+     parse_checkpoint_limit_gb = local_checkpoint_limit_gb,
+     parse_remote_cache_url = local_remote_cache_url,
+     parse_remote_cache_curl_config = local_remote_cache_curl_config}
 
 fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, local_config} =
   let
@@ -914,8 +878,11 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
     val members = package_relative_paths "build.members" (build_strings "members" ["."])
     val (manifest_excludes, deprecated_exclude_globs) =
       split_deprecated_excludes "build.exclude" (build_strings "exclude" [])
+    val manifest_exclude_globs =
+      deprecated_exclude_globs @
+      package_relative_paths "build.exclude_globs" (build_strings "exclude_globs" [])
     val excludes = manifest_excludes @ build_excludes
-    val exclude_globs = deprecated_exclude_globs @ package_relative_paths "build.exclude_globs" (build_strings "exclude_globs" []) @ build_exclude_globs
+    val exclude_globs = manifest_exclude_globs @ build_exclude_globs
     val roots = build_roots_from_manifest build_strings
     val root_groups = build_root_groups_from_manifest build_strings
     val groups = groups_at table
@@ -926,17 +893,33 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
     val schema = schema_version table
     val dependencies = dependencies_at table
     val _ = validate_schema2_dependency_refs dependencies
+    val name = Option.mapPartial (fn t =>
+                 Option.map (fn value =>
+                   (require_safe_materialized_dependency_name "project.name" value; value))
+                   (string_field t "name")) project
+    val version = Option.mapPartial (fn t => string_field t "version") project
+    val run_heap = Option.mapPartial (fn t => string_field t "heap") run
+    val run_loads = from run (fn t => string_array_field t "loads") []
+    val heaps = heaps_at table
+    val action_policies = action_policies_at root table
+    val generators = generators_at table
+    val definition =
+      HolbuildPackageDefinition.make
+        {name = name, version = version, members = members,
+         excludes = manifest_excludes, exclude_globs = manifest_exclude_globs,
+         roots = roots, root_groups = root_groups, groups = groups,
+         root_tactic_timeouts = root_tactic_timeouts,
+         dependencies = dependencies, run_heap = run_heap, run_loads = run_loads,
+         heaps = heaps, action_policies = action_policies, generators = generators}
   in
     { root = root,
       artifact_root = artifact_root,
       graph_artifact_root = graph_artifact_root,
       manifest = manifest,
+      definition = definition,
       schema = schema,
-      name = Option.mapPartial (fn t =>
-               Option.map (fn name =>
-                 (require_safe_materialized_dependency_name "project.name" name; name))
-                 (string_field t "name")) project,
-      version = Option.mapPartial (fn t => string_field t "version") project,
+      name = name,
+      version = version,
       members = members,
       excludes = excludes,
       exclude_globs = exclude_globs,
@@ -945,6 +928,7 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
       groups = groups,
       root_tactic_timeouts = root_tactic_timeouts,
       dependencies = dependencies,
+      local_config = local_config,
       overrides = overrides,
       local_build_excludes = build_excludes,
       local_build_exclude_globs = build_exclude_globs,
@@ -953,11 +937,11 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
       checkpoint_limit_gb = checkpoint_limit_gb,
       remote_cache_url = remote_cache_url,
       remote_cache_curl_config = remote_cache_curl_config,
-      run_heap = Option.mapPartial (fn t => string_field t "heap") run,
-      run_loads = from run (fn t => string_array_field t "loads") [],
-      heaps = heaps_at table,
-      action_policies = action_policies_at root table,
-      generators = generators_at table }
+      run_heap = run_heap,
+      run_loads = run_loads,
+      heaps = heaps,
+      action_policies = action_policies,
+      generators = generators }
   end
 
 fun parse_at args = parse_table_at (TOML.fromFile (#manifest args)) args
@@ -1042,6 +1026,8 @@ fun root_tactic_timeout_for ({root_tactic_timeouts, ...} : t) root =
   Option.map #timeout (List.find (fn entry => #root entry = root) root_tactic_timeouts)
 fun package_generators (Package {generators, ...}) = generators
 fun artifact_root ({artifact_root, ...} : t) = artifact_root
+fun package_definition ({definition, ...} : t) = definition
+fun local_config ({local_config, ...} : t) = local_config
 fun schema ({schema, ...} : t) = schema
 fun hol_dependency ({dependencies, ...} : t) =
   List.find (fn Dependency {name, ...} => name = "hol") dependencies
