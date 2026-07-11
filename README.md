@@ -152,6 +152,29 @@ To build that HOL toolchain ahead of time, for example in CI, run:
 holbuild buildhol
 ```
 
+### Tracing-kernel toolchains
+
+Proof-tracing builds use HOL's tracing kernel:
+
+```sh
+HOLBUILD_POLY=/path/to/tracing-poly holbuild buildhol --trknl
+HOLBUILD_POLY=/path/to/tracing-poly holbuild build --trknl MyTheory
+```
+
+`--trknl` requires a Poly/ML build that provides the tracing-kernel export
+support used by HOL. CI tracks the `exportSmall` branch of
+https://github.com/digama0/polyml; local users should set `HOLBUILD_POLY` to the
+corresponding `poly` executable when warming or using a tracing toolchain.
+Standard and tracing HOL builds have distinct toolchain identities and are
+cached separately under `$HOLBUILD_CACHE/hol-toolchains/`.
+
+A tracing build records the aggregate proof trace for each theory as
+`MyTheory.tr.gz`. The trace is a normal build output: holbuild requires it for
+up-to-date checks, includes it in output metadata, and publishes and restores it
+through the action cache. Standard-kernel builds do not require trace outputs.
+Tracing is a property of the selected bootstrapped HOL kernel; holbuild does not
+pass `--trknl` to each child HOL process.
+
 ## Common commands
 
 `build` is the default command, so it can usually be omitted:
@@ -172,6 +195,8 @@ holbuild run script.sml
 holbuild context
 holbuild execution-plan MyTheory:my_theorem
 holbuild buildhol
+holbuild buildhol --trknl
+holbuild build --trknl MyTheory
 holbuild heap main
 holbuild executable runtests
 holbuild export -o build-output.hbx MyTheory
@@ -474,8 +499,9 @@ $HOLBUILD_CACHE/hol-toolchains/       # built HOL toolchains and analysers
 ```
 
 The global build cache stores selected semantic artefacts such as `Theory.sig`,
-`Theory.sml`, and `Theory.dat` by action key. Cache hits materialise validated
-artefacts into the local `.holbuild/` tree.
+`Theory.sml`, `Theory.dat`, and tracing-kernel `Theory.tr.gz` files by action
+key. Cache hits materialise validated artefacts into the local `.holbuild/`
+tree. Standard cache entries do not require a trace blob.
 
 A build can also consult and publish to one Bazel-style HTTP remote cache:
 
