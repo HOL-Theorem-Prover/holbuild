@@ -767,11 +767,10 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
     val {name, version} =
       (HolbuildPackageDefinition.parse_metadata table
        handle HolbuildManifestUtil.Error msg => die msg)
-    val run_heap = Option.mapPartial (fn t => string_field t "heap") run
-    val run_loads = from run (fn t => string_array_field t "loads") []
-    val heaps = heaps_at table
+    val {run_heap, run_loads, heaps, generators} =
+      (HolbuildPackageDefinition.parse_runtime table
+       handle HolbuildManifestUtil.Error msg => die msg)
     val action_policies = action_policies_at root table
-    val generators = generators_at table
     val definition =
       HolbuildPackageDefinition.make
         {name = name, version = version, members = members,

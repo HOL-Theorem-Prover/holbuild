@@ -82,6 +82,14 @@ fun table_field table key =
 fun string_field table name = string_at table [name]
 fun string_array_field table name = string_array_at table [name]
 
+fun required_string_array_field context table name =
+  case lookup table [name] of
+      NONE => die (context ^ " requires " ^ name)
+    | SOME value =>
+        (case string_array_value value of
+             SOME xs => xs
+           | NONE => die (context ^ "." ^ name ^ " must be a string array"))
+
 fun env_name_char c = Char.isAlphaNum c orelse c = #"_"
 fun env_value context name =
   if name = "" then die (context ^ " contains empty environment variable reference")

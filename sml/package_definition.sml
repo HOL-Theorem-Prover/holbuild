@@ -73,6 +73,9 @@ type t =
     generators : generator list }
 
 type metadata = {name : string option, version : string option}
+type runtime =
+  {run_heap : string option, run_loads : string list, heaps : heap list,
+   generators : generator list}
 type compatibility = {schema : int}
 
 fun is_hex c = Char.isDigit c orelse (#"a" <= c andalso c <= #"f")
@@ -151,6 +154,67 @@ fun parse_dependencies table =
     val dependencies = map parse_dependency entries
     val _ = validate_dependency_refs dependencies
   in dependencies end
+
+fun parse_image_entry section kind value =
+  case value of
+      TOML.TABLE table =>
+        let
+          val name = case string_field table "name" of SOME s => s | NONE => die ("[[" ^ section ^ "]] entry requires name")
+          val output = case string_field table "output" of SOME s => s | NONE => die ("[[" ^ section ^ "]] entry requires output")
+        in Heap {name = name, output = output, objects = string_array_field table "objects", kind = kind table} end
+    | _ => die (section ^ " entries must be tables")
+
+fun image_entries table section parse =
+  case lookup table [section] of
+      NONE => []
+    | SOME (TOML.ARRAY values) => map parse values
+    | SOME _ => die (section ^ " must be an array of tables")
+
+fun parse_heaps table =
+  let
+    val heaps =
+      image_entries table "heap" (parse_image_entry "heap" (fn _ => HeapImage)) @
+      image_entries table "executable"
+        (parse_image_entry "executable" (fn value =>
+          ExecutableImage {main = Option.getOpt(string_field value "main", "main")}))
+    fun name_of (Heap {name, ...}) = name
+    fun loop _ [] = ()
+      | loop names (heap :: rest) =
+          let val name = name_of heap
+          in if List.exists (fn old => old = name) names then
+               die ("duplicate heap/executable target name: " ^ name)
+             else loop (name :: names) rest
+          end
+  in loop [] heaps; heaps end
+
+fun parse_generator value =
+  case value of
+      TOML.TABLE table =>
+        let
+          val name = case string_field table "name" of SOME s => s | NONE => die "[[generate]] entry requires name"
+          val command = required_string_array_field ("generate." ^ name) table "command"
+          val inputs = package_relative_paths ("generate." ^ name ^ ".inputs") (string_array_field table "inputs")
+          val outputs = package_relative_paths ("generate." ^ name ^ ".outputs") (required_string_array_field ("generate." ^ name) table "outputs")
+          val deps = string_array_field table "deps"
+          val _ = if name = "" then die "generate.name must not be empty" else ()
+          val _ = if null command then die ("generate." ^ name ^ ".command must not be empty") else ()
+          val _ = if null outputs then die ("generate." ^ name ^ ".outputs must not be empty") else ()
+        in Generator {name = name, command = command, inputs = inputs, outputs = outputs, deps = deps} end
+    | _ => die "generate entries must be tables"
+
+fun parse_generators table =
+  case lookup table ["generate"] of
+      NONE => []
+    | SOME (TOML.ARRAY values) => map parse_generator values
+    | SOME _ => die "generate must be an array of tables"
+
+fun parse_runtime table : runtime =
+  let val run = table_field table ["run"]
+  in
+    {run_heap = Option.mapPartial (fn value => string_field value "heap") run,
+     run_loads = case run of NONE => [] | SOME value => string_array_field value "loads",
+     heaps = parse_heaps table, generators = parse_generators table}
+  end
 
 fun schema_version table =
   case table_field table ["holbuild"] of
