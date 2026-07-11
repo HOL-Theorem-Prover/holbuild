@@ -531,7 +531,9 @@ fun validate_manifest_table table =
     val _ = Option.app (require_known_fields "run" ["heap", "loads"])
               (table_field table ["run"])
     val _ = ignore (schema_version table)
-    val _ = List.app validate_dependency_table (named_table_entries table ["dependencies"])
+    val _ =
+      (ignore (HolbuildPackageDefinition.parse_dependencies table)
+       handle HolbuildManifestUtil.Error msg => die msg)
     val _ = List.app validate_action_table (named_table_entries table ["actions"])
     val _ = validate_groups_table table
     val _ =
@@ -759,13 +761,12 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
     val _ = validate_root_tactic_timeouts roots root_groups groups root_tactic_timeouts
     val manifest_timeout = build_tactic_timeout_from_manifest build
     val schema = schema_version table
-    val dependencies = dependencies_at table
-    val _ = validate_schema2_dependency_refs dependencies
-    val name = Option.mapPartial (fn t =>
-                 Option.map (fn value =>
-                   (require_safe_materialized_dependency_name "project.name" value; value))
-                   (string_field t "name")) project
-    val version = Option.mapPartial (fn t => string_field t "version") project
+    val dependencies =
+      (HolbuildPackageDefinition.parse_dependencies table
+       handle HolbuildManifestUtil.Error msg => die msg)
+    val {name, version} =
+      (HolbuildPackageDefinition.parse_metadata table
+       handle HolbuildManifestUtil.Error msg => die msg)
     val run_heap = Option.mapPartial (fn t => string_field t "heap") run
     val run_loads = from run (fn t => string_array_field t "loads") []
     val heaps = heaps_at table

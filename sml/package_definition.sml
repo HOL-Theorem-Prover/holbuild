@@ -72,7 +72,85 @@ type t =
     action_policies : action_policy list,
     generators : generator list }
 
+type metadata = {name : string option, version : string option}
 type compatibility = {schema : int}
+
+fun is_hex c = Char.isDigit c orelse (#"a" <= c andalso c <= #"f")
+fun validate_git_rev rev =
+  if size rev = 40 andalso List.all is_hex (String.explode rev) then ()
+  else die ("git dependency rev must be a full 40-character lowercase hex commit: " ^ rev)
+
+fun parse_metadata table : metadata =
+  case table_field table ["project"] of
+      NONE => {name = NONE, version = NONE}
+    | SOME project =>
+        let
+          val name =
+            Option.map
+              (fn value =>
+                (require_safe_materialized_dependency_name "project.name" value; value))
+              (string_field project "name")
+        in {name = name, version = string_field project "version"} end
+
+fun validate_dependency_table (name, table) =
+  let
+    val context = "dependencies." ^ name
+    val path = string_field table "path"
+    val manifest = string_field table "manifest"
+    val git = string_field table "git"
+    val rev = string_field table "rev"
+    val from = string_field table "from"
+  in
+    require_known_fields context ["git", "rev", "from", "path", "manifest"] table;
+    case (git, rev, from, path, manifest) of
+        (SOME _, SOME rev, NONE, NONE, NONE) => validate_git_rev rev
+      | (SOME _, NONE, _, _, _) => die (context ^ " with git requires rev")
+      | (NONE, SOME _, _, _, _) => die (context ^ " with rev requires git")
+      | (SOME _, SOME _, _, _, _) => die (context ^ " git dependency may only contain git and rev")
+      | (NONE, NONE, SOME from, SOME path, SOME manifest) =>
+          (require_safe_materialized_dependency_name (context ^ ".from") from;
+           ignore (package_relative_path (context ^ ".path") path);
+           ignore (package_relative_path (context ^ ".manifest") manifest))
+      | (NONE, NONE, SOME _, _, _) => die (context ^ " with from requires path and manifest")
+      | (NONE, NONE, NONE, SOME _, _) => die (context ^ " path dependencies are not supported")
+      | (NONE, NONE, NONE, NONE, SOME _) => die (context ^ " manifest requires from")
+      | (NONE, NONE, NONE, NONE, NONE) => die (context ^ " must specify either git/rev or from/path/manifest")
+  end
+
+fun parse_dependency (name, table) =
+  let
+    val source =
+      case (string_field table "git", string_field table "rev", string_field table "from",
+            string_field table "path", string_field table "manifest") of
+          (SOME git, SOME rev, NONE, NONE, NONE) => GitSource {git = git, rev = rev}
+        | (NONE, NONE, SOME from, SOME path, SOME manifest) =>
+            FromSource {from = from, path = path, manifest = manifest}
+        | _ => die ("invalid dependency form for dependencies." ^ name)
+  in Dependency {name = name, source = source} end
+
+fun dependency_name (Dependency {name, ...}) = name
+
+fun validate_dependency_refs deps =
+  let
+    fun source_for name =
+      Option.map (fn Dependency {source, ...} => source)
+        (List.find (fn dep => dependency_name dep = name) deps)
+    fun one (Dependency {name, source = FromSource {from, ...}}) =
+          (case source_for from of
+               SOME (GitSource _) => ()
+             | SOME _ => die ("dependencies." ^ name ^ " from dependency must refer to a direct git dependency: " ^ from)
+             | NONE => die ("dependencies." ^ name ^ " from dependency is unknown: " ^ from))
+      | one (Dependency {name, source = GitSource _, ...}) =
+          require_safe_materialized_dependency_name ("dependencies." ^ name) name
+  in List.app one deps end
+
+fun parse_dependencies table =
+  let
+    val entries = named_table_entries table ["dependencies"]
+    val _ = List.app validate_dependency_table entries
+    val dependencies = map parse_dependency entries
+    val _ = validate_dependency_refs dependencies
+  in dependencies end
 
 fun schema_version table =
   case table_field table ["holbuild"] of
