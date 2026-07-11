@@ -1286,7 +1286,8 @@ fun effective_toolchain holdir maxheap =
     val _ = reject_holdir holdir
     val _ = require_schema2 project
   in
-    {holdir = project_hol_holdir project, maxheap = maxheap}
+    {holdir = project_hol_holdir project, maxheap = maxheap,
+     kernel_variant = HolbuildHolToolchainConfig.StandardKernel}
   end
 
 fun context_toolchain holdir maxheap =
@@ -1295,7 +1296,8 @@ fun context_toolchain holdir maxheap =
     val _ = reject_holdir holdir
     val _ = require_schema2 project
   in
-    {holdir = "", maxheap = maxheap}
+    {holdir = "", maxheap = maxheap,
+     kernel_variant = HolbuildHolToolchainConfig.StandardKernel}
   end
 
 fun buildhol holdir maxheap =
