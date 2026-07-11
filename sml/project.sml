@@ -590,29 +590,6 @@ fun validate_manifest_table table =
     validate_schema table
   end
 
-fun validate_override_table (name, table) =
-  (require_safe_materialized_dependency_name ("overrides." ^ name) name;
-   if name = "hol" then die "dependencies.hol cannot be overridden; use dependencies.hol.git with a local path and HOLBUILD_CANONICAL_HOL_GIT"
-   else ();
-   require_known_fields ("overrides." ^ name) ["path", "git"] table;
-   case (string_field table "path", string_field table "git") of
-       (SOME _, NONE) => ()
-     | (NONE, SOME _) => ()
-     | (SOME _, SOME _) => die ("overrides." ^ name ^ " must specify only one of path or git")
-     | (NONE, NONE) => die ("overrides." ^ name ^ " requires path or git"))
-
-fun validate_local_build_table table =
-  require_known_fields ".holconfig.toml build" ["exclude", "exclude_globs", "jobs", "tactic_timeout", "checkpoint_limit_gb"] table
-
-fun validate_local_remote_cache_table table =
-  require_known_fields ".holconfig.toml remote_cache" ["url", "curl_config"] table
-
-fun validate_local_config_table table =
-  (require_known_fields ".holconfig.toml" ["overrides", "build", "remote_cache"] table;
-   Option.app validate_local_build_table (table_field table ["build"]);
-   Option.app validate_local_remote_cache_table (table_field table ["remote_cache"]);
-   List.app validate_override_table (named_table_entries table ["overrides"]))
-
 fun parse_dependency (name, table) =
   let
     val source =
@@ -668,76 +645,10 @@ fun parse_action_policy root (logical, table) =
 fun action_policies_at root table =
   map (parse_action_policy root) (named_table_entries table ["actions"])
 
-fun override_abs root path =
-  let val raw = if Path.isAbsolute path then path else Path.concat(root, path)
-  in Path.mkCanonical raw handle Path.InvalidArc => raw end
-
-fun starts_with prefix s =
-  let val n = size prefix
-  in size s >= n andalso String.substring(s, 0, n) = prefix end
-
-fun contains c s = CharVector.exists (fn c' => c' = c) s
-
-fun remote_git_like git =
-  contains #":" git andalso not (starts_with "." git) andalso not (starts_with "/" git)
-
-fun local_git_abs root git =
-  if Path.isAbsolute git then override_abs root git
-  else if starts_with "http://" git orelse starts_with "https://" git orelse
-          starts_with "ssh://" git orelse starts_with "git://" git orelse
-          starts_with "file://" git orelse remote_git_like git then git
-  else override_abs root git
-
-fun parse_override root (name, table) =
-  case (path_string_field ("overrides." ^ name) table "path",
-        path_string_field ("overrides." ^ name) table "git") of
-      (SOME path, NONE) => OverridePath {name = name, path = override_abs root path}
-    | (NONE, SOME git) => OverrideGit {name = name, git = local_git_abs root git}
-    | _ => die ("[overrides." ^ name ^ "] requires path or git")
-
-fun overrides_at root table = map (parse_override root) (named_table_entries table ["overrides"])
-
-fun local_build_excludes table =
-  case table_field table ["build"] of
-      NONE => ([], [])
-    | SOME build =>
-        let
-          val (excludes, deprecated_globs) =
-            split_deprecated_excludes ".holconfig.toml build.exclude" (string_array_field build "exclude")
-          val globs = package_relative_paths ".holconfig.toml build.exclude_globs" (string_array_field build "exclude_globs")
-        in
-          (excludes, deprecated_globs @ globs)
-        end
-
-fun local_build_jobs table =
-  case table_field table ["build"] of
-      NONE => NONE
-    | SOME build => Option.map (positive_int_field ".holconfig.toml build.jobs") (int_at build ["jobs"])
-
-fun local_build_tactic_timeout table =
-  case table_field table ["build"] of
-      NONE => NONE
-    | SOME build => tactic_timeout_at ".holconfig.toml build.tactic_timeout" build ["tactic_timeout"]
-
 fun build_tactic_timeout_from_manifest build =
   case build of
       NONE => NONE
     | SOME t => tactic_timeout_at "build.tactic_timeout" t ["tactic_timeout"]
-
-fun local_checkpoint_limit_gb table =
-  case table_field table ["build"] of
-      NONE => NONE
-    | SOME build => Option.map (positive_int_field ".holconfig.toml build.checkpoint_limit_gb") (int_at build ["checkpoint_limit_gb"])
-
-fun local_remote_cache_url table =
-  case table_field table ["remote_cache"] of
-      NONE => NONE
-    | SOME remote_cache => string_at remote_cache ["url"]
-
-fun local_remote_cache_curl_config table =
-  case table_field table ["remote_cache"] of
-      NONE => NONE
-    | SOME remote_cache => string_at remote_cache ["curl_config"]
 
 fun root_tactic_timeouts_from_manifest build =
   case build of
@@ -850,18 +761,8 @@ fun validate_root_groups root_groups groups =
   end
 
 fun parse_local_config root =
-  HolbuildLocalConfig.parse
-    {config_path = Path.concat(root, ".holconfig.toml"),
-     readable = readable,
-     parse_file = TOML.fromFile,
-     validate = validate_local_config_table,
-     parse_overrides = overrides_at root,
-     parse_build_excludes = local_build_excludes,
-     parse_build_jobs = local_build_jobs,
-     parse_build_tactic_timeout = local_build_tactic_timeout,
-     parse_checkpoint_limit_gb = local_checkpoint_limit_gb,
-     parse_remote_cache_url = local_remote_cache_url,
-     parse_remote_cache_curl_config = local_remote_cache_curl_config}
+  HolbuildLocalConfig.parse root
+  handle HolbuildManifestUtil.Error msg => die msg
 
 fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, local_config} =
   let
