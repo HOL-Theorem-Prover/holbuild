@@ -291,13 +291,15 @@ fun discover_package package acc =
     sources
   end
 
-fun discover (project : HolbuildProject.t) =
+fun discover_with resolution (project : HolbuildProject.t) =
   by_logical
     (sort_sources
        (List.foldl
           (fn (package, acc) => discover_package package acc)
           []
-          (HolbuildProject.packages project)))
+          (HolbuildProject.packages_with resolution project)))
+
+fun discover project = discover_with HolbuildProject.standard_resolution project
 
 fun kind_string kind =
   case kind of
@@ -456,11 +458,15 @@ fun package_has_default_targets package =
   not (null (HolbuildProject.package_roots package)) orelse
   not (null (HolbuildProject.package_root_groups package))
 
-fun default_targets sources project =
+fun default_targets_with resolution sources project =
   unique_strings
     (List.concat
        (map (default_package_targets sources)
-            (List.filter package_has_default_targets (HolbuildProject.packages project))))
+            (List.filter package_has_default_targets
+              (HolbuildProject.packages_with resolution project))))
+
+fun default_targets sources project =
+  default_targets_with HolbuildProject.standard_resolution sources project
 
 fun root_package_targets sources project =
   let val root_name = HolbuildProject.root_package_name project

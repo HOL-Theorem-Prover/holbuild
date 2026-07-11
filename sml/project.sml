@@ -1046,11 +1046,20 @@ fun schema ({schema, ...} : t) = schema
 fun hol_dependency ({dependencies, ...} : t) =
   List.find (fn Dependency {name, ...} => name = "hol") dependencies
 
-fun project_hol_dir project =
+type resolution = {kernel_variant : HolbuildHolToolchainConfig.kernel_variant}
+val standard_resolution = {kernel_variant = HolbuildHolToolchainConfig.StandardKernel}
+
+fun hol_holdir ({kernel_variant} : resolution) {git, rev} =
+  HolbuildHolSharedCache.holdir_for_with_kernel
+    {git = git, rev = rev, kernel_variant = kernel_variant}
+
+fun project_hol_dir_with resolution project =
   case hol_dependency project of
-      SOME (Dependency {source = GitSource {git, rev}, ...}) =>
-        SOME (HolbuildHolSharedCache.holdir_for {git = git, rev = rev})
+      SOME (Dependency {source = GitSource request, ...}) =>
+        SOME (hol_holdir resolution request)
     | _ => NONE
+
+fun project_hol_dir project = project_hol_dir_with standard_resolution project
 fun build_roots ({roots, ...} : t) = roots
 fun build_root_groups ({root_groups, ...} : t) = root_groups
 fun build_groups ({groups, ...} : t) = groups
@@ -1095,20 +1104,22 @@ fun action_policy_for policies logical =
 fun dependency_path_context name = "dependencies." ^ name ^ ".path"
 fun dependency_manifest_context name = "dependencies." ^ name ^ ".manifest"
 
-fun dependency_local_path (project as {graph_artifact_root, ...} : t) (Dependency {name, source}) =
+fun dependency_local_path_with resolution (project as {graph_artifact_root, ...} : t) (Dependency {name, source}) =
   case override_path (#overrides project) name of
       SOME path => SOME path
     | NONE =>
         case source of
             GitSource {git, rev} =>
-              if name = "hol" then SOME (HolbuildHolSharedCache.holdir_for {git = git, rev = rev})
+              if name = "hol" then SOME (hol_holdir resolution {git = git, rev = rev})
               else SOME (Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), name))
           | FromSource {from, path, ...} =>
               (case hol_dependency project of
                    SOME (Dependency {name = "hol", source = GitSource {git, rev}}) =>
-                     if from = "hol" then SOME (Path.concat(HolbuildHolSharedCache.holdir_for {git = git, rev = rev}, path))
+                     if from = "hol" then SOME (Path.concat(hol_holdir resolution {git = git, rev = rev}, path))
                      else SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path))
                  | _ => SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path)))
+
+fun dependency_local_path project dep = dependency_local_path_with standard_resolution project dep
 
 fun dependency_manifest (project as {manifest = project_manifest, graph_artifact_root, ...} : t) dep =
   case dep of
@@ -1160,7 +1171,7 @@ fun project_package ({root, artifact_root, graph_artifact_root, manifest, name, 
 
 fun root_package_name project = package_name (project_package project)
 
-fun dependency_project (project : t) (dep as Dependency {name, source}) =
+fun dependency_project_with resolution (project : t) (dep as Dependency {name, source}) =
   let
     val _ =
       case source of
@@ -1172,7 +1183,7 @@ fun dependency_project (project : t) (dep as Dependency {name, source}) =
                                                        artifact_root = #graph_artifact_root project}) end
         | _ => ()
     val dep_root =
-      case dependency_local_path project dep of
+      case dependency_local_path_with resolution project dep of
           SOME path => path
         | NONE => die ("dependency " ^ name ^ " has no local path; add path or .holconfig.toml override")
     val dep_manifest =
@@ -1208,7 +1219,9 @@ fun dependency_project (project : t) (dep as Dependency {name, source}) =
     dep_project
   end
 
-fun resolved_hol_dependency project =
+fun dependency_project project dep = dependency_project_with standard_resolution project dep
+
+fun resolved_hol_dependency_with resolution project =
   let
     fun seen name names = List.exists (fn n => n = name) names
     fun search_project names p =
@@ -1221,17 +1234,19 @@ fun resolved_hol_dependency project =
         | (dep as Dependency {name, ...}) :: rest =>
             if seen name names then search_deps names parent rest
             else
-              (case search_project (name :: names) (dependency_project parent dep) of
+              (case search_project (name :: names) (dependency_project_with resolution parent dep) of
                    SOME hol => SOME hol
                  | NONE => search_deps (name :: names) parent rest)
   in
     search_project [] project
   end
 
-fun dependency_package artifact_parent project (dep as Dependency {name, ...}) =
+fun resolved_hol_dependency project = resolved_hol_dependency_with standard_resolution project
+
+fun dependency_package_with resolution artifact_parent project (dep as Dependency {name, ...}) =
   let
-    val dep_project = dependency_project project dep
-    val dep_root = valOf (dependency_local_path project dep)
+    val dep_project = dependency_project_with resolution project dep
+    val dep_root = valOf (dependency_local_path_with resolution project dep)
     val dep_manifest = valOf (dependency_manifest project dep)
     val artifact_root =
       Path.concat(Path.concat(Path.concat(artifact_parent, ".holbuild"), "packages"), name)
@@ -1246,12 +1261,15 @@ fun dependency_package artifact_parent project (dep as Dependency {name, ...}) =
      dep_project)
   end
 
+fun dependency_package artifact_parent project dep =
+  dependency_package_with standard_resolution artifact_parent project dep
+
 fun same_dependency_source (GitSource a, GitSource b) = #git a = #git b andalso #rev a = #rev b
   | same_dependency_source (FromSource a, FromSource b) =
       #from a = #from b andalso #path a = #path b andalso #manifest a = #manifest b
   | same_dependency_source _ = false
 
-fun packages (project : t) =
+fun packages_with resolution (project : t) =
   let
     val artifact_parent = #graph_artifact_root project
     fun seen_source name seen =
@@ -1263,7 +1281,7 @@ fun packages (project : t) =
             else die ("conflicting dependency " ^ name)
         | NONE =>
             let
-              val (package, dep_project) = dependency_package artifact_parent parent_project dep
+              val (package, dep_project) = dependency_package_with resolution artifact_parent parent_project dep
               val (seen', packages') = add_project dep_project ((name, source) :: seen, package :: packages)
             in
               (seen', packages')
@@ -1281,6 +1299,8 @@ fun packages (project : t) =
   in
     result
   end
+
+fun packages project = packages_with standard_resolution project
 
 fun describe (project : t) =
   let
