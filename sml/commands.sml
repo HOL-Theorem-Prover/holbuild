@@ -694,7 +694,8 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
          else HolbuildTacticTimeoutPolicy.entry_timeouts project index entry_plan (default_tactic_timeout ()),
        execution_plan = execution_plan,
        trace_steps = trace_steps,
-       repl_on_failure = repl_on_failure}
+       repl_on_failure = repl_on_failure,
+       trknl = HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)}
     fun prepare_plan () =
       let
         val index =
@@ -890,7 +891,7 @@ fun parse_export_args args =
 fun root_package_name project =
   HolbuildProject.package_name (HolbuildProject.project_package project)
 
-fun export_build_options project index entry_plan plan =
+fun export_build_options trknl project index entry_plan plan =
   let
     fun default_tactic_timeout () =
       case #build_tactic_timeout project of
@@ -906,7 +907,8 @@ fun export_build_options project index entry_plan plan =
      node_tactic_timeouts = HolbuildTacticTimeoutPolicy.entry_timeouts project index entry_plan (default_tactic_timeout ()),
      execution_plan = NONE,
      trace_steps = false,
-     repl_on_failure = false}
+     repl_on_failure = false,
+     trknl = trknl}
   end
 
 fun theory_node node =
@@ -1045,7 +1047,7 @@ fun export_archive tc jobs args =
     val entry_targets = map #2 (HolbuildTacticTimeoutPolicy.declared_entries project index)
     val entry_plan = timed_phase "entry_timeout.plan" (fn () => HolbuildBuildPlan.plan_targets (#holdir tc) index entry_targets)
     val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
-    val options = export_build_options project index entry_plan plan
+    val options = export_build_options (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)) project index entry_plan plan
     val keys = HolbuildBuildPlan.input_keys (HolbuildBuildExec.build_config_lines_for_node options project) toolchain_key plan
     val entries = export_entries project plan keys
     val cache = HolbuildFSCacheBackend.default () handle HolbuildFSCacheBackend.Error msg => raise Error msg
@@ -1160,7 +1162,7 @@ fun build_heap_kind tc cli_jobs command target =
         val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
         val output_path = HolbuildProject.abs_under (#root project) output
       in
-        HolbuildBuildExec.build {use_cache = true, force = HolbuildBuildExec.ForceNone, force_targets = [], skip_checkpoints = false, proof_steps = true, new_ir = true, node_tactic_timeouts = HolbuildTacticTimeoutPolicy.entry_timeouts project index plan (SOME 2.5), execution_plan = NONE, trace_steps = false, repl_on_failure = false}
+        HolbuildBuildExec.build {use_cache = true, force = HolbuildBuildExec.ForceNone, force_targets = [], skip_checkpoints = false, proof_steps = true, new_ir = true, node_tactic_timeouts = HolbuildTacticTimeoutPolicy.entry_timeouts project index plan (SOME 2.5), execution_plan = NONE, trace_steps = false, repl_on_failure = false, trknl = HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)}
                                tc project plan toolchain_key jobs;
         HolbuildBuildExec.export_heap tc project plan output_path kind
       end

@@ -1898,6 +1898,7 @@ fun write_local_theory_manifests plan node {parents, mldeps} =
 fun remove_failed_cache_outputs project node =
   let
     val {sig_path, sml_path, data_path, script_uo, theory_ui, theory_uo} = theory_outputs node
+    val trace_path = drop_suffix ".dat" data_path ^ ".tr.gz"
     (* Invalidate HOL load manifests before removing their targets.  If another
        reader observes the artifact directory while we discard a bad cache entry,
        it should see the theory as unavailable, not a .uo that still points at a
@@ -1909,7 +1910,8 @@ fun remove_failed_cache_outputs project node =
     val payload_paths =
       [data_path, hfs_remapped_path data_path,
        sig_path, hfs_remapped_path sig_path,
-       sml_path, hfs_remapped_path sml_path]
+       sml_path, hfs_remapped_path sml_path,
+       trace_path, hfs_remapped_path trace_path]
   in
     List.app remove_file (manifest_paths @ payload_paths);
     remove_checkpoint_family project node
@@ -2303,13 +2305,13 @@ fun best_failed_prefix_checkpoint requested_timeout checkpoints =
 
 datatype force_level = ForceNone | ForceTargets | ForceProject | ForceAll
 
-type build_options = {use_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, proof_steps : bool, new_ir : bool, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool}
+type build_options = {use_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, proof_steps : bool, new_ir : bool, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, trknl : bool}
 
 datatype checkpoint_policy =
-  CheckpointPolicy of {checkpoint : bool, proof_steps : bool, new_ir : bool, tactic_timeout : real option, execution_plan : string option, trace_steps : bool, repl_on_failure : bool}
+  CheckpointPolicy of {checkpoint : bool, proof_steps : bool, new_ir : bool, tactic_timeout : real option, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, trknl : bool}
 
 val no_checkpoint_policy =
-  CheckpointPolicy {checkpoint = false, proof_steps = false, new_ir = false, tactic_timeout = NONE, execution_plan = NONE, trace_steps = false, repl_on_failure = false}
+  CheckpointPolicy {checkpoint = false, proof_steps = false, new_ir = false, tactic_timeout = NONE, execution_plan = NONE, trace_steps = false, repl_on_failure = false, trknl = false}
 
 fun checkpoint_enabled (CheckpointPolicy {checkpoint, ...}) = checkpoint
 fun proof_steps_enabled (CheckpointPolicy {proof_steps, ...}) = proof_steps
@@ -2318,6 +2320,7 @@ fun tactic_timeout (CheckpointPolicy {tactic_timeout, ...}) = tactic_timeout
 fun execution_plan (CheckpointPolicy {execution_plan, ...}) = execution_plan
 fun trace_steps (CheckpointPolicy {trace_steps, ...}) = trace_steps
 fun repl_on_failure (CheckpointPolicy {repl_on_failure, ...}) = repl_on_failure
+fun trknl_enabled (CheckpointPolicy {trknl, ...}) = trknl
 
 fun execution_plan_only (CheckpointPolicy {execution_plan = SOME _, trace_steps = false, ...}) = true
   | execution_plan_only _ = false
@@ -2578,6 +2581,8 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
     val staged_sig = staged_theory_file stage node ".sig"
     val staged_sml = staged_theory_file stage node ".sml"
     val staged_dat = staged_theory_file stage node ".dat"
+    val staged_trace = staged_theory_file stage node ".tr.gz"
+    val trace_path = drop_suffix ".dat" data_path ^ ".tr.gz"
     val _ = remove_tree stage
     val _ = ensure_dir stage
     val _ = if checkpoint_enabled policy then ensure_parent deps_loaded else ()
@@ -2783,6 +2788,13 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
                NONE => ()
              | SOME output => HolbuildStatus.message_stdout ("proof step trace log: " ^ captured_output_path output ^ "\n"))
       else ()
+    val _ =
+      if trknl_enabled policy then
+        if file_exists staged_trace then
+          (copy_binary staged_trace trace_path;
+           copy_binary staged_trace (hfs_remapped_path trace_path))
+        else raise Error ("tracing kernel did not produce expected proof trace: " ^ staged_trace)
+      else ()
     val _ = copy_binary staged_dat data_path
     val _ = copy_binary staged_dat (hfs_remapped_path data_path)
     val _ = copy_binary staged_sig sig_path
@@ -2828,16 +2840,23 @@ fun build_sml_like plan node output_suffix =
     if output_suffix = ".uo" then write_empty_ui_if_needed plan node else ()
   end
 
-fun output_paths _ _ node =
+fun trace_paths checkpoint_policy data_paths =
+  if trknl_enabled checkpoint_policy then
+    map (fn path => drop_suffix ".dat" path ^ ".tr.gz") data_paths
+  else []
+
+fun output_paths checkpoint_policy _ node =
   let
     val artifacts = source_artifacts node
     val generated_paths = #generated artifacts
     val object_paths = #objects artifacts
     val data_paths = #theory_data artifacts
+    val trace_paths = trace_paths checkpoint_policy data_paths
   in
     generated_paths @ map hfs_remapped_path generated_paths @
     object_paths @ map hfs_remapped_path object_paths @
-    data_paths @ map hfs_remapped_path data_paths
+    data_paths @ map hfs_remapped_path data_paths @
+    trace_paths @ map hfs_remapped_path trace_paths
   end
 
 fun output_hash_line path = "output-sha1=" ^ path ^ " " ^ file_hash path
@@ -3043,7 +3062,7 @@ fun assoc_timeout _ [] = NONE
 fun effective_tactic_timeout proof_steps node_timeout =
   if proof_steps then node_timeout else NONE
 
-fun checkpoint_policy_for_node ({skip_checkpoints, proof_steps, new_ir, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure, ...} : build_options) project node =
+fun checkpoint_policy_for_node ({skip_checkpoints, proof_steps, new_ir, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure, trknl, ...} : build_options) project node =
   CheckpointPolicy {checkpoint = not skip_checkpoints,
                     proof_steps = proof_steps,
                     new_ir = new_ir,
@@ -3051,7 +3070,8 @@ fun checkpoint_policy_for_node ({skip_checkpoints, proof_steps, new_ir, node_tac
                                       (assoc_timeout (HolbuildBuildPlan.key node) node_tactic_timeouts),
                     execution_plan = if proof_steps then execution_plan else NONE,
                     trace_steps = proof_steps andalso trace_steps,
-                    repl_on_failure = repl_on_failure}
+                    repl_on_failure = repl_on_failure,
+                    trknl = trknl}
 
 fun proof_engine (CheckpointPolicy {proof_steps = false, ...}) = "plain_v1"
   | proof_engine (CheckpointPolicy {new_ir = true, ...}) = "proof_ir_v3"
@@ -3190,7 +3210,10 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
     val metadata_checkpoints = []
     val stage = stage_dir project input_key
     val forced = force_node options project node
-    val cache_allowed = #use_cache options andalso cache_enabled node
+    (* Trace blobs are added to action-cache manifests in the next phase.  Until
+       then traced builds must neither publish incomplete entries nor restore
+       entries that cannot materialize their required .tr.gz output. *)
+    val cache_allowed = #use_cache options andalso cache_enabled node andalso not (trknl_enabled policy)
     val cache_restore_allowed = cache_allowed andalso not forced
     fun invalidate_node_dat_hash () =
       invalidate_cached_file_hash dat_hash_cache (#data_path (theory_outputs node))
