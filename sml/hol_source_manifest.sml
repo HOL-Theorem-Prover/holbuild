@@ -186,14 +186,14 @@ fun add_minimum_version path =
       List.exists (fn line => String.isPrefix "minimum_version = " line) lines
     fun add [] = []
       | add (line :: rest) =
-          if line = "[holbuild]" then
+          if trim line = "[holbuild]" then
             line :: ("minimum_version = \"" ^
-                     HolbuildBuiltinManifests.manifest_minimum_version ^ "\"") ::
+                     HolbuildBuiltinManifests.manifest_minimum_version ^ "\"\n") ::
             add rest
           else line :: add rest
   in
     if has_minimum then ()
-    else write_file path (String.concatWith "\n" (add lines) ^ "\n")
+    else write_file path (String.concat (add lines))
   end
 
 fun generate {holdir, manifest_path, members_path} =
