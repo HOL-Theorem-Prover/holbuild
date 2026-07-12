@@ -179,6 +179,23 @@ fun holmake_source_dirs holdir roots =
 
 fun members holdir = holmake_source_dirs holdir (post_toolchain_roots holdir)
 
+fun add_minimum_version path =
+  let
+    val lines = read_lines path
+    val has_minimum =
+      List.exists (fn line => String.isPrefix "minimum_version = " line) lines
+    fun add [] = []
+      | add (line :: rest) =
+          if line = "[holbuild]" then
+            line :: ("minimum_version = \"" ^
+                     HolbuildBuiltinManifests.manifest_minimum_version ^ "\"") ::
+            add rest
+          else line :: add rest
+  in
+    if has_minimum then ()
+    else write_file path (String.concatWith "\n" (add lines) ^ "\n")
+  end
+
 fun generate {holdir, manifest_path, members_path} =
   let
     val members = members holdir

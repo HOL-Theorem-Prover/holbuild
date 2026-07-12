@@ -472,7 +472,7 @@ rev = "$schema2_rev"
 [project]
 name = "required_version_invalid"
 TOML
-expect_context_failure required_version_invalid "invalid holbuild.required_version: expected MAJOR.MINOR.PATCH, got '>=0.2'"
+expect_context_failure required_version_invalid "holbuild.required_version is not supported; use holbuild.minimum_version"
 
 make_project required_version_both_set
 cat > "$tmpdir/required_version_both_set/holproject.toml" <<TOML
@@ -488,7 +488,7 @@ rev = "$schema2_rev"
 [project]
 name = "required_version_both_set"
 TOML
-expect_context_failure required_version_both_set "holbuild.minimum_version and holbuild.required_version may not both be set"
+expect_context_failure required_version_both_set "holbuild.required_version is not supported; use holbuild.minimum_version"
 
 make_project schema2_missing_rev
 write_manifest schema2_missing_rev <<'TOML'

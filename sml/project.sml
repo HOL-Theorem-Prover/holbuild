@@ -168,10 +168,13 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
       generators = generators }
   end
 
-fun parse_at args = parse_table_at (TOML.fromFile (#manifest args)) args
+fun parse_at args =
+  parse_table_at (TOML.fromFile (#manifest args)) args
+  handle Error msg => die (#manifest args ^ ": " ^ msg)
 
 fun parse_builtin_holdir_at args =
   let
+    val _ = HolbuildHolSharedCache.migrate_hol_source_manifest_for_holdir (#root args)
     val cached_manifest = HolbuildHolSharedCache.hol_source_manifest_for_holdir (#root args)
     val text =
       if readable cached_manifest then
@@ -179,9 +182,8 @@ fun parse_builtin_holdir_at args =
         in TextIO.inputAll input before TextIO.closeIn input end
       else HolbuildBuiltinManifests.empty_hol_manifest_text
   in
-    parse_table_at
-      (TOML.fromString (HolbuildBuiltinManifests.upgrade_cached_manifest_text text))
-      args
+    parse_table_at (TOML.fromString text) args
+    handle Error msg => die (cached_manifest ^ ": " ^ msg)
   end
 
 fun parse manifest =

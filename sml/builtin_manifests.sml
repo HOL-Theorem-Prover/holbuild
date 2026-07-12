@@ -2,6 +2,7 @@ structure HolbuildBuiltinManifests =
 struct
 
 val holdir_manifest_name = "builtin:HOLDIR"
+val manifest_minimum_version = "0.10.0"
 
 fun toml_string s =
   "\"" ^ String.translate (fn #"\\" => "\\\\" | #"\"" => "\\\"" | c => str c) s ^ "\""
@@ -14,7 +15,7 @@ fun manifest_text members =
        "",
        "[holbuild]",
        "schema = 2",
-       "minimum_version = \"0.10.0\"",
+       "minimum_version = " ^ toml_string manifest_minimum_version,
        "",
        "[project]",
        "name = \"hol\"",
@@ -41,23 +42,5 @@ fun manifest_text members =
        ""] )
 
 val empty_hol_manifest_text = manifest_text []
-
-(* Toolchain caches created before minimum_version became mandatory contain a
-   generated manifest with only the legacy schema marker. Upgrade that trusted
-   generated text while reading it; regenerating the source inventory would
-   make otherwise-cheap context commands invoke Holmake. *)
-fun upgrade_cached_manifest_text text =
-  let
-    val lines = String.tokens (fn c => c = #"\n") text
-    val has_minimum =
-      List.exists (fn line => String.isPrefix "minimum_version" line) lines
-    fun add [] = []
-      | add (line :: rest) =
-          if line = "[holbuild]" then
-            line :: "minimum_version = \"0.10.0\"" :: add rest
-          else line :: add rest
-  in
-    if has_minimum then text else String.concatWith "\n" (add lines) ^ "\n"
-  end
 
 end
