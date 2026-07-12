@@ -85,16 +85,6 @@ name = "schema1_rejected"
 TOML
 expect_context_failure schema1_rejected "only legacy holproject schema 2 is supported"
 
-make_project missing_schema_accepted
-cat > "$tmpdir/missing_schema_accepted/holproject.toml" <<'TOML'
-[holbuild]
-minimum_version = "0.10.0"
-
-[project]
-name = "missing_schema_accepted"
-TOML
-(cd "$tmpdir/missing_schema_accepted" && "$HOLBUILD_BIN" context) > "$tmpdir/missing_schema_accepted.log"
-
 make_project missing_minimum_version
 cat > "$tmpdir/missing_minimum_version/holproject.toml" <<'TOML'
 [holbuild]
@@ -116,6 +106,20 @@ TOML
 } > "$schema2_repo/holproject.toml"
 schema2_rev=$(init_git_repo "$schema2_repo")
 export HOLBUILD_CANONICAL_HOL_GIT="$schema2_repo"
+
+make_project missing_schema_accepted
+cat > "$tmpdir/missing_schema_accepted/holproject.toml" <<TOML
+[holbuild]
+minimum_version = "0.10.0"
+
+[project]
+name = "missing_schema_accepted"
+
+[dependencies.hol]
+git = "$schema2_repo"
+rev = "$schema2_rev"
+TOML
+(cd "$tmpdir/missing_schema_accepted" && "$HOLBUILD_BIN" context) > "$tmpdir/missing_schema_accepted.log"
 
 make_project valid_schema2_git
 cat > "$tmpdir/valid_schema2_git/holproject.toml" <<TOML
