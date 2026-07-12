@@ -470,12 +470,72 @@ fun validate_compatibility table =
     {schema = schema}
   end
 
+fun validate_generate_entry value =
+  case value of
+      TOML.TABLE generate =>
+        require_known_fields "generate"
+          ["name", "command", "inputs", "outputs", "deps"] generate
+    | _ => die "generate entries must be tables"
+
+fun validate_groups_table table =
+  let
+    fun one (name, value) =
+      (require_group_name name;
+       case value of
+           TOML.TABLE group =>
+             require_known_fields ("build.groups." ^ name)
+               ["include", "include_globs", "exclude", "exclude_globs",
+                "allow_empty"] group
+         | _ => die ("build.groups." ^ name ^ " must be a table"))
+  in
+    case lookup table ["build", "groups"] of
+        NONE => ()
+      | SOME (TOML.TABLE groups) => List.app one groups
+      | SOME _ => die "build.groups must be a table"
+  end
+
+fun validate_image_entries table section fields =
+  case lookup table [section] of
+      NONE => ()
+    | SOME (TOML.ARRAY values) =>
+        List.app
+          (fn TOML.TABLE image => require_known_fields section fields image
+            | _ => die (section ^ " entries must be tables")) values
+    | SOME _ => die (section ^ " must be an array of tables")
+
+fun validate_manifest table =
+  (require_known_fields "holproject.toml"
+     ["holbuild", "project", "build", "dependencies", "run", "heap",
+      "executable", "actions", "generate"] table;
+   Option.app (require_known_fields "project" ["name", "version"])
+     (table_field table ["project"]);
+   Option.app
+     (require_known_fields "build"
+       ["members", "exclude", "exclude_globs", "roots", "root_groups",
+        "groups", "tactic_timeout", "root_tactic_timeouts"])
+     (table_field table ["build"]);
+   Option.app (require_known_fields "run" ["heap", "loads"])
+     (table_field table ["run"]);
+   ignore (validate_compatibility table);
+   List.app validate_dependency_table
+     (named_table_entries table ["dependencies"]);
+   validate_actions table;
+   validate_groups_table table;
+   (case lookup table ["generate"] of
+        NONE => ()
+      | SOME (TOML.ARRAY values) => List.app validate_generate_entry values
+      | SOME _ => die "generate must be an array of tables");
+   validate_image_entries table "heap" ["name", "output", "objects"];
+   validate_image_entries table "executable"
+     ["name", "output", "objects", "main"])
+
 type parsed =
   {definition : t, compatibility : compatibility,
    tactic_timeout : real option}
 
 fun parse_table {table, root} : parsed =
   let
+    val _ = validate_manifest table
     val compatibility = validate_compatibility table
     val {name, version} = parse_metadata table
     val {members, excludes, exclude_globs, roots, root_groups, groups,
