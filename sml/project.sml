@@ -179,7 +179,9 @@ fun parse_builtin_holdir_at args =
         in TextIO.inputAll input before TextIO.closeIn input end
       else HolbuildBuiltinManifests.empty_hol_manifest_text
   in
-    parse_table_at (TOML.fromString text) args
+    parse_table_at
+      (TOML.fromString (HolbuildBuiltinManifests.upgrade_cached_manifest_text text))
+      args
   end
 
 fun parse manifest =
