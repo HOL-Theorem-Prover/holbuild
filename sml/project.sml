@@ -571,34 +571,16 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
   let
     val _ = validate_manifest_table table
     val LocalConfig {overrides, build_excludes, build_exclude_globs, build_jobs, build_tactic_timeout, checkpoint_limit_gb, remote_cache_url, remote_cache_curl_config} = local_config
-    val {members, excludes = manifest_excludes,
-         exclude_globs = manifest_exclude_globs, roots, root_groups, groups,
-         root_tactic_timeouts, tactic_timeout = manifest_timeout} =
-      (HolbuildPackageDefinition.parse_build table
+    val {definition, compatibility = {schema},
+         tactic_timeout = manifest_timeout} =
+      (HolbuildPackageDefinition.parse_table {table = table, root = root}
        handle HolbuildManifestUtil.Error msg => die msg)
+    val {name, version, members, excludes = manifest_excludes,
+         exclude_globs = manifest_exclude_globs, roots, root_groups, groups,
+         root_tactic_timeouts, dependencies, run_heap, run_loads, heaps,
+         action_policies, generators} = definition
     val excludes = manifest_excludes @ build_excludes
     val exclude_globs = manifest_exclude_globs @ build_exclude_globs
-    val schema = schema_version table
-    val dependencies =
-      (HolbuildPackageDefinition.parse_dependencies table
-       handle HolbuildManifestUtil.Error msg => die msg)
-    val {name, version} =
-      (HolbuildPackageDefinition.parse_metadata table
-       handle HolbuildManifestUtil.Error msg => die msg)
-    val {run_heap, run_loads, heaps, generators} =
-      (HolbuildPackageDefinition.parse_runtime table
-       handle HolbuildManifestUtil.Error msg => die msg)
-    val action_policies =
-      (HolbuildPackageDefinition.parse_action_policies {table = table, root = root}
-       handle HolbuildManifestUtil.Error msg => die msg)
-    val definition =
-      HolbuildPackageDefinition.make
-        {name = name, version = version, members = members,
-         excludes = manifest_excludes, exclude_globs = manifest_exclude_globs,
-         roots = roots, root_groups = root_groups, groups = groups,
-         root_tactic_timeouts = root_tactic_timeouts,
-         dependencies = dependencies, run_heap = run_heap, run_loads = run_loads,
-         heaps = heaps, action_policies = action_policies, generators = generators}
   in
     { root = root,
       artifact_root = artifact_root,

@@ -470,6 +470,31 @@ fun validate_compatibility table =
     {schema = schema}
   end
 
+type parsed =
+  {definition : t, compatibility : compatibility,
+   tactic_timeout : real option}
+
+fun parse_table {table, root} : parsed =
+  let
+    val compatibility = validate_compatibility table
+    val {name, version} = parse_metadata table
+    val {members, excludes, exclude_globs, roots, root_groups, groups,
+         root_tactic_timeouts, tactic_timeout} = parse_build table
+    val dependencies = parse_dependencies table
+    val {run_heap, run_loads, heaps, generators} = parse_runtime table
+    val action_policies = parse_action_policies {table = table, root = root}
+    val definition =
+      {name = name, version = version, members = members,
+       excludes = excludes, exclude_globs = exclude_globs,
+       roots = roots, root_groups = root_groups, groups = groups,
+       root_tactic_timeouts = root_tactic_timeouts,
+       dependencies = dependencies, run_heap = run_heap, run_loads = run_loads,
+       heaps = heaps, action_policies = action_policies, generators = generators}
+  in
+    {definition = definition, compatibility = compatibility,
+     tactic_timeout = tactic_timeout}
+  end
+
 fun make (definition : t) = definition
 fun name (definition : t) = #name definition
 fun version (definition : t) = #version definition
