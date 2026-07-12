@@ -403,7 +403,7 @@ fun group_member_sources sources package name =
 fun group_token_name token =
   let val name = String.extract(token, 1, NONE)
   in
-    if HolbuildProject.valid_group_name name then name
+    if HolbuildPackageDefinition.valid_group_name name then name
     else raise Error ("invalid group reference \"" ^ token ^ "\"")
   end
 
