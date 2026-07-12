@@ -19,6 +19,7 @@ mkdir -p "$dep/src" "$project/src"
 cat > "$dep/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -118,6 +119,7 @@ mkdir -p "$root_timeout_project/src"
 cat > "$root_timeout_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"

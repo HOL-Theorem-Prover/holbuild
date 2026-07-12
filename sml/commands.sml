@@ -1282,10 +1282,6 @@ fun reject_holdir holdir =
       SOME _ => raise Error "--holdir is no longer supported; declare dependencies.hol"
     | NONE => ()
 
-fun require_schema2 project =
-  if HolbuildProject.schema project = 2 then ()
-  else raise Error "only holproject schema 2 is supported"
-
 fun project_hol_holdir kernel_variant project =
   let val resolution = {kernel_variant = kernel_variant}
   in
@@ -1301,7 +1297,6 @@ fun effective_toolchain_for kernel_variant holdir maxheap =
   let
     val project = load_project ()
     val _ = reject_holdir holdir
-    val _ = require_schema2 project
   in
     {holdir = project_hol_holdir kernel_variant project, maxheap = maxheap,
      kernel_variant = kernel_variant}
@@ -1317,7 +1312,6 @@ fun context_toolchain holdir maxheap =
   let
     val project = load_project ()
     val _ = reject_holdir holdir
-    val _ = require_schema2 project
   in
     {holdir = "", maxheap = maxheap,
      kernel_variant = HolbuildHolToolchainConfig.StandardKernel}
@@ -1334,7 +1328,6 @@ fun buildhol holdir maxheap args =
     val kernel_variant = parse_buildhol_args args
     val project = load_project ()
     val _ = reject_holdir holdir
-    val _ = require_schema2 project
     val holdir = project_hol_holdir kernel_variant project
   in
     print (holdir ^ "\n")

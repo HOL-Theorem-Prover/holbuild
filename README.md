@@ -63,7 +63,7 @@ Create `holproject.toml` in the root of your HOL project:
 ```toml
 [holbuild]
 schema = 2
-minimum_version = "<MAJOR.MINOR.PATCH>"  # optional; required_version is accepted as an alias
+minimum_version = "<MAJOR.MINOR.PATCH>"  # required
 
 [project]
 name = "example"
@@ -270,10 +270,10 @@ schema = 2
 minimum_version = "<MAJOR.MINOR.PATCH>"
 ```
 
-`schema = 2` is required. `minimum_version` is optional; `required_version` is
-accepted as an alias for compatibility. Set only one of them. If present, it
-must be a semantic version `MAJOR.MINOR.PATCH` and means "this project requires
-at least this holbuild version".
+`minimum_version` is required and must be a semantic version
+`MAJOR.MINOR.PATCH`; it means "this project requires at least this holbuild
+version". The legacy `schema = 2` marker is optional. Other schema values and
+`required_version` are rejected.
 
 ### `[project]`
 

@@ -18,6 +18,7 @@ dependency with a shim manifest:
 # consumer holproject.toml
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -33,6 +34,7 @@ manifest = "shims/keccak.toml"
 # shims/keccak.toml
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "keccak"

@@ -2,12 +2,12 @@
 
 ## Schema
 
-holbuild currently supports schema 2 only. The schema marker is required.
+`minimum_version` is required. The legacy schema-2 marker is optional.
 
 ```toml
 [holbuild]
 schema = 2
-minimum_version = "0.6.0"  # optional; required_version is accepted as an alias
+minimum_version = "0.10.0"  # required
 
 [project]
 name = "myproject"     # required for dependencies; optional for root
@@ -70,7 +70,7 @@ impure = true                     # shorthand: cache=false + always_reexecute=tr
 
 Unknown fields in recognized tables are **errors**, not silently ignored. This catches typos early.
 
-`[holbuild].minimum_version` (or its alias `[holbuild].required_version`), when present, must be a semantic version `MAJOR.MINOR.PATCH` and requires the running holbuild version to be at least that version. Set only one of them.
+`[holbuild].minimum_version` must be a semantic version `MAJOR.MINOR.PATCH` and requires the running holbuild version to be at least that version. `[holbuild].required_version` is rejected.
 
 Tables validated: `[holbuild]`, `[project]`, `[build]` (including `root_groups` and `groups`), `[build.groups.*]`, `[run]`, `[dependencies.*]`, `[actions.*]`, `[[generate]]`, `[[heap]]`, `[[executable]]`.
 

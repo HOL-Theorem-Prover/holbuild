@@ -19,6 +19,7 @@ make_repo() {
   cat > "$dir/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "$name"
@@ -56,6 +57,7 @@ mkdir -p "$root"
 cat > "$root/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "root"
@@ -77,6 +79,7 @@ mkdir -p "$nohol"
 cat > "$nohol/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "nohol"
@@ -121,6 +124,7 @@ mkdir -p "$conflict"
 cat > "$conflict/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "conflict"

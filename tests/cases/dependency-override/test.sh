@@ -30,6 +30,7 @@ make_project_dir() {
   cat > "$dir/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "$name"
@@ -65,6 +66,7 @@ mkdir -p "$project"
 cat > "$project/holproject.toml" <<'TOML'
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "direct_project"
@@ -105,6 +107,7 @@ mkdir -p "$git_project"
 cat > "$git_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "git_project"
@@ -148,6 +151,7 @@ mkdir -p "$recursive_project"
 cat > "$recursive_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "recursive_project"
@@ -198,6 +202,7 @@ mkdir -p "$recursive_git_project"
 cat > "$recursive_git_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "recursive_git_project"

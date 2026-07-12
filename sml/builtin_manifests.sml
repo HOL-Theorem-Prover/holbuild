@@ -14,6 +14,7 @@ fun manifest_text members =
        "",
        "[holbuild]",
        "schema = 2",
+       "minimum_version = \"0.10.0\"",
        "",
        "[project]",
        "name = \"hol\"",

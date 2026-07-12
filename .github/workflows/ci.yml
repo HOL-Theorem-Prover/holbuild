@@ -58,6 +58,7 @@ jobs:
           {
             echo '[holbuild]'
             echo 'schema = 2'
+            echo 'minimum_version = "0.10.0"'
             echo
             echo '[dependencies.hol]'
             echo 'git = "https://github.com/HOL-Theorem-Prover/HOL.git"'

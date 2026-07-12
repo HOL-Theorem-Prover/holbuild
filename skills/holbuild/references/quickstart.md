@@ -19,6 +19,7 @@ That `HOLDIR` is only a test input for holbuild's own test suite; it is not a pr
 # holproject.toml
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "myproject"

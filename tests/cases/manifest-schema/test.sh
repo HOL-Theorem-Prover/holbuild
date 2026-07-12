@@ -78,18 +78,32 @@ make_project schema1_rejected
 cat > "$tmpdir/schema1_rejected/holproject.toml" <<'TOML'
 [holbuild]
 schema = 1
+minimum_version = "0.10.0"
 
 [project]
 name = "schema1_rejected"
 TOML
-expect_context_failure schema1_rejected "only holproject schema 2 is supported"
+expect_context_failure schema1_rejected "only legacy holproject schema 2 is supported"
 
-make_project missing_schema_rejected
-cat > "$tmpdir/missing_schema_rejected/holproject.toml" <<'TOML'
+make_project missing_schema_accepted
+cat > "$tmpdir/missing_schema_accepted/holproject.toml" <<'TOML'
+[holbuild]
+minimum_version = "0.10.0"
+
 [project]
-name = "missing_schema_rejected"
+name = "missing_schema_accepted"
 TOML
-expect_context_failure missing_schema_rejected "holproject.toml must declare \[holbuild\] schema = 2"
+(cd "$tmpdir/missing_schema_accepted" && "$HOLBUILD_BIN" context) > "$tmpdir/missing_schema_accepted.log"
+
+make_project missing_minimum_version
+cat > "$tmpdir/missing_minimum_version/holproject.toml" <<'TOML'
+[holbuild]
+schema = 2
+
+[project]
+name = "missing_minimum_version"
+TOML
+expect_context_failure missing_minimum_version "holproject.toml must declare holbuild.minimum_version"
 
 schema2_repo=$tmpdir/schema2-repo
 mkdir -p "$schema2_repo"
@@ -107,6 +121,7 @@ make_project valid_schema2_git
 cat > "$tmpdir/valid_schema2_git/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "valid_schema2_git"
@@ -122,6 +137,7 @@ make_project valid_schema2_from
 cat > "$tmpdir/valid_schema2_from/holexamples.manifest.toml" <<'TOML'
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "holexamples"
@@ -129,6 +145,7 @@ TOML
 cat > "$tmpdir/valid_schema2_from/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "valid_schema2_from"
@@ -324,6 +341,7 @@ expect_context_failure no_paths_includes "unknown field in holproject.toml: path
 cat > "$tmpdir/bad_type/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -337,6 +355,7 @@ expect_context_failure bad_type "name must be a string"
 cat > "$tmpdir/bad_project_name/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -376,6 +395,7 @@ make_project required_version_current
 cat > "$tmpdir/required_version_current/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 required_version = "$holbuild_version"
 
 [dependencies.hol]
@@ -385,7 +405,7 @@ rev = "$schema2_rev"
 [project]
 name = "required_version_current"
 TOML
-(cd "$tmpdir/required_version_current" && "$HOLBUILD_BIN" context) > "$tmpdir/required_version_current.log"
+expect_context_failure required_version_current "holbuild.required_version is not supported; use holbuild.minimum_version"
 
 future_holbuild_version=999.0.0
 make_project minimum_version_future
@@ -407,6 +427,7 @@ make_project required_version_future
 cat > "$tmpdir/required_version_future/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 required_version = "$future_holbuild_version"
 
 [dependencies.hol]
@@ -416,7 +437,7 @@ rev = "$schema2_rev"
 [project]
 name = "required_version_future"
 TOML
-expect_context_failure required_version_future "project requires holbuild >= $future_holbuild_version, but this is holbuild $holbuild_version"
+expect_context_failure required_version_future "holbuild.required_version is not supported; use holbuild.minimum_version"
 
 make_project minimum_version_invalid
 cat > "$tmpdir/minimum_version_invalid/holproject.toml" <<TOML
@@ -437,6 +458,7 @@ make_project required_version_invalid
 cat > "$tmpdir/required_version_invalid/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 required_version = ">=0.2"
 
 [dependencies.hol]

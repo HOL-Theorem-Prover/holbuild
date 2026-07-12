@@ -76,7 +76,7 @@ type metadata = {name : string option, version : string option}
 type runtime =
   {run_heap : string option, run_loads : string list, heaps : heap list,
    generators : generator list}
-type compatibility = {schema : int}
+type compatibility = {minimum_version : string}
 
 fun is_hex c = Char.isDigit c orelse (#"a" <= c andalso c <= #"f")
 fun validate_git_rev rev =
@@ -421,53 +421,35 @@ fun parse_build table : build_definition =
      tactic_timeout = build_tactic_timeout_from_manifest build}
   end
 
-fun schema_version table =
-  case table_field table ["holbuild"] of
-      NONE => die "holproject.toml must declare [holbuild] schema = 2"
-    | SOME holbuild =>
-        case int_at holbuild ["schema"] of
-            NONE => die "holproject.toml must declare [holbuild] schema = 2"
-          | SOME n =>
-              if n = IntInf.fromInt 2 then 2
-              else die "only holproject schema 2 is supported"
-
-fun version_field_at holbuild name =
-  case string_at holbuild [name] of
-      NONE => NONE
-    | SOME "" => NONE
-    | SOME text => SOME (name, text)
-
-fun configured_required_version holbuild =
-  case (lookup holbuild ["minimum_version"], lookup holbuild ["required_version"]) of
-      (SOME _, SOME _) => die "holbuild.minimum_version and holbuild.required_version may not both be set"
-    | _ =>
-        (case (version_field_at holbuild "minimum_version",
-               version_field_at holbuild "required_version") of
-             (NONE, NONE) => NONE
-           | (SOME version, NONE) => SOME version
-           | (NONE, SOME version) => SOME version
-           | (SOME _, SOME _) => raise Fail "unreachable version field state")
-
-fun validate_required_version holbuild =
-  case configured_required_version holbuild of
-      NONE => ()
-    | SOME (name, required) =>
-        (HolbuildVersion.require_at_least required
-         handle HolbuildVersion.Error msg =>
-           die ("invalid holbuild." ^ name ^ ": " ^ msg))
-
 fun validate_compatibility table =
   let
     val holbuild =
       case table_field table ["holbuild"] of
-          NONE => die "holproject.toml must declare [holbuild] schema = 2"
+          NONE => die "holproject.toml must declare [holbuild] minimum_version"
         | SOME value => value
     val _ = require_known_fields "holbuild"
               ["schema", "minimum_version", "required_version"] holbuild
-    val schema = schema_version table
-    val _ = validate_required_version holbuild
+    val _ =
+      case lookup holbuild ["required_version"] of
+          NONE => ()
+        | SOME _ => die "holbuild.required_version is not supported; use holbuild.minimum_version"
+    val _ =
+      case int_at holbuild ["schema"] of
+          NONE => ()
+        | SOME n =>
+            if n = IntInf.fromInt 2 then ()
+            else die "only legacy holproject schema 2 is supported"
+    val minimum_version =
+      case string_at holbuild ["minimum_version"] of
+          NONE => die "holproject.toml must declare holbuild.minimum_version"
+        | SOME "" => die "holbuild.minimum_version must not be empty"
+        | SOME value => value
+    val _ =
+      (HolbuildVersion.require_at_least minimum_version
+       handle HolbuildVersion.Error msg =>
+         die ("invalid holbuild.minimum_version: " ^ msg))
   in
-    {schema = schema}
+    {minimum_version = minimum_version}
   end
 
 fun validate_generate_entry value =

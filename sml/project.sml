@@ -41,7 +41,6 @@ type t =
     graph_artifact_root : string,
     manifest : string,
     definition : HolbuildPackageDefinition.t,
-    schema : int,
     name : string option,
     version : string option,
     members : string list,
@@ -127,7 +126,7 @@ fun parse_local_config root =
 fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, local_config} =
   let
     val LocalConfig {overrides, build_excludes, build_exclude_globs, build_jobs, build_tactic_timeout, checkpoint_limit_gb, remote_cache_url, remote_cache_curl_config} = local_config
-    val {definition, compatibility = {schema},
+    val {definition, compatibility = _,
          tactic_timeout = manifest_timeout} =
       (HolbuildPackageDefinition.parse_table {table = table, root = root}
        handle HolbuildManifestUtil.Error msg => die msg)
@@ -143,7 +142,6 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
       graph_artifact_root = graph_artifact_root,
       manifest = manifest,
       definition = definition,
-      schema = schema,
       name = name,
       version = version,
       members = members,
@@ -254,7 +252,6 @@ fun package_generators (Package {generators, ...}) = generators
 fun artifact_root ({artifact_root, ...} : t) = artifact_root
 fun package_definition ({definition, ...} : t) = definition
 fun local_config ({local_config, ...} : t) = local_config
-fun schema ({schema, ...} : t) = schema
 fun hol_dependency ({dependencies, ...} : t) =
   List.find (fn Dependency {name, ...} => name = "hol") dependencies
 

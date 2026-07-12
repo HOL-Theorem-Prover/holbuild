@@ -30,6 +30,7 @@ required. The only supported schema is currently schema 2:
 ```toml
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 ```
 
 Package roots are declared by one of:
@@ -69,6 +70,7 @@ contain exactly one package named `hol`.
 ```toml
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -88,10 +90,11 @@ Supported dependency forms are deliberately narrow:
   `manifest` is a shim manifest relative to the declaring package's manifest
   root. Both paths are relative and cannot contain `..`.
 
-Schema 2 rejects path dependencies, local overrides, git manifests, branches,
-tags, ranges, registry names, and multiple versions. `[holbuild].minimum_version`
-(or its alias `[holbuild].required_version`) is an optional `MAJOR.MINOR.PATCH`
-minimum holbuild version check.
+The current manifest language rejects path dependencies, local overrides, Git
+manifests, branches, tags, ranges, registry names, and multiple versions.
+`[holbuild].minimum_version` is a required `MAJOR.MINOR.PATCH` minimum holbuild
+version check. The legacy `schema = 2` marker is optional, and
+`required_version` is rejected.
 
 For a root project, all dependency source checkouts are materialized once under:
 

@@ -27,6 +27,7 @@ Never request `.uo`/`.ui`/`.dat` — use logical names like `FooTheory`.
 ```toml
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "myproject"

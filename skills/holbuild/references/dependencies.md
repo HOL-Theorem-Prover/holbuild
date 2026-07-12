@@ -7,6 +7,7 @@ holbuild uses schema 2 dependency management only. A resolved project graph must
 ```toml
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -61,6 +62,7 @@ manifest = "shims/keccak.toml"
 # shims/keccak.toml
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "keccak"

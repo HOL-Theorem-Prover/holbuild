@@ -3,7 +3,7 @@
 # explicit package/action boundaries until their inputs/outputs are modeled.
 
 [holbuild]
-schema = 1
+minimum_version = "0.10.0"
 
 [project]
 name = "HOLDIR"
