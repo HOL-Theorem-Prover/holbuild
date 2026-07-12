@@ -378,90 +378,6 @@ fun named_table_entries table key =
           map one entries
         end
 
-fun parse_image_entry section kind value =
-  case value of
-      TOML.TABLE table =>
-        let
-          val name =
-            case string_field table "name" of
-                SOME s => s
-              | NONE => die ("[[" ^ section ^ "]] entry requires name")
-          val output =
-            case string_field table "output" of
-                SOME s => s
-              | NONE => die ("[[" ^ section ^ "]] entry requires output")
-          val objects = string_array_field table "objects"
-        in
-          Heap {name = name, output = output, objects = objects, kind = kind table}
-        end
-    | _ => die (section ^ " entries must be tables")
-
-fun parse_heap value = parse_image_entry "heap" (fn _ => HeapImage) value
-
-fun parse_executable value =
-  parse_image_entry "executable"
-    (fn table => ExecutableImage {main = Option.getOpt (string_field table "main", "main")})
-    value
-
-fun heap_entries_at table =
-  case lookup table ["heap"] of
-      NONE => []
-    | SOME (TOML.ARRAY values) => map parse_heap values
-    | SOME _ => die "heap must be an array of tables"
-
-fun executable_entries_at table =
-  case lookup table ["executable"] of
-      NONE => []
-    | SOME (TOML.ARRAY values) => map parse_executable values
-    | SOME _ => die "executable must be an array of tables"
-
-fun reject_duplicate_heap_names heaps =
-  let
-    fun name_of (Heap {name, ...}) = name
-    fun seen name values = List.exists (fn value => value = name) values
-    fun loop names rest =
-      case rest of
-          [] => ()
-        | heap :: more =>
-          let val name = name_of heap
-          in
-            if seen name names then die ("duplicate heap/executable target name: " ^ name)
-            else loop (name :: names) more
-          end
-  in
-    loop [] heaps
-  end
-
-fun heaps_at table =
-  let val heaps = heap_entries_at table @ executable_entries_at table
-  in reject_duplicate_heap_names heaps; heaps end
-
-fun parse_generator value =
-  case value of
-      TOML.TABLE table =>
-        let
-          val name =
-            case string_field table "name" of
-                SOME s => s
-              | NONE => die "[[generate]] entry requires name"
-          val command = required_string_array_field ("generate." ^ name) table "command"
-          val inputs = package_relative_paths ("generate." ^ name ^ ".inputs") (string_array_field table "inputs")
-          val outputs = package_relative_paths ("generate." ^ name ^ ".outputs") (required_string_array_field ("generate." ^ name) table "outputs")
-          val deps = string_array_field table "deps"
-          val _ = if name = "" then die "generate.name must not be empty" else ()
-          val _ = if null command then die ("generate." ^ name ^ ".command must not be empty") else ()
-          val _ = if null outputs then die ("generate." ^ name ^ ".outputs must not be empty") else ()
-        in
-          Generator {name = name, command = command, inputs = inputs, outputs = outputs, deps = deps}
-        end
-    | _ => die "generate entries must be tables"
-
-fun generators_at table =
-  case lookup table ["generate"] of
-      NONE => []
-    | SOME (TOML.ARRAY values) => map parse_generator values
-    | SOME _ => die "generate must be an array of tables"
-
 fun compatibility table =
   HolbuildPackageDefinition.validate_compatibility table
   handle HolbuildManifestUtil.Error msg => die msg
@@ -469,31 +385,6 @@ fun compatibility table =
 fun schema_version table = #schema (compatibility table)
 
 fun validate_schema table = ignore (compatibility table)
-
-fun validate_dependency_table (name, table) =
-  let
-    val context = "dependencies." ^ name
-    val path = string_field table "path"
-    val manifest = string_field table "manifest"
-    val git = string_field table "git"
-    val rev = string_field table "rev"
-    val from = string_field table "from"
-  in
-    require_known_fields context ["git", "rev", "from", "path", "manifest"] table;
-    case (git, rev, from, path, manifest) of
-        (SOME _, SOME rev, NONE, NONE, NONE) => validate_git_rev rev
-      | (SOME _, NONE, _, _, _) => die (context ^ " with git requires rev")
-      | (NONE, SOME _, _, _, _) => die (context ^ " with rev requires git")
-      | (SOME _, SOME _, _, _, _) => die (context ^ " git dependency may only contain git and rev")
-      | (NONE, NONE, SOME from, SOME path, SOME manifest) =>
-          (require_safe_materialized_dependency_name (context ^ ".from") from;
-           ignore (package_relative_path (context ^ ".path") path);
-           ignore (package_relative_path (context ^ ".manifest") manifest))
-      | (NONE, NONE, SOME _, _, _) => die (context ^ " with from requires path and manifest")
-      | (NONE, NONE, NONE, SOME _, _) => die (context ^ " path dependencies are not supported")
-      | (NONE, NONE, NONE, NONE, SOME _) => die (context ^ " manifest requires from")
-      | (NONE, NONE, NONE, NONE, NONE) => die (context ^ " must specify either git/rev or from/path/manifest")
-  end
 
 fun validate_generate_entry value =
   case value of
@@ -555,39 +446,6 @@ fun validate_manifest_table table =
         | SOME _ => die "executable must be an array of tables"
   in
     validate_schema table
-  end
-
-fun parse_dependency (name, table) =
-  let
-    val source =
-      case (string_field table "git", string_field table "rev", string_field table "from",
-            string_field table "path", string_field table "manifest") of
-          (SOME git, SOME rev, NONE, NONE, NONE) => GitSource {git = git, rev = rev}
-        | (NONE, NONE, SOME from, SOME path, SOME manifest) =>
-            FromSource {from = from, path = path, manifest = manifest}
-        | _ => die ("invalid dependency form for dependencies." ^ name)
-  in
-    Dependency {name = name, source = source}
-  end
-
-fun dependencies_at table = map parse_dependency (named_table_entries table ["dependencies"])
-
-fun dependency_name (Dependency {name, ...}) = name
-
-fun validate_schema2_dependency_refs deps =
-  let
-    fun source_for name =
-      Option.map (fn Dependency {source, ...} => source)
-        (List.find (fn dep => dependency_name dep = name) deps)
-    fun validate_one (Dependency {name, source = FromSource {from, ...}}) =
-          (case source_for from of
-               SOME (GitSource _) => ()
-             | SOME _ => die ("dependencies." ^ name ^ " from dependency must refer to a direct git dependency: " ^ from)
-             | NONE => die ("dependencies." ^ name ^ " from dependency is unknown: " ^ from))
-      | validate_one (Dependency {name, source = GitSource _, ...}) =
-          require_safe_materialized_dependency_name ("dependencies." ^ name) name
-  in
-    List.app validate_one deps
   end
 
 fun build_tactic_timeout_from_manifest build =
