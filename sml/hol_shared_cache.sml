@@ -6,7 +6,7 @@ structure FS = OS.FileSys
 
 exception Error of string
 
-val format_version = "holbuild-hol-toolchain-v1"
+val format_version = "holbuild-hol-toolchain-v2"
 val default_canonical_git = "https://github.com/HOL-Theorem-Prover/HOL.git"
 val standard_kernel = HolbuildHolToolchainConfig.StandardKernel
 
@@ -151,24 +151,7 @@ fun generate_hol_source_manifest k =
      members_path = hol_source_members_for_key k}
   handle HolbuildHolSourceManifest.Error msg => die msg
 
-fun manifest_has_minimum_version path =
-  if not (readable path) then false
-  else
-    let
-      val input = TextIO.openIn path
-      fun loop () =
-        case TextIO.inputLine input of
-            NONE => false
-          | SOME line =>
-              if String.isPrefix "minimum_version = " line then true else loop ()
-      val result = loop () handle exn => (TextIO.closeIn input; raise exn)
-    in
-      TextIO.closeIn input;
-      result
-    end
-
-fun hol_source_manifest_built k =
-  manifest_has_minimum_version (hol_source_manifest_for_key k)
+fun hol_source_manifest_built k = readable (hol_source_manifest_for_key k)
 
 fun validate_entry req k =
   let val dir = entry_dir_for_key k
@@ -235,27 +218,6 @@ fun acquire_lock k =
 fun release_lock (ToolchainLock lock) =
   (HolbuildFileLock.remove_file (lock_owner_path (HolbuildFileLock.path lock));
    HolbuildFileLock.release lock)
-
-fun migrate_hol_source_manifest_for_holdir holdir =
-  let
-    val entry = Path.dir holdir
-    val k = Path.file entry
-    val expected = holdir_for_key k
-  in
-    if holdir <> expected then
-      die ("HOL directory is not in the shared toolchain cache: " ^ holdir)
-    else if not (readable (hol_source_manifest_for_key k)) orelse
-            hol_source_manifest_built k then ()
-    else
-      let val l = acquire_lock k
-      in
-        ((if hol_source_manifest_built k then ()
-          else HolbuildHolSourceManifest.add_minimum_version
-                 (hol_source_manifest_for_key k))
-         before release_lock l)
-        handle e => (release_lock l; raise e)
-      end
-  end
 
 fun write_file path text =
   let val out = TextIO.openOut path
@@ -345,7 +307,6 @@ fun ensure_built_with_kernel req =
     val material = key_material req
     val k = HolbuildHash.string_sha1 material
     val ak = analyser_key ()
-    val _ = migrate_hol_source_manifest_for_holdir (holdir_for_key k)
   in
     if validate_entry req k andalso hol_source_manifest_built k andalso analyser_built k ak then holdir_for_key k
     else

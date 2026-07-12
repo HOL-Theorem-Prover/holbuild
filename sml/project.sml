@@ -174,7 +174,6 @@ fun parse_at args =
 
 fun parse_builtin_holdir_at args =
   let
-    val _ = HolbuildHolSharedCache.migrate_hol_source_manifest_for_holdir (#root args)
     val cached_manifest = HolbuildHolSharedCache.hol_source_manifest_for_holdir (#root args)
     val text =
       if readable cached_manifest then
