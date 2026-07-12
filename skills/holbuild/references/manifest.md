@@ -10,7 +10,7 @@ schema = 2
 minimum_version = "0.10.0"  # required
 
 [project]
-name = "myproject"     # required for dependencies; optional for root
+name = "myproject"     # required
 version = "0.1.0"      # optional
 
 [dependencies.hol]
@@ -97,7 +97,7 @@ Schema 2 dependency forms:
    ```
    `from` names a direct git dependency in the same manifest, `path` selects a subtree inside that checkout, and `manifest` is relative to the declaring package's manifest directory.
 
-Dependency `name` in `[dependencies.X]` must match `project.name` in the resolved manifest when the manifest declares a name. Mismatch is an error, except for the built-in `hol` manifest.
+The dependency key in `[dependencies.X]` must match the required `project.name` in the resolved manifest. Mismatch is an error.
 
 Unsupported: schema 1, `[dependencies.HOLDIR]`, manifest path dependencies, dependency path environment expansion, branches/tags/ranges, registries, lockfiles, solvers, and multiple versions of one package. Local `path`/`git` source overrides are available in `.holconfig.toml`, not in committed manifests.
 

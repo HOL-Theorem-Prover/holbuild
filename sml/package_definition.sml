@@ -56,7 +56,7 @@ datatype dependency =
    source acquisition, local overrides, and invocation configuration belong to
    resolved package/project state rather than this definition. *)
 type t =
-  { name : string option,
+  { name : string,
     version : string option,
     members : string list,
     excludes : string list,
@@ -72,7 +72,7 @@ type t =
     action_policies : action_policy list,
     generators : generator list }
 
-type metadata = {name : string option, version : string option}
+type metadata = {name : string, version : string option}
 type runtime =
   {run_heap : string option, run_loads : string list, heaps : heap list,
    generators : generator list}
@@ -84,16 +84,21 @@ fun validate_git_rev rev =
   else die ("git dependency rev must be a full 40-character lowercase hex commit: " ^ rev)
 
 fun parse_metadata table : metadata =
-  case table_field table ["project"] of
-      NONE => {name = NONE, version = NONE}
-    | SOME project =>
-        let
-          val name =
-            Option.map
-              (fn value =>
-                (require_safe_materialized_dependency_name "project.name" value; value))
-              (string_field project "name")
-        in {name = name, version = string_field project "version"} end
+  let
+    val project =
+      case table_field table ["project"] of
+          NONE => die "holproject.toml must declare [project] name"
+        | SOME value => value
+    val name =
+      case string_field project "name" of
+          NONE => die "holproject.toml must declare [project] name"
+        | SOME "" => die "project.name must not be empty"
+        | SOME value =>
+            (require_safe_materialized_dependency_name "project.name" value;
+             value)
+  in
+    {name = name, version = string_field project "version"}
+  end
 
 fun validate_dependency_table (name, table) =
   let

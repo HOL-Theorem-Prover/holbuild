@@ -282,7 +282,8 @@ version". The legacy `schema = 2` marker is optional. Other schema values and
 name = "example"
 ```
 
-The project name is used when the project is consumed as a dependency.
+`project.name` is required and identifies the logical package. A dependency
+manifest's name must match its dependency key.
 
 ### `[dependencies.*]`
 

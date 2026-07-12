@@ -41,7 +41,7 @@ type t =
     graph_artifact_root : string,
     manifest : string,
     definition : HolbuildPackageDefinition.t,
-    name : string option,
+    name : string,
     version : string option,
     members : string list,
     excludes : string list,
@@ -374,7 +374,7 @@ fun override_to_string (OverridePath {name, path}) = name ^ " path -> " ^ path
   | override_to_string (OverrideGit {name, git}) = name ^ " git -> " ^ git
 
 fun project_package ({root, artifact_root, graph_artifact_root, manifest, name, members, excludes, exclude_globs, roots, root_groups, groups, action_policies, generators, ...} : t) =
-  Package {name = Option.getOpt(name, "root"), root = root, manifest = manifest,
+  Package {name = name, root = root, manifest = manifest,
            members = members, excludes = excludes, exclude_globs = exclude_globs,
            roots = roots, root_groups = root_groups, groups = groups,
            artifact_root = if artifact_root = graph_artifact_root then Path.concat(artifact_root, ".holbuild") else artifact_root,
@@ -422,11 +422,8 @@ fun dependency_project_with resolution (project : t) (dep as Dependency {name, s
                                                              remote_cache_curl_config = #remote_cache_curl_config project}}
     val declared_name = #name dep_project
     val _ =
-      case declared_name of
-          NONE => ()
-        | SOME actual =>
-            if actual = name orelse schema2_hol_dependency dep then ()
-            else die ("dependency " ^ name ^ " manifest declares project.name = " ^ actual)
+      if declared_name = name then ()
+      else die ("dependency " ^ name ^ " manifest declares project.name = " ^ declared_name)
   in
     dep_project
   end
@@ -534,7 +531,7 @@ fun describe (project : t) =
     print ("manifest: " ^ manifest ^ "\n");
     print ("root: " ^ root ^ "\n");
     print ("artifact-root: " ^ artifact_root ^ "\n");
-    opt "name: " name;
+    print ("name: " ^ name ^ "\n");
     opt "version: " version;
     print ("members: " ^ String.concatWith ", " members ^ "\n");
     print ("exclude: " ^ String.concatWith ", " excludes ^ "\n");

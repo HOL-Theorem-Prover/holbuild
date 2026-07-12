@@ -342,6 +342,28 @@ includes = ["src"]
 TOML
 expect_context_failure no_paths_includes "unknown field in holproject.toml: paths"
 
+make_project missing_project
+cat > "$tmpdir/missing_project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+TOML
+expect_context_failure missing_project "holproject.toml must declare \[project\] name"
+
+make_project missing_project_name
+cat > "$tmpdir/missing_project_name/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+version = "1.0.0"
+TOML
+expect_context_failure missing_project_name "holproject.toml must declare \[project\] name"
+
+make_project empty_project_name
+cat > "$tmpdir/empty_project_name/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = ""
+TOML
+expect_context_failure empty_project_name "project.name must not be empty"
+
 cat > "$tmpdir/bad_type/holproject.toml" <<TOML
 [holbuild]
 schema = 2

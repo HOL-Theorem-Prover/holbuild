@@ -94,7 +94,7 @@ holbuild no longer supports:
 3. Materialize direct git dependencies under `.holbuild/src/<package>`; `hol` is resolved to the shared global HOL cache path.
 4. Resolve `from/path/manifest` dependencies to subtrees of direct git dependencies.
 5. Parse each dependency's manifest recursively.
-6. Validate that dependency manifest `project.name`, when present, matches the dependency key name, except for the built-in `hol` manifest.
+6. Validate that the required dependency manifest `project.name` matches the dependency key name.
 7. Assign dependency package artifacts under `.holbuild/packages/<package-name>`.
 8. Build the full resolved graph.
 
