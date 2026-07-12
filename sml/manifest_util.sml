@@ -88,6 +88,14 @@ fun table_field table key =
 fun string_field table name = string_at table [name]
 fun string_array_field table name = string_array_at table [name]
 
+fun string_array_field_opt table name =
+  case lookup table [name] of
+      NONE => NONE
+    | SOME value =>
+        (case string_array_value value of
+             SOME xs => SOME xs
+           | NONE => die (name ^ " must be a string array"))
+
 fun required_string_array_field context table name =
   case lookup table [name] of
       NONE => die (context ^ " requires " ^ name)

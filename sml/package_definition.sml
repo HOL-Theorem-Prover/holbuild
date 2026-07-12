@@ -250,6 +250,177 @@ fun parse_action_policy root (logical, table) =
 fun parse_action_policies {table, root} =
   (validate_actions table; map (parse_action_policy root) (action_entries table))
 
+fun group_name_char c =
+  (#"A" <= c andalso c <= #"Z") orelse
+  (#"a" <= c andalso c <= #"z") orelse
+  (#"0" <= c andalso c <= #"9") orelse
+  c = #"_" orelse c = #"-"
+
+fun valid_group_name name =
+  size name > 0 andalso List.all group_name_char (String.explode name)
+
+fun require_group_name name =
+  if valid_group_name name then ()
+  else die ("invalid group name \"" ^ name ^ "\": use [A-Za-z0-9_-]")
+
+fun strip_group_reference token =
+  if size token > 0 andalso String.sub(token, 0) = #"@" then
+    let val name = String.extract(token, 1, NONE)
+    in
+      if valid_group_name name then name
+      else die ("invalid group reference \"" ^ token ^ "\"")
+    end
+  else
+    (require_group_name token; token)
+
+fun is_group_reference token =
+  size token > 0 andalso String.sub(token, 0) = #"@"
+
+fun build_tactic_timeout_from_manifest build =
+  case build of
+      NONE => NONE
+    | SOME t => tactic_timeout_at "build.tactic_timeout" t ["tactic_timeout"]
+
+fun root_tactic_timeouts_from_manifest build =
+  case build of
+      NONE => []
+    | SOME t =>
+        case table_field t ["root_tactic_timeouts"] of
+            NONE => []
+          | SOME entries =>
+              map (fn (root, value) =>
+                      {root = package_relative_path "build.root_tactic_timeouts" root,
+                       timeout = tactic_timeout_value ("build.root_tactic_timeouts." ^ root) value})
+                  entries
+
+fun glob_match pattern text =
+  let
+    val pn = size pattern
+    val tn = size text
+    fun match p t =
+      if p = pn then t = tn
+      else
+        case String.sub(pattern, p) of
+            #"*" => match (p + 1) t orelse (t < tn andalso match p (t + 1))
+          | #"?" => t < tn andalso match (p + 1) (t + 1)
+          | c => t < tn andalso c = String.sub(text, t) andalso match (p + 1) (t + 1)
+  in
+    match 0 0
+  end
+
+fun path_matches paths globs rel =
+  List.exists (fn path => rel = path orelse String.isPrefix (path ^ "/") rel) paths orelse
+  List.exists (fn pattern => glob_match pattern rel) globs
+
+fun group_matches_root root (Group {includes, include_globs, excludes, exclude_globs, ...}) =
+  path_matches includes include_globs root andalso
+  not (path_matches excludes exclude_globs root)
+
+fun group_named groups name =
+  List.find (fn Group {name = group_name, ...} => group_name = name) groups
+
+fun referenced_root_group_names roots root_groups =
+  root_groups @ map strip_group_reference (List.filter is_group_reference roots)
+
+fun validate_root_tactic_timeouts roots root_groups groups timeouts =
+  let
+    val referenced_groups = referenced_root_group_names roots root_groups
+    fun root_in_group root name =
+      case group_named groups name of
+          NONE => false
+        | SOME group => group_matches_root root group
+    fun known_root root =
+      member root roots orelse
+      List.exists (root_in_group root) referenced_groups
+  in
+    List.app
+      (fn {root, ...} =>
+          if is_group_reference root then
+            die ("build.root_tactic_timeouts must reference a concrete root, not a group: " ^ root)
+          else if known_root root then ()
+          else die ("build.root_tactic_timeouts references unknown root: " ^ root))
+      timeouts
+  end
+
+fun build_roots_from_manifest build_strings =
+  let
+    val roots = build_strings "roots" []
+    fun validate root =
+      if is_group_reference root then ()
+      else ignore (package_relative_path "build.roots" root)
+  in
+    List.app validate roots;
+    roots
+  end
+
+fun build_root_groups_from_manifest build_strings =
+  map strip_group_reference (build_strings "root_groups" [])
+
+fun parse_group (name, table) =
+  let
+    val _ = require_group_name name
+    val includes = map (concrete_package_relative_path ("build.groups." ^ name ^ ".include"))
+                   (string_array_field table "include")
+    val include_globs = package_relative_paths ("build.groups." ^ name ^ ".include_globs")
+                        (string_array_field table "include_globs")
+    val excludes = map (concrete_package_relative_path ("build.groups." ^ name ^ ".exclude"))
+                   (string_array_field table "exclude")
+    val exclude_globs = package_relative_paths ("build.groups." ^ name ^ ".exclude_globs")
+                        (string_array_field table "exclude_globs")
+    val allow_empty = Option.getOpt(bool_at table ["allow_empty"], false)
+    val _ =
+      if null includes andalso null include_globs then
+        die ("group " ^ name ^ ": needs a non-empty include or include_globs")
+      else ()
+  in
+    Group {name = name, includes = includes, include_globs = include_globs,
+           excludes = excludes, exclude_globs = exclude_globs, allow_empty = allow_empty}
+  end
+
+fun groups_at table = map parse_group (named_table_entries table ["build", "groups"])
+
+fun validate_root_groups root_groups groups =
+  let
+    fun name_of (Group {name, ...}) = name
+    val names = map name_of groups
+  in
+    List.app
+      (fn name =>
+          if member name names then ()
+          else die ("unknown group in build.root_groups: " ^ name))
+      root_groups
+  end
+
+type build_definition =
+  {members : string list, excludes : string list, exclude_globs : string list,
+   roots : string list, root_groups : string list, groups : group list,
+   root_tactic_timeouts : root_tactic_timeout list,
+   tactic_timeout : real option}
+
+fun parse_build table : build_definition =
+  let
+    val build = table_field table ["build"]
+    fun build_strings name default =
+      case build of NONE => default
+        | SOME value => Option.getOpt(string_array_field_opt value name, default)
+    val members = package_relative_paths "build.members" (build_strings "members" ["."])
+    val (excludes, deprecated_globs) =
+      split_deprecated_excludes "build.exclude" (build_strings "exclude" [])
+    val exclude_globs = deprecated_globs @
+      package_relative_paths "build.exclude_globs" (build_strings "exclude_globs" [])
+    val roots = build_roots_from_manifest build_strings
+    val root_groups = build_root_groups_from_manifest build_strings
+    val groups = groups_at table
+    val timeouts = root_tactic_timeouts_from_manifest build
+    val _ = validate_root_groups root_groups groups
+    val _ = validate_root_tactic_timeouts roots root_groups groups timeouts
+  in
+    {members = members, excludes = excludes, exclude_globs = exclude_globs,
+     roots = roots, root_groups = root_groups, groups = groups,
+     root_tactic_timeouts = timeouts,
+     tactic_timeout = build_tactic_timeout_from_manifest build}
+  end
+
 fun schema_version table =
   case table_field table ["holbuild"] of
       NONE => die "holproject.toml must declare [holbuild] schema = 2"

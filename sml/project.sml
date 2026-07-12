@@ -570,30 +570,14 @@ fun parse_local_config root =
 fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, local_config} =
   let
     val _ = validate_manifest_table table
-    val project = table_field table ["project"]
-    val build = table_field table ["build"]
-    val run = table_field table ["run"]
-    fun from opt f default = case opt of NONE => default | SOME t => f t
-    fun build_strings name default =
-      case build of
-          NONE => default
-        | SOME t => Option.getOpt(string_array_field_opt t name, default)
     val LocalConfig {overrides, build_excludes, build_exclude_globs, build_jobs, build_tactic_timeout, checkpoint_limit_gb, remote_cache_url, remote_cache_curl_config} = local_config
-    val members = package_relative_paths "build.members" (build_strings "members" ["."])
-    val (manifest_excludes, deprecated_exclude_globs) =
-      split_deprecated_excludes "build.exclude" (build_strings "exclude" [])
-    val manifest_exclude_globs =
-      deprecated_exclude_globs @
-      package_relative_paths "build.exclude_globs" (build_strings "exclude_globs" [])
+    val {members, excludes = manifest_excludes,
+         exclude_globs = manifest_exclude_globs, roots, root_groups, groups,
+         root_tactic_timeouts, tactic_timeout = manifest_timeout} =
+      (HolbuildPackageDefinition.parse_build table
+       handle HolbuildManifestUtil.Error msg => die msg)
     val excludes = manifest_excludes @ build_excludes
     val exclude_globs = manifest_exclude_globs @ build_exclude_globs
-    val roots = build_roots_from_manifest build_strings
-    val root_groups = build_root_groups_from_manifest build_strings
-    val groups = groups_at table
-    val root_tactic_timeouts = root_tactic_timeouts_from_manifest build
-    val _ = validate_root_groups root_groups groups
-    val _ = validate_root_tactic_timeouts roots root_groups groups root_tactic_timeouts
-    val manifest_timeout = build_tactic_timeout_from_manifest build
     val schema = schema_version table
     val dependencies =
       (HolbuildPackageDefinition.parse_dependencies table
