@@ -495,10 +495,6 @@ fun validate_dependency_table (name, table) =
       | (NONE, NONE, NONE, NONE, NONE) => die (context ^ " must specify either git/rev or from/path/manifest")
   end
 
-fun validate_action_table (logical, table) =
-  require_known_fields ("actions." ^ logical)
-    ["deps", "loads", "extra_inputs", "extra_deps", "impure", "cache", "always_reexecute"] table
-
 fun validate_generate_entry value =
   case value of
       TOML.TABLE generate => require_known_fields "generate" ["name", "command", "inputs", "outputs", "deps"] generate
@@ -534,7 +530,9 @@ fun validate_manifest_table table =
     val _ =
       (ignore (HolbuildPackageDefinition.parse_dependencies table)
        handle HolbuildManifestUtil.Error msg => die msg)
-    val _ = List.app validate_action_table (named_table_entries table ["actions"])
+    val _ =
+      (HolbuildPackageDefinition.validate_actions table
+       handle HolbuildManifestUtil.Error msg => die msg)
     val _ = validate_groups_table table
     val _ =
       case lookup table ["generate"] of
@@ -591,28 +589,6 @@ fun validate_schema2_dependency_refs deps =
   in
     List.app validate_one deps
   end
-
-fun parse_action_policy root (logical, table) =
-  let
-    fun extra field path =
-      if Path.isAbsolute path then
-        die ("actions." ^ logical ^ "." ^ field ^ " must be package-root-relative: " ^ path)
-      else ExtraInput {path = path, absolute_path = Path.concat(root, path)}
-    val extra_inputs = map (extra "extra_inputs") (string_array_field table "extra_inputs")
-    val extra_deps = map (extra "extra_deps") (string_array_field table "extra_deps")
-  in
-    ActionPolicy
-      { logical = logical,
-        deps = string_array_field table "deps",
-        loads = string_array_field table "loads",
-        extra_inputs = extra_inputs @ extra_deps,
-        impure = Option.getOpt(bool_at table ["impure"], false),
-        cache = Option.getOpt(bool_at table ["cache"], true),
-        always_reexecute = Option.getOpt(bool_at table ["always_reexecute"], false) }
-  end
-
-fun action_policies_at root table =
-  map (parse_action_policy root) (named_table_entries table ["actions"])
 
 fun build_tactic_timeout_from_manifest build =
   case build of
@@ -770,7 +746,9 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
     val {run_heap, run_loads, heaps, generators} =
       (HolbuildPackageDefinition.parse_runtime table
        handle HolbuildManifestUtil.Error msg => die msg)
-    val action_policies = action_policies_at root table
+    val action_policies =
+      (HolbuildPackageDefinition.parse_action_policies {table = table, root = root}
+       handle HolbuildManifestUtil.Error msg => die msg)
     val definition =
       HolbuildPackageDefinition.make
         {name = name, version = version, members = members,

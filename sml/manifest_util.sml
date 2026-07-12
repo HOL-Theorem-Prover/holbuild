@@ -29,6 +29,12 @@ fun int_at table key =
     | SOME (TOML.INTEGER n) => SOME n
     | SOME _ => die (key_text key ^ " must be an integer")
 
+fun bool_at table key =
+  case lookup table key of
+      NONE => NONE
+    | SOME (TOML.BOOL b) => SOME b
+    | SOME _ => die (key_text key ^ " must be a boolean")
+
 fun real_value context value =
   case value of
       TOML.FLOAT r => r

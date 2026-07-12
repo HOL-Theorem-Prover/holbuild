@@ -216,6 +216,40 @@ fun parse_runtime table : runtime =
      heaps = parse_heaps table, generators = parse_generators table}
   end
 
+fun validate_action_table (logical, table) =
+  require_known_fields ("actions." ^ logical)
+    ["deps", "loads", "extra_inputs", "extra_deps", "impure", "cache",
+     "always_reexecute"] table
+
+fun action_entries table = named_table_entries table ["actions"]
+fun validate_actions table = List.app validate_action_table (action_entries table)
+
+fun parse_action_policy root (logical, table) =
+  let
+    fun extra field path =
+      if OS.Path.isAbsolute path then
+        die ("actions." ^ logical ^ "." ^ field ^
+             " must be package-root-relative: " ^ path)
+      else ExtraInput {path = path, absolute_path = OS.Path.concat(root, path)}
+    val extra_inputs =
+      map (extra "extra_inputs") (string_array_field table "extra_inputs")
+    val extra_deps =
+      map (extra "extra_deps") (string_array_field table "extra_deps")
+  in
+    ActionPolicy
+      {logical = logical,
+       deps = string_array_field table "deps",
+       loads = string_array_field table "loads",
+       extra_inputs = extra_inputs @ extra_deps,
+       impure = Option.getOpt(bool_at table ["impure"], false),
+       cache = Option.getOpt(bool_at table ["cache"], true),
+       always_reexecute =
+         Option.getOpt(bool_at table ["always_reexecute"], false)}
+  end
+
+fun parse_action_policies {table, root} =
+  (validate_actions table; map (parse_action_policy root) (action_entries table))
+
 fun schema_version table =
   case table_field table ["holbuild"] of
       NONE => die "holproject.toml must declare [holbuild] schema = 2"
