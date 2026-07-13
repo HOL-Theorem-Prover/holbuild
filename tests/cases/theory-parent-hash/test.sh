@@ -240,3 +240,67 @@ PY
 replaced_child_log=$tmpdir/replaced-child.log
 (cd "$project" && "$HOLBUILD_BIN" build --no-cache BTheory) > "$replaced_child_log" 2>&1
 require_grep "BTheory built" "$replaced_child_log"
+
+# An action dependency can impose build order without being exported as a HOL
+# theory parent.  Such a dependency must not invalidate BTheory on every run
+# or make its cache entry unusable.
+ordering_project=$tmpdir/ordering-project
+mkdir -p "$ordering_project/src"
+cat > "$ordering_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "ordering-parent-hash"
+
+[build]
+members = ["src"]
+
+[actions.BTheory]
+deps = ["ATheory"]
+TOML
+cat > "$ordering_project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+val _ = export_theory();
+SML
+cat > "$ordering_project/src/BScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "B";
+val _ = export_theory();
+SML
+
+(cd "$ordering_project" && "$HOLBUILD_BIN" build BTheory) > "$tmpdir/ordering-initial.log" 2>&1
+ordering_metadata=$(find "$ordering_project/.holbuild/dep" -type f -path "*/src/BScript.sml.key" -print -quit)
+require_file "$ordering_metadata"
+if grep -q '^parent_dat=A ' "$ordering_metadata"; then
+  echo "ordering-only dependency was recorded as a theory parent" >&2
+  exit 1
+fi
+
+ordering_noop_log=$tmpdir/ordering-noop.json
+(cd "$ordering_project" && "$HOLBUILD_BIN" --json build BTheory) > "$ordering_noop_log" 2>&1
+python3 - <<PY
+import json
+from pathlib import Path
+events = [json.loads(line) for line in Path("$ordering_noop_log").read_text().splitlines() if line.startswith("{")]
+event = [event for event in events if event.get("event") == "build_finished"][-1]
+if event.get("built") != 0 or event.get("from_cache") != 0 or event.get("unchanged") != 2:
+    raise SystemExit(f"ordering-only dependency prevented a no-op: {event}")
+PY
+
+rm "$ordering_project/.holbuild/obj/src/BTheory.dat"
+ordering_restore_log=$tmpdir/ordering-restore.json
+(cd "$ordering_project" && "$HOLBUILD_BIN" --json build BTheory) > "$ordering_restore_log" 2>&1
+python3 - <<PY
+import json
+from pathlib import Path
+events = [json.loads(line) for line in Path("$ordering_restore_log").read_text().splitlines() if line.startswith("{")]
+event = [event for event in events if event.get("event") == "build_finished"][-1]
+if event.get("built") != 0 or event.get("from_cache") != 1 or event.get("unchanged") != 1:
+    raise SystemExit(f"ordering-only dependency prevented a cache restore: {event}")
+PY

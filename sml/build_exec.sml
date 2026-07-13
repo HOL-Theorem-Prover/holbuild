@@ -3139,11 +3139,20 @@ fun metadata_parent_hashes lines =
     (Binarymap.mkDict String.compare)
     lines
 
+fun theory_parent_hash_recorded parent_hashes dep =
+  Binarymap.peek (parent_hashes, theory_name_from_logical (logical_name dep)) <> NONE
+
+(* Action dependencies also express build ordering.  A theory dependency is a
+   parent only when the exported .dat records it, so do not make an ordering-only
+   edge invalidate an otherwise valid artifact. *)
+fun project_theory_parent_deps parent_hashes plan node =
+  List.filter (theory_parent_hash_recorded parent_hashes) (project_theory_deps plan node)
+
 fun theory_parent_hash_matches dat_hash_cache parent_hashes dep =
   let
     val parent_name = theory_name_from_logical (logical_name dep)
   in
-    (* Every direct theory dependency must be represented by a valid hash.
+    (* Every selected exported theory parent must be represented by a valid hash.
        Treating a missing entry as a match lets truncated metadata or a
        malformed child .dat suppress a necessary rebuild. *)
     case cached_file_hash dat_hash_cache (#data_path (theory_outputs dep)) of
@@ -3155,22 +3164,35 @@ fun theory_parent_hash_matches dat_hash_cache parent_hashes dep =
   end
 
 fun child_dat_parent_hashes_match dat_hash_cache plan node =
-  let val parent_hashes = parse_dat_parent_hashes (read_text (#data_path (theory_outputs node)))
+  let
+    val parent_hashes = parse_dat_parent_hashes (read_text (#data_path (theory_outputs node)))
   in List.all (theory_parent_hash_matches dat_hash_cache parent_hashes)
-              (project_theory_deps plan node) end
+              (project_theory_parent_deps parent_hashes plan node)
+  end
 
 fun metadata_parent_hashes_match dat_hash_cache plan node text =
-  let val lines = metadata_lines text
+  let
+    val lines = metadata_lines text
+    val child_parent_hashes = parse_dat_parent_hashes (read_text (#data_path (theory_outputs node)))
+    val child_parent_deps = project_theory_parent_deps child_parent_hashes plan node
   in
     if metadata_has_parent_hashes lines then
-      (* Metadata is a cache for this check, not an authority on the current
-         child artifact.  Check both so replacing the .dat while retaining its
-         metadata cannot turn an invalid artifact into a no-op. *)
-      List.all (theory_parent_hash_matches dat_hash_cache (metadata_parent_hashes lines))
-               (project_theory_deps plan node) andalso
-      child_dat_parent_hashes_match dat_hash_cache plan node
+      let
+        val recorded_parent_hashes = metadata_parent_hashes lines
+        val recorded_parent_deps = project_theory_parent_deps recorded_parent_hashes plan node
+      in
+        (* Metadata is a cache for this check, not an authority on the current
+           child artifact.  Check both sets of recorded parents: this admits
+           ordering-only action dependencies, while still detecting a .dat
+           whose parent table was truncated after its metadata was written. *)
+        List.all (theory_parent_hash_matches dat_hash_cache recorded_parent_hashes)
+                 recorded_parent_deps andalso
+        List.all (theory_parent_hash_matches dat_hash_cache child_parent_hashes)
+                 child_parent_deps
+      end
     else
-      child_dat_parent_hashes_match dat_hash_cache plan node
+      List.all (theory_parent_hash_matches dat_hash_cache child_parent_hashes)
+               child_parent_deps
   end
 
 fun theory_parent_hashes_match dat_hash_cache plan node metadata_text =
