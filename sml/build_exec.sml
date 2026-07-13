@@ -3209,7 +3209,9 @@ fun up_to_date dat_hash_cache emit_output_hashes checkpoint_policy project plan 
                    metadata_ok andalso theory_parent_hashes_match dat_hash_cache plan node (SOME text)
                  val _ =
                    if parents_ok andalso
-                       (theory_parent_metadata_needs_refresh node text orelse emit_output_hashes) then
+                       (theory_parent_metadata_needs_refresh node text orelse
+                        emit_output_hashes orelse
+                        List.exists (String.isPrefix "output-sha1=") (metadata_lines text)) then
                      write_metadata emit_output_hashes checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints
                    else ()
                in

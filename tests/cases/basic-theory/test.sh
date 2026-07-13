@@ -196,6 +196,14 @@ if [[ "$reported_remapped_hash" != "$expected_remapped_hash" ]]; then
   exit 1
 fi
 
+# Diagnostic hashes are opt-in.  A subsequent ordinary no-op build must remove
+# them rather than retaining stale diagnostics in otherwise semantic metadata.
+(cd "$project" && "$HOLBUILD_BIN" --verbose build ATheory) > "$tmpdir/default-after-hashes.log"
+if grep -q "^output-sha1=" "$metadata"; then
+  echo "default up-to-date build retained output-sha1 diagnostics" >&2
+  exit 1
+fi
+
 input_key=$(grep '^input_key=' "$project/.holbuild/dep/basic/src/AScript.sml.key" | cut -d= -f2)
 cache_manifest="$HOLBUILD_CACHE/actions/$input_key/manifest"
 require_file "$cache_manifest"
