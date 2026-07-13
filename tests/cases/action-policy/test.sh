@@ -165,6 +165,25 @@ if [[ -e "$unknown_project/generator-ran" ]]; then
   exit 1
 fi
 
+outside_member_project="$tmpdir/outside_member_policy"
+make_theory_project "$outside_member_project" '[actions.Generated]
+cache = false'
+cat >> "$outside_member_project/holproject.toml" <<'TOML'
+[[generate]]
+name = "must-not-run-outside-member"
+command = ["sh", "-c", "printf x >> generator-ran"]
+outputs = ["gen/Generated.sml"]
+TOML
+if (cd "$outside_member_project" && "$HOLBUILD_BIN" build ATheory) > "$tmpdir/outside-member.log" 2>&1; then
+  echo "action policy for generator output outside build.members was accepted" >&2
+  exit 1
+fi
+require_grep "action policy references unknown target outside_member_policy:Generated" "$tmpdir/outside-member.log"
+if [[ -e "$outside_member_project/generator-ran" ]]; then
+  echo "action policy for generator output outside build.members ran a generator before validation" >&2
+  exit 1
+fi
+
 missing_dep_project="$tmpdir/missing_declared_dep"
 make_theory_project "$missing_dep_project" '[actions.ATheory]
 deps = ["Missing"]'

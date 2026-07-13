@@ -317,23 +317,37 @@ fun scan_package_sources allow_missing_members package acc =
     List.foldl scan_one acc members
   end
 
-(* Generator outputs may be the targets of action policies.  Include their
-   declared source-shaped paths in the side-effect-free preflight so a policy
-   typo is rejected before any package generator is allowed to run.  The final
-   validation below still uses discovered sources, which checks membership,
-   exclusions, and the generator's actual output. *)
+(* Generator outputs may be the targets of action policies.  Include only
+   declared paths that a post-generation scan could discover: a generator is
+   allowed to create a missing member directory, so membership is determined
+   lexically rather than by statting it.  In particular, do not let an
+   arbitrary source-shaped output outside build.members (or under an exclude)
+   satisfy policy prevalidation before its generator runs. *)
 fun declared_generator_sources package =
   let
     val name = HolbuildProject.package_name package
     val source_root = HolbuildProject.package_root package
     val artifact_root = HolbuildProject.package_artifact_root package
     val policies = HolbuildProject.package_action_policies package
-    fun add_output (rel, acc) =
-      let val path = HolbuildProject.abs_under source_root rel
+    val excludes = HolbuildProject.package_excludes package
+    val exclude_globs = HolbuildProject.package_exclude_globs package
+    val members =
+      map (fn member => normalize_path (HolbuildProject.abs_under source_root member))
+        (HolbuildProject.package_members package)
+    fun member_contains member path =
+      path = member orelse
+      String.isPrefix (if has_suffix "/" member then member else member ^ "/") path
+    fun is_member path = List.exists (fn member => member_contains member path) members
+    fun add_output (output, acc) =
+      let
+        val path = normalize_path (HolbuildProject.abs_under source_root output)
+        val rel = relative_path source_root path
       in
-        case classify name artifact_root policies path rel of
-            NONE => acc
-          | SOME source => source :: acc
+        if not (is_member path) orelse excluded excludes exclude_globs rel then acc
+        else
+          case classify name artifact_root policies path rel of
+              NONE => acc
+            | SOME source => source :: acc
       end
     fun add_generator (generator, acc) =
       List.foldl add_output acc (HolbuildProject.generator_outputs generator)
