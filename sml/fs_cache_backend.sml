@@ -147,12 +147,17 @@ fun verify_blob cache hash = file_hash_matches (blob_path cache hash) hash
 
 (* dst is a local filesystem path where the caller wants the blob materialized. *)
 fun fetch_blob cache {hash, dst} =
-  let val blob = blob_path cache hash
+  let
+    val blob = blob_path cache hash
+    fun corrupt detail = HolbuildCacheBackend.Corrupt (detail ^ ": " ^ hash)
   in
     if not (path_exists blob) then HolbuildCacheBackend.Miss
+    else if not (file_hash_matches blob hash) then
+      corrupt "cache blob SHA1 mismatch"
     else
       (link_or_copy {src = blob, dst = dst};
-       HolbuildCacheBackend.Hit)
+       if file_hash_matches dst hash then HolbuildCacheBackend.Hit
+       else (remove_file dst; corrupt "materialized blob SHA1 mismatch"))
   end
   handle Error msg => HolbuildCacheBackend.Corrupt msg
        | e => HolbuildCacheBackend.Corrupt (General.exnMessage e)
