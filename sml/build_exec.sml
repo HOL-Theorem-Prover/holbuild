@@ -3792,8 +3792,6 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
     val stopped = ref false
     val failure = ref (NONE : (string * HolbuildStatus.debug_artifacts) option)
     val failed_prefix_priority = Array.array (node_count, NONE : bool option)
-    val failed_prefix_priority_enabled =
-      #repl_on_failure options andalso not (#skip_checkpoints options)
 
     fun node_id node = HolbuildBuildPlan.indexed_key_id key_index (HolbuildBuildPlan.key node)
 
@@ -3843,7 +3841,6 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
           SOME value => value
         | NONE =>
             let val value =
-                  failed_prefix_priority_enabled andalso
                   (node_has_failed_prefix_checkpoint project (Vector.sub (nodes, id))
                    handle _ => false)
             in Array.update (failed_prefix_priority, id, SOME value); value end
@@ -3900,7 +3897,9 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
       if id >= node_count then ()
       else (mark_priority_root id; mark_priority_roots (id + 1))
 
-    val _ = if failed_prefix_priority_enabled then mark_priority_roots 0 else ()
+    (* Replay retained failures before unrelated ready work.  This scheduling
+       policy is independent of whether a post-failure REPL was requested. *)
+    val _ = mark_priority_roots 0
 
     fun signal () = ConditionVar.broadcast cv
     fun lock () = Mutex.lock mutex

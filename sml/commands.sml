@@ -662,21 +662,11 @@ fun configure_analyser_for_toolchain ({holdir, ...} : HolbuildToolchain.t) =
   if holdir = "" then HolbuildDependencies.clear_analyser_path ()
   else HolbuildDependencies.set_analyser_path (HolbuildHolSharedCache.analyser_path_for_holdir holdir)
 
-fun stat_cache_path project =
-  HolbuildBuildExec.project_state_dir project "stat-cache"
-
-fun begin_stat_cache project no_stat_cache =
-  (HolbuildStatCache.clear_current_instance ();
-   if no_stat_cache then NONE
-   else
-     let
-       val path = stat_cache_path project
-       val _ = HolbuildBuildExec.ensure_parent path
-       val instance = HolbuildStatCache.load {path = path}
-     in
-       HolbuildStatCache.set_current_instance instance;
-       SOME instance
-     end)
+fun begin_stat_cache _ _ =
+  (* A portable stat record cannot establish file content identity, so this
+     cache has no safe hit path.  Keep it disabled until a sound criterion is
+     available; direct hashing avoids its stats, locks, and cache-file I/O. *)
+  (HolbuildStatCache.clear_current_instance (); NONE)
 
 fun emit_stat_cache_stats instance_opt =
   let

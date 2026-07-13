@@ -251,10 +251,12 @@ SML
 
 first_timing=$tmpdir/first.timing
 (cd "$project" && HOLBUILD_TIMING_LOG="$first_timing" HOLBUILD_TIMING_DETAIL=fine "$HOLBUILD_BIN" build BTheory) > "$tmpdir/first.log" 2>&1
-require_file "$project/.holbuild/stat-cache"
-first_recomputes=$(stat_cache_field recomputes "$first_timing")
-if [[ "$first_recomputes" -le 0 ]]; then
-  echo "first build did not populate stat-cache recompute counters" >&2
+if [[ -e "$project/.holbuild/stat-cache" ]]; then
+  echo "default build unexpectedly created a stat cache" >&2
+  exit 1
+fi
+if [[ "$(stat_cache_field enabled "$first_timing")" != "false" ]]; then
+  echo "default build did not disable stat cache" >&2
   exit 1
 fi
 
@@ -265,10 +267,8 @@ second_json=$tmpdir/second.json
 assert_json_field built 0 "$second_json"
 assert_json_field from_cache 0 "$second_json"
 assert_json_field unchanged 2 "$second_json"
-second_hits=$(stat_cache_field hits "$second_timing")
-second_recomputes=$(stat_cache_field recomputes "$second_timing")
-if [[ "$second_hits" -ne 0 || "$second_recomputes" -le 0 ]]; then
-  echo "second no-op must verify source hashes; hits=$second_hits recomputes=$second_recomputes" >&2
+if [[ "$(stat_cache_field enabled "$second_timing")" != "false" ]]; then
+  echo "second build did not disable stat cache" >&2
   exit 1
 fi
 
