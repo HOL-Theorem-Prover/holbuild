@@ -420,7 +420,12 @@ module and `load` it instead. Generated HOL source is modeled by manifest
 outputs are visible source-tree files (commonly under `gen/`), may be overwritten,
 and are scanned/hashed as ordinary sources after generation. Generator keys decide
 whether to rerun the generator; theory/action keys still use the actual generated
-source bytes. `.sml` files get a `.uo` plus an empty companion `.ui` unless a real
+source bytes. Discovery first builds a canonical inventory for each prepared
+package, then combines resolved source views. Canonical source-node identities
+contain package-definition identity, relative paths, source kind, logical name,
+canonical artifact coordinates, and semantic action policy identity; machine
+paths and artifact roots exist only in the resolved views. `.sml` files get a
+`.uo` plus an empty companion `.ui` unless a real
 `.sig` companion exists, and same-name signatures are implicit dependencies of
 their implementation. HOL's current
 `HOLFileSys` remaps `.uo`/`.ui` and files ending in

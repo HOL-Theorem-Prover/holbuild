@@ -75,6 +75,14 @@ require_grep "package-origin: identity root" "$tmpdir/first.context"
 require_grep "package-origin: hol implicit-hol:standard" "$tmpdir/first.context"
 require_grep "package-retrieval: hol toolchain-cache" "$tmpdir/first.context"
 ids > "$tmpdir/first.ids"
+(cd "$project" && HOLBUILD_TEST_SOURCE_INVENTORY="$tmpdir/first.inventory" \
+  "$HOLBUILD_BIN" build --dry-run A) > "$tmpdir/first.plan"
+project_copy=$tmpdir/project-copy
+cp -a "$project" "$project_copy"
+(cd "$project_copy" && HOLBUILD_TEST_SOURCE_INVENTORY="$tmpdir/copy.inventory" \
+  "$HOLBUILD_BIN" build --dry-run A) > "$tmpdir/copy.plan"
+cmp "$tmpdir/first.inventory" "$tmpdir/copy.inventory"
+
 write_manifest 1.0.0 '"src/A.sml"' true reordered
 ids > "$tmpdir/reordered.ids"
 cmp "$tmpdir/first.ids" "$tmpdir/reordered.ids"
