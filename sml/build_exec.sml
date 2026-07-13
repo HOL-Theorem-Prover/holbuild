@@ -1616,10 +1616,10 @@ fun cache_entry_usable root input_key text =
     val {sig_hash, sml_hash, dat_hash, trace_hash, ...} =
       cache_manifest_blobs_from_lines input_key (cache_manifest_lines text)
   in
-    HolbuildCache.has_blob root sig_hash andalso
-    HolbuildCache.has_blob root sml_hash andalso
-    HolbuildCache.has_blob root dat_hash andalso
-    (case trace_hash of NONE => true | SOME hash => HolbuildCache.has_blob root hash)
+    HolbuildCache.verify_blob root sig_hash andalso
+    HolbuildCache.verify_blob root sml_hash andalso
+    HolbuildCache.verify_blob root dat_hash andalso
+    (case trace_hash of NONE => true | SOME hash => HolbuildCache.verify_blob root hash)
   end
   handle _ => false
 
