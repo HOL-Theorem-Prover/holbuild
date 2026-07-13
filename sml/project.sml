@@ -67,7 +67,11 @@ type t =
     run_loads : string list,
     heaps : heap list,
     action_policies : action_policy list,
-    generators : generator list }
+    generators : generator list,
+    package_cache :
+      (HolbuildHolToolchainConfig.kernel_variant * package list) list ref,
+    resolved_hol_cache :
+      (HolbuildHolToolchainConfig.kernel_variant * dependency) list ref }
 
 exception Error of string
 
@@ -171,7 +175,9 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
       run_loads = run_loads,
       heaps = heaps,
       action_policies = action_policies,
-      generators = generators }
+      generators = generators,
+      package_cache = ref [],
+      resolved_hol_cache = ref [] }
   end
 
 fun parse_at args =
@@ -453,8 +459,13 @@ fun dependency_project_with resolution (project : t) (dep as Dependency {name, s
 
 fun dependency_project project dep = dependency_project_with standard_resolution project dep
 
-fun resolved_hol_dependency_with resolution project =
+fun resolved_hol_dependency_with ({kernel_variant} : resolution) project =
+  case List.find (fn (variant, _) => variant = kernel_variant)
+         (!(#resolved_hol_cache project)) of
+      SOME (_, dependency) => SOME dependency
+    | NONE =>
   let
+    val resolution = {kernel_variant = kernel_variant}
     fun seen name names = List.exists (fn n => n = name) names
     fun search_project names p =
       case hol_dependency p of
@@ -568,7 +579,7 @@ fun same_dependency_source (GitSource a, GitSource b) = #git a = #git b andalso 
       #from a = #from b andalso #path a = #path b andalso #manifest a = #manifest b
   | same_dependency_source _ = false
 
-fun packages_with resolution (project : t) =
+fun resolve_packages_with resolution (project : t) =
   let
     val artifact_parent = #graph_artifact_root project
     fun seen_source name seen =
@@ -590,13 +601,51 @@ fun packages_with resolution (project : t) =
     val root_package = project_package project
     val (_, packages) = add_project project ([], [root_package])
     val result = rev packages
-    val hol_count = length (List.filter (fn package => package_name package = "hol") result)
+    val hol_count =
+      length
+        (List.filter
+          (fn package =>
+            HolbuildPackageProvenance.is_implicit_hol
+              (package_provenance package))
+          result)
     val _ =
       if hol_count <> 1 then
         die "dependency graph must contain exactly one hol dependency"
       else ()
   in
     result
+  end
+
+fun packages_with (resolution as {kernel_variant}) (project : t) =
+  let
+    fun same_variant (variant, _) = variant = kernel_variant
+  in
+    case List.find same_variant (!(#package_cache project)) of
+        SOME (_, packages) => packages
+      | NONE =>
+          let
+            val packages = resolve_packages_with resolution project
+            val hol_dependency =
+              case List.find
+                     (fn package =>
+                       HolbuildPackageProvenance.is_implicit_hol
+                         (package_provenance package))
+                     packages of
+                  SOME package =>
+                    (case HolbuildPackageProvenance.origin
+                            (package_provenance package) of
+                         HolbuildPackageProvenance.ImplicitHolOrigin {git, rev, ...} =>
+                           Dependency {name = "hol", source = GitSource {git = git, rev = rev},
+                                       role = HolToolchainDependency}
+                       | _ => raise Fail "typed HOL package lost its origin")
+                | NONE => raise Fail "validated package graph lost its HOL package"
+          in
+            #package_cache project :=
+              (kernel_variant, packages) :: !(#package_cache project);
+            #resolved_hol_cache project :=
+              (kernel_variant, hol_dependency) :: !(#resolved_hol_cache project);
+            packages
+          end
   end
 
 fun packages project = packages_with standard_resolution project

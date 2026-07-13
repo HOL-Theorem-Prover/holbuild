@@ -292,7 +292,9 @@ independently reusable policy layers; TOML formatting and table order do not
 affect these IDs. It also reports typed package provenance: authoritative source
 snapshot, definition and retrieval origins, logical/source roots, and implicit
 HOL toolchain origin. Retrieval and materialization paths are excluded from
-semantic package identities.
+semantic package identities. Package declarations are resolved into one typed
+project graph per kernel variant; context, source discovery, watching, and HOL
+selection reuse its stable package instances rather than reparsing manifests.
 
 ### `[dependencies.*]`
 

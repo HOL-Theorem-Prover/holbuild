@@ -60,6 +60,7 @@ use "sml/package_definition.sml";
 use "sml/package_provenance.sml";
 use "sml/local_config.sml";
 use "sml/project.sml";
+use "sml/project_graph.sml";
 use "sml/toolchain.sml";
 use "sml/status.sml";
 use "sml/generators.sml";

@@ -293,13 +293,17 @@ fun discover_package package acc =
     sources
   end
 
-fun discover_with resolution (project : HolbuildProject.t) =
+fun discover_graph graph =
   by_logical
     (sort_sources
        (List.foldl
           (fn (package, acc) => discover_package package acc)
           []
-          (HolbuildProject.packages_with resolution project)))
+          (HolbuildProjectGraph.packages graph)))
+
+fun discover_with resolution (project : HolbuildProject.t) =
+  discover_graph (HolbuildProjectGraph.resolve
+                    {project = project, resolution = resolution})
 
 fun discover project = discover_with HolbuildProject.standard_resolution project
 

@@ -61,7 +61,9 @@ fun watch_paths_with resolution project index =
     val paths = []
     val paths = add_readable (#manifest project) paths
     val paths = add_readable (Path.concat(#root project, ".holconfig.toml")) paths
-    val paths = List.foldl package_paths paths (HolbuildProject.packages_with resolution project)
+    val graph = HolbuildProjectGraph.resolve
+                  {project = project, resolution = resolution}
+    val paths = List.foldl package_paths paths (HolbuildProjectGraph.packages graph)
     val paths = List.foldl source_paths paths index
   in
     rev paths

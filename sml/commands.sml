@@ -291,9 +291,13 @@ fun reject_object_target target =
 
 fun reject_object_targets targets = List.app reject_object_target targets
 
+fun resolved_packages resolution project =
+  HolbuildProjectGraph.packages
+    (HolbuildProjectGraph.resolve {project = project, resolution = resolution})
+
 fun project_has_default_targets resolution project =
   List.exists HolbuildSourceIndex.package_has_default_targets
-    (HolbuildProject.packages_with resolution project)
+    (resolved_packages resolution project)
 
 fun default_build_targets resolution project index targets =
   if null targets then HolbuildSourceIndex.default_targets_with resolution index project
@@ -317,7 +321,7 @@ fun rooted_package_names resolution project =
       not (null (HolbuildProject.package_root_groups package))
   in
     map HolbuildProject.package_name
-      (List.filter has_rooted_targets (HolbuildProject.packages_with resolution project))
+      (List.filter has_rooted_targets (resolved_packages resolution project))
   end
 
 fun root_warning_source rooted_packages built_keys source =
@@ -636,7 +640,14 @@ fun load_project () =
   apply_project_local_remote_cache_config (HolbuildProject.discover ())
   handle HolbuildProject.Error msg => raise Error msg
 
-fun context () = HolbuildProject.describe (load_project ())
+fun context () =
+  let
+    val project = load_project ()
+    val _ = HolbuildProjectGraph.resolve
+              {project = project, resolution = HolbuildProject.standard_resolution}
+  in
+    HolbuildProject.describe project
+  end
 
 fun timed_phase name f = HolbuildToolchain.time_phase name f
 
@@ -1285,7 +1296,7 @@ fun reject_holdir holdir =
 fun project_hol_holdir kernel_variant project =
   let val resolution = {kernel_variant = kernel_variant}
   in
-    (HolbuildProject.packages_with resolution project;
+    (ignore (HolbuildProjectGraph.resolve {project = project, resolution = resolution});
      case HolbuildProject.resolved_hol_dependency_with resolution project of
          SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev}, ...}) =>
            HolbuildHolSharedCache.ensure_built_with_kernel
@@ -1401,6 +1412,7 @@ fun main raw_args =
        | Error msg => err msg
        | HolbuildToolchain.Error msg => err msg
        | HolbuildProject.Error msg => err msg
+       | HolbuildProjectGraph.Error msg => err msg
        | HolbuildGenerators.Error msg => err msg
        | HolbuildGenerators.ErrorWithDebugArtifacts (msg, artifacts) => err_with_debug_artifacts msg artifacts
        | HolbuildSourceIndex.Error msg => err msg
