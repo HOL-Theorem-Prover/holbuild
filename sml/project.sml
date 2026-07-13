@@ -149,6 +149,18 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
          entrypoints = {roots, root_groups, groups, root_tactic_timeouts},
          dependencies, runtime = {run_heap, run_loads, heaps},
          actions = action_policies, generators} = definition
+    fun override_name (OverridePath {name, ...}) = name
+      | override_name (OverrideGit {name, ...}) = name
+    val _ =
+      List.app
+        (fn Dependency {name, source = FromSource {from, ...}, ...} =>
+              if List.exists (fn override => override_name override = name) overrides then
+                die ("overrides." ^ name ^
+                     " cannot override a from/path/manifest package; override its source dependency " ^
+                     from ^ " instead")
+              else ()
+          | _ => ())
+        dependencies
     val excludes = manifest_excludes @ build_excludes
     val exclude_globs = manifest_exclude_globs @ build_exclude_globs
   in
@@ -440,16 +452,6 @@ fun root_package_name project = package_name (project_package project)
 
 fun dependency_project_with resolution (project : t) (dep as Dependency {name, source, ...}) =
   let
-    val _ =
-      case source of
-          FromSource {from, ...} =>
-            if Option.isSome (override_path (#overrides project) name) orelse
-               Option.isSome (override_git (#overrides project) name) then
-              die ("overrides." ^ name ^
-                   " cannot override a from/path/manifest package; override its source dependency " ^
-                   from ^ " instead")
-            else ()
-        | _ => ()
     val _ =
       case source of
           GitSource {git, rev} =>
