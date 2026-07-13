@@ -296,6 +296,9 @@ HOL toolchain origin. Retrieval and materialization paths are excluded from
 semantic package identities. Package declarations are resolved into one typed
 project graph per kernel variant; context, source discovery, watching, and HOL
 selection reuse its stable package instances rather than reparsing manifests.
+Commands that need sources then run an explicit impure generator-preparation
+phase before read-only source discovery; metadata-only context does not execute
+generators.
 
 ### `[dependencies.*]`
 

@@ -276,10 +276,6 @@ fun discover_package package acc =
     val policies = HolbuildProject.package_action_policies package
     val excludes = HolbuildProject.package_excludes package
     val exclude_globs = HolbuildProject.package_exclude_globs package
-    val _ = HolbuildGenerators.run_package package
-            handle HolbuildGenerators.Error msg => raise Error msg
-                 | HolbuildGenerators.ErrorWithDebugArtifacts (msg, artifacts) =>
-                     raise ErrorWithDebugArtifacts (msg, artifacts)
     val members =
       map (fn member => HolbuildProject.abs_under source_root member)
         (HolbuildProject.package_members package)
@@ -301,11 +297,8 @@ fun discover_graph graph =
           []
           (HolbuildProjectGraph.packages graph)))
 
-fun discover_with resolution (project : HolbuildProject.t) =
-  discover_graph (HolbuildProjectGraph.resolve
-                    {project = project, resolution = resolution})
-
-fun discover project = discover_with HolbuildProject.standard_resolution project
+fun discover_prepared preparation =
+  discover_graph (HolbuildPackagePrepare.graph preparation)
 
 fun kind_string kind =
   case kind of

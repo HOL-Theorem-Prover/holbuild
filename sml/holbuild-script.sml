@@ -64,6 +64,7 @@ use "sml/project_graph.sml";
 use "sml/toolchain.sml";
 use "sml/status.sml";
 use "sml/generators.sml";
+use "sml/package_prepare.sml";
 use "sml/source_index.sml";
 use "sml/analyser/analysis_protocol.sml";
 use "sml/dependencies.sml";
