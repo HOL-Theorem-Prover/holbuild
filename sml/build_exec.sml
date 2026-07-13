@@ -1649,25 +1649,14 @@ fun cache_conflict_warning cache_key manifest_path subject old_manifest new_mani
     warn ("cache entry already exists with different outputs for " ^ subject ^ ": " ^ cache_key ^
           "\n  existing cache entry: " ^ manifest_path)
 
-fun file_hash_matches path hash =
-  HolbuildHash.file_sha1 path = hash
-  handle _ => false
-
-fun copy_blob verify_cache root hash dst =
-  let
-    val _ =
-      if verify_cache andalso not (HolbuildCache.verify_blob root hash) then
-        raise Error ("cache blob missing or corrupt: " ^ hash)
-      else ()
-  in
-    case HolbuildCache.fetch_blob root {hash = hash, dst = dst} of
-        HolbuildCacheBackend.Hit =>
-          if verify_cache andalso not (file_hash_matches dst hash) then
-            raise Error ("cache blob materialized corrupt: " ^ hash)
-          else ()
-      | HolbuildCacheBackend.Miss => raise Error ("cache blob missing: " ^ hash)
-      | HolbuildCacheBackend.Corrupt detail => raise Error ("cache blob missing or corrupt: " ^ hash ^ " (" ^ detail ^ ")")
-  end
+(* The filesystem cache backend verifies the source blob and its materialized
+   destination before reporting Hit.  Do not repeat those full-file hashes here:
+   cache restoration can otherwise hash each blob four times. *)
+fun copy_blob _ root hash dst =
+  case HolbuildCache.fetch_blob root {hash = hash, dst = dst} of
+      HolbuildCacheBackend.Hit => ()
+    | HolbuildCacheBackend.Miss => raise Error ("cache blob missing: " ^ hash)
+    | HolbuildCacheBackend.Corrupt detail => raise Error ("cache blob missing or corrupt: " ^ hash ^ " (" ^ detail ^ ")")
 
 fun fs_cache_source cache : HolbuildCacheTransfer.source =
   {get_action = HolbuildFSCacheBackend.get_action cache,
