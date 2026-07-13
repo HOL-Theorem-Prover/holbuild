@@ -166,8 +166,10 @@ fun curl_put_zstd {url, src, size} =
       remove_file_before (curl_put {url = url, src = src}) compressed
   end
   handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
+fun remote_action_key key =
+  HolbuildHash.string_sha256 ("holbuild-remote-ac-v1\n" ^ key ^ "\n")
 
-fun action_url cache key = base_url cache ^ "/ac/" ^ key
+fun action_url cache key = base_url cache ^ "/ac/" ^ remote_action_key key
 fun cas_url cache sha256 = base_url cache ^ "/cas/" ^ sha256
 
 fun lookup_blob cache sha1 =

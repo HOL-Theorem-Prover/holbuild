@@ -30,6 +30,15 @@ datatype generator =
       outputs : string list,
       deps : string list }
 
+datatype group =
+  Group of
+    { name : string,
+      includes : string list,
+      include_globs : string list,
+      excludes : string list,
+      exclude_globs : string list,
+      allow_empty : bool }
+
 datatype dependency_source =
     GitSource of {git : string, rev : string}
   | FromSource of {from : string, path : string, manifest : string}
@@ -51,6 +60,8 @@ datatype package =
       excludes : string list,
       exclude_globs : string list,
       roots : string list,
+      root_groups : string list,
+      groups : group list,
       artifact_root : string,
       action_policies : action_policy list,
       generators : generator list }
@@ -67,6 +78,8 @@ type t =
     excludes : string list,
     exclude_globs : string list,
     roots : string list,
+    root_groups : string list,
+    groups : group list,
     root_tactic_timeouts : root_tactic_timeout list,
     dependencies : dependency list,
     overrides : override list,
@@ -349,6 +362,32 @@ fun require_safe_materialized_dependency_name context name =
   if safe_materialized_dependency_name name then ()
   else die (context ^ " must be a safe dependency name: " ^ name)
 
+fun group_name_char c =
+  (#"A" <= c andalso c <= #"Z") orelse
+  (#"a" <= c andalso c <= #"z") orelse
+  (#"0" <= c andalso c <= #"9") orelse
+  c = #"_" orelse c = #"-"
+
+fun valid_group_name name =
+  size name > 0 andalso List.all group_name_char (String.explode name)
+
+fun require_group_name name =
+  if valid_group_name name then ()
+  else die ("invalid group name \"" ^ name ^ "\": use [A-Za-z0-9_-]")
+
+fun strip_group_reference token =
+  if size token > 0 andalso String.sub(token, 0) = #"@" then
+    let val name = String.extract(token, 1, NONE)
+    in
+      if valid_group_name name then name
+      else die ("invalid group reference \"" ^ token ^ "\"")
+    end
+  else
+    (require_group_name token; token)
+
+fun is_group_reference token =
+  size token > 0 andalso String.sub(token, 0) = #"@"
+
 fun is_hex c = Char.isDigit c orelse (#"a" <= c andalso c <= #"f")
 
 fun validate_git_rev rev =
@@ -527,19 +566,36 @@ fun validate_generate_entry value =
       TOML.TABLE generate => require_known_fields "generate" ["name", "command", "inputs", "outputs", "deps"] generate
     | _ => die "generate entries must be tables"
 
+fun validate_groups_table table =
+  let
+    fun validate_one (name, value) =
+      (require_group_name name;
+       case value of
+           TOML.TABLE group =>
+             require_known_fields ("build.groups." ^ name)
+               ["include", "include_globs", "exclude", "exclude_globs", "allow_empty"] group
+         | _ => die ("build.groups." ^ name ^ " must be a table"))
+  in
+    case lookup table ["build", "groups"] of
+        NONE => ()
+      | SOME (TOML.TABLE groups) => List.app validate_one groups
+      | SOME _ => die "build.groups must be a table"
+  end
+
 fun validate_manifest_table table =
   let
     val _ = require_known_fields "holproject.toml"
               ["holbuild", "project", "build", "dependencies", "run", "heap", "executable", "actions", "generate"] table
     val _ = Option.app (require_known_fields "project" ["name", "version"])
               (table_field table ["project"])
-    val _ = Option.app (require_known_fields "build" ["members", "exclude", "exclude_globs", "roots", "tactic_timeout", "root_tactic_timeouts"])
+    val _ = Option.app (require_known_fields "build" ["members", "exclude", "exclude_globs", "roots", "root_groups", "groups", "tactic_timeout", "root_tactic_timeouts"])
               (table_field table ["build"])
     val _ = Option.app (require_known_fields "run" ["heap", "loads"])
               (table_field table ["run"])
     val _ = ignore (schema_version table)
     val _ = List.app validate_dependency_table (named_table_entries table ["dependencies"])
     val _ = List.app validate_action_table (named_table_entries table ["actions"])
+    val _ = validate_groups_table table
     val _ =
       case lookup table ["generate"] of
           NONE => ()
@@ -724,12 +780,103 @@ fun root_tactic_timeouts_from_manifest build =
                        timeout = tactic_timeout_value ("build.root_tactic_timeouts." ^ root) value})
                   entries
 
-fun validate_root_tactic_timeouts roots timeouts =
-  List.app
-    (fn {root, ...} =>
-        if member root roots then ()
-        else die ("build.root_tactic_timeouts references unknown root: " ^ root))
-    timeouts
+fun glob_match pattern text =
+  let
+    val pn = size pattern
+    val tn = size text
+    fun match p t =
+      if p = pn then t = tn
+      else
+        case String.sub(pattern, p) of
+            #"*" => match (p + 1) t orelse (t < tn andalso match p (t + 1))
+          | #"?" => t < tn andalso match (p + 1) (t + 1)
+          | c => t < tn andalso c = String.sub(text, t) andalso match (p + 1) (t + 1)
+  in
+    match 0 0
+  end
+
+fun path_matches paths globs rel =
+  List.exists (fn path => rel = path orelse String.isPrefix (path ^ "/") rel) paths orelse
+  List.exists (fn pattern => glob_match pattern rel) globs
+
+fun group_matches_root root (Group {includes, include_globs, excludes, exclude_globs, ...}) =
+  path_matches includes include_globs root andalso
+  not (path_matches excludes exclude_globs root)
+
+fun group_named groups name =
+  List.find (fn Group {name = group_name, ...} => group_name = name) groups
+
+fun referenced_root_group_names roots root_groups =
+  root_groups @ map strip_group_reference (List.filter is_group_reference roots)
+
+fun validate_root_tactic_timeouts roots root_groups groups timeouts =
+  let
+    val referenced_groups = referenced_root_group_names roots root_groups
+    fun root_in_group root name =
+      case group_named groups name of
+          NONE => false
+        | SOME group => group_matches_root root group
+    fun known_root root =
+      member root roots orelse
+      List.exists (root_in_group root) referenced_groups
+  in
+    List.app
+      (fn {root, ...} =>
+          if is_group_reference root then
+            die ("build.root_tactic_timeouts must reference a concrete root, not a group: " ^ root)
+          else if known_root root then ()
+          else die ("build.root_tactic_timeouts references unknown root: " ^ root))
+      timeouts
+  end
+
+fun build_roots_from_manifest build_strings =
+  let
+    val roots = build_strings "roots" []
+    fun validate root =
+      if is_group_reference root then ()
+      else ignore (package_relative_path "build.roots" root)
+  in
+    List.app validate roots;
+    roots
+  end
+
+fun build_root_groups_from_manifest build_strings =
+  map strip_group_reference (build_strings "root_groups" [])
+
+fun parse_group (name, table) =
+  let
+    val _ = require_group_name name
+    val includes = map (concrete_package_relative_path ("build.groups." ^ name ^ ".include"))
+                   (string_array_field table "include")
+    val include_globs = package_relative_paths ("build.groups." ^ name ^ ".include_globs")
+                        (string_array_field table "include_globs")
+    val excludes = map (concrete_package_relative_path ("build.groups." ^ name ^ ".exclude"))
+                   (string_array_field table "exclude")
+    val exclude_globs = package_relative_paths ("build.groups." ^ name ^ ".exclude_globs")
+                        (string_array_field table "exclude_globs")
+    val allow_empty = Option.getOpt(bool_at table ["allow_empty"], false)
+    val _ =
+      if null includes andalso null include_globs then
+        die ("group " ^ name ^ ": needs a non-empty include or include_globs")
+      else ()
+  in
+    Group {name = name, includes = includes, include_globs = include_globs,
+           excludes = excludes, exclude_globs = exclude_globs, allow_empty = allow_empty}
+  end
+
+fun groups_at table = map parse_group (named_table_entries table ["build", "groups"])
+
+fun validate_root_groups root_groups groups =
+  let
+    fun name_of (Group {name, ...}) = name
+    val names = map name_of groups
+  in
+    List.app
+      (fn name =>
+          if member name names then ()
+          else die ("unknown group in build.root_groups: " ^ name))
+      root_groups
+  end
 
 fun parse_local_config root =
   let val config = Path.concat(root, ".holconfig.toml")
@@ -769,9 +916,12 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
       split_deprecated_excludes "build.exclude" (build_strings "exclude" [])
     val excludes = manifest_excludes @ build_excludes
     val exclude_globs = deprecated_exclude_globs @ package_relative_paths "build.exclude_globs" (build_strings "exclude_globs" []) @ build_exclude_globs
-    val roots = package_relative_paths "build.roots" (build_strings "roots" [])
+    val roots = build_roots_from_manifest build_strings
+    val root_groups = build_root_groups_from_manifest build_strings
+    val groups = groups_at table
     val root_tactic_timeouts = root_tactic_timeouts_from_manifest build
-    val _ = validate_root_tactic_timeouts roots root_tactic_timeouts
+    val _ = validate_root_groups root_groups groups
+    val _ = validate_root_tactic_timeouts roots root_groups groups root_tactic_timeouts
     val manifest_timeout = build_tactic_timeout_from_manifest build
     val schema = schema_version table
     val dependencies = dependencies_at table
@@ -791,6 +941,8 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
       excludes = excludes,
       exclude_globs = exclude_globs,
       roots = roots,
+      root_groups = root_groups,
+      groups = groups,
       root_tactic_timeouts = root_tactic_timeouts,
       dependencies = dependencies,
       overrides = overrides,
@@ -811,7 +963,16 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
 fun parse_at args = parse_table_at (TOML.fromFile (#manifest args)) args
 
 fun parse_builtin_holdir_at args =
-  parse_table_at (TOML.fromString HolbuildBuiltinManifests.holdir_manifest_text) args
+  let
+    val cached_manifest = HolbuildHolSharedCache.hol_source_manifest_for_holdir (#root args)
+    val text =
+      if readable cached_manifest then
+        let val input = TextIO.openIn cached_manifest
+        in TextIO.inputAll input before TextIO.closeIn input end
+      else HolbuildBuiltinManifests.empty_hol_manifest_text
+  in
+    parse_table_at (TOML.fromString text) args
+  end
 
 val dependency_project_cache : (string, t) Binarymap.dict ref =
   ref (Binarymap.mkDict String.compare)
@@ -885,6 +1046,8 @@ fun package_members (Package {members, ...}) = members
 fun package_excludes (Package {excludes, ...}) = excludes
 fun package_exclude_globs (Package {exclude_globs, ...}) = exclude_globs
 fun package_roots (Package {roots, ...}) = roots
+fun package_root_groups (Package {root_groups, ...}) = root_groups
+fun package_groups (Package {groups, ...}) = groups
 fun package_artifact_root (Package {artifact_root, ...}) = artifact_root
 fun root_tactic_timeouts ({root_tactic_timeouts, ...} : t) = root_tactic_timeouts
 fun root_tactic_timeout_for ({root_tactic_timeouts, ...} : t) root =
@@ -895,12 +1058,23 @@ fun schema ({schema, ...} : t) = schema
 fun hol_dependency ({dependencies, ...} : t) =
   List.find (fn Dependency {name, ...} => name = "hol") dependencies
 
-fun project_hol_dir project =
+type resolution = {kernel_variant : HolbuildHolToolchainConfig.kernel_variant}
+val standard_resolution = {kernel_variant = HolbuildHolToolchainConfig.StandardKernel}
+
+fun hol_holdir ({kernel_variant} : resolution) {git, rev} =
+  HolbuildHolSharedCache.holdir_for_with_kernel
+    {git = git, rev = rev, kernel_variant = kernel_variant}
+
+fun project_hol_dir_with resolution project =
   case hol_dependency project of
-      SOME (Dependency {source = GitSource {git, rev}, ...}) =>
-        SOME (HolbuildHolSharedCache.holdir_for {git = git, rev = rev})
+      SOME (Dependency {source = GitSource request, ...}) =>
+        SOME (hol_holdir resolution request)
     | _ => NONE
+
+fun project_hol_dir project = project_hol_dir_with standard_resolution project
 fun build_roots ({roots, ...} : t) = roots
+fun build_root_groups ({root_groups, ...} : t) = root_groups
+fun build_groups ({groups, ...} : t) = groups
 fun checkpoint_limit_gb ({checkpoint_limit_gb, ...} : t) = checkpoint_limit_gb
 fun remote_cache_url ({remote_cache_url, ...} : t) = remote_cache_url
 fun remote_cache_curl_config ({remote_cache_curl_config, ...} : t) = remote_cache_curl_config
@@ -911,6 +1085,13 @@ fun generator_command (Generator {command, ...}) = command
 fun generator_inputs (Generator {inputs, ...}) = inputs
 fun generator_outputs (Generator {outputs, ...}) = outputs
 fun generator_deps (Generator {deps, ...}) = deps
+
+fun group_name (Group {name, ...}) = name
+fun group_includes (Group {includes, ...}) = includes
+fun group_include_globs (Group {include_globs, ...}) = include_globs
+fun group_excludes (Group {excludes, ...}) = excludes
+fun group_exclude_globs (Group {exclude_globs, ...}) = exclude_globs
+fun group_allow_empty (Group {allow_empty, ...}) = allow_empty
 
 fun action_policy_logical (ActionPolicy {logical, ...}) = logical
 fun action_deps (ActionPolicy {deps, ...}) = deps
@@ -935,20 +1116,22 @@ fun action_policy_for policies logical =
 fun dependency_path_context name = "dependencies." ^ name ^ ".path"
 fun dependency_manifest_context name = "dependencies." ^ name ^ ".manifest"
 
-fun dependency_local_path (project as {graph_artifact_root, ...} : t) (Dependency {name, source}) =
+fun dependency_local_path_with resolution (project as {graph_artifact_root, ...} : t) (Dependency {name, source}) =
   case override_path (#overrides project) name of
       SOME path => SOME path
     | NONE =>
         case source of
             GitSource {git, rev} =>
-              if name = "hol" then SOME (HolbuildHolSharedCache.holdir_for {git = git, rev = rev})
+              if name = "hol" then SOME (hol_holdir resolution {git = git, rev = rev})
               else SOME (Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), name))
           | FromSource {from, path, ...} =>
               (case hol_dependency project of
                    SOME (Dependency {name = "hol", source = GitSource {git, rev}}) =>
-                     if from = "hol" then SOME (Path.concat(HolbuildHolSharedCache.holdir_for {git = git, rev = rev}, path))
+                     if from = "hol" then SOME (Path.concat(hol_holdir resolution {git = git, rev = rev}, path))
                      else SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path))
                  | _ => SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path)))
+
+fun dependency_local_path project dep = dependency_local_path_with standard_resolution project dep
 
 fun dependency_manifest (project as {manifest = project_manifest, graph_artifact_root, ...} : t) dep =
   case dep of
@@ -990,9 +1173,10 @@ fun dependency_to_string project (dep as Dependency {name, source}) =
 fun override_to_string (OverridePath {name, path}) = name ^ " path -> " ^ path
   | override_to_string (OverrideGit {name, git}) = name ^ " git -> " ^ git
 
-fun project_package ({root, artifact_root, graph_artifact_root, manifest, name, members, excludes, exclude_globs, roots, action_policies, generators, ...} : t) =
+fun project_package ({root, artifact_root, graph_artifact_root, manifest, name, members, excludes, exclude_globs, roots, root_groups, groups, action_policies, generators, ...} : t) =
   Package {name = Option.getOpt(name, "root"), root = root, manifest = manifest,
-           members = members, excludes = excludes, exclude_globs = exclude_globs, roots = roots,
+           members = members, excludes = excludes, exclude_globs = exclude_globs,
+           roots = roots, root_groups = root_groups, groups = groups,
            artifact_root = if artifact_root = graph_artifact_root then Path.concat(artifact_root, ".holbuild") else artifact_root,
            action_policies = action_policies,
            generators = generators}
@@ -1022,10 +1206,12 @@ fun materialize_dependency_once (project : t) (dep as Dependency {name, source})
           end
     | _ => ()
 
-fun dependency_project (project : t) (dep as Dependency {name, source}) =
+fun root_package_name project = package_name (project_package project)
+
+fun dependency_project_with resolution (project : t) (dep as Dependency {name, source}) =
   let
     val dep_root =
-      case dependency_local_path project dep of
+      case dependency_local_path_with resolution project dep of
           SOME path => path
         | NONE => die ("dependency " ^ name ^ " has no local path; add path or .holconfig.toml override")
     val dep_manifest =
@@ -1071,7 +1257,9 @@ fun dependency_project (project : t) (dep as Dependency {name, source}) =
           end
   end
 
-fun resolved_hol_dependency project =
+fun dependency_project project dep = dependency_project_with standard_resolution project dep
+
+fun resolved_hol_dependency_with resolution project =
   let
     fun search_project seen p =
       case hol_dependency p of
@@ -1085,7 +1273,7 @@ fun resolved_hol_dependency project =
             else
               let val seen' = Binaryset.add(seen, name)
               in
-                case search_project seen' (dependency_project parent dep) of
+                case search_project seen' (dependency_project_with resolution parent dep) of
                    SOME hol => SOME hol
                  | NONE => search_deps seen' parent rest
               end
@@ -1093,10 +1281,12 @@ fun resolved_hol_dependency project =
     search_project (Binaryset.empty String.compare) project
   end
 
-fun dependency_package artifact_parent project (dep as Dependency {name, ...}) =
+fun resolved_hol_dependency project = resolved_hol_dependency_with standard_resolution project
+
+fun dependency_package_with resolution artifact_parent project (dep as Dependency {name, ...}) =
   let
-    val dep_project = dependency_project project dep
-    val dep_root = valOf (dependency_local_path project dep)
+    val dep_project = dependency_project_with resolution project dep
+    val dep_root = valOf (dependency_local_path_with resolution project dep)
     val dep_manifest = valOf (dependency_manifest project dep)
     val artifact_root =
       Path.concat(Path.concat(Path.concat(artifact_parent, ".holbuild"), "packages"), name)
@@ -1104,18 +1294,22 @@ fun dependency_package artifact_parent project (dep as Dependency {name, ...}) =
     (Package {name = name, root = dep_root, manifest = dep_manifest,
               members = #members dep_project, excludes = #excludes dep_project,
               exclude_globs = #exclude_globs dep_project,
-              roots = #roots dep_project, artifact_root = artifact_root,
+              roots = #roots dep_project, root_groups = #root_groups dep_project,
+              groups = #groups dep_project, artifact_root = artifact_root,
               action_policies = #action_policies dep_project,
               generators = #generators dep_project},
      dep_project)
   end
+
+fun dependency_package artifact_parent project dep =
+  dependency_package_with standard_resolution artifact_parent project dep
 
 fun same_dependency_source (GitSource a, GitSource b) = #git a = #git b andalso #rev a = #rev b
   | same_dependency_source (FromSource a, FromSource b) =
       #from a = #from b andalso #path a = #path b andalso #manifest a = #manifest b
   | same_dependency_source _ = false
 
-fun packages (project : t) =
+fun packages_with resolution (project : t) =
   let
     val artifact_parent = #graph_artifact_root project
     fun add_dependency parent_project (dep as Dependency {name, source}, (seen, packages)) =
@@ -1125,7 +1319,7 @@ fun packages (project : t) =
             else die ("conflicting dependency " ^ name)
         | NONE =>
             let
-              val (package, dep_project) = dependency_package artifact_parent parent_project dep
+              val (package, dep_project) = dependency_package_with resolution artifact_parent parent_project dep
               val (seen', packages') = add_project dep_project (Binarymap.insert(seen, name, source), package :: packages)
             in
               (seen', packages')
@@ -1146,15 +1340,24 @@ fun packages (project : t) =
     result
   end
 
+fun packages project = packages_with standard_resolution project
+
 fun describe (project : t) =
   let
-    val {root, artifact_root, manifest, name, version, members, excludes, exclude_globs, roots, root_tactic_timeouts, dependencies,
+    val {root, artifact_root, manifest, name, version, members, excludes, exclude_globs, roots, root_groups, groups, root_tactic_timeouts, dependencies,
          overrides, local_build_excludes, local_build_exclude_globs, local_build_jobs, build_tactic_timeout, run_heap, run_loads, heaps, action_policies, generators, ...} = project
     fun opt label value =
       case value of NONE => () | SOME s => print (label ^ s ^ "\n")
     fun describe_package (Package {name, root, manifest, artifact_root, ...}) =
       print ("package: " ^ name ^ " [root=" ^ root ^ ", manifest=" ^ manifest ^
              ", artifact-root=" ^ artifact_root ^ "]\n")
+    fun describe_group group =
+      print ("group: " ^ group_name group ^
+             " include=" ^ String.concatWith ", " (group_includes group) ^
+             " include_globs=" ^ String.concatWith ", " (group_include_globs group) ^
+             " exclude=" ^ String.concatWith ", " (group_excludes group) ^
+             " exclude_globs=" ^ String.concatWith ", " (group_exclude_globs group) ^
+             " allow_empty=" ^ (if group_allow_empty group then "true" else "false") ^ "\n")
   in
     print ("manifest: " ^ manifest ^ "\n");
     print ("root: " ^ root ^ "\n");
@@ -1165,6 +1368,8 @@ fun describe (project : t) =
     print ("exclude: " ^ String.concatWith ", " excludes ^ "\n");
     print ("exclude_globs: " ^ String.concatWith ", " exclude_globs ^ "\n");
     print ("roots: " ^ String.concatWith ", " roots ^ "\n");
+    print ("root_groups: " ^ String.concatWith ", " root_groups ^ "\n");
+    List.app describe_group groups;
     List.app (fn {root, timeout} =>
                 print ("root tactic_timeout: " ^ root ^ " = " ^
                        (case timeout of NONE => "none" | SOME t => Real.toString t) ^ "\n"))

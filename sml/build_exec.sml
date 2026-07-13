@@ -1433,7 +1433,7 @@ fun cache_blob root path =
       | HolbuildCacheBackend.Skipped => hash
   end
 
-fun cache_manifest_text {input_key, sig_hash, sml_hash, dat_hash, parents, mldeps, proof_timeout} =
+fun cache_manifest_text {input_key, sig_hash, sml_hash, dat_hash, trace_hash, parents, mldeps, proof_timeout} =
   String.concatWith "\n"
     (["holbuild-cache-action-v3",
       "input_key=" ^ input_key,
@@ -1444,7 +1444,8 @@ fun cache_manifest_text {input_key, sig_hash, sml_hash, dat_hash, parents, mldep
      map (fn dep => "mldep " ^ dep) mldeps @
      ["blob sig " ^ sig_hash,
       "blob sml " ^ sml_hash,
-      "blob dat " ^ dat_hash]) ^ "\n"
+      "blob dat " ^ dat_hash] @
+     (case trace_hash of NONE => [] | SOME hash => ["blob trace " ^ hash])) ^ "\n"
 
 fun cache_manifest_lines text = String.tokens (fn c => c = #"\n") text
 
@@ -1466,7 +1467,7 @@ fun require_sha1 role hash =
   if valid_sha1_text hash then hash
   else raise Error ("cache manifest invalid " ^ role ^ " blob hash: " ^ hash)
 
-fun known_blob_role role = role = "sig" orelse role = "sml" orelse role = "sml-template" orelse role = "dat"
+fun known_blob_role role = role = "sig" orelse role = "sml" orelse role = "sml-template" orelse role = "dat" orelse role = "trace"
 
 fun add_manifest_blob role hash blobs =
   if not (known_blob_role role) then
@@ -1582,6 +1583,7 @@ fun cache_manifest_blobs_from_lines input_key lines =
       {sig_hash = blob_from_manifest "sig" blobs,
        sml_hash = sml_blob_from_manifest blobs,
        dat_hash = blob_from_manifest "dat" blobs,
+       trace_hash = Option.map #2 (List.find (fn (role, _) => role = "trace") blobs),
        parents = stable_parents,
        mldeps = stable_mldeps}
     end
@@ -1605,25 +1607,28 @@ fun cache_manifest_outputs_equal input_key left right =
   in
     #sig_hash left_blobs = #sig_hash right_blobs andalso
     #sml_hash left_blobs = #sml_hash right_blobs andalso
-    #dat_hash left_blobs = #dat_hash right_blobs
+    #dat_hash left_blobs = #dat_hash right_blobs andalso
+    #trace_hash left_blobs = #trace_hash right_blobs
   end
 
 fun cache_entry_usable root input_key text =
   let
-    val {sig_hash, sml_hash, dat_hash, ...} =
+    val {sig_hash, sml_hash, dat_hash, trace_hash, ...} =
       cache_manifest_blobs_from_lines input_key (cache_manifest_lines text)
   in
     HolbuildCache.has_blob root sig_hash andalso
     HolbuildCache.has_blob root sml_hash andalso
-    HolbuildCache.has_blob root dat_hash
+    HolbuildCache.has_blob root dat_hash andalso
+    (case trace_hash of NONE => true | SOME hash => HolbuildCache.has_blob root hash)
   end
   handle _ => false
 
-fun cache_manifest_output_summary {sig_hash, sml_hash, dat_hash, parents, mldeps} =
+fun cache_manifest_output_summary {sig_hash, sml_hash, dat_hash, trace_hash, parents, mldeps} =
   String.concat
     ["sig=", sig_hash,
      " sml=", sml_hash,
      " dat=", dat_hash,
+     " trace=", Option.getOpt(trace_hash, "none"),
      " parents=", Int.toString (length parents),
      " mldeps=", Int.toString (length mldeps)]
 
@@ -1793,16 +1798,18 @@ fun theory_cache_keys project plan node input_key =
 fun cache_warning_subject node =
   String.concat [logical_name node, " (", source_file node, ")"]
 
-fun publish_cache_manifest root cache_key subject staged_sig published_sml staged_dat cache_parents cache_mldeps proof_timeout =
+fun publish_cache_manifest root cache_key subject staged_sig published_sml staged_dat staged_trace cache_parents cache_mldeps proof_timeout =
   let
     val manifest_path = HolbuildCache.action_manifest root cache_key
     val sig_hash = cache_blob root staged_sig
     val sml_hash = cache_blob root published_sml
     val dat_hash = cache_blob root staged_dat
+    val trace_hash = Option.map (cache_blob root) staged_trace
     fun manifest_with timeout =
       cache_manifest_text {input_key = cache_key, sig_hash = sig_hash,
                            sml_hash = sml_hash,
                            dat_hash = dat_hash,
+                           trace_hash = trace_hash,
                            parents = cache_parents,
                            mldeps = cache_mldeps,
                            proof_timeout = timeout}
@@ -1834,7 +1841,7 @@ fun publish_cache_manifest root cache_key subject staged_sig published_sml stage
       | NONE => put_new_manifest manifest
   end
 
-fun publish_theory_cache project plan node input_key proof_timeout staged_sig published_sml staged_dat {parents, mldeps} =
+fun publish_theory_cache project plan node input_key proof_timeout staged_sig published_sml staged_dat staged_trace {parents, mldeps} =
   let
     val root = cache_root ()
     val _ = HolbuildCache.ensure_layout root
@@ -1846,7 +1853,7 @@ fun publish_theory_cache project plan node input_key proof_timeout staged_sig pu
     fun drop_stale_manifest key = HolbuildCache.remove_action root key
     val subject = cache_warning_subject node
     fun publish () =
-      publish_cache_manifest root cache_key subject staged_sig published_sml staged_dat cache_parents cache_mldeps proof_timeout
+      publish_cache_manifest root cache_key subject staged_sig published_sml staged_dat staged_trace cache_parents cache_mldeps proof_timeout
     fun skip_locked_publish () = ()
   in
     ((if cache_key <> input_key then
@@ -1915,6 +1922,7 @@ fun write_local_theory_manifests plan node {parents, mldeps} =
 fun remove_failed_cache_outputs project node =
   let
     val {sig_path, sml_path, data_path, script_uo, theory_ui, theory_uo} = theory_outputs node
+    val trace_path = drop_suffix ".dat" data_path ^ ".tr.gz"
     (* Invalidate HOL load manifests before removing their targets.  If another
        reader observes the artifact directory while we discard a bad cache entry,
        it should see the theory as unavailable, not a .uo that still points at a
@@ -1926,7 +1934,8 @@ fun remove_failed_cache_outputs project node =
     val payload_paths =
       [data_path, hfs_remapped_path data_path,
        sig_path, hfs_remapped_path sig_path,
-       sml_path, hfs_remapped_path sml_path]
+       sml_path, hfs_remapped_path sml_path,
+       trace_path, hfs_remapped_path trace_path]
   in
     List.app remove_file (manifest_paths @ payload_paths);
     remove_checkpoint_family project node
@@ -1944,7 +1953,7 @@ fun cache_key_role project plan node input_key cache_key =
     else "cache key"
   end
 
-fun materialize_theory_cache_key verify_cache project plan input_key requested_timeout cache_key node =
+fun materialize_theory_cache_key verify_cache project plan input_key requested_timeout require_trace cache_key node =
   let
     val root = cache_root ()
     val manifest = HolbuildCache.action_manifest root cache_key
@@ -1959,14 +1968,19 @@ fun materialize_theory_cache_key verify_cache project plan input_key requested_t
           SOME dep => transient_cache_manifest_error root cache_key manifest manifest_text dep
         | NONE => ()
     val manifest_lines = cache_manifest_lines manifest_text
-    val {sig_hash, sml_hash, dat_hash, parents, mldeps} =
+    val {sig_hash, sml_hash, dat_hash, trace_hash, parents, mldeps} =
       cache_manifest_blobs_from_lines cache_key manifest_lines
+    val _ =
+      if require_trace andalso not (Option.isSome trace_hash) then
+        raise Error "cache manifest missing blob role: trace"
+      else ()
     val proof_timeout = cache_manifest_proof_timeout manifest_lines
     val _ =
       if timeout_satisfies requested_timeout proof_timeout then ()
       else raise Error ("cache entry built with insufficient tactic-timeout contract: built " ^
                         timeout_text proof_timeout ^ ", requested " ^ timeout_text requested_timeout)
     val {sig_path, sml_path, data_path, ...} = theory_outputs node
+    val trace_path = drop_suffix ".dat" data_path ^ ".tr.gz"
     fun install () =
       (copy_blob verify_cache root dat_hash data_path;
        link_or_copy {src = data_path, dst = hfs_remapped_path data_path};
@@ -1975,6 +1989,11 @@ fun materialize_theory_cache_key verify_cache project plan input_key requested_t
        copy_blob verify_cache root sml_hash sml_path;
        write_text sml_path (replace_all cache_sml_token data_path (read_text sml_path));
        link_or_copy {src = sml_path, dst = hfs_remapped_path sml_path};
+       (case trace_hash of
+            NONE => ()
+          | SOME hash =>
+              (copy_blob verify_cache root hash trace_path;
+               link_or_copy {src = trace_path, dst = hfs_remapped_path trace_path}));
        write_local_theory_manifests plan node {parents = parents, mldeps = mldeps};
        HolbuildCache.touch_action root cache_key;
        cache_trace ("cache hit: " ^ logical_name node ^ " " ^ role ^ "=" ^ cache_key);
@@ -1990,8 +2009,8 @@ fun materialize_theory_cache_key verify_cache project plan input_key requested_t
                warn ("cache entry unusable for " ^ logical_name node ^ ": " ^ General.exnMessage e);
                false)
 
-fun materialize_theory_cache verify_cache project plan input_key requested_timeout node =
-  List.exists (fn cache_key => materialize_theory_cache_key verify_cache project plan input_key requested_timeout cache_key node)
+fun materialize_theory_cache verify_cache project plan input_key requested_timeout require_trace node =
+  List.exists (fn cache_key => materialize_theory_cache_key verify_cache project plan input_key requested_timeout require_trace cache_key node)
               (theory_cache_keys project plan node input_key)
 
 fun metadata_path (project : HolbuildProject.t) node =
@@ -2326,13 +2345,13 @@ fun best_failed_prefix_checkpoint requested_timeout checkpoints =
 
 datatype force_level = ForceNone | ForceTargets | ForceProject | ForceAll
 
-type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, proof_steps : bool, new_ir : bool, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool}
+type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, proof_steps : bool, new_ir : bool, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, trknl : bool}
 
 datatype checkpoint_policy =
-  CheckpointPolicy of {checkpoint : bool, proof_steps : bool, new_ir : bool, tactic_timeout : real option, execution_plan : string option, trace_steps : bool, repl_on_failure : bool}
+  CheckpointPolicy of {checkpoint : bool, proof_steps : bool, new_ir : bool, tactic_timeout : real option, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, trknl : bool}
 
 val no_checkpoint_policy =
-  CheckpointPolicy {checkpoint = false, proof_steps = false, new_ir = false, tactic_timeout = NONE, execution_plan = NONE, trace_steps = false, repl_on_failure = false}
+  CheckpointPolicy {checkpoint = false, proof_steps = false, new_ir = false, tactic_timeout = NONE, execution_plan = NONE, trace_steps = false, repl_on_failure = false, trknl = false}
 
 fun checkpoint_enabled (CheckpointPolicy {checkpoint, ...}) = checkpoint
 fun proof_steps_enabled (CheckpointPolicy {proof_steps, ...}) = proof_steps
@@ -2341,6 +2360,7 @@ fun tactic_timeout (CheckpointPolicy {tactic_timeout, ...}) = tactic_timeout
 fun execution_plan (CheckpointPolicy {execution_plan, ...}) = execution_plan
 fun trace_steps (CheckpointPolicy {trace_steps, ...}) = trace_steps
 fun repl_on_failure (CheckpointPolicy {repl_on_failure, ...}) = repl_on_failure
+fun trknl_enabled (CheckpointPolicy {trknl, ...}) = trknl
 
 fun execution_plan_only (CheckpointPolicy {execution_plan = SOME _, trace_steps = false, ...}) = true
   | execution_plan_only _ = false
@@ -2601,6 +2621,8 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
     val staged_sig = staged_theory_file stage node ".sig"
     val staged_sml = staged_theory_file stage node ".sml"
     val staged_dat = staged_theory_file stage node ".dat"
+    val staged_trace = staged_theory_file stage node ".tr.gz"
+    val trace_path = drop_suffix ".dat" data_path ^ ".tr.gz"
     val _ = remove_tree stage
     val _ = ensure_dir stage
     val _ = if checkpoint_enabled policy then ensure_parent deps_loaded else ()
@@ -2806,6 +2828,13 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
                NONE => ()
              | SOME output => HolbuildStatus.message_stdout ("proof step trace log: " ^ captured_output_path output ^ "\n"))
       else ()
+    val _ =
+      if trknl_enabled policy then
+        if file_exists staged_trace then
+          (copy_binary staged_trace trace_path;
+           copy_binary staged_trace (hfs_remapped_path trace_path))
+        else raise Error ("tracing kernel did not produce expected proof trace: " ^ staged_trace)
+      else ()
     val _ = copy_binary staged_dat data_path
     val _ = link_or_copy {src = data_path, dst = hfs_remapped_path data_path}
     val _ = copy_binary staged_sig sig_path
@@ -2820,7 +2849,9 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
       if cache_allowed then
         detail_time_phase "build.exec.publish_cache"
           (fn () => publish_theory_cache project plan node input_key (tactic_timeout policy)
-                                      staged_sig sml_path staged_dat generated_metadata)
+                                      staged_sig sml_path staged_dat
+                                      (if trknl_enabled policy then SOME staged_trace else NONE)
+                                      generated_metadata)
       else ()
   in
     write_local_theory_manifests plan node generated_metadata;
@@ -2851,16 +2882,23 @@ fun build_sml_like plan node output_suffix =
     if output_suffix = ".uo" then write_empty_ui_if_needed plan node else ()
   end
 
-fun output_paths _ _ node =
+fun trace_paths checkpoint_policy data_paths =
+  if trknl_enabled checkpoint_policy then
+    map (fn path => drop_suffix ".dat" path ^ ".tr.gz") data_paths
+  else []
+
+fun output_paths checkpoint_policy _ node =
   let
     val artifacts = source_artifacts node
     val generated_paths = #generated artifacts
     val object_paths = #objects artifacts
     val data_paths = #theory_data artifacts
+    val trace_paths = trace_paths checkpoint_policy data_paths
   in
     generated_paths @ map hfs_remapped_path generated_paths @
     object_paths @ map hfs_remapped_path object_paths @
-    data_paths @ map hfs_remapped_path data_paths
+    data_paths @ map hfs_remapped_path data_paths @
+    trace_paths @ map hfs_remapped_path trace_paths
   end
 
 fun output_hash_line path hash = "output-sha1=" ^ path ^ " " ^ hash
@@ -3190,7 +3228,7 @@ fun assoc_timeout _ [] = NONE
 fun effective_tactic_timeout proof_steps node_timeout =
   if proof_steps then node_timeout else NONE
 
-fun checkpoint_policy_for_node ({skip_checkpoints, proof_steps, new_ir, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure, ...} : build_options) project node =
+fun checkpoint_policy_for_node ({skip_checkpoints, proof_steps, new_ir, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure, trknl, ...} : build_options) project node =
   CheckpointPolicy {checkpoint = not skip_checkpoints,
                     proof_steps = proof_steps,
                     new_ir = new_ir,
@@ -3198,7 +3236,8 @@ fun checkpoint_policy_for_node ({skip_checkpoints, proof_steps, new_ir, node_tac
                                       (assoc_timeout (HolbuildBuildPlan.key node) node_tactic_timeouts),
                     execution_plan = if proof_steps then execution_plan else NONE,
                     trace_steps = proof_steps andalso trace_steps,
-                    repl_on_failure = repl_on_failure}
+                    repl_on_failure = repl_on_failure,
+                    trknl = trknl}
 
 fun proof_engine (CheckpointPolicy {proof_steps = false, ...}) = "plain_v1"
   | proof_engine (CheckpointPolicy {new_ir = true, ...}) = "proof_ir_v3"
@@ -3342,7 +3381,7 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
     fun invalidate_node_dat_hash () =
       invalidate_cached_file_hash dat_hash_cache (#data_path (theory_outputs node))
     fun materialize_valid_cache () =
-      materialize_theory_cache (#verify_cache options) project plan input_key (tactic_timeout policy) node andalso
+      materialize_theory_cache (#verify_cache options) project plan input_key (tactic_timeout policy) (trknl_enabled policy) node andalso
       (if theory_parent_hashes_match dat_hash_cache plan node NONE then true
        else (remove_failed_cache_outputs project node; false))
   in
