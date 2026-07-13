@@ -288,6 +288,15 @@ fun topo_sort generators =
         : (string, HolbuildProject.generator) Binarymap.dict *
           (string, int) Binarymap.dict *
           (string, string list) Binarymap.dict
+    val manifest_positions =
+      #2 (List.foldl
+            (fn (generator, (position, positions)) =>
+                (position + 1,
+                 Binarymap.insert(positions, HolbuildProject.generator_name generator, position)))
+            (0, Binarymap.mkDict String.compare)
+            generators)
+    fun before_in_manifest left right =
+      Binarymap.find(manifest_positions, left) < Binarymap.find(manifest_positions, right)
     fun indegree dict name = Option.getOpt(Binarymap.peek(dict, name), 0)
     fun ready_names () =
       List.foldr
@@ -295,18 +304,29 @@ fun topo_sort generators =
             let val name = HolbuildProject.generator_name generator
             in if indegree initial_indegrees name = 0 then name :: acc else acc end)
         [] generators
-    fun push_back item (front, back) = (front, item :: back)
     fun pop_queue queue =
       case queue of
           (item :: front, back) => SOME (item, (front, back))
         | ([], []) => NONE
         | ([], back) => pop_queue (rev back, [])
+    fun queue_items (front, back) = front @ rev back
+    fun insert_ready item queue =
+      let
+        fun insert [] = [item]
+          | insert (other :: rest) =
+              if before_in_manifest item other then item :: other :: rest
+              else other :: insert rest
+      in
+        (* FIFO insertion orders newly unblocked independent generators by
+           predecessor completion; retain the manifest's stable ordering. *)
+        (insert (queue_items queue), [])
+      end
     fun process_dependent (dependent, (indegrees, queue)) =
       let
         val count = indegree indegrees dependent - 1
         val indegrees' = Binarymap.insert(indegrees, dependent, count)
       in
-        if count = 0 then (indegrees', push_back dependent queue)
+        if count = 0 then (indegrees', insert_ready dependent queue)
         else (indegrees', queue)
       end
     fun generator_for name =
