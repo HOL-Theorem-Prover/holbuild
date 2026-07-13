@@ -39,8 +39,12 @@ fun set_current_instance instance = global_instance := SOME instance
 fun clear_current_instance () = global_instance := NONE
 
 fun with_lock (instance : instance) f =
-  (Mutex.lock (#mutex instance); f () before Mutex.unlock (#mutex instance))
-  handle e => (Mutex.unlock (#mutex instance); raise e)
+  let val mutex = #mutex instance
+  in
+    Mutex.lock mutex;
+    (f () before Mutex.unlock mutex)
+    handle e => (Mutex.unlock mutex; raise e)
+  end
 
 fun stats (instance : instance) =
   with_lock instance
