@@ -12,7 +12,7 @@ GOLDEN_KEY_BASELINE := tests/golden/key-dumps
 
 golden-key-dump-check: bin/holbuild
 	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
-	HOLBUILD_TESTBED=/nonexistent tests/golden-key-dump.sh capture "$$tmp"; \
+	HOLDIR="$(HOLDIR)" HOLBUILD_HOLDIR="$(HOLBUILD_HOLDIR)" HOLBUILD_TESTBED=/nonexistent tests/golden-key-dump.sh capture "$$tmp"; \
 	tests/golden-key-dump.sh diff "$(GOLDEN_KEY_BASELINE)" "$$tmp";
 
 all: bin/holbuild
