@@ -107,5 +107,32 @@ if text.count(old) != 1:
 path.write_text(text.replace(old, new))
 PY
 
+# Keep the checked-in whitespace normalization too.  This is deliberately an
+# exact patch: if HOL changes this portion, a refresh must be updated rather
+# than silently producing a vendor tree that differs from the checked-in form.
+binaryset=tools-poly/poly/Binaryset.sml
+grep -Fxq "$binaryset" "$files" || {
+  echo "missing required vendored formatting file: $binaryset" >&2
+  exit 1
+}
+python3 - "$root/vendor/hol/$binaryset" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+old = '''\t   if wt n1 < n2 then T'(v2, concat t1 l2, r2)
+\t   else if wt n2 < n1 then T'(v1, l1, concat r1 t2)
+  \t   else T'(min t2,t1, delmin t2)
+'''
+new = '''           if wt n1 < n2 then T'(v2, concat t1 l2, r2)
+           else if wt n2 < n1 then T'(v1, l1, concat r1 t2)
+           else T'(min t2,t1, delmin t2)
+'''
+text = path.read_text()
+if text.count(old) != 1:
+    raise SystemExit(f"could not apply Binaryset formatting patch to {path}")
+path.write_text(text.replace(old, new))
+PY
+
 printf '%s\n' "$rev" > "$root/vendor/hol/REV"
 echo "updated vendored HOL files to $rev"
