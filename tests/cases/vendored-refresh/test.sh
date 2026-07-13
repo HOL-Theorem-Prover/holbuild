@@ -50,3 +50,22 @@ if [[ "$first_hash" != "$second_hash" ]]; then
   echo "vendored refresh is not idempotent for Binaryset" >&2
   exit 1
 fi
+
+# A failed exact compatibility patch must leave the prior vendor tree and REV
+# intact rather than publishing files from the incompatible upstream revision.
+printf 'incompatible upstream form\n' > "$source_checkout/tools-poly/poly/Binaryset.sml"
+git -C "$source_checkout" add tools-poly/poly/Binaryset.sml
+git -C "$source_checkout" commit -qm incompatible-fixture
+bad_rev=$(git -C "$source_checkout" rev-parse HEAD)
+if "$fixture/tools/update-vendored-hol.sh" --from "$source_checkout" "$bad_rev"; then
+  echo "vendored refresh accepted an incompatible compatibility patch" >&2
+  exit 1
+fi
+if [[ "$(cat "$fixture/vendor/hol/REV")" != "$rev" ]]; then
+  echo "failed vendored refresh changed REV" >&2
+  exit 1
+fi
+if [[ "$(sha1sum "$binaryset" | awk '{print $1}')" != "$second_hash" ]]; then
+  echo "failed vendored refresh changed the live vendor tree" >&2
+  exit 1
+fi

@@ -44,9 +44,13 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 files=$root/vendor/hol/FILES
 [[ -f $files ]] || { echo "missing $files" >&2; exit 1; }
 
-tmpdir=
+# Build a complete replacement beside the live tree.  In particular, do not
+# let a compatibility-patch failure leave a mixture of old and new files.
+tmpdir=$(mktemp -d "$root/vendor/.update-vendored-hol.XXXXXX")
+stage=$tmpdir/hol
+mkdir -p "$stage"
 cleanup() {
-  [[ -z ${tmpdir:-} ]] || rm -rf "$tmpdir"
+  rm -rf "$tmpdir"
 }
 trap cleanup EXIT
 
@@ -58,12 +62,12 @@ if [[ -n $source_checkout ]]; then
     exit 1
   }
 else
-  tmpdir=$(mktemp -d)
   hol=$tmpdir/HOL
   git clone --filter=blob:none https://github.com/HOL-Theorem-Prover/HOL.git "$hol"
   git -C "$hol" fetch --quiet origin "$rev"
 fi
 
+cp "$files" "$stage/FILES"
 while IFS= read -r rel || [[ -n $rel ]]; do
   [[ -z $rel || $rel = \#* ]] && continue
   case $rel in
@@ -72,9 +76,9 @@ while IFS= read -r rel || [[ -n $rel ]]; do
       exit 1
       ;;
   esac
-  mkdir -p "$(dirname "$root/vendor/hol/$rel")"
-  git -C "$hol" show "$rev:$rel" > "$root/vendor/hol/$rel.tmp"
-  mv "$root/vendor/hol/$rel.tmp" "$root/vendor/hol/$rel"
+  mkdir -p "$(dirname "$stage/$rel")"
+  git -C "$hol" show "$rev:$rel" > "$stage/$rel.tmp"
+  mv "$stage/$rel.tmp" "$stage/$rel"
 done < "$files"
 
 # HOL's Redblackmap refers to Portable.itlist, but the vendored compilation
@@ -86,7 +90,7 @@ grep -Fxq "$redblackmap" "$files" || {
   echo "missing required vendored compatibility file: $redblackmap" >&2
   exit 1
 }
-python3 - "$root/vendor/hol/$redblackmap" <<'PY'
+python3 - "$stage/$redblackmap" <<'PY'
 from pathlib import Path
 import sys
 
@@ -115,7 +119,7 @@ grep -Fxq "$binaryset" "$files" || {
   echo "missing required vendored formatting file: $binaryset" >&2
   exit 1
 }
-python3 - "$root/vendor/hol/$binaryset" <<'PY'
+python3 - "$stage/$binaryset" <<'PY'
 from pathlib import Path
 import sys
 
@@ -134,5 +138,21 @@ if text.count(old) != 1:
 path.write_text(text.replace(old, new))
 PY
 
-printf '%s\n' "$rev" > "$root/vendor/hol/REV"
+printf '%s\n' "$rev" > "$stage/REV"
+
+# Both directories are under vendor/, so these renames stay on one filesystem.
+# Every fetch and exact compatibility patch has succeeded before the live tree
+# is replaced.  Restore it if publishing the replacement itself fails.
+vendor=$root/vendor/hol
+backup=$(mktemp -d "$root/vendor/.update-vendored-hol-backup.XXXXXX")
+rmdir "$backup"
+mv "$vendor" "$backup"
+if mv "$stage" "$vendor"; then
+  rm -rf "$backup"
+else
+  mv "$backup" "$vendor"
+  echo "could not publish refreshed vendored HOL tree" >&2
+  exit 1
+fi
+
 echo "updated vendored HOL files to $rev"
