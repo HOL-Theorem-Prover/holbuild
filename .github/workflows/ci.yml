@@ -46,7 +46,7 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ~/.cache/holbuild/hol-toolchains
-          key: hol-toolchains-with-trknl-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ steps.trknl-polyml.outputs.polyml-rev }}-${{ steps.hol4-pin.outputs.hol4-ref }}-v1
+          key: hol-toolchains-with-trknl-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ steps.trknl-polyml.outputs.polyml-rev }}-${{ steps.hol4-pin.outputs.hol4-ref }}-v2
 
       - name: Build holbuild
         run: make
@@ -78,7 +78,7 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: ~/.cache/holbuild/hol-toolchains
-          key: hol-toolchains-with-trknl-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ steps.trknl-polyml.outputs.polyml-rev }}-${{ steps.hol4-pin.outputs.hol4-ref }}-v1
+          key: hol-toolchains-with-trknl-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ steps.trknl-polyml.outputs.polyml-rev }}-${{ steps.hol4-pin.outputs.hol4-ref }}-v2
 
       - name: Run tests
         env:
