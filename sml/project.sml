@@ -12,6 +12,7 @@ datatype action_policy = datatype HolbuildPackageDefinition.action_policy
 datatype generator = datatype HolbuildPackageDefinition.generator
 datatype group = datatype HolbuildPackageDefinition.group
 datatype dependency_source = datatype HolbuildPackageDefinition.dependency_source
+datatype dependency_role = datatype HolbuildPackageDefinition.dependency_role
 datatype dependency = datatype HolbuildPackageDefinition.dependency
 
 datatype override = datatype HolbuildLocalConfig.override
@@ -22,6 +23,8 @@ datatype package =
     { name : string,
       root : string,
       manifest : string,
+      definition : HolbuildPackageDefinition.t,
+      provenance : HolbuildPackageProvenance.t,
       members : string list,
       excludes : string list,
       exclude_globs : string list,
@@ -79,8 +82,9 @@ fun absolute_from_cwd path =
 
 fun set_source_dir path = source_dir_ref := SOME (absolute_from_cwd path)
 
-fun schema2_hol_dependency (Dependency {name = "hol", source = GitSource _}) = true
-  | schema2_hol_dependency _ = false
+fun hol_toolchain_dependency
+      (Dependency {role = HolToolchainDependency, source = GitSource _, ...}) = true
+  | hol_toolchain_dependency _ = false
 
 fun original_dir () =
   case OS.Process.getEnv "HOLBUILD_ORIG_CWD" of
@@ -243,6 +247,14 @@ fun dependency_name (Dependency {name, ...}) = name
 fun package_name (Package {name, ...}) = name
 fun package_root (Package {root, ...}) = root
 fun package_manifest (Package {manifest, ...}) = manifest
+fun package_definition_of (Package {definition, ...}) = definition
+fun package_provenance (Package {provenance, ...}) = provenance
+fun package_identity package =
+  HolbuildPackageProvenance.identity
+    (HolbuildPackageDefinition.canonical_id (package_definition_of package))
+    (package_provenance package)
+fun package_source_root package =
+  HolbuildPackageProvenance.source_root (package_provenance package)
 fun package_members (Package {members, ...}) = members
 fun package_excludes (Package {excludes, ...}) = excludes
 fun package_exclude_globs (Package {exclude_globs, ...}) = exclude_globs
@@ -258,7 +270,9 @@ fun artifact_root ({artifact_root, ...} : t) = artifact_root
 fun package_definition ({definition, ...} : t) = definition
 fun local_config ({local_config, ...} : t) = local_config
 fun hol_dependency ({dependencies, ...} : t) =
-  List.find (fn Dependency {name, ...} => name = "hol") dependencies
+  List.find
+    (fn Dependency {role = HolToolchainDependency, ...} => true | _ => false)
+    dependencies
 
 type resolution = {kernel_variant : HolbuildHolToolchainConfig.kernel_variant}
 val standard_resolution = {kernel_variant = HolbuildHolToolchainConfig.StandardKernel}
@@ -317,17 +331,19 @@ fun action_policy_for policies logical =
 fun dependency_path_context name = "dependencies." ^ name ^ ".path"
 fun dependency_manifest_context name = "dependencies." ^ name ^ ".manifest"
 
-fun dependency_local_path_with resolution (project as {graph_artifact_root, ...} : t) (Dependency {name, source}) =
+fun dependency_local_path_with resolution (project as {graph_artifact_root, ...} : t) (Dependency {name, source, role}) =
   case override_path (#overrides project) name of
       SOME path => SOME path
     | NONE =>
         case source of
             GitSource {git, rev} =>
-              if name = "hol" then SOME (hol_holdir resolution {git = git, rev = rev})
+              if role = HolToolchainDependency then
+                SOME (hol_holdir resolution {git = git, rev = rev})
               else SOME (Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), name))
           | FromSource {from, path, ...} =>
               (case hol_dependency project of
-                   SOME (Dependency {name = "hol", source = GitSource {git, rev}}) =>
+                   SOME (Dependency {role = HolToolchainDependency,
+                                     source = GitSource {git, rev}, ...}) =>
                      if from = "hol" then SOME (Path.concat(hol_holdir resolution {git = git, rev = rev}, path))
                      else SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path))
                  | _ => SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path)))
@@ -337,7 +353,7 @@ fun dependency_local_path project dep = dependency_local_path_with standard_reso
 fun dependency_manifest (project as {manifest = project_manifest, graph_artifact_root, ...} : t) dep =
   case dep of
       dep as Dependency {name, source = GitSource _, ...} =>
-        if schema2_hol_dependency dep then SOME (HolbuildBuiltinManifests.holdir_manifest_name)
+        if hol_toolchain_dependency dep then SOME (HolbuildBuiltinManifests.holdir_manifest_name)
         else
           (case override_path (#overrides project) name of
                SOME path => SOME (Path.concat(path, "holproject.toml"))
@@ -352,7 +368,7 @@ fun heap_kind_to_string HeapImage = "heap"
 fun heap_to_string (Heap {name, output, objects, kind}) =
   name ^ " (" ^ heap_kind_to_string kind ^ ") -> " ^ output ^ " [" ^ String.concatWith ", " objects ^ "]"
 
-fun dependency_to_string project (dep as Dependency {name, source}) =
+fun dependency_to_string project (dep as Dependency {name, source, ...}) =
   let
     fun field label value =
       case value of NONE => [] | SOME s => [label ^ "=" ^ s]
@@ -374,22 +390,33 @@ fun dependency_to_string project (dep as Dependency {name, source}) =
 fun override_to_string (OverridePath {name, path}) = name ^ " path -> " ^ path
   | override_to_string (OverrideGit {name, git}) = name ^ " git -> " ^ git
 
-fun project_package ({root, artifact_root, graph_artifact_root, manifest, name, members, excludes, exclude_globs, roots, root_groups, groups, action_policies, generators, ...} : t) =
+fun project_package ({root, artifact_root, graph_artifact_root, manifest, definition, name, members, excludes, exclude_globs, roots, root_groups, groups, action_policies, generators, ...} : t) =
+  let
+    val provenance =
+      {snapshot = HolbuildPackageProvenance.WorkingTreeSnapshot,
+       definition = HolbuildPackageProvenance.RootManifest,
+       retrieval = HolbuildPackageProvenance.WorkingTreeRetrieval,
+       materialization = {source_root = root, package_root = root,
+                          manifest = manifest},
+       origin = HolbuildPackageProvenance.RootOrigin}
+  in
   Package {name = name, root = root, manifest = manifest,
+           definition = definition, provenance = provenance,
            members = members, excludes = excludes, exclude_globs = exclude_globs,
            roots = roots, root_groups = root_groups, groups = groups,
            artifact_root = if artifact_root = graph_artifact_root then Path.concat(artifact_root, ".holbuild") else artifact_root,
            action_policies = action_policies,
            generators = generators}
+  end
 
 fun root_package_name project = package_name (project_package project)
 
-fun dependency_project_with resolution (project : t) (dep as Dependency {name, source}) =
+fun dependency_project_with resolution (project : t) (dep as Dependency {name, source, ...}) =
   let
     val _ =
       case source of
           GitSource {git, rev} =>
-            if schema2_hol_dependency dep orelse Option.isSome (override_path (#overrides project) name) then ()
+            if hol_toolchain_dependency dep orelse Option.isSome (override_path (#overrides project) name) then ()
             else
               let val effective_git = Option.getOpt(override_git (#overrides project) name, git)
               in ignore (HolbuildGitCache.materialize {name = name, git = effective_git, rev = rev,
@@ -404,7 +431,7 @@ fun dependency_project_with resolution (project : t) (dep as Dependency {name, s
           SOME manifest => manifest
         | NONE => die ("dependency " ^ name ^ " has no manifest")
     val parse_dep =
-      if schema2_hol_dependency dep then parse_builtin_holdir_at
+      if hol_toolchain_dependency dep then parse_builtin_holdir_at
       else
         (if readable dep_manifest then ()
          else die ("dependency " ^ name ^ " manifest not found: " ^ dep_manifest);
@@ -448,15 +475,82 @@ fun resolved_hol_dependency_with resolution project =
 
 fun resolved_hol_dependency project = resolved_hol_dependency_with standard_resolution project
 
-fun dependency_package_with resolution artifact_parent project (dep as Dependency {name, ...}) =
+fun dependency_package_with resolution artifact_parent project
+      (dep as Dependency {name, source, ...}) =
   let
     val dep_project = dependency_project_with resolution project dep
     val dep_root = valOf (dependency_local_path_with resolution project dep)
     val dep_manifest = valOf (dependency_manifest project dep)
     val artifact_root =
       Path.concat(Path.concat(Path.concat(artifact_parent, ".holbuild"), "packages"), name)
+    fun declared_dependency dep_name =
+      List.find (fn Dependency {name, ...} => name = dep_name)
+        (#dependencies project)
+    fun git_retrieval dep_name git =
+      case override_path (#overrides project) dep_name of
+          SOME path => HolbuildPackageProvenance.TrustedPathRetrieval {path = path}
+        | NONE =>
+            (case override_git (#overrides project) dep_name of
+                 SOME retrieval_git =>
+                   HolbuildPackageProvenance.AlternateGitRetrieval
+                     {declared_git = git, retrieval_git = retrieval_git}
+               | NONE => HolbuildPackageProvenance.DeclaredGitRetrieval {git = git})
+    val provenance =
+      case source of
+          GitSource {git, rev} =>
+            if hol_toolchain_dependency dep then
+              {snapshot = HolbuildPackageProvenance.ToolchainSnapshot
+                            {git = git, rev = rev,
+                             kernel_variant = #kernel_variant resolution},
+               definition = HolbuildPackageProvenance.ImplicitHolManifest,
+               retrieval = HolbuildPackageProvenance.ToolchainCacheRetrieval,
+               materialization = {source_root = dep_root, package_root = dep_root,
+                                  manifest = dep_manifest},
+               origin = HolbuildPackageProvenance.ImplicitHolOrigin
+                          {git = git, rev = rev,
+                           kernel_variant = #kernel_variant resolution}}
+            else
+              {snapshot = HolbuildPackageProvenance.GitSnapshot {git = git, rev = rev},
+               definition = HolbuildPackageProvenance.DependencyManifest
+                              {dependency = name},
+               retrieval = git_retrieval name git,
+               materialization = {source_root = dep_root, package_root = dep_root,
+                                  manifest = dep_manifest},
+               origin = HolbuildPackageProvenance.DependencyOrigin
+                          {dependency = name}}
+        | FromSource {from, path, manifest} =>
+            let
+              val (git, rev, role, source_root, retrieval) =
+                case declared_dependency from of
+                    SOME (from_dep as Dependency
+                            {source = GitSource {git, rev}, role, ...}) =>
+                      (git, rev, role,
+                       valOf (dependency_local_path_with resolution project from_dep),
+                       case role of
+                           HolToolchainDependency =>
+                             HolbuildPackageProvenance.ToolchainCacheRetrieval
+                         | PackageDependency => git_retrieval from git)
+                  | _ => raise Fail "validated from dependency disappeared"
+            in
+              {snapshot =
+                 (case role of
+                      HolToolchainDependency =>
+                        HolbuildPackageProvenance.ToolchainSnapshot
+                          {git = git, rev = rev,
+                           kernel_variant = #kernel_variant resolution}
+                    | PackageDependency =>
+                        HolbuildPackageProvenance.GitSnapshot {git = git, rev = rev}),
+               definition = HolbuildPackageProvenance.ShimManifest
+                              {from = from, path = path, manifest = manifest},
+               retrieval = retrieval,
+               materialization = {source_root = source_root, package_root = dep_root,
+                                  manifest = dep_manifest},
+               origin = HolbuildPackageProvenance.ShimOrigin
+                          {dependency = name, from = from}}
+            end
   in
     (Package {name = name, root = dep_root, manifest = dep_manifest,
+              definition = #definition dep_project, provenance = provenance,
               members = #members dep_project, excludes = #excludes dep_project,
               exclude_globs = #exclude_globs dep_project,
               roots = #roots dep_project, root_groups = #root_groups dep_project,
@@ -479,7 +573,7 @@ fun packages_with resolution (project : t) =
     val artifact_parent = #graph_artifact_root project
     fun seen_source name seen =
       Option.map #2 (List.find (fn (n, _) => n = name) seen)
-    fun add_dependency parent_project (dep as Dependency {name, source}, (seen, packages)) =
+    fun add_dependency parent_project (dep as Dependency {name, source, ...}, (seen, packages)) =
       case seen_source name seen of
           SOME previous =>
             if same_dependency_source (previous, source) then (seen, packages)
@@ -513,9 +607,23 @@ fun describe (project : t) =
          overrides, local_build_excludes, local_build_exclude_globs, local_build_jobs, build_tactic_timeout, run_heap, run_loads, heaps, action_policies, generators, ...} = project
     fun opt label value =
       case value of NONE => () | SOME s => print (label ^ s ^ "\n")
-    fun describe_package (Package {name, root, manifest, artifact_root, ...}) =
-      print ("package: " ^ name ^ " [root=" ^ root ^ ", manifest=" ^ manifest ^
-             ", artifact-root=" ^ artifact_root ^ "]\n")
+    fun describe_package (package as Package {name, root, manifest, artifact_root,
+                                              provenance, ...}) =
+      (print ("package: " ^ name ^ " [root=" ^ root ^ ", manifest=" ^ manifest ^
+              ", artifact-root=" ^ artifact_root ^ "]\n");
+       print ("package-identity: " ^ name ^ " " ^ package_identity package ^ "\n");
+       print ("package-origin: " ^ name ^ " " ^
+              HolbuildPackageProvenance.origin_text
+                (HolbuildPackageProvenance.origin provenance) ^ "\n");
+       print ("package-snapshot: " ^ name ^ " " ^
+              HolbuildPackageProvenance.snapshot_text (#snapshot provenance) ^ "\n");
+       print ("package-definition-provenance: " ^ name ^ " " ^
+              HolbuildPackageProvenance.definition_text (#definition provenance) ^ "\n");
+       print ("package-retrieval: " ^ name ^ " " ^
+              HolbuildPackageProvenance.retrieval_text (#retrieval provenance) ^ "\n");
+       print ("package-source-root: " ^ name ^ " " ^
+              HolbuildPackageProvenance.source_root provenance ^ "\n");
+       print ("package-root: " ^ name ^ " " ^ root ^ "\n"))
     fun describe_group group =
       print ("group: " ^ group_name group ^
              " include=" ^ String.concatWith ", " (group_includes group) ^

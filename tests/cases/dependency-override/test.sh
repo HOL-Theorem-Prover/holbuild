@@ -86,6 +86,8 @@ require_grep "override=$leaf" "$direct_log"
 require_grep "local=$leaf" "$direct_log"
 require_grep "resolved-manifest=$leaf/holproject.toml" "$direct_log"
 require_grep "package: leaf \[root=$leaf" "$direct_log"
+require_grep "package-snapshot: leaf .*git-v1" "$direct_log"
+require_grep "package-retrieval: leaf trusted-path:$leaf" "$direct_log"
 if [ -e "$project/.holbuild/src/leaf" ]; then
   echo "overridden direct dependency was materialized into .holbuild/src" >&2
   exit 1

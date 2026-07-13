@@ -70,6 +70,10 @@ ids() {
 }
 
 write_manifest 1.0.0 '"src/A.sml"' true project-first
+(cd "$project" && "$HOLBUILD_BIN" context) > "$tmpdir/first.context"
+require_grep "package-origin: identity root" "$tmpdir/first.context"
+require_grep "package-origin: hol implicit-hol:standard" "$tmpdir/first.context"
+require_grep "package-retrieval: hol toolchain-cache" "$tmpdir/first.context"
 ids > "$tmpdir/first.ids"
 write_manifest 1.0.0 '"src/A.sml"' true reordered
 ids > "$tmpdir/reordered.ids"

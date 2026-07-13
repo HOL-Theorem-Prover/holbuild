@@ -289,7 +289,10 @@ Holbuild parses committed semantics into separate metadata, source, entrypoint,
 dependency, runtime, action-input, action-dependency, action-execution, and
 generator layers. `holbuild context` reports canonical IDs for the package and
 independently reusable policy layers; TOML formatting and table order do not
-affect these IDs.
+affect these IDs. It also reports typed package provenance: authoritative source
+snapshot, definition and retrieval origins, logical/source roots, and implicit
+HOL toolchain origin. Retrieval and materialization paths are excluded from
+semantic package identities.
 
 ### `[dependencies.*]`
 

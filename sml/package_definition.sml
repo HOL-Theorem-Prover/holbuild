@@ -48,8 +48,11 @@ datatype dependency_source =
     GitSource of {git : string, rev : string}
   | FromSource of {from : string, path : string, manifest : string}
 
+datatype dependency_role = PackageDependency | HolToolchainDependency
+
 datatype dependency =
-  Dependency of {name : string, source : dependency_source}
+  Dependency of
+    {name : string, source : dependency_source, role : dependency_role}
 
 (* Parsed committed semantics only. Filesystem roots, artifact locations,
    source acquisition, local overrides, and invocation configuration belong to
@@ -140,7 +143,8 @@ fun parse_dependency (name, table) =
         | (NONE, NONE, SOME from, SOME path, SOME manifest) =>
             FromSource {from = from, path = path, manifest = manifest}
         | _ => die ("invalid dependency form for dependencies." ^ name)
-  in Dependency {name = name, source = source} end
+    val role = if name = "hol" then HolToolchainDependency else PackageDependency
+  in Dependency {name = name, source = source, role = role} end
 
 fun dependency_name (Dependency {name, ...}) = name
 
@@ -149,7 +153,7 @@ fun validate_dependency_refs deps =
     fun source_for name =
       Option.map (fn Dependency {source, ...} => source)
         (List.find (fn dep => dependency_name dep = name) deps)
-    fun one (Dependency {name, source = FromSource {from, ...}}) =
+    fun one (Dependency {name, source = FromSource {from, ...}, ...}) =
           (case source_for from of
                SOME (GitSource _) => ()
              | SOME _ => die ("dependencies." ^ name ^ " from dependency must refer to a direct git dependency: " ^ from)
@@ -575,7 +579,7 @@ fun group_text (Group {name, includes, include_globs, excludes, exclude_globs,
           string_sequence excludes, string_sequence exclude_globs,
           bool_text allow_empty]
 fun dependency_key (Dependency {name, ...}) = name
-fun dependency_text (Dependency {name, source}) =
+fun dependency_text (Dependency {name, source, ...}) =
   fields [name,
     case source of
         GitSource {git, rev} => fields ["git", git, rev]

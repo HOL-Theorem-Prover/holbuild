@@ -57,6 +57,7 @@ use "sml/cache_archive.sml";
 use "sml/hol_shared_cache.sml";
 use "sml/manifest_util.sml";
 use "sml/package_definition.sml";
+use "sml/package_provenance.sml";
 use "sml/local_config.sml";
 use "sml/project.sml";
 use "sml/toolchain.sml";
