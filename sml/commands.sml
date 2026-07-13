@@ -293,7 +293,7 @@ fun split_flags args =
               let val (flags, ys) = loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
               in (flags, x :: ys) end
   in
-    loop false false HolbuildBuildExec.ForceNone true false false false true true NONE false NONE false false false false build_args
+    loop false false HolbuildBuildExec.ForceNone true true false false true true NONE false NONE false false false false build_args
   end
 
 fun has_suffix suffix s =

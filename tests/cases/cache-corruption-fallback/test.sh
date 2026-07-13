@@ -50,20 +50,10 @@ printf 'corrupt dat blob\n' > "$HOLBUILD_CACHE/blobs/$dat_blob"
 rm -rf "$project/.holbuild"
 default_corrupt_blob_log=$tmpdir/default-corrupt-blob.log
 (cd "$project" && "$HOLBUILD_BIN" build ATheory) > "$default_corrupt_blob_log" 2>&1
-require_grep "ATheory restored from cache" "$default_corrupt_blob_log"
-cmp "$project/.holbuild/obj/src/ATheory.dat" "$HOLBUILD_CACHE/blobs/$dat_blob" || {
-  echo "default cache restore did not materialize the cache blob bytes" >&2
-  exit 1
-}
-require_file "$project/.holbuild/obj/src/ATheory.dat"
-
-rm -rf "$project/.holbuild"
-verify_corrupt_blob_log=$tmpdir/verify-corrupt-blob.log
-(cd "$project" && "$HOLBUILD_BIN" build --verify-cache ATheory) > "$verify_corrupt_blob_log" 2>&1
-require_grep "cache entry unusable" "$verify_corrupt_blob_log"
+require_grep "cache entry unusable" "$default_corrupt_blob_log"
 require_file "$project/.holbuild/obj/src/ATheory.dat"
 cmp "$clean_dat_blob" "$HOLBUILD_CACHE/blobs/$dat_blob" || {
-  echo "verify-cache rebuild did not repair the corrupt cache blob" >&2
+  echo "default cache verification did not repair the corrupt cache blob" >&2
   exit 1
 }
 
