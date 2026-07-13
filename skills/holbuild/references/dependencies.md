@@ -1,6 +1,6 @@
 # Dependency management
 
-holbuild uses schema 2 dependency management only. A resolved project graph must contain exactly one package named `hol`; this package is the project HOL toolchain and is declared with an exact git revision.
+The current manifest language supports exact dependency management; the legacy `schema = 2` marker is optional. A resolved project graph must contain exactly one package named `hol`; this package is the project HOL toolchain and is declared with an exact git revision.
 
 ## Project HOL
 
@@ -85,7 +85,7 @@ holbuild no longer supports:
 - branch/tag/range version specifications
 - lockfiles, registries, solvers, or multiple versions of one package
 
-`.holconfig.toml` supports local build settings such as `[build].jobs`, `[build].exclude`, and `[build].tactic_timeout`. It also supports `[overrides.NAME] path = "..."` for workstation-local dependency source directories and `[overrides.NAME] git = "..."` for alternate git sources checked out at the manifest `rev`. Overrides apply during recursive dependency resolution and do not change the committed manifest's dependency identity.
+`.holconfig.toml` supports local build settings such as `[build].jobs`, `[build].exclude`, and `[build].tactic_timeout`. It also supports `[overrides.NAME] path = "..."` for workstation-local dependency source directories and `[overrides.NAME] git = "..."` for alternate git sources checked out at the manifest `rev`. Overrides apply during recursive dependency resolution and do not change the committed manifest's dependency identity. A `from/path/manifest` shim cannot be overridden directly; override its direct source dependency instead so the declared subtree remains authoritative.
 
 ## Dependency resolution flow
 

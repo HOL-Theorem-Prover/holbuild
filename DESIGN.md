@@ -23,9 +23,9 @@ and cacheable builds that never require users to reason about the cache.
 ## Packages and manifests
 
 Every package in the resolved graph has a manifest. A source file can enter the
-build graph only through a declared package root. Manifests are schema-checked:
-unknown fields in recognized tables are rejected, and the schema marker is
-required. The only supported schema is currently schema 2:
+build graph only through a declared package root. Manifests are checked against
+the current language: unknown fields in recognized tables are rejected and
+`minimum_version` is required. The legacy schema-2 marker is optional:
 
 ```toml
 [holbuild]

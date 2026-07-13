@@ -35,6 +35,13 @@ datatype package =
       action_policies : action_policy list,
       generators : generator list }
 
+type project_graph_edge =
+  {declaring_package : string, dependency_name : string,
+   dependency_package : string}
+type project_graph_data =
+  {root : string, hol : string, packages : package list,
+   edges : project_graph_edge list}
+
 (* Transitional resolved-project record. The duplicated definition/local fields
    keep existing callers behaviorally unchanged while later #131 phases migrate
    them to package-definition and invocation-config accessors. *)
@@ -68,10 +75,8 @@ type t =
     heaps : heap list,
     action_policies : action_policy list,
     generators : generator list,
-    package_cache :
-      (HolbuildHolToolchainConfig.kernel_variant * package list) list ref,
-    resolved_hol_cache :
-      (HolbuildHolToolchainConfig.kernel_variant * dependency) list ref }
+    graph_cache :
+      (HolbuildHolToolchainConfig.kernel_variant * project_graph_data) list ref }
 
 exception Error of string
 
@@ -176,8 +181,7 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
       heaps = heaps,
       action_policies = action_policies,
       generators = generators,
-      package_cache = ref [],
-      resolved_hol_cache = ref [] }
+      graph_cache = ref [] }
   end
 
 fun parse_at args =
@@ -255,10 +259,18 @@ fun package_root (Package {root, ...}) = root
 fun package_manifest (Package {manifest, ...}) = manifest
 fun package_definition_of (Package {definition, ...}) = definition
 fun package_provenance (Package {provenance, ...}) = provenance
-fun package_identity package =
-  HolbuildPackageProvenance.identity
-    (HolbuildPackageDefinition.canonical_id (package_definition_of package))
+fun package_content_identity package =
+  HolbuildPackageProvenance.content_identity
+    (HolbuildPackageDefinition.content_id (package_definition_of package))
     (package_provenance package)
+fun package_identity package =
+  let val definition = package_definition_of package
+  in
+    HolbuildPackageProvenance.identity
+      {name = package_name package,
+       metadata_id = HolbuildPackageDefinition.metadata_id definition,
+       content_id = package_content_identity package}
+  end
 fun package_source_root package =
   HolbuildPackageProvenance.source_root (package_provenance package)
 fun package_members (Package {members, ...}) = members
@@ -281,6 +293,15 @@ fun hol_dependency ({dependencies, ...} : t) =
     dependencies
 
 type resolution = {kernel_variant : HolbuildHolToolchainConfig.kernel_variant}
+fun cached_graph_with ({kernel_variant} : resolution) (project : t) =
+  Option.map #2
+    (List.find (fn (variant, _) => variant = kernel_variant)
+      (!(#graph_cache project)))
+fun store_graph_with ({kernel_variant} : resolution) (project : t) graph =
+  #graph_cache project :=
+    (kernel_variant, graph) ::
+    List.filter (fn (variant, _) => variant <> kernel_variant)
+      (!(#graph_cache project))
 val standard_resolution = {kernel_variant = HolbuildHolToolchainConfig.StandardKernel}
 
 fun hol_holdir ({kernel_variant} : resolution) {git, rev} =
@@ -421,6 +442,16 @@ fun dependency_project_with resolution (project : t) (dep as Dependency {name, s
   let
     val _ =
       case source of
+          FromSource {from, ...} =>
+            if Option.isSome (override_path (#overrides project) name) orelse
+               Option.isSome (override_git (#overrides project) name) then
+              die ("overrides." ^ name ^
+                   " cannot override a from/path/manifest package; override its source dependency " ^
+                   from ^ " instead")
+            else ()
+        | _ => ()
+    val _ =
+      case source of
           GitSource {git, rev} =>
             if hol_toolchain_dependency dep orelse Option.isSome (override_path (#overrides project) name) then ()
             else
@@ -459,13 +490,21 @@ fun dependency_project_with resolution (project : t) (dep as Dependency {name, s
 
 fun dependency_project project dep = dependency_project_with standard_resolution project dep
 
-fun resolved_hol_dependency_with ({kernel_variant} : resolution) project =
-  case List.find (fn (variant, _) => variant = kernel_variant)
-         (!(#resolved_hol_cache project)) of
-      SOME (_, dependency) => SOME dependency
+fun resolved_hol_dependency_with (resolution as {kernel_variant} : resolution) project =
+  case cached_graph_with resolution project of
+      SOME {packages, hol, ...} =>
+        (case List.find (fn package => package_identity package = hol) packages of
+             SOME package =>
+               (case HolbuildPackageProvenance.origin
+                       (package_provenance package) of
+                    HolbuildPackageProvenance.ImplicitHolOrigin {git, rev, ...} =>
+                      SOME (Dependency
+                        {name = "hol", source = GitSource {git = git, rev = rev},
+                         role = HolToolchainDependency})
+                  | _ => die "typed HOL graph ID has non-HOL origin")
+           | NONE => die "typed HOL graph ID is not a package")
     | NONE =>
   let
-    val resolution = {kernel_variant = kernel_variant}
     fun seen name names = List.exists (fn n => n = name) names
     fun search_project names p =
       case hol_dependency p of
@@ -490,8 +529,14 @@ fun dependency_package_with resolution artifact_parent project
       (dep as Dependency {name, source, ...}) =
   let
     val dep_project = dependency_project_with resolution project dep
-    val dep_root = valOf (dependency_local_path_with resolution project dep)
-    val dep_manifest = valOf (dependency_manifest project dep)
+    val dep_root =
+      case dependency_local_path_with resolution project dep of
+          SOME value => value
+        | NONE => die ("dependency " ^ name ^ " has no local path")
+    val dep_manifest =
+      case dependency_manifest project dep of
+          SOME value => value
+        | NONE => die ("dependency " ^ name ^ " has no manifest")
     val artifact_root =
       Path.concat(Path.concat(Path.concat(artifact_parent, ".holbuild"), "packages"), name)
     fun declared_dependency dep_name =
@@ -536,12 +581,14 @@ fun dependency_package_with resolution artifact_parent project
                     SOME (from_dep as Dependency
                             {source = GitSource {git, rev}, role, ...}) =>
                       (git, rev, role,
-                       valOf (dependency_local_path_with resolution project from_dep),
-                       case role of
-                           HolToolchainDependency =>
-                             HolbuildPackageProvenance.ToolchainCacheRetrieval
-                         | PackageDependency => git_retrieval from git)
-                  | _ => raise Fail "validated from dependency disappeared"
+                       (case dependency_local_path_with resolution project from_dep of
+                            SOME value => value
+                          | NONE => die ("dependency " ^ from ^ " has no local path")),
+                       (case role of
+                            HolToolchainDependency =>
+                              HolbuildPackageProvenance.ToolchainCacheRetrieval
+                          | PackageDependency => git_retrieval from git))
+                  | _ => die ("validated from dependency disappeared: " ^ from)
             in
               {snapshot =
                  (case role of
@@ -579,76 +626,10 @@ fun same_dependency_source (GitSource a, GitSource b) = #git a = #git b andalso 
       #from a = #from b andalso #path a = #path b andalso #manifest a = #manifest b
   | same_dependency_source _ = false
 
-fun resolve_packages_with resolution (project : t) =
-  let
-    val artifact_parent = #graph_artifact_root project
-    fun seen_source name seen =
-      Option.map #2 (List.find (fn (n, _) => n = name) seen)
-    fun add_dependency parent_project (dep as Dependency {name, source, ...}, (seen, packages)) =
-      case seen_source name seen of
-          SOME previous =>
-            if same_dependency_source (previous, source) then (seen, packages)
-            else die ("conflicting dependency " ^ name)
-        | NONE =>
-            let
-              val (package, dep_project) = dependency_package_with resolution artifact_parent parent_project dep
-              val (seen', packages') = add_project dep_project ((name, source) :: seen, package :: packages)
-            in
-              (seen', packages')
-            end
-    and add_project current_project state =
-      List.foldl (add_dependency current_project) state (#dependencies current_project)
-    val root_package = project_package project
-    val (_, packages) = add_project project ([], [root_package])
-    val result = rev packages
-    val hol_count =
-      length
-        (List.filter
-          (fn package =>
-            HolbuildPackageProvenance.is_implicit_hol
-              (package_provenance package))
-          result)
-    val _ =
-      if hol_count <> 1 then
-        die "dependency graph must contain exactly one hol dependency"
-      else ()
-  in
-    result
-  end
-
-fun packages_with (resolution as {kernel_variant}) (project : t) =
-  let
-    fun same_variant (variant, _) = variant = kernel_variant
-  in
-    case List.find same_variant (!(#package_cache project)) of
-        SOME (_, packages) => packages
-      | NONE =>
-          let
-            val packages = resolve_packages_with resolution project
-            val hol_dependency =
-              case List.find
-                     (fn package =>
-                       HolbuildPackageProvenance.is_implicit_hol
-                         (package_provenance package))
-                     packages of
-                  SOME package =>
-                    (case HolbuildPackageProvenance.origin
-                            (package_provenance package) of
-                         HolbuildPackageProvenance.ImplicitHolOrigin {git, rev, ...} =>
-                           Dependency {name = "hol", source = GitSource {git = git, rev = rev},
-                                       role = HolToolchainDependency}
-                       | _ => raise Fail "typed HOL package lost its origin")
-                | NONE => raise Fail "validated package graph lost its HOL package"
-          in
-            #package_cache project :=
-              (kernel_variant, packages) :: !(#package_cache project);
-            #resolved_hol_cache project :=
-              (kernel_variant, hol_dependency) :: !(#resolved_hol_cache project);
-            packages
-          end
-  end
-
-fun packages project = packages_with standard_resolution project
+fun packages project =
+  case cached_graph_with standard_resolution project of
+      SOME {packages, ...} => packages
+    | NONE => die "project package graph has not been resolved"
 
 fun describe (project : t) =
   let

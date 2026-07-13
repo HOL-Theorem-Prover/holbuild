@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-Projects must use `holproject.toml` schema 2 and declare the project HOL toolchain as `[dependencies.hol]`. Commands that need HOL build or reuse that declared HOL under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`.
+Projects must declare `minimum_version` in `holproject.toml` and the project HOL toolchain as `[dependencies.hol]`; the legacy `schema = 2` marker is optional. Commands that need HOL build or reuse that declared HOL under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`.
 
 Building the current external `holbuild` executable requires Poly/ML; the small set of HOL source files needed at compile time is vendored under `vendor/hol`:
 

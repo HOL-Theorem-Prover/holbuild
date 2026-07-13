@@ -12,8 +12,9 @@ exact git revisions.
 
 ## Status
 
-`holbuild` is usable but still experimental. It currently supports schema 2
-manifests only. The manifest format and CLI may still change before any future
+`holbuild` is usable but still experimental. It supports only the current
+manifest language, with an optional legacy `schema = 2` marker. The manifest
+format and CLI may still change before any future
 upstreaming into HOL.
 
 `holbuild` reserves top-level SML identifiers beginning with `Holbuild` for its
@@ -624,6 +625,8 @@ root; URL-like git remotes are left unchanged. Overrides apply during recursive
 dependency resolution too, so a dependency declared by another dependency can be
 supplied from disk. Overridden dependencies still need a matching `project.name`
 in their `holproject.toml`; `dependencies.hol` cannot be overridden this way.
+A `from/path/manifest` shim cannot be overridden directly; override the direct
+source dependency named by `from` instead.
 
 Unknown fields in recognised `holproject.toml` and `.holconfig.toml` tables are
 errors.

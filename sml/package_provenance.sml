@@ -67,14 +67,25 @@ fun retrieval_text WorkingTreeRetrieval = "working-tree"
   | retrieval_text (TrustedPathRetrieval {path}) = "trusted-path:" ^ path
   | retrieval_text ToolchainCacheRetrieval = "toolchain-cache"
 
-(* Machine paths are deliberately excluded. Mutable working trees rely on live
-   validation; immutable snapshots provide their own content oracle. *)
-fun semantic_text definition_id
-      ({snapshot, definition, origin, ...} : t) =
-  fields ["package-instance-v1", definition_id, snapshot_text snapshot,
-          definition_text definition, origin_text origin]
-fun identity definition_id provenance =
-  HolbuildHash.string_sha256 (semantic_text definition_id provenance)
+fun content_definition_text RootManifest = "root-manifest"
+  | content_definition_text (DependencyManifest _) = "dependency-manifest"
+  | content_definition_text (ShimManifest {from, path, manifest}) =
+      fields ["shim-manifest", from, path, manifest]
+  | content_definition_text ImplicitHolManifest = "implicit-hol-manifest"
+
+(* Machine paths and logical binding names are deliberately excluded. Mutable
+   working trees rely on live validation; immutable snapshots provide their own
+   content oracle. *)
+fun content_text definition_content_id
+      ({snapshot, definition, ...} : t) =
+  fields ["package-content-instance-v1", definition_content_id,
+          snapshot_text snapshot, content_definition_text definition]
+fun content_identity definition_content_id provenance =
+  HolbuildHash.string_sha256 (content_text definition_content_id provenance)
+fun semantic_text {name, metadata_id, content_id} =
+  fields ["package-instance-v2", name, metadata_id, content_id]
+fun identity identity_fields =
+  HolbuildHash.string_sha256 (semantic_text identity_fields)
 
 fun source_root ({materialization = {source_root, ...}, ...} : t) = source_root
 fun package_root ({materialization = {package_root, ...}, ...} : t) = package_root

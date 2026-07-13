@@ -531,8 +531,12 @@ type parsed =
   {definition : t, compatibility : compatibility,
    tactic_timeout : real option}
 
+val parsed_manifest_count = ref 0
+fun manifest_parse_count () = !parsed_manifest_count
+
 fun parse_table table : parsed =
   let
+    val _ = parsed_manifest_count := !parsed_manifest_count + 1
     val _ = validate_manifest table
     val compatibility = validate_compatibility table
     val {name, version} = parse_metadata table
@@ -649,6 +653,17 @@ fun action_execution_policy_text actions =
 fun generator_definition_text generators =
   fields ["generator-definition-v1", sequence generator_text generators]
 
+fun content_text (definition : t) =
+  fields ["package-content-v1",
+          source_definition_text (#sources definition),
+          entrypoint_definition_text (#entrypoints definition),
+          dependency_definition_text (#dependencies definition),
+          runtime_definition_text (#runtime definition),
+          action_dependency_policy_text (#actions definition),
+          action_input_policy_text (#actions definition),
+          action_execution_policy_text (#actions definition),
+          generator_definition_text (#generators definition)]
+
 fun canonical_text (definition : t) =
   fields ["package-definition-v1", metadata_text (#metadata definition),
           source_definition_text (#sources definition),
@@ -660,6 +675,7 @@ fun canonical_text (definition : t) =
           action_execution_policy_text (#actions definition),
           generator_definition_text (#generators definition)]
 fun canonical_id definition = HolbuildHash.string_sha256 (canonical_text definition)
+fun content_id definition = HolbuildHash.string_sha256 (content_text definition)
 fun metadata_id (definition : t) =
   HolbuildHash.string_sha256 (metadata_text (#metadata definition))
 fun source_definition_id (definition : t) =

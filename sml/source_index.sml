@@ -469,7 +469,9 @@ fun default_targets_with resolution sources project =
     (List.concat
        (map (default_package_targets sources)
             (List.filter package_has_default_targets
-              (HolbuildProject.packages_with resolution project))))
+              (HolbuildProjectGraph.packages
+                (HolbuildProjectGraph.resolve
+                  {project = project, resolution = resolution})))))
 
 fun default_targets sources project =
   default_targets_with HolbuildProject.standard_resolution sources project

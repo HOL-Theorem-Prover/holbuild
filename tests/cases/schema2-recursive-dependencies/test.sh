@@ -66,7 +66,11 @@ name = "root"
 git = "$a"
 rev = "$a_rev"
 TOML
-(cd "$root" && "$HOLBUILD_BIN" context) > "$tmpdir/root.log"
+parse_counts=$tmpdir/parse-counts.log
+(cd "$root" && HOLBUILD_TEST_PACKAGE_PARSE_COUNT="$parse_counts" \
+  "$HOLBUILD_BIN" context) > "$tmpdir/root.log"
+[[ $(wc -l < "$parse_counts") -eq 1 ]]
+[[ $(cat "$parse_counts") -eq 3 ]]
 require_grep "package: a \[root=$root/.holbuild/src/a" "$tmpdir/root.log"
 require_grep "package: b \[root=$root/.holbuild/src/b" "$tmpdir/root.log"
 require_grep "package: hol \[root=$HOLBUILD_CACHE/hol-toolchains/" "$tmpdir/root.log"
