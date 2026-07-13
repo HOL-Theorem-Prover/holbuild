@@ -232,10 +232,13 @@ fun validate_actions table = List.app validate_action_table (action_entries tabl
 fun parse_action_policy root (logical, table) =
   let
     fun extra field path =
-      if OS.Path.isAbsolute path then
-        die ("actions." ^ logical ^ "." ^ field ^
-             " must be package-root-relative: " ^ path)
-      else ExtraInput {path = path, absolute_path = OS.Path.concat(root, path)}
+      let
+        val context = "actions." ^ logical ^ "." ^ field
+        val relative = package_relative_path context path
+      in
+        ExtraInput
+          {path = relative, absolute_path = OS.Path.concat(root, relative)}
+      end
     val extra_inputs =
       map (extra "extra_inputs") (string_array_field table "extra_inputs")
     val extra_deps =

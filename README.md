@@ -390,7 +390,8 @@ always_reexecute = true
 
 - `deps` adds logical project dependencies.
 - `loads` adds modules/libraries to load before the action.
-- `extra_deps` adds filesystem inputs that should be hashed into the action key.
+- `extra_deps` adds package-root-relative filesystem inputs that should be
+  hashed into the action key; absolute paths and `..` components are rejected.
 - `cache = false` disables global cache restore/publish for the action.
 - `always_reexecute = true` disables local up-to-date skipping for the action.
 

@@ -103,7 +103,7 @@ Unsupported: schema 1, `[dependencies.HOLDIR]`, manifest path dependencies, depe
 
 ## Path rules
 
-- `build.members`, `build.exclude`, `build.exclude_globs`, `build.roots`, `build.groups.*.include`, `build.groups.*.include_globs`, `build.groups.*.exclude`, `build.groups.*.exclude_globs`, `actions.*.extra_deps`, `generate.*.inputs`, `generate.*.outputs` — **package-root-relative**
+- `build.members`, `build.exclude`, `build.exclude_globs`, `build.roots`, `build.groups.*.include`, `build.groups.*.include_globs`, `build.groups.*.exclude`, `build.groups.*.exclude_globs`, `actions.*.extra_inputs`, `actions.*.extra_deps`, `generate.*.inputs`, `generate.*.outputs` — **package-root-relative** and may not contain `..` components
 - Absolute paths and `..` components are rejected in those package-relative fields
 - `dependencies.*.path` and `dependencies.*.manifest` are allowed only in `from/path/manifest` dependencies
 - `from` dependency `path` and `manifest` fields must be relative and contain no `..`
