@@ -2171,27 +2171,33 @@ fun declaration_checkpoint_specs proof_engine proof_timeout project node deps_ke
       terminations
 
 fun dependency_context_key toolchain_key plan keys node =
-  case HolbuildBuildPlan.cached_dependency_context_key plan node toolchain_key of
-      SOME key => key
-    | NONE =>
-        let
-          val project_deps = HolbuildBuildPlan.transitive_project_deps plan node
-          val external_theories = HolbuildBuildPlan.direct_external_theories plan node
-          val external_libs = HolbuildBuildPlan.direct_external_libs plan node
-          val project_lines = map (fn dep => "project " ^ HolbuildBuildPlan.key dep ^ " " ^
-                                             HolbuildBuildPlan.input_key_for keys dep)
-                                  project_deps
-          val theory_lines = map (fn dep => "external_theory " ^ dep) external_theories
-          val lib_lines = map (fn dep => "external_lib " ^ dep) external_libs
-          val key =
-            HolbuildToolchain.hash_text
-              (String.concatWith "\n"
-                 (["holbuild-dependency-context-v1",
-                   "toolchain_key=" ^ toolchain_key] @ project_lines @ theory_lines @ lib_lines) ^ "\n")
-        in
-          HolbuildBuildPlan.remember_dependency_context_key plan node toolchain_key key;
-          key
-        end
+  let
+    val project_deps = HolbuildBuildPlan.transitive_project_deps plan node
+    val project_lines = map (fn dep => "project " ^ HolbuildBuildPlan.key dep ^ " " ^
+                                       HolbuildBuildPlan.input_key_for keys dep)
+                            project_deps
+    (* The plan may be reused with a different input-key map.  Include the
+       relevant map entries in the memo discriminator, not just the toolchain. *)
+    val context_id = String.concatWith "\n" (toolchain_key :: project_lines)
+  in
+    case HolbuildBuildPlan.cached_dependency_context_key plan node context_id of
+        SOME key => key
+      | NONE =>
+          let
+            val external_theories = HolbuildBuildPlan.direct_external_theories plan node
+            val external_libs = HolbuildBuildPlan.direct_external_libs plan node
+            val theory_lines = map (fn dep => "external_theory " ^ dep) external_theories
+            val lib_lines = map (fn dep => "external_lib " ^ dep) external_libs
+            val key =
+              HolbuildToolchain.hash_text
+                (String.concatWith "\n"
+                   (["holbuild-dependency-context-v1",
+                     "toolchain_key=" ^ toolchain_key] @ project_lines @ theory_lines @ lib_lines) ^ "\n")
+          in
+            HolbuildBuildPlan.remember_dependency_context_key plan node context_id key;
+            key
+          end
+  end
 
 fun metadata_lines text = String.tokens (fn c => c = #"\n") text
 
