@@ -424,7 +424,15 @@ source bytes. Discovery first builds a canonical inventory for each prepared
 package, then combines resolved source views. Canonical source-node identities
 contain package-definition identity, relative paths, source kind, logical name,
 canonical artifact coordinates, and semantic action policy identity; machine
-paths and artifact roots exist only in the resolved views. `.sml` files get a
+paths and artifact roots exist only in the resolved views. A live component
+provider turns each inventory into a canonical package component, retaining
+symbolic declared dependency/load, signature-companion, and extra-input facts.
+Validation strategy (mutable working tree versus trusted immutable snapshot) and
+live generator preparation are explicit component properties rather than part
+of canonical component identity. Project resolution context has a separate
+identity over package instances, components, declaration edges, and HOL
+selection. Dependency extraction remains a per-node provider request, preserving
+reachable-frontier laziness. `.sml` files get a
 `.uo` plus an empty companion `.ui` unless a real
 `.sig` companion exists, and same-name signatures are implicit dependencies of
 their implementation. HOL's current

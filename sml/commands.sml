@@ -539,7 +539,10 @@ fun print_execution_plan_selector new_ir project selector =
                   {project = project,
                    resolution = HolbuildProject.standard_resolution}
     val preparation = HolbuildPackagePrepare.prepare graph
-    val index = HolbuildSourceIndex.discover_prepared preparation
+    val discovery = HolbuildSourceIndex.discover_prepared_with_inventories preparation
+    val components = HolbuildComponentProvider.load HolbuildComponentProvider.LiveProvider
+                       {preparation = preparation, discovery = discovery}
+    val index = HolbuildComponentProvider.sources components
     val source = find_theory_source index theory
   in
     print_static_execution_plan project new_ir source theorem (SOME (find_theorem_in_source theorem source))
@@ -669,9 +672,14 @@ fun prepare_source_index phase_prefix resolution project =
                     {project = project, resolution = resolution})
     val preparation = timed_phase (phase_prefix ^ ".generators.prepare")
                         (fn () => HolbuildPackagePrepare.prepare graph)
+    val discovery = timed_phase (phase_prefix ^ ".inventory.construct")
+                      (fn () => HolbuildSourceIndex.discover_prepared_with_inventories preparation)
+    val components = timed_phase (phase_prefix ^ ".components.load")
+                       (fn () => HolbuildComponentProvider.load
+                         HolbuildComponentProvider.LiveProvider
+                         {preparation = preparation, discovery = discovery})
   in
-    timed_phase (phase_prefix ^ ".source.discover")
-      (fn () => HolbuildSourceIndex.discover_prepared preparation)
+    HolbuildComponentProvider.sources components
   end
 
 fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_cache, skip_checkpoints, proof_steps, new_ir, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable}, targets) =
@@ -772,6 +780,8 @@ fun build_iteration_error_message exn =
     | HolbuildGenerators.ErrorWithDebugArtifacts (msg, _) => SOME msg
     | HolbuildPackagePrepare.Error msg => SOME msg
     | HolbuildPackagePrepare.ErrorWithDebugArtifacts (msg, _) => SOME msg
+    | HolbuildPackageComponent.Error msg => SOME msg
+    | HolbuildComponentProvider.Error msg => SOME msg
     | HolbuildSourceIndex.Error msg => SOME msg
     | HolbuildSourceIndex.ErrorWithDebugArtifacts (msg, _) => SOME msg
     | HolbuildDependencies.Error msg => SOME msg
@@ -1437,6 +1447,8 @@ fun main raw_args =
        | HolbuildGenerators.ErrorWithDebugArtifacts (msg, artifacts) => err_with_debug_artifacts msg artifacts
        | HolbuildPackagePrepare.Error msg => err msg
        | HolbuildPackagePrepare.ErrorWithDebugArtifacts (msg, artifacts) => err_with_debug_artifacts msg artifacts
+       | HolbuildPackageComponent.Error msg => err msg
+       | HolbuildComponentProvider.Error msg => err msg
        | HolbuildSourceIndex.Error msg => err msg
        | HolbuildSourceIndex.ErrorWithDebugArtifacts (msg, artifacts) => err_with_debug_artifacts msg artifacts
        | HolbuildDependencies.Error msg => err msg

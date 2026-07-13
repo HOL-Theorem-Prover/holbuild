@@ -33,10 +33,12 @@ fun deps_of (node as {source, deps, ...} : node) =
       SOME value => value
     | NONE =>
       let
-        val value = HolbuildDependencies.extract_cached_with_hash
-                      {cache_path = dependency_cache_path source,
-                       source_path = #source_path source,
-                       source_hash = source_hash_of node}
+        val analysis = HolbuildComponentProvider.analyse
+                         HolbuildComponentProvider.LiveProvider
+                         {cache_path = dependency_cache_path source,
+                          source = source,
+                          source_hash = source_hash_of node}
+        val value = HolbuildComponentProvider.analysis_dependencies analysis
       in deps := SOME value; value end
 fun external_dirs_of ({external_dirs, ...} : node) = external_dirs
 fun logical_name node = #logical_name (source_of node)

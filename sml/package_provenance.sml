@@ -87,6 +87,8 @@ fun semantic_text {name, metadata_id, content_id} =
 fun identity identity_fields =
   HolbuildHash.string_sha256 (semantic_text identity_fields)
 
+fun snapshot ({snapshot, ...} : t) = snapshot
+fun retrieval ({retrieval, ...} : t) = retrieval
 fun source_root ({materialization = {source_root, ...}, ...} : t) = source_root
 fun package_root ({materialization = {package_root, ...}, ...} : t) = package_root
 fun manifest ({materialization = {manifest, ...}, ...} : t) = manifest
