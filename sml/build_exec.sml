@@ -2910,13 +2910,12 @@ fun output_paths checkpoint_policy _ node =
 fun output_hash_line path hash = "output-sha1=" ^ path ^ " " ^ hash
 
 fun output_hash_lines_for_paths paths =
-  let
-    val canonical_hashes = map (fn path => (path, file_hash path)) paths
-    fun canonical_line (path, hash) = output_hash_line path hash
-    fun remap_line (path, hash) = output_hash_line (hfs_remapped_path path) hash
-  in
-    map canonical_line canonical_hashes @ map remap_line canonical_hashes
-  end
+  (* Remapped artifacts are normally copied from their canonical counterparts,
+     but they remain separate files and can be changed independently.  Hash
+     each emitted path rather than treating the copy relationship as an
+     integrity assertion. *)
+  map (fn path => output_hash_line path (file_hash path))
+      (paths @ map hfs_remapped_path paths)
 
 fun output_hash_lines checkpoint_policy _ node =
   let

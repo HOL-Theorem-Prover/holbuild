@@ -183,6 +183,19 @@ while IFS= read -r line; do
   fi
 done < <(grep "^output-sha1=" "$metadata")
 
+# A remapped artifact is a distinct file.  Its diagnostic hash must describe
+# its own bytes even if it has been corrupted independently of the canonical
+# artifact.
+remapped_sml=$project/.holbuild/obj/src/.hol/objs/ATheory.sml
+printf 'corrupted remapped artifact\n' > "$remapped_sml"
+(cd "$project" && "$HOLBUILD_BIN" --verbose build --emit-output-hashes ATheory) > "$tmpdir/corrupt-remap-hash.log"
+expected_remapped_hash=$(sha1sum "$remapped_sml" | awk '{print $1}')
+reported_remapped_hash=$(awk -v prefix="output-sha1=$remapped_sml " 'index($0, prefix) == 1 { print $NF }' "$metadata")
+if [[ "$reported_remapped_hash" != "$expected_remapped_hash" ]]; then
+  echo "output diagnostic did not hash the remapped artifact itself" >&2
+  exit 1
+fi
+
 input_key=$(grep '^input_key=' "$project/.holbuild/dep/basic/src/AScript.sml.key" | cut -d= -f2)
 cache_manifest="$HOLBUILD_CACHE/actions/$input_key/manifest"
 require_file "$cache_manifest"
