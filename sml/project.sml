@@ -412,14 +412,9 @@ fun dependency_project_with resolution (project : t) (dep as Dependency {name, s
       Path.concat(Path.concat(Path.concat(#graph_artifact_root project, ".holbuild"), "packages"), name)
     val dep_project = parse_dep {manifest = dep_manifest, root = dep_root, artifact_root = dep_artifact_root,
                                  graph_artifact_root = #graph_artifact_root project,
-                                 local_config = LocalConfig {overrides = #overrides project,
-                                                             build_excludes = #local_build_excludes project,
-                                                             build_exclude_globs = #local_build_exclude_globs project,
-                                                             build_jobs = #local_build_jobs project,
-                                                             build_tactic_timeout = #build_tactic_timeout project,
-                                                             checkpoint_limit_gb = #checkpoint_limit_gb project,
-                                                             remote_cache_url = #remote_cache_url project,
-                                                             remote_cache_curl_config = #remote_cache_curl_config project}}
+                                 local_config =
+                                   HolbuildLocalConfig.for_dependency
+                                     (#local_config project)}
     val declared_name = #name dep_project
     val _ =
       if declared_name = name then ()

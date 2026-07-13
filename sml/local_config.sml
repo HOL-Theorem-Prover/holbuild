@@ -108,6 +108,20 @@ fun parse root =
       end
   end
 
+fun for_dependency
+      (LocalConfig {overrides, build_jobs, build_tactic_timeout,
+                    checkpoint_limit_gb, remote_cache_url,
+                    remote_cache_curl_config, ...}) =
+  LocalConfig
+    {overrides = overrides,
+     build_excludes = [],
+     build_exclude_globs = [],
+     build_jobs = build_jobs,
+     build_tactic_timeout = build_tactic_timeout,
+     checkpoint_limit_gb = checkpoint_limit_gb,
+     remote_cache_url = remote_cache_url,
+     remote_cache_curl_config = remote_cache_curl_config}
+
 fun overrides (LocalConfig {overrides, ...}) = overrides
 fun build_excludes (LocalConfig {build_excludes, ...}) = build_excludes
 fun build_exclude_globs (LocalConfig {build_exclude_globs, ...}) = build_exclude_globs

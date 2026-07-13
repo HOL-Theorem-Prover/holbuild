@@ -601,7 +601,8 @@ git = "$BAR_REPO"
 
 `build.jobs` sets local default parallelism, and `build.checkpoint_limit_gb`
 sets the local checkpoint storage budget in GiB; the built-in checkpoint budget
-default is 5.
+default is 5. Local `exclude` and `exclude_globs` apply only to the root package.
+Dependency discovery is controlled by each dependency's committed manifest.
 
 `[overrides.NAME]` maps a declared dependency to local workstation source. Use
 `path` to read an existing checkout directly, or `git` to replace the dependency
