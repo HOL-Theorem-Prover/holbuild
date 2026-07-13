@@ -77,5 +77,35 @@ while IFS= read -r rel || [[ -n $rel ]]; do
   mv "$root/vendor/hol/$rel.tmp" "$root/vendor/hol/$rel"
 done < "$files"
 
+# HOL's Redblackmap refers to Portable.itlist, but the vendored compilation
+# unit deliberately does not load Portable.  Keep the compatibility change in
+# this refresh path so a subsequent update is reproducible rather than silently
+# restoring an unbuildable upstream file.
+redblackmap=src/portableML/Redblackmap.sml
+grep -Fxq "$redblackmap" "$files" || {
+  echo "missing required vendored compatibility file: $redblackmap" >&2
+  exit 1
+}
+python3 - "$root/vendor/hol/$redblackmap" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+old = '''    fun insertList (m, pairs) =
+        Portable.itlist (fn (k,x) => fn m' =>
+                            insertWith (fn (x,y) => y) (m', k, x)) pairs m
+'''
+new = '''    fun insertList (m, pairs) =
+        List.foldr
+          (fn ((k,x), m') => insertWith (fn (x,y) => y) (m', k, x))
+          m
+          pairs
+'''
+text = path.read_text()
+if text.count(old) != 1:
+    raise SystemExit(f"could not apply Redblackmap compatibility patch to {path}")
+path.write_text(text.replace(old, new))
+PY
+
 printf '%s\n' "$rev" > "$root/vendor/hol/REV"
 echo "updated vendored HOL files to $rev"
