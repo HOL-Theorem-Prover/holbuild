@@ -188,9 +188,9 @@ fun concat E s = s
   | concat s E = s
   | concat (t1 as T{elt=v1,cnt=n1,left=l1,right=r1})
            (t2 as T{elt=v2,cnt=n2,left=l2,right=r2}) =
-	   if wt n1 < n2 then T'(v2, concat t1 l2, r2)
-	   else if wt n2 < n1 then T'(v1, l1, concat r1 t2)
-  	   else T'(min t2,t1, delmin t2)
+           if wt n1 < n2 then T'(v2, concat t1 l2, r2)
+           else if wt n2 < n1 then T'(v1, l1, concat r1 t2)
+           else T'(min t2,t1, delmin t2)
 
 fun hedge_union cmpKey s E = s
   | hedge_union cmpKey E s = s
