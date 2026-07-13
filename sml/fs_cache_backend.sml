@@ -79,6 +79,11 @@ fun copy_binary src dst =
     handle e => (close_input (); close_output (); remove_file tmp; raise e)
   end
 
+(* GNU cp provides copy-on-write materialization; BSD cp does not understand
+   its options and otherwise writes an error for every cache hit. *)
+val reflink_cp_available =
+  OS.Process.isSuccess (OS.Process.system "cp --version >/dev/null 2>&1")
+
 fun link_or_copy {src, dst} =
   let
     val _ = ensure_parent dst
@@ -88,7 +93,7 @@ fun link_or_copy {src, dst} =
     val command =
       "cp --reflink=auto -- " ^ HolbuildHash.quote src ^ " " ^ HolbuildHash.quote tmp
   in
-    if OS.Process.isSuccess (OS.Process.system command) then
+    if reflink_cp_available andalso OS.Process.isSuccess (OS.Process.system command) then
       (rename_replace {old = tmp, new = dst}
        handle e => (cleanup (); raise e))
     else fallback ()
