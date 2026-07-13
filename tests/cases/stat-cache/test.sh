@@ -144,6 +144,11 @@ val _ = HolbuildStatCache.flush flush_instance
 val reloaded = HolbuildStatCache.load {path = flush_cache}
 val _ = assert "flushed cache should reload as a hit" (HolbuildStatCache.file_sha1 reloaded flush_file = flush_hash)
 val _ = assert "flush reload hit counter" (#hits (stats reloaded) = 1)
+val _ = OS.FileSys.remove flush_file
+val _ = HolbuildStatCache.flush reloaded
+val pruned = HolbuildStatCache.load {path = flush_cache}
+val _ = assert "flush should prune deleted paths"
+               (null (Binarymap.listItems (!(#entries pruned))) )
 
 val _ = print "stat-cache unit tests passed\n"
 SML

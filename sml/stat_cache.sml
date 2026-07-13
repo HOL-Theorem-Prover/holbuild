@@ -165,6 +165,21 @@ fun entry_line (path, ({dev, ino, size, mtime_ns, ctime_ns} : ident, sha1)) =
     [String.toString path, "\t", dev, "\t", ino, "\t", Int.toString size, "\t",
      LargeInt.toString mtime_ns, "\t", LargeInt.toString ctime_ns, "\t", sha1, "\n"]
 
+fun prune_missing_entries (instance : instance) =
+  with_lock instance
+    (fn () =>
+        let
+          val live =
+            List.filter (fn (path, _) => Option.isSome (stat_ident path))
+                        (Binarymap.listItems (!(#entries instance)))
+          val entries =
+            List.foldl (fn ((path, entry), dict) => Binarymap.insert (dict, path, entry))
+                       (empty_entries ())
+                       live
+        in
+          #entries instance := entries
+        end)
+
 fun flush (instance : instance) =
   if not (#enabled instance) then ()
   else
@@ -172,6 +187,10 @@ fun flush (instance : instance) =
         NONE => ()
       | SOME path =>
           let
+            (* Build stage artifacts are keyed by transient inputs and are
+               removed after publication.  Do not retain their dead paths in
+               the persistent cache forever. *)
+            val _ = prune_missing_entries instance
             val items =
               with_lock instance
                 (fn () => Binarymap.listItems (!(#entries instance)))
