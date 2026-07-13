@@ -128,7 +128,7 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
     val LocalConfig {overrides, build_excludes, build_exclude_globs, build_jobs, build_tactic_timeout, checkpoint_limit_gb, remote_cache_url, remote_cache_curl_config} = local_config
     val {definition, compatibility = _,
          tactic_timeout = manifest_timeout} =
-      (HolbuildPackageDefinition.parse_table {table = table, root = root}
+      (HolbuildPackageDefinition.parse_table table
        handle HolbuildManifestUtil.Error msg => die msg)
     val {name, version, members, excludes = manifest_excludes,
          exclude_globs = manifest_exclude_globs, roots, root_groups, groups,
@@ -301,8 +301,7 @@ fun action_cache_enabled (ActionPolicy {impure, cache, always_reexecute, ...}) =
   cache andalso not impure andalso not always_reexecute
 fun action_always_reexecute (ActionPolicy {impure, always_reexecute, ...}) =
   impure orelse always_reexecute
-fun extra_input_path (ExtraInput {path, ...}) = path
-fun extra_input_absolute_path (ExtraInput {absolute_path, ...}) = absolute_path
+fun extra_input_path (ExtraInput {path}) = path
 
 fun default_action_policy logical =
   ActionPolicy {logical = logical, deps = [], loads = [], extra_inputs = [], impure = false,

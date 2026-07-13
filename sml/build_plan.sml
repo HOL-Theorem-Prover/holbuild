@@ -865,18 +865,11 @@ fun action_text_with lookup config_lines_for_node toolchain_key external_key nod
     val declared_loads = HolbuildProject.action_loads policy
     val declared_dep_lines = map (fn dep => "declared_dep=" ^ dep) declared_deps
     val declared_load_lines = map (fn dep => "declared_load=" ^ dep) declared_loads
-    fun extra_input_root input =
-      let
-        val rel = HolbuildProject.extra_input_path input
-        val abs = HolbuildProject.extra_input_absolute_path input
-        val n = size abs - size rel
-      in
-        if n > 0 then String.substring(abs, 0, n) else Path.dir abs
-      end
     val extra_inputs = HolbuildProject.action_extra_inputs policy
     val manifest_extra_dep_lines =
       List.concat (map (fn input =>
-        extra_dep_lines "extra_dep" (extra_input_root input) [HolbuildProject.extra_input_path input]) extra_inputs)
+        extra_dep_lines "extra_dep" (#package_root source)
+          [HolbuildProject.extra_input_path input]) extra_inputs)
     val source_extra_dep_lines =
       extra_dep_lines "source_extra_dep" (Path.dir (#source_path source)) (#extra_deps (deps_of node))
     val lines =

@@ -15,8 +15,7 @@ datatype heap =
 
 type root_tactic_timeout = {root : string, timeout : real option}
 
-datatype extra_input =
-  ExtraInput of {path : string, absolute_path : string}
+datatype extra_input = ExtraInput of {path : string}
 
 datatype action_policy =
   ActionPolicy of
@@ -229,15 +228,14 @@ fun validate_action_table (logical, table) =
 fun action_entries table = named_table_entries table ["actions"]
 fun validate_actions table = List.app validate_action_table (action_entries table)
 
-fun parse_action_policy root (logical, table) =
+fun parse_action_policy (logical, table) =
   let
     fun extra field path =
       let
         val context = "actions." ^ logical ^ "." ^ field
         val relative = package_relative_path context path
       in
-        ExtraInput
-          {path = relative, absolute_path = OS.Path.concat(root, relative)}
+        ExtraInput {path = relative}
       end
     val extra_inputs =
       map (extra "extra_inputs") (string_array_field table "extra_inputs")
@@ -255,8 +253,8 @@ fun parse_action_policy root (logical, table) =
          Option.getOpt(bool_at table ["always_reexecute"], false)}
   end
 
-fun parse_action_policies {table, root} =
-  (validate_actions table; map (parse_action_policy root) (action_entries table))
+fun parse_action_policies table =
+  (validate_actions table; map parse_action_policy (action_entries table))
 
 fun group_name_char c =
   (#"A" <= c andalso c <= #"Z") orelse
@@ -522,7 +520,7 @@ type parsed =
   {definition : t, compatibility : compatibility,
    tactic_timeout : real option}
 
-fun parse_table {table, root} : parsed =
+fun parse_table table : parsed =
   let
     val _ = validate_manifest table
     val compatibility = validate_compatibility table
@@ -531,7 +529,7 @@ fun parse_table {table, root} : parsed =
          root_tactic_timeouts, tactic_timeout} = parse_build table
     val dependencies = parse_dependencies table
     val {run_heap, run_loads, heaps, generators} = parse_runtime table
-    val action_policies = parse_action_policies {table = table, root = root}
+    val action_policies = parse_action_policies table
     val definition =
       {name = name, version = version, members = members,
        excludes = excludes, exclude_globs = exclude_globs,

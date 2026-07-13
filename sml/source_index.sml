@@ -16,6 +16,7 @@ type artifacts =
 
 type source =
   { package : string,
+    package_root : string,
     kind : kind,
     logical_name : string,
     source_path : string,
@@ -74,8 +75,9 @@ fun sml_artifacts root rel =
 fun sig_artifacts root rel =
   { generated = [], objects = [obj_path root rel ".ui"], theory_data = [] }
 
-fun make_source package policies kind logical_name source_path relative_path artifacts =
+fun make_source package package_root policies kind logical_name source_path relative_path artifacts =
   {package = package,
+   package_root = package_root,
    kind = kind,
    logical_name = logical_name,
    source_path = source_path,
@@ -97,16 +99,16 @@ fun classify package source_root artifact_root policies abs_path =
       let
         val theory = drop_suffix "Script.sml" file ^ "Theory"
       in
-        SOME (make_source package policies TheoryScript theory abs_path rel
+        SOME (make_source package source_root policies TheoryScript theory abs_path rel
                             (theory_artifacts artifact_root rel theory))
       end
     else if has_suffix ".sml" file then
       let val logical = drop_suffix ".sml" file
-      in SOME (make_source package policies Sml logical abs_path rel
+      in SOME (make_source package source_root policies Sml logical abs_path rel
                            (sml_artifacts artifact_root rel)) end
     else if has_suffix ".sig" file then
       let val logical = drop_suffix ".sig" file
-      in SOME (make_source package policies Sig logical abs_path rel
+      in SOME (make_source package source_root policies Sig logical abs_path rel
                            (sig_artifacts artifact_root rel)) end
     else NONE
   end

@@ -47,9 +47,13 @@ fun source_paths (source : HolbuildSourceIndex.source, paths) =
     val paths = add_readable (#source_path source) paths
     val extras = HolbuildProject.action_extra_inputs (#policy source)
   in
-    List.foldl (fn (extra, acc) => add_existing (HolbuildProject.extra_input_absolute_path extra) acc)
-               paths
-               extras
+    List.foldl
+      (fn (extra, acc) =>
+        add_existing
+          (Path.concat(#package_root source, HolbuildProject.extra_input_path extra))
+          acc)
+      paths
+      extras
   end
 
 fun watch_paths_with resolution project index =

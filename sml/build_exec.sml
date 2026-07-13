@@ -2894,18 +2894,12 @@ fun action_policy_lines node =
       map (fn dep => "declared_dep=" ^ dep) (HolbuildProject.action_deps policy)
     val declared_load_lines =
       map (fn dep => "declared_load=" ^ dep) (HolbuildProject.action_loads policy)
-    fun extra_input_root input =
-      let
-        val rel = HolbuildProject.extra_input_path input
-        val abs = HolbuildProject.extra_input_absolute_path input
-        val n = size abs - size rel
-      in
-        if n > 0 then String.substring(abs, 0, n) else Path.dir abs
-      end
     val extra_inputs = HolbuildProject.action_extra_inputs policy
     val extra_lines =
       List.concat (map (fn input =>
-        extra_dep_lines "extra_dep" (extra_input_root input) [HolbuildProject.extra_input_path input]) extra_inputs)
+        extra_dep_lines "extra_dep"
+          (#package_root (HolbuildBuildPlan.source_of node))
+          [HolbuildProject.extra_input_path input]) extra_inputs)
     val source_extra_lines =
       extra_dep_lines "source_extra_dep" (Path.dir (source_file node)) (#extra_deps (source_deps node))
   in
