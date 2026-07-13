@@ -54,24 +54,31 @@ datatype dependency =
 (* Parsed committed semantics only. Filesystem roots, artifact locations,
    source acquisition, local overrides, and invocation configuration belong to
    resolved package/project state rather than this definition. *)
-type t =
-  { name : string,
-    version : string option,
-    members : string list,
-    excludes : string list,
-    exclude_globs : string list,
-    roots : string list,
-    root_groups : string list,
-    groups : group list,
-    root_tactic_timeouts : root_tactic_timeout list,
-    dependencies : dependency list,
-    run_heap : string option,
-    run_loads : string list,
-    heaps : heap list,
-    action_policies : action_policy list,
-    generators : generator list }
+type package_metadata = {name : string, version : string option}
+type source_definition =
+  {members : string list, excludes : string list, exclude_globs : string list}
+type entrypoint_definition =
+  {roots : string list, root_groups : string list, groups : group list,
+   root_tactic_timeouts : root_tactic_timeout list}
+type runtime_definition =
+  {run_heap : string option, run_loads : string list, heaps : heap list}
+type action_dependency_policy =
+  {logical : string, deps : string list, loads : string list}
+type action_input_policy = {logical : string, extra_inputs : extra_input list}
+type action_execution_policy =
+  {logical : string, impure : bool, cache : bool, always_reexecute : bool}
+type generator_definition = generator
 
-type metadata = {name : string, version : string option}
+type t =
+  { metadata : package_metadata,
+    sources : source_definition,
+    entrypoints : entrypoint_definition,
+    dependencies : dependency list,
+    runtime : runtime_definition,
+    actions : action_policy list,
+    generators : generator_definition list }
+
+type metadata = package_metadata
 type runtime =
   {run_heap : string option, run_loads : string list, heaps : heap list,
    generators : generator list}
@@ -531,20 +538,154 @@ fun parse_table table : parsed =
     val {run_heap, run_loads, heaps, generators} = parse_runtime table
     val action_policies = parse_action_policies table
     val definition =
-      {name = name, version = version, members = members,
-       excludes = excludes, exclude_globs = exclude_globs,
-       roots = roots, root_groups = root_groups, groups = groups,
-       root_tactic_timeouts = root_tactic_timeouts,
-       dependencies = dependencies, run_heap = run_heap, run_loads = run_loads,
-       heaps = heaps, action_policies = action_policies, generators = generators}
+      {metadata = {name = name, version = version},
+       sources = {members = members, excludes = excludes,
+                  exclude_globs = exclude_globs},
+       entrypoints = {roots = roots, root_groups = root_groups, groups = groups,
+                      root_tactic_timeouts = root_tactic_timeouts},
+       dependencies = dependencies,
+       runtime = {run_heap = run_heap, run_loads = run_loads, heaps = heaps},
+       actions = action_policies,
+       generators = generators}
   in
     {definition = definition, compatibility = compatibility,
      tactic_timeout = tactic_timeout}
   end
 
+fun bool_text value = if value then "true" else "false"
+fun atom text = Int.toString (size text) ^ ":" ^ text
+fun optional f NONE = "none"
+  | optional f (SOME value) = "some(" ^ f value ^ ")"
+fun sequence f values =
+  "[" ^ String.concatWith "," (map (fn value => atom (f value)) values) ^ "]"
+fun string_sequence values = sequence (fn value => value) values
+fun fields values = String.concatWith "|" (map atom values)
+
+fun insert_by key value [] = [value]
+  | insert_by key value (first :: rest) =
+      if String.compare(key value, key first) = LESS then value :: first :: rest
+      else first :: insert_by key value rest
+fun sort_by key values = List.foldl (fn (value, acc) => insert_by key value acc) [] values
+
+fun extra_input_text (ExtraInput {path}) = path
+fun group_key (Group {name, ...}) = name
+fun group_text (Group {name, includes, include_globs, excludes, exclude_globs,
+                       allow_empty}) =
+  fields [name, string_sequence includes, string_sequence include_globs,
+          string_sequence excludes, string_sequence exclude_globs,
+          bool_text allow_empty]
+fun dependency_key (Dependency {name, ...}) = name
+fun dependency_text (Dependency {name, source}) =
+  fields [name,
+    case source of
+        GitSource {git, rev} => fields ["git", git, rev]
+      | FromSource {from, path, manifest} =>
+          fields ["from", from, path, manifest]]
+fun heap_key (Heap {name, ...}) = name
+fun heap_text (Heap {name, output, objects, kind}) =
+  fields [name, output, string_sequence objects,
+    case kind of HeapImage => "heap"
+      | ExecutableImage {main} => fields ["executable", main]]
+fun action_key (ActionPolicy {logical, ...}) = logical
+fun action_dependency_policy (ActionPolicy {logical, deps, loads, ...}) =
+  {logical = logical, deps = deps, loads = loads} : action_dependency_policy
+fun action_input_policy (ActionPolicy {logical, extra_inputs, ...}) =
+  {logical = logical, extra_inputs = extra_inputs} : action_input_policy
+fun action_execution_policy
+      (ActionPolicy {logical, impure, cache, always_reexecute, ...}) =
+  {logical = logical, impure = impure, cache = cache,
+   always_reexecute = always_reexecute} : action_execution_policy
+fun action_dependency_text ({logical, deps, loads} : action_dependency_policy) =
+  fields [logical, string_sequence deps, string_sequence loads]
+fun action_input_text ({logical, extra_inputs} : action_input_policy) =
+  fields [logical, sequence extra_input_text extra_inputs]
+fun action_execution_text
+      ({logical, impure, cache, always_reexecute} : action_execution_policy) =
+  fields [logical, bool_text impure, bool_text cache, bool_text always_reexecute]
+fun generator_text (Generator {name, command, inputs, outputs, deps}) =
+  fields [name, string_sequence command, string_sequence inputs,
+          string_sequence outputs, string_sequence deps]
+
+fun metadata_text ({name, version} : package_metadata) =
+  fields ["package-metadata-v1", name, optional atom version]
+fun source_definition_text ({members, excludes, exclude_globs} : source_definition) =
+  fields ["source-definition-v1", string_sequence members,
+          string_sequence excludes, string_sequence exclude_globs]
+fun entrypoint_definition_text
+      ({roots, root_groups, groups, root_tactic_timeouts} : entrypoint_definition) =
+  let
+    fun timeout_key ({root, ...} : root_tactic_timeout) = root
+    fun timeout_text ({root, timeout} : root_tactic_timeout) =
+      fields [root, optional Real.toString timeout]
+    val timeouts = sort_by timeout_key root_tactic_timeouts
+  in
+    fields ["entrypoint-definition-v1", string_sequence roots,
+            string_sequence root_groups,
+            sequence group_text (sort_by group_key groups),
+            sequence timeout_text timeouts]
+  end
+fun dependency_definition_text dependencies =
+  fields ["dependency-definition-v1",
+          sequence dependency_text (sort_by dependency_key dependencies)]
+fun runtime_definition_text ({run_heap, run_loads, heaps} : runtime_definition) =
+  fields ["runtime-definition-v1", optional atom run_heap,
+          string_sequence run_loads, sequence heap_text (sort_by heap_key heaps)]
+fun action_dependency_policy_text actions =
+  fields ["action-dependency-policy-v1",
+          sequence action_dependency_text
+            (map action_dependency_policy (sort_by action_key actions))]
+fun action_input_policy_text actions =
+  fields ["action-input-policy-v1",
+          sequence action_input_text
+            (map action_input_policy (sort_by action_key actions))]
+fun action_execution_policy_text actions =
+  fields ["action-execution-policy-v1",
+          sequence action_execution_text
+            (map action_execution_policy (sort_by action_key actions))]
+fun generator_definition_text generators =
+  fields ["generator-definition-v1", sequence generator_text generators]
+
+fun canonical_text (definition : t) =
+  fields ["package-definition-v1", metadata_text (#metadata definition),
+          source_definition_text (#sources definition),
+          entrypoint_definition_text (#entrypoints definition),
+          dependency_definition_text (#dependencies definition),
+          runtime_definition_text (#runtime definition),
+          action_dependency_policy_text (#actions definition),
+          action_input_policy_text (#actions definition),
+          action_execution_policy_text (#actions definition),
+          generator_definition_text (#generators definition)]
+fun canonical_id definition = HolbuildHash.string_sha256 (canonical_text definition)
+fun metadata_id (definition : t) =
+  HolbuildHash.string_sha256 (metadata_text (#metadata definition))
+fun source_definition_id (definition : t) =
+  HolbuildHash.string_sha256 (source_definition_text (#sources definition))
+fun entrypoint_definition_id (definition : t) =
+  HolbuildHash.string_sha256 (entrypoint_definition_text (#entrypoints definition))
+fun dependency_definition_id (definition : t) =
+  HolbuildHash.string_sha256
+    (dependency_definition_text (#dependencies definition))
+fun runtime_definition_id (definition : t) =
+  HolbuildHash.string_sha256 (runtime_definition_text (#runtime definition))
+fun generator_definition_id (definition : t) =
+  HolbuildHash.string_sha256
+    (generator_definition_text (#generators definition))
+fun action_dependency_policy_id (definition : t) =
+  HolbuildHash.string_sha256 (action_dependency_policy_text (#actions definition))
+fun action_input_policy_id (definition : t) =
+  HolbuildHash.string_sha256 (action_input_policy_text (#actions definition))
+fun action_execution_policy_id (definition : t) =
+  HolbuildHash.string_sha256 (action_execution_policy_text (#actions definition))
+
 fun make (definition : t) = definition
-fun name (definition : t) = #name definition
-fun version (definition : t) = #version definition
+fun metadata (definition : t) = #metadata definition
+fun sources (definition : t) = #sources definition
+fun entrypoints (definition : t) = #entrypoints definition
+fun runtime (definition : t) = #runtime definition
+fun actions (definition : t) = #actions definition
+fun generators (definition : t) = #generators definition
+fun name definition = #name (metadata definition)
+fun version definition = #version (metadata definition)
 fun dependencies (definition : t) = #dependencies definition
 
 end

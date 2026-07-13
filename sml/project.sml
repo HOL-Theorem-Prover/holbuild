@@ -130,10 +130,12 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
          tactic_timeout = manifest_timeout} =
       (HolbuildPackageDefinition.parse_table table
        handle HolbuildManifestUtil.Error msg => die msg)
-    val {name, version, members, excludes = manifest_excludes,
-         exclude_globs = manifest_exclude_globs, roots, root_groups, groups,
-         root_tactic_timeouts, dependencies, run_heap, run_loads, heaps,
-         action_policies, generators} = definition
+    val {metadata = {name, version},
+         sources = {members, excludes = manifest_excludes,
+                    exclude_globs = manifest_exclude_globs},
+         entrypoints = {roots, root_groups, groups, root_tactic_timeouts},
+         dependencies, runtime = {run_heap, run_loads, heaps},
+         actions = action_policies, generators} = definition
     val excludes = manifest_excludes @ build_excludes
     val exclude_globs = manifest_exclude_globs @ build_exclude_globs
   in
@@ -527,6 +529,26 @@ fun describe (project : t) =
     print ("artifact-root: " ^ artifact_root ^ "\n");
     print ("name: " ^ name ^ "\n");
     opt "version: " version;
+    print ("package-definition-id: " ^
+           HolbuildPackageDefinition.canonical_id (#definition project) ^ "\n");
+    print ("metadata-id: " ^
+           HolbuildPackageDefinition.metadata_id (#definition project) ^ "\n");
+    print ("source-definition-id: " ^
+           HolbuildPackageDefinition.source_definition_id (#definition project) ^ "\n");
+    print ("entrypoint-definition-id: " ^
+           HolbuildPackageDefinition.entrypoint_definition_id (#definition project) ^ "\n");
+    print ("dependency-definition-id: " ^
+           HolbuildPackageDefinition.dependency_definition_id (#definition project) ^ "\n");
+    print ("runtime-definition-id: " ^
+           HolbuildPackageDefinition.runtime_definition_id (#definition project) ^ "\n");
+    print ("generator-definition-id: " ^
+           HolbuildPackageDefinition.generator_definition_id (#definition project) ^ "\n");
+    print ("action-dependency-policy-id: " ^
+           HolbuildPackageDefinition.action_dependency_policy_id (#definition project) ^ "\n");
+    print ("action-input-policy-id: " ^
+           HolbuildPackageDefinition.action_input_policy_id (#definition project) ^ "\n");
+    print ("action-execution-policy-id: " ^
+           HolbuildPackageDefinition.action_execution_policy_id (#definition project) ^ "\n");
     print ("members: " ^ String.concatWith ", " members ^ "\n");
     print ("exclude: " ^ String.concatWith ", " excludes ^ "\n");
     print ("exclude_globs: " ^ String.concatWith ", " exclude_globs ^ "\n");

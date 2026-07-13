@@ -285,6 +285,12 @@ name = "example"
 `project.name` is required and identifies the logical package. A dependency
 manifest's name must match its dependency key.
 
+Holbuild parses committed semantics into separate metadata, source, entrypoint,
+dependency, runtime, action-input, action-dependency, action-execution, and
+generator layers. `holbuild context` reports canonical IDs for the package and
+independently reusable policy layers; TOML formatting and table order do not
+affect these IDs.
+
 ### `[dependencies.*]`
 
 Direct git dependencies use exact commit hashes:
