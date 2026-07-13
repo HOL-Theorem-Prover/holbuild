@@ -200,46 +200,59 @@ fun assoc id pairs =
 fun parse_analyser_response response_path id_paths =
   let
     val lines = String.tokens (fn c => c = #"\n") (read_all response_path)
+    fun add_source ((id, path), dict) =
+      case Binarymap.peek(dict, id) of
+          NONE => Binarymap.insert(dict, id, path)
+        | SOME _ => raise Error ("duplicate analyser request id: " ^ id)
     val source_paths =
-      List.foldl
-        (fn ((id, path), dict) => Binarymap.insert(dict, id, path))
-        (Binarymap.mkDict String.compare)
-        id_paths
+      List.foldl add_source (Binarymap.mkDict String.compare) id_paths
     fun source_for id =
       Option.getOpt(Binarymap.peek(source_paths, id), "file " ^ id)
-    fun loop rest current acc =
+    fun expected id = Option.isSome (Binarymap.peek(source_paths, id))
+    fun missing_response completed =
+      case List.find (fn (id, _) => not (Option.isSome (Binarymap.peek(completed, id)))) id_paths of
+          SOME (id, _) => raise Error ("analyser response missing file: " ^ source_for id)
+        | NONE => ()
+    fun loop rest current completed acc =
       case rest of
           [] => raise Error "analyser response missing end"
         | line :: more =>
             (case HolbuildAnalysisProtocol.split line of
                  ["version", v] =>
-                   if v = HolbuildAnalysisProtocol.protocol_version then loop more current acc
+                   if v = HolbuildAnalysisProtocol.protocol_version then loop more current completed acc
                    else raise Error ("unsupported analyser protocol version: " ^ v)
-               | ["ok"] => loop more current acc
+               | ["ok"] => loop more current completed acc
                | ["begin-file", id] =>
                    (case current of
-                        NONE => loop more (SOME (id, empty_deps ())) acc
+                        NONE =>
+                          if not (expected id) then
+                            raise Error ("analyser response has unknown file id: " ^ id)
+                          else if Option.isSome (Binarymap.peek(completed, id)) then
+                            raise Error ("analyser response has duplicate file id: " ^ id)
+                          else loop more (SOME (id, empty_deps ())) completed acc
                       | SOME (open_id, _) =>
                           raise Error ("analyser response missing end-file for " ^ source_for open_id))
                | ["end-file", id] =>
                    (case current of
                         SOME (current_id, deps) =>
-                          if id = current_id then loop more NONE ((id, finish_deps deps) :: acc)
+                          if id = current_id then
+                            loop more NONE (Binarymap.insert(completed, id, ()))
+                              ((id, finish_deps deps) :: acc)
                           else raise Error ("analyser response end-file mismatch: " ^ source_for current_id)
-                      | NONE => loop more NONE acc)
+                      | NONE => raise Error ("analyser response end-file without begin-file: " ^ id))
                | ["end"] =>
                    (case current of
-                        NONE => rev acc
+                        NONE => (missing_response completed; rev acc)
                       | SOME (id, _) =>
                           raise Error ("analyser response missing end-file for " ^ source_for id))
                | [field, value] =>
                    (case current of
                         SOME (id, deps) =>
-                          loop more (SOME (id, add_response_field (fn () => source_for id) field value deps)) acc
-                      | NONE => loop more current acc)
+                          loop more (SOME (id, add_response_field (fn () => source_for id) field value deps)) completed acc
+                      | NONE => raise Error ("analyser response field outside file: " ^ field))
                | _ => raise Error ("bad analyser response line: " ^ line))
   in
-    loop lines NONE []
+    loop lines NONE (Binarymap.mkDict String.compare) []
   end
 
 fun write_file path text =

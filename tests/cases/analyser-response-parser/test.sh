@@ -109,6 +109,35 @@ val _ =
     assert "truncated response should identify missing end-file"
            (String.isSubstring "missing end-file" msg)
 
+fun malformed_response name requested lines expected =
+  let val path = join(tmp, name)
+      val _ = write_text path (response_text lines)
+  in
+    (D.parse_analyser_response path requested;
+     fail (name ^ " was accepted"))
+    handle D.Error msg => assert (name ^ " error") (String.isSubstring expected msg)
+  end
+
+val _ =
+  malformed_response "missing-file.txt" [("1", "AScript.sml"), ("2", "BScript.sml")]
+    [P.join ["version", P.protocol_version], P.join ["begin-file", "1"],
+     P.join ["end-file", "1"], P.join ["end"]]
+    "missing file"
+val _ =
+  malformed_response "unknown-file.txt" [("1", "AScript.sml")]
+    [P.join ["version", P.protocol_version], P.join ["begin-file", "2"], P.join ["end-file", "2"],
+     P.join ["end"]]
+    "unknown file id"
+val _ =
+  malformed_response "duplicate-file.txt" [("1", "AScript.sml")]
+    [P.join ["version", P.protocol_version], P.join ["begin-file", "1"], P.join ["end-file", "1"],
+     P.join ["begin-file", "1"], P.join ["end-file", "1"], P.join ["end"]]
+    "duplicate file id"
+val _ =
+  malformed_response "orphan-end-file.txt" [("1", "AScript.sml")]
+    [P.join ["version", P.protocol_version], P.join ["end-file", "1"], P.join ["end"]]
+    "without begin-file"
+
 val _ = print "analyser response parser unit tests passed\n"
 SML
 
