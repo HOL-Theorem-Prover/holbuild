@@ -149,11 +149,21 @@ require_file "$no_cache_project/.holbuild/obj/src/ATheory.dat"
 unknown_project="$tmpdir/unknown_policy"
 make_theory_project "$unknown_project" '[actions.MissingTheory]
 cache = false'
+cat >> "$unknown_project/holproject.toml" <<'TOML'
+[[generate]]
+name = "must-not-run"
+command = ["sh", "-c", "printf x >> generator-ran"]
+outputs = ["src/Generated.sml"]
+TOML
 if (cd "$unknown_project" && "$HOLBUILD_BIN" build ATheory) > "$tmpdir/unknown.log" 2>&1; then
   echo "unknown action policy target was accepted" >&2
   exit 1
 fi
 require_grep "action policy references unknown target unknown_policy:MissingTheory" "$tmpdir/unknown.log"
+if [[ -e "$unknown_project/generator-ran" ]]; then
+  echo "unknown action policy target ran a generator before validation" >&2
+  exit 1
+fi
 
 missing_dep_project="$tmpdir/missing_declared_dep"
 make_theory_project "$missing_dep_project" '[actions.ATheory]

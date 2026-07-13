@@ -299,7 +299,7 @@ fun scan_member name source_root artifact_root policies excludes exclude_globs (
   else if is_readable member then scan_file name source_root artifact_root policies excludes exclude_globs member acc
   else raise Error ("member does not exist: " ^ member)
 
-fun discover_package package acc =
+fun scan_package_sources allow_missing_members package acc =
   let
     val name = HolbuildProject.package_name package
     val source_root = HolbuildProject.package_root package
@@ -307,25 +307,65 @@ fun discover_package package acc =
     val policies = HolbuildProject.package_action_policies package
     val excludes = HolbuildProject.package_excludes package
     val exclude_globs = HolbuildProject.package_exclude_globs package
+    val members =
+      map (fn member => HolbuildProject.abs_under source_root member)
+        (HolbuildProject.package_members package)
+    fun scan_one (member, sources) =
+      if allow_missing_members andalso not (is_dir member orelse is_readable member) then sources
+      else scan_member name source_root artifact_root policies excludes exclude_globs (member, sources)
+  in
+    List.foldl scan_one acc members
+  end
+
+(* Generator outputs may be the targets of action policies.  Include their
+   declared source-shaped paths in the side-effect-free preflight so a policy
+   typo is rejected before any package generator is allowed to run.  The final
+   validation below still uses discovered sources, which checks membership,
+   exclusions, and the generator's actual output. *)
+fun declared_generator_sources package =
+  let
+    val name = HolbuildProject.package_name package
+    val source_root = HolbuildProject.package_root package
+    val artifact_root = HolbuildProject.package_artifact_root package
+    val policies = HolbuildProject.package_action_policies package
+    fun add_output (rel, acc) =
+      let val path = HolbuildProject.abs_under source_root rel
+      in
+        case classify name artifact_root policies path rel of
+            NONE => acc
+          | SOME source => source :: acc
+      end
+    fun add_generator (generator, acc) =
+      List.foldl add_output acc (HolbuildProject.generator_outputs generator)
+  in
+    List.foldl add_generator [] (HolbuildProject.package_generators package)
+  end
+
+fun prevalidate_action_policies package =
+  let
+    (* A generator can create a declared build member, so preflight ignores a
+       missing member and lets the normal post-generation scan diagnose it. *)
+    val candidates = scan_package_sources true package [] @ declared_generator_sources package
+  in
+    validate_action_policies (HolbuildProject.package_name package)
+                             (HolbuildProject.package_action_policies package)
+                             candidates
+  end
+
+fun discover_package package acc =
+  let
     val _ = HolbuildGenerators.run_package package
             handle HolbuildGenerators.Error msg => raise Error msg
                  | HolbuildGenerators.ErrorWithDebugArtifacts (msg, artifacts) =>
                      raise ErrorWithDebugArtifacts (msg, artifacts)
-    val members =
-      map (fn member => HolbuildProject.abs_under source_root member)
-        (HolbuildProject.package_members package)
-    val sources =
-      List.foldl
-        (scan_member name source_root artifact_root policies excludes exclude_globs)
-        acc
-        members
   in
-    sources
+    scan_package_sources false package acc
   end
 
 fun discover_with resolution (project : HolbuildProject.t) =
   let
     val packages = HolbuildProject.packages_with resolution project
+    val _ = List.app prevalidate_action_policies packages
     val sources =
       sort_sources
         (dedup_sources
