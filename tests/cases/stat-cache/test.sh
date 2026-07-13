@@ -55,6 +55,9 @@ fun with_size ({dev, ino, size, mtime_ns, ctime_ns} : HolbuildStatCache.ident) s
 fun with_mtime ({dev, ino, size, mtime_ns, ctime_ns} : HolbuildStatCache.ident) mtime' =
   {dev = dev, ino = ino, size = size, mtime_ns = mtime', ctime_ns = ctime_ns}
 
+fun with_times ({dev, ino, size, ...} : HolbuildStatCache.ident) mtime_ns ctime_ns =
+  {dev = dev, ino = ino, size = size, mtime_ns = mtime_ns, ctime_ns = ctime_ns}
+
 fun stats instance = HolbuildStatCache.stats instance
 
 val sentinel1 = "1111111111111111111111111111111111111111"
@@ -67,6 +70,13 @@ val corpus_a = join (tmp, "corpus-a.txt")
 val corpus_b = join (tmp, "corpus-b.txt")
 val _ = write_text corpus_a "alpha\n"
 val _ = write_text corpus_b "beta\n"
+val precision_ident = ident corpus_a
+val coarse_ident = with_times precision_ident 1700000000000000000 1700000000000000000
+val precise_ident = with_times precision_ident 1700000000000000001 1700000000000000001
+val _ = assert "whole-second timestamps must not be cacheable"
+               (not (HolbuildStatCache.cacheable_ident coarse_ident))
+val _ = assert "nanosecond timestamps should be cacheable"
+               (HolbuildStatCache.cacheable_ident precise_ident)
 val _ = HolbuildStatCache.clear_current_instance ()
 val _ =
   List.app
@@ -121,7 +131,7 @@ val _ = assert "ctime mismatch should rehash" (HolbuildStatCache.file_sha1 ctime
 val unknown_file = join (tmp, "unknown.txt")
 val unknown_cache = join (tmp, "unknown.cache")
 val _ = write_text unknown_file "unknown\n"
-val _ = write_cache unknown_cache "holbuild-stat-cache-v2" [cache_line unknown_file (ident unknown_file) sentinel5]
+val _ = write_cache unknown_cache "holbuild-stat-cache-v1" [cache_line unknown_file (ident unknown_file) sentinel5]
 val unknown_instance = HolbuildStatCache.load {path = unknown_cache}
 val _ = assert "unknown version should load empty and rehash" (HolbuildStatCache.file_sha1 unknown_instance unknown_file = raw unknown_file)
 
