@@ -37,7 +37,9 @@ uninstall:
 
 test: bin/holbuild
 	HOLBUILD_KEEP_TEST_LOGS="$(HOLBUILD_KEEP_TEST_LOGS)" HOLDIR="$(HOLDIR)" tests/run.sh $(TESTS)
+ifeq ($(strip $(TESTS)),)
 	$(MAKE) golden-key-dump-check
+endif
 
 clean:
 	rm -f bin/holbuild

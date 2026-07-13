@@ -67,7 +67,7 @@ capture_project() {
   local dump=$2
   shift 2
   mkdir -p "$(dirname "$dump")"
-  (cd "$project" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_DUMP_KEYS="$dump" "$HOLBUILD_BIN" -j1 build "$@") >/dev/null
+  (cd "$project" && HOLBUILD_DUMP_KEYS="$dump" "$HOLBUILD_BIN" -j1 build "$@") >/dev/null
 }
 
 capture_all() {
