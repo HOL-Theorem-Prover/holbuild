@@ -6,7 +6,14 @@ BINDIR ?= $(PREFIX)/bin
 VENDORED_HOL_FILES := $(shell sed 's|^|vendor/hol/|' vendor/hol/FILES)
 VENDORED_SHA256_FILES := $(wildcard vendor/sml-sha256/lib/*.sig vendor/sml-sha256/lib/*.sml) vendor/sml-sha256/LICENSE vendor/sml-sha256/AUTHORS vendor/sml-sha256/README.holbuild
 
-.PHONY: all check-vendored-hol install uninstall test clean
+.PHONY: all check-vendored-hol install uninstall test golden-key-dump-check clean
+
+GOLDEN_KEY_BASELINE := tests/golden/key-dumps
+
+golden-key-dump-check: bin/holbuild
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	HOLBUILD_TESTBED=/nonexistent tests/golden-key-dump.sh capture "$$tmp"; \
+	tests/golden-key-dump.sh diff "$(GOLDEN_KEY_BASELINE)" "$$tmp";
 
 all: bin/holbuild
 
@@ -30,6 +37,7 @@ uninstall:
 
 test: bin/holbuild
 	HOLBUILD_KEEP_TEST_LOGS="$(HOLBUILD_KEEP_TEST_LOGS)" HOLDIR="$(HOLDIR)" tests/run.sh $(TESTS)
+	$(MAKE) golden-key-dump-check
 
 clean:
 	rm -f bin/holbuild
