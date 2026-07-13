@@ -192,25 +192,26 @@ fun file_sha1 (instance : instance) path =
                  if same_ident (ident, cached_ident) then
                    with_lock instance
                      (fn () => (#hits instance := !(#hits instance) + 1; sha1))
-                 else
-                   let val sha1 = HolbuildHash.file_sha1 path
-                   in
-                     with_lock instance
-                       (fn () =>
-                           (#recomputes instance := !(#recomputes instance) + 1;
-                            #entries instance :=
-                              Binarymap.insert (!(#entries instance), path, (ident, sha1));
-                            sha1))
-                   end
-             | NONE =>
-                 let val sha1 = HolbuildHash.file_sha1 path
-                 in
-                   with_lock instance
-                     (fn () =>
-                         (#recomputes instance := !(#recomputes instance) + 1;
-                          #entries instance :=
-                            Binarymap.insert (!(#entries instance), path, (ident, sha1));
-                          sha1))
-                 end)
+                 else rehash_file_sha1 instance path ident
+             | NONE => rehash_file_sha1 instance path ident)
+
+and rehash_file_sha1 (instance : instance) path ident =
+  let val sha1 = HolbuildHash.file_sha1 path
+  in
+    (* The identity used to index the hash must describe the bytes we just
+       read.  Otherwise a same-size write on a coarse-timestamp filesystem can
+       persist a hash for the wrong action input. *)
+    case stat_ident path of
+        SOME final_ident =>
+          if same_ident (ident, final_ident) then
+            with_lock instance
+              (fn () =>
+                  (#recomputes instance := !(#recomputes instance) + 1;
+                   #entries instance :=
+                     Binarymap.insert (!(#entries instance), path, (final_ident, sha1));
+                   sha1))
+          else file_sha1 instance path
+      | NONE => file_sha1 instance path
+  end
 
 end
