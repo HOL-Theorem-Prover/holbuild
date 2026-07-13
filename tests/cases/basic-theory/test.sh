@@ -168,6 +168,20 @@ sed -i 's/^output-sha1=.*/output-sha1=stale-diagnostic-hash/' "$metadata"
 stale_hash_log=$tmpdir/stale-output-hash.log
 (cd "$project" && "$HOLBUILD_BIN" --verbose build --emit-output-hashes ATheory) > "$stale_hash_log"
 require_grep "ATheory is up to date" "$stale_hash_log"
+if grep -q 'output-sha1=stale-diagnostic-hash' "$metadata"; then
+  echo "up-to-date --emit-output-hashes did not refresh output diagnostics" >&2
+  exit 1
+fi
+while IFS= read -r line; do
+  payload=${line#output-sha1=}
+  path=${payload% *}
+  hash=${payload##* }
+  actual=$(sha1sum "$path" | awk '{print $1}')
+  if [[ "$hash" != "$actual" ]]; then
+    echo "up-to-date --emit-output-hashes wrote a stale output diagnostic for $path" >&2
+    exit 1
+  fi
+done < <(grep "^output-sha1=" "$metadata")
 
 input_key=$(grep '^input_key=' "$project/.holbuild/dep/basic/src/AScript.sml.key" | cut -d= -f2)
 cache_manifest="$HOLBUILD_CACHE/actions/$input_key/manifest"
