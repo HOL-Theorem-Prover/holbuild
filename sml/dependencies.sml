@@ -218,11 +218,7 @@ fun parse_analyser_response response_path id_paths =
           [] => raise Error "analyser response missing end"
         | line :: more =>
             (case HolbuildAnalysisProtocol.split line of
-                 ["version", v] =>
-                   if v = HolbuildAnalysisProtocol.protocol_version then loop more current completed acc
-                   else raise Error ("unsupported analyser protocol version: " ^ v)
-               | ["ok"] => loop more current completed acc
-               | ["begin-file", id] =>
+                 ["begin-file", id] =>
                    (case current of
                         NONE =>
                           if not (expected id) then
@@ -242,7 +238,9 @@ fun parse_analyser_response response_path id_paths =
                       | NONE => raise Error ("analyser response end-file without begin-file: " ^ id))
                | ["end"] =>
                    (case current of
-                        NONE => (missing_response completed; rev acc)
+                        NONE =>
+                          if null more then (missing_response completed; rev acc)
+                          else raise Error "analyser response has trailing records after end"
                       | SOME (id, _) =>
                           raise Error ("analyser response missing end-file for " ^ source_for id))
                | [field, value] =>
@@ -251,8 +249,25 @@ fun parse_analyser_response response_path id_paths =
                           loop more (SOME (id, add_response_field (fn () => source_for id) field value deps)) completed acc
                       | NONE => raise Error ("analyser response field outside file: " ^ field))
                | _ => raise Error ("bad analyser response line: " ^ line))
+    fun require_version line =
+      case HolbuildAnalysisProtocol.split line of
+          ["version", v] =>
+            if v = HolbuildAnalysisProtocol.protocol_version then ()
+            else raise Error ("unsupported analyser protocol version: " ^ v)
+        | _ => raise Error "analyser response missing version header"
+    fun require_ok line =
+      case HolbuildAnalysisProtocol.split line of
+          ["ok"] => ()
+        | _ => raise Error "analyser response missing ok header"
   in
-    loop lines NONE (Binarymap.mkDict String.compare) []
+    case lines of
+        version :: ok :: records =>
+          (require_version version;
+           require_ok ok;
+           loop records NONE (Binarymap.mkDict String.compare) [])
+      | [] => raise Error "analyser response missing version header"
+      | version :: _ => (require_version version;
+                         raise Error "analyser response missing ok header")
   end
 
 fun write_file path text =

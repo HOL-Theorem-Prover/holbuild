@@ -84,6 +84,7 @@ val _ =
   write_text missing_end_path
     (response_text
        [P.join ["version", P.protocol_version],
+        P.join ["ok"],
         P.join ["begin-file", "1"],
         P.join ["load", "A"],
         P.join ["end-file", "1"]])
@@ -99,6 +100,7 @@ val _ =
   write_text truncated_file_path
     (response_text
        [P.join ["version", P.protocol_version],
+        P.join ["ok"],
         P.join ["begin-file", "1"],
         P.join ["load", "A"],
         P.join ["end"]])
@@ -119,23 +121,37 @@ fun malformed_response name requested lines expected =
   end
 
 val _ =
-  malformed_response "missing-file.txt" [("1", "AScript.sml"), ("2", "BScript.sml")]
+  malformed_response "missing-version.txt" [("1", "AScript.sml")]
+    [P.join ["ok"], P.join ["begin-file", "1"], P.join ["end-file", "1"], P.join ["end"]]
+    "missing version header"
+val _ =
+  malformed_response "missing-ok.txt" [("1", "AScript.sml")]
     [P.join ["version", P.protocol_version], P.join ["begin-file", "1"],
+     P.join ["end-file", "1"], P.join ["end"]]
+    "missing ok header"
+val _ =
+  malformed_response "trailing-record.txt" [("1", "AScript.sml")]
+    [P.join ["version", P.protocol_version], P.join ["ok"], P.join ["begin-file", "1"],
+     P.join ["end-file", "1"], P.join ["end"], P.join ["begin-file", "1"]]
+    "trailing records"
+val _ =
+  malformed_response "missing-file.txt" [("1", "AScript.sml"), ("2", "BScript.sml")]
+    [P.join ["version", P.protocol_version], P.join ["ok"], P.join ["begin-file", "1"],
      P.join ["end-file", "1"], P.join ["end"]]
     "missing file"
 val _ =
   malformed_response "unknown-file.txt" [("1", "AScript.sml")]
-    [P.join ["version", P.protocol_version], P.join ["begin-file", "2"], P.join ["end-file", "2"],
+    [P.join ["version", P.protocol_version], P.join ["ok"], P.join ["begin-file", "2"], P.join ["end-file", "2"],
      P.join ["end"]]
     "unknown file id"
 val _ =
   malformed_response "duplicate-file.txt" [("1", "AScript.sml")]
-    [P.join ["version", P.protocol_version], P.join ["begin-file", "1"], P.join ["end-file", "1"],
+    [P.join ["version", P.protocol_version], P.join ["ok"], P.join ["begin-file", "1"], P.join ["end-file", "1"],
      P.join ["begin-file", "1"], P.join ["end-file", "1"], P.join ["end"]]
     "duplicate file id"
 val _ =
   malformed_response "orphan-end-file.txt" [("1", "AScript.sml")]
-    [P.join ["version", P.protocol_version], P.join ["end-file", "1"], P.join ["end"]]
+    [P.join ["version", P.protocol_version], P.join ["ok"], P.join ["end-file", "1"], P.join ["end"]]
     "without begin-file"
 
 val _ = print "analyser response parser unit tests passed\n"
