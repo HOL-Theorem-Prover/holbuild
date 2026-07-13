@@ -227,7 +227,11 @@ fun parse_analyser_response response_path id_paths =
                           if id = current_id then loop more NONE ((id, finish_deps deps) :: acc)
                           else raise Error ("analyser response end-file mismatch: " ^ source_for current_id)
                       | NONE => loop more NONE acc)
-               | ["end"] => rev acc
+               | ["end"] =>
+                   (case current of
+                        NONE => rev acc
+                      | SOME (id, _) =>
+                          raise Error ("analyser response missing end-file for " ^ source_for id))
                | [field, value] =>
                    (case current of
                         SOME (id, deps) =>

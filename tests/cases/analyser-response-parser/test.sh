@@ -94,6 +94,21 @@ val _ =
   handle D.Error msg =>
     assert "missing end error should mention end" (String.isSubstring "missing end" msg)
 
+val truncated_file_path = join(tmp, "truncated-file.txt")
+val _ =
+  write_text truncated_file_path
+    (response_text
+       [P.join ["version", P.protocol_version],
+        P.join ["begin-file", "1"],
+        P.join ["load", "A"],
+        P.join ["end"]])
+val _ =
+  (D.parse_analyser_response truncated_file_path [("1", "AScript.sml")];
+   fail "truncated analyser response was accepted")
+  handle D.Error msg =>
+    assert "truncated response should identify missing end-file"
+           (String.isSubstring "missing end-file" msg)
+
 val _ = print "analyser response parser unit tests passed\n"
 SML
 
