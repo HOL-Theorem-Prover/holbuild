@@ -105,7 +105,7 @@ fun resolve {project, resolution} : t =
     val hol =
       case hol_packages of
           [package] => package_id package
-        | _ => raise Error "resolved package graph must contain exactly one typed HOL package"
+        | _ => raise Error "dependency graph must contain exactly one hol dependency"
     val edges = List.concat (map (edges_for packages) packages)
     val graph = {root = root, hol = hol, packages = packages, edges = edges}
     val _ = HolbuildProject.store_graph_with resolution project graph
