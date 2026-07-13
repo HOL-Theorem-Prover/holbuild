@@ -51,6 +51,33 @@ if [[ "$first_hash" != "$second_hash" ]]; then
   exit 1
 fi
 
+# Interrupt immediately after the old live tree is moved to its backup.  The
+# EXIT cleanup must restore it rather than leaving vendor/hol absent.
+interrupt_bin=$tmpdir/interrupt-bin
+mkdir "$interrupt_bin"
+cat > "$interrupt_bin/mv" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+/bin/mv "$@"
+last=${!#}
+if [[ $last == */.update-vendored-hol-backup.* ]]; then
+  kill -TERM "$PPID"
+fi
+SH
+chmod +x "$interrupt_bin/mv"
+if PATH="$interrupt_bin:$PATH" "$fixture/tools/update-vendored-hol.sh" --from "$source_checkout" "$rev"; then
+  echo "interrupted vendored refresh unexpectedly succeeded" >&2
+  exit 1
+fi
+if [[ "$(cat "$fixture/vendor/hol/REV")" != "$rev" ]]; then
+  echo "interrupted vendored refresh did not restore REV" >&2
+  exit 1
+fi
+if [[ "$(sha1sum "$binaryset" | awk '{print $1}')" != "$second_hash" ]]; then
+  echo "interrupted vendored refresh did not restore the live vendor tree" >&2
+  exit 1
+fi
+
 # A failed exact compatibility patch must leave the prior vendor tree and REV
 # intact rather than publishing files from the incompatible upstream revision.
 printf 'incompatible upstream form\n' > "$source_checkout/tools-poly/poly/Binaryset.sml"

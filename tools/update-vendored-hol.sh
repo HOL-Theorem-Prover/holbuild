@@ -41,18 +41,33 @@ if [[ ! $rev =~ ^[0-9a-f]{40}$ ]]; then
 fi
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-files=$root/vendor/hol/FILES
+vendor=$root/vendor/hol
+files=$vendor/FILES
 [[ -f $files ]] || { echo "missing $files" >&2; exit 1; }
 
 # Build a complete replacement beside the live tree.  In particular, do not
 # let a compatibility-patch failure leave a mixture of old and new files.
 tmpdir=$(mktemp -d "$root/vendor/.update-vendored-hol.XXXXXX")
 stage=$tmpdir/hol
+backup=
 mkdir -p "$stage"
 cleanup() {
+  # Once the live tree has been moved aside, EXIT can be reached from a signal
+  # between either publish rename.  Put the old tree back unless the staged
+  # tree was already installed; in the latter case it is safe to discard it.
+  if [[ -n $backup && -d $backup ]]; then
+    if [[ ! -e $vendor ]]; then
+      mv "$backup" "$vendor" ||
+        echo "could not restore vendored HOL tree from $backup" >&2
+    else
+      rm -rf "$backup"
+    fi
+  fi
   rm -rf "$tmpdir"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [[ -n $source_checkout ]]; then
   hol=$source_checkout
@@ -143,14 +158,15 @@ printf '%s\n' "$rev" > "$stage/REV"
 # Both directories are under vendor/, so these renames stay on one filesystem.
 # Every fetch and exact compatibility patch has succeeded before the live tree
 # is replaced.  Restore it if publishing the replacement itself fails.
-vendor=$root/vendor/hol
 backup=$(mktemp -d "$root/vendor/.update-vendored-hol-backup.XXXXXX")
 rmdir "$backup"
 mv "$vendor" "$backup"
 if mv "$stage" "$vendor"; then
   rm -rf "$backup"
+  backup=
 else
   mv "$backup" "$vendor"
+  backup=
   echo "could not publish refreshed vendored HOL tree" >&2
   exit 1
 fi
