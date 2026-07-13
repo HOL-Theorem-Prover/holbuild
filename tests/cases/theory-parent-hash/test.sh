@@ -210,3 +210,33 @@ if grep -q "BTheory is up to date\|link_parents" "$stale_log"; then
   echo "stale theory parent metadata hash was accepted" >&2
   exit 1
 fi
+
+# A v1 marker is not sufficient: every current parent must have a valid entry.
+python3 - <<PY
+from pathlib import Path
+path = Path("$b_metadata")
+lines = [line for line in path.read_text().splitlines()
+         if not line.startswith("parent_dat=A ")]
+path.write_text("\\n".join(lines) + "\\n")
+PY
+missing_parent_log=$tmpdir/missing-parent.log
+(cd "$project" && "$HOLBUILD_BIN" build --no-cache BTheory) > "$missing_parent_log" 2>&1
+require_grep "BTheory built" "$missing_parent_log"
+
+# Metadata must also agree with the child artifact, rather than masking a
+# replaced or truncated .dat file.
+python3 - <<PY
+from pathlib import Path
+import re
+path = Path("$project/.holbuild/obj/src/BTheory.dat")
+text = path.read_text()
+changed = re.sub(r'("A"\\s*\\.\\s*")[0-9a-f]{40}',
+                 r'\\g<1>0000000000000000000000000000000000000000', text,
+                 count=1)
+if changed == text:
+    raise SystemExit("BTheory.dat did not contain A parent hash")
+path.write_text(changed)
+PY
+replaced_child_log=$tmpdir/replaced-child.log
+(cd "$project" && "$HOLBUILD_BIN" build --no-cache BTheory) > "$replaced_child_log" 2>&1
+require_grep "BTheory built" "$replaced_child_log"

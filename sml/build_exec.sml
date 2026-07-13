@@ -3149,14 +3149,14 @@ fun theory_parent_hash_matches dat_hash_cache parent_hashes dep =
   let
     val parent_name = theory_name_from_logical (logical_name dep)
   in
-    (* A parent whose data file cannot be hashed (missing/unreadable) makes the
-       node not up to date, matching the old eager-hash behaviour.  Only a
-       readable parent lets a missing recorded hash count as a match. *)
+    (* Every direct theory dependency must be represented by a valid hash.
+       Treating a missing entry as a match lets truncated metadata or a
+       malformed child .dat suppress a necessary rebuild. *)
     case cached_file_hash dat_hash_cache (#data_path (theory_outputs dep)) of
         NONE => false
       | SOME parent_hash =>
           (case Binarymap.peek (parent_hashes, parent_name) of
-               NONE => true
+               NONE => false
              | SOME recorded_hash => recorded_hash = parent_hash)
   end
 
@@ -3169,8 +3169,12 @@ fun metadata_parent_hashes_match dat_hash_cache plan node text =
   let val lines = metadata_lines text
   in
     if metadata_has_parent_hashes lines then
+      (* Metadata is a cache for this check, not an authority on the current
+         child artifact.  Check both so replacing the .dat while retaining its
+         metadata cannot turn an invalid artifact into a no-op. *)
       List.all (theory_parent_hash_matches dat_hash_cache (metadata_parent_hashes lines))
-               (project_theory_deps plan node)
+               (project_theory_deps plan node) andalso
+      child_dat_parent_hashes_match dat_hash_cache plan node
     else
       child_dat_parent_hashes_match dat_hash_cache plan node
   end
