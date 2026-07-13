@@ -14,7 +14,7 @@ type instance =
    hits : int ref,
    recomputes : int ref}
 
-val version = "holbuild-stat-cache-v2"
+val version = "holbuild-stat-cache-v3"
 
 fun empty_entries () = Binarymap.mkDict String.compare
 
@@ -70,17 +70,6 @@ fun same_ident ({dev = dev1, ino = ino1, size = size1,
                  mtime_ns = mtime2, ctime_ns = ctime2} : ident) =
   dev1 = dev2 andalso ino1 = ino2 andalso size1 = size2 andalso
   mtime1 = mtime2 andalso ctime1 = ctime2
-
-(* A stat identity is only a sound cache key when the filesystem reports
-   subsecond change times.  Coarse filesystems can leave every field above
-   unchanged after a same-size rewrite in one clock tick.  Poly/ML represents
-   POSIX times at microsecond precision, so reject timestamps on an exact
-   second boundary rather than silently treating a coarse timestamp as a hit. *)
-fun has_subsecond_precision timestamp =
-  LargeInt.mod(timestamp, 1000000000) <> 0
-
-fun cacheable_ident ({mtime_ns, ctime_ns, ...} : ident) =
-  has_subsecond_precision mtime_ns andalso has_subsecond_precision ctime_ns
 
 fun read_text path =
   let val input = TextIO.openIn path
@@ -220,14 +209,13 @@ fun file_sha1 (instance : instance) path =
     case stat_ident path of
         NONE => HolbuildHash.file_sha1 path
       | SOME ident =>
-          (case with_lock instance
-                   (fn () => Binarymap.peek (!(#entries instance), path)) of
-               SOME (cached_ident, sha1) =>
-                 if same_ident (ident, cached_ident) andalso cacheable_ident ident then
-                   with_lock instance
-                     (fn () => (#hits instance := !(#hits instance) + 1; sha1))
-                 else rehash_file_sha1 instance path ident
-             | NONE => rehash_file_sha1 instance path ident)
+          (* No combination of portable stat fields is a content identity:
+             a same-size write can preserve inode, mtime, and ctime on a
+             filesystem tick, including one with nonzero subsecond values.
+             Therefore an entry is retained only as a record of a hash we
+             computed; it must never be used to return a source hash without
+             reading the source again. *)
+          rehash_file_sha1 instance path ident
 
 and rehash_file_sha1 (instance : instance) path ident =
   let val sha1 = HolbuildHash.file_sha1 path

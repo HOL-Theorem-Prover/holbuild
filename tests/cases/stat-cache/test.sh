@@ -55,9 +55,6 @@ fun with_size ({dev, ino, size, mtime_ns, ctime_ns} : HolbuildStatCache.ident) s
 fun with_mtime ({dev, ino, size, mtime_ns, ctime_ns} : HolbuildStatCache.ident) mtime' =
   {dev = dev, ino = ino, size = size, mtime_ns = mtime', ctime_ns = ctime_ns}
 
-fun with_times ({dev, ino, size, ...} : HolbuildStatCache.ident) mtime_ns ctime_ns =
-  {dev = dev, ino = ino, size = size, mtime_ns = mtime_ns, ctime_ns = ctime_ns}
-
 fun stats instance = HolbuildStatCache.stats instance
 
 val sentinel1 = "1111111111111111111111111111111111111111"
@@ -70,13 +67,6 @@ val corpus_a = join (tmp, "corpus-a.txt")
 val corpus_b = join (tmp, "corpus-b.txt")
 val _ = write_text corpus_a "alpha\n"
 val _ = write_text corpus_b "beta\n"
-val precision_ident = ident corpus_a
-val coarse_ident = with_times precision_ident 1700000000000000000 1700000000000000000
-val precise_ident = with_times precision_ident 1700000000000000001 1700000000000000001
-val _ = assert "whole-second timestamps must not be cacheable"
-               (not (HolbuildStatCache.cacheable_ident coarse_ident))
-val _ = assert "nanosecond timestamps should be cacheable"
-               (HolbuildStatCache.cacheable_ident precise_ident)
 val _ = HolbuildStatCache.clear_current_instance ()
 val _ =
   List.app
@@ -90,8 +80,12 @@ val hit_cache = join (tmp, "hit.cache")
 val _ = write_text hit_file "unchanged\n"
 val _ = write_cache hit_cache HolbuildStatCache.version [cache_line hit_file (ident hit_file) sentinel1]
 val hit_instance = HolbuildStatCache.load {path = hit_cache}
-val _ = assert "unchanged file should return stored sha1" (HolbuildStatCache.file_sha1 hit_instance hit_file = sentinel1)
-val _ = assert "unchanged hit counter" (#hits (stats hit_instance) = 1 andalso #recomputes (stats hit_instance) = 0)
+(* Matching stat fields, even when they contain nonzero subsecond values,
+   cannot prove that the bytes still match.  A same-size rewrite in one
+   filesystem tick can produce exactly this cache record. *)
+val _ = assert "matching stat identity must rehash" (HolbuildStatCache.file_sha1 hit_instance hit_file = raw hit_file)
+val _ = assert "matching identity must not be a cache hit"
+               (#hits (stats hit_instance) = 0 andalso #recomputes (stats hit_instance) = 1)
 
 val size_file = join (tmp, "size.txt")
 val size_cache = join (tmp, "size.cache")
@@ -152,8 +146,9 @@ val flush_instance = HolbuildStatCache.load {path = flush_cache}
 val flush_hash = HolbuildStatCache.file_sha1 flush_instance flush_file
 val _ = HolbuildStatCache.flush flush_instance
 val reloaded = HolbuildStatCache.load {path = flush_cache}
-val _ = assert "flushed cache should reload as a hit" (HolbuildStatCache.file_sha1 reloaded flush_file = flush_hash)
-val _ = assert "flush reload hit counter" (#hits (stats reloaded) = 1)
+val _ = assert "flushed cache should reload and verify content" (HolbuildStatCache.file_sha1 reloaded flush_file = flush_hash)
+val _ = assert "flush reload must not use an unchecked hash"
+               (#hits (stats reloaded) = 0 andalso #recomputes (stats reloaded) = 1)
 val _ = OS.FileSys.remove flush_file
 val _ = HolbuildStatCache.flush reloaded
 val pruned = HolbuildStatCache.load {path = flush_cache}
@@ -272,8 +267,8 @@ assert_json_field from_cache 0 "$second_json"
 assert_json_field unchanged 2 "$second_json"
 second_hits=$(stat_cache_field hits "$second_timing")
 second_recomputes=$(stat_cache_field recomputes "$second_timing")
-if [[ "$second_hits" -le 0 || "$second_recomputes" -ne 0 ]]; then
-  echo "second no-op should hit stat cache without recomputes; hits=$second_hits recomputes=$second_recomputes" >&2
+if [[ "$second_hits" -ne 0 || "$second_recomputes" -le 0 ]]; then
+  echo "second no-op must verify source hashes; hits=$second_hits recomputes=$second_recomputes" >&2
   exit 1
 fi
 
