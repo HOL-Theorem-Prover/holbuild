@@ -3,6 +3,7 @@ HOLBUILD_KEEP_TEST_LOGS ?=
 POLYC ?= polyc
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
+DATADIR ?= $(PREFIX)/share/holbuild
 VENDORED_HOL_FILES := $(shell sed 's|^|vendor/hol/|' vendor/hol/FILES)
 VENDORED_SHA256_FILES := $(wildcard vendor/sml-sha256/lib/*.sig vendor/sml-sha256/lib/*.sml) vendor/sml-sha256/LICENSE vendor/sml-sha256/AUTHORS vendor/sml-sha256/README.holbuild
 
@@ -29,11 +30,12 @@ bin/holbuild: sml/holbuild-script.sml sml/hash.sml sml/stat_cache.sml sml/versio
 	$(POLYC) -o $@ sml/holbuild-script.sml
 
 install: bin/holbuild
-	install -d "$(DESTDIR)$(BINDIR)"
+	install -d "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(DATADIR)/copyrights"
 	install -m 755 bin/holbuild "$(DESTDIR)$(BINDIR)/holbuild"
+	install -m 644 vendor/hol/copyrights/smlnj.txt "$(DESTDIR)$(DATADIR)/copyrights/smlnj.txt"
 
 uninstall:
-	rm -f "$(DESTDIR)$(BINDIR)/holbuild"
+	rm -f "$(DESTDIR)$(BINDIR)/holbuild" "$(DESTDIR)$(DATADIR)/copyrights/smlnj.txt"
 
 test: bin/holbuild
 	HOLBUILD_KEEP_TEST_LOGS="$(HOLBUILD_KEEP_TEST_LOGS)" HOLDIR="$(HOLDIR)" tests/run.sh $(TESTS)
