@@ -52,7 +52,6 @@ fun build_help () = print
   \  --dry-run\n\
   \  --force[=theory|project|full]\n\
   \  --no-cache\n\
-  \  --verify-cache\n\
   \  --no-stat-cache\n\
   \  --skip-checkpoints\n\
   \  --skip-proof-steps\n\
@@ -241,8 +240,6 @@ fun split_flags args =
             loop dry watch HolbuildBuildExec.ForceAll use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
         | "--no-cache" :: xs =>
             loop dry watch force false verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
-        | "--verify-cache" :: xs =>
-            loop dry watch force use_cache true no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
         | "--no-stat-cache" :: xs =>
             loop dry watch force use_cache verify_cache true skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
         | "--skip-checkpoints" :: xs =>
