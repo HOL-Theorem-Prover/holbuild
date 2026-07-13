@@ -66,13 +66,11 @@ type name_index = (string * node list) Vector.vector
 
 fun split_pairs xs =
   let
-    fun loop left right rest =
-      case rest of
-          [] => (left, right)
-        | [x] => (x :: left, right)
-        | x :: y :: zs => loop (x :: left) (y :: right) zs
+    fun loop 0 left right = (rev left, right)
+      | loop count left (x :: right) = loop (count - 1) (x :: left) right
+      | loop _ _ [] = raise Error "internal error while splitting sort input"
   in
-    loop [] [] xs
+    loop (length xs div 2) [] xs
   end
 
 fun merge_pairs compare left right =

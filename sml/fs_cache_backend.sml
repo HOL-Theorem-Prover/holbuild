@@ -154,12 +154,16 @@ fun fetch_blob cache {hash, dst} =
 
 (* src is a local filesystem path containing bytes to store under hash. *)
 fun publish_blob cache {hash, src} =
-  let val blob = blob_path cache hash
+  let
+    val blob = blob_path cache hash
+    val _ =
+      if file_hash_matches src hash then ()
+      else raise Error ("blob SHA1 mismatch: expected " ^ hash)
   in
-    if has_blob cache hash then HolbuildCacheBackend.AlreadyPresent
+    if verify_blob cache hash then HolbuildCacheBackend.AlreadyPresent
     else
       (copy_binary src blob;
-       if path_exists blob then HolbuildCacheBackend.Published
+       if verify_blob cache hash then HolbuildCacheBackend.Published
        else HolbuildCacheBackend.Conflict blob)
   end
   handle Error msg => HolbuildCacheBackend.Conflict msg

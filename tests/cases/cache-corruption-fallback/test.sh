@@ -62,6 +62,10 @@ verify_corrupt_blob_log=$tmpdir/verify-corrupt-blob.log
 (cd "$project" && "$HOLBUILD_BIN" build --verify-cache ATheory) > "$verify_corrupt_blob_log" 2>&1
 require_grep "cache entry unusable" "$verify_corrupt_blob_log"
 require_file "$project/.holbuild/obj/src/ATheory.dat"
+cmp "$clean_dat_blob" "$HOLBUILD_CACHE/blobs/$dat_blob" || {
+  echo "verify-cache rebuild did not repair the corrupt cache blob" >&2
+  exit 1
+}
 
 cp "$clean_dat_blob" "$HOLBUILD_CACHE/blobs/$dat_blob"
 rm -rf "$project/.holbuild"

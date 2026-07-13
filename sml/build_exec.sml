@@ -2912,13 +2912,15 @@ fun output_hash_lines_for_paths paths =
     map canonical_line canonical_hashes @ map remap_line canonical_hashes
   end
 
-fun output_hash_lines _ _ node =
+fun output_hash_lines checkpoint_policy _ node =
   let
     val artifacts = source_artifacts node
+    val data_paths = #theory_data artifacts
   in
     output_hash_lines_for_paths (#generated artifacts) @
     output_hash_lines_for_paths (#objects artifacts) @
-    output_hash_lines_for_paths (#theory_data artifacts)
+    output_hash_lines_for_paths data_paths @
+    output_hash_lines_for_paths (trace_paths checkpoint_policy data_paths)
   end
 
 fun theory_name_from_logical logical =
