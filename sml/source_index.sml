@@ -319,19 +319,33 @@ fun discover_package package acc =
         (scan_member name source_root artifact_root policies excludes exclude_globs)
         acc
         members
-    val _ = validate_action_policies name policies sources
   in
     sources
   end
 
 fun discover_with resolution (project : HolbuildProject.t) =
-  by_logical
-    (sort_sources
-       (dedup_sources
-          (List.foldl
-             (fn (package, acc) => discover_package package acc)
-             []
-             (HolbuildProject.packages_with resolution project))))
+  let
+    val packages = HolbuildProject.packages_with resolution project
+    val sources =
+      sort_sources
+        (dedup_sources
+           (List.foldl
+              (fn (package, acc) => discover_package package acc)
+              []
+              packages))
+    (* A package can scan a physical file already retained from another
+       package.  Validate after global deduplication so its policy cannot be
+       accepted for a source that will not exist in the final index. *)
+    val _ =
+      List.app
+        (fn package =>
+            validate_action_policies (HolbuildProject.package_name package)
+                                     (HolbuildProject.package_action_policies package)
+                                     sources)
+        packages
+  in
+    by_logical sources
+  end
 
 fun discover project = discover_with HolbuildProject.standard_resolution project
 
