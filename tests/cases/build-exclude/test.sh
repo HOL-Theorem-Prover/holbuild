@@ -63,6 +63,16 @@ if grep -q "selftest\|Generated\|MachineOnly" "$tmpdir/dry.log"; then
   exit 1
 fi
 
+cat > "$project/.holconfig.toml" <<'TOML'
+[build]
+exclude = ["src/local/*"]
+TOML
+if (cd "$project" && "$HOLBUILD_BIN" context) > "$tmpdir/local-glob.log" 2>&1; then
+  echo "glob in local build.exclude unexpectedly accepted" >&2
+  exit 1
+fi
+require_grep ".holconfig.toml build.exclude entries must be concrete paths; use .holconfig.toml build.exclude_globs: src/local/\*" "$tmpdir/local-glob.log"
+
 cat > "$project/deprecated/holproject.toml" <<TOML
 [holbuild]
 schema = 2
@@ -85,6 +95,8 @@ SML
 cat > "$project/deprecated/src/Keep.sml" <<'SML'
 val keep = 1;
 SML
-(cd "$project/deprecated" && "$HOLBUILD_BIN" context) > "$tmpdir/deprecated-context.log" 2> "$tmpdir/deprecated-context.err"
-require_grep "exclude_globs: \*/selftest.sml" "$tmpdir/deprecated-context.log"
-require_grep "build.exclude glob pattern \"\*/selftest.sml\" is deprecated; use build.exclude_globs instead" "$tmpdir/deprecated-context.err"
+if (cd "$project/deprecated" && "$HOLBUILD_BIN" context) > "$tmpdir/deprecated-context.log" 2> "$tmpdir/deprecated-context.err"; then
+  echo "glob in build.exclude unexpectedly accepted" >&2
+  exit 1
+fi
+require_grep "build.exclude entries must be concrete paths; use build.exclude_globs: \*/selftest.sml" "$tmpdir/deprecated-context.err"

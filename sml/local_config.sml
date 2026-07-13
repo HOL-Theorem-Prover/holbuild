@@ -73,9 +73,11 @@ fun build_exclusions table =
       NONE => ([], [])
     | SOME build =>
         let
-          val (excludes, deprecated) = split_deprecated_excludes ".holconfig.toml build.exclude" (string_array_field build "exclude")
-          val globs = package_relative_paths ".holconfig.toml build.exclude_globs" (string_array_field build "exclude_globs")
-        in (excludes, deprecated @ globs) end
+          val excludes = concrete_excludes ".holconfig.toml build.exclude"
+                           (string_array_field build "exclude")
+          val globs = package_relative_paths ".holconfig.toml build.exclude_globs"
+                        (string_array_field build "exclude_globs")
+        in (excludes, globs) end
 
 fun positive_build_int table name =
   case table_field table ["build"] of

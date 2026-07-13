@@ -3,7 +3,6 @@ struct
 
 exception Error of string
 fun die msg = raise Error msg
-fun warn msg = TextIO.output(TextIO.stdErr, "holbuild: warning: " ^ msg ^ "\n")
 
 structure Path = OS.Path
 
@@ -168,17 +167,19 @@ fun concrete_package_relative_path field path =
   end
 
 fun glob_like path = CharVector.exists (fn c => c = #"*" orelse c = #"?") path
-fun split_deprecated_excludes context paths =
+fun concrete_excludes context paths =
   let
-    fun one (path, (excludes, globs)) =
-      if glob_like path then
-        let val path = package_relative_path context path
-        in warn (context ^ " glob pattern \"" ^ path ^ "\" is deprecated; use " ^ context ^ "_globs instead");
-           (excludes, path :: globs)
-        end
-      else (concrete_package_relative_path context path :: excludes, globs)
-    val (excludes, globs) = List.foldl one ([], []) paths
-  in (rev excludes, rev globs) end
+    fun one path =
+      let val path = package_relative_path context path
+      in
+        if glob_like path then
+          die (context ^ " entries must be concrete paths; use " ^ context ^
+               "_globs: " ^ path)
+        else concrete_package_relative_path context path
+      end
+  in
+    map one paths
+  end
 
 fun safe_materialized_dependency_name name =
   size name > 0 andalso name <> "." andalso name <> ".." andalso

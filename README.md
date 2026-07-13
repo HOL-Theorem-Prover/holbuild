@@ -342,7 +342,7 @@ allow_empty = false
 - `exclude` removes concrete package-root-relative paths from discovery; a
   directory entry excludes its subtree, and a file entry excludes just that file.
 - `exclude_globs` removes package-root-relative glob matches from discovery.
-  Deprecated glob patterns in `exclude` are still accepted with a warning.
+  Glob patterns in `exclude` are rejected; place them in `exclude_globs`.
 - `roots` are the default entry points when `holbuild build` is run with no
   target. Entries may be package-root-relative source paths or `@name` build
   group references. Source-path roots must name sources discovered through
