@@ -698,7 +698,7 @@ fun write_test_dependency_graph (graph : resolved_dependency_graph) =
                             ExternalInput => "input") ^
               " " ^ dependency_reason_text reason ^ " " ^ name ^ "\n")
           fun unresolved ({from_node, name, reason} : unresolved_dependency) =
-            TextIO.output(output, "unresolved " ^ safe from_node ^ " "
+            TextIO.output(output, "unresolved " ^ safe from_node ^ " " ^
               dependency_reason_text reason ^ " " ^ name ^ "\n")
           val _ = each_vector symbolic (#symbolic graph)
           val _ = each_vector resolved (#resolved graph)
