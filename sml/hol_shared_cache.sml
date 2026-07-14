@@ -151,7 +151,16 @@ fun generate_hol_source_manifest k =
      members_path = hol_source_members_for_key k}
   handle HolbuildHolSourceManifest.Error msg => die msg
 
-fun hol_source_manifest_built k = readable (hol_source_manifest_for_key k)
+fun hol_source_manifest_built k =
+  let
+    val path = hol_source_manifest_for_key k
+    val input = TextIO.openIn path
+    val first = TextIO.inputLine input
+    val _ = TextIO.closeIn input
+  in
+    first = SOME ("# " ^ HolbuildBuiltinManifests.hol_source_manifest_version ^ "\n")
+  end
+  handle _ => false
 
 fun validate_entry req k =
   let val dir = entry_dir_for_key k

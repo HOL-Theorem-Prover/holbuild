@@ -3534,6 +3534,7 @@ type checkpoint_budget_state =
    max_bytes : Position.int,
    index : checkpoint_index ref,
    watch : checkpoint_watch ref,
+   watch_paths : string list ref,
    index_bases : (string, unit) Binarymap.dict ref,
    refreshed : bool ref,
    mutex : Mutex.mutex}
@@ -3586,6 +3587,11 @@ fun watch_from_families dir families =
   in
     List.foldl add_family with_root families
   end
+
+fun watch_with_paths paths dir families =
+  List.foldl (fn (path, watch) => watch_insert_dir path watch)
+             (watch_from_families dir families)
+             paths
 
 fun bases_set_of families =
   List.foldl
@@ -3645,7 +3651,8 @@ fun create_checkpoint_budget_state project =
      checkpoint_limit_gb = checkpoint_limit_gb,
      max_bytes = gb_to_bytes checkpoint_limit_gb,
      index = ref index,
-     watch = ref (watch_from_families checkpoint_dir (#families index)),
+     watch_paths = ref [checkpoint_dir],
+     watch = ref (watch_with_paths [checkpoint_dir] checkpoint_dir (#families index)),
      index_bases = ref (bases_set_of (#families index)),
      refreshed = ref false,
      mutex = Mutex.mutex ()}
@@ -3660,6 +3667,24 @@ fun warn_checkpoint_budget_error e =
 fun with_checkpoint_budget_lock (state : checkpoint_budget_state) f =
   (Mutex.lock (#mutex state); f () before Mutex.unlock (#mutex state))
   handle e => (Mutex.unlock (#mutex state); raise e)
+
+(* Generated source trees commonly already exist before their checkpoint
+   families are created.  Watching only ancestors of existing families then
+   misses their mtime changes, postponing eviction until the final recovery
+   scan.  Register every scheduled checkpoint base up front so such families
+   are discovered after the node that creates them, without a byte scan. *)
+fun register_checkpoint_budget_bases state bases =
+  with_checkpoint_budget_lock state
+    (fn () =>
+        let
+          val dir = #checkpoint_dir state
+          val paths = unique_strings
+                        (!(#watch_paths state) @
+                         List.concat (map (family_base_ancestors dir) bases))
+        in
+          #watch_paths state := paths;
+          #watch state := watch_with_paths paths dir (#families (!(#index state)))
+        end)
 
 fun enforce_checkpoint_index_locked (state : checkpoint_budget_state) index protected_bases =
   let
@@ -3689,7 +3714,8 @@ fun enforce_checkpoint_budget_state_excluding state protected_bases =
               in
                 #index state := final_index;
                 #index_bases state := bases_set_of (#families final_index);
-                #watch state := watch_from_families (#checkpoint_dir state) (#families final_index)
+                #watch state := watch_with_paths (!(#watch_paths state))
+                                                  (#checkpoint_dir state) (#families final_index)
               end))
         handle e => warn_checkpoint_budget_error e)
 
@@ -3705,7 +3731,7 @@ fun rebuild_and_enforce_checkpoint_budget_state_excluding state protected_bases 
               in
                 #index state := final_index;
                 #index_bases state := bases_set_of (#families final_index);
-                #watch state := watch_from_families dir (#families final_index)
+                #watch state := watch_with_paths (!(#watch_paths state)) dir (#families final_index)
               end))
         handle e => warn_checkpoint_budget_error e)
 
@@ -3732,9 +3758,9 @@ fun refresh_checkpoint_budget_after_node state project node protected_bases =
                    val index' = merge_checkpoint_family_measurements (!(#index state)) measurements
                    val final_index = enforce_checkpoint_index_locked state index' protected_bases
                  in
-                   #index state := final_index;
-                   #index_bases state := bases_set_of (#families final_index);
-                   #watch state := watch_from_families dir (#families final_index);
+                  #index state := final_index;
+                  #index_bases state := bases_set_of (#families final_index);
+                   #watch state := watch_with_paths (!(#watch_paths state)) dir (#families final_index);
                    #refreshed state := true
                  end)
          end)
@@ -4203,6 +4229,8 @@ fun dump_keys_if_requested toolchain_key plan keys =
 fun build (options : build_options) tc project plan toolchain_key jobs =
   let
     val budget_state = create_checkpoint_budget_state project
+    val _ = register_checkpoint_budget_bases budget_state
+              (map (checkpoint_base project) (HolbuildBuildPlan.selected_nodes plan))
     val _ = enforce_checkpoint_budget_state_excluding budget_state []
     val base_context = toolchain_base_context tc
     val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project) toolchain_key plan

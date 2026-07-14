@@ -122,7 +122,14 @@ fun post_toolchain_roots holdir =
   let
     val full = sequence_dirs holdir "tools/build/build-sequence"
     val toolchain = sequence_dirs holdir (HolbuildHolToolchainConfig.sequence_file (#sequence HolbuildHolToolchainConfig.default))
-  in setdiff full toolchain end
+    (* sortingLib is an optional HOL library: it is not named by the default
+       build sequence, but HOLSource's `Libs sortingLib` header form requires
+       its source to be buildable when using the reduced upto-hol toolchain. *)
+    val optional_roots =
+      if is_dir (Path.concat(holdir, "src/sort")) then ["src/sort"] else []
+  in
+    setdiff full toolchain @ optional_roots
+  end
 
 fun split_lines text = String.tokens (fn c => c = #"\n") text
 

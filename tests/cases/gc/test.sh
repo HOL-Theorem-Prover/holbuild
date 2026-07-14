@@ -222,6 +222,55 @@ fi
 require_file "$failure_index_project/.holbuild/checkpoints/.index-v1"
 require_grep "checkpoint-failure-index/src/AScript.sml" "$failure_index_project/.holbuild/checkpoints/.index-v1"
 
+deep_watch_project=$tmpdir/deep-watch-budget-project
+deep_watch_family="$deep_watch_project/.holbuild/checkpoints/deep-watch/deep/nested/GeneratedScript.sml"
+deep_watch_marker="$deep_watch_family.deps/key/deps_loaded.save.ok"
+mkdir -p "$deep_watch_project/deep/nested" "$(dirname "$deep_watch_family")"
+cat > "$deep_watch_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "deep-watch"
+
+[build]
+members = ["deep"]
+TOML
+cat > "$deep_watch_project/.holconfig.toml" <<'TOML'
+[build]
+checkpoint_limit_gb = 1
+jobs = 1
+TOML
+cat > "$deep_watch_project/deep/nested/TriggerScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Trigger";
+val _ = export_theory();
+val _ = OS.Process.system "mkdir -p $deep_watch_family.deps/key && truncate -s 2G $deep_watch_family.deps/key/deps_loaded.save && printf ok > $deep_watch_marker";
+SML
+cat > "$deep_watch_project/deep/nested/CheckScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Check";
+val _ = load "TriggerTheory";
+val _ =
+  if OS.FileSys.access("$deep_watch_marker", []) then
+    raise Fail "deep generated checkpoint budget was not enforced"
+  else raise Fail "forced failure after deep generated checkpoint budget check";
+SML
+if (cd "$deep_watch_project" && "$HOLBUILD_BIN" build CheckTheory) > "$tmpdir/deep-watch-budget.log" 2>&1; then
+  echo "deep watch checkpoint budget fixture unexpectedly succeeded" >&2
+  exit 1
+fi
+require_grep "checkpoint budget: .*evicted=" "$tmpdir/deep-watch-budget.log"
+require_grep "forced failure after deep generated checkpoint budget check" "$tmpdir/deep-watch-budget.log"
+if grep -q "deep generated checkpoint budget was not enforced" "$tmpdir/deep-watch-budget.log"; then
+  echo "checkpoint budget missed a generated family in a pre-existing deep directory" >&2
+  exit 1
+fi
+
 mid_project=$tmpdir/mid-budget-project
 mid_family="$mid_project/.holbuild/checkpoints/mid-budget-generated/src/generated"
 mkdir -p "$mid_project/src"

@@ -126,6 +126,51 @@ fun extract_string_list_args keyword tokens =
         | [] => acc
   in loop tokens [] end
 
+(* Holdep records the dependencies introduced while parsing ordinary ML, but
+   HOLSource's header-only Libs declaration is consumed before it emits those
+   references.  Preserve it explicitly so a header library is planned as a
+   source dependency when its source is available in the implicit HOL package. *)
+fun header_stop_word word =
+  List.exists (fn stop => stop = word)
+    ["val", "fun", "open", "local", "structure", "signature", "datatype",
+     "type", "exception", "Type", "Definition", "Theorem", "Triviality", "Lemma",
+     "Corollary", "Datatype", "Overload", "Inductive", "CoInductive",
+     "End", "Resume", "Finalise"]
+
+fun header_libs tokens =
+  let
+    fun skip_qualifier rest =
+      let
+        fun loop xs =
+          case xs of
+              [] => []
+            | Symbol #"]" :: more => more
+            | _ :: more => loop more
+      in
+        case rest of
+            Symbol #"[" :: more => loop more
+          | _ => rest
+      end
+    fun section current rest libs =
+      case rest of
+          [] => libs
+        | Word "Ancestors" :: more => section "Ancestors" more libs
+        | Word "Libs" :: more => section "Libs" more libs
+        | Word word :: more =>
+            if header_stop_word word then libs
+            else if current = "Libs" then
+              section current (skip_qualifier more) (add_unique word libs)
+            else section current (skip_qualifier more) libs
+        | _ :: more => section current more libs
+    fun find rest =
+      case rest of
+          Word "Theory" :: Word _ :: more => section "" more []
+        | _ :: more => find more
+        | [] => []
+  in
+    sort_unique (find tokens)
+  end
+
 fun extract path =
   let
     val tokens = tokenize (read_all path)
@@ -135,7 +180,7 @@ fun extract path =
   in
     {loads = sort_unique loads, uses = sort_unique uses,
      extra_deps = sort_unique extra_deps,
-     holdep_mentions = holdep_mentions path}
+     holdep_mentions = sort_unique (holdep_mentions path @ header_libs tokens)}
   end
 
 end

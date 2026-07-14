@@ -14,7 +14,7 @@ type t =
     holdep_mentions : string list }
 
 val cache_version = "holbuild-dependencies-cache-v2"
-val extractor_version = "holbuild-hol-analyser-deps-v1"
+val extractor_version = "holbuild-hol-analyser-deps-v2"
 val analyser_path : string option ref = ref NONE
 
 fun set_analyser_path path = analyser_path := SOME path
