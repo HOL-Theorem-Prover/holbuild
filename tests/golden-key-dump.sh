@@ -3,6 +3,10 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 HOLBUILD_BIN=${HOLBUILD_BIN:-"$ROOT/bin/holbuild"}
+# A real toolchain key includes hashes of locally-built HOL binaries.  Keep the
+# checked-in fixture portable while still exercising the complete key algorithm.
+HOLBUILD_DUMP_KEYS_TOOLCHAIN_KEY=${HOLBUILD_DUMP_KEYS_TOOLCHAIN_KEY:-golden-toolchain-v1}
+export HOLBUILD_DUMP_KEYS_TOOLCHAIN_KEY
 export HOLBUILD_ROOT="$ROOT"
 export HOLBUILD_TEST_GLOBAL_CACHE="${HOLBUILD_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/holbuild}"
 GOLDEN_TMPDIR=
@@ -46,15 +50,6 @@ name = "key-dump-fixture"
 [build]
 members = ["src"]
 TOML
-  cat > "$project/src/AScript.sml" <<'SML'
-open HolKernel Parse boolLib bossLib;
-
-val _ = new_theory "A";
-
-val a_thm = store_thm("a_thm", ``T``, ACCEPT_TAC TRUTH);
-
-val _ = export_theory();
-SML
   cat > "$project/src/Util.sml" <<'SML'
 structure Util = struct val n = 1 end
 SML

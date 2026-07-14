@@ -4228,6 +4228,9 @@ fun write_text_atomic path text =
     handle e => (close (); remove_tmp (); raise e)
   end
 
+fun dump_key_label key =
+  String.translate (fn #"\000" => "\\0" | c => str c) key
+
 fun dump_key_row toolchain_key plan keys node =
   let
     val key = HolbuildBuildPlan.key node
@@ -4239,22 +4242,36 @@ fun dump_key_row toolchain_key plan keys node =
         | _ => NONE
     val line =
       case dependency_key of
-          SOME deps_key => String.concat [key, "\t", input_key, "\t", deps_key]
-        | NONE => String.concat [key, "\t", input_key]
+          SOME deps_key => String.concat [dump_key_label key, "\t", input_key, "\t", deps_key]
+        | NONE => String.concat [dump_key_label key, "\t", input_key]
   in
     (key, line)
   end
 
 fun compare_dump_rows ((left, _), (right, _)) = String.compare(left, right)
 
-fun dump_keys_if_requested toolchain_key plan keys =
+(* Key dumps are normally a faithful view of the build's cache keys.  Tests may
+   supply a fixed toolchain identity: real toolchain keys hash platform-built
+   HOL binaries, so using them in a checked-in golden fixture would make that
+   fixture host-specific.  This affects only the diagnostic dump; execution
+   and cache lookup continue to use the real toolchain key. *)
+fun dump_toolchain_key toolchain_key =
+  case OS.Process.getEnv "HOLBUILD_DUMP_KEYS_TOOLCHAIN_KEY" of
+      SOME key => if key = "" then toolchain_key else key
+    | NONE => toolchain_key
+
+fun dump_keys_if_requested config_lines_for_node toolchain_key plan keys =
   case OS.Process.getEnv "HOLBUILD_DUMP_KEYS" of
       NONE => ()
     | SOME path =>
         let
+          val dump_toolchain = dump_toolchain_key toolchain_key
+          val dump_keys =
+            if dump_toolchain = toolchain_key then keys
+            else HolbuildBuildPlan.input_keys config_lines_for_node dump_toolchain plan
           val rows =
             HolbuildBuildPlan.sort_pairs compare_dump_rows
-              (map (dump_key_row toolchain_key plan keys)
+              (map (dump_key_row dump_toolchain plan dump_keys)
                    (HolbuildBuildPlan.selected_nodes plan))
           val text = String.concat (map (fn (_, line) => line ^ "\n") rows)
         in
@@ -4269,7 +4286,7 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
     val _ = enforce_checkpoint_budget_state_excluding budget_state []
     val base_context = toolchain_base_context tc
     val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project) toolchain_key plan
-    val _ = dump_keys_if_requested toolchain_key plan keys
+    val _ = dump_keys_if_requested (build_config_lines_for_node options project) toolchain_key plan keys
     val dat_hash_cache = new_file_hash_cache ()
   in
     let
