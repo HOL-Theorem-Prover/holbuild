@@ -135,6 +135,8 @@ fun universe_nodes ({universe, ...} : t) = universe
 fun selected_nodes ({selected, ...} : t) = selected
 fun lookup ({name_index, ...} : t) = indexed_nodes_named name_index
 fun analysis_state ({analysis, ...} : t) = analysis
+fun dependencies plan node = deps_of (analysis_state plan) node
+fun source_hash plan node = source_hash_of (analysis_state plan) node
 fun direct_project_deps_cache ({direct_project_deps_cache, ...} : t) = direct_project_deps_cache
 
 fun indexed_key_id index node_key =

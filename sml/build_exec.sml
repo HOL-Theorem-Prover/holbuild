@@ -107,7 +107,7 @@ fun copy_rewriting_path {src, dst, replacements} =
 fun source_file node = #source_path (HolbuildBuildPlan.source_of node)
 fun source_artifacts node = #artifacts (HolbuildBuildPlan.source_of node)
 fun source_policy node = #policy (HolbuildBuildPlan.source_of node)
-fun source_deps node = HolbuildBuildPlan.deps_of node
+fun source_deps plan node = HolbuildBuildPlan.dependencies plan node
 fun logical_name node = HolbuildBuildPlan.logical_name node
 fun package node = HolbuildBuildPlan.package node
 fun cache_enabled node = HolbuildProject.action_cache_enabled (source_policy node)
@@ -2736,7 +2736,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
           let val dst = normalize_path (if Path.isAbsolute rel then rel else Path.concat(stage, rel))
           in ensure_parent dst; copy_binary abs dst end)
         (expand_extra_dep (Path.dir (source_file node)) decl)
-    val _ = List.app stage_source_extra_dep (#extra_deps (source_deps node))
+    val _ = List.app stage_source_extra_dep (#extra_deps (source_deps plan node))
     val build_log = Path.concat(stage, "holbuild-build.log")
     val _ =
       (validate_hol_context (#context run_spec);
@@ -2887,7 +2887,7 @@ fun dependency_context_lines plan keys toolchain_key node =
         ["dependency_context_key=" ^ dependency_context_key toolchain_key plan keys node]
     | _ => []
 
-fun action_policy_lines node =
+fun action_policy_lines plan node =
   let
     val policy = source_policy node
     val declared_dep_lines =
@@ -2901,7 +2901,7 @@ fun action_policy_lines node =
           (#package_root (HolbuildBuildPlan.source_of node))
           [HolbuildProject.extra_input_path input]) extra_inputs)
     val source_extra_lines =
-      extra_dep_lines "source_extra_dep" (Path.dir (source_file node)) (#extra_deps (source_deps node))
+      extra_dep_lines "source_extra_dep" (Path.dir (source_file node)) (#extra_deps (source_deps plan node))
   in
     ["cache=" ^ bool_text (HolbuildProject.action_cache_enabled policy),
      "always_reexecute=" ^ bool_text (HolbuildProject.action_always_reexecute policy)] @
@@ -2936,7 +2936,7 @@ fun metadata_core_lines checkpoint_policy project plan keys input_key toolchain_
      "source=" ^ #relative_path source] @
     dependency_context_lines plan keys toolchain_key node @
     proof_timeout_lines checkpoint_policy node @
-    action_policy_lines node @
+    action_policy_lines plan node @
     checkpoint_lines checkpoint_policy project node @
     theorem_boundary_lines theorem_checkpoints
   end
