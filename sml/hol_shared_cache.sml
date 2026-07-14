@@ -134,15 +134,21 @@ fun built holdir =
 fun dirty_status holdir = trim (command_output ("git -C " ^ quote holdir ^ " status --porcelain --ignored=no"))
 fun clean holdir = dirty_status holdir = ""
 
-fun require_build_sequence kernel_variant holdir =
-  case HolbuildHolToolchainConfig.required_sequence_file (toolchain_config kernel_variant) of
-      NONE => ()
-    | SOME rel =>
-        let val path = Path.concat(holdir, rel)
-        in
-          if readable path then ()
-          else die ("selected HOL revision does not provide " ^ rel)
-        end
+fun effective_build_args kernel_variant holdir =
+  let val config = toolchain_config kernel_variant
+  in
+    case HolbuildHolToolchainConfig.required_sequence_file config of
+        NONE => HolbuildHolToolchainConfig.build_args_text config
+      | SOME rel =>
+          if readable (Path.concat(holdir, rel)) then
+            HolbuildHolToolchainConfig.build_args_text config
+          else
+            (TextIO.output
+               (TextIO.stdErr,
+                "holbuild: warning: selected HOL revision does not provide " ^ rel ^
+                "; falling back to full HOL build\n");
+             HolbuildHolToolchainConfig.full_build_args_text config)
+  end
 
 fun generate_hol_source_manifest k =
   HolbuildHolSourceManifest.generate
@@ -296,11 +302,9 @@ fun build_entry req k =
        ensure_dir final;
        run_in_dir final ("git clone " ^ quote (#git req) ^ " " ^ quote hol);
        run_in_dir hol ("git checkout --detach " ^ quote (#rev req));
-       require_build_sequence (#kernel_variant req) hol;
        run_in_dir hol (quote (poly_command ()) ^ " --script tools/smart-configure.sml");
        run_in_dir hol
-         ("bin/build " ^
-          HolbuildHolToolchainConfig.build_args_text (toolchain_config (#kernel_variant req)));
+         ("bin/build " ^ effective_build_args (#kernel_variant req) hol);
        if built hol then () else die ("HOL build did not produce bin/hol, bin/build, and bin/hol.state in " ^ hol);
        generate_hol_source_manifest k;
        if clean hol then () else die ("HOL build left dirty checkout: " ^ hol ^ "\n" ^ dirty_status hol);
