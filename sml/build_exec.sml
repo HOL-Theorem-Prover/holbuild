@@ -225,11 +225,34 @@ fun direct_external_loads plan node =
     (HolbuildBuildPlan.direct_external_theories plan node @
      HolbuildBuildPlan.direct_external_libs plan node)
 
+(* An action `deps` entry orders builds but must not itself be loaded into the
+   HOL session: loading it causes HOL to export the dependency as a theory
+   parent.  Only source-discovered loads/mentions and explicit action `loads`
+   belong in the preload heap. *)
+fun project_preload_deps plan node =
+  let
+    val source = HolbuildBuildPlan.source_of node
+    val deps = source_deps node
+    val load_names =
+      unique_strings
+        (#loads deps @ #holdep_mentions deps @
+         HolbuildProject.action_loads (#policy source))
+    fun signature_companion dep =
+      #kind source = HolbuildSourceIndex.Sml andalso
+      #kind (HolbuildBuildPlan.source_of dep) = HolbuildSourceIndex.Sig andalso
+      HolbuildBuildPlan.package dep = HolbuildBuildPlan.package node andalso
+      HolbuildBuildPlan.logical_name dep = HolbuildBuildPlan.logical_name node
+    fun needed dep = List.exists (fn name => name = HolbuildBuildPlan.logical_name dep) load_names orelse
+                     signature_companion dep
+  in
+    List.filter needed (HolbuildBuildPlan.direct_project_deps plan node)
+  end
+
 fun preload_lines plan node =
   let
     val external_deps = HolbuildBuildPlan.direct_external_theories plan node
     val external_libs = HolbuildBuildPlan.direct_external_libs plan node
-    val project_deps = HolbuildBuildPlan.direct_project_deps plan node
+    val project_deps = project_preload_deps plan node
   in
     map load_theory_line external_deps @
     map load_project_line external_libs @
@@ -3148,6 +3171,16 @@ fun theory_parent_hash_recorded parent_hashes dep =
 fun project_theory_parent_deps parent_hashes plan node =
   List.filter (theory_parent_hash_recorded parent_hashes) (project_theory_deps plan node)
 
+fun same_theory_parent_deps left right =
+  let
+    fun contains node nodes =
+      List.exists (fn candidate => logical_name candidate = logical_name node)
+                  nodes
+  in
+    List.all (fn node => contains node right) left andalso
+    List.all (fn node => contains node left) right
+  end
+
 fun theory_parent_hash_matches dat_hash_cache parent_hashes dep =
   let
     val parent_name = theory_name_from_logical (logical_name dep)
@@ -3182,11 +3215,13 @@ fun metadata_parent_hashes_match dat_hash_cache plan node text =
         val recorded_parent_deps = project_theory_parent_deps recorded_parent_hashes plan node
       in
         (* Metadata is a cache for this check, not an authority on the current
-           child artifact.  Check both sets of recorded parents: this admits
-           ordering-only action dependencies, while still detecting a .dat
-           whose parent table was truncated after its metadata was written. *)
+           child artifact.  The two parent tables must name the same project
+           theories: otherwise either metadata or the child .dat was truncated.
+           Filtering through each table still admits ordering-only action deps,
+           which appear in neither table. *)
+        same_theory_parent_deps child_parent_deps recorded_parent_deps andalso
         List.all (theory_parent_hash_matches dat_hash_cache recorded_parent_hashes)
-                 recorded_parent_deps andalso
+                 child_parent_deps andalso
         List.all (theory_parent_hash_matches dat_hash_cache child_parent_hashes)
                  child_parent_deps
       end
