@@ -24,6 +24,7 @@ type source_node =
     origin : source_origin,
     canonical_artifacts : artifacts,
     policy_id : string,
+    execution_policy_id : string,
     policy : HolbuildProject.action_policy }
 
 type source =
@@ -110,17 +111,20 @@ fun framed fields = String.concat (map frame fields)
 fun framed_list tag values = [tag, Int.toString (length values)] @ values
 
 fun policy_render (HolbuildProject.ActionPolicy
-      {logical, deps, loads, extra_inputs, impure, cache, always_reexecute}) =
-  let
-    fun bool true = "1" | bool false = "0"
-    fun extra (HolbuildProject.ExtraInput {path}) = path
+      {logical, deps, loads, extra_inputs, ...}) =
+  let fun extra (HolbuildProject.ExtraInput {path}) = path
   in
     framed
       (["holbuild-source-policy-v1", logical] @
        framed_list "deps" deps @ framed_list "loads" loads @
-       framed_list "extra" (map extra extra_inputs) @
-       ["flags", bool impure, bool cache, bool always_reexecute])
+       framed_list "extra" (map extra extra_inputs))
   end
+
+fun execution_policy_render (HolbuildProject.ActionPolicy
+      {impure, cache, always_reexecute, ...}) =
+  let fun bool true = "1" | bool false = "0"
+  in framed ["holbuild-source-execution-policy-v1",
+             bool impure, bool cache, bool always_reexecute] end
 
 fun origin_tag DeclaredSource = "declared"
   | origin_tag GeneratedSource = "generated"
@@ -147,6 +151,8 @@ fun make_source package package_id package_root policies generated_paths kind lo
         | Sml => sml_artifacts "" relative_path
         | Sig => sig_artifacts "" relative_path
     val policy_id = HolbuildHash.string_sha256 (policy_render policy)
+    val execution_policy_id =
+      HolbuildHash.string_sha256 (execution_policy_render policy)
     val node =
       {id = source_node_id package_id kind origin logical_name relative_path canonical_artifacts policy_id,
        package_id = package_id,
@@ -156,6 +162,7 @@ fun make_source package package_id package_root policies generated_paths kind lo
        origin = origin,
        canonical_artifacts = canonical_artifacts,
        policy_id = policy_id,
+       execution_policy_id = execution_policy_id,
        policy = policy}
   in
     {node = node,
@@ -352,12 +359,22 @@ fun scan_member name package_id source_root artifact_root policies generated_pat
   else if is_readable member then scan_file name package_id source_root artifact_root policies generated_paths excludes exclude_globs member acc
   else raise Error ("member does not exist: " ^ member)
 
+fun source_graph_package_id package =
+  let val definition = HolbuildProject.package_definition_of package
+  in
+    HolbuildHash.string_sha256
+      (framed
+        ["holbuild-source-graph-package-v1",
+         HolbuildPackageDefinition.source_definition_id definition,
+         HolbuildPackageDefinition.dependency_definition_id definition,
+         HolbuildPackageDefinition.action_dependency_policy_id definition,
+         HolbuildPackageDefinition.action_input_policy_id definition])
+  end
+
 fun discover_package package acc =
   let
     val name = HolbuildProject.package_name package
-    val package_id =
-      HolbuildPackageDefinition.content_id
-        (HolbuildProject.package_definition_of package)
+    val package_id = source_graph_package_id package
     val source_root = HolbuildProject.package_root package
     val artifact_root = HolbuildProject.package_artifact_root package
     val policies = HolbuildProject.package_action_policies package
@@ -392,9 +409,7 @@ fun add_logical_node (node : source_node, entries) =
 
 fun package_inventory package sources : package_inventory =
   let
-    val package_id =
-      HolbuildPackageDefinition.content_id
-        (HolbuildProject.package_definition_of package)
+    val package_id = source_graph_package_id package
     val nodes = map (fn (source : source) => #node source) sources
     fun is_generated (node : source_node) = #origin node = GeneratedSource
     fun node_extra_inputs (node : source_node) =

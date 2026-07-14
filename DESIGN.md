@@ -440,7 +440,13 @@ materializes one immutable dependency graph containing typed symbolic facts,
 reasoned project edges, typed external references, unresolved references, and
 reverse dependents. Topological sorting, action keys, diagnostics, and
 invalidation-facing queries consume that shared resolution rather than
-re-resolving names independently. `.sml` files get a
+re-resolving names independently. Versioned length-delimited canonical
+renderings separately identify the project resolution context, unordered
+selected dependency graph, and root-sensitive ordered plan. They exclude
+machine paths, retrieval locations, and analysis-map state while retaining
+package/component bindings, typed HOL selection, canonical nodes, reasoned
+edges, roots, and final order. Execution-only action policy remains in the
+component/resolution layer but does not perturb selected graph or plan identity. `.sml` files get a
 `.uo` plus an empty companion `.ui` unless a real
 `.sig` companion exists, and same-name signatures are implicit dependencies of
 their implementation. HOL's current

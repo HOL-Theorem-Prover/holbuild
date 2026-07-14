@@ -46,7 +46,7 @@ fun node_text (node : HolbuildSourceIndex.source_node) =
   framed [HolbuildSourceIndex.node_id node,
           #package_id node, #relative_path node, #logical_name node,
           kind_text (#kind node), HolbuildSourceIndex.origin_tag (#origin node),
-          #policy_id node]
+          #policy_id node, #execution_policy_id node]
 
 fun inventory_id inventory =
   hash (["holbuild-package-inventory-v1",

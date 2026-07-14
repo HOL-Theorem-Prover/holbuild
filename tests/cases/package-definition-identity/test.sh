@@ -88,6 +88,19 @@ cp -a "$project" "$project_copy"
 cmp "$tmpdir/first.inventory" "$tmpdir/copy.inventory"
 cmp "$tmpdir/first.components" "$tmpdir/copy.components"
 cmp "$tmpdir/first.graph" "$tmpdir/copy.graph"
+first_graph_id=$(grep '^selected-graph-id ' "$tmpdir/first.graph")
+first_plan_id=$(grep '^selected-plan-id ' "$tmpdir/first.graph")
+
+write_manifest 1.0.0 '"src/A.sml"' false project-first
+(cd "$project" && HOLBUILD_TEST_RESOLVED_GRAPH="$tmpdir/execution-policy.graph" \
+  "$HOLBUILD_BIN" build --dry-run A) > "$tmpdir/execution-policy.plan"
+[[ $(grep '^selected-graph-id ' "$tmpdir/execution-policy.graph") == "$first_graph_id" ]]
+[[ $(grep '^selected-plan-id ' "$tmpdir/execution-policy.graph") == "$first_plan_id" ]]
+
+write_manifest 1.0.0 '"src/B.sml"' true project-first
+(cd "$project" && HOLBUILD_TEST_RESOLVED_GRAPH="$tmpdir/roots.graph" \
+  "$HOLBUILD_BIN" build --dry-run B) > "$tmpdir/roots.plan"
+[[ $(grep '^selected-plan-id ' "$tmpdir/roots.graph") != "$first_plan_id" ]]
 
 write_manifest 1.0.0 '"src/A.sml"' true reordered
 ids > "$tmpdir/reordered.ids"

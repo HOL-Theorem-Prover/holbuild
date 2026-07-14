@@ -155,18 +155,24 @@ fun build_key_index nodes =
 
 type t =
   {universe : node list,
+   roots : node list,
    selected : node list,
    name_index : name_index,
    analysis : HolbuildComponentProvider.analysis_state,
-   dependency_graph : resolved_dependency_graph}
+   dependency_graph : resolved_dependency_graph,
+   selected_graph_id : string,
+   selected_plan_id : string}
 
 fun universe_nodes ({universe, ...} : t) = universe
+fun root_nodes ({roots, ...} : t) = roots
 fun selected_nodes ({selected, ...} : t) = selected
 fun lookup ({name_index, ...} : t) = indexed_nodes_named name_index
 fun analysis_state ({analysis, ...} : t) = analysis
 fun dependencies plan node = deps_of (analysis_state plan) node
 fun source_hash plan node = source_hash_of (analysis_state plan) node
 fun dependency_graph ({dependency_graph, ...} : t) = dependency_graph
+fun selected_graph_id ({selected_graph_id, ...} : t) = selected_graph_id
+fun selected_plan_id ({selected_plan_id, ...} : t) = selected_plan_id
 
 fun indexed_key_id index node_key =
   let
@@ -560,6 +566,18 @@ fun prefetch_reachable_dependencies analysis lookup nodes roots =
     loop roots
   end
 
+fun canonical_frame text = Int.toString (size text) ^ ":" ^ text
+fun canonical_fields values = String.concat (map canonical_frame values)
+fun canonical_list tag values = [tag, Int.toString (length values)] @ values
+fun canonical_insert value values =
+  case values of
+      [] => [value]
+    | existing :: rest =>
+        if String.compare(value, existing) = LESS then value :: values
+        else existing :: canonical_insert value rest
+fun canonical_sort values =
+  List.foldl (fn (value, sorted) => canonical_insert value sorted) [] values
+
 fun dependency_reason_text ExtractedLoad = "extracted-load"
   | dependency_reason_text ExtractedHoldepMention = "holdep-mention"
   | dependency_reason_text DeclaredActionDependency = "declared-dependency"
@@ -658,6 +676,75 @@ fun build_resolved_dependency_graph analysis lookup selected =
      unresolved = unresolved, reverse = reverse}
   end
 
+fun vector_values vector =
+  Vector.foldr (fn ((_, values), acc) => values @ acc) [] vector
+
+fun bound_node_id node =
+  HolbuildHash.string_sha256
+    (canonical_fields
+      ["holbuild-resolved-node-v1", package node,
+       HolbuildSourceIndex.source_id (source_of node)])
+
+fun canonical_node_for nodes node_key =
+  case node_with_key nodes node_key of
+      SOME node => bound_node_id node
+    | NONE => raise Error ("internal canonical dependency node is missing: " ^ node_key)
+
+fun symbolic_text nodes (SymbolicDependency {from_node, name, reason}) =
+  canonical_fields
+    [canonical_node_for nodes from_node, dependency_reason_text reason, name]
+
+fun resolved_edge_text nodes
+      ({from_node, to_node, symbolic_name, reason} : resolved_dependency_edge) =
+  canonical_fields
+    [canonical_node_for nodes from_node, canonical_node_for nodes to_node,
+     dependency_reason_text reason, symbolic_name]
+
+fun external_edge_text nodes
+      ({from_node, name, kind, reason} : external_dependency) =
+  canonical_fields
+    [canonical_node_for nodes from_node,
+     case kind of ExternalTheory => "theory" | ExternalLibrary => "library" |
+                  ExternalInput => "input",
+     dependency_reason_text reason, name]
+
+fun unresolved_edge_text nodes
+      ({from_node, name, reason} : unresolved_dependency) =
+  canonical_fields
+    [canonical_node_for nodes from_node, dependency_reason_text reason, name]
+
+fun selected_graph_text nodes (graph : resolved_dependency_graph) =
+  canonical_fields
+    (["holbuild-selected-dependency-graph-v1"] @
+     canonical_list "nodes" (canonical_sort (map bound_node_id nodes)) @
+     canonical_list "symbolic"
+       (canonical_sort (map (symbolic_text nodes) (vector_values (#symbolic graph)))) @
+     canonical_list "resolved"
+       (canonical_sort (map (resolved_edge_text nodes) (vector_values (#resolved graph)))) @
+     canonical_list "external"
+       (canonical_sort (map (external_edge_text nodes) (vector_values (#external graph)))) @
+     canonical_list "unresolved"
+       (canonical_sort (map (unresolved_edge_text nodes) (vector_values (#unresolved graph)))) @
+     canonical_list "reverse"
+       (canonical_sort (map (resolved_edge_text nodes) (vector_values (#reverse graph)))))
+
+fun selected_graph_identity nodes graph =
+  HolbuildHash.string_sha256 (selected_graph_text nodes graph)
+
+fun selected_plan_text graph_id roots selected =
+  canonical_fields
+    (["holbuild-selected-plan-v1", graph_id] @
+     canonical_list "roots" (map bound_node_id roots) @
+     canonical_list "order" (map bound_node_id selected))
+
+fun selected_plan_identity graph_id roots selected =
+  HolbuildHash.string_sha256 (selected_plan_text graph_id roots selected)
+
+fun selected_graph_canonical_text plan =
+  selected_graph_text (selected_nodes plan) (dependency_graph plan)
+fun selected_plan_canonical_text plan =
+  selected_plan_text (selected_graph_id plan) (root_nodes plan) (selected_nodes plan)
+
 fun reject_graph_unresolved (graph : resolved_dependency_graph) selected =
   let
     fun check node =
@@ -671,7 +758,7 @@ fun reject_graph_unresolved (graph : resolved_dependency_graph) selected =
                          package node ^ ":" ^ relative_path node)
   in List.app check selected end
 
-fun write_test_dependency_graph (graph : resolved_dependency_graph) =
+fun write_test_dependency_graph graph_id plan_id (graph : resolved_dependency_graph) =
   if Vector.length (#symbolic graph) = 0 then ()
   else
   case OS.Process.getEnv "HOLBUILD_TEST_RESOLVED_GRAPH" of
@@ -700,6 +787,8 @@ fun write_test_dependency_graph (graph : resolved_dependency_graph) =
           fun unresolved ({from_node, name, reason} : unresolved_dependency) =
             TextIO.output(output, "unresolved " ^ safe from_node ^ " " ^
               dependency_reason_text reason ^ " " ^ name ^ "\n")
+          val _ = TextIO.output(output, "selected-graph-id " ^ graph_id ^ "\n")
+          val _ = TextIO.output(output, "selected-plan-id " ^ plan_id ^ "\n")
           val _ = each_vector symbolic (#symbolic graph)
           val _ = each_vector resolved (#resolved graph)
           val _ = each_vector reverse (#reverse graph)
@@ -725,12 +814,20 @@ fun plan_selection holdir sources selection =
     val selected =
       HolbuildToolchain.time_phase "dependency.toposort"
         (fn () => topo_sort_resolved reachable roots dependency_graph)
-    val _ = write_test_dependency_graph dependency_graph
+    val selected_graph_id =
+      HolbuildToolchain.time_phase "dependency.graph.identity"
+        (fn () => selected_graph_identity selected dependency_graph)
+    val selected_plan_id =
+      HolbuildToolchain.time_phase "build.plan.identity"
+        (fn () => selected_plan_identity selected_graph_id roots selected)
+    val _ = write_test_dependency_graph selected_graph_id selected_plan_id dependency_graph
     val _ = reject_graph_unresolved dependency_graph selected
     val _ = reject_source_uses analysis selected
   in
-    {universe = nodes, selected = selected, name_index = index, analysis = analysis,
-     dependency_graph = dependency_graph}
+    {universe = nodes, roots = roots, selected = selected, name_index = index, analysis = analysis,
+     dependency_graph = dependency_graph,
+     selected_graph_id = selected_graph_id,
+     selected_plan_id = selected_plan_id}
   end
 
 fun plan_all holdir sources = plan_selection holdir sources AllTargets

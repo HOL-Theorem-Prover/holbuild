@@ -13,6 +13,15 @@ type project_components =
 
 fun frame text = Int.toString (size text) ^ ":" ^ text
 fun framed fields = String.concat (map frame fields)
+fun list_fields tag values = [tag, Int.toString (length values)] @ values
+fun insert_string value values =
+  case values of
+      [] => [value]
+    | existing :: rest =>
+        if String.compare(value, existing) = LESS then value :: values
+        else existing :: insert_string value rest
+fun sort_strings values =
+  List.foldl (fn (value, sorted) => insert_string value sorted) [] values
 fun hash fields = HolbuildHash.string_sha256 (framed fields)
 
 fun inventory_named inventories name =
@@ -46,16 +55,26 @@ fun edge_text ({declaring_package, dependency_name, dependency_package} :
                 HolbuildProjectGraph.edge) =
   framed [declaring_package, dependency_name, dependency_package]
 
+fun resolution_context_text graph instances =
+  let
+    val bindings =
+      sort_strings
+        (map (fn instance =>
+          framed
+            [HolbuildProject.package_identity
+               (HolbuildPackageComponent.package_of instance),
+             HolbuildPackageComponent.id
+               (HolbuildPackageComponent.component_of instance)]) instances)
+    val edges = sort_strings (map edge_text (HolbuildProjectGraph.edges graph))
+  in
+    framed
+      (["holbuild-resolution-context-v2", HolbuildProjectGraph.root graph,
+        HolbuildProjectGraph.hol graph] @
+       list_fields "bindings" bindings @ list_fields "edges" edges)
+  end
+
 fun context_id graph instances =
-  hash
-    (["holbuild-resolution-context-v1", HolbuildProjectGraph.root graph,
-      HolbuildProjectGraph.hol graph] @
-     map (fn instance =>
-       HolbuildProject.package_identity
-         (HolbuildPackageComponent.package_of instance) ^ ":" ^
-       HolbuildPackageComponent.id
-         (HolbuildPackageComponent.component_of instance)) instances @
-     map edge_text (HolbuildProjectGraph.edges graph))
+  HolbuildHash.string_sha256 (resolution_context_text graph instances)
 
 fun write_test_components instances resolution_context_id =
   case OS.Process.getEnv "HOLBUILD_TEST_PACKAGE_COMPONENTS" of
@@ -156,5 +175,7 @@ fun instances ({instances, ...} : project_components) = instances
 fun graph ({graph, ...} : project_components) = graph
 fun resolution_context_id ({resolution_context_id, ...} : project_components) =
   resolution_context_id
+fun canonical_resolution_context ({graph, instances, ...} : project_components) =
+  resolution_context_text graph instances
 
 end
