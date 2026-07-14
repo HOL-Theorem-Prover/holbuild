@@ -298,7 +298,18 @@ project graph per kernel variant; context, source discovery, watching, and HOL
 selection reuse its stable package instances rather than reparsing manifests.
 Commands that need sources then run an explicit impure generator-preparation
 phase before read-only source discovery; metadata-only context does not execute
-generators.
+generators. Source-requiring commands use one layered pipeline:
+
+```text
+package definitions -> resolved package instances -> generator preparation
+-> canonical source inventories -> package components -> resolution context
+-> reachable source analysis -> resolved selected graph -> ordered build plan
+-> action keys and execution
+```
+
+Canonical resolution, selected-graph, and selected-plan identities exclude
+machine paths. Hashing and dependency extraction remain limited to the selected
+reachable frontier.
 
 ### `[dependencies.*]`
 

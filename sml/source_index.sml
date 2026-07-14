@@ -443,8 +443,9 @@ fun write_test_inventory inventories =
           TextIO.closeOut output
         end
 
-fun discover_graph_with_inventories graph : discovery =
+fun discover_prepared_with_inventories preparation : discovery =
   let
+    val graph = HolbuildPackagePrepare.graph preparation
     val pairs = map discover_package_inventory (HolbuildProjectGraph.packages graph)
     val inventories = map #1 pairs
     val sources = by_logical (sort_sources (List.concat (map #2 pairs)))
@@ -452,14 +453,6 @@ fun discover_graph_with_inventories graph : discovery =
   in
     {inventories = inventories, sources = sources}
   end
-
-fun discover_graph graph = #sources (discover_graph_with_inventories graph)
-
-fun discover_prepared_with_inventories preparation =
-  discover_graph_with_inventories (HolbuildPackagePrepare.graph preparation)
-
-fun discover_prepared preparation =
-  #sources (discover_prepared_with_inventories preparation)
 
 fun node_of (source : source) = #node source
 fun node_id (node : source_node) = #id node
