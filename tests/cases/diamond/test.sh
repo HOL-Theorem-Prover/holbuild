@@ -58,11 +58,17 @@ val _ = export_theory();
 SML
 
 dry_log=$tmpdir/dry.log
-(cd "$project" && "$HOLBUILD_BIN" build --dry-run DTheory) > "$dry_log"
+graph_log=$tmpdir/resolved-graph.log
+(cd "$project" && HOLBUILD_TEST_RESOLVED_GRAPH="$graph_log" \
+  "$HOLBUILD_BIN" build --dry-run DTheory) > "$dry_log"
 require_grep "ATheory" "$dry_log"
 require_grep "BTheory" "$dry_log"
 require_grep "CTheory" "$dry_log"
 require_grep "DTheory" "$dry_log"
+require_grep "resolved diamond:src/BScript.sml:BTheory diamond:src/AScript.sml:ATheory extracted-load ATheory" "$graph_log"
+require_grep "resolved diamond:src/CScript.sml:CTheory diamond:src/AScript.sml:ATheory extracted-load ATheory" "$graph_log"
+require_grep "reverse diamond:src/AScript.sml:ATheory diamond:src/BScript.sml:BTheory" "$graph_log"
+require_grep "reverse diamond:src/AScript.sml:ATheory diamond:src/CScript.sml:CTheory" "$graph_log"
 
 (cd "$project" && "$HOLBUILD_BIN" -j2 build DTheory)
 # checkpoints persist after successful builds for incremental rebuilds

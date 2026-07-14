@@ -12,6 +12,37 @@ type node =
 
 type keyed_node = {node : node, input_key : string}
 
+datatype dependency_reason =
+    ExtractedLoad
+  | ExtractedHoldepMention
+  | DeclaredActionDependency
+  | DeclaredActionLoad
+  | DeclaredExtraInput
+  | SignatureCompanionReason
+
+datatype symbolic_dependency =
+  SymbolicDependency of
+    {from_node : string, name : string, reason : dependency_reason}
+
+type resolved_dependency_edge =
+  {from_node : string, to_node : string,
+   symbolic_name : string, reason : dependency_reason}
+
+datatype external_dependency_kind = ExternalTheory | ExternalLibrary | ExternalInput
+type external_dependency =
+  {from_node : string, name : string,
+   kind : external_dependency_kind, reason : dependency_reason}
+
+type unresolved_dependency =
+  {from_node : string, name : string, reason : dependency_reason}
+
+type resolved_dependency_graph =
+  {symbolic : (string * symbolic_dependency list) Vector.vector,
+   resolved : (string * resolved_dependency_edge list) Vector.vector,
+   external : (string * external_dependency list) Vector.vector,
+   unresolved : (string * unresolved_dependency list) Vector.vector,
+   reverse : (string * resolved_dependency_edge list) Vector.vector}
+
 fun source_of ({source, ...} : node) = source
 
 fun source_hash_of analysis ({source, ...} : node) =
@@ -122,14 +153,12 @@ fun build_key_index nodes =
     Vector.fromList (sort_pairs compare_pair_key (enumerate 0 nodes))
   end
 
-type direct_project_deps_cache = (string * node list) Vector.vector
-
 type t =
   {universe : node list,
    selected : node list,
    name_index : name_index,
    analysis : HolbuildComponentProvider.analysis_state,
-   direct_project_deps_cache : direct_project_deps_cache}
+   dependency_graph : resolved_dependency_graph}
 
 fun universe_nodes ({universe, ...} : t) = universe
 fun selected_nodes ({selected, ...} : t) = selected
@@ -137,7 +166,7 @@ fun lookup ({name_index, ...} : t) = indexed_nodes_named name_index
 fun analysis_state ({analysis, ...} : t) = analysis
 fun dependencies plan node = deps_of (analysis_state plan) node
 fun source_hash plan node = source_hash_of (analysis_state plan) node
-fun direct_project_deps_cache ({direct_project_deps_cache, ...} : t) = direct_project_deps_cache
+fun dependency_graph ({dependency_graph, ...} : t) = dependency_graph
 
 fun indexed_key_id index node_key =
   let
@@ -263,36 +292,46 @@ fun direct_project_deps_with analysis lookup nodes node =
                      direct_holdep_project_deps_with analysis lookup node))
   end
 
-fun build_direct_project_deps_cache_with analysis lookup nodes =
-  Vector.fromList
-    (sort_pairs compare_pair_key
-       (map (fn node => (key node, direct_project_deps_with analysis lookup nodes node)) nodes))
-
-fun direct_project_deps_cached cache node =
+fun graph_values index node =
   let
-    val node_key = key node
+    val wanted = key node
     fun search lo hi =
-      if lo > hi then NONE
+      if lo > hi then []
       else
-        let
-          val mid = (lo + hi) div 2
-          val (candidate, deps) = Vector.sub(cache, mid)
+        let val mid = (lo + hi) div 2
+            val (candidate, values) = Vector.sub(index, mid)
         in
-          case String.compare(node_key, candidate) of
+          case String.compare(wanted, candidate) of
               LESS => search lo (mid - 1)
             | GREATER => search (mid + 1) hi
-            | EQUAL => SOME deps
+            | EQUAL => values
         end
-  in
-    search 0 (Vector.length cache - 1)
-  end
+  in search 0 (Vector.length index - 1) end
 
-(* The cache only covers selected (reachable) nodes; any other node falls back to
-   the lazy computation so an unrelated broken source cannot abort planning. *)
+fun node_with_key nodes wanted =
+  List.find (fn node => key node = wanted) nodes
+
+fun symbolic_dependencies plan node =
+  graph_values (#symbolic (dependency_graph plan)) node
+fun resolved_dependency_edges plan node =
+  graph_values (#resolved (dependency_graph plan)) node
+fun external_dependencies plan node =
+  graph_values (#external (dependency_graph plan)) node
+fun unresolved_dependencies plan node =
+  graph_values (#unresolved (dependency_graph plan)) node
+fun reverse_dependency_edges plan node =
+  graph_values (#reverse (dependency_graph plan)) node
+
 fun direct_project_deps plan node =
-  case direct_project_deps_cached (direct_project_deps_cache plan) node of
-      SOME deps => deps
-    | NONE => direct_project_deps_with (analysis_state plan) (lookup plan) (universe_nodes plan) node
+  let
+    val nodes = universe_nodes plan
+    fun target (edge : resolved_dependency_edge) =
+      case node_with_key nodes (#to_node edge) of
+          SOME dependency => dependency
+        | NONE => raise Error ("internal resolved dependency target is missing: " ^ #to_node edge)
+  in
+    unique_nodes (map target (resolved_dependency_edges plan node))
+  end
 
 fun direct_external_theories_with analysis lookup node =
   let
@@ -305,7 +344,10 @@ fun direct_external_theories_with analysis lookup node =
   end
 
 fun direct_external_theories plan node =
-  direct_external_theories_with (analysis_state plan) (lookup plan) node
+  unique_strings
+    (List.mapPartial
+      (fn {name, kind = ExternalTheory, ...} => SOME name | _ => NONE)
+      (external_dependencies plan node))
 
 fun direct_external_libs_with analysis lookup node =
   let
@@ -318,7 +360,19 @@ fun direct_external_libs_with analysis lookup node =
   end
 
 fun direct_external_libs plan node =
-  direct_external_libs_with (analysis_state plan) (lookup plan) node
+  let
+    val dependencies = external_dependencies plan node
+    fun names reason =
+      List.mapPartial
+        (fn {name, kind = ExternalLibrary, reason = reason', ...} =>
+              if reason = reason' then SOME name else NONE
+          | _ => NONE)
+        dependencies
+  in
+    unique_strings
+      (names DeclaredActionLoad @ names ExtractedHoldepMention @
+       names ExtractedLoad)
+  end
 
 fun direct_unresolved_loads_with analysis lookup node =
   let
@@ -330,7 +384,9 @@ fun direct_unresolved_loads_with analysis lookup node =
   end
 
 fun direct_unresolved_loads plan node =
-  direct_unresolved_loads_with (analysis_state plan) (lookup plan) node
+  List.mapPartial
+    (fn {name, reason = ExtractedLoad, ...} => SOME name | _ => NONE)
+    (unresolved_dependencies plan node)
 
 fun direct_unresolved_declared_deps_with lookup node =
   let
@@ -340,7 +396,9 @@ fun direct_unresolved_declared_deps_with lookup node =
   end
 
 fun direct_unresolved_declared_deps plan node =
-  direct_unresolved_declared_deps_with (lookup plan) node
+  List.mapPartial
+    (fn {name, reason = DeclaredActionDependency, ...} => SOME name | _ => NONE)
+    (unresolved_dependencies plan node)
 
 fun reject_unresolved_loads_with analysis lookup plan =
   let
@@ -405,16 +463,53 @@ fun topo_sort_with analysis lookup nodes roots =
     val order = List.foldl (fn (root, acc) => visit [] root acc) [] roots
     val plan = rev order
   in
+    plan
+  end
+
+fun topo_sort analysis nodes roots =
+  let
+    val lookup = nodes_named nodes
+    val plan = topo_sort_with analysis lookup nodes roots
+  in
     reject_unresolved_loads_with analysis lookup plan;
     reject_source_uses analysis plan;
     plan
   end
 
-fun topo_sort analysis nodes roots =
-  topo_sort_with analysis (nodes_named nodes) nodes roots
+fun topo_sort_resolved nodes roots (graph : resolved_dependency_graph) =
+  let
+    val key_index = build_key_index nodes
+    val visited = Array.array(length nodes, false)
+    val active = Array.array(length nodes, false)
+    fun node_id node = indexed_key_id key_index (key node)
+    fun dependencies node =
+      map (fn (edge : resolved_dependency_edge) =>
+        case node_with_key nodes (#to_node edge) of
+            SOME target => target
+          | NONE => raise Error ("internal resolved dependency target is missing: " ^ #to_node edge))
+        (graph_values (#resolved graph) node)
+    fun visit path node order =
+      let val id = node_id node
+      in
+        if Array.sub(visited, id) then order
+        else if Array.sub(active, id) then raise Error (cycle_message path node)
+        else
+          let
+            val _ = Array.update(active, id, true)
+            val order' = List.foldl (fn (dep, acc) => visit (node :: path) dep acc)
+                                      order (dependencies node)
+            val _ = Array.update(active, id, false)
+            val _ = Array.update(visited, id, true)
+          in node :: order' end
+      end
+  in
+    rev (List.foldl (fn (root, order) => visit [] root order) [] roots)
+  end
+
 
 fun transitive_project_deps plan node =
-  topo_sort_with (analysis_state plan) (lookup plan) (universe_nodes plan) (direct_project_deps plan node)
+  topo_sort_resolved (selected_nodes plan) (direct_project_deps plan node)
+    (dependency_graph plan)
 
 fun closure_external_theories plan node =
   unique_strings
@@ -465,6 +560,153 @@ fun prefetch_reachable_dependencies analysis lookup nodes roots =
     loop roots
   end
 
+fun dependency_reason_text ExtractedLoad = "extracted-load"
+  | dependency_reason_text ExtractedHoldepMention = "holdep-mention"
+  | dependency_reason_text DeclaredActionDependency = "declared-dependency"
+  | dependency_reason_text DeclaredActionLoad = "declared-load"
+  | dependency_reason_text DeclaredExtraInput = "extra-input"
+  | dependency_reason_text SignatureCompanionReason = "signature-companion"
+
+fun dependency_pairs nodes values_for =
+  Vector.fromList
+    (sort_pairs compare_pair_key (map (fn node => (key node, values_for node)) nodes))
+
+fun build_resolved_dependency_graph analysis lookup selected =
+  let
+    fun symbolic_for node =
+      let
+        val from = key node
+        val deps = deps_of analysis node
+        fun fact reason name =
+          SymbolicDependency {from_node = from, name = name, reason = reason}
+        val companion =
+          map (fn _ => fact SignatureCompanionReason (logical_name node))
+            (signature_companion_deps_with lookup node)
+      in
+        map (fact ExtractedLoad) (#loads deps) @
+        map (fact ExtractedHoldepMention) (#holdep_mentions deps) @
+        map (fact DeclaredActionDependency) (declared_dependency_names node) @
+        map (fact DeclaredActionLoad) (declared_load_names node) @
+        map (fn input => fact DeclaredExtraInput
+              (HolbuildProject.extra_input_path input))
+          (HolbuildProject.action_extra_inputs (#policy (source_of node))) @
+        companion
+      end
+    fun candidates node reason name =
+      case reason of
+          SignatureCompanionReason => signature_companion_deps_with lookup node
+        | DeclaredExtraInput => []
+        | _ => List.filter (fn candidate => key candidate <> key node) (lookup name)
+    fun resolve_fact node (SymbolicDependency {from_node, name, reason}) =
+      map (fn target =>
+        {from_node = from_node, to_node = key target,
+         symbolic_name = name, reason = reason})
+        (candidates node reason name)
+    fun resolved_for node = List.concat (map (resolve_fact node) (symbolic_for node))
+    fun no_candidate node reason name = null (candidates node reason name)
+    fun external_for node =
+      let
+        fun one (SymbolicDependency {from_node, name, reason}) =
+          case reason of
+              DeclaredActionLoad =>
+                [{from_node = from_node, name = name,
+                  kind = ExternalLibrary, reason = reason}]
+            | DeclaredExtraInput =>
+                [{from_node = from_node, name = name,
+                  kind = ExternalInput, reason = reason}]
+            | _ => if not (no_candidate node reason name) then []
+              else case reason of
+                ExtractedLoad =>
+                  if theory_name name then
+                    [{from_node = from_node, name = name,
+                      kind = ExternalTheory, reason = reason}]
+                  else if external_load_available node name then
+                    [{from_node = from_node, name = name,
+                      kind = ExternalLibrary, reason = reason}]
+                  else []
+              | ExtractedHoldepMention =>
+                  if external_load_available node name then
+                    [{from_node = from_node, name = name,
+                      kind = if theory_name name then ExternalTheory else ExternalLibrary,
+                      reason = reason}]
+                  else []
+              | _ => []
+      in List.concat (map one (symbolic_for node)) end
+    fun unresolved_for node =
+      let
+        fun one (SymbolicDependency {from_node, name, reason}) =
+          if not (no_candidate node reason name) then []
+          else
+            case reason of
+                DeclaredActionDependency =>
+                  [{from_node = from_node, name = name, reason = reason}]
+              | ExtractedLoad =>
+                  if theory_name name orelse external_load_available node name then []
+                  else [{from_node = from_node, name = name, reason = reason}]
+              | _ => []
+      in List.concat (map one (symbolic_for node)) end
+    val symbolic = dependency_pairs selected symbolic_for
+    val resolved = dependency_pairs selected resolved_for
+    val external = dependency_pairs selected external_for
+    val unresolved = dependency_pairs selected unresolved_for
+    val all_edges = List.concat (map resolved_for selected)
+    fun incoming node =
+      List.filter (fn (edge : resolved_dependency_edge) => #to_node edge = key node) all_edges
+    val reverse = dependency_pairs selected incoming
+  in
+    {symbolic = symbolic, resolved = resolved, external = external,
+     unresolved = unresolved, reverse = reverse}
+  end
+
+fun reject_graph_unresolved (graph : resolved_dependency_graph) selected =
+  let
+    fun check node =
+      case graph_values (#unresolved graph) node of
+          [] => ()
+        | {name, reason = DeclaredActionDependency, ...} :: _ =>
+            raise Error ("unresolved action dependency " ^ name ^ " in " ^
+                         package node ^ ":" ^ relative_path node)
+        | {name, ...} :: _ =>
+            raise Error ("unresolved load " ^ name ^ " in " ^
+                         package node ^ ":" ^ relative_path node)
+  in List.app check selected end
+
+fun write_test_dependency_graph (graph : resolved_dependency_graph) =
+  if Vector.length (#symbolic graph) = 0 then ()
+  else
+  case OS.Process.getEnv "HOLBUILD_TEST_RESOLVED_GRAPH" of
+      NONE => ()
+    | SOME path =>
+        let
+          val output = TextIO.openOut path
+          fun each_vector write vector =
+            Vector.app (fn (_, values) => List.app write values) vector
+          fun safe text =
+            String.translate (fn #"\000" => ":" | c => String.str c) text
+          fun symbolic (SymbolicDependency {from_node, name, reason}) =
+            TextIO.output(output, "symbolic " ^ safe from_node ^ " " ^
+              dependency_reason_text reason ^ " " ^ name ^ "\n")
+          fun resolved ({from_node, to_node, symbolic_name, reason} : resolved_dependency_edge) =
+            TextIO.output(output, "resolved " ^ safe from_node ^ " " ^ safe to_node ^ " " ^
+              dependency_reason_text reason ^ " " ^ symbolic_name ^ "\n")
+          fun reverse ({from_node, to_node, symbolic_name, reason} : resolved_dependency_edge) =
+            TextIO.output(output, "reverse " ^ safe to_node ^ " " ^ safe from_node ^ " " ^
+              dependency_reason_text reason ^ " " ^ symbolic_name ^ "\n")
+          fun external ({from_node, name, kind, reason} : external_dependency) =
+            TextIO.output(output, "external " ^ safe from_node ^ " " ^
+              (case kind of ExternalTheory => "theory" | ExternalLibrary => "library" |
+                            ExternalInput => "input") ^
+              " " ^ dependency_reason_text reason ^ " " ^ name ^ "\n")
+          fun unresolved ({from_node, name, reason} : unresolved_dependency) =
+            TextIO.output(output, "unresolved " ^ safe from_node ^ " "
+              dependency_reason_text reason ^ " " ^ name ^ "\n")
+          val _ = each_vector symbolic (#symbolic graph)
+          val _ = each_vector resolved (#resolved graph)
+          val _ = each_vector reverse (#reverse graph)
+          val _ = each_vector external (#external graph)
+          val _ = each_vector unresolved (#unresolved graph)
+        in TextIO.closeOut output end
+
 fun plan_selection holdir sources selection =
   let
     val _ = if holdir = "" then HolbuildDependencies.clear_analyser_path ()
@@ -476,11 +718,19 @@ fun plan_selection holdir sources selection =
     val lookup = indexed_nodes_named index
     val roots = target_roots lookup nodes selection
     val _ = prefetch_reachable_dependencies analysis lookup nodes roots
-    val selected = topo_sort_with analysis lookup nodes roots
-    val direct_project_deps_cache = build_direct_project_deps_cache_with analysis lookup selected
+    val reachable = topo_sort_with analysis lookup nodes roots
+    val dependency_graph =
+      HolbuildToolchain.time_phase "dependency.resolve"
+        (fn () => build_resolved_dependency_graph analysis lookup reachable)
+    val selected =
+      HolbuildToolchain.time_phase "dependency.toposort"
+        (fn () => topo_sort_resolved reachable roots dependency_graph)
+    val _ = write_test_dependency_graph dependency_graph
+    val _ = reject_graph_unresolved dependency_graph selected
+    val _ = reject_source_uses analysis selected
   in
     {universe = nodes, selected = selected, name_index = index, analysis = analysis,
-     direct_project_deps_cache = direct_project_deps_cache}
+     dependency_graph = dependency_graph}
   end
 
 fun plan_all holdir sources = plan_selection holdir sources AllTargets
@@ -837,19 +1087,20 @@ fun lookup_key keys dep =
       SOME (_, input_key) => input_key
     | NONE => raise Error ("missing action key for dependency: " ^ logical_name dep)
 
-fun action_text_with analysis lookup config_lines_for_node toolchain_key external_key nodes keys node =
+fun action_text_with plan config_lines_for_node toolchain_key external_key keys node =
   let
     val source = source_of node
+    val analysis = analysis_state plan
     val source_hash = source_hash_of analysis node
     val project_deps =
       map (fn dep => package dep ^ ":" ^ logical_name dep ^ "@" ^ lookup_key keys dep)
-        (direct_project_deps_with analysis lookup nodes node)
+        (direct_project_deps plan node)
     val external_deps =
       map (fn name => "HOL:" ^ name ^ "@" ^ external_key node "theory" name)
-        (direct_external_theories_with analysis lookup node)
+        (direct_external_theories plan node)
     val external_libs =
       map (fn name => "HOLLIB:" ^ name ^ "@" ^ external_key node "lib" name)
-        (direct_external_libs_with analysis lookup node)
+        (direct_external_libs plan node)
     val policy = #policy source
     val declared_deps = HolbuildProject.action_deps policy
     val declared_loads = HolbuildProject.action_loads policy
@@ -884,39 +1135,39 @@ fun action_text_with analysis lookup config_lines_for_node toolchain_key externa
 
 fun action_text config_lines_for_node toolchain_key plan keys node =
   let val external_key = external_key_lookup toolchain_key
-  in action_text_with (analysis_state plan) (lookup plan) config_lines_for_node toolchain_key external_key (universe_nodes plan) keys node end
+  in action_text_with plan config_lines_for_node toolchain_key external_key keys node end
 
-fun add_input_key_with analysis lookup config_lines_for_node toolchain_key external_key nodes (node, keys) =
-  (key node, hash_text (action_text_with analysis lookup config_lines_for_node toolchain_key external_key nodes keys node)) :: keys
+fun add_input_key_with plan config_lines_for_node toolchain_key external_key (node, keys) =
+  (key node, hash_text (action_text_with plan config_lines_for_node toolchain_key external_key keys node)) :: keys
 
-fun add_input_key config_lines_for_node toolchain_key nodes (node, keys) =
+fun add_input_key config_lines_for_node toolchain_key plan (node, keys) =
   let val external_key = external_key_lookup toolchain_key
-  in
-    let val analysis = HolbuildComponentProvider.new_analysis_state ()
-    in add_input_key_with analysis (nodes_named nodes) config_lines_for_node toolchain_key external_key nodes (node, keys) end
-  end
+  in add_input_key_with plan config_lines_for_node toolchain_key external_key (node, keys) end
 
-fun compute_input_keys_with analysis lookup config_lines_for_node toolchain_key nodes =
+fun compute_input_keys_with plan config_lines_for_node toolchain_key =
   let
+    val analysis = analysis_state plan
+    val lookup = lookup plan
+    val nodes = selected_nodes plan
     val _ = prefetch_external_dependency_sources_with analysis lookup nodes
     val external_timing = new_external_timing ()
     val external_key = external_key_lookup_with_timing external_timing toolchain_key
     val keys =
       List.foldl
         (fn (node, keys) =>
-            add_input_key_with analysis lookup config_lines_for_node toolchain_key external_key nodes (node, keys))
+            add_input_key_with plan config_lines_for_node toolchain_key external_key (node, keys))
         [] nodes
     val _ = emit_external_timing external_timing
   in
     keys
   end
 
-fun input_keys_with analysis lookup config_lines_for_node toolchain_key nodes =
+fun input_keys_with plan config_lines_for_node toolchain_key =
   HolbuildToolchain.time_phase "build.keys"
-    (fn () => compute_input_keys_with analysis lookup config_lines_for_node toolchain_key nodes)
+    (fn () => compute_input_keys_with plan config_lines_for_node toolchain_key)
 
 fun input_keys config_lines_for_node toolchain_key plan =
-  input_keys_with (analysis_state plan) (lookup plan) config_lines_for_node toolchain_key (selected_nodes plan)
+  input_keys_with plan config_lines_for_node toolchain_key
 
 fun input_key_for keys node = lookup_key keys node
 
@@ -926,7 +1177,9 @@ fun print_external_deps_with analysis lookup node =
     | deps => print ("  external theories: " ^ String.concatWith ", " deps ^ "\n")
 
 fun print_external_deps plan node =
-  print_external_deps_with (analysis_state plan) (lookup plan) node
+  case direct_external_theories plan node of
+      [] => ()
+    | deps => print ("  external theories: " ^ String.concatWith ", " deps ^ "\n")
 
 fun print_external_libs_with analysis lookup node =
   case direct_external_libs_with analysis lookup node of
@@ -934,7 +1187,9 @@ fun print_external_libs_with analysis lookup node =
     | deps => print ("  external libs: " ^ String.concatWith ", " deps ^ "\n")
 
 fun print_external_libs plan node =
-  print_external_libs_with (analysis_state plan) (lookup plan) node
+  case direct_external_libs plan node of
+      [] => ()
+    | deps => print ("  external libs: " ^ String.concatWith ", " deps ^ "\n")
 
 fun print_project_deps_with analysis lookup nodes node =
   case direct_project_deps_with analysis lookup nodes node of
@@ -943,7 +1198,10 @@ fun print_project_deps_with analysis lookup nodes node =
                      String.concatWith ", " (map logical_name deps) ^ "\n")
 
 fun print_project_deps plan node =
-  print_project_deps_with (analysis_state plan) (lookup plan) (universe_nodes plan) node
+  case direct_project_deps plan node of
+      [] => ()
+    | deps => print ("  project deps: " ^
+                     String.concatWith ", " (map logical_name deps) ^ "\n")
 
 fun describe_node_with analysis lookup nodes keys node =
   (HolbuildSourceIndex.describe_source (source_of node);
@@ -953,14 +1211,18 @@ fun describe_node_with analysis lookup nodes keys node =
    print_external_libs_with analysis lookup node)
 
 fun describe_node plan keys node =
-  describe_node_with (analysis_state plan) (lookup plan) (universe_nodes plan) keys node
+  (HolbuildSourceIndex.describe_source (source_of node);
+   print ("  input_key: " ^ input_key_for keys node ^ "\n");
+   print_project_deps plan node;
+   print_external_deps plan node;
+   print_external_libs plan node)
 
 fun describe config_lines_for_node toolchain_key plan =
   let
     val nodes = selected_nodes plan
     val keys = input_keys config_lines_for_node toolchain_key plan
   in
-    List.app (describe_node_with (analysis_state plan) (lookup plan) (universe_nodes plan) keys) nodes
+    List.app (describe_node plan keys) nodes
   end
 
 end

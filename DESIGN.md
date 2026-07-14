@@ -435,7 +435,12 @@ selection. Dependency extraction remains a per-node provider request, preserving
 reachable-frontier laziness. Planner nodes are immutable resolved source views;
 source digests and extracted symbolic facts live in an explicit plan-scoped
 provider analysis state keyed by canonical node ID, rather than mutable refs
-embedded in every node. `.sml` files get a
+embedded in every node. For the selected reachable closure, planning then
+materializes one immutable dependency graph containing typed symbolic facts,
+reasoned project edges, typed external references, unresolved references, and
+reverse dependents. Topological sorting, action keys, diagnostics, and
+invalidation-facing queries consume that shared resolution rather than
+re-resolving names independently. `.sml` files get a
 `.uo` plus an empty companion `.ui` unless a real
 `.sig` companion exists, and same-name signatures are implicit dependencies of
 their implementation. HOL's current
