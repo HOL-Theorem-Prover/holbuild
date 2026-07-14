@@ -3,7 +3,6 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 HOLBUILD_BIN=${HOLBUILD_BIN:-"$ROOT/bin/holbuild"}
-TESTBED=${HOLBUILD_TESTBED:-"$HOME/dev/vyper-automation/repo"}
 export HOLBUILD_ROOT="$ROOT"
 export HOLBUILD_TEST_GLOBAL_CACHE="${HOLBUILD_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/holbuild}"
 GOLDEN_TMPDIR=
@@ -26,7 +25,6 @@ usage:
 
 Environment:
   HOLBUILD_BIN       holbuild binary to run (default: ./bin/holbuild)
-  HOLBUILD_TESTBED   optional large project (default: ~/dev/vyper-automation/repo)
 USAGE
   exit 2
 }
@@ -82,14 +80,6 @@ capture_all() {
   write_fixture "$tmpdir/fixture"
   capture_project "$tmpdir/fixture" "$out_dir/fixture.keys"
 
-  if [[ -f "$TESTBED/holproject.toml" ]]; then
-    if ! capture_project "$TESTBED" "$out_dir/vyper-automation.keys"; then
-      rm -f "$out_dir/vyper-automation.keys"
-      printf 'skipping optional test-bed after capture failure: %s\n' "$TESTBED" >&2
-    fi
-  else
-    printf 'skipping optional test-bed: %s\n' "$TESTBED" >&2
-  fi
 }
 
 diff_file_if_present() {
@@ -107,7 +97,6 @@ diff_all() {
   local baseline_dir=$1
   local new_dir=$2
   diff_file_if_present "$baseline_dir/fixture.keys" "$new_dir/fixture.keys"
-  diff_file_if_present "$baseline_dir/vyper-automation.keys" "$new_dir/vyper-automation.keys"
 }
 
 case "${1:-}" in

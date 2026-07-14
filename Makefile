@@ -9,14 +9,14 @@ VENDORED_SHA256_FILES := $(wildcard vendor/sml-sha256/lib/*.sig vendor/sml-sha25
 
 .PHONY: all check-vendored-hol install uninstall test golden-key-dump-check clean
 
+all: bin/holbuild
+
 GOLDEN_KEY_BASELINE := tests/golden/key-dumps
 
 golden-key-dump-check: bin/holbuild
 	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
-	HOLDIR="$(HOLDIR)" HOLBUILD_HOLDIR="$(HOLBUILD_HOLDIR)" HOLBUILD_TESTBED=/nonexistent tests/golden-key-dump.sh capture "$$tmp"; \
+	HOLDIR="$(HOLDIR)" HOLBUILD_HOLDIR="$(HOLBUILD_HOLDIR)" tests/golden-key-dump.sh capture "$$tmp"; \
 	tests/golden-key-dump.sh diff "$(GOLDEN_KEY_BASELINE)" "$$tmp";
-
-all: bin/holbuild
 
 check-vendored-hol:
 	@test -s vendor/hol/REV || (echo "missing vendor/hol/REV" >&2; exit 1)
