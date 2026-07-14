@@ -432,7 +432,10 @@ live generator preparation are explicit component properties rather than part
 of canonical component identity. Project resolution context has a separate
 identity over package instances, components, declaration edges, and HOL
 selection. Dependency extraction remains a per-node provider request, preserving
-reachable-frontier laziness. `.sml` files get a
+reachable-frontier laziness. Planner nodes are immutable resolved source views;
+source digests and extracted symbolic facts live in an explicit plan-scoped
+provider analysis state keyed by canonical node ID, rather than mutable refs
+embedded in every node. `.sml` files get a
 `.uo` plus an empty companion `.ui` unless a real
 `.sig` companion exists, and same-name signatures are implicit dependencies of
 their implementation. HOL's current

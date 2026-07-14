@@ -95,21 +95,57 @@ type node_analysis =
    source_hash : string,
    symbolic_dependencies : HolbuildDependencies.t}
 
+type analysis_state =
+  {hashes : (string * string) list ref,
+   analyses : (string * node_analysis) list ref}
+
+fun new_analysis_state () : analysis_state = {hashes = ref [], analyses = ref []}
+
+fun lookup key entries =
+  Option.map #2 (List.find (fn (candidate, _) => candidate = key) entries)
+
+fun analysis_key (source : HolbuildSourceIndex.source) =
+  #package source ^ "\000" ^ HolbuildSourceIndex.source_id source
+
+fun source_hash ({hashes, ...} : analysis_state) source =
+  let val key = analysis_key source
+  in
+    case lookup key (!hashes) of
+        SOME value => value
+      | NONE =>
+          let
+            val value = HolbuildToolchain.time_phase "source.hash"
+                          (fn () => HolbuildHash.file_sha1 (#source_path source))
+          in hashes := (key, value) :: !hashes; value end
+  end
+
 (* Live providers analyse only an explicitly requested frontier node. Future
    immutable and incremental providers implement this same request without
    changing component consumers. The immutable result keeps extracted symbolic
    facts separate from project-wide resolved edges. *)
-fun analyse LiveProvider {source, cache_path, source_hash} : node_analysis =
+fun analyse LiveProvider state {source, cache_path} : node_analysis =
   let
-    val symbolic_dependencies =
-      HolbuildDependencies.extract_cached_with_hash
-        {cache_path = cache_path,
-         source_path = #source_path (source : HolbuildSourceIndex.source),
-         source_hash = source_hash}
+    val id = HolbuildSourceIndex.source_id source
+    val key = analysis_key source
   in
-    {node_id = HolbuildSourceIndex.source_id source,
-     source_hash = source_hash,
-     symbolic_dependencies = symbolic_dependencies}
+    case lookup key (!(#analyses (state : analysis_state))) of
+        SOME analysis => analysis
+      | NONE =>
+          let
+            val source_hash = source_hash state source
+            val symbolic_dependencies =
+              HolbuildToolchain.time_phase "dependency.extract"
+                (fn () => HolbuildDependencies.extract_cached_with_hash
+                  {cache_path = cache_path,
+                   source_path = #source_path (source : HolbuildSourceIndex.source),
+                   source_hash = source_hash})
+            val analysis =
+              {node_id = id, source_hash = source_hash,
+               symbolic_dependencies = symbolic_dependencies}
+          in
+            #analyses state := (key, analysis) :: !(#analyses state);
+            analysis
+          end
   end
 
 fun analysis_dependencies ({symbolic_dependencies, ...} : node_analysis) =
