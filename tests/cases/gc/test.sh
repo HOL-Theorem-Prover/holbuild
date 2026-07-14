@@ -561,6 +561,25 @@ if [[ -s "$scan_counter" ]]; then
   exit 1
 fi
 
+# A failed atomic index write must leave the dirty marker behind.  Otherwise a
+# later build trusts the last valid-but-stale index and can let checkpoint data
+# grow past the configured budget after ENOSPC or another persistence failure.
+mkdir "$scan_project/.holbuild/checkpoints/.index-v1.tmp"
+(cd "$scan_project" && "$HOLBUILD_BIN" build --force=project --no-cache ScanTheory) > "$tmpdir/scan-index-write-failure.log" 2>&1
+require_grep "could not persist checkpoint index" "$tmpdir/scan-index-write-failure.log"
+require_file "$scan_project/.holbuild/checkpoints/.index-dirty"
+rmdir "$scan_project/.holbuild/checkpoints/.index-v1.tmp"
+rm -f "$scan_counter"
+(cd "$scan_project" && HOLBUILD_CHECKPOINT_SCAN_COUNTER="$scan_counter" "$HOLBUILD_BIN" build ScanTheory) > "$tmpdir/scan-dirty-recovery.log" 2>&1
+if [[ ! -s "$scan_counter" ]]; then
+  echo "dirty checkpoint index was trusted instead of rebuilt" >&2
+  exit 1
+fi
+if [[ -e "$scan_project/.holbuild/checkpoints/.index-dirty" ]]; then
+  echo "checkpoint dirty marker remained after a successful index rebuild" >&2
+  exit 1
+fi
+
 perf_scan_project=$tmpdir/perf-scan-project
 mkdir -p "$perf_scan_project/src1" "$perf_scan_project/src2"
 cat > "$perf_scan_project/holproject.toml" <<TOML

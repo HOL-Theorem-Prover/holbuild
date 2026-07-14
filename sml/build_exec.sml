@@ -3571,6 +3571,7 @@ type checkpoint_budget_state =
    watch : checkpoint_watch ref,
    watch_paths : string list ref,
    index_bases : (string, unit) Binarymap.dict ref,
+   index_persisted : bool ref,
    refreshed : bool ref,
    mutex : Mutex.mutex}
 
@@ -3689,12 +3690,15 @@ fun create_checkpoint_budget_state project =
      watch_paths = ref [checkpoint_dir],
      watch = ref (watch_with_paths [checkpoint_dir] checkpoint_dir (#families index)),
      index_bases = ref (bases_set_of (#families index)),
+     index_persisted = ref false,
      refreshed = ref false,
      mutex = Mutex.mutex ()}
   end
 
 fun clear_checkpoint_index_dirty (state : checkpoint_budget_state) =
-  remove_file (checkpoint_index_dirty_path (#checkpoint_dir state))
+  if !(#index_persisted state) then
+    remove_file (checkpoint_index_dirty_path (#checkpoint_dir state))
+  else ()
 
 fun warn_checkpoint_budget_error e =
   warn ("checkpoint budget maintenance failed: " ^ General.exnMessage e)
@@ -3723,6 +3727,10 @@ fun register_checkpoint_budget_bases state bases =
 
 fun enforce_checkpoint_index_locked (state : checkpoint_budget_state) index protected_bases =
   let
+    (* The dirty marker may only be cleared after the latest index state reaches
+       disk.  In particular, an ENOSPC while replacing the index must force the
+       next build to rescan rather than trust the previous, stale index. *)
+    val _ = #index_persisted state := false
     val (evicted_index, eviction) =
       evict_from_index_excluding index (#max_bytes state) protected_bases
     val _ = checkpoint_budget_warnings (#checkpoint_limit_gb state) eviction
@@ -3733,7 +3741,8 @@ fun enforce_checkpoint_index_locked (state : checkpoint_budget_state) index prot
       else evicted_index
     (* Persisting the index must never fail the build: eviction already happened
        and the in-memory index is returned regardless. *)
-    val _ = write_checkpoint_index_atomically final_index
+    val _ = (write_checkpoint_index_atomically final_index;
+             #index_persisted state := true)
             handle e => warn ("could not persist checkpoint index: " ^ General.exnMessage e)
   in
     final_index
