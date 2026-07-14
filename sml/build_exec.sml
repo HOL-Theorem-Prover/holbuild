@@ -3923,30 +3923,6 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
     val checkpoints_possible = List.exists node_may_create_checkpoints selected
 
     val empty_protected_bases : string Binaryset.set = Binaryset.empty String.compare
-    val protected_bases_cache = Array.array (node_count, NONE : string Binaryset.set option)
-
-    fun protected_bases_for_id id =
-      case Array.sub (protected_bases_cache, id) of
-          SOME bases => bases
-        | NONE =>
-            let
-              val node = Vector.sub (nodes, id)
-              val deps = HolbuildBuildPlan.direct_project_deps plan node
-              val bases =
-                List.foldl
-                  (fn (dep, acc) => Binaryset.union (protected_bases_for_id (node_id dep), acc))
-                  (Binaryset.add (empty_protected_bases, checkpoint_base project node))
-                  deps
-            in
-              Array.update (protected_bases_cache, id, SOME bases);
-              bases
-            end
-
-    fun precompute_protected_bases id =
-      if id >= node_count then ()
-      else (ignore (protected_bases_for_id id); precompute_protected_bases (id + 1))
-
-    val _ = if checkpoints_possible then precompute_protected_bases 0 else ()
 
     fun mark_active_node id =
       (Array.update (active_nodes, id, true);
@@ -4109,7 +4085,13 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
     fun protected_bases_for_ids ids =
       Binaryset.listItems
         (List.foldl
-           (fn (id, acc) => Binaryset.union (protected_bases_for_id id, acc))
+           (* A child resumes only from a heap in its own checkpoint family.
+              Project dependencies are loaded from ordinary .uo/.dat artifacts,
+              so protecting their checkpoint families pins completed, unused
+              state and can defeat the configured budget on a wide/deep graph. *)
+           (fn (id, acc) =>
+               Binaryset.add
+                 (acc, checkpoint_base project (Vector.sub (nodes, id))))
            empty_protected_bases
            ids)
 

@@ -702,8 +702,10 @@ The project-local checkpoint budget defaults to 5 GiB and can be configured with
 `.holconfig.toml`'s local `[build].checkpoint_limit_gb`; old checkpoint families
 are evicted when the budget is exceeded at build start/end and between completed
 build nodes. Mid-build eviction excludes checkpoint families that may be referenced
-by currently running PolyML child heaps, so the effective floor is the size of the
-live protected family set.
+by currently running PolyML child heaps. Each child can resume only from its own
+node's checkpoint family; resolved project dependencies are loaded from ordinary
+theory/object artifacts, so completed dependency checkpoint families remain
+evictable. The effective floor is therefore the size of the active node families.
 `--skip-checkpoints` disables all `.save`/`.ok` creation while still running
 modern theorem proofs through the selected instrumentation runtime. `--skip-proof-steps`
 opts out of theorem instrumentation: with checkpoints still enabled, the build can

@@ -380,6 +380,76 @@ if grep -q "protected active family was evicted" "$tmpdir/protected-active.log";
   exit 1
 fi
 
+dependency_project=$tmpdir/evict-completed-dependency-project
+dependency_family="$dependency_project/.holbuild/checkpoints/evict-completed-dependency/src/DependencyScript.sml"
+dependency_live="$dependency_family.deps/live/deps_loaded.save"
+dependency_slow_started=$tmpdir/evict-completed-dependency-slow-started
+mkdir -p "$dependency_project/src" "$dependency_family.deps/seed"
+cat > "$dependency_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "evict-completed-dependency"
+
+[build]
+members = ["src"]
+TOML
+cat > "$dependency_project/.holconfig.toml" <<'TOML'
+[build]
+checkpoint_limit_gb = 1
+jobs = 2
+TOML
+printf 'seed\n' > "$dependency_family.deps/seed/deps_loaded.save"
+printf 'ok\n' > "$dependency_family.deps/seed/deps_loaded.save.ok"
+cat > "$dependency_project/src/DependencyScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Dependency";
+val _ = export_theory();
+val _ = OS.Process.system "mkdir -p $dependency_family.deps/live && truncate -s 2G $dependency_live && printf ok > $dependency_live.ok";
+SML
+cat > "$dependency_project/src/SlowDependentScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "SlowDependent";
+val _ = load "DependencyTheory";
+val started = TextIO.openOut "$dependency_slow_started";
+val _ = (TextIO.output(started, "started\n"); TextIO.closeOut started);
+val _ = OS.Process.sleep (Time.fromSeconds 4);
+val _ =
+  if OS.FileSys.access("$dependency_live.ok", []) then
+    raise Fail "completed dependency family remained protected"
+  else ();
+val _ = export_theory();
+SML
+cat > "$dependency_project/src/TriggerScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Trigger";
+val _ =
+  let
+    fun wait 0 = raise Fail "dependent did not start"
+      | wait remaining =
+          if OS.FileSys.access("$dependency_slow_started", []) then ()
+          else (OS.Process.sleep (Time.fromMilliseconds 20); wait (remaining - 1))
+  in
+    wait 300
+  end;
+val _ = export_theory();
+SML
+if ! (cd "$dependency_project" && "$HOLBUILD_BIN" build --force=project --no-cache) > "$tmpdir/evict-completed-dependency.log" 2>&1; then
+  echo "completed dependency checkpoint family was retained while its dependent was active" >&2
+  cat "$tmpdir/evict-completed-dependency.log" >&2
+  exit 1
+fi
+require_grep "checkpoint budget: .*checkpoint_limit_gb=1" "$tmpdir/evict-completed-dependency.log"
+if [[ -e "$dependency_live.ok" ]]; then
+  echo "checkpoint budget retained a completed dependency family" >&2
+  exit 1
+fi
+
 gate_project=$tmpdir/checkpoint-maintenance-gate-project
 gate_family="$gate_project/.holbuild/checkpoints/checkpoint-maintenance-gate/src/DependentScript.sml"
 gate_trash="$gate_project/.holbuild/checkpoints/checkpoint-maintenance-gate/src/TrashScript.sml"
