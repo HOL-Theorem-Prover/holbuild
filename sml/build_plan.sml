@@ -55,8 +55,7 @@ fun dependency_cache_path source =
 
 fun deps_of analysis ({source, ...} : node) =
   HolbuildComponentProvider.analysis_dependencies
-    (HolbuildComponentProvider.analyse HolbuildComponentProvider.LiveProvider
-      analysis {cache_path = dependency_cache_path source, source = source})
+    (HolbuildComponentProvider.analyse analysis {cache_path = dependency_cache_path source, source = source})
 fun external_dirs_of ({external_dirs, ...} : node) = external_dirs
 fun logical_name node = #logical_name (source_of node)
 fun package node = #package (source_of node)
@@ -160,8 +159,10 @@ type t =
    name_index : name_index,
    analysis : HolbuildComponentProvider.analysis_state,
    dependency_graph : resolved_dependency_graph,
+   resolution_context_id : string,
    selected_graph_id : string,
-   selected_plan_id : string}
+   selected_plan_id : string,
+   resolved_plan_id : string}
 
 fun universe_nodes ({universe, ...} : t) = universe
 fun root_nodes ({roots, ...} : t) = roots
@@ -171,8 +172,10 @@ fun analysis_state ({analysis, ...} : t) = analysis
 fun dependencies plan node = deps_of (analysis_state plan) node
 fun source_hash plan node = source_hash_of (analysis_state plan) node
 fun dependency_graph ({dependency_graph, ...} : t) = dependency_graph
+fun resolution_context_id ({resolution_context_id, ...} : t) = resolution_context_id
 fun selected_graph_id ({selected_graph_id, ...} : t) = selected_graph_id
 fun selected_plan_id ({selected_plan_id, ...} : t) = selected_plan_id
+fun resolved_plan_id ({resolved_plan_id, ...} : t) = resolved_plan_id
 
 fun indexed_key_id index node_key =
   let
@@ -215,15 +218,24 @@ fun theory_name name =
     n > m andalso String.substring(name, n - m, m) = suffix
   end
 
-fun declared_dependency_names node =
-  HolbuildProject.action_deps (#policy (source_of node))
-
-fun declared_load_names node =
-  HolbuildProject.action_loads (#policy (source_of node))
-
-fun bootstrap_dependency_names analysis node =
-  unique_strings
-    (#loads (deps_of analysis node) @ declared_dependency_names node @ declared_load_names node)
+fun bootstrap_dependency_names components analysis node =
+  let
+    fun logical fact =
+      case fact of
+          HolbuildPackageComponent.LogicalReference
+            {logical_name, reason = HolbuildPackageComponent.DeclaredDependency, ...} =>
+              SOME logical_name
+        | HolbuildPackageComponent.LogicalReference
+            {logical_name, reason = HolbuildPackageComponent.DeclaredLoad, ...} =>
+              SOME logical_name
+        | _ => NONE
+    val declared =
+      List.mapPartial logical
+        (HolbuildComponentProvider.component_symbolic_facts
+          components (source_of node))
+  in
+    unique_strings (#loads (deps_of analysis node) @ declared)
+  end
 
 fun unique_nodes nodes =
   let
@@ -262,10 +274,10 @@ fun signature_companion_deps_with lookup node =
 fun signature_companion_deps nodes node =
   signature_companion_deps_with (nodes_named nodes) node
 
-fun bootstrap_project_deps analysis lookup nodes node =
+fun bootstrap_project_deps components analysis lookup nodes node =
   let
     fun not_self candidate = key candidate <> key node
-    val named_deps = List.concat (map lookup (bootstrap_dependency_names analysis node))
+    val named_deps = List.concat (map lookup (bootstrap_dependency_names components analysis node))
   in
     unique_nodes (List.filter not_self
                     (signature_companion_deps_with lookup node @ named_deps @
@@ -351,7 +363,7 @@ fun cycle_message path node =
   "dependency cycle: " ^
   String.concatWith " -> " (rev (logical_name node :: map logical_name path))
 
-fun bootstrap_topo_sort analysis lookup nodes roots =
+fun bootstrap_topo_sort components analysis lookup nodes roots =
   let
     val key_index = build_key_index nodes
     val visited = Array.array (length nodes, false)
@@ -365,7 +377,7 @@ fun bootstrap_topo_sort analysis lookup nodes roots =
         else
           let
             val _ = Array.update(active, id, true)
-            val deps = bootstrap_project_deps analysis lookup nodes node
+            val deps = bootstrap_project_deps components analysis lookup nodes node
             val order' = List.foldl (fn (dep, acc) => visit (node :: active_path) dep acc) order deps
             val _ = Array.update(active, id, false)
             val _ = Array.update(visited, id, true)
@@ -437,7 +449,7 @@ fun bootstrap_prefetch_nodes analysis nodes =
    frontier at a time instead of prefetching every source in the universe.
    Mark a frontier expanded before following its edges so cycles terminate;
    bootstrap_topo_sort subsequently provides the usual cycle diagnostics and order. *)
-fun bootstrap_reachable_frontier analysis lookup nodes roots =
+fun bootstrap_reachable_frontier components analysis lookup nodes roots =
   let
     val key_index = build_key_index nodes
     val expanded = Array.array(length nodes, false)
@@ -458,7 +470,7 @@ fun bootstrap_reachable_frontier analysis lookup nodes roots =
           [] => ()
         | fresh =>
             (bootstrap_prefetch_nodes analysis fresh;
-             loop (List.concat (map (bootstrap_project_deps analysis lookup nodes) fresh)))
+             loop (List.concat (map (bootstrap_project_deps components analysis lookup nodes) fresh)))
   in
     loop roots
   end
@@ -486,7 +498,7 @@ fun dependency_pairs nodes values_for =
   Vector.fromList
     (sort_pairs compare_pair_key (map (fn node => (key node, values_for node)) nodes))
 
-fun build_resolved_dependency_graph analysis lookup selected =
+fun build_resolved_dependency_graph components analysis lookup selected =
   let
     fun symbolic_for node =
       let
@@ -494,18 +506,30 @@ fun build_resolved_dependency_graph analysis lookup selected =
         val deps = deps_of analysis node
         fun fact reason name =
           SymbolicDependency {from_node = from, name = name, reason = reason}
-        val companion =
-          map (fn _ => fact SignatureCompanionReason (logical_name node))
-            (signature_companion_deps_with lookup node)
+        fun component_fact symbolic =
+          case symbolic of
+              HolbuildPackageComponent.LogicalReference
+                {logical_name, reason, ...} =>
+                  fact
+                    (case reason of
+                        HolbuildPackageComponent.DeclaredDependency =>
+                          DeclaredActionDependency
+                      | HolbuildPackageComponent.DeclaredLoad =>
+                          DeclaredActionLoad
+                      | HolbuildPackageComponent.SignatureCompanion =>
+                          SignatureCompanionReason
+                      | HolbuildPackageComponent.DeclaredExtraInput =>
+                          raise Error "internal logical extra-input component fact")
+                    logical_name
+            | HolbuildPackageComponent.InputReference {relative_path, ...} =>
+                fact DeclaredExtraInput relative_path
+        val declared =
+          map component_fact
+            (HolbuildComponentProvider.component_symbolic_facts
+              components (source_of node))
       in
         map (fact ExtractedLoad) (#loads deps) @
-        map (fact ExtractedHoldepMention) (#holdep_mentions deps) @
-        map (fact DeclaredActionDependency) (declared_dependency_names node) @
-        map (fact DeclaredActionLoad) (declared_load_names node) @
-        map (fn input => fact DeclaredExtraInput
-              (HolbuildProject.extra_input_path input))
-          (HolbuildProject.action_extra_inputs (#policy (source_of node))) @
-        companion
+        map (fact ExtractedHoldepMention) (#holdep_mentions deps) @ declared
       end
     fun candidates node reason name =
       case reason of
@@ -655,7 +679,7 @@ fun reject_graph_unresolved (graph : resolved_dependency_graph) selected =
                          package node ^ ":" ^ relative_path node)
   in List.app check selected end
 
-fun write_test_dependency_graph graph_id plan_id (graph : resolved_dependency_graph) =
+fun write_test_dependency_graph graph_id plan_id resolved_id (graph : resolved_dependency_graph) =
   if Vector.length (#symbolic graph) = 0 then ()
   else
   case OS.Process.getEnv "HOLBUILD_TEST_RESOLVED_GRAPH" of
@@ -686,6 +710,7 @@ fun write_test_dependency_graph graph_id plan_id (graph : resolved_dependency_gr
               dependency_reason_text reason ^ " " ^ name ^ "\n")
           val _ = TextIO.output(output, "selected-graph-id " ^ graph_id ^ "\n")
           val _ = TextIO.output(output, "selected-plan-id " ^ plan_id ^ "\n")
+          val _ = TextIO.output(output, "resolved-plan-id " ^ resolved_id ^ "\n")
           val _ = each_vector symbolic (#symbolic graph)
           val _ = each_vector resolved (#resolved graph)
           val _ = each_vector reverse (#reverse graph)
@@ -693,21 +718,24 @@ fun write_test_dependency_graph graph_id plan_id (graph : resolved_dependency_gr
           val _ = each_vector unresolved (#unresolved graph)
         in TextIO.closeOut output end
 
-fun plan_selection holdir sources selection =
+fun plan_selection components holdir sources selection =
   let
+    val provider = HolbuildComponentProvider.provider components
+    val resolution_context_id =
+      HolbuildComponentProvider.resolution_context_id components
     val _ = if holdir = "" then HolbuildDependencies.clear_analyser_path ()
             else HolbuildDependencies.set_analyser_path (HolbuildHolSharedCache.analyser_path_for_holdir holdir)
     val external_dirs = [normalize_path (Path.concat(holdir, "sigobj"))]
-    val analysis = HolbuildComponentProvider.new_analysis_state ()
+    val analysis = HolbuildComponentProvider.new_analysis_state provider
     val nodes = map (make_node external_dirs) sources
     val index = build_name_index nodes
     val lookup = indexed_nodes_named index
     val roots = target_roots lookup nodes selection
-    val _ = bootstrap_reachable_frontier analysis lookup nodes roots
-    val reachable = bootstrap_topo_sort analysis lookup nodes roots
+    val _ = bootstrap_reachable_frontier components analysis lookup nodes roots
+    val reachable = bootstrap_topo_sort components analysis lookup nodes roots
     val dependency_graph =
       HolbuildToolchain.time_phase "dependency.resolve"
-        (fn () => build_resolved_dependency_graph analysis lookup reachable)
+        (fn () => build_resolved_dependency_graph components analysis lookup reachable)
     val selected =
       HolbuildToolchain.time_phase "dependency.toposort"
         (fn () => topo_sort_resolved reachable roots dependency_graph)
@@ -717,19 +745,27 @@ fun plan_selection holdir sources selection =
     val selected_plan_id =
       HolbuildToolchain.time_phase "build.plan.identity"
         (fn () => selected_plan_identity selected_graph_id roots selected)
-    val _ = write_test_dependency_graph selected_graph_id selected_plan_id dependency_graph
+    val resolved_plan_id =
+      HolbuildHash.string_sha256
+        (canonical_fields
+          ["holbuild-resolved-plan-v1", resolution_context_id, selected_plan_id])
+    val _ = write_test_dependency_graph selected_graph_id selected_plan_id resolved_plan_id dependency_graph
     val _ = reject_graph_unresolved dependency_graph selected
     val _ = reject_source_uses analysis selected
   in
     {universe = nodes, roots = roots, selected = selected, name_index = index, analysis = analysis,
      dependency_graph = dependency_graph,
+     resolution_context_id = resolution_context_id,
      selected_graph_id = selected_graph_id,
-     selected_plan_id = selected_plan_id}
+     selected_plan_id = selected_plan_id,
+     resolved_plan_id = resolved_plan_id}
   end
 
-fun plan_all holdir sources = plan_selection holdir sources AllTargets
+fun plan_all components holdir sources =
+  plan_selection components holdir sources AllTargets
 
-fun plan_targets holdir sources targets = plan_selection holdir sources (SelectedTargets targets)
+fun plan_targets components holdir sources targets =
+  plan_selection components holdir sources (SelectedTargets targets)
 
 fun kind_name source = HolbuildSourceIndex.kind_string (#kind source)
 

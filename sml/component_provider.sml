@@ -6,7 +6,8 @@ exception Error of string
 datatype provider = LiveProvider
 
 type project_components =
-  { graph : HolbuildProjectGraph.t,
+  { provider : provider,
+    graph : HolbuildProjectGraph.t,
     instances : HolbuildPackageComponent.instance list,
     sources : HolbuildSourceIndex.t,
     resolution_context_id : string }
@@ -103,7 +104,8 @@ fun load LiveProvider {preparation, discovery} : project_components =
     val resolution_context_id = context_id graph instances
     val _ = write_test_components instances resolution_context_id
   in
-    {graph = graph,
+    {provider = LiveProvider,
+     graph = graph,
      instances = instances,
      sources = sources,
      resolution_context_id = resolution_context_id}
@@ -115,10 +117,12 @@ type node_analysis =
    symbolic_dependencies : HolbuildDependencies.t}
 
 type analysis_state =
-  {hashes : (string * string) list ref,
+  {provider : provider,
+   hashes : (string * string) list ref,
    analyses : (string * node_analysis) list ref}
 
-fun new_analysis_state () : analysis_state = {hashes = ref [], analyses = ref []}
+fun new_analysis_state provider : analysis_state =
+  {provider = provider, hashes = ref [], analyses = ref []}
 
 fun lookup key entries =
   Option.map #2 (List.find (fn (candidate, _) => candidate = key) entries)
@@ -142,7 +146,8 @@ fun source_hash ({hashes, ...} : analysis_state) source =
    immutable and incremental providers implement this same request without
    changing component consumers. The immutable result keeps extracted symbolic
    facts separate from project-wide resolved edges. *)
-fun analyse LiveProvider state {source, cache_path} : node_analysis =
+fun analyse state {source, cache_path} : node_analysis =
+  case #provider (state : analysis_state) of LiveProvider =>
   let
     val id = HolbuildSourceIndex.source_id source
     val key = analysis_key source
@@ -170,6 +175,28 @@ fun analyse LiveProvider state {source, cache_path} : node_analysis =
 fun analysis_dependencies ({symbolic_dependencies, ...} : node_analysis) =
   symbolic_dependencies
 
+fun provider ({provider, ...} : project_components) = provider
+fun component_symbolic_facts ({instances, ...} : project_components) source =
+  let
+    val package_name = #package (source : HolbuildSourceIndex.source)
+    val node_id = HolbuildSourceIndex.source_id source
+    fun matching_instance instance =
+      HolbuildProject.package_name (HolbuildPackageComponent.package_of instance) =
+      package_name
+    fun matching_fact fact =
+      case fact of
+          HolbuildPackageComponent.LogicalReference {from_node, ...} =>
+            from_node = node_id
+        | HolbuildPackageComponent.InputReference {from_node, ...} =>
+            from_node = node_id
+  in
+    case List.find matching_instance instances of
+        NONE => raise Error ("component instance is missing for package " ^ package_name)
+      | SOME instance =>
+          List.filter matching_fact
+            (HolbuildPackageComponent.symbolic_facts
+              (HolbuildPackageComponent.component_of instance))
+  end
 fun sources ({sources, ...} : project_components) = sources
 fun instances ({instances, ...} : project_components) = instances
 fun graph ({graph, ...} : project_components) = graph

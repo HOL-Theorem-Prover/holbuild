@@ -42,9 +42,10 @@ type project_graph_data =
   {root : string, hol : string, packages : package list,
    edges : project_graph_edge list}
 
-(* Transitional resolved-project record. The duplicated definition/local fields
-   keep existing callers behaviorally unchanged while later #131 phases migrate
-   them to package-definition and invocation-config accessors. *)
+(* Compatibility view retained until #110 settles the external project/package
+   boundary. Package definitions and local configuration remain authoritative;
+   these resolved fields are derived once during parsing for existing command
+   consumers and must not be used for semantic identity. *)
 type t =
   { root : string,
     artifact_root : string,

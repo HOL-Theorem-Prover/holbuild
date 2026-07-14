@@ -5,13 +5,13 @@ HOL source roots might enter project mode without interpreting Holmakefiles.
 
 Schema 1, `[dependencies.HOLDIR]`, `--holdir`, `HOLDIR`, and
 `HOLBUILD_HOLDIR` are no longer supported project/runtime mechanisms. Current
-projects declare HOL through schema 2 `[dependencies.hol]`; holbuild uses a
+projects declare HOL through `[dependencies.hol]`; holbuild uses a
 built-in manifest for that reserved `hol` package and builds/reuses the declared
 HOL under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`.
 
 The sketch manifest deliberately excludes HOL examples, tests, manuals, and
 non-default tool variants. Example theories are separate package boundaries. For
-example, code that needs `keccakTheory` should declare a schema 2 `from = "hol"`
+example, code that needs `keccakTheory` should declare a `from = "hol"`
 dependency with a shim manifest:
 
 ```toml

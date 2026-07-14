@@ -307,8 +307,8 @@ package definitions -> resolved package instances -> generator preparation
 -> action keys and execution
 ```
 
-Canonical resolution, selected-graph, and selected-plan identities exclude
-machine paths. Hashing and dependency extraction remain limited to the selected
+Canonical resolution-context, selected-graph, structural selected-plan, and
+combined resolved-plan identities exclude machine paths. Hashing and dependency extraction remain limited to the selected
 reachable frontier.
 
 ### `[dependencies.*]`

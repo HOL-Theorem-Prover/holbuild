@@ -78,7 +78,7 @@ Tables validated: `[holbuild]`, `[project]`, `[build]` (including `root_groups` 
 
 Every resolved graph must contain exactly one package named `hol`, declared as an exact git dependency. Upstream HOL does not need a manifest; holbuild uses a built-in manifest for package metadata and builds/reuses the declared HOL under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`.
 
-Schema 2 dependency forms:
+Supported dependency forms:
 
 1. Direct git dependencies:
    ```toml

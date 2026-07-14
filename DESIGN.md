@@ -41,8 +41,8 @@ Package roots are declared by one of:
 - the built-in/root HOL manifest
 
 Committed manifests describe what dependency is required. They should not rely on
-ambient search paths such as `HOLPATH`, `HOLDIR`, or user include paths. Schema 2
-uses exact git commits plus explicit shim manifests for subtrees that do not have
+ambient search paths such as `HOLPATH`, `HOLDIR`, or user include paths. The
+current manifest language uses exact git commits plus explicit shim manifests for subtrees that do not have
 their own `holproject.toml`:
 
 ```toml
@@ -62,9 +62,9 @@ build settings such as jobs, excludes, and tactic timeout.
 
 ## Dependency-managed mode
 
-Schema 2 is the dependency-managed manifest format. It has intentionally no
+The current manifest language provides dependency management. It has intentionally no
 solver: dependencies are exact git commits, and duplicate package names must
-resolve to the same source or resolution fails. A resolved schema 2 graph must
+resolve to the same source or resolution fails. A resolved package graph must
 contain exactly one package named `hol`.
 
 ```toml
@@ -114,7 +114,7 @@ not the parent package artifact directory, so resolving `a -> b` creates
 For `from` dependencies, the source root is under `.holbuild/src/<from>/<path>`,
 but the shim manifest is read from the package that declares the dependency.
 
-The reserved schema 2 `hol` package is the project HOL toolchain. It is
+The reserved `hol` package is the project HOL toolchain. It is
 materialized and built at a canonical shared cache path
 `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`; upstream HOL does not need a
 `holproject.toml`, because holbuild uses its built-in HOL manifest for package
@@ -136,7 +136,7 @@ revision, Poly/ML command/version, build arguments, and cache format version.
 ## Main binary and project-HOL helper direction
 
 The intended split is that `bin/holbuild` becomes a portable build coordinator,
-not a HOL program. It should own manifest parsing, schema 2 resolution, cache
+not a HOL program. It should own manifest parsing, package resolution, cache
 management, scheduling, artifact movement, and process orchestration. HOL-specific
 source understanding should be supplied by the project HOL declared in
 `[dependencies.hol]`.
@@ -152,7 +152,8 @@ or line records rather than shared SML datatypes.
 
 This split lets the main binary shed compile-time dependencies on `TacticParse`,
 `HOLSourceParser`, `HOLSourceAST`, `HOLSource.fileToReader`, `Holdep`, and HOL
-load-plan metadata. It also aligns project analysis with schema 2: the HOL used
+load-plan metadata. It also aligns project analysis with dependency-managed
+manifests: the HOL used
 to understand project sources is the HOL declared by the project, not the HOL
 checkout used to compile the holbuild executable.
 
@@ -446,7 +447,9 @@ selected dependency graph, and root-sensitive ordered plan. They exclude
 machine paths, retrieval locations, and analysis-map state while retaining
 package/component bindings, typed HOL selection, canonical nodes, reasoned
 edges, roots, and final order. Execution-only action policy remains in the
-component/resolution layer but does not perturb selected graph or plan identity. `.sml` files get a
+component/resolution layer but does not perturb structural selected graph or
+plan identity. A final resolved-plan identity combines the structural plan with
+the resolution-context identity, including typed HOL/kernel selection. `.sml` files get a
 `.uo` plus an empty companion `.ui` unless a real
 `.sig` companion exists, and same-name signatures are implicit dependencies of
 their implementation. HOL's current

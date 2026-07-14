@@ -89,7 +89,7 @@ holbuild no longer supports:
 
 ## Dependency resolution flow
 
-1. Parse the root schema 2 `holproject.toml` and local `.holconfig.toml` build settings.
+1. Parse the root `holproject.toml` and local `.holconfig.toml` build settings.
 2. Validate that the resolved graph has exactly one `hol` dependency.
 3. Materialize direct git dependencies under `.holbuild/src/<package>`; `hol` is resolved to the shared global HOL cache path.
 4. Resolve `from/path/manifest` dependencies to subtrees of direct git dependencies.
