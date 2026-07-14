@@ -380,6 +380,96 @@ if grep -q "protected active family was evicted" "$tmpdir/protected-active.log";
   exit 1
 fi
 
+gate_project=$tmpdir/checkpoint-maintenance-gate-project
+gate_family="$gate_project/.holbuild/checkpoints/checkpoint-maintenance-gate/src/DependentScript.sml"
+gate_trash="$gate_project/.holbuild/checkpoints/checkpoint-maintenance-gate/src/TrashScript.sml"
+gate_sync=$tmpdir/checkpoint-maintenance
+gate_started=$tmpdir/checkpoint-maintenance-dependent-started
+gate_live="$gate_family.deps/live/deps_loaded.save"
+mkdir -p "$gate_project/src" "$gate_family.deps/seed"
+cat > "$gate_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "checkpoint-maintenance-gate"
+
+[build]
+members = ["src"]
+TOML
+cat > "$gate_project/.holconfig.toml" <<'TOML'
+[build]
+checkpoint_limit_gb = 1
+jobs = 2
+TOML
+printf 'seed\n' > "$gate_family.deps/seed/deps_loaded.save"
+printf 'ok\n' > "$gate_family.deps/seed/deps_loaded.save.ok"
+cat > "$gate_project/src/TriggerScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Trigger";
+val _ = export_theory();
+val _ = OS.Process.system "mkdir -p $gate_trash.deps/old && truncate -s 2G $gate_trash.deps/old/deps_loaded.save && printf ok > $gate_trash.deps/old/deps_loaded.save.ok && touch -d '2 days ago' $gate_trash.deps/old/deps_loaded.save $gate_trash.deps/old/deps_loaded.save.ok";
+SML
+cat > "$gate_project/src/DependentScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Dependent";
+val _ = load "TriggerTheory";
+val started = TextIO.openOut "$gate_started";
+val _ = (TextIO.output(started, "started\n"); TextIO.closeOut started);
+val _ = OS.Process.system "mkdir -p $gate_family.deps/live && truncate -s 2G $gate_live && printf ok > $gate_live.ok";
+val _ = OS.Process.sleep (Time.fromSeconds 1);
+val _ =
+  if OS.FileSys.access("$gate_live.ok", []) then ()
+  else raise Fail "dependent checkpoint family was evicted while active";
+val _ = export_theory();
+SML
+(
+  cd "$gate_project"
+  HOLBUILD_TEST_CHECKPOINT_BUDGET_GATE="$gate_sync" \
+    "$HOLBUILD_BIN" build --force=project --no-cache
+) > "$tmpdir/checkpoint-maintenance-gate.log" 2>&1 &
+gate_pid=$!
+gate_seen=0
+for _ in $(seq 1 300); do
+  if [[ -e "$gate_sync.active" ]]; then
+    gate_seen=1
+    break
+  fi
+  if ! kill -0 "$gate_pid" 2>/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
+if [[ "$gate_seen" -ne 1 ]]; then
+  touch "$gate_sync.release"
+  wait "$gate_pid" || true
+  echo "checkpoint maintenance fixture did not enter the budget pass" >&2
+  exit 1
+fi
+sleep 1
+if [[ -e "$gate_started" ]]; then
+  touch "$gate_sync.release"
+  wait "$gate_pid" || true
+  echo "dependent started while checkpoint maintenance was active" >&2
+  exit 1
+fi
+touch "$gate_sync.release"
+if ! wait "$gate_pid"; then
+  echo "checkpoint maintenance fixture failed" >&2
+  cat "$tmpdir/checkpoint-maintenance-gate.log" >&2
+  exit 1
+fi
+require_file "$gate_started"
+require_grep "checkpoint budget: .*checkpoint_limit_gb=1" "$tmpdir/checkpoint-maintenance-gate.log"
+if [[ -e "$gate_family.deps" ]]; then
+  echo "final checkpoint budget enforcement retained the completed dependent family" >&2
+  exit 1
+fi
+
 protected_empty_project=$tmpdir/protected-empty-active-project
 protected_empty_slow_family="$protected_empty_project/.holbuild/checkpoints/protected-empty-active/src/SlowScript.sml"
 protected_empty_old_family="$protected_empty_project/.holbuild/checkpoints/protected-empty-active/src/OldScript.sml"

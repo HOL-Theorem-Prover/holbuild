@@ -3770,10 +3770,32 @@ fun rebuild_and_enforce_checkpoint_budget_state_excluding state protected_bases 
               end))
         handle e => warn_checkpoint_budget_error e)
 
+(* Tests can hold a refresh at its entry to make scheduler/maintenance ordering
+   observable without relying on the speed of a filesystem scan. *)
+fun checkpoint_budget_test_gate () =
+  case OS.Process.getEnv "HOLBUILD_TEST_CHECKPOINT_BUDGET_GATE" of
+      NONE => ()
+    | SOME base =>
+        let
+          val active = base ^ ".active"
+          val release = base ^ ".release"
+          fun wait 0 = warn "checkpoint budget test gate timed out"
+            | wait remaining =
+                if path_exists release then ()
+                else
+                  (OS.Process.sleep (Time.fromReal 0.01);
+                   wait (remaining - 1))
+          val _ = write_text active "active\n"
+          val _ = wait 3000
+        in
+          remove_file active
+        end
+
 fun refresh_checkpoint_budget_after_node state project node protected_bases =
   detail_time_phase "build.exec.checkpoint_budget"
     (fn () =>
         (let
+           val _ = checkpoint_budget_test_gate ()
            val dir = #checkpoint_dir state
            val base = checkpoint_base project node
            val changed = changed_watch_dirs (!(#watch state))
@@ -3872,6 +3894,12 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
     fun int_compare (left : int, right : int) =
       if left < right then LESS else if left > right then GREATER else EQUAL
     val active_ids : int Binaryset.set ref = ref (Binaryset.empty int_compare)
+    (* A checkpoint refresh may unlink whole Poly/ML saved-state families.  Keep
+       dispatch closed from the protected-family snapshot through eviction, and
+       hand consecutive refreshes directly to the next completing worker so
+       there is no dispatch window between them. *)
+    val checkpoint_maintenance_owner = ref (NONE : int option)
+    val checkpoint_maintenance_queue = ref ([] : int list)
     val stopped = ref false
     val failure = ref (NONE : (string * HolbuildStatus.debug_artifacts) option)
     val failed_prefix_priority = Array.array (node_count, NONE : bool option)
@@ -4031,6 +4059,8 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
           SOME _ => NONE
         | NONE =>
             if !stopped then NONE
+            else if Option.isSome (!checkpoint_maintenance_owner) then
+              (ConditionVar.wait (cv, mutex); next_work_locked ())
             else
               case pop_ready () of
                   SOME (id, priority) =>
@@ -4074,24 +4104,72 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
            empty_protected_bases
            ids)
 
-    fun protected_bases_after_success_locked id collect_protected =
-      if collect_protected then protected_bases_for_ids (id :: active_node_ids_snapshot_locked ())
-      else []
+    fun finish_success_transition_locked id =
+      (running := !running - 1;
+       clear_active_node id;
+       finish_priority id;
+       completed := !completed + 1;
+       if !stopped then () else List.app release_dependent (Array.sub (dependents, id)))
 
-    fun finish_success id collect_protected =
+    fun wait_for_no_checkpoint_maintenance_locked () =
+      case !checkpoint_maintenance_owner of
+          NONE => ()
+        | SOME _ =>
+            (ConditionVar.wait (cv, mutex);
+             wait_for_no_checkpoint_maintenance_locked ())
+
+    fun finish_success id =
+      with_lock
+        (fn () =>
+            (wait_for_no_checkpoint_maintenance_locked ();
+             finish_success_transition_locked id;
+             signal ()))
+
+    fun enqueue_checkpoint_maintenance_locked id =
+      case !checkpoint_maintenance_owner of
+          NONE => checkpoint_maintenance_owner := SOME id
+        | SOME _ =>
+            checkpoint_maintenance_queue := !checkpoint_maintenance_queue @ [id]
+
+    fun wait_for_checkpoint_maintenance_turn_locked id =
+      case !checkpoint_maintenance_owner of
+          SOME owner =>
+            if owner = id then ()
+            else
+              (ConditionVar.wait (cv, mutex);
+               wait_for_checkpoint_maintenance_turn_locked id)
+        | NONE => raise Error "checkpoint maintenance owner disappeared"
+
+    fun begin_checkpoint_maintenance id =
       with_lock
         (fn () =>
             let
-              val _ = running := !running - 1
-              val _ = clear_active_node id
-              val _ = finish_priority id
-              val _ = completed := !completed + 1
-              val _ = if !stopped then () else List.app release_dependent (Array.sub (dependents, id))
-              val protected = protected_bases_after_success_locked id collect_protected
+              val _ = enqueue_checkpoint_maintenance_locked id
+              val _ = wait_for_checkpoint_maintenance_turn_locked id
             in
-              signal ();
-              protected
+              (* The completing node is still active here.  So are workers that
+                 completed during an earlier pass and are waiting their turn. *)
+              protected_bases_for_ids (active_node_ids_snapshot_locked ())
             end)
+
+    fun advance_checkpoint_maintenance_locked id =
+      case !checkpoint_maintenance_owner of
+          SOME owner =>
+            if owner <> id then raise Error "checkpoint maintenance owner mismatch"
+            else
+              (case !checkpoint_maintenance_queue of
+                   [] => checkpoint_maintenance_owner := NONE
+                 | next :: rest =>
+                     (checkpoint_maintenance_owner := SOME next;
+                      checkpoint_maintenance_queue := rest))
+        | NONE => raise Error "checkpoint maintenance finished without an owner"
+
+    fun finish_checkpoint_maintenance id =
+      with_lock
+        (fn () =>
+            (finish_success_transition_locked id;
+             advance_checkpoint_maintenance_locked id;
+             signal ()))
 
     fun finish_inspected id =
       let
@@ -4157,11 +4235,15 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
                             val collect_protected =
                               checkpoints_possible andalso
                               outcome_may_create_checkpoints options project node outcome
-                            val protected = finish_success id collect_protected
                           in
                             if collect_protected then
-                              refresh_checkpoint_budget_after_node budget_state project node protected
-                            else ()
+                              let
+                                val protected = begin_checkpoint_maintenance id
+                                val _ = refresh_checkpoint_budget_after_node budget_state project node protected
+                              in
+                                finish_checkpoint_maintenance id
+                              end
+                            else finish_success id
                           end;
                     loop ())
                    handle e =>
