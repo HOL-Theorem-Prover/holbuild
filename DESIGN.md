@@ -706,6 +706,14 @@ by currently running PolyML child heaps. Each child can resume only from its own
 node's checkpoint family; resolved project dependencies are loaded from ordinary
 theory/object artifacts, so completed dependency checkpoint families remain
 evictable. The effective floor is therefore the size of the active node families.
+Checkpoint accounting includes save metadata and proof-resume sidecars as well as
+the heap files themselves. A versioned local index avoids repeated recursive byte
+scans; every build marks it dirty before children can run, maintains it in memory,
+and writes it once during finalization. A crash or failed final scan/write leaves
+the marker in place and forces a ground-truth scan next time. Indexed families are
+also checked for existing artifact roots so indexes left by older buggy versions
+repair themselves instead of hiding current bytes. Eviction only credits a family
+after its artifact roots have actually disappeared.
 `--skip-checkpoints` disables all `.save`/`.ok` creation while still running
 modern theorem proofs through the selected instrumentation runtime. `--skip-proof-steps`
 opts out of theorem instrumentation: with checkpoints still enabled, the build can
@@ -713,6 +721,12 @@ still save and consult `deps_loaded` and save the final context, but there are n
 theorem-context/end-of-proof/failed-prefix proof-navigation checkpoints and no tactic
 timeout enforcement for that build. The final context is currently a transient
 debug/successor breadcrumb, not a downstream canonical load context.
+
+Current HOL versions also generate per-theory HTML documentation during
+`export_theory()` by default. Holbuild disables both historical spellings of that
+trace in a first-loaded child policy, including checkpoint-resume children. These
+HTML files live only in the disposable stage and are not cache or build artifacts;
+skipping them removes pretty-printing and I/O from the theory export transaction.
 
 When proof steps are enabled, holbuild applies a tactic timeout to each
 executable proof step, and to the conservative whole-tactic path used for

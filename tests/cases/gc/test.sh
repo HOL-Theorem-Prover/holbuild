@@ -60,16 +60,16 @@ require_grep "cache gc: removed" "$gc_log"
 [[ ! -e "$project/.holbuild/logs/old.log" ]] || { echo "gc left stale log" >&2; exit 1; }
 if find "$project/.holbuild/checkpoints" -type f -print -quit 2>/dev/null | grep -q .; then
   if find "$project/.holbuild/checkpoints" -type f \
-      ! -name .index-v1 ! -name .index-v1.tmp -print -quit 2>/dev/null | grep -q .; then
+      ! -name .index-v2 ! -name .index-v2.tmp -print -quit 2>/dev/null | grep -q .; then
     echo "gc left stale checkpoint artifacts" >&2
     exit 1
   fi
 fi
-require_file "$project/.holbuild/checkpoints/.index-v1"
-require_grep "holbuild-checkpoint-index-v1" "$project/.holbuild/checkpoints/.index-v1"
-printf 'not an index\n' > "$project/.holbuild/checkpoints/.index-v1"
+require_file "$project/.holbuild/checkpoints/.index-v2"
+require_grep "holbuild-checkpoint-index-v2" "$project/.holbuild/checkpoints/.index-v2"
+printf 'not an index\n' > "$project/.holbuild/checkpoints/.index-v2"
 (cd "$project" && "$HOLBUILD_BIN" gc --clean-only --retention-days 0) > "$tmpdir/corrupt-index-gc.log" 2>&1
-require_grep "holbuild-checkpoint-index-v1" "$project/.holbuild/checkpoints/.index-v1"
+require_grep "holbuild-checkpoint-index-v2" "$project/.holbuild/checkpoints/.index-v2"
 
 index_budget_project=$tmpdir/index-budget-project
 index_budget_family="$index_budget_project/.holbuild/checkpoints/index-budget/src/OldScript.sml"
@@ -94,8 +94,8 @@ checkpoint_limit_gb = 1
 TOML
 truncate -s 2G "$index_budget_family.deps/old/deps_loaded.save"
 printf 'ok\n' > "$index_budget_family.deps/old/deps_loaded.save.ok"
-cat > "$index_budget_project/.holbuild/checkpoints/.index-v1" <<EOF_INDEX
-holbuild-checkpoint-index-v1
+cat > "$index_budget_project/.holbuild/checkpoints/.index-v2" <<EOF_INDEX
+holbuild-checkpoint-index-v2
 root=$index_budget_project/.holbuild/checkpoints
 created_by=holbuild
 family	$index_budget_family	1	2147483651
@@ -106,6 +106,93 @@ if [[ -e "$index_budget_family.deps/old" ]]; then
   echo "index-based checkpoint budget did not evict stale indexed family" >&2
   exit 1
 fi
+
+# Recover from a syntactically valid index whose rows no longer describe disk.
+# This is the state left by older builds that cleared their dirty marker after a
+# failed final index write.  The large sidecar also verifies that every artifact
+# removed by remove_checkpoint is included in budget accounting.
+drift_project=$tmpdir/index-drift-project
+drift_actual_family="$drift_project/.holbuild/checkpoints/index-drift/src/ActualScript.sml"
+drift_phantom_family="$drift_project/.holbuild/checkpoints/index-drift/src/PhantomScript.sml"
+drift_prefix="$drift_actual_family.theorems/key/proof/prefix/actual_failed_prefix.save.prefix"
+mkdir -p "$drift_project/.holbuild/checkpoints/index-drift/src" "$(dirname "$drift_prefix")"
+cat > "$drift_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "index-drift"
+
+[build]
+members = []
+TOML
+cat > "$drift_project/.holconfig.toml" <<'TOML'
+[build]
+checkpoint_limit_gb = 1
+TOML
+truncate -s 2G "$drift_prefix"
+cat > "$drift_project/.holbuild/checkpoints/.index-v2" <<EOF_INDEX
+holbuild-checkpoint-index-v2
+root=$drift_project/.holbuild/checkpoints
+created_by=holbuild
+family	$drift_phantom_family	1	1
+EOF_INDEX
+(cd "$drift_project" && "$HOLBUILD_BIN" build) > "$tmpdir/index-drift.log" 2>&1
+require_grep "checkpoint budget: .*evicted=1" "$tmpdir/index-drift.log"
+if [[ -e "$drift_prefix" ]]; then
+  echo "checkpoint budget trusted a stale index or ignored a large prefix sidecar" >&2
+  exit 1
+fi
+if grep -q "PhantomScript.sml" "$drift_project/.holbuild/checkpoints/.index-v2"; then
+  echo "recovered checkpoint index retained a nonexistent family" >&2
+  exit 1
+fi
+
+# A failed rm must not be credited as reclaimed bytes or dropped from the
+# persisted index.  Use a narrow PATH shim so the fixture is independent of the
+# account running the test and does not rely on directory permission semantics.
+delete_failure_project=$tmpdir/delete-failure-project
+delete_failure_family="$delete_failure_project/.holbuild/checkpoints/delete-failure/src/UndeletableScript.sml"
+delete_failure_bin=$tmpdir/delete-failure-bin
+mkdir -p "$delete_failure_family.deps/old" "$delete_failure_bin"
+cat > "$delete_failure_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "delete-failure"
+
+[build]
+members = []
+TOML
+cat > "$delete_failure_project/.holconfig.toml" <<'TOML'
+[build]
+checkpoint_limit_gb = 1
+TOML
+truncate -s 2G "$delete_failure_family.deps/old/deps_loaded.save"
+printf 'ok\n' > "$delete_failure_family.deps/old/deps_loaded.save.ok"
+cat > "$delete_failure_bin/rm" <<'SH'
+#!/bin/sh
+case "$*" in
+  *UndeletableScript.sml*) exit 1 ;;
+  *) exec /bin/rm "$@" ;;
+esac
+SH
+chmod +x "$delete_failure_bin/rm"
+(cd "$delete_failure_project" && PATH="$delete_failure_bin:$PATH" "$HOLBUILD_BIN" build) > "$tmpdir/delete-failure.log" 2>&1
+require_grep "could not completely evict checkpoint family: .*UndeletableScript.sml" "$tmpdir/delete-failure.log"
+require_grep "checkpoint budget still exceeds limit after eviction" "$tmpdir/delete-failure.log"
+require_file "$delete_failure_family.deps/old/deps_loaded.save"
+require_grep "UndeletableScript.sml" "$delete_failure_project/.holbuild/checkpoints/.index-v2"
+/bin/rm -rf "$delete_failure_family.deps"
 [[ ! -e "$cache/tmp/old" ]] || { echo "gc left stale cache tmp" >&2; exit 1; }
 [[ ! -e "$cache/actions/old" ]] || { echo "gc left stale cache action" >&2; exit 1; }
 [[ ! -e "$cache/blobs/deadbeef" ]] || { echo "gc left stale cache blob" >&2; exit 1; }
@@ -219,8 +306,8 @@ if (cd "$failure_index_project" && "$HOLBUILD_BIN" build ATheory) > "$tmpdir/fai
   echo "checkpoint failure index fixture unexpectedly succeeded" >&2
   exit 1
 fi
-require_file "$failure_index_project/.holbuild/checkpoints/.index-v1"
-require_grep "checkpoint-failure-index/src/AScript.sml" "$failure_index_project/.holbuild/checkpoints/.index-v1"
+require_file "$failure_index_project/.holbuild/checkpoints/.index-v2"
+require_grep "checkpoint-failure-index/src/AScript.sml" "$failure_index_project/.holbuild/checkpoints/.index-v2"
 
 deep_watch_project=$tmpdir/deep-watch-budget-project
 deep_watch_family="$deep_watch_project/.holbuild/checkpoints/deep-watch/deep/nested/GeneratedScript.sml"
@@ -622,7 +709,7 @@ val _ = new_theory "Scan";
 val _ = export_theory();
 SML
 (cd "$scan_project" && "$HOLBUILD_BIN" build ScanTheory) > "$tmpdir/scan-first.log" 2>&1
-require_file "$scan_project/.holbuild/checkpoints/.index-v1"
+require_file "$scan_project/.holbuild/checkpoints/.index-v2"
 scan_counter=$tmpdir/checkpoint-scan-counter.log
 rm -f "$scan_counter"
 (cd "$scan_project" && HOLBUILD_CHECKPOINT_SCAN_COUNTER="$scan_counter" "$HOLBUILD_BIN" build ScanTheory) > "$tmpdir/scan-second.log" 2>&1
@@ -634,11 +721,11 @@ fi
 # A failed atomic index write must leave the dirty marker behind.  Otherwise a
 # later build trusts the last valid-but-stale index and can let checkpoint data
 # grow past the configured budget after ENOSPC or another persistence failure.
-mkdir "$scan_project/.holbuild/checkpoints/.index-v1.tmp"
+mkdir "$scan_project/.holbuild/checkpoints/.index-v2.tmp"
 (cd "$scan_project" && "$HOLBUILD_BIN" build --force=project --no-cache ScanTheory) > "$tmpdir/scan-index-write-failure.log" 2>&1
-require_grep "could not persist checkpoint index" "$tmpdir/scan-index-write-failure.log"
+require_grep "could not finalize checkpoint index" "$tmpdir/scan-index-write-failure.log"
 require_file "$scan_project/.holbuild/checkpoints/.index-dirty"
-rmdir "$scan_project/.holbuild/checkpoints/.index-v1.tmp"
+rmdir "$scan_project/.holbuild/checkpoints/.index-v2.tmp"
 rm -f "$scan_counter"
 (cd "$scan_project" && HOLBUILD_CHECKPOINT_SCAN_COUNTER="$scan_counter" "$HOLBUILD_BIN" build ScanTheory) > "$tmpdir/scan-dirty-recovery.log" 2>&1
 if [[ ! -s "$scan_counter" ]]; then

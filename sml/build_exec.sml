@@ -9,6 +9,8 @@ exception ErrorWithDebugArtifacts of string * HolbuildStatus.debug_artifacts
 exception ExecutionPlanPrinted
 exception RetryInvalidCheckpoint
 
+fun warn msg = HolbuildStatus.message_stderr ("holbuild: warning: " ^ msg ^ "\n")
+
 fun detail_time_phase name f =
   if HolbuildToolchain.timing_detail_at 1 then HolbuildToolchain.time_phase name f
   else f ()
@@ -273,6 +275,19 @@ fun write_preload plan node deps_loaded deps_ok path =
 fun write_plain_preload plan node path =
   write_text path (String.concatWith "\n" (runtime_line () :: preload_lines plan node) ^ "\n")
 
+(* HOL's theory exporter enables generated HTML documentation by default.  A
+   holbuild child runs in a disposable stage and these files are not build
+   artifacts, so generating them only adds pretty-printing and I/O to the
+   critical export path.  Keep this policy in its own first-loaded file: unlike
+   the regular preload, it must also run when a child resumes from any saved
+   checkpoint.  The trace was renamed in HOL, so tolerate either spelling. *)
+fun write_child_policy path =
+  write_text path
+    (String.concatWith "\n"
+       ["val _ = (Feedback.set_trace \"TheoryPP.include_docs\" 0 handle _ => ());",
+        "val _ = (Feedback.set_trace \"TheoryPP.include_html_docs\" 0 handle _ => ());"] ^
+     "\n")
+
 fun generated_metadata_report_lines {theory_name, parents_report, mldeps_report} =
   let
     val parent_lines =
@@ -499,6 +514,16 @@ fun remove_checkpoint_tree path =
     ignore (OS.Process.system ("rm -rf " ^ HolbuildToolchain.quote path))
   else ()
 
+fun remove_checkpoint_trees paths =
+  let val existing = List.filter (fn path => FS.access(path, []) handle OS.SysErr _ => false) paths
+  in
+    if null existing then ()
+    else
+      ignore
+        (OS.Process.system
+           ("rm -rf " ^ String.concatWith " " (map HolbuildToolchain.quote existing)))
+  end
+
 fun remove_theorem_checkpoints_for_deps project node deps_key =
   remove_checkpoint_tree (theorem_checkpoints_for_deps_root project node deps_key)
 
@@ -514,10 +539,11 @@ fun remove_deps_checkpoint_family project node deps_key deps_loaded =
    remove_checkpoint deps_loaded)
 
 fun remove_checkpoint_family project node =
-  (remove_legacy_checkpoint_family project node;
-   remove_checkpoint_tree (theorem_checkpoint_root project node);
-   remove_checkpoint_tree (declaration_checkpoint_root project node);
-   remove_checkpoint_tree (deps_checkpoint_root project node))
+  let val base = checkpoint_base project node
+  in
+    remove_legacy_checkpoint_family project node;
+    remove_checkpoint_trees [base ^ ".theorems", base ^ ".decls", base ^ ".deps"]
+  end
 
 fun path_exists path = FS.access(path, []) handle OS.SysErr _ => false
 
@@ -590,31 +616,16 @@ fun checkpoint_clean_artifact path =
   has_suffix ".save" path orelse has_suffix ".save.ok" path orelse
   has_suffix ".save.tmp" path orelse has_suffix ".save.ok.tmp" path orelse
   has_suffix ".save.bak" path orelse has_suffix ".save.ok.bak" path orelse
-  has_suffix ".meta" path
+  has_suffix ".meta" path orelse has_suffix ".prefix" path orelse
+  has_suffix ".steps" path
 
 fun remove_empty_dir path = FS.rmDir path handle OS.SysErr _ => ()
 
-fun protected_checkpoint_artifact_roots base =
-  [base ^ ".theorems", base ^ ".decls", base ^ ".deps",
-   base ^ ".final_context.save"]
-
-fun path_in_or_at_dir path dir =
-  path = dir orelse path_under_dir path dir
-
-fun protected_empty_checkpoint_dir protected_bases path =
-  List.exists
-    (fn base => List.exists (path_in_or_at_dir path)
-                            (protected_checkpoint_artifact_roots base))
-    protected_bases
-
-fun remove_empty_dirs_excluding protected_bases dir =
+fun remove_empty_dirs dir =
   if not (path_exists dir) orelse not (FS.isDir dir handle OS.SysErr _ => false) then ()
-  else if protected_empty_checkpoint_dir protected_bases dir then ()
   else
-    (List.app (remove_empty_dirs_excluding protected_bases) (children dir);
-     if protected_empty_checkpoint_dir protected_bases dir then () else remove_empty_dir dir)
-
-fun remove_empty_dirs dir = remove_empty_dirs_excluding [] dir
+    (List.app remove_empty_dirs (children dir);
+     remove_empty_dir dir)
 
 fun checkpoint_save_artifact_base path =
   if has_suffix ".save.ok.tmp" path then SOME (drop_suffix ".ok.tmp" path)
@@ -623,6 +634,8 @@ fun checkpoint_save_artifact_base path =
   else if has_suffix ".save.tmp" path then SOME (drop_suffix ".tmp" path)
   else if has_suffix ".save.bak" path then SOME (drop_suffix ".bak" path)
   else if has_suffix ".meta" path then SOME (drop_suffix ".meta" path)
+  else if has_suffix ".prefix" path then SOME (drop_suffix ".prefix" path)
+  else if has_suffix ".steps" path then SOME (drop_suffix ".steps" path)
   else if has_suffix ".save" path then SOME path
   else NONE
 
@@ -649,6 +662,8 @@ fun checkpoint_marker_base path =
       SOME (Path.concat(Path.dir path, drop_suffix ".final_context.save.meta" name))
     else if has_suffix ".final_context.save.prefix" name then
       SOME (Path.concat(Path.dir path, drop_suffix ".final_context.save.prefix" name))
+    else if has_suffix ".final_context.save.steps" name then
+      SOME (Path.concat(Path.dir path, drop_suffix ".final_context.save.steps" name))
     else if has_suffix ".final_context.save" name then
       SOME (Path.concat(Path.dir path, drop_suffix ".final_context.save" name))
     else NONE
@@ -669,9 +684,7 @@ fun checkpoint_family_base path =
   end
 
 fun remove_checkpoint_family_base base =
-  (remove_checkpoint_tree (base ^ ".theorems");
-   remove_checkpoint_tree (base ^ ".decls");
-   remove_checkpoint_tree (base ^ ".deps");
+  (remove_checkpoint_trees [base ^ ".theorems", base ^ ".decls", base ^ ".deps"];
    remove_checkpoint (base ^ ".final_context.save");
    remove_checkpoint base)
 
@@ -724,7 +737,16 @@ fun collect_checkpoint_families_from paths =
 fun checkpoint_family_artifact_roots base =
   let val final_context = base ^ ".final_context.save"
   in
-    [base ^ ".theorems",
+    [base,
+     base ^ ".ok",
+     base ^ ".tmp",
+     base ^ ".ok.tmp",
+     base ^ ".bak",
+     base ^ ".ok.bak",
+     base ^ ".meta",
+     base ^ ".prefix",
+     base ^ ".steps",
+     base ^ ".theorems",
      base ^ ".decls",
      base ^ ".deps",
      final_context,
@@ -733,7 +755,9 @@ fun checkpoint_family_artifact_roots base =
      final_context ^ ".ok.tmp",
      final_context ^ ".bak",
      final_context ^ ".ok.bak",
-     final_context ^ ".meta"]
+     final_context ^ ".meta",
+     final_context ^ ".prefix",
+     final_context ^ ".steps"]
   end
 
 fun collect_checkpoint_family base =
@@ -752,11 +776,18 @@ type checkpoint_index =
    families : checkpoint_family list,
    total_bytes : Position.int}
 
-val checkpoint_index_header = "holbuild-checkpoint-index-v1"
+(* Version two invalidates indexes written by builds predating the dirty-marker
+   persistence fixes.  Such an index can look syntactically valid while naming
+   families that were already evicted and omitting all of the current families. *)
+val checkpoint_index_header = "holbuild-checkpoint-index-v2"
 
-fun checkpoint_index_path dir = Path.concat(dir, ".index-v1")
+fun checkpoint_index_path dir = Path.concat(dir, ".index-v2")
 
-fun checkpoint_index_tmp_path dir = Path.concat(dir, ".index-v1.tmp")
+fun checkpoint_index_tmp_path dir = Path.concat(dir, ".index-v2.tmp")
+
+fun legacy_checkpoint_index_path dir = Path.concat(dir, ".index-v1")
+
+fun legacy_checkpoint_index_tmp_path dir = Path.concat(dir, ".index-v1.tmp")
 
 fun checkpoint_index_dirty_path dir = Path.concat(dir, ".index-dirty")
 
@@ -882,23 +913,24 @@ fun write_checkpoint_index_atomically (index as {dir, ...} : checkpoint_index) =
   in
     (TextIO.output(output, checkpoint_index_text index);
      TextIO.closeOut output;
-     rename_replace {old = tmp, new = path})
+     rename_replace {old = tmp, new = path};
+     remove_file (legacy_checkpoint_index_tmp_path dir);
+     remove_file (legacy_checkpoint_index_path dir))
     handle e => (close_output (); remove_file tmp; raise e)
   end
 
 fun rebuild_checkpoint_index dir =
   checkpoint_index_with_families dir (collect_checkpoint_families dir)
 
+fun checkpoint_index_roots_exist ({families, ...} : checkpoint_index) =
+  List.all (fn ({base, ...} : checkpoint_family) => checkpoint_family_root_exists base)
+           families
+
 fun load_or_rebuild_checkpoint_index dir =
   case read_checkpoint_index dir of
-      SOME index => index
-    | NONE =>
-        let
-          val index = rebuild_checkpoint_index dir
-          val _ = write_checkpoint_index_atomically index
-        in
-          index
-        end
+      SOME index => if checkpoint_index_roots_exist index then index
+                    else rebuild_checkpoint_index dir
+    | NONE => rebuild_checkpoint_index dir
 
 fun checkpoint_bytes dir = total_checkpoint_bytes (collect_checkpoint_families dir)
 
@@ -980,13 +1012,21 @@ fun evict_from_index_excluding (index as {dir, families, total_bytes} : checkpoi
           [] => (freed, removed, removed_bases)
         | ({base, bytes, ...} : checkpoint_family) :: rest =>
             let
-              val freed' = freed + bytes
-              val removed' = removed + 1
-              val removed_bases' = base :: removed_bases
               val _ = remove_checkpoint_family_base base
             in
-              if before_bytes - freed' <= max_bytes then (freed', removed', removed_bases')
-              else evict rest freed' removed' removed_bases'
+              if checkpoint_family_root_exists base then
+                (warn ("could not completely evict checkpoint family: " ^ base);
+                 evict rest freed removed removed_bases)
+              else
+                let
+                  val freed' = freed + bytes
+                  val removed' = removed + 1
+                  val removed_bases' = base :: removed_bases
+                in
+                  if before_bytes - freed' <= max_bytes then
+                    (freed', removed', removed_bases')
+                  else evict rest freed' removed' removed_bases'
+                end
             end
     val over_budget = not (max_bytes <= 0 orelse before_bytes <= max_bytes)
     val (freed, evicted, removed_bases) =
@@ -995,7 +1035,6 @@ fun evict_from_index_excluding (index as {dir, families, total_bytes} : checkpoi
       List.filter (fn ({base, ...} : checkpoint_family) => not (string_member base removed_bases)) families
     val after_bytes = before_bytes - freed
     val index' = {dir = dir, families = families', total_bytes = after_bytes}
-    val _ = if over_budget then remove_empty_dirs_excluding protected_bases dir else ()
   in
     (index', {before_bytes = before_bytes, after_bytes = after_bytes,
               max_bytes = max_bytes, evicted = evicted})
@@ -1238,8 +1277,6 @@ fun run_hol_files_to_log tc stage workdir context files log_name current_log err
 fun toolchain_base_context tc = HolState (HolbuildToolchain.base_state tc)
 
 val cache_sml_token = "__HOLBUILD_THEORY_DAT_LOAD__"
-
-fun warn msg = HolbuildStatus.message_stderr ("holbuild: warning: " ^ msg ^ "\n")
 
 fun first_some f values =
   case values of
@@ -2625,6 +2662,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
     val input_key = HolbuildBuildPlan.input_key_for keys node
     val stage = stage_dir project input_key
     val staged_script = Path.concat(stage, Path.file (source_file node))
+    val child_policy = Path.concat(stage, "holbuild-child-policy.sml")
     val preload = Path.concat(stage, "holbuild-preload.sml")
     val final_loader = Path.concat(stage, "holbuild-save-final-context.sml")
     val parents_report = Path.concat(stage, "holbuild-theory-parents.txt")
@@ -2643,6 +2681,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
     val trace_path = drop_suffix ".dat" data_path ^ ".tr.gz"
     val _ = remove_tree stage
     val _ = ensure_dir stage
+    val _ = write_child_policy child_policy
     val _ = if checkpoint_enabled policy then ensure_parent deps_loaded else ()
     val _ = if checkpoint_enabled policy then ensure_parent final_context else ()
     val _ =
@@ -2786,7 +2825,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
          (fn () =>
              run_hol_files_to_log tc stage stage
                (#context run_spec)
-               (#files run_spec @ [final_loader])
+               (child_policy :: (#files run_spec @ [final_loader]))
                "holbuild-build.log"
                (SOME (current_build_log project node))
                "hol run failed while building theory script"))
@@ -3481,7 +3520,7 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
         in
           build_after_checkpoint_retries (length theorem_checkpoints + length declaration_checkpoints + 1)
         end
-        handle ExecutionPlanPrinted => HolbuildStatus.Inspected
+        handle ExecutionPlanPrinted => (remove_tree stage; HolbuildStatus.Inspected)
       end
   end
 
@@ -3571,7 +3610,7 @@ type checkpoint_budget_state =
    watch : checkpoint_watch ref,
    watch_paths : string list ref,
    index_bases : (string, unit) Binarymap.dict ref,
-   index_persisted : bool ref,
+   index_finalized : bool ref,
    refreshed : bool ref,
    mutex : Mutex.mutex}
 
@@ -3681,7 +3720,14 @@ fun create_checkpoint_budget_state project =
     val index =
       if path_exists dirty_path then rebuild_checkpoint_index checkpoint_dir
       else load_or_rebuild_checkpoint_index checkpoint_dir
-    val _ = (ensure_parent dirty_path; write_text dirty_path "building\n") handle _ => ()
+    (* If the dirty marker cannot be installed, discard the trusted index.  A
+       crash during this build must make the next process rescan rather than
+       accept state that this process could not mark as in-flight. *)
+    val _ =
+      (ensure_parent dirty_path; write_text dirty_path "building\n")
+      handle e =>
+        (warn ("could not mark checkpoint index dirty: " ^ General.exnMessage e);
+         remove_file (checkpoint_index_path checkpoint_dir))
   in
     {checkpoint_dir = checkpoint_dir,
      checkpoint_limit_gb = checkpoint_limit_gb,
@@ -3690,13 +3736,13 @@ fun create_checkpoint_budget_state project =
      watch_paths = ref [checkpoint_dir],
      watch = ref (watch_with_paths [checkpoint_dir] checkpoint_dir (#families index)),
      index_bases = ref (bases_set_of (#families index)),
-     index_persisted = ref false,
+     index_finalized = ref false,
      refreshed = ref false,
      mutex = Mutex.mutex ()}
   end
 
 fun clear_checkpoint_index_dirty (state : checkpoint_budget_state) =
-  if !(#index_persisted state) then
+  if !(#index_finalized state) then
     remove_file (checkpoint_index_dirty_path (#checkpoint_dir state))
   else ()
 
@@ -3727,10 +3773,6 @@ fun register_checkpoint_budget_bases state bases =
 
 fun enforce_checkpoint_index_locked (state : checkpoint_budget_state) index protected_bases =
   let
-    (* The dirty marker may only be cleared after the latest index state reaches
-       disk.  In particular, an ENOSPC while replacing the index must force the
-       next build to rescan rather than trust the previous, stale index. *)
-    val _ = #index_persisted state := false
     val (evicted_index, eviction) =
       evict_from_index_excluding index (#max_bytes state) protected_bases
     val _ = checkpoint_budget_warnings (#checkpoint_limit_gb state) eviction
@@ -3739,14 +3781,15 @@ fun enforce_checkpoint_index_locked (state : checkpoint_budget_state) index prot
       if evicted > 0 andalso after_bytes > max_bytes then
         rebuild_checkpoint_index (#checkpoint_dir state)
       else evicted_index
-    (* Persisting the index must never fail the build: eviction already happened
-       and the in-memory index is returned regardless. *)
-    val _ = (write_checkpoint_index_atomically final_index;
-             #index_persisted state := true)
-            handle e => warn ("could not persist checkpoint index: " ^ General.exnMessage e)
   in
     final_index
   end
+
+fun install_checkpoint_index_locked (state : checkpoint_budget_state) final_index =
+  (#index state := final_index;
+   #index_bases state := bases_set_of (#families final_index);
+   #watch state := watch_with_paths (!(#watch_paths state))
+                                     (#checkpoint_dir state) (#families final_index))
 
 fun enforce_checkpoint_budget_state_excluding state protected_bases =
   detail_time_phase "build.exec.checkpoint_budget"
@@ -3756,28 +3799,34 @@ fun enforce_checkpoint_budget_state_excluding state protected_bases =
               let
                 val final_index = enforce_checkpoint_index_locked state (!(#index state)) protected_bases
               in
-                #index state := final_index;
-                #index_bases state := bases_set_of (#families final_index);
-                #watch state := watch_with_paths (!(#watch_paths state))
-                                                  (#checkpoint_dir state) (#families final_index)
+                install_checkpoint_index_locked state final_index
               end))
         handle e => warn_checkpoint_budget_error e)
 
-fun rebuild_and_enforce_checkpoint_budget_state_excluding state protected_bases =
+(* Mid-build passes update only the in-memory index.  The dirty marker already
+   guarantees a recovery scan after a crash, so rewriting the full index after
+   every completed theory provides no safety and is expensive on large graphs.
+   Only this final pass may authorize removal of the dirty marker. *)
+fun finalize_checkpoint_budget_state_excluding state rebuild protected_bases =
   detail_time_phase "build.exec.checkpoint_budget"
     (fn () =>
         (with_checkpoint_budget_lock state
           (fn () =>
               let
-                val dir = #checkpoint_dir state
-                val index' = rebuild_checkpoint_index dir
+                val _ = #index_finalized state := false
+                val index' =
+                  if rebuild then rebuild_checkpoint_index (#checkpoint_dir state)
+                  else !(#index state)
                 val final_index = enforce_checkpoint_index_locked state index' protected_bases
+                val _ = install_checkpoint_index_locked state final_index
+                val _ = write_checkpoint_index_atomically final_index
               in
-                #index state := final_index;
-                #index_bases state := bases_set_of (#families final_index);
-                #watch state := watch_with_paths (!(#watch_paths state)) dir (#families final_index)
+                #index_finalized state := true
               end))
-        handle e => warn_checkpoint_budget_error e)
+        handle e => warn ("could not finalize checkpoint index: " ^ General.exnMessage e))
+
+fun mark_checkpoint_budget_refresh_needed state =
+  with_checkpoint_budget_lock state (fn () => #refreshed state := true)
 
 (* Tests can hold a refresh at its entry to make scheduler/maintenance ordering
    observable without relying on the speed of a filesystem scan. *)
@@ -3804,6 +3853,10 @@ fun refresh_checkpoint_budget_after_node state project node protected_bases =
   detail_time_phase "build.exec.checkpoint_budget"
     (fn () =>
         (let
+           (* Mark this before any filesystem operation.  If discovery fails,
+              finalization must rebuild rather than persist the old in-memory
+              index and clear the dirty marker. *)
+           val _ = mark_checkpoint_budget_refresh_needed state
            val _ = checkpoint_budget_test_gate ()
            val dir = #checkpoint_dir state
            val base = checkpoint_base project node
@@ -3824,10 +3877,7 @@ fun refresh_checkpoint_budget_after_node state project node protected_bases =
                    val index' = merge_checkpoint_family_measurements (!(#index state)) measurements
                    val final_index = enforce_checkpoint_index_locked state index' protected_bases
                  in
-                  #index state := final_index;
-                  #index_bases state := bases_set_of (#families final_index);
-                   #watch state := watch_with_paths (!(#watch_paths state)) dir (#families final_index);
-                   #refreshed state := true
+                   install_checkpoint_index_locked state final_index
                  end)
          end)
         handle e => warn_checkpoint_budget_error e)
@@ -3858,7 +3908,7 @@ fun build_serial dat_hash_cache status options tc project base_context plan keys
     fun loop [] = ()
       | loop (node :: rest) =
           case one node of
-              HolbuildStatus.Inspected => ()
+              HolbuildStatus.Inspected => mark_checkpoint_budget_refresh_needed budget_state
             | outcome =>
                 (if outcome_may_create_checkpoints options project node outcome then
                    refresh_checkpoint_budget_after_node budget_state project node []
@@ -4164,6 +4214,7 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
 
     fun finish_inspected id =
       let
+        val _ = mark_checkpoint_budget_refresh_needed budget_state
         val first_stop =
           with_lock
             (fn () =>
@@ -4369,13 +4420,11 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
         else build_parallel dat_hash_cache status options tc project base_context plan keys toolchain_key jobs budget_state
     in
       (run (); HolbuildStatus.finish status;
-       if !(#refreshed budget_state) then
-         rebuild_and_enforce_checkpoint_budget_state_excluding budget_state []
-       else
-         enforce_checkpoint_budget_state_excluding budget_state [];
+       finalize_checkpoint_budget_state_excluding
+         budget_state (!(#refreshed budget_state)) [];
        clear_checkpoint_index_dirty budget_state)
       handle e => (HolbuildStatus.finish status;
-                   rebuild_and_enforce_checkpoint_budget_state_excluding budget_state [];
+                   finalize_checkpoint_budget_state_excluding budget_state true [];
                    clear_checkpoint_index_dirty budget_state;
                    raise e)
     end

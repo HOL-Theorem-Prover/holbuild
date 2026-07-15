@@ -36,6 +36,12 @@ val _ = new_theory "A";
 val a_thm = store_thm("a_thm", ``T``, ACCEPT_TAC TRUTH);
 
 val _ = export_theory();
+
+val _ =
+  if (OS.FileSys.access (".hol/docs/ATheory.html", []) handle OS.SysErr _ => false) orelse
+     (OS.FileSys.access (".hol/docs/AScript.html", []) handle OS.SysErr _ => false) then
+    raise Fail "holbuild theory child generated throwaway HTML documentation"
+  else ();
 SML
 cat > "$project/src/ATheory.sml" <<'SML'
 this source-tree generated theory artifact must be ignored by discovery
