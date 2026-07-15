@@ -45,8 +45,10 @@ fun external_hash command_name valid path =
 fun external_sha1 path = external_hash "sha1sum" valid_sha1 path
 fun external_sha256 path = external_hash "sha256sum" valid_sha256 path
 
+val small_file_limit = 196608
+
 fun large_file path =
-  (Position.toInt (OS.FileSys.fileSize path) >= 1048576)
+  (Position.toInt (OS.FileSys.fileSize path) >= small_file_limit)
   handle Overflow => true
        | OS.SysErr _ => false
 
@@ -90,13 +92,8 @@ fun file_sha1 path =
   else SHA1_ML.sha1_file {filename = path}
 
 fun file_sha256 path =
-  if large_file path then
-    case external_sha256 path of
-        SOME hash => hash
-      | NONE => string_sha256 (read_binary_all path)
-  else
-    case external_sha256 path of
-        SOME hash => hash
-      | NONE => string_sha256 (read_binary_all path)
+  case external_sha256 path of
+      SOME hash => hash
+    | NONE => string_sha256 (read_binary_all path)
 
 end

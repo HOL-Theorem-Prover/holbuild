@@ -216,15 +216,21 @@ fun duplicate_name names =
 
 fun duplicate_output generators =
   let
-    fun outputs generator = map (fn output => (output, HolbuildProject.generator_name generator))
-                                (HolbuildProject.generator_outputs generator)
-    fun loop [] = NONE
-      | loop ((output, owner) :: rest) =
-          case List.find (fn (other, _) => other = output) rest of
-              SOME (_, other_owner) => SOME (output, owner, other_owner)
-            | NONE => loop rest
+    fun add_output owner (output, (seen, duplicate)) =
+      case duplicate of
+          SOME _ => (seen, duplicate)
+        | NONE =>
+            (case Binarymap.peek(seen, output) of
+                 SOME first => (seen, SOME (output, first, owner))
+               | NONE => (Binarymap.insert(seen, output, owner), NONE))
+    fun add_generator (generator, state) =
+      let val owner = HolbuildProject.generator_name generator
+      in List.foldl (add_output owner) state (HolbuildProject.generator_outputs generator) end
+    val (_, duplicate) =
+      List.foldl add_generator (Binarymap.mkDict String.compare, NONE) generators
+        : (string, string) Binarymap.dict * (string * string * string) option
   in
-    loop (List.concat (map outputs generators))
+    duplicate
   end
 
 fun generator_named generators name =
@@ -254,22 +260,81 @@ fun validate_generators generators =
 fun topo_sort generators =
   let
     val _ = validate_generators generators
-    fun ready done generator = List.all (fn dep => member dep done) (HolbuildProject.generator_deps generator)
-    fun partition_ready done remaining =
-      List.partition (ready done) remaining
-    fun loop done ordered remaining =
-      case remaining of
-          [] => rev ordered
-        | _ =>
-            let val (ready_now, blocked) = partition_ready done remaining
-            in
-              if null ready_now then die "generator dependency cycle"
-              else loop (map HolbuildProject.generator_name ready_now @ done)
-                        (rev ready_now @ ordered)
-                        blocked
-            end
+    fun unique_deps deps =
+      let
+        fun add (dep, (seen, kept)) =
+          if Binaryset.member(seen, dep) then (seen, kept)
+          else (Binaryset.add(seen, dep), dep :: kept)
+        val (_, kept) = List.foldl add (Binaryset.empty String.compare, []) deps
+      in
+        rev kept
+      end
+    fun add_generator (generator, (by_name, indegrees, dependents)) =
+      let
+        val name = HolbuildProject.generator_name generator
+        val deps = unique_deps (HolbuildProject.generator_deps generator)
+        fun add_dependent (dep, dict) =
+          let val existing = Option.getOpt(Binarymap.peek(dict, dep), [])
+          in Binarymap.insert(dict, dep, name :: existing) end
+      in
+        (Binarymap.insert(by_name, name, generator),
+         Binarymap.insert(indegrees, name, length deps),
+         List.foldl add_dependent dependents deps)
+      end
+    val (by_name, initial_indegrees, dependents) =
+      List.foldl add_generator
+        (Binarymap.mkDict String.compare, Binarymap.mkDict String.compare, Binarymap.mkDict String.compare)
+        generators
+        : (string, HolbuildProject.generator) Binarymap.dict *
+          (string, int) Binarymap.dict *
+          (string, string list) Binarymap.dict
+    fun indegree dict name = Option.getOpt(Binarymap.peek(dict, name), 0)
+    fun ready_names () =
+      List.foldr
+        (fn (generator, acc) =>
+            let val name = HolbuildProject.generator_name generator
+            in if indegree initial_indegrees name = 0 then name :: acc else acc end)
+        [] generators
+    fun pop_queue queue =
+      case queue of
+          (item :: front, back) => SOME (item, (front, back))
+        | ([], []) => NONE
+        | ([], back) => pop_queue (rev back, [])
+    (* The initial queue and each dependent list follow manifest order.  Append
+       newly ready work, rather than re-sorting it ahead of work that was ready
+       earlier, so this remains a stable FIFO topological schedule. *)
+    fun push_back item (front, back) = (front, item :: back)
+    fun process_dependent (dependent, (indegrees, queue)) =
+      let
+        val count = indegree indegrees dependent - 1
+        val indegrees' = Binarymap.insert(indegrees, dependent, count)
+      in
+        if count = 0 then (indegrees', push_back dependent queue)
+        else (indegrees', queue)
+      end
+    fun generator_for name =
+      Binarymap.find(by_name, name)
+      handle Binarymap.NotFound => die ("internal missing generator: " ^ name)
+    fun loop done ordered count indegrees queue =
+      case pop_queue queue of
+          NONE =>
+            if count = length generators then rev ordered
+            else die "generator dependency cycle"
+        | SOME (name, queue') =>
+            if Binaryset.member(done, name) then
+              loop done ordered count indegrees queue'
+            else
+              let
+                val generator = generator_for name
+                val done' = Binaryset.add(done, name)
+                val newly_unblocked = rev (Option.getOpt(Binarymap.peek(dependents, name), []))
+                val (indegrees', queue'') =
+                  List.foldl process_dependent (indegrees, queue') newly_unblocked
+              in
+                loop done' (generator :: ordered) (count + 1) indegrees' queue''
+              end
   in
-    loop [] [] generators
+    loop (Binaryset.empty String.compare) [] 0 initial_indegrees (ready_names (), [])
   end
 
 fun run_package package =

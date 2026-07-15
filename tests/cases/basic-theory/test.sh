@@ -37,6 +37,12 @@ val _ = new_theory "A";
 val a_thm = store_thm("a_thm", ``T``, ACCEPT_TAC TRUTH);
 
 val _ = export_theory();
+
+val _ =
+  if (OS.FileSys.access (".hol/docs/ATheory.html", []) handle OS.SysErr _ => false) orelse
+     (OS.FileSys.access (".hol/docs/AScript.html", []) handle OS.SysErr _ => false) then
+    raise Fail "holbuild theory child generated throwaway HTML documentation"
+  else ();
 SML
 cat > "$project/src/ATheory.sml" <<'SML'
 this source-tree generated theory artifact must be ignored by discovery
@@ -78,16 +84,27 @@ fi
 require_file "$project/.holbuild/obj/src/ATheory.sig"
 require_file "$project/.holbuild/obj/src/ATheory.sml"
 require_file "$project/.holbuild/obj/src/ATheory.dat"
+for ext in sig sml dat; do
+  if ! cmp -s "$project/.holbuild/obj/src/ATheory.$ext" "$project/.holbuild/obj/src/.hol/objs/ATheory.$ext"; then
+    echo "remapped ATheory.$ext does not match canonical output" >&2
+    exit 1
+  fi
+done
 if strings -a "$project/.holbuild/obj/src/ATheory.dat" | grep -q '\.holbuild.*stage'; then
   echo "theory dat should not record transient holbuild stage paths" >&2
   exit 1
 fi
 require_file "$project/.holbuild/dep/basic/src/AScript.sml.key"
+metadata="$project/.holbuild/dep/basic/src/AScript.sml.key"
+if grep -q "^output-sha1=" "$metadata"; then
+  echo "default build metadata should not emit output-sha1 diagnostics" >&2
+  exit 1
+fi
 if ! find "$project/.holbuild/checkpoints" \( -name '*.save' -o -name '*.save.ok' \) -print -quit 2>/dev/null | grep -q .; then
   echo "successful build should retain checkpoint files for incremental rebuilds" >&2
   exit 1
 fi
-if grep -q "deps_loaded=\|final_context=\|theorem_boundary" "$project/.holbuild/dep/basic/src/AScript.sml.key"; then
+if grep -q "deps_loaded=\|final_context=\|theorem_boundary" "$metadata"; then
   echo "metadata should not retain checkpoint paths" >&2
   exit 1
 fi
@@ -125,12 +142,74 @@ if [[ ! -s "$project/.holbuild/obj/src/ATheory.sml" || ! -s "$project/.holbuild/
   exit 1
 fi
 
-metadata="$project/.holbuild/dep/basic/src/AScript.sml.key"
-require_grep "^output-sha1=" "$metadata"
+if grep -q "^output-sha1=" "$metadata"; then
+  echo "default repaired metadata should not emit output-sha1 diagnostics" >&2
+  exit 1
+fi
+
+emit_hash_log=$tmpdir/emit-output-hashes.log
+(cd "$project" && "$HOLBUILD_BIN" build --force --emit-output-hashes ATheory) > "$emit_hash_log"
+require_grep "ATheory built" "$emit_hash_log"
+hash_line_count=$(grep -c "^output-sha1=" "$metadata")
+if [[ "$hash_line_count" -ne 12 ]]; then
+  echo "expected 12 output-sha1 diagnostic lines, found $hash_line_count" >&2
+  exit 1
+fi
+while IFS= read -r line; do
+  payload=${line#output-sha1=}
+  path=${payload% *}
+  hash=${payload##* }
+  actual=$(sha1sum "$path" | awk '{print $1}')
+  if [[ "$hash" != "$actual" ]]; then
+    echo "stale output-sha1 diagnostic for $path" >&2
+    exit 1
+  fi
+done < <(grep "^output-sha1=" "$metadata")
+for ext in sig sml dat; do
+  if ! cmp -s "$project/.holbuild/obj/src/ATheory.$ext" "$project/.holbuild/obj/src/.hol/objs/ATheory.$ext"; then
+    echo "remapped ATheory.$ext does not match canonical output after diagnostic build" >&2
+    exit 1
+  fi
+done
 sed -i 's/^output-sha1=.*/output-sha1=stale-diagnostic-hash/' "$metadata"
 stale_hash_log=$tmpdir/stale-output-hash.log
-(cd "$project" && "$HOLBUILD_BIN" --verbose build ATheory) > "$stale_hash_log"
+(cd "$project" && "$HOLBUILD_BIN" --verbose build --emit-output-hashes ATheory) > "$stale_hash_log"
 require_grep "ATheory is up to date" "$stale_hash_log"
+if grep -q 'output-sha1=stale-diagnostic-hash' "$metadata"; then
+  echo "up-to-date --emit-output-hashes did not refresh output diagnostics" >&2
+  exit 1
+fi
+while IFS= read -r line; do
+  payload=${line#output-sha1=}
+  path=${payload% *}
+  hash=${payload##* }
+  actual=$(sha1sum "$path" | awk '{print $1}')
+  if [[ "$hash" != "$actual" ]]; then
+    echo "up-to-date --emit-output-hashes wrote a stale output diagnostic for $path" >&2
+    exit 1
+  fi
+done < <(grep "^output-sha1=" "$metadata")
+
+# A remapped artifact is a distinct file.  Its diagnostic hash must describe
+# its own bytes even if it has been corrupted independently of the canonical
+# artifact.
+remapped_sml=$project/.holbuild/obj/src/.hol/objs/ATheory.sml
+printf 'corrupted remapped artifact\n' > "$remapped_sml"
+(cd "$project" && "$HOLBUILD_BIN" --verbose build --emit-output-hashes ATheory) > "$tmpdir/corrupt-remap-hash.log"
+expected_remapped_hash=$(sha1sum "$remapped_sml" | awk '{print $1}')
+reported_remapped_hash=$(awk -v prefix="output-sha1=$remapped_sml " 'index($0, prefix) == 1 { print $NF }' "$metadata")
+if [[ "$reported_remapped_hash" != "$expected_remapped_hash" ]]; then
+  echo "output diagnostic did not hash the remapped artifact itself" >&2
+  exit 1
+fi
+
+# Diagnostic hashes are opt-in.  A subsequent ordinary no-op build must remove
+# them rather than retaining stale diagnostics in otherwise semantic metadata.
+(cd "$project" && "$HOLBUILD_BIN" --verbose build ATheory) > "$tmpdir/default-after-hashes.log"
+if grep -q "^output-sha1=" "$metadata"; then
+  echo "default up-to-date build retained output-sha1 diagnostics" >&2
+  exit 1
+fi
 
 input_key=$(grep '^input_key=' "$project/.holbuild/dep/basic/src/AScript.sml.key" | cut -d= -f2)
 cache_manifest="$HOLBUILD_CACHE/actions/$input_key/manifest"
@@ -147,6 +226,16 @@ require_grep "ATheory restored from cache" "$cache_log"
 require_file "$project/.holbuild/obj/src/ATheory.sig"
 require_file "$project/.holbuild/obj/src/ATheory.sml"
 require_file "$project/.holbuild/obj/src/ATheory.dat"
+for ext in sig sml dat; do
+  if ! cmp -s "$project/.holbuild/obj/src/ATheory.$ext" "$project/.holbuild/obj/src/.hol/objs/ATheory.$ext"; then
+    echo "cache-restored remapped ATheory.$ext does not match canonical output" >&2
+    exit 1
+  fi
+done
+if grep -q "^output-sha1=" "$metadata"; then
+  echo "default cache-restore metadata should not emit output-sha1 diagnostics" >&2
+  exit 1
+fi
 # cache restore does not create checkpoints (no HOL process runs),
 # but previously-saved checkpoints persist for incremental rebuilds
 if [[ ! "$cache_manifest" -nt "$cache_hit_marker" ]]; then

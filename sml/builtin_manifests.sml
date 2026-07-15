@@ -3,13 +3,15 @@ struct
 
 val holdir_manifest_name = "builtin:HOLDIR"
 val manifest_minimum_version = "0.10.0"
+val hol_source_manifest_version = "holbuild-hol-source-manifest-v3"
 
 fun toml_string s =
   "\"" ^ String.translate (fn #"\\" => "\\\\" | #"\"" => "\\\"" | c => str c) s ^ "\""
 
 fun manifest_text members =
   String.concatWith "\n"
-    ( ["# Built-in manifest for the reserved HOL dependency.",
+    ( ["# " ^ hol_source_manifest_version,
+       "# Built-in manifest for the reserved HOL dependency.",
        "# The shared toolchain builds the configured HOL sequence into sigobj;",
        "# remaining default-build source directories are generated per toolchain.",
        "",

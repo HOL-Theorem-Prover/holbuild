@@ -14,7 +14,7 @@ type t =
     holdep_mentions : string list }
 
 val cache_version = "holbuild-dependencies-cache-v2"
-val extractor_version = "holbuild-hol-analyser-deps-v1"
+val extractor_version = "holbuild-hol-analyser-deps-v2"
 val analyser_path : string option ref = ref NONE
 
 fun set_analyser_path path = analyser_path := SOME path
@@ -179,13 +179,13 @@ fun extract_textual path =
 
 fun empty_deps () = {loads = [], uses = [], extra_deps = [], holdep_mentions = []} : t
 
-fun add_response_field source_path field value ({loads, uses, extra_deps, holdep_mentions} : t) =
+fun add_response_field source_path_for_error field value ({loads, uses, extra_deps, holdep_mentions} : t) =
   case field of
       "load" => {loads = value :: loads, uses = uses, extra_deps = extra_deps, holdep_mentions = holdep_mentions}
     | "use" => {loads = loads, uses = value :: uses, extra_deps = extra_deps, holdep_mentions = holdep_mentions}
     | "extra-dep" => {loads = loads, uses = uses, extra_deps = value :: extra_deps, holdep_mentions = holdep_mentions}
     | "mention" => {loads = loads, uses = uses, extra_deps = extra_deps, holdep_mentions = value :: holdep_mentions}
-    | _ => raise Error ("bad analyser response field for " ^ source_path ^ ": " ^ field)
+    | _ => raise Error ("bad analyser response field for " ^ source_path_for_error () ^ ": " ^ field)
 
 fun finish_deps ({loads, uses, extra_deps, holdep_mentions} : t) =
   {loads = sort_unique loads, uses = sort_unique uses,
@@ -200,33 +200,74 @@ fun assoc id pairs =
 fun parse_analyser_response response_path id_paths =
   let
     val lines = String.tokens (fn c => c = #"\n") (read_all response_path)
-    fun source_for id = Option.getOpt(assoc id id_paths, "file " ^ id)
-    fun put id deps acc =
-      let fun go pairs =
-            case pairs of
-                [] => [(id, deps)]
-              | (k, v) :: rest => if k = id then (id, deps) :: rest else (k, v) :: go rest
-      in go acc end
-    fun current id acc = Option.getOpt(assoc id acc, empty_deps ())
-    fun loop rest current_id acc =
+    fun add_source ((id, path), dict) =
+      case Binarymap.peek(dict, id) of
+          NONE => Binarymap.insert(dict, id, path)
+        | SOME _ => raise Error ("duplicate analyser request id: " ^ id)
+    val source_paths =
+      List.foldl add_source (Binarymap.mkDict String.compare) id_paths
+    fun source_for id =
+      Option.getOpt(Binarymap.peek(source_paths, id), "file " ^ id)
+    fun expected id = Option.isSome (Binarymap.peek(source_paths, id))
+    fun missing_response completed =
+      case List.find (fn (id, _) => not (Option.isSome (Binarymap.peek(completed, id)))) id_paths of
+          SOME (id, _) => raise Error ("analyser response missing file: " ^ source_for id)
+        | NONE => ()
+    fun loop rest current completed acc =
       case rest of
           [] => raise Error "analyser response missing end"
         | line :: more =>
             (case HolbuildAnalysisProtocol.split line of
-                 ["version", v] =>
-                   if v = HolbuildAnalysisProtocol.protocol_version then loop more current_id acc
-                   else raise Error ("unsupported analyser protocol version: " ^ v)
-               | ["ok"] => loop more current_id acc
-               | ["begin-file", id] => loop more (SOME id) (put id (current id acc) acc)
-               | ["end-file", id] => loop more NONE acc
-               | ["end"] => map (fn (id, deps) => (id, finish_deps deps)) acc
+                 ["begin-file", id] =>
+                   (case current of
+                        NONE =>
+                          if not (expected id) then
+                            raise Error ("analyser response has unknown file id: " ^ id)
+                          else if Option.isSome (Binarymap.peek(completed, id)) then
+                            raise Error ("analyser response has duplicate file id: " ^ id)
+                          else loop more (SOME (id, empty_deps ())) completed acc
+                      | SOME (open_id, _) =>
+                          raise Error ("analyser response missing end-file for " ^ source_for open_id))
+               | ["end-file", id] =>
+                   (case current of
+                        SOME (current_id, deps) =>
+                          if id = current_id then
+                            loop more NONE (Binarymap.insert(completed, id, ()))
+                              ((id, finish_deps deps) :: acc)
+                          else raise Error ("analyser response end-file mismatch: " ^ source_for current_id)
+                      | NONE => raise Error ("analyser response end-file without begin-file: " ^ id))
+               | ["end"] =>
+                   (case current of
+                        NONE =>
+                          if null more then (missing_response completed; rev acc)
+                          else raise Error "analyser response has trailing records after end"
+                      | SOME (id, _) =>
+                          raise Error ("analyser response missing end-file for " ^ source_for id))
                | [field, value] =>
-                   (case current_id of
-                        SOME id => loop more current_id (put id (add_response_field (source_for id) field value (current id acc)) acc)
-                      | NONE => loop more current_id acc)
+                   (case current of
+                        SOME (id, deps) =>
+                          loop more (SOME (id, add_response_field (fn () => source_for id) field value deps)) completed acc
+                      | NONE => raise Error ("analyser response field outside file: " ^ field))
                | _ => raise Error ("bad analyser response line: " ^ line))
+    fun require_version line =
+      case HolbuildAnalysisProtocol.split line of
+          ["version", v] =>
+            if v = HolbuildAnalysisProtocol.protocol_version then ()
+            else raise Error ("unsupported analyser protocol version: " ^ v)
+        | _ => raise Error "analyser response missing version header"
+    fun require_ok line =
+      case HolbuildAnalysisProtocol.split line of
+          ["ok"] => ()
+        | _ => raise Error "analyser response missing ok header"
   in
-    loop lines NONE []
+    case lines of
+        version :: ok :: records =>
+          (require_version version;
+           require_ok ok;
+           loop records NONE (Binarymap.mkDict String.compare) [])
+      | [] => raise Error "analyser response missing version header"
+      | version :: _ => (require_version version;
+                         raise Error "analyser response missing ok header")
   end
 
 fun write_file path text =
@@ -353,8 +394,13 @@ fun prefetch_cached_with_hash requests =
           let
             val files = map (fn (id, {source_path, ...}) => (id, source_path)) (rev missing)
             val results = run_analyser_batch analyser files
+            val missing_by_id =
+              List.foldl
+                (fn ((id, req), dict) => Binarymap.insert(dict, id, req))
+                (Binarymap.mkDict String.compare)
+                missing
             fun store (id, deps) =
-              case assoc id missing of
+              case Binarymap.peek(missing_by_id, id) of
                   SOME {cache_path, source_hash, ...} => (write_cache cache_path source_hash deps handle _ => ())
                 | NONE => ()
           in

@@ -256,6 +256,62 @@ if [ -e "$shared_hol/configured" ] || [ -e "$shared_hol/built" ]; then
   exit 1
 fi
 
+# Older pinned HOL revisions predate tools/sequences/upto-hol.  They must keep
+# working through the historical full-build path instead of becoming
+# unbuildable when the reduced toolchain sequence is unavailable.
+legacy_hol=$tmpdir/legacy-hol
+mkdir -p "$legacy_hol/bin" "$legacy_hol/tools/build"
+git -C "$legacy_hol" init -q
+git_identity "$legacy_hol"
+cat > "$legacy_hol/.gitignore" <<'EOF_IGNORE'
+/bin/hol
+/bin/hol.state
+/sigobj
+/configured
+/legacy-built
+EOF_IGNORE
+cat > "$legacy_hol/tools/smart-configure.sml" <<'SML'
+(* fake configure script; HOLBUILD_POLY fixture handles it *)
+SML
+printf 'src/post\n' > "$legacy_hol/tools/build/build-sequence"
+cat > "$legacy_hol/bin/build" <<'SH'
+#!/usr/bin/env sh
+set -eu
+[ "$#" -eq 1 ] && [ "$1" = "--no-helpdocs" ]
+touch legacy-built
+mkdir -p sigobj
+: > sigobj/BaseTheory.uo
+cat > bin/hol <<'HOL'
+#!/usr/bin/env sh
+exit 0
+HOL
+chmod +x bin/hol
+echo fake-state > bin/hol.state
+SH
+chmod +x "$legacy_hol/bin/build"
+legacy_hol_rev=$(commit_repo "$legacy_hol")
+
+legacy_root=$tmpdir/legacy-root
+mkdir -p "$legacy_root"
+cat > "$legacy_root/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[project]
+name = "legacy-root"
+
+[dependencies.hol]
+git = "$legacy_hol"
+rev = "$legacy_hol_rev"
+TOML
+legacy_log=$tmpdir/legacy-hol.log
+(cd "$legacy_root" && env -u HOLDIR -u HOLBUILD_HOLDIR \
+  HOLBUILD_CANONICAL_HOL_GIT="$legacy_hol" HOLBUILD_POLY="$fakebin/poly" \
+  "$HOLBUILD_BIN" buildhol) > "$legacy_log" 2>&1
+require_grep "falling back to full HOL build" "$legacy_log"
+legacy_shared_hol=$(tail -n 1 "$legacy_log")
+require_file "$legacy_shared_hol/legacy-built"
+
 if (cd "$root" && "$HOLBUILD_BIN" --holdir "$HOLDIR" build --dry-run Foo) > "$tmpdir/holdir.log" 2>&1; then
   echo "schema 2 build unexpectedly accepted --holdir" >&2
   exit 1

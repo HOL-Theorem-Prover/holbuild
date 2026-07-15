@@ -11,6 +11,8 @@ fun use_hol rel = use (path_join(vendored_hol_source, rel));
 
 use_hol("tools-poly/poly/Binarymap.sig");
 use_hol("tools-poly/poly/Binarymap.sml");
+use_hol("tools-poly/poly/Binaryset.sig");
+use_hol("tools-poly/poly/Binaryset.sml");
 use_hol("tools/Holmake/toml/TOMLvalue_dtype.sml");
 use_hol("tools/Holmake/toml/TOMLvalue.sig");
 use_hol("tools/Holmake/toml/TOMLvalue.sml");
@@ -27,6 +29,8 @@ use_hol("src/portableML/poly/w64-SHA1.ML");
 use_hol("src/portableML/poly/ConcIsaLib.sml");
 use_hol("src/portableML/Redblackset.sig");
 use_hol("src/portableML/Redblackset.sml");
+use_hol("src/portableML/Redblackmap.sig");
+use_hol("src/portableML/Redblackmap.sml");
 
 use "vendor/sml-sha256/lib/from-string.sig";
 use "vendor/sml-sha256/lib/from-string.sml";
@@ -41,6 +45,7 @@ use "vendor/sml-sha256/lib/sha256.sig";
 use "vendor/sml-sha256/lib/sha256.sml";
 
 use "sml/hash.sml";
+use "sml/stat_cache.sml";
 use "sml/version.sml";
 use "sml/hol_toolchain_config.sml";
 use "sml/builtin_manifests.sml";

@@ -126,16 +126,118 @@ fun extract_string_list_args keyword tokens =
         | [] => acc
   in loop tokens [] end
 
+(* Holdep records the dependencies introduced while parsing ordinary ML, but
+   HOLSource's header-only Libs declaration is consumed before it emits those
+   references.  Preserve it explicitly so a header library is planned as a
+   source dependency when its source is available in the implicit HOL package.
+
+   Headers consist of line-leading Theory/Ancestors/Libs directives followed by
+   header-element lines.  Do not scan past that region: after Libs, an
+   ordinary SML expression may start with any identifier. *)
+fun header_libs text =
+  let
+    fun starts_word word line =
+      let
+        val n = size word
+      in
+        size line >= n andalso String.substring(line, 0, n) = word andalso
+        (size line = n orelse not (is_word_char (String.sub(line, n))))
+      end
+    fun is_blank line =
+      let
+        fun loop i = i >= size line orelse
+          (Char.isSpace (String.sub(line, i)) andalso loop (i + 1))
+      in
+        loop 0
+      end
+    fun starts_comment line =
+      size line >= 2 andalso String.substring(line, 0, 2) = "(*"
+    fun is_blank_or_comment line =
+      is_blank line orelse starts_comment line
+    fun lines text =
+      let
+        val n = size text
+        fun loop start i acc =
+          if i >= n then rev (String.substring(text, start, n - start) :: acc)
+          else if String.sub(text, i) = #"\n" then
+            loop (i + 1) (i + 1) (String.substring(text, start, i - start) :: acc)
+          else loop start (i + 1) acc
+      in
+        loop 0 0 []
+      end
+    fun skip_qualifier rest =
+      let
+        fun loop xs =
+          case xs of
+              [] => []
+            | Symbol #"]" :: more => more
+            | _ :: more => loop more
+      in
+        case rest of
+            Symbol #"[" :: more => loop more
+          | _ => rest
+      end
+    fun add_elements tokens libs =
+      let
+        fun loop rest acc =
+          case rest of
+              Word word :: more => loop (skip_qualifier more) (add_unique word acc)
+            | _ :: more => loop more acc
+            | [] => acc
+      in
+        loop tokens libs
+      end
+    fun header_elements line =
+      let
+        val tokens = tokenize line
+        fun valid depth rest =
+          case rest of
+              [] => depth = 0
+            | Word _ :: more => valid depth more
+            | Symbol #"[" :: more => valid (depth + 1) more
+            | Symbol #"]" :: more => depth > 0 andalso valid (depth - 1) more
+            | Symbol #"," :: more => depth > 0 andalso valid depth more
+            | Symbol #"=" :: more => depth > 0 andalso valid depth more
+            | _ => false
+      in
+        if valid 0 tokens then SOME tokens else NONE
+      end
+    fun after word line = String.extract(line, size word, NONE)
+    fun scan current rest libs =
+      case rest of
+          [] => libs
+        | line :: more =>
+            if starts_word "Ancestors" line then scan "Ancestors" more libs
+            else if starts_word "Libs" line then
+              scan "Libs" more
+                (add_elements (skip_qualifier (tokenize (after "Libs" line))) libs)
+            else if is_blank_or_comment line then scan current more libs
+            else if current = "" then libs
+            else
+              case header_elements line of
+                  SOME elements =>
+                    scan current more
+                      (if current = "Libs" then add_elements elements libs else libs)
+                | NONE => libs
+    fun find rest =
+      case rest of
+          line :: more => if starts_word "Theory" line then scan "" more [] else find more
+        | [] => []
+  in
+    sort_unique (find (lines text))
+  end
+
 fun extract path =
   let
-    val tokens = tokenize (read_all path)
+    val text = read_all path
+    val tokens = tokenize text
     val loads = extract_string_args "load" tokens
     val uses = extract_string_args "use" tokens
     val extra_deps = extract_string_list_args "holbuild_extra_deps" tokens
   in
     {loads = sort_unique loads, uses = sort_unique uses,
      extra_deps = sort_unique extra_deps,
-     holdep_mentions = holdep_mentions path}
+     holdep_mentions = sort_unique (holdep_mentions path @ header_libs text)}
   end
 
 end
