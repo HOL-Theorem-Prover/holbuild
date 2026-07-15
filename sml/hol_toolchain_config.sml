@@ -39,6 +39,14 @@ fun build_arg_list ({sequence, no_helpdocs, kernel_variant} : t) =
 
 fun build_args_text config = String.concatWith " " (build_arg_list config)
 
+(* HOL revisions from before the reduced build sequence was introduced still
+   support the historical full build.  Keep kernel selection in that fallback;
+   only the unavailable sequence argument is omitted. *)
+fun full_build_arg_list ({no_helpdocs, kernel_variant, ...} : t) =
+  helpdocs_args no_helpdocs @ kernel_variant_args kernel_variant
+
+fun full_build_args_text config = String.concatWith " " (full_build_arg_list config)
+
 fun key_material_fields (config : t) =
   ["build_sequence=" ^ sequence_name (#sequence config),
    "build_sequence_file=" ^ sequence_file (#sequence config),

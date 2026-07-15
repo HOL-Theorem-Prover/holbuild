@@ -63,6 +63,15 @@ QED
 val _ = export_theory();
 SML
 
+cat > "$tmpdir/header-boundary.sml" <<SML
+use "$HOLBUILD_ROOT/sml/analyser/dependency_extract.sml";
+val expected = ["sortingLib"];
+val actual = HolbuildAnalyserDependencyExtract.header_libs
+  "Theory C\\nLibs sortingLib\\n\\nexport_theory();\\n";
+val _ = if actual = expected then () else raise Fail "Libs leaked into SML body";
+SML
+"$HOLDIR/bin/hol" < "$tmpdir/header-boundary.sml" > "$tmpdir/header-boundary.log"
+
 (cd "$project" && "$HOLBUILD_BIN" build --dry-run ATheory) > "$tmpdir/dry.log"
 require_grep "external theories: .*arithmeticTheory" "$tmpdir/dry.log"
 require_grep "external theories: .*listTheory" "$tmpdir/dry.log"

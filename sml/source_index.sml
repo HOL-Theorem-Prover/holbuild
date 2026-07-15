@@ -87,9 +87,8 @@ fun generated_theory_artifact file =
   has_suffix "Theory.sml" file orelse
   has_suffix "Theory.sig" file
 
-fun classify package source_root artifact_root policies abs_path =
+fun classify package artifact_root policies abs_path rel =
   let
-    val rel = relative_path source_root abs_path
     val file = filename rel
   in
     if generated_theory_artifact file then NONE
@@ -178,15 +177,14 @@ fun list_dir path =
 
 fun list_dir_if_readable path = list_dir path handle Error _ => []
 
-fun has_source_path path sources =
-  let val path = normalize_path path
-  in List.exists (fn source : source => normalize_path (#source_path source) = path) sources end
-
 fun scan_file package source_root artifact_root policies excludes exclude_globs path acc =
-  if excluded excludes exclude_globs (relative_path source_root path) then acc
-  else case classify package source_root artifact_root policies path of
+  let val rel = relative_path source_root path
+  in
+    if excluded excludes exclude_globs rel then acc
+    else case classify package artifact_root policies path rel of
       NONE => acc
-    | SOME source => if has_source_path path acc then acc else source :: acc
+    | SOME source => source :: acc
+  end
 
 fun scan_dir package source_root artifact_root policies excludes exclude_globs path acc =
   let
@@ -211,6 +209,35 @@ fun compare_source (a : source, b : source) =
       EQUAL => String.compare(#relative_path a, #relative_path b)
     | order => order
 
+fun split xs =
+  let
+    fun loop left right rest =
+      case rest of
+          [] => (left, right)
+        | [x] => (x :: left, right)
+        | x :: y :: zs => loop (x :: left) (y :: right) zs
+  in
+    loop [] [] xs
+  end
+
+fun merge compare left right =
+  case (left, right) of
+      ([], _) => right
+    | (_, []) => left
+    | (l :: ls, r :: rs) =>
+        if compare (l, r) <> GREATER then
+          l :: merge compare ls right
+        else
+          r :: merge compare left rs
+
+fun msort compare xs =
+  case xs of
+      [] => []
+    | [_] => xs
+    | _ =>
+      let val (left, right) = split xs
+      in merge compare (msort compare left) (msort compare right) end
+
 fun compatible_same_name (a : source) (b : source) =
   #package a = #package b andalso
   (case (#kind a, #kind b) of
@@ -218,31 +245,37 @@ fun compatible_same_name (a : source) (b : source) =
      | (Sig, Sml) => true
      | _ => false)
 
-fun by_logical sources =
+fun by_logical (sources : source list) =
   let
-    fun conflicts source other =
-      #logical_name source = #logical_name other andalso
-      not (compatible_same_name source other)
+    fun conflicts source other = not (compatible_same_name source other)
     fun insert (source, seen) =
-      case List.find (conflicts source) seen of
-          NONE => source :: seen
-        | SOME other =>
-            raise Error ("duplicate logical name " ^ #logical_name source ^ ": " ^
-                         #package other ^ ":" ^ #relative_path other ^ " and " ^
-                         #package source ^ ":" ^ #relative_path source)
+      case Binarymap.peek (seen, #logical_name source) of
+          NONE => Binarymap.insert (seen, #logical_name source, [source])
+        | SOME same_name =>
+          case List.find (conflicts source) same_name of
+              NONE => Binarymap.insert (seen, #logical_name source, source :: same_name)
+            | SOME other =>
+                raise Error ("duplicate logical name " ^ #logical_name source ^ ": " ^
+                             #package other ^ ":" ^ #relative_path other ^ " and " ^
+                             #package source ^ ":" ^ #relative_path source)
   in
-    ignore (List.foldl insert [] sources);
+    ignore (List.foldl insert (Binarymap.mkDict String.compare) sources);
     sources
   end
 
-fun insert_sorted source sources =
-  case sources of
-      [] => [source]
-    | x :: xs =>
-        if compare_source(source, x) = LESS then source :: sources
-        else x :: insert_sorted source xs
+fun dedup_sources sources =
+  let
+    fun insert (source : source, (seen, acc)) =
+      let val path = normalize_path (#source_path source)
+      in
+        if Redblackset.member (seen, path) then (seen, acc)
+        else (Redblackset.add (seen, path), source :: acc)
+      end
+  in
+    #2 (List.foldr insert (Redblackset.empty String.compare, []) sources)
+  end
 
-fun sort_sources sources = List.foldl (fn (source, acc) => insert_sorted source acc) [] sources
+fun sort_sources sources = msort compare_source sources
 
 fun validate_action_policies package_name policies sources =
   let
@@ -266,7 +299,7 @@ fun scan_member name source_root artifact_root policies excludes exclude_globs (
   else if is_readable member then scan_file name source_root artifact_root policies excludes exclude_globs member acc
   else raise Error ("member does not exist: " ^ member)
 
-fun discover_package package acc =
+fun scan_package_sources allow_missing_members package acc =
   let
     val name = HolbuildProject.package_name package
     val source_root = HolbuildProject.package_root package
@@ -274,30 +307,99 @@ fun discover_package package acc =
     val policies = HolbuildProject.package_action_policies package
     val excludes = HolbuildProject.package_excludes package
     val exclude_globs = HolbuildProject.package_exclude_globs package
+    val members =
+      map (fn member => HolbuildProject.abs_under source_root member)
+        (HolbuildProject.package_members package)
+    fun scan_one (member, sources) =
+      if allow_missing_members andalso not (is_dir member orelse is_readable member) then sources
+      else scan_member name source_root artifact_root policies excludes exclude_globs (member, sources)
+  in
+    List.foldl scan_one acc members
+  end
+
+(* Generator outputs may be the targets of action policies.  Include only
+   declared paths that a post-generation scan could discover: a generator is
+   allowed to create a missing member directory, so membership is determined
+   lexically rather than by statting it.  In particular, do not let an
+   arbitrary source-shaped output outside build.members (or under an exclude)
+   satisfy policy prevalidation before its generator runs. *)
+fun declared_generator_sources package =
+  let
+    val name = HolbuildProject.package_name package
+    val source_root = HolbuildProject.package_root package
+    val artifact_root = HolbuildProject.package_artifact_root package
+    val policies = HolbuildProject.package_action_policies package
+    val excludes = HolbuildProject.package_excludes package
+    val exclude_globs = HolbuildProject.package_exclude_globs package
+    val members =
+      map (fn member => normalize_path (HolbuildProject.abs_under source_root member))
+        (HolbuildProject.package_members package)
+    fun member_contains member path =
+      path = member orelse
+      String.isPrefix (if has_suffix "/" member then member else member ^ "/") path
+    fun is_member path = List.exists (fn member => member_contains member path) members
+    fun add_output (output, acc) =
+      let
+        val path = normalize_path (HolbuildProject.abs_under source_root output)
+        val rel = relative_path source_root path
+      in
+        if not (is_member path) orelse excluded excludes exclude_globs rel then acc
+        else
+          case classify name artifact_root policies path rel of
+              NONE => acc
+            | SOME source => source :: acc
+      end
+    fun add_generator (generator, acc) =
+      List.foldl add_output acc (HolbuildProject.generator_outputs generator)
+  in
+    List.foldl add_generator [] (HolbuildProject.package_generators package)
+  end
+
+fun prevalidate_action_policies package =
+  let
+    (* A generator can create a declared build member, so preflight ignores a
+       missing member and lets the normal post-generation scan diagnose it. *)
+    val candidates = scan_package_sources true package [] @ declared_generator_sources package
+  in
+    validate_action_policies (HolbuildProject.package_name package)
+                             (HolbuildProject.package_action_policies package)
+                             candidates
+  end
+
+fun discover_package package acc =
+  let
     val _ = HolbuildGenerators.run_package package
             handle HolbuildGenerators.Error msg => raise Error msg
                  | HolbuildGenerators.ErrorWithDebugArtifacts (msg, artifacts) =>
                      raise ErrorWithDebugArtifacts (msg, artifacts)
-    val members =
-      map (fn member => HolbuildProject.abs_under source_root member)
-        (HolbuildProject.package_members package)
-    val sources =
-      List.foldl
-        (scan_member name source_root artifact_root policies excludes exclude_globs)
-        acc
-        members
-    val _ = validate_action_policies name policies sources
   in
-    sources
+    scan_package_sources false package acc
   end
 
 fun discover_with resolution (project : HolbuildProject.t) =
-  by_logical
-    (sort_sources
-       (List.foldl
-          (fn (package, acc) => discover_package package acc)
-          []
-          (HolbuildProject.packages_with resolution project)))
+  let
+    val packages = HolbuildProject.packages_with resolution project
+    val _ = List.app prevalidate_action_policies packages
+    val sources =
+      sort_sources
+        (dedup_sources
+           (List.foldl
+              (fn (package, acc) => discover_package package acc)
+              []
+              packages))
+    (* A package can scan a physical file already retained from another
+       package.  Validate after global deduplication so its policy cannot be
+       accepted for a source that will not exist in the final index. *)
+    val _ =
+      List.app
+        (fn package =>
+            validate_action_policies (HolbuildProject.package_name package)
+                                     (HolbuildProject.package_action_policies package)
+                                     sources)
+        packages
+  in
+    by_logical sources
+  end
 
 fun discover project = discover_with HolbuildProject.standard_resolution project
 

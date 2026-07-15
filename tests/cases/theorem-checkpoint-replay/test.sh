@@ -154,6 +154,12 @@ Proof
 QED
 
 val _ = export_theory();
+
+val _ =
+  if (OS.FileSys.access (".hol/docs/ATheory.html", []) handle OS.SysErr _ => false) orelse
+     (OS.FileSys.access (".hol/docs/AScript.html", []) handle OS.SysErr _ => false) then
+    raise Fail "holbuild checkpoint/replay child generated throwaway HTML documentation"
+  else ();
 SML
 
 first_log=$tmpdir/first.log

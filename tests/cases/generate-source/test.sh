@@ -201,3 +201,54 @@ if (cd "$cycle_project" && "$HOLBUILD_BIN" build --dry-run) > "$cycle_log" 2>&1;
   exit 1
 fi
 require_grep "generator dependency cycle" "$cycle_log"
+
+# Ready generators retain FIFO manifest order: work unblocked by first must not
+# leapfrog independent work which was already ready.
+order_project=$tmpdir/order-project
+mkdir -p "$order_project/scripts" "$order_project/data"
+cat > "$order_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "generator_order"
+
+[build]
+members = []
+
+[[generate]]
+name = "first"
+command = ["python3", "scripts/record.py", "data/order", "gen/first.txt", "first"]
+outputs = ["gen/first.txt"]
+
+[[generate]]
+name = "dependent"
+deps = ["first"]
+command = ["python3", "scripts/record.py", "data/order", "gen/dependent.txt", "dependent"]
+outputs = ["gen/dependent.txt"]
+
+[[generate]]
+name = "independent"
+command = ["python3", "scripts/record.py", "data/order", "gen/independent.txt", "independent"]
+outputs = ["gen/independent.txt"]
+TOML
+cat > "$order_project/scripts/record.py" <<'PY'
+from pathlib import Path
+import sys
+log, output, name = map(Path, sys.argv[1:])
+log.parent.mkdir(parents=True, exist_ok=True)
+log.write_text((log.read_text() if log.exists() else "") + name.name + "\n")
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_text(name.name + "\n")
+PY
+(cd "$order_project" && "$HOLBUILD_BIN" build --dry-run) > "$tmpdir/order.log"
+expected_order=$'first\nindependent\ndependent'
+actual_order=$(cat "$order_project/data/order")
+[[ "$actual_order" = "$expected_order" ]] || {
+  printf 'generator execution order was %s, expected %s\n' "$actual_order" "$expected_order" >&2
+  exit 1
+}

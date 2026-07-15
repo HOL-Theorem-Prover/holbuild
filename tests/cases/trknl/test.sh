@@ -60,6 +60,14 @@ if [[ ! -s "$trace" ]]; then
   exit 1
 fi
 
+hash_log=$tmpdir/output-hashes.log
+(cd "$project" && trknl_holbuild build --force --emit-output-hashes --trknl ATheory) > "$hash_log" 2>&1
+metadata="$project/.holbuild/dep/trknl/src/AScript.sml.key"
+for output in "$trace" "$remapped"; do
+  expected=$(sha1sum "$output" | awk '{print $1}')
+  require_grep "^output-sha1=$output $expected$" "$metadata"
+done
+
 second_log=$tmpdir/second.log
 (cd "$project" && trknl_holbuild --verbose build --trknl ATheory) > "$second_log" 2>&1
 require_grep "ATheory is up to date" "$second_log"

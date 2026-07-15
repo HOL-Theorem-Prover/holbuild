@@ -42,8 +42,10 @@ fun write_action root request = HolbuildFSCacheBackend.write_action (filesystem_
 fun remove_action root key = HolbuildFSCacheBackend.remove_action (filesystem_cache root) key
 fun touch_action root key = HolbuildFSCacheBackend.touch_action (filesystem_cache root) key
 fun has_blob root hash = HolbuildFSCacheBackend.has_blob (filesystem_cache root) hash
+fun verify_blob root hash = HolbuildFSCacheBackend.verify_blob (filesystem_cache root) hash
 fun fetch_blob root request = HolbuildFSCacheBackend.fetch_blob (filesystem_cache root) request
 fun publish_blob root request = HolbuildFSCacheBackend.publish_blob (filesystem_cache root) request
+fun link_or_copy request = HolbuildFSCacheBackend.link_or_copy request
 
 fun children dir =
   if not (path_exists dir) then []

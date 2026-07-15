@@ -974,10 +974,21 @@ fun parse_builtin_holdir_at args =
     parse_table_at (TOML.fromString text) args
   end
 
+val dependency_project_cache : (string, t) Binarymap.dict ref =
+  ref (Binarymap.mkDict String.compare)
+
+val materialized_dependency_cache : (string, unit) Binarymap.dict ref =
+  ref (Binarymap.mkDict String.compare)
+
+fun clear_dependency_caches () =
+  (dependency_project_cache := Binarymap.mkDict String.compare;
+   materialized_dependency_cache := Binarymap.mkDict String.compare)
+
 fun parse manifest =
   let
     val root = manifest_root manifest
     val local_config = parse_local_config root
+    val _ = clear_dependency_caches ()
   in
     parse_at {manifest = manifest, root = root, artifact_root = root, graph_artifact_root = root, local_config = local_config}
   end
@@ -991,6 +1002,7 @@ fun discover () =
             val root = manifest_root manifest
             val artifact_root' = if artifact_root = "" then root else artifact_root
             val local_config = parse_local_config root
+            val _ = clear_dependency_caches ()
           in
             parse_at {manifest = manifest, root = root, artifact_root = artifact_root', graph_artifact_root = artifact_root', local_config = local_config}
           end
@@ -1169,19 +1181,35 @@ fun project_package ({root, artifact_root, graph_artifact_root, manifest, name, 
            action_policies = action_policies,
            generators = generators}
 
+fun dependency_project_cache_key (project : t) name dep_root dep_manifest dep_artifact_root =
+  String.concatWith "\029" [#graph_artifact_root project, name, dep_root, dep_manifest, dep_artifact_root]
+
+fun materialized_dependency_cache_key (project : t) name git rev =
+  String.concatWith "\029" [#graph_artifact_root project, name, git, rev]
+
+fun materialize_dependency_once (project : t) (dep as Dependency {name, source}) =
+  case source of
+      GitSource {git, rev} =>
+        if schema2_hol_dependency dep orelse Option.isSome (override_path (#overrides project) name) then ()
+        else
+          let
+            val effective_git = Option.getOpt(override_git (#overrides project) name, git)
+            val key = materialized_dependency_cache_key project name effective_git rev
+          in
+            case Binarymap.peek(!materialized_dependency_cache, key) of
+                SOME () => ()
+              | NONE =>
+                  (ignore (HolbuildGitCache.materialize {name = name, git = effective_git, rev = rev,
+                                                         artifact_root = #graph_artifact_root project});
+                   materialized_dependency_cache :=
+                     Binarymap.insert(!materialized_dependency_cache, key, ()))
+          end
+    | _ => ()
+
 fun root_package_name project = package_name (project_package project)
 
 fun dependency_project_with resolution (project : t) (dep as Dependency {name, source}) =
   let
-    val _ =
-      case source of
-          GitSource {git, rev} =>
-            if schema2_hol_dependency dep orelse Option.isSome (override_path (#overrides project) name) then ()
-            else
-              let val effective_git = Option.getOpt(override_git (#overrides project) name, git)
-              in ignore (HolbuildGitCache.materialize {name = name, git = effective_git, rev = rev,
-                                                       artifact_root = #graph_artifact_root project}) end
-        | _ => ()
     val dep_root =
       case dependency_local_path_with resolution project dep of
           SOME path => path
@@ -1190,55 +1218,67 @@ fun dependency_project_with resolution (project : t) (dep as Dependency {name, s
       case dependency_manifest project dep of
           SOME manifest => manifest
         | NONE => die ("dependency " ^ name ^ " has no manifest")
-    val parse_dep =
-      if schema2_hol_dependency dep then parse_builtin_holdir_at
+    fun parse_dep args =
+      if schema2_hol_dependency dep then parse_builtin_holdir_at args
       else
         (if readable dep_manifest then ()
          else die ("dependency " ^ name ^ " manifest not found: " ^ dep_manifest);
-         parse_at)
+         parse_at args)
     val dep_artifact_root =
       Path.concat(Path.concat(Path.concat(#graph_artifact_root project, ".holbuild"), "packages"), name)
-    val dep_project = parse_dep {manifest = dep_manifest, root = dep_root, artifact_root = dep_artifact_root,
-                                 graph_artifact_root = #graph_artifact_root project,
-                                 local_config = LocalConfig {overrides = #overrides project,
-                                                             build_excludes = #local_build_excludes project,
-                                                             build_exclude_globs = #local_build_exclude_globs project,
-                                                             build_jobs = #local_build_jobs project,
-                                                             build_tactic_timeout = #build_tactic_timeout project,
-                                                             checkpoint_limit_gb = #checkpoint_limit_gb project,
-                                                             remote_cache_url = #remote_cache_url project,
-                                                             remote_cache_curl_config = #remote_cache_curl_config project}}
-    val declared_name = #name dep_project
-    val _ =
-      case declared_name of
-          NONE => ()
-        | SOME actual =>
-            if actual = name orelse schema2_hol_dependency dep then ()
-            else die ("dependency " ^ name ^ " manifest declares project.name = " ^ actual)
+    val cache_key = dependency_project_cache_key project name dep_root dep_manifest dep_artifact_root
   in
-    dep_project
+    case Binarymap.peek(!dependency_project_cache, cache_key) of
+        SOME dep_project => dep_project
+      | NONE =>
+          let
+            val _ = materialize_dependency_once project dep
+            val dep_project =
+              parse_dep {manifest = dep_manifest, root = dep_root, artifact_root = dep_artifact_root,
+                         graph_artifact_root = #graph_artifact_root project,
+                         local_config = LocalConfig {overrides = #overrides project,
+                                                     build_excludes = #local_build_excludes project,
+                                                     build_exclude_globs = #local_build_exclude_globs project,
+                                                     build_jobs = #local_build_jobs project,
+                                                     build_tactic_timeout = #build_tactic_timeout project,
+                                                     checkpoint_limit_gb = #checkpoint_limit_gb project,
+                                                     remote_cache_url = #remote_cache_url project,
+                                                     remote_cache_curl_config = #remote_cache_curl_config project}}
+            val declared_name = #name dep_project
+            val _ =
+              case declared_name of
+                  NONE => ()
+                | SOME actual =>
+                    if actual = name orelse schema2_hol_dependency dep then ()
+                    else die ("dependency " ^ name ^ " manifest declares project.name = " ^ actual)
+          in
+            dependency_project_cache := Binarymap.insert(!dependency_project_cache, cache_key, dep_project);
+            dep_project
+          end
   end
 
 fun dependency_project project dep = dependency_project_with standard_resolution project dep
 
 fun resolved_hol_dependency_with resolution project =
   let
-    fun seen name names = List.exists (fn n => n = name) names
-    fun search_project names p =
+    fun search_project seen p =
       case hol_dependency p of
           SOME dep => SOME dep
-        | NONE => search_deps names p (#dependencies p)
-    and search_deps names parent deps =
+        | NONE => search_deps seen p (#dependencies p)
+    and search_deps seen parent deps =
       case deps of
           [] => NONE
         | (dep as Dependency {name, ...}) :: rest =>
-            if seen name names then search_deps names parent rest
+            if Binaryset.member(seen, name) then search_deps seen parent rest
             else
-              (case search_project (name :: names) (dependency_project_with resolution parent dep) of
+              let val seen' = Binaryset.add(seen, name)
+              in
+                case search_project seen' (dependency_project_with resolution parent dep) of
                    SOME hol => SOME hol
-                 | NONE => search_deps (name :: names) parent rest)
+                 | NONE => search_deps seen' parent rest
+              end
   in
-    search_project [] project
+    search_project (Binaryset.empty String.compare) project
   end
 
 fun resolved_hol_dependency project = resolved_hol_dependency_with standard_resolution project
@@ -1272,24 +1312,24 @@ fun same_dependency_source (GitSource a, GitSource b) = #git a = #git b andalso 
 fun packages_with resolution (project : t) =
   let
     val artifact_parent = #graph_artifact_root project
-    fun seen_source name seen =
-      Option.map #2 (List.find (fn (n, _) => n = name) seen)
     fun add_dependency parent_project (dep as Dependency {name, source}, (seen, packages)) =
-      case seen_source name seen of
+      case Binarymap.peek(seen, name) of
           SOME previous =>
             if same_dependency_source (previous, source) then (seen, packages)
             else die ("conflicting dependency " ^ name)
         | NONE =>
             let
               val (package, dep_project) = dependency_package_with resolution artifact_parent parent_project dep
-              val (seen', packages') = add_project dep_project ((name, source) :: seen, package :: packages)
+              val (seen', packages') = add_project dep_project (Binarymap.insert(seen, name, source), package :: packages)
             in
               (seen', packages')
             end
     and add_project current_project state =
       List.foldl (add_dependency current_project) state (#dependencies current_project)
     val root_package = project_package project
-    val (_, packages) = add_project project ([], [root_package])
+    val (_, packages) =
+      add_project project (Binarymap.mkDict String.compare : (string, dependency_source) Binarymap.dict,
+                           [root_package])
     val result = rev packages
     val hol_count = length (List.filter (fn package => package_name package = "hol") result)
     val _ =

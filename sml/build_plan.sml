@@ -7,12 +7,14 @@ structure FS = OS.FileSys
 exception Error of string
 
 type node =
-  { source : HolbuildSourceIndex.source,
+  { key : string,
+    source : HolbuildSourceIndex.source,
     deps : HolbuildDependencies.t option ref,
     source_hash : string option ref,
     external_dirs : string list }
 
 type keyed_node = {node : node, input_key : string}
+type keys = (string, string) Binarymap.dict
 
 fun source_of ({source, ...} : node) = source
 
@@ -20,7 +22,7 @@ fun source_hash_of ({source, source_hash, ...} : node) =
   case !source_hash of
       SOME hash => hash
     | NONE =>
-        let val hash = HolbuildHash.file_sha1 (#source_path source)
+        let val hash = HolbuildStatCache.file_sha1 (HolbuildStatCache.current_instance ()) (#source_path source)
         in source_hash := SOME hash; hash end
 
 fun dependency_cache_path source =
@@ -42,13 +44,17 @@ fun external_dirs_of ({external_dirs, ...} : node) = external_dirs
 fun logical_name node = #logical_name (source_of node)
 fun package node = #package (source_of node)
 fun relative_path node = #relative_path (source_of node)
-fun key node = package node ^ "\000" ^ relative_path node ^ "\000" ^ logical_name node
+fun key ({key, ...} : node) = key
 
-fun member value values = List.exists (fn x => x = value) values
-
-fun add_unique (value, values) = if member value values then values else value :: values
-
-fun unique_strings values = rev (List.foldl add_unique [] values)
+fun unique_strings values =
+  let
+    fun add (value, (seen, kept)) =
+      if Binaryset.member(seen, value) then (seen, kept)
+      else (Binaryset.add(seen, value), value :: kept)
+    val (_, kept) = List.foldl add (Binaryset.empty String.compare, []) values
+  in
+    rev kept
+  end
 
 fun normalize_path path = Path.mkCanonical path handle Path.InvalidArc => path
 
@@ -60,13 +66,11 @@ type name_index = (string * node list) Vector.vector
 
 fun split_pairs xs =
   let
-    fun loop left right rest =
-      case rest of
-          [] => (left, right)
-        | [x] => (x :: left, right)
-        | x :: y :: zs => loop (x :: left) (y :: right) zs
+    fun loop 0 left right = (rev left, right)
+      | loop count left (x :: right) = loop (count - 1) (x :: left) right
+      | loop _ _ [] = raise Error "internal error while splitting sort input"
   in
-    loop [] [] xs
+    loop (length xs div 2) [] xs
   end
 
 fun merge_pairs compare left right =
@@ -135,17 +139,29 @@ fun build_key_index nodes =
   end
 
 type direct_project_deps_cache = (string * node list) Vector.vector
+type deps_closure_cache = node list option array ref
+type dependency_context_key_cache = (string * string) option array ref
 
 type t =
   {universe : node list,
    selected : node list,
    name_index : name_index,
-   direct_project_deps_cache : direct_project_deps_cache}
+   universe_key_index : key_index,
+   direct_project_deps_cache : direct_project_deps_cache,
+   deps_closure_cache : deps_closure_cache,
+   dependency_context_key_cache : dependency_context_key_cache}
 
 fun universe_nodes ({universe, ...} : t) = universe
 fun selected_nodes ({selected, ...} : t) = selected
 fun lookup ({name_index, ...} : t) = indexed_nodes_named name_index
+fun node_named ({name_index, ...} : t) name =
+  case indexed_nodes_named name_index name of
+      node :: _ => SOME node
+    | [] => NONE
+fun universe_key_index ({universe_key_index, ...} : t) = universe_key_index
 fun direct_project_deps_cache ({direct_project_deps_cache, ...} : t) = direct_project_deps_cache
+fun deps_closure_cache ({deps_closure_cache, ...} : t) = deps_closure_cache
+fun dependency_context_key_cache ({dependency_context_key_cache, ...} : t) = dependency_context_key_cache
 
 fun indexed_key_id index node_key =
   let
@@ -200,10 +216,15 @@ fun direct_dependency_names node =
 
 fun unique_nodes nodes =
   let
-    fun add (node, kept) =
-      if member (key node) (map key kept) then kept else node :: kept
+    fun add (node, (seen, kept)) =
+      let val node_key = key node
+      in
+        if Binaryset.member(seen, node_key) then (seen, kept)
+        else (Binaryset.add(seen, node_key), node :: kept)
+      end
+    val (_, kept) = List.foldl add (Binaryset.empty String.compare, []) nodes
   in
-    rev (List.foldl add [] nodes)
+    rev kept
   end
 
 fun direct_holdep_project_deps_with lookup node =
@@ -388,7 +409,7 @@ fun cycle_message path node =
   "dependency cycle: " ^
   String.concatWith " -> " (rev (logical_name node :: map logical_name path))
 
-fun topo_sort_with lookup nodes roots =
+fun topo_sort_with_deps lookup nodes direct_deps roots =
   let
     val key_index = build_key_index nodes
     val visited = Array.array (length nodes, false)
@@ -402,7 +423,7 @@ fun topo_sort_with lookup nodes roots =
         else
           let
             val _ = Array.update(active, id, true)
-            val deps = direct_project_deps_with lookup nodes node
+            val deps = direct_deps node
             val order' = List.foldl (fn (dep, acc) => visit (node :: active_path) dep acc) order deps
             val _ = Array.update(active, id, false)
             val _ = Array.update(visited, id, true)
@@ -418,24 +439,46 @@ fun topo_sort_with lookup nodes roots =
     plan
   end
 
+fun topo_sort_with lookup nodes roots =
+  topo_sort_with_deps lookup nodes (direct_project_deps_with lookup nodes) roots
+
 fun topo_sort nodes roots =
   topo_sort_with (nodes_named nodes) nodes roots
 
+fun plan_node_id plan node = indexed_key_id (universe_key_index plan) (key node)
+
 fun transitive_project_deps plan node =
-  topo_sort_with (lookup plan) (universe_nodes plan) (direct_project_deps plan node)
+  case direct_project_deps_cached (direct_project_deps_cache plan) node of
+      NONE => topo_sort_with (lookup plan) (universe_nodes plan) (direct_project_deps plan node)
+    | SOME roots =>
+        let
+          val cache = !(deps_closure_cache plan)
+          val id = plan_node_id plan node
+        in
+          case Array.sub(cache, id) of
+              SOME deps => deps
+            | NONE =>
+                let
+                  val deps = topo_sort_with_deps (lookup plan) (universe_nodes plan)
+                               (direct_project_deps plan) roots
+                in
+                  Array.update(cache, id, SOME deps);
+                  deps
+                end
+        end
 
-fun closure_external_theories plan node =
-  unique_strings
-    (List.concat (map (direct_external_theories plan)
-       (transitive_project_deps plan node @ [node])))
+fun cached_dependency_context_key plan node context_id =
+  case Array.sub(!(dependency_context_key_cache plan), plan_node_id plan node) of
+      SOME (cached_context_id, value) =>
+        if cached_context_id = context_id then SOME value else NONE
+    | NONE => NONE
 
-fun closure_external_libs plan node =
-  unique_strings
-    (List.concat (map (direct_external_libs plan)
-       (transitive_project_deps plan node @ [node])))
+fun remember_dependency_context_key plan node context_id value =
+  Array.update(!(dependency_context_key_cache plan), plan_node_id plan node, SOME (context_id, value))
 
 fun make_node external_dirs source =
-  {source = source,
+  {key = #package source ^ "\000" ^ #relative_path source ^ "\000" ^ #logical_name source,
+   source = source,
    deps = ref NONE,
    source_hash = ref NONE,
    external_dirs = external_dirs}
@@ -487,10 +530,16 @@ fun plan_selection holdir sources selection =
     val roots = target_roots lookup nodes selection
     val _ = prefetch_reachable_dependencies lookup nodes roots
     val selected = topo_sort_with lookup nodes roots
+    val universe_key_index = build_key_index nodes
     val direct_project_deps_cache = build_direct_project_deps_cache_with lookup selected
+    val deps_closure_cache = ref (Array.array(length nodes, NONE : node list option))
+    val dependency_context_key_cache = ref (Array.array(length nodes, NONE : (string * string) option))
   in
     {universe = nodes, selected = selected, name_index = index,
-     direct_project_deps_cache = direct_project_deps_cache}
+     universe_key_index = universe_key_index,
+     direct_project_deps_cache = direct_project_deps_cache,
+     deps_closure_cache = deps_closure_cache,
+     dependency_context_key_cache = dependency_context_key_cache}
   end
 
 fun plan_all holdir sources = plan_selection holdir sources AllTargets
@@ -524,14 +573,7 @@ fun path_has_glob path =
 
 fun join root rel = if rel = "" then root else Path.concat(root, rel)
 
-fun sort_strings xs =
-  let
-    fun insert x [] = [x]
-      | insert x (y :: ys) =
-          if String.compare(x, y) = LESS then x :: y :: ys else y :: insert x ys
-  in
-    List.foldl (fn (x, acc) => insert x acc) [] xs
-  end
+fun sort_strings xs = sort_pairs String.compare xs
 
 fun files_under abs rel =
   if is_dir abs then
@@ -717,9 +759,14 @@ fun external_sources_for_name dirs name =
 fun prefetch_external_dependency_sources_with lookup nodes =
   let
     fun item_id (dirs, name) = String.concatWith "\030" dirs ^ "\029" ^ name
-    fun seen item seen_ids = member (item_id item) seen_ids
-    fun add_unseen (item, items) =
-      if List.exists (fn existing => item_id existing = item_id item) items then items else item :: items
+    val empty_item_ids = Binaryset.empty String.compare
+    fun add_unseen (item, (items, ids)) =
+      let val id = item_id item
+      in
+        if Binaryset.member (ids, id) then (items, ids)
+        else (item :: items, Binaryset.add (ids, id))
+      end
+    fun unseen_items items = #1 (List.foldl add_unseen ([], empty_item_ids) items)
     fun source_requests paths =
       map (fn path => {source_path = path, source_hash = HolbuildHash.file_sha1 path}) paths
     fun deps_for_path path =
@@ -739,12 +786,12 @@ fun prefetch_external_dependency_sources_with lookup nodes =
           [] => ()
         | _ =>
             let
-              val fresh = List.filter (fn item => not (seen item seen_ids)) pending
-              val seen_ids' = List.foldl (fn (item, acc) => item_id item :: acc) seen_ids fresh
+              val (fresh, seen_ids') =
+                List.foldl add_unseen ([], seen_ids) pending
               val paths = unique_strings (List.concat (map (fn (dirs, name) => external_sources_for_name dirs name) fresh))
               val _ = HolbuildDependencies.prefetch_global_cached_with_hash (source_requests paths)
               val next =
-                List.foldl
+                #1 (List.foldl
                   (fn ((dirs, name), acc) =>
                       let
                         val source_paths = external_sources_for_name dirs name
@@ -752,13 +799,13 @@ fun prefetch_external_dependency_sources_with lookup nodes =
                       in
                         List.foldl add_unseen acc (follow_names dirs names)
                       end)
-                  [] fresh
+                  ([], empty_item_ids) fresh)
             in
               loop seen_ids' next
             end
-    val initial = List.foldl add_unseen [] (List.concat (map initial_items_for_node nodes))
+    val initial = unseen_items (List.concat (map initial_items_for_node nodes))
   in
-    loop [] initial
+    loop empty_item_ids initial
   end
   handle HolbuildDependencies.Error msg => raise Error msg
 
@@ -771,9 +818,9 @@ fun prefetch_external_dependency_sources_with lookup nodes =
    not in sigobj, treat it as part of the hol.state bootstrap boundary. *)
 fun external_key_lookup_with_timing timing toolchain_key =
   let
-    val memo = ref ([] : (string * string) list)
-    fun memoized id = Option.map #2 (List.find (fn (key, _) => key = id) (!memo))
-    fun remember id value = (memo := (id, value) :: !memo; value)
+    val memo = ref (Binarymap.mkDict String.compare : (string, string) Binarymap.dict)
+    fun memoized id = Binarymap.peek (!memo, id)
+    fun remember id value = (memo := Binarymap.insert (!memo, id, value); value)
     fun in_stack id stack = List.exists (fn active => active = id) stack
     fun cachekey_line cachekey =
       "cachekey=" ^ String.translate (fn #"\n" => " " | c => str c) (read_text cachekey)
@@ -843,9 +890,9 @@ fun bool_text true = "true"
 fun hash_text text = HolbuildHash.string_sha1 text
 
 fun lookup_key keys dep =
-  case List.find (fn (dep_key, _) => dep_key = key dep) keys of
-      SOME (_, input_key) => input_key
-    | NONE => raise Error ("missing action key for dependency: " ^ logical_name dep)
+  Binarymap.find (keys, key dep)
+  handle Binarymap.NotFound =>
+    raise Error ("missing action key for dependency: " ^ logical_name dep)
 
 fun action_text_with lookup config_lines_for_node toolchain_key external_key nodes keys node =
   let
@@ -904,7 +951,9 @@ fun action_text config_lines_for_node toolchain_key plan keys node =
   in action_text_with (lookup plan) config_lines_for_node toolchain_key external_key (universe_nodes plan) keys node end
 
 fun add_input_key_with lookup config_lines_for_node toolchain_key external_key nodes (node, keys) =
-  (key node, hash_text (action_text_with lookup config_lines_for_node toolchain_key external_key nodes keys node)) :: keys
+  Binarymap.insert
+    (keys, key node,
+     hash_text (action_text_with lookup config_lines_for_node toolchain_key external_key nodes keys node))
 
 fun add_input_key config_lines_for_node toolchain_key nodes (node, keys) =
   let val external_key = external_key_lookup toolchain_key
@@ -919,7 +968,7 @@ fun compute_input_keys_with lookup config_lines_for_node toolchain_key nodes =
       List.foldl
         (fn (node, keys) =>
             add_input_key_with lookup config_lines_for_node toolchain_key external_key nodes (node, keys))
-        [] nodes
+        (Binarymap.mkDict String.compare) nodes
     val _ = emit_external_timing external_timing
   in
     keys
