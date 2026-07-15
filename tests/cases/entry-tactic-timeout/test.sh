@@ -18,6 +18,7 @@ mkdir -p "$project/src"
 cat > "$project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -101,6 +102,7 @@ mkdir -p "$root_groups_project/gen"
 cat > "$root_groups_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -144,6 +146,7 @@ mkdir -p "$roots_group_project/gen"
 cat > "$roots_group_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"

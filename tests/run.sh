@@ -15,6 +15,7 @@ write_toolchain_manifest() {
   cat > "$manifest" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "$hol_git"

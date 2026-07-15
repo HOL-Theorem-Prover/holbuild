@@ -170,6 +170,7 @@ mkdir -p "$project/src"
 cat > "$project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -210,7 +211,7 @@ SML
 
 first_timing=$tmpdir/first.timing
 (cd "$project" && HOLBUILD_TIMING_LOG="$first_timing" HOLBUILD_TIMING_DETAIL=fine "$HOLBUILD_BIN" build --dry-run BTheory) > "$tmpdir/first.log" 2>&1
-require_grep $'^phase\tname=source\.discover\tstatus=ok\tms=' "$first_timing"
+require_grep $'^phase\tname=build\.inventory\.construct\tstatus=ok\tms=' "$first_timing"
 require_grep $'^phase\tname=build\.plan\tstatus=ok\tms=' "$first_timing"
 
 before_deps=$tmpdir/before-deps

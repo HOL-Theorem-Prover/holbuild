@@ -17,6 +17,7 @@ mkdir -p "$project/src"
 cat > "$project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -69,6 +70,7 @@ mkdir -p "$fail_project/src"
 cat > "$fail_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -123,6 +125,7 @@ mkdir -p "$exit_project/src"
 cat > "$exit_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"

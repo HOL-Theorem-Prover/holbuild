@@ -7,54 +7,66 @@ structure FS = OS.FileSys
 exception Error of string
 
 type node =
-  { key : string,
-    source : HolbuildSourceIndex.source,
-    deps : HolbuildDependencies.t option ref,
-    source_hash : string option ref,
+  { source : HolbuildSourceIndex.source,
     external_dirs : string list }
 
 type keyed_node = {node : node, input_key : string}
-type keys = (string, string) Binarymap.dict
+
+datatype dependency_reason =
+    ExtractedLoad
+  | ExtractedHoldepMention
+  | DeclaredActionDependency
+  | DeclaredActionLoad
+  | DeclaredExtraInput
+  | SignatureCompanionReason
+
+datatype symbolic_dependency =
+  SymbolicDependency of
+    {from_node : string, name : string, reason : dependency_reason}
+
+type resolved_dependency_edge =
+  {from_node : string, to_node : string,
+   symbolic_name : string, reason : dependency_reason}
+
+datatype external_dependency_kind = ExternalTheory | ExternalLibrary | ExternalInput
+type external_dependency =
+  {from_node : string, name : string,
+   kind : external_dependency_kind, reason : dependency_reason}
+
+type unresolved_dependency =
+  {from_node : string, name : string, reason : dependency_reason}
+
+type resolved_dependency_graph =
+  {symbolic : (string * symbolic_dependency list) Vector.vector,
+   resolved : (string * resolved_dependency_edge list) Vector.vector,
+   external : (string * external_dependency list) Vector.vector,
+   unresolved : (string * unresolved_dependency list) Vector.vector,
+   reverse : (string * resolved_dependency_edge list) Vector.vector}
 
 fun source_of ({source, ...} : node) = source
 
-fun source_hash_of ({source, source_hash, ...} : node) =
-  case !source_hash of
-      SOME hash => hash
-    | NONE =>
-        let val hash = HolbuildStatCache.file_sha1 (HolbuildStatCache.current_instance ()) (#source_path source)
-        in source_hash := SOME hash; hash end
+fun source_hash_of analysis ({source, ...} : node) =
+  HolbuildComponentProvider.source_hash analysis source
 
 fun dependency_cache_path source =
   case #objects (#artifacts source) of
       object :: _ => object ^ ".deps"
     | [] => #source_path source ^ ".holbuild-deps"
 
-fun deps_of (node as {source, deps, ...} : node) =
-  case !deps of
-      SOME value => value
-    | NONE =>
-      let
-        val value = HolbuildDependencies.extract_cached_with_hash
-                      {cache_path = dependency_cache_path source,
-                       source_path = #source_path source,
-                       source_hash = source_hash_of node}
-      in deps := SOME value; value end
+fun deps_of analysis ({source, ...} : node) =
+  HolbuildComponentProvider.analysis_dependencies
+    (HolbuildComponentProvider.analyse analysis {cache_path = dependency_cache_path source, source = source})
 fun external_dirs_of ({external_dirs, ...} : node) = external_dirs
 fun logical_name node = #logical_name (source_of node)
 fun package node = #package (source_of node)
 fun relative_path node = #relative_path (source_of node)
-fun key ({key, ...} : node) = key
+fun key node = package node ^ "\000" ^ relative_path node ^ "\000" ^ logical_name node
 
-fun unique_strings values =
-  let
-    fun add (value, (seen, kept)) =
-      if Binaryset.member(seen, value) then (seen, kept)
-      else (Binaryset.add(seen, value), value :: kept)
-    val (_, kept) = List.foldl add (Binaryset.empty String.compare, []) values
-  in
-    rev kept
-  end
+fun member value values = List.exists (fn x => x = value) values
+
+fun add_unique (value, values) = if member value values then values else value :: values
+
+fun unique_strings values = rev (List.foldl add_unique [] values)
 
 fun normalize_path path = Path.mkCanonical path handle Path.InvalidArc => path
 
@@ -66,11 +78,13 @@ type name_index = (string * node list) Vector.vector
 
 fun split_pairs xs =
   let
-    fun loop 0 left right = (rev left, right)
-      | loop count left (x :: right) = loop (count - 1) (x :: left) right
-      | loop _ _ [] = raise Error "internal error while splitting sort input"
+    fun loop left right rest =
+      case rest of
+          [] => (left, right)
+        | [x] => (x :: left, right)
+        | x :: y :: zs => loop (x :: left) (y :: right) zs
   in
-    loop (length xs div 2) [] xs
+    loop [] [] xs
   end
 
 fun merge_pairs compare left right =
@@ -138,30 +152,38 @@ fun build_key_index nodes =
     Vector.fromList (sort_pairs compare_pair_key (enumerate 0 nodes))
   end
 
-type direct_project_deps_cache = (string * node list) Vector.vector
-type deps_closure_cache = node list option array ref
-type dependency_context_key_cache = (string * string) option array ref
-
 type t =
   {universe : node list,
+   roots : node list,
    selected : node list,
    name_index : name_index,
+   analysis : HolbuildComponentProvider.analysis_state,
+   dependency_graph : resolved_dependency_graph,
+   resolution_context_id : string,
+   selected_graph_id : string,
+   selected_plan_id : string,
+   resolved_plan_id : string,
    universe_key_index : key_index,
-   direct_project_deps_cache : direct_project_deps_cache,
-   deps_closure_cache : deps_closure_cache,
-   dependency_context_key_cache : dependency_context_key_cache}
+   universe_node_index : node Vector.vector,
+   dependency_closure_cache : node list option array,
+   dependency_context_key_cache : (string * string) option array}
 
 fun universe_nodes ({universe, ...} : t) = universe
+fun root_nodes ({roots, ...} : t) = roots
 fun selected_nodes ({selected, ...} : t) = selected
 fun lookup ({name_index, ...} : t) = indexed_nodes_named name_index
-fun node_named ({name_index, ...} : t) name =
-  case indexed_nodes_named name_index name of
+fun node_named plan name =
+  case lookup plan name of
       node :: _ => SOME node
     | [] => NONE
-fun universe_key_index ({universe_key_index, ...} : t) = universe_key_index
-fun direct_project_deps_cache ({direct_project_deps_cache, ...} : t) = direct_project_deps_cache
-fun deps_closure_cache ({deps_closure_cache, ...} : t) = deps_closure_cache
-fun dependency_context_key_cache ({dependency_context_key_cache, ...} : t) = dependency_context_key_cache
+fun analysis_state ({analysis, ...} : t) = analysis
+fun dependencies plan node = deps_of (analysis_state plan) node
+fun source_hash plan node = source_hash_of (analysis_state plan) node
+fun dependency_graph ({dependency_graph, ...} : t) = dependency_graph
+fun resolution_context_id ({resolution_context_id, ...} : t) = resolution_context_id
+fun selected_graph_id ({selected_graph_id, ...} : t) = selected_graph_id
+fun selected_plan_id ({selected_plan_id, ...} : t) = selected_plan_id
+fun resolved_plan_id ({resolved_plan_id, ...} : t) = resolved_plan_id
 
 fun indexed_key_id index node_key =
   let
@@ -204,39 +226,40 @@ fun theory_name name =
     n > m andalso String.substring(name, n - m, m) = suffix
   end
 
-fun declared_dependency_names node =
-  HolbuildProject.action_deps (#policy (source_of node))
-
-fun declared_load_names node =
-  HolbuildProject.action_loads (#policy (source_of node))
-
-fun direct_dependency_names node =
-  unique_strings
-    (#loads (deps_of node) @ declared_dependency_names node @ declared_load_names node)
+fun bootstrap_dependency_names components analysis node =
+  let
+    fun logical fact =
+      case fact of
+          HolbuildPackageComponent.LogicalReference
+            {logical_name, reason = HolbuildPackageComponent.DeclaredDependency, ...} =>
+              SOME logical_name
+        | HolbuildPackageComponent.LogicalReference
+            {logical_name, reason = HolbuildPackageComponent.DeclaredLoad, ...} =>
+              SOME logical_name
+        | _ => NONE
+    val declared =
+      List.mapPartial logical
+        (HolbuildComponentProvider.component_symbolic_facts
+          components (source_of node))
+  in
+    unique_strings (#loads (deps_of analysis node) @ declared)
+  end
 
 fun unique_nodes nodes =
   let
-    fun add (node, (seen, kept)) =
-      let val node_key = key node
-      in
-        if Binaryset.member(seen, node_key) then (seen, kept)
-        else (Binaryset.add(seen, node_key), node :: kept)
-      end
-    val (_, kept) = List.foldl add (Binaryset.empty String.compare, []) nodes
+    fun add (node, kept) =
+      if member (key node) (map key kept) then kept else node :: kept
   in
-    rev kept
+    rev (List.foldl add [] nodes)
   end
 
-fun direct_holdep_project_deps_with lookup node =
+fun bootstrap_holdep_project_deps analysis lookup node =
   let
-    val mentions = #holdep_mentions (deps_of node)
+    val mentions = #holdep_mentions (deps_of analysis node)
     fun not_self candidate = key candidate <> key node
   in
     unique_nodes (List.filter not_self (List.concat (map lookup mentions)))
   end
-
-fun direct_holdep_project_deps nodes node =
-  direct_holdep_project_deps_with (nodes_named nodes) node
 
 fun readable_path path = FS.access(path, [FS.A_READ]) handle OS.SysErr _ => false
 
@@ -245,29 +268,6 @@ fun external_load_available node name =
     (fn dir => readable_path (Path.concat(dir, name ^ ".uo")) orelse
                readable_path (Path.concat(dir, name ^ ".ui")))
     (external_dirs_of node)
-
-fun holdep_external_names_with lookup node =
-  let
-    fun known name = not (null (lookup name))
-    fun external name = not (known name) andalso external_load_available node name
-  in
-    unique_strings (List.filter external (#holdep_mentions (deps_of node)))
-  end
-
-fun holdep_external_names nodes node =
-  holdep_external_names_with (nodes_named nodes) node
-
-fun raw_external_load_names_with lookup node =
-  let
-    fun known name = not (null (lookup name))
-    fun external name = not (known name) andalso not (theory_name name) andalso
-                        external_load_available node name
-  in
-    List.filter external (#loads (deps_of node))
-  end
-
-fun raw_external_load_names nodes node =
-  raw_external_load_names_with (nodes_named nodes) node
 
 fun signature_companion_deps_with lookup node =
   case #kind (source_of node) of
@@ -282,120 +282,81 @@ fun signature_companion_deps_with lookup node =
 fun signature_companion_deps nodes node =
   signature_companion_deps_with (nodes_named nodes) node
 
-fun direct_project_deps_with lookup nodes node =
+fun bootstrap_project_deps components analysis lookup nodes node =
   let
     fun not_self candidate = key candidate <> key node
-    val named_deps = List.concat (map lookup (direct_dependency_names node))
+    val named_deps = List.concat (map lookup (bootstrap_dependency_names components analysis node))
   in
     unique_nodes (List.filter not_self
                     (signature_companion_deps_with lookup node @ named_deps @
-                     direct_holdep_project_deps_with lookup node))
+                     bootstrap_holdep_project_deps analysis lookup node))
   end
 
-fun build_direct_project_deps_cache_with lookup nodes =
-  Vector.fromList
-    (sort_pairs compare_pair_key
-       (map (fn node => (key node, direct_project_deps_with lookup nodes node)) nodes))
-
-fun direct_project_deps_cached cache node =
+fun graph_values index node =
   let
-    val node_key = key node
+    val wanted = key node
     fun search lo hi =
-      if lo > hi then NONE
+      if lo > hi then []
       else
-        let
-          val mid = (lo + hi) div 2
-          val (candidate, deps) = Vector.sub(cache, mid)
+        let val mid = (lo + hi) div 2
+            val (candidate, values) = Vector.sub(index, mid)
         in
-          case String.compare(node_key, candidate) of
+          case String.compare(wanted, candidate) of
               LESS => search lo (mid - 1)
             | GREATER => search (mid + 1) hi
-            | EQUAL => SOME deps
+            | EQUAL => values
         end
-  in
-    search 0 (Vector.length cache - 1)
-  end
+  in search 0 (Vector.length index - 1) end
 
-(* The cache only covers selected (reachable) nodes; any other node falls back to
-   the lazy computation so an unrelated broken source cannot abort planning. *)
-fun direct_project_deps plan node =
-  case direct_project_deps_cached (direct_project_deps_cache plan) node of
-      SOME deps => deps
-    | NONE => direct_project_deps_with (lookup plan) (universe_nodes plan) node
+fun node_with_key nodes wanted =
+  List.find (fn node => key node = wanted) nodes
 
-fun direct_external_theories_with lookup node =
+fun symbolic_dependencies plan node =
+  graph_values (#symbolic (dependency_graph plan)) node
+fun resolved_dependency_edges plan node =
+  graph_values (#resolved (dependency_graph plan)) node
+fun external_dependencies plan node =
+  graph_values (#external (dependency_graph plan)) node
+fun unresolved_dependencies plan node =
+  graph_values (#unresolved (dependency_graph plan)) node
+fun reverse_dependency_edges plan node =
+  graph_values (#reverse (dependency_graph plan)) node
+
+fun direct_project_deps
+      (plan as {universe_key_index, universe_node_index, ...} : t) node =
   let
-    fun known name = not (null (lookup name))
-    val holdep_theories = List.filter theory_name (holdep_external_names_with lookup node)
-    val loaded_theories = List.filter theory_name (#loads (deps_of node))
+    fun target (edge : resolved_dependency_edge) =
+      Vector.sub(universe_node_index,
+                 indexed_key_id universe_key_index (#to_node edge))
   in
-    unique_strings (List.filter (fn name => not (known name))
-                      (loaded_theories @ holdep_theories))
+    unique_nodes (map target (resolved_dependency_edges plan node))
   end
 
 fun direct_external_theories plan node =
-  direct_external_theories_with (lookup plan) node
-
-fun direct_external_libs_with lookup node =
-  let
-    fun known name = not (null (lookup name))
-    val holdep_libs = List.filter (fn name => not (theory_name name)) (holdep_external_names_with lookup node)
-  in
-    unique_strings
-      (List.filter (fn name => not (known name))
-         (declared_load_names node @ holdep_libs @ raw_external_load_names_with lookup node))
-  end
+  unique_strings
+    (List.mapPartial
+      (fn {name, kind = ExternalTheory, ...} => SOME name | _ => NONE)
+      (external_dependencies plan node))
 
 fun direct_external_libs plan node =
-  direct_external_libs_with (lookup plan) node
-
-fun direct_unresolved_loads_with lookup node =
   let
-    fun known name = not (null (lookup name))
-    fun unresolved name = not (known name) andalso not (theory_name name) andalso
-                          not (external_load_available node name)
+    val dependencies = external_dependencies plan node
+    fun names reason =
+      List.mapPartial
+        (fn {name, kind = ExternalLibrary, reason = reason', ...} =>
+              if reason = reason' then SOME name else NONE
+          | _ => NONE)
+        dependencies
   in
-    List.filter unresolved (#loads (deps_of node))
+    unique_strings
+      (names DeclaredActionLoad @ names ExtractedHoldepMention @
+       names ExtractedLoad)
   end
 
-fun direct_unresolved_loads plan node =
-  direct_unresolved_loads_with (lookup plan) node
-
-fun direct_unresolved_declared_deps_with lookup node =
-  let
-    fun known name = not (null (lookup name))
-  in
-    List.filter (fn name => not (known name)) (declared_dependency_names node)
-  end
-
-fun direct_unresolved_declared_deps plan node =
-  direct_unresolved_declared_deps_with (lookup plan) node
-
-fun reject_unresolved_loads_with lookup plan =
-  let
-    fun check_loads node =
-      case direct_unresolved_loads_with lookup node of
-          [] => ()
-        | load :: _ =>
-            raise Error ("unresolved load " ^ load ^ " in " ^
-                         package node ^ ":" ^ relative_path node)
-    fun check_declared_deps node =
-      case direct_unresolved_declared_deps_with lookup node of
-          [] => ()
-        | dep :: _ =>
-            raise Error ("unresolved action dependency " ^ dep ^ " in " ^
-                         package node ^ ":" ^ relative_path node)
-  in
-    List.app (fn node => (check_loads node; check_declared_deps node)) plan
-  end
-
-fun reject_unresolved_loads nodes plan =
-  reject_unresolved_loads_with (nodes_named nodes) plan
-
-fun reject_source_uses plan =
+fun reject_source_uses analysis plan =
   let
     fun check node =
-      case #uses (deps_of node) of
+      case #uses (deps_of analysis node) of
           [] => ()
         | used :: _ =>
             raise Error ("unsupported use " ^ used ^ " in " ^
@@ -409,7 +370,7 @@ fun cycle_message path node =
   "dependency cycle: " ^
   String.concatWith " -> " (rev (logical_name node :: map logical_name path))
 
-fun topo_sort_with_deps lookup nodes direct_deps roots =
+fun bootstrap_topo_sort components analysis lookup nodes roots =
   let
     val key_index = build_key_index nodes
     val visited = Array.array (length nodes, false)
@@ -423,7 +384,7 @@ fun topo_sort_with_deps lookup nodes direct_deps roots =
         else
           let
             val _ = Array.update(active, id, true)
-            val deps = direct_deps node
+            val deps = bootstrap_project_deps components analysis lookup nodes node
             val order' = List.foldl (fn (dep, acc) => visit (node :: active_path) dep acc) order deps
             val _ = Array.update(active, id, false)
             val _ = Array.update(visited, id, true)
@@ -434,66 +395,96 @@ fun topo_sort_with_deps lookup nodes direct_deps roots =
     val order = List.foldl (fn (root, acc) => visit [] root acc) [] roots
     val plan = rev order
   in
-    reject_unresolved_loads_with lookup plan;
-    reject_source_uses plan;
     plan
   end
 
-fun topo_sort_with lookup nodes roots =
-  topo_sort_with_deps lookup nodes (direct_project_deps_with lookup nodes) roots
+fun topo_sort_resolved nodes roots (graph : resolved_dependency_graph) =
+  let
+    val key_index = build_key_index nodes
+    val visited = Array.array(length nodes, false)
+    val active = Array.array(length nodes, false)
+    fun node_id node = indexed_key_id key_index (key node)
+    fun dependencies node =
+      map (fn (edge : resolved_dependency_edge) =>
+        case node_with_key nodes (#to_node edge) of
+            SOME target => target
+          | NONE => raise Error ("internal resolved dependency target is missing: " ^ #to_node edge))
+        (graph_values (#resolved graph) node)
+    fun visit path node order =
+      let val id = node_id node
+      in
+        if Array.sub(visited, id) then order
+        else if Array.sub(active, id) then raise Error (cycle_message path node)
+        else
+          let
+            val _ = Array.update(active, id, true)
+            val order' = List.foldl (fn (dep, acc) => visit (node :: path) dep acc)
+                                      order (dependencies node)
+            val _ = Array.update(active, id, false)
+            val _ = Array.update(visited, id, true)
+          in node :: order' end
+      end
+  in
+    rev (List.foldl (fn (root, order) => visit [] root order) [] roots)
+  end
 
-fun topo_sort nodes roots =
-  topo_sort_with (nodes_named nodes) nodes roots
 
-fun plan_node_id plan node = indexed_key_id (universe_key_index plan) (key node)
+fun transitive_project_deps
+      (plan as {dependency_closure_cache, universe_key_index, ...} : t) node =
+  let val id = indexed_key_id universe_key_index (key node)
+  in
+    case Array.sub(dependency_closure_cache, id) of
+        SOME dependencies => dependencies
+      | NONE =>
+          let
+            val dependencies =
+              topo_sort_resolved (selected_nodes plan)
+                (direct_project_deps plan node) (dependency_graph plan)
+          in
+            Array.update(dependency_closure_cache, id, SOME dependencies);
+            dependencies
+          end
+  end
 
-fun transitive_project_deps plan node =
-  case direct_project_deps_cached (direct_project_deps_cache plan) node of
-      NONE => topo_sort_with (lookup plan) (universe_nodes plan) (direct_project_deps plan node)
-    | SOME roots =>
-        let
-          val cache = !(deps_closure_cache plan)
-          val id = plan_node_id plan node
-        in
-          case Array.sub(cache, id) of
-              SOME deps => deps
-            | NONE =>
-                let
-                  val deps = topo_sort_with_deps (lookup plan) (universe_nodes plan)
-                               (direct_project_deps plan) roots
-                in
-                  Array.update(cache, id, SOME deps);
-                  deps
-                end
-        end
+fun plan_node_id ({universe_key_index, ...} : t) node =
+  indexed_key_id universe_key_index (key node)
 
-fun cached_dependency_context_key plan node context_id =
-  case Array.sub(!(dependency_context_key_cache plan), plan_node_id plan node) of
+fun cached_dependency_context_key
+      (plan as {dependency_context_key_cache, ...} : t) node context_id =
+  case Array.sub(dependency_context_key_cache, plan_node_id plan node) of
       SOME (cached_context_id, value) =>
         if cached_context_id = context_id then SOME value else NONE
     | NONE => NONE
 
-fun remember_dependency_context_key plan node context_id value =
-  Array.update(!(dependency_context_key_cache plan), plan_node_id plan node, SOME (context_id, value))
+fun remember_dependency_context_key
+      (plan as {dependency_context_key_cache, ...} : t) node context_id value =
+  Array.update(dependency_context_key_cache, plan_node_id plan node,
+               SOME (context_id, value))
+
+fun closure_external_theories plan node =
+  unique_strings
+    (List.concat (map (direct_external_theories plan)
+       (transitive_project_deps plan node @ [node])))
+
+fun closure_external_libs plan node =
+  unique_strings
+    (List.concat (map (direct_external_libs plan)
+       (transitive_project_deps plan node @ [node])))
 
 fun make_node external_dirs source =
-  {key = #package source ^ "\000" ^ #relative_path source ^ "\000" ^ #logical_name source,
-   source = source,
-   deps = ref NONE,
-   source_hash = ref NONE,
-   external_dirs = external_dirs}
+  {source = source, external_dirs = external_dirs}
 
-fun prefetch_node_dependencies nodes =
+fun bootstrap_prefetch_nodes analysis nodes =
   HolbuildDependencies.prefetch_cached_with_hash
     (map (fn node => {cache_path = dependency_cache_path (source_of node),
                      source_path = #source_path (source_of node),
-                     source_hash = source_hash_of node}) nodes)
+                     source_hash = source_hash_of analysis node}) nodes)
 
 (* Dependency extraction is relatively expensive, so batch it one reachable
    frontier at a time instead of prefetching every source in the universe.
    Mark a frontier expanded before following its edges so cycles terminate;
-   topo_sort_with subsequently provides the usual cycle diagnostics and order. *)
-fun prefetch_reachable_dependencies lookup nodes roots =
+   bootstrap_topo_sort subsequently provides the usual cycle diagnostics and order. *)
+fun bootstrap_reachable_frontier components analysis lookup nodes roots =
   let
     val key_index = build_key_index nodes
     val expanded = Array.array(length nodes, false)
@@ -513,38 +504,313 @@ fun prefetch_reachable_dependencies lookup nodes roots =
       case take_fresh frontier of
           [] => ()
         | fresh =>
-            (prefetch_node_dependencies fresh;
-             loop (List.concat (map (direct_project_deps_with lookup nodes) fresh)))
+            (bootstrap_prefetch_nodes analysis fresh;
+             loop (List.concat (map (bootstrap_project_deps components analysis lookup nodes) fresh)))
   in
     loop roots
   end
 
-fun plan_selection holdir sources selection =
+fun canonical_frame text = Int.toString (size text) ^ ":" ^ text
+fun canonical_fields values = String.concat (map canonical_frame values)
+fun canonical_list tag values = [tag, Int.toString (length values)] @ values
+fun canonical_insert value values =
+  case values of
+      [] => [value]
+    | existing :: rest =>
+        if String.compare(value, existing) = LESS then value :: values
+        else existing :: canonical_insert value rest
+fun canonical_sort values =
+  List.foldl (fn (value, sorted) => canonical_insert value sorted) [] values
+
+fun dependency_reason_text ExtractedLoad = "extracted-load"
+  | dependency_reason_text ExtractedHoldepMention = "holdep-mention"
+  | dependency_reason_text DeclaredActionDependency = "declared-dependency"
+  | dependency_reason_text DeclaredActionLoad = "declared-load"
+  | dependency_reason_text DeclaredExtraInput = "extra-input"
+  | dependency_reason_text SignatureCompanionReason = "signature-companion"
+
+fun dependency_pairs nodes values_for =
+  Vector.fromList
+    (sort_pairs compare_pair_key (map (fn node => (key node, values_for node)) nodes))
+
+fun build_resolved_dependency_graph components analysis lookup selected =
   let
+    fun symbolic_for node =
+      let
+        val from = key node
+        val deps = deps_of analysis node
+        fun fact reason name =
+          SymbolicDependency {from_node = from, name = name, reason = reason}
+        fun component_fact symbolic =
+          case symbolic of
+              HolbuildPackageComponent.LogicalReference
+                {logical_name, reason, ...} =>
+                  fact
+                    (case reason of
+                        HolbuildPackageComponent.DeclaredDependency =>
+                          DeclaredActionDependency
+                      | HolbuildPackageComponent.DeclaredLoad =>
+                          DeclaredActionLoad
+                      | HolbuildPackageComponent.SignatureCompanion =>
+                          SignatureCompanionReason
+                      | HolbuildPackageComponent.DeclaredExtraInput =>
+                          raise Error "internal logical extra-input component fact")
+                    logical_name
+            | HolbuildPackageComponent.InputReference {relative_path, ...} =>
+                fact DeclaredExtraInput relative_path
+        val declared =
+          map component_fact
+            (HolbuildComponentProvider.component_symbolic_facts
+              components (source_of node))
+      in
+        map (fact ExtractedLoad) (#loads deps) @
+        map (fact ExtractedHoldepMention) (#holdep_mentions deps) @ declared
+      end
+    fun candidates node reason name =
+      case reason of
+          SignatureCompanionReason => signature_companion_deps_with lookup node
+        | DeclaredExtraInput => []
+        | _ => List.filter (fn candidate => key candidate <> key node) (lookup name)
+    fun resolve_fact node (SymbolicDependency {from_node, name, reason}) =
+      map (fn target =>
+        {from_node = from_node, to_node = key target,
+         symbolic_name = name, reason = reason})
+        (candidates node reason name)
+    fun resolved_for node = List.concat (map (resolve_fact node) (symbolic_for node))
+    fun no_candidate node reason name = null (candidates node reason name)
+    fun external_for node =
+      let
+        fun one (SymbolicDependency {from_node, name, reason}) =
+          case reason of
+              DeclaredActionLoad =>
+                [{from_node = from_node, name = name,
+                  kind = ExternalLibrary, reason = reason}]
+            | DeclaredExtraInput =>
+                [{from_node = from_node, name = name,
+                  kind = ExternalInput, reason = reason}]
+            | _ => if not (no_candidate node reason name) then []
+              else case reason of
+                ExtractedLoad =>
+                  if theory_name name then
+                    [{from_node = from_node, name = name,
+                      kind = ExternalTheory, reason = reason}]
+                  else if external_load_available node name then
+                    [{from_node = from_node, name = name,
+                      kind = ExternalLibrary, reason = reason}]
+                  else []
+              | ExtractedHoldepMention =>
+                  if external_load_available node name then
+                    [{from_node = from_node, name = name,
+                      kind = if theory_name name then ExternalTheory else ExternalLibrary,
+                      reason = reason}]
+                  else []
+              | _ => []
+      in List.concat (map one (symbolic_for node)) end
+    fun unresolved_for node =
+      let
+        fun one (SymbolicDependency {from_node, name, reason}) =
+          if not (no_candidate node reason name) then []
+          else
+            case reason of
+                DeclaredActionDependency =>
+                  [{from_node = from_node, name = name, reason = reason}]
+              | ExtractedLoad =>
+                  if theory_name name orelse external_load_available node name then []
+                  else [{from_node = from_node, name = name, reason = reason}]
+              | _ => []
+      in List.concat (map one (symbolic_for node)) end
+    val symbolic = dependency_pairs selected symbolic_for
+    val resolved = dependency_pairs selected resolved_for
+    val external = dependency_pairs selected external_for
+    val unresolved = dependency_pairs selected unresolved_for
+    val all_edges = List.concat (map resolved_for selected)
+    fun incoming node =
+      List.filter (fn (edge : resolved_dependency_edge) => #to_node edge = key node) all_edges
+    val reverse = dependency_pairs selected incoming
+  in
+    {symbolic = symbolic, resolved = resolved, external = external,
+     unresolved = unresolved, reverse = reverse}
+  end
+
+fun vector_values vector =
+  Vector.foldr (fn ((_, values), acc) => values @ acc) [] vector
+
+fun bound_node_id node =
+  HolbuildHash.string_sha256
+    (canonical_fields
+      ["holbuild-resolved-node-v1", package node,
+       HolbuildSourceIndex.source_id (source_of node)])
+
+fun canonical_node_for nodes node_key =
+  case node_with_key nodes node_key of
+      SOME node => bound_node_id node
+    | NONE => raise Error ("internal canonical dependency node is missing: " ^ node_key)
+
+fun symbolic_text nodes (SymbolicDependency {from_node, name, reason}) =
+  canonical_fields
+    [canonical_node_for nodes from_node, dependency_reason_text reason, name]
+
+fun resolved_edge_text nodes
+      ({from_node, to_node, symbolic_name, reason} : resolved_dependency_edge) =
+  canonical_fields
+    [canonical_node_for nodes from_node, canonical_node_for nodes to_node,
+     dependency_reason_text reason, symbolic_name]
+
+fun external_edge_text nodes
+      ({from_node, name, kind, reason} : external_dependency) =
+  canonical_fields
+    [canonical_node_for nodes from_node,
+     case kind of ExternalTheory => "theory" | ExternalLibrary => "library" |
+                  ExternalInput => "input",
+     dependency_reason_text reason, name]
+
+fun unresolved_edge_text nodes
+      ({from_node, name, reason} : unresolved_dependency) =
+  canonical_fields
+    [canonical_node_for nodes from_node, dependency_reason_text reason, name]
+
+fun selected_graph_text nodes (graph : resolved_dependency_graph) =
+  canonical_fields
+    (["holbuild-selected-dependency-graph-v1"] @
+     canonical_list "nodes" (canonical_sort (map bound_node_id nodes)) @
+     canonical_list "symbolic"
+       (canonical_sort (map (symbolic_text nodes) (vector_values (#symbolic graph)))) @
+     canonical_list "resolved"
+       (canonical_sort (map (resolved_edge_text nodes) (vector_values (#resolved graph)))) @
+     canonical_list "external"
+       (canonical_sort (map (external_edge_text nodes) (vector_values (#external graph)))) @
+     canonical_list "unresolved"
+       (canonical_sort (map (unresolved_edge_text nodes) (vector_values (#unresolved graph)))) @
+     canonical_list "reverse"
+       (canonical_sort (map (resolved_edge_text nodes) (vector_values (#reverse graph)))))
+
+fun selected_graph_identity nodes graph =
+  HolbuildHash.string_sha256 (selected_graph_text nodes graph)
+
+fun selected_plan_text graph_id roots selected =
+  canonical_fields
+    (["holbuild-selected-plan-v1", graph_id] @
+     canonical_list "roots" (map bound_node_id roots) @
+     canonical_list "order" (map bound_node_id selected))
+
+fun selected_plan_identity graph_id roots selected =
+  HolbuildHash.string_sha256 (selected_plan_text graph_id roots selected)
+
+fun selected_graph_canonical_text plan =
+  selected_graph_text (selected_nodes plan) (dependency_graph plan)
+fun selected_plan_canonical_text plan =
+  selected_plan_text (selected_graph_id plan) (root_nodes plan) (selected_nodes plan)
+
+fun reject_graph_unresolved (graph : resolved_dependency_graph) selected =
+  let
+    fun check node =
+      case graph_values (#unresolved graph) node of
+          [] => ()
+        | {name, reason = DeclaredActionDependency, ...} :: _ =>
+            raise Error ("unresolved action dependency " ^ name ^ " in " ^
+                         package node ^ ":" ^ relative_path node)
+        | {name, ...} :: _ =>
+            raise Error ("unresolved load " ^ name ^ " in " ^
+                         package node ^ ":" ^ relative_path node)
+  in List.app check selected end
+
+fun write_test_dependency_graph graph_id plan_id resolved_id (graph : resolved_dependency_graph) =
+  if Vector.length (#symbolic graph) = 0 then ()
+  else
+  case OS.Process.getEnv "HOLBUILD_TEST_RESOLVED_GRAPH" of
+      NONE => ()
+    | SOME path =>
+        let
+          val output = TextIO.openOut path
+          fun each_vector write vector =
+            Vector.app (fn (_, values) => List.app write values) vector
+          fun safe text =
+            String.translate (fn #"\000" => ":" | c => String.str c) text
+          fun symbolic (SymbolicDependency {from_node, name, reason}) =
+            TextIO.output(output, "symbolic " ^ safe from_node ^ " " ^
+              dependency_reason_text reason ^ " " ^ name ^ "\n")
+          fun resolved ({from_node, to_node, symbolic_name, reason} : resolved_dependency_edge) =
+            TextIO.output(output, "resolved " ^ safe from_node ^ " " ^ safe to_node ^ " " ^
+              dependency_reason_text reason ^ " " ^ symbolic_name ^ "\n")
+          fun reverse ({from_node, to_node, symbolic_name, reason} : resolved_dependency_edge) =
+            TextIO.output(output, "reverse " ^ safe to_node ^ " " ^ safe from_node ^ " " ^
+              dependency_reason_text reason ^ " " ^ symbolic_name ^ "\n")
+          fun external ({from_node, name, kind, reason} : external_dependency) =
+            TextIO.output(output, "external " ^ safe from_node ^ " " ^
+              (case kind of ExternalTheory => "theory" | ExternalLibrary => "library" |
+                            ExternalInput => "input") ^
+              " " ^ dependency_reason_text reason ^ " " ^ name ^ "\n")
+          fun unresolved ({from_node, name, reason} : unresolved_dependency) =
+            TextIO.output(output, "unresolved " ^ safe from_node ^ " " ^
+              dependency_reason_text reason ^ " " ^ name ^ "\n")
+          val _ = TextIO.output(output, "selected-graph-id " ^ graph_id ^ "\n")
+          val _ = TextIO.output(output, "selected-plan-id " ^ plan_id ^ "\n")
+          val _ = TextIO.output(output, "resolved-plan-id " ^ resolved_id ^ "\n")
+          val _ = each_vector symbolic (#symbolic graph)
+          val _ = each_vector resolved (#resolved graph)
+          val _ = each_vector reverse (#reverse graph)
+          val _ = each_vector external (#external graph)
+          val _ = each_vector unresolved (#unresolved graph)
+        in TextIO.closeOut output end
+
+fun plan_selection components holdir sources selection =
+  let
+    val provider = HolbuildComponentProvider.provider components
+    val resolution_context_id =
+      HolbuildComponentProvider.resolution_context_id components
     val _ = if holdir = "" then HolbuildDependencies.clear_analyser_path ()
             else HolbuildDependencies.set_analyser_path (HolbuildHolSharedCache.analyser_path_for_holdir holdir)
     val external_dirs = [normalize_path (Path.concat(holdir, "sigobj"))]
+    val analysis = HolbuildComponentProvider.new_analysis_state provider
     val nodes = map (make_node external_dirs) sources
     val index = build_name_index nodes
     val lookup = indexed_nodes_named index
     val roots = target_roots lookup nodes selection
-    val _ = prefetch_reachable_dependencies lookup nodes roots
-    val selected = topo_sort_with lookup nodes roots
+    val _ = bootstrap_reachable_frontier components analysis lookup nodes roots
+    val reachable = bootstrap_topo_sort components analysis lookup nodes roots
+    val dependency_graph =
+      HolbuildToolchain.time_phase "dependency.resolve"
+        (fn () => build_resolved_dependency_graph components analysis lookup reachable)
+    val selected =
+      HolbuildToolchain.time_phase "dependency.toposort"
+        (fn () => topo_sort_resolved reachable roots dependency_graph)
+    val selected_graph_id =
+      HolbuildToolchain.time_phase "dependency.graph.identity"
+        (fn () => selected_graph_identity selected dependency_graph)
+    val selected_plan_id =
+      HolbuildToolchain.time_phase "build.plan.identity"
+        (fn () => selected_plan_identity selected_graph_id roots selected)
+    val resolved_plan_id =
+      HolbuildHash.string_sha256
+        (canonical_fields
+          ["holbuild-resolved-plan-v1", resolution_context_id, selected_plan_id])
+    val _ = write_test_dependency_graph selected_graph_id selected_plan_id resolved_plan_id dependency_graph
+    val _ = reject_graph_unresolved dependency_graph selected
+    val _ = reject_source_uses analysis selected
     val universe_key_index = build_key_index nodes
-    val direct_project_deps_cache = build_direct_project_deps_cache_with lookup selected
-    val deps_closure_cache = ref (Array.array(length nodes, NONE : node list option))
-    val dependency_context_key_cache = ref (Array.array(length nodes, NONE : (string * string) option))
+    val universe_node_index = Vector.fromList nodes
+    val dependency_closure_cache =
+      Array.array(length nodes, NONE : node list option)
+    val dependency_context_key_cache =
+      Array.array(length nodes, NONE : (string * string) option)
   in
-    {universe = nodes, selected = selected, name_index = index,
+    {universe = nodes, roots = roots, selected = selected, name_index = index, analysis = analysis,
+     dependency_graph = dependency_graph,
+     resolution_context_id = resolution_context_id,
+     selected_graph_id = selected_graph_id,
+     selected_plan_id = selected_plan_id,
+     resolved_plan_id = resolved_plan_id,
      universe_key_index = universe_key_index,
-     direct_project_deps_cache = direct_project_deps_cache,
-     deps_closure_cache = deps_closure_cache,
+     universe_node_index = universe_node_index,
+     dependency_closure_cache = dependency_closure_cache,
      dependency_context_key_cache = dependency_context_key_cache}
   end
 
-fun plan_all holdir sources = plan_selection holdir sources AllTargets
+fun plan_all components holdir sources =
+  plan_selection components holdir sources AllTargets
 
-fun plan_targets holdir sources targets = plan_selection holdir sources (SelectedTargets targets)
+fun plan_targets components holdir sources targets =
+  plan_selection components holdir sources (SelectedTargets targets)
 
 fun kind_name source = HolbuildSourceIndex.kind_string (#kind source)
 
@@ -573,7 +839,14 @@ fun path_has_glob path =
 
 fun join root rel = if rel = "" then root else Path.concat(root, rel)
 
-fun sort_strings xs = sort_pairs String.compare xs
+fun sort_strings xs =
+  let
+    fun insert x [] = [x]
+      | insert x (y :: ys) =
+          if String.compare(x, y) = LESS then x :: y :: ys else y :: insert x ys
+  in
+    List.foldl (fn (x, acc) => insert x acc) [] xs
+  end
 
 fun files_under abs rel =
   if is_dir abs then
@@ -756,17 +1029,12 @@ fun external_sources_for_name dirs name =
           List.filter readable (external_source_candidates stem name)
         end
 
-fun prefetch_external_dependency_sources_with lookup nodes =
+fun prefetch_external_dependency_sources plan nodes =
   let
     fun item_id (dirs, name) = String.concatWith "\030" dirs ^ "\029" ^ name
-    val empty_item_ids = Binaryset.empty String.compare
-    fun add_unseen (item, (items, ids)) =
-      let val id = item_id item
-      in
-        if Binaryset.member (ids, id) then (items, ids)
-        else (item :: items, Binaryset.add (ids, id))
-      end
-    fun unseen_items items = #1 (List.foldl add_unseen ([], empty_item_ids) items)
+    fun seen item seen_ids = member (item_id item) seen_ids
+    fun add_unseen (item, items) =
+      if List.exists (fn existing => item_id existing = item_id item) items then items else item :: items
     fun source_requests paths =
       map (fn path => {source_path = path, source_hash = HolbuildHash.file_sha1 path}) paths
     fun deps_for_path path =
@@ -779,19 +1047,19 @@ fun prefetch_external_dependency_sources_with lookup nodes =
         (map (fn name => (dirs, name)) names)
     fun initial_items_for_node node =
       let val dirs = external_dirs_of node
-          val names = direct_external_libs_with lookup node @ direct_external_theories_with lookup node
+          val names = direct_external_libs plan node @ direct_external_theories plan node
       in map (fn name => (dirs, name)) names end
     fun loop seen_ids pending =
       case pending of
           [] => ()
         | _ =>
             let
-              val (fresh, seen_ids') =
-                List.foldl add_unseen ([], seen_ids) pending
+              val fresh = List.filter (fn item => not (seen item seen_ids)) pending
+              val seen_ids' = List.foldl (fn (item, acc) => item_id item :: acc) seen_ids fresh
               val paths = unique_strings (List.concat (map (fn (dirs, name) => external_sources_for_name dirs name) fresh))
               val _ = HolbuildDependencies.prefetch_global_cached_with_hash (source_requests paths)
               val next =
-                #1 (List.foldl
+                List.foldl
                   (fn ((dirs, name), acc) =>
                       let
                         val source_paths = external_sources_for_name dirs name
@@ -799,13 +1067,13 @@ fun prefetch_external_dependency_sources_with lookup nodes =
                       in
                         List.foldl add_unseen acc (follow_names dirs names)
                       end)
-                  ([], empty_item_ids) fresh)
+                  [] fresh
             in
               loop seen_ids' next
             end
-    val initial = unseen_items (List.concat (map initial_items_for_node nodes))
+    val initial = List.foldl add_unseen [] (List.concat (map initial_items_for_node nodes))
   in
-    loop empty_item_ids initial
+    loop [] initial
   end
   handle HolbuildDependencies.Error msg => raise Error msg
 
@@ -818,9 +1086,9 @@ fun prefetch_external_dependency_sources_with lookup nodes =
    not in sigobj, treat it as part of the hol.state bootstrap boundary. *)
 fun external_key_lookup_with_timing timing toolchain_key =
   let
-    val memo = ref (Binarymap.mkDict String.compare : (string, string) Binarymap.dict)
-    fun memoized id = Binarymap.peek (!memo, id)
-    fun remember id value = (memo := Binarymap.insert (!memo, id, value); value)
+    val memo = ref ([] : (string * string) list)
+    fun memoized id = Option.map #2 (List.find (fn (key, _) => key = id) (!memo))
+    fun remember id value = (memo := (id, value) :: !memo; value)
     fun in_stack id stack = List.exists (fn active => active = id) stack
     fun cachekey_line cachekey =
       "cachekey=" ^ String.translate (fn #"\n" => " " | c => str c) (read_text cachekey)
@@ -890,42 +1158,36 @@ fun bool_text true = "true"
 fun hash_text text = HolbuildHash.string_sha1 text
 
 fun lookup_key keys dep =
-  Binarymap.find (keys, key dep)
-  handle Binarymap.NotFound =>
-    raise Error ("missing action key for dependency: " ^ logical_name dep)
+  case List.find (fn (dep_key, _) => dep_key = key dep) keys of
+      SOME (_, input_key) => input_key
+    | NONE => raise Error ("missing action key for dependency: " ^ logical_name dep)
 
-fun action_text_with lookup config_lines_for_node toolchain_key external_key nodes keys node =
+fun action_text_with plan config_lines_for_node toolchain_key external_key keys node =
   let
     val source = source_of node
-    val source_hash = source_hash_of node
+    val analysis = analysis_state plan
+    val source_hash = source_hash_of analysis node
     val project_deps =
       map (fn dep => package dep ^ ":" ^ logical_name dep ^ "@" ^ lookup_key keys dep)
-        (direct_project_deps_with lookup nodes node)
+        (direct_project_deps plan node)
     val external_deps =
       map (fn name => "HOL:" ^ name ^ "@" ^ external_key node "theory" name)
-        (direct_external_theories_with lookup node)
+        (direct_external_theories plan node)
     val external_libs =
       map (fn name => "HOLLIB:" ^ name ^ "@" ^ external_key node "lib" name)
-        (direct_external_libs_with lookup node)
+        (direct_external_libs plan node)
     val policy = #policy source
     val declared_deps = HolbuildProject.action_deps policy
     val declared_loads = HolbuildProject.action_loads policy
     val declared_dep_lines = map (fn dep => "declared_dep=" ^ dep) declared_deps
     val declared_load_lines = map (fn dep => "declared_load=" ^ dep) declared_loads
-    fun extra_input_root input =
-      let
-        val rel = HolbuildProject.extra_input_path input
-        val abs = HolbuildProject.extra_input_absolute_path input
-        val n = size abs - size rel
-      in
-        if n > 0 then String.substring(abs, 0, n) else Path.dir abs
-      end
     val extra_inputs = HolbuildProject.action_extra_inputs policy
     val manifest_extra_dep_lines =
       List.concat (map (fn input =>
-        extra_dep_lines "extra_dep" (extra_input_root input) [HolbuildProject.extra_input_path input]) extra_inputs)
+        extra_dep_lines "extra_dep" (#package_root source)
+          [HolbuildProject.extra_input_path input]) extra_inputs)
     val source_extra_dep_lines =
-      extra_dep_lines "source_extra_dep" (Path.dir (#source_path source)) (#extra_deps (deps_of node))
+      extra_dep_lines "source_extra_dep" (Path.dir (#source_path source)) (#extra_deps (deps_of analysis node))
     val lines =
       ["holbuild-action-v1",
        "toolchain=" ^ toolchain_key,
@@ -946,84 +1208,63 @@ fun action_text_with lookup config_lines_for_node toolchain_key external_key nod
     String.concatWith "\n" lines ^ "\n"
   end
 
-fun action_text config_lines_for_node toolchain_key plan keys node =
-  let val external_key = external_key_lookup toolchain_key
-  in action_text_with (lookup plan) config_lines_for_node toolchain_key external_key (universe_nodes plan) keys node end
+fun add_input_key_with plan config_lines_for_node toolchain_key external_key (node, keys) =
+  (key node, hash_text (action_text_with plan config_lines_for_node toolchain_key external_key keys node)) :: keys
 
-fun add_input_key_with lookup config_lines_for_node toolchain_key external_key nodes (node, keys) =
-  Binarymap.insert
-    (keys, key node,
-     hash_text (action_text_with lookup config_lines_for_node toolchain_key external_key nodes keys node))
-
-fun add_input_key config_lines_for_node toolchain_key nodes (node, keys) =
-  let val external_key = external_key_lookup toolchain_key
-  in add_input_key_with (nodes_named nodes) config_lines_for_node toolchain_key external_key nodes (node, keys) end
-
-fun compute_input_keys_with lookup config_lines_for_node toolchain_key nodes =
+fun compute_input_keys_with plan config_lines_for_node toolchain_key =
   let
-    val _ = prefetch_external_dependency_sources_with lookup nodes
+    val nodes = selected_nodes plan
+    val _ = prefetch_external_dependency_sources plan nodes
     val external_timing = new_external_timing ()
     val external_key = external_key_lookup_with_timing external_timing toolchain_key
     val keys =
       List.foldl
         (fn (node, keys) =>
-            add_input_key_with lookup config_lines_for_node toolchain_key external_key nodes (node, keys))
-        (Binarymap.mkDict String.compare) nodes
+            add_input_key_with plan config_lines_for_node toolchain_key external_key (node, keys))
+        [] nodes
     val _ = emit_external_timing external_timing
   in
     keys
   end
 
-fun input_keys_with lookup config_lines_for_node toolchain_key nodes =
+fun input_keys_with plan config_lines_for_node toolchain_key =
   HolbuildToolchain.time_phase "build.keys"
-    (fn () => compute_input_keys_with lookup config_lines_for_node toolchain_key nodes)
+    (fn () => compute_input_keys_with plan config_lines_for_node toolchain_key)
 
 fun input_keys config_lines_for_node toolchain_key plan =
-  input_keys_with (lookup plan) config_lines_for_node toolchain_key (selected_nodes plan)
+  input_keys_with plan config_lines_for_node toolchain_key
 
 fun input_key_for keys node = lookup_key keys node
 
-fun print_external_deps_with lookup node =
-  case direct_external_theories_with lookup node of
+fun print_external_deps plan node =
+  case direct_external_theories plan node of
       [] => ()
     | deps => print ("  external theories: " ^ String.concatWith ", " deps ^ "\n")
 
-fun print_external_deps plan node =
-  print_external_deps_with (lookup plan) node
-
-fun print_external_libs_with lookup node =
-  case direct_external_libs_with lookup node of
+fun print_external_libs plan node =
+  case direct_external_libs plan node of
       [] => ()
     | deps => print ("  external libs: " ^ String.concatWith ", " deps ^ "\n")
 
-fun print_external_libs plan node =
-  print_external_libs_with (lookup plan) node
-
-fun print_project_deps_with lookup nodes node =
-  case direct_project_deps_with lookup nodes node of
+fun print_project_deps plan node =
+  case direct_project_deps plan node of
       [] => ()
     | deps => print ("  project deps: " ^
                      String.concatWith ", " (map logical_name deps) ^ "\n")
 
-fun print_project_deps plan node =
-  print_project_deps_with (lookup plan) (universe_nodes plan) node
-
-fun describe_node_with lookup nodes keys node =
+fun describe_node plan keys node =
   (HolbuildSourceIndex.describe_source (source_of node);
    print ("  input_key: " ^ input_key_for keys node ^ "\n");
-   print_project_deps_with lookup nodes node;
-   print_external_deps_with lookup node;
-   print_external_libs_with lookup node)
-
-fun describe_node plan keys node =
-  describe_node_with (lookup plan) (universe_nodes plan) keys node
+   print_project_deps plan node;
+   print_external_deps plan node;
+   print_external_libs plan node)
 
 fun describe config_lines_for_node toolchain_key plan =
   let
     val nodes = selected_nodes plan
     val keys = input_keys config_lines_for_node toolchain_key plan
   in
-    List.app (describe_node_with (lookup plan) (universe_nodes plan) keys) nodes
+    List.app (describe_node plan keys) nodes
   end
 
 end

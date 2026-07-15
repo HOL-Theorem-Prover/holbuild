@@ -18,6 +18,7 @@ mkdir -p "$project/src"
 cat > "$project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -414,6 +415,7 @@ mkdir -p "$multi_goal_project/src"
 cat > "$multi_goal_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -462,6 +464,7 @@ mkdir -p "$branch_input_project/src"
 cat > "$branch_input_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -512,6 +515,7 @@ mkdir -p "$multi_goal_large_project/src"
 cat > "$multi_goal_large_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -706,6 +710,7 @@ touch "$failed_root_counter"
 cat > "$failed_root_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -761,6 +766,7 @@ mkdir -p "$changed_prefix_project/src"
 cat > "$changed_prefix_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -819,6 +825,7 @@ touch "$priority_counter"
 cat > "$priority_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -876,6 +883,7 @@ touch "$always_context_counter"
 cat > "$always_context_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"

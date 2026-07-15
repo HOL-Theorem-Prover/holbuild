@@ -27,6 +27,7 @@ Never request `.uo`/`.ui`/`.dat` — use logical names like `FooTheory`.
 ```toml
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "myproject"
@@ -74,9 +75,9 @@ Root project artifacts live under `.holbuild/`: `gen/`, `obj/`, `dep/`, `checkpo
 - `--tactic-timeout` applies only to root package; dependencies build with no timeout
 - HOL source parse errors are build failures; holbuild may still use parser recovery internally for best-effort instrumentation and diagnostics
 - Proof engine/checkpoint/timeout/trace flags are execution/debug policy, not final artifact action-key inputs
-- Manifests must be schema 2 and the resolved graph must contain exactly one `[dependencies.hol]` exact git rev; it uses a built-in manifest and builds/reuses shared HOL under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol` with `${HOLBUILD_POLY:-poly}`. `holbuild buildhol` warms this cache.
+- Manifests must declare `minimum_version` (the legacy `schema = 2` marker is optional) and the resolved graph must contain exactly one `[dependencies.hol]` exact git rev; it uses a built-in manifest and builds/reuses shared HOL under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol` with `${HOLBUILD_POLY:-poly}`. `holbuild buildhol` warms this cache.
 - `--holdir`, `HOLDIR`, `HOLBUILD_HOLDIR`, schema 1, and manifest path dependencies are no longer supported for project toolchains/dependencies.
-- Schema 2 manifests support exact git `rev` hashes and `from/path/manifest` deps only; in a `from` dependency, `path` selects source inside the referenced checkout and `manifest` is a shim relative to the declaring package. No ranges, tags, branches, lockfile, or multiple versions yet. Workstation-local source overrides are configured in `.holconfig.toml [overrides.NAME]` with either `path` or `git` and apply during recursive dependency resolution.
+- The current manifest language supports exact git `rev` hashes and `from/path/manifest` deps only; in a `from` dependency, `path` selects source inside the referenced checkout and `manifest` is a shim relative to the declaring package. No ranges, tags, branches, lockfile, or multiple versions yet. Workstation-local source overrides are configured in `.holconfig.toml [overrides.NAME]` with either `path` or `git` and apply during recursive dependency resolution.
 - HOL examples/tests are intentionally outside built-in HOL manifests; declare example subtrees (e.g. `keccakTheory`) as separate shimmed/from dependencies
 
 ## References
@@ -86,5 +87,5 @@ Root project artifacts live under `.holbuild/`: `gen/`, `obj/`, `dep/`, `checkpo
 - [local-config.md](references/local-config.md) — `.holconfig.toml` overrides, excludes, jobs, timeout
 - [build-model.md](references/build-model.md) — dependency inference, action keys, invalidation, cache, write locks, gc
 - [checkpoints-proof-steps.md](references/checkpoints-proof-steps.md) — proof IR/proof-step checkpoints, tactic timeouts, replay, env vars
-- [dependencies.md](references/dependencies.md) — declaring schema 2 deps, project HOL, shim manifests, transitive resolution
+- [dependencies.md](references/dependencies.md) — declaring dependencies, project HOL, shim manifests, transitive resolution
 - [heaps-and-run.md](references/heaps-and-run.md) — `[[heap]]` exports; `run`/`repl` prototype status

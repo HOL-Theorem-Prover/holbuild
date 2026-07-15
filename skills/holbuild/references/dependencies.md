@@ -1,12 +1,13 @@
 # Dependency management
 
-holbuild uses schema 2 dependency management only. A resolved project graph must contain exactly one package named `hol`; this package is the project HOL toolchain and is declared with an exact git revision.
+The current manifest language supports exact dependency management; the legacy `schema = 2` marker is optional. A resolved project graph must contain exactly one package named `hol`; this package is the project HOL toolchain and is declared with an exact git revision.
 
 ## Project HOL
 
 ```toml
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -61,6 +62,7 @@ manifest = "shims/keccak.toml"
 # shims/keccak.toml
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "keccak"
@@ -83,16 +85,16 @@ holbuild no longer supports:
 - branch/tag/range version specifications
 - lockfiles, registries, solvers, or multiple versions of one package
 
-`.holconfig.toml` supports local build settings such as `[build].jobs`, `[build].exclude`, and `[build].tactic_timeout`. It also supports `[overrides.NAME] path = "..."` for workstation-local dependency source directories and `[overrides.NAME] git = "..."` for alternate git sources checked out at the manifest `rev`. Overrides apply during recursive dependency resolution and do not change the committed manifest's dependency identity.
+`.holconfig.toml` supports local build settings such as `[build].jobs`, `[build].exclude`, and `[build].tactic_timeout`. It also supports `[overrides.NAME] path = "..."` for workstation-local dependency source directories and `[overrides.NAME] git = "..."` for alternate git sources checked out at the manifest `rev`. Overrides apply during recursive dependency resolution and do not change the committed manifest's dependency identity. A `from/path/manifest` shim cannot be overridden directly; override its direct source dependency instead so the declared subtree remains authoritative.
 
 ## Dependency resolution flow
 
-1. Parse the root schema 2 `holproject.toml` and local `.holconfig.toml` build settings.
+1. Parse the root `holproject.toml` and local `.holconfig.toml` build settings.
 2. Validate that the resolved graph has exactly one `hol` dependency.
 3. Materialize direct git dependencies under `.holbuild/src/<package>`; `hol` is resolved to the shared global HOL cache path.
 4. Resolve `from/path/manifest` dependencies to subtrees of direct git dependencies.
 5. Parse each dependency's manifest recursively.
-6. Validate that dependency manifest `project.name`, when present, matches the dependency key name, except for the built-in `hol` manifest.
+6. Validate that the required dependency manifest `project.name` matches the dependency key name.
 7. Assign dependency package artifacts under `.holbuild/packages/<package-name>`.
 8. Build the full resolved graph.
 

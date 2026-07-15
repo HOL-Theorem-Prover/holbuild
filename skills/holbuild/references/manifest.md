@@ -2,15 +2,15 @@
 
 ## Schema
 
-holbuild currently supports schema 2 only. The schema marker is required.
+`minimum_version` is required. The legacy schema-2 marker is optional.
 
 ```toml
 [holbuild]
 schema = 2
-minimum_version = "0.6.0"  # optional; required_version is accepted as an alias
+minimum_version = "0.10.0"  # required
 
 [project]
-name = "myproject"     # required for dependencies; optional for root
+name = "myproject"     # required
 version = "0.1.0"      # optional
 
 [dependencies.hol]
@@ -70,7 +70,7 @@ impure = true                     # shorthand: cache=false + always_reexecute=tr
 
 Unknown fields in recognized tables are **errors**, not silently ignored. This catches typos early.
 
-`[holbuild].minimum_version` (or its alias `[holbuild].required_version`), when present, must be a semantic version `MAJOR.MINOR.PATCH` and requires the running holbuild version to be at least that version. Set only one of them.
+`[holbuild].minimum_version` must be a semantic version `MAJOR.MINOR.PATCH` and requires the running holbuild version to be at least that version. `[holbuild].required_version` is rejected.
 
 Tables validated: `[holbuild]`, `[project]`, `[build]` (including `root_groups` and `groups`), `[build.groups.*]`, `[run]`, `[dependencies.*]`, `[actions.*]`, `[[generate]]`, `[[heap]]`, `[[executable]]`.
 
@@ -78,7 +78,7 @@ Tables validated: `[holbuild]`, `[project]`, `[build]` (including `root_groups` 
 
 Every resolved graph must contain exactly one package named `hol`, declared as an exact git dependency. Upstream HOL does not need a manifest; holbuild uses a built-in manifest for package metadata and builds/reuses the declared HOL under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`.
 
-Schema 2 dependency forms:
+Supported dependency forms:
 
 1. Direct git dependencies:
    ```toml
@@ -97,13 +97,13 @@ Schema 2 dependency forms:
    ```
    `from` names a direct git dependency in the same manifest, `path` selects a subtree inside that checkout, and `manifest` is relative to the declaring package's manifest directory.
 
-Dependency `name` in `[dependencies.X]` must match `project.name` in the resolved manifest when the manifest declares a name. Mismatch is an error, except for the built-in `hol` manifest.
+The dependency key in `[dependencies.X]` must match the required `project.name` in the resolved manifest. Mismatch is an error.
 
 Unsupported: schema 1, `[dependencies.HOLDIR]`, manifest path dependencies, dependency path environment expansion, branches/tags/ranges, registries, lockfiles, solvers, and multiple versions of one package. Local `path`/`git` source overrides are available in `.holconfig.toml`, not in committed manifests.
 
 ## Path rules
 
-- `build.members`, `build.exclude`, `build.exclude_globs`, `build.roots`, `build.groups.*.include`, `build.groups.*.include_globs`, `build.groups.*.exclude`, `build.groups.*.exclude_globs`, `actions.*.extra_deps`, `generate.*.inputs`, `generate.*.outputs` — **package-root-relative**
+- `build.members`, `build.exclude`, `build.exclude_globs`, `build.roots`, `build.groups.*.include`, `build.groups.*.include_globs`, `build.groups.*.exclude`, `build.groups.*.exclude_globs`, `actions.*.extra_inputs`, `actions.*.extra_deps`, `generate.*.inputs`, `generate.*.outputs` — **package-root-relative** and may not contain `..` components
 - Absolute paths and `..` components are rejected in those package-relative fields
 - `dependencies.*.path` and `dependencies.*.manifest` are allowed only in `from/path/manifest` dependencies
 - `from` dependency `path` and `manifest` fields must be relative and contain no `..`

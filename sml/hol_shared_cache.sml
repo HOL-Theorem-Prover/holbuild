@@ -6,7 +6,7 @@ structure FS = OS.FileSys
 
 exception Error of string
 
-val format_version = "holbuild-hol-toolchain-v1"
+val format_version = "holbuild-hol-toolchain-v2"
 val default_canonical_git = "https://github.com/HOL-Theorem-Prover/HOL.git"
 val standard_kernel = HolbuildHolToolchainConfig.StandardKernel
 

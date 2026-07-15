@@ -18,6 +18,7 @@ make_project() {
   cat > "$project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -103,6 +104,7 @@ mkdir -p "$parent_sensitive_source/src" "$parent_sensitive_a1" "$parent_sensitiv
 cat > "$parent_sensitive_source/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"

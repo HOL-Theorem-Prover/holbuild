@@ -8,14 +8,29 @@ exception Error of string
 exception ErrorWithDebugArtifacts of string * HolbuildStatus.debug_artifacts
 
 datatype kind = TheoryScript | Sml | Sig
+datatype source_origin = DeclaredSource | GeneratedSource
 
 type artifacts =
   { generated : string list,
     objects : string list,
     theory_data : string list }
 
+type source_node =
+  { id : string,
+    package_id : string,
+    relative_path : string,
+    logical_name : string,
+    kind : kind,
+    origin : source_origin,
+    canonical_artifacts : artifacts,
+    policy_id : string,
+    execution_policy_id : string,
+    policy : HolbuildProject.action_policy }
+
 type source =
-  { package : string,
+  { node : source_node,
+    package : string,
+    package_root : string,
     kind : kind,
     logical_name : string,
     source_path : string,
@@ -23,7 +38,20 @@ type source =
     artifacts : artifacts,
     policy : HolbuildProject.action_policy }
 
+type package_inventory =
+  { package_id : string,
+    package_name : string,
+    nodes : source_node list,
+    by_relative_path : (string * source_node) list,
+    by_logical_name : (string * source_node list) list,
+    generated_outputs : (string * source_node) list,
+    extra_inputs : (string * source_node) list }
+
 type t = source list
+
+type discovery =
+  { inventories : package_inventory list,
+    sources : t }
 
 fun has_suffix suffix s =
   let
@@ -74,21 +102,87 @@ fun sml_artifacts root rel =
 fun sig_artifacts root rel =
   { generated = [], objects = [obj_path root rel ".ui"], theory_data = [] }
 
-fun make_source package policies kind logical_name source_path relative_path artifacts =
-  {package = package,
-   kind = kind,
-   logical_name = logical_name,
-   source_path = source_path,
-   relative_path = relative_path,
-   artifacts = artifacts,
-   policy = HolbuildProject.action_policy_for policies logical_name}
+fun kind_tag TheoryScript = "theory"
+  | kind_tag Sml = "sml"
+  | kind_tag Sig = "sig"
+
+fun frame text = Int.toString (size text) ^ ":" ^ text
+fun framed fields = String.concat (map frame fields)
+fun framed_list tag values = [tag, Int.toString (length values)] @ values
+
+fun policy_render (HolbuildProject.ActionPolicy
+      {logical, deps, loads, extra_inputs, ...}) =
+  let fun extra (HolbuildProject.ExtraInput {path}) = path
+  in
+    framed
+      (["holbuild-source-policy-v1", logical] @
+       framed_list "deps" deps @ framed_list "loads" loads @
+       framed_list "extra" (map extra extra_inputs))
+  end
+
+fun execution_policy_render (HolbuildProject.ActionPolicy
+      {impure, cache, always_reexecute, ...}) =
+  let fun bool true = "1" | bool false = "0"
+  in framed ["holbuild-source-execution-policy-v1",
+             bool impure, bool cache, bool always_reexecute] end
+
+fun origin_tag DeclaredSource = "declared"
+  | origin_tag GeneratedSource = "generated"
+
+fun source_node_id package_id kind origin logical_name relative_path (canonical_artifacts : artifacts) policy_id =
+  HolbuildHash.string_sha256
+    (framed
+      (["holbuild-source-node-v1", package_id, kind_tag kind, origin_tag origin,
+        logical_name, relative_path, policy_id] @
+       framed_list "generated" (#generated canonical_artifacts) @
+       framed_list "objects" (#objects canonical_artifacts) @
+       framed_list "theory_data" (#theory_data canonical_artifacts)))
+
+fun make_source package package_id package_root policies generated_paths kind logical_name source_path relative_path artifacts =
+  let
+    val origin =
+      if List.exists (fn path => path = relative_path) generated_paths then
+        GeneratedSource
+      else DeclaredSource
+    val policy = HolbuildProject.action_policy_for policies logical_name
+    val canonical_artifacts =
+      case kind of
+          TheoryScript => theory_artifacts "" relative_path logical_name
+        | Sml => sml_artifacts "" relative_path
+        | Sig => sig_artifacts "" relative_path
+    val policy_id = HolbuildHash.string_sha256 (policy_render policy)
+    val execution_policy_id =
+      HolbuildHash.string_sha256 (execution_policy_render policy)
+    val node =
+      {id = source_node_id package_id kind origin logical_name relative_path canonical_artifacts policy_id,
+       package_id = package_id,
+       relative_path = relative_path,
+       logical_name = logical_name,
+       kind = kind,
+       origin = origin,
+       canonical_artifacts = canonical_artifacts,
+       policy_id = policy_id,
+       execution_policy_id = execution_policy_id,
+       policy = policy}
+  in
+    {node = node,
+     package = package,
+     package_root = package_root,
+     kind = kind,
+     logical_name = logical_name,
+     source_path = source_path,
+     relative_path = relative_path,
+     artifacts = artifacts,
+     policy = policy}
+  end
 
 fun generated_theory_artifact file =
   has_suffix "Theory.sml" file orelse
   has_suffix "Theory.sig" file
 
-fun classify package artifact_root policies abs_path rel =
+fun classify package package_id source_root artifact_root policies generated_paths abs_path =
   let
+    val rel = relative_path source_root abs_path
     val file = filename rel
   in
     if generated_theory_artifact file then NONE
@@ -96,16 +190,16 @@ fun classify package artifact_root policies abs_path rel =
       let
         val theory = drop_suffix "Script.sml" file ^ "Theory"
       in
-        SOME (make_source package policies TheoryScript theory abs_path rel
+        SOME (make_source package package_id source_root policies generated_paths TheoryScript theory abs_path rel
                             (theory_artifacts artifact_root rel theory))
       end
     else if has_suffix ".sml" file then
       let val logical = drop_suffix ".sml" file
-      in SOME (make_source package policies Sml logical abs_path rel
+      in SOME (make_source package package_id source_root policies generated_paths Sml logical abs_path rel
                            (sml_artifacts artifact_root rel)) end
     else if has_suffix ".sig" file then
       let val logical = drop_suffix ".sig" file
-      in SOME (make_source package policies Sig logical abs_path rel
+      in SOME (make_source package package_id source_root policies generated_paths Sig logical abs_path rel
                            (sig_artifacts artifact_root rel)) end
     else NONE
   end
@@ -177,16 +271,13 @@ fun list_dir path =
 
 fun list_dir_if_readable path = list_dir path handle Error _ => []
 
-fun scan_file package source_root artifact_root policies excludes exclude_globs path acc =
-  let val rel = relative_path source_root path
-  in
-    if excluded excludes exclude_globs rel then acc
-    else case classify package artifact_root policies path rel of
+fun scan_file package package_id source_root artifact_root policies generated_paths excludes exclude_globs path acc =
+  if excluded excludes exclude_globs (relative_path source_root path) then acc
+  else case classify package package_id source_root artifact_root policies generated_paths path of
       NONE => acc
     | SOME source => source :: acc
-  end
 
-fun scan_dir package source_root artifact_root policies excludes exclude_globs path acc =
+fun scan_dir package package_id source_root artifact_root policies generated_paths excludes exclude_globs path acc =
   let
     fun scan_name (name, acc) =
       let val path' = join path name
@@ -195,9 +286,9 @@ fun scan_dir package source_root artifact_root policies excludes exclude_globs p
         else if is_dir path' then
           if skip_dir name orelse not (is_readable path') orelse contains_manifest path' orelse
              excluded excludes exclude_globs (relative_path source_root path') then acc
-          else scan_dir package source_root artifact_root policies excludes exclude_globs path' acc
+          else scan_dir package package_id source_root artifact_root policies generated_paths excludes exclude_globs path' acc
         else if String.isPrefix "." name then acc
-        else if is_readable path' then scan_file package source_root artifact_root policies excludes exclude_globs path' acc
+        else if is_readable path' then scan_file package package_id source_root artifact_root policies generated_paths excludes exclude_globs path' acc
         else acc
       end
   in
@@ -208,35 +299,6 @@ fun compare_source (a : source, b : source) =
   case String.compare(#package a, #package b) of
       EQUAL => String.compare(#relative_path a, #relative_path b)
     | order => order
-
-fun split xs =
-  let
-    fun loop left right rest =
-      case rest of
-          [] => (left, right)
-        | [x] => (x :: left, right)
-        | x :: y :: zs => loop (x :: left) (y :: right) zs
-  in
-    loop [] [] xs
-  end
-
-fun merge compare left right =
-  case (left, right) of
-      ([], _) => right
-    | (_, []) => left
-    | (l :: ls, r :: rs) =>
-        if compare (l, r) <> GREATER then
-          l :: merge compare ls right
-        else
-          r :: merge compare left rs
-
-fun msort compare xs =
-  case xs of
-      [] => []
-    | [_] => xs
-    | _ =>
-      let val (left, right) = split xs
-      in merge compare (msort compare left) (msort compare right) end
 
 fun compatible_same_name (a : source) (b : source) =
   #package a = #package b andalso
@@ -249,33 +311,49 @@ fun by_logical (sources : source list) =
   let
     fun conflicts source other = not (compatible_same_name source other)
     fun insert (source, seen) =
-      case Binarymap.peek (seen, #logical_name source) of
-          NONE => Binarymap.insert (seen, #logical_name source, [source])
+      case Binarymap.peek(seen, #logical_name source) of
+          NONE => Binarymap.insert(seen, #logical_name source, [source])
         | SOME same_name =>
-          case List.find (conflicts source) same_name of
-              NONE => Binarymap.insert (seen, #logical_name source, source :: same_name)
-            | SOME other =>
-                raise Error ("duplicate logical name " ^ #logical_name source ^ ": " ^
-                             #package other ^ ":" ^ #relative_path other ^ " and " ^
-                             #package source ^ ":" ^ #relative_path source)
+            (case List.find (conflicts source) same_name of
+                 NONE => Binarymap.insert(seen, #logical_name source,
+                                          source :: same_name)
+               | SOME other =>
+                   raise Error ("duplicate logical name " ^ #logical_name source ^ ": " ^
+                                #package other ^ ":" ^ #relative_path other ^ " and " ^
+                                #package source ^ ":" ^ #relative_path source))
   in
     ignore (List.foldl insert (Binarymap.mkDict String.compare) sources);
     sources
   end
 
-fun dedup_sources sources =
+fun split_sources xs =
   let
-    fun insert (source : source, (seen, acc)) =
-      let val path = normalize_path (#source_path source)
-      in
-        if Redblackset.member (seen, path) then (seen, acc)
-        else (Redblackset.add (seen, path), source :: acc)
-      end
+    fun loop left right rest =
+      case rest of
+          [] => (left, right)
+        | [x] => (x :: left, right)
+        | x :: y :: more => loop (x :: left) (y :: right) more
   in
-    #2 (List.foldr insert (Redblackset.empty String.compare, []) sources)
+    loop [] [] xs
   end
 
-fun sort_sources sources = msort compare_source sources
+fun merge_sources left right =
+  case (left, right) of
+      ([], _) => right
+    | (_, []) => left
+    | (l :: ls, r :: rs) =>
+        if compare_source(l, r) <> GREATER then
+          l :: merge_sources ls right
+        else
+          r :: merge_sources left rs
+
+fun sort_sources sources =
+  case sources of
+      [] => []
+    | [_] => sources
+    | _ =>
+        let val (left, right) = split_sources sources
+        in merge_sources (sort_sources left) (sort_sources right) end
 
 fun validate_action_policies package_name policies sources =
   let
@@ -294,114 +372,178 @@ fun validate_action_policies package_name policies sources =
     List.app validate policies
   end
 
-fun scan_member name source_root artifact_root policies excludes exclude_globs (member, acc) =
-  if is_dir member then scan_dir name source_root artifact_root policies excludes exclude_globs member acc
-  else if is_readable member then scan_file name source_root artifact_root policies excludes exclude_globs member acc
+fun scan_member name package_id source_root artifact_root policies generated_paths excludes exclude_globs (member, acc) =
+  if is_dir member then scan_dir name package_id source_root artifact_root policies generated_paths excludes exclude_globs member acc
+  else if is_readable member then scan_file name package_id source_root artifact_root policies generated_paths excludes exclude_globs member acc
   else raise Error ("member does not exist: " ^ member)
 
-fun scan_package_sources allow_missing_members package acc =
+fun source_graph_package_id package =
+  let val definition = HolbuildProject.package_definition_of package
+  in
+    HolbuildHash.string_sha256
+      (framed
+        ["holbuild-source-graph-package-v1",
+         HolbuildPackageDefinition.source_definition_id definition,
+         HolbuildPackageDefinition.dependency_definition_id definition,
+         HolbuildPackageDefinition.action_dependency_policy_id definition,
+         HolbuildPackageDefinition.action_input_policy_id definition])
+  end
+
+fun member_contains member path =
+  let
+    val member = normalize_path member
+    val path = normalize_path path
+    val prefix = if has_suffix "/" member then member else member ^ "/"
+  in
+    path = member orelse String.isPrefix prefix path
+  end
+
+fun prevalidate_package package =
   let
     val name = HolbuildProject.package_name package
+    val package_id = source_graph_package_id package
     val source_root = HolbuildProject.package_root package
     val artifact_root = HolbuildProject.package_artifact_root package
     val policies = HolbuildProject.package_action_policies package
+    val generators = HolbuildProject.package_generators package
+    val generated_paths = List.concat (map HolbuildProject.generator_outputs generators)
     val excludes = HolbuildProject.package_excludes package
     val exclude_globs = HolbuildProject.package_exclude_globs package
     val members =
       map (fn member => HolbuildProject.abs_under source_root member)
         (HolbuildProject.package_members package)
-    fun scan_one (member, sources) =
-      if allow_missing_members andalso not (is_dir member orelse is_readable member) then sources
-      else scan_member name source_root artifact_root policies excludes exclude_globs (member, sources)
-  in
-    List.foldl scan_one acc members
-  end
-
-(* Generator outputs may be the targets of action policies.  Include only
-   declared paths that a post-generation scan could discover: a generator is
-   allowed to create a missing member directory, so membership is determined
-   lexically rather than by statting it.  In particular, do not let an
-   arbitrary source-shaped output outside build.members (or under an exclude)
-   satisfy policy prevalidation before its generator runs. *)
-fun declared_generator_sources package =
-  let
-    val name = HolbuildProject.package_name package
-    val source_root = HolbuildProject.package_root package
-    val artifact_root = HolbuildProject.package_artifact_root package
-    val policies = HolbuildProject.package_action_policies package
-    val excludes = HolbuildProject.package_excludes package
-    val exclude_globs = HolbuildProject.package_exclude_globs package
-    val members =
-      map (fn member => normalize_path (HolbuildProject.abs_under source_root member))
-        (HolbuildProject.package_members package)
-    fun member_contains member path =
-      path = member orelse
-      String.isPrefix (if has_suffix "/" member then member else member ^ "/") path
-    fun is_member path = List.exists (fn member => member_contains member path) members
-    fun add_output (output, acc) =
+    fun scan_existing (member, sources) =
+      if is_dir member orelse is_readable member then
+        scan_member name package_id source_root artifact_root policies generated_paths
+          excludes exclude_globs (member, sources)
+      else sources
+    fun declared_output (output, sources) =
       let
-        val path = normalize_path (HolbuildProject.abs_under source_root output)
+        val path = HolbuildProject.abs_under source_root output
         val rel = relative_path source_root path
       in
-        if not (is_member path) orelse excluded excludes exclude_globs rel then acc
+        if not (List.exists (fn member => member_contains member path) members) orelse
+           excluded excludes exclude_globs rel then sources
         else
-          case classify name artifact_root policies path rel of
-              NONE => acc
-            | SOME source => source :: acc
+          case classify name package_id source_root artifact_root policies
+                          generated_paths path of
+              NONE => sources
+            | SOME source => source :: sources
       end
-    fun add_generator (generator, acc) =
-      List.foldl add_output acc (HolbuildProject.generator_outputs generator)
+    val existing = List.foldl scan_existing [] members
+    val candidates = List.foldl declared_output existing generated_paths
   in
-    List.foldl add_generator [] (HolbuildProject.package_generators package)
+    validate_action_policies name policies candidates
   end
 
-fun prevalidate_action_policies package =
+fun prevalidate_graph graph =
+  List.app prevalidate_package (HolbuildProjectGraph.packages graph)
+
+fun deduplicate_sources sources =
   let
-    (* A generator can create a declared build member, so preflight ignores a
-       missing member and lets the normal post-generation scan diagnose it. *)
-    val candidates = scan_package_sources true package [] @ declared_generator_sources package
+    fun add (source : source, (seen, kept)) =
+      let val identity = #package source ^ "\000" ^ normalize_path (#source_path source)
+      in
+        if Redblackset.member(seen, identity) then (seen, kept)
+        else (Redblackset.add(seen, identity), source :: kept)
+      end
+    val (_, kept) = List.foldr add (Redblackset.empty String.compare, []) sources
   in
-    validate_action_policies (HolbuildProject.package_name package)
-                             (HolbuildProject.package_action_policies package)
-                             candidates
+    kept
   end
 
 fun discover_package package acc =
   let
-    val _ = HolbuildGenerators.run_package package
-            handle HolbuildGenerators.Error msg => raise Error msg
-                 | HolbuildGenerators.ErrorWithDebugArtifacts (msg, artifacts) =>
-                     raise ErrorWithDebugArtifacts (msg, artifacts)
-  in
-    scan_package_sources false package acc
-  end
-
-fun discover_with resolution (project : HolbuildProject.t) =
-  let
-    val packages = HolbuildProject.packages_with resolution project
-    val _ = List.app prevalidate_action_policies packages
+    val name = HolbuildProject.package_name package
+    val package_id = source_graph_package_id package
+    val source_root = HolbuildProject.package_root package
+    val artifact_root = HolbuildProject.package_artifact_root package
+    val policies = HolbuildProject.package_action_policies package
+    val generated_paths =
+      List.concat
+        (map HolbuildProject.generator_outputs
+          (HolbuildProject.package_generators package))
+    val excludes = HolbuildProject.package_excludes package
+    val exclude_globs = HolbuildProject.package_exclude_globs package
+    val members =
+      map (fn member => HolbuildProject.abs_under source_root member)
+        (HolbuildProject.package_members package)
     val sources =
-      sort_sources
-        (dedup_sources
-           (List.foldl
-              (fn (package, acc) => discover_package package acc)
-              []
-              packages))
-    (* A package can scan a physical file already retained from another
-       package.  Validate after global deduplication so its policy cannot be
-       accepted for a source that will not exist in the final index. *)
-    val _ =
-      List.app
-        (fn package =>
-            validate_action_policies (HolbuildProject.package_name package)
-                                     (HolbuildProject.package_action_policies package)
-                                     sources)
-        packages
+      deduplicate_sources
+        (List.foldl
+          (scan_member name package_id source_root artifact_root policies generated_paths excludes exclude_globs)
+          acc
+          members)
+    val _ = validate_action_policies name policies sources
   in
-    by_logical sources
+    sources
   end
 
-fun discover project = discover_with HolbuildProject.standard_resolution project
+fun add_logical_node (node : source_node, entries) =
+  let val logical = #logical_name node
+  in
+    case List.find (fn (name, _) => name = logical) entries of
+        NONE => (logical, [node]) :: entries
+      | SOME (_, existing) =>
+          (logical, existing @ [node]) ::
+          List.filter (fn (name, _) => name <> logical) entries
+  end
+
+fun package_inventory package sources : package_inventory =
+  let
+    val package_id = source_graph_package_id package
+    val nodes = map (fn (source : source) => #node source) sources
+    fun is_generated (node : source_node) = #origin node = GeneratedSource
+    fun node_extra_inputs (node : source_node) =
+      map (fn HolbuildProject.ExtraInput {path} => (path, node))
+        (HolbuildProject.action_extra_inputs (#policy node))
+  in
+    {package_id = package_id,
+     package_name = HolbuildProject.package_name package,
+     nodes = nodes,
+     by_relative_path = map (fn node => (#relative_path node, node)) nodes,
+     by_logical_name = List.foldl add_logical_node [] nodes,
+     generated_outputs =
+       map (fn node => (#relative_path node, node)) (List.filter is_generated nodes),
+     extra_inputs = List.concat (map node_extra_inputs nodes)}
+  end
+
+fun discover_package_inventory package =
+  let val sources = sort_sources (discover_package package [])
+  in (package_inventory package sources, sources) end
+
+fun write_test_inventory inventories =
+  case OS.Process.getEnv "HOLBUILD_TEST_SOURCE_INVENTORY" of
+      NONE => ()
+    | SOME path =>
+        let
+          val output = TextIO.openOut path
+          fun write_node (node : source_node) =
+            TextIO.output(output, #id node ^ " " ^ #relative_path node ^ "\n")
+          val _ = List.app (fn (inventory : package_inventory) => List.app write_node (#nodes inventory)) inventories
+        in
+          TextIO.closeOut output
+        end
+
+fun discover_prepared_with_inventories preparation : discovery =
+  let
+    val graph = HolbuildPackagePrepare.graph preparation
+    val pairs = map discover_package_inventory (HolbuildProjectGraph.packages graph)
+    val inventories = map #1 pairs
+    val sources = by_logical (sort_sources (List.concat (map #2 pairs)))
+    val _ = write_test_inventory inventories
+  in
+    {inventories = inventories, sources = sources}
+  end
+
+fun node_of (source : source) = #node source
+fun node_id (node : source_node) = #id node
+fun source_id source = node_id (node_of source)
+fun inventory_nodes (inventory : package_inventory) = #nodes inventory
+fun inventory_package_id (inventory : package_inventory) = #package_id inventory
+fun inventory_package_name (inventory : package_inventory) = #package_name inventory
+fun inventories_of ({inventories, ...} : discovery) = inventories
+fun sources_of ({sources, ...} : discovery) = sources
 
 fun kind_string kind =
   case kind of
@@ -505,7 +647,7 @@ fun group_member_sources sources package name =
 fun group_token_name token =
   let val name = String.extract(token, 1, NONE)
   in
-    if HolbuildProject.valid_group_name name then name
+    if HolbuildPackageDefinition.valid_group_name name then name
     else raise Error ("invalid group reference \"" ^ token ^ "\"")
   end
 
@@ -565,7 +707,9 @@ fun default_targets_with resolution sources project =
     (List.concat
        (map (default_package_targets sources)
             (List.filter package_has_default_targets
-              (HolbuildProject.packages_with resolution project))))
+              (HolbuildProjectGraph.packages
+                (HolbuildProjectGraph.resolve
+                  {project = project, resolution = resolution})))))
 
 fun default_targets sources project =
   default_targets_with HolbuildProject.standard_resolution sources project

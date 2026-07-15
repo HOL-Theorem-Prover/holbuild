@@ -24,6 +24,7 @@ mkdir -p \
 cat > "$project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -77,6 +78,7 @@ mkdir -p "$index_budget_project/.holbuild/checkpoints/index-budget/src/OldScript
 cat > "$index_budget_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -120,6 +122,7 @@ mkdir -p "$(dirname "$drift_prefix")" "$(dirname "$drift_indexed_save")"
 cat > "$drift_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -171,6 +174,7 @@ mkdir -p "$delete_failure_family.deps/old" "$delete_failure_bin"
 cat > "$delete_failure_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -213,6 +217,7 @@ mkdir -p "$clean_only_project/.holbuild/stage/old" "$clean_only_cache/tmp/old"
 cat > "$clean_only_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -246,6 +251,7 @@ mkdir -p \
 cat > "$budget_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -293,6 +299,7 @@ mkdir -p "$failure_index_project/src"
 cat > "$failure_index_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -325,6 +332,7 @@ mkdir -p "$deep_watch_project/deep/nested" "$(dirname "$deep_watch_family")"
 cat > "$deep_watch_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -373,6 +381,7 @@ mkdir -p "$mid_project/src"
 cat > "$mid_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -424,6 +433,7 @@ mkdir -p "$protected_project/src" "$protected_slow_family.deps/seed"
 cat > "$protected_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -484,6 +494,7 @@ mkdir -p "$dependency_project/src" "$dependency_family.deps/seed"
 cat > "$dependency_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -556,6 +567,7 @@ mkdir -p "$gate_project/src" "$gate_family.deps/seed"
 cat > "$gate_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -644,6 +656,7 @@ mkdir -p "$protected_empty_project/src" "$protected_empty_old_family.deps/old"
 cat > "$protected_empty_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -701,6 +714,7 @@ mkdir -p "$scan_project/src"
 cat > "$scan_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -751,6 +765,7 @@ mkdir -p "$perf_scan_project/src1" "$perf_scan_project/src2"
 cat > "$perf_scan_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"

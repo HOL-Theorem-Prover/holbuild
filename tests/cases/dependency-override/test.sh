@@ -30,6 +30,7 @@ make_project_dir() {
   cat > "$dir/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "$name"
@@ -65,6 +66,7 @@ mkdir -p "$project"
 cat > "$project/holproject.toml" <<'TOML'
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "direct_project"
@@ -84,6 +86,8 @@ require_grep "override=$leaf" "$direct_log"
 require_grep "local=$leaf" "$direct_log"
 require_grep "resolved-manifest=$leaf/holproject.toml" "$direct_log"
 require_grep "package: leaf \[root=$leaf" "$direct_log"
+require_grep "package-snapshot: leaf .*git-v1" "$direct_log"
+require_grep "package-retrieval: leaf trusted-path:$leaf" "$direct_log"
 if [ -e "$project/.holbuild/src/leaf" ]; then
   echo "overridden direct dependency was materialized into .holbuild/src" >&2
   exit 1
@@ -105,6 +109,7 @@ mkdir -p "$git_project"
 cat > "$git_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "git_project"
@@ -148,6 +153,7 @@ mkdir -p "$recursive_project"
 cat > "$recursive_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "recursive_project"
@@ -198,6 +204,7 @@ mkdir -p "$recursive_git_project"
 cat > "$recursive_git_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "recursive_git_project"

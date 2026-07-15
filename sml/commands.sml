@@ -309,19 +309,23 @@ fun reject_object_target target =
 
 fun reject_object_targets targets = List.app reject_object_target targets
 
+fun resolved_packages resolution project =
+  HolbuildProjectGraph.packages
+    (HolbuildProjectGraph.resolve {project = project, resolution = resolution})
+
 fun project_has_default_targets resolution project =
   List.exists HolbuildSourceIndex.package_has_default_targets
-    (HolbuildProject.packages_with resolution project)
+    (resolved_packages resolution project)
 
 fun default_build_targets resolution project index targets =
   if null targets then HolbuildSourceIndex.default_targets_with resolution index project
   else HolbuildSourceIndex.expand_group_tokens index (HolbuildProject.project_package project) targets
 
-fun build_target_plan resolution holdir project index requested_targets targets =
+fun build_target_plan resolution components holdir project index requested_targets targets =
   if null requested_targets andalso null targets andalso not (project_has_default_targets resolution project) then
-    HolbuildBuildPlan.plan_targets holdir index (HolbuildSourceIndex.root_package_targets index project)
+    HolbuildBuildPlan.plan_targets components holdir index (HolbuildSourceIndex.root_package_targets index project)
   else
-    HolbuildBuildPlan.plan_targets holdir index targets
+    HolbuildBuildPlan.plan_targets components holdir index targets
 
 fun source_key source =
   #package source ^ "\000" ^ #relative_path source ^ "\000" ^ #logical_name source
@@ -335,7 +339,7 @@ fun rooted_package_names resolution project =
       not (null (HolbuildProject.package_root_groups package))
   in
     map HolbuildProject.package_name
-      (List.filter has_rooted_targets (HolbuildProject.packages_with resolution project))
+      (List.filter has_rooted_targets (resolved_packages resolution project))
   end
 
 fun root_warning_source rooted_packages built_keys source =
@@ -549,7 +553,14 @@ fun find_theorem_in_source theorem source =
 fun print_execution_plan_selector new_ir project selector =
   let
     val {theory, theorem} = parse_execution_plan_selector selector
-    val index = HolbuildSourceIndex.discover project
+    val graph = HolbuildProjectGraph.resolve
+                  {project = project,
+                   resolution = HolbuildProject.standard_resolution}
+    val preparation = HolbuildPackagePrepare.prepare graph
+    val discovery = HolbuildSourceIndex.discover_prepared_with_inventories preparation
+    val components = HolbuildComponentProvider.load HolbuildComponentProvider.LiveProvider
+                       {preparation = preparation, discovery = discovery}
+    val index = HolbuildComponentProvider.sources components
     val source = find_theory_source index theory
   in
     print_static_execution_plan project new_ir source theorem (SOME (find_theorem_in_source theorem source))
@@ -654,7 +665,14 @@ fun load_project () =
   apply_project_local_remote_cache_config (HolbuildProject.discover ())
   handle HolbuildProject.Error msg => raise Error msg
 
-fun context () = HolbuildProject.describe (load_project ())
+fun context () =
+  let
+    val project = load_project ()
+    val _ = HolbuildProjectGraph.resolve
+              {project = project, resolution = HolbuildProject.standard_resolution}
+  in
+    HolbuildProject.describe project
+  end
 
 fun timed_phase name f = HolbuildToolchain.time_phase name f
 
@@ -690,6 +708,26 @@ fun finish_stat_cache instance_opt =
 
 fun resolution_for_toolchain (tc : HolbuildToolchain.t) =
   {kernel_variant = #kernel_variant tc}
+
+fun prepare_source_index phase_prefix resolution project =
+  let
+    val graph = timed_phase (phase_prefix ^ ".graph.resolve")
+                  (fn () => HolbuildProjectGraph.resolve
+                    {project = project, resolution = resolution})
+    val _ = timed_phase (phase_prefix ^ ".policies.prevalidate")
+              (fn () => HolbuildSourceIndex.prevalidate_graph graph)
+    val preparation = timed_phase (phase_prefix ^ ".generators.prepare")
+                        (fn () => HolbuildPackagePrepare.prepare graph)
+    val discovery = timed_phase (phase_prefix ^ ".inventory.construct")
+                      (fn () => HolbuildSourceIndex.discover_prepared_with_inventories preparation)
+    val components = timed_phase (phase_prefix ^ ".components.load")
+                       (fn () => HolbuildComponentProvider.load
+                         HolbuildComponentProvider.LiveProvider
+                         {preparation = preparation, discovery = discovery})
+  in
+    {index = HolbuildComponentProvider.sources components,
+     components = components}
+  end
 
 fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, proof_steps, new_ir, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes}, targets) =
   let
@@ -745,16 +783,17 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
        trknl = HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)}
     fun prepare_plan () =
       let
-        val index =
+        val {index, components} =
           case prepared of
-              SOME {index, ...} => index
-            | NONE => timed_phase "source.discover" (fn () => HolbuildSourceIndex.discover_with resolution project)
+              SOME {index, components, ...} =>
+                {index = index, components = components}
+            | NONE => prepare_source_index "build" resolution project
         val requested_targets = targets
         val targets = timed_phase "targets.default" (fn () => default_build_targets resolution project index requested_targets)
         val _ = reject_object_targets targets
-        val plan = timed_phase "build.plan" (fn () => build_target_plan resolution (#holdir tc) project index requested_targets targets)
+        val plan = timed_phase "build.plan" (fn () => build_target_plan resolution components (#holdir tc) project index requested_targets targets)
         val entry_targets = map #2 (HolbuildTacticTimeoutPolicy.declared_entries project index)
-        val entry_plan = timed_phase "entry_timeout.plan" (fn () => HolbuildBuildPlan.plan_targets (#holdir tc) index entry_targets)
+        val entry_plan = timed_phase "entry_timeout.plan" (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index entry_targets)
         val _ = if warn_unreachable andalso null requested_targets then
                   warn_unreachable_root_scripts resolution project index plan
                 else ()
@@ -793,6 +832,10 @@ fun build_iteration_error_message exn =
     | HolbuildProject.Error msg => SOME msg
     | HolbuildGenerators.Error msg => SOME msg
     | HolbuildGenerators.ErrorWithDebugArtifacts (msg, _) => SOME msg
+    | HolbuildPackagePrepare.Error msg => SOME msg
+    | HolbuildPackagePrepare.ErrorWithDebugArtifacts (msg, _) => SOME msg
+    | HolbuildPackageComponent.Error msg => SOME msg
+    | HolbuildComponentProvider.Error msg => SOME msg
     | HolbuildSourceIndex.Error msg => SOME msg
     | HolbuildSourceIndex.ErrorWithDebugArtifacts (msg, _) => SOME msg
     | HolbuildDependencies.Error msg => SOME msg
@@ -808,10 +851,11 @@ fun build_iteration_error_message exn =
 fun current_watch_state resolution previous_paths =
   let
     val project = timed_phase "watch.project.discover" load_project
-    val index = timed_phase "watch.source.discover" (fn () => HolbuildSourceIndex.discover_with resolution project)
+    val {index, components} = prepare_source_index "watch" resolution project
     val paths = HolbuildWatch.watch_paths_with resolution project index
   in
-    {prepared = SOME {project = project, index = index, paths = paths}, paths = paths}
+    {prepared = SOME {project = project, index = index,
+                      components = components, paths = paths}, paths = paths}
   end
   handle exn =>
     case (build_iteration_error_message exn, previous_paths) of
@@ -1092,12 +1136,12 @@ fun export_archive tc jobs args =
     val _ = if build_first then build tc jobs requested_targets else ()
     val project = timed_phase "project.discover" load_project
     val resolution = resolution_for_toolchain tc
-    val index = timed_phase "source.discover" (fn () => HolbuildSourceIndex.discover_with resolution project)
+    val {index, components} = prepare_source_index "export" resolution project
     val targets = timed_phase "targets.default" (fn () => default_build_targets resolution project index requested_targets)
     val _ = reject_object_targets targets
-    val plan = timed_phase "build.plan" (fn () => build_target_plan resolution (#holdir tc) project index requested_targets targets)
+    val plan = timed_phase "build.plan" (fn () => build_target_plan resolution components (#holdir tc) project index requested_targets targets)
     val entry_targets = map #2 (HolbuildTacticTimeoutPolicy.declared_entries project index)
-    val entry_plan = timed_phase "entry_timeout.plan" (fn () => HolbuildBuildPlan.plan_targets (#holdir tc) index entry_targets)
+    val entry_plan = timed_phase "entry_timeout.plan" (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index entry_targets)
     val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
     val options = export_build_options (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)) project index entry_plan plan
     val keys = HolbuildBuildPlan.input_keys (HolbuildBuildExec.build_config_lines_for_node options project) toolchain_key plan
@@ -1160,8 +1204,10 @@ fun clean_targets args =
     val _ = reject_object_targets args
     fun execute_clean () =
       let
-        val index = timed_phase "source.discover" (fn () => HolbuildSourceIndex.discover project)
-        val plan = timed_phase "build.plan" (fn () => HolbuildBuildPlan.plan_targets "" index args)
+        val {index, components} = prepare_source_index "clean"
+                                  HolbuildProject.standard_resolution project
+        val plan = timed_phase "build.plan"
+                     (fn () => HolbuildBuildPlan.plan_targets components "" index args)
         fun target_nodes target =
           case HolbuildBuildPlan.lookup plan target of
               [] => raise Error ("unknown clean target: " ^ target)
@@ -1207,10 +1253,11 @@ fun build_heap_kind tc cli_jobs command target =
     fun execute_heap () =
       let
         val HolbuildProject.Heap {output, objects, kind, ...} = heap_named project command target
-        val index = timed_phase "source.discover" (fn () => HolbuildSourceIndex.discover project)
+        val {index, components} = prepare_source_index "heap"
+                                  (resolution_for_toolchain tc) project
         val objects = HolbuildSourceIndex.expand_group_tokens index (HolbuildProject.project_package project) objects
         val _ = if null objects then raise Error (command ^ " target has no objects: " ^ target) else ()
-        val plan = timed_phase "build.plan" (fn () => HolbuildBuildPlan.plan_targets (#holdir tc) index objects)
+        val plan = timed_phase "build.plan" (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index objects)
         val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
         val output_path = HolbuildProject.abs_under (#root project) output
       in
@@ -1334,14 +1381,10 @@ fun reject_holdir holdir =
       SOME _ => raise Error "--holdir is no longer supported; declare dependencies.hol"
     | NONE => ()
 
-fun require_schema2 project =
-  if HolbuildProject.schema project = 2 then ()
-  else raise Error "only holproject schema 2 is supported"
-
 fun project_hol_holdir kernel_variant project =
   let val resolution = {kernel_variant = kernel_variant}
   in
-    (HolbuildProject.packages_with resolution project;
+    (ignore (HolbuildProjectGraph.resolve {project = project, resolution = resolution});
      case HolbuildProject.resolved_hol_dependency_with resolution project of
          SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev}, ...}) =>
            HolbuildHolSharedCache.ensure_built_with_kernel
@@ -1353,7 +1396,6 @@ fun effective_toolchain_for kernel_variant holdir maxheap =
   let
     val project = load_project ()
     val _ = reject_holdir holdir
-    val _ = require_schema2 project
   in
     {holdir = project_hol_holdir kernel_variant project, maxheap = maxheap,
      kernel_variant = kernel_variant}
@@ -1369,7 +1411,6 @@ fun context_toolchain holdir maxheap =
   let
     val project = load_project ()
     val _ = reject_holdir holdir
-    val _ = require_schema2 project
   in
     {holdir = "", maxheap = maxheap,
      kernel_variant = HolbuildHolToolchainConfig.StandardKernel}
@@ -1386,7 +1427,6 @@ fun buildhol holdir maxheap args =
     val kernel_variant = parse_buildhol_args args
     val project = load_project ()
     val _ = reject_holdir holdir
-    val _ = require_schema2 project
     val holdir = project_hol_holdir kernel_variant project
   in
     print (holdir ^ "\n")
@@ -1460,8 +1500,13 @@ fun main raw_args =
        | Error msg => err msg
        | HolbuildToolchain.Error msg => err msg
        | HolbuildProject.Error msg => err msg
+       | HolbuildProjectGraph.Error msg => err msg
        | HolbuildGenerators.Error msg => err msg
        | HolbuildGenerators.ErrorWithDebugArtifacts (msg, artifacts) => err_with_debug_artifacts msg artifacts
+       | HolbuildPackagePrepare.Error msg => err msg
+       | HolbuildPackagePrepare.ErrorWithDebugArtifacts (msg, artifacts) => err_with_debug_artifacts msg artifacts
+       | HolbuildPackageComponent.Error msg => err msg
+       | HolbuildComponentProvider.Error msg => err msg
        | HolbuildSourceIndex.Error msg => err msg
        | HolbuildSourceIndex.ErrorWithDebugArtifacts (msg, artifacts) => err_with_debug_artifacts msg artifacts
        | HolbuildDependencies.Error msg => err msg

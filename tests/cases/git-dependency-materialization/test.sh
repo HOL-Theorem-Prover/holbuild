@@ -35,6 +35,7 @@ git_identity "$repo"
 cat > "$repo/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "$hol_repo"
@@ -47,6 +48,7 @@ mkdir -p "$repo/subdir"
 cat > "$repo/subdir/sub.manifest.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "$hol_repo"
@@ -68,6 +70,7 @@ mkdir -p "$project"
 cat > "$project/sub.manifest.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "$hol_repo"
@@ -79,6 +82,7 @@ TOML
 cat > "$project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "project"
@@ -123,6 +127,7 @@ mkdir -p "$bad_short"
 cat > "$bad_short/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "bad-short"
@@ -146,6 +151,7 @@ mkdir -p "$bad_name"
 cat > "$bad_name/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "bad-name"
@@ -173,6 +179,7 @@ mkdir -p "$no_manifest_project"
 cat > "$no_manifest_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "no-manifest-project"
@@ -196,6 +203,7 @@ mkdir -p "$missing_from_manifest"
 cat > "$missing_from_manifest/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "missing-from-manifest"
@@ -224,6 +232,7 @@ mkdir -p "$unknown_from"
 cat > "$unknown_from/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "unknown-from"
@@ -244,6 +253,7 @@ mkdir -p "$from_from"
 cat > "$from_from/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "from-from"
@@ -277,6 +287,7 @@ mkdir -p "$bad_from_path"
 cat > "$bad_from_path/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "bad-from-path"
@@ -306,6 +317,7 @@ missing_rev=0000000000000000000000000000000000000000
 cat > "$missing/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "missing"

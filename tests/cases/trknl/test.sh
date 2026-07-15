@@ -48,6 +48,16 @@ if [[ "$traced_holdir" == "$HOLDIR" ]]; then
   exit 1
 fi
 
+standard_graph=$tmpdir/standard.graph
+tracing_graph=$tmpdir/tracing.graph
+(cd "$project" && HOLBUILD_TEST_RESOLVED_GRAPH="$standard_graph" \
+  "$HOLBUILD_BIN" build --dry-run ATheory) > "$tmpdir/standard-plan.log"
+(cd "$project" && HOLBUILD_TEST_RESOLVED_GRAPH="$tracing_graph" \
+  trknl_holbuild build --trknl --dry-run ATheory) > "$tmpdir/tracing-plan.log"
+[[ $(grep '^selected-graph-id ' "$standard_graph") == $(grep '^selected-graph-id ' "$tracing_graph") ]]
+[[ $(grep '^selected-plan-id ' "$standard_graph") == $(grep '^selected-plan-id ' "$tracing_graph") ]]
+[[ $(grep '^resolved-plan-id ' "$standard_graph") != $(grep '^resolved-plan-id ' "$tracing_graph") ]]
+
 trace="$project/.holbuild/obj/src/ATheory.tr.gz"
 remapped="$project/.holbuild/obj/src/.hol/objs/ATheory.tr.gz"
 

@@ -78,18 +78,22 @@ make_project schema1_rejected
 cat > "$tmpdir/schema1_rejected/holproject.toml" <<'TOML'
 [holbuild]
 schema = 1
+minimum_version = "0.10.0"
 
 [project]
 name = "schema1_rejected"
 TOML
-expect_context_failure schema1_rejected "only holproject schema 2 is supported"
+expect_context_failure schema1_rejected "only legacy holproject schema 2 is supported"
 
-make_project missing_schema_rejected
-cat > "$tmpdir/missing_schema_rejected/holproject.toml" <<'TOML'
+make_project missing_minimum_version
+cat > "$tmpdir/missing_minimum_version/holproject.toml" <<'TOML'
+[holbuild]
+schema = 2
+
 [project]
-name = "missing_schema_rejected"
+name = "missing_minimum_version"
 TOML
-expect_context_failure missing_schema_rejected "holproject.toml must declare \[holbuild\] schema = 2"
+expect_context_failure missing_minimum_version "holproject.toml must declare holbuild.minimum_version"
 
 schema2_repo=$tmpdir/schema2-repo
 mkdir -p "$schema2_repo"
@@ -103,10 +107,25 @@ TOML
 schema2_rev=$(init_git_repo "$schema2_repo")
 export HOLBUILD_CANONICAL_HOL_GIT="$schema2_repo"
 
+make_project missing_schema_accepted
+cat > "$tmpdir/missing_schema_accepted/holproject.toml" <<TOML
+[holbuild]
+minimum_version = "0.10.0"
+
+[project]
+name = "missing_schema_accepted"
+
+[dependencies.hol]
+git = "$schema2_repo"
+rev = "$schema2_rev"
+TOML
+(cd "$tmpdir/missing_schema_accepted" && "$HOLBUILD_BIN" context) > "$tmpdir/missing_schema_accepted.log"
+
 make_project valid_schema2_git
 cat > "$tmpdir/valid_schema2_git/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "valid_schema2_git"
@@ -122,6 +141,7 @@ make_project valid_schema2_from
 cat > "$tmpdir/valid_schema2_from/holexamples.manifest.toml" <<'TOML'
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "holexamples"
@@ -129,6 +149,7 @@ TOML
 cat > "$tmpdir/valid_schema2_from/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "valid_schema2_from"
@@ -144,8 +165,24 @@ manifest = "holexamples.manifest.toml"
 TOML
 (cd "$tmpdir/valid_schema2_from" && "$HOLBUILD_BIN" context) > "$tmpdir/valid_schema2_from.log"
 require_grep "dependency: holexamples \[from=hol, path=., manifest=holexamples.manifest.toml" "$tmpdir/valid_schema2_from.log"
+require_grep "package-origin: holexamples shim:holexamples from hol" "$tmpdir/valid_schema2_from.log"
+require_grep "package-snapshot: holexamples .*toolchain-v1\|" "$tmpdir/valid_schema2_from.log"
 
-for case in unknown_top typo_build bad_group_field bad_group_entry_type bad_group_empty bad_group_name_at bad_group_name_slash bad_group_name_colon bad_group_name_space bad_group_abs_include bad_group_parent_include bad_root_groups_type bad_root_groups_unknown bad_exclude_type bad_exclude_globs_type bad_exclude_trailing_slash bad_exclude_dot bad_roots_type bad_root_timeout bad_root_timeout_group absolute_member parent_exclude no_paths_includes bad_type bad_project_name bad_action_field bad_action_type bad_action_deps_type bad_action_loads_type bad_action_abs_input bad_action_abs_dep bad_generate_field bad_generate_command_type bad_generate_abs_output; do
+make_project bad_from_override
+write_manifest bad_from_override <<'TOML'
+
+[dependencies.shim]
+from = "hol"
+path = "."
+manifest = "shim.toml"
+TOML
+cat > "$tmpdir/bad_from_override/.holconfig.toml" <<'TOML'
+[overrides.shim]
+path = "../custom"
+TOML
+expect_context_failure bad_from_override "overrides.shim cannot override a from/path/manifest package; override its source dependency hol instead"
+
+for case in unknown_top typo_build bad_group_field bad_group_entry_type bad_group_empty bad_group_name_at bad_group_name_slash bad_group_name_colon bad_group_name_space bad_group_abs_include bad_group_parent_include bad_root_groups_type bad_root_groups_unknown bad_exclude_type bad_exclude_globs_type bad_exclude_trailing_slash bad_exclude_dot bad_roots_type bad_root_timeout bad_root_timeout_group absolute_member parent_exclude no_paths_includes bad_type bad_project_name bad_action_field bad_action_type bad_action_deps_type bad_action_loads_type bad_action_abs_input bad_action_abs_dep bad_action_parent_input bad_action_mixed_parent_dep bad_generate_field bad_generate_command_type bad_generate_abs_output bad_generate_parent_output bad_from_parent_path bad_from_parent_manifest; do
   make_project "$case"
 done
 
@@ -321,9 +358,32 @@ includes = ["src"]
 TOML
 expect_context_failure no_paths_includes "unknown field in holproject.toml: paths"
 
+make_project missing_project
+cat > "$tmpdir/missing_project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+TOML
+expect_context_failure missing_project "holproject.toml must declare \[project\] name"
+
+make_project missing_project_name
+cat > "$tmpdir/missing_project_name/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+version = "1.0.0"
+TOML
+expect_context_failure missing_project_name "holproject.toml must declare \[project\] name"
+
+make_project empty_project_name
+cat > "$tmpdir/empty_project_name/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = ""
+TOML
+expect_context_failure empty_project_name "project.name must not be empty"
+
 cat > "$tmpdir/bad_type/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -337,6 +397,7 @@ expect_context_failure bad_type "name must be a string"
 cat > "$tmpdir/bad_project_name/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -376,6 +437,7 @@ make_project required_version_current
 cat > "$tmpdir/required_version_current/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 required_version = "$holbuild_version"
 
 [dependencies.hol]
@@ -385,7 +447,7 @@ rev = "$schema2_rev"
 [project]
 name = "required_version_current"
 TOML
-(cd "$tmpdir/required_version_current" && "$HOLBUILD_BIN" context) > "$tmpdir/required_version_current.log"
+expect_context_failure required_version_current "holbuild.required_version is not supported; use holbuild.minimum_version"
 
 future_holbuild_version=999.0.0
 make_project minimum_version_future
@@ -407,6 +469,7 @@ make_project required_version_future
 cat > "$tmpdir/required_version_future/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 required_version = "$future_holbuild_version"
 
 [dependencies.hol]
@@ -416,7 +479,7 @@ rev = "$schema2_rev"
 [project]
 name = "required_version_future"
 TOML
-expect_context_failure required_version_future "project requires holbuild >= $future_holbuild_version, but this is holbuild $holbuild_version"
+expect_context_failure required_version_future "holbuild.required_version is not supported; use holbuild.minimum_version"
 
 make_project minimum_version_invalid
 cat > "$tmpdir/minimum_version_invalid/holproject.toml" <<TOML
@@ -437,6 +500,7 @@ make_project required_version_invalid
 cat > "$tmpdir/required_version_invalid/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 required_version = ">=0.2"
 
 [dependencies.hol]
@@ -446,7 +510,7 @@ rev = "$schema2_rev"
 [project]
 name = "required_version_invalid"
 TOML
-expect_context_failure required_version_invalid "invalid holbuild.required_version: expected MAJOR.MINOR.PATCH, got '>=0.2'"
+expect_context_failure required_version_invalid "holbuild.required_version is not supported; use holbuild.minimum_version"
 
 make_project required_version_both_set
 cat > "$tmpdir/required_version_both_set/holproject.toml" <<TOML
@@ -462,7 +526,7 @@ rev = "$schema2_rev"
 [project]
 name = "required_version_both_set"
 TOML
-expect_context_failure required_version_both_set "holbuild.minimum_version and holbuild.required_version may not both be set"
+expect_context_failure required_version_both_set "holbuild.required_version is not supported; use holbuild.minimum_version"
 
 make_project schema2_missing_rev
 write_manifest schema2_missing_rev <<'TOML'
@@ -541,6 +605,20 @@ extra_deps = ["/tmp/generated.dat"]
 TOML
 expect_context_failure bad_action_abs_dep "extra_deps must be package-root-relative"
 
+write_manifest bad_action_parent_input <<'TOML'
+
+[actions.FooTheory]
+extra_inputs = ["../generated.dat"]
+TOML
+expect_context_failure bad_action_parent_input "actions.FooTheory.extra_inputs must be package-root-relative: ../generated.dat"
+
+write_manifest bad_action_mixed_parent_dep <<'TOML'
+
+[actions.FooTheory]
+extra_deps = ['nested\..\..\generated.dat']
+TOML
+expect_context_failure bad_action_mixed_parent_dep "actions.FooTheory.extra_deps must be package-root-relative"
+
 write_manifest bad_generate_field <<'TOML'
 
 [[generate]]
@@ -568,6 +646,33 @@ command = ["python3", "gen.py"]
 outputs = ["/tmp/AScript.sml"]
 TOML
 expect_context_failure bad_generate_abs_output "generate.gen.outputs must be package-root-relative"
+
+write_manifest bad_generate_parent_output <<'TOML'
+
+[[generate]]
+name = "gen"
+command = ["python3", "gen.py"]
+outputs = ["../AScript.sml"]
+TOML
+expect_context_failure bad_generate_parent_output "generate.gen.outputs must be package-root-relative: ../AScript.sml"
+
+write_manifest bad_from_parent_path <<'TOML'
+
+[dependencies.bad_from_parent_path]
+from = "hol"
+path = "../escape"
+manifest = "shim.toml"
+TOML
+expect_context_failure bad_from_parent_path "dependencies.bad_from_parent_path.path must be package-root-relative: ../escape"
+
+write_manifest bad_from_parent_manifest <<'TOML'
+
+[dependencies.bad_from_parent_manifest]
+from = "hol"
+path = "."
+manifest = "../shim.toml"
+TOML
+expect_context_failure bad_from_parent_manifest "dependencies.bad_from_parent_manifest.manifest must be package-root-relative: ../shim.toml"
 
 make_project bad_local_build
 write_manifest bad_local_build <<'TOML'

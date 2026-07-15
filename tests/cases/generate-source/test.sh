@@ -17,6 +17,7 @@ mkdir -p "$project/data" "$project/scripts" "$project/src"
 cat > "$project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -74,6 +75,16 @@ count.write_text(count.read_text() + "x" if count.exists() else "x")
 PY
 printf 'first\n' > "$project/data/spec.txt"
 
+(cd "$project" && "$HOLBUILD_BIN" context) > "$tmpdir/context.log"
+[[ ! -e "$project/gen/spec.txt" && ! -e "$project/gen/GScript.sml" ]] || {
+  echo "metadata-only context unexpectedly prepared generators" >&2
+  exit 1
+}
+[[ ! -e "$project/data/copy.count" && ! -e "$project/data/theory.count" ]] || {
+  echo "package graph resolution unexpectedly ran generators" >&2
+  exit 1
+}
+
 first_log=$tmpdir/first.log
 (cd "$project" && "$HOLBUILD_BIN" build GTheory) > "$first_log"
 require_file "$project/gen/spec.txt"
@@ -112,6 +123,7 @@ mkdir -p "$bad_project/scripts"
 cat > "$bad_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -143,6 +155,7 @@ mkdir -p "$unknown_dep_project"
 cat > "$unknown_dep_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -172,6 +185,7 @@ mkdir -p "$cycle_project"
 cat > "$cycle_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -209,6 +223,7 @@ mkdir -p "$order_project/scripts" "$order_project/data"
 cat > "$order_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"

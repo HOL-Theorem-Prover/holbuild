@@ -12,8 +12,9 @@ exact git revisions.
 
 ## Status
 
-`holbuild` is usable but still experimental. It currently supports schema 2
-manifests only. The manifest format and CLI may still change before any future
+`holbuild` is usable but still experimental. It supports only the current
+manifest language, with an optional legacy `schema = 2` marker. The manifest
+format and CLI may still change before any future
 upstreaming into HOL.
 
 `holbuild` reserves top-level SML identifiers beginning with `Holbuild` for its
@@ -63,7 +64,7 @@ Create `holproject.toml` in the root of your HOL project:
 ```toml
 [holbuild]
 schema = 2
-minimum_version = "<MAJOR.MINOR.PATCH>"  # optional; required_version is accepted as an alias
+minimum_version = "<MAJOR.MINOR.PATCH>"  # required
 
 [project]
 name = "example"
@@ -270,10 +271,10 @@ schema = 2
 minimum_version = "<MAJOR.MINOR.PATCH>"
 ```
 
-`schema = 2` is required. `minimum_version` is optional; `required_version` is
-accepted as an alias for compatibility. Set only one of them. If present, it
-must be a semantic version `MAJOR.MINOR.PATCH` and means "this project requires
-at least this holbuild version".
+`minimum_version` is required and must be a semantic version
+`MAJOR.MINOR.PATCH`; it means "this project requires at least this holbuild
+version". The legacy `schema = 2` marker is optional. Other schema values and
+`required_version` are rejected.
 
 ### `[project]`
 
@@ -282,7 +283,33 @@ at least this holbuild version".
 name = "example"
 ```
 
-The project name is used when the project is consumed as a dependency.
+`project.name` is required and identifies the logical package. A dependency
+manifest's name must match its dependency key.
+
+Holbuild parses committed semantics into separate metadata, source, entrypoint,
+dependency, runtime, action-input, action-dependency, action-execution, and
+generator layers. `holbuild context` reports canonical IDs for the package and
+independently reusable policy layers; TOML formatting and table order do not
+affect these IDs. It also reports typed package provenance: authoritative source
+snapshot, definition and retrieval origins, logical/source roots, and implicit
+HOL toolchain origin. Retrieval and materialization paths are excluded from
+semantic package identities. Package declarations are resolved into one typed
+project graph per kernel variant; context, source discovery, watching, and HOL
+selection reuse its stable package instances rather than reparsing manifests.
+Commands that need sources then run an explicit impure generator-preparation
+phase before read-only source discovery; metadata-only context does not execute
+generators. Source-requiring commands use one layered pipeline:
+
+```text
+package definitions -> resolved package instances -> generator preparation
+-> canonical source inventories -> package components -> resolution context
+-> reachable source analysis -> resolved selected graph -> ordered build plan
+-> action keys and execution
+```
+
+Canonical resolution-context, selected-graph, structural selected-plan, and
+combined resolved-plan identities exclude machine paths. Hashing and dependency extraction remain limited to the selected
+reachable frontier.
 
 ### `[dependencies.*]`
 
@@ -341,7 +368,7 @@ allow_empty = false
 - `exclude` removes concrete package-root-relative paths from discovery; a
   directory entry excludes its subtree, and a file entry excludes just that file.
 - `exclude_globs` removes package-root-relative glob matches from discovery.
-  Deprecated glob patterns in `exclude` are still accepted with a warning.
+  Glob patterns in `exclude` are rejected; place them in `exclude_globs`.
 - `roots` are the default entry points when `holbuild build` is run with no
   target. Entries may be package-root-relative source paths or `@name` build
   group references. Source-path roots must name sources discovered through
@@ -389,7 +416,8 @@ always_reexecute = true
 
 - `deps` adds logical project dependencies.
 - `loads` adds modules/libraries to load before the action.
-- `extra_deps` adds filesystem inputs that should be hashed into the action key.
+- `extra_deps` adds package-root-relative filesystem inputs that should be
+  hashed into the action key; absolute paths and `..` components are rejected.
 - `cache = false` disables global cache restore/publish for the action.
 - `always_reexecute = true` disables local up-to-date skipping for the action.
 
@@ -600,7 +628,8 @@ git = "$BAR_REPO"
 
 `build.jobs` sets local default parallelism, and `build.checkpoint_limit_gb`
 sets the local checkpoint storage budget in GiB; the built-in checkpoint budget
-default is 5.
+default is 5. Local `exclude` and `exclude_globs` apply only to the root package.
+Dependency discovery is controlled by each dependency's committed manifest.
 
 `[overrides.NAME]` maps a declared dependency to local workstation source. Use
 `path` to read an existing checkout directly, or `git` to replace the dependency
@@ -610,6 +639,8 @@ root; URL-like git remotes are left unchanged. Overrides apply during recursive
 dependency resolution too, so a dependency declared by another dependency can be
 supplied from disk. Overridden dependencies still need a matching `project.name`
 in their `holproject.toml`; `dependencies.hol` cannot be overridden this way.
+A `from/path/manifest` shim cannot be overridden directly; override the direct
+source dependency named by `from` instead.
 
 Unknown fields in recognised `holproject.toml` and `.holconfig.toml` tables are
 errors.

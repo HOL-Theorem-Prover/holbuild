@@ -129,6 +129,7 @@ git_identity "$b"
 cat > "$b/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "b"
@@ -154,6 +155,7 @@ git_identity "$a"
 cat > "$a/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "a"
@@ -173,6 +175,7 @@ mkdir -p "$root/src"
 cat > "$root/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "root"
@@ -293,6 +296,7 @@ mkdir -p "$legacy_root"
 cat > "$legacy_root/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "legacy-root"

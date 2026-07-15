@@ -23,13 +23,14 @@ and cacheable builds that never require users to reason about the cache.
 ## Packages and manifests
 
 Every package in the resolved graph has a manifest. A source file can enter the
-build graph only through a declared package root. Manifests are schema-checked:
-unknown fields in recognized tables are rejected, and the schema marker is
-required. The only supported schema is currently schema 2:
+build graph only through a declared package root. Manifests are checked against
+the current language: unknown fields in recognized tables are rejected and
+`minimum_version` is required. The legacy schema-2 marker is optional:
 
 ```toml
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 ```
 
 Package roots are declared by one of:
@@ -40,8 +41,8 @@ Package roots are declared by one of:
 - the built-in/root HOL manifest
 
 Committed manifests describe what dependency is required. They should not rely on
-ambient search paths such as `HOLPATH`, `HOLDIR`, or user include paths. Schema 2
-uses exact git commits plus explicit shim manifests for subtrees that do not have
+ambient search paths such as `HOLPATH`, `HOLDIR`, or user include paths. The
+current manifest language uses exact git commits plus explicit shim manifests for subtrees that do not have
 their own `holproject.toml`:
 
 ```toml
@@ -61,14 +62,15 @@ build settings such as jobs, excludes, and tactic timeout.
 
 ## Dependency-managed mode
 
-Schema 2 is the dependency-managed manifest format. It has intentionally no
+The current manifest language provides dependency management. It has intentionally no
 solver: dependencies are exact git commits, and duplicate package names must
-resolve to the same source or resolution fails. A resolved schema 2 graph must
+resolve to the same source or resolution fails. A resolved package graph must
 contain exactly one package named `hol`.
 
 ```toml
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -88,10 +90,11 @@ Supported dependency forms are deliberately narrow:
   `manifest` is a shim manifest relative to the declaring package's manifest
   root. Both paths are relative and cannot contain `..`.
 
-Schema 2 rejects path dependencies, local overrides, git manifests, branches,
-tags, ranges, registry names, and multiple versions. `[holbuild].minimum_version`
-(or its alias `[holbuild].required_version`) is an optional `MAJOR.MINOR.PATCH`
-minimum holbuild version check.
+The current manifest language rejects path dependencies, local overrides, Git
+manifests, branches, tags, ranges, registry names, and multiple versions.
+`[holbuild].minimum_version` is a required `MAJOR.MINOR.PATCH` minimum holbuild
+version check. The legacy `schema = 2` marker is optional, and
+`required_version` is rejected.
 
 For a root project, all dependency source checkouts are materialized once under:
 
@@ -111,7 +114,7 @@ not the parent package artifact directory, so resolving `a -> b` creates
 For `from` dependencies, the source root is under `.holbuild/src/<from>/<path>`,
 but the shim manifest is read from the package that declares the dependency.
 
-The reserved schema 2 `hol` package is the project HOL toolchain. It is
+The reserved `hol` package is the project HOL toolchain. It is
 materialized and built at a canonical shared cache path
 `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`; upstream HOL does not need a
 `holproject.toml`, because holbuild uses its built-in HOL manifest for package
@@ -133,7 +136,7 @@ revision, Poly/ML command/version, build arguments, and cache format version.
 ## Main binary and project-HOL helper direction
 
 The intended split is that `bin/holbuild` becomes a portable build coordinator,
-not a HOL program. It should own manifest parsing, schema 2 resolution, cache
+not a HOL program. It should own manifest parsing, package resolution, cache
 management, scheduling, artifact movement, and process orchestration. HOL-specific
 source understanding should be supplied by the project HOL declared in
 `[dependencies.hol]`.
@@ -149,7 +152,8 @@ or line records rather than shared SML datatypes.
 
 This split lets the main binary shed compile-time dependencies on `TacticParse`,
 `HOLSourceParser`, `HOLSourceAST`, `HOLSource.fileToReader`, `Holdep`, and HOL
-load-plan metadata. It also aligns project analysis with schema 2: the HOL used
+load-plan metadata. It also aligns project analysis with dependency-managed
+manifests: the HOL used
 to understand project sources is the HOL declared by the project, not the HOL
 checkout used to compile the holbuild executable.
 
@@ -417,7 +421,36 @@ module and `load` it instead. Generated HOL source is modeled by manifest
 outputs are visible source-tree files (commonly under `gen/`), may be overwritten,
 and are scanned/hashed as ordinary sources after generation. Generator keys decide
 whether to rerun the generator; theory/action keys still use the actual generated
-source bytes. `.sml` files get a `.uo` plus an empty companion `.ui` unless a real
+source bytes. Discovery first builds a canonical inventory for each prepared
+package, then combines resolved source views. Canonical source-node identities
+contain package-definition identity, relative paths, source kind, logical name,
+canonical artifact coordinates, and semantic action policy identity; machine
+paths and artifact roots exist only in the resolved views. A live component
+provider turns each inventory into a canonical package component, retaining
+symbolic declared dependency/load, signature-companion, and extra-input facts.
+Validation strategy (mutable working tree versus trusted immutable snapshot) and
+live generator preparation are explicit component properties rather than part
+of canonical component identity. Project resolution context has a separate
+identity over package instances, components, declaration edges, and HOL
+selection. Dependency extraction remains a per-node provider request, preserving
+reachable-frontier laziness. Planner nodes are immutable resolved source views;
+source digests and extracted symbolic facts live in an explicit plan-scoped
+provider analysis state keyed by canonical node ID, rather than mutable refs
+embedded in every node. For the selected reachable closure, planning then
+materializes one immutable dependency graph containing typed symbolic facts,
+reasoned project edges, typed external references, unresolved references, and
+reverse dependents. Topological sorting, action keys, diagnostics, and
+invalidation-facing queries consume that shared resolution rather than
+re-resolving names independently. Versioned length-delimited canonical
+renderings separately identify the project resolution context, unordered
+selected dependency graph, and root-sensitive ordered plan. They exclude
+machine paths, retrieval locations, and analysis-map state while retaining
+package/component bindings, typed HOL selection, canonical nodes, reasoned
+edges, roots, and final order. Execution-only action policy remains in the
+component/resolution layer but does not perturb structural selected graph or
+plan identity. A final resolved-plan identity combines the structural plan with
+the resolution-context identity, including typed HOL/kernel selection. `.sml` files get a
+`.uo` plus an empty companion `.ui` unless a real
 `.sig` companion exists, and same-name signatures are implicit dependencies of
 their implementation. HOL's current
 `HOLFileSys` remaps `.uo`/`.ui` and files ending in
