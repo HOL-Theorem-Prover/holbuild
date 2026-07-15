@@ -271,15 +271,11 @@ fun list_dir path =
 
 fun list_dir_if_readable path = list_dir path handle Error _ => []
 
-fun has_source_path path sources =
-  let val path = normalize_path path
-  in List.exists (fn source : source => normalize_path (#source_path source) = path) sources end
-
 fun scan_file package package_id source_root artifact_root policies generated_paths excludes exclude_globs path acc =
   if excluded excludes exclude_globs (relative_path source_root path) then acc
   else case classify package package_id source_root artifact_root policies generated_paths path of
       NONE => acc
-    | SOME source => if has_source_path path acc then acc else source :: acc
+    | SOME source => source :: acc
 
 fun scan_dir package package_id source_root artifact_root policies generated_paths excludes exclude_globs path acc =
   let
@@ -311,31 +307,53 @@ fun compatible_same_name (a : source) (b : source) =
      | (Sig, Sml) => true
      | _ => false)
 
-fun by_logical sources =
+fun by_logical (sources : source list) =
   let
-    fun conflicts source other =
-      #logical_name source = #logical_name other andalso
-      not (compatible_same_name source other)
+    fun conflicts source other = not (compatible_same_name source other)
     fun insert (source, seen) =
-      case List.find (conflicts source) seen of
-          NONE => source :: seen
-        | SOME other =>
-            raise Error ("duplicate logical name " ^ #logical_name source ^ ": " ^
-                         #package other ^ ":" ^ #relative_path other ^ " and " ^
-                         #package source ^ ":" ^ #relative_path source)
+      case Binarymap.peek(seen, #logical_name source) of
+          NONE => Binarymap.insert(seen, #logical_name source, [source])
+        | SOME same_name =>
+            (case List.find (conflicts source) same_name of
+                 NONE => Binarymap.insert(seen, #logical_name source,
+                                          source :: same_name)
+               | SOME other =>
+                   raise Error ("duplicate logical name " ^ #logical_name source ^ ": " ^
+                                #package other ^ ":" ^ #relative_path other ^ " and " ^
+                                #package source ^ ":" ^ #relative_path source))
   in
-    ignore (List.foldl insert [] sources);
+    ignore (List.foldl insert (Binarymap.mkDict String.compare) sources);
     sources
   end
 
-fun insert_sorted source sources =
-  case sources of
-      [] => [source]
-    | x :: xs =>
-        if compare_source(source, x) = LESS then source :: sources
-        else x :: insert_sorted source xs
+fun split_sources xs =
+  let
+    fun loop left right rest =
+      case rest of
+          [] => (left, right)
+        | [x] => (x :: left, right)
+        | x :: y :: more => loop (x :: left) (y :: right) more
+  in
+    loop [] [] xs
+  end
 
-fun sort_sources sources = List.foldl (fn (source, acc) => insert_sorted source acc) [] sources
+fun merge_sources left right =
+  case (left, right) of
+      ([], _) => right
+    | (_, []) => left
+    | (l :: ls, r :: rs) =>
+        if compare_source(l, r) <> GREATER then
+          l :: merge_sources ls right
+        else
+          r :: merge_sources left rs
+
+fun sort_sources sources =
+  case sources of
+      [] => []
+    | [_] => sources
+    | _ =>
+        let val (left, right) = split_sources sources
+        in merge_sources (sort_sources left) (sort_sources right) end
 
 fun validate_action_policies package_name policies sources =
   let
@@ -371,6 +389,19 @@ fun source_graph_package_id package =
          HolbuildPackageDefinition.action_input_policy_id definition])
   end
 
+fun deduplicate_sources sources =
+  let
+    fun add (source : source, (seen, kept)) =
+      let val identity = #package source ^ "\000" ^ normalize_path (#source_path source)
+      in
+        if Redblackset.member(seen, identity) then (seen, kept)
+        else (Redblackset.add(seen, identity), source :: kept)
+      end
+    val (_, kept) = List.foldr add (Redblackset.empty String.compare, []) sources
+  in
+    kept
+  end
+
 fun discover_package package acc =
   let
     val name = HolbuildProject.package_name package
@@ -388,10 +419,11 @@ fun discover_package package acc =
       map (fn member => HolbuildProject.abs_under source_root member)
         (HolbuildProject.package_members package)
     val sources =
-      List.foldl
-        (scan_member name package_id source_root artifact_root policies generated_paths excludes exclude_globs)
-        acc
-        members
+      deduplicate_sources
+        (List.foldl
+          (scan_member name package_id source_root artifact_root policies generated_paths excludes exclude_globs)
+          acc
+          members)
     val _ = validate_action_policies name policies sources
   in
     sources

@@ -164,6 +164,8 @@ type t =
    selected_plan_id : string,
    resolved_plan_id : string,
    universe_key_index : key_index,
+   universe_node_index : node Vector.vector,
+   dependency_closure_cache : node list option array,
    dependency_context_key_cache : (string * string) option array}
 
 fun universe_nodes ({universe, ...} : t) = universe
@@ -320,13 +322,12 @@ fun unresolved_dependencies plan node =
 fun reverse_dependency_edges plan node =
   graph_values (#reverse (dependency_graph plan)) node
 
-fun direct_project_deps plan node =
+fun direct_project_deps
+      (plan as {universe_key_index, universe_node_index, ...} : t) node =
   let
-    val nodes = universe_nodes plan
     fun target (edge : resolved_dependency_edge) =
-      case node_with_key nodes (#to_node edge) of
-          SOME dependency => dependency
-        | NONE => raise Error ("internal resolved dependency target is missing: " ^ #to_node edge)
+      Vector.sub(universe_node_index,
+                 indexed_key_id universe_key_index (#to_node edge))
   in
     unique_nodes (map target (resolved_dependency_edges plan node))
   end
@@ -428,9 +429,22 @@ fun topo_sort_resolved nodes roots (graph : resolved_dependency_graph) =
   end
 
 
-fun transitive_project_deps plan node =
-  topo_sort_resolved (selected_nodes plan) (direct_project_deps plan node)
-    (dependency_graph plan)
+fun transitive_project_deps
+      (plan as {dependency_closure_cache, universe_key_index, ...} : t) node =
+  let val id = indexed_key_id universe_key_index (key node)
+  in
+    case Array.sub(dependency_closure_cache, id) of
+        SOME dependencies => dependencies
+      | NONE =>
+          let
+            val dependencies =
+              topo_sort_resolved (selected_nodes plan)
+                (direct_project_deps plan node) (dependency_graph plan)
+          in
+            Array.update(dependency_closure_cache, id, SOME dependencies);
+            dependencies
+          end
+  end
 
 fun plan_node_id ({universe_key_index, ...} : t) node =
   indexed_key_id universe_key_index (key node)
@@ -774,6 +788,9 @@ fun plan_selection components holdir sources selection =
     val _ = reject_graph_unresolved dependency_graph selected
     val _ = reject_source_uses analysis selected
     val universe_key_index = build_key_index nodes
+    val universe_node_index = Vector.fromList nodes
+    val dependency_closure_cache =
+      Array.array(length nodes, NONE : node list option)
     val dependency_context_key_cache =
       Array.array(length nodes, NONE : (string * string) option)
   in
@@ -784,6 +801,8 @@ fun plan_selection components holdir sources selection =
      selected_plan_id = selected_plan_id,
      resolved_plan_id = resolved_plan_id,
      universe_key_index = universe_key_index,
+     universe_node_index = universe_node_index,
+     dependency_closure_cache = dependency_closure_cache,
      dependency_context_key_cache = dependency_context_key_cache}
   end
 
