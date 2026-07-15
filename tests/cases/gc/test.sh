@@ -122,6 +122,7 @@ mkdir -p "$(dirname "$drift_prefix")" "$(dirname "$drift_indexed_save")"
 cat > "$drift_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -173,6 +174,7 @@ mkdir -p "$delete_failure_family.deps/old" "$delete_failure_bin"
 cat > "$delete_failure_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -330,6 +332,7 @@ mkdir -p "$deep_watch_project/deep/nested" "$(dirname "$deep_watch_family")"
 cat > "$deep_watch_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -491,6 +494,7 @@ mkdir -p "$dependency_project/src" "$dependency_family.deps/seed"
 cat > "$dependency_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -563,6 +567,7 @@ mkdir -p "$gate_project/src" "$gate_family.deps/seed"
 cat > "$gate_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"

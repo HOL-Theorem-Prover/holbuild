@@ -389,6 +389,56 @@ fun source_graph_package_id package =
          HolbuildPackageDefinition.action_input_policy_id definition])
   end
 
+fun member_contains member path =
+  let
+    val member = normalize_path member
+    val path = normalize_path path
+    val prefix = if has_suffix "/" member then member else member ^ "/"
+  in
+    path = member orelse String.isPrefix prefix path
+  end
+
+fun prevalidate_package package =
+  let
+    val name = HolbuildProject.package_name package
+    val package_id = source_graph_package_id package
+    val source_root = HolbuildProject.package_root package
+    val artifact_root = HolbuildProject.package_artifact_root package
+    val policies = HolbuildProject.package_action_policies package
+    val generators = HolbuildProject.package_generators package
+    val generated_paths = List.concat (map HolbuildProject.generator_outputs generators)
+    val excludes = HolbuildProject.package_excludes package
+    val exclude_globs = HolbuildProject.package_exclude_globs package
+    val members =
+      map (fn member => HolbuildProject.abs_under source_root member)
+        (HolbuildProject.package_members package)
+    fun scan_existing (member, sources) =
+      if is_dir member orelse is_readable member then
+        scan_member name package_id source_root artifact_root policies generated_paths
+          excludes exclude_globs (member, sources)
+      else sources
+    fun declared_output (output, sources) =
+      let
+        val path = HolbuildProject.abs_under source_root output
+        val rel = relative_path source_root path
+      in
+        if not (List.exists (fn member => member_contains member path) members) orelse
+           excluded excludes exclude_globs rel then sources
+        else
+          case classify name package_id source_root artifact_root policies
+                          generated_paths path of
+              NONE => sources
+            | SOME source => source :: sources
+      end
+    val existing = List.foldl scan_existing [] members
+    val candidates = List.foldl declared_output existing generated_paths
+  in
+    validate_action_policies name policies candidates
+  end
+
+fun prevalidate_graph graph =
+  List.app prevalidate_package (HolbuildProjectGraph.packages graph)
+
 fun deduplicate_sources sources =
   let
     fun add (source : source, (seen, kept)) =

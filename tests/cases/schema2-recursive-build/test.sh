@@ -296,6 +296,7 @@ mkdir -p "$legacy_root"
 cat > "$legacy_root/holproject.toml" <<TOML
 [holbuild]
 schema = 2
+minimum_version = "0.10.0"
 
 [project]
 name = "legacy-root"

@@ -714,6 +714,8 @@ fun prepare_source_index phase_prefix resolution project =
     val graph = timed_phase (phase_prefix ^ ".graph.resolve")
                   (fn () => HolbuildProjectGraph.resolve
                     {project = project, resolution = resolution})
+    val _ = timed_phase (phase_prefix ^ ".policies.prevalidate")
+              (fn () => HolbuildSourceIndex.prevalidate_graph graph)
     val preparation = timed_phase (phase_prefix ^ ".generators.prepare")
                         (fn () => HolbuildPackagePrepare.prepare graph)
     val discovery = timed_phase (phase_prefix ^ ".inventory.construct")
