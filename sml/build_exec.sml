@@ -821,6 +821,37 @@ fun insert_index_family ({dir, families, ...} : checkpoint_index)
 fun checkpoint_family_root_exists base =
   List.exists path_exists (checkpoint_family_artifact_roots base)
 
+(* Discover checkpoint family topology without measuring artifact sizes.  Marker
+   directories can contain thousands of heap segments, so stop as soon as one
+   checkpoint artifact proves that the family is non-empty.  Ordinary save
+   files and sidecars outside marker directories must also be included: older
+   holbuild versions can leave either layout behind. *)
+fun checkpoint_tree_has_artifact path =
+  if not (path_exists path) then false
+  else if FS.isDir path handle OS.SysErr _ => false then
+    List.exists checkpoint_tree_has_artifact (children path)
+  else checkpoint_clean_artifact path
+
+fun checkpoint_family_bases_on_disk root =
+  let
+    fun add_base base bases = Binaryset.add (bases, base)
+    fun walk path bases =
+      if not (path_exists path) then bases
+      else
+        case checkpoint_marker_base path of
+            SOME base =>
+              if checkpoint_tree_has_artifact path then add_base base bases else bases
+          | NONE =>
+              if FS.isDir path handle OS.SysErr _ => false then
+                List.foldl (fn (child, acc) => walk child acc) bases (children path)
+              else
+                (case checkpoint_save_artifact_base path of
+                     SOME base => add_base base bases
+                   | NONE => bases)
+  in
+    Binaryset.listItems (walk root (Binaryset.empty String.compare))
+  end
+
 fun merge_checkpoint_family_measurements index measurements =
   List.foldl
     (fn ((base, family_opt), acc) =>
@@ -926,9 +957,23 @@ fun checkpoint_index_roots_exist ({families, ...} : checkpoint_index) =
   List.all (fn ({base, ...} : checkpoint_family) => checkpoint_family_root_exists base)
            families
 
+fun checkpoint_index_covers_disk
+      ({dir, families, ...} : checkpoint_index) =
+  let
+    val indexed =
+      List.foldl
+        (fn ({base, ...} : checkpoint_family, bases) => Binaryset.add (bases, base))
+        (Binaryset.empty String.compare)
+        families
+  in
+    List.all (fn base => Binaryset.member (indexed, base))
+             (checkpoint_family_bases_on_disk dir)
+  end
+
 fun load_or_rebuild_checkpoint_index dir =
   case read_checkpoint_index dir of
-      SOME index => if checkpoint_index_roots_exist index then index
+      SOME index => if checkpoint_index_roots_exist index andalso
+                       checkpoint_index_covers_disk index then index
                     else rebuild_checkpoint_index dir
     | NONE => rebuild_checkpoint_index dir
 
@@ -3681,23 +3726,9 @@ fun changed_watch_dirs (watch : checkpoint_watch) =
     []
     watch
 
-(* Enumerate candidate family bases reachable under root without summing file
-   sizes.  Stop at the first checkpoint marker subtree so this remains a shallow
-   directory walk rather than a recursive byte scan. *)
-fun shallow_family_bases root =
-  let
-    fun walk path acc =
-      if not (path_exists path) then acc
-      else
-        case checkpoint_marker_base path of
-            SOME base => base :: acc
-          | NONE =>
-              if FS.isDir path handle OS.SysErr _ => false then
-                List.foldl (fn (child, bases) => walk child bases) acc (children path)
-              else acc
-  in
-    unique_strings (walk root [])
-  end
+(* Mid-build discovery and startup index validation use the same artifact-aware,
+   size-free topology walk. *)
+fun shallow_family_bases root = checkpoint_family_bases_on_disk root
 
 fun checkpoint_budget_warnings checkpoint_limit_gb
       (eviction as {before_bytes, after_bytes, max_bytes, evicted} : checkpoint_eviction) =

@@ -711,9 +711,11 @@ the heap files themselves. A versioned local index avoids repeated recursive byt
 scans; every build marks it dirty before children can run, maintains it in memory,
 and writes it once during finalization. A crash or failed final scan/write leaves
 the marker in place and forces a ground-truth scan next time. Indexed families are
-also checked for existing artifact roots so indexes left by older buggy versions
-repair themselves instead of hiding current bytes. Eviction only credits a family
-after its artifact roots have actually disappeared.
+also checked for existing artifact roots. A size-free topology walk verifies that
+every family present on disk occurs in the index, so families written by an older
+unmanaged process cannot hide bytes behind an otherwise valid index. Only a
+topology mismatch triggers the recursive size scan and repair. Eviction only
+credits a family after its artifact roots have actually disappeared.
 `--skip-checkpoints` disables all `.save`/`.ok` creation while still running
 modern theorem proofs through the selected instrumentation runtime. `--skip-proof-steps`
 opts out of theorem instrumentation: with checkpoints still enabled, the build can

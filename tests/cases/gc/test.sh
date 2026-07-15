@@ -107,15 +107,16 @@ if [[ -e "$index_budget_family.deps/old" ]]; then
   exit 1
 fi
 
-# Recover from a syntactically valid index whose rows no longer describe disk.
-# This is the state left by older builds that cleared their dirty marker after a
-# failed final index write.  The large sidecar also verifies that every artifact
-# removed by remove_checkpoint is included in budget accounting.
+# Recover from a syntactically valid index that still names real families but
+# omits families written by an older, unmanaged holbuild.  The large sidecar
+# also verifies that every artifact removed by remove_checkpoint is included in
+# budget accounting.
 drift_project=$tmpdir/index-drift-project
 drift_actual_family="$drift_project/.holbuild/checkpoints/index-drift/src/ActualScript.sml"
-drift_phantom_family="$drift_project/.holbuild/checkpoints/index-drift/src/PhantomScript.sml"
+drift_indexed_family="$drift_project/.holbuild/checkpoints/index-drift/src/IndexedScript.sml"
 drift_prefix="$drift_actual_family.theorems/key/proof/prefix/actual_failed_prefix.save.prefix"
-mkdir -p "$drift_project/.holbuild/checkpoints/index-drift/src" "$(dirname "$drift_prefix")"
+drift_indexed_save="$drift_indexed_family.deps/key/deps_loaded.save"
+mkdir -p "$(dirname "$drift_prefix")" "$(dirname "$drift_indexed_save")"
 cat > "$drift_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
@@ -135,20 +136,28 @@ cat > "$drift_project/.holconfig.toml" <<'TOML'
 checkpoint_limit_gb = 1
 TOML
 truncate -s 2G "$drift_prefix"
+touch -t 200001010000 "$drift_prefix"
+printf 'indexed\n' > "$drift_indexed_save"
+printf 'ok\n' > "$drift_indexed_save.ok"
 cat > "$drift_project/.holbuild/checkpoints/.index-v2" <<EOF_INDEX
 holbuild-checkpoint-index-v2
 root=$drift_project/.holbuild/checkpoints
 created_by=holbuild
-family	$drift_phantom_family	1	1
+family	$drift_indexed_family	1	11
 EOF_INDEX
 (cd "$drift_project" && "$HOLBUILD_BIN" build) > "$tmpdir/index-drift.log" 2>&1
 require_grep "checkpoint budget: .*evicted=1" "$tmpdir/index-drift.log"
 if [[ -e "$drift_prefix" ]]; then
-  echo "checkpoint budget trusted a stale index or ignored a large prefix sidecar" >&2
+  echo "checkpoint budget trusted an incomplete index or ignored a large prefix sidecar" >&2
   exit 1
 fi
-if grep -q "PhantomScript.sml" "$drift_project/.holbuild/checkpoints/.index-v2"; then
-  echo "recovered checkpoint index retained a nonexistent family" >&2
+require_file "$drift_indexed_save"
+if ! grep -q "IndexedScript.sml" "$drift_project/.holbuild/checkpoints/.index-v2"; then
+  echo "recovered checkpoint index lost its valid indexed family" >&2
+  exit 1
+fi
+if grep -q "ActualScript.sml" "$drift_project/.holbuild/checkpoints/.index-v2"; then
+  echo "recovered checkpoint index retained its evicted unindexed family" >&2
   exit 1
 fi
 
