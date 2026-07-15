@@ -162,12 +162,18 @@ type t =
    resolution_context_id : string,
    selected_graph_id : string,
    selected_plan_id : string,
-   resolved_plan_id : string}
+   resolved_plan_id : string,
+   universe_key_index : key_index,
+   dependency_context_key_cache : (string * string) option array}
 
 fun universe_nodes ({universe, ...} : t) = universe
 fun root_nodes ({roots, ...} : t) = roots
 fun selected_nodes ({selected, ...} : t) = selected
 fun lookup ({name_index, ...} : t) = indexed_nodes_named name_index
+fun node_named plan name =
+  case lookup plan name of
+      node :: _ => SOME node
+    | [] => NONE
 fun analysis_state ({analysis, ...} : t) = analysis
 fun dependencies plan node = deps_of (analysis_state plan) node
 fun source_hash plan node = source_hash_of (analysis_state plan) node
@@ -425,6 +431,21 @@ fun topo_sort_resolved nodes roots (graph : resolved_dependency_graph) =
 fun transitive_project_deps plan node =
   topo_sort_resolved (selected_nodes plan) (direct_project_deps plan node)
     (dependency_graph plan)
+
+fun plan_node_id ({universe_key_index, ...} : t) node =
+  indexed_key_id universe_key_index (key node)
+
+fun cached_dependency_context_key
+      (plan as {dependency_context_key_cache, ...} : t) node context_id =
+  case Array.sub(dependency_context_key_cache, plan_node_id plan node) of
+      SOME (cached_context_id, value) =>
+        if cached_context_id = context_id then SOME value else NONE
+    | NONE => NONE
+
+fun remember_dependency_context_key
+      (plan as {dependency_context_key_cache, ...} : t) node context_id value =
+  Array.update(dependency_context_key_cache, plan_node_id plan node,
+               SOME (context_id, value))
 
 fun closure_external_theories plan node =
   unique_strings
@@ -752,13 +773,18 @@ fun plan_selection components holdir sources selection =
     val _ = write_test_dependency_graph selected_graph_id selected_plan_id resolved_plan_id dependency_graph
     val _ = reject_graph_unresolved dependency_graph selected
     val _ = reject_source_uses analysis selected
+    val universe_key_index = build_key_index nodes
+    val dependency_context_key_cache =
+      Array.array(length nodes, NONE : (string * string) option)
   in
     {universe = nodes, roots = roots, selected = selected, name_index = index, analysis = analysis,
      dependency_graph = dependency_graph,
      resolution_context_id = resolution_context_id,
      selected_graph_id = selected_graph_id,
      selected_plan_id = selected_plan_id,
-     resolved_plan_id = resolved_plan_id}
+     resolved_plan_id = resolved_plan_id,
+     universe_key_index = universe_key_index,
+     dependency_context_key_cache = dependency_context_key_cache}
   end
 
 fun plan_all components holdir sources =

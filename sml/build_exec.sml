@@ -234,7 +234,7 @@ fun direct_external_loads plan node =
 fun project_preload_deps plan node =
   let
     val source = HolbuildBuildPlan.source_of node
-    val deps = source_deps node
+    val deps = source_deps plan node
     val load_names =
       unique_strings
         (#loads deps @ #holdep_mentions deps @
