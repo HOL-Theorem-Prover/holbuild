@@ -48,6 +48,7 @@ val failed_step_span_ref = ref NONE : (int * int) option ref
 val failed_plan_position_ref = ref NONE : (int * string * string) option ref
 val failed_goal_state_printed_ref = ref false
 val suppress_expected_failure_diagnostics_ref = ref false
+val suppressed_failure_diagnostic_ref = ref (NONE : (unit -> unit) option)
 val compiled_tactic_ref = ref Tactical.ALL_TAC
 val compiled_list_tactic_ref = ref Tactical.ALL_LT
 val proof_history_ref = ref (NONE : goalStack.gstk History.history option)
@@ -685,14 +686,19 @@ fun print_finish_goal_state name =
     result
   end
 
+fun emit_step_failure_diagnostic label goals =
+  (save_failed_prefix_checkpoint ();
+   print_goal_state label goals
+   handle print_e =>
+     TextIO.output(TextIO.stdErr,
+       String.concat ["holbuild failed to print goal state: ", General.exnMessage print_e, "\n"]))
+
 fun report_step_failure_with_goals label goals e =
-  if !suppress_expected_failure_diagnostics_ref then raise e
+  if !suppress_expected_failure_diagnostics_ref then
+    (suppressed_failure_diagnostic_ref := SOME (fn () => emit_step_failure_diagnostic label goals);
+     raise e)
   else
-    (save_failed_prefix_checkpoint ();
-     print_goal_state label goals
-     handle print_e =>
-       TextIO.output(TextIO.stdErr,
-         String.concat ["holbuild failed to print goal state: ", General.exnMessage print_e, "\n"]);
+    (emit_step_failure_diagnostic label goals;
      raise e)
 
 fun report_finish_failure name e =
@@ -1033,9 +1039,20 @@ fun restore_runtime_state {history, current_path, successful_path, current_frame
 fun with_expected_failures_suppressed f =
   let val old = !suppress_expected_failure_diagnostics_ref
       val _ = suppress_expected_failure_diagnostics_ref := true
+      val _ = suppressed_failure_diagnostic_ref := NONE
       val result = (f (); NONE) handle e => SOME e
       val _ = suppress_expected_failure_diagnostics_ref := old
+      val _ = case result of NONE => suppressed_failure_diagnostic_ref := NONE | SOME _ => ()
   in case result of NONE => () | SOME e => raise e end
+
+fun discard_suppressed_failure_diagnostic () = suppressed_failure_diagnostic_ref := NONE
+
+fun raise_choice_failure (e, diagnostic) =
+  (suppressed_failure_diagnostic_ref := diagnostic;
+   if !suppress_expected_failure_diagnostics_ref then ()
+   else
+     (case diagnostic of SOME emit => emit () | NONE => ());
+   raise e)
 
 fun with_plan_position display_index kind label span f =
   let
@@ -1280,16 +1297,22 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
         fun nth_body 1 (body :: _) = SOME body
           | nth_body n (_ :: rest) = nth_body (n - 1) rest
           | nth_body _ [] = NONE
-        fun attempt _ _ [] last = (case last of SOME e => raise e | NONE => raise Fail ("choice has no alternatives: " ^ label))
+        fun attempt _ _ [] last =
+              (case last of
+                   SOME failure => raise_choice_failure failure
+                 | NONE => raise Fail ("choice has no alternatives: " ^ label))
           | attempt n alt_line (body :: rest) _ =
               let val saved = runtime_state_snapshot()
                   val result = (with_expected_failures_suppressed (fn () => run_list (alt_line + 1) (path @ [HolbuildProofIr.PathAlternative n]) 0 body); NONE) handle e => SOME e
+                  val diagnostic = !suppressed_failure_diagnostic_ref
               in
                 case result of
-                    NONE => record_or_replay_event (HolbuildProofIr.ChoiceEvent (path, n))
+                    NONE =>
+                      (discard_suppressed_failure_diagnostic ();
+                       record_or_replay_event (HolbuildProofIr.ChoiceEvent (path, n)))
                   | SOME e =>
                       (restore_runtime_state saved;
-                       attempt (n + 1) (alt_line + 1 + HolbuildProofIr.display_line_count_list body) rest (SOME e))
+                       attempt (n + 1) (alt_line + 1 + HolbuildProofIr.display_line_count_list body) rest (SOME (e, diagnostic)))
               end
       in
         if not (!resume_reached_ref) then
@@ -1326,6 +1349,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
                  NONE => record_or_replay_event (HolbuildProofIr.TryEvent (path, true))
                | SOME _ =>
                    (restore_runtime_state saved;
+                    discard_suppressed_failure_diagnostic ();
                     record_or_replay_event (HolbuildProofIr.TryEvent (path, false)))
           end;
         d + HolbuildProofIr.display_line_count proof_step
@@ -1345,6 +1369,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
                in case result of
                       SOME _ =>
                         (restore_runtime_state saved;
+                         discard_suppressed_failure_diagnostic ();
                          record_or_replay_event (HolbuildProofIr.RepeatStopEvent (path, iter)))
                     | NONE =>
                         (record_or_replay_event (HolbuildProofIr.RepeatIterEvent (path, iter));
@@ -1400,6 +1425,7 @@ fun run_steps steps =
    dynamic_events_ref := [];
    resume_events_ref := [];
    suppress_expected_failure_diagnostics_ref := false;
+   suppressed_failure_diagnostic_ref := NONE;
    branch_tail_count_ref := [];
    reverse_group_lengths_ref := NONE;
    run_structural_steps 0 steps)
@@ -1751,6 +1777,7 @@ fun install ({checkpoint_enabled, tactic_timeout, timeout_marker, plan_theorem, 
    failed_step_span_ref := NONE;
    failed_plan_position_ref := NONE;
    failed_goal_state_printed_ref := false;
+   suppressed_failure_diagnostic_ref := NONE;
    failed_prefix_resume_active_ref := false;
    proving_with_proof_ir_ref := false;
    Tactical.set_prover proof_ir_prover)
