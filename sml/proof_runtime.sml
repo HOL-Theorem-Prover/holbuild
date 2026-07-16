@@ -1883,7 +1883,6 @@ fun install ({checkpoint_enabled, tactic_timeout, timeout_marker, plan_theorem, 
    failed_plan_position_ref := NONE;
    failed_goal_state_printed_ref := false;
    suppressed_failure_diagnostic_ref := NONE;
-   history_step_count_ref := 0;
    failed_prefix_resume_active_ref := false;
    proving_with_proof_ir_ref := false;
    Tactical.set_prover proof_ir_prover)
