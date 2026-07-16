@@ -74,12 +74,21 @@ if (cd "$selector_project" && "$HOLBUILD_BIN" build ATheory) >"$selector_resume_
   exit 1
 fi
 require_grep "from: failed-prefix checkpoint in selected_goals_diagnostic" "$selector_resume_log"
+require_grep "theorem: selected_goals_diagnostic" "$selector_resume_log"
+require_grep "fragment: branch close" "$selector_resume_log"
+require_grep "plan position:" "$selector_resume_log"
+require_grep "failed tactic input goals: 1" "$selector_resume_log"
+require_grep "failed tactic top input goal:" "$selector_resume_log"
 require_grep "selected goals were not solved" "$selector_resume_log"
-require_grep "holbuild failed theorem: selected_goals_diagnostic" "$selector_resume_log"
-require_grep "holbuild plan position:" "$selector_resume_log"
-require_grep "holbuild goal state at failed fragment: branch close" "$selector_resume_log"
-require_grep "holbuild failed tactic input goal count: 1" "$selector_resume_log"
-require_grep "holbuild failed tactic top input goal:" "$selector_resume_log"
+
+selector_instrumented_log=$(awk -F'instrumented log: ' '/instrumented log: / {print $2}' "$selector_resume_log" | tail -n 1)
+require_file "$selector_instrumented_log"
+require_grep "holbuild failed theorem: selected_goals_diagnostic" "$selector_instrumented_log"
+require_grep "holbuild plan position:" "$selector_instrumented_log"
+require_grep "holbuild goal state at failed fragment: branch close" "$selector_instrumented_log"
+require_grep "holbuild failed tactic input goal count: 1" "$selector_instrumented_log"
+require_grep "holbuild failed tactic top input goal:" "$selector_instrumented_log"
+require_grep "selected goals were not solved" "$selector_instrumented_log"
 
 # Reproduce the other exception reported in the issue deterministically.  The
 # checkpoint contains two open goals while inside `each`, with one goal outside
@@ -131,9 +140,18 @@ if (cd "$each_project" && "$HOLBUILD_BIN" build ATheory) >"$each_resume_log" 2>&
   exit 1
 fi
 require_grep "from: failed-prefix checkpoint in each_focus_diagnostic" "$each_resume_log"
+require_grep "theorem: each_focus_diagnostic" "$each_resume_log"
+require_grep "fragment:" "$each_resume_log"
+require_grep "plan position:" "$each_resume_log"
+require_grep "failed tactic input goals:" "$each_resume_log"
+require_grep "failed tactic top input goal:" "$each_resume_log"
 require_grep "focus tail count exceeds open goals: each" "$each_resume_log"
-require_grep "holbuild failed theorem: each_focus_diagnostic" "$each_resume_log"
-require_grep "holbuild plan position:" "$each_resume_log"
-require_grep "holbuild goal state at failed fragment:" "$each_resume_log"
-require_grep "holbuild failed tactic input goal count:" "$each_resume_log"
-require_grep "holbuild failed tactic top input goal:" "$each_resume_log"
+
+each_instrumented_log=$(awk -F'instrumented log: ' '/instrumented log: / {print $2}' "$each_resume_log" | tail -n 1)
+require_file "$each_instrumented_log"
+require_grep "holbuild failed theorem: each_focus_diagnostic" "$each_instrumented_log"
+require_grep "holbuild plan position:" "$each_instrumented_log"
+require_grep "holbuild goal state at failed fragment:" "$each_instrumented_log"
+require_grep "holbuild failed tactic input goal count:" "$each_instrumented_log"
+require_grep "holbuild failed tactic top input goal:" "$each_instrumented_log"
+require_grep "focus tail count exceeds open goals: each" "$each_instrumented_log"
