@@ -33,8 +33,7 @@ TOML
 write_script() {
   local selected=$1
   cat > "$project/src/AScript.sml" <<SML
-open HolKernel Parse boolLib bossLib;
-val _ = new_theory "A";
+Theory A
 
 Theorem selector_edit:
   T ∧ F
@@ -42,8 +41,6 @@ Proof
   CONJ_TAC
   >>~- ([\`$selected\`], ALL_TAC >> FAIL_TAC "selector suffix failure")
 QED
-
-val _ = export_theory();
 SML
 }
 
@@ -112,5 +109,87 @@ fi
 
 if [[ "$clean_goal" != "F" ]]; then
   printf 'expected edited selector to focus F, got:\n%s\n' "$clean_goal" >&2
+  exit 1
+fi
+
+# Exercise rewind beyond History's default retention.  The explicit control on
+# the right of >> is traversed once per generated goal, so it creates many more
+# proof-history operations than the static plan contains.  Editing TRY to the
+# equivalent one-alternative FIRST invalidates those structural leaf snapshots;
+# replay must retain enough history to rewind all the way to many_tac.
+history_project=$tmpdir/history-project
+history_counter=$tmpdir/history-count.txt
+mkdir -p "$history_project/src"
+touch "$history_counter"
+cp "$project/holproject.toml" "$history_project/holproject.toml"
+
+write_history_script() {
+  local control=$1
+  cat > "$history_project/src/AScript.sml" <<SML
+Theory A
+
+val history_counter = "$history_counter";
+fun bump_counter () =
+  let val out = TextIO.openAppend history_counter
+  in TextIO.output(out, "x"); TextIO.closeOut out end;
+fun many_tac g =
+  (bump_counter();
+   (List.tabulate (20, fn _ => g),
+    fn ths => case ths of th :: _ => th | [] => raise Fail "many_tac validator"));
+
+Theorem retained_structural_history:
+  T
+Proof
+  many_tac >> $control >> FAIL_TAC "history retention suffix failure"
+QED
+SML
+}
+
+write_history_script "TRY ALL_TAC"
+history_seed_log=$tmpdir/history-seed.log
+if (cd "$history_project" && "$HOLBUILD_BIN" build ATheory) >"$history_seed_log" 2>&1; then
+  echo "expected history-retention seed proof to fail" >&2
+  exit 1
+fi
+require_grep "history retention suffix failure" "$history_seed_log"
+require_file "$(find "$history_project/.holbuild/checkpoints" -name 'retained_structural_history_failed_prefix.save' -print -quit)"
+if [[ $(wc -c < "$history_counter" | tr -d ' ') != 1 ]]; then
+  echo "expected many_tac to run once while seeding history checkpoint" >&2
+  exit 1
+fi
+
+write_history_script "FIRST [ALL_TAC]"
+history_incremental_log=$tmpdir/history-incremental.log
+if (cd "$history_project" && "$HOLBUILD_BIN" build ATheory) >"$history_incremental_log" 2>&1; then
+  echo "expected edited history-retention proof to fail" >&2
+  exit 1
+fi
+require_grep "from: failed-prefix checkpoint in retained_structural_history" "$history_incremental_log"
+require_grep "history retention suffix failure" "$history_incremental_log"
+if grep -q "CANT_BACKUP_ANYMORE\|failed-prefix checkpoint cannot rewind" "$history_incremental_log"; then
+  echo "structural salvage could not rewind retained proof history" >&2
+  exit 1
+fi
+if [[ $(wc -c < "$history_counter" | tr -d ' ') != 1 ]]; then
+  echo "structural salvage reran many_tac instead of rewinding to its snapshot" >&2
+  exit 1
+fi
+history_incremental_goal=$(failed_top_goal "$history_incremental_log")
+
+rm -rf "$history_project/.holbuild/checkpoints"
+history_clean_log=$tmpdir/history-clean.log
+if (cd "$history_project" && "$HOLBUILD_BIN" build ATheory) >"$history_clean_log" 2>&1; then
+  echo "expected clean history-retention proof to fail" >&2
+  exit 1
+fi
+require_grep "history retention suffix failure" "$history_clean_log"
+history_clean_goal=$(failed_top_goal "$history_clean_log")
+if [[ "$history_incremental_goal" != "$history_clean_goal" ]]; then
+  printf '%s\n' \
+    "deep structural rewind disagrees with clean execution" \
+    "incremental goal:" \
+    "$history_incremental_goal" \
+    "clean goal:" \
+    "$history_clean_goal" >&2
   exit 1
 fi
