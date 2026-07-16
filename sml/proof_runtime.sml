@@ -48,6 +48,7 @@ val failed_step_span_ref = ref NONE : (int * int) option ref
 val failed_plan_position_ref = ref NONE : (int * string * string) option ref
 val failed_goal_state_printed_ref = ref false
 val suppress_expected_failure_diagnostics_ref = ref false
+val suppressed_failure_diagnostic_ref = ref (NONE : (unit -> unit) option)
 val compiled_tactic_ref = ref Tactical.ALL_TAC
 val compiled_list_tactic_ref = ref Tactical.ALL_LT
 val proof_history_ref = ref (NONE : goalStack.gstk History.history option)
@@ -685,15 +686,31 @@ fun print_finish_goal_state name =
     result
   end
 
+fun emit_step_failure_diagnostic label goals =
+  (save_failed_prefix_checkpoint ();
+   print_goal_state label goals
+   handle print_e =>
+     TextIO.output(TextIO.stdErr,
+       String.concat ["holbuild failed to print goal state: ", General.exnMessage print_e, "\n"]))
+
 fun report_step_failure_with_goals label goals e =
-  if !suppress_expected_failure_diagnostics_ref then raise e
-  else
-    (save_failed_prefix_checkpoint ();
-     print_goal_state label goals
-     handle print_e =>
-       TextIO.output(TextIO.stdErr,
-         String.concat ["holbuild failed to print goal state: ", General.exnMessage print_e, "\n"]);
+  if !suppress_expected_failure_diagnostics_ref then
+    (suppressed_failure_diagnostic_ref := SOME (fn () => emit_step_failure_diagnostic label goals);
      raise e)
+  else
+    (emit_step_failure_diagnostic label goals;
+     raise e)
+
+fun report_finish_failure name e =
+  let
+    val _ =
+      (ignore (print_finish_goal_state name)
+       handle print_e =>
+         TextIO.output(TextIO.stdErr,
+           String.concat ["holbuild failed to print goal state: ", General.exnMessage print_e, "\n"]))
+  in
+    raise e
+  end
 
 fun report_step_failure label e =
   report_step_failure_with_goals label (history_top_goals() handle _ => []) e
@@ -736,7 +753,10 @@ fun active_focus_snapshot label =
            val total_count = length goals
            val generated_count = total_count - tail_count
          in
-           if generated_count < 0 then raise Fail ("focus tail count exceeds open goals: " ^ label)
+           if generated_count < 0 then
+             raise Fail (String.concat ["focus tail count exceeds open goals: ", label,
+                                        " (tail count ", Int.toString tail_count,
+                                        ", open goals ", Int.toString total_count, ")"])
            else {goals = goals, total_count = total_count, generated_count = generated_count, tail_count = tail_count}
          end
          handle e => if tail_count = 0 andalso history_is_proved () then {goals = [], total_count = 0, generated_count = 0, tail_count = tail_count} else raise e)
@@ -881,7 +901,7 @@ fun close_focus label HolbuildProofIr.SelectKeep = pop_branch_tail_count label
       let val remaining = focused_goal_count label
       in
         if remaining = 0 then pop_branch_tail_count label
-        else raise Fail "selected goals were not solved"
+        else raise Fail ("selected goals were not solved: " ^ label)
       end
 
 fun reorder_focused_front_after label front_count middle_count =
@@ -1019,9 +1039,20 @@ fun restore_runtime_state {history, current_path, successful_path, current_frame
 fun with_expected_failures_suppressed f =
   let val old = !suppress_expected_failure_diagnostics_ref
       val _ = suppress_expected_failure_diagnostics_ref := true
+      val _ = suppressed_failure_diagnostic_ref := NONE
       val result = (f (); NONE) handle e => SOME e
       val _ = suppress_expected_failure_diagnostics_ref := old
+      val _ = case result of NONE => suppressed_failure_diagnostic_ref := NONE | SOME _ => ()
   in case result of NONE => () | SOME e => raise e end
+
+fun discard_suppressed_failure_diagnostic () = suppressed_failure_diagnostic_ref := NONE
+
+fun raise_choice_failure (e, diagnostic) =
+  (suppressed_failure_diagnostic_ref := diagnostic;
+   if !suppress_expected_failure_diagnostics_ref then ()
+   else
+     (case diagnostic of SOME emit => emit () | NONE => ());
+   raise e)
 
 fun with_plan_position display_index kind label span f =
   let
@@ -1034,11 +1065,10 @@ fun with_plan_position display_index kind label span f =
     fun restore () = (failed_step_end_ref := old_failed_step_end;
                       failed_step_span_ref := old_failed_step_span;
                       failed_plan_position_ref := old_failed_plan_position)
-    val result = (f (); NONE) handle e => SOME e
+    val value = f ()
   in
-    case result of
-        NONE => (restore (); ())
-      | SOME e => raise e
+    restore ();
+    value
   end
 
 fun run_maybe_traced_step index display_index proof_step =
@@ -1267,16 +1297,22 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
         fun nth_body 1 (body :: _) = SOME body
           | nth_body n (_ :: rest) = nth_body (n - 1) rest
           | nth_body _ [] = NONE
-        fun attempt _ _ [] last = (case last of SOME e => raise e | NONE => raise Fail ("choice has no alternatives: " ^ label))
+        fun attempt _ _ [] last =
+              (case last of
+                   SOME failure => raise_choice_failure failure
+                 | NONE => raise Fail ("choice has no alternatives: " ^ label))
           | attempt n alt_line (body :: rest) _ =
               let val saved = runtime_state_snapshot()
                   val result = (with_expected_failures_suppressed (fn () => run_list (alt_line + 1) (path @ [HolbuildProofIr.PathAlternative n]) 0 body); NONE) handle e => SOME e
+                  val diagnostic = !suppressed_failure_diagnostic_ref
               in
                 case result of
-                    NONE => record_or_replay_event (HolbuildProofIr.ChoiceEvent (path, n))
+                    NONE =>
+                      (discard_suppressed_failure_diagnostic ();
+                       record_or_replay_event (HolbuildProofIr.ChoiceEvent (path, n)))
                   | SOME e =>
                       (restore_runtime_state saved;
-                       attempt (n + 1) (alt_line + 1 + HolbuildProofIr.display_line_count_list body) rest (SOME e))
+                       attempt (n + 1) (alt_line + 1 + HolbuildProofIr.display_line_count_list body) rest (SOME (e, diagnostic)))
               end
       in
         if not (!resume_reached_ref) then
@@ -1313,6 +1349,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
                  NONE => record_or_replay_event (HolbuildProofIr.TryEvent (path, true))
                | SOME _ =>
                    (restore_runtime_state saved;
+                    discard_suppressed_failure_diagnostic ();
                     record_or_replay_event (HolbuildProofIr.TryEvent (path, false)))
           end;
         d + HolbuildProofIr.display_line_count proof_step
@@ -1332,6 +1369,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
                in case result of
                       SOME _ =>
                         (restore_runtime_state saved;
+                         discard_suppressed_failure_diagnostic ();
                          record_or_replay_event (HolbuildProofIr.RepeatStopEvent (path, iter)))
                     | NONE =>
                         (record_or_replay_event (HolbuildProofIr.RepeatIterEvent (path, iter));
@@ -1351,15 +1389,18 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
         d + HolbuildProofIr.display_line_count proof_step
       end)
     and run_one d path proof_step =
-      case proof_step of
-          HolbuildProofIr.StepTactic _ => run_leaf d path proof_step
-        | HolbuildProofIr.StepList _ => run_leaf d path proof_step
-        | HolbuildProofIr.StepSelect {selector, mode, body, ...} => run_select d path proof_step selector mode body
-        | HolbuildProofIr.StepEach {body, ...} => run_each d path proof_step body
-        | HolbuildProofIr.StepCases {cases, ...} => run_cases d path proof_step cases
-        | HolbuildProofIr.StepChoice {label, alternatives, ...} => run_choice d path proof_step label alternatives
-        | HolbuildProofIr.StepTry {body, ...} => run_try d path proof_step body
-        | HolbuildProofIr.StepRepeat {body, ...} => run_repeat d path proof_step body
+      with_plan_position d (HolbuildProofIr.step_kind proof_step) (HolbuildProofIr.step_label proof_step)
+        (HolbuildProofIr.step_start proof_step, HolbuildProofIr.step_end proof_step)
+        (fn () =>
+          case proof_step of
+              HolbuildProofIr.StepTactic _ => run_leaf d path proof_step
+            | HolbuildProofIr.StepList _ => run_leaf d path proof_step
+            | HolbuildProofIr.StepSelect {selector, mode, body, ...} => run_select d path proof_step selector mode body
+            | HolbuildProofIr.StepEach {body, ...} => run_each d path proof_step body
+            | HolbuildProofIr.StepCases {cases, ...} => run_cases d path proof_step cases
+            | HolbuildProofIr.StepChoice {label, alternatives, ...} => run_choice d path proof_step label alternatives
+            | HolbuildProofIr.StepTry {body, ...} => run_try d path proof_step body
+            | HolbuildProofIr.StepRepeat {body, ...} => run_repeat d path proof_step body)
   in
     run_list display_index [] 0 steps;
     case resume_after_path of
@@ -1384,15 +1425,12 @@ fun run_steps steps =
    dynamic_events_ref := [];
    resume_events_ref := [];
    suppress_expected_failure_diagnostics_ref := false;
+   suppressed_failure_diagnostic_ref := NONE;
    branch_tail_count_ref := [];
    reverse_group_lengths_ref := NONE;
    run_structural_steps 0 steps)
 
 datatype 'a traced_result = TraceOk of 'a | TraceError of exn
-
-fun run_whole_tactic g label tac =
-  with_tactic_timeout label (fn () => Tactical.TAC_PROOF(g, tac)) ()
-  handle e => (init_history g 15; print_goal_state label; clear_history (); raise e)
 
 fun backup_n 0 = ()
   | backup_n n = (set_history (History.undo (current_history())); backup_n (n - 1))
@@ -1429,9 +1467,11 @@ fun proof_ir_prove name end_path end_ok checkpoint_depth g original_tac tactic_t
     let
             val _ = init_history g (HolbuildProofIr.display_step_count plan + 1)
             val _ = run_steps plan
-                     handle e => (if !failed_goal_state_printed_ref then () else ignore (print_finish_goal_state name); raise e)
+                     handle e =>
+                       if !failed_goal_state_printed_ref then raise e
+                       else report_finish_failure name e
             val th = history_top_thm g
-                     handle e => (ignore (print_finish_goal_state name); raise e)
+                     handle e => report_finish_failure name e
             val _ = save_checkpoint "end_of_proof" false end_path end_ok checkpoint_depth
             val _ = drop_all()
           in th end
@@ -1676,10 +1716,13 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
           val _ = dynamic_events_ref := rev (#events metadata)
           val _ = resume_events_ref := #events metadata
           val _ =
-            if #step_count metadata = 0 then run_structural_steps 0 plan
-            else run_steps_from_path (#path metadata) 0 plan
+            (if #step_count metadata = 0 then run_structural_steps 0 plan
+             else run_steps_from_path (#path metadata) 0 plan)
+            handle e =>
+              if !failed_goal_state_printed_ref then raise e
+              else report_finish_failure name e
           val th = history_top_thm (project_history goalStack.initial_goal)
-                   handle e => (ignore (print_finish_goal_state name); raise e)
+                   handle e => report_finish_failure name e
           val _ = drop_all()
           val _ = theorem_info_ref := NONE
         in th end))
@@ -1734,6 +1777,7 @@ fun install ({checkpoint_enabled, tactic_timeout, timeout_marker, plan_theorem, 
    failed_step_span_ref := NONE;
    failed_plan_position_ref := NONE;
    failed_goal_state_printed_ref := false;
+   suppressed_failure_diagnostic_ref := NONE;
    failed_prefix_resume_active_ref := false;
    proving_with_proof_ir_ref := false;
    Tactical.set_prover proof_ir_prover)
