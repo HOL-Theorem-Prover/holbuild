@@ -14,7 +14,8 @@ fun toolchain_config kernel_variant = HolbuildHolToolchainConfig.config kernel_v
 val analyser_format_version = "holbuild-hol-analyser-v1"
 val analyser_protocol_version = "1"
 val analyser_source_files =
-  ["../hash.sml",
+  ["../string_hash.sml",
+   "../hash.sml",
    "../../vendor/sml-sha256/lib/from-string.sig",
    "../../vendor/sml-sha256/lib/from-string.sml",
    "../../vendor/sml-sha256/lib/bytestring.sig",
