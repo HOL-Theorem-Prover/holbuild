@@ -2201,6 +2201,7 @@ fun pre_theorem_hash source theorem_start =
   HolbuildToolchain.hash_text (String.substring(source, 0, theorem_start))
 
 fun failed_prefix_diagnostic_key proof_engine = proof_engine ^ ":finish_goal_state_v2"
+fun failed_prefix_resume_schema_key proof_engine = proof_engine ^ ":dependency_prefix_history_v1"
 
 fun failed_prefix_ok proof_engine proof_timeout deps_key safe_name pre_hash header_hash =
   checkpoint_ok_text "failed_prefix"
@@ -2210,7 +2211,8 @@ fun failed_prefix_ok proof_engine proof_timeout deps_key safe_name pre_hash head
      ("safe_name", safe_name),
      ("pre_theorem_key", pre_hash),
      ("header_key", header_hash),
-     ("failure_diagnostic_key", failed_prefix_diagnostic_key proof_engine)]
+     ("failure_diagnostic_key", failed_prefix_diagnostic_key proof_engine),
+     ("resume_schema_key", failed_prefix_resume_schema_key proof_engine)]
 
 fun theorem_checkpoint_specs proof_engine proof_timeout project node deps_key source proof_ir_plans (boundaries : HolbuildTheoryCheckpoints.boundary list) =
   let
@@ -2400,10 +2402,15 @@ fun failed_prefix_metadata path =
                    lines
               end
         in
-          case (value "proof_ir_failed_prefix_version", value "step_count", value "prefix_end", value "path", value "focus") of
-              (SOME version, SOME step_count_text, SOME _, SOME _, SOME _) =>
-                if version = "1" orelse version = "3" then
-                  Option.map (fn step_count => {step_count = step_count, metadata_text = text})
+          case (value "proof_ir_failed_prefix_version", value "step_count", value "prefix_end",
+                value "path", value "focus", value "prefix_signature", value "history_count") of
+              (SOME version, SOME step_count_text, SOME _, SOME _, SOME _, prefix_signature, SOME _) =>
+                if version = "4" then
+                  Option.mapPartial
+                    (fn step_count =>
+                       if step_count = 0 orelse Option.isSome prefix_signature then
+                         SOME {step_count = step_count, metadata_text = text}
+                       else NONE)
                     (strict_nonnegative_int step_count_text)
                 else NONE
             | _ => NONE
@@ -2809,6 +2816,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
             in
               if List.exists (fn marker => String.isSubstring marker failure_text)
                    ["failed-prefix checkpoint cannot rewind",
+                    "failed-prefix checkpoint history does not match metadata",
                     "failed-prefix proof path is not present in current proof-ir plan",
                     "invalid proof-ir failed-prefix metadata",
                     "proof-ir dynamic replay mismatch"] then

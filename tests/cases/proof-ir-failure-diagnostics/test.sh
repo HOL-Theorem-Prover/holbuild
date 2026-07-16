@@ -92,8 +92,10 @@ require_grep "selected goals were not solved" "$selector_instrumented_log"
 
 # Reproduce the other exception reported in the issue deterministically.  The
 # checkpoint contains two open goals while inside `each`, with one goal outside
-# the active focus.  Raising the recorded tail count models the inconsistent
-# resume state which previously escaped with only an internal exception.
+# the active focus.  Raising the recorded tail count in both endpoint metadata
+# and its v4 leaf snapshot models the inconsistent runtime state which previously
+# escaped with only an internal exception.  The copies must agree so metadata
+# integrity validation does not safely repair the stale endpoint first.
 each_project=$tmpdir/each-project
 mkdir -p "$each_project/src"
 write_manifest "$each_project" "failed-prefix-each-diagnostics"
@@ -125,12 +127,29 @@ from pathlib import Path
 import sys
 path = Path(sys.argv[1])
 lines = path.read_text().splitlines()
+step_count = None
+for line in lines:
+    if line.startswith("step_count="):
+        step_count = int(line.split("=", 1)[1])
+        break
+if step_count is None:
+    raise SystemExit("failed-prefix metadata has no step count")
+
+found_focus = False
+found_endpoint = False
 for i, line in enumerate(lines):
     if line.startswith("focus="):
         lines[i] = "focus=99"
-        break
-else:
+        found_focus = True
+    elif line.startswith(f"leaf={step_count}\t"):
+        fields = line.split("\t")
+        fields[3] = "99"
+        lines[i] = "\t".join(fields)
+        found_endpoint = True
+if not found_focus:
     raise SystemExit("failed-prefix metadata has no focus field")
+if not found_endpoint:
+    raise SystemExit("failed-prefix metadata has no endpoint leaf snapshot")
 path.write_text("\n".join(lines) + "\n")
 PY
 

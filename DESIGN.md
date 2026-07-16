@@ -664,16 +664,23 @@ proof body hash. That would invalidate exactly the state a proof author needs
 after editing a failing suffix. Instead, a failed proof-step run may retain a
 proof-navigation checkpoint plus versioned metadata describing the last trusted
 structural Proof-IR boundary: successful path, leaf count, source end, focused
-state, dynamic replay events, and a leaf signature. On the next rebuild,
-holbuild restores the checkpoint, validates that metadata against the current
-Proof-IR plan, reconstructs the remaining continuation from the current plan, and
-continues from the restored HOL proof state. Hashes remain guardrails for
-dependency context and initial goal compatibility; structural path/signature
+state, dynamic replay events, a leaf signature, and a canonical dependency-prefix
+signature. The dependency prefix is derived from parsed Proof-IR structure: it
+excludes source spans and display labels, while retaining exact opaque tactic
+programs, selector semantics, preceding branches, and prior repeated iterations.
+Thus structural whitespace normalized by parsing does not invalidate a prefix,
+but an edit to an enclosing or preceding proof operation does. On the next
+rebuild, holbuild restores the checkpoint, validates that metadata against the
+current Proof-IR plan, reconstructs the remaining continuation from the current
+plan, and continues from the restored HOL proof state. Hashes remain guardrails
+for dependency context and initial goal compatibility; structural path/signature
 validation decides whether the saved proof prefix is usable. Failed-prefix
-metadata also records per-leaf structural snapshots. If the saved endpoint is
-stale after an edit, holbuild can opportunistically choose the longest still-valid
-leaf prefix, rewind the retained HOL proof history to that prefix, restore the
-recorded structural focus state, and continue from the current Proof-IR plan.
+metadata also records per-leaf structural snapshots and the actual proof-history
+operation position of each leaf. If the saved endpoint is stale after an edit,
+holbuild can opportunistically choose the longest still-valid leaf prefix, rewind
+the retained HOL proof history by history operations—not merely successful leaf
+count—to that prefix, restore the recorded structural focus state, and continue
+from the current Proof-IR plan.
 If snapshot validation, history rewind, or structural resume fails, replay is
 rejected and holbuild falls back to an earlier valid checkpoint. Future
 incrementality work should make this opportunistic reuse fire in more structural

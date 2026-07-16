@@ -36,7 +36,8 @@ val successful_branch_tail_counts_ref = ref ([] : int list)
 type leaf_snapshot = {count : int, prefix_end : int, path : HolbuildProofIr.proof_path,
                       focus : int list, frames : structural_frame list,
                       events : HolbuildProofIr.dynamic_event list,
-                      sig_text : string * string}
+                      sig_text : string * string, prefix_signature : string option,
+                      history_count : int}
 val successful_leaf_snapshots_ref = ref ([] : leaf_snapshot list)
 (* Frame stacks are stored innermost-first, matching current_frames_ref push/pop order.
    Dynamic events are accumulated newest-first internally; metadata stores them in
@@ -52,6 +53,7 @@ val suppressed_failure_diagnostic_ref = ref (NONE : (unit -> unit) option)
 val compiled_tactic_ref = ref Tactical.ALL_TAC
 val compiled_list_tactic_ref = ref Tactical.ALL_LT
 val proof_history_ref = ref (NONE : goalStack.gstk History.history option)
+val history_step_count_ref = ref 0
 val branch_tail_count_ref = ref ([] : int list)
 val reverse_group_lengths_ref = ref (NONE : int list option)
 val default_repeat_iteration_limit = 10000
@@ -406,11 +408,13 @@ fun decode_metadata_list text =
   Option.map (fn decoded => if decoded = "" then [] else String.fields (fn c => c = #"|") decoded)
              (String.fromString text)
 
-fun leaf_snapshot_text ({count, prefix_end, path, focus, frames, events, sig_text = (kind, program)} : leaf_snapshot) =
+fun leaf_snapshot_text ({count, prefix_end, path, focus, frames, events,
+                         sig_text = (kind, program), prefix_signature, history_count} : leaf_snapshot) =
   String.concat [Int.toString count, "\t", Int.toString prefix_end, "\t",
                  path_text path, "\t", int_list_text focus, "\t",
                  encode_metadata_list (map structural_frame_text frames), "\t",
                  encode_metadata_list (map dynamic_event_text events), "\t",
+                 Option.getOpt(prefix_signature, ""), "\t", Int.toString history_count, "\t",
                  kind, "\t", String.toString program]
 
 fun parse_step_signature_text text =
@@ -420,12 +424,13 @@ fun parse_step_signature_text text =
 
 fun parse_leaf_snapshot_text text =
   case String.fields (fn c => c = #"\t") text of
-      count_text :: end_text :: path_text' :: focus_text :: frames_text :: events_text :: kind :: rest =>
+      count_text :: end_text :: path_text' :: focus_text :: frames_text :: events_text :: prefix_signature :: history_text :: kind :: [program_text] =>
         (case (strict_positive_int count_text, strict_nonnegative_int end_text,
                parse_path_text path_text', parse_int_list_text focus_text,
                decode_metadata_list frames_text, decode_metadata_list events_text,
-               String.fromString (String.concatWith "\t" rest)) of
-             (SOME count, SOME prefix_end, SOME path, SOME focus, SOME frame_texts, SOME event_texts, SOME program) =>
+               strict_nonnegative_int history_text, String.fromString program_text) of
+             (SOME count, SOME prefix_end, SOME path, SOME focus, SOME frame_texts, SOME event_texts,
+              SOME history_count, SOME program) =>
                let
                  fun parse_frames [] acc = SOME (rev acc)
                    | parse_frames (frame_text :: more) acc =
@@ -442,17 +447,11 @@ fun parse_leaf_snapshot_text text =
                      (SOME frames, SOME events) =>
                        SOME ({count = count, prefix_end = prefix_end, path = path,
                               focus = focus, frames = frames, events = events,
-                              sig_text = (kind, program)} : leaf_snapshot)
+                              sig_text = (kind, program),
+                              prefix_signature = if prefix_signature = "" then NONE else SOME prefix_signature,
+                              history_count = history_count} : leaf_snapshot)
                    | _ => NONE
                end
-           | _ => NONE)
-    | count_text :: end_text :: path_text' :: focus_text :: kind :: rest =>
-        (case (strict_positive_int count_text, strict_nonnegative_int end_text,
-               parse_path_text path_text', parse_int_list_text focus_text,
-               String.fromString (String.concatWith "\t" rest)) of
-             (SOME count, SOME prefix_end, SOME path, SOME focus, SOME program) =>
-               SOME ({count = count, prefix_end = prefix_end, path = path,
-                      focus = focus, frames = [], events = [], sig_text = (kind, program)} : leaf_snapshot)
            | _ => NONE)
     | _ => NONE
 
@@ -475,13 +474,19 @@ fun save_failed_prefix_checkpoint () =
                               SOME step => ["leaf_signature=" ^ step_signature_text step ^ "\n"]
                             | NONE => [])
                 | _ => []
+            val prefix_signature_lines =
+              case !successful_leaf_snapshots_ref of
+                  ({prefix_signature = SOME saved_signature, ...} : leaf_snapshot) :: _ =>
+                    ["prefix_signature=" ^ saved_signature ^ "\n"]
+                | _ => []
             val meta_text =
-              String.concat (["proof_ir_failed_prefix_version=3\n",
+              String.concat (["proof_ir_failed_prefix_version=4\n",
                               "step_count=", Int.toString step_count, "\n",
                               "prefix_end=", Int.toString prefix_end, "\n",
                               "path=", path_text (!successful_path_ref), "\n",
-                              "focus=", int_list_text (!successful_branch_tail_counts_ref), "\n"] @
-                             leaf_signature_lines @
+                              "focus=", int_list_text (!successful_branch_tail_counts_ref), "\n",
+                              "history_count=", Int.toString (!history_step_count_ref), "\n"] @
+                             leaf_signature_lines @ prefix_signature_lines @
                              map (fn snap => "leaf=" ^ leaf_snapshot_text snap ^ "\n") (rev (!successful_leaf_snapshots_ref)) @
                              map (fn frame => "frame=" ^ structural_frame_text frame ^ "\n") (!successful_frames_ref) @
                              map (fn event => "event=" ^ dynamic_event_text event ^ "\n") (rev (!dynamic_events_ref)))
@@ -489,7 +494,7 @@ fun save_failed_prefix_checkpoint () =
               (case !proof_history_ref of
                    NONE => ()
                  | SOME history =>
-                     proof_history_ref := SOME (History.set_limit history (Int.max(15, step_count + 1))))
+                     proof_history_ref := SOME (History.set_limit history (Int.max(15, !history_step_count_ref + 1))))
             val _ = save_checkpoint "failed_prefix" false failed_prefix_path failed_prefix_ok depth
             val _ = write_text_file (failed_prefix_path ^ ".meta") meta_text
             val _ = write_text_file (failed_prefix_path ^ ".prefix") (String.substring(!active_tactic_text_ref, 0, prefix_end))
@@ -597,20 +602,33 @@ fun clear_history () = proof_history_ref := NONE
 fun project_history f = History.project f (current_history())
 
 fun init_history g limit =
-  set_history (History.new_history {obj = goalStack.new_goal g Lib.I,
-                                    limit = Int.max(15, limit)})
+  (set_history (History.new_history {obj = goalStack.new_goal g Lib.I,
+                                     limit = Int.max(15, limit)});
+   history_step_count_ref := 0)
 
 fun apply_history f =
   Lib.with_flag (goalStack.chatting, false)
     (fn () => History.apply f (current_history())) ()
 
-fun append_history f = set_history (apply_history f)
+fun ensure_history_limit limit =
+  set_history (History.set_limit (current_history()) (Int.max(15, limit)))
+
+fun prepare_history_append () =
+  ensure_history_limit (!history_step_count_ref + 2)
+
+fun append_history f =
+  (prepare_history_append ();
+   set_history (apply_history f);
+   history_step_count_ref := !history_step_count_ref + 1)
 
 fun append_history_with_timeout label f =
-  let val new_history = with_tactic_timeout label apply_history f
-  in set_history new_history end
-
-fun ensure_history_limit limit = set_history (History.set_limit (current_history()) (Int.max(15, limit)))
+  let
+    val _ = prepare_history_append ()
+    val new_history = with_tactic_timeout label apply_history f
+  in
+    set_history new_history;
+    history_step_count_ref := !history_step_count_ref + 1
+  end
 
 fun history_top_goals () = project_history goalStack.top_goals
 
@@ -1016,12 +1034,13 @@ fun runtime_state_snapshot () =
    events = !dynamic_events_ref,
    resume_events = !resume_events_ref,
    branch_tail_counts = !branch_tail_count_ref,
-   reverse_group_lengths = !reverse_group_lengths_ref}
+   reverse_group_lengths = !reverse_group_lengths_ref,
+   history_step_count = !history_step_count_ref}
 
 fun restore_runtime_state {history, current_path, successful_path, current_frames,
                            successful_frames, resume_frames, successful_branch_tail_counts, successful_count,
                            successful_end, events, resume_events, branch_tail_counts,
-                           reverse_group_lengths} =
+                           reverse_group_lengths, history_step_count} =
   (set_history history;
    current_path_ref := current_path;
    successful_path_ref := successful_path;
@@ -1034,7 +1053,8 @@ fun restore_runtime_state {history, current_path, successful_path, current_frame
    dynamic_events_ref := events;
    resume_events_ref := resume_events;
    branch_tail_count_ref := branch_tail_counts;
-   reverse_group_lengths_ref := reverse_group_lengths)
+   reverse_group_lengths_ref := reverse_group_lengths;
+   history_step_count_ref := history_step_count)
 
 fun with_expected_failures_suppressed f =
   let val old = !suppress_expected_failure_diagnostics_ref
@@ -1150,6 +1170,9 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
         val count = !successful_step_count_ref + 1
         val prefix_end = HolbuildProofIr.step_end proof_step
         val sig_text = (HolbuildProofIr.step_kind proof_step, HolbuildProofIr.step_program proof_step)
+        val prefix_signature =
+          Option.map HolbuildStringHash.string_sha1
+            (HolbuildProofIr.canonical_dependency_prefix steps path)
       in
         successful_step_count_ref := count;
         successful_prefix_end_ref := prefix_end;
@@ -1160,7 +1183,9 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
                                           focus = !branch_tail_count_ref,
                                           frames = !current_frames_ref,
                                           events = rev (!dynamic_events_ref),
-                                          sig_text = sig_text} ::
+                                          sig_text = sig_text,
+                                          prefix_signature = prefix_signature,
+                                          history_count = !history_step_count_ref} ::
                                          !successful_leaf_snapshots_ref
       end
     fun run_list _ _ _ [] = ()
@@ -1426,6 +1451,7 @@ fun run_steps steps =
    resume_events_ref := [];
    suppress_expected_failure_diagnostics_ref := false;
    suppressed_failure_diagnostic_ref := NONE;
+   history_step_count_ref := 0;
    branch_tail_count_ref := [];
    reverse_group_lengths_ref := NONE;
    run_structural_steps 0 steps)
@@ -1433,7 +1459,10 @@ fun run_steps steps =
 datatype 'a traced_result = TraceOk of 'a | TraceError of exn
 
 fun backup_n 0 = ()
-  | backup_n n = (set_history (History.undo (current_history())); backup_n (n - 1))
+  | backup_n n =
+      (set_history (History.undo (current_history()));
+       history_step_count_ref := !history_step_count_ref - 1;
+       backup_n (n - 1))
 
 fun drop_all () = clear_history ()
 
@@ -1513,27 +1542,37 @@ fun parse_failed_prefix_metadata text =
   in
     case metadata_value "proof_ir_failed_prefix_version" lines of
         SOME version =>
-          if version = "1" orelse version = "3" then
+          if version = "4" then
             (case (metadata_value "step_count" lines,
                    metadata_value "prefix_end" lines,
                    metadata_value "path" lines,
                    metadata_value "focus" lines,
+                   metadata_value "prefix_signature" lines,
+                   metadata_value "history_count" lines,
                    parse_events event_texts [],
                    parse_frames frame_texts [],
                    parse_leaf_snapshots leaf_texts []) of
-                 (SOME count_text, SOME end_text, SOME path_text', SOME focus_text, SOME events, SOME frames, SOME leaves) =>
-                   (case (strict_nonnegative_int count_text, strict_nonnegative_int end_text, parse_path_text path_text', parse_int_list_text focus_text) of
-                        (SOME step_count, SOME prefix_end, SOME path, SOME focus) =>
+                 (SOME count_text, SOME end_text, SOME path_text', SOME focus_text,
+                  prefix_signature, SOME history_text, SOME events, SOME frames, SOME leaves) =>
+                   (case (strict_nonnegative_int count_text, strict_nonnegative_int end_text,
+                          parse_path_text path_text', parse_int_list_text focus_text,
+                          strict_nonnegative_int history_text) of
+                        (SOME step_count, SOME prefix_end, SOME path, SOME focus, SOME history_count) =>
                           let
                             val leaf_signature =
                               case metadata_value "leaf_signature" lines of
                                   SOME text => parse_step_signature_text text
                                 | NONE => NONE
                           in
-                            if version = "3" andalso step_count > 0 andalso not (Option.isSome leaf_signature) then NONE
+                            if step_count > 0 andalso
+                               (not (Option.isSome leaf_signature) orelse
+                                not (Option.isSome prefix_signature) orelse
+                                List.exists (fn ({prefix_signature, ...} : leaf_snapshot) =>
+                                               not (Option.isSome prefix_signature)) leaves) then NONE
                             else SOME {step_count = step_count, prefix_end = prefix_end, path = path, focus = focus,
-                                       leaf_signature = leaf_signature, events = events, frames = frames,
-                                       leaves = if version = "3" then leaves else []}
+                                       leaf_signature = leaf_signature, prefix_signature = prefix_signature,
+                                       history_count = history_count,
+                                       events = events, frames = frames, leaves = leaves}
                           end
                       | _ => NONE)
                | _ => NONE)
@@ -1543,13 +1582,15 @@ fun parse_failed_prefix_metadata text =
 
 fun validate_failed_prefix_metadata plan (metadata : {step_count : int, prefix_end : int, path : HolbuildProofIr.proof_path,
                                                focus : int list, leaf_signature : (string * string) option,
+                                               prefix_signature : string option, history_count : int,
                                                events : HolbuildProofIr.dynamic_event list,
                                                frames : structural_frame list,
                                                leaves : leaf_snapshot list}) =
   let
     val path = #path metadata
-    val _ = if #step_count metadata >= 0 andalso #prefix_end metadata >= 0 then ()
-            else raise Fail "invalid proof-ir failed-prefix metadata: negative step_count or prefix_end"
+    val _ = if #step_count metadata >= 0 andalso #prefix_end metadata >= 0 andalso
+               #history_count metadata >= 0 then ()
+            else raise Fail "invalid proof-ir failed-prefix metadata: negative step_count, prefix_end, or history_count"
     val _ = if #step_count metadata <> 0 orelse
                (path = [] andalso #focus metadata = [] andalso #frames metadata = [] andalso #events metadata = []) then ()
             else raise Fail "invalid proof-ir failed-prefix metadata: nonempty zero-step state"
@@ -1566,6 +1607,15 @@ fun validate_failed_prefix_metadata plan (metadata : {step_count : int, prefix_e
                 val _ = if HolbuildProofIr.step_end step = #prefix_end metadata then ()
                         else raise Fail "invalid proof-ir failed-prefix metadata: leaf source end changed"
                 val current_signature = (HolbuildProofIr.step_kind step, HolbuildProofIr.step_program step)
+                val current_prefix_signature =
+                  Option.map HolbuildStringHash.string_sha1
+                    (HolbuildProofIr.canonical_dependency_prefix plan path)
+                val _ =
+                  case (#prefix_signature metadata, current_prefix_signature) of
+                      (SOME saved, SOME current) =>
+                        if saved = current then ()
+                        else raise Fail "invalid proof-ir failed-prefix metadata: execution prefix changed"
+                    | _ => raise Fail "invalid proof-ir failed-prefix metadata: missing execution prefix signature"
               in
                 case #leaf_signature metadata of
                     SOME saved_signature =>
@@ -1574,6 +1624,36 @@ fun validate_failed_prefix_metadata plan (metadata : {step_count : int, prefix_e
                   | NONE => ()
               end
           | NONE => raise Fail "failed-prefix proof path is not present in current proof-ir plan"
+    fun validate_endpoint_snapshot () =
+      case rev (#leaves metadata) of
+          [] => raise Fail "invalid proof-ir failed-prefix metadata: missing endpoint leaf snapshot"
+        | ({count, prefix_end, path = leaf_path, focus, frames, events, sig_text,
+            prefix_signature, history_count} : leaf_snapshot) :: _ =>
+            if count = #step_count metadata andalso
+               prefix_end = #prefix_end metadata andalso
+               leaf_path = #path metadata andalso
+               focus = #focus metadata andalso
+               frames = #frames metadata andalso
+               events = #events metadata andalso
+               SOME sig_text = #leaf_signature metadata andalso
+               prefix_signature = #prefix_signature metadata andalso
+               history_count = #history_count metadata then ()
+            else raise Fail "invalid proof-ir failed-prefix metadata: endpoint snapshot mismatch"
+    fun validate_history_counts expected [] =
+          if expected = #step_count metadata + 1 then ()
+          else raise Fail "invalid proof-ir failed-prefix metadata: leaf snapshot count mismatch"
+      | validate_history_counts expected (({count, history_count, ...} : leaf_snapshot) :: rest) =
+          if count <> expected orelse history_count <= 0 then
+            raise Fail "invalid proof-ir failed-prefix metadata: invalid leaf history count"
+          else
+            (case rest of
+                 ({history_count = next, ...} : leaf_snapshot) :: _ =>
+                   if history_count <= next then validate_history_counts (expected + 1) rest
+                   else raise Fail "invalid proof-ir failed-prefix metadata: decreasing leaf history count"
+               | [] =>
+                   if history_count = #history_count metadata then
+                     validate_history_counts (expected + 1) rest
+                   else raise Fail "invalid proof-ir failed-prefix metadata: endpoint history count mismatch")
     fun validate_focus [] = ()
       | validate_focus (n :: rest) =
           if n >= 0 then validate_focus rest
@@ -1621,6 +1701,12 @@ fun validate_failed_prefix_metadata plan (metadata : {step_count : int, prefix_e
             else raise Fail "invalid proof-ir failed-prefix metadata: inconsistent frame stack order"
           end
   in
+    if #step_count metadata = 0 then
+      (if #history_count metadata = 0 andalso null (#leaves metadata) then ()
+       else raise Fail "invalid proof-ir failed-prefix metadata: nonempty zero-step history")
+    else
+      (validate_endpoint_snapshot ();
+       validate_history_counts 1 (#leaves metadata));
     validate_focus (#focus metadata);
     List.app validate_frame (#frames metadata);
     validate_frame_order (#frames metadata);
@@ -1635,14 +1721,20 @@ fun salvage_failed_prefix_metadata plan metadata =
   let
     fun current_signature path =
       case step_at_path plan path of
-          SOME step => SOME (HolbuildProofIr.step_kind step, HolbuildProofIr.step_program step,
-                             HolbuildProofIr.step_end step)
+          SOME step =>
+            Option.map
+              (fn prefix_signature =>
+                 (HolbuildProofIr.step_kind step, HolbuildProofIr.step_program step,
+                  HolbuildProofIr.step_end step, HolbuildStringHash.string_sha1 prefix_signature))
+              (HolbuildProofIr.canonical_dependency_prefix plan path)
         | NONE => NONE
-    fun valid_leaf ({count, prefix_end, path, sig_text, ...} : leaf_snapshot) expected_count =
+    fun valid_leaf ({count, prefix_end, path, sig_text, prefix_signature, ...} : leaf_snapshot) expected_count =
       count = expected_count andalso
-      (case current_signature path of
-           SOME (kind, program, current_end) => prefix_end = current_end andalso sig_text = (kind, program)
-         | NONE => false)
+      (case (current_signature path, prefix_signature) of
+           (SOME (kind, program, current_end, current_prefix_signature), SOME saved_prefix_signature) =>
+             prefix_end = current_end andalso sig_text = (kind, program) andalso
+             saved_prefix_signature = current_prefix_signature
+         | _ => false)
     fun loop _ [] last = last
       | loop expected (leaf :: rest) last =
           if valid_leaf leaf expected then loop (expected + 1) rest (SOME leaf)
@@ -1651,14 +1743,18 @@ fun salvage_failed_prefix_metadata plan metadata =
   in
     case loop 1 leaves NONE of
         NONE => {step_count = 0, prefix_end = 0, path = [], focus = [], leaf_signature = NONE,
-                 events = [], frames = [], leaves = leaves}
-      | SOME ({count, path, focus, frames, events, sig_text, ...} : leaf_snapshot) =>
+                 prefix_signature = NONE, history_count = 0,
+                 events = [], frames = [], leaves = []}
+      | SOME ({count, path, focus, frames, events, sig_text, prefix_signature, history_count, ...} : leaf_snapshot) =>
           (case current_signature path of
-               SOME (_, _, current_end) =>
+               SOME (_, _, current_end, _) =>
                  {step_count = count, prefix_end = current_end, path = path, focus = focus,
-                  leaf_signature = SOME sig_text, events = events, frames = frames, leaves = leaves}
+                  leaf_signature = SOME sig_text, prefix_signature = prefix_signature,
+                  history_count = history_count,
+                  events = events, frames = frames, leaves = take_at_most count leaves}
              | NONE => {step_count = 0, prefix_end = 0, path = [], focus = [], leaf_signature = NONE,
-                         events = [], frames = [], leaves = leaves})
+                         prefix_signature = NONE, history_count = 0,
+                         events = [], frames = [], leaves = []})
   end
 
 fun resumable_failed_prefix_metadata plan metadata =
@@ -1686,16 +1782,25 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
             case parse_failed_prefix_metadata metadata_text of
                 SOME m => m
               | NONE => raise Fail "invalid proof-ir failed-prefix metadata"
-          val _ = ensure_history_limit (Int.max(HolbuildProofIr.display_step_count plan + 1, #step_count metadata + 1))
+          val _ = ensure_history_limit (Int.max(HolbuildProofIr.display_step_count plan + 1,
+                                                  #history_count metadata + 1))
+          val _ =
+            if !history_step_count_ref = #history_count metadata then ()
+            else raise Fail (String.concat ["failed-prefix checkpoint history does not match metadata: heap=",
+                                            Int.toString (!history_step_count_ref),
+                                            " metadata=", Int.toString (#history_count metadata)])
           val resume_metadata = resumable_failed_prefix_metadata plan metadata
-          val backup_count = Int.max(0, #step_count metadata - #step_count resume_metadata)
+          val backup_count = #history_count metadata - #history_count resume_metadata
+          val _ =
+            if backup_count >= 0 then ()
+            else raise Fail "invalid proof-ir failed-prefix metadata: salvage history exceeds checkpoint history"
           val _ =
             (backup_n backup_count
              handle History.CANT_BACKUP_ANYMORE =>
                raise Fail (String.concat ["failed-prefix checkpoint cannot rewind ",
                                           Int.toString backup_count,
-                                          " proof IR steps; checkpoint history retained fewer steps than its metadata step_count=",
-                                          Int.toString (#step_count metadata)]))
+                                          " proof history steps; checkpoint history retained fewer steps than its metadata history_count=",
+                                          Int.toString (#history_count metadata)]))
           val _ = trace_plan name plan
           val _ = stop_after_plan_if_requested ()
           val metadata = resume_metadata

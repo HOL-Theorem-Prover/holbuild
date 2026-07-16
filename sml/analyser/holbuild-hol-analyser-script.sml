@@ -55,6 +55,7 @@ use_hol("tools/Holmake/deps/Holdep.sml");
 
 use_hol("src/portableML/poly/SHA1_ML.sig");
 use_hol("src/portableML/poly/w64-SHA1.ML");
+use_root "sml/string_hash.sml";
 use_root "vendor/sml-sha256/lib/from-string.sig";
 use_root "vendor/sml-sha256/lib/from-string.sml";
 use_root "vendor/sml-sha256/lib/bytestring.sig";
