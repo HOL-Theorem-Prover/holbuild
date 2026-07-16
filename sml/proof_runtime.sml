@@ -494,7 +494,7 @@ fun save_failed_prefix_checkpoint () =
               (case !proof_history_ref of
                    NONE => ()
                  | SOME history =>
-                     proof_history_ref := SOME (History.set_limit history (Int.max(15, step_count + 1))))
+                     proof_history_ref := SOME (History.set_limit history (Int.max(15, !history_step_count_ref + 1))))
             val _ = save_checkpoint "failed_prefix" false failed_prefix_path failed_prefix_ok depth
             val _ = write_text_file (failed_prefix_path ^ ".meta") meta_text
             val _ = write_text_file (failed_prefix_path ^ ".prefix") (String.substring(!active_tactic_text_ref, 0, prefix_end))
@@ -610,15 +610,25 @@ fun apply_history f =
   Lib.with_flag (goalStack.chatting, false)
     (fn () => History.apply f (current_history())) ()
 
+fun ensure_history_limit limit =
+  set_history (History.set_limit (current_history()) (Int.max(15, limit)))
+
+fun prepare_history_append () =
+  ensure_history_limit (!history_step_count_ref + 2)
+
 fun append_history f =
-  (set_history (apply_history f);
+  (prepare_history_append ();
+   set_history (apply_history f);
    history_step_count_ref := !history_step_count_ref + 1)
 
 fun append_history_with_timeout label f =
-  let val new_history = with_tactic_timeout label apply_history f
-  in set_history new_history; history_step_count_ref := !history_step_count_ref + 1 end
-
-fun ensure_history_limit limit = set_history (History.set_limit (current_history()) (Int.max(15, limit)))
+  let
+    val _ = prepare_history_append ()
+    val new_history = with_tactic_timeout label apply_history f
+  in
+    set_history new_history;
+    history_step_count_ref := !history_step_count_ref + 1
+  end
 
 fun history_top_goals () = project_history goalStack.top_goals
 
@@ -1772,7 +1782,8 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
             case parse_failed_prefix_metadata metadata_text of
                 SOME m => m
               | NONE => raise Fail "invalid proof-ir failed-prefix metadata"
-          val _ = ensure_history_limit (Int.max(HolbuildProofIr.display_step_count plan + 1, #step_count metadata + 1))
+          val _ = ensure_history_limit (Int.max(HolbuildProofIr.display_step_count plan + 1,
+                                                  #history_count metadata + 1))
           val _ =
             if !history_step_count_ref = #history_count metadata then ()
             else raise Fail (String.concat ["failed-prefix checkpoint history does not match metadata: heap=",
