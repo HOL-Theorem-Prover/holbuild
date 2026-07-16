@@ -1441,9 +1441,11 @@ fun proof_ir_prove name end_path end_ok checkpoint_depth g original_tac tactic_t
     let
             val _ = init_history g (HolbuildProofIr.display_step_count plan + 1)
             val _ = run_steps plan
-                     handle e => (if !failed_goal_state_printed_ref then () else ignore (print_finish_goal_state name); raise e)
+                     handle e =>
+                       if !failed_goal_state_printed_ref then raise e
+                       else report_finish_failure name e
             val th = history_top_thm g
-                     handle e => (ignore (print_finish_goal_state name); raise e)
+                     handle e => report_finish_failure name e
             val _ = save_checkpoint "end_of_proof" false end_path end_ok checkpoint_depth
             val _ = drop_all()
           in th end
