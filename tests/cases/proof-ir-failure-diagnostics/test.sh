@@ -208,9 +208,9 @@ end = "holbuild end failed tactic top input goal"
 if start not in text or end not in text.split(start, 1)[1]:
     raise SystemExit("missing failed top-goal markers in exhausted-choice log")
 goal = text.split(start, 1)[1].split(end, 1)[0].strip()
-if goal != "T":
+if "T ⇒ T" in goal or "0.  T" not in goal or not goal.endswith("T"):
     raise SystemExit(
-        "exhausted choice reported its restored pre-choice goal instead of "
-        f"the final alternative's input goal:\n{goal}\n"
+        "exhausted choice did not report the final alternative's assumption-bearing input goal:\n"
+        f"{goal}\n"
     )
 PY
