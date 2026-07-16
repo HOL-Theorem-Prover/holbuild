@@ -200,10 +200,10 @@ fun canonical_dependency_prefix plan target =
       case path of
           PathStep i :: rest =>
             (case split_nth i steps of
-                 SOME (before, step, _) =>
+                 SOME (prior, step, _) =>
                    Option.map
                      (fn current => canonical_node "plan-prefix"
-                                      [canonical_full_plan before, current])
+                                      [canonical_full_plan prior, current])
                      (step_prefix step rest)
                | NONE => NONE)
         | _ => NONE
@@ -229,11 +229,11 @@ fun canonical_dependency_prefix plan target =
             if n <= 0 then NONE
             else
               (case split_nth (n - 1) cases of
-                   SOME (before, body, _) =>
+                   SOME (prior, body, _) =>
                      Option.map
                        (fn child => canonical_node "cases-prefix"
                                       [Int.toString (length cases),
-                                       canonical_node "completed-cases" (map canonical_full_plan before),
+                                       canonical_node "completed-cases" (map canonical_full_plan prior),
                                        child])
                        (plan_prefix body rest)
                  | NONE => NONE)
@@ -241,11 +241,11 @@ fun canonical_dependency_prefix plan target =
             if n <= 0 then NONE
             else
               (case split_nth (n - 1) alternatives of
-                   SOME (before, body, _) =>
+                   SOME (prior, body, _) =>
                      Option.map
                        (fn child => canonical_node "choice-prefix"
                                       [Int.toString (length alternatives),
-                                       canonical_node "attempted-alternatives" (map canonical_full_plan before),
+                                       canonical_node "attempted-alternatives" (map canonical_full_plan prior),
                                        child])
                        (plan_prefix body rest)
                  | NONE => NONE)
