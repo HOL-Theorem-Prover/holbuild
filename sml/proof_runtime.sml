@@ -1406,10 +1406,6 @@ fun run_steps steps =
 
 datatype 'a traced_result = TraceOk of 'a | TraceError of exn
 
-fun run_whole_tactic g label tac =
-  with_tactic_timeout label (fn () => Tactical.TAC_PROOF(g, tac)) ()
-  handle e => (init_history g 15; print_goal_state label; clear_history (); raise e)
-
 fun backup_n 0 = ()
   | backup_n n = (set_history (History.undo (current_history())); backup_n (n - 1))
 
