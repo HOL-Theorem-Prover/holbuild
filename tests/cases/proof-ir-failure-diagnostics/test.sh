@@ -157,3 +157,60 @@ require_grep "holbuild failed tactic input goal count:" "$each_instrumented_log"
 require_grep "holbuild failed tactic top input goal:" "$each_instrumented_log"
 require_grep "focus tail count exceeds open goals:" "$each_instrumented_log"
 require_grep "tail count 99, open goals 2" "$each_instrumented_log"
+
+# When every alternative of a proof-IR choice fails, report the final
+# alternative's leaf and its intermediate input goal.  Restoring the choice's
+# initial runtime state must not reduce the diagnostic to the outer ORELSE and
+# its pre-choice goal.
+choice_project=$tmpdir/choice-project
+mkdir -p "$choice_project/src"
+write_manifest "$choice_project" "proof-ir-choice-failure-diagnostics"
+cat > "$choice_project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+
+Theorem exhausted_choice_diagnostic:
+  T ==> T
+Proof
+  FAIL_TAC "first choice failure"
+  ORELSE (DISCH_TAC >> FAIL_TAC "final choice failure")
+QED
+
+val _ = export_theory();
+SML
+
+choice_log=$tmpdir/choice.log
+if (cd "$choice_project" && "$HOLBUILD_BIN" build ATheory) >"$choice_log" 2>&1; then
+  echo "expected exhausted proof-IR choice to fail" >&2
+  exit 1
+fi
+require_grep "theorem: exhausted_choice_diagnostic" "$choice_log"
+require_grep 'fragment: FAIL_TAC "final choice failure"' "$choice_log"
+require_grep 'plan position:.*step FAIL_TAC "final choice failure"' "$choice_log"
+require_grep "failed tactic input goals: 1" "$choice_log"
+require_grep "final choice failure" "$choice_log"
+
+choice_instrumented_log=$(awk -F'instrumented log: ' '/instrumented log: / {print $2}' "$choice_log" | tail -n 1)
+require_file "$choice_instrumented_log"
+require_grep "holbuild failed theorem: exhausted_choice_diagnostic" "$choice_instrumented_log"
+require_grep 'holbuild goal state at failed fragment: FAIL_TAC "final choice failure"' "$choice_instrumented_log"
+require_grep 'holbuild plan position:.*step FAIL_TAC "final choice failure"' "$choice_instrumented_log"
+require_grep "holbuild failed tactic input goal count: 1" "$choice_instrumented_log"
+require_grep "final choice failure" "$choice_instrumented_log"
+
+python3 - "$choice_instrumented_log" <<'PY'
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text()
+start = "holbuild failed tactic top input goal:\n"
+end = "holbuild end failed tactic top input goal"
+if start not in text or end not in text.split(start, 1)[1]:
+    raise SystemExit("missing failed top-goal markers in exhausted-choice log")
+goal = text.split(start, 1)[1].split(end, 1)[0].strip()
+if goal != "T":
+    raise SystemExit(
+        "exhausted choice reported its restored pre-choice goal instead of "
+        f"the final alternative's input goal:\n{goal}\n"
+    )
+PY
