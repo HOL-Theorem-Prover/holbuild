@@ -91,7 +91,7 @@ fun resolve {project, resolution} : t =
       SOME graph => graph
     | NONE =>
   let
-    val before = HolbuildPackageDefinition.manifest_parse_count ()
+    val parse_count_before = HolbuildPackageDefinition.manifest_parse_count ()
     val packages = resolve_package_closure resolution project
     val _ = validate_unique packages
     val root_package = HolbuildProject.project_package project
@@ -110,7 +110,7 @@ fun resolve {project, resolution} : t =
     val graph = {root = root, hol = hol, packages = packages, edges = edges}
     val _ = HolbuildProject.store_graph_with resolution project graph
     val _ = append_parse_count
-              (HolbuildPackageDefinition.manifest_parse_count () - before)
+              (HolbuildPackageDefinition.manifest_parse_count () - parse_count_before)
   in
     graph
   end
