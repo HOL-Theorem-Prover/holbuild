@@ -99,7 +99,11 @@ To inspect how the project is resolved, run:
 
 ```sh
 holbuild context
+holbuild context --trknl  # inspect the tracing-kernel context
 ```
+
+`context` resolves metadata for the selected kernel variant without building the
+HOL toolchain.
 
 ## How HOL is selected
 
@@ -194,6 +198,7 @@ holbuild --help
 holbuild repl
 holbuild run script.sml
 holbuild context
+holbuild context --trknl
 holbuild execution-plan MyTheory:my_theorem
 holbuild buildhol
 holbuild buildhol --trknl

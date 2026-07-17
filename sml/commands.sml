@@ -23,7 +23,7 @@ fun global_help () = print
   \Project interaction:\n\
   \  repl [ARG ...]              Start HOL REPL with project context\n\
   \  run [ARG ...]               Run HOL with project context\n\
-  \  context                     Show resolved project context\n\n\
+  \  context [--trknl]          Show resolved project context\n\n\
   \Inspection and advanced commands:\n\
   \  execution-plan T:THM        Inspect proof-step execution plan\n\
   \  buildhol                    Build/reuse declared HOL and print its path\n\
@@ -66,8 +66,9 @@ fun build_help () = print
 
 fun context_help () = print
   "Usage:\n\
-  \  holbuild [GLOBAL OPTIONS] context\n\n\
-  \Show resolved project context.\n\n\
+  \  holbuild [GLOBAL OPTIONS] context [--trknl]\n\n\
+  \Show resolved project context. Use --trknl to select the tracing-kernel\n\
+  \context. This command resolves metadata but does not build the toolchain.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun repl_help () = print
@@ -665,13 +666,19 @@ fun load_project () =
   apply_project_local_remote_cache_config (HolbuildProject.discover ())
   handle HolbuildProject.Error msg => raise Error msg
 
-fun context () =
+fun context (tc : HolbuildToolchain.t) args =
   let
+    val _ =
+      case args of
+          [] => ()
+        | ["--trknl"] => ()
+        | _ => raise Error "usage: holbuild context [--trknl]"
     val project = load_project ()
+    val resolution = {kernel_variant = #kernel_variant tc}
     val _ = HolbuildProjectGraph.resolve
-              {project = project, resolution = HolbuildProject.standard_resolution}
+              {project = project, resolution = resolution}
   in
-    HolbuildProject.describe project
+    HolbuildProject.describe_with resolution project
   end
 
 fun timed_phase name f = HolbuildToolchain.time_phase name f
@@ -1316,7 +1323,7 @@ fun reject_json command =
 fun dispatch tc jobs args =
   case args of
       [] => build tc jobs []
-    | "context" :: [] => (reject_json "context"; context ())
+    | "context" :: rest => (reject_json "context"; context tc rest)
     | "execution-plan" :: rest => (reject_json "execution-plan"; execution_plan_command tc rest)
     | "goalfrag-plan" :: rest => removed_legacy_plan_command tc rest
     | "build" :: rest => build tc jobs rest
@@ -1407,14 +1414,19 @@ fun effective_toolchain holdir maxheap =
 fun tracing_toolchain holdir maxheap =
   effective_toolchain_for HolbuildHolToolchainConfig.TracingKernel holdir maxheap
 
-fun context_toolchain holdir maxheap =
+fun context_toolchain_for kernel_variant holdir maxheap =
   let
-    val project = load_project ()
+    val _ = load_project ()
     val _ = reject_holdir holdir
   in
-    {holdir = "", maxheap = maxheap,
-     kernel_variant = HolbuildHolToolchainConfig.StandardKernel}
+    {holdir = "", maxheap = maxheap, kernel_variant = kernel_variant}
   end
+
+fun parse_context_args args =
+  case args of
+      [] => HolbuildHolToolchainConfig.StandardKernel
+    | ["--trknl"] => HolbuildHolToolchainConfig.TracingKernel
+    | _ => raise Error "usage: holbuild context [--trknl]"
 
 fun parse_buildhol_args args =
   case args of
@@ -1464,7 +1476,8 @@ fun dispatch_with_options {holdir, source_dir, cache_dir, remote_cache, jobs, ma
          else if List.exists (fn arg => arg = "--trknl") rest then
            dispatch (tracing_toolchain holdir maxheap) jobs args
          else dispatch (effective_toolchain holdir maxheap) jobs args
-     | "context" :: _ => dispatch (context_toolchain holdir maxheap) jobs args
+     | "context" :: rest =>
+         dispatch (context_toolchain_for (parse_context_args rest) holdir maxheap) jobs args
      | _ =>
          if List.exists (fn arg => arg = "--trknl") args then
            dispatch (tracing_toolchain holdir maxheap) jobs args

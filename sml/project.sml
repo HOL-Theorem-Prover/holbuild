@@ -629,12 +629,14 @@ fun same_dependency_source (GitSource a, GitSource b) = #git a = #git b andalso 
       #from a = #from b andalso #path a = #path b andalso #manifest a = #manifest b
   | same_dependency_source _ = false
 
-fun packages project =
-  case cached_graph_with standard_resolution project of
+fun packages_with resolution project =
+  case cached_graph_with resolution project of
       SOME {packages, ...} => packages
     | NONE => die "project package graph has not been resolved"
 
-fun describe (project : t) =
+fun packages project = packages_with standard_resolution project
+
+fun describe_with resolution (project : t) =
   let
     val {root, artifact_root, manifest, name, version, members, excludes, exclude_globs, roots, root_groups, groups, root_tactic_timeouts, dependencies,
          overrides, local_build_excludes, local_build_exclude_globs, local_build_jobs, build_tactic_timeout, run_heap, run_loads, heaps, action_policies, generators, ...} = project
@@ -700,7 +702,7 @@ fun describe (project : t) =
                 print ("root tactic_timeout: " ^ root ^ " = " ^
                        (case timeout of NONE => "none" | SOME t => Real.toString t) ^ "\n"))
              root_tactic_timeouts;
-    List.app describe_package (packages project);
+    List.app describe_package (packages_with resolution project);
     List.app (fn dep => print ("dependency: " ^ dependency_to_string project dep ^ "\n")) dependencies;
     List.app (fn override => print ("override: " ^ override_to_string override ^ "\n")) overrides;
     Option.app (fn jobs => print ("local build.jobs: " ^ Int.toString jobs ^ "\n")) local_build_jobs;
@@ -711,5 +713,7 @@ fun describe (project : t) =
     List.app (fn generator => print ("generate: " ^ generator_name generator ^ "\n")) generators;
     List.app (fn policy => print ("action: " ^ action_policy_logical policy ^ "\n")) action_policies
   end
+
+fun describe project = describe_with standard_resolution project
 
 end
