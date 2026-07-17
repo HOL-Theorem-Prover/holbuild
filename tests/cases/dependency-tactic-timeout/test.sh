@@ -71,13 +71,29 @@ val _ = export_theory();
 SML
 
 build_log=$tmpdir/build.log
-(cd "$project" && "$HOLBUILD_BIN" build --tactic-timeout 0.1 BTheory) > "$build_log" 2>&1
+(cd "$project" && "$HOLBUILD_BIN" build --no-cache --trace-steps --tactic-timeout 0.1 BTheory) > "$build_log" 2>&1
 require_file "$project/.holbuild/packages/dep/obj/src/ATheory.dat"
 require_file "$project/.holbuild/obj/src/BTheory.dat"
 if grep -q "tactic timed out while building ATheory" "$build_log"; then
   echo "dependency package used root tactic timeout" >&2
   exit 1
 fi
+if find "$project/.holbuild/checkpoints/dep" -type f -print -quit 2>/dev/null | grep -q .; then
+  echo "dependency package created checkpoint artifacts" >&2
+  find "$project/.holbuild/checkpoints/dep" -type f -print >&2
+  exit 1
+fi
+if ! find "$project/.holbuild/checkpoints/consumer" -type f -name '*.save' -print -quit 2>/dev/null | grep -q .; then
+  echo "root package did not retain its requested checkpoints" >&2
+  exit 1
+fi
+if [[ -e "$project/.holbuild/logs/current/dep/ATheory/proof-trace.log" ]]; then
+  echo "dependency package enabled proof-step tracing" >&2
+  exit 1
+fi
+root_trace="$project/.holbuild/logs/current/consumer/BTheory/proof-trace.log"
+require_file "$root_trace"
+require_grep "holbuild proof-ir plan theorem=root_fast_thm steps=" "$root_trace"
 
 passing_build_log=$tmpdir/passing-build.log
 (cd "$project" && "$HOLBUILD_BIN" build --tactic-timeout 1.0 BTheory) > "$passing_build_log" 2>&1

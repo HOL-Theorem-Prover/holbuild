@@ -99,7 +99,11 @@ To inspect how the project is resolved, run:
 
 ```sh
 holbuild context
+holbuild context --trknl  # inspect the tracing-kernel context
 ```
+
+`context` resolves metadata for the selected kernel variant without building the
+HOL toolchain.
 
 ## How HOL is selected
 
@@ -194,6 +198,7 @@ holbuild --help
 holbuild repl
 holbuild run script.sml
 holbuild context
+holbuild context --trknl
 holbuild execution-plan MyTheory:my_theorem
 holbuild buildhol
 holbuild buildhol --trknl
@@ -475,9 +480,11 @@ and executable objects may also include signature targets. `holbuild run` and
 
 ## Proof steps and checkpoints
 
-By default, `holbuild` instruments modern theorem proofs and executes them as
-proof steps. This gives better failure locations, per-step tactic timeouts,
-failed-prefix checkpoints, and optional traces.
+By default, `holbuild` instruments modern theorem proofs in the root package and
+executes them as proof steps. This gives better failure locations, per-step
+tactic timeouts, failed-prefix checkpoints, and optional traces. Theories in
+dependency packages build without proof-step instrumentation or checkpoints;
+to debug a dependency's proofs, build that package as the root project.
 
 Useful commands and options:
 
