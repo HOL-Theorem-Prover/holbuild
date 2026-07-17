@@ -3375,15 +3375,25 @@ fun effective_tactic_timeout proof_steps node_timeout =
   if proof_steps then node_timeout else NONE
 
 fun checkpoint_policy_for_node ({skip_checkpoints, proof_steps, new_ir, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure, trknl, ...} : build_options) project node =
-  CheckpointPolicy {checkpoint = not skip_checkpoints,
-                    proof_steps = proof_steps,
-                    new_ir = new_ir,
-                    tactic_timeout = effective_tactic_timeout proof_steps
-                                      (assoc_timeout (HolbuildBuildPlan.key node) node_tactic_timeouts),
-                    execution_plan = if proof_steps then execution_plan else NONE,
-                    trace_steps = proof_steps andalso trace_steps,
-                    repl_on_failure = repl_on_failure,
-                    trknl = trknl}
+  if root_package_node project node then
+    CheckpointPolicy {checkpoint = not skip_checkpoints,
+                      proof_steps = proof_steps,
+                      new_ir = new_ir,
+                      tactic_timeout = effective_tactic_timeout proof_steps
+                                        (assoc_timeout (HolbuildBuildPlan.key node) node_tactic_timeouts),
+                      execution_plan = if proof_steps then execution_plan else NONE,
+                      trace_steps = proof_steps andalso trace_steps,
+                      repl_on_failure = repl_on_failure,
+                      trknl = trknl}
+  else
+    CheckpointPolicy {checkpoint = false,
+                      proof_steps = false,
+                      new_ir = false,
+                      tactic_timeout = NONE,
+                      execution_plan = NONE,
+                      trace_steps = false,
+                      repl_on_failure = false,
+                      trknl = trknl}
 
 fun proof_engine (CheckpointPolicy {proof_steps = false, ...}) = "plain_v1"
   | proof_engine (CheckpointPolicy {new_ir = true, ...}) = "proof_ir_v3"

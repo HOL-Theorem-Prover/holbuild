@@ -731,8 +731,16 @@ nearest valid theorem-context checkpoint and replay only the suffix to
 successor-ready contexts, and are not used for dependency replay.
 
 Proof instrumentation is separable from PolyML checkpoint creation and
-retention. By default, holbuild may create several local checkpoint classes while
-executing a theory action: `deps_loaded` after loading resolved dependencies,
+retention. The command's requested proof-debugging policy applies to root-package
+nodes. Dependency-package nodes instead use plain proof execution with checkpoint
+creation, proof steps, tactic timeouts, execution-plan targeting, step tracing,
+and failure REPL disabled; developers who need those facilities build the
+dependency as the root project. Kernel selection remains a toolchain property and
+is unchanged for dependency nodes. This effective per-node execution policy does
+not enter final theory action keys.
+
+For instrumented root-package actions, holbuild may create several local
+checkpoint classes while executing a theory action: `deps_loaded` after loading resolved dependencies,
 theorem context/end-of-proof states for modern AST `Theorem ... Proof ... QED`
 declarations, failed-prefix proof-navigation state after instrumented proof
 failures, and a final post-export context. Successful builds remove stale

@@ -480,9 +480,11 @@ and executable objects may also include signature targets. `holbuild run` and
 
 ## Proof steps and checkpoints
 
-By default, `holbuild` instruments modern theorem proofs and executes them as
-proof steps. This gives better failure locations, per-step tactic timeouts,
-failed-prefix checkpoints, and optional traces.
+By default, `holbuild` instruments modern theorem proofs in the root package and
+executes them as proof steps. This gives better failure locations, per-step
+tactic timeouts, failed-prefix checkpoints, and optional traces. Theories in
+dependency packages build without proof-step instrumentation or checkpoints;
+to debug a dependency's proofs, build that package as the root project.
 
 Useful commands and options:
 
