@@ -44,13 +44,9 @@ fun write_file path text =
   let val out = TextIO.openOut path
   in TextIO.output(out, text); TextIO.closeOut out end
 
-fun command_output command =
+fun command_output run_command command =
   let
-    val tmp = FS.tmpName ()
-    val status = OS.Process.system (command ^ " > " ^ quote tmp ^ " 2>&1")
-    val input = TextIO.openIn tmp
-    val text = TextIO.inputAll input before TextIO.closeIn input
-    val _ = FS.remove tmp handle OS.SysErr _ => ()
+    val {status, output = text} = run_command (command ^ " 2>&1")
   in
     if OS.Process.isSuccess status then text
     else die ("command failed: " ^ command ^ "\n" ^ text)
@@ -167,14 +163,14 @@ fun member_dir_from_target holdir target =
       NONE => NONE
     | SOME rel => if source_target rel then SOME (#dir (Path.splitDirFile rel)) else NONE
 
-fun holmake_source_dirs holdir roots =
+fun holmake_source_dirs run_command holdir roots =
   if null roots then []
   else
     let
       val holmake = Path.concat(Path.concat(holdir, "bin"), "Holmake")
       val command = String.concatWith " "
         (map quote (holmake :: "--no-project" :: "--dirs" :: "--json" :: roots))
-      val text = command_output ("cd " ^ quote holdir ^ " && " ^ command)
+      val text = command_output run_command ("cd " ^ quote holdir ^ " && " ^ command)
       (* Temporary workaround for https://github.com/HOL-Theorem-Prover/HOL/issues/2021:
          Holmake --json can emit invalid JSON because command strings are not escaped.
          We only need target fields, so scan those lines directly until holbuild can
@@ -190,11 +186,12 @@ fun holmake_source_dirs holdir roots =
       rev (List.foldl add_line roots (split_lines text))
     end
 
-fun members holdir = holmake_source_dirs holdir (post_toolchain_roots holdir)
+fun members run_command holdir =
+  holmake_source_dirs run_command holdir (post_toolchain_roots holdir)
 
-fun generate {holdir, manifest_path, members_path} =
+fun generate {holdir, manifest_path, members_path, run_command} =
   let
-    val members = members holdir
+    val members = members run_command holdir
     val member_text = String.concatWith "\n" members ^ (if null members then "" else "\n")
     val manifest = HolbuildBuiltinManifests.manifest_text members
   in
