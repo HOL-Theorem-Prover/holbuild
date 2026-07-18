@@ -60,6 +60,7 @@ use "sml/cache_backend.sml";
 use "sml/fs_cache_backend.sml";
 use "sml/cache_transfer.sml";
 use "sml/remote_cache.sml";
+use "sml/tar_archive.sml";
 use "sml/cache_archive.sml";
 use "sml/toolchain_archive.sml";
 use "sml/hol_shared_cache.sml";
