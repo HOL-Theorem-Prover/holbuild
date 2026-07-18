@@ -78,30 +78,83 @@ fun all_zero bytes =
     loop 0
   end
 
-fun field_string bytes start length =
-  let
-    val stop = start + length
-    fun finish i =
-      if i >= stop orelse byte_at bytes i = 0 then i else finish (i + 1)
-    val finish_at = finish start
-  in
-    String.implode
-      (List.tabulate(finish_at - start, fn i => Char.chr (byte_at bytes (start + i))))
-  end
+datatype field_grammar =
+    NulPaddedText
+  | TarOctal
+
+datatype decoded_field =
+    TextField of string
+  | NumericField of IntInf.int
+
+datatype octal_state =
+    LeadingPadding
+  | OctalDigits
+  | TrailingPadding
+
+fun raw_field bytes start length =
+  String.implode
+    (List.tabulate(length, fn i => Char.chr (byte_at bytes (start + i))))
+
+fun decode_strict_field label NulPaddedText raw =
+      let
+        val length = size raw
+        fun loop i terminated chars =
+          if i >= length then TextField (String.implode (rev chars))
+          else
+            let val c = String.sub(raw, i)
+            in
+              if c = #"\000" then loop (i + 1) true chars
+              else if terminated then die ("invalid " ^ label ^ " field")
+              else loop (i + 1) false (c :: chars)
+            end
+      in
+        loop 0 false []
+      end
+  | decode_strict_field label TarOctal raw =
+      let
+        val length = size raw
+        fun digit c = Char.ord c - Char.ord #"0"
+        fun invalid () = die ("invalid " ^ label ^ " field")
+        fun loop i state value =
+          if i >= length then NumericField value
+          else
+            let val c = String.sub(raw, i)
+            in
+              case state of
+                  LeadingPadding =>
+                    if c = #" " then loop (i + 1) LeadingPadding value
+                    else if #"0" <= c andalso c <= #"7" then
+                      loop (i + 1) OctalDigits (IntInf.fromInt (digit c))
+                    else if c = #"\000" then loop (i + 1) TrailingPadding value
+                    else invalid ()
+                | OctalDigits =>
+                    if #"0" <= c andalso c <= #"7" then
+                      loop (i + 1) OctalDigits
+                        (value * 8 + IntInf.fromInt (digit c))
+                    else if c = #"\000" orelse c = #" " then
+                      loop (i + 1) TrailingPadding value
+                    else invalid ()
+                | TrailingPadding =>
+                    if c = #"\000" orelse c = #" " then
+                      loop (i + 1) TrailingPadding value
+                    else invalid ()
+            end
+      in
+        loop 0 LeadingPadding 0
+      end
+
+fun field_string label bytes start length =
+  case decode_strict_field ("tar " ^ label) NulPaddedText
+         (raw_field bytes start length) of
+      TextField value => value
+    | NumericField _ => raise Fail "impossible numeric string field"
 
 fun octal_value label bytes start length =
-  let
-    val raw = field_string bytes start length
-    val digits = String.implode (List.filter (fn c => c <> #" ") (String.explode raw))
-    fun digit c =
-      if #"0" <= c andalso c <= #"7" then Char.ord c - Char.ord #"0"
-      else die ("invalid tar " ^ label ^ " field")
-    fun add (c, value) = value * 8 + IntInf.fromInt (digit c)
-    val value = List.foldl add (0 : IntInf.int) (String.explode digits)
-  in
-    if digits = "" then 0
-    else IntInf.toInt value handle Overflow => die ("tar " ^ label ^ " is too large")
-  end
+  case decode_strict_field ("tar " ^ label) TarOctal
+         (raw_field bytes start length) of
+      NumericField value =>
+        (IntInf.toInt value handle Overflow => die ("tar " ^ label ^ " is too large"))
+    | TextField _ => raise Fail "impossible text octal field"
 
 fun tar_checksum bytes =
   let
@@ -223,20 +276,20 @@ fun require_root_directory path kind =
 
 fun require_supported_header header =
   let
-    val magic = field_string header 257 6
+    val magic = field_string "magic" header 257 6
     val stored = octal_value "checksum" header 148 8
     val actual = tar_checksum header
     val _ = if String.isPrefix "ustar" magic then () else die "archive is not ustar"
     val _ = if stored = actual then () else die "archive tar header checksum mismatch"
-    val name = field_string header 0 100
-    val prefix = field_string header 345 155
+    val name = field_string "name" header 0 100
+    val prefix = field_string "prefix" header 345 155
     val raw_path = if prefix = "" then name else prefix ^ "/" ^ name
     val path = member_path raw_path
     val mode = octal_value "mode" header 100 8
     val size = octal_value "size" header 124 12
     val type_byte = byte_at header 156
     val type_flag = if type_byte = 0 then #"0" else Char.chr type_byte
-    val link = field_string header 157 100
+    val link = field_string "link name" header 157 100
     val kind =
       case type_flag of
           #"0" => Regular
