@@ -174,8 +174,7 @@ fun validate_entry req k =
       val holdir = holdir_for_key k
   in
     if not (path_exists dir) then false
-    else if not (path_exists (ok_for_key k)) then
-      die ("incomplete HOL toolchain cache entry: " ^ dir ^ "\nremove it with: rm -rf " ^ quote dir)
+    else if not (path_exists (ok_for_key k)) then false
     else if not (built holdir) then
       die ("broken HOL toolchain cache entry: " ^ dir ^ "\nremove it with: rm -rf " ^ quote dir)
     else
@@ -297,9 +296,7 @@ fun build_entry req k =
     val material = key_material req
     fun build () =
       (ensure_dir (toolchains_dir ());
-       if path_exists final then
-         die ("incomplete HOL toolchain cache entry: " ^ final ^ "\nremove it with: rm -rf " ^ quote final)
-       else ();
+       if path_exists final then remove_tree final else ();
        ensure_dir final;
        run_in_dir final ("git clone " ^ quote (#git req) ^ " " ^ quote hol);
        run_in_dir hol ("git checkout --detach " ^ quote (#rev req));
@@ -313,7 +310,7 @@ fun build_entry req k =
        write_file (ok_for_key k) "ok\n";
        hol)
   in
-    build () handle Error msg => die (msg ^ "\nfailed HOL build left at: " ^ final)
+    build () handle e => (remove_tree final; raise e)
   end
 
 fun ensure_built_with_kernel req =

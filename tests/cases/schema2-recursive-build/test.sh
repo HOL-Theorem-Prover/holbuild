@@ -7,11 +7,21 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
-trap 'rm -rf "$tmpdir"' EXIT
+first_builder=
+second_builder=
+release=
+cleanup() {
+  [[ -z "$release" ]] || touch "$release"
+  [[ -z "$first_builder" ]] || wait "$first_builder" 2>/dev/null || true
+  [[ -z "$second_builder" ]] || wait "$second_builder" 2>/dev/null || true
+  rm -rf "$tmpdir"
+}
+trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
 git_identity() { git -C "$1" config user.email test@example.com; git -C "$1" config user.name 'Holbuild Test'; git -C "$1" config commit.gpgsign false; }
 commit_repo() { git -C "$1" add .; git -C "$1" commit -q -m initial; git -C "$1" rev-parse HEAD; }
+fail() { echo "$*" >&2; exit 1; }
 
 hol=$tmpdir/hol
 mkdir -p "$hol"
@@ -44,6 +54,19 @@ cat > "$hol/bin/build" <<'SH'
 #!/usr/bin/env sh
 set -eu
 [ "$#" -eq 2 ] && [ "$1" = "--no-helpdocs" ] && [ "$2" = "--seq=tools/sequences/upto-hol" ]
+if [ -n "${HOLBUILD_TEST_ATTEMPTS:-}" ]; then
+  printf 'attempt\n' >> "$HOLBUILD_TEST_ATTEMPTS"
+fi
+if [ -n "${HOLBUILD_TEST_BUILD_STARTED:-}" ]; then
+  touch "$HOLBUILD_TEST_BUILD_STARTED"
+  while [ ! -e "$HOLBUILD_TEST_BUILD_RELEASE" ]; do
+    sleep 0.05
+  done
+fi
+if [ "${HOLBUILD_TEST_FAIL_BUILD:-0}" = "1" ]; then
+  touch partial-build
+  exit 1
+fi
 touch built
 pwd > built-at
 mkdir -p sigobj
@@ -219,13 +242,61 @@ fi
 require_grep 'no longer supported' "$tmpdir/heap-holdir.log"
 
 toolchain_entry=${shared_hol_from_context%/hol}
-stale_lock="$HOLBUILD_CACHE/hol-toolchains/.locks/hol-toolchain-$(basename "$toolchain_entry").lock"
+toolchain_key=$(basename "$toolchain_entry")
+toolchains_dir=$HOLBUILD_CACHE/hol-toolchains
+stale_lock="$toolchains_dir/.locks/hol-toolchain-$toolchain_key.lock"
+attempts=$tmpdir/toolchain-build-attempts
+export HOLBUILD_TEST_ATTEMPTS=$attempts
+
+failed_log=$tmpdir/interrupted-build.log
+if (cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" \
+    HOLBUILD_TEST_FAIL_BUILD=1 "$HOLBUILD_BIN" build --dry-run Foo) > "$failed_log" 2>&1; then
+  fail "interrupted toolchain build unexpectedly succeeded"
+fi
+[[ ! -e "$toolchain_entry" ]] ||
+  fail "interrupted toolchain build exposed an incomplete final entry"
+
+mkdir -p "$toolchain_entry"
+touch "$toolchain_entry/interrupted-build"
+rm -f "$stale_lock"
 mkdir -p "$stale_lock"
 
+started=$tmpdir/toolchain-build-started
+release=$tmpdir/toolchain-build-release
 dry_log=$tmpdir/dry.log
-(cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" "$HOLBUILD_BIN" build --dry-run Foo) > "$dry_log" 2>&1
+(cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" \
+  HOLBUILD_TEST_BUILD_STARTED="$started" HOLBUILD_TEST_BUILD_RELEASE="$release" \
+  "$HOLBUILD_BIN" build --dry-run Foo) > "$dry_log" 2>&1 &
+first_builder=$!
+for _ in $(seq 1 200); do
+  [[ -f "$started" ]] && break
+  sleep 0.05
+done
+[[ -f "$started" ]] || fail "toolchain build did not reach the publish gate"
+[[ -d "$toolchain_entry" ]] ||
+  fail "toolchain build did not use its configured final directory"
+[[ ! -e "$toolchain_entry/build.ok" ]] ||
+  fail "toolchain entry was committed before build completion"
+[[ ! -e "$toolchain_entry/interrupted-build" ]] ||
+  fail "incomplete toolchain entry was not invalidated"
+
+race_log=$tmpdir/dry-race.log
+(cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" \
+  "$HOLBUILD_BIN" build --dry-run Foo) > "$race_log" 2>&1 &
+second_builder=$!
+sleep 1
+kill -0 "$second_builder" 2>/dev/null ||
+  fail "concurrent toolchain request did not wait for the active builder"
+touch "$release"
+wait "$first_builder"
+wait "$second_builder"
+
 require_grep "removing obsolete directory HOL toolchain lock" "$dry_log"
 require_grep "Foo (sml, package b)" "$dry_log"
+require_grep "Foo (sml, package b)" "$race_log"
+[[ "$(wc -l < "$attempts" | tr -d ' ')" = "2" ]] ||
+  fail "concurrent toolchain requests ran more than one successful build"
+
 (cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" "$HOLBUILD_BIN" build --dry-run wordsTheory) > "$tmpdir/words-hol-source.log" 2>&1
 require_grep "wordsTheory (theory, package hol)" "$tmpdir/words-hol-source.log"
 (cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" "$HOLBUILD_BIN" build --dry-run ATheory) > "$tmpdir/base-external.log" 2>&1
@@ -237,6 +308,7 @@ fi
 [[ -f "$stale_lock" ]] || { echo "toolchain lock was not recreated as a file" >&2; exit 1; }
 [[ ! -e "$stale_lock.owner" ]] || { echo "toolchain lock owner survived successful bootstrap" >&2; exit 1; }
 shared_hol=$shared_hol_from_context
+require_file "$toolchain_entry/build.ok"
 require_file "$shared_hol/configured"
 require_file "$shared_hol/built"
 require_file "$shared_hol/bin/hol"
