@@ -134,6 +134,7 @@ fun hol_source_manifest_for_holdir holdir = Path.concat(Path.dir holdir, "hol-so
 
 fun built holdir =
   executable (Path.concat(holdir, "bin/hol")) andalso
+  executable (Path.concat(holdir, "bin/Holmake")) andalso
   executable (Path.concat(holdir, "bin/build")) andalso
   readable (Path.concat(holdir, "bin/hol.state"))
 
@@ -300,7 +301,7 @@ fun build_entry req k =
        run_in_dir hol (quote (poly_command ()) ^ " --script tools/smart-configure.sml");
        run_in_dir hol
          ("bin/build " ^ effective_build_args (#kernel_variant req) hol);
-       if built hol then () else die ("HOL build did not produce bin/hol, bin/build, and bin/hol.state in " ^ hol);
+       if built hol then () else die ("HOL build did not produce bin/hol, bin/Holmake, bin/build, and bin/hol.state in " ^ hol);
        generate_hol_source_manifest k;
        if clean hol then () else die ("HOL build left dirty checkout: " ^ hol ^ "\n" ^ dirty_status hol);
        write_file (manifest_for_key k) (material ^ "\nkey=" ^ k ^ "\n");

@@ -634,6 +634,28 @@ invalid_restore corrupt-heap 'failed final validation'
 
 cp "$original_action" "${action_files[0]}"
 
+# A marker-bearing local entry without Holmake must never be accepted as built.
+rm -rf "$cache/hol-toolchains"
+local_holmake_setup_log=$tmpdir/local-holmake-setup.log
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) \
+  > "$local_holmake_setup_log" 2>&1
+local_holmake_holdir=$(tail -n 1 "$local_holmake_setup_log")
+rm "$local_holmake_holdir/bin/Holmake"
+local_holmake_check_log=$tmpdir/local-holmake-check.log
+if (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) \
+    > "$local_holmake_check_log" 2>&1; then
+  if [[ ! -x "$local_holmake_holdir/bin/Holmake" ]]; then
+    record_regression_failure "local toolchain without bin/Holmake was accepted as built"
+  fi
+else
+  require_grep 'broken HOL toolchain cache entry' "$local_holmake_check_log"
+fi
+rm -rf "$cache/hol-toolchains"
+local_holmake_repair_log=$tmpdir/local-holmake-repair.log
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) \
+  > "$local_holmake_repair_log" 2>&1
+require_file "$(tail -n 1 "$local_holmake_repair_log")/bin/Holmake"
+
 
 wait_for_file() {
   local path=$1
