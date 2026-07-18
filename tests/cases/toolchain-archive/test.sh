@@ -397,6 +397,27 @@ if (cd "$project" && \
   symlink_holdir=$(tail -n 1 "$symlink_publish_log")
   require_file "$symlink_holdir/bin/Holmake"
   require_file "$(dirname "$symlink_holdir")/build.ok"
+  case "$symlink_holdir" in
+    "$symlink_cache"/hol-toolchains/*/hol) ;;
+    *) record_regression_failure "symlinked cache returned a different path spelling" ;;
+  esac
+  rm -rf "$symlink_cache_real/hol-toolchains"
+  symlink_restore_log=$tmpdir/symlink-restore.log
+  if (cd "$project" && \
+      HOLBUILD_CACHE="$symlink_cache" \
+      HOLBUILD_TEST_BUILD_COUNT="$symlink_build_count" \
+      "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) \
+      > "$symlink_restore_log" 2>&1; then
+    symlink_restored_holdir=$(tail -n 1 "$symlink_restore_log")
+    if [[ "$symlink_restored_holdir" != "$symlink_holdir" ]] ||
+       [[ $(wc -l < "$symlink_build_count") -ne 1 ]] ||
+       [[ $(readlink "$symlink_restored_holdir/sigobj/Runtime.uo") != \
+          "$symlink_restored_holdir/src/runtime/Runtime.sml" ]]; then
+      record_regression_failure "symlink-alias toolchain identity was not restored consistently"
+    fi
+  else
+    record_regression_failure "symlink-alias toolchain archive was not restorable"
+  fi
 else
   record_regression_failure "toolchain publication rejected a symlinked cache path"
 fi
@@ -612,6 +633,7 @@ invalid_restore missing-holmake 'failed final validation'
 invalid_restore corrupt-heap 'failed final validation'
 
 cp "$original_action" "${action_files[0]}"
+
 
 wait_for_file() {
   local path=$1

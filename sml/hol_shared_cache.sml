@@ -105,7 +105,12 @@ fun key_material {git, rev, kernel_variant} =
 
 fun key req = HolbuildHash.string_sha1 (key_material req)
 fun standard_request {git, rev} = {git = git, rev = rev, kernel_variant = standard_kernel}
-fun toolchains_dir () = Path.concat(cache_root (), "hol-toolchains")
+fun lexical_absolute path =
+  Path.mkCanonical
+    (if Path.isAbsolute path then path
+     else Path.mkAbsolute {path = path, relativeTo = FS.getDir ()})
+
+fun toolchains_dir () = Path.concat(lexical_absolute (cache_root ()), "hol-toolchains")
 fun entry_dir_for_key k = Path.concat(toolchains_dir (), k)
 fun holdir_for_key k = Path.concat(entry_dir_for_key k, "hol")
 fun manifest_for_key k = Path.concat(entry_dir_for_key k, "manifest")
@@ -321,11 +326,6 @@ fun wait_test_gate variable =
 fun platform_value command =
   trim (command_output command) handle Error _ => "unavailable"
 
-fun canonical_toolchains_dir () =
-  (ensure_dir (toolchains_dir ()); FS.fullPath (toolchains_dir ()))
-
-fun canonical_entry_dir k = Path.concat(canonical_toolchains_dir (), k)
-fun canonical_holdir_for_key k = Path.concat(canonical_entry_dir k, "hol")
 
 fun poly_executable_path () =
   let val path = trim (command_output ("command -v " ^ quote (poly_command ())))
@@ -341,7 +341,7 @@ fun archive_identity req k =
        "toolchain-format=" ^ format_version,
        "toolchain-key=" ^ k,
        "toolchain-key-material-sha256=" ^ HolbuildHash.string_sha256 material,
-       "holdir=" ^ canonical_holdir_for_key k,
+       "holdir=" ^ holdir_for_key k,
        "platform-os=" ^ platform_value "uname -s",
        "platform-arch=" ^ platform_value "uname -m",
        "platform-libc=" ^ platform_value "getconf GNU_LIBC_VERSION",
@@ -406,7 +406,7 @@ fun restore_error_message error =
     | _ => General.exnMessage error
 
 fun cleanup_restore_state k =
-  let val final = canonical_entry_dir k
+  let val final = entry_dir_for_key k
   in
     HolbuildToolchainArchive.cleanup_staging final;
     if path_exists final andalso not (path_exists (Path.concat(final, "build.ok"))) then
@@ -416,7 +416,7 @@ fun cleanup_restore_state k =
 
 fun restore_entry req k =
   let
-    val final = canonical_entry_dir k
+    val final = entry_dir_for_key k
     val identity = archive_identity req k
     fun restore url =
       let val remote = HolbuildRemoteCache.remote url
@@ -490,7 +490,7 @@ fun publish_toolchain_with_kernel req =
           (HolbuildToolchainArchive.publish
              {remote = remote,
               identity = archive_identity req k,
-              entry_dir = canonical_entry_dir k})
+              entry_dir = entry_dir_for_key k})
       else die "HOL toolchain is not complete enough to publish"
   in
     (publish () before release_lock lock)
