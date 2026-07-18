@@ -49,7 +49,7 @@ fun ensure_dir path =
 
 fun remove_tree path =
   if path = "" orelse path = "." orelse path = "/" then die ("refusing to remove unsafe path: " ^ path)
-  else ignore (OS.Process.system ("rm -rf " ^ quote path))
+  else ignore (HolbuildProcessGroup.run_shell ("rm -rf " ^ quote path))
 
 fun cache_root () =
   HolbuildCacheConfig.cache_root ()
@@ -76,7 +76,7 @@ fun command_output command =
        | e => die ("command failed: " ^ command ^ ": " ^ General.exnMessage e)
 
 fun run_in_dir dir command =
-  let val status = OS.Process.system ("cd " ^ quote dir ^ " && " ^ command)
+  let val status = HolbuildProcessGroup.run_shell ("cd " ^ quote dir ^ " && " ^ command)
   in if OS.Process.isSuccess status then () else die ("HOL build command failed in " ^ dir ^ ": " ^ command) end
 
 fun trim text =
@@ -212,6 +212,11 @@ fun try_acquire_lock_path lock =
   HolbuildFileLock.try_acquire_path {path = lock, obsolete_kind = SOME "HOL toolchain"}
   handle HolbuildFileLock.Error msg => raise Error ("could not acquire HOL toolchain cache lock: " ^ msg)
 
+fun signal_test_lock_event variable =
+  case OS.Process.getEnv variable of
+      NONE => ()
+    | SOME path => HolbuildFileLock.write_text path "observed\n"
+
 fun acquire_lock k =
   let
     val lock_path = lock_dir k
@@ -225,7 +230,10 @@ fun acquire_lock k =
       | wait n =
           case try_acquire_lock_path lock_path of
               SOME lock => acquired lock
-            | NONE => (ignore (OS.Process.system "sleep 1"); wait (n - 1))
+            | NONE =>
+                (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_LOCK_WAITING";
+                 ignore (OS.Process.system "sleep 1");
+                 wait (n - 1))
   in
     wait 120
   end
@@ -323,7 +331,9 @@ fun ensure_built_with_kernel req =
     else
       let val l = acquire_lock k
       in
-        ((if validate_entry req k then holdir_for_key k else build_entry req k;
+        ((if validate_entry req k then
+            (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_REVALIDATED"; holdir_for_key k)
+          else build_entry req k;
           if hol_source_manifest_built k then () else generate_hol_source_manifest k;
           ignore (build_analyser k);
           holdir_for_key k)
