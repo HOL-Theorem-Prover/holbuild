@@ -643,6 +643,16 @@ kill_toolchain_owner() {
   kill -KILL "$owner_pid"
 }
 
+restore_scratch_paths() {
+  local final_dir parent prefix path
+  final_dir=$(dirname "$published_holdir")
+  parent=$(dirname "$final_dir")
+  prefix=".$(basename "$final_dir").restore-"
+  for path in "$parent"/"$prefix"*; do
+    [[ -e "$path" ]] && printf '%s\n' "$path"
+  done
+}
+
 # A killed download leaves only task-local scratch. The next caller acquires
 # the released per-key lock and performs a complete restore.
 archive_temp_baseline=$tmpdir/archive-temp-baseline
@@ -660,10 +670,18 @@ download_pid=$!
 IFS= read -r _ < "$server_control/download-event"
 kill_toolchain_owner
 wait "$download_pid" 2>/dev/null || true
+mapfile -t download_scratch < <(restore_scratch_paths)
+if (( ${#download_scratch[@]} != 1 )); then
+  record_regression_failure "interrupted download did not leave recoverable per-entry scratch"
+fi
 rm -f "$server_control/download-enable"
 touch "$server_control/download-release"
 rm -f "$server_control/download-event"
 restore_after_interruption download "$(wc -l < "$build_count")"
+mapfile -t remaining_download_scratch < <(restore_scratch_paths)
+if (( ${#remaining_download_scratch[@]} > 0 )); then
+  record_regression_failure "next lock owner did not sweep interrupted download scratch"
+fi
 
 real_tar=$(command -v tar)
 tarbin=$tmpdir/tarbin
@@ -713,10 +731,14 @@ interrupt_extraction() {
   ) > "$log" 2>&1 &
   local pid=$!
   IFS= read -r _ < "$event"
-  local final_dir
-  final_dir=$(dirname "$published_holdir")
-  staging_dirs=("$(dirname "$final_dir")/.$(basename "$final_dir").restore-"*)
-  [[ -e "${staging_dirs[0]}/.holbuild-toolchain-archive-manifest" ]]
+  local path staging_dir=
+  while IFS= read -r path; do
+    if [[ -e "$path/.holbuild-toolchain-archive-manifest" ]]; then
+      staging_dir=$path
+      break
+    fi
+  done < <(restore_scratch_paths)
+  [[ -n "$staging_dir" ]]
   kill_toolchain_owner
   wait "$pid" 2>/dev/null || true
   touch "$release"

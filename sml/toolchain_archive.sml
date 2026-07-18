@@ -624,14 +624,28 @@ fun inspect_archive {archive_path, identity, final_dir} =
       | NONE => die "toolchain archive is missing its internal manifest"
   end
 
+fun fresh_temp_name () =
+  let val placeholder = FS.tmpName ()
+  in
+    remove_file placeholder;
+    placeholder
+  end
+
 fun temp_path label =
-  Path.concat(Path.dir (FS.tmpName ()), "holbuild-toolchain-" ^ label ^ "-" ^ Path.file (FS.tmpName ()))
+  let val unique = fresh_temp_name ()
+  in
+    Path.concat(Path.dir unique,
+                "holbuild-toolchain-" ^ label ^ "-" ^ Path.file unique)
+  end
 
 fun stage_prefix final_dir = "." ^ Path.file final_dir ^ ".restore-"
 
 fun staging_path final_dir =
   Path.concat(Path.dir final_dir,
-              stage_prefix final_dir ^ HolbuildFileLock.current_pid_text () ^ "-" ^ Path.file (FS.tmpName ()))
+              stage_prefix final_dir ^ HolbuildFileLock.current_pid_text () ^
+              "-" ^ Path.file (fresh_temp_name ()))
+
+fun restore_scratch_path final_dir = staging_path final_dir ^ ".scratch"
 
 fun children dir =
   let
@@ -743,15 +757,17 @@ fun restore {remote, identity, final_dir} =
     | SOME text =>
         let
           val expected = parse_remote_record identity text
-          val archive_path = temp_path "download"
-          fun cleanup () = remove_file archive_path
+          val scratch_dir = restore_scratch_path final_dir
+          val archive_path = Path.concat(scratch_dir, "archive.tar")
+          fun cleanup () = remove_tree scratch_dir handle _ => ()
           fun fetch () =
             case HolbuildRemoteCache.fetch_toolchain_blob remote {hash = #sha1 expected, dst = archive_path} of
                 HolbuildCacheBackend.Hit => ()
               | HolbuildCacheBackend.Miss => die "remote toolchain archive blob is missing"
               | HolbuildCacheBackend.Corrupt detail => die ("remote toolchain archive blob is corrupt: " ^ detail)
         in
-          ((fetch ();
+          ((FS.mkDir scratch_dir;
+            fetch ();
             verify_archive_file archive_path expected;
             inspect_archive {archive_path = archive_path, identity = identity, final_dir = final_dir};
             install_archive {archive_path = archive_path, identity = identity, final_dir = final_dir};
