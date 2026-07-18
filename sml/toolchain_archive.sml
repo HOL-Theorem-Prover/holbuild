@@ -49,23 +49,6 @@ fun write_text path text =
 fun tar_operation operation =
   operation () handle HolbuildTar.Error msg => die msg
 
-fun components path = String.tokens (fn c => c = #"/") path
-
-fun volatile_lock_path path =
-  let
-    fun loop (".hol" :: "locks" :: _) = true
-      | loop (_ :: rest) = loop rest
-      | loop [] = false
-  in
-    loop (components path)
-  end
-
-fun require_toolchain_member {path, ...} =
-  if path = "build.ok" then die "archive contains build.ok"
-  else if volatile_lock_path path then
-    die ("archive contains volatile .hol/locks path: " ^ path)
-  else ()
-
 fun split_at_marker text =
   let
     val marker_length = size manifest_marker
@@ -126,22 +109,16 @@ fun require_manifest identity text =
           ()
         end
 
-fun inspect_archive {archive_path, identity, final_dir} =
-  let
-    val {members, content} =
-      tar_operation
-        (fn () => HolbuildTar.inspect
-          {archive_path = archive_path,
-           destination = final_dir,
-           capture = SOME
-             {path = internal_manifest_path,
-              max_size = max_manifest_size,
-              description = "toolchain archive manifest"}})
-    val _ = List.app require_toolchain_member members
+fun validate_extracted_manifest {staging_dir, identity} =
+  let val path = Path.concat(staging_dir, internal_manifest_path)
   in
-    case content of
-        SOME text => require_manifest identity text
-      | NONE => die "toolchain archive is missing its internal manifest"
+    if not (path_exists path) orelse is_dir path orelse FS.isLink path then
+      die "extracted toolchain archive manifest is missing"
+    else if FS.fileSize path > Position.fromInt max_manifest_size then
+      die "toolchain archive manifest is too large"
+    else
+      (require_manifest identity (read_text path);
+       remove_file path)
   end
 
 fun fresh_temp_name () =
@@ -206,7 +183,6 @@ fun create_archive {entry_dir, identity, archive_path} =
              (entry_dir, ["."])],
           excludes = ["./build.ok", "*/.hol/locks", "*/.hol/locks/*"],
           hard_dereference = true});
-     inspect_archive {archive_path = archive_path, identity = identity, final_dir = entry_dir};
      remove_tree manifest_dir)
     handle e => (cleanup (); raise e)
   end
@@ -258,16 +234,14 @@ fun extract_archive {archive_path, staging_dir} =
 fun install_archive {archive_path, identity, final_dir} =
   let
     val staging_dir = staging_path final_dir
-    val extracted_manifest = Path.concat(staging_dir, internal_manifest_path)
+    val extracted_marker = Path.concat(staging_dir, "build.ok")
     fun cleanup () = remove_tree staging_dir handle _ => ()
   in
     (if path_exists final_dir then die ("toolchain install path already exists: " ^ final_dir) else ();
-     inspect_archive {archive_path = archive_path, identity = identity, final_dir = final_dir};
      FS.mkDir staging_dir;
      extract_archive {archive_path = archive_path, staging_dir = staging_dir};
-     inspect_archive {archive_path = archive_path, identity = identity, final_dir = final_dir};
-     if path_exists extracted_manifest andalso not (is_dir extracted_manifest) then remove_file extracted_manifest
-     else die "extracted toolchain archive manifest is missing";
+     if path_exists extracted_marker then die "archive contains build.ok" else ();
+     validate_extracted_manifest {staging_dir = staging_dir, identity = identity};
      FS.rename {old = staging_dir, new = final_dir})
     handle e => (cleanup (); raise e)
   end

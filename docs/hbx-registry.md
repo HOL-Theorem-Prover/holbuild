@@ -18,6 +18,11 @@ The sidecar is for discovery before downloading the archive. Treat it as
 advisory until the archive checksum has been verified; the archive still carries
 its internal `holbuild-cache/manifest`.
 
+HBX archives are trusted build inputs, not sandboxed packages. Their cached
+Poly/ML outputs may be loaded by a later build. Import only from a trusted
+publisher; a checksum detects corruption but does not authenticate who produced
+the archive.
+
 ## Publishing with GitHub Releases
 
 Example release job fragment:

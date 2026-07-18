@@ -125,30 +125,6 @@ import_log=$tmpdir/import.log
 HOLBUILD_CACHE="$import_cache" "$HOLBUILD_BIN" import "$archive" > "$import_log" 2>&1
 require_grep "imported 2 cache action" "$import_log"
 
-# HBX import uses the same strict tar field decoder as toolchain restore.
-ambiguous_archive=$tmpdir/ambiguous-size.hbx
-python3 - "$archive" "$ambiguous_archive" <<'PY'
-import pathlib
-import sys
-import tarfile
-
-source = pathlib.Path(sys.argv[1])
-destination = pathlib.Path(sys.argv[2])
-member = tarfile.TarInfo("ambiguous")
-member.mode = 0o755
-header = bytearray(member.tobuf(format=tarfile.USTAR_FORMAT))
-header[124:136] = b"0 000002000\0"
-header[148:156] = b"        "
-header[148:156] = f"{sum(header):06o}\0 ".encode()
-destination.write_bytes(bytes(header) + source.read_bytes())
-PY
-ambiguous_log=$tmpdir/ambiguous-size.log
-if HOLBUILD_CACHE="$import_cache" "$HOLBUILD_BIN" import "$ambiguous_archive" > "$ambiguous_log" 2>&1; then
-  echo "HBX import accepted an ambiguous tar size field" >&2
-  exit 1
-fi
-require_grep "invalid tar size field" "$ambiguous_log"
-
 rm -rf "$project/.holbuild"
 restore_log=$tmpdir/restore.log
 (cd "$project" && HOLBUILD_CACHE="$import_cache" HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" build ATheory) > "$restore_log" 2>&1

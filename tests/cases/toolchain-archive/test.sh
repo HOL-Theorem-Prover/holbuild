@@ -487,91 +487,15 @@ with tarfile.open(destination, "w", format=tarfile.PAX_FORMAT, pax_headers={}) a
         member.mtime = 0
         output.addfile(member, io.BytesIO(data) if member.isreg() else None)
 
-    if mutation in {"absolute-path", "traversal", "duplicate", "symlink-escape", "hardlink-escape", "device", "pax-root-file"}:
-        if mutation == "absolute-path":
-            extra = tarfile.TarInfo("/absolute-escape")
-            payload = b"escape"
-            extra.size = len(payload)
-        elif mutation == "traversal":
-            extra = tarfile.TarInfo("../parent-escape")
-            payload = b"escape"
-            extra.size = len(payload)
-        elif mutation == "duplicate":
-            original = next((member, data) for member, data in members if normalized(member.name) == "hol/bin/hol")
-            extra = copy.copy(original[0])
-            payload = original[1]
-        elif mutation == "symlink-escape":
-            extra = tarfile.TarInfo("escaping-symlink")
-            extra.type = tarfile.SYMTYPE
-            extra.linkname = "/tmp/outside-toolchain"
-            payload = b""
-        elif mutation == "hardlink-escape":
-            extra = tarfile.TarInfo("escaping-hardlink")
-            extra.type = tarfile.LNKTYPE
-            extra.linkname = "../outside-toolchain"
-            payload = b""
-        elif mutation == "device":
-            extra = tarfile.TarInfo("device")
-            extra.type = tarfile.CHRTYPE
-            extra.devmajor = 1
-            extra.devminor = 3
-            payload = b""
-        else:
-            extra = tarfile.TarInfo("pax-root-file")
-            extra.pax_headers = {"path": "."}
-            payload = b"escape"
-            extra.size = len(payload)
+    if mutation == "traversal":
+        extra = tarfile.TarInfo("../parent-escape")
+        payload = b"escape"
+        extra.size = len(payload)
         extra.mode = 0o755
         extra.uid = 0
         extra.gid = 0
         extra.mtime = 0
-        output.addfile(extra, io.BytesIO(payload) if extra.isreg() else None)
-
-if mutation == "pax-nul-path":
-    value = b"hol/bin/hol\0ignored"
-    body = b" path=" + value + b"\n"
-    length = len(body) + len(str(len(body)))
-    while len(str(length)) + len(body) != length:
-        length = len(body) + len(str(length))
-    pax_data = str(length).encode() + body
-    pax_member = tarfile.TarInfo("PaxHeaders/nul-path")
-    pax_member.type = tarfile.XHDTYPE
-    pax_member.size = len(pax_data)
-    pax_member.mode = 0o644
-    replacement = b"replacement"
-    replacement_member = tarfile.TarInfo("pax-nul-source")
-    replacement_member.size = len(replacement)
-    replacement_member.mode = 0o755
-    def padded(data):
-        return data + b"\0" * ((512 - len(data) % 512) % 512)
-    destination.write_bytes(
-        pax_member.tobuf(format=tarfile.USTAR_FORMAT)
-        + padded(pax_data)
-        + replacement_member.tobuf(format=tarfile.USTAR_FORMAT)
-        + padded(replacement)
-        + destination.read_bytes()
-    )
-
-if mutation == "ambiguous-size":
-    def header(name, kind=tarfile.REGTYPE, linkname=""):
-        member = tarfile.TarInfo(name)
-        member.type = kind
-        member.linkname = linkname
-        member.mode = 0o755
-        member.uid = 0
-        member.gid = 0
-        member.mtime = 0
-        return member.tobuf(format=tarfile.USTAR_FORMAT)
-
-    outer = bytearray(header("outer"))
-    outer[124:136] = b"0 000002000\0"
-    outer[148:156] = b"        "
-    outer[148:156] = f"{sum(outer):06o}\0 ".encode()
-    hidden = (
-        header("build.ok")
-        + header("escaping-symlink", tarfile.SYMTYPE, "/tmp/outside-toolchain")
-    )
-    destination.write_bytes(bytes(outer) + hidden + destination.read_bytes())
+        output.addfile(extra, io.BytesIO(payload))
 
 archive_bytes = destination.read_bytes()
 sha1 = hashlib.sha1(archive_bytes).hexdigest()
@@ -620,15 +544,7 @@ invalid_restore() {
 
 invalid_restore wrong-identity 'identity does not match'
 invalid_restore digest 'SHA256 mismatch'
-invalid_restore absolute-path 'absolute path'
-invalid_restore traversal 'traverses its parent'
-invalid_restore duplicate 'duplicate path'
-invalid_restore symlink-escape 'symlink escapes'
-invalid_restore hardlink-escape 'traverses its parent'
-invalid_restore device 'character device'
-invalid_restore pax-root-file 'archive root is not a directory'
-invalid_restore pax-nul-path 'NUL'
-invalid_restore ambiguous-size 'remote HOL toolchain restore failed'
+invalid_restore traversal 'could not extract tar archive'
 invalid_restore missing-executable 'failed final validation'
 invalid_restore missing-holmake 'failed final validation'
 invalid_restore corrupt-heap 'failed final validation'

@@ -65,48 +65,18 @@ fun temp_file_near path =
 fun tar_operation operation =
   operation () handle HolbuildTar.Error msg => raise Error msg
 
-fun require_cache_member {path, kind, ...} =
-  let
-    val in_payload =
-      path = payload_dir orelse String.isPrefix (payload_dir ^ "/") path
-    val supported_kind =
-      case kind of
-          HolbuildTar.Regular => true
-        | HolbuildTar.Directory => true
-        | _ => false
-  in
-    if not in_payload then
-      raise Error ("cache archive member is outside " ^ payload_dir ^ ": " ^ path)
-    else if not supported_kind then
-      raise Error ("cache archive contains a link: " ^ path)
-    else ()
-  end
-
-fun inspect_archive {archive_path, stage_dir} =
-  let
-    val {members, ...} =
-      tar_operation
-        (fn () => HolbuildTar.inspect
-          {archive_path = archive_path, destination = stage_dir, capture = NONE})
-  in
-    List.app require_cache_member members
-  end
-
 fun tar_create {stage_dir, archive_tmp} =
-  (tar_operation
-     (fn () => HolbuildTar.create
-       {archive_path = archive_tmp,
-        sources = [(stage_dir, [payload_dir])],
-        excludes = [],
-        hard_dereference = false});
-   inspect_archive {archive_path = archive_tmp, stage_dir = stage_dir})
+  tar_operation
+    (fn () => HolbuildTar.create
+      {archive_path = archive_tmp,
+       sources = [(stage_dir, [payload_dir])],
+       excludes = [],
+       hard_dereference = false})
 
 fun tar_extract {archive_path, stage_dir} =
-  (inspect_archive {archive_path = archive_path, stage_dir = stage_dir};
-   tar_operation
-     (fn () => HolbuildTar.extract
-       {archive_path = archive_path, destination = stage_dir});
-   inspect_archive {archive_path = archive_path, stage_dir = stage_dir})
+  tar_operation
+    (fn () => HolbuildTar.extract
+      {archive_path = archive_path, destination = stage_dir})
 
 fun rename_new {old, new} =
   FS.rename {old = old, new = new}
