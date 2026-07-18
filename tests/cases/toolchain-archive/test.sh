@@ -16,12 +16,13 @@ record_regression_failure() {
   regression_failures+=("$message")
 }
 
-archive_temp_snapshot() {
+archive_temp_snapshot() (
   local path
-  for path in /tmp/holbuild-toolchain-download-*; do
+  shopt -s nullglob
+  for path in "${TMPDIR:-/tmp}"/holbuild-toolchain-download-*; do
     [[ -f "$path" ]] && printf '%s\n' "$path"
   done | sort
-}
+)
 
 cleanup() {
   if [[ -n "${server_pid:-}" ]]; then
