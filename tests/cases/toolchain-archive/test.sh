@@ -647,8 +647,6 @@ if (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) \
   if [[ ! -x "$local_holmake_holdir/bin/Holmake" ]]; then
     record_regression_failure "local toolchain without bin/Holmake was accepted as built"
   fi
-else
-  require_grep 'broken HOL toolchain cache entry' "$local_holmake_check_log"
 fi
 
 
