@@ -174,8 +174,7 @@ fun validate_entry req k =
       val holdir = holdir_for_key k
   in
     if not (path_exists dir) then false
-    else if not (path_exists (ok_for_key k)) then
-      die ("incomplete HOL toolchain cache entry: " ^ dir ^ "\nremove it with: rm -rf " ^ quote dir)
+    else if not (path_exists (ok_for_key k)) then false
     else if not (built holdir) then
       die ("broken HOL toolchain cache entry: " ^ dir ^ "\nremove it with: rm -rf " ^ quote dir)
     else
@@ -186,7 +185,6 @@ fun validate_entry req k =
       end
   end
 
-fun current_lock_owner lock = SOME (HolbuildFileLock.read_text (lock_owner_path lock)) handle _ => NONE
 
 fun lock_owner () =
   String.concatWith "\n"
@@ -197,21 +195,14 @@ fun lock_owner () =
      "host=" ^ HolbuildFileLock.current_host (),
      "started=" ^ Time.toString (Time.now ())] ^ "\n"
 
-fun unavailable_lock_owner () =
-  String.concatWith "\n"
-    ["holbuild-hol-toolchain-lock-v1",
-     "command=unknown",
-     "pid=unknown",
-     "cwd=unknown"] ^ "\n"
-
-fun toolchain_lock_error lock owner =
-  Error ("HOL toolchain cache is locked\n" ^
-         "lock: " ^ lock ^ "\n" ^
-         "owner: " ^ HolbuildFileLock.owner_summary owner)
-
 fun try_acquire_lock_path lock =
   HolbuildFileLock.try_acquire_path {path = lock, obsolete_kind = SOME "HOL toolchain"}
   handle HolbuildFileLock.Error msg => raise Error ("could not acquire HOL toolchain cache lock: " ^ msg)
+
+fun signal_test_lock_event variable =
+  case OS.Process.getEnv variable of
+      NONE => ()
+    | SOME path => HolbuildFileLock.write_text path "observed\n"
 
 fun acquire_lock k =
   let
@@ -220,15 +211,15 @@ fun acquire_lock k =
       ((HolbuildFileLock.write_text (lock_owner_path lock_path) (lock_owner ());
         ToolchainLock lock)
        handle e => (HolbuildFileLock.release lock; raise e))
-    fun wait 0 =
-          let val owner = Option.getOpt(current_lock_owner lock_path, unavailable_lock_owner ())
-          in raise toolchain_lock_error lock_path owner end
-      | wait n =
-          case try_acquire_lock_path lock_path of
-              SOME lock => acquired lock
-            | NONE => (ignore (OS.Process.system "sleep 1"); wait (n - 1))
+    fun wait () =
+      case try_acquire_lock_path lock_path of
+          SOME lock => acquired lock
+        | NONE =>
+            (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_LOCK_WAITING";
+             OS.Process.sleep (Time.fromSeconds 1);
+             wait ())
   in
-    wait 120
+    wait ()
   end
 
 fun release_lock (ToolchainLock lock) =
@@ -297,9 +288,7 @@ fun build_entry req k =
     val material = key_material req
     fun build () =
       (ensure_dir (toolchains_dir ());
-       if path_exists final then
-         die ("incomplete HOL toolchain cache entry: " ^ final ^ "\nremove it with: rm -rf " ^ quote final)
-       else ();
+       if path_exists final then remove_tree final else ();
        ensure_dir final;
        run_in_dir final ("git clone " ^ quote (#git req) ^ " " ^ quote hol);
        run_in_dir hol ("git checkout --detach " ^ quote (#rev req));
@@ -313,8 +302,154 @@ fun build_entry req k =
        write_file (ok_for_key k) "ok\n";
        hol)
   in
-    build () handle Error msg => die (msg ^ "\nfailed HOL build left at: " ^ final)
+    build () handle e => (remove_tree final; raise e)
   end
+
+fun read_file path =
+  let
+    val input = TextIO.openIn path
+    fun close () = TextIO.closeIn input handle _ => ()
+  in
+    (TextIO.inputAll input before close ()) handle e => (close (); raise e)
+  end
+
+fun wait_test_gate variable =
+  case OS.Process.getEnv variable of
+      NONE => ()
+    | SOME path => ignore (read_file path)
+
+fun platform_value command =
+  trim (command_output command) handle Error _ => "unavailable"
+
+fun canonical_toolchains_dir () =
+  (ensure_dir (toolchains_dir ()); FS.fullPath (toolchains_dir ()))
+
+fun canonical_entry_dir k = Path.concat(canonical_toolchains_dir (), k)
+fun canonical_holdir_for_key k = Path.concat(canonical_entry_dir k, "hol")
+
+fun poly_executable_path () =
+  let val path = trim (command_output ("command -v " ^ quote (poly_command ())))
+  in FS.fullPath path end
+
+fun archive_identity req k =
+  let
+    val material = key_material req
+    val poly_path = poly_executable_path ()
+  in
+    String.concatWith "\n"
+      [HolbuildToolchainArchive.archive_format,
+       "toolchain-format=" ^ format_version,
+       "toolchain-key=" ^ k,
+       "toolchain-key-material-sha256=" ^ HolbuildHash.string_sha256 material,
+       "holdir=" ^ canonical_holdir_for_key k,
+       "platform-os=" ^ platform_value "uname -s",
+       "platform-arch=" ^ platform_value "uname -m",
+       "platform-libc=" ^ platform_value "getconf GNU_LIBC_VERSION",
+       "poly-command=" ^ poly_command (),
+       "poly-version-sha256=" ^ HolbuildHash.string_sha256 (poly_version ()),
+       "poly-executable=" ^ poly_path,
+       "poly-executable-sha256=" ^ HolbuildHash.file_sha256 poly_path,
+       "analyser-key=" ^ analyser_key ()]
+  end
+
+fun toolchain_manifest_matches req k =
+  read_file (manifest_for_key k) = key_material req ^ "\nkey=" ^ k ^ "\n"
+  handle _ => false
+
+fun analyser_manifest_matches k ak =
+  read_file (analyser_manifest_for_key k ak) =
+    analyser_key_material () ^ "\nkey=" ^ ak ^ "\n"
+  handle _ => false
+
+fun heap_loads k =
+  let
+    val holdir = holdir_for_key k
+    val hol = Path.concat(holdir, "bin/hol")
+    val state = Path.concat(holdir, "bin/hol.state")
+    val command =
+      quote hol ^ " --noconfig --holstate " ^ quote state ^
+      " </dev/null >/dev/null 2>&1"
+  in
+    OS.Process.isSuccess (OS.Process.system command)
+  end
+
+fun analyser_responds k ak =
+  trim (command_output (quote (analyser_bin_for_key k ak) ^ " --version")) =
+    "holbuild-hol-analyser " ^ analyser_format_version
+  handle _ => false
+
+fun complete_entry_contents req k =
+  let
+    val ak = analyser_key ()
+    val holdir = holdir_for_key k
+  in
+    built holdir andalso
+    toolchain_manifest_matches req k andalso
+    hol_source_manifest_built k andalso
+    analyser_built k ak andalso
+    analyser_manifest_matches k ak andalso
+    heap_loads k andalso
+    analyser_responds k ak andalso
+    clean holdir
+  end
+
+fun warn_restore message =
+  TextIO.output(TextIO.stdErr,
+    "holbuild: warning: remote HOL toolchain restore failed; building locally: " ^
+    message ^ "\n")
+
+fun restore_error_message error =
+  case error of
+      HolbuildToolchainArchive.Error message => message
+    | HolbuildRemoteCache.Error message => message
+    | Error message => message
+    | _ => General.exnMessage error
+
+fun cleanup_restore_state k =
+  let val final = canonical_entry_dir k
+  in
+    HolbuildToolchainArchive.cleanup_staging final;
+    if path_exists final andalso not (path_exists (Path.concat(final, "build.ok"))) then
+      remove_tree final
+    else ()
+  end
+
+fun restore_entry req k =
+  let
+    val final = canonical_entry_dir k
+    val identity = archive_identity req k
+    fun restore url =
+      let val remote = HolbuildRemoteCache.remote url
+      in
+        if HolbuildToolchainArchive.restore
+             {remote = remote, identity = identity, final_dir = final} then
+          (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_RENAMED";
+           wait_test_gate "HOLBUILD_TEST_TOOLCHAIN_RENAMED_GATE";
+           if complete_entry_contents req k then
+             (write_file (ok_for_key k) "ok\n"; true)
+           else die "restored HOL toolchain failed final validation")
+        else false
+      end
+  in
+    cleanup_restore_state k;
+    case HolbuildRemoteCacheConfig.url () of
+        NONE => false
+      | SOME url =>
+          (restore url
+           handle error =>
+             (cleanup_restore_state k;
+              warn_restore (restore_error_message error);
+              false))
+  end
+
+fun build_or_restore_entry req k =
+  if restore_entry req k then holdir_for_key k
+  else
+    (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_LOCAL_FALLBACK";
+     wait_test_gate "HOLBUILD_TEST_TOOLCHAIN_LOCAL_FALLBACK_GATE";
+     build_entry req k)
+
+
 
 fun ensure_built_with_kernel req =
   let
@@ -326,7 +461,10 @@ fun ensure_built_with_kernel req =
     else
       let val l = acquire_lock k
       in
-        ((if validate_entry req k then holdir_for_key k else build_entry req k;
+        ((if validate_entry req k then
+            (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_REVALIDATED";
+             holdir_for_key k)
+          else build_or_restore_entry req k;
           if hol_source_manifest_built k then () else generate_hol_source_manifest k;
           ignore (build_analyser k);
           holdir_for_key k)
@@ -336,5 +474,30 @@ fun ensure_built_with_kernel req =
   end
 
 fun ensure_built req = ensure_built_with_kernel (standard_request req)
+
+fun publish_toolchain_with_kernel req =
+  let
+    val _ = ensure_built_with_kernel req
+    val k = key req
+    val remote =
+      case HolbuildRemoteCacheConfig.url () of
+          SOME url => HolbuildRemoteCache.remote url
+        | NONE => die "--publish-toolchain requires a configured remote cache"
+    val lock = acquire_lock k
+    fun publish () =
+      if validate_entry req k andalso complete_entry_contents req k then
+        ignore
+          (HolbuildToolchainArchive.publish
+             {remote = remote,
+              identity = archive_identity req k,
+              entry_dir = canonical_entry_dir k})
+      else die "HOL toolchain is not complete enough to publish"
+  in
+    (publish () before release_lock lock)
+    handle error => (release_lock lock; raise error)
+  end
+
+fun publish_toolchain req =
+  publish_toolchain_with_kernel (standard_request req)
 
 end

@@ -42,7 +42,13 @@ fun open_lock_file path = Posix.FileSys.createf(path, Posix.FileSys.O_RDWR, Posi
 fun close_fd fd = Posix.IO.close fd handle OS.SysErr _ => ()
 fun set_close_on_exec fd = (Posix.IO.setfd(fd, Posix.IO.FD.flags [Posix.IO.getfd fd, Posix.IO.FD.cloexec]) handle OS.SysErr _ => ())
 fun whole_file_lock ltype = Posix.IO.FLock.flock {ltype = ltype, whence = Posix.IO.SEEK_SET, start = 0, len = 0, pid = NONE}
-fun try_lock_fd fd = (ignore (Posix.IO.setlk(fd, whole_file_lock Posix.IO.F_WRLCK)); true) handle OS.SysErr _ => false
+fun lock_contended NONE = false
+  | lock_contended (SOME error) =
+      let val name = OS.errorName error
+      in name = "EACCES" orelse name = "EAGAIN" end
+fun try_lock_fd fd =
+  (ignore (Posix.IO.setlk(fd, whole_file_lock Posix.IO.F_WRLCK)); true)
+  handle e as OS.SysErr (_, error) => if lock_contended error then false else raise e
 fun blocking_lock_owner fd =
   (case Posix.IO.FLock.pid (Posix.IO.getlk(fd, whole_file_lock Posix.IO.F_WRLCK)) of SOME pid => SOME (pid_text pid) | NONE => NONE)
   handle OS.SysErr _ => NONE
