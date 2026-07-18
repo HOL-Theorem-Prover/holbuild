@@ -8,6 +8,21 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
+regression_failures=()
+
+record_regression_failure() {
+  local message=$1
+  printf '%s\n' "$message" >&2
+  regression_failures+=("$message")
+}
+
+archive_temp_snapshot() {
+  local path
+  for path in /tmp/holbuild-toolchain-download-*; do
+    [[ -f "$path" ]] && printf '%s\n' "$path"
+  done | sort
+}
+
 cleanup() {
   if [[ -n "${server_pid:-}" ]]; then
     kill "$server_pid" 2>/dev/null || true
@@ -365,6 +380,27 @@ wrong_platform_log=$tmpdir/wrong-platform.log
 [[ $(grep -c '^PUT ' "$request_log") -eq "$initial_put_count" ]]
 [[ $(grep -c '^GET /cas/' "$request_log") -eq "$initial_cas_get_count" ]]
 
+# The exact path identity must use the same spelling embedded by the HOL build.
+# A cache reached through a symlink is still a valid same-path installation.
+symlink_cache=$tmpdir/symlink-cache
+symlink_cache_real=$tmpdir/symlink-cache-real
+symlink_build_count=$tmpdir/symlink-build-count
+mkdir -p "$symlink_cache_real"
+ln -s "$symlink_cache_real" "$symlink_cache"
+: > "$symlink_build_count"
+symlink_publish_log=$tmpdir/symlink-publish.log
+if (cd "$project" && \
+    HOLBUILD_CACHE="$symlink_cache" \
+    HOLBUILD_TEST_BUILD_COUNT="$symlink_build_count" \
+    "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol --publish-toolchain) \
+    > "$symlink_publish_log" 2>&1; then
+  symlink_holdir=$(tail -n 1 "$symlink_publish_log")
+  require_file "$symlink_holdir/bin/Holmake"
+  require_file "$(dirname "$symlink_holdir")/build.ok"
+else
+  record_regression_failure "toolchain publication rejected a symlinked cache path"
+fi
+
 write_archive_mutator() {
   cat > "$tmpdir/mutate_archive.py" <<'PY'
 import copy
@@ -412,6 +448,8 @@ with tarfile.open(destination, "w", format=tarfile.PAX_FORMAT, pax_headers={}) a
     for member, data in members:
         name = normalized(member.name)
         if mutation == "missing-executable" and name == "hol/bin/hol":
+            continue
+        if mutation == "missing-holmake" and name == "hol/bin/Holmake":
             continue
         if mutation == "wrong-identity" and name == manifest_name:
             data = manifest_bytes
@@ -467,6 +505,27 @@ with tarfile.open(destination, "w", format=tarfile.PAX_FORMAT, pax_headers={}) a
         extra.mtime = 0
         output.addfile(extra, io.BytesIO(payload) if extra.isreg() else None)
 
+if mutation == "ambiguous-size":
+    def header(name, kind=tarfile.REGTYPE, linkname=""):
+        member = tarfile.TarInfo(name)
+        member.type = kind
+        member.linkname = linkname
+        member.mode = 0o755
+        member.uid = 0
+        member.gid = 0
+        member.mtime = 0
+        return member.tobuf(format=tarfile.USTAR_FORMAT)
+
+    outer = bytearray(header("outer"))
+    outer[124:136] = b"0 000002000\0"
+    outer[148:156] = b"        "
+    outer[148:156] = f"{sum(outer):06o}\0 ".encode()
+    hidden = (
+        header("build.ok")
+        + header("escaping-symlink", tarfile.SYMTYPE, "/tmp/outside-toolchain")
+    )
+    destination.write_bytes(bytes(outer) + hidden + destination.read_bytes())
+
 archive_bytes = destination.read_bytes()
 sha1 = hashlib.sha1(archive_bytes).hexdigest()
 sha256 = hashlib.sha256(archive_bytes).hexdigest()
@@ -505,8 +564,8 @@ invalid_restore() {
   local log=$tmpdir/invalid-"$mutation".log
   if (cd "$project" && HOLBUILD_TEST_FAIL_LOCAL_BUILD=1 \
       "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$log" 2>&1; then
-    echo "invalid $mutation archive unexpectedly restored" >&2
-    exit 1
+    record_regression_failure "invalid $mutation archive unexpectedly restored"
+    return
   fi
   require_grep "$expected" "$log"
   [[ ! -e "$(dirname "$published_holdir")" ]]
@@ -521,7 +580,9 @@ invalid_restore symlink-escape 'symlink escapes'
 invalid_restore hardlink-escape 'traverses its parent'
 invalid_restore device 'character device'
 invalid_restore pax-root-file 'archive root is not a directory'
+invalid_restore ambiguous-size 'remote HOL toolchain restore failed'
 invalid_restore missing-executable 'failed final validation'
+invalid_restore missing-holmake 'failed final validation'
 invalid_restore corrupt-heap 'failed final validation'
 
 cp "$original_action" "${action_files[0]}"
@@ -558,6 +619,8 @@ kill_toolchain_owner() {
 
 # A killed download leaves only task-local scratch. The next caller acquires
 # the released per-key lock and performs a complete restore.
+archive_temp_baseline=$tmpdir/archive-temp-baseline
+archive_temp_snapshot > "$archive_temp_baseline"
 rm -rf "$cache/hol-toolchains"
 rm -f "$server_control"/download-*
 mkfifo "$server_control/download-event"
@@ -725,3 +788,21 @@ rm -f "$build_event" "$build_gate"
 mv "$tmpdir/action-disabled" "${action_files[0]}"
 builds_after_interrupted_fallback=$(wc -l < "$build_count")
 restore_after_interruption local-fallback "$builds_after_interrupted_fallback"
+
+archive_temp_after=$tmpdir/archive-temp-after
+archive_temp_leaks=$tmpdir/archive-temp-leaks
+archive_temp_snapshot > "$archive_temp_after"
+comm -13 "$archive_temp_baseline" "$archive_temp_after" > "$archive_temp_leaks"
+if [[ -s "$archive_temp_leaks" ]]; then
+  leak_count=$(wc -l < "$archive_temp_leaks")
+  record_regression_failure "interrupted restores leaked $leak_count downloaded archive(s)"
+  while IFS= read -r leaked; do
+    rm -f -- "$leaked"
+  done < "$archive_temp_leaks"
+fi
+
+if (( ${#regression_failures[@]} > 0 )); then
+  printf 'toolchain archive regression failures:\n' >&2
+  printf '  - %s\n' "${regression_failures[@]}" >&2
+  exit 1
+fi
