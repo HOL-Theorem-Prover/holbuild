@@ -427,7 +427,7 @@ with tarfile.open(destination, "w", format=tarfile.PAX_FORMAT, pax_headers={}) a
         member.mtime = 0
         output.addfile(member, io.BytesIO(data) if member.isreg() else None)
 
-    if mutation in {"absolute-path", "traversal", "duplicate", "symlink-escape", "hardlink-escape", "device"}:
+    if mutation in {"absolute-path", "traversal", "duplicate", "symlink-escape", "hardlink-escape", "device", "pax-root-file"}:
         if mutation == "absolute-path":
             extra = tarfile.TarInfo("/absolute-escape")
             payload = b"escape"
@@ -450,12 +450,17 @@ with tarfile.open(destination, "w", format=tarfile.PAX_FORMAT, pax_headers={}) a
             extra.type = tarfile.LNKTYPE
             extra.linkname = "../outside-toolchain"
             payload = b""
-        else:
+        elif mutation == "device":
             extra = tarfile.TarInfo("device")
             extra.type = tarfile.CHRTYPE
             extra.devmajor = 1
             extra.devminor = 3
             payload = b""
+        else:
+            extra = tarfile.TarInfo("pax-root-file")
+            extra.pax_headers = {"path": "."}
+            payload = b"escape"
+            extra.size = len(payload)
         extra.mode = 0o755
         extra.uid = 0
         extra.gid = 0
@@ -515,6 +520,7 @@ invalid_restore duplicate 'duplicate path'
 invalid_restore symlink-escape 'symlink escapes'
 invalid_restore hardlink-escape 'traverses its parent'
 invalid_restore device 'character device'
+invalid_restore pax-root-file 'archive root is not a directory'
 invalid_restore missing-executable 'failed final validation'
 invalid_restore corrupt-heap 'failed final validation'
 

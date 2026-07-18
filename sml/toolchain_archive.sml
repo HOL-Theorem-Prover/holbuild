@@ -215,6 +215,12 @@ fun kind_name kind =
     | Hardlink _ => "hardlink"
     | ExtendedHeader => "PAX extended header"
 
+fun require_root_directory path kind =
+  if path = "" andalso
+     (case kind of Directory => false | ExtendedHeader => false | _ => true) then
+    die "archive root is not a directory"
+  else ()
+
 fun require_supported_header header =
   let
     val magic = field_string header 257 6
@@ -250,11 +256,7 @@ fun require_supported_header header =
         | _ => if size = 0 then () else die ("non-regular archive member has data: " ^ path)
     val _ = if kind_name kind = "PAX extended header" orelse path <> "build.ok" then () else die "archive contains build.ok"
     val _ = if kind_name kind = "PAX extended header" orelse not (volatile_lock_path path) then () else die ("archive contains volatile .hol/locks path: " ^ path)
-    val _ =
-      if path = "" andalso
-         (case kind of Directory => false | ExtendedHeader => false | _ => true) then
-        die "archive root is not a directory"
-      else ()
+    val _ = require_root_directory path kind
   in
     {path = path, kind = kind, mode = mode, size = size}
   end
@@ -391,6 +393,7 @@ fun scan_archive path =
           case overrides of
               NONE => kind
             | SOME {linkpath, ...} => apply_pax_link kind linkpath
+        val _ = require_root_directory member' kind'
         val _ = pending_pax := NONE
         val _ = if member' = "build.ok" then die "archive contains build.ok" else ()
         val _ = if volatile_lock_path member' then die ("archive contains volatile .hol/locks path: " ^ member') else ()
