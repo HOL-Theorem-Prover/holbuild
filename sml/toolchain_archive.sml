@@ -80,6 +80,7 @@ fun all_zero bytes =
 
 datatype field_grammar =
     NulPaddedText
+  | NulFreeText
   | TarOctal
 
 datatype decoded_field =
@@ -109,6 +110,17 @@ fun decode_strict_field label NulPaddedText raw =
             end
       in
         loop 0 false []
+      end
+  | decode_strict_field label NulFreeText raw =
+      let
+        val length = size raw
+        fun loop i =
+          if i >= length then TextField raw
+          else if String.sub(raw, i) = #"\000" then
+            die ("invalid " ^ label ^ " field: NUL is not allowed")
+          else loop (i + 1)
+      in
+        loop 0
       end
   | decode_strict_field label TarOctal raw =
       let
@@ -142,6 +154,11 @@ fun decode_strict_field label NulPaddedText raw =
       in
         loop 0 LeadingPadding 0
       end
+
+fun pax_path_value label value =
+  case decode_strict_field ("PAX " ^ label) NulFreeText value of
+      TextField valid => valid
+    | NumericField _ => raise Fail "impossible numeric PAX path field"
 
 fun field_string label bytes start length =
   case decode_strict_field ("tar " ^ label) NulPaddedText
@@ -368,10 +385,10 @@ fun pax_fields text =
       case key of
           "path" =>
             if Option.isSome path then die "PAX header repeats path"
-            else {path = SOME value, linkpath = linkpath}
+            else {path = SOME (pax_path_value "path" value), linkpath = linkpath}
         | "linkpath" =>
             if Option.isSome linkpath then die "PAX header repeats linkpath"
-            else {path = path, linkpath = SOME value}
+            else {path = path, linkpath = SOME (pax_path_value "linkpath" value)}
         | _ => die ("archive contains unsupported PAX field: " ^ key)
     fun loop offset fields =
       if offset = total then fields

@@ -505,6 +505,31 @@ with tarfile.open(destination, "w", format=tarfile.PAX_FORMAT, pax_headers={}) a
         extra.mtime = 0
         output.addfile(extra, io.BytesIO(payload) if extra.isreg() else None)
 
+if mutation == "pax-nul-path":
+    value = b"hol/bin/hol\0ignored"
+    body = b" path=" + value + b"\n"
+    length = len(body) + len(str(len(body)))
+    while len(str(length)) + len(body) != length:
+        length = len(body) + len(str(length))
+    pax_data = str(length).encode() + body
+    pax_member = tarfile.TarInfo("PaxHeaders/nul-path")
+    pax_member.type = tarfile.XHDTYPE
+    pax_member.size = len(pax_data)
+    pax_member.mode = 0o644
+    replacement = b"replacement"
+    replacement_member = tarfile.TarInfo("pax-nul-source")
+    replacement_member.size = len(replacement)
+    replacement_member.mode = 0o755
+    def padded(data):
+        return data + b"\0" * ((512 - len(data) % 512) % 512)
+    destination.write_bytes(
+        pax_member.tobuf(format=tarfile.USTAR_FORMAT)
+        + padded(pax_data)
+        + replacement_member.tobuf(format=tarfile.USTAR_FORMAT)
+        + padded(replacement)
+        + destination.read_bytes()
+    )
+
 if mutation == "ambiguous-size":
     def header(name, kind=tarfile.REGTYPE, linkname=""):
         member = tarfile.TarInfo(name)
@@ -580,6 +605,7 @@ invalid_restore symlink-escape 'symlink escapes'
 invalid_restore hardlink-escape 'traverses its parent'
 invalid_restore device 'character device'
 invalid_restore pax-root-file 'archive root is not a directory'
+invalid_restore pax-nul-path 'NUL'
 invalid_restore ambiguous-size 'remote HOL toolchain restore failed'
 invalid_restore missing-executable 'failed final validation'
 invalid_restore missing-holmake 'failed final validation'
