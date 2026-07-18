@@ -650,11 +650,6 @@ if (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) \
 else
   require_grep 'broken HOL toolchain cache entry' "$local_holmake_check_log"
 fi
-rm -rf "$cache/hol-toolchains"
-local_holmake_repair_log=$tmpdir/local-holmake-repair.log
-(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) \
-  > "$local_holmake_repair_log" 2>&1
-require_file "$(tail -n 1 "$local_holmake_repair_log")/bin/Holmake"
 
 
 wait_for_file() {
