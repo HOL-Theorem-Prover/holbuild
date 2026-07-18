@@ -47,9 +47,9 @@ fun ensure_dir path =
   else if path_exists path then ()
   else (ensure_dir (Path.dir path); FS.mkDir path handle OS.SysErr _ => ())
 
-fun remove_tree path =
+fun remove_tree run_command path =
   if path = "" orelse path = "." orelse path = "/" then die ("refusing to remove unsafe path: " ^ path)
-  else ignore (HolbuildProcessGroup.run_shell ("rm -rf " ^ quote path))
+  else ignore (run_command ("rm -rf " ^ quote path))
 
 fun cache_root () =
   HolbuildCacheConfig.cache_root ()
@@ -61,13 +61,9 @@ fun validate_git git =
   if git = canonical_git () then ()
   else die ("dependencies.hol.git must be the canonical HOL repository: " ^ canonical_git ())
 
-fun command_output command =
+fun command_output_using run_command command =
   let
-    val tmp = FS.tmpName ()
-    val status = OS.Process.system (command ^ " > " ^ quote tmp ^ " 2>&1")
-    val input = TextIO.openIn tmp
-    val text = TextIO.inputAll input before TextIO.closeIn input
-    val _ = FS.remove tmp handle OS.SysErr _ => ()
+    val {status, output = text} = run_command (command ^ " 2>&1")
   in
     if OS.Process.isSuccess status then text
     else die ("command failed: " ^ command ^ "\n" ^ text)
@@ -75,8 +71,11 @@ fun command_output command =
   handle e as Error _ => raise e
        | e => die ("command failed: " ^ command ^ ": " ^ General.exnMessage e)
 
-fun run_in_dir dir command =
-  let val status = HolbuildProcessGroup.run_shell ("cd " ^ quote dir ^ " && " ^ command)
+fun command_output command =
+  command_output_using HolbuildProcessGroup.run_shell_output command
+
+fun run_in_dir run_command dir command =
+  let val status = run_command ("cd " ^ quote dir ^ " && " ^ command)
   in if OS.Process.isSuccess status then () else die ("HOL build command failed in " ^ dir ^ ": " ^ command) end
 
 fun trim text =
@@ -119,6 +118,20 @@ fun analyser_ok_for_key k ak = Path.concat(analyser_dir_for_key k ak, "build.ok"
 fun analyser_manifest_for_key k ak = Path.concat(analyser_dir_for_key k ak, "manifest")
 fun locks_dir () = Path.concat(toolchains_dir (), ".locks")
 fun lock_dir k = Path.concat(locks_dir (), "hol-toolchain-" ^ k ^ ".lock")
+
+fun mutation_lease_path k = lock_dir k ^ ".mutation"
+
+fun run_mutation k script =
+  HolbuildProcessGroup.run_shell_with_mutation_lease
+    {lease_path = mutation_lease_path k, script = script}
+
+fun run_mutation_output k script =
+  HolbuildProcessGroup.run_shell_output_with_mutation_lease
+    {lease_path = mutation_lease_path k, script = script}
+
+fun await_mutation_quiescence k =
+  if OS.Process.isSuccess (run_mutation k ":") then ()
+  else die ("could not acquire HOL toolchain mutation lease: " ^ mutation_lease_path k)
 fun lock_owner_path lock = lock ^ ".owner"
 
 datatype toolchain_lock = ToolchainLock of HolbuildFileLock.t
@@ -132,8 +145,11 @@ fun built holdir =
   executable (Path.concat(holdir, "bin/build")) andalso
   readable (Path.concat(holdir, "bin/hol.state"))
 
-fun dirty_status holdir = trim (command_output ("git -C " ^ quote holdir ^ " status --porcelain --ignored=no"))
-fun clean holdir = dirty_status holdir = ""
+fun dirty_status k holdir =
+  trim
+    (command_output_using (run_mutation_output k)
+       ("git -C " ^ quote holdir ^ " status --porcelain --ignored=no"))
+fun clean k holdir = dirty_status k holdir = ""
 
 fun effective_build_args kernel_variant holdir =
   let val config = toolchain_config kernel_variant
@@ -155,7 +171,8 @@ fun generate_hol_source_manifest k =
   HolbuildHolSourceManifest.generate
     {holdir = holdir_for_key k,
      manifest_path = hol_source_manifest_for_key k,
-     members_path = hol_source_members_for_key k}
+     members_path = hol_source_members_for_key k,
+     run_command = run_mutation_output k}
   handle HolbuildHolSourceManifest.Error msg => die msg
 
 fun hol_source_manifest_built k =
@@ -178,7 +195,7 @@ fun validate_entry req k =
     else if not (built holdir) then
       die ("broken HOL toolchain cache entry: " ^ dir ^ "\nremove it with: rm -rf " ^ quote dir)
     else
-      let val status = dirty_status holdir
+      let val status = dirty_status k holdir
       in
         if status = "" then true
         else die ("dirty HOL toolchain cache entry: " ^ dir ^ "\n" ^ status ^ "\nremove it with: rm -rf " ^ quote dir)
@@ -280,13 +297,14 @@ fun build_analyser k =
     val bindir = Path.concat(dir, "bin")
     val out = analyser_bin_for_key k ak
     val hol = holdir_for_key k
+    val run_command = run_mutation k
     val src = analyser_source_dir ()
     val material = analyser_key_material ()
   in
     if analyser_built k ak then out
     else
       (ensure_dir bindir;
-       run_in_dir hol
+       run_in_dir run_command hol
          ("HOLBUILD_HOLDIR=" ^ quote hol ^ " " ^
           "HOLBUILD_ANALYSER_SRC=" ^ quote src ^ " " ^
           quote (polyc_command ()) ^ " -o " ^ quote out ^ " " ^
@@ -302,23 +320,24 @@ fun build_entry req k =
     val final = entry_dir_for_key k
     val hol = holdir_for_key k
     val material = key_material req
+    val run_command = run_mutation k
     fun build () =
       (ensure_dir (toolchains_dir ());
-       if path_exists final then remove_tree final else ();
+       if path_exists final then remove_tree run_command final else ();
        ensure_dir final;
-       run_in_dir final ("git clone " ^ quote (#git req) ^ " " ^ quote hol);
-       run_in_dir hol ("git checkout --detach " ^ quote (#rev req));
-       run_in_dir hol (quote (poly_command ()) ^ " --script tools/smart-configure.sml");
-       run_in_dir hol
+       run_in_dir run_command final ("git clone " ^ quote (#git req) ^ " " ^ quote hol);
+       run_in_dir run_command hol ("git checkout --detach " ^ quote (#rev req));
+       run_in_dir run_command hol (quote (poly_command ()) ^ " --script tools/smart-configure.sml");
+       run_in_dir run_command hol
          ("bin/build " ^ effective_build_args (#kernel_variant req) hol);
        if built hol then () else die ("HOL build did not produce bin/hol, bin/build, and bin/hol.state in " ^ hol);
        generate_hol_source_manifest k;
-       if clean hol then () else die ("HOL build left dirty checkout: " ^ hol ^ "\n" ^ dirty_status hol);
+       if clean k hol then () else die ("HOL build left dirty checkout: " ^ hol ^ "\n" ^ dirty_status k hol);
        write_file (manifest_for_key k) (material ^ "\nkey=" ^ k ^ "\n");
        write_file (ok_for_key k) "ok\n";
        hol)
   in
-    build () handle e => (remove_tree final; raise e)
+    build () handle e => (remove_tree run_command final; raise e)
   end
 
 fun ensure_built_with_kernel req =
@@ -331,7 +350,8 @@ fun ensure_built_with_kernel req =
     else
       let val l = acquire_lock k
       in
-        ((if validate_entry req k then
+        (await_mutation_quiescence k;
+         (if validate_entry req k then
             (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_REVALIDATED"; holdir_for_key k)
           else build_entry req k;
           if hol_source_manifest_built k then () else generate_hol_source_manifest k;
