@@ -33,23 +33,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-git_identity() {
-  git -C "$1" config user.email test@example.invalid
-  git -C "$1" config user.name "holbuild test"
-  git -C "$1" config commit.gpgsign false
-}
-
-commit_repo() {
-  git -C "$1" add .
-  git -C "$1" commit -q --no-gpg-sign -m initial
-  git -C "$1" rev-parse HEAD
-}
-
 write_fake_hol() {
   local hol=$1
   mkdir -p "$hol"
-  git -C "$hol" init -q
-  git_identity "$hol"
   mkdir -p "$hol/bin" "$hol/tools/build" "$hol/tools/sequences" "$hol/src/runtime"
   cat > "$hol/.gitignore" <<'EOF'
 /bin/hol
@@ -181,104 +167,6 @@ rev = "$revision"
 TOML
 }
 
-write_server() {
-  local script=$1
-  cat > "$script" <<'PY'
-import http.server
-import pathlib
-import subprocess
-import sys
-import urllib.parse
-import time
-
-root = pathlib.Path(sys.argv[1]).resolve()
-port_file = pathlib.Path(sys.argv[2])
-request_log = pathlib.Path(sys.argv[3])
-control = pathlib.Path(sys.argv[4])
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    def object_path(self):
-        relative = urllib.parse.urlparse(self.path).path.lstrip('/')
-        if '..' in pathlib.PurePosixPath(relative).parts:
-            self.send_response(400)
-            self.end_headers()
-            return None
-        return root / relative
-
-    def record_request(self):
-        with request_log.open('a', encoding='utf-8') as log:
-            log.write(f'{self.command} {urllib.parse.urlparse(self.path).path}\n')
-
-    def gate_download(self):
-        enabled = control / 'download-enable'
-        if '/cas/' not in self.path or not enabled.exists():
-            return
-        with (control / 'download-event').open('w', encoding='utf-8') as event:
-            event.write('observed\n')
-        release = control / 'download-release'
-        while not release.exists():
-            time.sleep(0.01)
-
-    def do_GET(self):
-        self.record_request()
-        path = self.object_path()
-        if path is None:
-            return
-        if not path.is_file():
-            self.send_response(404)
-            self.end_headers()
-            return
-        self.gate_download()
-        data = path.read_bytes()
-        compressed = 'zstd' in self.headers.get('Accept-Encoding', '') and '/cas/' in self.path
-        if compressed:
-            data = subprocess.check_output(['zstd', '-q', '-c'], input=data)
-        self.send_response(200)
-        if compressed:
-            self.send_header('Content-Encoding', 'zstd')
-        self.send_header('Content-Length', str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def do_PUT(self):
-        self.record_request()
-        path = self.object_path()
-        if path is None:
-            return
-        data = self.rfile.read(int(self.headers.get('Content-Length', '0')))
-        if self.headers.get('Content-Encoding') == 'zstd':
-            data = subprocess.check_output(['zstd', '-q', '-d', '-c'], input=data)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
-        self.send_response(201)
-        self.end_headers()
-
-    def log_message(self, fmt, *args):
-        pass
-
-server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
-port_file.write_text(str(server.server_address[1]), encoding='utf-8')
-server.serve_forever()
-PY
-}
-
-start_server() {
-  remote_root=$tmpdir/remote
-  request_log=$tmpdir/requests.log
-  port_file=$tmpdir/server.port
-  server_control=$tmpdir/server-control
-  mkdir -p "$remote_root" "$server_control"
-  write_server "$tmpdir/server.py"
-  python3 "$tmpdir/server.py" "$remote_root" "$port_file" "$request_log" "$server_control" &
-  server_pid=$!
-  for _ in {1..100}; do
-    [[ -s "$port_file" ]] && break
-    sleep 0.01
-  done
-  [[ -s "$port_file" ]]
-  remote_url="http://127.0.0.1:$(cat "$port_file")"
-}
-
 hol=$tmpdir/hol
 fakebin=$tmpdir/fakebin
 project=$tmpdir/project
@@ -286,10 +174,12 @@ cache=$tmpdir/cache
 build_count=$tmpdir/build-count
 : > "$build_count"
 write_fake_hol "$hol"
-hol_rev=$(commit_repo "$hol")
+hol_rev=$(init_git_repo "$hol")
 write_fake_poly "$fakebin"
 write_project "$project" "$hol" "$hol_rev"
-start_server
+remote_root=$tmpdir/remote
+server_control=$tmpdir/server-control
+start_remote_cache_server "$remote_root" "$tmpdir/server" "$server_control"
 
 export HOLBUILD_CANONICAL_HOL_GIT=$hol
 export HOLBUILD_POLY=$fakebin/poly
@@ -458,12 +348,8 @@ marker = b"identity-text-v1\n"
 identity = manifest_bytes.split(marker, 1)[1]
 
 if mutation == "wrong-identity":
-    wrong = identity + b"\nwrong"
     manifest_bytes = (
-        b"holbuild-toolchain-archive-v1\n"
-        + b"identity-sha256 " + hashlib.sha256(wrong).hexdigest().encode() + b"\n"
-        + b"identity-size " + str(len(wrong)).encode() + b"\n"
-        + marker + wrong
+        b"holbuild-toolchain-archive-v1\n" + marker + identity + b"\nwrong"
     )
 
 with tarfile.open(destination, "w", format=tarfile.PAX_FORMAT, pax_headers={}) as output:
@@ -502,21 +388,18 @@ sha1 = hashlib.sha1(archive_bytes).hexdigest()
 sha256 = hashlib.sha256(archive_bytes).hexdigest()
 size = str(len(archive_bytes))
 remote_cas.mkdir(parents=True, exist_ok=True)
-(remote_cas / sha256).write_bytes(archive_bytes)
-
 recorded_sha256 = "0" * 64 if mutation == "digest" else sha256
+(remote_cas / recorded_sha256).write_bytes(archive_bytes)
+
 action = (
     "holbuild-remote-toolchain-action-v1\n"
-    f"identity-sha256={hashlib.sha256(identity).hexdigest()}\n"
     f"blob-sha1={sha1}\n"
-    f"archive-sha256={recorded_sha256}\n"
-    f"archive-size={size}\n"
 ).encode()
 metadata = (
     "holbuild-remote-cache-action-v1\n"
     f"manifest-sha256 {hashlib.sha256(action).hexdigest()}\n"
     f"manifest-size {len(action)}\n"
-    f"blob {sha1} {sha256} {size}\n"
+    f"blob {sha1} {recorded_sha256} {size}\n"
     "manifest-text-v1\n"
 ).encode() + action
 action_path.write_bytes(metadata)

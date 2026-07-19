@@ -190,17 +190,11 @@ fun curl_put_zstd_with_timeout timeout_seconds {url, src, size} =
 fun curl_put_zstd request =
   curl_put_zstd_with_timeout curl_max_time_seconds request
 val action_domain = "holbuild-remote-ac-v1"
-val toolchain_action_domain = "holbuild-remote-toolchain-ac-v1"
 
-fun remote_action_key_for_domain domain key =
-  HolbuildHash.string_sha256 (domain ^ "\n" ^ key ^ "\n")
+fun remote_action_key key =
+  HolbuildHash.string_sha256 (action_domain ^ "\n" ^ key ^ "\n")
 
-fun remote_action_key key = remote_action_key_for_domain action_domain key
-fun action_url_for_domain cache domain key =
-  base_url cache ^ "/ac/" ^ remote_action_key_for_domain domain key
-fun action_url cache key = action_url_for_domain cache action_domain key
-fun toolchain_action_url cache identity =
-  action_url_for_domain cache toolchain_action_domain identity
+fun action_url cache key = base_url cache ^ "/ac/" ^ remote_action_key key
 fun cas_url cache sha256 = base_url cache ^ "/cas/" ^ sha256
 
 fun lookup_blob cache sha1 =
@@ -304,9 +298,6 @@ fun get_action_at_url cache url =
 
 fun get_action cache key = get_action_at_url cache (action_url cache key)
 
-fun get_toolchain_action cache identity =
-  get_action_at_url cache (toolchain_action_url cache identity)
-
 fun put_action_at_url cache lookup policy {key, text, url} =
   let
     val refs = HolbuildCacheTransfer.unique_blobs text
@@ -334,24 +325,28 @@ fun put_action cache policy {key, text} =
   put_action_at_url cache (fn () => get_action cache key) policy
     {key = key, text = text, url = action_url cache key}
 
-fun put_toolchain_action cache policy {identity, text} =
-  put_action_at_url cache (fn () => get_toolchain_action cache identity) policy
-    {key = HolbuildHash.string_sha256 identity,
-     text = text,
-     url = toolchain_action_url cache identity}
-
 fun has_blob cache sha1 = Option.isSome (lookup_blob cache sha1)
+
+fun verify_downloaded_blob path ({sha1, sha256, size} : blob_entry) =
+  if Position.toString (FS.fileSize path) <> size then
+    HolbuildCacheBackend.Corrupt ("downloaded blob size mismatch: " ^ sha1)
+  else if HolbuildHash.file_sha1 path <> sha1 then
+    HolbuildCacheBackend.Corrupt ("downloaded blob SHA1 mismatch: " ^ sha1)
+  else if HolbuildHash.file_sha256 path <> sha256 then
+    HolbuildCacheBackend.Corrupt ("downloaded blob SHA256 mismatch: " ^ sha256)
+  else
+    HolbuildCacheBackend.Hit
 
 fun fetch_blob_with_timeout timeout_seconds cache {hash, dst} =
   case lookup_blob cache hash of
       NONE => HolbuildCacheBackend.Miss
-    | SOME {sha256, ...} =>
-        let val result = curl_get_with_timeout timeout_seconds {url = cas_url cache sha256, dst = dst}
+    | SOME entry =>
+        let
+          val {sha256, ...} = entry
+          val result = curl_get_with_timeout timeout_seconds {url = cas_url cache sha256, dst = dst}
         in
           case result of
-              HolbuildCacheBackend.Hit =>
-                if HolbuildHash.file_sha1 dst = hash then HolbuildCacheBackend.Hit
-                else HolbuildCacheBackend.Corrupt ("downloaded blob SHA1 mismatch: " ^ hash)
+              HolbuildCacheBackend.Hit => verify_downloaded_blob dst entry
             | other => other
         end
         handle e => HolbuildCacheBackend.Corrupt (General.exnMessage e)

@@ -31,8 +31,6 @@ cleanup() {
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
-git_identity() { git -C "$1" config user.email test@example.com; git -C "$1" config user.name 'Holbuild Test'; git -C "$1" config commit.gpgsign false; }
-commit_repo() { git -C "$1" add .; git -C "$1" commit -q -m initial; git -C "$1" rev-parse HEAD; }
 fail() { echo "$*" >&2; exit 1; }
 record_regression_failure() { regression_failures+=("$*"); echo "$*" >&2; }
 wait_for_file() {
@@ -96,9 +94,6 @@ observe_file_while_process_runs() {
 }
 
 hol=$tmpdir/hol
-mkdir -p "$hol"
-git -C "$hol" init -q
-git_identity "$hol"
 mkdir -p "$hol/bin" "$hol/tools" "$hol/tools/build" "$hol/tools/sequences" "$hol/src/post" "$hol/src/n-bit"
 cat > "$hol/.gitignore" <<'EOF_IGNORE'
 /bin/hol
@@ -180,7 +175,7 @@ chmod +x bin/Holmake
 echo fake-state > bin/hol.state
 SH
 chmod +x "$hol/bin/build"
-hol_rev=$(commit_repo "$hol")
+hol_rev=$(init_git_repo "$hol")
 export HOLBUILD_CANONICAL_HOL_GIT="$hol"
 
 fakebin=$tmpdir/fakebin
@@ -234,8 +229,6 @@ export HOLBUILD_POLYC="$fakebin/polyc"
 
 b=$tmpdir/b
 mkdir -p "$b/src"
-git -C "$b" init -q
-git_identity "$b"
 cat > "$b/holproject.toml" <<TOML
 [holbuild]
 schema = 2
@@ -256,12 +249,10 @@ structure Foo = struct
   val value = true
 end
 SML
-b_rev=$(commit_repo "$b")
+b_rev=$(init_git_repo "$b")
 
 a=$tmpdir/a
 mkdir -p "$a"
-git -C "$a" init -q
-git_identity "$a"
 cat > "$a/holproject.toml" <<TOML
 [holbuild]
 schema = 2
@@ -278,7 +269,7 @@ rev = "$hol_rev"
 git = "$b"
 rev = "$b_rev"
 TOML
-a_rev=$(commit_repo "$a")
+a_rev=$(init_git_repo "$a")
 
 root=$tmpdir/root
 mkdir -p "$root/src"
@@ -568,8 +559,6 @@ fi
 # unbuildable when the reduced toolchain sequence is unavailable.
 legacy_hol=$tmpdir/legacy-hol
 mkdir -p "$legacy_hol/bin" "$legacy_hol/tools/build"
-git -C "$legacy_hol" init -q
-git_identity "$legacy_hol"
 cat > "$legacy_hol/.gitignore" <<'EOF_IGNORE'
 /bin/hol
 /bin/Holmake
@@ -602,7 +591,7 @@ chmod +x bin/Holmake
 echo fake-state > bin/hol.state
 SH
 chmod +x "$legacy_hol/bin/build"
-legacy_hol_rev=$(commit_repo "$legacy_hol")
+legacy_hol_rev=$(init_git_repo "$legacy_hol")
 
 legacy_root=$tmpdir/legacy-root
 mkdir -p "$legacy_root"

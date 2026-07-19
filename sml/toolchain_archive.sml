@@ -8,6 +8,7 @@ exception Error of string
 
 val archive_format = "holbuild-toolchain-archive-v1"
 val action_format = "holbuild-remote-toolchain-action-v1"
+val action_key_domain = "holbuild-remote-toolchain-action-key-v1"
 val internal_manifest_path = ".holbuild-toolchain-archive-manifest"
 val manifest_marker = "identity-text-v1\n"
 val max_manifest_size = 65536
@@ -49,25 +50,8 @@ fun write_text path text =
 fun tar_operation operation =
   operation () handle HolbuildTar.Error msg => die msg
 
-fun split_at_marker text =
-  let
-    val marker_length = size manifest_marker
-    val text_length = size text
-    fun loop i =
-      if i + marker_length > text_length then NONE
-      else if String.substring(text, i, marker_length) = manifest_marker then
-        SOME (String.substring(text, 0, i), String.extract(text, i + marker_length, NONE))
-      else loop (i + 1)
-  in
-    loop 0
-  end
-
 fun manifest_text identity =
-  String.concatWith "\n"
-    [archive_format,
-     "identity-sha256 " ^ HolbuildHash.string_sha256 identity,
-     "identity-size " ^ Int.toString (size identity),
-     manifest_marker ^ identity]
+  archive_format ^ "\n" ^ manifest_marker ^ identity
 
 fun field_value name lines =
   let
@@ -84,30 +68,8 @@ fun field_value name lines =
   end
 
 fun require_manifest identity text =
-  case split_at_marker text of
-      NONE => die "toolchain archive manifest is missing identity"
-    | SOME (header, actual_identity) =>
-        let
-          val lines = String.tokens (fn c => c = #"\n") header
-          val _ =
-            case lines of
-                format :: _ => if format = archive_format then () else die "unsupported toolchain archive format"
-              | [] => die "empty toolchain archive manifest"
-          fun line_value name =
-            let
-              val prefix = name ^ " "
-              val matches = List.mapPartial (fn line => if String.isPrefix prefix line then SOME (String.extract(line, size prefix, NONE)) else NONE) lines
-            in
-              case matches of [value] => value | _ => die ("toolchain archive manifest has invalid " ^ name)
-            end
-          val expected_hash = line_value "identity-sha256"
-          val expected_size = line_value "identity-size"
-          val _ = if expected_hash = HolbuildHash.string_sha256 actual_identity then () else die "toolchain archive identity checksum mismatch"
-          val _ = if expected_size = Int.toString (size actual_identity) then () else die "toolchain archive identity size mismatch"
-          val _ = if actual_identity = identity then () else die "toolchain archive identity does not match this installation"
-        in
-          ()
-        end
+  if text = manifest_text identity then ()
+  else die "toolchain archive identity does not match this installation"
 
 fun validate_extracted_manifest {staging_dir, identity} =
   let val path = Path.concat(staging_dir, internal_manifest_path)
@@ -187,43 +149,23 @@ fun create_archive {entry_dir, identity, archive_path} =
     handle e => (cleanup (); raise e)
   end
 
-fun remote_record identity {sha1, sha256, size} =
-  String.concatWith "\n"
-    [action_format,
-     "identity-sha256=" ^ HolbuildHash.string_sha256 identity,
-     "blob-sha1=" ^ sha1,
-     "archive-sha256=" ^ sha256,
-     "archive-size=" ^ size] ^ "\n"
+fun remote_action_key identity =
+  HolbuildHash.string_sha256 (action_key_domain ^ "\n" ^ identity ^ "\n")
 
-fun parse_remote_record identity text =
+fun remote_record sha1 =
+  String.concatWith "\n" [action_format, "blob-sha1=" ^ sha1] ^ "\n"
+
+fun parse_remote_record text =
   let
     val lines = String.tokens (fn c => c = #"\n") text
     val _ =
       case lines of
           format :: _ => if format = action_format then () else die "unsupported remote toolchain action format"
         | [] => die "empty remote toolchain action"
-    val identity_sha256 = field_value "identity-sha256" lines
     val sha1 = field_value "blob-sha1" lines
-    val sha256 = field_value "archive-sha256" lines
-    val size = field_value "archive-size" lines
-    val _ = if identity_sha256 = HolbuildHash.string_sha256 identity then () else die "remote toolchain action identity mismatch"
     val _ = if HolbuildHash.valid_sha1 sha1 then () else die "remote toolchain action has invalid SHA1"
-    val _ = if HolbuildHash.valid_sha256 sha256 then () else die "remote toolchain action has invalid SHA256"
-    val _ = case Position.fromString size of SOME _ => () | NONE => die "remote toolchain action has invalid archive size"
   in
-    {sha1 = sha1, sha256 = sha256, size = size}
-  end
-
-fun verify_archive_file path {sha1, sha256, size} =
-  let
-    val actual_size = Position.toString (FS.fileSize path)
-    val actual_sha1 = HolbuildHash.file_sha1 path
-    val actual_sha256 = HolbuildHash.file_sha256 path
-  in
-    if actual_size <> size then die "downloaded toolchain archive size mismatch"
-    else if actual_sha1 <> sha1 then die "downloaded toolchain archive SHA1 mismatch"
-    else if actual_sha256 <> sha256 then die "downloaded toolchain archive SHA256 mismatch"
-    else ()
+    sha1
   end
 
 fun extract_archive {archive_path, staging_dir} =
@@ -247,23 +189,22 @@ fun install_archive {archive_path, identity, final_dir} =
   end
 
 fun restore {remote, identity, final_dir} =
-  case HolbuildRemoteCache.get_toolchain_action remote identity of
+  case HolbuildRemoteCache.get_action remote (remote_action_key identity) of
       NONE => false
     | SOME text =>
         let
-          val expected = parse_remote_record identity text
+          val sha1 = parse_remote_record text
           val scratch_dir = restore_scratch_path final_dir
           val archive_path = Path.concat(scratch_dir, "archive.tar")
           fun cleanup () = remove_tree scratch_dir handle _ => ()
           fun fetch () =
-            case HolbuildRemoteCache.fetch_toolchain_blob remote {hash = #sha1 expected, dst = archive_path} of
+            case HolbuildRemoteCache.fetch_toolchain_blob remote {hash = sha1, dst = archive_path} of
                 HolbuildCacheBackend.Hit => ()
               | HolbuildCacheBackend.Miss => die "remote toolchain archive blob is missing"
               | HolbuildCacheBackend.Corrupt detail => die ("remote toolchain archive blob is corrupt: " ^ detail)
         in
           ((FS.mkDir scratch_dir;
             fetch ();
-            verify_archive_file archive_path expected;
             install_archive {archive_path = archive_path, identity = identity, final_dir = final_dir};
             cleanup ();
             true)
@@ -284,13 +225,11 @@ fun publish {remote, identity, entry_dir} =
     ((create_archive {entry_dir = entry_dir, identity = identity, archive_path = archive_path};
       let
         val sha1 = HolbuildHash.file_sha1 archive_path
-        val sha256 = HolbuildHash.file_sha256 archive_path
-        val size = Position.toString (FS.fileSize archive_path)
         val _ = upload sha1
-        val action = remote_record identity {sha1 = sha1, sha256 = sha256, size = size}
+        val action = remote_record sha1
       in
-        case HolbuildRemoteCache.put_toolchain_action remote HolbuildCacheBackend.PutIfAbsentOrSame
-               {identity = identity, text = action} of
+        case HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsentOrSame
+               {key = remote_action_key identity, text = action} of
             result as HolbuildCacheBackend.Published => result
           | result as HolbuildCacheBackend.AlreadyPresent => result
           | HolbuildCacheBackend.Skipped => die "remote cache skipped toolchain action publication"

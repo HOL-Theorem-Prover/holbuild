@@ -28,6 +28,31 @@ cleanup_temp_dir() {
   fi
 }
 
+start_remote_cache_server() {
+  local root=$1
+  local state_dir=$2
+  local control_dir=${3:-}
+  local lib_dir port_file
+  lib_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  port_file=$state_dir/server.port
+  request_log=$state_dir/requests.log
+  mkdir -p "$root" "$state_dir"
+  [[ -z "$control_dir" ]] || mkdir -p "$control_dir"
+  : > "$request_log"
+  python3 "$lib_dir/fixtures/remote_cache_server.py" \
+    "$root" "$port_file" "$request_log" "$control_dir" &
+  server_pid=$!
+  for _ in {1..100}; do
+    [[ -s "$port_file" ]] && break
+    sleep 0.01
+  done
+  [[ -s "$port_file" ]] || {
+    echo "remote cache server did not start" >&2
+    return 1
+  }
+  remote_url="http://127.0.0.1:$(< "$port_file")"
+}
+
 holbuild_pinned_hol_rev() {
   tr -d '[:space:]' < "${HOLBUILD_ROOT:?HOLBUILD_ROOT not set}/vendor/hol/REV"
 }
