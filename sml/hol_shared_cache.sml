@@ -348,56 +348,31 @@ fun build_entry req k =
     build () handle e => (remove_tree run_command final; raise e)
   end
 
-fun read_file path =
-  let
-    val input = TextIO.openIn path
-    fun close () = TextIO.closeIn input handle _ => ()
-  in
-    (TextIO.inputAll input before close ()) handle e => (close (); raise e)
-  end
-
 fun wait_test_gate variable =
   case OS.Process.getEnv variable of
       NONE => ()
-    | SOME path => ignore (read_file path)
+    | SOME path => ignore (HolbuildFileLock.read_text path)
 
 fun platform_value command =
   trim (command_output command) handle Error _ => "unavailable"
-
 
 fun poly_executable_path () =
   let val path = trim (command_output ("command -v " ^ quote (poly_command ())))
   in FS.fullPath path end
 
-fun archive_identity req k =
-  let
-    val material = key_material req
-    val poly_path = poly_executable_path ()
+fun archive_identity k =
+  let val poly_path = poly_executable_path ()
   in
     String.concatWith "\n"
       [HolbuildToolchainArchive.archive_format,
-       "toolchain-format=" ^ format_version,
        "toolchain-key=" ^ k,
-       "toolchain-key-material-sha256=" ^ HolbuildHash.string_sha256 material,
        "holdir=" ^ holdir_for_key k,
        "platform-os=" ^ platform_value "uname -s",
        "platform-arch=" ^ platform_value "uname -m",
        "platform-libc=" ^ platform_value "getconf GNU_LIBC_VERSION",
-       "poly-command=" ^ poly_command (),
-       "poly-version-sha256=" ^ HolbuildHash.string_sha256 (poly_version ()),
-       "poly-executable=" ^ poly_path,
        "poly-executable-sha256=" ^ HolbuildHash.file_sha256 poly_path,
        "analyser-key=" ^ analyser_key ()]
   end
-
-fun toolchain_manifest_matches req k =
-  read_file (manifest_for_key k) = key_material req ^ "\nkey=" ^ k ^ "\n"
-  handle _ => false
-
-fun analyser_manifest_matches k ak =
-  read_file (analyser_manifest_for_key k ak) =
-    analyser_key_material () ^ "\nkey=" ^ ak ^ "\n"
-  handle _ => false
 
 fun heap_loads k =
   let
@@ -416,16 +391,14 @@ fun analyser_responds k ak =
     "holbuild-hol-analyser " ^ analyser_format_version
   handle _ => false
 
-fun complete_entry_contents req k =
+fun complete_entry_contents k =
   let
     val ak = analyser_key ()
     val holdir = holdir_for_key k
   in
     built holdir andalso
-    toolchain_manifest_matches req k andalso
     hol_source_manifest_built k andalso
     analyser_built k ak andalso
-    analyser_manifest_matches k ak andalso
     heap_loads k andalso
     analyser_responds k ak andalso
     clean k holdir
@@ -455,7 +428,7 @@ fun cleanup_restore_state k =
 fun restore_entry req k =
   let
     val final = entry_dir_for_key k
-    val identity = archive_identity req k
+    val identity = archive_identity k
     fun restore url =
       let val remote = HolbuildRemoteCache.remote url
       in
@@ -463,7 +436,7 @@ fun restore_entry req k =
              {remote = remote, identity = identity, final_dir = final} then
           (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_RENAMED";
            wait_test_gate "HOLBUILD_TEST_TOOLCHAIN_RENAMED_GATE";
-           if complete_entry_contents req k then
+           if complete_entry_contents k then
              (write_file (ok_for_key k) "ok\n"; true)
            else die "restored HOL toolchain failed final validation")
         else false
@@ -486,8 +459,6 @@ fun build_or_restore_entry req k =
     (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_LOCAL_FALLBACK";
      wait_test_gate "HOLBUILD_TEST_TOOLCHAIN_LOCAL_FALLBACK_GATE";
      build_entry req k)
-
-
 
 fun ensure_built_with_kernel req =
   let
@@ -524,11 +495,11 @@ fun publish_toolchain_with_kernel req =
         | NONE => die "--publish-toolchain requires a configured remote cache"
     val lock = acquire_lock k
     fun publish () =
-      if validate_entry req k andalso complete_entry_contents req k then
+      if validate_entry req k andalso complete_entry_contents k then
         ignore
           (HolbuildToolchainArchive.publish
              {remote = remote,
-              identity = archive_identity req k,
+              identity = archive_identity k,
               entry_dir = entry_dir_for_key k})
       else die "HOL toolchain is not complete enough to publish"
   in

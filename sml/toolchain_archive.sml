@@ -7,65 +7,24 @@ structure FS = OS.FileSys
 exception Error of string
 
 val archive_format = "holbuild-toolchain-archive-v1"
-val action_format = "holbuild-remote-toolchain-action-v1"
-val action_key_domain = "holbuild-remote-toolchain-action-key-v1"
 val internal_manifest_path = ".holbuild-toolchain-archive-manifest"
 val manifest_marker = "identity-text-v1\n"
 val max_manifest_size = 65536
 
 fun die msg = raise Error msg
-fun quote text = HolbuildHash.quote text
 fun path_exists path = FS.access(path, []) handle OS.SysErr _ => false
 fun is_dir path = FS.isDir path handle OS.SysErr _ => false
 
-fun ensure_dir path =
-  if path = "" orelse path = "." then ()
-  else if path_exists path then ()
-  else (ensure_dir (Path.dir path); FS.mkDir path handle OS.SysErr _ => ())
-
-fun remove_file path = FS.remove path handle OS.SysErr _ => ()
-
-fun remove_tree path =
-  if path = "" orelse path = "." orelse path = "/" then
-    die ("refusing to remove unsafe toolchain archive path: " ^ path)
-  else
-    ignore (OS.Process.system ("rm -rf " ^ quote path))
-
-fun read_text path =
-  let
-    val input = TextIO.openIn path
-    fun close () = TextIO.closeIn input handle _ => ()
-  in
-    (TextIO.inputAll input before close ()) handle e => (close (); raise e)
-  end
-
-fun write_text path text =
-  let
-    val output = TextIO.openOut path
-    fun close () = TextIO.closeOut output handle _ => ()
-  in
-    (TextIO.output(output, text); close ()) handle e => (close (); raise e)
-  end
+val remove_file = HolbuildFileLock.remove_file
+val remove_tree = HolbuildFileLock.remove_tree
+val read_text = HolbuildFileLock.read_text
+val write_text = HolbuildFileLock.write_text
 
 fun tar_operation operation =
   operation () handle HolbuildTar.Error msg => die msg
 
 fun manifest_text identity =
   archive_format ^ "\n" ^ manifest_marker ^ identity
-
-fun field_value name lines =
-  let
-    val prefix = name ^ "="
-    val values =
-      List.mapPartial
-        (fn line => if String.isPrefix prefix line then SOME (String.extract(line, size prefix, NONE)) else NONE)
-        lines
-  in
-    case values of
-        [value] => value
-      | [] => die ("remote toolchain action is missing " ^ name)
-      | _ => die ("remote toolchain action repeats " ^ name)
-  end
 
 fun require_manifest identity text =
   if text = manifest_text identity then ()
@@ -149,24 +108,14 @@ fun create_archive {entry_dir, identity, archive_path} =
     handle e => (cleanup (); raise e)
   end
 
-fun remote_action_key identity =
-  HolbuildHash.string_sha256 (action_key_domain ^ "\n" ^ identity ^ "\n")
-
-fun remote_record sha1 =
-  String.concatWith "\n" [action_format, "blob-sha1=" ^ sha1] ^ "\n"
+fun remote_record sha1 = "blob=" ^ sha1 ^ "\n"
 
 fun parse_remote_record text =
-  let
-    val lines = String.tokens (fn c => c = #"\n") text
-    val _ =
-      case lines of
-          format :: _ => if format = action_format then () else die "unsupported remote toolchain action format"
-        | [] => die "empty remote toolchain action"
-    val sha1 = field_value "blob-sha1" lines
-    val _ = if HolbuildHash.valid_sha1 sha1 then () else die "remote toolchain action has invalid SHA1"
-  in
-    sha1
-  end
+  case HolbuildCacheTransfer.unique_blobs text of
+      [sha1] =>
+        if HolbuildHash.valid_sha1 sha1 then sha1
+        else die "remote toolchain action has invalid SHA1"
+    | _ => die "remote toolchain action must reference exactly one blob"
 
 fun extract_archive {archive_path, staging_dir} =
   tar_operation
@@ -189,7 +138,7 @@ fun install_archive {archive_path, identity, final_dir} =
   end
 
 fun restore {remote, identity, final_dir} =
-  case HolbuildRemoteCache.get_action remote (remote_action_key identity) of
+  case HolbuildRemoteCache.get_action remote identity of
       NONE => false
     | SOME text =>
         let
@@ -229,7 +178,7 @@ fun publish {remote, identity, entry_dir} =
         val action = remote_record sha1
       in
         case HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsentOrSame
-               {key = remote_action_key identity, text = action} of
+               {key = identity, text = action} of
             result as HolbuildCacheBackend.Published => result
           | result as HolbuildCacheBackend.AlreadyPresent => result
           | HolbuildCacheBackend.Skipped => die "remote cache skipped toolchain action publication"

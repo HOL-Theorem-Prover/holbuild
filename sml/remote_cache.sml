@@ -13,22 +13,10 @@ datatype t = RemoteCache of {base_url : string, blobs : blob_map ref}
 val metadata_header = "holbuild-remote-cache-action-v1"
 val manifest_marker = "manifest-text-v1\n"
 
-(* Theory actions are small enough for the original bounded transfer policy.
-   Toolchain archives stream through curl's file I/O but need a separate,
-   configurable minutes-scale bound. *)
+(* Large toolchain archives get a minutes-scale transfer bound without changing
+   the existing theory-action policy. *)
 val curl_max_time_seconds = "30"
-val default_toolchain_curl_max_time_seconds = "1800"
-
-fun positive_decimal text =
-  text <> "" andalso List.all Char.isDigit (String.explode text) andalso
-  (case Int.fromString text of SOME n => n > 0 | NONE => false)
-
-fun toolchain_curl_max_time_seconds () =
-  case OS.Process.getEnv "HOLBUILD_REMOTE_CACHE_TOOLCHAIN_TIMEOUT_SECONDS" of
-      NONE => default_toolchain_curl_max_time_seconds
-    | SOME text =>
-        if positive_decimal text then text
-        else raise Error "HOLBUILD_REMOTE_CACHE_TOOLCHAIN_TIMEOUT_SECONDS must be a positive integer"
+val toolchain_curl_max_time_seconds = "1800"
 
 fun trim_trailing_slashes url =
   let
@@ -189,10 +177,9 @@ fun curl_put_zstd_with_timeout timeout_seconds {url, src, size} =
 
 fun curl_put_zstd request =
   curl_put_zstd_with_timeout curl_max_time_seconds request
-val action_domain = "holbuild-remote-ac-v1"
 
 fun remote_action_key key =
-  HolbuildHash.string_sha256 (action_domain ^ "\n" ^ key ^ "\n")
+  HolbuildHash.string_sha256 ("holbuild-remote-ac-v1\n" ^ key ^ "\n")
 
 fun action_url cache key = base_url cache ^ "/ac/" ^ remote_action_key key
 fun cas_url cache sha256 = base_url cache ^ "/cas/" ^ sha256
@@ -277,12 +264,12 @@ fun metadata_text manifest blobs =
      map (fn {sha1, sha256, size} => "blob " ^ sha1 ^ " " ^ sha256 ^ " " ^ size) blobs @
      [manifest_marker ^ manifest])
 
-fun get_action_at_url cache url =
+fun get_action cache key =
   let
     val tmp = temp_path "action"
     fun cleanup () = remove_file tmp
   in
-    case curl_get {url = url, dst = tmp} of
+    case curl_get {url = action_url cache key, dst = tmp} of
         HolbuildCacheBackend.Hit =>
           let
             val {blobs, manifest} = metadata_manifest (read_text tmp)
@@ -296,9 +283,7 @@ fun get_action_at_url cache url =
   end
   handle _ => NONE
 
-fun get_action cache key = get_action_at_url cache (action_url cache key)
-
-fun put_action_at_url cache lookup policy {key, text, url} =
+fun put_action cache policy {key, text} =
   let
     val refs = HolbuildCacheTransfer.unique_blobs text
     val known_blobs = List.mapPartial (lookup_blob cache) refs
@@ -307,10 +292,11 @@ fun put_action_at_url cache lookup policy {key, text, url} =
       else raise Error ("remote action is missing published blob metadata for " ^ key)
     val metadata = metadata_text text known_blobs
     val tmp = temp_path "action-put"
+    val url = action_url cache key
     fun cleanup () = remove_file tmp
     fun publish () = (write_text tmp metadata; curl_put {url = url, src = tmp} before cleanup ())
   in
-    case lookup () of
+    case get_action cache key of
         SOME existing =>
           (case policy of
                HolbuildCacheBackend.PutIfAbsent => HolbuildCacheBackend.Conflict url
@@ -320,10 +306,6 @@ fun put_action_at_url cache lookup policy {key, text, url} =
       | NONE => publish ()
   end
   handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
-
-fun put_action cache policy {key, text} =
-  put_action_at_url cache (fn () => get_action cache key) policy
-    {key = key, text = text, url = action_url cache key}
 
 fun has_blob cache sha1 = Option.isSome (lookup_blob cache sha1)
 
@@ -355,7 +337,7 @@ fun fetch_blob cache request =
   fetch_blob_with_timeout curl_max_time_seconds cache request
 
 fun fetch_toolchain_blob cache request =
-  fetch_blob_with_timeout (toolchain_curl_max_time_seconds ()) cache request
+  fetch_blob_with_timeout toolchain_curl_max_time_seconds cache request
 
 fun publish_blob_with_timeout timeout_seconds cache {hash, src} =
   let
@@ -380,6 +362,6 @@ fun publish_blob cache request =
   publish_blob_with_timeout curl_max_time_seconds cache request
 
 fun publish_toolchain_blob cache request =
-  publish_blob_with_timeout (toolchain_curl_max_time_seconds ()) cache request
+  publish_blob_with_timeout toolchain_curl_max_time_seconds cache request
 
 end

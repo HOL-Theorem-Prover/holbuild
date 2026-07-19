@@ -391,10 +391,7 @@ remote_cas.mkdir(parents=True, exist_ok=True)
 recorded_sha256 = "0" * 64 if mutation == "digest" else sha256
 (remote_cas / recorded_sha256).write_bytes(archive_bytes)
 
-action = (
-    "holbuild-remote-toolchain-action-v1\n"
-    f"blob-sha1={sha1}\n"
-).encode()
+action = f"blob={sha1}\n".encode()
 metadata = (
     "holbuild-remote-cache-action-v1\n"
     f"manifest-sha256 {hashlib.sha256(action).hexdigest()}\n"
