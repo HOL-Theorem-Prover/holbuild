@@ -93,7 +93,8 @@ fun buildhol_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] buildhol [--trknl]\n\n\
   \Build/reuse the declared HOL tree and print its path. Use --trknl to select\n\
-  \the tracing kernel.\n\n\
+  \the tracing kernel. A configured remote cache restores toolchains and\n\
+  \publishes successful local builds automatically.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun heap_help () = print

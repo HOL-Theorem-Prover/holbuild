@@ -541,19 +541,27 @@ tree. Standard cache entries do not require a trace blob.
 A build can also consult and publish to one Bazel-style HTTP remote cache:
 
 ```sh
-holbuild --remote-cache http://cache.example.org build MyTheory
-HOLBUILD_REMOTE_CACHE_URL=http://cache.example.org holbuild build MyTheory
+holbuild --remote-cache https://cache.example.org build MyTheory
+HOLBUILD_REMOTE_CACHE_URL=https://cache.example.org holbuild build MyTheory
 # or in project-local .holconfig.toml:
 # [remote_cache]
-# url = "http://cache.example.org"
+# url = "https://cache.example.org"
 ```
 
 Remote cache misses or errors fall back to the local cache/source build path.
+A missing HOL toolchain is restored from the same remote cache when its exact
+installation path, platform, and Poly/ML identity match. After a remote miss, a
+successful local toolchain build is published automatically; local and remote
+hits are not re-uploaded, and publication failure is only a warning.
+
 The remote endpoint stores content blobs under `/cas/<sha256>` and holbuild
 cache metadata under `/ac/<action-key>`. CAS transfers use zstd compression when
 supported by the server; action metadata stays small and is sent uncompressed.
 This is a live accelerator, not remote execution and not an immutable release
-registry.
+registry. Remote cache contents are trusted build inputs: cache hits can load
+Poly/ML objects, and restored toolchains execute cached binaries. Use an
+authenticated HTTPS endpoint with trusted writers. Content hashes detect
+corruption but do not authenticate the cache publisher.
 
 For private caches, put credentials in local/CI configuration, not in
 `holproject.toml`. CLI `--remote-cache` overrides `HOLBUILD_REMOTE_CACHE_URL`,
@@ -591,7 +599,9 @@ holbuild --cache-dir /path/to/other/cache import my-build.hbx
 build unless `--build` is passed. The archive stores a global deduplicated blob
 area plus `project/` and `deps/<package>/` package views for the exported action
 manifests. `import` hydrates the global cache; a later `holbuild build MyTheory`
-materialises outputs through the normal cache-restore path.
+materialises outputs through the normal cache-restore path. Import HBX archives
+only from trusted publishers because those cached build outputs may later be
+loaded by Poly/ML.
 
 Use `holbuild export --metadata-out MyTheory.hbx.json` to write a registry
 metadata sidecar for static hosting or GitHub Releases; see

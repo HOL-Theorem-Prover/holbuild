@@ -104,7 +104,12 @@ fun key_material {git, rev, kernel_variant} =
 
 fun key req = HolbuildHash.string_sha1 (key_material req)
 fun standard_request {git, rev} = {git = git, rev = rev, kernel_variant = standard_kernel}
-fun toolchains_dir () = Path.concat(cache_root (), "hol-toolchains")
+fun lexical_absolute path =
+  Path.mkCanonical
+    (if Path.isAbsolute path then path
+     else Path.mkAbsolute {path = path, relativeTo = FS.getDir ()})
+
+fun toolchains_dir () = Path.concat(lexical_absolute (cache_root ()), "hol-toolchains")
 fun entry_dir_for_key k = Path.concat(toolchains_dir (), k)
 fun holdir_for_key k = Path.concat(entry_dir_for_key k, "hol")
 fun manifest_for_key k = Path.concat(entry_dir_for_key k, "manifest")
@@ -142,6 +147,7 @@ fun hol_source_manifest_for_holdir holdir = Path.concat(Path.dir holdir, "hol-so
 
 fun built holdir =
   executable (Path.concat(holdir, "bin/hol")) andalso
+  executable (Path.concat(holdir, "bin/Holmake")) andalso
   executable (Path.concat(holdir, "bin/build")) andalso
   readable (Path.concat(holdir, "bin/hol.state"))
 
@@ -202,7 +208,9 @@ fun validate_entry req k =
       end
   end
 
-fun current_lock_owner lock = SOME (HolbuildFileLock.read_text (lock_owner_path lock)) handle _ => NONE
+
+fun current_lock_owner lock =
+  SOME (HolbuildFileLock.read_text (lock_owner_path lock)) handle _ => NONE
 
 fun lock_owner () =
   String.concatWith "\n"
@@ -330,7 +338,7 @@ fun build_entry req k =
        run_in_dir run_command hol (quote (poly_command ()) ^ " --script tools/smart-configure.sml");
        run_in_dir run_command hol
          ("bin/build " ^ effective_build_args (#kernel_variant req) hol);
-       if built hol then () else die ("HOL build did not produce bin/hol, bin/build, and bin/hol.state in " ^ hol);
+       if built hol then () else die ("HOL build did not produce bin/hol, bin/Holmake, bin/build, and bin/hol.state in " ^ hol);
        generate_hol_source_manifest k;
        if clean k hol then () else die ("HOL build left dirty checkout: " ^ hol ^ "\n" ^ dirty_status k hol);
        write_file (manifest_for_key k) (material ^ "\nkey=" ^ k ^ "\n");
@@ -340,25 +348,163 @@ fun build_entry req k =
     build () handle e => (remove_tree run_command final; raise e)
   end
 
+fun wait_test_gate variable =
+  case OS.Process.getEnv variable of
+      NONE => ()
+    | SOME path => ignore (HolbuildFileLock.read_text path)
+
+fun platform_value command =
+  trim (command_output command) handle Error _ => "unavailable"
+
+fun poly_executable_path () =
+  let val path = trim (command_output ("command -v " ^ quote (poly_command ())))
+  in FS.fullPath path end
+
+fun archive_identity k =
+  let val poly_path = poly_executable_path ()
+  in
+    String.concatWith "\n"
+      [HolbuildToolchainArchive.archive_format,
+       "toolchain-key=" ^ k,
+       "holdir=" ^ holdir_for_key k,
+       "platform-os=" ^ platform_value "uname -s",
+       "platform-arch=" ^ platform_value "uname -m",
+       "platform-libc=" ^ platform_value "getconf GNU_LIBC_VERSION",
+       "poly-executable-sha256=" ^ HolbuildHash.file_sha256 poly_path,
+       "analyser-key=" ^ analyser_key ()]
+  end
+
+fun heap_loads k =
+  let
+    val holdir = holdir_for_key k
+    val hol = Path.concat(holdir, "bin/hol")
+    val state = Path.concat(holdir, "bin/hol.state")
+    val command =
+      quote hol ^ " --noconfig --holstate " ^ quote state ^
+      " </dev/null >/dev/null 2>&1"
+  in
+    OS.Process.isSuccess (OS.Process.system command)
+  end
+
+fun analyser_responds k ak =
+  trim (command_output (quote (analyser_bin_for_key k ak) ^ " --version")) =
+    "holbuild-hol-analyser " ^ analyser_format_version
+  handle _ => false
+
+fun complete_entry_contents k =
+  let
+    val ak = analyser_key ()
+    val holdir = holdir_for_key k
+  in
+    built holdir andalso
+    hol_source_manifest_built k andalso
+    analyser_built k ak andalso
+    heap_loads k andalso
+    analyser_responds k ak andalso
+    clean k holdir
+  end
+
+fun warn_restore message =
+  TextIO.output(TextIO.stdErr,
+    "holbuild: warning: remote HOL toolchain restore failed; building locally: " ^
+    message ^ "\n")
+
+fun warn_publish message =
+  TextIO.output(TextIO.stdErr,
+    "holbuild: warning: could not publish HOL toolchain to remote cache: " ^
+    message ^ "\n")
+
+fun archive_error_message error =
+  case error of
+      HolbuildToolchainArchive.Error message => message
+    | HolbuildRemoteCache.Error message => message
+    | Error message => message
+    | _ => General.exnMessage error
+
+fun cleanup_restore_state k =
+  let val final = entry_dir_for_key k
+  in
+    HolbuildToolchainArchive.cleanup_staging final;
+    if path_exists final andalso not (path_exists (Path.concat(final, "build.ok"))) then
+      remove_tree (run_mutation k) final
+    else ()
+  end
+
+fun restore_entry k =
+  let
+    val final = entry_dir_for_key k
+    val identity = archive_identity k
+    fun restore url =
+      let val remote = HolbuildRemoteCache.remote url
+      in
+        if HolbuildToolchainArchive.restore
+             {remote = remote, identity = identity, final_dir = final} then
+          (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_RENAMED";
+           wait_test_gate "HOLBUILD_TEST_TOOLCHAIN_RENAMED_GATE";
+           if complete_entry_contents k then
+             (write_file (ok_for_key k) "ok\n"; true)
+           else die "restored HOL toolchain failed final validation")
+        else false
+      end
+  in
+    cleanup_restore_state k;
+    case HolbuildRemoteCacheConfig.url () of
+        NONE => false
+      | SOME url =>
+          (restore url
+           handle error =>
+             (cleanup_restore_state k;
+              warn_restore (archive_error_message error);
+              false))
+  end
+
+fun publish_entry k =
+  case HolbuildRemoteCacheConfig.url () of
+      NONE => ()
+    | SOME url =>
+        ((if path_exists (ok_for_key k) andalso complete_entry_contents k then
+            ignore
+              (HolbuildToolchainArchive.publish
+                 {remote = HolbuildRemoteCache.remote url,
+                  identity = archive_identity k,
+                  entry_dir = entry_dir_for_key k})
+          else die "HOL toolchain is not complete enough to publish")
+         handle error => warn_publish (archive_error_message error))
+
+fun restore_or_build_entry req k =
+  if restore_entry k then false
+  else
+    (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_LOCAL_FALLBACK";
+     wait_test_gate "HOLBUILD_TEST_TOOLCHAIN_LOCAL_FALLBACK_GATE";
+     ignore (build_entry req k);
+     true)
+
+fun finish_entry req k =
+  let
+    val built_locally =
+      if validate_entry req k then
+        (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_REVALIDATED";
+         false)
+      else restore_or_build_entry req k
+    val _ = if hol_source_manifest_built k then () else generate_hol_source_manifest k
+    val _ = ignore (build_analyser k)
+    val _ = if built_locally then publish_entry k else ()
+  in
+    holdir_for_key k
+  end
+
 fun ensure_built_with_kernel req =
   let
-    val material = key_material req
-    val k = HolbuildHash.string_sha1 material
+    val k = key req
     val ak = analyser_key ()
   in
     if validate_entry req k andalso hol_source_manifest_built k andalso analyser_built k ak then holdir_for_key k
     else
-      let val l = acquire_lock k
+      let val lock = acquire_lock k
       in
         (await_mutation_quiescence k;
-         (if validate_entry req k then
-            (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_REVALIDATED"; holdir_for_key k)
-          else build_entry req k;
-          if hol_source_manifest_built k then () else generate_hol_source_manifest k;
-          ignore (build_analyser k);
-          holdir_for_key k)
-         before release_lock l)
-        handle e => (release_lock l; raise e)
+         finish_entry req k before release_lock lock)
+        handle error => (release_lock lock; raise error)
       end
   end
 

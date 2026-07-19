@@ -13,105 +13,9 @@ cleanup() {
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
   fi
-  rm -rf "$tmpdir"
+  cleanup_temp_dir "$tmpdir"
 }
 trap cleanup EXIT
-
-write_server() {
-  local script=$1
-  cat > "$script" <<'PY'
-import http.server
-import os
-import pathlib
-import subprocess
-import sys
-import tempfile
-import urllib.parse
-
-root = pathlib.Path(sys.argv[1]).resolve()
-port_file = pathlib.Path(sys.argv[2])
-request_log = pathlib.Path(sys.argv[3])
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    def object_path(self):
-        path = urllib.parse.urlparse(self.path).path.lstrip('/')
-        if '..' in pathlib.PurePosixPath(path).parts:
-            self.send_response(400)
-            self.end_headers()
-            return None
-        return root / path
-
-    def zstd_compress(self, data):
-        return subprocess.check_output(['zstd', '-q', '-c'], input=data)
-
-    def zstd_decompress(self, data):
-        return subprocess.check_output(['zstd', '-q', '-d', '-c'], input=data)
-
-    def accepts_zstd(self):
-        return 'zstd' in self.headers.get('Accept-Encoding', '')
-
-    def log_request_path(self):
-        with request_log.open('a') as log:
-            log.write(urllib.parse.urlparse(self.path).path + '\n')
-
-    def do_GET(self):
-        self.log_request_path()
-        path = self.object_path()
-        if path is None:
-            return
-        if not path.is_file():
-            self.send_response(404)
-            self.end_headers()
-            return
-        data = path.read_bytes()
-        compressed = self.accepts_zstd() and '/cas/' in self.path
-        if compressed:
-            data = self.zstd_compress(data)
-        self.send_response(200)
-        if compressed:
-            self.send_header('Content-Encoding', 'zstd')
-        self.send_header('Content-Length', str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def do_PUT(self):
-        self.log_request_path()
-        path = self.object_path()
-        if path is None:
-            return
-        length = int(self.headers.get('Content-Length', '0'))
-        data = self.rfile.read(length)
-        if self.headers.get('Content-Encoding') == 'zstd':
-            data = self.zstd_decompress(data)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
-        self.send_response(201)
-        self.end_headers()
-
-    def log_message(self, fmt, *args):
-        pass
-
-server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
-port_file.write_text(str(server.server_address[1]))
-server.serve_forever()
-PY
-}
-
-start_server() {
-  local root=$1
-  local script=$tmpdir/server.py
-  local port_file=$tmpdir/server.port
-  request_log=$tmpdir/request-paths.log
-  write_server "$script"
-  python3 "$script" "$root" "$port_file" "$request_log" &
-  server_pid=$!
-  for _ in {1..50}; do
-    [[ -s "$port_file" ]] && break
-    sleep 0.1
-  done
-  [[ -s "$port_file" ]] || { echo "remote cache server did not start" >&2; exit 1; }
-  remote_url="http://127.0.0.1:$(cat "$port_file")"
-}
 
 write_project() {
   local project=$1
@@ -142,7 +46,8 @@ import pathlib
 import re
 import sys
 
-paths = pathlib.Path(sys.argv[1]).read_text().splitlines()
+requests = pathlib.Path(sys.argv[1]).read_text().splitlines()
+paths = [request.split(" ", 1)[1] for request in requests]
 action_paths = [path for path in paths if path.startswith("/ac/")]
 if not action_paths:
     raise SystemExit("remote cache server observed no action-cache requests")
@@ -157,8 +62,7 @@ PY
 }
 
 remote_root=$tmpdir/remote
-mkdir -p "$remote_root"
-start_server "$remote_root"
+start_remote_cache_server "$remote_root" "$tmpdir/server"
 
 first=$tmpdir/first
 second=$tmpdir/second

@@ -62,17 +62,21 @@ fun temp_file_near path =
   Path.concat(Path.dir path,
               "." ^ Path.file path ^ "." ^ Path.file (FS.tmpName ()) ^ ".tmp")
 
-fun run command error =
-  if OS.Process.isSuccess (OS.Process.system command) then ()
-  else raise Error error
+fun tar_operation operation =
+  operation () handle HolbuildTar.Error msg => raise Error msg
 
 fun tar_create {stage_dir, archive_tmp} =
-  run ("tar -C " ^ quote stage_dir ^ " -cf " ^ quote archive_tmp ^ " " ^ quote payload_dir)
-      ("could not create cache archive: " ^ archive_tmp)
+  tar_operation
+    (fn () => HolbuildTar.create
+      {archive_path = archive_tmp,
+       sources = [(stage_dir, [payload_dir])],
+       excludes = [],
+       hard_dereference = false})
 
 fun tar_extract {archive_path, stage_dir} =
-  run ("tar -C " ^ quote stage_dir ^ " -xf " ^ quote archive_path)
-      ("could not extract cache archive: " ^ archive_path)
+  tar_operation
+    (fn () => HolbuildTar.extract
+      {archive_path = archive_path, destination = stage_dir})
 
 fun rename_new {old, new} =
   FS.rename {old = old, new = new}
