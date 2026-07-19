@@ -39,7 +39,8 @@ val repl_smoke_thm = store_thm("repl_smoke_thm", ``T``, ACCEPT_TAC TRUTH);
 val _ = export_theory();
 SML
 
-(cd "$project" && "$HOLBUILD_BIN" build ATheory) > "$tmpdir/build.log" 2>&1
+(cd "$project" && "$HOLBUILD_BIN" build ATheory stringSyntax) > "$tmpdir/build.log" 2>&1
+require_file "$project/.holbuild/packages/hol/obj/src/string/stringSyntax.ui"
 
 repl_log=$tmpdir/repl.log
 (
@@ -54,10 +55,13 @@ require_grep "HolbuildRuntime.load \"ATheory\"" "$context"
 
 run_script=$tmpdir/run-smoke.sml
 cat > "$run_script" <<'SML'
+val _ = load "stringSyntax";
+val _ = print "RUN_PACKAGE_LOAD_OK\n";
 val _ = (ATheory.repl_smoke_thm; print "RUN_SMOKE_OK\n");
 SML
 run_log=$tmpdir/run.log
 (cd "$project" && "$HOLBUILD_BIN" run "$run_script") > "$run_log" 2>&1
+require_grep "RUN_PACKAGE_LOAD_OK" "$run_log"
 require_grep "RUN_SMOKE_OK" "$run_log"
 
 no_run_loads=$tmpdir/no-run-loads
@@ -71,7 +75,10 @@ path.write_text(text)
 PY
 manual_repl_log=$tmpdir/manual-repl.log
 (
+  printf 'load "stringSyntax";\n'
+  printf 'val _ = print "MANUAL_REPL_PACKAGE_LOAD_OK\\n";\n'
   printf 'load "ATheory";\n'
   printf 'val _ = (ATheory.repl_smoke_thm; print "MANUAL_REPL_LOAD_OK\\n");\n'
 ) | (cd "$no_run_loads" && timeout 20 "$HOLBUILD_BIN" repl) > "$manual_repl_log" 2>&1
+require_grep "MANUAL_REPL_PACKAGE_LOAD_OK" "$manual_repl_log"
 require_grep "MANUAL_REPL_LOAD_OK" "$manual_repl_log"
