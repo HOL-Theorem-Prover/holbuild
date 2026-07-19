@@ -3,6 +3,7 @@ struct
 
 exception Error of string
 fun die msg = raise Error msg
+fun warn msg = TextIO.output(TextIO.stdErr, "holbuild: warning: " ^ msg ^ "\n")
 
 structure Path = OS.Path
 
@@ -10,6 +11,14 @@ fun lookup table key = TOML.lookupInTable table key
 fun key_text key = String.concatWith "." key
 fun table_keys table = map (fn (name, _) => name) table
 fun member value values = List.exists (fn existing => existing = value) values
+
+val deprecated_exclude_warnings : string list ref = ref []
+fun warn_deprecated_exclude context path =
+  if member context (!deprecated_exclude_warnings) then ()
+  else
+    (deprecated_exclude_warnings := context :: !deprecated_exclude_warnings;
+     warn (context ^ " glob pattern \"" ^ path ^ "\" is deprecated; use " ^
+           context ^ "_globs instead"))
 
 fun require_known_fields context allowed table =
   case List.filter (fn name => not (member name allowed)) (table_keys table) of
@@ -167,18 +176,19 @@ fun concrete_package_relative_path field path =
   end
 
 fun glob_like path = CharVector.exists (fn c => c = #"*" orelse c = #"?") path
-fun concrete_excludes context paths =
+fun split_deprecated_excludes context paths =
   let
-    fun one path =
-      let val path = package_relative_path context path
-      in
-        if glob_like path then
-          die (context ^ " entries must be concrete paths; use " ^ context ^
-               "_globs: " ^ path)
-        else concrete_package_relative_path context path
-      end
+    fun one (path, (excludes, globs)) =
+      if glob_like path then
+        let val path = package_relative_path context path
+        in
+          warn_deprecated_exclude context path;
+          (excludes, path :: globs)
+        end
+      else (concrete_package_relative_path context path :: excludes, globs)
+    val (excludes, globs) = List.foldl one ([], []) paths
   in
-    map one paths
+    (rev excludes, rev globs)
   end
 
 fun safe_materialized_dependency_name name =

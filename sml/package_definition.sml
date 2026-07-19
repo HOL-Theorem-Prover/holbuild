@@ -421,8 +421,9 @@ fun parse_build table : build_definition =
       case build of NONE => default
         | SOME value => Option.getOpt(string_array_field_opt value name, default)
     val members = package_relative_paths "build.members" (build_strings "members" ["."])
-    val excludes = concrete_excludes "build.exclude" (build_strings "exclude" [])
-    val exclude_globs =
+    val (excludes, deprecated_globs) =
+      split_deprecated_excludes "build.exclude" (build_strings "exclude" [])
+    val exclude_globs = deprecated_globs @
       package_relative_paths "build.exclude_globs" (build_strings "exclude_globs" [])
     val roots = build_roots_from_manifest build_strings
     val root_groups = build_root_groups_from_manifest build_strings

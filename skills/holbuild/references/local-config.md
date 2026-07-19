@@ -20,7 +20,7 @@ Dependency overrides are local-only source substitutions. The committed manifest
 
 ## Build excludes
 
-`[build].exclude` in `.holconfig.toml` is **appended** to the root package's manifest `[build].exclude`, not a replacement. Use it for workstation-specific concrete paths/subtrees (worktrees, local scratch) that shouldn't affect the committed manifest. Entries must be concrete paths; use `[build].exclude_globs` for glob filters. Both local exclusion fields apply only to the root package; dependency packages retain the source universe declared by their own committed manifests.
+`[build].exclude` in `.holconfig.toml` is **appended** to the root package's manifest `[build].exclude`, not a replacement. Use it for workstation-specific concrete paths/subtrees (worktrees, local scratch) that shouldn't affect the committed manifest. For backwards compatibility, glob entries are accepted with a deprecation warning and treated as local `[build].exclude_globs`; new configuration should use that explicit field. Both local exclusion fields apply only to the root package; dependency packages retain the source universe declared by their own committed manifests.
 
 ## Build jobs and timeout
 

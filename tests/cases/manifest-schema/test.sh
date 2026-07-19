@@ -199,7 +199,7 @@ path = "../custom"
 TOML
 expect_context_failure bad_from_override "overrides.shim cannot override a from/path/manifest package; override its source dependency hol instead"
 
-for case in unknown_top typo_build bad_group_field bad_group_entry_type bad_group_empty bad_group_name_at bad_group_name_slash bad_group_name_colon bad_group_name_space bad_group_abs_include bad_group_parent_include bad_root_groups_type bad_root_groups_unknown bad_exclude_type bad_exclude_globs_type bad_exclude_trailing_slash bad_exclude_dot bad_roots_type bad_root_timeout bad_root_timeout_group absolute_member parent_exclude no_paths_includes bad_type bad_project_name bad_action_field bad_action_type bad_action_deps_type bad_action_loads_type bad_action_abs_input bad_action_abs_dep bad_action_parent_input bad_action_mixed_parent_dep bad_generate_field bad_generate_command_type bad_generate_abs_output bad_generate_parent_output bad_from_parent_path bad_from_parent_manifest; do
+for case in unknown_top typo_build bad_group_field bad_group_entry_type bad_group_empty bad_group_name_at bad_group_name_slash bad_group_name_colon bad_group_name_space bad_group_abs_include bad_group_parent_include bad_root_groups_type bad_root_groups_unknown bad_exclude_type bad_exclude_globs_type bad_exclude_trailing_slash bad_exclude_dot bad_roots_type bad_root_timeout bad_root_timeout_group absolute_member absolute_exclude parent_exclude no_paths_includes bad_type bad_project_name bad_action_field bad_action_type bad_action_deps_type bad_action_loads_type bad_action_abs_input bad_action_abs_dep bad_action_parent_input bad_action_mixed_parent_dep bad_generate_field bad_generate_command_type bad_generate_abs_output bad_generate_parent_output bad_from_parent_path bad_from_parent_manifest; do
   make_project "$case"
 done
 
@@ -360,6 +360,13 @@ write_manifest absolute_member <<'TOML'
 members = ["/tmp/src"]
 TOML
 expect_context_failure absolute_member "build.members must be package-root-relative: /tmp/src"
+
+write_manifest absolute_exclude <<'TOML'
+
+[build]
+exclude = ["/tmp/generated/*"]
+TOML
+expect_context_failure absolute_exclude "build.exclude must be package-root-relative: /tmp/generated/\*"
 
 write_manifest parent_exclude <<'TOML'
 
