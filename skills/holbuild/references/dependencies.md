@@ -1,13 +1,19 @@
 # Dependency management
 
-The current manifest language supports exact dependency management; the legacy `schema = 2` marker is optional. A resolved project graph must contain exactly one package named `hol`; this package is the project HOL toolchain and is declared with an exact git revision.
+The current manifest language supports exact dependency management.
+`[holbuild].minimum_version` is an optional `MAJOR.MINOR.PATCH` version floor.
+When present, the running holbuild version must be at least that version; when
+omitted, holbuild performs no minimum-version check. The legacy `schema = 2`
+marker is optional. A resolved project graph must contain exactly one package
+named `hol`; this package is the project HOL toolchain and is declared with an
+exact git revision.
 
 ## Project HOL
 
 ```toml
 [holbuild]
 schema = 2
-minimum_version = "0.10.0"
+minimum_version = "0.10.0"  # optional version floor
 
 [dependencies.hol]
 git = "https://github.com/HOL-Theorem-Prover/HOL.git"
@@ -62,7 +68,7 @@ manifest = "shims/keccak.toml"
 # shims/keccak.toml
 [holbuild]
 schema = 2
-minimum_version = "0.10.0"
+minimum_version = "0.10.0"  # optional version floor
 
 [project]
 name = "keccak"

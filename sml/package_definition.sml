@@ -85,7 +85,7 @@ type metadata = package_metadata
 type runtime =
   {run_heap : string option, run_loads : string list, heaps : heap list,
    generators : generator list}
-type compatibility = {minimum_version : string}
+type compatibility = {minimum_version : string option}
 
 fun is_hex c = Char.isDigit c orelse (#"a" <= c andalso c <= #"f")
 fun validate_git_rev rev =
@@ -441,7 +441,7 @@ fun validate_compatibility table =
   let
     val holbuild =
       case table_field table ["holbuild"] of
-          NONE => die "holproject.toml must declare [holbuild] minimum_version"
+          NONE => []
         | SOME value => value
     val _ = require_known_fields "holbuild"
               ["schema", "minimum_version", "required_version"] holbuild
@@ -455,15 +455,15 @@ fun validate_compatibility table =
         | SOME n =>
             if n = IntInf.fromInt 2 then ()
             else die "only legacy holproject schema 2 is supported"
-    val minimum_version =
-      case string_at holbuild ["minimum_version"] of
-          NONE => die "holproject.toml must declare holbuild.minimum_version"
-        | SOME "" => die "holbuild.minimum_version must not be empty"
-        | SOME value => value
+    val minimum_version = string_at holbuild ["minimum_version"]
     val _ =
-      (HolbuildVersion.require_at_least minimum_version
-       handle HolbuildVersion.Error msg =>
-         die ("invalid holbuild.minimum_version: " ^ msg))
+      case minimum_version of
+          NONE => ()
+        | SOME "" => die "holbuild.minimum_version must not be empty"
+        | SOME value =>
+            (HolbuildVersion.require_at_least value
+             handle HolbuildVersion.Error msg =>
+               die ("invalid holbuild.minimum_version: " ^ msg))
   in
     {minimum_version = minimum_version}
   end
