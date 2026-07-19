@@ -188,7 +188,7 @@ export HOLBUILD_TEST_BUILD_COUNT=$build_count
 export HOLBUILD_CACHE=$cache
 
 publish_log=$tmpdir/publish.log
-(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol --publish-toolchain) > "$publish_log" 2>&1
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$publish_log" 2>&1
 published_holdir=$(tail -n 1 "$publish_log")
 [[ $(wc -l < "$build_count") -eq 1 ]]
 require_file "$published_holdir/bin/hol"
@@ -204,6 +204,7 @@ original_action=$tmpdir/original-action
 original_archive=$tmpdir/original-archive
 cp "${action_files[0]}" "$original_action"
 cp "${cas_files[0]}" "$original_archive"
+published_put_count=$(grep -c '^PUT ' "$request_log")
 
 rm -rf "$cache/hol-toolchains"
 restore_log=$tmpdir/restore.log
@@ -226,17 +227,18 @@ analyser_dirs=("$(dirname "$restored_holdir")"/analysers/*)
 "${analyser_dirs[0]}/bin/holbuild-hol-analyser" --version > "$tmpdir/analyser-version"
 require_grep '^holbuild-hol-analyser holbuild-hol-analyser-v1$' "$tmpdir/analyser-version"
 require_grep '^GET /cas/' "$request_log"
+[[ $(grep -c '^PUT ' "$request_log") -eq "$published_put_count" ]]
 
 initial_put_count=$(grep -c '^PUT ' "$request_log")
 initial_cas_get_count=$(grep -c '^GET /cas/' "$request_log")
 
-# A different absolute installation path must select a different AC record.
-# The miss builds locally, and ordinary buildhol must not publish.
+# A different absolute installation path selects a different AC record. Its
+# successful local fallback is published automatically.
 other_cache=$tmpdir/other-cache
 wrong_path_log=$tmpdir/wrong-path.log
 (cd "$project" && HOLBUILD_CACHE="$other_cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$wrong_path_log" 2>&1
 [[ $(wc -l < "$build_count") -eq 2 ]]
-[[ $(grep -c '^PUT ' "$request_log") -eq "$initial_put_count" ]]
+[[ $(grep -c '^PUT ' "$request_log") -eq $((initial_put_count + 2)) ]]
 [[ $(grep -c '^GET /cas/' "$request_log") -eq "$initial_cas_get_count" ]]
 
 # The Poly executable digest is part of remote identity even when its version
@@ -247,7 +249,7 @@ rm -rf "$cache/hol-toolchains"
 wrong_poly_log=$tmpdir/wrong-poly.log
 (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$wrong_poly_log" 2>&1
 [[ $(wc -l < "$build_count") -eq 3 ]]
-[[ $(grep -c '^PUT ' "$request_log") -eq "$initial_put_count" ]]
+[[ $(grep -c '^PUT ' "$request_log") -eq $((initial_put_count + 4)) ]]
 [[ $(grep -c '^GET /cas/' "$request_log") -eq "$initial_cas_get_count" ]]
 cp "$tmpdir/original-poly" "$fakebin/poly"
 chmod +x "$fakebin/poly"
@@ -268,7 +270,7 @@ rm -rf "$cache/hol-toolchains"
 wrong_platform_log=$tmpdir/wrong-platform.log
 (cd "$project" && PATH="$platformbin:$PATH" "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$wrong_platform_log" 2>&1
 [[ $(wc -l < "$build_count") -eq 4 ]]
-[[ $(grep -c '^PUT ' "$request_log") -eq "$initial_put_count" ]]
+[[ $(grep -c '^PUT ' "$request_log") -eq $((initial_put_count + 6)) ]]
 [[ $(grep -c '^GET /cas/' "$request_log") -eq "$initial_cas_get_count" ]]
 
 # The exact path identity must use the same spelling embedded by the HOL build.
@@ -283,7 +285,7 @@ symlink_publish_log=$tmpdir/symlink-publish.log
 if (cd "$project" && \
     HOLBUILD_CACHE="$symlink_cache" \
     HOLBUILD_TEST_BUILD_COUNT="$symlink_build_count" \
-    "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol --publish-toolchain) \
+    "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) \
     > "$symlink_publish_log" 2>&1; then
   symlink_holdir=$(tail -n 1 "$symlink_publish_log")
   require_file "$symlink_holdir/bin/Holmake"

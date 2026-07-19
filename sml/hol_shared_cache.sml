@@ -409,7 +409,12 @@ fun warn_restore message =
     "holbuild: warning: remote HOL toolchain restore failed; building locally: " ^
     message ^ "\n")
 
-fun restore_error_message error =
+fun warn_publish message =
+  TextIO.output(TextIO.stdErr,
+    "holbuild: warning: could not publish HOL toolchain to remote cache: " ^
+    message ^ "\n")
+
+fun archive_error_message error =
   case error of
       HolbuildToolchainArchive.Error message => message
     | HolbuildRemoteCache.Error message => message
@@ -425,7 +430,7 @@ fun cleanup_restore_state k =
     else ()
   end
 
-fun restore_entry req k =
+fun restore_entry k =
   let
     val final = entry_dir_for_key k
     val identity = archive_identity k
@@ -449,65 +454,60 @@ fun restore_entry req k =
           (restore url
            handle error =>
              (cleanup_restore_state k;
-              warn_restore (restore_error_message error);
+              warn_restore (archive_error_message error);
               false))
   end
 
-fun build_or_restore_entry req k =
-  if restore_entry req k then holdir_for_key k
+fun publish_entry k =
+  case HolbuildRemoteCacheConfig.url () of
+      NONE => ()
+    | SOME url =>
+        ((if path_exists (ok_for_key k) andalso complete_entry_contents k then
+            ignore
+              (HolbuildToolchainArchive.publish
+                 {remote = HolbuildRemoteCache.remote url,
+                  identity = archive_identity k,
+                  entry_dir = entry_dir_for_key k})
+          else die "HOL toolchain is not complete enough to publish")
+         handle error => warn_publish (archive_error_message error))
+
+fun restore_or_build_entry req k =
+  if restore_entry k then false
   else
     (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_LOCAL_FALLBACK";
      wait_test_gate "HOLBUILD_TEST_TOOLCHAIN_LOCAL_FALLBACK_GATE";
-     build_entry req k)
+     ignore (build_entry req k);
+     true)
+
+fun finish_entry req k =
+  let
+    val built_locally =
+      if validate_entry req k then
+        (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_REVALIDATED";
+         false)
+      else restore_or_build_entry req k
+    val _ = if hol_source_manifest_built k then () else generate_hol_source_manifest k
+    val _ = ignore (build_analyser k)
+    val _ = if built_locally then publish_entry k else ()
+  in
+    holdir_for_key k
+  end
 
 fun ensure_built_with_kernel req =
   let
-    val material = key_material req
-    val k = HolbuildHash.string_sha1 material
+    val k = key req
     val ak = analyser_key ()
   in
     if validate_entry req k andalso hol_source_manifest_built k andalso analyser_built k ak then holdir_for_key k
     else
-      let val l = acquire_lock k
+      let val lock = acquire_lock k
       in
         (await_mutation_quiescence k;
-         (if validate_entry req k then
-            (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_REVALIDATED";
-             holdir_for_key k)
-          else build_or_restore_entry req k;
-          if hol_source_manifest_built k then () else generate_hol_source_manifest k;
-          ignore (build_analyser k);
-          holdir_for_key k)
-         before release_lock l)
-        handle e => (release_lock l; raise e)
+         finish_entry req k before release_lock lock)
+        handle error => (release_lock lock; raise error)
       end
   end
 
 fun ensure_built req = ensure_built_with_kernel (standard_request req)
-
-fun publish_toolchain_with_kernel req =
-  let
-    val _ = ensure_built_with_kernel req
-    val k = key req
-    val remote =
-      case HolbuildRemoteCacheConfig.url () of
-          SOME url => HolbuildRemoteCache.remote url
-        | NONE => die "--publish-toolchain requires a configured remote cache"
-    val lock = acquire_lock k
-    fun publish () =
-      if validate_entry req k andalso complete_entry_contents k then
-        ignore
-          (HolbuildToolchainArchive.publish
-             {remote = remote,
-              identity = archive_identity k,
-              entry_dir = entry_dir_for_key k})
-      else die "HOL toolchain is not complete enough to publish"
-  in
-    (publish () before release_lock lock)
-    handle error => (release_lock lock; raise error)
-  end
-
-fun publish_toolchain req =
-  publish_toolchain_with_kernel (standard_request req)
 
 end

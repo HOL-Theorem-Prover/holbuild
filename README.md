@@ -549,6 +549,11 @@ HOLBUILD_REMOTE_CACHE_URL=https://cache.example.org holbuild build MyTheory
 ```
 
 Remote cache misses or errors fall back to the local cache/source build path.
+A missing HOL toolchain is restored from the same remote cache when its exact
+installation path, platform, and Poly/ML identity match. After a remote miss, a
+successful local toolchain build is published automatically; local and remote
+hits are not re-uploaded, and publication failure is only a warning.
+
 The remote endpoint stores content blobs under `/cas/<sha256>` and holbuild
 cache metadata under `/ac/<action-key>`. CAS transfers use zstd compression when
 supported by the server; action metadata stays small and is sent uncompressed.
