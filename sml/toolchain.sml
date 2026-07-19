@@ -237,16 +237,30 @@ fun load_path_dirs_under root =
     visit root []
   end
 
+fun dependency_object_roots hol_dir =
+  let
+    val deps = Path.concat(hol_dir, "deps")
+    fun obj_root entry = Path.concat(Path.concat(deps, entry), "obj")
+  in
+    List.filter is_directory (map obj_root (directory_entries deps))
+  end
+
 fun package_object_root package =
   Path.concat(HolbuildProject.package_artifact_root package, "obj")
 
-fun run_context_load_path_dirs packages =
-  rev (List.foldl
-         (fn (package, dirs) =>
-             List.foldl (fn (path, acc) => add_unique_path path acc)
-                        dirs
-                        (load_path_dirs_under (package_object_root package)))
-         [] packages)
+fun run_context_load_path_dirs (project : HolbuildProject.t) packages =
+  let
+    val hol_dir = Path.concat(HolbuildProject.artifact_root project, ".holbuild")
+    val object_roots =
+      map package_object_root packages @ dependency_object_roots hol_dir
+  in
+    rev (List.foldl
+           (fn (object_root, dirs) =>
+               List.foldl (fn (path, acc) => add_unique_path path acc)
+                          dirs
+                          (load_path_dirs_under object_root))
+           [] object_roots)
+  end
 
 fun runtime_helper_path () =
   Path.concat(HolbuildRuntimePaths.source_root, "sml/holbuild_runtime.sml")
@@ -260,7 +274,7 @@ fun write_run_context (project : HolbuildProject.t) packages =
     val root = HolbuildProject.artifact_root project
     val hol_dir = Path.concat(root, ".holbuild")
     val context = Path.concat(hol_dir, "holbuild-run-context.sml")
-    val load_dirs = run_context_load_path_dirs packages
+    val load_dirs = run_context_load_path_dirs project packages
     val _ = ensure_dir hol_dir
     val out = TextIO.openOut context
       handle e => raise Error ("could not write " ^ context ^ ": " ^ General.exnMessage e)

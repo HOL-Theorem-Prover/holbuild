@@ -82,3 +82,24 @@ manual_repl_log=$tmpdir/manual-repl.log
 ) | (cd "$no_run_loads" && timeout 20 "$HOLBUILD_BIN" repl) > "$manual_repl_log" 2>&1
 require_grep "MANUAL_REPL_PACKAGE_LOAD_OK" "$manual_repl_log"
 require_grep "MANUAL_REPL_LOAD_OK" "$manual_repl_log"
+
+legacy_obj=$no_run_loads/.holbuild/deps/legacy/obj/src
+mkdir -p "$legacy_obj/.hol/objs"
+mv "$no_run_loads/.holbuild/obj/src/ATheory.ui" \
+   "$no_run_loads/.holbuild/obj/src/ATheory.uo" \
+   "$legacy_obj/"
+mv "$no_run_loads/.holbuild/obj/src/.hol/objs/ATheory.ui" \
+   "$no_run_loads/.holbuild/obj/src/.hol/objs/ATheory.uo" \
+   "$legacy_obj/.hol/objs/"
+
+legacy_run_script=$tmpdir/legacy-run.sml
+cat > "$legacy_run_script" <<'SML'
+val _ = load "ATheory";
+val _ = print "LEGACY_LAYOUT_LOAD_OK\n";
+SML
+legacy_run_log=$tmpdir/legacy-run.log
+if ! (cd "$no_run_loads" && "$HOLBUILD_BIN" run "$legacy_run_script") > "$legacy_run_log" 2>&1; then
+  cat "$legacy_run_log" >&2
+  exit 1
+fi
+require_grep "LEGACY_LAYOUT_LOAD_OK" "$legacy_run_log"
