@@ -1282,7 +1282,8 @@ fun build_executable tc cli_jobs target = build_heap_kind tc cli_jobs "executabl
 
 fun hol_args_for_project tc project subcommand user_args =
   let
-    val context = HolbuildToolchain.write_run_context project
+    val packages = resolved_packages (resolution_for_toolchain tc) project
+    val context = HolbuildToolchain.write_run_context project packages
     val heap_args =
       case HolbuildProject.abs_run_heap project of
           NONE => ["--holstate", HolbuildToolchain.base_state tc]
