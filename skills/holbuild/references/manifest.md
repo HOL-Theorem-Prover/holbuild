@@ -113,6 +113,12 @@ Unsupported: schema 1, `[dependencies.HOLDIR]`, manifest path dependencies, depe
 
 ## Source discovery
 
+`build.exclude` normally contains concrete package-root-relative paths or
+subtrees. For backwards compatibility, glob entries are accepted with a
+deprecation warning and treated as `build.exclude_globs`; new manifests should
+use the explicit glob field. Build-group `include` and `exclude` entries remain
+concrete-only.
+
 Members can be files or directories. Directories are walked recursively, skipping:
 - Names starting with `.`
 - Names equal to `_build`

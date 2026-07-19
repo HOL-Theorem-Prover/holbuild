@@ -266,10 +266,13 @@ inside the declared source discovery boundary. If `roots` is omitted, no-target
 roots are configured, no-target `build` warns about discoverable theory scripts
 that are outside the roots' dependency closure.
 `[build].exclude` is an explicit package-root-relative path/subtree filter
-applied during source discovery. `[build].exclude_globs` is a package-root-relative
-glob filter for excluding tests, examples, or platform variants from a package
-boundary; neither setting adds search paths or changes dependency resolution. Generated theory artifacts matching
-`*Theory.sml` and `*Theory.sig` are ignored by source discovery by default.
+applied during source discovery. For backwards compatibility, glob entries are
+accepted with a deprecation warning and treated as `[build].exclude_globs`;
+new manifests should use that explicit package-root-relative glob filter for
+excluding tests, examples, or platform variants from a package boundary.
+Neither setting adds search paths or changes dependency resolution. Generated
+theory artifacts matching `*Theory.sml` and `*Theory.sig` are ignored by source
+discovery by default.
 
 Build groups (`[build.groups.NAME]`, referenced as `@name` or via
 `[build].root_groups`) are phony-target grouping metadata. They expand only after
