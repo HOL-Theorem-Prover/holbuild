@@ -25,7 +25,7 @@ and cacheable builds that never require users to reason about the cache.
 Every package in the resolved graph has a manifest. A source file can enter the
 build graph only through a declared package root. Manifests are checked against
 the current language: unknown fields in recognized tables are rejected and
-`minimum_version` is required. The legacy schema-2 marker is optional:
+`[holbuild].minimum_version` is an optional version floor. The legacy schema-2 marker is optional:
 
 ```toml
 [holbuild]
@@ -92,9 +92,10 @@ Supported dependency forms are deliberately narrow:
 
 The current manifest language rejects path dependencies, local overrides, Git
 manifests, branches, tags, ranges, registry names, and multiple versions.
-`[holbuild].minimum_version` is a required `MAJOR.MINOR.PATCH` minimum holbuild
-version check. The legacy `schema = 2` marker is optional, and
-`required_version` is rejected.
+`[holbuild].minimum_version` is an optional `MAJOR.MINOR.PATCH` version floor.
+When present, the running holbuild version must be at least that version; when
+omitted, holbuild performs no minimum-version check. The legacy `schema = 2`
+marker is optional, and `required_version` is rejected.
 
 For a root project, all dependency source checkouts are materialized once under:
 

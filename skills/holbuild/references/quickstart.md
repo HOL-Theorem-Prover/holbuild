@@ -2,7 +2,11 @@
 
 ## Prerequisites
 
-Projects must declare `minimum_version` in `holproject.toml` and the project HOL toolchain as `[dependencies.hol]`; the legacy `schema = 2` marker is optional. Commands that need HOL build or reuse that declared HOL under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`.
+Projects must declare the project HOL toolchain as `[dependencies.hol]` with an
+exact git revision. `[holbuild].minimum_version` is an optional exact
+`MAJOR.MINOR.PATCH` floor; when omitted, holbuild performs no minimum-version
+check. The legacy `schema = 2` marker is optional. Commands that need HOL build
+or reuse the declared HOL under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`.
 
 Building the current external `holbuild` executable requires Poly/ML; the small set of HOL source files needed at compile time is vendored under `vendor/hol`:
 
@@ -19,7 +23,7 @@ That `HOLDIR` is only a test input for holbuild's own test suite; it is not a pr
 # holproject.toml
 [holbuild]
 schema = 2
-minimum_version = "0.10.0"
+minimum_version = "0.10.0"  # optional version floor
 
 [project]
 name = "myproject"

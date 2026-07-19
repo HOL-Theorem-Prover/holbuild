@@ -85,16 +85,6 @@ name = "schema1_rejected"
 TOML
 expect_context_failure schema1_rejected "only legacy holproject schema 2 is supported"
 
-make_project missing_minimum_version
-cat > "$tmpdir/missing_minimum_version/holproject.toml" <<'TOML'
-[holbuild]
-schema = 2
-
-[project]
-name = "missing_minimum_version"
-TOML
-expect_context_failure missing_minimum_version "holproject.toml must declare holbuild.minimum_version"
-
 schema2_repo=$tmpdir/schema2-repo
 mkdir -p "$schema2_repo"
 {
@@ -106,6 +96,33 @@ TOML
 } > "$schema2_repo/holproject.toml"
 schema2_rev=$(init_git_repo "$schema2_repo")
 export HOLBUILD_CANONICAL_HOL_GIT="$schema2_repo"
+
+make_project minimum_version_omitted
+cat > "$tmpdir/minimum_version_omitted/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+
+[project]
+name = "minimum_version_omitted"
+
+[dependencies.hol]
+git = "$schema2_repo"
+rev = "$schema2_rev"
+TOML
+(cd "$tmpdir/minimum_version_omitted" && "$HOLBUILD_BIN" context) > "$tmpdir/minimum_version_omitted.log"
+require_grep "dependency: hol \[git=$schema2_repo, rev=$schema2_rev" "$tmpdir/minimum_version_omitted.log"
+
+make_project holbuild_table_omitted
+cat > "$tmpdir/holbuild_table_omitted/holproject.toml" <<TOML
+[project]
+name = "holbuild_table_omitted"
+
+[dependencies.hol]
+git = "$schema2_repo"
+rev = "$schema2_rev"
+TOML
+(cd "$tmpdir/holbuild_table_omitted" && "$HOLBUILD_BIN" context) > "$tmpdir/holbuild_table_omitted.log"
+require_grep "dependency: hol \[git=$schema2_repo, rev=$schema2_rev" "$tmpdir/holbuild_table_omitted.log"
 
 make_project missing_schema_accepted
 cat > "$tmpdir/missing_schema_accepted/holproject.toml" <<TOML
