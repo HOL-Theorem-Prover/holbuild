@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+default_test_jobs() {
+  nproc 2>/dev/null ||
+    getconf _NPROCESSORS_ONLN 2>/dev/null ||
+    sysctl -n hw.ncpu 2>/dev/null ||
+    printf '1\n'
+}
+
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 HOLBUILD_BIN=${HOLBUILD_BIN:-"$ROOT/bin/holbuild"}
-HOLBUILD_TEST_JOBS=${HOLBUILD_TEST_JOBS:-1}
+HOLBUILD_TEST_JOBS=${HOLBUILD_TEST_JOBS:-$(default_test_jobs)}
 export HOLBUILD_ROOT="$ROOT"
 export HOLBUILD_TEST_GLOBAL_CACHE="${HOLBUILD_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/holbuild}"
 
