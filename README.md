@@ -157,11 +157,13 @@ To build that HOL toolchain ahead of time, for example in CI, run:
 holbuild buildhol
 ```
 
-With a configured remote cache, `buildhol --publish` also ensures a restore-usable
-toolchain archive for the selected toolchain identity is available remotely. An
-already-present valid remote entry is accepted without re-upload. Unlike
-automatic write-through publication, an explicitly requested publication
-failure fails the command:
+With a configured remote cache, `buildhol --publish` succeeds only after it has
+observed and validated a restore-usable archive for the selected toolchain
+identity during publication. An already-present valid entry is accepted without
+re-upload; a valid concurrent same-identity entry is accepted without replacing
+local bytes. This is not a durability guarantee: later replacement or eviction
+can make a future restore fail and fall back to a local build. An explicitly
+requested publication failure fails the command:
 
 ```sh
 holbuild --remote-cache https://cache.example.org buildhol --publish
@@ -566,10 +568,14 @@ A missing HOL toolchain is restored from the same remote cache when its exact
 installation path, platform, and Poly/ML identity match. After a remote miss, a
 successful local toolchain build is published automatically; local and remote
 hits are not re-uploaded, and automatic publication failure is only a warning.
-`holbuild buildhol --publish` ensures a restore-usable toolchain archive for the
-selected toolchain identity is available remotely; an already-present valid
-remote entry is accepted without re-upload. It requires a configured remote
-cache and treats publication failure as fatal.
+`holbuild buildhol --publish` succeeds only after it has observed and validated
+a restore-usable archive for the selected toolchain identity during publication.
+The archive may be its own upload or a valid concurrent same-identity entry;
+accepting the latter does not replace local bytes. This does not guarantee that
+the action or archive remains present after the command returns: later
+replacement or eviction can make a consumer's restore fail and fall back to a
+local build. Explicit publication requires a configured remote cache and treats
+failure as fatal.
 
 The remote endpoint stores content blobs under `/cas/<sha256>` and holbuild
 cache metadata under `/ac/<action-key>`. CAS transfers use zstd compression when

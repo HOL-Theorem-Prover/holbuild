@@ -94,10 +94,12 @@ fun buildhol_help () = print
   \  holbuild [GLOBAL OPTIONS] buildhol [--trknl] [--publish]\n\n\
   \Build/reuse the declared HOL tree and print its path. Use --trknl to select\n\
   \the tracing kernel. A configured remote cache restores toolchains and\n\
-  \publishes successful local builds automatically. Use --publish to ensure a\n\
-  \restore-usable toolchain archive for the selected toolchain identity is\n\
-  \available remotely. An already-present valid remote entry is accepted without\n\
-  \re-upload; publication failure is fatal.\n\n\
+  \publishes successful local builds automatically. With --publish, success\n\
+  \means holbuild observed and validated a restore-usable archive for the\n\
+  \selected toolchain identity during publication. A valid concurrent\n\
+  \same-identity entry is accepted without replacing local bytes. Later cache\n\
+  \replacement or eviction can make a future restore fail; publication failure\n\
+  \is fatal.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun heap_help () = print
