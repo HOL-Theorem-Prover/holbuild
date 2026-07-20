@@ -283,18 +283,41 @@ fun get_action cache key =
   end
   handle _ => NONE
 
-fun put_action cache policy {key, text} =
+fun action_metadata cache key text =
   let
     val refs = HolbuildCacheTransfer.unique_blobs text
     val known_blobs = List.mapPartial (lookup_blob cache) refs
     val _ =
       if length refs = length known_blobs then ()
       else raise Error ("remote action is missing published blob metadata for " ^ key)
-    val metadata = metadata_text text known_blobs
+  in
+    metadata_text text known_blobs
+  end
+
+fun publish_action_metadata cache key metadata =
+  let
     val tmp = temp_path "action-put"
     val url = action_url cache key
     fun cleanup () = remove_file tmp
-    fun publish () = (write_text tmp metadata; curl_put {url = url, src = tmp} before cleanup ())
+    fun publish () =
+      ((write_text tmp metadata; curl_put {url = url, src = tmp} before cleanup ())
+       handle e => (cleanup (); raise e))
+  in
+    publish ()
+  end
+
+fun publish_action cache {key, text} =
+  publish_action_metadata cache key (action_metadata cache key text)
+  handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
+
+(* The HTTP write is unconditional.  Callers must authorize replacement from
+   action-kind-specific semantics before using this operation. *)
+fun replace_action_unconditionally cache request = publish_action cache request
+
+fun put_action cache policy {key, text} =
+  let
+    val url = action_url cache key
+    val metadata = action_metadata cache key text
   in
     case get_action cache key of
         SOME existing =>
@@ -303,7 +326,7 @@ fun put_action cache policy {key, text} =
              | HolbuildCacheBackend.PutIfAbsentOrSame =>
                  if existing = text then HolbuildCacheBackend.AlreadyPresent
                  else HolbuildCacheBackend.Conflict url)
-      | NONE => publish ()
+      | NONE => publish_action_metadata cache key metadata
   end
   handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
