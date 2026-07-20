@@ -194,6 +194,12 @@ fun remote_entry_available remote identity =
           true
         end
 
+fun require_remote_entry_available remote identity result =
+  if remote_entry_available remote identity then
+    result
+  else
+    die "remote toolchain action is not restore-usable after publication"
+
 fun publish {remote, identity, entry_dir} =
   let
     val archive_path = temp_path "publish"
@@ -213,8 +219,10 @@ fun publish {remote, identity, entry_dir} =
       in
         case HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsentOrSame
                {key = identity, text = action} of
-            result as HolbuildCacheBackend.Published => result
-          | result as HolbuildCacheBackend.AlreadyPresent => result
+            result as HolbuildCacheBackend.Published =>
+              require_remote_entry_available remote identity result
+          | result as HolbuildCacheBackend.AlreadyPresent =>
+              require_remote_entry_available remote identity result
           | HolbuildCacheBackend.Skipped => die "remote cache skipped toolchain action publication"
           | HolbuildCacheBackend.Conflict detail => die ("remote cache rejected toolchain action: " ^ detail)
       end before cleanup ())

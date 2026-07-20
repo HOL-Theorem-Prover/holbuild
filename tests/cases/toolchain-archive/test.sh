@@ -379,13 +379,14 @@ initial_put_count=$(grep -c '^PUT ' "$request_log")
 initial_cas_get_count=$(grep -c '^GET /cas/' "$request_log")
 
 # A different absolute installation path selects a different AC record. Its
-# successful local fallback is published automatically.
+# successful local fallback is published automatically, then read back and
+# validated.
 other_cache=$tmpdir/other-cache
 wrong_path_log=$tmpdir/wrong-path.log
 (cd "$project" && HOLBUILD_CACHE="$other_cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$wrong_path_log" 2>&1
 [[ $(wc -l < "$build_count") -eq 2 ]]
 [[ $(grep -c '^PUT ' "$request_log") -eq $((initial_put_count + 2)) ]]
-[[ $(grep -c '^GET /cas/' "$request_log") -eq "$initial_cas_get_count" ]]
+[[ $(grep -c '^GET /cas/' "$request_log") -eq $((initial_cas_get_count + 1)) ]]
 
 # The Poly executable digest is part of remote identity even when its version
 # string and the local toolchain key are unchanged.
@@ -396,7 +397,7 @@ wrong_poly_log=$tmpdir/wrong-poly.log
 (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$wrong_poly_log" 2>&1
 [[ $(wc -l < "$build_count") -eq 3 ]]
 [[ $(grep -c '^PUT ' "$request_log") -eq $((initial_put_count + 4)) ]]
-[[ $(grep -c '^GET /cas/' "$request_log") -eq "$initial_cas_get_count" ]]
+[[ $(grep -c '^GET /cas/' "$request_log") -eq $((initial_cas_get_count + 2)) ]]
 cp "$tmpdir/original-poly" "$fakebin/poly"
 chmod +x "$fakebin/poly"
 
@@ -417,7 +418,7 @@ wrong_platform_log=$tmpdir/wrong-platform.log
 (cd "$project" && PATH="$platformbin:$PATH" "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$wrong_platform_log" 2>&1
 [[ $(wc -l < "$build_count") -eq 4 ]]
 [[ $(grep -c '^PUT ' "$request_log") -eq $((initial_put_count + 6)) ]]
-[[ $(grep -c '^GET /cas/' "$request_log") -eq "$initial_cas_get_count" ]]
+[[ $(grep -c '^GET /cas/' "$request_log") -eq $((initial_cas_get_count + 3)) ]]
 
 # The exact path identity must use the same spelling embedded by the HOL build.
 # A cache reached through a symlink is still a valid same-path installation.
@@ -513,6 +514,9 @@ with tarfile.open(destination, "w", format=tarfile.PAX_FORMAT, pax_headers={}) a
         if mutation == "corrupt-heap" and name == "hol/bin/hol.state":
             data = b"corrupt-state\n"
             member.size = len(data)
+        if mutation == "valid-different" and name == "hol/bin/hol":
+            data += b"\n# concurrent publisher\n"
+            member.size = len(data)
         member.pax_headers = {}
         member.uid = 0
         member.gid = 0
@@ -530,6 +534,7 @@ with tarfile.open(destination, "w", format=tarfile.PAX_FORMAT, pax_headers={}) a
         extra.gid = 0
         extra.mtime = 0
         output.addfile(extra, io.BytesIO(payload))
+
 
 archive_bytes = destination.read_bytes()
 sha1 = hashlib.sha1(archive_bytes).hexdigest()
@@ -629,6 +634,163 @@ wait_for_file() {
   echo "timed out waiting for $label: $path" >&2
   return 1
 }
+
+wait_for_absence() {
+  local path=$1
+  local label=$2
+  for _ in {1..500}; do
+    [[ ! -e "$path" ]] && return 0
+    sleep 0.01
+  done
+  echo "timed out waiting for $label: $path" >&2
+  return 1
+}
+
+stale_action_publisher() {
+  local label=$1
+  local action=$2
+  local release=$3
+  local done=$4
+  local get_status put_status
+  get_status=$(curl -q -sS -o /dev/null -w '%{http_code}' \
+    -H "X-Holbuild-Test-Publisher: $label" "$race_action_url")
+  [[ "$get_status" = 404 ]]
+  wait_for_file "$release" "$label publication release"
+  put_status=$(curl -q -sS -o /dev/null -w '%{http_code}' \
+    -H "X-Holbuild-Test-Publisher: $label" -T "$action" "$race_action_url")
+  [[ "$put_status" = 200 || "$put_status" = 201 || "$put_status" = 204 ]]
+  touch "$done"
+}
+
+release_action_miss() {
+  local label=$1
+  local event=$server_control/action-miss-event-$label
+  local release=$server_control/action-miss-release-$label
+  rm -f "$event"
+  touch "$release"
+  wait_for_absence "$release" "$label action-miss release"
+}
+
+run_publish_race() {
+  local final_action=$1
+  local label=$2
+  local status_file=$tmpdir/race-$label.status
+  local log=$tmpdir/race-$label.log
+  local first_release=$tmpdir/race-$label-first-release
+  local final_release=$tmpdir/race-$label-final-release
+  local first_done=$tmpdir/race-$label-first-done
+  local final_done=$tmpdir/race-$label-final-done
+  local holbuild_event=$server_control/action-miss-event-holbuild
+  local first_event=$server_control/action-miss-event-first
+  local final_event=$server_control/action-miss-event-final
+
+  rm -f "${action_files[0]}" "$status_file" "$log" \
+    "$first_release" "$final_release" "$first_done" "$final_done"
+  rm -f "$server_control"/action-miss-* "$server_control"/action-put-*
+  touch "$server_control/action-miss-enable" "$server_control/action-put-enable"
+
+  (
+    if (cd "$project" && \
+        "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol --publish) \
+        > "$log" 2>&1; then
+      printf '0\n' > "$status_file"
+    else
+      printf '%s\n' "$?" > "$status_file"
+    fi
+  ) &
+  local holbuild_pid=$!
+  (stale_action_publisher first "$race_valid_action" \
+    "$first_release" "$first_done") &
+  local first_pid=$!
+  (stale_action_publisher final "$final_action" \
+    "$final_release" "$final_done") &
+  local final_pid=$!
+
+  wait_for_file "$holbuild_event" "initial holbuild action miss"
+  wait_for_file "$first_event" "first publisher action miss"
+  wait_for_file "$final_event" "final publisher action miss"
+
+  release_action_miss holbuild
+  wait_for_file "$holbuild_event" "pre-publication holbuild action miss"
+
+  touch "$server_control/action-miss-release-first"
+  touch "$server_control/action-miss-release-final"
+  release_action_miss holbuild
+
+  wait_for_file "$server_control/action-put-event" "holbuild action PUT"
+  touch "$first_release"
+  wait_for_file "$first_done" "first publisher completion"
+  wait "$first_pid"
+  touch "$final_release"
+  wait_for_file "$final_done" "final publisher completion"
+  wait "$final_pid"
+  cmp -s "${action_files[0]}" "$final_action"
+
+  touch "$server_control/action-put-release"
+  wait "$holbuild_pid"
+  publish_race_status=$(< "$status_file")
+  publish_race_log=$log
+
+  rm -f "$server_control"/action-miss-* "$server_control"/action-put-*
+}
+
+# Three publishers can all observe the same missing action before performing
+# unconditional writes. The explicit publisher must validate the action that
+# is current after its own write is acknowledged. A final invalid writer makes
+# publication fail closed without changing the already-valid local toolchain.
+race_action_url="$remote_url/ac/$(basename "${action_files[0]}")"
+race_valid_action=$tmpdir/race-valid-action
+race_invalid_action=$tmpdir/race-invalid-action
+python3 "$tmpdir/mutate_archive.py" \
+  "$original_archive" "$tmpdir/race-valid.tar" \
+  "$race_valid_action" "$remote_root/cas" valid-different
+python3 "$tmpdir/mutate_archive.py" \
+  "$original_archive" "$tmpdir/race-invalid.tar" \
+  "$race_invalid_action" "$remote_root/cas" digest
+race_setup_builds=$(wc -l < "$build_count")
+rm -rf "$cache/hol-toolchains"
+(cd "$project" && HOLBUILD_TEST_FAIL_LOCAL_BUILD=1 \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) \
+  > "$tmpdir/race-local-setup.log" 2>&1
+[[ $(wc -l < "$build_count") -eq "$race_setup_builds" ]]
+require_file "$published_holdir/bin/hol"
+require_file "$published_holdir/bin/Holmake"
+require_file "$(dirname "$published_holdir")/build.ok"
+race_local_hol=$tmpdir/race-local-hol
+cp "$published_holdir/bin/hol" "$race_local_hol"
+
+run_publish_race "$race_invalid_action" invalid-final
+if [[ "$publish_race_status" -eq 0 ]]; then
+  record_regression_failure "buildhol --publish accepted a final invalid concurrent action"
+else
+  require_grep 'SHA256 mismatch' "$publish_race_log"
+fi
+cmp -s "${action_files[0]}" "$race_invalid_action"
+cmp -s "$published_holdir/bin/hol" "$race_local_hol"
+require_file "$(dirname "$published_holdir")/build.ok"
+
+# A different but restore-usable same-identity archive is interchangeable. The
+# explicit publisher accepts it without replacing local bytes, and a later
+# consumer can restore it without rebuilding.
+run_publish_race "$race_valid_action" valid-final
+[[ "$publish_race_status" -eq 0 ]]
+[[ $(tail -n 1 "$publish_race_log") = "$published_holdir" ]]
+cmp -s "${action_files[0]}" "$race_valid_action"
+cmp -s "$published_holdir/bin/hol" "$race_local_hol"
+require_file "$(dirname "$published_holdir")/build.ok"
+
+race_builds=$(wc -l < "$build_count")
+rm -rf "$cache/hol-toolchains"
+(cd "$project" && HOLBUILD_TEST_FAIL_LOCAL_BUILD=1 \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) \
+  > "$tmpdir/race-valid-restore.log" 2>&1
+[[ $(wc -l < "$build_count") -eq "$race_builds" ]]
+require_file "$published_holdir/bin/hol"
+require_file "$published_holdir/bin/Holmake"
+require_file "$(dirname "$published_holdir")/build.ok"
+"$published_holdir/bin/hol" --noconfig \
+  --holstate "$published_holdir/bin/hol.state" </dev/null
+cp "$original_action" "${action_files[0]}"
 
 restore_after_interruption() {
   local label=$1
