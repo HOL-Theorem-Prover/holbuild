@@ -424,6 +424,36 @@ cmp "$output_action_before" "$remote_action" || {
 }
 assert_remote_proof_timeout 60.0
 
+discrepancy=$tmpdir/discrepancy
+write_project "$discrepancy"
+discrepancy_cache=$tmpdir/cache-discrepancy
+link_hol_toolchain_cache "$discrepancy_cache"
+discrepancy_metadata=$discrepancy/.holbuild/dep/remote-cache-test/src/AScript.sml.key
+
+discrepancy_restore_log=$tmpdir/discrepancy-restore.log
+(cd "$discrepancy" && HOLBUILD_CACHE="$discrepancy_cache" HOLBUILD_CACHE_TRACE=1 \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" build \
+  --allow-cache-timeout-discrepancy --tactic-timeout 30 ATheory) > "$discrepancy_restore_log" 2>&1
+require_grep "remote cache hydrated:" "$discrepancy_restore_log"
+require_grep "ATheory restored from cache" "$discrepancy_restore_log"
+require_grep '^proof_timeout=60.0$' "$discrepancy_metadata"
+
+discrepancy_up_to_date_log=$tmpdir/discrepancy-up-to-date.log
+(cd "$discrepancy" && HOLBUILD_CACHE="$discrepancy_cache" \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" --verbose build \
+  --allow-cache-timeout-discrepancy --tactic-timeout 30 ATheory) > "$discrepancy_up_to_date_log" 2>&1
+require_grep "ATheory is up to date" "$discrepancy_up_to_date_log"
+require_grep '^proof_timeout=60.0$' "$discrepancy_metadata"
+
+discrepancy_strict_log=$tmpdir/discrepancy-strict.log
+(cd "$discrepancy" && HOLBUILD_CACHE="$discrepancy_cache" HOLBUILD_CACHE_TRACE=1 \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" build \
+  --tactic-timeout 30 ATheory) > "$discrepancy_strict_log" 2>&1
+require_grep "insufficient tactic-timeout contract" "$discrepancy_strict_log"
+require_grep "ATheory built" "$discrepancy_strict_log"
+require_grep '^proof_timeout=30.0$' "$discrepancy_metadata"
+assert_remote_proof_timeout 30.0
+
 assert_server_action_paths
 
 stop_remote_cache_server

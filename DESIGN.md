@@ -851,9 +851,14 @@ debugging mode that retains durable failure logs and reports them as
 not final artifact semantics. They must not be included in the final theory
 action key or local metadata comparison for `.uo/.ui/.dat`: switching
 `--skip-proof-steps`, `--skip-checkpoints`, or root tactic timeout should not rebuild
-an otherwise up-to-date semantic artifact. If proof-step execution and plain
-source execution produce different final artifacts or success/failure behavior,
-that is an instrumentation bug to fix, not a separate artifact identity.
+an otherwise up-to-date semantic artifact when its recorded timeout contract
+satisfies the request. `--allow-cache-timeout-discrepancy` explicitly waives that
+completed-artifact check for both project metadata and every build-cache origin;
+it does not waive checkpoint compatibility or source-execution watchdogs. Cache
+restores propagate the manifest's recorded timeout into project metadata rather
+than replacing it with the request. If proof-step execution and plain source
+execution produce different final artifacts or success/failure behavior, that is
+an instrumentation bug to fix, not a separate artifact identity.
 Checkpoint validity remains separate and is represented by checkpoint paths plus
 `.ok` metadata keyed by dependency context and source prefix. On timeout,
 holbuild reports the timed-out tactic and does not retry the script through the

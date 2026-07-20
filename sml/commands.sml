@@ -52,6 +52,7 @@ fun build_help () = print
   \  --dry-run\n\
   \  --force[=theory|project|full]\n\
   \  --no-cache\n\
+  \  --allow-cache-timeout-discrepancy\n\
   \  --no-stat-cache\n\
   \  --skip-checkpoints\n\
   \  --skip-proof-steps\n\
@@ -202,17 +203,21 @@ fun force_level_value text =
 
 fun split_flags args =
   let
-    fun extract_emit_output_hashes rest =
+    fun extract_flag flag rest =
       let
-        fun loop emit acc xs =
+        fun loop found acc xs =
           case xs of
-              [] => (emit, rev acc)
-            | "--emit-output-hashes" :: ys => loop true acc ys
-            | y :: ys => loop emit (y :: acc) ys
+              [] => (found, rev acc)
+            | y :: ys =>
+                if y = flag then loop true acc ys
+                else loop found (y :: acc) ys
       in
         loop false [] rest
       end
-    val (emit_output_hashes, build_args) = extract_emit_output_hashes args
+    val (emit_output_hashes, args_without_emit_output_hashes) =
+      extract_flag "--emit-output-hashes" args
+    val (allow_cache_timeout_discrepancy, build_args) =
+      extract_flag "--allow-cache-timeout-discrepancy" args_without_emit_output_hashes
     fun loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable rest =
       case rest of
           [] => ({dry_run = dry, watch = watch, force = force, use_cache = use_cache,
@@ -227,7 +232,8 @@ fun split_flags args =
                   repl_on_failure = repl_on_failure,
                   retain_debug_artifacts = retain_debug_artifacts,
                   warn_unreachable = warn_unreachable,
-                  emit_output_hashes = emit_output_hashes}, [])
+                  emit_output_hashes = emit_output_hashes,
+                  allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy}, [])
         | "--dry-run" :: xs =>
             loop true watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
         | "--watch" :: xs =>
@@ -737,7 +743,7 @@ fun prepare_source_index phase_prefix resolution project =
      components = components}
   end
 
-fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, proof_steps, new_ir, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes}, targets) =
+fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, proof_steps, new_ir, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy}, targets) =
   let
     val project =
       case prepared of
@@ -788,6 +794,7 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
        trace_steps = trace_steps,
        repl_on_failure = repl_on_failure,
        emit_output_hashes = emit_output_hashes,
+       allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy,
        trknl = HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)}
     fun prepare_plan () =
       let
@@ -1012,7 +1019,8 @@ fun export_build_options trknl project index entry_plan plan =
      trace_steps = false,
      repl_on_failure = false,
      emit_output_hashes = false,
-      trknl = trknl}
+     allow_cache_timeout_discrepancy = false,
+     trknl = trknl}
   end
 
 fun theory_node node =
@@ -1269,7 +1277,7 @@ fun build_heap_kind tc cli_jobs command target =
         val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
         val output_path = HolbuildProject.abs_under (#root project) output
       in
-        HolbuildBuildExec.build {use_cache = true, verify_cache = true, force = HolbuildBuildExec.ForceNone, force_targets = [], skip_checkpoints = false, proof_steps = true, new_ir = true, node_tactic_timeouts = HolbuildTacticTimeoutPolicy.entry_timeouts project index plan (SOME 2.5), execution_plan = NONE, trace_steps = false, repl_on_failure = false, emit_output_hashes = false, trknl = HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)}
+        HolbuildBuildExec.build {use_cache = true, verify_cache = true, force = HolbuildBuildExec.ForceNone, force_targets = [], skip_checkpoints = false, proof_steps = true, new_ir = true, node_tactic_timeouts = HolbuildTacticTimeoutPolicy.entry_timeouts project index plan (SOME 2.5), execution_plan = NONE, trace_steps = false, repl_on_failure = false, emit_output_hashes = false, allow_cache_timeout_discrepancy = false, trknl = HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)}
                                tc project plan toolchain_key jobs;
         HolbuildBuildExec.export_heap tc project plan output_path kind
       end
