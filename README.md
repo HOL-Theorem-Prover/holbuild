@@ -545,8 +545,9 @@ Completed theory artifacts are reused only when their recorded proof timeout
 satisfies the requested timeout. `--allow-cache-timeout-discrepancy` waives that
 check for project-local artifacts and all build-cache sources, including remote
 and HBX-imported entries. It does not change source-execution watchdogs or
-checkpoint compatibility. Restored project metadata retains the artifact's
-recorded timeout, so a later build without the flag applies the strict check.
+checkpoint compatibility. When this waiver permits reuse, project metadata
+retains the artifact's recorded timeout, so a later build without the flag
+applies the strict check.
 
 A build can also consult and publish to one Bazel-style HTTP remote cache:
 

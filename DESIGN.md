@@ -854,10 +854,11 @@ action key or local metadata comparison for `.uo/.ui/.dat`: switching
 an otherwise up-to-date semantic artifact when its recorded timeout contract
 satisfies the request. `--allow-cache-timeout-discrepancy` explicitly waives that
 completed-artifact check for both project metadata and every build-cache origin;
-it does not waive checkpoint compatibility or source-execution watchdogs. Cache
-restores propagate the manifest's recorded timeout into project metadata rather
-than replacing it with the request. If proof-step execution and plain source
-execution produce different final artifacts or success/failure behavior, that is
+it does not waive checkpoint compatibility or source-execution watchdogs.
+Reuse admitted by this waiver retains the artifact or cache manifest's recorded
+timeout in project metadata rather than replacing it with the request. If
+proof-step execution and plain source execution produce different final
+artifacts or success/failure behavior, that is
 an instrumentation bug to fix, not a separate artifact identity.
 Checkpoint validity remains separate and is represented by checkpoint paths plus
 `.ok` metadata keyed by dependency context and source prefix. On timeout,

@@ -60,3 +60,37 @@ strict_log=$tmpdir/strict.log
 require_grep "insufficient tactic-timeout contract" "$strict_log"
 require_grep "ATheory built" "$strict_log"
 require_grep '^proof_timeout=60.0$' "$metadata"
+
+use_case_cache "$tmpdir/default-off-cache"
+rm -rf "$project/.holbuild"
+default_off_build_log=$tmpdir/default-off-build.log
+(cd "$project" && "$HOLBUILD_BIN" build --tactic-timeout 30 ATheory) > "$default_off_build_log" 2>&1
+require_grep "ATheory built" "$default_off_build_log"
+require_grep '^proof_timeout=30.0$' "$metadata"
+
+rm -rf "$project/.holbuild"
+default_off_restore_log=$tmpdir/default-off-restore.log
+(cd "$project" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" build \
+  --tactic-timeout 60 ATheory) > "$default_off_restore_log" 2>&1
+require_grep "cache hit: ATheory" "$default_off_restore_log"
+require_grep "ATheory restored from cache" "$default_off_restore_log"
+require_grep '^proof_timeout=60.0$' "$metadata"
+
+default_off_stricter_log=$tmpdir/default-off-stricter.log
+(cd "$project" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" build \
+  --tactic-timeout 45 ATheory) > "$default_off_stricter_log" 2>&1
+require_grep "cache hit: ATheory" "$default_off_stricter_log"
+require_grep "ATheory restored from cache" "$default_off_stricter_log"
+require_grep '^proof_timeout=45.0$' "$metadata"
+
+refresh_build_log=$tmpdir/refresh-build.log
+(cd "$project" && "$HOLBUILD_BIN" build --force \
+  --tactic-timeout 30 ATheory) > "$refresh_build_log" 2>&1
+require_grep "ATheory built" "$refresh_build_log"
+require_grep '^proof_timeout=30.0$' "$metadata"
+
+refresh_log=$tmpdir/refresh.log
+(cd "$project" && "$HOLBUILD_BIN" --verbose build --emit-output-hashes \
+  --tactic-timeout 60 ATheory) > "$refresh_log" 2>&1
+require_grep "ATheory is up to date" "$refresh_log"
+require_grep '^proof_timeout=60.0$' "$metadata"

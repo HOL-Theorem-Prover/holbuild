@@ -3452,7 +3452,10 @@ fun up_to_date dat_hash_cache emit_output_hashes allow_timeout_discrepancy check
                        (theory_parent_metadata_needs_refresh node text orelse
                         emit_output_hashes orelse
                         List.exists (String.isPrefix "output-sha1=") (metadata_lines text)) then
-                     write_metadata emit_output_hashes checkpoint_policy (metadata_proof_timeout text) project plan keys input_key toolchain_key node theorem_checkpoints
+                     write_metadata emit_output_hashes checkpoint_policy
+                       (if allow_timeout_discrepancy then metadata_proof_timeout text
+                        else tactic_timeout checkpoint_policy)
+                       project plan keys input_key toolchain_key node theorem_checkpoints
                    else ()
                in
                  metadata_ok andalso parents_ok
@@ -3655,7 +3658,9 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
     fun restore_from_cache built_timeout =
       (remove_tree stage;
        invalidate_node_dat_hash ();
-       write_metadata (#emit_output_hashes options) policy built_timeout project plan keys input_key toolchain_key node metadata_checkpoints;
+       write_metadata (#emit_output_hashes options) policy
+         (if allow_timeout_discrepancy then built_timeout else tactic_timeout policy)
+         project plan keys input_key toolchain_key node metadata_checkpoints;
        HolbuildStatus.Restored)
     fun build_from_source () =
       let
