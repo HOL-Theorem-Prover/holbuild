@@ -1699,11 +1699,40 @@ fun cache_manifest_blobs root input_key =
       SOME manifest_text => cache_manifest_blobs_from_lines input_key (cache_manifest_lines manifest_text)
     | NONE => raise Error ("cache manifest missing: " ^ input_key)
 
-fun cache_manifest_proof_timeout lines = legacy_proof_timeout lines "proof-timeout"
+fun explicit_cache_manifest_proof_timeouts lines =
+  List.mapPartial
+    (fn line =>
+        if String.isPrefix "proof-timeout=" line then
+          case parse_timeout_text (String.extract(line, size "proof-timeout=", NONE)) of
+              SOME timeout => SOME timeout
+            | NONE => raise Error "cache manifest invalid proof-timeout"
+        else NONE)
+    lines
+
+fun cache_manifest_proof_timeout lines =
+  case explicit_cache_manifest_proof_timeouts lines of
+      [] => legacy_default_proof_timeout
+    | [timeout] => timeout
+    | _ => raise Error "cache manifest duplicate proof-timeout"
 
 fun cache_manifest_proof_timeout_text input_key text =
   (cache_manifest_blobs_from_lines input_key (cache_manifest_lines text);
    cache_manifest_proof_timeout (cache_manifest_lines text))
+
+fun cache_manifest_contract input_key text =
+  let
+    val lines = cache_manifest_lines text
+    val _ = cache_manifest_blobs_from_lines input_key lines
+    val proof_timeout = cache_manifest_proof_timeout lines
+    val non_timeout_lines =
+      List.filter (fn line => not (String.isPrefix "proof-timeout=" line)) lines
+  in
+    {proof_timeout = proof_timeout,
+     non_timeout_text = String.concatWith "\n" non_timeout_lines ^ "\n"}
+  end
+
+fun timeout_at_least_as_strong candidate reference =
+  timeout_satisfies reference candidate
 
 fun cache_manifest_outputs_equal input_key left right =
   let
@@ -1771,8 +1800,67 @@ fun fs_cache_destination cache : HolbuildCacheTransfer.destination =
   {put_action = HolbuildFSCacheBackend.put_action cache,
    publish_blob = HolbuildFSCacheBackend.publish_blob cache}
 
+(* The HTTP cache has no compare-and-swap operation.  Re-read after each
+   authorized replacement and retry a weaker observation, but retain the
+   restore-time compatibility check as the correctness boundary. *)
+val remote_theory_publish_attempts = 3
+
+fun put_remote_theory_action remote _ (request as {key, text}) =
+  let
+    val incoming = cache_manifest_contract key text
+    fun conflict detail = HolbuildCacheBackend.Conflict ("remote theory action " ^ key ^ ": " ^ detail)
+    fun compatible_contract resident_text =
+      let val resident = cache_manifest_contract key resident_text
+      in
+        if #non_timeout_text resident = #non_timeout_text incoming then resident
+        else raise Error "resident manifest differs outside proof-timeout"
+      end
+    fun attempt attempts =
+      let
+        fun retry detail =
+          if attempts > 1 then attempt (attempts - 1) else conflict detail
+        fun verify result =
+          case HolbuildRemoteCache.get_action remote key of
+              NONE => retry "action missing after publication"
+            | SOME observed_text =>
+                let val observed = compatible_contract observed_text
+                in
+                  if timeout_at_least_as_strong (#proof_timeout observed) (#proof_timeout incoming) then result
+                  else retry "weaker proof-timeout observed after publication"
+                end
+        fun publish_missing () =
+          case HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsentOrSame request of
+              result as HolbuildCacheBackend.Published => verify result
+            | result as HolbuildCacheBackend.AlreadyPresent => verify result
+            | HolbuildCacheBackend.Conflict detail => retry detail
+            | HolbuildCacheBackend.Skipped => HolbuildCacheBackend.Skipped
+        fun replace_weaker () =
+          case HolbuildRemoteCache.replace_action_unconditionally remote request of
+              result as HolbuildCacheBackend.Published => verify result
+            | HolbuildCacheBackend.Conflict detail => retry detail
+            | result as HolbuildCacheBackend.AlreadyPresent => verify result
+            | HolbuildCacheBackend.Skipped => HolbuildCacheBackend.Skipped
+      in
+        case HolbuildRemoteCache.get_action remote key of
+            NONE => publish_missing ()
+          | SOME resident_text =>
+              let val resident = compatible_contract resident_text
+              in
+                if timeout_at_least_as_strong (#proof_timeout resident) (#proof_timeout incoming) then
+                  HolbuildCacheBackend.AlreadyPresent
+                else if timeout_at_least_as_strong (#proof_timeout incoming) (#proof_timeout resident) then
+                  replace_weaker ()
+                else
+                  conflict "proof-timeout contracts are incomparable"
+              end
+      end
+  in
+    attempt remote_theory_publish_attempts
+  end
+  handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
+
 fun remote_cache_destination remote : HolbuildCacheTransfer.destination =
-  {put_action = HolbuildRemoteCache.put_action remote,
+  {put_action = put_remote_theory_action remote,
    publish_blob = HolbuildRemoteCache.publish_blob remote}
 
 fun remote_cache_source_with_action remote key manifest : HolbuildCacheTransfer.source =
