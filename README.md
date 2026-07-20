@@ -229,6 +229,7 @@ option before the targets:
 ```sh
 holbuild build --force=project MyTheory
 holbuild --no-cache MyTheory
+holbuild --allow-cache-timeout-discrepancy --tactic-timeout 5 MyTheory
 holbuild --tactic-timeout 5 MyTheory
 holbuild --watch MyTheory
 holbuild --dry-run MyTheory
@@ -539,6 +540,14 @@ The global build cache stores selected semantic artefacts such as `Theory.sig`,
 `Theory.sml`, `Theory.dat`, and tracing-kernel `Theory.tr.gz` files by action
 key. Cache hits materialise validated artefacts into the local `.holbuild/`
 tree. Standard cache entries do not require a trace blob.
+
+Completed theory artifacts are reused only when their recorded proof timeout
+satisfies the requested timeout. `--allow-cache-timeout-discrepancy` waives that
+check for project-local artifacts and all build-cache sources, including remote
+and HBX-imported entries. It does not change source-execution watchdogs or
+checkpoint compatibility. When this waiver permits reuse, project metadata
+retains the artifact's recorded timeout, so a later build without the flag
+applies the strict check.
 
 A build can also consult and publish to one Bazel-style HTTP remote cache:
 

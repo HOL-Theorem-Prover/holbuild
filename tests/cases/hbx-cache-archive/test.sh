@@ -71,7 +71,7 @@ val _ = export_theory();
 SML
 
 build_log=$tmpdir/build.log
-(cd "$project" && HOLBUILD_CACHE="$source_cache" "$HOLBUILD_BIN" build ATheory) > "$build_log" 2>&1
+(cd "$project" && HOLBUILD_CACHE="$source_cache" "$HOLBUILD_BIN" build --tactic-timeout 0 ATheory) > "$build_log" 2>&1
 require_grep "BTheory built" "$build_log"
 require_grep "ATheory built" "$build_log"
 
@@ -127,10 +127,12 @@ require_grep "imported 2 cache action" "$import_log"
 
 rm -rf "$project/.holbuild"
 restore_log=$tmpdir/restore.log
-(cd "$project" && HOLBUILD_CACHE="$import_cache" HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" build ATheory) > "$restore_log" 2>&1
+(cd "$project" && HOLBUILD_CACHE="$import_cache" HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" build \
+  --allow-cache-timeout-discrepancy --tactic-timeout 60 ATheory) > "$restore_log" 2>&1
 require_grep "cache hit: BTheory" "$restore_log"
 require_grep "cache hit: ATheory" "$restore_log"
 require_grep "BTheory restored from cache" "$restore_log"
 require_grep "ATheory restored from cache" "$restore_log"
 require_file "$project/.holbuild/packages/dep/obj/src/BTheory.dat"
 require_file "$project/.holbuild/obj/src/ATheory.dat"
+require_grep '^proof_timeout=none$' "$project/.holbuild/dep/hbxarchive/src/AScript.sml.key"

@@ -1505,6 +1505,9 @@ fun timeout_satisfies requested built =
             SOME built_seconds => built_seconds <= requested_seconds
           | NONE => false
 
+fun cache_timeout_satisfies allow_discrepancy requested built =
+  allow_discrepancy orelse timeout_satisfies requested built
+
 fun timeout_min (NONE, timeout) = timeout
   | timeout_min (timeout, NONE) = timeout
   | timeout_min (SOME a, SOME b) = SOME (Real.min(a, b))
@@ -2143,7 +2146,9 @@ fun cache_key_role project plan node input_key cache_key =
     else "cache key"
   end
 
-fun materialize_theory_cache_key verify_cache project plan input_key requested_timeout require_trace cache_key node =
+datatype theory_cache_restore = CacheMiss | CacheRestored of real option
+
+fun materialize_theory_cache_key verify_cache allow_timeout_discrepancy project plan input_key requested_timeout require_trace cache_key node =
   let
     val root = cache_root ()
     val manifest = HolbuildCache.action_manifest root cache_key
@@ -2166,7 +2171,7 @@ fun materialize_theory_cache_key verify_cache project plan input_key requested_t
       else ()
     val proof_timeout = cache_manifest_proof_timeout manifest_lines
     val _ =
-      if timeout_satisfies requested_timeout proof_timeout then ()
+      if cache_timeout_satisfies allow_timeout_discrepancy requested_timeout proof_timeout then ()
       else raise Error ("cache entry built with insufficient tactic-timeout contract: built " ^
                         timeout_text proof_timeout ^ ", requested " ^ timeout_text requested_timeout)
     val {sig_path, sml_path, data_path, ...} = theory_outputs node
@@ -2187,21 +2192,28 @@ fun materialize_theory_cache_key verify_cache project plan input_key requested_t
        write_local_theory_manifests plan node {parents = parents, mldeps = mldeps};
        HolbuildCache.touch_action root cache_key;
        cache_trace ("cache hit: " ^ logical_name node ^ " " ^ role ^ "=" ^ cache_key);
-       true)
+       CacheRestored proof_timeout)
   in
     install ()
   end
-  handle Error "cache entry not found" => false
+  handle Error "cache entry not found" => CacheMiss
        | e => (remove_failed_cache_outputs project node;
                cache_trace ("cache miss: " ^ logical_name node ^ " " ^
                             cache_key_role project plan node input_key cache_key ^ "=" ^ cache_key ^
                             " (" ^ General.exnMessage e ^ ")");
                warn ("cache entry unusable for " ^ logical_name node ^ ": " ^ General.exnMessage e);
-               false)
+               CacheMiss)
 
-fun materialize_theory_cache verify_cache project plan input_key requested_timeout require_trace node =
-  List.exists (fn cache_key => materialize_theory_cache_key verify_cache project plan input_key requested_timeout require_trace cache_key node)
-              (theory_cache_keys project plan node input_key)
+fun materialize_theory_cache verify_cache allow_timeout_discrepancy project plan input_key requested_timeout require_trace node =
+  let
+    fun first_restore [] = CacheMiss
+      | first_restore (cache_key :: cache_keys) =
+          case materialize_theory_cache_key verify_cache allow_timeout_discrepancy project plan input_key requested_timeout require_trace cache_key node of
+              CacheMiss => first_restore cache_keys
+            | restored => restored
+  in
+    first_restore (theory_cache_keys project plan node input_key)
+  end
 
 fun metadata_path (project : HolbuildProject.t) node =
   let
@@ -2548,7 +2560,7 @@ fun best_failed_prefix_checkpoint requested_timeout checkpoints =
 
 datatype force_level = ForceNone | ForceTargets | ForceProject | ForceAll
 
-type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, proof_steps : bool, new_ir : bool, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, trknl : bool}
+type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, proof_steps : bool, new_ir : bool, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool}
 
 datatype checkpoint_policy =
   CheckpointPolicy of {checkpoint : bool, proof_steps : bool, new_ir : bool, tactic_timeout : real option, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, trknl : bool}
@@ -3250,12 +3262,12 @@ fun theorem_boundary_line ({safe_name, prefix_hash, context_path, end_of_proof_p
 fun theorem_boundary_lines theorem_checkpoints =
   map theorem_boundary_line theorem_checkpoints
 
-fun proof_timeout_lines checkpoint_policy node =
+fun proof_timeout_lines proof_timeout node =
   case #kind (HolbuildBuildPlan.source_of node) of
-      HolbuildSourceIndex.TheoryScript => ["proof_timeout=" ^ timeout_text (tactic_timeout checkpoint_policy)]
+      HolbuildSourceIndex.TheoryScript => ["proof_timeout=" ^ timeout_text proof_timeout]
     | _ => []
 
-fun metadata_core_lines checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints =
+fun metadata_core_lines checkpoint_policy proof_timeout project plan keys input_key toolchain_key node theorem_checkpoints =
   let
     val source = HolbuildBuildPlan.source_of node
   in
@@ -3268,7 +3280,7 @@ fun metadata_core_lines checkpoint_policy project plan keys input_key toolchain_
      "source=" ^ #relative_path source] @
     dependency_context_lines plan keys toolchain_key node @
     parent_hash_metadata_lines plan node @
-    proof_timeout_lines checkpoint_policy node @
+    proof_timeout_lines proof_timeout node @
     action_policy_lines plan node @
     checkpoint_lines checkpoint_policy project node @
     theorem_boundary_lines theorem_checkpoints
@@ -3276,12 +3288,12 @@ fun metadata_core_lines checkpoint_policy project plan keys input_key toolchain_
 
 fun lines_text lines = String.concatWith "\n" lines ^ "\n"
 
-fun metadata_core_text checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints =
-  lines_text (metadata_core_lines checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints)
+fun metadata_core_text checkpoint_policy proof_timeout project plan keys input_key toolchain_key node theorem_checkpoints =
+  lines_text (metadata_core_lines checkpoint_policy proof_timeout project plan keys input_key toolchain_key node theorem_checkpoints)
 
-fun metadata_text emit_output_hashes checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints =
+fun metadata_text emit_output_hashes checkpoint_policy proof_timeout project plan keys input_key toolchain_key node theorem_checkpoints =
   lines_text
-    (metadata_core_lines checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints @
+    (metadata_core_lines checkpoint_policy proof_timeout project plan keys input_key toolchain_key node theorem_checkpoints @
      (if emit_output_hashes then output_hash_lines checkpoint_policy project node else []))
 
 fun semantic_metadata_text text =
@@ -3295,10 +3307,10 @@ fun metadata_input_key_matches input_key text =
 
 fun metadata_proof_timeout text = legacy_proof_timeout (metadata_lines text) "proof_timeout"
 
-fun metadata_timeout_satisfies policy node text =
+fun metadata_timeout_satisfies allow_discrepancy policy node text =
   case #kind (HolbuildBuildPlan.source_of node) of
       HolbuildSourceIndex.TheoryScript =>
-        timeout_satisfies (tactic_timeout policy) (metadata_proof_timeout text)
+        cache_timeout_satisfies allow_discrepancy (tactic_timeout policy) (metadata_proof_timeout text)
     | _ => true
 
 (* Up-to-date is intentionally a cheap semantic check. The input_key already
@@ -3312,9 +3324,9 @@ fun output_exists_for_node node path =
       HolbuildSourceIndex.TheoryScript => file_nonempty path
     | _ => file_exists path
 
-fun write_metadata emit_output_hashes checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints =
+fun write_metadata emit_output_hashes checkpoint_policy proof_timeout project plan keys input_key toolchain_key node theorem_checkpoints =
   write_text (metadata_path project node)
-             (metadata_text emit_output_hashes checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints)
+             (metadata_text emit_output_hashes checkpoint_policy proof_timeout project plan keys input_key toolchain_key node theorem_checkpoints)
 
 fun metadata_has_parent_hashes lines =
   metadata_value "parent_hashes" lines = SOME "v1"
@@ -3423,7 +3435,7 @@ fun theory_parent_hashes_match dat_hash_cache plan node metadata_text =
            | _ => true)
         handle _ => false)
 
-fun up_to_date dat_hash_cache emit_output_hashes checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints =
+fun up_to_date dat_hash_cache emit_output_hashes allow_timeout_discrepancy checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints =
   detail_time_phase "build.exec.node.up_to_date"
     (fn () =>
         List.all (output_exists_for_node node) (output_paths checkpoint_policy project node) andalso
@@ -3432,7 +3444,7 @@ fun up_to_date dat_hash_cache emit_output_hashes checkpoint_policy project plan 
                let
                  val metadata_ok =
                    metadata_input_key_matches input_key text andalso
-                   metadata_timeout_satisfies checkpoint_policy node text
+                   metadata_timeout_satisfies allow_timeout_discrepancy checkpoint_policy node text
                  val parents_ok =
                    metadata_ok andalso theory_parent_hashes_match dat_hash_cache plan node (SOME text)
                  val _ =
@@ -3440,7 +3452,10 @@ fun up_to_date dat_hash_cache emit_output_hashes checkpoint_policy project plan 
                        (theory_parent_metadata_needs_refresh node text orelse
                         emit_output_hashes orelse
                         List.exists (String.isPrefix "output-sha1=") (metadata_lines text)) then
-                     write_metadata emit_output_hashes checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints
+                     write_metadata emit_output_hashes checkpoint_policy
+                       (if allow_timeout_discrepancy then metadata_proof_timeout text
+                        else tactic_timeout checkpoint_policy)
+                       project plan keys input_key toolchain_key node theorem_checkpoints
                    else ()
                in
                  metadata_ok andalso parents_ok
@@ -3630,23 +3645,24 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
     val forced = force_node options project node
     val cache_allowed = #use_cache options andalso cache_enabled node
     val cache_restore_allowed = cache_allowed andalso not forced
+    val allow_timeout_discrepancy = #allow_cache_timeout_discrepancy options
     fun invalidate_node_dat_hash () =
       invalidate_cached_file_hash dat_hash_cache (#data_path (theory_outputs node))
     fun materialize_valid_cache () =
-      materialize_theory_cache (#verify_cache options) project plan input_key (tactic_timeout policy) (trknl_enabled policy) node andalso
-      (if theory_parent_hashes_match dat_hash_cache plan node NONE then true
-       else (remove_failed_cache_outputs project node; false))
-  in
-    if not forced andalso not (always_reexecute node) andalso
-       up_to_date dat_hash_cache (#emit_output_hashes options) policy project plan keys input_key toolchain_key node metadata_checkpoints then
-      (remove_tree_if_exists stage;
-       HolbuildStatus.UpToDate)
-    else if cache_restore_allowed andalso materialize_valid_cache () then
+      case materialize_theory_cache (#verify_cache options) allow_timeout_discrepancy
+             project plan input_key (tactic_timeout policy) (trknl_enabled policy) node of
+          CacheMiss => CacheMiss
+        | restored as CacheRestored _ =>
+            if theory_parent_hashes_match dat_hash_cache plan node NONE then restored
+            else (remove_failed_cache_outputs project node; CacheMiss)
+    fun restore_from_cache built_timeout =
       (remove_tree stage;
        invalidate_node_dat_hash ();
-       write_metadata (#emit_output_hashes options) policy project plan keys input_key toolchain_key node metadata_checkpoints;
+       write_metadata (#emit_output_hashes options) policy
+         (if allow_timeout_discrepancy then built_timeout else tactic_timeout policy)
+         project plan keys input_key toolchain_key node metadata_checkpoints;
        HolbuildStatus.Restored)
-    else
+    fun build_from_source () =
       let
         val source_text = read_text (source_file node)
         val source_spans = source_spans_for_node policy node source_text
@@ -3659,22 +3675,32 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
         val termination_diagnostics = #termination_diagnostics source_spans
         val declaration_checkpoints =
           declaration_checkpoints_for_node policy project plan keys toolchain_key node source_text termination_diagnostics
+        fun build_after_checkpoint_retries retries_left =
+          ((build_theory cache_allowed policy tc project base_context plan keys toolchain_key node source_text theorem_checkpoints declaration_checkpoints termination_diagnostics;
+            remove_failed_prefix_checkpoints theorem_checkpoints;
+            invalidate_node_dat_hash ();
+            write_metadata (#emit_output_hashes options) policy (tactic_timeout policy) project plan keys input_key toolchain_key node metadata_checkpoints;
+            HolbuildStatus.Built)
+           handle RetryInvalidCheckpoint =>
+             if retries_left <= 0 then raise RetryInvalidCheckpoint
+             else build_after_checkpoint_retries (retries_left - 1))
       in
-        let
-          fun build_after_checkpoint_retries retries_left =
-            ((build_theory cache_allowed policy tc project base_context plan keys toolchain_key node source_text theorem_checkpoints declaration_checkpoints termination_diagnostics;
-              remove_failed_prefix_checkpoints theorem_checkpoints;
-              invalidate_node_dat_hash ();
-              write_metadata (#emit_output_hashes options) policy project plan keys input_key toolchain_key node metadata_checkpoints;
-              HolbuildStatus.Built)
-             handle RetryInvalidCheckpoint =>
-               if retries_left <= 0 then raise RetryInvalidCheckpoint
-               else build_after_checkpoint_retries (retries_left - 1))
-        in
-          build_after_checkpoint_retries (length theorem_checkpoints + length declaration_checkpoints + 1)
-        end
-        handle ExecutionPlanPrinted => (remove_tree stage; HolbuildStatus.Inspected)
+        build_after_checkpoint_retries (length theorem_checkpoints + length declaration_checkpoints + 1)
       end
+      handle ExecutionPlanPrinted => (remove_tree stage; HolbuildStatus.Inspected)
+    fun restore_or_build () =
+      if not cache_restore_allowed then build_from_source ()
+      else
+        case materialize_valid_cache () of
+            CacheRestored built_timeout => restore_from_cache built_timeout
+          | CacheMiss => build_from_source ()
+  in
+    if not forced andalso not (always_reexecute node) andalso
+       up_to_date dat_hash_cache (#emit_output_hashes options) allow_timeout_discrepancy
+         policy project plan keys input_key toolchain_key node metadata_checkpoints then
+      (remove_tree_if_exists stage;
+       HolbuildStatus.UpToDate)
+    else restore_or_build ()
   end
 
 fun build_node dat_hash_cache options tc project base_context plan keys toolchain_key node =
@@ -3685,17 +3711,19 @@ fun build_node dat_hash_cache options tc project base_context plan keys toolchai
           build_theory_node dat_hash_cache options tc project base_context plan keys toolchain_key node input_key
       | HolbuildSourceIndex.Sml =>
           if not (force_node options project node) andalso not (always_reexecute node) andalso
-             up_to_date dat_hash_cache (#emit_output_hashes options) no_checkpoint_policy project plan keys input_key toolchain_key node [] then
+             up_to_date dat_hash_cache (#emit_output_hashes options) (#allow_cache_timeout_discrepancy options)
+               no_checkpoint_policy project plan keys input_key toolchain_key node [] then
             HolbuildStatus.UpToDate
           else (build_sml_like plan node ".uo";
-                write_metadata (#emit_output_hashes options) no_checkpoint_policy project plan keys input_key toolchain_key node [];
+                write_metadata (#emit_output_hashes options) no_checkpoint_policy (tactic_timeout no_checkpoint_policy) project plan keys input_key toolchain_key node [];
                 HolbuildStatus.Built)
       | HolbuildSourceIndex.Sig =>
           if not (force_node options project node) andalso not (always_reexecute node) andalso
-             up_to_date dat_hash_cache (#emit_output_hashes options) no_checkpoint_policy project plan keys input_key toolchain_key node [] then
+             up_to_date dat_hash_cache (#emit_output_hashes options) (#allow_cache_timeout_discrepancy options)
+               no_checkpoint_policy project plan keys input_key toolchain_key node [] then
             HolbuildStatus.UpToDate
           else (build_sml_like plan node ".ui";
-                write_metadata (#emit_output_hashes options) no_checkpoint_policy project plan keys input_key toolchain_key node [];
+                write_metadata (#emit_output_hashes options) no_checkpoint_policy (tactic_timeout no_checkpoint_policy) project plan keys input_key toolchain_key node [];
                 HolbuildStatus.Built)
   end
 
@@ -3707,8 +3735,8 @@ fun node_policy options project node =
 
 fun node_is_up_to_date options project plan keys toolchain_key node =
   not (force_node options project node) andalso not (always_reexecute node) andalso
-  up_to_date (new_file_hash_cache ()) (#emit_output_hashes options) (node_policy options project node)
-             project plan keys (HolbuildBuildPlan.input_key_for keys node)
+  up_to_date (new_file_hash_cache ()) (#emit_output_hashes options) (#allow_cache_timeout_discrepancy options)
+             (node_policy options project node) project plan keys (HolbuildBuildPlan.input_key_for keys node)
              toolchain_key node []
 
 fun report_up_to_date_node status project keys node =

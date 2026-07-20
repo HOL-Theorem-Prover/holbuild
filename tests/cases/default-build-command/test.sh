@@ -89,6 +89,7 @@ build_help_log=$tmpdir/build-help.log
 (cd "$tmpdir" && "$HOLBUILD_BIN" build --help) > "$build_help_log" 2>&1
 require_grep "holbuild \[GLOBAL OPTIONS\] \[build\] \[OPTIONS\] \[TARGET ...\]" "$build_help_log"
 require_grep "force\[=theory|project|full\]" "$build_help_log"
+require_grep "allow-cache-timeout-discrepancy" "$build_help_log"
 
 context_help_log=$tmpdir/context-help.log
 (cd "$tmpdir" && "$HOLBUILD_BIN" context --help) > "$context_help_log" 2>&1
