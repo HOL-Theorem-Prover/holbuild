@@ -1486,16 +1486,16 @@ fun cache_root () = HolbuildCache.cache_root ()
 fun timeout_text NONE = "none"
   | timeout_text (SOME seconds) = Real.toString seconds
 
-fun parse_finite_real_text text =
+fun parse_positive_finite_real_text text =
   case Real.scan Substring.getc (Substring.full text) of
       SOME (value, rest) =>
-        if Substring.isEmpty rest andalso Real.isFinite value then SOME value
+        if Substring.isEmpty rest andalso Real.isFinite value andalso value > 0.0 then SOME value
         else NONE
     | NONE => NONE
 
 fun parse_timeout_text text =
   if text = "none" then SOME NONE
-  else Option.map SOME (parse_finite_real_text text)
+  else Option.map SOME (parse_positive_finite_real_text text)
 
 fun timeout_satisfies requested built =
   case requested of
@@ -1520,18 +1520,35 @@ fun timeout_equal (NONE, NONE) = true
    fields. Those artifacts were produced under the historical CLI default. *)
 val legacy_default_proof_timeout = SOME 2.5
 
-fun legacy_proof_timeout lines field_name =
+datatype proof_timeout_field =
+    ProofTimeoutAbsent
+  | ProofTimeoutPresent of real option
+  | ProofTimeoutInvalid
+
+fun parse_proof_timeout_field lines field_name =
   let
     val prefix = field_name ^ "="
-    fun line_timeout line =
+    fun line_value line =
       if String.isPrefix prefix line then
-        parse_timeout_text (String.extract(line, size prefix, NONE))
+        SOME (String.extract(line, size prefix, NONE))
       else NONE
   in
-    case first_some line_timeout lines of
-        SOME timeout => timeout
-      | NONE => legacy_default_proof_timeout
+    case List.mapPartial line_value lines of
+        [] => ProofTimeoutAbsent
+      | [text] =>
+          (case parse_timeout_text text of
+               SOME timeout => ProofTimeoutPresent timeout
+             | NONE => ProofTimeoutInvalid)
+      | _ => ProofTimeoutInvalid
   end
+
+fun proof_timeout_field_satisfies allow_discrepancy requested field =
+  case field of
+      ProofTimeoutAbsent =>
+        cache_timeout_satisfies allow_discrepancy requested legacy_default_proof_timeout
+    | ProofTimeoutPresent built =>
+        cache_timeout_satisfies allow_discrepancy requested built
+    | ProofTimeoutInvalid => false
 
 fun file_hash_matches path hash =
   file_exists path andalso file_hash path = hash
@@ -2426,13 +2443,12 @@ fun deps_checkpoint_ok_text deps_key =
 fun deps_checkpoint_exists path deps_key =
   checkpoint_ok_matches path [("kind", "deps_loaded"), ("deps_key", deps_key)]
 
-fun checkpoint_proof_timeout path =
-  case current_metadata (path ^ ".ok") of
-      NONE => legacy_default_proof_timeout
-    | SOME text => legacy_proof_timeout (metadata_lines text) "proof_timeout"
-
 fun checkpoint_timeout_satisfies requested_timeout path =
-  timeout_satisfies requested_timeout (checkpoint_proof_timeout path)
+  case current_metadata (path ^ ".ok") of
+      NONE => timeout_satisfies requested_timeout legacy_default_proof_timeout
+    | SOME text =>
+        proof_timeout_field_satisfies false requested_timeout
+          (parse_proof_timeout_field (metadata_lines text) "proof_timeout")
 
 fun theorem_context_checkpoint_exists requested_timeout project node checkpoint =
   let val deps_loaded = deps_loaded_path project node (#deps_key checkpoint)
@@ -3305,12 +3321,17 @@ fun metadata_input_key_matches input_key text =
       SOME old_key => old_key = input_key
     | NONE => false
 
-fun metadata_proof_timeout text = legacy_proof_timeout (metadata_lines text) "proof_timeout"
+fun metadata_proof_timeout text =
+  case parse_proof_timeout_field (metadata_lines text) "proof_timeout" of
+      ProofTimeoutAbsent => legacy_default_proof_timeout
+    | ProofTimeoutPresent timeout => timeout
+    | ProofTimeoutInvalid => raise Error "metadata invalid proof_timeout"
 
 fun metadata_timeout_satisfies allow_discrepancy policy node text =
   case #kind (HolbuildBuildPlan.source_of node) of
       HolbuildSourceIndex.TheoryScript =>
-        cache_timeout_satisfies allow_discrepancy (tactic_timeout policy) (metadata_proof_timeout text)
+        proof_timeout_field_satisfies allow_discrepancy (tactic_timeout policy)
+          (parse_proof_timeout_field (metadata_lines text) "proof_timeout")
     | _ => true
 
 (* Up-to-date is intentionally a cheap semantic check. The input_key already
@@ -3564,11 +3585,21 @@ fun analyser_proof_ir_plan_sml_for_boundaries (boundaries : HolbuildTheoryCheckp
               | NONE => raise Error ("missing proof-IR plan for theorem boundary " ^ Int.toString i)
         in List.tabulate(expected, require) end
 
-fun source_boundaries_for_node node source_text =
+fun reject_unenforced_tactic_timeout policy node detail =
+  case tactic_timeout policy of
+      NONE => ()
+    | SOME seconds =>
+        raise Error ("cannot enforce requested tactic timeout of " ^
+                     timeout_text (SOME seconds) ^ "s while building " ^
+                     logical_name node ^ " because theorem instrumentation is unavailable\n" ^
+                     detail)
+
+fun source_boundaries_for_node policy node source_text =
   SOME (detail_time_phase "build.exec.node.analyse_boundaries"
           (fn () => discover_theorem_boundaries_recovering (source_file node) source_text))
   handle Error msg =>
-    (warn ("could not safely instrument theorem boundaries for " ^ logical_name node ^
+    (reject_unenforced_tactic_timeout policy node msg;
+     warn ("could not safely instrument theorem boundaries for " ^ logical_name node ^
            "; building without proof steps/checkpoints for this theory\n" ^ msg);
      NONE)
 
@@ -3593,11 +3624,12 @@ fun theory_checkpoints_for_node policy project plan keys toolchain_key node sour
       theorem_checkpoint_specs (proof_engine policy) (tactic_timeout policy) project node deps_key source_text proof_ir_plans boundaries
     end
     handle Error msg =>
-      if proof_ir_enabled policy then raise Error msg
-      else
-        (warn ("could not safely instrument theorem boundaries for " ^ logical_name node ^
-               "; building without proof steps/checkpoints for this theory\n" ^ msg);
-         [])
+      (reject_unenforced_tactic_timeout policy node msg;
+       if proof_ir_enabled policy then raise Error msg
+       else
+         (warn ("could not safely instrument theorem boundaries for " ^ logical_name node ^
+                "; building without proof steps/checkpoints for this theory\n" ^ msg);
+          []))
 
 fun termination_diagnostics_for_node policy node source_text =
   if not (proof_steps_enabled policy) then []
@@ -3621,10 +3653,10 @@ fun source_spans_for_node policy node source_text =
        termination_diagnostics = #terminations combined}
     end
     handle Error _ =>
-      {source_boundaries = source_boundaries_for_node node source_text,
+      {source_boundaries = source_boundaries_for_node policy node source_text,
        termination_diagnostics = termination_diagnostics_for_node policy node source_text}
   else
-    {source_boundaries = source_boundaries_for_node node source_text,
+    {source_boundaries = source_boundaries_for_node policy node source_text,
      termination_diagnostics = []}
 
 fun declaration_checkpoints_for_node policy project plan keys toolchain_key node source_text terminations =
