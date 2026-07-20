@@ -160,6 +160,11 @@ fun restore {remote, identity, final_dir} =
            handle e => (cleanup (); raise e))
         end
 
+fun remote_entry_available remote identity =
+  case HolbuildRemoteCache.get_action remote identity of
+      NONE => false
+    | SOME text => (ignore (parse_remote_record text); true)
+
 fun publish {remote, identity, entry_dir} =
   let
     val archive_path = temp_path "publish"
@@ -186,5 +191,19 @@ fun publish {remote, identity, entry_dir} =
       end before cleanup ())
      handle e => (cleanup (); raise e))
   end
+
+fun publish_or_existing (request as {remote, identity, entry_dir = _}) =
+  publish request
+  handle error =>
+    if remote_entry_available remote identity then
+      HolbuildCacheBackend.AlreadyPresent
+    else
+      raise error
+
+fun ensure_published (request as {remote, identity, entry_dir = _}) =
+  if remote_entry_available remote identity then
+    HolbuildCacheBackend.AlreadyPresent
+  else
+    publish_or_existing request
 
 end

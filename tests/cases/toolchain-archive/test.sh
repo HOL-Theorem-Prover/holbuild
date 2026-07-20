@@ -229,6 +229,61 @@ require_grep '^holbuild-hol-analyser holbuild-hol-analyser-v1$' "$tmpdir/analyse
 require_grep '^GET /cas/' "$request_log"
 [[ $(grep -c '^PUT ' "$request_log") -eq "$published_put_count" ]]
 
+# Explicit publication ensures a pre-existing local toolchain is available in
+# an empty remote cache without rebuilding it. Repeating the command observes
+# the valid remote AC record and remains upload-free.
+rm -rf "$remote_root/ac" "$remote_root/cas"
+explicit_puts_before=$(grep -c '^PUT ' "$request_log")
+explicit_publish_log=$tmpdir/explicit-publish.log
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol --publish) \
+  > "$explicit_publish_log" 2>&1
+[[ $(tail -n 1 "$explicit_publish_log") = "$published_holdir" ]]
+[[ $(wc -l < "$build_count") -eq 1 ]]
+[[ $(grep -c '^PUT ' "$request_log") -eq $((explicit_puts_before + 2)) ]]
+[[ $(find "$remote_root/ac" -type f | wc -l) -eq 1 ]]
+[[ $(find "$remote_root/cas" -type f | wc -l) -eq 1 ]]
+explicit_repeat_puts=$(grep -c '^PUT ' "$request_log")
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol --publish) \
+  > "$tmpdir/explicit-publish-repeat.log" 2>&1
+[[ $(grep -c '^PUT ' "$request_log") -eq "$explicit_repeat_puts" ]]
+[[ $(wc -l < "$build_count") -eq 1 ]]
+
+# An explicit request requires an endpoint and reports publication failures as
+# command failures while preserving the valid local entry.
+if (cd "$project" && "$HOLBUILD_BIN" buildhol --publish) \
+    > "$tmpdir/explicit-publish-no-remote.log" 2>&1; then
+  record_regression_failure "buildhol --publish succeeded without a remote cache"
+else
+  require_grep 'requires a configured remote cache' "$tmpdir/explicit-publish-no-remote.log"
+fi
+if (cd "$project" && "$HOLBUILD_BIN" --remote-cache http://127.0.0.1:1 buildhol --publish) \
+    > "$tmpdir/explicit-publish-failure.log" 2>&1; then
+  record_regression_failure "buildhol --publish ignored a publication failure"
+else
+  require_grep 'could not ensure HOL toolchain is published' "$tmpdir/explicit-publish-failure.log"
+fi
+require_file "$(dirname "$published_holdir")/build.ok"
+
+# A remote restore already proves availability and must not be re-uploaded by
+# the explicit mode.
+rm -rf "$cache/hol-toolchains"
+explicit_restore_puts=$(grep -c '^PUT ' "$request_log")
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol --publish) \
+  > "$tmpdir/explicit-publish-restore.log" 2>&1
+[[ $(grep -c '^PUT ' "$request_log") -eq "$explicit_restore_puts" ]]
+[[ $(wc -l < "$build_count") -eq 1 ]]
+require_file "$(dirname "$published_holdir")/build.ok"
+
+# The explicit-publication test replaced the fixture remote. Keep subsequent
+# corruption/interruption tests anchored to its current complete AC/CAS pair.
+action_files=("$remote_root"/ac/*)
+cas_files=("$remote_root"/cas/*)
+cp "${action_files[0]}" "$original_action"
+cp "${cas_files[0]}" "$original_archive"
+
+"$HOLBUILD_BIN" buildhol --help > "$tmpdir/buildhol-help.log"
+require_grep '\-\-publish' "$tmpdir/buildhol-help.log"
+
 initial_put_count=$(grep -c '^PUT ' "$request_log")
 initial_cas_get_count=$(grep -c '^GET /cas/' "$request_log")
 

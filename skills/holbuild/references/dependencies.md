@@ -29,7 +29,7 @@ The `hol` dependency is special:
 - `${HOLBUILD_POLY:-poly} --script tools/smart-configure.sml` and `bin/build --no-helpdocs` are used to build a missing shared entry
 - dirty, broken, or incomplete shared HOL entries are rejected until removed manually
 
-Use `holbuild buildhol` to warm this cache explicitly. Normal commands that need HOL build/reuse it automatically.
+Use `holbuild buildhol` to warm this cache explicitly. Normal commands that need HOL build/reuse it automatically. With a configured remote cache, `holbuild buildhol --publish` ensures a validated local toolchain is available remotely and fails if explicit publication fails.
 
 ## Git dependencies
 

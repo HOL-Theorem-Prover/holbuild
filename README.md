@@ -157,6 +157,14 @@ To build that HOL toolchain ahead of time, for example in CI, run:
 holbuild buildhol
 ```
 
+With a configured remote cache, `buildhol --publish` also ensures an existing
+validated local toolchain is available remotely. Unlike automatic write-through
+publication, an explicitly requested publication failure fails the command:
+
+```sh
+holbuild --remote-cache https://cache.example.org buildhol --publish
+```
+
 ### Tracing-kernel toolchains
 
 Proof-tracing builds use HOL's tracing kernel:
@@ -201,6 +209,7 @@ holbuild context
 holbuild context --trknl
 holbuild execution-plan MyTheory:my_theorem
 holbuild buildhol
+holbuild buildhol --publish
 holbuild buildhol --trknl
 holbuild build --trknl MyTheory
 holbuild heap main
@@ -554,7 +563,9 @@ Remote cache misses or errors fall back to the local cache/source build path.
 A missing HOL toolchain is restored from the same remote cache when its exact
 installation path, platform, and Poly/ML identity match. After a remote miss, a
 successful local toolchain build is published automatically; local and remote
-hits are not re-uploaded, and publication failure is only a warning.
+hits are not re-uploaded, and automatic publication failure is only a warning.
+`holbuild buildhol --publish` ensures a validated local hit is present remotely;
+it requires a configured remote cache and treats publication failure as fatal.
 
 The remote endpoint stores content blobs under `/cas/<sha256>` and holbuild
 cache metadata under `/ac/<action-key>`. CAS transfers use zstd compression when
