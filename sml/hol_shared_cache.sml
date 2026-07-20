@@ -458,54 +458,97 @@ fun restore_entry k =
               false))
   end
 
+fun publish_complete_entry publish k url =
+  if path_exists (ok_for_key k) andalso complete_entry_contents k then
+    ignore
+      (publish
+         {remote = HolbuildRemoteCache.remote url,
+          identity = archive_identity k,
+          entry_dir = entry_dir_for_key k})
+  else
+    die "HOL toolchain is not complete enough to publish"
+
 fun publish_entry k =
   case HolbuildRemoteCacheConfig.url () of
       NONE => ()
     | SOME url =>
-        ((if path_exists (ok_for_key k) andalso complete_entry_contents k then
-            ignore
-              (HolbuildToolchainArchive.publish
-                 {remote = HolbuildRemoteCache.remote url,
-                  identity = archive_identity k,
-                  entry_dir = entry_dir_for_key k})
-          else die "HOL toolchain is not complete enough to publish")
+        (publish_complete_entry HolbuildToolchainArchive.publish_or_existing k url
          handle error => warn_publish (archive_error_message error))
 
-fun restore_or_build_entry req k =
-  if restore_entry k then false
-  else
-    (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_LOCAL_FALLBACK";
-     wait_test_gate "HOLBUILD_TEST_TOOLCHAIN_LOCAL_FALLBACK_GATE";
-     ignore (build_entry req k);
-     true)
+fun publish_entry_required publish k =
+  case HolbuildRemoteCacheConfig.url () of
+      NONE => die "buildhol --publish requires a configured remote cache"
+    | SOME url =>
+        (publish_complete_entry publish k url
+         handle error =>
+           die ("could not ensure HOL toolchain is published: " ^ archive_error_message error))
 
-fun finish_entry req k =
+fun ensure_entry_published k =
+  publish_entry_required HolbuildToolchainArchive.ensure_published k
+
+fun publish_entry_or_accept_existing k =
+  publish_entry_required HolbuildToolchainArchive.publish_or_existing k
+
+datatype entry_origin = ExistingLocal | RestoredRemote | BuiltLocally
+
+fun prepare_entry req k =
   let
-    val built_locally =
+    val origin =
       if validate_entry req k then
         (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_REVALIDATED";
-         false)
-      else restore_or_build_entry req k
+         ExistingLocal)
+      else if restore_entry k then
+        RestoredRemote
+      else
+        (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_LOCAL_FALLBACK";
+         wait_test_gate "HOLBUILD_TEST_TOOLCHAIN_LOCAL_FALLBACK_GATE";
+         ignore (build_entry req k);
+         BuiltLocally)
     val _ = if hol_source_manifest_built k then () else generate_hol_source_manifest k
     val _ = ignore (build_analyser k)
-    val _ = if built_locally then publish_entry k else ()
   in
-    holdir_for_key k
+    origin
   end
 
-fun ensure_built_with_kernel req =
-  let
-    val k = key req
-    val ak = analyser_key ()
+fun finish_entry publication req k =
+  let val origin = prepare_entry req k
+      val _ = publication origin k
+  in holdir_for_key k end
+
+fun publish_automatic BuiltLocally k = publish_entry k
+  | publish_automatic _ _ = ()
+
+fun publish_required RestoredRemote _ = ()
+  | publish_required ExistingLocal k = ensure_entry_published k
+  | publish_required BuiltLocally k = publish_entry_or_accept_existing k
+
+fun with_entry_lock k operation =
+  let val lock = acquire_lock k
   in
-    if validate_entry req k andalso hol_source_manifest_built k andalso analyser_built k ak then holdir_for_key k
+    (await_mutation_quiescence k;
+     operation () before release_lock lock)
+    handle error => (release_lock lock; raise error)
+  end
+
+fun entry_ready req k =
+  validate_entry req k andalso
+  hol_source_manifest_built k andalso
+  analyser_built k (analyser_key ())
+
+fun ensure_built_with_kernel req =
+  let val k = key req
+  in
+    if entry_ready req k then holdir_for_key k
+    else with_entry_lock k (fn () => finish_entry publish_automatic req k)
+  end
+
+fun ensure_published_with_kernel req =
+  let val k = key req
+  in
+    if HolbuildRemoteCacheConfig.enabled () then
+      with_entry_lock k (fn () => finish_entry publish_required req k)
     else
-      let val lock = acquire_lock k
-      in
-        (await_mutation_quiescence k;
-         finish_entry req k before release_lock lock)
-        handle error => (release_lock lock; raise error)
-      end
+      die "buildhol --publish requires a configured remote cache"
   end
 
 fun ensure_built req = ensure_built_with_kernel (standard_request req)

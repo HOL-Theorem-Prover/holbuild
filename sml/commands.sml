@@ -91,10 +91,15 @@ fun execution_plan_help () = print
 
 fun buildhol_help () = print
   "Usage:\n\
-  \  holbuild [GLOBAL OPTIONS] buildhol [--trknl]\n\n\
+  \  holbuild [GLOBAL OPTIONS] buildhol [--trknl] [--publish]\n\n\
   \Build/reuse the declared HOL tree and print its path. Use --trknl to select\n\
   \the tracing kernel. A configured remote cache restores toolchains and\n\
-  \publishes successful local builds automatically.\n\n\
+  \publishes successful local builds automatically. With --publish, success\n\
+  \means holbuild observed and validated a restore-usable archive for the\n\
+  \selected toolchain identity during publication. A valid concurrent\n\
+  \same-identity entry is accepted without replacing local bytes. Later cache\n\
+  \replacement or eviction can make a future restore fail; publication failure\n\
+  \is fatal.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun heap_help () = print
@@ -1390,16 +1395,21 @@ fun reject_holdir holdir =
       SOME _ => raise Error "--holdir is no longer supported; declare dependencies.hol"
     | NONE => ()
 
-fun project_hol_holdir kernel_variant project =
+fun project_hol_holdir_with ensure kernel_variant project =
   let val resolution = {kernel_variant = kernel_variant}
   in
     (ignore (HolbuildProjectGraph.resolve {project = project, resolution = resolution});
      case HolbuildProject.resolved_hol_dependency_with resolution project of
          SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev}, ...}) =>
-           HolbuildHolSharedCache.ensure_built_with_kernel
-             {git = git, rev = rev, kernel_variant = kernel_variant}
+           ensure {git = git, rev = rev, kernel_variant = kernel_variant}
        | _ => raise Error "schema 2 project has no dependencies.hol")
   end
+
+fun project_hol_holdir kernel_variant project =
+  project_hol_holdir_with HolbuildHolSharedCache.ensure_built_with_kernel kernel_variant project
+
+fun published_project_hol_holdir kernel_variant project =
+  project_hol_holdir_with HolbuildHolSharedCache.ensure_published_with_kernel kernel_variant project
 
 fun effective_toolchain_for kernel_variant holdir maxheap =
   let
@@ -1431,17 +1441,25 @@ fun parse_context_args args =
     | _ => raise Error "usage: holbuild context [--trknl]"
 
 fun parse_buildhol_args args =
-  case args of
-      [] => HolbuildHolToolchainConfig.StandardKernel
-    | ["--trknl"] => HolbuildHolToolchainConfig.TracingKernel
-    | _ => raise Error "usage: holbuild buildhol [--trknl]"
+  let
+    fun loop kernel_variant publish rest =
+      case rest of
+          [] => {kernel_variant = kernel_variant, publish = publish}
+        | "--trknl" :: xs => loop HolbuildHolToolchainConfig.TracingKernel publish xs
+        | "--publish" :: xs => loop kernel_variant true xs
+        | _ => raise Error "usage: holbuild buildhol [--trknl] [--publish]"
+  in
+    loop HolbuildHolToolchainConfig.StandardKernel false args
+  end
 
 fun buildhol holdir maxheap args =
   let
-    val kernel_variant = parse_buildhol_args args
+    val {kernel_variant, publish} = parse_buildhol_args args
     val project = load_project ()
     val _ = reject_holdir holdir
-    val holdir = project_hol_holdir kernel_variant project
+    val holdir =
+      if publish then published_project_hol_holdir kernel_variant project
+      else project_hol_holdir kernel_variant project
   in
     print (holdir ^ "\n")
   end

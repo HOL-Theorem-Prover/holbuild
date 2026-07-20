@@ -53,6 +53,7 @@ holbuild build                           # build all, or roots if configured
 holbuild build --dry-run FooTheory       # show plan
 holbuild context                         # show manifest info/cache paths
 holbuild buildhol                        # prebuild/reuse dependencies.hol
+holbuild buildhol --publish              # ensure it is available in the configured remote cache
 holbuild execution-plan FooTheory:thm    # static proof-step plan
 holbuild build --force --trace-steps FooTheory
 holbuild --json build FooTheory          # bounded JSON events/errors for build output
