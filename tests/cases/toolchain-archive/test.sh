@@ -248,6 +248,97 @@ explicit_repeat_puts=$(grep -c '^PUT ' "$request_log")
 [[ $(grep -c '^PUT ' "$request_log") -eq "$explicit_repeat_puts" ]]
 [[ $(wc -l < "$build_count") -eq 1 ]]
 
+# Existing action metadata is not sufficient evidence for explicit publication:
+# its referenced archive must still be downloadable and intact. Neither failure
+# may trigger a replacement upload or alter the valid local toolchain.
+action_files=("$remote_root"/ac/*)
+cas_files=("$remote_root"/cas/*)
+explicit_action_snapshot=$tmpdir/explicit-action
+explicit_archive_snapshot=$tmpdir/explicit-archive
+explicit_local_hol_snapshot=$tmpdir/explicit-local-hol
+cp "${action_files[0]}" "$explicit_action_snapshot"
+cp "${cas_files[0]}" "$explicit_archive_snapshot"
+cp "$published_holdir/bin/hol" "$explicit_local_hol_snapshot"
+
+rm "${cas_files[0]}"
+missing_archive_puts=$(grep -c '^PUT ' "$request_log")
+if (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol --publish) \
+    > "$tmpdir/explicit-missing-archive.log" 2>&1; then
+  record_regression_failure "buildhol --publish accepted an action with a missing archive"
+else
+  require_grep 'archive blob is missing' "$tmpdir/explicit-missing-archive.log"
+fi
+[[ $(grep -c '^PUT ' "$request_log") -eq "$missing_archive_puts" ]]
+cmp -s "${action_files[0]}" "$explicit_action_snapshot"
+cmp -s "$published_holdir/bin/hol" "$explicit_local_hol_snapshot"
+require_file "$(dirname "$published_holdir")/build.ok"
+cp "$explicit_archive_snapshot" "${cas_files[0]}"
+
+truncate -s 1 "${cas_files[0]}"
+corrupt_archive_puts=$(grep -c '^PUT ' "$request_log")
+if (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol --publish) \
+    > "$tmpdir/explicit-corrupt-archive.log" 2>&1; then
+  record_regression_failure "buildhol --publish accepted an action with a corrupt archive"
+else
+  require_grep 'archive blob is corrupt: downloaded blob size mismatch' \
+    "$tmpdir/explicit-corrupt-archive.log"
+fi
+[[ $(grep -c '^PUT ' "$request_log") -eq "$corrupt_archive_puts" ]]
+cmp -s "${action_files[0]}" "$explicit_action_snapshot"
+cmp -s "$published_holdir/bin/hol" "$explicit_local_hol_snapshot"
+require_file "$(dirname "$published_holdir")/build.ok"
+cp "$explicit_archive_snapshot" "${cas_files[0]}"
+
+# A plain local hit remains entirely local even when the configured remote is
+# empty.
+rm -rf "$remote_root/ac" "$remote_root/cas"
+plain_local_hit_puts=$(grep -c '^PUT ' "$request_log")
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) \
+  > "$tmpdir/plain-local-hit.log" 2>&1
+[[ $(grep -c '^PUT ' "$request_log") -eq "$plain_local_hit_puts" ]]
+[[ $(wc -l < "$build_count") -eq 1 ]]
+[[ ! -e "$remote_root/ac" ]]
+[[ ! -e "$remote_root/cas" ]]
+mkdir -p "$(dirname "${action_files[0]}")" "$(dirname "${cas_files[0]}")"
+cp "$explicit_action_snapshot" "${action_files[0]}"
+cp "$explicit_archive_snapshot" "${cas_files[0]}"
+
+# An empty local cache and remote miss in explicit mode build once and perform
+# one CAS write plus one action write. The result must then restore without
+# rebuilding or writing again.
+strict_cache=$tmpdir/strict-cache
+strict_build_count=$tmpdir/strict-build-count
+: > "$strict_build_count"
+rm -rf "$remote_root/ac" "$remote_root/cas"
+strict_fallback_puts=$(grep -c '^PUT ' "$request_log")
+(cd "$project" && HOLBUILD_CACHE="$strict_cache" \
+  HOLBUILD_TEST_BUILD_COUNT="$strict_build_count" \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol --publish) \
+  > "$tmpdir/strict-local-fallback.log" 2>&1
+strict_holdir=$(tail -n 1 "$tmpdir/strict-local-fallback.log")
+[[ $(wc -l < "$strict_build_count") -eq 1 ]]
+[[ $(grep -c '^PUT ' "$request_log") -eq $((strict_fallback_puts + 2)) ]]
+[[ $(find "$remote_root/ac" -type f | wc -l) -eq 1 ]]
+[[ $(find "$remote_root/cas" -type f | wc -l) -eq 1 ]]
+require_file "$strict_holdir/bin/hol"
+require_file "$(dirname "$strict_holdir")/build.ok"
+
+rm -rf "$strict_cache/hol-toolchains"
+strict_restore_puts=$(grep -c '^PUT ' "$request_log")
+(cd "$project" && HOLBUILD_CACHE="$strict_cache" \
+  HOLBUILD_TEST_BUILD_COUNT="$strict_build_count" \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) \
+  > "$tmpdir/strict-local-fallback-restore.log" 2>&1
+[[ $(wc -l < "$strict_build_count") -eq 1 ]]
+[[ $(grep -c '^PUT ' "$request_log") -eq "$strict_restore_puts" ]]
+require_file "$strict_holdir/bin/hol"
+require_file "$(dirname "$strict_holdir")/build.ok"
+
+rm -rf "$remote_root/ac" "$remote_root/cas"
+mkdir -p "$(dirname "${action_files[0]}")" "$(dirname "${cas_files[0]}")"
+cp "$explicit_action_snapshot" "${action_files[0]}"
+cp "$explicit_archive_snapshot" "${cas_files[0]}"
+
 # An explicit request requires an endpoint and reports publication failures as
 # command failures while preserving the valid local entry.
 if (cd "$project" && "$HOLBUILD_BIN" buildhol --publish) \
@@ -461,6 +552,30 @@ PY
 }
 
 write_archive_mutator
+
+# A complete blob with a manifest for a different identity is likewise not a
+# usable remote entry. Explicit validation must reject it without replacing the
+# local toolchain or attempting another upload.
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) \
+  > "$tmpdir/explicit-identity-setup.log" 2>&1
+require_file "$(dirname "$published_holdir")/build.ok"
+cp "$published_holdir/bin/hol" "$tmpdir/explicit-identity-local-hol"
+python3 "$tmpdir/mutate_archive.py" \
+  "$original_archive" "$tmpdir/mutated-explicit-identity.tar" \
+  "${action_files[0]}" "$remote_root/cas" wrong-identity
+cp "${action_files[0]}" "$tmpdir/mutated-explicit-identity-action"
+identity_mismatch_puts=$(grep -c '^PUT ' "$request_log")
+if (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol --publish) \
+    > "$tmpdir/explicit-identity-mismatch.log" 2>&1; then
+  record_regression_failure "buildhol --publish accepted an archive for a different identity"
+else
+  require_grep 'identity does not match' "$tmpdir/explicit-identity-mismatch.log"
+fi
+[[ $(grep -c '^PUT ' "$request_log") -eq "$identity_mismatch_puts" ]]
+cmp -s "${action_files[0]}" "$tmpdir/mutated-explicit-identity-action"
+cmp -s "$published_holdir/bin/hol" "$tmpdir/explicit-identity-local-hol"
+require_file "$(dirname "$published_holdir")/build.ok"
+cp "$original_action" "${action_files[0]}"
 
 invalid_restore() {
   local mutation=$1

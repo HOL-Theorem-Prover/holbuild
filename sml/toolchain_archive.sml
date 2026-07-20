@@ -122,6 +122,37 @@ fun extract_archive {archive_path, staging_dir} =
     (fn () => HolbuildTar.extract
       {archive_path = archive_path, destination = staging_dir})
 
+fun fetch_remote_archive {remote, sha1, archive_path} =
+  case HolbuildRemoteCache.fetch_toolchain_blob remote {hash = sha1, dst = archive_path} of
+      HolbuildCacheBackend.Hit => ()
+    | HolbuildCacheBackend.Miss => die "remote toolchain archive blob is missing"
+    | HolbuildCacheBackend.Corrupt detail => die ("remote toolchain archive blob is corrupt: " ^ detail)
+
+fun with_remote_archive {remote, sha1, scratch_dir} use_archive =
+  let
+    val archive_path = Path.concat(scratch_dir, "archive.tar")
+    fun cleanup () = remove_tree scratch_dir handle _ => ()
+  in
+    ((FS.mkDir scratch_dir;
+      fetch_remote_archive {remote = remote, sha1 = sha1, archive_path = archive_path};
+      use_archive archive_path)
+     before cleanup ())
+    handle e => (cleanup (); raise e)
+  end
+
+fun validate_remote_archive {remote, sha1, identity} =
+  let
+    val scratch_dir = temp_path "validate"
+    val staging_dir = Path.concat(scratch_dir, "contents")
+  in
+    with_remote_archive {remote = remote, sha1 = sha1, scratch_dir = scratch_dir}
+      (fn archive_path =>
+        (FS.mkDir staging_dir;
+         extract_archive {archive_path = archive_path, staging_dir = staging_dir};
+         validate_extracted_manifest {staging_dir = staging_dir, identity = identity}))
+  end
+
+
 fun install_archive {archive_path, identity, final_dir} =
   let
     val staging_dir = staging_path final_dir
@@ -144,26 +175,24 @@ fun restore {remote, identity, final_dir} =
         let
           val sha1 = parse_remote_record text
           val scratch_dir = restore_scratch_path final_dir
-          val archive_path = Path.concat(scratch_dir, "archive.tar")
-          fun cleanup () = remove_tree scratch_dir handle _ => ()
-          fun fetch () =
-            case HolbuildRemoteCache.fetch_toolchain_blob remote {hash = sha1, dst = archive_path} of
-                HolbuildCacheBackend.Hit => ()
-              | HolbuildCacheBackend.Miss => die "remote toolchain archive blob is missing"
-              | HolbuildCacheBackend.Corrupt detail => die ("remote toolchain archive blob is corrupt: " ^ detail)
         in
-          ((FS.mkDir scratch_dir;
-            fetch ();
-            install_archive {archive_path = archive_path, identity = identity, final_dir = final_dir};
-            cleanup ();
-            true)
-           handle e => (cleanup (); raise e))
+          with_remote_archive {remote = remote, sha1 = sha1, scratch_dir = scratch_dir}
+            (fn archive_path =>
+              (install_archive
+                 {archive_path = archive_path, identity = identity, final_dir = final_dir};
+               true))
         end
+
 
 fun remote_entry_available remote identity =
   case HolbuildRemoteCache.get_action remote identity of
       NONE => false
-    | SOME text => (ignore (parse_remote_record text); true)
+    | SOME text =>
+        let val sha1 = parse_remote_record text
+        in
+          validate_remote_archive {remote = remote, sha1 = sha1, identity = identity};
+          true
+        end
 
 fun publish {remote, identity, entry_dir} =
   let
