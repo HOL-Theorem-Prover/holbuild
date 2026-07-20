@@ -1486,9 +1486,16 @@ fun cache_root () = HolbuildCache.cache_root ()
 fun timeout_text NONE = "none"
   | timeout_text (SOME seconds) = Real.toString seconds
 
+fun parse_finite_real_text text =
+  case Real.scan Substring.getc (Substring.full text) of
+      SOME (value, rest) =>
+        if Substring.isEmpty rest andalso Real.isFinite value then SOME value
+        else NONE
+    | NONE => NONE
+
 fun parse_timeout_text text =
   if text = "none" then SOME NONE
-  else Option.map SOME (Real.fromString text)
+  else Option.map SOME (parse_finite_real_text text)
 
 fun timeout_satisfies requested built =
   case requested of
@@ -1724,11 +1731,12 @@ fun cache_manifest_contract input_key text =
     val lines = cache_manifest_lines text
     val _ = cache_manifest_blobs_from_lines input_key lines
     val proof_timeout = cache_manifest_proof_timeout lines
-    val non_timeout_lines =
-      List.filter (fn line => not (String.isPrefix "proof-timeout=" line)) lines
+    val fields = String.fields (fn c => c = #"\n") text
+    val non_timeout_fields =
+      List.filter (fn line => not (String.isPrefix "proof-timeout=" line)) fields
   in
     {proof_timeout = proof_timeout,
-     non_timeout_text = String.concatWith "\n" non_timeout_lines ^ "\n"}
+     non_timeout_text = String.concatWith "\n" non_timeout_fields}
   end
 
 fun timeout_at_least_as_strong candidate reference =
