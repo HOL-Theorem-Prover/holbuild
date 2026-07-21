@@ -17,7 +17,7 @@ mkdir -p "$analyser_root/sml" "$analyser_root/vendor"
 cp "$HOLBUILD_ROOT"/sml/*.sml "$analyser_root/sml/"
 cp -R "$HOLBUILD_ROOT/sml/analyser" "$analyser_root/sml/analyser"
 cp -R "$HOLBUILD_ROOT/vendor/sml-sha256" "$analyser_root/vendor/sml-sha256"
-printf '\n(* timeout analyser failure regression fixture *)\n' >> "$analyser_root/sml/analyser/analysis_protocol.sml"
+printf '\n(* exit-zero incomplete analyser response regression fixture *)\n' >> "$analyser_root/sml/analyser/analysis_protocol.sml"
 
 fake_polyc=$tmpdir/fake-polyc
 cat > "$fake_polyc" <<'SH'
