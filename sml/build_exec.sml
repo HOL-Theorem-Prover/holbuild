@@ -1525,20 +1525,21 @@ datatype proof_timeout_field =
   | ProofTimeoutPresent of real option
   | ProofTimeoutInvalid
 
+fun parse_present_proof_timeout_field prefix line =
+  if String.isPrefix prefix line then
+    case parse_timeout_text (String.extract(line, size prefix, NONE)) of
+        SOME timeout => ProofTimeoutPresent timeout
+      | NONE => ProofTimeoutInvalid
+  else ProofTimeoutInvalid
+
 fun parse_proof_timeout_field lines field_name =
   let
     val prefix = field_name ^ "="
-    fun line_value line =
-      if String.isPrefix prefix line then
-        SOME (String.extract(line, size prefix, NONE))
-      else NONE
+    val matching_lines = List.filter (String.isPrefix field_name) lines
   in
-    case List.mapPartial line_value lines of
+    case matching_lines of
         [] => ProofTimeoutAbsent
-      | [text] =>
-          (case parse_timeout_text text of
-               SOME timeout => ProofTimeoutPresent timeout
-             | NONE => ProofTimeoutInvalid)
+      | [line] => parse_present_proof_timeout_field prefix line
       | _ => ProofTimeoutInvalid
   end
 
@@ -3603,6 +3604,11 @@ fun source_boundaries_for_node policy node source_text =
            "; building without proof steps/checkpoints for this theory\n" ^ msg);
      NONE)
 
+fun fallback_theory_checkpoints node msg =
+  (warn ("could not safely instrument theorem boundaries for " ^ logical_name node ^
+         "; building without proof steps/checkpoints for this theory\n" ^ msg);
+   [])
+
 fun theory_checkpoints_for_node policy project plan keys toolchain_key node source_text boundaries errors =
   if not (proof_steps_enabled policy) andalso not (checkpoint_enabled policy) then []
   else
@@ -3626,10 +3632,7 @@ fun theory_checkpoints_for_node policy project plan keys toolchain_key node sour
     handle Error msg =>
       (reject_unenforced_tactic_timeout policy node msg;
        if proof_ir_enabled policy then raise Error msg
-       else
-         (warn ("could not safely instrument theorem boundaries for " ^ logical_name node ^
-                "; building without proof steps/checkpoints for this theory\n" ^ msg);
-          []))
+       else fallback_theory_checkpoints node msg)
 
 fun termination_diagnostics_for_node policy node source_text =
   if not (proof_steps_enabled policy) then []

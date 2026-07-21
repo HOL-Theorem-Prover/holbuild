@@ -216,6 +216,7 @@ if not any(line.startswith(prefix) for line in lines):
 replacement = {
     "absent": [],
     "malformed": ["proof_timeout=180.0junk"],
+    "malformed-syntax": ["proof_timeout 180.0"],
     "duplicate": ["proof_timeout=1.0", "proof_timeout=180.0"],
 }[mode]
 result = []
@@ -287,7 +288,7 @@ metadata_absent_log=$tmpdir/metadata-absent.log
 (cd "$contract_project" && "$HOLBUILD_BIN" --verbose build --no-cache --tactic-timeout 60 ContractTheory) > "$metadata_absent_log" 2>&1
 require_grep "ContractTheory is up to date" "$metadata_absent_log"
 
-for invalid_mode in malformed duplicate; do
+for invalid_mode in malformed malformed-syntax duplicate; do
   cp "$contract_metadata_valid" "$contract_metadata"
   mutate_timeout_field "$contract_metadata" "$invalid_mode"
   invalid_metadata_log=$tmpdir/metadata-$invalid_mode.log
@@ -318,7 +319,7 @@ checkpoint_absent_log=$tmpdir/checkpoint-absent.log
 require_grep "from: theorem-context checkpoint after" "$checkpoint_absent_log"
 require_grep "ContractTheory built" "$checkpoint_absent_log"
 
-for invalid_mode in malformed duplicate; do
+for invalid_mode in malformed malformed-syntax duplicate; do
   restore_contract_checkpoints
   mapfile -t contract_checkpoint_ok_files < <(
     grep -rl '^proof_timeout=180.0$' "$contract_project/.holbuild/checkpoints" --include='*.ok'

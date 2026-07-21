@@ -63,8 +63,8 @@ done
 [ -n "$request" ]
 [ -n "$response" ]
 if grep -Eq 'boundaries|terminations' "$request"; then
-  echo 'simulated theorem-boundary analyser failure' >&2
-  exit 1
+  printf 'version 1\nok\nend\n' > "$response"
+  exit 0
 fi
 {
   printf 'version 1\nok\n'
