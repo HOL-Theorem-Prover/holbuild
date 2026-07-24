@@ -107,9 +107,14 @@ fun sort_pairs compare pairs =
 
 fun compare_pair_key ((left, _), (right, _)) = String.compare(left, right)
 
+fun compare_name_pair ((left_name, left_node), (right_name, right_node)) =
+  case String.compare(left_name, right_name) of
+      EQUAL => String.compare(key left_node, key right_node)
+    | order => order
+
 fun build_name_index nodes =
   let
-    val pairs = sort_pairs compare_pair_key (map (fn node => (logical_name node, node)) nodes)
+    val pairs = sort_pairs compare_name_pair (map (fn node => (logical_name node, node)) nodes)
     fun collect name acc rest =
       case rest of
           (name', node) :: more =>
