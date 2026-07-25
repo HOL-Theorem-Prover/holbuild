@@ -81,22 +81,36 @@ fun parse_termination fields =
 
 fun response_records wants source_path =
   let
-    fun loop lines in_file acc errors =
+    fun incomplete detail =
+      raise HolbuildTheoryCheckpoints.Error
+        ("incomplete analyser response for " ^ source_path ^ ": " ^ detail)
+    fun loop lines in_file completed acc errors =
       case lines of
-          [] => raise HolbuildTheoryCheckpoints.Error "analyser response missing end"
+          [] => incomplete "missing end"
         | line :: rest =>
             (case P.split line of
                  ["version", v] =>
-                   if v = P.protocol_version then loop rest in_file acc errors
+                   if v = P.protocol_version then loop rest in_file completed acc errors
                    else raise HolbuildTheoryCheckpoints.Error ("unsupported analyser protocol version: " ^ v)
-               | ["ok"] => loop rest in_file acc errors
-               | ["begin-file", "1"] => loop rest true acc errors
-               | ["end-file", "1"] => loop rest false acc errors
-               | ["end"] => (rev acc, rev errors)
-               | ["parse-error", text] => if in_file then loop rest in_file acc (text :: errors) else loop rest in_file acc errors
-               | fields => if in_file then loop rest in_file (fields :: acc) errors else loop rest in_file acc errors)
+               | ["ok"] => loop rest in_file completed acc errors
+               | ["begin-file", "1"] =>
+                   if in_file orelse completed then incomplete "duplicate begin-file"
+                   else loop rest true completed acc errors
+               | ["end-file", "1"] =>
+                   if in_file then loop rest false true acc errors
+                   else incomplete "end-file without begin-file"
+               | ["end"] =>
+                   if in_file then incomplete "missing end-file"
+                   else if completed then (rev acc, rev errors)
+                   else incomplete "missing file envelope"
+               | ["parse-error", text] =>
+                   if in_file then loop rest in_file completed acc (text :: errors)
+                   else loop rest in_file completed acc errors
+               | fields =>
+                   if in_file then loop rest in_file completed (fields :: acc) errors
+                   else loop rest in_file completed acc errors)
   in
-    loop (run wants source_path) false [] []
+    loop (run wants source_path) false false [] []
   end
 
 fun boundary_record fields =

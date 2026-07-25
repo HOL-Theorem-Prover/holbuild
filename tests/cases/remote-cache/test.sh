@@ -296,7 +296,7 @@ remote_action=$(remote_theory_action_path)
 clean_remote_action=$tmpdir/remote-action-60.clean
 cp "$remote_action" "$clean_remote_action"
 
-for invalid_timeout in 60.0junk inf; do
+for invalid_timeout in 60.0junk 0.0 '~1.0' 1e-999 inf nan; do
   cp "$clean_remote_action" "$remote_action"
   mutate_remote_manifest "$remote_action" timeout "$invalid_timeout"
   invalid_before=$tmpdir/invalid-$invalid_timeout.before

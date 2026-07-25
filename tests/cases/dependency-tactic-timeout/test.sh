@@ -198,3 +198,141 @@ if grep -q "tactic_timeout=\|proof_steps=\|goalfrag=" "$root_default_project/.ho
   echo "default root execution policy leaked into final action metadata" >&2
   exit 1
 fi
+
+mutate_timeout_field() {
+  local path=$1
+  local mode=$2
+  python3 - "$path" "$mode" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+mode = sys.argv[2]
+prefix = "proof_timeout="
+lines = path.read_text().splitlines()
+if not any(line.startswith(prefix) for line in lines):
+    raise SystemExit(f"missing {prefix} field in {path}")
+
+replacement = {
+    "absent": [],
+    "malformed": ["proof_timeout=180.0junk"],
+    "malformed-syntax": ["proof_timeout 180.0"],
+    "duplicate": ["proof_timeout=1.0", "proof_timeout=180.0"],
+}[mode]
+result = []
+inserted = False
+for line in lines:
+    if line.startswith(prefix):
+        if not inserted:
+            result.extend(replacement)
+            inserted = True
+    else:
+        result.append(line)
+path.write_text("\n".join(result) + "\n")
+PY
+}
+
+contract_project=$tmpdir/timeout-contract-hardening
+mkdir -p "$contract_project/src"
+cat > "$contract_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "timeout-contract-hardening"
+
+[build]
+members = ["src"]
+TOML
+cat > "$contract_project/src/ContractScript.sml" <<'SML'
+Theory Contract
+Ancestors bool
+
+Theorem first_contract_thm:
+  T
+Proof
+  simp[]
+QED
+
+Theorem second_contract_thm:
+  T
+Proof
+  simp[]
+QED
+SML
+
+contract_initial_log=$tmpdir/contract-initial.log
+(cd "$contract_project" && "$HOLBUILD_BIN" build --no-cache --tactic-timeout 180 ContractTheory) > "$contract_initial_log" 2>&1
+require_grep "ContractTheory built" "$contract_initial_log"
+contract_metadata="$contract_project/.holbuild/dep/timeout-contract-hardening/src/ContractScript.sml.key"
+require_grep '^proof_timeout=180.0$' "$contract_metadata"
+contract_metadata_valid=$tmpdir/contract-metadata.valid
+cp "$contract_metadata" "$contract_metadata_valid"
+contract_checkpoints_valid=$tmpdir/contract-checkpoints.valid
+cp -R "$contract_project/.holbuild/checkpoints" "$contract_checkpoints_valid"
+mapfile -t contract_checkpoint_ok_files < <(
+  grep -rl '^proof_timeout=180.0$' "$contract_project/.holbuild/checkpoints" --include='*.ok'
+)
+if [[ ${#contract_checkpoint_ok_files[@]} -eq 0 ]]; then
+  echo "initial finite build produced no timeout-bearing theorem checkpoints" >&2
+  exit 1
+fi
+
+mutate_timeout_field "$contract_metadata" absent
+metadata_absent_log=$tmpdir/metadata-absent.log
+(cd "$contract_project" && "$HOLBUILD_BIN" --verbose build --no-cache --tactic-timeout 60 ContractTheory) > "$metadata_absent_log" 2>&1
+require_grep "ContractTheory is up to date" "$metadata_absent_log"
+
+for invalid_mode in malformed malformed-syntax duplicate; do
+  cp "$contract_metadata_valid" "$contract_metadata"
+  mutate_timeout_field "$contract_metadata" "$invalid_mode"
+  invalid_metadata_log=$tmpdir/metadata-$invalid_mode.log
+  (cd "$contract_project" && "$HOLBUILD_BIN" --verbose build --no-cache --tactic-timeout 60 ContractTheory) > "$invalid_metadata_log" 2>&1
+  require_grep "ContractTheory built" "$invalid_metadata_log"
+  if grep -q "ContractTheory is up to date" "$invalid_metadata_log"; then
+    echo "$invalid_mode proof_timeout metadata satisfied a finite timeout request" >&2
+    cat "$invalid_metadata_log" >&2
+    exit 1
+  fi
+done
+
+restore_contract_checkpoints() {
+  rm -rf "$contract_project/.holbuild/checkpoints"
+  cp -R "$contract_checkpoints_valid" "$contract_project/.holbuild/checkpoints"
+  cp "$contract_metadata_valid" "$contract_metadata"
+}
+
+restore_contract_checkpoints
+mapfile -t contract_checkpoint_ok_files < <(
+  grep -rl '^proof_timeout=180.0$' "$contract_project/.holbuild/checkpoints" --include='*.ok'
+)
+for checkpoint_ok in "${contract_checkpoint_ok_files[@]}"; do
+  mutate_timeout_field "$checkpoint_ok" absent
+done
+checkpoint_absent_log=$tmpdir/checkpoint-absent.log
+(cd "$contract_project" && "$HOLBUILD_BIN" build --no-cache --tactic-timeout 60 ContractTheory) > "$checkpoint_absent_log" 2>&1
+require_grep "from: theorem-context checkpoint after" "$checkpoint_absent_log"
+require_grep "ContractTheory built" "$checkpoint_absent_log"
+
+for invalid_mode in malformed malformed-syntax duplicate; do
+  restore_contract_checkpoints
+  mapfile -t contract_checkpoint_ok_files < <(
+    grep -rl '^proof_timeout=180.0$' "$contract_project/.holbuild/checkpoints" --include='*.ok'
+  )
+  for checkpoint_ok in "${contract_checkpoint_ok_files[@]}"; do
+    mutate_timeout_field "$checkpoint_ok" "$invalid_mode"
+  done
+  invalid_checkpoint_log=$tmpdir/checkpoint-$invalid_mode.log
+  (cd "$contract_project" && "$HOLBUILD_BIN" build --no-cache --tactic-timeout 60 ContractTheory) > "$invalid_checkpoint_log" 2>&1
+  require_grep "ContractTheory built" "$invalid_checkpoint_log"
+  if grep -q "from: theorem-context checkpoint after" "$invalid_checkpoint_log"; then
+    echo "$invalid_mode proof_timeout checkpoint satisfied a finite timeout request" >&2
+    cat "$invalid_checkpoint_log" >&2
+    exit 1
+  fi
+done
