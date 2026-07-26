@@ -1770,8 +1770,12 @@ fun resumable_failed_prefix_metadata plan metadata =
 fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path failed_prefix_ok =
   let
     val old_resume_active = !failed_prefix_resume_active_ref
-    fun restore_resume_flag () = failed_prefix_resume_active_ref := old_resume_active
+    val old_proving = !proving_with_proof_ir_ref
+    fun restore_flags () =
+      (failed_prefix_resume_active_ref := old_resume_active;
+       proving_with_proof_ir_ref := old_proving)
     val _ = failed_prefix_resume_active_ref := true
+    val _ = proving_with_proof_ir_ref := true
     val result =
       (restore_failed_prefix_checkpoint_info (name, tactic_text, failed_prefix_path, failed_prefix_ok);
        with_theorem_trace name (fn () =>
@@ -1831,8 +1835,8 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
           val _ = drop_all()
           val _ = theorem_info_ref := NONE
         in th end))
-      handle e => (restore_resume_flag (); raise e)
-    val _ = restore_resume_flag ()
+      handle e => (restore_flags (); raise e)
+    val _ = restore_flags ()
   in
     result
   end
