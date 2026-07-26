@@ -1486,6 +1486,16 @@ fun with_theorem_trace name f =
     case result of TraceOk value => value | TraceError e => raise e
   end
 
+fun with_proof_ir_execution f =
+  let
+    val old_proving = !proving_with_proof_ir_ref
+    val _ = proving_with_proof_ir_ref := true
+    val result = TraceOk (f ()) handle e => TraceError e
+    val _ = proving_with_proof_ir_ref := old_proving
+  in
+    case result of TraceOk value => value | TraceError e => raise e
+  end
+
 fun proof_ir_prove name end_path end_ok checkpoint_depth g original_tac tactic_text =
   let
     val _ = active_tactic_text_ref := tactic_text
@@ -1770,11 +1780,13 @@ fun resumable_failed_prefix_metadata plan metadata =
 fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path failed_prefix_ok =
   let
     val old_resume_active = !failed_prefix_resume_active_ref
-    fun restore_resume_flag () = failed_prefix_resume_active_ref := old_resume_active
+    fun restore_resume_flag () =
+      failed_prefix_resume_active_ref := old_resume_active
     val _ = failed_prefix_resume_active_ref := true
     val result =
-      (restore_failed_prefix_checkpoint_info (name, tactic_text, failed_prefix_path, failed_prefix_ok);
-       with_theorem_trace name (fn () =>
+      with_proof_ir_execution (fn () =>
+       (restore_failed_prefix_checkpoint_info (name, tactic_text, failed_prefix_path, failed_prefix_ok);
+        with_theorem_trace name (fn () =>
         let
           val _ = active_tactic_text_ref := tactic_text
           val plan = case !active_plan_ref of SOME p => p | NONE => raise Fail "internal error: proof-IR plan is not installed"
@@ -1830,7 +1842,7 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
                    handle e => report_finish_failure name e
           val _ = drop_all()
           val _ = theorem_info_ref := NONE
-        in th end))
+        in th end)))
       handle e => (restore_resume_flag (); raise e)
     val _ = restore_resume_flag ()
   in
@@ -1840,13 +1852,11 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
 fun prove_outer_theorem (g, tac) (_, name, tactic_text, _, _, end_path, end_ok, _, _, has_attrs, checkpoint_depth) =
   let
     val atomic = has_attrs orelse tactic_text = ""
-    val _ = proving_with_proof_ir_ref := true
     val th =
-      with_theorem_trace name (fn () =>
-        if atomic then atomic_prove name g tac
-        else proof_ir_prove name end_path end_ok checkpoint_depth g tac tactic_text)
-      handle e => (proving_with_proof_ir_ref := false; raise e)
-    val _ = proving_with_proof_ir_ref := false
+      with_proof_ir_execution (fn () =>
+        with_theorem_trace name (fn () =>
+          if atomic then atomic_prove name g tac
+          else proof_ir_prove name end_path end_ok checkpoint_depth g tac tactic_text))
     val _ = theorem_info_ref := NONE
   in
     th
