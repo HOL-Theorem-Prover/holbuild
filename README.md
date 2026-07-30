@@ -506,12 +506,16 @@ holbuild build --skip-checkpoints MyTheory
 - `--repl-on-failure` starts a HOL REPL from the newest useful checkpoint after a
   theory failure. It serialises the build and is not supported with `--json`.
 - `--skip-proof-steps` opts out of proof-step execution.
-- `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation.
+- `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation. With no final
+  context to save, holbuild does not eagerly reload the just-exported generated
+  theory; dependents and explicit consumers load it normally through its manifest.
 
 For source-executed theory builds, holbuild writes a live child log at
 `.holbuild/logs/current/<package>/<logical>/build.log`. You can inspect it during
 a long build with `tail -f`; after the child exits, the same path is kept as the
-latest log. Up-to-date and cache-restored targets do not produce a new log; use
+latest log. When checkpoints are enabled, the separate generated-theory load and
+final-context save are recorded in `final-context.log` beside `build.log`.
+Up-to-date and cache-restored targets do not produce a new log; use
 `--force --no-cache` to regenerate one.
 
 Compatibility aliases:
