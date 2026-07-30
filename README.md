@@ -705,8 +705,18 @@ Repository tests resolve the schema 2 HOL toolchain cache automatically:
 make test
 ```
 
-To reuse an explicit checkout instead, pass `HOLDIR=/path/to/built/HOL`. The
-checkout must be at the revision recorded in `vendor/hol/REV`.
+To reuse an explicit checkout instead, pass `HOLDIR=/path/to/built/HOL`. By
+default the checkout must be at the revision recorded in `vendor/hol/REV`.
+
+To test against another immutable HOL commit without changing the vendor pin,
+leave `HOLDIR` unset and override the test revision. The runner provisions and
+reuses the corresponding revision-keyed toolchain through `holbuild buildhol`,
+and generated test manifests use the same revision:
+
+```sh
+env -u HOLDIR -u HOLBUILD_HOLDIR \
+  HOLBUILD_TEST_HOL_REV=<full-40-character-commit> make test
+```
 
 ## Release process
 

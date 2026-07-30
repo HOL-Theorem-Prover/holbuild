@@ -54,7 +54,11 @@ start_remote_cache_server() {
 }
 
 holbuild_pinned_hol_rev() {
-  tr -d '[:space:]' < "${HOLBUILD_ROOT:?HOLBUILD_ROOT not set}/vendor/hol/REV"
+  if [[ -n "${HOLBUILD_TEST_HOL_REV:-}" ]]; then
+    printf '%s\n' "$HOLBUILD_TEST_HOL_REV"
+  else
+    tr -d '[:space:]' < "${HOLBUILD_ROOT:?HOLBUILD_ROOT not set}/vendor/hol/REV"
+  fi
 }
 
 write_schema2_prelude() {
