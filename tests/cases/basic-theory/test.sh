@@ -34,6 +34,11 @@ open HolKernel Parse boolLib bossLib;
 
 val _ = new_theory "A";
 
+Datatype:
+  a_colour = ARed | ABlue
+End
+
+val a_def = new_definition("a_def", ``a_const = T``);
 val a_thm = store_thm("a_thm", ``T``, ACCEPT_TAC TRUTH);
 
 val _ = export_theory();
@@ -66,9 +71,11 @@ require_grep $'^phase\tname=build\.keys\.external\.lib_artifact\tstatus=ok\tms=.
 require_grep $'^phase\tname=build\.exec\.node\.analyse_boundaries\tstatus=ok\tms=' "$first_timing"
 require_grep $'^phase\tname=build\.exec\.node\.analyse_terminations\tstatus=ok\tms=' "$first_timing"
 require_grep $'^phase\tname=build\.exec\.node\.child_run\tstatus=ok\tms=' "$first_timing"
+require_grep $'^phase\tname=build\.exec\.node\.final_context\tstatus=ok\tms=' "$first_timing"
 require_grep $'^phase\tname=build\.exec\.checkpoint_budget\tstatus=ok\tms=' "$first_timing"
 require_grep $'^phase\tname=build\.exec\.publish_cache\tstatus=ok\tms=' "$first_timing"
 require_file "$project/.holbuild/logs/current/basic/ATheory/build.log"
+require_file "$project/.holbuild/logs/current/basic/ATheory/final-context.log"
 
 coarse_timing=$tmpdir/coarse.tool-timing
 (cd "$project" && HOLBUILD_TIMING_LOG="$coarse_timing" "$HOLBUILD_BIN" build --dry-run ATheory) > /dev/null
@@ -104,6 +111,23 @@ if ! find "$project/.holbuild/checkpoints" \( -name '*.save' -o -name '*.save.ok
   echo "successful build should retain checkpoint files for incremental rebuilds" >&2
   exit 1
 fi
+final_context=$(find "$project/.holbuild/checkpoints" -type f -name '*.final_context.save' -print -quit)
+if [[ -z "$final_context" ]]; then
+  echo "successful build did not retain final_context.save" >&2
+  exit 1
+fi
+require_file "$final_context.ok"
+require_grep '^holbuild-checkpoint-ok-v2$' "$final_context.ok"
+require_grep '^kind=final_context$' "$final_context.ok"
+require_grep '^deps_key=' "$final_context.ok"
+require_grep '^input_key=' "$final_context.ok"
+require_grep '^load_schema=fresh_generated_theory_v1$' "$final_context.ok"
+cat > "$tmpdir/final-context-check.sml" <<'SML'
+val _ = ATheory.a_def;
+val _ = ATheory.a_thm;
+SML
+"$HOLDIR/bin/hol" run --noconfig --holstate "$final_context" \
+  "$tmpdir/final-context-check.sml" > "$tmpdir/final-context-check.log" 2>&1
 if grep -q "deps_loaded=\|final_context=\|theorem_boundary" "$metadata"; then
   echo "metadata should not retain checkpoint paths" >&2
   exit 1
@@ -339,6 +363,7 @@ cp "$project/holproject.toml" "$no_export_project/holproject.toml"
 cat > "$no_export_project/src/AScript.sml" <<'SML'
 open HolKernel Parse boolLib bossLib;
 val _ = new_theory "A";
+val no_export_def = new_definition("no_export_def", ``no_export_const = T``);
 Theorem no_export_thm:
   T
 Proof
@@ -376,7 +401,7 @@ cp "$project/holproject.toml" "$skip_project/holproject.toml"
 cp "$project/src/AScript.sml" "$skip_project/src/AScript.sml"
 skip_log=$tmpdir/skip.log
 (cd "$skip_project" && \
-  HOLBUILD_CHECKPOINT_TIMING=1 HOLBUILD_ECHO_CHILD_LOGS=1 "$HOLBUILD_BIN" build --skip-checkpoints ATheory) \
+  HOLBUILD_CHECKPOINT_TIMING=1 HOLBUILD_ECHO_CHILD_LOGS=1 "$HOLBUILD_BIN" build --skip-checkpoints --no-cache ATheory) \
   > "$skip_log" 2>&1
 if grep -q "holbuild checkpoint kind=deps_loaded\|holbuild checkpoint kind=final_context" "$skip_log"; then
   echo "--skip-checkpoints created theory checkpoints" >&2
@@ -389,6 +414,16 @@ if find "$skip_project/.holbuild/checkpoints" \( -name '*.save' -o -name '*.save
   echo "--skip-checkpoints left checkpoint files" >&2
   exit 1
 fi
+if [[ -e "$skip_project/.holbuild/logs/current/basic/ATheory/final-context.log" ]]; then
+  echo "--skip-checkpoints ran a generated-theory final-context child" >&2
+  exit 1
+fi
+cat > "$tmpdir/skip-checkpoints-load.sml" <<SML
+load "$skip_project/.holbuild/obj/src/ATheory";
+val _ = ATheory.a_def;
+SML
+"$HOLDIR/bin/hol" run --noconfig --holstate "$HOLDIR/bin/hol.state" \
+  "$tmpdir/skip-checkpoints-load.sml" > "$tmpdir/skip-checkpoints-load.log" 2>&1
 
 stage_residue_project=$tmpdir/stage-residue-project
 mkdir -p "$stage_residue_project/src"

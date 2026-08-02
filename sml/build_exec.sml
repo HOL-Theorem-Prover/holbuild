@@ -288,7 +288,7 @@ fun write_child_policy path =
         "val _ = (Feedback.set_trace \"TheoryPP.include_html_docs\" 0 handle _ => ());"] ^
      "\n")
 
-fun generated_metadata_report_lines {theory_name, parents_report, mldeps_report} =
+fun generated_metadata_report_lines {parents_report, mldeps_report} =
   let
     val parent_lines =
       case parents_report of
@@ -307,11 +307,6 @@ fun generated_metadata_report_lines {theory_name, parents_report, mldeps_report}
 fun export_theory_if_needed_line sig_path =
   "val _ = HolbuildRuntime.export_theory_if_needed " ^ HolbuildToolchain.sml_string sig_path ^ ";"
 
-fun write_manifest_line path lines =
-  String.concat
-    ["val _ = HolbuildRuntime.write_manifest ", HolbuildToolchain.sml_string path,
-     " ", HolbuildToolchain.sml_list lines, ";"]
-
 fun hfs_unmapped_path path =
   let
     val {dir, file} = Path.splitDirFile path
@@ -322,42 +317,33 @@ fun hfs_unmapped_path path =
     else path
   end
 
-fun final_context_loader_lines {theory_name, sig_path, sml_path, parents_report, mldeps_report} =
+(* Export now seals a theory in current HOL versions.  Keep metadata capture and
+   export in the source child, but never load the generated theory module there:
+   the consumer-style load belongs in a fresh process. *)
+fun write_theory_exporter {sig_path, path, parents_report, mldeps_report} =
   let
-    val load_sig_path = hfs_unmapped_path sig_path
-    val load_sml_path = hfs_unmapped_path sml_path
-    val stem = drop_suffix ".sml" load_sml_path
-    val ui_path = stem ^ ".ui"
-    val uo_path = stem ^ ".uo"
-  in
-    generated_metadata_report_lines {theory_name = theory_name,
-                                     parents_report = parents_report,
-                                     mldeps_report = mldeps_report} @
-    [export_theory_if_needed_line sig_path,
-     write_manifest_line ui_path [load_sig_path],
-     write_manifest_line uo_path [load_sml_path],
-     "HolbuildRuntime.load " ^ HolbuildToolchain.sml_string stem ^ ";"]
-  end
-
-fun write_final_context_loader {theory_name, sig_path, sml_path, output, path, parents_report, mldeps_report} =
-  let
-    val lines = final_context_loader_lines {theory_name = theory_name,
-                                            sig_path = sig_path, sml_path = sml_path,
-                                            parents_report = parents_report,
-                                            mldeps_report = mldeps_report} @
-                [checkpoint_save_runtime_line (),
-                 save_heap_line {label = "final_context", share_common_data = true,
-                                 output = output, ok_text = checkpoint_ok_v1 ()}]
+    val lines =
+      generated_metadata_report_lines {parents_report = parents_report,
+                                       mldeps_report = mldeps_report} @
+      [export_theory_if_needed_line sig_path]
   in
     write_text path (String.concatWith "\n" lines ^ "\n")
   end
 
-fun write_plain_final_context_loader {theory_name, sig_path, sml_path, path, parents_report, mldeps_report} =
-  write_text path (String.concatWith "\n"
-                     (final_context_loader_lines {theory_name = theory_name,
-                                                  sig_path = sig_path, sml_path = sml_path,
-                                                  parents_report = parents_report,
-                                                  mldeps_report = mldeps_report}) ^ "\n")
+fun generated_theory_stem sml_path =
+  drop_suffix ".sml" (hfs_unmapped_path sml_path)
+
+fun write_final_context_loader {sml_path, output, ok_text, path} =
+  let
+    val lines =
+      ["HolbuildRuntime.load " ^
+         HolbuildToolchain.sml_string (generated_theory_stem sml_path) ^ ";",
+       checkpoint_save_runtime_line (),
+       save_heap_line {label = "final_context", share_common_data = true,
+                       output = output, ok_text = ok_text}]
+  in
+    write_text path (String.concatWith "\n" lines ^ "\n")
+  end
 
 fun generated_outputs node =
   let val generated = #generated (source_artifacts node)
@@ -388,6 +374,7 @@ fun current_log_dir project node =
   Path.concat(Path.concat(Path.concat(log_dir project, "current"), package node), logical_name node)
 
 fun current_build_log project node = Path.concat(current_log_dir project node, "build.log")
+fun current_final_context_log project node = Path.concat(current_log_dir project node, "final-context.log")
 fun current_checkpoint_failure_log project node = Path.concat(current_log_dir project node, "instrumented-failure.log")
 fun current_proof_trace_log project node = Path.concat(current_log_dir project node, "proof-trace.log")
 
@@ -2117,17 +2104,35 @@ fun parent_theory_load_stem plan parent =
 
 fun parent_load_stems plan parents = unique_strings (map (parent_theory_load_stem plan) parents)
 
-fun write_local_theory_manifests plan node {parents, mldeps} =
+fun generated_theory_loads plan {parents, mldeps} =
+  parent_load_stems plan parents @
+  mldep_load_stems plan (stable_generated_mldeps mldeps)
+
+fun write_local_theory_manifests plan node generated_metadata =
   let
     val {sig_path, sml_path, script_uo, theory_ui, theory_uo, ...} = theory_outputs node
     val deps = HolbuildBuildPlan.direct_project_deps plan node
-    val theory_loads = parent_load_stems plan parents @
-                       mldep_load_stems plan (stable_generated_mldeps mldeps)
+    val theory_loads = generated_theory_loads plan generated_metadata
     val script_loads = direct_external_loads plan node @ project_load_stems deps
   in
     write_object_manifest theory_ui [sig_path];
     write_object_manifest theory_uo (theory_loads @ [sml_path]);
     write_object_manifest script_uo (script_loads @ [source_file node])
+  end
+
+(* A source child used to write a one-entry stage manifest and then load it in
+   the already-exported session.  A fresh final-context child needs the same
+   parent/ML-dependency closure as an eventual consumer of the published
+   artifact, so construct its stage manifests from the runtime reports. *)
+fun write_staged_theory_manifests plan node stage generated_metadata =
+  let
+    val staged_sig = hfs_unmapped_path (staged_theory_file stage node ".sig")
+    val staged_sml = hfs_unmapped_path (staged_theory_file stage node ".sml")
+    val stem = generated_theory_stem staged_sml
+    val theory_loads = generated_theory_loads plan generated_metadata
+  in
+    write_object_manifest (stem ^ ".ui") [staged_sig];
+    write_object_manifest (stem ^ ".uo") (theory_loads @ [staged_sml])
   end
 
 fun remove_failed_cache_outputs project node =
@@ -2440,6 +2445,12 @@ fun checkpoint_ok_text_matches path expected_text =
 
 fun deps_checkpoint_ok_text deps_key =
   checkpoint_ok_text "deps_loaded" [("deps_key", deps_key)]
+
+fun final_context_ok_text deps_key input_key =
+  checkpoint_ok_text "final_context"
+    [("deps_key", deps_key),
+     ("input_key", input_key),
+     ("load_schema", "fresh_generated_theory_v1")]
 
 fun deps_checkpoint_exists path deps_key =
   checkpoint_ok_matches path [("kind", "deps_loaded"), ("deps_key", deps_key)]
@@ -2841,6 +2852,8 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
     val staged_script = Path.concat(stage, Path.file (source_file node))
     val child_policy = Path.concat(stage, "holbuild-child-policy.sml")
     val preload = Path.concat(stage, "holbuild-preload.sml")
+    val theory_exporter = Path.concat(stage, "holbuild-export-theory.sml")
+    val final_runtime = Path.concat(stage, "holbuild-final-context-runtime.sml")
     val final_loader = Path.concat(stage, "holbuild-save-final-context.sml")
     val parents_report = Path.concat(stage, "holbuild-theory-parents.txt")
     val mldeps_report = Path.concat(stage, "holbuild-theory-mldeps.txt")
@@ -2848,9 +2861,8 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
     val plan_only_marker = Path.concat(stage, "holbuild-proof-ir-plan.txt")
     val deps_key = dependency_context_key toolchain_key plan keys node
     val deps_loaded = deps_loaded_path project node deps_key
-    val deps_ok = deps_checkpoint_ok_text deps_key
     val final_context = final_context_path project node
-    val {sig_path, sml_path, data_path, script_uo, theory_ui, theory_uo} = theory_outputs node
+    val {sig_path, sml_path, data_path, ...} = theory_outputs node
     val staged_sig = staged_theory_file stage node ".sig"
     val staged_sml = staged_theory_file stage node ".sml"
     val staged_dat = staged_theory_file stage node ".dat"
@@ -2859,6 +2871,12 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
     val _ = remove_tree stage
     val _ = ensure_dir stage
     val _ = write_child_policy child_policy
+    val _ = remove_file (current_final_context_log project node)
+    val _ =
+      write_theory_exporter
+        {sig_path = staged_sig, path = theory_exporter,
+         parents_report = SOME parents_report,
+         mldeps_report = SOME mldeps_report}
     val _ = if checkpoint_enabled policy then ensure_parent deps_loaded else ()
     val _ = if checkpoint_enabled policy then ensure_parent final_context else ()
     val _ =
@@ -2869,19 +2887,12 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
       else ()
     val _ =
       if checkpoint_enabled policy then
-        write_final_context_loader
-          {theory_name = logical_name node,
-           sig_path = staged_sig, sml_path = staged_sml,
-           output = final_context, path = final_loader,
-           parents_report = SOME parents_report,
-           mldeps_report = SOME mldeps_report}
-      else
-        write_plain_final_context_loader
-          {theory_name = logical_name node,
-           sig_path = staged_sig, sml_path = staged_sml,
-           path = final_loader,
-           parents_report = SOME parents_report,
-           mldeps_report = SOME mldeps_report}
+        (write_text final_runtime (runtime_line () ^ "\n");
+         write_final_context_loader
+           {sml_path = staged_sml, output = final_context,
+            ok_text = final_context_ok_text deps_key input_key,
+            path = final_loader})
+      else ()
     val _ = remove_file timeout_marker
     val _ = remove_file plan_only_marker
     val run_spec = write_theory_script policy project base_context plan keys input_key toolchain_key node
@@ -3003,7 +3014,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
          (fn () =>
              run_hol_files_to_log tc stage stage
                (#context run_spec)
-               (child_policy :: (#files run_spec @ [final_loader]))
+               (child_policy :: (#files run_spec @ [theory_exporter]))
                "holbuild-build.log"
                (SOME (current_build_log project node))
                "hol run failed while building theory script"))
@@ -3063,6 +3074,43 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
                NONE => ()
              | SOME output => HolbuildStatus.message_stdout ("proof step trace log: " ^ captured_output_path output ^ "\n"))
       else ()
+    val generated_metadata =
+      read_generated_load_metadata {parents_report = parents_report,
+                                    mldeps_report = mldeps_report}
+    fun final_context_checkpoint_retryable msg =
+      hol_state_load_failure msg orelse
+      selected_hol_state_missing_failure msg orelse
+      holbuild_runtime_missing_failure msg
+    fun run_final_context_from context include_runtime =
+      let
+        val files =
+          child_policy ::
+          ((if include_runtime then [final_runtime] else []) @ [final_loader])
+      in
+        validate_hol_context context;
+        detail_time_phase "build.exec.node.final_context"
+          (fn () =>
+              run_hol_files_to_log tc stage stage context files
+                "holbuild-final-context.log"
+                (SOME (current_final_context_log project node))
+                "hol run failed while loading generated theory for final context")
+      end
+    val _ =
+      if checkpoint_enabled policy then
+        ((write_staged_theory_manifests plan node stage generated_metadata;
+          remove_checkpoint final_context;
+          if deps_checkpoint_exists deps_loaded deps_key then
+            (run_final_context_from (HolState deps_loaded) false
+             handle Error msg =>
+               if final_context_checkpoint_retryable msg then
+                 (remove_deps_checkpoint_family project node deps_key deps_loaded;
+                  warn ("discarding invalid deps-loaded checkpoint before final-context retry: " ^ deps_loaded);
+                  run_final_context_from base_context true)
+               else raise Error msg)
+          else
+            run_final_context_from base_context true)
+         handle Error msg => (cleanup_json_stage stage; raise Error msg))
+      else ()
     val _ =
       if trknl_enabled policy then
         if file_exists staged_trace then
@@ -3078,8 +3126,6 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
     val _ = copy_rewriting_path {src = staged_sml, dst = sml_path,
                                  replacements = dat_replacements}
     val _ = link_or_copy {src = sml_path, dst = hfs_remapped_path sml_path}
-    val generated_metadata = read_generated_load_metadata {parents_report = parents_report,
-                                                           mldeps_report = mldeps_report}
     val _ =
       if cache_allowed then
         detail_time_phase "build.exec.publish_cache"

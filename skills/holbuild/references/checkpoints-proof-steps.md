@@ -36,7 +36,9 @@ During a theory build, checkpoints may be created at syntactic boundaries:
 | `<thm>_context.save` | Theorem stored in theory context | Resume before the next declaration |
 | `<thm>_end_of_proof.save` | Instrumented proof replay complete, before `drop_all` | Proof navigation/debug state, not successor-ready |
 | `<thm>_failed_prefix.save` | Failed proof after a reusable prefix | Fast rebuild after editing a failing suffix |
-| `final_context.save` | Generated theory sig/sml loaded; successor-ready | Debug/successor breadcrumb |
+| `final_context.save` | Generated theory sig/sml loaded in a clean consumer process; successor-ready | Debug/successor breadcrumb |
+
+Export seals a theory in current HOL versions. The source process therefore records load metadata, exports, and exits; a separate process starts from the pre-theory dependency context (or the toolchain base state), loads the generated theory, and saves `final_context.save`. This consumer-style context intentionally excludes arbitrary source-script SML bindings.
 
 Successful source builds retain reusable deps/theorem-context checkpoints for future proof edits and clear stale failed-prefix checkpoints for that source. Failed/interrupted builds may leave failed-prefix and partial debug breadcrumbs. `holbuild gc` removes old checkpoint families and enforces the default 5GB project checkpoint budget.
 
@@ -47,12 +49,13 @@ Successful source builds retain reusable deps/theorem-context checkpoints for fu
 - Dependency context key (`deps_key`)
 - Proof engine (`proof_ir_*`)
 - Source prefix/header/checkpoint keys
+- Final-context input key and fresh-load schema
 
 Replay eligibility requires exact metadata match. Invalid selected checkpoints are discarded and retried from an earlier valid context instead of surfacing as proof failures. Parent/child checkpoint families are removed atomically: theorem descendants must not outlive their `deps_loaded.save` parent.
 
 ## `--skip-checkpoints`
 
-Runs theorem proofs through proof steps without saving `.save`/`.ok` files. No `deps_loaded`, `final_context`, theorem-context, end-of-proof, or failed-prefix checkpoints are created. Theory artifacts are still built normally.
+Runs theorem proofs through proof steps without saving `.save`/`.ok` files. No `deps_loaded`, `final_context`, theorem-context, end-of-proof, or failed-prefix checkpoints are created. With no final context to persist, holbuild stops the source process after export rather than eagerly reloading the sealed theory; generated artifacts are loaded normally by dependents or explicit consumers.
 
 ## `--skip-proof-steps`
 
