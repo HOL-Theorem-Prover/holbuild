@@ -518,14 +518,7 @@ fun bootstrap_reachable_frontier components analysis lookup nodes roots =
 fun canonical_frame text = Int.toString (size text) ^ ":" ^ text
 fun canonical_fields values = String.concat (map canonical_frame values)
 fun canonical_list tag values = [tag, Int.toString (length values)] @ values
-fun canonical_insert value values =
-  case values of
-      [] => [value]
-    | existing :: rest =>
-        if String.compare(value, existing) = LESS then value :: values
-        else existing :: canonical_insert value rest
-fun canonical_sort values =
-  List.foldl (fn (value, sorted) => canonical_insert value sorted) [] values
+fun canonical_sort values = sort_pairs String.compare values
 
 fun dependency_reason_text ExtractedLoad = "extracted-load"
   | dependency_reason_text ExtractedHoldepMention = "holdep-mention"
@@ -646,48 +639,61 @@ fun bound_node_id node =
       ["holbuild-resolved-node-v1", package node,
        HolbuildSourceIndex.source_id (source_of node)])
 
-fun canonical_node_for nodes node_key =
-  case node_with_key nodes node_key of
-      SOME node => bound_node_id node
-    | NONE => raise Error ("internal canonical dependency node is missing: " ^ node_key)
+type canonical_node_index =
+  {key_index : key_index, bound_ids : string Vector.vector}
 
-fun symbolic_text nodes (SymbolicDependency {from_node, name, reason}) =
+fun build_canonical_node_index nodes : canonical_node_index =
+  {key_index = build_key_index nodes,
+   bound_ids = Vector.fromList (map bound_node_id nodes)}
+
+fun canonical_node_for
+      ({key_index, bound_ids} : canonical_node_index) node_key =
+  Vector.sub(bound_ids, indexed_key_id key_index node_key)
+
+fun canonical_node_ids ({bound_ids, ...} : canonical_node_index) =
+  Vector.foldr (op ::) [] bound_ids
+
+fun symbolic_text index (SymbolicDependency {from_node, name, reason}) =
   canonical_fields
-    [canonical_node_for nodes from_node, dependency_reason_text reason, name]
+    [canonical_node_for index from_node, dependency_reason_text reason, name]
 
-fun resolved_edge_text nodes
+fun resolved_edge_text index
       ({from_node, to_node, symbolic_name, reason} : resolved_dependency_edge) =
   canonical_fields
-    [canonical_node_for nodes from_node, canonical_node_for nodes to_node,
+    [canonical_node_for index from_node, canonical_node_for index to_node,
      dependency_reason_text reason, symbolic_name]
 
-fun external_edge_text nodes
+fun external_edge_text index
       ({from_node, name, kind, reason} : external_dependency) =
   canonical_fields
-    [canonical_node_for nodes from_node,
+    [canonical_node_for index from_node,
      case kind of ExternalTheory => "theory" | ExternalLibrary => "library" |
                   ExternalInput => "input",
      dependency_reason_text reason, name]
 
-fun unresolved_edge_text nodes
+fun unresolved_edge_text index
       ({from_node, name, reason} : unresolved_dependency) =
   canonical_fields
-    [canonical_node_for nodes from_node, dependency_reason_text reason, name]
+    [canonical_node_for index from_node, dependency_reason_text reason, name]
 
 fun selected_graph_text nodes (graph : resolved_dependency_graph) =
-  canonical_fields
-    (["holbuild-selected-dependency-graph-v1"] @
-     canonical_list "nodes" (canonical_sort (map bound_node_id nodes)) @
-     canonical_list "symbolic"
-       (canonical_sort (map (symbolic_text nodes) (vector_values (#symbolic graph)))) @
-     canonical_list "resolved"
-       (canonical_sort (map (resolved_edge_text nodes) (vector_values (#resolved graph)))) @
-     canonical_list "external"
-       (canonical_sort (map (external_edge_text nodes) (vector_values (#external graph)))) @
-     canonical_list "unresolved"
-       (canonical_sort (map (unresolved_edge_text nodes) (vector_values (#unresolved graph)))) @
-     canonical_list "reverse"
-       (canonical_sort (map (resolved_edge_text nodes) (vector_values (#reverse graph)))))
+  let
+    val index = build_canonical_node_index nodes
+  in
+    canonical_fields
+      (["holbuild-selected-dependency-graph-v1"] @
+       canonical_list "nodes" (canonical_sort (canonical_node_ids index)) @
+       canonical_list "symbolic"
+         (canonical_sort (map (symbolic_text index) (vector_values (#symbolic graph)))) @
+       canonical_list "resolved"
+         (canonical_sort (map (resolved_edge_text index) (vector_values (#resolved graph)))) @
+       canonical_list "external"
+         (canonical_sort (map (external_edge_text index) (vector_values (#external graph)))) @
+       canonical_list "unresolved"
+         (canonical_sort (map (unresolved_edge_text index) (vector_values (#unresolved graph)))) @
+       canonical_list "reverse"
+         (canonical_sort (map (resolved_edge_text index) (vector_values (#reverse graph)))))
+  end
 
 fun selected_graph_identity nodes graph =
   HolbuildHash.string_sha256 (selected_graph_text nodes graph)
