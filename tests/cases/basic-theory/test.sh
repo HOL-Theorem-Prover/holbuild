@@ -88,6 +88,14 @@ if grep -q 'build\.exec\.node\|build\.exec\.checkpoint_budget\|build\.exec\.publ
   exit 1
 fi
 
+skip_proof_timing=$tmpdir/skip-proof.tool-timing
+(cd "$project" && HOLBUILD_TIMING_LOG="$skip_proof_timing" "$HOLBUILD_BIN" build --dry-run --skip-proof-steps ATheory) > /dev/null
+require_grep $'^phase\tname=build\.plan\tstatus=ok\tms=' "$skip_proof_timing"
+if grep -q $'^phase\tname=entry_timeout\.plan\t' "$skip_proof_timing"; then
+  echo "--skip-proof-steps should not plan proof-entry timeouts" >&2
+  exit 1
+fi
+
 require_file "$project/.holbuild/obj/src/ATheory.sig"
 require_file "$project/.holbuild/obj/src/ATheory.sml"
 require_file "$project/.holbuild/obj/src/ATheory.dat"
