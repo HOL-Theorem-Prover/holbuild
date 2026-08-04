@@ -788,8 +788,11 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
        proof_steps = proof_steps,
        new_ir = new_ir,
        node_tactic_timeouts =
-         if tactic_timeout_set then HolbuildTacticTimeoutPolicy.plan_timeouts project plan tactic_timeout
-         else HolbuildTacticTimeoutPolicy.entry_timeouts project index entry_plan (default_tactic_timeout ()),
+         (case entry_plan of
+              NONE => []
+            | SOME entry_plan =>
+                if tactic_timeout_set then HolbuildTacticTimeoutPolicy.plan_timeouts project plan tactic_timeout
+                else HolbuildTacticTimeoutPolicy.entry_timeouts project index entry_plan (default_tactic_timeout ())),
        execution_plan = execution_plan,
        trace_steps = trace_steps,
        repl_on_failure = repl_on_failure,
@@ -807,8 +810,14 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
         val targets = timed_phase "targets.default" (fn () => default_build_targets resolution project index requested_targets)
         val _ = reject_object_targets targets
         val plan = timed_phase "build.plan" (fn () => build_target_plan resolution components (#holdir tc) project index requested_targets targets)
-        val entry_targets = map #2 (HolbuildTacticTimeoutPolicy.declared_entries project index)
-        val entry_plan = timed_phase "entry_timeout.plan" (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index entry_targets)
+        val entry_plan =
+          if proof_steps then
+            let
+              val entry_targets = map #2 (HolbuildTacticTimeoutPolicy.declared_entries project index)
+            in
+              SOME (timed_phase "entry_timeout.plan" (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index entry_targets))
+            end
+          else NONE
         val _ = if warn_unreachable andalso null requested_targets then
                   warn_unreachable_root_scripts resolution project index plan
                 else ()
