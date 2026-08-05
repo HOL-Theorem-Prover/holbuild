@@ -82,7 +82,8 @@ printf 'first\n' > "$project/data/spec.txt"
 cat > "$project/src/AScript.sml" <<'SML'
 Theory A
 Theorem ordinary: T
-Proof ACCEPT_TAC TRUTH QED
+Proof ACCEPT_TAC TRUTH
+QED
 SML
 
 (cd "$project" && "$HOLBUILD_BIN" context) > "$tmpdir/context.log"
@@ -165,7 +166,8 @@ TOML
 cat > "$dep_project/src/DepScript.sml" <<'SML'
 Theory Dep
 Theorem dep_thm: T
-Proof ACCEPT_TAC TRUTH QED
+Proof ACCEPT_TAC TRUTH
+QED
 SML
 dep_rev=$(init_git_repo "$dep_project")
 cat > "$consumer_project/holproject.toml" <<TOML
@@ -191,7 +193,8 @@ cat > "$consumer_project/src/ConsumerScript.sml" <<'SML'
 Theory Consumer
 Ancestors Dep
 Theorem consumer_thm: T
-Proof ACCEPT_TAC dep_thm QED
+Proof ACCEPT_TAC dep_thm
+QED
 SML
 (cd "$consumer_project" && "$HOLBUILD_BIN" build ConsumerTheory) > "$tmpdir/generator-consumer.log"
 require_file "$consumer_project/.holbuild/obj/src/ConsumerTheory.dat"
@@ -233,14 +236,16 @@ TOML
 cat > "$data_project/src/AScript.sml" <<'SML'
 Theory A
 Theorem generated_data_input: T
-Proof ACCEPT_TAC TRUTH QED
+Proof ACCEPT_TAC TRUTH
+QED
 SML
 cat > "$data_project/src/BScript.sml" <<'SML'
 Theory B
 fun holbuild_extra_deps (_ : string list) = ()
 val () = holbuild_extra_deps ["../data/inline-generated.txt"];
 Theorem inline_generated_data_input: T
-Proof ACCEPT_TAC TRUTH QED
+Proof ACCEPT_TAC TRUTH
+QED
 SML
 (cd "$data_project" && "$HOLBUILD_BIN" build ATheory) > "$tmpdir/generated-data.log"
 require_file "$data_project/data/generated.txt"
