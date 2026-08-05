@@ -71,4 +71,27 @@ fun entry_timeouts project index entry_plan default_timeout =
     []
     (declared_entries project index)
 
+fun combine_timeouts left right =
+  let
+    fun add ((node_key, timeout), entries) =
+      let
+        fun insert values =
+          case values of
+              [] => [(node_key, timeout)]
+            | (key, old_timeout) :: rest =>
+                if key = node_key then
+                  (key, timeout_min (old_timeout, timeout)) :: rest
+                else (key, old_timeout) :: insert rest
+      in
+        insert entries
+      end
+  in
+    List.foldl add left right
+  end
+
+fun explicit_entries project index =
+  List.filter
+    (fn (root, _) => Option.isSome (HolbuildProject.root_tactic_timeout_for project root))
+    (declared_entries project index)
+
 end
