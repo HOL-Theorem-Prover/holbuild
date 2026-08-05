@@ -137,6 +137,69 @@ fi
 [[ "$(wc -c < "$project/data/copy.count" | tr -d ' ')" = "2" ]] || { echo "unaffected dependency generator reran during repair" >&2; exit 1; }
 [[ "$(wc -c < "$project/data/theory.count" | tr -d ' ')" = "3" ]] || { echo "theory generator did not rerun to repair changed output" >&2; exit 1; }
 
+# A consumer of an ordinary theory from a dependency must not need tools used
+# only by an unrelated generator in that dependency.
+dep_project=$tmpdir/generator-dependency
+consumer_project=$tmpdir/generator-consumer
+mkdir -p "$dep_project/src" "$consumer_project/src"
+cat > "$dep_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "generator-dependency"
+
+[build]
+members = ["src", "gen"]
+
+[[generate]]
+name = "unused-dependency-theory"
+command = ["dependency-tool-that-must-not-be-installed", "gen/UnusedScript.sml"]
+outputs = ["gen/UnusedScript.sml"]
+TOML
+cat > "$dep_project/src/DepScript.sml" <<'SML'
+Theory Dep
+Theorem dep_thm: T
+Proof ACCEPT_TAC TRUTH QED
+SML
+dep_rev=$(init_git_repo "$dep_project")
+cat > "$consumer_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[dependencies.generator-dependency]
+git = "$dep_project"
+rev = "$dep_rev"
+
+[project]
+name = "generator-consumer"
+
+[build]
+members = ["src"]
+TOML
+cat > "$consumer_project/src/ConsumerScript.sml" <<'SML'
+Theory Consumer
+Ancestors Dep
+Theorem consumer_thm: T
+Proof ACCEPT_TAC dep_thm QED
+SML
+(cd "$consumer_project" && "$HOLBUILD_BIN" build ConsumerTheory) > "$tmpdir/generator-consumer.log"
+require_file "$consumer_project/.holbuild/obj/src/ConsumerTheory.dat"
+if find "$consumer_project/.holbuild/packages" -path '*/gen/UnusedScript.sml' -print -quit | grep -q .; then
+  echo "consumer build ran an unreachable generator from a dependency" >&2
+  exit 1
+fi
+
 data_project=$tmpdir/generated-data-project
 mkdir -p "$data_project/src"
 cat > "$data_project/holproject.toml" <<TOML
@@ -161,15 +224,34 @@ extra_deps = ["data/generated.txt"]
 name = "make-data"
 command = ["sh", "-c", "mkdir -p data; printf generated > data/generated.txt"]
 outputs = ["data/generated.txt"]
+
+[[generate]]
+name = "make-inline-data"
+command = ["sh", "-c", "mkdir -p data; printf inline > data/inline-generated.txt"]
+outputs = ["data/inline-generated.txt"]
 TOML
 cat > "$data_project/src/AScript.sml" <<'SML'
 Theory A
 Theorem generated_data_input: T
 Proof ACCEPT_TAC TRUTH QED
 SML
+cat > "$data_project/src/BScript.sml" <<'SML'
+Theory B
+fun holbuild_extra_deps (_ : string list) = ()
+val () = holbuild_extra_deps ["../data/inline-generated.txt"];
+Theorem inline_generated_data_input: T
+Proof ACCEPT_TAC TRUTH QED
+SML
 (cd "$data_project" && "$HOLBUILD_BIN" build ATheory) > "$tmpdir/generated-data.log"
 require_file "$data_project/data/generated.txt"
 require_file "$data_project/.holbuild/obj/src/ATheory.dat"
+[[ ! -e "$data_project/data/inline-generated.txt" ]] || {
+  echo "manifest extra dependency ran an unrelated inline-data generator" >&2
+  exit 1
+}
+(cd "$data_project" && "$HOLBUILD_BIN" build BTheory) > "$tmpdir/inline-generated-data.log"
+require_file "$data_project/data/inline-generated.txt"
+require_file "$data_project/.holbuild/obj/src/BTheory.dat"
 
 bad_project=$tmpdir/bad-project
 mkdir -p "$bad_project/scripts"
