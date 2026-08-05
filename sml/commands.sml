@@ -810,14 +810,7 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
         val targets = timed_phase "targets.default" (fn () => default_build_targets resolution project index requested_targets)
         val _ = reject_object_targets targets
         val plan = timed_phase "build.plan" (fn () => build_target_plan resolution components (#holdir tc) project index requested_targets targets)
-        val entry_plan =
-          if proof_steps then
-            let
-              val entry_targets = map #2 (HolbuildTacticTimeoutPolicy.declared_entries project index)
-            in
-              SOME (timed_phase "entry_timeout.plan" (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index entry_targets))
-            end
-          else NONE
+        val entry_plan = if proof_steps then SOME plan else NONE
         val _ = if warn_unreachable andalso null requested_targets then
                   warn_unreachable_root_scripts resolution project index plan
                 else ()
@@ -1165,8 +1158,7 @@ fun export_archive tc jobs args =
     val targets = timed_phase "targets.default" (fn () => default_build_targets resolution project index requested_targets)
     val _ = reject_object_targets targets
     val plan = timed_phase "build.plan" (fn () => build_target_plan resolution components (#holdir tc) project index requested_targets targets)
-    val entry_targets = map #2 (HolbuildTacticTimeoutPolicy.declared_entries project index)
-    val entry_plan = timed_phase "entry_timeout.plan" (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index entry_targets)
+    val entry_plan = plan
     val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
     val options = export_build_options (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)) project index entry_plan plan
     val keys = HolbuildBuildPlan.input_keys (HolbuildBuildExec.build_config_lines_for_node options project) toolchain_key plan
