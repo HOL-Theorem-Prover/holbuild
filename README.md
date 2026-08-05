@@ -451,8 +451,12 @@ outputs = ["gen/OpcodeScript.sml"]
 deps = []
 ```
 
-Generators run before source discovery. Declared outputs are checked and then
-scanned as normal source files.
+Declared outputs participate in source discovery as virtual entries. A generator
+runs only when a selected source reaches one of its outputs, either as HOL/SML
+source or through a manifest/inline `extra_deps` declaration. Its transitive
+`deps` run first, and all declared outputs are then checked. Unreachable
+generators do not require their command-line tools to be installed. Broad groups
+and default roots still demand every generated output they select.
 
 ### Heaps and run contexts
 

@@ -41,6 +41,11 @@ deps = ["copy-spec"]
 command = ["python3", "scripts/gen_theory.py", "gen/spec.txt", "gen/GScript.sml", "data/theory.count"]
 inputs = ["scripts/gen_theory.py", "gen/spec.txt"]
 outputs = ["gen/GScript.sml"]
+
+[[generate]]
+name = "unused-theory"
+command = ["tool-that-must-not-be-installed", "gen/UnusedScript.sml"]
+outputs = ["gen/UnusedScript.sml"]
 TOML
 cat > "$project/scripts/copy_spec.py" <<'PY'
 from pathlib import Path
@@ -74,6 +79,11 @@ val _ = export_theory();
 count.write_text(count.read_text() + "x" if count.exists() else "x")
 PY
 printf 'first\n' > "$project/data/spec.txt"
+cat > "$project/src/AScript.sml" <<'SML'
+Theory A
+Theorem ordinary: T
+Proof ACCEPT_TAC TRUTH QED
+SML
 
 (cd "$project" && "$HOLBUILD_BIN" context) > "$tmpdir/context.log"
 [[ ! -e "$project/gen/spec.txt" && ! -e "$project/gen/GScript.sml" ]] || {
@@ -82,6 +92,15 @@ printf 'first\n' > "$project/data/spec.txt"
 }
 [[ ! -e "$project/data/copy.count" && ! -e "$project/data/theory.count" ]] || {
   echo "package graph resolution unexpectedly ran generators" >&2
+  exit 1
+}
+
+ordinary_log=$tmpdir/ordinary.log
+(cd "$project" && "$HOLBUILD_BIN" build ATheory) > "$ordinary_log"
+require_file "$project/.holbuild/obj/src/ATheory.dat"
+[[ ! -e "$project/gen/spec.txt" && ! -e "$project/gen/GScript.sml" &&
+   ! -e "$project/gen/UnusedScript.sml" ]] || {
+  echo "building an ordinary theory ran an unreachable generator" >&2
   exit 1
 }
 
@@ -117,6 +136,40 @@ if grep -q "poisoned" "$project/gen/GScript.sml"; then
 fi
 [[ "$(wc -c < "$project/data/copy.count" | tr -d ' ')" = "2" ]] || { echo "unaffected dependency generator reran during repair" >&2; exit 1; }
 [[ "$(wc -c < "$project/data/theory.count" | tr -d ' ')" = "3" ]] || { echo "theory generator did not rerun to repair changed output" >&2; exit 1; }
+
+data_project=$tmpdir/generated-data-project
+mkdir -p "$data_project/src"
+cat > "$data_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "generated_data"
+
+[build]
+members = ["src"]
+
+[actions.ATheory]
+extra_deps = ["data/generated.txt"]
+
+[[generate]]
+name = "make-data"
+command = ["sh", "-c", "mkdir -p data; printf generated > data/generated.txt"]
+outputs = ["data/generated.txt"]
+TOML
+cat > "$data_project/src/AScript.sml" <<'SML'
+Theory A
+Theorem generated_data_input: T
+Proof ACCEPT_TAC TRUTH QED
+SML
+(cd "$data_project" && "$HOLBUILD_BIN" build ATheory) > "$tmpdir/generated-data.log"
+require_file "$data_project/data/generated.txt"
+require_file "$data_project/.holbuild/obj/src/ATheory.dat"
 
 bad_project=$tmpdir/bad-project
 mkdir -p "$bad_project/scripts"

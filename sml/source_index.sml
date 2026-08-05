@@ -468,12 +468,32 @@ fun discover_package package acc =
     val members =
       map (fn member => HolbuildProject.abs_under source_root member)
         (HolbuildProject.package_members package)
+    fun generated_under member =
+      List.exists
+        (fn output => member_contains member (HolbuildProject.abs_under source_root output))
+        generated_paths
+    fun scan_existing (member, sources) =
+      if is_dir member orelse is_readable member then
+        scan_member name package_id source_root artifact_root policies generated_paths
+          excludes exclude_globs (member, sources)
+      else if generated_under member then sources
+      else scan_member name package_id source_root artifact_root policies generated_paths
+             excludes exclude_globs (member, sources)
+    fun declared_output (output, sources) =
+      let
+        val path = HolbuildProject.abs_under source_root output
+        val rel = relative_path source_root path
+      in
+        if not (List.exists (fn member => member_contains member path) members) orelse
+           excluded excludes exclude_globs rel then sources
+        else
+          case classify name package_id source_root artifact_root policies generated_paths path of
+              NONE => sources
+            | SOME source => source :: sources
+      end
+    val existing = List.foldl scan_existing acc members
     val sources =
-      deduplicate_sources
-        (List.foldl
-          (scan_member name package_id source_root artifact_root policies generated_paths excludes exclude_globs)
-          acc
-          members)
+      deduplicate_sources (List.foldl declared_output existing generated_paths)
     val _ = validate_action_policies name policies sources
   in
     sources
