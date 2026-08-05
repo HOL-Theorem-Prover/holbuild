@@ -772,7 +772,7 @@ fun plan_selection components holdir sources selection =
     val _ = if holdir = "" then HolbuildDependencies.clear_analyser_path ()
             else HolbuildDependencies.set_analyser_path (HolbuildHolSharedCache.analyser_path_for_holdir holdir)
     val external_dirs = [normalize_path (Path.concat(holdir, "sigobj"))]
-    val analysis = HolbuildComponentProvider.new_analysis_state provider
+    val analysis = HolbuildComponentProvider.new_analysis_state components
     val nodes = map (make_node external_dirs) sources
     val index = build_name_index nodes
     val lookup = indexed_nodes_named index
@@ -1193,12 +1193,23 @@ fun action_text_with plan config_lines_for_node toolchain_key external_key keys 
     val declared_dep_lines = map (fn dep => "declared_dep=" ^ dep) declared_deps
     val declared_load_lines = map (fn dep => "declared_load=" ^ dep) declared_loads
     val extra_inputs = HolbuildProject.action_extra_inputs policy
+    val _ =
+      List.app
+        (fn input => HolbuildComponentProvider.ensure_extra_input analysis source
+          (#package_root source) (HolbuildProject.extra_input_path input))
+        extra_inputs
+    val source_extra_deps = #extra_deps (deps_of analysis node)
+    val _ =
+      List.app
+        (HolbuildComponentProvider.ensure_extra_input analysis source
+          (Path.dir (#source_path source)))
+        source_extra_deps
     val manifest_extra_dep_lines =
       List.concat (map (fn input =>
         extra_dep_lines "extra_dep" (#package_root source)
           [HolbuildProject.extra_input_path input]) extra_inputs)
     val source_extra_dep_lines =
-      extra_dep_lines "source_extra_dep" (Path.dir (#source_path source)) (#extra_deps (deps_of analysis node))
+      extra_dep_lines "source_extra_dep" (Path.dir (#source_path source)) source_extra_deps
     val lines =
       ["holbuild-action-v1",
        "toolchain=" ^ toolchain_key,

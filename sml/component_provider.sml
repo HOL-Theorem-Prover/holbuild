@@ -7,6 +7,7 @@ datatype provider = LiveProvider
 
 type project_components =
   { provider : provider,
+    preparation : HolbuildPackagePrepare.t,
     graph : HolbuildProjectGraph.t,
     instances : HolbuildPackageComponent.instance list,
     sources : HolbuildSourceIndex.t,
@@ -105,6 +106,7 @@ fun load LiveProvider {preparation, discovery} : project_components =
     val _ = write_test_components instances resolution_context_id
   in
     {provider = LiveProvider,
+     preparation = preparation,
      graph = graph,
      instances = instances,
      sources = sources,
@@ -118,11 +120,14 @@ type node_analysis =
 
 type analysis_state =
   {provider : provider,
+   preparation : HolbuildPackagePrepare.t,
    hashes : (string * string) list ref,
    analyses : (string * node_analysis) list ref}
 
-fun new_analysis_state provider : analysis_state =
-  {provider = provider, hashes = ref [], analyses = ref []}
+fun new_analysis_state components : analysis_state =
+  {provider = #provider (components : project_components),
+   preparation = #preparation components,
+   hashes = ref [], analyses = ref []}
 
 fun lookup key entries =
   Option.map #2 (List.find (fn (candidate, _) => candidate = key) entries)
@@ -130,8 +135,23 @@ fun lookup key entries =
 fun analysis_key (source : HolbuildSourceIndex.source) =
   #package source ^ "\000" ^ HolbuildSourceIndex.source_id source
 
-fun source_hash ({hashes, ...} : analysis_state) source =
-  let val key = analysis_key source
+fun ensure_output ({preparation, ...} : analysis_state)
+                  (source : HolbuildSourceIndex.source) relative_path =
+  HolbuildPackagePrepare.ensure_output preparation (#package source) relative_path
+
+fun ensure_extra_input state (source : HolbuildSourceIndex.source) base relative_path =
+  let
+    val absolute = OS.Path.mkCanonical (OS.Path.concat(base, relative_path))
+    val package_relative =
+      HolbuildSourceIndex.relative_path (#package_root source) absolute
+  in
+    ensure_output state source package_relative
+  end
+
+fun source_hash (state as {hashes, ...} : analysis_state) source =
+  let
+    val _ = ensure_output state source (#relative_path source)
+    val key = analysis_key source
   in
     case lookup key (!hashes) of
         SOME value => value
