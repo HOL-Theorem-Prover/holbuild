@@ -7,6 +7,14 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../../lib.sh
 source "$SCRIPT_DIR/../../lib.sh"
 
+require_no_run_contexts() {
+  local dir=$1
+  if find "$dir" -maxdepth 1 -type f -name 'holbuild-run-context-*.sml' -print -quit | grep -q .; then
+    echo "unexpected run context remains in $dir" >&2
+    exit 1
+  fi
+}
+
 tmpdir=$(make_temp_dir)
 cleanup() { rm -rf "$tmpdir"; }
 trap cleanup EXIT
@@ -48,10 +56,8 @@ repl_log=$tmpdir/repl.log
 ) | (cd "$project" && timeout 20 "$HOLBUILD_BIN" repl) > "$repl_log" 2>&1
 require_grep "REPL_SMOKE_OK" "$repl_log"
 
-context="$project/.holbuild/holbuild-run-context.sml"
-require_file "$context"
-require_grep "loadPath :=" "$context"
-require_grep "HolbuildRuntime.load \"ATheory\"" "$context"
+require_no_run_contexts "$project/.holbuild"
+require_no_file "$project/.holbuild/holbuild-run-context.sml"
 
 run_script=$tmpdir/run-smoke.sml
 cat > "$run_script" <<'SML'
@@ -63,6 +69,37 @@ run_log=$tmpdir/run.log
 (cd "$project" && "$HOLBUILD_BIN" run "$run_script") > "$run_log" 2>&1
 require_grep "RUN_PACKAGE_LOAD_OK" "$run_log"
 require_grep "RUN_SMOKE_OK" "$run_log"
+require_no_run_contexts "$project/.holbuild"
+
+concurrent_script=$tmpdir/concurrent-run.sml
+cat > "$concurrent_script" <<'SML'
+val _ = OS.Process.sleep (Time.fromSeconds 3);
+val _ = print "CONCURRENT_RUN_OK\n";
+SML
+concurrent1_log=$tmpdir/concurrent1.log
+concurrent2_log=$tmpdir/concurrent2.log
+(cd "$project" && "$HOLBUILD_BIN" run "$concurrent_script") > "$concurrent1_log" 2>&1 &
+concurrent1_pid=$!
+(cd "$project" && "$HOLBUILD_BIN" run "$concurrent_script") > "$concurrent2_log" 2>&1 &
+concurrent2_pid=$!
+found_two_contexts=
+for _ in $(seq 1 50); do
+  context_count=$(find "$project/.holbuild" -maxdepth 1 -type f -name 'holbuild-run-context-*.sml' | wc -l)
+  if [[ $context_count -ge 2 ]]; then
+    found_two_contexts=1
+    break
+  fi
+  sleep 0.1
+done
+wait "$concurrent1_pid"
+wait "$concurrent2_pid"
+if [[ -z "$found_two_contexts" ]]; then
+  echo "concurrent run invocations did not retain distinct contexts" >&2
+  exit 1
+fi
+require_grep "CONCURRENT_RUN_OK" "$concurrent1_log"
+require_grep "CONCURRENT_RUN_OK" "$concurrent2_log"
+require_no_run_contexts "$project/.holbuild"
 
 no_run_loads=$tmpdir/no-run-loads
 cp -R "$project" "$no_run_loads"

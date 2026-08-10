@@ -1330,10 +1330,8 @@ fun build_heap_kind tc cli_jobs command target =
 fun build_heap tc cli_jobs target = build_heap_kind tc cli_jobs "heap" target
 fun build_executable tc cli_jobs target = build_heap_kind tc cli_jobs "executable" target
 
-fun hol_args_for_project tc project subcommand user_args =
+fun hol_args_for_project tc project subcommand context user_args =
   let
-    val packages = resolved_packages (resolution_for_toolchain tc) project
-    val context = HolbuildToolchain.write_run_context project packages
     val heap_args =
       case HolbuildProject.abs_run_heap project of
           NONE => ["--holstate", HolbuildToolchain.base_state tc]
@@ -1345,11 +1343,17 @@ fun hol_args_for_project tc project subcommand user_args =
 fun run_hol_with runner tc subcommand user_args =
   let
     val project = timed_phase "project.discover" load_project
-    val argv = hol_args_for_project tc project subcommand user_args
-    val status = runner argv
+    val packages = resolved_packages (resolution_for_toolchain tc) project
+    fun invoke context =
+      let
+        val argv = hol_args_for_project tc project subcommand context user_args
+        val status = runner argv
+      in
+        if HolbuildToolchain.success status then ()
+        else raise Error ("hol " ^ subcommand ^ " failed")
+      end
   in
-    if HolbuildToolchain.success status then ()
-    else raise Error ("hol " ^ subcommand ^ " failed")
+    HolbuildToolchain.with_run_context project packages invoke
   end
 
 fun run_hol tc subcommand user_args =
