@@ -210,4 +210,9 @@ val () = holbuild_extra_deps ["../data/table.txt"];
 
 Source-declared extra dependencies are staged so matching relative filesystem reads work during the action.
 
+Theory scripts can similarly declare deterministic fixed-file outputs with
+`holbuild_extra_outputs ["results/test.nsv"]`. These declarations are
+source-file-relative, must remain inside the package without `.`/`..` or glob
+syntax, and participate in up-to-date checking, caches, and target cleaning.
+
 Action policy names must resolve to sources in the package. An `[actions.FooTheory]` entry for a target that doesn't exist in the package is an error.

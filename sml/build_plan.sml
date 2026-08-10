@@ -70,6 +70,70 @@ fun unique_strings values = rev (List.foldl add_unique [] values)
 
 fun normalize_path path = Path.mkCanonical path handle Path.InvalidArc => path
 
+fun path_components path = String.tokens (fn c => c = #"/" orelse c = #"\\") path
+fun path_has_suffix suffix path =
+  size path >= size suffix andalso
+  String.substring(path, size path - size suffix, size suffix) = suffix
+fun has_glob_char path =
+  CharVector.exists (fn c => c = #"*" orelse c = #"?" orelse c = #"[" orelse c = #"]") path
+
+fun validate_extra_output_decl node path =
+  let
+    val source = source_of node
+    val context = "holbuild_extra_outputs in " ^ #source_path source
+    val components = path_components path
+    val invalid_component =
+      List.exists (fn component => component = "." orelse component = "..") components
+  in
+    if path = "" then raise Error (context ^ " contains an empty path")
+    else if Path.isAbsolute path then
+      raise Error (context ^ " path must be relative to the declaring source: " ^ path)
+    else if invalid_component then
+      raise Error (context ^ " path must not contain . or .. components: " ^ path)
+    else if path_has_suffix "/" path orelse path_has_suffix "\\" path then
+      raise Error (context ^ " path must name a file, not a directory: " ^ path)
+    else if has_glob_char path then
+      raise Error (context ^ " path must be a fixed file path, not a glob: " ^ path)
+    else if List.null components then
+      raise Error (context ^ " contains an invalid path: " ^ path)
+    else
+      case #kind source of
+          HolbuildSourceIndex.TheoryScript => ()
+        | _ => raise Error (context ^ " is only supported for theory-script actions")
+  end
+
+fun extra_output_path node declaration =
+  normalize_path (Path.concat(Path.dir (#source_path (source_of node)), declaration))
+
+fun validate_extra_output_ownership analysis selected =
+  let
+    fun outputs node =
+      let
+        val declarations = #extra_outputs (deps_of analysis node)
+        val _ = List.app (validate_extra_output_decl node) declarations
+        fun output declaration =
+          let val path = extra_output_path node declaration
+          in
+            if (FS.isDir path handle OS.SysErr _ => false) then
+              raise Error ("holbuild_extra_outputs path is a directory: " ^ path)
+            else (path, node)
+          end
+      in
+        map output declarations
+      end
+    fun insert ((path, owner), owners) =
+      case Binarymap.peek(owners, path) of
+          NONE => Binarymap.insert(owners, path, owner)
+        | SOME existing =>
+            if key existing = key owner then owners
+            else raise Error ("extra output has multiple owners: " ^ path ^ " (" ^
+                              logical_name existing ^ " and " ^ logical_name owner ^ ")")
+    val _ = List.foldl insert (Binarymap.mkDict String.compare)
+              (List.concat (map outputs selected))
+  in
+    ()
+  end
+
 fun has_logical_name name node = logical_name node = name
 
 fun nodes_named nodes name = List.filter (has_logical_name name) nodes
@@ -798,6 +862,7 @@ fun plan_selection components holdir sources selection =
     val _ = write_test_dependency_graph selected_graph_id selected_plan_id resolved_plan_id dependency_graph
     val _ = reject_graph_unresolved dependency_graph selected
     val _ = reject_source_uses analysis selected
+    val _ = validate_extra_output_ownership analysis selected
     val universe_key_index = build_key_index nodes
     val universe_node_index = Vector.fromList nodes
     val dependency_closure_cache =
@@ -1210,6 +1275,9 @@ fun action_text_with plan config_lines_for_node toolchain_key external_key keys 
           [HolbuildProject.extra_input_path input]) extra_inputs)
     val source_extra_dep_lines =
       extra_dep_lines "source_extra_dep" (Path.dir (#source_path source)) source_extra_deps
+    val source_extra_output_lines =
+      map (fn output => "source_extra_output=" ^ output)
+          (#extra_outputs (deps_of analysis node))
     val lines =
       ["holbuild-action-v1",
        "toolchain=" ^ toolchain_key,
@@ -1225,6 +1293,7 @@ fun action_text_with plan config_lines_for_node toolchain_key external_key keys 
       declared_load_lines @
       manifest_extra_dep_lines @
       source_extra_dep_lines @
+      source_extra_output_lines @
       map (fn dep => "dep=" ^ dep) (project_deps @ external_deps @ external_libs)
   in
     String.concatWith "\n" lines ^ "\n"

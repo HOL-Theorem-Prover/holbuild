@@ -2,7 +2,7 @@ structure HolbuildAnalysisProtocol =
 struct
 
 val protocol_version = "1"
-val analyser_format_version = "holbuild-hol-analyser-v1"
+val analyser_format_version = "holbuild-hol-analyser-v2"
 
 fun escape s =
   let

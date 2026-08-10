@@ -5,6 +5,14 @@ require_file() {
   [[ -f "$path" ]] || { echo "missing expected file: $path" >&2; exit 1; }
 }
 
+require_no_file() {
+  local path=$1
+  if [[ -e "$path" ]]; then
+    echo "unexpected file exists: $path" >&2
+    exit 1
+  fi
+}
+
 require_grep() {
   local pattern=$1
   local path=$2
