@@ -9,6 +9,8 @@ exception ErrorWithDebugArtifacts of string * HolbuildStatus.debug_artifacts
 exception ExecutionPlanPrinted
 exception RetryInvalidCheckpoint
 
+fun normalize_path path = Path.mkCanonical path handle Path.InvalidArc => path
+
 fun warn msg = HolbuildStatus.message_stderr ("holbuild: warning: " ^ msg ^ "\n")
 
 fun detail_time_phase name f =
@@ -1326,8 +1328,6 @@ fun invalidate_cached_file_hash (cache : file_hash_cache) path =
         case Binarymap.peek (!(#entries cache), path) of
             NONE => ()
           | SOME _ => #entries cache := #1 (Binarymap.remove (!(#entries cache), path)))
-
-fun normalize_path path = Path.mkCanonical path handle Path.InvalidArc => path
 
 fun is_dir path = FS.isDir path handle OS.SysErr _ => false
 
