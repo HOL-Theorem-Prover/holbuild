@@ -46,7 +46,11 @@ in
 end
 open HolKernel Parse boolLib bossLib;
 val _ = new_theory "A";
-Theorem a_thm: T Proof ACCEPT_TAC TRUTH QED
+Theorem a_thm:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
 val _ = export_theory();
 SML
 
