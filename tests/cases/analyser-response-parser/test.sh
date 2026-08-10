@@ -52,6 +52,7 @@ val _ =
         P.join ["load", "A"],
         P.join ["use", "other file.sml"],
         P.join ["extra-dep", "config file"],
+        P.join ["extra-output", "result file.nsv"],
         P.join ["mention", "arithTheory"],
         P.join ["end-file", "1"],
         P.join ["begin-file", "2"],
@@ -65,18 +66,19 @@ val parsed =
   D.parse_analyser_response response_path
     [("1", "AScript.sml"), ("2", "EmptyScript.sml"), ("3", "BScript.sml")]
 
-fun require_deps label deps loads uses extra_deps mentions =
+fun require_deps label deps loads uses extra_deps extra_outputs mentions =
   (assert (label ^ " loads") (#loads deps = loads);
    assert (label ^ " uses") (#uses deps = uses);
    assert (label ^ " extra_deps") (#extra_deps deps = extra_deps);
+   assert (label ^ " extra_outputs") (#extra_outputs deps = extra_outputs);
    assert (label ^ " mentions") (#holdep_mentions deps = mentions))
 
 val _ =
   case parsed of
       [("1", deps1), ("2", deps2), ("3", deps3)] =>
-        (require_deps "file 1" deps1 ["A", "Z"] ["other file.sml"] ["config file"] ["arithTheory"];
-         require_deps "empty file" deps2 [] [] [] [];
-         require_deps "file 3" deps3 ["B"] [] [] [])
+        (require_deps "file 1" deps1 ["A", "Z"] ["other file.sml"] ["config file"] ["result file.nsv"] ["arithTheory"];
+         require_deps "empty file" deps2 [] [] [] [] [];
+         require_deps "file 3" deps3 ["B"] [] [] [] [])
     | _ => fail "unexpected parsed analyser response shape"
 
 val missing_end_path = join(tmp, "missing-end.txt")
