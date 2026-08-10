@@ -269,11 +269,24 @@ fun runtime_line () = "use " ^ sml_string (runtime_helper_path ()) ^ ";"
 
 fun run_load_line name = "val _ = HolbuildRuntime.load " ^ sml_string name ^ ";"
 
+fun run_context_nonce () =
+  let
+    val temporary = FS.tmpName ()
+    val nonce = Path.file temporary
+    val _ = FS.remove temporary handle OS.SysErr _ => ()
+  in
+    nonce
+  end
+
 fun write_run_context (project : HolbuildProject.t) packages =
   let
     val root = HolbuildProject.artifact_root project
     val hol_dir = Path.concat(root, ".holbuild")
-    val context = Path.concat(hol_dir, "holbuild-run-context.sml")
+    val context =
+      Path.concat
+        (hol_dir,
+         "holbuild-run-context-" ^ HolbuildFileLock.current_pid_text () ^ "-" ^
+         run_context_nonce () ^ ".sml")
     val load_dirs = run_context_load_path_dirs project packages
     val _ = ensure_dir hol_dir
     val out = TextIO.openOut context
@@ -286,6 +299,17 @@ fun write_run_context (project : HolbuildProject.t) packages =
     List.app (line o run_load_line) (#run_loads project);
     TextIO.closeOut out;
     context
+  end
+
+fun remove_run_context context = FS.remove context handle OS.SysErr _ => ()
+
+fun with_run_context project packages body =
+  let
+    val context = write_run_context project packages
+    fun cleanup () = remove_run_context context
+  in
+    (body context before cleanup ())
+    handle e => (cleanup (); raise e)
   end
 
 end
