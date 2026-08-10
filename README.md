@@ -435,6 +435,22 @@ Source files may also declare source-file-relative extra dependencies:
 val () = holbuild_extra_deps ["../data/table.txt"];
 ```
 
+Theory scripts may declare deterministic extra output files:
+
+```sml
+val () = holbuild_extra_outputs ["results/test.nsv"];
+```
+
+Each path is relative to the declaring source file and must be a fixed file path
+inside the package: absolute paths, `.`/`..` components, trailing slashes, and
+glob syntax are rejected. The action must produce every declaration. Extra
+outputs participate in up-to-date checks and cache publication/restoration, and
+`holbuild clean TARGET` removes them. Holbuild records ownership lazily and
+rejects another action that attempts to materialize the same path. As with
+ordinary outputs, cleaning followed
+by a normal build may restore them from cache; use existing no-cache or impure /
+always-reexecute controls when source execution is required.
+
 ### Generated source
 
 Generated HOL source can be declared with `[[generate]]` entries:

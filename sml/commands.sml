@@ -1276,7 +1276,7 @@ fun clean_targets args =
             | _ => raise Error ("clean only supports theory targets: " ^ HolbuildBuildPlan.logical_name node)
         val nodes = List.concat (map target_nodes args)
         val theory_nodes = map require_theory nodes
-        val _ = List.app (HolbuildBuildExec.clean_theory_node project) theory_nodes
+        val _ = List.app (HolbuildBuildExec.clean_theory_node project plan) theory_nodes
         val _ = List.app (fn node => print ("cleaned " ^ HolbuildBuildPlan.logical_name node ^ "\n")) theory_nodes
         val _ = print "note: subsequent builds may restore cleaned targets from the global cache; use `holbuild build --no-cache TARGET...` to force a local rebuild\n"
       in

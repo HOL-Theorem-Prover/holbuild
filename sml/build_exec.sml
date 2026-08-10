@@ -114,6 +114,12 @@ fun source_file node = #source_path (HolbuildBuildPlan.source_of node)
 fun source_artifacts node = #artifacts (HolbuildBuildPlan.source_of node)
 fun source_policy node = #policy (HolbuildBuildPlan.source_of node)
 fun source_deps plan node = HolbuildBuildPlan.dependencies plan node
+fun source_extra_output_declarations plan node = #extra_outputs (source_deps plan node)
+fun source_extra_output_path node declaration =
+  normalize_path (Path.concat(Path.dir (source_file node), declaration))
+fun source_extra_output_paths plan node =
+  map (source_extra_output_path node) (source_extra_output_declarations plan node)
+fun staged_extra_output_path stage declaration = normalize_path (Path.concat(stage, declaration))
 fun logical_name node = HolbuildBuildPlan.logical_name node
 fun package node = HolbuildBuildPlan.package node
 fun cache_enabled node = HolbuildProject.action_cache_enabled (source_policy node)
@@ -364,6 +370,174 @@ fun theory_outputs node =
   end
 
 fun project_artifact_root project = HolbuildProject.artifact_root project
+
+datatype extra_output_owner = ExtraOutputOwner of
+  {package : string, source : string, logical : string}
+
+fun extra_output_owner node =
+  ExtraOutputOwner
+    {package = package node,
+     source = HolbuildBuildPlan.relative_path node,
+     logical = logical_name node}
+
+fun same_extra_output_owner
+      (ExtraOutputOwner {package = left_package, source = left_source, ...},
+       ExtraOutputOwner {package = right_package, source = right_source, ...}) =
+  left_package = right_package andalso left_source = right_source
+
+fun extra_output_owner_text (ExtraOutputOwner {package, source, logical}) =
+  package ^ ":" ^ logical ^ " (" ^ source ^ ")"
+
+fun extra_output_registry_path_exists path =
+  FS.access(path, []) handle OS.SysErr _ => false
+
+fun extra_output_registry_root project =
+  Path.concat(project_artifact_root project, ".holbuild/extra-outputs")
+
+fun extra_output_claim_path project output =
+  Path.concat(Path.concat(extra_output_registry_root project, "owners"),
+              HolbuildHash.string_sha256 output ^ ".owner")
+
+fun extra_output_action_path project node =
+  let
+    val ExtraOutputOwner {package, source, ...} = extra_output_owner node
+    val identity = package ^ "\000" ^ source
+  in
+    Path.concat(Path.concat(extra_output_registry_root project, "actions"),
+                HolbuildHash.string_sha256 identity ^ ".outputs")
+  end
+
+fun extra_output_owner_fields (ExtraOutputOwner {package, source, logical}) =
+  [package, source, logical]
+
+fun extra_output_claim_text owner output =
+  String.concatWith "\n"
+    ["holbuild-extra-output-owner-v1",
+     HolbuildAnalysisProtocol.join ("owner" :: extra_output_owner_fields owner),
+     HolbuildAnalysisProtocol.join ["path", output]] ^ "\n"
+
+fun parse_extra_output_claim path text =
+  case String.tokens (fn c => c = #"\n") text of
+      [version, owner_line, path_line] =>
+        (case (version, HolbuildAnalysisProtocol.split owner_line,
+                HolbuildAnalysisProtocol.split path_line) of
+             ("holbuild-extra-output-owner-v1", ["owner", package, source, logical],
+              ["path", output]) =>
+               (ExtraOutputOwner {package = package, source = source, logical = logical}, output)
+           | _ => raise Error ("invalid extra-output ownership record: " ^ path))
+    | _ => raise Error ("invalid extra-output ownership record: " ^ path)
+
+fun read_extra_output_claim project output =
+  let val path = extra_output_claim_path project output
+  in
+    if extra_output_registry_path_exists path then
+      let val (owner, recorded_output) = parse_extra_output_claim path (read_text path)
+      in
+        if recorded_output = output then SOME owner
+        else raise Error ("extra-output ownership record path mismatch: " ^ path)
+      end
+    else NONE
+  end
+
+fun extra_output_action_text owner outputs =
+  String.concatWith "\n"
+    (["holbuild-extra-output-action-v1",
+      HolbuildAnalysisProtocol.join ("owner" :: extra_output_owner_fields owner)] @
+     map (fn output => HolbuildAnalysisProtocol.join ["path", output]) outputs) ^ "\n"
+
+fun parse_extra_output_action path expected_owner text =
+  case String.tokens (fn c => c = #"\n") text of
+      version :: owner_line :: output_lines =>
+        (case (version, HolbuildAnalysisProtocol.split owner_line) of
+             ("holbuild-extra-output-action-v1", ["owner", package, source, logical]) =>
+               let
+                 val owner = ExtraOutputOwner {package = package, source = source, logical = logical}
+                 fun output line =
+                   case HolbuildAnalysisProtocol.split line of
+                       ["path", value] => value
+                     | _ => raise Error ("invalid extra-output action record: " ^ path)
+               in
+                 if same_extra_output_owner (owner, expected_owner) then map output output_lines
+                 else raise Error ("extra-output action record owner mismatch: " ^ path)
+               end
+           | _ => raise Error ("invalid extra-output action record: " ^ path))
+    | _ => raise Error ("invalid extra-output action record: " ^ path)
+
+fun recorded_extra_outputs project node =
+  let val path = extra_output_action_path project node
+  in
+    if extra_output_registry_path_exists path then
+      parse_extra_output_action path (extra_output_owner node) (read_text path)
+    else []
+  end
+
+fun member_string value values = List.exists (fn existing => existing = value) values
+
+fun claim_extra_outputs project node outputs =
+  let
+    val owner = extra_output_owner node
+    val recorded = recorded_extra_outputs project node
+    val created = ref ([] : string list)
+    fun claim output =
+      let val path = extra_output_claim_path project output
+      in
+        case read_extra_output_claim project output of
+            NONE =>
+              if extra_output_registry_path_exists output andalso
+                 not (member_string output recorded) then
+                raise Error ("extra output already exists without an ownership record: " ^ output)
+              else (write_text path (extra_output_claim_text owner output);
+                    created := path :: !created)
+          | SOME existing =>
+              if same_extra_output_owner (owner, existing) then ()
+              else raise Error ("extra output is already owned: " ^ output ^ " by " ^
+                                extra_output_owner_text existing)
+      end
+  in
+    (List.app claim outputs)
+    handle e => (List.app remove_file (!created); raise e)
+  end
+
+fun release_extra_output project owner strict output =
+  let val claim_path = extra_output_claim_path project output
+  in
+    case read_extra_output_claim project output of
+        SOME existing =>
+          if same_extra_output_owner (owner, existing) then
+            (remove_file output; remove_file claim_path)
+          else if strict then
+            raise Error ("refusing to remove extra output owned by " ^
+                         extra_output_owner_text existing ^ ": " ^ output)
+          else ()
+      | NONE =>
+          if strict andalso extra_output_registry_path_exists output then
+            raise Error ("extra output has no ownership record; refusing to remove: " ^ output)
+          else ()
+  end
+
+fun record_materialized_extra_outputs project node outputs =
+  let
+    val owner = extra_output_owner node
+    val previous = recorded_extra_outputs project node
+    val obsolete = List.filter (fn output => not (member_string output outputs)) previous
+    val _ = List.app (release_extra_output project owner true) obsolete
+    val action_path = extra_output_action_path project node
+  in
+    if null outputs then remove_file action_path
+    else write_text action_path (extra_output_action_text owner outputs)
+  end
+
+fun clean_registered_extra_outputs project plan node =
+  let
+    val owner = extra_output_owner node
+    val recorded = recorded_extra_outputs project node
+    val current = source_extra_output_paths plan node
+    val unrecorded = List.filter (fn output => not (member_string output recorded)) current
+    val _ = List.app (release_extra_output project owner true) recorded
+    val _ = List.app (release_extra_output project owner false) unrecorded
+  in
+    remove_file (extra_output_action_path project node)
+  end
 
 fun stage_dir (project : HolbuildProject.t) input_key =
   Path.concat(Path.concat(project_artifact_root project, ".holbuild/stage"), input_key)
@@ -1553,9 +1727,16 @@ fun cache_blob root path =
       | HolbuildCacheBackend.Skipped => hash
   end
 
-fun cache_manifest_text {input_key, sig_hash, sml_hash, dat_hash, trace_hash, parents, mldeps, proof_timeout} =
+fun extra_blob_role path = "extra:" ^ HolbuildAnalysisProtocol.escape path
+fun extra_path_from_blob_role role =
+  if String.isPrefix "extra:" role then
+    SOME (HolbuildAnalysisProtocol.unescape (String.extract(role, size "extra:", NONE)))
+  else NONE
+
+fun cache_manifest_text {input_key, sig_hash, sml_hash, dat_hash, trace_hash, extra_hashes,
+                         parents, mldeps, proof_timeout} =
   String.concatWith "\n"
-    (["holbuild-cache-action-v3",
+    (["holbuild-cache-action-v4",
       "input_key=" ^ input_key,
       "kind=theory",
       "proof-timeout=" ^ timeout_text proof_timeout,
@@ -1565,7 +1746,8 @@ fun cache_manifest_text {input_key, sig_hash, sml_hash, dat_hash, trace_hash, pa
      ["blob sig " ^ sig_hash,
       "blob sml " ^ sml_hash,
       "blob dat " ^ dat_hash] @
-     (case trace_hash of NONE => [] | SOME hash => ["blob trace " ^ hash])) ^ "\n"
+     (case trace_hash of NONE => [] | SOME hash => ["blob trace " ^ hash]) @
+     map (fn (path, hash) => "blob " ^ extra_blob_role path ^ " " ^ hash) extra_hashes) ^ "\n"
 
 fun cache_manifest_lines text = String.tokens (fn c => c = #"\n") text
 
@@ -1587,7 +1769,9 @@ fun require_sha1 role hash =
   if valid_sha1_text hash then hash
   else raise Error ("cache manifest invalid " ^ role ^ " blob hash: " ^ hash)
 
-fun known_blob_role role = role = "sig" orelse role = "sml" orelse role = "sml-template" orelse role = "dat" orelse role = "trace"
+fun known_blob_role role =
+  role = "sig" orelse role = "sml" orelse role = "sml-template" orelse
+  role = "dat" orelse role = "trace" orelse Option.isSome (extra_path_from_blob_role role)
 
 fun add_manifest_blob role hash blobs =
   if not (known_blob_role role) then
@@ -1657,7 +1841,7 @@ fun add_mldep dep deps =
 fun add_parent parent parents = add_mldep parent parents
 
 fun parse_cache_manifest_line input_key line (saw_header, saw_input, saw_kind, saw_metadata, blobs, parents, mldeps) =
-  if line = "holbuild-cache-action-v3" then
+  if line = "holbuild-cache-action-v4" orelse line = "holbuild-cache-action-v3" then
     if saw_header then raise Error "cache manifest duplicate header"
     else (true, saw_input, saw_kind, saw_metadata, blobs, parents, mldeps)
   else if line = "holbuild-cache-action-v2" then
@@ -1704,6 +1888,11 @@ fun cache_manifest_blobs_from_lines input_key lines =
        sml_hash = sml_blob_from_manifest blobs,
        dat_hash = blob_from_manifest "dat" blobs,
        trace_hash = Option.map #2 (List.find (fn (role, _) => role = "trace") blobs),
+       extra_hashes =
+         List.mapPartial
+           (fn (role, hash) => Option.map (fn path => (path, hash))
+                                          (extra_path_from_blob_role role))
+           (rev blobs),
        parents = stable_parents,
        mldeps = stable_mldeps}
     end
@@ -1758,27 +1947,31 @@ fun cache_manifest_outputs_equal input_key left right =
     #sig_hash left_blobs = #sig_hash right_blobs andalso
     #sml_hash left_blobs = #sml_hash right_blobs andalso
     #dat_hash left_blobs = #dat_hash right_blobs andalso
-    #trace_hash left_blobs = #trace_hash right_blobs
+    #trace_hash left_blobs = #trace_hash right_blobs andalso
+    #extra_hashes left_blobs = #extra_hashes right_blobs
   end
 
 fun cache_entry_usable root input_key text =
   let
-    val {sig_hash, sml_hash, dat_hash, trace_hash, ...} =
+    val {sig_hash, sml_hash, dat_hash, trace_hash, extra_hashes, ...} =
       cache_manifest_blobs_from_lines input_key (cache_manifest_lines text)
   in
     HolbuildCache.verify_blob root sig_hash andalso
     HolbuildCache.verify_blob root sml_hash andalso
     HolbuildCache.verify_blob root dat_hash andalso
-    (case trace_hash of NONE => true | SOME hash => HolbuildCache.verify_blob root hash)
+    (case trace_hash of NONE => true | SOME hash => HolbuildCache.verify_blob root hash) andalso
+    List.all (fn (_, hash) => HolbuildCache.verify_blob root hash) extra_hashes
   end
   handle _ => false
 
-fun cache_manifest_output_summary {sig_hash, sml_hash, dat_hash, trace_hash, parents, mldeps} =
+fun cache_manifest_output_summary {sig_hash, sml_hash, dat_hash, trace_hash, extra_hashes,
+                                   parents, mldeps} =
   String.concat
     ["sig=", sig_hash,
      " sml=", sml_hash,
      " dat=", dat_hash,
      " trace=", Option.getOpt(trace_hash, "none"),
+     " extras=", Int.toString (length extra_hashes),
      " parents=", Int.toString (length parents),
      " mldeps=", Int.toString (length mldeps)]
 
@@ -1996,18 +2189,21 @@ fun theory_cache_keys project plan node input_key =
 fun cache_warning_subject node =
   String.concat [logical_name node, " (", source_file node, ")"]
 
-fun publish_cache_manifest root cache_key subject staged_sig published_sml staged_dat staged_trace cache_parents cache_mldeps proof_timeout =
+fun publish_cache_manifest root cache_key subject staged_sig published_sml staged_dat staged_trace
+                           staged_extras cache_parents cache_mldeps proof_timeout =
   let
     val manifest_path = HolbuildCache.action_manifest root cache_key
     val sig_hash = cache_blob root staged_sig
     val sml_hash = cache_blob root published_sml
     val dat_hash = cache_blob root staged_dat
     val trace_hash = Option.map (cache_blob root) staged_trace
+    val extra_hashes = map (fn (path, staged) => (path, cache_blob root staged)) staged_extras
     fun manifest_with timeout =
       cache_manifest_text {input_key = cache_key, sig_hash = sig_hash,
                            sml_hash = sml_hash,
                            dat_hash = dat_hash,
                            trace_hash = trace_hash,
+                           extra_hashes = extra_hashes,
                            parents = cache_parents,
                            mldeps = cache_mldeps,
                            proof_timeout = timeout}
@@ -2039,7 +2235,8 @@ fun publish_cache_manifest root cache_key subject staged_sig published_sml stage
       | NONE => put_new_manifest manifest
   end
 
-fun publish_theory_cache project plan node input_key proof_timeout staged_sig published_sml staged_dat staged_trace {parents, mldeps} =
+fun publish_theory_cache project plan node input_key proof_timeout staged_sig published_sml staged_dat
+                         staged_trace staged_extras {parents, mldeps} =
   let
     val root = cache_root ()
     val _ = HolbuildCache.ensure_layout root
@@ -2051,7 +2248,8 @@ fun publish_theory_cache project plan node input_key proof_timeout staged_sig pu
     fun drop_stale_manifest key = HolbuildCache.remove_action root key
     val subject = cache_warning_subject node
     fun publish () =
-      publish_cache_manifest root cache_key subject staged_sig published_sml staged_dat staged_trace cache_parents cache_mldeps proof_timeout
+      publish_cache_manifest root cache_key subject staged_sig published_sml staged_dat staged_trace
+                             staged_extras cache_parents cache_mldeps proof_timeout
     fun skip_locked_publish () = ()
   in
     ((if cache_key <> input_key then
@@ -2186,8 +2384,12 @@ fun materialize_theory_cache_key verify_cache allow_timeout_discrepancy project 
           SOME dep => transient_cache_manifest_error root cache_key manifest manifest_text dep
         | NONE => ()
     val manifest_lines = cache_manifest_lines manifest_text
-    val {sig_hash, sml_hash, dat_hash, trace_hash, parents, mldeps} =
+    val {sig_hash, sml_hash, dat_hash, trace_hash, extra_hashes, parents, mldeps} =
       cache_manifest_blobs_from_lines cache_key manifest_lines
+    val expected_extra_outputs = source_extra_output_declarations plan node
+    val _ =
+      if map #1 extra_hashes = expected_extra_outputs then ()
+      else raise Error "cache manifest extra outputs do not match the action declaration"
     val _ =
       if require_trace andalso not (Option.isSome trace_hash) then
         raise Error "cache manifest missing blob role: trace"
@@ -2199,6 +2401,8 @@ fun materialize_theory_cache_key verify_cache allow_timeout_discrepancy project 
                         timeout_text proof_timeout ^ ", requested " ^ timeout_text requested_timeout)
     val {sig_path, sml_path, data_path, ...} = theory_outputs node
     val trace_path = drop_suffix ".dat" data_path ^ ".tr.gz"
+    val extra_output_paths = source_extra_output_paths plan node
+    val _ = claim_extra_outputs project node extra_output_paths
     fun install () =
       (copy_blob verify_cache root dat_hash data_path;
        link_or_copy {src = data_path, dst = hfs_remapped_path data_path};
@@ -2212,6 +2416,12 @@ fun materialize_theory_cache_key verify_cache allow_timeout_discrepancy project 
           | SOME hash =>
               (copy_blob verify_cache root hash trace_path;
                link_or_copy {src = trace_path, dst = hfs_remapped_path trace_path}));
+       List.app
+         (fn (declaration, hash) =>
+             let val destination = source_extra_output_path node declaration
+             in ensure_parent destination; copy_blob verify_cache root hash destination end)
+         extra_hashes;
+       record_materialized_extra_outputs project node extra_output_paths;
        write_local_theory_manifests plan node {parents = parents, mldeps = mldeps};
        HolbuildCache.touch_action root cache_key;
        cache_trace ("cache hit: " ^ logical_name node ^ " " ^ role ^ "=" ^ cache_key);
@@ -2246,8 +2456,9 @@ fun metadata_path (project : HolbuildProject.t) node =
     Path.concat(base, #relative_path source ^ ".key")
   end
 
-fun clean_theory_node project node =
-  (remove_failed_cache_outputs project node;
+fun clean_theory_node project plan node =
+  (clean_registered_extra_outputs project plan node;
+   remove_failed_cache_outputs project node;
    remove_file (metadata_path project node);
    remove_file (HolbuildBuildPlan.dependency_cache_path (HolbuildBuildPlan.source_of node)))
 
@@ -2868,6 +3079,10 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
     val staged_dat = staged_theory_file stage node ".dat"
     val staged_trace = staged_theory_file stage node ".tr.gz"
     val trace_path = drop_suffix ".dat" data_path ^ ".tr.gz"
+    val extra_output_declarations = source_extra_output_declarations plan node
+    val staged_extra_outputs =
+      map (fn declaration => (declaration, staged_extra_output_path stage declaration))
+          extra_output_declarations
     val _ = remove_tree stage
     val _ = ensure_dir stage
     val _ = write_child_policy child_policy
@@ -2895,6 +3110,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
       else ()
     val _ = remove_file timeout_marker
     val _ = remove_file plan_only_marker
+    val _ = List.app (ensure_parent o #2) staged_extra_outputs
     val run_spec = write_theory_script policy project base_context plan keys input_key toolchain_key node
                                     source_text theorem_checkpoints declaration_checkpoints termination_diagnostics staged_script preload timeout_marker
                                     (if execution_plan_only policy then SOME plan_only_marker else NONE)
@@ -3074,6 +3290,17 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
                NONE => ()
              | SOME output => HolbuildStatus.message_stdout ("proof step trace log: " ^ captured_output_path output ^ "\n"))
       else ()
+    val _ =
+      List.app
+        (fn (declaration, staged) =>
+            if not (file_exists staged) then
+              raise Error ("theory " ^ logical_name node ^
+                           " did not produce declared extra output: " ^ declaration)
+            else if OS.FileSys.isDir staged then
+              raise Error ("declared extra output is not a file: " ^ declaration)
+            else ())
+        staged_extra_outputs
+    val _ = claim_extra_outputs project node (source_extra_output_paths plan node)
     val generated_metadata =
       read_generated_load_metadata {parents_report = parents_report,
                                     mldeps_report = mldeps_report}
@@ -3127,12 +3354,20 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
                                  replacements = dat_replacements}
     val _ = link_or_copy {src = sml_path, dst = hfs_remapped_path sml_path}
     val _ =
+      List.app
+        (fn (declaration, staged) =>
+            let val destination = source_extra_output_path node declaration
+            in ensure_parent destination; copy_binary staged destination end)
+        staged_extra_outputs
+    val _ = record_materialized_extra_outputs project node
+              (source_extra_output_paths plan node)
+    val _ =
       if cache_allowed then
         detail_time_phase "build.exec.publish_cache"
           (fn () => publish_theory_cache project plan node input_key (tactic_timeout policy)
                                       staged_sig sml_path staged_dat
                                       (if trknl_enabled policy then SOME staged_trace else NONE)
-                                      generated_metadata)
+                                      staged_extra_outputs generated_metadata)
       else ()
   in
     write_local_theory_manifests plan node generated_metadata;
@@ -3192,7 +3427,7 @@ fun output_hash_lines_for_paths paths =
   map (fn path => output_hash_line path (file_hash path))
       (paths @ map hfs_remapped_path paths)
 
-fun output_hash_lines checkpoint_policy _ node =
+fun output_hash_lines checkpoint_policy plan node =
   let
     val artifacts = source_artifacts node
     val data_paths = #theory_data artifacts
@@ -3200,7 +3435,9 @@ fun output_hash_lines checkpoint_policy _ node =
     output_hash_lines_for_paths (#generated artifacts) @
     output_hash_lines_for_paths (#objects artifacts) @
     output_hash_lines_for_paths data_paths @
-    output_hash_lines_for_paths (trace_paths checkpoint_policy data_paths)
+    output_hash_lines_for_paths (trace_paths checkpoint_policy data_paths) @
+    map (fn path => output_hash_line path (file_hash path))
+        (source_extra_output_paths plan node)
   end
 
 fun theory_name_from_logical logical =
@@ -3309,13 +3546,17 @@ fun action_policy_lines plan node =
           [HolbuildProject.extra_input_path input]) extra_inputs)
     val source_extra_lines =
       extra_dep_lines "source_extra_dep" (Path.dir (source_file node)) (#extra_deps (source_deps plan node))
+    val source_extra_output_lines =
+      map (fn output => "source_extra_output=" ^ output)
+          (source_extra_output_declarations plan node)
   in
     ["cache=" ^ bool_text (HolbuildProject.action_cache_enabled policy),
      "always_reexecute=" ^ bool_text (HolbuildProject.action_always_reexecute policy)] @
     declared_dep_lines @
     declared_load_lines @
     extra_lines @
-    source_extra_lines
+    source_extra_lines @
+    source_extra_output_lines
   end
 
 fun theorem_boundary_line ({safe_name, prefix_hash, context_path, end_of_proof_path, ...} : HolbuildTheoryCheckpoints.checkpoint) =
@@ -3357,7 +3598,7 @@ fun metadata_core_text checkpoint_policy proof_timeout project plan keys input_k
 fun metadata_text emit_output_hashes checkpoint_policy proof_timeout project plan keys input_key toolchain_key node theorem_checkpoints =
   lines_text
     (metadata_core_lines checkpoint_policy proof_timeout project plan keys input_key toolchain_key node theorem_checkpoints @
-     (if emit_output_hashes then output_hash_lines checkpoint_policy project node else []))
+     (if emit_output_hashes then output_hash_lines checkpoint_policy plan node else []))
 
 fun semantic_metadata_text text =
   lines_text (List.filter (fn line => not (String.isPrefix "output-sha1=" line))
@@ -3506,7 +3747,8 @@ fun theory_parent_hashes_match dat_hash_cache plan node metadata_text =
 fun up_to_date dat_hash_cache emit_output_hashes allow_timeout_discrepancy checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints =
   detail_time_phase "build.exec.node.up_to_date"
     (fn () =>
-        List.all (output_exists_for_node node) (output_paths checkpoint_policy project node) andalso
+        List.all (output_exists_for_node node) (output_paths checkpoint_policy plan node) andalso
+        List.all file_exists (source_extra_output_paths plan node) andalso
         case current_metadata (metadata_path project node) of
              SOME text =>
                let
@@ -3727,6 +3969,7 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
     val cache_allowed = #use_cache options andalso cache_enabled node
     val cache_restore_allowed = cache_allowed andalso not forced
     val allow_timeout_discrepancy = #allow_cache_timeout_discrepancy options
+    val _ = claim_extra_outputs project node (source_extra_output_paths plan node)
     fun invalidate_node_dat_hash () =
       invalidate_cached_file_hash dat_hash_cache (#data_path (theory_outputs node))
     fun materialize_valid_cache () =

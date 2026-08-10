@@ -327,6 +327,17 @@ entries are package-root-relative; source files may also declare source-file-rel
 extra dependencies with static literal `holbuild_extra_deps [...]` annotations.
 Entries may name files, directories, or simple globs, and source-declared entries
 are staged so matching relative filesystem reads work during the action.
+Theory-script sources may declare deterministic, source-file-relative fixed
+output files with static literal `holbuild_extra_outputs [...]` annotations.
+These paths are part of the action identity and owned output set: successful
+execution must produce them, local up-to-date checks require them, action caches
+publish and restore them as named blobs, and target cleaning removes them. A
+lazy registry under `.holbuild/extra-outputs` records path claims and each
+materialized action's last output set. It prevents separately requested actions
+from overwriting one another and lets cleaning or a changed declaration remove
+previously owned files without eagerly analysing unrelated sources.
+Absolute paths, `.`/`..` components, directories, and globs are deliberately not
+part of the initial contract.
 `cache = false` disables global-cache restore/publish for the action.
 `always_reexecute = true` disables local up-to-date skipping and any retained/debug
 checkpoint replay for the action. `impure = true`
