@@ -28,7 +28,7 @@ Heap export flow:
 
 ## `holbuild run` / `holbuild repl` — prototype status
 
-These commands generate `.holbuild/holbuild-run-context.sml`, add built project artifact object directories to HOL `loadPath`, and load `[run].loads` before user-supplied files/interactive input. Build requested targets first; `run`/`repl` do not trigger hidden rebuilds.
+These commands generate an invocation-private run context under `.holbuild/`, add built project artifact object directories to HOL `loadPath`, and load `[run].loads` before user-supplied files or interactive input. Before starting HOL, `run` and `repl` resolve every configured load as a build target and build its dependency closure using normal cache and up-to-date behavior. Unknown configured targets are errors.
 
 `holbuild repl` uses an interactive HOL process runner so stdin/stdout stay attached to the terminal.
 
