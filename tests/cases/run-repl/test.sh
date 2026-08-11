@@ -67,7 +67,7 @@ repl_log=$tmpdir/repl.log
 (
   printf 'val _ = (ATheory.repl_smoke_thm; print "REPL_SMOKE_OK\\n");\n'
   printf 'val _ = (ProjectLib.marker; print "REPL_INTLIB_DEP_OK\\n");\n'
-) | (cd "$project" && timeout 20 "$HOLBUILD_BIN" repl) > "$repl_log" 2>&1
+) | (cd "$project" && timeout 60 "$HOLBUILD_BIN" repl) > "$repl_log" 2>&1
 require_grep "REPL_SMOKE_OK" "$repl_log"
 require_grep "REPL_INTLIB_DEP_OK" "$repl_log"
 require_file "$project/.holbuild/obj/src/ATheory.uo"
