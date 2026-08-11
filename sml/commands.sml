@@ -301,6 +301,16 @@ fun split_flags args =
     loop false false HolbuildBuildExec.ForceNone true true false false true true NONE false NONE false false false false build_args
   end
 
+fun default_build_request targets =
+  ({dry_run = false, watch = false, force = HolbuildBuildExec.ForceNone,
+    use_cache = true, verify_cache = true, no_stat_cache = false,
+    skip_checkpoints = false, proof_steps = true, new_ir = true,
+    tactic_timeout = NONE, tactic_timeout_set = false, execution_plan = NONE,
+    trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
+    warn_unreachable = false, emit_output_hashes = false,
+    allow_cache_timeout_discrepancy = false},
+   targets)
+
 fun has_suffix suffix s =
   let
     val n = size s
@@ -1340,9 +1350,16 @@ fun hol_args_for_project tc project subcommand context user_args =
     HolbuildToolchain.hol_subcommand_argv tc subcommand @ heap_args @ [context] @ user_args
   end
 
-fun run_hol_with runner tc subcommand user_args =
+fun run_hol_with runner tc cli_jobs subcommand user_args =
   let
-    val project = timed_phase "project.discover" load_project
+    val configured_project = timed_phase "project.discover" load_project
+    val run_loads = #run_loads configured_project
+    val _ =
+      if null run_loads then ()
+      else build_once tc cli_jobs (default_build_request run_loads)
+    val project =
+      if null run_loads then configured_project
+      else timed_phase "run.project.rediscover" load_project
     val packages = resolved_packages (resolution_for_toolchain tc) project
     fun invoke context =
       let
@@ -1356,11 +1373,11 @@ fun run_hol_with runner tc subcommand user_args =
     HolbuildToolchain.with_run_context project packages invoke
   end
 
-fun run_hol tc subcommand user_args =
-  run_hol_with HolbuildToolchain.run tc subcommand user_args
+fun run_hol tc cli_jobs subcommand user_args =
+  run_hol_with HolbuildToolchain.run tc cli_jobs subcommand user_args
 
-fun repl_hol tc user_args =
-  run_hol_with HolbuildToolchain.run_interactive tc "repl" user_args
+fun repl_hol tc cli_jobs user_args =
+  run_hol_with HolbuildToolchain.run_interactive tc cli_jobs "repl" user_args
 
 fun removed_legacy_plan_command _ _ =
   raise Error "goalfrag-plan has been removed; use execution-plan THEORY:THEOREM"
@@ -1388,8 +1405,8 @@ fun dispatch tc jobs args =
     | "heap" :: _ => raise Error "usage: holbuild heap NAME"
     | "executable" :: [target] => (reject_json "executable"; build_executable tc jobs target)
     | "executable" :: _ => raise Error "usage: holbuild executable NAME"
-    | "run" :: rest => (reject_json "run"; run_hol tc "run" rest)
-    | "repl" :: rest => (reject_json "repl"; repl_hol tc rest)
+    | "run" :: rest => (reject_json "run"; run_hol tc jobs "run" rest)
+    | "repl" :: rest => (reject_json "repl"; repl_hol tc jobs rest)
     | "export" :: rest => (reject_json "export"; export_archive tc jobs rest)
     | "import" :: rest => (reject_json "import"; import_archive rest)
     | cmd :: _ => if known_command cmd then raise Error ("unknown command: " ^ cmd)

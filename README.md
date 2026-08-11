@@ -497,9 +497,10 @@ loads = ["MyLib"]
 to save the heap. `[[heap]].objects` may name theory and SML logical targets.
 `holbuild executable runtests` builds the listed logical objects and uses HOL
 `buildheap --exe=<main>` to produce an executable; `main` defaults to `"main"`
-and executable objects may also include signature targets. `holbuild run` and
-`holbuild repl` create a project run context under `.holbuild/` before loading
-`[run].loads` and user arguments.
+and executable objects may also include signature targets. Before starting HOL,
+`holbuild run` and `holbuild repl` build every target named by `[run].loads`,
+create an invocation-private project context under `.holbuild/`, and then load
+the configured targets followed by user arguments.
 
 ## Proof steps and checkpoints
 

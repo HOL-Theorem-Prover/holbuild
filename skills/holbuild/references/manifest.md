@@ -43,7 +43,7 @@ from = "hol"
 path = "examples/Crypto/Keccak"
 manifest = "shims/keccak.toml"
 
-# [run] — prototype, not yet functional for consumers
+# [run] — run/repl build these load targets before starting HOL
 # heap = "build/main.heap"
 # loads = ["MyLib"]
 
