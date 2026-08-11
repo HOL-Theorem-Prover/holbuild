@@ -53,26 +53,25 @@ end
 SML
 cat > "$project/src/ProjectLib.sml" <<'SML'
 structure ProjectLib :> PROJECT_LIB = struct
-  open HolKernel boolLib intLib
+  open HolKernel boolLib stringSyntax
   val marker = true
 end
 SML
 
-(cd "$project" && "$HOLBUILD_BIN" build stringSyntax) > "$tmpdir/build.log" 2>&1
-require_file "$project/.holbuild/packages/hol/obj/src/string/stringSyntax.ui"
+require_no_file "$project/.holbuild/packages/hol/obj/src/string/stringSyntax.ui"
 require_no_file "$project/.holbuild/obj/src/ATheory.uo"
 require_no_file "$project/.holbuild/obj/src/ProjectLib.uo"
 
 repl_log=$tmpdir/repl.log
 (
   printf 'val _ = (ATheory.repl_smoke_thm; print "REPL_SMOKE_OK\\n");\n'
-  printf 'val _ = (ProjectLib.marker; print "REPL_INTLIB_DEP_OK\\n");\n'
+  printf 'val _ = (ProjectLib.marker; print "REPL_PACKAGE_DEP_OK\\n");\n'
 ) | (cd "$project" && timeout 60 "$HOLBUILD_BIN" repl) > "$repl_log" 2>&1
 require_grep "REPL_SMOKE_OK" "$repl_log"
-require_grep "REPL_INTLIB_DEP_OK" "$repl_log"
+require_grep "REPL_PACKAGE_DEP_OK" "$repl_log"
 require_file "$project/.holbuild/obj/src/ATheory.uo"
 require_file "$project/.holbuild/obj/src/ProjectLib.uo"
-require_file "$project/.holbuild/packages/hol/obj/src/integer/intLib.uo"
+require_file "$project/.holbuild/packages/hol/obj/src/string/stringSyntax.ui"
 
 require_no_run_contexts "$project/.holbuild"
 require_no_file "$project/.holbuild/holbuild-run-context.sml"
@@ -82,13 +81,13 @@ cat > "$run_script" <<'SML'
 val _ = load "stringSyntax";
 val _ = print "RUN_PACKAGE_LOAD_OK\n";
 val _ = (ATheory.repl_smoke_thm; print "RUN_SMOKE_OK\n");
-val _ = (ProjectLib.marker; print "RUN_INTLIB_DEP_OK\n");
+val _ = (ProjectLib.marker; print "RUN_CONFIGURED_PACKAGE_DEP_OK\n");
 SML
 run_log=$tmpdir/run.log
 (cd "$project" && "$HOLBUILD_BIN" run "$run_script") > "$run_log" 2>&1
 require_grep "RUN_PACKAGE_LOAD_OK" "$run_log"
 require_grep "RUN_SMOKE_OK" "$run_log"
-require_grep "RUN_INTLIB_DEP_OK" "$run_log"
+require_grep "RUN_CONFIGURED_PACKAGE_DEP_OK" "$run_log"
 require_grep "holbuild finished in" "$run_log"
 if grep -q ' built$' "$run_log"; then
   echo "incremental run rebuilt an up-to-date configured load or dependency" >&2
