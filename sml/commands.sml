@@ -1079,24 +1079,17 @@ fun cache_key_usable root key =
       SOME text => HolbuildBuildExec.cache_entry_usable root key text
     | NONE => false
 
-fun any_usable_cache_key root keys = List.exists (cache_key_usable root) keys
-
-fun portable_cache_key_for_node project plan root keys node =
+fun portable_cache_key_for_node _ plan root keys node =
   let
     val logical = HolbuildBuildPlan.logical_name node
     val input_key = HolbuildBuildPlan.input_key_for keys node
-    val cache_keys = HolbuildBuildExec.theory_cache_keys project plan node input_key
+    val cache_key = HolbuildBuildExec.theory_cache_key plan node input_key
   in
-    case cache_keys of
-        [] => raise Error ("internal error: no cache keys for " ^ logical)
-      | portable_key :: path_dependent_keys =>
-          if cache_key_usable root portable_key then portable_key
-          else if any_usable_cache_key root path_dependent_keys then
-            raise Error ("target " ^ logical ^ " only has a path-dependent cache entry; portable export requires rebuilding it without transient stage paths")
-          else
-            raise Error ("target " ^ logical ^
-                         " is not built in the cache; run `holbuild build " ^
-                         logical ^ "` first, or use `holbuild export --build`")
+    if cache_key_usable root cache_key then cache_key
+    else
+      raise Error ("target " ^ logical ^
+                   " is not built in the cache; run `holbuild build " ^
+                   logical ^ "` first, or use `holbuild export --build`")
   end
 
 fun export_entry_for_node project plan root keys node =

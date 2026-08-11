@@ -2130,35 +2130,6 @@ fun publish_remote_cache_key_if_usable root key =
       SOME manifest => if cache_entry_usable root key manifest then publish_remote_cache_key root key else ()
     | NONE => ()
 
-fun file_strings path =
-  let
-    val tmp = FS.tmpName ()
-    fun cleanup () = remove_file tmp
-    fun run () =
-      let val status = OS.Process.system ("strings -a " ^ HolbuildToolchain.quote path ^
-                                          " > " ^ HolbuildToolchain.quote tmp)
-      in
-        if OS.Process.isSuccess status then read_text tmp else ""
-      end
-  in
-    (run () before cleanup ()) handle e => (cleanup (); "")
-  end
-
-fun dat_mentions_stage_key input_key staged_dat =
-  let val text = file_strings staged_dat
-  in
-    String.isSubstring input_key text andalso
-    String.isSubstring ".holbuild" text andalso
-    String.isSubstring "stage" text
-  end
-
-fun path_dependent_cache_key project input_key =
-  HolbuildHash.string_sha1
-    (String.concatWith "\n"
-       ["holbuild-path-dependent-cache-v1",
-        "input_key=" ^ input_key,
-        "root=" ^ canonical_path (project_artifact_root project)] ^ "\n")
-
 fun direct_project_theory_deps plan node =
   List.filter
     (fn dep => #kind (HolbuildBuildPlan.source_of dep) = HolbuildSourceIndex.TheoryScript)
@@ -2182,9 +2153,8 @@ fun parent_output_cache_key plan node input_key =
           (String.concatWith "\n"
              (["holbuild-parent-output-cache-v1", "input_key=" ^ input_key] @ parent_lines) ^ "\n")
 
-fun theory_cache_keys project plan node input_key =
-  let val context_key = parent_output_cache_key plan node input_key
-  in unique_strings [context_key, path_dependent_cache_key project context_key] end
+fun theory_cache_key plan node input_key =
+  parent_output_cache_key plan node input_key
 
 fun cache_warning_subject node =
   String.concat [logical_name node, " (", source_file node, ")"]
@@ -2235,16 +2205,14 @@ fun publish_cache_manifest root cache_key subject staged_sig published_sml stage
       | NONE => put_new_manifest manifest
   end
 
-fun publish_theory_cache project plan node input_key proof_timeout staged_sig published_sml staged_dat
+fun publish_theory_cache plan node input_key proof_timeout staged_sig published_sml staged_dat
                          staged_trace staged_extras {parents, mldeps} =
   let
     val root = cache_root ()
     val _ = HolbuildCache.ensure_layout root
     val cache_mldeps = List.filter (not o transient_stage_mldep) mldeps
     val cache_parents = parents
-    val context_key = parent_output_cache_key plan node input_key
-    val path_dependent = List.exists transient_stage_mldep mldeps andalso dat_mentions_stage_key context_key staged_dat
-    val cache_key = if path_dependent then path_dependent_cache_key project context_key else context_key
+    val cache_key = theory_cache_key plan node input_key
     fun drop_stale_manifest key = HolbuildCache.remove_action root key
     val subject = cache_warning_subject node
     fun publish () =
@@ -2255,11 +2223,8 @@ fun publish_theory_cache project plan node input_key proof_timeout staged_sig pu
     ((if cache_key <> input_key then
         HolbuildCache.with_action_publish_lock root input_key (fn () => drop_stale_manifest input_key) skip_locked_publish
       else ());
-     (if cache_key <> context_key then
-        HolbuildCache.with_action_publish_lock root context_key (fn () => drop_stale_manifest context_key) skip_locked_publish
-      else ());
      HolbuildCache.with_action_publish_lock root cache_key publish skip_locked_publish;
-     if path_dependent then () else publish_remote_cache_key_if_usable root cache_key)
+     publish_remote_cache_key_if_usable root cache_key)
     handle e => warn ("could not publish cache entry: " ^ General.exnMessage e)
   end
 
@@ -2356,16 +2321,10 @@ fun remove_failed_cache_outputs project node =
   end
 
 
-fun cache_key_role project plan node input_key cache_key =
-  let
-    val context_key = parent_output_cache_key plan node input_key
-    val path_key = path_dependent_cache_key project context_key
-  in
-    if cache_key = input_key then "source/dependency key"
-    else if cache_key = context_key then "parent-output key"
-    else if cache_key = path_key then "path-dependent parent-output key"
-    else "cache key"
-  end
+fun cache_key_role plan node input_key cache_key =
+  if cache_key = input_key then "source/dependency key"
+  else if cache_key = theory_cache_key plan node input_key then "parent-output key"
+  else "cache key"
 
 datatype theory_cache_restore = CacheMiss | CacheRestored of real option
 
@@ -2373,7 +2332,7 @@ fun materialize_theory_cache_key verify_cache allow_timeout_discrepancy project 
   let
     val root = cache_root ()
     val manifest = HolbuildCache.action_manifest root cache_key
-    val role = cache_key_role project plan node input_key cache_key
+    val role = cache_key_role plan node input_key cache_key
     val manifest_text =
       case ensure_local_cache_entry root cache_key of
           SOME text => text
@@ -2432,21 +2391,14 @@ fun materialize_theory_cache_key verify_cache allow_timeout_discrepancy project 
   handle Error "cache entry not found" => CacheMiss
        | e => (remove_failed_cache_outputs project node;
                cache_trace ("cache miss: " ^ logical_name node ^ " " ^
-                            cache_key_role project plan node input_key cache_key ^ "=" ^ cache_key ^
+                            cache_key_role plan node input_key cache_key ^ "=" ^ cache_key ^
                             " (" ^ General.exnMessage e ^ ")");
                warn ("cache entry unusable for " ^ logical_name node ^ ": " ^ General.exnMessage e);
                CacheMiss)
 
 fun materialize_theory_cache verify_cache allow_timeout_discrepancy project plan input_key requested_timeout require_trace node =
-  let
-    fun first_restore [] = CacheMiss
-      | first_restore (cache_key :: cache_keys) =
-          case materialize_theory_cache_key verify_cache allow_timeout_discrepancy project plan input_key requested_timeout require_trace cache_key node of
-              CacheMiss => first_restore cache_keys
-            | restored => restored
-  in
-    first_restore (theory_cache_keys project plan node input_key)
-  end
+  materialize_theory_cache_key verify_cache allow_timeout_discrepancy project plan input_key
+    requested_timeout require_trace (theory_cache_key plan node input_key) node
 
 fun metadata_path (project : HolbuildProject.t) node =
   let
@@ -3364,7 +3316,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
     val _ =
       if cache_allowed then
         detail_time_phase "build.exec.publish_cache"
-          (fn () => publish_theory_cache project plan node input_key (tactic_timeout policy)
+          (fn () => publish_theory_cache plan node input_key (tactic_timeout policy)
                                       staged_sig sml_path staged_dat
                                       (if trknl_enabled policy then SOME staged_trace else NONE)
                                       staged_extra_outputs generated_metadata)
