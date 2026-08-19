@@ -86,8 +86,7 @@ fun ensure_remote git =
     val dir = cache_remote_dir git
     val meta = dir ^ ".holbuild-url"
   in
-    if path_exists dir then
-      run ("git -C " ^ quote dir ^ " fetch --prune origin")
+    if path_exists dir then ()
     else
       (ensure_dir (Path.dir dir);
        run ("git clone --bare " ^ quote git ^ " " ^ quote dir);
@@ -100,6 +99,12 @@ fun verify_commit remote rev =
   (run ("git -C " ^ quote remote ^ " cat-file -e " ^ quote (rev ^ "^{commit}"));
    trim (command_output ("git -C " ^ quote remote ^ " rev-parse " ^ quote (rev ^ "^{commit}"))))
 
+fun ensure_commit remote rev =
+  verify_commit remote rev
+  handle Error _ =>
+    (run ("git -C " ^ quote remote ^ " fetch origin " ^ quote rev);
+     verify_commit remote rev)
+
 fun materialized_head dest =
   if path_exists dest then
     SOME (trim (command_output ("git -C " ^ quote dest ^ " rev-parse HEAD")))
@@ -110,26 +115,26 @@ fun materialize {name, git, rev, artifact_root} =
   let
     val _ = validate_name name
     val _ = validate_rev rev
-    val remote = ensure_remote git
-    val commit = verify_commit remote rev
     val src_root = Path.concat(Path.concat(artifact_root, ".holbuild"), "src")
     val dest = Path.concat(src_root, name)
+    fun materialize_missing () =
+      let
+        val remote = ensure_remote git
+        val commit = ensure_commit remote rev
+        val tmp = Path.concat(src_root, ".tmp-" ^ name ^ "-" ^ HolbuildHash.string_sha1 (name ^ rev ^ Time.toString (Time.now ())))
+      in
+        if path_exists tmp then remove_tree tmp else ();
+        run ("git clone " ^ quote remote ^ " " ^ quote tmp);
+        run ("git -C " ^ quote tmp ^ " checkout --detach " ^ quote commit);
+        if path_exists dest then remove_tree dest else ();
+        FS.rename {old = tmp, new = dest};
+        dest
+      end
   in
     ensure_dir src_root;
     case materialized_head dest of
-        SOME head => if head = commit then dest
-                     else (remove_tree dest; materialize {name = name, git = git, rev = rev, artifact_root = artifact_root})
-      | NONE =>
-          let
-            val tmp = Path.concat(src_root, ".tmp-" ^ name ^ "-" ^ HolbuildHash.string_sha1 (name ^ rev ^ Time.toString (Time.now ())))
-          in
-            if path_exists tmp then remove_tree tmp else ();
-            run ("git clone " ^ quote remote ^ " " ^ quote tmp);
-            run ("git -C " ^ quote tmp ^ " checkout --detach " ^ quote commit);
-            if path_exists dest then remove_tree dest else ();
-            FS.rename {old = tmp, new = dest};
-            dest
-          end
+        SOME head => if head = rev then dest else materialize_missing ()
+      | NONE => materialize_missing ()
   end
 
 end

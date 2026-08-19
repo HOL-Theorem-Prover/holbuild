@@ -112,7 +112,31 @@ require_grep '^one$' "$project/.holbuild/src/dep/value.txt"
 (cd "$project" && "$HOLBUILD_BIN" context) > "$tmpdir/context2.log"
 [ "$(git -C "$project/.holbuild/src/dep" rev-parse HEAD)" = "$rev1" ]
 
-python3 - "$project/holproject.toml" "$rev1" "$rev2" <<'PY'
+# A materialized immutable revision must remain usable without its remote.
+mv "$repo" "$tmpdir/dep-repo-offline"
+(cd "$project" && "$HOLBUILD_BIN" context) > "$tmpdir/context-offline.log"
+mv "$tmpdir/dep-repo-offline" "$repo"
+[ "$(git -C "$project/.holbuild/src/dep" rev-parse HEAD)" = "$rev1" ]
+
+# The shared bare cache already exists, so a commit subsequently advertised only
+# by a non-default branch must be fetched explicitly rather than through HEAD.
+default_branch=$(git -C "$repo" symbolic-ref --short HEAD)
+git -C "$repo" checkout -q -b side "$rev1"
+echo side > "$repo/value.txt"
+git -C "$repo" commit -q -am side
+side_rev=$(git -C "$repo" rev-parse HEAD)
+git -C "$repo" checkout -q "$default_branch"
+python3 - "$project/holproject.toml" "$rev1" "$side_rev" <<'PY'
+import sys
+path, old, new = sys.argv[1:]
+text = open(path).read().replace(old, new)
+open(path, 'w').write(text)
+PY
+(cd "$project" && "$HOLBUILD_BIN" context) > "$tmpdir/context-side.log"
+[ "$(git -C "$project/.holbuild/src/dep" rev-parse HEAD)" = "$side_rev" ]
+require_grep '^side$' "$project/.holbuild/src/dep/value.txt"
+
+python3 - "$project/holproject.toml" "$side_rev" "$rev2" <<'PY'
 import sys
 path, old, new = sys.argv[1:]
 text = open(path).read().replace(old, new)
@@ -334,4 +358,4 @@ if (cd "$missing" && "$HOLBUILD_BIN" context) > "$tmpdir/missing.log" 2>&1; then
   echo "missing rev unexpectedly accepted" >&2
   exit 1
 fi
-require_grep 'cat-file -e' "$tmpdir/missing.log"
+require_grep "fetch origin '$missing_rev'" "$tmpdir/missing.log"
