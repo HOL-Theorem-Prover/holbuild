@@ -358,4 +358,4 @@ if (cd "$missing" && "$HOLBUILD_BIN" context) > "$tmpdir/missing.log" 2>&1; then
   echo "missing rev unexpectedly accepted" >&2
   exit 1
 fi
-require_grep 'cat-file -e' "$tmpdir/missing.log"
+require_grep "fetch origin '$missing_rev'" "$tmpdir/missing.log"
