@@ -4884,7 +4884,15 @@ fun buildheap_arg heap_kind node =
            raise Error ("heap objects cannot be signature targets: " ^
                         HolbuildBuildPlan.logical_name node))
 
-fun buildheap_args heap_kind plan = map (buildheap_arg heap_kind) (HolbuildBuildPlan.selected_nodes plan)
+fun buildheap_external_args plan =
+  unique_strings
+    (List.concat
+      (map (direct_external_loads plan)
+           (HolbuildBuildPlan.selected_nodes plan)))
+
+fun buildheap_args heap_kind plan =
+  buildheap_external_args plan @
+  map (buildheap_arg heap_kind) (HolbuildBuildPlan.selected_nodes plan)
 
 fun export_heap tc (project : HolbuildProject.t) plan output heap_kind =
   let
