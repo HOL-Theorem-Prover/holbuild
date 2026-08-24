@@ -46,10 +46,16 @@ val a_thm = store_thm("a_thm", ``T``, ACCEPT_TAC TRUTH);
 val _ = export_theory();
 SML
 cat > "$project/src/RunSig.sig" <<'SML'
-signature RunSig = sig val message : string end
+signature RunSig = sig
+  type value = unit PIntMap.t
+  val message : string
+end
 SML
 cat > "$project/src/runtests.sml" <<'SML'
-structure Run : RunSig = struct val message = "executable ok" end
+structure Run : RunSig = struct
+  type value = unit PIntMap.t
+  val message = "executable ok"
+end
 fun main () = print (Run.message ^ "\n")
 SML
 
