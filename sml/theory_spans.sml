@@ -76,7 +76,8 @@ fun parse_termination fields =
          quote_text = quote_text,
          tactic_start = int "tactic_start" tactic_start,
          tactic_end = int "tactic_end" tactic_end,
-         tactic_text = tactic_text}
+         tactic_text = tactic_text,
+         proof_ir_plan = NONE}
     | _ => raise HolbuildTheoryCheckpoints.Error "bad analyser termination record"
 
 fun response_records wants source_path =

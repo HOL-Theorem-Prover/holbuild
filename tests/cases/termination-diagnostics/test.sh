@@ -54,6 +54,8 @@ require_grep "source: .*AScript.sml:7:3-42" "$failure_log"
 require_grep "termination condition goal:" "$failure_log"
 require_grep "WF" "$failure_log"
 require_grep "expected termination failure" "$failure_log"
+require_grep "holbuild plan position:" "$failure_log"
+require_grep "holbuild goal state at failed fragment:" "$failure_log"
 require_grep "instrumented log:" "$failure_log"
 
 success_project=$tmpdir/success-project
@@ -90,9 +92,18 @@ End
 val _ = export_theory();
 SML
 
+plan_log=$tmpdir/termination-plan.log
+(cd "$success_project" && "$HOLBUILD_BIN" execution-plan ATheory:test_def) > "$plan_log" 2>&1
+require_grep "holbuild proof-ir plan termination ATheory:test_def source=src/AScript.sml (" "$plan_log"
+require_grep "WF_REL_TAC" "$plan_log"
+
 success_log=$tmpdir/success.log
-(cd "$success_project" && "$HOLBUILD_BIN" build ATheory) > "$success_log" 2>&1
+(cd "$success_project" && "$HOLBUILD_BIN" build --trace-steps ATheory) > "$success_log" 2>&1
 require_grep "ATheory built" "$success_log"
+trace_child_log="$success_project/.holbuild/logs/current/termination-success/ATheory/build.log"
+require_grep "holbuild proof-ir plan theorem=test_def steps=" "$trace_child_log"
+require_grep "holbuild proof-ir before theorem=test_def" "$trace_child_log"
+require_grep "holbuild proof-ir after theorem=test_def" "$trace_child_log"
 require_file "$success_project/.holbuild/obj/src/AScript.uo"
 require_file "$success_project/.holbuild/obj/src/ATheory.uo"
 require_file "$success_project/.holbuild/obj/src/ATheory.dat"
@@ -104,6 +115,31 @@ if ! find "$success_project/.holbuild/checkpoints" -path '*.decls/*/proof_ir_v3*
   echo "missing definition-context checkpoint for successful termination definition" >&2
   exit 1
 fi
+
+timeout_project=$tmpdir/timeout-project
+mkdir -p "$timeout_project/src"
+cp "$project/holproject.toml" "$timeout_project/holproject.toml"
+cat > "$timeout_project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+
+Definition timeout_def:
+  timeout n = if n = 0 then 0 else timeout (n - 1)
+Termination
+  (fn g => (OS.Process.sleep (Time.fromSeconds 5); ALL_TAC g))
+End
+
+val _ = export_theory();
+SML
+
+timeout_log=$tmpdir/timeout.log
+if (cd "$timeout_project" && "$HOLBUILD_BIN" build --tactic-timeout 1 ATheory) > "$timeout_log" 2>&1; then
+  echo "expected termination proof timeout" >&2
+  exit 1
+fi
+require_grep "tactic timed out after 1" "$timeout_log"
+require_grep "termination: timeout_def (line " "$timeout_log"
+require_grep "holbuild plan position:" "$timeout_log"
 
 resume_project=$tmpdir/resume-project
 mkdir -p "$resume_project/src"

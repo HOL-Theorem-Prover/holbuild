@@ -405,15 +405,28 @@ fun parse_execution_plan_selector selector =
         else {theory = theory, theorem = theorem}
     | _ => raise Error "execution-plan requires THEORY:THEOREM"
 
+type execution_plan_unit = {kind : string, name : string, tactic_start : int,
+                            tactic_end : int, tactic_text : string}
+
 fun theorem_match theorem source =
   let
     val text = read_text (#source_path source)
     val boundaries = HolbuildBuildExec.discover_theorem_boundaries (#source_path source) text
+    val terminations = HolbuildBuildExec.discover_termination_diagnostics_strict (#source_path source) text
+    val theorem_units =
+      map (fn ({name, tactic_start, tactic_end, tactic_text, ...} : HolbuildTheoryCheckpoints.boundary) =>
+             {kind = "theorem", name = name, tactic_start = tactic_start,
+              tactic_end = tactic_end, tactic_text = tactic_text}) boundaries
+    val termination_units =
+      map (fn ({name, tactic_start, tactic_end, tactic_text, ...} : HolbuildTheoryCheckpoints.termination) =>
+             {kind = "termination", name = name, tactic_start = tactic_start,
+              tactic_end = tactic_end, tactic_text = tactic_text}) terminations
   in
-    case List.filter (fn boundary => #name boundary = theorem) boundaries of
+    case List.filter (fn ({name, ...} : execution_plan_unit) => name = theorem)
+                     (theorem_units @ termination_units) of
         [] => NONE
-      | [boundary] => SOME (source, boundary)
-      | _ => raise Error ("duplicate theorem in " ^ describe_source source ^ ": " ^ theorem)
+      | [unit] => SOME (source, unit)
+      | _ => raise Error ("ambiguous proof unit in " ^ describe_source source ^ ": " ^ theorem)
   end
 
 fun write_text_file path text =
@@ -524,9 +537,9 @@ fun parse_proof_steps fieldss =
     case rest of [] => steps | _ => raise Error "unexpected proof-ir parser residue"
   end
 
-fun analyser_proof_ir_plan_for_boundary (boundary : HolbuildTheoryCheckpoints.boundary) =
+fun analyser_proof_ir_plan_for_unit (unit : execution_plan_unit) =
   let
-    val {name, tactic_start, tactic_end, tactic_text, ...} = boundary
+    val {name, tactic_start, tactic_end, tactic_text, ...} = unit
     val lines = String.tokens (fn c => c = #"\n")
       (run_analyser_for_proof_ir_text {name = name, tactic_start = tactic_start,
                                        tactic_end = tactic_end, tactic_text = tactic_text})
@@ -544,13 +557,17 @@ fun analyser_proof_ir_plan_for_boundary (boundary : HolbuildTheoryCheckpoints.bo
   in
     case loop lines false [] NONE of
         SOME steps => steps
-      | NONE => raise Error ("proof-IR plan missing for execution-plan theorem: " ^ name)
+      | NONE => raise Error ("proof-IR plan missing for execution-plan proof unit: " ^ name)
   end
 
-fun print_static_execution_plan project new_ir source theorem boundary_opt =
-  (print (let val plan = analyser_proof_ir_plan_for_boundary (case boundary_opt of SOME b => b | NONE => raise Error "internal error: missing proof-IR boundary")
+fun print_static_execution_plan project new_ir source theorem unit_opt =
+  (print (let
+            val unit = case unit_opt of SOME value => value | NONE => raise Error "internal error: missing proof-IR unit"
+            val plan = analyser_proof_ir_plan_for_unit unit
           in
-            "holbuild proof-ir plan " ^ #logical_name source ^ ":" ^ theorem ^ " source=" ^ #relative_path source ^
+            "holbuild proof-ir plan " ^
+            (if #kind unit = "theorem" then "" else #kind unit ^ " ") ^
+            #logical_name source ^ ":" ^ theorem ^ " source=" ^ #relative_path source ^
             " (" ^ Int.toString (HolbuildProofIr.display_step_count plan) ^ " steps)\n" ^
             HolbuildProofIr.format_plan_lines plan
           end);
@@ -565,8 +582,8 @@ fun find_theory_source index theory =
 
 fun find_theorem_in_source theorem source =
   case theorem_match theorem source of
-      SOME (_, boundary) => boundary
-    | NONE => raise Error ("theorem not found for execution-plan: " ^ #logical_name source ^ ":" ^ theorem)
+      SOME (_, unit) => unit
+    | NONE => raise Error ("proof unit not found for execution-plan: " ^ #logical_name source ^ ":" ^ theorem)
 
 fun print_execution_plan_selector new_ir project selector =
   let

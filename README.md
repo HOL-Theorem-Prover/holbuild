@@ -504,9 +504,11 @@ the configured targets followed by user arguments.
 
 ## Proof steps and checkpoints
 
-By default, `holbuild` instruments modern theorem proofs in the root package and
-executes them as proof steps. This gives better failure locations, per-step
-tactic timeouts, failed-prefix checkpoints, and optional traces. Theories in
+By default, `holbuild` instruments modern theorem and explicit termination
+proofs in the root package and executes them as proof steps. This gives better
+failure locations, per-step tactic timeouts, and optional traces. Theorem proofs
+also support failed-prefix checkpoints; termination proofs currently replay from
+the preceding clean definition/theorem/dependency checkpoint. Theories in
 dependency packages build without proof-step instrumentation or checkpoints;
 to debug a dependency's proofs, build that package as the root project.
 
@@ -521,7 +523,8 @@ holbuild build --skip-proof-steps MyTheory
 holbuild build --skip-checkpoints MyTheory
 ```
 
-- `execution-plan THEORY:THEOREM` prints the proof-step plan for one theorem.
+- `execution-plan THEORY:NAME` prints the proof-step plan for one theorem or
+  explicit termination proof. The name must be unambiguous within the theory.
 - `--tactic-timeout SECONDS` changes the per-step timeout; `0` disables it.
 - `--trace-steps` records proof-step traces in child logs.
 - `--repl-on-failure` starts a HOL REPL from the newest useful checkpoint after a
