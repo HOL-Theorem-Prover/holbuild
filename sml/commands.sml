@@ -412,21 +412,32 @@ fun theorem_match theorem source =
   let
     val text = read_text (#source_path source)
     val boundaries = HolbuildBuildExec.discover_theorem_boundaries (#source_path source) text
-    val terminations = HolbuildBuildExec.discover_termination_diagnostics_strict (#source_path source) text
     val theorem_units =
       map (fn ({name, tactic_start, tactic_end, tactic_text, ...} : HolbuildTheoryCheckpoints.boundary) =>
              {kind = "theorem", name = name, tactic_start = tactic_start,
               tactic_end = tactic_end, tactic_text = tactic_text}) boundaries
-    val termination_units =
-      map (fn ({name, tactic_start, tactic_end, tactic_text, ...} : HolbuildTheoryCheckpoints.termination) =>
-             {kind = "termination", name = name, tactic_start = tactic_start,
-              tactic_end = tactic_end, tactic_text = tactic_text}) terminations
+    val theorem_matches =
+      List.filter (fn ({name, ...} : execution_plan_unit) => name = theorem) theorem_units
+    fun termination_match () =
+      let
+        val terminations =
+          HolbuildBuildExec.discover_termination_diagnostics_strict (#source_path source) text
+        val termination_units =
+          map (fn ({name, tactic_start, tactic_end, tactic_text, ...} : HolbuildTheoryCheckpoints.termination) =>
+                 {kind = "termination", name = name, tactic_start = tactic_start,
+                  tactic_end = tactic_end, tactic_text = tactic_text}) terminations
+      in
+        case List.filter (fn ({name, ...} : execution_plan_unit) => name = theorem)
+                         termination_units of
+            [] => NONE
+          | [unit] => SOME (source, unit)
+          | _ => raise Error ("duplicate termination proof in " ^ describe_source source ^ ": " ^ theorem)
+      end
   in
-    case List.filter (fn ({name, ...} : execution_plan_unit) => name = theorem)
-                     (theorem_units @ termination_units) of
-        [] => NONE
+    case theorem_matches of
+        [] => termination_match ()
       | [unit] => SOME (source, unit)
-      | _ => raise Error ("ambiguous proof unit in " ^ describe_source source ^ ": " ^ theorem)
+      | _ => raise Error ("duplicate theorem in " ^ describe_source source ^ ": " ^ theorem)
   end
 
 fun write_text_file path text =
