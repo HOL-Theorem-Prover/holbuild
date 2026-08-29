@@ -3,7 +3,7 @@ struct
 
 exception Error of string
 
-val version = "0.11.2"
+val version = "0.11.3"
 
 type semver = {major : int, minor : int, patch : int}
 
