@@ -36,7 +36,7 @@ val _ = new_theory "A";
 Definition test_def:
   test n = if n = 0 then 0 else test (n - 1)
 Termination
-  WF_REL_TAC `measure I` >>
+  qexists_tac `measure I` >>
   FAIL_TAC "expected termination failure"
 End
 
