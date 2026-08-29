@@ -524,7 +524,8 @@ holbuild build --skip-checkpoints MyTheory
 ```
 
 - `execution-plan THEORY:NAME` prints the proof-step plan for one theorem or
-  explicit termination proof. The name must be unambiguous within the theory.
+  explicit termination proof. If a theorem and terminating definition have the
+  same name, the theorem takes precedence.
 - `--tactic-timeout SECONDS` changes the per-step timeout; `0` disables it.
 - `--trace-steps` records proof-step traces in child logs.
 - `--repl-on-failure` starts a HOL REPL from the newest useful checkpoint after a
