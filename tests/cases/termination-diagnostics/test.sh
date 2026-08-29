@@ -54,8 +54,8 @@ require_grep "source: .*AScript.sml:7:3-42" "$failure_log"
 require_grep "termination condition goal:" "$failure_log"
 require_grep "WF" "$failure_log"
 require_grep "expected termination failure" "$failure_log"
-require_grep "holbuild plan position:" "$failure_log"
-require_grep "holbuild goal state at failed fragment:" "$failure_log"
+require_grep "plan position:" "$failure_log"
+require_grep "failed tactic top input goal:" "$failure_log"
 require_grep "instrumented log:" "$failure_log"
 
 success_project=$tmpdir/success-project
@@ -139,7 +139,7 @@ if (cd "$timeout_project" && "$HOLBUILD_BIN" build --tactic-timeout 1 ATheory) >
 fi
 require_grep "tactic timed out after 1" "$timeout_log"
 require_grep "termination: timeout_def (line " "$timeout_log"
-require_grep "holbuild plan position:" "$timeout_log"
+require_grep "plan position:" "$timeout_log"
 
 resume_project=$tmpdir/resume-project
 mkdir -p "$resume_project/src"
