@@ -1518,6 +1518,37 @@ fun proof_ir_prove name end_path end_ok checkpoint_depth g original_tac tactic_t
           in th end
   end
 
+fun termination_tactic name tactic_text plan original_tac g =
+  let
+    val depth = length (PolyML.SaveState.showHierarchy())
+    val _ = theorem_info_ref := SOME ("termination", name, tactic_text,
+                                      "", "", "", "", "", "", false, depth)
+    val _ = failed_step_end_ref := NONE
+    val _ = failed_step_span_ref := NONE
+    val _ = failed_plan_position_ref := NONE
+    val _ = failed_goal_state_printed_ref := false
+    fun execute () =
+      let
+        val _ = active_tactic_text_ref := tactic_text
+        val _ = active_plan_ref := SOME plan
+        val _ = trace_plan name plan
+        val _ = stop_after_plan_if_requested ()
+        val _ = init_history g (HolbuildProofIr.display_step_count plan + 1)
+        val _ = run_steps plan
+                handle e =>
+                  if !failed_goal_state_printed_ref then raise e
+                  else report_finish_failure name e
+        val th = history_top_thm g
+                 handle e => report_finish_failure name e
+        val _ = drop_all ()
+        val _ = theorem_info_ref := NONE
+      in
+        ([], fn [] => th | _ => raise Fail "termination tactic validation received theorems")
+      end
+  in
+    with_proof_ir_execution (fn () => with_theorem_trace name execute)
+  end
+
 fun metadata_value key lines =
   let val prefix = key ^ "="
   in case List.find (String.isPrefix prefix) lines of

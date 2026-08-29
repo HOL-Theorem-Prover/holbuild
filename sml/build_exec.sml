@@ -3074,7 +3074,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
         val source_context =
           Option.mapPartial
             (HolbuildTheoryDiagnostics.summarize_failed_fragment_source
-               (source_file node) source_text theorem_checkpoints)
+               (source_file node) source_text theorem_checkpoints termination_diagnostics)
             failure_output_path
         val goal_state =
           Option.mapPartial
@@ -3141,7 +3141,10 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
         val plan_position = Option.mapPartial HolbuildTheoryDiagnostics.plan_position_summary failure_output_path
         val trace_context = if trace_steps policy then Option.mapPartial HolbuildTheoryDiagnostics.summarize_trace_steps failure_output_path else NONE
         val static_error = Option.mapPartial (fn path => HolbuildTheoryDiagnostics.static_error_summary (source_file node) source_text (String.fields (fn c => c = #"\n") (read_text path))) failure_output_path
-        val source_context = Option.mapPartial (HolbuildTheoryDiagnostics.summarize_failed_fragment_source (source_file node) source_text theorem_checkpoints) failure_output_path
+        val source_context = Option.mapPartial
+          (HolbuildTheoryDiagnostics.summarize_failed_fragment_source
+             (source_file node) source_text theorem_checkpoints termination_diagnostics)
+          failure_output_path
         val termination_context =
           Option.mapPartial
             (HolbuildTheoryDiagnostics.summarize_termination_goal_source
@@ -3782,12 +3785,14 @@ fun write_temp_text path text =
   let val out = TextIO.openOut path
   in TextIO.output(out, text); TextIO.closeOut out end
 
-fun analyser_proof_ir_plan_sml_for_boundaries (boundaries : HolbuildTheoryCheckpoints.boundary list) =
+type proof_ir_input = {name : string, tactic_start : int, tactic_end : int, tactic_text : string}
+
+fun analyser_proof_ir_plan_sml (inputs : proof_ir_input list) =
   case HolbuildDependencies.current_analyser_path () of
       NONE => raise Error "internal error: HOL analyser is not configured"
     | SOME analyser =>
         let
-          fun theorem_line (i, {name, tactic_start, tactic_end, tactic_text, ...}) =
+          fun proof_line (i, {name, tactic_start, tactic_end, tactic_text} : proof_ir_input) =
             HolbuildAnalysisProtocol.join ["theorem", Int.toString i, name,
                                            Int.toString tactic_start, Int.toString tactic_end, tactic_text]
           val req = OS.FileSys.tmpName ()
@@ -3795,7 +3800,7 @@ fun analyser_proof_ir_plan_sml_for_boundaries (boundaries : HolbuildTheoryCheckp
           val request = String.concatWith "\n"
             ([HolbuildAnalysisProtocol.join ["version", HolbuildAnalysisProtocol.protocol_version],
               HolbuildAnalysisProtocol.join ["command", "proof-ir-plan"]] @
-             map theorem_line (ListPair.zip (List.tabulate(length boundaries, fn i => i), boundaries)) @
+             map proof_line (ListPair.zip (List.tabulate(length inputs, fn i => i), inputs)) @
              [HolbuildAnalysisProtocol.join ["end"]]) ^ "\n"
           val _ = write_temp_text req request
           val status = OS.Process.system (HolbuildHash.quote analyser ^ " --request " ^ HolbuildHash.quote req ^
@@ -3805,7 +3810,7 @@ fun analyser_proof_ir_plan_sml_for_boundaries (boundaries : HolbuildTheoryCheckp
                      else (OS.FileSys.remove resp handle OS.SysErr _ => ();
                            raise Error "holbuild-hol-analyser failed")
           val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
-          val expected = length boundaries
+          val expected = length inputs
           val result = Array.array(expected, NONE : string option)
           fun store id expr =
             case Int.fromString id of
@@ -3858,7 +3863,11 @@ fun theory_checkpoints_for_node policy project plan keys toolchain_key node sour
         if null boundaries then []
         else if proof_ir_enabled policy then
           detail_time_phase "build.exec.node.proof_ir_plan"
-            (fn () => analyser_proof_ir_plan_sml_for_boundaries boundaries)
+            (fn () => analyser_proof_ir_plan_sml
+              (map (fn {name, tactic_start, tactic_end, tactic_text, ...} =>
+                       {name = name, tactic_start = tactic_start,
+                        tactic_end = tactic_end, tactic_text = tactic_text})
+                   boundaries))
         else map (fn _ => NONE) boundaries
       val _ =
         case errors of
@@ -3873,6 +3882,37 @@ fun theory_checkpoints_for_node policy project plan keys toolchain_key node sour
       (reject_unenforced_tactic_timeout policy node msg;
        if proof_ir_enabled policy then raise Error msg
        else fallback_theory_checkpoints node msg)
+
+fun termination_proof_plans_for_node policy node terminations =
+  if null terminations orelse not (proof_ir_enabled policy) then terminations
+  else
+    let
+      val plans = detail_time_phase "build.exec.node.proof_ir_plan_terminations"
+        (fn () => analyser_proof_ir_plan_sml
+          (map (fn ({name, tactic_start, tactic_end, tactic_text, ...} : HolbuildTheoryCheckpoints.termination) =>
+                   {name = name, tactic_start = tactic_start,
+                    tactic_end = tactic_end, tactic_text = tactic_text})
+               terminations))
+      fun attach (termination, plan) =
+        let
+          val {name, safe_name, definition_start, definition_stop, boundary,
+               quote_start, quote_end, quote_text, tactic_start, tactic_end,
+               tactic_text, ...} = termination
+        in
+          {name = name, safe_name = safe_name,
+           definition_start = definition_start, definition_stop = definition_stop,
+           boundary = boundary, quote_start = quote_start, quote_end = quote_end,
+           quote_text = quote_text, tactic_start = tactic_start,
+           tactic_end = tactic_end, tactic_text = tactic_text,
+           proof_ir_plan = plan}
+        end
+    in
+      if length plans = length terminations then ListPair.map attach (terminations, plans)
+      else raise Error "internal error: proof-IR plan count does not match termination count"
+    end
+    handle Error msg =>
+      (reject_unenforced_tactic_timeout policy node msg;
+       raise Error ("could not create termination proof plans for " ^ logical_name node ^ "\n" ^ msg))
 
 fun termination_diagnostics_for_node policy node source_text =
   if not (proof_steps_enabled policy) then []
@@ -3948,7 +3988,8 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
               NONE => []
             | SOME {boundaries, errors} =>
                 theory_checkpoints_for_node policy project plan keys toolchain_key node source_text boundaries errors
-        val termination_diagnostics = #termination_diagnostics source_spans
+        val termination_diagnostics =
+          termination_proof_plans_for_node policy node (#termination_diagnostics source_spans)
         val declaration_checkpoints =
           declaration_checkpoints_for_node policy project plan keys toolchain_key node source_text termination_diagnostics
         fun build_after_checkpoint_retries retries_left =
