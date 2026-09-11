@@ -34,6 +34,9 @@ exclude = ["gen/fixtures/known-broken"]
 exclude_globs = ["gen/*ExperimentalScript.sml"]
 allow_empty = false              # optional; default false
 
+[build.theory_tactic_timeouts]
+"src/SlowScript.sml" = 30.0      # applies only to this theory; 0 disables
+
 [dependencies.depname]
 git = "https://github.com/org/dep"
 rev = "0123456789abcdef0123456789abcdef01234567"

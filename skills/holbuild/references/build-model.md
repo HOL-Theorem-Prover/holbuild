@@ -104,7 +104,7 @@ GC:
 
 ## Build root/dependency tactic timeout
 
-`--tactic-timeout` applies only to the **root package**. Dependency packages build with no tactic timeout. This prevents a consumer's proof-debug timeout from breaking dependency builds.
+`--tactic-timeout` applies only to the **root package**. Dependency packages build with no tactic timeout. This prevents a consumer's proof-debug timeout from breaking dependency builds. `[build.theory_tactic_timeouts]` may replace the manifest/default timeout for one concrete root-package theory without propagating to its dependencies or consumers; an explicit CLI timeout still wins.
 
 ## Project write lock
 

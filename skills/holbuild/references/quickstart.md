@@ -15,6 +15,11 @@ make
 make HOLDIR=/path/to/built/HOL test
 ```
 
+If `polyc` is outside `PATH`, build with
+`make POLYC=/custom/polyml/bin/polyc`. `POLYC` is the build-time compiler; it is
+separate from `HOLBUILD_POLY`, which selects the `poly` executable used for
+project HOL toolchains.
+
 That `HOLDIR` is only a test input for holbuild's own test suite; it is not a project/runtime configuration mechanism. `holbuild` commands no longer support `--holdir`, `HOLDIR`, or `HOLBUILD_HOLDIR`.
 
 ## Minimal project

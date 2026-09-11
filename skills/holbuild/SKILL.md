@@ -73,6 +73,7 @@ Root project artifacts live under `.holbuild/`: `gen/`, `obj/`, `dep/`, `checkpo
 - Duplicate logical names across packages → error (except same-package `.sig`/`.sml` companion)
 - Unknown manifest/local-config fields → error (schema-checked)
 - `--tactic-timeout` applies only to root package; dependencies build with no timeout
+- `[build.theory_tactic_timeouts]` overrides one concrete root-package theory only; CLI timeout takes precedence
 - HOL source parse errors are build failures; holbuild may still use parser recovery internally for best-effort instrumentation and diagnostics
 - Proof engine/checkpoint/timeout/trace flags are execution/debug policy, not final artifact action-key inputs
 - Manifests may declare an exact `[holbuild].minimum_version` floor; when omitted, no minimum-version check is performed. The legacy `schema = 2` marker is optional. The resolved graph must contain exactly one `[dependencies.hol]` exact git rev; it uses a built-in manifest and builds/reuses shared HOL under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol` with `${HOLBUILD_POLY:-poly}`. `holbuild buildhol` warms this cache.
