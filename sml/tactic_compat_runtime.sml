@@ -31,18 +31,18 @@ local
 
   val legacy =
     "structure HolbuildTacticCompat = struct\n" ^
-    "  fun lift_tactic run goal = run goal\n" ^
-    "  fun lift_list_tactic run goals = run goals\n" ^
-    "  fun run_tactic tactic goal = tactic goal\n" ^
-    "  fun install_prover prover = Tactical.set_prover prover\n" ^
+    "  fun lift_tactic (run : Tactical.goal -> Tactical.goal list * Tactical.validation) : Tactical.tactic = run\n" ^
+    "  fun lift_list_tactic (run : Tactical.goal list -> Tactical.goal list * Tactical.list_validation) : Tactical.list_tactic = run\n" ^
+    "  fun run_tactic (tactic : Tactical.tactic) (goal : Tactical.goal) = tactic goal\n" ^
+    "  fun install_prover (prover : Tactical.goal * Tactical.tactic -> Thm.thm) = Tactical.set_prover prover\n" ^
     "end;\n"
 
   val contextual =
     "structure HolbuildTacticCompat = struct\n" ^
-    "  fun lift_tactic run goal _ = run goal\n" ^
-    "  fun lift_list_tactic run goals _ = run goals\n" ^
-    "  fun run_tactic tactic goal = tactic goal (Context.snapshot ())\n" ^
-    "  fun install_prover prover = Tactical.set_prover (fn _ => prover)\n" ^
+    "  fun lift_tactic (run : Tactical.goal -> Tactical.goal list * Tactical.validation) : Tactical.tactic = fn goal => fn _ => run goal\n" ^
+    "  fun lift_list_tactic (run : Tactical.goal list -> Tactical.goal list * Tactical.list_validation) : Tactical.list_tactic = fn goals => fn _ => run goals\n" ^
+    "  fun run_tactic (tactic : Tactical.tactic) (goal : Tactical.goal) = tactic goal (Context.snapshot ())\n" ^
+    "  fun install_prover (prover : Tactical.goal * Tactical.tactic -> Thm.thm) = Tactical.set_prover (fn _ => prover)\n" ^
     "end;\n"
 in
   val _ = compile (if context_tactics then contextual else legacy)
