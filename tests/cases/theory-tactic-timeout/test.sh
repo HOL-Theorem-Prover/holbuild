@@ -27,11 +27,11 @@ name = "theory-tactic-timeout"
 
 [build]
 members = ["src"]
-tactic_timeout = 0.1
+tactic_timeout = 1.0
 
 [build.theory_tactic_timeouts]
-"src/SlowScript.sml" = 1.0
-"src/AlternateScript.sml" = 0.01
+"src/SlowScript.sml" = 3.0
+"src/AlternateScript.sml" = 0.1
 TOML
 
 cat > "$project/src/BaseScript.sml" <<'SML'
@@ -44,7 +44,7 @@ cat > "$project/src/SlowScript.sml" <<'SML'
 open HolKernel Parse boolLib bossLib;
 open BaseTheory;
 val _ = new_theory "Slow";
-fun slow_tac g = (OS.Process.sleep (Time.fromReal 0.35); ACCEPT_TAC TRUTH g);
+fun slow_tac g = (OS.Process.sleep (Time.fromReal 1.5); ACCEPT_TAC TRUTH g);
 Theorem slow_ok: T Proof slow_tac QED
 val _ = export_theory();
 SML
@@ -67,25 +67,25 @@ val helper = 1
 SML
 
 (cd "$project" && "$HOLBUILD_BIN" context) > "$tmpdir/context.log"
-require_grep "theory tactic_timeout: src/SlowScript.sml = 1" "$tmpdir/context.log"
+require_grep "theory tactic_timeout: src/SlowScript.sml = 3" "$tmpdir/context.log"
 (cd "$project" && "$HOLBUILD_BIN" build AppTheory) > "$tmpdir/build.log" 2>&1
-require_grep "proof_timeout=0.1" "$project/.holbuild/dep/theory-tactic-timeout/src/BaseScript.sml.key"
-require_grep "proof_timeout=1.0" "$project/.holbuild/dep/theory-tactic-timeout/src/SlowScript.sml.key"
-require_grep "proof_timeout=0.1" "$project/.holbuild/dep/theory-tactic-timeout/src/AppScript.sml.key"
+require_grep "proof_timeout=1.0" "$project/.holbuild/dep/theory-tactic-timeout/src/BaseScript.sml.key"
+require_grep "proof_timeout=3.0" "$project/.holbuild/dep/theory-tactic-timeout/src/SlowScript.sml.key"
+require_grep "proof_timeout=1.0" "$project/.holbuild/dep/theory-tactic-timeout/src/AppScript.sml.key"
 
 # An explicit CLI timeout replaces all manifest policy, including node-local policy.
-(cd "$project" && "$HOLBUILD_BIN" build --force --tactic-timeout 2 AppTheory) > "$tmpdir/cli.log" 2>&1
-require_grep "proof_timeout=2.0" "$project/.holbuild/dep/theory-tactic-timeout/src/SlowScript.sml.key"
+(cd "$project" && "$HOLBUILD_BIN" build --force --tactic-timeout 4 AppTheory) > "$tmpdir/cli.log" 2>&1
+require_grep "proof_timeout=4.0" "$project/.holbuild/dep/theory-tactic-timeout/src/SlowScript.sml.key"
 
 # Zero disables only the named theory.
 python3 - "$project/holproject.toml" <<'PY'
 from pathlib import Path
 p = Path(__import__('sys').argv[1])
-p.write_text(p.read_text().replace('"src/SlowScript.sml" = 1.0', '"src/SlowScript.sml" = 0'))
+p.write_text(p.read_text().replace('"src/SlowScript.sml" = 3.0', '"src/SlowScript.sml" = 0'))
 PY
 (cd "$project" && "$HOLBUILD_BIN" build --force AppTheory) > "$tmpdir/disabled.log" 2>&1
 require_grep "proof_timeout=none" "$project/.holbuild/dep/theory-tactic-timeout/src/SlowScript.sml.key"
-require_grep "proof_timeout=0.1" "$project/.holbuild/dep/theory-tactic-timeout/src/BaseScript.sml.key"
+require_grep "proof_timeout=1.0" "$project/.holbuild/dep/theory-tactic-timeout/src/BaseScript.sml.key"
 
 # Invalid entries receive focused diagnostics.
 for path in src/MissingScript.sml src/Helper.sml @not-a-source; do
