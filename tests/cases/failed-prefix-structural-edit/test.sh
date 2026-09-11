@@ -132,10 +132,10 @@ val history_counter = "$history_counter";
 fun bump_counter () =
   let val out = TextIO.openAppend history_counter
   in TextIO.output(out, "x"); TextIO.closeOut out end;
-fun many_tac g =
+val many_tac = HolbuildTacticCompat.lift_tactic (fn g =>
   (bump_counter();
    (List.tabulate (20, fn _ => g),
-    fn ths => case ths of th :: _ => th | [] => raise Fail "many_tac validator"));
+    fn ths => case ths of th :: _ => th | [] => raise Fail "many_tac validator")));
 
 Theorem retained_structural_history:
   T
