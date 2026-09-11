@@ -71,6 +71,59 @@ fun entry_timeouts project index entry_plan default_timeout =
     []
     (declared_entries project index)
 
+fun selected_node_for_source project plan source =
+  let
+    val package = root_package_name project
+    val path = #relative_path (source : HolbuildSourceIndex.source)
+  in
+    List.find
+      (fn node =>
+          HolbuildBuildPlan.package node = package andalso
+          #relative_path (HolbuildBuildPlan.source_of node) = path)
+      (HolbuildBuildPlan.selected_nodes plan)
+  end
+
+fun theory_timeouts project index plan =
+  let
+    val package = root_package_name project
+    fun source_for path =
+      case List.filter
+             (fn (source : HolbuildSourceIndex.source) =>
+                 #package source = package andalso #relative_path source = path)
+             index of
+          [] => raise HolbuildProject.Error
+                  ("build.theory_tactic_timeouts references unknown source: " ^ path)
+        | [source] =>
+            if #kind source = HolbuildSourceIndex.TheoryScript then source
+            else raise HolbuildProject.Error
+                   ("build.theory_tactic_timeouts references a non-theory source: " ^ path)
+        | _ => raise HolbuildProject.Error
+                 ("build.theory_tactic_timeouts references an ambiguous source: " ^ path)
+    fun one ({source = path, timeout}, acc) =
+      case selected_node_for_source project plan (source_for path) of
+          NONE => acc
+        | SOME node => (HolbuildBuildPlan.key node, timeout) :: acc
+  in
+    List.foldl one [] (HolbuildProject.theory_tactic_timeouts project)
+  end
+
+fun replace_timeouts base overrides =
+  let
+    fun replace ((node_key, timeout), entries) =
+      let
+        fun insert values =
+          case values of
+              [] => [(node_key, timeout)]
+            | (key, old_timeout) :: rest =>
+                if key = node_key then (key, timeout) :: rest
+                else (key, old_timeout) :: insert rest
+      in
+        insert entries
+      end
+  in
+    List.foldl replace base overrides
+  end
+
 fun combine_timeouts left right =
   let
     fun add ((node_key, timeout), entries) =

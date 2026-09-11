@@ -76,6 +76,10 @@ HOL source parse errors are build failures. When HOLSourceParser recovery occurs
 ```
 
 The timeout applies only to the root package; dependency packages build with no tactic timeout.
+A manifest `[build.theory_tactic_timeouts]` entry can replace the manifest/default
+policy for one concrete theory script without affecting its dependencies or
+consumers. An explicit CLI `--tactic-timeout` takes precedence; `0` disables the
+timeout for the named theory.
 
 On timeout:
 1. Runtime timeout wrapper raises the timeout marker/failure

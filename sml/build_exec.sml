@@ -1468,7 +1468,7 @@ fun run_hol_files_to_log tc stage workdir context files log_name current_log err
     val _ = create_current_log_link log current_log
     val status =
       HolbuildToolchain.run_in_dir_to_file workdir
-        (HolbuildToolchain.hol_subcommand_argv tc "run" @ ["--noconfig"] @ hol_context_args context @ file_args)
+        (HolbuildToolchain.theory_run_argv tc @ ["--noconfig"] @ hol_context_args context @ file_args)
         log
     val detail_log = finalize_current_log log current_log
   in

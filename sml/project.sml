@@ -7,6 +7,7 @@ structure FS = OS.FileSys
 datatype heap_kind = datatype HolbuildPackageDefinition.heap_kind
 datatype heap = datatype HolbuildPackageDefinition.heap
 type root_tactic_timeout = HolbuildPackageDefinition.root_tactic_timeout
+type theory_tactic_timeout = HolbuildPackageDefinition.theory_tactic_timeout
 datatype extra_input = datatype HolbuildPackageDefinition.extra_input
 datatype action_policy = datatype HolbuildPackageDefinition.action_policy
 datatype generator = datatype HolbuildPackageDefinition.generator
@@ -61,6 +62,7 @@ type t =
     root_groups : string list,
     groups : group list,
     root_tactic_timeouts : root_tactic_timeout list,
+    theory_tactic_timeouts : theory_tactic_timeout list,
     dependencies : dependency list,
     local_config : HolbuildLocalConfig.t,
     overrides : override list,
@@ -141,7 +143,8 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
   let
     val LocalConfig {overrides, build_excludes, build_exclude_globs, build_jobs, build_tactic_timeout, checkpoint_limit_gb, remote_cache_url, remote_cache_curl_config} = local_config
     val {definition, compatibility = _,
-         tactic_timeout = manifest_timeout} =
+         tactic_timeout = manifest_timeout,
+         theory_tactic_timeouts} =
       (HolbuildPackageDefinition.parse_table table
        handle HolbuildManifestUtil.Error msg => die msg)
     val {metadata = {name, version},
@@ -179,6 +182,7 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
       root_groups = root_groups,
       groups = groups,
       root_tactic_timeouts = root_tactic_timeouts,
+      theory_tactic_timeouts = theory_tactic_timeouts,
       dependencies = dependencies,
       local_config = local_config,
       overrides = overrides,
@@ -296,6 +300,8 @@ fun package_artifact_root (Package {artifact_root, ...}) = artifact_root
 fun root_tactic_timeouts ({root_tactic_timeouts, ...} : t) = root_tactic_timeouts
 fun root_tactic_timeout_for ({root_tactic_timeouts, ...} : t) root =
   Option.map #timeout (List.find (fn entry => #root entry = root) root_tactic_timeouts)
+fun theory_tactic_timeouts ({theory_tactic_timeouts, ...} : t) =
+  theory_tactic_timeouts
 fun package_generators (Package {generators, ...}) = generators
 fun artifact_root ({artifact_root, ...} : t) = artifact_root
 fun package_definition ({definition, ...} : t) = definition
@@ -638,7 +644,7 @@ fun packages project = packages_with standard_resolution project
 
 fun describe_with resolution (project : t) =
   let
-    val {root, artifact_root, manifest, name, version, members, excludes, exclude_globs, roots, root_groups, groups, root_tactic_timeouts, dependencies,
+    val {root, artifact_root, manifest, name, version, members, excludes, exclude_globs, roots, root_groups, groups, root_tactic_timeouts, theory_tactic_timeouts, dependencies,
          overrides, local_build_excludes, local_build_exclude_globs, local_build_jobs, build_tactic_timeout, run_heap, run_loads, heaps, action_policies, generators, ...} = project
     fun opt label value =
       case value of NONE => () | SOME s => print (label ^ s ^ "\n")
@@ -702,6 +708,10 @@ fun describe_with resolution (project : t) =
                 print ("root tactic_timeout: " ^ root ^ " = " ^
                        (case timeout of NONE => "none" | SOME t => Real.toString t) ^ "\n"))
              root_tactic_timeouts;
+    List.app (fn {source, timeout} =>
+                print ("theory tactic_timeout: " ^ source ^ " = " ^
+                       (case timeout of NONE => "none" | SOME t => Real.toString t) ^ "\n"))
+             theory_tactic_timeouts;
     List.app describe_package (packages_with resolution project);
     List.app (fn dep => print ("dependency: " ^ dependency_to_string project dep ^ "\n")) dependencies;
     List.app (fn override => print ("override: " ^ override_to_string override ^ "\n")) overrides;

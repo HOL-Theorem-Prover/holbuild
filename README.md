@@ -30,6 +30,16 @@ You need Poly/ML. The small set of HOL source files needed to compile the
 make
 ```
 
+If `polyc` is not on `PATH`, select it at build time with `POLYC`:
+
+```sh
+make POLYC=/custom/polyml/bin/polyc
+```
+
+`POLYC` selects the compiler used to build the `holbuild` executable. It is
+separate from `HOLBUILD_POLY`, which selects the `poly` executable used when
+holbuild builds or runs project HOL toolchains.
+
 Check the resulting binary:
 
 ```sh
@@ -364,6 +374,9 @@ exclude = ["gen/fixtures/known-broken"]
 exclude_globs = ["gen/*ExperimentalScript.sml"]
 allow_empty = false
 
+[build.theory_tactic_timeouts]
+"src/SlowScript.sml" = 30.0
+
 [build.root_tactic_timeouts]
 "src/SlowScript.sml" = 60.0
 ```
@@ -405,6 +418,9 @@ allow_empty = false
   creates no aggregate HOL theory to load or export.
 - `tactic_timeout` sets the default root-project proof-step timeout in seconds.
   The built-in default is `2.5`; `0` disables the timeout.
+- `theory_tactic_timeouts` sets a timeout for exactly the named theory script;
+  it does not affect dependencies or consumers. `0` disables the timeout for
+  that theory. An explicit CLI `--tactic-timeout` overrides this table.
 - `root_tactic_timeouts` lets individual root source files set timeout contracts
   for their dependency closures.
 
