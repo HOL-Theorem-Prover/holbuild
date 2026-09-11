@@ -811,17 +811,6 @@ fun apply_list_tactic_step label program =
     let val list_tactic = compile_list_tactic label program
     in apply_focus_list_tactic label list_tactic end
 
-fun recording_allgoals tactic goals =
-  let
-    val results = map tactic goals
-    val goal_groups = map (fn (generated, _) => generated) results
-    val validators = map (fn (_, validate) => validate) results
-    val lengths = map length goal_groups
-    val _ = reverse_group_lengths_ref := SOME lengths
-  in
-    (List.concat goal_groups, Lib.mapshape lengths validators)
-  end
-
 fun split_by_lengths lengths xs =
   let
     fun loop [] rest = ([], rest)
@@ -877,7 +866,7 @@ fun matching_selector_count label selector goals =
           val tac = compile_tactic label program
           fun loop [] count = SOME count
             | loop (g :: rest) count =
-                if Option.isSome (Lib.total tac g) then
+                if Option.isSome (Lib.total (HolbuildTacticCompat.run_tactic tac) g) then
                   (case selector of
                        HolbuildProofIr.SelectMatchingFirst _ => SOME 1
                      | HolbuildProofIr.SelectMatchingAll _ => loop rest (count + 1)
@@ -886,7 +875,7 @@ fun matching_selector_count label selector goals =
         in
           case selector of
               HolbuildProofIr.SelectMatchingFirst _ =>
-                if List.exists (fn g => Option.isSome (Lib.total tac g)) goals then SOME 1 else NONE
+                if List.exists (fn g => Option.isSome (Lib.total (HolbuildTacticCompat.run_tactic tac) g)) goals then SOME 1 else NONE
             | HolbuildProofIr.SelectMatchingAll _ => loop goals 0
             | _ => loop goals 0
         end
@@ -936,7 +925,7 @@ fun reorder_focused_front_after label front_count middle_count =
               val (front_thms, tail_thms) = Lib.split_after front_count rest_thms
             in front_thms @ middle_thms @ tail_thms end
         in (middle @ front @ tail, validate) end
-    in apply_focus_list_tactic label reorder end
+    in apply_focus_list_tactic label (HolbuildTacticCompat.lift_list_tactic reorder) end
 
 fun restore_focused_group_order label lengths =
   case List.filter (fn n => n <> 0) lengths of
@@ -954,7 +943,7 @@ fun restore_focused_group_order label lengths =
                   val (normal_groups, tail_thms) = split_by_lengths nonzero_lengths thms
                 in List.concat (rev normal_groups) @ tail_thms end
             in (List.concat groups @ tail, validate) end
-        in apply_focus_list_tactic label reorder end
+        in apply_focus_list_tactic label (HolbuildTacticCompat.lift_list_tactic reorder) end
 
 fun step proof_step =
   case proof_step of
@@ -1518,7 +1507,8 @@ fun proof_ir_prove name end_path end_ok checkpoint_depth g original_tac tactic_t
           in th end
   end
 
-fun termination_tactic name tactic_text plan original_tac g =
+fun termination_tactic name tactic_text plan original_tac =
+  HolbuildTacticCompat.lift_tactic (fn g =>
   let
     val depth = length (PolyML.SaveState.showHierarchy())
     val _ = theorem_info_ref := SOME ("termination", name, tactic_text,
@@ -1547,7 +1537,7 @@ fun termination_tactic name tactic_text plan original_tac g =
       end
   in
     with_proof_ir_execution (fn () => with_theorem_trace name execute)
-  end
+  end)
 
 fun metadata_value key lines =
   let val prefix = key ^ "="
@@ -1928,6 +1918,6 @@ fun install ({checkpoint_enabled, tactic_timeout, timeout_marker, plan_theorem, 
    suppressed_failure_diagnostic_ref := NONE;
    failed_prefix_resume_active_ref := false;
    proving_with_proof_ir_ref := false;
-   Tactical.set_prover proof_ir_prover)
+   HolbuildTacticCompat.install_prover proof_ir_prover)
 
 end
