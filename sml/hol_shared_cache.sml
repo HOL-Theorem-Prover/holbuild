@@ -32,6 +32,8 @@ val analyser_source_files =
    "theory_span_extract.sml",
    "../proof_ir_types.sml",
    "../proof_ir.sml",
+   "proof_step_plan_adapter_legacy.sml",
+   "proof_step_plan_adapter_shared.sml",
    "proof_ir_extract.sml",
    "analyser_main.sml",
    "holbuild-hol-analyser-script.sml"]
