@@ -1,6 +1,6 @@
 ---
 name: holbuild
-Build HOL4 projects with holbuild. Use when working with holproject.toml manifests, building theory targets like FooTheory, managing dependencies, configuring proof IR/proof-step or checkpoint behavior, using the holbuild CLI, generated source, JSON output, tactic timeouts, cache/gc, or heap exports.
+description: Build HOL4 projects with holbuild. Use when working with holproject.toml manifests, building theory targets like FooTheory, managing dependencies, configuring proof IR/proof-step or checkpoint behavior, using the holbuild CLI, generated source, JSON output, tactic timeouts, cache/gc, or heap exports.
 ---
 
 # holbuild
