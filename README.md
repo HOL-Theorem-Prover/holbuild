@@ -422,9 +422,7 @@ allow_empty = false
   it does not affect dependencies or consumers. `0` disables the timeout for
   that theory. An explicit CLI `--tactic-timeout` overrides this table.
 - `root_tactic_timeouts` lets individual root source files set timeout contracts
-  for their dependency closures. A script reached by several roots uses the
-  smallest of their timeouts; a root-project script that no declared root
-  reaches uses `tactic_timeout`.
+  for their dependency closures.
 
 ### Action overrides
 

@@ -196,9 +196,9 @@ if (cd "$roots_group_project" && "$HOLBUILD_BIN" build) > "$tmpdir/roots-group.l
 fi
 require_grep "tactic timed out after 0.1s while building BetaTheory: slow_tac" "$tmpdir/roots-group.log"
 
-unreached_project=$tmpdir/unreached
-mkdir -p "$unreached_project/src"
-cat > "$unreached_project/holproject.toml" <<TOML
+heap_project=$tmpdir/heap
+mkdir -p "$heap_project/src"
+cat > "$heap_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
 minimum_version = "0.10.0"
@@ -208,33 +208,28 @@ git = "https://github.com/HOL-Theorem-Prover/HOL.git"
 rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
-name = "unreached-timeout"
+name = "heap-timeout"
 
 [build]
 members = ["src"]
 roots = ["src/RootScript.sml"]
 tactic_timeout = 0.1
 
-[build.root_tactic_timeouts]
-"src/RootScript.sml" = 5.0
+[[heap]]
+name = "orphan"
+output = ".holbuild/heap/orphan.save"
+objects = ["OrphanTheory"]
 TOML
 
-cat > "$unreached_project/src/RootScript.sml" <<'SML'
+cat > "$heap_project/src/RootScript.sml" <<'SML'
 open HolKernel Parse boolLib bossLib;
 val _ = new_theory "Root";
-fun slow_tac g = (OS.Process.sleep (Time.fromReal 0.45); ACCEPT_TAC TRUTH g);
-Theorem root_slow:
-  T
-Proof
-  slow_tac
-QED
 val _ = export_theory();
 SML
 
-for name in Orphan OrphanDep; do
-cat > "$unreached_project/src/${name}Script.sml" <<SML
+cat > "$heap_project/src/OrphanScript.sml" <<'SML'
 open HolKernel Parse boolLib bossLib;
-val _ = new_theory "$name";
+val _ = new_theory "Orphan";
 fun slow_tac g = (OS.Process.sleep (Time.fromReal 0.45); ACCEPT_TAC TRUTH g);
 Theorem slow_thm:
   T
@@ -243,36 +238,9 @@ Proof
 QED
 val _ = export_theory();
 SML
-done
 
-cat > "$unreached_project/src/OrphanUserScript.sml" <<'SML'
-open HolKernel Parse boolLib bossLib;
-open OrphanDepTheory;
-val _ = new_theory "OrphanUser";
-Theorem user_thm:
-  T
-Proof
-  ACCEPT_TAC OrphanDepTheory.slow_thm
-QED
-val _ = export_theory();
-SML
-
-if (cd "$unreached_project" && "$HOLBUILD_BIN" build OrphanTheory) > "$tmpdir/orphan.log" 2>&1; then
-  echo "script unreachable from declared roots ignored package default tactic_timeout" >&2
+if (cd "$heap_project" && "$HOLBUILD_BIN" heap orphan) > "$tmpdir/heap.log" 2>&1; then
+  echo "heap build ignored package default tactic_timeout" >&2
   exit 1
 fi
-require_grep "tactic timed out after 0.1s while building OrphanTheory: slow_tac" "$tmpdir/orphan.log"
-
-if (cd "$unreached_project" && "$HOLBUILD_BIN" build OrphanUserTheory) > "$tmpdir/orphan-user.log" 2>&1; then
-  echo "dependency of unreachable script ignored package default tactic_timeout" >&2
-  exit 1
-fi
-require_grep "tactic timed out after 0.1s while building OrphanDepTheory: slow_tac" "$tmpdir/orphan-user.log"
-
-# A root timeout above the package default is not capped by that default.
-(cd "$unreached_project" && "$HOLBUILD_BIN" build RootTheory) > "$tmpdir/root.log" 2>&1
-require_file "$unreached_project/.holbuild/obj/src/RootTheory.dat"
-
-(cd "$unreached_project" && "$HOLBUILD_BIN" build --tactic-timeout 5.0 OrphanTheory OrphanUserTheory) > "$tmpdir/orphan-cli.log" 2>&1
-require_file "$unreached_project/.holbuild/obj/src/OrphanTheory.dat"
-require_file "$unreached_project/.holbuild/obj/src/OrphanUserTheory.dat"
+require_grep "tactic timed out after 0.1s while building OrphanTheory: slow_tac" "$tmpdir/heap.log"

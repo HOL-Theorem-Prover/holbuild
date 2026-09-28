@@ -829,14 +829,30 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
          let
            (* Resolve all manifest entries even when CLI policy wins, so invalid
               configuration is never hidden by an invocation override. *)
-           val manifest =
-             HolbuildTacticTimeoutPolicy.manifest_timeouts project index entry_plan plan
-               (default_tactic_timeout ())
+           val node_local = HolbuildTacticTimeoutPolicy.theory_timeouts project index plan
          in
            if not proof_steps then []
            else if tactic_timeout_set then
              HolbuildTacticTimeoutPolicy.plan_timeouts project plan tactic_timeout
-           else manifest
+           else
+             let
+               val selected =
+                 HolbuildTacticTimeoutPolicy.combine_timeouts
+                   (HolbuildTacticTimeoutPolicy.plan_timeouts project plan
+                      (default_tactic_timeout ()))
+                   (HolbuildTacticTimeoutPolicy.entry_timeouts project index plan
+                      (default_tactic_timeout ()))
+               val explicit =
+                 case entry_plan of
+                     NONE => []
+                   | SOME explicit_plan =>
+                       HolbuildTacticTimeoutPolicy.entry_timeouts project index explicit_plan
+                         (default_tactic_timeout ())
+             in
+               HolbuildTacticTimeoutPolicy.replace_timeouts
+                 (HolbuildTacticTimeoutPolicy.combine_timeouts selected explicit)
+                 node_local
+             end
          end,
        execution_plan = execution_plan,
        trace_steps = trace_steps,
@@ -1072,8 +1088,19 @@ fun export_build_options trknl project index entry_plan plan =
      proof_steps = true,
      new_ir = true,
      node_tactic_timeouts =
-       HolbuildTacticTimeoutPolicy.manifest_timeouts project index entry_plan plan
-         (default_tactic_timeout ()),
+       HolbuildTacticTimeoutPolicy.replace_timeouts
+         (HolbuildTacticTimeoutPolicy.combine_timeouts
+            (HolbuildTacticTimeoutPolicy.combine_timeouts
+               (HolbuildTacticTimeoutPolicy.plan_timeouts project plan
+                  (default_tactic_timeout ()))
+               (HolbuildTacticTimeoutPolicy.entry_timeouts project index plan
+                  (default_tactic_timeout ())))
+            (case entry_plan of
+                 NONE => []
+               | SOME explicit_plan =>
+                   HolbuildTacticTimeoutPolicy.entry_timeouts project index explicit_plan
+                     (default_tactic_timeout ())))
+         (HolbuildTacticTimeoutPolicy.theory_timeouts project index plan),
      execution_plan = NONE,
      trace_steps = false,
      repl_on_failure = false,
@@ -1336,14 +1363,10 @@ fun build_heap_kind tc cli_jobs command target =
           if null explicit_entry_targets then NONE
           else SOME (timed_phase "entry_timeout.plan"
                        (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index explicit_entry_targets))
-        val default_tactic_timeout =
-          case #build_tactic_timeout project of
-              NONE => SOME 2.5
-            | some => some
         val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
         val output_path = HolbuildProject.abs_under (#root project) output
       in
-        HolbuildBuildExec.build {use_cache = true, verify_cache = true, force = HolbuildBuildExec.ForceNone, force_targets = [], skip_checkpoints = false, proof_steps = true, new_ir = true, node_tactic_timeouts = HolbuildTacticTimeoutPolicy.manifest_timeouts project index entry_plan plan default_tactic_timeout, execution_plan = NONE, trace_steps = false, repl_on_failure = false, emit_output_hashes = false, allow_cache_timeout_discrepancy = false, trknl = HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)}
+        HolbuildBuildExec.build (export_build_options (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)) project index entry_plan plan)
                                tc project plan toolchain_key jobs;
         HolbuildBuildExec.export_heap tc project plan output_path kind
       end

@@ -65,24 +65,11 @@ fun add_entry_timeout project plan (logical, timeout) acc =
       NONE => acc
     | SOME root => List.foldl (add_root_node_timeout project timeout) acc (closure_nodes plan root)
 
-fun add_unreached_timeout project timeout (node, acc) =
-  if root_package_node project node andalso
-     not (List.exists (fn (key, _) => key = HolbuildBuildPlan.key node) acc)
-  then acc @ [(HolbuildBuildPlan.key node, timeout)]
-  else acc
-
-fun closure_timeouts project index entry_plan default_timeout =
+fun entry_timeouts project index entry_plan default_timeout =
   List.foldl
     (fn ((root, logical), acc) => add_entry_timeout project entry_plan (logical, entry_timeout project default_timeout root) acc)
     []
     (declared_entries project index)
-
-(* Root-package scripts in the build plan that no declared entry point reaches
-   fall back to the package default timeout. *)
-fun entry_timeouts project index entry_plan plan default_timeout =
-  List.foldl (add_unreached_timeout project default_timeout)
-    (closure_timeouts project index entry_plan default_timeout)
-    (HolbuildBuildPlan.selected_nodes plan)
 
 fun selected_node_for_source project plan source =
   let
@@ -159,20 +146,5 @@ fun explicit_entries project index =
   List.filter
     (fn (root, _) => Option.isSome (HolbuildProject.root_tactic_timeout_for project root))
     (declared_entries project index)
-
-(* Manifest timeout policy for a build plan. Entry points selected by the plan
-   and unreached scripts use the plan itself; roots with explicit timeouts also
-   constrain shared dependencies through [explicit_plan] even when unselected.
-   Theory-local timeouts then replace the result for exactly their scripts. *)
-fun manifest_timeouts project index explicit_plan plan default_timeout =
-  let
-    val selected = entry_timeouts project index plan plan default_timeout
-    val explicit =
-      case explicit_plan of
-          NONE => []
-        | SOME entry_plan => closure_timeouts project index entry_plan default_timeout
-  in
-    replace_timeouts (combine_timeouts selected explicit) (theory_timeouts project index plan)
-  end
 
 end
