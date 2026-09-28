@@ -795,7 +795,9 @@ the package default and `[build.root_tactic_timeouts]` may set per-entry-point t
 contracts keyed by `[build].roots` source paths. Entry-point contracts apply to the
 root-package portion of the build dependency closure; dependency packages do not inherit a
 consumer's proof-debug timeout. If multiple declared entry points can reach the same
-root-package script, the script uses the minimum effective timeout. This timeout is a
+root-package script, the script uses the minimum effective timeout. Root-package scripts
+outside every declared entry point's closure (for example a directly requested script that
+no root imports, and its dependencies) use the package default. This timeout is a
 property of the declared entry point graph, not of the current request, except that
 `--tactic-timeout` overrides root-package entry point timeouts for the invocation. Timeout policy is not part of final artifact action keys,
 but local metadata/cache records the timeout a successful build satisfied; a success under

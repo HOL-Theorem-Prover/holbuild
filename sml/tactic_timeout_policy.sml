@@ -65,10 +65,23 @@ fun add_entry_timeout project plan (logical, timeout) acc =
       NONE => acc
     | SOME root => List.foldl (add_root_node_timeout project timeout) acc (closure_nodes plan root)
 
-fun entry_timeouts project index entry_plan default_timeout =
-  List.foldl
-    (fn ((root, logical), acc) => add_entry_timeout project entry_plan (logical, entry_timeout project default_timeout root) acc)
-    []
-    (declared_entries project index)
+fun add_unreached_timeout project timeout (node, acc) =
+  if root_package_node project node andalso
+     not (List.exists (fn (key, _) => key = HolbuildBuildPlan.key node) acc)
+  then acc @ [(HolbuildBuildPlan.key node, timeout)]
+  else acc
+
+(* Root-package scripts in the build plan that no declared entry point reaches
+   fall back to the package default timeout. *)
+fun entry_timeouts project index entry_plan plan default_timeout =
+  let
+    val reached =
+      List.foldl
+        (fn ((root, logical), acc) => add_entry_timeout project entry_plan (logical, entry_timeout project default_timeout root) acc)
+        []
+        (declared_entries project index)
+  in
+    List.foldl (add_unreached_timeout project default_timeout) reached (HolbuildBuildPlan.selected_nodes plan)
+  end
 
 end

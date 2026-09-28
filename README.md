@@ -406,7 +406,9 @@ allow_empty = false
 - `tactic_timeout` sets the default root-project proof-step timeout in seconds.
   The built-in default is `2.5`; `0` disables the timeout.
 - `root_tactic_timeouts` lets individual root source files set timeout contracts
-  for their dependency closures.
+  for their dependency closures. A script reached by several roots uses the
+  smallest of their timeouts; a root-project script that no declared root
+  reaches uses `tactic_timeout`.
 
 ### Action overrides
 
