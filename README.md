@@ -30,6 +30,16 @@ You need Poly/ML. The small set of HOL source files needed to compile the
 make
 ```
 
+If `polyc` is not on `PATH`, select it at build time with `POLYC`:
+
+```sh
+make POLYC=/custom/polyml/bin/polyc
+```
+
+`POLYC` selects the compiler used to build the `holbuild` executable. It is
+separate from `HOLBUILD_POLY`, which selects the `poly` executable used when
+holbuild builds or runs project HOL toolchains.
+
 Check the resulting binary:
 
 ```sh
@@ -364,6 +374,9 @@ exclude = ["gen/fixtures/known-broken"]
 exclude_globs = ["gen/*ExperimentalScript.sml"]
 allow_empty = false
 
+[build.theory_tactic_timeouts]
+"src/SlowScript.sml" = 30.0
+
 [build.root_tactic_timeouts]
 "src/SlowScript.sml" = 60.0
 ```
@@ -405,6 +418,9 @@ allow_empty = false
   creates no aggregate HOL theory to load or export.
 - `tactic_timeout` sets the default root-project proof-step timeout in seconds.
   The built-in default is `2.5`; `0` disables the timeout.
+- `theory_tactic_timeouts` sets a timeout for exactly the named theory script;
+  it does not affect dependencies or consumers. `0` disables the timeout for
+  that theory. An explicit CLI `--tactic-timeout` overrides this table.
 - `root_tactic_timeouts` lets individual root source files set timeout contracts
   for their dependency closures. A script reached by several roots uses the
   smallest of their timeouts; a root-project script that no declared root
@@ -437,6 +453,22 @@ Source files may also declare source-file-relative extra dependencies:
 val () = holbuild_extra_deps ["../data/table.txt"];
 ```
 
+Theory scripts may declare deterministic extra output files:
+
+```sml
+val () = holbuild_extra_outputs ["results/test.nsv"];
+```
+
+Each path is relative to the declaring source file and must be a fixed file path
+inside the package: absolute paths, `.`/`..` components, trailing slashes, and
+glob syntax are rejected. The action must produce every declaration. Extra
+outputs participate in up-to-date checks and cache publication/restoration, and
+`holbuild clean TARGET` removes them. Holbuild records ownership lazily and
+rejects another action that attempts to materialize the same path. As with
+ordinary outputs, cleaning followed
+by a normal build may restore them from cache; use existing no-cache or impure /
+always-reexecute controls when source execution is required.
+
 ### Generated source
 
 Generated HOL source can be declared with `[[generate]]` entries:
@@ -453,8 +485,12 @@ outputs = ["gen/OpcodeScript.sml"]
 deps = []
 ```
 
-Generators run before source discovery. Declared outputs are checked and then
-scanned as normal source files.
+Declared outputs participate in source discovery as virtual entries. A generator
+runs only when a selected source reaches one of its outputs, either as HOL/SML
+source or through a manifest/inline `extra_deps` declaration. Its transitive
+`deps` run first, and all declared outputs are then checked. Unreachable
+generators do not require their command-line tools to be installed. Broad groups
+and default roots still demand every generated output they select.
 
 ### Heaps and run contexts
 
@@ -479,15 +515,18 @@ loads = ["MyLib"]
 to save the heap. `[[heap]].objects` may name theory and SML logical targets.
 `holbuild executable runtests` builds the listed logical objects and uses HOL
 `buildheap --exe=<main>` to produce an executable; `main` defaults to `"main"`
-and executable objects may also include signature targets. `holbuild run` and
-`holbuild repl` create a project run context under `.holbuild/` before loading
-`[run].loads` and user arguments.
+and executable objects may also include signature targets. Before starting HOL,
+`holbuild run` and `holbuild repl` build every target named by `[run].loads`,
+create an invocation-private project context under `.holbuild/`, and then load
+the configured targets followed by user arguments.
 
 ## Proof steps and checkpoints
 
-By default, `holbuild` instruments modern theorem proofs in the root package and
-executes them as proof steps. This gives better failure locations, per-step
-tactic timeouts, failed-prefix checkpoints, and optional traces. Theories in
+By default, `holbuild` instruments modern theorem and explicit termination
+proofs in the root package and executes them as proof steps. This gives better
+failure locations, per-step tactic timeouts, and optional traces. Theorem proofs
+also support failed-prefix checkpoints; termination proofs currently replay from
+the preceding clean definition/theorem/dependency checkpoint. Theories in
 dependency packages build without proof-step instrumentation or checkpoints;
 to debug a dependency's proofs, build that package as the root project.
 
@@ -502,18 +541,24 @@ holbuild build --skip-proof-steps MyTheory
 holbuild build --skip-checkpoints MyTheory
 ```
 
-- `execution-plan THEORY:THEOREM` prints the proof-step plan for one theorem.
+- `execution-plan THEORY:NAME` prints the proof-step plan for one theorem or
+  explicit termination proof. If a theorem and terminating definition have the
+  same name, the theorem takes precedence.
 - `--tactic-timeout SECONDS` changes the per-step timeout; `0` disables it.
 - `--trace-steps` records proof-step traces in child logs.
 - `--repl-on-failure` starts a HOL REPL from the newest useful checkpoint after a
   theory failure. It serialises the build and is not supported with `--json`.
 - `--skip-proof-steps` opts out of proof-step execution.
-- `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation.
+- `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation. With no final
+  context to save, holbuild does not eagerly reload the just-exported generated
+  theory; dependents and explicit consumers load it normally through its manifest.
 
 For source-executed theory builds, holbuild writes a live child log at
 `.holbuild/logs/current/<package>/<logical>/build.log`. You can inspect it during
 a long build with `tail -f`; after the child exits, the same path is kept as the
-latest log. Up-to-date and cache-restored targets do not produce a new log; use
+latest log. When checkpoints are enabled, the separate generated-theory load and
+final-context save are recorded in `final-context.log` beside `build.log`.
+Up-to-date and cache-restored targets do not produce a new log; use
 `--force --no-cache` to regenerate one.
 
 Compatibility aliases:
@@ -703,8 +748,18 @@ Repository tests resolve the schema 2 HOL toolchain cache automatically:
 make test
 ```
 
-To reuse an explicit checkout instead, pass `HOLDIR=/path/to/built/HOL`. The
-checkout must be at the revision recorded in `vendor/hol/REV`.
+To reuse an explicit checkout instead, pass `HOLDIR=/path/to/built/HOL`. By
+default the checkout must be at the revision recorded in `vendor/hol/REV`.
+
+To test against another immutable HOL commit without changing the vendor pin,
+leave `HOLDIR` unset and override the test revision. The runner provisions and
+reuses the corresponding revision-keyed toolchain through `holbuild buildhol`,
+and generated test manifests use the same revision:
+
+```sh
+env -u HOLDIR -u HOLBUILD_HOLDIR \
+  HOLBUILD_TEST_HOL_REV=<full-40-character-commit> make test
+```
 
 ## Release process
 

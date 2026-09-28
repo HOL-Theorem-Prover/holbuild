@@ -70,6 +70,21 @@ require_grep "resolved diamond:src/CScript.sml:CTheory diamond:src/AScript.sml:A
 require_grep "reverse diamond:src/AScript.sml:ATheory diamond:src/BScript.sml:BTheory" "$graph_log"
 require_grep "reverse diamond:src/AScript.sml:ATheory diamond:src/CScript.sml:CTheory" "$graph_log"
 
+# Repeated proof-entry planning must be stable, while a one-file dependency edit
+# must change the graph identity used by the plan.
+first_graph_id=$(grep '^selected-graph-id ' "$graph_log")
+repeat_graph_log=$tmpdir/repeated-resolved-graph.log
+(cd "$project" && HOLBUILD_TEST_RESOLVED_GRAPH="$repeat_graph_log" \
+  "$HOLBUILD_BIN" build --dry-run DTheory) > /dev/null
+[[ $(grep '^selected-graph-id ' "$repeat_graph_log") == "$first_graph_id" ]]
+
+sed -i 's/open ATheory;/open ATheory CTheory;/' "$project/src/BScript.sml"
+edited_graph_log=$tmpdir/edited-resolved-graph.log
+(cd "$project" && HOLBUILD_TEST_RESOLVED_GRAPH="$edited_graph_log" \
+  "$HOLBUILD_BIN" build --dry-run DTheory) > /dev/null
+[[ $(grep '^selected-graph-id ' "$edited_graph_log") != "$first_graph_id" ]]
+require_grep "resolved diamond:src/BScript.sml:BTheory diamond:src/CScript.sml:CTheory holdep-mention CTheory" "$edited_graph_log"
+
 (cd "$project" && "$HOLBUILD_BIN" -j2 build DTheory)
 # checkpoints persist after successful builds for incremental rebuilds
 

@@ -102,7 +102,9 @@ import sys
 
 actions = []
 for action in (pathlib.Path(sys.argv[1]) / "ac").glob("*"):
-    if b"manifest-text-v1\nholbuild-cache-action-v3\n" in action.read_bytes():
+    data = action.read_bytes()
+    if (b"manifest-text-v1\nholbuild-cache-action-v4\n" in data or
+            b"manifest-text-v1\nholbuild-cache-action-v3\n" in data):
         actions.append(action)
 if len(actions) != 1:
     raise SystemExit(f"expected one remote theory action, found {len(actions)}")
@@ -194,7 +196,8 @@ for action in (root / "ac").glob("*"):
     if marker not in text:
         continue
     manifest = text.split(marker, 1)[1]
-    if not manifest.startswith("holbuild-cache-action-v3\n"):
+    if not manifest.startswith(("holbuild-cache-action-v4\n",
+                                "holbuild-cache-action-v3\n")):
         continue
     fields = [line.split("=", 1)[1]
               for line in manifest.splitlines()

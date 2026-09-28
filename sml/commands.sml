@@ -301,6 +301,16 @@ fun split_flags args =
     loop false false HolbuildBuildExec.ForceNone true true false false true true NONE false NONE false false false false build_args
   end
 
+fun default_build_request targets =
+  ({dry_run = false, watch = false, force = HolbuildBuildExec.ForceNone,
+    use_cache = true, verify_cache = true, no_stat_cache = false,
+    skip_checkpoints = false, proof_steps = true, new_ir = true,
+    tactic_timeout = NONE, tactic_timeout_set = false, execution_plan = NONE,
+    trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
+    warn_unreachable = false, emit_output_hashes = false,
+    allow_cache_timeout_discrepancy = false},
+   targets)
+
 fun has_suffix suffix s =
   let
     val n = size s
@@ -395,14 +405,38 @@ fun parse_execution_plan_selector selector =
         else {theory = theory, theorem = theorem}
     | _ => raise Error "execution-plan requires THEORY:THEOREM"
 
+type execution_plan_unit = {kind : string, name : string, tactic_start : int,
+                            tactic_end : int, tactic_text : string}
+
 fun theorem_match theorem source =
   let
     val text = read_text (#source_path source)
     val boundaries = HolbuildBuildExec.discover_theorem_boundaries (#source_path source) text
+    val theorem_units =
+      map (fn ({name, tactic_start, tactic_end, tactic_text, ...} : HolbuildTheoryCheckpoints.boundary) =>
+             {kind = "theorem", name = name, tactic_start = tactic_start,
+              tactic_end = tactic_end, tactic_text = tactic_text}) boundaries
+    val theorem_matches =
+      List.filter (fn ({name, ...} : execution_plan_unit) => name = theorem) theorem_units
+    fun termination_match () =
+      let
+        val terminations =
+          HolbuildBuildExec.discover_termination_diagnostics_strict (#source_path source) text
+        val termination_units =
+          map (fn ({name, tactic_start, tactic_end, tactic_text, ...} : HolbuildTheoryCheckpoints.termination) =>
+                 {kind = "termination", name = name, tactic_start = tactic_start,
+                  tactic_end = tactic_end, tactic_text = tactic_text}) terminations
+      in
+        case List.filter (fn ({name, ...} : execution_plan_unit) => name = theorem)
+                         termination_units of
+            [] => NONE
+          | [unit] => SOME (source, unit)
+          | _ => raise Error ("duplicate termination proof in " ^ describe_source source ^ ": " ^ theorem)
+      end
   in
-    case List.filter (fn boundary => #name boundary = theorem) boundaries of
-        [] => NONE
-      | [boundary] => SOME (source, boundary)
+    case theorem_matches of
+        [] => termination_match ()
+      | [unit] => SOME (source, unit)
       | _ => raise Error ("duplicate theorem in " ^ describe_source source ^ ": " ^ theorem)
   end
 
@@ -514,9 +548,9 @@ fun parse_proof_steps fieldss =
     case rest of [] => steps | _ => raise Error "unexpected proof-ir parser residue"
   end
 
-fun analyser_proof_ir_plan_for_boundary (boundary : HolbuildTheoryCheckpoints.boundary) =
+fun analyser_proof_ir_plan_for_unit (unit : execution_plan_unit) =
   let
-    val {name, tactic_start, tactic_end, tactic_text, ...} = boundary
+    val {name, tactic_start, tactic_end, tactic_text, ...} = unit
     val lines = String.tokens (fn c => c = #"\n")
       (run_analyser_for_proof_ir_text {name = name, tactic_start = tactic_start,
                                        tactic_end = tactic_end, tactic_text = tactic_text})
@@ -534,13 +568,17 @@ fun analyser_proof_ir_plan_for_boundary (boundary : HolbuildTheoryCheckpoints.bo
   in
     case loop lines false [] NONE of
         SOME steps => steps
-      | NONE => raise Error ("proof-IR plan missing for execution-plan theorem: " ^ name)
+      | NONE => raise Error ("proof-IR plan missing for execution-plan proof unit: " ^ name)
   end
 
-fun print_static_execution_plan project new_ir source theorem boundary_opt =
-  (print (let val plan = analyser_proof_ir_plan_for_boundary (case boundary_opt of SOME b => b | NONE => raise Error "internal error: missing proof-IR boundary")
+fun print_static_execution_plan project new_ir source theorem unit_opt =
+  (print (let
+            val unit = case unit_opt of SOME value => value | NONE => raise Error "internal error: missing proof-IR unit"
+            val plan = analyser_proof_ir_plan_for_unit unit
           in
-            "holbuild proof-ir plan " ^ #logical_name source ^ ":" ^ theorem ^ " source=" ^ #relative_path source ^
+            "holbuild proof-ir plan " ^
+            (if #kind unit = "theorem" then "" else #kind unit ^ " ") ^
+            #logical_name source ^ ":" ^ theorem ^ " source=" ^ #relative_path source ^
             " (" ^ Int.toString (HolbuildProofIr.display_step_count plan) ^ " steps)\n" ^
             HolbuildProofIr.format_plan_lines plan
           end);
@@ -555,8 +593,8 @@ fun find_theory_source index theory =
 
 fun find_theorem_in_source theorem source =
   case theorem_match theorem source of
-      SOME (_, boundary) => boundary
-    | NONE => raise Error ("theorem not found for execution-plan: " ^ #logical_name source ^ ":" ^ theorem)
+      SOME (_, unit) => unit
+    | NONE => raise Error ("proof unit not found for execution-plan: " ^ #logical_name source ^ ":" ^ theorem)
 
 fun print_execution_plan_selector new_ir project selector =
   let
@@ -788,8 +826,18 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
        proof_steps = proof_steps,
        new_ir = new_ir,
        node_tactic_timeouts =
-         if tactic_timeout_set then HolbuildTacticTimeoutPolicy.plan_timeouts project plan tactic_timeout
-         else HolbuildTacticTimeoutPolicy.entry_timeouts project index entry_plan plan (default_tactic_timeout ()),
+         let
+           (* Resolve all manifest entries even when CLI policy wins, so invalid
+              configuration is never hidden by an invocation override. *)
+           val manifest =
+             HolbuildTacticTimeoutPolicy.manifest_timeouts project index entry_plan plan
+               (default_tactic_timeout ())
+         in
+           if not proof_steps then []
+           else if tactic_timeout_set then
+             HolbuildTacticTimeoutPolicy.plan_timeouts project plan tactic_timeout
+           else manifest
+         end,
        execution_plan = execution_plan,
        trace_steps = trace_steps,
        repl_on_failure = repl_on_failure,
@@ -807,8 +855,17 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
         val targets = timed_phase "targets.default" (fn () => default_build_targets resolution project index requested_targets)
         val _ = reject_object_targets targets
         val plan = timed_phase "build.plan" (fn () => build_target_plan resolution components (#holdir tc) project index requested_targets targets)
-        val entry_targets = map #2 (HolbuildTacticTimeoutPolicy.declared_entries project index)
-        val entry_plan = timed_phase "entry_timeout.plan" (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index entry_targets)
+        val entry_plan =
+          if proof_steps then
+            let
+              val entry_targets =
+                map #2 (HolbuildTacticTimeoutPolicy.explicit_entries project index)
+            in
+              if null entry_targets then NONE
+              else SOME (timed_phase "entry_timeout.plan"
+                           (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index entry_targets))
+            end
+          else NONE
         val _ = if warn_unreachable andalso null requested_targets then
                   warn_unreachable_root_scripts resolution project index plan
                 else ()
@@ -1014,7 +1071,9 @@ fun export_build_options trknl project index entry_plan plan =
      skip_checkpoints = false,
      proof_steps = true,
      new_ir = true,
-     node_tactic_timeouts = HolbuildTacticTimeoutPolicy.entry_timeouts project index entry_plan plan (default_tactic_timeout ()),
+     node_tactic_timeouts =
+       HolbuildTacticTimeoutPolicy.manifest_timeouts project index entry_plan plan
+         (default_tactic_timeout ()),
      execution_plan = NONE,
      trace_steps = false,
      repl_on_failure = false,
@@ -1031,24 +1090,17 @@ fun cache_key_usable root key =
       SOME text => HolbuildBuildExec.cache_entry_usable root key text
     | NONE => false
 
-fun any_usable_cache_key root keys = List.exists (cache_key_usable root) keys
-
-fun portable_cache_key_for_node project plan root keys node =
+fun portable_cache_key_for_node _ plan root keys node =
   let
     val logical = HolbuildBuildPlan.logical_name node
     val input_key = HolbuildBuildPlan.input_key_for keys node
-    val cache_keys = HolbuildBuildExec.theory_cache_keys project plan node input_key
+    val cache_key = HolbuildBuildExec.theory_cache_key plan node input_key
   in
-    case cache_keys of
-        [] => raise Error ("internal error: no cache keys for " ^ logical)
-      | portable_key :: path_dependent_keys =>
-          if cache_key_usable root portable_key then portable_key
-          else if any_usable_cache_key root path_dependent_keys then
-            raise Error ("target " ^ logical ^ " only has a path-dependent cache entry; portable export requires rebuilding it without transient stage paths")
-          else
-            raise Error ("target " ^ logical ^
-                         " is not built in the cache; run `holbuild build " ^
-                         logical ^ "` first, or use `holbuild export --build`")
+    if cache_key_usable root cache_key then cache_key
+    else
+      raise Error ("target " ^ logical ^
+                   " is not built in the cache; run `holbuild build " ^
+                   logical ^ "` first, or use `holbuild export --build`")
   end
 
 fun export_entry_for_node project plan root keys node =
@@ -1156,8 +1208,12 @@ fun export_archive tc jobs args =
     val targets = timed_phase "targets.default" (fn () => default_build_targets resolution project index requested_targets)
     val _ = reject_object_targets targets
     val plan = timed_phase "build.plan" (fn () => build_target_plan resolution components (#holdir tc) project index requested_targets targets)
-    val entry_targets = map #2 (HolbuildTacticTimeoutPolicy.declared_entries project index)
-    val entry_plan = timed_phase "entry_timeout.plan" (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index entry_targets)
+    val explicit_entry_targets =
+      map #2 (HolbuildTacticTimeoutPolicy.explicit_entries project index)
+    val entry_plan =
+      if null explicit_entry_targets then NONE
+      else SOME (timed_phase "entry_timeout.plan"
+                   (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index explicit_entry_targets))
     val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
     val options = export_build_options (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)) project index entry_plan plan
     val keys = HolbuildBuildPlan.input_keys (HolbuildBuildExec.build_config_lines_for_node options project) toolchain_key plan
@@ -1234,7 +1290,7 @@ fun clean_targets args =
             | _ => raise Error ("clean only supports theory targets: " ^ HolbuildBuildPlan.logical_name node)
         val nodes = List.concat (map target_nodes args)
         val theory_nodes = map require_theory nodes
-        val _ = List.app (HolbuildBuildExec.clean_theory_node project) theory_nodes
+        val _ = List.app (HolbuildBuildExec.clean_theory_node project plan) theory_nodes
         val _ = List.app (fn node => print ("cleaned " ^ HolbuildBuildPlan.logical_name node ^ "\n")) theory_nodes
         val _ = print "note: subsequent builds may restore cleaned targets from the global cache; use `holbuild build --no-cache TARGET...` to force a local rebuild\n"
       in
@@ -1274,8 +1330,12 @@ fun build_heap_kind tc cli_jobs command target =
         val objects = HolbuildSourceIndex.expand_group_tokens index (HolbuildProject.project_package project) objects
         val _ = if null objects then raise Error (command ^ " target has no objects: " ^ target) else ()
         val plan = timed_phase "build.plan" (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index objects)
-        val entry_targets = map #2 (HolbuildTacticTimeoutPolicy.declared_entries project index)
-        val entry_plan = timed_phase "entry_timeout.plan" (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index entry_targets)
+        val explicit_entry_targets =
+          map #2 (HolbuildTacticTimeoutPolicy.explicit_entries project index)
+        val entry_plan =
+          if null explicit_entry_targets then NONE
+          else SOME (timed_phase "entry_timeout.plan"
+                       (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index explicit_entry_targets))
         val default_tactic_timeout =
           case #build_tactic_timeout project of
               NONE => SOME 2.5
@@ -1283,7 +1343,7 @@ fun build_heap_kind tc cli_jobs command target =
         val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
         val output_path = HolbuildProject.abs_under (#root project) output
       in
-        HolbuildBuildExec.build {use_cache = true, verify_cache = true, force = HolbuildBuildExec.ForceNone, force_targets = [], skip_checkpoints = false, proof_steps = true, new_ir = true, node_tactic_timeouts = HolbuildTacticTimeoutPolicy.entry_timeouts project index entry_plan plan default_tactic_timeout, execution_plan = NONE, trace_steps = false, repl_on_failure = false, emit_output_hashes = false, allow_cache_timeout_discrepancy = false, trknl = HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)}
+        HolbuildBuildExec.build {use_cache = true, verify_cache = true, force = HolbuildBuildExec.ForceNone, force_targets = [], skip_checkpoints = false, proof_steps = true, new_ir = true, node_tactic_timeouts = HolbuildTacticTimeoutPolicy.manifest_timeouts project index entry_plan plan default_tactic_timeout, execution_plan = NONE, trace_steps = false, repl_on_failure = false, emit_output_hashes = false, allow_cache_timeout_discrepancy = false, trknl = HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)}
                                tc project plan toolchain_key jobs;
         HolbuildBuildExec.export_heap tc project plan output_path kind
       end
@@ -1294,10 +1354,8 @@ fun build_heap_kind tc cli_jobs command target =
 fun build_heap tc cli_jobs target = build_heap_kind tc cli_jobs "heap" target
 fun build_executable tc cli_jobs target = build_heap_kind tc cli_jobs "executable" target
 
-fun hol_args_for_project tc project subcommand user_args =
+fun hol_args_for_project tc project subcommand context user_args =
   let
-    val packages = resolved_packages (resolution_for_toolchain tc) project
-    val context = HolbuildToolchain.write_run_context project packages
     val heap_args =
       case HolbuildProject.abs_run_heap project of
           NONE => ["--holstate", HolbuildToolchain.base_state tc]
@@ -1306,21 +1364,34 @@ fun hol_args_for_project tc project subcommand user_args =
     HolbuildToolchain.hol_subcommand_argv tc subcommand @ heap_args @ [context] @ user_args
   end
 
-fun run_hol_with runner tc subcommand user_args =
+fun run_hol_with runner tc cli_jobs subcommand user_args =
   let
-    val project = timed_phase "project.discover" load_project
-    val argv = hol_args_for_project tc project subcommand user_args
-    val status = runner argv
+    val configured_project = timed_phase "project.discover" load_project
+    val run_loads = #run_loads configured_project
+    val _ =
+      if null run_loads then ()
+      else build_once tc cli_jobs (default_build_request run_loads)
+    val project =
+      if null run_loads then configured_project
+      else timed_phase "run.project.rediscover" load_project
+    val packages = resolved_packages (resolution_for_toolchain tc) project
+    fun invoke context =
+      let
+        val argv = hol_args_for_project tc project subcommand context user_args
+        val status = runner argv
+      in
+        if HolbuildToolchain.success status then ()
+        else raise Error ("hol " ^ subcommand ^ " failed")
+      end
   in
-    if HolbuildToolchain.success status then ()
-    else raise Error ("hol " ^ subcommand ^ " failed")
+    HolbuildToolchain.with_run_context project packages invoke
   end
 
-fun run_hol tc subcommand user_args =
-  run_hol_with HolbuildToolchain.run tc subcommand user_args
+fun run_hol tc cli_jobs subcommand user_args =
+  run_hol_with HolbuildToolchain.run tc cli_jobs subcommand user_args
 
-fun repl_hol tc user_args =
-  run_hol_with HolbuildToolchain.run_interactive tc "repl" user_args
+fun repl_hol tc cli_jobs user_args =
+  run_hol_with HolbuildToolchain.run_interactive tc cli_jobs "repl" user_args
 
 fun removed_legacy_plan_command _ _ =
   raise Error "goalfrag-plan has been removed; use execution-plan THEORY:THEOREM"
@@ -1348,8 +1419,8 @@ fun dispatch tc jobs args =
     | "heap" :: _ => raise Error "usage: holbuild heap NAME"
     | "executable" :: [target] => (reject_json "executable"; build_executable tc jobs target)
     | "executable" :: _ => raise Error "usage: holbuild executable NAME"
-    | "run" :: rest => (reject_json "run"; run_hol tc "run" rest)
-    | "repl" :: rest => (reject_json "repl"; repl_hol tc rest)
+    | "run" :: rest => (reject_json "run"; run_hol tc jobs "run" rest)
+    | "repl" :: rest => (reject_json "repl"; repl_hol tc jobs rest)
     | "export" :: rest => (reject_json "export"; export_archive tc jobs rest)
     | "import" :: rest => (reject_json "import"; import_archive rest)
     | cmd :: _ => if known_command cmd then raise Error ("unknown command: " ^ cmd)

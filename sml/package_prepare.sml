@@ -16,7 +16,7 @@ fun prepare_package (package, (prepared, generator_packages, outputs)) =
     val id = HolbuildProject.package_identity package
     val generators = HolbuildProject.package_generators package
     val _ =
-      HolbuildGenerators.run_package package
+      HolbuildGenerators.validate_package package
       handle HolbuildGenerators.Error msg => raise Error msg
            | HolbuildGenerators.ErrorWithDebugArtifacts (msg, artifacts) =>
                raise ErrorWithDebugArtifacts (msg, artifacts)
@@ -50,5 +50,29 @@ fun generator_packages ({generator_packages, ...} : t) = generator_packages
 fun expected_outputs ({expected_outputs, ...} : t) = expected_outputs
 fun requires_live_preparation ({requires_live_preparation, ...} : t) =
   requires_live_preparation
+
+fun package_named graph name =
+  List.find (fn package => HolbuildProject.package_name package = name)
+    (HolbuildProjectGraph.packages graph)
+
+fun generator_for_output package relative_path =
+  List.find
+    (fn generator =>
+      List.exists (fn output => output = relative_path)
+        (HolbuildProject.generator_outputs generator))
+    (HolbuildProject.package_generators package)
+
+fun ensure_output ({graph, ...} : t) package_name relative_path =
+  case package_named graph package_name of
+      NONE => ()
+    | SOME package =>
+        (case generator_for_output package relative_path of
+             NONE => ()
+           | SOME generator =>
+               (HolbuildGenerators.run_selected package
+                  [HolbuildProject.generator_name generator]
+                handle HolbuildGenerators.Error msg => raise Error msg
+                     | HolbuildGenerators.ErrorWithDebugArtifacts (msg, artifacts) =>
+                         raise ErrorWithDebugArtifacts (msg, artifacts)))
 
 end

@@ -5,6 +5,14 @@ require_file() {
   [[ -f "$path" ]] || { echo "missing expected file: $path" >&2; exit 1; }
 }
 
+require_no_file() {
+  local path=$1
+  if [[ -e "$path" ]]; then
+    echo "unexpected file exists: $path" >&2
+    exit 1
+  fi
+}
+
 require_grep() {
   local pattern=$1
   local path=$2
@@ -54,7 +62,11 @@ start_remote_cache_server() {
 }
 
 holbuild_pinned_hol_rev() {
-  tr -d '[:space:]' < "${HOLBUILD_ROOT:?HOLBUILD_ROOT not set}/vendor/hol/REV"
+  if [[ -n "${HOLBUILD_TEST_HOL_REV:-}" ]]; then
+    printf '%s\n' "$HOLBUILD_TEST_HOL_REV"
+  else
+    tr -d '[:space:]' < "${HOLBUILD_ROOT:?HOLBUILD_ROOT not set}/vendor/hol/REV"
+  fi
 }
 
 write_schema2_prelude() {

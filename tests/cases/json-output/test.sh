@@ -257,17 +257,17 @@ rev = "$(holbuild_pinned_hol_rev)"
 name = "json-generator-failure"
 
 [build]
-members = []
+members = ["gen"]
 
 [[generate]]
 name = "bad-gen"
 command = ["python3", "-c", "import sys; print('generator boom'); sys.exit(7)"]
-outputs = ["gen/out.txt"]
+outputs = ["gen/BadScript.sml"]
 TOML
 
 gen_fail_stdout=$tmpdir/gen-fail.stdout
 gen_fail_stderr=$tmpdir/gen-fail.stderr
-if (cd "$gen_fail_project" && "$HOLBUILD_BIN" --json build) > "$gen_fail_stdout" 2> "$gen_fail_stderr"; then
+if (cd "$gen_fail_project" && "$HOLBUILD_BIN" --json build BadTheory) > "$gen_fail_stdout" 2> "$gen_fail_stderr"; then
   echo "expected json generator failure to fail" >&2
   exit 1
 fi
@@ -306,7 +306,7 @@ PY
 
 gen_retain_stdout=$tmpdir/gen-retain.stdout
 gen_retain_stderr=$tmpdir/gen-retain.stderr
-if (cd "$gen_fail_project" && "$HOLBUILD_BIN" --json build --retain-debug-artifacts) > "$gen_retain_stdout" 2> "$gen_retain_stderr"; then
+if (cd "$gen_fail_project" && "$HOLBUILD_BIN" --json build --retain-debug-artifacts BadTheory) > "$gen_retain_stdout" 2> "$gen_retain_stderr"; then
   echo "expected retained json generator failure to fail" >&2
   exit 1
 fi

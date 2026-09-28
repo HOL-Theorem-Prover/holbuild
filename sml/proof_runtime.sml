@@ -1031,6 +1031,7 @@ fun runtime_state_snapshot () =
    successful_branch_tail_counts = !successful_branch_tail_counts_ref,
    successful_count = !successful_step_count_ref,
    successful_end = !successful_prefix_end_ref,
+   successful_leaf_snapshots = !successful_leaf_snapshots_ref,
    events = !dynamic_events_ref,
    resume_events = !resume_events_ref,
    branch_tail_counts = !branch_tail_count_ref,
@@ -1039,7 +1040,7 @@ fun runtime_state_snapshot () =
 
 fun restore_runtime_state {history, current_path, successful_path, current_frames,
                            successful_frames, resume_frames, successful_branch_tail_counts, successful_count,
-                           successful_end, events, resume_events, branch_tail_counts,
+                           successful_end, successful_leaf_snapshots, events, resume_events, branch_tail_counts,
                            reverse_group_lengths, history_step_count} =
   (set_history history;
    current_path_ref := current_path;
@@ -1050,6 +1051,7 @@ fun restore_runtime_state {history, current_path, successful_path, current_frame
    successful_branch_tail_counts_ref := successful_branch_tail_counts;
    successful_step_count_ref := successful_count;
    successful_prefix_end_ref := successful_end;
+   successful_leaf_snapshots_ref := successful_leaf_snapshots;
    dynamic_events_ref := events;
    resume_events_ref := resume_events;
    branch_tail_count_ref := branch_tail_counts;
@@ -1514,6 +1516,37 @@ fun proof_ir_prove name end_path end_ok checkpoint_depth g original_tac tactic_t
             val _ = save_checkpoint "end_of_proof" false end_path end_ok checkpoint_depth
             val _ = drop_all()
           in th end
+  end
+
+fun termination_tactic name tactic_text plan original_tac g =
+  let
+    val depth = length (PolyML.SaveState.showHierarchy())
+    val _ = theorem_info_ref := SOME ("termination", name, tactic_text,
+                                      "", "", "", "", "", "", false, depth)
+    val _ = failed_step_end_ref := NONE
+    val _ = failed_step_span_ref := NONE
+    val _ = failed_plan_position_ref := NONE
+    val _ = failed_goal_state_printed_ref := false
+    fun execute () =
+      let
+        val _ = active_tactic_text_ref := tactic_text
+        val _ = active_plan_ref := SOME plan
+        val _ = trace_plan name plan
+        val _ = stop_after_plan_if_requested ()
+        val _ = init_history g (HolbuildProofIr.display_step_count plan + 1)
+        val _ = run_steps plan
+                handle e =>
+                  if !failed_goal_state_printed_ref then raise e
+                  else report_finish_failure name e
+        val th = history_top_thm g
+                 handle e => report_finish_failure name e
+        val _ = drop_all ()
+        val _ = theorem_info_ref := NONE
+      in
+        ([], fn [] => th | _ => raise Fail "termination tactic validation received theorems")
+      end
+  in
+    with_proof_ir_execution (fn () => with_theorem_trace name execute)
   end
 
 fun metadata_value key lines =

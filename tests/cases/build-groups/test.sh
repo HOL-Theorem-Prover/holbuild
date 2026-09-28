@@ -21,14 +21,6 @@ require_no_grep() {
   fi
 }
 
-require_no_file() {
-  local path=$1
-  if [[ -e "$path" ]]; then
-    echo "unexpected file exists: $path" >&2
-    exit 1
-  fi
-}
-
 write_manifest_prelude() {
   cat <<TOML
 [holbuild]

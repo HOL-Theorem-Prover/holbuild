@@ -20,7 +20,8 @@ type checkpoint = {kind : string, name : string, safe_name : string, theorem_sta
 type termination = {name : string, safe_name : string, definition_start : int,
                     definition_stop : int, boundary : int,
                     quote_start : int, quote_end : int, quote_text : string,
-                    tactic_start : int, tactic_end : int, tactic_text : string}
+                    tactic_start : int, tactic_end : int, tactic_text : string,
+                    proof_ir_plan : string option}
 
 type declaration_checkpoint = {name : string, safe_name : string,
                                definition_start : int, boundary : int,
@@ -141,6 +142,18 @@ fun begin_termination_line ({name, definition_start, quote_text, ...} : terminat
      Int.toString definition_start, " ",
      HolbuildToolchain.sml_string quote_text,
      ";\n"]
+
+fun termination_tactic_prefix ({name, tactic_text, proof_ir_plan, ...} : termination) =
+  case proof_ir_plan of
+      NONE => ""
+    | SOME plan =>
+        String.concat
+          ["(HolbuildProofRuntime.termination_tactic ",
+           HolbuildToolchain.sml_string name, " ",
+           HolbuildToolchain.sml_string tactic_text, " (", plan, ") ("]
+
+fun termination_tactic_suffix ({proof_ir_plan, ...} : termination) =
+  case proof_ir_plan of NONE => "" | SOME _ => "))"
 
 fun save_declaration_context_line ({safe_name, context_path, context_ok, ...} : declaration_checkpoint) =
   String.concat
@@ -291,8 +304,10 @@ fun instrument ({source, start_offset, checkpoints, declaration_checkpoints, ter
        plan_only_marker = plan_only_marker,
        new_ir = new_ir}
     fun prelude () =
-      runtime_prelude (runtime_config ()) active_checkpoints ^
-      declaration_checkpoint_runtime_prelude (if null active_checkpoints then active_declaration_checkpoints else []) ^
+      runtime_prelude (runtime_config ())
+        (if null active_checkpoints andalso null active_terminations then [] else [()]) ^
+      declaration_checkpoint_runtime_prelude
+        (if null active_checkpoints andalso null active_terminations then active_declaration_checkpoints else []) ^
       termination_runtime_prelude active_terminations
     fun loop pos events acc =
       case events of
@@ -314,11 +329,15 @@ fun instrument ({source, start_offset, checkpoints, declaration_checkpoints, ter
                 (save_declaration_context_line declaration_checkpoint ::
                  source_slice pos boundary ::
                  acc)
-        | TerminationEvent (termination as {definition_start, ...}) :: rest =>
+        | TerminationEvent (termination as {definition_start, tactic_start, tactic_end, ...}) :: rest =>
             if definition_start < pos then loop pos rest acc
             else
-              loop definition_start rest
-                (begin_termination_line termination ::
+              loop tactic_end rest
+                (termination_tactic_suffix termination ::
+                 source_slice tactic_start tactic_end ::
+                 termination_tactic_prefix termination ::
+                 source_slice definition_start tactic_start ::
+                 begin_termination_line termination ::
                  source_slice pos definition_start ::
                  acc)
   in

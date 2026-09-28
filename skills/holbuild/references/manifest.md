@@ -34,6 +34,9 @@ exclude = ["gen/fixtures/known-broken"]
 exclude_globs = ["gen/*ExperimentalScript.sml"]
 allow_empty = false              # optional; default false
 
+[build.theory_tactic_timeouts]
+"src/SlowScript.sml" = 30.0      # applies only to this theory; 0 disables
+
 [dependencies.depname]
 git = "https://github.com/org/dep"
 rev = "0123456789abcdef0123456789abcdef01234567"
@@ -43,7 +46,7 @@ from = "hol"
 path = "examples/Crypto/Keccak"
 manifest = "shims/keccak.toml"
 
-# [run] — prototype, not yet functional for consumers
+# [run] — run/repl build these load targets before starting HOL
 # heap = "build/main.heap"
 # loads = ["MyLib"]
 
@@ -209,5 +212,10 @@ val () = holbuild_extra_deps ["../data/table.txt"];
 ```
 
 Source-declared extra dependencies are staged so matching relative filesystem reads work during the action.
+
+Theory scripts can similarly declare deterministic fixed-file outputs with
+`holbuild_extra_outputs ["results/test.nsv"]`. These declarations are
+source-file-relative, must remain inside the package without `.`/`..` or glob
+syntax, and participate in up-to-date checking, caches, and target cleaning.
 
 Action policy names must resolve to sources in the package. An `[actions.FooTheory]` entry for a target that doesn't exist in the package is an error.

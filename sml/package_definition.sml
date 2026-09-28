@@ -14,6 +14,7 @@ datatype heap =
            kind : heap_kind}
 
 type root_tactic_timeout = {root : string, timeout : real option}
+type theory_tactic_timeout = {source : string, timeout : real option}
 
 datatype extra_input = ExtraInput of {path : string}
 
@@ -310,6 +311,20 @@ fun root_tactic_timeouts_from_manifest build =
                        timeout = tactic_timeout_value ("build.root_tactic_timeouts." ^ root) value})
                   entries
 
+fun theory_tactic_timeouts_from_manifest build =
+  case build of
+      NONE => []
+    | SOME t =>
+        case table_field t ["theory_tactic_timeouts"] of
+            NONE => []
+          | SOME entries =>
+              map (fn (source, value) =>
+                      {source = concrete_package_relative_path
+                                  "build.theory_tactic_timeouts" source,
+                       timeout = tactic_timeout_value
+                                   ("build.theory_tactic_timeouts." ^ source) value})
+                  entries
+
 fun glob_match pattern text =
   let
     val pn = size pattern
@@ -511,7 +526,8 @@ fun validate_manifest table =
    Option.app
      (require_known_fields "build"
        ["members", "exclude", "exclude_globs", "roots", "root_groups",
-        "groups", "tactic_timeout", "root_tactic_timeouts"])
+        "groups", "tactic_timeout", "root_tactic_timeouts",
+        "theory_tactic_timeouts"])
      (table_field table ["build"]);
    Option.app (require_known_fields "run" ["heap", "loads"])
      (table_field table ["run"]);
@@ -530,7 +546,8 @@ fun validate_manifest table =
 
 type parsed =
   {definition : t, compatibility : compatibility,
-   tactic_timeout : real option}
+   tactic_timeout : real option,
+   theory_tactic_timeouts : theory_tactic_timeout list}
 
 val parsed_manifest_count = ref 0
 fun manifest_parse_count () = !parsed_manifest_count
@@ -543,6 +560,8 @@ fun parse_table table : parsed =
     val {name, version} = parse_metadata table
     val {members, excludes, exclude_globs, roots, root_groups, groups,
          root_tactic_timeouts, tactic_timeout} = parse_build table
+    val theory_tactic_timeouts =
+      theory_tactic_timeouts_from_manifest (table_field table ["build"])
     val dependencies = parse_dependencies table
     val {run_heap, run_loads, heaps, generators} = parse_runtime table
     val action_policies = parse_action_policies table
@@ -558,7 +577,8 @@ fun parse_table table : parsed =
        generators = generators}
   in
     {definition = definition, compatibility = compatibility,
-     tactic_timeout = tactic_timeout}
+     tactic_timeout = tactic_timeout,
+     theory_tactic_timeouts = theory_tactic_timeouts}
   end
 
 fun bool_text value = if value then "true" else "false"

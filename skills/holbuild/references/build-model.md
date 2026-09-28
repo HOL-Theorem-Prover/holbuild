@@ -60,6 +60,8 @@ Proof engine/checkpoint/timeout/trace flags are intentionally not final artifact
 
 `extra_deps` are filesystem dependencies outside the normal HOL dependency graph. Manifest entries are package-root-relative; source annotations of the form `holbuild_extra_deps ["../data/table.txt"]` are source-file-relative. Entries may name files, directories, or simple globs. Expanded contents are hashed into the action key, and source-declared entries are staged so matching relative filesystem reads work during the action.
 
+Theory scripts can declare deterministic extra output files with `holbuild_extra_outputs ["results/test.nsv"]`. Paths are source-file-relative fixed paths inside the package; absolute paths, `.`/`..` components, directories, and globs are not supported. Declared files are required after execution, included in local up-to-date checks and action-cache blobs, restored by local/remote/HBX caches, and removed by `clean TARGET`. Cleaning does not force source regeneration because the next build may restore the file from cache.
+
 ## Up-to-date check
 
 A node is up-to-date when:
@@ -102,7 +104,7 @@ GC:
 
 ## Build root/dependency tactic timeout
 
-`--tactic-timeout` applies only to the **root package**. Dependency packages build with no tactic timeout. This prevents a consumer's proof-debug timeout from breaking dependency builds.
+`--tactic-timeout` applies only to the **root package**. Dependency packages build with no tactic timeout. This prevents a consumer's proof-debug timeout from breaking dependency builds. `[build.theory_tactic_timeouts]` may replace the manifest/default timeout for one concrete root-package theory without propagating to its dependencies or consumers; an explicit CLI timeout still wins.
 
 ## Project write lock
 

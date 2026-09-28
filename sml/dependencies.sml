@@ -11,10 +11,11 @@ type t =
   { loads : string list,
     uses : string list,
     extra_deps : string list,
+    extra_outputs : string list,
     holdep_mentions : string list }
 
-val cache_version = "holbuild-dependencies-cache-v2"
-val extractor_version = "holbuild-hol-analyser-deps-v2"
+val cache_version = "holbuild-dependencies-cache-v3"
+val extractor_version = "holbuild-hol-analyser-deps-v3"
 val analyser_path : string option ref = ref NONE
 
 fun set_analyser_path path = analyser_path := SOME path
@@ -171,25 +172,36 @@ fun extract_textual path =
     val loads = extract_string_args "load" tokens
     val uses = extract_string_args "use" tokens
     val extra_deps = extract_string_list_args "holbuild_extra_deps" tokens
+    val extra_outputs = extract_string_list_args "holbuild_extra_outputs" tokens
   in
     {loads = sort_unique loads, uses = sort_unique uses,
      extra_deps = sort_unique extra_deps,
+     extra_outputs = sort_unique extra_outputs,
      holdep_mentions = []}
   end
 
-fun empty_deps () = {loads = [], uses = [], extra_deps = [], holdep_mentions = []} : t
+fun empty_deps () =
+  {loads = [], uses = [], extra_deps = [], extra_outputs = [], holdep_mentions = []} : t
 
-fun add_response_field source_path_for_error field value ({loads, uses, extra_deps, holdep_mentions} : t) =
+fun add_response_field source_path_for_error field value
+      ({loads, uses, extra_deps, extra_outputs, holdep_mentions} : t) =
   case field of
-      "load" => {loads = value :: loads, uses = uses, extra_deps = extra_deps, holdep_mentions = holdep_mentions}
-    | "use" => {loads = loads, uses = value :: uses, extra_deps = extra_deps, holdep_mentions = holdep_mentions}
-    | "extra-dep" => {loads = loads, uses = uses, extra_deps = value :: extra_deps, holdep_mentions = holdep_mentions}
-    | "mention" => {loads = loads, uses = uses, extra_deps = extra_deps, holdep_mentions = value :: holdep_mentions}
+      "load" => {loads = value :: loads, uses = uses, extra_deps = extra_deps,
+                  extra_outputs = extra_outputs, holdep_mentions = holdep_mentions}
+    | "use" => {loads = loads, uses = value :: uses, extra_deps = extra_deps,
+                 extra_outputs = extra_outputs, holdep_mentions = holdep_mentions}
+    | "extra-dep" => {loads = loads, uses = uses, extra_deps = value :: extra_deps,
+                       extra_outputs = extra_outputs, holdep_mentions = holdep_mentions}
+    | "extra-output" => {loads = loads, uses = uses, extra_deps = extra_deps,
+                          extra_outputs = value :: extra_outputs, holdep_mentions = holdep_mentions}
+    | "mention" => {loads = loads, uses = uses, extra_deps = extra_deps,
+                     extra_outputs = extra_outputs, holdep_mentions = value :: holdep_mentions}
     | _ => raise Error ("bad analyser response field for " ^ source_path_for_error () ^ ": " ^ field)
 
-fun finish_deps ({loads, uses, extra_deps, holdep_mentions} : t) =
+fun finish_deps ({loads, uses, extra_deps, extra_outputs, holdep_mentions} : t) =
   {loads = sort_unique loads, uses = sort_unique uses,
    extra_deps = sort_unique extra_deps,
+   extra_outputs = sort_unique extra_outputs,
    holdep_mentions = sort_unique holdep_mentions}
 
 fun assoc id pairs =
@@ -327,6 +339,7 @@ fun read_cache cache_path source_hash =
             SOME {loads = values "load=" rest,
                   uses = values "use=" rest,
                   extra_deps = values "extra_dep=" rest,
+                  extra_outputs = values "extra_output=" rest,
                   holdep_mentions = values "mention=" rest}
           else NONE
       | _ => NONE
@@ -340,7 +353,7 @@ fun ensure_dir path =
 
 fun ensure_parent path = ensure_dir (Path.dir path)
 
-fun cache_text source_hash ({loads, uses, extra_deps, holdep_mentions} : t) =
+fun cache_text source_hash ({loads, uses, extra_deps, extra_outputs, holdep_mentions} : t) =
   String.concatWith "\n"
     ([cache_version,
       "extractor=" ^ extractor_version,
@@ -348,6 +361,7 @@ fun cache_text source_hash ({loads, uses, extra_deps, holdep_mentions} : t) =
      map (fn value => "load=" ^ value) loads @
      map (fn value => "use=" ^ value) uses @
      map (fn value => "extra_dep=" ^ value) extra_deps @
+     map (fn value => "extra_output=" ^ value) extra_outputs @
      map (fn value => "mention=" ^ value) holdep_mentions) ^ "\n"
 
 fun write_cache cache_path source_hash deps =
@@ -442,7 +456,7 @@ fun extract_global_cached source_path =
 
 fun extract path = extract_uncached path
 
-fun describe ({loads, uses, extra_deps, holdep_mentions} : t) =
+fun describe ({loads, uses, extra_deps, extra_outputs, holdep_mentions} : t) =
   let
     fun line label values =
       case values of
@@ -452,6 +466,7 @@ fun describe ({loads, uses, extra_deps, holdep_mentions} : t) =
     line "loads" loads;
     line "uses" uses;
     line "extra deps" extra_deps;
+    line "extra outputs" extra_outputs;
     line "Holdep mentions" holdep_mentions
   end
 

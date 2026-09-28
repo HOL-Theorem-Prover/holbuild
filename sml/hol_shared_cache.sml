@@ -11,7 +11,7 @@ val default_canonical_git = "https://github.com/HOL-Theorem-Prover/HOL.git"
 val standard_kernel = HolbuildHolToolchainConfig.StandardKernel
 
 fun toolchain_config kernel_variant = HolbuildHolToolchainConfig.config kernel_variant
-val analyser_format_version = "holbuild-hol-analyser-v1"
+val analyser_format_version = "holbuild-hol-analyser-v2"
 val analyser_protocol_version = "1"
 val analyser_source_files =
   ["../string_hash.sml",

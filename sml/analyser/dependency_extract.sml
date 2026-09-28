@@ -10,6 +10,7 @@ type t =
   { loads : string list,
     uses : string list,
     extra_deps : string list,
+    extra_outputs : string list,
     holdep_mentions : string list }
 
 fun has_suffix suffix s =
@@ -234,9 +235,11 @@ fun extract path =
     val loads = extract_string_args "load" tokens
     val uses = extract_string_args "use" tokens
     val extra_deps = extract_string_list_args "holbuild_extra_deps" tokens
+    val extra_outputs = extract_string_list_args "holbuild_extra_outputs" tokens
   in
     {loads = sort_unique loads, uses = sort_unique uses,
      extra_deps = sort_unique extra_deps,
+     extra_outputs = sort_unique extra_outputs,
      holdep_mentions = sort_unique (holdep_mentions path @ header_libs text)}
   end
 

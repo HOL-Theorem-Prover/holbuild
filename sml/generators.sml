@@ -337,17 +337,41 @@ fun topo_sort generators =
     loop (Binaryset.empty String.compare) [] 0 initial_indegrees (ready_names (), [])
   end
 
-fun run_package package =
+fun selected_generator_names generators requested =
+  let
+    fun add (name, selected) =
+      if List.exists (fn existing => existing = name) selected then selected
+      else
+        case generator_named generators name of
+            NONE => die ("unknown generator " ^ name)
+          | SOME generator =>
+              List.foldl add (name :: selected) (HolbuildProject.generator_deps generator)
+  in
+    List.foldl add [] requested
+  end
+
+fun run_selected package requested =
   let val generators = HolbuildProject.package_generators package
   in
-    if null generators then ()
+    if null requested then ()
     else
       let
+        val selected = selected_generator_names generators requested
         val ordered = topo_sort generators
-        fun run (generator, dep_results) = run_one package dep_results generator :: dep_results
+        fun wanted generator =
+          List.exists (fn name => name = HolbuildProject.generator_name generator) selected
+        fun run (generator, dep_results) =
+          if wanted generator then run_one package dep_results generator :: dep_results
+          else dep_results
       in
         ignore (List.foldl run [] ordered)
       end
   end
+
+fun validate_package package = ignore (topo_sort (HolbuildProject.package_generators package))
+
+fun run_package package =
+  run_selected package
+    (map HolbuildProject.generator_name (HolbuildProject.package_generators package))
 
 end

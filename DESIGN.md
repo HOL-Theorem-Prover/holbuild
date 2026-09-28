@@ -327,6 +327,17 @@ entries are package-root-relative; source files may also declare source-file-rel
 extra dependencies with static literal `holbuild_extra_deps [...]` annotations.
 Entries may name files, directories, or simple globs, and source-declared entries
 are staged so matching relative filesystem reads work during the action.
+Theory-script sources may declare deterministic, source-file-relative fixed
+output files with static literal `holbuild_extra_outputs [...]` annotations.
+These paths are part of the action identity and owned output set: successful
+execution must produce them, local up-to-date checks require them, action caches
+publish and restore them as named blobs, and target cleaning removes them. A
+lazy registry under `.holbuild/extra-outputs` records path claims and each
+materialized action's last output set. It prevents separately requested actions
+from overwriting one another and lets cleaning or a changed declaration remove
+previously owned files without eagerly analysing unrelated sources.
+Absolute paths, `.`/`..` components, directories, and globs are deliberately not
+part of the initial contract.
 `cache = false` disables global-cache restore/publish for the action.
 `always_reexecute = true` disables local up-to-date skipping and any retained/debug
 checkpoint replay for the action. `impure = true`
@@ -634,20 +645,30 @@ primitive. `buildheap` snapshots a process after loading a closure of `.uo`
 modules, and holbuild uses it only for explicit exported heap/executable
 artifacts after the relevant logical targets have already been built.
 
-The relevant checkpointing model is the `Holmake --dumpheap` design: while a
-theory script executes, the prover/runtime saves PolyML states at syntactic
-boundaries such as:
+The relevant checkpointing model is the `Holmake --dumpheap` design: while
+building a theory, the prover/runtime saves PolyML states at boundaries such as:
 
 ```text
 deps_loaded.save         after resolved ancestors are loaded in topological order
 <thm>_context.save       after the theorem has been stored in the theory context
 <thm>_end_of_proof.save  after goal-fragment proof replay, for navigation
-final_context.save       after the script is successor-ready
+final_context.save       after a clean consumer process loads the generated theory
 ```
 
 `final_context.save` must mean successor-ready, not merely immediately after
-`export_theory()`. The generated `FooTheory.sig/sml` module must be loaded before
-saving so dependents can open/use `FooTheory` when starting from the checkpoint.
+`export_theory()`. Current HOL versions seal a theory when it is exported, so a
+single session cannot safely export and then re-incorporate the generated theory
+module. The source child therefore records generated load metadata, exports, and
+exits. Holbuild constructs complete stage load manifests from that metadata, then
+a separate child starts from the pre-theory dependency context (or the toolchain
+base state as a fallback), loads `FooTheory`, and saves `final_context.save`.
+This also ensures that the final context reflects the published consumer view,
+not arbitrary top-level SML bindings retained from the theory script.
+
+When checkpoints are disabled there is no persistent state that needs this
+second load, so source execution stops after export. Generated modules are loaded
+normally by dependent actions or explicit HOL consumers through their published
+manifests rather than being eagerly reloaded in a disposable source process.
 
 Those checkpoints answer a different question from action keys:
 
@@ -747,7 +768,8 @@ For instrumented root-package actions, holbuild may create several local
 checkpoint classes while executing a theory action: `deps_loaded` after loading resolved dependencies,
 theorem context/end-of-proof states for modern AST `Theorem ... Proof ... QED`
 declarations, failed-prefix proof-navigation state after instrumented proof
-failures, and a final post-export context. Successful builds remove stale
+failures, and a final context created by loading the exported theory in a clean
+consumer child. Successful builds remove stale
 failed-prefix checkpoints for the rebuilt source but retain reusable dependency
 and theorem checkpoints for proof-edit resume until they are replaced or evicted.
 The project-local checkpoint budget defaults to 5 GiB and can be configured with
@@ -771,10 +793,11 @@ credits a family after its artifact roots have actually disappeared.
 `--skip-checkpoints` disables all `.save`/`.ok` creation while still running
 modern theorem proofs through the selected instrumentation runtime. `--skip-proof-steps`
 opts out of theorem instrumentation: with checkpoints still enabled, the build can
-still save and consult `deps_loaded` and save the final context, but there are no
-theorem-context/end-of-proof/failed-prefix proof-navigation checkpoints and no tactic
-timeout enforcement for that build. The final context is currently a transient
-debug/successor breadcrumb, not a downstream canonical load context.
+still save and consult `deps_loaded` and save the final context in the separate
+consumer child, but there are no theorem-context/end-of-proof/failed-prefix
+proof-navigation checkpoints and no tactic timeout enforcement for that build.
+The final context is currently a transient debug/successor breadcrumb, not a
+downstream canonical load context.
 
 Current HOL versions also generate per-theory HTML documentation during
 `export_theory()` by default. Holbuild disables both historical spellings of that

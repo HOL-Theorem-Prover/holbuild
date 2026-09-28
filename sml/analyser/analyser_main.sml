@@ -55,10 +55,11 @@ fun parse_request path =
     loop lines NONE [] []
   end
 
-fun emit_deps ({loads, uses, extra_deps, holdep_mentions} : D.t) =
+fun emit_deps ({loads, uses, extra_deps, extra_outputs, holdep_mentions} : D.t) =
   map (fn x => P.join ["load", x]) loads @
   map (fn x => P.join ["use", x]) uses @
   map (fn x => P.join ["extra-dep", x]) extra_deps @
+  map (fn x => P.join ["extra-output", x]) extra_outputs @
   map (fn x => P.join ["mention", x]) holdep_mentions
 
 fun read_all_file path =

@@ -14,7 +14,14 @@ HOLBUILD_TEST_JOBS=${HOLBUILD_TEST_JOBS:-$(default_test_jobs)}
 export HOLBUILD_ROOT="$ROOT"
 export HOLBUILD_TEST_GLOBAL_CACHE="${HOLBUILD_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/holbuild}"
 
-pinned_hol_rev=$(tr -d '[:space:]' < "$ROOT/vendor/hol/REV")
+vendor_hol_rev=$(tr -d '[:space:]' < "$ROOT/vendor/hol/REV")
+test_hol_rev=${HOLBUILD_TEST_HOL_REV:-$vendor_hol_rev}
+test_hol_rev=$(printf '%s' "$test_hol_rev" | tr '[:upper:]' '[:lower:]')
+if [[ ! "$test_hol_rev" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "HOLBUILD_TEST_HOL_REV must be a full 40-character Git commit" >&2
+  exit 2
+fi
+export HOLBUILD_TEST_HOL_REV="$test_hol_rev"
 
 write_toolchain_manifest() {
   local manifest=$1
@@ -26,7 +33,7 @@ minimum_version = "0.10.0"
 
 [dependencies.hol]
 git = "$hol_git"
-rev = "$pinned_hol_rev"
+rev = "$test_hol_rev"
 
 [project]
 name = "holbuild-test-toolchain"
@@ -61,8 +68,8 @@ resolve_holdir() {
 
 HOLDIR=$(resolve_holdir)
 holdir_rev=$(git -C "$HOLDIR" rev-parse HEAD)
-if [[ "$holdir_rev" != "$pinned_hol_rev" ]]; then
-  echo "HOLDIR rev $holdir_rev does not match vendor/hol/REV $pinned_hol_rev" >&2
+if [[ "$holdir_rev" != "$test_hol_rev" ]]; then
+  echo "HOLDIR rev $holdir_rev does not match selected test HOL rev $test_hol_rev" >&2
   exit 2
 fi
 
@@ -121,7 +128,7 @@ count_lines() {
 }
 
 suite_start_ms=$(now_ms)
-echo "running holbuild tests with HOLBUILD_TEST_JOBS=$HOLBUILD_TEST_JOBS"
+echo "running holbuild tests with HOLBUILD_TEST_JOBS=$HOLBUILD_TEST_JOBS HOLBUILD_TEST_HOL_REV=$test_hol_rev"
 
 write_holbuild_wrapper() {
   local wrapper=$1

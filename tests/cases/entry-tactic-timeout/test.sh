@@ -222,10 +222,11 @@ TOML
 cat > "$unreached_project/src/RootScript.sml" <<'SML'
 open HolKernel Parse boolLib bossLib;
 val _ = new_theory "Root";
-Theorem root_fast:
+fun slow_tac g = (OS.Process.sleep (Time.fromReal 0.45); ACCEPT_TAC TRUTH g);
+Theorem root_slow:
   T
 Proof
-  ACCEPT_TAC TRUTH
+  slow_tac
 QED
 val _ = export_theory();
 SML
@@ -268,6 +269,7 @@ if (cd "$unreached_project" && "$HOLBUILD_BIN" build OrphanUserTheory) > "$tmpdi
 fi
 require_grep "tactic timed out after 0.1s while building OrphanDepTheory: slow_tac" "$tmpdir/orphan-user.log"
 
+# A root timeout above the package default is not capped by that default.
 (cd "$unreached_project" && "$HOLBUILD_BIN" build RootTheory) > "$tmpdir/root.log" 2>&1
 require_file "$unreached_project/.holbuild/obj/src/RootTheory.dat"
 

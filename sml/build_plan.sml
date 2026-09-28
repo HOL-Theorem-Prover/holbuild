@@ -70,6 +70,70 @@ fun unique_strings values = rev (List.foldl add_unique [] values)
 
 fun normalize_path path = Path.mkCanonical path handle Path.InvalidArc => path
 
+fun path_components path = String.tokens (fn c => c = #"/" orelse c = #"\\") path
+fun path_has_suffix suffix path =
+  size path >= size suffix andalso
+  String.substring(path, size path - size suffix, size suffix) = suffix
+fun has_glob_char path =
+  CharVector.exists (fn c => c = #"*" orelse c = #"?" orelse c = #"[" orelse c = #"]") path
+
+fun validate_extra_output_decl node path =
+  let
+    val source = source_of node
+    val context = "holbuild_extra_outputs in " ^ #source_path source
+    val components = path_components path
+    val invalid_component =
+      List.exists (fn component => component = "." orelse component = "..") components
+  in
+    if path = "" then raise Error (context ^ " contains an empty path")
+    else if Path.isAbsolute path then
+      raise Error (context ^ " path must be relative to the declaring source: " ^ path)
+    else if invalid_component then
+      raise Error (context ^ " path must not contain . or .. components: " ^ path)
+    else if path_has_suffix "/" path orelse path_has_suffix "\\" path then
+      raise Error (context ^ " path must name a file, not a directory: " ^ path)
+    else if has_glob_char path then
+      raise Error (context ^ " path must be a fixed file path, not a glob: " ^ path)
+    else if List.null components then
+      raise Error (context ^ " contains an invalid path: " ^ path)
+    else
+      case #kind source of
+          HolbuildSourceIndex.TheoryScript => ()
+        | _ => raise Error (context ^ " is only supported for theory-script actions")
+  end
+
+fun extra_output_path node declaration =
+  normalize_path (Path.concat(Path.dir (#source_path (source_of node)), declaration))
+
+fun validate_extra_output_ownership analysis selected =
+  let
+    fun outputs node =
+      let
+        val declarations = #extra_outputs (deps_of analysis node)
+        val _ = List.app (validate_extra_output_decl node) declarations
+        fun output declaration =
+          let val path = extra_output_path node declaration
+          in
+            if (FS.isDir path handle OS.SysErr _ => false) then
+              raise Error ("holbuild_extra_outputs path is a directory: " ^ path)
+            else (path, node)
+          end
+      in
+        map output declarations
+      end
+    fun insert ((path, owner), owners) =
+      case Binarymap.peek(owners, path) of
+          NONE => Binarymap.insert(owners, path, owner)
+        | SOME existing =>
+            if key existing = key owner then owners
+            else raise Error ("extra output has multiple owners: " ^ path ^ " (" ^
+                              logical_name existing ^ " and " ^ logical_name owner ^ ")")
+    val _ = List.foldl insert (Binarymap.mkDict String.compare)
+              (List.concat (map outputs selected))
+  in
+    ()
+  end
+
 fun has_logical_name name node = logical_name node = name
 
 fun nodes_named nodes name = List.filter (has_logical_name name) nodes
@@ -518,14 +582,7 @@ fun bootstrap_reachable_frontier components analysis lookup nodes roots =
 fun canonical_frame text = Int.toString (size text) ^ ":" ^ text
 fun canonical_fields values = String.concat (map canonical_frame values)
 fun canonical_list tag values = [tag, Int.toString (length values)] @ values
-fun canonical_insert value values =
-  case values of
-      [] => [value]
-    | existing :: rest =>
-        if String.compare(value, existing) = LESS then value :: values
-        else existing :: canonical_insert value rest
-fun canonical_sort values =
-  List.foldl (fn (value, sorted) => canonical_insert value sorted) [] values
+fun canonical_sort values = sort_pairs String.compare values
 
 fun dependency_reason_text ExtractedLoad = "extracted-load"
   | dependency_reason_text ExtractedHoldepMention = "holdep-mention"
@@ -646,48 +703,61 @@ fun bound_node_id node =
       ["holbuild-resolved-node-v1", package node,
        HolbuildSourceIndex.source_id (source_of node)])
 
-fun canonical_node_for nodes node_key =
-  case node_with_key nodes node_key of
-      SOME node => bound_node_id node
-    | NONE => raise Error ("internal canonical dependency node is missing: " ^ node_key)
+type canonical_node_index =
+  {key_index : key_index, bound_ids : string Vector.vector}
 
-fun symbolic_text nodes (SymbolicDependency {from_node, name, reason}) =
+fun build_canonical_node_index nodes : canonical_node_index =
+  {key_index = build_key_index nodes,
+   bound_ids = Vector.fromList (map bound_node_id nodes)}
+
+fun canonical_node_for
+      ({key_index, bound_ids} : canonical_node_index) node_key =
+  Vector.sub(bound_ids, indexed_key_id key_index node_key)
+
+fun canonical_node_ids ({bound_ids, ...} : canonical_node_index) =
+  Vector.foldr (op ::) [] bound_ids
+
+fun symbolic_text index (SymbolicDependency {from_node, name, reason}) =
   canonical_fields
-    [canonical_node_for nodes from_node, dependency_reason_text reason, name]
+    [canonical_node_for index from_node, dependency_reason_text reason, name]
 
-fun resolved_edge_text nodes
+fun resolved_edge_text index
       ({from_node, to_node, symbolic_name, reason} : resolved_dependency_edge) =
   canonical_fields
-    [canonical_node_for nodes from_node, canonical_node_for nodes to_node,
+    [canonical_node_for index from_node, canonical_node_for index to_node,
      dependency_reason_text reason, symbolic_name]
 
-fun external_edge_text nodes
+fun external_edge_text index
       ({from_node, name, kind, reason} : external_dependency) =
   canonical_fields
-    [canonical_node_for nodes from_node,
+    [canonical_node_for index from_node,
      case kind of ExternalTheory => "theory" | ExternalLibrary => "library" |
                   ExternalInput => "input",
      dependency_reason_text reason, name]
 
-fun unresolved_edge_text nodes
+fun unresolved_edge_text index
       ({from_node, name, reason} : unresolved_dependency) =
   canonical_fields
-    [canonical_node_for nodes from_node, dependency_reason_text reason, name]
+    [canonical_node_for index from_node, dependency_reason_text reason, name]
 
 fun selected_graph_text nodes (graph : resolved_dependency_graph) =
-  canonical_fields
-    (["holbuild-selected-dependency-graph-v1"] @
-     canonical_list "nodes" (canonical_sort (map bound_node_id nodes)) @
-     canonical_list "symbolic"
-       (canonical_sort (map (symbolic_text nodes) (vector_values (#symbolic graph)))) @
-     canonical_list "resolved"
-       (canonical_sort (map (resolved_edge_text nodes) (vector_values (#resolved graph)))) @
-     canonical_list "external"
-       (canonical_sort (map (external_edge_text nodes) (vector_values (#external graph)))) @
-     canonical_list "unresolved"
-       (canonical_sort (map (unresolved_edge_text nodes) (vector_values (#unresolved graph)))) @
-     canonical_list "reverse"
-       (canonical_sort (map (resolved_edge_text nodes) (vector_values (#reverse graph)))))
+  let
+    val index = build_canonical_node_index nodes
+  in
+    canonical_fields
+      (["holbuild-selected-dependency-graph-v1"] @
+       canonical_list "nodes" (canonical_sort (canonical_node_ids index)) @
+       canonical_list "symbolic"
+         (canonical_sort (map (symbolic_text index) (vector_values (#symbolic graph)))) @
+       canonical_list "resolved"
+         (canonical_sort (map (resolved_edge_text index) (vector_values (#resolved graph)))) @
+       canonical_list "external"
+         (canonical_sort (map (external_edge_text index) (vector_values (#external graph)))) @
+       canonical_list "unresolved"
+         (canonical_sort (map (unresolved_edge_text index) (vector_values (#unresolved graph)))) @
+       canonical_list "reverse"
+         (canonical_sort (map (resolved_edge_text index) (vector_values (#reverse graph)))))
+  end
 
 fun selected_graph_identity nodes graph =
   HolbuildHash.string_sha256 (selected_graph_text nodes graph)
@@ -766,7 +836,7 @@ fun plan_selection components holdir sources selection =
     val _ = if holdir = "" then HolbuildDependencies.clear_analyser_path ()
             else HolbuildDependencies.set_analyser_path (HolbuildHolSharedCache.analyser_path_for_holdir holdir)
     val external_dirs = [normalize_path (Path.concat(holdir, "sigobj"))]
-    val analysis = HolbuildComponentProvider.new_analysis_state provider
+    val analysis = HolbuildComponentProvider.new_analysis_state components
     val nodes = map (make_node external_dirs) sources
     val index = build_name_index nodes
     val lookup = indexed_nodes_named index
@@ -792,6 +862,7 @@ fun plan_selection components holdir sources selection =
     val _ = write_test_dependency_graph selected_graph_id selected_plan_id resolved_plan_id dependency_graph
     val _ = reject_graph_unresolved dependency_graph selected
     val _ = reject_source_uses analysis selected
+    val _ = validate_extra_output_ownership analysis selected
     val universe_key_index = build_key_index nodes
     val universe_node_index = Vector.fromList nodes
     val dependency_closure_cache =
@@ -1187,12 +1258,26 @@ fun action_text_with plan config_lines_for_node toolchain_key external_key keys 
     val declared_dep_lines = map (fn dep => "declared_dep=" ^ dep) declared_deps
     val declared_load_lines = map (fn dep => "declared_load=" ^ dep) declared_loads
     val extra_inputs = HolbuildProject.action_extra_inputs policy
+    val _ =
+      List.app
+        (fn input => HolbuildComponentProvider.ensure_extra_input analysis source
+          (#package_root source) (HolbuildProject.extra_input_path input))
+        extra_inputs
+    val source_extra_deps = #extra_deps (deps_of analysis node)
+    val _ =
+      List.app
+        (HolbuildComponentProvider.ensure_extra_input analysis source
+          (Path.dir (#source_path source)))
+        source_extra_deps
     val manifest_extra_dep_lines =
       List.concat (map (fn input =>
         extra_dep_lines "extra_dep" (#package_root source)
           [HolbuildProject.extra_input_path input]) extra_inputs)
     val source_extra_dep_lines =
-      extra_dep_lines "source_extra_dep" (Path.dir (#source_path source)) (#extra_deps (deps_of analysis node))
+      extra_dep_lines "source_extra_dep" (Path.dir (#source_path source)) source_extra_deps
+    val source_extra_output_lines =
+      map (fn output => "source_extra_output=" ^ output)
+          (#extra_outputs (deps_of analysis node))
     val lines =
       ["holbuild-action-v1",
        "toolchain=" ^ toolchain_key,
@@ -1208,6 +1293,7 @@ fun action_text_with plan config_lines_for_node toolchain_key external_key keys 
       declared_load_lines @
       manifest_extra_dep_lines @
       source_extra_dep_lines @
+      source_extra_output_lines @
       map (fn dep => "dep=" ^ dep) (project_deps @ external_deps @ external_libs)
   in
     String.concatWith "\n" lines ^ "\n"

@@ -71,17 +71,108 @@ fun add_unreached_timeout project timeout (node, acc) =
   then acc @ [(HolbuildBuildPlan.key node, timeout)]
   else acc
 
+fun closure_timeouts project index entry_plan default_timeout =
+  List.foldl
+    (fn ((root, logical), acc) => add_entry_timeout project entry_plan (logical, entry_timeout project default_timeout root) acc)
+    []
+    (declared_entries project index)
+
 (* Root-package scripts in the build plan that no declared entry point reaches
    fall back to the package default timeout. *)
 fun entry_timeouts project index entry_plan plan default_timeout =
+  List.foldl (add_unreached_timeout project default_timeout)
+    (closure_timeouts project index entry_plan default_timeout)
+    (HolbuildBuildPlan.selected_nodes plan)
+
+fun selected_node_for_source project plan source =
   let
-    val reached =
-      List.foldl
-        (fn ((root, logical), acc) => add_entry_timeout project entry_plan (logical, entry_timeout project default_timeout root) acc)
-        []
-        (declared_entries project index)
+    val package = root_package_name project
+    val path = #relative_path (source : HolbuildSourceIndex.source)
   in
-    List.foldl (add_unreached_timeout project default_timeout) reached (HolbuildBuildPlan.selected_nodes plan)
+    List.find
+      (fn node =>
+          HolbuildBuildPlan.package node = package andalso
+          #relative_path (HolbuildBuildPlan.source_of node) = path)
+      (HolbuildBuildPlan.selected_nodes plan)
+  end
+
+fun theory_timeouts project index plan =
+  let
+    val package = root_package_name project
+    fun source_for path =
+      case List.filter
+             (fn (source : HolbuildSourceIndex.source) =>
+                 #package source = package andalso #relative_path source = path)
+             index of
+          [] => raise HolbuildProject.Error
+                  ("build.theory_tactic_timeouts references unknown source: " ^ path)
+        | [source] =>
+            if #kind source = HolbuildSourceIndex.TheoryScript then source
+            else raise HolbuildProject.Error
+                   ("build.theory_tactic_timeouts references a non-theory source: " ^ path)
+        | _ => raise HolbuildProject.Error
+                 ("build.theory_tactic_timeouts references an ambiguous source: " ^ path)
+    fun one ({source = path, timeout}, acc) =
+      case selected_node_for_source project plan (source_for path) of
+          NONE => acc
+        | SOME node => (HolbuildBuildPlan.key node, timeout) :: acc
+  in
+    List.foldl one [] (HolbuildProject.theory_tactic_timeouts project)
+  end
+
+fun replace_timeouts base overrides =
+  let
+    fun replace ((node_key, timeout), entries) =
+      let
+        fun insert values =
+          case values of
+              [] => [(node_key, timeout)]
+            | (key, old_timeout) :: rest =>
+                if key = node_key then (key, timeout) :: rest
+                else (key, old_timeout) :: insert rest
+      in
+        insert entries
+      end
+  in
+    List.foldl replace base overrides
+  end
+
+fun combine_timeouts left right =
+  let
+    fun add ((node_key, timeout), entries) =
+      let
+        fun insert values =
+          case values of
+              [] => [(node_key, timeout)]
+            | (key, old_timeout) :: rest =>
+                if key = node_key then
+                  (key, timeout_min (old_timeout, timeout)) :: rest
+                else (key, old_timeout) :: insert rest
+      in
+        insert entries
+      end
+  in
+    List.foldl add left right
+  end
+
+fun explicit_entries project index =
+  List.filter
+    (fn (root, _) => Option.isSome (HolbuildProject.root_tactic_timeout_for project root))
+    (declared_entries project index)
+
+(* Manifest timeout policy for a build plan. Entry points selected by the plan
+   and unreached scripts use the plan itself; roots with explicit timeouts also
+   constrain shared dependencies through [explicit_plan] even when unselected.
+   Theory-local timeouts then replace the result for exactly their scripts. *)
+fun manifest_timeouts project index explicit_plan plan default_timeout =
+  let
+    val selected = entry_timeouts project index plan plan default_timeout
+    val explicit =
+      case explicit_plan of
+          NONE => []
+        | SOME entry_plan => closure_timeouts project index entry_plan default_timeout
+  in
+    replace_timeouts (combine_timeouts selected explicit) (theory_timeouts project index plan)
   end
 
 end

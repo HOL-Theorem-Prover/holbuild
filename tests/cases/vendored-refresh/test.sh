@@ -29,6 +29,7 @@ SML
 git -C "$source_checkout" init -q
 git -C "$source_checkout" config user.email test@example.invalid
 git -C "$source_checkout" config user.name test
+git -C "$source_checkout" config commit.gpgsign false
 git -C "$source_checkout" add .
 git -C "$source_checkout" commit -qm fixture
 rev=$(git -C "$source_checkout" rev-parse HEAD)

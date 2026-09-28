@@ -52,7 +52,7 @@ while [ "$#" -gt 0 ]; do
       shift 2
       ;;
     --version)
-      printf 'holbuild-hol-analyser holbuild-hol-analyser-v1\n'
+      printf 'holbuild-hol-analyser holbuild-hol-analyser-v2\n'
       exit 0
       ;;
     *)

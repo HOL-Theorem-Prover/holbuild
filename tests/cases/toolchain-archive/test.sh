@@ -130,7 +130,7 @@ cat > "$out" <<'ANALYSER'
 #!/usr/bin/env sh
 set -eu
 if [ "${1:-}" = --version ]; then
-  printf 'holbuild-hol-analyser holbuild-hol-analyser-v1\n'
+  printf 'holbuild-hol-analyser holbuild-hol-analyser-v2\n'
   exit 0
 fi
 response=
@@ -225,7 +225,7 @@ printf 'val x = true\n' > "$tmpdir/TinyScript.sml"
 require_file "$tmpdir/TinyTheory.uo"
 analyser_dirs=("$(dirname "$restored_holdir")"/analysers/*)
 "${analyser_dirs[0]}/bin/holbuild-hol-analyser" --version > "$tmpdir/analyser-version"
-require_grep '^holbuild-hol-analyser holbuild-hol-analyser-v1$' "$tmpdir/analyser-version"
+require_grep '^holbuild-hol-analyser holbuild-hol-analyser-v2$' "$tmpdir/analyser-version"
 require_grep '^GET /cas/' "$request_log"
 [[ $(grep -c '^PUT ' "$request_log") -eq "$published_put_count" ]]
 

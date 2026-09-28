@@ -585,7 +585,35 @@ fun child_failure_summary path =
   end
   handle _ => NONE
 
-fun summarize_failed_fragment_source source_path source_text checkpoints path =
+fun failed_termination_source_summary source_path source_text terminations label name failed_span failed_end =
+  case List.find (fn (termination : HolbuildTheoryCheckpoints.termination) => #name termination = name) terminations of
+      NONE => NONE
+    | SOME termination =>
+        let
+          val tactic_size = size (#tactic_text termination)
+          fun bounded n = Int.max(0, Int.min(tactic_size, n))
+          val (relative, width) =
+            case failed_span of
+                SOME (start_pos, end_pos) =>
+                  let val start = bounded start_pos
+                      val stop = bounded end_pos
+                  in (start, Int.max(1, stop - start)) end
+              | NONE =>
+                  (case failed_end of
+                       SOME end_pos => (Int.max(0, bounded end_pos - 1), 1)
+                     | NONE => (0, 1))
+          val offset = #tactic_start termination + relative
+          val end_offset = Int.min(#tactic_end termination, offset + width)
+        in
+          SOME (String.concat
+            ["termination: ", #name termination, " (line ",
+             Int.toString (line_number_at source_text (#definition_start termination)), ")\n",
+             "proof: line ", Int.toString (line_number_at source_text (#tactic_start termination)), "\n",
+             "fragment: ", label, "\n",
+             source_span_text source_path source_text offset (Int.max(offset + 1, end_offset))])
+        end
+
+fun summarize_failed_fragment_source source_path source_text checkpoints terminations path =
   let
     val lines = String.fields (fn c => c = #"\n") (read_text path)
     val label = find_failed_fragment_label lines
@@ -594,7 +622,9 @@ fun summarize_failed_fragment_source source_path source_text checkpoints path =
   in
     case (label, find_failed_theorem_name lines) of
         (SOME label', SOME theorem_name) =>
-          failed_theorem_source_summary source_path source_text checkpoints label' theorem_name failed_span failed_end
+          (case failed_theorem_source_summary source_path source_text checkpoints label' theorem_name failed_span failed_end of
+               SOME summary => SOME summary
+             | NONE => failed_termination_source_summary source_path source_text terminations label' theorem_name failed_span failed_end)
       | _ => NONE
   end
   handle _ => NONE
