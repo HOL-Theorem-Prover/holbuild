@@ -8,7 +8,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
-cleanup() { rm -rf "$tmpdir"; }
+cleanup() { cleanup_temp_dir "$tmpdir"; }
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
@@ -79,6 +79,23 @@ Theorem select_goals_keep:
   T /\ T
 Proof
   CONJ_TAC >>~ [`T`] >> ACCEPT_TAC TRUTH
+QED
+
+Theorem select_goal_skips_nonmatch:
+  (F ==> F) /\ T
+Proof
+  CONJ_TAC
+  >~ [`T`]
+  >- ACCEPT_TAC TRUTH
+  >- (DISCH_TAC >> FIRST_ASSUM ACCEPT_TAC)
+QED
+
+Theorem select_goals_exact_matches:
+  (F ==> F) /\ T /\ T
+Proof
+  rpt CONJ_TAC
+  >>~- ([`T`], ACCEPT_TAC TRUTH)
+  >> DISCH_TAC >> FIRST_ASSUM ACCEPT_TAC
 QED
 
 Theorem no_lt_orelse:
@@ -154,6 +171,10 @@ fi
 require_grep 'select matching-first \[`T`\] keep' "$tmpdir/select_goal_keep.plan.out"
 (cd "$runtime_project" && "$HOLBUILD_BIN" execution-plan ATheory:select_goals_keep) > "$tmpdir/select_goals_keep.plan.out" 2>&1
 require_grep 'select matching-all \[`T`\] keep' "$tmpdir/select_goals_keep.plan.out"
+(cd "$runtime_project" && "$HOLBUILD_BIN" execution-plan ATheory:select_goal_skips_nonmatch) > "$tmpdir/select_goal_skips_nonmatch.plan.out" 2>&1
+require_grep 'select matching-first \[`T`\] keep' "$tmpdir/select_goal_skips_nonmatch.plan.out"
+(cd "$runtime_project" && "$HOLBUILD_BIN" execution-plan ATheory:select_goals_exact_matches) > "$tmpdir/select_goals_exact_matches.plan.out" 2>&1
+require_grep 'select matching-all \[`T`\] solve' "$tmpdir/select_goals_exact_matches.plan.out"
 (cd "$runtime_project" && "$HOLBUILD_BIN" execution-plan ATheory:chained_then1_plain) > "$tmpdir/chained_then1.plan.out" 2>&1
 require_grep 'rpt CONJ_TAC' "$tmpdir/chained_then1.plan.out"
 

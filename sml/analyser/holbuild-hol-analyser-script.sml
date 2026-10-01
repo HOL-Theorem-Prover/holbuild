@@ -71,6 +71,23 @@ use_root "sml/hash.sml";
 use_root "sml/proof_ir_types.sml";
 use_root "sml/proof_ir.sml";
 
+(* ProofStepPlan is an upstream extension under development.  Load the shared
+   adapter when the selected project HOL provides it, while retaining the old
+   planner for earlier HOL revisions. *)
+val have_shared_proof_step_plan =
+  ((Meta.loadPlan quiet_holsource_use "ProofStepPlan"; true)
+   handle _ => false);
+val _ =
+  if OS.Process.getEnv "HOLBUILD_REQUIRE_SHARED_PROOF_STEP_PLAN" = SOME "1" andalso
+     not have_shared_proof_step_plan then
+    raise Fail "selected HOL does not provide ProofStepPlan"
+  else ();
+val _ =
+  if have_shared_proof_step_plan then
+    use_src "proof_step_plan_adapter_shared.sml"
+  else
+    use_src "proof_step_plan_adapter_legacy.sml";
+
 use_src "analysis_protocol.sml";
 use_src "dependency_extract.sml";
 use_src "theory_span_extract.sml";
