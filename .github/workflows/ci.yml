@@ -85,3 +85,64 @@ jobs:
           TMPDIR: ${{ runner.temp }}
           HOLBUILD_TEST_JOBS: ${{ inputs.test-jobs || '4' }}
         run: make HOLDIR="$HOLDIR" test
+
+  legacy-tactics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Read legacy tactic ABI pin
+        id: legacy-hol4-pin
+        run: echo "hol4-ref=$(tr -d '[:space:]' < tests/HOL_LEGACY_TACTICS_REV)" >> "$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/setup-polyml
+        id: polyml
+
+      - name: Configure holbuild test cache
+        run: echo "HOLBUILD_CACHE=$HOME/.cache/holbuild" >> "$GITHUB_ENV"
+
+      - name: Restore legacy HOL toolchain cache
+        id: legacy-hol-toolchain-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.cache/holbuild/hol-toolchains
+          key: hol-toolchains-legacy-tactics-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ steps.legacy-hol4-pin.outputs.hol4-ref }}-v1
+
+      - name: Build holbuild
+        run: make
+
+      - name: Setup legacy HOL cache
+        run: |
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          {
+            echo '[holbuild]'
+            echo 'schema = 2'
+            echo 'minimum_version = "0.10.0"'
+            echo
+            echo '[dependencies.hol]'
+            echo 'git = "https://github.com/HOL-Theorem-Prover/HOL.git"'
+            echo 'rev = "${{ steps.legacy-hol4-pin.outputs.hol4-ref }}"'
+            echo
+            echo '[project]'
+            echo 'name = "ci-legacy-tactics-toolchain"'
+          } > "$tmp/holproject.toml"
+          holdir=$(cd "$tmp" && "$GITHUB_WORKSPACE/bin/holbuild" buildhol | tail -n 1)
+          echo "HOLDIR=$holdir" >> "$GITHUB_ENV"
+
+      - name: Save legacy HOL toolchain cache
+        if: steps.legacy-hol-toolchain-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ~/.cache/holbuild/hol-toolchains
+          key: hol-toolchains-legacy-tactics-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ steps.legacy-hol4-pin.outputs.hol4-ref }}-v1
+
+      - name: Run legacy tactic compatibility tests
+        env:
+          TMPDIR: ${{ runner.temp }}
+          HOLBUILD_TEST_JOBS: ${{ inputs.test-jobs || '4' }}
+          HOLBUILD_TEST_HOL_REV: ${{ steps.legacy-hol4-pin.outputs.hol4-ref }}
+        run: >-
+          make HOLDIR="$HOLDIR" test
+          TESTS="proof-step-runtime-semantics proof-ir-branch-composition-behavior failed-prefix-structural-edit checkpoint-recovery termination-diagnostics"
