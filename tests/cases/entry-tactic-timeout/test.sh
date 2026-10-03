@@ -195,3 +195,52 @@ if (cd "$roots_group_project" && "$HOLBUILD_BIN" build) > "$tmpdir/roots-group.l
   exit 1
 fi
 require_grep "tactic timed out after 0.1s while building BetaTheory: slow_tac" "$tmpdir/roots-group.log"
+
+heap_project=$tmpdir/heap
+mkdir -p "$heap_project/src"
+cat > "$heap_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "heap-timeout"
+
+[build]
+members = ["src"]
+roots = ["src/RootScript.sml"]
+tactic_timeout = 0.1
+
+[[heap]]
+name = "orphan"
+output = ".holbuild/heap/orphan.save"
+objects = ["OrphanTheory"]
+TOML
+
+cat > "$heap_project/src/RootScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Root";
+val _ = export_theory();
+SML
+
+cat > "$heap_project/src/OrphanScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Orphan";
+fun slow_tac g = (OS.Process.sleep (Time.fromReal 0.45); ACCEPT_TAC TRUTH g);
+Theorem slow_thm:
+  T
+Proof
+  slow_tac
+QED
+val _ = export_theory();
+SML
+
+if (cd "$heap_project" && "$HOLBUILD_BIN" heap orphan) > "$tmpdir/heap.log" 2>&1; then
+  echo "heap build ignored package default tactic_timeout" >&2
+  exit 1
+fi
+require_grep "tactic timed out after 0.1s while building OrphanTheory: slow_tac" "$tmpdir/heap.log"

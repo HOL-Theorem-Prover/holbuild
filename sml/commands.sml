@@ -1357,10 +1357,16 @@ fun build_heap_kind tc cli_jobs command target =
         val objects = HolbuildSourceIndex.expand_group_tokens index (HolbuildProject.project_package project) objects
         val _ = if null objects then raise Error (command ^ " target has no objects: " ^ target) else ()
         val plan = timed_phase "build.plan" (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index objects)
+        val explicit_entry_targets =
+          map #2 (HolbuildTacticTimeoutPolicy.explicit_entries project index)
+        val entry_plan =
+          if null explicit_entry_targets then NONE
+          else SOME (timed_phase "entry_timeout.plan"
+                       (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index explicit_entry_targets))
         val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
         val output_path = HolbuildProject.abs_under (#root project) output
       in
-        HolbuildBuildExec.build {use_cache = true, verify_cache = true, force = HolbuildBuildExec.ForceNone, force_targets = [], skip_checkpoints = false, proof_steps = true, new_ir = true, node_tactic_timeouts = HolbuildTacticTimeoutPolicy.replace_timeouts (HolbuildTacticTimeoutPolicy.entry_timeouts project index plan (SOME 2.5)) (HolbuildTacticTimeoutPolicy.theory_timeouts project index plan), execution_plan = NONE, trace_steps = false, repl_on_failure = false, emit_output_hashes = false, allow_cache_timeout_discrepancy = false, trknl = HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)}
+        HolbuildBuildExec.build (export_build_options (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)) project index entry_plan plan)
                                tc project plan toolchain_key jobs;
         HolbuildBuildExec.export_heap tc project plan output_path kind
       end
