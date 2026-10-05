@@ -57,7 +57,7 @@ Theorem rename_operand_leaf:
 Proof
   rpt strip_tac >>
   rename [`x`] >>
-  assumption
+  FIRST_ASSUM ACCEPT_TAC
 QED
 
 Theorem expanded_map_every_leaf:
