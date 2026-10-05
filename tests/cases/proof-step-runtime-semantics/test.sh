@@ -69,7 +69,7 @@ QED
 Theorem suffices_by_leaf:
   T
 Proof
-  `T` suffices_by ACCEPT_TAC TRUTH >>
+  `T` suffices_by simp[] >>
   ACCEPT_TAC TRUTH
 QED
 
