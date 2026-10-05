@@ -106,10 +106,19 @@ and step_span step =
     | HolbuildProofIr.StepTry {start_pos, end_pos, ...} =>
         (start_pos, end_pos)
 
-fun printed source tactic =
-  case TacticParse.printTacAsSML source tactic of
-      SOME text => "(" ^ text ^ ")"
-    | NONE => "Tactical.ALL_TAC"
+(* TacticParse.printTacAsSML produces surface syntax, not necessarily
+   self-contained executable SML: some leaves assume the usual script opens,
+   and operand-only nodes have no whole-expression source span.  Prefer the
+   user's original source whenever it covers the complete leaf, and qualify
+   the entry points that must be synthesised.  This mirrors TacticWalker's
+   atomSrc strategy until HOL exposes the shared API requested in HOL#2069. *)
+fun printed source identity tactic =
+  case TacticParse.topSpan tactic of
+      SOME span => source_text source span
+    | NONE =>
+        (case TacticParse.printTacAsSML source tactic of
+             SOME text => "(" ^ text ^ ")"
+           | NONE => identity)
 
 fun leaf_program source ProofStepPlan.TacticLeaf tactic =
       (case tactic of
@@ -117,15 +126,22 @@ fun leaf_program source ProofStepPlan.TacticLeaf tactic =
              "BasicProvers.byA (" ^ source_text source quotation ^
              ", Tactical.ALL_TAC)"
          | SufficesBy (quotation, Then []) =>
-             "qsuff_tac " ^ source_text source quotation
+             "bossLib.qsuff_tac " ^ source_text source quotation
          | MapEvery (function, [argument]) =>
              "(" ^ source_text source function ^ ") (" ^
              source_text source (required_span "mapped argument" argument) ^ ")"
-         | _ => printed source tactic)
+         | Subgoal quotation =>
+             "BasicProvers.subgoal " ^ source_text source quotation
+         | Rename patterns =>
+             "Q.RENAME_TAC " ^ source_text source patterns
+         | _ => printed source "Tactical.ALL_TAC" tactic)
   | leaf_program source ProofStepPlan.ListTacticLeaf tactic =
-      (case TacticParse.printTacAsSML source tactic of
-           SOME text => "(" ^ text ^ ")"
-         | NONE => "Tactical.ALL_LT")
+      (case tactic of
+           LSelectGoal patterns =>
+             "Q.SELECT_GOAL_LT " ^ source_text source patterns
+         | LSelectGoals patterns =>
+             "Q.SELECT_GOALS_LT " ^ source_text source patterns
+         | _ => printed source "Tactical.ALL_LT" tactic)
 
 fun leaf_label source tactic =
   case tactic of
