@@ -7,6 +7,11 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../../lib.sh
 source "$SCRIPT_DIR/../../lib.sh"
 
+shared_plan_requirement=()
+if [[ -f "$HOLDIR/tools/parsing/ProofStepPlan.sig" ]]; then
+  shared_plan_requirement=(HOLBUILD_REQUIRE_SHARED_PROOF_STEP_PLAN=1)
+fi
+
 tmpdir=$(make_temp_dir)
 cleanup() { cleanup_temp_dir "$tmpdir"; }
 trap cleanup EXIT
@@ -43,6 +48,29 @@ Theorem sequence_allgoals:
   T /\ T
 Proof
   CONJ_TAC >> ACCEPT_TAC TRUTH
+QED
+
+(* Keep Q unopened: the shared-plan adapter must qualify the executable form
+   of this operand-only Rename leaf rather than relying on script opens. *)
+Theorem rename_operand_leaf:
+  !x:bool. x ==> x
+Proof
+  rpt strip_tac >>
+  rename [`x`] >>
+  FIRST_ASSUM ACCEPT_TAC
+QED
+
+Theorem expanded_map_every_leaf:
+  T /\ T
+Proof
+  CONJ_TAC >> MAP_EVERY (fn th => ACCEPT_TAC th) [TRUTH]
+QED
+
+Theorem suffices_by_leaf:
+  T
+Proof
+  `T` suffices_by simp[] >>
+  ACCEPT_TAC TRUTH
 QED
 
 Theorem branch_then1:
@@ -157,7 +185,7 @@ QED
 
 val _ = export_theory();
 SML
-(cd "$runtime_project" && HOLBUILD_ECHO_CHILD_LOGS=1 "$HOLBUILD_BIN" build --skip-checkpoints --tactic-timeout 60) > "$tmpdir/runtime.out" 2>&1
+(cd "$runtime_project" && env HOLBUILD_ECHO_CHILD_LOGS=1 "${shared_plan_requirement[@]}" "$HOLBUILD_BIN" build --skip-checkpoints --tactic-timeout 60) > "$tmpdir/runtime.out" 2>&1
 require_file "$runtime_project/.holbuild/obj/src/ATheory.dat"
 (cd "$runtime_project" && "$HOLBUILD_BIN" execution-plan ATheory:select_then1_nested_body) > "$tmpdir/select_then1_nested_body.plan.out" 2>&1
 require_grep 'select matching-all \[`T`\] solve' "$tmpdir/select_then1_nested_body.plan.out"
