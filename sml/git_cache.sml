@@ -51,6 +51,7 @@ fun command_output command =
     else die ("command failed: " ^ command ^ "\n" ^ text)
   end
   handle e as Error _ => raise e
+       | e as HolbuildProcessGroup.Error _ => raise e
        | e => die ("command failed: " ^ command ^ ": " ^ General.exnMessage e)
 
 fun run command = (ignore (command_output command); ())

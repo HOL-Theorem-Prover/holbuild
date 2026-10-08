@@ -52,6 +52,7 @@ fun command_output run_command command =
     else die ("command failed: " ^ command ^ "\n" ^ text)
   end
   handle e as Error _ => raise e
+       | e as HolbuildProcessGroup.Error _ => raise e
        | e => die ("command failed: " ^ command ^ ": " ^ General.exnMessage e)
 
 fun member x xs = List.exists (fn y => x = y) xs
