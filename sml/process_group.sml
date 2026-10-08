@@ -1,6 +1,8 @@
 structure HolbuildProcessGroup =
 struct
 
+exception Error of string
+
 type child_process = (TextIO.instream, unit) Unix.proc
 type active_child = {id : int, process : child_process}
 
@@ -53,10 +55,51 @@ fun cleanup_active_children () = kill_active_child_groups ()
 
 fun pid_text pid = LargeInt.toString (SysWord.toLargeInt (Posix.Process.pidToWord pid))
 
+(* macOS ships neither setsid(1) nor flock(1).  Perl is part of its base
+   system and exposes both primitives, so fall back to it when the utilities
+   are absent.  POSIX::setsid reports failure as -1, which is truthy in Perl,
+   hence the explicit comparison. *)
+
+fun have_command name =
+  OS.Process.isSuccess
+    (OS.Process.system ("command -v " ^ HolbuildHash.quote name ^ " >/dev/null 2>&1"))
+  handle _ => false
+
+(* Probes are deterministic, so a racing second probe is harmless. *)
+fun probed probe =
+  let
+    val cached = ref NONE
+  in
+    fn () =>
+      case !cached of
+          SOME value => value
+        | NONE => let val value = probe () in cached := SOME value; value end
+  end
+
+val perl_session_leader =
+  "perl -MPOSIX -e 'POSIX::setsid() != -1 or die \"setsid: $!\\n\"; " ^
+  "exec(\"/bin/sh\", \"-c\", $ARGV[0]) or die \"exec: $!\\n\"' --"
+
+val session_leader = probed (fn () =>
+  if have_command "setsid" then "setsid /bin/sh -c"
+  else if have_command "perl" then perl_session_leader
+  else raise Error ("cannot start a process-group leader: neither setsid " ^
+                    "nor perl is available on PATH"))
+
+val perl_lease_lock =
+  "perl -MFcntl=:flock -e 'open(my $fh, \">&=9\") or die \"dup: $!\\n\"; " ^
+  "flock($fh, LOCK_EX) or die \"flock: $!\\n\"'"
+
+val lease_lock = probed (fn () =>
+  if have_command "flock" then "flock -x 9"
+  else if have_command "perl" then perl_lease_lock
+  else raise Error ("cannot lock a mutation lease: neither flock " ^
+                    "nor perl is available on PATH"))
+
 fun mutation_lease_setup NONE = []
   | mutation_lease_setup (SOME path) =
       ["exec 9>" ^ HolbuildHash.quote path,
-       "flock -x 9",
+       lease_lock (),
        "kill -0 \"$holbuild_parent\" 2>/dev/null || exit 125"]
 
 fun parent_watch_script parent_pid mutation_lease script =
@@ -89,9 +132,9 @@ fun launch_shell parent_pid mutation_lease script : child_process =
   let
     (* Poly/ML implements Unix.execute in the runtime so the child reaches
        execve without returning to SML or allocating in a post-fork heap.
-       setsid makes the eventual shell its process-group leader. *)
+       The session leader makes the eventual shell its process-group leader. *)
     val grouped =
-      "exec setsid /bin/sh -c " ^
+      "exec " ^ session_leader () ^ " " ^
       HolbuildHash.quote (parent_watch_script parent_pid mutation_lease script)
   in
     Unix.execute ("/bin/sh", ["-c", grouped])

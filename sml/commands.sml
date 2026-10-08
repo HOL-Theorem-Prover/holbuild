@@ -916,6 +916,7 @@ fun build_once tc cli_jobs parsed = build_once_with_prepared tc cli_jobs NONE pa
 fun build_iteration_error_message exn =
   case exn of
       Error msg => SOME msg
+    | HolbuildProcessGroup.Error msg => SOME msg
     | HolbuildToolchain.Error msg => SOME msg
     | HolbuildProject.Error msg => SOME msg
     | HolbuildGenerators.Error msg => SOME msg
@@ -1157,16 +1158,6 @@ fun fs_cache_source cache : HolbuildCacheTransfer.source =
   {get_action = HolbuildFSCacheBackend.get_action cache,
    fetch_blob = HolbuildFSCacheBackend.fetch_blob cache}
 
-fun first_token text =
-  case String.tokens Char.isSpace text of
-      token :: _ => SOME token
-    | [] => NONE
-
-fun file_sha256 path =
-  case command_output ("sha256sum " ^ HolbuildHash.quote path) of
-      SOME text => first_token text
-    | NONE => NONE
-
 fun file_size_string path = Position.toString (OS.FileSys.fileSize path)
 
 fun json_escape text =
@@ -1196,10 +1187,7 @@ fun optional_json_string_field name value =
 
 fun export_metadata_json {archive_path, targets, action_count, metadata} =
   let
-    val sha256 =
-      case file_sha256 archive_path of
-          SOME hash => hash
-        | NONE => raise Error ("could not compute sha256 for " ^ archive_path)
+    val sha256 = HolbuildHash.file_sha256 archive_path
     val {created_at, source_repo, source_rev, hol_repo, hol_rev} : HolbuildCacheArchive.metadata = metadata
     val fields =
       [json_string_field "format" "holbuild-hbx-metadata-v1",
@@ -1637,6 +1625,7 @@ fun main raw_args =
        | HolbuildBuildExec.Error msg => err msg
        | HolbuildBuildExec.ErrorWithDebugArtifacts (msg, artifacts) => err_with_debug_artifacts msg artifacts
        | HolbuildHolSharedCache.Error msg => err msg
+       | HolbuildProcessGroup.Error msg => err msg
        | HolbuildCache.Error msg => err msg
        | HolbuildCacheArchive.Error msg => err msg
        | HolbuildCacheTransfer.Error msg => err msg
