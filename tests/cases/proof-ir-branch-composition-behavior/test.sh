@@ -160,10 +160,25 @@ Proof
   rpt strip_tac >> ASM_REWRITE_TAC[]
 QED
 
+(* All LThen1 spellings must survive either parser annotation shape. *)
+Theorem then1_keyword_success:
+  T /\ T
+Proof
+  CONJ_TAC THEN1 (ALL_TAC >> ACCEPT_TAC TRUTH) >>
+  ACCEPT_TAC TRUTH
+QED
+
+Theorem annotated_then1_success:
+  T /\ T
+Proof
+  (CONJ_TAC, 1) >>- (ALL_TAC >> ACCEPT_TAC TRUTH) >>
+  ACCEPT_TAC TRUTH
+QED
+
 Theorem by_sugar_success:
   T
 Proof
-  `T` by ACCEPT_TAC TRUTH
+  `T` by (ALL_TAC >> ACCEPT_TAC TRUTH)
 QED
 
 Theorem suffices_by_sugar_success:
