@@ -15,18 +15,21 @@ replacement_builder=
 replacement_release=
 orphan_pid=
 orphan_pgid=
+lease_holder=
+lease_release=
 regression_failures=()
 cleanup() {
   [[ -z "$release" ]] || touch "$release"
   [[ -z "$replacement_release" ]] || touch "$replacement_release"
-  [[ -z "$orphan_pgid" ]] || kill -CONT -- "-$orphan_pgid" 2>/dev/null || true
+  [[ -z "$lease_release" ]] || touch "$lease_release"
+  [[ -z "$lease_holder" ]] || wait "$lease_holder" 2>/dev/null || true
   [[ -z "$first_builder" ]] || wait "$first_builder" 2>/dev/null || true
   [[ -z "$second_builder" ]] || wait "$second_builder" 2>/dev/null || true
   [[ -z "$killed_builder" ]] || wait "$killed_builder" 2>/dev/null || true
   [[ -z "$replacement_builder" ]] || wait "$replacement_builder" 2>/dev/null || true
   [[ -z "$orphan_pgid" ]] || kill -KILL -- "-$orphan_pgid" 2>/dev/null || true
   [[ -z "$orphan_pid" ]] || kill -KILL "$orphan_pid" 2>/dev/null || true
-  rm -rf "$tmpdir"
+  cleanup_temp_dir "$tmpdir"
 }
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
@@ -67,17 +70,6 @@ wait_for_process_group_exit() {
   local description=$2
   for _ in $(seq 1 200); do
     process_group_alive "$pgid" || return 0
-    sleep 0.05
-  done
-  fail "$description"
-}
-wait_for_process_stop() {
-  local pid=$1
-  local description=$2
-  local state
-  for _ in $(seq 1 200); do
-    state=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true)
-    [[ "$state" == T* ]] && return 0
     sleep 0.05
   done
   fail "$description"
@@ -408,10 +400,8 @@ kill -0 "$killed_builder" 2>/dev/null ||
 process_alive "$orphan_pid" ||
   fail "toolchain build child exited before its parent was terminated"
 
-# Freeze the mutating group, including the parent watcher. Cache exclusion must
-# remain correct even when watcher scheduling delays termination after SIGKILL.
-kill -STOP -- "-$orphan_pgid"
-wait_for_process_stop "$orphan_pid" "toolchain build process group did not stop"
+# Exercise real parent-death recovery without suspending the watchdog. Lease
+# exclusion is tested separately below with a controlled independent holder.
 kill -KILL "$killed_builder"
 if wait "$killed_builder" 2>/dev/null; then
   fail "SIGKILLed toolchain build parent unexpectedly succeeded"
@@ -431,23 +421,10 @@ replacement_log=$tmpdir/post-kill-rebuild.log
     "$REAL_HOLBUILD_BIN" build --dry-run Foo
 ) > "$replacement_log" 2>&1 &
 replacement_builder=$!
-replacement_overlapped=0
-if process_group_alive "$orphan_pgid"; then
-  set +e
-  observe_file_while_process_runs "$replacement_started" "$replacement_builder"
-  replacement_observation=$?
-  set -e
-  case "$replacement_observation" in
-    0) process_group_alive "$orphan_pgid" && replacement_overlapped=1 ;;
-    1) ;;
-    *) fail "replacement toolchain build exited before reaching bin/build" ;;
-  esac
-fi
-
-kill -CONT -- "-$orphan_pgid" 2>/dev/null || true
-touch "$replacement_release"
 wait_for_process_group_exit "$orphan_pgid" \
-  "old toolchain process group did not exit after resume"
+  "old toolchain process group did not exit after parent death"
+wait_for_file "$replacement_started" "replacement build did not reach bin/build"
+touch "$replacement_release"
 orphan_pid=
 orphan_pgid=
 release=
@@ -459,10 +436,54 @@ replacement_builder=
 replacement_release=
 require_file "$toolchain_entry/build.ok"
 require_grep "Foo (sml, package b)" "$replacement_log"
-if [[ "$replacement_overlapped" -ne 0 ]]; then
-  record_regression_failure \
-    "replacement mutated the cache while the previous toolchain process group was alive"
+# Independently verify exclusion while a mutation lease remains held. Unlike
+# SIGSTOP choreography, readiness and release are explicit protocol events.
+rm -rf "$toolchain_entry"
+lease_ready=$tmpdir/mutation-lease-ready
+lease_release=$tmpdir/mutation-lease-release
+(
+  exec 9>"$stale_lock.mutation"
+  if command -v flock >/dev/null 2>&1; then
+    flock -x 9
+  else
+    perl -MFcntl=:flock -e 'open(my $fh, ">&=9") or die "dup: $!"; flock($fh, LOCK_EX) or die "flock: $!"'
+  fi
+  touch "$lease_ready"
+  while [[ ! -e "$lease_release" ]]; do sleep 0.05; done
+) &
+lease_holder=$!
+wait_for_file "$lease_ready" "independent mutation lease was not acquired"
+replacement_started=$tmpdir/lease-blocked-build-started
+replacement_log=$tmpdir/lease-blocked-build.log
+(
+  cd "$root"
+  exec env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" \
+    HOLBUILD_TEST_BUILD_STARTED="$replacement_started" \
+    HOLBUILD_TEST_BUILD_RELEASE="$lease_release" \
+    "$REAL_HOLBUILD_BIN" build --dry-run Foo
+) > "$replacement_log" 2>&1 &
+replacement_builder=$!
+set +e
+observe_file_while_process_runs "$replacement_started" "$replacement_builder"
+replacement_observation=$?
+set -e
+case "$replacement_observation" in
+  0) fail "replacement entered bin/build while the independent mutation lease was held" ;;
+  1) ;;
+  *) fail "replacement exited while waiting for the independent mutation lease" ;;
+esac
+touch "$lease_release"
+wait "$lease_holder"
+lease_holder=
+lease_release=
+wait_for_file "$replacement_started" "replacement did not build after lease release"
+if ! wait "$replacement_builder"; then
+  replacement_builder=
+  fail "replacement failed after lease release; see $replacement_log"
 fi
+replacement_builder=
+require_file "$toolchain_entry/build.ok"
+require_grep "Foo (sml, package b)" "$replacement_log"
 
 # Manifest discovery runs after bin/build but before build.ok. Killing holbuild
 # here must not leave an untracked Holmake able to write into a replacement.
