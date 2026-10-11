@@ -62,3 +62,29 @@ if grep -Eq 'error:|Exception-' "$tmpdir/check.log"; then
   cat "$tmpdir/check.log"
   exit 1
 fi
+
+# The legacy planner must preserve standalone atomic source text, but still
+# group atoms when synthesizing nested expressions.
+cat > "$tmpdir/legacy-leaves.sml" <<SML
+Meta.load "HOLSourceParser";
+use "$HOLBUILD_ROOT/sml/proof_ir_types.sml";
+use "$HOLBUILD_ROOT/sml/proof_ir.sml";
+val _ = let
+  open HolbuildProofIrPlanner
+  fun check true = () | check false = raise Fail "legacy leaf spelling";
+  val atom = TacAtomic (10, (0, 6));
+  val _ = check (HolbuildProofIr.step_program (tactic_step "NO_TAC" atom) = "NO_TAC");
+  val _ = check (tactic_program "NO_TAC" atom = "(NO_TAC)");
+  val _ = check (HolbuildProofIr.step_program
+    (tactic_step "(NO_TAC)" (TacAtomic (10, (0, 8)))) = "(NO_TAC)");
+  val _ = check (tactic_program "NO_TAC" (TacTry ((0, 6), atom)) =
+    "Tactical.TRY((NO_TAC))");
+in print "legacy leaf spelling passed\\n" end;
+OS.Process.exit OS.Process.success;
+SML
+"$HOLDIR/bin/hol" < "$tmpdir/legacy-leaves.sml" > "$tmpdir/legacy-leaves.log" 2>&1
+require_grep 'legacy leaf spelling passed' "$tmpdir/legacy-leaves.log"
+if grep -Eq 'error:|Exception-' "$tmpdir/legacy-leaves.log"; then
+  cat "$tmpdir/legacy-leaves.log"
+  exit 1
+fi
