@@ -645,6 +645,33 @@ primitive. `buildheap` snapshots a process after loading a closure of `.uo`
 modules, and holbuild uses it only for explicit exported heap/executable
 artifacts after the relevant logical targets have already been built.
 
+The one exception is an opt-in base heap (`[[heap]]` with `base = true`). It
+replaces `hol.state` as the starting state of a theory child, so the child
+skips reloading shared ancestors. Three rules keep a heap start equivalent to
+a cold start:
+
+- The heap loads only its object theories, not the SML closure an explicit
+  heap target loads. Loading a theory loads its ancestors and recorded ML
+  dependencies, so the heap holds exactly what its objects' consumers load.
+- A theory starts from the heap only when the load edges of its preloads
+  (theory preloads and SML load manifests, never order-only action `deps`)
+  reach every object. Any theory such edges reach is loaded by the child or is
+  an ancestor of one that is, so the heap adds no module the cold child would
+  not load. The remaining preloads find the heap's modules already loaded.
+- The heap identity hashes the toolchain key with the objects' load stems and
+  input keys. A missing or mismatched `<output>.ok` re-exports it, and the
+  dependency-context key of every checkpoint started from the heap includes
+  that identity, so checkpoints never outlive the heap they were saved over.
+
+A heap start still differs from a cold start in load order: the heap's
+modules load first, in the order `buildheap` loads them, rather than in
+preload order. HOL state that keeps the most recent registration, such as the
+`cv_trans` translation database, can therefore resolve differently, and the
+theory files differ even though every theorem is proved. So the input key of
+a theory that starts from the heap records the heap's objects, and heap-built
+and cold-built files are cached under different keys. The objects' own input
+keys already cover the heap's contents.
+
 The relevant checkpointing model is the `Holmake --dumpheap` design: while
 building a theory, the prover/runtime saves PolyML states at boundaries such as:
 

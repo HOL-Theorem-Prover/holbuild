@@ -7,7 +7,7 @@ open HolbuildManifestUtil
    The external table is still named [project]; #110 may change that syntax when
    one repository manifest can define multiple logical packages. *)
 
-datatype heap_kind = HeapImage | ExecutableImage of {main : string}
+datatype heap_kind = HeapImage of {base : bool} | ExecutableImage of {main : string}
 
 datatype heap =
   Heap of {name : string, output : string, objects : string list,
@@ -189,7 +189,9 @@ fun image_entries table section parse =
 fun parse_heaps table =
   let
     val heaps =
-      image_entries table "heap" (parse_image_entry "heap" (fn _ => HeapImage)) @
+      image_entries table "heap"
+        (parse_image_entry "heap" (fn value =>
+          HeapImage {base = Option.getOpt(bool_at value ["base"], false)})) @
       image_entries table "executable"
         (parse_image_entry "executable" (fn value =>
           ExecutableImage {main = Option.getOpt(string_field value "main", "main")}))
@@ -201,6 +203,13 @@ fun parse_heaps table =
                die ("duplicate heap/executable target name: " ^ name)
              else loop (name :: names) rest
           end
+    fun is_base (Heap {kind = HeapImage {base}, ...}) = base
+      | is_base _ = false
+    val _ =
+      case List.filter is_base heaps of
+          _ :: second :: _ =>
+            die ("at most one [[heap]] may set base = true; also set on: " ^ name_of second)
+        | _ => ()
   in loop [] heaps; heaps end
 
 fun parse_generator value =
@@ -540,7 +549,7 @@ fun validate_manifest table =
         NONE => ()
       | SOME (TOML.ARRAY values) => List.app validate_generate_entry values
       | SOME _ => die "generate must be an array of tables");
-   validate_image_entries table "heap" ["name", "output", "objects"];
+   validate_image_entries table "heap" ["name", "output", "objects", "base"];
    validate_image_entries table "executable"
      ["name", "output", "objects", "main"])
 
@@ -613,7 +622,8 @@ fun dependency_text (Dependency {name, source, ...}) =
 fun heap_key (Heap {name, ...}) = name
 fun heap_text (Heap {name, output, objects, kind}) =
   fields [name, output, string_sequence objects,
-    case kind of HeapImage => "heap"
+    case kind of HeapImage {base = false} => "heap"
+      | HeapImage {base = true} => fields ["heap", "base"]
       | ExecutableImage {main} => fields ["executable", main]]
 fun action_key (ActionPolicy {logical, ...}) = logical
 fun action_dependency_policy (ActionPolicy {logical, deps, loads, ...}) =

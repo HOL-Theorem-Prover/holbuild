@@ -408,7 +408,8 @@ fun dependency_manifest (project as {manifest = project_manifest, graph_artifact
     | Dependency {source = FromSource {manifest, ...}, ...} =>
         SOME (abs_under (manifest_root project_manifest) manifest)
 
-fun heap_kind_to_string HeapImage = "heap"
+fun heap_kind_to_string (HeapImage {base = false}) = "heap"
+  | heap_kind_to_string (HeapImage {base = true}) = "heap base"
   | heap_kind_to_string (ExecutableImage {main}) = "executable main=" ^ main
 
 fun heap_to_string (Heap {name, output, objects, kind}) =

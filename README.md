@@ -532,6 +532,36 @@ and executable objects may also include signature targets. Before starting HOL,
 create an invocation-private project context under `.holbuild/`, and then load
 the configured targets followed by user arguments.
 
+#### Base heap for theory builds
+
+```toml
+[[heap]]
+name = "base"
+output = ".holbuild/heap/base.save"
+objects = ["vyperStateTheory"]
+base = true
+```
+
+A `[[heap]]` with `base = true` is the saved state that theory builds start
+from instead of HOL's `hol.state`, so a theory child does not reload every
+shared ancestor from disk. At most one heap may set `base`, and its objects
+must be theory targets. The heap holds exactly what loading its objects loads.
+A theory starts from it only when its own preloads reach every object; other
+theories, and the objects and their ancestors, start from `hol.state`.
+
+`holbuild build` exports the base heap the first time a theory that would
+start from it has to build from source, and only when the heap is missing or
+stale. The heap is keyed by the toolchain and the objects' input keys, which
+`<output>.ok` records; editing any ancestor of an object re-exports it.
+`holbuild heap base` refreshes the same heap.
+
+A heap start loads the heap's theories before the theory's other preloads, and
+HOL state that keeps the most recent registration (for example `cv_trans`
+translations defined in two ancestors) can then resolve differently. Theory
+files built from the heap can therefore differ from cold-built ones, so setting
+`base` changes the input keys of the theories that start from the heap: they
+rebuild once, and heap-built and cold-built files are cached separately.
+
 ## Proof steps and checkpoints
 
 By default, `holbuild` instruments modern theorem and explicit termination
