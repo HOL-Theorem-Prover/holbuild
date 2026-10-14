@@ -75,6 +75,29 @@ fun read_binary_all path =
 val string_sha1 = HolbuildStringHash.string_sha1
 fun string_sha256 text = SHA256.hashStringHex text
 
+fun string_sha256_large text =
+  if size text < small_file_limit then string_sha256 text
+  else
+    let
+      val path = OS.FileSys.tmpName ()
+      val result =
+        (let
+           val output = BinIO.openOut path
+           val _ = (BinIO.output (output, Byte.stringToBytes text);
+                    BinIO.closeOut output)
+                   handle e => (BinIO.closeOut output; raise e)
+         in
+           external_sha256 path
+         end)
+        handle e => (remove_quietly path; raise e)
+      val _ = remove_quietly path
+    in
+      case result of
+          SOME digest => digest
+        | NONE => string_sha256 text
+    end
+    handle _ => string_sha256 text
+
 fun file_sha1 path =
   if large_file path then
     case external_sha1 path of
