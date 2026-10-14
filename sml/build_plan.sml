@@ -760,7 +760,7 @@ fun selected_graph_text nodes (graph : resolved_dependency_graph) =
   end
 
 fun selected_graph_identity nodes graph =
-  HolbuildHash.string_sha256 (selected_graph_text nodes graph)
+  HolbuildHash.string_sha256_large (selected_graph_text nodes graph)
 
 fun selected_plan_text graph_id roots selected =
   canonical_fields
