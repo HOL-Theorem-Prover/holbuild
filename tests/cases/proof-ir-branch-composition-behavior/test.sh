@@ -8,7 +8,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
-cleanup() { rm -rf "$tmpdir"; }
+cleanup() { cleanup_temp_dir "$tmpdir"; }
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
@@ -160,10 +160,18 @@ Proof
   rpt strip_tac >> ASM_REWRITE_TAC[]
 QED
 
+(* Ordinary THEN1 syntax must survive either parser annotation shape. *)
+Theorem then1_keyword_success:
+  T /\ T
+Proof
+  CONJ_TAC THEN1 (ALL_TAC >> ACCEPT_TAC TRUTH) >>
+  ACCEPT_TAC TRUTH
+QED
+
 Theorem by_sugar_success:
   T
 Proof
-  `T` by ACCEPT_TAC TRUTH
+  `T` by (ALL_TAC >> ACCEPT_TAC TRUTH)
 QED
 
 Theorem suffices_by_sugar_success:

@@ -34,6 +34,9 @@ val analyser_source_files =
    "../proof_ir.sml",
    "proof_step_plan_adapter_legacy.sml",
    "proof_step_plan_adapter_shared.sml",
+   "tactic_parse_capabilities.sml",
+   "tactic_parse_adapter_legacy.sml",
+   "tactic_parse_adapter_token_spans.sml",
    "proof_ir_extract.sml",
    "analyser_main.sml",
    "holbuild-hol-analyser-script.sml"]

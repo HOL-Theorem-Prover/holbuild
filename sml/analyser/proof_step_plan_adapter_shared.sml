@@ -32,12 +32,17 @@ fun merge_span NONE span = span
 fun spans spans = List.foldl (fn (span, result) => merge_span result span) NONE spans
 
 fun tactic_span tactic =
-  case tactic of
+  case HolbuildTacticParseAdapter.view tactic of
+      HolbuildTacticParseAdapter.ByNode (span, body) =>
+        merge_span (SOME span) (tactic_span body)
+    | HolbuildTacticParseAdapter.SufficesByNode (span, body) =>
+        merge_span (SOME span) (tactic_span body)
+    | HolbuildTacticParseAdapter.Then1Node body => tactic_span body
+    | HolbuildTacticParseAdapter.Other tactic =>
+  (case tactic of
       Then tactics => spans (map tactic_span tactics)
     | ThenLT (first, rest) => spans (tactic_span first :: map tactic_span rest)
     | Subgoal span => SOME span
-    | By (span, body) => merge_span (SOME span) (tactic_span body)
-    | SufficesBy (span, body) => merge_span (SOME span) (tactic_span body)
     | First tactics => spans (map tactic_span tactics)
     | FirstProve tactics => spans (map tactic_span tactics)
     | TacticParse.Try tactic => tactic_span tactic
@@ -48,7 +53,6 @@ fun tactic_span tactic =
     | Opaque (_, span) => SOME span
     | LThen (first, rest) => spans (tactic_span first :: map tactic_span rest)
     | LThenLT tactics => spans (map tactic_span tactics)
-    | LThen1 tactic => tactic_span tactic
     | LTacsToLT tactic => tactic_span tactic
     | LNullOk tactic => tactic_span tactic
     | LFirst tactics => spans (map tactic_span tactics)
@@ -72,6 +76,7 @@ fun tactic_span tactic =
     | RepairEmpty (_, span, _) => SOME span
     | RepairGroup (span, _, _, _) => SOME span
     | OOpaque (_, span) => SOME span
+    | _ => raise Fail "unhandled tactic parser constructor")
 
 fun required_span description tactic =
   case tactic_span tactic of
@@ -121,20 +126,21 @@ fun printed source identity tactic =
            | NONE => identity)
 
 fun leaf_program source ProofStepPlan.TacticLeaf tactic =
-      (case tactic of
-           By (quotation, Then []) =>
+      (case HolbuildTacticParseAdapter.view tactic of
+           HolbuildTacticParseAdapter.ByNode (quotation, Then []) =>
              "BasicProvers.byA (" ^ source_text source quotation ^
              ", Tactical.ALL_TAC)"
-         | SufficesBy (quotation, Then []) =>
+         | HolbuildTacticParseAdapter.SufficesByNode (quotation, Then []) =>
              "bossLib.qsuff_tac " ^ source_text source quotation
-         | MapEvery (function, [argument]) =>
+         | _ => (case tactic of
+           MapEvery (function, [argument]) =>
              "(" ^ source_text source function ^ ") (" ^
              source_text source (required_span "mapped argument" argument) ^ ")"
          | Subgoal quotation =>
              "BasicProvers.subgoal " ^ source_text source quotation
          | Rename patterns =>
              "Q.RENAME_TAC " ^ source_text source patterns
-         | _ => printed source "Tactical.ALL_TAC" tactic)
+         | _ => printed source "Tactical.ALL_TAC" tactic))
   | leaf_program source ProofStepPlan.ListTacticLeaf tactic =
       (case tactic of
            LSelectGoal patterns =>
@@ -144,10 +150,13 @@ fun leaf_program source ProofStepPlan.TacticLeaf tactic =
          | _ => printed source "Tactical.ALL_LT" tactic)
 
 fun leaf_label source tactic =
-  case tactic of
-      By (quotation, Then []) => "by-subgoal " ^ source_text source quotation
-    | SufficesBy (quotation, Then []) => "qsuff_tac " ^ source_text source quotation
-    | MapEvery (function, [argument]) =>
+  case HolbuildTacticParseAdapter.view tactic of
+      HolbuildTacticParseAdapter.ByNode (quotation, Then []) =>
+        "by-subgoal " ^ source_text source quotation
+    | HolbuildTacticParseAdapter.SufficesByNode (quotation, Then []) =>
+        "qsuff_tac " ^ source_text source quotation
+    | _ => (case tactic of
+      MapEvery (function, [argument]) =>
         source_text source function ^ " " ^
         source_text source (required_span "mapped argument" argument)
     | LSelectThen (selected, Then []) =>
@@ -165,7 +174,7 @@ fun leaf_label source tactic =
           else text
         end
     | RepairGroup (_, _, inner, _) => leaf_label source inner
-    | _ => source_text source (required_span "leaf" tactic)
+    | _ => source_text source (required_span "leaf" tactic))
 
 fun selector source ProofStepPlan.SelectFirst = HolbuildProofIr.SelectFirst
   | selector source (ProofStepPlan.SelectMatchingFirst span) =

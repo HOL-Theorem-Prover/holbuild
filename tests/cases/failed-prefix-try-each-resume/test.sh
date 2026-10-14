@@ -73,7 +73,7 @@ checkpoint=$(find "$project/.holbuild/checkpoints" -name 'try_each_resume_failed
 require_file "$checkpoint"
 require_file "$checkpoint.meta"
 require_grep '^path=.*each:.*try/' "$checkpoint.meta"
-require_grep $'leaf_signature=step\t(NO_TAC)' "$checkpoint.meta"
+require_grep $'leaf_signature=step\tNO_TAC' "$checkpoint.meta"
 
 # The marker makes the unchanged suffix succeed on the second run.  Resuming
 # from the nested TRY/Each endpoint must preserve ordinary TRY rollback for the

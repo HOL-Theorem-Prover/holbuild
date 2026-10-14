@@ -485,7 +485,12 @@ fun tactic_step source tactic =
   in
     StepTactic {start_pos = #1 sp, end_pos = #2 sp,
                 label = tactic_label source tactic,
-                program = tactic_program source tactic}
+                (* Standalone leaves are parenthesized by compile_tactic.
+                   Preserve their source spelling, as the shared planner does;
+                   keep grouping in tactic_program for nested synthesis. *)
+                program = case tactic of
+                              TacAtomic (_, span) => source_text source span
+                            | _ => tactic_program source tactic}
   end
 
 fun list_step sp label program =

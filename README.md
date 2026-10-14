@@ -21,6 +21,20 @@ upstreaming into HOL.
 own generated code and runtime support. User project code should not define
 values, structures, signatures, or functors with that prefix.
 
+### HOL revision compatibility
+
+The same holbuild executable supports the current HOL pin in `vendor/hol/REV`
+and the legacy compatibility floor recorded in `tests/HOL_LEGACY_TACTICS_REV`
+(`e395eb6e69054ff6f7cef9d1107fd1a04dd5848f`). CI covers those two revisions;
+this is not a guarantee for every intervening or future HOL commit.
+
+Compatibility boundaries select implementations by the installed HOL API,
+not branch names or revision ordering. In particular, the analyser retains its
+legacy planner when `ProofStepPlan` is absent and supports both shared-parser
+constructor shapes, before and after HOL added combinator-token spans. Small
+adapter tests cover both shapes without adding a third HOL toolchain to CI.
+The new token annotations do not change existing proof-step labels or extents.
+
 ## Install from source
 
 You need Poly/ML. The small set of HOL source files needed to compile the

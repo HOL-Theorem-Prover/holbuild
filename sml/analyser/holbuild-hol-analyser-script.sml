@@ -82,9 +82,27 @@ val _ =
      not have_shared_proof_step_plan then
     raise Fail "selected HOL does not provide ProofStepPlan"
   else ();
+(* As with the tactic ABI boundary, inspect the installed signature rather
+   than ordering revisions or emitting errors from an ill-typed probe.  Strip
+   whitespace so harmless signature formatting changes do not affect selection.
+   Unexpected API shapes fail explicitly instead of silently using old code. *)
+use_src "tactic_parse_capabilities.sml";
+fun parser_has_token_spans () =
+  let
+    val input = TextIO.openIn
+      (path_join(compile_time_holdir, "tools/parsing/TacticParse.sig"))
+    val text = (TextIO.inputAll input
+                handle e => (TextIO.closeIn input; raise e))
+    val _ = TextIO.closeIn input
+  in
+    HolbuildTacticParseCapabilities.has_token_spans text
+  end;
 val _ =
   if have_shared_proof_step_plan then
-    use_src "proof_step_plan_adapter_shared.sml"
+    (use_src (if parser_has_token_spans () then
+                "tactic_parse_adapter_token_spans.sml"
+              else "tactic_parse_adapter_legacy.sml");
+     use_src "proof_step_plan_adapter_shared.sml")
   else
     use_src "proof_step_plan_adapter_legacy.sml";
 
