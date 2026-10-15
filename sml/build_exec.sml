@@ -4072,11 +4072,14 @@ fun run_buildheap tc (project : HolbuildProject.t) dir options args output =
   end
 
 (* The object input keys cover their dependency closures, so they pin the
-   theory files the heap was built from. *)
-fun base_heap_key toolchain_key keys objects =
+   theory files the heap was built from.  The heap records the absolute path
+   of the hol.state it extends, which the toolchain key, a content hash, does
+   not cover: a moved toolchain must re-export. *)
+fun base_heap_key tc toolchain_key keys objects =
   HolbuildToolchain.hash_text
     (String.concatWith "\n"
-       (["holbuild-base-heap-v1", "toolchain_key=" ^ toolchain_key] @
+       (["holbuild-base-heap-v2", "toolchain_key=" ^ toolchain_key,
+         "parent_state=" ^ HolbuildToolchain.base_state tc] @
         map (fn node => "object " ^ HolbuildBuildPlan.key node ^ " " ^ load_stem node ^ " " ^
                         HolbuildBuildPlan.input_key_for keys node)
             objects) ^ "\n")
@@ -4085,9 +4088,9 @@ fun new_base_heap path key objects users : base_heap =
   {path = path, key = key, objects = objects, users = users,
    state = ref HeapUnchecked, mutex = Mutex.mutex ()}
 
-fun base_heap_for toolchain_key keys ({spec = {output, ...}, objects, users} : base_heap_users) =
+fun base_heap_for tc toolchain_key keys ({spec = {output, ...}, objects, users} : base_heap_users) =
   if Redblackset.isEmpty users then NONE
-  else SOME (new_base_heap output (base_heap_key toolchain_key keys objects) objects users)
+  else SOME (new_base_heap output (base_heap_key tc toolchain_key keys objects) objects users)
 
 (* The content hash identifies one export of the heap.  Re-exporting under an
    unchanged key still rewrites the file, and Poly/ML then rejects every
@@ -4095,27 +4098,52 @@ fun base_heap_for toolchain_key keys ({spec = {output, ...}, objects, users} : b
 fun base_heap_ok_text key hash =
   checkpoint_ok_text "base_heap" [("heap_key", key), ("heap_hash", hash)]
 
-(* Comparing the file with the recorded hash catches a heap that was
-   truncated or replaced after export, which every user would fail to load. *)
+(* A missing file or `.ok` means the heap is not current.  Comparing the file
+   with the recorded hash catches a heap that was truncated or replaced after
+   export, which every user would fail to load. *)
 fun current_base_heap_hash path key =
-  if checkpoint_ok_matches path [("kind", "base_heap"), ("heap_key", key)] then
-    case metadata_value "heap_hash" (metadata_lines (read_text (checkpoint_ok_path path))) of
-        SOME hash => if HolbuildToolchain.file_hash path = hash then SOME hash else NONE
-      | NONE => NONE
-  else NONE
+  case (file_exists path, HolbuildCheckpointStore.current_metadata (checkpoint_ok_path path)) of
+      (true, SOME text) =>
+        if HolbuildCheckpointStore.metadata_matches_fields
+             [("kind", "base_heap"), ("heap_key", key)] text then
+          case metadata_value "heap_hash" (metadata_lines text) of
+              SOME hash => if HolbuildToolchain.file_hash path = hash then SOME hash else NONE
+            | NONE => NONE
+        else NONE
+    | _ => NONE
+
+val hol_project_files = ["holproject.toml", ".holpath"]
+
+fun hol_project_file_above dir =
+  case List.find (fn name => file_exists (Path.concat(dir, name))) hol_project_files of
+      SOME name => SOME (Path.concat(dir, name))
+    | NONE =>
+        let val parent = Path.getParent dir
+        in if parent = dir then NONE else hol_project_file_above parent end
 
 (* Theory children add the dirs of the project around their stage dir to
    Meta.loadPath when they start.  A heap exported inside the project would
-   keep a second copy, taken at export time, that hol.state lacks; exporting
-   from an empty directory outside it leaves the heap's loadPath as
-   hol.state's. *)
+   keep a second copy, taken at export time, that hol.state lacks.  HOL finds
+   that project by walking up from its working directory for the files in
+   `hol_project_files`, so the export runs in an empty directory under the
+   holbuild cache, and refuses when one of those files is above it: whatever
+   it names would go ahead of sigobj on every heap user's load path. *)
 fun run_buildheap_outside_project tc project args output =
   let
-    val dir = FS.tmpName ()
-    val _ = remove_file dir
-    val _ = FS.mkDir dir
+    val parent = Path.concat(cache_root (), "tmp")
+    val dir = Path.concat(parent, "heap-export-" ^ HolbuildFileLock.current_pid_text ())
+    val _ = remove_tree dir
+    val _ = ensure_dir dir
+    fun run () =
+      case hol_project_file_above (FS.realPath dir) of
+          SOME file =>
+            raise Error (String.concatWith "\n"
+              ["cannot export base heap: " ^ file ^ " is above the export directory " ^ dir,
+               "HOL would put the directories it names on the heap's load path.",
+               "Remove it, or set HOLBUILD_CACHE to a directory outside any HOL project."])
+        | NONE => run_buildheap tc project dir [] args output
   in
-    run_buildheap tc project dir [] args output before remove_tree dir
+    run () before remove_tree dir
     handle e => (remove_tree dir; raise e)
   end
 
@@ -4169,7 +4197,7 @@ fun refresh_base_heap (options : build_options) tc project plan toolchain_key =
           val objects = base_heap_object_nodes plan (#objects spec)
         in
           ignore (export_base_heap tc project
-                    (new_base_heap (#output spec) (base_heap_key toolchain_key keys objects) objects
+                    (new_base_heap (#output spec) (base_heap_key tc toolchain_key keys objects) objects
                                    (Redblackset.empty String.compare)))
         end
 
@@ -5078,9 +5106,15 @@ fun write_text_atomic path text =
 fun dump_key_label key =
   String.translate (fn #"\000" => "\\0" | c => str c) key
 
-fun dump_key_row toolchain_key plan keys node =
+(* A base heap user's checkpoints also hash the heap file, which may not exist
+   yet when keys are dumped, so its row shows the cold key marked `base_heap`. *)
+fun dump_key_row toolchain_key plan keys base_heap node =
   let
     val key = HolbuildBuildPlan.key node
+    val heap_user =
+      case base_heap of
+          SOME ({users, ...} : base_heap) => Redblackset.member(users, key)
+        | NONE => false
     val input_key = HolbuildBuildPlan.input_key_for keys node
     val dependency_key =
       case #kind (HolbuildBuildPlan.source_of node) of
@@ -5089,7 +5123,9 @@ fun dump_key_row toolchain_key plan keys node =
         | _ => NONE
     val line =
       case dependency_key of
-          SOME deps_key => String.concat [dump_key_label key, "\t", input_key, "\t", deps_key]
+          SOME deps_key =>
+            String.concat ([dump_key_label key, "\t", input_key, "\t", deps_key] @
+                           (if heap_user then ["\tbase_heap"] else []))
         | NONE => String.concat [dump_key_label key, "\t", input_key]
   in
     (key, line)
@@ -5107,7 +5143,7 @@ fun dump_toolchain_key toolchain_key =
       SOME key => if key = "" then toolchain_key else key
     | NONE => toolchain_key
 
-fun dump_keys_if_requested config_lines_for_node toolchain_key plan keys =
+fun dump_keys_if_requested config_lines_for_node toolchain_key plan keys base_heap =
   case OS.Process.getEnv "HOLBUILD_DUMP_KEYS" of
       NONE => ()
     | SOME path =>
@@ -5118,7 +5154,7 @@ fun dump_keys_if_requested config_lines_for_node toolchain_key plan keys =
             else HolbuildBuildPlan.input_keys config_lines_for_node dump_toolchain plan
           val rows =
             HolbuildBuildPlan.sort_pairs compare_dump_rows
-              (map (dump_key_row dump_toolchain plan dump_keys)
+              (map (dump_key_row dump_toolchain plan dump_keys base_heap)
                    (HolbuildBuildPlan.selected_nodes plan))
           val text = String.concat (map (fn (_, line) => line ^ "\n") rows)
         in
@@ -5134,8 +5170,8 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
     val users = Option.map (base_heap_users project plan) (#base_heap options)
     val config_lines = config_lines_with users options project
     val keys = HolbuildBuildPlan.input_keys config_lines toolchain_key plan
-    val base_heap = Option.mapPartial (base_heap_for toolchain_key keys) users
-    val _ = dump_keys_if_requested config_lines toolchain_key plan keys
+    val base_heap = Option.mapPartial (base_heap_for tc toolchain_key keys) users
+    val _ = dump_keys_if_requested config_lines toolchain_key plan keys base_heap
     val dat_hash_cache = new_file_hash_cache ()
   in
     let

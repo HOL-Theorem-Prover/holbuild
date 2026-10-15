@@ -120,6 +120,7 @@ write_manifest ""
 require_no_file "$heap"
 dat_hashes > "$tmpdir/cold.sha"
 for theory in A B C D; do require_toolchain_start "$theory"; done
+cp "$markers/B.loadpath" "$tmpdir/B-cold.loadpath"
 
 # Declaring the base heap changes the input keys of the theories that start
 # from it, so B and C rebuild from the heap; A and D stay up to date.
@@ -133,10 +134,18 @@ require_heap_start B
 require_heap_start C
 require_no_markers A D
 # Every child adds the project's dirs to its load path when it starts; the
-# heap must not carry a second copy taken when it was exported.
-project_entries=$(grep -c '/project$' "$markers/B.loadpath" || true)
-if [[ "$project_entries" != 1 ]]; then
-  echo "base heap user has the project root on its load path $project_entries times" >&2
+# heap must add nothing to that.  Which project dirs exist differs between the
+# two builds, so compare the entries outside the project, and require no
+# project entry twice.
+outside_project() { grep -v "^$project\(/\|\$\)" "$1" || true; }
+if ! diff <(outside_project "$tmpdir/B-cold.loadpath") \
+          <(outside_project "$markers/B.loadpath") > "$tmpdir/loadpath.diff"; then
+  echo "base heap user's load path outside the project differs from a hol.state child's" >&2
+  cat "$tmpdir/loadpath.diff" >&2
+  exit 1
+fi
+if [[ -n "$(sort "$markers/B.loadpath" | uniq -d)" ]]; then
+  echo "base heap user has duplicate load path entries" >&2
   cat "$markers/B.loadpath" >&2
   exit 1
 fi
@@ -232,6 +241,88 @@ rm -f "$markers"/*.hierarchy
 require_grep "exporting base heap" "$tmpdir/after-plain.log"
 require_heap_start C
 
+# A heap file deleted while its .ok stays is just stale: no checkpoint
+# residue warning, and it is exported again.
+rm "$heap"
+rm -f "$markers"/*.hierarchy
+(cd "$project" && "$HOLBUILD_BIN" build --force=theory CTheory) > "$tmpdir/missing-heap.log" 2>&1
+if grep -q "checkpoint metadata exists without checkpoint file" "$tmpdir/missing-heap.log"; then
+  echo "missing base heap was reported as checkpoint residue" >&2
+  cat "$tmpdir/missing-heap.log" >&2
+  exit 1
+fi
+require_grep "exporting base heap" "$tmpdir/missing-heap.log"
+require_heap_start C
+
+# Key dumps mark the rows of theories that start from the heap.
+(cd "$project" && HOLBUILD_DUMP_KEYS="$tmpdir/heap.keys" "$HOLBUILD_BIN" build) > /dev/null
+for theory in B C; do require_grep "${theory}Theory.*	base_heap\$" "$tmpdir/heap.keys"; done
+for theory in A D; do
+  if grep -q "${theory}Theory.*base_heap" "$tmpdir/heap.keys"; then
+    echo "$theory is not a base heap user but its key row is marked" >&2
+    cat "$tmpdir/heap.keys" >&2
+    exit 1
+  fi
+done
+
+# Two users that build at once share one export, and a failed export fails
+# both without being retried.
+for theory in F G; do
+  cat > "$project/src/${theory}Script.sml" <<SML
+open HolKernel Parse boolLib bossLib ATheory;
+$(record_hierarchy "$theory")
+val _ = new_theory "$theory";
+val ${theory,,}_thm = store_thm("${theory,,}_thm", \`\`T /\\ T\`\`, REWRITE_TAC [a_thm]);
+val _ = export_theory();
+SML
+done
+rm -f "$heap" "$heap.ok" "$markers"/*.hierarchy
+(cd "$project" && "$HOLBUILD_BIN" -j2 build FTheory GTheory) > "$tmpdir/shared-export.log" 2>&1
+exports=$(grep -c "exporting base heap" "$tmpdir/shared-export.log" || true)
+[[ "$exports" == 1 ]] || { echo "two base heap users exported the heap $exports times" >&2; exit 1; }
+require_heap_start F
+require_heap_start G
+rm -f "$heap" "$heap.ok"
+chmod a-w "$project/.holbuild/heap"
+if (cd "$project" && "$HOLBUILD_BIN" -j2 build --force=theory FTheory GTheory) > "$tmpdir/failed-export.log" 2>&1; then
+  chmod u+w "$project/.holbuild/heap"
+  echo "build succeeded although the base heap could not be exported" >&2
+  exit 1
+fi
+chmod u+w "$project/.holbuild/heap"
+exports=$(grep -c "exporting base heap" "$tmpdir/failed-export.log" || true)
+[[ "$exports" == 1 ]] || { echo "a failed base heap export was attempted $exports times" >&2; exit 1; }
+require_grep "hol buildheap failed while exporting heap" "$tmpdir/failed-export.log"
+rm "$project/src/FScript.sml" "$project/src/GScript.sml"
+
+# HOL adds the dirs named by a holproject.toml or .holpath above its working
+# directory to the heap's load path, so the export refuses to run below one.
+planted=$tmpdir/planted
+mkdir -p "$planted"
+printf '[holmake]\n' > "$planted/holproject.toml"
+use_case_cache "$planted/cache"
+if (cd "$project" && "$HOLBUILD_BIN" build --force=theory CTheory) > "$tmpdir/planted.log" 2>&1; then
+  echo "base heap was exported below a planted holproject.toml" >&2
+  exit 1
+fi
+require_grep "cannot export base heap: $planted/holproject.toml is above the export directory" "$tmpdir/planted.log"
+if compgen -G "$planted/cache/tmp/heap-export-*" > /dev/null; then
+  echo "refused base heap export left its directory behind" >&2
+  exit 1
+fi
+use_case_cache "$tmpdir/cache"
+
+# The heap records the path of the hol.state it extends, so moving the
+# toolchain (here, with the cache that links to it) exports it again.
+(cd "$project" && "$HOLBUILD_BIN" build --force=theory CTheory) > "$tmpdir/before-move.log"
+require_file "$heap.ok"
+mv "$tmpdir/cache" "$tmpdir/cache-moved"
+use_case_cache "$tmpdir/cache-moved"
+rm -f "$markers"/*.hierarchy
+(cd "$project" && "$HOLBUILD_BIN" build --force=theory CTheory) > "$tmpdir/moved-toolchain.log" 2>&1
+require_grep "exporting base heap" "$tmpdir/moved-toolchain.log"
+require_heap_start C
+
 # A theory that reaches only some of the objects starts from hol.state.
 cat > "$project/src/EScript.sml" <<SML
 open HolKernel Parse boolLib bossLib CTheory DTheory;
@@ -321,7 +412,8 @@ SML
 write_consumer_manifest ""
 rm -f "$markers"/*.hierarchy
 (cd "$consumer" && "$HOLBUILD_BIN" -j2 build) > "$tmpdir/consumer-cold.log" 2>&1
-require_grep "ignoring base = true in dependency package depbase" "$tmpdir/consumer-cold.log"
+warnings=$(grep -c "ignoring base = true in dependency package depbase" "$tmpdir/consumer-cold.log" || true)
+[[ "$warnings" == 1 ]] || { echo "dependency base heap warning printed $warnings times" >&2; exit 1; }
 require_file "$markers/Q.hierarchy"
 write_consumer_manifest "base = true"
 rm -f "$markers"/*.hierarchy
@@ -347,11 +439,16 @@ name = "other"
 output = "other.save"
 objects = ["BTheory"]
 base = true'
-reject duplicate-output "duplicate heap/executable output: .holbuild/heap/base.save" '
+reject duplicate-output "duplicate heap/executable output: \./\.holbuild/heap/base\.save" '
 [[heap]]
 name = "other"
 output = "./.holbuild/heap/base.save"
 objects = ["BTheory"]'
+reject duplicate-absolute-output "duplicate heap/executable output: $tmpdir/duplicate-absolute-output/" "
+[[heap]]
+name = \"other\"
+output = \"$tmpdir/duplicate-absolute-output/.holbuild/heap/base.save\"
+objects = [\"BTheory\"]"
 reject executable-base "unknown field in executable: base" '
 [[executable]]
 name = "tool"

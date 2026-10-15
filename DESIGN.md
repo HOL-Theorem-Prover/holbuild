@@ -623,7 +623,7 @@ PolyML heap checkpoints and `.save` files are materialized as local project
 artifacts:
 
 ```text
-.holbuild/heap/          optional user-requested exported heaps
+.holbuild/heap/          exported [[heap]]/[[executable]] targets, including a base heap
 .holbuild/checkpoints/   local PolyML replay checkpoints
 ```
 
@@ -658,14 +658,16 @@ a cold start that loads the objects first:
   reach every object. Any theory such edges reach is loaded by the child or is
   an ancestor of one that is, so the heap adds no module the cold child would
   not load. The remaining preloads find the heap's modules already loaded.
-- The heap key hashes the toolchain key with the objects' load stems and
-  input keys. A missing or mismatched `<output>.ok`, or a heap file whose
+- The heap key hashes the toolchain key, the path of `hol.state` (which the
+  heap records as its parent), and the objects' load stems and input keys. A missing or mismatched `<output>.ok`, or a heap file whose
   content hash differs from the one `<output>.ok` records, re-exports it.
-- `buildheap` runs in an empty directory outside the project. HOL adds the
-  dirs of the project around its working directory to `Meta.loadPath`, and a
-  saved state keeps them; every theory child adds the current dirs again when
-  it starts. Exported inside the project, the heap would carry a second copy,
-  taken at export time, that a `hol.state` child lacks.
+- `buildheap` runs in an empty directory under the holbuild cache's `tmp/`.
+  HOL adds the dirs of the project around its working directory to
+  `Meta.loadPath`, and a saved state keeps them; every theory child adds the
+  current dirs again when it starts. Exported inside the project, the heap
+  would carry a second copy, taken at export time, that a `hol.state` child
+  lacks. HOL finds that project by walking up for `holproject.toml` or
+  `.holpath`, so the export fails when either is above the directory.
 
 Only root-package theories start from the heap, even when an object is a
 dependency's theory: a dependency's input keys then never depend on the
@@ -706,8 +708,10 @@ final_context.save       after a clean consumer process loads the generated theo
 single session cannot safely export and then re-incorporate the generated theory
 module. The source child therefore records generated load metadata, exports, and
 exits. Holbuild constructs complete stage load manifests from that metadata, then
-a separate child starts from the pre-theory dependency context (or the toolchain
-base state as a fallback), loads `FooTheory`, and saves `final_context.save`.
+a separate child starts from the pre-theory dependency context (or, as a
+fallback, the state the theory child started from: the toolchain base state, or
+the base heap for a theory that starts from it), loads `FooTheory`, and saves
+`final_context.save`.
 This also ensures that the final context reflects the published consumer view,
 not arbitrary top-level SML bindings retained from the theory script.
 

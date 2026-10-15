@@ -556,14 +556,20 @@ manifest's `base = true` is ignored with a warning.
 
 `holbuild build` exports the base heap the first time a theory that would
 start from it has to build from source, and only when the heap is missing or
-stale. The heap is keyed by the toolchain and the objects' input keys, which
-`<output>.ok` records; editing any ancestor of an object re-exports it.
+stale. The heap is keyed by the toolchain, the path of its `hol.state`, and
+the objects' input keys, which `<output>.ok` records; editing any ancestor of
+an object, or moving the toolchain, re-exports it.
 `<output>.ok` also records the exported file's content hash, and a build
 re-exports a heap file that no longer matches it. `holbuild heap base` always
 re-exports the same heap. Exporting it while `base` is unset deletes
 `<output>.ok`, so the next build re-exports it. Checkpoints
 saved over the heap are keyed by the exported file itself, so a re-export
 never resumes them, even when the heap key is unchanged.
+
+The export runs `hol buildheap` in a directory under the holbuild cache
+directory, and fails when a
+`holproject.toml` or `.holpath` lies above that directory, since HOL would
+add the directories it names to the heap's load path.
 
 A heap start loads the heap's theories before the theory's other preloads, and
 HOL state that keeps the most recent registration (for example `cv_trans`

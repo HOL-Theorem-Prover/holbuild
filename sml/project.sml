@@ -165,6 +165,21 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
               else ()
           | _ => ())
         dependencies
+    (* Two targets writing one file would overwrite each other's export.
+       Outputs are compared as absolute paths, so `x.save` and `/root/x.save`
+       collide. *)
+    fun output_path (Heap {output, ...}) =
+      Path.mkCanonical (if Path.isAbsolute output then output else Path.concat(root, output))
+    val _ =
+      List.foldl
+        (fn (heap as Heap {output, ...}, seen) =>
+            let val path = output_path heap
+            in
+              if List.exists (fn old => old = path) seen then
+                die ("duplicate heap/executable output: " ^ output)
+              else path :: seen
+            end)
+        [] heaps
     val excludes = manifest_excludes @ build_excludes
     val exclude_globs = manifest_exclude_globs @ build_exclude_globs
   in

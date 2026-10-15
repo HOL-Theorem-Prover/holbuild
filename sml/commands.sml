@@ -789,6 +789,10 @@ fun heap_objects index project command (HolbuildProject.Heap {name, objects, ...
       [] => raise Error (command ^ " target has no objects: " ^ name)
     | expanded => expanded
 
+(* Packages already warned about: build options are computed again in every
+   round of watch mode. *)
+val warned_dependency_base_heaps : string list ref = ref []
+
 (* Like other root-only settings, a dependency's base heap does not apply to
    the consumer's build; warn because it is easy to expect otherwise. *)
 fun warn_dependency_base_heaps resolution project =
@@ -798,12 +802,17 @@ fun warn_dependency_base_heaps resolution project =
       HolbuildProject.package_name package <> root andalso
       List.exists is_base_heap
         (#heaps (HolbuildPackageDefinition.runtime (HolbuildProject.package_definition_of package)))
+    fun warn_once package =
+      let val name = HolbuildProject.package_name package
+      in
+        if List.exists (fn old => old = name) (!warned_dependency_base_heaps) then ()
+        else
+          (warned_dependency_base_heaps := name :: !warned_dependency_base_heaps;
+           warn ("ignoring base = true in dependency package " ^ name ^
+                 "; only the root project's base heap is used"))
+      end
   in
-    List.app (fn package =>
-                warn ("ignoring base = true in dependency package " ^
-                      HolbuildProject.package_name package ^
-                      "; only the root project's base heap is used"))
-             (List.filter sets_base (resolved_packages resolution project))
+    List.app warn_once (List.filter sets_base (resolved_packages resolution project))
   end
 
 fun base_heap_spec resolution project index =

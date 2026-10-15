@@ -196,8 +196,6 @@ fun parse_heaps table =
         (parse_image_entry "executable" (fn value =>
           ExecutableImage {main = Option.getOpt(string_field value "main", "main")}))
     fun name_of (Heap {name, ...}) = name
-    (* Two targets writing one file would overwrite each other's export. *)
-    fun output_of (Heap {output, ...}) = OS.Path.mkCanonical output
     fun reject_duplicates what field =
       let
         fun loop _ [] = ()
@@ -215,7 +213,7 @@ fun parse_heaps table =
           _ :: second :: _ =>
             die ("at most one [[heap]] may set base = true; also set on: " ^ name_of second)
         | _ => ()
-  in reject_duplicates "target name" name_of; reject_duplicates "output" output_of; heaps end
+  in reject_duplicates "target name" name_of; heaps end
 
 fun parse_generator value =
   case value of

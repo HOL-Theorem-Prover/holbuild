@@ -39,7 +39,8 @@ base = true
 - Root-project theories whose preloads reach every object start from this heap instead of `hol.state`. Other theories, the objects and their ancestors, and all dependency-package theories start from `hol.state`.
 - It declares that those theories start with the objects loaded first; it is not only a speed-up. Their theory files (and in principle which proofs succeed) can differ from a build without `base`, so setting `base` changes their input keys and they rebuild once.
 - At most one heap may set `base`; `objects` must be non-empty theory targets. A dependency manifest's `base = true` is ignored with a warning.
-- `holbuild build` exports the heap when a theory that starts from it builds from source and the heap is missing, stale, or no longer matches the content hash in `<output>.ok`. `holbuild heap base` always re-exports it.
+- `holbuild build` exports the heap when a theory that starts from it builds from source and the heap is missing, stale (objects changed or toolchain moved), or no longer matches the content hash in `<output>.ok`. `holbuild heap base` always re-exports it.
+- The export runs under the holbuild cache directory and fails if a `holproject.toml` or `.holpath` is above it; set `HOLBUILD_CACHE` outside any HOL project.
 
 ## `holbuild run` / `holbuild repl` — prototype status
 
