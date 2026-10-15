@@ -175,6 +175,128 @@ rm -f "$heap.ok"
 require_grep "exporting base heap" "$tmpdir/heap-command.log"
 require_grep "$key_after" "$heap.ok"
 
+# That re-export kept the heap key but rewrote the file, so checkpoints saved
+# over the previous file must not be resumed.
+rm -f "$markers"/*.hierarchy
+printf '\nval c2_thm = store_thm("c2_thm", ``~F``, REWRITE_TAC []);\nval _ = export_theory();\n' \
+  >> "$project/src/CScript.sml"
+(cd "$project" && "$HOLBUILD_BIN" -j2 build) > "$tmpdir/reexport-resume.log" 2>&1
+if grep -q "discarding invalid checkpoint" "$tmpdir/reexport-resume.log"; then
+  echo "resumed a checkpoint saved over a replaced base heap" >&2
+  cat "$tmpdir/reexport-resume.log" >&2
+  exit 1
+fi
+require_heap_start C
+
+# Exporting the heap as a plain heap drops the base heap's .ok, so setting
+# base again re-exports it rather than trusting the plain heap.
+write_manifest ""
+(cd "$project" && "$HOLBUILD_BIN" heap base) > "$tmpdir/plain-export.log"
+require_file "$heap"
+require_no_file "$heap.ok"
+write_manifest "base = true"
+rm -f "$markers"/*.hierarchy
+(cd "$project" && "$HOLBUILD_BIN" build --force=theory CTheory) > "$tmpdir/after-plain.log"
+require_grep "exporting base heap" "$tmpdir/after-plain.log"
+require_heap_start C
+
+# A theory that reaches only some of the objects starts from hol.state.
+cat > "$project/src/EScript.sml" <<SML
+open HolKernel Parse boolLib bossLib CTheory DTheory;
+$(record_hierarchy E)
+val _ = new_theory "E";
+val e_thm = store_thm("e_thm", \`\`T /\\ T\`\`, REWRITE_TAC [c_thm]);
+val _ = export_theory();
+SML
+sed -i 's/objects = \["ATheory"\]/objects = ["ATheory", "DTheory"]/' "$project/holproject.toml"
+rm -f "$markers"/*.hierarchy
+(cd "$project" && "$HOLBUILD_BIN" -j2 build --force) > "$tmpdir/two-objects.log"
+for theory in A B C D; do require_toolchain_start "$theory"; done
+require_heap_start E
+write_manifest "base = true"
+rm "$project/src/EScript.sml"
+
+# Only root-package theories start from the base heap: a dependency theory
+# that reaches the objects keeps its input key, and a dependency's own base
+# heap is ignored with a warning.
+dep=$tmpdir/dep
+consumer=$tmpdir/consumer
+consumer_heap=$consumer/.holbuild/heap/base.save
+mkdir -p "$dep/src" "$consumer/src"
+{
+  write_schema2_prelude
+  cat <<'TOML'
+[project]
+name = "depbase"
+
+[build]
+members = ["src"]
+
+[[heap]]
+name = "base"
+output = "base.save"
+objects = ["PTheory"]
+base = true
+TOML
+} > "$dep/holproject.toml"
+cat > "$dep/src/PScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "P";
+val p_thm = store_thm("p_thm", ``T``, ACCEPT_TAC TRUTH);
+val _ = export_theory();
+SML
+{
+  echo 'open HolKernel Parse boolLib bossLib PTheory;'
+  record_hierarchy Q
+  cat <<'SML'
+val _ = new_theory "Q";
+val q_thm = store_thm("q_thm", ``T /\ T``, REWRITE_TAC [p_thm]);
+val _ = export_theory();
+SML
+} > "$dep/src/QScript.sml"
+dep_rev=$(init_git_repo "$dep")
+write_consumer_manifest() {
+  {
+    write_schema2_prelude
+    cat <<TOML
+[project]
+name = "consumer"
+
+[build]
+members = ["src"]
+
+[dependencies.depbase]
+git = "$dep"
+rev = "$dep_rev"
+
+[[heap]]
+name = "base"
+output = ".holbuild/heap/base.save"
+objects = ["PTheory"]
+$1
+TOML
+  } > "$consumer/holproject.toml"
+}
+{
+  echo 'open HolKernel Parse boolLib bossLib QTheory;'
+  record_hierarchy R
+  cat <<'SML'
+val _ = new_theory "R";
+val r_thm = store_thm("r_thm", ``T /\ T``, REWRITE_TAC [q_thm]);
+val _ = export_theory();
+SML
+} > "$consumer/src/RScript.sml"
+write_consumer_manifest ""
+rm -f "$markers"/*.hierarchy
+(cd "$consumer" && "$HOLBUILD_BIN" -j2 build) > "$tmpdir/consumer-cold.log" 2>&1
+require_grep "ignoring base = true in dependency package depbase" "$tmpdir/consumer-cold.log"
+require_file "$markers/Q.hierarchy"
+write_consumer_manifest "base = true"
+rm -f "$markers"/*.hierarchy
+(cd "$consumer" && "$HOLBUILD_BIN" -j2 build) > "$tmpdir/consumer-heap.log" 2>&1
+require_no_file "$markers/Q.hierarchy"
+require_grep "$consumer_heap" "$markers/R.hierarchy"
+
 reject() {
   local name=$1 expected=$2 extra=$3
   local dir=$tmpdir/$name
@@ -193,12 +315,25 @@ name = "other"
 output = "other.save"
 objects = ["BTheory"]
 base = true'
+reject duplicate-output "duplicate heap/executable output: .holbuild/heap/base.save" '
+[[heap]]
+name = "other"
+output = "./.holbuild/heap/base.save"
+objects = ["BTheory"]'
 reject executable-base "unknown field in executable: base" '
 [[executable]]
 name = "tool"
 output = "tool.exe"
 objects = ["ATheory"]
 base = true'
+no_objects=$tmpdir/no-objects
+cp -R "$project" "$no_objects"
+sed -i 's/objects = \["ATheory"\]/objects = []/' "$no_objects/holproject.toml"
+if (cd "$no_objects" && "$HOLBUILD_BIN" build) > "$tmpdir/no-objects.log" 2>&1; then
+  echo "build unexpectedly accepted a base heap with no objects" >&2
+  exit 1
+fi
+require_grep "heap target has no objects: base" "$tmpdir/no-objects.log"
 cat > "$project/src/helperLib.sml" <<'SML'
 structure helperLib = struct val x = 1 end
 SML

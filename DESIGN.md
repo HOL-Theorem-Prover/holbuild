@@ -658,10 +658,21 @@ a cold start:
   reach every object. Any theory such edges reach is loaded by the child or is
   an ancestor of one that is, so the heap adds no module the cold child would
   not load. The remaining preloads find the heap's modules already loaded.
-- The heap identity hashes the toolchain key with the objects' load stems and
-  input keys. A missing or mismatched `<output>.ok` re-exports it, and the
-  dependency-context key of every checkpoint started from the heap includes
-  that identity, so checkpoints never outlive the heap they were saved over.
+- The heap key hashes the toolchain key with the objects' load stems and
+  input keys. A missing or mismatched `<output>.ok` re-exports it.
+
+Only root-package theories start from the heap, even when an object is a
+dependency's theory: a dependency's input keys then never depend on the
+consumer's manifest. A dependency manifest's `base = true` is ignored with a
+warning.
+
+The heap key can recur for a new file: deleting `<output>.ok` and running
+`holbuild heap`, or reverting an edit to an object, re-exports under the same
+key. Poly/ML rejects a child state whose parent file was rewritten, so the
+dependency-context key of a checkpoint started from the heap includes the
+content hash of the exported file, which `<output>.ok` records at export.
+Checkpoints therefore never outlive the heap file they were saved over, while
+theory input keys, which name only the objects, stay shared through the cache.
 
 A heap start still differs from a cold start in load order: the heap's
 modules load first, in the order `buildheap` loads them, rather than in

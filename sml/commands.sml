@@ -784,15 +784,35 @@ fun prepare_source_index phase_prefix resolution project =
 fun is_base_heap (HolbuildProject.Heap {kind = HolbuildProject.HeapImage {base}, ...}) = base
   | is_base_heap _ = false
 
-fun heap_objects index project objects =
-  HolbuildSourceIndex.expand_group_tokens index (HolbuildProject.project_package project) objects
+fun heap_objects index project command (HolbuildProject.Heap {name, objects, ...}) =
+  case HolbuildSourceIndex.expand_group_tokens index (HolbuildProject.project_package project) objects of
+      [] => raise Error (command ^ " target has no objects: " ^ name)
+    | expanded => expanded
 
-fun base_heap_spec project index =
-  case List.find is_base_heap (#heaps project) of
-      SOME (HolbuildProject.Heap {output, objects, ...}) =>
-        SOME {output = HolbuildProject.abs_under (#root project) output,
-              objects = heap_objects index project objects}
-    | NONE => NONE
+(* Like other root-only settings, a dependency's base heap does not apply to
+   the consumer's build; warn because it is easy to expect otherwise. *)
+fun warn_dependency_base_heaps resolution project =
+  let
+    val root = HolbuildProject.package_name (HolbuildProject.project_package project)
+    fun sets_base package =
+      HolbuildProject.package_name package <> root andalso
+      List.exists is_base_heap
+        (#heaps (HolbuildPackageDefinition.runtime (HolbuildProject.package_definition_of package)))
+  in
+    List.app (fn package =>
+                warn ("ignoring base = true in dependency package " ^
+                      HolbuildProject.package_name package ^
+                      "; only the root project's base heap is used"))
+             (List.filter sets_base (resolved_packages resolution project))
+  end
+
+fun base_heap_spec resolution project index =
+  (warn_dependency_base_heaps resolution project;
+   case List.find is_base_heap (#heaps project) of
+       SOME (heap as HolbuildProject.Heap {output, ...}) =>
+         SOME {output = HolbuildProject.abs_under (#root project) output,
+               objects = heap_objects index project "heap" heap}
+     | NONE => NONE)
 
 fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, proof_steps, new_ir, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy}, targets) =
   let
@@ -873,7 +893,7 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
        emit_output_hashes = emit_output_hashes,
        allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy,
        trknl = HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc),
-       base_heap = base_heap_spec project index}
+       base_heap = base_heap_spec resolution project index}
     fun prepare_plan () =
       let
         val {index, components} =
@@ -1088,7 +1108,7 @@ fun parse_export_args args =
 fun root_package_name project =
   HolbuildProject.package_name (HolbuildProject.project_package project)
 
-fun export_build_options trknl project index entry_plan plan =
+fun export_build_options resolution trknl project index entry_plan plan =
   let
     fun default_tactic_timeout () =
       case #build_tactic_timeout project of
@@ -1122,7 +1142,7 @@ fun export_build_options trknl project index entry_plan plan =
      emit_output_hashes = false,
      allow_cache_timeout_discrepancy = false,
      trknl = trknl,
-     base_heap = base_heap_spec project index}
+     base_heap = base_heap_spec resolution project index}
   end
 
 fun theory_node node =
@@ -1245,7 +1265,7 @@ fun export_archive tc jobs args =
       else SOME (timed_phase "entry_timeout.plan"
                    (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index explicit_entry_targets))
     val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
-    val options = export_build_options (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)) project index entry_plan plan
+    val options = export_build_options resolution (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)) project index entry_plan plan
     val keys = HolbuildBuildPlan.input_keys (HolbuildBuildExec.build_config_lines options project plan) toolchain_key plan
     val entries = export_entries project plan keys
     val cache = HolbuildFSCacheBackend.default () handle HolbuildFSCacheBackend.Error msg => raise Error msg
@@ -1355,11 +1375,10 @@ fun build_heap_kind tc cli_jobs command target =
     fun execute_heap () =
       let
         val heap = heap_named project command target
-        val HolbuildProject.Heap {output, objects, kind, ...} = heap
-        val {index, components} = prepare_source_index "heap"
-                                  (resolution_for_toolchain tc) project
-        val objects = heap_objects index project objects
-        val _ = if null objects then raise Error (command ^ " target has no objects: " ^ target) else ()
+        val HolbuildProject.Heap {output, kind, ...} = heap
+        val resolution = resolution_for_toolchain tc
+        val {index, components} = prepare_source_index "heap" resolution project
+        val objects = heap_objects index project command heap
         val plan = timed_phase "build.plan" (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index objects)
         val explicit_entry_targets =
           map #2 (HolbuildTacticTimeoutPolicy.explicit_entries project index)
@@ -1370,7 +1389,7 @@ fun build_heap_kind tc cli_jobs command target =
         val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
         val output_path = HolbuildProject.abs_under (#root project) output
         val build_options =
-          export_build_options (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)) project index entry_plan plan
+          export_build_options resolution (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)) project index entry_plan plan
       in
         HolbuildBuildExec.build build_options tc project plan toolchain_key jobs;
         if is_base_heap heap then

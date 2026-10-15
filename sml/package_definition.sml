@@ -196,13 +196,18 @@ fun parse_heaps table =
         (parse_image_entry "executable" (fn value =>
           ExecutableImage {main = Option.getOpt(string_field value "main", "main")}))
     fun name_of (Heap {name, ...}) = name
-    fun loop _ [] = ()
-      | loop names (heap :: rest) =
-          let val name = name_of heap
-          in if List.exists (fn old => old = name) names then
-               die ("duplicate heap/executable target name: " ^ name)
-             else loop (name :: names) rest
-          end
+    (* Two targets writing one file would overwrite each other's export. *)
+    fun output_of (Heap {output, ...}) = OS.Path.mkCanonical output
+    fun reject_duplicates what field =
+      let
+        fun loop _ [] = ()
+          | loop seen (heap :: rest) =
+              let val value = field heap
+              in if List.exists (fn old => old = value) seen then
+                   die ("duplicate heap/executable " ^ what ^ ": " ^ value)
+                 else loop (value :: seen) rest
+              end
+      in loop [] heaps end
     fun is_base (Heap {kind = HeapImage {base}, ...}) = base
       | is_base _ = false
     val _ =
@@ -210,7 +215,7 @@ fun parse_heaps table =
           _ :: second :: _ =>
             die ("at most one [[heap]] may set base = true; also set on: " ^ name_of second)
         | _ => ()
-  in loop [] heaps; heaps end
+  in reject_duplicates "target name" name_of; reject_duplicates "output" output_of; heaps end
 
 fun parse_generator value =
   case value of
