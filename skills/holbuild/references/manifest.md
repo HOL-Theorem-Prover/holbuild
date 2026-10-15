@@ -23,7 +23,7 @@ rev = "<exact-40-character-commit>"
 members = ["src", "lib", "gen"]   # source dirs/files relative to package root. Default: ["."]
 exclude = ["src/generated", "src/OneOff.sml"]  # concrete package-relative paths/subtrees
 exclude_globs = ["*/selftest.sml", "*/examples/*"]  # glob patterns, package-root-relative
-roots = ["src/MainScript.sml"]  # default roots; @name refs build groups are also accepted
+roots = ["MainTheory"]           # default roots: logical names, package-relative source paths, or @group refs
 root_groups = ["@generated"]  # additional default build groups; bare names also accepted
 tactic_timeout = 60.0            # root-package per-step timeout; CLI/local config override
 
@@ -35,7 +35,7 @@ exclude_globs = ["gen/*ExperimentalScript.sml"]
 allow_empty = false              # optional; default false
 
 [build.theory_tactic_timeouts]
-"src/SlowScript.sml" = 30.0      # applies only to this theory; 0 disables
+"SlowTheory" = 30.0              # logical name or script path; applies only to this theory; 0 disables
 
 [dependencies.depname]
 git = "https://github.com/org/dep"
@@ -108,7 +108,7 @@ Unsupported: schema 1, `[dependencies.HOLDIR]`, manifest path dependencies, depe
 
 ## Path rules
 
-- `build.members`, `build.exclude`, `build.exclude_globs`, `build.roots`, `build.groups.*.include`, `build.groups.*.include_globs`, `build.groups.*.exclude`, `build.groups.*.exclude_globs`, `actions.*.extra_inputs`, `actions.*.extra_deps`, `generate.*.inputs`, `generate.*.outputs` — **package-root-relative** and may not contain `..` components
+- `build.members`, `build.exclude`, `build.exclude_globs`, `build.roots` (path entries), `build.groups.*.include`, `build.groups.*.include_globs`, `build.groups.*.exclude`, `build.groups.*.exclude_globs`, `actions.*.extra_inputs`, `actions.*.extra_deps`, `generate.*.inputs`, `generate.*.outputs` — **package-root-relative** and may not contain `..` components
 - Absolute paths and `..` components are rejected in those package-relative fields
 - `dependencies.*.path` and `dependencies.*.manifest` are allowed only in `from/path/manifest` dependencies
 - `from` dependency `path` and `manifest` fields must be relative and contain no `..`

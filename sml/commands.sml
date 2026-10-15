@@ -337,7 +337,10 @@ fun project_has_default_targets resolution project =
 
 fun default_build_targets resolution project index targets =
   if null targets then HolbuildSourceIndex.default_targets_with resolution index project
-  else HolbuildSourceIndex.expand_group_tokens index (HolbuildProject.project_package project) targets
+  else
+    (reject_object_targets targets;
+     HolbuildSourceIndex.expand_group_tokens index (HolbuildProject.project_package project)
+       (HolbuildSourceIndex.resolve_path_targets index targets))
 
 fun build_target_plan resolution components holdir project index requested_targets targets =
   if null requested_targets andalso null targets andalso not (project_has_default_targets resolution project) then
@@ -1293,6 +1296,7 @@ fun clean_targets args =
       let
         val {index, components} = prepare_source_index "clean"
                                   HolbuildProject.standard_resolution project
+        val args = HolbuildSourceIndex.resolve_path_targets index args
         val plan = timed_phase "build.plan"
                      (fn () => HolbuildBuildPlan.plan_targets components "" index args)
         fun target_nodes target =

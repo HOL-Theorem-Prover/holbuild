@@ -86,25 +86,43 @@ fun selected_node_for_source project plan source =
 fun theory_timeouts project index plan =
   let
     val package = root_package_name project
-    fun source_for path =
+    (* Entries name a theory by package-relative script path or by logical
+       name (`src/SlowScript.sml` or `SlowTheory`). *)
+    fun source_for name =
       case List.filter
              (fn (source : HolbuildSourceIndex.source) =>
-                 #package source = package andalso #relative_path source = path)
+                 #package source = package andalso
+                 (#relative_path source = name orelse #logical_name source = name))
              index of
           [] => raise HolbuildProject.Error
-                  ("build.theory_tactic_timeouts references unknown source: " ^ path)
-        | [source] =>
-            if #kind source = HolbuildSourceIndex.TheoryScript then source
-            else raise HolbuildProject.Error
-                   ("build.theory_tactic_timeouts references a non-theory source: " ^ path)
-        | _ => raise HolbuildProject.Error
-                 ("build.theory_tactic_timeouts references an ambiguous source: " ^ path)
-    fun one ({source = path, timeout}, acc) =
-      case selected_node_for_source project plan (source_for path) of
-          NONE => acc
-        | SOME node => (HolbuildBuildPlan.key node, timeout) :: acc
+                  ("build.theory_tactic_timeouts references unknown source: " ^ name)
+        | matches =>
+            if List.exists (fn source => #kind source <> HolbuildSourceIndex.TheoryScript) matches then
+              raise HolbuildProject.Error
+                ("build.theory_tactic_timeouts references a non-theory source: " ^ name)
+            else
+              case matches of
+                  [source] => source
+                | _ => raise HolbuildProject.Error
+                         ("build.theory_tactic_timeouts references an ambiguous source: " ^ name)
+    fun one ({source = name, timeout}, (seen, acc)) =
+      let
+        val source = source_for name
+        val path = #relative_path source
+        val _ =
+          if List.exists (fn seen_path => seen_path = path) seen then
+            raise HolbuildProject.Error
+              ("build.theory_tactic_timeouts references " ^ #logical_name source ^ " more than once")
+          else ()
+        val acc =
+          case selected_node_for_source project plan source of
+              NONE => acc
+            | SOME node => (HolbuildBuildPlan.key node, timeout) :: acc
+      in
+        (path :: seen, acc)
+      end
   in
-    List.foldl one [] (HolbuildProject.theory_tactic_timeouts project)
+    #2 (List.foldl one ([], []) (HolbuildProject.theory_tactic_timeouts project))
   end
 
 fun replace_timeouts base overrides =
