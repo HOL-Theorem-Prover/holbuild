@@ -40,6 +40,7 @@ base = true
 - It declares that those theories start with the objects loaded first; it is not only a speed-up. Their theory files (and in principle which proofs succeed) can differ from a build without `base`, so setting `base` changes their input keys and they rebuild once.
 - At most one heap of the root project may set `base`; `objects` must be non-empty theory targets. A dependency manifest's `base = true` is ignored with a warning.
 - `holbuild build` exports the heap when a theory that starts from it builds from source and the heap is missing, stale (objects changed or toolchain moved), or no longer matches the content hash in `<output>.ok`. `holbuild heap base` always re-exports it.
+- A relative `output` resolves under the build directory (the current directory with `--source-dir`), not the project root as for other heaps, so each build directory gets its own base heap and the source tree is never written.
 - Heap users' keys carry `base_heap_objects=`, so HBX archives and remote-cache entries built with `base = true` never serve consumers, whose theories use cold keys.
 
 ## `holbuild run` / `holbuild repl` — prototype status

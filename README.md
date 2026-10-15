@@ -567,6 +567,12 @@ re-exports the same heap. Exporting it while `base` is unset deletes
 saved over the heap are keyed by the exported file itself, so a re-export
 never resumes them, even when the heap key is unchanged.
 
+A relative `output` of the base heap is resolved under the directory that
+holds the build's `.holbuild/` (the current directory with `--source-dir`),
+while other heaps resolve it under the project root. Builds export the base
+heap on their own, so each build directory gets its own heap, and a shared
+or read-only source tree is never written.
+
 The export runs `hol buildheap` in a fresh directory under
 `.holbuild/stage/` that holds a `holproject.toml` with `holmake = false`. HOL
 adds the directories of the project around its working directory to the load

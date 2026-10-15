@@ -291,11 +291,25 @@ val _ = export_theory();
 SML
 done
 rm -f "$heap" "$heap.ok" "$markers"/*.hierarchy
-(cd "$project" && "$HOLBUILD_BIN" -j2 build FTheory GTheory) > "$tmpdir/shared-export.log" 2>&1
+(cd "$project" && HOLBUILD_TIMING_LOG="$tmpdir/shared-export.timing" HOLBUILD_TIMING_DETAIL=fine \
+   "$HOLBUILD_BIN" -j2 build FTheory GTheory) > "$tmpdir/shared-export.log" 2>&1
 exports=$(grep -c "exporting base heap" "$tmpdir/shared-export.log" || true)
 [[ "$exports" == 1 ]] || { echo "two base heap users exported the heap $exports times" >&2; exit 1; }
 require_heap_start F
 require_heap_start G
+# A user that finds the heap already exported returns at once, so a user that
+# took at least half as long as the export waited for it.
+phase_ms() {
+  grep "name=build.exec.base_heap.$1	status=ok" "$tmpdir/shared-export.timing" |
+    sed 's/.*	ms=\([0-9]*\).*/\1/'
+}
+export_ms=$(phase_ms export)
+waits=$(phase_ms ensure | awk -v export_ms="$export_ms" '2 * $1 >= export_ms' | wc -l)
+if [[ -z "$export_ms" || "$waits" != 2 ]]; then
+  echo "expected both base heap users to wait for the one export" >&2
+  grep "base_heap" "$tmpdir/shared-export.timing" >&2
+  exit 1
+fi
 # A regular file where the heap's directory belongs fails the export, even
 # for root.  holbuild reports only the first failure, so the timing log shows
 # that both users asked for the heap.
@@ -380,6 +394,77 @@ for theory in A B C D; do require_toolchain_start "$theory"; done
 require_heap_start E
 write_manifest "base = true"
 rm "$project/src/EScript.sml"
+
+# An object with project ancestors: a user whose preloads also name one of
+# them starts from the heap and builds what a hol.state child builds.
+{
+  echo 'open HolKernel Parse boolLib bossLib BTheory CTheory;'
+  record_hierarchy H
+  cat <<'SML'
+val _ = new_theory "H";
+val h_thm = store_thm("h_thm", ``T /\ T``, REWRITE_TAC [b_thm, c_thm]);
+val _ = export_theory();
+SML
+} > "$project/src/HScript.sml"
+write_manifest ""
+rm -f "$markers"/*.hierarchy
+(cd "$project" && "$HOLBUILD_BIN" build HTheory) > "$tmpdir/ancestor-cold.log"
+require_toolchain_start H
+h_cold=$(sha256sum < "$obj/HTheory.dat")
+write_manifest "base = true"
+sed -i 's/objects = \["ATheory"\]/objects = ["CTheory"]/' "$project/holproject.toml"
+rm -f "$markers"/*.hierarchy
+(cd "$project" && "$HOLBUILD_BIN" build HTheory) > "$tmpdir/ancestor-heap.log"
+require_grep "exporting base heap" "$tmpdir/ancestor-heap.log"
+require_heap_start H
+require_cold_load_path H
+[[ "$(sha256sum < "$obj/HTheory.dat")" == "$h_cold" ]] ||
+  { echo "HTheory differs between toolchain and base heap starts" >&2; exit 1; }
+write_manifest "base = true"
+rm "$project/src/HScript.sml"
+
+# With --source-dir, each build directory exports its own base heap under its
+# .holbuild/, and the source tree, here read-only, is never written.
+shared_src=$tmpdir/shared-src
+cp -R "$project" "$shared_src"
+rm -rf "$shared_src/.holbuild"
+chmod -R a-w "$shared_src"
+pids=()
+for out in out1 out2; do
+  mkdir -p "$tmpdir/$out"
+  (cd "$tmpdir/$out" && "$HOLBUILD_BIN" --source-dir "$shared_src" build --force=theory CTheory) \
+    > "$tmpdir/$out.log" 2>&1 &
+  pids+=($!)
+done
+status=0
+for pid in "${pids[@]}"; do wait "$pid" || status=1; done
+chmod -R u+w "$shared_src"
+if [[ "$status" != 0 ]]; then
+  echo "a --source-dir build failed" >&2
+  cat "$tmpdir/out1.log" "$tmpdir/out2.log" >&2
+  exit 1
+fi
+for out in out1 out2; do
+  require_grep "exporting base heap $tmpdir/$out/.holbuild/heap/base.save" "$tmpdir/$out.log"
+  require_grep "kind=base_heap" "$tmpdir/$out/.holbuild/heap/base.save.ok"
+done
+require_no_file "$shared_src/.holbuild"
+# Each build directory keeps its own heap current.
+(cd "$tmpdir/out1" && "$HOLBUILD_BIN" --source-dir "$shared_src" build --force=theory CTheory) \
+  > "$tmpdir/out1-again.log" 2>&1
+if grep -q "exporting base heap" "$tmpdir/out1-again.log"; then
+  echo "a build directory's base heap was exported again after another's export" >&2
+  exit 1
+fi
+# --quiet hides the export message, like the other progress lines.
+rm "$tmpdir/out2/.holbuild/heap/base.save"
+(cd "$tmpdir/out2" && "$HOLBUILD_BIN" --quiet --source-dir "$shared_src" build --force=theory CTheory) \
+  > "$tmpdir/out2-quiet.log" 2>&1
+require_file "$tmpdir/out2/.holbuild/heap/base.save"
+if grep -q "exporting base heap" "$tmpdir/out2-quiet.log"; then
+  echo "--quiet printed the base heap export" >&2
+  exit 1
+fi
 
 # Only root-package theories start from the base heap: a dependency theory
 # that reaches the objects keeps its input key and starts from hol.state.  A
@@ -504,6 +589,12 @@ reject duplicate-absolute-output "duplicate heap/executable output: $tmpdir/dupl
 name = \"other\"
 output = \"$tmpdir/duplicate-absolute-output/.holbuild/heap/base.save\"
 objects = [\"BTheory\"]"
+reject non-boolean-base "holproject.toml: base must be a boolean in \[\[heap\]\] other" '
+[[heap]]
+name = "other"
+output = "other.save"
+objects = ["BTheory"]
+base = "yes"'
 reject executable-base "unknown field in executable: base" '
 [[executable]]
 name = "tool"

@@ -13,9 +13,11 @@ and cacheable builds that never require users to reason about the cache.
 - The source tree is user-owned; build products live under project `.holbuild/`.
 - Target build contexts should be produced by holbuild from declared sources,
   predecessor checkpoints, or validated shared dependency state. The external
-  implementation currently starts child HOL actions from the project HOL declared
-  by `[dependencies.hol]` and keys that base state in the toolchain; eliminating
-  the prebuilt-base dependency is a root-HOL transition goal, not current behavior.
+  implementation currently starts child HOL actions from the base state of the
+  project HOL declared by `[dependencies.hol]` and keys that base state in the
+  toolchain; root theories that reach every object of a `base = true` heap start
+  from that heap, which extends the same base state. Eliminating the
+  prebuilt-base dependency is a root-HOL transition goal, not current behavior.
 - The cache is an optional accelerator. Local `.holbuild/` is the authoritative
   materialized build view.
 - When unsure, rebuild. A bad cache hit is worse than a missed cache hit.
@@ -671,6 +673,10 @@ a cold start that loads the objects first:
   none. HOL's separate walk up for holpath names does not stop there, but from
   a stage dir it sees what a theory child sees. The directory does not depend
   on the holbuild cache, which may be read-only or inside a HOL project.
+- A relative `output` resolves under the artifact root, while explicit heap
+  targets resolve it under the source root. Builds export the base heap
+  implicitly, and with `--source-dir` several artifact roots share one source
+  tree, which may be read-only and which the project lock does not cover.
 
 Only root-package theories start from the heap, even when an object is a
 dependency's theory: a dependency's input keys then never depend on the

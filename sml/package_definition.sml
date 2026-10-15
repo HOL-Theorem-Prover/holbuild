@@ -177,7 +177,7 @@ fun parse_image_entry section kind value =
         let
           val name = case string_field table "name" of SOME s => s | NONE => die ("[[" ^ section ^ "]] entry requires name")
           val output = case string_field table "output" of SOME s => s | NONE => die ("[[" ^ section ^ "]] entry requires output")
-        in Heap {name = name, output = output, objects = string_array_field table "objects", kind = kind table} end
+        in Heap {name = name, output = output, objects = string_array_field table "objects", kind = kind name table} end
     | _ => die (section ^ " entries must be tables")
 
 fun image_entries table section parse =
@@ -190,10 +190,13 @@ fun parse_heaps table =
   let
     val heaps =
       image_entries table "heap"
-        (parse_image_entry "heap" (fn value =>
-          HeapImage {base = Option.getOpt(bool_at value ["base"], false)})) @
+        (parse_image_entry "heap" (fn name => fn value =>
+          case lookup value ["base"] of
+              NONE => HeapImage {base = false}
+            | SOME (TOML.BOOL base) => HeapImage {base = base}
+            | SOME _ => die ("base must be a boolean in [[heap]] " ^ name))) @
       image_entries table "executable"
-        (parse_image_entry "executable" (fn value =>
+        (parse_image_entry "executable" (fn _ => fn value =>
           ExecutableImage {main = Option.getOpt(string_field value "main", "main")}))
     fun name_of (Heap {name, ...}) = name
     fun loop _ [] = ()

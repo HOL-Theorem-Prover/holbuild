@@ -4144,7 +4144,8 @@ fun export_base_heap tc project ({path, key, objects, ...} : base_heap) =
     val tmp = path ^ ".tmp"
   in
     remove_file (checkpoint_ok_path path);
-    HolbuildStatus.message_stdout ("exporting base heap " ^ path ^ "\n");
+    if HolbuildStatus.quiet_mode () then ()
+    else HolbuildStatus.message_stdout ("exporting base heap " ^ path ^ "\n");
     detail_time_phase "build.exec.base_heap.export"
       (fn () => run_buildheap_without_project tc project (map load_stem objects) tmp)
     handle e => (remove_file tmp; raise e);

@@ -815,11 +815,15 @@ fun warn_dependency_base_heaps resolution project =
     List.app warn_once (List.filter sets_base (resolved_packages resolution project))
   end
 
+(* A relative base heap output resolves under the artifact root, not the
+   source root like other heaps: builds export it on their own, and with
+   --source-dir several artifact roots share one source tree, which may be
+   read-only, while only the artifact root is under the project lock. *)
 fun base_heap_spec resolution project index =
   (warn_dependency_base_heaps resolution project;
    case List.find is_base_heap (#heaps project) of
        SOME (heap as HolbuildProject.Heap {output, ...}) =>
-         SOME {output = HolbuildProject.abs_under (#root project) output,
+         SOME {output = HolbuildProject.abs_under (HolbuildProject.artifact_root project) output,
                objects = heap_objects index project "heap" heap}
      | NONE => NONE)
 

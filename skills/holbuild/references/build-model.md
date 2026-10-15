@@ -50,6 +50,7 @@ hash(
   dependency input keys (recursively),
   declared action policy (deps, loads, extra_deps, cache, always_reexecute),
   extra dependency hashes,
+  base heap objects (base_heap_objects=, only for a theory that starts from the base heap),
   toolchain key (hol binary + hol.state hashes)
 )
 ```
