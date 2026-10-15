@@ -95,12 +95,13 @@ Cache restore: on action-key or parent-output key match, blobs are materialized 
 `--no-cache` disables both restore and publish but preserves local `.holbuild/` up-to-date checks. Force levels skip local up-to-date and cache restore only for the selected node set, and still publish cache unless `--no-cache` is also set: `--force=theory` (or `--force-theory`) forces requested/default target nodes, `--force=project` forces root-project nodes in the requested plan, and `--force=full`/bare `--force` forces the whole requested plan including dependency packages.
 
 GC:
-- `holbuild [--cache-dir PATH] gc [--retention-days N] [--max-checkpoints-gb GB] [--clean-only|--cache-only]`
+- `holbuild [--cache-dir PATH] gc [--retention-days N] [--max-checkpoints-gb GB] [--clean-only|--cache-only|--toolchains-only]`
 - Default: project clean + global cache GC, 7-day retention, 5GB checkpoint budget
 - Project clean removes stale `.holbuild/stage`, `.holbuild/logs`, checkpoint families, and evicts oldest checkpoint families above the size cap
 - Cache GC removes stale tmp, expired action manifests, and unreachable blobs, serialized with a POSIX file lock at `locks/gc.lock`
 - Cache GC also removes HOL toolchains under `hol-toolchains/` unused for the retention period (tracked by each entry's `last-used` marker); toolchains being built, restored, or used by a running holbuild are skipped and reported as `toolchains-busy`
 - Cache GC stages (tmp, locks, actions, blobs, toolchain-trash, toolchains) that run longer than a second on a terminal, or ten seconds when redirected, report scanned/removed counts and elapsed time on stderr, except under `--quiet`; stdout keeps the `project clean:` and `cache gc:` summary lines
+- `--toolchains-only` runs only the toolchain-trash and toolchains stages, under the same `locks/gc.lock`, without project discovery or scanning tmp, actions, or blobs; its stdout summary is `cache gc: removed toolchains=N toolchains-busy=M`; the `--*-only` options are mutually exclusive
 - Interrupted cache GC does not leave a stale lock; older directory-style `locks/gc.lock` entries are removed/replaced automatically
 - Legacy `holbuild cache gc` remains cache-only
 

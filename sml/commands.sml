@@ -125,8 +125,10 @@ fun gc_help () = print
   \Options:\n\
   \  --retention-days DAYS\n\
   \  --max-checkpoints-gb GB\n\
-  \  --clean-only\n\
-  \  --cache-only\n\n\
+  \  --clean-only        project state only\n\
+  \  --cache-only        global cache only; no project needed\n\
+  \  --toolchains-only   installed HOL toolchains only; no project needed\n\n\
+  \The --*-only options are mutually exclusive.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun cache_help () = print
@@ -1442,30 +1444,38 @@ fun dispatch tc jobs args =
     | cmd :: _ => if known_command cmd then raise Error ("unknown command: " ^ cmd)
                   else build tc jobs args
 
+datatype gc_scope = GcProjectAndCache | GcProjectOnly | GcCacheOnly | GcToolchainsOnly
+
+fun gc_scope_flag scope =
+  case scope of
+      GcProjectAndCache => ""
+    | GcProjectOnly => "--clean-only"
+    | GcCacheOnly => "--cache-only"
+    | GcToolchainsOnly => "--toolchains-only"
+
+fun select_gc_scope scope selected =
+  if scope = GcProjectAndCache orelse scope = selected then selected
+  else raise Error (gc_scope_flag scope ^ " and " ^ gc_scope_flag selected ^ " are mutually exclusive")
+
 fun parse_gc_args args =
   let
-    fun result days max_checkpoints_gb clean_only cache_only =
-      case (clean_only, cache_only) of
-          (true, true) => raise Error "--clean-only and --cache-only are mutually exclusive"
-        | (true, false) => (days, max_checkpoints_gb, true, false)
-        | (false, true) => (days, max_checkpoints_gb, false, true)
-        | (false, false) => (days, max_checkpoints_gb, true, true)
-    fun loop days max_checkpoints_gb clean_only cache_only rest =
+    fun loop days max_checkpoints_gb scope rest =
       case rest of
-          [] => result days max_checkpoints_gb clean_only cache_only
-        | "--retention-days" :: n :: xs => loop (HolbuildCache.parse_days n) max_checkpoints_gb clean_only cache_only xs
-        | "--days" :: n :: xs => loop (HolbuildCache.parse_days n) max_checkpoints_gb clean_only cache_only xs
+          [] => (days, max_checkpoints_gb, scope)
+        | "--retention-days" :: n :: xs => loop (HolbuildCache.parse_days n) max_checkpoints_gb scope xs
+        | "--days" :: n :: xs => loop (HolbuildCache.parse_days n) max_checkpoints_gb scope xs
         | "--max-checkpoints-gb" :: n :: xs =>
             (case Int.fromString n of
-                 SOME gb => if gb >= 0 then loop days (SOME gb) clean_only cache_only xs
+                 SOME gb => if gb >= 0 then loop days (SOME gb) scope xs
                             else raise Error "--max-checkpoints-gb must be non-negative"
                | NONE => raise Error "--max-checkpoints-gb requires an integer")
         | "--max-checkpoints-gb" :: [] => raise Error "--max-checkpoints-gb requires GB"
-        | "--clean-only" :: xs => loop days max_checkpoints_gb true cache_only xs
-        | "--cache-only" :: xs => loop days max_checkpoints_gb clean_only true xs
+        | "--clean-only" :: xs => loop days max_checkpoints_gb (select_gc_scope scope GcProjectOnly) xs
+        | "--cache-only" :: xs => loop days max_checkpoints_gb (select_gc_scope scope GcCacheOnly) xs
+        | "--toolchains-only" :: xs => loop days max_checkpoints_gb (select_gc_scope scope GcToolchainsOnly) xs
         | arg :: _ => raise Error ("unknown gc option: " ^ arg)
   in
-    loop HolbuildCache.default_retention_days NONE false false args
+    loop HolbuildCache.default_retention_days NONE GcProjectAndCache args
   end
 
 fun run_project_gc (days, max_checkpoints_gb_option) =
@@ -1479,11 +1489,14 @@ fun run_project_gc (days, max_checkpoints_gb_option) =
 
 fun gc args =
   let
-    val (days, max_checkpoints_gb, clean_project, clean_cache) = parse_gc_args args
-    val _ = if clean_project then run_project_gc (days, max_checkpoints_gb) else ()
-    val _ = if clean_cache then HolbuildCache.gc_root (HolbuildCache.cache_root ()) days else ()
+    val (days, max_checkpoints_gb, scope) = parse_gc_args args
+    fun cache_gc () = HolbuildCache.gc_root (HolbuildCache.cache_root ()) days
   in
-    ()
+    case scope of
+        GcProjectAndCache => (run_project_gc (days, max_checkpoints_gb); cache_gc ())
+      | GcProjectOnly => run_project_gc (days, max_checkpoints_gb)
+      | GcCacheOnly => cache_gc ()
+      | GcToolchainsOnly => HolbuildCache.gc_toolchains_root (HolbuildCache.cache_root ()) days
   end
 
 fun reject_holdir holdir =

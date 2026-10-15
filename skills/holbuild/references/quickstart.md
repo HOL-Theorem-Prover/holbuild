@@ -101,6 +101,7 @@ holbuild gc --retention-days 30                 # custom retention
 holbuild gc --max-checkpoints-gb 10             # size cap for project checkpoints
 holbuild gc --clean-only                        # project .holbuild residue only
 holbuild --cache-dir /path gc --cache-only      # global cache only; no project HOL needed
+holbuild gc --toolchains-only                   # installed HOL toolchains only; no project needed
 holbuild cache gc                               # legacy cache-only form still exists
 ```
 

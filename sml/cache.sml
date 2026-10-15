@@ -387,6 +387,19 @@ fun gc_root root days =
       with_lock root run
     end
 
+(* Toolchain-only GC: gc_root's lock and toolchain stages, without the tmp,
+   locks, actions, or blobs stages. *)
+fun gc_toolchains_root root days =
+  if not (path_exists root) then
+    print ("cache not found: " ^ root ^ "\n")
+  else
+    with_lock root (fn () =>
+      let val {removed, busy} = gc_toolchains (retention_cutoff days)
+      in
+        print ("cache gc: removed toolchains=" ^ Int.toString removed ^
+               " toolchains-busy=" ^ Int.toString busy ^ "\n")
+      end)
+
 fun parse_days text =
   case Int.fromString text of
       SOME n => n
