@@ -106,3 +106,129 @@ use_case_cache() {
   link_hol_toolchain_cache "$cache"
   export HOLBUILD_CACHE="$cache"
 }
+
+# A fake HOL checkout whose bin/build produces a minimal toolchain without
+# Poly/ML. Gates: HOLBUILD_TEST_BUILD_EVENT/GATE pause the build, and
+# HOLBUILD_TEST_FAKE_HOL_EVENT/GATE pause the built bin/hol. Requires
+# HOLBUILD_TEST_BUILD_COUNT.
+write_fake_hol() {
+  local hol=$1
+  mkdir -p "$hol"
+  mkdir -p "$hol/bin" "$hol/tools/build" "$hol/tools/sequences" "$hol/src/runtime"
+  cat > "$hol/.gitignore" <<'EOF'
+/bin/hol
+/bin/Holmake
+/bin/hol.state
+/sigobj
+/configured
+/built
+**/.hol/locks/
+EOF
+  cat > "$hol/tools/smart-configure.sml" <<'EOF'
+(* The fake Poly/ML executable records configuration. *)
+EOF
+  printf '#include sequences/upto-hol\nsrc/runtime\n' > "$hol/tools/build/build-sequence"
+  printf 'fake upto-hol sequence\n' > "$hol/tools/sequences/upto-hol"
+  cat > "$hol/src/runtime/Runtime.sml" <<'EOF'
+val restored_runtime = true
+EOF
+  cat > "$hol/bin/build" <<'SH'
+#!/usr/bin/env sh
+set -eu
+printf 'build\n' >> "${HOLBUILD_TEST_BUILD_COUNT:?}"
+if [ "${HOLBUILD_TEST_FAIL_LOCAL_BUILD:-}" = 1 ]; then
+  exit 71
+fi
+if [ -n "${HOLBUILD_TEST_BUILD_EVENT:-}" ]; then
+  printf 'observed\n' > "$HOLBUILD_TEST_BUILD_EVENT"
+fi
+if [ -n "${HOLBUILD_TEST_BUILD_GATE:-}" ]; then
+  cat "$HOLBUILD_TEST_BUILD_GATE" >/dev/null
+fi
+touch built
+mkdir -p bin sigobj src/runtime/.hol/locks
+printf 'fake-state\n' > bin/hol.state
+printf 'volatile\n' > src/runtime/.hol/locks/owner
+cat > bin/hol <<'HOL'
+#!/usr/bin/env sh
+set -eu
+state=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --holstate) state=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [ -n "$state" ] && ! grep -qx 'fake-state' "$state"; then
+  exit 72
+fi
+if [ -n "${HOLBUILD_TEST_FAKE_HOL_EVENT:-}" ]; then
+  printf 'observed\n' > "$HOLBUILD_TEST_FAKE_HOL_EVENT"
+fi
+if [ -n "${HOLBUILD_TEST_FAKE_HOL_GATE:-}" ]; then
+  cat "$HOLBUILD_TEST_FAKE_HOL_GATE" >/dev/null
+fi
+exit 0
+HOL
+chmod +x bin/hol
+cat > bin/Holmake <<'HOLMAKE'
+#!/usr/bin/env sh
+set -eu
+for source in "$@"; do
+  case "$source" in
+    *Script.sml) : > "${source%Script.sml}Theory.uo" ;;
+  esac
+done
+HOLMAKE
+chmod +x bin/Holmake
+ln -s "$(pwd)/src/runtime/Runtime.sml" sigobj/Runtime.uo
+SH
+  chmod +x "$hol/bin/build"
+}
+
+# Fake poly/polyc for HOLBUILD_POLY/HOLBUILD_POLYC, pairing with write_fake_hol.
+write_fake_poly() {
+  local fakebin=$1
+  mkdir -p "$fakebin"
+  cat > "$fakebin/poly" <<'SH'
+#!/usr/bin/env sh
+set -eu
+if [ "${1:-}" = -v ]; then
+  printf 'Fake Poly/ML Arm64 1.0\n'
+  exit 0
+fi
+touch configured
+SH
+  chmod +x "$fakebin/poly"
+  cat > "$fakebin/polyc" <<'SH'
+#!/usr/bin/env sh
+set -eu
+out=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) out=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$out" ]
+cat > "$out" <<'ANALYSER'
+#!/usr/bin/env sh
+set -eu
+if [ "${1:-}" = --version ]; then
+  printf 'holbuild-hol-analyser holbuild-hol-analyser-v2\n'
+  exit 0
+fi
+response=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --response) response=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$response" ]
+printf 'version 1\nok\nend\n' > "$response"
+ANALYSER
+chmod +x "$out"
+SH
+  chmod +x "$fakebin/polyc"
+}

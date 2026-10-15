@@ -120,7 +120,8 @@ fun clean_help () = print
 fun gc_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] gc [OPTIONS]\n\n\
-  \Remove stale project/cache state.\n\n\
+  \Remove stale project/cache state, including HOL toolchains unused for the\n\
+  \retention period.\n\n\
   \Options:\n\
   \  --retention-days DAYS\n\
   \  --max-checkpoints-gb GB\n\

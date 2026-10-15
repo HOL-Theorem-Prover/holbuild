@@ -131,6 +131,9 @@ fun locks_dir () = Path.concat(toolchains_dir (), ".locks")
 fun lock_dir k = Path.concat(locks_dir (), "hol-toolchain-" ^ k ^ ".lock")
 
 fun mutation_lease_path k = lock_dir k ^ ".mutation"
+fun usage_lease_path k = lock_dir k ^ ".usage"
+fun last_used_for_key k = Path.concat(entry_dir_for_key k, "last-used")
+fun trash_dir () = Path.concat(toolchains_dir (), ".trash")
 
 fun run_mutation k script =
   HolbuildProcessGroup.run_shell_with_mutation_lease
@@ -218,14 +221,16 @@ fun validate_entry req k =
 fun current_lock_owner lock =
   SOME (HolbuildFileLock.read_text (lock_owner_path lock)) handle _ => NONE
 
-fun lock_owner () =
+fun lock_owner_for command =
   String.concatWith "\n"
     ["holbuild-hol-toolchain-lock-v1",
-     "command=bootstrap HOL toolchain",
+     "command=" ^ command,
      "pid=" ^ HolbuildFileLock.current_pid_text (),
      "cwd=" ^ FS.getDir (),
      "host=" ^ HolbuildFileLock.current_host (),
      "started=" ^ Time.toString (Time.now ())] ^ "\n"
+
+fun lock_owner () = lock_owner_for "bootstrap HOL toolchain"
 
 fun unavailable_lock_owner () =
   String.concatWith "\n"
@@ -276,6 +281,28 @@ fun release_lock (ToolchainLock lock) =
 fun write_file path text =
   let val out = TextIO.openOut path
   in TextIO.output(out, text); TextIO.closeOut out end
+
+(* Every command that uses a toolchain holds a shared usage lease on it until
+   the process exits, so toolchain GC never removes an entry in use. fcntl
+   locks are dropped when the process closes any descriptor for the lease
+   file, so each key is leased at most once per process and never released. *)
+val held_usage_leases = ref ([] : (string * HolbuildFileLock.t) list)
+
+fun holds_usage_lease k = List.exists (fn (held, _) => held = k) (!held_usage_leases)
+
+fun hold_usage_lease k =
+  if holds_usage_lease k then ()
+  else
+    let
+      val lease = HolbuildFileLock.acquire_shared_path_wait {path = usage_lease_path k}
+                  handle HolbuildFileLock.Error msg =>
+                    die ("could not acquire HOL toolchain usage lease: " ^ msg)
+    in
+      held_usage_leases := (k, lease) :: !held_usage_leases
+    end
+
+(* GC retention is measured from the last-used marker's mtime. *)
+fun touch_last_used k = write_file (last_used_for_key k) "" handle IO.Io _ => ()
 
 fun analyser_source_dir () =
   case OS.Process.getEnv "HOLBUILD_ANALYSER_SRC" of
@@ -503,17 +530,126 @@ fun ensure_built_with_kernel req =
   let
     val k = key req
     val ak = analyser_key ()
+    (* Lease before validating, so GC cannot remove the entry in between. *)
+    val _ = hold_usage_lease k
+    val holdir =
+      if validate_entry req k andalso hol_source_manifest_built k andalso analyser_built k ak then holdir_for_key k
+      else
+        let val lock = acquire_lock k
+        in
+          (await_mutation_quiescence k;
+           finish_entry req k before release_lock lock)
+          handle error => (release_lock lock; raise error)
+        end
   in
-    if validate_entry req k andalso hol_source_manifest_built k andalso analyser_built k ak then holdir_for_key k
-    else
-      let val lock = acquire_lock k
-      in
-        (await_mutation_quiescence k;
-         finish_entry req k before release_lock lock)
-        handle error => (release_lock lock; raise error)
-      end
+    touch_last_used k;
+    holdir
   end
 
 fun ensure_built req = ensure_built_with_kernel (standard_request req)
+
+(* Toolchain GC: installed toolchains are rebuildable cache entries, removed
+   when unused for the retention period. An entry being built, restored or
+   used by another holbuild process is skipped rather than waited for. *)
+
+fun child_names dir =
+  let
+    val stream = FS.openDir dir
+    fun loop acc =
+      case FS.readDir stream of
+          NONE => rev acc
+        | SOME name => loop (if name = "." orelse name = ".." then acc else name :: acc)
+  in
+    (loop [] before FS.closeDir stream) handle e => (FS.closeDir stream; raise e)
+  end
+  handle OS.SysErr _ => []
+
+fun is_toolchain_key name = size name = 40 andalso CharVector.all Char.isHexDigit name
+
+fun remove_unlocked_tree path = remove_tree OS.Process.system path
+
+fun last_use_time k =
+  let fun mtime path = SOME (FS.modTime path) handle OS.SysErr _ => NONE
+  in
+    case mtime (last_used_for_key k) of
+        SOME time => SOME time
+      | NONE =>
+          (* Entries from before last-used existed, or never completed. *)
+          case mtime (ok_for_key k) of
+              SOME time => SOME time
+            | NONE => mtime (entry_dir_for_key k)
+  end
+
+fun entry_stale cutoff k =
+  case last_use_time k of
+      SOME time => Time.<(time, cutoff)
+    | NONE => false
+
+(* Renames the entry out of hol-toolchains under a non-blocking mutation lease,
+   so an interrupted GC never leaves a half-deleted entry in place and a
+   surviving child of a crashed builder keeps the entry busy. *)
+fun retire_entry k =
+  let
+    val trash = Path.concat(trash_dir (), k ^ "." ^ HolbuildFileLock.current_pid_text ())
+    val _ = ensure_dir (trash_dir ())
+    val _ = if path_exists trash then remove_unlocked_tree trash else ()
+    val script =
+      String.concatWith "\n"
+        ["exec 9>" ^ quote (mutation_lease_path k),
+         HolbuildProcessGroup.try_lease_lock () ^ " || exit 0",
+         "mv " ^ quote (entry_dir_for_key k) ^ " " ^ quote trash]
+    val status = OS.Process.system ("/bin/sh -c " ^ quote script)
+  in
+    if not (OS.Process.isSuccess status) then
+      die ("could not remove HOL toolchain cache entry: " ^ entry_dir_for_key k)
+    else if path_exists trash then (remove_unlocked_tree trash; true)
+    else false
+  end
+
+datatype gc_outcome = GcKept | GcRemoved | GcBusy
+
+fun with_try_lock path f =
+  case HolbuildFileLock.try_acquire_path {path = path, obsolete_kind = NONE}
+       handle HolbuildFileLock.Error msg => die msg of
+      NONE => GcBusy
+    | SOME lock =>
+        (f () before HolbuildFileLock.release lock)
+        handle e => (HolbuildFileLock.release lock; raise e)
+
+fun gc_entry cutoff k =
+  (* fcntl locks never conflict within one process, so an entry this process
+     uses must be skipped explicitly. *)
+  if holds_usage_lease k orelse not (entry_stale cutoff k) then GcKept
+  else
+    case try_acquire_lock_path (lock_dir k) of
+        NONE => GcBusy
+      | SOME lock =>
+          let
+            val build_lock = ToolchainLock lock
+            fun sweep () =
+              (HolbuildFileLock.write_text (lock_owner_path (lock_dir k)) (lock_owner_for "gc HOL toolchain");
+               with_try_lock (usage_lease_path k)
+                 (fn () =>
+                     if not (entry_stale cutoff k) then GcKept
+                     else if retire_entry k then GcRemoved
+                     else GcBusy))
+          in
+            (sweep () before release_lock build_lock)
+            handle e => (release_lock build_lock; raise e)
+          end
+
+fun gc_toolchains cutoff =
+  let
+    val _ = List.app (fn name => remove_unlocked_tree (Path.concat(trash_dir (), name)))
+                     (child_names (trash_dir ()))
+    fun count (k, {removed, busy}) =
+      case gc_entry cutoff k of
+          GcRemoved => {removed = removed + 1, busy = busy}
+        | GcBusy => {removed = removed, busy = busy + 1}
+        | GcKept => {removed = removed, busy = busy}
+  in
+    List.foldl count {removed = 0, busy = 0}
+      (List.filter is_toolchain_key (child_names (toolchains_dir ())))
+  end
 
 end
