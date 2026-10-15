@@ -661,8 +661,13 @@ a cold start that loads the objects first:
   an ancestor of one that is, so the heap adds no module the cold child would
   not load. The remaining preloads find the heap's modules already loaded.
 - The heap key hashes the toolchain key, the path of `hol.state` (which the
-  heap records as its parent), and the objects' load stems and input keys. A missing or mismatched `<output>.ok`, or a heap file whose
-  content hash differs from the one `<output>.ok` records, re-exports it.
+  heap records as its parent), and the objects' load stems and input keys.
+  `<output>.ok` also records a hash of the objects' `.dat` files, which record
+  their parents' hashes and so cover the ancestors too: a rebuild under an
+  unchanged input key can write different theory files, and users built over
+  the old ones would record parent hashes that never match. A missing or
+  mismatched `<output>.ok`, or a heap file whose content hash differs from the
+  one `<output>.ok` records, re-exports it.
 - `buildheap` runs in a fresh `.holbuild/stage/heap-export-<pid>-<nonce>/`
   holding a `holproject.toml` with `holmake = false`. HOL adds the dirs of the
   project around its working directory to `Meta.loadPath`, and a saved state
@@ -673,10 +678,13 @@ a cold start that loads the objects first:
   none. HOL's separate walk up for holpath names does not stop there, but from
   a stage dir it sees what a theory child sees. The directory does not depend
   on the holbuild cache, which may be read-only or inside a HOL project.
-- A relative `output` resolves under the artifact root, while explicit heap
-  targets resolve it under the source root. Builds export the base heap
-  implicitly, and with `--source-dir` several artifact roots share one source
-  tree, which may be read-only and which the project lock does not cover.
+
+A relative base heap `output` resolves under the artifact root, while explicit
+heap targets resolve it under the source root. Builds export the base heap
+implicitly, and with `--source-dir` several artifact roots share one source
+tree, which may be read-only and which the project lock does not cover. An
+absolute `output`, or one containing `..`, is rejected, because the export
+takes no lock of its own and several artifact roots would write one file.
 
 Only root-package theories start from the heap, even when an object is a
 dependency's theory: a dependency's input keys then never depend on the

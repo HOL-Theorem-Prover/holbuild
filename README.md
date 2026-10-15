@@ -559,7 +559,9 @@ manifest's `base = true` is ignored with a warning.
 start from it has to build from source, and only when the heap is missing or
 stale. The heap is keyed by the toolchain, the path of its `hol.state`, and
 the objects' input keys, which `<output>.ok` records; editing any ancestor of
-an object, or moving the toolchain, re-exports it.
+an object, or moving the toolchain, re-exports it. `<output>.ok` also records
+a hash of the objects' theory files, so rebuilding an object to different
+files under the same key (for example with `--force`) re-exports it too.
 `<output>.ok` also records the exported file's content hash, and a build
 re-exports a heap file that no longer matches it. `holbuild heap base` always
 re-exports the same heap. Exporting it while `base` is unset deletes
@@ -571,7 +573,9 @@ A relative `output` of the base heap is resolved under the directory that
 holds the build's `.holbuild/` (the current directory with `--source-dir`),
 while other heaps resolve it under the project root. Builds export the base
 heap on their own, so each build directory gets its own heap, and a shared
-or read-only source tree is never written.
+or read-only source tree is never written. An absolute base heap `output`, or
+one containing `..`, is rejected: it would let several build directories
+write one file.
 
 The export runs `hol buildheap` in a fresh directory under
 `.holbuild/stage/` that holds a `holproject.toml` with `holmake = false`. HOL

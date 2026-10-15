@@ -4071,10 +4071,9 @@ fun run_buildheap tc (project : HolbuildProject.t) dir options args output =
          child_log_detail log])
   end
 
-(* The object input keys cover their dependency closures, so they pin the
-   theory files the heap was built from.  The heap records the absolute path
-   of the hol.state it extends, which the toolchain key, a content hash, does
-   not cover: a moved toolchain must re-export. *)
+(* The object input keys cover their dependency closures.  The heap records
+   the absolute path of the hol.state it extends, which the toolchain key, a
+   content hash, does not cover: a moved toolchain must re-export. *)
 fun base_heap_key tc toolchain_key keys objects =
   HolbuildToolchain.hash_text
     (String.concatWith "\n"
@@ -4095,17 +4094,36 @@ fun base_heap_for tc toolchain_key keys ({spec = {output, ...}, objects, users} 
 (* The content hash identifies one export of the heap.  Re-exporting under an
    unchanged key still rewrites the file, and Poly/ML then rejects every
    checkpoint saved over the old one, so checkpoint keys use the hash. *)
-fun base_heap_ok_text key hash =
-  checkpoint_ok_text "base_heap" [("heap_key", key), ("heap_hash", hash)]
+fun base_heap_ok_text key hash objects_hash =
+  checkpoint_ok_text "base_heap"
+    [("heap_key", key), ("heap_hash", hash), ("objects_dat_hash", objects_hash)]
+
+(* A rebuild under an unchanged input key can write different theory files,
+   and a user built over the old ones would record stale parent hashes.  Each
+   .dat records its parents' hashes, so hashing the objects' .dat files also
+   covers their ancestors.  The users' up-to-date checks hash these same files
+   through [dat_hash_cache]. *)
+fun base_heap_objects_hash dat_hash_cache objects =
+  let
+    fun line node =
+      let val path = #data_path (theory_outputs node)
+      in
+        case cached_file_hash dat_hash_cache path of
+            SOME hash => HolbuildBuildPlan.key node ^ " " ^ hash
+          | NONE => raise Error ("base heap object has no theory data: " ^ path)
+      end
+  in
+    HolbuildToolchain.hash_text (String.concatWith "\n" (map line objects) ^ "\n")
+  end
 
 (* A missing file or `.ok` means the heap is not current.  Comparing the file
    with the recorded hash catches a heap that was truncated or replaced after
    export, which every user would fail to load. *)
-fun current_base_heap_hash path key =
+fun current_base_heap_hash path key objects_hash =
   case (file_exists path, HolbuildCheckpointStore.current_metadata (checkpoint_ok_path path)) of
       (true, SOME text) =>
         if HolbuildCheckpointStore.metadata_matches_fields
-             [("kind", "base_heap"), ("heap_key", key)] text then
+             [("kind", "base_heap"), ("heap_key", key), ("objects_dat_hash", objects_hash)] text then
           case metadata_value "heap_hash" (metadata_lines text) of
               SOME hash => if HolbuildToolchain.file_hash path = hash then SOME hash else NONE
             | NONE => NONE
@@ -4139,9 +4157,10 @@ fun run_buildheap_without_project tc project args output =
     handle e => (remove_tree dir; raise e)
   end
 
-fun export_base_heap tc project ({path, key, objects, ...} : base_heap) =
+fun export_base_heap dat_hash_cache tc project ({path, key, objects, ...} : base_heap) =
   let
     val tmp = path ^ ".tmp"
+    val objects_hash = base_heap_objects_hash dat_hash_cache objects
   in
     remove_file (checkpoint_ok_path path);
     if HolbuildStatus.quiet_mode () then ()
@@ -4151,12 +4170,12 @@ fun export_base_heap tc project ({path, key, objects, ...} : base_heap) =
     handle e => (remove_file tmp; raise e);
     rename_replace {old = tmp, new = path};
     let val hash = HolbuildToolchain.file_hash path
-    in write_text (checkpoint_ok_path path) (base_heap_ok_text key hash); hash end
+    in write_text (checkpoint_ok_path path) (base_heap_ok_text key hash objects_hash); hash end
   end
 
 (* Returns the content hash of the current heap, exporting it at most once per
    build. *)
-fun ensure_base_heap tc project (heap as {path, key, state, mutex, ...} : base_heap) =
+fun ensure_base_heap dat_hash_cache tc project (heap as {path, key, objects, state, mutex, ...} : base_heap) =
   let
     fun ensure () =
       case !state of
@@ -4165,9 +4184,9 @@ fun ensure_base_heap tc project (heap as {path, key, state, mutex, ...} : base_h
         | HeapUnchecked =>
             let
               val hash =
-                case current_base_heap_hash path key of
+                case current_base_heap_hash path key (base_heap_objects_hash dat_hash_cache objects) of
                     SOME hash => hash
-                  | NONE => export_base_heap tc project heap
+                  | NONE => export_base_heap dat_hash_cache tc project heap
             in
               state := HeapReady hash;
               hash
@@ -4189,13 +4208,13 @@ fun refresh_base_heap (options : build_options) tc project plan toolchain_key =
           val keys = HolbuildBuildPlan.input_keys (build_config_lines options project plan) toolchain_key plan
           val objects = base_heap_object_nodes plan (#objects spec)
         in
-          ignore (export_base_heap tc project
+          ignore (export_base_heap (new_file_hash_cache ()) tc project
                     (new_base_heap (#output spec) (base_heap_key tc toolchain_key keys objects) objects
                                    (Redblackset.empty String.compare)))
         end
 
 (* Exports the base heap first when the node starts from it. *)
-fun node_base tc project base_heap toolchain_key plan keys node : node_base =
+fun node_base dat_hash_cache tc project base_heap toolchain_key plan keys node : node_base =
   let
     val deps_key = dependency_context_key toolchain_key plan keys node
     val cold = {context = toolchain_base_context tc, deps_key = deps_key}
@@ -4208,7 +4227,7 @@ fun node_base tc project base_heap toolchain_key plan keys node : node_base =
                           ("holbuild-base-heap-dependency-context-v2\ndeps_key=" ^ deps_key ^
                            "\nbase_heap_hash=" ^
                            detail_time_phase "build.exec.base_heap.ensure"
-                             (fn () => ensure_base_heap tc project heap) ^ "\n")}
+                             (fn () => ensure_base_heap dat_hash_cache tc project heap) ^ "\n")}
           else cold
       | NONE => cold
   end
@@ -4241,7 +4260,7 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_h
        HolbuildStatus.Restored)
     fun build_from_source () =
       let
-        val base = node_base tc project base_heap toolchain_key plan keys node
+        val base = node_base dat_hash_cache tc project base_heap toolchain_key plan keys node
         val source_text = read_text (source_file node)
         val source_spans = source_spans_for_node policy node source_text
         val source_boundaries = #source_boundaries source_spans

@@ -561,6 +561,53 @@ rm -f "$markers"/*.hierarchy
 require_no_file "$markers/Q.hierarchy"
 require_grep "$consumer_heap" "$markers/R.hierarchy"
 
+# A forced rebuild of a nondeterministic object writes a new .dat under an
+# unchanged input key.  The heap must be re-exported, or its users load the
+# old theory and record a parent hash that never matches.
+nondet=$tmpdir/nondet
+mkdir -p "$nondet/src"
+sed -e 's/name = "basectx"/name = "nondet"/' -e 's/objects = \["ATheory"\]/objects = ["NTheory"]/' \
+  "$project/holproject.toml" > "$nondet/holproject.toml"
+require_grep 'objects = \["NTheory"\]' "$nondet/holproject.toml"
+require_grep '^base = true' "$nondet/holproject.toml"
+cat > "$nondet/src/NScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "N";
+val _ = new_constant ("stamp" ^ LargeInt.toString (Time.toNanoseconds (Time.now ())), bool);
+val _ = export_theory();
+SML
+cat > "$nondet/src/MScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib NTheory;
+val _ = new_theory "M";
+val m_thm = store_thm("m_thm", ``T``, ACCEPT_TAC TRUTH);
+val _ = export_theory();
+SML
+nondet_obj=$nondet/.holbuild/obj/src
+require_parent_hash() {
+  local n_hash
+  n_hash=$(sha1sum "$nondet_obj/NTheory.dat" | cut -c1-40)
+  if ! tr -d ' \n' < "$nondet_obj/MTheory.dat" | grep -q "(\"N\"\.\"$n_hash\")"; then
+    echo "MTheory.dat does not record the current NTheory.dat hash $n_hash" >&2
+    exit 1
+  fi
+}
+(cd "$nondet" && "$HOLBUILD_BIN" build) > "$tmpdir/nondet-cold.log" 2>&1
+require_parent_hash
+cp "$nondet/.holbuild/heap/base.save.ok" "$tmpdir/nondet-heap.ok"
+(cd "$nondet" && "$HOLBUILD_BIN" build --force=theory NTheory) > "$tmpdir/nondet-force.log" 2>&1
+(cd "$nondet" && "$HOLBUILD_BIN" build) > "$tmpdir/nondet-after.log" 2>&1
+require_grep "exporting base heap" "$tmpdir/nondet-after.log"
+if cmp -s "$tmpdir/nondet-heap.ok" "$nondet/.holbuild/heap/base.save.ok"; then
+  echo "base heap was not re-exported after its object's .dat changed" >&2
+  exit 1
+fi
+require_parent_hash
+(cd "$nondet" && "$HOLBUILD_BIN" build) > "$tmpdir/nondet-noop.log" 2>&1
+if grep -q "MTheory built\|exporting base heap" "$tmpdir/nondet-noop.log"; then
+  echo "a build after the re-export rebuilt MTheory or the heap again" >&2
+  exit 1
+fi
+
 reject() {
   local name=$1 expected=$2 extra=$3
   local dir=$tmpdir/$name
@@ -589,6 +636,33 @@ reject duplicate-absolute-output "duplicate heap/executable output: $tmpdir/dupl
 name = \"other\"
 output = \"$tmpdir/duplicate-absolute-output/.holbuild/heap/base.save\"
 objects = [\"BTheory\"]"
+reject_base_output() {
+  local name=$1 output=$2
+  local dir=$tmpdir/$name
+  cp -R "$project" "$dir"
+  sed -i "s|^output = \".holbuild/heap/base.save\"|output = \"$output\"|" "$dir/holproject.toml"
+  require_grep "^output = \"$output\"" "$dir/holproject.toml"
+  if (cd "$dir" && "$HOLBUILD_BIN" build) > "$tmpdir/$name.log" 2>&1; then
+    echo "$name: build unexpectedly accepted the manifest" >&2
+    exit 1
+  fi
+  require_grep "/$name/holproject.toml: base heap output must be relative and contain no \.\. in \[\[heap\]\] base: $output" \
+    "$tmpdir/$name.log"
+}
+reject_base_output absolute-base-output "$tmpdir/shared/base.save"
+reject_base_output dotdot-base-output "../shared/base.save"
+# Under --source-dir a base heap resolves under the artifact root and a plain
+# heap under the source root, so one relative output does not collide.
+mkdir -p "$tmpdir/split-roots/out"
+cp -R "$project" "$tmpdir/split-roots/src"
+printf '%s\n' '
+[[heap]]
+name = "other"
+output = ".holbuild/heap/base.save"
+objects = ["BTheory"]' >> "$tmpdir/split-roots/src/holproject.toml"
+(cd "$tmpdir/split-roots/out" && "$HOLBUILD_BIN" --source-dir "$tmpdir/split-roots/src" build --dry-run CTheory) \
+  > "$tmpdir/split-roots.log" 2>&1 ||
+  { echo "a base heap and a plain heap under different roots were rejected" >&2; cat "$tmpdir/split-roots.log" >&2; exit 1; }
 reject non-boolean-base "holproject.toml: base must be a boolean in \[\[heap\]\] other" '
 [[heap]]
 name = "other"

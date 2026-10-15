@@ -59,7 +59,7 @@ deps = []  # optional names of earlier [[generate]] steps
 
 [[heap]]
 name = "main"
-output = "build/main.heap"  # heap output path, package-root-relative
+output = "build/main.heap"  # heap output path, package-root-relative; with base = true, relative to the build directory (artifact root) and must be relative and contain no `..`
 objects = ["MainTheory", "@generated"]  # logical targets/groups to build before saving heap
 base = false                # true: root-project theories reaching every object start from this heap (see heaps-and-run.md)
 

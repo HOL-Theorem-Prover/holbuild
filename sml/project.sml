@@ -207,21 +207,32 @@ fun parse_at args =
 
 (* Only the root project's heaps are exported, so these checks skip
    dependency manifests, which a consumer cannot fix. *)
-fun validate_root_heaps ({root, manifest, heaps, ...} : t) =
+fun validate_root_heaps ({root, artifact_root, manifest, heaps, ...} : t) =
   let
     fun fail msg = die (manifest ^ ": " ^ msg)
     fun is_base (Heap {kind = HeapImage {base}, ...}) = base
       | is_base _ = false
     (* Two targets writing one file would overwrite each other's export.
-       Outputs are compared as absolute paths, so `x.save` and `/root/x.save`
-       collide. *)
-    fun output_path (Heap {output, ...}) =
-      Path.mkCanonical (if Path.isAbsolute output then output else Path.concat(root, output))
+       Outputs are compared as absolute paths where each is written, so
+       `x.save` and `/root/x.save` collide.  A base heap resolves under the
+       artifact root, other heaps under the source root. *)
+    fun output_path (heap as Heap {output, ...}) =
+      Path.mkCanonical
+        (if Path.isAbsolute output then output
+         else Path.concat(if is_base heap then artifact_root else root, output))
+    (* Each artifact root exports its own base heap without locking the
+       output; an output outside the artifact root would let several share,
+       and overwrite, one file. *)
+    fun check_base_output (Heap {name, output, ...}) =
+      if Path.isAbsolute output orelse
+         List.exists (fn arc => arc = "..") (HolbuildManifestUtil.path_components output) then
+        fail ("base heap output must be relative and contain no .. in [[heap]] " ^ name ^ ": " ^ output)
+      else ()
   in
     case List.filter is_base heaps of
         _ :: Heap {name, ...} :: _ =>
           fail ("at most one [[heap]] may set base = true; also set on: " ^ name)
-      | _ => ();
+      | bases => List.app check_base_output bases;
     ignore
       (List.foldl
          (fn (heap as Heap {output, ...}, seen) =>
