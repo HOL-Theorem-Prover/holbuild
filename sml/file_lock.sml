@@ -43,12 +43,22 @@ fun close_fd fd = Posix.IO.close fd handle OS.SysErr _ => ()
 fun set_close_on_exec fd = (Posix.IO.setfd(fd, Posix.IO.FD.flags [Posix.IO.getfd fd, Posix.IO.FD.cloexec]) handle OS.SysErr _ => ())
 fun whole_file_lock ltype = Posix.IO.FLock.flock {ltype = ltype, whence = Posix.IO.SEEK_SET, start = 0, len = 0, pid = NONE}
 fun try_lock_fd fd = (ignore (Posix.IO.setlk(fd, whole_file_lock Posix.IO.F_WRLCK)); true) handle OS.SysErr _ => false
+fun wait_lock_fd ltype fd =
+  ignore (Posix.IO.setlkw(fd, whole_file_lock ltype))
+  handle e as OS.SysErr (_, SOME err) => if err = Posix.Error.intr then wait_lock_fd ltype fd else raise e
 fun blocking_lock_owner fd =
   (case Posix.IO.FLock.pid (Posix.IO.getlk(fd, whole_file_lock Posix.IO.F_WRLCK)) of SOME pid => SOME (pid_text pid) | NONE => NONE)
   handle OS.SysErr _ => NONE
 fun try_acquire_path {path, obsolete_kind} =
   let val _ = ensure_dir (Path.dir path) val _ = Option.app (fn kind => remove_obsolete_lock_dir kind path) obsolete_kind val fd = open_lock_file path val _ = set_close_on_exec fd
   in if try_lock_fd fd then SOME (FileLock {fd = fd, path = path}) else (close_fd fd; NONE) end
+  handle OS.SysErr (msg, _) => raise Error ("could not acquire lock: " ^ path ^ ": " ^ msg)
+(* Blocks until no other process holds an exclusive lock on the path. fcntl
+   locks belong to the process and are dropped when it closes any descriptor
+   for the file, so callers must not acquire the same path twice. *)
+fun acquire_shared_path_wait {path} =
+  let val _ = ensure_dir (Path.dir path) val fd = open_lock_file path val _ = set_close_on_exec fd
+  in (wait_lock_fd Posix.IO.F_RDLCK fd; FileLock {fd = fd, path = path}) handle e => (close_fd fd; raise e) end
   handle OS.SysErr (msg, _) => raise Error ("could not acquire lock: " ^ path ^ ": " ^ msg)
 fun release (FileLock {fd, ...}) = close_fd fd
 fun path (FileLock {path, ...}) = path

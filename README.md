@@ -697,6 +697,15 @@ locking/discovery and does not require a HOL toolchain. Project checkpoint GC
 uses `.holconfig.toml`'s `[build].checkpoint_limit_gb` unless overridden with
 `--max-checkpoints-gb`.
 
+Cache GC also removes installed HOL toolchains under `hol-toolchains/` that no
+holbuild command has used within the retention period; a removed toolchain is
+rebuilt, or restored from a remote cache, the next time a project needs it.
+Toolchains being built, restored, or used by a running holbuild process
+(including `build --watch`) are skipped. Project checkpoints saved against a
+removed toolchain are discarded and rebuilt automatically, but heaps exported
+with `holbuild heap` or `holbuild executable` must be re-exported before they
+are used outside holbuild.
+
 ## Local configuration
 
 Local machine settings may go in `.holconfig.toml`:

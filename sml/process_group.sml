@@ -96,6 +96,17 @@ val lease_lock = probed (fn () =>
   else raise Error ("cannot lock a mutation lease: neither flock " ^
                     "nor perl is available on PATH"))
 
+val perl_try_lease_lock =
+  "perl -MFcntl=:flock -e 'open(my $fh, \">&=9\") or die \"dup: $!\\n\"; " ^
+  "flock($fh, LOCK_EX | LOCK_NB) or exit 1'"
+
+(* Non-blocking form of lease_lock: the command fails if fd 9 is locked. *)
+val try_lease_lock = probed (fn () =>
+  if have_command "flock" then "flock -n -x 9"
+  else if have_command "perl" then perl_try_lease_lock
+  else raise Error ("cannot lock a mutation lease: neither flock " ^
+                    "nor perl is available on PATH"))
+
 fun mutation_lease_setup NONE = []
   | mutation_lease_setup (SOME path) =
       ["exec 9>" ^ HolbuildHash.quote path,

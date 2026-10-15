@@ -267,11 +267,16 @@ fun gc_root root days =
           val lock_removed = remove_obsolete_action_lock_dirs cutoff (locks_dir root)
           val (live_blobs, actions_removed) = collect_live_actions cutoff actions_dir
           val blobs_removed = sweep_blobs cutoff live_blobs blobs_dir
+          val {removed = toolchains_removed, busy = toolchains_busy} =
+            HolbuildHolSharedCache.gc_toolchains cutoff
+            handle HolbuildHolSharedCache.Error msg => raise Error msg
         in
           print ("cache gc: removed tmp=" ^ Int.toString tmp_removed ^
                  " locks=" ^ Int.toString lock_removed ^
                  " actions=" ^ Int.toString actions_removed ^
-                 " blobs=" ^ Int.toString blobs_removed ^ "\n")
+                 " blobs=" ^ Int.toString blobs_removed ^
+                 " toolchains=" ^ Int.toString toolchains_removed ^
+                 " toolchains-busy=" ^ Int.toString toolchains_busy ^ "\n")
         end
     in
       with_lock root run
