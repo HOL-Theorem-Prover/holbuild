@@ -301,19 +301,8 @@ fun hold_usage_lease k =
       held_usage_leases := (k, lease) :: !held_usage_leases
     end
 
-(* GC retention is measured from last-used. Refreshing it at most hourly
-   avoids a cache write on every command. *)
-val last_used_refresh = Time.fromSeconds 3600
-
-fun touch_last_used k =
-  let
-    val path = last_used_for_key k
-    val fresh = Time.<(Time.-(Time.now (), FS.modTime path), last_used_refresh)
-                handle OS.SysErr _ => false
-  in
-    if fresh then () else write_file path ""
-  end
-  handle IO.Io _ => ()
+(* GC retention is measured from the last-used marker's mtime. *)
+fun touch_last_used k = write_file (last_used_for_key k) "" handle IO.Io _ => ()
 
 fun analyser_source_dir () =
   case OS.Process.getEnv "HOLBUILD_ANALYSER_SRC" of

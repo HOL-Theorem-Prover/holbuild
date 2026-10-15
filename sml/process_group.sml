@@ -113,13 +113,15 @@ fun mutation_lease_setup NONE = []
        lease_lock (),
        "kill -0 \"$holbuild_parent\" 2>/dev/null || exit 125"]
 
+(* The watcher closes fd 9: it ignores TERM and can outlive the script by a
+   few hundred milliseconds, and must not keep holding the mutation lease. *)
 fun parent_watch_script parent_pid mutation_lease script =
   String.concatWith "\n"
     (["holbuild_parent=" ^ pid_text parent_pid] @
      mutation_lease_setup mutation_lease @
      ["holbuild_leader=$$",
       "holbuild_group=$$",
-      "( trap '' TERM; while kill -0 \"$holbuild_parent\" 2>/dev/null && kill -0 \"$holbuild_leader\" 2>/dev/null; do sleep 0.1; done; kill -TERM -\"$holbuild_group\" 2>/dev/null; sleep 0.2; kill -KILL -\"$holbuild_group\" 2>/dev/null ) </dev/null >/dev/null 2>&1 &",
+      "( trap '' TERM; while kill -0 \"$holbuild_parent\" 2>/dev/null && kill -0 \"$holbuild_leader\" 2>/dev/null; do sleep 0.1; done; kill -TERM -\"$holbuild_group\" 2>/dev/null; sleep 0.2; kill -KILL -\"$holbuild_group\" 2>/dev/null ) </dev/null >/dev/null 2>&1 9>&- &",
       "holbuild_parent_watch=$!",
       "trap 'holbuild_status=$?; kill \"$holbuild_parent_watch\" 2>/dev/null; exit $holbuild_status' EXIT",
       script])
