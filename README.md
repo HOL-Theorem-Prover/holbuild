@@ -543,11 +543,13 @@ objects = ["vyperStateTheory"]
 base = true
 ```
 
-A `[[heap]]` with `base = true` is the saved state that theory builds start
-from instead of HOL's `hol.state`, so a theory child does not reload every
-shared ancestor from disk. At most one heap may set `base`, and it must list
-at least one object, all theory targets. The heap holds exactly what loading
-its objects loads. A root-project theory starts from it only when its own
+A `[[heap]]` with `base = true` declares that the theories that reach its
+objects start with those objects loaded first: they start from the heap
+instead of HOL's `hol.state`, so a theory child does not reload every shared
+ancestor from disk. It is not only a speed-up, because loading the objects
+first can change what a theory builds (see below). At most one heap may set
+`base`, and it must list at least one object, all theory targets. The heap
+holds exactly what loading its objects loads. A root-project theory starts from it only when its own
 preloads reach every object; other theories, the objects and their ancestors,
 and every dependency package's theories start from `hol.state`. A dependency
 manifest's `base = true` is ignored with a warning.
@@ -556,17 +558,21 @@ manifest's `base = true` is ignored with a warning.
 start from it has to build from source, and only when the heap is missing or
 stale. The heap is keyed by the toolchain and the objects' input keys, which
 `<output>.ok` records; editing any ancestor of an object re-exports it.
-`holbuild heap base` refreshes the same heap. Exporting it while `base` is
-unset deletes `<output>.ok`, so the next build re-exports it. Checkpoints
+`<output>.ok` also records the exported file's content hash, and a build
+re-exports a heap file that no longer matches it. `holbuild heap base` always
+re-exports the same heap. Exporting it while `base` is unset deletes
+`<output>.ok`, so the next build re-exports it. Checkpoints
 saved over the heap are keyed by the exported file itself, so a re-export
 never resumes them, even when the heap key is unchanged.
 
 A heap start loads the heap's theories before the theory's other preloads, and
 HOL state that keeps the most recent registration (for example `cv_trans`
-translations defined in two ancestors) can then resolve differently. Theory
-files built from the heap can therefore differ from cold-built ones, so setting
-`base` changes the input keys of the theories that start from the heap: they
-rebuild once, and heap-built and cold-built files are cached separately.
+translations defined in two ancestors) can then resolve differently. A theory
+built from the heap matches a cold build that loads the objects first, but its
+results can differ from a build without `base`: its theory files can differ,
+and so in principle can which of its proofs succeed. Setting `base` therefore
+changes the input keys of the theories that start from the heap: they rebuild
+once, and heap-built and cold-built files are cached separately.
 
 ## Proof steps and checkpoints
 

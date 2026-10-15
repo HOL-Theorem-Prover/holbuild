@@ -26,6 +26,21 @@ Heap export flow:
 
 `objects` must currently be theory targets — non-theory objects in heap targets is not yet supported.
 
+## Base heap (`base = true`)
+
+```toml
+[[heap]]
+name = "base"
+output = ".holbuild/heap/base.save"
+objects = ["vyperStateTheory"]
+base = true
+```
+
+- Root-project theories whose preloads reach every object start from this heap instead of `hol.state`. Other theories, the objects and their ancestors, and all dependency-package theories start from `hol.state`.
+- It declares that those theories start with the objects loaded first; it is not only a speed-up. Their theory files (and in principle which proofs succeed) can differ from a build without `base`, so setting `base` changes their input keys and they rebuild once.
+- At most one heap may set `base`; `objects` must be non-empty theory targets. A dependency manifest's `base = true` is ignored with a warning.
+- `holbuild build` exports the heap when a theory that starts from it builds from source and the heap is missing, stale, or no longer matches the content hash in `<output>.ok`. `holbuild heap base` always re-exports it.
+
 ## `holbuild run` / `holbuild repl` — prototype status
 
 These commands generate an invocation-private run context under `.holbuild/`, add built project artifact object directories to HOL `loadPath`, and load `[run].loads` before user-supplied files or interactive input. Before starting HOL, `run` and `repl` resolve every configured load as a build target and build its dependency closure using normal cache and up-to-date behavior. Unknown configured targets are errors.

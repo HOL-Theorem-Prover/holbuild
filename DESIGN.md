@@ -647,8 +647,8 @@ artifacts after the relevant logical targets have already been built.
 
 The one exception is an opt-in base heap (`[[heap]]` with `base = true`). It
 replaces `hol.state` as the starting state of a theory child, so the child
-skips reloading shared ancestors. Three rules keep a heap start equivalent to
-a cold start:
+skips reloading shared ancestors. Four rules keep a heap start equivalent to
+a cold start that loads the objects first:
 
 - The heap loads only its object theories, not the SML closure an explicit
   heap target loads. Loading a theory loads its ancestors and recorded ML
@@ -659,7 +659,13 @@ a cold start:
   an ancestor of one that is, so the heap adds no module the cold child would
   not load. The remaining preloads find the heap's modules already loaded.
 - The heap key hashes the toolchain key with the objects' load stems and
-  input keys. A missing or mismatched `<output>.ok` re-exports it.
+  input keys. A missing or mismatched `<output>.ok`, or a heap file whose
+  content hash differs from the one `<output>.ok` records, re-exports it.
+- `buildheap` runs in an empty directory outside the project. HOL adds the
+  dirs of the project around its working directory to `Meta.loadPath`, and a
+  saved state keeps them; every theory child adds the current dirs again when
+  it starts. Exported inside the project, the heap would carry a second copy,
+  taken at export time, that a `hol.state` child lacks.
 
 Only root-package theories start from the heap, even when an object is a
 dependency's theory: a dependency's input keys then never depend on the
@@ -674,14 +680,16 @@ content hash of the exported file, which `<output>.ok` records at export.
 Checkpoints therefore never outlive the heap file they were saved over, while
 theory input keys, which name only the objects, stay shared through the cache.
 
-A heap start still differs from a cold start in load order: the heap's
-modules load first, in the order `buildheap` loads them, rather than in
+A heap start still differs from an ordinary cold start in load order: the
+heap's modules load first, in the order `buildheap` loads them, rather than in
 preload order. HOL state that keeps the most recent registration, such as the
-`cv_trans` translation database, can therefore resolve differently, and the
-theory files differ even though every theorem is proved. So the input key of
-a theory that starts from the heap records the heap's objects, and heap-built
-and cold-built files are cached under different keys. The objects' own input
-keys already cover the heap's contents.
+`cv_trans` translation database, can therefore resolve differently, so the
+theory files can differ, and in principle so can which proofs succeed.
+`base = true` thus declares that heap users start with the objects loaded
+first; it is not a pure speed-up. The input key of a theory that starts from
+the heap records the heap's objects, and heap-built and cold-built files are
+cached under different keys. The objects' own input keys already cover the
+heap's contents.
 
 The relevant checkpointing model is the `Holmake --dumpheap` design: while
 building a theory, the prover/runtime saves PolyML states at boundaries such as:

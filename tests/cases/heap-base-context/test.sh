@@ -40,13 +40,18 @@ $base_line
 TOML
 }
 
-# Each theory records the saved-state chain its HOL session started from.
+# Each theory records the saved-state chain its HOL session started from, and
+# its load path.
 record_hierarchy() {
   cat <<SML
 val _ =
-  let val out = TextIO.openOut "$markers/$1.hierarchy"
-  in TextIO.output(out, String.concatWith "\n" (PolyML.SaveState.showHierarchy()) ^ "\n");
-     TextIO.closeOut out
+  let
+    fun write name lines =
+      let val out = TextIO.openOut ("$markers/$1." ^ name)
+      in TextIO.output(out, String.concatWith "\n" lines ^ "\n"); TextIO.closeOut out end
+  in
+    write "hierarchy" (PolyML.SaveState.showHierarchy());
+    write "loadpath" (!Meta.loadPath)
   end;
 SML
 }
@@ -127,6 +132,14 @@ require_grep "kind=base_heap" "$heap.ok"
 require_heap_start B
 require_heap_start C
 require_no_markers A D
+# Every child adds the project's dirs to its load path when it starts; the
+# heap must not carry a second copy taken when it was exported.
+project_entries=$(grep -c '/project$' "$markers/B.loadpath" || true)
+if [[ "$project_entries" != 1 ]]; then
+  echo "base heap user has the project root on its load path $project_entries times" >&2
+  cat "$markers/B.loadpath" >&2
+  exit 1
+fi
 dat_hashes > "$tmpdir/heap.sha"
 if ! cmp -s "$tmpdir/cold.sha" "$tmpdir/heap.sha"; then
   echo "theory outputs differ between toolchain and base heap starts" >&2
@@ -169,8 +182,8 @@ require_heap_start B
 require_heap_start C
 require_no_file "$markers/D.hierarchy"
 
-# `holbuild heap` refreshes the same heap a build would use.
-rm -f "$heap.ok"
+# `holbuild heap` re-exports the same heap a build would use, even when it is
+# current.
 (cd "$project" && "$HOLBUILD_BIN" heap base) > "$tmpdir/heap-command.log"
 require_grep "exporting base heap" "$tmpdir/heap-command.log"
 require_grep "$key_after" "$heap.ok"
@@ -184,6 +197,25 @@ printf '\nval c2_thm = store_thm("c2_thm", ``~F``, REWRITE_TAC []);\nval _ = exp
 if grep -q "discarding invalid checkpoint" "$tmpdir/reexport-resume.log"; then
   echo "resumed a checkpoint saved over a replaced base heap" >&2
   cat "$tmpdir/reexport-resume.log" >&2
+  exit 1
+fi
+require_heap_start C
+
+# A heap damaged after export is exported again: a build finds that the file
+# no longer matches the hash in its .ok, and `holbuild heap` always exports.
+truncate -s 4096 "$heap"
+rm -f "$markers"/*.hierarchy
+(cd "$project" && "$HOLBUILD_BIN" build --force=theory CTheory) > "$tmpdir/repair-build.log" 2>&1
+require_grep "exporting base heap" "$tmpdir/repair-build.log"
+require_heap_start C
+truncate -s 4096 "$heap"
+(cd "$project" && "$HOLBUILD_BIN" heap base) > "$tmpdir/repair-command.log"
+require_grep "exporting base heap" "$tmpdir/repair-command.log"
+require_no_file "$heap.tmp"
+rm -f "$markers"/*.hierarchy
+(cd "$project" && "$HOLBUILD_BIN" build --force=theory CTheory) > "$tmpdir/after-repair.log" 2>&1
+if grep -q "exporting base heap" "$tmpdir/after-repair.log"; then
+  echo "repaired base heap was exported again" >&2
   exit 1
 fi
 require_heap_start C

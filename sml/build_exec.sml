@@ -4049,9 +4049,9 @@ fun declaration_checkpoints_for_node policy project deps_key node source_text te
              "; building without termination-definition checkpoints for this theory\n" ^ msg);
        [])
 
-(* hol buildheap runs in the project root so its loadPath and holpathdb
-   extensions match the ones `holbuild heap` has always used. *)
-fun run_buildheap tc (project : HolbuildProject.t) options args output =
+(* hol buildheap adds the dirs of the project holding [dir] to Meta.loadPath,
+   and the exported heap keeps them. *)
+fun run_buildheap tc (project : HolbuildProject.t) dir options args output =
   let
     val stage = Path.concat(Path.concat(project_artifact_root project, ".holbuild/stage"), "heap")
     val log = Path.concat(stage, "holbuild-heap.log")
@@ -4060,7 +4060,7 @@ fun run_buildheap tc (project : HolbuildProject.t) options args output =
                options @ ["-o", output] @ args
     val _ = ensure_dir stage
     val _ = ensure_parent output
-    val status = HolbuildToolchain.run_in_dir_to_file (#root project) argv log
+    val status = HolbuildToolchain.run_in_dir_to_file dir argv log
   in
     if HolbuildToolchain.success status then
       (if echo_child_logs () then HolbuildStatus.message_stdout (read_text log handle _ => "") else ();
@@ -4095,10 +4095,29 @@ fun base_heap_for toolchain_key keys ({spec = {output, ...}, objects, users} : b
 fun base_heap_ok_text key hash =
   checkpoint_ok_text "base_heap" [("heap_key", key), ("heap_hash", hash)]
 
+(* Comparing the file with the recorded hash catches a heap that was
+   truncated or replaced after export, which every user would fail to load. *)
 fun current_base_heap_hash path key =
   if checkpoint_ok_matches path [("kind", "base_heap"), ("heap_key", key)] then
-    metadata_value "heap_hash" (metadata_lines (read_text (checkpoint_ok_path path)))
+    case metadata_value "heap_hash" (metadata_lines (read_text (checkpoint_ok_path path))) of
+        SOME hash => if HolbuildToolchain.file_hash path = hash then SOME hash else NONE
+      | NONE => NONE
   else NONE
+
+(* Theory children add the dirs of the project around their stage dir to
+   Meta.loadPath when they start.  A heap exported inside the project would
+   keep a second copy, taken at export time, that hol.state lacks; exporting
+   from an empty directory outside it leaves the heap's loadPath as
+   hol.state's. *)
+fun run_buildheap_outside_project tc project args output =
+  let
+    val dir = FS.tmpName ()
+    val _ = remove_file dir
+    val _ = FS.mkDir dir
+  in
+    run_buildheap tc project dir [] args output before remove_tree dir
+    handle e => (remove_tree dir; raise e)
+  end
 
 fun export_base_heap tc project ({path, key, objects, ...} : base_heap) =
   let
@@ -4107,7 +4126,8 @@ fun export_base_heap tc project ({path, key, objects, ...} : base_heap) =
     remove_file (checkpoint_ok_path path);
     HolbuildStatus.message_stdout ("exporting base heap " ^ path ^ "\n");
     detail_time_phase "build.exec.base_heap.export"
-      (fn () => run_buildheap tc project [] (map load_stem objects) tmp);
+      (fn () => run_buildheap_outside_project tc project (map load_stem objects) tmp)
+    handle e => (remove_file tmp; raise e);
     rename_replace {old = tmp, new = path};
     let val hash = HolbuildToolchain.file_hash path
     in write_text (checkpoint_ok_path path) (base_heap_ok_text key hash); hash end
@@ -4137,9 +4157,9 @@ fun ensure_base_heap tc project (heap as {path, key, state, mutex, ...} : base_h
     handle e => (Mutex.unlock mutex; raise e)
   end
 
-(* `holbuild heap` plans only the objects, which never start from the heap,
-   so it ensures the heap without waiting for a user.  Like a build, it
-   re-exports only when `<output>.ok` is missing or stale. *)
+(* `holbuild heap` plans only the objects, which never start from the heap.
+   Like a plain heap, it always re-exports, so it repairs a heap a build
+   would still accept. *)
 fun refresh_base_heap (options : build_options) tc project plan toolchain_key =
   case #base_heap options of
       NONE => ()
@@ -4148,7 +4168,7 @@ fun refresh_base_heap (options : build_options) tc project plan toolchain_key =
           val keys = HolbuildBuildPlan.input_keys (build_config_lines options project plan) toolchain_key plan
           val objects = base_heap_object_nodes plan (#objects spec)
         in
-          ignore (ensure_base_heap tc project
+          ignore (export_base_heap tc project
                     (new_base_heap (#output spec) (base_heap_key toolchain_key keys objects) objects
                                    (Redblackset.empty String.compare)))
         end
@@ -5166,7 +5186,7 @@ fun export_heap tc (project : HolbuildProject.t) plan output heap_kind =
         | HolbuildProject.ExecutableImage {main} => ["--exe=" ^ main]
   in
     remove_file (checkpoint_ok_path output);
-    run_buildheap tc project exe_args (buildheap_args heap_kind plan) output
+    run_buildheap tc project (#root project) exe_args (buildheap_args heap_kind plan) output
   end
 
 end
