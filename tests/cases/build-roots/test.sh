@@ -114,6 +114,32 @@ if (cd "$project" && "$HOLBUILD_BIN" build ExtraTheory) > "$tmpdir/extra.log" 2>
 fi
 require_grep "default build should not build ExtraTheory" "$tmpdir/extra.log"
 
+# Path-shaped command-line targets resolve against the current directory.
+if (cd "$project/src" && "$HOLBUILD_BIN" build ExtraScript.sml) > "$tmpdir/extra-path.log" 2>&1; then
+  echo "explicit ExtraScript.sml path unexpectedly succeeded" >&2
+  exit 1
+fi
+require_grep "default build should not build ExtraTheory" "$tmpdir/extra-path.log"
+(cd "$project" && "$HOLBUILD_BIN" build src/MainScript.sml) > "$tmpdir/main-path.log" 2>&1
+if (cd "$project" && "$HOLBUILD_BIN" build src/MissingScript.sml) > "$tmpdir/missing-path.log" 2>&1; then
+  echo "missing path target unexpectedly succeeded" >&2
+  exit 1
+fi
+require_grep "build target path is not a known source: src/MissingScript.sml" "$tmpdir/missing-path.log"
+
+# build.roots also accepts logical names.
+named_root=$tmpdir/named-root
+mkdir -p "$named_root/src"
+sed 's|roots = \["src/MainScript.sml"\]|roots = ["MainTheory"]|' "$project/holproject.toml" > "$named_root/holproject.toml"
+require_grep 'roots = \["MainTheory"\]' "$named_root/holproject.toml"
+cp "$project/src/"*.sml "$named_root/src/"
+(cd "$named_root" && "$HOLBUILD_BIN" build) > "$tmpdir/named-root.log" 2>&1
+require_file "$named_root/.holbuild/obj/src/MainTheory.dat"
+if [[ -e "$named_root/.holbuild/obj/src/ExtraTheory.dat" ]]; then
+  echo "logical-name root built ExtraTheory" >&2
+  exit 1
+fi
+
 # If [build] exists but omits members, members still defaults to ["."].
 # Source discovery should skip hidden files/directories, unreadable dirs, and symlink dirs.
 dot=$tmpdir/dot

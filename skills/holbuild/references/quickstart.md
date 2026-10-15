@@ -54,6 +54,7 @@ Use `holbuild buildhol` to warm the declared project-HOL cache explicitly, for e
 ```sh
 holbuild build FooTheory                 # build one target
 holbuild build Foo BarTheory             # build multiple targets
+holbuild build src/FooScript.sml         # source paths (relative to cwd) also work
 holbuild build                           # build all, or roots if configured
 holbuild build --dry-run FooTheory       # show plan
 holbuild context                         # show manifest info/cache paths

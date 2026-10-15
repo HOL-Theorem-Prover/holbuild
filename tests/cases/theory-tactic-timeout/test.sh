@@ -88,8 +88,32 @@ PY
 require_grep "proof_timeout=none" "$project/.holbuild/dep/theory-tactic-timeout/src/SlowScript.sml.key"
 require_grep "proof_timeout=0.1" "$project/.holbuild/dep/theory-tactic-timeout/src/BaseScript.sml.key"
 
+# Entries may name the theory instead of its script.
+python3 - "$project/holproject.toml" <<'PY'
+from pathlib import Path
+p = Path(__import__('sys').argv[1])
+p.write_text(p.read_text().replace('"src/SlowScript.sml" = 0', '"SlowTheory" = 1.0'))
+PY
+(cd "$project" && "$HOLBUILD_BIN" build --force AppTheory) > "$tmpdir/named.log" 2>&1
+require_grep "proof_timeout=1.0" "$project/.holbuild/dep/theory-tactic-timeout/src/SlowScript.sml.key"
+
+# Naming the same theory by path and by logical name is rejected.
+duplicate=$tmpdir/duplicate
+cp -R "$project" "$duplicate"
+python3 - "$duplicate/holproject.toml" <<'PY'
+from pathlib import Path
+p = Path(__import__('sys').argv[1])
+p.write_text(p.read_text().replace('"SlowTheory" = 1.0', '"SlowTheory" = 1.0\n"src/SlowScript.sml" = 2.0'))
+PY
+if (cd "$duplicate" && "$HOLBUILD_BIN" build AppTheory) > "$tmpdir/duplicate.log" 2>&1; then
+  echo "duplicate theory_tactic_timeouts entries were accepted" >&2
+  exit 1
+fi
+require_grep "build.theory_tactic_timeouts references SlowTheory more than once" "$tmpdir/duplicate.log"
+rm -rf "$duplicate"
+
 # Invalid entries receive focused diagnostics.
-for path in src/MissingScript.sml src/Helper.sml @not-a-source; do
+for path in src/MissingScript.sml src/Helper.sml @not-a-source MissingTheory Helper; do
   invalid=$tmpdir/invalid
   cp -R "$project" "$invalid"
   python3 - "$invalid/holproject.toml" "$path" <<'PY'

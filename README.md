@@ -115,9 +115,12 @@ a specific logical target:
 holbuild ExampleTheory
 ```
 
-The target is the logical theory/module name, not an object filename. The
-explicit `build` command remains accepted, for example `holbuild build` and
-`holbuild build ExampleTheory`.
+The target is the logical theory/module name, not an object filename. A target
+that looks like a source path (it contains `/` or ends in `.sml`/`.sig`) is
+resolved relative to the current directory instead, so `holbuild
+src/ExampleScript.sml` builds the same target. The explicit `build` command
+remains accepted, for example `holbuild build` and `holbuild build
+ExampleTheory`.
 
 To inspect how the project is resolved, run:
 
@@ -389,7 +392,7 @@ exclude_globs = ["gen/*ExperimentalScript.sml"]
 allow_empty = false
 
 [build.theory_tactic_timeouts]
-"src/SlowScript.sml" = 30.0
+"SlowTheory" = 30.0
 
 [build.root_tactic_timeouts]
 "src/SlowScript.sml" = 60.0
@@ -405,10 +408,11 @@ allow_empty = false
   deprecation warning and treated as `exclude_globs`; new manifests should use
   the explicit field.
 - `roots` are the default entry points when `holbuild build` is run with no
-  target. Entries may be package-root-relative source paths or `@name` build
-  group references. Source-path roots must name sources discovered through
-  `members` and not removed by `exclude` or `exclude_globs`; the `.sml` suffix
-  may be omitted. If no package in the dependency graph declares roots or root
+  target. Entries may be logical names (`MainTheory`), package-root-relative
+  source paths, or `@name` build group references. Logical-name and source-path
+  roots must name sources of this package discovered through `members` and not
+  removed by `exclude` or `exclude_globs`; the `.sml` suffix of a path may be
+  omitted. If no package in the dependency graph declares roots or root
   groups, `holbuild build` defaults to all discovered sources in the root project
   package only. Dependency packages, including the implicit `hol` package, are
   not default-built merely because they have members. Use `holbuild build
@@ -432,11 +436,14 @@ allow_empty = false
   creates no aggregate HOL theory to load or export.
 - `tactic_timeout` sets the default root-project proof-step timeout in seconds.
   The built-in default is `2.5`; `0` disables the timeout.
-- `theory_tactic_timeouts` sets a timeout for exactly the named theory script;
-  it does not affect dependencies or consumers. `0` disables the timeout for
+- `theory_tactic_timeouts` sets a timeout for exactly the named theory, given as
+  a logical name (`SlowTheory`) or a package-root-relative script path
+  (`src/SlowScript.sml`); it does not affect dependencies or consumers. Naming
+  the same theory twice is an error. `0` disables the timeout for
   that theory. An explicit CLI `--tactic-timeout` overrides this table.
 - `root_tactic_timeouts` lets individual root source files set timeout contracts
-  for their dependency closures.
+  for their dependency closures. Keys must spell the root exactly as it appears
+  in `roots` (or, for a group root, as the member's package-root-relative path).
 
 ### Action overrides
 
