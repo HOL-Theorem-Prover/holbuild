@@ -165,21 +165,6 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
               else ()
           | _ => ())
         dependencies
-    (* Two targets writing one file would overwrite each other's export.
-       Outputs are compared as absolute paths, so `x.save` and `/root/x.save`
-       collide. *)
-    fun output_path (Heap {output, ...}) =
-      Path.mkCanonical (if Path.isAbsolute output then output else Path.concat(root, output))
-    val _ =
-      List.foldl
-        (fn (heap as Heap {output, ...}, seen) =>
-            let val path = output_path heap
-            in
-              if List.exists (fn old => old = path) seen then
-                die ("duplicate heap/executable output: " ^ output)
-              else path :: seen
-            end)
-        [] heaps
     val excludes = manifest_excludes @ build_excludes
     val exclude_globs = manifest_exclude_globs @ build_exclude_globs
   in
@@ -220,6 +205,35 @@ fun parse_at args =
   parse_table_at (TOML.fromFile (#manifest args)) args
   handle Error msg => die (#manifest args ^ ": " ^ msg)
 
+(* Only the root project's heaps are exported, so these checks skip
+   dependency manifests, which a consumer cannot fix. *)
+fun validate_root_heaps ({root, manifest, heaps, ...} : t) =
+  let
+    fun fail msg = die (manifest ^ ": " ^ msg)
+    fun is_base (Heap {kind = HeapImage {base}, ...}) = base
+      | is_base _ = false
+    (* Two targets writing one file would overwrite each other's export.
+       Outputs are compared as absolute paths, so `x.save` and `/root/x.save`
+       collide. *)
+    fun output_path (Heap {output, ...}) =
+      Path.mkCanonical (if Path.isAbsolute output then output else Path.concat(root, output))
+  in
+    case List.filter is_base heaps of
+        _ :: Heap {name, ...} :: _ =>
+          fail ("at most one [[heap]] may set base = true; also set on: " ^ name)
+      | _ => ();
+    ignore
+      (List.foldl
+         (fn (heap as Heap {output, ...}, seen) =>
+             let val path = output_path heap
+             in
+               if List.exists (fn old => old = path) seen then
+                 fail ("duplicate heap/executable output: " ^ output)
+               else path :: seen
+             end)
+         [] heaps)
+  end
+
 fun parse_builtin_holdir_at args =
   let
     val cached_manifest = HolbuildHolSharedCache.hol_source_manifest_for_holdir (#root args)
@@ -250,8 +264,11 @@ fun discover () =
             val root = manifest_root manifest
             val artifact_root' = if artifact_root = "" then root else artifact_root
             val local_config = parse_local_config root
+            val project =
+              parse_at {manifest = manifest, root = root, artifact_root = artifact_root', graph_artifact_root = artifact_root', local_config = local_config}
           in
-            parse_at {manifest = manifest, root = root, artifact_root = artifact_root', graph_artifact_root = artifact_root', local_config = local_config}
+            validate_root_heaps project;
+            project
           end
       | NONE => die "no holproject.toml found in --source-dir/current directory or parents"
   end

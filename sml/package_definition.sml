@@ -196,24 +196,14 @@ fun parse_heaps table =
         (parse_image_entry "executable" (fn value =>
           ExecutableImage {main = Option.getOpt(string_field value "main", "main")}))
     fun name_of (Heap {name, ...}) = name
-    fun reject_duplicates what field =
-      let
-        fun loop _ [] = ()
-          | loop seen (heap :: rest) =
-              let val value = field heap
-              in if List.exists (fn old => old = value) seen then
-                   die ("duplicate heap/executable " ^ what ^ ": " ^ value)
-                 else loop (value :: seen) rest
-              end
-      in loop [] heaps end
-    fun is_base (Heap {kind = HeapImage {base}, ...}) = base
-      | is_base _ = false
-    val _ =
-      case List.filter is_base heaps of
-          _ :: second :: _ =>
-            die ("at most one [[heap]] may set base = true; also set on: " ^ name_of second)
-        | _ => ()
-  in reject_duplicates "target name" name_of; heaps end
+    fun loop _ [] = ()
+      | loop names (heap :: rest) =
+          let val name = name_of heap
+          in if List.exists (fn old => old = name) names then
+               die ("duplicate heap/executable target name: " ^ name)
+             else loop (name :: names) rest
+          end
+  in loop [] heaps; heaps end
 
 fun parse_generator value =
   case value of

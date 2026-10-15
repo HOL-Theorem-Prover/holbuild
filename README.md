@@ -528,7 +528,7 @@ to save the heap. `[[heap]].objects` may name theory and SML logical targets.
 `holbuild executable runtests` builds the listed logical objects and uses HOL
 `buildheap --exe=<main>` to produce an executable; `main` defaults to `"main"`
 and executable objects may also include signature targets. No two heap or
-executable targets may share an `output`. Before starting HOL,
+executable targets of the root project may share an `output`. Before starting HOL,
 `holbuild run` and `holbuild repl` build every target named by `[run].loads`,
 create an invocation-private project context under `.holbuild/`, and then load
 the configured targets followed by user arguments.
@@ -539,7 +539,7 @@ the configured targets followed by user arguments.
 [[heap]]
 name = "base"
 output = ".holbuild/heap/base.save"
-objects = ["vyperStateTheory"]
+objects = ["semanticsTheory"]
 base = true
 ```
 
@@ -547,8 +547,9 @@ A `[[heap]]` with `base = true` declares that the theories that reach its
 objects start with those objects loaded first: they start from the heap
 instead of HOL's `hol.state`, so a theory child does not reload every shared
 ancestor from disk. It is not only a speed-up, because loading the objects
-first can change what a theory builds (see below). At most one heap may set
-`base`, and it must list at least one object, all theory targets. The heap
+first can change what a theory builds (see below). At most one heap of the
+root project may set `base`, and it must list at least one object, all theory
+targets. The heap
 holds exactly what loading its objects loads. A root-project theory starts from it only when its own
 preloads reach every object; other theories, the objects and their ancestors,
 and every dependency package's theories start from `hol.state`. A dependency
@@ -566,10 +567,11 @@ re-exports the same heap. Exporting it while `base` is unset deletes
 saved over the heap are keyed by the exported file itself, so a re-export
 never resumes them, even when the heap key is unchanged.
 
-The export runs `hol buildheap` in a directory under the holbuild cache
-directory, and fails when a
-`holproject.toml` or `.holpath` lies above that directory, since HOL would
-add the directories it names to the heap's load path.
+The export runs `hol buildheap` in a fresh directory under
+`.holbuild/stage/` that holds a `holproject.toml` with `holmake = false`. HOL
+adds the directories of the project around its working directory to the load
+path, and the heap would keep them; that file gives HOL a project with no
+directories.
 
 A heap start loads the heap's theories before the theory's other preloads, and
 HOL state that keeps the most recent registration (for example `cv_trans`
@@ -578,7 +580,9 @@ built from the heap matches a cold build that loads the objects first, but its
 results can differ from a build without `base`: its theory files can differ,
 and so in principle can which of its proofs succeed. Setting `base` therefore
 changes the input keys of the theories that start from the heap: they rebuild
-once, and heap-built and cold-built files are cached separately.
+once, and heap-built and cold-built files are cached separately. Their keys
+carry `base_heap_objects=`, so HBX archives and remote-cache entries built with
+`base = true` never serve a consumer, whose theories use cold keys.
 
 ## Proof steps and checkpoints
 

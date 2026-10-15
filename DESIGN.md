@@ -661,13 +661,16 @@ a cold start that loads the objects first:
 - The heap key hashes the toolchain key, the path of `hol.state` (which the
   heap records as its parent), and the objects' load stems and input keys. A missing or mismatched `<output>.ok`, or a heap file whose
   content hash differs from the one `<output>.ok` records, re-exports it.
-- `buildheap` runs in an empty directory under the holbuild cache's `tmp/`.
-  HOL adds the dirs of the project around its working directory to
-  `Meta.loadPath`, and a saved state keeps them; every theory child adds the
-  current dirs again when it starts. Exported inside the project, the heap
-  would carry a second copy, taken at export time, that a `hol.state` child
-  lacks. HOL finds that project by walking up for `holproject.toml` or
-  `.holpath`, so the export fails when either is above the directory.
+- `buildheap` runs in a fresh `.holbuild/stage/heap-export-<pid>-<nonce>/`
+  holding a `holproject.toml` with `holmake = false`. HOL adds the dirs of the
+  project around its working directory to `Meta.loadPath`, and a saved state
+  keeps them; every theory child adds the current dirs again when it starts,
+  so a heap carrying them would give its users a second copy, taken at export
+  time, that a `hol.state` child lacks. HOL takes those dirs from the first
+  `holproject.toml` at or above its working directory, and this one names
+  none. HOL's separate walk up for holpath names does not stop there, but from
+  a stage dir it sees what a theory child sees. The directory does not depend
+  on the holbuild cache, which may be read-only or inside a HOL project.
 
 Only root-package theories start from the heap, even when an object is a
 dependency's theory: a dependency's input keys then never depend on the

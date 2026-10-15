@@ -109,6 +109,25 @@ require_toolchain_start() {
   fi
 }
 
+# Every child adds the project's dirs to its load path when it starts; the
+# heap must add nothing to that.  Which project dirs exist differs between
+# builds, so compare the entries outside the project with a hol.state child's,
+# and require no project entry twice.
+outside_project() { grep -v "^$project\(/\|\$\)" "$1" || true; }
+require_cold_load_path() {
+  if ! diff <(outside_project "$tmpdir/B-cold.loadpath") \
+            <(outside_project "$markers/$1.loadpath") > "$tmpdir/loadpath.diff"; then
+    echo "base heap user $1's load path outside the project differs from a hol.state child's" >&2
+    cat "$tmpdir/loadpath.diff" >&2
+    exit 1
+  fi
+  if [[ -n "$(sort "$markers/$1.loadpath" | uniq -d)" ]]; then
+    echo "base heap user $1 has duplicate load path entries" >&2
+    cat "$markers/$1.loadpath" >&2
+    exit 1
+  fi
+}
+
 require_no_markers() {
   local theory
   for theory in "$@"; do require_no_file "$markers/$theory.hierarchy"; done
@@ -133,22 +152,7 @@ require_grep "kind=base_heap" "$heap.ok"
 require_heap_start B
 require_heap_start C
 require_no_markers A D
-# Every child adds the project's dirs to its load path when it starts; the
-# heap must add nothing to that.  Which project dirs exist differs between the
-# two builds, so compare the entries outside the project, and require no
-# project entry twice.
-outside_project() { grep -v "^$project\(/\|\$\)" "$1" || true; }
-if ! diff <(outside_project "$tmpdir/B-cold.loadpath") \
-          <(outside_project "$markers/B.loadpath") > "$tmpdir/loadpath.diff"; then
-  echo "base heap user's load path outside the project differs from a hol.state child's" >&2
-  cat "$tmpdir/loadpath.diff" >&2
-  exit 1
-fi
-if [[ -n "$(sort "$markers/B.loadpath" | uniq -d)" ]]; then
-  echo "base heap user has duplicate load path entries" >&2
-  cat "$markers/B.loadpath" >&2
-  exit 1
-fi
+require_cold_load_path B
 dat_hashes > "$tmpdir/heap.sha"
 if ! cmp -s "$tmpdir/cold.sha" "$tmpdir/heap.sha"; then
   echo "theory outputs differ between toolchain and base heap starts" >&2
@@ -265,6 +269,16 @@ for theory in A D; do
   fi
 done
 
+# `--dry-run` and `export` compute a heap user's input key as a build does:
+# dry-run prints it, and export finds the build's cache entry under it.
+c_key=$(awk -F'\t' '$1 ~ /CTheory/ {print $2}' "$tmpdir/heap.keys")
+[[ -n "$c_key" ]] || { echo "no CTheory row in the key dump" >&2; cat "$tmpdir/heap.keys" >&2; exit 1; }
+(cd "$project" && "$HOLBUILD_BIN" build --dry-run CTheory) > "$tmpdir/dry-run.log"
+dry_key=$(awk '/^CTheory / {found = 1} found && /input_key:/ {print $2; exit}' "$tmpdir/dry-run.log")
+[[ "$dry_key" == "$c_key" ]] || { echo "dry-run input key $dry_key differs from build's $c_key" >&2; exit 1; }
+(cd "$project" && "$HOLBUILD_BIN" export -o "$tmpdir/heap-user.hbx" CTheory) > "$tmpdir/export.log" 2>&1
+require_grep "exported 3 cache action" "$tmpdir/export.log"
+
 # Two users that build at once share one export, and a failed export fails
 # both without being retried.
 for theory in F G; do
@@ -282,34 +296,62 @@ exports=$(grep -c "exporting base heap" "$tmpdir/shared-export.log" || true)
 [[ "$exports" == 1 ]] || { echo "two base heap users exported the heap $exports times" >&2; exit 1; }
 require_heap_start F
 require_heap_start G
-rm -f "$heap" "$heap.ok"
-chmod a-w "$project/.holbuild/heap"
-if (cd "$project" && "$HOLBUILD_BIN" -j2 build --force=theory FTheory GTheory) > "$tmpdir/failed-export.log" 2>&1; then
-  chmod u+w "$project/.holbuild/heap"
+# A regular file where the heap's directory belongs fails the export, even
+# for root.  holbuild reports only the first failure, so the timing log shows
+# that both users asked for the heap.
+rm -rf "$heap" "$heap.ok" "$project/.holbuild/heap"
+touch "$project/.holbuild/heap"
+if (cd "$project" && HOLBUILD_TIMING_LOG="$tmpdir/failed-export.timing" HOLBUILD_TIMING_DETAIL=fine \
+      "$HOLBUILD_BIN" -j2 build --force=theory FTheory GTheory) > "$tmpdir/failed-export.log" 2>&1; then
   echo "build succeeded although the base heap could not be exported" >&2
   exit 1
 fi
-chmod u+w "$project/.holbuild/heap"
+rm "$project/.holbuild/heap"
 exports=$(grep -c "exporting base heap" "$tmpdir/failed-export.log" || true)
 [[ "$exports" == 1 ]] || { echo "a failed base heap export was attempted $exports times" >&2; exit 1; }
 require_grep "hol buildheap failed while exporting heap" "$tmpdir/failed-export.log"
+users=$(grep -c "name=build.exec.base_heap.ensure	status=fail" "$tmpdir/failed-export.timing" || true)
+[[ "$users" == 2 ]] || { echo "$users base heap users saw the failed export, expected 2" >&2; exit 1; }
 rm "$project/src/FScript.sml" "$project/src/GScript.sml"
 
-# HOL adds the dirs named by a holproject.toml or .holpath above its working
-# directory to the heap's load path, so the export refuses to run below one.
-planted=$tmpdir/planted
-mkdir -p "$planted"
-printf '[holmake]\n' > "$planted/holproject.toml"
-use_case_cache "$planted/cache"
-if (cd "$project" && "$HOLBUILD_BIN" build --force=theory CTheory) > "$tmpdir/planted.log" 2>&1; then
-  echo "base heap was exported below a planted holproject.toml" >&2
+# The export's own holproject.toml stops HOL's search for a project, so
+# neither the project's nor one planted above it adds to the heap's load path.
+mkdir -p "$tmpdir/planted-incs"
+printf 'external_includes = ["%s"]\n' "$tmpdir/planted-incs" > "$tmpdir/holproject.toml"
+(cd "$project" && "$HOLBUILD_BIN" heap base) > "$tmpdir/planted-export.log" 2>&1
+rm -f "$markers"/*.hierarchy
+(cd "$project" && "$HOLBUILD_BIN" build --force=theory BTheory) > "$tmpdir/planted.log" 2>&1
+require_heap_start B
+require_cold_load_path B
+if compgen -G "$project/.holbuild/stage/heap-export-*" > /dev/null; then
+  echo "base heap export left its directory behind" >&2
   exit 1
 fi
-require_grep "cannot export base heap: $planted/holproject.toml is above the export directory" "$tmpdir/planted.log"
-if compgen -G "$planted/cache/tmp/heap-export-*" > /dev/null; then
-  echo "refused base heap export left its directory behind" >&2
-  exit 1
-fi
+rm "$tmpdir/holproject.toml"
+
+# The export does not write to the holbuild cache, which may be read-only or
+# inside the project.  A regular file at the cache's tmp/ also blocks the
+# export directory the cache used to hold, for root too.
+for cache in "$project/.hol/cache" "$tmpdir/read-only-cache"; do
+  use_case_cache "$cache"
+  rm -f "$markers"/*.hierarchy
+  build_flags=(--force=theory)
+  if [[ "$cache" == "$tmpdir/read-only-cache" ]]; then
+    touch "$cache/tmp"
+    chmod a-w "$cache"
+    build_flags=(--no-cache --force=theory)
+  fi
+  if ! (cd "$project" && "$HOLBUILD_BIN" build "${build_flags[@]}" CTheory) > "$tmpdir/cache-$(basename "$cache").log" 2>&1; then
+    chmod u+w "$cache"
+    echo "base heap export failed with HOLBUILD_CACHE=$cache" >&2
+    cat "$tmpdir/cache-$(basename "$cache").log" >&2
+    exit 1
+  fi
+  chmod u+w "$cache"
+  require_grep "exporting base heap" "$tmpdir/cache-$(basename "$cache").log"
+  require_heap_start C
+done
+rm -rf "$project/.hol"
 use_case_cache "$tmpdir/cache"
 
 # The heap records the path of the hol.state it extends, so moving the
@@ -340,8 +382,10 @@ write_manifest "base = true"
 rm "$project/src/EScript.sml"
 
 # Only root-package theories start from the base heap: a dependency theory
-# that reaches the objects keeps its input key, and a dependency's own base
-# heap is ignored with a warning.
+# that reaches the objects keeps its input key and starts from hol.state.  A
+# dependency's own base heaps are ignored with a warning, and the root
+# project's heap checks skip its manifest, here with two base heaps sharing an
+# output.
 dep=$tmpdir/dep
 consumer=$tmpdir/consumer
 consumer_heap=$consumer/.holbuild/heap/base.save
@@ -357,6 +401,12 @@ members = ["src"]
 
 [[heap]]
 name = "base"
+output = "base.save"
+objects = ["PTheory"]
+base = true
+
+[[heap]]
+name = "other"
 output = "base.save"
 objects = ["PTheory"]
 base = true
@@ -415,6 +465,11 @@ rm -f "$markers"/*.hierarchy
 warnings=$(grep -c "ignoring base = true in dependency package depbase" "$tmpdir/consumer-cold.log" || true)
 [[ "$warnings" == 1 ]] || { echo "dependency base heap warning printed $warnings times" >&2; exit 1; }
 require_file "$markers/Q.hierarchy"
+if grep -q 'base\.save' "$markers/Q.hierarchy"; then
+  echo "dependency theory Q did not start from hol.state" >&2
+  cat "$markers/Q.hierarchy" >&2
+  exit 1
+fi
 write_consumer_manifest "base = true"
 rm -f "$markers"/*.hierarchy
 (cd "$consumer" && "$HOLBUILD_BIN" -j2 build) > "$tmpdir/consumer-heap.log" 2>&1

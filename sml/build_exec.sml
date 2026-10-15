@@ -4112,36 +4112,28 @@ fun current_base_heap_hash path key =
         else NONE
     | _ => NONE
 
-val hol_project_files = ["holproject.toml", ".holpath"]
-
-fun hol_project_file_above dir =
-  case List.find (fn name => file_exists (Path.concat(dir, name))) hol_project_files of
-      SOME name => SOME (Path.concat(dir, name))
-    | NONE =>
-        let val parent = Path.getParent dir
-        in if parent = dir then NONE else hol_project_file_above parent end
-
 (* Theory children add the dirs of the project around their stage dir to
-   Meta.loadPath when they start.  A heap exported inside the project would
-   keep a second copy, taken at export time, that hol.state lacks.  HOL finds
-   that project by walking up from its working directory for the files in
-   `hol_project_files`, so the export runs in an empty directory under the
-   holbuild cache, and refuses when one of those files is above it: whatever
-   it names would go ahead of sigobj on every heap user's load path. *)
-fun run_buildheap_outside_project tc project args output =
+   Meta.loadPath when they start, and a saved state keeps them, so a heap
+   would carry a second copy, taken at export time, that hol.state lacks.
+   HOL takes those dirs from the first holproject.toml at or above its working
+   directory, so the export runs in a fresh stage dir holding one with
+   `holmake = false`, which adds none.  Its other walk up, for holpath names,
+   does not stop there, but from a stage dir it sees what a theory child
+   sees. *)
+fun run_buildheap_without_project tc project args output =
   let
-    val parent = Path.concat(cache_root (), "tmp")
-    val dir = Path.concat(parent, "heap-export-" ^ HolbuildFileLock.current_pid_text ())
-    val _ = remove_tree dir
-    val _ = ensure_dir dir
+    val dir =
+      Path.concat(Path.concat(project_artifact_root project, ".holbuild/stage"),
+                  "heap-export-" ^ HolbuildFileLock.current_pid_text () ^ "-" ^
+                  HolbuildToolchain.run_context_nonce ())
+    val _ = ensure_parent dir
+    val _ = FS.mkDir dir
+      handle e => raise Error ("could not create base heap export directory " ^ dir ^ ": " ^
+                               General.exnMessage e)
     fun run () =
-      case hol_project_file_above (FS.realPath dir) of
-          SOME file =>
-            raise Error (String.concatWith "\n"
-              ["cannot export base heap: " ^ file ^ " is above the export directory " ^ dir,
-               "HOL would put the directories it names on the heap's load path.",
-               "Remove it, or set HOLBUILD_CACHE to a directory outside any HOL project."])
-        | NONE => run_buildheap tc project dir [] args output
+      (write_text (Path.concat(dir, "holproject.toml"))
+         "# Stops HOL's search for a project above this directory.\nholmake = false\n";
+       run_buildheap tc project dir [] args output)
   in
     run () before remove_tree dir
     handle e => (remove_tree dir; raise e)
@@ -4154,7 +4146,7 @@ fun export_base_heap tc project ({path, key, objects, ...} : base_heap) =
     remove_file (checkpoint_ok_path path);
     HolbuildStatus.message_stdout ("exporting base heap " ^ path ^ "\n");
     detail_time_phase "build.exec.base_heap.export"
-      (fn () => run_buildheap_outside_project tc project (map load_stem objects) tmp)
+      (fn () => run_buildheap_without_project tc project (map load_stem objects) tmp)
     handle e => (remove_file tmp; raise e);
     rename_replace {old = tmp, new = path};
     let val hash = HolbuildToolchain.file_hash path
@@ -4213,7 +4205,9 @@ fun node_base tc project base_heap toolchain_key plan keys node : node_base =
             {context = HolState path,
              deps_key = HolbuildToolchain.hash_text
                           ("holbuild-base-heap-dependency-context-v2\ndeps_key=" ^ deps_key ^
-                           "\nbase_heap_hash=" ^ ensure_base_heap tc project heap ^ "\n")}
+                           "\nbase_heap_hash=" ^
+                           detail_time_phase "build.exec.base_heap.ensure"
+                             (fn () => ensure_base_heap tc project heap) ^ "\n")}
           else cold
       | NONE => cold
   end
