@@ -101,31 +101,35 @@ fun remove_tree path =
     FS.remove path
     handle e as OS.SysErr (msg, _) => if missing_entry e then () else raise remove_error path msg
 
-(* Progress for long GC stages goes to stderr, leaving stdout to the summary.
-   A stage reports only after running for one interval, then once per
-   interval: every second on a terminal, every ten seconds otherwise. *)
+(* Progress for long GC stages goes to stderr, leaving stdout to the summary,
+   and is off under --quiet. A stage reports only after running for one
+   interval, then once per interval: every second on a terminal, every ten
+   seconds otherwise. An ANSI terminal gets one line redrawn in place, anything
+   else a line per report. *)
 datatype progress =
-  Progress of {stage : string, total : int, tty : bool, interval : Time.time,
+  Progress of {stage : string, total : int, in_place : bool, interval : Time.time,
                started : Time.time, next : Time.time ref, scanned : int ref,
                removed : int ref, shown : bool ref}
 
-fun progress_interval tty =
+fun progress_interval terminal =
   case Option.mapPartial Real.fromString (OS.Process.getEnv "HOLBUILD_TEST_GC_PROGRESS_INTERVAL") of
       SOME seconds => Time.fromReal seconds
-    | NONE => Time.fromReal (if tty then 1.0 else 10.0)
+    | NONE => Time.fromReal (if terminal then 1.0 else 10.0)
 
 fun start_progress stage total =
   let
-    val tty = Posix.ProcEnv.isatty Posix.FileSys.stderr handle _ => false
-    val interval = progress_interval tty
+    val terminal = terminal_primitives.strmIsTTY TextIO.stdErr
+    val interval = progress_interval terminal
     val now = Time.now ()
   in
-    Progress {stage = stage, total = total, tty = tty, interval = interval, started = now,
+    Progress {stage = stage, total = total,
+              in_place = terminal andalso terminal_primitives.TERM_isANSI (),
+              interval = interval, started = now,
               next = ref (Time.+(now, interval)), scanned = ref 0, removed = ref 0,
               shown = ref false}
   end
 
-fun show_progress (Progress {stage, total, tty, started, scanned, removed, shown, ...}) final =
+fun show_progress (Progress {stage, total, in_place, started, scanned, removed, shown, ...}) final =
   let
     val elapsed = Real.fmt (StringCvt.FIX (SOME 1)) (Time.toReal (Time.-(Time.now (), started)))
     val text = "cache gc: " ^ stage ^ ": " ^ Int.toString (!scanned) ^ "/" ^ Int.toString total ^
@@ -133,7 +137,7 @@ fun show_progress (Progress {stage, total, tty, started, scanned, removed, shown
   in
     shown := true;
     TextIO.output (TextIO.stdErr,
-                   if tty then "\r" ^ text ^ "\027[K" ^ (if final then "\n" else "")
+                   if in_place then "\r" ^ text ^ HolbuildStatus.clear_to_eol ^ (if final then "\n" else "")
                    else text ^ "\n");
     TextIO.flushOut TextIO.stdErr
   end
@@ -152,15 +156,18 @@ fun finish_progress (progress as Progress {shown, ...}) =
 (* Folds step over paths as one reported GC stage; step returns the new
    accumulator and whether it removed the entry. *)
 fun gc_stage stage paths step init =
-  let
-    val progress = start_progress stage (length paths)
-    fun one (path, acc) =
-      let val (acc, was_removed) = step (path, acc)
-      in tick progress was_removed; acc end
-  in
-    (List.foldl one init paths before finish_progress progress)
-    handle e => (finish_progress progress; raise e)
-  end
+  if HolbuildStatus.quiet_mode () then
+    List.foldl (fn (path, acc) => #1 (step (path, acc))) init paths
+  else
+    let
+      val progress = start_progress stage (length paths)
+      fun one (path, acc) =
+        let val (acc, was_removed) = step (path, acc)
+        in tick progress was_removed; acc end
+    in
+      (List.foldl one init paths before finish_progress progress)
+      handle e => (finish_progress progress; raise e)
+    end
 
 fun stale cutoff path =
   Time.<(FS.modTime path, cutoff) handle OS.SysErr _ => false

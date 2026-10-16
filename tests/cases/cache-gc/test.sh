@@ -145,3 +145,41 @@ require_grep "failed to remove cache path: .*$fail_cache/tmp/stuck/ro/file" "$tm
 [[ ! -e "$fail_cache/locks/gc.lock.owner" ]] || { echo "failed cache gc kept its lock owner" >&2; exit 1; }
 env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$fail_cache" "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/fail-retry.log"
 require_grep "removed tmp=1 " "$tmpdir/fail-retry.log"
+
+# --quiet turns progress off.
+make_progress_cache "$progress_cache"
+env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$progress_cache" HOLBUILD_TEST_GC_PROGRESS_INTERVAL=0 \
+  "$HOLBUILD_BIN" --quiet gc --cache-only > "$tmpdir/quiet-progress.out" 2> "$tmpdir/quiet-progress.err"
+[[ ! -s "$tmpdir/quiet-progress.err" ]] || { echo "--quiet GC printed progress:" >&2; cat "$tmpdir/quiet-progress.err" >&2; exit 1; }
+require_grep "blobs=20 " "$tmpdir/quiet-progress.out"
+
+# On a terminal, progress is redrawn in place only when TERM is ANSI. Needs
+# util-linux script(1) for the pseudo-terminal.
+if script -qec true /dev/null > /dev/null 2>&1; then
+  # gc_on_terminal TERM CACHE: run cache GC on a pseudo-terminal, printing its output.
+  gc_on_terminal() {
+    local command
+    command=$(printf '%q ' env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$2" \
+      HOLBUILD_TEST_GC_PROGRESS_INTERVAL=0 "$HOLBUILD_BIN" gc --cache-only)
+    TERM=$1 script -qec "$command" /dev/null < /dev/null
+  }
+  make_progress_cache "$progress_cache"
+  gc_on_terminal xterm "$progress_cache" > "$tmpdir/ansi.log"
+  require_grep "blobs: 1/20 scanned.*blobs: 2/20 scanned" "$tmpdir/ansi.log"
+  make_progress_cache "$progress_cache"
+  gc_on_terminal dumb "$progress_cache" > "$tmpdir/dumb.log"
+  require_grep "^cache gc: blobs: 20/20 scanned" "$tmpdir/dumb.log"
+  ! grep -q $'\033' "$tmpdir/dumb.log" || { echo "GC progress sent escape codes to a dumb terminal" >&2; exit 1; }
+
+  # A stage that fails ends its progress line before the error is printed.
+  mkdir -p "$fail_cache/tmp/stuck/ro"
+  : > "$fail_cache/tmp/stuck/ro/file"
+  for i in $(seq 1 20); do mkdir "$fail_cache/tmp/old$i"; done
+  age 10 "$fail_cache/tmp/stuck" "$fail_cache"/tmp/old*
+  chmod a-w "$fail_cache/tmp/stuck/ro"
+  if gc_on_terminal xterm "$fail_cache" > "$tmpdir/fail-ansi.log"; then
+    echo "GC succeeded despite an undeletable entry" >&2; exit 1
+  fi
+  chmod u+w "$fail_cache/tmp/stuck/ro"
+  require_grep "^holbuild: failed to remove cache path: " "$tmpdir/fail-ansi.log"
+fi
