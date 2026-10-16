@@ -254,10 +254,10 @@ fun selected_graph_id ({selected_graph_id, ...} : t) = selected_graph_id
 fun selected_plan_id ({selected_plan_id, ...} : t) = selected_plan_id
 fun resolved_plan_id ({resolved_plan_id, ...} : t) = resolved_plan_id
 
-fun indexed_key_id index node_key =
+fun find_key_id index node_key =
   let
     fun search lo hi =
-      if lo > hi then raise Error ("internal missing node key: " ^ node_key)
+      if lo > hi then NONE
       else
         let
           val mid = (lo + hi) div 2
@@ -266,11 +266,16 @@ fun indexed_key_id index node_key =
           case String.compare(node_key, candidate) of
               LESS => search lo (mid - 1)
             | GREATER => search (mid + 1) hi
-            | EQUAL => id
+            | EQUAL => SOME id
         end
   in
     search 0 (Vector.length index - 1)
   end
+
+fun indexed_key_id index node_key =
+  case find_key_id index node_key of
+      SOME id => id
+    | NONE => raise Error ("internal missing node key: " ^ node_key)
 
 datatype target_selection = AllTargets | SelectedTargets of string list
 
@@ -377,9 +382,6 @@ fun graph_values index node =
         end
   in search 0 (Vector.length index - 1) end
 
-fun node_with_key nodes wanted =
-  List.find (fn node => key node = wanted) nodes
-
 fun symbolic_dependencies plan node =
   graph_values (#symbolic (dependency_graph plan)) node
 fun resolved_dependency_edges plan node =
@@ -470,13 +472,14 @@ fun bootstrap_topo_sort components analysis lookup nodes roots =
 fun topo_sort_resolved nodes roots (graph : resolved_dependency_graph) =
   let
     val key_index = build_key_index nodes
+    val node_index = Vector.fromList nodes
     val visited = Array.array(length nodes, false)
     val active = Array.array(length nodes, false)
     fun node_id node = indexed_key_id key_index (key node)
     fun dependencies node =
       map (fn (edge : resolved_dependency_edge) =>
-        case node_with_key nodes (#to_node edge) of
-            SOME target => target
+        case find_key_id key_index (#to_node edge) of
+            SOME id => Vector.sub(node_index, id)
           | NONE => raise Error ("internal resolved dependency target is missing: " ^ #to_node edge))
         (graph_values (#resolved graph) node)
     fun visit path node order =
@@ -686,8 +689,13 @@ fun build_resolved_dependency_graph components analysis lookup selected =
     val external = dependency_pairs selected external_for
     val unresolved = dependency_pairs selected unresolved_for
     val all_edges = List.concat (map resolved_for selected)
-    fun incoming node =
-      List.filter (fn (edge : resolved_dependency_edge) => #to_node edge = key node) all_edges
+    val incoming_index =
+      List.foldr
+        (fn (edge : resolved_dependency_edge, index) =>
+          Binarymap.insert(index, #to_node edge,
+            edge :: getOpt(Binarymap.peek(index, #to_node edge), [])))
+        (Binarymap.mkDict String.compare) all_edges
+    fun incoming node = getOpt(Binarymap.peek(incoming_index, key node), [])
     val reverse = dependency_pairs selected incoming
   in
     {symbolic = symbolic, resolved = resolved, external = external,
