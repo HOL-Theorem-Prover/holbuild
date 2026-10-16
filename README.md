@@ -690,6 +690,7 @@ Clean old project and cache state with:
 holbuild gc
 holbuild gc --clean-only
 holbuild --cache-dir /path/to/cache gc --cache-only
+holbuild gc --toolchains-only
 ```
 
 Long cache GC stages report scanned and removed counts on stderr while they
@@ -709,6 +710,13 @@ Toolchains being built, restored, or used by a running holbuild process
 removed toolchain are discarded and rebuilt automatically, but heaps exported
 with `holbuild heap` or `holbuild executable` must be re-exported before they
 are used outside holbuild.
+
+`gc --toolchains-only` removes only such stale toolchains, skipping project
+cleanup and the action/blob scan, which can take minutes on a large cache. Like
+`--cache-only`, it needs no project or HOL toolchain. `--clean-only`,
+`--cache-only`, and `--toolchains-only` are mutually exclusive.
+`--max-checkpoints-gb` applies only to project cleanup and is ignored with
+`--cache-only` or `--toolchains-only`.
 
 ## Local configuration
 

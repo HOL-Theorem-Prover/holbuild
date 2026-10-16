@@ -598,12 +598,16 @@ holbuild gc --retention-days 7
 holbuild --cache-dir /path/to/cache gc
 holbuild gc --clean-only
 holbuild gc --cache-only
+holbuild gc --toolchains-only
 ```
 
 By default `holbuild gc` takes the project lock, removes stale project-local
 `.holbuild/stage`, `.holbuild/logs`, and checkpoint artifacts, then runs global
 cache GC. `--clean-only` skips cache GC. `--cache-only` skips project discovery
-and locking, so it works without a HOL toolchain. The cache root is
+and locking, so it works without a HOL toolchain. `--toolchains-only` also skips
+project discovery and runs only the installed HOL toolchain sweep of cache GC,
+leaving tmp, lock, action, and blob entries alone. The three `--*-only` options
+are mutually exclusive. The cache root is
 `--cache-dir`, else `$HOLBUILD_CACHE`, else `$XDG_CACHE_HOME/holbuild`, else `$HOME/.cache/holbuild`.
 
 Future in-tree spelling may be:
