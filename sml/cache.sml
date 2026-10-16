@@ -279,7 +279,9 @@ fun sweep_blobs cutoff live_blobs blobs_dir =
     0
 
 fun gc_toolchains cutoff =
-  (HolbuildHolSharedCache.sweep_toolchain_trash ();
+  (gc_stage "toolchain-trash" (HolbuildHolSharedCache.toolchain_trash ())
+     (fn (path, ()) => (HolbuildHolSharedCache.remove_unlocked_tree path; ((), true)))
+     ();
    gc_stage "toolchains" (HolbuildHolSharedCache.toolchain_keys ())
      (fn (k, {removed, busy}) =>
          case HolbuildHolSharedCache.gc_entry cutoff k of

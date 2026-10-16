@@ -183,3 +183,12 @@ if script -qec true /dev/null > /dev/null 2>&1; then
   chmod u+w "$fail_cache/tmp/stuck/ro"
   require_grep "^holbuild: failed to remove cache path: " "$tmpdir/fail-ansi.log"
 fi
+
+# Leftovers of an interrupted toolchain GC are removed as a reported stage.
+make_progress_cache "$progress_cache"
+mkdir -p "$progress_cache/hol-toolchains/.trash/interrupted/hol"
+: > "$progress_cache/hol-toolchains/.trash/interrupted/hol/file"
+env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$progress_cache" HOLBUILD_TEST_GC_PROGRESS_INTERVAL=0 \
+  "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/trash.out" 2> "$tmpdir/trash.err"
+require_grep "cache gc: toolchain-trash: 1/1 scanned, 1 removed" "$tmpdir/trash.err"
+[[ ! -e "$progress_cache/hol-toolchains/.trash/interrupted" ]] || { echo "toolchain trash survived GC" >&2; exit 1; }
