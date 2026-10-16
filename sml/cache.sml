@@ -81,10 +81,10 @@ fun remove_tree path =
       fun remove p =
         (if not (is_link p) andalso is_dir p then (List.app remove (children p); FS.rmDir p)
          else FS.remove p)
-        handle e => if missing_entry e then () else raise e
+        handle e as OS.SysErr (msg, _) =>
+          if missing_entry e then () else raise Error ("failed to remove cache path: " ^ p ^ ": " ^ msg)
     in
       remove path
-      handle OS.SysErr (msg, _) => raise Error ("failed to remove cache path: " ^ path ^ ": " ^ msg)
     end
 
 (* Progress for long GC stages goes to stderr, leaving stdout to the summary.
