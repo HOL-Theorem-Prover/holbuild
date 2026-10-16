@@ -182,6 +182,20 @@ if script -qec true /dev/null > /dev/null 2>&1; then
   fi
   chmod u+w "$fail_cache/tmp/stuck/ro"
   require_grep "^holbuild: failed to remove cache path: " "$tmpdir/fail-ansi.log"
+
+  # Toolchain removal can warn on stderr mid-stage, here about legacy
+  # directory locks, so its reports are not redrawn in place.
+  make_progress_cache "$progress_cache"
+  for key in 0123456789abcdef0123456789abcdef01234567 0123456789abcdef0123456789abcdef01234568; do
+    mkdir -p "$progress_cache/hol-toolchains/$key/hol" \
+      "$progress_cache/hol-toolchains/.locks/hol-toolchain-$key.lock"
+    : > "$progress_cache/hol-toolchains/$key/last-used"
+    age 10 "$progress_cache/hol-toolchains/$key/last-used"
+  done
+  gc_on_terminal xterm "$progress_cache" > "$tmpdir/toolchain-warning.log"
+  require_grep "toolchains=2 " "$tmpdir/toolchain-warning.log"
+  [[ $(grep -c "^holbuild: warning: removing obsolete directory HOL toolchain lock" "$tmpdir/toolchain-warning.log") -eq 2 ]] ||
+    { echo "toolchain GC warning was appended to a progress line:" >&2; cat -A "$tmpdir/toolchain-warning.log" >&2; exit 1; }
 fi
 
 # Leftovers of an interrupted toolchain GC are removed as a reported stage.

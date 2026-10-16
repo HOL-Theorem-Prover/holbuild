@@ -116,14 +116,14 @@ fun progress_interval terminal =
       SOME seconds => Time.fromReal seconds
     | NONE => Time.fromReal (if terminal then 1.0 else 10.0)
 
-fun start_progress stage total =
+fun start_progress steps_print stage total =
   let
     val terminal = terminal_primitives.strmIsTTY TextIO.stdErr
     val interval = progress_interval terminal
     val now = Time.now ()
   in
     Progress {stage = stage, total = total,
-              in_place = terminal andalso terminal_primitives.TERM_isANSI (),
+              in_place = terminal andalso terminal_primitives.TERM_isANSI () andalso not steps_print,
               interval = interval, started = now,
               next = ref (Time.+(now, interval)), scanned = ref 0, removed = ref 0,
               shown = ref false}
@@ -154,13 +154,15 @@ fun finish_progress (progress as Progress {shown, ...}) =
   if !shown then show_progress progress true else ()
 
 (* Folds step over paths as one reported GC stage; step returns the new
-   accumulator and whether it removed the entry. *)
-fun gc_stage stage paths step init =
+   accumulator and whether it removed the entry. When steps_print, steps may
+   write to stderr themselves, so each report gets a line of its own rather
+   than one redrawn in place that their output would be appended to. *)
+fun run_gc_stage steps_print stage paths step init =
   if HolbuildStatus.quiet_mode () then
     List.foldl (fn (path, acc) => #1 (step (path, acc))) init paths
   else
     let
-      val progress = start_progress stage (length paths)
+      val progress = start_progress steps_print stage (length paths)
       fun one (path, acc) =
         let val (acc, was_removed) = step (path, acc)
         in tick progress was_removed; acc end
@@ -168,6 +170,12 @@ fun gc_stage stage paths step init =
       (List.foldl one init paths before finish_progress progress)
       handle e => (finish_progress progress; raise e)
     end
+
+fun gc_stage stage = run_gc_stage false stage
+
+(* Toolchain removal runs `rm -rf` with inherited stderr, and taking an
+   entry's lock may warn about an obsolete directory lock. *)
+fun gc_toolchain_stage stage = run_gc_stage true stage
 
 fun stale cutoff path =
   Time.<(FS.modTime path, cutoff) handle OS.SysErr _ => false
@@ -279,10 +287,10 @@ fun sweep_blobs cutoff live_blobs blobs_dir =
     0
 
 fun gc_toolchains cutoff =
-  (gc_stage "toolchain-trash" (HolbuildHolSharedCache.toolchain_trash ())
+  (gc_toolchain_stage "toolchain-trash" (HolbuildHolSharedCache.toolchain_trash ())
      (fn (path, ()) => (HolbuildHolSharedCache.remove_unlocked_tree path; ((), true)))
      ();
-   gc_stage "toolchains" (HolbuildHolSharedCache.toolchain_keys ())
+   gc_toolchain_stage "toolchains" (HolbuildHolSharedCache.toolchain_keys ())
      (fn (k, {removed, busy}) =>
          case HolbuildHolSharedCache.gc_entry cutoff k of
              HolbuildHolSharedCache.GcRemoved => ({removed = removed + 1, busy = busy}, true)
