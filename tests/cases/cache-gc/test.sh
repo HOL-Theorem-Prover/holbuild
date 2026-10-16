@@ -141,7 +141,7 @@ if env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$fail_cache" \
   echo "GC succeeded despite an undeletable entry" >&2; exit 1
 fi
 chmod u+w "$fail_cache/tmp/stuck/ro"
-require_grep "failed to remove cache path: $fail_cache/tmp/stuck/ro/file" "$tmpdir/fail.err"
+require_grep "failed to remove cache path: .*$fail_cache/tmp/stuck/ro/file" "$tmpdir/fail.err"
 [[ ! -e "$fail_cache/locks/gc.lock.owner" ]] || { echo "failed cache gc kept its lock owner" >&2; exit 1; }
 env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$fail_cache" "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/fail-retry.log"
 require_grep "removed tmp=1 " "$tmpdir/fail-retry.log"

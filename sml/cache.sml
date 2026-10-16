@@ -70,22 +70,36 @@ fun is_dir path = FS.isDir path handle OS.SysErr _ => false
 fun missing_entry (OS.SysErr (_, SOME err)) = err = Posix.Error.noent
   | missing_entry _ = false
 
-(* Removes a cache entry in-process; spawning `rm -rf` per entry dominated GC
-   time on large caches. Directories are descended without following symlinks,
-   and an entry that has already disappeared counts as removed. *)
+fun remove_error path msg = Error ("failed to remove cache path: " ^ path ^ ": " ^ msg)
+
+fun trim_newline s =
+  if size s > 0 andalso String.sub(s, size s - 1) = #"\n" then
+    String.substring(s, 0, size s - 1)
+  else s
+
+(* `rm -rf` descends through directories it has opened, so a subdirectory
+   swapped for a symlink while it runs cannot redirect it outside the cache;
+   its messages name the path that failed. *)
+fun remove_dir_tree path =
+  let
+    val proc = Unix.execute ("/bin/sh", ["-c", "rm -rf -- " ^ quote path ^ " 2>&1"])
+    val output = TextIO.inputAll (Unix.textInstreamOf proc)
+  in
+    if OS.Process.isSuccess (Unix.reap proc) then ()
+    else raise remove_error path (trim_newline output)
+  end
+
+(* Regular files and symlinks, which include every blob, are unlinked
+   in-process, since spawning a process per entry dominated GC time on large
+   caches. An entry that has already disappeared counts as removed. *)
 fun remove_tree path =
   if path = "" orelse path = "." orelse path = "/" then
     raise Error ("refusing to remove unsafe cache path: " ^ path)
+  else if not (is_link path) andalso is_dir path then
+    remove_dir_tree path
   else
-    let
-      fun remove p =
-        (if not (is_link p) andalso is_dir p then (List.app remove (children p); FS.rmDir p)
-         else FS.remove p)
-        handle e as OS.SysErr (msg, _) =>
-          if missing_entry e then () else raise Error ("failed to remove cache path: " ^ p ^ ": " ^ msg)
-    in
-      remove path
-    end
+    FS.remove path
+    handle e as OS.SysErr (msg, _) => if missing_entry e then () else raise remove_error path msg
 
 (* Progress for long GC stages goes to stderr, leaving stdout to the summary.
    A stage reports only after running for one interval, then once per
@@ -167,11 +181,6 @@ fun read_lines path =
     TextIO.closeIn input;
     lines
   end
-
-fun trim_newline s =
-  if size s > 0 andalso String.sub(s, size s - 1) = #"\n" then
-    String.substring(s, 0, size s - 1)
-  else s
 
 fun take_token s =
   let
