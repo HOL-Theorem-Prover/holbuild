@@ -102,7 +102,9 @@ stale_entry=$(buildhol)
 write_manifest "$new_rev"
 recent_entry=$(buildhol)
 [[ "$stale_entry" != "$recent_entry" ]] || { echo "expected two toolchain entries" >&2; exit 1; }
-[[ "$stale_entry" == "$cache/hol-toolchains/"* ]] || { echo "toolchain not under --cache-dir: $stale_entry" >&2; exit 1; }
+# holbuild prints canonical paths, so compare entries by name rather than
+# against $cache, which may contain // from a trailing-slash TMPDIR.
+[[ -d "$cache/hol-toolchains/$(basename "$stale_entry")" ]] || { echo "toolchain not under --cache-dir: $stale_entry" >&2; exit 1; }
 [[ $(builds) -eq 2 ]] || { echo "expected two toolchain builds" >&2; exit 1; }
 
 # Stale entries that a full or --cache-only GC would remove.
@@ -159,6 +161,42 @@ for other in --cache-only --clean-only; do
   fi
   require_grep "mutually exclusive" "$tmpdir/bad-flags.log"
 done
+
+# A running cache GC holds locks/gc.lock; toolchain-only GC must not overlap it.
+write_manifest "$old_rev"
+locked_entry=$(buildhol)
+age 10 "$locked_entry/last-used"
+python3 - "$cache/locks/gc.lock" "$tmpdir/held" <<'PY' &
+import fcntl
+import os
+import sys
+import time
+
+lock, held = sys.argv[1:]
+fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o666)
+fcntl.lockf(fd, fcntl.LOCK_EX)
+with open(held, "w") as out:
+    out.write("held\n")
+time.sleep(60)
+PY
+holder=$!
+background+=("$holder")
+for _ in $(seq 1 100); do
+  [[ -f "$tmpdir/held" ]] && break
+  sleep 0.05
+done
+[[ -f "$tmpdir/held" ]] || { echo "test lock holder did not start" >&2; exit 1; }
+if (cd "$outside" && "$HOLBUILD_BIN" --cache-dir "$cache" gc --toolchains-only) > "$tmpdir/locked.log" 2>&1; then
+  echo "gc --toolchains-only ran while the cache gc lock was held" >&2
+  exit 1
+fi
+require_grep "cache gc already running" "$tmpdir/locked.log"
+require_entry "$locked_entry" "a toolchain while the cache gc lock was held"
+kill "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+expect_gc "$outside" 1 0
+require_no_entry "$locked_entry" "a stale toolchain once the cache gc lock was free"
+[[ ! -e "$cache/locks/gc.lock.owner" ]] || { echo "cache gc lock owner survived" >&2; exit 1; }
 
 (cd "$outside" && "$HOLBUILD_BIN" --cache-dir "$tmpdir/missing" gc --toolchains-only) > "$tmpdir/missing.log" 2>&1
 require_grep "cache not found: $tmpdir/missing" "$tmpdir/missing.log"

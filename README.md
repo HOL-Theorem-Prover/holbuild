@@ -715,6 +715,8 @@ are used outside holbuild.
 cleanup and the action/blob scan, which can take minutes on a large cache. Like
 `--cache-only`, it needs no project or HOL toolchain. `--clean-only`,
 `--cache-only`, and `--toolchains-only` are mutually exclusive.
+`--max-checkpoints-gb` applies only to project cleanup and is ignored with
+`--cache-only` or `--toolchains-only`.
 
 ## Local configuration
 
