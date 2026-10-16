@@ -64,15 +64,89 @@ fun children dir =
       result
     end
 
+fun is_link path = FS.isLink path handle OS.SysErr _ => false
+fun is_dir path = FS.isDir path handle OS.SysErr _ => false
+
+fun missing_entry (OS.SysErr (_, SOME err)) = err = Posix.Error.noent
+  | missing_entry _ = false
+
+(* Removes a cache entry in-process; spawning `rm -rf` per entry dominated GC
+   time on large caches. Directories are descended without following symlinks,
+   and an entry that has already disappeared counts as removed. *)
 fun remove_tree path =
   if path = "" orelse path = "." orelse path = "/" then
     raise Error ("refusing to remove unsafe cache path: " ^ path)
   else
-    let val status = OS.Process.system ("rm -rf " ^ quote path)
+    let
+      fun remove p =
+        (if not (is_link p) andalso is_dir p then (List.app remove (children p); FS.rmDir p)
+         else FS.remove p)
+        handle e => if missing_entry e then () else raise e
     in
-      if OS.Process.isSuccess status then ()
-      else raise Error ("failed to remove cache path: " ^ path)
+      remove path
+      handle OS.SysErr (msg, _) => raise Error ("failed to remove cache path: " ^ path ^ ": " ^ msg)
     end
+
+(* Progress for long GC stages goes to stderr, leaving stdout to the summary.
+   A stage reports only after running for one interval, then once per
+   interval: every second on a terminal, every ten seconds otherwise. *)
+datatype progress =
+  Progress of {stage : string, total : int, tty : bool, interval : Time.time,
+               started : Time.time, next : Time.time ref, scanned : int ref,
+               removed : int ref, shown : bool ref}
+
+fun progress_interval tty =
+  case Option.mapPartial Real.fromString (OS.Process.getEnv "HOLBUILD_TEST_GC_PROGRESS_INTERVAL") of
+      SOME seconds => Time.fromReal seconds
+    | NONE => Time.fromReal (if tty then 1.0 else 10.0)
+
+fun start_progress stage total =
+  let
+    val tty = Posix.ProcEnv.isatty Posix.FileSys.stderr handle _ => false
+    val interval = progress_interval tty
+    val now = Time.now ()
+  in
+    Progress {stage = stage, total = total, tty = tty, interval = interval, started = now,
+              next = ref (Time.+(now, interval)), scanned = ref 0, removed = ref 0,
+              shown = ref false}
+  end
+
+fun show_progress (Progress {stage, total, tty, started, scanned, removed, shown, ...}) final =
+  let
+    val elapsed = Real.fmt (StringCvt.FIX (SOME 1)) (Time.toReal (Time.-(Time.now (), started)))
+    val text = "cache gc: " ^ stage ^ ": " ^ Int.toString (!scanned) ^ "/" ^ Int.toString total ^
+               " scanned, " ^ Int.toString (!removed) ^ " removed, " ^ elapsed ^ "s"
+  in
+    shown := true;
+    TextIO.output (TextIO.stdErr,
+                   if tty then "\r" ^ text ^ "\027[K" ^ (if final then "\n" else "")
+                   else text ^ "\n");
+    TextIO.flushOut TextIO.stdErr
+  end
+
+fun tick (progress as Progress {next, interval, scanned, removed, ...}) was_removed =
+  let val now = Time.now ()
+  in
+    scanned := !scanned + 1;
+    if was_removed then removed := !removed + 1 else ();
+    if Time.>=(now, !next) then (next := Time.+(now, interval); show_progress progress false) else ()
+  end
+
+fun finish_progress (progress as Progress {shown, ...}) =
+  if !shown then show_progress progress true else ()
+
+(* Folds step over paths as one reported GC stage; step returns the new
+   accumulator and whether it removed the entry. *)
+fun gc_stage stage paths step init =
+  let
+    val progress = start_progress stage (length paths)
+    fun one (path, acc) =
+      let val (acc, was_removed) = step (path, acc)
+      in tick progress was_removed; acc end
+  in
+    (List.foldl one init paths before finish_progress progress)
+    handle e => (finish_progress progress; raise e)
+  end
 
 fun stale cutoff path =
   Time.<(FS.modTime path, cutoff) handle OS.SysErr _ => false
@@ -152,45 +226,52 @@ fun collect_live_actions cutoff actions_dir =
       in
         if path_exists manifest then
           if stale cutoff manifest then
-            (remove_tree action_dir; (live_blobs, removed + 1))
+            (remove_tree action_dir; ((live_blobs, removed + 1), true))
           else
-            (Redblackset.union(live_blobs, action_live_blobs action_dir),
-             removed)
+            ((Redblackset.union(live_blobs, action_live_blobs action_dir), removed), false)
         else if stale cutoff action_dir then
-          (remove_tree action_dir; (live_blobs, removed + 1))
+          (remove_tree action_dir; ((live_blobs, removed + 1), true))
         else
-          (live_blobs, removed)
+          ((live_blobs, removed), false)
       end
   in
-    List.foldl one (empty_blob_set (), 0) (children actions_dir)
+    gc_stage "actions" (children actions_dir) one (empty_blob_set (), 0)
   end
 
-fun remove_stale_children cutoff dir =
-  List.foldl
+fun remove_stale_children stage cutoff dir =
+  gc_stage stage (children dir)
     (fn (path, removed) =>
-        if stale cutoff path then (remove_tree path; removed + 1) else removed)
+        if stale cutoff path then (remove_tree path; (removed + 1, true)) else (removed, false))
     0
-    (children dir)
 
 fun remove_obsolete_action_lock_dirs cutoff dir =
-  List.foldl
+  gc_stage "locks" (children dir)
     (fn (path, removed) =>
-        if has_prefix "action-" (Path.file path) andalso (FS.isDir path handle OS.SysErr _ => false) andalso stale cutoff path then
-          (remove_tree path; removed + 1)
-        else removed)
+        if has_prefix "action-" (Path.file path) andalso is_dir path andalso stale cutoff path then
+          (remove_tree path; (removed + 1, true))
+        else (removed, false))
     0
-    (children dir)
 
 fun blob_name path = Path.file path
 
 fun sweep_blobs cutoff live_blobs blobs_dir =
-  List.foldl
+  gc_stage "blobs" (children blobs_dir)
     (fn (path, removed) =>
         if stale cutoff path andalso not (Redblackset.member(live_blobs, blob_name path)) then
-          (remove_tree path; removed + 1)
-        else removed)
+          (remove_tree path; (removed + 1, true))
+        else (removed, false))
     0
-    (children blobs_dir)
+
+fun gc_toolchains cutoff =
+  (HolbuildHolSharedCache.sweep_toolchain_trash ();
+   gc_stage "toolchains" (HolbuildHolSharedCache.toolchain_keys ())
+     (fn (k, {removed, busy}) =>
+         case HolbuildHolSharedCache.gc_entry cutoff k of
+             HolbuildHolSharedCache.GcRemoved => ({removed = removed + 1, busy = busy}, true)
+           | HolbuildHolSharedCache.GcBusy => ({removed = removed, busy = busy + 1}, false)
+           | HolbuildHolSharedCache.GcKept => ({removed = removed, busy = busy}, false))
+     {removed = 0, busy = 0})
+  handle HolbuildHolSharedCache.Error msg => raise Error msg
 
 fun gc_lock_path root = Path.concat(locks_dir root, "gc.lock")
 fun gc_lock_owner_path lock = lock ^ ".owner"
@@ -263,13 +344,11 @@ fun gc_root root days =
       val tmp_dir = Path.concat(root, "tmp")
       fun run () =
         let
-          val tmp_removed = remove_stale_children cutoff tmp_dir
+          val tmp_removed = remove_stale_children "tmp" cutoff tmp_dir
           val lock_removed = remove_obsolete_action_lock_dirs cutoff (locks_dir root)
           val (live_blobs, actions_removed) = collect_live_actions cutoff actions_dir
           val blobs_removed = sweep_blobs cutoff live_blobs blobs_dir
-          val {removed = toolchains_removed, busy = toolchains_busy} =
-            HolbuildHolSharedCache.gc_toolchains cutoff
-            handle HolbuildHolSharedCache.Error msg => raise Error msg
+          val {removed = toolchains_removed, busy = toolchains_busy} = gc_toolchains cutoff
         in
           print ("cache gc: removed tmp=" ^ Int.toString tmp_removed ^
                  " locks=" ^ Int.toString lock_removed ^

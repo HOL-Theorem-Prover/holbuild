@@ -75,3 +75,56 @@ kill "$holder" 2>/dev/null || true
 wait "$holder" 2>/dev/null || true
 env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$live_cache" "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/live-gc-after-kill.log"
 [[ ! -e "$live_cache/locks/gc.lock.owner" ]] || { echo "cache gc lock owner survived after retry" >&2; exit 1; }
+
+# age DAYS PATH...: set modification times, without following symlinks.
+age() {
+  python3 - "$@" <<'PY'
+import os, sys, time
+when = time.time() - float(sys.argv[1]) * 86400
+for path in sys.argv[2:]:
+    os.utime(path, (when, when), follow_symlinks=False)
+PY
+}
+
+# Entry removal never follows symlinks out of the cache.
+outside=$tmpdir/outside
+safe_cache=$tmpdir/safe-cache
+mkdir -p "$outside/keep" "$safe_cache/tmp/olddir" "$safe_cache/actions" "$safe_cache/blobs"
+printf 'keep\n' > "$outside/keep/file"
+ln -s "$outside/keep" "$safe_cache/tmp/olddir/link"
+ln -s "$outside/keep" "$safe_cache/tmp/oldlink"
+age 10 "$safe_cache/tmp/olddir/link" "$safe_cache/tmp/olddir" "$safe_cache/tmp/oldlink" "$outside/keep"
+env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$safe_cache" "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/safe-gc.log"
+require_grep "removed tmp=2 " "$tmpdir/safe-gc.log"
+[[ ! -e "$safe_cache/tmp/olddir" && ! -L "$safe_cache/tmp/oldlink" ]] || { echo "stale tmp entries survived" >&2; exit 1; }
+require_file "$outside/keep/file"
+
+# Long stages report progress on stderr before the summary; stdout keeps only
+# the summary line. The test interval forces a report for every entry.
+make_progress_cache() {
+  local dir=$1
+  rm -rf "$dir"
+  mkdir -p "$dir/actions" "$dir/blobs" "$dir/tmp"
+  for i in $(seq 1 20); do : > "$dir/blobs/blob$i"; done
+  age 10 "$dir"/blobs/*
+}
+progress_cache=$tmpdir/progress-cache
+make_progress_cache "$progress_cache"
+env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$progress_cache" HOLBUILD_TEST_GC_PROGRESS_INTERVAL=0 \
+  "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/progress.log" 2>&1
+require_grep "cache gc: blobs: 1/20 scanned, 1 removed" "$tmpdir/progress.log"
+require_grep "cache gc: blobs: 20/20 scanned, 20 removed" "$tmpdir/progress.log"
+first_progress=$(grep -n "cache gc: blobs:" "$tmpdir/progress.log" | head -n 1 | cut -d: -f1)
+summary=$(grep -n "cache gc: removed" "$tmpdir/progress.log" | cut -d: -f1)
+[[ $first_progress -lt $summary ]] || { echo "GC progress was not reported before completion" >&2; exit 1; }
+make_progress_cache "$progress_cache"
+env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$progress_cache" HOLBUILD_TEST_GC_PROGRESS_INTERVAL=0 \
+  "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/progress.out" 2> /dev/null
+[[ $(wc -l < "$tmpdir/progress.out") -eq 1 ]] || { echo "GC progress leaked onto stdout" >&2; exit 1; }
+require_grep "blobs=20 " "$tmpdir/progress.out"
+
+# A GC that finishes within the default interval prints no progress.
+make_progress_cache "$progress_cache"
+env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$progress_cache" \
+  "$HOLBUILD_BIN" gc --cache-only > /dev/null 2> "$tmpdir/quiet.err"
+[[ ! -s "$tmpdir/quiet.err" ]] || { echo "fast GC printed progress:" >&2; cat "$tmpdir/quiet.err" >&2; exit 1; }

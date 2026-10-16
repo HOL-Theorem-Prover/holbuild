@@ -638,18 +638,12 @@ fun gc_entry cutoff k =
             handle e => (release_lock build_lock; raise e)
           end
 
-fun gc_toolchains cutoff =
-  let
-    val _ = List.app (fn name => remove_unlocked_tree (Path.concat(trash_dir (), name)))
-                     (child_names (trash_dir ()))
-    fun count (k, {removed, busy}) =
-      case gc_entry cutoff k of
-          GcRemoved => {removed = removed + 1, busy = busy}
-        | GcBusy => {removed = removed, busy = busy + 1}
-        | GcKept => {removed = removed, busy = busy}
-  in
-    List.foldl count {removed = 0, busy = 0}
-      (List.filter is_toolchain_key (child_names (toolchains_dir ())))
-  end
+(* Removes leftovers of an interrupted toolchain GC; HolbuildCache.gc_root
+   then runs gc_entry over toolchain_keys. *)
+fun sweep_toolchain_trash () =
+  List.app (fn name => remove_unlocked_tree (Path.concat(trash_dir (), name)))
+           (child_names (trash_dir ()))
+
+fun toolchain_keys () = List.filter is_toolchain_key (child_names (toolchains_dir ()))
 
 end
