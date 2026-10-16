@@ -239,6 +239,11 @@ write_manifest ""
 (cd "$project" && "$HOLBUILD_BIN" heap base) > "$tmpdir/plain-export.log"
 require_file "$heap"
 require_no_file "$heap.ok"
+# A .ok that is not a base heap's is not holbuild's to delete.
+echo "notes" > "$heap.ok"
+(cd "$project" && "$HOLBUILD_BIN" heap base) > "$tmpdir/plain-export-notes.log"
+require_grep "^notes\$" "$heap.ok"
+rm "$heap.ok"
 write_manifest "base = true"
 rm -f "$markers"/*.hierarchy
 (cd "$project" && "$HOLBUILD_BIN" build --force=theory CTheory) > "$tmpdir/after-plain.log"
@@ -279,8 +284,7 @@ dry_key=$(awk '/^CTheory / {found = 1} found && /input_key:/ {print $2; exit}' "
 (cd "$project" && "$HOLBUILD_BIN" export -o "$tmpdir/heap-user.hbx" CTheory) > "$tmpdir/export.log" 2>&1
 require_grep "exported 3 cache action" "$tmpdir/export.log"
 
-# Two users that build at once share one export, and a failed export fails
-# both without being retried.
+# Two users that build at once share one export.
 for theory in F G; do
   cat > "$project/src/${theory}Script.sml" <<SML
 open HolKernel Parse boolLib bossLib ATheory;
@@ -291,41 +295,58 @@ val _ = export_theory();
 SML
 done
 rm -f "$heap" "$heap.ok" "$markers"/*.hierarchy
-(cd "$project" && HOLBUILD_TIMING_LOG="$tmpdir/shared-export.timing" HOLBUILD_TIMING_DETAIL=fine \
-   "$HOLBUILD_BIN" -j2 build FTheory GTheory) > "$tmpdir/shared-export.log" 2>&1
+(cd "$project" && HOLBUILD_DUMP_KEYS="$tmpdir/shared-export.keys" "$HOLBUILD_BIN" -j2 build FTheory GTheory) \
+  > "$tmpdir/shared-export.log" 2>&1
 exports=$(grep -c "exporting base heap" "$tmpdir/shared-export.log" || true)
 [[ "$exports" == 1 ]] || { echo "two base heap users exported the heap $exports times" >&2; exit 1; }
 require_heap_start F
 require_heap_start G
-# A user that finds the heap already exported returns at once, so a user that
-# took at least half as long as the export waited for it.
-phase_ms() {
-  grep "name=build.exec.base_heap.$1	status=ok" "$tmpdir/shared-export.timing" |
-    sed 's/.*	ms=\([0-9]*\).*/\1/'
+
+# A failed export is a warning: the users start from hol.state, load the
+# objects first, and build exactly what they built from the heap, under the
+# same input keys.  A directory at the heap's temporary file makes buildheap
+# fail, even for root.
+users=(B C F G)
+user_outputs() {
+  local theory
+  for theory in "${users[@]}"; do
+    (cd "$obj" && sha256sum "${theory}Theory.dat" "${theory}Theory.sig" "${theory}Theory.sml")
+  done
 }
-export_ms=$(phase_ms export)
-waits=$(phase_ms ensure | awk -v export_ms="$export_ms" '2 * $1 >= export_ms' | wc -l)
-if [[ -z "$export_ms" || "$waits" != 2 ]]; then
-  echo "expected both base heap users to wait for the one export" >&2
-  grep "base_heap" "$tmpdir/shared-export.timing" >&2
-  exit 1
-fi
-# A regular file where the heap's directory belongs fails the export, even
-# for root.  holbuild reports only the first failure, so the timing log shows
-# that both users asked for the heap.
-rm -rf "$heap" "$heap.ok" "$project/.holbuild/heap"
-touch "$project/.holbuild/heap"
-if (cd "$project" && HOLBUILD_TIMING_LOG="$tmpdir/failed-export.timing" HOLBUILD_TIMING_DETAIL=fine \
-      "$HOLBUILD_BIN" -j2 build --force=theory FTheory GTheory) > "$tmpdir/failed-export.log" 2>&1; then
-  echo "build succeeded although the base heap could not be exported" >&2
-  exit 1
-fi
-rm "$project/.holbuild/heap"
+user_outputs > "$tmpdir/heap-users.sha"
+rm -f "$heap" "$heap.ok" "$markers"/*.hierarchy
+mkdir "$heap.tmp"
+(cd "$project" && HOLBUILD_DUMP_KEYS="$tmpdir/failed-export.keys" \
+   "$HOLBUILD_BIN" -j2 build --force=theory BTheory CTheory FTheory GTheory) > "$tmpdir/failed-export.log" 2>&1 ||
+  { echo "a failed base heap export failed the build" >&2; cat "$tmpdir/failed-export.log" >&2; exit 1; }
+rmdir "$heap.tmp"
 exports=$(grep -c "exporting base heap" "$tmpdir/failed-export.log" || true)
 [[ "$exports" == 1 ]] || { echo "a failed base heap export was attempted $exports times" >&2; exit 1; }
-require_grep "hol buildheap failed while exporting heap" "$tmpdir/failed-export.log"
-users=$(grep -c "name=build.exec.base_heap.ensure	status=fail" "$tmpdir/failed-export.timing" || true)
-[[ "$users" == 2 ]] || { echo "$users base heap users saw the failed export, expected 2" >&2; exit 1; }
+warnings=$(grep -c "warning: could not export base heap $heap" "$tmpdir/failed-export.log" || true)
+[[ "$warnings" == 1 ]] || { echo "a failed base heap export warned $warnings times" >&2; exit 1; }
+require_grep "child log: .*holbuild-heap.log" "$tmpdir/failed-export.log"
+for theory in "${users[@]}"; do require_toolchain_start "$theory"; done
+user_outputs > "$tmpdir/cold-users.sha"
+if ! cmp -s "$tmpdir/heap-users.sha" "$tmpdir/cold-users.sha"; then
+  echo "base heap users built cold differ from their heap builds" >&2
+  diff "$tmpdir/heap-users.sha" "$tmpdir/cold-users.sha" >&2 || true
+  exit 1
+fi
+for theory in F G; do
+  heap_key=$(awk -F'\t' -v t="${theory}Theory" '$1 ~ t {print $2}' "$tmpdir/shared-export.keys")
+  cold_key=$(awk -F'\t' -v t="${theory}Theory" '$1 ~ t {print $2}' "$tmpdir/failed-export.keys")
+  [[ -n "$heap_key" && "$heap_key" == "$cold_key" ]] ||
+    { echo "$theory's input key depends on whether the heap was used" >&2; exit 1; }
+done
+# Users built cold are current once the heap is: a build neither rebuilds
+# them nor exports.
+(cd "$project" && "$HOLBUILD_BIN" heap base) > "$tmpdir/after-fallback-export.log"
+(cd "$project" && "$HOLBUILD_BIN" -j2 build) > "$tmpdir/after-fallback.log" 2>&1
+if grep -q "Theory built\|exporting base heap" "$tmpdir/after-fallback.log"; then
+  echo "a build after the cold fallback rebuilt a user" >&2
+  cat "$tmpdir/after-fallback.log" >&2
+  exit 1
+fi
 rm "$project/src/FScript.sml" "$project/src/GScript.sml"
 
 # The export's own holproject.toml stops HOL's search for a project, so
@@ -420,6 +441,19 @@ require_heap_start H
 require_cold_load_path H
 [[ "$(sha256sum < "$obj/HTheory.dat")" == "$h_cold" ]] ||
   { echo "HTheory differs between toolchain and base heap starts" >&2; exit 1; }
+# Started cold with the objects loaded first, H builds what it built from
+# the heap.
+users=(H)
+user_outputs > "$tmpdir/heap-H.sha"
+rm -f "$heap" "$heap.ok" "$markers"/*.hierarchy
+mkdir "$heap.tmp"
+(cd "$project" && "$HOLBUILD_BIN" build --force=theory HTheory) > "$tmpdir/ancestor-fallback.log" 2>&1
+rmdir "$heap.tmp"
+require_grep "warning: could not export base heap" "$tmpdir/ancestor-fallback.log"
+require_toolchain_start H
+user_outputs > "$tmpdir/cold-H.sha"
+cmp -s "$tmpdir/heap-H.sha" "$tmpdir/cold-H.sha" ||
+  { echo "HTheory differs between base heap and cold objects-first starts" >&2; exit 1; }
 write_manifest "base = true"
 rm "$project/src/HScript.sml"
 
@@ -560,6 +594,64 @@ rm -f "$markers"/*.hierarchy
 (cd "$consumer" && "$HOLBUILD_BIN" -j2 build) > "$tmpdir/consumer-heap.log" 2>&1
 require_no_file "$markers/Q.hierarchy"
 require_grep "$consumer_heap" "$markers/R.hierarchy"
+
+# Load order changes results: P and Q overload one name, and the later load
+# wins.  Without base, U loads P after Q; with Q as the object, U loads Q
+# first, from the heap or cold, and builds the same files either way.
+order=$tmpdir/order
+mkdir -p "$order/src"
+write_order_manifest() {
+  sed -e 's/name = "basectx"/name = "order"/' -e 's/objects = \["ATheory"\]/objects = ["QTheory"]/' \
+      -e '/^base = true$/d' "$project/holproject.toml" > "$order/holproject.toml"
+  printf '%s\n' "$1" >> "$order/holproject.toml"
+  require_grep 'objects = \["QTheory"\]' "$order/holproject.toml"
+}
+for theory in P Q; do
+  value=T
+  [[ "$theory" == Q ]] && value=F
+  cat > "$order/src/${theory}Script.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "$theory";
+val _ = overload_on ("zz", \`\`$value\`\`);
+val _ = export_theory();
+SML
+done
+cat > "$order/src/UScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib QTheory PTheory;
+val _ = new_theory "U";
+val u_thm = store_thm("u_thm", ``zz \/ ~zz``, ACCEPT_TAC (SPEC ``zz`` EXCLUDED_MIDDLE));
+val _ = export_theory();
+SML
+order_obj=$order/.holbuild/obj/src
+u_outputs() { (cd "$order_obj" && sha256sum UTheory.dat UTheory.sig UTheory.sml); }
+write_order_manifest ""
+(cd "$order" && "$HOLBUILD_BIN" build) > "$tmpdir/order-plain.log" 2>&1
+u_outputs > "$tmpdir/order-plain.sha"
+write_order_manifest "base = true"
+(cd "$order" && "$HOLBUILD_BIN" build) > "$tmpdir/order-heap.log" 2>&1
+require_grep "exporting base heap" "$tmpdir/order-heap.log"
+u_outputs > "$tmpdir/order-heap.sha"
+if cmp -s "$tmpdir/order-plain.sha" "$tmpdir/order-heap.sha"; then
+  echo "U does not depend on load order, so it cannot show the objects load first" >&2
+  exit 1
+fi
+rm -f "$order/.holbuild/heap/base.save" "$order/.holbuild/heap/base.save.ok"
+mkdir "$order/.holbuild/heap/base.save.tmp"
+(cd "$order" && "$HOLBUILD_BIN" build --force=theory UTheory) > "$tmpdir/order-cold.log" 2>&1
+rmdir "$order/.holbuild/heap/base.save.tmp"
+require_grep "warning: could not export base heap" "$tmpdir/order-cold.log"
+u_outputs > "$tmpdir/order-cold.sha"
+cmp -s "$tmpdir/order-heap.sha" "$tmpdir/order-cold.sha" ||
+  { echo "U built cold with its objects first differs from its heap build" >&2; exit 1; }
+# --skip-checkpoints writes the plain preload, which loads the objects first
+# too.
+mkdir "$order/.holbuild/heap/base.save.tmp"
+(cd "$order" && "$HOLBUILD_BIN" build --skip-checkpoints --force=theory UTheory) > "$tmpdir/order-plain-preload.log" 2>&1
+rmdir "$order/.holbuild/heap/base.save.tmp"
+require_grep "warning: could not export base heap" "$tmpdir/order-plain-preload.log"
+u_outputs > "$tmpdir/order-plain-preload.sha"
+cmp -s "$tmpdir/order-heap.sha" "$tmpdir/order-plain-preload.sha" ||
+  { echo "U built with --skip-checkpoints differs from its heap build" >&2; exit 1; }
 
 # A forced rebuild of a nondeterministic object writes a new .dat under an
 # unchanged input key.  The heap must be re-exported, or its users load the

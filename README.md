@@ -543,56 +543,43 @@ objects = ["semanticsTheory"]
 base = true
 ```
 
-A `[[heap]]` with `base = true` declares that the theories that reach its
-objects start with those objects loaded first: they start from the heap
-instead of HOL's `hol.state`, so a theory child does not reload every shared
-ancestor from disk. It is not only a speed-up, because loading the objects
-first can change what a theory builds (see below). At most one heap of the
-root project may set `base`, and it must list at least one object, all theory
-targets. The heap
-holds exactly what loading its objects loads. A root-project theory starts from it only when its own
-preloads reach every object; other theories, the objects and their ancestors,
-and every dependency package's theories start from `hol.state`. A dependency
-manifest's `base = true` is ignored with a warning.
+A `[[heap]]` with `base = true` declares a load order: every root-project
+theory whose preloads reach every object loads the objects first, in manifest
+order, before its other preloads. Load order can change what a theory builds:
+HOL state that keeps the most recent registration (an overloaded name, or
+`cv_trans` translations defined in two ancestors) resolves to the theory
+loaded last, so theory files, and in principle which proofs succeed, can
+differ from a build without `base`. Setting `base` therefore changes those
+theories' input keys, which carry `base_heap_objects=`: they rebuild once, and
+HBX archives and remote-cache entries built with `base = true` never serve a
+consumer, whose theories use cold keys. Other theories, the objects and their
+ancestors, and every dependency package's theories are unaffected. At most one
+heap of the root project may set `base`, and it must list at least one object,
+all theory targets. A dependency manifest's `base = true` is ignored with a
+warning.
 
-`holbuild build` exports the base heap the first time a theory that would
-start from it has to build from source, and only when the heap is missing or
-stale. The heap is keyed by the toolchain, the path of its `hol.state`, and
-the objects' input keys, which `<output>.ok` records; editing any ancestor of
-an object, or moving the toolchain, re-exports it. `<output>.ok` also records
-a hash of the objects' theory files, so rebuilding an object to different
-files under the same key (for example with `--force`) re-exports it too.
-`<output>.ok` also records the exported file's content hash, and a build
-re-exports a heap file that no longer matches it. `holbuild heap base` always
-re-exports the same heap. Exporting it while `base` is unset deletes
-`<output>.ok`, so the next build re-exports it. Checkpoints
-saved over the heap are keyed by the exported file itself, so a re-export
-never resumes them, even when the heap key is unchanged.
+The heap, which holds exactly what loading the objects loads, only speeds this
+up: those theories start from it instead of from HOL's `hol.state` followed by
+loading the objects, so they do not reload every shared ancestor from disk.
+Both starts build identical files and share cache entries. `holbuild build`
+exports the heap the first time such a theory has to build from source, and
+only when the heap is missing or stale: when the toolchain moves, or an
+object's input key or theory files change, or the file no longer matches the
+content hash in `<output>.ok`. If the export fails, holbuild warns once,
+naming the heap and its log, and builds those theories from `hol.state` with
+the objects loaded first. `holbuild heap base` always re-exports the heap.
+Exporting the same file as a plain heap, with `base` unset, deletes the base
+heap's `<output>.ok`, so the next build re-exports it.
 
 A relative `output` of the base heap is resolved under the directory that
 holds the build's `.holbuild/` (the current directory with `--source-dir`),
-while other heaps resolve it under the project root. Builds export the base
-heap on their own, so each build directory gets its own heap, and a shared
-or read-only source tree is never written. An absolute base heap `output`, or
-one containing `..`, is rejected: it would let several build directories
-write one file.
-
-The export runs `hol buildheap` in a fresh directory under
-`.holbuild/stage/` that holds a `holproject.toml` with `holmake = false`. HOL
-adds the directories of the project around its working directory to the load
-path, and the heap would keep them; that file gives HOL a project with no
-directories.
-
-A heap start loads the heap's theories before the theory's other preloads, and
-HOL state that keeps the most recent registration (for example `cv_trans`
-translations defined in two ancestors) can then resolve differently. A theory
-built from the heap matches a cold build that loads the objects first, but its
-results can differ from a build without `base`: its theory files can differ,
-and so in principle can which of its proofs succeed. Setting `base` therefore
-changes the input keys of the theories that start from the heap: they rebuild
-once, and heap-built and cold-built files are cached separately. Their keys
-carry `base_heap_objects=`, so HBX archives and remote-cache entries built with
-`base = true` never serve a consumer, whose theories use cold keys.
+while other heaps resolve it under the project root, so each build directory
+gets its own heap and a shared or read-only source tree is never written. An
+absolute base heap `output`, or one containing `..`, is rejected: it would let
+several build directories write one file. The export runs `hol buildheap` in a
+fresh directory under `.holbuild/stage/` whose `holproject.toml` sets
+`holmake = false`, so the heap does not keep the project's directories on its
+load path.
 
 ## Proof steps and checkpoints
 

@@ -269,10 +269,10 @@ fun preload_lines plan node =
     List.concat (map project_preload_lines project_deps)
   end
 
-fun write_preload plan node deps_loaded deps_ok path =
+fun write_preload first_loads plan node deps_loaded deps_ok path =
   let
     val lines = runtime_line () ::
-                (preload_lines plan node @
+                (first_loads @ preload_lines plan node @
                  [checkpoint_save_runtime_line (),
                   save_heap_line {label = "deps_loaded", share_common_data = true,
                                   output = deps_loaded, ok_text = deps_ok}])
@@ -280,8 +280,9 @@ fun write_preload plan node deps_loaded deps_ok path =
     write_text path (String.concatWith "\n" lines ^ "\n")
   end
 
-fun write_plain_preload plan node path =
-  write_text path (String.concatWith "\n" (runtime_line () :: preload_lines plan node) ^ "\n")
+fun write_plain_preload first_loads plan node path =
+  write_text path
+    (String.concatWith "\n" (runtime_line () :: first_loads @ preload_lines plan node) ^ "\n")
 
 (* HOL's theory exporter enables generated HTML documentation by default.  A
    holbuild child runs in a disposable stage and these files are not build
@@ -1391,29 +1392,29 @@ fun hol_context_path (HolState path) = path
 
 fun hol_context_args (HolState path) = ["--holstate", path]
 
-(* A base heap is a `hol buildheap` image of declared theories that theory
-   children start from instead of the toolchain hol.state.  It holds exactly
-   what loading its objects loads, and a root-package node starts from it
-   only when the node's own preloads reach every object, so the heap never
-   adds a module the node's cold session would not load.  It does change the
-   load order, which HOL state such as the cv_trans database depends on, so a
-   heap user's input key records the heap (see config_lines_with). *)
+(* `base = true` makes every root-package theory whose preloads reach every
+   object (a user) load the objects first, in manifest order, before its other
+   preloads.  The base heap, a `hol buildheap` image of the objects, only
+   speeds that up: a user starts from it instead of hol.state and loading the
+   objects, and starts cold when it cannot be exported. *)
 type base_heap_spec = {output : string, objects : string list}
 
-(* The selected theories that start from the base heap, by node key. *)
+(* The selected theories that load the base heap objects first, by node key. *)
 type base_heap_users =
   {spec : base_heap_spec, objects : HolbuildBuildPlan.node list,
    users : string Redblackset.set}
 
-(* HeapReady carries the exported file's content hash.  HeapFailed keeps the
-   export failure so nodes waiting on the mutex fail without rerunning it. *)
-datatype base_heap_state = HeapUnchecked | HeapReady of string | HeapFailed of exn
+(* HeapReady carries the exported file's content hash.  HeapFailed records
+   that the export failed, so later users start cold without retrying it. *)
+datatype base_heap_state = HeapUnchecked | HeapReady of string | HeapFailed
 
 type base_heap =
   {path : string, key : string, objects : HolbuildBuildPlan.node list,
    users : string Redblackset.set, state : base_heap_state ref, mutex : Mutex.mutex}
 
-type node_base = {context : hol_context, deps_key : string}
+(* [first_loads] are preload lines that run before the node's own preloads:
+   the base heap objects for a user that starts cold. *)
+type node_base = {context : hol_context, deps_key : string, first_loads : string list}
 
 fun validate_hol_context context =
   let val path = hol_context_path context
@@ -2972,7 +2973,7 @@ fun run_failure_repl tc policy theorem_checkpoints failure_checkpoints deps_load
 
 fun write_theory_script policy project (base : node_base) plan keys input_key node source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
   if not (checkpoint_enabled policy) then
-    (write_plain_preload plan node preload;
+    (write_plain_preload (#first_loads base) plan node preload;
      write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_text 0 checkpoints [] terminations);
      {context = #context base, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
   else
@@ -2994,7 +2995,7 @@ fun write_theory_script policy project (base : node_base) plan keys input_key no
         (remove_theorem_checkpoints_for_deps project node deps_key;
          remove_declaration_checkpoints_for_deps project node deps_key;
          ensure_source_checkpoint_parents ();
-         write_preload plan node deps_loaded deps_ok preload;
+         write_preload (#first_loads base) plan node deps_loaded deps_ok preload;
          write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_text 0 checkpoints declaration_checkpoints terminations);
          {context = #context base, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
       fun run_from_failed_prefix {checkpoint, step_count, metadata_text} =
@@ -3078,7 +3079,7 @@ fun build_theory cache_allowed policy tc project (base : node_base) plan keys no
       else ()
     val _ =
       if checkpoint_enabled policy then
-        (write_text final_runtime (runtime_line () ^ "\n");
+        (write_text final_runtime (String.concatWith "\n" (runtime_line () :: #first_loads base) ^ "\n");
          write_final_context_loader
            {sml_path = staged_sml, output = final_context,
             ok_text = final_context_ok_text deps_key input_key,
@@ -3814,10 +3815,10 @@ fun base_heap_object_nodes plan objects =
     map require_theory (List.concat (map lookup objects))
   end
 
-(* A theory starts from the base heap only when the load edges of its
-   preloads (theory preloads and SML load manifests) reach every object.  A
-   theory reached that way is loaded by the child or is an ancestor of one
-   that is, so the heap adds no module a cold child would not load.  Only
+(* A theory loads the base heap objects first only when the load edges of
+   its preloads (theory preloads and SML load manifests) reach every object.
+   A theory reached that way is loaded by the child or is an ancestor of one
+   that is, so loading the objects first adds no module.  Only
    root-package theories qualify: a dependency's input keys must not depend
    on the consumer's manifest, or its cached results would not be shared. *)
 fun base_heap_users project plan (spec as {objects, ...} : base_heap_spec) : base_heap_users =
@@ -3864,10 +3865,11 @@ fun build_config_lines_for_node options project node =
     | HolbuildSourceIndex.Sml => policy_config_lines no_checkpoint_policy
     | HolbuildSourceIndex.Sig => policy_config_lines no_checkpoint_policy
 
-(* A heap start loads the objects before the theory's other preloads, and that
-   order can change the theory (a constant name defined by two theories
-   resolves to the later one), so a heap user's input key records the heap's
-   objects.  Their input keys already pin the heap's contents. *)
+(* A user loads the objects before its other preloads, and that order can
+   change the theory (a constant name defined by two theories resolves to the
+   later one), so a user's input key records the objects.  It does not record
+   whether the heap was used: a heap start and a cold start build the same
+   files, so they share cache entries. *)
 fun config_lines_with users options project node =
   build_config_lines_for_node options project node @
   (case users of
@@ -4174,13 +4176,14 @@ fun export_base_heap dat_hash_cache tc project ({path, key, objects, ...} : base
   end
 
 (* Returns the content hash of the current heap, exporting it at most once per
-   build. *)
+   build, or NONE when it cannot be exported.  The heap only speeds up its
+   users, so a failed export is a warning and the users start cold. *)
 fun ensure_base_heap dat_hash_cache tc project (heap as {path, key, objects, state, mutex, ...} : base_heap) =
   let
     fun ensure () =
       case !state of
-          HeapReady hash => hash
-        | HeapFailed e => raise e
+          HeapReady hash => SOME hash
+        | HeapFailed => NONE
         | HeapUnchecked =>
             let
               val hash =
@@ -4189,9 +4192,14 @@ fun ensure_base_heap dat_hash_cache tc project (heap as {path, key, objects, sta
                   | NONE => export_base_heap dat_hash_cache tc project heap
             in
               state := HeapReady hash;
-              hash
+              SOME hash
             end
-            handle e => (state := HeapFailed e; raise e)
+            handle e =>
+              (state := HeapFailed;
+               warn ("could not export base heap " ^ path ^
+                     "; its users start from hol.state and load its objects first\n" ^
+                     General.exnMessage e);
+               NONE)
   in
     (Mutex.lock mutex; ensure () before Mutex.unlock mutex)
     handle e => (Mutex.unlock mutex; raise e)
@@ -4213,21 +4221,32 @@ fun refresh_base_heap (options : build_options) tc project plan toolchain_key =
                                    (Redblackset.empty String.compare)))
         end
 
-(* Exports the base heap first when the node starts from it. *)
+(* A user starts from the base heap, exporting it first, or from hol.state
+   with the objects loaded first.  Checkpoints saved over either start must
+   not be resumed by the other, or over another heap file, so each has its
+   own deps_key. *)
 fun node_base dat_hash_cache tc project base_heap toolchain_key plan keys node : node_base =
   let
     val deps_key = dependency_context_key toolchain_key plan keys node
-    val cold = {context = toolchain_base_context tc, deps_key = deps_key}
+    val cold = {context = toolchain_base_context tc, deps_key = deps_key, first_loads = []}
+    fun derived_key tag lines =
+      HolbuildToolchain.hash_text (String.concatWith "\n" (tag :: ("deps_key=" ^ deps_key) :: lines) ^ "\n")
   in
     case base_heap of
-        SOME (heap as {path, users, ...} : base_heap) =>
+        SOME (heap as {path, users, objects, ...} : base_heap) =>
           if Redblackset.member(users, HolbuildBuildPlan.key node) then
-            {context = HolState path,
-             deps_key = HolbuildToolchain.hash_text
-                          ("holbuild-base-heap-dependency-context-v2\ndeps_key=" ^ deps_key ^
-                           "\nbase_heap_hash=" ^
-                           detail_time_phase "build.exec.base_heap.ensure"
-                             (fn () => ensure_base_heap dat_hash_cache tc project heap) ^ "\n")}
+            case detail_time_phase "build.exec.base_heap.ensure"
+                   (fn () => ensure_base_heap dat_hash_cache tc project heap) of
+                SOME hash =>
+                  {context = HolState path,
+                   deps_key = derived_key "holbuild-base-heap-dependency-context-v2"
+                                          ["base_heap_hash=" ^ hash],
+                   first_loads = []}
+              | NONE =>
+                  {context = toolchain_base_context tc,
+                   deps_key = derived_key "holbuild-base-heap-objects-first-v1"
+                                          (map (fn node => "object " ^ load_stem node) objects),
+                   first_loads = map (load_project_line o load_stem) objects}
           else cold
       | NONE => cold
   end
@@ -5234,8 +5253,15 @@ fun export_heap tc (project : HolbuildProject.t) plan output heap_kind =
       case heap_kind of
           HolbuildProject.HeapImage _ => []
         | HolbuildProject.ExecutableImage {main} => ["--exe=" ^ main]
+    (* A plain export over a base heap would leave the base heap's .ok
+       describing a different file.  Any other .ok there is not holbuild's. *)
+    val ok = checkpoint_ok_path output
   in
-    remove_file (checkpoint_ok_path output);
+    case HolbuildCheckpointStore.current_metadata ok of
+        SOME text =>
+          if HolbuildCheckpointStore.metadata_matches_fields [("kind", "base_heap")] text
+          then remove_file ok else ()
+      | NONE => ();
     run_buildheap tc project (#root project) exe_args (buildheap_args heap_kind plan) output
   end
 

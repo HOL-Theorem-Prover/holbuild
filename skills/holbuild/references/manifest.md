@@ -61,7 +61,7 @@ deps = []  # optional names of earlier [[generate]] steps
 name = "main"
 output = "build/main.heap"  # heap output path, package-root-relative; with base = true, relative to the build directory (artifact root) and must be relative and contain no `..`
 objects = ["MainTheory", "@generated"]  # logical targets/groups to build before saving heap
-base = false                # true: root-project theories reaching every object start from this heap (see heaps-and-run.md)
+base = false                # true: root-project theories reaching every object load the objects first, starting from this heap when it exports (see heaps-and-run.md)
 
 [actions.TargetName]
 deps = ["OtherTheory"]            # extra logical project dependencies

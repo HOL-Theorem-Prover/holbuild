@@ -15,8 +15,9 @@ and cacheable builds that never require users to reason about the cache.
   predecessor checkpoints, or validated shared dependency state. The external
   implementation currently starts child HOL actions from the base state of the
   project HOL declared by `[dependencies.hol]` and keys that base state in the
-  toolchain; root theories that reach every object of a `base = true` heap start
-  from that heap, which extends the same base state. Eliminating the
+  toolchain; root theories that reach every object of a `base = true` heap load
+  its objects first, starting from that heap, which extends the same base state,
+  when it can be exported. Eliminating the
   prebuilt-base dependency is a root-HOL transition goal, not current behavior.
 - The cache is an optional accelerator. Local `.holbuild/` is the authoritative
   materialized build view.
@@ -648,67 +649,54 @@ modules, and holbuild uses it only for explicit exported heap/executable
 artifacts after the relevant logical targets have already been built.
 
 The one exception is an opt-in base heap (`[[heap]]` with `base = true`). It
-replaces `hol.state` as the starting state of a theory child, so the child
-skips reloading shared ancestors. Four rules keep a heap start equivalent to
-a cold start that loads the objects first:
+declares a load order: every root-package theory whose preload load edges
+(theory preloads and SML load manifests, never order-only action `deps`)
+reach every object, a user, loads the objects first, in manifest order,
+before its other preloads. Load order can change results. HOL state that keeps
+the most recent registration, such as an overloaded name or the `cv_trans`
+translation database, resolves to the theory loaded last, so a user's theory
+files, and in principle which of its proofs succeed, can differ from a build
+without `base`. A user's input key therefore records the objects. Any theory
+the edges reach is loaded by the user or is an ancestor of one that is, so
+loading the objects first adds no module the user would not load. Only
+root-package theories are users, so a dependency's input keys never depend on
+the consumer's manifest; a dependency manifest's `base = true` is ignored with
+a warning.
 
-- The heap loads only its object theories, not the SML closure an explicit
-  heap target loads. Loading a theory loads its ancestors and recorded ML
-  dependencies, so the heap holds exactly what its objects' consumers load.
-- A theory starts from the heap only when the load edges of its preloads
-  (theory preloads and SML load manifests, never order-only action `deps`)
-  reach every object. Any theory such edges reach is loaded by the child or is
-  an ancestor of one that is, so the heap adds no module the cold child would
-  not load. The remaining preloads find the heap's modules already loaded.
-- The heap key hashes the toolchain key, the path of `hol.state` (which the
-  heap records as its parent), and the objects' load stems and input keys.
-  `<output>.ok` also records a hash of the objects' `.dat` files, which record
-  their parents' hashes and so cover the ancestors too: a rebuild under an
-  unchanged input key can write different theory files, and users built over
-  the old ones would record parent hashes that never match. A missing or
-  mismatched `<output>.ok`, or a heap file whose content hash differs from the
-  one `<output>.ok` records, re-exports it.
-- `buildheap` runs in a fresh `.holbuild/stage/heap-export-<pid>-<nonce>/`
-  holding a `holproject.toml` with `holmake = false`. HOL adds the dirs of the
-  project around its working directory to `Meta.loadPath`, and a saved state
-  keeps them; every theory child adds the current dirs again when it starts,
-  so a heap carrying them would give its users a second copy, taken at export
-  time, that a `hol.state` child lacks. HOL takes those dirs from the first
-  `holproject.toml` at or above its working directory, and this one names
-  none. HOL's separate walk up for holpath names does not stop there, but from
-  a stage dir it sees what a theory child sees. The directory does not depend
-  on the holbuild cache, which may be read-only or inside a HOL project.
+The heap only accelerates that order. It is a `buildheap` image of the object
+theories, not the SML closure an explicit heap target loads, and a user starts
+from it instead of from `hol.state` followed by loading the objects, so the
+user skips reloading the shared ancestors. A cold objects-first build of a
+user is byte-identical to its heap build, so a user's input key does not record
+which start ran, and both share cache entries. A build exports the heap at most
+once, when a user first builds from source and finds it missing or stale. If
+the export fails, the build warns once, naming the heap and the error with the
+export log, and every user starts cold with the objects loaded first.
 
-A relative base heap `output` resolves under the artifact root, while explicit
-heap targets resolve it under the source root. Builds export the base heap
-implicitly, and with `--source-dir` several artifact roots share one source
-tree, which may be read-only and which the project lock does not cover. An
-absolute `output`, or one containing `..`, is rejected, because the export
-takes no lock of its own and several artifact roots would write one file.
+The heap key hashes the toolchain key, the path of `hol.state` (which the heap
+records as its parent), and the objects' load stems and input keys.
+`<output>.ok` records the key, the exported file's content hash, and a hash of
+the objects' `.dat` files; a mismatch in any of them, or a missing file,
+re-exports the heap. The `.dat` hash catches a rebuild that writes different
+theory files under an unchanged input key, after which users built over the
+old heap would record parent hashes that never match; each `.dat` records its
+parents' hashes, so it covers the ancestors too. `buildheap` runs in a fresh
+`.holbuild/stage/heap-export-<pid>-<nonce>/` holding a `holproject.toml` with
+`holmake = false`: HOL adds the dirs of the first project at or above its
+working directory to `Meta.loadPath`, a saved state keeps them, and every
+theory child adds the current dirs again, so a heap carrying them would give
+its users a second copy.
 
-Only root-package theories start from the heap, even when an object is a
-dependency's theory: a dependency's input keys then never depend on the
-consumer's manifest. A dependency manifest's `base = true` is ignored with a
-warning.
-
-The heap key can recur for a new file: deleting `<output>.ok` and running
-`holbuild heap`, or reverting an edit to an object, re-exports under the same
-key. Poly/ML rejects a child state whose parent file was rewritten, so the
-dependency-context key of a checkpoint started from the heap includes the
-content hash of the exported file, which `<output>.ok` records at export.
-Checkpoints therefore never outlive the heap file they were saved over, while
-theory input keys, which name only the objects, stay shared through the cache.
-
-A heap start still differs from an ordinary cold start in load order: the
-heap's modules load first, in the order `buildheap` loads them, rather than in
-preload order. HOL state that keeps the most recent registration, such as the
-`cv_trans` translation database, can therefore resolve differently, so the
-theory files can differ, and in principle so can which proofs succeed.
-`base = true` thus declares that heap users start with the objects loaded
-first; it is not a pure speed-up. The input key of a theory that starts from
-the heap records the heap's objects, and heap-built and cold-built files are
-cached under different keys. The objects' own input keys already cover the
-heap's contents.
+A relative base heap `output` resolves under the artifact root,
+not the source root as for explicit heap targets, because builds export the
+heap implicitly and with `--source-dir` several artifact roots share one
+source tree, which may be read-only and which the project lock does not cover;
+an absolute or `..` output is rejected, since the export takes no lock of its
+own. A checkpoint saved over the heap has a dependency-context key that
+includes the heap file's content hash, because Poly/ML rejects a child state
+whose parent file was rewritten, and a re-export can recur under one heap key.
+A checkpoint saved over a cold objects-first start has its own key too, so
+neither is resumed as the other or as a plain cold start.
 
 The relevant checkpointing model is the `Holmake --dumpheap` design: while
 building a theory, the prover/runtime saves PolyML states at boundaries such as:
@@ -726,8 +714,9 @@ single session cannot safely export and then re-incorporate the generated theory
 module. The source child therefore records generated load metadata, exports, and
 exits. Holbuild constructs complete stage load manifests from that metadata, then
 a separate child starts from the pre-theory dependency context (or, as a
-fallback, the state the theory child started from: the toolchain base state, or
-the base heap for a theory that starts from it), loads `FooTheory`, and saves
+fallback, the state the theory child started from: the base heap, or the
+toolchain base state, followed by the base heap objects for a base heap user),
+loads `FooTheory`, and saves
 `final_context.save`.
 This also ensures that the final context reflects the published consumer view,
 not arbitrary top-level SML bindings retained from the theory script.

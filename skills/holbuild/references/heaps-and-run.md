@@ -36,10 +36,11 @@ objects = ["semanticsTheory"]
 base = true
 ```
 
-- Root-project theories whose preloads reach every object start from this heap instead of `hol.state`. Other theories, the objects and their ancestors, and all dependency-package theories start from `hol.state`.
-- It declares that those theories start with the objects loaded first; it is not only a speed-up. Their theory files (and in principle which proofs succeed) can differ from a build without `base`, so setting `base` changes their input keys and they rebuild once.
+- Root-project theories whose preloads reach every object (users) load the objects first, in manifest order, before their other preloads. Other theories, the objects and their ancestors, and all dependency-package theories are unaffected.
+- That order is the semantics; it can change users' theory files (and in principle which proofs succeed) compared with a build without `base`, so setting `base` changes their input keys and they rebuild once.
+- The heap only speeds it up: a user starts from the heap instead of `hol.state` plus loading the objects. Both starts build identical files under one input key, so they share cache entries.
 - At most one heap of the root project may set `base`; `objects` must be non-empty theory targets. A dependency manifest's `base = true` is ignored with a warning.
-- `holbuild build` exports the heap when a theory that starts from it builds from source and the heap is missing, stale (objects or their theory files changed, or toolchain moved), or no longer matches the content hash in `<output>.ok`. `holbuild heap base` always re-exports it.
+- `holbuild build` exports the heap when a theory that starts from it builds from source and the heap is missing, stale (objects or their theory files changed, or toolchain moved), or no longer matches the content hash in `<output>.ok`. If the export fails, holbuild warns once (naming the heap and its log) and builds the users from `hol.state` with the objects loaded first. `holbuild heap base` always re-exports it.
 - A relative `output` resolves under the build directory (the current directory with `--source-dir`), not the project root as for other heaps, so each build directory gets its own base heap and the source tree is never written. An absolute base heap `output`, or one containing `..`, is rejected.
 - Heap users' keys carry `base_heap_objects=`, so HBX archives and remote-cache entries built with `base = true` never serve consumers, whose theories use cold keys.
 
