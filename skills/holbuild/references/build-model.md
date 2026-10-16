@@ -100,6 +100,7 @@ GC:
 - Project clean removes stale `.holbuild/stage`, `.holbuild/logs`, checkpoint families, and evicts oldest checkpoint families above the size cap
 - Cache GC removes stale tmp, expired action manifests, and unreachable blobs, serialized with a POSIX file lock at `locks/gc.lock`
 - Cache GC also removes HOL toolchains under `hol-toolchains/` unused for the retention period (tracked by each entry's `last-used` marker); toolchains being built, restored, or used by a running holbuild are skipped and reported as `toolchains-busy`
+- Cache GC stages (tmp, locks, actions, blobs, toolchain-trash, toolchains) that run longer than a second on a terminal, or ten seconds when redirected, report scanned/removed counts and elapsed time on stderr, except under `--quiet`; stdout keeps the `project clean:` and `cache gc:` summary lines
 - Interrupted cache GC does not leave a stale lock; older directory-style `locks/gc.lock` entries are removed/replaced automatically
 - Legacy `holbuild cache gc` remains cache-only
 

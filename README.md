@@ -692,6 +692,10 @@ holbuild gc --clean-only
 holbuild --cache-dir /path/to/cache gc --cache-only
 ```
 
+Long cache GC stages report scanned and removed counts on stderr while they
+run, unless `--quiet` is given. Progress never goes to stdout, which keeps the
+`project clean: removed ...` and `cache gc: removed ...` summaries.
+
 `gc --clean-only` skips the global cache. `gc --cache-only` skips project
 locking/discovery and does not require a HOL toolchain. Project checkpoint GC
 uses `.holconfig.toml`'s `[build].checkpoint_limit_gb` unless overridden with
