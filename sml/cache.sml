@@ -70,48 +70,66 @@ fun is_dir path = FS.isDir path handle OS.SysErr _ => false
 fun missing_entry (OS.SysErr (_, SOME err)) = err = Posix.Error.noent
   | missing_entry _ = false
 
-(* Removes a cache entry in-process; spawning `rm -rf` per entry dominated GC
-   time on large caches. Directories are descended without following symlinks,
-   and an entry that has already disappeared counts as removed. *)
+fun remove_error path msg = Error ("failed to remove cache path: " ^ path ^ ": " ^ msg)
+
+fun trim_newline s =
+  if size s > 0 andalso String.sub(s, size s - 1) = #"\n" then
+    String.substring(s, 0, size s - 1)
+  else s
+
+(* `rm -rf` descends through directories it has opened, so a subdirectory
+   swapped for a symlink while it runs cannot redirect it outside the cache;
+   its messages name the path that failed. *)
+fun remove_dir_tree path =
+  let
+    val proc = Unix.execute ("/bin/sh", ["-c", "rm -rf -- " ^ quote path ^ " 2>&1"])
+    val output = TextIO.inputAll (Unix.textInstreamOf proc)
+  in
+    if OS.Process.isSuccess (Unix.reap proc) then ()
+    else raise remove_error path (trim_newline output)
+  end
+
+(* Regular files and symlinks, which include every blob, are unlinked
+   in-process, since spawning a process per entry dominated GC time on large
+   caches. An entry that has already disappeared counts as removed. *)
 fun remove_tree path =
   if path = "" orelse path = "." orelse path = "/" then
     raise Error ("refusing to remove unsafe cache path: " ^ path)
+  else if not (is_link path) andalso is_dir path then
+    remove_dir_tree path
   else
-    let
-      fun remove p =
-        (if not (is_link p) andalso is_dir p then (List.app remove (children p); FS.rmDir p)
-         else FS.remove p)
-        handle e => if missing_entry e then () else raise e
-    in
-      remove path
-      handle OS.SysErr (msg, _) => raise Error ("failed to remove cache path: " ^ path ^ ": " ^ msg)
-    end
+    FS.remove path
+    handle e as OS.SysErr (msg, _) => if missing_entry e then () else raise remove_error path msg
 
-(* Progress for long GC stages goes to stderr, leaving stdout to the summary.
-   A stage reports only after running for one interval, then once per
-   interval: every second on a terminal, every ten seconds otherwise. *)
+(* Progress for long GC stages goes to stderr, leaving stdout to the summary,
+   and is off under --quiet. A stage reports only after running for one
+   interval, then once per interval: every second on a terminal, every ten
+   seconds otherwise. An ANSI terminal gets one line redrawn in place, anything
+   else a line per report. *)
 datatype progress =
-  Progress of {stage : string, total : int, tty : bool, interval : Time.time,
+  Progress of {stage : string, total : int, in_place : bool, interval : Time.time,
                started : Time.time, next : Time.time ref, scanned : int ref,
                removed : int ref, shown : bool ref}
 
-fun progress_interval tty =
+fun progress_interval terminal =
   case Option.mapPartial Real.fromString (OS.Process.getEnv "HOLBUILD_TEST_GC_PROGRESS_INTERVAL") of
       SOME seconds => Time.fromReal seconds
-    | NONE => Time.fromReal (if tty then 1.0 else 10.0)
+    | NONE => Time.fromReal (if terminal then 1.0 else 10.0)
 
-fun start_progress stage total =
+fun start_progress steps_print stage total =
   let
-    val tty = Posix.ProcEnv.isatty Posix.FileSys.stderr handle _ => false
-    val interval = progress_interval tty
+    val terminal = terminal_primitives.strmIsTTY TextIO.stdErr
+    val interval = progress_interval terminal
     val now = Time.now ()
   in
-    Progress {stage = stage, total = total, tty = tty, interval = interval, started = now,
+    Progress {stage = stage, total = total,
+              in_place = terminal andalso terminal_primitives.TERM_isANSI () andalso not steps_print,
+              interval = interval, started = now,
               next = ref (Time.+(now, interval)), scanned = ref 0, removed = ref 0,
               shown = ref false}
   end
 
-fun show_progress (Progress {stage, total, tty, started, scanned, removed, shown, ...}) final =
+fun show_progress (Progress {stage, total, in_place, started, scanned, removed, shown, ...}) final =
   let
     val elapsed = Real.fmt (StringCvt.FIX (SOME 1)) (Time.toReal (Time.-(Time.now (), started)))
     val text = "cache gc: " ^ stage ^ ": " ^ Int.toString (!scanned) ^ "/" ^ Int.toString total ^
@@ -119,7 +137,7 @@ fun show_progress (Progress {stage, total, tty, started, scanned, removed, shown
   in
     shown := true;
     TextIO.output (TextIO.stdErr,
-                   if tty then "\r" ^ text ^ "\027[K" ^ (if final then "\n" else "")
+                   if in_place then "\r" ^ text ^ HolbuildStatus.clear_to_eol ^ (if final then "\n" else "")
                    else text ^ "\n");
     TextIO.flushOut TextIO.stdErr
   end
@@ -136,17 +154,28 @@ fun finish_progress (progress as Progress {shown, ...}) =
   if !shown then show_progress progress true else ()
 
 (* Folds step over paths as one reported GC stage; step returns the new
-   accumulator and whether it removed the entry. *)
-fun gc_stage stage paths step init =
-  let
-    val progress = start_progress stage (length paths)
-    fun one (path, acc) =
-      let val (acc, was_removed) = step (path, acc)
-      in tick progress was_removed; acc end
-  in
-    (List.foldl one init paths before finish_progress progress)
-    handle e => (finish_progress progress; raise e)
-  end
+   accumulator and whether it removed the entry. When steps_print, steps may
+   write to stderr themselves, so each report gets a line of its own rather
+   than one redrawn in place that their output would be appended to. *)
+fun run_gc_stage steps_print stage paths step init =
+  if HolbuildStatus.quiet_mode () then
+    List.foldl (fn (path, acc) => #1 (step (path, acc))) init paths
+  else
+    let
+      val progress = start_progress steps_print stage (length paths)
+      fun one (path, acc) =
+        let val (acc, was_removed) = step (path, acc)
+        in tick progress was_removed; acc end
+    in
+      (List.foldl one init paths before finish_progress progress)
+      handle e => (finish_progress progress; raise e)
+    end
+
+fun gc_stage stage = run_gc_stage false stage
+
+(* Toolchain removal runs `rm -rf` with inherited stderr, and taking an
+   entry's lock may warn about an obsolete directory lock. *)
+fun gc_toolchain_stage stage = run_gc_stage true stage
 
 fun stale cutoff path =
   Time.<(FS.modTime path, cutoff) handle OS.SysErr _ => false
@@ -167,11 +196,6 @@ fun read_lines path =
     TextIO.closeIn input;
     lines
   end
-
-fun trim_newline s =
-  if size s > 0 andalso String.sub(s, size s - 1) = #"\n" then
-    String.substring(s, 0, size s - 1)
-  else s
 
 fun take_token s =
   let
@@ -263,8 +287,10 @@ fun sweep_blobs cutoff live_blobs blobs_dir =
     0
 
 fun gc_toolchains cutoff =
-  (HolbuildHolSharedCache.sweep_toolchain_trash ();
-   gc_stage "toolchains" (HolbuildHolSharedCache.toolchain_keys ())
+  (gc_toolchain_stage "toolchain-trash" (HolbuildHolSharedCache.toolchain_trash ())
+     (fn (path, ()) => (HolbuildHolSharedCache.remove_unlocked_tree path; ((), true)))
+     ();
+   gc_toolchain_stage "toolchains" (HolbuildHolSharedCache.toolchain_keys ())
      (fn (k, {removed, busy}) =>
          case HolbuildHolSharedCache.gc_entry cutoff k of
              HolbuildHolSharedCache.GcRemoved => ({removed = removed + 1, busy = busy}, true)
