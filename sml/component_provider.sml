@@ -121,16 +121,16 @@ type node_analysis =
 type analysis_state =
   {provider : provider,
    preparation : HolbuildPackagePrepare.t,
-   hashes : (string * string) list ref,
-   analyses : (string * node_analysis) list ref}
+   hashes : (string, string) Binarymap.dict ref,
+   analyses : (string, node_analysis) Binarymap.dict ref}
 
 fun new_analysis_state components : analysis_state =
   {provider = #provider (components : project_components),
    preparation = #preparation components,
-   hashes = ref [], analyses = ref []}
+   hashes = ref (Binarymap.mkDict String.compare),
+   analyses = ref (Binarymap.mkDict String.compare)}
 
-fun lookup key entries =
-  Option.map #2 (List.find (fn (candidate, _) => candidate = key) entries)
+fun lookup key entries = Binarymap.peek(entries, key)
 
 fun analysis_key (source : HolbuildSourceIndex.source) =
   #package source ^ "\000" ^ HolbuildSourceIndex.source_id source
@@ -159,7 +159,7 @@ fun source_hash (state as {hashes, ...} : analysis_state) source =
           let
             val value = HolbuildToolchain.time_phase "source.hash"
                           (fn () => HolbuildHash.file_sha1 (#source_path source))
-          in hashes := (key, value) :: !hashes; value end
+          in hashes := Binarymap.insert(!hashes, key, value); value end
   end
 
 (* Live providers analyse only an explicitly requested frontier node. Future
@@ -187,9 +187,45 @@ fun analyse state {source, cache_path} : node_analysis =
               {node_id = id, source_hash = source_hash,
                symbolic_dependencies = symbolic_dependencies}
           in
-            #analyses state := (key, analysis) :: !(#analyses state);
+            #analyses state := Binarymap.insert(!(#analyses state), key, analysis);
             analysis
           end
+  end
+
+(* Analyse a reachable frontier as one batch: hash its unhashed sources with
+   one external process and keep the dependency facts that the batched cache
+   read or analyser run produces, so analyse finds them without reading the
+   cache again. *)
+fun prefetch (state as {hashes, analyses, ...} : analysis_state) requests =
+  case #provider state of LiveProvider =>
+  let
+    fun analysed ({source, ...} : {source : HolbuildSourceIndex.source, cache_path : string}) =
+      Option.isSome (lookup (analysis_key source) (!analyses))
+    val fresh = List.filter (not o analysed) requests
+    val _ = List.app (fn {source, ...} => ensure_output state source (#relative_path source)) fresh
+    val unhashed =
+      List.filter (fn {source, ...} => not (Option.isSome (lookup (analysis_key source) (!hashes)))) fresh
+    val digests =
+      HolbuildToolchain.time_phase "source.hash"
+        (fn () => HolbuildHash.files_sha1 (map (fn {source, ...} => #source_path source) unhashed))
+    val _ =
+      ListPair.appEq
+        (fn ({source, ...}, digest) => hashes := Binarymap.insert(!hashes, analysis_key source, digest))
+        (unhashed, digests)
+    fun request {source, cache_path} =
+      {cache_path = cache_path, source_path = #source_path source,
+       source_hash = source_hash state source}
+    val results =
+      HolbuildToolchain.time_phase "dependency.extract"
+        (fn () => HolbuildDependencies.prefetch_cached_with_hash (map request fresh))
+    fun record ({source, ...}, SOME deps) =
+          analyses := Binarymap.insert(!analyses, analysis_key source,
+                        {node_id = HolbuildSourceIndex.source_id source,
+                         source_hash = source_hash state source,
+                         symbolic_dependencies = deps})
+      | record (_, NONE) = ()
+  in
+    ListPair.appEq record (fresh, results)
   end
 
 fun analysis_dependencies ({symbolic_dependencies, ...} : node_analysis) =
