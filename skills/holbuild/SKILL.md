@@ -1,6 +1,6 @@
 ---
 name: holbuild
-description: Build HOL4 projects with holbuild. Use when working with holproject.toml manifests, building theory targets like FooTheory, managing dependencies, configuring proof IR/proof-step or checkpoint behavior, using the holbuild CLI, generated source, JSON output, tactic timeouts, cache/gc, or heap exports.
+description: Build HOL4 projects with holbuild. Use when working with holproject.toml or holbuild.toml manifests, building theory targets like FooTheory, managing dependencies, configuring proof IR/proof-step or checkpoint behavior, using the holbuild CLI, generated source, JSON output, tactic timeouts, cache/gc, or heap exports.
 ---
 
 # holbuild
@@ -84,7 +84,7 @@ Root project artifacts live under `.holbuild/`: `gen/`, `obj/`, `dep/`, `checkpo
 ## References
 
 - [quickstart.md](references/quickstart.md) — setup, full command/flag reference, theory naming
-- [manifest.md](references/manifest.md) — `holproject.toml` schema, source discovery, generators, action policies, HOLSource headers
+- [manifest.md](references/manifest.md) — manifest (`holproject.toml`/`holbuild.toml`) schema, source discovery, generators, action policies, HOLSource headers
 - [local-config.md](references/local-config.md) — `.holconfig.toml` overrides, excludes, jobs, timeout
 - [build-model.md](references/build-model.md) — dependency inference, action keys, invalidation, cache, write locks, gc
 - [checkpoints-proof-steps.md](references/checkpoints-proof-steps.md) — proof IR/proof-step checkpoints, tactic timeouts, replay, env vars
