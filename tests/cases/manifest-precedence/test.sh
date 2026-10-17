@@ -103,8 +103,13 @@ invalid=$tmpdir/invalid-holbuild
 write_source "$invalid" Invalid
 write_holbuild_manifest "$invalid/holproject.toml" invalid_fallback
 {
-  write_holbuild_manifest /dev/stdout invalid_holbuild
+  write_schema2_prelude
   cat <<'TOML'
+[project]
+name = "invalid_holbuild"
+
+[build]
+members = ["src"]
 
 [mystery]
 value = "nope"
@@ -114,6 +119,22 @@ expect_context_failure "$invalid" "$invalid/holbuild.toml: unknown field in mani
 if grep -q "invalid_fallback" "$tmpdir/invalid.log"; then
   echo "invalid holbuild.toml fell back to holproject.toml" >&2
   exit 1
+fi
+
+# An unreadable holbuild.toml is still the selected manifest: a loud error, no
+# fallback to the valid holproject.toml beside it. Root ignores file modes.
+if [[ $(id -u) -ne 0 ]]; then
+  unreadable=$tmpdir/unreadable-holbuild
+  write_source "$unreadable" Unreadable
+  write_holbuild_manifest "$unreadable/holproject.toml" unreadable_fallback
+  write_holbuild_manifest "$unreadable/holbuild.toml" unreadable_holbuild
+  chmod 000 "$unreadable/holbuild.toml"
+  expect_context_failure "$unreadable" "$unreadable/holbuild.toml: cannot read manifest" "$tmpdir/unreadable.log"
+  chmod 600 "$unreadable/holbuild.toml"
+  if grep -q "unreadable_fallback" "$tmpdir/unreadable.log"; then
+    echo "unreadable holbuild.toml fell back to holproject.toml" >&2
+    exit 1
+  fi
 fi
 
 # Discovery from a subdirectory picks the nearest manifest: a nearer
@@ -174,11 +195,9 @@ echo upstream-hol > "$hol/README"
 hol_rev=$(commit_repo "$hol")
 export HOLBUILD_CANONICAL_HOL_GIT="$hol"
 
-write_dependency_dir() {
-  local dir=$1 name=$2
-  write_source "$dir" "$name"
-  {
-    cat <<TOML
+write_dependency_manifest() {
+  local file=$1 name=$2
+  cat > "$file" <<TOML
 [holbuild]
 schema = 2
 minimum_version = "0.10.0"
@@ -193,44 +212,81 @@ rev = "$hol_rev"
 [build]
 members = ["src"]
 TOML
-  } > "$dir/holbuild.toml"
+}
+
+write_dependency_dir() {
+  local dir=$1 name=$2
+  write_source "$dir" "$name"
+  write_dependency_manifest "$dir/holbuild.toml" "$name"
   write_holmake_manifest "$dir/holproject.toml" "${name}_holmake"
+}
+
+write_override_project() {
+  local dir=$1 name=$2 dep=$3 override=$4
+  mkdir -p "$dir"
+  cat > "$dir/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[project]
+name = "$name"
+
+[dependencies.$dep]
+git = "https://example.invalid/$dep.git"
+rev = "1111111111111111111111111111111111111111"
+TOML
+  cat > "$dir/.holconfig.toml" <<TOML
+[overrides.$dep]
+path = "$override"
+TOML
 }
 
 leaf=$tmpdir/leaf
 write_dependency_dir "$leaf" leaf
 
 override_project=$tmpdir/override-project
-mkdir -p "$override_project"
-cat > "$override_project/holproject.toml" <<'TOML'
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[project]
-name = "override_project"
-
-[dependencies.leaf]
-git = "https://example.invalid/leaf.git"
-rev = "1111111111111111111111111111111111111111"
-TOML
-cat > "$override_project/.holconfig.toml" <<TOML
-[overrides.leaf]
-path = "$leaf"
-TOML
+write_override_project "$override_project" override_project leaf "$leaf"
 (cd "$override_project" && "$HOLBUILD_BIN" context) > "$tmpdir/override.log"
 require_grep "resolved-manifest=$leaf/holbuild.toml" "$tmpdir/override.log"
 require_grep "package: leaf \[root=$leaf, manifest=$leaf/holbuild.toml," "$tmpdir/override.log"
 
+# An invalid dependency holbuild.toml is an error naming it, not a fallback to
+# the valid holproject.toml beside it.
+bad_leaf=$tmpdir/bad-leaf
+write_source "$bad_leaf" bad_leaf
+write_dependency_manifest "$bad_leaf/holproject.toml" bad_leaf
+write_dependency_manifest "$bad_leaf/holbuild.toml" bad_leaf
+printf '\n[mystery]\nvalue = "nope"\n' >> "$bad_leaf/holbuild.toml"
+bad_project=$tmpdir/bad-project
+write_override_project "$bad_project" bad_project bad_leaf "$bad_leaf"
+expect_context_failure "$bad_project" "$bad_leaf/holbuild.toml: unknown field in manifest: mystery" "$tmpdir/bad.log"
+if grep -q "package: bad_leaf" "$tmpdir/bad.log"; then
+  echo "invalid dependency holbuild.toml fell back to holproject.toml" >&2
+  exit 1
+fi
+
+# A dependency directory with neither file: the error names both.
+missing_leaf=$tmpdir/missing-leaf
+mkdir -p "$missing_leaf"
+missing_project=$tmpdir/missing-project
+write_override_project "$missing_project" missing_project missing_leaf "$missing_leaf"
+expect_context_failure "$missing_project" "dependency missing_leaf manifest not found: no holbuild.toml or holproject.toml in $missing_leaf" "$tmpdir/missing.log"
+
+# A materialized git dependency, and an explicit shim manifest that stays
+# authoritative although the shim's directory has a holbuild.toml.
 git_leaf=$tmpdir/git-leaf
 mkdir -p "$git_leaf"
 git -C "$git_leaf" init -q
 git_identity "$git_leaf"
 write_dependency_dir "$git_leaf" git_leaf
+write_source "$git_leaf/subdir" Sub
+write_dependency_manifest "$git_leaf/subdir/holbuild.toml" sub_holbuild
 git_leaf_rev=$(commit_repo "$git_leaf")
 
 git_project=$tmpdir/git-project
 mkdir -p "$git_project"
+write_dependency_manifest "$git_project/sub.manifest.toml" sub
 cat > "$git_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
@@ -242,6 +298,11 @@ name = "git_project"
 [dependencies.git_leaf]
 git = "$git_leaf"
 rev = "$git_leaf_rev"
+
+[dependencies.sub]
+from = "git_leaf"
+path = "subdir"
+manifest = "sub.manifest.toml"
 TOML
 (cd "$git_project" && "$HOLBUILD_BIN" context) > "$tmpdir/git.log"
 materialized=$git_project/.holbuild/src/git_leaf
@@ -249,3 +310,6 @@ require_file "$materialized/holbuild.toml"
 require_file "$materialized/holproject.toml"
 require_grep "resolved-manifest=$materialized/holbuild.toml" "$tmpdir/git.log"
 require_grep "package: git_leaf \[root=$materialized, manifest=$materialized/holbuild.toml," "$tmpdir/git.log"
+require_file "$materialized/subdir/holbuild.toml"
+require_grep "resolved-manifest=$git_project/sub.manifest.toml" "$tmpdir/git.log"
+require_grep "package: sub \[root=$materialized/subdir, manifest=$git_project/sub.manifest.toml," "$tmpdir/git.log"

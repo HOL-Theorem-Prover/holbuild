@@ -202,6 +202,8 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
 fun parse_at args =
   parse_table_at (TOML.fromFile (#manifest args)) args
   handle Error msg => die (#manifest args ^ ": " ^ msg)
+       | IO.Io {cause, ...} =>
+           die (#manifest args ^ ": cannot read manifest: " ^ General.exnMessage cause)
 
 fun parse_builtin_holdir_at args =
   let
@@ -494,7 +496,8 @@ fun dependency_project_with resolution (project : t) (dep as Dependency {name, s
     val declared_name = #name dep_project
     val _ =
       if declared_name = name then ()
-      else die ("dependency " ^ name ^ " manifest declares project.name = " ^ declared_name)
+      else die ("dependency " ^ name ^ " manifest " ^ dep_manifest ^
+                " declares project.name = " ^ declared_name)
   in
     dep_project
   end

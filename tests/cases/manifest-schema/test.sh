@@ -83,7 +83,7 @@ minimum_version = "0.10.0"
 [project]
 name = "schema1_rejected"
 TOML
-expect_context_failure schema1_rejected "only legacy holproject schema 2 is supported"
+expect_context_failure schema1_rejected "only legacy manifest schema 2 is supported"
 
 schema2_repo=$tmpdir/schema2-repo
 mkdir -p "$schema2_repo"

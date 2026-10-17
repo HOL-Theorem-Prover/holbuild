@@ -470,7 +470,7 @@ fun validate_compatibility table =
           NONE => ()
         | SOME n =>
             if n = IntInf.fromInt 2 then ()
-            else die "only legacy holproject schema 2 is supported"
+            else die "only legacy manifest schema 2 is supported"
     val minimum_version = string_at holbuild ["minimum_version"]
     val _ =
       case minimum_version of
