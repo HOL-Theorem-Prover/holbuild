@@ -75,28 +75,41 @@ fun read_binary_all path =
 val string_sha1 = HolbuildStringHash.string_sha1
 fun string_sha256 text = SHA256.hashStringHex text
 
+(* macOS ships shasum but not sha256sum.  stderr is dropped since every
+   failure falls back to the SML implementation. *)
+val stdin_sha256_command =
+  "if command -v sha256sum >/dev/null 2>&1; then exec sha256sum 2>/dev/null; " ^
+  "else exec shasum -a 256 2>/dev/null; fi"
+
+(* Unix.execute leaves the parent's pipe ends inheritable, so this must not
+   run while other threads launch children: one could hold the child's stdin
+   open.  Poly/ML ignores SIGPIPE, so a child that exits early makes the
+   write raise Io, and Unix.reap's close of the closed stdin is a no-op. *)
+fun piped_sha256 command text =
+  let
+    val proc = Unix.execute ("/bin/sh", ["-c", command])
+    val input = Unix.textInstreamOf proc
+    val output = Unix.textOutstreamOf proc
+    val written =
+      (TextIO.output (output, text); TextIO.closeOut output; true)
+      handle IO.Io _ => (TextIO.closeOut output handle IO.Io _ => (); false)
+    val result = TextIO.inputAll input handle IO.Io _ => ""
+    val status = Unix.reap proc
+  in
+    if written andalso OS.Process.isSuccess status then
+      case first_token result of
+          SOME hash => if valid_sha256 hash then SOME (String.map Char.toLower hash) else NONE
+        | NONE => NONE
+    else NONE
+  end
+  handle OS.SysErr _ => NONE
+
 fun string_sha256_large text =
   if size text < small_file_limit then string_sha256 text
   else
-    let
-      val path = OS.FileSys.tmpName ()
-      val result =
-        (let
-           val output = BinIO.openOut path
-           val _ = (BinIO.output (output, Byte.stringToBytes text);
-                    BinIO.closeOut output)
-                   handle e => (BinIO.closeOut output; raise e)
-         in
-           external_sha256 path
-         end)
-        handle e => (remove_quietly path; raise e)
-      val _ = remove_quietly path
-    in
-      case result of
-          SOME digest => digest
-        | NONE => string_sha256 text
-    end
-    handle _ => string_sha256 text
+    case piped_sha256 stdin_sha256_command text of
+        SOME digest => digest
+      | NONE => string_sha256 text
 
 fun file_sha1 path =
   if large_file path then
