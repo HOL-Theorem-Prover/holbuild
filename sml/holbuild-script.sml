@@ -45,6 +45,7 @@ use "vendor/sml-sha256/lib/stream.sml";
 use "vendor/sml-sha256/lib/sha256.sig";
 use "vendor/sml-sha256/lib/sha256.sml";
 
+use "sml/spawn.sml";
 use "sml/hash.sml";
 use "sml/process_group.sml";
 use "sml/stat_cache.sml";
