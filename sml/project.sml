@@ -222,12 +222,23 @@ fun validate_root_heaps ({root, artifact_root, manifest, heaps, ...} : t) =
          else Path.concat(if is_base heap then artifact_root else root, output))
     (* Each artifact root exports its own base heap without locking the
        output; an output outside the artifact root would let several share,
-       and overwrite, one file. *)
+       and overwrite, one file.  An ordinary build exports it, so it must stay
+       in holbuild's own directory: `README` would overwrite a source file,
+       and "" names the artifact root itself. *)
     fun check_base_output (Heap {name, output, ...}) =
-      if Path.isAbsolute output orelse
-         List.exists (fn arc => arc = "..") (HolbuildManifestUtil.path_components output) then
-        fail ("base heap output must be relative and contain no .. in [[heap]] " ^ name ^ ": " ^ output)
-      else ()
+      let
+        val arcs = HolbuildManifestUtil.path_components output
+        val under_holbuild =
+          case HolbuildManifestUtil.path_components (Path.mkCanonical output) of
+              ".holbuild" :: _ :: _ => true
+            | _ => false
+      in
+        if Path.isAbsolute output orelse List.exists (fn arc => arc = "..") arcs orelse
+           not under_holbuild then
+          fail ("base heap output must be a relative path under .holbuild/ with no .. in [[heap]] " ^
+                name ^ ": " ^ output)
+        else ()
+      end
   in
     case List.filter is_base heaps of
         _ :: Heap {name, ...} :: _ =>

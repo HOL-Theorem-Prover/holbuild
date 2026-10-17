@@ -690,14 +690,16 @@ working directory to `Meta.loadPath`, a saved state keeps them, and every
 theory child adds the current dirs again, so a heap carrying them would give
 its users a second copy.
 
-A relative base heap `output` resolves under the artifact root,
-not the source root as for explicit heap targets, because builds export the
-heap implicitly and with `--source-dir` several artifact roots share one
-source tree, which may be read-only and which the project lock does not cover;
-an absolute or `..` output is rejected, since the export takes no lock of its
-own. A checkpoint saved over the heap has a dependency-context key that
-includes the heap file's content hash, because Poly/ML rejects a child state
-whose parent file was rewritten, and a re-export can recur under one heap key.
+The base heap `output` resolves under the artifact root, not the source root
+as for explicit heap targets, because builds export the heap implicitly and
+with `--source-dir` several artifact roots share one source tree, which may be
+read-only and which the project lock does not cover. The output must be a
+relative path under `.holbuild/` with no `..`: the export takes no lock of its
+own, and an ordinary build must not overwrite a source file or, for an empty
+output, write beside the artifact root. A checkpoint saved over the heap has a
+dependency-context key that includes the heap file's content hash, because
+Poly/ML rejects a child state whose parent file was rewritten, and a re-export
+can recur under one heap key.
 A checkpoint saved over a cold objects-first start has its own key too, so
 neither is resumed as the other or as a plain cold start.
 

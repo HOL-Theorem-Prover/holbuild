@@ -4174,10 +4174,10 @@ fun export_base_heap dat_hash_cache tc project ({path, key, objects, ...} : base
     remove_file (checkpoint_ok_path path);
     if HolbuildStatus.quiet_mode () then ()
     else HolbuildStatus.message_stdout ("exporting base heap " ^ path ^ "\n");
-    detail_time_phase "build.exec.base_heap.export"
-      (fn () => run_buildheap_without_project tc project (map load_stem objects) tmp)
+    (detail_time_phase "build.exec.base_heap.export"
+       (fn () => run_buildheap_without_project tc project (map load_stem objects) tmp);
+     rename_replace {old = tmp, new = path})
     handle e => (remove_file tmp; raise e);
-    rename_replace {old = tmp, new = path};
     let val hash = HolbuildToolchain.file_hash path
     in write_text (checkpoint_ok_path path) (base_heap_ok_text key hash objects_hash); hash end
   end

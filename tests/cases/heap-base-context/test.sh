@@ -369,6 +369,15 @@ if grep -q "Theory built\|exporting base heap" "$tmpdir/after-fallback.log"; the
 fi
 rm "$project/src/FScript.sml" "$project/src/GScript.sml"
 
+# A failed rename of the exported heap removes its temporary file.  A
+# directory at the heap's path makes the rename fail.
+rm -f "$heap" "$heap.ok"
+mkdir "$heap"
+(cd "$project" && "$HOLBUILD_BIN" build --force=theory BTheory) > "$tmpdir/failed-rename.log" 2>&1
+rmdir "$heap"
+require_grep "warning: could not export base heap $heap" "$tmpdir/failed-rename.log"
+require_no_file "$heap.tmp"
+
 # The export's own holproject.toml stops HOL's search for a project, so
 # neither the project's nor one planted above it adds to the heap's load path.
 mkdir -p "$tmpdir/planted-incs"
@@ -817,11 +826,16 @@ reject_base_output() {
     echo "$name: build unexpectedly accepted the manifest" >&2
     exit 1
   fi
-  require_grep "/$name/holproject.toml: base heap output must be relative and contain no \.\. in \[\[heap\]\] base: $output" \
+  require_grep "/$name/holproject.toml: base heap output must be a relative path under \.holbuild/ with no \.\. in \[\[heap\]\] base: $output\$" \
     "$tmpdir/$name.log"
 }
 reject_base_output absolute-base-output "$tmpdir/shared/base.save"
 reject_base_output dotdot-base-output "../shared/base.save"
+# A build exports the base heap, so an output outside .holbuild/ would
+# overwrite a source file, and "" names the artifact root itself.
+reject_base_output source-base-output "README"
+reject_base_output empty-base-output ""
+reject_base_output holbuild-dir-base-output ".holbuild"
 # Under --source-dir a base heap resolves under the artifact root and a plain
 # heap under the source root, so one relative output does not collide.
 mkdir -p "$tmpdir/split-roots/out"

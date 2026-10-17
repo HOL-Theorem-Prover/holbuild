@@ -553,12 +553,14 @@ differ from a build without `base`. Setting `base` therefore changes those
 theories' input keys, which carry `base_heap_objects=`: they rebuild once, and
 HBX archives and remote-cache entries built with `base = true` never serve a
 consumer, whose theories use cold keys. Other theories, the objects and their
-ancestors, and every dependency package's theories are unaffected. At most one
-heap of the root project may set `base`, and it must list at least one object,
-all theory targets. A dependency manifest's `base = true` is ignored with a
-warning. holbuild versions without `base` reject it (`unknown field in heap:
-base`), so a project that sets it should raise `[holbuild].minimum_version` to
-a release that supports it.
+ancestors start and build as before, and dependency packages are untouched; a
+non-user that depends on a user (through `[actions] deps`, or an SML module
+that loads one) still rebuilds once, since its key includes the user's. At
+most one heap of the root project may set `base`, and it must list at least
+one object, all theory targets. A dependency manifest's `base = true` is
+ignored with a warning. holbuild versions without `base` reject it (`unknown
+field in heap: base`), so a project that sets it should raise
+`[holbuild].minimum_version` to a release that supports it.
 
 The heap, which holds exactly what loading the objects loads, only speeds this
 up: those theories start from it instead of from HOL's `hol.state` followed by
@@ -574,12 +576,12 @@ Exporting the same file as a plain heap, with `base` unset, deletes the base
 heap's `<output>.ok` when both outputs resolve to the same path, so the next
 build re-exports it.
 
-A relative `output` of the base heap is resolved under the directory that
+The base heap's `output` must be a relative path under `.holbuild/`, such as
+`.holbuild/heap/base.save`, with no `..`. It resolves under the directory that
 holds the build's `.holbuild/` (the current directory with `--source-dir`),
-while other heaps resolve it under the project root, so each build directory
-gets its own heap and a shared or read-only source tree is never written. An
-absolute base heap `output`, or one containing `..`, is rejected: it would let
-several build directories write one file. The export runs `hol buildheap` in a
+while other heaps resolve it under the project root. An ordinary build exports
+it, so it never writes a source file or a shared or read-only source tree, and
+each build directory gets its own heap. The export runs `hol buildheap` in a
 fresh directory under `.holbuild/stage/` whose `holproject.toml` sets
 `holmake = false`, so the heap does not keep the project's directories on its
 load path.
