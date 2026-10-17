@@ -7,7 +7,7 @@ open HolbuildManifestUtil
    The external table is still named [project]; #110 may change that syntax when
    one repository manifest can define multiple logical packages. *)
 
-datatype heap_kind = HeapImage | ExecutableImage of {main : string}
+datatype heap_kind = HeapImage of {base : bool} | ExecutableImage of {main : string}
 
 datatype heap =
   Heap of {name : string, output : string, objects : string list,
@@ -177,7 +177,7 @@ fun parse_image_entry section kind value =
         let
           val name = case string_field table "name" of SOME s => s | NONE => die ("[[" ^ section ^ "]] entry requires name")
           val output = case string_field table "output" of SOME s => s | NONE => die ("[[" ^ section ^ "]] entry requires output")
-        in Heap {name = name, output = output, objects = string_array_field table "objects", kind = kind table} end
+        in Heap {name = name, output = output, objects = string_array_field table "objects", kind = kind name table} end
     | _ => die (section ^ " entries must be tables")
 
 fun image_entries table section parse =
@@ -189,9 +189,14 @@ fun image_entries table section parse =
 fun parse_heaps table =
   let
     val heaps =
-      image_entries table "heap" (parse_image_entry "heap" (fn _ => HeapImage)) @
+      image_entries table "heap"
+        (parse_image_entry "heap" (fn name => fn value =>
+          case lookup value ["base"] of
+              NONE => HeapImage {base = false}
+            | SOME (TOML.BOOL base) => HeapImage {base = base}
+            | SOME _ => die ("base must be a boolean in [[heap]] " ^ name))) @
       image_entries table "executable"
-        (parse_image_entry "executable" (fn value =>
+        (parse_image_entry "executable" (fn _ => fn value =>
           ExecutableImage {main = Option.getOpt(string_field value "main", "main")}))
     fun name_of (Heap {name, ...}) = name
     fun loop _ [] = ()
@@ -540,7 +545,7 @@ fun validate_manifest table =
         NONE => ()
       | SOME (TOML.ARRAY values) => List.app validate_generate_entry values
       | SOME _ => die "generate must be an array of tables");
-   validate_image_entries table "heap" ["name", "output", "objects"];
+   validate_image_entries table "heap" ["name", "output", "objects", "base"];
    validate_image_entries table "executable"
      ["name", "output", "objects", "main"])
 
@@ -613,7 +618,8 @@ fun dependency_text (Dependency {name, source, ...}) =
 fun heap_key (Heap {name, ...}) = name
 fun heap_text (Heap {name, output, objects, kind}) =
   fields [name, output, string_sequence objects,
-    case kind of HeapImage => "heap"
+    case kind of HeapImage {base = false} => "heap"
+      | HeapImage {base = true} => fields ["heap", "base"]
       | ExecutableImage {main} => fields ["executable", main]]
 fun action_key (ActionPolicy {logical, ...}) = logical
 fun action_dependency_policy (ActionPolicy {logical, deps, loads, ...}) =

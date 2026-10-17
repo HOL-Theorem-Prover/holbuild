@@ -38,7 +38,7 @@ During a theory build, checkpoints may be created at syntactic boundaries:
 | `<thm>_failed_prefix.save` | Failed proof after a reusable prefix | Fast rebuild after editing a failing suffix |
 | `final_context.save` | Generated theory sig/sml loaded in a clean consumer process; successor-ready | Debug/successor breadcrumb |
 
-Export seals a theory in current HOL versions. The source process therefore records load metadata, exports, and exits; a separate process starts from the pre-theory dependency context (or the toolchain base state), loads the generated theory, and saves `final_context.save`. This consumer-style context intentionally excludes arbitrary source-script SML bindings.
+Export seals a theory in current HOL versions. The source process therefore records load metadata, exports, and exits; a separate process starts from the pre-theory dependency context (or, failing that, the state the theory started from: the base heap, or the toolchain base state followed by the base heap objects for a base heap user), loads the generated theory, and saves `final_context.save`. This consumer-style context intentionally excludes arbitrary source-script SML bindings.
 
 Successful source builds retain reusable deps/theorem-context checkpoints for future proof edits and clear stale failed-prefix checkpoints for that source. Failed/interrupted builds may leave failed-prefix and partial debug breadcrumbs. `holbuild gc` removes old checkpoint families and enforces the default 5GB project checkpoint budget.
 

@@ -205,6 +205,57 @@ fun parse_at args =
   parse_table_at (TOML.fromFile (#manifest args)) args
   handle Error msg => die (#manifest args ^ ": " ^ msg)
 
+(* Only the root project's heaps are exported, so these checks skip
+   dependency manifests, which a consumer cannot fix. *)
+fun validate_root_heaps ({root, artifact_root, manifest, heaps, ...} : t) =
+  let
+    fun fail msg = die (manifest ^ ": " ^ msg)
+    fun is_base (Heap {kind = HeapImage {base}, ...}) = base
+      | is_base _ = false
+    (* Two targets writing one file would overwrite each other's export.
+       Outputs are compared as absolute paths where each is written, so
+       `x.save` and `/root/x.save` collide.  A base heap resolves under the
+       artifact root, other heaps under the source root. *)
+    fun output_path (heap as Heap {output, ...}) =
+      Path.mkCanonical
+        (if Path.isAbsolute output then output
+         else Path.concat(if is_base heap then artifact_root else root, output))
+    (* Each artifact root exports its own base heap without locking the
+       output; an output outside the artifact root would let several share,
+       and overwrite, one file.  An ordinary build exports it, so it must stay
+       in holbuild's own directory: `README` would overwrite a source file,
+       and "" names the artifact root itself. *)
+    fun check_base_output (Heap {name, output, ...}) =
+      let
+        val arcs = HolbuildManifestUtil.path_components output
+        val under_holbuild =
+          case HolbuildManifestUtil.path_components (Path.mkCanonical output) of
+              ".holbuild" :: _ :: _ => true
+            | _ => false
+      in
+        if Path.isAbsolute output orelse List.exists (fn arc => arc = "..") arcs orelse
+           not under_holbuild then
+          fail ("base heap output must be a relative path under .holbuild/ with no .. in [[heap]] " ^
+                name ^ ": " ^ output)
+        else ()
+      end
+  in
+    case List.filter is_base heaps of
+        _ :: Heap {name, ...} :: _ =>
+          fail ("at most one [[heap]] may set base = true; also set on: " ^ name)
+      | bases => List.app check_base_output bases;
+    ignore
+      (List.foldl
+         (fn (heap as Heap {output, ...}, seen) =>
+             let val path = output_path heap
+             in
+               if List.exists (fn old => old = path) seen then
+                 fail ("duplicate heap/executable output: " ^ output)
+               else path :: seen
+             end)
+         [] heaps)
+  end
+
 fun parse_builtin_holdir_at args =
   let
     val cached_manifest = HolbuildHolSharedCache.hol_source_manifest_for_holdir (#root args)
@@ -235,8 +286,11 @@ fun discover () =
             val root = manifest_root manifest
             val artifact_root' = if artifact_root = "" then root else artifact_root
             val local_config = parse_local_config root
+            val project =
+              parse_at {manifest = manifest, root = root, artifact_root = artifact_root', graph_artifact_root = artifact_root', local_config = local_config}
           in
-            parse_at {manifest = manifest, root = root, artifact_root = artifact_root', graph_artifact_root = artifact_root', local_config = local_config}
+            validate_root_heaps project;
+            project
           end
       | NONE => die "no holproject.toml found in --source-dir/current directory or parents"
   end
@@ -408,7 +462,8 @@ fun dependency_manifest (project as {manifest = project_manifest, graph_artifact
     | Dependency {source = FromSource {manifest, ...}, ...} =>
         SOME (abs_under (manifest_root project_manifest) manifest)
 
-fun heap_kind_to_string HeapImage = "heap"
+fun heap_kind_to_string (HeapImage {base = false}) = "heap"
+  | heap_kind_to_string (HeapImage {base = true}) = "heap base"
   | heap_kind_to_string (ExecutableImage {main}) = "executable main=" ^ main
 
 fun heap_to_string (Heap {name, output, objects, kind}) =

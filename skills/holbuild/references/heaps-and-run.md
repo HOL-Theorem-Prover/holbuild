@@ -26,6 +26,24 @@ Heap export flow:
 
 `objects` must currently be theory targets — non-theory objects in heap targets is not yet supported.
 
+## Base heap (`base = true`)
+
+```toml
+[[heap]]
+name = "base"
+output = ".holbuild/heap/base.save"
+objects = ["semanticsTheory"]
+base = true
+```
+
+- Root-project theories whose preloads reach every object (users) load the objects first, in manifest order, before their other preloads. Other theories, the objects and their ancestors start and build as before, and dependency packages are untouched; a non-user that depends on a user (through `[actions] deps`, or an SML module that loads one) still rebuilds once, since its key includes the user's.
+- That order is the semantics; it can change users' theory files (and in principle which proofs succeed) compared with a build without `base`, so setting `base` changes their input keys and they rebuild once.
+- The heap only speeds it up: a user starts from the heap instead of `hol.state` plus loading the objects. Both starts build identical files under one input key, so they share cache entries.
+- At most one heap of the root project may set `base`; `objects` must be non-empty theory targets. A dependency manifest's `base = true` is ignored with a warning.
+- `holbuild build` exports the heap when a theory that starts from it builds from source and the heap is missing, stale (objects or their theory files changed, or toolchain moved), or no longer matches the content hash in `<output>.ok`. If the export fails, holbuild warns once (naming the heap and its log) and builds the users from `hol.state` with the objects loaded first. `holbuild heap base` always re-exports it.
+- `output` must be a relative path under `.holbuild/` with no `..` (e.g. `.holbuild/heap/base.save`). It resolves under the build directory (the current directory with `--source-dir`), not the project root as for other heaps, so each build directory gets its own base heap and the source tree is never written.
+- Heap users' keys carry `base_heap_objects=`, so HBX archives and remote-cache entries built with `base = true` never serve consumers, whose theories use cold keys.
+
 ## `holbuild run` / `holbuild repl` — prototype status
 
 These commands generate an invocation-private run context under `.holbuild/`, add built project artifact object directories to HOL `loadPath`, and load `[run].loads` before user-supplied files or interactive input. Before starting HOL, `run` and `repl` resolve every configured load as a build target and build its dependency closure using normal cache and up-to-date behavior. Unknown configured targets are errors.
