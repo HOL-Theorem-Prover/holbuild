@@ -389,6 +389,8 @@ fun extract_cached_with_hash {cache_path, source_path, source_hash} =
           deps
         end
 
+(* Returns, for each request, the dependency facts read from its cache or
+   produced by the batch analyser run, or NONE if neither produced them. *)
 fun prefetch_cached_with_hash requests =
   let
     fun enumerate i xs =
@@ -399,27 +401,33 @@ fun prefetch_cached_with_hash requests =
       case read_cache cache_path source_hash of
           SOME deps => ((id, deps) :: cached, missing)
         | NONE => (cached, (id, req) :: missing)
-    val (_, missing) = List.foldl cached_or_missing ([], []) (enumerate 1 requests)
+    val (cached, missing) = List.foldl cached_or_missing ([], []) (enumerate 1 requests)
+    val analysed =
+      case (!analyser_path, missing) of
+          (_, []) => []
+        | (NONE, _) => []
+        | (SOME analyser, _) =>
+            let
+              val files = map (fn (id, {source_path, ...}) => (id, source_path)) (rev missing)
+              val results = run_analyser_batch analyser files
+              val missing_by_id =
+                List.foldl
+                  (fn ((id, req), dict) => Binarymap.insert(dict, id, req))
+                  (Binarymap.mkDict String.compare)
+                  missing
+              fun store (id, deps) =
+                case Binarymap.peek(missing_by_id, id) of
+                    SOME {cache_path, source_hash, ...} => (write_cache cache_path source_hash deps handle _ => ())
+                  | NONE => ()
+            in
+              List.app store results;
+              List.filter (fn (id, _) => Option.isSome (Binarymap.peek(missing_by_id, id))) results
+            end
+    val by_id =
+      List.foldl (fn ((id, deps), dict) => Binarymap.insert(dict, id, deps))
+        (Binarymap.mkDict String.compare) (cached @ analysed)
   in
-    case (!analyser_path, missing) of
-        (_, []) => ()
-      | (NONE, _) => ()
-      | (SOME analyser, _) =>
-          let
-            val files = map (fn (id, {source_path, ...}) => (id, source_path)) (rev missing)
-            val results = run_analyser_batch analyser files
-            val missing_by_id =
-              List.foldl
-                (fn ((id, req), dict) => Binarymap.insert(dict, id, req))
-                (Binarymap.mkDict String.compare)
-                missing
-            fun store (id, deps) =
-              case Binarymap.peek(missing_by_id, id) of
-                  SOME {cache_path, source_hash, ...} => (write_cache cache_path source_hash deps handle _ => ())
-                | NONE => ()
-          in
-            List.app store results
-          end
+    map (fn (id, _) => Binarymap.peek(by_id, id)) (enumerate 1 requests)
   end
 
 fun extract_cached {cache_path, source_path} =
@@ -444,11 +452,11 @@ fun prefetch_global_cached_with_hash requests =
   case cache_root () of
       NONE => ()
     | SOME root =>
-        prefetch_cached_with_hash
+        ignore (prefetch_cached_with_hash
           (map (fn {source_path, source_hash} =>
                   {cache_path = external_cache_path root source_hash,
                    source_path = source_path,
-                   source_hash = source_hash}) requests)
+                   source_hash = source_hash}) requests))
 
 fun extract_global_cached source_path =
   extract_global_cached_with_hash {source_path = source_path,
