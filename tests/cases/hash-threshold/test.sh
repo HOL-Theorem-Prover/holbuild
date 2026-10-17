@@ -64,7 +64,8 @@ fun check_size size =
     assert ("sha1 mismatch at " ^ Int.toString size) (HolbuildHash.file_sha1 path = sha1);
     assert ("string sha1 mismatch at " ^ Int.toString size) (HolbuildHash.string_sha1 (HolbuildHash.read_binary_all path) = sha1);
     assert ("sha256 mismatch at " ^ Int.toString size) (HolbuildHash.file_sha256 path = sha256);
-    assert ("string sha256 mismatch at " ^ Int.toString size) (HolbuildHash.string_sha256 (HolbuildHash.read_binary_all path) = sha256)
+    assert ("string sha256 mismatch at " ^ Int.toString size) (HolbuildHash.string_sha256 (HolbuildHash.read_binary_all path) = sha256);
+    assert ("large string sha256 mismatch at " ^ Int.toString size) (HolbuildHash.string_sha256_large (HolbuildHash.read_binary_all path) = sha256)
   end
 
 val sizes = [0, 1, 17, 4096, 5120, 65536, 196607, 196608, 307200]
@@ -143,3 +144,90 @@ if grep -q "blob-5120.bin" "$tmpdir/sha1-path.log"; then
   exit 1
 fi
 require_grep "blob-307200.bin" "$tmpdir/sha1-path.log"
+
+# string_sha256_large pipes the text to sha256sum, or to shasum when
+# sha256sum is absent, and falls back to the SML digest on any failure.
+sentinel256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+wc_bin=$(command -v wc)
+poly_bin=$(command -v "${HOLBUILD_POLY:-poly}")
+
+write_digest_shim() {
+  local path=$1 body=$2
+  printf '#!/bin/sh\n%s\n' "$body" > "$path"
+  chmod +x "$path"
+}
+
+cat > "$tmpdir/string-large.sml" <<'SML'
+val root =
+  case OS.Process.getEnv "HOLBUILD_ROOT" of
+      SOME path => path
+    | NONE => raise Fail "HOLBUILD_ROOT not set";
+val tmp =
+  case OS.Process.getEnv "HASH_THRESHOLD_TEST_TMP" of
+      SOME path => path
+    | NONE => raise Fail "HASH_THRESHOLD_TEST_TMP not set";
+val expected =
+  case OS.Process.getEnv "STRING_LARGE_EXPECT" of
+      SOME text => text
+    | NONE => raise Fail "STRING_LARGE_EXPECT not set";
+
+val _ = OS.FileSys.chDir root;
+use "sml/holbuild-script.sml";
+
+fun fail message = (TextIO.output (TextIO.stdErr, message ^ "\n");
+                    OS.Process.exit OS.Process.failure)
+fun assert message condition = if condition then () else fail message
+
+val small = HolbuildHash.read_binary_all (OS.Path.concat(tmp, "blob-5120.bin"))
+val large = HolbuildHash.read_binary_all (OS.Path.concat(tmp, "blob-307200.bin"))
+val want = if expected = "fallback" then HolbuildHash.string_sha256 large else expected
+val got = HolbuildHash.string_sha256_large large
+
+val _ = assert ("large string digest " ^ got ^ ", expected " ^ want) (got = want)
+val _ = assert "small string digest changed"
+          (HolbuildHash.string_sha256_large small = HolbuildHash.string_sha256 small)
+val _ = print "string sha256 large test passed\n"
+SML
+
+run_string_large() {
+  local label=$1 path=$2 expect=$3
+  : > "$tmpdir/stdin-bytes.log"
+  PATH="$path" HASH_THRESHOLD_TEST_TMP="$tmpdir" STRING_LARGE_EXPECT="$expect" \
+    "$poly_bin" < "$tmpdir/string-large.sml" > "$tmpdir/string-large-$label.log" 2>&1 || {
+      cat "$tmpdir/string-large-$label.log" >&2
+      exit 1
+    }
+  require_grep "string sha256 large test passed" "$tmpdir/string-large-$label.log"
+}
+
+# The tool receives the whole text on stdin, and only large texts reach it.
+counting="$tmpdir/shim-counting"
+mkdir -p "$counting"
+write_digest_shim "$counting/sha256sum" \
+  "$wc_bin -c >> \"\$STDIN_BYTES_LOG\"; echo '$sentinel256  -'"
+STDIN_BYTES_LOG="$tmpdir/stdin-bytes.log" run_string_large counting "$counting:$PATH" "$sentinel256"
+if [ "$(tr -d ' ' < "$tmpdir/stdin-bytes.log")" != 307200 ]; then
+  echo "sha256sum stdin byte counts: $(cat "$tmpdir/stdin-bytes.log"), expected one 307200" >&2
+  exit 1
+fi
+
+# Without sha256sum on PATH, shasum -a 256 is used.
+shasum_only="$tmpdir/shim-shasum"
+mkdir -p "$shasum_only"
+write_digest_shim "$shasum_only/shasum" \
+  "[ \"\$1 \$2\" = '-a 256' ] || exit 2; $wc_bin -c >> \"\$STDIN_BYTES_LOG\"; echo '$sentinel256  -'"
+STDIN_BYTES_LOG="$tmpdir/stdin-bytes.log" run_string_large shasum "$shasum_only" "$sentinel256"
+require_grep 307200 "$tmpdir/stdin-bytes.log"
+
+# Neither tool, a failing tool, an invalid digest, or a tool that exits
+# before reading its input: the SML digest is used.
+for case in none fails invalid early-exit; do
+  dir="$tmpdir/shim-$case"
+  mkdir -p "$dir"
+  case $case in
+    fails) write_digest_shim "$dir/sha256sum" "$wc_bin -c > /dev/null; exit 1" ;;
+    invalid) write_digest_shim "$dir/sha256sum" "$wc_bin -c > /dev/null; echo 'not-a-digest  -'" ;;
+    early-exit) write_digest_shim "$dir/sha256sum" "echo '$sentinel256  -'" ;;
+  esac
+  run_string_large "$case" "$dir" fallback
+done
