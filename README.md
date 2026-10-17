@@ -1,7 +1,8 @@
 # holbuild
 
 `holbuild` is a build tool for HOL4 projects. It lets a project describe its
-sources, HOL revision, and dependencies in a `holproject.toml` file, then builds
+sources, HOL revision, and dependencies in a `holproject.toml` file (or a
+`holbuild.toml`, see [Manifest discovery](#manifest-discovery)), then builds
 logical targets such as `MyTheory` without requiring users to manage `.uo`,
 `.ui`, `.dat`, or Holmake state directly.
 
@@ -291,8 +292,30 @@ require it. Clean does not remove global cache entries, so use
 restoring the target from the global cache.
 
 `--source-dir PATH` or `HOLBUILD_SOURCE_DIR` chooses where to look for
-`holproject.toml`. Build output is written under `.holbuild/` in the current
+the project manifest. Build output is written under `.holbuild/` in the current
 working directory.
+
+### Manifest discovery
+
+holbuild looks for the manifest in the source directory and then in each
+parent. In each directory it selects `holbuild.toml` if present, otherwise
+`holproject.toml`, and moves to the parent only when neither exists. So the
+nearest directory with a manifest wins, and within that directory
+`holbuild.toml` wins; a nearer `holproject.toml` still beats an ancestor's
+`holbuild.toml`. Only the selected file is parsed, with the same schema
+whichever name it has. The files are never merged, and an invalid
+`holbuild.toml` is an error even when a valid `holproject.toml` sits beside it.
+
+Dependencies discovered on disk (git dependencies and `.holconfig.toml` path
+overrides) use the same preference. An explicit shim `manifest` path is used as
+declared. A nested directory containing either file is a separate project and
+is excluded from its parent's automatic source discovery.
+
+`holbuild.toml` exists so that a project can also carry a `holproject.toml`
+written for another tool: Holmake reads `holproject.toml` with its own schema,
+which holbuild's validator rejects. Such a project keeps that file for Holmake
+and adds `holbuild.toml` for holbuild. This is a compatibility measure; the
+shared-schema and workspace design questions of issue #110 are not settled by it.
 
 ## Manifest guide
 

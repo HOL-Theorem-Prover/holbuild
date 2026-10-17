@@ -6,6 +6,19 @@ fun die msg = raise Error msg
 fun warn msg = TextIO.output(TextIO.stdErr, "holbuild: warning: " ^ msg ^ "\n")
 
 structure Path = OS.Path
+structure FS = OS.FileSys
+
+(* Manifest filenames in order of preference within one directory.
+   `holbuild.toml` lets a project also carry a `holproject.toml` written for
+   another tool (Holmake's schema differs); only the selected file is parsed. *)
+val manifest_filenames = ["holbuild.toml", "holproject.toml"]
+val manifest_filenames_text = String.concatWith " or " manifest_filenames
+
+fun readable path = FS.access(path, [FS.A_READ]) handle OS.SysErr _ => false
+
+(* The manifest to use for the project rooted at dir, if it has one. *)
+fun select_manifest_in dir =
+  List.find readable (map (fn name => Path.concat(dir, name)) manifest_filenames)
 
 fun lookup table key = TOML.lookupInTable table key
 fun key_text key = String.concatWith "." key
@@ -75,7 +88,7 @@ fun string_array_value value =
       TOML.ARRAY values =>
         let
           fun one (TOML.STRING s) = s
-            | one _ = die "expected string array in holproject.toml"
+            | one _ = die "expected string array"
         in SOME (map one values) end
     | _ => NONE
 

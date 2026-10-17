@@ -35,10 +35,22 @@ minimum_version = "0.10.0"
 
 Package roots are declared by one of:
 
-- the current project's `holproject.toml`
-- a dependency's own `holproject.toml`
+- the current project's manifest
+- a dependency's own manifest
 - an explicit shim manifest supplied by the consumer
 - the built-in/root HOL manifest
+
+A project's or dependency's manifest is `holbuild.toml` if the directory has
+one, otherwise `holproject.toml`. Root discovery walks from the source
+directory to its parents and stops at the first directory holding either file,
+so the nearest project wins and only then does `holbuild.toml` take precedence.
+The selected file is parsed on its own with the one manifest schema; the two
+are never merged and an invalid `holbuild.toml` is not a fallback to
+`holproject.toml`. The second name exists because Holmake reads
+`holproject.toml` with a different schema, so a project used by both tools
+keeps that file for Holmake and adds `holbuild.toml`. This is a compatibility
+step; the workspace, sibling-dependency, and shared-schema questions of issue
+#110 remain open.
 
 Committed manifests describe what dependency is required. They should not rely on
 ambient search paths such as `HOLPATH`, `HOLDIR`, or user include paths. The
