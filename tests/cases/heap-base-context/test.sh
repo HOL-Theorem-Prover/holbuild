@@ -167,6 +167,26 @@ if grep -q "exporting base heap" "$tmpdir/noop.log"; then
 fi
 key_before=$(grep '^heap_key=' "$heap.ok")
 
+# Proof-step tracing runs a user's proofs step by step over the same heap
+# start.
+cat > "$project/src/WScript.sml" <<SML
+open HolKernel Parse boolLib bossLib ATheory;
+$(record_hierarchy W)
+val _ = new_theory "W";
+Theorem w_thm:
+  T /\\ T
+Proof
+  CONJ_TAC >- ACCEPT_TAC a_thm >- ACCEPT_TAC a_thm
+QED
+val _ = export_theory();
+SML
+(cd "$project" && "$HOLBUILD_BIN" build --trace-steps WTheory) > "$tmpdir/trace.log" 2>&1
+require_grep "WTheory built" "$tmpdir/trace.log"
+require_heap_start W
+require_grep "holbuild proof-ir after theorem=w_thm step=0" \
+  "$project/.holbuild/logs/current/basectx/WTheory/proof-trace.log"
+rm "$project/src/WScript.sml"
+
 # Cold and heap builds are cached under different keys: switching back and
 # forth restores each from the cache, and a heap nobody has to build from is
 # not exported.
@@ -652,6 +672,65 @@ require_grep "warning: could not export base heap" "$tmpdir/order-plain-preload.
 u_outputs > "$tmpdir/order-plain-preload.sha"
 cmp -s "$tmpdir/order-heap.sha" "$tmpdir/order-plain-preload.sha" ||
   { echo "U built with --skip-checkpoints differs from its heap build" >&2; exit 1; }
+
+# A node that fails while a user exports the heap stops the build: the export
+# is not reported as failed, and the users waiting on it do not start cold.
+# The export sleeps in slowLib, which A loads, until the stop kills it.  X
+# fails once the export's directory exists, so it fails during the export.
+stop=$tmpdir/stop
+mkdir -p "$stop/src"
+sed -e 's/name = "basectx"/name = "stop"/' "$project/holproject.toml" > "$stop/holproject.toml"
+require_grep '^base = true' "$stop/holproject.toml"
+cat > "$stop/src/slowLib.sml" <<'SML'
+structure slowLib = struct
+  val _ = if String.isSubstring "heap-export-" (OS.FileSys.getDir ())
+          then OS.Process.sleep (Time.fromSeconds 60) else ()
+end
+SML
+cat > "$stop/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib slowLib;
+val _ = new_theory "A";
+val a_thm = store_thm("a_thm", ``T``, ACCEPT_TAC TRUTH);
+val _ = export_theory();
+SML
+for theory in S V; do
+  cat > "$stop/src/${theory}Script.sml" <<SML
+open HolKernel Parse boolLib bossLib ATheory;
+$(record_hierarchy "$theory")
+val _ = new_theory "$theory";
+val ${theory,,}_thm = store_thm("${theory,,}_thm", \`\`T /\\ T\`\`, REWRITE_TAC [a_thm]);
+val _ = export_theory();
+SML
+done
+cat > "$stop/src/XScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+fun exporting () =
+  let val dir = OS.FileSys.openDir "$stop/.holbuild/stage"
+      fun loop () =
+        case OS.FileSys.readDir dir of
+            NONE => false
+          | SOME name => String.isPrefix "heap-export-" name orelse loop ()
+  in loop () before OS.FileSys.closeDir dir end
+  handle _ => false;
+fun wait n =
+  if exporting () then ()
+  else if n = 0 then raise Fail "the base heap export never started"
+  else (OS.Process.sleep (Time.fromMilliseconds 10); wait (n - 1));
+val _ = wait 6000;
+val _ = OS.Process.exit OS.Process.failure;
+SML
+rm -f "$markers"/*.hierarchy
+if (cd "$stop" && "$HOLBUILD_BIN" -j3 build) > "$tmpdir/stop.log" 2>&1; then
+  echo "a build with a failing node succeeded" >&2; cat "$tmpdir/stop.log" >&2; exit 1
+fi
+require_grep "exporting base heap" "$tmpdir/stop.log"
+require_grep "XTheory/build.log" "$tmpdir/stop.log"
+if grep -q "could not export base heap" "$tmpdir/stop.log"; then
+  echo "a base heap export killed by a stopping build warned as a failed export" >&2
+  cat "$tmpdir/stop.log" >&2
+  exit 1
+fi
+require_no_markers S V
 
 # A forced rebuild of a nondeterministic object writes a new .dat under an
 # unchanged input key.  The heap must be re-exported, or its users load the

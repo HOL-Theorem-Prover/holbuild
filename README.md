@@ -556,7 +556,9 @@ consumer, whose theories use cold keys. Other theories, the objects and their
 ancestors, and every dependency package's theories are unaffected. At most one
 heap of the root project may set `base`, and it must list at least one object,
 all theory targets. A dependency manifest's `base = true` is ignored with a
-warning.
+warning. holbuild versions without `base` reject it (`unknown field in heap:
+base`), so a project that sets it should raise `[holbuild].minimum_version` to
+a release that supports it.
 
 The heap, which holds exactly what loading the objects loads, only speeds this
 up: those theories start from it instead of from HOL's `hol.state` followed by
@@ -569,7 +571,8 @@ content hash in `<output>.ok`. If the export fails, holbuild warns once,
 naming the heap and its log, and builds those theories from `hol.state` with
 the objects loaded first. `holbuild heap base` always re-exports the heap.
 Exporting the same file as a plain heap, with `base` unset, deletes the base
-heap's `<output>.ok`, so the next build re-exports it.
+heap's `<output>.ok` when both outputs resolve to the same path, so the next
+build re-exports it.
 
 A relative `output` of the base heap is resolved under the directory that
 holds the build's `.holbuild/` (the current directory with `--source-dir`),

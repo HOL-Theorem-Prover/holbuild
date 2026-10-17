@@ -671,7 +671,10 @@ user is byte-identical to its heap build, so a user's input key does not record
 which start ran, and both share cache entries. A build exports the heap at most
 once, when a user first builds from source and finds it missing or stale. If
 the export fails, the build warns once, naming the heap and the error with the
-export log, and every user starts cold with the objects loaded first.
+export log, and every user starts cold with the objects loaded first. An
+export killed because a parallel build is stopping is not a failed export:
+the users waiting on it are cancelled with the build, without a warning,
+since starting them cold would only delay the stop.
 
 The heap key hashes the toolchain key, the path of `hol.state` (which the heap
 records as its parent), and the objects' load stems and input keys.

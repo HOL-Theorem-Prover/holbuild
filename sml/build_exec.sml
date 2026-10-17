@@ -1405,12 +1405,15 @@ type base_heap_users =
    users : string Redblackset.set}
 
 (* HeapReady carries the exported file's content hash.  HeapFailed records
-   that the export failed, so later users start cold without retrying it. *)
+   that the export failed, so later users start cold without retrying it.
+   [stopping] is set when a parallel build stops: an export killed by the
+   stop is not a failure, and users waiting on it must not start cold. *)
 datatype base_heap_state = HeapUnchecked | HeapReady of string | HeapFailed
 
 type base_heap =
   {path : string, key : string, objects : HolbuildBuildPlan.node list,
-   users : string Redblackset.set, state : base_heap_state ref, mutex : Mutex.mutex}
+   users : string Redblackset.set, state : base_heap_state ref, mutex : Mutex.mutex,
+   stopping : bool ref}
 
 (* [first_loads] are preload lines that run before the node's own preloads:
    the base heap objects for a user that starts cold. *)
@@ -4087,7 +4090,11 @@ fun base_heap_key tc toolchain_key keys objects =
 
 fun new_base_heap path key objects users : base_heap =
   {path = path, key = key, objects = objects, users = users,
-   state = ref HeapUnchecked, mutex = Mutex.mutex ()}
+   state = ref HeapUnchecked, mutex = Mutex.mutex (), stopping = ref false}
+
+(* Set without the heap's mutex, which an export holds while it runs. *)
+fun stop_base_heap (SOME ({stopping, ...} : base_heap)) = stopping := true
+  | stop_base_heap NONE = ()
 
 fun base_heap_for tc toolchain_key keys ({spec = {output, ...}, objects, users} : base_heap_users) =
   if Redblackset.isEmpty users then NONE
@@ -4177,29 +4184,37 @@ fun export_base_heap dat_hash_cache tc project ({path, key, objects, ...} : base
 
 (* Returns the content hash of the current heap, exporting it at most once per
    build, or NONE when it cannot be exported.  The heap only speeds up its
-   users, so a failed export is a warning and the users start cold. *)
-fun ensure_base_heap dat_hash_cache tc project (heap as {path, key, objects, state, mutex, ...} : base_heap) =
+   users, so a failed export is a warning and the users start cold.  Once the
+   build is stopping, the export and its waiters raise instead: starting cold
+   then would only delay the stop. *)
+fun ensure_base_heap dat_hash_cache tc project
+                     (heap as {path, key, objects, state, mutex, stopping, ...} : base_heap) =
   let
     fun ensure () =
       case !state of
           HeapReady hash => SOME hash
         | HeapFailed => NONE
         | HeapUnchecked =>
-            let
-              val hash =
-                case current_base_heap_hash path key (base_heap_objects_hash dat_hash_cache objects) of
-                    SOME hash => hash
-                  | NONE => export_base_heap dat_hash_cache tc project heap
-            in
-              state := HeapReady hash;
-              SOME hash
-            end
-            handle e =>
-              (state := HeapFailed;
-               warn ("could not export base heap " ^ path ^
-                     "; its users start from hol.state and load its objects first\n" ^
-                     General.exnMessage e);
-               NONE)
+            if !stopping then
+              raise Error ("build stopped before base heap " ^ path ^ " was exported")
+            else
+              let
+                val hash =
+                  case current_base_heap_hash path key (base_heap_objects_hash dat_hash_cache objects) of
+                      SOME hash => hash
+                    | NONE => export_base_heap dat_hash_cache tc project heap
+              in
+                state := HeapReady hash;
+                SOME hash
+              end
+              handle e =>
+                if !stopping then raise e
+                else
+                  (state := HeapFailed;
+                   warn ("could not export base heap " ^ path ^
+                         "; its users start from hol.state and load its objects first\n" ^
+                         General.exnMessage e);
+                   NONE)
   in
     (Mutex.lock mutex; ensure () before Mutex.unlock mutex)
     handle e => (Mutex.unlock mutex; raise e)
@@ -5014,7 +5029,8 @@ fun build_parallel dat_hash_cache status options tc project base_heap plan keys 
                   first
                 end)
       in
-        if first_stop then HolbuildToolchain.cleanup_active_children () else ()
+        if first_stop then (stop_base_heap base_heap; HolbuildToolchain.cleanup_active_children ())
+        else ()
       end
 
     fun finish_cancelled_after_stop id =
@@ -5040,7 +5056,8 @@ fun build_parallel dat_hash_cache status options tc project base_heap plan keys 
                   first
                 end)
       in
-        if first_failure then HolbuildToolchain.cleanup_active_children () else ()
+        if first_failure then (stop_base_heap base_heap; HolbuildToolchain.cleanup_active_children ())
+        else ()
       end
 
     fun worker_exit () =
