@@ -43,8 +43,12 @@ fun external_sha256 path = external_hash "sha256sum" valid_sha256 path
 
 val small_file_limit = 196608
 
+(* Starting sha1sum costs ~0.6ms and SHA1_ML hashes ~66 MB/s, so SHA1_ML is
+   faster for files below ~40 KiB. *)
+val external_sha1_limit = 65536
+
 fun large_file path =
-  (Position.toInt (OS.FileSys.fileSize path) >= small_file_limit)
+  (Position.toInt (OS.FileSys.fileSize path) >= external_sha1_limit)
   handle Overflow => true
        | OS.SysErr _ => false
 
