@@ -55,7 +55,7 @@ step; the workspace, sibling-dependency, and shared-schema questions of issue
 Committed manifests describe what dependency is required. They should not rely on
 ambient search paths such as `HOLPATH`, `HOLDIR`, or user include paths. The
 current manifest language uses exact git commits plus explicit shim manifests for subtrees that do not have
-their own `holproject.toml`:
+their own manifest:
 
 ```toml
 [dependencies.foo]
@@ -130,7 +130,7 @@ but the shim manifest is read from the package that declares the dependency.
 The reserved `hol` package is the project HOL toolchain. It is
 materialized and built at a canonical shared cache path
 `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`; upstream HOL does not need a
-`holproject.toml`, because holbuild uses its built-in HOL manifest for package
+manifest, because holbuild uses its built-in HOL manifest for package
 metadata. `context` resolves the path but does not build HOL. Commands that need
 HOL use the shared cached tree as the project HOL toolchain and build it on
 demand with:

@@ -84,7 +84,8 @@ You can override the destination with `PREFIX`, `BINDIR`, or `DESTDIR`.
 
 ## A minimal project
 
-Create `holproject.toml` in the root of your HOL project:
+Create `holproject.toml` in the root of your HOL project (`holbuild.toml`
+works too; see [Manifest discovery](#manifest-discovery)):
 
 ```toml
 [holbuild]
@@ -280,9 +281,11 @@ Common global options:
   processes.
 
 `holbuild build --watch MyTheory` runs an initial build, then watches project
-inputs with `inotifywait` and rebuilds after changes. Watch mode currently
-requires `inotifywait` from `inotify-tools` and does not support `--json`,
-`--dry-run`, or `--repl-on-failure`.
+inputs with `inotifywait` and rebuilds after changes. The directory of each
+manifest in use is watched as well (not recursively), so a `holbuild.toml` or
+`.holconfig.toml` appearing beside the manifest triggers a rebuild. Watch mode
+currently requires `inotifywait` from `inotify-tools` and does not support
+`--json`, `--dry-run`, or `--repl-on-failure`.
 
 `holbuild clean MyTheory` removes project-local generated artifacts, dependency
 metadata, and checkpoints for the named theory target. This is primarily a
@@ -664,7 +667,7 @@ authenticated HTTPS endpoint with trusted writers. Content hashes detect
 corruption but do not authenticate the cache publisher.
 
 For private caches, put credentials in local/CI configuration, not in
-`holproject.toml`. CLI `--remote-cache` overrides `HOLBUILD_REMOTE_CACHE_URL`,
+the project manifest. CLI `--remote-cache` overrides `HOLBUILD_REMOTE_CACHE_URL`,
 which overrides `.holconfig.toml`'s `[remote_cache].url`. `bazel-remote`
 supports HTTP Basic Auth; the safest holbuild path is to pass curl a config
 file:
@@ -776,11 +779,11 @@ may use environment variables. Local relative paths are resolved from the projec
 root; URL-like git remotes are left unchanged. Overrides apply during recursive
 dependency resolution too, so a dependency declared by another dependency can be
 supplied from disk. Overridden dependencies still need a matching `project.name`
-in their `holproject.toml`; `dependencies.hol` cannot be overridden this way.
+in their manifest; `dependencies.hol` cannot be overridden this way.
 A `from/path/manifest` shim cannot be overridden directly; override the direct
 source dependency named by `from` instead.
 
-Unknown fields in recognised `holproject.toml` and `.holconfig.toml` tables are
+Unknown fields in recognised manifest and `.holconfig.toml` tables are
 errors.
 
 ## CI guidance
