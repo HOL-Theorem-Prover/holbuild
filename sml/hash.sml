@@ -28,13 +28,9 @@ fun remove_quietly path = OS.FileSys.remove path handle OS.SysErr _ => ()
 
 fun external_hash command_name valid path =
   let
-    val out = OS.FileSys.tmpName ()
-    val command = command_name ^ " " ^ quote path ^ " > " ^ quote out
-    val status = OS.Process.system command
-    val result =
-      if OS.Process.isSuccess status then first_token (read_all out)
-      else NONE
-    val _ = remove_quietly out
+    val run = HolbuildSpawn.run {program = command_name, args = [path],
+                                 stderr = HolbuildSpawn.Inherit}
+    val result = if HolbuildSpawn.succeeded run then first_token (#output run) else NONE
   in
     case result of
         SOME hash => if valid hash then SOME (String.map Char.toLower hash) else NONE
