@@ -35,15 +35,27 @@ minimum_version = "0.10.0"
 
 Package roots are declared by one of:
 
-- the current project's `holproject.toml`
-- a dependency's own `holproject.toml`
+- the current project's manifest
+- a dependency's own manifest
 - an explicit shim manifest supplied by the consumer
 - the built-in/root HOL manifest
+
+A project's or dependency's manifest is `holbuild.toml` if the directory has
+one, otherwise `holproject.toml`. Root discovery walks from the source
+directory to its parents and stops at the first directory holding either file,
+so the nearest project wins and only then does `holbuild.toml` take precedence.
+The selected file is parsed on its own with the one manifest schema; the two
+are never merged and an invalid `holbuild.toml` is not a fallback to
+`holproject.toml`. The second name exists because Holmake reads
+`holproject.toml` with a different schema, so a project used by both tools
+keeps that file for Holmake and adds `holbuild.toml`. This is a compatibility
+step; the workspace, sibling-dependency, and shared-schema questions of issue
+#110 remain open.
 
 Committed manifests describe what dependency is required. They should not rely on
 ambient search paths such as `HOLPATH`, `HOLDIR`, or user include paths. The
 current manifest language uses exact git commits plus explicit shim manifests for subtrees that do not have
-their own `holproject.toml`:
+their own manifest:
 
 ```toml
 [dependencies.foo]
@@ -118,7 +130,7 @@ but the shim manifest is read from the package that declares the dependency.
 The reserved `hol` package is the project HOL toolchain. It is
 materialized and built at a canonical shared cache path
 `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`; upstream HOL does not need a
-`holproject.toml`, because holbuild uses its built-in HOL manifest for package
+manifest, because holbuild uses its built-in HOL manifest for package
 metadata. `context` resolves the path but does not build HOL. Commands that need
 HOL use the shared cached tree as the project HOL toolchain and build it on
 demand with:

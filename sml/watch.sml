@@ -56,6 +56,22 @@ fun source_paths (source : HolbuildSourceIndex.source, paths) =
       extras
   end
 
+(* The directories whose manifests are in use. A manifest that takes
+   precedence (holbuild.toml beside holproject.toml) or a .holconfig.toml can
+   appear there without touching any watched path, so these directories are
+   watched non-recursively. All events, not just creation: when a new manifest
+   is invalid the watch set cannot be recomputed and does not contain it, and
+   fixing or removing it must still be noticed. *)
+fun manifest_dirs project packages =
+  let
+    fun add_manifest_dir (manifest, dirs) =
+      if readable manifest then add_unique (Path.dir manifest) dirs else dirs
+  in
+    List.foldl add_manifest_dir
+               (add_manifest_dir (#manifest project, []))
+               (map HolbuildProject.package_manifest packages)
+  end
+
 fun watch_paths_with resolution project index =
   let
     val paths = []
@@ -63,10 +79,11 @@ fun watch_paths_with resolution project index =
     val paths = add_readable (Path.concat(#root project, ".holconfig.toml")) paths
     val graph = HolbuildProjectGraph.resolve
                   {project = project, resolution = resolution}
-    val paths = List.foldl package_paths paths (HolbuildProjectGraph.packages graph)
+    val packages = HolbuildProjectGraph.packages graph
+    val paths = List.foldl package_paths paths packages
     val paths = List.foldl source_paths paths index
   in
-    rev paths
+    {paths = rev paths, manifest_dirs = rev (manifest_dirs project packages)}
   end
 
 fun watch_paths project index =
@@ -78,17 +95,36 @@ fun ensure_inotifywait () =
 
 fun sleep_debounce () = OS.Process.sleep (Time.fromReal 0.25)
 
-fun inotify_command paths =
+fun inotify_tree_command paths =
   "inotifywait -q -r --exclude " ^ quote "(^|/)(\\.[^/]+|_build)/" ^
   " -e close_write,move,create,delete,attrib -- " ^
   String.concatWith " " (map quote paths) ^ " >/dev/null 2>&1"
 
-fun wait_for_change paths =
+fun inotify_dirs_command dirs =
+  "inotifywait -q -e close_write,move,create,delete,attrib -- " ^
+  String.concatWith " " (map quote dirs) ^ " >/dev/null 2>&1"
+
+(* Two inotifywait processes, since one invocation is either recursive or not:
+   the tree watch on the inputs, and a flat watch on the manifest directories.
+   The first to exit decides; its status is the command's status. *)
+fun inotify_command {paths, manifest_dirs} =
+  String.concatWith "\n"
+    [inotify_tree_command paths ^ " &",
+     "tree=$!",
+     inotify_dirs_command manifest_dirs ^ " &",
+     "dirs=$!",
+     "while kill -0 \"$tree\" 2>/dev/null && kill -0 \"$dirs\" 2>/dev/null; do sleep 0.2; done",
+     "if kill -0 \"$tree\" 2>/dev/null; then first=$dirs; other=$tree; else first=$tree; other=$dirs; fi",
+     "kill \"$other\" 2>/dev/null",
+     "wait \"$other\" 2>/dev/null",
+     "wait \"$first\""]
+
+fun wait_for_change (watch_set as {paths, ...}) =
   case paths of
       [] => raise Error "build --watch has no files or directories to watch"
     | _ =>
         let
-          val status = HolbuildToolchain.run ["sh", "-c", inotify_command paths]
+          val status = HolbuildToolchain.run ["sh", "-c", inotify_command watch_set]
         in
           if HolbuildToolchain.success status then sleep_debounce ()
           else raise Error "inotifywait failed while watching project inputs"
