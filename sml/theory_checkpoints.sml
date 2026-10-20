@@ -301,6 +301,14 @@ fun line_pragma ({line, col, ...} : position) =
 fun source_line_pragma source offset =
   line_pragma (advance_position source start_position offset)
 
+fun line_at source offset = #line (advance_position source start_position offset)
+
+(* Placed before holbuild's own code at the top of a staged script: it numbers
+   that code past the end of the source, so an error in it is not reported at
+   a line of the source. *)
+fun generated_code_pragma source =
+  "#(LINE=" ^ Int.toString (line_at source (size source) + 1) ^ ")\n"
+
 datatype instrument_event =
   CheckpointEvent of checkpoint
 | DeclarationCheckpointEvent of declaration_checkpoint
@@ -395,7 +403,7 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
     val prelude_text = prelude ()
     val start_pragma = resume_at start_offset
   in
-    String.concat [prelude_text, file_pragma source_name, start_pragma,
+    String.concat [generated_code_pragma source, prelude_text, file_pragma source_name, start_pragma,
                    loop start_offset (sorted_events ()) []]
   end
 

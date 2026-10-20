@@ -142,26 +142,25 @@ fun marker_line_after marker text =
       NONE => NONE
     | SOME i => parse_decimal_prefix text (i + size marker)
 
-fun split_first_char ch text =
-  case find_substring (String.str ch) text of
-      NONE => NONE
-    | SOME i => SOME (String.substring(text, 0, i), String.extract(text, i + 1, NONE))
-
+(* `path:line: error:` from Poly or `path:line:col: parse error:` from HOL's
+   source parser; the path itself may contain colons. *)
 fun parse_static_error_location line =
   case static_error_marker line of
       NONE => NONE
     | SOME marker =>
         let
-          val before_error = String.substring(line, 0, marker)
-          fun loop path rest last =
-            case split_first_char #":" rest of
-                NONE => Option.map (fn line_no => {path = path, line = line_no}) last
-              | SOME (piece, after) =>
-                  loop (path ^ ":" ^ piece) after (Int.fromString after)
+          fun number text =
+            if text <> "" andalso CharVector.all Char.isDigit text then Int.fromString text else NONE
+          fun located path_fields line_no =
+            SOME {path = String.concatWith ":" (rev path_fields), line = line_no}
         in
-          case split_first_char #":" before_error of
-              NONE => NONE
-            | SOME (path, rest) => loop path rest (Int.fromString rest)
+          case rev (String.fields (fn c => c = #":") (String.substring(line, 0, marker))) of
+              last :: previous :: rest =>
+                (case (number last, number previous, rest) of
+                     (SOME _, SOME line_no, _ :: _) => located rest line_no
+                   | (SOME line_no, _, _) => located (previous :: rest) line_no
+                   | _ => NONE)
+            | _ => NONE
         end
 
 (* Staged scripts carry location pragmas, so Poly reports lines of the source
