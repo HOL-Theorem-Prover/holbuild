@@ -27,7 +27,7 @@ fun register_child_group launch =
           (* Unix.execute briefly owns pipe ends that must not leak through
              another concurrent fork/exec.  Serialize only this short launch
              window, then release the registry lock while the child runs. *)
-          val process = launch ()
+          val process = HolbuildSpawn.with_launch_lock launch
           val id = !next_child_id
         in
           next_child_id := id + 1;

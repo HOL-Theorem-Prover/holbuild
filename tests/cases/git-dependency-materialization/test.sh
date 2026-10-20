@@ -220,7 +220,7 @@ if (cd "$no_manifest_project" && "$HOLBUILD_BIN" context) > "$tmpdir/no-manifest
   echo "missing git manifest unexpectedly accepted" >&2
   exit 1
 fi
-require_grep 'dependency dep manifest not found:' "$tmpdir/no-manifest.log"
+require_grep "dependency dep manifest not found: no holbuild.toml or holproject.toml in $no_manifest_project/.holbuild/src/dep" "$tmpdir/no-manifest.log"
 
 missing_from_manifest=$tmpdir/missing-from-manifest
 mkdir -p "$missing_from_manifest"

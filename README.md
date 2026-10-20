@@ -1,7 +1,8 @@
 # holbuild
 
 `holbuild` is a build tool for HOL4 projects. It lets a project describe its
-sources, HOL revision, and dependencies in a `holproject.toml` file, then builds
+sources, HOL revision, and dependencies in a `holproject.toml` file (or a
+`holbuild.toml`, see [Manifest discovery](#manifest-discovery)), then builds
 logical targets such as `MyTheory` without requiring users to manage `.uo`,
 `.ui`, `.dat`, or Holmake state directly.
 
@@ -83,7 +84,8 @@ You can override the destination with `PREFIX`, `BINDIR`, or `DESTDIR`.
 
 ## A minimal project
 
-Create `holproject.toml` in the root of your HOL project:
+Create `holproject.toml` in the root of your HOL project (`holbuild.toml`
+works too; see [Manifest discovery](#manifest-discovery)):
 
 ```toml
 [holbuild]
@@ -279,9 +281,11 @@ Common global options:
   processes.
 
 `holbuild build --watch MyTheory` runs an initial build, then watches project
-inputs with `inotifywait` and rebuilds after changes. Watch mode currently
-requires `inotifywait` from `inotify-tools` and does not support `--json`,
-`--dry-run`, or `--repl-on-failure`.
+inputs with `inotifywait` and rebuilds after changes. The directory of each
+manifest in use is watched as well (not recursively), so a `holbuild.toml` or
+`.holconfig.toml` appearing beside the manifest triggers a rebuild. Watch mode
+currently requires `inotifywait` from `inotify-tools` and does not support
+`--json`, `--dry-run`, or `--repl-on-failure`.
 
 `holbuild clean MyTheory` removes project-local generated artifacts, dependency
 metadata, and checkpoints for the named theory target. This is primarily a
@@ -291,8 +295,30 @@ require it. Clean does not remove global cache entries, so use
 restoring the target from the global cache.
 
 `--source-dir PATH` or `HOLBUILD_SOURCE_DIR` chooses where to look for
-`holproject.toml`. Build output is written under `.holbuild/` in the current
+the project manifest. Build output is written under `.holbuild/` in the current
 working directory.
+
+### Manifest discovery
+
+holbuild looks for the manifest in the source directory and then in each
+parent. In each directory it selects `holbuild.toml` if present, otherwise
+`holproject.toml`, and moves to the parent only when neither exists. So the
+nearest directory with a manifest wins, and within that directory
+`holbuild.toml` wins; a nearer `holproject.toml` still beats an ancestor's
+`holbuild.toml`. Only the selected file is parsed, with the same schema
+whichever name it has. The files are never merged, and an invalid
+`holbuild.toml` is an error even when a valid `holproject.toml` sits beside it.
+
+Dependencies discovered on disk (git dependencies and `.holconfig.toml` path
+overrides) use the same preference. An explicit shim `manifest` path is used as
+declared. A nested directory containing either file is a separate project and
+is excluded from its parent's automatic source discovery.
+
+`holbuild.toml` exists so that a project can also carry a `holproject.toml`
+written for another tool: Holmake reads `holproject.toml` with its own schema,
+which holbuild's validator rejects. Such a project keeps that file for Holmake
+and adds `holbuild.toml` for holbuild. This is a compatibility measure; the
+shared-schema and workspace design questions of issue #110 are not settled by it.
 
 ## Manifest guide
 
@@ -641,7 +667,7 @@ authenticated HTTPS endpoint with trusted writers. Content hashes detect
 corruption but do not authenticate the cache publisher.
 
 For private caches, put credentials in local/CI configuration, not in
-`holproject.toml`. CLI `--remote-cache` overrides `HOLBUILD_REMOTE_CACHE_URL`,
+the project manifest. CLI `--remote-cache` overrides `HOLBUILD_REMOTE_CACHE_URL`,
 which overrides `.holconfig.toml`'s `[remote_cache].url`. `bazel-remote`
 supports HTTP Basic Auth; the safest holbuild path is to pass curl a config
 file:
@@ -753,11 +779,11 @@ may use environment variables. Local relative paths are resolved from the projec
 root; URL-like git remotes are left unchanged. Overrides apply during recursive
 dependency resolution too, so a dependency declared by another dependency can be
 supplied from disk. Overridden dependencies still need a matching `project.name`
-in their `holproject.toml`; `dependencies.hol` cannot be overridden this way.
+in their manifest; `dependencies.hol` cannot be overridden this way.
 A `from/path/manifest` shim cannot be overridden directly; override the direct
 source dependency named by `from` instead.
 
-Unknown fields in recognised `holproject.toml` and `.holconfig.toml` tables are
+Unknown fields in recognised manifest and `.holconfig.toml` tables are
 errors.
 
 ## CI guidance

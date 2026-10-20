@@ -35,6 +35,7 @@ use_hol("src/portableML/Redblackmap.sml");
 
 use "sml/sha256.sml";
 
+use "sml/spawn.sml";
 use "sml/hash.sml";
 use "sml/process_group.sml";
 use "sml/stat_cache.sml";

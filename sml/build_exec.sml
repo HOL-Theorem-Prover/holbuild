@@ -593,6 +593,15 @@ fun holpath_reference path dir name =
     SOME ("$(" ^ name ^ ")/" ^ String.extract(path, size dir + 1, NONE))
   else NONE
 
+(* The script's path in recorded theorem locations, in holpathdb form so that
+   a cached theory carries no path of the checkout that built it: HOL's own
+   sources under `$(HOLDIR)`, as HOL records them, and other packages under
+   their package name. *)
+fun located_source_name holdir node =
+  case holpath_reference (canonical_path (source_file node)) (canonical_path holdir) "HOLDIR" of
+      SOME name => name
+    | NONE => "$(" ^ package node ^ ")/" ^ HolbuildBuildPlan.relative_path node
+
 fun holpath_stage_references path =
   let
     val canonical = canonical_path path
@@ -2452,6 +2461,11 @@ fun discover_boundaries_and_terminations source_path source_text =
   HolbuildTheorySpans.scan_boundaries_and_terminations_recovering_strict source_path source_text
   handle HolbuildTheoryCheckpoints.Error msg => raise Error msg
 
+(* Context checkpoints hold the theorems saved so far, with their recorded
+   locations; this names how those were recorded, so that states saved before
+   staged scripts carried location pragmas are not resumed. *)
+val theorem_location_schema = "source_pragmas_v1"
+
 fun theorem_checkpoint_key {kind, name, safe_name, boundary, deps_key, proof_engine, prefix_hash} =
   HolbuildToolchain.hash_text
     (String.concatWith "\n"
@@ -2462,7 +2476,8 @@ fun theorem_checkpoint_key {kind, name, safe_name, boundary, deps_key, proof_eng
         "boundary=" ^ Int.toString boundary,
         "deps_key=" ^ deps_key,
         "proof_engine=" ^ proof_engine,
-        "prefix_key=" ^ prefix_hash] ^ "\n")
+        "prefix_key=" ^ prefix_hash,
+        "theorem_locations=" ^ theorem_location_schema] ^ "\n")
 
 fun declaration_checkpoint_key {name, safe_name, boundary, deps_key, proof_engine, prefix_hash} =
   HolbuildToolchain.hash_text
@@ -2473,7 +2488,8 @@ fun declaration_checkpoint_key {name, safe_name, boundary, deps_key, proof_engin
         "boundary=" ^ Int.toString boundary,
         "deps_key=" ^ deps_key,
         "proof_engine=" ^ proof_engine,
-        "prefix_key=" ^ prefix_hash] ^ "\n")
+        "prefix_key=" ^ prefix_hash,
+        "theorem_locations=" ^ theorem_location_schema] ^ "\n")
 
 fun proof_timeout_field proof_timeout = ("proof_timeout", timeout_text proof_timeout)
 
@@ -2506,7 +2522,8 @@ fun failed_prefix_ok proof_engine proof_timeout deps_key safe_name pre_hash head
      ("pre_theorem_key", pre_hash),
      ("header_key", header_hash),
      ("failure_diagnostic_key", failed_prefix_diagnostic_key proof_engine),
-     ("resume_schema_key", failed_prefix_resume_schema_key proof_engine)]
+     ("resume_schema_key", failed_prefix_resume_schema_key proof_engine),
+     ("theorem_locations", theorem_location_schema)]
 
 fun theorem_checkpoint_specs proof_engine proof_timeout project node deps_key source proof_ir_plans (boundaries : HolbuildTheoryCheckpoints.boundary list) =
   let
@@ -2784,14 +2801,19 @@ val theory_manifest_version = "1"
 fun policy_config_lines _ =
   ["theory_manifest_version=" ^ theory_manifest_version]
 
-fun plain_source_from_checkpoint source_text start_offset =
-  if start_offset <= 0 then source_text
-  else "val _ = HolbuildRuntime.restore_prover();\n" ^ String.extract(source_text, start_offset, NONE)
+fun plain_source_from_checkpoint source_name source_text start_offset =
+  String.concat
+    [if start_offset <= 0 then ""
+     else HolbuildTheoryCheckpoints.generated_code_pragma source_text ^
+          "val _ = HolbuildRuntime.restore_prover();\n",
+     HolbuildTheoryCheckpoints.file_pragma source_name,
+     HolbuildTheoryCheckpoints.source_line_pragma source_text start_offset,
+     String.extract(source_text, Int.max(0, start_offset), NONE)]
 
-fun instrumented_source policy timeout_marker plan_only_marker source_text start_offset checkpoints declaration_checkpoints terminations =
+fun instrumented_source policy timeout_marker plan_only_marker source_name source_text start_offset checkpoints declaration_checkpoints terminations =
   if proof_steps_enabled policy then
     HolbuildTheoryCheckpoints.instrument
-      {source = source_text, start_offset = start_offset, checkpoints = checkpoints,
+      {source = source_text, source_name = source_name, start_offset = start_offset, checkpoints = checkpoints,
        declaration_checkpoints = if checkpoint_enabled policy then declaration_checkpoints else [],
        terminations = terminations,
        save_checkpoints = checkpoint_enabled policy,
@@ -2801,7 +2823,7 @@ fun instrumented_source policy timeout_marker plan_only_marker source_text start
        trace_all = trace_steps policy,
        plan_only_marker = plan_only_marker,
        new_ir = proof_ir_enabled policy}
-  else plain_source_from_checkpoint source_text start_offset
+  else plain_source_from_checkpoint source_name source_text start_offset
 
 fun replay_candidate policy project node theorem_checkpoints declaration_checkpoints =
   best_replay_candidate (tactic_timeout policy) project node theorem_checkpoints declaration_checkpoints
@@ -2832,7 +2854,7 @@ fun failed_prefix_resume_message node source_text checkpoint step_count =
     ["from: failed-prefix checkpoint in " ^ #safe_name checkpoint,
      "restoring proof-ir prefix with " ^ Int.toString step_count ^ " successful leaf steps"]
 
-fun failed_prefix_resume_source policy timeout_marker plan_only_marker source checkpoints declaration_checkpoints terminations checkpoint metadata_text =
+fun failed_prefix_resume_source policy timeout_marker plan_only_marker source_name source checkpoints declaration_checkpoints terminations checkpoint metadata_text =
   let
     val runtime_config =
       {checkpoint_enabled = checkpoint_enabled policy,
@@ -2855,13 +2877,16 @@ fun failed_prefix_resume_source policy timeout_marker plan_only_marker source ch
          " " ^ HolbuildToolchain.sml_string (#failed_prefix_ok checkpoint)]
     val theorem_save_line =
       String.concat
-        ["val ", theorem_binding, " = HolbuildRuntime.save_thm(",
+        ["val ", theorem_binding, " = HolbuildRuntime.save_thm_at (",
+         HolbuildToolchain.sml_string source_name, ", ",
+         Int.toString (HolbuildTheoryCheckpoints.line_at source (#theorem_start checkpoint)), ") (",
          HolbuildToolchain.sml_string (#name checkpoint), ", ",
          finish_failed_prefix_call,
          ");\n"]
     val resume_replay_block =
       String.concat
-        [source_slice (#theorem_start checkpoint) (#tactic_start checkpoint),
+        [HolbuildTheoryCheckpoints.source_line_pragma source (#theorem_start checkpoint),
+         source_slice (#theorem_start checkpoint) (#tactic_start checkpoint),
          "(ACCEPT_TAC (", finish_failed_prefix_call, "))",
          source_slice (#tactic_end checkpoint) (#boundary checkpoint),
          "\n"]
@@ -2874,6 +2899,7 @@ fun failed_prefix_resume_source policy timeout_marker plan_only_marker source ch
     val suffix =
       HolbuildTheoryCheckpoints.instrument
         {source = source,
+         source_name = source_name,
          start_offset = #boundary checkpoint,
          checkpoints = checkpoints,
          declaration_checkpoints = if checkpoint_enabled policy then declaration_checkpoints else [],
@@ -2886,7 +2912,9 @@ fun failed_prefix_resume_source policy timeout_marker plan_only_marker source ch
          plan_only_marker = plan_only_marker,
          new_ir = proof_ir_enabled policy}
   in
-    prelude ^ replay_block ^ suffix
+    String.concat
+      [HolbuildTheoryCheckpoints.generated_code_pragma source, prelude,
+       HolbuildTheoryCheckpoints.file_pragma source_name, replay_block, suffix]
   end
 
 datatype failure_repl_checkpoint =
@@ -2946,10 +2974,10 @@ fun run_failure_repl tc policy theorem_checkpoints failure_checkpoints deps_load
             ignore (HolbuildToolchain.run_interactive argv)
           end
 
-fun write_theory_script policy project base_context plan keys input_key toolchain_key node source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
+fun write_theory_script policy project base_context plan keys input_key toolchain_key node source_name source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
   if not (checkpoint_enabled policy) then
     (write_plain_preload plan node preload;
-     write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_text 0 checkpoints [] terminations);
+     write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints [] terminations);
      {context = base_context, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
   else
     let
@@ -2963,7 +2991,7 @@ fun write_theory_script policy project base_context plan keys input_key toolchai
          List.app (fn {context_path, ...} => ensure_parent context_path) declaration_checkpoints)
       fun run_from_deps_checkpoint () =
         (ensure_source_checkpoint_parents ();
-         write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_text 0 checkpoints declaration_checkpoints terminations);
+         write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
          deps_loaded_resume_message node;
          {context = HolState deps_loaded, files = [staged_script], failure_checkpoints = [deps_loaded], failed_prefix_context = NONE})
       fun run_from_fresh_preload () =
@@ -2971,13 +2999,13 @@ fun write_theory_script policy project base_context plan keys input_key toolchai
          remove_declaration_checkpoints_for_deps project node deps_key;
          ensure_source_checkpoint_parents ();
          write_preload plan node deps_loaded deps_ok preload;
-         write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_text 0 checkpoints declaration_checkpoints terminations);
+         write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
          {context = base_context, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
       fun run_from_failed_prefix {checkpoint, step_count, metadata_text} =
         let
           val path = #failed_prefix_path checkpoint
           val _ = ensure_source_checkpoint_parents ()
-          val _ = write_text staged_script (failed_prefix_resume_source policy timeout_marker plan_only_marker source_text checkpoints declaration_checkpoints terminations checkpoint metadata_text)
+          val _ = write_text staged_script (failed_prefix_resume_source policy timeout_marker plan_only_marker source_name source_text checkpoints declaration_checkpoints terminations checkpoint metadata_text)
           val _ = failed_prefix_resume_message node source_text checkpoint step_count
         in
           {context = HolState path, files = [staged_script], failure_checkpoints = [path, deps_loaded], failed_prefix_context = SOME (path, step_count)}
@@ -2985,7 +3013,7 @@ fun write_theory_script policy project base_context plan keys input_key toolchai
       fun run_from_replay {boundary, path, safe_name, kind, failure_checkpoints} =
         let
           val _ = ensure_source_checkpoint_parents ()
-          val _ = write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_text boundary checkpoints declaration_checkpoints terminations)
+          val _ = write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_name source_text boundary checkpoints declaration_checkpoints terminations)
           val _ = source_context_resume_message node source_text kind safe_name boundary
         in
           {context = HolState path, files = [staged_script], failure_checkpoints = failure_checkpoints @ [deps_loaded], failed_prefix_context = NONE}
@@ -3064,7 +3092,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
     val _ = remove_file plan_only_marker
     val _ = List.app (ensure_parent o #2) staged_extra_outputs
     val run_spec = write_theory_script policy project base_context plan keys input_key toolchain_key node
-                                    source_text theorem_checkpoints declaration_checkpoints termination_diagnostics staged_script preload timeout_marker
+                                    (located_source_name (#holdir tc) node) source_text theorem_checkpoints declaration_checkpoints termination_diagnostics staged_script preload timeout_marker
                                     (if execution_plan_only policy then SOME plan_only_marker else NONE)
     fun tactic_timeout_error () =
       let
