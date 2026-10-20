@@ -142,27 +142,6 @@ fun marker_line_after marker text =
       NONE => NONE
     | SOME i => parse_decimal_prefix text (i + size marker)
 
-fun trim text =
-  let
-    val n = size text
-    fun left i = if i >= n orelse not (Char.isSpace (String.sub(text, i))) then i else left (i + 1)
-    fun right i = if i < 0 orelse not (Char.isSpace (String.sub(text, i))) then i else right (i - 1)
-    val l = left 0
-    val r = right (n - 1)
-  in
-    if r < l then "" else String.substring(text, l, r - l + 1)
-  end
-
-fun find_line_number text wanted =
-  let
-    val needle = trim wanted
-    fun loop _ [] = NONE
-      | loop n (line :: rest) =
-          if needle <> "" andalso trim line = needle then SOME n else loop (n + 1) rest
-  in
-    loop 1 (source_lines text)
-  end
-
 fun split_first_char ch text =
   case find_substring (String.str ch) text of
       NONE => NONE
@@ -185,23 +164,27 @@ fun parse_static_error_location line =
             | SOME (path, rest) => loop path rest (Int.fromString rest)
         end
 
-fun source_line_from_staged_error source_text block =
+(* Staged scripts carry location pragmas, so Poly reports lines of the source
+   script itself; errors in other files (the preload) have no source line. *)
+fun source_line_from_static_error source_path source_text block =
   case block of
       [] => NONE
     | first :: _ =>
         case parse_static_error_location first of
             NONE => NONE
           | SOME {path, line} =>
-              (find_line_number source_text (nth_line (source_lines (read_text path)) line)
-               handle _ => NONE)
+              if OS.Path.file path = OS.Path.file source_path andalso
+                 1 <= line andalso line <= length (source_lines source_text)
+              then SOME line
+              else NONE
 
 fun source_line_from_loc_marker source_text block =
   case marker_line_after "(*#loc " (String.concatWith "\n" block) of
       SOME line => if line <= length (source_lines source_text) then SOME line else NONE
     | NONE => NONE
 
-fun static_error_source_line source_text block =
-  case source_line_from_staged_error source_text block of
+fun static_error_source_line source_path source_text block =
+  case source_line_from_static_error source_path source_text block of
       SOME line => SOME line
     | NONE => source_line_from_loc_marker source_text block
 
@@ -211,7 +194,7 @@ fun static_error_summary source_path source_text lines =
     | SOME block =>
         let
           val source_context =
-            case static_error_source_line source_text block of
+            case static_error_source_line source_path source_text block of
                 NONE => ""
               | SOME line =>
                   String.concat
