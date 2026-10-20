@@ -266,13 +266,56 @@ fun runtime_reinstall_prelude {checkpoint_enabled, tactic_timeout, timeout_marke
     runtime_lines install
   end
 
+(* HOL's source parser reads top-level `#(FILE="...")` and `#(LINE=...)`
+   declarations as location pragmas.  Staged scripts use them so that the
+   locations HOL records for theorems name the source script and its lines
+   rather than the instrumented copy. *)
+fun file_pragma source_name =
+  "#(FILE=" ^ HolbuildToolchain.sml_string source_name ^ ")\n"
+
+type position = {offset : int, line : int, col : int}
+
+val start_position : position = {offset = 0, line = 1, col = 1}
+
+(* Advance from an earlier position, so that a forward walk over the source
+   stays linear in its size. *)
+fun advance_position source (position as {offset, ...} : position) target =
+  if target < offset then advance_position source start_position target
+  else
+    let
+      fun loop i line col =
+        if i >= target then {offset = target, line = line, col = col}
+        else if String.sub(source, i) = #"\n" then loop (i + 1) (line + 1) 1
+        else loop (i + 1) line (col + 1)
+    in
+      loop offset (#line position) (#col position)
+    end
+
+(* Emitted at the start of an output line: the text after the pragma starts
+   at line and col of the source.  The pragma takes a line of its own, since
+   HOL recognises declarations such as `Theory` only at the start of a line;
+   for source line 1 that means claiming line 0 for the pragma. *)
+fun line_pragma ({line, col, ...} : position) =
+  "#(LINE=" ^ Int.toString (line - 1) ^ ")\n" ^ CharVector.tabulate(col - 1, fn _ => #" ")
+
+fun source_line_pragma source offset =
+  line_pragma (advance_position source start_position offset)
+
+fun line_at source offset = #line (advance_position source start_position offset)
+
+(* Placed before holbuild's own code at the top of a staged script: it numbers
+   that code past the end of the source, so an error in it is not reported at
+   a line of the source. *)
+fun generated_code_pragma source =
+  "#(LINE=" ^ Int.toString (line_at source (size source) + 1) ^ ")\n"
+
 datatype instrument_event =
   CheckpointEvent of checkpoint
 | DeclarationCheckpointEvent of declaration_checkpoint
 | TerminationEvent of termination
 
-fun instrument ({source, start_offset, checkpoints, declaration_checkpoints, terminations, save_checkpoints, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} :
-                {source : string, start_offset : int, checkpoints : checkpoint list,
+fun instrument ({source, source_name, start_offset, checkpoints, declaration_checkpoints, terminations, save_checkpoints, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} :
+                {source : string, source_name : string, start_offset : int, checkpoints : checkpoint list,
                  declaration_checkpoints : declaration_checkpoint list,
                  terminations : termination list, save_checkpoints : bool,
                  tactic_timeout : real option, timeout_marker : string option,
@@ -313,24 +356,36 @@ fun instrument ({source, start_offset, checkpoints, declaration_checkpoints, ter
       declaration_checkpoint_runtime_prelude
         (if null active_checkpoints andalso null active_terminations then active_declaration_checkpoints else []) ^
       termination_runtime_prelude active_terminations
+    val position = ref start_position
+    fun resume_at offset =
+      (position := advance_position source (!position) offset;
+       line_pragma (!position))
     fun loop pos events acc =
       case events of
           [] => String.concat (rev (source_slice pos n :: acc))
         | CheckpointEvent (checkpoint as {theorem_start, boundary, ...}) :: rest =>
             if boundary <= start_offset then loop pos rest acc
             else
-              loop boundary rest
-                ("val _ = holbuild_save_theorem_context();\n" ::
-                 "\n" ::
-                 source_slice theorem_start boundary ::
-                 begin_theorem_line checkpoint ::
-                 source_slice pos theorem_start ::
-                 acc)
+              let
+                val theorem_pragma = resume_at theorem_start
+                val boundary_pragma = resume_at boundary
+              in
+                loop boundary rest
+                  (boundary_pragma ::
+                   "val _ = holbuild_save_theorem_context();\n" ::
+                   "\n" ::
+                   source_slice theorem_start boundary ::
+                   theorem_pragma ::
+                   begin_theorem_line checkpoint ::
+                   source_slice pos theorem_start ::
+                   acc)
+              end
         | DeclarationCheckpointEvent (declaration_checkpoint as {boundary, ...}) :: rest =>
             if boundary <= start_offset orelse boundary < pos then loop pos rest acc
             else
               loop boundary rest
-                (save_declaration_context_line declaration_checkpoint ::
+                (resume_at boundary ::
+                 save_declaration_context_line declaration_checkpoint ::
                  source_slice pos boundary ::
                  acc)
         | TerminationEvent (termination as {definition_start, tactic_start, tactic_end, ...}) :: rest =>
@@ -341,11 +396,15 @@ fun instrument ({source, start_offset, checkpoints, declaration_checkpoints, ter
                  source_slice tactic_start tactic_end ::
                  termination_tactic_prefix termination ::
                  source_slice definition_start tactic_start ::
+                 resume_at definition_start ::
                  begin_termination_line termination ::
                  source_slice pos definition_start ::
                  acc)
+    val prelude_text = prelude ()
+    val start_pragma = resume_at start_offset
   in
-    prelude () ^ loop start_offset (sorted_events ()) []
+    String.concat [generated_code_pragma source, prelude_text, file_pragma source_name, start_pragma,
+                   loop start_offset (sorted_events ()) []]
   end
 
 end
