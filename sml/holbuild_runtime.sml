@@ -5,7 +5,9 @@ struct
   val print = TextIO.print
   val export_theory = Theory.export_theory
   val restore_prover = Tactical.restore_prover
-  val save_thm = Theory.save_thm
+  fun save_thm_at (file, line) (name, th) =
+    Theory.gen_save_thm {name = name, private = false, thm = th,
+                         loc = DB_dtype.mkloc (file, line, true)}
 
   fun save_hierarchy_depth () = List.length (PolyML.SaveState.showHierarchy())
 
