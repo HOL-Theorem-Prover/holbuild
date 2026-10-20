@@ -67,6 +67,7 @@ use_root "vendor/sml-sha256/lib/stream.sig";
 use_root "vendor/sml-sha256/lib/stream.sml";
 use_root "vendor/sml-sha256/lib/sha256.sig";
 use_root "vendor/sml-sha256/lib/sha256.sml";
+use_root "sml/spawn.sml";
 use_root "sml/hash.sml";
 use_root "sml/proof_ir_types.sml";
 use_root "sml/proof_ir.sml";
