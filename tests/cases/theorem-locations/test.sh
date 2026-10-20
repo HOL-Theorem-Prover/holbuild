@@ -32,7 +32,7 @@ TOML
   # the pragma after that QED places them.
   cat > "$project/src/locScript.sml" <<'SML'
 Theory loc
-Ancestors arithmetic
+Ancestors arithmetic mergesort
 
 Definition double_def:
   double n = n + n
@@ -80,6 +80,12 @@ fun show n =
 val _ = List.app show
   ["double_def", "double_0", "triple_def", "double_0_again", "countdown_def",
    "double_1", "double_1_again", "double_2"];
+(* mergesort is a HOL library theory that holbuild stages itself *)
+val _ =
+  case DB.lookup {Thy = "mergesort", Name = "stable_def"} of
+      SOME (_, {loc = DB.Located {scriptpath, linenum, ...}, ...}) =>
+        print ("hol-location stable_def " ^ scriptpath ^ ":" ^ Int.toString linenum ^ "\n")
+    | _ => print "hol-location stable_def unknown\n";
 SML
 }
 
@@ -108,6 +114,9 @@ location double_2 \$(locs)/src/locScript.sml:$double_2_line
 TXT
 }
 
+stable_def_line=$(grep -n '^Definition stable_def:' "$HOLDIR/src/sort/mergesortScript.sml" | cut -d: -f1)
+[[ -n "$stable_def_line" ]] || { echo "stable_def not found in $HOLDIR/src/sort/mergesortScript.sml" >&2; exit 1; }
+
 check_locations() {
   local project=$1
   local double_2_line=$2
@@ -118,6 +127,7 @@ check_locations() {
     echo "$label: theorem locations differ from the source (log: $log)" >&2
     exit 1
   fi
+  require_grep "^hol-location stable_def \$(HOLDIR)/src/sort/mergesortScript.sml:$stable_def_line\$" "$log"
 }
 
 double_2_proof=$'Theorem double_2:\n  double 2 = 4\nProof\n  simp[double_def]\nQED'
