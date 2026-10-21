@@ -33,17 +33,7 @@ use_hol("src/portableML/Redblackset.sml");
 use_hol("src/portableML/Redblackmap.sig");
 use_hol("src/portableML/Redblackmap.sml");
 
-use "vendor/sml-sha256/lib/from-string.sig";
-use "vendor/sml-sha256/lib/from-string.sml";
-use "vendor/sml-sha256/lib/bytestring.sig";
-use "vendor/sml-sha256/lib/bytestring.sml";
-use "vendor/sml-sha256/lib/convert-word.sml";
-use "vendor/sml-sha256/lib/susp.sig";
-use "vendor/sml-sha256/lib/susp.sml";
-use "vendor/sml-sha256/lib/stream.sig";
-use "vendor/sml-sha256/lib/stream.sml";
-use "vendor/sml-sha256/lib/sha256.sig";
-use "vendor/sml-sha256/lib/sha256.sml";
+use "sml/sha256.sml";
 
 use "sml/spawn.sml";
 use "sml/hash.sml";

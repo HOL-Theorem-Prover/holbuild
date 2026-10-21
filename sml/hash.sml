@@ -73,7 +73,7 @@ fun read_binary_all path =
   end
 
 val string_sha1 = HolbuildStringHash.string_sha1
-fun string_sha256 text = SHA256.hashStringHex text
+fun string_sha256 text = HolbuildSha256.string_hex text
 
 fun string_sha256_large text =
   if size text < small_file_limit then string_sha256 text
