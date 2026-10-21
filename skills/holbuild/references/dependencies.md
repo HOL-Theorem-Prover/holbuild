@@ -24,7 +24,7 @@ The `hol` dependency is special:
 
 - it must point at the canonical HOL repository
 - it uses an exact commit hash, not a branch/tag/range
-- upstream HOL does not need a `holproject.toml`; holbuild uses its built-in HOL manifest for package metadata
+- upstream HOL does not need a manifest; holbuild uses its built-in HOL manifest for package metadata
 - built HOL trees are shared under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`
 - `${HOLBUILD_POLY:-poly} --script tools/smart-configure.sml` and `bin/build --no-helpdocs` are used to build a missing shared entry
 - dirty, broken, or incomplete shared HOL entries are rejected until removed manually
@@ -51,7 +51,7 @@ and its package artifacts live under:
 .holbuild/packages/foo
 ```
 
-Git dependencies must have their own `holproject.toml`; a `manifest` field is not allowed on a direct git dependency.
+Git dependencies must have their own manifest (`holbuild.toml` if present, else `holproject.toml`); a `manifest` field is not allowed on a direct git dependency.
 
 ## From dependencies and shim manifests
 
@@ -95,7 +95,7 @@ holbuild no longer supports:
 
 ## Dependency resolution flow
 
-1. Parse the root `holproject.toml` and local `.holconfig.toml` build settings.
+1. Parse the root manifest (`holbuild.toml` if present, else `holproject.toml`) and local `.holconfig.toml` build settings.
 2. Validate that the resolved graph has exactly one `hol` dependency.
 3. Materialize direct git dependencies under `.holbuild/src/<package>`; `hol` is resolved to the shared global HOL cache path.
 4. Resolve `from/path/manifest` dependencies to subtrees of direct git dependencies.

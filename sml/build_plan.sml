@@ -254,10 +254,10 @@ fun selected_graph_id ({selected_graph_id, ...} : t) = selected_graph_id
 fun selected_plan_id ({selected_plan_id, ...} : t) = selected_plan_id
 fun resolved_plan_id ({resolved_plan_id, ...} : t) = resolved_plan_id
 
-fun indexed_key_id index node_key =
+fun find_key_id index node_key =
   let
     fun search lo hi =
-      if lo > hi then raise Error ("internal missing node key: " ^ node_key)
+      if lo > hi then NONE
       else
         let
           val mid = (lo + hi) div 2
@@ -266,11 +266,16 @@ fun indexed_key_id index node_key =
           case String.compare(node_key, candidate) of
               LESS => search lo (mid - 1)
             | GREATER => search (mid + 1) hi
-            | EQUAL => id
+            | EQUAL => SOME id
         end
   in
     search 0 (Vector.length index - 1)
   end
+
+fun indexed_key_id index node_key =
+  case find_key_id index node_key of
+      SOME id => id
+    | NONE => raise Error ("internal missing node key: " ^ node_key)
 
 datatype target_selection = AllTargets | SelectedTargets of string list
 
@@ -377,9 +382,6 @@ fun graph_values index node =
         end
   in search 0 (Vector.length index - 1) end
 
-fun node_with_key nodes wanted =
-  List.find (fn node => key node = wanted) nodes
-
 fun symbolic_dependencies plan node =
   graph_values (#symbolic (dependency_graph plan)) node
 fun resolved_dependency_edges plan node =
@@ -470,13 +472,14 @@ fun bootstrap_topo_sort components analysis lookup nodes roots =
 fun topo_sort_resolved nodes roots (graph : resolved_dependency_graph) =
   let
     val key_index = build_key_index nodes
+    val node_index = Vector.fromList nodes
     val visited = Array.array(length nodes, false)
     val active = Array.array(length nodes, false)
     fun node_id node = indexed_key_id key_index (key node)
     fun dependencies node =
       map (fn (edge : resolved_dependency_edge) =>
-        case node_with_key nodes (#to_node edge) of
-            SOME target => target
+        case find_key_id key_index (#to_node edge) of
+            SOME id => Vector.sub(node_index, id)
           | NONE => raise Error ("internal resolved dependency target is missing: " ^ #to_node edge))
         (graph_values (#resolved graph) node)
     fun visit path node order =
@@ -685,8 +688,13 @@ fun build_resolved_dependency_graph components analysis lookup selected =
     val external = dependency_pairs selected external_for
     val unresolved = dependency_pairs selected unresolved_for
     val all_edges = List.concat (map resolved_for selected)
-    fun incoming node =
-      List.filter (fn (edge : resolved_dependency_edge) => #to_node edge = key node) all_edges
+    val incoming_index =
+      List.foldr
+        (fn (edge : resolved_dependency_edge, index) =>
+          Binarymap.insert(index, #to_node edge,
+            edge :: getOpt(Binarymap.peek(index, #to_node edge), [])))
+        (Binarymap.mkDict String.compare) all_edges
+    fun incoming node = getOpt(Binarymap.peek(incoming_index, key node), [])
     val reverse = dependency_pairs selected incoming
   in
     {symbolic = symbolic, resolved = resolved, external = external,
@@ -1070,11 +1078,25 @@ fun emit_external_timing (timing : external_timing) =
     emit "build.keys.external.lib_artifact" (#lib_artifact_time timing) (#lib_artifact_count timing)
   end
 
-fun external_source_deps_with timing path =
+(* Planning reads the same HOL sources while prefetching and again while
+   keying, so one invocation hashes each external source file once. *)
+fun new_external_source_hashes () =
+  let
+    val memo = ref (Binarymap.mkDict String.compare)
+  in
+    fn path =>
+      case Binarymap.peek(!memo, path) of
+          SOME hash => hash
+        | NONE =>
+            let val hash = HolbuildHash.file_sha1 path
+            in memo := Binarymap.insert(!memo, path, hash); hash end
+  end
+
+fun external_source_deps_with timing source_hash path =
   let
     val source_hash =
       measure_external timing (#source_hash_time timing) (#source_hash_count timing)
-        (fn () => HolbuildHash.file_sha1 path)
+        (fn () => source_hash path)
   in
     measure_external timing (#dep_cache_time timing) (#dep_cache_count timing)
       (fn () => HolbuildDependencies.extract_global_cached_with_hash
@@ -1082,10 +1104,10 @@ fun external_source_deps_with timing path =
   end
   handle HolbuildDependencies.Error msg => raise Error msg
 
-fun external_dependency_names_with timing sources =
+fun external_dependency_names_with timing source_hash sources =
   let
     fun deps_for_source path =
-      let val deps = external_source_deps_with timing path
+      let val deps = external_source_deps_with timing source_hash path
       in #loads deps @ #holdep_mentions deps end
   in
     unique_strings (List.concat (map deps_for_source sources))
@@ -1104,17 +1126,22 @@ fun external_sources_for_name dirs name =
           List.filter readable (external_source_candidates stem name)
         end
 
-fun prefetch_external_dependency_sources plan nodes =
+fun prefetch_external_dependency_sources source_hash plan nodes =
   let
     fun item_id (dirs, name) = String.concatWith "\030" dirs ^ "\029" ^ name
-    fun seen item seen_ids = member (item_id item) seen_ids
-    fun add_unseen (item, items) =
-      if List.exists (fn existing => item_id existing = item_id item) items then items else item :: items
+    fun seen item seen_ids = Binaryset.member (seen_ids, item_id item)
+    fun add_unseen (item, (ids, items)) =
+      let val id = item_id item
+      in
+        if Binaryset.member (ids, id) then (ids, items)
+        else (Binaryset.add (ids, id), item :: items)
+      end
+    fun unseen items = #2 (List.foldl add_unseen (Binaryset.empty String.compare, []) items)
     fun source_requests paths =
-      map (fn path => {source_path = path, source_hash = HolbuildHash.file_sha1 path}) paths
+      map (fn path => {source_path = path, source_hash = source_hash path}) paths
     fun deps_for_path path =
-      let val source_hash = HolbuildHash.file_sha1 path
-      in HolbuildDependencies.extract_global_cached_with_hash {source_path = path, source_hash = source_hash} end
+      HolbuildDependencies.extract_global_cached_with_hash
+        {source_path = path, source_hash = source_hash path}
     fun deps_names deps = #loads deps @ #holdep_mentions deps
     fun names_for_sources paths = unique_strings (List.concat (map (deps_names o deps_for_path) paths))
     fun follow_names dirs names =
@@ -1130,25 +1157,22 @@ fun prefetch_external_dependency_sources plan nodes =
         | _ =>
             let
               val fresh = List.filter (fn item => not (seen item seen_ids)) pending
-              val seen_ids' = List.foldl (fn (item, acc) => item_id item :: acc) seen_ids fresh
+              val seen_ids' = List.foldl (fn (item, acc) => Binaryset.add (acc, item_id item)) seen_ids fresh
               val paths = unique_strings (List.concat (map (fn (dirs, name) => external_sources_for_name dirs name) fresh))
               val _ = HolbuildDependencies.prefetch_global_cached_with_hash (source_requests paths)
               val next =
-                List.foldl
-                  (fn ((dirs, name), acc) =>
-                      let
-                        val source_paths = external_sources_for_name dirs name
-                        val names = names_for_sources source_paths
-                      in
-                        List.foldl add_unseen acc (follow_names dirs names)
-                      end)
-                  [] fresh
+                unseen
+                  (List.concat
+                     (map (fn (dirs, name) =>
+                             follow_names dirs
+                               (names_for_sources (external_sources_for_name dirs name)))
+                          fresh))
             in
               loop seen_ids' next
             end
-    val initial = List.foldl add_unseen [] (List.concat (map initial_items_for_node nodes))
+    val initial = unseen (List.concat (map initial_items_for_node nodes))
   in
-    loop [] initial
+    loop (Binaryset.empty String.compare) initial
   end
   handle HolbuildDependencies.Error msg => raise Error msg
 
@@ -1159,11 +1183,11 @@ fun prefetch_external_dependency_sources plan nodes =
    the compiled artifact hash is the correctness fallback, with source-derived
    load deps included to track theories loaded by that artifact.  If an object is
    not in sigobj, treat it as part of the hol.state bootstrap boundary. *)
-fun external_key_lookup_with_timing timing toolchain_key =
+fun external_key_lookup_with_timing timing source_hash toolchain_key =
   let
-    val memo = ref ([] : (string * string) list)
-    fun memoized id = Option.map #2 (List.find (fn (key, _) => key = id) (!memo))
-    fun remember id value = (memo := (id, value) :: !memo; value)
+    val memo = ref (Binarymap.mkDict String.compare)
+    fun memoized id = Binarymap.peek(!memo, id)
+    fun remember id value = (memo := Binarymap.insert(!memo, id, value); value)
     fun in_stack id stack = List.exists (fn active => active = id) stack
     fun cachekey_line cachekey =
       "cachekey=" ^ String.translate (fn #"\n" => " " | c => str c) (read_text cachekey)
@@ -1183,7 +1207,7 @@ fun external_key_lookup_with_timing timing toolchain_key =
           measure_external timing (#lib_artifact_time timing) (#lib_artifact_count timing)
             (fn () => artifact_line artifact)
       in
-        artifact_key :: dependency_lines dirs stack (external_dependency_names_with timing sources)
+        artifact_key :: dependency_lines dirs stack (external_dependency_names_with timing source_hash sources)
       end
     and compute dirs stack kind name =
       let val id = external_memo_id dirs kind name
@@ -1224,17 +1248,14 @@ fun external_key_lookup_with_timing timing toolchain_key =
     fn node => fn kind => fn name => compute (external_dirs_of node) [] kind name
   end
 
-fun external_key_lookup toolchain_key =
-  external_key_lookup_with_timing (new_external_timing ()) toolchain_key
-
 fun bool_text true = "true"
   | bool_text false = "false"
 
 fun hash_text text = HolbuildHash.string_sha1 text
 
 fun lookup_key keys dep =
-  case List.find (fn (dep_key, _) => dep_key = key dep) keys of
-      SOME (_, input_key) => input_key
+  case Binarymap.peek(keys, key dep) of
+      SOME input_key => input_key
     | NONE => raise Error ("missing action key for dependency: " ^ logical_name dep)
 
 fun action_text_with plan config_lines_for_node toolchain_key external_key keys node =
@@ -1299,19 +1320,21 @@ fun action_text_with plan config_lines_for_node toolchain_key external_key keys 
   end
 
 fun add_input_key_with plan config_lines_for_node toolchain_key external_key (node, keys) =
-  (key node, hash_text (action_text_with plan config_lines_for_node toolchain_key external_key keys node)) :: keys
+  Binarymap.insert(keys, key node,
+                   hash_text (action_text_with plan config_lines_for_node toolchain_key external_key keys node))
 
 fun compute_input_keys_with plan config_lines_for_node toolchain_key =
   let
     val nodes = selected_nodes plan
-    val _ = prefetch_external_dependency_sources plan nodes
+    val source_hash = new_external_source_hashes ()
+    val _ = prefetch_external_dependency_sources source_hash plan nodes
     val external_timing = new_external_timing ()
-    val external_key = external_key_lookup_with_timing external_timing toolchain_key
+    val external_key = external_key_lookup_with_timing external_timing source_hash toolchain_key
     val keys =
       List.foldl
         (fn (node, keys) =>
             add_input_key_with plan config_lines_for_node toolchain_key external_key (node, keys))
-        [] nodes
+        (Binarymap.mkDict String.compare) nodes
     val _ = emit_external_timing external_timing
   in
     keys

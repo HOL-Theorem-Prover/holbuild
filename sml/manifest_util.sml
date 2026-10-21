@@ -6,6 +6,22 @@ fun die msg = raise Error msg
 fun warn msg = TextIO.output(TextIO.stdErr, "holbuild: warning: " ^ msg ^ "\n")
 
 structure Path = OS.Path
+structure FS = OS.FileSys
+
+(* Manifest filenames in order of preference within one directory.
+   `holbuild.toml` lets a project also carry a `holproject.toml` written for
+   another tool (Holmake's schema differs); only the selected file is parsed. *)
+val manifest_filenames = ["holbuild.toml", "holproject.toml"]
+val manifest_filenames_text = String.concatWith " or " manifest_filenames
+
+(* Existence, not readability: an unreadable or dangling holbuild.toml must
+   be selected and fail loudly, not silently yield to its neighbour. *)
+fun exists path =
+  (FS.access(path, []) orelse FS.isLink path) handle OS.SysErr _ => false
+
+(* The manifest to use for the project rooted at dir, if it has one. *)
+fun select_manifest_in dir =
+  List.find exists (map (fn name => Path.concat(dir, name)) manifest_filenames)
 
 fun lookup table key = TOML.lookupInTable table key
 fun key_text key = String.concatWith "." key
@@ -70,14 +86,13 @@ fun positive_int_field context n =
     IntInf.toInt n handle Overflow => die (context ^ " is too large")
   else die (context ^ " must be a positive integer")
 
-fun string_array_value value =
-  case value of
-      TOML.ARRAY values =>
-        let
-          fun one (TOML.STRING s) = s
-            | one _ = die "expected string array in holproject.toml"
-        in SOME (map one values) end
-    | _ => NONE
+fun string_value (TOML.STRING s) = SOME s
+  | string_value _ = NONE
+
+fun string_array_value (TOML.ARRAY values) =
+      let val strings = List.mapPartial string_value values
+      in if length strings = length values then SOME strings else NONE end
+  | string_array_value _ = NONE
 
 fun string_array_at table key =
   case lookup table key of

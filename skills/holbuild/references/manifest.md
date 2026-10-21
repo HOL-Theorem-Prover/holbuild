@@ -1,4 +1,7 @@
-# holproject.toml manifest
+# Project manifest: holproject.toml or holbuild.toml
+
+Per directory, `holbuild.toml` is used when present, otherwise `holproject.toml`
+(so a Holmake-schema `holproject.toml` can sit beside it); the same schema either way.
 
 ## Schema
 
@@ -91,7 +94,7 @@ Supported dependency forms:
    git = "https://github.com/acme/foo"
    rev = "0123456789abcdef0123456789abcdef01234567"
    ```
-   Direct git dependencies must have their own `holproject.toml`; `manifest` is not allowed here.
+   Direct git dependencies must have their own manifest (`holbuild.toml` or `holproject.toml`); `manifest` is not allowed here.
 
 2. Subtree/shim dependencies:
    ```toml

@@ -297,11 +297,12 @@ fun run_analyser_batch analyser files =
        map file_line files @
        [HolbuildAnalysisProtocol.join ["end"]]) ^ "\n"
     val _ = write_file req request
-    val status = OS.Process.system (HolbuildHash.quote analyser ^ " --request " ^ HolbuildHash.quote req ^
-                                    " --response " ^ HolbuildHash.quote resp)
+    val run = HolbuildSpawn.run {program = analyser, args = ["--request", req, "--response", resp],
+                                 stderr = HolbuildSpawn.Inherit}
+    val _ = print (#output run)
     val _ = OS.FileSys.remove req handle OS.SysErr _ => ()
   in
-    if OS.Process.isSuccess status then
+    if HolbuildSpawn.succeeded run then
       let val deps = parse_analyser_response resp files
           val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
       in deps end
