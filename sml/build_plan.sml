@@ -547,10 +547,9 @@ fun make_node external_dirs source =
   {source = source, external_dirs = external_dirs}
 
 fun bootstrap_prefetch_nodes analysis nodes =
-  HolbuildDependencies.prefetch_cached_with_hash
-    (map (fn node => {cache_path = dependency_cache_path (source_of node),
-                     source_path = #source_path (source_of node),
-                     source_hash = source_hash_of analysis node}) nodes)
+  HolbuildComponentProvider.prefetch analysis
+    (map (fn node => {source = source_of node,
+                      cache_path = dependency_cache_path (source_of node)}) nodes)
 
 (* Dependency extraction is relatively expensive, so batch it one reachable
    frontier at a time instead of prefetching every source in the universe.

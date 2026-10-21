@@ -105,6 +105,53 @@ fun file_sha1 path =
       | NONE => SHA1_ML.sha1_file {filename = path}
   else SHA1_ML.sha1_file {filename = path}
 
+(* Spawning one process per file, or hashing in SML, costs far more than the
+   hashing itself, so hash a batch of files with one sha1sum per chunk.  Any
+   chunk whose output doesn't give one digest per file is hashed file by file. *)
+fun files_sha1 paths =
+  let
+    val chunk_size = 256
+    fun digest line =
+      let val hex = if String.isPrefix "\\" line then String.extract(line, 1, NONE) else line
+      in
+        if size hex >= 40 andalso valid_sha1 (String.substring(hex, 0, 40))
+        then SOME (String.map Char.toLower (String.substring(hex, 0, 40)))
+        else NONE
+      end
+    fun external chunk =
+      let
+        val out = OS.FileSys.tmpName ()
+        val command =
+          "sha1sum -- " ^ String.concatWith " " (map quote chunk) ^
+          " > " ^ quote out ^ " 2>/dev/null"
+        val status = OS.Process.system command
+        val lines =
+          if OS.Process.isSuccess status
+          then String.tokens (fn c => c = #"\n") (read_all out)
+          else []
+        val _ = remove_quietly out
+        val digests = List.mapPartial digest lines
+      in
+        if length digests = length chunk andalso length lines = length chunk
+        then SOME digests
+        else NONE
+      end
+      handle _ => NONE
+    fun hash_chunk chunk =
+      case external chunk of
+          SOME digests => digests
+        | NONE => map file_sha1 chunk
+    fun loop [] acc = List.concat (rev acc)
+      | loop paths acc =
+          let
+            val n = Int.min(chunk_size, length paths)
+          in
+            loop (List.drop(paths, n)) (hash_chunk (List.take(paths, n)) :: acc)
+          end
+  in
+    loop paths []
+  end
+
 fun file_sha256 path =
   case external_sha256 path of
       SOME hash => hash
