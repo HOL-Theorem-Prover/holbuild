@@ -13,10 +13,9 @@ trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
 analyser_root=$tmpdir/analyser-root
-mkdir -p "$analyser_root/sml" "$analyser_root/vendor"
+mkdir -p "$analyser_root/sml"
 cp "$HOLBUILD_ROOT"/sml/*.sml "$analyser_root/sml/"
 cp -R "$HOLBUILD_ROOT/sml/analyser" "$analyser_root/sml/analyser"
-cp -R "$HOLBUILD_ROOT/vendor/sml-sha256" "$analyser_root/vendor/sml-sha256"
 printf '\n(* exit-zero incomplete analyser response regression fixture *)\n' >> "$analyser_root/sml/analyser/analysis_protocol.sml"
 
 fake_polyc=$tmpdir/fake-polyc

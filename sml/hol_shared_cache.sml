@@ -15,18 +15,9 @@ val analyser_format_version = "holbuild-hol-analyser-v2"
 val analyser_protocol_version = "1"
 val analyser_source_files =
   ["../string_hash.sml",
+   "../sha256.sml",
+   "../spawn.sml",
    "../hash.sml",
-   "../../vendor/sml-sha256/lib/from-string.sig",
-   "../../vendor/sml-sha256/lib/from-string.sml",
-   "../../vendor/sml-sha256/lib/bytestring.sig",
-   "../../vendor/sml-sha256/lib/bytestring.sml",
-   "../../vendor/sml-sha256/lib/convert-word.sml",
-   "../../vendor/sml-sha256/lib/susp.sig",
-   "../../vendor/sml-sha256/lib/susp.sml",
-   "../../vendor/sml-sha256/lib/stream.sig",
-   "../../vendor/sml-sha256/lib/stream.sml",
-   "../../vendor/sml-sha256/lib/sha256.sig",
-   "../../vendor/sml-sha256/lib/sha256.sml",
    "analysis_protocol.sml",
    "dependency_extract.sml",
    "theory_span_extract.sml",
@@ -95,7 +86,14 @@ fun trim text =
   in if r < l then "" else String.substring(text, l, r - l + 1) end
 
 fun poly_command () = Option.getOpt(OS.Process.getEnv "HOLBUILD_POLY", "poly")
-fun poly_version () = trim (command_output (quote (poly_command ()) ^ " -v"))
+fun poly_version () =
+  let
+    val poly = poly_command ()
+    val run = HolbuildSpawn.run {program = poly, args = ["-v"], stderr = HolbuildSpawn.Merge}
+  in
+    if HolbuildSpawn.succeeded run then trim (#output run)
+    else die ("command failed: " ^ quote poly ^ " -v\n" ^ #output run)
+  end
 
 fun key_material {git, rev, kernel_variant} =
   let val _ = validate_git git

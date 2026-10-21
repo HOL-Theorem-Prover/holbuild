@@ -16,7 +16,7 @@ import pathlib
 import sys
 
 tmp = pathlib.Path(sys.argv[1])
-sizes = [0, 1, 17, 4096, 5120, 65536, 196607, 196608, 307200]
+sizes = [0, 1, 17, 55, 56, 63, 64, 119, 120, 4096, 5120, 65535, 65536, 196607, 196608, 307200]
 for size in sizes:
     data = bytes((i * 37 + size) % 256 for i in range(size))
     (tmp / f"blob-{size}.bin").write_bytes(data)
@@ -67,12 +67,12 @@ fun check_size size =
     assert ("string sha256 mismatch at " ^ Int.toString size) (HolbuildHash.string_sha256 (HolbuildHash.read_binary_all path) = sha256)
   end
 
-val sizes = [0, 1, 17, 4096, 5120, 65536, 196607, 196608, 307200]
+val sizes = [0, 1, 17, 55, 56, 63, 64, 119, 120, 4096, 5120, 65535, 65536, 196607, 196608, 307200]
 val _ = List.app check_size sizes
 
 val small_path = join(tmp, "blob-5120.bin")
-val threshold_minus_one = join(tmp, "blob-196607.bin")
-val threshold = join(tmp, "blob-196608.bin")
+val threshold_minus_one = join(tmp, "blob-65535.bin")
+val threshold = join(tmp, "blob-65536.bin")
 val benchmark_path = join(tmp, "blob-307200.bin")
 
 val _ = assert "5 KB file should use small-file path" (not (HolbuildHash.large_file small_path))

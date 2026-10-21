@@ -947,16 +947,17 @@ fun current_watch_state resolution previous_paths =
   let
     val project = timed_phase "watch.project.discover" load_project
     val {index, components} = prepare_source_index "watch" resolution project
-    val paths = HolbuildWatch.watch_paths_with resolution project index
+    val watch_set = HolbuildWatch.watch_paths_with resolution project index
   in
     {prepared = SOME {project = project, index = index,
-                      components = components, paths = paths}, paths = paths}
+                      components = components, paths = #paths watch_set},
+     watch_set = watch_set}
   end
   handle exn =>
     case (build_iteration_error_message exn, previous_paths) of
-        (SOME msg, SOME paths) =>
+        (SOME msg, SOME watch_set) =>
           (warn ("could not recompute watch set: " ^ msg);
-           {prepared = NONE, paths = paths})
+           {prepared = NONE, watch_set = watch_set})
       | (SOME msg, NONE) => raise Error ("could not compute watch set: " ^ msg)
       | (NONE, _) => raise exn
 
@@ -972,15 +973,16 @@ fun build_watch tc cli_jobs parsed =
           | NONE => raise exn
     fun loop previous_paths =
       let
-        val {prepared, paths = before_paths} = current_watch_state resolution previous_paths
+        val {prepared, watch_set = previous} = current_watch_state resolution previous_paths
         val _ = attempt prepared
         (* Recompute the watch set after the build so inputs created during the
            build are watched immediately, not only after the next change. *)
-        val {prepared = _, paths} = current_watch_state resolution (SOME before_paths)
-        val _ = warn ("watching " ^ Int.toString (length paths) ^ " project path(s); waiting for changes")
-        val _ = HolbuildWatch.wait_for_change paths
+        val {prepared = _, watch_set} = current_watch_state resolution (SOME previous)
+        val _ = warn ("watching " ^ Int.toString (length (#paths watch_set)) ^
+                      " project path(s); waiting for changes")
+        val _ = HolbuildWatch.wait_for_change watch_set
       in
-        loop (SOME paths)
+        loop (SOME watch_set)
       end
   in
     loop NONE

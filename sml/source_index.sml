@@ -254,8 +254,7 @@ fun unique_strings values =
 fun skip_dir name = String.isPrefix "." name orelse name = "_build"
 
 fun contains_manifest path =
-  FS.access(Path.concat(path, "holproject.toml"), [FS.A_READ])
-  handle OS.SysErr _ => false
+  Option.isSome (HolbuildManifestUtil.select_manifest_in path)
 
 fun list_dir path =
   let
