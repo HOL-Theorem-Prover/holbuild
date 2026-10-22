@@ -31,12 +31,9 @@ local
      deliberately ill-typed expression, which would emit a misleading error. *)
   val context_tactics = declares "src/1/Tactical.sig" "TAC_PROOF_in"
 
-  (* goalStack.expand_listf_in came later.  Without it, goalStack runs a step
-     in Context.snapshot(), so a step whose context differs from the live one
-     pins that context on the thread running it.  Only then: while any pin is
-     held, every ambient read in the process (mk_const included) takes a
-     slower path.  The pin is per step, never around the whole proof, so it
-     is not held while a checkpoint is saved and nested proofs never pin. *)
+  (* goalStack.expand_listf_in came later.  Without it, goalStack.expand_listf
+     hands the list tactic Context.snapshot(); the step ignores that and runs
+     in the context it was given instead, which needs no context pin. *)
   val context_goalstack = declares "src/proofman/goalStack.sig" "expand_listf_in"
 
   val legacy =
@@ -55,11 +52,8 @@ local
     if context_goalstack then
       "  fun expand_listf ctxt list_tactic gstk = goalStack.expand_listf_in ctxt list_tactic gstk\n"
     else
-      "  fun expand_listf ctxt list_tactic gstk =\n" ^
-      "    if PolyML.pointerEq (ctxt, Context.snapshot ()) then goalStack.expand_listf list_tactic gstk\n" ^
-      "    else if Context.is_pinned () then\n" ^
-      "      raise Fail \"holbuild cannot run a proof step in its own context on a thread that already has a context pin\"\n" ^
-      "    else Context.with_context ctxt (goalStack.expand_listf list_tactic) gstk\n"
+      "  fun expand_listf ctxt (list_tactic : Tactical.list_tactic) gstk =\n" ^
+      "    goalStack.expand_listf (fn goals => fn _ => list_tactic goals ctxt) gstk\n"
 
   val contextual =
     "structure HolbuildTacticCompat = struct\n" ^

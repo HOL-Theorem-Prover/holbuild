@@ -146,11 +146,6 @@ val timeout_attrib_sync =
   [Thread.InterruptState Thread.InterruptSynch,
    Thread.EnableBroadcastInterrupt true]
 
-(* Interrupting the worker unwinds it, so a context pin it holds for a step is
-   released.  Thread.kill does not unwind, which leaves the pin counted and
-   every ambient read in the process on the slower pinned path from then on;
-   it is kept only for a worker that ignores the interrupt, where leaving a
-   tactic running alongside the rest of the build would be worse. *)
 fun interruptkill worker =
   let
     open Thread

@@ -44,7 +44,7 @@ TOML
 # prover was handed its own: a Data slot marker and the overload `hbpick`, which
 # the explicit context resolves to the constant hb_b and the live one leaves a
 # variable matching any goal.  Every later step, probe and nested proof must
-# still see the explicit context.
+# still see the explicit context, in theorem proofs and termination proofs.
 context_prelude() {
   cat <<'SML'
 Definition hb_a_def:
@@ -140,6 +140,14 @@ Proof
   >- (DISCH_TAC >> FIRST_ASSUM ACCEPT_TAC)
   >- ACCEPT_TAC hb_a_thm
 QED
+
+val _ = reset_context ();
+Definition hb_count_def:
+  hb_count (n:num) = if n = 0 then 0 else hb_count (n - 1)
+Termination
+  diverge_tac >> check_tac >>> check_lt >> nested_tac >>
+  WF_REL_TAC ‘measure I’ >> simp[]
+End
 SML
 } > "$project/src/AScript.sml"
 
