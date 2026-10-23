@@ -3385,10 +3385,13 @@ fun output_hash_lines checkpoint_policy plan node =
 fun theory_name_from_logical logical =
   if has_suffix "Theory" logical then drop_suffix "Theory" logical else logical
 
+(* The whole closure, since a theory parent can be reached through an ML
+   library.  Callers keep only the deps the child's .dat records as parents,
+   which drops ordering-only deps. *)
 fun project_theory_deps plan node =
   List.filter
     (fn dep => #kind (HolbuildBuildPlan.source_of dep) = HolbuildSourceIndex.TheoryScript)
-    (HolbuildBuildPlan.direct_project_deps plan node)
+    (HolbuildBuildPlan.transitive_project_deps plan node)
 
 fun insert_first_string_dict (dict, key, value) =
   case Binarymap.peek (dict, key) of

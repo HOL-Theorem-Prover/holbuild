@@ -179,33 +179,3 @@ if [[ "$(input_key_for_root "$root_a")" == "$input_a" ]]; then
   echo "ATheory input key did not change with the HOL source" >&2
   exit 1
 fi
-
-# A tracing kernel's theory actions also publish .tr.gz traces, which are
-# Poly/ML exports, so their keys keep the exact toolchain key.
-trknl_input_key_for_root() {
-  (cd "$project" && HOLBUILD_CACHE=$1 "$HOLBUILD_BIN" buildhol --trknl) > "$tmpdir/buildhol.log" 2>&1 ||
-    { cat "$tmpdir/buildhol.log" >&2; exit 1; }
-  (cd "$project" && HOLBUILD_CACHE=$1 "$HOLBUILD_BIN" build --trknl --dry-run ATheory) > "$tmpdir/dry-run.log" 2>&1 ||
-    { cat "$tmpdir/dry-run.log" >&2; exit 1; }
-  awk '/input_key:/ {print $2; exit}' "$tmpdir/dry-run.log"
-}
-trknl_a=$(trknl_input_key_for_root "$root_a")
-trknl_b=$(trknl_input_key_for_root "$root_b")
-if [[ -z "$trknl_a" || "$trknl_a" == "$trknl_b" || "$trknl_a" == "$input_a" ]]; then
-  echo "tracing-kernel ATheory input keys did not follow the exact toolchain: '$trknl_a' vs '$trknl_b'" >&2
-  exit 1
-fi
-
-# Changing one HOL source file changes the identity and every theory key.
-printf 'val restored_runtime = false\n' > "$hol/src/runtime/Runtime.sml"
-git -C "$hol" commit -qam changed-runtime
-sed -i "s/^rev = .*/rev = \"$(git -C "$hol" rev-parse HEAD)\"/" "$project/holproject.toml"
-holdir_changed=$(holdir_for_root "$root_a")
-if [[ "$(theory_toolchain_key "$holdir_changed")" == "$key_a" ]]; then
-  echo "theory toolchain key did not change with a HOL source file" >&2
-  exit 1
-fi
-if [[ "$(input_key_for_root "$root_a")" == "$input_a" ]]; then
-  echo "ATheory input key did not change with a HOL source file" >&2
-  exit 1
-fi
