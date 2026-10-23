@@ -900,7 +900,8 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
           val build_options = build_options_for index entry_plan plan force_targets
       in
         timed_phase "dry_run.describe"
-          (fn () => HolbuildBuildPlan.describe (HolbuildBuildExec.build_config_lines_for_node build_options project) toolchain_key plan)
+          (fn () => HolbuildBuildPlan.describe (HolbuildBuildExec.build_config_lines_for_node build_options project)
+                      (HolbuildToolchain.theory_toolchain_key tc) plan)
       end
     fun execute_build () =
       let val (index, force_targets, entry_plan, plan, toolchain_key) = prepare_plan ()
@@ -1126,11 +1127,10 @@ fun cache_key_usable root key =
       SOME text => HolbuildBuildExec.cache_entry_usable root key text
     | NONE => false
 
-fun portable_cache_key_for_node _ plan root keys node =
+fun portable_cache_key_for_node root keys node =
   let
     val logical = HolbuildBuildPlan.logical_name node
-    val input_key = HolbuildBuildPlan.input_key_for keys node
-    val cache_key = HolbuildBuildExec.theory_cache_key plan node input_key
+    val cache_key = HolbuildBuildPlan.input_key_for keys node
   in
     if cache_key_usable root cache_key then cache_key
     else
@@ -1139,9 +1139,9 @@ fun portable_cache_key_for_node _ plan root keys node =
                    logical ^ "` first, or use `holbuild export --build`")
   end
 
-fun export_entry_for_node project plan root keys node =
+fun export_entry_for_node project root keys node =
   let
-    val cache_key = portable_cache_key_for_node project plan root keys node
+    val cache_key = portable_cache_key_for_node root keys node
     val source = HolbuildBuildPlan.source_of node
     val package = HolbuildBuildPlan.package node
   in
@@ -1158,7 +1158,7 @@ fun export_entries project plan keys =
     val theory_nodes = List.filter theory_node (HolbuildBuildPlan.selected_nodes plan)
     val _ = if null theory_nodes then raise Error "export found no theory build outputs in the selected targets" else ()
   in
-    map (export_entry_for_node project plan root keys) theory_nodes
+    map (export_entry_for_node project root keys) theory_nodes
   end
   handle HolbuildBuildExec.Error msg => raise Error msg
 
@@ -1237,9 +1237,9 @@ fun export_archive tc jobs args =
       if null explicit_entry_targets then NONE
       else SOME (timed_phase "entry_timeout.plan"
                    (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index explicit_entry_targets))
-    val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
+    val theory_toolchain_key = HolbuildToolchain.theory_toolchain_key tc
     val options = export_build_options (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)) project index entry_plan plan
-    val keys = HolbuildBuildPlan.input_keys (HolbuildBuildExec.build_config_lines_for_node options project) toolchain_key plan
+    val keys = HolbuildBuildPlan.input_keys (HolbuildBuildExec.build_config_lines_for_node options project) theory_toolchain_key plan
     val entries = export_entries project plan keys
     val cache = HolbuildFSCacheBackend.default () handle HolbuildFSCacheBackend.Error msg => raise Error msg
     val metadata = hbx_export_metadata project

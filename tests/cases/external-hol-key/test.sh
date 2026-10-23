@@ -42,11 +42,6 @@ if [[ -z "$key_v1" ]]; then
   exit 1
 fi
 
-if ! find "$HOLBUILD_CACHE/deps/external" -name '*.deps' -print -quit | grep -q .; then
-  echo "external HOL source dependency extraction was not cached" >&2
-  exit 1
-fi
-
 key_v2=$(input_key)
 if [[ "$key_v2" != "$key_v1" ]]; then
   echo "external HOL key was not stable across repeated dry-runs" >&2

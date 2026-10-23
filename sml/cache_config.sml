@@ -23,6 +23,4 @@ fun cache_root () =
                   SOME home => Path.concat(Path.concat(home, ".cache"), "holbuild")
                 | NONE => raise Error "set HOME, XDG_CACHE_HOME, or HOLBUILD_CACHE"
 
-fun cache_root_option () = SOME (cache_root ()) handle Error _ => NONE
-
 end

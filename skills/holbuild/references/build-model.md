@@ -50,9 +50,21 @@ hash(
   dependency input keys (recursively),
   declared action policy (deps, loads, extra_deps, cache, always_reexecute),
   extra dependency hashes,
-  toolchain key (hol binary + hol.state hashes)
+  names of the HOL toolchain theories and libraries it loads,
+  theory toolchain key
 )
 ```
+
+The theory toolchain key identifies what theory actions see of the HOL
+toolchain: a content hash of the HOL source tree as fetched (VCS metadata
+excluded), the HOL build arguments, the kernel variant, and the Poly/ML release
+(without its runtime/architecture token). It is computed when the toolchain is
+built and stored in the toolchain cache entry's `theory-toolchain` file. Toolchain
+objects are named but not hashed: they are a function of those inputs, and their
+files embed the install path. So toolchains of one recipe built under different
+cache roots, or rebuilt, give the same action keys. Proof checkpoints and heaps
+are Poly/ML heaps and stay keyed by the exact toolchain key (`bin/hol` and
+`bin/hol.state` hashes).
 
 **Any source byte change** (including comments/proof edits) changes the action key and cascades to all dependents. This is conservative — v1 does not attempt semantic equivalence of generated outputs.
 
@@ -84,10 +96,11 @@ locks/                          # publish + GC locks
 
 Cache publish: after a source build, theory artifacts (sig, sml, dat) are stored as blobs. New HOL `Theory.sml` files are relocatable and copied unchanged; old HOL `Theory.sml` files are rebased to the local adjacent `.dat` path before publishing.
 
-Cache restore: on action-key or parent-output key match, blobs are materialized into local `.holbuild/`, `HOLFileSys` remap copies are created, and `.uo/.ui` load manifests are written.
+Cache restore: on action-key match, blobs are materialized into local `.holbuild/`, `HOLFileSys` remap copies are created, and `.uo/.ui` load manifests are written.
 
 **A bad cache hit is worse than a missed cache hit.** Validation:
 - Action key must match
+- A restored theory's recorded parent `.dat` hashes must match the project parent theories it is restored against
 - All referenced blobs must exist with correct content hashes
 - Manifest must have no transient stage paths in mldeps
 - On any validation failure: warn, delete local outputs, rebuild from source
