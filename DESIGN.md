@@ -694,7 +694,9 @@ syntactic checkpoint:    if the action changed, where can replay resume?
 ```
 
 A retained/debug checkpoint is replay-eligible only under the same resolved
-dependency context, toolchain/base context, and checkpoint schema. Raw `.save`
+dependency context, toolchain/base context, and checkpoint schema, and, for a
+checkpoint saved after running part of the script, the same contents of the
+node's declared extra inputs, which that run may have read. Raw `.save`
 bytes are diagnostic only and must not be used as stable semantic keys. The
 default build may retain successful local checkpoints for proof-edit resume, but
 does not materialize checkpoints from the global cache; cache restore recreates
