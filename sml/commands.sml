@@ -901,7 +901,7 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
       in
         timed_phase "dry_run.describe"
           (fn () => HolbuildBuildPlan.describe (HolbuildBuildExec.build_config_lines_for_node build_options project)
-                      (HolbuildToolchain.theory_toolchain_key tc) plan)
+                      (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan)
       end
     fun execute_build () =
       let val (index, force_targets, entry_plan, plan, toolchain_key) = prepare_plan ()
@@ -1237,9 +1237,9 @@ fun export_archive tc jobs args =
       if null explicit_entry_targets then NONE
       else SOME (timed_phase "entry_timeout.plan"
                    (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index explicit_entry_targets))
-    val theory_toolchain_key = HolbuildToolchain.theory_toolchain_key tc
+    val action_toolchain_key = HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key
     val options = export_build_options (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)) project index entry_plan plan
-    val keys = HolbuildBuildPlan.input_keys (HolbuildBuildExec.build_config_lines_for_node options project) theory_toolchain_key plan
+    val keys = HolbuildBuildPlan.input_keys (HolbuildBuildExec.build_config_lines_for_node options project) action_toolchain_key plan
     val entries = export_entries project plan keys
     val cache = HolbuildFSCacheBackend.default () handle HolbuildFSCacheBackend.Error msg => raise Error msg
     val metadata = hbx_export_metadata project

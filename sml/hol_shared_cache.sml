@@ -234,9 +234,14 @@ fun hol_source_files holdir =
    next to the sources; the checkout's own file list recovers the source set
    that hol_source_files saw right after the fetch. *)
 fun legacy_hol_source_files k holdir =
-  String.tokens (fn c => c = #"\000")
-    (command_output_using (run_mutation_output k)
-       ("git -C " ^ quote holdir ^ " ls-files -z"))
+  let
+    (* Not command_output_using: git's stderr must not mix with the paths. *)
+    val command = "git -C " ^ quote holdir ^ " ls-files -z"
+    val {status, output} = run_mutation_output k command
+  in
+    if OS.Process.isSuccess status then String.tokens (fn c => c = #"\000") output
+    else die ("command failed: " ^ command)
+  end
 
 fun hol_source_identity holdir rels =
   let

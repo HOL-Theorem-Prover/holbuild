@@ -185,10 +185,14 @@ fun toolchain_key tc =
         "base_state=" ^ file_hash (base_state tc)] ^ "\n")
 
 (* Theory and library action keys use the toolchain's semantic identity,
-   recorded when the toolchain was built; see HolbuildHolSharedCache. *)
-fun theory_toolchain_key ({holdir, ...} : t) =
-  HolbuildHolSharedCache.theory_toolchain_key_for_holdir holdir
-  handle HolbuildHolSharedCache.Error msg => raise Error msg
+   recorded when the toolchain was built; see HolbuildHolSharedCache.  A
+   tracing kernel's theory actions also publish .tr.gz traces, which are
+   Poly/ML exports, so their keys keep the exact toolchain key. *)
+fun action_toolchain_key (tc as {holdir, kernel_variant, ...} : t) exact_key =
+  if kernel_variant_tracing kernel_variant then exact_key tc
+  else
+    HolbuildHolSharedCache.theory_toolchain_key_for_holdir holdir
+    handle HolbuildHolSharedCache.Error msg => raise Error msg
 
 fun sml_string s =
   "\"" ^ String.translate

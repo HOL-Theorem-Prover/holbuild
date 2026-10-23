@@ -3957,7 +3957,9 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
           CacheMiss => CacheMiss
         | restored as CacheRestored _ =>
             if theory_parent_hashes_match dat_hash_cache plan node NONE then restored
-            else (remove_failed_cache_outputs project node; CacheMiss)
+            else (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
+                               input_key ^ " (parent outputs differ)");
+                  remove_failed_cache_outputs project node; CacheMiss)
     fun restore_from_cache built_timeout =
       (remove_tree stage;
        invalidate_node_dat_hash ();
@@ -4882,7 +4884,7 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
     val _ = enforce_checkpoint_budget_state_excluding budget_state []
     val base_context = toolchain_base_context tc
     val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
-                 (HolbuildToolchain.theory_toolchain_key tc) plan
+                 (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
     val _ = dump_keys_if_requested (build_config_lines_for_node options project) toolchain_key plan keys
     val dat_hash_cache = new_file_hash_cache ()
   in

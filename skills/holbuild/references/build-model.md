@@ -64,7 +64,8 @@ objects are named but not hashed: they are a function of those inputs, and their
 files embed the install path. So toolchains of one recipe built under different
 cache roots, or rebuilt, give the same action keys. Proof checkpoints and heaps
 are Poly/ML heaps and stay keyed by the exact toolchain key (`bin/hol` and
-`bin/hol.state` hashes).
+`bin/hol.state` hashes). So do all action keys under a tracing kernel, whose
+theory actions also produce `.tr.gz` Poly/ML exports.
 
 **Any source byte change** (including comments/proof edits) changes the action key and cascades to all dependents. This is conservative — v1 does not attempt semantic equivalence of generated outputs.
 
