@@ -97,11 +97,11 @@ fun parse_metadata table : metadata =
   let
     val project =
       case table_field table ["project"] of
-          NONE => die "holproject.toml must declare [project] name"
+          NONE => die "manifest must declare [project] name"
         | SOME value => value
     val name =
       case string_field project "name" of
-          NONE => die "holproject.toml must declare [project] name"
+          NONE => die "manifest must declare [project] name"
         | SOME "" => die "project.name must not be empty"
         | SOME value =>
             (require_safe_materialized_dependency_name "project.name" value;
@@ -475,7 +475,7 @@ fun validate_compatibility table =
           NONE => ()
         | SOME n =>
             if n = IntInf.fromInt 2 then ()
-            else die "only legacy holproject schema 2 is supported"
+            else die "only legacy manifest schema 2 is supported"
     val minimum_version = string_at holbuild ["minimum_version"]
     val _ =
       case minimum_version of
@@ -523,7 +523,7 @@ fun validate_image_entries table section fields =
     | SOME _ => die (section ^ " must be an array of tables")
 
 fun validate_manifest table =
-  (require_known_fields "holproject.toml"
+  (require_known_fields "manifest"
      ["holbuild", "project", "build", "dependencies", "run", "heap",
       "executable", "actions", "generate"] table;
    Option.app (require_known_fields "project" ["name", "version"])

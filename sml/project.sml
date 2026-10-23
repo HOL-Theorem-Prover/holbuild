@@ -122,13 +122,11 @@ fun parent dir =
 fun find_manifest_from dir =
   let
     fun loop d =
-      let val candidate = Path.concat(d, "holproject.toml")
-      in
-        if readable candidate then SOME candidate
-        else
-          let val p = parent d
-          in if p = d then NONE else loop p end
-      end
+      case HolbuildManifestUtil.select_manifest_in d of
+          SOME manifest => SOME manifest
+        | NONE =>
+            let val p = parent d
+            in if p = d then NONE else loop p end
   in
     loop (Path.mkAbsolute {path = dir, relativeTo = FS.getDir ()})
   end
@@ -204,6 +202,8 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
 fun parse_at args =
   parse_table_at (TOML.fromFile (#manifest args)) args
   handle Error msg => die (#manifest args ^ ": " ^ msg)
+       | IO.Io {cause, ...} =>
+           die (#manifest args ^ ": cannot read manifest: " ^ General.exnMessage cause)
 
 (* Only the root project's heaps are exported, so these checks skip
    dependency manifests, which a consumer cannot fix. *)
@@ -292,7 +292,8 @@ fun discover () =
             validate_root_heaps project;
             project
           end
-      | NONE => die "no holproject.toml found in --source-dir/current directory or parents"
+      | NONE => die ("no " ^ HolbuildManifestUtil.manifest_filenames_text ^
+                     " found in --source-dir/current directory or parents")
   end
 
 fun abs_under root path =
@@ -450,15 +451,17 @@ fun dependency_local_path_with resolution (project as {graph_artifact_root, ...}
 
 fun dependency_local_path project dep = dependency_local_path_with standard_resolution project dep
 
+(* NONE for a git dependency whose directory has no manifest (or is not
+   materialized yet); explicit shim manifests are returned as declared. *)
 fun dependency_manifest (project as {manifest = project_manifest, graph_artifact_root, ...} : t) dep =
   case dep of
       dep as Dependency {name, source = GitSource _, ...} =>
         if hol_toolchain_dependency dep then SOME (HolbuildBuiltinManifests.holdir_manifest_name)
         else
           (case override_path (#overrides project) name of
-               SOME path => SOME (Path.concat(path, "holproject.toml"))
-             | NONE => SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), name),
-                                         "holproject.toml")))
+               SOME path => HolbuildManifestUtil.select_manifest_in path
+             | NONE => HolbuildManifestUtil.select_manifest_in
+                         (Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), name)))
     | Dependency {source = FromSource {manifest, ...}, ...} =>
         SOME (abs_under (manifest_root project_manifest) manifest)
 
@@ -530,7 +533,8 @@ fun dependency_project_with resolution (project : t) (dep as Dependency {name, s
     val dep_manifest =
       case dependency_manifest project dep of
           SOME manifest => manifest
-        | NONE => die ("dependency " ^ name ^ " has no manifest")
+        | NONE => die ("dependency " ^ name ^ " manifest not found: no " ^
+                       HolbuildManifestUtil.manifest_filenames_text ^ " in " ^ dep_root)
     val parse_dep =
       if hol_toolchain_dependency dep then parse_builtin_holdir_at
       else
@@ -547,7 +551,8 @@ fun dependency_project_with resolution (project : t) (dep as Dependency {name, s
     val declared_name = #name dep_project
     val _ =
       if declared_name = name then ()
-      else die ("dependency " ^ name ^ " manifest declares project.name = " ^ declared_name)
+      else die ("dependency " ^ name ^ " manifest " ^ dep_manifest ^
+                " declares project.name = " ^ declared_name)
   in
     dep_project
   end
@@ -600,7 +605,8 @@ fun dependency_package_with resolution artifact_parent project
     val dep_manifest =
       case dependency_manifest project dep of
           SOME value => value
-        | NONE => die ("dependency " ^ name ^ " has no manifest")
+        | NONE => die ("dependency " ^ name ^ " manifest not found: no " ^
+                       HolbuildManifestUtil.manifest_filenames_text ^ " in " ^ dep_root)
     val artifact_root =
       Path.concat(Path.concat(Path.concat(artifact_parent, ".holbuild"), "packages"), name)
     fun declared_dependency dep_name =

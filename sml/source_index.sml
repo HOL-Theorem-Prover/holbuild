@@ -254,8 +254,7 @@ fun unique_strings values =
 fun skip_dir name = String.isPrefix "." name orelse name = "_build"
 
 fun contains_manifest path =
-  FS.access(Path.concat(path, "holproject.toml"), [FS.A_READ])
-  handle OS.SysErr _ => false
+  Option.isSome (HolbuildManifestUtil.select_manifest_in path)
 
 fun list_dir path =
   let
@@ -608,10 +607,22 @@ fun root_candidate_paths source_root root =
     [relative_path source_root exact, relative_path source_root sml]
   end
 
+(* A concrete root names a source of its own package either by logical name
+   (`MainTheory`) or by package-relative path (`src/MainScript.sml`, with the
+   `.sml` extension optional). *)
 fun source_matches_root package (source : source) root =
   #package source = HolbuildProject.package_name package andalso
-  List.exists (fn rel => rel = #relative_path source)
-    (root_candidate_paths (HolbuildProject.package_root package) root)
+  (#logical_name source = root orelse
+   List.exists (fn rel => rel = #relative_path source)
+     (root_candidate_paths (HolbuildProject.package_root package) root))
+
+fun root_logical_name sources package root =
+  case unique_strings
+         (map #logical_name
+              (List.filter (fn source => source_matches_root package source root) sources)) of
+      [] => raise Error ("unknown build root: " ^ HolbuildProject.package_name package ^ ":" ^ root)
+    | [logical] => logical
+    | _ => raise Error ("ambiguous build root: " ^ HolbuildProject.package_name package ^ ":" ^ root)
 
 fun group_members sources package group =
   let
@@ -683,22 +694,14 @@ fun expand_group_tokens sources package tokens =
 
 fun root_for_package sources package root =
   if is_group_token root then resolve_group_ref sources package (group_token_name root)
-  else
-    case List.filter (fn source => source_matches_root package source root) sources of
-        [] => raise Error ("unknown build root: " ^ HolbuildProject.package_name package ^ ":" ^ root)
-      | [source] => [#logical_name source]
-      | _ => raise Error ("ambiguous build root: " ^ HolbuildProject.package_name package ^ ":" ^ root)
+  else [root_logical_name sources package root]
 
 fun source_entry source = (#relative_path source, #logical_name source)
 
 fun root_entries_for_package_root sources package root =
   if is_group_token root then
     map source_entry (group_member_sources sources package (group_token_name root))
-  else
-    case List.filter (fn source => source_matches_root package source root) sources of
-        [] => raise Error ("unknown build root: " ^ HolbuildProject.package_name package ^ ":" ^ root)
-      | [source] => [(root, #logical_name source)]
-      | _ => raise Error ("ambiguous build root: " ^ HolbuildProject.package_name package ^ ":" ^ root)
+  else [(root, root_logical_name sources package root)]
 
 fun roots_for_package sources package =
   List.concat (map (root_for_package sources package) (HolbuildProject.package_roots package))
@@ -740,5 +743,37 @@ fun root_package_targets sources project =
     map (fn (source : source) => #logical_name source)
       (List.filter (fn (source : source) => #package source = root_name) sources)
   end
+
+(* Command-line targets are logical names unless they look like a file path,
+   in which case they are resolved relative to the current directory. *)
+fun is_path_target token =
+  CharVector.exists (fn c => c = #"/") token orelse
+  has_suffix ".sml" token orelse has_suffix ".sig" token
+
+fun existing_full_path path =
+  SOME (OS.FileSys.fullPath path) handle OS.SysErr _ => NONE
+
+fun path_target_logical_name sources token =
+  let
+    val candidates =
+      if has_suffix ".sml" token orelse has_suffix ".sig" token then [token]
+      else [token, token ^ ".sml"]
+    val wanted = List.mapPartial existing_full_path candidates
+    val wanted_files = map OS.Path.file candidates
+    fun matches (source : source) =
+      List.exists (fn file => file = OS.Path.file (#source_path source)) wanted_files andalso
+      (case existing_full_path (#source_path source) of
+           SOME full => List.exists (fn path => path = full) wanted
+         | NONE => false)
+  in
+    case unique_strings (map #logical_name (List.filter matches sources)) of
+        [] => raise Error ("build target path is not a known source: " ^ token)
+      | [logical] => logical
+      | _ => raise Error ("ambiguous build target path: " ^ token)
+  end
+
+fun resolve_path_targets sources tokens =
+  map (fn token => if is_path_target token then path_target_logical_name sources token else token)
+      tokens
 
 end

@@ -102,7 +102,7 @@ fun create_archive {entry_dir, identity, archive_path} =
           sources =
             [(manifest_dir, [internal_manifest_path]),
              (entry_dir, ["."])],
-          excludes = ["./build.ok", "*/.hol/locks", "*/.hol/locks/*"],
+          excludes = ["./build.ok", "./last-used", "*/.hol/locks", "*/.hol/locks/*"],
           hard_dereference = true});
      remove_tree manifest_dir)
     handle e => (cleanup (); raise e)
@@ -132,6 +132,7 @@ fun install_archive {archive_path, identity, final_dir} =
      FS.mkDir staging_dir;
      extract_archive {archive_path = archive_path, staging_dir = staging_dir};
      if path_exists extracted_marker then die "archive contains build.ok" else ();
+     if path_exists (Path.concat(staging_dir, "last-used")) then die "archive contains last-used" else ();
      validate_extracted_manifest {staging_dir = staging_dir, identity = identity};
      FS.rename {old = staging_dir, new = final_dir})
     handle e => (cleanup (); raise e)

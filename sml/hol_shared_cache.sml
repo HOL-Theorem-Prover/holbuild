@@ -7,6 +7,7 @@ structure FS = OS.FileSys
 exception Error of string
 
 val format_version = "holbuild-hol-toolchain-v2"
+val theory_toolchain_format = "holbuild-theory-toolchain-v2"
 val default_canonical_git = "https://github.com/HOL-Theorem-Prover/HOL.git"
 val standard_kernel = HolbuildHolToolchainConfig.StandardKernel
 
@@ -15,18 +16,9 @@ val analyser_format_version = "holbuild-hol-analyser-v2"
 val analyser_protocol_version = "1"
 val analyser_source_files =
   ["../string_hash.sml",
+   "../sha256.sml",
+   "../spawn.sml",
    "../hash.sml",
-   "../../vendor/sml-sha256/lib/from-string.sig",
-   "../../vendor/sml-sha256/lib/from-string.sml",
-   "../../vendor/sml-sha256/lib/bytestring.sig",
-   "../../vendor/sml-sha256/lib/bytestring.sml",
-   "../../vendor/sml-sha256/lib/convert-word.sml",
-   "../../vendor/sml-sha256/lib/susp.sig",
-   "../../vendor/sml-sha256/lib/susp.sml",
-   "../../vendor/sml-sha256/lib/stream.sig",
-   "../../vendor/sml-sha256/lib/stream.sml",
-   "../../vendor/sml-sha256/lib/sha256.sig",
-   "../../vendor/sml-sha256/lib/sha256.sml",
    "analysis_protocol.sml",
    "dependency_extract.sml",
    "theory_span_extract.sml",
@@ -95,7 +87,14 @@ fun trim text =
   in if r < l then "" else String.substring(text, l, r - l + 1) end
 
 fun poly_command () = Option.getOpt(OS.Process.getEnv "HOLBUILD_POLY", "poly")
-fun poly_version () = trim (command_output (quote (poly_command ()) ^ " -v"))
+fun poly_version () =
+  let
+    val poly = poly_command ()
+    val run = HolbuildSpawn.run {program = poly, args = ["-v"], stderr = HolbuildSpawn.Merge}
+  in
+    if HolbuildSpawn.succeeded run then trim (#output run)
+    else die ("command failed: " ^ quote poly ^ " -v\n" ^ #output run)
+  end
 
 fun key_material {git, rev, kernel_variant} =
   let val _ = validate_git git
@@ -121,6 +120,7 @@ fun holdir_for_key k = Path.concat(entry_dir_for_key k, "hol")
 fun manifest_for_key k = Path.concat(entry_dir_for_key k, "manifest")
 fun hol_source_manifest_for_key k = Path.concat(entry_dir_for_key k, "hol-source.manifest.toml")
 fun hol_source_members_for_key k = Path.concat(entry_dir_for_key k, "hol-source.members")
+fun theory_toolchain_for_key k = Path.concat(entry_dir_for_key k, "theory-toolchain")
 fun ok_for_key k = Path.concat(entry_dir_for_key k, "build.ok")
 fun analysers_dir_for_key k = Path.concat(entry_dir_for_key k, "analysers")
 fun analyser_dir_for_key k ak = Path.concat(analysers_dir_for_key k, ak)
@@ -131,6 +131,9 @@ fun locks_dir () = Path.concat(toolchains_dir (), ".locks")
 fun lock_dir k = Path.concat(locks_dir (), "hol-toolchain-" ^ k ^ ".lock")
 
 fun mutation_lease_path k = lock_dir k ^ ".mutation"
+fun usage_lease_path k = lock_dir k ^ ".usage"
+fun last_used_for_key k = Path.concat(entry_dir_for_key k, "last-used")
+fun trash_dir () = Path.concat(toolchains_dir (), ".trash")
 
 fun run_mutation k script =
   HolbuildProcessGroup.run_shell_with_mutation_lease
@@ -150,6 +153,7 @@ datatype toolchain_lock = ToolchainLock of HolbuildFileLock.t
 fun holdir_for_with_kernel req = holdir_for_key (key req)
 fun holdir_for req = holdir_for_with_kernel (standard_request req)
 fun hol_source_manifest_for_holdir holdir = Path.concat(Path.dir holdir, "hol-source.manifest.toml")
+fun theory_toolchain_for_holdir holdir = Path.concat(Path.dir holdir, "theory-toolchain")
 
 fun built holdir =
   executable (Path.concat(holdir, "bin/hol")) andalso
@@ -198,6 +202,103 @@ fun hol_source_manifest_built k =
   end
   handle _ => false
 
+(* The theory toolchain identity names what theory and library actions see of
+   a toolchain: the HOL sources, how they were built, and the Poly/ML release.
+   Theory objects are a function of these, while bin/hol and hol.state differ
+   on every build, so theory action keys use this identity and runnable
+   artifacts keep the exact toolchain key. *)
+
+fun hol_source_files holdir =
+  let
+    fun visit rel acc =
+      let val stream = FS.openDir (Path.concat(holdir, rel))
+          fun child name = if rel = "" then name else Path.concat(rel, name)
+          fun loop acc =
+            case FS.readDir stream of
+                NONE => acc
+              | SOME ".git" => loop acc
+              | SOME name =>
+                  let val path = Path.concat(holdir, child name)
+                  in
+                    if not (FS.isLink path) andalso FS.isDir path then loop (visit (child name) acc)
+                    else loop (child name :: acc)
+                  end
+      in
+        (loop acc before FS.closeDir stream) handle e => (FS.closeDir stream; raise e)
+      end
+  in
+    visit "" []
+  end
+
+(* Legacy only: toolchain entries built before the identity existed hold
+   build outputs next to the sources, and their git checkout's file list
+   recovers the source set that hol_source_files saw right after the fetch.
+   NONE when that fails (not a git checkout, no git); the caller then
+   rebuilds the entry.  Nothing else reads the identity from git. *)
+fun legacy_hol_source_files k holdir =
+  let
+    (* Not command_output_using: git's stderr must not mix with the paths. *)
+    val {status, output} =
+      run_mutation_output k ("git -C " ^ quote holdir ^ " ls-files -z 2>/dev/null")
+  in
+    if OS.Process.isSuccess status then SOME (String.tokens (fn c => c = #"\000") output)
+    else NONE
+  end
+
+fun hol_source_identity holdir rels =
+  let
+    fun is_link rel = FS.isLink (Path.concat(holdir, rel))
+    val (links, files) = List.partition is_link rels
+    val file_hashes =
+      ListPair.zip (files, HolbuildHash.files_sha1 (map (fn rel => Path.concat(holdir, rel)) files))
+    val link_hashes =
+      map (fn rel => (rel, "symlink:" ^ FS.readLink (Path.concat(holdir, rel)))) links
+    val entries =
+      List.foldl (fn ((rel, hash), acc) => Binarymap.insert(acc, rel, hash))
+                 (Binarymap.mkDict String.compare) (file_hashes @ link_hashes)
+  in
+    HolbuildHash.string_sha1
+      (String.concat (map (fn (rel, hash) => rel ^ "\t" ^ hash ^ "\n") (Binarymap.listItems entries)))
+  end
+  handle OS.SysErr (msg, _) => die ("could not hash HOL sources in " ^ holdir ^ ": " ^ msg)
+
+(* poly -v prints "Poly/ML 5.9.2 Release    RTS version: Arm64-5.9.2 ...";
+   the RTS part names the architecture, which does not reach theory output. *)
+fun poly_release version =
+  trim (Substring.string (#1 (Substring.position "RTS version:" (Substring.full version))))
+
+fun theory_toolchain_text kernel_variant hol_source =
+  let val config = toolchain_config kernel_variant
+      val material =
+        String.concatWith "\n"
+          [theory_toolchain_format,
+           "hol_source=" ^ hol_source,
+           "build_args=" ^ HolbuildHolToolchainConfig.build_args_text config,
+           "kernel_variant=" ^ HolbuildHolToolchainConfig.kernel_variant_name kernel_variant,
+           "poly=" ^ poly_release (poly_version ())] ^ "\n"
+  in
+    material ^ "key=" ^ HolbuildHash.string_sha1 material ^ "\n"
+  end
+
+fun parse_theory_toolchain_key path text =
+  case List.find (String.isPrefix "key=") (String.tokens (fn c => c = #"\n") text) of
+      SOME line =>
+        let val key = String.extract(line, size "key=", NONE)
+        in if HolbuildHash.valid_sha1 key then key else die ("malformed theory toolchain key in " ^ path) end
+    | NONE => die ("missing theory toolchain key in " ^ path)
+
+fun theory_toolchain_built k =
+  (ignore (parse_theory_toolchain_key "" (HolbuildFileLock.read_text (theory_toolchain_for_key k))); true)
+  handle _ => false
+
+fun theory_toolchain_key_for_holdir holdir =
+  let val path = theory_toolchain_for_holdir holdir
+      val text = HolbuildFileLock.read_text path
+                 handle IO.Io _ => die ("HOL toolchain has no theory toolchain identity: " ^ path)
+  in
+    parse_theory_toolchain_key path text
+  end
+
 fun validate_entry req k =
   let val dir = entry_dir_for_key k
       val holdir = holdir_for_key k
@@ -207,10 +308,15 @@ fun validate_entry req k =
     else if not (built holdir) then
       die ("broken HOL toolchain cache entry: " ^ dir ^ "\nremove it with: rm -rf " ^ quote dir)
     else
-      let val status = dirty_status k holdir
+      let
+        val {status, output} =
+          run_mutation_output k
+            ("git -C " ^ quote holdir ^ " status --porcelain --ignored=no 2>/dev/null")
       in
-        if status = "" then true
-        else die ("dirty HOL toolchain cache entry: " ^ dir ^ "\n" ^ status ^ "\nremove it with: rm -rf " ^ quote dir)
+        (* An entry whose tree is not a git checkout is rebuilt. *)
+        if not (OS.Process.isSuccess status) then false
+        else if trim output = "" then true
+        else die ("dirty HOL toolchain cache entry: " ^ dir ^ "\n" ^ trim output ^ "\nremove it with: rm -rf " ^ quote dir)
       end
   end
 
@@ -218,14 +324,16 @@ fun validate_entry req k =
 fun current_lock_owner lock =
   SOME (HolbuildFileLock.read_text (lock_owner_path lock)) handle _ => NONE
 
-fun lock_owner () =
+fun lock_owner_for command =
   String.concatWith "\n"
     ["holbuild-hol-toolchain-lock-v1",
-     "command=bootstrap HOL toolchain",
+     "command=" ^ command,
      "pid=" ^ HolbuildFileLock.current_pid_text (),
      "cwd=" ^ FS.getDir (),
      "host=" ^ HolbuildFileLock.current_host (),
      "started=" ^ Time.toString (Time.now ())] ^ "\n"
+
+fun lock_owner () = lock_owner_for "bootstrap HOL toolchain"
 
 fun unavailable_lock_owner () =
   String.concatWith "\n"
@@ -276,6 +384,28 @@ fun release_lock (ToolchainLock lock) =
 fun write_file path text =
   let val out = TextIO.openOut path
   in TextIO.output(out, text); TextIO.closeOut out end
+
+(* Every command that uses a toolchain holds a shared usage lease on it until
+   the process exits, so toolchain GC never removes an entry in use. fcntl
+   locks are dropped when the process closes any descriptor for the lease
+   file, so each key is leased at most once per process and never released. *)
+val held_usage_leases = ref ([] : (string * HolbuildFileLock.t) list)
+
+fun holds_usage_lease k = List.exists (fn (held, _) => held = k) (!held_usage_leases)
+
+fun hold_usage_lease k =
+  if holds_usage_lease k then ()
+  else
+    let
+      val lease = HolbuildFileLock.acquire_shared_path_wait {path = usage_lease_path k}
+                  handle HolbuildFileLock.Error msg =>
+                    die ("could not acquire HOL toolchain usage lease: " ^ msg)
+    in
+      held_usage_leases := (k, lease) :: !held_usage_leases
+    end
+
+(* GC retention is measured from the last-used marker's mtime. *)
+fun touch_last_used k = write_file (last_used_for_key k) "" handle IO.Io _ => ()
 
 fun analyser_source_dir () =
   case OS.Process.getEnv "HOLBUILD_ANALYSER_SRC" of
@@ -335,21 +465,28 @@ fun build_entry req k =
     val hol = holdir_for_key k
     val material = key_material req
     val run_command = run_mutation k
-    fun build () =
+    fun fetch () =
       (ensure_dir (toolchains_dir ());
        if path_exists final then remove_tree run_command final else ();
        ensure_dir final;
        run_in_dir run_command final ("git clone " ^ quote (#git req) ^ " " ^ quote hol);
-       run_in_dir run_command hol ("git checkout --detach " ^ quote (#rev req));
-       run_in_dir run_command hol (quote (poly_command ()) ^ " --script tools/smart-configure.sml");
-       run_in_dir run_command hol
-         ("bin/build " ^ effective_build_args (#kernel_variant req) hol);
-       if built hol then () else die ("HOL build did not produce bin/hol, bin/Holmake, bin/build, and bin/hol.state in " ^ hol);
-       generate_hol_source_manifest k;
-       if clean k hol then () else die ("HOL build left dirty checkout: " ^ hol ^ "\n" ^ dirty_status k hol);
-       write_file (manifest_for_key k) (material ^ "\nkey=" ^ k ^ "\n");
-       write_file (ok_for_key k) "ok\n";
-       hol)
+       run_in_dir run_command hol ("git checkout --detach " ^ quote (#rev req)))
+    fun build () =
+      let
+        val _ = fetch ()
+        val hol_source = hol_source_identity hol (hol_source_files hol)
+      in
+        run_in_dir run_command hol (quote (poly_command ()) ^ " --script tools/smart-configure.sml");
+        run_in_dir run_command hol
+          ("bin/build " ^ effective_build_args (#kernel_variant req) hol);
+        if built hol then () else die ("HOL build did not produce bin/hol, bin/Holmake, bin/build, and bin/hol.state in " ^ hol);
+        generate_hol_source_manifest k;
+        if clean k hol then () else die ("HOL build left dirty checkout: " ^ hol ^ "\n" ^ dirty_status k hol);
+        write_file (manifest_for_key k) (material ^ "\nkey=" ^ k ^ "\n");
+        write_file (theory_toolchain_for_key k) (theory_toolchain_text (#kernel_variant req) hol_source);
+        write_file (ok_for_key k) "ok\n";
+        hol
+      end
   in
     build () handle e => (remove_tree run_command final; raise e)
   end
@@ -477,6 +614,18 @@ fun publish_entry k =
           else die "HOL toolchain is not complete enough to publish")
          handle error => warn_publish (archive_error_message error))
 
+(* false when the legacy entry's sources cannot be listed. *)
+fun generate_legacy_theory_toolchain req k =
+  let val holdir = holdir_for_key k
+  in
+    case legacy_hol_source_files k holdir of
+        NONE => false
+      | SOME rels =>
+          (write_file (theory_toolchain_for_key k)
+             (theory_toolchain_text (#kernel_variant req) (hol_source_identity holdir rels));
+           true)
+  end
+
 fun restore_or_build_entry req k =
   if restore_entry k then false
   else
@@ -493,6 +642,10 @@ fun finish_entry req k =
          false)
       else restore_or_build_entry req k
     val _ = if hol_source_manifest_built k then () else generate_hol_source_manifest k
+    val built_locally =
+      if theory_toolchain_built k orelse generate_legacy_theory_toolchain req k then built_locally
+      else
+        (ignore (build_entry req k); true)
     val _ = ignore (build_analyser k)
     val _ = if built_locally then publish_entry k else ()
   in
@@ -503,17 +656,120 @@ fun ensure_built_with_kernel req =
   let
     val k = key req
     val ak = analyser_key ()
+    (* Lease before validating, so GC cannot remove the entry in between. *)
+    val _ = hold_usage_lease k
+    val holdir =
+      if validate_entry req k andalso hol_source_manifest_built k andalso
+         theory_toolchain_built k andalso analyser_built k ak then holdir_for_key k
+      else
+        let val lock = acquire_lock k
+        in
+          (await_mutation_quiescence k;
+           finish_entry req k before release_lock lock)
+          handle error => (release_lock lock; raise error)
+        end
   in
-    if validate_entry req k andalso hol_source_manifest_built k andalso analyser_built k ak then holdir_for_key k
-    else
-      let val lock = acquire_lock k
-      in
-        (await_mutation_quiescence k;
-         finish_entry req k before release_lock lock)
-        handle error => (release_lock lock; raise error)
-      end
+    touch_last_used k;
+    holdir
   end
 
 fun ensure_built req = ensure_built_with_kernel (standard_request req)
+
+(* Toolchain GC: installed toolchains are rebuildable cache entries, removed
+   when unused for the retention period. An entry being built, restored or
+   used by another holbuild process is skipped rather than waited for. *)
+
+fun child_names dir =
+  let
+    val stream = FS.openDir dir
+    fun loop acc =
+      case FS.readDir stream of
+          NONE => rev acc
+        | SOME name => loop (if name = "." orelse name = ".." then acc else name :: acc)
+  in
+    (loop [] before FS.closeDir stream) handle e => (FS.closeDir stream; raise e)
+  end
+  handle OS.SysErr _ => []
+
+fun is_toolchain_key name = size name = 40 andalso CharVector.all Char.isHexDigit name
+
+fun remove_unlocked_tree path = remove_tree OS.Process.system path
+
+fun last_use_time k =
+  let fun mtime path = SOME (FS.modTime path) handle OS.SysErr _ => NONE
+  in
+    case mtime (last_used_for_key k) of
+        SOME time => SOME time
+      | NONE =>
+          (* Entries from before last-used existed, or never completed. *)
+          case mtime (ok_for_key k) of
+              SOME time => SOME time
+            | NONE => mtime (entry_dir_for_key k)
+  end
+
+fun entry_stale cutoff k =
+  case last_use_time k of
+      SOME time => Time.<(time, cutoff)
+    | NONE => false
+
+(* Renames the entry out of hol-toolchains under a non-blocking mutation lease,
+   so an interrupted GC never leaves a half-deleted entry in place and a
+   surviving child of a crashed builder keeps the entry busy. *)
+fun retire_entry k =
+  let
+    val trash = Path.concat(trash_dir (), k ^ "." ^ HolbuildFileLock.current_pid_text ())
+    val _ = ensure_dir (trash_dir ())
+    val _ = if path_exists trash then remove_unlocked_tree trash else ()
+    val script =
+      String.concatWith "\n"
+        ["exec 9>" ^ quote (mutation_lease_path k),
+         HolbuildProcessGroup.try_lease_lock () ^ " || exit 0",
+         "mv " ^ quote (entry_dir_for_key k) ^ " " ^ quote trash]
+    val status = OS.Process.system ("/bin/sh -c " ^ quote script)
+  in
+    if not (OS.Process.isSuccess status) then
+      die ("could not remove HOL toolchain cache entry: " ^ entry_dir_for_key k)
+    else if path_exists trash then (remove_unlocked_tree trash; true)
+    else false
+  end
+
+datatype gc_outcome = GcKept | GcRemoved | GcBusy
+
+fun with_try_lock path f =
+  case HolbuildFileLock.try_acquire_path {path = path, obsolete_kind = NONE}
+       handle HolbuildFileLock.Error msg => die msg of
+      NONE => GcBusy
+    | SOME lock =>
+        (f () before HolbuildFileLock.release lock)
+        handle e => (HolbuildFileLock.release lock; raise e)
+
+fun gc_entry cutoff k =
+  (* fcntl locks never conflict within one process, so an entry this process
+     uses must be skipped explicitly. *)
+  if holds_usage_lease k orelse not (entry_stale cutoff k) then GcKept
+  else
+    case try_acquire_lock_path (lock_dir k) of
+        NONE => GcBusy
+      | SOME lock =>
+          let
+            val build_lock = ToolchainLock lock
+            fun sweep () =
+              (HolbuildFileLock.write_text (lock_owner_path (lock_dir k)) (lock_owner_for "gc HOL toolchain");
+               with_try_lock (usage_lease_path k)
+                 (fn () =>
+                     if not (entry_stale cutoff k) then GcKept
+                     else if retire_entry k then GcRemoved
+                     else GcBusy))
+          in
+            (sweep () before release_lock build_lock)
+            handle e => (release_lock build_lock; raise e)
+          end
+
+(* Leftovers of an interrupted toolchain GC; HolbuildCache.gc_root removes
+   them with remove_unlocked_tree, then runs gc_entry over toolchain_keys. *)
+fun toolchain_trash () =
+  List.map (fn name => Path.concat(trash_dir (), name)) (child_names (trash_dir ()))
+
+fun toolchain_keys () = List.filter is_toolchain_key (child_names (toolchains_dir ()))
 
 end

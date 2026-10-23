@@ -108,8 +108,12 @@ fun ensure_commit remote rev =
 
 fun materialized_head dest =
   if path_exists dest then
-    SOME (trim (command_output ("git -C " ^ quote dest ^ " rev-parse HEAD")))
-    handle Error _ => NONE
+    let
+      val run = HolbuildSpawn.run {program = "git", args = ["-C", dest, "rev-parse", "HEAD"],
+                                   stderr = HolbuildSpawn.Discard}
+    in
+      if HolbuildSpawn.succeeded run then SOME (trim (#output run)) else NONE
+    end
   else NONE
 
 fun materialize {name, git, rev, artifact_root} =

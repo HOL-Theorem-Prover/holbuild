@@ -43,6 +43,23 @@ unknown = "invalid"
 TOML
 }
 
+write_bad_holbuild_file() {
+  cat > "$project/holbuild.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "watch-mode"
+unknown = "invalid"
+TOML
+}
+
+write_good_holbuild_file() {
+  cat > "$project/holbuild.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "watch-mode"
+TOML
+}
+
 write_good_source() {
   cat > "$project/AScript.sml" <<'SML'
 open HolKernel boolLib bossLib;
@@ -147,6 +164,21 @@ sleep 1
 
 write_good_source
 wait_for_count "waiting for changes" "$watch_log" 6 45
+sleep 1
+
+# A holbuild.toml appearing beside the manifest in use takes precedence and is
+# noticed without any watched path changing; so are fixing and removing it.
+write_bad_holbuild_file
+wait_for_count "waiting for changes" "$watch_log" 7 45
+require_grep "holbuild.toml: unknown field in project: unknown" "$watch_log"
+sleep 1
+
+write_good_holbuild_file
+wait_for_count "waiting for changes" "$watch_log" 8 45
+sleep 1
+
+rm "$project/holbuild.toml"
+wait_for_count "waiting for changes" "$watch_log" 9 45
 
 kill -INT "$watch_pid"
 wait_for_exit "$watch_pid" 10

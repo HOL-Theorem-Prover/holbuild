@@ -21,6 +21,11 @@ val theorem_info_ref = ref NONE : (string * string * string * string * string * 
 val context_info_ref = ref NONE : (string * string * int) option ref
 val failed_prefix_resume_active_ref = ref false
 val proving_with_proof_ir_ref = ref false
+(* The context handed to the installed prover for the proof being run: every
+   step, selector probe and nested proof runs in it.  A failed-prefix
+   checkpoint saves it with the rest of the heap, so a resumed prefix runs in
+   the context the original proof was given. *)
+val proof_context_ref = ref (NONE : HolbuildTacticCompat.proof_context option)
 val active_tactic_text_ref = ref ""
 val active_plan_ref = ref (NONE : HolbuildProofIr.step list option)
 val successful_step_count_ref = ref 0
@@ -616,6 +621,11 @@ fun ensure_history_limit limit =
 fun prepare_history_append () =
   ensure_history_limit (!history_step_count_ref + 2)
 
+fun current_proof_context () =
+  case !proof_context_ref of
+      SOME ctxt => ctxt
+    | NONE => raise Fail "internal error: no proof context is installed"
+
 fun append_history f =
   (prepare_history_append ();
    set_history (apply_history f);
@@ -789,9 +799,11 @@ fun apply_focus_list_tactic label list_tactic =
         | _ => Tactical.SPLIT_LT generated_count (list_tactic, Tactical.ALL_LT)
   in
     (if generated_count = 0 then
-       (if total_count = 0 then () else append_history (goalStack.expand_listf Tactical.ALL_LT))
+       (if total_count = 0 then ()
+        else append_history (HolbuildTacticCompat.expand_listf (current_proof_context ()) Tactical.ALL_LT))
      else
-       append_history_with_timeout label (goalStack.expand_listf scoped_list_tactic))
+       append_history_with_timeout label
+         (HolbuildTacticCompat.expand_listf (current_proof_context ()) scoped_list_tactic))
     handle e => report_step_failure_with_goals label input_goals e
   end
 
@@ -864,9 +876,10 @@ fun matching_selector_count label selector goals =
     | SOME program =>
         let
           val tac = compile_tactic label program
+          val probe = HolbuildTacticCompat.run_tactic (current_proof_context ()) tac
           fun loop [] count = SOME count
             | loop (g :: rest) count =
-                if Option.isSome (Lib.total (HolbuildTacticCompat.run_tactic tac) g) then
+                if Option.isSome (Lib.total probe g) then
                   (case selector of
                        HolbuildProofIr.SelectMatchingFirst _ => SOME 1
                      | HolbuildProofIr.SelectMatchingAll _ => loop rest (count + 1)
@@ -875,7 +888,7 @@ fun matching_selector_count label selector goals =
         in
           case selector of
               HolbuildProofIr.SelectMatchingFirst _ =>
-                if List.exists (fn g => Option.isSome (Lib.total (HolbuildTacticCompat.run_tactic tac) g)) goals then SOME 1 else NONE
+                if List.exists (fn g => Option.isSome (Lib.total probe g)) goals then SOME 1 else NONE
             | HolbuildProofIr.SelectMatchingAll _ => loop goals 0
             | _ => loop goals 0
         end
@@ -1458,7 +1471,8 @@ fun backup_n 0 = ()
 fun drop_all () = clear_history ()
 
 fun atomic_prove label g tac =
-  with_tactic_timeout label (fn () => Tactical.TAC_PROOF(g, tac)) ()
+  with_tactic_timeout label
+    (fn () => HolbuildTacticCompat.tac_proof (current_proof_context ()) (g, tac)) ()
   handle e => (init_history g 15; report_step_failure label e)
 
 fun with_theorem_trace name f =
@@ -1477,12 +1491,15 @@ fun with_theorem_trace name f =
     case result of TraceOk value => value | TraceError e => raise e
   end
 
-fun with_proof_ir_execution f =
+fun with_proof_ir_execution ctxt f =
   let
     val old_proving = !proving_with_proof_ir_ref
+    val old_context = !proof_context_ref
     val _ = proving_with_proof_ir_ref := true
+    val _ = proof_context_ref := SOME ctxt
     val result = TraceOk (f ()) handle e => TraceError e
     val _ = proving_with_proof_ir_ref := old_proving
+    val _ = proof_context_ref := old_context
   in
     case result of TraceOk value => value | TraceError e => raise e
   end
@@ -1508,7 +1525,7 @@ fun proof_ir_prove name end_path end_ok checkpoint_depth g original_tac tactic_t
   end
 
 fun termination_tactic name tactic_text plan original_tac =
-  HolbuildTacticCompat.lift_tactic (fn g =>
+  HolbuildTacticCompat.lift_context_tactic (fn ctxt => fn g =>
   let
     val depth = length (PolyML.SaveState.showHierarchy())
     val _ = theorem_info_ref := SOME ("termination", name, tactic_text,
@@ -1536,7 +1553,7 @@ fun termination_tactic name tactic_text plan original_tac =
         ([], fn [] => th | _ => raise Fail "termination tactic validation received theorems")
       end
   in
-    with_proof_ir_execution (fn () => with_theorem_trace name execute)
+    with_proof_ir_execution ctxt (fn () => with_theorem_trace name execute)
   end)
 
 fun metadata_value key lines =
@@ -1807,7 +1824,7 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
       failed_prefix_resume_active_ref := old_resume_active
     val _ = failed_prefix_resume_active_ref := true
     val result =
-      with_proof_ir_execution (fn () =>
+      with_proof_ir_execution (current_proof_context ()) (fn () =>
        (restore_failed_prefix_checkpoint_info (name, tactic_text, failed_prefix_path, failed_prefix_ok);
         with_theorem_trace name (fn () =>
         let
@@ -1872,11 +1889,11 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
     result
   end
 
-fun prove_outer_theorem (g, tac) (_, name, tactic_text, _, _, end_path, end_ok, _, _, has_attrs, checkpoint_depth) =
+fun prove_outer_theorem ctxt (g, tac) (_, name, tactic_text, _, _, end_path, end_ok, _, _, has_attrs, checkpoint_depth) =
   let
     val atomic = has_attrs orelse tactic_text = ""
     val th =
-      with_proof_ir_execution (fn () =>
+      with_proof_ir_execution ctxt (fn () =>
         with_theorem_trace name (fn () =>
           if atomic then atomic_prove name g tac
           else proof_ir_prove name end_path end_ok checkpoint_depth g tac tactic_text))
@@ -1885,14 +1902,14 @@ fun prove_outer_theorem (g, tac) (_, name, tactic_text, _, _, end_path, end_ok, 
     th
   end
 
-fun proof_ir_prover (g, tac) =
+fun proof_ir_prover ctxt (g, tac) =
   if !proving_with_proof_ir_ref then
-    Tactical.TAC_PROOF(g, tac)
+    HolbuildTacticCompat.tac_proof ctxt (g, tac)
   else
     case !theorem_info_ref of
-        NONE => Tactical.TAC_PROOF(g, tac)
+        NONE => HolbuildTacticCompat.tac_proof ctxt (g, tac)
       | SOME info =>
-          prove_outer_theorem (g, tac) info
+          prove_outer_theorem ctxt (g, tac) info
           handle e =>
             (proving_with_proof_ir_ref := false;
              theorem_info_ref := NONE;

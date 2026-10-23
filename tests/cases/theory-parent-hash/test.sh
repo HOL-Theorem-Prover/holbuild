@@ -306,3 +306,71 @@ event = [event for event in events if event.get("event") == "build_finished"][-1
 if event.get("built") != 0 or event.get("from_cache") != 1 or event.get("unchanged") != 1:
     raise SystemExit(f"ordering-only dependency prevented a cache restore: {event}")
 PY
+
+# A child's key names its parents' keys, not their outputs, so a parent whose
+# build is not reproducible meets the child's cache entry with a different
+# .dat.  The restored child must be rejected and rebuilt, also when the parent
+# is reached only through an ML library (C loads Helper, which loads A).
+nondet_project=$tmpdir/nondet-project
+mkdir -p "$nondet_project/src"
+cat > "$nondet_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "nondet-parent-hash"
+
+[build]
+members = ["src"]
+TOML
+cat > "$nondet_project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+val _ = new_constant ("c" ^ LargeInt.toString (Time.toMicroseconds (Time.now ())), bool);
+
+Theorem a_thm:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+
+val _ = export_theory();
+SML
+cp "$project/src/BScript.sml" "$nondet_project/src/BScript.sml"
+cat > "$nondet_project/src/Helper.sml" <<'SML'
+structure Helper =
+struct
+  val a_thm = ATheory.a_thm
+end
+SML
+cat > "$nondet_project/src/CScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "C";
+
+Theorem c_thm:
+  T
+Proof
+  ACCEPT_TAC Helper.a_thm
+QED
+
+val _ = export_theory();
+SML
+
+(cd "$nondet_project" && "$HOLBUILD_BIN" build BTheory CTheory) > "$tmpdir/nondet-initial.log" 2>&1
+rm -rf "$nondet_project/.holbuild"
+(cd "$nondet_project" && "$HOLBUILD_BIN" build --force ATheory) > "$tmpdir/nondet-parent.log" 2>&1
+require_grep "ATheory built" "$tmpdir/nondet-parent.log"
+nondet_child_log=$tmpdir/nondet-child.log
+(cd "$nondet_project" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" build BTheory CTheory) > "$nondet_child_log" 2>&1
+for child in BTheory CTheory; do
+  require_grep "cache miss: $child .*(parent outputs differ)" "$nondet_child_log"
+  require_grep "$child built" "$nondet_child_log"
+  # The existing entry stays: it is consistent with the parent entry it was
+  # built on, and the conflict says the parent build is not reproducible.
+  require_grep "cache entry already exists with different outputs for $child" "$nondet_child_log"
+done

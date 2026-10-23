@@ -120,12 +120,15 @@ fun clean_help () = print
 fun gc_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] gc [OPTIONS]\n\n\
-  \Remove stale project/cache state.\n\n\
+  \Remove stale project/cache state, including HOL toolchains unused for the\n\
+  \retention period.\n\n\
   \Options:\n\
   \  --retention-days DAYS\n\
   \  --max-checkpoints-gb GB\n\
-  \  --clean-only\n\
-  \  --cache-only\n\n\
+  \  --clean-only        project state only\n\
+  \  --cache-only        global cache only; no project needed\n\
+  \  --toolchains-only   installed HOL toolchains only; no project needed\n\n\
+  \The --*-only options are mutually exclusive.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun cache_help () = print
@@ -337,7 +340,10 @@ fun project_has_default_targets resolution project =
 
 fun default_build_targets resolution project index targets =
   if null targets then HolbuildSourceIndex.default_targets_with resolution index project
-  else HolbuildSourceIndex.expand_group_tokens index (HolbuildProject.project_package project) targets
+  else
+    (reject_object_targets targets;
+     HolbuildSourceIndex.expand_group_tokens index (HolbuildProject.project_package project)
+       (HolbuildSourceIndex.resolve_path_targets index targets))
 
 fun build_target_plan resolution components holdir project index requested_targets targets =
   if null requested_targets andalso null targets andalso not (project_has_default_targets resolution project) then
@@ -941,7 +947,8 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
           val build_options = build_options_for index entry_plan plan force_targets
       in
         timed_phase "dry_run.describe"
-          (fn () => HolbuildBuildPlan.describe (HolbuildBuildExec.build_config_lines build_options project plan) toolchain_key plan)
+          (fn () => HolbuildBuildPlan.describe (HolbuildBuildExec.build_config_lines build_options project plan)
+                      (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan)
       end
     fun execute_build () =
       let val (index, force_targets, entry_plan, plan, toolchain_key) = prepare_plan ()
@@ -988,16 +995,17 @@ fun current_watch_state resolution previous_paths =
   let
     val project = timed_phase "watch.project.discover" load_project
     val {index, components} = prepare_source_index "watch" resolution project
-    val paths = HolbuildWatch.watch_paths_with resolution project index
+    val watch_set = HolbuildWatch.watch_paths_with resolution project index
   in
     {prepared = SOME {project = project, index = index,
-                      components = components, paths = paths}, paths = paths}
+                      components = components, paths = #paths watch_set},
+     watch_set = watch_set}
   end
   handle exn =>
     case (build_iteration_error_message exn, previous_paths) of
-        (SOME msg, SOME paths) =>
+        (SOME msg, SOME watch_set) =>
           (warn ("could not recompute watch set: " ^ msg);
-           {prepared = NONE, paths = paths})
+           {prepared = NONE, watch_set = watch_set})
       | (SOME msg, NONE) => raise Error ("could not compute watch set: " ^ msg)
       | (NONE, _) => raise exn
 
@@ -1013,15 +1021,16 @@ fun build_watch tc cli_jobs parsed =
           | NONE => raise exn
     fun loop previous_paths =
       let
-        val {prepared, paths = before_paths} = current_watch_state resolution previous_paths
+        val {prepared, watch_set = previous} = current_watch_state resolution previous_paths
         val _ = attempt prepared
         (* Recompute the watch set after the build so inputs created during the
            build are watched immediately, not only after the next change. *)
-        val {prepared = _, paths} = current_watch_state resolution (SOME before_paths)
-        val _ = warn ("watching " ^ Int.toString (length paths) ^ " project path(s); waiting for changes")
-        val _ = HolbuildWatch.wait_for_change paths
+        val {prepared = _, watch_set} = current_watch_state resolution (SOME previous)
+        val _ = warn ("watching " ^ Int.toString (length (#paths watch_set)) ^
+                      " project path(s); waiting for changes")
+        val _ = HolbuildWatch.wait_for_change watch_set
       in
-        loop (SOME paths)
+        loop (SOME watch_set)
       end
   in
     loop NONE
@@ -1166,11 +1175,10 @@ fun cache_key_usable root key =
       SOME text => HolbuildBuildExec.cache_entry_usable root key text
     | NONE => false
 
-fun portable_cache_key_for_node _ plan root keys node =
+fun portable_cache_key_for_node root keys node =
   let
     val logical = HolbuildBuildPlan.logical_name node
-    val input_key = HolbuildBuildPlan.input_key_for keys node
-    val cache_key = HolbuildBuildExec.theory_cache_key plan node input_key
+    val cache_key = HolbuildBuildPlan.input_key_for keys node
   in
     if cache_key_usable root cache_key then cache_key
     else
@@ -1179,9 +1187,9 @@ fun portable_cache_key_for_node _ plan root keys node =
                    logical ^ "` first, or use `holbuild export --build`")
   end
 
-fun export_entry_for_node project plan root keys node =
+fun export_entry_for_node project root keys node =
   let
-    val cache_key = portable_cache_key_for_node project plan root keys node
+    val cache_key = portable_cache_key_for_node root keys node
     val source = HolbuildBuildPlan.source_of node
     val package = HolbuildBuildPlan.package node
   in
@@ -1198,7 +1206,7 @@ fun export_entries project plan keys =
     val theory_nodes = List.filter theory_node (HolbuildBuildPlan.selected_nodes plan)
     val _ = if null theory_nodes then raise Error "export found no theory build outputs in the selected targets" else ()
   in
-    map (export_entry_for_node project plan root keys) theory_nodes
+    map (export_entry_for_node project root keys) theory_nodes
   end
   handle HolbuildBuildExec.Error msg => raise Error msg
 
@@ -1277,9 +1285,9 @@ fun export_archive tc jobs args =
       if null explicit_entry_targets then NONE
       else SOME (timed_phase "entry_timeout.plan"
                    (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index explicit_entry_targets))
-    val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
+    val action_toolchain_key = HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key
     val options = export_build_options resolution (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)) project index entry_plan plan
-    val keys = HolbuildBuildPlan.input_keys (HolbuildBuildExec.build_config_lines options project plan) toolchain_key plan
+    val keys = HolbuildBuildPlan.input_keys (HolbuildBuildExec.build_config_lines options project plan) action_toolchain_key plan
     val entries = export_entries project plan keys
     val cache = HolbuildFSCacheBackend.default () handle HolbuildFSCacheBackend.Error msg => raise Error msg
     val metadata = hbx_export_metadata project
@@ -1341,6 +1349,7 @@ fun clean_targets args =
       let
         val {index, components} = prepare_source_index "clean"
                                   HolbuildProject.standard_resolution project
+        val args = HolbuildSourceIndex.resolve_path_targets index args
         val plan = timed_phase "build.plan"
                      (fn () => HolbuildBuildPlan.plan_targets components "" index args)
         fun target_nodes target =
@@ -1488,30 +1497,38 @@ fun dispatch tc jobs args =
     | cmd :: _ => if known_command cmd then raise Error ("unknown command: " ^ cmd)
                   else build tc jobs args
 
+datatype gc_scope = GcProjectAndCache | GcProjectOnly | GcCacheOnly | GcToolchainsOnly
+
+fun gc_scope_flag scope =
+  case scope of
+      GcProjectAndCache => ""
+    | GcProjectOnly => "--clean-only"
+    | GcCacheOnly => "--cache-only"
+    | GcToolchainsOnly => "--toolchains-only"
+
+fun select_gc_scope scope selected =
+  if scope = GcProjectAndCache orelse scope = selected then selected
+  else raise Error (gc_scope_flag scope ^ " and " ^ gc_scope_flag selected ^ " are mutually exclusive")
+
 fun parse_gc_args args =
   let
-    fun result days max_checkpoints_gb clean_only cache_only =
-      case (clean_only, cache_only) of
-          (true, true) => raise Error "--clean-only and --cache-only are mutually exclusive"
-        | (true, false) => (days, max_checkpoints_gb, true, false)
-        | (false, true) => (days, max_checkpoints_gb, false, true)
-        | (false, false) => (days, max_checkpoints_gb, true, true)
-    fun loop days max_checkpoints_gb clean_only cache_only rest =
+    fun loop days max_checkpoints_gb scope rest =
       case rest of
-          [] => result days max_checkpoints_gb clean_only cache_only
-        | "--retention-days" :: n :: xs => loop (HolbuildCache.parse_days n) max_checkpoints_gb clean_only cache_only xs
-        | "--days" :: n :: xs => loop (HolbuildCache.parse_days n) max_checkpoints_gb clean_only cache_only xs
+          [] => (days, max_checkpoints_gb, scope)
+        | "--retention-days" :: n :: xs => loop (HolbuildCache.parse_days n) max_checkpoints_gb scope xs
+        | "--days" :: n :: xs => loop (HolbuildCache.parse_days n) max_checkpoints_gb scope xs
         | "--max-checkpoints-gb" :: n :: xs =>
             (case Int.fromString n of
-                 SOME gb => if gb >= 0 then loop days (SOME gb) clean_only cache_only xs
+                 SOME gb => if gb >= 0 then loop days (SOME gb) scope xs
                             else raise Error "--max-checkpoints-gb must be non-negative"
                | NONE => raise Error "--max-checkpoints-gb requires an integer")
         | "--max-checkpoints-gb" :: [] => raise Error "--max-checkpoints-gb requires GB"
-        | "--clean-only" :: xs => loop days max_checkpoints_gb true cache_only xs
-        | "--cache-only" :: xs => loop days max_checkpoints_gb clean_only true xs
+        | "--clean-only" :: xs => loop days max_checkpoints_gb (select_gc_scope scope GcProjectOnly) xs
+        | "--cache-only" :: xs => loop days max_checkpoints_gb (select_gc_scope scope GcCacheOnly) xs
+        | "--toolchains-only" :: xs => loop days max_checkpoints_gb (select_gc_scope scope GcToolchainsOnly) xs
         | arg :: _ => raise Error ("unknown gc option: " ^ arg)
   in
-    loop HolbuildCache.default_retention_days NONE false false args
+    loop HolbuildCache.default_retention_days NONE GcProjectAndCache args
   end
 
 fun run_project_gc (days, max_checkpoints_gb_option) =
@@ -1525,11 +1542,14 @@ fun run_project_gc (days, max_checkpoints_gb_option) =
 
 fun gc args =
   let
-    val (days, max_checkpoints_gb, clean_project, clean_cache) = parse_gc_args args
-    val _ = if clean_project then run_project_gc (days, max_checkpoints_gb) else ()
-    val _ = if clean_cache then HolbuildCache.gc_root (HolbuildCache.cache_root ()) days else ()
+    val (days, max_checkpoints_gb, scope) = parse_gc_args args
+    fun cache_gc () = HolbuildCache.gc_root (HolbuildCache.cache_root ()) days
   in
-    ()
+    case scope of
+        GcProjectAndCache => (run_project_gc (days, max_checkpoints_gb); cache_gc ())
+      | GcProjectOnly => run_project_gc (days, max_checkpoints_gb)
+      | GcCacheOnly => cache_gc ()
+      | GcToolchainsOnly => HolbuildCache.gc_toolchains_root (HolbuildCache.cache_root ()) days
   end
 
 fun reject_holdir holdir =

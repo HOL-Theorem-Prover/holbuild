@@ -297,11 +297,12 @@ fun run_analyser_batch analyser files =
        map file_line files @
        [HolbuildAnalysisProtocol.join ["end"]]) ^ "\n"
     val _ = write_file req request
-    val status = OS.Process.system (HolbuildHash.quote analyser ^ " --request " ^ HolbuildHash.quote req ^
-                                    " --response " ^ HolbuildHash.quote resp)
+    val run = HolbuildSpawn.run {program = analyser, args = ["--request", req, "--response", resp],
+                                 stderr = HolbuildSpawn.Inherit}
+    val _ = print (#output run)
     val _ = OS.FileSys.remove req handle OS.SysErr _ => ()
   in
-    if OS.Process.isSuccess status then
+    if HolbuildSpawn.succeeded run then
       let val deps = parse_analyser_response resp files
           val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
       in deps end
@@ -389,6 +390,8 @@ fun extract_cached_with_hash {cache_path, source_path, source_hash} =
           deps
         end
 
+(* Returns, for each request, the dependency facts read from its cache or
+   produced by the batch analyser run, or NONE if neither produced them. *)
 fun prefetch_cached_with_hash requests =
   let
     fun enumerate i xs =
@@ -399,60 +402,39 @@ fun prefetch_cached_with_hash requests =
       case read_cache cache_path source_hash of
           SOME deps => ((id, deps) :: cached, missing)
         | NONE => (cached, (id, req) :: missing)
-    val (_, missing) = List.foldl cached_or_missing ([], []) (enumerate 1 requests)
+    val (cached, missing) = List.foldl cached_or_missing ([], []) (enumerate 1 requests)
+    val analysed =
+      case (!analyser_path, missing) of
+          (_, []) => []
+        | (NONE, _) => []
+        | (SOME analyser, _) =>
+            let
+              val files = map (fn (id, {source_path, ...}) => (id, source_path)) (rev missing)
+              val results = run_analyser_batch analyser files
+              val missing_by_id =
+                List.foldl
+                  (fn ((id, req), dict) => Binarymap.insert(dict, id, req))
+                  (Binarymap.mkDict String.compare)
+                  missing
+              fun store (id, deps) =
+                case Binarymap.peek(missing_by_id, id) of
+                    SOME {cache_path, source_hash, ...} => (write_cache cache_path source_hash deps handle _ => ())
+                  | NONE => ()
+            in
+              List.app store results;
+              List.filter (fn (id, _) => Option.isSome (Binarymap.peek(missing_by_id, id))) results
+            end
+    val by_id =
+      List.foldl (fn ((id, deps), dict) => Binarymap.insert(dict, id, deps))
+        (Binarymap.mkDict String.compare) (cached @ analysed)
   in
-    case (!analyser_path, missing) of
-        (_, []) => ()
-      | (NONE, _) => ()
-      | (SOME analyser, _) =>
-          let
-            val files = map (fn (id, {source_path, ...}) => (id, source_path)) (rev missing)
-            val results = run_analyser_batch analyser files
-            val missing_by_id =
-              List.foldl
-                (fn ((id, req), dict) => Binarymap.insert(dict, id, req))
-                (Binarymap.mkDict String.compare)
-                missing
-            fun store (id, deps) =
-              case Binarymap.peek(missing_by_id, id) of
-                  SOME {cache_path, source_hash, ...} => (write_cache cache_path source_hash deps handle _ => ())
-                | NONE => ()
-          in
-            List.app store results
-          end
+    map (fn (id, _) => Binarymap.peek(by_id, id)) (enumerate 1 requests)
   end
 
 fun extract_cached {cache_path, source_path} =
   extract_cached_with_hash {cache_path = cache_path,
                             source_path = source_path,
                             source_hash = HolbuildHash.file_sha1 source_path}
-
-fun cache_root () = HolbuildCacheConfig.cache_root_option ()
-
-fun external_cache_path root source_hash =
-  Path.concat(root, Path.concat("deps", Path.concat("external", source_hash ^ ".deps")))
-
-fun extract_global_cached_with_hash {source_path, source_hash} =
-  case cache_root () of
-      NONE => extract_uncached source_path
-    | SOME root =>
-        extract_cached_with_hash {cache_path = external_cache_path root source_hash,
-                                  source_path = source_path,
-                                  source_hash = source_hash}
-
-fun prefetch_global_cached_with_hash requests =
-  case cache_root () of
-      NONE => ()
-    | SOME root =>
-        prefetch_cached_with_hash
-          (map (fn {source_path, source_hash} =>
-                  {cache_path = external_cache_path root source_hash,
-                   source_path = source_path,
-                   source_hash = source_hash}) requests)
-
-fun extract_global_cached source_path =
-  extract_global_cached_with_hash {source_path = source_path,
-                                   source_hash = HolbuildHash.file_sha1 source_path}
 
 fun extract path = extract_uncached path
 

@@ -38,15 +38,27 @@ minimum_version = "0.10.0"
 
 Package roots are declared by one of:
 
-- the current project's `holproject.toml`
-- a dependency's own `holproject.toml`
+- the current project's manifest
+- a dependency's own manifest
 - an explicit shim manifest supplied by the consumer
 - the built-in/root HOL manifest
+
+A project's or dependency's manifest is `holbuild.toml` if the directory has
+one, otherwise `holproject.toml`. Root discovery walks from the source
+directory to its parents and stops at the first directory holding either file,
+so the nearest project wins and only then does `holbuild.toml` take precedence.
+The selected file is parsed on its own with the one manifest schema; the two
+are never merged and an invalid `holbuild.toml` is not a fallback to
+`holproject.toml`. The second name exists because Holmake reads
+`holproject.toml` with a different schema, so a project used by both tools
+keeps that file for Holmake and adds `holbuild.toml`. This is a compatibility
+step; the workspace, sibling-dependency, and shared-schema questions of issue
+#110 remain open.
 
 Committed manifests describe what dependency is required. They should not rely on
 ambient search paths such as `HOLPATH`, `HOLDIR`, or user include paths. The
 current manifest language uses exact git commits plus explicit shim manifests for subtrees that do not have
-their own `holproject.toml`:
+their own manifest:
 
 ```toml
 [dependencies.foo]
@@ -121,7 +133,7 @@ but the shim manifest is read from the package that declares the dependency.
 The reserved `hol` package is the project HOL toolchain. It is
 materialized and built at a canonical shared cache path
 `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`; upstream HOL does not need a
-`holproject.toml`, because holbuild uses its built-in HOL manifest for package
+manifest, because holbuild uses its built-in HOL manifest for package
 metadata. `context` resolves the path but does not build HOL. Commands that need
 HOL use the shared cached tree as the project HOL toolchain and build it on
 demand with:
@@ -169,8 +181,8 @@ The current external implementation vendors the small set of HOL implementation
 pieces needed to compile the holbuild executable under `vendor/hol`. That is a
 build-time host/tool dependency, not a project semantic state model. During the transition, holbuild
 starts target actions from the project HOL's `bin/hol.state` and includes that
-heap in the toolchain key; it
-does not copy it into a project-local `_base` checkpoint. The target model
+heap in the toolchain key of checkpoints and heaps (theory action keys use the
+toolchain's semantic identity instead); it does not copy it into a project-local `_base` checkpoint. The target model
 replaces this configured seed with declared bootstrap contexts. Root HOL and user
 dependencies should be ordinary manifest-resolved package nodes whose contexts
 are produced by holbuild. The initial build context is a declared bootstrap
@@ -601,12 +613,16 @@ holbuild gc --retention-days 7
 holbuild --cache-dir /path/to/cache gc
 holbuild gc --clean-only
 holbuild gc --cache-only
+holbuild gc --toolchains-only
 ```
 
 By default `holbuild gc` takes the project lock, removes stale project-local
 `.holbuild/stage`, `.holbuild/logs`, and checkpoint artifacts, then runs global
 cache GC. `--clean-only` skips cache GC. `--cache-only` skips project discovery
-and locking, so it works without a HOL toolchain. The cache root is
+and locking, so it works without a HOL toolchain. `--toolchains-only` also skips
+project discovery and runs only the installed HOL toolchain sweep of cache GC,
+leaving tmp, lock, action, and blob entries alone. The three `--*-only` options
+are mutually exclusive. The cache root is
 `--cache-dir`, else `$HOLBUILD_CACHE`, else `$XDG_CACHE_HOME/holbuild`, else `$HOME/.cache/holbuild`.
 
 Future in-tree spelling may be:
@@ -676,7 +692,7 @@ export killed because a parallel build is stopping is not a failed export:
 the users waiting on it are cancelled with the build, without a warning,
 since starting them cold would only delay the stop.
 
-The heap key hashes the toolchain key, the path of `hol.state` (which the heap
+The heap key hashes the exact toolchain key, the path of `hol.state` (which the heap
 records as its parent), and the objects' load stems and input keys.
 `<output>.ok` records the key, the exported file's content hash, and a hash of
 the objects' `.dat` files; a mismatch in any of them, or a missing file,

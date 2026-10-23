@@ -594,6 +594,15 @@ fun holpath_reference path dir name =
     SOME ("$(" ^ name ^ ")/" ^ String.extract(path, size dir + 1, NONE))
   else NONE
 
+(* The script's path in recorded theorem locations, in holpathdb form so that
+   a cached theory carries no path of the checkout that built it: HOL's own
+   sources under `$(HOLDIR)`, as HOL records them, and other packages under
+   their package name. *)
+fun located_source_name holdir node =
+  case holpath_reference (canonical_path (source_file node)) (canonical_path holdir) "HOLDIR" of
+      SOME name => name
+    | NONE => "$(" ^ package node ^ ")/" ^ HolbuildBuildPlan.relative_path node
+
 fun holpath_stage_references path =
   let
     val canonical = canonical_path path
@@ -2158,32 +2167,6 @@ fun publish_remote_cache_key_if_usable root key =
       SOME manifest => if cache_entry_usable root key manifest then publish_remote_cache_key root key else ()
     | NONE => ()
 
-fun direct_project_theory_deps plan node =
-  List.filter
-    (fn dep => #kind (HolbuildBuildPlan.source_of dep) = HolbuildSourceIndex.TheoryScript)
-    (HolbuildBuildPlan.direct_project_deps plan node)
-
-fun parent_output_cache_lines plan node =
-  map
-    (fn dep =>
-        let val {data_path, ...} = theory_outputs dep
-        in String.concat ["parent=", HolbuildBuildPlan.package dep, ":",
-                          HolbuildBuildPlan.relative_path dep, ":",
-                          logical_name dep, "@", file_hash data_path]
-        end)
-    (direct_project_theory_deps plan node)
-
-fun parent_output_cache_key plan node input_key =
-  case parent_output_cache_lines plan node of
-      [] => input_key
-    | parent_lines =>
-        HolbuildHash.string_sha1
-          (String.concatWith "\n"
-             (["holbuild-parent-output-cache-v1", "input_key=" ^ input_key] @ parent_lines) ^ "\n")
-
-fun theory_cache_key plan node input_key =
-  parent_output_cache_key plan node input_key
-
 fun cache_warning_subject node =
   String.concat [logical_name node, " (", source_file node, ")"]
 
@@ -2239,20 +2222,14 @@ fun publish_theory_cache plan node input_key proof_timeout staged_sig published_
     val root = cache_root ()
     val _ = HolbuildCache.ensure_layout root
     val cache_mldeps = List.filter (not o transient_stage_mldep) mldeps
-    val cache_parents = parents
-    val cache_key = theory_cache_key plan node input_key
-    fun drop_stale_manifest key = HolbuildCache.remove_action root key
     val subject = cache_warning_subject node
     fun publish () =
-      publish_cache_manifest root cache_key subject staged_sig published_sml staged_dat staged_trace
-                             staged_extras cache_parents cache_mldeps proof_timeout
+      publish_cache_manifest root input_key subject staged_sig published_sml staged_dat staged_trace
+                             staged_extras parents cache_mldeps proof_timeout
     fun skip_locked_publish () = ()
   in
-    ((if cache_key <> input_key then
-        HolbuildCache.with_action_publish_lock root input_key (fn () => drop_stale_manifest input_key) skip_locked_publish
-      else ());
-     HolbuildCache.with_action_publish_lock root cache_key publish skip_locked_publish;
-     publish_remote_cache_key_if_usable root cache_key)
+    (HolbuildCache.with_action_publish_lock root input_key publish skip_locked_publish;
+     publish_remote_cache_key_if_usable root input_key)
     handle e => warn ("could not publish cache entry: " ^ General.exnMessage e)
   end
 
@@ -2348,31 +2325,26 @@ fun remove_failed_cache_outputs project node =
     remove_checkpoint_family project node
   end
 
-
-fun cache_key_role plan node input_key cache_key =
-  if cache_key = input_key then "source/dependency key"
-  else if cache_key = theory_cache_key plan node input_key then "parent-output key"
-  else "cache key"
-
 datatype theory_cache_restore = CacheMiss | CacheRestored of real option
 
-fun materialize_theory_cache_key verify_cache allow_timeout_discrepancy project plan input_key requested_timeout require_trace cache_key node =
+val cache_key_role = "source/dependency key"
+
+fun materialize_theory_cache verify_cache allow_timeout_discrepancy project plan input_key requested_timeout require_trace node =
   let
     val root = cache_root ()
-    val manifest = HolbuildCache.action_manifest root cache_key
-    val role = cache_key_role plan node input_key cache_key
+    val manifest = HolbuildCache.action_manifest root input_key
     val manifest_text =
-      case ensure_local_cache_entry root cache_key of
+      case ensure_local_cache_entry root input_key of
           SOME text => text
-        | NONE => (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ role ^ "=" ^ cache_key ^ " (no manifest)");
+        | NONE => (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^ input_key ^ " (no manifest)");
                    raise Error "cache entry not found")
     val _ =
       case transient_stage_mldep_in_manifest manifest_text of
-          SOME dep => transient_cache_manifest_error root cache_key manifest manifest_text dep
+          SOME dep => transient_cache_manifest_error root input_key manifest manifest_text dep
         | NONE => ()
     val manifest_lines = cache_manifest_lines manifest_text
     val {sig_hash, sml_hash, dat_hash, trace_hash, extra_hashes, parents, mldeps} =
-      cache_manifest_blobs_from_lines cache_key manifest_lines
+      cache_manifest_blobs_from_lines input_key manifest_lines
     val expected_extra_outputs = source_extra_output_declarations plan node
     val _ =
       if map #1 extra_hashes = expected_extra_outputs then ()
@@ -2410,8 +2382,8 @@ fun materialize_theory_cache_key verify_cache allow_timeout_discrepancy project 
          extra_hashes;
        record_materialized_extra_outputs project node extra_output_paths;
        write_local_theory_manifests plan node {parents = parents, mldeps = mldeps};
-       HolbuildCache.touch_action root cache_key;
-       cache_trace ("cache hit: " ^ logical_name node ^ " " ^ role ^ "=" ^ cache_key);
+       HolbuildCache.touch_action root input_key;
+       cache_trace ("cache hit: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^ input_key);
        CacheRestored proof_timeout)
   in
     install ()
@@ -2419,14 +2391,10 @@ fun materialize_theory_cache_key verify_cache allow_timeout_discrepancy project 
   handle Error "cache entry not found" => CacheMiss
        | e => (remove_failed_cache_outputs project node;
                cache_trace ("cache miss: " ^ logical_name node ^ " " ^
-                            cache_key_role plan node input_key cache_key ^ "=" ^ cache_key ^
+                            cache_key_role ^ "=" ^ input_key ^
                             " (" ^ General.exnMessage e ^ ")");
                warn ("cache entry unusable for " ^ logical_name node ^ ": " ^ General.exnMessage e);
                CacheMiss)
-
-fun materialize_theory_cache verify_cache allow_timeout_discrepancy project plan input_key requested_timeout require_trace node =
-  materialize_theory_cache_key verify_cache allow_timeout_discrepancy project plan input_key
-    requested_timeout require_trace (theory_cache_key plan node input_key) node
 
 fun metadata_path (project : HolbuildProject.t) node =
   let
@@ -2480,6 +2448,11 @@ fun discover_boundaries_and_terminations source_path source_text =
   HolbuildTheorySpans.scan_boundaries_and_terminations_recovering_strict source_path source_text
   handle HolbuildTheoryCheckpoints.Error msg => raise Error msg
 
+(* Context checkpoints hold the theorems saved so far, with their recorded
+   locations; this names how those were recorded, so that states saved before
+   staged scripts carried location pragmas are not resumed. *)
+val theorem_location_schema = "source_pragmas_v1"
+
 fun theorem_checkpoint_key {kind, name, safe_name, boundary, deps_key, proof_engine, prefix_hash} =
   HolbuildToolchain.hash_text
     (String.concatWith "\n"
@@ -2490,7 +2463,8 @@ fun theorem_checkpoint_key {kind, name, safe_name, boundary, deps_key, proof_eng
         "boundary=" ^ Int.toString boundary,
         "deps_key=" ^ deps_key,
         "proof_engine=" ^ proof_engine,
-        "prefix_key=" ^ prefix_hash] ^ "\n")
+        "prefix_key=" ^ prefix_hash,
+        "theorem_locations=" ^ theorem_location_schema] ^ "\n")
 
 fun declaration_checkpoint_key {name, safe_name, boundary, deps_key, proof_engine, prefix_hash} =
   HolbuildToolchain.hash_text
@@ -2501,7 +2475,8 @@ fun declaration_checkpoint_key {name, safe_name, boundary, deps_key, proof_engin
         "boundary=" ^ Int.toString boundary,
         "deps_key=" ^ deps_key,
         "proof_engine=" ^ proof_engine,
-        "prefix_key=" ^ prefix_hash] ^ "\n")
+        "prefix_key=" ^ prefix_hash,
+        "theorem_locations=" ^ theorem_location_schema] ^ "\n")
 
 fun proof_timeout_field proof_timeout = ("proof_timeout", timeout_text proof_timeout)
 
@@ -2534,7 +2509,8 @@ fun failed_prefix_ok proof_engine proof_timeout deps_key safe_name pre_hash head
      ("pre_theorem_key", pre_hash),
      ("header_key", header_hash),
      ("failure_diagnostic_key", failed_prefix_diagnostic_key proof_engine),
-     ("resume_schema_key", failed_prefix_resume_schema_key proof_engine)]
+     ("resume_schema_key", failed_prefix_resume_schema_key proof_engine),
+     ("theorem_locations", theorem_location_schema)]
 
 fun theorem_checkpoint_specs proof_engine proof_timeout project node deps_key source proof_ir_plans (boundaries : HolbuildTheoryCheckpoints.boundary list) =
   let
@@ -2812,14 +2788,19 @@ val theory_manifest_version = "1"
 fun policy_config_lines _ =
   ["theory_manifest_version=" ^ theory_manifest_version]
 
-fun plain_source_from_checkpoint source_text start_offset =
-  if start_offset <= 0 then source_text
-  else "val _ = HolbuildRuntime.restore_prover();\n" ^ String.extract(source_text, start_offset, NONE)
+fun plain_source_from_checkpoint source_name source_text start_offset =
+  String.concat
+    [if start_offset <= 0 then ""
+     else HolbuildTheoryCheckpoints.generated_code_pragma source_text ^
+          "val _ = HolbuildRuntime.restore_prover();\n",
+     HolbuildTheoryCheckpoints.file_pragma source_name,
+     HolbuildTheoryCheckpoints.source_line_pragma source_text start_offset,
+     String.extract(source_text, Int.max(0, start_offset), NONE)]
 
-fun instrumented_source policy timeout_marker plan_only_marker source_text start_offset checkpoints declaration_checkpoints terminations =
+fun instrumented_source policy timeout_marker plan_only_marker source_name source_text start_offset checkpoints declaration_checkpoints terminations =
   if proof_steps_enabled policy then
     HolbuildTheoryCheckpoints.instrument
-      {source = source_text, start_offset = start_offset, checkpoints = checkpoints,
+      {source = source_text, source_name = source_name, start_offset = start_offset, checkpoints = checkpoints,
        declaration_checkpoints = if checkpoint_enabled policy then declaration_checkpoints else [],
        terminations = terminations,
        save_checkpoints = checkpoint_enabled policy,
@@ -2829,7 +2810,7 @@ fun instrumented_source policy timeout_marker plan_only_marker source_text start
        trace_all = trace_steps policy,
        plan_only_marker = plan_only_marker,
        new_ir = proof_ir_enabled policy}
-  else plain_source_from_checkpoint source_text start_offset
+  else plain_source_from_checkpoint source_name source_text start_offset
 
 fun replay_candidate policy project node theorem_checkpoints declaration_checkpoints =
   best_replay_candidate (tactic_timeout policy) project node theorem_checkpoints declaration_checkpoints
@@ -2860,7 +2841,7 @@ fun failed_prefix_resume_message node source_text checkpoint step_count =
     ["from: failed-prefix checkpoint in " ^ #safe_name checkpoint,
      "restoring proof-ir prefix with " ^ Int.toString step_count ^ " successful leaf steps"]
 
-fun failed_prefix_resume_source policy timeout_marker plan_only_marker source checkpoints declaration_checkpoints terminations checkpoint metadata_text =
+fun failed_prefix_resume_source policy timeout_marker plan_only_marker source_name source checkpoints declaration_checkpoints terminations checkpoint metadata_text =
   let
     val runtime_config =
       {checkpoint_enabled = checkpoint_enabled policy,
@@ -2883,13 +2864,16 @@ fun failed_prefix_resume_source policy timeout_marker plan_only_marker source ch
          " " ^ HolbuildToolchain.sml_string (#failed_prefix_ok checkpoint)]
     val theorem_save_line =
       String.concat
-        ["val ", theorem_binding, " = HolbuildRuntime.save_thm(",
+        ["val ", theorem_binding, " = HolbuildRuntime.save_thm_at (",
+         HolbuildToolchain.sml_string source_name, ", ",
+         Int.toString (HolbuildTheoryCheckpoints.line_at source (#theorem_start checkpoint)), ") (",
          HolbuildToolchain.sml_string (#name checkpoint), ", ",
          finish_failed_prefix_call,
          ");\n"]
     val resume_replay_block =
       String.concat
-        [source_slice (#theorem_start checkpoint) (#tactic_start checkpoint),
+        [HolbuildTheoryCheckpoints.source_line_pragma source (#theorem_start checkpoint),
+         source_slice (#theorem_start checkpoint) (#tactic_start checkpoint),
          "(ACCEPT_TAC (", finish_failed_prefix_call, "))",
          source_slice (#tactic_end checkpoint) (#boundary checkpoint),
          "\n"]
@@ -2902,6 +2886,7 @@ fun failed_prefix_resume_source policy timeout_marker plan_only_marker source ch
     val suffix =
       HolbuildTheoryCheckpoints.instrument
         {source = source,
+         source_name = source_name,
          start_offset = #boundary checkpoint,
          checkpoints = checkpoints,
          declaration_checkpoints = if checkpoint_enabled policy then declaration_checkpoints else [],
@@ -2914,7 +2899,9 @@ fun failed_prefix_resume_source policy timeout_marker plan_only_marker source ch
          plan_only_marker = plan_only_marker,
          new_ir = proof_ir_enabled policy}
   in
-    prelude ^ replay_block ^ suffix
+    String.concat
+      [HolbuildTheoryCheckpoints.generated_code_pragma source, prelude,
+       HolbuildTheoryCheckpoints.file_pragma source_name, replay_block, suffix]
   end
 
 datatype failure_repl_checkpoint =
@@ -2974,10 +2961,10 @@ fun run_failure_repl tc policy theorem_checkpoints failure_checkpoints deps_load
             ignore (HolbuildToolchain.run_interactive argv)
           end
 
-fun write_theory_script policy project (base : node_base) plan keys input_key node source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
+fun write_theory_script policy project (base : node_base) plan keys input_key node source_name source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
   if not (checkpoint_enabled policy) then
     (write_plain_preload (#first_loads base) plan node preload;
-     write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_text 0 checkpoints [] terminations);
+     write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints [] terminations);
      {context = #context base, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
   else
     let
@@ -2991,7 +2978,7 @@ fun write_theory_script policy project (base : node_base) plan keys input_key no
          List.app (fn {context_path, ...} => ensure_parent context_path) declaration_checkpoints)
       fun run_from_deps_checkpoint () =
         (ensure_source_checkpoint_parents ();
-         write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_text 0 checkpoints declaration_checkpoints terminations);
+         write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
          deps_loaded_resume_message node;
          {context = HolState deps_loaded, files = [staged_script], failure_checkpoints = [deps_loaded], failed_prefix_context = NONE})
       fun run_from_fresh_preload () =
@@ -2999,13 +2986,13 @@ fun write_theory_script policy project (base : node_base) plan keys input_key no
          remove_declaration_checkpoints_for_deps project node deps_key;
          ensure_source_checkpoint_parents ();
          write_preload (#first_loads base) plan node deps_loaded deps_ok preload;
-         write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_text 0 checkpoints declaration_checkpoints terminations);
+         write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
          {context = #context base, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
       fun run_from_failed_prefix {checkpoint, step_count, metadata_text} =
         let
           val path = #failed_prefix_path checkpoint
           val _ = ensure_source_checkpoint_parents ()
-          val _ = write_text staged_script (failed_prefix_resume_source policy timeout_marker plan_only_marker source_text checkpoints declaration_checkpoints terminations checkpoint metadata_text)
+          val _ = write_text staged_script (failed_prefix_resume_source policy timeout_marker plan_only_marker source_name source_text checkpoints declaration_checkpoints terminations checkpoint metadata_text)
           val _ = failed_prefix_resume_message node source_text checkpoint step_count
         in
           {context = HolState path, files = [staged_script], failure_checkpoints = [path, deps_loaded], failed_prefix_context = SOME (path, step_count)}
@@ -3013,7 +3000,7 @@ fun write_theory_script policy project (base : node_base) plan keys input_key no
       fun run_from_replay {boundary, path, safe_name, kind, failure_checkpoints} =
         let
           val _ = ensure_source_checkpoint_parents ()
-          val _ = write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_text boundary checkpoints declaration_checkpoints terminations)
+          val _ = write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_name source_text boundary checkpoints declaration_checkpoints terminations)
           val _ = source_context_resume_message node source_text kind safe_name boundary
         in
           {context = HolState path, files = [staged_script], failure_checkpoints = failure_checkpoints @ [deps_loaded], failed_prefix_context = NONE}
@@ -3092,7 +3079,7 @@ fun build_theory cache_allowed policy tc project (base : node_base) plan keys no
     val _ = remove_file plan_only_marker
     val _ = List.app (ensure_parent o #2) staged_extra_outputs
     val run_spec = write_theory_script policy project base plan keys input_key node
-                                    source_text theorem_checkpoints declaration_checkpoints termination_diagnostics staged_script preload timeout_marker
+                                    (located_source_name (#holdir tc) node) source_text theorem_checkpoints declaration_checkpoints termination_diagnostics staged_script preload timeout_marker
                                     (if execution_plan_only policy then SOME plan_only_marker else NONE)
     fun tactic_timeout_error () =
       let
@@ -3426,10 +3413,13 @@ fun output_hash_lines checkpoint_policy plan node =
 fun theory_name_from_logical logical =
   if has_suffix "Theory" logical then drop_suffix "Theory" logical else logical
 
+(* The whole closure, since a theory parent can be reached through an ML
+   library.  Callers keep only the deps the child's .dat records as parents,
+   which drops ordering-only deps. *)
 fun project_theory_deps plan node =
   List.filter
     (fn dep => #kind (HolbuildBuildPlan.source_of dep) = HolbuildSourceIndex.TheoryScript)
-    (HolbuildBuildPlan.direct_project_deps plan node)
+    (HolbuildBuildPlan.transitive_project_deps plan node)
 
 fun insert_first_string_dict (dict, key, value) =
   case Binarymap.peek (dict, key) of
@@ -4228,7 +4218,8 @@ fun refresh_base_heap (options : build_options) tc project plan toolchain_key =
       NONE => ()
     | SOME spec =>
         let
-          val keys = HolbuildBuildPlan.input_keys (build_config_lines options project plan) toolchain_key plan
+          val keys = HolbuildBuildPlan.input_keys (build_config_lines options project plan)
+                       (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
           val objects = base_heap_object_nodes plan (#objects spec)
         in
           ignore (export_base_heap (new_file_hash_cache ()) tc project
@@ -4284,7 +4275,9 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_h
           CacheMiss => CacheMiss
         | restored as CacheRestored _ =>
             if theory_parent_hashes_match dat_hash_cache plan node NONE then restored
-            else (remove_failed_cache_outputs project node; CacheMiss)
+            else (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
+                               input_key ^ " (parent outputs differ)");
+                  remove_failed_cache_outputs project node; CacheMiss)
     fun restore_from_cache built_timeout =
       (remove_tree stage;
        invalidate_node_dat_hash ();
@@ -5186,22 +5179,23 @@ fun compare_dump_rows ((left, _), (right, _)) = String.compare(left, right)
 (* Key dumps are normally a faithful view of the build's cache keys.  Tests may
    supply a fixed toolchain identity: real toolchain keys hash platform-built
    HOL binaries, so using them in a checked-in golden fixture would make that
-   fixture host-specific.  This affects only the diagnostic dump; execution
-   and cache lookup continue to use the real toolchain key. *)
-fun dump_toolchain_key toolchain_key =
+   fixture host-specific.  The fixed identity stands for both the theory
+   toolchain key and the exact toolchain key.  This affects only the
+   diagnostic dump; execution and cache lookup continue to use the real keys. *)
+fun dump_toolchain_key () =
   case OS.Process.getEnv "HOLBUILD_DUMP_KEYS_TOOLCHAIN_KEY" of
-      SOME key => if key = "" then toolchain_key else key
-    | NONE => toolchain_key
+      SOME key => if key = "" then NONE else SOME key
+    | NONE => NONE
 
 fun dump_keys_if_requested config_lines_for_node toolchain_key plan keys base_heap =
   case OS.Process.getEnv "HOLBUILD_DUMP_KEYS" of
       NONE => ()
     | SOME path =>
         let
-          val dump_toolchain = dump_toolchain_key toolchain_key
-          val dump_keys =
-            if dump_toolchain = toolchain_key then keys
-            else HolbuildBuildPlan.input_keys config_lines_for_node dump_toolchain plan
+          val (dump_toolchain, dump_keys) =
+            case dump_toolchain_key () of
+                NONE => (toolchain_key, keys)
+              | SOME key => (key, HolbuildBuildPlan.input_keys config_lines_for_node key plan)
           val rows =
             HolbuildBuildPlan.sort_pairs compare_dump_rows
               (map (dump_key_row dump_toolchain plan dump_keys base_heap)
@@ -5219,7 +5213,8 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
     val _ = enforce_checkpoint_budget_state_excluding budget_state []
     val users = Option.map (base_heap_users project plan) (#base_heap options)
     val config_lines = config_lines_with users options project
-    val keys = HolbuildBuildPlan.input_keys config_lines toolchain_key plan
+    val keys = HolbuildBuildPlan.input_keys config_lines
+                 (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
     val base_heap = Option.mapPartial (base_heap_for tc toolchain_key keys) users
     val _ = dump_keys_if_requested config_lines toolchain_key plan keys base_heap
     val dat_hash_cache = new_file_hash_cache ()

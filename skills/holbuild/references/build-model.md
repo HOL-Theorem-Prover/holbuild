@@ -51,9 +51,22 @@ hash(
   declared action policy (deps, loads, extra_deps, cache, always_reexecute),
   extra dependency hashes,
   base heap objects (base_heap_objects=, only for a base heap user, whether it starts from the heap or cold),
-  toolchain key (hol binary + hol.state hashes)
+  names of the HOL toolchain theories and libraries it loads,
+  theory toolchain key
 )
 ```
+
+The theory toolchain key identifies what theory actions see of the HOL
+toolchain: a content hash of the HOL source tree as fetched (VCS metadata
+excluded), the HOL build arguments, the kernel variant, and the Poly/ML release
+(without its runtime/architecture token). It is computed when the toolchain is
+built and stored in the toolchain cache entry's `theory-toolchain` file. Toolchain
+objects are named but not hashed: they are a function of those inputs, and their
+files embed the install path. So toolchains of one recipe built under different
+cache roots, or rebuilt, give the same action keys. Proof checkpoints and heaps
+are Poly/ML heaps and stay keyed by the exact toolchain key (`bin/hol` and
+`bin/hol.state` hashes). So do all action keys under a tracing kernel, whose
+theory actions also produce `.tr.gz` Poly/ML exports.
 
 **Any source byte change** (including comments/proof edits) changes the action key and cascades to all dependents. This is conservative — v1 does not attempt semantic equivalence of generated outputs.
 
@@ -85,10 +98,11 @@ locks/                          # publish + GC locks
 
 Cache publish: after a source build, theory artifacts (sig, sml, dat) are stored as blobs. New HOL `Theory.sml` files are relocatable and copied unchanged; old HOL `Theory.sml` files are rebased to the local adjacent `.dat` path before publishing.
 
-Cache restore: on action-key or parent-output key match, blobs are materialized into local `.holbuild/`, `HOLFileSys` remap copies are created, and `.uo/.ui` load manifests are written.
+Cache restore: on action-key match, blobs are materialized into local `.holbuild/`, `HOLFileSys` remap copies are created, and `.uo/.ui` load manifests are written.
 
 **A bad cache hit is worse than a missed cache hit.** Validation:
 - Action key must match
+- A restored theory's recorded parent `.dat` hashes must match the project parent theories it is restored against
 - All referenced blobs must exist with correct content hashes
 - Manifest must have no transient stage paths in mldeps
 - On any validation failure: warn, delete local outputs, rebuild from source
@@ -96,10 +110,13 @@ Cache restore: on action-key or parent-output key match, blobs are materialized 
 `--no-cache` disables both restore and publish but preserves local `.holbuild/` up-to-date checks. Force levels skip local up-to-date and cache restore only for the selected node set, and still publish cache unless `--no-cache` is also set: `--force=theory` (or `--force-theory`) forces requested/default target nodes, `--force=project` forces root-project nodes in the requested plan, and `--force=full`/bare `--force` forces the whole requested plan including dependency packages.
 
 GC:
-- `holbuild [--cache-dir PATH] gc [--retention-days N] [--max-checkpoints-gb GB] [--clean-only|--cache-only]`
+- `holbuild [--cache-dir PATH] gc [--retention-days N] [--max-checkpoints-gb GB] [--clean-only|--cache-only|--toolchains-only]`
 - Default: project clean + global cache GC, 7-day retention, 5GB checkpoint budget
 - Project clean removes stale `.holbuild/stage`, `.holbuild/logs`, checkpoint families, and evicts oldest checkpoint families above the size cap
 - Cache GC removes stale tmp, expired action manifests, and unreachable blobs, serialized with a POSIX file lock at `locks/gc.lock`
+- Cache GC also removes HOL toolchains under `hol-toolchains/` unused for the retention period (tracked by each entry's `last-used` marker); toolchains being built, restored, or used by a running holbuild are skipped and reported as `toolchains-busy`
+- Cache GC stages (tmp, locks, actions, blobs, toolchain-trash, toolchains) that run longer than a second on a terminal, or ten seconds when redirected, report scanned/removed counts and elapsed time on stderr, except under `--quiet`; stdout keeps the `project clean:` and `cache gc:` summary lines
+- `--toolchains-only` runs only the toolchain-trash and toolchains stages, under the same `locks/gc.lock`, without project discovery or scanning tmp, actions, or blobs; its stdout summary is `cache gc: removed toolchains=N toolchains-busy=M`; the `--*-only` options are mutually exclusive
 - Interrupted cache GC does not leave a stale lock; older directory-style `locks/gc.lock` entries are removed/replaced automatically
 - Legacy `holbuild cache gc` remains cache-only
 
