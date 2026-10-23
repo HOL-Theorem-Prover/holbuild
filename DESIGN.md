@@ -178,8 +178,8 @@ The current external implementation vendors the small set of HOL implementation
 pieces needed to compile the holbuild executable under `vendor/hol`. That is a
 build-time host/tool dependency, not a project semantic state model. During the transition, holbuild
 starts target actions from the project HOL's `bin/hol.state` and includes that
-heap in the toolchain key; it
-does not copy it into a project-local `_base` checkpoint. The target model
+heap in the toolchain key of checkpoints and heaps (theory action keys use the
+toolchain's semantic identity instead); it does not copy it into a project-local `_base` checkpoint. The target model
 replaces this configured seed with declared bootstrap contexts. Root HOL and user
 dependencies should be ordinary manifest-resolved package nodes whose contexts
 are produced by holbuild. The initial build context is a declared bootstrap

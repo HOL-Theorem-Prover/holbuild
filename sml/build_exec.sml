@@ -2139,32 +2139,6 @@ fun publish_remote_cache_key_if_usable root key =
       SOME manifest => if cache_entry_usable root key manifest then publish_remote_cache_key root key else ()
     | NONE => ()
 
-fun direct_project_theory_deps plan node =
-  List.filter
-    (fn dep => #kind (HolbuildBuildPlan.source_of dep) = HolbuildSourceIndex.TheoryScript)
-    (HolbuildBuildPlan.direct_project_deps plan node)
-
-fun parent_output_cache_lines plan node =
-  map
-    (fn dep =>
-        let val {data_path, ...} = theory_outputs dep
-        in String.concat ["parent=", HolbuildBuildPlan.package dep, ":",
-                          HolbuildBuildPlan.relative_path dep, ":",
-                          logical_name dep, "@", file_hash data_path]
-        end)
-    (direct_project_theory_deps plan node)
-
-fun parent_output_cache_key plan node input_key =
-  case parent_output_cache_lines plan node of
-      [] => input_key
-    | parent_lines =>
-        HolbuildHash.string_sha1
-          (String.concatWith "\n"
-             (["holbuild-parent-output-cache-v1", "input_key=" ^ input_key] @ parent_lines) ^ "\n")
-
-fun theory_cache_key plan node input_key =
-  parent_output_cache_key plan node input_key
-
 fun cache_warning_subject node =
   String.concat [logical_name node, " (", source_file node, ")"]
 
@@ -2220,20 +2194,14 @@ fun publish_theory_cache plan node input_key proof_timeout staged_sig published_
     val root = cache_root ()
     val _ = HolbuildCache.ensure_layout root
     val cache_mldeps = List.filter (not o transient_stage_mldep) mldeps
-    val cache_parents = parents
-    val cache_key = theory_cache_key plan node input_key
-    fun drop_stale_manifest key = HolbuildCache.remove_action root key
     val subject = cache_warning_subject node
     fun publish () =
-      publish_cache_manifest root cache_key subject staged_sig published_sml staged_dat staged_trace
-                             staged_extras cache_parents cache_mldeps proof_timeout
+      publish_cache_manifest root input_key subject staged_sig published_sml staged_dat staged_trace
+                             staged_extras parents cache_mldeps proof_timeout
     fun skip_locked_publish () = ()
   in
-    ((if cache_key <> input_key then
-        HolbuildCache.with_action_publish_lock root input_key (fn () => drop_stale_manifest input_key) skip_locked_publish
-      else ());
-     HolbuildCache.with_action_publish_lock root cache_key publish skip_locked_publish;
-     publish_remote_cache_key_if_usable root cache_key)
+    (HolbuildCache.with_action_publish_lock root input_key publish skip_locked_publish;
+     publish_remote_cache_key_if_usable root input_key)
     handle e => warn ("could not publish cache entry: " ^ General.exnMessage e)
   end
 
@@ -2329,31 +2297,26 @@ fun remove_failed_cache_outputs project node =
     remove_checkpoint_family project node
   end
 
-
-fun cache_key_role plan node input_key cache_key =
-  if cache_key = input_key then "source/dependency key"
-  else if cache_key = theory_cache_key plan node input_key then "parent-output key"
-  else "cache key"
-
 datatype theory_cache_restore = CacheMiss | CacheRestored of real option
 
-fun materialize_theory_cache_key verify_cache allow_timeout_discrepancy project plan input_key requested_timeout require_trace cache_key node =
+val cache_key_role = "source/dependency key"
+
+fun materialize_theory_cache verify_cache allow_timeout_discrepancy project plan input_key requested_timeout require_trace node =
   let
     val root = cache_root ()
-    val manifest = HolbuildCache.action_manifest root cache_key
-    val role = cache_key_role plan node input_key cache_key
+    val manifest = HolbuildCache.action_manifest root input_key
     val manifest_text =
-      case ensure_local_cache_entry root cache_key of
+      case ensure_local_cache_entry root input_key of
           SOME text => text
-        | NONE => (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ role ^ "=" ^ cache_key ^ " (no manifest)");
+        | NONE => (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^ input_key ^ " (no manifest)");
                    raise Error "cache entry not found")
     val _ =
       case transient_stage_mldep_in_manifest manifest_text of
-          SOME dep => transient_cache_manifest_error root cache_key manifest manifest_text dep
+          SOME dep => transient_cache_manifest_error root input_key manifest manifest_text dep
         | NONE => ()
     val manifest_lines = cache_manifest_lines manifest_text
     val {sig_hash, sml_hash, dat_hash, trace_hash, extra_hashes, parents, mldeps} =
-      cache_manifest_blobs_from_lines cache_key manifest_lines
+      cache_manifest_blobs_from_lines input_key manifest_lines
     val expected_extra_outputs = source_extra_output_declarations plan node
     val _ =
       if map #1 extra_hashes = expected_extra_outputs then ()
@@ -2391,8 +2354,8 @@ fun materialize_theory_cache_key verify_cache allow_timeout_discrepancy project 
          extra_hashes;
        record_materialized_extra_outputs project node extra_output_paths;
        write_local_theory_manifests plan node {parents = parents, mldeps = mldeps};
-       HolbuildCache.touch_action root cache_key;
-       cache_trace ("cache hit: " ^ logical_name node ^ " " ^ role ^ "=" ^ cache_key);
+       HolbuildCache.touch_action root input_key;
+       cache_trace ("cache hit: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^ input_key);
        CacheRestored proof_timeout)
   in
     install ()
@@ -2400,14 +2363,10 @@ fun materialize_theory_cache_key verify_cache allow_timeout_discrepancy project 
   handle Error "cache entry not found" => CacheMiss
        | e => (remove_failed_cache_outputs project node;
                cache_trace ("cache miss: " ^ logical_name node ^ " " ^
-                            cache_key_role plan node input_key cache_key ^ "=" ^ cache_key ^
+                            cache_key_role ^ "=" ^ input_key ^
                             " (" ^ General.exnMessage e ^ ")");
                warn ("cache entry unusable for " ^ logical_name node ^ ": " ^ General.exnMessage e);
                CacheMiss)
-
-fun materialize_theory_cache verify_cache allow_timeout_discrepancy project plan input_key requested_timeout require_trace node =
-  materialize_theory_cache_key verify_cache allow_timeout_discrepancy project plan input_key
-    requested_timeout require_trace (theory_cache_key plan node input_key) node
 
 fun metadata_path (project : HolbuildProject.t) node =
   let
@@ -3426,10 +3385,13 @@ fun output_hash_lines checkpoint_policy plan node =
 fun theory_name_from_logical logical =
   if has_suffix "Theory" logical then drop_suffix "Theory" logical else logical
 
+(* The whole closure, since a theory parent can be reached through an ML
+   library.  Callers keep only the deps the child's .dat records as parents,
+   which drops ordering-only deps. *)
 fun project_theory_deps plan node =
   List.filter
     (fn dep => #kind (HolbuildBuildPlan.source_of dep) = HolbuildSourceIndex.TheoryScript)
-    (HolbuildBuildPlan.direct_project_deps plan node)
+    (HolbuildBuildPlan.transitive_project_deps plan node)
 
 fun insert_first_string_dict (dict, key, value) =
   case Binarymap.peek (dict, key) of
@@ -3998,7 +3960,9 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
           CacheMiss => CacheMiss
         | restored as CacheRestored _ =>
             if theory_parent_hashes_match dat_hash_cache plan node NONE then restored
-            else (remove_failed_cache_outputs project node; CacheMiss)
+            else (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
+                               input_key ^ " (parent outputs differ)");
+                  remove_failed_cache_outputs project node; CacheMiss)
     fun restore_from_cache built_timeout =
       (remove_tree stage;
        invalidate_node_dat_hash ();
@@ -4889,22 +4853,23 @@ fun compare_dump_rows ((left, _), (right, _)) = String.compare(left, right)
 (* Key dumps are normally a faithful view of the build's cache keys.  Tests may
    supply a fixed toolchain identity: real toolchain keys hash platform-built
    HOL binaries, so using them in a checked-in golden fixture would make that
-   fixture host-specific.  This affects only the diagnostic dump; execution
-   and cache lookup continue to use the real toolchain key. *)
-fun dump_toolchain_key toolchain_key =
+   fixture host-specific.  The fixed identity stands for both the theory
+   toolchain key and the exact toolchain key.  This affects only the
+   diagnostic dump; execution and cache lookup continue to use the real keys. *)
+fun dump_toolchain_key () =
   case OS.Process.getEnv "HOLBUILD_DUMP_KEYS_TOOLCHAIN_KEY" of
-      SOME key => if key = "" then toolchain_key else key
-    | NONE => toolchain_key
+      SOME key => if key = "" then NONE else SOME key
+    | NONE => NONE
 
 fun dump_keys_if_requested config_lines_for_node toolchain_key plan keys =
   case OS.Process.getEnv "HOLBUILD_DUMP_KEYS" of
       NONE => ()
     | SOME path =>
         let
-          val dump_toolchain = dump_toolchain_key toolchain_key
-          val dump_keys =
-            if dump_toolchain = toolchain_key then keys
-            else HolbuildBuildPlan.input_keys config_lines_for_node dump_toolchain plan
+          val (dump_toolchain, dump_keys) =
+            case dump_toolchain_key () of
+                NONE => (toolchain_key, keys)
+              | SOME key => (key, HolbuildBuildPlan.input_keys config_lines_for_node key plan)
           val rows =
             HolbuildBuildPlan.sort_pairs compare_dump_rows
               (map (dump_key_row dump_toolchain plan dump_keys)
@@ -4921,7 +4886,8 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
               (map (checkpoint_base project) (HolbuildBuildPlan.selected_nodes plan))
     val _ = enforce_checkpoint_budget_state_excluding budget_state []
     val base_context = toolchain_base_context tc
-    val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project) toolchain_key plan
+    val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
+                 (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
     val _ = dump_keys_if_requested (build_config_lines_for_node options project) toolchain_key plan keys
     val dat_hash_cache = new_file_hash_cache ()
   in
