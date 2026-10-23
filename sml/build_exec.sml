@@ -2469,6 +2469,16 @@ fun theorem_header_hash source theorem_start tactic_start =
 fun pre_theorem_hash source theorem_start =
   HolbuildToolchain.hash_text (String.substring(source, 0, theorem_start))
 
+(* Checkpoints save state from running the script up to a boundary.  Besides
+   the source prefix, that run may have read the node's extra inputs, so
+   their contents are part of the prefix identity.  Without extra inputs the
+   key is the plain source prefix hash. *)
+fun script_prefix_key NONE source_prefix_hash = source_prefix_hash
+  | script_prefix_key (SOME inputs_key) source_prefix_hash =
+      HolbuildToolchain.hash_text
+        ("holbuild-script-prefix-v1\nsource_prefix=" ^ source_prefix_hash ^
+         "\nextra_inputs=" ^ inputs_key ^ "\n")
+
 fun failed_prefix_diagnostic_key proof_engine = proof_engine ^ ":finish_goal_state_v2"
 fun failed_prefix_resume_schema_key proof_engine = proof_engine ^ ":dependency_prefix_history_v1"
 
@@ -2484,18 +2494,19 @@ fun failed_prefix_ok proof_engine proof_timeout deps_key safe_name pre_hash head
      ("resume_schema_key", failed_prefix_resume_schema_key proof_engine),
      ("theorem_locations", theorem_location_schema)]
 
-fun theorem_checkpoint_specs proof_engine proof_timeout project node deps_key source proof_ir_plans (boundaries : HolbuildTheoryCheckpoints.boundary list) =
+fun theorem_checkpoint_specs proof_engine proof_timeout project node deps_key inputs_key source proof_ir_plans (boundaries : HolbuildTheoryCheckpoints.boundary list) =
   let
     fun pair (boundary, proof_ir_plan) =
       let
         val {kind, name, safe_name, theorem_start, theorem_stop, boundary = boundary_pos, tactic_start,
-             tactic_end, tactic_text, has_proof_attrs, prefix_hash} = boundary
+             tactic_end, tactic_text, has_proof_attrs, prefix_hash = source_prefix_hash} = boundary
+        val prefix_hash = script_prefix_key inputs_key source_prefix_hash
         val checkpoint_key = theorem_checkpoint_key {kind = kind, name = name, safe_name = safe_name,
                                                      boundary = boundary_pos, deps_key = deps_key,
                                                      proof_engine = proof_engine,
                                                      prefix_hash = prefix_hash}
         val header_hash = theorem_header_hash source theorem_start tactic_start
-        val pre_hash = pre_theorem_hash source theorem_start
+        val pre_hash = script_prefix_key inputs_key (pre_theorem_hash source theorem_start)
       in
         {kind = kind, name = name, safe_name = safe_name, theorem_start = theorem_start,
          theorem_stop = theorem_stop, boundary = boundary_pos,
@@ -2517,10 +2528,11 @@ fun theorem_checkpoint_specs proof_engine proof_timeout project node deps_key so
     else raise Error "internal error: proof-IR plan count does not match theorem boundary count"
   end
 
-fun declaration_checkpoint_specs proof_engine proof_timeout project node deps_key source terminations =
+fun declaration_checkpoint_specs proof_engine proof_timeout project node deps_key inputs_key source terminations =
   map (fn ({name, safe_name, definition_start, boundary, ...} : HolbuildTheoryCheckpoints.termination) =>
           let
-            val prefix_hash = HolbuildTheoryCheckpoints.prefix_hash source boundary
+            val prefix_hash =
+              script_prefix_key inputs_key (HolbuildTheoryCheckpoints.prefix_hash source boundary)
             val checkpoint_key = declaration_checkpoint_key {name = name, safe_name = safe_name,
                                                              boundary = boundary, deps_key = deps_key,
                                                              proof_engine = proof_engine,
@@ -3866,7 +3878,8 @@ fun theory_checkpoints_for_node policy project plan keys toolchain_key node sour
                        logical_name node ^ "; using recovered theorem boundaries\n" ^
                        String.concatWith "\n" errors)
     in
-      theorem_checkpoint_specs (proof_engine policy) (tactic_timeout policy) project node deps_key source_text proof_ir_plans boundaries
+      theorem_checkpoint_specs (proof_engine policy) (tactic_timeout policy) project node deps_key
+        (HolbuildBuildPlan.extra_inputs_key plan node) source_text proof_ir_plans boundaries
     end
     handle Error msg =>
       (reject_unenforced_tactic_timeout policy node msg;
@@ -3935,8 +3948,13 @@ fun source_spans_for_node policy node source_text =
 fun declaration_checkpoints_for_node policy project plan keys toolchain_key node source_text terminations =
   if not (checkpoint_enabled policy) orelse not (proof_steps_enabled policy) then []
   else
-    let val deps_key = dependency_context_key toolchain_key plan keys node
-    in declaration_checkpoint_specs (proof_engine policy) (tactic_timeout policy) project node deps_key source_text terminations end
+    let
+      val deps_key = dependency_context_key toolchain_key plan keys node
+      val inputs_key = HolbuildBuildPlan.extra_inputs_key plan node
+    in
+      declaration_checkpoint_specs (proof_engine policy) (tactic_timeout policy) project node deps_key
+        inputs_key source_text terminations
+    end
     handle Error msg =>
       (warn ("could not safely create termination-definition checkpoints for " ^ logical_name node ^
              "; building without termination-definition checkpoints for this theory\n" ^ msg);

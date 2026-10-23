@@ -972,24 +972,13 @@ fun lookup_key keys dep =
       SOME input_key => input_key
     | NONE => raise Error ("missing action key for dependency: " ^ logical_name dep)
 
-fun action_text_with plan config_lines_for_node toolchain_key keys node =
+(* The node's manifest-declared and source-declared extra inputs, each with
+   the content hashes of the files it names. *)
+fun extra_input_lines plan node =
   let
     val source = source_of node
     val analysis = analysis_state plan
-    val source_hash = source_hash_of analysis node
-    val project_deps =
-      map (fn dep => package dep ^ ":" ^ logical_name dep ^ "@" ^ lookup_key keys dep)
-        (direct_project_deps plan node)
-    (* Toolchain objects are a function of the theory toolchain identity, so
-       they are named but not hashed: their files carry the install path. *)
-    val external_deps = map (fn name => "HOL:" ^ name) (direct_external_theories plan node)
-    val external_libs = map (fn name => "HOLLIB:" ^ name) (direct_external_libs plan node)
-    val policy = #policy source
-    val declared_deps = HolbuildProject.action_deps policy
-    val declared_loads = HolbuildProject.action_loads policy
-    val declared_dep_lines = map (fn dep => "declared_dep=" ^ dep) declared_deps
-    val declared_load_lines = map (fn dep => "declared_load=" ^ dep) declared_loads
-    val extra_inputs = HolbuildProject.action_extra_inputs policy
+    val extra_inputs = HolbuildProject.action_extra_inputs (#policy source)
     val _ =
       List.app
         (fn input => HolbuildComponentProvider.ensure_extra_input analysis source
@@ -1007,6 +996,35 @@ fun action_text_with plan config_lines_for_node toolchain_key keys node =
           [HolbuildProject.extra_input_path input]) extra_inputs)
     val source_extra_dep_lines =
       extra_dep_lines "source_extra_dep" (Path.dir (#source_path source)) source_extra_deps
+  in
+    manifest_extra_dep_lines @ source_extra_dep_lines
+  end
+
+(* Running a script prefix may read the node's extra inputs, so state saved
+   from such a run is valid only for the same input contents.  NONE when the
+   node has no extra inputs. *)
+fun extra_inputs_key plan node =
+  case extra_input_lines plan node of
+      [] => NONE
+    | lines => SOME (hash_text (String.concatWith "\n" ("holbuild-extra-inputs-v1" :: lines) ^ "\n"))
+
+fun action_text_with plan config_lines_for_node toolchain_key keys node =
+  let
+    val source = source_of node
+    val analysis = analysis_state plan
+    val source_hash = source_hash_of analysis node
+    val project_deps =
+      map (fn dep => package dep ^ ":" ^ logical_name dep ^ "@" ^ lookup_key keys dep)
+        (direct_project_deps plan node)
+    (* Toolchain objects are a function of the theory toolchain identity, so
+       they are named but not hashed: their files carry the install path. *)
+    val external_deps = map (fn name => "HOL:" ^ name) (direct_external_theories plan node)
+    val external_libs = map (fn name => "HOLLIB:" ^ name) (direct_external_libs plan node)
+    val policy = #policy source
+    val declared_deps = HolbuildProject.action_deps policy
+    val declared_loads = HolbuildProject.action_loads policy
+    val declared_dep_lines = map (fn dep => "declared_dep=" ^ dep) declared_deps
+    val declared_load_lines = map (fn dep => "declared_load=" ^ dep) declared_loads
     val source_extra_output_lines =
       map (fn output => "source_extra_output=" ^ output)
           (#extra_outputs (deps_of analysis node))
@@ -1023,8 +1041,7 @@ fun action_text_with plan config_lines_for_node toolchain_key keys node =
       config_lines_for_node node @
       declared_dep_lines @
       declared_load_lines @
-      manifest_extra_dep_lines @
-      source_extra_dep_lines @
+      extra_input_lines plan node @
       source_extra_output_lines @
       map (fn dep => "dep=" ^ dep) (project_deps @ external_deps @ external_libs)
   in
