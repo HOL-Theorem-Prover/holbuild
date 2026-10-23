@@ -235,7 +235,8 @@ type t =
    universe_key_index : key_index,
    universe_node_index : node Vector.vector,
    dependency_closure_cache : node list option array,
-   dependency_context_key_cache : (string * string) option array}
+   dependency_context_key_cache : (string * string) option array,
+   extra_inputs_key_cache : string option option array}
 
 fun universe_nodes ({universe, ...} : t) = universe
 fun root_nodes ({roots, ...} : t) = roots
@@ -876,6 +877,8 @@ fun plan_selection components holdir sources selection =
       Array.array(length nodes, NONE : node list option)
     val dependency_context_key_cache =
       Array.array(length nodes, NONE : (string * string) option)
+    val extra_inputs_key_cache =
+      Array.array(length nodes, NONE : string option option)
   in
     {universe = nodes, roots = roots, selected = selected, name_index = index, analysis = analysis,
      dependency_graph = dependency_graph,
@@ -886,7 +889,8 @@ fun plan_selection components holdir sources selection =
      universe_key_index = universe_key_index,
      universe_node_index = universe_node_index,
      dependency_closure_cache = dependency_closure_cache,
-     dependency_context_key_cache = dependency_context_key_cache}
+     dependency_context_key_cache = dependency_context_key_cache,
+     extra_inputs_key_cache = extra_inputs_key_cache}
   end
 
 fun plan_all components holdir sources =
@@ -1000,13 +1004,25 @@ fun extra_input_lines plan node =
     manifest_extra_dep_lines @ source_extra_dep_lines
   end
 
+fun remember_extra_inputs_key (plan as {extra_inputs_key_cache, ...} : t) node lines =
+  let
+    val value =
+      case lines of
+          [] => NONE
+        | _ => SOME (hash_text (String.concatWith "\n" ("holbuild-extra-inputs-v1" :: lines) ^ "\n"))
+  in
+    Array.update(extra_inputs_key_cache, plan_node_id plan node, SOME value)
+  end
+
 (* Running a script prefix may read the node's extra inputs, so state saved
    from such a run is valid only for the same input contents.  NONE when the
-   node has no extra inputs. *)
-fun extra_inputs_key plan node =
-  case extra_input_lines plan node of
-      [] => NONE
-    | lines => SOME (hash_text (String.concatWith "\n" ("holbuild-extra-inputs-v1" :: lines) ^ "\n"))
+   node has no extra inputs.  Recorded when the node's input key is computed,
+   so it names the same bytes as the action key, and building never rehashes
+   inputs or reruns their generators. *)
+fun extra_inputs_key (plan as {extra_inputs_key_cache, ...} : t) node =
+  case Array.sub(extra_inputs_key_cache, plan_node_id plan node) of
+      SOME value => value
+    | NONE => raise Error ("internal error: extra-inputs key not computed for " ^ logical_name node)
 
 fun action_text_with plan config_lines_for_node toolchain_key keys node =
   let
@@ -1028,6 +1044,8 @@ fun action_text_with plan config_lines_for_node toolchain_key keys node =
     val source_extra_output_lines =
       map (fn output => "source_extra_output=" ^ output)
           (#extra_outputs (deps_of analysis node))
+    val input_lines = extra_input_lines plan node
+    val _ = remember_extra_inputs_key plan node input_lines
     val lines =
       ["holbuild-action-v1",
        "toolchain=" ^ toolchain_key,
@@ -1041,7 +1059,7 @@ fun action_text_with plan config_lines_for_node toolchain_key keys node =
       config_lines_for_node node @
       declared_dep_lines @
       declared_load_lines @
-      extra_input_lines plan node @
+      input_lines @
       source_extra_output_lines @
       map (fn dep => "dep=" ^ dep) (project_deps @ external_deps @ external_libs)
   in
