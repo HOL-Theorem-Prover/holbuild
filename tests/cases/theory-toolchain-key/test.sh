@@ -179,3 +179,23 @@ if [[ "$(input_key_for_root "$root_a")" == "$input_a" ]]; then
   echo "ATheory input key did not change with the HOL source" >&2
   exit 1
 fi
+
+# The recovery reads the legacy entry's git checkout only; an entry whose tree
+# is not a git checkout is rebuilt from source instead.
+key_c=$(theory_toolchain_key "$holdir_c")
+input_c=$(input_key_for_root "$root_a")
+rm "$(dirname "$holdir_c")/theory-toolchain"
+rm -rf "$holdir_c/.git"
+builds_before=$(builds)
+if [[ "$(input_key_for_root "$root_a")" != "$input_c" ]]; then
+  echo "rebuilt legacy entry gives a different ATheory input key" >&2
+  exit 1
+fi
+if [[ "$(builds)" != $((builds_before + 1)) ]]; then
+  echo "legacy entry without a git checkout was not rebuilt" >&2
+  exit 1
+fi
+if [[ "$(theory_toolchain_key "$holdir_c")" != "$key_c" ]]; then
+  echo "rebuilt legacy entry has a different theory toolchain identity" >&2
+  exit 1
+fi

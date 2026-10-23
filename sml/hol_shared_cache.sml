@@ -230,17 +230,19 @@ fun hol_source_files holdir =
     visit "" []
   end
 
-(* Toolchain entries built before the identity existed hold build outputs
-   next to the sources; the checkout's own file list recovers the source set
-   that hol_source_files saw right after the fetch. *)
+(* Legacy only: toolchain entries built before the identity existed hold
+   build outputs next to the sources, and their git checkout's file list
+   recovers the source set that hol_source_files saw right after the fetch.
+   NONE when that fails (not a git checkout, no git); the caller then
+   rebuilds the entry.  Nothing else reads the identity from git. *)
 fun legacy_hol_source_files k holdir =
   let
     (* Not command_output_using: git's stderr must not mix with the paths. *)
-    val command = "git -C " ^ quote holdir ^ " ls-files -z"
-    val {status, output} = run_mutation_output k command
+    val {status, output} =
+      run_mutation_output k ("git -C " ^ quote holdir ^ " ls-files -z 2>/dev/null")
   in
-    if OS.Process.isSuccess status then String.tokens (fn c => c = #"\000") output
-    else die ("command failed: " ^ command)
+    if OS.Process.isSuccess status then SOME (String.tokens (fn c => c = #"\000") output)
+    else NONE
   end
 
 fun hol_source_identity holdir rels =
@@ -306,10 +308,15 @@ fun validate_entry req k =
     else if not (built holdir) then
       die ("broken HOL toolchain cache entry: " ^ dir ^ "\nremove it with: rm -rf " ^ quote dir)
     else
-      let val status = dirty_status k holdir
+      let
+        val {status, output} =
+          run_mutation_output k
+            ("git -C " ^ quote holdir ^ " status --porcelain --ignored=no 2>/dev/null")
       in
-        if status = "" then true
-        else die ("dirty HOL toolchain cache entry: " ^ dir ^ "\n" ^ status ^ "\nremove it with: rm -rf " ^ quote dir)
+        (* An entry whose tree is not a git checkout is rebuilt. *)
+        if not (OS.Process.isSuccess status) then false
+        else if trim output = "" then true
+        else die ("dirty HOL toolchain cache entry: " ^ dir ^ "\n" ^ trim output ^ "\nremove it with: rm -rf " ^ quote dir)
       end
   end
 
@@ -607,12 +614,16 @@ fun publish_entry k =
           else die "HOL toolchain is not complete enough to publish")
          handle error => warn_publish (archive_error_message error))
 
+(* false when the legacy entry's sources cannot be listed. *)
 fun generate_legacy_theory_toolchain req k =
   let val holdir = holdir_for_key k
   in
-    write_file (theory_toolchain_for_key k)
-      (theory_toolchain_text (#kernel_variant req)
-         (hol_source_identity holdir (legacy_hol_source_files k holdir)))
+    case legacy_hol_source_files k holdir of
+        NONE => false
+      | SOME rels =>
+          (write_file (theory_toolchain_for_key k)
+             (theory_toolchain_text (#kernel_variant req) (hol_source_identity holdir rels));
+           true)
   end
 
 fun restore_or_build_entry req k =
@@ -631,7 +642,10 @@ fun finish_entry req k =
          false)
       else restore_or_build_entry req k
     val _ = if hol_source_manifest_built k then () else generate_hol_source_manifest k
-    val _ = if theory_toolchain_built k then () else generate_legacy_theory_toolchain req k
+    val built_locally =
+      if theory_toolchain_built k orelse generate_legacy_theory_toolchain req k then built_locally
+      else
+        (ignore (build_entry req k); true)
     val _ = ignore (build_analyser k)
     val _ = if built_locally then publish_entry k else ()
   in
