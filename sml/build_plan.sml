@@ -1047,7 +1047,7 @@ fun action_text_with plan config_lines_for_node toolchain_key keys node =
     val input_lines = extra_input_lines plan node
     val _ = remember_extra_inputs_key plan node input_lines
     val lines =
-      ["holbuild-action-v1",
+      ["holbuild-action-v2",
        "toolchain=" ^ toolchain_key,
        "kind=" ^ kind_name source,
        "package=" ^ #package source,
