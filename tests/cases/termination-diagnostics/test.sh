@@ -152,6 +152,18 @@ if ! find "$success_project/.holbuild/checkpoints" -path '*.decls/*/proof_ir_v3*
   exit 1
 fi
 
+# Instrumenting a termination proof must not change the exported theory, or
+# cache entries from instrumented and --skip-proof-steps builds disagree.
+instrumented_dat=$tmpdir/instrumented-ATheory.dat
+cp "$success_project/.holbuild/obj/src/ATheory.dat" "$instrumented_dat"
+uninstrumented_log=$tmpdir/uninstrumented-success.log
+(cd "$success_project" && "$HOLBUILD_BIN" build --force --no-cache --skip-proof-steps ATheory) > "$uninstrumented_log" 2>&1
+require_grep "ATheory built" "$uninstrumented_log"
+if ! cmp -s "$instrumented_dat" "$success_project/.holbuild/obj/src/ATheory.dat"; then
+  echo "instrumented and --skip-proof-steps builds exported different ATheory.dat" >&2
+  exit 1
+fi
+
 timeout_project=$tmpdir/timeout-project
 mkdir -p "$timeout_project/src"
 cp "$project/holproject.toml" "$timeout_project/holproject.toml"
