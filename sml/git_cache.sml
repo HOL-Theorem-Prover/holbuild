@@ -82,29 +82,53 @@ fun cache_remote_dir git =
     Path.concat(remotes, hash ^ ".git")
   end
 
-fun ensure_remote git =
+fun with_lock path f =
   let
-    val dir = cache_remote_dir git
-    val meta = dir ^ ".holbuild-url"
+    val lock = HolbuildFileLock.acquire_exclusive_path_wait {path = path}
+               handle HolbuildFileLock.Error msg => die msg
   in
-    if path_exists dir then ()
-    else
-      (ensure_dir (Path.dir dir);
-       run ("git clone --bare " ^ quote git ^ " " ^ quote dir);
-       let val out = TextIO.openOut meta
-       in TextIO.output(out, git ^ "\n"); TextIO.closeOut out end);
-    dir
+    (f () before HolbuildFileLock.release lock)
+    handle e => (HolbuildFileLock.release lock; raise e)
+  end
+
+fun remove_if_exists path = if path_exists path then remove_tree path else ()
+
+(* Clones into a temporary directory and renames it into place, so a mirror
+   path that exists always holds a complete clone. *)
+fun clone_remote git dir =
+  let
+    val tmp = dir ^ ".tmp-" ^ HolbuildFileLock.current_pid_text ()
+  in
+    remove_if_exists tmp;
+    (run ("git clone --bare " ^ quote git ^ " " ^ quote tmp);
+     let val out = TextIO.openOut (dir ^ ".holbuild-url")
+     in TextIO.output(out, git ^ "\n"); TextIO.closeOut out end;
+     FS.rename {old = tmp, new = dir})
+    handle e => (remove_if_exists tmp; raise e)
   end
 
 fun verify_commit remote rev =
   (run ("git -C " ^ quote remote ^ " cat-file -e " ^ quote (rev ^ "^{commit}"));
    trim (command_output ("git -C " ^ quote remote ^ " rev-parse " ^ quote (rev ^ "^{commit}"))))
 
-fun ensure_commit remote rev =
-  verify_commit remote rev
-  handle Error _ =>
-    (run ("git -C " ^ quote remote ^ " fetch origin " ^ quote rev);
-     verify_commit remote rev)
+fun has_commit remote rev = (ignore (verify_commit remote rev); true) handle Error _ => false
+
+(* Returns the bare mirror of git and the commit rev names in it. The mirror
+   is shared by every project under the cache root, so creating it and
+   fetching into it are serialized per mirror. *)
+fun ensure_commit git rev =
+  let
+    val remote = cache_remote_dir git
+  in
+    if path_exists remote andalso has_commit remote rev then ()
+    else
+      with_lock (remote ^ ".lock")
+        (fn () =>
+            (if path_exists remote then () else clone_remote git remote;
+             if has_commit remote rev then ()
+             else run ("git -C " ^ quote remote ^ " fetch origin " ^ quote rev)));
+    (remote, verify_commit remote rev)
+  end
 
 fun materialized_head dest =
   if path_exists dest then
@@ -116,30 +140,71 @@ fun materialized_head dest =
     end
   else NONE
 
+(* A process that has seen a checkout at its pinned commit holds a shared
+   lease on it until exit, and replacing a checkout takes the lease
+   exclusively, so no process removes a tree another one is reading. fcntl
+   locks are dropped when the process closes any descriptor for the file, so
+   each lease is held at most once per process. *)
+val held_leases = ref ([] : (string * HolbuildFileLock.t) list)
+
+fun hold_lease path =
+  if List.exists (fn (held, _) => held = path) (!held_leases) then ()
+  else
+    let
+      val lease = HolbuildFileLock.acquire_shared_path_wait {path = path}
+                  handle HolbuildFileLock.Error msg => die msg
+    in
+      held_leases := (path, lease) :: !held_leases
+    end
+
+fun drop_lease path =
+  let val (dropped, kept) = List.partition (fn (held, _) => held = path) (!held_leases)
+  in List.app (fn (_, lease) => HolbuildFileLock.release lease) dropped; held_leases := kept end
+
+(* Moves a complete checkout to dest, replacing an existing tree only while
+   no other process holds its lease. *)
+fun publish_checkout {tmp, dest, lease} =
+  if not (path_exists dest) then FS.rename {old = tmp, new = dest}
+  else
+    case HolbuildFileLock.try_acquire_path {path = lease, obsolete_kind = NONE}
+         handle HolbuildFileLock.Error msg => die msg of
+        NONE => die ("cannot replace dependency checkout " ^ dest ^
+                     ": another holbuild process is using it")
+      | SOME lock =>
+          ((remove_tree dest; FS.rename {old = tmp, new = dest}; HolbuildFileLock.release lock)
+           handle e => (HolbuildFileLock.release lock; raise e))
+
 fun materialize {name, git, rev, artifact_root} =
   let
     val _ = validate_name name
     val _ = validate_rev rev
-    val src_root = Path.concat(Path.concat(artifact_root, ".holbuild"), "src")
+    val holbuild_dir = Path.concat(artifact_root, ".holbuild")
+    val src_root = Path.concat(holbuild_dir, "src")
     val dest = Path.concat(src_root, name)
-    fun materialize_missing () =
+    val locks = Path.concat(Path.concat(holbuild_dir, "locks"), "src")
+    val lease = Path.concat(locks, name ^ ".lease")
+    fun pinned () = materialized_head dest = SOME rev
+    fun checkout () =
       let
-        val remote = ensure_remote git
-        val commit = ensure_commit remote rev
-        val tmp = Path.concat(src_root, ".tmp-" ^ name ^ "-" ^ HolbuildHash.string_sha1 (name ^ rev ^ Time.toString (Time.now ())))
+        val (remote, commit) = ensure_commit git rev
+        val tmp = Path.concat(src_root, ".tmp-" ^ name ^ "-" ^ HolbuildFileLock.current_pid_text ())
       in
-        if path_exists tmp then remove_tree tmp else ();
-        run ("git clone " ^ quote remote ^ " " ^ quote tmp);
-        run ("git -C " ^ quote tmp ^ " checkout --detach " ^ quote commit);
-        if path_exists dest then remove_tree dest else ();
-        FS.rename {old = tmp, new = dest};
-        dest
+        remove_if_exists tmp;
+        (run ("git clone " ^ quote remote ^ " " ^ quote tmp);
+         run ("git -C " ^ quote tmp ^ " checkout --detach " ^ quote commit);
+         publish_checkout {tmp = tmp, dest = dest, lease = lease})
+        handle e => (remove_if_exists tmp; raise e)
       end
   in
     ensure_dir src_root;
-    case materialized_head dest of
-        SOME head => if head = rev then dest else materialize_missing ()
-      | NONE => materialize_missing ()
+    (* HEAD is checked again under the lease: a checkout replaced between the
+       first check and the lease is no longer at rev. *)
+    if pinned () andalso (hold_lease lease; pinned ()) then dest
+    else
+      (drop_lease lease;
+       with_lock (Path.concat(locks, name ^ ".lock"))
+         (fn () => (if pinned () then () else checkout (); hold_lease lease));
+       dest)
   end
 
 end

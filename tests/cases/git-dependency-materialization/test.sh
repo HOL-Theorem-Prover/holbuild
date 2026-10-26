@@ -359,3 +359,118 @@ if (cd "$missing" && "$HOLBUILD_BIN" context) > "$tmpdir/missing.log" 2>&1; then
   exit 1
 fi
 require_grep "fetch origin '$missing_rev'" "$tmpdir/missing.log"
+
+# Concurrent materialization: a git shim that stalls every clone keeps racing
+# processes inside the clone-and-publish window together. Two project roots
+# share a fresh cache, so their first runs also race to create the mirror.
+use_case_cache "$tmpdir/race-cache"
+slow_git=$tmpdir/slow-git
+mkdir -p "$slow_git"
+real_git=$(command -v git)
+cat > "$slow_git/git" <<SH
+#!/bin/sh
+for arg in "\$@"; do
+  if [ "\$arg" = clone ]; then sleep 1; break; fi
+done
+exec "$real_git" "\$@"
+SH
+chmod +x "$slow_git/git"
+
+set_dep_rev() {
+  python3 - "$1/holproject.toml" "$2" <<'PY'
+import re, sys
+path, rev = sys.argv[1:]
+text = open(path).read()
+text = re.sub(r'(\[dependencies\.dep\]\ngit = "[^"]*"\nrev = ")[0-9a-f]*(")', r'\g<1>' + rev + r'\g<2>', text)
+open(path, 'w').write(text)
+PY
+}
+
+for race in race1 race2; do
+  mkdir -p "$tmpdir/$race"
+  cat > "$tmpdir/$race/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[project]
+name = "$race"
+
+[dependencies.hol]
+git = "$hol_repo"
+rev = "$hol_rev"
+
+[dependencies.dep]
+git = "$repo"
+rev = "$rev1"
+TOML
+done
+
+race_context() {
+  local label=$1 rev=$2
+  shift 2
+  local -a pids=()
+  local project i=0 failed=0
+  for project in "$@"; do
+    (cd "$project" && PATH="$slow_git:$PATH" "$HOLBUILD_BIN" context) > "$tmpdir/$label-$i.log" 2>&1 &
+    pids+=("$!")
+    i=$((i + 1))
+  done
+  for i in "${!pids[@]}"; do
+    if ! wait "${pids[$i]}"; then
+      echo "concurrent context $label-$i failed" >&2
+      cat "$tmpdir/$label-$i.log" >&2
+      failed=1
+    fi
+  done
+  [ "$failed" = 0 ]
+  for project in "$@"; do
+    [ "$(git -C "$project/.holbuild/src/dep" rev-parse HEAD)" = "$rev" ]
+    if compgen -G "$project/.holbuild/src/.tmp-*" > /dev/null; then
+      echo "checkout temp dir left in $project/.holbuild/src" >&2
+      exit 1
+    fi
+  done
+}
+
+race_context cold "$rev1" "$tmpdir/race1" "$tmpdir/race1" "$tmpdir/race2" "$tmpdir/race2"
+if compgen -G "$HOLBUILD_CACHE/git/remotes/*.tmp-*" > /dev/null; then
+  echo "mirror temp dir left in $HOLBUILD_CACHE/git/remotes" >&2
+  exit 1
+fi
+
+rm -rf "$tmpdir/race1/.holbuild/src" "$tmpdir/race2/.holbuild/src"
+race_context warm-mirror "$rev1" "$tmpdir/race1" "$tmpdir/race1" "$tmpdir/race2" "$tmpdir/race2"
+
+set_dep_rev "$tmpdir/race1" "$rev2"
+set_dep_rev "$tmpdir/race2" "$rev2"
+race_context repin "$rev2" "$tmpdir/race1" "$tmpdir/race1" "$tmpdir/race2" "$tmpdir/race2"
+
+# A process using the checkout holds its lease: another process at the same
+# rev still proceeds, but none may replace the tree until the lease is gone.
+lease=$tmpdir/race1/.holbuild/locks/src/dep.lease
+python3 - "$lease" "$tmpdir/lease.ready" <<'PY' &
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR)
+fcntl.lockf(fd, fcntl.LOCK_SH)
+open(sys.argv[2], 'w').close()
+time.sleep(120)
+PY
+lease_holder=$!
+for _ in {1..100}; do
+  [[ -e "$tmpdir/lease.ready" ]] && break
+  sleep 0.05
+done
+require_file "$tmpdir/lease.ready"
+(cd "$tmpdir/race1" && "$HOLBUILD_BIN" context) > "$tmpdir/leased-same.log"
+set_dep_rev "$tmpdir/race1" "$rev1"
+if (cd "$tmpdir/race1" && "$HOLBUILD_BIN" context) > "$tmpdir/leased-replace.log" 2>&1; then
+  echo "checkout replaced while another process held its lease" >&2
+  exit 1
+fi
+require_grep 'another holbuild process is using it' "$tmpdir/leased-replace.log"
+[ "$(git -C "$tmpdir/race1/.holbuild/src/dep" rev-parse HEAD)" = "$rev2" ]
+kill "$lease_holder"
+wait "$lease_holder" || true
+(cd "$tmpdir/race1" && "$HOLBUILD_BIN" context) > "$tmpdir/released-replace.log"
+[ "$(git -C "$tmpdir/race1/.holbuild/src/dep" rev-parse HEAD)" = "$rev1" ]
