@@ -388,12 +388,13 @@ fun dependency_local_path_with resolution (project as {graph_artifact_root, ...}
                 SOME (hol_holdir resolution {git = git, rev = rev})
               else SOME (Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), name))
           | FromSource {from, path, ...} =>
-              (case hol_dependency project of
-                   SOME (Dependency {role = HolToolchainDependency,
-                                     source = GitSource {git, rev}, ...}) =>
-                     if from = "hol" then SOME (Path.concat(hol_holdir resolution {git = git, rev = rev}, path))
-                     else SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path))
-                 | _ => SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path)))
+              (* The shim lives inside its from dependency's checkout, so an
+                 override of that dependency moves the shim with it. *)
+              (case List.find (fn Dependency {name, ...} => name = from) (#dependencies project) of
+                   SOME from_dep =>
+                     Option.map (fn from_root => Path.concat(from_root, path))
+                       (dependency_local_path_with resolution project from_dep)
+                 | NONE => die ("validated from dependency disappeared: " ^ from))
 
 fun dependency_local_path project dep = dependency_local_path_with standard_resolution project dep
 
