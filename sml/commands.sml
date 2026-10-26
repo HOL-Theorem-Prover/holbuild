@@ -1429,6 +1429,7 @@ fun from_theory_state tc project theory =
   let
     val {index, components} = prepare_source_index "run.from" (resolution_for_toolchain tc) project
     val target = hd (HolbuildSourceIndex.resolve_path_targets index [theory])
+                 handle HolbuildSourceIndex.Error msg => raise Error ("--from " ^ theory ^ ": " ^ msg)
     val plan = timed_phase "run.from.plan"
                  (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index [target])
                  handle HolbuildBuildPlan.Error msg => raise Error ("--from " ^ theory ^ ": " ^ msg)
@@ -1438,29 +1439,36 @@ fun from_theory_state tc project theory =
     HolbuildBuildExec.run_from_state project plan keys (HolbuildToolchain.toolchain_key tc) node
   end
 
+(* The state HOL starts from, and the lines the run context loads first. *)
+type run_start = {holstate : string, context_lines : string list}
+
+fun checkpoint_start path =
+  {holstate = path, context_lines = HolbuildBuildExec.child_policy_reset_lines}
+
 (* A usable --from checkpoint takes precedence over [run].heap; without one,
    run starts from [run].heap when configured and the base state otherwise. *)
-fun run_holstate tc project from =
+fun run_start tc project from : run_start =
   let
     val (fallback, fallback_name) =
       case HolbuildProject.abs_run_heap project of
           NONE => (HolbuildToolchain.base_state tc, "the HOL base state")
         | SOME heap => (heap, "[run].heap " ^ heap)
+    val fallback_start = {holstate = fallback, context_lines = []}
     fun note theory text =
       HolbuildStatus.message_stderr ("holbuild: --from " ^ theory ^ ": " ^ text ^ "\n")
   in
     case from of
-        NONE => fallback
+        NONE => fallback_start
       | SOME theory =>
           case from_theory_state tc project theory of
               HolbuildBuildExec.FinalContextState path =>
-                (note theory "starting from its final_context checkpoint"; path)
+                (note theory "starting from its final_context checkpoint"; checkpoint_start path)
             | HolbuildBuildExec.DepsLoadedState path =>
                 (note theory ("no final_context checkpoint for its current source; starting from " ^
                               "its deps_loaded checkpoint, which has only its ancestors loaded");
-                 path)
+                 checkpoint_start path)
             | HolbuildBuildExec.NoRunFromState reason =>
-                (note theory (reason ^ "; starting from " ^ fallback_name); fallback)
+                (note theory (reason ^ "; starting from " ^ fallback_name); fallback_start)
   end
 
 fun hol_run_argv tc holstate subcommand context user_args =
@@ -1477,7 +1485,7 @@ fun run_hol_with runner tc cli_jobs subcommand args =
     val project =
       if null run_loads then configured_project
       else timed_phase "run.project.rediscover" load_project
-    val holstate = run_holstate tc project from
+    val {holstate, context_lines} = run_start tc project from
     val packages = resolved_packages (resolution_for_toolchain tc) project
     fun invoke context =
       let
@@ -1488,7 +1496,7 @@ fun run_hol_with runner tc cli_jobs subcommand args =
         else raise Error ("hol " ^ subcommand ^ " failed")
       end
   in
-    HolbuildToolchain.with_run_context project packages invoke
+    HolbuildToolchain.with_run_context project packages context_lines invoke
   end
 
 fun run_hol tc cli_jobs subcommand user_args =

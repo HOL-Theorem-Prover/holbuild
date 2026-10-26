@@ -72,6 +72,11 @@ SML
 (cd "$project" && "$HOLBUILD_BIN" build BTheory) > "$tmpdir/build.log" 2>&1 ||
   { cat "$tmpdir/build.log" >&2; exit 1; }
 
+deps_script=$tmpdir/deps.sml
+cat > "$deps_script" <<'SML'
+val _ = (ATheory.a_thm; print "DEPS_LOADED_BOUND_OK\n");
+SML
+
 # Current final_context: BTheory is bound before any load, and loading it again
 # is a no-op rather than a second copy of the theory.
 final_script=$tmpdir/final.sml
@@ -92,13 +97,20 @@ printf 'val _ = (BTheory.b_thm; print "REPL_FROM_OK\\n");\n' |
 require_grep "starting from its final_context checkpoint" "$repl_log"
 require_grep "REPL_FROM_OK" "$repl_log"
 
+# A --from session exports theories with the same trace settings as a plain run,
+# not the build child policy its checkpoint was saved under.
+trace_script=$tmpdir/trace.sml
+cat > "$trace_script" <<'SML'
+val _ = print ("HTML_DOCS=" ^ Int.toString (Feedback.current_trace "TheoryPP.include_html_docs") ^ "\n");
+SML
+run_from "$tmpdir/plain-trace.log" "$trace_script"
+plain_trace=$(grep -o 'HTML_DOCS=[0-9]*' "$tmpdir/plain-trace.log")
+run_from "$tmpdir/from-trace.log" --from BTheory "$trace_script"
+require_grep "$plain_trace" "$tmpdir/from-trace.log"
+
 # Only BTheory is stale: its ancestors come from deps_loaded.
 sed -i 's/^val _ = export_theory();$/val b2_thm = store_thm("b2_thm", ``T``, ACCEPT_TAC TRUTH);\nval _ = export_theory();/' \
   "$project/src/BScript.sml"
-deps_script=$tmpdir/deps.sml
-cat > "$deps_script" <<'SML'
-val _ = (ATheory.a_thm; print "DEPS_LOADED_BOUND_OK\n");
-SML
 deps_log=$tmpdir/deps.log
 run_from "$deps_log" --from BTheory "$deps_script"
 require_grep "holbuild: --from BTheory: no final_context checkpoint for its current source; starting from its deps_loaded checkpoint" "$deps_log"
@@ -128,6 +140,27 @@ run_from "$cache_log" --from BTheory "$fallback_script"
 require_grep "holbuild: --from BTheory: BTheory has no current checkpoint (not built yet, restored from the cache, built with --skip-checkpoints, or removed by gc); starting from \[run\].heap" "$cache_log"
 require_grep "FALLBACK_RUN_OK" "$cache_log"
 
+# A static error discards and rewrites deps_loaded; the final_context saved on
+# top of the old deps_loaded must go with it, even once the source is reverted.
+sed -i 's/^val _ = export_theory();$/val b3_thm = store_thm("b3_thm", ``T``, ACCEPT_TAC TRUTH);\nval _ = export_theory();/' \
+  "$project/src/BScript.sml"
+(cd "$project" && "$HOLBUILD_BIN" build BTheory) > "$tmpdir/fresh.log" 2>&1 ||
+  { cat "$tmpdir/fresh.log" >&2; exit 1; }
+run_from "$tmpdir/fresh-run.log" --from BTheory "$final_script"
+require_grep "starting from its final_context checkpoint" "$tmpdir/fresh-run.log"
+cp "$project/src/BScript.sml" "$tmpdir/BScript.sml.good"
+sed -i 's/^val _ = export_theory();$/val bad : int = "typo";\nval _ = export_theory();/' \
+  "$project/src/BScript.sml"
+if (cd "$project" && "$HOLBUILD_BIN" build BTheory) > "$tmpdir/static-error.log" 2>&1; then
+  echo "build accepted a static error" >&2
+  exit 1
+fi
+cp "$tmpdir/BScript.sml.good" "$project/src/BScript.sml"
+reverted_log=$tmpdir/reverted.log
+run_from "$reverted_log" --from BTheory "$deps_script"
+require_grep "starting from its deps_loaded checkpoint" "$reverted_log"
+require_grep "DEPS_LOADED_BOUND_OK" "$reverted_log"
+
 unknown_log=$tmpdir/unknown.log
 if (cd "$project" && "$HOLBUILD_BIN" run --from MissingTheory "$fallback_script") > "$unknown_log" 2>&1; then
   echo "run accepted an unknown --from theory" >&2
@@ -135,6 +168,13 @@ if (cd "$project" && "$HOLBUILD_BIN" run --from MissingTheory "$fallback_script"
 fi
 require_grep "holbuild: --from MissingTheory: unknown build target: MissingTheory" "$unknown_log"
 require_no_grep "FALLBACK_RUN_OK" "$unknown_log"
+
+unknown_path_log=$tmpdir/unknown-path.log
+if (cd "$project" && "$HOLBUILD_BIN" run --from src/MissingScript.sml "$fallback_script") > "$unknown_path_log" 2>&1; then
+  echo "run accepted an unknown --from path" >&2
+  exit 1
+fi
+require_grep "holbuild: --from src/MissingScript.sml: build target path is not a known source: src/MissingScript.sml" "$unknown_path_log"
 
 library_log=$tmpdir/library.log
 if (cd "$project" && "$HOLBUILD_BIN" run --from Util "$fallback_script") > "$library_log" 2>&1; then

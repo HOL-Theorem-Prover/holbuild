@@ -289,12 +289,21 @@ fun write_plain_preload plan node path =
    critical export path.  Keep this policy in its own first-loaded file: unlike
    the regular preload, it must also run when a child resumes from any saved
    checkpoint.  The trace was renamed in HOL, so tolerate either spelling. *)
+val child_policy_traces = ["TheoryPP.include_docs", "TheoryPP.include_html_docs"]
+
 fun write_child_policy path =
   write_text path
-    (String.concatWith "\n"
-       ["val _ = (Feedback.set_trace \"TheoryPP.include_docs\" 0 handle _ => ());",
-        "val _ = (Feedback.set_trace \"TheoryPP.include_html_docs\" 0 handle _ => ());"] ^
-     "\n")
+    (String.concat
+       (map (fn trace => "val _ = (Feedback.set_trace " ^ HolbuildToolchain.sml_string trace ^
+                         " 0 handle _ => ());\n")
+            child_policy_traces))
+
+(* Checkpoints are saved with the child policy in effect.  A `run --from`
+   session loads these lines so it exports theories as a plain run does. *)
+val child_policy_reset_lines =
+  map (fn trace => "val _ = (Feedback.reset_trace " ^ HolbuildToolchain.sml_string trace ^
+                   " handle _ => ());")
+      child_policy_traces
 
 fun generated_metadata_report_lines {parents_report, mldeps_report} =
   let
@@ -702,12 +711,17 @@ fun remove_theorem_checkpoints_for_deps project node deps_key =
 fun remove_declaration_checkpoints_for_deps project node deps_key =
   remove_checkpoint_tree (declaration_checkpoints_for_deps_root project node deps_key)
 
-fun remove_deps_checkpoint_family project node deps_key deps_loaded =
-  (* Delete source-context descendants before deleting/replacing the deps parent.
-     A deps heap path is stable for a deps_key, so surviving descendants must
-     never outlive deletion of that parent path. *)
+(* Delete these before deleting or replacing the deps parent.  A deps heap path
+   is stable for a deps_key, so surviving descendants must never outlive
+   deletion of that parent path.  final_context is not keyed on deps_key, but it
+   may be a child of this parent, and `run --from` loads it. *)
+fun remove_deps_checkpoint_descendants project node deps_key =
   (remove_theorem_checkpoints_for_deps project node deps_key;
    remove_declaration_checkpoints_for_deps project node deps_key;
+   remove_checkpoint (final_context_path project node))
+
+fun remove_deps_checkpoint_family project node deps_key deps_loaded =
+  (remove_deps_checkpoint_descendants project node deps_key;
    remove_checkpoint deps_loaded)
 
 fun remove_checkpoint_family project node =
@@ -2966,8 +2980,7 @@ fun write_theory_script policy project base_context plan keys input_key toolchai
          deps_loaded_resume_message node;
          {context = HolState deps_loaded, files = [staged_script], failure_checkpoints = [deps_loaded], failed_prefix_context = NONE})
       fun run_from_fresh_preload () =
-        (remove_theorem_checkpoints_for_deps project node deps_key;
-         remove_declaration_checkpoints_for_deps project node deps_key;
+        (remove_deps_checkpoint_descendants project node deps_key;
          ensure_source_checkpoint_parents ();
          write_preload plan node deps_loaded deps_ok preload;
          write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
