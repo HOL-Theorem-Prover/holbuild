@@ -245,7 +245,7 @@ default build command:
 
 ```sh
 holbuild -j4 MyTheory
-holbuild --maxheap 4096 MyTheory
+holbuild --max-heap 4096 MyTheory
 holbuild --source-dir /path/to/project MyTheory
 holbuild --cache-dir /path/to/cache MyTheory
 holbuild --remote-cache http://cache.example.org MyTheory
@@ -277,8 +277,9 @@ Common global options:
 - `--json`: emit newline-delimited JSON where supported.
 - `--quiet`, `--verbose`, `--verbosity LEVEL`: adjust status output.
 - `-j N`, `-jN`, `--jobs N`: build parallelism.
-- `--maxheap MB`, `--max-heap MB`: Poly/ML maximum heap size for child HOL
-  processes.
+- `--max-heap MB`: Poly/ML maximum heap size for child HOL processes. The
+  `--maxheap` spelling does not work: holbuild's own Poly/ML runtime consumes
+  it, and holbuild rejects it where it can detect it (Linux).
 
 `holbuild build --watch MyTheory` runs an initial build, then watches project
 inputs with `inotifywait` and rebuilds after changes. The directory of each
