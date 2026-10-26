@@ -433,6 +433,9 @@ race_context() {
   done
 }
 
+# A mirror clone killed mid-way leaves a temp dir that the next clone removes.
+mkdir -p "$HOLBUILD_CACHE/git/remotes"
+mkdir "$HOLBUILD_CACHE/git/remotes/$(printf %s "$repo" | sha1sum | cut -d' ' -f1).git.tmp-999999999"
 race_context cold "$rev1" "$tmpdir/race1" "$tmpdir/race1" "$tmpdir/race2" "$tmpdir/race2"
 if compgen -G "$HOLBUILD_CACHE/git/remotes/*.tmp-*" > /dev/null; then
   echo "mirror temp dir left in $HOLBUILD_CACHE/git/remotes" >&2
@@ -446,31 +449,74 @@ set_dep_rev "$tmpdir/race1" "$rev2"
 set_dep_rev "$tmpdir/race2" "$rev2"
 race_context repin "$rev2" "$tmpdir/race1" "$tmpdir/race1" "$tmpdir/race2" "$tmpdir/race2"
 
-# A process using the checkout holds its lease: another process at the same
-# rev still proceeds, but none may replace the tree until the lease is gone.
-lease=$tmpdir/race1/.holbuild/locks/src/dep.lease
-python3 - "$lease" "$tmpdir/lease.ready" <<'PY' &
-import fcntl, os, sys, time
-fd = os.open(sys.argv[1], os.O_RDWR)
-fcntl.lockf(fd, fcntl.LOCK_SH)
-open(sys.argv[2], 'w').close()
-time.sleep(120)
-PY
+# A holbuild process that has materialized dep keeps its lease while it runs:
+# another process at the same rev still proceeds, but none may replace the tree
+# until the holder exits. The holder is kept alive by a second git dependency
+# whose mirror clone blocks on a FIFO.
+blocker_repo=$tmpdir/blocker-repo
+mkdir -p "$blocker_repo"
+git -C "$blocker_repo" init -q
+git_identity "$blocker_repo"
+cat > "$blocker_repo/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[dependencies.hol]
+git = "$hol_repo"
+rev = "$hol_rev"
+
+[project]
+name = "blocker"
+TOML
+git -C "$blocker_repo" add .
+git -C "$blocker_repo" commit -q -m blocker
+blocker_rev=$(git -C "$blocker_repo" rev-parse HEAD)
+cp "$tmpdir/race1/holproject.toml" "$tmpdir/race1.toml"
+cat >> "$tmpdir/race1/holproject.toml" <<TOML
+
+[dependencies.blocker]
+git = "$blocker_repo"
+rev = "$blocker_rev"
+TOML
+
+blocking_git=$tmpdir/blocking-git
+mkdir -p "$blocking_git"
+mkfifo "$tmpdir/blocker.fifo"
+cat > "$blocking_git/git" <<SH
+#!/bin/sh
+for arg in "\$@"; do
+  if [ "\$arg" = "$blocker_repo" ]; then
+    : > "$tmpdir/blocker.ready"
+    timeout 120 cat "$tmpdir/blocker.fifo" > /dev/null
+    break
+  fi
+done
+exec "$real_git" "\$@"
+SH
+chmod +x "$blocking_git/git"
+
+(cd "$tmpdir/race1" && PATH="$blocking_git:$PATH" "$HOLBUILD_BIN" context) > "$tmpdir/holder.log" 2>&1 &
 lease_holder=$!
-for _ in {1..100}; do
-  [[ -e "$tmpdir/lease.ready" ]] && break
+for _ in {1..600}; do
+  [[ -e "$tmpdir/blocker.ready" ]] && break
   sleep 0.05
 done
-require_file "$tmpdir/lease.ready"
+require_file "$tmpdir/blocker.ready"
+# The holder has read its manifest; later runs see dep alone.
+cp "$tmpdir/race1.toml" "$tmpdir/race1/holproject.toml"
 (cd "$tmpdir/race1" && "$HOLBUILD_BIN" context) > "$tmpdir/leased-same.log"
 set_dep_rev "$tmpdir/race1" "$rev1"
 if (cd "$tmpdir/race1" && "$HOLBUILD_BIN" context) > "$tmpdir/leased-replace.log" 2>&1; then
-  echo "checkout replaced while another process held its lease" >&2
+  echo "checkout replaced while another holbuild process was using it" >&2
   exit 1
 fi
-require_grep 'another holbuild process is using it' "$tmpdir/leased-replace.log"
+require_grep "another holbuild process is using it (pid [0-9][0-9]*)" "$tmpdir/leased-replace.log"
 [ "$(git -C "$tmpdir/race1/.holbuild/src/dep" rev-parse HEAD)" = "$rev2" ]
-kill "$lease_holder"
-wait "$lease_holder" || true
+echo > "$tmpdir/blocker.fifo"
+if ! wait "$lease_holder"; then
+  cat "$tmpdir/holder.log" >&2
+  exit 1
+fi
 (cd "$tmpdir/race1" && "$HOLBUILD_BIN" context) > "$tmpdir/released-replace.log"
 [ "$(git -C "$tmpdir/race1/.holbuild/src/dep" rev-parse HEAD)" = "$rev1" ]

@@ -49,6 +49,12 @@ fun wait_lock_fd ltype fd =
 fun blocking_lock_owner fd =
   (case Posix.IO.FLock.pid (Posix.IO.getlk(fd, whole_file_lock Posix.IO.F_WRLCK)) of SOME pid => SOME (pid_text pid) | NONE => NONE)
   handle OS.SysErr _ => NONE
+(* Returns the pid of a process holding any lock on the path. Closing the probe
+   descriptor drops this process's own fcntl locks on the file, so callers must
+   hold none. *)
+fun lock_owner_path {path} =
+  let val fd = open_lock_file path in blocking_lock_owner fd before close_fd fd end
+  handle OS.SysErr _ => NONE
 fun try_acquire_path {path, obsolete_kind} =
   let val _ = ensure_dir (Path.dir path) val _ = Option.app (fn kind => remove_obsolete_lock_dir kind path) obsolete_kind val fd = open_lock_file path val _ = set_close_on_exec fd
   in if try_lock_fd fd then SOME (FileLock {fd = fd, path = path}) else (close_fd fd; NONE) end

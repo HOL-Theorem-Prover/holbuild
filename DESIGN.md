@@ -131,7 +131,8 @@ A checkout already at its pinned commit is used without network access. Otherwis
 the commit is fetched into a bare mirror under `$HOLBUILD_CACHE/git/remotes`,
 shared by every project using that cache; creating a mirror and fetching into it
 are serialized by a per-mirror lock, and a new mirror is cloned to a temporary
-directory and renamed into place. Publishing a checkout is serialized by
+directory and renamed into place; temporary clones left by killed processes are
+removed under that lock. Publishing a checkout is serialized by
 `.holbuild/locks/src/<package>.lock`, and HEAD is checked again under that lock.
 Every process that uses a checkout holds a shared lease,
 `.holbuild/locks/src/<package>.lease`, until it exits; replacing a checkout at

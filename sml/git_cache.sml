@@ -93,13 +93,25 @@ fun with_lock path f =
 
 fun remove_if_exists path = if path_exists path then remove_tree path else ()
 
+fun list_dir dir =
+  let
+    val stream = FS.openDir dir
+    fun loop acc = case FS.readDir stream of NONE => acc | SOME entry => loop (entry :: acc)
+  in
+    (loop [] before FS.closeDir stream) handle e => (FS.closeDir stream; raise e)
+  end
+
 (* Clones into a temporary directory and renames it into place, so a mirror
-   path that exists always holds a complete clone. *)
+   path that exists always holds a complete clone. Runs under the mirror lock,
+   so every temporary clone of this mirror is left over from a killed process. *)
 fun clone_remote git dir =
   let
+    val tmp_prefix = Path.file dir ^ ".tmp-"
     val tmp = dir ^ ".tmp-" ^ HolbuildFileLock.current_pid_text ()
   in
-    remove_if_exists tmp;
+    List.app (fn entry => if String.isPrefix tmp_prefix entry
+                          then remove_tree (Path.concat(Path.dir dir, entry)) else ())
+             (list_dir (Path.dir dir));
     (run ("git clone --bare " ^ quote git ^ " " ^ quote tmp);
      let val out = TextIO.openOut (dir ^ ".holbuild-url")
      in TextIO.output(out, git ^ "\n"); TextIO.closeOut out end;
@@ -168,8 +180,16 @@ fun publish_checkout {tmp, dest, lease} =
   else
     case HolbuildFileLock.try_acquire_path {path = lease, obsolete_kind = NONE}
          handle HolbuildFileLock.Error msg => die msg of
-        NONE => die ("cannot replace dependency checkout " ^ dest ^
-                     ": another holbuild process is using it")
+        NONE =>
+          let
+            val holder =
+              case HolbuildFileLock.lock_owner_path {path = lease} of
+                  SOME pid => " (pid " ^ pid ^ ")"
+                | NONE => ""
+          in
+            die ("cannot replace dependency checkout " ^ dest ^
+                 ": another holbuild process is using it" ^ holder)
+          end
       | SOME lock =>
           ((remove_tree dest; FS.rename {old = tmp, new = dest}; HolbuildFileLock.release lock)
            handle e => (HolbuildFileLock.release lock; raise e))

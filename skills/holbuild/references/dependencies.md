@@ -53,7 +53,8 @@ and its package artifacts live under:
 
 Concurrent holbuild runs may share one checkout. Changing `rev` while another
 holbuild process is still using the checkout fails with
-`another holbuild process is using it`; rerun once that process exits.
+`another holbuild process is using it (pid <pid>)`; rerun once that process
+exits.
 
 Git dependencies must have their own manifest (`holbuild.toml` if present, else `holproject.toml`); a `manifest` field is not allowed on a direct git dependency.
 
