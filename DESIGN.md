@@ -831,7 +831,10 @@ uses HOLSource parser recovery, but lowers `HOLSourceAST.exp` directly.
 accepted as a deprecated no-op because proof IR is now the default. The CLI default is
 2.5 seconds per tactic step;
 `--tactic-timeout SECONDS` overrides all manifest timeout policy for the invocation, and
-`--tactic-timeout 0` disables it. Without a CLI override, `[build].tactic_timeout` sets
+`--tactic-timeout 0` disables it. A timeout is not a tactic failure: inside `TRY`,
+an `ORELSE`/`FIRST` alternative or a repeat body it fails the build at that step
+instead of taking the combinator's failure branch, and it records no try, choice or
+repeat event and no failed-prefix checkpoint inside that body. Without a CLI override, `[build].tactic_timeout` sets
 the package default and `[build.root_tactic_timeouts]` may set per-entry-point timeout
 contracts keyed by `[build].roots` source paths. Entry-point contracts apply to the
 root-package portion of the build dependency closure; dependency packages do not inherit a
