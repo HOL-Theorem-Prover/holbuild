@@ -2425,6 +2425,11 @@ fun discover_boundaries_and_terminations source_path source_text =
    staged scripts carried location pragmas are not resumed. *)
 val theorem_location_schema = "source_pragmas_v1"
 
+(* Context checkpoints also hold the theorem numbering HOL assigned so far.
+   States saved while termination goals were derived by a second Hol_defn
+   carry advanced numbering, so they are not resumed. *)
+val termination_goal_schema = "in_tactic_v1"
+
 fun theorem_checkpoint_key {kind, name, safe_name, boundary, deps_key, proof_engine, prefix_hash} =
   HolbuildToolchain.hash_text
     (String.concatWith "\n"
@@ -2436,7 +2441,8 @@ fun theorem_checkpoint_key {kind, name, safe_name, boundary, deps_key, proof_eng
         "deps_key=" ^ deps_key,
         "proof_engine=" ^ proof_engine,
         "prefix_key=" ^ prefix_hash,
-        "theorem_locations=" ^ theorem_location_schema] ^ "\n")
+        "theorem_locations=" ^ theorem_location_schema,
+        "termination_goals=" ^ termination_goal_schema] ^ "\n")
 
 fun declaration_checkpoint_key {name, safe_name, boundary, deps_key, proof_engine, prefix_hash} =
   HolbuildToolchain.hash_text
@@ -2448,7 +2454,8 @@ fun declaration_checkpoint_key {name, safe_name, boundary, deps_key, proof_engin
         "deps_key=" ^ deps_key,
         "proof_engine=" ^ proof_engine,
         "prefix_key=" ^ prefix_hash,
-        "theorem_locations=" ^ theorem_location_schema] ^ "\n")
+        "theorem_locations=" ^ theorem_location_schema,
+        "termination_goals=" ^ termination_goal_schema] ^ "\n")
 
 fun proof_timeout_field proof_timeout = ("proof_timeout", timeout_text proof_timeout)
 
@@ -2492,7 +2499,8 @@ fun failed_prefix_ok proof_engine proof_timeout deps_key safe_name pre_hash head
      ("header_key", header_hash),
      ("failure_diagnostic_key", failed_prefix_diagnostic_key proof_engine),
      ("resume_schema_key", failed_prefix_resume_schema_key proof_engine),
-     ("theorem_locations", theorem_location_schema)]
+     ("theorem_locations", theorem_location_schema),
+     ("termination_goals", termination_goal_schema)]
 
 fun theorem_checkpoint_specs proof_engine proof_timeout project node deps_key inputs_key source proof_ir_plans (boundaries : HolbuildTheoryCheckpoints.boundary list) =
   let

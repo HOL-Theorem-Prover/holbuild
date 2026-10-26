@@ -164,6 +164,43 @@ if ! cmp -s "$instrumented_dat" "$success_project/.holbuild/obj/src/ATheory.dat"
   exit 1
 fi
 
+# A definition rejected before HOL runs its Termination tactic prints no goal;
+# the previous definition's goal must not be reported for it.
+early_project=$tmpdir/early-failure-project
+mkdir -p "$early_project/src"
+cp "$project/holproject.toml" "$early_project/holproject.toml"
+cat > "$early_project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+
+Definition first_def:
+  first n = if n = 0 then 0 else first (n - 1)
+Termination
+  WF_REL_TAC `measure I` >> simp[]
+End
+
+Definition second_def[holbuild_no_such_attribute]:
+  second n = if n = 0 then 0 else second (n - 1)
+Termination
+  WF_REL_TAC `measure I` >> simp[]
+End
+
+val _ = export_theory();
+SML
+
+early_log=$tmpdir/early-failure.log
+if (cd "$early_project" && "$HOLBUILD_BIN" build ATheory) > "$early_log" 2>&1; then
+  echo "expected unknown definition attribute failure" >&2
+  exit 1
+fi
+early_child_log="$early_project/.holbuild/logs/current/termination-diagnostics/ATheory/build.log"
+require_grep "holbuild termination condition goal for first_def at " "$early_child_log"
+require_grep "holbuild termination definition start for second_def at " "$early_child_log"
+if grep -q "termination: first_def" "$early_log"; then
+  echo "reported first_def's termination goal for second_def's failure" >&2
+  exit 1
+fi
+
 timeout_project=$tmpdir/timeout-project
 mkdir -p "$timeout_project/src"
 cp "$project/holproject.toml" "$timeout_project/holproject.toml"
