@@ -361,6 +361,13 @@ wait_for_file "$race_waiting" \
   "concurrent toolchain request did not observe the active builder's lock"
 [[ ! -e "$race_revalidated" ]] ||
   fail "concurrent toolchain request revalidated before the active builder committed"
+# A bootstrap holds the lock far longer than the waiter's former 120 s budget;
+# the waiter keeps waiting and reports the owner while it does.
+sleep 130
+process_alive "$second_builder" ||
+  fail "concurrent toolchain request stopped waiting for the active builder"
+[[ ! -e "$race_revalidated" ]] ||
+  fail "concurrent toolchain request revalidated while the active builder held the lock"
 touch "$release"
 wait "$first_builder"
 wait "$second_builder"
@@ -372,6 +379,8 @@ require_file "$race_revalidated"
 require_grep "removing obsolete directory HOL toolchain lock" "$dry_log"
 require_grep "Foo (sml, package b)" "$dry_log"
 require_grep "Foo (sml, package b)" "$race_log"
+require_grep "holbuild: waiting 0s for HOL toolchain lock held by pid=[0-9][0-9]* host=.* command=bootstrap HOL toolchain" "$race_log"
+require_grep "holbuild: waiting 12[0-9]s for HOL toolchain lock held by pid=" "$race_log"
 [[ "$(wc -l < "$attempts" | tr -d ' ')" = "1" ]] ||
   fail "lock waiter rebuilt instead of consuming the committed toolchain entry"
 
