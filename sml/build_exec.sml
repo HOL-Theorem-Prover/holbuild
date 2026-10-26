@@ -3783,6 +3783,40 @@ fun build_config_lines_for_node options project node =
     | HolbuildSourceIndex.Sml => policy_config_lines no_checkpoint_policy
     | HolbuildSourceIndex.Sig => policy_config_lines no_checkpoint_policy
 
+(* The saved HOL state `run --from` starts from, or why there is none. *)
+datatype run_from_state =
+  FinalContextState of string
+| DepsLoadedState of string
+| NoRunFromState of string
+
+(* Checkpoints are current only for the keys a build of NODE would use now.
+   Run holds no project lock, so this only reads checkpoint files. *)
+fun run_from_state project plan keys toolchain_key node =
+  let
+    val name = logical_name node
+    val deps_key = dependency_context_key toolchain_key plan keys node
+    val final_context = final_context_path project node
+    val deps_loaded = deps_loaded_path project node deps_key
+    val saved_deps_key =
+      Option.mapPartial (metadata_value "deps_key" o metadata_lines)
+        (current_metadata (checkpoint_ok_path final_context))
+  in
+    if not (root_package_node project node) then
+      NoRunFromState (name ^ " is in dependency package " ^ package node ^
+                      "; holbuild keeps checkpoints only for root-package theories")
+    else if HolbuildCheckpointStore.ok_text_current final_context
+              (final_context_ok_text deps_key (HolbuildBuildPlan.input_key_for keys node)) then
+      FinalContextState final_context
+    else if HolbuildCheckpointStore.ok_current deps_loaded
+              [("kind", "deps_loaded"), ("deps_key", deps_key)] then
+      DepsLoadedState deps_loaded
+    else if Option.isSome saved_deps_key andalso saved_deps_key <> SOME deps_key then
+      NoRunFromState ("the dependencies of " ^ name ^ " changed since its checkpoints were saved")
+    else
+      NoRunFromState (name ^ " has no current checkpoint (not built yet, restored from the cache, " ^
+                      "built with --skip-checkpoints, or removed by gc)")
+  end
+
 fun write_temp_text path text =
   let val out = TextIO.openOut path
   in TextIO.output(out, text); TextIO.closeOut out end

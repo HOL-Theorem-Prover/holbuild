@@ -226,6 +226,7 @@ holbuild --version
 holbuild --help
 holbuild repl
 holbuild run script.sml
+holbuild repl --from MyTheory
 holbuild context
 holbuild context --trknl
 holbuild execution-plan MyTheory:my_theorem
@@ -564,6 +565,24 @@ and executable objects may also include signature targets. Before starting HOL,
 `holbuild run` and `holbuild repl` build every target named by `[run].loads`,
 create an invocation-private project context under `.holbuild/`, and then load
 the configured targets followed by user arguments.
+
+`holbuild run --from THEORY` and `holbuild repl --from THEORY` start HOL from a
+checkpoint that building `THEORY` left behind, instead of loading its ancestry
+again. `THEORY` is a logical name or source path; only root-package theories
+have checkpoints. `--from` must come before the arguments passed to HOL. The
+starting state is:
+
+| Condition | State |
+| --- | --- |
+| `THEORY`'s `final_context` checkpoint matches its current input key | `THEORY` and its ancestors loaded |
+| Only `THEORY` changed: its `deps_loaded` checkpoint matches its current dependencies | ancestors loaded, `THEORY` not loaded |
+| Otherwise: not built yet, restored from the cache, built with `--skip-checkpoints`, checkpoints removed by `gc`, or a dependency changed | `[run].heap` if configured, else the HOL base state |
+
+A usable checkpoint takes precedence over `[run].heap`. holbuild prints one
+line naming the state it chose and, on fallback, why. `--from` does not build
+`THEORY`; run `holbuild build THEORY` first to refresh its checkpoints.
+`[run].loads` are still built and loaded on top of the chosen state. An unknown
+`THEORY` is an error.
 
 ## Proof steps and checkpoints
 
