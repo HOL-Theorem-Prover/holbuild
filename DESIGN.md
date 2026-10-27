@@ -831,11 +831,7 @@ uses HOLSource parser recovery, but lowers `HOLSourceAST.exp` directly.
 accepted as a deprecated no-op because proof IR is now the default. The CLI default is
 2.5 seconds per tactic step;
 `--tactic-timeout SECONDS` overrides all manifest timeout policy for the invocation, and
-`--tactic-timeout 0` disables it. A timeout is not a tactic failure: inside `TRY`,
-an `ORELSE`/`FIRST` alternative or a repeat body it fails the build at that step
-instead of taking the combinator's failure branch. It records no try, choice or
-repeat event for that body, and the failed-prefix checkpoint is saved at the outermost
-such combinator's entry rather than inside the body. Without a CLI override, `[build].tactic_timeout` sets
+`--tactic-timeout 0` disables it. Without a CLI override, `[build].tactic_timeout` sets
 the package default and `[build.root_tactic_timeouts]` may set per-entry-point timeout
 contracts keyed by `[build].roots` source paths. Entry-point contracts apply to the
 root-package portion of the build dependency closure; dependency packages do not inherit a
@@ -846,6 +842,14 @@ property of the declared entry point graph, not of the current request, except t
 but local metadata/cache records the timeout a successful build satisfied; a success under
 60s may satisfy a later 180s request, while a success under 180s does not satisfy a later
 60s request.
+
+A timeout is not a tactic failure: inside `TRY`, an `ORELSE`/`FIRST` alternative or a
+repeat body it fails the build at that step instead of taking the combinator's failure
+branch. It records no try, choice or repeat event for that body. The failed-prefix
+checkpoint is saved where the outermost such combinator started that body rather than
+inside it: at the `TRY` or choice's entry, or at the start of the timed-out repeat
+iteration, since earlier iterations do not depend on later ones.
+
 `execution-plan THEORY:THEOREM` and `--trace-steps` are debugging/inspection paths.
 `holbuild execution-plan THEORY:THEOREM` is static inspection for proof steps: it
 discovers sources, finds the named theorem in the named theory script, pretty-prints

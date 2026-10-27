@@ -732,8 +732,8 @@ fun emit_step_failure_diagnostic label goals =
 (* A timeout inside a TRY, ORELSE or rpt body is reported at once, since no
    combinator recovers from it.  It saves no failed-prefix checkpoint inside
    the body: resuming there would commit to that body without rerunning the
-   combinator that chose it.  raise_body_timeout saves one at the outermost
-   combinator's entry instead. *)
+   combinator that chose it.  raise_body_timeout saves one where the outermost
+   combinator started the body instead. *)
 fun report_step_failure_with_goals label goals e =
   case (e, !suppress_expected_failure_diagnostics_ref) of
       (TacticTimeout _, true) =>
@@ -1089,8 +1089,10 @@ fun with_expected_failures_suppressed f =
 fun discard_suppressed_failure_diagnostic () = suppressed_failure_diagnostic_ref := NONE
 
 (* Re-raises a timeout from a TRY, ORELSE or rpt body.  The outermost such
-   combinator restores its entry state and saves the failed-prefix checkpoint
-   there, the latest point no combinator choice depends on. *)
+   combinator restores the state from before it ran the body -- its entry for
+   TRY and ORELSE, the start of the timed-out iteration for rpt -- and saves
+   the failed-prefix checkpoint there, the latest point no combinator choice
+   depends on. *)
 fun raise_body_timeout saved e =
   (if !suppress_expected_failure_diagnostics_ref then ()
    else (restore_runtime_state saved; save_failed_prefix_checkpoint ());
