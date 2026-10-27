@@ -98,8 +98,6 @@ fun first_token text =
       token :: _ => token
     | [] => ""
 
-fun remove_file_before result path = (remove_file path; result)
-
 fun run program args =
   HolbuildSpawn.run {program = program, args = args, stderr = HolbuildSpawn.Inherit}
 
@@ -151,16 +149,18 @@ fun curl_put_with_headers headers request =
 fun curl_put request = curl_put_with_headers [] request
 
 fun curl_put_zstd_with_timeout timeout_seconds {url, src, size} =
-  let val compressed = FS.tmpName ()
+  let
+    val compressed = FS.tmpName ()
+    val result =
+      (if zstd_compress src compressed then
+         curl_put_with_headers_timeout timeout_seconds (zstd_content_headers size)
+           {url = url, src = compressed}
+       else
+         curl_put_with_headers_timeout timeout_seconds [] {url = url, src = src})
+      handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
   in
-    if zstd_compress src compressed then
-      curl_put_with_headers_timeout timeout_seconds (zstd_content_headers size)
-        {url = url, src = compressed}
-      before remove_file compressed
-    else
-      remove_file_before
-        (curl_put_with_headers_timeout timeout_seconds [] {url = url, src = src})
-        compressed
+    remove_file compressed;
+    result
   end
   handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
