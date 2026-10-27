@@ -181,7 +181,8 @@ for source in "$@"; do
 done
 HOLMAKE
 chmod +x bin/Holmake
-ln -s "$(pwd)/src/runtime/Runtime.sml" sigobj/Runtime.uo
+# HOL bakes its build directory as getcwd reports it, symlinks resolved.
+ln -s "$(pwd -P)/src/runtime/Runtime.sml" sigobj/Runtime.uo
 SH
   chmod +x "$hol/bin/build"
 }

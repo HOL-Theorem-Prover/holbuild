@@ -96,14 +96,16 @@ fun poly_version () =
     else die ("command failed: " ^ quote poly ^ " -v\n" ^ #output run)
   end
 
+(* The local toolchain key names how the toolchain was built: the HOL
+   sources (git, rev), the build recipe and kernel, and the Poly/ML that
+   compiled it.  How the poly command is spelled is not part of it; the
+   version text and, remotely, the executable digest identify Poly/ML. *)
 fun key_material {git, rev, kernel_variant} =
   let val _ = validate_git git
-      val poly = poly_command ()
       val version = poly_version ()
   in
     String.concatWith "\n"
-      ([format_version, "git=" ^ git, "rev=" ^ rev, "poly=" ^ poly,
-        "poly_version=" ^ version] @
+      ([format_version, "git=" ^ git, "rev=" ^ rev, "poly_version=" ^ version] @
        HolbuildHolToolchainConfig.key_material_fields (toolchain_config kernel_variant))
   end
 
@@ -503,18 +505,38 @@ fun poly_executable_path () =
   let val path = trim (command_output ("command -v " ^ quote (poly_command ())))
   in FS.fullPath path end
 
+(* HOL's configure records its build directory as getcwd reports it, with
+   symlinks resolved, and bakes it into executables, heaps and sigobj links.
+   The archive identity therefore names the physical path, so cache roots
+   reached through different symlinks share an archive exactly when their
+   toolchains would be installed in the same place. *)
+fun physical_holdir_for_key k =
+  (ensure_dir (toolchains_dir ());
+   Path.concat(Path.concat(FS.fullPath (toolchains_dir ()), k), "hol"))
+
+(* What a restored toolchain must share with the one that was published:
+   - toolchain-key: the same HOL sources, build recipe, kernel and Poly/ML
+     version (key_material);
+   - holdir: the installation path baked into the build;
+   - platform-os, platform-arch: executables and heaps are native code;
+   - platform-libc: bin/hol and the Poly/ML runtime link against the host C
+     library;
+   - poly-executable-sha256: heaps load only into the Poly/ML build that
+     exported them, and a patched build reports the same version as its
+     release.
+   The analyser is not archived: it is rebuilt against the restored toolchain
+   under its own key, so analyser changes do not split archives. *)
 fun archive_identity k =
   let val poly_path = poly_executable_path ()
   in
     String.concatWith "\n"
       [HolbuildToolchainArchive.archive_format,
        "toolchain-key=" ^ k,
-       "holdir=" ^ holdir_for_key k,
+       "holdir=" ^ physical_holdir_for_key k,
        "platform-os=" ^ platform_value "uname -s",
        "platform-arch=" ^ platform_value "uname -m",
        "platform-libc=" ^ platform_value "getconf GNU_LIBC_VERSION",
-       "poly-executable-sha256=" ^ HolbuildHash.file_sha256 poly_path,
-       "analyser-key=" ^ analyser_key ()]
+       "poly-executable-sha256=" ^ HolbuildHash.file_sha256 poly_path]
   end
 
 fun heap_loads k =
@@ -534,16 +556,13 @@ fun analyser_responds k ak =
     "holbuild-hol-analyser " ^ analyser_format_version
   handle _ => false
 
-fun complete_entry_contents k =
-  let
-    val ak = analyser_key ()
-    val holdir = holdir_for_key k
+(* What a toolchain archive holds: the HOL build and its source manifest. *)
+fun complete_toolchain_contents k =
+  let val holdir = holdir_for_key k
   in
     built holdir andalso
     hol_source_manifest_built k andalso
-    analyser_built k ak andalso
     heap_loads k andalso
-    analyser_responds k ak andalso
     clean k holdir
   end
 
@@ -584,9 +603,13 @@ fun restore_entry k =
              {remote = remote, identity = identity, final_dir = final} then
           (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_RENAMED";
            wait_test_gate "HOLBUILD_TEST_TOOLCHAIN_RENAMED_GATE";
-           if complete_entry_contents k then
-             (write_file (ok_for_key k) "ok\n"; true)
-           else die "restored HOL toolchain failed final validation")
+           if complete_toolchain_contents k then ()
+           else die "restored HOL toolchain failed final validation";
+           ignore (build_analyser k);
+           if analyser_responds k (analyser_key ()) then ()
+           else die "analyser built against the restored HOL toolchain does not respond";
+           write_file (ok_for_key k) "ok\n";
+           true)
         else false
       end
   in
@@ -605,7 +628,7 @@ fun publish_entry k =
   case HolbuildRemoteCacheConfig.url () of
       NONE => ()
     | SOME url =>
-        ((if path_exists (ok_for_key k) andalso complete_entry_contents k then
+        ((if path_exists (ok_for_key k) andalso complete_toolchain_contents k then
             ignore
               (HolbuildToolchainArchive.publish
                  {remote = HolbuildRemoteCache.remote url,

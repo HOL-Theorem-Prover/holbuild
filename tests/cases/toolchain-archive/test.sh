@@ -52,6 +52,8 @@ rev = "$revision"
 TOML
 }
 
+physical_dir() (cd "$1" && pwd -P)
+
 hol=$tmpdir/hol
 fakebin=$tmpdir/fakebin
 project=$tmpdir/project
@@ -102,7 +104,7 @@ require_file "$(dirname "$restored_holdir")/build.ok"
 [[ -x "$restored_holdir/bin/hol" ]]
 [[ -x "$restored_holdir/bin/Holmake" ]]
 [[ -L "$restored_holdir/sigobj/Runtime.uo" ]]
-[[ $(readlink "$restored_holdir/sigobj/Runtime.uo") = "$restored_holdir/src/runtime/Runtime.sml" ]]
+[[ $(readlink "$restored_holdir/sigobj/Runtime.uo") = "$(physical_dir "$restored_holdir")/src/runtime/Runtime.sml" ]]
 [[ ! -e "$restored_holdir/src/runtime/.hol/locks" ]]
 "$restored_holdir/bin/hol" --noconfig --holstate "$restored_holdir/bin/hol.state" </dev/null
 printf 'val x = true\n' > "$tmpdir/TinyScript.sml"
@@ -112,6 +114,25 @@ analyser_dirs=("$(dirname "$restored_holdir")"/analysers/*)
 "${analyser_dirs[0]}/bin/holbuild-hol-analyser" --version > "$tmpdir/analyser-version"
 require_grep '^holbuild-hol-analyser holbuild-hol-analyser-v2$' "$tmpdir/analyser-version"
 require_grep '^GET /cas/' "$request_log"
+[[ $(grep -c '^PUT ' "$request_log") -eq "$published_put_count" ]]
+
+# The analyser is rebuilt after a restore rather than archived, so a changed
+# analyser still restores the published toolchain.
+if tar -tf "$original_archive" | grep -q '^\./analysers'; then
+  record_regression_failure "toolchain archive contains analysers"
+fi
+analyser_src=$tmpdir/analyser-src
+cp -R "$SCRIPT_DIR/../../../sml" "$analyser_src"
+printf '\n(* changed analyser *)\n' >> "$analyser_src/analyser/analyser_main.sml"
+rm -rf "$cache/hol-toolchains"
+changed_analyser_log=$tmpdir/changed-analyser.log
+(cd "$project" && HOLBUILD_ANALYSER_SRC="$analyser_src/analyser" \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$changed_analyser_log" 2>&1
+[[ $(wc -l < "$build_count") -eq 1 ]]
+changed_analyser_dirs=("$(dirname "$published_holdir")"/analysers/*)
+[[ ${#changed_analyser_dirs[@]} -eq 1 ]]
+[[ "${changed_analyser_dirs[0]}" != "${analyser_dirs[0]}" ]]
+require_file "$(dirname "$published_holdir")/build.ok"
 [[ $(grep -c '^PUT ' "$request_log") -eq "$published_put_count" ]]
 
 initial_put_count=$(grep -c '^PUT ' "$request_log")
@@ -158,8 +179,8 @@ wrong_platform_log=$tmpdir/wrong-platform.log
 [[ $(grep -c '^PUT ' "$request_log") -eq $((initial_put_count + 6)) ]]
 [[ $(grep -c '^GET /cas/' "$request_log") -eq "$initial_cas_get_count" ]]
 
-# The exact path identity must use the same spelling embedded by the HOL build.
-# A cache reached through a symlink is still a valid same-path installation.
+# The path identity is the physical path, which the HOL build embeds. A cache
+# reached through a symlink is still a valid same-path installation.
 symlink_cache=$tmpdir/symlink-cache
 symlink_cache_real=$tmpdir/symlink-cache-real
 symlink_build_count=$tmpdir/symlink-build-count
@@ -190,11 +211,48 @@ if (cd "$project" && \
     if [[ "$symlink_restored_holdir" != "$symlink_holdir" ]] ||
        [[ $(wc -l < "$symlink_build_count") -ne 1 ]] ||
        [[ $(readlink "$symlink_restored_holdir/sigobj/Runtime.uo") != \
-          "$symlink_restored_holdir/src/runtime/Runtime.sml" ]]; then
+          "$(physical_dir "$symlink_cache_real")/hol-toolchains/$(basename "$(dirname "$symlink_holdir")")/hol/src/runtime/Runtime.sml" ]]; then
       record_regression_failure "symlink-alias toolchain identity was not restored consistently"
     fi
   else
     record_regression_failure "symlink-alias toolchain archive was not restorable"
+  fi
+
+  # The same physical path spelled without the symlink restores the archive.
+  rm -rf "$symlink_cache_real/hol-toolchains"
+  physical_restore_log=$tmpdir/physical-restore.log
+  if (cd "$project" && \
+      HOLBUILD_CACHE="$symlink_cache_real" \
+      HOLBUILD_TEST_BUILD_COUNT="$symlink_build_count" \
+      "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) \
+      > "$physical_restore_log" 2>&1; then
+    if [[ $(wc -l < "$symlink_build_count") -ne 1 ]]; then
+      record_regression_failure "physical spelling of a published path missed its archive"
+    fi
+  else
+    record_regression_failure "physical spelling of a published path was not restorable"
+  fi
+
+  # The same symlink spelling resolving elsewhere must not restore an archive
+  # whose baked paths name the publisher's directory.
+  moved_cache_real=$tmpdir/symlink-cache-moved
+  mkdir -p "$moved_cache_real"
+  rm "$symlink_cache"
+  ln -s "$moved_cache_real" "$symlink_cache"
+  moved_log=$tmpdir/symlink-moved.log
+  if (cd "$project" && \
+      HOLBUILD_CACHE="$symlink_cache" \
+      HOLBUILD_TEST_BUILD_COUNT="$symlink_build_count" \
+      "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) \
+      > "$moved_log" 2>&1; then
+    moved_holdir=$(tail -n 1 "$moved_log")
+    if [[ $(wc -l < "$symlink_build_count") -ne 2 ]] ||
+       [[ $(readlink "$moved_holdir/sigobj/Runtime.uo") != \
+          "$(physical_dir "$moved_holdir")/src/runtime/Runtime.sml" ]]; then
+      record_regression_failure "symlink resolving to another directory reused the publisher's archive"
+    fi
+  else
+    record_regression_failure "symlink resolving to another directory did not build locally"
   fi
 else
   record_regression_failure "toolchain publication rejected a symlinked cache path"
@@ -236,7 +294,7 @@ identity = manifest_bytes.split(marker, 1)[1]
 
 if mutation == "wrong-identity":
     manifest_bytes = (
-        b"holbuild-toolchain-archive-v1\n" + marker + identity + b"\nwrong"
+        b"holbuild-toolchain-archive-v2\n" + marker + identity + b"\nwrong"
     )
 
 with tarfile.open(destination, "w", format=tarfile.PAX_FORMAT, pax_headers={}) as output:
@@ -259,6 +317,16 @@ with tarfile.open(destination, "w", format=tarfile.PAX_FORMAT, pax_headers={}) a
         member.gname = ""
         member.mtime = 0
         output.addfile(member, io.BytesIO(data) if member.isreg() else None)
+
+    if mutation == "analysers":
+        extra = tarfile.TarInfo("./analysers/stale")
+        payload = b"stale"
+        extra.size = len(payload)
+        extra.mode = 0o644
+        extra.uid = 0
+        extra.gid = 0
+        extra.mtime = 0
+        output.addfile(extra, io.BytesIO(payload))
 
     if mutation == "traversal":
         extra = tarfile.TarInfo("../parent-escape")
@@ -312,6 +380,7 @@ invalid_restore() {
 invalid_restore wrong-identity 'identity does not match'
 invalid_restore digest 'SHA256 mismatch'
 invalid_restore traversal 'could not extract tar archive'
+invalid_restore analysers 'archive contains analysers'
 invalid_restore missing-executable 'failed final validation'
 invalid_restore missing-holmake 'failed final validation'
 invalid_restore corrupt-heap 'failed final validation'
