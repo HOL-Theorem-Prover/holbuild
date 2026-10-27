@@ -98,8 +98,8 @@ fun redact_userinfo url =
           end
   end
 
-fun read_first_token path =
-  case String.tokens Char.isSpace (read_text path) of
+fun first_token text =
+  case String.tokens Char.isSpace text of
       token :: _ => token
     | [] => ""
 
@@ -107,11 +107,40 @@ fun remove_file_before result path = (remove_file path; result)
 
 fun command_success command = OS.Process.isSuccess (OS.Process.system command)
 
-fun zstd_compress src dst =
-  command_success ("zstd -q -f -T0 -o " ^ quote dst ^ " " ^ quote src)
+fun completed_line text =
+  case List.find (String.isSubstring "Completed in") (String.fields (fn c => c = #"\n") text) of
+      SOME line => Substring.string (#2 (Substring.position "Completed in" (Substring.full line)))
+    | NONE => "no zstd completion line"
+
+(* Under HOLBUILD_CACHE_TRACE, zstd runs verbosely so its wall time and CPU
+   load show how much the -T0 threads compete with the build. *)
+fun zstd_compress url src dst =
+  if HolbuildStatus.cache_trace_enabled () then
+    let
+      val log = dst ^ ".log"
+      val ok = command_success ("zstd -vv -f -T0 -o " ^ quote dst ^ " " ^ quote src ^ " 2> " ^ quote log)
+      val text = if path_exists log then read_text log else ""
+    in
+      remove_file log;
+      HolbuildStatus.cache_trace ("remote cache zstd " ^ redact_userinfo url ^ " " ^ completed_line text);
+      ok
+    end
+  else
+    command_success ("zstd -q -f -T0 -o " ^ quote dst ^ " " ^ quote src)
 
 fun zstd_content_headers size =
   " -H 'Content-Encoding: zstd' -H " ^ quote ("X-Digest-SizeBytes: " ^ size)
+
+(* The HTTP code comes first; the rest only feeds the HOLBUILD_CACHE_TRACE line. *)
+val curl_write_out =
+  " -w '%{http_code} down=%{size_download}B up=%{size_upload}B ttfb=%{time_starttransfer}s total=%{time_total}s'"
+
+(* One line per request: wall time around the curl process, then curl's own
+   transfer timings, so per-request overhead and transfer time separate. *)
+fun trace_request method display_url timer write_out =
+  HolbuildStatus.cache_trace
+    ("remote cache " ^ method ^ " " ^ display_url ^ " wall=" ^
+     LargeInt.toString (Time.toMilliseconds (Timer.checkRealTimer timer)) ^ "ms " ^ write_out)
 
 fun curl_get_with_timeout timeout_seconds {url, dst} =
   let
@@ -120,10 +149,13 @@ fun curl_get_with_timeout timeout_seconds {url, dst} =
     (* --compressed advertises curl-supported response encodings, including zstd
        when this curl build has zstd support, and streams decompressed bytes to dst. *)
     val command = "curl -q -sS -L --compressed --max-time " ^ timeout_seconds ^ curl_config_arg () ^ " -o " ^ quote dst ^
-                  " -w '%{http_code}' " ^ quote url ^ " > " ^ quote code
+                  curl_write_out ^ " " ^ quote url ^ " > " ^ quote code
+    val timer = Timer.startRealTimer ()
     val status = OS.Process.system command
-    val http_code = if path_exists code then read_first_token code else "000"
+    val write_out = if path_exists code then read_text code else ""
+    val http_code = if write_out = "" then "000" else first_token write_out
     val _ = remove_file code
+    val _ = trace_request "GET" display_url timer write_out
   in
     if not (OS.Process.isSuccess status) then HolbuildCacheBackend.Corrupt ("curl GET failed: " ^ display_url)
     else if http_code = "200" then HolbuildCacheBackend.Hit
@@ -143,11 +175,14 @@ fun curl_put_with_headers_timeout timeout_seconds headers {url, src} =
     val body = temp_path "body"
     val display_url = redact_userinfo url
     val command = "curl -q -sS -L --max-time " ^ timeout_seconds ^ curl_config_arg () ^ headers ^ " -T " ^ quote src ^
-                  " -o " ^ quote body ^ " -w '%{http_code}' " ^ quote url ^
+                  " -o " ^ quote body ^ curl_write_out ^ " " ^ quote url ^
                   " > " ^ quote code
+    val timer = Timer.startRealTimer ()
     val status = OS.Process.system command
-    val http_code = if path_exists code then read_first_token code else "000"
+    val write_out = if path_exists code then read_text code else ""
+    val http_code = if write_out = "" then "000" else first_token write_out
     val _ = remove_file code
+    val _ = trace_request "PUT" display_url timer write_out
     val _ = remove_file body
   in
     if not (OS.Process.isSuccess status) then HolbuildCacheBackend.Conflict ("curl PUT failed: " ^ display_url)
@@ -164,7 +199,7 @@ fun curl_put request = curl_put_with_headers "" request
 fun curl_put_zstd_with_timeout timeout_seconds {url, src, size} =
   let val compressed = temp_path "zstd-put"
   in
-    if zstd_compress src compressed then
+    if zstd_compress url src compressed then
       curl_put_with_headers_timeout timeout_seconds (zstd_content_headers size)
         {url = url, src = compressed}
       before remove_file compressed

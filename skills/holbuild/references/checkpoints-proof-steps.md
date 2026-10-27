@@ -149,7 +149,7 @@ With `--json`, failures are emitted as structured `error`/`node_failed` JSONL ev
 | `HOLBUILD_SHARE_COMMON_DATA` | Override `PolyML.shareCommonData` default for checkpoint saves |
 | `HOLBUILD_CHECKPOINT_TIMING` | `1`/`true` = print checkpoint save timing to stderr |
 | `HOLBUILD_ECHO_CHILD_LOGS` | `1`/`true` = echo child `hol run` log to stdout |
-| `HOLBUILD_CACHE_TRACE` | `1`/`true` = print cache decision trace |
+| `HOLBUILD_CACHE_TRACE` | `1`/`true` = print cache decision trace, one timing line per remote-cache request and zstd compression, and the build's Linux CPU-pressure (PSI) delta |
 | `HOLBUILD_STATUS` | `1`/`true` = enable status display, `0`/`false` = disable |
 | `HOLBUILD_TIMING_LOG` | Path for structured timing data (tool + coarse phase lines, including `build.keys` action-key computation) |
 | `HOLBUILD_TIMING_DETAIL` | Optional timing coarseness: unset/`coarse` logs coarse phases only; `fine` adds aggregate subphase lines; `trace` is reserved for future per-item detail |
