@@ -52,7 +52,7 @@ fun blocking_lock_owner fd =
 (* Returns the pid of a process holding any lock on the path. Closing the probe
    descriptor drops this process's own fcntl locks on the file, so callers must
    hold none. *)
-fun lock_owner_path {path} =
+fun lock_holder_pid {path} =
   let val fd = open_lock_file path in blocking_lock_owner fd before close_fd fd end
   handle OS.SysErr _ => NONE
 fun try_acquire_path {path, obsolete_kind} =

@@ -82,10 +82,24 @@ fun cache_remote_dir git =
     Path.concat(remotes, hash ^ ".git")
   end
 
+fun holder_text path =
+  case HolbuildFileLock.lock_holder_pid {path = path} of
+      SOME pid => " (pid " ^ pid ^ ")"
+    | NONE => ""
+
+(* Says who holds the lock before blocking on it: the holder's git output is
+   captured, so without this a long clone elsewhere looks like a hang. *)
 fun with_lock path f =
   let
-    val lock = HolbuildFileLock.acquire_exclusive_path_wait {path = path}
-               handle HolbuildFileLock.Error msg => die msg
+    val lock =
+      (case HolbuildFileLock.try_acquire_path {path = path, obsolete_kind = NONE} of
+           SOME lock => lock
+         | NONE =>
+             (TextIO.output(TextIO.stdErr, "holbuild: waiting for another holbuild process" ^
+                                           holder_text path ^ " to release " ^ path ^ "\n");
+              TextIO.flushOut TextIO.stdErr;
+              HolbuildFileLock.acquire_exclusive_path_wait {path = path}))
+      handle HolbuildFileLock.Error msg => die msg
   in
     (f () before HolbuildFileLock.release lock)
     handle e => (HolbuildFileLock.release lock; raise e)
@@ -101,17 +115,27 @@ fun list_dir dir =
     (loop [] before FS.closeDir stream) handle e => (FS.closeDir stream; raise e)
   end
 
+(* Removes the temporary dirs prefix ^ <pid> in dir. Callers hold the lock
+   that every writer of these dirs holds, so each one is left over from a
+   killed process. *)
+fun remove_temp_dirs {dir, prefix} =
+  let
+    fun is_temp entry =
+      String.isPrefix prefix entry andalso
+      let val pid = String.extract(entry, size prefix, NONE)
+      in size pid > 0 andalso CharVector.all Char.isDigit pid end
+  in
+    List.app (fn entry => if is_temp entry then remove_tree (Path.concat(dir, entry)) else ())
+             (list_dir dir)
+  end
+
 (* Clones into a temporary directory and renames it into place, so a mirror
-   path that exists always holds a complete clone. Runs under the mirror lock,
-   so every temporary clone of this mirror is left over from a killed process. *)
+   path that exists always holds a complete clone. Runs under the mirror lock. *)
 fun clone_remote git dir =
   let
-    val tmp_prefix = Path.file dir ^ ".tmp-"
     val tmp = dir ^ ".tmp-" ^ HolbuildFileLock.current_pid_text ()
   in
-    List.app (fn entry => if String.isPrefix tmp_prefix entry
-                          then remove_tree (Path.concat(Path.dir dir, entry)) else ())
-             (list_dir (Path.dir dir));
+    remove_temp_dirs {dir = Path.dir dir, prefix = Path.file dir ^ ".tmp-"};
     (run ("git clone --bare " ^ quote git ^ " " ^ quote tmp);
      let val out = TextIO.openOut (dir ^ ".holbuild-url")
      in TextIO.output(out, git ^ "\n"); TextIO.closeOut out end;
@@ -181,15 +205,8 @@ fun publish_checkout {tmp, dest, lease} =
     case HolbuildFileLock.try_acquire_path {path = lease, obsolete_kind = NONE}
          handle HolbuildFileLock.Error msg => die msg of
         NONE =>
-          let
-            val holder =
-              case HolbuildFileLock.lock_owner_path {path = lease} of
-                  SOME pid => " (pid " ^ pid ^ ")"
-                | NONE => ""
-          in
-            die ("cannot replace dependency checkout " ^ dest ^
-                 ": another holbuild process is using it" ^ holder)
-          end
+          die ("cannot replace dependency checkout " ^ dest ^
+               ": another holbuild process is using it" ^ holder_text lease)
       | SOME lock =>
           ((remove_tree dest; FS.rename {old = tmp, new = dest}; HolbuildFileLock.release lock)
            handle e => (HolbuildFileLock.release lock; raise e))
@@ -204,12 +221,14 @@ fun materialize {name, git, rev, artifact_root} =
     val locks = Path.concat(Path.concat(holbuild_dir, "locks"), "src")
     val lease = Path.concat(locks, name ^ ".lease")
     fun pinned () = materialized_head dest = SOME rev
+    (* Runs under the checkout lock. *)
     fun checkout () =
       let
         val (remote, commit) = ensure_commit git rev
-        val tmp = Path.concat(src_root, ".tmp-" ^ name ^ "-" ^ HolbuildFileLock.current_pid_text ())
+        val tmp_prefix = ".tmp-" ^ name ^ "-"
+        val tmp = Path.concat(src_root, tmp_prefix ^ HolbuildFileLock.current_pid_text ())
       in
-        remove_if_exists tmp;
+        remove_temp_dirs {dir = src_root, prefix = tmp_prefix};
         (run ("git clone " ^ quote remote ^ " " ^ quote tmp);
          run ("git -C " ^ quote tmp ^ " checkout --detach " ^ quote commit);
          publish_checkout {tmp = tmp, dest = dest, lease = lease})

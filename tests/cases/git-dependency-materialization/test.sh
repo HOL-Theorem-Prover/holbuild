@@ -8,7 +8,18 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
-cleanup() { rm -rf "$tmpdir"; }
+lease_holder=
+lock_waiter=
+cleanup() {
+  # A lease holder still blocked on its FIFO is released so that it and the
+  # run waiting on it exit before their files go.
+  if [[ -n $lease_holder ]]; then
+    release_lease_holder
+    wait $lease_holder $lock_waiter || true
+  fi
+  rm -rf "$tmpdir"
+}
+release_lease_holder() { timeout 10 sh -c ': > "$1"' sh "$tmpdir/blocker.fifo" || true; }
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
@@ -426,11 +437,15 @@ race_context() {
   [ "$failed" = 0 ]
   for project in "$@"; do
     [ "$(git -C "$project/.holbuild/src/dep" rev-parse HEAD)" = "$rev" ]
-    if compgen -G "$project/.holbuild/src/.tmp-*" > /dev/null; then
-      echo "checkout temp dir left in $project/.holbuild/src" >&2
-      exit 1
-    fi
+    require_no_checkout_temp "$project"
   done
+}
+
+require_no_checkout_temp() {
+  if compgen -G "$1/.holbuild/src/.tmp-*" > /dev/null; then
+    echo "checkout temp dir left in $1/.holbuild/src" >&2
+    exit 1
+  fi
 }
 
 # A mirror clone killed mid-way leaves a temp dir that the next clone removes.
@@ -445,9 +460,15 @@ fi
 rm -rf "$tmpdir/race1/.holbuild/src" "$tmpdir/race2/.holbuild/src"
 race_context warm-mirror "$rev1" "$tmpdir/race1" "$tmpdir/race1" "$tmpdir/race2" "$tmpdir/race2"
 
-set_dep_rev "$tmpdir/race1" "$rev2"
-set_dep_rev "$tmpdir/race2" "$rev2"
-race_context repin "$rev2" "$tmpdir/race1" "$tmpdir/race1" "$tmpdir/race2" "$tmpdir/race2"
+# rev3 is not yet in the mirror, so both roots also race to fetch it. A
+# checkout clone killed mid-way leaves a temp dir that the next publish removes.
+echo three > "$repo/value.txt"
+git -C "$repo" commit -q -am three
+rev3=$(git -C "$repo" rev-parse HEAD)
+mkdir "$tmpdir/race1/.holbuild/src/.tmp-dep-999999999"
+set_dep_rev "$tmpdir/race1" "$rev3"
+set_dep_rev "$tmpdir/race2" "$rev3"
+race_context repin "$rev3" "$tmpdir/race1" "$tmpdir/race1" "$tmpdir/race2" "$tmpdir/race2"
 
 # A holbuild process that has materialized dep keeps its lease while it runs:
 # another process at the same rev still proceeds, but none may replace the tree
@@ -512,11 +533,32 @@ if (cd "$tmpdir/race1" && "$HOLBUILD_BIN" context) > "$tmpdir/leased-replace.log
   exit 1
 fi
 require_grep "another holbuild process is using it (pid [0-9][0-9]*)" "$tmpdir/leased-replace.log"
-[ "$(git -C "$tmpdir/race1/.holbuild/src/dep" rev-parse HEAD)" = "$rev2" ]
-echo > "$tmpdir/blocker.fifo"
-if ! wait "$lease_holder"; then
-  cat "$tmpdir/holder.log" >&2
-  exit 1
-fi
+[ "$(git -C "$tmpdir/race1/.holbuild/src/dep" rev-parse HEAD)" = "$rev3" ]
+require_no_checkout_temp "$tmpdir/race1"
+# The holder is blocked inside the blocker mirror clone, so it also holds that
+# mirror's lock; a run that needs the mirror names the pid it waits for.
+cat >> "$tmpdir/race2/holproject.toml" <<TOML
+
+[dependencies.blocker]
+git = "$blocker_repo"
+rev = "$blocker_rev"
+TOML
+(cd "$tmpdir/race2" && "$HOLBUILD_BIN" context) > "$tmpdir/waiter.log" 2>&1 &
+lock_waiter=$!
+for _ in {1..600}; do
+  grep -q "waiting for another holbuild process" "$tmpdir/waiter.log" && break
+  sleep 0.05
+done
+require_grep "waiting for another holbuild process (pid [0-9][0-9]*) to release .*[.]git[.]lock" "$tmpdir/waiter.log"
+release_lease_holder
+holder=$lease_holder waiter=$lock_waiter
+lease_holder= lock_waiter=
+for pid in "$holder" "$waiter"; do
+  if ! wait "$pid"; then
+    cat "$tmpdir/holder.log" "$tmpdir/waiter.log" >&2
+    exit 1
+  fi
+done
+[ "$(git -C "$tmpdir/race2/.holbuild/src/blocker" rev-parse HEAD)" = "$blocker_rev" ]
 (cd "$tmpdir/race1" && "$HOLBUILD_BIN" context) > "$tmpdir/released-replace.log"
 [ "$(git -C "$tmpdir/race1/.holbuild/src/dep" rev-parse HEAD)" = "$rev1" ]
