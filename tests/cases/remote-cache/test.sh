@@ -238,7 +238,7 @@ require_grep "remote cache published:" "$first_log"
 require_grep "remote cache zstd .*/cas/[0-9a-f]* Completed in" "$first_log"
 require_grep "remote cache PUT .*/cas/[0-9a-f]* wall=[0-9]*ms 20[014] down=[0-9]*B up=[0-9]*B ttfb=" "$first_log"
 if [[ -r /proc/pressure/cpu ]]; then
-  require_grep "cpu pressure some delta: [0-9]*us" "$first_log"
+  require_grep "system cpu pressure some delta: [0-9]*us" "$first_log"
 fi
 assert_remote_proof_timeout none
 

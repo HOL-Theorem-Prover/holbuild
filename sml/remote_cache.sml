@@ -122,7 +122,9 @@ fun zstd_compress url src dst =
       val text = if path_exists log then read_text log else ""
     in
       remove_file log;
-      HolbuildStatus.cache_trace ("remote cache zstd " ^ redact_userinfo url ^ " " ^ completed_line text);
+      HolbuildStatus.cache_trace
+        ("remote cache zstd " ^ redact_userinfo url ^ " " ^
+         (if ok then completed_line text else "failed: " ^ text));
       ok
     end
   else

@@ -4894,8 +4894,8 @@ fun dump_keys_if_requested config_lines_for_node toolchain_key plan keys =
           write_text_atomic path text
         end
 
-(* Linux PSI: total microseconds runnable tasks waited for a CPU.  NONE where
-   /proc/pressure/cpu doesn't exist (e.g. macOS). *)
+(* Linux PSI: total microseconds runnable tasks, machine-wide, waited for a CPU.
+   NONE where /proc/pressure/cpu doesn't exist (e.g. macOS). *)
 fun cpu_pressure_total_us () =
   let
     val input = TextIO.openIn "/proc/pressure/cpu"
@@ -4909,7 +4909,7 @@ fun cpu_pressure_total_us () =
 fun trace_cpu_pressure_delta start =
   case (start, cpu_pressure_total_us ()) of
       (SOME before_us, SOME after_us) =>
-        cache_trace ("cpu pressure some delta: " ^ LargeInt.toString (after_us - before_us) ^ "us")
+        cache_trace ("system cpu pressure some delta: " ^ LargeInt.toString (after_us - before_us) ^ "us")
     | _ => ()
 
 fun build (options : build_options) tc project plan toolchain_key jobs =
@@ -4938,6 +4938,7 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
          budget_state (!(#refreshed budget_state)) [];
        clear_checkpoint_index_dirty budget_state)
       handle e => (HolbuildStatus.finish status;
+                   trace_cpu_pressure_delta cpu_pressure_start;
                    finalize_checkpoint_budget_state_excluding budget_state true [];
                    clear_checkpoint_index_dirty budget_state;
                    raise e)
