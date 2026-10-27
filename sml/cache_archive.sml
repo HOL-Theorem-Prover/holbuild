@@ -223,7 +223,7 @@ fun require_manifest payload =
     else raise Error ("unsupported cache archive format in " ^ path)
   end
 
-fun create_export {archive_path, source, entries, targets, metadata} =
+fun create_export {archive_path, source, entries, targets, metadata, pool} =
   if path_exists archive_path then
     raise Error ("cache archive already exists: " ^ archive_path)
   else
@@ -237,7 +237,7 @@ fun create_export {archive_path, source, entries, targets, metadata} =
     in
       (ensure_dir payload;
        HolbuildFSCacheBackend.ensure_layout cache;
-       ignore (HolbuildCacheTransfer.copy_entries
+       ignore (HolbuildCacheTransfer.copy_entries pool
                  {source = source,
                   destination = fs_destination cache,
                   tmp_dir = HolbuildFSCacheBackend.tmp_dir cache}
@@ -250,15 +250,16 @@ fun create_export {archive_path, source, entries, targets, metadata} =
       handle e => (cleanup (); raise e)
     end
 
-fun create_with_targets {archive_path, source, keys, targets} =
+fun create_with_targets {archive_path, source, keys, targets, pool} =
   create_export {archive_path = archive_path,
                  source = source,
+                 pool = pool,
                  entries = map (fn key => {key = key, package = "", logical = "", source_path = "", root = true}) keys,
                  targets = targets,
                  metadata = empty_metadata}
 
-fun create {archive_path, source, keys} =
-  create_with_targets {archive_path = archive_path, source = source, keys = keys, targets = []}
+fun create {archive_path, source, keys, pool} =
+  create_with_targets {archive_path = archive_path, source = source, keys = keys, targets = [], pool = pool}
 
 fun with_entries {archive_path, f} =
   let

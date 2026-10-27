@@ -1244,11 +1244,13 @@ fun export_archive tc jobs args =
     val cache = HolbuildFSCacheBackend.default () handle HolbuildFSCacheBackend.Error msg => raise Error msg
     val metadata = hbx_export_metadata project
   in
-    HolbuildCacheArchive.create_export {archive_path = output,
-                                        source = fs_cache_source cache,
-                                        entries = entries,
-                                        targets = targets,
-                                        metadata = metadata};
+    HolbuildCacheTransfer.with_pool (HolbuildCacheTransfer.pool_jobs (effective_jobs project jobs))
+      (fn pool => HolbuildCacheArchive.create_export {archive_path = output,
+                                                      source = fs_cache_source cache,
+                                                      entries = entries,
+                                                      targets = targets,
+                                                      metadata = metadata,
+                                                      pool = pool});
     Option.app (fn path => write_export_metadata {path = path,
                                                   archive_path = output,
                                                   targets = targets,
@@ -1261,7 +1263,7 @@ fun fs_cache_destination cache : HolbuildCacheTransfer.destination =
   {put_action = HolbuildFSCacheBackend.put_action cache,
    publish_blob = HolbuildFSCacheBackend.publish_blob cache}
 
-fun import_archive args =
+fun import_archive jobs args =
   case args of
       [archive_path] =>
         let
@@ -1277,11 +1279,14 @@ fun import_archive args =
           fun copy {source, keys} =
             let
               val _ = List.app (validate_action source) keys
-              val results = HolbuildCacheTransfer.copy_entries
+              val results =
+                HolbuildCacheTransfer.with_pool
+                  (HolbuildCacheTransfer.pool_jobs (Option.getOpt (jobs, default_jobs ())))
+                  (fn pool => HolbuildCacheTransfer.copy_entries pool
                               {source = source,
                                destination = fs_cache_destination destination,
                                tmp_dir = HolbuildFSCacheBackend.tmp_dir destination}
-                              keys
+                              keys)
             in
               result_count := length results
             end
@@ -1442,7 +1447,7 @@ fun dispatch tc jobs args =
     | "run" :: rest => (reject_json "run"; run_hol tc jobs "run" rest)
     | "repl" :: rest => (reject_json "repl"; repl_hol tc jobs rest)
     | "export" :: rest => (reject_json "export"; export_archive tc jobs rest)
-    | "import" :: rest => (reject_json "import"; import_archive rest)
+    | "import" :: rest => (reject_json "import"; import_archive jobs rest)
     | cmd :: _ => if known_command cmd then raise Error ("unknown command: " ^ cmd)
                   else build tc jobs args
 
@@ -1579,7 +1584,7 @@ fun dispatch_with_options {holdir, source_dir, cache_dir, remote_cache, jobs, ma
    case args of
        "gc" :: rest => (reject_json "gc"; gc rest)
      | "cache" :: rest => (reject_json "cache"; HolbuildCache.dispatch rest)
-     | "import" :: rest => (reject_json "import"; import_archive rest)
+     | "import" :: rest => (reject_json "import"; import_archive jobs rest)
      | "buildhol" :: rest => buildhol holdir maxheap rest
      | "goalfrag-plan" :: _ => raise Error "goalfrag-plan has been removed; use execution-plan THEORY:THEOREM"
      | [] => dispatch (effective_toolchain holdir maxheap) jobs args

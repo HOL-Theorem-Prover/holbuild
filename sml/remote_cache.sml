@@ -8,7 +8,7 @@ exception Error of string
 
 type blob_entry = {sha1 : string, sha256 : string, size : string}
 type blob_map = (string, blob_entry) Redblackmap.dict
-datatype t = RemoteCache of {base_url : string, blobs : blob_map ref}
+datatype t = RemoteCache of {base_url : string, blobs : blob_map ref, blobs_mutex : Mutex.mutex}
 
 val metadata_header = "holbuild-remote-cache-action-v1"
 val manifest_marker = "manifest-text-v1\n"
@@ -30,7 +30,8 @@ fun trim_trailing_slashes url =
 fun empty_blob_map () = Redblackmap.mkDict String.compare
 
 fun remote url =
-  RemoteCache {base_url = trim_trailing_slashes url, blobs = ref (empty_blob_map ())}
+  RemoteCache {base_url = trim_trailing_slashes url, blobs = ref (empty_blob_map ()),
+               blobs_mutex = Mutex.mutex ()}
 
 fun base_url (RemoteCache {base_url, ...}) = base_url
 fun blob_map (RemoteCache {blobs, ...}) = blobs
@@ -187,12 +188,14 @@ fun cas_url cache sha256 = base_url cache ^ "/cas/" ^ sha256
 fun lookup_blob cache sha1 =
   Redblackmap.peek (!(blob_map cache), sha1)
 
-fun remember_blob cache entry =
-  let
-    val blobs = blob_map cache
-    val {sha1, ...} = entry
+(* Concurrent transfers share one client.  Readers see a whole map either way;
+   the lock keeps two inserts from losing one. *)
+fun remember_blob (RemoteCache {blobs, blobs_mutex, ...}) entry =
+  let val {sha1, ...} = entry
   in
-    blobs := Redblackmap.insert (!blobs, sha1, entry)
+    Mutex.lock blobs_mutex;
+    blobs := Redblackmap.insert (!blobs, sha1, entry);
+    Mutex.unlock blobs_mutex
   end
 
 fun split_at_marker text =
