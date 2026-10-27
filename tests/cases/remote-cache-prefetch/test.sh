@@ -154,7 +154,7 @@ mkdir -p "$gate"
 consumer_log=$tmpdir/consumer.log
 (cd "$consumer" && HOLBUILD_CACHE="$consumer_cache" HOLBUILD_CACHE_TRACE=1 \
   HOLBUILD_TEST_PREFETCH_GATE="$gate" \
-  exec "$HOLBUILD_BIN" --remote-cache "$remote_url" -j2 build LateTheory BrokenTheory AbsentTheory) \
+  exec "$HOLBUILD_BIN" --remote-cache "$remote_url" -j1 build BrokenTheory AbsentTheory LateTheory) \
   > "$consumer_log" 2>&1 &
 consumer_pid=$!
 

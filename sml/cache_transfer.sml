@@ -89,12 +89,9 @@ fun next_temp_blob_id () =
 (* Unique per copy: concurrent copies of one blob (parallel build workers,
    prefetch, other holbuild processes) share tmp_dir. *)
 fun temp_blob_path tmp_dir hash =
-  let
-    val pid = SysWord.fmt StringCvt.DEC (Posix.Process.pidToWord (Posix.ProcEnv.getpid ()))
-  in
-    Path.concat(tmp_dir, String.concat ["holbuild-cache-transfer-", hash, "-", pid, "-",
-                                        Int.toString (next_temp_blob_id ()), ".blob"])
-  end
+  Path.concat(tmp_dir, String.concat ["holbuild-cache-transfer-", hash, "-",
+                                      HolbuildFileLock.current_pid_text (), "-",
+                                      Int.toString (next_temp_blob_id ()), ".blob"])
 
 fun fetch_blob_or_raise (source : source) hash path =
   case #fetch_blob source {hash = hash, dst = path} of
