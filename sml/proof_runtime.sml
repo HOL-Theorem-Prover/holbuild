@@ -192,8 +192,9 @@ fun timeout_message label seconds =
   String.concat ["holbuild tactic timeout after ", Real.toString seconds, "s: ", label]
 
 (* Raised when a proof step exceeds the tactic timeout.  It is not a tactic
-   failure: TRY, ORELSE and rpt propagate it instead of taking their failure
-   branch, so a step that only stopped because of the timeout fails the build. *)
+   failure: TRY, ORELSE and structural repeat propagate it instead of taking
+   their failure branch, so a step that only stopped because of the timeout
+   fails the build. *)
 exception TacticTimeout of string
 
 fun with_tactic_timeout label f x =
@@ -729,7 +730,7 @@ fun emit_step_failure_diagnostic label goals =
   (save_failed_prefix_checkpoint ();
    print_step_failure_goal_state label goals)
 
-(* A timeout inside a TRY, ORELSE or rpt body is reported at once, since no
+(* A timeout inside a TRY, ORELSE or repeat body is reported at once, since no
    combinator recovers from it.  It saves no failed-prefix checkpoint inside
    the body: resuming there would commit to that body without rerunning the
    combinator that chose it.  raise_body_timeout saves one where the outermost
@@ -1088,9 +1089,9 @@ fun with_expected_failures_suppressed f =
 
 fun discard_suppressed_failure_diagnostic () = suppressed_failure_diagnostic_ref := NONE
 
-(* Re-raises a timeout from a TRY, ORELSE or rpt body.  The outermost such
+(* Re-raises a timeout from a TRY, ORELSE or repeat body.  The outermost such
    combinator restores the state from before it ran the body -- its entry for
-   TRY and ORELSE, the start of the timed-out iteration for rpt -- and saves
+   TRY and ORELSE, the start of the timed-out iteration for repeat -- and saves
    the failed-prefix checkpoint there, the latest point no combinator choice
    depends on. *)
 fun raise_body_timeout saved e =

@@ -844,11 +844,12 @@ but local metadata/cache records the timeout a successful build satisfied; a suc
 60s request.
 
 A timeout is not a tactic failure: inside `TRY`, an `ORELSE`/`FIRST` alternative or a
-repeat body it fails the build at that step instead of taking the combinator's failure
-branch. It records no try, choice or repeat event for that body. The failed-prefix
+structural repeat body it fails the build at that step instead of taking the combinator's
+failure branch. It records no try, choice or repeat event for that body. The failed-prefix
 checkpoint is saved where the outermost such combinator started that body rather than
-inside it: at the `TRY` or choice's entry, or at the start of the timed-out repeat
-iteration, since earlier iterations do not depend on later ones.
+inside it: at the `TRY` or choice's entry, or at the start of the timed-out iteration of a
+structural repeat. Tactic-level `REPEAT`/`rpt` is an opaque leaf (see above), so it is
+timed as one step and fails like any other leaf.
 
 `execution-plan THEORY:THEOREM` and `--trace-steps` are debugging/inspection paths.
 `holbuild execution-plan THEORY:THEOREM` is static inspection for proof steps: it
