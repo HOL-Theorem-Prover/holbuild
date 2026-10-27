@@ -16,13 +16,6 @@ type metadata =
    hol_repo : string option,
    hol_rev : string option}
 
-val empty_metadata : metadata =
-  {created_at = NONE,
-   source_repo = NONE,
-   source_rev = NONE,
-   hol_repo = NONE,
-   hol_rev = NONE}
-
 fun quote s = HolbuildHash.quote s
 
 fun path_exists path = FS.access(path, []) handle OS.SysErr _ => false
@@ -249,17 +242,6 @@ fun create_export {archive_path, source, entries, targets, metadata, pool} =
        remove_tree stage_dir)
       handle e => (cleanup (); raise e)
     end
-
-fun create_with_targets {archive_path, source, keys, targets, pool} =
-  create_export {archive_path = archive_path,
-                 source = source,
-                 pool = pool,
-                 entries = map (fn key => {key = key, package = "", logical = "", source_path = "", root = true}) keys,
-                 targets = targets,
-                 metadata = empty_metadata}
-
-fun create {archive_path, source, keys, pool} =
-  create_with_targets {archive_path = archive_path, source = source, keys = keys, targets = [], pool = pool}
 
 fun with_entries {archive_path, f} =
   let

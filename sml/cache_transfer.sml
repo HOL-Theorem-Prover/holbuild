@@ -254,7 +254,8 @@ fun pool_jobs build_jobs =
 (** Queues the copy of one entry and returns at once; finish gets its outcome
     after every blob task the entry started has finished, so nothing is still
     writing into tmp_dir.  A failed blob stops the entry's remaining blobs and
-    its action is never written. *)
+    its action is never written.  A Background entry that shutdown_pool drops
+    never calls finish. *)
 fun start_entry pool priority (transfer as {source : source, destination : destination, tmp_dir}) key finish =
   let
     fun report outcome = finish outcome handle _ => ()
@@ -292,12 +293,12 @@ fun start_entry pool priority (transfer as {source : source, destination : desti
         push_front pool priority (map blob_task blobs)
       end
     fun manifest_task () =
-      case #get_action source key of
-          NONE => report Missing
-        | SOME text =>
-            case unique_blobs text of
-                [] => write_action text 0 0 0
-              | blobs => start_blobs text blobs
+      (case #get_action source key of
+           NONE => report Missing
+         | SOME text =>
+             case unique_blobs text of
+                 [] => write_action text 0 0 0
+               | blobs => start_blobs text blobs)
       handle e => report (Failed e)
   in
     push_back pool priority manifest_task

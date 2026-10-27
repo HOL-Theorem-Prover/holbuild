@@ -44,7 +44,7 @@ fun sleep_ms ms = OS.Process.sleep (Time.fromMilliseconds ms)
 
 (* Fake backends record every operation.  A blob's content is its name, so a
    destination can check what it was handed.  Hashes starting "bad" fail to
-   fetch, hashes starting "slow" take longer. *)
+   fetch, hashes containing "slow" take longer. *)
 val in_flight = ref 0
 val peak = ref 0
 val events = ref ([] : string list)
@@ -72,13 +72,19 @@ fun counted f =
     handle e => (locked (fn () => in_flight := !in_flight - 1); raise e)
   end
 
+(* A pool bug shows up as a hang; fail the test instead. *)
+val _ = Thread.fork (fn () => (sleep_ms 120000; fail "cache transfer pool test hung"), [])
+
 val source : T.source =
   {get_action = fn key =>
-     counted (fn () => (sleep_ms 5; Option.map #2 (List.find (fn (k, _) => k = key) (!manifests)))),
+     counted (fn () =>
+       (sleep_ms 5;
+        if String.isPrefix "raise" key then raise Fail ("injected get_action failure for " ^ key)
+        else Option.map #2 (List.find (fn (k, _) => k = key) (!manifests)))),
    fetch_blob = fn {hash, dst} =>
      counted (fn () =>
        (locked (fn () => temp_paths := dst :: !temp_paths);
-        sleep_ms (if String.isPrefix "slow" hash then 300 else 20);
+        sleep_ms (if String.isSubstring "slow" hash then 300 else 20);
         if String.isPrefix "bad" hash then B.Corrupt "injected failure"
         else (write_file dst hash; record ("fetched " ^ hash); B.Hit)))}
 
@@ -156,6 +162,34 @@ val _ =
   case T.with_pool 1 (fn pool => T.copy_entry pool transfer "absent") of
       T.Missing => ()
     | _ => fail "missing entry not reported as Missing"
+
+(* A raising manifest fetch reports Failed rather than leaving the caller
+   waiting. *)
+val _ =
+  case T.with_pool 1 (fn pool => T.copy_entry pool transfer "raise1") of
+      T.Failed _ => ()
+    | _ => fail "raising get_action not reported as Failed"
+
+(* Once a blob fails, the entry's queued blobs are skipped. *)
+val _ = reset ()
+val _ = set_manifests [("k3", ["bad3", "skipped3a", "skipped3b"])]
+val _ =
+  case T.with_pool 1 (fn pool => T.copy_entry pool transfer "k3") of
+      T.Failed _ => ()
+    | _ => fail "entry k3 with a failing blob did not fail"
+val _ = assert "blobs after a failed blob were still fetched"
+          (not (Option.isSome (index_of "fetched skipped3a")) andalso
+           not (Option.isSome (index_of "fetched skipped3b")))
+
+(* copy_entries raises the first failed key's error, even when a later key
+   fails first. *)
+val _ = reset ()
+val _ = set_manifests [("f1", ["bad-slow-f1"]), ("f2", ["bad-f2"])]
+val _ =
+  (T.with_pool 3 (fn pool => T.copy_entries pool transfer ["f1", "f2"]);
+   fail "copy_entries ignored failed entries")
+  handle T.Error message =>
+    assert ("copy_entries raised a later key's error: " ^ message) (String.isSubstring "bad-slow-f1" message)
 
 (* copy_entries raises the first failed key's error after all entries finish. *)
 val _ = reset ()

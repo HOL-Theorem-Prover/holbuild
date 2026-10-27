@@ -4924,7 +4924,10 @@ fun remote_transfer_for (options : build_options) jobs =
     | NONE => NONE
 
 fun shutdown_remote_transfer (transfer : remote_transfer option) =
-  Option.app (HolbuildCacheTransfer.shutdown_pool o #pool) transfer
+  Option.app (fn {pool, ...} =>
+                detail_time_phase "build.exec.drain_remote_cache"
+                  (fn () => HolbuildCacheTransfer.shutdown_pool pool))
+             transfer
 
 (* Queues the plan's remote theory cache entries on the transfer pool, in build
    order, behind every demand restore and publish; the pool drops what is still
