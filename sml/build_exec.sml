@@ -3799,35 +3799,63 @@ fun build_config_lines_for_node options project node =
 (* The saved HOL state `run --from` starts from, or why there is none. *)
 datatype run_from_state =
   FinalContextState of string
-| DepsLoadedState of string
+| DepsLoadedState of {path : string, final_context_unusable : string}
 | NoRunFromState of string
 
+fun same_file a b =
+  FS.compare (FS.fileId a, FS.fileId b) = EQUAL handle OS.SysErr _ => false
+
+(* Poly/ML loads a child state only from the parent path saved in its header,
+   so a final_context whose parent moved with the project directory, or is no
+   longer the current deps_loaded, cannot load.  NONE when it has no parent or
+   its parent is one of PARENTS, else why not. *)
+fun parent_mismatch path parents =
+  case PolyML.SaveState.showParent path of
+      SOME parent =>
+        if List.exists (same_file parent) parents then NONE
+        else SOME ("its final_context checkpoint cannot load because its parent state " ^
+                   parent ^ " has moved or been replaced")
+    | NONE => NONE
+  handle OS.SysErr (msg, _) => SOME ("its final_context checkpoint is unreadable: " ^ msg)
+       | Fail msg => SOME ("its final_context checkpoint is unreadable: " ^ msg)
+
 (* Checkpoints are current only for the keys a build of NODE would use now.
-   Run holds no project lock, so this only reads checkpoint files. *)
-fun run_from_state project plan keys toolchain_key node =
+   Run holds no project lock, so this only reads checkpoint files; a build, gc
+   or eviction that removes the chosen checkpoint before HOL loads it makes
+   the run fail rather than start from a wrong state. *)
+fun run_from_state tc project plan keys node =
   let
     val name = logical_name node
-    val deps_key = dependency_context_key toolchain_key plan keys node
+    val deps_key = dependency_context_key (HolbuildToolchain.toolchain_key tc) plan keys node
     val final_context = final_context_path project node
+    fun deps_loaded_current dir =
+      HolbuildCheckpointStore.ok_current (Path.concat(dir, "deps_loaded.save"))
+        [("kind", "deps_loaded"), ("deps_key", Path.file dir)]
+    val deps_dir = Path.concat(deps_checkpoint_root project node, deps_key)
     val deps_loaded = deps_loaded_path project node deps_key
-    val saved_deps_key =
-      Option.mapPartial (metadata_value "deps_key" o metadata_lines)
-        (current_metadata (checkpoint_ok_path final_context))
+    fun final_context_unusable () =
+      if HolbuildCheckpointStore.ok_text_current final_context
+           (final_context_ok_text deps_key (HolbuildBuildPlan.input_key_for keys node)) then
+        parent_mismatch final_context [deps_loaded, HolbuildToolchain.base_state tc]
+      else SOME "no final_context checkpoint for its current source"
+    fun deps_changed () =
+      List.exists (fn dir => dir <> deps_dir andalso deps_loaded_current dir)
+        (children (deps_checkpoint_root project node))
   in
     if not (root_package_node project node) then
       NoRunFromState (name ^ " is in dependency package " ^ package node ^
                       "; holbuild keeps checkpoints only for root-package theories")
-    else if HolbuildCheckpointStore.ok_text_current final_context
-              (final_context_ok_text deps_key (HolbuildBuildPlan.input_key_for keys node)) then
-      FinalContextState final_context
-    else if HolbuildCheckpointStore.ok_current deps_loaded
-              [("kind", "deps_loaded"), ("deps_key", deps_key)] then
-      DepsLoadedState deps_loaded
-    else if Option.isSome saved_deps_key andalso saved_deps_key <> SOME deps_key then
-      NoRunFromState ("the dependencies of " ^ name ^ " changed since its checkpoints were saved")
     else
-      NoRunFromState (name ^ " has no current checkpoint (not built yet, restored from the cache, " ^
-                      "built with --skip-checkpoints, or removed by gc)")
+      case final_context_unusable () of
+          NONE => FinalContextState final_context
+        | SOME why =>
+            if deps_loaded_current deps_dir then
+              DepsLoadedState {path = deps_loaded, final_context_unusable = why}
+            else if deps_changed () then
+              NoRunFromState ("the dependencies of " ^ name ^ " changed since its checkpoints were saved")
+            else
+              NoRunFromState (name ^ " has no current checkpoint (not built yet, restored from the cache, " ^
+                              "built with --skip-checkpoints, or removed by gc)")
   end
 
 fun write_temp_text path text =

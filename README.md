@@ -574,15 +574,18 @@ starting state is:
 
 | Condition | State |
 | --- | --- |
-| `THEORY`'s `final_context` checkpoint matches its current input key | `THEORY` and its ancestors loaded |
-| Only `THEORY` changed: its `deps_loaded` checkpoint matches its current dependencies | ancestors loaded, `THEORY` not loaded |
-| Otherwise: not built yet, restored from the cache, built with `--skip-checkpoints`, checkpoints removed by `gc`, or a dependency changed | `[run].heap` if configured, else the HOL base state |
+| `THEORY`'s `final_context` checkpoint matches its current input key and its parent state is still in place | `THEORY` and its ancestors loaded |
+| Only `THEORY` changed, or the project directory moved: its `deps_loaded` checkpoint matches its current dependencies | ancestors loaded, `THEORY` not loaded |
+| Otherwise: not built yet, restored from the cache, built with `--skip-checkpoints`, checkpoints removed by `gc`, a dependency changed, or `THEORY` is in a dependency package | `[run].heap` if configured, else the HOL base state |
 
 A usable checkpoint takes precedence over `[run].heap`. holbuild prints one
 line naming the state it chose and, on fallback, why. `--from` does not build
-`THEORY`; run `holbuild build THEORY` first to refresh its checkpoints.
-`[run].loads` are still built and loaded on top of the chosen state. An unknown
-`THEORY` is an error.
+`THEORY` itself; run `holbuild build THEORY` first to refresh its checkpoints.
+`[run].loads` are still built first and loaded on top of the chosen state.
+Checkpoints are saved with `TheoryPP.include_docs` and
+`TheoryPP.include_html_docs` off, so a session started from one resets both to
+their defaults; under `repl` this also overrides a value set in your HOL
+config. An unknown `THEORY` is an error.
 
 ## Proof steps and checkpoints
 

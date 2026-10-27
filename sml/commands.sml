@@ -1412,17 +1412,16 @@ fun split_run_from args =
     loop NONE args
   end
 
+(* A .sig/.sml pair shares a logical name; a theory's name is unique. *)
 fun from_theory_node plan theory =
   let
-    val node =
-      case HolbuildBuildPlan.lookup plan theory of
-          [node] => node
-        | [] => raise Error ("unknown --from theory: " ^ theory)
-        | nodes => raise Error ("--from theory " ^ theory ^ " is ambiguous; it is in packages " ^
-                                String.concatWith ", " (map HolbuildBuildPlan.package nodes))
+    val nodes = HolbuildBuildPlan.lookup plan theory
   in
-    if theory_node node then node
-    else raise Error ("--from requires a theory target, not " ^ HolbuildBuildPlan.logical_name node)
+    case (List.filter theory_node nodes, nodes) of
+        (node :: _, _) => node
+      | ([], node :: _) =>
+          raise Error ("--from requires a theory target, not " ^ HolbuildBuildPlan.logical_name node)
+      | ([], []) => raise Error ("--from " ^ theory ^ ": unknown build target: " ^ theory)
   end
 
 fun from_theory_state tc project theory =
@@ -1436,7 +1435,7 @@ fun from_theory_state tc project theory =
     val node = from_theory_node plan target
     val keys = default_build_input_keys tc project index components plan
   in
-    HolbuildBuildExec.run_from_state project plan keys (HolbuildToolchain.toolchain_key tc) node
+    HolbuildBuildExec.run_from_state tc project plan keys node
   end
 
 (* The state HOL starts from, and the lines the run context loads first. *)
@@ -1463,9 +1462,9 @@ fun run_start tc project from : run_start =
           case from_theory_state tc project theory of
               HolbuildBuildExec.FinalContextState path =>
                 (note theory "starting from its final_context checkpoint"; checkpoint_start path)
-            | HolbuildBuildExec.DepsLoadedState path =>
-                (note theory ("no final_context checkpoint for its current source; starting from " ^
-                              "its deps_loaded checkpoint, which has only its ancestors loaded");
+            | HolbuildBuildExec.DepsLoadedState {path, final_context_unusable} =>
+                (note theory (final_context_unusable ^ "; starting from its deps_loaded checkpoint, " ^
+                              "which has only its ancestors loaded");
                  checkpoint_start path)
             | HolbuildBuildExec.NoRunFromState reason =>
                 (note theory (reason ^ "; starting from " ^ fallback_name); fallback_start)

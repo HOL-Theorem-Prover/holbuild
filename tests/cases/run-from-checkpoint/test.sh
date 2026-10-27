@@ -30,28 +30,60 @@ cleanup() { cleanup_temp_dir "$tmpdir"; }
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
+# A dependency package with a theory, and a .sig/.sml pair sharing one name.
+lib=$tmpdir/lib
+mkdir -p "$lib/src"
+{
+  write_schema2_prelude
+  cat <<'TOML'
+[project]
+name = "lib"
+
+[build]
+members = ["src"]
+TOML
+} > "$lib/holproject.toml"
+cat > "$lib/src/CScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "C";
+val c_thm = store_thm("c_thm", ``T``, ACCEPT_TAC TRUTH);
+val _ = export_theory();
+SML
+cat > "$lib/src/Foo.sig" <<'SML'
+signature FOO = sig val value : bool end
+SML
+cat > "$lib/src/Foo.sml" <<'SML'
+structure Foo : FOO = struct val value = true end
+SML
+lib_rev=$(init_git_repo "$lib")
+
 project=$tmpdir/project
 mkdir -p "$project/src"
-# [run].heap names the toolchain's own base state, so the precedence of --from
-# over [run].heap is observable without building a separate heap.
-cat > "$project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
-
+# [run].heap is a second name for the HOL base state, so a session's loaded
+# state hierarchy shows whether it started from [run].heap, without building a
+# separate heap.
+run_heap=$tmpdir/run.heap
+ln -s "$HOLDIR/bin/hol.state" "$run_heap"
+write_manifest() {
+  {
+    write_schema2_prelude
+    cat <<TOML
 [project]
 name = "runfrom"
 
 [build]
 members = ["src"]
 
-[run]
-heap = "$HOLDIR/bin/hol.state"
+[dependencies.lib]
+git = "$lib"
+rev = "$lib_rev"
 TOML
+    if [[ $1 == with-heap ]]; then
+      printf '\n[run]\nheap = "%s"\n' "$run_heap"
+    fi
+  } > "$project/holproject.toml"
+}
+write_manifest with-heap
 cat > "$project/src/AScript.sml" <<'SML'
 open HolKernel Parse boolLib bossLib;
 val _ = new_theory "A";
@@ -59,7 +91,7 @@ val a_thm = store_thm("a_thm", ``T``, ACCEPT_TAC TRUTH);
 val _ = export_theory();
 SML
 cat > "$project/src/BScript.sml" <<'SML'
-open HolKernel Parse boolLib bossLib ATheory;
+open HolKernel Parse boolLib bossLib ATheory CTheory;
 val _ = new_theory "B";
 val b_thm = store_thm("b_thm", ``T``, ACCEPT_TAC a_thm);
 val _ = export_theory();
@@ -77,6 +109,29 @@ cat > "$deps_script" <<'SML'
 val _ = (ATheory.a_thm; print "DEPS_LOADED_BOUND_OK\n");
 SML
 
+# The saved states a session loaded, outermost first.
+state_script=$tmpdir/state.sml
+cat > "$state_script" <<'SML'
+val _ = List.app (fn s => print ("LOADED_STATE " ^ s ^ "\n")) (PolyML.SaveState.showHierarchy ());
+SML
+fallback_script=$tmpdir/fallback.sml
+cat > "$fallback_script" <<'SML'
+val _ = print "FALLBACK_RUN_OK\n";
+SML
+
+# Fallback to [run].heap with REASON, and the session really started from it.
+require_heap_fallback() {
+  local name=$1
+  local reason=$2
+  local log=$tmpdir/$name.log
+  run_from "$log" --from BTheory "$fallback_script" "$state_script"
+  require_grep "holbuild: --from BTheory: $reason; starting from \[run\].heap $run_heap" "$log"
+  require_grep "FALLBACK_RUN_OK" "$log"
+  require_grep "LOADED_STATE $run_heap" "$log"
+  require_no_grep "starting from its" "$log"
+}
+no_checkpoint_reason="BTheory has no current checkpoint (not built yet, restored from the cache, built with --skip-checkpoints, or removed by gc)"
+
 # Current final_context: BTheory is bound before any load, and loading it again
 # is a no-op rather than a second copy of the theory.
 final_script=$tmpdir/final.sml
@@ -86,10 +141,11 @@ val _ = load "BTheory";
 val _ = print "FINAL_CONTEXT_RELOAD_OK\n";
 SML
 final_log=$tmpdir/final.log
-run_from "$final_log" --from BTheory "$final_script"
+run_from "$final_log" --from BTheory "$final_script" "$state_script"
 require_grep "holbuild: --from BTheory: starting from its final_context checkpoint" "$final_log"
 require_grep "FINAL_CONTEXT_BOUND_OK" "$final_log"
 require_grep "FINAL_CONTEXT_RELOAD_OK" "$final_log"
+require_grep "LOADED_STATE .*/BScript.sml.final_context.save" "$final_log"
 
 repl_log=$tmpdir/repl.log
 printf 'val _ = (BTheory.b_thm; print "REPL_FROM_OK\\n");\n' |
@@ -108,6 +164,19 @@ plain_trace=$(grep -o 'HTML_DOCS=[0-9]*' "$tmpdir/plain-trace.log")
 run_from "$tmpdir/from-trace.log" --from BTheory "$trace_script"
 require_grep "$plain_trace" "$tmpdir/from-trace.log"
 
+# final_context's saved parent is deps_loaded at its old absolute path, so after
+# the project directory moves only deps_loaded can load.
+moved=$tmpdir/moved
+mv "$project" "$moved"
+moved_log=$tmpdir/moved.log
+if ! (cd "$moved" && "$HOLBUILD_BIN" run --from BTheory "$deps_script") > "$moved_log" 2>&1; then
+  cat "$moved_log" >&2
+  exit 1
+fi
+require_grep "holbuild: --from BTheory: its final_context checkpoint cannot load because its parent state $project/.*/deps_loaded.save has moved or been replaced; starting from its deps_loaded checkpoint" "$moved_log"
+require_grep "DEPS_LOADED_BOUND_OK" "$moved_log"
+mv "$moved" "$project"
+
 # Only BTheory is stale: its ancestors come from deps_loaded.
 sed -i 's/^val _ = export_theory();$/val b2_thm = store_thm("b2_thm", ``T``, ACCEPT_TAC TRUTH);\nval _ = export_theory();/' \
   "$project/src/BScript.sml"
@@ -116,18 +185,10 @@ run_from "$deps_log" --from BTheory "$deps_script"
 require_grep "holbuild: --from BTheory: no final_context checkpoint for its current source; starting from its deps_loaded checkpoint" "$deps_log"
 require_grep "DEPS_LOADED_BOUND_OK" "$deps_log"
 
-# A stale dependency invalidates both checkpoints: fall back to [run].heap.
+# A stale dependency invalidates both checkpoints.
 sed -i 's/ACCEPT_TAC TRUTH);/ACCEPT_TAC TRUTH);\nval a2_thm = store_thm("a2_thm", ``T``, ACCEPT_TAC TRUTH);/' \
   "$project/src/AScript.sml"
-fallback_script=$tmpdir/fallback.sml
-cat > "$fallback_script" <<'SML'
-val _ = print "FALLBACK_RUN_OK\n";
-SML
-stale_log=$tmpdir/stale.log
-run_from "$stale_log" --from BTheory "$fallback_script"
-require_grep "holbuild: --from BTheory: the dependencies of BTheory changed since its checkpoints were saved; starting from \[run\].heap $HOLDIR/bin/hol.state" "$stale_log"
-require_grep "FALLBACK_RUN_OK" "$stale_log"
-require_no_grep "starting from its" "$stale_log"
+require_heap_fallback stale "the dependencies of BTheory changed since its checkpoints were saved"
 
 # A cache hit leaves no checkpoint at all.
 (cd "$project" && "$HOLBUILD_BIN" build BTheory) > "$tmpdir/rebuild.log" 2>&1 ||
@@ -135,10 +196,7 @@ require_no_grep "starting from its" "$stale_log"
 rm -rf "$project/.holbuild"
 (cd "$project" && "$HOLBUILD_BIN" build BTheory) > "$tmpdir/cache-hit.log" 2>&1 ||
   { cat "$tmpdir/cache-hit.log" >&2; exit 1; }
-cache_log=$tmpdir/cache.log
-run_from "$cache_log" --from BTheory "$fallback_script"
-require_grep "holbuild: --from BTheory: BTheory has no current checkpoint (not built yet, restored from the cache, built with --skip-checkpoints, or removed by gc); starting from \[run\].heap" "$cache_log"
-require_grep "FALLBACK_RUN_OK" "$cache_log"
+require_heap_fallback cache "$no_checkpoint_reason"
 
 # A static error discards and rewrites deps_loaded; the final_context saved on
 # top of the old deps_loaded must go with it, even once the source is reverted.
@@ -161,24 +219,58 @@ run_from "$reverted_log" --from BTheory "$deps_script"
 require_grep "starting from its deps_loaded checkpoint" "$reverted_log"
 require_grep "DEPS_LOADED_BOUND_OK" "$reverted_log"
 
-unknown_log=$tmpdir/unknown.log
-if (cd "$project" && "$HOLBUILD_BIN" run --from MissingTheory "$fallback_script") > "$unknown_log" 2>&1; then
-  echo "run accepted an unknown --from theory" >&2
-  exit 1
-fi
-require_grep "holbuild: --from MissingTheory: unknown build target: MissingTheory" "$unknown_log"
-require_no_grep "FALLBACK_RUN_OK" "$unknown_log"
+# gc removes the checkpoints of a successful build.  The edit makes the
+# build a cache miss, which saves checkpoints.
+sed -i 's/^val _ = export_theory();$/val b4_thm = store_thm("b4_thm", ``T``, ACCEPT_TAC TRUTH);\nval _ = export_theory();/' \
+  "$project/src/BScript.sml"
+(cd "$project" && "$HOLBUILD_BIN" build BTheory) > "$tmpdir/pre-gc.log" 2>&1 ||
+  { cat "$tmpdir/pre-gc.log" >&2; exit 1; }
+run_from "$tmpdir/pre-gc-run.log" --from BTheory "$final_script"
+require_grep "starting from its final_context checkpoint" "$tmpdir/pre-gc-run.log"
+(cd "$project" && "$HOLBUILD_BIN" gc --clean-only --retention-days 0) > "$tmpdir/gc.log" 2>&1 ||
+  { cat "$tmpdir/gc.log" >&2; exit 1; }
+require_heap_fallback gc "$no_checkpoint_reason"
 
-unknown_path_log=$tmpdir/unknown-path.log
-if (cd "$project" && "$HOLBUILD_BIN" run --from src/MissingScript.sml "$fallback_script") > "$unknown_path_log" 2>&1; then
-  echo "run accepted an unknown --from path" >&2
-  exit 1
-fi
-require_grep "holbuild: --from src/MissingScript.sml: build target path is not a known source: src/MissingScript.sml" "$unknown_path_log"
+# A build with --skip-checkpoints saves none.
+sed -i 's/^val _ = export_theory();$/val b5_thm = store_thm("b5_thm", ``T``, ACCEPT_TAC TRUTH);\nval _ = export_theory();/' \
+  "$project/src/BScript.sml"
+(cd "$project" && "$HOLBUILD_BIN" build --skip-checkpoints BTheory) > "$tmpdir/skip.log" 2>&1 ||
+  { cat "$tmpdir/skip.log" >&2; exit 1; }
+require_heap_fallback skip "$no_checkpoint_reason"
 
-library_log=$tmpdir/library.log
-if (cd "$project" && "$HOLBUILD_BIN" run --from Util "$fallback_script") > "$library_log" 2>&1; then
-  echo "run accepted a non-theory --from target" >&2
-  exit 1
-fi
-require_grep "holbuild: --from requires a theory target, not Util" "$library_log"
+# Dependency-package theories have no checkpoints.
+dependency_log=$tmpdir/dependency.log
+run_from "$dependency_log" --from CTheory "$fallback_script"
+require_grep "holbuild: --from CTheory: CTheory is in dependency package lib; holbuild keeps checkpoints only for root-package theories; starting from \[run\].heap $run_heap" "$dependency_log"
+require_grep "FALLBACK_RUN_OK" "$dependency_log"
+
+# Without [run].heap the fallback is the HOL base state.
+write_manifest without-heap
+base_log=$tmpdir/base.log
+run_from "$base_log" --from BTheory "$fallback_script" "$state_script"
+require_grep "holbuild: --from BTheory: .*; starting from the HOL base state$" "$base_log"
+require_grep "FALLBACK_RUN_OK" "$base_log"
+require_grep "LOADED_STATE .*/bin/hol.state$" "$base_log"
+require_no_grep "LOADED_STATE $run_heap" "$base_log"
+
+expect_run_failure() {
+  local name=$1
+  local message=$2
+  shift 2
+  local log=$tmpdir/$name.log
+  if (cd "$project" && "$HOLBUILD_BIN" run "$@" "$fallback_script") > "$log" 2>&1; then
+    echo "run accepted $*" >&2
+    exit 1
+  fi
+  require_grep "$message" "$log"
+  require_no_grep "FALLBACK_RUN_OK" "$log"
+}
+expect_run_failure unknown "holbuild: --from MissingTheory: unknown build target: MissingTheory" \
+  --from MissingTheory
+expect_run_failure unknown-path \
+  "holbuild: --from src/MissingScript.sml: build target path is not a known source: src/MissingScript.sml" \
+  --from src/MissingScript.sml
+expect_run_failure library "holbuild: --from requires a theory target, not Util" --from Util
+expect_run_failure sig-pair "holbuild: --from requires a theory target, not Foo" --from Foo
+expect_run_failure twice "holbuild: --from given more than once" --from BTheory --from=BTheory
+expect_run_failure empty "holbuild: --from requires THEORY" --from=
