@@ -178,6 +178,9 @@ require_grep "remote cache prefetched: $late_key" "$consumer_log"
 require_grep "LateTheory restored from cache" "$consumer_log"
 require_grep "BrokenTheory built" "$consumer_log"
 require_grep "AbsentTheory built" "$consumer_log"
+# The check below needs these entries usable on the remote again.
+require_grep "remote cache published: $broken_key" "$consumer_log"
+require_grep "remote cache published: $absent_key" "$consumer_log"
 # The failed prefetch is silent; only the demand restore reports the entry.
 warnings=$(grep -c "remote cache entry unusable for $broken_key" "$consumer_log" || true)
 if [[ "$warnings" != 1 ]]; then

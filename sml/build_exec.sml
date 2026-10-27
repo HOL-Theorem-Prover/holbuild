@@ -2116,13 +2116,11 @@ fun hydrate_remote_cache_key root key =
           (warn ("remote cache entry unusable for " ^ key ^ ": " ^ General.exnMessage e);
            false)
 
-(* Silent on failure: the demand restore of the same key retries and reports. *)
 fun prefetch_remote_cache_key root url key =
-  (if Option.isSome (HolbuildCache.get_action root key) then ()
-   else if copy_remote_cache_entry root url key then
-     cache_trace ("remote cache prefetched: " ^ key)
-   else ())
-  handle _ => ()
+  if Option.isSome (HolbuildCache.get_action root key) then ()
+  else if copy_remote_cache_entry root url key then
+    cache_trace ("remote cache prefetched: " ^ key)
+  else ()
 
 fun ensure_local_cache_entry root key =
   case HolbuildCache.get_action root key of
@@ -4927,7 +4925,8 @@ fun prefetch_key (options : build_options) project keys node =
 
 (* Starts jobs background threads that hydrate the plan's remote theory cache
    entries into the local cache, in build order, while the build runs; returns
-   a function that drops the nodes not yet started.  The build workers keep
+   a function that drops the nodes not yet started and waits for the copies in
+   flight.  The build workers keep
    their own demand restore, so they never wait behind a prefetch. *)
 fun start_remote_cache_prefetch (options : build_options) project plan keys jobs =
   case HolbuildRemoteCacheConfig.url () of
@@ -4946,17 +4945,23 @@ fun start_remote_cache_prefetch (options : build_options) project plan keys jobs
                 case !pending of
                     [] => NONE
                   | node :: rest => (pending := rest; SOME node))
+            fun prefetch node =
+              case prefetch_key options project keys node of
+                  SOME key => prefetch_remote_cache_key root url key
+                | NONE => ()
+            (* Silent on failure: the demand restore of the same key retries
+               and reports. *)
             fun worker () =
               case next () of
                   NONE => ()
-                | SOME node =>
-                    ((case prefetch_key options project keys node of
-                          SOME key => prefetch_remote_cache_key root url key
-                        | NONE => ());
-                     worker ())
-            val _ = List.tabulate (jobs, fn _ => Thread.fork (worker, []))
+                | SOME node => ((prefetch node handle _ => ()); worker ())
+            val threads = List.tabulate (jobs, fn _ => Thread.fork (worker, []))
+            fun wait_threads () =
+              if List.exists Thread.isActive threads then
+                (OS.Process.sleep (Time.fromReal 0.05); wait_threads ())
+              else ()
           in
-            fn () => with_lock (fn () => pending := [])
+            fn () => (with_lock (fn () => pending := []); wait_threads ())
           end
     | NONE => (fn () => ())
 
