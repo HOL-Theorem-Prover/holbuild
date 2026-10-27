@@ -135,6 +135,26 @@ changed_analyser_dirs=("$(dirname "$published_holdir")"/analysers/*)
 require_file "$(dirname "$published_holdir")/build.ok"
 [[ $(grep -c '^PUT ' "$request_log") -eq "$published_put_count" ]]
 
+# The local key names the resolved Poly/ML executable: an alias of the same
+# install reuses the toolchain, another install of the same version does not.
+poly_alias=$tmpdir/poly-alias
+mkdir -p "$poly_alias"
+ln -s "$fakebin/poly" "$poly_alias/poly"
+poly_alias_log=$tmpdir/poly-alias.log
+(cd "$project" && HOLBUILD_POLY="$poly_alias/poly" "$HOLBUILD_BIN" buildhol) > "$poly_alias_log" 2>&1
+[[ $(tail -n 1 "$poly_alias_log") = "$published_holdir" ]]
+[[ $(wc -l < "$build_count") -eq 1 ]]
+other_poly=$tmpdir/other-poly
+other_poly_build_count=$tmpdir/other-poly-build-count
+mkdir -p "$other_poly"
+cp "$fakebin/poly" "$other_poly/poly"
+: > "$other_poly_build_count"
+other_poly_log=$tmpdir/other-poly.log
+(cd "$project" && HOLBUILD_POLY="$other_poly/poly" \
+  HOLBUILD_TEST_BUILD_COUNT="$other_poly_build_count" "$HOLBUILD_BIN" buildhol) > "$other_poly_log" 2>&1
+[[ $(tail -n 1 "$other_poly_log") != "$published_holdir" ]]
+[[ $(wc -l < "$other_poly_build_count") -eq 1 ]]
+
 initial_put_count=$(grep -c '^PUT ' "$request_log")
 initial_cas_get_count=$(grep -c '^GET /cas/' "$request_log")
 

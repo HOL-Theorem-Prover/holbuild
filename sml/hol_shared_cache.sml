@@ -96,16 +96,22 @@ fun poly_version () =
     else die ("command failed: " ^ quote poly ^ " -v\n" ^ #output run)
   end
 
+fun poly_executable_path () =
+  let val path = trim (command_output ("command -v " ^ quote (poly_command ())))
+  in FS.fullPath path end
+
 (* The local toolchain key names how the toolchain was built: the HOL
    sources (git, rev), the build recipe and kernel, and the Poly/ML that
-   compiled it.  How the poly command is spelled is not part of it; the
-   version text and, remotely, the executable digest identify Poly/ML. *)
+   compiled it.  Poly/ML is named by its resolved executable rather than by
+   how HOLBUILD_POLY spells it, so aliases of one install share a toolchain
+   while two installs reporting the same version do not. *)
 fun key_material {git, rev, kernel_variant} =
   let val _ = validate_git git
       val version = poly_version ()
   in
     String.concatWith "\n"
-      ([format_version, "git=" ^ git, "rev=" ^ rev, "poly_version=" ^ version] @
+      ([format_version, "git=" ^ git, "rev=" ^ rev,
+        "poly_path=" ^ poly_executable_path (), "poly_version=" ^ version] @
        HolbuildHolToolchainConfig.key_material_fields (toolchain_config kernel_variant))
   end
 
@@ -501,10 +507,6 @@ fun wait_test_gate variable =
 fun platform_value command =
   trim (command_output command) handle Error _ => "unavailable"
 
-fun poly_executable_path () =
-  let val path = trim (command_output ("command -v " ^ quote (poly_command ())))
-  in FS.fullPath path end
-
 (* HOL's configure records its build directory as getcwd reports it, with
    symlinks resolved, and bakes it into executables, heaps and sigobj links.
    The archive identity therefore names the physical path, so cache roots
@@ -515,8 +517,9 @@ fun physical_holdir_for_key k =
    Path.concat(Path.concat(FS.fullPath (toolchains_dir ()), k), "hol"))
 
 (* What a restored toolchain must share with the one that was published:
-   - toolchain-key: the same HOL sources, build recipe, kernel and Poly/ML
-     version (key_material);
+   - toolchain-key: the same HOL sources, build recipe and kernel, and a
+     Poly/ML of the same version at the same path, which HOL's configure
+     also bakes in (key_material);
    - holdir: the installation path baked into the build;
    - platform-os, platform-arch: executables and heaps are native code;
    - platform-libc: bin/hol and the Poly/ML runtime link against the host C
@@ -550,11 +553,6 @@ fun heap_loads k =
   in
     OS.Process.isSuccess (OS.Process.system command)
   end
-
-fun analyser_responds k ak =
-  trim (command_output (quote (analyser_bin_for_key k ak) ^ " --version")) =
-    "holbuild-hol-analyser " ^ analyser_format_version
-  handle _ => false
 
 (* What a toolchain archive holds: the HOL build and its source manifest. *)
 fun complete_toolchain_contents k =
@@ -595,21 +593,18 @@ fun cleanup_restore_state k =
 fun restore_entry k =
   let
     val final = entry_dir_for_key k
-    val identity = archive_identity k
+    (* The analyser is not archived; finish_entry builds it for restored and
+       locally built entries alike. *)
     fun restore url =
       let val remote = HolbuildRemoteCache.remote url
       in
         if HolbuildToolchainArchive.restore
-             {remote = remote, identity = identity, final_dir = final} then
+             {remote = remote, identity = archive_identity k, final_dir = final} then
           (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_RENAMED";
            wait_test_gate "HOLBUILD_TEST_TOOLCHAIN_RENAMED_GATE";
-           if complete_toolchain_contents k then ()
-           else die "restored HOL toolchain failed final validation";
-           ignore (build_analyser k);
-           if analyser_responds k (analyser_key ()) then ()
-           else die "analyser built against the restored HOL toolchain does not respond";
-           write_file (ok_for_key k) "ok\n";
-           true)
+           if complete_toolchain_contents k then
+             (write_file (ok_for_key k) "ok\n"; true)
+           else die "restored HOL toolchain failed final validation")
         else false
       end
   in
