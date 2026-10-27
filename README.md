@@ -656,7 +656,8 @@ All of a build's remote transfers run on one pool of
 `HOLBUILD_CACHE_TRANSFER_JOBS` workers (default `min(32, 4 × -j)`), which
 fetches or uploads an entry's blobs in parallel and writes its action last.
 Restores the build is waiting for and uploads of freshly built theories go
-first; uploads don't hold up the build, which waits for them before it exits.
+first; uploads don't hold up the worker that built the theory, and the build
+waits for them before it exits.
 With the remaining capacity the pool also copies the remote entries of the
 plan's out-of-date theories into the local cache in build order, so a theory's
 restore usually finds its entry already local. This prefetch is best-effort

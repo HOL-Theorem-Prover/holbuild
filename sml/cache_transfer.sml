@@ -125,8 +125,8 @@ fun put_action_or_raise (destination : destination) key text =
     | result as HolbuildCacheBackend.Skipped => result
     | HolbuildCacheBackend.Conflict detail => raise Error ("destination cache action conflict: " ^ key ^ " (" ^ detail ^ ")")
 
-(* Work that a caller waits on (demand restores, publishes, hbx) runs before
-   queued speculative work (prefetch). *)
+(* Urgent work (demand restores, hbx, and publishes, which shutdown must not
+   drop) runs before queued speculative work (prefetch). *)
 datatype priority = Urgent | Background
 
 datatype outcome = Copied of entry_result | Missing | Failed of exn
@@ -194,7 +194,10 @@ fun next_task (pool : pool) () =
     | NONE =>
         case pop (#background pool) of
             SOME task => SOME task
-          | NONE => if !(#closing pool) then NONE else (wait pool; next_task pool ())
+          | NONE =>
+              (* A running task may still queue blobs, so stay until none runs. *)
+              if !(#closing pool) andalso !(#running pool) = 0 then NONE
+              else (wait pool; next_task pool ())
 
 fun worker (pool : pool) () =
   case with_lock pool (fn () =>

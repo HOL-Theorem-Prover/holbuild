@@ -144,18 +144,19 @@ val _ = assert "action not last"
 val _ = assert "temp files left after success" (tmp_empty ())
 
 (* A failed blob leaves no action and reports only once the entry's other
-   started blobs have finished. *)
+   started blobs have finished.  Checked before with_pool drains the pool. *)
 val _ = reset ()
 val _ = set_manifests [("k2", ["slow2", "bad2", "b2"])]
 val _ =
-  case T.with_pool 3 (fn pool => T.copy_entry pool transfer "k2") of
-      T.Failed _ =>
-        (assert "failed entry returned with a blob still running" (!in_flight = 0);
-         assert "slow blob did not finish before the failure was reported"
-           (Option.isSome (index_of "published slow2")))
-    | _ => fail "entry k2 with a failing blob did not fail"
+  T.with_pool 3 (fn pool =>
+    case T.copy_entry pool transfer "k2" of
+        T.Failed _ =>
+          (assert "failed entry returned with a blob still running" (!in_flight = 0);
+           assert "slow blob did not finish before the failure was reported"
+             (Option.isSome (index_of "published slow2"));
+           assert "temp files left after failure" (tmp_empty ()))
+      | _ => fail "entry k2 with a failing blob did not fail")
 val _ = assert "action written after a failed blob" (null (!actions))
-val _ = assert "temp files left after failure" (tmp_empty ())
 
 (* Missing manifest. *)
 val _ =
@@ -191,17 +192,19 @@ val _ =
   handle T.Error message =>
     assert ("copy_entries raised a later key's error: " ^ message) (String.isSubstring "bad-slow-f1" message)
 
-(* copy_entries raises the first failed key's error after all entries finish. *)
+(* copy_entries raises the first failed key's error after all entries finish.
+   Checked before with_pool drains the pool. *)
 val _ = reset ()
-val _ = set_manifests [("e1", ["c1"]), ("e2", ["bad-e2"]), ("e3", ["c3"])]
+val _ = set_manifests [("e1", ["c1"]), ("e2", ["bad-e2"]), ("e3", ["slow-c3"])]
 val _ =
-  (T.with_pool 2 (fn pool => T.copy_entries pool transfer ["e1", "e2", "e3"]);
-   fail "copy_entries ignored a failed entry")
-  handle T.Error message =>
-    assert ("unexpected copy_entries error: " ^ message) (String.isSubstring "bad-e2" message)
-val _ = assert "copy_entries returned before every entry finished" (!in_flight = 0)
-val _ = assert "copy_entries skipped healthy entries"
-          (List.exists (fn k => k = "e1") (!actions) andalso List.exists (fn k => k = "e3") (!actions))
+  T.with_pool 2 (fn pool =>
+    (T.copy_entries pool transfer ["e1", "e2", "e3"];
+     fail "copy_entries ignored a failed entry")
+    handle T.Error message =>
+      (assert ("unexpected copy_entries error: " ^ message) (String.isSubstring "bad-e2" message);
+       assert "copy_entries returned before every entry finished" (!in_flight = 0);
+       assert "copy_entries skipped healthy entries"
+         (List.exists (fn k => k = "e1") (!actions) andalso List.exists (fn k => k = "e3") (!actions))))
 
 (* Size 1 makes progress, and entries that share blobs copy them under
    distinct temp paths. *)
@@ -244,25 +247,26 @@ val _ = assert "temp files left after mixed load" (tmp_empty ())
 val _ = reset ()
 val queued = List.tabulate (5, fn i => ("p" ^ Int.toString i, ["pa" ^ Int.toString i, "pb" ^ Int.toString i]))
 val _ = set_manifests (("demand", ["da", "db"]) :: queued)
+val prefetch_finished = ref 0
 val _ =
   T.with_pool 1 (fn pool =>
-    (List.app (fn (key, _) => T.start_entry pool T.Background transfer key (fn _ => ())) queued;
+    (List.app (fn (key, _) =>
+                 T.start_entry pool T.Background transfer key
+                   (fn _ => locked (fn () => prefetch_finished := !prefetch_finished + 1)))
+              queued;
      assert "demand entry not copied" (copied (T.copy_entry pool transfer "demand"))))
 val _ = assert ("demand entry waited behind prefetch: " ^ String.concatWith "," (rev (!actions)))
           (length (List.filter (fn k => k <> "demand") (!actions)) <= 1)
 
-(* Shutdown drops queued background work and leaves no partial entry. *)
-val _ = assert "dropped prefetch wrote a partial entry"
-          (List.all (fn (key, blobs) =>
-                       not (List.exists (fn k => k = key) (!actions)) orelse
-                       List.all (fn hash => List.exists (fn h => h = hash) (!published)) blobs)
-                    queued)
+(* Shutdown drops queued background work: the dropped entries never finish. *)
+val _ = assert ("shutdown ran every queued prefetch: " ^ Int.toString (!prefetch_finished))
+          (!prefetch_finished < length queued)
 val _ = assert "temp files left after shutdown" (tmp_empty ())
 
 val _ = print "cache transfer pool tests passed\n";
 SML
 
-CACHE_TRANSFER_POOL_TEST_TMP="$tmpdir" "${HOLBUILD_POLY:-poly}" < "$tmpdir/cache-transfer-pool-test.sml" > "$tmpdir/cache-transfer-pool-test.log" 2>&1 || {
+CACHE_TRANSFER_POOL_TEST_TMP="$tmpdir" "${HOLBUILD_POLY:-poly}" --error-exit < "$tmpdir/cache-transfer-pool-test.sml" > "$tmpdir/cache-transfer-pool-test.log" 2>&1 || {
   cat "$tmpdir/cache-transfer-pool-test.log" >&2
   exit 1
 }
