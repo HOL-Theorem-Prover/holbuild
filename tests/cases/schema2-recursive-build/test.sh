@@ -55,7 +55,8 @@ process_alive() {
 wait_for_process_exit() {
   local pid=$1
   local description=$2
-  for _ in $(seq 1 200); do
+  local polls=${3:-200}
+  for _ in $(seq 1 "$polls"); do
     process_alive "$pid" || return 0
     sleep 0.05
   done
@@ -369,6 +370,10 @@ process_alive "$second_builder" ||
 [[ ! -e "$race_revalidated" ]] ||
   fail "concurrent toolchain request revalidated while the active builder held the lock"
 touch "$release"
+# The waiter has no deadline of its own, so bound it here: a waiter that misses
+# the release fails this case instead of hanging until the CI job timeout.
+wait_for_process_exit "$first_builder" "active toolchain builder did not finish after release" 1200
+wait_for_process_exit "$second_builder" "concurrent toolchain request did not finish after release" 1200
 wait "$first_builder"
 wait "$second_builder"
 first_builder=

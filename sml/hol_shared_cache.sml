@@ -389,7 +389,7 @@ fun acquire_lock k =
             (report_lock_wait lock_path (Time.-(now, started));
              Time.+(now, lock_wait_report_interval))
       in
-        ignore (OS.Process.system "sleep 1");
+        OS.Process.sleep (Time.fromSeconds 1);
         case try_acquire_lock_path lock_path of
             SOME lock => acquired lock
           | NONE => wait next_report
