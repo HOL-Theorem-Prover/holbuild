@@ -3810,12 +3810,12 @@ fun same_file a b =
    longer the current deps_loaded, cannot load.  NONE when it has no parent or
    its parent is one of PARENTS, else why not. *)
 fun parent_mismatch path parents =
-  case PolyML.SaveState.showParent path of
-      SOME parent =>
-        if List.exists (same_file parent) parents then NONE
-        else SOME ("its final_context checkpoint cannot load because its parent state " ^
-                   parent ^ " has moved or been replaced")
-    | NONE => NONE
+  (case PolyML.SaveState.showParent path of
+       SOME parent =>
+         if List.exists (same_file parent) parents then NONE
+         else SOME ("its final_context checkpoint cannot load because its parent state " ^
+                    parent ^ " has moved or been replaced")
+     | NONE => NONE)
   handle OS.SysErr (msg, _) => SOME ("its final_context checkpoint is unreadable: " ^ msg)
        | Fail msg => SOME ("its final_context checkpoint is unreadable: " ^ msg)
 
@@ -3852,9 +3852,11 @@ fun run_from_state tc project plan keys node =
             if deps_loaded_current deps_dir then
               DepsLoadedState {path = deps_loaded, final_context_unusable = why}
             else if deps_changed () then
-              NoRunFromState ("the dependencies of " ^ name ^ " changed since its checkpoints were saved")
+              NoRunFromState ("the dependencies or HOL toolchain of " ^ name ^
+                              " changed since its checkpoints were saved")
             else
-              NoRunFromState (name ^ " has no current checkpoint (not built yet, restored from the cache, " ^
+              NoRunFromState (name ^ " has no current checkpoint (not built yet, restored from the cache " ^
+                              "without a local build, " ^
                               "built with --skip-checkpoints, or removed by gc)")
   end
 

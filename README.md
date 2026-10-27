@@ -576,11 +576,12 @@ starting state is:
 | --- | --- |
 | `THEORY`'s `final_context` checkpoint matches its current input key and its parent state is still in place | `THEORY` and its ancestors loaded |
 | Only `THEORY` changed, or the project directory moved: its `deps_loaded` checkpoint matches its current dependencies | ancestors loaded, `THEORY` not loaded |
-| Otherwise: not built yet, restored from the cache, built with `--skip-checkpoints`, checkpoints removed by `gc`, a dependency changed, or `THEORY` is in a dependency package | `[run].heap` if configured, else the HOL base state |
+| Otherwise: not built yet, restored from the cache without a local build, built with `--skip-checkpoints`, checkpoints removed by `gc`, a dependency or the HOL toolchain changed, or `THEORY` is in a dependency package | `[run].heap` if configured, else the HOL base state |
 
 A usable checkpoint takes precedence over `[run].heap`. holbuild prints one
 line naming the state it chose and, on fallback, why. `--from` does not build
-`THEORY` itself; run `holbuild build THEORY` first to refresh its checkpoints.
+`THEORY` itself. To refresh its checkpoints when `THEORY` is up to date or a
+cache hit, run `holbuild build --force --no-cache THEORY`.
 `[run].loads` are still built first and loaded on top of the chosen state.
 Checkpoints are saved with `TheoryPP.include_docs` and
 `TheoryPP.include_html_docs` off, so a session started from one resets both to

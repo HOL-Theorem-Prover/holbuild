@@ -651,9 +651,9 @@ logical objects, then invokes HOL's public `buildheap` command on the selected
 object stems. Executable targets add `--exe=<main>`.
 
 Heaps requested by users remain project-local exported artifacts. Checkpoints are
-transient build/debug state. Normal successful theory builds may create them
-while running, but remove them after logical artifacts and metadata are written.
-Raw checkpoint bytes are never the semantic identity; they are local replay/debug
+local build/debug state, not exported artifacts. Successful theory builds keep
+reusable checkpoints, including `final_context`, until they are replaced or
+evicted, so later builds and `run --from` can start from them. Raw checkpoint bytes are never the semantic identity; they are local replay/debug
 breadcrumbs for an already-resolved graph, not retained outputs.
 
 `holbuild` should not use `hol buildheap` as the normal incremental-build

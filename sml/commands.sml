@@ -21,8 +21,8 @@ fun global_help () = print
   \Primary command:\n\
   \  [build] [TARGET ...]        Build project targets\n\n\
   \Project interaction:\n\
-  \  repl [ARG ...]              Start HOL REPL with project context\n\
-  \  run [ARG ...]               Run HOL with project context\n\
+  \  repl [--from THEORY] [ARG ...]  Start HOL REPL with project context\n\
+  \  run [--from THEORY] [ARG ...]   Run HOL with project context\n\
   \  context [--trknl]          Show resolved project context\n\n\
   \Inspection and advanced commands:\n\
   \  execution-plan T:THM        Inspect proof-step execution plan\n\

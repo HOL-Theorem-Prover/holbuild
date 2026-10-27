@@ -107,6 +107,7 @@ SML
 deps_script=$tmpdir/deps.sml
 cat > "$deps_script" <<'SML'
 val _ = (ATheory.a_thm; print "DEPS_LOADED_BOUND_OK\n");
+val _ = (Theory.parents "B"; print "B_LOADED\n") handle _ => print "B_NOT_LOADED\n";
 SML
 
 # The saved states a session loaded, outermost first.
@@ -130,7 +131,7 @@ require_heap_fallback() {
   require_grep "LOADED_STATE $run_heap" "$log"
   require_no_grep "starting from its" "$log"
 }
-no_checkpoint_reason="BTheory has no current checkpoint (not built yet, restored from the cache, built with --skip-checkpoints, or removed by gc)"
+no_checkpoint_reason="BTheory has no current checkpoint (not built yet, restored from the cache without a local build, built with --skip-checkpoints, or removed by gc)"
 
 # Current final_context: BTheory is bound before any load, and loading it again
 # is a no-op rather than a second copy of the theory.
@@ -146,6 +147,11 @@ require_grep "holbuild: --from BTheory: starting from its final_context checkpoi
 require_grep "FINAL_CONTEXT_BOUND_OK" "$final_log"
 require_grep "FINAL_CONTEXT_RELOAD_OK" "$final_log"
 require_grep "LOADED_STATE .*/BScript.sml.final_context.save" "$final_log"
+
+source_log=$tmpdir/source-path.log
+run_from "$source_log" --from src/BScript.sml "$final_script"
+require_grep "holbuild: --from src/BScript.sml: starting from its final_context checkpoint" "$source_log"
+require_grep "FINAL_CONTEXT_BOUND_OK" "$source_log"
 
 repl_log=$tmpdir/repl.log
 printf 'val _ = (BTheory.b_thm; print "REPL_FROM_OK\\n");\n' |
@@ -175,7 +181,19 @@ if ! (cd "$moved" && "$HOLBUILD_BIN" run --from BTheory "$deps_script") > "$move
 fi
 require_grep "holbuild: --from BTheory: its final_context checkpoint cannot load because its parent state $project/.*/deps_loaded.save has moved or been replaced; starting from its deps_loaded checkpoint" "$moved_log"
 require_grep "DEPS_LOADED_BOUND_OK" "$moved_log"
+require_grep "B_NOT_LOADED" "$moved_log"
 mv "$moved" "$project"
+
+# A final_context that is not a saved state, with its ok-file still current,
+# falls back to deps_loaded instead of aborting the run.
+final_context_file=$(find "$project/.holbuild/checkpoints" -name 'BScript.sml.final_context.save')
+cp "$final_context_file" "$tmpdir/final_context.save.good"
+echo garbage > "$final_context_file"
+unreadable_log=$tmpdir/unreadable.log
+run_from "$unreadable_log" --from BTheory "$deps_script"
+require_grep "holbuild: --from BTheory: its final_context checkpoint is unreadable: .*; starting from its deps_loaded checkpoint" "$unreadable_log"
+require_grep "B_NOT_LOADED" "$unreadable_log"
+cp "$tmpdir/final_context.save.good" "$final_context_file"
 
 # Only BTheory is stale: its ancestors come from deps_loaded.
 sed -i 's/^val _ = export_theory();$/val b2_thm = store_thm("b2_thm", ``T``, ACCEPT_TAC TRUTH);\nval _ = export_theory();/' \
@@ -184,11 +202,12 @@ deps_log=$tmpdir/deps.log
 run_from "$deps_log" --from BTheory "$deps_script"
 require_grep "holbuild: --from BTheory: no final_context checkpoint for its current source; starting from its deps_loaded checkpoint" "$deps_log"
 require_grep "DEPS_LOADED_BOUND_OK" "$deps_log"
+require_grep "B_NOT_LOADED" "$deps_log"
 
 # A stale dependency invalidates both checkpoints.
 sed -i 's/ACCEPT_TAC TRUTH);/ACCEPT_TAC TRUTH);\nval a2_thm = store_thm("a2_thm", ``T``, ACCEPT_TAC TRUTH);/' \
   "$project/src/AScript.sml"
-require_heap_fallback stale "the dependencies of BTheory changed since its checkpoints were saved"
+require_heap_fallback stale "the dependencies or HOL toolchain of BTheory changed since its checkpoints were saved"
 
 # A cache hit leaves no checkpoint at all.
 (cd "$project" && "$HOLBUILD_BIN" build BTheory) > "$tmpdir/rebuild.log" 2>&1 ||
