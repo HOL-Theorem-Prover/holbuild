@@ -154,11 +154,14 @@ mkdir -p "$gate"
 consumer_log=$tmpdir/consumer.log
 (cd "$consumer" && HOLBUILD_CACHE="$consumer_cache" HOLBUILD_CACHE_TRACE=1 \
   HOLBUILD_TEST_PREFETCH_GATE="$gate" \
-  exec "$HOLBUILD_BIN" --remote-cache "$remote_url" -j2 build LateTheory BrokenTheory AbsentTheory) \
+  exec "$HOLBUILD_BIN" --remote-cache "$remote_url" -j1 build --skip-checkpoints BrokenTheory AbsentTheory LateTheory) \
   > "$consumer_log" 2>&1 &
 consumer_pid=$!
 
-wait_for_file "$gate/started"
+wait_for_file "$gate/started" || {
+  cat "$consumer_log" >&2
+  exit 1
+}
 wait_for_file "$consumer_cache/actions/$late_key/manifest" || {
   cat "$consumer_log" >&2
   exit 1
@@ -179,6 +182,42 @@ require_grep "AbsentTheory built" "$consumer_log"
 warnings=$(grep -c "remote cache entry unusable for $broken_key" "$consumer_log" || true)
 if [[ "$warnings" != 1 ]]; then
   echo "expected one unusable-entry warning for BrokenTheory, found $warnings" >&2
+  cat "$consumer_log" >&2
+  exit 1
+fi
+
+# Theories whose metadata already records their key are not prefetched, even
+# when their entries are gone from the local cache.  Gate (rebuilt) and Late
+# lose their metadata; with one prefetch thread walking Broken, Absent, Late,
+# Late's entry reaching the local cache means the others were passed over.
+metadata=$consumer/.holbuild/dep/remote-cache-prefetch-test/src
+rm "$metadata/GateScript.sml.key" "$metadata/LateScript.sml.key"
+rm -rf "$consumer_cache/actions" "$gate"
+mkdir -p "$gate"
+consumer_log=$tmpdir/up-to-date.log
+(cd "$consumer" && HOLBUILD_CACHE="$consumer_cache" HOLBUILD_CACHE_TRACE=1 \
+  HOLBUILD_TEST_PREFETCH_GATE="$gate" \
+  exec "$HOLBUILD_BIN" --remote-cache "$remote_url" -j1 build --skip-checkpoints BrokenTheory AbsentTheory LateTheory) \
+  > "$consumer_log" 2>&1 &
+consumer_pid=$!
+wait_for_file "$gate/started" || {
+  cat "$consumer_log" >&2
+  exit 1
+}
+wait_for_file "$consumer_cache/actions/$late_key/manifest" || {
+  cat "$consumer_log" >&2
+  exit 1
+}
+touch "$gate/release"
+if ! wait "$consumer_pid"; then
+  consumer_pid=
+  cat "$consumer_log" >&2
+  exit 1
+fi
+consumer_pid=
+require_grep "LateTheory restored from cache" "$consumer_log"
+if grep -q "remote cache prefetched: \($broken_key\|$absent_key\)" "$consumer_log"; then
+  echo "up-to-date theories were prefetched" >&2
   cat "$consumer_log" >&2
   exit 1
 fi

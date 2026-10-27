@@ -652,6 +652,18 @@ HOLBUILD_REMOTE_CACHE_URL=https://cache.example.org holbuild build MyTheory
 ```
 
 Remote cache misses or errors fall back to the local cache/source build path.
+All of a build's remote transfers run on one pool of
+`HOLBUILD_CACHE_TRANSFER_JOBS` workers (default `min(32, 4 × -j)`), which
+fetches or uploads an entry's blobs in parallel and writes its action last.
+Restores the build is waiting for and uploads of freshly built theories go
+first; uploads don't hold up the build, which waits for them before it exits.
+With the remaining capacity the pool also copies the remote entries of the
+plan's out-of-date theories into the local cache in build order, so a theory's
+restore usually finds its entry already local. This prefetch is best-effort
+and silent; whatever it misses is fetched when the theory is reached, as
+before. `HOLBUILD_CACHE_TRACE=1` shows each prefetched entry as
+`remote cache prefetched: <key>`. `holbuild export` and `holbuild import` copy
+their entries on a pool of the same size.
 A missing HOL toolchain is restored from the same remote cache when its exact
 installation path, platform, and Poly/ML identity match. After a remote miss, a
 successful local toolchain build is published automatically; local and remote

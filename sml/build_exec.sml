@@ -4929,23 +4929,33 @@ fun shutdown_remote_transfer (transfer : remote_transfer option) =
 (* Queues the plan's remote theory cache entries on the transfer pool, in build
    order, behind every demand restore and publish; the pool drops what is still
    queued when the build ends.  Silent on failure: the demand restore of the
-   same key retries and reports.  The local check runs when the task does, so
-   an entry restored on demand in the meantime is not fetched again. *)
+   same key retries and reports.  Whether a node needs its entry is decided
+   when its task runs, off the build thread, so an entry restored on demand in
+   the meantime is not fetched again. *)
 fun start_remote_cache_prefetch (options : build_options) project plan keys transfer =
   case transfer of
       SOME {pool, remote} =>
         let
           val root = cache_root ()
-          fun get_action key =
-            if Option.isSome (HolbuildCache.get_action root key) then NONE
-            else HolbuildRemoteCache.get_action remote key
-          val prefetch =
-            remote_to_local_transfer {get_action = get_action, fetch_blob = HolbuildRemoteCache.fetch_blob remote} root
-          fun finish key (HolbuildCacheTransfer.Copied _) = cache_trace ("remote cache prefetched: " ^ key)
-            | finish _ _ = ()
-          fun start key = HolbuildCacheTransfer.start_entry pool HolbuildCacheTransfer.Background prefetch key (finish key)
+          val {destination, tmp_dir, ...} = remote_to_local_transfer (remote_cache_source remote) root
+          fun start node =
+            let
+              val key = HolbuildBuildPlan.input_key_for keys node
+              fun get_action requested =
+                if Option.isSome (prefetch_key options project keys node) andalso
+                   not (Option.isSome (HolbuildCache.get_action root requested)) then
+                  HolbuildRemoteCache.get_action remote requested
+                else NONE
+              fun finish (HolbuildCacheTransfer.Copied _) = cache_trace ("remote cache prefetched: " ^ key)
+                | finish _ = ()
+            in
+              HolbuildCacheTransfer.start_entry pool HolbuildCacheTransfer.Background
+                {source = {get_action = get_action, fetch_blob = HolbuildRemoteCache.fetch_blob remote},
+                 destination = destination, tmp_dir = tmp_dir}
+                key finish
+            end
         in
-          List.app start (List.mapPartial (prefetch_key options project keys) (HolbuildBuildPlan.selected_nodes plan))
+          List.app start (HolbuildBuildPlan.selected_nodes plan)
         end
     | NONE => ()
 
