@@ -531,18 +531,18 @@ uncacheable.
 
 Because input keys hash sources rather than outputs, sharing cache entries
 across machines rests on a reproducibility contract: a deterministic script,
-with its sources and extra inputs declared, under the same theory toolchain
-key, produces a byte-identical `Theory.dat` in any project directory and cache
-root. A script that reads the clock, the
-environment, undeclared files, or host paths has to declare the files as
-`extra_deps` or opt out with `cache = false`.
+with its sources and extra inputs declared, under the same theory toolchain key,
+produces a byte-identical `Theory.dat` in any project directory and artifact
+cache. A script that reads the clock, the environment, undeclared files, or host
+paths has to declare the files as `extra_deps` or opt out with `cache = false`.
 
 If the same input key produces different output keys, that indicates
 nondeterminism or undeclared inputs. The cache keeps the first entry and warns
 on the conflicting publish. Correctness doesn't depend on the contract: a
 restored theory whose recorded parent `.dat` hashes differ from the local
 parents is rejected and rebuilt. What a nondeterministic theory costs is cache
-hits: where it was built locally, its whole subtree misses and can't republish.
+hits: where the local parent's `.dat` differs from the one the cached children
+were built against, its whole subtree misses and can't republish.
 
 ## Global cache
 

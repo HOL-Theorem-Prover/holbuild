@@ -7,6 +7,10 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../../lib.sh
 source "$SCRIPT_DIR/../../lib.sh"
 
+# Both builds must run from source, so neither may restore from or publish to a
+# shared remote cache.
+unset HOLBUILD_REMOTE_CACHE_URL
+
 # Theory cache keys depend on sources, not on parent .dat outputs, so a cache
 # entry is shared only if a deterministic theory script yields the same
 # Theory.dat bytes wherever it is built.  Build the same chain from source in

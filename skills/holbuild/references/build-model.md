@@ -107,24 +107,26 @@ Cache restore: on action-key match, blobs are materialized into local `.holbuild
 - On any validation failure: warn, delete local outputs, rebuild from source
 
 **Reproducibility contract.** Theory keys hash sources, not parent outputs, so a
-cache entry is shared across machines and project directories on this promise:
-a deterministic theory script, with its sources and extra inputs declared, under
+cache entry is shared across machines and project directories on this promise: a
+deterministic theory script, with its sources and extra inputs declared, under
 the same theory toolchain key, produces a byte-identical `Theory.dat` wherever
 it is built. `tests/cases/theory-dat-reproducible` checks it for a three-theory
-chain built in two project directories with separate caches. A script that
-reads the clock, environment variables, files it doesn't declare, or host paths
-breaks the promise: declare the files in `extra_deps`, and set `cache = false`
-for anything that can't be declared.
+chain built in two project directories with separate caches; both builds use one
+HOL toolchain install, so toolchains at different paths aren't covered. A script
+that reads the clock, environment variables, files it doesn't declare, or host
+paths breaks the promise: declare the files in `extra_deps`, and set
+`cache = false` for anything that can't be declared.
 
 A nondeterministic theory stays correct but costs cache hits below it. Each
 child entry records the parent `.dat` hashes it was built against, and restore
 rejects it when the local parent differs (`parent outputs differ` under
-`HOLBUILD_CACHE_TRACE=1`) and rebuilds. On a machine whose parent was built
-locally rather than restored, every cache lookup in the parent's subtree misses
-for as long as that parent stays, and the rebuilt entries can't be republished,
-since the key already holds the first build's outputs (`cache entry already
-exists with different outputs`). `cache = false` on the parent doesn't help its
-descendants: every machine then builds its own parent.
+`HOLBUILD_CACHE_TRACE=1`) and rebuilds. On a machine whose local parent `.dat`
+differs from the one the cached children were built against, every cache lookup
+in the parent's subtree misses for as long as that parent stays, and the rebuilt
+entries can't be republished, since the key already holds the first build's
+outputs (`cache entry already exists with different outputs`). `cache = false`
+on the parent doesn't help its descendants: every machine then builds its own
+parent.
 
 `--no-cache` disables both restore and publish but preserves local `.holbuild/` up-to-date checks. Force levels skip local up-to-date and cache restore only for the selected node set, and still publish cache unless `--no-cache` is also set: `--force=theory` (or `--force-theory`) forces requested/default target nodes, `--force=project` forces root-project nodes in the requested plan, and `--force=full`/bare `--force` forces the whole requested plan including dependency packages.
 

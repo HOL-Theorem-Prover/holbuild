@@ -500,8 +500,8 @@ undeclared files, or host paths must declare those files in `extra_deps`, or set
 `cache = false` for what can't be declared. Builds stay correct either way,
 because holbuild rejects a restored theory whose parents' `.dat` files differ
 from the local ones, but descendants of a nondeterministic theory then miss the
-cache wherever it was built locally, and their rebuilt entries can't be
-published.
+cache wherever the local build of it differs from the one their cache entries
+were built against, and their rebuilt entries can't be published.
 
 Source files may also declare source-file-relative extra dependencies:
 
