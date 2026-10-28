@@ -25,7 +25,7 @@ local
   val curl = getSymbol (loadLibraryIndirect library_name)
   val libc = getSymbol (loadExecutable ())
 
-  (* curl_easy_setopt, curl_easy_getinfo and fcntl take their third argument
+  (* curl_easy_setopt and curl_easy_getinfo take their third argument
      through `...`.  x86-64 and Linux arm64 pass it like a fixed third
      argument, in a register; Apple arm64 passes variadic arguments on the
      stack.  Repeating the value up to the ninth argument, the first stack
@@ -53,14 +53,15 @@ in
   val multi_info_read = buildCall2 (curl "curl_multi_info_read", (cPointer, cStar cInt), cPointer)
   val fopen = buildCall2 (libc "fopen", (cString, cString), cPointer)
   val fclose = buildCall1 (libc "fclose", cPointer, cInt)
-  val fcntl =
-    variadic (buildCall9 (libc "fcntl", (cInt, cInt, cInt, cInt, cInt, cInt, cInt, cInt, cInt), cInt))
 
-  (* libcurl's sockets are not close-on-exec, so without this every child
-     holbuild starts would inherit the open connections.  F_SETFD and
-     FD_CLOEXEC have the same values on Linux and macOS. *)
+  (* libcurl's connection sockets are not close-on-exec, so without this
+     every child holbuild starts would inherit the open connections.  (The
+     wakeup pipe each multi handle creates is close-on-exec only from libcurl
+     8.10; a child holding it keeps no connection open.) *)
   val sockopt_cloexec =
-    buildCallback3 ((cPointer, cInt, cInt), cInt) (fn (_, fd, _) => (ignore (fcntl (fd, 2, 1)); 0))
+    buildCallback3 ((cPointer, cInt, cInt), cInt)
+      (fn (_, fd, _) =>
+        (Posix.IO.setfd (Posix.FileSys.wordToFD (SysWord.fromInt fd), Posix.IO.FD.cloexec); 0))
 end
 
 val CURLOPT_WRITEDATA = 10001
@@ -75,6 +76,8 @@ val CURLOPT_FOLLOWLOCATION = 52
 val CURLOPT_HTTPGET = 80
 val CURLOPT_NOSIGNAL = 99
 val CURLOPT_ACCEPT_ENCODING = 10102
+val CURLOPT_CAINFO = 10065
+val CURLOPT_CAPATH = 10097
 val CURLOPT_INFILESIZE_LARGE = 30115
 val CURLOPT_SOCKOPTFUNCTION = 20148
 val CURLINFO_RESPONSE_CODE = 0x200002
@@ -158,6 +161,17 @@ fun check what code =
 fun mcheck what code =
   if code = 0 then () else raise Error (what ^ " failed with CURLMcode " ^ Int.toString code)
 
+(* The CA options the curl command sets from the environment; libcurl
+   doesn't read these variables itself. *)
+fun ca_options () =
+  case OS.Process.getEnv "CURL_CA_BUNDLE" of
+      SOME bundle => [("CAINFO", CURLOPT_CAINFO, bundle)]
+    | NONE =>
+        List.mapPartial
+          (fn (variable, name, option) =>
+             Option.map (fn value => (name, option, value)) (OS.Process.getEnv variable))
+          [("SSL_CERT_DIR", "CAPATH", CURLOPT_CAPATH), ("SSL_CERT_FILE", "CAINFO", CURLOPT_CAINFO)]
+
 type connection = {easy : Foreign.Memory.voidStar, multi : Foreign.Memory.voidStar,
                errors : Foreign.Memory.voidStar}
 
@@ -177,6 +191,7 @@ fun new_connection () : connection =
     check "SOCKOPTFUNCTION" (setopt_fn (easy, CURLOPT_SOCKOPTFUNCTION, sockopt_cloexec));
     check "ERRORBUFFER" (setopt_ptr (easy, CURLOPT_ERRORBUFFER, errors));
     Option.app (fn user => check "USERPWD" (setopt_str (easy, CURLOPT_USERPWD, user))) (!userpwd);
+    List.app (fn (name, option, value) => check name (setopt_str (easy, option, value))) (ca_options ());
     {easy = easy, multi = multi, errors = errors}
   end
 

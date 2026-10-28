@@ -103,11 +103,17 @@ fun zstd_compress src dst =
 fun zstd_content_headers size =
   ["Content-Encoding: zstd", "X-Digest-SizeBytes: " ^ size]
 
+(* Transport failures are printed as the curl command printed them, since
+   callers treat a failed lookup as a miss. *)
+fun report_failure message =
+  (TextIO.output (TextIO.stdErr, "holbuild: remote cache: " ^ message ^ "\n"); message)
+
 fun curl_get_with_timeout timeout_seconds {url, dst} =
   let val display_url = redact_userinfo url
   in
     case HolbuildHttp.get {url = url, dst = dst, timeout = timeout_seconds} of
-        HolbuildHttp.Failed message => HolbuildCacheBackend.Corrupt ("GET " ^ display_url ^ " failed: " ^ message)
+        HolbuildHttp.Failed message =>
+          HolbuildCacheBackend.Corrupt (report_failure ("GET " ^ display_url ^ " failed: " ^ message))
       | HolbuildHttp.Response 200 => HolbuildCacheBackend.Hit
       | HolbuildHttp.Response 404 => HolbuildCacheBackend.Miss
       | HolbuildHttp.Response code => HolbuildCacheBackend.Corrupt ("HTTP " ^ Int.toString code ^ " from " ^ display_url)
@@ -123,7 +129,8 @@ fun curl_put_with_headers_timeout timeout_seconds headers {url, src} =
   let val display_url = redact_userinfo url
   in
     case HolbuildHttp.put {url = url, src = src, headers = headers, timeout = timeout_seconds} of
-        HolbuildHttp.Failed message => HolbuildCacheBackend.Conflict ("PUT " ^ display_url ^ " failed: " ^ message)
+        HolbuildHttp.Failed message =>
+          HolbuildCacheBackend.Conflict (report_failure ("PUT " ^ display_url ^ " failed: " ^ message))
       | HolbuildHttp.Response code =>
           if successful_put_code code then HolbuildCacheBackend.Published
           else HolbuildCacheBackend.Conflict ("HTTP " ^ Int.toString code ^ " from " ^ display_url)

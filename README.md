@@ -692,7 +692,9 @@ corruption but do not authenticate the cache publisher.
 holbuild talks to the remote cache through libcurl (7.66 or later, with an
 asynchronous DNS resolver), loaded at run time: `libcurl.so.4` on Linux, the
 system `/usr/lib/libcurl.4.dylib` on macOS. If it can't be loaded or lacks
-those, holbuild warns once and builds without the remote cache.
+those, holbuild warns once and builds without the remote cache. As with the
+curl command, `CURL_CA_BUNDLE`, `SSL_CERT_FILE` and `SSL_CERT_DIR` select the
+CA certificates that HTTPS connections trust.
 
 For private caches, put credentials in local/CI configuration, not in
 the project manifest. CLI `--remote-cache` overrides `HOLBUILD_REMOTE_CACHE_URL`,
