@@ -496,6 +496,17 @@ always_reexecute = true
 - `cache = false` disables global cache restore/publish for the action.
 - `always_reexecute = true` disables local up-to-date skipping for the action.
 
+Cache keys hash sources, not built outputs, so a cached theory is reusable only
+if its build is reproducible: a deterministic script, with its inputs declared
+and the same HOL toolchain, must produce a byte-identical `Theory.dat` in any
+project directory. A script that reads the clock, environment variables,
+undeclared files, or host paths must declare those files in `extra_deps`, or set
+`cache = false` for what can't be declared. Builds stay correct either way,
+because holbuild rejects a restored theory whose parents' `.dat` files differ
+from the local ones, but descendants of a nondeterministic theory then miss the
+cache wherever the local build of it differs from the one their cache entries
+were built against, and their rebuilt entries can't be published.
+
 Source files may also declare source-file-relative extra dependencies:
 
 ```sml
