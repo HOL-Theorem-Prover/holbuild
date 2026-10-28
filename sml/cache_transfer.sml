@@ -78,8 +78,20 @@ fun ensure_dir path =
 
 fun remove_file path = FS.remove path handle OS.SysErr _ => ()
 
+val temp_blob_counter = ref 0
+val temp_blob_mutex = Mutex.mutex ()
+
+fun next_temp_blob_id () =
+  (Mutex.lock temp_blob_mutex;
+   (temp_blob_counter := !temp_blob_counter + 1; !temp_blob_counter)
+   before Mutex.unlock temp_blob_mutex)
+
+(* Unique per copy: concurrent copies of one blob (parallel build workers,
+   prefetch, other holbuild processes) share tmp_dir. *)
 fun temp_blob_path tmp_dir hash =
-  Path.concat(tmp_dir, "holbuild-cache-transfer-" ^ hash ^ ".blob")
+  Path.concat(tmp_dir, String.concat ["holbuild-cache-transfer-", hash, "-",
+                                      HolbuildFileLock.current_pid_text (), "-",
+                                      Int.toString (next_temp_blob_id ()), ".blob"])
 
 fun fetch_blob_or_raise (source : source) hash path =
   case #fetch_blob source {hash = hash, dst = path} of
@@ -97,13 +109,14 @@ fun publish_blob_or_raise (destination : destination) hash path =
 fun copy_blob source destination tmp_dir hash (uploaded, reused) =
   let
     val path = temp_blob_path tmp_dir hash
-    val _ = fetch_blob_or_raise source hash path
-    val (uploaded', reused') = publish_blob_or_raise destination hash path
-    val _ = remove_file path
+    val (uploaded', reused') =
+      (fetch_blob_or_raise source hash path;
+       publish_blob_or_raise destination hash path)
+      handle e => (remove_file path; raise e)
   in
+    remove_file path;
     (uploaded + uploaded', reused + reused')
   end
-  handle e => (remove_file (temp_blob_path tmp_dir hash); raise e)
 
 fun put_action_or_raise (destination : destination) key text =
   case #put_action destination HolbuildCacheBackend.PutIfAbsentOrSame {key = key, text = text} of
