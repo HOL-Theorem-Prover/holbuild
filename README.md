@@ -245,7 +245,7 @@ default build command:
 
 ```sh
 holbuild -j4 MyTheory
-holbuild --maxheap 4096 MyTheory
+holbuild --max-heap 4096 MyTheory
 holbuild --source-dir /path/to/project MyTheory
 holbuild --cache-dir /path/to/cache MyTheory
 holbuild --remote-cache http://cache.example.org MyTheory
@@ -277,8 +277,12 @@ Common global options:
 - `--json`: emit newline-delimited JSON where supported.
 - `--quiet`, `--verbose`, `--verbosity LEVEL`: adjust status output.
 - `-j N`, `-jN`, `--jobs N`: build parallelism.
-- `--maxheap MB`, `--max-heap MB`: Poly/ML maximum heap size for child HOL
-  processes.
+- `--max-heap MB`: Poly/ML maximum heap size for child HOL processes. Do not
+  use `--maxheap`: holbuild is itself a Poly/ML program, and its runtime takes
+  `--maxheap MB` as the cap on holbuild's own heap, so the option never reaches
+  holbuild and child HOL processes run uncapped. holbuild rejects `--maxheap`
+  where it can detect it (Linux), so there it cannot be used to cap holbuild's
+  own heap either.
 
 `holbuild build --watch MyTheory` runs an initial build, then watches project
 inputs with `inotifywait` and rebuilds after changes. The directory of each
@@ -492,6 +496,17 @@ always_reexecute = true
 - `cache = false` disables global cache restore/publish for the action.
 - `always_reexecute = true` disables local up-to-date skipping for the action.
 
+Cache keys hash sources, not built outputs, so a cached theory is reusable only
+if its build is reproducible: a deterministic script, with its inputs declared
+and the same HOL toolchain, must produce a byte-identical `Theory.dat` in any
+project directory. A script that reads the clock, environment variables,
+undeclared files, or host paths must declare those files in `extra_deps`, or set
+`cache = false` for what can't be declared. Builds stay correct either way,
+because holbuild rejects a restored theory whose parents' `.dat` files differ
+from the local ones, but descendants of a nondeterministic theory then miss the
+cache wherever the local build of it differs from the one their cache entries
+were built against, and their rebuilt entries can't be published.
+
 Source files may also declare source-file-relative extra dependencies:
 
 ```sml
@@ -590,6 +605,8 @@ holbuild build --skip-checkpoints MyTheory
   explicit termination proof. If a theorem and terminating definition have the
   same name, the theorem takes precedence.
 - `--tactic-timeout SECONDS` changes the per-step timeout; `0` disables it.
+  A step that times out fails the build even inside `TRY` or an `ORELSE`
+  alternative.
 - `--trace-steps` records proof-step traces in child logs.
 - `--repl-on-failure` starts a HOL REPL from the newest useful checkpoint after a
   theory failure. It serialises the build and is not supported with `--json`.

@@ -529,9 +529,20 @@ Different absolute paths under the same declared root may normalize to the same
 root-relative identity. Arbitrary outside-root paths are rejected or treated as
 uncacheable.
 
+Because input keys hash sources rather than outputs, sharing cache entries
+across machines rests on a reproducibility contract: a deterministic script,
+with its sources and extra inputs declared, under the same theory toolchain key,
+produces a byte-identical `Theory.dat` in any project directory and artifact
+cache. A script that reads the clock, the environment, undeclared files, or host
+paths has to declare the files as `extra_deps` or opt out with `cache = false`.
+
 If the same input key produces different output keys, that indicates
-nondeterminism or undeclared inputs; the safe response is to warn and disable
-cache use for that action.
+nondeterminism or undeclared inputs. The cache keeps the first entry and warns
+on the conflicting publish. Correctness doesn't depend on the contract: a
+restored theory whose recorded parent `.dat` hashes differ from the local
+parents is rejected and rebuilt. What a nondeterministic theory costs is cache
+hits: where the local parent's `.dat` differs from the one the cached children
+were built against, its whole subtree misses and can't republish.
 
 ## Global cache
 
@@ -842,6 +853,15 @@ property of the declared entry point graph, not of the current request, except t
 but local metadata/cache records the timeout a successful build satisfied; a success under
 60s may satisfy a later 180s request, while a success under 180s does not satisfy a later
 60s request.
+
+A timeout is not a tactic failure: inside `TRY`, an `ORELSE`/`FIRST` alternative or a
+structural repeat body it fails the build at that step instead of taking the combinator's
+failure branch. It records no try, choice or repeat event for that body. The failed-prefix
+checkpoint is saved where the outermost such combinator started that body rather than
+inside it: at the `TRY` or choice's entry, or at the start of the timed-out iteration of a
+structural repeat. Tactic-level `REPEAT`/`rpt` is an opaque leaf (see above), so it is
+timed as one step and fails like any other leaf.
+
 `execution-plan THEORY:THEOREM` and `--trace-steps` are debugging/inspection paths.
 `holbuild execution-plan THEORY:THEOREM` is static inspection for proof steps: it
 discovers sources, finds the named theorem in the named theory script, pretty-prints
