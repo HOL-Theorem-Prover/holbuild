@@ -689,11 +689,16 @@ Poly/ML objects, and restored toolchains execute cached binaries. Use an
 authenticated HTTPS endpoint with trusted writers. Content hashes detect
 corruption but do not authenticate the cache publisher.
 
+holbuild talks to the remote cache through libcurl (7.66 or later, with an
+asynchronous DNS resolver), loaded at run time: `libcurl.so.4` on Linux, the
+system `/usr/lib/libcurl.4.dylib` on macOS. If it can't be loaded or lacks
+those, holbuild warns once and builds without the remote cache.
+
 For private caches, put credentials in local/CI configuration, not in
 the project manifest. CLI `--remote-cache` overrides `HOLBUILD_REMOTE_CACHE_URL`,
 which overrides `.holconfig.toml`'s `[remote_cache].url`. `bazel-remote`
-supports HTTP Basic Auth; the safest holbuild path is to pass curl a config
-file:
+supports HTTP Basic Auth; the safest holbuild path is a credentials file in
+curl's config syntax:
 
 ```sh
 cat > "$RUNNER_TEMP/holbuild-remote-cache.curl" <<'EOF'
@@ -705,10 +710,13 @@ HOLBUILD_REMOTE_CACHE_CURL_CONFIG="$RUNNER_TEMP/holbuild-remote-cache.curl" \
 ```
 
 `HOLBUILD_REMOTE_CACHE_CURL_CONFIG` overrides `.holconfig.toml`'s
-`[remote_cache].curl_config`.
+`[remote_cache].curl_config`. holbuild reads only the `user` option from this
+file (`user = "name:password"`, `user name:password` or `--user name:password`;
+`#` starts a comment line). Any other option is reported by name, and that
+build runs without the remote cache rather than ignoring it.
 
-The URL form `https://user:password@cache.example.org` also works with curl, but
-can expose credentials via process listings or shell history; prefer the config
+The URL form `https://user:password@cache.example.org` also works, but can
+expose credentials via process listings or shell history; prefer the config
 file form for CI and shared machines. holbuild redacts URL userinfo in its own
 remote-cache diagnostics, but it cannot hide secrets from the operating system if
 they are passed as command-line arguments.
