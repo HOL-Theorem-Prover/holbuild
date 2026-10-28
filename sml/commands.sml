@@ -40,7 +40,7 @@ fun global_help () = print
   \  --json\n\
   \  --quiet, --verbose, --verbosity LEVEL\n\
   \  -j N, -jN, --jobs N\n\
-  \  --maxheap MB, --max-heap MB\n\n\
+  \  --max-heap MB\n\n\
   \Use `holbuild COMMAND --help` for command-specific help.\n"
 
 fun build_help () = print
@@ -645,7 +645,6 @@ fun parse_global_options args =
         | "--remote-cache" :: url :: xs => loop holdir source_dir cache_dir (SOME url) jobs maxheap json verbosity xs
         | "--jobs" :: n :: xs => loop holdir source_dir cache_dir remote_cache (SOME (positive_int "--jobs" n)) maxheap json verbosity xs
         | "-j" :: n :: xs => loop holdir source_dir cache_dir remote_cache (SOME (positive_int "-j" n)) maxheap json verbosity xs
-        | "--maxheap" :: n :: xs => loop holdir source_dir cache_dir remote_cache jobs (SOME (positive_int "--maxheap" n)) json verbosity xs
         | "--max-heap" :: n :: xs => loop holdir source_dir cache_dir remote_cache jobs (SOME (positive_int "--max-heap" n)) json verbosity xs
         | "--verbosity" :: [] => raise Error "--verbosity requires LEVEL"
         | "--holdir" :: [] => raise Error "--holdir requires PATH"
@@ -654,7 +653,6 @@ fun parse_global_options args =
         | "--remote-cache" :: [] => raise Error "--remote-cache requires URL"
         | "--jobs" :: [] => raise Error "--jobs requires N"
         | "-j" :: [] => raise Error "-j requires N"
-        | "--maxheap" :: [] => raise Error "--maxheap requires MB"
         | "--max-heap" :: [] => raise Error "--max-heap requires MB"
         | arg :: xs =>
             if String.isPrefix "--verbosity=" arg then
@@ -669,8 +667,6 @@ fun parse_global_options args =
               loop holdir source_dir cache_dir (SOME (String.extract (arg, size "--remote-cache=", NONE))) jobs maxheap json verbosity xs
             else if String.isPrefix "--jobs=" arg then
               loop holdir source_dir cache_dir remote_cache (SOME (positive_int "--jobs" (String.extract (arg, size "--jobs=", NONE)))) maxheap json verbosity xs
-            else if String.isPrefix "--maxheap=" arg then
-              loop holdir source_dir cache_dir remote_cache jobs (SOME (positive_int "--maxheap" (String.extract (arg, size "--maxheap=", NONE)))) json verbosity xs
             else if String.isPrefix "--max-heap=" arg then
               loop holdir source_dir cache_dir remote_cache jobs (SOME (positive_int "--max-heap" (String.extract (arg, size "--max-heap=", NONE)))) json verbosity xs
             else if String.isPrefix "-j" arg andalso size arg > 2 then
@@ -1613,10 +1609,27 @@ fun install_signal_handlers () =
     ()
   end
 
+(* The process's own command line, without argv[0], or [] where /proc is
+   unavailable. *)
+fun process_arguments () =
+  (case String.fields (fn c => c = #"\000") (with_input "/proc/self/cmdline" TextIO.inputAll) of
+       [] => []
+     | _ :: args => args)
+  handle IO.Io _ => []
+
+(* The Poly/ML runtime removes --maxheap from the command line before
+   CommandLine.arguments, so holbuild can only see it in the process's own
+   arguments, and only where /proc exists. *)
+fun reject_runtime_maxheap () =
+  if List.exists (String.isPrefix "--maxheap") (process_arguments ()) then
+    raise Error "--maxheap is consumed by holbuild's Poly/ML runtime and does not reach child HOL processes; use --max-heap MB"
+  else ()
+
 fun main raw_args =
   (let
      val _ = install_signal_handlers ()
      val _ = HolbuildStatus.set_json_mode (List.exists (fn s => s = "--json") raw_args)
+     val _ = reject_runtime_maxheap ()
      val _ =
        if raw_args = ["--version"] then
          (print ("holbuild " ^ HolbuildVersion.version ^ "\n"); OS.Process.exit OS.Process.success)
