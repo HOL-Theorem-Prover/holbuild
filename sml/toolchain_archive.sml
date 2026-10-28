@@ -162,7 +162,10 @@ fun restore {remote, identity, final_dir} =
            handle e => (cleanup (); raise e))
         end
 
-fun publish {remote, identity, entry_dir} =
+(* Another builder may have published since this one's restore missed, so
+   look for the action before creating and uploading the archive.  replace
+   overwrites an action whose archive this builder rejected. *)
+fun publish {remote, identity, entry_dir, replace} =
   let
     val archive_path = temp_path "publish"
     fun cleanup () = remove_file archive_path
@@ -172,21 +175,25 @@ fun publish {remote, identity, entry_dir} =
         | result as HolbuildCacheBackend.AlreadyPresent => result
         | HolbuildCacheBackend.Skipped => die "remote cache skipped toolchain archive publication"
         | HolbuildCacheBackend.Conflict detail => die ("remote cache rejected toolchain archive: " ^ detail)
+    fun put_action request =
+      if replace then HolbuildRemoteCache.replace_action_unconditionally remote request
+      else HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsentOrSame request
   in
-    ((create_archive {entry_dir = entry_dir, identity = identity, archive_path = archive_path};
-      let
-        val sha1 = HolbuildHash.file_sha1 archive_path
-        val _ = upload sha1
-        val action = remote_record sha1
-      in
-        case HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsentOrSame
-               {key = identity, text = action} of
-            result as HolbuildCacheBackend.Published => result
-          | result as HolbuildCacheBackend.AlreadyPresent => result
-          | HolbuildCacheBackend.Skipped => die "remote cache skipped toolchain action publication"
-          | HolbuildCacheBackend.Conflict detail => die ("remote cache rejected toolchain action: " ^ detail)
-      end before cleanup ())
-     handle e => (cleanup (); raise e))
+    if not replace andalso Option.isSome (HolbuildRemoteCache.get_action remote identity) then
+      HolbuildCacheBackend.AlreadyPresent
+    else
+      ((create_archive {entry_dir = entry_dir, identity = identity, archive_path = archive_path};
+        let
+          val sha1 = HolbuildHash.file_sha1 archive_path
+          val _ = upload sha1
+        in
+          case put_action {key = identity, text = remote_record sha1} of
+              result as HolbuildCacheBackend.Published => result
+            | result as HolbuildCacheBackend.AlreadyPresent => result
+            | HolbuildCacheBackend.Skipped => die "remote cache skipped toolchain action publication"
+            | HolbuildCacheBackend.Conflict detail => die ("remote cache rejected toolchain action: " ^ detail)
+        end before cleanup ())
+       handle e => (cleanup (); raise e))
   end
 
 end

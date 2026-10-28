@@ -195,7 +195,7 @@ write_fake_poly() {
 #!/usr/bin/env sh
 set -eu
 if [ "${1:-}" = -v ]; then
-  printf 'Fake Poly/ML Arm64 1.0\n'
+  printf 'Poly/ML 1.0 Release    RTS version: Fake-1.0 (Git version v1.0)\n'
   exit 0
 fi
 touch configured

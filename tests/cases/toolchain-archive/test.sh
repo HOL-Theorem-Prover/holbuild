@@ -167,16 +167,25 @@ wrong_path_log=$tmpdir/wrong-path.log
 [[ $(grep -c '^PUT ' "$request_log") -eq $((initial_put_count + 2)) ]]
 [[ $(grep -c '^GET /cas/' "$request_log") -eq "$initial_cas_get_count" ]]
 
-# The Poly executable digest is part of remote identity even when its version
-# string and the local toolchain key are unchanged.
+# Poly/ML is identified by its runtime release and architecture variant and by
+# its location, not by the bytes of bin/poly, which differ on every build.
 cp "$fakebin/poly" "$tmpdir/original-poly"
-printf '\n# changed executable identity\n' >> "$fakebin/poly"
+printf '\n# rebuilt executable\n' >> "$fakebin/poly"
+rm -rf "$cache/hol-toolchains"
+rebuilt_poly_log=$tmpdir/rebuilt-poly.log
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$rebuilt_poly_log" 2>&1
+[[ $(wc -l < "$build_count") -eq 2 ]]
+[[ $(grep -c '^PUT ' "$request_log") -eq $((initial_put_count + 2)) ]]
+[[ $(grep -c '^GET /cas/' "$request_log") -eq $((initial_cas_get_count + 1)) ]]
+
+# Another runtime variant at the same location selects a different toolchain.
+sed 's/RTS version: Fake-1.0/RTS version: Fake32-1.0/' "$tmpdir/original-poly" > "$fakebin/poly"
 rm -rf "$cache/hol-toolchains"
 wrong_poly_log=$tmpdir/wrong-poly.log
 (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$wrong_poly_log" 2>&1
 [[ $(wc -l < "$build_count") -eq 3 ]]
 [[ $(grep -c '^PUT ' "$request_log") -eq $((initial_put_count + 4)) ]]
-[[ $(grep -c '^GET /cas/' "$request_log") -eq "$initial_cas_get_count" ]]
+[[ $(grep -c '^GET /cas/' "$request_log") -eq $((initial_cas_get_count + 1)) ]]
 cp "$tmpdir/original-poly" "$fakebin/poly"
 chmod +x "$fakebin/poly"
 
@@ -197,7 +206,7 @@ wrong_platform_log=$tmpdir/wrong-platform.log
 (cd "$project" && PATH="$platformbin:$PATH" "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$wrong_platform_log" 2>&1
 [[ $(wc -l < "$build_count") -eq 4 ]]
 [[ $(grep -c '^PUT ' "$request_log") -eq $((initial_put_count + 6)) ]]
-[[ $(grep -c '^GET /cas/' "$request_log") -eq "$initial_cas_get_count" ]]
+[[ $(grep -c '^GET /cas/' "$request_log") -eq $((initial_cas_get_count + 1)) ]]
 
 # The path identity is the physical path, which the HOL build embeds. A cache
 # reached through a symlink is still a valid same-path installation.
@@ -405,6 +414,24 @@ invalid_restore missing-executable 'failed final validation'
 invalid_restore missing-holmake 'failed final validation'
 invalid_restore corrupt-heap 'failed final validation'
 
+# A builder that rejects an archive replaces it with its own local build.
+python3 "$tmpdir/mutate_archive.py" \
+  "$original_archive" "$tmpdir/mutated-replace.tar" "${action_files[0]}" "$remote_root/cas" corrupt-heap
+cp "${action_files[0]}" "$tmpdir/rejected-action"
+rm -rf "$cache/hol-toolchains"
+builds_before_replace=$(wc -l < "$build_count")
+replace_log=$tmpdir/replace-rejected.log
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$replace_log" 2>&1
+require_grep 'failed final validation' "$replace_log"
+[[ $(wc -l < "$build_count") -eq $((builds_before_replace + 1)) ]]
+if cmp -s "${action_files[0]}" "$tmpdir/rejected-action"; then
+  record_regression_failure "rejected toolchain archive was not replaced"
+fi
+rm -rf "$cache/hol-toolchains"
+replaced_log=$tmpdir/replaced-restore.log
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$replaced_log" 2>&1
+[[ $(wc -l < "$build_count") -eq $((builds_before_replace + 1)) ]]
+
 cp "$original_action" "${action_files[0]}"
 
 # A marker-bearing local entry without Holmake must never be accepted as built.
@@ -462,6 +489,29 @@ restore_scratch_paths() {
     [[ -e "$path" ]] && printf '%s\n' "$path"
   done
 }
+
+# A builder whose restore missed does not upload when the archive was
+# published while it built.
+mv "${action_files[0]}" "$tmpdir/action-held"
+rm -rf "$cache/hol-toolchains"
+fallback_event=$tmpdir/fallback-event
+fallback_gate=$tmpdir/fallback-gate
+mkfifo "$fallback_event" "$fallback_gate"
+puts_before_meanwhile=$(grep -c '^PUT ' "$request_log")
+(
+  cd "$project"
+  exec env \
+    HOLBUILD_TEST_TOOLCHAIN_LOCAL_FALLBACK="$fallback_event" \
+    HOLBUILD_TEST_TOOLCHAIN_LOCAL_FALLBACK_GATE="$fallback_gate" \
+    "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol
+) > "$tmpdir/published-meanwhile.log" 2>&1 &
+meanwhile_pid=$!
+IFS= read -r _ < "$fallback_event"
+mv "$tmpdir/action-held" "${action_files[0]}"
+printf 'continue\n' > "$fallback_gate"
+wait "$meanwhile_pid"
+[[ $(grep -c '^PUT ' "$request_log") -eq "$puts_before_meanwhile" ]]
+rm -f "$fallback_event" "$fallback_gate"
 
 # A killed download leaves only task-local scratch. The next caller acquires
 # the released per-key lock and performs a complete restore.

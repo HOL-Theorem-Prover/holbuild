@@ -658,13 +658,16 @@ theory's restore usually finds its entry already local. This prefetch is
 best-effort and silent; whatever it misses is fetched when the theory is
 reached, as before. `HOLBUILD_CACHE_TRACE=1` shows each prefetched entry as
 `remote cache prefetched: <key>`.
-A missing HOL toolchain is restored from the same remote cache when its
-installation path (with symlinks resolved, as HOL's build records it),
-platform, C library and Poly/ML executable match. The source-analysis helper
-is not archived; holbuild rebuilds it against the restored toolchain. After a
-remote miss, a successful local toolchain build is published automatically;
-local and remote hits are not re-uploaded, and publication failure is only a
-warning.
+A missing HOL toolchain is restored from the same remote cache when its HOL
+commit, build arguments, installation path (with symlinks resolved, as HOL's
+build records it), platform, C library, Poly/ML runtime (release and
+architecture variant, as `poly -v` reports them) and resolved `poly`
+executable path match. The source-analysis helper is not archived; holbuild
+rebuilds it against the restored toolchain. After a remote miss, a successful
+local toolchain build is published automatically unless another builder
+published it meanwhile; an archive that failed to restore is replaced by the
+local build. Local and remote hits are not re-uploaded, and publication
+failure is only a warning.
 
 The remote endpoint stores content blobs under `/cas/<sha256>` and holbuild
 cache metadata under `/ac/<action-key>`. CAS transfers use zstd compression when
