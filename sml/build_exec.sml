@@ -4963,8 +4963,10 @@ fun start_remote_cache_prefetch (options : build_options) project plan keys =
               case next () of
                   NONE => ()
                 | SOME node => ((prefetch node handle _ => ()); worker ())
-            val threads = List.tabulate (!HolbuildRemoteCacheConfig.prefetch_concurrency,
-                                         fn _ => Thread.fork (worker, []))
+            val count = Int.min (!HolbuildRemoteCacheConfig.prefetch_concurrency,
+                                 length (!pending))
+            val _ = cache_trace ("remote cache prefetch threads: " ^ Int.toString count)
+            val threads = List.tabulate (count, fn _ => Thread.fork (worker, []))
             fun wait_threads () =
               if List.exists Thread.isActive threads then
                 (OS.Process.sleep (Time.fromReal 0.05); wait_threads ())

@@ -174,6 +174,7 @@ if ! wait "$consumer_pid"; then
 fi
 consumer_pid=
 
+require_grep "remote cache prefetch threads: 1$" "$consumer_log"
 require_grep "remote cache prefetched: $late_key" "$consumer_log"
 require_grep "LateTheory restored from cache" "$consumer_log"
 require_grep "BrokenTheory built" "$consumer_log"
@@ -218,6 +219,7 @@ if ! wait "$consumer_pid"; then
   exit 1
 fi
 consumer_pid=
+require_grep "remote cache prefetch threads: 1$" "$consumer_log"
 require_grep "LateTheory restored from cache" "$consumer_log"
 if grep -q "remote cache prefetched: \($broken_key\|$absent_key\)" "$consumer_log"; then
   echo "up-to-date theories were prefetched" >&2
