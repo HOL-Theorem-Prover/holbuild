@@ -32,6 +32,8 @@ These commands generate an invocation-private run context under `.holbuild/`, ad
 
 `holbuild repl` uses an interactive HOL process runner so stdin/stdout stay attached to the terminal.
 
+`run --from THEORY` / `repl --from THEORY` (before any HOL arguments) start from `THEORY`'s build checkpoint instead of `[run].heap` or the base state: `final_context` (THEORY loaded) when it matches THEORY's current input key and its parent state is in place, else `deps_loaded` (ancestors loaded) when it matches the current dependency key (e.g. only THEORY changed, or the project moved), else `[run].heap` or the base state with a one-line reason (no checkpoint: cache hit without a local build, `--skip-checkpoints`, gc, never built, stale dependencies or toolchain, or a dependency-package theory). A usable checkpoint takes precedence over `[run].heap`. `--from` does not build THEORY; `holbuild build --force --no-cache THEORY` refreshes its checkpoints. Unknown theories are errors.
+
 Global flags apply: `--source-dir` and `--maxheap`/`--max-heap`. `heap`, `run`, and `repl` use the manifest-declared project HOL from `[dependencies.hol]`; use `holbuild buildhol` to warm that shared cache explicitly if desired.
 
 For proof failures during builds, prefer `holbuild build --repl-on-failure TARGET`: it serializes the build and starts `hol repl` from the newest failed-prefix checkpoint, falling back to replay/deps-loaded checkpoint. It requires checkpoints and is not supported with `--json`.

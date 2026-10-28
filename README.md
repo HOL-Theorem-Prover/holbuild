@@ -226,6 +226,7 @@ holbuild --version
 holbuild --help
 holbuild repl
 holbuild run script.sml
+holbuild repl --from MyTheory
 holbuild context
 holbuild context --trknl
 holbuild execution-plan MyTheory:my_theorem
@@ -564,6 +565,28 @@ and executable objects may also include signature targets. Before starting HOL,
 `holbuild run` and `holbuild repl` build every target named by `[run].loads`,
 create an invocation-private project context under `.holbuild/`, and then load
 the configured targets followed by user arguments.
+
+`holbuild run --from THEORY` and `holbuild repl --from THEORY` start HOL from a
+checkpoint that building `THEORY` left behind, instead of loading its ancestry
+again. `THEORY` is a logical name or source path; only root-package theories
+have checkpoints. `--from` must come before the arguments passed to HOL. The
+starting state is:
+
+| Condition | State |
+| --- | --- |
+| `THEORY`'s `final_context` checkpoint matches its current input key and its parent state is still in place | `THEORY` and its ancestors loaded |
+| Only `THEORY` changed, or the project directory moved: its `deps_loaded` checkpoint matches its current dependencies | ancestors loaded, `THEORY` not loaded |
+| Otherwise: not built yet, restored from the cache without a local build, built with `--skip-checkpoints`, checkpoints removed by `gc`, a dependency or the HOL toolchain changed, or `THEORY` is in a dependency package | `[run].heap` if configured, else the HOL base state |
+
+A usable checkpoint takes precedence over `[run].heap`. holbuild prints one
+line naming the state it chose and, on fallback, why. `--from` does not build
+`THEORY` itself. To refresh its checkpoints when `THEORY` is up to date or a
+cache hit, run `holbuild build --force --no-cache THEORY`.
+`[run].loads` are still built first and loaded on top of the chosen state.
+Checkpoints are saved with `TheoryPP.include_docs` and
+`TheoryPP.include_html_docs` off, so a session started from one resets both to
+their defaults; under `repl` this also overrides a value set in your HOL
+config. An unknown `THEORY` is an error.
 
 ## Proof steps and checkpoints
 

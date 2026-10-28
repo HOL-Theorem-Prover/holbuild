@@ -651,9 +651,9 @@ logical objects, then invokes HOL's public `buildheap` command on the selected
 object stems. Executable targets add `--exe=<main>`.
 
 Heaps requested by users remain project-local exported artifacts. Checkpoints are
-transient build/debug state. Normal successful theory builds may create them
-while running, but remove them after logical artifacts and metadata are written.
-Raw checkpoint bytes are never the semantic identity; they are local replay/debug
+local build/debug state, not exported artifacts. Successful theory builds keep
+reusable checkpoints, including `final_context`, until they are replaced or
+evicted, so later builds and `run --from` can start from them. Raw checkpoint bytes are never the semantic identity; they are local replay/debug
 breadcrumbs for an already-resolved graph, not retained outputs.
 
 `holbuild` should not use `hol buildheap` as the normal incremental-build
@@ -814,8 +814,16 @@ opts out of theorem instrumentation: with checkpoints still enabled, the build c
 still save and consult `deps_loaded` and save the final context in the separate
 consumer child, but there are no theorem-context/end-of-proof/failed-prefix
 proof-navigation checkpoints and no tactic timeout enforcement for that build.
-The final context is currently a transient debug/successor breadcrumb, not a
-downstream canonical load context.
+The final context is not a downstream canonical load context for builds, but
+`holbuild run --from THEORY` and `repl --from THEORY` start interactive
+sessions from it, or from `deps_loaded`, while it is current. A final context
+saved from `deps_loaded` is a PolyML child of that exact path, so it is removed
+whenever its `deps_loaded` parent is removed or rewritten, and `--from` uses it
+only while its saved parent path still names the current `deps_loaded` or the
+toolchain base state (a moved project falls back to `deps_loaded`). `run` takes
+no project lock, so `--from` only reads ok-files; a concurrent build, `gc`, or
+eviction that removes the chosen checkpoint first makes the session fail to
+start rather than start from a wrong state.
 
 Current HOL versions also generate per-theory HTML documentation during
 `export_theory()` by default. Holbuild disables both historical spellings of that
