@@ -15,8 +15,9 @@ cleanup() {
 trap cleanup EXIT
 
 # An HTTP/1.1 server, so libcurl keeps its connection open between requests.
-# Every request must carry the test credentials; /slow answers after 3 s, and
-# PUT /stored keeps a body that GET /stored returns.
+# Every request must carry the test credentials; /slow answers after 3 s,
+# /missing with 404 and /error with 500, and PUT /store/<name> keeps a body
+# that GET /store/<name> returns.
 cat > "$tmpdir/server.py" <<'PY'
 import base64
 import http.server
@@ -25,34 +26,43 @@ import sys
 import time
 
 credentials = "Basic " + base64.b64encode(b"name:secret").decode()
-stored = b""
+stored = {}
 
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def reply(self, status, body):
-        self.send_response(status)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the client gave up, as the timeout test does
 
     def do_GET(self):
         if self.headers.get("Authorization") != credentials:
             self.reply(401, b"")
-            return
-        if self.path == "/slow":
+        elif self.path == "/slow":
             time.sleep(3)
-        self.reply(200, stored if self.path == "/stored" else b"ok\n")
+            self.reply(200, b"ok\n")
+        elif self.path == "/missing":
+            self.reply(404, b"not found\n")
+        elif self.path == "/error":
+            self.reply(500, b"server error\n")
+        elif self.path.startswith("/store/"):
+            self.reply(200, stored[self.path])
+        else:
+            self.reply(200, b"ok\n")
 
     def do_PUT(self):
-        global stored
         body = self.rfile.read(int(self.headers["Content-Length"]))
         if self.headers.get("Authorization") != credentials:
             self.reply(401, b"")
         elif self.headers.get("X-Test") != "yes":
             self.reply(400, b"")
         else:
-            stored = body
+            stored[self.path] = body
             self.reply(201, b"")
 
     def log_message(self, *args):
@@ -127,9 +137,9 @@ val _ = assert "GET writes the response body" (read_file (dir ^ "/fast.out") = "
 (* One thread, so the PUT and the GET reuse the kept-alive handle. *)
 val body = dir ^ "/body"
 val _ = let val output = TextIO.openOut body in TextIO.output (output, "uploaded\n"); TextIO.closeOut output end
-val put = HolbuildHttp.put {url = url ^ "/stored", src = body, headers = ["X-Test: yes"], timeout = 30}
+val put = HolbuildHttp.put {url = url ^ "/store/single", src = body, headers = ["X-Test: yes"], timeout = 30}
 val _ = assert "PUT sends the body and headers" (put = HolbuildHttp.Response 201)
-val stored = HolbuildHttp.get {url = url ^ "/stored", dst = dir ^ "/stored.out", timeout = 30}
+val stored = HolbuildHttp.get {url = url ^ "/store/single", dst = dir ^ "/stored.out", timeout = 30}
 val _ = assert "a GET after a PUT on the same handle" (stored = HolbuildHttp.Response 200)
 val _ = assert "the GET returns the uploaded body" (read_file (dir ^ "/stored.out") = "uploaded\n")
 
@@ -138,6 +148,69 @@ val _ = assert "a refused connection is a transport failure with libcurl's messa
                (case refused of
                     HolbuildHttp.Failed message => String.isSubstring "127.0.0.1 port 1" message
                   | _ => false)
+
+(* An error status is a response, not a transport failure; the remote cache
+   reads a 404 as a miss whatever body it wrote. *)
+val _ = assert "a 404 is a response"
+               (HolbuildHttp.get {url = url ^ "/missing", dst = dir ^ "/missing.out", timeout = 30}
+                = HolbuildHttp.Response 404)
+val _ = assert "a 500 is a response"
+               (HolbuildHttp.get {url = url ^ "/error", dst = dir ^ "/error.out", timeout = 30}
+                = HolbuildHttp.Response 500)
+val _ = assert "the remote cache reads a 404 as a miss"
+               (HolbuildRemoteCache.curl_get {url = url ^ "/missing", dst = dir ^ "/missing.out"}
+                = HolbuildCacheBackend.Miss)
+val _ = assert "the remote cache reads a 500 as corrupt"
+               (case HolbuildRemoteCache.curl_get {url = url ^ "/error", dst = dir ^ "/error.out"} of
+                    HolbuildCacheBackend.Corrupt message => String.isSubstring "HTTP 500" message
+                  | _ => false)
+
+(* A timeout fails the transfer when it fires, and the handle still works. *)
+val start = Time.now ()
+val timed_out = HolbuildHttp.get {url = url ^ "/slow", dst = dir ^ "/timeout.out", timeout = 1}
+val elapsed = Time.- (Time.now (), start)
+val _ = assert "a timeout is a transport failure"
+               (case timed_out of HolbuildHttp.Failed _ => true | _ => false)
+val _ = assert ("the 1 s timeout took " ^ Time.toString elapsed ^ " s")
+               (Time.< (elapsed, Time.fromMilliseconds 2000))
+val _ = assert "the handle works after a timeout"
+               (HolbuildHttp.get {url = url ^ "/fast", dst = dir ^ "/after-timeout.out", timeout = 30}
+                = HolbuildHttp.Response 200)
+
+(* Concurrent requests share the pool without mixing up transfers: each of
+   16 threads uploads 25 bodies and reads each back. *)
+fun write_file path text =
+  let val output = TextIO.openOut path in TextIO.output (output, text); TextIO.closeOut output end
+val results_mutex = Mutex.mutex ()
+val failures = ref [] : string list ref
+val finished = ref 0
+fun record f = (Mutex.lock results_mutex; f (); Mutex.unlock results_mutex)
+fun client thread =
+  let
+    fun request i =
+      let
+        val name = Int.toString thread ^ "-" ^ Int.toString i
+        val src = dir ^ "/put-" ^ name
+        val dst = dir ^ "/get-" ^ name
+        val _ = write_file src ("body " ^ name ^ "\n")
+        val put = HolbuildHttp.put {url = url ^ "/store/" ^ name, src = src,
+                                    headers = ["X-Test: yes"], timeout = 30}
+        val get = HolbuildHttp.get {url = url ^ "/store/" ^ name, dst = dst, timeout = 30}
+      in
+        if put = HolbuildHttp.Response 201 andalso get = HolbuildHttp.Response 200
+           andalso read_file dst = "body " ^ name ^ "\n"
+        then ()
+        else record (fn () => failures := name :: !failures)
+      end
+  in
+    List.app request (List.tabulate (25, fn i => i))
+    handle e => record (fn () => failures := (Int.toString thread ^ ": " ^ General.exnMessage e) :: !failures);
+    record (fn () => finished := !finished + 1)
+  end
+val _ = List.app (fn thread => ignore (Thread.fork (fn () => client thread, []))) (List.tabulate (16, fn i => i))
+fun wait_clients () = if !finished = 16 then () else (OS.Process.sleep (Time.fromMilliseconds 50); wait_clients ())
+val _ = wait_clients ()
+val _ = assert ("concurrent requests failed: " ^ String.concatWith ", " (!failures)) (null (!failures))
 
 (* The pooled connection is still open; a child must not inherit it. *)
 fun count_connections pid =
