@@ -245,7 +245,7 @@ default build command:
 
 ```sh
 holbuild -j4 MyTheory
-holbuild --maxheap 4096 MyTheory
+holbuild --max-heap 4096 MyTheory
 holbuild --source-dir /path/to/project MyTheory
 holbuild --cache-dir /path/to/cache MyTheory
 holbuild --remote-cache http://cache.example.org MyTheory
@@ -277,8 +277,12 @@ Common global options:
 - `--json`: emit newline-delimited JSON where supported.
 - `--quiet`, `--verbose`, `--verbosity LEVEL`: adjust status output.
 - `-j N`, `-jN`, `--jobs N`: build parallelism.
-- `--maxheap MB`, `--max-heap MB`: Poly/ML maximum heap size for child HOL
-  processes.
+- `--max-heap MB`: Poly/ML maximum heap size for child HOL processes. Do not
+  use `--maxheap`: holbuild is itself a Poly/ML program, and its runtime takes
+  `--maxheap MB` as the cap on holbuild's own heap, so the option never reaches
+  holbuild and child HOL processes run uncapped. holbuild rejects `--maxheap`
+  where it can detect it (Linux), so there it cannot be used to cap holbuild's
+  own heap either.
 
 `holbuild build --watch MyTheory` runs an initial build, then watches project
 inputs with `inotifywait` and rebuilds after changes. The directory of each
@@ -652,6 +656,12 @@ HOLBUILD_REMOTE_CACHE_URL=https://cache.example.org holbuild build MyTheory
 ```
 
 Remote cache misses or errors fall back to the local cache/source build path.
+While a build runs, `-j` background threads also copy the remote entries of
+the plan's out-of-date theories into the local cache in build order, so a
+theory's restore usually finds its entry already local. This prefetch is
+best-effort and silent; whatever it misses is fetched when the theory is
+reached, as before. `HOLBUILD_CACHE_TRACE=1` shows each prefetched entry as
+`remote cache prefetched: <key>`.
 A missing HOL toolchain is restored from the same remote cache when its exact
 installation path, platform, and Poly/ML identity match. After a remote miss, a
 successful local toolchain build is published automatically; local and remote
