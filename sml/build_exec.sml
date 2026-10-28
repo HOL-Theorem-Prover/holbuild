@@ -33,8 +33,7 @@ fun ensure_dir path =
 fun ensure_parent path = ensure_dir (Path.dir path)
 
 fun temp_near path =
-  Path.concat(Path.dir path,
-              "." ^ Path.file path ^ "." ^ Path.file (FS.tmpName ()) ^ ".tmp")
+  HolbuildTempPath.near path ".tmp"
 
 fun remove_file path = FS.remove path handle OS.SysErr _ => ()
 
@@ -3010,8 +3009,13 @@ fun write_theory_script policy project base_context plan keys input_key toolchai
       fun failed_prefix_at_least_as_late failed NONE = true
         | failed_prefix_at_least_as_late failed (SOME replay) =
             #boundary (#checkpoint failed) >= #boundary replay
-      val failed_prefix = if proof_steps_enabled policy then best_failed_prefix_checkpoint (tactic_timeout policy) checkpoints else NONE
-      val replay = replay_candidate policy project node checkpoints declaration_checkpoints
+      val failed_prefix =
+        if proof_steps_enabled policy andalso not (trace_steps policy) then
+          best_failed_prefix_checkpoint (tactic_timeout policy) checkpoints
+        else NONE
+      val replay =
+        if trace_steps policy then NONE
+        else replay_candidate policy project node checkpoints declaration_checkpoints
     in
       case failed_prefix of
           SOME failed =>
@@ -4808,9 +4812,10 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
                          val msg = build_error_message e
                          val artifacts = build_error_debug_artifacts e
                        in
-                         HolbuildStatus.fail_with_debug_artifacts
+                         (HolbuildStatus.fail_with_debug_artifacts
                            status (HolbuildBuildPlan.key node) (HolbuildBuildPlan.logical_name node)
-                           msg artifacts;
+                           msg artifacts
+                          handle IO.Io _ => ());
                          finish_failure id msg artifacts;
                          worker_exit ()
                        end)

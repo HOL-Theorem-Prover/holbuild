@@ -69,7 +69,7 @@ type t =
     local_build_excludes : string list,
     local_build_exclude_globs : string list,
     local_build_jobs : int option,
-    build_tactic_timeout : real option,
+    build_tactic_timeout : real option option,
     checkpoint_limit_gb : int option,
     remote_cache_url : string option,
     remote_cache_curl_config : string option,
@@ -722,7 +722,9 @@ fun describe_with resolution (project : t) =
     List.app (fn dep => print ("dependency: " ^ dependency_to_string project dep ^ "\n")) dependencies;
     List.app (fn override => print ("override: " ^ override_to_string override ^ "\n")) overrides;
     Option.app (fn jobs => print ("local build.jobs: " ^ Int.toString jobs ^ "\n")) local_build_jobs;
-    Option.app (fn t => print ("build.tactic_timeout: " ^ Real.toString t ^ "\n")) build_tactic_timeout;
+    Option.app (fn timeout => print ("build.tactic_timeout: " ^
+                (case timeout of NONE => "none" | SOME t => Real.toString t) ^ "\n"))
+               build_tactic_timeout;
     opt "run.heap: " run_heap;
     print ("run.loads: " ^ String.concatWith ", " run_loads ^ "\n");
     List.app (fn heap => print ("heap: " ^ heap_to_string heap ^ "\n")) heaps;

@@ -343,3 +343,38 @@ message = '\n'.join(e.get('message', '') for e in errors)
 if 'generator bad-gen failed' not in message or 'generator boom' not in message:
     raise SystemExit(f'retained generator failure lost bounded message/output: {message!r}')
 PY
+
+# Close the reader after a worker starts, so its next status write sees EPIPE.
+python3 - "$HOLBUILD_BIN" "$project" <<'PYTHON'
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+
+with tempfile.TemporaryFile() as errors:
+    process = subprocess.Popen(
+        [sys.argv[1], '--json', '-j2', 'build', '--force', 'JTheory'],
+        cwd=sys.argv[2], stdout=subprocess.PIPE, stderr=errors,
+        start_new_session=True,
+    )
+    try:
+        for line in process.stdout:
+            event = json.loads(line)
+            if event.get('event') == 'node_started' and event.get('target') == 'JTheory':
+                break
+        else:
+            raise SystemExit('worker never started before stdout closed')
+        process.stdout.close()
+        try:
+            status = process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            raise SystemExit('parallel build hung after its JSON reader closed stdout')
+        if status == 0:
+            raise SystemExit('closed JSON stdout should fail the build')
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+PYTHON

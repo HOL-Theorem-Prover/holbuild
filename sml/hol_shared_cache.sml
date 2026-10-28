@@ -307,16 +307,12 @@ fun validate_entry req k =
     else if not (path_exists (ok_for_key k)) then false
     else if not (built holdir) then
       die ("broken HOL toolchain cache entry: " ^ dir ^ "\nremove it with: rm -rf " ^ quote dir)
+    else if not (path_exists (Path.concat(holdir, ".git"))) then false
     else
-      let
-        val {status, output} =
-          run_mutation_output k
-            ("git -C " ^ quote holdir ^ " status --porcelain --ignored=no 2>/dev/null")
+      let val output = dirty_status k holdir
       in
-        (* An entry whose tree is not a git checkout is rebuilt. *)
-        if not (OS.Process.isSuccess status) then false
-        else if trim output = "" then true
-        else die ("dirty HOL toolchain cache entry: " ^ dir ^ "\n" ^ trim output ^ "\nremove it with: rm -rf " ^ quote dir)
+        if output = "" then true
+        else die ("dirty HOL toolchain cache entry: " ^ dir ^ "\n" ^ output ^ "\nremove it with: rm -rf " ^ quote dir)
       end
   end
 
