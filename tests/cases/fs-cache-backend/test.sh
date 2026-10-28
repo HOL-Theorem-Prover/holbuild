@@ -64,8 +64,8 @@ val _ = assert "materialized blob hash mismatch" (HolbuildHash.file_sha1 dst = h
 val _ = print "filesystem cache backend tests passed\n";
 SML
 
-# A cp that logs its arguments one per line, to check that the copy runs cp
-# with an argv rather than through a shell.
+# A cp that logs its arguments one per line, to check what the fetch passes
+# to cp.
 real_cp=$(command -v cp)
 mkdir -p "$tmpdir/bin"
 cat > "$tmpdir/bin/cp" <<CP
