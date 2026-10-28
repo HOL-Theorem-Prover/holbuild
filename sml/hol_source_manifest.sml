@@ -164,18 +164,104 @@ fun member_dir_from_target holdir target =
       NONE => NONE
     | SOME rel => if source_target rel then SOME (#dir (Path.splitDirFile rel)) else NONE
 
-fun holmake_source_dirs run_command holdir roots =
-  if null roots then []
+type graph_node = {id : int, target : string, dependencies : int list,
+                   toplevel_compile : bool}
+
+(* Older Holmake versions do not escape command strings as JSON. Read only
+   the fields needed here, rather than parsing those commands or running them. *)
+fun graph_nodes text =
+  let
+    fun field name line =
+      let val prefix = "\"" ^ name ^ "\" : "
+          val line = trim line
+      in
+        if has_prefix prefix line then SOME (String.extract(line, size prefix, NONE))
+        else NONE
+      end
+    fun integers value =
+      List.mapPartial Int.fromString
+        (String.tokens (fn c => not (Char.isDigit c)) value)
+    fun compile line =
+      case field "command" line of
+          NONE => false
+        | SOME value =>
+            let val words = String.tokens Char.isSpace value
+            in
+              has_prefix "\"%%MOSCOWML_INDICATOR%% " value andalso
+              member "-c" words andalso member "-toplevel" words
+            end
+    fun loop [] _ _ _ _ acc = rev acc
+      | loop (line :: rest) id target deps toplevel acc =
+          if trim line = "}" orelse trim line = "}," then
+            loop rest NONE "" [] false
+              (case id of
+                   NONE => acc
+                 | SOME id => {id = id, target = target, dependencies = deps,
+                               toplevel_compile = toplevel} :: acc)
+          else
+            case field "node_id" line of
+                SOME value => loop rest (Int.fromString value) target deps toplevel acc
+              | NONE =>
+                  (case json_target_value line of
+                       SOME value => loop rest id value deps toplevel acc
+                     | NONE =>
+                         (case field "dependencies" line of
+                              SOME value => loop rest id target (integers value) toplevel acc
+                            | NONE => loop rest id target deps (toplevel orelse compile line) acc))
+  in
+    loop (split_lines text) NONE "" [] false []
+  end
+
+(* Toplevel compiler recipes declare object prerequisites that Holdep cannot
+   infer when a signature or functor name differs from its source filename.
+   Ordinary rules can have build-only prerequisites, so leave those alone. *)
+fun compile_loads holdir members (nodes : graph_node list) =
+  let
+    val by_id = List.foldl (fn (node, dict) => Binarymap.insert(dict, #id node, node))
+                  (Binarymap.mkDict Int.compare) nodes
+    fun source_object path =
+      case rel_under holdir path of
+          NONE => false
+        | SOME rel =>
+            let val base = #base (Path.splitBaseExt path)
+                val source = base ^ ".sml"
+                val script =
+                  if has_suffix "Theory" base then
+                    String.substring(base, 0, size base - size "Theory") ^ "Script.sml"
+                  else source
+            in
+              has_suffix ".uo" rel andalso
+              member (#dir (Path.splitDirFile rel)) members andalso
+              (readable source orelse readable script)
+            end
+    fun logical path = #base (Path.splitBaseExt (#file (Path.splitDirFile path)))
+    fun load id =
+      case Binarymap.peek(by_id, id) of
+          NONE => NONE
+        | SOME {target, ...} =>
+            if source_object target orelse
+               (has_suffix ".uo" target andalso
+                #dir (Path.splitDirFile target) = Path.concat(holdir, "sigobj")) then
+              SOME (logical target)
+            else NONE
+    fun policy ({target, dependencies, toplevel_compile, ...} : graph_node) =
+      if not toplevel_compile orelse not (source_object target) then NONE
+      else
+        case List.mapPartial load dependencies of
+            [] => NONE
+          | loads => SOME (logical target, rev (List.foldl (fn (load, acc) => insert_unique load acc) [] loads))
+  in
+    List.mapPartial policy nodes
+  end
+
+fun holmake_sources run_command holdir roots =
+  if null roots then {members = [], loads = []}
   else
     let
       val holmake = Path.concat(Path.concat(holdir, "bin"), "Holmake")
       val command = String.concatWith " "
         (map quote (holmake :: "--no-project" :: "--dirs" :: "--json" :: roots))
       val text = command_output run_command ("cd " ^ quote holdir ^ " && " ^ command)
-      (* Temporary workaround for https://github.com/HOL-Theorem-Prover/HOL/issues/2021:
-         Holmake --json can emit invalid JSON because command strings are not escaped.
-         We only need target fields, so scan those lines directly until holbuild can
-         depend on fixed HOL JSON. *)
       fun add_line (line, acc) =
         case json_target_value line of
             NONE => acc
@@ -183,18 +269,20 @@ fun holmake_source_dirs run_command holdir roots =
               (case member_dir_from_target holdir target of
                    NONE => acc
                  | SOME dir => insert_unique dir acc)
+      val members = rev (List.foldl add_line roots (split_lines text))
     in
-      rev (List.foldl add_line roots (split_lines text))
+      {members = members, loads = compile_loads holdir members (graph_nodes text)}
     end
-
-fun members run_command holdir =
-  holmake_source_dirs run_command holdir (post_toolchain_roots holdir)
 
 fun generate {holdir, manifest_path, members_path, run_command} =
   let
-    val members = members run_command holdir
+    val {members, loads} = holmake_sources run_command holdir (post_toolchain_roots holdir)
     val member_text = String.concatWith "\n" members ^ (if null members then "" else "\n")
-    val manifest = HolbuildBuiltinManifests.manifest_text members
+    fun policy (logical, loads) =
+      "\n[actions." ^ HolbuildBuiltinManifests.toml_string logical ^ "]\nloads = [" ^
+      String.concatWith ", " (map HolbuildBuiltinManifests.toml_string loads) ^ "]\n"
+    val manifest = HolbuildBuiltinManifests.manifest_text members ^
+                   String.concat (map policy loads)
   in
     write_file members_path member_text;
     write_file manifest_path manifest
