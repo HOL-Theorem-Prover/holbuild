@@ -245,7 +245,7 @@ assert_remote_proof_timeout none
 second_log=$tmpdir/second.log
 (cd "$second" && HOLBUILD_CACHE="$second_cache" HOLBUILD_CACHE_TRACE=1 \
   "$HOLBUILD_BIN" --remote-cache "$remote_url" build --tactic-timeout 180 ATheory) > "$second_log" 2>&1
-require_grep "remote cache hydrated:" "$second_log"
+require_grep "remote cache \(hydrated\|prefetched\):" "$second_log"
 require_grep "insufficient tactic-timeout contract" "$second_log"
 require_grep "ATheory built" "$second_log"
 require_grep "remote cache published:" "$second_log"
@@ -282,7 +282,7 @@ TOML
 third_log=$tmpdir/third.log
 (cd "$third" && HOLBUILD_CACHE="$third_cache" HOLBUILD_CACHE_TRACE=1 \
   "$HOLBUILD_BIN" build ATheory) > "$third_log" 2>&1
-require_grep "remote cache hydrated:" "$third_log"
+require_grep "remote cache \(hydrated\|prefetched\):" "$third_log"
 require_grep "remote cache GET .*/cas/[0-9a-f]* wall=[0-9]*ms 200 down=[0-9]*B" "$third_log"
 require_grep "cache hit: ATheory" "$third_log"
 require_grep "ATheory restored from cache" "$third_log"
@@ -443,7 +443,7 @@ discrepancy_restore_log=$tmpdir/discrepancy-restore.log
 (cd "$discrepancy" && HOLBUILD_CACHE="$discrepancy_cache" HOLBUILD_CACHE_TRACE=1 \
   "$HOLBUILD_BIN" --remote-cache "$remote_url" build \
   --allow-cache-timeout-discrepancy --tactic-timeout 30 ATheory) > "$discrepancy_restore_log" 2>&1
-require_grep "remote cache hydrated:" "$discrepancy_restore_log"
+require_grep "remote cache \(hydrated\|prefetched\):" "$discrepancy_restore_log"
 require_grep "ATheory restored from cache" "$discrepancy_restore_log"
 require_grep '^proof_timeout=60.0$' "$discrepancy_metadata"
 
