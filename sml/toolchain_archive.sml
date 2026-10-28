@@ -6,7 +6,7 @@ structure FS = OS.FileSys
 
 exception Error of string
 
-val archive_format = "holbuild-toolchain-archive-v2"
+val archive_format = "holbuild-toolchain-archive-v1"
 val internal_manifest_path = ".holbuild-toolchain-archive-manifest"
 val manifest_marker = "identity-text-v1\n"
 val max_manifest_size = 65536

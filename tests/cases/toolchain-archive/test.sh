@@ -323,7 +323,7 @@ identity = manifest_bytes.split(marker, 1)[1]
 
 if mutation == "wrong-identity":
     manifest_bytes = (
-        b"holbuild-toolchain-archive-v2\n" + marker + identity + b"\nwrong"
+        b"holbuild-toolchain-archive-v1\n" + marker + identity + b"\nwrong"
     )
 
 with tarfile.open(destination, "w", format=tarfile.PAX_FORMAT, pax_headers={}) as output:
