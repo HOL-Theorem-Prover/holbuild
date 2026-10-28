@@ -12,6 +12,20 @@ cat > "$tmpdir/check.sml" <<'SML'
 val _ = OS.FileSys.chDir (valOf (OS.Process.getEnv "HOLBUILD_ROOT"));
 use "sml/holbuild-script.sml";
 
+(* A precreated symlink at the first directory candidate must be skipped. *)
+val root = valOf (OS.Process.getEnv "TMPDIR");
+val planted = OS.Path.concat (root, "holbuild-" ^
+  SysWord.toString (Posix.Process.pidToWord (Posix.ProcEnv.getpid ())) ^ "-1");
+val _ = Posix.FileSys.symlink {old = "/", new = planted};
+val remote_path = HolbuildRemoteCache.temp_path "probe";
+val private_dir = OS.Path.dir remote_path;
+val mode = Posix.FileSys.ST.mode (Posix.FileSys.stat private_dir);
+val _ = if private_dir = root orelse private_dir = planted orelse
+           Posix.FileSys.S.toWord mode <> Posix.FileSys.S.toWord Posix.FileSys.S.irwxu then
+          raise Fail "remote temporary files lack a private 0700 directory"
+        else ();
+val _ = OS.FileSys.remove planted;
+
 (* tmpName creates a file and changes the process umask in Poly/ML.  Name-only
    operations must never call it, even if they clean up the file afterwards. *)
 structure OS =
@@ -50,8 +64,13 @@ val _ = check "filesystem cache" (fn () =>
 val _ = if null (!failures) then () else raise Fail (String.concatWith "\n" (rev (!failures)));
 val _ = print "temporary path tests passed\n";
 SML
-TEMP_PATH_TEST_CACHE="$tmpdir/cache" "${HOLBUILD_POLY:-poly}" --script "$tmpdir/check.sml" > "$tmpdir/check.log" 2>&1 || {
+mkdir -p "$tmpdir/shared"
+TMPDIR="$tmpdir/shared" TEMP_PATH_TEST_CACHE="$tmpdir/cache" "${HOLBUILD_POLY:-poly}" --script "$tmpdir/check.sml" > "$tmpdir/check.log" 2>&1 || {
   cat "$tmpdir/check.log" >&2
   exit 1
 }
 require_grep 'temporary path tests passed' "$tmpdir/check.log"
+if [[ -n "$(ls -A "$tmpdir/shared")" ]]; then
+  echo "private temporary directory was not cleaned up at exit" >&2
+  exit 1
+fi

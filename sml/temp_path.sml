@@ -18,8 +18,32 @@ fun near path extension =
   OS.Path.concat (OS.Path.dir path,
     "." ^ OS.Path.file path ^ "." ^ suffix () ^ extension)
 
+val temporary_dir = ref NONE
+val temporary_mutex = Mutex.mutex ()
+
+fun private_temporary_dir () =
+  (Mutex.lock temporary_mutex;
+   (case !temporary_dir of
+        SOME dir => dir
+      | NONE =>
+          let
+            val root = Option.getOpt (OS.Process.getEnv "TMPDIR", "/tmp")
+            fun create () =
+              let val dir = OS.Path.concat (root, "holbuild-" ^ suffix ())
+              in
+                (Posix.FileSys.mkdir (dir, Posix.FileSys.S.irwxu); dir)
+                handle e as OS.SysErr (_, SOME code) =>
+                  if code = Posix.Error.exist then create () else raise e
+              end
+            val dir = create ()
+            val _ = OS.Process.atExit (fn () => OS.FileSys.rmDir dir handle OS.SysErr _ => ())
+            val _ = temporary_dir := SOME dir
+          in dir end)
+   before Mutex.unlock temporary_mutex)
+  handle e => (Mutex.unlock temporary_mutex; raise e)
+
+(* Shared temporary roots need an atomically reserved, private namespace. *)
 fun temporary label =
-  OS.Path.concat (Option.getOpt (OS.Process.getEnv "TMPDIR", "/tmp"),
-    "holbuild-" ^ label ^ "-" ^ suffix ())
+  OS.Path.concat (private_temporary_dir (), label ^ "-" ^ suffix ())
 
 end
