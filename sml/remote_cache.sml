@@ -111,24 +111,18 @@ fun zstd_compress src dst =
   command_success ("zstd -q -f -T0 -o " ^ quote dst ^ " " ^ quote src)
 
 fun zstd_content_headers size =
-  " -H 'Content-Encoding: zstd' -H " ^ quote ("X-Digest-SizeBytes: " ^ size)
+  ["Content-Encoding: zstd", "X-Digest-SizeBytes: " ^ size]
 
 fun curl_get_with_timeout timeout_seconds {url, dst} =
   let
-    val code = temp_path "code"
     val display_url = redact_userinfo url
-    (* --compressed advertises curl-supported response encodings, including zstd
-       when this curl build has zstd support, and streams decompressed bytes to dst. *)
-    val command = "curl -q -sS -L --compressed --max-time " ^ timeout_seconds ^ curl_config_arg () ^ " -o " ^ quote dst ^
-                  " -w '%{http_code}' " ^ quote url ^ " > " ^ quote code
-    val status = OS.Process.system command
-    val http_code = if path_exists code then read_first_token code else "000"
-    val _ = remove_file code
+    val timeout = valOf (Int.fromString timeout_seconds)
   in
-    if not (OS.Process.isSuccess status) then HolbuildCacheBackend.Corrupt ("curl GET failed: " ^ display_url)
-    else if http_code = "200" then HolbuildCacheBackend.Hit
-    else if http_code = "404" then HolbuildCacheBackend.Miss
-    else HolbuildCacheBackend.Corrupt ("HTTP " ^ http_code ^ " from " ^ display_url)
+    case HolbuildCurl.get {url = url, dst = dst, timeout = timeout} of
+        HolbuildCurl.Failed msg => HolbuildCacheBackend.Corrupt ("curl GET failed: " ^ display_url ^ ": " ^ msg)
+      | HolbuildCurl.Done 200 => HolbuildCacheBackend.Hit
+      | HolbuildCurl.Done 404 => HolbuildCacheBackend.Miss
+      | HolbuildCurl.Done code => HolbuildCacheBackend.Corrupt ("HTTP " ^ Int.toString code ^ " from " ^ display_url)
   end
   handle e => (HolbuildCacheBackend.Corrupt (General.exnMessage e))
 
@@ -139,27 +133,21 @@ fun successful_put_code code =
 
 fun curl_put_with_headers_timeout timeout_seconds headers {url, src} =
   let
-    val code = temp_path "code"
-    val body = temp_path "body"
     val display_url = redact_userinfo url
-    val command = "curl -q -sS -L --max-time " ^ timeout_seconds ^ curl_config_arg () ^ headers ^ " -T " ^ quote src ^
-                  " -o " ^ quote body ^ " -w '%{http_code}' " ^ quote url ^
-                  " > " ^ quote code
-    val status = OS.Process.system command
-    val http_code = if path_exists code then read_first_token code else "000"
-    val _ = remove_file code
-    val _ = remove_file body
+    val timeout = valOf (Int.fromString timeout_seconds)
   in
-    if not (OS.Process.isSuccess status) then HolbuildCacheBackend.Conflict ("curl PUT failed: " ^ display_url)
-    else if successful_put_code http_code then HolbuildCacheBackend.Published
-    else HolbuildCacheBackend.Conflict ("HTTP " ^ http_code ^ " from " ^ display_url)
+    case HolbuildCurl.put {url = url, src = src, headers = headers, timeout = timeout} of
+        HolbuildCurl.Failed msg => HolbuildCacheBackend.Conflict ("curl PUT failed: " ^ display_url ^ ": " ^ msg)
+      | HolbuildCurl.Done code =>
+          if successful_put_code (Int.toString code) then HolbuildCacheBackend.Published
+          else HolbuildCacheBackend.Conflict ("HTTP " ^ Int.toString code ^ " from " ^ display_url)
   end
   handle e => (HolbuildCacheBackend.Conflict (General.exnMessage e))
 
 fun curl_put_with_headers headers request =
   curl_put_with_headers_timeout curl_max_time_seconds headers request
 
-fun curl_put request = curl_put_with_headers "" request
+fun curl_put request = curl_put_with_headers [] request
 
 fun curl_put_zstd_with_timeout timeout_seconds {url, src, size} =
   let val compressed = temp_path "zstd-put"
@@ -170,7 +158,7 @@ fun curl_put_zstd_with_timeout timeout_seconds {url, src, size} =
       before remove_file compressed
     else
       remove_file_before
-        (curl_put_with_headers_timeout timeout_seconds "" {url = url, src = src})
+        (curl_put_with_headers_timeout timeout_seconds [] {url = url, src = src})
         compressed
   end
   handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
