@@ -125,6 +125,53 @@ fun put_action_or_raise (destination : destination) key text =
     | result as HolbuildCacheBackend.Skipped => result
     | HolbuildCacheBackend.Conflict detail => raise Error ("destination cache action conflict: " ^ key ^ " (" ^ detail ^ ")")
 
+(* Prototype: concurrency of local transfers, HOLBUILD_FS_TRANSFER_JOBS (default 8). *)
+val transfer_jobs =
+  case Option.mapPartial Int.fromString (OS.Process.getEnv "HOLBUILD_FS_TRANSFER_JOBS") of
+      SOME n => Int.max (1, n)
+    | NONE => 8
+
+datatype 'a outcome = Value of 'a | Raised of exn
+
+(* Maps f over xs on up to jobs threads, the caller's included; results keep
+   the order of xs, and the first failure in that order is re-raised. *)
+fun parallel_map jobs f xs =
+  let
+    val items = Vector.fromList xs
+    val n = Vector.length items
+    val results = Array.array (n, NONE)
+    val mutex = Mutex.mutex ()
+    val finished = ConditionVar.conditionVar ()
+    val next = ref 0
+    val running = ref 0
+    fun locked g = (Mutex.lock mutex; g () before Mutex.unlock mutex)
+    fun take () = locked (fn () => !next before next := !next + 1)
+    fun work () =
+      let val i = take ()
+      in
+        if i >= n then ()
+        else
+          (Array.update (results, i,
+                         SOME (Value (f (Vector.sub (items, i))) handle e => Raised e));
+           work ())
+      end
+    fun helper () =
+      (work ();
+       locked (fn () => (running := !running - 1; ConditionVar.signal finished)))
+    val helpers = Int.min (jobs, n) - 1
+    val _ = running := Int.max (0, helpers)
+    val _ = List.app (fn _ => ignore (Thread.fork (helper, []))) (List.tabulate (Int.max (0, helpers), fn i => i))
+    val _ = work ()
+    fun wait_helpers () =
+      if !running = 0 then () else (ConditionVar.wait (finished, mutex); wait_helpers ())
+    val _ = (Mutex.lock mutex; wait_helpers (); Mutex.unlock mutex)
+    fun result (SOME (Value v)) = v
+      | result (SOME (Raised e)) = raise e
+      | result NONE = raise Error "parallel_map: missing result"
+  in
+    map result (Array.foldr (op ::) [] results)
+  end
+
 fun copy_entry {source, destination, tmp_dir} key =
   let
     val manifest_text =
@@ -143,6 +190,6 @@ fun copy_entry {source, destination, tmp_dir} key =
      reused_blobs = reused, action = action}
   end
 
-fun copy_entries transfer keys = map (copy_entry transfer) keys
+fun copy_entries transfer keys = parallel_map transfer_jobs (copy_entry transfer) keys
 
 end

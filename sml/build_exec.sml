@@ -2344,24 +2344,23 @@ fun materialize_theory_cache verify_cache allow_timeout_discrepancy project plan
     val trace_path = drop_suffix ".dat" data_path ^ ".tr.gz"
     val extra_output_paths = source_extra_output_paths plan node
     val _ = claim_extra_outputs project node extra_output_paths
-    fun install () =
-      (copy_blob verify_cache root dat_hash data_path;
-       link_or_copy {src = data_path, dst = hfs_remapped_path data_path};
-       copy_blob verify_cache root sig_hash sig_path;
-       link_or_copy {src = sig_path, dst = hfs_remapped_path sig_path};
-       copy_blob verify_cache root sml_hash sml_path;
+    fun blob_and_remap hash path () =
+      (copy_blob verify_cache root hash path;
+       link_or_copy {src = path, dst = hfs_remapped_path path})
+    fun sml_chain () =
+      (copy_blob verify_cache root sml_hash sml_path;
        write_text sml_path (replace_all cache_sml_token data_path (read_text sml_path));
-       link_or_copy {src = sml_path, dst = hfs_remapped_path sml_path};
-       (case trace_hash of
-            NONE => ()
-          | SOME hash =>
-              (copy_blob verify_cache root hash trace_path;
-               link_or_copy {src = trace_path, dst = hfs_remapped_path trace_path}));
-       List.app
-         (fn (declaration, hash) =>
-             let val destination = source_extra_output_path node declaration
-             in ensure_parent destination; copy_blob verify_cache root hash destination end)
-         extra_hashes;
+       link_or_copy {src = sml_path, dst = hfs_remapped_path sml_path})
+    fun extra (declaration, hash) () =
+      let val destination = source_extra_output_path node declaration
+      in ensure_parent destination; copy_blob verify_cache root hash destination end
+    val chains =
+      [blob_and_remap dat_hash data_path, blob_and_remap sig_hash sig_path, sml_chain] @
+      (case trace_hash of NONE => [] | SOME hash => [blob_and_remap hash trace_path]) @
+      map extra extra_hashes
+    fun install () =
+      (ignore (HolbuildCacheTransfer.parallel_map HolbuildCacheTransfer.transfer_jobs
+                 (fn chain => chain ()) chains);
        record_materialized_extra_outputs project node extra_output_paths;
        write_local_theory_manifests plan node {parents = parents, mldeps = mldeps};
        HolbuildCache.touch_action root input_key;
