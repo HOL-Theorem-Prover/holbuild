@@ -154,7 +154,7 @@ mkdir -p "$gate"
 consumer_log=$tmpdir/consumer.log
 (cd "$consumer" && HOLBUILD_CACHE="$consumer_cache" HOLBUILD_CACHE_TRACE=1 \
   HOLBUILD_TEST_PREFETCH_GATE="$gate" \
-  exec "$HOLBUILD_BIN" --remote-cache "$remote_url" -j1 build --skip-checkpoints BrokenTheory AbsentTheory LateTheory) \
+  exec "$HOLBUILD_BIN" --remote-cache "$remote_url" --prefetch-concurrency 1 -j1 build --skip-checkpoints BrokenTheory AbsentTheory LateTheory) \
   > "$consumer_log" 2>&1 &
 consumer_pid=$!
 
@@ -200,7 +200,7 @@ mkdir -p "$gate"
 consumer_log=$tmpdir/up-to-date.log
 (cd "$consumer" && HOLBUILD_CACHE="$consumer_cache" HOLBUILD_CACHE_TRACE=1 \
   HOLBUILD_TEST_PREFETCH_GATE="$gate" \
-  exec "$HOLBUILD_BIN" --remote-cache "$remote_url" -j1 build --skip-checkpoints BrokenTheory AbsentTheory LateTheory) \
+  exec "$HOLBUILD_BIN" --remote-cache "$remote_url" --prefetch-concurrency=1 -j1 build --skip-checkpoints BrokenTheory AbsentTheory LateTheory) \
   > "$consumer_log" 2>&1 &
 consumer_pid=$!
 wait_for_file "$gate/started" || {
@@ -224,3 +224,12 @@ if grep -q "remote cache prefetched: \($broken_key\|$absent_key\)" "$consumer_lo
   cat "$consumer_log" >&2
   exit 1
 fi
+
+for spelling in "--prefetch-concurrency 0" "--prefetch-concurrency=0" "--prefetch-concurrency many"; do
+  # shellcheck disable=SC2086
+  if (cd "$consumer" && "$HOLBUILD_BIN" $spelling build LateTheory) > "$tmpdir/rejected.out" 2>&1; then
+    echo "holbuild accepted $spelling" >&2
+    exit 1
+  fi
+  require_grep '^holbuild: --prefetch-concurrency must be a positive integer$' "$tmpdir/rejected.out"
+done

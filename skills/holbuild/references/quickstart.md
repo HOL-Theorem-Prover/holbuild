@@ -71,6 +71,7 @@ holbuild --json build --retain-debug-artifacts FooTheory  # also retain/report f
 - `--cache-dir PATH` — override the global cache directory for this command
 - `--max-heap MB` — pass Poly/ML max heap to child HOL processes (not `--maxheap`, which holbuild's own Poly/ML runtime consumes)
 - `-jN` / `--jobs N` — parallel workers. Default: `.holconfig.toml [build].jobs` or `max(1, nproc/2)`
+- `--prefetch-concurrency N` — remote cache entries copied ahead of the build at once (default 50, independent of `-j`)
 - `--json` — newline-delimited streaming JSON `message`, `node_started`, `node_finished`, `node_failed`, `build_finished`, and `error` events on stdout (build only; no retained log paths by default; not dry-run/plan/trace/repl-on-failure)
 - normal non-TTY output suppresses unchanged node lines
 - `--quiet` / `--verbosity quiet` — suppress per-node success lines
