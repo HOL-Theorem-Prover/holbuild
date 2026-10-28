@@ -49,17 +49,26 @@ fun wait_lock_fd ltype fd =
 fun blocking_lock_owner fd =
   (case Posix.IO.FLock.pid (Posix.IO.getlk(fd, whole_file_lock Posix.IO.F_WRLCK)) of SOME pid => SOME (pid_text pid) | NONE => NONE)
   handle OS.SysErr _ => NONE
+(* Returns the pid of a process holding any lock on the path. Closing the probe
+   descriptor drops this process's own fcntl locks on the file, so callers must
+   hold none. *)
+fun lock_holder_pid {path} =
+  let val fd = open_lock_file path in blocking_lock_owner fd before close_fd fd end
+  handle OS.SysErr _ => NONE
 fun try_acquire_path {path, obsolete_kind} =
   let val _ = ensure_dir (Path.dir path) val _ = Option.app (fn kind => remove_obsolete_lock_dir kind path) obsolete_kind val fd = open_lock_file path val _ = set_close_on_exec fd
   in if try_lock_fd fd then SOME (FileLock {fd = fd, path = path}) else (close_fd fd; NONE) end
   handle OS.SysErr (msg, _) => raise Error ("could not acquire lock: " ^ path ^ ": " ^ msg)
-(* Blocks until no other process holds an exclusive lock on the path. fcntl
-   locks belong to the process and are dropped when it closes any descriptor
-   for the file, so callers must not acquire the same path twice. *)
-fun acquire_shared_path_wait {path} =
+(* fcntl locks belong to the process and are dropped when it closes any
+   descriptor for the file, so callers must not acquire the same path twice. *)
+fun acquire_path_wait ltype path =
   let val _ = ensure_dir (Path.dir path) val fd = open_lock_file path val _ = set_close_on_exec fd
-  in (wait_lock_fd Posix.IO.F_RDLCK fd; FileLock {fd = fd, path = path}) handle e => (close_fd fd; raise e) end
+  in (wait_lock_fd ltype fd; FileLock {fd = fd, path = path}) handle e => (close_fd fd; raise e) end
   handle OS.SysErr (msg, _) => raise Error ("could not acquire lock: " ^ path ^ ": " ^ msg)
+(* Blocks until no other process holds an exclusive lock on the path. *)
+fun acquire_shared_path_wait {path} = acquire_path_wait Posix.IO.F_RDLCK path
+(* Blocks until no other process holds any lock on the path. *)
+fun acquire_exclusive_path_wait {path} = acquire_path_wait Posix.IO.F_WRLCK path
 fun release (FileLock {fd, ...}) = close_fd fd
 fun path (FileLock {path, ...}) = path
 end

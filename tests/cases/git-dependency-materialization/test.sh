@@ -8,7 +8,18 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
-cleanup() { rm -rf "$tmpdir"; }
+lease_holder=
+lock_waiter=
+cleanup() {
+  # A lease holder still blocked on its FIFO is released so that it and the
+  # run waiting on it exit before their files go.
+  if [[ -n $lease_holder ]]; then
+    release_lease_holder
+    wait $lease_holder $lock_waiter || true
+  fi
+  rm -rf "$tmpdir"
+}
+release_lease_holder() { timeout 10 sh -c ': > "$1"' sh "$tmpdir/blocker.fifo" || true; }
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
@@ -359,3 +370,195 @@ if (cd "$missing" && "$HOLBUILD_BIN" context) > "$tmpdir/missing.log" 2>&1; then
   exit 1
 fi
 require_grep "fetch origin '$missing_rev'" "$tmpdir/missing.log"
+
+# Concurrent materialization: a git shim that stalls every clone keeps racing
+# processes inside the clone-and-publish window together. Two project roots
+# share a fresh cache, so their first runs also race to create the mirror.
+use_case_cache "$tmpdir/race-cache"
+slow_git=$tmpdir/slow-git
+mkdir -p "$slow_git"
+real_git=$(command -v git)
+cat > "$slow_git/git" <<SH
+#!/bin/sh
+for arg in "\$@"; do
+  if [ "\$arg" = clone ]; then sleep 1; break; fi
+done
+exec "$real_git" "\$@"
+SH
+chmod +x "$slow_git/git"
+
+set_dep_rev() {
+  python3 - "$1/holproject.toml" "$2" <<'PY'
+import re, sys
+path, rev = sys.argv[1:]
+text = open(path).read()
+text = re.sub(r'(\[dependencies\.dep\]\ngit = "[^"]*"\nrev = ")[0-9a-f]*(")', r'\g<1>' + rev + r'\g<2>', text)
+open(path, 'w').write(text)
+PY
+}
+
+for race in race1 race2; do
+  mkdir -p "$tmpdir/$race"
+  cat > "$tmpdir/$race/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[project]
+name = "$race"
+
+[dependencies.hol]
+git = "$hol_repo"
+rev = "$hol_rev"
+
+[dependencies.dep]
+git = "$repo"
+rev = "$rev1"
+TOML
+done
+
+race_context() {
+  local label=$1 rev=$2
+  shift 2
+  local -a pids=()
+  local project i=0 failed=0
+  for project in "$@"; do
+    (cd "$project" && PATH="$slow_git:$PATH" "$HOLBUILD_BIN" context) > "$tmpdir/$label-$i.log" 2>&1 &
+    pids+=("$!")
+    i=$((i + 1))
+  done
+  for i in "${!pids[@]}"; do
+    if ! wait "${pids[$i]}"; then
+      echo "concurrent context $label-$i failed" >&2
+      cat "$tmpdir/$label-$i.log" >&2
+      failed=1
+    fi
+  done
+  [ "$failed" = 0 ]
+  for project in "$@"; do
+    [ "$(git -C "$project/.holbuild/src/dep" rev-parse HEAD)" = "$rev" ]
+    require_no_checkout_temp "$project"
+  done
+}
+
+require_no_checkout_temp() {
+  if compgen -G "$1/.holbuild/src/.tmp-*" > /dev/null; then
+    echo "checkout temp dir left in $1/.holbuild/src" >&2
+    exit 1
+  fi
+}
+
+# A mirror clone killed mid-way leaves a temp dir that the next clone removes.
+mkdir -p "$HOLBUILD_CACHE/git/remotes"
+mkdir "$HOLBUILD_CACHE/git/remotes/$(printf %s "$repo" | sha1sum | cut -d' ' -f1).git.tmp-999999999"
+race_context cold "$rev1" "$tmpdir/race1" "$tmpdir/race1" "$tmpdir/race2" "$tmpdir/race2"
+if compgen -G "$HOLBUILD_CACHE/git/remotes/*.tmp-*" > /dev/null; then
+  echo "mirror temp dir left in $HOLBUILD_CACHE/git/remotes" >&2
+  exit 1
+fi
+
+rm -rf "$tmpdir/race1/.holbuild/src" "$tmpdir/race2/.holbuild/src"
+race_context warm-mirror "$rev1" "$tmpdir/race1" "$tmpdir/race1" "$tmpdir/race2" "$tmpdir/race2"
+
+# rev3 is not yet in the mirror, so both roots also race to fetch it. A
+# checkout clone killed mid-way leaves a temp dir that the next publish removes.
+echo three > "$repo/value.txt"
+git -C "$repo" commit -q -am three
+rev3=$(git -C "$repo" rev-parse HEAD)
+mkdir "$tmpdir/race1/.holbuild/src/.tmp-dep-999999999"
+set_dep_rev "$tmpdir/race1" "$rev3"
+set_dep_rev "$tmpdir/race2" "$rev3"
+race_context repin "$rev3" "$tmpdir/race1" "$tmpdir/race1" "$tmpdir/race2" "$tmpdir/race2"
+
+# A holbuild process that has materialized dep keeps its lease while it runs:
+# another process at the same rev still proceeds, but none may replace the tree
+# until the holder exits. The holder is kept alive by a second git dependency
+# whose mirror clone blocks on a FIFO.
+blocker_repo=$tmpdir/blocker-repo
+mkdir -p "$blocker_repo"
+git -C "$blocker_repo" init -q
+git_identity "$blocker_repo"
+cat > "$blocker_repo/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[dependencies.hol]
+git = "$hol_repo"
+rev = "$hol_rev"
+
+[project]
+name = "blocker"
+TOML
+git -C "$blocker_repo" add .
+git -C "$blocker_repo" commit -q -m blocker
+blocker_rev=$(git -C "$blocker_repo" rev-parse HEAD)
+cp "$tmpdir/race1/holproject.toml" "$tmpdir/race1.toml"
+cat >> "$tmpdir/race1/holproject.toml" <<TOML
+
+[dependencies.blocker]
+git = "$blocker_repo"
+rev = "$blocker_rev"
+TOML
+
+blocking_git=$tmpdir/blocking-git
+mkdir -p "$blocking_git"
+mkfifo "$tmpdir/blocker.fifo"
+cat > "$blocking_git/git" <<SH
+#!/bin/sh
+for arg in "\$@"; do
+  if [ "\$arg" = "$blocker_repo" ]; then
+    : > "$tmpdir/blocker.ready"
+    timeout 120 cat "$tmpdir/blocker.fifo" > /dev/null
+    break
+  fi
+done
+exec "$real_git" "\$@"
+SH
+chmod +x "$blocking_git/git"
+
+(cd "$tmpdir/race1" && PATH="$blocking_git:$PATH" "$HOLBUILD_BIN" context) > "$tmpdir/holder.log" 2>&1 &
+lease_holder=$!
+for _ in {1..600}; do
+  [[ -e "$tmpdir/blocker.ready" ]] && break
+  sleep 0.05
+done
+require_file "$tmpdir/blocker.ready"
+# The holder has read its manifest; later runs see dep alone.
+cp "$tmpdir/race1.toml" "$tmpdir/race1/holproject.toml"
+(cd "$tmpdir/race1" && "$HOLBUILD_BIN" context) > "$tmpdir/leased-same.log"
+set_dep_rev "$tmpdir/race1" "$rev1"
+if (cd "$tmpdir/race1" && "$HOLBUILD_BIN" context) > "$tmpdir/leased-replace.log" 2>&1; then
+  echo "checkout replaced while another holbuild process was using it" >&2
+  exit 1
+fi
+require_grep "another holbuild process is using it (pid [0-9][0-9]*)" "$tmpdir/leased-replace.log"
+[ "$(git -C "$tmpdir/race1/.holbuild/src/dep" rev-parse HEAD)" = "$rev3" ]
+require_no_checkout_temp "$tmpdir/race1"
+# The holder is blocked inside the blocker mirror clone, so it also holds that
+# mirror's lock; a run that needs the mirror names the pid it waits for.
+cat >> "$tmpdir/race2/holproject.toml" <<TOML
+
+[dependencies.blocker]
+git = "$blocker_repo"
+rev = "$blocker_rev"
+TOML
+(cd "$tmpdir/race2" && "$HOLBUILD_BIN" context) > "$tmpdir/waiter.log" 2>&1 &
+lock_waiter=$!
+for _ in {1..600}; do
+  grep -q "waiting for another holbuild process" "$tmpdir/waiter.log" && break
+  sleep 0.05
+done
+require_grep "waiting for another holbuild process (pid [0-9][0-9]*) to release .*[.]git[.]lock" "$tmpdir/waiter.log"
+release_lease_holder
+holder=$lease_holder waiter=$lock_waiter
+lease_holder= lock_waiter=
+for pid in "$holder" "$waiter"; do
+  if ! wait "$pid"; then
+    cat "$tmpdir/holder.log" "$tmpdir/waiter.log" >&2
+    exit 1
+  fi
+done
+[ "$(git -C "$tmpdir/race2/.holbuild/src/blocker" rev-parse HEAD)" = "$blocker_rev" ]
+(cd "$tmpdir/race1" && "$HOLBUILD_BIN" context) > "$tmpdir/released-replace.log"
+[ "$(git -C "$tmpdir/race1/.holbuild/src/dep" rev-parse HEAD)" = "$rev1" ]
