@@ -64,13 +64,15 @@ val _ = assert "materialized blob hash mismatch" (HolbuildHash.file_sha1 dst = h
 val _ = print "filesystem cache backend tests passed\n";
 SML
 
-# A cp that logs its arguments one per line, to check what the fetch passes
-# to cp.
+# A cp that logs its arguments one per line, and the program that started it,
+# to check that the fetch runs cp directly with an argv rather than through a
+# shell.
 real_cp=$(command -v cp)
 mkdir -p "$tmpdir/bin"
 cat > "$tmpdir/bin/cp" <<CP
 #!/bin/sh
 printf '%s\n' "\$@" >> "$tmpdir/cp.log"
+ps -o comm= -p "\$PPID" >> "$tmpdir/cp-parent.log"
 exec "$real_cp" "\$@"
 CP
 chmod +x "$tmpdir/bin/cp"
@@ -89,4 +91,9 @@ if "$real_cp" --version >/dev/null 2>&1; then
   require_grep '^--reflink=auto$' "$tmpdir/cp.log"
   require_grep "^$tmpdir/cache/blobs/" "$tmpdir/cp.log"
   require_grep "^$tmpdir/\\.dst\\..*\\.tmp$" "$tmpdir/cp.log"
+  if grep -q 'sh$' "$tmpdir/cp-parent.log"; then
+    echo "cp was started by a shell:" >&2
+    cat "$tmpdir/cp-parent.log" >&2
+    exit 1
+  fi
 fi
