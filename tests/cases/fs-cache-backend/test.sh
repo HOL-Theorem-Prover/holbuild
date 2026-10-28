@@ -64,9 +64,29 @@ val _ = assert "materialized blob hash mismatch" (HolbuildHash.file_sha1 dst = h
 val _ = print "filesystem cache backend tests passed\n";
 SML
 
-FS_CACHE_BACKEND_TEST_TMP="$tmpdir" "${HOLBUILD_POLY:-poly}" < "$tmpdir/fs-cache-backend-test.sml" > "$tmpdir/fs-cache-backend-test.log" 2>&1 || {
+# A cp that logs its arguments one per line, to check that the copy runs cp
+# with an argv rather than through a shell.
+real_cp=$(command -v cp)
+mkdir -p "$tmpdir/bin"
+cat > "$tmpdir/bin/cp" <<CP
+#!/bin/sh
+printf '%s\n' "\$@" >> "$tmpdir/cp.log"
+exec "$real_cp" "\$@"
+CP
+chmod +x "$tmpdir/bin/cp"
+
+PATH="$tmpdir/bin:$PATH" FS_CACHE_BACKEND_TEST_TMP="$tmpdir" "${HOLBUILD_POLY:-poly}" < "$tmpdir/fs-cache-backend-test.sml" > "$tmpdir/fs-cache-backend-test.log" 2>&1 || {
   cat "$tmpdir/fs-cache-backend-test.log" >&2
   exit 1
 }
 
 grep -q "filesystem cache backend tests passed" "$tmpdir/fs-cache-backend-test.log"
+
+# GNU cp copies the blob to a temporary file next to dst with --reflink=auto;
+# other cp implementations only answer the --version probe and the copy falls
+# back to an in-process one.
+if "$real_cp" --version >/dev/null 2>&1; then
+  require_grep '^--reflink=auto$' "$tmpdir/cp.log"
+  require_grep "^$tmpdir/cache/blobs/" "$tmpdir/cp.log"
+  require_grep "^$tmpdir/\\.dst\\..*\\.tmp$" "$tmpdir/cp.log"
+fi

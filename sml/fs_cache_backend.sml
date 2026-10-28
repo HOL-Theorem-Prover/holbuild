@@ -81,8 +81,10 @@ fun copy_binary src dst =
 
 (* GNU cp provides copy-on-write materialization; BSD cp does not understand
    its options and otherwise writes an error for every cache hit. *)
-val reflink_cp_available =
-  OS.Process.isSuccess (OS.Process.system "cp --version >/dev/null 2>&1")
+fun run_cp args stderr =
+  HolbuildSpawn.succeeded (HolbuildSpawn.run {program = "cp", args = args, stderr = stderr})
+
+val reflink_cp_available = run_cp ["--version"] HolbuildSpawn.Discard
 
 fun link_or_copy {src, dst} =
   let
@@ -90,10 +92,9 @@ fun link_or_copy {src, dst} =
     val tmp = temp_near dst
     fun cleanup () = remove_file tmp
     fun fallback () = (cleanup (); copy_binary src dst)
-    val command =
-      "cp --reflink=auto -- " ^ HolbuildHash.quote src ^ " " ^ HolbuildHash.quote tmp
   in
-    if reflink_cp_available andalso OS.Process.isSuccess (OS.Process.system command) then
+    if reflink_cp_available andalso
+       run_cp ["--reflink=auto", "--", src, tmp] HolbuildSpawn.Inherit then
       (rename_replace {old = tmp, new = dst}
        handle e => (cleanup (); raise e))
     else fallback ()
