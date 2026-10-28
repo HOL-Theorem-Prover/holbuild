@@ -594,6 +594,8 @@ holbuild build --skip-checkpoints MyTheory
   explicit termination proof. If a theorem and terminating definition have the
   same name, the theorem takes precedence.
 - `--tactic-timeout SECONDS` changes the per-step timeout; `0` disables it.
+  A step that times out fails the build even inside `TRY` or an `ORELSE`
+  alternative.
 - `--trace-steps` records proof-step traces in child logs.
 - `--repl-on-failure` starts a HOL REPL from the newest useful checkpoint after a
   theory failure. It serialises the build and is not supported with `--json`.
