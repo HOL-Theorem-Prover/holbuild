@@ -692,9 +692,10 @@ corruption but do not authenticate the cache publisher.
 holbuild talks to the remote cache through libcurl (7.66 or later, with an
 asynchronous DNS resolver), loaded at run time: `libcurl.so.4` on Linux, the
 system `/usr/lib/libcurl.4.dylib` on macOS. If it can't be loaded or lacks
-those, holbuild warns once and builds without the remote cache. As with the
-curl command, `CURL_CA_BUNDLE`, `SSL_CERT_FILE` and `SSL_CERT_DIR` select the
-CA certificates that HTTPS connections trust.
+those, holbuild says why once and runs the `curl` command for each request
+instead, as it did before it used libcurl. As with the curl command,
+`CURL_CA_BUNDLE`, `SSL_CERT_FILE` and `SSL_CERT_DIR` select the CA certificates
+that HTTPS connections trust.
 
 For private caches, put credentials in local/CI configuration, not in
 the project manifest. CLI `--remote-cache` overrides `HOLBUILD_REMOTE_CACHE_URL`,
@@ -712,10 +713,11 @@ HOLBUILD_REMOTE_CACHE_CURL_CONFIG="$RUNNER_TEMP/holbuild-remote-cache.curl" \
 ```
 
 `HOLBUILD_REMOTE_CACHE_CURL_CONFIG` overrides `.holconfig.toml`'s
-`[remote_cache].curl_config`. holbuild reads only the `user` option from this
-file (`user = "name:password"`, `user name:password` or `--user name:password`;
-`#` starts a comment line). Any other option is reported by name, and that
-build runs without the remote cache rather than ignoring it.
+`[remote_cache].curl_config`. Through libcurl, holbuild reads only the `user`
+option from this file (`user = "name:password"`, `user name:password` or
+`--user name:password`; `#` starts a comment line). A file with any other
+option (`proxy`, `cacert`, `netrc`, ...) makes holbuild say so once and use the
+`curl` command, which reads the whole file.
 
 The URL form `https://user:password@cache.example.org` also works, but can
 expose credentials via process listings or shell history; prefer the config

@@ -120,7 +120,7 @@ fun curl_config_user text =
       in
         if Substring.isEmpty s orelse Substring.isPrefix "#" s then user
         else if bare = "user" then SOME (value rest)
-        else raise Error ("unsupported option " ^ name ^ " (holbuild reads only user)")
+        else raise Error ("unsupported option " ^ name ^ " (holbuild's libcurl client reads only user)")
       end
   in
     List.foldl option NONE (String.fields (fn c => c = #"\n") text)

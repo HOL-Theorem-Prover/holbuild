@@ -124,7 +124,7 @@ val _ = assert "an unsupported option is reported by name"
 
 val url = valOf (OS.Process.getEnv "HTTP_TEST_URL")
 val dir = valOf (OS.Process.getEnv "HTTP_TEST_DIR")
-val _ = HolbuildHttp.setup {user = SOME "name:secret"}
+val _ = assert "libcurl is set up with the configured user" (HolbuildRemoteCacheConfig.uses_libcurl ())
 
 fun read_file path =
   let val input = TextIO.openIn path
@@ -245,7 +245,8 @@ val _ = wait_slow ()
 val _ = print "http tests passed\n"
 SML
 
-"${HOLBUILD_POLY:-poly}" < "$tmpdir/http-test.sml" > "$tmpdir/http-test.log" 2>&1 || {
+printf 'user = "name:secret"\n' > "$tmpdir/user.curl"
+HOLBUILD_REMOTE_CACHE_CURL_CONFIG=$tmpdir/user.curl "${HOLBUILD_POLY:-poly}" < "$tmpdir/http-test.sml" > "$tmpdir/http-test.log" 2>&1 || {
   cat "$tmpdir/http-test.log" >&2
   exit 1
 }
@@ -253,9 +254,13 @@ grep -q "http tests passed" "$tmpdir/http-test.log" || {
   cat "$tmpdir/http-test.log" >&2
   exit 1
 }
+kill "$server_pid"
+wait "$server_pid" 2>/dev/null || true
+server_pid=
 
-# When the HTTP client can't be set up, a build warns once and runs without
-# the remote cache.
+# When libcurl can't be used, a build says why once and makes its requests
+# with the curl command: a first build publishes to the remote cache and a
+# second, with an empty local cache, restores from it.
 project=$tmpdir/project
 mkdir -p "$project/src"
 cat > "$project/holproject.toml" <<TOML
@@ -276,33 +281,40 @@ Proof
   simp[]
 QED
 SML
-printf 'user = "name:secret"\nproxy = "http://proxy.invalid"\n' > "$tmpdir/proxy.curl"
+printf 'connect-timeout = 10\n' > "$tmpdir/connect-timeout.curl"
 
-build_without_remote() {
+build_with_curl_command() {
   local name=$1
   local expected=$2
   shift 2
-  local cache=$tmpdir/cache-$name
-  local log=$tmpdir/$name.log
-  link_hol_toolchain_cache "$cache"
-  rm -rf "$project/.holbuild"
-  (cd "$project" && env "$@" HOLBUILD_CACHE="$cache" \
-     "$HOLBUILD_BIN" --remote-cache "$HTTP_TEST_URL" build ATheory) > "$log" 2>&1 || {
-    cat "$log" >&2
-    exit 1
-  }
-  require_grep "ATheory built" "$log"
-  require_grep "remote cache disabled: $expected" "$log"
-  if [[ $(grep -c "remote cache disabled" "$log") -ne 1 ]]; then
-    echo "expected one remote cache warning in $log" >&2
-    cat "$log" >&2
-    exit 1
-  fi
+  local log
+  start_remote_cache_server "$tmpdir/remote-$name" "$tmpdir/server-$name"
+  for run in publish restore; do
+    log=$tmpdir/$name-$run.log
+    link_hol_toolchain_cache "$tmpdir/cache-$name-$run"
+    rm -rf "$project/.holbuild"
+    (cd "$project" && env -u HOLBUILD_REMOTE_CACHE_CURL_CONFIG "$@" HOLBUILD_CACHE="$tmpdir/cache-$name-$run" HOLBUILD_CACHE_TRACE=1 \
+       "$HOLBUILD_BIN" --remote-cache "$remote_url" build ATheory) > "$log" 2>&1 || {
+      cat "$log" >&2
+      exit 1
+    }
+    require_grep "remote cache: using the curl command, since $expected" "$log"
+    if [[ $(grep -c "using the curl command" "$log") -ne 1 ]]; then
+      echo "expected one curl command note in $log" >&2
+      cat "$log" >&2
+      exit 1
+    fi
+  done
+  require_grep "remote cache published:" "$tmpdir/$name-publish.log"
+  require_grep "remote cache \(hydrated\|prefetched\):" "$tmpdir/$name-restore.log"
+  kill "$server_pid"
+  wait "$server_pid" 2>/dev/null || true
+  server_pid=
 }
 
-build_without_remote unloadable "could not load libcurl" \
+build_with_curl_command unloadable "libcurl could not be loaded" \
   HOLBUILD_TEST_LIBCURL=libholbuild-test-no-such-curl.so
-build_without_remote no-asynchdns "libcurl .* has no asynchronous DNS resolver" \
+build_with_curl_command no-asynchdns "libcurl .* has no asynchronous DNS resolver" \
   HOLBUILD_TEST_LIBCURL_NO_ASYNCHDNS=1
-build_without_remote unsupported-config "curl config .*: unsupported option proxy" \
-  HOLBUILD_REMOTE_CACHE_CURL_CONFIG="$tmpdir/proxy.curl"
+build_with_curl_command other-config-option "curl config .*: unsupported option connect-timeout" \
+  HOLBUILD_REMOTE_CACHE_CURL_CONFIG="$tmpdir/connect-timeout.curl"

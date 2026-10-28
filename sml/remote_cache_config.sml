@@ -49,36 +49,35 @@ fun curl_config_user () =
         handle IO.Io {cause, ...} =>
           raise Error ("could not read curl config " ^ path ^ ": " ^ General.exnMessage cause)
 
-(* Whether the HTTP client is usable, once it has been set up. *)
-val http_ready : bool option ref = ref NONE
+(* Whether requests go through libcurl, once that has been decided.  When
+   libcurl can't be used, they go through the curl command, which reads the
+   whole curl config file itself. *)
+val libcurl_ready : bool option ref = ref NONE
 
-fun disable_remote reason =
-  (TextIO.output (TextIO.stdErr, "holbuild: warning: remote cache disabled: " ^ reason ^ "\n");
+fun fall_back reason =
+  (TextIO.output (TextIO.stdErr, "holbuild: remote cache: using the curl command, since " ^ reason ^ "\n");
    false)
 
-fun setup_http () =
+fun setup_libcurl () =
   (HolbuildHttp.setup {user = curl_config_user ()}; true)
-  handle Error message => disable_remote message
-       | HolbuildHttp.Error message => disable_remote message
-       | Foreign.Foreign message => disable_remote ("could not load libcurl: " ^ message)
+  handle Error message => fall_back message
+       | HolbuildHttp.Error message => fall_back message
+       | Foreign.Foreign message => fall_back ("libcurl could not be loaded: " ^ message)
 
-(* The remote cache URL, or NONE when none is configured or the HTTP client
-   can't be set up.  The first call with a URL configured sets up the client.
-   Commands make that call on the main thread before they start other
-   threads (toolchain restore, then the build's prefetch and workers), as
-   HolbuildHttp.setup requires. *)
+(* Decides the HTTP client on the first call.  HolbuildHttp.setup must run on
+   the main thread before any other thread starts; url () makes this first
+   call, and commands look up the URL on the main thread before they start
+   other threads (toolchain restore, then the build's prefetch and workers). *)
+fun uses_libcurl () =
+  case !libcurl_ready of
+      SOME ready => ready
+    | NONE => let val ready = setup_libcurl () in libcurl_ready := SOME ready; ready end
+
+(* The remote cache URL, or NONE when none is configured. *)
 fun url () =
   case configured_url () of
       NONE => NONE
-    | SOME url =>
-        let
-          val ready =
-            case !http_ready of
-                SOME ready => ready
-              | NONE => let val ready = setup_http () in http_ready := SOME ready; ready end
-        in
-          if ready then SOME url else NONE
-        end
+    | SOME url => (ignore (uses_libcurl ()); SOME url)
 
 fun enabled () = Option.isSome (url ())
 
