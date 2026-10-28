@@ -101,21 +101,22 @@ fun poly_executable_path () =
   in FS.fullPath path end
 
 (* poly -v prints "Poly/ML 5.9.2 Release    RTS version: Arm64-5.9.2 (Git
-   version v5.9.2)".  The RTS token names the release, which Poly/ML checks
-   when it loads an exported heap, and the architecture variant (X86_64,
-   compact X86_64_32, Portable), which it does not.  An unrecognised line is
-   kept whole. *)
-fun poly_rts version =
-  let val (_, rest) = Substring.position "RTS version:" (Substring.full version)
+   version v5.9.2)".  release is the text before "RTS version:", without the
+   architecture, which does not reach theory output.  rts is the RTS token: the
+   release, which Poly/ML checks when it loads an exported heap, and the
+   architecture variant (X86_64, compact X86_64_32, Portable), which it does
+   not.  An unrecognised line is kept whole. *)
+fun poly_version_parts version =
+  let val (head, rest) = Substring.position "RTS version:" (Substring.full version)
+      val rts =
+        if Substring.isEmpty rest then version
+        else
+          case String.tokens Char.isSpace
+                 (Substring.string (Substring.triml (size "RTS version:") rest)) of
+              token :: _ => token
+            | [] => version
   in
-    if Substring.isEmpty rest then version
-    else
-      let val after = Substring.triml (size "RTS version:") rest
-      in
-        case String.tokens Char.isSpace (Substring.string after) of
-            token :: _ => token
-          | [] => version
-      end
+    {release = trim (Substring.string head), rts = rts}
   end
 
 (* The local toolchain key names what a built toolchain depends on:
@@ -135,7 +136,7 @@ fun key_material {git, rev, kernel_variant} =
   in
     String.concatWith "\n"
       ([format_version, "rev=" ^ rev,
-        "poly_rts=" ^ poly_rts (poly_version ()),
+        "poly_rts=" ^ #rts (poly_version_parts (poly_version ())),
         "poly_path=" ^ poly_executable_path ()] @
        HolbuildHolToolchainConfig.key_material_fields (toolchain_config kernel_variant))
   end
@@ -295,11 +296,6 @@ fun hol_source_identity holdir rels =
   end
   handle OS.SysErr (msg, _) => die ("could not hash HOL sources in " ^ holdir ^ ": " ^ msg)
 
-(* poly -v prints "Poly/ML 5.9.2 Release    RTS version: Arm64-5.9.2 ...";
-   the RTS part names the architecture, which does not reach theory output. *)
-fun poly_release version =
-  trim (Substring.string (#1 (Substring.position "RTS version:" (Substring.full version))))
-
 fun theory_toolchain_text kernel_variant hol_source =
   let val config = toolchain_config kernel_variant
       val material =
@@ -308,7 +304,7 @@ fun theory_toolchain_text kernel_variant hol_source =
            "hol_source=" ^ hol_source,
            "build_args=" ^ HolbuildHolToolchainConfig.build_args_text config,
            "kernel_variant=" ^ HolbuildHolToolchainConfig.kernel_variant_name kernel_variant,
-           "poly=" ^ poly_release (poly_version ())] ^ "\n"
+           "poly=" ^ #release (poly_version_parts (poly_version ()))] ^ "\n"
   in
     material ^ "key=" ^ HolbuildHash.string_sha1 material ^ "\n"
   end
