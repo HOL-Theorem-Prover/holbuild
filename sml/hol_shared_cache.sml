@@ -569,12 +569,13 @@ fun heap_loads k =
     OS.Process.isSuccess (OS.Process.system command)
   end
 
-(* What a toolchain archive holds: the HOL build and its source manifest. *)
+(* What a toolchain archive must hold: a working HOL build.  The source
+   manifest is not required, since another holbuild version may have written
+   it in a different format; finish_entry regenerates it. *)
 fun complete_toolchain_contents k =
   let val holdir = holdir_for_key k
   in
     built holdir andalso
-    hol_source_manifest_built k andalso
     heap_loads k andalso
     clean k holdir
   end
@@ -592,6 +593,7 @@ fun warn_publish message =
 fun archive_error_message error =
   case error of
       HolbuildToolchainArchive.Error message => message
+    | HolbuildToolchainArchive.Rejected message => message
     | HolbuildRemoteCache.Error message => message
     | Error message => message
     | _ => General.exnMessage error
@@ -605,9 +607,10 @@ fun cleanup_restore_state k =
     else ()
   end
 
-(* Rejected: the remote had an archive for this identity, but it could not be
-   fetched, extracted or validated; a local build then replaces it. *)
-datatype restore_outcome = Restored | NotPublished | Rejected
+(* Rejected: the remote's archive for this identity is bad (see
+   HolbuildToolchainArchive.Rejected); a local build then replaces it.
+   NotRestored covers no remote, no archive, and failing to fetch one. *)
+datatype restore_outcome = Restored | NotRestored | Rejected
 
 fun restore_entry k =
   let
@@ -623,19 +626,23 @@ fun restore_entry k =
            wait_test_gate "HOLBUILD_TEST_TOOLCHAIN_RENAMED_GATE";
            if complete_toolchain_contents k then
              (write_file (ok_for_key k) "ok\n"; Restored)
-           else die "restored HOL toolchain failed final validation")
-        else NotPublished
+           else
+             raise HolbuildToolchainArchive.Rejected
+                     "restored HOL toolchain failed final validation")
+        else NotRestored
       end
   in
     cleanup_restore_state k;
     case HolbuildRemoteCacheConfig.url () of
-        NONE => NotPublished
+        NONE => NotRestored
       | SOME url =>
           (restore url
            handle error =>
              (cleanup_restore_state k;
               warn_restore (archive_error_message error);
-              Rejected))
+              case error of
+                  HolbuildToolchainArchive.Rejected _ => Rejected
+                | _ => NotRestored))
   end
 
 fun publish_entry {replace} k =
@@ -687,11 +694,12 @@ fun finish_entry req k =
       if theory_toolchain_built k orelse generate_legacy_theory_toolchain req k then publication
       else
         (ignore (build_entry req k); Publish {replace = false})
-    val _ = ignore (build_analyser k)
+    (* The analyser is not archived, so its build cannot stop publication. *)
     val _ =
       case publication of
           NoPublication => ()
         | Publish replace => publish_entry replace k
+    val _ = ignore (build_analyser k)
   in
     holdir_for_key k
   end

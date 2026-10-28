@@ -432,6 +432,20 @@ replaced_log=$tmpdir/replaced-restore.log
 (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$replaced_log" 2>&1
 [[ $(wc -l < "$build_count") -eq $((builds_before_replace + 1)) ]]
 
+# A blob that does not download intact is a failed fetch, not a bad archive,
+# so the local build leaves the action alone.
+python3 "$tmpdir/mutate_archive.py" \
+  "$original_archive" "$tmpdir/mutated-unfetched.tar" "${action_files[0]}" "$remote_root/cas" digest
+cp "${action_files[0]}" "$tmpdir/unfetched-action"
+rm -rf "$cache/hol-toolchains"
+unfetched_log=$tmpdir/unfetched.log
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$unfetched_log" 2>&1
+require_grep 'SHA256 mismatch' "$unfetched_log"
+[[ $(wc -l < "$build_count") -eq $((builds_before_replace + 2)) ]]
+if ! cmp -s "${action_files[0]}" "$tmpdir/unfetched-action"; then
+  record_regression_failure "toolchain archive was replaced after a failed download"
+fi
+
 cp "$original_action" "${action_files[0]}"
 
 # A marker-bearing local entry without Holmake must never be accepted as built.

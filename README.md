@@ -682,8 +682,8 @@ architecture variant, as `poly -v` reports them) and resolved `poly`
 executable path match. The source-analysis helper is not archived; holbuild
 rebuilds it against the restored toolchain. After a remote miss, a successful
 local toolchain build is published automatically unless another builder
-published it meanwhile; an archive that failed to restore is replaced by the
-local build. Local and remote hits are not re-uploaded, and publication
+published it meanwhile; an archive that is missing its blob or fails to extract
+or validate is replaced by the local build (a failed download is not). Local and remote hits are not re-uploaded, and publication
 failure is only a warning.
 
 The remote endpoint stores content blobs under `/cas/<sha256>` and holbuild
@@ -832,8 +832,8 @@ run `make`. The pinned HOL revision is recorded in `vendor/hol/REV`.
 
 Useful caches:
 
-- `$HOLBUILD_CACHE/hol-toolchains`, keyed by the project HOL revision and Poly/ML
-  version.
+- `$HOLBUILD_CACHE/hol-toolchains`, keyed by the project HOL revision, HOL build
+  arguments, Poly/ML runtime and resolved `poly` path.
 
 ## Running holbuild's own tests
 
