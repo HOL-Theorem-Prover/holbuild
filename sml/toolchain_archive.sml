@@ -5,6 +5,10 @@ structure Path = OS.Path
 structure FS = OS.FileSys
 
 exception Error of string
+(* The remote's archive is itself bad: its blob is missing, or it does not
+   extract to a valid entry for this identity.  Failing to fetch it is not a
+   rejection. *)
+exception Rejected of string
 
 val archive_format = "holbuild-toolchain-archive-v1"
 val internal_manifest_path = ".holbuild-toolchain-archive-manifest"
@@ -12,6 +16,7 @@ val manifest_marker = "identity-text-v1\n"
 val max_manifest_size = 65536
 
 fun die msg = raise Error msg
+fun reject msg = raise Rejected msg
 fun path_exists path = FS.access(path, []) handle OS.SysErr _ => false
 fun is_dir path = FS.isDir path handle OS.SysErr _ => false
 
@@ -102,7 +107,7 @@ fun create_archive {entry_dir, identity, archive_path} =
           sources =
             [(manifest_dir, [internal_manifest_path]),
              (entry_dir, ["."])],
-          excludes = ["./build.ok", "./last-used", "*/.hol/locks", "*/.hol/locks/*"],
+          excludes = ["./build.ok", "./last-used", "./analysers", "*/.hol/locks", "*/.hol/locks/*"],
           hard_dereference = true});
      remove_tree manifest_dir)
     handle e => (cleanup (); raise e)
@@ -114,8 +119,8 @@ fun parse_remote_record text =
   case HolbuildCacheTransfer.unique_blobs text of
       [sha1] =>
         if HolbuildHash.valid_sha1 sha1 then sha1
-        else die "remote toolchain action has invalid SHA1"
-    | _ => die "remote toolchain action must reference exactly one blob"
+        else reject "remote toolchain action has invalid SHA1"
+    | _ => reject "remote toolchain action must reference exactly one blob"
 
 fun extract_archive {archive_path, staging_dir} =
   tar_operation
@@ -130,10 +135,12 @@ fun install_archive {archive_path, identity, final_dir} =
   in
     (if path_exists final_dir then die ("toolchain install path already exists: " ^ final_dir) else ();
      FS.mkDir staging_dir;
-     extract_archive {archive_path = archive_path, staging_dir = staging_dir};
-     if path_exists extracted_marker then die "archive contains build.ok" else ();
-     if path_exists (Path.concat(staging_dir, "last-used")) then die "archive contains last-used" else ();
-     validate_extracted_manifest {staging_dir = staging_dir, identity = identity};
+     (extract_archive {archive_path = archive_path, staging_dir = staging_dir};
+      if path_exists extracted_marker then die "archive contains build.ok" else ();
+      if path_exists (Path.concat(staging_dir, "last-used")) then die "archive contains last-used" else ();
+      if path_exists (Path.concat(staging_dir, "analysers")) then die "archive contains analysers" else ();
+      validate_extracted_manifest {staging_dir = staging_dir, identity = identity})
+     handle Error message => reject message;
      FS.rename {old = staging_dir, new = final_dir})
     handle e => (cleanup (); raise e)
   end
@@ -150,8 +157,8 @@ fun restore {remote, identity, final_dir} =
           fun fetch () =
             case HolbuildRemoteCache.fetch_toolchain_blob remote {hash = sha1, dst = archive_path} of
                 HolbuildCacheBackend.Hit => ()
-              | HolbuildCacheBackend.Miss => die "remote toolchain archive blob is missing"
-              | HolbuildCacheBackend.Corrupt detail => die ("remote toolchain archive blob is corrupt: " ^ detail)
+              | HolbuildCacheBackend.Miss => reject "remote toolchain archive blob is missing"
+              | HolbuildCacheBackend.Corrupt detail => die ("could not fetch remote toolchain archive blob: " ^ detail)
         in
           ((FS.mkDir scratch_dir;
             fetch ();
@@ -161,7 +168,10 @@ fun restore {remote, identity, final_dir} =
            handle e => (cleanup (); raise e))
         end
 
-fun publish {remote, identity, entry_dir} =
+(* Another builder may have published since this one's restore missed, so
+   look for the action before creating and uploading the archive.  replace
+   overwrites an action whose archive this builder rejected (see Rejected). *)
+fun publish {remote, identity, entry_dir, replace} =
   let
     val archive_path = temp_path "publish"
     fun cleanup () = remove_file archive_path
@@ -171,21 +181,25 @@ fun publish {remote, identity, entry_dir} =
         | result as HolbuildCacheBackend.AlreadyPresent => result
         | HolbuildCacheBackend.Skipped => die "remote cache skipped toolchain archive publication"
         | HolbuildCacheBackend.Conflict detail => die ("remote cache rejected toolchain archive: " ^ detail)
+    fun put_action request =
+      if replace then HolbuildRemoteCache.replace_action_unconditionally remote request
+      else HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsentOrSame request
   in
-    ((create_archive {entry_dir = entry_dir, identity = identity, archive_path = archive_path};
-      let
-        val sha1 = HolbuildHash.file_sha1 archive_path
-        val _ = upload sha1
-        val action = remote_record sha1
-      in
-        case HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsentOrSame
-               {key = identity, text = action} of
-            result as HolbuildCacheBackend.Published => result
-          | result as HolbuildCacheBackend.AlreadyPresent => result
-          | HolbuildCacheBackend.Skipped => die "remote cache skipped toolchain action publication"
-          | HolbuildCacheBackend.Conflict detail => die ("remote cache rejected toolchain action: " ^ detail)
-      end before cleanup ())
-     handle e => (cleanup (); raise e))
+    if not replace andalso Option.isSome (HolbuildRemoteCache.get_action remote identity) then
+      HolbuildCacheBackend.AlreadyPresent
+    else
+      ((create_archive {entry_dir = entry_dir, identity = identity, archive_path = archive_path};
+        let
+          val sha1 = HolbuildHash.file_sha1 archive_path
+          val _ = upload sha1
+        in
+          case put_action {key = identity, text = remote_record sha1} of
+              result as HolbuildCacheBackend.Published => result
+            | result as HolbuildCacheBackend.AlreadyPresent => result
+            | HolbuildCacheBackend.Skipped => die "remote cache skipped toolchain action publication"
+            | HolbuildCacheBackend.Conflict detail => die ("remote cache rejected toolchain action: " ^ detail)
+        end before cleanup ())
+       handle e => (cleanup (); raise e))
   end
 
 end

@@ -156,8 +156,9 @@ bin/build --no-helpdocs
 A built HOL checkout is expected to contain `bin/hol`, `bin/build`, and
 `bin/hol.state`, and must be git-clean ignoring ignored build products. If a
 shared cache entry is dirty or incomplete, holbuild refuses to use it until the
-user removes it manually. The cache key includes the canonical HOL repository,
-revision, Poly/ML command/version, build arguments, and cache format version.
+user removes it manually. The cache key includes the HOL revision, the Poly/ML
+runtime (release and architecture variant), the resolved `poly` executable
+path, build arguments, and cache format version.
 
 ## Main binary and project-HOL helper direction
 

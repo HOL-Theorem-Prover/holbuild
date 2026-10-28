@@ -52,6 +52,8 @@ rev = "$revision"
 TOML
 }
 
+physical_dir() (cd "$1" && pwd -P)
+
 hol=$tmpdir/hol
 fakebin=$tmpdir/fakebin
 project=$tmpdir/project
@@ -102,7 +104,7 @@ require_file "$(dirname "$restored_holdir")/build.ok"
 [[ -x "$restored_holdir/bin/hol" ]]
 [[ -x "$restored_holdir/bin/Holmake" ]]
 [[ -L "$restored_holdir/sigobj/Runtime.uo" ]]
-[[ $(readlink "$restored_holdir/sigobj/Runtime.uo") = "$restored_holdir/src/runtime/Runtime.sml" ]]
+[[ $(readlink "$restored_holdir/sigobj/Runtime.uo") = "$(physical_dir "$restored_holdir")/src/runtime/Runtime.sml" ]]
 [[ ! -e "$restored_holdir/src/runtime/.hol/locks" ]]
 "$restored_holdir/bin/hol" --noconfig --holstate "$restored_holdir/bin/hol.state" </dev/null
 printf 'val x = true\n' > "$tmpdir/TinyScript.sml"
@@ -113,6 +115,45 @@ analyser_dirs=("$(dirname "$restored_holdir")"/analysers/*)
 require_grep '^holbuild-hol-analyser holbuild-hol-analyser-v2$' "$tmpdir/analyser-version"
 require_grep '^GET /cas/' "$request_log"
 [[ $(grep -c '^PUT ' "$request_log") -eq "$published_put_count" ]]
+
+# The analyser is rebuilt after a restore rather than archived, so a changed
+# analyser still restores the published toolchain.
+if tar -tf "$original_archive" | grep -q '^\./analysers'; then
+  record_regression_failure "toolchain archive contains analysers"
+fi
+analyser_src=$tmpdir/analyser-src
+cp -R "$SCRIPT_DIR/../../../sml" "$analyser_src"
+printf '\n(* changed analyser *)\n' >> "$analyser_src/analyser/analyser_main.sml"
+rm -rf "$cache/hol-toolchains"
+changed_analyser_log=$tmpdir/changed-analyser.log
+(cd "$project" && HOLBUILD_ANALYSER_SRC="$analyser_src/analyser" \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$changed_analyser_log" 2>&1
+[[ $(wc -l < "$build_count") -eq 1 ]]
+changed_analyser_dirs=("$(dirname "$published_holdir")"/analysers/*)
+[[ ${#changed_analyser_dirs[@]} -eq 1 ]]
+[[ "${changed_analyser_dirs[0]}" != "${analyser_dirs[0]}" ]]
+require_file "$(dirname "$published_holdir")/build.ok"
+[[ $(grep -c '^PUT ' "$request_log") -eq "$published_put_count" ]]
+
+# The local key names the resolved Poly/ML executable: an alias of the same
+# install reuses the toolchain, another install of the same version does not.
+poly_alias=$tmpdir/poly-alias
+mkdir -p "$poly_alias"
+ln -s "$fakebin/poly" "$poly_alias/poly"
+poly_alias_log=$tmpdir/poly-alias.log
+(cd "$project" && HOLBUILD_POLY="$poly_alias/poly" "$HOLBUILD_BIN" buildhol) > "$poly_alias_log" 2>&1
+[[ $(tail -n 1 "$poly_alias_log") = "$published_holdir" ]]
+[[ $(wc -l < "$build_count") -eq 1 ]]
+other_poly=$tmpdir/other-poly
+other_poly_build_count=$tmpdir/other-poly-build-count
+mkdir -p "$other_poly"
+cp "$fakebin/poly" "$other_poly/poly"
+: > "$other_poly_build_count"
+other_poly_log=$tmpdir/other-poly.log
+(cd "$project" && HOLBUILD_POLY="$other_poly/poly" \
+  HOLBUILD_TEST_BUILD_COUNT="$other_poly_build_count" "$HOLBUILD_BIN" buildhol) > "$other_poly_log" 2>&1
+[[ $(tail -n 1 "$other_poly_log") != "$published_holdir" ]]
+[[ $(wc -l < "$other_poly_build_count") -eq 1 ]]
 
 initial_put_count=$(grep -c '^PUT ' "$request_log")
 initial_cas_get_count=$(grep -c '^GET /cas/' "$request_log")
@@ -126,16 +167,25 @@ wrong_path_log=$tmpdir/wrong-path.log
 [[ $(grep -c '^PUT ' "$request_log") -eq $((initial_put_count + 2)) ]]
 [[ $(grep -c '^GET /cas/' "$request_log") -eq "$initial_cas_get_count" ]]
 
-# The Poly executable digest is part of remote identity even when its version
-# string and the local toolchain key are unchanged.
+# Poly/ML is identified by its runtime release and architecture variant and by
+# its location, not by the bytes of bin/poly, which differ on every build.
 cp "$fakebin/poly" "$tmpdir/original-poly"
-printf '\n# changed executable identity\n' >> "$fakebin/poly"
+printf '\n# rebuilt executable\n' >> "$fakebin/poly"
+rm -rf "$cache/hol-toolchains"
+rebuilt_poly_log=$tmpdir/rebuilt-poly.log
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$rebuilt_poly_log" 2>&1
+[[ $(wc -l < "$build_count") -eq 2 ]]
+[[ $(grep -c '^PUT ' "$request_log") -eq $((initial_put_count + 2)) ]]
+[[ $(grep -c '^GET /cas/' "$request_log") -eq $((initial_cas_get_count + 1)) ]]
+
+# Another runtime variant at the same location selects a different toolchain.
+sed 's/RTS version: Fake-1.0/RTS version: Fake32-1.0/' "$tmpdir/original-poly" > "$fakebin/poly"
 rm -rf "$cache/hol-toolchains"
 wrong_poly_log=$tmpdir/wrong-poly.log
 (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$wrong_poly_log" 2>&1
 [[ $(wc -l < "$build_count") -eq 3 ]]
 [[ $(grep -c '^PUT ' "$request_log") -eq $((initial_put_count + 4)) ]]
-[[ $(grep -c '^GET /cas/' "$request_log") -eq "$initial_cas_get_count" ]]
+[[ $(grep -c '^GET /cas/' "$request_log") -eq $((initial_cas_get_count + 1)) ]]
 cp "$tmpdir/original-poly" "$fakebin/poly"
 chmod +x "$fakebin/poly"
 
@@ -156,10 +206,10 @@ wrong_platform_log=$tmpdir/wrong-platform.log
 (cd "$project" && PATH="$platformbin:$PATH" "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$wrong_platform_log" 2>&1
 [[ $(wc -l < "$build_count") -eq 4 ]]
 [[ $(grep -c '^PUT ' "$request_log") -eq $((initial_put_count + 6)) ]]
-[[ $(grep -c '^GET /cas/' "$request_log") -eq "$initial_cas_get_count" ]]
+[[ $(grep -c '^GET /cas/' "$request_log") -eq $((initial_cas_get_count + 1)) ]]
 
-# The exact path identity must use the same spelling embedded by the HOL build.
-# A cache reached through a symlink is still a valid same-path installation.
+# The path identity is the physical path, which the HOL build embeds. A cache
+# reached through a symlink is still a valid same-path installation.
 symlink_cache=$tmpdir/symlink-cache
 symlink_cache_real=$tmpdir/symlink-cache-real
 symlink_build_count=$tmpdir/symlink-build-count
@@ -190,11 +240,48 @@ if (cd "$project" && \
     if [[ "$symlink_restored_holdir" != "$symlink_holdir" ]] ||
        [[ $(wc -l < "$symlink_build_count") -ne 1 ]] ||
        [[ $(readlink "$symlink_restored_holdir/sigobj/Runtime.uo") != \
-          "$symlink_restored_holdir/src/runtime/Runtime.sml" ]]; then
+          "$(physical_dir "$symlink_cache_real")/hol-toolchains/$(basename "$(dirname "$symlink_holdir")")/hol/src/runtime/Runtime.sml" ]]; then
       record_regression_failure "symlink-alias toolchain identity was not restored consistently"
     fi
   else
     record_regression_failure "symlink-alias toolchain archive was not restorable"
+  fi
+
+  # The same physical path spelled without the symlink restores the archive.
+  rm -rf "$symlink_cache_real/hol-toolchains"
+  physical_restore_log=$tmpdir/physical-restore.log
+  if (cd "$project" && \
+      HOLBUILD_CACHE="$symlink_cache_real" \
+      HOLBUILD_TEST_BUILD_COUNT="$symlink_build_count" \
+      "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) \
+      > "$physical_restore_log" 2>&1; then
+    if [[ $(wc -l < "$symlink_build_count") -ne 1 ]]; then
+      record_regression_failure "physical spelling of a published path missed its archive"
+    fi
+  else
+    record_regression_failure "physical spelling of a published path was not restorable"
+  fi
+
+  # The same symlink spelling resolving elsewhere must not restore an archive
+  # whose baked paths name the publisher's directory.
+  moved_cache_real=$tmpdir/symlink-cache-moved
+  mkdir -p "$moved_cache_real"
+  rm "$symlink_cache"
+  ln -s "$moved_cache_real" "$symlink_cache"
+  moved_log=$tmpdir/symlink-moved.log
+  if (cd "$project" && \
+      HOLBUILD_CACHE="$symlink_cache" \
+      HOLBUILD_TEST_BUILD_COUNT="$symlink_build_count" \
+      "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) \
+      > "$moved_log" 2>&1; then
+    moved_holdir=$(tail -n 1 "$moved_log")
+    if [[ $(wc -l < "$symlink_build_count") -ne 2 ]] ||
+       [[ $(readlink "$moved_holdir/sigobj/Runtime.uo") != \
+          "$(physical_dir "$moved_holdir")/src/runtime/Runtime.sml" ]]; then
+      record_regression_failure "symlink resolving to another directory reused the publisher's archive"
+    fi
+  else
+    record_regression_failure "symlink resolving to another directory did not build locally"
   fi
 else
   record_regression_failure "toolchain publication rejected a symlinked cache path"
@@ -260,6 +347,16 @@ with tarfile.open(destination, "w", format=tarfile.PAX_FORMAT, pax_headers={}) a
         member.mtime = 0
         output.addfile(member, io.BytesIO(data) if member.isreg() else None)
 
+    if mutation == "analysers":
+        extra = tarfile.TarInfo("./analysers/stale")
+        payload = b"stale"
+        extra.size = len(payload)
+        extra.mode = 0o644
+        extra.uid = 0
+        extra.gid = 0
+        extra.mtime = 0
+        output.addfile(extra, io.BytesIO(payload))
+
     if mutation == "traversal":
         extra = tarfile.TarInfo("../parent-escape")
         payload = b"escape"
@@ -312,9 +409,42 @@ invalid_restore() {
 invalid_restore wrong-identity 'identity does not match'
 invalid_restore digest 'SHA256 mismatch'
 invalid_restore traversal 'could not extract tar archive'
+invalid_restore analysers 'archive contains analysers'
 invalid_restore missing-executable 'failed final validation'
 invalid_restore missing-holmake 'failed final validation'
 invalid_restore corrupt-heap 'failed final validation'
+
+# A builder that rejects an archive replaces it with its own local build.
+python3 "$tmpdir/mutate_archive.py" \
+  "$original_archive" "$tmpdir/mutated-replace.tar" "${action_files[0]}" "$remote_root/cas" corrupt-heap
+cp "${action_files[0]}" "$tmpdir/rejected-action"
+rm -rf "$cache/hol-toolchains"
+builds_before_replace=$(wc -l < "$build_count")
+replace_log=$tmpdir/replace-rejected.log
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$replace_log" 2>&1
+require_grep 'failed final validation' "$replace_log"
+[[ $(wc -l < "$build_count") -eq $((builds_before_replace + 1)) ]]
+if cmp -s "${action_files[0]}" "$tmpdir/rejected-action"; then
+  record_regression_failure "rejected toolchain archive was not replaced"
+fi
+rm -rf "$cache/hol-toolchains"
+replaced_log=$tmpdir/replaced-restore.log
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$replaced_log" 2>&1
+[[ $(wc -l < "$build_count") -eq $((builds_before_replace + 1)) ]]
+
+# A blob that does not download intact is a failed fetch, not a bad archive,
+# so the local build leaves the action alone.
+python3 "$tmpdir/mutate_archive.py" \
+  "$original_archive" "$tmpdir/mutated-unfetched.tar" "${action_files[0]}" "$remote_root/cas" digest
+cp "${action_files[0]}" "$tmpdir/unfetched-action"
+rm -rf "$cache/hol-toolchains"
+unfetched_log=$tmpdir/unfetched.log
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$unfetched_log" 2>&1
+require_grep 'SHA256 mismatch' "$unfetched_log"
+[[ $(wc -l < "$build_count") -eq $((builds_before_replace + 2)) ]]
+if ! cmp -s "${action_files[0]}" "$tmpdir/unfetched-action"; then
+  record_regression_failure "toolchain archive was replaced after a failed download"
+fi
 
 cp "$original_action" "${action_files[0]}"
 
@@ -373,6 +503,29 @@ restore_scratch_paths() {
     [[ -e "$path" ]] && printf '%s\n' "$path"
   done
 }
+
+# A builder whose restore missed does not upload when the archive was
+# published while it built.
+mv "${action_files[0]}" "$tmpdir/action-held"
+rm -rf "$cache/hol-toolchains"
+fallback_event=$tmpdir/fallback-event
+fallback_gate=$tmpdir/fallback-gate
+mkfifo "$fallback_event" "$fallback_gate"
+puts_before_meanwhile=$(grep -c '^PUT ' "$request_log")
+(
+  cd "$project"
+  exec env \
+    HOLBUILD_TEST_TOOLCHAIN_LOCAL_FALLBACK="$fallback_event" \
+    HOLBUILD_TEST_TOOLCHAIN_LOCAL_FALLBACK_GATE="$fallback_gate" \
+    "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol
+) > "$tmpdir/published-meanwhile.log" 2>&1 &
+meanwhile_pid=$!
+IFS= read -r _ < "$fallback_event"
+mv "$tmpdir/action-held" "${action_files[0]}"
+printf 'continue\n' > "$fallback_gate"
+wait "$meanwhile_pid"
+[[ $(grep -c '^PUT ' "$request_log") -eq "$puts_before_meanwhile" ]]
+rm -f "$fallback_event" "$fallback_gate"
 
 # A killed download leaves only task-local scratch. The next caller acquires
 # the released per-key lock and performs a complete restore.
