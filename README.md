@@ -151,6 +151,11 @@ That revision is the HOL checkout used to analyse and build the project.
 $HOLBUILD_CACHE/hol-toolchains/<key>/hol
 ```
 
+Only one holbuild process builds or restores a given toolchain at a time.
+Another process that needs the same toolchain waits for it, however long that
+takes, and reports the owning process on stderr when the wait starts and every
+30 s.
+
 For schema 2 projects, the shared HOL toolchain is warmed with HOL's reduced
 `upto-hol` build sequence rather than a full default HOL build:
 

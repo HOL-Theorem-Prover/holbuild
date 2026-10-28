@@ -342,11 +342,6 @@ fun unavailable_lock_owner () =
      "pid=unknown",
      "cwd=unknown"] ^ "\n"
 
-fun toolchain_lock_error lock owner =
-  Error ("HOL toolchain cache is locked\n" ^
-         "lock: " ^ lock ^ "\n" ^
-         "owner: " ^ HolbuildFileLock.owner_summary owner)
-
 fun try_acquire_lock_path lock =
   HolbuildFileLock.try_acquire_path {path = lock, obsolete_kind = SOME "HOL toolchain"}
   handle HolbuildFileLock.Error msg => raise Error ("could not acquire HOL toolchain cache lock: " ^ msg)
@@ -356,6 +351,26 @@ fun signal_test_lock_event variable =
       NONE => ()
     | SOME path => HolbuildFileLock.write_text path "observed\n"
 
+(* Waiting for the toolchain lock has no deadline: a bootstrap holds it for as
+   long as the HOL build takes, and the lock is an fcntl lock, which the kernel
+   drops when its owner exits however it exits. A caller that wants a bound
+   applies its own timeout; a killed waiter holds no toolchain lock. *)
+val lock_wait_report_interval = Time.fromSeconds 30
+
+fun report_lock_wait lock_path waited =
+  let
+    val owner = Option.getOpt(current_lock_owner lock_path, unavailable_lock_owner ())
+    fun field name = name ^ "=" ^ Option.getOpt(HolbuildFileLock.owner_value name owner, "unknown")
+  in
+    TextIO.output
+      (TextIO.stdErr,
+       "holbuild: waiting " ^ LargeInt.toString (Time.toSeconds waited) ^
+       "s for HOL toolchain lock held by " ^
+       String.concatWith " " [field "pid", field "host", field "command"] ^ "\n" ^
+       "  lock: " ^ lock_path ^ "\n");
+    TextIO.flushOut TextIO.stdErr
+  end
+
 fun acquire_lock k =
   let
     val lock_path = lock_dir k
@@ -363,18 +378,26 @@ fun acquire_lock k =
       ((HolbuildFileLock.write_text (lock_owner_path lock_path) (lock_owner ());
         ToolchainLock lock)
        handle e => (HolbuildFileLock.release lock; raise e))
-    fun wait 0 =
-          let val owner = Option.getOpt(current_lock_owner lock_path, unavailable_lock_owner ())
-          in raise toolchain_lock_error lock_path owner end
-      | wait n =
-          case try_acquire_lock_path lock_path of
-              SOME lock => acquired lock
-            | NONE =>
-                (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_LOCK_WAITING";
-                 ignore (OS.Process.system "sleep 1");
-                 wait (n - 1))
+    val started = Time.now ()
+    (* Reports the owner when due, sleeps, then tries again. *)
+    fun wait next_report =
+      let
+        val now = Time.now ()
+        val next_report =
+          if Time.<(now, next_report) then next_report
+          else
+            (report_lock_wait lock_path (Time.-(now, started));
+             Time.+(now, lock_wait_report_interval))
+      in
+        OS.Process.sleep (Time.fromSeconds 1);
+        case try_acquire_lock_path lock_path of
+            SOME lock => acquired lock
+          | NONE => wait next_report
+      end
   in
-    wait 120
+    case try_acquire_lock_path lock_path of
+        SOME lock => acquired lock
+      | NONE => (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_LOCK_WAITING"; wait started)
   end
 
 fun release_lock (ToolchainLock lock) =
