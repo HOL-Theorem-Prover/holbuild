@@ -234,6 +234,7 @@ holbuild run script.sml
 holbuild context
 holbuild context --trknl
 holbuild execution-plan MyTheory:my_theorem
+holbuild check MyTheory
 holbuild buildhol
 holbuild buildhol --trknl
 holbuild build --trknl MyTheory
@@ -295,6 +296,16 @@ manifest in use is watched as well (not recursively), so a `holbuild.toml` or
 `.holconfig.toml` appearing beside the manifest triggers a rebuild. Watch mode
 currently requires `inotifywait` from `inotify-tools` and does not support
 `--json`, `--dry-run`, or `--repl-on-failure`.
+
+`holbuild check MyTheory` builds the theory if needed, loads it in HOL and
+checks that its stored theorems are kernel-clean. It prints one line per
+theorem whose tag carries an oracle other than `DISK_THM` (for instance
+`MyTheory.my_theorem: cheat`) and one per axiom declared in the theory or its
+ancestors outside HOL itself, that is, in the root package or a dependency
+package (`DepTheory.my_axiom: axiom`). Theorems loaded from disk do not record
+which axioms they use, so every such axiom in the ancestry is reported. With
+findings it exits non-zero; otherwise it prints `MyTheory: clean (N theorems)`
+and exits zero. `holbuild check MyTheory:my_theorem` checks one theorem.
 
 `holbuild clean MyTheory` removes project-local generated artifacts, dependency
 metadata, and checkpoints for the named theory target. This is primarily a

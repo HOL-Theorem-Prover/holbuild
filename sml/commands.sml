@@ -26,6 +26,7 @@ fun global_help () = print
   \  context [--trknl]          Show resolved project context\n\n\
   \Inspection and advanced commands:\n\
   \  execution-plan T:THM        Inspect proof-step execution plan\n\
+  \  check THEORY[:THEOREM]      Check theorems for cheats, oracles and axioms\n\
   \  buildhol                    Build/reuse declared HOL and print its path\n\
   \  heap NAME                   Build a configured heap\n\
   \  executable NAME             Build a configured executable heap\n\
@@ -90,6 +91,16 @@ fun execution_plan_help () = print
   \Inspect the proof-step execution plan for a theorem.\n\n\
   \Global options: see `holbuild --help`.\n"
 
+fun check_help () = print
+  "Usage:\n\
+  \  holbuild [GLOBAL OPTIONS] check THEORY[:THEOREM]\n\n\
+  \Build THEORY if needed, load it in HOL and check the tags of its stored\n\
+  \theorems, or of THEOREM alone. Prints one line per theorem that depends on an\n\
+  \oracle other than DISK_THM (cheat, for instance) and per axiom declared in\n\
+  \THEORY or its ancestors outside HOL itself, and exits non-zero if there are\n\
+  \any. Otherwise prints a clean line and exits zero.\n\n\
+  \Global options: see `holbuild --help`.\n"
+
 fun buildhol_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] buildhol [--trknl]\n\n\
@@ -151,7 +162,7 @@ fun has_help_arg args = List.exists help_arg args
 
 fun known_command command =
   command = "build" orelse command = "context" orelse command = "repl" orelse
-  command = "run" orelse command = "execution-plan" orelse command = "buildhol" orelse
+  command = "run" orelse command = "execution-plan" orelse command = "check" orelse command = "buildhol" orelse
   command = "heap" orelse command = "executable" orelse command = "clean" orelse command = "export" orelse
   command = "import" orelse command = "gc" orelse command = "cache" orelse
   command = "goalfrag-plan"
@@ -163,6 +174,7 @@ fun command_help command =
     | "repl" => repl_help ()
     | "run" => run_help ()
     | "execution-plan" => execution_plan_help ()
+    | "check" => check_help ()
     | "buildhol" => buildhol_help ()
     | "heap" => heap_help ()
     | "executable" => executable_help ()
@@ -590,12 +602,15 @@ fun print_static_execution_plan project new_ir source theorem unit_opt =
           end);
    TextIO.flushOut TextIO.stdOut)
 
-fun find_theory_source index theory =
+fun find_theory_source_for command index theory =
   case List.filter (fn source => theory_source source andalso #logical_name source = theory) index of
       [source] => source
-    | [] => raise Error ("theory not found for execution-plan: " ^ theory)
+    | [] => raise Error ("theory not found for " ^ command ^ ": " ^ theory)
     | matches =>
-        raise Error ("ambiguous theory for execution-plan: " ^ theory ^ " in " ^                     String.concatWith ", " (map describe_source matches))
+        raise Error ("ambiguous theory for " ^ command ^ ": " ^ theory ^ " in " ^
+                     String.concatWith ", " (map describe_source matches))
+
+fun find_theory_source index theory = find_theory_source_for "execution-plan" index theory
 
 fun find_theorem_in_source theorem source =
   case theorem_match theorem source of
@@ -1399,7 +1414,7 @@ fun hol_args_for_project tc project subcommand context user_args =
     HolbuildToolchain.hol_subcommand_argv tc subcommand @ heap_args @ [context] @ user_args
   end
 
-fun run_hol_with runner tc cli_jobs subcommand user_args =
+fun run_hol_status runner tc cli_jobs subcommand user_args =
   let
     val configured_project = timed_phase "project.discover" load_project
     val run_loads = #run_loads configured_project
@@ -1410,23 +1425,137 @@ fun run_hol_with runner tc cli_jobs subcommand user_args =
       if null run_loads then configured_project
       else timed_phase "run.project.rediscover" load_project
     val packages = resolved_packages (resolution_for_toolchain tc) project
-    fun invoke context =
-      let
-        val argv = hol_args_for_project tc project subcommand context user_args
-        val status = runner argv
-      in
-        if HolbuildToolchain.success status then ()
-        else raise Error ("hol " ^ subcommand ^ " failed")
-      end
+    fun invoke context = runner (hol_args_for_project tc project subcommand context user_args)
   in
     HolbuildToolchain.with_run_context project packages invoke
   end
+
+fun run_hol_with runner tc cli_jobs subcommand user_args =
+  if HolbuildToolchain.success (run_hol_status runner tc cli_jobs subcommand user_args) then ()
+  else raise Error ("hol " ^ subcommand ^ " failed")
 
 fun run_hol tc cli_jobs subcommand user_args =
   run_hol_with HolbuildToolchain.run tc cli_jobs subcommand user_args
 
 fun repl_hol tc cli_jobs user_args =
   run_hol_with HolbuildToolchain.run_interactive tc cli_jobs "repl" user_args
+
+fun parse_check_selector selector =
+  case String.fields (fn c => c = #":") selector of
+      [theory] =>
+        if theory = "" then raise Error "check requires THEORY or THEORY:THEOREM"
+        else {theory = theory, theorem = NONE}
+    | [theory, theorem] =>
+        if theory = "" orelse theorem = "" then
+          raise Error "check requires THEORY or THEORY:THEOREM"
+        else {theory = theory, theorem = SOME theorem}
+    | _ => raise Error "check requires THEORY or THEORY:THEOREM"
+
+(* HOL's name for the theory whose structure is NAMETheory. *)
+fun hol_theory_name logical_name =
+  String.substring(logical_name, 0, size logical_name - size "Theory")
+
+(* The theory names HOL itself does not declare: those of the root package
+   and its dependency packages.  Axioms in these theories are findings. *)
+fun project_theory_names tc project index =
+  let
+    val graph = HolbuildProjectGraph.resolve
+                  {project = project, resolution = resolution_for_toolchain tc}
+    val hol = HolbuildProjectGraph.hol graph
+    fun project_theory source =
+      theory_source source andalso #package_id (#node source) <> hol
+  in
+    map (hol_theory_name o #logical_name) (List.filter project_theory index)
+  end
+
+(* An SML script for `hol run` that loads the theory and prints the
+   findings.  Theorems loaded from disk keep their oracles but not the axioms
+   they depend on, so axioms are found by scanning the ancestry instead. *)
+fun check_script {logical_name, theorem, project_theories} =
+  let
+    val sml_string = HolbuildToolchain.sml_string
+    val theory = hol_theory_name logical_name
+    val selected =
+      case theorem of
+          NONE => "NONE"
+        | SOME name => "SOME " ^ sml_string name
+  in
+    String.concatWith "\n"
+      ["val _ = load " ^ sml_string logical_name ^ ";",
+       "local",
+       "  val theory = " ^ sml_string theory,
+       "  val selected : string option = " ^ selected,
+       "  val project_theories = " ^ HolbuildToolchain.sml_list project_theories,
+       "  fun out s = (TextIO.output(TextIO.stdOut, s ^ \"\\n\"); TextIO.flushOut TextIO.stdOut)",
+       "  fun fail s = (TextIO.output(TextIO.stdErr, \"holbuild: \" ^ s ^ \"\\n\");",
+       "                TextIO.flushOut TextIO.stdErr; OS.Process.exit OS.Process.failure)",
+       "  fun qualified thy name = thy ^ \"Theory.\" ^ name",
+       "  fun by_name ((a, _), (b, _)) = String.compare(a, b)",
+       "  val stored = Listsort.sort by_name (DB.thms theory)",
+       "  val checked =",
+       "    case selected of",
+       "        NONE => stored",
+       "      | SOME name =>",
+       "          (case List.filter (fn (n, _) => n = name) stored of",
+       "               [] => fail (\"theorem not found: \" ^ qualified theory name)",
+       "             | found => found)",
+       "  fun theorem_problems (name, th) =",
+       "    let val (oracles, axioms) = Tag.dest_tag (Thm.tag th)",
+       "        val problems = List.filter (fn s => s <> \"DISK_THM\") oracles @",
+       "                       map (fn s => \"axiom \" ^ s) axioms",
+       "    in if null problems then []",
+       "       else [qualified theory name ^ \": \" ^ String.concatWith \", \" problems]",
+       "    end",
+       "  fun project_theory thy = List.exists (fn t => t = thy) project_theories",
+       "  fun theory_axioms thy =",
+       "    map (fn (name, _) => qualified thy name ^ \": axiom\")",
+       "        (Listsort.sort by_name (DB.axioms thy))",
+       "  val findings =",
+       "    List.concat (map theorem_problems checked) @",
+       "    List.concat (map theory_axioms",
+       "                   (List.filter project_theory (theory :: Theory.ancestry theory)))",
+       "  fun count n noun = Int.toString n ^ \" \" ^ noun ^ (if n = 1 then \"\" else \"s\")",
+       "  val subject =",
+       "    case selected of NONE => theory ^ \"Theory\" | SOME name => qualified theory name",
+       "in",
+       "  val _ = List.app out findings",
+       "  val _ =",
+       "    if null findings then",
+       "      out (subject ^ \": clean (\" ^ count (length checked) \"theorem\" ^ \")\")",
+       "    else",
+       "      (out (subject ^ \": \" ^ count (length findings) \"finding\");",
+       "       OS.Process.exit OS.Process.failure)",
+       "end;",
+       ""]
+  end
+
+fun check_selector tc cli_jobs selector =
+  let
+    val {theory, theorem} = parse_check_selector selector
+    val project = timed_phase "project.discover" load_project
+    val {index, ...} = prepare_source_index "check" (resolution_for_toolchain tc) project
+    val source = find_theory_source_for "check" index theory
+    val _ = build_once tc cli_jobs (default_build_request [#logical_name source])
+    val script_path =
+      OS.Path.concat(OS.Path.concat(HolbuildProject.artifact_root project, ".holbuild"),
+                     "holbuild-check-" ^ HolbuildFileLock.current_pid_text () ^ "-" ^
+                     HolbuildToolchain.run_context_nonce () ^ ".sml")
+    val _ = write_text_file script_path
+              (check_script {logical_name = #logical_name source, theorem = theorem,
+                             project_theories = project_theory_names tc project index})
+    fun cleanup () = OS.FileSys.remove script_path handle OS.SysErr _ => ()
+    val status =
+      run_hol_status HolbuildToolchain.run tc cli_jobs "run" [script_path]
+      handle e => (cleanup (); raise e)
+  in
+    cleanup ();
+    if HolbuildToolchain.success status then () else OS.Process.exit OS.Process.failure
+  end
+
+fun check_command tc cli_jobs args =
+  case args of
+      [selector] => check_selector tc cli_jobs selector
+    | _ => raise Error "usage: holbuild check THEORY[:THEOREM]"
 
 fun removed_legacy_plan_command _ _ =
   raise Error "goalfrag-plan has been removed; use execution-plan THEORY:THEOREM"
@@ -1447,6 +1576,7 @@ fun dispatch tc jobs args =
       [] => build tc jobs []
     | "context" :: rest => (reject_json "context"; context tc rest)
     | "execution-plan" :: rest => (reject_json "execution-plan"; execution_plan_command tc rest)
+    | "check" :: rest => (reject_json "check"; check_command tc jobs rest)
     | "goalfrag-plan" :: rest => removed_legacy_plan_command tc rest
     | "build" :: rest => build tc jobs rest
     | "clean" :: rest => (reject_json "clean"; clean_targets rest)
