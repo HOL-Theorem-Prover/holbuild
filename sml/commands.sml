@@ -1115,6 +1115,25 @@ fun export_build_options trknl project index entry_plan plan =
      trknl = trknl}
   end
 
+(* Heaps and executables build their ancestors plain: proof steps and their
+   tactic timeouts are checked by build, and a timeout-free request can reuse
+   any cached theory, including ones from build --skip-proof-steps. *)
+fun heap_build_options trknl =
+  {use_cache = true,
+   verify_cache = true,
+   force = HolbuildBuildExec.ForceNone,
+   force_targets = [],
+   skip_checkpoints = false,
+   proof_steps = false,
+   new_ir = false,
+   node_tactic_timeouts = [],
+   execution_plan = NONE,
+   trace_steps = false,
+   repl_on_failure = false,
+   emit_output_hashes = false,
+   allow_cache_timeout_discrepancy = false,
+   trknl = trknl}
+
 fun theory_node node =
   #kind (HolbuildBuildPlan.source_of node) = HolbuildSourceIndex.TheoryScript
 
@@ -1350,16 +1369,10 @@ fun build_heap_kind tc cli_jobs command target =
         val objects = HolbuildSourceIndex.expand_group_tokens index (HolbuildProject.project_package project) objects
         val _ = if null objects then raise Error (command ^ " target has no objects: " ^ target) else ()
         val plan = timed_phase "build.plan" (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index objects)
-        val explicit_entry_targets =
-          map #2 (HolbuildTacticTimeoutPolicy.explicit_entries project index)
-        val entry_plan =
-          if null explicit_entry_targets then NONE
-          else SOME (timed_phase "entry_timeout.plan"
-                       (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index explicit_entry_targets))
         val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
         val output_path = HolbuildProject.abs_under (#root project) output
       in
-        HolbuildBuildExec.build (export_build_options (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)) project index entry_plan plan)
+        HolbuildBuildExec.build (heap_build_options (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)))
                                tc project plan toolchain_key jobs;
         HolbuildBuildExec.export_heap tc project plan output_path kind
       end

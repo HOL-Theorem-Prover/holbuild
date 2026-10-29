@@ -673,7 +673,9 @@ manifest entries. Executable heap targets are requested with `holbuild executabl
 NAME` from `[[executable]]` manifest entries. They are exported artifacts, not
 the normal incremental-build primitive: holbuild first builds the declared
 logical objects, then invokes HOL's public `buildheap` command on the selected
-object stems. Executable targets add `--exe=<main>`.
+object stems. Executable targets add `--exe=<main>`. The object build runs without
+proof steps: tactic timeouts are a `build` check, and a timeout-free request can
+reuse any cached theory, including those built with `--skip-proof-steps`.
 
 Heaps requested by users remain project-local exported artifacts. Checkpoints are
 transient build/debug state. Normal successful theory builds may create them
