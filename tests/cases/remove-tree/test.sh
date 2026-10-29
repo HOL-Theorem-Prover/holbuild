@@ -23,7 +23,7 @@ ln -s "$outside" "$tree/link-to-outside"
 ln -s "$tmpdir/missing" "$tmpdir/dangling"
 # The strict variant fails when something is left behind; a read-only
 # directory keeps its entries, but root ignores directory permissions.
-mkdir -p "$tmpdir/strict/a" "$tmpdir/stuck/ro"
+mkdir -p "$tmpdir/strict/a" "$tmpdir/stuck/ro" "$tmpdir/empty"
 printf 'z\n' > "$tmpdir/strict/a/file"
 printf 'z\n' > "$tmpdir/stuck/ro/file"
 chmod a-w "$tmpdir/stuck/ro"
@@ -49,7 +49,11 @@ val _ = print "remove_tree done\n";
 fun report f path =
   (f path; print ("removed " ^ path ^ "\n"))
   handle HolbuildRemoveTree.Error msg => print ("error: " ^ msg ^ "\n");
-val _ = List.app (report HolbuildRemoveTree.remove) ["", ".", "/"];
+(* Live guard calls run from an empty directory, so a broken guard costs
+   nothing; "/" is only checked through the predicate. *)
+val _ = OS.FileSys.chDir (join (tmp, "empty"));
+val _ = List.app (report HolbuildRemoveTree.remove) ["", "."];
+val _ = if HolbuildRemoveTree.unsafe "/" then print "unsafe: /\n" else ();
 val _ = report HolbuildRemoveTree.remove_strict (join (tmp, "strict"));
 val _ = report HolbuildRemoveTree.remove_strict (join (tmp, "missing"));
 val _ = report HolbuildRemoveTree.remove_strict (join (tmp, "stuck"));
@@ -67,7 +71,7 @@ require_no_file "$other"
 require_file "$outside/kept"
 require_grep "error: refusing to remove unsafe path: $" "$tmpdir/remove-tree-test.log"
 require_grep "error: refusing to remove unsafe path: \.$" "$tmpdir/remove-tree-test.log"
-require_grep "error: refusing to remove unsafe path: /$" "$tmpdir/remove-tree-test.log"
+require_grep "^unsafe: /$" "$tmpdir/remove-tree-test.log"
 require_grep "removed $tmpdir/strict$" "$tmpdir/remove-tree-test.log"
 require_no_file "$tmpdir/strict"
 require_grep "removed $tmpdir/missing$" "$tmpdir/remove-tree-test.log"

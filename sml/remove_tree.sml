@@ -25,8 +25,10 @@ fun remove_entry path =
          else FS.remove path)
   handle OS.SysErr _ => ()
 
+fun unsafe path = path = "" orelse path = "." orelse path = "/"
+
 fun remove path =
-  if path = "" orelse path = "." orelse path = "/" then
+  if unsafe path then
     raise Error ("refusing to remove unsafe path: " ^ path)
   else remove_entry path
 
