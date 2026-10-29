@@ -15,8 +15,8 @@ val manifest_marker = "manifest-text-v1\n"
 
 (* Large toolchain archives get a minutes-scale transfer bound without changing
    the existing theory-action policy. *)
-val curl_max_time_seconds = "30"
-val toolchain_curl_max_time_seconds = "1800"
+val curl_max_time_seconds = 30
+val toolchain_curl_max_time_seconds = 1800
 
 fun trim_trailing_slashes url =
   let
@@ -98,8 +98,8 @@ fun redact_userinfo url =
           end
   end
 
-fun first_token text =
-  case String.tokens Char.isSpace text of
+fun read_first_token path =
+  case String.tokens Char.isSpace (read_text path) of
       token :: _ => token
     | [] => ""
 
@@ -131,18 +131,7 @@ fun zstd_compress url src dst =
     command_success ("zstd -q -f -T0 -o " ^ quote dst ^ " " ^ quote src)
 
 fun zstd_content_headers size =
-  " -H 'Content-Encoding: zstd' -H " ^ quote ("X-Digest-SizeBytes: " ^ size)
-
-(* The HTTP code comes first; the rest only feeds the HOLBUILD_CACHE_TRACE line. *)
-val curl_write_out =
-  " -w '%{http_code} down=%{size_download}B up=%{size_upload}B ttfb=%{time_starttransfer}s total=%{time_total}s'"
-
-(* One line per request: wall time around the curl process, then curl's own
-   transfer timings, so per-request overhead and transfer time separate. *)
-fun trace_request method display_url timer write_out =
-  HolbuildStatus.cache_trace
-    ("remote cache " ^ method ^ " " ^ display_url ^ " wall=" ^
-     LargeInt.toString (Time.toMilliseconds (Timer.checkRealTimer timer)) ^ "ms " ^ write_out)
+  ["Content-Encoding: zstd", "X-Digest-SizeBytes: " ^ size]
 
 val restore_warning_emitted = ref false
 val restore_warning_mutex = Mutex.mutex ()
@@ -160,59 +149,96 @@ fun warn_restore_once message =
     else ()
   end
 
-fun curl_get_with_timeout timeout_seconds {url, dst} =
+(* Requests go through libcurl when HolbuildRemoteCacheConfig could set it
+   up, and otherwise through the curl command, which prints its own error
+   message. *)
+fun cli_status timeout_seconds options url =
   let
     val code = temp_path "code"
-    val display_url = redact_userinfo url
+    val command = "curl -q -sS -L --connect-timeout " ^ Int.toString HolbuildHttp.connect_timeout_seconds ^
+                  " --max-time " ^ Int.toString timeout_seconds ^
+                  curl_config_arg () ^ options ^ " -w '%{http_code}' " ^ quote url ^
+                  " > " ^ quote code
+    val status = OS.Process.system command
+    val http_code = if path_exists code then read_first_token code else ""
+    val _ = remove_file code
+  in
+    case (OS.Process.isSuccess status, Int.fromString http_code) of
+        (true, SOME http_code) => HolbuildHttp.Response http_code
+      | _ => HolbuildHttp.Failed "the curl command failed"
+  end
+
+fun get_status timeout_seconds {url, dst} =
+  if HolbuildRemoteCacheConfig.uses_libcurl () then
+    HolbuildHttp.get {url = url, dst = dst, timeout = timeout_seconds}
+  else
     (* --compressed advertises curl-supported response encodings, including zstd
        when this curl build has zstd support, and streams decompressed bytes to dst. *)
-    val command = "curl -q -sS -L --compressed --connect-timeout 10 --max-time " ^ timeout_seconds ^ curl_config_arg () ^ " -o " ^ quote dst ^
-                  curl_write_out ^ " " ^ quote url ^ " > " ^ quote code
-    val timer = Timer.startRealTimer ()
-    val status = OS.Process.system command
-    val write_out = if path_exists code then read_text code else ""
-    val http_code = if write_out = "" then "000" else first_token write_out
-    val _ = remove_file code
-    val _ = trace_request "GET" display_url timer write_out
+    cli_status timeout_seconds (" --compressed -o " ^ quote dst) url
+
+fun put_status timeout_seconds headers {url, src} =
+  if HolbuildRemoteCacheConfig.uses_libcurl () then
+    HolbuildHttp.put {url = url, src = src, headers = headers, timeout = timeout_seconds}
+  else
+    cli_status timeout_seconds
+               (String.concat (map (fn header => " -H " ^ quote header) headers) ^
+                " -T " ^ quote src ^ " -o /dev/null") url
+
+(* Under HOLBUILD_CACHE_TRACE, one line per request: its wall time, then the
+   HTTP status and the size of the file received or sent. *)
+fun traced method url path request =
+  if not (HolbuildStatus.cache_trace_enabled ()) then request ()
+  else
+    let
+      val timer = Timer.startRealTimer ()
+      val result = request ()
+      val wall = LargeInt.toString (Time.toMilliseconds (Timer.checkRealTimer timer))
+      val outcome =
+        case result of
+            HolbuildHttp.Failed message => "failed: " ^ message
+          | HolbuildHttp.Response code =>
+              Int.toString code ^ " bytes=" ^
+              (if path_exists path then Position.toString (FS.fileSize path) else "0")
+    in
+      HolbuildStatus.cache_trace
+        ("remote cache " ^ method ^ " " ^ redact_userinfo url ^ " wall=" ^ wall ^ "ms " ^ outcome);
+      result
+    end
+
+fun curl_get_with_timeout timeout_seconds (request as {url, dst}) =
+  let val display_url = redact_userinfo url
   in
-    if not (OS.Process.isSuccess status) then HolbuildCacheBackend.Corrupt ("curl GET failed: " ^ display_url)
-    else if http_code = "200" then HolbuildCacheBackend.Hit
-    else if http_code = "404" then HolbuildCacheBackend.Miss
-    else HolbuildCacheBackend.Corrupt ("HTTP " ^ http_code ^ " from " ^ display_url)
+    case traced "GET" url dst (fn () => get_status timeout_seconds request) of
+        HolbuildHttp.Failed message =>
+          HolbuildCacheBackend.Corrupt ("GET " ^ display_url ^ " failed: " ^ message)
+      | HolbuildHttp.Response 200 => HolbuildCacheBackend.Hit
+      | HolbuildHttp.Response 404 => HolbuildCacheBackend.Miss
+      | HolbuildHttp.Response code =>
+          HolbuildCacheBackend.Corrupt ("HTTP " ^ Int.toString code ^ " from " ^ display_url)
   end
   handle e => (HolbuildCacheBackend.Corrupt (General.exnMessage e))
 
 fun curl_get request = curl_get_with_timeout curl_max_time_seconds request
 
 fun successful_put_code code =
-  code = "200" orelse code = "201" orelse code = "204"
+  code = 200 orelse code = 201 orelse code = 204
 
-fun curl_put_with_headers_timeout timeout_seconds headers {url, src} =
-  let
-    val code = temp_path "code"
-    val body = temp_path "body"
-    val display_url = redact_userinfo url
-    val command = "curl -q -sS -L --connect-timeout 10 --max-time " ^ timeout_seconds ^ curl_config_arg () ^ headers ^ " -T " ^ quote src ^
-                  " -o " ^ quote body ^ curl_write_out ^ " " ^ quote url ^
-                  " > " ^ quote code
-    val timer = Timer.startRealTimer ()
-    val status = OS.Process.system command
-    val write_out = if path_exists code then read_text code else ""
-    val http_code = if write_out = "" then "000" else first_token write_out
-    val _ = remove_file code
-    val _ = trace_request "PUT" display_url timer write_out
-    val _ = remove_file body
+fun curl_put_with_headers_timeout timeout_seconds headers (request as {url, src}) =
+  let val display_url = redact_userinfo url
   in
-    if not (OS.Process.isSuccess status) then HolbuildCacheBackend.Conflict ("curl PUT failed: " ^ display_url)
-    else if successful_put_code http_code then HolbuildCacheBackend.Published
-    else HolbuildCacheBackend.Conflict ("HTTP " ^ http_code ^ " from " ^ display_url)
+    case traced "PUT" url src (fn () => put_status timeout_seconds headers request) of
+        HolbuildHttp.Failed message =>
+          HolbuildCacheBackend.Conflict ("PUT " ^ display_url ^ " failed: " ^ message)
+      | HolbuildHttp.Response code =>
+          if successful_put_code code then HolbuildCacheBackend.Published
+          else HolbuildCacheBackend.Conflict ("HTTP " ^ Int.toString code ^ " from " ^ display_url)
   end
   handle e => (HolbuildCacheBackend.Conflict (General.exnMessage e))
 
 fun curl_put_with_headers headers request =
   curl_put_with_headers_timeout curl_max_time_seconds headers request
 
-fun curl_put request = curl_put_with_headers "" request
+fun curl_put request = curl_put_with_headers [] request
 
 fun curl_put_zstd_with_timeout timeout_seconds {url, src, size} =
   let val compressed = temp_path "zstd-put"
@@ -223,7 +249,7 @@ fun curl_put_zstd_with_timeout timeout_seconds {url, src, size} =
       before remove_file compressed
     else
       remove_file_before
-        (curl_put_with_headers_timeout timeout_seconds "" {url = url, src = src})
+        (curl_put_with_headers_timeout timeout_seconds [] {url = url, src = src})
         compressed
   end
   handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
