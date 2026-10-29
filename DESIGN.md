@@ -127,6 +127,19 @@ not the parent package artifact directory, so resolving `a -> b` creates
 For `from` dependencies, the source root is under `.holbuild/src/<from>/<path>`,
 but the shim manifest is read from the package that declares the dependency.
 
+A checkout already at its pinned commit is used without network access. Otherwise
+the commit is fetched into a bare mirror under `$HOLBUILD_CACHE/git/remotes`,
+shared by every project using that cache; creating a mirror and fetching into it
+are serialized by a per-mirror lock, and a new mirror is cloned to a temporary
+directory and renamed into place. Publishing a checkout is serialized by
+`.holbuild/locks/src/<package>.lock`, and HEAD is checked again under that lock.
+Temporary clones left by killed processes are removed under the lock that
+guards them, and a process waiting on either lock names the pid holding it.
+Every process that uses a checkout holds a shared lease,
+`.holbuild/locks/src/<package>.lease`, until it exits; replacing a checkout at
+another commit takes the lease exclusively and fails while another process holds
+it, so no process removes a tree another one is reading.
+
 The reserved `hol` package is the project HOL toolchain. It is
 materialized and built at a canonical shared cache path
 `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`; upstream HOL does not need a
@@ -143,8 +156,9 @@ bin/build --no-helpdocs
 A built HOL checkout is expected to contain `bin/hol`, `bin/build`, and
 `bin/hol.state`, and must be git-clean ignoring ignored build products. If a
 shared cache entry is dirty or incomplete, holbuild refuses to use it until the
-user removes it manually. The cache key includes the canonical HOL repository,
-revision, Poly/ML command/version, build arguments, and cache format version.
+user removes it manually. The cache key includes the HOL revision, the Poly/ML
+runtime (release and architecture variant), the resolved `poly` executable
+path, build arguments, and cache format version.
 
 ## Main binary and project-HOL helper direction
 

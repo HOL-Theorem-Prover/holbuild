@@ -63,7 +63,7 @@ fun write_text path text =
   end
 
 fun temp_path label =
-  Path.concat(Path.dir (FS.tmpName ()), "holbuild-remote-cache-" ^ label ^ "-" ^ Path.file (FS.tmpName ()))
+  HolbuildTempPath.temporary ("remote-cache-" ^ label)
 
 fun curl_config_arg () =
   case HolbuildRemoteCacheConfig.curl_config () of
@@ -113,6 +113,22 @@ fun zstd_compress src dst =
 fun zstd_content_headers size =
   ["Content-Encoding: zstd", "X-Digest-SizeBytes: " ^ size]
 
+val restore_warning_emitted = ref false
+val restore_warning_mutex = Mutex.mutex ()
+
+fun warn_restore_once message =
+  let
+    val _ = Mutex.lock restore_warning_mutex
+    val emit = not (!restore_warning_emitted)
+    val _ = restore_warning_emitted := true
+    val _ = Mutex.unlock restore_warning_mutex
+  in
+    if emit then
+      (TextIO.output (TextIO.stdErr, "holbuild: warning: remote cache restore failed: " ^ message ^ "\n");
+       TextIO.flushOut TextIO.stdErr)
+    else ()
+  end
+
 (* Transport failures are printed as the curl command printed them, since
    callers treat a failed lookup as a miss. *)
 fun report_failure message =
@@ -129,7 +145,7 @@ fun libcurl_status method request =
 fun cli_status options url =
   let
     val code = temp_path "code"
-    val command = "curl -q -sS -L" ^ curl_config_arg () ^ options ^ " -w '%{http_code}' " ^ quote url ^
+    val command = "curl -q -sS -L --connect-timeout 10" ^ curl_config_arg () ^ options ^ " -w '%{http_code}' " ^ quote url ^
                   " > " ^ quote code
     val status = OS.Process.system command
     val http_code = if path_exists code then read_first_token code else "000"
@@ -310,7 +326,8 @@ fun get_action cache key =
             SOME manifest
           end
       | HolbuildCacheBackend.Miss => (cleanup (); NONE)
-      | HolbuildCacheBackend.Corrupt _ => (cleanup (); NONE)
+      | HolbuildCacheBackend.Corrupt message =>
+          (cleanup (); warn_restore_once message; NONE)
   end
   handle _ => NONE
 
@@ -383,6 +400,8 @@ fun fetch_blob_with_timeout timeout_seconds cache {hash, dst} =
         in
           case result of
               HolbuildCacheBackend.Hit => verify_downloaded_blob dst entry
+            | HolbuildCacheBackend.Corrupt message =>
+                (warn_restore_once message; result)
             | other => other
         end
         handle e => HolbuildCacheBackend.Corrupt (General.exnMessage e)

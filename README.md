@@ -151,6 +151,11 @@ That revision is the HOL checkout used to analyse and build the project.
 $HOLBUILD_CACHE/hol-toolchains/<key>/hol
 ```
 
+Only one holbuild process builds or restores a given toolchain at a time.
+Another process that needs the same toolchain waits for it, however long that
+takes, and reports the owning process on stderr when the wait starts and every
+30 s.
+
 For schema 2 projects, the shared HOL toolchain is warmed with HOL's reduced
 `upto-hol` build sequence rather than a full default HOL build:
 
@@ -675,10 +680,16 @@ theory's restore usually finds its entry already local. This prefetch is
 best-effort and silent; whatever it misses is fetched when the theory is
 reached, as before. `HOLBUILD_CACHE_TRACE=1` shows each prefetched entry as
 `remote cache prefetched: <key>`.
-A missing HOL toolchain is restored from the same remote cache when its exact
-installation path, platform, and Poly/ML identity match. After a remote miss, a
-successful local toolchain build is published automatically; local and remote
-hits are not re-uploaded, and publication failure is only a warning.
+A missing HOL toolchain is restored from the same remote cache when its HOL
+commit, build arguments, installation path (with symlinks resolved, as HOL's
+build records it), platform, C library, Poly/ML runtime (release and
+architecture variant, as `poly -v` reports them) and resolved `poly`
+executable path match. The source-analysis helper is not archived; holbuild
+rebuilds it against the restored toolchain. After a remote miss, a successful
+local toolchain build is published automatically unless another builder
+published it meanwhile; an archive that is missing its blob or fails to extract
+or validate is replaced by the local build (a failed download is not). Local and remote hits are not re-uploaded, and publication
+failure is only a warning.
 
 The remote endpoint stores content blobs under `/cas/<sha256>` and holbuild
 cache metadata under `/ac/<action-key>`. CAS transfers use zstd compression when
@@ -838,8 +849,8 @@ run `make`. The pinned HOL revision is recorded in `vendor/hol/REV`.
 
 Useful caches:
 
-- `$HOLBUILD_CACHE/hol-toolchains`, keyed by the project HOL revision and Poly/ML
-  version.
+- `$HOLBUILD_CACHE/hol-toolchains`, keyed by the project HOL revision, HOL build
+  arguments, Poly/ML runtime and resolved `poly` path.
 
 ## Running holbuild's own tests
 

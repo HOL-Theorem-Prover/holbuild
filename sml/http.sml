@@ -70,6 +70,7 @@ val CURLOPT_USERPWD = 10005
 val CURLOPT_READDATA = 10009
 val CURLOPT_ERRORBUFFER = 10010
 val CURLOPT_TIMEOUT = 13
+val CURLOPT_CONNECTTIMEOUT = 78
 val CURLOPT_HTTPHEADER = 10023
 val CURLOPT_UPLOAD = 46
 val CURLOPT_FOLLOWLOCATION = 52
@@ -185,6 +186,7 @@ fun new_connection () : connection =
       raise Error "could not create a libcurl handle"
     else ();
     check "NOSIGNAL" (setopt_long (easy, CURLOPT_NOSIGNAL, 1));
+    check "CONNECTTIMEOUT" (setopt_long (easy, CURLOPT_CONNECTTIMEOUT, 10));
     check "FOLLOWLOCATION" (setopt_long (easy, CURLOPT_FOLLOWLOCATION, 1));
     (* Accept every encoding this libcurl can decode, as curl --compressed. *)
     check "ACCEPT_ENCODING" (setopt_str (easy, CURLOPT_ACCEPT_ENCODING, ""));

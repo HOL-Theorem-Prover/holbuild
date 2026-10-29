@@ -21,7 +21,8 @@ fun set_local_curl_config NONE = local_curl_config := NONE
 
 fun env_url () =
   case OS.Process.getEnv "HOLBUILD_REMOTE_CACHE_URL" of
-      SOME url => SOME (normalize_url url)
+      SOME "" => NONE
+    | SOME url => SOME (normalize_url url)
     | NONE => NONE
 
 fun configured_url () =

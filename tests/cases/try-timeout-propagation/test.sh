@@ -125,3 +125,26 @@ has_checkpoint "$fast" 't_end_of_proof.save' || {
   echo "fast: no end-of-proof checkpoint, so the absence check above proves nothing" >&2
   exit 1
 }
+
+# Catching Interrupt cannot convert an expired deadline into a successful step,
+# whether the handler returns promptly or keeps running beyond the kill grace.
+for handler in returns continues; do
+  project=$tmpdir/catches-$handler
+  write_project "$project" "catches-$handler" '  caught_tac >> simp[]'
+  python3 - "$project/src/AScript.sml" "$handler" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+handler = 'ALL_TAC g' if sys.argv[2] == 'returns' else '(OS.Process.sleep (Time.fromReal 5.0); ALL_TAC g)'
+text = p.read_text().replace('Theorem t:', '''fun caught_tac g =
+  ((OS.Process.sleep (Time.fromReal 5.0); ALL_TAC g) handle _ => ''' + handler + ''');
+
+Theorem t:''')
+p.write_text(text)
+PY
+  require_timeout_failure "catches-$handler" caught_tac
+  if grep -q 'Illegal instruction\|hol run failed' "$tmpdir/catches-$handler.log"; then
+    echo "catches-$handler: timeout crashed the HOL process" >&2
+    exit 1
+  fi
+done
