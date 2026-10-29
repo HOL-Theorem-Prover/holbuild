@@ -55,12 +55,10 @@ fun write_text path text =
   end
 
 fun temp_dir_near path =
-  Path.concat(Path.dir path,
-              "." ^ Path.file path ^ "." ^ Path.file (FS.tmpName ()) ^ ".d")
+  HolbuildTempPath.near path ".d"
 
 fun temp_file_near path =
-  Path.concat(Path.dir path,
-              "." ^ Path.file path ^ "." ^ Path.file (FS.tmpName ()) ^ ".tmp")
+  HolbuildTempPath.near path ".tmp"
 
 fun tar_operation operation =
   operation () handle HolbuildTar.Error msg => raise Error msg

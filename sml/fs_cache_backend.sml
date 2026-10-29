@@ -26,8 +26,7 @@ fun ensure_dir path =
 fun ensure_parent path = ensure_dir (Path.dir path)
 
 fun temp_near path =
-  Path.concat(Path.dir path,
-              "." ^ Path.file path ^ "." ^ Path.file (FS.tmpName ()) ^ ".tmp")
+  HolbuildTempPath.near path ".tmp"
 
 fun remove_file path = FS.remove path handle OS.SysErr _ => ()
 

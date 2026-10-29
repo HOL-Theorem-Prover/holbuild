@@ -149,14 +149,15 @@ val timeout_attrib_sync =
 fun interruptkill worker =
   let
     open Thread
+    val delay = Time.fromReal 0.01
     val _ = interrupt worker handle Thread _ => ()
     fun loop n =
       if not (isActive worker) then ()
-      else if n > 0 then loop (n - 1)
+      else if n > 0 then (OS.Process.sleep delay; loop (n - 1))
       else (Feedback.HOL_WARNING "HolbuildProofRuntime" "interruptkill" "thread killed";
-            kill worker)
+            kill worker handle Thread _ => ())
   in
-    loop 100000000
+    loop 100
   end
 
 (* Local timeout helper adapted from HOL's smlTimeout.  Keeping this here avoids
@@ -180,7 +181,8 @@ fun timeout seconds f x =
     val _ = Thread.setAttributes curattrib
     val _ = if completed then () else interruptkill worker
     val result =
-      case !resultref of
+      if not completed then TimeoutException FunctionTimeout
+      else case !resultref of
           NONE => TimeoutException FunctionTimeout
         | SOME (TimeoutException Interrupt) => TimeoutException FunctionTimeout
         | SOME r => r

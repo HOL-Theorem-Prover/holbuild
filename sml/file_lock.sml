@@ -44,8 +44,11 @@ fun set_close_on_exec fd = (Posix.IO.setfd(fd, Posix.IO.FD.flags [Posix.IO.getfd
 fun whole_file_lock ltype = Posix.IO.FLock.flock {ltype = ltype, whence = Posix.IO.SEEK_SET, start = 0, len = 0, pid = NONE}
 fun try_lock_fd fd = (ignore (Posix.IO.setlk(fd, whole_file_lock Posix.IO.F_WRLCK)); true) handle OS.SysErr _ => false
 fun wait_lock_fd ltype fd =
-  ignore (Posix.IO.setlkw(fd, whole_file_lock ltype))
-  handle e as OS.SysErr (_, SOME err) => if err = Posix.Error.intr then wait_lock_fd ltype fd else raise e
+  ignore (Posix.IO.setlk(fd, whole_file_lock ltype))
+  handle e as OS.SysErr (_, SOME err) =>
+    if err = Posix.Error.again orelse err = Posix.Error.acces orelse err = Posix.Error.intr then
+      (OS.Process.sleep (Time.fromReal 0.2); wait_lock_fd ltype fd)
+    else raise e
 fun blocking_lock_owner fd =
   (case Posix.IO.FLock.pid (Posix.IO.getlk(fd, whole_file_lock Posix.IO.F_WRLCK)) of SOME pid => SOME (pid_text pid) | NONE => NONE)
   handle OS.SysErr _ => NONE
