@@ -35,8 +35,6 @@ fun remote url =
 fun base_url (RemoteCache {base_url, ...}) = base_url
 fun blob_map (RemoteCache {blobs, ...}) = blobs
 
-fun quote s = HolbuildHash.quote s
-
 fun path_exists path = FS.access(path, []) handle OS.SysErr _ => false
 
 fun ensure_dir path =
@@ -65,10 +63,10 @@ fun write_text path text =
 fun temp_path label =
   HolbuildTempPath.temporary ("remote-cache-" ^ label)
 
-fun curl_config_arg () =
+fun curl_config_args () =
   case HolbuildRemoteCacheConfig.curl_config () of
-      SOME path => " --config " ^ quote path
-    | NONE => ""
+      SOME path => ["--config", path]
+    | NONE => []
 
 fun redact_userinfo url =
   let
@@ -98,14 +96,15 @@ fun redact_userinfo url =
           end
   end
 
-fun read_first_token path =
-  case String.tokens Char.isSpace (read_text path) of
+fun first_token text =
+  case String.tokens Char.isSpace text of
       token :: _ => token
     | [] => ""
 
 fun remove_file_before result path = (remove_file path; result)
 
-fun command_success command = OS.Process.isSuccess (OS.Process.system command)
+fun run program args =
+  HolbuildSpawn.run {program = program, args = args, stderr = HolbuildSpawn.Inherit}
 
 fun completed_line text =
   case List.find (String.isSubstring "Completed in") (String.fields (fn c => c = #"\n") text) of
@@ -117,18 +116,17 @@ fun completed_line text =
 fun zstd_compress url src dst =
   if HolbuildStatus.cache_trace_enabled () then
     let
-      val log = dst ^ ".log"
-      val ok = command_success ("zstd -vv -f -T0 -o " ^ quote dst ^ " " ^ quote src ^ " 2> " ^ quote log)
-      val text = if path_exists log then read_text log else ""
+      val result = HolbuildSpawn.run {program = "zstd", args = ["-vv", "-f", "-T0", "-o", dst, src],
+                                      stderr = HolbuildSpawn.Merge}
+      val ok = HolbuildSpawn.succeeded result
     in
-      remove_file log;
       HolbuildStatus.cache_trace
         ("remote cache zstd " ^ redact_userinfo url ^ " " ^
-         (if ok then completed_line text else "failed: " ^ text));
+         (if ok then completed_line (#output result) else "failed: " ^ #output result));
       ok
     end
   else
-    command_success ("zstd -q -f -T0 -o " ^ quote dst ^ " " ^ quote src)
+    HolbuildSpawn.succeeded (run "zstd" ["-q", "-f", "-T0", "-o", dst, src])
 
 fun zstd_content_headers size =
   ["Content-Encoding: zstd", "X-Digest-SizeBytes: " ^ size]
@@ -154,16 +152,12 @@ fun warn_restore_once message =
    message. *)
 fun cli_status timeout_seconds options url =
   let
-    val code = temp_path "code"
-    val command = "curl -q -sS -L --connect-timeout " ^ Int.toString HolbuildHttp.connect_timeout_seconds ^
-                  " --max-time " ^ Int.toString timeout_seconds ^
-                  curl_config_arg () ^ options ^ " -w '%{http_code}' " ^ quote url ^
-                  " > " ^ quote code
-    val status = OS.Process.system command
-    val http_code = if path_exists code then read_first_token code else ""
-    val _ = remove_file code
+    val result =
+      run "curl" (["-q", "-sS", "-L", "--connect-timeout", Int.toString HolbuildHttp.connect_timeout_seconds,
+                   "--max-time", Int.toString timeout_seconds] @
+                  curl_config_args () @ options @ ["-w", "%{http_code}", url])
   in
-    case (OS.Process.isSuccess status, Int.fromString http_code) of
+    case (HolbuildSpawn.succeeded result, Int.fromString (first_token (#output result))) of
         (true, SOME http_code) => HolbuildHttp.Response http_code
       | _ => HolbuildHttp.Failed "the curl command failed"
   end
@@ -174,15 +168,14 @@ fun get_status timeout_seconds {url, dst} =
   else
     (* --compressed advertises curl-supported response encodings, including zstd
        when this curl build has zstd support, and streams decompressed bytes to dst. *)
-    cli_status timeout_seconds (" --compressed -o " ^ quote dst) url
+    cli_status timeout_seconds ["--compressed", "-o", dst] url
 
 fun put_status timeout_seconds headers {url, src} =
   if HolbuildRemoteCacheConfig.uses_libcurl () then
     HolbuildHttp.put {url = url, src = src, headers = headers, timeout = timeout_seconds}
   else
     cli_status timeout_seconds
-               (String.concat (map (fn header => " -H " ^ quote header) headers) ^
-                " -T " ^ quote src ^ " -o /dev/null") url
+               (List.concat (map (fn header => ["-H", header]) headers) @ ["-T", src, "-o", "/dev/null"]) url
 
 (* Under HOLBUILD_CACHE_TRACE, one line per request: its wall time, then the
    HTTP status and the size of the file received or sent. *)
