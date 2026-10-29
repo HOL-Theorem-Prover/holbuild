@@ -160,12 +160,15 @@ fun import_help () = print
 fun help_arg arg = arg = "--help" orelse arg = "-h"
 fun has_help_arg args = List.exists help_arg args
 
+val command_names =
+  ["build", "context", "repl", "run", "execution-plan", "check", "buildhol", "heap", "executable",
+   "clean", "export", "import", "gc", "cache"]
+
 fun known_command command =
-  command = "build" orelse command = "context" orelse command = "repl" orelse
-  command = "run" orelse command = "execution-plan" orelse command = "check" orelse command = "buildhol" orelse
-  command = "heap" orelse command = "executable" orelse command = "clean" orelse command = "export" orelse
-  command = "import" orelse command = "gc" orelse command = "cache" orelse
-  command = "goalfrag-plan"
+  List.exists (fn name => name = command) command_names orelse command = "goalfrag-plan"
+
+fun unknown_command command =
+  Error ("unknown command: " ^ command ^ HolbuildSuggest.did_you_mean command command_names)
 
 fun command_help command =
   case command of
@@ -184,7 +187,7 @@ fun command_help command =
     | "gc" => gc_help ()
     | "cache" => cache_help ()
     | "goalfrag-plan" => raise Error "goalfrag-plan has been removed; use execution-plan THEORY:THEOREM"
-    | _ => raise Error ("unknown command: " ^ command)
+    | _ => raise unknown_command command
 
 fun maybe_handle_command_help args =
   case args of
@@ -192,7 +195,7 @@ fun maybe_handle_command_help args =
     | command :: rest =>
         if has_help_arg rest then
           if known_command command then (command_help command; true)
-          else raise Error ("unknown command: " ^ command)
+          else raise unknown_command command
         else false
 
 fun nonnegative_real label text =
@@ -458,6 +461,18 @@ fun theorem_match theorem source =
       | _ => raise Error ("duplicate theorem in " ^ describe_source source ^ ": " ^ theorem)
   end
 
+(* The theorem and termination names theorem_match accepts for source. *)
+fun proof_unit_names source =
+  let
+    val path = #source_path source
+    val text = read_text path
+  in
+    map (fn ({name, ...} : HolbuildTheoryCheckpoints.boundary) => name)
+        (HolbuildBuildExec.discover_theorem_boundaries path text) @
+    map (fn ({name, ...} : HolbuildTheoryCheckpoints.termination) => name)
+        (HolbuildBuildExec.discover_termination_diagnostics_strict path text)
+  end
+
 fun write_text_file path text =
   let val out = TextIO.openOut path
   in TextIO.output(out, text); TextIO.closeOut out end
@@ -605,7 +620,10 @@ fun print_static_execution_plan project new_ir source theorem unit_opt =
 fun find_theory_source command index theory =
   case List.filter (fn source => theory_source source andalso #logical_name source = theory) index of
       [source] => source
-    | [] => raise Error ("theory not found for " ^ command ^ ": " ^ theory)
+    | [] =>
+        raise Error ("theory not found for " ^ command ^ ": " ^ theory ^
+                     HolbuildSuggest.did_you_mean theory
+                       (map #logical_name (List.filter theory_source index)))
     | matches =>
         raise Error ("ambiguous theory for " ^ command ^ ": " ^ theory ^ " in " ^
                      String.concatWith ", " (map describe_source matches))
@@ -613,7 +631,9 @@ fun find_theory_source command index theory =
 fun find_theorem_in_source theorem source =
   case theorem_match theorem source of
       SOME (_, unit) => unit
-    | NONE => raise Error ("proof unit not found for execution-plan: " ^ #logical_name source ^ ":" ^ theorem)
+    | NONE =>
+        raise Error ("proof unit not found for execution-plan: " ^ #logical_name source ^ ":" ^ theorem ^
+                     HolbuildSuggest.did_you_mean theorem (proof_unit_names source))
 
 fun print_execution_plan_selector new_ir project selector =
   let
@@ -948,6 +968,7 @@ fun build_iteration_error_message exn =
     | HolbuildSourceIndex.ErrorWithDebugArtifacts (msg, _) => SOME msg
     | HolbuildDependencies.Error msg => SOME msg
     | HolbuildBuildPlan.Error msg => SOME msg
+    | HolbuildBuildPlan.UnknownTarget unknown => SOME (HolbuildBuildPlan.unknown_target_message unknown)
     | HolbuildBuildExec.Error msg => SOME msg
     | HolbuildBuildExec.ErrorWithDebugArtifacts (msg, _) => SOME msg
     | HolbuildHolSharedCache.Error msg => SOME msg
@@ -1370,7 +1391,13 @@ fun heap_named project command target =
         SOME (heap as HolbuildProject.Heap {kind, ...}) =>
         if heap_kind_matches command kind then heap
         else raise Error (target ^ " is a " ^ heap_kind_name kind ^ " target, not a " ^ command ^ " target")
-      | NONE => raise Error ("unknown " ^ command ^ " target: " ^ target)
+      | NONE =>
+          raise Error ("unknown " ^ command ^ " target: " ^ target ^
+                       HolbuildSuggest.did_you_mean target
+                         (List.mapPartial
+                            (fn HolbuildProject.Heap {name, kind, ...} =>
+                                if heap_kind_matches command kind then SOME name else NONE)
+                            (#heaps project)))
   end
 
 fun build_heap_kind tc cli_jobs command target =
@@ -1581,8 +1608,14 @@ fun dispatch tc jobs args =
     | "repl" :: rest => (reject_json "repl"; repl_hol tc jobs rest)
     | "export" :: rest => (reject_json "export"; export_archive tc jobs rest)
     | "import" :: rest => (reject_json "import"; import_archive rest)
-    | cmd :: _ => if known_command cmd then raise Error ("unknown command: " ^ cmd)
-                  else build tc jobs args
+    | cmd :: _ =>
+        if known_command cmd then raise Error ("unknown command: " ^ cmd)
+        else
+          (* A first word that is no target may be a mistyped command. *)
+          build tc jobs args
+          handle HolbuildBuildPlan.UnknownTarget (target, candidates) =>
+            raise HolbuildBuildPlan.UnknownTarget
+                    (target, if target = cmd then command_names @ candidates else candidates)
 
 datatype gc_scope = GcProjectAndCache | GcProjectOnly | GcCacheOnly | GcToolchainsOnly
 
@@ -1797,6 +1830,7 @@ fun main raw_args =
        | HolbuildSourceIndex.ErrorWithDebugArtifacts (msg, artifacts) => err_with_debug_artifacts msg artifacts
        | HolbuildDependencies.Error msg => err msg
        | HolbuildBuildPlan.Error msg => err msg
+       | HolbuildBuildPlan.UnknownTarget unknown => err (HolbuildBuildPlan.unknown_target_message unknown)
        | HolbuildBuildExec.Error msg => err msg
        | HolbuildBuildExec.ErrorWithDebugArtifacts (msg, artifacts) => err_with_debug_artifacts msg artifacts
        | HolbuildHolSharedCache.Error msg => err msg

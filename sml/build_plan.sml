@@ -5,6 +5,11 @@ structure Path = OS.Path
 structure FS = OS.FileSys
 
 exception Error of string
+(* A target no node is named, with the names it could have meant. *)
+exception UnknownTarget of string * string list
+
+fun unknown_target_message (target, candidates) =
+  "unknown build target: " ^ target ^ HolbuildSuggest.did_you_mean target candidates
 
 type node =
   { source : HolbuildSourceIndex.source,
@@ -287,7 +292,7 @@ fun target_roots lookup nodes selection =
       let
         fun find target =
           case lookup target of
-              [] => raise Error ("unknown build target: " ^ target)
+              [] => raise UnknownTarget (target, map logical_name nodes)
             | matches => matches
       in
         List.concat (map find targets)
