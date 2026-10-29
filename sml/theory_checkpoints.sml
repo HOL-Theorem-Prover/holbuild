@@ -135,25 +135,28 @@ fun begin_theorem_line ({kind, name, tactic_text, context_path, context_ok,
      if has_proof_attrs then "true" else "false",
      ");\n"]
 
-fun begin_termination_line ({name, definition_start, quote_text, ...} : termination) =
+fun begin_termination_line ({name, definition_start, ...} : termination) =
   String.concat
-    ["val _ = HolbuildTerminationDiagnosticsRuntime.report ",
+    ["val _ = HolbuildTerminationDiagnosticsRuntime.begin_definition ",
      HolbuildToolchain.sml_string name, " ",
-     Int.toString definition_start, " ",
-     HolbuildToolchain.sml_string quote_text,
+     Int.toString definition_start,
      ";\n"]
 
-fun termination_tactic_prefix ({name, tactic_text, proof_ir_plan, ...} : termination) =
-  case proof_ir_plan of
-      NONE => ""
-    | SOME plan =>
-        String.concat
-          ["(HolbuildProofRuntime.termination_tactic ",
-           HolbuildToolchain.sml_string name, " ",
-           HolbuildToolchain.sml_string tactic_text, " (", plan, ") ("]
+fun termination_tactic_prefix ({name, definition_start, tactic_text, proof_ir_plan, ...} : termination) =
+  String.concat
+    ["(HolbuildTerminationDiagnosticsRuntime.report_goal ",
+     HolbuildToolchain.sml_string name, " ",
+     Int.toString definition_start, " (",
+     case proof_ir_plan of
+         NONE => ""
+       | SOME plan =>
+           String.concat
+             ["(HolbuildProofRuntime.termination_tactic ",
+              HolbuildToolchain.sml_string name, " ",
+              HolbuildToolchain.sml_string tactic_text, " (", plan, ") ("]]
 
 fun termination_tactic_suffix ({proof_ir_plan, ...} : termination) =
-  case proof_ir_plan of NONE => "" | SOME _ => "))"
+  case proof_ir_plan of NONE => "))" | SOME _ => "))))"
 
 fun save_declaration_context_line ({safe_name, context_path, context_ok, ...} : declaration_checkpoint) =
   String.concat
@@ -168,34 +171,23 @@ fun runtime_lines lines =
 
 val runtime_load_lines = []
 
+(* The goal is printed from inside the Termination tactic: deriving it with a
+   second Defn.Hol_defn would advance HOL's theorem numbering, so the theory
+   would differ from an uninstrumented build.  A definition that fails before
+   HOL runs its tactic prints no goal, so each definition first prints a start
+   marker; an earlier definition's goal is then not reported for it. *)
 val termination_runtime_lines =
-  ["HolbuildRuntime.load \"Defn\";",
-   "HolbuildRuntime.load \"proofManagerLib\";",
-   "structure HolbuildTerminationDiagnosticsRuntime = struct",
-   "exception Rollback",
+  ["structure HolbuildTerminationDiagnosticsRuntime = struct",
    "fun print_line text = (TextIO.output(TextIO.stdOut, text ^ \"\\n\"); TextIO.flushOut TextIO.stdOut)",
-   "fun cleanup_goals () = ((proofManagerLib.drop_all(); ()) handle _ => ())",
    "fun assumptions_text [] = \"\"",
    "  | assumptions_text asms = String.concat (map (fn tm => \"asm: \" ^ Parse.term_to_string tm ^ \"\\n\") asms)",
    "fun goal_text (asms, concl) = assumptions_text asms ^ \"goal: \" ^ Parse.term_to_string concl",
    "fun marker name start = String.concat [\"holbuild termination condition goal for \", name, \" at \", Int.toString start, \":\"]",
    "fun print_goal name start text = (print_line (marker name start); print_line text; print_line \"holbuild termination condition goal end\")",
-   "fun extract start body =",
-   "  let",
-   "    val result = ref NONE",
-   "    fun inner () =",
-   "      let",
-   "        val defn = Defn.Hol_defn (\"holbuild_tc_extract_\" ^ Int.toString start) [QUOTE body]",
-   "        val _ = Defn.tgoal defn",
-   "        val text = case proofManagerLib.top_goals() of [] => \"<no termination condition goals>\" | goal :: _ => goal_text goal",
-   "        val _ = result := SOME text",
-   "        val _ = cleanup_goals ()",
-   "      in raise Rollback end",
-   "    val _ = (Parse.try_grammar_extension (fn () => Theory.try_theory_extension inner ()) ()) handle Rollback => ()",
-   "  in !result end",
-   "fun report name start body =",
-   "  (case extract start body of SOME text => print_goal name start text | NONE => ())",
-   "  handle e => (cleanup_goals (); print_line (String.concat [\"holbuild termination condition goal extraction failed for \", name, \" at \", Int.toString start, \": \", General.exnMessage e]))",
+   "fun begin_definition name start = print_line (String.concat [\"holbuild termination definition start for \", name, \" at \", Int.toString start])",
+   "fun report_goal name start tac =",
+   "  HolbuildTacticCompat.lift_context_tactic (fn ctxt => fn g =>",
+   "    (print_goal name start (goal_text g); HolbuildTacticCompat.run_tactic ctxt tac g))",
    "end;"]
 
 fun termination_runtime_prelude [] = ""

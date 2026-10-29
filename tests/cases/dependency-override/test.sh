@@ -224,3 +224,86 @@ require_grep "package: mid_git \[root=$recursive_git_project/.holbuild/src/mid_g
 require_grep "package: transitive_git \[root=$recursive_git_project/.holbuild/src/transitive_git" "$recursive_git_log"
 require_grep "override: transitive_git git -> $transitive_git" "$recursive_git_log"
 [ "$(git -C "$recursive_git_project/.holbuild/src/transitive_git" rev-parse HEAD)" = "$transitive_git_rev" ]
+
+# A from/path/manifest shim lives inside its from dependency's checkout, so
+# overriding the from dependency must move the shim's package root with it.
+shim_foo=$tmpdir/shim-foo
+mkdir -p "$shim_foo/sub/lib"
+cat > "$shim_foo/holproject.toml" <<'TOML'
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[project]
+name = "foo"
+
+[build]
+members = ["."]
+exclude = ["sub"]
+TOML
+cat > "$shim_foo/sub/lib/shimLibScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "shimLib";
+val shim_thm = store_thm("shim_thm", ``T``, ACCEPT_TAC TRUTH);
+val _ = export_theory();
+SML
+git -C "$shim_foo" init -q
+git_identity "$shim_foo"
+shim_foo_rev=$(commit_repo "$shim_foo")
+
+shim_project=$tmpdir/shim-project
+mkdir -p "$shim_project/shims"
+cat > "$shim_project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "shim_consumer"
+
+[build]
+members = ["."]
+roots = ["useShimScript.sml"]
+
+[dependencies.foo]
+git = "https://example.invalid/foo.git"
+rev = "$shim_foo_rev"
+
+[dependencies.keccak]
+from = "foo"
+path = "sub/lib"
+manifest = "shims/keccak.toml"
+TOML
+cat > "$shim_project/shims/keccak.toml" <<'TOML'
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[project]
+name = "keccak"
+
+[build]
+members = ["."]
+TOML
+cat > "$shim_project/useShimScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+open shimLibTheory;
+val _ = new_theory "useShim";
+val use_thm = store_thm("use_thm", ``T``, ACCEPT_TAC shimLibTheory.shim_thm);
+val _ = export_theory();
+SML
+cat > "$shim_project/.holconfig.toml" <<'TOML'
+[overrides.foo]
+path = "../shim-foo"
+TOML
+
+shim_log=$tmpdir/shim.log
+(cd "$shim_project" && env -u HOLBUILD_CANONICAL_HOL_GIT "$HOLBUILD_BIN" context) > "$shim_log"
+require_grep "package-source-root: keccak $shim_foo\$" "$shim_log"
+require_grep "package-root: keccak $shim_foo/sub/lib\$" "$shim_log"
+require_grep "dependency: keccak \[from=foo, path=sub/lib, manifest=shims/keccak.toml, local=$shim_foo/sub/lib," "$shim_log"
+
+rm -rf "$shim_project/.holbuild"
+(cd "$shim_project" && env -u HOLBUILD_CANONICAL_HOL_GIT "$HOLBUILD_BIN" build) > "$tmpdir/shim-build.log" 2>&1 ||
+  { cat "$tmpdir/shim-build.log" >&2; exit 1; }
+if [ -e "$shim_project/.holbuild/src/foo" ]; then
+  echo "overridden from dependency was materialized into .holbuild/src" >&2
+  exit 1
+fi

@@ -88,14 +88,7 @@ fun rename_replace {old, new} =
      OS.FileSys.rename {old = old, new = new}
      handle _ => raise e)
 
-fun tmp_path_for path =
-  let
-    val dir = OS.Path.dir path
-    val file = OS.Path.file path
-    val tmp_file = "." ^ file ^ "." ^ OS.Path.file (OS.FileSys.tmpName ()) ^ ".tmp"
-  in
-    OS.Path.concat (dir, tmp_file)
-  end
+fun tmp_path_for path = HolbuildTempPath.near path ".tmp"
 
 fun write_text_atomically path text =
   let

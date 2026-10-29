@@ -33,8 +33,7 @@ fun ensure_dir path =
 fun ensure_parent path = ensure_dir (Path.dir path)
 
 fun temp_near path =
-  Path.concat(Path.dir path,
-              "." ^ Path.file path ^ "." ^ Path.file (FS.tmpName ()) ^ ".tmp")
+  HolbuildTempPath.near path ".tmp"
 
 fun remove_file path = FS.remove path handle OS.SysErr _ => ()
 
@@ -2085,32 +2084,42 @@ fun remote_cache_source_with_action remote key manifest : HolbuildCacheTransfer.
   {get_action = fn requested => if requested = key then SOME manifest else HolbuildRemoteCache.get_action remote requested,
    fetch_blob = HolbuildRemoteCache.fetch_blob remote}
 
+(* Copies the remote entry for key into the local cache.  Returns false on a
+   remote miss and raises if the entry is unusable. *)
+fun copy_remote_cache_entry root url key =
+  let
+    val remote = HolbuildRemoteCache.remote url
+    val local_cache = HolbuildFSCacheBackend.filesystem root
+  in
+    case HolbuildRemoteCache.get_action remote key of
+        NONE => false
+      | SOME manifest =>
+          (HolbuildFSCacheBackend.ensure_layout local_cache;
+           HolbuildCacheTransfer.copy_entry
+             {source = remote_cache_source_with_action remote key manifest,
+              destination = fs_cache_destination local_cache,
+              tmp_dir = HolbuildFSCacheBackend.tmp_dir local_cache}
+             key;
+           true)
+  end
+
 fun hydrate_remote_cache_key root key =
   case HolbuildRemoteCacheConfig.url () of
       NONE => false
     | SOME url =>
-        let
-          val remote = HolbuildRemoteCache.remote url
-          val local_cache = HolbuildFSCacheBackend.filesystem root
-        in
-          case HolbuildRemoteCache.get_action remote key of
-              NONE => (cache_trace ("remote cache miss: " ^ key); false)
-            | SOME manifest =>
-                let
-                  val _ = HolbuildFSCacheBackend.ensure_layout local_cache
-                  val _ = HolbuildCacheTransfer.copy_entry
-                            {source = remote_cache_source_with_action remote key manifest,
-                             destination = fs_cache_destination local_cache,
-                             tmp_dir = HolbuildFSCacheBackend.tmp_dir local_cache}
-                            key
-                in
-                  cache_trace ("remote cache hydrated: " ^ key);
-                  true
-                end
-        end
+        (if copy_remote_cache_entry root url key then
+           (cache_trace ("remote cache hydrated: " ^ key); true)
+         else
+           (cache_trace ("remote cache miss: " ^ key); false))
         handle e =>
           (warn ("remote cache entry unusable for " ^ key ^ ": " ^ General.exnMessage e);
            false)
+
+fun prefetch_remote_cache_key root url key =
+  if Option.isSome (HolbuildCache.get_action root key) then ()
+  else if copy_remote_cache_entry root url key then
+    cache_trace ("remote cache prefetched: " ^ key)
+  else ()
 
 fun ensure_local_cache_entry root key =
   case HolbuildCache.get_action root key of
@@ -2425,6 +2434,11 @@ fun discover_boundaries_and_terminations source_path source_text =
    staged scripts carried location pragmas are not resumed. *)
 val theorem_location_schema = "source_pragmas_v1"
 
+(* Context checkpoints also hold the theorem numbering HOL assigned so far.
+   States saved while termination goals were derived by a second Hol_defn
+   carry advanced numbering, so they are not resumed. *)
+val termination_goal_schema = "in_tactic_v1"
+
 fun theorem_checkpoint_key {kind, name, safe_name, boundary, deps_key, proof_engine, prefix_hash} =
   HolbuildToolchain.hash_text
     (String.concatWith "\n"
@@ -2436,7 +2450,8 @@ fun theorem_checkpoint_key {kind, name, safe_name, boundary, deps_key, proof_eng
         "deps_key=" ^ deps_key,
         "proof_engine=" ^ proof_engine,
         "prefix_key=" ^ prefix_hash,
-        "theorem_locations=" ^ theorem_location_schema] ^ "\n")
+        "theorem_locations=" ^ theorem_location_schema,
+        "termination_goals=" ^ termination_goal_schema] ^ "\n")
 
 fun declaration_checkpoint_key {name, safe_name, boundary, deps_key, proof_engine, prefix_hash} =
   HolbuildToolchain.hash_text
@@ -2448,7 +2463,8 @@ fun declaration_checkpoint_key {name, safe_name, boundary, deps_key, proof_engin
         "deps_key=" ^ deps_key,
         "proof_engine=" ^ proof_engine,
         "prefix_key=" ^ prefix_hash,
-        "theorem_locations=" ^ theorem_location_schema] ^ "\n")
+        "theorem_locations=" ^ theorem_location_schema,
+        "termination_goals=" ^ termination_goal_schema] ^ "\n")
 
 fun proof_timeout_field proof_timeout = ("proof_timeout", timeout_text proof_timeout)
 
@@ -2492,7 +2508,8 @@ fun failed_prefix_ok proof_engine proof_timeout deps_key safe_name pre_hash head
      ("header_key", header_hash),
      ("failure_diagnostic_key", failed_prefix_diagnostic_key proof_engine),
      ("resume_schema_key", failed_prefix_resume_schema_key proof_engine),
-     ("theorem_locations", theorem_location_schema)]
+     ("theorem_locations", theorem_location_schema),
+     ("termination_goals", termination_goal_schema)]
 
 fun theorem_checkpoint_specs proof_engine proof_timeout project node deps_key inputs_key source proof_ir_plans (boundaries : HolbuildTheoryCheckpoints.boundary list) =
   let
@@ -2992,8 +3009,13 @@ fun write_theory_script policy project base_context plan keys input_key toolchai
       fun failed_prefix_at_least_as_late failed NONE = true
         | failed_prefix_at_least_as_late failed (SOME replay) =
             #boundary (#checkpoint failed) >= #boundary replay
-      val failed_prefix = if proof_steps_enabled policy then best_failed_prefix_checkpoint (tactic_timeout policy) checkpoints else NONE
-      val replay = replay_candidate policy project node checkpoints declaration_checkpoints
+      val failed_prefix =
+        if proof_steps_enabled policy andalso not (trace_steps policy) then
+          best_failed_prefix_checkpoint (tactic_timeout policy) checkpoints
+        else NONE
+      val replay =
+        if trace_steps policy then NONE
+        else replay_candidate policy project node checkpoints declaration_checkpoints
     in
       case failed_prefix of
           SOME failed =>
@@ -4790,9 +4812,10 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
                          val msg = build_error_message e
                          val artifacts = build_error_debug_artifacts e
                        in
-                         HolbuildStatus.fail_with_debug_artifacts
+                         (HolbuildStatus.fail_with_debug_artifacts
                            status (HolbuildBuildPlan.key node) (HolbuildBuildPlan.logical_name node)
-                           msg artifacts;
+                           msg artifacts
+                          handle IO.Io _ => ());
                          finish_failure id msg artifacts;
                          worker_exit ()
                        end)
@@ -4897,6 +4920,64 @@ fun dump_keys_if_requested config_lines_for_node toolchain_key plan keys =
           write_text_atomic path text
         end
 
+(* A node whose metadata already records its input key is most likely up to
+   date, so fetching its entry would only download what the build won't use. *)
+fun prefetch_key (options : build_options) project keys node =
+  let val input_key = HolbuildBuildPlan.input_key_for keys node
+  in
+    case #kind (HolbuildBuildPlan.source_of node) of
+        HolbuildSourceIndex.TheoryScript =>
+          if cache_enabled node andalso not (force_node options project node) andalso
+             not (case current_metadata (metadata_path project node) of
+                      SOME text => metadata_input_key_matches input_key text
+                    | NONE => false) then
+            SOME input_key
+          else NONE
+      | _ => NONE
+  end
+
+(* Starts jobs background threads that hydrate the plan's remote theory cache
+   entries into the local cache, in build order, while the build runs; returns
+   a function that drops the nodes not yet started and waits for the copies in
+   flight.  The build workers keep
+   their own demand restore, so they never wait behind a prefetch. *)
+fun start_remote_cache_prefetch (options : build_options) project plan keys jobs =
+  case HolbuildRemoteCacheConfig.url () of
+      SOME url =>
+        if not (#use_cache options) then (fn () => ())
+        else
+          let
+            val root = cache_root ()
+            val pending = ref (HolbuildBuildPlan.selected_nodes plan)
+            val mutex = Mutex.mutex ()
+            fun with_lock f =
+              (Mutex.lock mutex; f () before Mutex.unlock mutex)
+              handle e => (Mutex.unlock mutex; raise e)
+            fun next () =
+              with_lock (fn () =>
+                case !pending of
+                    [] => NONE
+                  | node :: rest => (pending := rest; SOME node))
+            fun prefetch node =
+              case prefetch_key options project keys node of
+                  SOME key => prefetch_remote_cache_key root url key
+                | NONE => ()
+            (* Silent on failure: the demand restore of the same key retries
+               and reports. *)
+            fun worker () =
+              case next () of
+                  NONE => ()
+                | SOME node => ((prefetch node handle _ => ()); worker ())
+            val threads = List.tabulate (jobs, fn _ => Thread.fork (worker, []))
+            fun wait_threads () =
+              if List.exists Thread.isActive threads then
+                (OS.Process.sleep (Time.fromReal 0.05); wait_threads ())
+              else ()
+          in
+            fn () => (with_lock (fn () => pending := []); wait_threads ())
+          end
+    | NONE => (fn () => ())
+
 fun build (options : build_options) tc project plan toolchain_key jobs =
   let
     val budget_state = create_checkpoint_budget_state project
@@ -4912,8 +4993,15 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
     let
       val status = HolbuildStatus.create {total = length (HolbuildBuildPlan.selected_nodes plan), jobs = jobs}
       fun run () =
-        if jobs <= 1 then build_serial dat_hash_cache status options tc project base_context plan keys toolchain_key budget_state
-        else build_parallel dat_hash_cache status options tc project base_context plan keys toolchain_key jobs budget_state
+        let
+          val stop_prefetch = start_remote_cache_prefetch options project plan keys jobs
+          fun build_nodes () =
+            if jobs <= 1 then build_serial dat_hash_cache status options tc project base_context plan keys toolchain_key budget_state
+            else build_parallel dat_hash_cache status options tc project base_context plan keys toolchain_key jobs budget_state
+        in
+          (build_nodes (); stop_prefetch ())
+          handle e => (stop_prefetch (); raise e)
+        end
     in
       (run (); HolbuildStatus.finish status;
        finalize_checkpoint_budget_state_excluding

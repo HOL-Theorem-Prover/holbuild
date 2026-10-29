@@ -149,14 +149,15 @@ val timeout_attrib_sync =
 fun interruptkill worker =
   let
     open Thread
+    val delay = Time.fromReal 0.01
     val _ = interrupt worker handle Thread _ => ()
     fun loop n =
       if not (isActive worker) then ()
-      else if n > 0 then loop (n - 1)
+      else if n > 0 then (OS.Process.sleep delay; loop (n - 1))
       else (Feedback.HOL_WARNING "HolbuildProofRuntime" "interruptkill" "thread killed";
-            kill worker)
+            kill worker handle Thread _ => ())
   in
-    loop 100000000
+    loop 100
   end
 
 (* Local timeout helper adapted from HOL's smlTimeout.  Keeping this here avoids
@@ -180,7 +181,8 @@ fun timeout seconds f x =
     val _ = Thread.setAttributes curattrib
     val _ = if completed then () else interruptkill worker
     val result =
-      case !resultref of
+      if not completed then TimeoutException FunctionTimeout
+      else case !resultref of
           NONE => TimeoutException FunctionTimeout
         | SOME (TimeoutException Interrupt) => TimeoutException FunctionTimeout
         | SOME r => r
@@ -191,6 +193,12 @@ fun timeout seconds f x =
 fun timeout_message label seconds =
   String.concat ["holbuild tactic timeout after ", Real.toString seconds, "s: ", label]
 
+(* Raised when a proof step exceeds the tactic timeout.  It is not a tactic
+   failure: TRY, ORELSE and structural repeat propagate it instead of taking
+   their failure branch, so a step that only stopped because of the timeout
+   fails the build. *)
+exception TacticTimeout of string
+
 fun with_tactic_timeout label f x =
   case !tactic_timeout_ref of
       NONE => f x
@@ -198,7 +206,7 @@ fun with_tactic_timeout label f x =
         (timeout seconds f x
          handle FunctionTimeout =>
            (write_timeout_marker label seconds;
-            raise Fail (timeout_message label seconds)))
+            raise TacticTimeout (timeout_message label seconds)))
 
 fun save_checkpoint label default_share path ok_text depth =
   if not (!checkpoint_enabled_ref) then ()
@@ -714,20 +722,32 @@ fun print_finish_goal_state name =
     result
   end
 
+fun print_step_failure_goal_state label goals =
+  print_goal_state label goals
+  handle print_e =>
+    TextIO.output(TextIO.stdErr,
+      String.concat ["holbuild failed to print goal state: ", General.exnMessage print_e, "\n"])
+
 fun emit_step_failure_diagnostic label goals =
   (save_failed_prefix_checkpoint ();
-   print_goal_state label goals
-   handle print_e =>
-     TextIO.output(TextIO.stdErr,
-       String.concat ["holbuild failed to print goal state: ", General.exnMessage print_e, "\n"]))
+   print_step_failure_goal_state label goals)
 
+(* A timeout inside a TRY, ORELSE or repeat body is reported at once, since no
+   combinator recovers from it.  It saves no failed-prefix checkpoint inside
+   the body: resuming there would commit to that body without rerunning the
+   combinator that chose it.  raise_body_timeout saves one where the outermost
+   combinator started the body instead. *)
 fun report_step_failure_with_goals label goals e =
-  if !suppress_expected_failure_diagnostics_ref then
-    (suppressed_failure_diagnostic_ref := SOME (fn () => emit_step_failure_diagnostic label goals);
-     raise e)
-  else
-    (emit_step_failure_diagnostic label goals;
-     raise e)
+  case (e, !suppress_expected_failure_diagnostics_ref) of
+      (TacticTimeout _, true) =>
+        (print_step_failure_goal_state label goals;
+         raise e)
+    | (_, true) =>
+        (suppressed_failure_diagnostic_ref := SOME (fn () => emit_step_failure_diagnostic label goals);
+         raise e)
+    | (_, false) =>
+        (emit_step_failure_diagnostic label goals;
+         raise e)
 
 fun report_finish_failure name e =
   let
@@ -1071,6 +1091,16 @@ fun with_expected_failures_suppressed f =
 
 fun discard_suppressed_failure_diagnostic () = suppressed_failure_diagnostic_ref := NONE
 
+(* Re-raises a timeout from a TRY, ORELSE or repeat body.  The outermost such
+   combinator restores the state from before it ran the body -- its entry for
+   TRY and ORELSE, the start of the timed-out iteration for repeat -- and saves
+   the failed-prefix checkpoint there, the latest point no combinator choice
+   depends on. *)
+fun raise_body_timeout saved e =
+  (if !suppress_expected_failure_diagnostics_ref then ()
+   else (restore_runtime_state saved; save_failed_prefix_checkpoint ());
+   raise e)
+
 fun raise_choice_failure (e, diagnostic) =
   (suppressed_failure_diagnostic_ref := diagnostic;
    if !suppress_expected_failure_diagnostics_ref then ()
@@ -1339,6 +1369,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
                     NONE =>
                       (discard_suppressed_failure_diagnostic ();
                        record_or_replay_event (HolbuildProofIr.ChoiceEvent (path, n)))
+                  | SOME (e as TacticTimeout _) => raise_body_timeout saved e
                   | SOME e =>
                       (restore_runtime_state saved;
                        attempt (n + 1) (alt_line + 1 + HolbuildProofIr.display_line_count_list body) rest (SOME (e, diagnostic)))
@@ -1376,6 +1407,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
           let val result = (with_expected_failures_suppressed (fn () => run_list (d + 1) (path @ [HolbuildProofIr.PathTry]) 0 body); NONE) handle e => SOME e
           in case result of
                  NONE => record_or_replay_event (HolbuildProofIr.TryEvent (path, true))
+               | SOME (e as TacticTimeout _) => raise_body_timeout saved e
                | SOME _ =>
                    (restore_runtime_state saved;
                     discard_suppressed_failure_diagnostic ();
@@ -1396,7 +1428,8 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
           else let val saved = runtime_state_snapshot()
                    val result = (with_expected_failures_suppressed (fn () => run_list (d + 1) (path @ [HolbuildProofIr.PathRepeat iter]) 0 body); NONE) handle e => SOME e
                in case result of
-                      SOME _ =>
+                      SOME (e as TacticTimeout _) => raise_body_timeout saved e
+                    | SOME _ =>
                         (restore_runtime_state saved;
                          discard_suppressed_failure_diagnostic ();
                          record_or_replay_event (HolbuildProofIr.RepeatStopEvent (path, iter)))
