@@ -23,8 +23,6 @@ val empty_metadata : metadata =
    hol_repo = NONE,
    hol_rev = NONE}
 
-fun quote s = HolbuildHash.quote s
-
 fun path_exists path = FS.access(path, []) handle OS.SysErr _ => false
 
 fun ensure_dir path =
@@ -35,9 +33,7 @@ fun ensure_dir path =
 fun remove_file path = FS.remove path handle OS.SysErr _ => ()
 
 fun remove_tree path =
-  if path = "" orelse path = "." orelse path = "/" then
-    raise Error ("refusing to remove unsafe archive path: " ^ path)
-  else ignore (OS.Process.system ("rm -rf " ^ quote path))
+  HolbuildRemoveTree.remove path handle HolbuildRemoveTree.Error msg => raise Error msg
 
 fun read_text path =
   let val input = TextIO.openIn path
@@ -55,12 +51,10 @@ fun write_text path text =
   end
 
 fun temp_dir_near path =
-  Path.concat(Path.dir path,
-              "." ^ Path.file path ^ "." ^ Path.file (FS.tmpName ()) ^ ".d")
+  HolbuildTempPath.near path ".d"
 
 fun temp_file_near path =
-  Path.concat(Path.dir path,
-              "." ^ Path.file path ^ "." ^ Path.file (FS.tmpName ()) ^ ".tmp")
+  HolbuildTempPath.near path ".tmp"
 
 fun tar_operation operation =
   operation () handle HolbuildTar.Error msg => raise Error msg

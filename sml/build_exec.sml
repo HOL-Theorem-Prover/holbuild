@@ -33,8 +33,7 @@ fun ensure_dir path =
 fun ensure_parent path = ensure_dir (Path.dir path)
 
 fun temp_near path =
-  Path.concat(Path.dir path,
-              "." ^ Path.file path ^ "." ^ Path.file (FS.tmpName ()) ^ ".tmp")
+  HolbuildTempPath.near path ".tmp"
 
 fun remove_file path = FS.remove path handle OS.SysErr _ => ()
 
@@ -43,6 +42,10 @@ fun rename_replace {old, new} =
   handle OS.SysErr _ =>
     (FS.remove new handle OS.SysErr _ => ();
      FS.rename {old = old, new = new})
+
+val remove_tree = HolbuildRemoveTree.remove
+
+fun remove_trees paths = List.app remove_tree paths
 
 fun copy_binary src dst =
   let
@@ -681,26 +684,11 @@ fun remove_legacy_checkpoint_family project node =
   end
   handle Fail "holbuild checkpoint directory missing" => ()
 
-fun remove_checkpoint_tree path =
-  if FS.access(path, []) handle OS.SysErr _ => false then
-    ignore (OS.Process.system ("rm -rf " ^ HolbuildToolchain.quote path))
-  else ()
-
-fun remove_checkpoint_trees paths =
-  let val existing = List.filter (fn path => FS.access(path, []) handle OS.SysErr _ => false) paths
-  in
-    if null existing then ()
-    else
-      ignore
-        (OS.Process.system
-           ("rm -rf " ^ String.concatWith " " (map HolbuildToolchain.quote existing)))
-  end
-
 fun remove_theorem_checkpoints_for_deps project node deps_key =
-  remove_checkpoint_tree (theorem_checkpoints_for_deps_root project node deps_key)
+  remove_tree (theorem_checkpoints_for_deps_root project node deps_key)
 
 fun remove_declaration_checkpoints_for_deps project node deps_key =
-  remove_checkpoint_tree (declaration_checkpoints_for_deps_root project node deps_key)
+  remove_tree (declaration_checkpoints_for_deps_root project node deps_key)
 
 fun remove_deps_checkpoint_family project node deps_key deps_loaded =
   (* Delete source-context descendants before deleting/replacing the deps parent.
@@ -714,16 +702,10 @@ fun remove_checkpoint_family project node =
   let val base = checkpoint_base project node
   in
     remove_legacy_checkpoint_family project node;
-    remove_checkpoint_trees [base ^ ".theorems", base ^ ".decls", base ^ ".deps"]
+    remove_trees [base ^ ".theorems", base ^ ".decls", base ^ ".deps"]
   end
 
 fun path_exists path = FS.access(path, []) handle OS.SysErr _ => false
-
-fun remove_tree path =
-  ignore (OS.Process.system ("rm -rf " ^ HolbuildToolchain.quote path))
-
-fun remove_tree_if_exists path =
-  if path_exists path then remove_tree path else ()
 
 fun children dir =
   if not (path_exists dir) then []
@@ -856,7 +838,7 @@ fun checkpoint_family_base path =
   end
 
 fun remove_checkpoint_family_base base =
-  (remove_checkpoint_trees [base ^ ".theorems", base ^ ".decls", base ^ ".deps"];
+  (remove_trees [base ^ ".theorems", base ^ ".decls", base ^ ".deps"];
    remove_checkpoint (base ^ ".final_context.save");
    remove_checkpoint base)
 
@@ -1461,10 +1443,7 @@ fun child_log_detail path =
     "child log was not created: " ^ path
 
 fun echo_child_logs () = env_bool "HOLBUILD_ECHO_CHILD_LOGS" false
-fun cache_trace_enabled () = env_bool "HOLBUILD_CACHE_TRACE" false
-
-fun cache_trace line =
-  if cache_trace_enabled () then HolbuildStatus.message_stdout (line ^ "\n") else ()
+val cache_trace = HolbuildStatus.cache_trace
 
 fun hol_run_file_arg stage file =
   if canonical_path (Path.dir file) = canonical_path stage then Path.file file else file
@@ -3010,8 +2989,13 @@ fun write_theory_script policy project base_context plan keys input_key toolchai
       fun failed_prefix_at_least_as_late failed NONE = true
         | failed_prefix_at_least_as_late failed (SOME replay) =
             #boundary (#checkpoint failed) >= #boundary replay
-      val failed_prefix = if proof_steps_enabled policy then best_failed_prefix_checkpoint (tactic_timeout policy) checkpoints else NONE
-      val replay = replay_candidate policy project node checkpoints declaration_checkpoints
+      val failed_prefix =
+        if proof_steps_enabled policy andalso not (trace_steps policy) then
+          best_failed_prefix_checkpoint (tactic_timeout policy) checkpoints
+        else NONE
+      val replay =
+        if trace_steps policy then NONE
+        else replay_candidate policy project node checkpoints declaration_checkpoints
     in
       case failed_prefix of
           SOME failed =>
@@ -4043,7 +4027,7 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
     if not forced andalso not (always_reexecute node) andalso
        up_to_date dat_hash_cache (#emit_output_hashes options) allow_timeout_discrepancy
          policy project plan keys input_key toolchain_key node metadata_checkpoints then
-      (remove_tree_if_exists stage;
+      (remove_tree stage;
        HolbuildStatus.UpToDate)
     else restore_or_build ()
   end
@@ -4092,7 +4076,7 @@ fun report_up_to_date_node status project keys node =
   in
     HolbuildStatus.start_node status key label;
     case #kind (HolbuildBuildPlan.source_of node) of
-        HolbuildSourceIndex.TheoryScript => remove_tree_if_exists (stage_dir project input_key)
+        HolbuildSourceIndex.TheoryScript => remove_tree (stage_dir project input_key)
       | _ => ();
     HolbuildStatus.finish_node status key label HolbuildStatus.UpToDate
   end
@@ -4808,9 +4792,10 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
                          val msg = build_error_message e
                          val artifacts = build_error_debug_artifacts e
                        in
-                         HolbuildStatus.fail_with_debug_artifacts
+                         (HolbuildStatus.fail_with_debug_artifacts
                            status (HolbuildBuildPlan.key node) (HolbuildBuildPlan.logical_name node)
-                           msg artifacts;
+                           msg artifacts
+                          handle IO.Io _ => ());
                          finish_failure id msg artifacts;
                          worker_exit ()
                        end)
@@ -4976,8 +4961,28 @@ fun start_remote_cache_prefetch (options : build_options) project plan keys =
           end
     | NONE => (fn () => ())
 
+(* Linux PSI: total microseconds runnable tasks, machine-wide, waited for a CPU.
+   NONE where /proc/pressure/cpu doesn't exist (e.g. macOS). *)
+fun cpu_pressure_total_us () =
+  let
+    val input = TextIO.openIn "/proc/pressure/cpu"
+    val line = Option.getOpt (TextIO.inputLine input, "") before TextIO.closeIn input
+  in
+    Option.mapPartial (fn field => LargeInt.fromString (String.extract (field, size "total=", NONE)))
+      (List.find (String.isPrefix "total=") (String.tokens Char.isSpace line))
+  end
+  handle IO.Io _ => NONE
+
+fun trace_cpu_pressure_delta start =
+  case (start, cpu_pressure_total_us ()) of
+      (SOME before_us, SOME after_us) =>
+        cache_trace ("system cpu pressure some delta: " ^ LargeInt.toString (after_us - before_us) ^ "us")
+    | _ => ()
+
 fun build (options : build_options) tc project plan toolchain_key jobs =
   let
+    val cpu_pressure_start =
+      if HolbuildStatus.cache_trace_enabled () then cpu_pressure_total_us () else NONE
     val budget_state = create_checkpoint_budget_state project
     val _ = register_checkpoint_budget_bases budget_state
               (map (checkpoint_base project) (HolbuildBuildPlan.selected_nodes plan))
@@ -5002,10 +5007,12 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
         end
     in
       (run (); HolbuildStatus.finish status;
+       trace_cpu_pressure_delta cpu_pressure_start;
        finalize_checkpoint_budget_state_excluding
          budget_state (!(#refreshed budget_state)) [];
        clear_checkpoint_index_dirty budget_state)
       handle e => (HolbuildStatus.finish status;
+                   trace_cpu_pressure_delta cpu_pressure_start;
                    finalize_checkpoint_budget_state_excluding budget_state true [];
                    clear_checkpoint_index_dirty budget_state;
                    raise e)

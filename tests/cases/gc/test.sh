@@ -164,13 +164,12 @@ if grep -q "ActualScript.sml" "$drift_project/.holbuild/checkpoints/.index-v2"; 
   exit 1
 fi
 
-# A failed rm must not be credited as reclaimed bytes or dropped from the
-# persisted index.  Use a narrow PATH shim so the fixture is independent of the
-# account running the test and does not rely on directory permission semantics.
+# A failed removal must not be credited as reclaimed bytes or dropped from the
+# persisted index.  A read-only directory makes the removal fail; root ignores
+# directory permissions, so the check is skipped there.
 delete_failure_project=$tmpdir/delete-failure-project
 delete_failure_family="$delete_failure_project/.holbuild/checkpoints/delete-failure/src/UndeletableScript.sml"
-delete_failure_bin=$tmpdir/delete-failure-bin
-mkdir -p "$delete_failure_family.deps/old" "$delete_failure_bin"
+mkdir -p "$delete_failure_family.deps/old"
 cat > "$delete_failure_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
@@ -192,20 +191,16 @@ checkpoint_limit_gb = 1
 TOML
 truncate -s 2G "$delete_failure_family.deps/old/deps_loaded.save"
 printf 'ok\n' > "$delete_failure_family.deps/old/deps_loaded.save.ok"
-cat > "$delete_failure_bin/rm" <<'SH'
-#!/bin/sh
-case "$*" in
-  *UndeletableScript.sml*) exit 1 ;;
-  *) exec /bin/rm "$@" ;;
-esac
-SH
-chmod +x "$delete_failure_bin/rm"
-(cd "$delete_failure_project" && PATH="$delete_failure_bin:$PATH" "$HOLBUILD_BIN" build) > "$tmpdir/delete-failure.log" 2>&1
-require_grep "could not completely evict checkpoint family: .*UndeletableScript.sml" "$tmpdir/delete-failure.log"
-require_grep "checkpoint budget still exceeds limit after eviction" "$tmpdir/delete-failure.log"
-require_file "$delete_failure_family.deps/old/deps_loaded.save"
-require_grep "UndeletableScript.sml" "$delete_failure_project/.holbuild/checkpoints/.index-v2"
-/bin/rm -rf "$delete_failure_family.deps"
+chmod a-w "$delete_failure_family.deps/old"
+if [[ $EUID -ne 0 ]]; then
+  (cd "$delete_failure_project" && "$HOLBUILD_BIN" build) > "$tmpdir/delete-failure.log" 2>&1
+  require_grep "could not completely evict checkpoint family: .*UndeletableScript.sml" "$tmpdir/delete-failure.log"
+  require_grep "checkpoint budget still exceeds limit after eviction" "$tmpdir/delete-failure.log"
+  require_file "$delete_failure_family.deps/old/deps_loaded.save"
+  require_grep "UndeletableScript.sml" "$delete_failure_project/.holbuild/checkpoints/.index-v2"
+fi
+chmod u+w "$delete_failure_family.deps/old"
+rm -rf "$delete_failure_family.deps"
 [[ ! -e "$cache/tmp/old" ]] || { echo "gc left stale cache tmp" >&2; exit 1; }
 [[ ! -e "$cache/actions/old" ]] || { echo "gc left stale cache action" >&2; exit 1; }
 [[ ! -e "$cache/blobs/deadbeef" ]] || { echo "gc left stale cache blob" >&2; exit 1; }

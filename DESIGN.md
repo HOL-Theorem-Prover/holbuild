@@ -594,12 +594,9 @@ an interrupted fallback rebuild should not warn repeatedly about the same known-
 entry. A successful cache hit refreshes the action manifest mtime for retention;
 this avoids relying on filesystem atime policy.
 
-Materialization preference for v1:
-
-```text
-1. reflink / copy-on-write clone
-2. copy
-```
+Cache blobs are materialized by an in-process copy. Reflink clones only help on
+copy-on-write filesystems and cost a `cp` process per blob, which is slower than
+copying small theory files.
 
 Avoid hardlinking cache blobs into project `.holbuild/`: even if cache blobs are meant
 to be immutable, project outputs are the local materialized build view and should
@@ -673,7 +670,9 @@ manifest entries. Executable heap targets are requested with `holbuild executabl
 NAME` from `[[executable]]` manifest entries. They are exported artifacts, not
 the normal incremental-build primitive: holbuild first builds the declared
 logical objects, then invokes HOL's public `buildheap` command on the selected
-object stems. Executable targets add `--exe=<main>`.
+object stems. Executable targets add `--exe=<main>`. The object build runs without
+proof steps: tactic timeouts are a `build` check, and a timeout-free request can
+reuse any cached theory, including those built with `--skip-proof-steps`.
 
 Heaps requested by users remain project-local exported artifacts. Checkpoints are
 transient build/debug state. Normal successful theory builds may create them

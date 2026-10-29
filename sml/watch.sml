@@ -96,7 +96,7 @@ fun ensure_inotifywait () =
 fun sleep_debounce () = OS.Process.sleep (Time.fromReal 0.25)
 
 fun inotify_tree_command paths =
-  "inotifywait -q -r --exclude " ^ quote "(^|/)(\\.[^/]+|_build)/" ^
+  "inotifywait -q -r --exclude " ^ quote "/(\\.holbuild|\\.git|_build)/" ^
   " -e close_write,move,create,delete,attrib -- " ^
   String.concatWith " " (map quote paths) ^ " >/dev/null 2>&1"
 

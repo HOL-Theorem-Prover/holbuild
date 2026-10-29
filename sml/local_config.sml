@@ -18,7 +18,7 @@ datatype t =
       build_excludes : string list,
       build_exclude_globs : string list,
       build_jobs : int option,
-      build_tactic_timeout : real option,
+      build_tactic_timeout : real option option,
       checkpoint_limit_gb : int option,
       remote_cache_url : string option,
       remote_cache_curl_config : string option }

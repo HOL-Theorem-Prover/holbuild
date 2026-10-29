@@ -562,3 +562,77 @@ done
 [ "$(git -C "$tmpdir/race2/.holbuild/src/blocker" rev-parse HEAD)" = "$blocker_rev" ]
 (cd "$tmpdir/race1" && "$HOLBUILD_BIN" context) > "$tmpdir/released-replace.log"
 [ "$(git -C "$tmpdir/race1/.holbuild/src/dep" rev-parse HEAD)" = "$rev1" ]
+
+# Waiting for checkout locks and shared leases must remain interruptible. The
+# holder keeps its lock through the child's exit, so releasing it cannot make
+# an otherwise uninterruptible wait look successful.
+python3 - "${REAL_HOLBUILD_BIN:-$HOLBUILD_BIN}" "$tmpdir" "$tmpdir/race1/holproject.toml" <<'PY'
+import fcntl
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+binary, temporary, manifest = sys.argv[1:]
+project = Path(temporary) / "interrupt-project"
+project.mkdir()
+(project / "holproject.toml").write_text(Path(manifest).read_text())
+
+
+def wait_for_open_lock(process: subprocess.Popen[bytes], lock: Path) -> None:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise AssertionError("lock waiter exited before opening the lock")
+        descriptors = Path(f"/proc/{process.pid}/fd")
+        for descriptor in descriptors.iterdir():
+            try:
+                if descriptor.resolve() == lock:
+                    return
+            except FileNotFoundError:
+                pass
+        time.sleep(0.02)
+    raise AssertionError(f"lock waiter never opened {lock}")
+
+
+def interrupt_wait(lock: Path, signum: signal.Signals, *, diagnostic: bool) -> None:
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with lock.open("a+") as holder:
+        fcntl.lockf(holder, fcntl.LOCK_EX)
+        with (project / "interrupted.log").open("wb") as log:
+            process = subprocess.Popen(
+                [binary, "context"], cwd=project, stdout=log, stderr=log,
+                start_new_session=True,
+            )
+            try:
+                wait_for_open_lock(process, lock)
+                # Give the waiter time to enter the lock operation after open.
+                time.sleep(0.3)
+                process.send_signal(signum)
+                try:
+                    status = process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    raise AssertionError(f"lock waiter ignored {signum.name}")
+                if status == 0:
+                    raise AssertionError("interrupted lock waiter succeeded")
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+        if diagnostic:
+            output = (project / "interrupted.log").read_text()
+            expected = f"waiting for another holbuild process (pid {os.getpid()})"
+            if expected not in output:
+                raise AssertionError(f"missing lock holder diagnostic: {output}")
+
+
+checkout_lock = project / ".holbuild/locks/src/dep.lock"
+for signum in (signal.SIGINT, signal.SIGTERM):
+    interrupt_wait(checkout_lock, signum, diagnostic=True)
+subprocess.run([binary, "context"], cwd=project, check=True, stdout=subprocess.DEVNULL)
+lease = project / ".holbuild/locks/src/dep.lease"
+for signum in (signal.SIGINT, signal.SIGTERM):
+    interrupt_wait(lease, signum, diagnostic=False)
+PY

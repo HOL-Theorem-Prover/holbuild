@@ -583,7 +583,10 @@ loads = ["MyLib"]
 to save the heap. `[[heap]].objects` may name theory and SML logical targets.
 `holbuild executable runtests` builds the listed logical objects and uses HOL
 `buildheap --exe=<main>` to produce an executable; `main` defaults to `"main"`
-and executable objects may also include signature targets. Before starting HOL,
+and executable objects may also include signature targets. Heap and executable
+targets build their objects without proof steps, so no tactic timeout applies
+and they reuse theories built by `holbuild build --skip-proof-steps`; use
+`holbuild build` to check proof-step timeouts. Before starting HOL,
 `holbuild run` and `holbuild repl` build every target named by `[run].loads`,
 create an invocation-private project context under `.holbuild/`, and then load
 the configured targets followed by user arguments.
@@ -704,11 +707,19 @@ Poly/ML objects, and restored toolchains execute cached binaries. Use an
 authenticated HTTPS endpoint with trusted writers. Content hashes detect
 corruption but do not authenticate the cache publisher.
 
+holbuild talks to the remote cache through libcurl (7.66 or later, with an
+asynchronous DNS resolver), loaded at run time: `libcurl.so.4` on Linux, the
+system `/usr/lib/libcurl.4.dylib` on macOS. If it can't be loaded or lacks
+those, holbuild says why once and runs the `curl` command for each request
+instead, as it did before it used libcurl. As with the curl command,
+`CURL_CA_BUNDLE`, `SSL_CERT_FILE` and `SSL_CERT_DIR` select the CA certificates
+that HTTPS connections trust.
+
 For private caches, put credentials in local/CI configuration, not in
 the project manifest. CLI `--remote-cache` overrides `HOLBUILD_REMOTE_CACHE_URL`,
 which overrides `.holconfig.toml`'s `[remote_cache].url`. `bazel-remote`
-supports HTTP Basic Auth; the safest holbuild path is to pass curl a config
-file:
+supports HTTP Basic Auth; the safest holbuild path is a credentials file in
+curl's config syntax:
 
 ```sh
 cat > "$RUNNER_TEMP/holbuild-remote-cache.curl" <<'EOF'
@@ -720,10 +731,14 @@ HOLBUILD_REMOTE_CACHE_CURL_CONFIG="$RUNNER_TEMP/holbuild-remote-cache.curl" \
 ```
 
 `HOLBUILD_REMOTE_CACHE_CURL_CONFIG` overrides `.holconfig.toml`'s
-`[remote_cache].curl_config`.
+`[remote_cache].curl_config`. Through libcurl, holbuild reads only the `user`
+option from this file (`user = "name:password"`, `user name:password` or
+`--user name:password`; `#` starts a comment line). A file with any other
+option (`proxy`, `cacert`, `netrc`, ...) makes holbuild say so once and use the
+`curl` command, which reads the whole file.
 
-The URL form `https://user:password@cache.example.org` also works with curl, but
-can expose credentials via process listings or shell history; prefer the config
+The URL form `https://user:password@cache.example.org` also works, but can
+expose credentials via process listings or shell history; prefer the config
 file form for CI and shared machines. holbuild redacts URL userinfo in its own
 remote-cache diagnostics, but it cannot hide secrets from the operating system if
 they are passed as command-line arguments.
