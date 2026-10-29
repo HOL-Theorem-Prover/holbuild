@@ -129,36 +129,28 @@ fun warn_restore_once message =
     else ()
   end
 
-(* Transport failures are printed as the curl command printed them, since
-   callers treat a failed lookup as a miss. *)
-fun report_failure message =
-  TextIO.output (TextIO.stdErr, "holbuild: remote cache: " ^ message ^ "\n")
-
 (* Requests go through libcurl when HolbuildRemoteCacheConfig could set it
-   up, and otherwise through the curl command.  Both give an HTTP status, or
-   NONE when the transfer itself failed. *)
-fun libcurl_status method request =
-  case request () of
-      HolbuildHttp.Failed message => (report_failure (method ^ " failed: " ^ message); NONE)
-    | HolbuildHttp.Response code => SOME (Int.toString code)
-
+   up, and otherwise through the curl command, which prints its own error
+   message. *)
 fun cli_status timeout_seconds options url =
   let
     val code = temp_path "code"
-    val command = "curl -q -sS -L --connect-timeout 10 --max-time " ^ Int.toString timeout_seconds ^
+    val command = "curl -q -sS -L --connect-timeout " ^ Int.toString HolbuildHttp.connect_timeout_seconds ^
+                  " --max-time " ^ Int.toString timeout_seconds ^
                   curl_config_arg () ^ options ^ " -w '%{http_code}' " ^ quote url ^
                   " > " ^ quote code
     val status = OS.Process.system command
-    val http_code = if path_exists code then read_first_token code else "000"
+    val http_code = if path_exists code then read_first_token code else ""
     val _ = remove_file code
   in
-    if OS.Process.isSuccess status then SOME http_code else NONE
+    case (OS.Process.isSuccess status, Int.fromString http_code) of
+        (true, SOME http_code) => HolbuildHttp.Response http_code
+      | _ => HolbuildHttp.Failed "the curl command failed"
   end
 
 fun get_status timeout_seconds {url, dst} =
   if HolbuildRemoteCacheConfig.uses_libcurl () then
-    libcurl_status ("GET " ^ redact_userinfo url)
-      (fn () => HolbuildHttp.get {url = url, dst = dst, timeout = timeout_seconds})
+    HolbuildHttp.get {url = url, dst = dst, timeout = timeout_seconds}
   else
     (* --compressed advertises curl-supported response encodings, including zstd
        when this curl build has zstd support, and streams decompressed bytes to dst. *)
@@ -166,41 +158,39 @@ fun get_status timeout_seconds {url, dst} =
 
 fun put_status timeout_seconds headers {url, src} =
   if HolbuildRemoteCacheConfig.uses_libcurl () then
-    libcurl_status ("PUT " ^ redact_userinfo url)
-      (fn () => HolbuildHttp.put {url = url, src = src, headers = headers, timeout = timeout_seconds})
+    HolbuildHttp.put {url = url, src = src, headers = headers, timeout = timeout_seconds}
   else
-    let val body = temp_path "body"
-    in
-      cli_status timeout_seconds
-                 (String.concat (map (fn header => " -H " ^ quote header) headers) ^
-                  " -T " ^ quote src ^ " -o " ^ quote body) url
-      before remove_file body
-    end
+    cli_status timeout_seconds
+               (String.concat (map (fn header => " -H " ^ quote header) headers) ^
+                " -T " ^ quote src ^ " -o /dev/null") url
 
 fun curl_get_with_timeout timeout_seconds (request as {url, ...}) =
   let val display_url = redact_userinfo url
   in
     case get_status timeout_seconds request of
-        NONE => HolbuildCacheBackend.Corrupt ("curl GET failed: " ^ display_url)
-      | SOME "200" => HolbuildCacheBackend.Hit
-      | SOME "404" => HolbuildCacheBackend.Miss
-      | SOME code => HolbuildCacheBackend.Corrupt ("HTTP " ^ code ^ " from " ^ display_url)
+        HolbuildHttp.Failed message =>
+          HolbuildCacheBackend.Corrupt ("GET " ^ display_url ^ " failed: " ^ message)
+      | HolbuildHttp.Response 200 => HolbuildCacheBackend.Hit
+      | HolbuildHttp.Response 404 => HolbuildCacheBackend.Miss
+      | HolbuildHttp.Response code =>
+          HolbuildCacheBackend.Corrupt ("HTTP " ^ Int.toString code ^ " from " ^ display_url)
   end
   handle e => (HolbuildCacheBackend.Corrupt (General.exnMessage e))
 
 fun curl_get request = curl_get_with_timeout curl_max_time_seconds request
 
 fun successful_put_code code =
-  code = "200" orelse code = "201" orelse code = "204"
+  code = 200 orelse code = 201 orelse code = 204
 
 fun curl_put_with_headers_timeout timeout_seconds headers (request as {url, ...}) =
   let val display_url = redact_userinfo url
   in
     case put_status timeout_seconds headers request of
-        NONE => HolbuildCacheBackend.Conflict ("curl PUT failed: " ^ display_url)
-      | SOME code =>
+        HolbuildHttp.Failed message =>
+          HolbuildCacheBackend.Conflict ("PUT " ^ display_url ^ " failed: " ^ message)
+      | HolbuildHttp.Response code =>
           if successful_put_code code then HolbuildCacheBackend.Published
-          else HolbuildCacheBackend.Conflict ("HTTP " ^ code ^ " from " ^ display_url)
+          else HolbuildCacheBackend.Conflict ("HTTP " ^ Int.toString code ^ " from " ^ display_url)
   end
   handle e => (HolbuildCacheBackend.Conflict (General.exnMessage e))
 

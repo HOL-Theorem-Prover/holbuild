@@ -36,6 +36,7 @@ in
   val version_info = buildCall1 (curl "curl_version_info", cInt, cPointer)
   val global_init = buildCall1 (curl "curl_global_init", cLong, cInt)
   val easy_init = buildCall0 (curl "curl_easy_init", (), cPointer)
+  val easy_cleanup = buildCall1 (curl "curl_easy_cleanup", cPointer, cVoid)
   val easy_strerror = buildCall1 (curl "curl_easy_strerror", cInt, cString)
   val setopt_long = variadic (buildCall9 (curl "curl_easy_setopt", variadic_conv cLong, cInt))
   val setopt_ptr = variadic (buildCall9 (curl "curl_easy_setopt", variadic_conv cPointer, cInt))
@@ -45,6 +46,7 @@ in
   val slist_append = buildCall2 (curl "curl_slist_append", (cPointer, cString), cPointer)
   val slist_free_all = buildCall1 (curl "curl_slist_free_all", cPointer, cVoid)
   val multi_init = buildCall0 (curl "curl_multi_init", (), cPointer)
+  val multi_cleanup = buildCall1 (curl "curl_multi_cleanup", cPointer, cInt)
   val multi_add_handle = buildCall2 (curl "curl_multi_add_handle", (cPointer, cPointer), cInt)
   val multi_remove_handle = buildCall2 (curl "curl_multi_remove_handle", (cPointer, cPointer), cInt)
   val multi_perform = buildCall2 (curl "curl_multi_perform", (cPointer, cStar cInt), cInt)
@@ -55,7 +57,10 @@ in
   val fclose = buildCall1 (libc "fclose", cPointer, cInt)
 
   (* libcurl's connection sockets are not close-on-exec, so without this
-     every child holbuild starts would inherit the open connections.  (The
+     every child holbuild starts would inherit the open connections.  A
+     child started between libcurl's socket() and this callback still
+     inherits that one socket, and keeps it open until the child exits;
+     closing that window would need SOCK_CLOEXEC, which macOS lacks.  (The
      wakeup pipe each multi handle creates is close-on-exec only from libcurl
      8.10; a child holding it keeps no connection open.) *)
   val sockopt_cloexec =
@@ -86,46 +91,8 @@ val CURL_GLOBAL_DEFAULT = 3
 val CURL_VERSION_ASYNCHDNS = 0wx80 : Word32.word
 val CURL_ERROR_SIZE = 0w256
 
-(* The `user` value of a curl config file, the only option holbuild reads
-   from it.  Follows curl's syntax: `#` comment lines, `name value`,
-   `name = value`, `name: value` and `--name value`, values in double quotes
-   with backslash escapes.  Any other option raises Error naming it. *)
-fun curl_config_user text =
-  let
-    fun is_separator c = Char.isSpace c orelse c = #"=" orelse c = #":"
-    val drop_spaces = Substring.dropl Char.isSpace
-    fun unescape c =
-      case c of #"t" => #"\t" | #"n" => #"\n" | #"r" => #"\r" | #"v" => #"\v" | c => c
-    fun quoted chars acc =
-      case chars of
-          [] => raise Error "unterminated quoted value"
-        | #"\"" :: _ => String.implode (rev acc)
-        | #"\\" :: c :: rest => quoted rest (unescape c :: acc)
-        | c :: rest => quoted rest (c :: acc)
-    fun value s =
-      let
-        val s = drop_spaces s
-        val s = drop_spaces (if Substring.isPrefix "=" s orelse Substring.isPrefix ":" s
-                             then Substring.triml 1 s else s)
-      in
-        case Substring.getc s of
-            SOME (#"\"", rest) => quoted (Substring.explode rest) []
-          | _ => Substring.string (Substring.takel (not o Char.isSpace) s)
-      end
-    fun option (line, user) =
-      let
-        val s = drop_spaces (Substring.full line)
-        val (name, rest) = Substring.splitl (not o is_separator) s
-        val name = Substring.string name
-        val bare = if String.isPrefix "--" name then String.extract (name, 2, NONE) else name
-      in
-        if Substring.isEmpty s orelse Substring.isPrefix "#" s then user
-        else if bare = "user" then SOME (value rest)
-        else raise Error ("unsupported option " ^ name ^ " (holbuild's libcurl client reads only user)")
-      end
-  in
-    List.foldl option NONE (String.fields (fn c => c = #"\n") text)
-  end
+(* Seconds to wait for a connection, in both remote cache clients. *)
+val connect_timeout_seconds = 10
 
 val userpwd : string option ref = ref NONE
 
@@ -139,7 +106,9 @@ fun version_text number =
    libcurl can't be loaded. *)
 fun setup {user} =
   let
-    (* Fields of curl_version_info_data present since its first version. *)
+    (* Fields of curl_version_info_data present since its first version.
+       get32's offset counts 32-bit words: version_num is at byte 16 and
+       features at byte 32 on 64-bit platforms. *)
     val info = version_info 0
     val number = Word32.toInt (Foreign.Memory.get32 (info, 0w4))
     val features = Foreign.Memory.get32 (info, 0w8)
@@ -176,25 +145,30 @@ fun ca_options () =
 type connection = {easy : Foreign.Memory.voidStar, multi : Foreign.Memory.voidStar,
                errors : Foreign.Memory.voidStar}
 
+fun close ({easy, multi, errors} : connection) =
+  (if easy = Foreign.Memory.null then () else easy_cleanup easy;
+   if multi = Foreign.Memory.null then () else ignore (multi_cleanup multi);
+   Foreign.Memory.free errors)
+
 fun new_connection () : connection =
   let
-    val easy = easy_init ()
-    val multi = multi_init ()
-    val errors = Foreign.Memory.malloc CURL_ERROR_SIZE
+    val connection as {easy, multi, errors} =
+      {easy = easy_init (), multi = multi_init (), errors = Foreign.Memory.malloc CURL_ERROR_SIZE}
   in
-    if easy = Foreign.Memory.null orelse multi = Foreign.Memory.null then
-      raise Error "could not create a libcurl handle"
-    else ();
-    check "NOSIGNAL" (setopt_long (easy, CURLOPT_NOSIGNAL, 1));
-    check "CONNECTTIMEOUT" (setopt_long (easy, CURLOPT_CONNECTTIMEOUT, 10));
-    check "FOLLOWLOCATION" (setopt_long (easy, CURLOPT_FOLLOWLOCATION, 1));
-    (* Accept every encoding this libcurl can decode, as curl --compressed. *)
-    check "ACCEPT_ENCODING" (setopt_str (easy, CURLOPT_ACCEPT_ENCODING, ""));
-    check "SOCKOPTFUNCTION" (setopt_fn (easy, CURLOPT_SOCKOPTFUNCTION, sockopt_cloexec));
-    check "ERRORBUFFER" (setopt_ptr (easy, CURLOPT_ERRORBUFFER, errors));
-    Option.app (fn user => check "USERPWD" (setopt_str (easy, CURLOPT_USERPWD, user))) (!userpwd);
-    List.app (fn (name, option, value) => check name (setopt_str (easy, option, value))) (ca_options ());
-    {easy = easy, multi = multi, errors = errors}
+    (if easy = Foreign.Memory.null orelse multi = Foreign.Memory.null then
+       raise Error "could not create a libcurl handle"
+     else ();
+     check "NOSIGNAL" (setopt_long (easy, CURLOPT_NOSIGNAL, 1));
+     check "CONNECTTIMEOUT" (setopt_long (easy, CURLOPT_CONNECTTIMEOUT, connect_timeout_seconds));
+     check "FOLLOWLOCATION" (setopt_long (easy, CURLOPT_FOLLOWLOCATION, 1));
+     (* Accept every encoding this libcurl can decode, as curl --compressed. *)
+     check "ACCEPT_ENCODING" (setopt_str (easy, CURLOPT_ACCEPT_ENCODING, ""));
+     check "SOCKOPTFUNCTION" (setopt_fn (easy, CURLOPT_SOCKOPTFUNCTION, sockopt_cloexec));
+     check "ERRORBUFFER" (setopt_ptr (easy, CURLOPT_ERRORBUFFER, errors));
+     Option.app (fn user => check "USERPWD" (setopt_str (easy, CURLOPT_USERPWD, user))) (!userpwd);
+     List.app (fn (name, option, value) => check name (setopt_str (easy, option, value))) (ca_options ());
+     connection)
+    handle e => (close connection; raise e)
   end
 
 val pool_mutex = Mutex.mutex ()
@@ -218,9 +192,15 @@ fun take () =
 
 fun give connection = with_pool_lock (fn () => idle := connection :: !idle)
 
+(* A connection whose request raised may be left mid-transfer, so it is
+   closed rather than pooled. *)
 fun with_handle f =
-  let val connection = take ()
-  in f connection before give connection handle e => (give connection; raise e) end
+  let
+    val connection = take ()
+    val result = f connection handle e => (close connection; raise e)
+  in
+    give connection; result
+  end
 
 fun c_string_at p =
   let
@@ -242,6 +222,7 @@ fun transfer ({easy, multi, errors} : connection) =
       let val message = multi_info_read (multi, ref 0)
       in
         if message = Foreign.Memory.null then ()
+        (* CURLMsg's data.result, at byte 16 on 64-bit platforms. *)
         else (code := Word32.toInt (Foreign.Memory.get32 (message, 0w4)); read_done ())
       end
     fun loop () =
@@ -270,38 +251,43 @@ fun with_file path mode f =
     else f file before ignore (fclose file) handle e => (ignore (fclose file); raise e)
   end
 
+(* Runs one request on a pooled connection, writing the response body to
+   output.  set_options sets the request's own options; the data pointers
+   are cleared afterwards, so the pooled handle keeps none of them. *)
+fun request {url, timeout, output, set_options} =
+  with_handle (fn connection as {easy, ...} =>
+    (check "TIMEOUT" (setopt_long (easy, CURLOPT_TIMEOUT, timeout));
+     check "URL" (setopt_str (easy, CURLOPT_URL, url));
+     check "WRITEDATA" (setopt_ptr (easy, CURLOPT_WRITEDATA, output));
+     set_options easy;
+     transfer connection
+     before List.app (fn option => ignore (setopt_ptr (easy, option, Foreign.Memory.null)))
+              [CURLOPT_WRITEDATA, CURLOPT_READDATA, CURLOPT_HTTPHEADER]))
+
 (* Downloads url into dst, decoding any content encoding. *)
 fun get {url, dst, timeout} =
-  with_handle (fn connection as {easy, ...} =>
-    with_file dst "wb" (fn output =>
-      (check "HTTPGET" (setopt_long (easy, CURLOPT_HTTPGET, 1));
-       check "TIMEOUT" (setopt_long (easy, CURLOPT_TIMEOUT, timeout));
-       check "URL" (setopt_str (easy, CURLOPT_URL, url));
-       check "WRITEDATA" (setopt_ptr (easy, CURLOPT_WRITEDATA, output));
-       transfer connection)))
+  with_file dst "wb" (fn output =>
+    request {url = url, timeout = timeout, output = output,
+             set_options = fn easy => check "HTTPGET" (setopt_long (easy, CURLOPT_HTTPGET, 1))})
 
 (* Uploads src to url with PUT and the given extra request headers; the
    response body is discarded. *)
 fun put {url, src, headers, timeout} =
-  with_handle (fn connection as {easy, ...} =>
-    with_file src "rb" (fn input =>
-    with_file "/dev/null" "wb" (fn sink =>
-      let
-        val header_list = List.foldl (fn (h, l) => slist_append (l, h)) Foreign.Memory.null headers
-        fun reset () =
-          (ignore (setopt_ptr (easy, CURLOPT_HTTPHEADER, Foreign.Memory.null));
-           slist_free_all header_list)
-      in
+  with_file src "rb" (fn input =>
+  with_file "/dev/null" "wb" (fn sink =>
+    let
+      val header_list = List.foldl (fn (h, l) => slist_append (l, h)) Foreign.Memory.null headers
+      fun set_options easy =
         (check "UPLOAD" (setopt_long (easy, CURLOPT_UPLOAD, 1));
-         check "TIMEOUT" (setopt_long (easy, CURLOPT_TIMEOUT, timeout));
-         check "URL" (setopt_str (easy, CURLOPT_URL, url));
          check "READDATA" (setopt_ptr (easy, CURLOPT_READDATA, input));
-         check "WRITEDATA" (setopt_ptr (easy, CURLOPT_WRITEDATA, sink));
          check "INFILESIZE_LARGE"
            (setopt_long (easy, CURLOPT_INFILESIZE_LARGE, Position.toInt (OS.FileSys.fileSize src)));
-         check "HTTPHEADER" (setopt_ptr (easy, CURLOPT_HTTPHEADER, header_list));
-         transfer connection before reset ())
-        handle e => (reset (); raise e)
-      end)))
+         check "HTTPHEADER" (setopt_ptr (easy, CURLOPT_HTTPHEADER, header_list)))
+    in
+      (* request clears HTTPHEADER, or closes the handle, before this frees the list. *)
+      request {url = url, timeout = timeout, output = sink, set_options = set_options}
+      before slist_free_all header_list
+      handle e => (slist_free_all header_list; raise e)
+    end))
 
 end

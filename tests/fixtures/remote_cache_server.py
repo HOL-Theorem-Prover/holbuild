@@ -60,6 +60,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.record_request()
+        if control is not None and (control / "get-status").exists():
+            self.send_response(int((control / "get-status").read_text()))
+            self.end_headers()
+            return
         path = self.object_path()
         if path is None:
             return

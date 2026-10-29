@@ -16,8 +16,9 @@ trap cleanup EXIT
 
 # An HTTP/1.1 server, so libcurl keeps its connection open between requests.
 # Every request must carry the test credentials; /slow answers after 3 s,
-# /missing with 404 and /error with 500, and PUT /store/<name> keeps a body
-# that GET /store/<name> returns.
+# /gated once the file gate-release exists in the test directory (writing
+# gate-event there on arrival), /missing with 404 and /error with 500, and
+# PUT /store/<name> keeps a body that GET /store/<name> returns.
 cat > "$tmpdir/server.py" <<'PY'
 import base64
 import http.server
@@ -27,6 +28,7 @@ import time
 
 credentials = "Basic " + base64.b64encode(b"name:secret").decode()
 stored = {}
+test_dir = pathlib.Path(sys.argv[2])
 
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -45,6 +47,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(401, b"")
         elif self.path == "/slow":
             time.sleep(3)
+            self.reply(200, b"ok\n")
+        elif self.path == "/gated":
+            (test_dir / "gate-event").write_text("arrived\n")
+            while not (test_dir / "gate-release").exists():
+                time.sleep(0.01)
             self.reply(200, b"ok\n")
         elif self.path == "/missing":
             self.reply(404, b"not found\n")
@@ -72,26 +79,31 @@ server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 pathlib.Path(sys.argv[1]).write_text(str(server.server_address[1]))
 server.serve_forever()
 PY
-# The established TCP connections of a process.
+# The number of TCP sockets a process holds.
 cat > "$tmpdir/tcp-sockets.py" <<'PY'
 import os
 import sys
 
 inodes = set()
 for table in ("/proc/net/tcp", "/proc/net/tcp6"):
-    with open(table) as lines:
-        next(lines)
-        inodes.update(line.split()[9] for line in lines)
+    if os.path.exists(table):
+        with open(table) as lines:
+            next(lines)
+            inodes.update(line.split()[9] for line in lines)
 fd_dir = f"/proc/{sys.argv[1]}/fd"
 links = [os.readlink(os.path.join(fd_dir, fd)) for fd in os.listdir(fd_dir)]
 print(sum(link.startswith("socket:[") and link[8:-1] in inodes for link in links))
 PY
-python3 "$tmpdir/server.py" "$tmpdir/port" &
+python3 "$tmpdir/server.py" "$tmpdir/port" "$tmpdir" &
 server_pid=$!
 for _ in {1..100}; do
   [[ -s "$tmpdir/port" ]] && break
   sleep 0.01
 done
+[[ -s "$tmpdir/port" ]] || {
+  echo "test HTTP server did not start" >&2
+  exit 1
+}
 HTTP_TEST_URL="http://127.0.0.1:$(< "$tmpdir/port")"
 export HTTP_TEST_URL HTTP_TEST_DIR=$tmpdir
 
@@ -108,7 +120,7 @@ fun fail message = (TextIO.output (TextIO.stdErr, message ^ "\n");
                     OS.Process.exit OS.Process.failure)
 fun assert message condition = if condition then () else fail message
 
-fun user text = HolbuildHttp.curl_config_user text
+fun user text = HolbuildRemoteCacheConfig.parse_curl_config_user text
 val _ = assert "unquoted user" (user "user = name:secret\n" = SOME "name:secret")
 val _ = assert "user with colon separator" (user "user: name:secret" = SOME "name:secret")
 val _ = assert "user with space separator" (user "  user name:secret  \n" = SOME "name:secret")
@@ -120,10 +132,12 @@ val _ = assert "comments and blank lines"
 val _ = assert "no user" (user "# nothing here\n" = NONE)
 val _ = assert "an unsupported option is reported by name"
                ((ignore (user "user = name:secret\nproxy = http://proxy\n"); false)
-                handle HolbuildHttp.Error message => String.isSubstring "proxy" message)
+                handle HolbuildRemoteCacheConfig.Error message => String.isSubstring "proxy" message)
 
 val url = valOf (OS.Process.getEnv "HTTP_TEST_URL")
 val dir = valOf (OS.Process.getEnv "HTTP_TEST_DIR")
+val _ = HolbuildRemoteCacheConfig.set_url url
+val _ = HolbuildRemoteCacheConfig.setup_client ()
 val _ = assert "libcurl is set up with the configured user" (HolbuildRemoteCacheConfig.uses_libcurl ())
 
 fun read_file path =
@@ -213,34 +227,45 @@ val _ = wait_clients ()
 val _ = assert ("concurrent requests failed: " ^ String.concatWith ", " (!failures)) (null (!failures))
 
 (* The pooled connection is still open; a child must not inherit it. *)
-fun count_connections pid =
-  #output (HolbuildSpawn.run
-             {program = "python3", args = [dir ^ "/tcp-sockets.py", pid], stderr = HolbuildSpawn.Inherit})
-fun spawned_count () =
-  #output (HolbuildSpawn.run
-             {program = "sh", args = ["-c", "python3 \"$0\" $$", dir ^ "/tcp-sockets.py"],
-              stderr = HolbuildSpawn.Inherit})
+fun socket_count request =
+  let val result = HolbuildSpawn.run request
+  in
+    case (HolbuildSpawn.succeeded result, Int.fromString (#output result)) of
+        (true, SOME count) => count
+      | _ => fail ("tcp-sockets.py failed: " ^ #output result)
+  end
 val self = Int.toString (SysWord.toInt (Posix.Process.pidToWord (Posix.ProcEnv.getpid ())))
 val _ =
   if OS.FileSys.access ("/proc/self/fd", []) then
-    (assert "the parent holds the pooled connection" (count_connections self <> "0\n");
-     assert "a spawned child inherits no connection" (spawned_count () = "0\n"))
+    (assert "the parent holds the pooled connection"
+            (socket_count {program = "python3", args = [dir ^ "/tcp-sockets.py", self],
+                           stderr = HolbuildSpawn.Inherit} > 0);
+     assert "a spawned child inherits no connection"
+            (socket_count {program = "sh", args = ["-c", "python3 \"$0\" $$", dir ^ "/tcp-sockets.py"],
+                           stderr = HolbuildSpawn.Inherit} = 0))
   else ()
 
-(* A transfer waiting on a slow response must not hold up another thread's GC. *)
-val slow_done = ref false
+(* A transfer waiting on a response must not hold up another thread's GC.
+   The server holds /gated until gate-release exists. *)
+fun wait_for what condition deadline =
+  if condition () then ()
+  else if Time.> (Time.now (), deadline) then fail ("timed out waiting for " ^ what)
+  else (OS.Process.sleep (Time.fromMilliseconds 10); wait_for what condition deadline)
+fun in_10s () = Time.+ (Time.now (), Time.fromSeconds 10)
+val gated_done = ref false
 val _ = Thread.fork (fn () =>
-          (ignore (HolbuildHttp.get {url = url ^ "/slow", dst = dir ^ "/slow.out", timeout = 30});
-           slow_done := true), [])
-val _ = OS.Process.sleep (Time.fromMilliseconds 500)
+          ((ignore (HolbuildHttp.get {url = url ^ "/gated", dst = dir ^ "/gated.out", timeout = 30})
+            handle _ => ());
+           gated_done := true), [])
+val _ = wait_for "the gated request" (fn () => OS.FileSys.access (dir ^ "/gate-event", [])) (in_10s ())
 val start = Time.now ()
 val _ = PolyML.fullGC ()
 val gc_time = Time.- (Time.now (), start)
-val _ = assert "the slow transfer is still running during the GC" (not (!slow_done))
+val _ = assert "the gated transfer is still running during the GC" (not (!gated_done))
+val _ = write_file (dir ^ "/gate-release") ""
 val _ = assert ("GC waited " ^ Time.toString gc_time ^ " s for the transfer")
                (Time.< (gc_time, Time.fromMilliseconds 1000))
-fun wait_slow () = if !slow_done then () else (OS.Process.sleep (Time.fromMilliseconds 50); wait_slow ())
-val _ = wait_slow ()
+val _ = wait_for "the gated transfer" (fn () => !gated_done) (in_10s ())
 
 val _ = print "http tests passed\n"
 SML
