@@ -144,6 +144,12 @@ fun read_file path =
   let val input = TextIO.openIn path
   in TextIO.inputAll input before TextIO.closeIn input end
 
+fun wait_for what condition deadline =
+  if condition () then ()
+  else if Time.> (Time.now (), deadline) then fail ("timed out waiting for " ^ what)
+  else (OS.Process.sleep (Time.fromMilliseconds 10); wait_for what condition deadline)
+fun in_10s () = Time.+ (Time.now (), Time.fromSeconds 10)
+
 val fast = HolbuildHttp.get {url = url ^ "/fast", dst = dir ^ "/fast.out", timeout = 30}
 val _ = assert "GET sends the credentials and returns the HTTP status" (fast = HolbuildHttp.Response 200)
 val _ = assert "GET writes the response body" (read_file (dir ^ "/fast.out") = "ok\n")
@@ -222,8 +228,7 @@ fun client thread =
     record (fn () => finished := !finished + 1)
   end
 val _ = List.app (fn thread => ignore (Thread.fork (fn () => client thread, []))) (List.tabulate (16, fn i => i))
-fun wait_clients () = if !finished = 16 then () else (OS.Process.sleep (Time.fromMilliseconds 50); wait_clients ())
-val _ = wait_clients ()
+val _ = wait_for "the concurrent requests" (fn () => !finished = 16) (Time.+ (Time.now (), Time.fromSeconds 60))
 val _ = assert ("concurrent requests failed: " ^ String.concatWith ", " (!failures)) (null (!failures))
 
 (* The pooled connection is still open; a child must not inherit it. *)
@@ -247,11 +252,6 @@ val _ =
 
 (* A transfer waiting on a response must not hold up another thread's GC.
    The server holds /gated until gate-release exists. *)
-fun wait_for what condition deadline =
-  if condition () then ()
-  else if Time.> (Time.now (), deadline) then fail ("timed out waiting for " ^ what)
-  else (OS.Process.sleep (Time.fromMilliseconds 10); wait_for what condition deadline)
-fun in_10s () = Time.+ (Time.now (), Time.fromSeconds 10)
 val gated_done = ref false
 val _ = Thread.fork (fn () =>
           ((ignore (HolbuildHttp.get {url = url ^ "/gated", dst = dir ^ "/gated.out", timeout = 30})
@@ -267,11 +267,36 @@ val _ = assert ("GC waited " ^ Time.toString gc_time ^ " s for the transfer")
                (Time.< (gc_time, Time.fromMilliseconds 1000))
 val _ = wait_for "the gated transfer" (fn () => !gated_done) (in_10s ())
 
+(* CA settings come from the environment variables the curl command reads,
+   with its precedence. *)
+local
+  val libc = Foreign.getSymbol (Foreign.loadExecutable ())
+  val setenv =
+    Foreign.buildCall3 (libc "setenv", (Foreign.cString, Foreign.cString, Foreign.cInt), Foreign.cInt)
+  val unsetenv = Foreign.buildCall1 (libc "unsetenv", Foreign.cString, Foreign.cInt)
+in
+  fun ca_options_with settings =
+    (List.app (fn (name, SOME value) => ignore (setenv (name, value, 1))
+                | (name, NONE) => ignore (unsetenv name))
+              settings;
+     map (fn (name, _, value) => (name, value)) (HolbuildHttp.ca_options ()))
+end
+val _ = assert "CURL_CA_BUNDLE wins over SSL_CERT_DIR and SSL_CERT_FILE"
+               (ca_options_with [("CURL_CA_BUNDLE", SOME "/bundle"), ("SSL_CERT_DIR", SOME "/dir"),
+                                 ("SSL_CERT_FILE", SOME "/file")]
+                = [("CAINFO", "/bundle")])
+val _ = assert "SSL_CERT_DIR and SSL_CERT_FILE"
+               (ca_options_with [("CURL_CA_BUNDLE", NONE)] = [("CAPATH", "/dir"), ("CAINFO", "/file")])
+val _ = assert "SSL_CERT_FILE alone" (ca_options_with [("SSL_CERT_DIR", NONE)] = [("CAINFO", "/file")])
+val _ = assert "no CA settings" (ca_options_with [("SSL_CERT_FILE", NONE)] = [])
+
 val _ = print "http tests passed\n"
 SML
 
 printf 'user = "name:secret"\n' > "$tmpdir/user.curl"
-HOLBUILD_REMOTE_CACHE_CURL_CONFIG=$tmpdir/user.curl "${HOLBUILD_POLY:-poly}" < "$tmpdir/http-test.sml" > "$tmpdir/http-test.log" 2>&1 || {
+# --error-exit makes an uncaught exception fail the script; without it, the
+# REPL reports the exception and carries on with the next declaration.
+HOLBUILD_REMOTE_CACHE_CURL_CONFIG=$tmpdir/user.curl "${HOLBUILD_POLY:-poly}" --error-exit < "$tmpdir/http-test.sml" > "$tmpdir/http-test.log" 2>&1 || {
   cat "$tmpdir/http-test.log" >&2
   exit 1
 }
@@ -343,3 +368,39 @@ build_with_curl_command no-asynchdns "libcurl .* has no asynchronous DNS resolve
   HOLBUILD_TEST_LIBCURL_NO_ASYNCHDNS=1
 build_with_curl_command other-config-option "curl config .*: unsupported option connect-timeout" \
   HOLBUILD_REMOTE_CACHE_CURL_CONFIG="$tmpdir/connect-timeout.curl"
+
+# Through libcurl, a build takes its credentials from the curl config named
+# in .holconfig.toml: a first build publishes to a remote cache that requires
+# them and a second, with an empty local cache, restores from it.
+mkdir -p "$tmpdir/no-curl"
+cat > "$tmpdir/no-curl/curl" <<'SH'
+#!/usr/bin/env bash
+echo "unexpected curl command" >&2
+exit 99
+SH
+chmod +x "$tmpdir/no-curl/curl"
+start_remote_cache_server "$tmpdir/remote-auth" "$tmpdir/server-auth" "$tmpdir/control-auth"
+printf 'Basic %s\n' "$(printf 'name:secret' | base64)" > "$tmpdir/control-auth/authorization"
+cat > "$project/.holconfig.toml" <<TOML
+[remote_cache]
+url = "$remote_url"
+curl_config = "$tmpdir/user.curl"
+TOML
+for run in publish restore; do
+  log=$tmpdir/holconfig-$run.log
+  link_hol_toolchain_cache "$tmpdir/cache-holconfig-$run"
+  rm -rf "$project/.holbuild"
+  (cd "$project" && env -u HOLBUILD_REMOTE_CACHE_URL -u HOLBUILD_REMOTE_CACHE_CURL_CONFIG \
+     PATH="$tmpdir/no-curl:$PATH" HOLBUILD_CACHE="$tmpdir/cache-holconfig-$run" HOLBUILD_CACHE_TRACE=1 \
+     "$HOLBUILD_BIN" build ATheory) > "$log" 2>&1 || {
+    cat "$log" >&2
+    exit 1
+  }
+  if grep -q 'using the curl command\|unexpected curl command' "$log"; then
+    echo "expected libcurl requests in $log" >&2
+    cat "$log" >&2
+    exit 1
+  fi
+done
+require_grep "remote cache published:" "$tmpdir/holconfig-publish.log"
+require_grep "remote cache \(hydrated\|prefetched\):" "$tmpdir/holconfig-restore.log"

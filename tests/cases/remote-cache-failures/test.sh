@@ -67,6 +67,14 @@ else
 fi
 SH
 chmod +x "$tmpdir/shims/curl"
+# On PATH when the requests must go through libcurl.
+mkdir -p "$tmpdir/no-curl"
+cat > "$tmpdir/no-curl/curl" <<'SH'
+#!/usr/bin/env bash
+echo "unexpected curl command" >&2
+exit 99
+SH
+chmod +x "$tmpdir/no-curl/curl"
 
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/server" "$tmpdir/control"
 trap 'kill "$server_pid" 2>/dev/null || true; cleanup_temp_dir "$tmpdir"' EXIT
@@ -102,13 +110,14 @@ build_with_failure() {
     else
       printf '%s\n' "$failure" > "$tmpdir/control/get-status"
     fi
-    (cd "$project" && TMPDIR="$tmpdir/tmp" \
+    (cd "$project" && env -u HOLBUILD_REMOTE_CACHE_CURL_CONFIG PATH="$tmpdir/no-curl:$PATH" TMPDIR="$tmpdir/tmp" \
       "$HOLBUILD_BIN" -j2 --remote-cache "$url" build ATheory BTheory CTheory) > "$log" 2>&1
-    if grep -q 'using the curl command' "$log"; then
+    if grep -q 'using the curl command\|unexpected curl command' "$log"; then
       echo "expected libcurl requests for $failure" >&2
       cat "$log" >&2
       exit 1
     fi
+    [[ "$failure" != transport ]] || require_grep "failed: Couldn't connect to server" "$log"
   fi
   require_grep 'ATheory built' "$log"
   require_grep 'BTheory built' "$log"
