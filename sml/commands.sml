@@ -1369,6 +1369,9 @@ fun build_heap_kind tc cli_jobs command target =
         val objects = HolbuildSourceIndex.expand_group_tokens index (HolbuildProject.project_package project) objects
         val _ = if null objects then raise Error (command ^ " target has no objects: " ^ target) else ()
         val plan = timed_phase "build.plan" (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index objects)
+        (* Unused without proof steps, but resolved so invalid configuration is
+           reported here as it is by build. *)
+        val _ = HolbuildTacticTimeoutPolicy.theory_timeouts project index plan
         val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
         val output_path = HolbuildProject.abs_under (#root project) output
       in
