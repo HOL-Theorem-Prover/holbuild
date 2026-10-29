@@ -142,10 +142,11 @@ fun libcurl_status method request =
       HolbuildHttp.Failed message => (report_failure (method ^ " failed: " ^ message); NONE)
     | HolbuildHttp.Response code => SOME (Int.toString code)
 
-fun cli_status options url =
+fun cli_status timeout_seconds options url =
   let
     val code = temp_path "code"
-    val command = "curl -q -sS -L --connect-timeout 10" ^ curl_config_arg () ^ options ^ " -w '%{http_code}' " ^ quote url ^
+    val command = "curl -q -sS -L --connect-timeout 10 --max-time " ^ Int.toString timeout_seconds ^
+                  curl_config_arg () ^ options ^ " -w '%{http_code}' " ^ quote url ^
                   " > " ^ quote code
     val status = OS.Process.system command
     val http_code = if path_exists code then read_first_token code else "000"
@@ -161,7 +162,7 @@ fun get_status timeout_seconds {url, dst} =
   else
     (* --compressed advertises curl-supported response encodings, including zstd
        when this curl build has zstd support, and streams decompressed bytes to dst. *)
-    cli_status (" --compressed --max-time " ^ Int.toString timeout_seconds ^ " -o " ^ quote dst) url
+    cli_status timeout_seconds (" --compressed -o " ^ quote dst) url
 
 fun put_status timeout_seconds headers {url, src} =
   if HolbuildRemoteCacheConfig.uses_libcurl () then
@@ -170,8 +171,8 @@ fun put_status timeout_seconds headers {url, src} =
   else
     let val body = temp_path "body"
     in
-      cli_status (" --max-time " ^ Int.toString timeout_seconds ^
-                  String.concat (map (fn header => " -H " ^ quote header) headers) ^
+      cli_status timeout_seconds
+                 (String.concat (map (fn header => " -H " ^ quote header) headers) ^
                   " -T " ^ quote src ^ " -o " ^ quote body) url
       before remove_file body
     end

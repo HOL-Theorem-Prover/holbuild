@@ -37,6 +37,8 @@ use_case_cache "$tmpdir/empty-cache"
 require_grep 'ATheory built' "$tmpdir/empty.log"
 
 # Record curl policy without relying on network routing or wall-clock timing.
+# The builds below make their requests with the curl command, since they can't
+# load libcurl; remote-cache-libcurl covers libcurl.
 cat > "$tmpdir/shims/curl" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -78,7 +80,7 @@ for failure in 404 401 403 503 transport; do
   fi
   (cd "$project" && PATH="$tmpdir/shims:$PATH" TMPDIR="$tmpdir/tmp" \
     HOLBUILD_TEST_CURL_LOG="$curl_log" HOLBUILD_TEST_HTTP_CODE="$http_code" \
-    HOLBUILD_TEST_CURL_STATUS="$curl_status" \
+    HOLBUILD_TEST_CURL_STATUS="$curl_status" HOLBUILD_TEST_LIBCURL=libholbuild-test-no-such-curl.so \
     "$HOLBUILD_BIN" -j2 --remote-cache http://cache.invalid build ATheory BTheory CTheory) > "$log" 2>&1
   require_grep 'ATheory built' "$log"
   require_grep 'BTheory built' "$log"
