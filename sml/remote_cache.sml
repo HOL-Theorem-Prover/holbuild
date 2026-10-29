@@ -106,8 +106,27 @@ fun remove_file_before result path = (remove_file path; result)
 fun run program args =
   HolbuildSpawn.run {program = program, args = args, stderr = HolbuildSpawn.Inherit}
 
-fun zstd_compress src dst =
-  HolbuildSpawn.succeeded (run "zstd" ["-q", "-f", "-T0", "-o", dst, src])
+fun completed_line text =
+  case List.find (String.isSubstring "Completed in") (String.fields (fn c => c = #"\n") text) of
+      SOME line => Substring.string (#2 (Substring.position "Completed in" (Substring.full line)))
+    | NONE => "no zstd completion line"
+
+(* Under HOLBUILD_CACHE_TRACE, zstd runs verbosely so its wall time and CPU
+   load show how much the -T0 threads compete with the build. *)
+fun zstd_compress url src dst =
+  if HolbuildStatus.cache_trace_enabled () then
+    let
+      val result = HolbuildSpawn.run {program = "zstd", args = ["-vv", "-f", "-T0", "-o", dst, src],
+                                      stderr = HolbuildSpawn.Merge}
+      val ok = HolbuildSpawn.succeeded result
+    in
+      HolbuildStatus.cache_trace
+        ("remote cache zstd " ^ redact_userinfo url ^ " " ^
+         (if ok then completed_line (#output result) else "failed: " ^ #output result));
+      ok
+    end
+  else
+    HolbuildSpawn.succeeded (run "zstd" ["-q", "-f", "-T0", "-o", dst, src])
 
 fun zstd_content_headers size =
   ["Content-Encoding: zstd", "X-Digest-SizeBytes: " ^ size]
@@ -158,10 +177,31 @@ fun put_status timeout_seconds headers {url, src} =
     cli_status timeout_seconds
                (List.concat (map (fn header => ["-H", header]) headers) @ ["-T", src, "-o", "/dev/null"]) url
 
-fun curl_get_with_timeout timeout_seconds (request as {url, ...}) =
+(* Under HOLBUILD_CACHE_TRACE, one line per request: its wall time, then the
+   HTTP status and the size of the file received or sent. *)
+fun traced method url path request =
+  if not (HolbuildStatus.cache_trace_enabled ()) then request ()
+  else
+    let
+      val timer = Timer.startRealTimer ()
+      val result = request ()
+      val wall = LargeInt.toString (Time.toMilliseconds (Timer.checkRealTimer timer))
+      val outcome =
+        case result of
+            HolbuildHttp.Failed message => "failed: " ^ message
+          | HolbuildHttp.Response code =>
+              Int.toString code ^ " bytes=" ^
+              (if path_exists path then Position.toString (FS.fileSize path) else "0")
+    in
+      HolbuildStatus.cache_trace
+        ("remote cache " ^ method ^ " " ^ redact_userinfo url ^ " wall=" ^ wall ^ "ms " ^ outcome);
+      result
+    end
+
+fun curl_get_with_timeout timeout_seconds (request as {url, dst}) =
   let val display_url = redact_userinfo url
   in
-    case get_status timeout_seconds request of
+    case traced "GET" url dst (fn () => get_status timeout_seconds request) of
         HolbuildHttp.Failed message =>
           HolbuildCacheBackend.Corrupt ("GET " ^ display_url ^ " failed: " ^ message)
       | HolbuildHttp.Response 200 => HolbuildCacheBackend.Hit
@@ -176,10 +216,10 @@ fun curl_get request = curl_get_with_timeout curl_max_time_seconds request
 fun successful_put_code code =
   code = 200 orelse code = 201 orelse code = 204
 
-fun curl_put_with_headers_timeout timeout_seconds headers (request as {url, ...}) =
+fun curl_put_with_headers_timeout timeout_seconds headers (request as {url, src}) =
   let val display_url = redact_userinfo url
   in
-    case put_status timeout_seconds headers request of
+    case traced "PUT" url src (fn () => put_status timeout_seconds headers request) of
         HolbuildHttp.Failed message =>
           HolbuildCacheBackend.Conflict ("PUT " ^ display_url ^ " failed: " ^ message)
       | HolbuildHttp.Response code =>
@@ -196,7 +236,7 @@ fun curl_put request = curl_put_with_headers [] request
 fun curl_put_zstd_with_timeout timeout_seconds {url, src, size} =
   let val compressed = temp_path "zstd-put"
   in
-    if zstd_compress src compressed then
+    if zstd_compress url src compressed then
       curl_put_with_headers_timeout timeout_seconds (zstd_content_headers size)
         {url = url, src = compressed}
       before remove_file compressed

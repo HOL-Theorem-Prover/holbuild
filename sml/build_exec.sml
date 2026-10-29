@@ -1443,10 +1443,7 @@ fun child_log_detail path =
     "child log was not created: " ^ path
 
 fun echo_child_logs () = env_bool "HOLBUILD_ECHO_CHILD_LOGS" false
-fun cache_trace_enabled () = env_bool "HOLBUILD_CACHE_TRACE" false
-
-fun cache_trace line =
-  if cache_trace_enabled () then HolbuildStatus.message_stdout (line ^ "\n") else ()
+val cache_trace = HolbuildStatus.cache_trace
 
 fun hol_run_file_arg stage file =
   if canonical_path (Path.dir file) = canonical_path stage then Path.file file else file
@@ -4961,8 +4958,28 @@ fun start_remote_cache_prefetch (options : build_options) project plan keys jobs
           end
     | NONE => (fn () => ())
 
+(* Linux PSI: total microseconds runnable tasks, machine-wide, waited for a CPU.
+   NONE where /proc/pressure/cpu doesn't exist (e.g. macOS). *)
+fun cpu_pressure_total_us () =
+  let
+    val input = TextIO.openIn "/proc/pressure/cpu"
+    val line = Option.getOpt (TextIO.inputLine input, "") before TextIO.closeIn input
+  in
+    Option.mapPartial (fn field => LargeInt.fromString (String.extract (field, size "total=", NONE)))
+      (List.find (String.isPrefix "total=") (String.tokens Char.isSpace line))
+  end
+  handle IO.Io _ => NONE
+
+fun trace_cpu_pressure_delta start =
+  case (start, cpu_pressure_total_us ()) of
+      (SOME before_us, SOME after_us) =>
+        cache_trace ("system cpu pressure some delta: " ^ LargeInt.toString (after_us - before_us) ^ "us")
+    | _ => ()
+
 fun build (options : build_options) tc project plan toolchain_key jobs =
   let
+    val cpu_pressure_start =
+      if HolbuildStatus.cache_trace_enabled () then cpu_pressure_total_us () else NONE
     val budget_state = create_checkpoint_budget_state project
     val _ = register_checkpoint_budget_bases budget_state
               (map (checkpoint_base project) (HolbuildBuildPlan.selected_nodes plan))
@@ -4987,10 +5004,12 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
         end
     in
       (run (); HolbuildStatus.finish status;
+       trace_cpu_pressure_delta cpu_pressure_start;
        finalize_checkpoint_budget_state_excluding
          budget_state (!(#refreshed budget_state)) [];
        clear_checkpoint_index_dirty budget_state)
       handle e => (HolbuildStatus.finish status;
+                   trace_cpu_pressure_delta cpu_pressure_start;
                    finalize_checkpoint_budget_state_excluding budget_state true [];
                    clear_checkpoint_index_dirty budget_state;
                    raise e)
