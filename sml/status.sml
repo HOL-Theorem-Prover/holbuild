@@ -532,6 +532,14 @@ fun message_stdout text = message_to "stdout" TextIO.stdOut text
 fun message_stderr text = message_to "stderr" TextIO.stdErr text
 fun message stream text = message_to "stdout" stream text
 
+fun cache_trace_enabled () =
+  case OS.Process.getEnv "HOLBUILD_CACHE_TRACE" of
+      SOME s => s = "1" orelse s = "true" orelse s = "yes"
+    | NONE => false
+
+fun cache_trace line =
+  if cache_trace_enabled () then message_stdout (line ^ "\n") else ()
+
 fun fail_with_debug_artifacts status key label msg artifacts =
   (with_lock status
      (fn () =>
