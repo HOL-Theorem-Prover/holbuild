@@ -4,15 +4,12 @@ structure Path = OS.Path
 structure FS = OS.FileSys
 exception Error of string
 datatype t = FileLock of {fd : Posix.IO.file_desc, path : string}
-fun quote s = "'" ^ String.translate (fn #"'" => "'\\''" | c => str c) s ^ "'"
 fun exists path = FS.access(path, []) handle OS.SysErr _ => false
 fun ensure_dir path = if path = "" orelse path = "." orelse exists path then () else (ensure_dir (Path.dir path); FS.mkDir path handle OS.SysErr _ => ())
 fun read_text path = let val f = TextIO.openIn path fun close () = TextIO.closeIn f handle _ => () in (TextIO.inputAll f before close ()) handle e => (close (); raise e) end
 fun write_text path text = let val f = TextIO.openOut path fun close () = TextIO.closeOut f handle _ => () in (TextIO.output(f, text); close ()) handle e => (close (); raise e) end
 fun remove_file path = FS.remove path handle OS.SysErr _ => ()
-fun remove_tree path =
-  if path = "" orelse path = "." orelse path = "/" then raise Error ("refusing to remove unsafe lock path: " ^ path)
-  else ignore (OS.Process.system ("rm -rf " ^ quote path))
+fun remove_tree path = HolbuildRemoveTree.remove path handle HolbuildRemoveTree.Error msg => raise Error msg
 fun remove_obsolete_lock_dir kind path =
   if (FS.isDir path handle OS.SysErr _ => false) then
     (TextIO.output(TextIO.stdErr, "holbuild: warning: removing obsolete directory " ^ kind ^ " lock: " ^ path ^ "\n"); remove_tree path)
