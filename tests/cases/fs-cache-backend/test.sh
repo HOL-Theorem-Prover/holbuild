@@ -64,9 +64,26 @@ val _ = assert "materialized blob hash mismatch" (HolbuildHash.file_sha1 dst = h
 val _ = print "filesystem cache backend tests passed\n";
 SML
 
-FS_CACHE_BACKEND_TEST_TMP="$tmpdir" "${HOLBUILD_POLY:-poly}" < "$tmpdir/fs-cache-backend-test.sml" > "$tmpdir/fs-cache-backend-test.log" 2>&1 || {
+# A cp that logs its arguments, to check that the fetch copies in-process and
+# starts no cp at all.
+real_cp=$(command -v cp)
+mkdir -p "$tmpdir/bin"
+cat > "$tmpdir/bin/cp" <<CP
+#!/bin/sh
+printf '%s\n' "\$@" >> "$tmpdir/cp.log"
+exec "$real_cp" "\$@"
+CP
+chmod +x "$tmpdir/bin/cp"
+
+PATH="$tmpdir/bin:$PATH" FS_CACHE_BACKEND_TEST_TMP="$tmpdir" "${HOLBUILD_POLY:-poly}" < "$tmpdir/fs-cache-backend-test.sml" > "$tmpdir/fs-cache-backend-test.log" 2>&1 || {
   cat "$tmpdir/fs-cache-backend-test.log" >&2
   exit 1
 }
 
 grep -q "filesystem cache backend tests passed" "$tmpdir/fs-cache-backend-test.log"
+
+if [[ -s "$tmpdir/cp.log" ]]; then
+  echo "the fetch started cp:" >&2
+  cat "$tmpdir/cp.log" >&2
+  exit 1
+fi

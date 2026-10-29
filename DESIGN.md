@@ -594,12 +594,9 @@ an interrupted fallback rebuild should not warn repeatedly about the same known-
 entry. A successful cache hit refreshes the action manifest mtime for retention;
 this avoids relying on filesystem atime policy.
 
-Materialization preference for v1:
-
-```text
-1. reflink / copy-on-write clone
-2. copy
-```
+Cache blobs are materialized by an in-process copy. Reflink clones only help on
+copy-on-write filesystems and cost a `cp` process per blob, which is slower than
+copying small theory files.
 
 Avoid hardlinking cache blobs into project `.holbuild/`: even if cache blobs are meant
 to be immutable, project outputs are the local materialized build view and should

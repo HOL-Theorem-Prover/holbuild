@@ -43,6 +43,27 @@ fun rename_replace {old, new} =
     (FS.remove new handle OS.SysErr _ => ();
      FS.rename {old = old, new = new})
 
+(* rm -rf: symlinks are removed, never followed; errors are ignored. *)
+fun remove_tree_entry path =
+  (case (SOME (Posix.FileSys.lstat path) handle OS.SysErr _ => NONE) of
+       NONE => ()
+     | SOME st =>
+         if Posix.FileSys.ST.isDir st then
+           let
+             val dir = FS.openDir path
+             fun names acc = case FS.readDir dir of NONE => acc | SOME name => names (name :: acc)
+             val entries = (names [] handle e => (FS.closeDir dir; raise e)) before FS.closeDir dir
+           in
+             List.app (fn name => remove_tree_entry (Path.concat (path, name))) entries;
+             FS.rmDir path
+           end
+         else FS.remove path)
+  handle OS.SysErr _ => ()
+
+fun remove_trees paths = List.app remove_tree_entry paths
+
+fun remove_tree path = remove_trees [path]
+
 fun copy_binary src dst =
   let
     val input = BinIO.openIn src
@@ -680,26 +701,11 @@ fun remove_legacy_checkpoint_family project node =
   end
   handle Fail "holbuild checkpoint directory missing" => ()
 
-fun remove_checkpoint_tree path =
-  if FS.access(path, []) handle OS.SysErr _ => false then
-    ignore (OS.Process.system ("rm -rf " ^ HolbuildToolchain.quote path))
-  else ()
-
-fun remove_checkpoint_trees paths =
-  let val existing = List.filter (fn path => FS.access(path, []) handle OS.SysErr _ => false) paths
-  in
-    if null existing then ()
-    else
-      ignore
-        (OS.Process.system
-           ("rm -rf " ^ String.concatWith " " (map HolbuildToolchain.quote existing)))
-  end
-
 fun remove_theorem_checkpoints_for_deps project node deps_key =
-  remove_checkpoint_tree (theorem_checkpoints_for_deps_root project node deps_key)
+  remove_tree (theorem_checkpoints_for_deps_root project node deps_key)
 
 fun remove_declaration_checkpoints_for_deps project node deps_key =
-  remove_checkpoint_tree (declaration_checkpoints_for_deps_root project node deps_key)
+  remove_tree (declaration_checkpoints_for_deps_root project node deps_key)
 
 fun remove_deps_checkpoint_family project node deps_key deps_loaded =
   (* Delete source-context descendants before deleting/replacing the deps parent.
@@ -713,16 +719,10 @@ fun remove_checkpoint_family project node =
   let val base = checkpoint_base project node
   in
     remove_legacy_checkpoint_family project node;
-    remove_checkpoint_trees [base ^ ".theorems", base ^ ".decls", base ^ ".deps"]
+    remove_trees [base ^ ".theorems", base ^ ".decls", base ^ ".deps"]
   end
 
 fun path_exists path = FS.access(path, []) handle OS.SysErr _ => false
-
-fun remove_tree path =
-  ignore (OS.Process.system ("rm -rf " ^ HolbuildToolchain.quote path))
-
-fun remove_tree_if_exists path =
-  if path_exists path then remove_tree path else ()
 
 fun children dir =
   if not (path_exists dir) then []
@@ -855,7 +855,7 @@ fun checkpoint_family_base path =
   end
 
 fun remove_checkpoint_family_base base =
-  (remove_checkpoint_trees [base ^ ".theorems", base ^ ".decls", base ^ ".deps"];
+  (remove_trees [base ^ ".theorems", base ^ ".decls", base ^ ".deps"];
    remove_checkpoint (base ^ ".final_context.save");
    remove_checkpoint base)
 
@@ -4047,7 +4047,7 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
     if not forced andalso not (always_reexecute node) andalso
        up_to_date dat_hash_cache (#emit_output_hashes options) allow_timeout_discrepancy
          policy project plan keys input_key toolchain_key node metadata_checkpoints then
-      (remove_tree_if_exists stage;
+      (remove_tree stage;
        HolbuildStatus.UpToDate)
     else restore_or_build ()
   end
@@ -4096,7 +4096,7 @@ fun report_up_to_date_node status project keys node =
   in
     HolbuildStatus.start_node status key label;
     case #kind (HolbuildBuildPlan.source_of node) of
-        HolbuildSourceIndex.TheoryScript => remove_tree_if_exists (stage_dir project input_key)
+        HolbuildSourceIndex.TheoryScript => remove_tree (stage_dir project input_key)
       | _ => ();
     HolbuildStatus.finish_node status key label HolbuildStatus.UpToDate
   end
