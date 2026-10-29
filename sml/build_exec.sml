@@ -43,26 +43,9 @@ fun rename_replace {old, new} =
     (FS.remove new handle OS.SysErr _ => ();
      FS.rename {old = old, new = new})
 
-(* rm -rf: symlinks are removed, never followed; errors are ignored. *)
-fun remove_tree_entry path =
-  (case (SOME (Posix.FileSys.lstat path) handle OS.SysErr _ => NONE) of
-       NONE => ()
-     | SOME st =>
-         if Posix.FileSys.ST.isDir st then
-           let
-             val dir = FS.openDir path
-             fun names acc = case FS.readDir dir of NONE => acc | SOME name => names (name :: acc)
-             val entries = (names [] handle e => (FS.closeDir dir; raise e)) before FS.closeDir dir
-           in
-             List.app (fn name => remove_tree_entry (Path.concat (path, name))) entries;
-             FS.rmDir path
-           end
-         else FS.remove path)
-  handle OS.SysErr _ => ()
+val remove_tree = HolbuildRemoveTree.remove
 
-fun remove_trees paths = List.app remove_tree_entry paths
-
-fun remove_tree path = remove_trees [path]
+fun remove_trees paths = List.app remove_tree paths
 
 fun copy_binary src dst =
   let
