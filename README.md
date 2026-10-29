@@ -245,6 +245,17 @@ holbuild clean MyTheory
 holbuild gc
 ```
 
+When a command, target, heap or executable, or an `execution-plan` theory or
+theorem isn't found, the error is followed by a line of up to three of the
+nearest known names, nearest first, ignoring case:
+
+```text
+holbuild: unknown build target: listLemasTheory
+did you mean listLemmasTheory?
+```
+
+The line is left out when no name is close.
+
 Global options go before the command, or before the target list when using the
 default build command:
 

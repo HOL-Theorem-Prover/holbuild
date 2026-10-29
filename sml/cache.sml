@@ -425,6 +425,6 @@ fun dispatch args =
   case args of
       "gc" :: rest => gc rest
     | [] => raise Error "cache command requires subcommand: gc"
-    | cmd :: _ => raise Error ("unknown cache command: " ^ cmd)
+    | cmd :: _ => raise Error ("unknown cache command: " ^ cmd ^ HolbuildSuggest.did_you_mean cmd ["gc"])
 
 end
