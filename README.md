@@ -580,7 +580,10 @@ loads = ["MyLib"]
 to save the heap. `[[heap]].objects` may name theory and SML logical targets.
 `holbuild executable runtests` builds the listed logical objects and uses HOL
 `buildheap --exe=<main>` to produce an executable; `main` defaults to `"main"`
-and executable objects may also include signature targets. Before starting HOL,
+and executable objects may also include signature targets. Heap and executable
+targets build their objects without proof steps, so no tactic timeout applies
+and they reuse theories built by `holbuild build --skip-proof-steps`; use
+`holbuild build` to check proof-step timeouts. Before starting HOL,
 `holbuild run` and `holbuild repl` build every target named by `[run].loads`,
 create an invocation-private project context under `.holbuild/`, and then load
 the configured targets followed by user arguments.
