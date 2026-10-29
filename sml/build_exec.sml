@@ -4916,12 +4916,12 @@ fun prefetch_key (options : build_options) project keys node =
       | _ => NONE
   end
 
-(* Starts --prefetch-concurrency background threads that hydrate the plan's
-   remote theory cache entries into the local cache, in build order, while the
-   build runs; returns a function that drops the nodes not yet started and
-   waits for the copies in flight.  The build workers keep their own demand
-   restore, so they never wait behind a prefetch. *)
-fun start_remote_cache_prefetch (options : build_options) project plan keys =
+(* Starts --prefetch-concurrency (default 2 * jobs) background threads that
+   hydrate the plan's remote theory cache entries into the local cache, in
+   build order, while the build runs; returns a function that drops the nodes
+   not yet started and waits for the copies in flight.  The build workers keep
+   their own demand restore, so they never wait behind a prefetch. *)
+fun start_remote_cache_prefetch (options : build_options) project plan keys jobs =
   case HolbuildRemoteCacheConfig.url () of
       SOME url =>
         if not (#use_cache options) then (fn () => ())
@@ -4948,8 +4948,9 @@ fun start_remote_cache_prefetch (options : build_options) project plan keys =
               case next () of
                   NONE => ()
                 | SOME node => ((prefetch node handle _ => ()); worker ())
-            val count = Int.min (!HolbuildRemoteCacheConfig.prefetch_concurrency,
-                                 length (!pending))
+            val count =
+              Int.min (Option.getOpt (!HolbuildRemoteCacheConfig.prefetch_concurrency, 2 * jobs),
+                       length (!pending))
             val _ = cache_trace ("remote cache prefetch threads: " ^ Int.toString count)
             val threads = List.tabulate (count, fn _ => Thread.fork (worker, []))
             fun wait_threads () =
@@ -4997,7 +4998,7 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
       val status = HolbuildStatus.create {total = length (HolbuildBuildPlan.selected_nodes plan), jobs = jobs}
       fun run () =
         let
-          val stop_prefetch = start_remote_cache_prefetch options project plan keys
+          val stop_prefetch = start_remote_cache_prefetch options project plan keys jobs
           fun build_nodes () =
             if jobs <= 1 then build_serial dat_hash_cache status options tc project base_context plan keys toolchain_key budget_state
             else build_parallel dat_hash_cache status options tc project base_context plan keys toolchain_key jobs budget_state

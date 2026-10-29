@@ -289,8 +289,8 @@ Common global options:
   where it can detect it (Linux), so there it cannot be used to cap holbuild's
   own heap either.
 - `--prefetch-concurrency N`: how many remote cache entries a build copies into
-  the local cache at once, ahead of the build workers. Defaults to 50,
-  independent of `-j`; only used with a remote cache.
+  the local cache at once, ahead of the build workers. Defaults to twice the
+  build's jobs; only used with a remote cache.
 
 `holbuild build --watch MyTheory` runs an initial build, then watches project
 inputs with `inotifywait` and rebuilds after changes. The directory of each
@@ -680,7 +680,7 @@ HOLBUILD_REMOTE_CACHE_URL=https://cache.example.org holbuild build MyTheory
 ```
 
 Remote cache misses or errors fall back to the local cache/source build path.
-While a build runs, `--prefetch-concurrency` background threads (50 by
+While a build runs, `--prefetch-concurrency` background threads (twice `-j` by
 default) also copy the remote entries of the plan's out-of-date theories into
 the local cache in build order, so a theory's restore usually finds its entry
 already local. This prefetch is best-effort and silent; whatever it misses is
