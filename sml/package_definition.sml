@@ -427,7 +427,7 @@ type build_definition =
   {members : string list, excludes : string list, exclude_globs : string list,
    roots : string list, root_groups : string list, groups : group list,
    root_tactic_timeouts : root_tactic_timeout list,
-   tactic_timeout : real option}
+   tactic_timeout : real option option}
 
 fun parse_build table : build_definition =
   let
@@ -546,7 +546,7 @@ fun validate_manifest table =
 
 type parsed =
   {definition : t, compatibility : compatibility,
-   tactic_timeout : real option,
+   tactic_timeout : real option option,
    theory_tactic_timeouts : theory_tactic_timeout list}
 
 val parsed_manifest_count = ref 0

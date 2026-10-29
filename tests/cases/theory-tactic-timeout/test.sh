@@ -132,3 +132,37 @@ PY
   require_grep "theory_tactic_timeouts" "$tmpdir/invalid.log"
   rm -rf "$invalid"
 done
+
+# An absent build policy uses the default, while zero explicitly disables it.
+# Remove node-local policies so these checks exercise the build-level setting.
+python3 - "$project/holproject.toml" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+text = p.read_text().split('[build.theory_tactic_timeouts]')[0]
+p.write_text(text.replace('tactic_timeout = 0.1\n', ''))
+PY
+(cd "$project" && "$HOLBUILD_BIN" build --force --skip-checkpoints --no-cache AppTheory) > "$tmpdir/default.log" 2>&1
+require_grep '^proof_timeout=2.5$' "$project/.holbuild/dep/theory-tactic-timeout/src/SlowScript.sml.key"
+
+printf 'tactic_timeout = 0\n' >> "$project/holproject.toml"
+(cd "$project" && "$HOLBUILD_BIN" context) > "$tmpdir/manifest-zero-context.log"
+require_grep '^build.tactic_timeout: none$' "$tmpdir/manifest-zero-context.log"
+(cd "$project" && "$HOLBUILD_BIN" build --force --skip-checkpoints --no-cache AppTheory) > "$tmpdir/manifest-zero.log" 2>&1
+require_grep '^proof_timeout=none$' "$project/.holbuild/dep/theory-tactic-timeout/src/SlowScript.sml.key"
+
+# A local zero overrides a nonzero manifest value rather than inheriting it.
+python3 - "$project/holproject.toml" <<'PY_EDIT'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_text(p.read_text().replace('tactic_timeout = 0\n', 'tactic_timeout = 0.1\n'))
+PY_EDIT
+printf '[build]\ntactic_timeout = 0\n' > "$project/.holconfig.toml"
+(cd "$project" && "$HOLBUILD_BIN" build --force --skip-checkpoints --no-cache AppTheory) > "$tmpdir/local-zero.log" 2>&1
+require_grep '^proof_timeout=none$' "$project/.holbuild/dep/theory-tactic-timeout/src/SlowScript.sml.key"
+
+# CLI zero still wins over both configured policies.
+printf '[build]\ntactic_timeout = 0.1\n' > "$project/.holconfig.toml"
+(cd "$project" && "$HOLBUILD_BIN" build --force --skip-checkpoints --no-cache --tactic-timeout 0 AppTheory) > "$tmpdir/cli-zero.log" 2>&1
+require_grep '^proof_timeout=none$' "$project/.holbuild/dep/theory-tactic-timeout/src/SlowScript.sml.key"

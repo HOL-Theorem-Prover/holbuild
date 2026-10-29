@@ -181,7 +181,8 @@ for source in "$@"; do
 done
 HOLMAKE
 chmod +x bin/Holmake
-ln -s "$(pwd)/src/runtime/Runtime.sml" sigobj/Runtime.uo
+# HOL bakes its build directory as getcwd reports it, symlinks resolved.
+ln -s "$(pwd -P)/src/runtime/Runtime.sml" sigobj/Runtime.uo
 SH
   chmod +x "$hol/bin/build"
 }
@@ -194,7 +195,7 @@ write_fake_poly() {
 #!/usr/bin/env sh
 set -eu
 if [ "${1:-}" = -v ]; then
-  printf 'Fake Poly/ML Arm64 1.0\n'
+  printf 'Poly/ML 1.0 Release    RTS version: Fake-1.0 (Git version v1.0)\n'
   exit 0
 fi
 touch configured
