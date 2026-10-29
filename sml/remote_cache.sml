@@ -63,7 +63,7 @@ fun write_text path text =
   end
 
 fun temp_path label =
-  Path.concat(Path.dir (FS.tmpName ()), "holbuild-remote-cache-" ^ label ^ "-" ^ Path.file (FS.tmpName ()))
+  HolbuildTempPath.temporary ("remote-cache-" ^ label)
 
 fun curl_config_arg () =
   case HolbuildRemoteCacheConfig.curl_config () of
@@ -113,13 +113,29 @@ fun zstd_compress src dst =
 fun zstd_content_headers size =
   " -H 'Content-Encoding: zstd' -H " ^ quote ("X-Digest-SizeBytes: " ^ size)
 
+val restore_warning_emitted = ref false
+val restore_warning_mutex = Mutex.mutex ()
+
+fun warn_restore_once message =
+  let
+    val _ = Mutex.lock restore_warning_mutex
+    val emit = not (!restore_warning_emitted)
+    val _ = restore_warning_emitted := true
+    val _ = Mutex.unlock restore_warning_mutex
+  in
+    if emit then
+      (TextIO.output (TextIO.stdErr, "holbuild: warning: remote cache restore failed: " ^ message ^ "\n");
+       TextIO.flushOut TextIO.stdErr)
+    else ()
+  end
+
 fun curl_get_with_timeout timeout_seconds {url, dst} =
   let
     val code = temp_path "code"
     val display_url = redact_userinfo url
     (* --compressed advertises curl-supported response encodings, including zstd
        when this curl build has zstd support, and streams decompressed bytes to dst. *)
-    val command = "curl -q -sS -L --compressed --max-time " ^ timeout_seconds ^ curl_config_arg () ^ " -o " ^ quote dst ^
+    val command = "curl -q -sS -L --compressed --connect-timeout 10 --max-time " ^ timeout_seconds ^ curl_config_arg () ^ " -o " ^ quote dst ^
                   " -w '%{http_code}' " ^ quote url ^ " > " ^ quote code
     val status = OS.Process.system command
     val http_code = if path_exists code then read_first_token code else "000"
@@ -142,7 +158,7 @@ fun curl_put_with_headers_timeout timeout_seconds headers {url, src} =
     val code = temp_path "code"
     val body = temp_path "body"
     val display_url = redact_userinfo url
-    val command = "curl -q -sS -L --max-time " ^ timeout_seconds ^ curl_config_arg () ^ headers ^ " -T " ^ quote src ^
+    val command = "curl -q -sS -L --connect-timeout 10 --max-time " ^ timeout_seconds ^ curl_config_arg () ^ headers ^ " -T " ^ quote src ^
                   " -o " ^ quote body ^ " -w '%{http_code}' " ^ quote url ^
                   " > " ^ quote code
     val status = OS.Process.system command
@@ -279,7 +295,8 @@ fun get_action cache key =
             SOME manifest
           end
       | HolbuildCacheBackend.Miss => (cleanup (); NONE)
-      | HolbuildCacheBackend.Corrupt _ => (cleanup (); NONE)
+      | HolbuildCacheBackend.Corrupt message =>
+          (cleanup (); warn_restore_once message; NONE)
   end
   handle _ => NONE
 
@@ -352,6 +369,8 @@ fun fetch_blob_with_timeout timeout_seconds cache {hash, dst} =
         in
           case result of
               HolbuildCacheBackend.Hit => verify_downloaded_blob dst entry
+            | HolbuildCacheBackend.Corrupt message =>
+                (warn_restore_once message; result)
             | other => other
         end
         handle e => HolbuildCacheBackend.Corrupt (General.exnMessage e)

@@ -79,7 +79,7 @@ fun tactic_timeout_value context value =
 fun tactic_timeout_at context table key =
   case lookup table key of
       NONE => NONE
-    | SOME value => tactic_timeout_value context value
+    | SOME value => SOME (tactic_timeout_value context value)
 
 fun positive_int_field context n =
   if n >= IntInf.fromInt 1 then

@@ -38,6 +38,7 @@ use "sml/sha256.sml";
 use "sml/spawn.sml";
 use "sml/hash.sml";
 use "sml/process_group.sml";
+use "sml/temp_path.sml";
 use "sml/stat_cache.sml";
 use "sml/version.sml";
 use "sml/hol_toolchain_config.sml";

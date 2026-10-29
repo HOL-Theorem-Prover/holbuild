@@ -818,7 +818,7 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
     fun default_tactic_timeout () =
       case #build_tactic_timeout project of
           NONE => SOME 2.5
-        | some => some
+        | SOME timeout => timeout
     fun build_options_for index entry_plan plan force_targets =
       {use_cache = use_cache,
        verify_cache = verify_cache,
@@ -1084,7 +1084,7 @@ fun export_build_options trknl project index entry_plan plan =
     fun default_tactic_timeout () =
       case #build_tactic_timeout project of
           NONE => SOME 2.5
-        | some => some
+        | SOME timeout => timeout
   in
     {use_cache = true,
      verify_cache = true,
@@ -1665,7 +1665,8 @@ fun main raw_args =
        | HolbuildCacheConfig.Error msg => err msg
        | HolbuildRemoteCacheConfig.Error msg => err msg
        | HolbuildWatch.Error msg => err msg
-       | e => if is_broken_pipe e then OS.Process.exit OS.Process.success
+       | e => if is_broken_pipe e then
+                OS.Process.exit (if HolbuildStatus.json_mode () then OS.Process.failure else OS.Process.success)
               else err (General.exnMessage e)
 
 end
