@@ -46,6 +46,7 @@ use "sml/hol_toolchain_config.sml";
 use "sml/builtin_manifests.sml";
 use "sml/hol_source_manifest.sml";
 use "sml/cache_config.sml";
+use "sml/http.sml";
 use "sml/remote_cache_config.sml";
 use "sml/file_lock.sml";
 use "sml/git_cache.sml";

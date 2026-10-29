@@ -707,6 +707,9 @@ fun effective_jobs (project : HolbuildProject.t) cli_jobs =
 fun apply_project_local_remote_cache_config (project : HolbuildProject.t) =
   (HolbuildRemoteCacheConfig.set_local_url (HolbuildProject.remote_cache_url project);
    HolbuildRemoteCacheConfig.set_local_curl_config (HolbuildProject.remote_cache_curl_config project);
+   (* The remote cache settings are final here, and no other thread has
+      started yet. *)
+   HolbuildRemoteCacheConfig.setup_client ();
    project)
 
 fun load_project () =
