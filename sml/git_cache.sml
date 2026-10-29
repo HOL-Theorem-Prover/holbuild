@@ -18,11 +18,7 @@ fun ensure_dir path =
   else (ensure_dir (Path.dir path); FS.mkDir path handle OS.SysErr _ => ())
 
 fun remove_tree path =
-  if path = "" orelse path = "." orelse path = "/" then
-    die ("refusing to remove unsafe path: " ^ path)
-  else
-    let val status = OS.Process.system ("rm -rf " ^ quote path)
-    in if OS.Process.isSuccess status then () else die ("failed to remove path: " ^ path) end
+  HolbuildRemoveTree.remove_strict path handle HolbuildRemoveTree.Error msg => die msg
 
 fun is_safe_name name =
   size name > 0 andalso
