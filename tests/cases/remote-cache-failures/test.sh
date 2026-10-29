@@ -117,7 +117,7 @@ build_with_failure() {
       cat "$log" >&2
       exit 1
     fi
-    [[ "$failure" != transport ]] || require_grep "failed: Couldn't connect to server" "$log"
+    [[ "$failure" != transport ]] || require_grep 'Failed to connect to 127.0.0.1 port 1' "$log"
   fi
   require_grep 'ATheory built' "$log"
   require_grep 'BTheory built' "$log"
