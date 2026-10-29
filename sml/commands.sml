@@ -602,15 +602,13 @@ fun print_static_execution_plan project new_ir source theorem unit_opt =
           end);
    TextIO.flushOut TextIO.stdOut)
 
-fun find_theory_source_for command index theory =
+fun find_theory_source command index theory =
   case List.filter (fn source => theory_source source andalso #logical_name source = theory) index of
       [source] => source
     | [] => raise Error ("theory not found for " ^ command ^ ": " ^ theory)
     | matches =>
         raise Error ("ambiguous theory for " ^ command ^ ": " ^ theory ^ " in " ^
                      String.concatWith ", " (map describe_source matches))
-
-fun find_theory_source index theory = find_theory_source_for "execution-plan" index theory
 
 fun find_theorem_in_source theorem source =
   case theorem_match theorem source of
@@ -628,7 +626,7 @@ fun print_execution_plan_selector new_ir project selector =
     val components = HolbuildComponentProvider.load HolbuildComponentProvider.LiveProvider
                        {preparation = preparation, discovery = discovery}
     val index = HolbuildComponentProvider.sources components
-    val source = find_theory_source index theory
+    val source = find_theory_source "execution-plan" index theory
   in
     print_static_execution_plan project new_ir source theorem (SOME (find_theorem_in_source theorem source))
   end
@@ -1404,17 +1402,19 @@ fun build_heap_kind tc cli_jobs command target =
 fun build_heap tc cli_jobs target = build_heap_kind tc cli_jobs "heap" target
 fun build_executable tc cli_jobs target = build_heap_kind tc cli_jobs "executable" target
 
-fun hol_args_for_project tc project subcommand context user_args =
+fun hol_args_for_project tc project run_heap subcommand context user_args =
   let
     val heap_args =
-      case HolbuildProject.abs_run_heap project of
-          NONE => ["--holstate", HolbuildToolchain.base_state tc]
-        | SOME heap => ["--holstate", heap]
+      case (run_heap, HolbuildProject.abs_run_heap project) of
+          (true, SOME heap) => ["--holstate", heap]
+        | _ => ["--holstate", HolbuildToolchain.base_state tc]
   in
     HolbuildToolchain.hol_subcommand_argv tc subcommand @ heap_args @ [context] @ user_args
   end
 
-fun run_hol_status runner tc cli_jobs subcommand user_args =
+(* With run_heap false, HOL starts from the toolchain's base state even when
+   [run].heap is configured. *)
+fun run_hol_status runner tc cli_jobs run_heap subcommand user_args =
   let
     val configured_project = timed_phase "project.discover" load_project
     val run_loads = #run_loads configured_project
@@ -1425,13 +1425,14 @@ fun run_hol_status runner tc cli_jobs subcommand user_args =
       if null run_loads then configured_project
       else timed_phase "run.project.rediscover" load_project
     val packages = resolved_packages (resolution_for_toolchain tc) project
-    fun invoke context = runner (hol_args_for_project tc project subcommand context user_args)
+    fun invoke context =
+      runner (hol_args_for_project tc project run_heap subcommand context user_args)
   in
     HolbuildToolchain.with_run_context project packages invoke
   end
 
 fun run_hol_with runner tc cli_jobs subcommand user_args =
-  if HolbuildToolchain.success (run_hol_status runner tc cli_jobs subcommand user_args) then ()
+  if HolbuildToolchain.success (run_hol_status runner tc cli_jobs true subcommand user_args) then ()
   else raise Error ("hol " ^ subcommand ^ " failed")
 
 fun run_hol tc cli_jobs subcommand user_args =
@@ -1451,10 +1452,6 @@ fun parse_check_selector selector =
         else {theory = theory, theorem = SOME theorem}
     | _ => raise Error "check requires THEORY or THEORY:THEOREM"
 
-(* HOL's name for the theory whose structure is NAMETheory. *)
-fun hol_theory_name logical_name =
-  String.substring(logical_name, 0, size logical_name - size "Theory")
-
 (* The theory names HOL itself does not declare: those of the root package
    and its dependency packages.  Axioms in these theories are findings. *)
 fun project_theory_names tc project index =
@@ -1465,7 +1462,8 @@ fun project_theory_names tc project index =
     fun project_theory source =
       theory_source source andalso #package_id (#node source) <> hol
   in
-    map (hol_theory_name o #logical_name) (List.filter project_theory index)
+    map (HolbuildBuildExec.theory_name_from_logical o #logical_name)
+        (List.filter project_theory index)
   end
 
 (* An SML script for `hol run` that loads the theory and prints the
@@ -1474,14 +1472,14 @@ fun project_theory_names tc project index =
 fun check_script {logical_name, theorem, project_theories} =
   let
     val sml_string = HolbuildToolchain.sml_string
-    val theory = hol_theory_name logical_name
+    val theory = HolbuildBuildExec.theory_name_from_logical logical_name
     val selected =
       case theorem of
           NONE => "NONE"
         | SOME name => "SOME " ^ sml_string name
   in
     String.concatWith "\n"
-      ["val _ = load " ^ sml_string logical_name ^ ";",
+      [HolbuildToolchain.run_load_line logical_name,
        "local",
        "  val theory = " ^ sml_string theory,
        "  val selected : string option = " ^ selected,
@@ -1499,19 +1497,16 @@ fun check_script {logical_name, theorem, project_theories} =
        "          (case List.filter (fn (n, _) => n = name) stored of",
        "               [] => fail (\"theorem not found: \" ^ qualified theory name)",
        "             | found => found)",
-       "  fun theorem_problems (name, th) =",
-       "    let val (oracles, axioms) = Tag.dest_tag (Thm.tag th)",
-       "        val problems = List.filter (fn s => s <> \"DISK_THM\") oracles @",
-       "                       map (fn s => \"axiom \" ^ s) axioms",
-       "    in if null problems then []",
-       "       else [qualified theory name ^ \": \" ^ String.concatWith \", \" problems]",
-       "    end",
+       "  fun theorem_oracles (name, th) =",
+       "    case List.filter (fn s => s <> \"DISK_THM\") (#1 (Tag.dest_tag (Thm.tag th))) of",
+       "        [] => []",
+       "      | oracles => [qualified theory name ^ \": \" ^ String.concatWith \", \" oracles]",
        "  fun project_theory thy = List.exists (fn t => t = thy) project_theories",
        "  fun theory_axioms thy =",
        "    map (fn (name, _) => qualified thy name ^ \": axiom\")",
        "        (Listsort.sort by_name (DB.axioms thy))",
        "  val findings =",
-       "    List.concat (map theorem_problems checked) @",
+       "    List.concat (map theorem_oracles checked) @",
        "    List.concat (map theory_axioms",
        "                   (List.filter project_theory (theory :: Theory.ancestry theory)))",
        "  fun count n noun = Int.toString n ^ \" \" ^ noun ^ (if n = 1 then \"\" else \"s\")",
@@ -1534,18 +1529,16 @@ fun check_selector tc cli_jobs selector =
     val {theory, theorem} = parse_check_selector selector
     val project = timed_phase "project.discover" load_project
     val {index, ...} = prepare_source_index "check" (resolution_for_toolchain tc) project
-    val source = find_theory_source_for "check" index theory
+    val source = find_theory_source "check" index theory
     val _ = build_once tc cli_jobs (default_build_request [#logical_name source])
-    val script_path =
-      OS.Path.concat(OS.Path.concat(HolbuildProject.artifact_root project, ".holbuild"),
-                     "holbuild-check-" ^ HolbuildFileLock.current_pid_text () ^ "-" ^
-                     HolbuildToolchain.run_context_nonce () ^ ".sml")
+    val script_path = HolbuildToolchain.invocation_sml_file project "holbuild-check"
     val _ = write_text_file script_path
               (check_script {logical_name = #logical_name source, theorem = theorem,
                              project_theories = project_theory_names tc project index})
     fun cleanup () = OS.FileSys.remove script_path handle OS.SysErr _ => ()
     val status =
-      run_hol_status HolbuildToolchain.run tc cli_jobs "run" [script_path]
+      (* A run heap may hold an older copy of the theory, which load would keep. *)
+      run_hol_status HolbuildToolchain.run tc cli_jobs false "run" [script_path]
       handle e => (cleanup (); raise e)
   in
     cleanup ();

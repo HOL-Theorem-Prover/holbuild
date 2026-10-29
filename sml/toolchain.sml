@@ -293,17 +293,18 @@ fun run_context_nonce () =
     nonce
   end
 
+(* An SML file under the project's .holbuild/ private to this invocation. *)
+fun invocation_sml_file (project : HolbuildProject.t) prefix =
+  Path.concat
+    (Path.concat(HolbuildProject.artifact_root project, ".holbuild"),
+     prefix ^ "-" ^ HolbuildFileLock.current_pid_text () ^ "-" ^
+     run_context_nonce () ^ ".sml")
+
 fun write_run_context (project : HolbuildProject.t) packages =
   let
-    val root = HolbuildProject.artifact_root project
-    val hol_dir = Path.concat(root, ".holbuild")
-    val context =
-      Path.concat
-        (hol_dir,
-         "holbuild-run-context-" ^ HolbuildFileLock.current_pid_text () ^ "-" ^
-         run_context_nonce () ^ ".sml")
+    val context = invocation_sml_file project "holbuild-run-context"
     val load_dirs = run_context_load_path_dirs project packages
-    val _ = ensure_dir hol_dir
+    val _ = ensure_dir (Path.dir context)
     val out = TextIO.openOut context
       handle e => raise Error ("could not write " ^ context ^ ": " ^ General.exnMessage e)
     fun line s = TextIO.output(out, s ^ "\n")

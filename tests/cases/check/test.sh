@@ -133,6 +133,14 @@ run_check UsesTheory 1
 require_grep "^BaseTheory.magic_ax: axiom$" "$log"
 require_grep "^UsesTheory: 1 finding$" "$log"
 
+# A single theorem still gets the ancestry's axioms reported.
+run_check UsesTheory:uses_thm 1
+require_grep "^BaseTheory.magic_ax: axiom$" "$log"
+
+# A theory's own axioms are findings too.
+run_check BaseTheory 1
+require_grep "^BaseTheory.magic_ax: axiom$" "$log"
+
 run_check CheatTheory:missing_thm 1
 require_grep "holbuild: theorem not found: CheatTheory.missing_thm" "$log"
 
@@ -145,3 +153,28 @@ require_grep "holbuild: check requires THEORY or THEORY:THEOREM" "$log"
 help_log=$tmpdir/help.log
 "$HOLBUILD_BIN" check --help > "$help_log"
 require_grep "holbuild \[GLOBAL OPTIONS\] check THEORY\[:THEOREM\]" "$help_log"
+
+if find "$project/.holbuild" -maxdepth 1 -name 'holbuild-check-*.sml' -print -quit | grep -q .; then
+  echo "check left its generated script behind" >&2
+  exit 1
+fi
+
+# A [run].heap holding an older CheatTheory must not hide the rebuilt one.
+cat >> "$project/holproject.toml" <<'TOML'
+
+[[heap]]
+name = "main"
+output = ".holbuild/heap/main.save"
+objects = ["CheatTheory"]
+
+[run]
+heap = ".holbuild/heap/main.save"
+TOML
+(cd "$project" && "$HOLBUILD_BIN" -j2 heap main) > "$tmpdir/heap.log" 2>&1
+python3 - "$project/src/CheatScript.sml" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+path.write_text(path.read_text().replace("  F\nProof\n  cheat\n", "  T\nProof\n  simp[]\n"))
+PY
+run_check CheatTheory 0
+require_grep "^CheatTheory: clean (2 theorems)$" "$log"
