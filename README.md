@@ -510,7 +510,8 @@ always_reexecute = true
 - `extra_deps` adds package-root-relative filesystem inputs that are hashed
   into the action key and copied into the action's stage directory at their
   path relative to the script, so `data/table.txt` for `src/FooScript.sml` is
-  read as `../data/table.txt`; absolute paths and `..` components are rejected.
+  read as `../data/table.txt` (the stage mirrors the package layout, so such
+  copies stay inside it); absolute paths and `..` components are rejected.
 - `cache = false` disables global cache restore/publish for the action.
 - `always_reexecute = true` disables local up-to-date skipping for the action.
 

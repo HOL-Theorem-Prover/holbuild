@@ -126,9 +126,10 @@ if grep -q "ATheory is up to date" "$tmpdir/source-extra2.log"; then
 fi
 
 # Manifest inputs are staged at their script-relative paths, so the script can
-# read them the way it would read source-declared ones.
+# read them the way it would read source-declared ones, and inputs reached
+# through ../ stay inside the action's stage.
 manifest_stage_project="$tmpdir/manifest_stage_policy"
-mkdir -p "$manifest_stage_project/src" "$manifest_stage_project/data"
+mkdir -p "$manifest_stage_project/src/a" "$manifest_stage_project/data"
 cat > "$manifest_stage_project/holproject.toml" <<TOML
 [holbuild]
 schema = 2
@@ -145,16 +146,16 @@ name = "manifest_stage_policy"
 members = ["src"]
 
 [actions.ATheory]
-extra_deps = ["src/side.txt", "data/message.txt"]
+extra_deps = ["src/a/side.txt", "data/message.txt"]
 TOML
-echo side > "$manifest_stage_project/src/side.txt"
+echo side > "$manifest_stage_project/src/a/side.txt"
 echo message > "$manifest_stage_project/data/message.txt"
-cat > "$manifest_stage_project/src/AScript.sml" <<'SML'
+cat > "$manifest_stage_project/src/a/AScript.sml" <<'SML'
 fun read_input path =
   let val input = TextIO.openIn path
   in TextIO.inputAll input before TextIO.closeIn input end
 val _ = if read_input "side.txt" = "side\n" then () else raise Fail "bad side.txt"
-val _ = if read_input "../data/message.txt" = "message\n" then () else raise Fail "bad message.txt"
+val _ = if read_input "../../data/message.txt" = "message\n" then () else raise Fail "bad message.txt"
 open HolKernel Parse boolLib bossLib;
 val _ = new_theory "A";
 Theorem a_thm:
@@ -165,7 +166,11 @@ QED
 val _ = export_theory();
 SML
 (cd "$manifest_stage_project" && "$HOLBUILD_BIN" build ATheory) > "$tmpdir/manifest-stage.log" 2>&1
-require_file "$manifest_stage_project/.holbuild/obj/src/ATheory.dat"
+require_file "$manifest_stage_project/.holbuild/obj/src/a/ATheory.dat"
+if [[ -e "$manifest_stage_project/.holbuild/data" || -e "$manifest_stage_project/.holbuild/stage/data" ]]; then
+  echo "manifest extra input was staged outside the action's stage" >&2
+  exit 1
+fi
 
 always_project="$tmpdir/always_policy"
 make_theory_project "$always_project" '[actions.ATheory]
