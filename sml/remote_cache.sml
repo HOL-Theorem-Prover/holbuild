@@ -6,11 +6,11 @@ structure FS = OS.FileSys
 
 exception Error of string
 
-type blob_entry = {sha1 : string, sha256 : string, size : string}
+type blob_entry = {sha256 : string, size : string}
 type blob_map = (string, blob_entry) Redblackmap.dict
 datatype t = RemoteCache of {base_url : string, blobs : blob_map ref}
 
-val metadata_header = "holbuild-remote-cache-action-v1"
+val metadata_header = "holbuild-remote-cache-action-v2"
 val manifest_marker = "manifest-text-v1\n"
 
 (* Large toolchain archives get a minutes-scale transfer bound without changing
@@ -256,15 +256,15 @@ fun remote_action_key key =
 fun action_url cache key = base_url cache ^ "/ac/" ^ remote_action_key key
 fun cas_url cache sha256 = base_url cache ^ "/cas/" ^ sha256
 
-fun lookup_blob cache sha1 =
-  Redblackmap.peek (!(blob_map cache), sha1)
+fun lookup_blob cache sha256 =
+  Redblackmap.peek (!(blob_map cache), sha256)
 
 fun remember_blob cache entry =
   let
     val blobs = blob_map cache
-    val {sha1, ...} = entry
+    val {sha256, ...} = entry
   in
-    blobs := Redblackmap.insert (!blobs, sha1, entry)
+    blobs := Redblackmap.insert (!blobs, sha256, entry)
   end
 
 fun split_at_marker text =
@@ -282,9 +282,9 @@ fun split_at_marker text =
 
 fun parse_blob_line line =
   case String.tokens Char.isSpace line of
-      ["blob", sha1, sha256, size] =>
-        if HolbuildHash.valid_sha1 sha1 andalso HolbuildHash.valid_sha256 sha256 then
-          SOME {sha1 = sha1, sha256 = sha256, size = size}
+      ["blob", sha256, size] =>
+        if HolbuildHash.valid_sha256 sha256 then
+          SOME {sha256 = sha256, size = size}
         else NONE
     | _ => NONE
 
@@ -333,7 +333,7 @@ fun metadata_text manifest blobs =
     ([metadata_header,
       "manifest-sha256 " ^ HolbuildHash.string_sha256 manifest,
       "manifest-size " ^ Int.toString (size manifest)] @
-     map (fn {sha1, sha256, size} => "blob " ^ sha1 ^ " " ^ sha256 ^ " " ^ size) blobs @
+     map (fn {sha256, size} => "blob " ^ sha256 ^ " " ^ size) blobs @
      [manifest_marker ^ manifest])
 
 fun get_action cache key =
@@ -403,13 +403,11 @@ fun put_action cache policy {key, text} =
   end
   handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
-fun has_blob cache sha1 = Option.isSome (lookup_blob cache sha1)
+fun has_blob cache sha256 = Option.isSome (lookup_blob cache sha256)
 
-fun verify_downloaded_blob path ({sha1, sha256, size} : blob_entry) =
+fun verify_downloaded_blob path ({sha256, size} : blob_entry) =
   if Position.toString (FS.fileSize path) <> size then
-    HolbuildCacheBackend.Corrupt ("downloaded blob size mismatch: " ^ sha1)
-  else if HolbuildHash.file_sha1 path <> sha1 then
-    HolbuildCacheBackend.Corrupt ("downloaded blob SHA1 mismatch: " ^ sha1)
+    HolbuildCacheBackend.Corrupt ("downloaded blob size mismatch: " ^ sha256)
   else if HolbuildHash.file_sha256 path <> sha256 then
     HolbuildCacheBackend.Corrupt ("downloaded blob SHA256 mismatch: " ^ sha256)
   else
@@ -439,19 +437,18 @@ fun fetch_toolchain_blob cache request =
 
 fun publish_blob_with_timeout timeout_seconds cache {hash, src} =
   let
-    val sha1 = HolbuildHash.file_sha1 src
     val sha256 = HolbuildHash.file_sha256 src
     val size = Position.toString (FS.fileSize src)
     val _ =
-      if sha1 = hash then ()
-      else raise Error ("blob SHA1 mismatch: expected " ^ hash ^ " got " ^ sha1)
+      if sha256 = hash then ()
+      else raise Error ("blob SHA256 mismatch: expected " ^ hash ^ " got " ^ sha256)
     val result =
       curl_put_zstd_with_timeout timeout_seconds
         {url = cas_url cache sha256, src = src, size = size}
   in
     case result of
-        HolbuildCacheBackend.Published => (remember_blob cache {sha1 = hash, sha256 = sha256, size = size}; result)
-      | HolbuildCacheBackend.AlreadyPresent => (remember_blob cache {sha1 = hash, sha256 = sha256, size = size}; result)
+        HolbuildCacheBackend.Published => (remember_blob cache {sha256 = sha256, size = size}; result)
+      | HolbuildCacheBackend.AlreadyPresent => (remember_blob cache {sha256 = sha256, size = size}; result)
       | other => other
   end
   handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)

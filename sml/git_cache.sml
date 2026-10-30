@@ -72,7 +72,7 @@ fun cache_remote_dir git =
   let
     val root = cache_root ()
     val remotes = Path.concat(Path.concat(root, "git"), "remotes")
-    val hash = HolbuildHash.string_sha1 git
+    val hash = HolbuildHash.string_sha256 git
   in
     ensure_dir remotes;
     Path.concat(remotes, hash ^ ".git")

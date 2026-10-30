@@ -113,13 +113,13 @@ fun create_archive {entry_dir, identity, archive_path} =
     handle e => (cleanup (); raise e)
   end
 
-fun remote_record sha1 = "blob=" ^ sha1 ^ "\n"
+fun remote_record hash = "blob=" ^ hash ^ "\n"
 
 fun parse_remote_record text =
   case HolbuildCacheTransfer.unique_blobs text of
-      [sha1] =>
-        if HolbuildHash.valid_sha1 sha1 then sha1
-        else reject "remote toolchain action has invalid SHA1"
+      [hash] =>
+        if HolbuildHash.valid_sha256 hash then hash
+        else reject "remote toolchain action has invalid SHA256"
     | _ => reject "remote toolchain action must reference exactly one blob"
 
 fun extract_archive {archive_path, staging_dir} =
@@ -150,12 +150,12 @@ fun restore {remote, identity, final_dir} =
       NONE => false
     | SOME text =>
         let
-          val sha1 = parse_remote_record text
+          val hash = parse_remote_record text
           val scratch_dir = restore_scratch_path final_dir
           val archive_path = Path.concat(scratch_dir, "archive.tar")
           fun cleanup () = remove_tree scratch_dir handle _ => ()
           fun fetch () =
-            case HolbuildRemoteCache.fetch_toolchain_blob remote {hash = sha1, dst = archive_path} of
+            case HolbuildRemoteCache.fetch_toolchain_blob remote {hash = hash, dst = archive_path} of
                 HolbuildCacheBackend.Hit => ()
               | HolbuildCacheBackend.Miss => reject "remote toolchain archive blob is missing"
               | HolbuildCacheBackend.Corrupt detail => die ("could not fetch remote toolchain archive blob: " ^ detail)
@@ -175,8 +175,8 @@ fun publish {remote, identity, entry_dir, replace} =
   let
     val archive_path = temp_path "publish"
     fun cleanup () = remove_file archive_path
-    fun upload sha1 =
-      case HolbuildRemoteCache.publish_toolchain_blob remote {hash = sha1, src = archive_path} of
+    fun upload hash =
+      case HolbuildRemoteCache.publish_toolchain_blob remote {hash = hash, src = archive_path} of
           result as HolbuildCacheBackend.Published => result
         | result as HolbuildCacheBackend.AlreadyPresent => result
         | HolbuildCacheBackend.Skipped => die "remote cache skipped toolchain archive publication"
@@ -190,10 +190,10 @@ fun publish {remote, identity, entry_dir, replace} =
     else
       ((create_archive {entry_dir = entry_dir, identity = identity, archive_path = archive_path};
         let
-          val sha1 = HolbuildHash.file_sha1 archive_path
-          val _ = upload sha1
+          val hash = HolbuildHash.file_sha256 archive_path
+          val _ = upload hash
         in
-          case put_action {key = identity, text = remote_record sha1} of
+          case put_action {key = identity, text = remote_record hash} of
               result as HolbuildCacheBackend.Published => result
             | result as HolbuildCacheBackend.AlreadyPresent => result
             | HolbuildCacheBackend.Skipped => die "remote cache skipped toolchain action publication"

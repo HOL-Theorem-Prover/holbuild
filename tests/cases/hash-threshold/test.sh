@@ -61,8 +61,7 @@ fun check_size size =
     val sha1 = command_hash "sha1sum" path
     val sha256 = command_hash "sha256sum" path
   in
-    assert ("sha1 mismatch at " ^ Int.toString size) (HolbuildHash.file_sha1 path = sha1);
-    assert ("string sha1 mismatch at " ^ Int.toString size) (HolbuildHash.string_sha1 (HolbuildHash.read_binary_all path) = sha1);
+    assert ("HOL .dat sha1 mismatch at " ^ Int.toString size) (HolbuildBuildExec.hol_dat_hash path = sha1);
     assert ("sha256 mismatch at " ^ Int.toString size) (HolbuildHash.file_sha256 path = sha256);
     assert ("string sha256 mismatch at " ^ Int.toString size) (HolbuildHash.string_sha256 (HolbuildHash.read_binary_all path) = sha256)
   end
@@ -92,13 +91,13 @@ grep -q "hash threshold and corpus tests passed" "$tmpdir/hash-threshold-test.lo
 
 shimdir="$tmpdir/shim"
 mkdir -p "$shimdir"
-cat > "$shimdir/sha1sum" <<'SH'
+cat > "$shimdir/sha256sum" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-printf '%s\n' "$1" >> "$HASH_THRESHOLD_SHA1_LOG"
-printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  %s\n' "$1"
+printf '%s\n' "$1" >> "$HASH_THRESHOLD_SHA256_LOG"
+printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  %s\n' "$1"
 SH
-chmod +x "$shimdir/sha1sum"
+chmod +x "$shimdir/sha256sum"
 
 cat > "$tmpdir/hash-path-selection.sml" <<'SML'
 val root =
@@ -120,17 +119,17 @@ fun join (a, b) = OS.Path.concat(a, b)
 
 val small = join(tmp, "blob-5120.bin")
 val large = join(tmp, "blob-307200.bin")
-val sentinel = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-val small_hash = HolbuildHash.file_sha1 small
-val large_hash = HolbuildHash.file_sha1 large
+val sentinel = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+val small_hash = HolbuildHash.file_sha256 small
+val large_hash = HolbuildHash.file_sha256 large
 
-val _ = assert "5 KB SHA1 unexpectedly used external path" (small_hash <> sentinel)
-val _ = assert "300 KB SHA1 did not use external path" (large_hash = sentinel)
+val _ = assert "5 KB SHA256 unexpectedly used external path" (small_hash <> sentinel)
+val _ = assert "300 KB SHA256 did not use external path" (large_hash = sentinel)
 val _ = print "hash path selection test passed\n"
 SML
 
-: > "$tmpdir/sha1-path.log"
-PATH="$shimdir:$PATH" HASH_THRESHOLD_TEST_TMP="$tmpdir" HASH_THRESHOLD_SHA1_LOG="$tmpdir/sha1-path.log" \
+: > "$tmpdir/sha256-path.log"
+PATH="$shimdir:$PATH" HASH_THRESHOLD_TEST_TMP="$tmpdir" HASH_THRESHOLD_SHA256_LOG="$tmpdir/sha256-path.log" \
   "${HOLBUILD_POLY:-poly}" < "$tmpdir/hash-path-selection.sml" > "$tmpdir/hash-path-selection.log" 2>&1 || {
     cat "$tmpdir/hash-path-selection.log" >&2
     exit 1
@@ -138,8 +137,8 @@ PATH="$shimdir:$PATH" HASH_THRESHOLD_TEST_TMP="$tmpdir" HASH_THRESHOLD_SHA1_LOG=
 
 grep -q "hash path selection test passed" "$tmpdir/hash-path-selection.log"
 
-if grep -q "blob-5120.bin" "$tmpdir/sha1-path.log"; then
-  echo "5 KB file unexpectedly called sha1sum" >&2
+if grep -q "blob-5120.bin" "$tmpdir/sha256-path.log"; then
+  echo "5 KB file unexpectedly called sha256sum" >&2
   exit 1
 fi
-require_grep "blob-307200.bin" "$tmpdir/sha1-path.log"
+require_grep "blob-307200.bin" "$tmpdir/sha256-path.log"

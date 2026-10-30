@@ -336,7 +336,7 @@ fun read_cache cache_path source_hash =
         version :: extractor :: hash_line :: rest =>
           if version = cache_version andalso
              extractor = "extractor=" ^ extractor_version andalso
-             hash_line = "source_sha1=" ^ source_hash then
+             hash_line = "source_sha256=" ^ source_hash then
             SOME {loads = values "load=" rest,
                   uses = values "use=" rest,
                   extra_deps = values "extra_dep=" rest,
@@ -358,7 +358,7 @@ fun cache_text source_hash ({loads, uses, extra_deps, extra_outputs, holdep_ment
   String.concatWith "\n"
     ([cache_version,
       "extractor=" ^ extractor_version,
-      "source_sha1=" ^ source_hash] @
+      "source_sha256=" ^ source_hash] @
      map (fn value => "load=" ^ value) loads @
      map (fn value => "use=" ^ value) uses @
      map (fn value => "extra_dep=" ^ value) extra_deps @
@@ -434,7 +434,7 @@ fun prefetch_cached_with_hash requests =
 fun extract_cached {cache_path, source_path} =
   extract_cached_with_hash {cache_path = cache_path,
                             source_path = source_path,
-                            source_hash = HolbuildHash.file_sha1 source_path}
+                            source_hash = HolbuildHash.file_sha256 source_path}
 
 fun extract path = extract_uncached path
 

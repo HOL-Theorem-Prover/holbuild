@@ -35,7 +35,7 @@ val cache = HolbuildFSCacheBackend.filesystem (join (tmp, "cache"));
 val _ = HolbuildFSCacheBackend.ensure_layout cache;
 val source = join (tmp, "source");
 val _ = write_text source "valid cache blob\n";
-val hash = HolbuildHash.file_sha1 source;
+val hash = HolbuildHash.file_sha256 source;
 val _ =
   case HolbuildFSCacheBackend.publish_blob cache {hash = hash, src = source} of
       HolbuildCacheBackend.Published => ()
@@ -60,7 +60,7 @@ val _ =
   case HolbuildFSCacheBackend.fetch_blob cache {hash = hash, dst = dst} of
       HolbuildCacheBackend.Hit => ()
     | _ => fail "valid cache blob was not fetched";
-val _ = assert "materialized blob hash mismatch" (HolbuildHash.file_sha1 dst = hash);
+val _ = assert "materialized blob hash mismatch" (HolbuildHash.file_sha256 dst = hash);
 val _ = print "filesystem cache backend tests passed\n";
 SML
 

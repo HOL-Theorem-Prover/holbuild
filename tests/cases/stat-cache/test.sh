@@ -34,17 +34,17 @@ fun write_text path text =
   let val out = TextIO.openOut path
   in TextIO.output (out, text); TextIO.closeOut out end
 
-fun raw path = HolbuildHash.file_sha1 path
+fun raw path = HolbuildHash.file_sha256 path
 
 fun ident path =
   case HolbuildStatCache.stat_ident path of
       SOME ident => ident
     | NONE => fail ("stat_ident failed for " ^ path)
 
-fun cache_line path ({dev, ino, size, mtime_ns, ctime_ns} : HolbuildStatCache.ident) sha1 =
+fun cache_line path ({dev, ino, size, mtime_ns, ctime_ns} : HolbuildStatCache.ident) hash =
   String.concat
     [String.toString path, "\t", dev, "\t", ino, "\t", Int.toString size, "\t",
-     LargeInt.toString mtime_ns, "\t", LargeInt.toString ctime_ns, "\t", sha1, "\n"]
+     LargeInt.toString mtime_ns, "\t", LargeInt.toString ctime_ns, "\t", hash, "\n"]
 
 fun write_cache cache_path version lines =
   write_text cache_path (version ^ "\n" ^ String.concat lines)
@@ -57,11 +57,11 @@ fun with_mtime ({dev, ino, size, mtime_ns, ctime_ns} : HolbuildStatCache.ident) 
 
 fun stats instance = HolbuildStatCache.stats instance
 
-val sentinel1 = "1111111111111111111111111111111111111111"
-val sentinel2 = "2222222222222222222222222222222222222222"
-val sentinel3 = "3333333333333333333333333333333333333333"
-val sentinel4 = "4444444444444444444444444444444444444444"
-val sentinel5 = "5555555555555555555555555555555555555555"
+val sentinel1 = "1111111111111111111111111111111111111111111111111111111111111111"
+val sentinel2 = "2222222222222222222222222222222222222222222222222222222222222222"
+val sentinel3 = "3333333333333333333333333333333333333333333333333333333333333333"
+val sentinel4 = "4444444444444444444444444444444444444444444444444444444444444444"
+val sentinel5 = "5555555555555555555555555555555555555555555555555555555555555555"
 
 val corpus_a = join (tmp, "corpus-a.txt")
 val corpus_b = join (tmp, "corpus-b.txt")
@@ -72,7 +72,7 @@ val _ =
   List.app
     (fn path =>
         assert ("default instance mismatch for " ^ path)
-               (HolbuildStatCache.file_sha1 (HolbuildStatCache.current_instance ()) path = raw path))
+               (HolbuildStatCache.file_sha256 (HolbuildStatCache.current_instance ()) path = raw path))
     [corpus_a, corpus_b]
 
 val hit_file = join (tmp, "hit.txt")
@@ -83,7 +83,7 @@ val hit_instance = HolbuildStatCache.load {path = hit_cache}
 (* Matching stat fields, even when they contain nonzero subsecond values,
    cannot prove that the bytes still match.  A same-size rewrite in one
    filesystem tick can produce exactly this cache record. *)
-val _ = assert "matching stat identity must rehash" (HolbuildStatCache.file_sha1 hit_instance hit_file = raw hit_file)
+val _ = assert "matching stat identity must rehash" (HolbuildStatCache.file_sha256 hit_instance hit_file = raw hit_file)
 val _ = assert "matching identity must not be a cache hit"
                (#hits (stats hit_instance) = 0 andalso #recomputes (stats hit_instance) = 1)
 
@@ -93,7 +93,7 @@ val _ = write_text size_file "small"
 val size_ident = ident size_file
 val _ = write_cache size_cache HolbuildStatCache.version [cache_line size_file (with_size size_ident (#size size_ident + 1)) sentinel2]
 val size_instance = HolbuildStatCache.load {path = size_cache}
-val _ = assert "size mismatch should rehash" (HolbuildStatCache.file_sha1 size_instance size_file = raw size_file)
+val _ = assert "size mismatch should rehash" (HolbuildStatCache.file_sha256 size_instance size_file = raw size_file)
 val _ = assert "size miss counters" (#hits (stats size_instance) = 0 andalso #recomputes (stats size_instance) = 1)
 
 val mtime_file = join (tmp, "mtime.txt")
@@ -102,7 +102,7 @@ val _ = write_text mtime_file "mtime"
 val mtime_ident = ident mtime_file
 val _ = write_cache mtime_cache HolbuildStatCache.version [cache_line mtime_file (with_mtime mtime_ident (#mtime_ns mtime_ident + 1)) sentinel3]
 val mtime_instance = HolbuildStatCache.load {path = mtime_cache}
-val _ = assert "mtime mismatch should rehash" (HolbuildStatCache.file_sha1 mtime_instance mtime_file = raw mtime_file)
+val _ = assert "mtime mismatch should rehash" (HolbuildStatCache.file_sha256 mtime_instance mtime_file = raw mtime_file)
 
 val ctime_file = join (tmp, "ctime.txt")
 val ctime_ref = join (tmp, "ctime.ref")
@@ -120,14 +120,14 @@ val _ = assert "same-second edit fixture did not preserve size" (#size ctime_bef
 val _ = assert "same-second edit fixture did not preserve mtime" (#mtime_ns ctime_before = #mtime_ns ctime_after)
 val _ = assert "same-second edit fixture did not change ctime" (#ctime_ns ctime_before <> #ctime_ns ctime_after)
 val ctime_instance = HolbuildStatCache.load {path = ctime_cache}
-val _ = assert "ctime mismatch should rehash" (HolbuildStatCache.file_sha1 ctime_instance ctime_file = raw ctime_file)
+val _ = assert "ctime mismatch should rehash" (HolbuildStatCache.file_sha256 ctime_instance ctime_file = raw ctime_file)
 
 val unknown_file = join (tmp, "unknown.txt")
 val unknown_cache = join (tmp, "unknown.cache")
 val _ = write_text unknown_file "unknown\n"
 val _ = write_cache unknown_cache "holbuild-stat-cache-v1" [cache_line unknown_file (ident unknown_file) sentinel5]
 val unknown_instance = HolbuildStatCache.load {path = unknown_cache}
-val _ = assert "unknown version should load empty and rehash" (HolbuildStatCache.file_sha1 unknown_instance unknown_file = raw unknown_file)
+val _ = assert "unknown version should load empty and rehash" (HolbuildStatCache.file_sha256 unknown_instance unknown_file = raw unknown_file)
 
 val corrupt_file = join (tmp, "corrupt.txt")
 val corrupt_cache = join (tmp, "corrupt.cache")
@@ -136,17 +136,17 @@ val _ = write_text corrupt_file "corrupt\n"
 val _ = write_text corrupt_cache (HolbuildStatCache.version ^ "\nnot\ta\tvalid\tentry\n")
 val corrupt_instance = HolbuildStatCache.load {path = corrupt_cache}
 val missing_instance = HolbuildStatCache.load {path = missing_cache}
-val _ = assert "corrupt cache should load empty and rehash" (HolbuildStatCache.file_sha1 corrupt_instance corrupt_file = raw corrupt_file)
-val _ = assert "missing cache should load empty and rehash" (HolbuildStatCache.file_sha1 missing_instance corrupt_file = raw corrupt_file)
+val _ = assert "corrupt cache should load empty and rehash" (HolbuildStatCache.file_sha256 corrupt_instance corrupt_file = raw corrupt_file)
+val _ = assert "missing cache should load empty and rehash" (HolbuildStatCache.file_sha256 missing_instance corrupt_file = raw corrupt_file)
 
 val flush_file = join (tmp, "flush.txt")
 val flush_cache = join (tmp, "flush.cache")
 val _ = write_text flush_file "flush\n"
 val flush_instance = HolbuildStatCache.load {path = flush_cache}
-val flush_hash = HolbuildStatCache.file_sha1 flush_instance flush_file
+val flush_hash = HolbuildStatCache.file_sha256 flush_instance flush_file
 val _ = HolbuildStatCache.flush flush_instance
 val reloaded = HolbuildStatCache.load {path = flush_cache}
-val _ = assert "flushed cache should reload and verify content" (HolbuildStatCache.file_sha1 reloaded flush_file = flush_hash)
+val _ = assert "flushed cache should reload and verify content" (HolbuildStatCache.file_sha256 reloaded flush_file = flush_hash)
 val _ = assert "flush reload must not use an unchecked hash"
                (#hits (stats reloaded) = 0 andalso #recomputes (stats reloaded) = 1)
 val _ = OS.FileSys.remove flush_file

@@ -1205,7 +1205,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
         val prefix_end = HolbuildProofIr.step_end proof_step
         val sig_text = (HolbuildProofIr.step_kind proof_step, HolbuildProofIr.step_program proof_step)
         val prefix_signature =
-          Option.map HolbuildStringHash.string_sha1
+          Option.map HolbuildSha256.string_hex
             (HolbuildProofIr.canonical_dependency_prefix steps path)
       in
         successful_step_count_ref := count;
@@ -1691,7 +1691,7 @@ fun validate_failed_prefix_metadata plan (metadata : {step_count : int, prefix_e
                         else raise Fail "invalid proof-ir failed-prefix metadata: leaf source end changed"
                 val current_signature = (HolbuildProofIr.step_kind step, HolbuildProofIr.step_program step)
                 val current_prefix_signature =
-                  Option.map HolbuildStringHash.string_sha1
+                  Option.map HolbuildSha256.string_hex
                     (HolbuildProofIr.canonical_dependency_prefix plan path)
                 val _ =
                   case (#prefix_signature metadata, current_prefix_signature) of
@@ -1808,7 +1808,7 @@ fun salvage_failed_prefix_metadata plan metadata =
             Option.map
               (fn prefix_signature =>
                  (HolbuildProofIr.step_kind step, HolbuildProofIr.step_program step,
-                  HolbuildProofIr.step_end step, HolbuildStringHash.string_sha1 prefix_signature))
+                  HolbuildProofIr.step_end step, HolbuildSha256.string_hex prefix_signature))
               (HolbuildProofIr.canonical_dependency_prefix plan path)
         | NONE => NONE
     fun valid_leaf ({count, prefix_end, path, sig_text, prefix_signature, ...} : leaf_snapshot) expected_count =
