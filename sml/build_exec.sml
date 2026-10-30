@@ -3173,12 +3173,21 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
       in
         error_with_captured_output detail failure_output
       end
+    val script_dir = Path.dir (source_file node)
+    fun stage_extra_file (rel, abs) =
+      let val dst = normalize_path (if Path.isAbsolute rel then rel else Path.concat(stage, rel))
+      in ensure_parent dst; copy_binary abs dst end
     fun stage_source_extra_dep decl =
-      List.app (fn (rel, abs) =>
-          let val dst = normalize_path (if Path.isAbsolute rel then rel else Path.concat(stage, rel))
-          in ensure_parent dst; copy_binary abs dst end)
-        (expand_extra_dep (Path.dir (source_file node)) decl)
+      List.app stage_extra_file (expand_extra_dep script_dir decl)
+    (* Manifest inputs are package-root-relative: stage each file at its path
+       relative to the script, where a source declaration would put it. *)
+    fun stage_manifest_extra_input input =
+      List.app (fn (_, abs) =>
+          stage_extra_file (Path.mkRelative {path = normalize_path abs, relativeTo = normalize_path script_dir}, abs))
+        (expand_extra_dep (#package_root (HolbuildBuildPlan.source_of node))
+          (HolbuildProject.extra_input_path input))
     val _ = List.app stage_source_extra_dep (#extra_deps (source_deps plan node))
+    val _ = List.app stage_manifest_extra_input (HolbuildProject.action_extra_inputs (source_policy node))
     val build_log = Path.concat(stage, "holbuild-build.log")
     val _ =
       (validate_hol_context (#context run_spec);

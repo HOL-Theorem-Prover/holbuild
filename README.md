@@ -507,8 +507,10 @@ always_reexecute = true
 
 - `deps` adds logical project dependencies.
 - `loads` adds modules/libraries to load before the action.
-- `extra_deps` adds package-root-relative filesystem inputs that should be
-  hashed into the action key; absolute paths and `..` components are rejected.
+- `extra_deps` adds package-root-relative filesystem inputs that are hashed
+  into the action key and copied into the action's stage directory at their
+  path relative to the script, so `data/table.txt` for `src/FooScript.sml` is
+  read as `../data/table.txt`; absolute paths and `..` components are rejected.
 - `cache = false` disables global cache restore/publish for the action.
 - `always_reexecute = true` disables local up-to-date skipping for the action.
 
