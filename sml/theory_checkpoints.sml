@@ -207,7 +207,7 @@ fun proof_ir_runtime_helper_path () =
 fun source_helper_path relative =
   OS.Path.concat(HolbuildRuntimePaths.source_root, relative)
 
-fun string_hash_runtime_helper_path () = source_helper_path "sml/string_hash.sml"
+fun sha256_runtime_helper_path () = source_helper_path "sml/sha256.sml"
 
 fun proof_ir_helper_path () = source_helper_path "sml/proof_ir_types.sml"
 
@@ -222,7 +222,7 @@ fun declaration_checkpoint_runtime_prelude [] = ""
       runtime_lines ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";"]
 
 fun runtime_install_lines {checkpoint_enabled, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} =
-  ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (string_hash_runtime_helper_path ()) ^ ";",
+  ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (sha256_runtime_helper_path ()) ^ ";",
    "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (proof_ir_helper_path ()) ^ ";",
    "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";",
    "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (tactic_compat_runtime_helper_path ()) ^ ";",

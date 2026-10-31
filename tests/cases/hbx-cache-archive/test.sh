@@ -91,7 +91,7 @@ metadata_path, archive_path, sha256, hol_rev = sys.argv[1:]
 with open(metadata_path, encoding="utf-8") as f:
     metadata = json.load(f)
 assert metadata["format"] == "holbuild-hbx-metadata-v1"
-assert metadata["archive_format"] == "holbuild-hbx-v1"
+assert metadata["archive_format"] == "holbuild-hbx-v2"
 assert metadata["archive"] == os.path.basename(archive_path)
 assert metadata["sha256"] == sha256
 assert metadata["size"] == os.path.getsize(archive_path)
@@ -114,7 +114,7 @@ require_grep '^holbuild-cache/deps/dep-' "$tmpdir/archive.list"
 require_grep '^holbuild-cache/actions/.*/manifest$' "$tmpdir/archive.list"
 
 tar -xOf "$archive" holbuild-cache/manifest > "$tmpdir/archive.manifest"
-require_grep '^holbuild-hbx-v1$' "$tmpdir/archive.manifest"
+require_grep '^holbuild-hbx-v2$' "$tmpdir/archive.manifest"
 require_grep '^holbuild_version=' "$tmpdir/archive.manifest"
 require_grep '^created_at=' "$tmpdir/archive.manifest"
 require_grep '^hol_repo=https://github.com/HOL-Theorem-Prover/HOL.git$' "$tmpdir/archive.manifest"

@@ -15,8 +15,7 @@ fun toolchain_config kernel_variant = HolbuildHolToolchainConfig.config kernel_v
 val analyser_format_version = "holbuild-hol-analyser-v2"
 val analyser_protocol_version = "1"
 val analyser_source_files =
-  ["../string_hash.sml",
-   "../sha256.sml",
+  ["../sha256.sml",
    "../spawn.sml",
    "../hash.sml",
    "analysis_protocol.sml",
@@ -141,7 +140,7 @@ fun key_material {git, rev, kernel_variant} =
        HolbuildHolToolchainConfig.key_material_fields (toolchain_config kernel_variant))
   end
 
-fun key req = HolbuildHash.string_sha1 (key_material req)
+fun key req = HolbuildHash.string_sha256 (key_material req)
 fun standard_request {git, rev} = {git = git, rev = rev, kernel_variant = standard_kernel}
 fun lexical_absolute path =
   Path.mkCanonical
@@ -284,14 +283,14 @@ fun hol_source_identity holdir rels =
     fun is_link rel = FS.isLink (Path.concat(holdir, rel))
     val (links, files) = List.partition is_link rels
     val file_hashes =
-      ListPair.zip (files, HolbuildHash.files_sha1 (map (fn rel => Path.concat(holdir, rel)) files))
+      ListPair.zip (files, HolbuildHash.files_sha256 (map (fn rel => Path.concat(holdir, rel)) files))
     val link_hashes =
       map (fn rel => (rel, "symlink:" ^ FS.readLink (Path.concat(holdir, rel)))) links
     val entries =
       List.foldl (fn ((rel, hash), acc) => Binarymap.insert(acc, rel, hash))
                  (Binarymap.mkDict String.compare) (file_hashes @ link_hashes)
   in
-    HolbuildHash.string_sha1
+    HolbuildHash.string_sha256
       (String.concat (map (fn (rel, hash) => rel ^ "\t" ^ hash ^ "\n") (Binarymap.listItems entries)))
   end
   handle OS.SysErr (msg, _) => die ("could not hash HOL sources in " ^ holdir ^ ": " ^ msg)
@@ -306,14 +305,14 @@ fun theory_toolchain_text kernel_variant hol_source =
            "kernel_variant=" ^ HolbuildHolToolchainConfig.kernel_variant_name kernel_variant,
            "poly=" ^ #release (poly_version_parts (poly_version ()))] ^ "\n"
   in
-    material ^ "key=" ^ HolbuildHash.string_sha1 material ^ "\n"
+    material ^ "key=" ^ HolbuildHash.string_sha256 material ^ "\n"
   end
 
 fun parse_theory_toolchain_key path text =
   case List.find (String.isPrefix "key=") (String.tokens (fn c => c = #"\n") text) of
       SOME line =>
         let val key = String.extract(line, size "key=", NONE)
-        in if HolbuildHash.valid_sha1 key then key else die ("malformed theory toolchain key in " ^ path) end
+        in if HolbuildHash.valid_sha256 key then key else die ("malformed theory toolchain key in " ^ path) end
     | NONE => die ("missing theory toolchain key in " ^ path)
 
 fun theory_toolchain_built k =
@@ -463,9 +462,9 @@ fun analyser_source_dir () =
 fun analyser_source_path rel = Path.concat(analyser_source_dir (), rel)
 
 fun analyser_source_hash () =
-  HolbuildHash.string_sha1
+  HolbuildHash.string_sha256
     (String.concatWith "\n"
-       (map (fn rel => rel ^ "=" ^ HolbuildHash.file_sha1 (analyser_source_path rel)) analyser_source_files))
+       (map (fn rel => rel ^ "=" ^ HolbuildHash.file_sha256 (analyser_source_path rel)) analyser_source_files))
 
 fun analyser_key_material () =
   String.concatWith "\n"
@@ -473,7 +472,7 @@ fun analyser_key_material () =
      "protocol=" ^ analyser_protocol_version,
      "source_hash=" ^ analyser_source_hash ()]
 
-fun analyser_key () = HolbuildHash.string_sha1 (analyser_key_material ())
+fun analyser_key () = HolbuildHash.string_sha256 (analyser_key_material ())
 fun analyser_path_for_toolchain_key k = analyser_bin_for_key k (analyser_key ())
 fun analyser_path_for_holdir holdir = analyser_path_for_toolchain_key (Path.file (Path.dir holdir))
 
@@ -762,7 +761,10 @@ fun child_names dir =
   end
   handle OS.SysErr _ => []
 
-fun is_toolchain_key name = size name = 40 andalso CharVector.all Char.isHexDigit name
+(* 40-character keys are toolchains from before the SHA-256 keys; they are
+   never used again, but GC still collects them. *)
+fun is_toolchain_key name =
+  (size name = 64 orelse size name = 40) andalso CharVector.all Char.isHexDigit name
 
 fun remove_unlocked_tree path = remove_tree OS.Process.system path
 

@@ -42,7 +42,7 @@ fun statement_boundary text i =
 fun slice text start stop =
   if start < 0 orelse stop < start orelse stop > size text then raise Error "AST report span is outside source text"
   else String.substring(text, start, stop - start)
-fun prefix_hash text boundary = HolbuildHash.string_sha1 (String.substring(text, 0, boundary))
+fun prefix_hash text boundary = HolbuildHash.string_sha256 (String.substring(text, 0, boundary))
 
 fun bool_digit true = "1" | bool_digit false = "0"
 fun attr_args NONE = [] | attr_args (SOME {attrs, ...}) = #args attrs

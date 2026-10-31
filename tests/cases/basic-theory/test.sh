@@ -103,8 +103,8 @@ if strings -a "$project/.holbuild/obj/src/ATheory.dat" | grep -q '\.holbuild.*st
 fi
 require_file "$project/.holbuild/dep/basic/src/AScript.sml.key"
 metadata="$project/.holbuild/dep/basic/src/AScript.sml.key"
-if grep -q "^output-sha1=" "$metadata"; then
-  echo "default build metadata should not emit output-sha1 diagnostics" >&2
+if grep -q "^output-sha256=" "$metadata"; then
+  echo "default build metadata should not emit output-sha256 diagnostics" >&2
   exit 1
 fi
 if ! find "$project/.holbuild/checkpoints" \( -name '*.save' -o -name '*.save.ok' \) -print -quit 2>/dev/null | grep -q .; then
@@ -166,53 +166,53 @@ if [[ ! -s "$project/.holbuild/obj/src/ATheory.sml" || ! -s "$project/.holbuild/
   exit 1
 fi
 
-if grep -q "^output-sha1=" "$metadata"; then
-  echo "default repaired metadata should not emit output-sha1 diagnostics" >&2
+if grep -q "^output-sha256=" "$metadata"; then
+  echo "default repaired metadata should not emit output-sha256 diagnostics" >&2
   exit 1
 fi
 
 emit_hash_log=$tmpdir/emit-output-hashes.log
 (cd "$project" && "$HOLBUILD_BIN" build --force --emit-output-hashes ATheory) > "$emit_hash_log"
 require_grep "ATheory built" "$emit_hash_log"
-hash_line_count=$(grep -c "^output-sha1=" "$metadata")
+hash_line_count=$(grep -c "^output-sha256=" "$metadata")
 if [[ "$hash_line_count" -ne 12 ]]; then
-  echo "expected 12 output-sha1 diagnostic lines, found $hash_line_count" >&2
+  echo "expected 12 output-sha256 diagnostic lines, found $hash_line_count" >&2
   exit 1
 fi
 while IFS= read -r line; do
-  payload=${line#output-sha1=}
+  payload=${line#output-sha256=}
   path=${payload% *}
   hash=${payload##* }
-  actual=$(sha1sum "$path" | awk '{print $1}')
+  actual=$(sha256sum "$path" | awk '{print $1}')
   if [[ "$hash" != "$actual" ]]; then
-    echo "stale output-sha1 diagnostic for $path" >&2
+    echo "stale output-sha256 diagnostic for $path" >&2
     exit 1
   fi
-done < <(grep "^output-sha1=" "$metadata")
+done < <(grep "^output-sha256=" "$metadata")
 for ext in sig sml dat; do
   if ! cmp -s "$project/.holbuild/obj/src/ATheory.$ext" "$project/.holbuild/obj/src/.hol/objs/ATheory.$ext"; then
     echo "remapped ATheory.$ext does not match canonical output after diagnostic build" >&2
     exit 1
   fi
 done
-sed -i 's/^output-sha1=.*/output-sha1=stale-diagnostic-hash/' "$metadata"
+sed -i 's/^output-sha256=.*/output-sha256=stale-diagnostic-hash/' "$metadata"
 stale_hash_log=$tmpdir/stale-output-hash.log
 (cd "$project" && "$HOLBUILD_BIN" --verbose build --emit-output-hashes ATheory) > "$stale_hash_log"
 require_grep "ATheory is up to date" "$stale_hash_log"
-if grep -q 'output-sha1=stale-diagnostic-hash' "$metadata"; then
+if grep -q 'output-sha256=stale-diagnostic-hash' "$metadata"; then
   echo "up-to-date --emit-output-hashes did not refresh output diagnostics" >&2
   exit 1
 fi
 while IFS= read -r line; do
-  payload=${line#output-sha1=}
+  payload=${line#output-sha256=}
   path=${payload% *}
   hash=${payload##* }
-  actual=$(sha1sum "$path" | awk '{print $1}')
+  actual=$(sha256sum "$path" | awk '{print $1}')
   if [[ "$hash" != "$actual" ]]; then
     echo "up-to-date --emit-output-hashes wrote a stale output diagnostic for $path" >&2
     exit 1
   fi
-done < <(grep "^output-sha1=" "$metadata")
+done < <(grep "^output-sha256=" "$metadata")
 
 # A remapped artifact is a distinct file.  Its diagnostic hash must describe
 # its own bytes even if it has been corrupted independently of the canonical
@@ -220,8 +220,8 @@ done < <(grep "^output-sha1=" "$metadata")
 remapped_sml=$project/.holbuild/obj/src/.hol/objs/ATheory.sml
 printf 'corrupted remapped artifact\n' > "$remapped_sml"
 (cd "$project" && "$HOLBUILD_BIN" --verbose build --emit-output-hashes ATheory) > "$tmpdir/corrupt-remap-hash.log"
-expected_remapped_hash=$(sha1sum "$remapped_sml" | awk '{print $1}')
-reported_remapped_hash=$(awk -v prefix="output-sha1=$remapped_sml " 'index($0, prefix) == 1 { print $NF }' "$metadata")
+expected_remapped_hash=$(sha256sum "$remapped_sml" | awk '{print $1}')
+reported_remapped_hash=$(awk -v prefix="output-sha256=$remapped_sml " 'index($0, prefix) == 1 { print $NF }' "$metadata")
 if [[ "$reported_remapped_hash" != "$expected_remapped_hash" ]]; then
   echo "output diagnostic did not hash the remapped artifact itself" >&2
   exit 1
@@ -230,8 +230,8 @@ fi
 # Diagnostic hashes are opt-in.  A subsequent ordinary no-op build must remove
 # them rather than retaining stale diagnostics in otherwise semantic metadata.
 (cd "$project" && "$HOLBUILD_BIN" --verbose build ATheory) > "$tmpdir/default-after-hashes.log"
-if grep -q "^output-sha1=" "$metadata"; then
-  echo "default up-to-date build retained output-sha1 diagnostics" >&2
+if grep -q "^output-sha256=" "$metadata"; then
+  echo "default up-to-date build retained output-sha256 diagnostics" >&2
   exit 1
 fi
 
@@ -256,8 +256,8 @@ for ext in sig sml dat; do
     exit 1
   fi
 done
-if grep -q "^output-sha1=" "$metadata"; then
-  echo "default cache-restore metadata should not emit output-sha1 diagnostics" >&2
+if grep -q "^output-sha256=" "$metadata"; then
+  echo "default cache-restore metadata should not emit output-sha256 diagnostics" >&2
   exit 1
 fi
 # cache restore does not create checkpoints (no HOL process runs),
@@ -296,9 +296,9 @@ input_key=$bad_key
 kind=theory
 mldeps
 mldep /stale/.holbuild/stage/$bad_key/ATheory
-blob sig 0000000000000000000000000000000000000000
-blob sml 0000000000000000000000000000000000000000
-blob dat 0000000000000000000000000000000000000000
+blob sig 0000000000000000000000000000000000000000000000000000000000000000
+blob sml 0000000000000000000000000000000000000000000000000000000000000000
+blob dat 0000000000000000000000000000000000000000000000000000000000000000
 EOF
 rm -rf "$project/.holbuild"
 bad_manifest_log=$tmpdir/stale-cache-manifest-source-fails.log

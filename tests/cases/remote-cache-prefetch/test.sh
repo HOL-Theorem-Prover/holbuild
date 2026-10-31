@@ -114,11 +114,9 @@ import pathlib
 import sys
 
 root = pathlib.Path(sys.argv[1])
-header, manifest = pathlib.Path(sys.argv[2]).read_text().split("manifest-text-v1\n", 1)
+manifest = pathlib.Path(sys.argv[2]).read_text().split("manifest-text-v1\n", 1)[1]
 dat = next(line.split()[2] for line in manifest.splitlines() if line.startswith("blob dat "))
-sha256 = next(line.split()[2] for line in header.splitlines()
-              if line.startswith("blob ") and line.split()[1] == dat)
-(root / "cas" / sha256).write_text("corrupt\n")
+(root / "cas" / dat).write_text("corrupt\n")
 PY
 }
 

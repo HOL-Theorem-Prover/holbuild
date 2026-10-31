@@ -128,7 +128,7 @@ fi
 
 key_a=$(theory_toolchain_key "$holdir_a")
 key_b=$(theory_toolchain_key "$holdir_b")
-if [[ ! "$key_a" =~ ^[0-9a-f]{40}$ || "$key_a" != "$key_b" ]]; then
+if [[ ! "$key_a" =~ ^[0-9a-f]{64}$ || "$key_a" != "$key_b" ]]; then
   echo "theory toolchain keys differ across cache roots: '$key_a' vs '$key_b'" >&2
   exit 1
 fi
