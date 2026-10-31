@@ -3820,7 +3820,9 @@ fun analyser_proof_ir_plan_sml (inputs : proof_ir_input list) =
              map proof_line (ListPair.zip (List.tabulate(length inputs, fn i => i), inputs)) @
              [HolbuildAnalysisProtocol.join ["end"]]) ^ "\n"
           val _ = write_temp_text req request
-          val status = OS.Process.system (HolbuildHash.quote analyser ^ " --request " ^ HolbuildHash.quote req ^
+          val status = OS.Process.system (HolbuildHash.quote analyser ^ " " ^
+                                          String.concatWith " " (HolbuildDependencies.analyser_min_heap_args ()) ^
+                                          " --request " ^ HolbuildHash.quote req ^
                                           " --response " ^ HolbuildHash.quote resp)
           val _ = OS.FileSys.remove req handle OS.SysErr _ => ()
           val text = if OS.Process.isSuccess status then read_text resp

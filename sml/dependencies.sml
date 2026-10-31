@@ -22,6 +22,20 @@ fun set_analyser_path path = analyser_path := SOME path
 fun clear_analyser_path () = analyser_path := NONE
 fun current_analyser_path () = !analyser_path
 
+(* Poly/ML's own initial heap is 8 MB, and the analyser reads a source as one
+   allocation, so a source of a few MB cannot be allocated from it: the
+   parallel collector reports "Completed with insufficient space", the runtime
+   prints "Run out of store - interrupting threads", waits 5 s and the process
+   exits non-zero, failing the build that spawned it.  128 MB covers sources
+   several times the largest one measured (a 2.3 MB generated source needed
+   more than the 8 MB default and was comfortable at 50 MB), and Poly maps the
+   heap lazily, so a small source costs nothing.
+   The options go on the command line of every analyser process: Poly's runtime
+   consumes its own options wherever they appear and leaves the rest. *)
+val analyser_min_heap_mb = 128
+
+fun analyser_min_heap_args () = ["--minheap", Int.toString analyser_min_heap_mb]
+
 fun has_suffix suffix s =
   let
     val n = size s
@@ -297,7 +311,9 @@ fun run_analyser_batch analyser files =
        map file_line files @
        [HolbuildAnalysisProtocol.join ["end"]]) ^ "\n"
     val _ = write_file req request
-    val run = HolbuildSpawn.run {program = analyser, args = ["--request", req, "--response", resp],
+    val run = HolbuildSpawn.run {program = analyser,
+                                 args = analyser_min_heap_args () @
+                                        ["--request", req, "--response", resp],
                                  stderr = HolbuildSpawn.Inherit}
     val _ = print (#output run)
     val _ = OS.FileSys.remove req handle OS.SysErr _ => ()
