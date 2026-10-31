@@ -3012,7 +3012,16 @@ fun write_theory_script policy project base_context plan keys input_key toolchai
 fun build_theory cache_allowed policy tc project base_context plan keys toolchain_key node source_text theorem_checkpoints declaration_checkpoints termination_diagnostics =
   let
     val input_key = HolbuildBuildPlan.input_key_for keys node
-    val stage = stage_dir project input_key
+    (* The stage mirrors the package layout, and the script runs from its own
+       directory in it, so inputs it reaches through ../ stay in the stage. *)
+    val stage_root = stage_dir project input_key
+    val package_root = #package_root (HolbuildBuildPlan.source_of node)
+    val script_dir = Path.dir (source_file node)
+    val script_rel_dir =
+      Path.mkRelative {path = normalize_path script_dir, relativeTo = normalize_path package_root}
+    val stage =
+      if String.isPrefix ".." script_rel_dir then stage_root
+      else normalize_path (Path.concat(stage_root, script_rel_dir))
     val staged_script = Path.concat(stage, Path.file (source_file node))
     val child_policy = Path.concat(stage, "holbuild-child-policy.sml")
     val preload = Path.concat(stage, "holbuild-preload.sml")
@@ -3036,7 +3045,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
     val staged_extra_outputs =
       map (fn declaration => (declaration, staged_extra_output_path stage declaration))
           extra_output_declarations
-    val _ = remove_tree stage
+    val _ = remove_tree stage_root
     val _ = ensure_dir stage
     val _ = write_child_policy child_policy
     val _ = remove_file (current_final_context_log project node)
@@ -3173,12 +3182,16 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
       in
         error_with_captured_output detail failure_output
       end
+    fun stage_extra_file base (rel, abs) =
+      let val dst = normalize_path (if Path.isAbsolute rel then rel else Path.concat(base, rel))
+      in ensure_parent dst; copy_binary abs dst end
     fun stage_source_extra_dep decl =
-      List.app (fn (rel, abs) =>
-          let val dst = normalize_path (if Path.isAbsolute rel then rel else Path.concat(stage, rel))
-          in ensure_parent dst; copy_binary abs dst end)
-        (expand_extra_dep (Path.dir (source_file node)) decl)
+      List.app (stage_extra_file stage) (expand_extra_dep script_dir decl)
+    fun stage_manifest_extra_input input =
+      List.app (stage_extra_file stage_root)
+        (expand_extra_dep package_root (HolbuildProject.extra_input_path input))
     val _ = List.app stage_source_extra_dep (#extra_deps (source_deps plan node))
+    val _ = List.app stage_manifest_extra_input (HolbuildProject.action_extra_inputs (source_policy node))
     val build_log = Path.concat(stage, "holbuild-build.log")
     val _ =
       (validate_hol_context (#context run_spec);
@@ -3227,7 +3240,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
                   else if null theorem_checkpoints andalso null termination_diagnostics then Error msg
                   else checkpoint_failure_error msg
                 val _ = run_failure_repl tc policy theorem_checkpoints (#failure_checkpoints run_spec) deps_loaded stage
-                val _ = cleanup_json_stage stage
+                val _ = cleanup_json_stage stage_root
               in
                 raise failure_error
               end
@@ -3292,7 +3305,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
                else raise Error msg)
           else
             run_final_context_from base_context true)
-         handle Error msg => (cleanup_json_stage stage; raise Error msg))
+         handle Error msg => (cleanup_json_stage stage_root; raise Error msg))
       else ()
     val _ =
       if trknl_enabled policy then
@@ -3327,7 +3340,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
       else ()
   in
     write_local_theory_manifests plan node generated_metadata;
-    remove_tree stage
+    remove_tree stage_root
   end
 
 fun same_package_logical a b =
