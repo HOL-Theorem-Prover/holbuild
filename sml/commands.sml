@@ -490,7 +490,9 @@ fun run_analyser_for_proof_ir_text {name, tactic_start, tactic_end, tactic_text}
              HolbuildAnalysisProtocol.join ["theorem", "0", name, Int.toString tactic_start, Int.toString tactic_end, tactic_text],
              HolbuildAnalysisProtocol.join ["end"]] ^ "\n"
           val _ = write_text_file req request
-          val status = OS.Process.system (HolbuildHash.quote analyser ^ " --request " ^ HolbuildHash.quote req ^
+          val status = OS.Process.system (HolbuildHash.quote analyser ^ " " ^
+                                          String.concatWith " " (HolbuildDependencies.analyser_min_heap_args ()) ^
+                                          " --request " ^ HolbuildHash.quote req ^
                                           " --response " ^ HolbuildHash.quote resp)
           val _ = OS.FileSys.remove req handle OS.SysErr _ => ()
           val text = if OS.Process.isSuccess status then read_text resp

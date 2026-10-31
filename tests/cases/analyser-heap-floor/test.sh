@@ -12,7 +12,9 @@ source "$SCRIPT_DIR/../../lib.sh"
 # interrupting threads" unless the analyser is spawned with a heap floor. The
 # fake analyser below fails the same way when its command line carries no heap
 # floor large enough for the largest source in its request, so this test fails
-# if holbuild stops passing one to every analyser process.
+# if holbuild stops passing one to the dependency batch (the spawn that failed
+# in the field; the same floor goes to the other analyser spawns, which this
+# dry run does not reach).
 
 tmpdir=$(make_temp_dir)
 cleanup() { cleanup_temp_dir "$tmpdir"; }
@@ -117,6 +119,7 @@ if [ "$big_bytes" -lt 2000000 ]; then
 fi
 
 unset HOLDIR HOLBUILD_HOLDIR HOLBUILD_REMOTE_CACHE_URL
+export HOLBUILD_CACHE=$tmpdir/cache
 export HOLBUILD_CANONICAL_HOL_GIT=$hol
 export HOLBUILD_POLY=$fakebin/poly
 export HOLBUILD_POLYC=$fakebin/polyc
