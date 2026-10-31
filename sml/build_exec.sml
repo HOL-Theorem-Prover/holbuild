@@ -4916,10 +4916,10 @@ fun prefetch_key (options : build_options) project keys node =
       | _ => NONE
   end
 
-(* Starts jobs background threads that hydrate the plan's remote theory cache
-   entries into the local cache, in build order, while the build runs; returns
-   a function that drops the nodes not yet started and waits for the copies in
-   flight.  The build workers keep
+(* Starts --prefetch-concurrency (default 2 * jobs) background threads that
+   hydrate the plan's remote theory cache entries into the local cache, in
+   build order, while the build runs; returns a function that drops the nodes
+   not yet started and waits for the copies in flight.  The build workers keep
    their own demand restore, so they never wait behind a prefetch. *)
 fun start_remote_cache_prefetch (options : build_options) project plan keys jobs =
   case HolbuildRemoteCacheConfig.url () of
@@ -4948,7 +4948,11 @@ fun start_remote_cache_prefetch (options : build_options) project plan keys jobs
               case next () of
                   NONE => ()
                 | SOME node => ((prefetch node handle _ => ()); worker ())
-            val threads = List.tabulate (jobs, fn _ => Thread.fork (worker, []))
+            val count =
+              Int.min (Option.getOpt (!HolbuildRemoteCacheConfig.prefetch_concurrency, 2 * jobs),
+                       length (!pending))
+            val _ = cache_trace ("remote cache prefetch threads: " ^ Int.toString count)
+            val threads = List.tabulate (count, fn _ => Thread.fork (worker, []))
             fun wait_threads () =
               if List.exists Thread.isActive threads then
                 (OS.Process.sleep (Time.fromReal 0.05); wait_threads ())

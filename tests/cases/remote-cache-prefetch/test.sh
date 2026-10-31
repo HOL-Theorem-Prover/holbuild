@@ -154,7 +154,7 @@ mkdir -p "$gate"
 consumer_log=$tmpdir/consumer.log
 (cd "$consumer" && HOLBUILD_CACHE="$consumer_cache" HOLBUILD_CACHE_TRACE=1 \
   HOLBUILD_TEST_PREFETCH_GATE="$gate" \
-  exec "$HOLBUILD_BIN" --remote-cache "$remote_url" -j1 build --skip-checkpoints BrokenTheory AbsentTheory LateTheory) \
+  exec "$HOLBUILD_BIN" --remote-cache "$remote_url" --prefetch-concurrency 1 -j1 build --skip-checkpoints BrokenTheory AbsentTheory LateTheory) \
   > "$consumer_log" 2>&1 &
 consumer_pid=$!
 
@@ -174,6 +174,7 @@ if ! wait "$consumer_pid"; then
 fi
 consumer_pid=
 
+require_grep "remote cache prefetch threads: 1$" "$consumer_log"
 require_grep "remote cache prefetched: $late_key" "$consumer_log"
 require_grep "LateTheory restored from cache" "$consumer_log"
 require_grep "BrokenTheory built" "$consumer_log"
@@ -200,7 +201,7 @@ mkdir -p "$gate"
 consumer_log=$tmpdir/up-to-date.log
 (cd "$consumer" && HOLBUILD_CACHE="$consumer_cache" HOLBUILD_CACHE_TRACE=1 \
   HOLBUILD_TEST_PREFETCH_GATE="$gate" \
-  exec "$HOLBUILD_BIN" --remote-cache "$remote_url" -j1 build --skip-checkpoints BrokenTheory AbsentTheory LateTheory) \
+  exec "$HOLBUILD_BIN" --remote-cache "$remote_url" --prefetch-concurrency=1 -j1 build --skip-checkpoints BrokenTheory AbsentTheory LateTheory) \
   > "$consumer_log" 2>&1 &
 consumer_pid=$!
 wait_for_file "$gate/started" || {
@@ -218,9 +219,30 @@ if ! wait "$consumer_pid"; then
   exit 1
 fi
 consumer_pid=
+require_grep "remote cache prefetch threads: 1$" "$consumer_log"
 require_grep "LateTheory restored from cache" "$consumer_log"
 if grep -q "remote cache prefetched: \($broken_key\|$absent_key\)" "$consumer_log"; then
   echo "up-to-date theories were prefetched" >&2
   cat "$consumer_log" >&2
   exit 1
 fi
+
+# Without the option, the prefetch runs twice the build's jobs, bounded by the
+# plan's four nodes.
+consumer_log=$tmpdir/default.log
+(cd "$consumer" && HOLBUILD_CACHE="$consumer_cache" HOLBUILD_CACHE_TRACE=1 \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" -j1 build --skip-checkpoints BrokenTheory AbsentTheory LateTheory) \
+  > "$consumer_log" 2>&1 || {
+  cat "$consumer_log" >&2
+  exit 1
+}
+require_grep "remote cache prefetch threads: 2$" "$consumer_log"
+
+for spelling in "--prefetch-concurrency 0" "--prefetch-concurrency=0" "--prefetch-concurrency many"; do
+  # shellcheck disable=SC2086
+  if (cd "$consumer" && "$HOLBUILD_BIN" $spelling build LateTheory) > "$tmpdir/rejected.out" 2>&1; then
+    echo "holbuild accepted $spelling" >&2
+    exit 1
+  fi
+  require_grep '^holbuild: --prefetch-concurrency must be a positive integer$' "$tmpdir/rejected.out"
+done

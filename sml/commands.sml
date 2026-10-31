@@ -41,7 +41,8 @@ fun global_help () = print
   \  --json\n\
   \  --quiet, --verbose, --verbosity LEVEL\n\
   \  -j N, -jN, --jobs N\n\
-  \  --max-heap MB\n\n\
+  \  --max-heap MB\n\
+  \  --prefetch-concurrency N\n\n\
   \Use `holbuild COMMAND --help` for command-specific help.\n"
 
 fun build_help () = print
@@ -665,20 +666,21 @@ fun verbosity_value text =
 
 fun parse_global_options args =
   let
-    fun loop holdir source_dir cache_dir remote_cache jobs maxheap json verbosity rest =
+    fun loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap json verbosity rest =
       case rest of
-          [] => ({holdir = holdir, source_dir = source_dir, cache_dir = cache_dir, remote_cache = remote_cache, jobs = jobs, maxheap = maxheap, json = json, verbosity = verbosity}, [])
-        | "--json" :: xs => loop holdir source_dir cache_dir remote_cache jobs maxheap true verbosity xs
-        | "--quiet" :: xs => loop holdir source_dir cache_dir remote_cache jobs maxheap json HolbuildStatus.Quiet xs
-        | "--verbose" :: xs => loop holdir source_dir cache_dir remote_cache jobs maxheap json HolbuildStatus.Verbose xs
-        | "--verbosity" :: level :: xs => loop holdir source_dir cache_dir remote_cache jobs maxheap json (verbosity_value level) xs
-        | "--holdir" :: path :: xs => loop (SOME path) source_dir cache_dir remote_cache jobs maxheap json verbosity xs
-        | "--source-dir" :: path :: xs => loop holdir (SOME path) cache_dir remote_cache jobs maxheap json verbosity xs
-        | "--cache-dir" :: path :: xs => loop holdir source_dir (SOME path) remote_cache jobs maxheap json verbosity xs
-        | "--remote-cache" :: url :: xs => loop holdir source_dir cache_dir (SOME url) jobs maxheap json verbosity xs
-        | "--jobs" :: n :: xs => loop holdir source_dir cache_dir remote_cache (SOME (positive_int "--jobs" n)) maxheap json verbosity xs
-        | "-j" :: n :: xs => loop holdir source_dir cache_dir remote_cache (SOME (positive_int "-j" n)) maxheap json verbosity xs
-        | "--max-heap" :: n :: xs => loop holdir source_dir cache_dir remote_cache jobs (SOME (positive_int "--max-heap" n)) json verbosity xs
+          [] => ({holdir = holdir, source_dir = source_dir, cache_dir = cache_dir, remote_cache = remote_cache, jobs = jobs, maxheap = maxheap, prefetch_concurrency = prefetch_concurrency, json = json, verbosity = verbosity}, [])
+        | "--json" :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap true verbosity xs
+        | "--quiet" :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap json HolbuildStatus.Quiet xs
+        | "--verbose" :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap json HolbuildStatus.Verbose xs
+        | "--verbosity" :: level :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap json (verbosity_value level) xs
+        | "--holdir" :: path :: xs => loop prefetch_concurrency (SOME path) source_dir cache_dir remote_cache jobs maxheap json verbosity xs
+        | "--source-dir" :: path :: xs => loop prefetch_concurrency holdir (SOME path) cache_dir remote_cache jobs maxheap json verbosity xs
+        | "--cache-dir" :: path :: xs => loop prefetch_concurrency holdir source_dir (SOME path) remote_cache jobs maxheap json verbosity xs
+        | "--remote-cache" :: url :: xs => loop prefetch_concurrency holdir source_dir cache_dir (SOME url) jobs maxheap json verbosity xs
+        | "--jobs" :: n :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache (SOME (positive_int "--jobs" n)) maxheap json verbosity xs
+        | "-j" :: n :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache (SOME (positive_int "-j" n)) maxheap json verbosity xs
+        | "--max-heap" :: n :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs (SOME (positive_int "--max-heap" n)) json verbosity xs
+        | "--prefetch-concurrency" :: n :: xs => loop (SOME (positive_int "--prefetch-concurrency" n)) holdir source_dir cache_dir remote_cache jobs maxheap json verbosity xs
         | "--verbosity" :: [] => raise Error "--verbosity requires LEVEL"
         | "--holdir" :: [] => raise Error "--holdir requires PATH"
         | "--source-dir" :: [] => raise Error "--source-dir requires PATH"
@@ -687,27 +689,30 @@ fun parse_global_options args =
         | "--jobs" :: [] => raise Error "--jobs requires N"
         | "-j" :: [] => raise Error "-j requires N"
         | "--max-heap" :: [] => raise Error "--max-heap requires MB"
+        | "--prefetch-concurrency" :: [] => raise Error "--prefetch-concurrency requires N"
         | arg :: xs =>
             if String.isPrefix "--verbosity=" arg then
-              loop holdir source_dir cache_dir remote_cache jobs maxheap json (verbosity_value (String.extract (arg, size "--verbosity=", NONE))) xs
+              loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap json (verbosity_value (String.extract (arg, size "--verbosity=", NONE))) xs
             else if String.isPrefix "--holdir=" arg then
-              loop (SOME (String.extract (arg, size "--holdir=", NONE))) source_dir cache_dir remote_cache jobs maxheap json verbosity xs
+              loop prefetch_concurrency (SOME (String.extract (arg, size "--holdir=", NONE))) source_dir cache_dir remote_cache jobs maxheap json verbosity xs
             else if String.isPrefix "--source-dir=" arg then
-              loop holdir (SOME (String.extract (arg, size "--source-dir=", NONE))) cache_dir remote_cache jobs maxheap json verbosity xs
+              loop prefetch_concurrency holdir (SOME (String.extract (arg, size "--source-dir=", NONE))) cache_dir remote_cache jobs maxheap json verbosity xs
             else if String.isPrefix "--cache-dir=" arg then
-              loop holdir source_dir (SOME (String.extract (arg, size "--cache-dir=", NONE))) remote_cache jobs maxheap json verbosity xs
+              loop prefetch_concurrency holdir source_dir (SOME (String.extract (arg, size "--cache-dir=", NONE))) remote_cache jobs maxheap json verbosity xs
             else if String.isPrefix "--remote-cache=" arg then
-              loop holdir source_dir cache_dir (SOME (String.extract (arg, size "--remote-cache=", NONE))) jobs maxheap json verbosity xs
+              loop prefetch_concurrency holdir source_dir cache_dir (SOME (String.extract (arg, size "--remote-cache=", NONE))) jobs maxheap json verbosity xs
             else if String.isPrefix "--jobs=" arg then
-              loop holdir source_dir cache_dir remote_cache (SOME (positive_int "--jobs" (String.extract (arg, size "--jobs=", NONE)))) maxheap json verbosity xs
+              loop prefetch_concurrency holdir source_dir cache_dir remote_cache (SOME (positive_int "--jobs" (String.extract (arg, size "--jobs=", NONE)))) maxheap json verbosity xs
             else if String.isPrefix "--max-heap=" arg then
-              loop holdir source_dir cache_dir remote_cache jobs (SOME (positive_int "--max-heap" (String.extract (arg, size "--max-heap=", NONE)))) json verbosity xs
+              loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs (SOME (positive_int "--max-heap" (String.extract (arg, size "--max-heap=", NONE)))) json verbosity xs
+            else if String.isPrefix "--prefetch-concurrency=" arg then
+              loop (SOME (positive_int "--prefetch-concurrency" (String.extract (arg, size "--prefetch-concurrency=", NONE)))) holdir source_dir cache_dir remote_cache jobs maxheap json verbosity xs
             else if String.isPrefix "-j" arg andalso size arg > 2 then
-              loop holdir source_dir cache_dir remote_cache (SOME (positive_int "-j" (String.extract (arg, 2, NONE)))) maxheap json verbosity xs
+              loop prefetch_concurrency holdir source_dir cache_dir remote_cache (SOME (positive_int "-j" (String.extract (arg, 2, NONE)))) maxheap json verbosity xs
             else
-              let val (opts, args') = loop holdir source_dir cache_dir remote_cache jobs maxheap json verbosity xs in (opts, arg :: args') end
+              let val (opts, args') = loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap json verbosity xs in (opts, arg :: args') end
   in
-    loop NONE NONE NONE NONE NONE NONE false HolbuildStatus.Normal args
+    loop NONE NONE NONE NONE NONE NONE NONE false HolbuildStatus.Normal args
   end
 
 fun with_input path f =
@@ -1738,13 +1743,14 @@ fun removed_legacy_proof_step_build_arg arg =
 
 fun trace_steps_build_arg arg = arg = "--trace-steps" orelse arg = "--goalfrag-trace"
 
-fun dispatch_with_options {holdir, source_dir, cache_dir, remote_cache, jobs, maxheap, json, verbosity} args =
+fun dispatch_with_options {holdir, source_dir, cache_dir, remote_cache, jobs, maxheap, prefetch_concurrency, json, verbosity} args =
   (HolbuildStatus.set_json_mode json;
    HolbuildStatus.set_verbosity verbosity;
    HolbuildStatus.set_retain_debug_artifacts false;
    Option.app HolbuildProject.set_source_dir source_dir;
    Option.app HolbuildCacheConfig.set_cache_root cache_dir;
    Option.app HolbuildRemoteCacheConfig.set_url remote_cache;
+   Option.app HolbuildRemoteCacheConfig.set_prefetch_concurrency prefetch_concurrency;
    if args = ["--help"] orelse args = ["-h"] then global_help ()
    else if maybe_handle_command_help args then () else
    case args of
