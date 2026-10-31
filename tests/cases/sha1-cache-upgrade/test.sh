@@ -111,9 +111,24 @@ if grep -Eq "built|restored" "$second_log"; then
   exit 1
 fi
 
-# The SHA-1 entries are still collectable.
+# gc collects the SHA-1 entries once they age out, and keeps the new ones.
+old_entries() { find "$cache/actions" "$cache/blobs" -mindepth 1 -maxdepth 1 -regextype egrep -regex '.*/[0-9a-f]{40}'; }
+[ -n "$(old_entries)" ] || { echo "no SHA-1 cache entries to collect" >&2; exit 1; }
+new_entries() { find "$cache/actions" "$cache/blobs" -mindepth 1 -maxdepth 1 -regextype egrep -regex '.*/[0-9a-f]{64}' | sort; }
+new_before=$(new_entries)
+[ -n "$new_before" ] || { echo "no SHA-256 cache entries" >&2; exit 1; }
+old_entries | while read -r entry; do find "$entry" -exec touch -h -d '30 days ago' {} +; done
 (cd "$project" && "$HOLBUILD_BIN" gc --cache-only) > "$tmpdir/gc.log" 2>&1 || {
   cat "$tmpdir/gc.log" >&2
   echo "cache gc failed over SHA-1 entries" >&2
   exit 1
 }
+if [ -n "$(old_entries)" ]; then
+  old_entries >&2
+  echo "cache gc left SHA-1 entries behind" >&2
+  exit 1
+fi
+if [ "$(new_entries)" != "$new_before" ]; then
+  echo "cache gc removed live entries" >&2
+  exit 1
+fi

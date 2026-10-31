@@ -450,7 +450,7 @@ require_no_checkout_temp() {
 
 # A mirror clone killed mid-way leaves a temp dir that the next clone removes.
 mkdir -p "$HOLBUILD_CACHE/git/remotes"
-mkdir "$HOLBUILD_CACHE/git/remotes/$(printf %s "$repo" | sha256sum | cut -d' ' -f1).git.tmp-999999999"
+mkdir "$HOLBUILD_CACHE/git/remotes/$(printf %s "$repo" | sha1sum | cut -d' ' -f1).git.tmp-999999999"
 race_context cold "$rev1" "$tmpdir/race1" "$tmpdir/race1" "$tmpdir/race2" "$tmpdir/race2"
 if compgen -G "$HOLBUILD_CACHE/git/remotes/*.tmp-*" > /dev/null; then
   echo "mirror temp dir left in $HOLBUILD_CACHE/git/remotes" >&2

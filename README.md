@@ -675,9 +675,11 @@ them from SHA-1, so it reads none of the local cache entries, remote cache
 entries or HOL toolchains that earlier releases wrote: its first build of a
 project builds the toolchain and every theory again (or restores what other
 0.12.1 builds have published), and is never served an old entry. `holbuild gc`
-removes the old entries once they age out. The one SHA-1 left is HOL's own: a
-theory's `.dat` names each parent by the SHA-1 of the parent's `.dat`, and
-holbuild checks those names.
+removes the old entries once they age out. Two uses of SHA-1 remain. A
+theory's `.dat` names each parent by the SHA-1 of the parent's `.dat` (HOL's
+format), and holbuild checks those names. Git dependency mirrors under the
+cache's `git/remotes/` keep their SHA-1-of-URL names, so existing mirrors
+stay in use.
 
 Completed theory artifacts are reused only when their recorded proof timeout
 satisfies the requested timeout. `--allow-cache-timeout-discrepancy` waives that

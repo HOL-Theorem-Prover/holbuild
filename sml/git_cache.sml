@@ -68,11 +68,18 @@ fun cache_root () =
   HolbuildCacheConfig.cache_root ()
   handle HolbuildCacheConfig.Error msg => die msg
 
+fun string_byte_reader text (offset, requested) =
+  let val count = Int.max(0, Int.min(requested, size text - offset))
+  in (Byte.stringToBytes (String.substring(text, offset, count)), offset + count) end
+
+(* A mirror's name only has to be stable. It stays the SHA-1 of the URL, so
+   caches keep the mirrors they have rather than cloning every dependency
+   again and leaving the old mirrors behind, which gc never collects. *)
 fun cache_remote_dir git =
   let
     val root = cache_root ()
     val remotes = Path.concat(Path.concat(root, "git"), "remotes")
-    val hash = HolbuildHash.string_sha256 git
+    val hash = SHA1_ML.sha1String (string_byte_reader git) 0
   in
     ensure_dir remotes;
     Path.concat(remotes, hash ^ ".git")
