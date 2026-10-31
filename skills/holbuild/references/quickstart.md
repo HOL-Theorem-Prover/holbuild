@@ -60,6 +60,7 @@ holbuild build --dry-run FooTheory       # show plan
 holbuild context                         # show manifest info/cache paths
 holbuild buildhol                        # prebuild/reuse dependencies.hol
 holbuild execution-plan FooTheory:thm    # static proof-step plan
+holbuild check FooTheory[:thm]           # report oracles (cheat, ...) and non-HOL axioms; exit 1 if any
 holbuild build --force --trace-steps FooTheory
 holbuild --json build FooTheory          # bounded JSON events/errors for build output
 holbuild --json build --retain-debug-artifacts FooTheory  # also retain/report failure logs
