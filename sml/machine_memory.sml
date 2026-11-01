@@ -2,12 +2,12 @@
 
    Independent holbuild processes that share DIR start a HOL child only while
    the reservations of all their running children, plus the new one, fit the
-   byte budget in DIR/budget, and while the memory in use on the machine
-   (MemTotal less MemAvailable) plus the new one fits it too.  Every child is
+   byte budget in DIR/budget, and while MemAvailable covers the new one plus
+   the reserve that the default budget leaves outside itself.  Every child is
    charged the same --child-charge, an expected size rather than its
-   --max-heap ceiling, so the second check is what holds children back when
-   the running ones grow past their charge.  This bounds admission; it does
-   not enforce RSS.
+   --max-heap ceiling, so the MemAvailable check is what holds children back
+   when the running ones grow past their charge.  This bounds admission; it
+   does not enforce RSS.
 
    A reservation is a file DIR/lease-* holding its byte charge.  It counts
    while some process holds an flock(2) on it.  The parent creates and locks
@@ -159,12 +159,14 @@ fun meminfo () =
 
 fun mem_total () = #total (meminfo ())
 
-(* MemTotal less a quarter (at least 1 GiB) for the OS, page cache and
+(* A quarter of MemTotal (at least 1 GiB) for the OS, page cache and
    holbuild parents. *)
+fun reserve total = Int.max (1024 * mib, total div 4)
+
 fun default_budget dir =
   case mem_total () of
       SOME total =>
-        let val budget = total - Int.max (1024 * mib, total div 4)
+        let val budget = total - reserve total
         in
           if budget > 0 then budget
           else raise Error ("machine memory is too small for a default budget in " ^ dir ^
@@ -255,16 +257,16 @@ fun mib_text bytes = Int.toString (bytes div mib) ^ " MiB"
 fun retry_delay () =
   Time.fromMilliseconds (500 + Time.toMicroseconds (Time.now ()) mod 250000 div 1000)
 
-(* MemAvailable must cover the new child plus the memory outside the budget:
-   the memory in use on the machine plus the child fits the budget (and
-   MemTotal).  Without MemAvailable, admission rests on the reservations
-   alone. *)
-fun live_shortfall budget charge =
+(* MemAvailable must cover the new child plus the reserve, whatever DIR/budget
+   says: the budget caps holbuild's reservations, while this keeps the machine
+   from running out, also when other work uses it.  Without MemAvailable,
+   admission rests on the reservations alone. *)
+fun live_shortfall charge =
   case meminfo () of
       {total = SOME total, available = SOME available} =>
-        if available >= Int.max (0, total - budget) + charge then NONE
-        else SOME (mib_text (total - available) ^ " of " ^ mib_text budget ^
-                   " in use on the machine (MemTotal less MemAvailable)")
+        if available >= charge + reserve total then NONE
+        else SOME ("MemAvailable is " ^ mib_text available ^ ", below the charge plus " ^
+                   mib_text (reserve total) ^ " kept free")
     | _ => NONE
 
 fun acquire {dir, budget_mb, charge_mb} =
@@ -290,7 +292,7 @@ fun acquire {dir, budget_mb, charge_mb} =
               if reserved + charge > budget then
                 Wait (mib_text reserved ^ " of " ^ mib_text budget ^ " reserved in " ^ dir)
               else
-                case live_shortfall budget charge of
+                case live_shortfall charge of
                     NONE => Admitted (create_lease dir charge)
                   | SOME why => Wait why
             end

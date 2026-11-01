@@ -326,10 +326,10 @@ machine (several users, CI jobs, containers with a shared bind mount) can share
 a memory budget instead: with `--cooperate-dir DIR`, every theory, generator and
 heap-export child reserves `--child-charge`, and starts only while the
 reservations of all processes using `DIR` fit the byte count in `DIR/budget`,
-and so does the memory in use on the machine (`MemTotal` less `MemAvailable`)
-plus the charge. The charge is an expected size, not a ceiling: `--max-heap`
-still caps each child, and the second check holds new children back when
-running ones grow past their charge. Where `/proc/meminfo` has no
+and `MemAvailable` covers the charge plus a quarter of `MemTotal` (at least
+1 GiB), whatever the budget. The charge is an expected size, not a ceiling:
+`--max-heap` still caps each child, and the `MemAvailable` check holds new
+children back when running ones, or anything else on the machine, grow. Where `/proc/meminfo` has no
 `MemAvailable` (outside Linux), only the reservations count, so set
 `--child-charge` to what a child can reach there. A child
 that waits shows as `(waiting for memory)` in the status line, as a

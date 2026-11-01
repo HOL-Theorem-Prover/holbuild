@@ -50,8 +50,8 @@ fun global_help () = print
   \                               most 3072)\n\n\
   \With --cooperate-dir, each theory, generator or heap-export child reserves\n\
   \--child-charge, and starts only while all reservations in DIR plus its own fit\n\
-  \the budget in DIR/budget (default: MemTotal less a quarter), and so does the\n\
-  \memory in use on the machine (MemTotal less MemAvailable) plus its charge.\n\
+  \the budget in DIR/budget (default: MemTotal less a quarter), and MemAvailable\n\
+  \covers its charge plus that quarter (at least 1 GiB).\n\
   \This bounds admission; it does not enforce RSS. HOL toolchain builds, check,\n\
   \run and repl reserve nothing.\n\
   \To resize, replace DIR/budget (a byte count) while holding DIR/lock:\n\

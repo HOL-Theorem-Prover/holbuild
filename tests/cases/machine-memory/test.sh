@@ -20,9 +20,9 @@ use_case_cache "$tmpdir/cache"
 
 gib=$((1024 * 1024 * 1024))
 
-# These budgets are far below the test machine's memory, so the MemAvailable
-# check would hold every child back; it is off (no meminfo) except where the
-# test exercises it.
+# The MemAvailable check is off (no meminfo) except where the test exercises
+# it, so that the rest depends on the reservations alone, not on how much
+# memory the test machine has free.
 export HOLBUILD_TEST_MEMINFO=$tmpdir/no-meminfo
 events=$tmpdir/events.log
 : > "$events"
@@ -185,15 +185,15 @@ if (cd "$tmpdir/big" && timeout 60 "$HOLBUILD_BIN" --cooperate-dir "$tmpdir/smal
 fi
 require_grep 'reservation of 3072 MiB .* exceeds the machine budget of 2048 MiB' "$tmpdir/capped.out"
 
-# The memory in use on the machine (MemTotal less MemAvailable) plus the
-# charge must fit the budget, even when the reservations do.  The charge defaults to --max-heap below 3 GiB.
+# MemAvailable must cover the charge plus a quarter of MemTotal, even when
+# the reservations fit.  The charge defaults to --max-heap below 3 GiB.
 : > "$events"
 write_meminfo() {
   printf 'MemTotal:        8388608 kB\nMemFree:          1 kB\nMemAvailable:    %s kB\n' "$1" \
     > "$tmpdir/meminfo.new"
   mv "$tmpdir/meminfo.new" "$tmpdir/meminfo"
 }
-write_meminfo $((4096 * 1024))
+write_meminfo $((2048 * 1024))
 make_project live 0 Live
 (cd "$tmpdir/live" && HOLBUILD_TEST_MEMINFO=$tmpdir/meminfo exec "$HOLBUILD_BIN" \
   --cooperate-dir "$tmpdir/live-coop" --machine-max-mem 4096 --max-heap 1024 \
@@ -203,13 +203,13 @@ for _ in $(seq 1 600); do
   grep -q 'waiting for machine memory' "$tmpdir/live.out" && break
   sleep 0.1
 done
-require_grep 'waiting for machine memory: needs 1024 MiB, 4096 MiB of 4096 MiB in use on the machine' "$tmpdir/live.out"
+require_grep 'waiting for machine memory: needs 1024 MiB, MemAvailable is 2048 MiB, below the charge plus 2048 MiB kept free' "$tmpdir/live.out"
 sleep 2
 if grep -q '^START Live' "$events"; then
   echo "child started while MemAvailable was short" >&2
   exit 1
 fi
-write_meminfo $((5120 * 1024))
+write_meminfo $((3072 * 1024))
 wait "$holbuild_pid" || { cat "$tmpdir/live.out" >&2; exit 1; }
 holbuild_pid=""
 require_grep '^START Live' "$events"
