@@ -34,7 +34,11 @@ TOML
 cat > "$project/src/AScript.sml" <<'SML'
 open HolKernel Parse boolLib bossLib;
 val _ = new_theory "A";
-val _ = store_thm("TRIVIAL", ``T``, ACCEPT_TAC TRUTH);
+Theorem TRIVIAL:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
 val _ = export_theory();
 SML
 
@@ -61,14 +65,46 @@ tracing_graph=$tmpdir/tracing.graph
 trace="$project/.holbuild/obj/src/ATheory.tr.gz"
 remapped="$project/.holbuild/obj/src/.hol/objs/ATheory.tr.gz"
 
+require_no_checkpoints() {
+  if find "$project/.holbuild/checkpoints" \( -name '*.save' -o -name '*.save.ok' \) -print -quit 2>/dev/null | grep -q .; then
+    echo "$1 created checkpoint files" >&2
+    exit 1
+  fi
+}
+
+# A tracing build defaults to --skip-checkpoints --skip-proof-steps.
 first_log=$tmpdir/first.log
-(cd "$project" && trknl_holbuild build --trknl ATheory) > "$first_log" 2>&1
+first_timing=$tmpdir/first.tool-timing
+(cd "$project" && HOLBUILD_TIMING_LOG="$first_timing" HOLBUILD_TIMING_DETAIL=fine \
+  HOLBUILD_CHECKPOINT_TIMING=1 HOLBUILD_ECHO_CHILD_LOGS=1 \
+  trknl_holbuild build --trknl ATheory) > "$first_log" 2>&1
 require_file "$trace"
 require_file "$remapped"
 if [[ ! -s "$trace" ]]; then
   echo "trace output is empty: $trace" >&2
   exit 1
 fi
+if grep -q "holbuild checkpoint kind=" "$first_log"; then
+  echo "--trknl build saved checkpoints" >&2
+  exit 1
+fi
+require_no_checkpoints "--trknl build"
+if grep -q $'^phase\tname=build\.exec\.node\.proof_ir_plan\t' "$first_timing"; then
+  echo "--trknl build ran proof steps" >&2
+  exit 1
+fi
+
+# An explicit debugging flag turns proof steps back on.
+steps_log=$tmpdir/trace-steps.log
+steps_timing=$tmpdir/trace-steps.tool-timing
+rm -f "$trace" "$remapped"
+(cd "$project" && HOLBUILD_TIMING_LOG="$steps_timing" HOLBUILD_TIMING_DETAIL=fine \
+  trknl_holbuild build --trknl --force --trace-steps ATheory) > "$steps_log" 2>&1
+require_grep "proof step trace log:" "$steps_log"
+require_grep $'^phase\tname=build\.exec\.node\.proof_ir_plan\tstatus=ok\tms=' "$steps_timing"
+require_file "$trace"
+require_file "$remapped"
+require_no_checkpoints "--trknl --trace-steps build"
 
 hash_log=$tmpdir/output-hashes.log
 (cd "$project" && trknl_holbuild build --force --emit-output-hashes --trknl ATheory) > "$hash_log" 2>&1

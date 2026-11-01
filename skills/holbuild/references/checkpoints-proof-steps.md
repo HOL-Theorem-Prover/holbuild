@@ -63,6 +63,10 @@ Opts out of proof-step execution. Source is sent through the plain `hol run` pat
 
 **Incompatible**: `--skip-proof-steps` with `--tactic-timeout`, `--trace-steps`, or `--repl-on-failure`.
 
+## `--trknl` defaults
+
+A tracing-kernel build runs root-package theories as `--skip-checkpoints --skip-proof-steps` would; kernel checking and `.tr.gz` export are unchanged. `--trace-steps` or `--tactic-timeout` turns proof steps back on; `--repl-on-failure` turns on proof steps and checkpoints. Explicit `--skip-*` flags still conflict with them as above.
+
 ## Parser recovery
 
 HOL source parse errors are build failures. When HOLSourceParser recovery occurs, holbuild may warn and keep recovered theorem/resume boundaries for best-effort instrumentation and diagnostics before HOL reports the failing script-play status. This avoids the old all-or-nothing fallback where one later parse recovery could disable proof IR/timeouts for the whole theory.

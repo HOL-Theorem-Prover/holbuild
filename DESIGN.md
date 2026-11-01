@@ -803,7 +803,11 @@ nodes. Dependency-package nodes instead use plain proof execution with checkpoin
 creation, proof steps, tactic timeouts, execution-plan targeting, step tracing,
 and failure REPL disabled; developers who need those facilities build the
 dependency as the root project. Kernel selection remains a toolchain property and
-is unchanged for dependency nodes. This effective per-node execution policy does
+is unchanged for dependency nodes. A tracing-kernel build (`--trknl`) defaults
+root-package nodes to the same plain policy, since it collects proof traces
+rather than proof-development state; an explicit `--trace-steps`,
+`--tactic-timeout` or `--repl-on-failure` re-enables the proof steps (and, for
+the REPL, checkpoints) it needs. This effective per-node execution policy does
 not enter final theory action keys.
 
 For instrumented root-package actions, holbuild may create several local
