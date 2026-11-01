@@ -330,7 +330,8 @@ and so does the memory in use on the machine (`MemTotal` less `MemAvailable`)
 plus the charge. The charge is an expected size, not a ceiling: `--max-heap`
 still caps each child, and the second check holds new children back when
 running ones grow past their charge. Where `/proc/meminfo` has no
-`MemAvailable`, only the reservations count. A child
+`MemAvailable` (outside Linux), only the reservations count, so set
+`--child-charge` to what a child can reach there. A child
 that waits shows as `(waiting for memory)` in the status line, as a
 `waiting for machine memory` line otherwise, and as a `waiting_for_memory`
 event with `--json`. A charge larger than the whole budget fails at once.

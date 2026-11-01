@@ -177,6 +177,13 @@ if (cd "$tmpdir/big" && timeout 60 "$HOLBUILD_BIN" --cooperate-dir "$hetero" --c
   exit 1
 fi
 require_grep 'reservation of 8192 MiB .* exceeds the machine budget of 4096 MiB' "$tmpdir/big.out"
+# The default charge is --max-heap, but at most 3072 MiB.
+if (cd "$tmpdir/big" && timeout 60 "$HOLBUILD_BIN" --cooperate-dir "$tmpdir/small" --machine-max-mem 2048 \
+      --max-heap 8192 build) > "$tmpdir/capped.out" 2>&1; then
+  echo "default charge larger than the budget succeeded" >&2
+  exit 1
+fi
+require_grep 'reservation of 3072 MiB .* exceeds the machine budget of 2048 MiB' "$tmpdir/capped.out"
 
 # The memory in use on the machine (MemTotal less MemAvailable) plus the
 # charge must fit the budget, even when the reservations do.  The charge defaults to --max-heap below 3 GiB.
