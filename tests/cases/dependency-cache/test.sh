@@ -87,3 +87,40 @@ printf 'not a valid dependency cache\n' > "$cache_file"
 (cd "$project" && "$HOLBUILD_BIN" build --dry-run ATheory) > "$tmpdir/corrupt.log"
 require_grep "external theories: .*listTheory" "$tmpdir/corrupt.log"
 require_grep "holbuild-dependencies-cache-v3" "$cache_file"
+
+# A library's X.sig and X.sml both build X.ui, so their analyses need separate
+# cache files; sharing one made every run re-analyse both.
+cat > "$project/src/Shared.sig" <<'SML'
+signature Shared = sig val value : bool end
+SML
+cat > "$project/src/Shared.sml" <<'SML'
+structure Shared = struct val value = true end
+SML
+cat > "$project/src/AScript.sml" <<'SML'
+Theory A
+Ancestors arithmetic list
+Libs Shared
+
+Theorem a:
+  1 + 1 = 2
+Proof
+  simp[]
+QED
+
+val _ = export_theory();
+SML
+
+(cd "$project" && "$HOLBUILD_BIN" build --dry-run ATheory) > "$tmpdir/library.log"
+sig_cache_file="$project/.holbuild/obj/src/Shared.ui.deps"
+sml_cache_file="$project/.holbuild/obj/src/Shared.uo.deps"
+require_grep "source_sha1=$(sha1sum < "$project/src/Shared.sig" | cut -d' ' -f1)" "$sig_cache_file"
+require_grep "source_sha1=$(sha1sum < "$project/src/Shared.sml" | cut -d' ' -f1)" "$sml_cache_file"
+
+touch -d '2000-01-01 00:00:00' "$sig_cache_file" "$sml_cache_file"
+(cd "$project" && "$HOLBUILD_BIN" build --dry-run ATheory) > "$tmpdir/library-again.log"
+for file in "$sig_cache_file" "$sml_cache_file"; do
+  if [[ $(date -r "$file" +%Y) != 2000 ]]; then
+    echo "no-op run re-analysed $file" >&2
+    exit 1
+  fi
+done

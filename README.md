@@ -306,6 +306,9 @@ Common global options:
 - `--machine-max-mem MB`: the budget to record in `DIR/budget` when that file
   does not exist yet; a value that differs from the file at this process's
   first admission is an error.
+- `--prefetch-concurrency N`: how many remote cache entries a build copies into
+  the local cache at once, ahead of the build workers. Defaults to twice the
+  build's jobs; only used with a remote cache.
 
 ### Sharing a machine's memory between holbuild processes
 
@@ -740,12 +743,13 @@ HOLBUILD_REMOTE_CACHE_URL=https://cache.example.org holbuild build MyTheory
 ```
 
 Remote cache misses or errors fall back to the local cache/source build path.
-While a build runs, `-j` background threads also copy the remote entries of
-the plan's out-of-date theories into the local cache in build order, so a
-theory's restore usually finds its entry already local. This prefetch is
-best-effort and silent; whatever it misses is fetched when the theory is
-reached, as before. `HOLBUILD_CACHE_TRACE=1` shows each prefetched entry as
-`remote cache prefetched: <key>`.
+While a build runs, `--prefetch-concurrency` background threads (twice `-j` by
+default) also copy the remote entries of the plan's out-of-date theories into
+the local cache in build order, so a theory's restore usually finds its entry
+already local. This prefetch is best-effort and silent; whatever it misses is
+fetched when the theory is reached, as before. `HOLBUILD_CACHE_TRACE=1` shows
+the prefetch thread count as `remote cache prefetch threads: <n>` and each
+prefetched entry as `remote cache prefetched: <key>`.
 A missing HOL toolchain is restored from the same remote cache when its HOL
 commit, build arguments, installation path (with symlinks resolved, as HOL's
 build records it), platform, C library, Poly/ML runtime (release and
