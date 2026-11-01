@@ -912,7 +912,7 @@ fun kind_name source = HolbuildSourceIndex.kind_string (#kind source)
 fun readable path = OS.FileSys.access(path, [OS.FileSys.A_READ]) handle OS.SysErr _ => false
 
 fun file_hash path =
-  if readable path then HolbuildHash.file_sha1 path
+  if readable path then HolbuildHash.file_sha256 path
   else raise Error ("extra dependency not found: " ^ path)
 
 fun is_dir path = FS.isDir path handle OS.SysErr _ => false
@@ -977,7 +977,7 @@ fun extra_dep_lines label base decls =
 fun bool_text true = "true"
   | bool_text false = "false"
 
-fun hash_text text = HolbuildHash.string_sha1 text
+fun hash_text text = HolbuildHash.string_sha256 text
 
 fun lookup_key keys dep =
   case Binarymap.peek(keys, key dep) of
@@ -1061,7 +1061,7 @@ fun action_text_with plan config_lines_for_node toolchain_key keys node =
        "package=" ^ #package source,
        "logical=" ^ #logical_name source,
        "source=" ^ #relative_path source,
-       "source-sha1=" ^ source_hash,
+       "source-sha256=" ^ source_hash,
        "cache=" ^ bool_text (HolbuildProject.action_cache_enabled policy),
        "always_reexecute=" ^ bool_text (HolbuildProject.action_always_reexecute policy)] @
       config_lines_for_node node @

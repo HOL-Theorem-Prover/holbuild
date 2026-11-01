@@ -47,8 +47,8 @@ fun all_chars pred text =
 
 fun valid_sha1_text text = size text = 40 andalso all_chars is_hex_digit text
 
-fun require_sha1 role hash =
-  if valid_sha1_text hash then hash
+fun require_sha256 role hash =
+  if HolbuildHash.valid_sha256 hash then hash
   else raise Error ("cache manifest invalid " ^ role ^ " blob hash: " ^ hash)
 
 fun known_blob_role role =
@@ -61,7 +61,7 @@ fun add_manifest_blob role hash blobs =
   else if List.exists (fn (role', _) => role' = role) blobs then
     raise Error ("cache manifest duplicate blob role: " ^ role)
   else
-    (role, require_sha1 role hash) :: blobs
+    (role, require_sha256 role hash) :: blobs
 
 fun blob_from_manifest role blobs =
   case List.find (fn (role', _) => role' = role) blobs of

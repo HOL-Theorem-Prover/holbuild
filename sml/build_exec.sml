@@ -1283,7 +1283,17 @@ fun file_exists path = FS.access(path, [FS.A_READ]) handle OS.SysErr _ => false
 
 fun checkpoint_exists path = file_exists path andalso file_exists (checkpoint_ok_path path)
 
-fun file_hash path = HolbuildStatCache.file_sha1 (HolbuildStatCache.current_instance ()) path
+fun file_hash path = HolbuildStatCache.file_sha256 (HolbuildStatCache.current_instance ()) path
+
+(* HOL records each parent theory as the SHA-1 of the parent's .dat file
+   (Theory.sml's export), so checking those records needs HOL's hash, not
+   holbuild's own. *)
+fun hol_dat_hash path =
+  if HolbuildHash.large_file path then
+    case HolbuildHash.external_hash "sha1sum" (HolbuildHash.valid_hex 40) path of
+        SOME hash => hash
+      | NONE => SHA1_ML.sha1_file {filename = path}
+  else SHA1_ML.sha1_file {filename = path}
 
 type file_hash_cache = {entries : (string, string) Binarymap.dict ref, mutex : Mutex.mutex}
 
@@ -1302,7 +1312,7 @@ fun cached_file_hash (cache : file_hash_cache) path =
          (fn () => Binarymap.peek (!(#entries cache), path)) of
       SOME hash => SOME hash
     | NONE =>
-        (case (SOME (HolbuildStatCache.file_sha1 (HolbuildStatCache.current_instance ()) path) handle _ => NONE) of
+        (case (SOME (hol_dat_hash path) handle _ => NONE) of
              NONE => NONE
            | SOME hash =>
                with_file_hash_cache_lock cache
@@ -3229,7 +3239,7 @@ fun output_paths checkpoint_policy _ node =
     trace_paths @ map hfs_remapped_path trace_paths
   end
 
-fun output_hash_line path hash = "output-sha1=" ^ path ^ " " ^ hash
+fun output_hash_line path hash = "output-sha256=" ^ path ^ " " ^ hash
 
 fun output_hash_lines_for_paths paths =
   (* Remapped artifacts are normally copied from their canonical counterparts,
@@ -3416,7 +3426,7 @@ fun metadata_text emit_output_hashes checkpoint_policy proof_timeout project pla
      (if emit_output_hashes then output_hash_lines checkpoint_policy plan node else []))
 
 fun semantic_metadata_text text =
-  lines_text (List.filter (fn line => not (String.isPrefix "output-sha1=" line))
+  lines_text (List.filter (fn line => not (String.isPrefix "output-sha256=" line))
                           (metadata_lines text))
 
 fun metadata_input_key_matches input_key text =
@@ -3576,7 +3586,7 @@ fun up_to_date dat_hash_cache emit_output_hashes allow_timeout_discrepancy check
                    if parents_ok andalso
                        (theory_parent_metadata_needs_refresh node text orelse
                         emit_output_hashes orelse
-                        List.exists (String.isPrefix "output-sha1=") (metadata_lines text)) then
+                        List.exists (String.isPrefix "output-sha256=") (metadata_lines text)) then
                      write_metadata emit_output_hashes checkpoint_policy
                        (if allow_timeout_discrepancy then metadata_proof_timeout text
                         else tactic_timeout checkpoint_policy)

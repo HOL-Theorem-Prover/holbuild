@@ -724,6 +724,18 @@ The global build cache stores selected semantic artefacts such as `Theory.sig`,
 key. Cache hits materialise validated artefacts into the local `.holbuild/`
 tree. Standard cache entries do not require a trace blob.
 
+Source, action and toolchain keys and cache blobs are SHA-256 digests, the
+digest Bazel-style remote caches use for `/cas/`. holbuild 0.12.1 switched
+them from SHA-1, so it reads none of the local cache entries, remote cache
+entries or HOL toolchains that earlier releases wrote: its first build of a
+project builds the toolchain and every theory again (or restores what other
+0.12.1 builds have published), and is never served an old entry. `holbuild gc`
+removes the old entries once they age out. Two uses of SHA-1 remain. A
+theory's `.dat` names each parent by the SHA-1 of the parent's `.dat` (HOL's
+format), and holbuild checks those names. Git dependency mirrors under the
+cache's `git/remotes/` keep their SHA-1-of-URL names, so existing mirrors
+stay in use.
+
 Completed theory artifacts are reused only when their recorded proof timeout
 satisfies the requested timeout. `--allow-cache-timeout-discrepancy` waives that
 check for project-local artifacts and all build-cache sources, including remote
@@ -762,7 +774,8 @@ or validate is replaced by the local build (a failed download is not). Local and
 failure is only a warning.
 
 The remote endpoint stores content blobs under `/cas/<sha256>` and holbuild
-cache metadata under `/ac/<action-key>`. CAS transfers use zstd compression when
+cache metadata under `/ac/<sha256>`; a blob's CAS digest is the same one
+holbuild uses locally. CAS transfers use zstd compression when
 supported by the server; action metadata stays small and is sent uncompressed.
 This is a live accelerator, not remote execution and not an immutable release
 registry. Remote cache contents are trusted build inputs: cache hits can load

@@ -36,7 +36,7 @@ val cache = HolbuildFSCacheBackend.filesystem (join (tmp, "cache"));
 val _ = HolbuildFSCacheBackend.ensure_layout cache;
 val source = join (tmp, "source");
 val _ = write_text source "valid cache blob\n";
-val hash = HolbuildHash.file_sha1 source;
+val hash = HolbuildHash.file_sha256 source;
 val _ =
   case HolbuildFSCacheBackend.publish_blob cache {hash = hash, src = source} of
       HolbuildCacheBackend.Published => ()
@@ -61,8 +61,8 @@ val _ =
   case HolbuildFSCacheBackend.fetch_blob cache {hash = hash, dst = dst} of
       HolbuildCacheBackend.Hit => ()
     | _ => fail "valid cache blob was not fetched";
-val _ = assert "materialized blob hash mismatch" (HolbuildHash.file_sha1 dst = hash);
-val key = HolbuildHash.string_sha1 "timeout theory";
+val _ = assert "materialized blob hash mismatch" (HolbuildHash.file_sha256 dst = hash);
+val key = HolbuildHash.string_sha256 "timeout theory";
 fun manifest timeout =
   HolbuildBuildExec.cache_manifest_text
     {input_key = key, sig_hash = hash, sml_hash = hash, dat_hash = hash,
@@ -112,9 +112,9 @@ fun check_conflict_pair (old, incoming) =
   in resident_is incoming end;
 fun check_conflict incoming = check_conflict_pair (strong, incoming);
 val _ = List.app check_conflict
-  [replace_line "blob dat " ("blob dat " ^ HolbuildHash.string_sha1 "different output") weak,
+  [replace_line "blob dat " ("blob dat " ^ HolbuildHash.string_sha256 "different output") weak,
    replace_line "parent " "parent arithmetic" weak,
-   replace_line "input_key=" ("input_key=" ^ HolbuildHash.string_sha1 "other action") weak,
+   replace_line "input_key=" ("input_key=" ^ HolbuildHash.string_sha256 "other action") weak,
    replace_line "kind=" "kind=library" weak,
    replace_line "holbuild-cache-action-" "holbuild-cache-action-v99" weak,
    replace_line "blob dat " "blob dat invalid" weak,
@@ -123,7 +123,7 @@ val _ = List.app check_conflict
    weak ^ "proof-timeout=2.5\n"];
 val _ = List.app
   (fn transform => check_conflict_pair (transform strong, transform weak))
-  [replace_line "input_key=" ("input_key=" ^ HolbuildHash.string_sha1 "other action"),
+  [replace_line "input_key=" ("input_key=" ^ HolbuildHash.string_sha256 "other action"),
    replace_line "kind=" "kind=library",
    replace_line "holbuild-cache-action-" "holbuild-cache-action-v99",
    replace_line "blob dat " "blob dat invalid",
