@@ -872,6 +872,16 @@ fun prepare_source_index phase_prefix resolution project =
      components = components}
   end
 
+(* A theory script may write SML sources as extra outputs, as EmitML code does.
+   A plan made before the theory runs has no node for such a source while it is
+   missing, so the sources that use it build without it, and it hashes a stale
+   one.  Builds the planned theories that declare such outputs, and returns
+   true when the caller must plan again over the sources they wrote. *)
+fun build_generated_source_owners build components holdir index plan =
+  case HolbuildBuildPlan.generated_source_owners plan of
+      [] => false
+    | owners => (build (HolbuildBuildPlan.plan_targets components holdir index owners); true)
+
 fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, proof_steps, new_ir, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy}, targets) =
   let
     val project =
@@ -962,13 +972,12 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
        emit_output_hashes = emit_output_hashes,
        allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy,
        trknl = trknl}
-    fun prepare_plan () =
+    fun prepared_sources () =
+      case prepared of
+          SOME {index, components, ...} => {index = index, components = components}
+        | NONE => prepare_source_index "build" resolution project
+    fun prepare_plan {index, components} =
       let
-        val {index, components} =
-          case prepared of
-              SOME {index, components, ...} =>
-                {index = index, components = components}
-            | NONE => prepare_source_index "build" resolution project
         val requested_targets = targets
         val targets = timed_phase "targets.default" (fn () => default_build_targets resolution project index requested_targets)
         val _ = reject_object_targets targets
@@ -992,7 +1001,7 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
         (index, targets, entry_plan, plan, toolchain_key)
       end
     fun describe_dry_run () =
-      let val (index, force_targets, entry_plan, plan, toolchain_key) = prepare_plan ()
+      let val (index, force_targets, entry_plan, plan, toolchain_key) = prepare_plan (prepared_sources ())
           val build_options = build_options_for index entry_plan plan force_targets
       in
         timed_phase "dry_run.describe"
@@ -1000,11 +1009,18 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
                       (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan)
       end
     fun execute_build () =
-      let val (index, force_targets, entry_plan, plan, toolchain_key) = prepare_plan ()
-          val build_options = build_options_for index entry_plan plan force_targets
+      let
+        fun execute (index, force_targets, entry_plan, plan, toolchain_key) =
+          timed_phase "build.execute"
+            (fn () => HolbuildBuildExec.build (build_options_for index entry_plan plan force_targets)
+                        tc project plan toolchain_key jobs)
+        val sources = prepared_sources ()
+        val planned as (index, _, entry_plan, plan, toolchain_key) = prepare_plan sources
+        fun build_owners owner_plan = execute (index, [], entry_plan, owner_plan, toolchain_key)
       in
-        timed_phase "build.execute"
-          (fn () => HolbuildBuildExec.build build_options tc project plan toolchain_key jobs)
+        if build_generated_source_owners build_owners (#components sources) (#holdir tc) index plan then
+          execute (prepare_plan (prepare_source_index "build" resolution project))
+        else execute planned
       end
     fun run_with_stat_cache f =
       (f (); finish_stat_cache stat_cache)
@@ -1471,19 +1487,30 @@ fun build_heap_kind tc cli_jobs command target =
     fun execute_heap () =
       let
         val HolbuildProject.Heap {output, objects, kind, ...} = heap_named project command target
-        val {index, components} = prepare_source_index "heap"
-                                  (resolution_for_toolchain tc) project
-        val objects = HolbuildSourceIndex.expand_group_tokens index (HolbuildProject.project_package project) objects
-        val _ = if null objects then raise Error (command ^ " target has no objects: " ^ target) else ()
-        val plan = timed_phase "build.plan" (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index objects)
-        (* Unused without proof steps, but resolved so invalid configuration is
-           reported here as it is by build. *)
-        val _ = HolbuildTacticTimeoutPolicy.theory_timeouts project index plan
+        fun plan_heap () =
+          let
+            val {index, components} = prepare_source_index "heap"
+                                      (resolution_for_toolchain tc) project
+            val objects = HolbuildSourceIndex.expand_group_tokens index (HolbuildProject.project_package project) objects
+            val _ = if null objects then raise Error (command ^ " target has no objects: " ^ target) else ()
+            val plan = timed_phase "build.plan" (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index objects)
+            (* Unused without proof steps, but resolved so invalid configuration is
+               reported here as it is by build. *)
+            val _ = HolbuildTacticTimeoutPolicy.theory_timeouts project index plan
+          in
+            {index = index, components = components, plan = plan}
+          end
         val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
         val output_path = HolbuildProject.abs_under (#root project) output
+        fun build_plan plan =
+          HolbuildBuildExec.build (heap_build_options (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)))
+                                 tc project plan toolchain_key jobs
+        val {index, components, plan} = plan_heap ()
+        val plan =
+          if build_generated_source_owners build_plan components (#holdir tc) index plan then #plan (plan_heap ())
+          else plan
       in
-        HolbuildBuildExec.build (heap_build_options (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)))
-                               tc project plan toolchain_key jobs;
+        build_plan plan;
         HolbuildBuildExec.export_heap tc project plan output_path kind
       end
   in

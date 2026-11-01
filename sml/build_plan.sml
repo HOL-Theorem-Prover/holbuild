@@ -263,6 +263,17 @@ fun selected_graph_id ({selected_graph_id, ...} : t) = selected_graph_id
 fun selected_plan_id ({selected_plan_id, ...} : t) = selected_plan_id
 fun resolved_plan_id ({resolved_plan_id, ...} : t) = resolved_plan_id
 
+(* The selected theories that declare an SML source (.sml or .sig) among their
+   extra outputs.  Until such a theory runs, its sources are missing or may be
+   stale, so the plan cannot have a node for them or a key for their content. *)
+fun generated_source_owners plan =
+  let
+    fun is_source path = path_has_suffix ".sml" path orelse path_has_suffix ".sig" path
+    fun declares_source node = List.exists is_source (#extra_outputs (dependencies plan node))
+  in
+    unique_strings (map logical_name (List.filter declares_source (selected_nodes plan)))
+  end
+
 fun find_key_id index node_key =
   let
     fun search lo hi =
