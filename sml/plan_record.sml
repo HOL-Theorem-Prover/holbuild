@@ -751,8 +751,7 @@ fun load dir fingerprint =
         (decode text handle Error msg => fall msg)
 
 fun configure_analyser ({holdir, ...} : HolbuildToolchain.t) =
-  if holdir = "" then HolbuildDependencies.clear_analyser_path ()
-  else HolbuildDependencies.set_analyser_path (HolbuildHolSharedCache.analyser_path_for_holdir holdir)
+  HolbuildDependencies.configure_analyser_for_holdir holdir
 
 (* Check RECORD against the files it names and rebuild the plan from it, or
    say why planning must start over. *)
