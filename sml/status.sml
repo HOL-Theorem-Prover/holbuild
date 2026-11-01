@@ -3,7 +3,10 @@ struct
 
 datatype outcome = Built | UpToDate | Restored | Inspected
 
-type active_node = {key : string, label : string, started_at : Time.time}
+(* thread is the worker building the node; waiting is set while that worker
+   waits for machine memory before launching the node's child. *)
+type active_node = {key : string, label : string, started_at : Time.time,
+                    thread : Thread.thread, waiting : bool}
 
 type t = {
   enabled : bool,
@@ -360,7 +363,8 @@ fun remove_active key active = List.filter (fn {key = k, ...} => k <> key) activ
 
 fun find_active key active = List.find (fn {key = k, ...} => k = key) active
 
-fun active_labels active = map (fn {label, ...} => label) active
+fun active_labels active =
+  map (fn {label, waiting, ...} => if waiting then label ^ " (waiting for memory)" else label) active
 
 fun active_elapsed_text NONE = ""
   | active_elapsed_text (SOME {started_at, ...}) =
@@ -446,7 +450,8 @@ fun start_node status key label =
         in
           if !ended then ()
           else
-            (active := {key = key, label = label, started_at = Time.now ()} :: remove_active key (!active);
+            (active := {key = key, label = label, started_at = Time.now (),
+                        thread = Thread.self (), waiting = false} :: remove_active key (!active);
              if json_mode () then
                emit_json "node_started" (json_node_fields key label)
              else if enabled then redraw status
@@ -527,6 +532,48 @@ fun message_to stream_name stream text =
                   else
                     (TextIO.output (stream, text); TextIO.flushOut stream)
                 end)
+
+(* Marks the node built by the calling thread as waiting for machine memory
+   (SOME detail) or no longer waiting (NONE).  A wait outside any node, such
+   as a heap export, is reported without a label. *)
+fun set_waiting_for_memory detail =
+  let
+    val self = Thread.self ()
+    val waiting = Option.isSome detail
+    fun mark (node as {key, label, started_at, thread, ...} : active_node) =
+      if Thread.equal (thread, self) then
+        {key = key, label = label, started_at = started_at, thread = thread, waiting = waiting}
+      else node
+    fun announce label =
+      case detail of
+          NONE => ()
+        | SOME text =>
+            if json_mode () then
+              emit_json "waiting_for_memory"
+                ((case label of SOME (key, name) => json_node_fields key name | NONE => []) @
+                 [json_string_field "detail" text])
+            else if quiet_mode () then ()
+            else
+              (TextIO.output (TextIO.stdOut,
+                 Option.getOpt (Option.map #2 label, "holbuild") ^
+                 " waiting for machine memory: " ^ text ^ "\n");
+               TextIO.flushOut TextIO.stdOut)
+  in
+    case !current_status of
+        NONE => announce NONE
+      | SOME status =>
+          with_lock status (fn () =>
+            let
+              val {enabled, active, ended, ...} = status
+              val own = List.find (fn {thread, ...} => Thread.equal (thread, self)) (!active)
+            in
+              if !ended then ()
+              else
+                (active := map mark (!active);
+                 if enabled andalso not (json_mode ()) then redraw status
+                 else announce (Option.map (fn {key, label, ...} => (key, label)) own))
+            end)
+  end
 
 fun message_stdout text = message_to "stdout" TextIO.stdOut text
 fun message_stderr text = message_to "stderr" TextIO.stdErr text

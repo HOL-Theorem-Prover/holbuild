@@ -42,7 +42,16 @@ fun global_help () = print
   \  --quiet, --verbose, --verbosity LEVEL\n\
   \  -j N, -jN, --jobs N\n\
   \  --max-heap MB\n\
-  \  --prefetch-concurrency N\n\n\
+  \  --prefetch-concurrency N\n\
+  \  --cooperate-dir DIR          Share a machine memory budget with other holbuild\n\
+  \                               processes using DIR (or $HOLBUILD_COOPERATE_DIR)\n\
+  \  --machine-max-mem MB         Budget to record in DIR/budget if it is missing\n\n\
+  \With --cooperate-dir, each theory, generator or heap-export child reserves\n\
+  \--max-heap plus 1 GiB, and starts only while all reservations in DIR fit the\n\
+  \budget in DIR/budget (default: MemTotal less a quarter). This bounds admission;\n\
+  \it does not enforce RSS. HOL toolchain builds, check, run and repl reserve nothing.\n\
+  \To resize, replace DIR/budget (a byte count) while holding DIR/lock:\n\
+  \  flock DIR/lock sh -c 'echo BYTES > DIR/budget.new && mv DIR/budget.new DIR/budget'\n\n\
   \Use `holbuild COMMAND --help` for command-specific help.\n"
 
 fun build_help () = print
@@ -715,6 +724,43 @@ fun parse_global_options args =
               let val (opts, args') = loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap json verbosity xs in (opts, arg :: args') end
   in
     loop NONE NONE NONE NONE NONE NONE NONE false HolbuildStatus.Normal args
+  end
+
+(* --cooperate-dir and --machine-max-mem, removed from args. *)
+fun parse_cooperation_options args =
+  let
+    fun loop dir mem [] = (dir, mem, [])
+      | loop _ _ ("--cooperate-dir" :: "" :: _) = raise Error "--cooperate-dir requires DIR"
+      | loop _ mem ("--cooperate-dir" :: path :: xs) = loop (SOME path) mem xs
+      | loop _ _ ["--cooperate-dir"] = raise Error "--cooperate-dir requires DIR"
+      | loop dir _ ("--machine-max-mem" :: n :: xs) = loop dir (SOME (positive_int "--machine-max-mem" n)) xs
+      | loop _ _ ["--machine-max-mem"] = raise Error "--machine-max-mem requires MB"
+      | loop dir mem (arg :: xs) =
+          if String.isPrefix "--cooperate-dir=" arg then
+            loop dir mem ("--cooperate-dir" :: String.extract (arg, size "--cooperate-dir=", NONE) :: xs)
+          else if String.isPrefix "--machine-max-mem=" arg then
+            loop dir (SOME (positive_int "--machine-max-mem" (String.extract (arg, size "--machine-max-mem=", NONE)))) xs
+          else
+            let val (dir', mem', rest) = loop dir mem xs in (dir', mem', arg :: rest) end
+  in
+    loop NONE NONE args
+  end
+
+fun configure_cooperation dir budget_mb maxheap =
+  let
+    val dir =
+      case dir of
+          SOME _ => dir
+        | NONE =>
+            (case OS.Process.getEnv "HOLBUILD_COOPERATE_DIR" of
+                 SOME "" => NONE
+               | env => env)
+  in
+    case (dir, budget_mb, maxheap) of
+        (SOME dir, _, SOME mb) => HolbuildMachineMemory.configure {dir = dir, budget_mb = budget_mb, maxheap = mb}
+      | (SOME _, _, NONE) => raise Error "--cooperate-dir requires --max-heap MB, which sizes each child's reservation"
+      | (NONE, SOME _, _) => raise Error "--machine-max-mem requires --cooperate-dir DIR"
+      | (NONE, NONE, _) => ()
   end
 
 fun with_input path f =
@@ -1830,8 +1876,10 @@ fun main raw_args =
        else if raw_args = ["--help"] orelse raw_args = ["-h"]
        then (global_help (); OS.Process.exit OS.Process.success)
        else ()
+     val (cooperate_dir, machine_max_mem, raw_args) = parse_cooperation_options raw_args
      val (options, args) = parse_global_options raw_args
    in
+     configure_cooperation cooperate_dir machine_max_mem (#maxheap options);
      dispatch_with_options options args
    end)
   handle Thread.Interrupt => (HolbuildToolchain.cleanup_active_children (); err "interrupted")

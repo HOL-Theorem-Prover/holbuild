@@ -308,9 +308,43 @@ Common global options:
   holbuild and child HOL processes run uncapped. holbuild rejects `--maxheap`
   where it can detect it (Linux), so there it cannot be used to cap holbuild's
   own heap either.
+- `--cooperate-dir DIR` (or `HOLBUILD_COOPERATE_DIR`): share a machine memory
+  budget with every holbuild process using `DIR`; requires `--max-heap`. See
+  below.
+- `--machine-max-mem MB`: the budget to record in `DIR/budget` when that file
+  does not exist yet; a value that differs from the file at this process's
+  first admission is an error.
 - `--prefetch-concurrency N`: how many remote cache entries a build copies into
   the local cache at once, ahead of the build workers. Defaults to twice the
   build's jobs; only used with a remote cache.
+
+### Sharing a machine's memory between holbuild processes
+
+`-j` limits children within one holbuild process. Independent processes on one
+machine (several users, CI jobs, containers with a shared bind mount) can share
+a memory budget instead: with `--cooperate-dir DIR`, every theory, generator and
+heap-export child reserves its `--max-heap` plus 1 GiB, and starts only while
+the reservations of all processes using `DIR` fit the byte count in
+`DIR/budget`. A child that waits shows as `(waiting for memory)` in the status
+line, as a `waiting for machine memory` line otherwise, and as a
+`waiting_for_memory` event with `--json`. A child larger than the whole budget
+fails at once.
+
+This bounds admission; it does not enforce RSS, and it covers neither HOL
+toolchain builds nor `check`, `run` or `repl`.
+
+- `DIR/budget` is created on first use from `--machine-max-mem`, or else
+  `MemTotal` less a quarter (at least 1 GiB). To resize, replace it while
+  holding `DIR/lock`:
+  `flock DIR/lock sh -c 'echo BYTES > DIR/budget.new && mv DIR/budget.new DIR/budget'`.
+  Running children keep their reservations; new ones use the new value.
+- Each running child has a file `DIR/lease-*` holding its byte charge,
+  `flock`ed by holbuild and inherited by the child, so a killed holbuild's
+  reservation ends with its children, with no timeout. A lease nobody holds no
+  longer counts and is removed by the next process that scans `DIR`.
+- For several users, create `DIR` writable by all of them (for example mode
+  `1777`, or `2775` with a shared group) on a local filesystem. holbuild makes
+  its files readable by everyone.
 
 `holbuild build --watch MyTheory` runs an initial build, then watches project
 inputs with `inotifywait` and rebuilds after changes. The directory of each
