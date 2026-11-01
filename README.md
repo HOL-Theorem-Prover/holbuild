@@ -337,7 +337,9 @@ anything else on the machine, grow. While no reservation is held in `DIR`, a
 child that fits the budget starts whatever `MemAvailable` says, so a build
 never waits on memory none of its children use. Where `/proc/meminfo` has no
 `MemAvailable` (outside Linux), only the reservations count, and the default
-charge is `--max-heap` + 1 GiB, what a child can reach. A child
+charge is `--max-heap` + 1 GiB, what a child can reach. `/proc/meminfo` shows
+the whole machine, not a container's memory limit, so inside a
+memory-limited container set `--child-charge` to what a child can reach. A child
 that waits shows as `(waiting for memory)` in the status line, as a
 `waiting for machine memory` line otherwise, and as a `waiting_for_memory`
 event with `--json`. A charge larger than the whole budget fails at once.

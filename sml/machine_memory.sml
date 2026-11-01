@@ -311,9 +311,8 @@ fun acquire {dir, budget_mb, charge_mb} =
           val _ = settings := SOME {dir = dir, budget_mb = NONE, charge_mb = charge_mb}
         in
           if charge > budget then
-            raise Error ("a child's reservation of " ^ mib_text charge ^ " (--child-charge, by default --max-heap up to " ^
-                         Int.toString default_charge_mb ^ " MiB) exceeds the machine budget of " ^
-                         mib_text budget ^ " in " ^ budget_path dir)
+            raise Error ("a child's reservation of " ^ mib_text charge ^ " (--child-charge or its default) " ^
+                         "exceeds the machine budget of " ^ mib_text budget ^ " in " ^ budget_path dir)
           else
             let val {reserved, starting} = reserved_bytes dir
             in
