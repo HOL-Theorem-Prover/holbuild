@@ -1645,24 +1645,8 @@ fun cache_root () = HolbuildCache.cache_root ()
 fun timeout_text NONE = "none"
   | timeout_text (SOME seconds) = Real.toString seconds
 
-fun parse_positive_finite_real_text text =
-  case Real.scan Substring.getc (Substring.full text) of
-      SOME (value, rest) =>
-        if Substring.isEmpty rest andalso Real.isFinite value andalso value > 0.0 then SOME value
-        else NONE
-    | NONE => NONE
-
-fun parse_timeout_text text =
-  if text = "none" then SOME NONE
-  else Option.map SOME (parse_positive_finite_real_text text)
-
-fun timeout_satisfies requested built =
-  case requested of
-      NONE => true
-    | SOME requested_seconds =>
-        case built of
-            SOME built_seconds => built_seconds <= requested_seconds
-          | NONE => false
+val parse_timeout_text = HolbuildTheoryCacheManifest.parse_timeout_text
+val timeout_satisfies = HolbuildTheoryCacheManifest.timeout_satisfies
 
 fun cache_timeout_satisfies allow_discrepancy requested built =
   allow_discrepancy orelse timeout_satisfies requested built
@@ -1675,9 +1659,7 @@ fun timeout_equal (NONE, NONE) = true
   | timeout_equal (SOME a, SOME b) = Real.== (a, b)
   | timeout_equal _ = false
 
-(* Older cache/checkpoint/action metadata predates explicit proof-timeout
-   fields. Those artifacts were produced under the historical CLI default. *)
-val legacy_default_proof_timeout = SOME 2.5
+val legacy_default_proof_timeout = HolbuildTheoryCacheManifest.legacy_default_proof_timeout
 
 datatype proof_timeout_field =
     ProofTimeoutAbsent
@@ -1726,10 +1708,6 @@ fun cache_blob root path =
   end
 
 fun extra_blob_role path = "extra:" ^ HolbuildAnalysisProtocol.escape path
-fun extra_path_from_blob_role role =
-  if String.isPrefix "extra:" role then
-    SOME (HolbuildAnalysisProtocol.unescape (String.extract(role, size "extra:", NONE)))
-  else NONE
 
 fun cache_manifest_text {input_key, sig_hash, sml_hash, dat_hash, trace_hash, extra_hashes,
                          parents, mldeps, proof_timeout} =
@@ -1747,57 +1725,14 @@ fun cache_manifest_text {input_key, sig_hash, sml_hash, dat_hash, trace_hash, ex
      (case trace_hash of NONE => [] | SOME hash => ["blob trace " ^ hash]) @
      map (fn (path, hash) => "blob " ^ extra_blob_role path ^ " " ^ hash) extra_hashes) ^ "\n"
 
-fun cache_manifest_lines text = String.tokens (fn c => c = #"\n") text
+val cache_manifest_lines = HolbuildTheoryCacheManifest.cache_manifest_lines
+val valid_sha1_text = HolbuildTheoryCacheManifest.valid_sha1_text
+val transient_stage_mldep = HolbuildTheoryCacheManifest.transient_stage_mldep
+val valid_mldep_name = HolbuildTheoryCacheManifest.valid_mldep_name
 
-fun is_hex_digit c =
-  (#"0" <= c andalso c <= #"9") orelse
-  (#"a" <= c andalso c <= #"f") orelse
-  (#"A" <= c andalso c <= #"F")
-
-fun all_chars pred text =
-  let
-    fun loop i = i >= size text orelse (pred (String.sub(text, i)) andalso loop (i + 1))
-  in
-    loop 0
-  end
-
-fun valid_sha1_text text = size text = 40 andalso all_chars is_hex_digit text
-
-fun require_sha256 role hash =
-  if HolbuildHash.valid_sha256 hash then hash
-  else raise Error ("cache manifest invalid " ^ role ^ " blob hash: " ^ hash)
-
-fun known_blob_role role =
-  role = "sig" orelse role = "sml" orelse role = "sml-template" orelse
-  role = "dat" orelse role = "trace" orelse Option.isSome (extra_path_from_blob_role role)
-
-fun add_manifest_blob role hash blobs =
-  if not (known_blob_role role) then
-    raise Error ("cache manifest unknown blob role: " ^ role)
-  else if List.exists (fn (role', _) => role' = role) blobs then
-    raise Error ("cache manifest duplicate blob role: " ^ role)
-  else
-    (role, require_sha256 role hash) :: blobs
-
-fun blob_from_manifest role blobs =
-  case List.find (fn (role', _) => role' = role) blobs of
-      SOME (_, hash) => hash
-    | NONE => raise Error ("cache manifest missing blob role: " ^ role)
-
-fun sml_blob_from_manifest blobs =
-  case List.find (fn (role, _) => role = "sml") blobs of
-      SOME (_, hash) => hash
-    | NONE => blob_from_manifest "sml-template" blobs
-
-fun transient_stage_mldep dep = String.isSubstring "/.holbuild/stage/" dep
-
-fun valid_mldep_name dep =
-  dep <> "" andalso all_chars (fn c => not (Char.isSpace c)) dep
-
-fun reject_transient_cache_mldeps mldeps =
-  case List.find transient_stage_mldep mldeps of
-      SOME dep => raise Error ("cache manifest contains transient stage mldep: " ^ dep)
-    | NONE => ()
+fun cache_manifest_blobs_from_lines key lines =
+  HolbuildTheoryCacheManifest.cache_manifest_blobs_from_lines key lines
+  handle HolbuildTheoryCacheManifest.Error msg => raise Error msg
 
 fun transient_stage_mldep_in_manifest text =
   first_some
@@ -1830,112 +1765,24 @@ fun transient_cache_manifest_error root input_key manifest manifest_text dep =
     raise Error ("cache manifest contains transient stage mldep: " ^ dep ^ action)
   end
 
-fun add_mldep dep deps =
-  if not (valid_mldep_name dep) then
-    raise Error ("cache manifest invalid mldep: " ^ dep)
-  else if List.exists (fn existing => existing = dep) deps then deps
-  else dep :: deps
-
-fun add_parent parent parents = add_mldep parent parents
-
-fun parse_cache_manifest_line input_key line (saw_header, saw_input, saw_kind, saw_metadata, blobs, parents, mldeps) =
-  if line = "holbuild-cache-action-v4" orelse line = "holbuild-cache-action-v3" then
-    if saw_header then raise Error "cache manifest duplicate header"
-    else (true, saw_input, saw_kind, saw_metadata, blobs, parents, mldeps)
-  else if line = "holbuild-cache-action-v2" then
-    raise Error "cache manifest missing generated theory load metadata"
-  else if line = "input_key=" ^ input_key then
-    if saw_input then raise Error "cache manifest duplicate input key"
-    else (saw_header, true, saw_kind, saw_metadata, blobs, parents, mldeps)
-  else if String.isPrefix "input_key=" line then
-    raise Error "cache manifest input key mismatch"
-  else if line = "kind=theory" then
-    if saw_kind then raise Error "cache manifest duplicate kind"
-    else (saw_header, saw_input, true, saw_metadata, blobs, parents, mldeps)
-  else if String.isPrefix "kind=" line then
-    raise Error "cache manifest unsupported kind"
-  else if line = "load-metadata-v1" then
-    if saw_metadata then raise Error "cache manifest duplicate load metadata marker"
-    else (saw_header, saw_input, saw_kind, true, blobs, parents, mldeps)
-  else if line = "mldeps" then
-    raise Error "cache manifest missing generated theory load metadata"
-  else if String.isPrefix "proof-timeout=" line then
-    (saw_header, saw_input, saw_kind, saw_metadata, blobs, parents, mldeps)
-  else
-    case String.tokens Char.isSpace line of
-        ["parent", parent] => (saw_header, saw_input, saw_kind, saw_metadata, blobs, add_parent parent parents, mldeps)
-      | ["mldep", dep] => (saw_header, saw_input, saw_kind, saw_metadata, blobs, parents, add_mldep dep mldeps)
-      | ["blob", role, hash] => (saw_header, saw_input, saw_kind, saw_metadata, add_manifest_blob role hash blobs, parents, mldeps)
-      | _ => raise Error ("cache manifest unknown line: " ^ line)
-
-fun cache_manifest_blobs_from_lines input_key lines =
-  let
-    val (saw_header, saw_input, saw_kind, saw_metadata, blobs, parents, mldeps) =
-      List.foldl (fn (line, state) => parse_cache_manifest_line input_key line state)
-                 (false, false, false, false, [], [], []) lines
-    val _ = if saw_header then () else raise Error "cache manifest missing header"
-    val _ = if saw_input then () else raise Error "cache manifest missing input key"
-    val _ = if saw_kind then () else raise Error "cache manifest missing kind"
-    val _ = if saw_metadata then () else raise Error "cache manifest missing generated theory load metadata"
-  in
-    let val stable_mldeps = rev mldeps
-        val stable_parents = rev parents
-        val _ = reject_transient_cache_mldeps stable_mldeps
-    in
-      {sig_hash = blob_from_manifest "sig" blobs,
-       sml_hash = sml_blob_from_manifest blobs,
-       dat_hash = blob_from_manifest "dat" blobs,
-       trace_hash = Option.map #2 (List.find (fn (role, _) => role = "trace") blobs),
-       extra_hashes =
-         List.mapPartial
-           (fn (role, hash) => Option.map (fn path => (path, hash))
-                                          (extra_path_from_blob_role role))
-           (rev blobs),
-       parents = stable_parents,
-       mldeps = stable_mldeps}
-    end
-  end
-
 fun cache_manifest_blobs root input_key =
   case HolbuildCache.get_action root input_key of
       SOME manifest_text => cache_manifest_blobs_from_lines input_key (cache_manifest_lines manifest_text)
     | NONE => raise Error ("cache manifest missing: " ^ input_key)
 
-fun explicit_cache_manifest_proof_timeouts lines =
-  List.mapPartial
-    (fn line =>
-        if String.isPrefix "proof-timeout=" line then
-          case parse_timeout_text (String.extract(line, size "proof-timeout=", NONE)) of
-              SOME timeout => SOME timeout
-            | NONE => raise Error "cache manifest invalid proof-timeout"
-        else NONE)
-    lines
-
 fun cache_manifest_proof_timeout lines =
-  case explicit_cache_manifest_proof_timeouts lines of
-      [] => legacy_default_proof_timeout
-    | [timeout] => timeout
-    | _ => raise Error "cache manifest duplicate proof-timeout"
+  HolbuildTheoryCacheManifest.cache_manifest_proof_timeout lines
+  handle HolbuildTheoryCacheManifest.Error msg => raise Error msg
 
-fun cache_manifest_proof_timeout_text input_key text =
-  (cache_manifest_blobs_from_lines input_key (cache_manifest_lines text);
-   cache_manifest_proof_timeout (cache_manifest_lines text))
+fun cache_manifest_proof_timeout_text key text =
+  HolbuildTheoryCacheManifest.cache_manifest_proof_timeout_text key text
+  handle HolbuildTheoryCacheManifest.Error msg => raise Error msg
 
-fun cache_manifest_contract input_key text =
-  let
-    val lines = cache_manifest_lines text
-    val _ = cache_manifest_blobs_from_lines input_key lines
-    val proof_timeout = cache_manifest_proof_timeout lines
-    val fields = String.fields (fn c => c = #"\n") text
-    val non_timeout_fields =
-      List.filter (fn line => not (String.isPrefix "proof-timeout=" line)) fields
-  in
-    {proof_timeout = proof_timeout,
-     non_timeout_text = String.concatWith "\n" non_timeout_fields}
-  end
+fun cache_manifest_contract key text =
+  HolbuildTheoryCacheManifest.cache_manifest_contract key text
+  handle HolbuildTheoryCacheManifest.Error msg => raise Error msg
 
-fun timeout_at_least_as_strong candidate reference =
-  timeout_satisfies reference candidate
+val timeout_at_least_as_strong = HolbuildTheoryCacheManifest.timeout_at_least_as_strong
 
 fun cache_manifest_outputs_equal input_key left right =
   let
@@ -2141,6 +1988,7 @@ fun publish_remote_cache_key_if_usable root key =
 fun cache_warning_subject node =
   String.concat [logical_name node, " (", source_file node, ")"]
 
+(* The caller holds the action publication lock, including for a new entry. *)
 fun publish_cache_manifest root cache_key subject staged_sig published_sml staged_dat staged_trace
                            staged_extras cache_parents cache_mldeps proof_timeout =
   let
@@ -2162,12 +2010,6 @@ fun publish_cache_manifest root cache_key subject staged_sig published_sml stage
     val manifest = manifest_with proof_timeout
     val existing = HolbuildCache.get_action root cache_key
     fun write_manifest text = HolbuildCache.write_action root {key = cache_key, text = text}
-    fun put_new_manifest text =
-      case HolbuildCache.put_action root HolbuildCacheBackend.PutIfAbsentOrSame {key = cache_key, text = text} of
-          HolbuildCacheBackend.Published => ()
-        | HolbuildCacheBackend.AlreadyPresent => HolbuildCache.touch_action root cache_key
-        | HolbuildCacheBackend.Conflict detail => raise Error ("cache manifest publish conflict: " ^ detail)
-        | HolbuildCacheBackend.Skipped => ()
     fun publish_same_outputs old =
       let val old_timeout = cache_manifest_proof_timeout_text cache_key old
           val best_timeout = timeout_min (old_timeout, proof_timeout)
@@ -2184,7 +2026,7 @@ fun publish_cache_manifest root cache_key subject staged_sig published_sml stage
             else cache_conflict_warning cache_key manifest_path subject old manifest
           else
             write_manifest manifest
-      | NONE => put_new_manifest manifest
+      | NONE => write_manifest manifest
   end
 
 fun publish_theory_cache plan node input_key proof_timeout staged_sig published_sml staged_dat
@@ -3022,7 +2864,16 @@ fun write_theory_script policy project base_context plan keys input_key toolchai
 fun build_theory cache_allowed policy tc project base_context plan keys toolchain_key node source_text theorem_checkpoints declaration_checkpoints termination_diagnostics =
   let
     val input_key = HolbuildBuildPlan.input_key_for keys node
-    val stage = stage_dir project input_key
+    (* The stage mirrors the package layout, and the script runs from its own
+       directory in it, so inputs it reaches through ../ stay in the stage. *)
+    val stage_root = stage_dir project input_key
+    val package_root = #package_root (HolbuildBuildPlan.source_of node)
+    val script_dir = Path.dir (source_file node)
+    val script_rel_dir =
+      Path.mkRelative {path = normalize_path script_dir, relativeTo = normalize_path package_root}
+    val stage =
+      if String.isPrefix ".." script_rel_dir then stage_root
+      else normalize_path (Path.concat(stage_root, script_rel_dir))
     val staged_script = Path.concat(stage, Path.file (source_file node))
     val child_policy = Path.concat(stage, "holbuild-child-policy.sml")
     val preload = Path.concat(stage, "holbuild-preload.sml")
@@ -3046,7 +2897,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
     val staged_extra_outputs =
       map (fn declaration => (declaration, staged_extra_output_path stage declaration))
           extra_output_declarations
-    val _ = remove_tree stage
+    val _ = remove_tree stage_root
     val _ = ensure_dir stage
     val _ = write_child_policy child_policy
     val _ = remove_file (current_final_context_log project node)
@@ -3183,12 +3034,16 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
       in
         error_with_captured_output detail failure_output
       end
+    fun stage_extra_file base (rel, abs) =
+      let val dst = normalize_path (if Path.isAbsolute rel then rel else Path.concat(base, rel))
+      in ensure_parent dst; copy_binary abs dst end
     fun stage_source_extra_dep decl =
-      List.app (fn (rel, abs) =>
-          let val dst = normalize_path (if Path.isAbsolute rel then rel else Path.concat(stage, rel))
-          in ensure_parent dst; copy_binary abs dst end)
-        (expand_extra_dep (Path.dir (source_file node)) decl)
+      List.app (stage_extra_file stage) (expand_extra_dep script_dir decl)
+    fun stage_manifest_extra_input input =
+      List.app (stage_extra_file stage_root)
+        (expand_extra_dep package_root (HolbuildProject.extra_input_path input))
     val _ = List.app stage_source_extra_dep (#extra_deps (source_deps plan node))
+    val _ = List.app stage_manifest_extra_input (HolbuildProject.action_extra_inputs (source_policy node))
     val build_log = Path.concat(stage, "holbuild-build.log")
     val _ =
       (validate_hol_context (#context run_spec);
@@ -3237,7 +3092,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
                   else if null theorem_checkpoints andalso null termination_diagnostics then Error msg
                   else checkpoint_failure_error msg
                 val _ = run_failure_repl tc policy theorem_checkpoints (#failure_checkpoints run_spec) deps_loaded stage
-                val _ = cleanup_json_stage stage
+                val _ = cleanup_json_stage stage_root
               in
                 raise failure_error
               end
@@ -3302,7 +3157,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
                else raise Error msg)
           else
             run_final_context_from base_context true)
-         handle Error msg => (cleanup_json_stage stage; raise Error msg))
+         handle Error msg => (cleanup_json_stage stage_root; raise Error msg))
       else ()
     val _ =
       if trknl_enabled policy then
@@ -3337,7 +3192,7 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
       else ()
   in
     write_local_theory_manifests plan node generated_metadata;
-    remove_tree stage
+    remove_tree stage_root
   end
 
 fun same_package_logical a b =
@@ -3817,7 +3672,9 @@ fun analyser_proof_ir_plan_sml (inputs : proof_ir_input list) =
              map proof_line (ListPair.zip (List.tabulate(length inputs, fn i => i), inputs)) @
              [HolbuildAnalysisProtocol.join ["end"]]) ^ "\n"
           val _ = write_temp_text req request
-          val status = OS.Process.system (HolbuildHash.quote analyser ^ " --request " ^ HolbuildHash.quote req ^
+          val status = OS.Process.system (HolbuildHash.quote analyser ^ " " ^
+                                          String.concatWith " " (HolbuildDependencies.analyser_min_heap_args ()) ^
+                                          " --request " ^ HolbuildHash.quote req ^
                                           " --response " ^ HolbuildHash.quote resp)
           val _ = OS.FileSys.remove req handle OS.SysErr _ => ()
           val text = if OS.Process.isSuccess status then read_text resp
@@ -4926,10 +4783,10 @@ fun prefetch_key (options : build_options) project keys node =
       | _ => NONE
   end
 
-(* Starts jobs background threads that hydrate the plan's remote theory cache
-   entries into the local cache, in build order, while the build runs; returns
-   a function that drops the nodes not yet started and waits for the copies in
-   flight.  The build workers keep
+(* Starts --prefetch-concurrency (default 2 * jobs) background threads that
+   hydrate the plan's remote theory cache entries into the local cache, in
+   build order, while the build runs; returns a function that drops the nodes
+   not yet started and waits for the copies in flight.  The build workers keep
    their own demand restore, so they never wait behind a prefetch. *)
 fun start_remote_cache_prefetch (options : build_options) project plan keys jobs =
   case HolbuildRemoteCacheConfig.url () of
@@ -4958,7 +4815,11 @@ fun start_remote_cache_prefetch (options : build_options) project plan keys jobs
               case next () of
                   NONE => ()
                 | SOME node => ((prefetch node handle _ => ()); worker ())
-            val threads = List.tabulate (jobs, fn _ => Thread.fork (worker, []))
+            val count =
+              Int.min (Option.getOpt (!HolbuildRemoteCacheConfig.prefetch_concurrency, 2 * jobs),
+                       length (!pending))
+            val _ = cache_trace ("remote cache prefetch threads: " ^ Int.toString count)
+            val threads = List.tabulate (count, fn _ => Thread.fork (worker, []))
             fun wait_threads () =
               if List.exists Thread.isActive threads then
                 (OS.Process.sleep (Time.fromReal 0.05); wait_threads ())

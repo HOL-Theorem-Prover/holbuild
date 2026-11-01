@@ -300,6 +300,9 @@ Common global options:
   holbuild and child HOL processes run uncapped. holbuild rejects `--maxheap`
   where it can detect it (Linux), so there it cannot be used to cap holbuild's
   own heap either.
+- `--prefetch-concurrency N`: how many remote cache entries a build copies into
+  the local cache at once, ahead of the build workers. Defaults to twice the
+  build's jobs; only used with a remote cache.
 
 `holbuild build --watch MyTheory` runs an initial build, then watches project
 inputs with `inotifywait` and rebuilds after changes. The directory of each
@@ -522,8 +525,11 @@ always_reexecute = true
 
 - `deps` adds logical project dependencies.
 - `loads` adds modules/libraries to load before the action.
-- `extra_deps` adds package-root-relative filesystem inputs that should be
-  hashed into the action key; absolute paths and `..` components are rejected.
+- `extra_deps` adds package-root-relative filesystem inputs that are hashed
+  into the action key and copied into the action's stage directory at their
+  path relative to the script, so `data/table.txt` for `src/FooScript.sml` is
+  read as `../data/table.txt` (the stage mirrors the package layout, so such
+  copies stay inside it); absolute paths and `..` components are rejected.
 - `cache = false` disables global cache restore/publish for the action.
 - `always_reexecute = true` disables local up-to-date skipping for the action.
 
@@ -715,12 +721,13 @@ HOLBUILD_REMOTE_CACHE_URL=https://cache.example.org holbuild build MyTheory
 ```
 
 Remote cache misses or errors fall back to the local cache/source build path.
-While a build runs, `-j` background threads also copy the remote entries of
-the plan's out-of-date theories into the local cache in build order, so a
-theory's restore usually finds its entry already local. This prefetch is
-best-effort and silent; whatever it misses is fetched when the theory is
-reached, as before. `HOLBUILD_CACHE_TRACE=1` shows each prefetched entry as
-`remote cache prefetched: <key>`.
+While a build runs, `--prefetch-concurrency` background threads (twice `-j` by
+default) also copy the remote entries of the plan's out-of-date theories into
+the local cache in build order, so a theory's restore usually finds its entry
+already local. This prefetch is best-effort and silent; whatever it misses is
+fetched when the theory is reached, as before. `HOLBUILD_CACHE_TRACE=1` shows
+the prefetch thread count as `remote cache prefetch threads: <n>` and each
+prefetched entry as `remote cache prefetched: <key>`.
 A missing HOL toolchain is restored from the same remote cache when its HOL
 commit, build arguments, installation path (with symlinks resolved, as HOL's
 build records it), platform, C library, Poly/ML runtime (release and

@@ -22,6 +22,23 @@ fun set_analyser_path path = analyser_path := SOME path
 fun clear_analyser_path () = analyser_path := NONE
 fun current_analyser_path () = !analyser_path
 
+(* Workaround for a released Poly/ML, to drop once the toolchain's Poly/ML has
+   the heap-sizing and segmentation rework of Poly/ML master (49ae4e76 and
+   neighbours, in no release yet; #280 tracks the removal): without a floor the
+   analyser cannot allocate a source of a few MB from Poly's 8 MB initial heap
+   - the parallel collector reports "Completed with insufficient space", the
+   runtime prints "Run out of store - interrupting threads", waits 5 s and the
+   process exits non-zero, failing the build that spawned it (issue #278).
+   128 MB covers sources several times the largest one measured (a 2.3 MB
+   generated source needed more than the 8 MB default and was comfortable at
+   50 MB), and Poly maps the heap lazily, so a small source costs nothing; the
+   measured peak RSS of that batch is 89 MB at a 64 MB floor and 123 MB here.
+   The options go on the command line of every analyser process: Poly's runtime
+   consumes its own options wherever they appear and leaves the rest. *)
+val analyser_min_heap_mb = 128
+
+fun analyser_min_heap_args () = ["--minheap", Int.toString analyser_min_heap_mb]
+
 fun has_suffix suffix s =
   let
     val n = size s
@@ -297,7 +314,9 @@ fun run_analyser_batch analyser files =
        map file_line files @
        [HolbuildAnalysisProtocol.join ["end"]]) ^ "\n"
     val _ = write_file req request
-    val run = HolbuildSpawn.run {program = analyser, args = ["--request", req, "--response", resp],
+    val run = HolbuildSpawn.run {program = analyser,
+                                 args = analyser_min_heap_args () @
+                                        ["--request", req, "--response", resp],
                                  stderr = HolbuildSpawn.Inherit}
     val _ = print (#output run)
     val _ = OS.FileSys.remove req handle OS.SysErr _ => ()

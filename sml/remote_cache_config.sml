@@ -6,6 +6,9 @@ exception Error of string
 val override_url : string option ref = ref NONE
 val local_url : string option ref = ref NONE
 val local_curl_config : string option ref = ref NONE
+(* How many threads copy remote theory entries ahead of the build; NONE
+   means twice the build's jobs. *)
+val prefetch_concurrency : int option ref = ref NONE
 
 fun nonempty label text =
   if text = "" then raise Error (label ^ " must not be empty") else text
@@ -18,6 +21,8 @@ fun set_local_url NONE = local_url := NONE
   | set_local_url (SOME url) = local_url := SOME (normalize_url url)
 fun set_local_curl_config NONE = local_curl_config := NONE
   | set_local_curl_config (SOME path) = local_curl_config := SOME (normalize_curl_config path)
+
+fun set_prefetch_concurrency n = prefetch_concurrency := SOME n
 
 fun env_url () =
   case OS.Process.getEnv "HOLBUILD_REMOTE_CACHE_URL" of

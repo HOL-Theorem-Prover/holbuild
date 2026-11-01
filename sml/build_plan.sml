@@ -53,10 +53,13 @@ fun source_of ({source, ...} : node) = source
 fun source_hash_of analysis ({source, ...} : node) =
   HolbuildComponentProvider.source_hash analysis source
 
+(* A library's X.sig and X.sml both list X.ui first, so the .sml names its
+   cache after X.uo to keep the two analyses apart. *)
 fun dependency_cache_path source =
-  case #objects (#artifacts source) of
-      object :: _ => object ^ ".deps"
-    | [] => #source_path source ^ ".holbuild-deps"
+  case (#kind source, #objects (#artifacts source)) of
+      (HolbuildSourceIndex.Sml, _ :: uo :: _) => uo ^ ".deps"
+    | (_, object :: _) => object ^ ".deps"
+    | (_, []) => #source_path source ^ ".holbuild-deps"
 
 fun deps_of analysis ({source, ...} : node) =
   HolbuildComponentProvider.analysis_dependencies
