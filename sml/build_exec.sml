@@ -1320,25 +1320,6 @@ fun invalidate_cached_file_hash (cache : file_hash_cache) path =
             NONE => ()
           | SOME _ => #entries cache := #1 (Binarymap.remove (!(#entries cache), path)))
 
-fun is_dir path = FS.isDir path handle OS.SysErr _ => false
-
-fun list_dir path =
-  let
-    val stream = FS.openDir path
-      handle OS.SysErr _ => raise Error ("could not read directory: " ^ path)
-    fun loop acc =
-      case FS.readDir stream of
-          NONE => rev acc before FS.closeDir stream
-        | SOME name => loop (name :: acc)
-  in
-    loop [] handle e => (FS.closeDir stream; raise e)
-  end
-
-fun path_has_glob path =
-  List.exists (fn c => c = #"*" orelse c = #"?") (String.explode path)
-
-fun join root rel = if rel = "" then root else Path.concat(root, rel)
-
 fun sort_strings xs =
   let
     fun insert x [] = [x]
@@ -1348,22 +1329,9 @@ fun sort_strings xs =
     List.foldl (fn (x, acc) => insert x acc) [] xs
   end
 
-fun files_under abs rel =
-  if is_dir abs then
-    List.concat (map (fn name => files_under (Path.concat(abs, name)) (join rel name)) (list_dir abs))
-  else if FS.access(abs, [FS.A_READ]) handle OS.SysErr _ => false then [(rel, abs)]
-  else []
-
 fun expand_extra_dep base decl =
-  if path_has_glob decl then
-    List.filter (fn (rel, _) => HolbuildSourceIndex.glob_match decl rel) (files_under base "")
-  else
-    let val abs = normalize_path (if Path.isAbsolute decl then decl else Path.concat(base, decl))
-    in
-      if is_dir abs then files_under abs decl
-      else if FS.access(abs, [FS.A_READ]) handle OS.SysErr _ => false then [(decl, abs)]
-      else raise Error ("extra dependency not found: " ^ abs)
-    end
+  HolbuildBuildPlan.expand_extra_dep base decl
+  handle HolbuildBuildPlan.Error msg => raise Error msg
 
 fun extra_dep_lines label base decls =
   let
@@ -2888,8 +2856,20 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
     val staged_extra_outputs =
       map (fn declaration => (declaration, staged_extra_output_path stage declaration))
           extra_output_declarations
+    fun stage_extra_file base (rel, abs) =
+      let val dst = normalize_path (if Path.isAbsolute rel then rel else Path.concat(base, rel))
+      in ensure_parent dst; copy_binary abs dst end
+    fun stage_source_extra_dep decl =
+      List.app (stage_extra_file stage) (expand_extra_dep script_dir decl)
+    fun stage_manifest_extra_input input =
+      List.app (stage_extra_file stage_root)
+        (expand_extra_dep package_root (HolbuildProject.extra_input_path input))
     val _ = remove_tree stage_root
     val _ = ensure_dir stage
+    (* Extra inputs go in first, so holbuild's own files (the instrumented
+       script above all) overwrite any input staged at the same path. *)
+    val _ = List.app stage_source_extra_dep (#extra_deps (source_deps plan node))
+    val _ = List.app stage_manifest_extra_input (HolbuildProject.action_extra_inputs (source_policy node))
     val _ = write_child_policy child_policy
     val _ = remove_file (current_final_context_log project node)
     val _ =
@@ -3025,16 +3005,6 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
       in
         error_with_captured_output detail failure_output
       end
-    fun stage_extra_file base (rel, abs) =
-      let val dst = normalize_path (if Path.isAbsolute rel then rel else Path.concat(base, rel))
-      in ensure_parent dst; copy_binary abs dst end
-    fun stage_source_extra_dep decl =
-      List.app (stage_extra_file stage) (expand_extra_dep script_dir decl)
-    fun stage_manifest_extra_input input =
-      List.app (stage_extra_file stage_root)
-        (expand_extra_dep package_root (HolbuildProject.extra_input_path input))
-    val _ = List.app stage_source_extra_dep (#extra_deps (source_deps plan node))
-    val _ = List.app stage_manifest_extra_input (HolbuildProject.action_extra_inputs (source_policy node))
     val build_log = Path.concat(stage, "holbuild-build.log")
     val _ =
       (validate_hol_context (#context run_spec);

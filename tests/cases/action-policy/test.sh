@@ -172,6 +172,60 @@ if [[ -e "$manifest_stage_project/.holbuild/data" || -e "$manifest_stage_project
   exit 1
 fi
 
+# Staged inputs must not replace holbuild's own staged files: an input naming
+# the script's directory still runs the instrumented script (the tactic
+# timeout fires), and globs skip holbuild's state under .holbuild/.
+manifest_dir_project="$tmpdir/manifest_dir_policy"
+mkdir -p "$manifest_dir_project/src" "$manifest_dir_project/.holbuild"
+cat > "$manifest_dir_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "manifest_dir_policy"
+
+[build]
+members = ["src"]
+tactic_timeout = 0.1
+
+[actions.ATheory]
+extra_inputs = ["src", "*.txt"]
+TOML
+echo stray > "$manifest_dir_project/.holbuild/stray.txt"
+cat > "$manifest_dir_project/src/AScript.sml" <<'SML'
+val _ = if OS.FileSys.access ("../.holbuild", []) then raise Fail ".holbuild was staged" else ();
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+fun slow_tac g = (OS.Process.sleep (Time.fromReal 0.5); ACCEPT_TAC TRUTH g);
+Theorem a_thm:
+  T
+Proof
+  slow_tac
+QED
+val _ = export_theory();
+SML
+if (cd "$manifest_dir_project" && "$HOLBUILD_BIN" build ATheory) > "$tmpdir/manifest-dir.log" 2>&1; then
+  echo "staged extra input replaced the instrumented script" >&2
+  cat "$tmpdir/manifest-dir.log" >&2
+  exit 1
+fi
+require_grep "tactic timed out after 0.1s while building ATheory" "$tmpdir/manifest-dir.log"
+
+# Nor does holbuild's state under .holbuild/ change the action key.
+glob_project="$tmpdir/glob_policy"
+make_theory_project "$glob_project" '[actions.ATheory]
+extra_deps = ["*.txt"]'
+echo one > "$glob_project/extra.txt"
+(cd "$glob_project" && "$HOLBUILD_BIN" build ATheory) > "$tmpdir/glob1.log" 2>&1
+echo stray > "$glob_project/.holbuild/stray.txt"
+(cd "$glob_project" && "$HOLBUILD_BIN" --verbose build ATheory) > "$tmpdir/glob2.log" 2>&1
+require_grep "ATheory is up to date" "$tmpdir/glob2.log"
+
 always_project="$tmpdir/always_policy"
 make_theory_project "$always_project" '[actions.ATheory]
 always_reexecute = true'
