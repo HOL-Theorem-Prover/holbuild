@@ -156,9 +156,16 @@ fun run_interactive argv =
 fun run_in_dir dir argv =
   timed_shell "run_in_dir" argv NONE ("cd " ^ quote dir ^ " && " ^ command argv)
 
+(* Theory children, generators and heap exports all start here, so this is
+   where they take a machine memory reservation (--cooperate-dir). *)
 fun run_in_dir_to_file dir argv output =
-  timed_shell "run_in_dir_to_file" argv (SOME output)
-    ("cd " ^ quote dir ^ " && " ^ command argv ^ " > " ^ quote output ^ " 2>&1")
+  HolbuildMachineMemory.with_reservation
+    (fn lease =>
+        timed_system "run_in_dir_to_file" argv (SOME output)
+          (fn () =>
+              HolbuildProcessGroup.run_shell_inheriting lease
+                ("cd " ^ quote dir ^ " && " ^ command argv ^ " > " ^ quote output ^ " 2>&1")))
+  handle HolbuildMachineMemory.Error msg => raise Error msg
 
 fun ensure_dir path =
   if path = "" orelse path = "." then ()

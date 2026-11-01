@@ -1458,6 +1458,7 @@ fun run_hol_files_to_log tc stage workdir context files log_name current_log err
       HolbuildToolchain.run_in_dir_to_file workdir
         (HolbuildToolchain.theory_run_argv tc @ ["--noconfig"] @ hol_context_args context @ file_args)
         log
+      handle HolbuildToolchain.Error msg => raise Error msg
     val detail_log = finalize_current_log log current_log
   in
     if HolbuildToolchain.success status then
@@ -5066,6 +5067,7 @@ fun export_heap tc (project : HolbuildProject.t) plan output heap_kind =
     val _ = ensure_dir stage
     val _ = ensure_parent output
     val status = HolbuildToolchain.run_in_dir_to_file (#root project) argv log
+                 handle HolbuildToolchain.Error msg => raise Error msg
   in
     if HolbuildToolchain.success status then
       (if echo_child_logs () then HolbuildStatus.message_stdout (read_text log handle _ => "") else ();

@@ -55,6 +55,7 @@ use "sml/cache_backend.sml";
 use "sml/fs_cache_backend.sml";
 use "sml/cache_transfer.sml";
 use "sml/status.sml";
+use "sml/machine_memory.sml";
 use "sml/remote_cache.sml";
 use "sml/tar_archive.sml";
 use "sml/cache_archive.sml";
