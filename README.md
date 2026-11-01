@@ -610,6 +610,18 @@ ordinary outputs, cleaning followed
 by a normal build may restore them from cache; use existing no-cache or impure /
 always-reexecute controls when source execution is required.
 
+A theory may write SML sources (`.sml` or `.sig`) as extra outputs, as EmitML
+code does. A plan made before the theory runs has no node for such a source, so
+when a planned theory declares one, holbuild builds the planned theories that
+declare SML outputs first and then plans again over the sources they wrote. A
+source that uses a generated structure names its theory in `deps`, so that a
+fresh checkout plans the theory:
+
+```toml
+[actions.UseLib]
+deps = ["GenTheory"]
+```
+
 ### Generated source
 
 Generated HOL source can be declared with `[[generate]]` entries:
