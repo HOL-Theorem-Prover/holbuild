@@ -154,6 +154,18 @@ fun rel_under root path =
   let val root' = if has_suffix "/" root then root else root ^ "/"
   in if has_prefix root' path then SOME (String.extract(path, size root', NONE)) else NONE end
 
+(* HOL records its directory with symlinks resolved, so Holmake names targets
+   under the physical path even when holdir is reached through a symlink, such
+   as a symlinked cache root.  Respell those targets under holdir. *)
+fun holdir_spelling holdir =
+  let val physical = OS.FileSys.fullPath holdir
+  in
+    fn target =>
+      case rel_under physical target of
+          SOME rel => Path.concat(holdir, rel)
+        | NONE => target
+  end
+
 fun source_target path =
   (has_suffix ".sml" path orelse has_suffix ".sig" path) andalso
   not (String.isSubstring "/.hol/" path) andalso
@@ -262,16 +274,22 @@ fun holmake_sources run_command holdir roots =
       val command = String.concatWith " "
         (map quote (holmake :: "--no-project" :: "--dirs" :: "--json" :: roots))
       val text = command_output run_command ("cd " ^ quote holdir ^ " && " ^ command)
+      val respell = holdir_spelling holdir
       fun add_line (line, acc) =
         case json_target_value line of
             NONE => acc
           | SOME target =>
-              (case member_dir_from_target holdir target of
+              (case member_dir_from_target holdir (respell target) of
                    NONE => acc
                  | SOME dir => insert_unique dir acc)
       val members = rev (List.foldl add_line roots (split_lines text))
+      val nodes =
+        map (fn {id, target, dependencies, toplevel_compile} =>
+                {id = id, target = respell target, dependencies = dependencies,
+                 toplevel_compile = toplevel_compile})
+            (graph_nodes text)
     in
-      {members = members, loads = compile_loads holdir members (graph_nodes text)}
+      {members = members, loads = compile_loads holdir members nodes}
     end
 
 fun generate {holdir, manifest_path, members_path, run_command} =
