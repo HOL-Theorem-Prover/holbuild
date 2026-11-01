@@ -71,9 +71,10 @@ holbuild --json build --retain-debug-artifacts FooTheory  # also retain/report f
 - `--source-dir PATH` — source tree for manifest discovery; `.holbuild/` artifacts are written under the shell cwd
 - `--cache-dir PATH` — override the global cache directory for this command
 - `--max-heap MB` — pass Poly/ML max heap to child HOL processes (not `--maxheap`, which holbuild's own Poly/ML runtime consumes)
+- `--cooperate-dir DIR` / `--machine-max-mem MB` — share a machine memory budget (`DIR/budget`) with other holbuild processes; each child reserves `--max-heap` + 1 GiB (see README)
 - `-jN` / `--jobs N` — parallel workers. Default: `.holconfig.toml [build].jobs` or `max(1, nproc/2)`
 - `--prefetch-concurrency N` — remote cache entries copied ahead of the build at once (default twice `-j`)
-- `--json` — newline-delimited streaming JSON `message`, `node_started`, `node_finished`, `node_failed`, `build_finished`, and `error` events on stdout (build only; no retained log paths by default; not dry-run/plan/trace/repl-on-failure)
+- `--json` — newline-delimited streaming JSON `message`, `node_started`, `node_finished`, `node_failed`, `waiting_for_memory`, `build_finished`, and `error` events on stdout (build only; no retained log paths by default; not dry-run/plan/trace/repl-on-failure)
 - normal non-TTY output suppresses unchanged node lines
 - `--quiet` / `--verbosity quiet` — suppress per-node success lines
 - `--verbose` / `--verbosity verbose` — node starts plus all finishes, including unchanged nodes, with per-node elapsed times when the live TTY status line is disabled
