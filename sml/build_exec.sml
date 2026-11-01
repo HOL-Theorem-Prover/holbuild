@@ -1329,7 +1329,9 @@ fun sort_strings xs =
     List.foldl (fn (x, acc) => insert x acc) [] xs
   end
 
-val expand_extra_dep = HolbuildBuildPlan.expand_extra_dep
+fun expand_extra_dep base decl =
+  HolbuildBuildPlan.expand_extra_dep base decl
+  handle HolbuildBuildPlan.Error msg => raise Error msg
 
 fun extra_dep_lines label base decls =
   let

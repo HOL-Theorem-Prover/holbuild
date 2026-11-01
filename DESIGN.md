@@ -351,8 +351,9 @@ from the configured HOL toolchain context. `extra_deps` are filesystem
 dependencies whose expanded contents are hashed into the action key. Manifest
 entries are package-root-relative; source files may also declare source-file-relative
 extra dependencies with static literal `holbuild_extra_deps [...]` annotations.
-Entries may name files, directories, or simple globs, and source-declared entries
-are staged so matching relative filesystem reads work during the action.
+Entries may name files, directories, or simple globs (which skip `.holbuild/`
+directories inside them), and entries are staged so matching relative
+filesystem reads work during the action.
 Theory-script sources may declare deterministic, source-file-relative fixed
 output files with static literal `holbuild_extra_outputs [...]` annotations.
 These paths are part of the action identity and owned output set: successful

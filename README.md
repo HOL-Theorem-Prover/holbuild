@@ -572,8 +572,8 @@ always_reexecute = true
   path relative to the script, so `data/table.txt` for `src/FooScript.sml` is
   read as `../data/table.txt` (the stage mirrors the package layout, so such
   copies stay inside it); absolute paths and `..` components are rejected. A
-  directory or glob names the files under it, skipping `.holbuild/`
-  directories.
+  directory or glob names the files under it, skipping any `.holbuild/`
+  directory inside it.
 - `cache = false` disables global cache restore/publish for the action.
 - `always_reexecute = true` disables local up-to-date skipping for the action.
 

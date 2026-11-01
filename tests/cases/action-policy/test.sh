@@ -216,6 +216,16 @@ if (cd "$manifest_dir_project" && "$HOLBUILD_BIN" build ATheory) > "$tmpdir/mani
 fi
 require_grep "tactic timed out after 0.1s while building ATheory" "$tmpdir/manifest-dir.log"
 
+# Nor does holbuild's state under .holbuild/ change the action key.
+glob_project="$tmpdir/glob_policy"
+make_theory_project "$glob_project" '[actions.ATheory]
+extra_deps = ["*.txt"]'
+echo one > "$glob_project/extra.txt"
+(cd "$glob_project" && "$HOLBUILD_BIN" build ATheory) > "$tmpdir/glob1.log" 2>&1
+echo stray > "$glob_project/.holbuild/stray.txt"
+(cd "$glob_project" && "$HOLBUILD_BIN" --verbose build ATheory) > "$tmpdir/glob2.log" 2>&1
+require_grep "ATheory is up to date" "$tmpdir/glob2.log"
+
 always_project="$tmpdir/always_policy"
 make_theory_project "$always_project" '[actions.ATheory]
 always_reexecute = true'
