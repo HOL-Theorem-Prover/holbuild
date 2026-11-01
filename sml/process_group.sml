@@ -51,7 +51,15 @@ fun kill_group_forcefully ({process, ...} : active_child) =
 
 fun kill_active_child_groups () = List.app kill_group_forcefully (active_child_group_snapshot ())
 
-fun cleanup_active_children () = kill_active_child_groups ()
+(* Counts cleanups, so code waiting to launch a child (for machine memory)
+   can tell that the build stopped while it waited. *)
+val cleanups = ref 0
+
+fun cleanup_count () = with_active_child_lock (fn () => !cleanups)
+
+fun cleanup_active_children () =
+  (with_active_child_lock (fn () => cleanups := !cleanups + 1);
+   kill_active_child_groups ())
 
 fun pid_text pid = LargeInt.toString (SysWord.toLargeInt (Posix.Process.pidToWord pid))
 
@@ -153,11 +161,25 @@ fun launch_shell parent_pid mutation_lease script : child_process =
     Unix.execute ("/bin/sh", ["-c", grouped])
   end
 
-fun run_shell_process mutation_lease script consume =
+(* The launch lock is held here, so clearing close-on-exec hands this one
+   descriptor to this child and to no child another thread launches through
+   HolbuildSpawn.  A fork that bypasses the launch lock (OS.Process.system)
+   in this window also gets it, and holds the reservation until it exits. *)
+fun with_inherited NONE launch = launch ()
+  | with_inherited (SOME fd) launch =
+      let
+        fun restore () = Posix.IO.setfd (fd, Posix.IO.FD.cloexec)
+        val _ = Posix.IO.setfd (fd, Posix.IO.FD.flags [])
+      in
+        (launch () before restore ()) handle e => (restore (); raise e)
+      end
+
+fun run_shell_process mutation_lease inherit script consume =
   let
     val {id, process} =
       register_child_group
-        (fn () => launch_shell (Posix.ProcEnv.getpid ()) mutation_lease script)
+        (fn () => with_inherited inherit
+                    (fn () => launch_shell (Posix.ProcEnv.getpid ()) mutation_lease script))
     fun cleanup () = unregister_child_group id
     fun abort () =
       (kill_group_forcefully {id = id, process = process};
@@ -175,17 +197,21 @@ fun reap_with_output process =
     {status = status, output = output}
   end
 
-fun run_shell script =
-  run_shell_process NONE script
+(* inherit is a descriptor the child keeps open for its whole life, such as
+   a machine memory lease. *)
+fun run_shell_inheriting inherit script =
+  run_shell_process NONE inherit script
     (fn process => (copy_child_stdout process; Unix.reap process))
 
-fun run_shell_output script = run_shell_process NONE script reap_with_output
+fun run_shell script = run_shell_inheriting NONE script
+
+fun run_shell_output script = run_shell_process NONE NONE script reap_with_output
 
 fun run_shell_with_mutation_lease {lease_path, script} =
-  run_shell_process (SOME lease_path) script
+  run_shell_process (SOME lease_path) NONE script
     (fn process => (copy_child_stdout process; Unix.reap process))
 
 fun run_shell_output_with_mutation_lease {lease_path, script} =
-  run_shell_process (SOME lease_path) script reap_with_output
+  run_shell_process (SOME lease_path) NONE script reap_with_output
 
 end
