@@ -214,6 +214,14 @@ through the action cache. Standard-kernel builds do not require trace outputs.
 Tracing is a property of the selected bootstrapped HOL kernel; holbuild does not
 pass `--trknl` to each child HOL process.
 
+`build --trknl` collects traces, not proof-development artifacts, so it builds
+root-package theories as `--skip-checkpoints --skip-proof-steps` would, as
+dependency packages always are. Kernel inference checking and the `.tr.gz`
+outputs are unaffected. An explicit debugging flag turns back on what it needs:
+`--trace-steps` and `--tactic-timeout` enable proof steps, and
+`--repl-on-failure` enables proof steps and checkpoints. Explicit
+`--skip-proof-steps` or `--skip-checkpoints` still conflicts with those flags.
+
 ## Common commands
 
 `build` is the default command, so it can usually be omitted:

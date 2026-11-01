@@ -879,6 +879,17 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
           SOME {project, ...} => project
         | NONE => timed_phase "project.discover" load_project
     val resolution = resolution_for_toolchain tc
+    val trknl = HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)
+    (* Tracing builds collect proof traces, so by default they skip the proof
+       development artifacts, as --skip-checkpoints --skip-proof-steps would.
+       An explicit debugging flag turns back on what it needs. *)
+    val debug_proof_steps = trace_steps orelse tactic_timeout_set orelse repl_on_failure
+    val (skip_checkpoints, proof_steps, new_ir) =
+      if trknl then
+        (skip_checkpoints orelse not repl_on_failure,
+         proof_steps andalso debug_proof_steps,
+         new_ir andalso debug_proof_steps)
+      else (skip_checkpoints, proof_steps, new_ir)
     val _ = HolbuildStatus.set_retain_debug_artifacts retain_debug_artifacts
     val jobs = if repl_on_failure then 1 else effective_jobs project cli_jobs
     val _ =
@@ -950,7 +961,7 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
        repl_on_failure = repl_on_failure,
        emit_output_hashes = emit_output_hashes,
        allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy,
-       trknl = HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)}
+       trknl = trknl}
     fun prepare_plan () =
       let
         val {index, components} =
