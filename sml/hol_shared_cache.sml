@@ -477,6 +477,22 @@ fun analyser_key () = HolbuildHash.string_sha1 (analyser_key_material ())
 fun analyser_path_for_toolchain_key k = analyser_bin_for_key k (analyser_key ())
 fun analyser_path_for_holdir holdir = analyser_path_for_toolchain_key (Path.file (Path.dir holdir))
 
+(* The analyser's answers depend on the HOL sources it is compiled against and
+   on its own sources.  Not on the kernel variant or the build sequence, so
+   stdknl and trknl builds share a project's dependency caches. *)
+fun analyser_identity_for_holdir holdir =
+  let val path = theory_toolchain_for_holdir holdir
+      val text = HolbuildFileLock.read_text path
+                 handle IO.Io _ => die ("HOL toolchain has no theory toolchain identity: " ^ path)
+  in
+    case List.find (String.isPrefix "hol_source=") (String.tokens (fn c => c = #"\n") text) of
+        SOME line => HolbuildHash.string_sha1 (line ^ "\nanalyser=" ^ analyser_key ())
+      | NONE => die ("missing HOL source identity in " ^ path)
+  end
+
+fun analyser_for_holdir holdir =
+  {path = analyser_path_for_holdir holdir, identity = analyser_identity_for_holdir holdir}
+
 fun analyser_built k ak =
   executable (analyser_bin_for_key k ak) andalso path_exists (analyser_ok_for_key k ak)
 
