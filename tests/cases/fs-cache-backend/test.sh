@@ -31,6 +31,7 @@ fun write_text path text =
   let val out = TextIO.openOut path
   in TextIO.output (out, text); TextIO.closeOut out end
 
+val _ = (let
 val cache = HolbuildFSCacheBackend.filesystem (join (tmp, "cache"));
 val _ = HolbuildFSCacheBackend.ensure_layout cache;
 val source = join (tmp, "source");
@@ -86,6 +87,11 @@ fun check_merge (old, incoming, best, changed) =
 val weak = manifest NONE;
 val strong = manifest (SOME 2.5);
 val strongest = manifest (SOME 1.0);
+(* Older holbuild versions used directory locks. Transfers must migrate them
+   just like build-time cache publication does. *)
+val _ = OS.FileSys.mkDir (HolbuildFSCacheBackend.locks_dir cache);
+val _ = OS.FileSys.mkDir
+  (join (HolbuildFSCacheBackend.locks_dir cache, "action-" ^ key ^ ".lock"));
 val _ = List.app check_merge
   [(strong, weak, strong, false), (weak, strong, strong, true),
    (strongest, strong, strongest, false), (strong, strongest, strongest, true),
@@ -133,7 +139,9 @@ val _ = case HolbuildFSCacheBackend.put_action cache HolbuildCacheBackend.PutIfA
             HolbuildCacheBackend.Conflict _ => ()
           | _ => fail "PutIfAbsent replaced a resident action";
 val _ = resident_is weak;
-val _ = print "filesystem cache backend tests passed\n";
+in
+  print "filesystem cache backend tests passed\n"
+end) handle e => fail (General.exnMessage e);
 SML
 
 # A cp that logs its arguments, to check that the fetch copies in-process and

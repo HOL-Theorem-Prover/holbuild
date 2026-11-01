@@ -219,7 +219,9 @@ fun with_action_publish_lock cache key publish skip =
 fun put_action cache policy {key, text} =
   with_action_mutex cache key (fn () =>
     let
-      val lock = HolbuildFileLock.acquire_exclusive_path_wait {path = action_lock cache key}
+      val path = action_lock cache key
+      val _ = HolbuildFileLock.remove_obsolete_lock_dir "action cache" path
+      val lock = HolbuildFileLock.acquire_exclusive_path_wait {path = path}
       fun publish () =
         case get_action cache key of
             SOME old => existing_action_result cache policy key text old
