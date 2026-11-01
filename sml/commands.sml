@@ -47,11 +47,13 @@ fun global_help () = print
   \                               processes using DIR (or $HOLBUILD_COOPERATE_DIR)\n\
   \  --machine-max-mem MB         Budget to record in DIR/budget if it is missing\n\
   \  --child-charge MB            Reservation per child (default: --max-heap, at\n\
-  \                               most 3072)\n\n\
+  \                               most 3072; --max-heap + 1024 without\n\
+  \                               MemAvailable)\n\n\
   \With --cooperate-dir, each theory, generator or heap-export child reserves\n\
   \--child-charge, and starts only while all reservations in DIR plus its own fit\n\
-  \the budget in DIR/budget (default: MemTotal less a quarter), and MemAvailable\n\
-  \covers its charge plus that quarter (at least 1 GiB).\n\
+  \the budget in DIR/budget (default: MemTotal less a quarter), and, while other\n\
+  \children hold reservations, MemAvailable less the charges of children started\n\
+  \in the last 30 s covers its charge plus that quarter (at least 1 GiB).\n\
   \This bounds admission; it does not enforce RSS. HOL toolchain builds, check,\n\
   \run and repl reserve nothing.\n\
   \To resize, replace DIR/budget (a byte count) while holding DIR/lock:\n\
@@ -766,11 +768,21 @@ fun configure_cooperation dir budget_mb charge_mb maxheap =
   in
     case (dir, budget_mb, charge_mb) of
         (SOME dir, _, _) =>
-          let val default = HolbuildMachineMemory.default_charge_mb
+          let
+            val default = HolbuildMachineMemory.default_charge_mb
+            (* The flat default leans on the MemAvailable check; without it a
+               child is charged all it may reach, as before that check. *)
+            val default_charge =
+              if HolbuildMachineMemory.has_mem_available () then
+                Int.min (Option.getOpt (maxheap, default), default)
+              else
+                case maxheap of
+                    SOME mb => mb + 1024
+                  | NONE => raise Error ("--cooperate-dir requires --max-heap MB or --child-charge MB " ^
+                                         "where MemAvailable cannot be read")
           in
             HolbuildMachineMemory.configure
-              {dir = dir, budget_mb = budget_mb,
-               charge_mb = Option.getOpt (charge_mb, Int.min (Option.getOpt (maxheap, default), default))}
+              {dir = dir, budget_mb = budget_mb, charge_mb = Option.getOpt (charge_mb, default_charge)}
           end
       | (NONE, SOME _, _) => raise Error "--machine-max-mem requires --cooperate-dir DIR"
       | (NONE, NONE, SOME _) => raise Error "--child-charge requires --cooperate-dir DIR"

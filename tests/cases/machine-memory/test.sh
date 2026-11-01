@@ -20,10 +20,11 @@ use_case_cache "$tmpdir/cache"
 
 gib=$((1024 * 1024 * 1024))
 
-# The MemAvailable check is off (no meminfo) except where the test exercises
-# it, so that the rest depends on the reservations alone, not on how much
-# memory the test machine has free.
-export HOLBUILD_TEST_MEMINFO=$tmpdir/no-meminfo
+# A meminfo with plenty available, except where the test exercises the
+# MemAvailable check, so that the rest depends on the reservations alone, not
+# on how much memory the test machine has free.
+printf 'MemTotal:        67108864 kB\nMemAvailable:    67108864 kB\n' > "$tmpdir/plenty"
+export HOLBUILD_TEST_MEMINFO=$tmpdir/plenty
 events=$tmpdir/events.log
 : > "$events"
 
@@ -185,8 +186,25 @@ if (cd "$tmpdir/big" && timeout 60 "$HOLBUILD_BIN" --cooperate-dir "$tmpdir/smal
 fi
 require_grep 'reservation of 3072 MiB .* exceeds the machine budget of 2048 MiB' "$tmpdir/capped.out"
 
-# MemAvailable must cover the charge plus a quarter of MemTotal, even when
-# the reservations fit.  The charge defaults to --max-heap below 3 GiB.
+# Where MemAvailable can't be read, the default charge is --max-heap plus
+# 1 GiB, and one of --max-heap or --child-charge is required.
+if (cd "$tmpdir/big" && HOLBUILD_TEST_MEMINFO=$tmpdir/no-meminfo timeout 60 "$HOLBUILD_BIN" \
+      --cooperate-dir "$tmpdir/small" --max-heap 1536 build) > "$tmpdir/fallback.out" 2>&1; then
+  echo "fallback charge larger than the budget succeeded" >&2
+  exit 1
+fi
+require_grep 'reservation of 2560 MiB .* exceeds the machine budget of 2048 MiB' "$tmpdir/fallback.out"
+if (cd "$tmpdir/big" && HOLBUILD_TEST_MEMINFO=$tmpdir/no-meminfo timeout 60 "$HOLBUILD_BIN" \
+      --cooperate-dir "$tmpdir/small" build) > "$tmpdir/fallback-none.out" 2>&1; then
+  echo "--cooperate-dir without MemAvailable, --max-heap or --child-charge succeeded" >&2
+  exit 1
+fi
+require_grep 'requires --max-heap MB or --child-charge MB where MemAvailable cannot be read' "$tmpdir/fallback-none.out"
+
+# With MemTotal 8 GiB, MemAvailable must cover the charge plus 2 GiB, even
+# when the reservations fit, but only while some child holds a reservation:
+# alone, Live starts with 2 GiB available.  The charge defaults to --max-heap
+# below 3 GiB.
 : > "$events"
 write_meminfo() {
   printf 'MemTotal:        8388608 kB\nMemFree:          1 kB\nMemAvailable:    %s kB\n' "$1" \
@@ -195,24 +213,54 @@ write_meminfo() {
 }
 write_meminfo $((2048 * 1024))
 make_project live 0 Live
-(cd "$tmpdir/live" && HOLBUILD_TEST_MEMINFO=$tmpdir/meminfo exec "$HOLBUILD_BIN" \
+(cd "$tmpdir/live" && HOLBUILD_TEST_MEMINFO=$tmpdir/meminfo timeout 60 "$HOLBUILD_BIN" \
   --cooperate-dir "$tmpdir/live-coop" --machine-max-mem 4096 --max-heap 1024 \
+  build --skip-checkpoints --skip-proof-steps) > "$tmpdir/live-alone.out" 2>&1 || {
+  echo "a child with no reservation held waited on MemAvailable" >&2
+  cat "$tmpdir/live-alone.out" >&2
+  exit 1
+}
+require_grep '^START Live' "$events"
+
+# While Hold's 2 GiB child is starting, its charge counts against
+# MemAvailable: 4 GiB available would cover Live2's 1 GiB plus 2 GiB on its
+# own, but not after the 2 GiB still to come.
+: > "$events"
+make_project hold 15 Hold
+holbuild_in "$tmpdir/hold" --cooperate-dir "$tmpdir/live-coop" --child-charge 2048 \
+  build --skip-checkpoints --skip-proof-steps > "$tmpdir/hold.out" 2>&1 &
+hold_pid=$!
+for _ in $(seq 1 600); do
+  grep -q '^START Hold' "$events" && break
+  sleep 0.1
+done
+grep -q '^START Hold' "$events" || { echo "Hold did not start" >&2; cat "$tmpdir/hold.out" >&2; exit 1; }
+write_meminfo $((4096 * 1024))
+make_project live2 0 Live2
+(cd "$tmpdir/live2" && HOLBUILD_TEST_MEMINFO=$tmpdir/meminfo exec "$HOLBUILD_BIN" \
+  --cooperate-dir "$tmpdir/live-coop" --max-heap 1024 \
   build --skip-checkpoints --skip-proof-steps) > "$tmpdir/live.out" 2>&1 &
 holbuild_pid=$!
 for _ in $(seq 1 600); do
   grep -q 'waiting for machine memory' "$tmpdir/live.out" && break
   sleep 0.1
 done
-require_grep 'waiting for machine memory: needs 1024 MiB, MemAvailable is 2048 MiB, below the charge plus 2048 MiB kept free' "$tmpdir/live.out"
+require_grep 'waiting for machine memory: needs 1024 MiB, MemAvailable is 4096 MiB less 2048 MiB for children starting, below the charge plus 2048 MiB kept free' "$tmpdir/live.out"
 sleep 2
-if grep -q '^START Live' "$events"; then
+if grep -q '^START Live2' "$events"; then
   echo "child started while MemAvailable was short" >&2
   exit 1
 fi
-write_meminfo $((3072 * 1024))
+write_meminfo $((5120 * 1024))
 wait "$holbuild_pid" || { cat "$tmpdir/live.out" >&2; exit 1; }
 holbuild_pid=""
-require_grep '^START Live' "$events"
+require_grep '^START Live2' "$events"
+if sed -n '/^START Live2/q;p' "$events" | grep -q '^END Hold'; then
+  echo "Live2 started only after Hold ended" >&2
+  cat "$events" >&2
+  exit 1
+fi
+wait "$hold_pid" || { cat "$tmpdir/hold.out" >&2; exit 1; }
 
 # When a node fails, a worker still waiting for memory gives up instead of
 # starting its child once the failed child's reservation frees up.  Fail and

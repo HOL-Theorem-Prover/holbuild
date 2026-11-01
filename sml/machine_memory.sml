@@ -2,12 +2,15 @@
 
    Independent holbuild processes that share DIR start a HOL child only while
    the reservations of all their running children, plus the new one, fit the
-   byte budget in DIR/budget, and while MemAvailable covers the new one plus
-   the reserve that the default budget leaves outside itself.  Every child is
-   charged the same --child-charge, an expected size rather than its
-   --max-heap ceiling, so the MemAvailable check is what holds children back
-   when the running ones grow past their charge.  This bounds admission; it
-   does not enforce RSS.
+   byte budget in DIR/budget, and while MemAvailable, less the charges of
+   children admitted in the last startup_seconds (which have not allocated
+   yet), covers the new one plus the reserve that the default budget leaves
+   outside itself.  Every child is charged the same --child-charge, an
+   expected size rather than its --max-heap ceiling, so the MemAvailable check
+   is what holds children back when the running ones grow past their charge.
+   With no reservation held in DIR, a child that fits the budget starts
+   whatever MemAvailable says, so a domain never waits on memory it does not
+   use.  This bounds admission; it does not enforce RSS.
 
    A reservation is a file DIR/lease-* holding its byte charge.  It counts
    while some process holds an flock(2) on it.  The parent creates and locks
@@ -40,6 +43,10 @@ val mib = 1024 * 1024
 
 (* The --child-charge default caps it at this, or at --max-heap if lower. *)
 val default_charge_mb = 3072
+
+(* How long a new child counts against MemAvailable by its charge, before its
+   own allocations show there. *)
+val startup_seconds = 30
 
 local
   open Foreign
@@ -159,6 +166,8 @@ fun meminfo () =
 
 fun mem_total () = #total (meminfo ())
 
+fun has_mem_available () = isSome (#available (meminfo ()))
+
 (* A quarter of MemTotal (at least 1 GiB) for the OS, page cache and
    holbuild parents. *)
 fun reserve total = Int.max (1024 * mib, total div 4)
@@ -202,16 +211,23 @@ fun current_budget dir budget_mb =
 
 fun remove_file path = OS.FileSys.remove path handle OS.SysErr _ => ()
 
-(* A lease that this process can lock has no holder left: remove it (another
-   user's stale lease in a sticky directory cannot be removed, and is just
-   not counted).  A lease that can't be read is an error rather than zero. *)
+fun is_starting path =
+  Time.< (Time.now (), Time.+ (OS.FileSys.modTime path, Time.fromSeconds startup_seconds))
+  handle OS.SysErr _ => false
+
+(* A lease's charge, and whether its child is still starting.  A lease that
+   this process can lock has no holder left: remove it (another user's stale
+   lease in a sticky directory cannot be removed, and is just not counted).  A
+   lease that can't be read is an error rather than zero. *)
 fun lease_charge dir name =
   let val path = Path.concat(dir, name)
   in
     case open_existing path of
-        NONE => 0
+        NONE => {charge = 0, starting = false}
       | SOME fd =>
-          ((if try_lock fd then (remove_file path; 0) else read_number path fd) before close fd)
+          ((if try_lock fd then (remove_file path; {charge = 0, starting = false})
+            else {charge = read_number path fd, starting = is_starting path})
+           before close fd)
           handle e => (close fd; raise e)
   end
 
@@ -228,7 +244,16 @@ fun lease_names dir =
   end
   handle OS.SysErr (msg, _) => raise sys_error dir msg
 
-fun reserved_bytes dir = List.foldl (fn (name, sum) => sum + lease_charge dir name) 0 (lease_names dir)
+(* The charges of all leases in DIR, and of those still starting. *)
+fun reserved_bytes dir =
+  List.foldl
+    (fn (name, {reserved, starting}) =>
+       let val lease = lease_charge dir name
+       in
+         {reserved = reserved + #charge lease,
+          starting = if #starting lease then starting + #charge lease else starting}
+       end)
+    {reserved = 0, starting = 0} (lease_names dir)
 
 type lease = {path : string, fd : Posix.IO.file_desc}
 
@@ -257,16 +282,19 @@ fun mib_text bytes = Int.toString (bytes div mib) ^ " MiB"
 fun retry_delay () =
   Time.fromMilliseconds (500 + Time.toMicroseconds (Time.now ()) mod 250000 div 1000)
 
-(* MemAvailable must cover the new child plus the reserve, whatever DIR/budget
-   says: the budget caps holbuild's reservations, while this keeps the machine
-   from running out, also when other work uses it.  Without MemAvailable,
-   admission rests on the reservations alone. *)
-fun live_shortfall charge =
+(* MemAvailable, less what children still starting will take, must cover the
+   new child plus the reserve, whatever DIR/budget says: the budget caps
+   holbuild's reservations, while this keeps the machine from running out,
+   also when other work uses it.  Without MemAvailable, admission rests on
+   the reservations alone. *)
+fun live_shortfall charge starting =
   case meminfo () of
       {total = SOME total, available = SOME available} =>
-        if available >= charge + reserve total then NONE
-        else SOME ("MemAvailable is " ^ mib_text available ^ ", below the charge plus " ^
-                   mib_text (reserve total) ^ " kept free")
+        if available - starting >= charge + reserve total then NONE
+        else SOME ("MemAvailable is " ^ mib_text available ^
+                   (if starting > 0 then " less " ^ mib_text starting ^ " for children starting"
+                    else "") ^
+                   ", below the charge plus " ^ mib_text (reserve total) ^ " kept free")
     | _ => NONE
 
 fun acquire {dir, budget_mb, charge_mb} =
@@ -287,12 +315,13 @@ fun acquire {dir, budget_mb, charge_mb} =
                          Int.toString default_charge_mb ^ " MiB) exceeds the machine budget of " ^
                          mib_text budget ^ " in " ^ budget_path dir)
           else
-            let val reserved = reserved_bytes dir
+            let val {reserved, starting} = reserved_bytes dir
             in
               if reserved + charge > budget then
                 Wait (mib_text reserved ^ " of " ^ mib_text budget ^ " reserved in " ^ dir)
+              else if reserved = 0 then Admitted (create_lease dir charge)
               else
-                case live_shortfall charge of
+                case live_shortfall charge starting of
                     NONE => Admitted (create_lease dir charge)
                   | SOME why => Wait why
             end

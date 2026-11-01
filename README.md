@@ -314,7 +314,9 @@ Common global options:
   does not exist yet; a value that differs from the file at this process's
   first admission is an error.
 - `--child-charge MB`: what each child reserves against that budget. Defaults
-  to `--max-heap`, but at most 3072 (3072 without `--max-heap`).
+  to `--max-heap`, but at most 3072 (3072 without `--max-heap`); where
+  `MemAvailable` can't be read, to `--max-heap` + 1024, and then `--max-heap`
+  or `--child-charge` is required.
 - `--prefetch-concurrency N`: how many remote cache entries a build copies into
   the local cache at once, ahead of the build workers. Defaults to twice the
   build's jobs; only used with a remote cache.
@@ -327,11 +329,15 @@ a memory budget instead: with `--cooperate-dir DIR`, every theory, generator and
 heap-export child reserves `--child-charge`, and starts only while the
 reservations of all processes using `DIR` fit the byte count in `DIR/budget`,
 and `MemAvailable` covers the charge plus a quarter of `MemTotal` (at least
-1 GiB), whatever the budget. The charge is an expected size, not a ceiling:
-`--max-heap` still caps each child, and the `MemAvailable` check holds new
-children back when running ones, or anything else on the machine, grow. Where `/proc/meminfo` has no
-`MemAvailable` (outside Linux), only the reservations count, so set
-`--child-charge` to what a child can reach there. A child
+1 GiB), whatever the budget. Children admitted in the last 30 seconds, which
+have not allocated yet, count against `MemAvailable` by their charge. The
+charge is an expected size, not a ceiling: `--max-heap` caps each child, and
+the `MemAvailable` check holds new children back when running ones, or
+anything else on the machine, grow. While no reservation is held in `DIR`, a
+child that fits the budget starts whatever `MemAvailable` says, so a build
+never waits on memory none of its children use. Where `/proc/meminfo` has no
+`MemAvailable` (outside Linux), only the reservations count, and the default
+charge is `--max-heap` + 1 GiB, what a child can reach. A child
 that waits shows as `(waiting for memory)` in the status line, as a
 `waiting for machine memory` line otherwise, and as a `waiting_for_memory`
 event with `--json`. A charge larger than the whole budget fails at once.
