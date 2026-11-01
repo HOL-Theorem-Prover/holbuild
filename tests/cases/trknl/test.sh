@@ -74,7 +74,9 @@ require_no_checkpoints() {
 
 # A tracing build defaults to --skip-checkpoints --skip-proof-steps.
 first_log=$tmpdir/first.log
-(cd "$project" && HOLBUILD_CHECKPOINT_TIMING=1 HOLBUILD_ECHO_CHILD_LOGS=1 \
+first_timing=$tmpdir/first.tool-timing
+(cd "$project" && HOLBUILD_TIMING_LOG="$first_timing" HOLBUILD_TIMING_DETAIL=fine \
+  HOLBUILD_CHECKPOINT_TIMING=1 HOLBUILD_ECHO_CHILD_LOGS=1 \
   trknl_holbuild build --trknl ATheory) > "$first_log" 2>&1
 require_file "$trace"
 require_file "$remapped"
@@ -87,12 +89,19 @@ if grep -q "holbuild checkpoint kind=" "$first_log"; then
   exit 1
 fi
 require_no_checkpoints "--trknl build"
+if grep -q $'^phase\tname=build\.exec\.node\.proof_ir_plan\t' "$first_timing"; then
+  echo "--trknl build ran proof steps" >&2
+  exit 1
+fi
 
 # An explicit debugging flag turns proof steps back on.
 steps_log=$tmpdir/trace-steps.log
+steps_timing=$tmpdir/trace-steps.tool-timing
 rm -f "$trace" "$remapped"
-(cd "$project" && trknl_holbuild build --trknl --force --trace-steps ATheory) > "$steps_log" 2>&1
+(cd "$project" && HOLBUILD_TIMING_LOG="$steps_timing" HOLBUILD_TIMING_DETAIL=fine \
+  trknl_holbuild build --trknl --force --trace-steps ATheory) > "$steps_log" 2>&1
 require_grep "proof step trace log:" "$steps_log"
+require_grep $'^phase\tname=build\.exec\.node\.proof_ir_plan\tstatus=ok\tms=' "$steps_timing"
 require_file "$trace"
 require_file "$remapped"
 require_no_checkpoints "--trknl --trace-steps build"
