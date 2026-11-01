@@ -125,6 +125,49 @@ import_log=$tmpdir/import.log
 HOLBUILD_CACHE="$import_cache" "$HOLBUILD_BIN" import "$archive" > "$import_log" 2>&1
 require_grep "imported 2 cache action" "$import_log"
 
+# Same-output archives can carry different successfully checked timeout contracts.
+timeout_cache=$tmpdir/timeout-cache
+strong_archive=$tmpdir/strong.hbx
+mkdir "$tmpdir/strong-archive"
+tar -xf "$archive" -C "$tmpdir/strong-archive"
+find "$tmpdir/strong-archive/holbuild-cache/actions" -name manifest -exec \
+  sed -i 's/^proof-timeout=none$/proof-timeout=2.5/' {} +
+tar -cf "$strong_archive" -C "$tmpdir/strong-archive" holbuild-cache
+
+assert_strong_timeout() {
+  local cache=$1
+  python3 - "$cache" <<'PYTHON'
+from pathlib import Path
+import sys
+manifests = list((Path(sys.argv[1]) / "actions").glob("*/manifest"))
+assert len(manifests) == 2, manifests
+for manifest in manifests:
+    assert "proof-timeout=2.5\n" in manifest.read_text(), manifest
+PYTHON
+}
+
+HOLBUILD_CACHE="$timeout_cache" "$HOLBUILD_BIN" import "$archive" > "$tmpdir/weak-import.log" 2>&1
+HOLBUILD_CACHE="$timeout_cache" "$HOLBUILD_BIN" import "$strong_archive" > "$tmpdir/strengthen-import.log" 2>&1
+assert_strong_timeout "$timeout_cache"
+HOLBUILD_CACHE="$timeout_cache" "$HOLBUILD_BIN" import "$archive" > "$tmpdir/keep-strong-import.log" 2>&1
+HOLBUILD_CACHE="$timeout_cache" "$HOLBUILD_BIN" import "$strong_archive" > "$tmpdir/reimport.log" 2>&1
+assert_strong_timeout "$timeout_cache"
+
+# Concurrent importers must not lose the stronger contract to a weaker writer.
+concurrent_cache=$tmpdir/concurrent-cache
+import_pids=()
+for iteration in 1 2 3 4; do
+  for input in "$archive" "$strong_archive"; do
+    HOLBUILD_CACHE="$concurrent_cache" "$HOLBUILD_BIN" import "$input" \
+      > "$tmpdir/concurrent-$iteration-$(basename "$input").log" 2>&1 &
+    import_pids+=("$!")
+  done
+done
+for pid in "${import_pids[@]}"; do
+  wait "$pid"
+done
+assert_strong_timeout "$concurrent_cache"
+
 rm -rf "$project/.holbuild"
 restore_log=$tmpdir/restore.log
 (cd "$project" && HOLBUILD_CACHE="$import_cache" HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" build \

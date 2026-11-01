@@ -108,20 +108,28 @@ fun touch_action cache key = FS.setTime(action_manifest cache key, NONE) handle 
 fun get_action cache key =
   SOME (read_text (action_manifest cache key)) handle _ => NONE
 
-fun existing_action_result policy path expected actual =
+fun existing_action_result cache policy key expected actual =
   case policy of
-      HolbuildCacheBackend.PutIfAbsent => HolbuildCacheBackend.Conflict path
+      HolbuildCacheBackend.PutIfAbsent => HolbuildCacheBackend.Conflict (action_manifest cache key)
     | HolbuildCacheBackend.PutIfAbsentOrSame =>
         if actual = expected then HolbuildCacheBackend.AlreadyPresent
-        else HolbuildCacheBackend.Conflict path
-
-fun put_action cache policy {key, text} =
-  let val path = action_manifest cache key
-  in
-    case get_action cache key of
-        SOME old => existing_action_result policy path text old
-      | NONE => (write_action cache {key = key, text = text}; HolbuildCacheBackend.Published)
-  end
+        else
+          let
+            val resident = HolbuildTheoryCacheManifest.cache_manifest_contract key actual
+            val incoming = HolbuildTheoryCacheManifest.cache_manifest_contract key expected
+          in
+            if #non_timeout_text resident <> #non_timeout_text incoming then
+              HolbuildCacheBackend.Conflict (action_manifest cache key)
+            else if HolbuildTheoryCacheManifest.timeout_at_least_as_strong
+                      (#proof_timeout resident) (#proof_timeout incoming) then
+              HolbuildCacheBackend.AlreadyPresent
+            else
+              (* Keep an original manifest: reconciliation never claims a check
+                 that neither publisher recorded. *)
+              (write_action cache {key = key, text = expected}; HolbuildCacheBackend.Published)
+          end
+          handle HolbuildTheoryCacheManifest.Error _ =>
+            HolbuildCacheBackend.Conflict (action_manifest cache key)
 
 fun has_blob cache hash = path_exists (blob_path cache hash)
 
@@ -173,11 +181,52 @@ fun try_acquire_action_lock cache key =
 
 fun release_action_lock (ActionLockHandle lock) = HolbuildFileLock.release lock
 
+(* fcntl locks serialize processes, not threads in one process. *)
+val action_mutexes = ref (Redblackmap.mkDict String.compare)
+val action_mutexes_lock = Mutex.mutex ()
+
+fun action_mutex cache key =
+  let
+    val path = action_lock cache key
+    val _ = Mutex.lock action_mutexes_lock
+    val mutex =
+      case Redblackmap.peek (!action_mutexes, path) of
+          SOME mutex => mutex
+        | NONE =>
+            let val mutex = Mutex.mutex ()
+            in action_mutexes := Redblackmap.insert (!action_mutexes, path, mutex); mutex end
+  in
+    Mutex.unlock action_mutexes_lock;
+    mutex
+  end
+
+fun with_action_mutex cache key f =
+  let val mutex = action_mutex cache key
+      val _ = Mutex.lock mutex
+  in
+    (f () before Mutex.unlock mutex)
+    handle e => (Mutex.unlock mutex; raise e)
+  end
+
 fun with_action_publish_lock cache key publish skip =
-  case try_acquire_action_lock cache key of
-      SOME lock =>
-        ((publish () before release_action_lock lock)
-         handle e => (release_action_lock lock; raise e))
-    | NONE => skip ()
+  with_action_mutex cache key (fn () =>
+    case try_acquire_action_lock cache key of
+        SOME lock =>
+          ((publish () before release_action_lock lock)
+           handle e => (release_action_lock lock; raise e))
+      | NONE => skip ())
+
+fun put_action cache policy {key, text} =
+  with_action_mutex cache key (fn () =>
+    let
+      val lock = HolbuildFileLock.acquire_exclusive_path_wait {path = action_lock cache key}
+      fun publish () =
+        case get_action cache key of
+            SOME old => existing_action_result cache policy key text old
+          | NONE => (write_action cache {key = key, text = text}; HolbuildCacheBackend.Published)
+    in
+      (publish () before HolbuildFileLock.release lock)
+      handle e => (HolbuildFileLock.release lock; raise e)
+    end)
 
 end
