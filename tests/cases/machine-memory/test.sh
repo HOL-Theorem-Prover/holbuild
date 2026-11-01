@@ -19,6 +19,12 @@ trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
 gib=$((1024 * 1024 * 1024))
+
+# A meminfo with plenty available, except where the test exercises the
+# MemAvailable check, so that the rest depends on the reservations alone, not
+# on how much memory the test machine has free.
+printf 'MemTotal:        67108864 kB\nMemAvailable:    67108864 kB\n' > "$tmpdir/plenty"
+export HOLBUILD_TEST_MEMINFO=$tmpdir/plenty
 events=$tmpdir/events.log
 : > "$events"
 
@@ -100,13 +106,11 @@ if "$HOLBUILD_BIN" --machine-max-mem 1024 build > "$tmpdir/no-dir.out" 2>&1; the
 fi
 require_grep 'machine-max-mem requires --cooperate-dir' "$tmpdir/no-dir.out"
 
-# Reservations are sized from --max-heap, so it is required up front.
-if "$HOLBUILD_BIN" --cooperate-dir "$tmpdir/unused" build > "$tmpdir/no-heap.out" 2>&1; then
-  echo "--cooperate-dir without --max-heap succeeded" >&2
+if "$HOLBUILD_BIN" --child-charge 1024 build > "$tmpdir/no-dir-charge.out" 2>&1; then
+  echo "--child-charge without --cooperate-dir succeeded" >&2
   exit 1
 fi
-require_grep 'cooperate-dir requires --max-heap' "$tmpdir/no-heap.out"
-require_no_file "$tmpdir/unused"
+require_grep 'child-charge requires --cooperate-dir' "$tmpdir/no-dir-charge.out"
 if "$HOLBUILD_BIN" --cooperate-dir= --max-heap 1024 build > "$tmpdir/empty-dir.out" 2>&1; then
   echo "an empty --cooperate-dir succeeded" >&2
   exit 1
@@ -114,14 +118,14 @@ fi
 require_grep 'cooperate-dir requires DIR' "$tmpdir/empty-dir.out"
 
 # Two processes, a budget for one child: children never overlap, and the
-# second waits visibly.
+# second waits visibly.  No --max-heap is needed.
 coop=$tmpdir/coop
 make_project p1 2 P1a P1b
 make_project p2 2 P2a P2b
-holbuild_in "$tmpdir/p1" --cooperate-dir "$coop" --machine-max-mem 3072 --max-heap 1024 -j2 \
+holbuild_in "$tmpdir/p1" --cooperate-dir "$coop" --machine-max-mem 3072 --child-charge 2048 -j2 \
   build --skip-checkpoints --skip-proof-steps > "$tmpdir/p1.out" 2>&1 &
 p1_pid=$!
-holbuild_in "$tmpdir/p2" --cooperate-dir "$coop" --machine-max-mem 3072 --max-heap 1024 -j2 \
+holbuild_in "$tmpdir/p2" --cooperate-dir "$coop" --machine-max-mem 3072 --child-charge 2048 -j2 \
   build --skip-checkpoints --skip-proof-steps > "$tmpdir/p2.out" 2>&1 &
 p2_pid=$!
 wait "$p1_pid" || { cat "$tmpdir/p1.out" >&2; exit 1; }
@@ -143,16 +147,17 @@ if holbuild_in "$tmpdir/p1" --cooperate-dir "$coop" --machine-max-mem 4096 --max
 fi
 require_grep '^holbuild: --machine-max-mem 4096 (4294967296 bytes) conflicts with 3221225472 bytes in' "$tmpdir/conflict.out"
 
-# Heterogeneous heaps in a 4 GiB budget: two 2 GiB children fit together, a
-# 3 GiB child fits with neither.
+# Heterogeneous charges in a 4 GiB budget: two 2 GiB children fit together, a
+# 3 GiB child fits with neither.  The charge is --child-charge, not --max-heap,
+# which alone exceeds the budget.
 : > "$events"
 hetero=$tmpdir/hetero
 make_project pa 3 A1 A2
 make_project pb 3 B1
-holbuild_in "$tmpdir/pa" --cooperate-dir "$hetero" --machine-max-mem 4096 --max-heap 1024 -j2 \
+holbuild_in "$tmpdir/pa" --cooperate-dir "$hetero" --machine-max-mem 4096 --max-heap 8192 --child-charge 2048 -j2 \
   build --skip-checkpoints --skip-proof-steps > "$tmpdir/pa.out" 2>&1 &
 pa_pid=$!
-holbuild_in "$tmpdir/pb" --cooperate-dir "$hetero" --machine-max-mem 4096 --max-heap 2048 \
+holbuild_in "$tmpdir/pb" --cooperate-dir "$hetero" --machine-max-mem 4096 --child-charge 3072 \
   build --skip-checkpoints --skip-proof-steps > "$tmpdir/pb.out" 2>&1 &
 pb_pid=$!
 wait "$pa_pid" || { cat "$tmpdir/pa.out" >&2; exit 1; }
@@ -167,12 +172,101 @@ require_no_live_leases "$hetero"
 
 # A child larger than the whole budget fails at once instead of waiting.
 make_project big 0 Big
-if (cd "$tmpdir/big" && timeout 60 "$HOLBUILD_BIN" --cooperate-dir "$hetero" --max-heap 8192 build) \
+if (cd "$tmpdir/big" && timeout 60 "$HOLBUILD_BIN" --cooperate-dir "$hetero" --child-charge 8192 build) \
      > "$tmpdir/big.out" 2>&1; then
   echo "reservation larger than the budget succeeded" >&2
   exit 1
 fi
-require_grep 'reservation of 9216 MiB .* exceeds the machine budget of 4096 MiB' "$tmpdir/big.out"
+require_grep 'reservation of 8192 MiB .* exceeds the machine budget of 4096 MiB' "$tmpdir/big.out"
+# The default charge is --max-heap, but at most 3072 MiB.
+if (cd "$tmpdir/big" && timeout 60 "$HOLBUILD_BIN" --cooperate-dir "$tmpdir/small" --machine-max-mem 2048 \
+      --max-heap 8192 build) > "$tmpdir/capped.out" 2>&1; then
+  echo "default charge larger than the budget succeeded" >&2
+  exit 1
+fi
+require_grep 'reservation of 3072 MiB .* exceeds the machine budget of 2048 MiB' "$tmpdir/capped.out"
+
+# Where MemAvailable can't be read, the default charge is --max-heap plus
+# 1 GiB, and one of --max-heap or --child-charge is required.
+if (cd "$tmpdir/big" && HOLBUILD_TEST_MEMINFO=$tmpdir/no-meminfo timeout 60 "$HOLBUILD_BIN" \
+      --cooperate-dir "$tmpdir/small" --max-heap 1536 build) > "$tmpdir/fallback.out" 2>&1; then
+  echo "fallback charge larger than the budget succeeded" >&2
+  exit 1
+fi
+require_grep 'reservation of 2560 MiB .* exceeds the machine budget of 2048 MiB' "$tmpdir/fallback.out"
+if (cd "$tmpdir/big" && HOLBUILD_TEST_MEMINFO=$tmpdir/no-meminfo timeout 60 "$HOLBUILD_BIN" \
+      --cooperate-dir "$tmpdir/small" build) > "$tmpdir/fallback-none.out" 2>&1; then
+  echo "--cooperate-dir without MemAvailable, --max-heap or --child-charge succeeded" >&2
+  exit 1
+fi
+require_grep 'requires --max-heap MB or --child-charge MB where MemAvailable cannot be read' "$tmpdir/fallback-none.out"
+if (cd "$tmpdir/big" && HOLBUILD_TEST_MEMINFO=$tmpdir/no-meminfo timeout 60 "$HOLBUILD_BIN" \
+      --cooperate-dir "$tmpdir/small" --child-charge 4096 build) > "$tmpdir/fallback-charge.out" 2>&1; then
+  echo "explicit charge larger than the budget succeeded without MemAvailable" >&2
+  exit 1
+fi
+require_grep 'reservation of 4096 MiB .* exceeds the machine budget of 2048 MiB' "$tmpdir/fallback-charge.out"
+
+# With MemTotal 8 GiB, MemAvailable must cover the charge plus 2 GiB, even
+# when the reservations fit, but only while some child holds a reservation:
+# alone, Live starts with 2 GiB available.  The charge defaults to --max-heap
+# below 3 GiB.
+: > "$events"
+write_meminfo() {
+  printf 'MemTotal:        8388608 kB\nMemFree:          1 kB\nMemAvailable:    %s kB\n' "$1" \
+    > "$tmpdir/meminfo.new"
+  mv "$tmpdir/meminfo.new" "$tmpdir/meminfo"
+}
+write_meminfo $((2048 * 1024))
+make_project live 0 Live
+(cd "$tmpdir/live" && HOLBUILD_TEST_MEMINFO=$tmpdir/meminfo timeout 60 "$HOLBUILD_BIN" \
+  --cooperate-dir "$tmpdir/live-coop" --machine-max-mem 4096 --max-heap 1024 \
+  build --skip-checkpoints --skip-proof-steps) > "$tmpdir/live-alone.out" 2>&1 || {
+  echo "a child with no reservation held waited on MemAvailable" >&2
+  cat "$tmpdir/live-alone.out" >&2
+  exit 1
+}
+require_grep '^START Live' "$events"
+
+# While Hold's 2 GiB child is starting, its charge counts against
+# MemAvailable: 4 GiB available would cover Live2's 1 GiB plus 2 GiB on its
+# own, but not after the 2 GiB still to come.
+: > "$events"
+make_project hold 15 Hold
+holbuild_in "$tmpdir/hold" --cooperate-dir "$tmpdir/live-coop" --child-charge 2048 \
+  build --skip-checkpoints --skip-proof-steps > "$tmpdir/hold.out" 2>&1 &
+hold_pid=$!
+for _ in $(seq 1 600); do
+  grep -q '^START Hold' "$events" && break
+  sleep 0.1
+done
+grep -q '^START Hold' "$events" || { echo "Hold did not start" >&2; cat "$tmpdir/hold.out" >&2; exit 1; }
+write_meminfo $((4096 * 1024))
+make_project live2 0 Live2
+(cd "$tmpdir/live2" && HOLBUILD_TEST_MEMINFO=$tmpdir/meminfo exec "$HOLBUILD_BIN" \
+  --cooperate-dir "$tmpdir/live-coop" --max-heap 1024 \
+  build --skip-checkpoints --skip-proof-steps) > "$tmpdir/live.out" 2>&1 &
+holbuild_pid=$!
+for _ in $(seq 1 600); do
+  grep -q 'waiting for machine memory' "$tmpdir/live.out" && break
+  sleep 0.1
+done
+require_grep 'waiting for machine memory: needs 1024 MiB, MemAvailable is 4096 MiB less 2048 MiB for children starting, below the charge plus 2048 MiB kept free' "$tmpdir/live.out"
+sleep 2
+if grep -q '^START Live2' "$events"; then
+  echo "child started while MemAvailable was short" >&2
+  exit 1
+fi
+write_meminfo $((5120 * 1024))
+wait "$holbuild_pid" || { cat "$tmpdir/live.out" >&2; exit 1; }
+holbuild_pid=""
+require_grep '^START Live2' "$events"
+if sed -n '/^START Live2/q;p' "$events" | grep -q '^END Hold'; then
+  echo "Live2 started only after Hold ended" >&2
+  cat "$events" >&2
+  exit 1
+fi
+wait "$hold_pid" || { cat "$tmpdir/hold.out" >&2; exit 1; }
 
 # When a node fails, a worker still waiting for memory gives up instead of
 # starting its child once the failed child's reservation frees up.  Fail and
@@ -197,7 +291,7 @@ val _ = (TextIO.output (out, "START Other\\n"); TextIO.closeOut out);
 val _ = new_theory "Other";
 val _ = export_theory();
 SML
-if holbuild_in "$tmpdir/failing" --cooperate-dir "$tmpdir/failing-coop" --machine-max-mem 3072 --max-heap 1024 -j2 \
+if holbuild_in "$tmpdir/failing" --cooperate-dir "$tmpdir/failing-coop" --machine-max-mem 3072 -j2 \
      build --skip-checkpoints --skip-proof-steps > "$tmpdir/failing.out" 2>&1; then
   echo "build with a failing theory succeeded" >&2
   exit 1
@@ -212,12 +306,13 @@ require_no_live_leases "$tmpdir/failing-coop"
 
 # A killed parent's reservation is released once its child group is gone,
 # without any timeout, and the next scan removes the stale lease.  The budget
-# fits one child, so Next running at all shows that Slow's group is gone.
+# fits one child at the default 3 GiB charge, so Next running at all shows that
+# Slow's group is gone.
 : > "$events"
 stale=$tmpdir/stale
 make_project slow 30 Slow
 make_project next 0 Next
-(cd "$tmpdir/slow" && exec "$HOLBUILD_BIN" --cooperate-dir "$stale" --machine-max-mem 3072 --max-heap 1024 \
+(cd "$tmpdir/slow" && exec "$HOLBUILD_BIN" --cooperate-dir "$stale" --machine-max-mem 3072 \
   build --skip-checkpoints --skip-proof-steps) > "$tmpdir/slow.out" 2>&1 &
 holbuild_pid=$!
 for _ in $(seq 1 600); do
@@ -236,7 +331,7 @@ holbuild_pid=""
 killed_leases=$(compgen -G "$stale/lease-*" || true)
 [[ -n "$killed_leases" ]] || { echo "killed parent left no lease to reclaim" >&2; exit 1; }
 start_seconds=$SECONDS
-(cd "$tmpdir/next" && timeout 25 "$HOLBUILD_BIN" --cooperate-dir "$stale" --max-heap 1024 \
+(cd "$tmpdir/next" && timeout 25 "$HOLBUILD_BIN" --cooperate-dir "$stale" \
   build --skip-checkpoints --skip-proof-steps) > "$tmpdir/next.out" 2>&1 || {
   echo "build after a killed parent did not get its reservation within 25 s" >&2
   cat "$tmpdir/next.out" >&2

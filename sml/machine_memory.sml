@@ -2,9 +2,15 @@
 
    Independent holbuild processes that share DIR start a HOL child only while
    the reservations of all their running children, plus the new one, fit the
-   byte budget in DIR/budget.  A child reserves its --max-heap plus a fixed
-   allowance for memory outside the Poly/ML heap.  This bounds admission; it
-   does not enforce RSS.
+   byte budget in DIR/budget, and while MemAvailable, less the charges of
+   children admitted in the last startup_seconds (which have not allocated
+   yet), covers the new one plus the reserve that the default budget leaves
+   outside itself.  Every child is charged the same --child-charge, an
+   expected size rather than its --max-heap ceiling, so the MemAvailable check
+   is what holds children back when the running ones grow past their charge.
+   With no reservation held in DIR, a child that fits the budget starts
+   whatever MemAvailable says, so a domain never waits on memory it does not
+   use.  This bounds admission; it does not enforce RSS.
 
    A reservation is a file DIR/lease-* holding its byte charge.  It counts
    while some process holds an flock(2) on it.  The parent creates and locks
@@ -27,14 +33,20 @@ exception Error of string
 
 (* budget_mb is checked against DIR/budget at the first admission only, so
    that a later resize doesn't fail this process. *)
-type settings = {dir : string, budget_mb : int option, maxheap : int}
+type settings = {dir : string, budget_mb : int option, charge_mb : int}
 
 val settings : settings option ref = ref NONE
 
 fun configure s = settings := SOME s
 
 val mib = 1024 * 1024
-val child_overhead = 1024 * mib
+
+(* The --child-charge default caps it at this, or at --max-heap if lower. *)
+val default_charge_mb = 3072
+
+(* How long a new child counts against MemAvailable by its charge, before its
+   own allocations show there. *)
+val startup_seconds = 30
 
 local
   open Foreign
@@ -133,27 +145,37 @@ fun with_coordinator dir f =
     (wait coordinator_attempts; f () before close fd) handle e => (close fd; raise e)
   end
 
-fun mem_total () =
+(* MemTotal and MemAvailable in bytes, NONE where /proc/meminfo or the field
+   is missing.  Tests point HOLBUILD_TEST_MEMINFO at a stand-in file. *)
+fun meminfo () =
   let
-    val ins = TextIO.openIn "/proc/meminfo"
-    val text = TextIO.inputAll ins before TextIO.closeIn ins
-    fun kib line =
-      case String.tokens Char.isSpace line of
-          ["MemTotal:", n, "kB"] => Int.fromString n
-        | _ => NONE
+    val path = Option.getOpt (OS.Process.getEnv "HOLBUILD_TEST_MEMINFO", "/proc/meminfo")
+    val ins = TextIO.openIn path
+    val lines = String.tokens (fn c => c = #"\n") (TextIO.inputAll ins before TextIO.closeIn ins)
+    fun field name =
+      List.foldl (fn (line, NONE) =>
+                     (case String.tokens Char.isSpace line of
+                          [label, n, "kB"] => if label = name then Option.map (fn n => n * 1024) (Int.fromString n) else NONE
+                        | _ => NONE)
+                   | (_, found) => found)
+                 NONE lines
   in
-    Option.map (fn n => n * 1024)
-      (List.foldl (fn (line, NONE) => kib line | (_, found) => found) NONE
-                  (String.tokens (fn c => c = #"\n") text))
+    {total = field "MemTotal:", available = field "MemAvailable:"}
   end
-  handle IO.Io _ => NONE
+  handle IO.Io _ => {total = NONE, available = NONE}
 
-(* MemTotal less a quarter (at least 1 GiB) for the OS, page cache and
+fun mem_total () = #total (meminfo ())
+
+fun has_mem_available () = isSome (#available (meminfo ()))
+
+(* A quarter of MemTotal (at least 1 GiB) for the OS, page cache and
    holbuild parents. *)
+fun reserve total = Int.max (1024 * mib, total div 4)
+
 fun default_budget dir =
   case mem_total () of
       SOME total =>
-        let val budget = total - Int.max (1024 * mib, total div 4)
+        let val budget = total - reserve total
         in
           if budget > 0 then budget
           else raise Error ("machine memory is too small for a default budget in " ^ dir ^
@@ -189,16 +211,23 @@ fun current_budget dir budget_mb =
 
 fun remove_file path = OS.FileSys.remove path handle OS.SysErr _ => ()
 
-(* A lease that this process can lock has no holder left: remove it (another
-   user's stale lease in a sticky directory cannot be removed, and is just
-   not counted).  A lease that can't be read is an error rather than zero. *)
+fun is_starting path =
+  Time.< (Time.now (), Time.+ (OS.FileSys.modTime path, Time.fromSeconds startup_seconds))
+  handle OS.SysErr _ => false
+
+(* A lease's charge, and whether its child is still starting.  A lease that
+   this process can lock has no holder left: remove it (another user's stale
+   lease in a sticky directory cannot be removed, and is just not counted).  A
+   lease that can't be read is an error rather than zero. *)
 fun lease_charge dir name =
   let val path = Path.concat(dir, name)
   in
     case open_existing path of
-        NONE => 0
+        NONE => {charge = 0, starting = false}
       | SOME fd =>
-          ((if try_lock fd then (remove_file path; 0) else read_number path fd) before close fd)
+          ((if try_lock fd then (remove_file path; {charge = 0, starting = false})
+            else {charge = read_number path fd, starting = is_starting path})
+           before close fd)
           handle e => (close fd; raise e)
   end
 
@@ -215,7 +244,16 @@ fun lease_names dir =
   end
   handle OS.SysErr (msg, _) => raise sys_error dir msg
 
-fun reserved_bytes dir = List.foldl (fn (name, sum) => sum + lease_charge dir name) 0 (lease_names dir)
+(* The charges of all leases in DIR, and of those still starting. *)
+fun reserved_bytes dir =
+  List.foldl
+    (fn (name, {reserved, starting}) =>
+       let val lease = lease_charge dir name
+       in
+         {reserved = reserved + #charge lease,
+          starting = if #starting lease then starting + #charge lease else starting}
+       end)
+    {reserved = 0, starting = 0} (lease_names dir)
 
 type lease = {path : string, fd : Posix.IO.file_desc}
 
@@ -236,16 +274,32 @@ fun create_lease dir charge : lease =
    the next scan removes the file. *)
 fun release ({fd, ...} : lease) = close fd
 
-datatype attempt = Admitted of lease | Wait of {reserved : int, budget : int}
+(* Wait carries why, for the status line. *)
+datatype attempt = Admitted of lease | Wait of string
 
 fun mib_text bytes = Int.toString (bytes div mib) ^ " MiB"
 
 fun retry_delay () =
   Time.fromMilliseconds (500 + Time.toMicroseconds (Time.now ()) mod 250000 div 1000)
 
-fun acquire {dir, budget_mb, maxheap} =
+(* MemAvailable, less what children still starting will take, must cover the
+   new child plus the reserve, whatever DIR/budget says: the budget caps
+   holbuild's reservations, while this keeps the machine from running out,
+   also when other work uses it.  Without MemAvailable, admission rests on
+   the reservations alone. *)
+fun live_shortfall charge starting =
+  case meminfo () of
+      {total = SOME total, available = SOME available} =>
+        if available - starting >= charge + reserve total then NONE
+        else SOME ("MemAvailable is " ^ mib_text available ^
+                   (if starting > 0 then " less " ^ mib_text starting ^ " for children starting"
+                    else "") ^
+                   ", below the charge plus " ^ mib_text (reserve total) ^ " kept free")
+    | _ => NONE
+
+fun acquire {dir, budget_mb, charge_mb} =
   let
-    val charge = maxheap * mib + child_overhead
+    val charge = charge_mb * mib
     val cleanups = HolbuildProcessGroup.cleanup_count ()
     fun check_not_stopped () =
       if HolbuildProcessGroup.cleanup_count () = cleanups then ()
@@ -254,17 +308,21 @@ fun acquire {dir, budget_mb, maxheap} =
       with_coordinator dir (fn () =>
         let
           val budget = current_budget dir budget_mb
-          val _ = settings := SOME {dir = dir, budget_mb = NONE, maxheap = maxheap}
+          val _ = settings := SOME {dir = dir, budget_mb = NONE, charge_mb = charge_mb}
         in
           if charge > budget then
-            raise Error ("a child's reservation of " ^ mib_text charge ^ " (--max-heap plus " ^
-                         mib_text child_overhead ^ ") exceeds the machine budget of " ^
-                         mib_text budget ^ " in " ^ budget_path dir)
+            raise Error ("a child's reservation of " ^ mib_text charge ^ " (--child-charge or its default) " ^
+                         "exceeds the machine budget of " ^ mib_text budget ^ " in " ^ budget_path dir)
           else
-            let val reserved = reserved_bytes dir
+            let val {reserved, starting} = reserved_bytes dir
             in
-              if reserved + charge <= budget then Admitted (create_lease dir charge)
-              else Wait {reserved = reserved, budget = budget}
+              if reserved + charge > budget then
+                Wait (mib_text reserved ^ " of " ^ mib_text budget ^ " reserved in " ^ dir)
+              else if reserved = 0 then Admitted (create_lease dir charge)
+              else
+                case live_shortfall charge starting of
+                    NONE => Admitted (create_lease dir charge)
+                  | SOME why => Wait why
             end
         end)
     fun loop waiting =
@@ -273,12 +331,11 @@ fun acquire {dir, budget_mb, maxheap} =
             ((check_not_stopped () handle e => (release lease; raise e));
              if waiting then HolbuildStatus.set_waiting_for_memory NONE else ();
              lease)
-        | Wait {reserved, budget} =>
+        | Wait why =>
             (check_not_stopped ();
              (if waiting then ()
               else HolbuildStatus.set_waiting_for_memory
-                     (SOME ("needs " ^ mib_text charge ^ ", " ^ mib_text reserved ^ " of " ^
-                            mib_text budget ^ " reserved in " ^ dir)));
+                     (SOME ("needs " ^ mib_text charge ^ ", " ^ why)));
              OS.Process.sleep (retry_delay ());
              loop true)
   in
