@@ -100,6 +100,19 @@ if "$HOLBUILD_BIN" --machine-max-mem 1024 build > "$tmpdir/no-dir.out" 2>&1; the
 fi
 require_grep 'machine-max-mem requires --cooperate-dir' "$tmpdir/no-dir.out"
 
+# Reservations are sized from --max-heap, so it is required up front.
+if "$HOLBUILD_BIN" --cooperate-dir "$tmpdir/unused" build > "$tmpdir/no-heap.out" 2>&1; then
+  echo "--cooperate-dir without --max-heap succeeded" >&2
+  exit 1
+fi
+require_grep 'cooperate-dir requires --max-heap' "$tmpdir/no-heap.out"
+require_no_file "$tmpdir/unused"
+if "$HOLBUILD_BIN" --cooperate-dir= --max-heap 1024 build > "$tmpdir/empty-dir.out" 2>&1; then
+  echo "an empty --cooperate-dir succeeded" >&2
+  exit 1
+fi
+require_grep 'cooperate-dir requires DIR' "$tmpdir/empty-dir.out"
+
 # Two processes, a budget for one child: children never overlap, and the
 # second waits visibly.
 coop=$tmpdir/coop
@@ -161,8 +174,45 @@ if (cd "$tmpdir/big" && timeout 60 "$HOLBUILD_BIN" --cooperate-dir "$hetero" --m
 fi
 require_grep 'reservation of 9216 MiB .* exceeds the machine budget of 4096 MiB' "$tmpdir/big.out"
 
+# When a node fails, a worker still waiting for memory gives up instead of
+# starting its child once the failed child's reservation frees up.  Fail and
+# Q compete for a one-child budget, and Other waits on Q, so some worker is
+# waiting whichever starts first.
+: > "$events"
+make_project failing 0 Q
+cat > "$tmpdir/failing/src/FailScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+fun append msg =
+  let val out = TextIO.openAppend "$events"
+  in TextIO.output(out, msg ^ "\\n"); TextIO.closeOut out end;
+val _ = append "START Fail";
+val _ = OS.Process.system "sleep 4";
+val _ = append "FAILED Fail";
+val _ = raise Fail "planned failure";
+SML
+cat > "$tmpdir/failing/src/OtherScript.sml" <<SML
+open HolKernel Parse boolLib bossLib QTheory;
+val out = TextIO.openAppend "$events";
+val _ = (TextIO.output (out, "START Other\\n"); TextIO.closeOut out);
+val _ = new_theory "Other";
+val _ = export_theory();
+SML
+if holbuild_in "$tmpdir/failing" --cooperate-dir "$tmpdir/failing-coop" --machine-max-mem 3072 --max-heap 1024 -j2 \
+     build --skip-checkpoints --skip-proof-steps > "$tmpdir/failing.out" 2>&1; then
+  echo "build with a failing theory succeeded" >&2
+  exit 1
+fi
+require_grep '^FAILED Fail' "$events"
+if sed -n '/^FAILED Fail/,$p' "$events" | grep -q '^START'; then
+  echo "a waiting child started after the build failed" >&2
+  cat "$events" >&2
+  exit 1
+fi
+require_no_live_leases "$tmpdir/failing-coop"
+
 # A killed parent's reservation is released once its child group is gone,
-# without any timeout, and the next scan removes the stale lease.
+# without any timeout, and the next scan removes the stale lease.  The budget
+# fits one child, so Next running at all shows that Slow's group is gone.
 : > "$events"
 stale=$tmpdir/stale
 make_project slow 30 Slow
@@ -193,10 +243,6 @@ start_seconds=$SECONDS
   exit 1
 }
 require_grep '^END Next' "$events"
-if grep -q '^END Slow' "$events"; then
-  echo "killed parent's child kept running" >&2
-  exit 1
-fi
 for lease in $killed_leases; do
   require_no_file "$lease"
 done

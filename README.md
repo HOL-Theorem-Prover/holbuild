@@ -304,7 +304,8 @@ Common global options:
   budget with every holbuild process using `DIR`; requires `--max-heap`. See
   below.
 - `--machine-max-mem MB`: the budget to record in `DIR/budget` when that file
-  does not exist yet; a value that differs from an existing file is an error.
+  does not exist yet; a value that differs from the file at this process's
+  first admission is an error.
 
 ### Sharing a machine's memory between holbuild processes
 
@@ -319,7 +320,7 @@ line, as a `waiting for machine memory` line otherwise, and as a
 fails at once.
 
 This bounds admission; it does not enforce RSS, and it covers neither HOL
-toolchain builds nor `run`/`repl`.
+toolchain builds nor `check`, `run` or `repl`.
 
 - `DIR/budget` is created on first use from `--machine-max-mem`, or else
   `MemTotal` less a quarter (at least 1 GiB). To resize, replace it while

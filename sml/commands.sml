@@ -48,7 +48,7 @@ fun global_help () = print
   \With --cooperate-dir, each theory, generator or heap-export child reserves\n\
   \--max-heap plus 1 GiB, and starts only while all reservations in DIR fit the\n\
   \budget in DIR/budget (default: MemTotal less a quarter). This bounds admission;\n\
-  \it does not enforce RSS, and HOL toolchain builds, run and repl reserve nothing.\n\
+  \it does not enforce RSS. HOL toolchain builds, check, run and repl reserve nothing.\n\
   \To resize, replace DIR/budget (a byte count) while holding DIR/lock:\n\
   \  flock DIR/lock sh -c 'echo BYTES > DIR/budget.new && mv DIR/budget.new DIR/budget'\n\n\
   \Use `holbuild COMMAND --help` for command-specific help.\n"
@@ -725,13 +725,14 @@ fun parse_global_options args =
 fun parse_cooperation_options args =
   let
     fun loop dir mem [] = (dir, mem, [])
+      | loop _ _ ("--cooperate-dir" :: "" :: _) = raise Error "--cooperate-dir requires DIR"
       | loop _ mem ("--cooperate-dir" :: path :: xs) = loop (SOME path) mem xs
       | loop _ _ ["--cooperate-dir"] = raise Error "--cooperate-dir requires DIR"
       | loop dir _ ("--machine-max-mem" :: n :: xs) = loop dir (SOME (positive_int "--machine-max-mem" n)) xs
       | loop _ _ ["--machine-max-mem"] = raise Error "--machine-max-mem requires MB"
       | loop dir mem (arg :: xs) =
           if String.isPrefix "--cooperate-dir=" arg then
-            loop (SOME (String.extract (arg, size "--cooperate-dir=", NONE))) mem xs
+            loop dir mem ("--cooperate-dir" :: String.extract (arg, size "--cooperate-dir=", NONE) :: xs)
           else if String.isPrefix "--machine-max-mem=" arg then
             loop dir (SOME (positive_int "--machine-max-mem" (String.extract (arg, size "--machine-max-mem=", NONE)))) xs
           else
@@ -750,10 +751,11 @@ fun configure_cooperation dir budget_mb maxheap =
                  SOME "" => NONE
                | env => env)
   in
-    case (dir, budget_mb) of
-        (SOME dir, _) => HolbuildMachineMemory.configure {dir = dir, budget_mb = budget_mb, maxheap = maxheap}
-      | (NONE, SOME _) => raise Error "--machine-max-mem requires --cooperate-dir DIR"
-      | (NONE, NONE) => ()
+    case (dir, budget_mb, maxheap) of
+        (SOME dir, _, SOME mb) => HolbuildMachineMemory.configure {dir = dir, budget_mb = budget_mb, maxheap = mb}
+      | (SOME _, _, NONE) => raise Error "--cooperate-dir requires --max-heap MB, which sizes each child's reservation"
+      | (NONE, SOME _, _) => raise Error "--machine-max-mem requires --cooperate-dir DIR"
+      | (NONE, NONE, _) => ()
   end
 
 fun with_input path f =

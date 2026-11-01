@@ -25,7 +25,9 @@ structure Path = OS.Path
 
 exception Error of string
 
-type settings = {dir : string, budget_mb : int option, maxheap : int option}
+(* budget_mb is checked against DIR/budget at the first admission only, so
+   that a later resize doesn't fail this process. *)
+type settings = {dir : string, budget_mb : int option, maxheap : int}
 
 val settings : settings option ref = ref NONE
 
@@ -104,20 +106,31 @@ fun ensure_dir path =
   else (ensure_dir (Path.dir path); OS.FileSys.mkDir path handle OS.SysErr _ => ())
 
 fun open_lock dir =
-  case open_existing (lock_path dir) of
-      SOME fd => fd
-    | NONE =>
-        (ensure_dir dir;
-         case create_file (lock_path dir) "" of
-             SOME fd => (close fd; open_lock dir)
-           | NONE => open_lock dir)
+  let val path = lock_path dir
+  in
+    case open_existing path of
+        SOME fd => fd
+      | NONE =>
+          (ensure_dir dir;
+           Option.app close (create_file path "");
+           case open_existing path of
+               SOME fd => fd
+             | NONE => raise Error (path ^ " exists but cannot be opened"))
+  end
+
+(* DIR/lock is held only for a scan of DIR, so a minute without it means it
+   is stuck, or this filesystem refuses flock: fail rather than hang. *)
+val coordinator_attempts = 3000
+val coordinator_poll = Time.fromMilliseconds 20
 
 fun with_coordinator dir f =
   let
     val fd = open_lock dir
-    fun wait () = if try_lock fd then () else (OS.Process.sleep (Time.fromMilliseconds 20); wait ())
+    fun wait 0 = raise Error ("could not lock " ^ lock_path dir ^
+                              " for a minute: another process holds it, or the filesystem does not support flock")
+      | wait n = if try_lock fd then () else (OS.Process.sleep coordinator_poll; wait (n - 1))
   in
-    (wait (); f () before close fd) handle e => (close fd; raise e)
+    (wait coordinator_attempts; f () before close fd) handle e => (close fd; raise e)
   end
 
 fun mem_total () =
@@ -217,6 +230,12 @@ fun create_lease dir charge : lease =
           else (close fd; remove_file path; raise Error ("could not lock new lease " ^ path))
   end
 
+(* Closes the parent's copy; never LOCK_UN, which would also unlock the
+   child's inherited copy.  The child's group holds the lock until its last
+   process exits (the parent watcher lingers a few hundred milliseconds), and
+   the next scan removes the file. *)
+fun release ({fd, ...} : lease) = close fd
+
 datatype attempt = Admitted of lease | Wait of {reserved : int, budget : int}
 
 fun mib_text bytes = Int.toString (bytes div mib) ^ " MiB"
@@ -226,13 +245,16 @@ fun retry_delay () =
 
 fun acquire {dir, budget_mb, maxheap} =
   let
-    val charge =
-      case maxheap of
-          SOME mb => mb * mib + child_overhead
-        | NONE => raise Error "--cooperate-dir requires --max-heap MB, which sizes each child's reservation"
+    val charge = maxheap * mib + child_overhead
+    val cleanups = HolbuildProcessGroup.cleanup_count ()
+    fun check_not_stopped () =
+      if HolbuildProcessGroup.cleanup_count () = cleanups then ()
+      else raise Error "build stopped while waiting for machine memory"
     fun try () =
       with_coordinator dir (fn () =>
-        let val budget = current_budget dir budget_mb
+        let
+          val budget = current_budget dir budget_mb
+          val _ = settings := SOME {dir = dir, budget_mb = NONE, maxheap = maxheap}
         in
           if charge > budget then
             raise Error ("a child's reservation of " ^ mib_text charge ^ " (--max-heap plus " ^
@@ -248,9 +270,12 @@ fun acquire {dir, budget_mb, maxheap} =
     fun loop waiting =
       case try () of
           Admitted lease =>
-            (if waiting then HolbuildStatus.set_waiting_for_memory NONE else (); lease)
+            ((check_not_stopped () handle e => (release lease; raise e));
+             if waiting then HolbuildStatus.set_waiting_for_memory NONE else ();
+             lease)
         | Wait {reserved, budget} =>
-            ((if waiting then ()
+            (check_not_stopped ();
+             (if waiting then ()
               else HolbuildStatus.set_waiting_for_memory
                      (SOME ("needs " ^ mib_text charge ^ ", " ^ mib_text reserved ^ " of " ^
                             mib_text budget ^ " reserved in " ^ dir)));
@@ -259,12 +284,6 @@ fun acquire {dir, budget_mb, maxheap} =
   in
     loop false
   end
-
-(* Closes the parent's copy; never LOCK_UN, which would also unlock the
-   child's inherited copy.  The child's group holds the lock until its last
-   process exits (the parent watcher lingers a few hundred milliseconds), and
-   the next scan removes the file. *)
-fun release ({fd, ...} : lease) = close fd
 
 (* Runs launch with a reserved lease descriptor that the child must inherit,
    or with NONE when cooperation is off. *)

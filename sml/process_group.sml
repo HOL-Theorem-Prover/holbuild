@@ -51,7 +51,15 @@ fun kill_group_forcefully ({process, ...} : active_child) =
 
 fun kill_active_child_groups () = List.app kill_group_forcefully (active_child_group_snapshot ())
 
-fun cleanup_active_children () = kill_active_child_groups ()
+(* Counts cleanups, so code waiting to launch a child (for machine memory)
+   can tell that the build stopped while it waited. *)
+val cleanups = ref 0
+
+fun cleanup_count () = with_active_child_lock (fn () => !cleanups)
+
+fun cleanup_active_children () =
+  (with_active_child_lock (fn () => cleanups := !cleanups + 1);
+   kill_active_child_groups ())
 
 fun pid_text pid = LargeInt.toString (SysWord.toLargeInt (Posix.Process.pidToWord pid))
 
@@ -154,7 +162,9 @@ fun launch_shell parent_pid mutation_lease script : child_process =
   end
 
 (* The launch lock is held here, so clearing close-on-exec hands this one
-   descriptor to this one child and to no child another thread launches. *)
+   descriptor to this child and to no child another thread launches through
+   HolbuildSpawn.  A fork that bypasses the launch lock (OS.Process.system)
+   in this window also gets it, and holds the reservation until it exits. *)
 fun with_inherited NONE launch = launch ()
   | with_inherited (SOME fd) launch =
       let
