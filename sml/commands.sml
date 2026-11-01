@@ -772,7 +772,7 @@ fun configure_cooperation dir budget_mb charge_mb maxheap =
             val default = HolbuildMachineMemory.default_charge_mb
             (* The flat default leans on the MemAvailable check; without it a
                child is charged all it may reach, as before that check. *)
-            val default_charge =
+            fun default_charge () =
               if HolbuildMachineMemory.has_mem_available () then
                 Int.min (Option.getOpt (maxheap, default), default)
               else
@@ -782,7 +782,8 @@ fun configure_cooperation dir budget_mb charge_mb maxheap =
                                          "where MemAvailable cannot be read")
           in
             HolbuildMachineMemory.configure
-              {dir = dir, budget_mb = budget_mb, charge_mb = Option.getOpt (charge_mb, default_charge)}
+              {dir = dir, budget_mb = budget_mb,
+               charge_mb = case charge_mb of SOME mb => mb | NONE => default_charge ()}
           end
       | (NONE, SOME _, _) => raise Error "--machine-max-mem requires --cooperate-dir DIR"
       | (NONE, NONE, SOME _) => raise Error "--child-charge requires --cooperate-dir DIR"

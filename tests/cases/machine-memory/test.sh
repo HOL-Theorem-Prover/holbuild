@@ -200,6 +200,12 @@ if (cd "$tmpdir/big" && HOLBUILD_TEST_MEMINFO=$tmpdir/no-meminfo timeout 60 "$HO
   exit 1
 fi
 require_grep 'requires --max-heap MB or --child-charge MB where MemAvailable cannot be read' "$tmpdir/fallback-none.out"
+if (cd "$tmpdir/big" && HOLBUILD_TEST_MEMINFO=$tmpdir/no-meminfo timeout 60 "$HOLBUILD_BIN" \
+      --cooperate-dir "$tmpdir/small" --child-charge 4096 build) > "$tmpdir/fallback-charge.out" 2>&1; then
+  echo "explicit charge larger than the budget succeeded without MemAvailable" >&2
+  exit 1
+fi
+require_grep 'reservation of 4096 MiB .* exceeds the machine budget of 2048 MiB' "$tmpdir/fallback-charge.out"
 
 # With MemTotal 8 GiB, MemAvailable must cover the charge plus 2 GiB, even
 # when the reservations fit, but only while some child holds a reservation:

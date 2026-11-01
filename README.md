@@ -342,7 +342,9 @@ that waits shows as `(waiting for memory)` in the status line, as a
 `waiting for machine memory` line otherwise, and as a `waiting_for_memory`
 event with `--json`. A charge larger than the whole budget fails at once.
 
-This bounds admission; it does not enforce RSS, and it covers neither HOL
+This bounds admission; it does not enforce RSS: children already running can
+still grow together, up to their `--max-heap`, past what the machine has left,
+since nothing re-checks a child once it has started. It covers neither HOL
 toolchain builds nor `check`, `run` or `repl`.
 
 - `DIR/budget` is created on first use from `--machine-max-mem`, or else
