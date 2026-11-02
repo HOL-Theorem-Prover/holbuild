@@ -301,7 +301,9 @@ Common global options:
   `.holconfig.toml`.
 - `--json`: emit newline-delimited JSON where supported.
 - `--quiet`, `--verbose`, `--verbosity LEVEL`: adjust status output.
-- `-j N`, `-jN`, `--jobs N`: build parallelism.
+- `-j N`, `-jN`, `--jobs N`: build parallelism. When holbuild builds a HOL
+  toolchain, it also passes `-j N` to HOL's `bin/build`; without it, `bin/build`
+  uses HOL's own default.
 - `--max-heap MB`: Poly/ML maximum heap size for child HOL processes. Do not
   use `--maxheap`: holbuild is itself a Poly/ML program, and its runtime takes
   `--maxheap MB` as the cap on holbuild's own heap, so the option never reaches
