@@ -122,7 +122,8 @@ fun buildhol_help () = print
   \  holbuild [GLOBAL OPTIONS] buildhol [--trknl]\n\n\
   \Build/reuse the declared HOL tree and print its path. Use --trknl to select\n\
   \the tracing kernel. A configured remote cache restores toolchains and\n\
-  \publishes successful local builds automatically.\n\n\
+  \publishes successful local builds automatically. A global -j N is passed to\n\
+  \HOL's bin/build when the toolchain is built here.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun heap_help () = print
@@ -1768,31 +1769,31 @@ fun reject_holdir holdir =
       SOME _ => raise Error "--holdir is no longer supported; declare dependencies.hol"
     | NONE => ()
 
-fun project_hol_holdir kernel_variant project =
+fun project_hol_holdir kernel_variant jobs project =
   let val resolution = {kernel_variant = kernel_variant}
   in
     (ignore (HolbuildProjectGraph.resolve {project = project, resolution = resolution});
      case HolbuildProject.resolved_hol_dependency_with resolution project of
          SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev}, ...}) =>
-           HolbuildHolSharedCache.ensure_built_with_kernel
+           HolbuildHolSharedCache.ensure_built_with_kernel jobs
              {git = git, rev = rev, kernel_variant = kernel_variant}
        | _ => raise Error "schema 2 project has no dependencies.hol")
   end
 
-fun effective_toolchain_for kernel_variant holdir maxheap =
+fun effective_toolchain_for kernel_variant holdir maxheap jobs =
   let
     val project = load_project ()
     val _ = reject_holdir holdir
   in
-    {holdir = project_hol_holdir kernel_variant project, maxheap = maxheap,
+    {holdir = project_hol_holdir kernel_variant jobs project, maxheap = maxheap,
      kernel_variant = kernel_variant}
   end
 
-fun effective_toolchain holdir maxheap =
-  effective_toolchain_for HolbuildHolToolchainConfig.StandardKernel holdir maxheap
+fun effective_toolchain holdir maxheap jobs =
+  effective_toolchain_for HolbuildHolToolchainConfig.StandardKernel holdir maxheap jobs
 
-fun tracing_toolchain holdir maxheap =
-  effective_toolchain_for HolbuildHolToolchainConfig.TracingKernel holdir maxheap
+fun tracing_toolchain holdir maxheap jobs =
+  effective_toolchain_for HolbuildHolToolchainConfig.TracingKernel holdir maxheap jobs
 
 fun context_toolchain_for kernel_variant holdir maxheap =
   let
@@ -1814,12 +1815,12 @@ fun parse_buildhol_args args =
     | ["--trknl"] => HolbuildHolToolchainConfig.TracingKernel
     | _ => raise Error "usage: holbuild buildhol [--trknl]"
 
-fun buildhol holdir maxheap args =
+fun buildhol holdir maxheap jobs args =
   let
     val kernel_variant = parse_buildhol_args args
     val project = load_project ()
     val _ = reject_holdir holdir
-    val holdir = project_hol_holdir kernel_variant project
+    val holdir = project_hol_holdir kernel_variant jobs project
   in
     print (holdir ^ "\n")
   end
@@ -1843,26 +1844,26 @@ fun dispatch_with_options {holdir, source_dir, cache_dir, remote_cache, jobs, ma
        "gc" :: rest => (reject_json "gc"; gc rest)
      | "cache" :: rest => (reject_json "cache"; HolbuildCache.dispatch rest)
      | "import" :: rest => (reject_json "import"; import_archive rest)
-     | "buildhol" :: rest => buildhol holdir maxheap rest
+     | "buildhol" :: rest => buildhol holdir maxheap jobs rest
      | "goalfrag-plan" :: _ => raise Error "goalfrag-plan has been removed; use execution-plan THEORY:THEOREM"
-     | [] => dispatch (effective_toolchain holdir maxheap) jobs args
+     | [] => dispatch (effective_toolchain holdir maxheap jobs) jobs args
      | "build" :: rest =>
          if List.exists removed_legacy_proof_step_build_arg rest then
            (case List.find removed_legacy_proof_step_build_arg rest of
                 SOME "--goalfrag" => raise Error "--goalfrag has been removed; proof steps are enabled by default"
               | SOME _ => raise Error "--goalfrag-plan has been removed; use execution-plan THEORY:THEOREM"
-              | NONE => dispatch (effective_toolchain holdir maxheap) jobs args)
+              | NONE => dispatch (effective_toolchain holdir maxheap jobs) jobs args)
          else if json andalso List.exists trace_steps_build_arg rest then
            raise Error "--json does not support --trace-steps until structured proof-step trace events exist"
          else if List.exists (fn arg => arg = "--trknl") rest then
-           dispatch (tracing_toolchain holdir maxheap) jobs args
-         else dispatch (effective_toolchain holdir maxheap) jobs args
+           dispatch (tracing_toolchain holdir maxheap jobs) jobs args
+         else dispatch (effective_toolchain holdir maxheap jobs) jobs args
      | "context" :: rest =>
          dispatch (context_toolchain_for (parse_context_args rest) holdir maxheap) jobs args
      | _ =>
          if List.exists (fn arg => arg = "--trknl") args then
-           dispatch (tracing_toolchain holdir maxheap) jobs args
-         else dispatch (effective_toolchain holdir maxheap) jobs args)
+           dispatch (tracing_toolchain holdir maxheap jobs) jobs args
+         else dispatch (effective_toolchain holdir maxheap jobs) jobs args)
 
 fun is_broken_pipe (IO.Io {cause = OS.SysErr (msg, _), ...}) = msg = "Broken pipe"
   | is_broken_pipe _ = false
