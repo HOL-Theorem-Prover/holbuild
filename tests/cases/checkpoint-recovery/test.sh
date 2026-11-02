@@ -76,6 +76,50 @@ val _ = export_theory();
 SML
 }
 
+write_static_error_tactic_source() {
+  cat > "$project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+
+Theorem first:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+
+Theorem second:
+  T
+Proof
+  ACCEPT_TAC no_such_value
+QED
+
+val _ = export_theory();
+SML
+}
+
+write_static_error_declaration_source() {
+  cat > "$project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+
+Theorem first:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+
+val _ = no_such_value;
+
+Theorem second:
+  T
+Proof
+  ACCEPT_TAC first
+QED
+
+val _ = export_theory();
+SML
+}
+
 write_changed_prefix_source() {
   cat > "$project/src/AScript.sml" <<'SML'
 open HolKernel Parse boolLib bossLib;
@@ -392,27 +436,55 @@ fi
 require_file "$project/.holbuild/obj/src/ATheory.dat"
 # checkpoints persist after successful parent-mismatch rebuild for incremental rebuilds
 
-run_expect_suffix_failure "$tmpdir/wrong-valid-context-seed.log"
-wrong_valid_deps=$(first_deps_path)
-wrong_valid_context=$(first_context_path)
-wrong_valid_failed_prefix=$(second_failed_prefix_path)
-rm -f "$wrong_valid_failed_prefix" "$wrong_valid_failed_prefix.ok" "$wrong_valid_failed_prefix.meta" "$wrong_valid_failed_prefix.prefix"
-cp "$wrong_valid_deps" "$wrong_valid_context"
+# An ML static error in the source run after a checkpoint is a source error:
+# the build fails with it at once, without discarding the checkpoint it resumed
+# from or retrying from earlier contexts.
+expect_static_error_failure() {
+  local log=$1 resumed_from=$2
+  if (cd "$project" && "$HOLBUILD_BIN" build ATheory) > "$log" 2>&1; then
+    echo "static error in the source did not fail the build" >&2
+    cat "$log" >&2
+    exit 1
+  fi
+  require_grep "from: $resumed_from" "$log"
+  require_grep "static error:" "$log"
+  require_grep "(no_such_value) has not been declared" "$log"
+  if grep -q "discarding invalid checkpoint" "$log"; then
+    echo "static error in the source was treated as an invalid checkpoint" >&2
+    cat "$log" >&2
+    exit 1
+  fi
+  if [[ $(grep -c "^resuming ATheory" "$log") -ne 1 ]]; then
+    echo "static error in the source was retried from an earlier context" >&2
+    cat "$log" >&2
+    exit 1
+  fi
+}
+
+run_expect_suffix_failure "$tmpdir/static-error-tactic-seed.log"
+static_error_failed_prefix=$(second_failed_prefix_path)
+write_static_error_tactic_source
+expect_static_error_failure "$tmpdir/static-error-tactic.log" "failed-prefix checkpoint in second"
+require_file "$static_error_failed_prefix"
 write_good_source
 force_rebuild
-wrong_valid_log=$tmpdir/wrong-valid-context.log
-if ! (cd "$project" && "$HOLBUILD_BIN" build ATheory) > "$wrong_valid_log" 2>&1; then
-  cat "$wrong_valid_log" >&2
-  exit 1
-fi
-require_grep "from: theorem-context checkpoint after first" "$wrong_valid_log"
-require_grep "discarding invalid checkpoint after HOL state load failure" "$wrong_valid_log"
-if grep -q "Couldn't load HOL base-state\|Unable to load header\|Structure (HolbuildRuntime) has not been declared" "$wrong_valid_log"; then
-  echo "valid but wrong theorem-context checkpoint leaked as a build failure" >&2
-  exit 1
-fi
+static_error_tactic_fixed_log=$tmpdir/static-error-tactic-fixed.log
+(cd "$project" && "$HOLBUILD_BIN" build ATheory) > "$static_error_tactic_fixed_log" 2>&1
+require_grep "from: failed-prefix checkpoint in second" "$static_error_tactic_fixed_log"
 require_file "$project/.holbuild/obj/src/ATheory.dat"
-# checkpoints persist after successful wrong-valid-context rebuild for incremental rebuilds
+
+run_expect_suffix_failure "$tmpdir/static-error-declaration-seed.log"
+static_error_context=$(first_context_path)
+write_static_error_declaration_source
+expect_static_error_failure "$tmpdir/static-error-declaration.log" "theorem-context checkpoint after first"
+require_file "$static_error_context"
+require_file "$(first_deps_path)"
+write_good_source
+force_rebuild
+static_error_declaration_fixed_log=$tmpdir/static-error-declaration-fixed.log
+(cd "$project" && "$HOLBUILD_BIN" build ATheory) > "$static_error_declaration_fixed_log" 2>&1
+require_grep "from: failed-prefix checkpoint in second" "$static_error_declaration_fixed_log"
+require_file "$project/.holbuild/obj/src/ATheory.dat"
 
 run_expect_suffix_failure "$tmpdir/corrupt-seed.log"
 corrupt_context=$(first_context_path)

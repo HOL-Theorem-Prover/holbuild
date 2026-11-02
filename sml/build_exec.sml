@@ -1468,18 +1468,17 @@ fun selected_hol_state_missing_failure text =
 fun holbuild_runtime_missing_failure text =
   Option.isSome (find_substring "Structure (HolbuildRuntime) has not been declared" text)
 
-fun hol_static_error_failure text =
-  Option.isSome (find_substring "Static Errors" text)
-
 (* Defensive recovery for already-invalid checkpoint artifacts. Holbuild should
    preserve parent/child heap families atomically; this path is not a substitute
    for that invariant. It keeps old/manual/interrupted artifacts from surfacing
    as source proof failures.  A stale/manual checkpoint can load as a valid
    PolyML heap while still missing holbuild's runtime prelude; retry that case
-   from a fresh dependency context too. *)
+   from a fresh dependency context too.  Other ML static errors are not retried:
+   they come from the source run after the checkpoint, and retrying from earlier
+   contexts repeats them after discarding valid checkpoints. *)
 fun invalid_checkpoint_retryable base_context run_context msg =
   (hol_state_load_failure msg orelse selected_hol_state_missing_failure msg orelse
-   holbuild_runtime_missing_failure msg orelse hol_static_error_failure msg) andalso
+   holbuild_runtime_missing_failure msg) andalso
   hol_context_path run_context <> hol_context_path base_context
 
 fun theorem_context_or_end_path path
@@ -3029,34 +3028,14 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
           raise RetryInvalidCheckpoint
         else
           let
-            val failure_output = checkpoint_failure_output project node input_key stage
-            val failure_output_path = captured_output_path_option failure_output
-            val static_error =
-              Option.mapPartial
-                (fn path => HolbuildTheoryDiagnostics.static_error_summary
-                              (source_file node) source_text
-                              (String.fields (fn c => c = #"\n") (read_text path)))
-                failure_output_path
+            val failure_error =
+              if file_exists timeout_marker then tactic_timeout_error ()
+              else if null theorem_checkpoints andalso null termination_diagnostics then Error msg
+              else checkpoint_failure_error msg
+            val _ = run_failure_repl tc policy theorem_checkpoints (#failure_checkpoints run_spec) deps_loaded stage
+            val _ = cleanup_json_stage stage_root
           in
-            if Option.isSome static_error andalso hol_context_path (#context run_spec) <> hol_context_path base_context then
-              let
-                val invalid = hol_context_path (#context run_spec)
-                val _ = discard_loaded_checkpoint_after_load_failure ()
-                val _ = warn ("discarding invalid checkpoint after HOL state load failure: " ^ invalid)
-              in
-                raise RetryInvalidCheckpoint
-              end
-            else
-              let
-                val failure_error =
-                  if file_exists timeout_marker then tactic_timeout_error ()
-                  else if null theorem_checkpoints andalso null termination_diagnostics then Error msg
-                  else checkpoint_failure_error msg
-                val _ = run_failure_repl tc policy theorem_checkpoints (#failure_checkpoints run_spec) deps_loaded stage
-                val _ = cleanup_json_stage stage_root
-              in
-                raise failure_error
-              end
+            raise failure_error
           end
     val _ =
       if execution_plan_only policy andalso file_exists plan_only_marker then
