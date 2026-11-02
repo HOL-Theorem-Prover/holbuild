@@ -158,7 +158,7 @@ A built HOL checkout is expected to contain `bin/hol`, `bin/build`, and
 shared cache entry is dirty or incomplete, holbuild refuses to use it until the
 user removes it manually. The cache key includes the HOL revision, the Poly/ML
 runtime (release and architecture variant), the resolved `poly` executable
-path, build arguments, and cache format version.
+path, build arguments other than `-j`, and cache format version.
 
 ## Main binary and project-HOL helper direction
 
