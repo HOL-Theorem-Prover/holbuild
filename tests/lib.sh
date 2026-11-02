@@ -135,7 +135,7 @@ EOF
   cat > "$hol/bin/build" <<'SH'
 #!/usr/bin/env sh
 set -eu
-printf 'build\n' >> "${HOLBUILD_TEST_BUILD_COUNT:?}"
+printf 'build %s\n' "$*" >> "${HOLBUILD_TEST_BUILD_COUNT:?}"
 if [ "${HOLBUILD_TEST_FAIL_LOCAL_BUILD:-}" = 1 ]; then
   exit 71
 fi
