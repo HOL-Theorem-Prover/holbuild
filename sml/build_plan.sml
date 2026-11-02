@@ -849,8 +849,8 @@ fun plan_selection components holdir sources selection =
     val provider = HolbuildComponentProvider.provider components
     val resolution_context_id =
       HolbuildComponentProvider.resolution_context_id components
-    val _ = if holdir = "" then HolbuildDependencies.clear_analyser_path ()
-            else HolbuildDependencies.set_analyser_path (HolbuildHolSharedCache.analyser_path_for_holdir holdir)
+    val _ = if holdir = "" then HolbuildDependencies.clear_analyser ()
+            else HolbuildDependencies.set_analyser (HolbuildHolSharedCache.analyser_for_holdir holdir)
     val external_dirs = [normalize_path (Path.concat(holdir, "sigobj"))]
     val analysis = HolbuildComponentProvider.new_analysis_state components
     val nodes = map (make_node external_dirs) sources

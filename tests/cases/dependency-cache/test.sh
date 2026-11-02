@@ -86,7 +86,7 @@ require_grep "mention=listTheory" "$cache_file"
 printf 'not a valid dependency cache\n' > "$cache_file"
 (cd "$project" && "$HOLBUILD_BIN" build --dry-run ATheory) > "$tmpdir/corrupt.log"
 require_grep "external theories: .*listTheory" "$tmpdir/corrupt.log"
-require_grep "holbuild-dependencies-cache-v3" "$cache_file"
+require_grep "holbuild-dependencies-cache-v4" "$cache_file"
 
 # A library's X.sig and X.sml both build X.ui, so their analyses need separate
 # cache files; sharing one made every run re-analyse both.

@@ -14,13 +14,21 @@ type t =
     extra_outputs : string list,
     holdep_mentions : string list }
 
-val cache_version = "holbuild-dependencies-cache-v3"
+val cache_version = "holbuild-dependencies-cache-v4"
 val extractor_version = "holbuild-hol-analyser-deps-v3"
-val analyser_path : string option ref = ref NONE
+(* identity names what the analyser's answers depend on; see
+   HolbuildHolSharedCache.analyser_identity_for_holdir. *)
+val analyser : {path : string, identity : string} option ref = ref NONE
 
-fun set_analyser_path path = analyser_path := SOME path
-fun clear_analyser_path () = analyser_path := NONE
-fun current_analyser_path () = !analyser_path
+fun set_analyser a = analyser := SOME a
+fun clear_analyser () = analyser := NONE
+fun current_analyser_path () = Option.map #path (!analyser)
+
+(* Without a HOL toolchain the textual extractor answers instead. *)
+fun analyser_identity () =
+  case !analyser of
+      SOME {identity, ...} => identity
+    | NONE => "textual"
 
 (* Workaround for a released Poly/ML, to drop once the toolchain's Poly/ML has
    the heap-sizing and segmentation rework of Poly/ML master (49ae4e76 and
@@ -336,7 +344,7 @@ fun extract_with_analyser analyser source_path =
     | NONE => raise Error ("holbuild-hol-analyser returned no result for " ^ source_path)
 
 fun extract_uncached path =
-  case !analyser_path of
+  case current_analyser_path () of
       SOME analyser => extract_with_analyser analyser path
     | NONE => extract_textual path
 
@@ -352,9 +360,10 @@ fun read_cache cache_path source_hash =
     val lines = String.tokens (fn c => c = #"\n") text
   in
     case lines of
-        version :: extractor :: hash_line :: rest =>
+        version :: extractor :: analyser_line :: hash_line :: rest =>
           if version = cache_version andalso
              extractor = "extractor=" ^ extractor_version andalso
+             analyser_line = "analyser=" ^ analyser_identity () andalso
              hash_line = "source_sha1=" ^ source_hash then
             SOME {loads = values "load=" rest,
                   uses = values "use=" rest,
@@ -377,6 +386,7 @@ fun cache_text source_hash ({loads, uses, extra_deps, extra_outputs, holdep_ment
   String.concatWith "\n"
     ([cache_version,
       "extractor=" ^ extractor_version,
+      "analyser=" ^ analyser_identity (),
       "source_sha1=" ^ source_hash] @
      map (fn value => "load=" ^ value) loads @
      map (fn value => "use=" ^ value) uses @
@@ -423,7 +433,7 @@ fun prefetch_cached_with_hash requests =
         | NONE => (cached, (id, req) :: missing)
     val (cached, missing) = List.foldl cached_or_missing ([], []) (enumerate 1 requests)
     val analysed =
-      case (!analyser_path, missing) of
+      case (current_analyser_path (), missing) of
           (_, []) => []
         | (NONE, _) => []
         | (SOME analyser, _) =>
