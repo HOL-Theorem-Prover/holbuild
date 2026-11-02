@@ -301,7 +301,9 @@ Common global options:
   `.holconfig.toml`.
 - `--json`: emit newline-delimited JSON where supported.
 - `--quiet`, `--verbose`, `--verbosity LEVEL`: adjust status output.
-- `-j N`, `-jN`, `--jobs N`: build parallelism.
+- `-j N`, `-jN`, `--jobs N`: build parallelism. When holbuild builds a HOL
+  toolchain, it also passes `-j N` to HOL's `bin/build`; without it, `bin/build`
+  uses HOL's own default.
 - `--max-heap MB`: Poly/ML maximum heap size for child HOL processes. Do not
   use `--maxheap`: holbuild is itself a Poly/ML program, and its runtime takes
   `--maxheap MB` as the cap on holbuild's own heap, so the option never reaches
@@ -777,10 +779,10 @@ fetched when the theory is reached, as before. `HOLBUILD_CACHE_TRACE=1` shows
 the prefetch thread count as `remote cache prefetch threads: <n>` and each
 prefetched entry as `remote cache prefetched: <key>`.
 A missing HOL toolchain is restored from the same remote cache when its HOL
-commit, build arguments, installation path (with symlinks resolved, as HOL's
-build records it), platform, C library, Poly/ML runtime (release and
-architecture variant, as `poly -v` reports them) and resolved `poly`
-executable path match. The source-analysis helper is not archived; holbuild
+commit, build arguments other than `-j`, installation path (with symlinks
+resolved, as HOL's build records it), platform, C library, Poly/ML runtime
+(release and architecture variant, as `poly -v` reports them) and resolved
+`poly` executable path match. The source-analysis helper is not archived; holbuild
 rebuilds it against the restored toolchain. After a remote miss, a successful
 local toolchain build is published automatically unless another builder
 published it meanwhile; an archive that is missing its blob or fails to extract
