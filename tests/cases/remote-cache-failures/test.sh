@@ -79,6 +79,20 @@ chmod +x "$tmpdir/no-curl/curl"
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/server" "$tmpdir/control"
 trap 'kill "$server_pid" 2>/dev/null || true; cleanup_temp_dir "$tmpdir"' EXIT
 
+# A publish that never reached the cache is a failed write, not a conflict
+# with a different value already there.
+require_publish_failure() {
+  local log=$1
+  local detail=$2
+  require_grep 'warning: could not publish remote cache entry .*destination cache blob publish failed' "$log"
+  require_grep "$detail" "$log"
+  if grep -q 'conflict' "$log"; then
+    echo "remote cache publish failure reported as a conflict" >&2
+    cat "$log" >&2
+    exit 1
+  fi
+}
+
 build_with_failure() {
   local client=$1
   local failure=$2
@@ -117,7 +131,7 @@ build_with_failure() {
       cat "$log" >&2
       exit 1
     fi
-    [[ "$failure" != transport ]] || require_grep 'Failed to connect to 127.0.0.1 port 1' "$log"
+    [[ "$failure" != transport ]] || require_publish_failure "$log" 'Failed to connect to 127.0.0.1 port 1'
   fi
   require_grep 'ATheory built' "$log"
   require_grep 'BTheory built' "$log"
@@ -141,3 +155,25 @@ done
 archive=$tmpdir/cache.hbx
 (cd "$project" && TMPDIR="$tmpdir/tmp" "$HOLBUILD_BIN" export -o "$archive" ATheory) > "$tmpdir/export.log" 2>&1
 TMPDIR="$tmpdir/tmp" HOLBUILD_CACHE="$tmpdir/import-cache" "$HOLBUILD_BIN" import "$archive" > "$tmpdir/import.log" 2>&1
+
+# The cache answers reads but rejects every upload with 502.  DTheory is
+# not in the remote cache yet, so the build has to publish it.
+cat > "$project/src/DScript.sml" <<SML
+Theory D
+Ancestors bool
+Theorem truth:
+  T
+Proof
+  simp[]
+QED
+SML
+use_case_cache "$tmpdir/cache-put-502"
+rm -rf "$project/.holbuild"
+rm -f "$tmpdir/control/get-status"
+printf '502\n' > "$tmpdir/control/put-status"
+put_log=$tmpdir/put-502.log
+(cd "$project" && env -u HOLBUILD_REMOTE_CACHE_CURL_CONFIG TMPDIR="$tmpdir/tmp" \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" build DTheory) > "$put_log" 2>&1
+rm -f "$tmpdir/control/put-status"
+require_grep 'DTheory built' "$put_log"
+require_publish_failure "$put_log" 'HTTP 502 from'

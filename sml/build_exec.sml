@@ -1663,6 +1663,7 @@ fun cache_blob root path =
         HolbuildCacheBackend.Published => hash
       | HolbuildCacheBackend.AlreadyPresent => hash
       | HolbuildCacheBackend.Conflict detail => raise Error ("could not publish cache blob " ^ hash ^ ": " ^ detail)
+      | HolbuildCacheBackend.Failed detail => raise Error ("could not publish cache blob " ^ hash ^ ": " ^ detail)
       | HolbuildCacheBackend.Skipped => hash
   end
 
@@ -1822,6 +1823,7 @@ fun put_remote_theory_action remote _ (request as {key, text}) =
   let
     val incoming = cache_manifest_contract key text
     fun conflict detail = HolbuildCacheBackend.Conflict ("remote theory action " ^ key ^ ": " ^ detail)
+    fun failed detail = HolbuildCacheBackend.Failed ("remote theory action " ^ key ^ ": " ^ detail)
     fun compatible_contract resident_text =
       let val resident = cache_manifest_contract key resident_text
       in
@@ -1830,27 +1832,29 @@ fun put_remote_theory_action remote _ (request as {key, text}) =
       end
     fun attempt attempts =
       let
-        fun retry detail =
-          if attempts > 1 then attempt (attempts - 1) else conflict detail
+        fun retry last_result =
+          if attempts > 1 then attempt (attempts - 1) else last_result
         fun verify result =
           case HolbuildRemoteCache.get_action remote key of
-              NONE => retry "action missing after publication"
+              NONE => retry (conflict "action missing after publication")
             | SOME observed_text =>
                 let val observed = compatible_contract observed_text
                 in
                   if timeout_at_least_as_strong (#proof_timeout observed) (#proof_timeout incoming) then result
-                  else retry "weaker proof-timeout observed after publication"
+                  else retry (conflict "weaker proof-timeout observed after publication")
                 end
         fun publish_missing () =
           case HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsentOrSame request of
               result as HolbuildCacheBackend.Published => verify result
             | result as HolbuildCacheBackend.AlreadyPresent => verify result
-            | HolbuildCacheBackend.Conflict detail => retry detail
+            | HolbuildCacheBackend.Conflict detail => retry (conflict detail)
+            | HolbuildCacheBackend.Failed detail => retry (failed detail)
             | HolbuildCacheBackend.Skipped => HolbuildCacheBackend.Skipped
         fun replace_weaker () =
           case HolbuildRemoteCache.replace_action_unconditionally remote request of
               result as HolbuildCacheBackend.Published => verify result
-            | HolbuildCacheBackend.Conflict detail => retry detail
+            | HolbuildCacheBackend.Conflict detail => retry (conflict detail)
+            | HolbuildCacheBackend.Failed detail => retry (failed detail)
             | result as HolbuildCacheBackend.AlreadyPresent => verify result
             | HolbuildCacheBackend.Skipped => HolbuildCacheBackend.Skipped
       in

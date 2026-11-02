@@ -221,12 +221,12 @@ fun curl_put_with_headers_timeout timeout_seconds headers (request as {url, src}
   in
     case traced "PUT" url src (fn () => put_status timeout_seconds headers request) of
         HolbuildHttp.Failed message =>
-          HolbuildCacheBackend.Conflict ("PUT " ^ display_url ^ " failed: " ^ message)
+          HolbuildCacheBackend.Failed ("PUT " ^ display_url ^ " failed: " ^ message)
       | HolbuildHttp.Response code =>
           if successful_put_code code then HolbuildCacheBackend.Published
-          else HolbuildCacheBackend.Conflict ("HTTP " ^ Int.toString code ^ " from " ^ display_url)
+          else HolbuildCacheBackend.Failed ("HTTP " ^ Int.toString code ^ " from " ^ display_url)
   end
-  handle e => (HolbuildCacheBackend.Conflict (General.exnMessage e))
+  handle e => (HolbuildCacheBackend.Failed (General.exnMessage e))
 
 fun curl_put_with_headers headers request =
   curl_put_with_headers_timeout curl_max_time_seconds headers request
@@ -245,7 +245,7 @@ fun curl_put_zstd_with_timeout timeout_seconds {url, src, size} =
         (curl_put_with_headers_timeout timeout_seconds [] {url = url, src = src})
         compressed
   end
-  handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
+  handle e => HolbuildCacheBackend.Failed (General.exnMessage e)
 
 fun curl_put_zstd request =
   curl_put_zstd_with_timeout curl_max_time_seconds request
@@ -381,7 +381,7 @@ fun publish_action_metadata cache key metadata =
 
 fun publish_action cache {key, text} =
   publish_action_metadata cache key (action_metadata cache key text)
-  handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
+  handle e => HolbuildCacheBackend.Failed (General.exnMessage e)
 
 (* The HTTP write is unconditional.  Callers must authorize replacement from
    action-kind-specific semantics before using this operation. *)
@@ -401,7 +401,7 @@ fun put_action cache policy {key, text} =
                  else HolbuildCacheBackend.Conflict url)
       | NONE => publish_action_metadata cache key metadata
   end
-  handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
+  handle e => HolbuildCacheBackend.Failed (General.exnMessage e)
 
 fun has_blob cache sha1 = Option.isSome (lookup_blob cache sha1)
 
@@ -454,7 +454,7 @@ fun publish_blob_with_timeout timeout_seconds cache {hash, src} =
       | HolbuildCacheBackend.AlreadyPresent => (remember_blob cache {sha1 = hash, sha256 = sha256, size = size}; result)
       | other => other
   end
-  handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
+  handle e => HolbuildCacheBackend.Failed (General.exnMessage e)
 
 fun publish_blob cache request =
   publish_blob_with_timeout curl_max_time_seconds cache request
