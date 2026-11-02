@@ -105,6 +105,7 @@ fun publish_blob_or_raise (destination : destination) hash path =
     | HolbuildCacheBackend.AlreadyPresent => (0, 1)
     | HolbuildCacheBackend.Skipped => (0, 0)
     | HolbuildCacheBackend.Conflict detail => raise Error ("destination cache blob conflict: " ^ hash ^ " (" ^ detail ^ ")")
+    | HolbuildCacheBackend.Failed detail => raise Error ("destination cache blob publish failed: " ^ hash ^ " (" ^ detail ^ ")")
 
 fun copy_blob source destination tmp_dir hash (uploaded, reused) =
   let
@@ -124,6 +125,7 @@ fun put_action_or_raise (destination : destination) key text =
     | result as HolbuildCacheBackend.AlreadyPresent => result
     | result as HolbuildCacheBackend.Skipped => result
     | HolbuildCacheBackend.Conflict detail => raise Error ("destination cache action conflict: " ^ key ^ " (" ^ detail ^ ")")
+    | HolbuildCacheBackend.Failed detail => raise Error ("destination cache action publish failed: " ^ key ^ " (" ^ detail ^ ")")
 
 fun copy_entry {source, destination, tmp_dir} key =
   let
