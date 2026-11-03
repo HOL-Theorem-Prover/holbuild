@@ -731,8 +731,9 @@ Holdep finds, as for build sources), takes the one with the most ancestors
 (when one has all the others as ancestors, that one), and starts from it as
 `--from` would. Its line names the theory and says it was inferred. Scripts
 that use no root-package theory, and a `repl` without scripts, start from
-`[run].heap` or the HOL base state as before. An explicit `--from` overrides
-the inferred theory.
+`[run].heap` or the HOL base state as before; so do scripts whose analysis
+fails, with a line saying why. An explicit `--from` overrides the inferred
+theory.
 
 ## Proof steps and checkpoints
 

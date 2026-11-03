@@ -1853,24 +1853,20 @@ fun run_start tc project run_heap from : run_start =
         NoFrom => fallback_start
       | FromTheory theory => start ("--from " ^ theory) theory
       | FromScripts scripts =>
-          let
-            (* Nobody asked for a theory, so a script or project the analysis
-               cannot handle starts HOL as it would without inference. *)
-            fun cannot_infer msg =
-              (HolbuildStatus.message_stderr
-                 ("holbuild: could not infer --from from the scripts' dependencies: " ^ msg ^
-                  "; starting from " ^ fallback_name ^ "\n");
-               NONE)
-            val inferred =
-              infer_from_theory tc project scripts
-              handle HolbuildDependencies.Error msg => cannot_infer msg
-                   | HolbuildSourceIndex.Error msg => cannot_infer msg
-                   | HolbuildBuildPlan.Error msg => cannot_infer msg
-          in
-            case inferred of
-                NONE => fallback_start
-              | SOME theory => start ("--from " ^ theory ^ " (inferred from the scripts' dependencies)") theory
-          end
+          (* Nobody asked for a theory, so a script or project the analysis or
+             checkpoint lookup cannot handle starts HOL as it would without
+             inference. *)
+          (case infer_from_theory tc project scripts of
+               NONE => fallback_start
+             | SOME theory => start ("--from " ^ theory ^ " (inferred from the scripts' dependencies)") theory)
+          handle exn =>
+            case build_iteration_error_message exn of
+                SOME msg =>
+                  (HolbuildStatus.message_stderr
+                     ("holbuild: could not infer --from from the scripts' dependencies: " ^ msg ^
+                      "; starting from " ^ fallback_name ^ "\n");
+                   fallback_start)
+              | NONE => raise exn
   end
 
 fun hol_run_argv tc holstate subcommand context user_args =
