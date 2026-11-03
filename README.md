@@ -311,6 +311,11 @@ Common global options:
   holbuild and child HOL processes run uncapped. holbuild rejects `--maxheap`
   where it can detect it (Linux), so there it cannot be used to cap holbuild's
   own heap either.
+- `--gc-threads N`: number of Poly/ML garbage-collection threads for child HOL
+  processes. Without it, theory builds use 1, as Holmake does, and `run`,
+  `repl`, `check` and heap exports use Poly/ML's default, one per core. Do not
+  use `--gcthreads`: like `--maxheap`, holbuild's own runtime takes it, and
+  holbuild rejects it where it can detect it.
 - `--cooperate-dir DIR` (or `HOLBUILD_COOPERATE_DIR`): share a machine memory
   budget with every holbuild process using `DIR`. See below.
 - `--machine-max-mem MB`: the budget to record in `DIR/budget` when that file

@@ -8,7 +8,8 @@ datatype kernel_variant = datatype HolbuildHolToolchainConfig.kernel_variant
 val kernel_variant_name = HolbuildHolToolchainConfig.kernel_variant_name
 val kernel_variant_tracing = HolbuildHolToolchainConfig.kernel_variant_tracing
 
-type t = {holdir : string, maxheap : int option, kernel_variant : kernel_variant}
+type t = {holdir : string, maxheap : int option, gcthreads : int option,
+          kernel_variant : kernel_variant}
 
 exception Error of string
 
@@ -19,18 +20,25 @@ fun hol tc = executable tc ["bin", "hol"]
 fun holmake tc = executable tc ["bin", "Holmake"]
 fun base_state tc = executable tc ["bin", "hol.state"]
 
-fun poly_runtime_args ({maxheap, ...} : t) =
+fun gcthreads_args gcthreads =
+  case gcthreads of
+      NONE => []
+    | SOME n => ["--gcthreads=" ^ Int.toString n]
+
+fun maxheap_args ({maxheap, ...} : t) =
   case maxheap of
       NONE => []
     | SOME n => ["--maxheap", Int.toString n]
 
-fun hol_subcommand_argv tc subcommand =
-  hol tc :: poly_runtime_args tc @ [subcommand]
+fun hol_subcommand_argv (tc : t) subcommand =
+  hol tc :: gcthreads_args (#gcthreads tc) @ maxheap_args tc @ [subcommand]
 
 (* Holmake deliberately confines Poly/ML to one GC thread while playing theory
-   scripts.  Keep that build policy separate from interactive run/repl use. *)
-fun theory_run_argv tc =
-  hol tc :: "--gcthreads=1" :: poly_runtime_args tc @ ["run"]
+   scripts, so theory builds use one unless --gcthreads says otherwise;
+   interactive run/repl keep Poly/ML's default. *)
+fun theory_run_argv (tc : t) =
+  hol tc :: gcthreads_args (SOME (Option.getOpt (#gcthreads tc, 1))) @
+  maxheap_args tc @ ["run"]
 
 fun quote s =
   "'" ^ String.translate (fn #"'" => "'\\''" | c => str c) s ^ "'"

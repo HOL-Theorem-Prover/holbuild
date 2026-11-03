@@ -71,6 +71,7 @@ holbuild --json build --retain-debug-artifacts FooTheory  # also retain/report f
 - `--source-dir PATH` — source tree for manifest discovery; `.holbuild/` artifacts are written under the shell cwd
 - `--cache-dir PATH` — override the global cache directory for this command
 - `--max-heap MB` — pass Poly/ML max heap to child HOL processes (not `--maxheap`, which holbuild's own Poly/ML runtime consumes)
+- `--gc-threads N` — Poly/ML GC threads for child HOL processes (default: 1 for theory builds, Poly/ML's default, one per core, for `run`/`repl`/`check`; not `--gcthreads`, which holbuild's own Poly/ML runtime consumes)
 - `--cooperate-dir DIR` / `--machine-max-mem MB` / `--child-charge MB` — share a machine memory budget (`DIR/budget`) with other holbuild processes; each child reserves `--child-charge` (default `--max-heap`, at most 3072, or 3072 without `--max-heap`) and, while others hold reservations, starts only while `MemAvailable` also covers the charge plus a margin of a quarter of `MemTotal`, at most 30 GiB, or less when the budget is set above its default (see README)
 - `-jN` / `--jobs N` — parallel workers. Default: `.holconfig.toml [build].jobs` or `max(1, nproc/2)`
 - `--prefetch-concurrency N` — remote cache entries copied ahead of the build at once (default twice `-j`)
