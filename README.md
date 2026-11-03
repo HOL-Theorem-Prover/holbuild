@@ -330,12 +330,15 @@ Common global options:
 machine (several users, CI jobs, containers with a shared bind mount) can share
 a memory budget instead: with `--cooperate-dir DIR`, every theory, generator and
 heap-export child reserves `--child-charge`, and starts only while the
-reservations of all processes using `DIR` fit the byte count in `DIR/budget`,
-and `MemAvailable` covers the charge plus a quarter of `MemTotal` (at least
-1 GiB), whatever the budget. Children admitted in the last 30 seconds, which
-have not allocated yet, count against `MemAvailable` by their charge. The
-charge is an expected size, not a ceiling: `--max-heap` caps each child, and
-the `MemAvailable` check holds new children back when running ones, or
+reservations of all processes using `DIR` fit the budget, and `MemAvailable`
+covers the charge plus a margin kept free. The reserve is a quarter of
+`MemTotal`, at least 1 GiB and at most 30 GiB; the default budget is
+`MemTotal` less the reserve, and the margin is the reserve, or what the budget
+leaves out of `MemTotal` if that is less (at least 1 GiB), so a budget set
+above the default can be used. Children admitted in the last 30 seconds,
+which have not allocated yet, count against `MemAvailable` by their charge.
+The charge is an expected size, not a ceiling: `--max-heap` caps each child,
+and the `MemAvailable` check holds new children back when running ones, or
 anything else on the machine, grow. While no reservation is held in `DIR`, a
 child that fits the budget starts whatever `MemAvailable` says, so a build
 never waits on memory none of its children use. Where `/proc/meminfo` has no
@@ -352,11 +355,15 @@ still grow together, up to their `--max-heap`, past what the machine has left,
 since nothing re-checks a child once it has started. It covers neither HOL
 toolchain builds nor `check`, `run` or `repl`.
 
-- `DIR/budget` is created on first use from `--machine-max-mem`, or else
-  `MemTotal` less a quarter (at least 1 GiB). To resize, replace it while
+- The budget is the byte count in `DIR/budget`, which `--machine-max-mem`
+  creates on first use. Without that file, it is the default, recomputed from
+  `MemTotal` at each admission. To set or resize it, write the file while
   holding `DIR/lock`:
   `flock DIR/lock sh -c 'echo BYTES > DIR/budget.new && mv DIR/budget.new DIR/budget'`.
-  Running children keep their reservations; new ones use the new value.
+  Running children keep their reservations; new ones use the new value. To
+  return to the default, remove it: `flock DIR/lock rm DIR/budget`. A
+  `DIR/budget` that an older holbuild wrote with its default counts as set
+  this way, since nothing tells the two apart.
 - Each running child has a file `DIR/lease-*` holding its byte charge,
   `flock`ed by holbuild and inherited by the child, so a killed holbuild's
   reservation ends with its children, with no timeout. A lease nobody holds no
