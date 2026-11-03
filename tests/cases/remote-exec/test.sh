@@ -216,3 +216,34 @@ run id-missing 1 build --remote-exec "$coordinator" --attach --remote-only BTheo
 require_grep "attach requires BATCH-ID" "$tmpdir/id-missing.log"
 run trace 1 build --remote-exec "$coordinator" --trace-steps BTheory
 require_grep "does not support .*--trace-steps" "$tmpdir/trace.log"
+
+# With --remote-only, a HOL toolchain that no cache holds is an error rather
+# than a local HOL build.
+fake_hol=$tmpdir/fake-hol
+write_fake_hol "$fake_hol"
+fake_rev=$(init_git_repo "$fake_hol")
+mkdir -p "$tmpdir/fake-project"
+cat > "$tmpdir/fake-project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[project]
+name = "rx-fake"
+
+[dependencies.hol]
+git = "$fake_hol"
+rev = "$fake_rev"
+TOML
+: > "$tmpdir/fake-build-count"
+set +e
+(cd "$tmpdir/fake-project" &&
+  HOLBUILD_CACHE=$tmpdir/fake-cache HOLBUILD_CANONICAL_HOL_GIT=$fake_hol \
+  HOLBUILD_TEST_BUILD_COUNT=$tmpdir/fake-build-count \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only) \
+  > "$tmpdir/toolchain-only.log" 2>&1
+status=$?
+set -e
+[[ $status -eq 1 ]] || { echo "toolchain-only exited $status, wanted 1" >&2; cat "$tmpdir/toolchain-only.log" >&2; exit 1; }
+require_grep "HOL toolchain is in neither the local nor the remote cache, and --remote-only builds nothing locally" "$tmpdir/toolchain-only.log"
+[[ ! -s "$tmpdir/fake-build-count" ]] || { cat "$tmpdir/fake-build-count" >&2; exit 1; }

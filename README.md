@@ -1087,8 +1087,8 @@ in a curl config file named by `HOLBUILD_REMOTE_EXEC_CURL_CONFIG`, such as
 The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the
 batch, or the batch fails, it warns and builds locally. With `--remote-only`
-it fails instead, and it never runs a theory locally: a theory that doesn't
-restore from the remote cache after the batch is an error. With nothing to
+it fails instead, and it never builds HOL or a theory locally: a HOL
+toolchain or a theory that doesn't restore from a cache is an error. With nothing to
 build remotely it goes straight to the local build.
 
 `--detach` submits the batch, prints its id (`holbuild: remote batch <id>`)

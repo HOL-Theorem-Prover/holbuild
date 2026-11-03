@@ -2099,6 +2099,7 @@ fun dispatch_with_options {holdir, source_dir, cache_dir, remote_cache, jobs, ma
      | "goalfrag-plan" :: _ => raise Error "goalfrag-plan has been removed; use execution-plan THEORY:THEOREM"
      | [] => dispatch (effective_toolchain holdir maxheap gcthreads jobs) jobs args
      | "build" :: rest =>
+         (HolbuildHolSharedCache.restore_only := List.exists (fn arg => arg = "--remote-only") rest;
          if List.exists removed_legacy_proof_step_build_arg rest then
            (case List.find removed_legacy_proof_step_build_arg rest of
                 SOME "--goalfrag" => raise Error "--goalfrag has been removed; proof steps are enabled by default"
@@ -2108,7 +2109,7 @@ fun dispatch_with_options {holdir, source_dir, cache_dir, remote_cache, jobs, ma
            raise Error "--json does not support --trace-steps until structured proof-step trace events exist"
          else if List.exists (fn arg => arg = "--trknl") rest then
            dispatch (tracing_toolchain holdir maxheap gcthreads jobs) jobs args
-         else dispatch (effective_toolchain holdir maxheap gcthreads jobs) jobs args
+         else dispatch (effective_toolchain holdir maxheap gcthreads jobs) jobs args)
      | "context" :: rest =>
          dispatch (context_toolchain_for (parse_context_args rest) holdir maxheap gcthreads) jobs args
      | _ =>
