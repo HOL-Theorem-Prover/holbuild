@@ -1199,7 +1199,7 @@ fun gb_decimal_text bytes =
     IntInf.toString whole ^ "." ^ IntInf.toString frac
   end
 
-(* Oldest first; stable, so families with equal times keep their order. *)
+(* Oldest first. *)
 fun sort_by_mtime_ascending (mtime_of : 'a -> Time.time) families =
   let
     fun split xs =
@@ -5477,6 +5477,22 @@ fun verify_action_spec (spec : action_spec) =
     fun check ok msg = if ok then () else reject_spec msg
     fun escapes path = Path.isAbsolute path orelse path = ".." orelse String.isPrefix "../" path orelse
                        String.isSubstring "/../" path
+    (* The extra inputs are the files the action text names with their
+       hashes: a manifest input by its path in the package, a script's by its
+       path from the script's directory. *)
+    val script_dir = Path.dir (#path (#source spec))
+    fun named prefix base =
+      map (fn value =>
+             case rev (String.fields (fn c => c = #"@") value) of
+                 hash :: (rel as _ :: _) =>
+                   let val rel = String.concatWith "@" (rev rel)
+                   in (normalize_path (if base = "" then rel else Path.concat(base, rel)), hash) end
+               | _ => reject_spec ("malformed action text line " ^ prefix ^ value))
+          (action_text_values spec prefix)
+    val text_inputs = named "extra_dep=" "" @ named "source_extra_dep=" script_dir
+    val spec_inputs = map (fn {path, sha256, ...} => (normalize_path path, sha256)) (#inputs spec)
+    fun contains xs x = List.exists (fn y => y = x) xs
+    fun same_files (xs, ys) = List.all (contains ys) xs andalso List.all (contains xs) ys
     (* A direct project dependency is a theory with this key or a library;
        a HOL dependency has no key. *)
     fun direct_dep_ok dep_line =
@@ -5502,9 +5518,13 @@ fun verify_action_spec (spec : action_spec) =
     check (action_text_value spec "always_reexecute" = "false") "the action sets always_reexecute";
     check (List.all direct_dep_ok (action_text_values spec "dep="))
       "a dependency's key does not match the action text";
+    check (same_files (text_inputs, spec_inputs)) "the extra inputs do not match the action text";
+    check (List.all (fn {suffix, ...} => suffix = ".ui" orelse suffix = ".uo") (#libs spec))
+      "a library manifest is neither .ui nor .uo";
     List.app (fn path => check (not (escapes path)) ("path " ^ path ^ " leaves the action root"))
       (#path (#source spec) :: map #path (#inputs spec @ #libraries spec) @
        map #stem (#deps spec) @ map #stem (#libs spec) @
+       List.filter (CharVector.exists (fn c => c = #"/")) (List.concat (map #loads (#libs spec))) @
        [#sig_path (#outputs spec), #sml_path (#outputs spec), #data_path (#outputs spec)])
   end
 
@@ -5716,9 +5736,12 @@ fun classify_run_failure log_text oom_before msg =
   let
     val text = msg ^ "\n" ^ log_text
     fun has marker = String.isSubstring marker text
+    val oom_killed =
+      case (oom_before, cgroup_oom_kills ()) of
+          ([earlier], [later]) => later > earlier
+        | _ => false
   in
-    if cgroup_oom_kills () <> oom_before orelse has "Run out of store" orelse
-       has "Insufficient memory" then MemoryFailure
+    if oom_killed orelse has "Run out of store" then MemoryFailure
     else if has "No space left on device" then DiskFailure
     else if String.isPrefix "tactic timed out" msg then TacticTimeoutFailure
     else ProofFailure
@@ -5729,7 +5752,8 @@ fun classify_run_failure log_text oom_before msg =
    local cache), swept before each action.  It extends the checkpoint budget
    sweep's family eviction to the whole cache root: a family goes whole, and a
    toolchain another process is using is pinned. *)
-type cache_family = {mtime : Time.time, bytes : Position.int, evict : unit -> bool}
+(* A family's eviction returns the bytes it freed, or NONE if it was kept. *)
+type cache_family = {mtime : Time.time, evict : unit -> Position.int option}
 
 fun tree_bytes path =
   if (FS.isLink path handle OS.SysErr _ => false) then 0
@@ -5742,9 +5766,9 @@ fun modified_time path = FS.modTime path handle OS.SysErr _ => Time.zeroTime
 fun checkpoint_cache_families checkpoint_root =
   List.map
     (fn ({base, mtime, bytes} : checkpoint_family) =>
-        {mtime = mtime, bytes = bytes,
+        {mtime = mtime,
          evict = fn () => (remove_checkpoint_family_base base;
-                           not (checkpoint_family_root_exists base))})
+                           if checkpoint_family_root_exists base then NONE else SOME bytes)})
     (collect_checkpoint_families checkpoint_root)
 
 fun toolchain_cache_families () =
@@ -5754,47 +5778,62 @@ fun toolchain_cache_families () =
     val cutoff = Time.+(Time.now (), Time.fromSeconds 86400)
     fun family k =
       {mtime = Option.getOpt (HolbuildHolSharedCache.last_use_time k, Time.zeroTime),
-       bytes = tree_bytes (HolbuildHolSharedCache.entry_dir_for_key k),
        evict = fn () =>
-         (HolbuildHolSharedCache.gc_entry cutoff k = HolbuildHolSharedCache.GcRemoved)
-         handle e => (warn ("could not evict HOL toolchain " ^ k ^ ": " ^ General.exnMessage e); false)}
+         let val bytes = tree_bytes (HolbuildHolSharedCache.entry_dir_for_key k)
+         in
+           if HolbuildHolSharedCache.gc_entry cutoff k = HolbuildHolSharedCache.GcRemoved then SOME bytes
+           else NONE
+         end
+         handle e => (warn ("could not evict HOL toolchain " ^ k ^ ": " ^ General.exnMessage e); NONE)}
   in
     List.map family (HolbuildHolSharedCache.toolchain_keys ())
   end
 
-(* A blob belongs to the newest entry naming it, so evicting oldest first
-   removes it with its last user; blobs no entry names go first. *)
+(* Local cache entries, and a family of the blobs no entry names.  Evicting an
+   entry removes the blobs no remaining entry names, whatever order the
+   entries go in. *)
 fun local_cache_families cache =
   let
+    val blobs_dir = HolbuildCache.blobs_dir cache
     val entries =
-      List.map (fn dir => (dir, modified_time (HolbuildCache.manifest_path dir), HolbuildCache.action_live_blobs dir))
+      List.map (fn dir => (dir, HolbuildCache.action_live_blobs dir))
                (HolbuildCache.children (HolbuildCache.actions_dir cache))
-    fun claim ((dir, mtime, blobs), owners) =
-      Redblackset.foldl
-        (fn (blob, owners) =>
-            case Redblackmap.peek (owners, blob) of
-                SOME (_, owner_mtime) =>
-                  if Time.<(owner_mtime, mtime) then Redblackmap.insert (owners, blob, (dir, mtime)) else owners
-              | NONE => Redblackmap.insert (owners, blob, (dir, mtime)))
-        owners blobs
-    val owners = List.foldl claim (Redblackmap.mkDict String.compare) entries
-    fun assign (path, (owned, orphans)) =
-      case Redblackmap.peek (owners, Path.file path) of
-          SOME (dir, _) =>
-            (Redblackmap.insert (owned, dir, path :: Option.getOpt (Redblackmap.peek (owned, dir), [])), orphans)
-        | NONE => (owned, path :: orphans)
-    val (owned, orphans) =
-      List.foldl assign (Redblackmap.mkDict String.compare, [])
-                 (HolbuildCache.children (HolbuildCache.blobs_dir cache))
-    fun files_bytes paths = List.foldl (fn (path, total) => total + file_size path) (0 : Position.int) paths
-    fun remove_all paths = (List.app HolbuildCache.remove_tree paths; not (List.exists path_exists paths))
-    fun entry_family (dir, mtime, _) =
-      let val blobs = Option.getOpt (Redblackmap.peek (owned, dir), [])
-      in {mtime = mtime, bytes = tree_bytes dir + files_bytes blobs, evict = fn () => remove_all (dir :: blobs)} end
+    fun count_blob (blob, users) =
+      Redblackmap.insert (users, blob, 1 + Option.getOpt (Redblackmap.peek (users, blob), 0))
+    val users = ref (List.foldl (fn ((_, blobs), users) => Redblackset.foldl count_blob users blobs)
+                                (Redblackmap.mkDict String.compare) entries)
+    fun remove_paths paths =
+      List.foldl
+        (fn (path, freed) =>
+            let val bytes = tree_bytes path
+            in HolbuildCache.remove_tree path; if path_exists path then freed else freed + bytes end)
+        (0 : Position.int) paths
+    fun release blob =
+      case Redblackmap.peek (!users, blob) of
+          SOME 1 => (users := #1 (Redblackmap.remove (!users, blob)); [Path.concat(blobs_dir, blob)])
+        | SOME n => (users := Redblackmap.insert (!users, blob, n - 1); [])
+        | NONE => []
+    fun entry_family (dir, blobs) =
+      {mtime = modified_time (HolbuildCache.manifest_path dir),
+       evict = fn () =>
+         let val freed = remove_paths [dir]
+         in
+           if path_exists dir then NONE
+           else SOME (freed + remove_paths (List.concat (map release (Redblackset.listItems blobs))))
+         end}
+    val orphans =
+      List.filter (fn path => not (Option.isSome (Redblackmap.peek (!users, Path.file path))))
+                  (HolbuildCache.children blobs_dir)
   in
-    {mtime = Time.zeroTime, bytes = files_bytes orphans, evict = fn () => remove_all orphans} ::
+    {mtime = Time.zeroTime, evict = fn () => SOME (remove_paths orphans)} ::
     List.map entry_family entries
   end
+
+fun worker_cache_bytes {cache, checkpoint_root} =
+  total_checkpoint_bytes (collect_checkpoint_families checkpoint_root) +
+  List.foldl (fn (k, total) => total + tree_bytes (HolbuildHolSharedCache.entry_dir_for_key k))
+             (0 : Position.int) (HolbuildHolSharedCache.toolchain_keys ()) +
+  tree_bytes (HolbuildCache.actions_dir cache) + tree_bytes (HolbuildCache.blobs_dir cache)
 
 (* Evict least recently used families until the cache leaves reserve_bytes of
    room under limit_bytes. *)
@@ -5810,11 +5849,14 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
       else
         case remaining of
             [] => total
-          | ({bytes, evict, ...} : cache_family) :: rest =>
-              let val evicted = evict () handle e => (warn ("worker cache eviction failed: " ^ General.exnMessage e); false)
-              in sweep (if evicted then total - bytes else total) rest end
-    val total = List.foldl (fn ({bytes, ...} : cache_family, sum) => sum + bytes) (0 : Position.int) families
-    val after = sweep total families
+          | ({evict, ...} : cache_family) :: rest =>
+              let
+                val freed =
+                  evict () handle e => (warn ("worker cache eviction failed: " ^ General.exnMessage e); NONE)
+              in
+                sweep (total - Option.getOpt (freed, 0)) rest
+              end
+    val after = sweep (worker_cache_bytes {cache = cache, checkpoint_root = checkpoint_root}) families
   in
     if after <= target then ()
     else warn ("worker cache holds " ^ gb_decimal_text after ^ " GB of entries in use, over the " ^
@@ -5890,23 +5932,37 @@ fun exec_action {spec_sha256, result_file, cache_cap, toolchain} =
       let
         val _ = (empty_root (); ensure_dir root)
         val spec_path = Path.concat(root, ".holbuild/action-spec")
-        val _ = fetch_spec_blob remote {hash = spec_sha256, dst = spec_path}
-                handle ActionFailed (_, msg) => reject_spec ("cannot fetch the spec: " ^ msg)
+        (* Only a spec the cache doesn't have is rejected; a failed fetch is
+           retryable. *)
+        val _ =
+          (ensure_parent spec_path;
+           case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = spec_sha256, dst = spec_path} of
+               HolbuildCacheBackend.Hit => ()
+             | HolbuildCacheBackend.Miss => reject_spec ("the cache has no spec " ^ spec_sha256)
+             | HolbuildCacheBackend.Corrupt msg => raise action_failed InternalFailure ("cannot fetch the spec: " ^ msg))
         val spec = parse_action_spec (read_text spec_path)
         val _ = (input_key := #input_key spec; target := (#package spec, #logical spec))
         val _ = verify_action_spec spec
         val tc =
           toolchain (#toolchain spec)
-          handle e => raise ActionFailed (ToolchainFailure, General.exnMessage e)
+          handle e => raise action_failed ToolchainFailure (General.exnMessage e)
         val _ =
           if HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key =
              action_text_value spec "toolchain" then ()
           else raise ActionFailed (ToolchainFailure, "the toolchain's identity does not match the action text")
         val _ = hydrate_action_root remote root spec
       in
-        if action_already_done root spec then "cached"
+        if action_already_done root spec then
+          (* The entry may have come from the worker's local cache, so make
+             sure the remote, where the result counts, holds it too. *)
+          (publish_remote_cache_key_if_usable cache (#input_key spec);
+           check_remote_publication remote spec;
+           "cached")
         else
           let
+            (* A local entry that didn't restore must not stand in for this
+               build's when the publication is checked. *)
+            val _ = HolbuildCache.remove_action cache (#input_key spec)
             val action = spec_theory_action root spec
             val stage = action_stage root action
             val oom_before = cgroup_oom_kills ()

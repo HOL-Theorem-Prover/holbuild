@@ -148,6 +148,25 @@ spec_tampered=$(sha256sum "$tmpdir/tampered" | cut -d' ' -f1)
 curl -fsS -X PUT --data-binary "@$tmpdir/tampered" "$remote_url/cas/$spec_tampered"
 worker tampered "$spec_tampered"
 expect tampered 4 "status=failed" "failure=spec-rejected"
+# So is one whose extra input isn't the file its action text names.
+python3 - "$project/.holbuild/action-specs/$spec_b" "$tmpdir/other-input" <<'PY'
+import hashlib, sys
+lines = open(sys.argv[1], "rb").read().split(b"\n")
+other = hashlib.sha256(b"other data\n").hexdigest().encode()
+for i, line in enumerate(lines):
+    if line.startswith(b"file input "):
+        fields = line.split(b" ")
+        fields[3] = other
+        lines[i] = b" ".join(fields)
+        break
+else:
+    sys.exit("spec has no file input line")
+open(sys.argv[2], "wb").write(b"\n".join(lines))
+PY
+spec_other=$(sha256sum "$tmpdir/other-input" | cut -d' ' -f1)
+curl -fsS -X PUT --data-binary "@$tmpdir/other-input" "$remote_url/cas/$spec_other"
+worker other-input "$spec_other"
+expect other-input 4 "status=failed" "failure=spec-rejected"
 worker absent "$(printf 'absent' | sha256sum | cut -d' ' -f1)"
 expect absent 4 "status=failed" "failure=spec-rejected"
 
@@ -165,23 +184,23 @@ for name in twin1 twin2; do
   worker_status=$(< "$tmpdir/$name.status")
   expect "$name" 0 "spec=$spec_a" "input-key=$key_a"
   grep -qx 'status=built\|status=cached' "$tmpdir/$name.result" || { cat "$tmpdir/$name.result" >&2; exit 1; }
-  require_grep '^log=[0-9a-f]\{64\} [0-9][0-9]*$' "$tmpdir/$name.result"
 done
-grep -qx 'status=built' "$tmpdir/twin1.result" "$tmpdir/twin2.result" ||
-  { echo "neither concurrent worker built the action" >&2; exit 1; }
+built=$(grep -lx 'status=built' "$tmpdir/twin1.result" "$tmpdir/twin2.result" | head -n 1)
+[[ -n "$built" ]] || { echo "neither concurrent worker built the action" >&2; exit 1; }
+built_worker=$tmpdir/worker-$(basename "$built" .result)
 ac_a=$(awk '$1 == "action" && $5 == "worker:ATheory" { print $3 }' "$tmpdir/batch.txt")
-curl -fsS -o /dev/null "$remote_url/ac/$ac_a"
+require_file "$remote_root/ac/$ac_a"
 
 # The action root is emptied after the run; the checkpoints are kept.
-[[ ! -e "$tmpdir/worker-twin1/action" ]] || { echo "the action root was not emptied" >&2; exit 1; }
-find "$tmpdir/worker-twin1/checkpoints" -name 'deps_loaded.save' | grep -q . ||
-  { echo "the worker kept no deps heap" >&2; find "$tmpdir/worker-twin1" -maxdepth 3 >&2; exit 1; }
-find "$tmpdir/worker-twin1/checkpoints" -path '*.theorems*' -type f | grep -q . ||
+[[ ! -e "$built_worker/action" ]] || { echo "the action root was not emptied" >&2; exit 1; }
+find "$built_worker/checkpoints" -name 'deps_loaded.save' | grep -q . ||
+  { echo "the worker kept no deps heap" >&2; find "$built_worker" -maxdepth 3 >&2; exit 1; }
+find "$built_worker/checkpoints" -path '*.theorems*' -type f | grep -q . ||
   { echo "the worker kept no theorem checkpoints" >&2; exit 1; }
 
 # A successful build reports its peak memory and uploads its log.
-built=$(grep -lx 'status=built' "$tmpdir/twin1.result" "$tmpdir/twin2.result" | head -n 1)
 require_grep '^peak-rss-mb=[1-9][0-9]*$' "$built"
+require_grep '^log=[0-9a-f]\{64\} [0-9][0-9]*$' "$built"
 log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$built")
 curl -fsS "$remote_url/cas/$log_sha" > "$tmpdir/a-build.log"
 [[ -s "$tmpdir/a-build.log" ]] || { echo "the uploaded log is empty" >&2; exit 1; }
@@ -189,6 +208,13 @@ curl -fsS "$remote_url/cas/$log_sha" > "$tmpdir/a-build.log"
 # Rerunning a done action reports it cached.
 worker again "$spec_a"
 expect again 0 "status=cached"
+
+# A worker that still holds an entry the remote lost publishes it again
+# before reporting it cached.
+rm "$remote_root/ac/$ac_a"
+worker "$(basename "$built_worker" | sed 's/^worker-//')" "$spec_a"
+expect "$(basename "$built_worker" | sed 's/^worker-//')" 0 "status=cached"
+require_file "$remote_root/ac/$ac_a"
 
 # The rest of the chain builds in order on another worker.
 worker b "$spec_b"
