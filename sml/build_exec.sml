@@ -3637,8 +3637,8 @@ fun theory_parent_hash_recorded parent_hashes dep =
 (* Action dependencies also express build ordering.  A theory dependency is a
    parent only when the exported .dat records it, so do not make an ordering-only
    edge invalidate an otherwise valid artifact. *)
-fun project_theory_parent_deps parent_hashes plan node =
-  List.filter (theory_parent_hash_recorded parent_hashes) (project_theory_deps plan node)
+fun project_theory_parent_deps parent_hashes theory_deps =
+  List.filter (theory_parent_hash_recorded parent_hashes) theory_deps
 
 fun same_theory_parent_deps left right =
   let
@@ -3669,19 +3669,20 @@ fun child_dat_parent_hashes_match dat_hash_cache plan node =
   let
     val parent_hashes = parse_dat_parent_hashes (read_text (#data_path (theory_outputs node)))
   in List.all (theory_parent_hash_matches dat_hash_cache parent_hashes)
-              (project_theory_parent_deps parent_hashes plan node)
+              (project_theory_parent_deps parent_hashes (project_theory_deps plan node))
   end
 
 fun metadata_parent_hashes_match dat_hash_cache plan node text =
   let
     val lines = metadata_lines text
     val child_parent_hashes = parse_dat_parent_hashes (read_text (#data_path (theory_outputs node)))
-    val child_parent_deps = project_theory_parent_deps child_parent_hashes plan node
+    val theory_deps = project_theory_deps plan node
+    val child_parent_deps = project_theory_parent_deps child_parent_hashes theory_deps
   in
     if metadata_has_parent_hashes lines then
       let
         val recorded_parent_hashes = metadata_parent_hashes lines
-        val recorded_parent_deps = project_theory_parent_deps recorded_parent_hashes plan node
+        val recorded_parent_deps = project_theory_parent_deps recorded_parent_hashes theory_deps
       in
         (* Metadata is a cache for this check, not an authority on the current
            child artifact.  The two parent tables must name the same project
