@@ -1955,6 +1955,21 @@ fun remote_cache_source_with_action remote key manifest : HolbuildCacheTransfer.
   {get_action = fn requested => if requested = key then SOME manifest else HolbuildRemoteCache.get_action remote requested,
    fetch_blob = HolbuildRemoteCache.fetch_blob remote}
 
+(* The keys whose entries this process copied from the remote cache, so that
+   restoring one counts as a remote hit. *)
+val remote_copied_keys = ref (Redblackset.empty String.compare)
+val remote_copied_mutex = Mutex.mutex ()
+
+fun note_remote_copy key =
+  (Mutex.lock remote_copied_mutex;
+   remote_copied_keys := Redblackset.add (!remote_copied_keys, key);
+   Mutex.unlock remote_copied_mutex)
+
+fun copied_from_remote key =
+  (Mutex.lock remote_copied_mutex;
+   Redblackset.member (!remote_copied_keys, key)
+   before Mutex.unlock remote_copied_mutex)
+
 (* Copies the remote entry for key into the local cache.  Returns false on a
    remote miss and raises if the entry is unusable. *)
 fun copy_remote_cache_entry root url key =
@@ -1966,6 +1981,9 @@ fun copy_remote_cache_entry root url key =
         NONE => false
       | SOME manifest =>
           (HolbuildFSCacheBackend.ensure_layout local_cache;
+           (* Before the copy, which a build worker may restore as soon as
+              its manifest lands. *)
+           note_remote_copy key;
            HolbuildCacheTransfer.copy_entry
              {source = remote_cache_source_with_action remote key manifest,
               destination = fs_cache_destination local_cache,
@@ -4052,7 +4070,7 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
        write_metadata (#emit_output_hashes options) policy
          (if allow_timeout_discrepancy then built_timeout else tactic_timeout policy)
          project plan keys input_key toolchain_key node metadata_checkpoints;
-       HolbuildStatus.Restored)
+       if copied_from_remote input_key then HolbuildStatus.RestoredRemote else HolbuildStatus.Restored)
     fun build_from_source () =
       if #restore_only options then
         raise Error (logical_name node ^ " is not in the remote cache, and --remote-only builds nothing locally")

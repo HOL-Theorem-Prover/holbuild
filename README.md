@@ -802,6 +802,14 @@ HOLBUILD_REMOTE_CACHE_URL=https://cache.example.org holbuild build MyTheory
 ```
 
 Remote cache misses or errors fall back to the local cache/source build path.
+A request waits at most 5 s for its connection. After three requests in a row
+get no response at all (no connection, or a timeout), holbuild warns once and
+leaves the remote cache alone for the rest of the run, so an unreachable cache
+costs a build a bounded amount of time; an HTTP error status doesn't count
+towards the three, and any response resets the count. In the status line and
+`--json`'s `build_finished` event, `from_cache` counts every theory restored
+from a cache, and `from_remote` the ones among them whose entries this run
+copied from the remote cache.
 While a build runs, `--prefetch-concurrency` background threads (twice `-j` by
 default) also copy the remote entries of the plan's out-of-date theories into
 the local cache in build order, so a theory's restore usually finds its entry
