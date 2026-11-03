@@ -977,7 +977,9 @@ each action, and keeps the theory's dependency heap and checkpoints in
 `<cache root>/checkpoints`, so a later run of an edited theory resumes from
 them as a local build does. A saved heap records the absolute paths it was
 built at, so every worker should use the same cache root. One `exec-action`
-runs per cache root at a time; a second waits for the first.
+runs per cache root at a time; a second waits for the first. The cache root
+is the worker's own: other holbuild commands shouldn't share it, since the
+cache cap below sweeps it.
 
 In order, it checks the spec (its holbuild version and runtime must equal the
 worker's, and its action text must hash to its input key and agree with its
