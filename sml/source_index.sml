@@ -397,6 +397,8 @@ fun member_contains member path =
     path = member orelse String.isPrefix prefix path
   end
 
+fun scan_key name source_root = name ^ "\000" ^ source_root
+
 fun prevalidate_package package =
   let
     val name = HolbuildProject.package_name package
@@ -431,12 +433,18 @@ fun prevalidate_package package =
       end
     val existing = List.foldl scan_existing [] members
     val candidates = List.foldl declared_output existing generated_paths
+    val _ = validate_action_policies name policies candidates
   in
-    validate_action_policies name policies candidates
+    (* Without generators nothing can change the tree before discovery, so
+       discovery reuses this scan instead of walking the tree again. *)
+    if null generators andalso List.all (fn m => is_dir m orelse is_readable m) members then
+      SOME (scan_key name source_root, existing)
+    else NONE
   end
 
+(* Scans of the packages discovery may reuse, keyed by scan_key. *)
 fun prevalidate_graph graph =
-  List.app prevalidate_package (HolbuildProjectGraph.packages graph)
+  List.mapPartial prevalidate_package (HolbuildProjectGraph.packages graph)
 
 fun deduplicate_sources sources =
   let
@@ -451,7 +459,7 @@ fun deduplicate_sources sources =
     kept
   end
 
-fun discover_package package acc =
+fun discover_package scans package =
   let
     val name = HolbuildProject.package_name package
     val package_id = source_graph_package_id package
@@ -490,7 +498,10 @@ fun discover_package package acc =
               NONE => sources
             | SOME source => source :: sources
       end
-    val existing = List.foldl scan_existing acc members
+    val existing =
+      case (generated_paths, List.find (fn (k, _) => k = scan_key name source_root) scans) of
+          ([], SOME (_, scanned)) => scanned
+        | _ => List.foldl scan_existing [] members
     val sources =
       deduplicate_sources (List.foldl declared_output existing generated_paths)
     val _ = validate_action_policies name policies sources
@@ -527,8 +538,8 @@ fun package_inventory package sources : package_inventory =
      extra_inputs = List.concat (map node_extra_inputs nodes)}
   end
 
-fun discover_package_inventory package =
-  let val sources = sort_sources (discover_package package [])
+fun discover_package_inventory scans package =
+  let val sources = sort_sources (discover_package scans package)
   in (package_inventory package sources, sources) end
 
 fun write_test_inventory inventories =
@@ -544,10 +555,10 @@ fun write_test_inventory inventories =
           TextIO.closeOut output
         end
 
-fun discover_prepared_with_inventories preparation : discovery =
+fun discover_prepared_with_inventories scans preparation : discovery =
   let
     val graph = HolbuildPackagePrepare.graph preparation
-    val pairs = map discover_package_inventory (HolbuildProjectGraph.packages graph)
+    val pairs = map (discover_package_inventory scans) (HolbuildProjectGraph.packages graph)
     val inventories = map #1 pairs
     val sources = by_logical (sort_sources (List.concat (map #2 pairs)))
     val _ = write_test_inventory inventories
@@ -610,16 +621,21 @@ fun root_candidate_paths source_root root =
 (* A concrete root names a source of its own package either by logical name
    (`MainTheory`) or by package-relative path (`src/MainScript.sml`, with the
    `.sml` extension optional). *)
-fun source_matches_root package (source : source) root =
-  #package source = HolbuildProject.package_name package andalso
-  (#logical_name source = root orelse
-   List.exists (fn rel => rel = #relative_path source)
-     (root_candidate_paths (HolbuildProject.package_root package) root))
+fun source_matches_root package root =
+  let
+    val name = HolbuildProject.package_name package
+    val candidates = root_candidate_paths (HolbuildProject.package_root package) root
+  in
+    fn (source : source) =>
+      #package source = name andalso
+      (#logical_name source = root orelse
+       List.exists (fn rel => rel = #relative_path source) candidates)
+  end
 
 fun root_logical_name sources package root =
   case unique_strings
          (map #logical_name
-              (List.filter (fn source => source_matches_root package source root) sources)) of
+              (List.filter (source_matches_root package root) sources)) of
       [] => raise Error ("unknown build root: " ^ HolbuildProject.package_name package ^ ":" ^ root)
     | [logical] => logical
     | _ => raise Error ("ambiguous build root: " ^ HolbuildProject.package_name package ^ ":" ^ root)
