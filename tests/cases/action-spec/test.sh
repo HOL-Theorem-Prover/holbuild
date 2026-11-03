@@ -109,7 +109,10 @@ for line in batch[1:]:
     assert f"target {target}" in lines, target
     source = [l.split() for l in lines if l.startswith("source ")]
     assert len(source) == 1, source
-    assert f"source-sha256={source[0][3]}".encode() in action_text.split(b"\n"), target
+    text_lines = action_text.split(b"\n")
+    assert f"package={source[0][1]}".encode() in text_lines, target
+    assert f"source={source[0][2]}".encode() in text_lines, target
+    assert f"source-sha256={source[0][3]}".encode() in text_lines, target
 PY
 }
 
@@ -168,7 +171,7 @@ expect_refusal() {
     echo "action-spec unexpectedly succeeded: $*" >&2
     exit 1
   fi
-  require_grep "$pattern" "$tmpdir/refused.log"
+  grep -q -- "$pattern" "$tmpdir/refused.log" || { cat "$tmpdir/refused.log" >&2; require_grep "$pattern" "$tmpdir/refused.log"; }
 }
 expect_refusal "spec:ATheory can't run remotely: it is forced" --force CTheory
 
@@ -183,6 +186,15 @@ SML
 expect_refusal "spec:DTheory can't run remotely: its extra input ../outside.txt lies outside its package root" DTheory
 rm "$project/src/DScript.sml"
 
+cp "$project/holproject.toml" "$tmpdir/holproject.toml.orig"
+cat >> "$project/holproject.toml" <<'TOML'
+
+[actions.ATheory]
+always_reexecute = true
+TOML
+expect_refusal "spec:ATheory can't run remotely: it sets always_reexecute" CTheory
+
+cp "$tmpdir/holproject.toml.orig" "$project/holproject.toml"
 cat >> "$project/holproject.toml" <<'TOML'
 
 [actions.ATheory]

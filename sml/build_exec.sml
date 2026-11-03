@@ -5006,24 +5006,34 @@ fun runtime_identity () =
 fun spec_token context text =
   if text <> "" andalso not (CharVector.exists (fn c => Char.isSpace c orelse Char.isCntrl c) text)
   then text
-  else raise Error ("cannot export " ^ context ^ ": " ^ HolbuildHash.quote text ^
-                    " is empty or contains whitespace")
+  else raise Error ("action-spec: " ^ context ^ " can't run remotely: " ^
+                    HolbuildHash.quote text ^ " is empty or contains whitespace")
 
 fun is_theory_node node = #kind (HolbuildBuildPlan.source_of node) = HolbuildSourceIndex.TheoryScript
 
 fun escapes_root rel = Path.isAbsolute rel orelse rel = ".." orelse String.isPrefix "../" rel
 
+(* A HOL theory or library the preload names by a path on this machine
+   rather than by name; a worker has no such file. *)
+fun hol_load_by_path (LoadTheory name) = CharVector.exists (fn c => c = #"/") name
+  | hol_load_by_path (LoadLibrary name) = CharVector.exists (fn c => c = #"/") name
+  | hol_load_by_path (LoadObject _) = false
+
 (* Why a theory can't run remotely, if it can't. *)
 fun excluded_reason (options : build_options) project (action : theory_action) node =
-  if not (cache_enabled node) then SOME "it sets cache = false"
-  else if always_reexecute node then SOME "it sets always_reexecute"
+  if always_reexecute node then SOME "it sets always_reexecute"
+  else if not (cache_enabled node) then SOME "it sets cache = false"
   else if force_node options project node then SOME "it is forced"
   else if escapes_root (HolbuildBuildPlan.relative_path node) then
     SOME "its script lies outside its package root"
   else
     case List.find (fn {path, ...} => escapes_root path) (#inputs action) of
         SOME {path, ...} => SOME ("its extra input " ^ path ^ " lies outside its package root")
-      | NONE => NONE
+      | NONE =>
+          case List.find hol_load_by_path (#loads action) of
+              SOME (LoadTheory name) => SOME ("it loads " ^ name ^ " by path")
+            | SOME (LoadLibrary name) => SOME ("it loads " ^ name ^ " by path")
+            | _ => NONE
 
 (* Whether the remote cache holds an entry this build would restore: usable,
    and with a timeout contract at least as strict as the one requested.
@@ -5054,7 +5064,7 @@ fun library_manifest root plan node =
     val context = package node ^ ":" ^ logical_name node
     fun name text =
       if CharVector.exists (fn c => c = #"/") text then
-        raise Error ("cannot export " ^ context ^ ": HOL load name contains /: " ^ text)
+        raise Error ("action-spec: " ^ context ^ " can't run remotely: it loads " ^ text ^ " by path")
       else spec_token context text
     fun rooted path = spec_token context (root_relative root path)
     val deps = HolbuildBuildPlan.direct_project_deps plan node
@@ -5217,15 +5227,19 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
         val spec_sha256 = HolbuildHash.string_sha256 text
         val path = Path.concat(spec_dir, spec_sha256)
         val _ = (ensure_dir spec_dir; write_text path text)
-        val _ = if upload then List.app (publish_spec_blob remote) (files @ [path]) else ()
       in
-        String.concatWith " "
+        {files = files @ [path], lines = String.concatWith " "
           ["action", #input_key action, HolbuildRemoteCache.remote_action_key (#input_key action),
            spec_sha256, package node ^ ":" ^ logical_name node] ::
         map (fn parent => "edge " ^ #input_key action ^ " " ^ HolbuildBuildPlan.input_key_for keys parent)
-            (uncached_parents plan uncached node)
+            (uncached_parents plan uncached node)}
       end
-    val action_lines = List.concat (map export uncached_actions)
+    val exported = map export uncached_actions
+    val action_lines = List.concat (map #lines exported)
+    (* Specs share their library sources, so each file goes up once. *)
+    val _ =
+      if upload then List.app (publish_spec_blob remote) (unique_strings (List.concat (map #files exported)))
+      else ()
   in
     print (String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n")
   end

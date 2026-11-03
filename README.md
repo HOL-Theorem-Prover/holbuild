@@ -903,7 +903,9 @@ a theory depends on, looking through libraries and cached theories.
 `action-spec` refuses a closure containing a theory that can't run remotely,
 and says which and why: one with `cache = false` or `always_reexecute`, a
 forced one (`--force`), one whose script or extra input lies outside its
-package root, and any theory with `--trknl`. Such a closure builds locally.
+package root, one that loads a HOL theory or library by path, one with a path
+containing whitespace, and any theory with `--trknl`. Such a closure builds
+locally.
 
 An ActionSpec names no path on the exporting machine:
 
