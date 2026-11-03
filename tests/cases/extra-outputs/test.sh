@@ -190,3 +190,40 @@ if (cd "$conflict" && "$HOLBUILD_BIN" build ATheory BTheory) > "$tmpdir/conflict
   exit 1
 fi
 require_grep "extra output has multiple owners" "$tmpdir/conflict.log"
+
+# A theory can write an SML source as an extra output, as EmitML code does. In
+# a fresh checkout the source does not exist when the build is planned, so the
+# theory that writes it must run before its users are planned.
+generated=$tmpdir/generated-source
+write_manifest "$generated" generated-source
+cat >> "$generated/holproject.toml" <<TOML
+
+[actions.UseLib]
+deps = ["GenTheory"]
+
+[[executable]]
+name = "useit"
+output = "useit.exe"
+objects = ["useit"]
+TOML
+cat > "$generated/src/GenScript.sml" <<SML
+Theory Gen
+
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_outputs ["GenML.sml"];
+val () = let val out = TextIO.openOut "GenML.sml"
+         in TextIO.output (out, "structure GenML = struct val x = 42 end\n"); TextIO.closeOut out end;
+SML
+cat > "$generated/src/UseLib.sml" <<SML
+structure UseLib = struct val y = GenML.x + 1 end
+SML
+cat > "$generated/src/useit.sml" <<SML
+fun main () = print ("useit " ^ Int.toString UseLib.y ^ "\n")
+SML
+(cd "$generated" && "$HOLBUILD_BIN" build UseLib) > "$tmpdir/generated-build.log" 2>&1
+require_file "$generated/.holbuild/obj/src/GenML.uo"
+(cd "$generated" && "$HOLBUILD_BIN" clean GenTheory) > "$tmpdir/generated-clean.log" 2>&1
+require_no_file "$generated/src/GenML.sml"
+(cd "$generated" && "$HOLBUILD_BIN" executable useit) > "$tmpdir/generated-executable.log" 2>&1
+"$generated/useit.exe" > "$tmpdir/generated-run.out"
+require_grep "useit 43" "$tmpdir/generated-run.out"
