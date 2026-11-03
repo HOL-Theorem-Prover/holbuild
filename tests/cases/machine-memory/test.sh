@@ -147,6 +147,14 @@ if holbuild_in "$tmpdir/p1" --cooperate-dir "$coop" --machine-max-mem 4096 --max
 fi
 require_grep '^holbuild: --machine-max-mem 4096 (4294967296 bytes) conflicts with 3221225472 bytes in' "$tmpdir/conflict.out"
 
+# The default budget leaves a quarter of MemTotal out, at most 30 GiB: 256 GiB
+# gives 226 GiB.
+printf 'MemTotal:        268435456 kB\nMemAvailable:    268435456 kB\n' > "$tmpdir/large"
+HOLBUILD_TEST_MEMINFO=$tmpdir/large holbuild_in "$tmpdir/p1" --cooperate-dir "$tmpdir/large-coop" \
+  build --force P1aTheory > "$tmpdir/large.out" 2>&1 || { cat "$tmpdir/large.out" >&2; exit 1; }
+[[ "$(cat "$tmpdir/large-coop/budget")" == "$((226 * gib))" ]] ||
+  { echo "unexpected default budget: $(cat "$tmpdir/large-coop/budget")" >&2; exit 1; }
+
 # Heterogeneous charges in a 4 GiB budget: two 2 GiB children fit together, a
 # 3 GiB child fits with neither.  The charge is --child-charge, not --max-heap,
 # which alone exceeds the budget.

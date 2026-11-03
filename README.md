@@ -330,9 +330,10 @@ machine (several users, CI jobs, containers with a shared bind mount) can share
 a memory budget instead: with `--cooperate-dir DIR`, every theory, generator and
 heap-export child reserves `--child-charge`, and starts only while the
 reservations of all processes using `DIR` fit the byte count in `DIR/budget`,
-and `MemAvailable` covers the charge plus a quarter of `MemTotal` (at least
-1 GiB), whatever the budget. Children admitted in the last 30 seconds, which
-have not allocated yet, count against `MemAvailable` by their charge. The
+and `MemAvailable` covers the charge plus a reserve of a quarter of `MemTotal`
+(at least 1 GiB, at most 30 GiB), whatever the budget. Children admitted in
+the last 30 seconds, which have not allocated yet, count against
+`MemAvailable` by their charge. The
 charge is an expected size, not a ceiling: `--max-heap` caps each child, and
 the `MemAvailable` check holds new children back when running ones, or
 anything else on the machine, grow. While no reservation is held in `DIR`, a
@@ -352,8 +353,8 @@ since nothing re-checks a child once it has started. It covers neither HOL
 toolchain builds nor `check`, `run` or `repl`.
 
 - `DIR/budget` is created on first use from `--machine-max-mem`, or else
-  `MemTotal` less a quarter (at least 1 GiB). To resize, replace it while
-  holding `DIR/lock`:
+  `MemTotal` less that reserve. To resize, replace it while holding
+  `DIR/lock`:
   `flock DIR/lock sh -c 'echo BYTES > DIR/budget.new && mv DIR/budget.new DIR/budget'`.
   Running children keep their reservations; new ones use the new value.
 - Each running child has a file `DIR/lease-*` holding its byte charge,

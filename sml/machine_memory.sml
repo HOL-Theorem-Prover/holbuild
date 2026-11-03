@@ -168,9 +168,9 @@ fun mem_total () = #total (meminfo ())
 
 fun has_mem_available () = isSome (#available (meminfo ()))
 
-(* A quarter of MemTotal (at least 1 GiB) for the OS, page cache and
-   holbuild parents. *)
-fun reserve total = Int.max (1024 * mib, total div 4)
+(* A quarter of MemTotal, at least 1 GiB and at most 30 GiB, for the OS, page
+   cache and holbuild parents. *)
+fun reserve total = Int.max (1024 * mib, Int.min (total div 4, 30 * 1024 * mib))
 
 fun default_budget dir =
   case mem_total () of
