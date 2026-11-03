@@ -105,13 +105,39 @@ fun publish_blob_or_raise (destination : destination) hash path =
     | HolbuildCacheBackend.Skipped => (0, 0)
     | HolbuildCacheBackend.Conflict detail => raise Error ("destination cache blob conflict: " ^ hash ^ " (" ^ detail ^ ")")
 
+val no_space = "No space left on device"
+
+(* Whether the filesystem holding dir can't take a small write. *)
+fun out_of_space dir =
+  let val probe = Path.concat(dir, ".holbuild-space-probe")
+  in
+    (let val out = BinIO.openOut probe
+     in
+       (BinIO.output (out, Word8Vector.tabulate (1048576, fn _ => 0w0)); BinIO.closeOut out)
+       handle e => (BinIO.closeOut out handle _ => (); raise e)
+     end;
+     remove_file probe;
+     false)
+    handle e => (remove_file probe; String.isSubstring no_space (General.exnMessage e))
+  end
+
+(* A download that filled the disk need not say so (curl reports only a
+   failed write, or leaves a short file), and removing it frees the space:
+   probe while it is still there. *)
 fun copy_blob source destination tmp_dir hash (uploaded, reused) =
   let
     val path = temp_blob_path tmp_dir hash
     val (uploaded', reused') =
       (fetch_blob_or_raise source hash path;
        publish_blob_or_raise destination hash path)
-      handle e => (remove_file path; raise e)
+      handle e =>
+        let val full = out_of_space (Path.dir path)
+        in
+          remove_file path;
+          if full andalso not (String.isSubstring no_space (General.exnMessage e)) then
+            raise Error ("cache blob " ^ hash ^ ": " ^ no_space)
+          else raise e
+        end
   in
     remove_file path;
     (uploaded + uploaded', reused + reused')

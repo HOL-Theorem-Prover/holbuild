@@ -986,13 +986,13 @@ result there, and exits:
 ```sh
 HOLBUILD_CACHE=/var/cache/holbuild holbuild --remote-cache https://cache.example.org \
   --max-heap 32000 --cooperate-dir /var/lib/holbuild/memory \
-  exec-action SPEC-SHA256 --result result.txt --cache-limit-gb 200
+  exec-action SPEC-SHA256 --result result.txt --cache-limit-gb 200 [--share-heaps]
 ```
 
 It runs in `<cache root>/action`, which it locks and empties before and after
-each action, and keeps the theory's dependency heap and checkpoints in
-`<cache root>/checkpoints`, so a later run of an edited theory resumes from
-them as a local build does. A saved heap records the absolute paths it was
+each action, and, without `--share-heaps` (below), keeps the theory's
+dependency heap and checkpoints in `<cache root>/checkpoints`, so a later run
+of an edited theory resumes from them as a local build does. A saved heap records the absolute paths it was
 built at, so every worker should use the same cache root. One `exec-action`
 runs per cache root at a time; a second waits for the first. The cache root
 is the worker's own: other holbuild commands shouldn't share it, since the
@@ -1044,6 +1044,28 @@ Before each action, it evicts the least recently used until they fit in `N`
 GB minus a reserve for the action itself (`--cache-reserve-gb`, by default a
 tenth of `N`). A theory's checkpoints go together, a toolchain goes with its
 analysers, and a toolchain another holbuild process is using is kept.
+
+With `--share-heaps`, workers share dependency heaps and checkpoints through
+the remote cache. Before the build, the worker restores the latest checkpoint
+another worker published for the theory's source, the way a local build
+picks one: the last theorem or definition context whose source prefix is
+unchanged, or a failed proof's prefix, with a timeout at least as strict as
+the spec's. If there's none, it restores the dependency heap; if there's no
+heap either, it loads the dependencies cold. After the build, successful or
+not, it publishes its heap if no other worker's is, and then, when the heap
+under them is the published one, the checkpoints it saved. A heap is shared
+only between workers with the same toolchain bytes, cache root, action root
+and platform, which is why every worker should use the same cache root.
+
+The checkpoint tree is then the action's own, emptied before and after it;
+the host store `<cache root>/checkpoint-store` keeps the shared files, one
+directory per heap, which the cache cap evicts as a unit, unless an action
+on the host is using it. Worker containers on one host can share
+`checkpoint-store/` and `hol-toolchains/`, mounted from host directories, and
+keep the rest of the cache root to themselves. A restored file is hard-linked
+from the store when the store and `checkpoints/` are on one mount, and copied
+otherwise. A bind mount counts as another mount even on the same filesystem,
+so in that layout restores copy: the store still saves downloads, not disk.
 
 Clean old project and cache state with:
 

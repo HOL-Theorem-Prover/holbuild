@@ -189,7 +189,7 @@ fun action_spec_help () = print
 fun exec_action_help () = print
   "Usage:\n\
   \  holbuild --remote-cache URL [GLOBAL OPTIONS] exec-action SPEC-SHA256\n\
-  \      --cache-limit-gb N [--cache-reserve-gb N] [--result FILE]\n\n\
+  \      --cache-limit-gb N [--cache-reserve-gb N] [--share-heaps] [--result FILE]\n\n\
   \Run the ActionSpec stored in the remote cache as SPEC-SHA256 (see\n\
   \action-spec) and publish its result to the remote cache. The action runs in\n\
   \CACHE/action, with checkpoints in CACHE/checkpoints, where CACHE is the cache\n\
@@ -200,7 +200,10 @@ fun exec_action_help () = print
   \--cache-limit-gb N   Before the action, evict least recently used\n\
   \                     checkpoints, toolchains and local cache entries until\n\
   \                     the cache root holds at most N GB minus the reserve.\n\
-  \--cache-reserve-gb N Room to keep free under the limit (default: a tenth).\n\n\
+  \--cache-reserve-gb N Room to keep free under the limit (default: a tenth).\n\
+  \--share-heaps        Resume from the deps-loaded heap and theorem checkpoints\n\
+  \                     other workers published, and publish this run's. The\n\
+  \                     host store CACHE/checkpoint-store keeps their files.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun export_help () = print
@@ -1917,14 +1920,15 @@ fun exec_action_command maxheap gcthreads jobs args =
           SOME n => if n >= 0 then IntInf.fromInt n * 1073741824
                     else raise Error (label ^ " must be a non-negative integer")
         | NONE => raise Error (label ^ " must be a non-negative integer")
-    fun parse (opts as {spec, result, limit, reserve}) rest =
+    fun parse (opts as {spec, result, limit, reserve, share}) rest =
       case rest of
           [] => opts
-        | "--result" :: file :: xs => parse {spec = spec, result = SOME file, limit = limit, reserve = reserve} xs
+        | "--result" :: file :: xs => parse {spec = spec, result = SOME file, limit = limit, reserve = reserve, share = share} xs
         | "--cache-limit-gb" :: n :: xs =>
-            parse {spec = spec, result = result, limit = SOME (gb "--cache-limit-gb" n), reserve = reserve} xs
+            parse {spec = spec, result = result, limit = SOME (gb "--cache-limit-gb" n), reserve = reserve, share = share} xs
         | "--cache-reserve-gb" :: n :: xs =>
-            parse {spec = spec, result = result, limit = limit, reserve = SOME (gb "--cache-reserve-gb" n)} xs
+            parse {spec = spec, result = result, limit = limit, reserve = SOME (gb "--cache-reserve-gb" n), share = share} xs
+        | "--share-heaps" :: xs => parse {spec = spec, result = result, limit = limit, reserve = reserve, share = true} xs
         | ["--result"] => raise Error "--result requires FILE"
         | ["--cache-limit-gb"] => raise Error "--cache-limit-gb requires N"
         | ["--cache-reserve-gb"] => raise Error "--cache-reserve-gb requires N"
@@ -1932,9 +1936,10 @@ fun exec_action_command maxheap gcthreads jobs args =
             if String.isPrefix "-" arg then raise Error ("unknown exec-action option: " ^ arg)
             else
               case spec of
-                  NONE => parse {spec = SOME arg, result = result, limit = limit, reserve = reserve} xs
+                  NONE => parse {spec = SOME arg, result = result, limit = limit, reserve = reserve, share = share} xs
                 | SOME _ => raise Error "exec-action takes one SPEC-SHA256"
-    val {spec, result, limit, reserve} = parse {spec = NONE, result = NONE, limit = NONE, reserve = NONE} args
+    val {spec, result, limit, reserve, share} =
+      parse {spec = NONE, result = NONE, limit = NONE, reserve = NONE, share = false} args
     val spec = case spec of SOME s => s | NONE => raise Error "exec-action requires SPEC-SHA256"
     val cache_cap =
       case limit of
@@ -1958,7 +1963,8 @@ fun exec_action_command maxheap gcthreads jobs args =
     val code =
       (HolbuildRemoteCacheConfig.setup_client ();
        HolbuildBuildExec.exec_action
-         {spec_sha256 = spec, result_file = result, cache_cap = cache_cap, toolchain = toolchain})
+         {spec_sha256 = spec, result_file = result, cache_cap = cache_cap, share_heaps = share,
+          toolchain = toolchain})
       handle e =>
         (HolbuildStatus.message_stderr
            ("holbuild: exec-action failed: " ^
