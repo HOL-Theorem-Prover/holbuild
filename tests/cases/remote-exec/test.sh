@@ -210,3 +210,9 @@ run no-url 1 build --remote-only BTheory
 require_grep "need --remote-exec URL" "$tmpdir/no-url.log"
 run both 1 build --remote-exec "$coordinator" --detach --attach b1 BTheory
 require_grep "exclude each other" "$tmpdir/both.log"
+run url-missing 1 build --remote-exec --remote-only BTheory
+require_grep "remote-exec requires URL" "$tmpdir/url-missing.log"
+run id-missing 1 build --remote-exec "$coordinator" --attach --remote-only BTheory
+require_grep "attach requires BATCH-ID" "$tmpdir/id-missing.log"
+run trace 1 build --remote-exec "$coordinator" --trace-steps BTheory
+require_grep "does not support .*--trace-steps" "$tmpdir/trace.log"

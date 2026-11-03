@@ -1265,12 +1265,16 @@ fun split_remote_exec_flags args =
     fun loop (url, remote_only, detach, attach) acc xs =
       case xs of
           [] => ({url = url, remote_only = remote_only, detach = detach, attach = attach}, rev acc)
+        | "--remote-exec" :: value :: rest =>
+            if String.isPrefix "-" value then raise Error "--remote-exec requires URL"
+            else loop (SOME value, remote_only, detach, attach) acc rest
         | ["--remote-exec"] => raise Error "--remote-exec requires URL"
-        | "--remote-exec" :: value :: rest => loop (SOME value, remote_only, detach, attach) acc rest
         | "--remote-only" :: rest => loop (url, true, detach, attach) acc rest
         | "--detach" :: rest => loop (url, remote_only, true, attach) acc rest
+        | "--attach" :: value :: rest =>
+            if String.isPrefix "-" value then raise Error "--attach requires BATCH-ID"
+            else loop (url, remote_only, detach, SOME value) acc rest
         | ["--attach"] => raise Error "--attach requires BATCH-ID"
-        | "--attach" :: value :: rest => loop (url, remote_only, detach, SOME value) acc rest
         | x :: rest => loop (url, remote_only, detach, attach) (x :: acc) rest
   in
     loop (NONE, false, false, NONE) [] args
@@ -1279,7 +1283,7 @@ fun split_remote_exec_flags args =
 fun build tc cli_jobs args =
   let
     val ({url, remote_only, detach, attach}, args) = split_remote_exec_flags args
-    val parsed as ({dry_run, watch, repl_on_failure, ...}, _) = split_flags args
+    val parsed as ({dry_run, watch, repl_on_failure, trace_steps, execution_plan, ...}, _) = split_flags args
     val _ =
       if watch andalso HolbuildStatus.json_mode () then
         raise Error "--json does not support build --watch yet"
@@ -1289,8 +1293,9 @@ fun build tc cli_jobs args =
         raise Error "--watch does not support --repl-on-failure"
       else if not (Option.isSome url) andalso (remote_only orelse detach orelse Option.isSome attach) then
         raise Error "--remote-only, --detach and --attach need --remote-exec URL"
-      else if Option.isSome url andalso (watch orelse dry_run) then
-        raise Error "--remote-exec does not support --watch or --dry-run"
+      else if Option.isSome url andalso
+              (watch orelse dry_run orelse trace_steps orelse repl_on_failure orelse Option.isSome execution_plan) then
+        raise Error "--remote-exec does not support --watch, --dry-run, --trace-steps, --execution-plan or --repl-on-failure"
       else if Option.isSome url andalso HolbuildStatus.json_mode () then
         raise Error "--json does not support --remote-exec yet"
       else if detach andalso Option.isSome attach then

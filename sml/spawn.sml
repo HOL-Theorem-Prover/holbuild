@@ -192,7 +192,12 @@ fun run_lines request on_line =
                   SOME line => (on_line line; loop ())
                 | NONE => ()
           in
-            (loop (); TextIO.closeIn input) handle e => (TextIO.closeIn input; ignore (reap pid); raise e);
+            (loop (); TextIO.closeIn input)
+            handle e =>
+              (TextIO.closeIn input;
+               Posix.Process.kill (Posix.Process.K_PROC pid, Posix.Signal.term);
+               ignore (reap pid);
+               raise e);
             reap pid
           end
   end
