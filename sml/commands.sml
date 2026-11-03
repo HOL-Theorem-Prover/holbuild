@@ -987,6 +987,52 @@ datatype build_mode =
   | ExportActionSpecs of {upload : bool}
   | RemoteExec of {url : string, remote_only : bool, detach : bool, attach : string option}
 
+fun is_base_heap (HolbuildProject.Heap {kind = HolbuildProject.HeapImage {base}, ...}) = base
+  | is_base_heap _ = false
+
+fun heap_objects index project command (HolbuildProject.Heap {name, objects, ...}) =
+  case HolbuildSourceIndex.expand_group_tokens index (HolbuildProject.project_package project) objects of
+      [] => raise Error (command ^ " target has no objects: " ^ name)
+    | expanded => expanded
+
+(* Packages already warned about: build options are computed again in every
+   round of watch mode. *)
+val warned_dependency_base_heaps : string list ref = ref []
+
+(* Like other root-only settings, a dependency's base heap does not apply to
+   the consumer's build; warn because it is easy to expect otherwise. *)
+fun warn_dependency_base_heaps resolution project =
+  let
+    val root = HolbuildProject.package_name (HolbuildProject.project_package project)
+    fun sets_base package =
+      HolbuildProject.package_name package <> root andalso
+      List.exists is_base_heap
+        (#heaps (HolbuildPackageDefinition.runtime (HolbuildProject.package_definition_of package)))
+    fun warn_once package =
+      let val name = HolbuildProject.package_name package
+      in
+        if List.exists (fn old => old = name) (!warned_dependency_base_heaps) then ()
+        else
+          (warned_dependency_base_heaps := name :: !warned_dependency_base_heaps;
+           warn ("ignoring base = true in dependency package " ^ name ^
+                 "; only the root project's base heap is used"))
+      end
+  in
+    List.app warn_once (List.filter sets_base (resolved_packages resolution project))
+  end
+
+(* A relative base heap output resolves under the artifact root, not the
+   source root like other heaps: builds export it on their own, and with
+   --source-dir several artifact roots share one source tree, which may be
+   read-only, while only the artifact root is under the project lock. *)
+fun base_heap_spec resolution project index =
+  (warn_dependency_base_heaps resolution project;
+   case List.find is_base_heap (#heaps project) of
+       SOME (heap as HolbuildProject.Heap {output, ...}) =>
+         SOME {output = HolbuildProject.abs_under (HolbuildProject.artifact_root project) output,
+               objects = heap_objects index project "heap" heap}
+     | NONE => NONE)
+
 fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, proof_steps, new_ir, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy}, targets) =
   let
     val project =
@@ -1078,7 +1124,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
        emit_output_hashes = emit_output_hashes,
        allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy,
        trknl = trknl,
-       restore_only = (case mode of RemoteExec {remote_only, ...} => remote_only | _ => false)}
+       restore_only = (case mode of RemoteExec {remote_only, ...} => remote_only | _ => false),
+       base_heap = base_heap_spec resolution project index}
     fun prepared_sources () =
       case prepared of
           SOME {index, components, ...} => {index = index, components = components}
@@ -1112,7 +1159,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           val build_options = build_options_for index entry_plan plan force_targets
       in
         timed_phase "dry_run.describe"
-          (fn () => HolbuildBuildPlan.describe (HolbuildBuildExec.build_config_lines_for_node build_options project)
+          (fn () => HolbuildBuildPlan.describe (HolbuildBuildExec.build_config_lines build_options project plan)
                       (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan)
       end
     fun execute_build () =
@@ -1415,7 +1462,7 @@ fun parse_export_args args =
 fun root_package_name project =
   HolbuildProject.package_name (HolbuildProject.project_package project)
 
-fun default_build_options trknl project index entry_plan plan =
+fun default_build_options resolution trknl project index entry_plan plan =
   let
     fun default_tactic_timeout () =
       case #build_tactic_timeout project of
@@ -1449,7 +1496,8 @@ fun default_build_options trknl project index entry_plan plan =
      emit_output_hashes = false,
      allow_cache_timeout_discrepancy = false,
      trknl = trknl,
-     restore_only = false}
+     restore_only = false,
+     base_heap = base_heap_spec resolution project index}
   end
 
 (* Input keys a plain `holbuild build` uses for PLAN's nodes; they name the
@@ -1463,9 +1511,9 @@ fun default_build_input_keys tc project index components plan =
       else SOME (timed_phase "entry_timeout.plan"
                    (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index explicit_entry_targets))
     val action_toolchain_key = HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key
-    val options = default_build_options (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)) project index entry_plan plan
+    val options = default_build_options (resolution_for_toolchain tc) (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)) project index entry_plan plan
   in
-    HolbuildBuildPlan.input_keys (HolbuildBuildExec.build_config_lines_for_node options project) action_toolchain_key plan
+    HolbuildBuildPlan.input_keys (HolbuildBuildExec.build_config_lines options project plan) action_toolchain_key plan
   end
 
 (* Heaps and executables build their ancestors plain: proof steps and their
@@ -1486,7 +1534,8 @@ fun heap_build_options trknl =
    emit_output_hashes = false,
    allow_cache_timeout_discrepancy = false,
    trknl = trknl,
-   restore_only = false}
+   restore_only = false,
+   base_heap = NONE}
 
 fun theory_node node =
   #kind (HolbuildBuildPlan.source_of node) = HolbuildSourceIndex.TheoryScript
@@ -1685,10 +1734,10 @@ fun clean_targets args =
     HolbuildBuildExec.with_project_lock project "clean" execute_clean
   end
 
-fun heap_kind_name HolbuildProject.HeapImage = "heap"
+fun heap_kind_name (HolbuildProject.HeapImage _) = "heap"
   | heap_kind_name (HolbuildProject.ExecutableImage _) = "executable"
 
-fun heap_kind_matches "heap" HolbuildProject.HeapImage = true
+fun heap_kind_matches "heap" (HolbuildProject.HeapImage _) = true
   | heap_kind_matches "executable" (HolbuildProject.ExecutableImage _) = true
   | heap_kind_matches _ _ = false
 
@@ -1716,13 +1765,13 @@ fun build_heap_kind tc cli_jobs command target =
     val _ = HolbuildDependencies.set_analyser_jobs jobs
     fun execute_heap () =
       let
-        val HolbuildProject.Heap {output, objects, kind, ...} = heap_named project command target
+        val heap = heap_named project command target
+        val HolbuildProject.Heap {output, kind, ...} = heap
+        val resolution = resolution_for_toolchain tc
         fun plan_heap () =
           let
-            val {index, components} = prepare_source_index "heap"
-                                      (resolution_for_toolchain tc) project
-            val objects = HolbuildSourceIndex.expand_group_tokens index (HolbuildProject.project_package project) objects
-            val _ = if null objects then raise Error (command ^ " target has no objects: " ^ target) else ()
+            val {index, components} = prepare_source_index "heap" resolution project
+            val objects = heap_objects index project command heap
             val plan = timed_phase "build.plan" (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index objects)
             (* Unused without proof steps, but resolved so invalid configuration is
                reported here as it is by build. *)
@@ -1732,16 +1781,34 @@ fun build_heap_kind tc cli_jobs command target =
           end
         val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
         val output_path = HolbuildProject.abs_under (#root project) output
-        fun build_plan plan =
-          HolbuildBuildExec.build (heap_build_options (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)))
-                                 tc project plan toolchain_key jobs
+        val trknl = HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)
+        (* A base heap's objects are built with the options a default build
+           uses, so the keys its users record match. *)
+        fun heap_options {index, components, plan} =
+          if is_base_heap heap then
+            let
+              val explicit_entry_targets =
+                map #2 (HolbuildTacticTimeoutPolicy.explicit_entries project index)
+              val entry_plan =
+                if null explicit_entry_targets then NONE
+                else SOME (timed_phase "entry_timeout.plan"
+                             (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index explicit_entry_targets))
+            in default_build_options resolution trknl project index entry_plan plan end
+          else heap_build_options trknl
+        fun build_plan (planned as {plan, ...}) =
+          HolbuildBuildExec.build (heap_options planned) tc project plan toolchain_key jobs
         val {index, components, plan} = plan_heap ()
-        val plan =
-          if build_generated_source_owners build_plan components (#holdir tc) index plan then #plan (plan_heap ())
-          else plan
+        val planned =
+          if build_generated_source_owners (fn p => build_plan {index = index, components = components, plan = p})
+               components (#holdir tc) index plan
+          then plan_heap ()
+          else {index = index, components = components, plan = plan}
+        val plan = #plan planned
       in
-        build_plan plan;
-        HolbuildBuildExec.export_heap tc project plan output_path kind
+        build_plan planned;
+        if is_base_heap heap then
+          HolbuildBuildExec.refresh_base_heap (heap_options planned) tc project plan toolchain_key
+        else HolbuildBuildExec.export_heap tc project plan output_path kind
       end
   in
     HolbuildBuildExec.with_project_lock project (command ^ " " ^ target) execute_heap
