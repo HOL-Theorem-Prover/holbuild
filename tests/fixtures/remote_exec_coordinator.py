@@ -4,9 +4,11 @@
 POST /v1/batches stores the batch as STATE/<id>.batch and answers 201 with its
 id.  GET /v1/batches/<id>/events runs `RUN <batch file>` (a stand-in for the
 workers), then streams one action event per action and the batch's final
-event: done when RUN exits 0, failed otherwise.  Control files in STATE
-change the answers: `refuse` makes POST answer 400, `drop` ends the event
-stream before the final event.  Every request is logged to STATE/requests.log.
+event: done when RUN exits 0, failed otherwise.  Each action is reported
+running twice first, as a coordinator repeats unchanged states.  Control
+files in STATE change the answers: `refuse` makes POST answer 400, `drop`
+ends the event stream before the final event, `skip` reports the batch done
+without running RUN.  Every request is logged to STATE/requests.log.
 """
 
 import json
@@ -27,8 +29,8 @@ class Handler(BaseHTTPRequestHandler):
         with open(state / "requests.log", "a") as log:
             log.write(f"{self.command} {self.path} {self.headers.get('Authorization', '-')}\n")
 
-    def answer(self, code, body):
-        data = json.dumps(body, separators=(",", ":")).encode()
+    def answer(self, code, body, separators=(",", ":")):
+        data = json.dumps(body, separators=separators).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
@@ -44,7 +46,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.answer(400, {"detail": "batch refused by the stub"})
         batch_id = f"b{len(list(state.glob('*.batch'))) + 1}"
         (state / f"{batch_id}.batch").write_text(body)
-        self.answer(201, {"batch_id": batch_id})
+        # Whitespace around the colon is valid JSON the client must accept.
+        self.answer(201, {"batch_id": batch_id}, separators=(", ", " : "))
 
     def do_GET(self):
         self.log_request_line()
@@ -52,13 +55,18 @@ class Handler(BaseHTTPRequestHandler):
         batch = state / f"{parts[3]}.batch" if len(parts) == 5 and parts[4] == "events" else None
         if batch is None or not batch.exists():
             return self.answer(404, {"detail": "no such batch"})
-        ok = subprocess.run([run, str(batch)]).returncode == 0
+        ok = (state / "skip").exists() or subprocess.run([run, str(batch)]).returncode == 0
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self.end_headers()
         for line in batch.read_text().splitlines():
             fields = line.split()
             if fields[0] == "action":
+                for _ in range(2):
+                    running = {"type": "action", "input_key": fields[1], "theory": fields[4],
+                               "state": "running", "tier": "standard", "attempts": 1,
+                               "last_failure": None, "log_sha256": None}
+                    self.wfile.write((json.dumps(running) + "\n").encode())
                 event = {"type": "action", "input_key": fields[1], "theory": fields[4],
                          "state": "done" if ok else "failed", "tier": "standard", "attempts": 1,
                          "last_failure": None if ok else "proof", "log_sha256": None}

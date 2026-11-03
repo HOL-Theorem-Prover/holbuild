@@ -30,27 +30,41 @@ fun curl_args url options =
 fun endpoint base path =
   (if String.isSuffix "/" base then String.substring (base, 0, size base - 1) else base) ^ path
 
-(* The string value of a top-level field in one JSON object, as the
-   coordinator writes it: NONE when the field is missing or null. *)
+(* The string value of a field in one JSON object, as the coordinator writes
+   it: NONE when the field is missing or not a string.  Only the escapes a
+   theory name, state or failure message can carry are decoded. *)
 fun json_string_field name text =
   let
-    val key = "\"" ^ name ^ "\":"
+    val key = "\"" ^ name ^ "\""
     fun unescape (#"\\" :: c :: rest) acc =
           unescape rest ((case c of #"n" => #"\n" | #"t" => #"\t" | c => c) :: acc)
       | unescape (#"\"" :: _) acc = SOME (String.implode (rev acc))
       | unescape (c :: rest) acc = unescape rest (c :: acc)
       | unescape [] _ = NONE
+    val skip_space = Substring.dropl Char.isSpace
   in
     case HolbuildStatus.find_substring key text of
         NONE => NONE
       | SOME start =>
-          let
-            val value = Substring.string (Substring.dropl Char.isSpace
-                          (Substring.extract (text, start + size key, NONE)))
+          let val after_key = skip_space (Substring.extract (text, start + size key, NONE))
           in
-            if String.isPrefix "\"" value then unescape (tl (String.explode value)) []
-            else NONE
+            case Substring.getc after_key of
+                SOME (#":", value) =>
+                  (case Substring.getc (skip_space value) of
+                       SOME (#"\"", rest) => unescape (Substring.explode rest) []
+                     | _ => NONE)
+              | _ => NONE
           end
+  end
+
+(* curl's output split into lines, and the HTTP status `-w` appends as the
+   last line (0 when no response came). *)
+fun split_status output =
+  let val lines = String.tokens (fn c => c = #"\n") output
+  in
+    case rev lines of
+        [] => ([], 0)
+      | last :: earlier => (rev earlier, Option.getOpt (Int.fromString last, 0))
   end
 
 fun write_text path text =
@@ -69,20 +83,19 @@ fun submit url batch_text : attempt =
                   ["--max-time", Int.toString request_max_time_seconds, "-X", "POST",
                    "-H", "Content-Type: text/plain", "--data-binary", "@" ^ body,
                    "-w", "\n%{http_code}"],
-         stderr = HolbuildSpawn.Discard}
+         stderr = HolbuildSpawn.Merge}
     val _ = OS.FileSys.remove body handle OS.SysErr _ => ()
-    val lines = String.tokens (fn c => c = #"\n") (#output result)
-    val status = if null lines then NONE else Int.fromString (List.last lines)
+    val (lines, status) = split_status (#output result)
+    val text = String.concatWith "\n" lines
   in
-    case (HolbuildSpawn.succeeded result, status) of
-        (true, SOME 201) =>
-          (case json_string_field "batch_id" (#output result) of
-               SOME id => Ok id
-             | NONE => Refused ("coordinator answered without a batch_id: " ^ #output result))
-      | (true, SOME code) =>
-          Refused ("coordinator refused the batch (HTTP " ^ Int.toString code ^ "): " ^
-                      String.concatWith "\n" (List.take (lines, length lines - 1)))
-      | _ => Refused ("could not reach the coordinator at " ^ url)
+    if status = 201 then
+      case json_string_field "batch_id" text of
+          SOME id => Ok id
+        | NONE => Refused ("coordinator answered without a batch_id: " ^ text)
+    else if status = 0 then
+      Refused ("could not reach the coordinator at " ^ HolbuildRemoteCache.redact_userinfo url ^
+               (if text = "" then "" else ": " ^ text))
+    else Refused ("coordinator refused the batch (HTTP " ^ Int.toString status ^ "): " ^ text)
   end
 
 fun report_action line =
@@ -104,6 +117,7 @@ fun follow url batch_id : outcome =
   let
     val states : (string * string) list ref = ref []
     val outcome : outcome option ref = ref NONE
+    val others : string list ref = ref []
     fun on_line line =
       case json_string_field "type" line of
           SOME "action" =>
@@ -124,19 +138,24 @@ fun follow url batch_id : outcome =
                                                SOME failure => ": " ^ failure
                                              | NONE => ""))
                       | NONE => Failed "finished in an unknown state")
-        | _ => ()
-    val status =
+        | _ => others := line :: !others
+    val _ =
       HolbuildSpawn.run_lines
         {program = "curl",
-         args = curl_args (endpoint url ("/v1/batches/" ^ batch_id ^ "/events")) ["-N", "-f"],
-         stderr = HolbuildSpawn.Discard}
+         args = curl_args (endpoint url ("/v1/batches/" ^ batch_id ^ "/events"))
+                  ["-N", "-w", "\n%{http_code}"],
+         stderr = HolbuildSpawn.Merge}
         on_line
+    val (lines, status) = split_status (String.concat (rev (!others)))
+    val text = String.concatWith "\n" lines
   in
     case !outcome of
         SOME outcome => outcome
       | NONE =>
-          Unreachable ("lost the coordinator's event stream for batch " ^ batch_id ^
-                       (if status = Posix.Process.W_EXITED then "" else " (curl failed)"))
+          if status = 0 orelse (status >= 200 andalso status < 300) then
+            Unreachable ("lost the coordinator's event stream for batch " ^ batch_id ^
+                         (if text = "" then "" else ": " ^ text))
+          else Failed ("can't be followed (HTTP " ^ Int.toString status ^ "): " ^ text)
   end
 
 end

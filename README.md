@@ -1069,13 +1069,15 @@ in a curl config file named by `HOLBUILD_REMOTE_EXEC_CURL_CONFIG`, such as
 
 The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the
-batch, or the batch fails, it warns and builds locally; with `--remote-only`
-it fails instead. With nothing to build remotely it goes straight to the
-local build.
+batch, or the batch fails, it warns and builds locally. With `--remote-only`
+it fails instead, and it never runs a theory locally: a theory that doesn't
+restore from the remote cache after the batch is an error. With nothing to
+build remotely it goes straight to the local build.
 
 `--detach` submits the batch, prints its id (`holbuild: remote batch <id>`)
-and exits. `--attach <id>` follows that batch and then builds as above. A
-build that loses the event stream says how to reattach.
+and exits; if the batch can't be submitted, it fails rather than building
+locally. `--attach <id>` follows that batch and then builds as above. A build
+that loses the event stream says how to reattach.
 
 The coordinator's protocol, in what holbuild uses of it:
 

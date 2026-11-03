@@ -2658,7 +2658,7 @@ fun best_failed_prefix_checkpoint requested_timeout checkpoints =
 
 datatype force_level = ForceNone | ForceTargets | ForceProject | ForceAll
 
-type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, proof_steps : bool, new_ir : bool, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool}
+type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, proof_steps : bool, new_ir : bool, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool}
 
 datatype checkpoint_policy =
   CheckpointPolicy of {checkpoint : bool, proof_steps : bool, new_ir : bool, tactic_timeout : real option, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, trknl : bool}
@@ -4054,6 +4054,9 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
          project plan keys input_key toolchain_key node metadata_checkpoints;
        HolbuildStatus.Restored)
     fun build_from_source () =
+      if #restore_only options then
+        raise Error (logical_name node ^ " is not in the remote cache, and --remote-only builds nothing locally")
+      else
       (build_theory cache_allowed policy tc project base_context plan keys toolchain_key node;
        invalidate_node_dat_hash ();
        write_metadata (#emit_output_hashes options) policy (tactic_timeout policy) project plan keys input_key toolchain_key node metadata_checkpoints;

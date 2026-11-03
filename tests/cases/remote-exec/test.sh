@@ -121,6 +121,7 @@ write_theories one
 run follow 0 build --remote-exec "$coordinator" BTheory
 require_grep "holbuild: remote batch b1" "$tmpdir/follow.log"
 require_grep "holbuild: remote rx:BTheory: done" "$tmpdir/follow.log"
+[[ $(grep -c "remote rx:BTheory: running" "$tmpdir/follow.log") -eq 1 ]] || { cat "$tmpdir/follow.log" >&2; exit 1; }
 require_grep "ATheory restored from cache" "$tmpdir/follow.log"
 require_grep "BTheory restored from cache" "$tmpdir/follow.log"
 refute_grep "Theory built" "$tmpdir/follow.log"
@@ -143,7 +144,8 @@ refute_grep "Theory built" "$tmpdir/attach.log"
 [[ $(grep -c '^POST' "$state/requests.log") -eq 2 ]] || { cat "$state/requests.log" >&2; exit 1; }
 
 # A coordinator that can't be reached, refuses the batch, or loses the
-# event stream: the build goes on locally, or fails with --remote-only.
+# event stream: the build goes on locally, or fails with --remote-only or
+# --detach.
 write_theories three
 run unreachable-only 1 build --remote-exec "$unreachable" --remote-only BTheory
 require_grep "remote execution: could not reach the coordinator at $unreachable" "$tmpdir/unreachable-only.log"
@@ -156,6 +158,8 @@ write_theories four
 touch "$state/refuse"
 run refused-only 1 build --remote-exec "$coordinator" --remote-only BTheory
 require_grep "coordinator refused the batch (HTTP 400): .*batch refused by the stub" "$tmpdir/refused-only.log"
+run refused-detach 1 build --remote-exec "$coordinator" --detach BTheory
+refute_grep "Theory built" "$tmpdir/refused-detach.log"
 run refused 0 build --remote-exec "$coordinator" BTheory
 require_grep "BTheory built" "$tmpdir/refused.log"
 rm "$state/refuse"
@@ -164,16 +168,27 @@ write_theories five
 touch "$state/drop"
 run dropped 0 build --remote-exec "$coordinator" BTheory
 require_grep "lost the coordinator's event stream for batch b3; reattach with --attach b3" "$tmpdir/dropped.log"
+require_grep "BTheory restored from cache" "$tmpdir/dropped.log"
 rm "$state/drop"
 run unknown-only 1 build --remote-exec "$coordinator" --remote-only --attach nope BTheory
-require_grep "lost the coordinator's event stream for batch nope" "$tmpdir/unknown-only.log"
+require_grep "batch nope can't be followed (HTTP 404): .*no such batch" "$tmpdir/unknown-only.log"
+refute_grep "reattach" "$tmpdir/unknown-only.log"
+
+# A batch reported done whose results aren't in the remote cache: with
+# --remote-only nothing is built locally.
+write_theories five-skip
+touch "$state/skip"
+run skipped-only 1 build --remote-exec "$coordinator" --remote-only BTheory
+require_grep "ATheory is not in the remote cache, and --remote-only builds nothing locally" "$tmpdir/skipped-only.log"
+refute_grep "Theory built" "$tmpdir/skipped-only.log"
+rm "$state/skip"
 
 # A failed batch falls back too.
 write_theories six
 touch "$state/fail"
 run failed-only 1 build --remote-exec "$coordinator" --remote-only BTheory
 require_grep "remote rx:ATheory: failed (proof)" "$tmpdir/failed-only.log"
-require_grep "remote execution: batch b4 failed: an action failed" "$tmpdir/failed-only.log"
+require_grep "remote execution: batch b5 failed: an action failed" "$tmpdir/failed-only.log"
 run failed 0 build --remote-exec "$coordinator" BTheory
 require_grep "BTheory built" "$tmpdir/failed.log"
 rm "$state/fail"

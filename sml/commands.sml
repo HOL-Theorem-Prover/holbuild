@@ -1040,7 +1040,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
        repl_on_failure = repl_on_failure,
        emit_output_hashes = emit_output_hashes,
        allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy,
-       trknl = trknl}
+       trknl = trknl,
+       restore_only = (case mode of RemoteExec {remote_only, ...} => remote_only | _ => false)}
     fun prepare_plan () =
       let
         val {index, components} =
@@ -1108,17 +1109,15 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         fun build_locally () =
           timed_phase "build.execute"
             (fn () => HolbuildBuildExec.build build_options tc project plan toolchain_key jobs)
+        (* Under --remote-only the build options only restore (restore_only);
+           a detached build has nothing to fall back to. *)
         fun fall_back reason =
-          if remote_only then raise Error ("remote execution: " ^ reason)
+          if remote_only orelse detach then raise Error ("remote execution: " ^ reason)
           else (HolbuildBuildExec.warn ("remote execution: " ^ reason ^ "; building locally");
                 build_locally ())
-        fun restore () =
-          if remote_only andalso has_actions (export false) then
-            raise Error "remote execution: the batch finished, but the remote cache still lacks some of its theories"
-          else build_locally ()
         fun finish batch_id =
           case HolbuildRemoteExec.follow url batch_id of
-              HolbuildRemoteExec.Done => restore ()
+              HolbuildRemoteExec.Done => build_locally ()
             | HolbuildRemoteExec.Failed reason => fall_back ("batch " ^ batch_id ^ " " ^ reason)
             | HolbuildRemoteExec.Unreachable reason =>
                 fall_back (reason ^ "; reattach with --attach " ^ batch_id)
@@ -1401,7 +1400,8 @@ fun export_build_options trknl project index entry_plan plan =
      repl_on_failure = false,
      emit_output_hashes = false,
      allow_cache_timeout_discrepancy = false,
-     trknl = trknl}
+     trknl = trknl,
+     restore_only = false}
   end
 
 (* Heaps and executables build their ancestors plain: proof steps and their
@@ -1421,7 +1421,8 @@ fun heap_build_options trknl =
    repl_on_failure = false,
    emit_output_hashes = false,
    allow_cache_timeout_discrepancy = false,
-   trknl = trknl}
+   trknl = trknl,
+   restore_only = false}
 
 fun theory_node node =
   #kind (HolbuildBuildPlan.source_of node) = HolbuildSourceIndex.TheoryScript
