@@ -65,7 +65,27 @@ val _ =
   end;
 val _ =
   case #lookupStruct PolyML.globalNameSpace "TheoryModules" of
-      NONE => print "module-cache unsupported\n"
+      NONE =>
+        let
+          fun sub (ns : PolyML.NameSpace.nameSpace) name =
+            Option.map PolyML.NameSpace.Structures.contents (#lookupStruct ns name)
+          val meta = sub PolyML.globalNameSpace "Meta"
+          val save = Option.mapPartial (fn ns => sub ns "SaveState")
+                       (sub PolyML.globalNameSpace "PolyML")
+          fun has ns name = Option.isSome (#lookupVal ns name)
+          val supported =
+            (case meta of NONE => false
+             | SOME ns => has ns "configureTheoryModuleCache") andalso
+            (case save of NONE => false
+             | SOME ns => List.all (has ns)
+                 ["showHierarchyWithIds", "saveDependentModuleBasic"]) andalso
+            OS.FileSys.access
+              (OS.Path.concat (Systeml.HOLDIR, "tools-poly/poly/theory_modules.ML"),
+               [OS.FileSys.A_READ])
+        in
+          if supported then raise Fail "module cache was not configured"
+          else print "module-cache unsupported\n"
+        end
     | SOME _ => CompilerSpecific.quietbind
         (String.concat
           ["val _ = let val {hits,misses,writes} = TheoryModules.statistics() ",
