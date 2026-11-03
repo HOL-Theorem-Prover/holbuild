@@ -5531,6 +5531,8 @@ fun verify_action_spec (spec : action_spec) =
     check (List.all direct_dep_ok (action_text_values spec "dep="))
       "a dependency's key does not match the action text";
     check (same_files (text_inputs, spec_inputs)) "the extra inputs do not match the action text";
+    check (same_files (action_text_values spec "source_extra_output=", #extra_outputs spec))
+      "the extra outputs do not match the action text";
     check (List.all (fn {suffix, ...} => suffix = ".ui" orelse suffix = ".uo") (#libs spec))
       "a library manifest is neither .ui nor .uo";
     List.app (fn path => check (not (escapes path)) ("path " ^ path ^ " leaves the action root"))
@@ -5699,12 +5701,34 @@ fun action_already_done root (spec : action_spec) =
     handle _ => false
   end
 
-(* Step 6: the remote now holds an entry for the action with this build's
-   outputs, a timeout contract at least as strict as the spec's, and every
-   blob it names (the publish only warns when an upload fails). *)
+(* Uploads every blob of the local entry for key, raising if one fails (the
+   build's own publish only warns), then puts the action.  A different entry
+   already there is left for check_remote_publication to judge. *)
+fun publish_action_entry remote key =
+  let
+    val local_cache = HolbuildFSCacheBackend.filesystem (cache_root ())
+    val source = fs_cache_source local_cache
+    val destination = remote_cache_destination remote
+    val tmp_dir = HolbuildFSCacheBackend.tmp_dir local_cache
+    val manifest =
+      case #get_action source key of
+          SOME text => text
+        | NONE => raise ActionFailed (PublishFailure, "the build published no local cache entry")
+  in
+    ensure_dir tmp_dir;
+    (List.app (fn hash => ignore (HolbuildCacheTransfer.copy_blob source destination tmp_dir hash (0, 0)))
+       (HolbuildCacheTransfer.unique_blobs manifest)
+     handle e => raise ActionFailed (PublishFailure, "could not publish the entry: " ^ General.exnMessage e));
+    ignore (#put_action destination HolbuildCacheBackend.PutIfAbsentOrSame {key = key, text = manifest})
+  end
+
+(* Step 6: publish the entry, then check that the remote holds an entry for
+   the action with this build's outputs and a timeout contract at least as
+   strict as the spec's. *)
 fun check_remote_publication remote (spec : action_spec) =
   let
     val key = #input_key spec
+    val _ = publish_action_entry remote key
     val local_manifest = HolbuildCache.get_action (cache_root ()) key
     val remote_manifest = HolbuildRemoteCache.get_action remote key
     fun fail msg = raise ActionFailed (PublishFailure, msg)
@@ -5718,11 +5742,7 @@ fun check_remote_publication remote (spec : action_spec) =
           else if not (timeout_satisfies (#tactic_timeout spec)
                          (cache_manifest_proof_timeout (cache_manifest_lines theirs))) then
             fail "the remote cache's entry has a weaker timeout contract than requested"
-          else
-            case List.find (not o HolbuildRemoteCache.has_blob remote)
-                           (HolbuildCacheTransfer.unique_blobs theirs) of
-                SOME hash => fail ("the remote cache lacks blob " ^ hash ^ " of the action's entry")
-              | NONE => ()
+          else ()
   end
 
 (* The OOM killer's count for this process's cgroup (v2), if readable. *)
@@ -5973,8 +5993,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, toolchain} =
         if action_already_done root spec then
           (* The entry may have come from the worker's local cache, so make
              sure the remote, where the result counts, holds it too. *)
-          (publish_remote_cache_key_if_usable cache (#input_key spec);
-           check_remote_publication remote spec;
+          (check_remote_publication remote spec;
            "cached")
         else
           let

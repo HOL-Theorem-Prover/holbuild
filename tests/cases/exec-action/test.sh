@@ -167,6 +167,17 @@ spec_other=$(sha256sum "$tmpdir/other-input" | cut -d' ' -f1)
 curl -fsS -X PUT --data-binary "@$tmpdir/other-input" "$remote_url/cas/$spec_other"
 worker other-input "$spec_other"
 expect other-input 4 "status=failed" "failure=spec-rejected"
+# Or one with an extra output its action text doesn't declare.
+python3 - "$project/.holbuild/action-specs/$spec_a" "$tmpdir/extra-output" <<'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+open(sys.argv[2], "wb").write(data.replace(b"\naction-text\n", b"\noutput extra extra.txt\naction-text\n", 1))
+PY
+spec_extra=$(sha256sum "$tmpdir/extra-output" | cut -d' ' -f1)
+curl -fsS -X PUT --data-binary "@$tmpdir/extra-output" "$remote_url/cas/$spec_extra"
+worker extra-output "$spec_extra"
+expect extra-output 4 "status=failed" "failure=spec-rejected"
+require_grep "the extra outputs do not match the action text" "$tmpdir/extra-output.log"
 worker absent "$(printf 'absent' | sha256sum | cut -d' ' -f1)"
 expect absent 4 "status=failed" "failure=spec-rejected"
 

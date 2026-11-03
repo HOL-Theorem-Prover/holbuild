@@ -189,3 +189,12 @@ evicted "$cache2/actions/older" "the least recently used entry over the cap"
 evicted "$cache2/blobs/$own" "a blob only an evicted entry named"
 kept "$cache2/actions/newer" "an entry once the cache fits"
 kept "$cache2/blobs/$shared" "a blob a surviving entry names"
+
+# An error outside the action, here no remote cache, is an infrastructure
+# failure (exit 3), never the final exit 1.
+set +e
+env -u HOLBUILD_REMOTE_CACHE_URL "$HOLBUILD_BIN" exec-action "$absent" --cache-limit-gb 7 \
+  > "$tmpdir/exec4.log" 2>&1
+status=$?
+set -e
+[[ $status -eq 3 ]] || { echo "exec-action without a remote exited $status, wanted 3" >&2; cat "$tmpdir/exec4.log" >&2; exit 1; }
