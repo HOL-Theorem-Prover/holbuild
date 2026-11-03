@@ -147,29 +147,59 @@ fun reap pid =
       SOME (_, status) => status
     | NONE => (ignore (Posix.Process.sleep (Time.fromMilliseconds 1)); reap pid)
 
+(* Starts the child with its stdout on a pipe; returns the pipe's read end. *)
+fun launch request =
+  with_launch_lock (fn () =>
+    let
+      val {infd, outfd} = Posix.IO.pipe ()
+      val _ = Posix.IO.setfd (infd, Posix.IO.FD.cloexec)
+      val _ = Posix.IO.setfd (outfd, Posix.IO.FD.cloexec)
+      val pid = spawn request outfd
+                handle e => (Posix.IO.close infd; Posix.IO.close outfd; raise e)
+    in
+      Posix.IO.close outfd;
+      (infd, pid)
+    end)
+
 (* Runs program (searched in PATH) with args and returns its exit status and
    stdout.  A program that cannot be started reports exit status 127, as a
    shell would. *)
 fun run request : result =
   let
-    val (read_fd, pid) =
-      with_launch_lock (fn () =>
-        let
-          val {infd, outfd} = Posix.IO.pipe ()
-          val _ = Posix.IO.setfd (infd, Posix.IO.FD.cloexec)
-          val _ = Posix.IO.setfd (outfd, Posix.IO.FD.cloexec)
-          val pid = spawn request outfd
-                    handle e => (Posix.IO.close infd; Posix.IO.close outfd; raise e)
-        in
-          Posix.IO.close outfd;
-          (infd, pid)
-        end)
+    val (read_fd, pid) = launch request
   in
     case pid of
         NONE => (Posix.IO.close read_fd; {status = Posix.Process.W_EXITSTATUS 0w127, output = ""})
       | SOME pid =>
           let val output = read_to_end read_fd
           in {status = reap pid, output = output} end
+  end
+
+(* Like run, but hands each line of stdout to on_line as it arrives, for a
+   child that streams, and returns only the exit status. *)
+fun run_lines request on_line =
+  let
+    val (read_fd, pid) = launch request
+  in
+    case pid of
+        NONE => (Posix.IO.close read_fd; Posix.Process.W_EXITSTATUS 0w127)
+      | SOME pid =>
+          let
+            val reader = Posix.IO.mkTextReader {fd = read_fd, name = "child stdout", initBlkMode = true}
+            val input = TextIO.mkInstream (TextIO.StreamIO.mkInstream (reader, ""))
+            fun loop () =
+              case TextIO.inputLine input of
+                  SOME line => (on_line line; loop ())
+                | NONE => ()
+          in
+            (loop (); TextIO.closeIn input)
+            handle e =>
+              (TextIO.closeIn input;
+               Posix.Process.kill (Posix.Process.K_PROC pid, Posix.Signal.term);
+               ignore (reap pid);
+               raise e);
+            reap pid
+          end
   end
 
 fun succeeded ({status, ...} : result) = status = Posix.Process.W_EXITED

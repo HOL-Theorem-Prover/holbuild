@@ -506,7 +506,14 @@ fun build_analyser k =
        out)
   end
 
+(* Set by `build --remote-only`, which must find the toolchain in a cache
+   rather than build HOL locally. *)
+val restore_only = ref false
+
 fun build_entry jobs req k =
+  if !restore_only then
+    die "the HOL toolchain could not be restored from a cache, and --remote-only builds nothing locally"
+  else
   let
     val final = entry_dir_for_key k
     val hol = holdir_for_key k
