@@ -194,7 +194,15 @@ fun publish {remote, identity, entry_dir, replace} =
           val _ = upload hash
         in
           case put_action {key = identity, text = remote_record hash} of
-              result as HolbuildCacheBackend.Published => result
+              HolbuildCacheBackend.Published =>
+                (* HTTP has no compare-and-swap: two builders can both see no
+                   record and both put one, so only a record that still names
+                   this archive counts as ours. *)
+                (case HolbuildRemoteCache.get_action remote identity of
+                     SOME text =>
+                       if (parse_remote_record text = hash handle _ => false) then HolbuildCacheBackend.Published
+                       else HolbuildCacheBackend.AlreadyPresent
+                   | NONE => HolbuildCacheBackend.AlreadyPresent)
             | result as HolbuildCacheBackend.AlreadyPresent => result
             | HolbuildCacheBackend.Skipped => die "remote cache skipped toolchain action publication"
             | HolbuildCacheBackend.Conflict detail => die ("remote cache rejected toolchain action: " ^ detail)
