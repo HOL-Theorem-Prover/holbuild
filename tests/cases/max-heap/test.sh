@@ -62,8 +62,13 @@ for spelling in "--maxheap 4096" "--maxheap=4096"; do
   require_grep "^holbuild: ${spelling% *} is consumed by holbuild.s Poly/ML runtime .* use --max-heap MB$" "$tmpdir/rejected.out"
 done
 
-# The same holds for every other Poly/ML runtime option, wherever it appears:
-# passed to run or repl, it would never reach HOL.
+# Other Poly/ML runtime options may tune holbuild's own runtime on purpose.
+(cd "$project" && "$HOLBUILD_BIN" --gcthreads 1 build ATheory) > "$tmpdir/gcthreads.out" 2>&1 || {
+  cat "$tmpdir/gcthreads.out" >&2
+  exit 1
+}
+
+# But passed to run or repl, wherever they appear, they would never reach HOL.
 reject_runtime_option() {
   local option=$1
   shift

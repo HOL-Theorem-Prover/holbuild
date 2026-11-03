@@ -308,9 +308,9 @@ Common global options:
 - `--max-heap MB`: Poly/ML maximum heap size for child HOL processes. Do not
   use `--maxheap`: holbuild is itself a Poly/ML program, and its runtime takes
   `--maxheap MB` as the cap on holbuild's own heap, so the option never reaches
-  holbuild and child HOL processes run uncapped. holbuild rejects `--maxheap`,
-  like every Poly/ML runtime option, where it can detect it (Linux), so there it
-  cannot be used to cap holbuild's own heap either.
+  holbuild and child HOL processes run uncapped. holbuild rejects `--maxheap`
+  where it can detect it (Linux), so there it cannot be used to cap holbuild's
+  own heap either.
 - `--cooperate-dir DIR` (or `HOLBUILD_COOPERATE_DIR`): share a machine memory
   budget with every holbuild process using `DIR`. See below.
 - `--machine-max-mem MB`: the budget to record in `DIR/budget` when that file

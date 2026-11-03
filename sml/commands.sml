@@ -2130,29 +2130,39 @@ fun process_arguments () =
 (* The Poly/ML runtime removes its own options (--maxheap, --gcthreads, -H,
    ...) and their values from the command line before CommandLine.arguments,
    so they set holbuild's own runtime and never reach HOL. The process's own
-   arguments, readable where /proc exists, still hold them: the first one that
-   CommandLine.arguments lacks and that starts with "-", as every runtime
-   option does, is such an option. Others (the program path, when a dynamic
-   loader started holbuild) never reached the runtime. *)
-fun reject_runtime_options args =
+   arguments, readable where /proc exists, still hold them: those that
+   CommandLine.arguments lacks and that start with "-", as every runtime
+   option does, are such options. Others (an option's value; the program
+   path, when a dynamic loader started holbuild) are skipped. *)
+fun runtime_options args =
   let
-    fun consumed [] _ = NONE
+    fun consumed [] _ = []
       | consumed (x :: xs) (y :: ys) = if x = y then consumed xs ys else missing x xs (y :: ys)
       | consumed (x :: xs) [] = missing x xs []
-    and missing x xs ys = if String.isPrefix "-" x then SOME x else consumed xs ys
+    and missing x xs ys = if String.isPrefix "-" x then x :: consumed xs ys else consumed xs ys
   in
-    case consumed (process_arguments ()) args of
-        NONE => ()
-      | SOME arg =>
-          raise Error (arg ^ " is consumed by holbuild's Poly/ML runtime and does not reach child HOL processes" ^
-                       (if String.isPrefix "--maxheap" arg then "; use --max-heap MB" else ""))
+    consumed (process_arguments ()) args
+  end
+
+(* --maxheap would cap holbuild's own heap, never HOL's, so it is always an
+   error. Other runtime options may tune holbuild's own runtime on purpose,
+   except with run and repl, whose extra arguments are meant for HOL. *)
+fun reject_runtime_options options args =
+  let
+    val consumed = " is consumed by holbuild's Poly/ML runtime and does not reach child HOL processes"
+  in
+    case (List.find (String.isPrefix "--maxheap") options, options, args) of
+        (SOME arg, _, _) => raise Error (arg ^ consumed ^ "; use --max-heap MB")
+      | (NONE, arg :: _, command :: _) =>
+          if command = "run" orelse command = "repl" then raise Error (arg ^ consumed) else ()
+      | _ => ()
   end
 
 fun main raw_args =
   (let
      val _ = install_signal_handlers ()
      val _ = HolbuildStatus.set_json_mode (List.exists (fn s => s = "--json") raw_args)
-     val _ = reject_runtime_options raw_args
+     val runtime_options = runtime_options raw_args
      val _ =
        if raw_args = ["--version"] then
          (print ("holbuild " ^ HolbuildVersion.version ^ "\n"); OS.Process.exit OS.Process.success)
@@ -2161,6 +2171,7 @@ fun main raw_args =
        else ()
      val (cooperate_dir, machine_max_mem, child_charge, raw_args) = parse_cooperation_options raw_args
      val (options, args) = parse_global_options raw_args
+     val _ = reject_runtime_options runtime_options args
    in
      configure_cooperation cooperate_dir machine_max_mem child_charge (#maxheap options);
      dispatch_with_options options args
