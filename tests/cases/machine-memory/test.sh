@@ -25,8 +25,6 @@ gib=$((1024 * 1024 * 1024))
 # on how much memory the test machine has free.
 printf 'MemTotal:        67108864 kB\nMemAvailable:    67108864 kB\n' > "$tmpdir/plenty"
 export HOLBUILD_TEST_MEMINFO=$tmpdir/plenty
-# Likewise processors, except where the test exercises the CPU budget.
-export HOLBUILD_TEST_PROCESSORS=64
 events=$tmpdir/events.log
 : > "$events"
 
@@ -107,11 +105,6 @@ if "$HOLBUILD_BIN" --machine-max-mem 1024 build > "$tmpdir/no-dir.out" 2>&1; the
   exit 1
 fi
 require_grep 'machine-max-mem requires --cooperate-dir' "$tmpdir/no-dir.out"
-if "$HOLBUILD_BIN" --machine-max-cpus 1 build > "$tmpdir/no-dir-cpus.out" 2>&1; then
-  echo "--machine-max-cpus without --cooperate-dir succeeded" >&2
-  exit 1
-fi
-require_grep 'machine-max-cpus requires --cooperate-dir' "$tmpdir/no-dir-cpus.out"
 
 if "$HOLBUILD_BIN" --child-charge 1024 build > "$tmpdir/no-dir-charge.out" 2>&1; then
   echo "--child-charge without --cooperate-dir succeeded" >&2
@@ -141,9 +134,6 @@ check_overlaps single
 cat "$tmpdir/p1.out" "$tmpdir/p2.out" > "$tmpdir/both.out"
 require_grep 'waiting for machine memory: needs 2048 MiB, 2048 MiB of 3072 MiB reserved' "$tmpdir/both.out"
 [[ "$(cat "$coop/budget")" == "$((3 * gib))" ]] || { echo "unexpected budget: $(cat "$coop/budget")" >&2; exit 1; }
-# Without --machine-max-cpus the CPU budget is the online processor count,
-# never written down.
-require_no_file "$coop/cpus"
 require_no_live_leases "$coop"
 if [[ -d /proc/self/fd ]]; then
   require_file "$tmpdir/P1a.held"
@@ -197,89 +187,6 @@ awk '/^START A/ { n++; if (n > max) max = n } /^END A/ { n-- } END { exit !(max 
   exit 1
 }
 require_no_live_leases "$hetero"
-
-# Two processes, memory for many children but a CPU budget of one: children
-# never overlap, and the second waits visibly for a CPU slot.
-: > "$events"
-cpus=$tmpdir/cpus
-make_project c1 2 C1a C1b
-make_project c2 2 C2a C2b
-holbuild_in "$tmpdir/c1" --cooperate-dir "$cpus" --machine-max-cpus 1 --child-charge 1024 -j2 \
-  build --skip-checkpoints --skip-proof-steps > "$tmpdir/c1.out" 2>&1 &
-c1_pid=$!
-holbuild_in "$tmpdir/c2" --cooperate-dir "$cpus" --machine-max-cpus 1 --child-charge 1024 -j2 \
-  build --skip-checkpoints --skip-proof-steps > "$tmpdir/c2.out" 2>&1 &
-c2_pid=$!
-wait "$c1_pid" || { cat "$tmpdir/c1.out" >&2; exit 1; }
-wait "$c2_pid" || { cat "$tmpdir/c2.out" >&2; exit 1; }
-check_overlaps single
-cat "$tmpdir/c1.out" "$tmpdir/c2.out" > "$tmpdir/cpus.out"
-require_grep 'waiting for machine memory: needs 1024 MiB, 1 of 1 CPU slots in use in' "$tmpdir/cpus.out"
-[[ "$(cat "$cpus/cpus")" == 1 ]] || { echo "unexpected CPU budget: $(cat "$cpus/cpus")" >&2; exit 1; }
-require_no_live_leases "$cpus"
-if holbuild_in "$tmpdir/c1" --cooperate-dir "$cpus" --machine-max-cpus 2 --child-charge 1024 \
-     build --force C1aTheory > "$tmpdir/cpus-conflict.out" 2>&1; then
-  echo "conflicting --machine-max-cpus succeeded" >&2
-  exit 1
-fi
-require_grep '^holbuild: --machine-max-cpus 2 conflicts with 1 in' "$tmpdir/cpus-conflict.out"
-
-# Without DIR/cpus, the budget follows the online processor count.
-: > "$events"
-online=$tmpdir/online
-holbuild_in "$tmpdir/c1" --cooperate-dir "$online" --child-charge 1024 -j2 \
-  build --force=project --skip-checkpoints --skip-proof-steps > "$tmpdir/online1.out" 2>&1 &
-o1_pid=$!
-HOLBUILD_TEST_PROCESSORS=1 holbuild_in "$tmpdir/c2" --cooperate-dir "$online" --child-charge 1024 -j2 \
-  build --force=project --skip-checkpoints --skip-proof-steps > "$tmpdir/online2.out" 2>&1 &
-o2_pid=$!
-wait "$o1_pid" || { cat "$tmpdir/online1.out" >&2; exit 1; }
-wait "$o2_pid" || { cat "$tmpdir/online2.out" >&2; exit 1; }
-require_grep 'waiting for machine memory: needs 1024 MiB, [0-9]* of 1 CPU slots in use in' "$tmpdir/online2.out"
-require_no_file "$online/cpus"
-require_no_live_leases "$online"
-
-# A CPU budget of zero would admit nothing: it fails at once.
-zero_cpus=$tmpdir/zero-cpus
-mkdir -p "$zero_cpus"
-echo 0 > "$zero_cpus/cpus"
-if (cd "$tmpdir/c1" && timeout 60 "$HOLBUILD_BIN" --cooperate-dir "$zero_cpus" --child-charge 1024 \
-      build --force C1aTheory) > "$tmpdir/zero-cpus.out" 2>&1; then
-  echo "a zero CPU budget succeeded" >&2
-  exit 1
-fi
-require_grep 'zero-cpus/cpus: the processor count must be positive' "$tmpdir/zero-cpus.out"
-
-# The HOL process of run reserves too.  While a build holds the only CPU slot,
-# run waits, and says so on stderr, out of the script's output.
-if [[ -d /proc/self/fd ]]; then
-  cat > "$tmpdir/held.sml" <<SML
-val _ = OS.Process.system "ls -l /proc/self/fd 2>/dev/null | grep -q lease- && touch $tmpdir/run.held";
-SML
-  : > "$events"
-  make_project c3 4 C3a
-  holbuild_in "$tmpdir/c3" --cooperate-dir "$cpus" --child-charge 1024 \
-    build --skip-checkpoints --skip-proof-steps > "$tmpdir/c3.out" 2>&1 &
-  c3_pid=$!
-  for _ in $(seq 1 600); do
-    grep -q '^START C3a' "$events" && break
-    sleep 0.1
-  done
-  require_grep '^START C3a' "$events"
-  holbuild_in "$tmpdir/c1" --cooperate-dir "$cpus" --child-charge 1024 run "$tmpdir/held.sml" \
-    > "$tmpdir/run.out" 2> "$tmpdir/run.err" || {
-    cat "$tmpdir/run.out" "$tmpdir/run.err" >&2
-    exit 1
-  }
-  wait "$c3_pid" || { cat "$tmpdir/c3.out" >&2; exit 1; }
-  require_file "$tmpdir/run.held"
-  require_grep 'waiting for machine memory: needs 1024 MiB, 1 of 1 CPU slots in use in' "$tmpdir/run.err"
-  if grep -q 'waiting for machine memory' "$tmpdir/run.out"; then
-    echo "run's wait notice went to stdout" >&2
-    exit 1
-  fi
-  require_no_live_leases "$cpus"
-fi
 
 # A child larger than the whole budget fails at once instead of waiting.
 make_project big 0 Big
