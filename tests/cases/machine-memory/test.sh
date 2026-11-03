@@ -139,6 +139,9 @@ check_overlaps single
 cat "$tmpdir/p1.out" "$tmpdir/p2.out" > "$tmpdir/both.out"
 require_grep 'waiting for machine memory: needs 2048 MiB, 2048 MiB of 3072 MiB reserved' "$tmpdir/both.out"
 [[ "$(cat "$coop/budget")" == "$((3 * gib))" ]] || { echo "unexpected budget: $(cat "$coop/budget")" >&2; exit 1; }
+# Without --machine-max-cpus the CPU budget is the live processor count, never
+# written down.
+require_no_file "$coop/cpus"
 require_no_live_leases "$coop"
 if [[ -d /proc/self/fd ]]; then
   require_file "$tmpdir/P1a.held"
@@ -219,16 +222,45 @@ if holbuild_in "$tmpdir/c1" --cooperate-dir "$cpus" --machine-max-cpus 2 --child
 fi
 require_grep '^holbuild: --machine-max-cpus 2 conflicts with 1 in' "$tmpdir/cpus-conflict.out"
 
-# The HOL process of run reserves too.
+# A CPU budget of zero would admit nothing: it fails at once.
+zero_cpus=$tmpdir/zero-cpus
+mkdir -p "$zero_cpus"
+echo 0 > "$zero_cpus/cpus"
+if (cd "$tmpdir/c1" && timeout 60 "$HOLBUILD_BIN" --cooperate-dir "$zero_cpus" --child-charge 1024 \
+      build --force C1aTheory) > "$tmpdir/zero-cpus.out" 2>&1; then
+  echo "a zero CPU budget succeeded" >&2
+  exit 1
+fi
+require_grep 'zero-cpus/cpus: the processor count must be positive' "$tmpdir/zero-cpus.out"
+
+# The HOL process of run reserves too.  While a build holds the only CPU slot,
+# run waits, and says so on stderr, out of the script's output.
 if [[ -d /proc/self/fd ]]; then
   cat > "$tmpdir/held.sml" <<SML
 val _ = OS.Process.system "ls -l /proc/self/fd 2>/dev/null | grep -q lease- && touch $tmpdir/run.held";
 SML
-  holbuild_in "$tmpdir/c1" --cooperate-dir "$cpus" run "$tmpdir/held.sml" > "$tmpdir/run.out" 2>&1 || {
-    cat "$tmpdir/run.out" >&2
+  : > "$events"
+  make_project c3 4 C3a
+  holbuild_in "$tmpdir/c3" --cooperate-dir "$cpus" --child-charge 1024 \
+    build --skip-checkpoints --skip-proof-steps > "$tmpdir/c3.out" 2>&1 &
+  c3_pid=$!
+  for _ in $(seq 1 600); do
+    grep -q '^START C3a' "$events" && break
+    sleep 0.1
+  done
+  require_grep '^START C3a' "$events"
+  holbuild_in "$tmpdir/c1" --cooperate-dir "$cpus" --child-charge 1024 run "$tmpdir/held.sml" \
+    > "$tmpdir/run.out" 2> "$tmpdir/run.err" || {
+    cat "$tmpdir/run.out" "$tmpdir/run.err" >&2
     exit 1
   }
+  wait "$c3_pid" || { cat "$tmpdir/c3.out" >&2; exit 1; }
   require_file "$tmpdir/run.held"
+  require_grep 'waiting for machine memory: needs 1024 MiB, 1 of 1 CPU slots in use in' "$tmpdir/run.err"
+  if grep -q 'waiting for machine memory' "$tmpdir/run.out"; then
+    echo "run's wait notice went to stdout" >&2
+    exit 1
+  fi
   require_no_live_leases "$cpus"
 fi
 

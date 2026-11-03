@@ -535,7 +535,9 @@ fun message_to stream_name stream text =
 
 (* Marks the node built by the calling thread as waiting for machine memory
    (SOME detail) or no longer waiting (NONE).  A wait outside any node, such
-   as a heap export, is reported without a label. *)
+   as a heap export, is reported without a label, and with no status line, as
+   for the HOL process of run or check, on stderr, so that it stays out of
+   that process's output. *)
 fun set_waiting_for_memory detail =
   let
     val self = Thread.self ()
@@ -544,7 +546,7 @@ fun set_waiting_for_memory detail =
       if Thread.equal (thread, self) then
         {key = key, label = label, started_at = started_at, thread = thread, waiting = waiting}
       else node
-    fun announce label =
+    fun announce stream label =
       case detail of
           NONE => ()
         | SOME text =>
@@ -554,13 +556,13 @@ fun set_waiting_for_memory detail =
                  [json_string_field "detail" text])
             else if quiet_mode () then ()
             else
-              (TextIO.output (TextIO.stdOut,
+              (TextIO.output (stream,
                  Option.getOpt (Option.map #2 label, "holbuild") ^
                  " waiting for machine memory: " ^ text ^ "\n");
-               TextIO.flushOut TextIO.stdOut)
+               TextIO.flushOut stream)
   in
     case !current_status of
-        NONE => announce NONE
+        NONE => announce TextIO.stdErr NONE
       | SOME status =>
           with_lock status (fn () =>
             let
@@ -571,7 +573,7 @@ fun set_waiting_for_memory detail =
               else
                 (active := map mark (!active);
                  if enabled andalso not (json_mode ()) then redraw status
-                 else announce (Option.map (fn {key, label, ...} => (key, label)) own))
+                 else announce TextIO.stdOut (Option.map (fn {key, label, ...} => (key, label)) own))
             end)
   end
 

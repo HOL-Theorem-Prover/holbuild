@@ -226,7 +226,10 @@ fun current_cpus dir cpus =
   in
     case open_existing path of
         SOME fd =>
-          let val stored = read_number "a decimal processor count" path fd before close fd
+          let
+            val stored = read_number "a decimal processor count" path fd before close fd
+            val _ = if stored > 0 then ()
+                    else raise Error (path ^ ": the processor count must be positive")
           in
             case cpus of
                 SOME n =>
