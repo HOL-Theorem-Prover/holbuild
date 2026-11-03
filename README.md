@@ -368,6 +368,12 @@ toolchain builds nor `check`, `run` or `repl`.
   `flock`ed by holbuild and inherited by the child, so a killed holbuild's
   reservation ends with its children, with no timeout. A lease nobody holds no
   longer counts and is removed by the next process that scans `DIR`.
+- Each admission scans `DIR` while holding `DIR/lock`. A child waits for that
+  lock while another process holds it, printing
+  `holbuild: waiting Ns for machine-memory lock DIR/lock` every 30 s, for up
+  to `HOLBUILD_COOPERATE_LOCK_TIMEOUT` seconds (default 600; `0` waits with no
+  limit), and then the build fails. If `flock` itself fails (a filesystem
+  without it), the build fails at once.
 - For several users, create `DIR` writable by all of them (for example mode
   `1777`, or `2775` with a shared group) on a local filesystem. holbuild makes
   its files readable by everyone.
@@ -793,6 +799,14 @@ HOLBUILD_REMOTE_CACHE_URL=https://cache.example.org holbuild build MyTheory
 ```
 
 Remote cache misses or errors fall back to the local cache/source build path.
+A request waits at most 5 s for its connection. After three requests in a row
+get no response at all (no connection, or a timeout), holbuild warns once and
+leaves the remote cache alone for the rest of the run, so an unreachable cache
+costs a build a bounded amount of time; an HTTP error status doesn't count
+towards the three, and any response resets the count. In the status line and
+`--json`'s `build_finished` event, `from_cache` counts every theory restored
+from a cache, and `from_remote` the ones among them whose entries this run
+copied from the remote cache.
 While a build runs, `--prefetch-concurrency` background threads (twice `-j` by
 default) also copy the remote entries of the plan's out-of-date theories into
 the local cache in build order, so a theory's restore usually finds its entry

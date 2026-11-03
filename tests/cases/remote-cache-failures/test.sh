@@ -55,7 +55,7 @@ while [[ $# -gt 0 ]]; do
     *) shift ;;
   esac
 done
-[[ "$connect_timeout" == 10 && "$max_time" == 30 ]] || {
+[[ "$connect_timeout" == 5 && "$max_time" == 30 ]] || {
   echo "missing curl timeout policy" >&2
   exit 99
 }
@@ -97,7 +97,7 @@ build_with_failure() {
       HOLBUILD_TEST_CURL_LOG="$curl_log" HOLBUILD_TEST_HTTP_CODE="$http_code" \
       HOLBUILD_TEST_CURL_STATUS="$curl_status" HOLBUILD_TEST_LIBCURL=libholbuild-test-no-such-curl.so \
       "$HOLBUILD_BIN" -j2 --remote-cache http://cache.invalid build ATheory BTheory CTheory) > "$log" 2>&1
-    require_grep 'connect-timeout 10 --max-time 30' "$curl_log"
+    require_grep 'connect-timeout 5 --max-time 30' "$curl_log"
     if grep -q 'missing curl timeout policy' "$log"; then
       cat "$log" >&2
       exit 1
@@ -130,6 +130,15 @@ build_with_failure() {
     cat "$log" >&2
     exit 1
   fi
+  # Only requests that get no response at all turn the remote cache off.
+  disabled_count=$(grep -c 'warning: remote cache disabled for the rest of this run' "$log" || true)
+  expected=0
+  [[ "$failure" != transport ]] || expected=1
+  if [[ "$disabled_count" != "$expected" ]]; then
+    echo "expected $expected disabled warnings for $failure with $client, found $disabled_count" >&2
+    cat "$log" >&2
+    exit 1
+  fi
 }
 
 for failure in 404 401 403 503 transport; do
@@ -141,3 +150,83 @@ done
 archive=$tmpdir/cache.hbx
 (cd "$project" && TMPDIR="$tmpdir/tmp" "$HOLBUILD_BIN" export -o "$archive" ATheory) > "$tmpdir/export.log" 2>&1
 TMPDIR="$tmpdir/tmp" HOLBUILD_CACHE="$tmpdir/import-cache" "$HOLBUILD_BIN" import "$archive" > "$tmpdir/import.log" 2>&1
+
+# An unreachable cache costs at most the three failed requests that turn it
+# off, plus the one other request in flight then: with one build job and one
+# prefetch thread, no more than four requests are sent.  192.0.2.1 is a
+# documentation address (RFC 5737), so a connection to it waits for the
+# connect timeout or fails at once.  The wall-time bound has room for the
+# four requests' timeouts and load noise, but not for the dozens of requests
+# a build of three theories sends to a cache that stays on.
+build_seconds() {
+  local log=$1
+  shift
+  use_case_cache "$tmpdir/cache-timed-$(basename "$log" .log)"
+  rm -rf "$project/.holbuild"
+  local started=$SECONDS
+  (cd "$project" && env -u HOLBUILD_REMOTE_CACHE_CURL_CONFIG TMPDIR="$tmpdir/tmp" HOLBUILD_CACHE_TRACE=1 \
+    "$HOLBUILD_BIN" -j1 "$@" build ATheory BTheory CTheory) > "$log" 2>&1 || {
+    cat "$log" >&2
+    exit 1
+  }
+  echo $((SECONDS - started))
+}
+local_seconds=$(build_seconds "$tmpdir/timed-local.log")
+unreachable_log=$tmpdir/timed-unreachable.log
+unreachable_seconds=$(build_seconds "$unreachable_log" --prefetch-concurrency 1 --remote-cache http://192.0.2.1)
+require_grep 'CTheory built' "$unreachable_log"
+require_grep 'warning: remote cache disabled for the rest of this run after 3 requests in a row failed' "$unreachable_log"
+requests=$(grep -c '^remote cache \(GET\|PUT\) ' "$unreachable_log" || true)
+if (( requests > 4 )); then
+  echo "expected at most 4 requests to an unreachable cache, found $requests" >&2
+  cat "$unreachable_log" >&2
+  exit 1
+fi
+if (( unreachable_seconds > local_seconds + 25 )); then
+  echo "unreachable cache added $((unreachable_seconds - local_seconds))s to a ${local_seconds}s build" >&2
+  cat "$unreachable_log" >&2
+  exit 1
+fi
+
+# The summary counts the restores whose entries came from the remote cache
+# apart from the restores of entries already in the local cache.
+json_summary() {
+  python3 - "$1" "$2" <<'PY'
+import json
+import sys
+
+path, fields = sys.argv[1], sys.argv[2].split(",")
+for line in open(path):
+    if line.startswith("{"):
+        event = json.loads(line)
+        if event.get("event") == "build_finished":
+            print(" ".join(f"{field}={event.get(field)}" for field in fields))
+PY
+}
+rm -f "$tmpdir/control/get-status"
+build_json() {
+  local log=$1
+  rm -rf "$project/.holbuild"
+  (cd "$project" && env -u HOLBUILD_REMOTE_CACHE_CURL_CONFIG TMPDIR="$tmpdir/tmp" \
+    "$HOLBUILD_BIN" --json --remote-cache "$remote_url" build ATheory BTheory CTheory) > "$log" 2>&1 || {
+    cat "$log" >&2
+    exit 1
+  }
+}
+require_summary() {
+  local expected=$1
+  local log=$2
+  local actual
+  actual=$(json_summary "$log" built,from_cache,from_remote)
+  [[ "$actual" == "$expected" ]] || {
+    echo "expected '$expected', got '$actual'" >&2
+    cat "$log" >&2
+    exit 1
+  }
+}
+# The libcurl builds above published all three theories to the fixture server.
+use_case_cache "$tmpdir/cache-consumer"
+build_json "$tmpdir/remote-hits.json"
+require_summary "built=0 from_cache=3 from_remote=3" "$tmpdir/remote-hits.json"
+build_json "$tmpdir/local-hits.json"
+require_summary "built=0 from_cache=3 from_remote=0" "$tmpdir/local-hits.json"

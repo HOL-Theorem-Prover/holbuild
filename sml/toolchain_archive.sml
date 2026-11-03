@@ -185,7 +185,8 @@ fun publish {remote, identity, entry_dir, replace} =
       if replace then HolbuildRemoteCache.replace_action_unconditionally remote request
       else HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsentOrSame request
   in
-    if not replace andalso Option.isSome (HolbuildRemoteCache.get_action remote identity) then
+    if HolbuildRemoteCache.disabled () then HolbuildCacheBackend.Skipped
+    else if not replace andalso Option.isSome (HolbuildRemoteCache.get_action remote identity) then
       HolbuildCacheBackend.AlreadyPresent
     else
       ((create_archive {entry_dir = entry_dir, identity = identity, archive_path = archive_path};
