@@ -9,9 +9,13 @@ source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
 holbuild_pid=""
+holder_pid=""
 cleanup() {
   if [[ -n "$holbuild_pid" ]]; then
     kill -KILL "$holbuild_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$holder_pid" ]]; then
+    kill "$holder_pid" 2>/dev/null || true
   fi
   rm -rf "$tmpdir"
 }
@@ -390,3 +394,32 @@ for lease in $killed_leases; do
 done
 require_no_live_leases "$stale"
 echo "reclaimed after $((SECONDS - start_seconds)) s"
+
+# A held DIR/lock makes a child wait, with a report every 30 s, for as long as
+# it is held: past the minute after which holbuild used to give up.  The
+# holder releases it once the build has reported a wait of a minute or more.
+: > "$events"
+busy=$tmpdir/busy
+mkdir -p "$busy"
+: > "$busy/lock"
+make_project locked 0 Locked
+flock "$busy/lock" bash -c '
+  for _ in $(seq 1 300); do
+    grep -q "waiting [6-9][0-9]s for machine-memory lock" "$1" 2>/dev/null && exit 0
+    sleep 1
+  done' _ "$tmpdir/locked.out" &
+holder_pid=$!
+for _ in $(seq 1 100); do
+  flock -n "$busy/lock" true || break
+  sleep 0.1
+done
+holbuild_in "$tmpdir/locked" --cooperate-dir "$busy" --machine-max-mem 3072 \
+  build --skip-checkpoints --skip-proof-steps > "$tmpdir/locked.out" 2>&1 || {
+  echo "build waiting on a held machine-memory lock failed" >&2
+  cat "$tmpdir/locked.out" >&2
+  exit 1
+}
+wait "$holder_pid"
+holder_pid=""
+require_grep "waiting [6-9][0-9]s for machine-memory lock $busy/lock" "$tmpdir/locked.out"
+require_grep '^END Locked' "$events"

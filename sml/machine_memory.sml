@@ -59,8 +59,17 @@ local
   val lock_ex = 2
   val lock_nb = 4
 in
-  fun try_lock fd =
-    flock_call (SysWord.toInt (Posix.FileSys.fdToWord fd), lock_ex + lock_nb) = 0
+  (* False when another descriptor holds the lock (EWOULDBLOCK, which is EAGAIN
+     on Linux and the BSDs).  Any other failure, such as a filesystem without
+     flock, raises: waiting would never end. *)
+  fun try_lock path fd =
+    flock_call (SysWord.toInt (Posix.FileSys.fdToWord fd), lock_ex + lock_nb) = 0 orelse
+    let val err = Error.fromWord (Error.getLastError ())
+    in
+      if err = Posix.Error.again orelse err = Posix.Error.intr
+      then false
+      else raise Error (path ^ ": flock: " ^ OS.errorMsg err)
+    end
 end
 
 val file_mode =
@@ -133,19 +142,41 @@ fun open_lock dir =
              | NONE => raise Error (path ^ " exists but cannot be opened"))
   end
 
-(* DIR/lock is held only for a scan of DIR, so a minute without it means it
-   is stuck, or this filesystem refuses flock: fail rather than hang. *)
-val coordinator_attempts = 3000
+(* DIR/lock is held only for a scan of DIR, but flock polling isn't fair, so
+   with many processes sharing DIR a waiter can lose the race for minutes.
+   Waiting has no deadline: it reports every lock_wait_report_interval and
+   ends when the build stops. *)
 val coordinator_poll = Time.fromMilliseconds 20
+val lock_wait_report_interval = Time.fromSeconds 30
 
-fun with_coordinator dir f =
+fun report_lock_wait path waited =
+  (TextIO.output (TextIO.stdErr,
+                  "holbuild: waiting " ^ LargeInt.toString (Time.toSeconds waited) ^
+                  "s for machine-memory lock " ^ path ^ "\n");
+   TextIO.flushOut TextIO.stdErr)
+
+fun with_coordinator dir check_not_stopped f =
   let
+    val path = lock_path dir
     val fd = open_lock dir
-    fun wait 0 = raise Error ("could not lock " ^ lock_path dir ^
-                              " for a minute: another process holds it, or the filesystem does not support flock")
-      | wait n = if try_lock fd then () else (OS.Process.sleep coordinator_poll; wait (n - 1))
+    val started = Time.now ()
+    fun wait next_report =
+      if try_lock path fd then ()
+      else
+        let
+          val now = Time.now ()
+          val next_report =
+            if Time.< (now, next_report) then next_report
+            else (report_lock_wait path (Time.- (now, started));
+                  Time.+ (now, lock_wait_report_interval))
+        in
+          check_not_stopped ();
+          OS.Process.sleep coordinator_poll;
+          wait next_report
+        end
   in
-    (wait coordinator_attempts; f () before close fd) handle e => (close fd; raise e)
+    (wait (Time.+ (started, lock_wait_report_interval)); f () before close fd)
+    handle e => (close fd; raise e)
   end
 
 (* MemTotal and MemAvailable in bytes, NONE where /proc/meminfo or the field
@@ -228,7 +259,7 @@ fun lease_charge dir name =
     case open_existing path of
         NONE => {charge = 0, starting = false}
       | SOME fd =>
-          ((if try_lock fd then (remove_file path; {charge = 0, starting = false})
+          ((if try_lock path fd then (remove_file path; {charge = 0, starting = false})
             else {charge = read_number path fd, starting = is_starting path})
            before close fd)
           handle e => (close fd; raise e)
@@ -267,8 +298,9 @@ fun create_lease dir charge : lease =
     case create_file path (Int.toString charge ^ "\n") of
         NONE => create_lease dir charge
       | SOME fd =>
-          if try_lock fd then {path = path, fd = fd}
-          else (close fd; remove_file path; raise Error ("could not lock new lease " ^ path))
+          (if try_lock path fd then {path = path, fd = fd}
+           else raise Error ("could not lock new lease " ^ path))
+          handle e => (close fd; remove_file path; raise e)
   end
 
 (* Closes the parent's copy; never LOCK_UN, which would also unlock the
@@ -313,7 +345,7 @@ fun acquire {dir, budget_mb, charge_mb} =
       if HolbuildProcessGroup.cleanup_count () = cleanups then ()
       else raise Error "build stopped while waiting for machine memory"
     fun try () =
-      with_coordinator dir (fn () =>
+      with_coordinator dir check_not_stopped (fn () =>
         let
           val budget = current_budget dir budget_mb
           val _ = settings := SOME {dir = dir, budget_mb = NONE, charge_mb = charge_mb}
