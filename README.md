@@ -250,6 +250,7 @@ holbuild heap main
 holbuild executable runtests
 holbuild export -o build-output.hbx MyTheory
 holbuild import build-output.hbx
+holbuild --remote-cache URL action-spec --upload MyTheory
 holbuild clean MyTheory
 holbuild gc
 ```
@@ -866,6 +867,89 @@ loaded by Poly/ML.
 Use `holbuild export --metadata-out MyTheory.hbx.json` to write a registry
 metadata sidecar for static hosting or GitHub Releases; see
 [`docs/hbx-registry.md`](docs/hbx-registry.md).
+
+### Exporting theory actions for remote execution
+
+`action-spec` plans targets as `build` would, without building, and exports
+each theory the remote cache can't yet satisfy as an ActionSpec: a text blob
+with everything another machine needs to build that one theory from the remote
+cache alone. A theory counts as satisfied only if its remote entry would
+restore for this build: a usable manifest whose timeout contract is at least
+as strict as the one requested. The command takes `build`'s cache and proof
+options (`--tactic-timeout`, `--skip-proof-steps`, ...) and needs a remote
+cache:
+
+```sh
+holbuild --remote-cache https://cache.example.org action-spec --upload MyTheory
+```
+
+Each spec is written to `.holbuild/action-specs/<sha256>`, named by its
+SHA-256. With `--upload`, the specs and every source file they name are also
+uploaded to the remote cache's `/cas/`. The command prints the batch, the
+uncached theories with the uncached theories each waits for:
+
+```text
+holbuild-action-batch-v1
+action <input_key> <ac-key> <spec-sha256> <package>:<logical>
+edge <input_key> <parent input_key>
+```
+
+A theory is ready to build once all its `edge` parents' results are in the
+remote cache, that is once `/ac/<ac-key>` exists for each;
+`ac-key = sha256("holbuild-remote-ac-v1\n" ^ input_key ^ "\n")` is where
+holbuild stores a theory's entry. An edge names the nearest uncached theories
+a theory depends on, looking through libraries and cached theories.
+
+`action-spec` refuses a closure containing a theory that can't run remotely,
+and says which and why: one with `cache = false` or `always_reexecute`, a
+forced one (`--force`), one whose script or extra input lies outside its
+package root, and any theory with `--trknl`. Such a closure builds locally.
+
+An ActionSpec names no path on the exporting machine:
+
+```text
+holbuild-action-spec-v1
+holbuild-version=<version>
+holbuild-runtime=<sha256 of the holbuild sources a theory child loads>
+toolchain git=<url> rev=<rev> kernel=<variant>
+input-key=<input_key>
+action-text-sha256=<sha256 of the action text below>
+deps-key=<dependency context key>
+target <package>:<logical>
+source <package> <relpath> <sha256> <size>
+file input <relpath> <sha256> <size>
+file library <relpath> <sha256> <size>
+dep theory <package>:<logical> <stem> <input_key>
+lib <package>:<logical> <stem> <suffix> <load>...
+load theory|library|object <name-or-stem>
+output sig|sml|dat <relpath>
+output extra <declaration>
+option proof-steps=<bool>
+option tactic-timeout=<seconds|none>
+option new-ir=<bool>
+action-text
+<the action text, verbatim to the end of the blob>
+```
+
+- The action text is the one whose SHA-256 is `input-key`, so a reader can
+  check the spec against the key it claims. It names the source's SHA-256 and
+  the keys of the direct dependencies.
+- `source` is the theory's script, by its path in its package. `file input`
+  lines are its extra inputs, relative to the package root. `file library`
+  lines are the sources of the project libraries it loads, and `lib` lines are
+  those libraries' `.uo`/`.ui` manifests, with their loads in order.
+- Every other path (`file library`, a `dep theory` or `lib` object stem, a
+  `load object`, an `output`) is relative to the action root, the directory
+  that holds the `.holbuild/` tree. In a `lib` line, a load containing `/` is
+  such a path; any other load is a HOL name. Library sources are placed under
+  `.holbuild/action-src/<package>/`.
+- `dep theory` lines list every theory the target depends on, directly or not,
+  with the object stem its outputs restore to.
+- `deps-key` identifies the target's dependency context with the toolchain's
+  semantic identity, for naming a saved dependency heap.
+- The `option` lines are how the theory is run, which the action key leaves
+  out; the entry built under them carries the timeout contract the exporting
+  build will ask for.
 
 Clean old project and cache state with:
 

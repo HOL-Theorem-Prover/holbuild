@@ -4976,6 +4976,260 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
     end
   end
 
+(* ActionSpecs: a theory action serialized for a remote worker, and the batch
+   of uncached actions a coordinator schedules.  Everything a spec names is
+   relative to an action root or the theory's stage root, never to this
+   machine.  The README describes the formats. *)
+
+val action_spec_header = "holbuild-action-spec-v1"
+val action_batch_header = "holbuild-action-batch-v1"
+
+(* The holbuild sources a theory child loads, directly or through the HOL
+   analyser that instruments its script.  They end up in saved heaps, so a
+   worker runs only specs exported by holbuild with the same sources. *)
+val runtime_source_files =
+  ["sml/checkpoint_save_runtime.sml", "sml/holbuild_runtime.sml",
+   "sml/proof_runtime.sml", "sml/tactic_compat_runtime.sml"] @
+  map (fn file => normalize_path (Path.concat("sml/analyser", file)))
+      HolbuildHolSharedCache.analyser_source_files
+
+fun runtime_identity () =
+  let
+    fun line rel =
+      rel ^ " " ^ HolbuildHash.file_sha256 (Path.concat(HolbuildRuntimePaths.source_root, rel))
+  in
+    HolbuildToolchain.hash_text
+      (String.concatWith "\n"
+         ("holbuild-runtime-v1" :: map line (sort_strings (unique_strings runtime_source_files))) ^ "\n")
+  end
+
+fun spec_token context text =
+  if text <> "" andalso not (CharVector.exists (fn c => Char.isSpace c orelse Char.isCntrl c) text)
+  then text
+  else raise Error ("cannot export " ^ context ^ ": " ^ HolbuildHash.quote text ^
+                    " is empty or contains whitespace")
+
+fun is_theory_node node = #kind (HolbuildBuildPlan.source_of node) = HolbuildSourceIndex.TheoryScript
+
+fun escapes_root rel = Path.isAbsolute rel orelse rel = ".." orelse String.isPrefix "../" rel
+
+(* Why a theory can't run remotely, if it can't. *)
+fun excluded_reason (options : build_options) project (action : theory_action) node =
+  if not (cache_enabled node) then SOME "it sets cache = false"
+  else if always_reexecute node then SOME "it sets always_reexecute"
+  else if force_node options project node then SOME "it is forced"
+  else if escapes_root (HolbuildBuildPlan.relative_path node) then
+    SOME "its script lies outside its package root"
+  else
+    case List.find (fn {path, ...} => escapes_root path) (#inputs action) of
+        SOME {path, ...} => SOME ("its extra input " ^ path ^ " lies outside its package root")
+      | NONE => NONE
+
+(* Whether the remote cache holds an entry this build would restore: usable,
+   and with a timeout contract at least as strict as the one requested.
+   Checked from the manifest alone; restoring still checks the blobs. *)
+fun remote_entry_satisfies remote (options : build_options) project plan node input_key =
+  case HolbuildRemoteCache.get_action remote input_key of
+      NONE => false
+    | SOME text =>
+        (let
+           val lines = cache_manifest_lines text
+           val {extra_hashes, ...} = cache_manifest_blobs_from_lines input_key lines
+           val requested = tactic_timeout (checkpoint_policy_for_node options project node)
+         in
+           not (Option.isSome (transient_stage_mldep_in_manifest text)) andalso
+           map #1 extra_hashes = source_extra_output_declarations plan node andalso
+           cache_timeout_satisfies (#allow_cache_timeout_discrepancy options) requested
+             (cache_manifest_proof_timeout lines)
+         end
+         handle _ => false)
+
+(* Where a worker places a library's source, relative to its action root. *)
+fun library_source_path node =
+  normalize_path (String.concatWith "/"
+    [".holbuild/action-src", package node, HolbuildBuildPlan.relative_path node])
+
+fun library_manifest root plan node =
+  let
+    val context = package node ^ ":" ^ logical_name node
+    fun name text =
+      if CharVector.exists (fn c => c = #"/") text then
+        raise Error ("cannot export " ^ context ^ ": HOL load name contains /: " ^ text)
+      else spec_token context text
+    fun rooted path = spec_token context (root_relative root path)
+    val deps = HolbuildBuildPlan.direct_project_deps plan node
+    val loads =
+      map name (direct_external_loads plan node) @
+      map rooted (project_load_stems deps) @
+      [spec_token context (library_source_path node)]
+    fun line suffix loads =
+      String.concatWith " "
+        (["lib", context, rooted (drop_suffix suffix (one_with_suffix suffix (#objects (source_artifacts node)))),
+          suffix] @ loads)
+  in
+    case #kind (HolbuildBuildPlan.source_of node) of
+        HolbuildSourceIndex.Sig => [line ".ui" loads]
+      | HolbuildSourceIndex.Sml =>
+          line ".uo" loads ::
+          (if has_signature_companion plan node then [] else [line ".ui" []])
+      | HolbuildSourceIndex.TheoryScript => []
+  end
+
+fun file_line role path from =
+  String.concatWith " "
+    ["file", role, path, HolbuildHash.file_sha256 from, Position.toString (FS.fileSize from)]
+
+fun theory_load_spec_line token (LoadTheory name) = "load theory " ^ token name
+  | theory_load_spec_line token (LoadLibrary name) = "load library " ^ token name
+  | theory_load_spec_line token (LoadObject stem) = "load object " ^ token stem
+
+fun bool_option name value = "option " ^ name ^ "=" ^ bool_text value
+
+(* The spec text and the files a worker fetches by content hash for it. *)
+fun action_spec_text {root, plan, keys, action_toolchain_key, runtime, toolchain_line} policy
+                     (action : theory_action) node action_text =
+  let
+    val context = #package action ^ ":" ^ #logical action
+    val token = spec_token context
+    val deps = HolbuildBuildPlan.transitive_project_deps plan node
+    val theory_deps = List.filter is_theory_node deps
+    val libraries = List.filter (not o is_theory_node) deps
+    val source = #source_file action
+    val {sig_path, sml_path, data_path} = #outputs action
+    val input_lines =
+      map (fn {path, from} => file_line "input" (token path) from) (#inputs action)
+    val library_lines =
+      map (fn lib => file_line "library" (token (library_source_path lib)) (source_file lib)) libraries
+    val dep_lines =
+      map (fn dep => String.concatWith " "
+             ["dep theory", token (package dep ^ ":" ^ logical_name dep),
+              token (root_relative root (load_stem dep)), HolbuildBuildPlan.input_key_for keys dep])
+          theory_deps
+    val lines =
+      [action_spec_header,
+       "holbuild-version=" ^ HolbuildVersion.version,
+       "holbuild-runtime=" ^ runtime,
+       toolchain_line,
+       "input-key=" ^ #input_key action,
+       "action-text-sha256=" ^ HolbuildToolchain.hash_text action_text,
+       "deps-key=" ^ dependency_context_key action_toolchain_key plan keys node,
+       "target " ^ token context,
+       String.concatWith " "
+         ["source", token (#package action), token (#relative_path action),
+          HolbuildHash.file_sha256 source, Position.toString (FS.fileSize source)]] @
+      input_lines @
+      library_lines @
+      dep_lines @
+      List.concat (map (library_manifest root plan) libraries) @
+      map (theory_load_spec_line token) (#loads action) @
+      ["output sig " ^ token sig_path,
+       "output sml " ^ token sml_path,
+       "output dat " ^ token data_path] @
+      map (fn decl => "output extra " ^ token decl) (#extra_outputs action) @
+      [bool_option "proof-steps" (proof_steps_enabled policy),
+       "option tactic-timeout=" ^ timeout_text (tactic_timeout policy),
+       bool_option "new-ir" (proof_ir_enabled policy),
+       "action-text"]
+  in
+    {text = String.concatWith "\n" lines ^ "\n" ^ action_text,
+     files = source :: map #from (#inputs action) @ map source_file libraries}
+  end
+
+(* A theory waits for the nearest uncached theories it depends on, looking
+   through libraries and cached theories, which a worker restores but
+   doesn't build. *)
+fun uncached_parents plan uncached node =
+  let
+    fun walk (dep, (seen, parents)) =
+      let val key = HolbuildBuildPlan.key dep
+      in
+        if List.exists (fn k => k = key) seen then (seen, parents)
+        else if is_theory_node dep andalso uncached dep then (key :: seen, dep :: parents)
+        else List.foldl walk (key :: seen, parents) (HolbuildBuildPlan.direct_project_deps plan dep)
+      end
+    val (_, parents) = List.foldl walk ([], []) (HolbuildBuildPlan.direct_project_deps plan node)
+  in
+    rev parents
+  end
+
+fun publish_spec_blob remote path =
+  case HolbuildRemoteCache.publish_blob remote {hash = HolbuildHash.file_sha256 path, src = path} of
+      HolbuildCacheBackend.Published => ()
+    | HolbuildCacheBackend.AlreadyPresent => ()
+    | HolbuildCacheBackend.Conflict message => raise Error ("could not upload " ^ path ^ ": " ^ message)
+    | HolbuildCacheBackend.Skipped => raise Error ("could not upload " ^ path ^ ": skipped")
+
+(* Writes the ActionSpec of every theory in the plan the remote cache can't
+   satisfy, uploads them and their sources with upload, and prints the batch. *)
+fun export_action_specs (options : build_options) tc project plan toolchain_key upload =
+  let
+    val remote =
+      case HolbuildRemoteCacheConfig.url () of
+          SOME url => HolbuildRemoteCache.remote url
+        | NONE => raise Error "action-spec needs a remote cache: pass --remote-cache URL"
+    val _ =
+      if #trknl options then
+        raise Error "action-spec: tracing-kernel actions key on the exact HOL executable and stay local"
+      else if not (#use_cache options) then
+        raise Error "action-spec: a remote action's result is its cache entry, so --no-cache can't apply"
+      else ()
+    val root = project_artifact_root project
+    val config_lines = build_config_lines_for_node options project
+    val action_toolchain_key = HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)
+    val keys = HolbuildBuildPlan.input_keys config_lines action_toolchain_key plan
+    val theories = List.filter is_theory_node (HolbuildBuildPlan.selected_nodes plan)
+    val actions = map (fn node => (node, theory_action root plan keys toolchain_key (#holdir tc) node)) theories
+    val _ =
+      List.app
+        (fn (node, action) =>
+            case excluded_reason options project action node of
+                SOME reason =>
+                  raise Error ("action-spec: " ^ package node ^ ":" ^ logical_name node ^
+                               " can't run remotely: " ^ reason)
+              | NONE => ())
+        actions
+    val uncached_actions =
+      List.filter
+        (fn (node, action) =>
+            not (remote_entry_satisfies remote options project plan node (#input_key action)))
+        actions
+    val uncached_keys = map (HolbuildBuildPlan.key o #1) uncached_actions
+    fun uncached node = List.exists (fn k => k = HolbuildBuildPlan.key node) uncached_keys
+    val toolchain_line =
+      case HolbuildProject.resolved_hol_dependency_with {kernel_variant = #kernel_variant tc} project of
+          SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev}, ...}) =>
+            "toolchain git=" ^ spec_token "the HOL dependency" git ^ " rev=" ^ spec_token "the HOL dependency" rev ^
+            " kernel=" ^ HolbuildToolchain.kernel_variant_name (#kernel_variant tc)
+        | _ => raise Error "action-spec: the project has no git dependencies.hol"
+    val spec_dir = Path.concat(root, ".holbuild/action-specs")
+    val context = {root = root, plan = plan, keys = keys, action_toolchain_key = action_toolchain_key,
+                   runtime = runtime_identity (), toolchain_line = toolchain_line}
+    fun export (node, action) =
+      let
+        val action_text =
+          HolbuildBuildPlan.action_text_with plan config_lines action_toolchain_key keys node
+        val _ =
+          if HolbuildToolchain.hash_text action_text = #input_key action then ()
+          else raise Error ("internal error: action text of " ^ logical_name node ^ " does not hash to its input key")
+        val {text, files} =
+          action_spec_text context (checkpoint_policy_for_node options project node)
+            action node action_text
+        val spec_sha256 = HolbuildHash.string_sha256 text
+        val path = Path.concat(spec_dir, spec_sha256)
+        val _ = (ensure_dir spec_dir; write_text path text)
+        val _ = if upload then List.app (publish_spec_blob remote) (files @ [path]) else ()
+      in
+        String.concatWith " "
+          ["action", #input_key action, HolbuildRemoteCache.remote_action_key (#input_key action),
+           spec_sha256, package node ^ ":" ^ logical_name node] ::
+        map (fn parent => "edge " ^ #input_key action ^ " " ^ HolbuildBuildPlan.input_key_for keys parent)
+            (uncached_parents plan uncached node)
+      end
+    val action_lines = List.concat (map export uncached_actions)
+  in
+    print (String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n")
+  end
+
 fun buildheap_arg heap_kind node =
   case #kind (HolbuildBuildPlan.source_of node) of
       HolbuildSourceIndex.TheoryScript => load_stem node
