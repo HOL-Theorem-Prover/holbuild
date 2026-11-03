@@ -435,6 +435,16 @@ fun fetch_blob cache request =
 fun fetch_toolchain_blob cache request =
   fetch_blob_with_timeout toolchain_curl_max_time_seconds cache request
 
+(* Fetches a blob by its SHA-256 alone, without an action entry that lists
+   it, as a remote worker fetches its spec and sources. *)
+fun fetch_unlisted_blob cache {hash, dst} =
+  (case curl_get {url = cas_url cache hash, dst = dst} of
+       HolbuildCacheBackend.Hit =>
+         if HolbuildHash.file_sha256 dst = hash then HolbuildCacheBackend.Hit
+         else HolbuildCacheBackend.Corrupt ("downloaded blob SHA256 mismatch: " ^ hash)
+     | other => other)
+  handle e => HolbuildCacheBackend.Corrupt (General.exnMessage e)
+
 fun publish_blob_with_timeout timeout_seconds cache {hash, src} =
   let
     val sha256 = HolbuildHash.file_sha256 src

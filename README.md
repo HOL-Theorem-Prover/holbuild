@@ -953,6 +953,72 @@ action-text
   out; the entry built under them carries the timeout contract the exporting
   build will ask for.
 
+### Running one theory action as a remote worker
+
+`exec-action` builds the ActionSpec stored in the remote cache under
+`SPEC-SHA256`, with nothing but the remote cache as input, publishes the
+result there, and exits:
+
+```sh
+HOLBUILD_CACHE=/var/cache/holbuild holbuild --remote-cache https://cache.example.org \
+  --max-heap 32000 --cooperate-dir /var/lib/holbuild/memory \
+  exec-action SPEC-SHA256 --result result.txt --cache-limit-gb 200
+```
+
+It runs in `<cache root>/action`, which it locks and empties before and after
+each action, and keeps the theory's dependency heap and checkpoints in
+`<cache root>/checkpoints`, so a later run of an edited theory resumes from
+them as a local build does. A saved heap records the absolute paths it was
+built at, so every worker should use the same cache root. One `exec-action`
+runs per cache root at a time; a second waits for the first.
+
+In order, it checks the spec (its holbuild version and runtime must equal the
+worker's, and its action text must hash to its input key and agree with its
+source and direct dependencies), ensures the HOL toolchain (restoring the
+remote toolchain archive, or building one, and when another worker's archive
+was published first, switching to that archive), fetches the sources by
+SHA-256, restores every dependency through the normal cache restore and its
+checks, and reports `cached` if the theory's own entry already restores.
+Otherwise it builds the theory as a local build would, with the spec's proof
+options, and checks that the remote cache then holds an entry for it whose
+outputs equal the build's. A missing dependency fails the action; the worker
+never builds one.
+
+It writes this record to `--result FILE`, or to stdout:
+
+```text
+holbuild-action-result-v1
+spec=<sha256>
+input-key=<input_key>
+status=built|cached|failed
+failure=proof|tactic-timeout|memory|input-missing|publish|toolchain|disk|spec-rejected|internal
+missing=theory <input_key> | blob <sha256>
+peak-rss-mb=<n>
+wall-ms=<n>
+log=<sha256> <size>
+```
+
+`failure` appears on failure, and `missing` with `input-missing`.
+`peak-rss-mb` is the HOL process's peak resident memory on a successful build.
+`log` is the build log, uploaded to `/cas/`. `memory` means Poly/ML ran out
+of heap or the container's cgroup `memory.events` counted an OOM kill during
+the run; `disk` means the disk filled. The exit status summarizes the record:
+
+| Exit | Meaning |
+|---|---|
+| 0 | built or cached |
+| 1 | `proof` or `tactic-timeout`: final, retrying won't help |
+| 2 | `memory`: retry with more memory |
+| 3 | `input-missing`, `publish`, `toolchain`, `disk` or `internal`: retry or resubmit |
+| 4 | `spec-rejected` |
+
+`--cache-limit-gb N` caps what the worker keeps between actions: its
+checkpoints, its HOL toolchains with their analysers, and its local cache.
+Before each action, it evicts the least recently used until they fit in `N`
+GB minus a reserve for the action itself (`--cache-reserve-gb`, by default a
+tenth of `N`). A theory's checkpoints go together, a toolchain goes with its
+analysers, and a toolchain another holbuild process is using is kept.
+
 Clean old project and cache state with:
 
 ```sh

@@ -33,6 +33,7 @@ fun global_help () = print
   \  clean THEORY...             Remove local build outputs\n\
   \  export -o FILE [TARGET ...]  Export cached build outputs\n\
   \  action-spec [TARGET ...]   Export uncached theories for remote execution\n\
+  \  exec-action SPEC-SHA256    Run one exported theory action as a remote worker\n\
   \  import FILE                  Import cached build outputs\n\
   \  gc                          Remove stale project/cache state\n\n\
   \Global options:\n\
@@ -172,6 +173,23 @@ fun action_spec_help () = print
   \remote cache. Takes build's cache and proof options. Needs --remote-cache.\n\n\
   \Global options: see `holbuild --help`.\n"
 
+fun exec_action_help () = print
+  "Usage:\n\
+  \  holbuild --remote-cache URL [GLOBAL OPTIONS] exec-action SPEC-SHA256\n\
+  \      [--result FILE] [--cache-limit-gb N [--cache-reserve-gb N]]\n\n\
+  \Run the ActionSpec stored in the remote cache as SPEC-SHA256 (see\n\
+  \action-spec) and publish its result to the remote cache. The action runs in\n\
+  \CACHE/action, with checkpoints in CACHE/checkpoints, where CACHE is the cache\n\
+  \root. Writes a holbuild-action-result-v1 record to FILE, or to stdout.\n\n\
+  \Exit status: 0 built or cached; 1 proof or tactic-timeout failure; 2 out of\n\
+  \memory; 3 input-missing, publish, toolchain, disk or internal failure;\n\
+  \4 spec rejected.\n\n\
+  \--cache-limit-gb N   Before the action, evict least recently used\n\
+  \                     checkpoints, toolchains and local cache entries until\n\
+  \                     the cache root holds at most N GB minus the reserve.\n\
+  \--cache-reserve-gb N Room to keep free under the limit (default: a tenth).\n\n\
+  \Global options: see `holbuild --help`.\n"
+
 fun export_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] export [--build] -o FILE [--metadata-out FILE] [TARGET ...]\n\n\
@@ -189,7 +207,7 @@ fun has_help_arg args = List.exists help_arg args
 
 val command_names =
   ["build", "context", "repl", "run", "execution-plan", "check", "buildhol", "heap", "executable",
-   "clean", "export", "import", "gc", "cache", "action-spec"]
+   "clean", "export", "import", "gc", "cache", "action-spec", "exec-action"]
 
 fun known_command command =
   List.exists (fn name => name = command) command_names orelse command = "goalfrag-plan"
@@ -211,6 +229,7 @@ fun command_help command =
     | "clean" => clean_help ()
     | "export" => export_help ()
     | "action-spec" => action_spec_help ()
+    | "exec-action" => exec_action_help ()
     | "import" => import_help ()
     | "gc" => gc_help ()
     | "cache" => cache_help ()
@@ -1868,6 +1887,57 @@ fun buildhol holdir maxheap jobs args =
     print (holdir ^ "\n")
   end
 
+fun exec_action_command maxheap jobs args =
+  let
+    fun gb label text =
+      case Int.fromString text of
+          SOME n => if n >= 0 then IntInf.fromInt n * 1073741824
+                    else raise Error (label ^ " must be a non-negative integer")
+        | NONE => raise Error (label ^ " must be a non-negative integer")
+    fun parse (opts as {spec, result, limit, reserve}) rest =
+      case rest of
+          [] => opts
+        | "--result" :: file :: xs => parse {spec = spec, result = SOME file, limit = limit, reserve = reserve} xs
+        | "--cache-limit-gb" :: n :: xs =>
+            parse {spec = spec, result = result, limit = SOME (gb "--cache-limit-gb" n), reserve = reserve} xs
+        | "--cache-reserve-gb" :: n :: xs =>
+            parse {spec = spec, result = result, limit = limit, reserve = SOME (gb "--cache-reserve-gb" n)} xs
+        | ["--result"] => raise Error "--result requires FILE"
+        | ["--cache-limit-gb"] => raise Error "--cache-limit-gb requires N"
+        | ["--cache-reserve-gb"] => raise Error "--cache-reserve-gb requires N"
+        | arg :: xs =>
+            if String.isPrefix "-" arg then raise Error ("unknown exec-action option: " ^ arg)
+            else
+              case spec of
+                  NONE => parse {spec = SOME arg, result = result, limit = limit, reserve = reserve} xs
+                | SOME _ => raise Error "exec-action takes one SPEC-SHA256"
+    val {spec, result, limit, reserve} = parse {spec = NONE, result = NONE, limit = NONE, reserve = NONE} args
+    val spec = case spec of SOME s => s | NONE => raise Error "exec-action requires SPEC-SHA256"
+    val cache_cap =
+      case (limit, reserve) of
+          (SOME limit, reserve) => SOME {limit_bytes = limit, reserve_bytes = Option.getOpt (reserve, limit div 10)}
+        | (NONE, SOME _) => raise Error "--cache-reserve-gb requires --cache-limit-gb"
+        | (NONE, NONE) => NONE
+    fun toolchain {git, rev, kernel = _} =
+      let
+        (* Every worker must run the published archive's bytes, so a build
+           whose own publish lost is replaced by the stored archive. *)
+        val _ = HolbuildHolSharedCache.adopt_published_archive := true
+        val kernel_variant = HolbuildHolToolchainConfig.StandardKernel
+        val holdir = HolbuildHolSharedCache.ensure_built_with_kernel jobs
+                       {git = git, rev = rev, kernel_variant = kernel_variant}
+        val tc = {holdir = holdir, maxheap = maxheap, kernel_variant = kernel_variant}
+      in
+        configure_analyser_for_toolchain tc; tc
+      end
+    val code = HolbuildBuildExec.exec_action
+                 {spec_sha256 = spec, result_file = result, cache_cap = cache_cap, toolchain = toolchain}
+  in
+    TextIO.flushOut TextIO.stdOut;
+    TextIO.flushOut TextIO.stdErr;
+    Posix.Process.exit (Word8.fromInt code)
+  end
+
 fun removed_legacy_proof_step_build_arg arg =
   arg = "--goalfrag" orelse arg = "--goalfrag-plan" orelse String.isPrefix "--goalfrag-plan=" arg
 
@@ -1888,6 +1958,9 @@ fun dispatch_with_options {holdir, source_dir, cache_dir, remote_cache, jobs, ma
      | "cache" :: rest => (reject_json "cache"; HolbuildCache.dispatch rest)
      | "import" :: rest => (reject_json "import"; import_archive rest)
      | "buildhol" :: rest => buildhol holdir maxheap jobs rest
+     | "exec-action" :: rest =>
+         (reject_json "exec-action"; reject_holdir holdir;
+          exec_action_command maxheap jobs rest)
      | "goalfrag-plan" :: _ => raise Error "goalfrag-plan has been removed; use execution-plan THEORY:THEOREM"
      | [] => dispatch (effective_toolchain holdir maxheap jobs) jobs args
      | "build" :: rest =>

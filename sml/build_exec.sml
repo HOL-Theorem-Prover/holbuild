@@ -367,12 +367,26 @@ fun hfs_unmapped_path path =
 (* Export now seals a theory in current HOL versions.  Keep metadata capture and
    export in the source child, but never load the generated theory module there:
    the consumer-style load belongs in a fresh process. *)
+(* The exporter is the child's last file, so the child's peak resident set
+   size is known there: it records /proc/self/status's VmHWM line beside
+   itself, where it can, for a remote worker's result record. *)
+val peak_rss_report_name = "holbuild-peak-rss.txt"
+
+fun peak_rss_report_line path =
+  String.concat
+    ["val _ = let fun find s = case TextIO.inputLine s of NONE => \"\" ",
+     "| SOME l => if String.isPrefix \"VmHWM:\" l then l else find s; ",
+     "val s = TextIO.openIn \"/proc/self/status\"; val l = find s before TextIO.closeIn s; ",
+     "val out = TextIO.openOut ", HolbuildToolchain.sml_string path, " ",
+     "in TextIO.output (out, l); TextIO.closeOut out end handle _ => ();"]
+
 fun write_theory_exporter {sig_path, path, parents_report, mldeps_report} =
   let
     val lines =
       generated_metadata_report_lines {parents_report = parents_report,
                                        mldeps_report = mldeps_report} @
-      [export_theory_if_needed_line sig_path]
+      [export_theory_if_needed_line sig_path,
+       peak_rss_report_line (Path.concat(Path.dir path, peak_rss_report_name))]
   in
     write_text path (String.concatWith "\n" lines ^ "\n")
   end
@@ -669,10 +683,15 @@ fun stage_dat_references stage logical =
 fun stage_dat_replacements stage logical final_dat =
   map (fn path_ref => (path_ref, final_dat)) (stage_dat_references stage logical)
 
-(* A theory's checkpoints live under one base path in its action root; the
-   functions below take that base. *)
+(* A theory's checkpoints live under one base path in a checkpoint root, by
+   default the one in its action root; the functions below take that base. *)
+fun default_checkpoint_root root = Path.concat(root, ".holbuild/checkpoints")
+
+fun checkpoint_base_in checkpoint_root package relative_path =
+  Path.concat(Path.concat(checkpoint_root, package), relative_path)
+
 fun checkpoint_base_at root package relative_path =
-  Path.concat(Path.concat(Path.concat(root, ".holbuild/checkpoints"), package), relative_path)
+  checkpoint_base_in (default_checkpoint_root root) package relative_path
 
 fun checkpoint_base (project : HolbuildProject.t) node =
   checkpoint_base_at (project_artifact_root project) (HolbuildBuildPlan.package node)
@@ -1180,7 +1199,8 @@ fun gb_decimal_text bytes =
     IntInf.toString whole ^ "." ^ IntInf.toString frac
   end
 
-fun sort_families_by_mtime_ascending families =
+(* Oldest first; stable, so families with equal times keep their order. *)
+fun sort_by_mtime_ascending (mtime_of : 'a -> Time.time) families =
   let
     fun split xs =
       let
@@ -1196,9 +1216,8 @@ fun sort_families_by_mtime_ascending families =
       case (left, right) of
           ([], _) => right
         | (_, []) => left
-        | ((x as {mtime = x_mtime, ...} : checkpoint_family) :: xs,
-           (y as {mtime = y_mtime, ...} : checkpoint_family) :: ys) =>
-            if Time.<=(x_mtime, y_mtime) then x :: merge xs right
+        | (x :: xs, y :: ys) =>
+            if Time.<=(mtime_of x, mtime_of y) then x :: merge xs right
             else y :: merge left ys
     fun sort xs =
       case xs of
@@ -1210,6 +1229,9 @@ fun sort_families_by_mtime_ascending families =
   in
     sort families
   end
+
+fun sort_families_by_mtime_ascending families =
+  sort_by_mtime_ascending (fn ({mtime, ...} : checkpoint_family) => mtime) families
 
 fun remove_stale_checkpoint_families cutoff dir =
   if not (path_exists dir) then 0
@@ -2145,26 +2167,31 @@ datatype theory_cache_restore = CacheMiss | CacheRestored of real option
 
 val cache_key_role = "source/dependency key"
 
-fun materialize_theory_cache verify_cache allow_timeout_discrepancy project plan input_key requested_timeout require_trace node =
+(* A cache entry's manifest, checked for a restore: no transient stage mldep,
+   the declared extra outputs (any, given NONE), a trace when one is required, and a timeout
+   contract at least as strict as the one requested.  Raises
+   `Error "cache entry not found"` on a miss. *)
+fun checked_cache_entry allow_timeout_discrepancy {root, input_key, subject, expected_extra_outputs,
+                                                  requested_timeout, require_trace} =
   let
-    val root = cache_root ()
     val manifest = HolbuildCache.action_manifest root input_key
     val manifest_text =
       case ensure_local_cache_entry root input_key of
           SOME text => text
-        | NONE => (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^ input_key ^ " (no manifest)");
+        | NONE => (cache_trace ("cache miss: " ^ subject ^ " " ^ cache_key_role ^ "=" ^ input_key ^ " (no manifest)");
                    raise Error "cache entry not found")
     val _ =
       case transient_stage_mldep_in_manifest manifest_text of
           SOME dep => transient_cache_manifest_error root input_key manifest manifest_text dep
         | NONE => ()
     val manifest_lines = cache_manifest_lines manifest_text
-    val {sig_hash, sml_hash, dat_hash, trace_hash, extra_hashes, parents, mldeps} =
-      cache_manifest_blobs_from_lines input_key manifest_lines
-    val expected_extra_outputs = source_extra_output_declarations plan node
+    val blobs as {extra_hashes, trace_hash, ...} = cache_manifest_blobs_from_lines input_key manifest_lines
     val _ =
-      if map #1 extra_hashes = expected_extra_outputs then ()
-      else raise Error "cache manifest extra outputs do not match the action declaration"
+      case expected_extra_outputs of
+          NONE => ()
+        | SOME expected =>
+            if map #1 extra_hashes = expected then ()
+            else raise Error "cache manifest extra outputs do not match the action declaration"
     val _ =
       if require_trace andalso not (Option.isSome trace_hash) then
         raise Error "cache manifest missing blob role: trace"
@@ -2174,35 +2201,64 @@ fun materialize_theory_cache verify_cache allow_timeout_discrepancy project plan
       if cache_timeout_satisfies allow_timeout_discrepancy requested_timeout proof_timeout then ()
       else raise Error ("cache entry built with insufficient tactic-timeout contract: built " ^
                         timeout_text proof_timeout ^ ", requested " ^ timeout_text requested_timeout)
-    val {sig_path, sml_path, data_path, ...} = theory_outputs node
+  in
+    {blobs = blobs, proof_timeout = proof_timeout}
+  end
+
+(* Installs a checked cache entry's outputs at the given paths, its extra
+   outputs where `extra_destination` puts each declaration, and its load
+   manifests with `write_manifests`. *)
+fun install_cache_entry verify_cache root input_key subject
+                        {blobs = {sig_hash, sml_hash, dat_hash, trace_hash, extra_hashes, parents, mldeps},
+                         proof_timeout}
+                        {outputs = {sig_path, sml_path, data_path}, extra_destination, write_manifests} =
+  let
     val trace_path = drop_suffix ".dat" data_path ^ ".tr.gz"
+  in
+    copy_blob verify_cache root dat_hash data_path;
+    link_or_copy {src = data_path, dst = hfs_remapped_path data_path};
+    copy_blob verify_cache root sig_hash sig_path;
+    link_or_copy {src = sig_path, dst = hfs_remapped_path sig_path};
+    copy_blob verify_cache root sml_hash sml_path;
+    write_text sml_path (replace_all cache_sml_token data_path (read_text sml_path));
+    link_or_copy {src = sml_path, dst = hfs_remapped_path sml_path};
+    (case trace_hash of
+         NONE => ()
+       | SOME hash =>
+           (copy_blob verify_cache root hash trace_path;
+            link_or_copy {src = trace_path, dst = hfs_remapped_path trace_path}));
+    List.app
+      (fn (declaration, hash) =>
+          let val destination = extra_destination declaration
+          in ensure_parent destination; copy_blob verify_cache root hash destination end)
+      extra_hashes;
+    write_manifests {parents = parents, mldeps = mldeps};
+    HolbuildCache.touch_action root input_key;
+    cache_trace ("cache hit: " ^ subject ^ " " ^ cache_key_role ^ "=" ^ input_key);
+    proof_timeout
+  end
+
+fun materialize_theory_cache verify_cache allow_timeout_discrepancy project plan input_key requested_timeout require_trace node =
+  let
+    val root = cache_root ()
+    val subject = logical_name node
+    val entry =
+      checked_cache_entry allow_timeout_discrepancy
+        {root = root, input_key = input_key, subject = subject,
+         expected_extra_outputs = SOME (source_extra_output_declarations plan node),
+         requested_timeout = requested_timeout, require_trace = require_trace}
+    val {sig_path, sml_path, data_path, ...} = theory_outputs node
     val extra_output_paths = source_extra_output_paths plan node
     val _ = claim_extra_outputs project node extra_output_paths
-    fun install () =
-      (copy_blob verify_cache root dat_hash data_path;
-       link_or_copy {src = data_path, dst = hfs_remapped_path data_path};
-       copy_blob verify_cache root sig_hash sig_path;
-       link_or_copy {src = sig_path, dst = hfs_remapped_path sig_path};
-       copy_blob verify_cache root sml_hash sml_path;
-       write_text sml_path (replace_all cache_sml_token data_path (read_text sml_path));
-       link_or_copy {src = sml_path, dst = hfs_remapped_path sml_path};
-       (case trace_hash of
-            NONE => ()
-          | SOME hash =>
-              (copy_blob verify_cache root hash trace_path;
-               link_or_copy {src = trace_path, dst = hfs_remapped_path trace_path}));
-       List.app
-         (fn (declaration, hash) =>
-             let val destination = source_extra_output_path node declaration
-             in ensure_parent destination; copy_blob verify_cache root hash destination end)
-         extra_hashes;
-       record_materialized_extra_outputs project node extra_output_paths;
-       write_local_theory_manifests plan node {parents = parents, mldeps = mldeps};
-       HolbuildCache.touch_action root input_key;
-       cache_trace ("cache hit: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^ input_key);
-       CacheRestored proof_timeout)
+    fun write_manifests metadata =
+      (record_materialized_extra_outputs project node extra_output_paths;
+       write_local_theory_manifests plan node metadata)
   in
-    install ()
+    CacheRestored
+      (install_cache_entry verify_cache root input_key subject entry
+         {outputs = {sig_path = sig_path, sml_path = sml_path, data_path = data_path},
+          extra_destination = source_extra_output_path node,
+          write_manifests = write_manifests})
   end
   handle Error "cache entry not found" => CacheMiss
        | e => (remove_failed_cache_outputs project node;
@@ -2850,14 +2906,14 @@ fun action_stage root (action : theory_action) =
     else normalize_path (Path.concat(stage_root, #script_dir action))
   end
 
-fun action_checkpoint_base root (action : theory_action) =
-  checkpoint_base_at root (#package action) (#relative_path action)
+fun action_checkpoint_base checkpoint_root (action : theory_action) =
+  checkpoint_base_in checkpoint_root (#package action) (#relative_path action)
 
 fun action_outputs root ({outputs = {sig_path, sml_path, data_path}, ...} : theory_action) =
   {sig_path = in_root root sig_path, sml_path = in_root root sml_path,
    data_path = in_root root data_path}
 
-fun write_theory_script policy root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
+fun write_theory_script policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
   let
     val source_name = #source_name action
     val logical = #logical action
@@ -2869,7 +2925,7 @@ fun write_theory_script policy root base_context (action : theory_action) source
      {context = base_context, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
   else
     let
-      val base = action_checkpoint_base root action
+      val base = action_checkpoint_base checkpoint_root action
       val deps_key = #deps_key action
       val deps_loaded = deps_loaded_path base deps_key
       val deps_ok = deps_checkpoint_ok_text deps_key
@@ -2936,7 +2992,7 @@ fun write_theory_script policy root base_context (action : theory_action) source
    publishes them to the cache.  Returns the generated theory's load metadata,
    and leaves the stage, which holds the declared extra outputs, to the
    caller. *)
-fun run_theory_action cache_allowed policy tc root base_context (action : theory_action) source_text theorem_checkpoints declaration_checkpoints termination_diagnostics =
+fun run_theory_action cache_allowed policy tc root checkpoint_root base_context (action : theory_action) source_text theorem_checkpoints declaration_checkpoints termination_diagnostics =
   let
     val input_key = #input_key action
     val logical = #logical action
@@ -2954,7 +3010,7 @@ fun run_theory_action cache_allowed policy tc root base_context (action : theory
     val timeout_marker = Path.concat(stage, "holbuild-tactic-timeout.txt")
     val plan_only_marker = Path.concat(stage, "holbuild-proof-ir-plan.txt")
     val log_dir = current_log_dir root (#package action) logical
-    val checkpoint_base = action_checkpoint_base root action
+    val checkpoint_base = action_checkpoint_base checkpoint_root action
     val deps_key = #deps_key action
     val deps_loaded = deps_loaded_path checkpoint_base deps_key
     val final_context = final_context_path checkpoint_base
@@ -3001,7 +3057,7 @@ fun run_theory_action cache_allowed policy tc root base_context (action : theory
     val _ = remove_file timeout_marker
     val _ = remove_file plan_only_marker
     val _ = List.app (ensure_parent o #2) staged_extra_outputs
-    val run_spec = write_theory_script policy root base_context action source_text
+    val run_spec = write_theory_script policy root checkpoint_root base_context action source_text
                                     theorem_checkpoints declaration_checkpoints termination_diagnostics staged_script preload timeout_marker
                                     (if execution_plan_only policy then SOME plan_only_marker else NONE)
     fun tactic_timeout_error () =
@@ -3782,7 +3838,7 @@ fun fallback_theory_checkpoints (action : theory_action) msg =
          "; building without proof steps/checkpoints for this theory\n" ^ msg);
    [])
 
-fun theory_checkpoints_for_action policy root (action : theory_action) source_text boundaries errors =
+fun theory_checkpoints_for_action policy checkpoint_root (action : theory_action) source_text boundaries errors =
   if not (proof_steps_enabled policy) andalso not (checkpoint_enabled policy) then []
   else
     let
@@ -3804,7 +3860,7 @@ fun theory_checkpoints_for_action policy root (action : theory_action) source_te
                        String.concatWith "\n" errors)
     in
       theorem_checkpoint_specs (proof_engine policy) (tactic_timeout policy)
-        (action_checkpoint_base root action) (#deps_key action)
+        (action_checkpoint_base checkpoint_root action) (#deps_key action)
         (#inputs_key action) source_text proof_ir_plans boundaries
     end
     handle Error msg =>
@@ -3871,22 +3927,23 @@ fun source_spans_for_action policy (action : theory_action) source_text =
     {source_boundaries = source_boundaries_for_action policy action source_text,
      termination_diagnostics = []}
 
-fun declaration_checkpoints_for_action policy root (action : theory_action) source_text terminations =
+fun declaration_checkpoints_for_action policy checkpoint_root (action : theory_action) source_text terminations =
   if not (checkpoint_enabled policy) orelse not (proof_steps_enabled policy) then []
   else
     declaration_checkpoint_specs (proof_engine policy) (tactic_timeout policy)
-      (action_checkpoint_base root action) (#deps_key action)
+      (action_checkpoint_base checkpoint_root action) (#deps_key action)
       (#inputs_key action) source_text terminations
     handle Error msg =>
       (warn ("could not safely create termination-definition checkpoints for " ^ #logical action ^
              "; building without termination-definition checkpoints for this theory\n" ^ msg);
        [])
 
-(* Builds a theory action in action root `root`: plans its proof steps and
-   checkpoints from the script, then runs it, again after discarding a
-   checkpoint HOL could not resume from.  Returns the generated theory's load
+(* Builds a theory action in action root `root`, keeping its checkpoints in
+   checkpoint root `checkpoint_root`: plans its proof steps and checkpoints from
+   the script, then runs it, again after discarding a checkpoint HOL could not
+   resume from.  Returns the generated theory's load
    metadata, and leaves the stage to the caller, as `run_theory_action`. *)
-fun build_theory_action cache_allowed policy tc root base_context (action : theory_action) =
+fun build_theory_action cache_allowed policy tc root checkpoint_root base_context (action : theory_action) =
   let
     val source_text = read_text (#source_file action)
     val source_spans = source_spans_for_action policy action source_text
@@ -3894,15 +3951,15 @@ fun build_theory_action cache_allowed policy tc root base_context (action : theo
       case #source_boundaries source_spans of
           NONE => []
         | SOME {boundaries, errors} =>
-            theory_checkpoints_for_action policy root action source_text boundaries errors
+            theory_checkpoints_for_action policy checkpoint_root action source_text boundaries errors
     val termination_diagnostics =
       termination_proof_plans_for_action policy action (#termination_diagnostics source_spans)
     val declaration_checkpoints =
-      declaration_checkpoints_for_action policy root action source_text termination_diagnostics
+      declaration_checkpoints_for_action policy checkpoint_root action source_text termination_diagnostics
     fun run retries_left =
       let
         val generated_metadata =
-          run_theory_action cache_allowed policy tc root base_context action source_text
+          run_theory_action cache_allowed policy tc root checkpoint_root base_context action source_text
                             theorem_checkpoints declaration_checkpoints termination_diagnostics
       in
         remove_failed_prefix_checkpoints theorem_checkpoints;
@@ -3922,7 +3979,8 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
   let
     val root = project_artifact_root project
     val action = theory_action root plan keys toolchain_key (#holdir tc) node
-    val generated_metadata = build_theory_action cache_allowed policy tc root base_context action
+    val generated_metadata =
+      build_theory_action cache_allowed policy tc root (default_checkpoint_root root) base_context action
     val stage = action_stage root action
     val extra_output_paths = source_extra_output_paths plan node
   in
@@ -5242,6 +5300,663 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       else ()
   in
     print (String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n")
+  end
+
+(* holbuild exec-action: a remote worker builds one ActionSpec in a fixed
+   action root under the cache root, with only the remote cache as input, and
+   reports the outcome as a result record.  See README, "Running one theory
+   action as a remote worker". *)
+
+val action_result_header = "holbuild-action-result-v1"
+
+datatype action_failure =
+    ProofFailure
+  | TacticTimeoutFailure
+  | MemoryFailure
+  | InputMissing of string  (* "theory <input_key>" or "blob <sha256>" *)
+  | PublishFailure
+  | ToolchainFailure
+  | DiskFailure
+  | SpecRejected
+  | InternalFailure
+
+exception ActionFailed of action_failure * string
+
+fun failure_name ProofFailure = "proof"
+  | failure_name TacticTimeoutFailure = "tactic-timeout"
+  | failure_name MemoryFailure = "memory"
+  | failure_name (InputMissing _) = "input-missing"
+  | failure_name PublishFailure = "publish"
+  | failure_name ToolchainFailure = "toolchain"
+  | failure_name DiskFailure = "disk"
+  | failure_name SpecRejected = "spec-rejected"
+  | failure_name InternalFailure = "internal"
+
+(* 1 is final, 2 retries on more memory, 3 retries or resubmits, 4 rejects. *)
+fun failure_exit_code ProofFailure = 1
+  | failure_exit_code TacticTimeoutFailure = 1
+  | failure_exit_code MemoryFailure = 2
+  | failure_exit_code SpecRejected = 4
+  | failure_exit_code _ = 3
+
+fun reject_spec msg = raise ActionFailed (SpecRejected, msg)
+
+type spec_file = {path : string, sha256 : string, size : string}
+
+type action_spec =
+  {version : string, runtime : string,
+   toolchain : {git : string, rev : string, kernel : string},
+   input_key : string, action_text_sha256 : string, deps_key : string,
+   package : string, logical : string,
+   source : spec_file,
+   inputs : spec_file list, libraries : spec_file list,
+   deps : {target : string, stem : string, key : string} list,
+   libs : {target : string, stem : string, suffix : string, loads : string list} list,
+   loads : theory_load list,
+   outputs : {sig_path : string, sml_path : string, data_path : string},
+   extra_outputs : string list,
+   proof_steps : bool, tactic_timeout : real option, new_ir : bool,
+   action_text : string}
+
+fun split_spec_text text =
+  let val marker = "\naction-text\n"
+      val (head, rest) = Substring.position marker (Substring.full text)
+  in
+    if Substring.size rest = 0 then reject_spec "spec has no action-text section"
+    else (Substring.string head, Substring.string (Substring.triml (size marker) rest))
+  end
+
+fun target_name text =
+  case String.fields (fn c => c = #":") text of
+      [package, logical] =>
+        if package <> "" andalso logical <> "" then (package, logical)
+        else reject_spec ("malformed target " ^ text)
+    | _ => reject_spec ("malformed target " ^ text)
+
+fun spec_bool name text =
+  case text of "true" => true | "false" => false
+     | _ => reject_spec ("option " ^ name ^ " is not a boolean: " ^ text)
+
+fun parse_action_spec text : action_spec =
+  let
+    val (head, action_text) = split_spec_text text
+    val lines = List.filter (fn line => line <> "") (String.fields (fn c => c = #"\n") head)
+    val _ =
+      case lines of
+          first :: _ => if first = action_spec_header then ()
+                        else reject_spec ("not an ActionSpec: " ^ HolbuildHash.quote first)
+        | [] => reject_spec "empty spec"
+    val values = ref ([] : (string * string) list)
+    val toolchain = ref NONE
+    val target = ref NONE
+    val source = ref NONE
+    val inputs = ref []
+    val libraries = ref []
+    val deps = ref []
+    val libs = ref []
+    val loads = ref []
+    val outputs = ref ([] : (string * string) list)
+    val extra_outputs = ref []
+    fun push r x = r := x :: !r
+    fun key_value text =
+      case Substring.position "=" (Substring.full text) of
+          (key, value) =>
+            if Substring.size value = 0 then reject_spec ("malformed spec line: " ^ text)
+            else (Substring.string key, Substring.string (Substring.triml 1 value))
+    fun line text =
+      case String.tokens (fn c => c = #" ") text of
+          ["toolchain", git, rev, kernel] =>
+            (case (key_value git, key_value rev, key_value kernel) of
+                 (("git", g), ("rev", r), ("kernel", k)) => toolchain := SOME {git = g, rev = r, kernel = k}
+               | _ => reject_spec ("malformed toolchain line: " ^ text))
+        | ["target", t] => target := SOME t
+        | ["source", package, path, sha256, size] =>
+            source := SOME (package, {path = path, sha256 = sha256, size = size})
+        | ["file", "input", path, sha256, size] => push inputs {path = path, sha256 = sha256, size = size}
+        | ["file", "library", path, sha256, size] => push libraries {path = path, sha256 = sha256, size = size}
+        | ["dep", "theory", t, stem, key] => push deps {target = t, stem = stem, key = key}
+        | "lib" :: t :: stem :: suffix :: lib_loads =>
+            push libs {target = t, stem = stem, suffix = suffix, loads = lib_loads}
+        | ["load", "theory", name] => push loads (LoadTheory name)
+        | ["load", "library", name] => push loads (LoadLibrary name)
+        | ["load", "object", stem] => push loads (LoadObject stem)
+        | ["output", "extra", decl] => push extra_outputs decl
+        | ["output", role, path] => push outputs (role, path)
+        | ["option", option] => push values (key_value ("option " ^ option))
+        | [single] => push values (key_value single)
+        | _ => reject_spec ("unknown spec line: " ^ text)
+    val _ = List.app line (tl lines)
+    fun value key =
+      case List.find (fn (k, _) => k = key) (!values) of
+          SOME (_, v) => v
+        | NONE => reject_spec ("spec has no " ^ key)
+    fun output role =
+      case List.find (fn (r, _) => r = role) (!outputs) of
+          SOME (_, path) => path
+        | NONE => reject_spec ("spec has no output " ^ role)
+    val (package, logical) =
+      target_name (case !target of SOME t => t | NONE => reject_spec "spec has no target")
+    val (source_package, source_file) =
+      case !source of SOME s => s | NONE => reject_spec "spec has no source"
+    val _ = if source_package = package then ()
+            else reject_spec "the source's package is not the target's"
+    val tactic_timeout =
+      case parse_timeout_text (value "option tactic-timeout") of
+          SOME timeout => timeout
+        | NONE => reject_spec "malformed option tactic-timeout"
+  in
+    {version = value "holbuild-version", runtime = value "holbuild-runtime",
+     toolchain = (case !toolchain of SOME t => t | NONE => reject_spec "spec has no toolchain"),
+     input_key = value "input-key", action_text_sha256 = value "action-text-sha256",
+     deps_key = value "deps-key", package = package, logical = logical,
+     source = source_file, inputs = rev (!inputs), libraries = rev (!libraries),
+     deps = rev (!deps), libs = rev (!libs), loads = rev (!loads),
+     outputs = {sig_path = output "sig", sml_path = output "sml", data_path = output "dat"},
+     extra_outputs = rev (!extra_outputs),
+     proof_steps = spec_bool "proof-steps" (value "option proof-steps"),
+     tactic_timeout = tactic_timeout,
+     new_ir = spec_bool "new-ir" (value "option new-ir"),
+     action_text = action_text}
+  end
+
+fun action_text_values (spec : action_spec) prefix =
+  List.mapPartial
+    (fn line => if String.isPrefix prefix line then SOME (String.extract(line, size prefix, NONE)) else NONE)
+    (String.fields (fn c => c = #"\n") (#action_text spec))
+
+fun action_text_value spec key =
+  case action_text_values spec (key ^ "=") of
+      [value] => value
+    | _ => reject_spec ("the action text has no single " ^ key ^ " line")
+
+(* Step 1: the spec is for this holbuild, intact, and of an action a worker
+   may run. *)
+fun verify_action_spec (spec : action_spec) =
+  let
+    val text_hash = HolbuildToolchain.hash_text (#action_text spec)
+    fun check ok msg = if ok then () else reject_spec msg
+    fun escapes path = Path.isAbsolute path orelse path = ".." orelse String.isPrefix "../" path orelse
+                       String.isSubstring "/../" path
+    (* A direct project dependency is a theory with this key or a library;
+       a HOL dependency has no key. *)
+    fun direct_dep_ok dep_line =
+      case String.fields (fn c => c = #"@") dep_line of
+          [target, key] =>
+            (case List.find (fn {target = t, ...} => t = target) (#deps spec) of
+                 SOME {key = spec_key, ...} => spec_key = key
+               | NONE => List.exists (fn {target = t, ...} => t = target) (#libs spec))
+        | _ => true
+  in
+    check (#version spec = HolbuildVersion.version)
+      ("spec is for holbuild " ^ #version spec ^ ", this is " ^ HolbuildVersion.version);
+    check (#runtime spec = runtime_identity ()) "spec is for different holbuild runtime sources";
+    check (#kernel (#toolchain spec) = "stdknl") "spec is for a tracing kernel";
+    check (text_hash = #input_key spec) "the action text does not hash to input-key";
+    check (#action_text_sha256 spec = text_hash) "action-text-sha256 does not match the action text";
+    check (action_text_value spec "package" = #package spec) "the action text names another package";
+    check (action_text_value spec "logical" = #logical spec) "the action text names another theory";
+    check (action_text_value spec "source" = #path (#source spec)) "the action text names another source";
+    check (action_text_value spec "source-sha256" = #sha256 (#source spec))
+      "the source's SHA-256 does not match the action text";
+    check (action_text_value spec "cache" = "true") "the action sets cache = false";
+    check (action_text_value spec "always_reexecute" = "false") "the action sets always_reexecute";
+    check (List.all direct_dep_ok (action_text_values spec "dep="))
+      "a dependency's key does not match the action text";
+    List.app (fn path => check (not (escapes path)) ("path " ^ path ^ " leaves the action root"))
+      (#path (#source spec) :: map #path (#inputs spec @ #libraries spec) @
+       map #stem (#deps spec) @ map #stem (#libs spec) @
+       [#sig_path (#outputs spec), #sml_path (#outputs spec), #data_path (#outputs spec)])
+  end
+
+(* The extra-inputs key the build plan records for checkpoint keys, from the
+   extra-input lines of the action text, which name the same bytes. *)
+fun spec_inputs_key (spec : action_spec) =
+  let
+    val lines =
+      List.filter
+        (fn line => List.exists (fn prefix => String.isPrefix prefix line)
+                      ["extra_dep_decl=", "extra_dep=", "source_extra_dep_decl=", "source_extra_dep="])
+        (String.fields (fn c => c = #"\n") (#action_text spec))
+  in
+    case lines of
+        [] => NONE
+      | _ => SOME (HolbuildToolchain.hash_text
+                     (String.concatWith "\n" ("holbuild-extra-inputs-v1" :: lines) ^ "\n"))
+  end
+
+fun action_source_path package path =
+  normalize_path (String.concatWith "/" [".holbuild/action-src", package, path])
+
+fun spec_load_stems (spec : action_spec) =
+  let
+    fun add ((name, stem), acc) =
+      if List.exists (fn (n, _) => n = name) acc then acc else acc @ [(name, stem)]
+  in
+    List.foldl add []
+      (map (fn {target, stem, ...} => (#2 (target_name target), stem)) (#deps spec) @
+       map (fn {target, stem, ...} => (#2 (target_name target), stem)) (#libs spec))
+  end
+
+fun spec_theory_action root (spec : action_spec) : theory_action =
+  let
+    val package = #package spec
+    val path = #path (#source spec)
+    val script_dir = case Path.dir path of "" => "" | dir => normalize_path dir
+  in
+    {input_key = #input_key spec,
+     deps_key = #deps_key spec,
+     inputs_key = spec_inputs_key spec,
+     package = package,
+     logical = #logical spec,
+     relative_path = path,
+     source_file = in_root root (action_source_path package path),
+     source_name = "$(" ^ package ^ ")/" ^ path,
+     script_dir = script_dir,
+     inputs = map (fn {path, ...} => {path = path, from = in_root root (action_source_path package path)}) (#inputs spec),
+     loads = #loads spec,
+     load_stems = spec_load_stems spec,
+     outputs = #outputs spec,
+     extra_outputs = #extra_outputs spec}
+  end
+
+fun spec_policy (spec : action_spec) =
+  CheckpointPolicy {checkpoint = true,
+                    proof_steps = #proof_steps spec,
+                    new_ir = #new_ir spec,
+                    tactic_timeout = effective_tactic_timeout (#proof_steps spec) (#tactic_timeout spec),
+                    execution_plan = NONE,
+                    trace_steps = false,
+                    repl_on_failure = false,
+                    trknl = false}
+
+(* A full disk is a disk failure, whichever step hit it. *)
+fun action_failed failure msg =
+  ActionFailed (if String.isSubstring "No space left on device" msg then DiskFailure else failure, msg)
+
+fun fetch_spec_blob remote {hash, dst} =
+  (ensure_parent dst;
+   case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = hash, dst = dst} of
+       HolbuildCacheBackend.Hit => ()
+     | HolbuildCacheBackend.Miss => raise ActionFailed (InputMissing ("blob " ^ hash), "blob " ^ hash ^ " is not in the cache")
+     | HolbuildCacheBackend.Corrupt msg => raise action_failed (InputMissing ("blob " ^ hash)) msg)
+
+(* Restores a theory the action depends on, or the action's own entry, into
+   the action root, writing its load manifests with the spec's stems. *)
+fun restore_spec_theory root (spec : action_spec) {key, subject, stem, extra_outputs, requested_timeout} =
+  let
+    val cache = cache_root ()
+    val entry =
+      checked_cache_entry false
+        {root = cache, input_key = key, subject = subject,
+         expected_extra_outputs = extra_outputs,
+         requested_timeout = requested_timeout, require_trace = false}
+    val stems = spec_load_stems spec
+    fun resolve name = Option.map (fn (_, s) => in_root root s) (List.find (fn (n, _) => n = name) stems)
+    val stem_path = in_root root stem
+    val sig_path = stem_path ^ ".sig"
+    val sml_path = stem_path ^ ".sml"
+    fun write_manifests metadata =
+      (write_object_manifest (stem_path ^ ".ui") [sig_path];
+       write_object_manifest (stem_path ^ ".uo") (generated_theory_loads resolve metadata @ [sml_path]))
+  in
+    ignore
+      (install_cache_entry false cache key subject entry
+         {outputs = {sig_path = sig_path, sml_path = sml_path, data_path = stem_path ^ ".dat"},
+          extra_destination = fn decl => in_root root (action_source_path (#1 (target_name subject)) decl),
+          write_manifests = write_manifests})
+  end
+
+(* Each restored theory's .dat records the hashes of its parents' .dat
+   files; every parent the spec places must match. *)
+fun spec_parent_hashes_match root (spec : action_spec) data_path =
+  let
+    val recorded = parse_dat_parent_hashes (read_text data_path)
+  in
+    List.all
+      (fn {target, stem, ...} =>
+          case Binarymap.peek (recorded, theory_name_from_logical (#2 (target_name target))) of
+              NONE => true
+            | SOME hash => (hol_dat_hash (in_root root (stem ^ ".dat")) = hash handle _ => false))
+      (#deps spec)
+  end
+
+(* Step 3: sources and library manifests from the spec, dependency theories
+   from the cache. *)
+fun hydrate_action_root remote root (spec : action_spec) =
+  let
+    val package = #package spec
+    fun fetch_file {path, sha256, ...} =
+      fetch_spec_blob remote {hash = sha256, dst = in_root root (action_source_path package path)}
+    fun fetch_library {path, sha256, ...} =
+      fetch_spec_blob remote {hash = sha256, dst = in_root root path}
+    fun lib_load load = if CharVector.exists (fn c => c = #"/") load then in_root root load else load
+    fun write_lib {stem, suffix, loads, ...} =
+      (ensure_parent (in_root root stem);
+       write_object_manifest (in_root root (stem ^ suffix)) (map lib_load loads))
+    fun restore_dep {target, stem, key} =
+      (ensure_parent (in_root root stem);
+       restore_spec_theory root spec
+         {key = key, subject = target, stem = stem, extra_outputs = NONE, requested_timeout = NONE})
+      handle e => raise action_failed (InputMissing ("theory " ^ key))
+                          ("dependency " ^ target ^ " (" ^ key ^ ") is not restorable from the cache: " ^
+                           General.exnMessage e)
+  in
+    fetch_file (#source spec);
+    List.app fetch_file (#inputs spec);
+    List.app fetch_library (#libraries spec);
+    List.app write_lib (#libs spec);
+    List.app restore_dep (#deps spec);
+    List.app
+      (fn {target, stem, key} =>
+          if spec_parent_hashes_match root spec (in_root root (stem ^ ".dat")) then ()
+          else raise ActionFailed (InputMissing ("theory " ^ key),
+                                   "dependency " ^ target ^ " does not match its parents in the cache"))
+      (#deps spec)
+  end
+
+(* Step 4: the action's own entry restores with full validation. *)
+fun action_already_done root (spec : action_spec) =
+  let
+    val {sig_path, sml_path, data_path} = #outputs spec
+    val stem = drop_suffix ".dat" data_path
+  in
+    (restore_spec_theory root spec
+       {key = #input_key spec, subject = #package spec ^ ":" ^ #logical spec, stem = stem,
+        extra_outputs = SOME (#extra_outputs spec), requested_timeout = #tactic_timeout spec};
+     spec_parent_hashes_match root spec (in_root root data_path))
+    handle _ => false
+  end
+
+(* Step 6: the remote now holds an entry for the action with this build's
+   outputs and a timeout contract at least as strict as the spec's. *)
+fun check_remote_publication remote (spec : action_spec) =
+  let
+    val key = #input_key spec
+    val local_manifest = HolbuildCache.get_action (cache_root ()) key
+    val remote_manifest = HolbuildRemoteCache.get_action remote key
+    fun fail msg = raise ActionFailed (PublishFailure, msg)
+  in
+    case (local_manifest, remote_manifest) of
+        (NONE, _) => fail "the build published no local cache entry"
+      | (_, NONE) => fail "the remote cache holds no entry for the action after publishing"
+      | (SOME mine, SOME theirs) =>
+          if not (cache_manifest_outputs_equal key mine theirs) then
+            fail "the remote cache holds different outputs for the action"
+          else if not (timeout_satisfies (#tactic_timeout spec)
+                         (cache_manifest_proof_timeout (cache_manifest_lines theirs))) then
+            fail "the remote cache's entry has a weaker timeout contract than requested"
+          else ()
+  end
+
+(* The OOM killer's count for this process's cgroup (v2), if readable. *)
+fun cgroup_oom_kills () =
+  let
+    val cgroup_line =
+      List.find (String.isPrefix "0::") (String.fields (fn c => c = #"\n") (read_text "/proc/self/cgroup"))
+    val path =
+      case cgroup_line of
+          SOME line => "/sys/fs/cgroup" ^ String.extract(line, 3, NONE) ^ "/memory.events"
+        | NONE => raise Fail "no cgroup v2"
+    fun count line =
+      case String.tokens Char.isSpace line of
+          ["oom_kill", n] => Int.fromString n
+        | _ => NONE
+  in
+    List.mapPartial count (String.fields (fn c => c = #"\n") (read_text path))
+  end
+  handle _ => []
+
+fun peak_rss_mb stage =
+  case String.tokens Char.isSpace (read_text (Path.concat(stage, peak_rss_report_name))) of
+      ["VmHWM:", kb, "kB"] => Option.map (fn n => n div 1024) (Int.fromString kb)
+    | _ => NONE
+  handle _ => NONE
+
+fun classify_run_failure log_text oom_before msg =
+  let
+    val text = msg ^ "\n" ^ log_text
+    fun has marker = String.isSubstring marker text
+  in
+    if cgroup_oom_kills () <> oom_before orelse has "Run out of store" orelse
+       has "Insufficient memory" then MemoryFailure
+    else if has "No space left on device" then DiskFailure
+    else if String.isPrefix "tactic timed out" msg then TacticTimeoutFailure
+    else ProofFailure
+  end
+
+(* The worker cache cap: one LRU over everything a worker keeps between
+   actions (its checkpoint tree, the toolchains with their analysers, and the
+   local cache), swept before each action.  It extends the checkpoint budget
+   sweep's family eviction to the whole cache root: a family goes whole, and a
+   toolchain another process is using is pinned. *)
+type cache_family = {mtime : Time.time, bytes : Position.int, evict : unit -> bool}
+
+fun tree_bytes path =
+  if (FS.isLink path handle OS.SysErr _ => false) then 0
+  else if (FS.isDir path handle OS.SysErr _ => false) then
+    List.foldl (fn (child, total) => total + tree_bytes child) (0 : Position.int) (children path)
+  else file_size path
+
+fun modified_time path = FS.modTime path handle OS.SysErr _ => Time.zeroTime
+
+fun checkpoint_cache_families checkpoint_root =
+  List.map
+    (fn ({base, mtime, bytes} : checkpoint_family) =>
+        {mtime = mtime, bytes = bytes,
+         evict = fn () => (remove_checkpoint_family_base base;
+                           not (checkpoint_family_root_exists base))})
+    (collect_checkpoint_families checkpoint_root)
+
+fun toolchain_cache_families () =
+  let
+    (* Any cutoff after now makes every entry stale, so gc_entry removes it
+       unless a process holds its usage lease. *)
+    val cutoff = Time.+(Time.now (), Time.fromSeconds 86400)
+    fun family k =
+      {mtime = Option.getOpt (HolbuildHolSharedCache.last_use_time k, Time.zeroTime),
+       bytes = tree_bytes (HolbuildHolSharedCache.entry_dir_for_key k),
+       evict = fn () =>
+         (HolbuildHolSharedCache.gc_entry cutoff k = HolbuildHolSharedCache.GcRemoved)
+         handle e => (warn ("could not evict HOL toolchain " ^ k ^ ": " ^ General.exnMessage e); false)}
+  in
+    List.map family (HolbuildHolSharedCache.toolchain_keys ())
+  end
+
+(* A blob belongs to the newest entry naming it, so evicting oldest first
+   removes it with its last user; blobs no entry names go first. *)
+fun local_cache_families cache =
+  let
+    val entries =
+      List.map (fn dir => (dir, modified_time (HolbuildCache.manifest_path dir), HolbuildCache.action_live_blobs dir))
+               (HolbuildCache.children (HolbuildCache.actions_dir cache))
+    fun claim ((dir, mtime, blobs), owners) =
+      Redblackset.foldl
+        (fn (blob, owners) =>
+            case Redblackmap.peek (owners, blob) of
+                SOME (_, owner_mtime) =>
+                  if Time.<(owner_mtime, mtime) then Redblackmap.insert (owners, blob, (dir, mtime)) else owners
+              | NONE => Redblackmap.insert (owners, blob, (dir, mtime)))
+        owners blobs
+    val owners = List.foldl claim (Redblackmap.mkDict String.compare) entries
+    fun assign (path, (owned, orphans)) =
+      case Redblackmap.peek (owners, Path.file path) of
+          SOME (dir, _) =>
+            (Redblackmap.insert (owned, dir, path :: Option.getOpt (Redblackmap.peek (owned, dir), [])), orphans)
+        | NONE => (owned, path :: orphans)
+    val (owned, orphans) =
+      List.foldl assign (Redblackmap.mkDict String.compare, [])
+                 (HolbuildCache.children (HolbuildCache.blobs_dir cache))
+    fun files_bytes paths = List.foldl (fn (path, total) => total + file_size path) (0 : Position.int) paths
+    fun remove_all paths = (List.app HolbuildCache.remove_tree paths; not (List.exists path_exists paths))
+    fun entry_family (dir, mtime, _) =
+      let val blobs = Option.getOpt (Redblackmap.peek (owned, dir), [])
+      in {mtime = mtime, bytes = tree_bytes dir + files_bytes blobs, evict = fn () => remove_all (dir :: blobs)} end
+  in
+    {mtime = Time.zeroTime, bytes = files_bytes orphans, evict = fn () => remove_all orphans} ::
+    List.map entry_family entries
+  end
+
+(* Evict least recently used families until the cache leaves reserve_bytes of
+   room under limit_bytes. *)
+fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes} =
+  let
+    val families =
+      sort_by_mtime_ascending (fn ({mtime, ...} : cache_family) => mtime)
+        (checkpoint_cache_families checkpoint_root @ toolchain_cache_families () @
+         local_cache_families cache)
+    val target = limit_bytes - reserve_bytes
+    fun sweep total remaining =
+      if total <= target then total
+      else
+        case remaining of
+            [] => total
+          | ({bytes, evict, ...} : cache_family) :: rest =>
+              let val evicted = evict () handle e => (warn ("worker cache eviction failed: " ^ General.exnMessage e); false)
+              in sweep (if evicted then total - bytes else total) rest end
+    val total = List.foldl (fn ({bytes, ...} : cache_family, sum) => sum + bytes) (0 : Position.int) families
+    val after = sweep total families
+  in
+    if after <= target then ()
+    else warn ("worker cache holds " ^ gb_decimal_text after ^ " GB of entries in use, over the " ^
+               gb_decimal_text target ^ " GB left under the cap after its reserve")
+  end
+  handle e => warn ("worker cache sweep failed: " ^ General.exnMessage e)
+
+fun with_action_root_lock cache f =
+  let
+    val _ = ensure_dir cache
+    val lock = HolbuildFileLock.acquire_exclusive_path_wait {path = Path.concat(cache, "action.lock")}
+  in
+    (f () before HolbuildFileLock.release lock)
+    handle e => (HolbuildFileLock.release lock; raise e)
+  end
+
+fun result_text (spec_sha256, input_key) {status, failure, wall_ms, peak, log} =
+  String.concatWith "\n"
+    ([action_result_header,
+      "spec=" ^ spec_sha256,
+      "input-key=" ^ input_key,
+      "status=" ^ status] @
+     (case failure of
+          NONE => []
+        | SOME (kind, _) =>
+            ("failure=" ^ failure_name kind) ::
+            (case kind of InputMissing missing => ["missing=" ^ missing] | _ => [])) @
+     (case peak of SOME mb => ["peak-rss-mb=" ^ Int.toString mb] | NONE => []) @
+     ["wall-ms=" ^ LargeInt.toString wall_ms] @
+     (case log of SOME (sha, bytes) => ["log=" ^ sha ^ " " ^ bytes] | NONE => [])) ^ "\n"
+
+fun exception_failure e =
+  let val msg = General.exnMessage e
+  in
+    if String.isSubstring "No space left on device" msg then (DiskFailure, msg)
+    else (InternalFailure, msg)
+  end
+
+(* Runs one ActionSpec, writes its result record and returns the exit code.
+   `toolchain` ensures the spec's HOL toolchain and returns it. *)
+fun exec_action {spec_sha256, result_file, cache_cap, toolchain} =
+  let
+    val start = Time.now ()
+    val remote =
+      case HolbuildRemoteCacheConfig.url () of
+          SOME url => HolbuildRemoteCache.remote url
+        | NONE => raise Error "exec-action needs a remote cache: pass --remote-cache URL"
+    val cache = cache_root ()
+    val root = Path.concat(cache, "action")
+    val checkpoint_root = Path.concat(cache, "checkpoints")
+    val input_key = ref ""
+    val target = ref ("", "")
+    val peak = ref NONE
+    (* The checkpoint tree outlives the action root, so a rerun after an edit
+       resumes from the checkpoints before it; the worker cache cap bounds it. *)
+    fun empty_root () = remove_tree root
+    fun build_log () = current_build_log (current_log_dir root (#1 (!target)) (#2 (!target)))
+    fun upload_log () =
+      let val path = build_log ()
+      in
+        if not (file_exists path) then NONE
+        else
+          let val sha = HolbuildHash.file_sha256 path
+          in
+            case HolbuildRemoteCache.publish_blob remote {hash = sha, src = path} of
+                HolbuildCacheBackend.Published => SOME (sha, Position.toString (FS.fileSize path))
+              | HolbuildCacheBackend.AlreadyPresent => SOME (sha, Position.toString (FS.fileSize path))
+              | _ => (warn "could not upload the action log"; NONE)
+          end
+      end
+      handle e => (warn ("could not upload the action log: " ^ General.exnMessage e); NONE)
+    fun run () =
+      let
+        val _ = (empty_root (); ensure_dir root)
+        val spec_path = Path.concat(root, ".holbuild/action-spec")
+        val _ = fetch_spec_blob remote {hash = spec_sha256, dst = spec_path}
+                handle ActionFailed (_, msg) => reject_spec ("cannot fetch the spec: " ^ msg)
+        val spec = parse_action_spec (read_text spec_path)
+        val _ = (input_key := #input_key spec; target := (#package spec, #logical spec))
+        val _ = verify_action_spec spec
+        val tc =
+          toolchain (#toolchain spec)
+          handle e => raise ActionFailed (ToolchainFailure, General.exnMessage e)
+        val _ =
+          if HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key =
+             action_text_value spec "toolchain" then ()
+          else raise ActionFailed (ToolchainFailure, "the toolchain's identity does not match the action text")
+        val _ = hydrate_action_root remote root spec
+      in
+        if action_already_done root spec then "cached"
+        else
+          let
+            val action = spec_theory_action root spec
+            val stage = action_stage root action
+            val oom_before = cgroup_oom_kills ()
+            val _ =
+              ignore (build_theory_action true (spec_policy spec) tc root checkpoint_root
+                        (toolchain_base_context tc) action)
+              handle Error msg =>
+                let val log_text = read_text (build_log ()) handle _ => ""
+                in raise ActionFailed (classify_run_failure log_text oom_before msg, msg) end
+            val _ = peak := peak_rss_mb stage
+            val _ = check_remote_publication remote spec
+          in
+            "built"
+          end
+      end
+    fun attempt () =
+      (run (), NONE)
+      handle ActionFailed failure => ("failed", SOME failure)
+           | e => ("failed", SOME (exception_failure e))
+    val (status, failure, log) =
+      with_action_root_lock cache
+        (fn () =>
+            let
+              val _ =
+                Option.app (fn {limit_bytes, reserve_bytes} =>
+                               enforce_worker_cache_cap
+                                 {cache = cache, checkpoint_root = checkpoint_root,
+                                  limit_bytes = limit_bytes, reserve_bytes = reserve_bytes})
+                           cache_cap
+              val (status, failure) = attempt ()
+              val log = upload_log ()
+            in
+              empty_root ();
+              (status, failure, log)
+            end)
+    val wall_ms = Time.toMilliseconds (Time.-(Time.now (), start))
+    val text =
+      result_text (spec_sha256, !input_key)
+        {status = status, failure = failure, wall_ms = wall_ms,
+         peak = if status = "built" then !peak else NONE, log = log}
+  in
+    (case failure of
+         SOME (_, msg) => HolbuildStatus.message_stderr ("holbuild: exec-action failed: " ^ msg ^ "\n")
+       | NONE => ());
+    (case result_file of
+         SOME path => write_text path text
+       | NONE => print text);
+    case failure of
+        NONE => 0
+      | SOME (kind, _) => failure_exit_code kind
   end
 
 fun buildheap_arg heap_kind node =

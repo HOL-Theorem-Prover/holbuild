@@ -665,19 +665,31 @@ fun restore_entry k =
                 | _ => NotRestored))
   end
 
+(* Whether this entry's own archive is the one the remote now holds; with no
+   remote there is nothing else it could hold. *)
 fun publish_entry {replace} k =
   case HolbuildRemoteCacheConfig.url () of
-      NONE => ()
+      NONE => true
     | SOME url =>
         ((if path_exists (ok_for_key k) andalso complete_toolchain_contents k then
-            ignore
-              (HolbuildToolchainArchive.publish
-                 {remote = HolbuildRemoteCache.remote url,
-                  identity = archive_identity k,
-                  entry_dir = entry_dir_for_key k,
-                  replace = replace})
+            HolbuildToolchainArchive.publish
+              {remote = HolbuildRemoteCache.remote url,
+               identity = archive_identity k,
+               entry_dir = entry_dir_for_key k,
+               replace = replace} = HolbuildCacheBackend.Published
           else die "HOL toolchain is not complete enough to publish")
-         handle error => warn_publish (archive_error_message error))
+         handle error => (warn_publish (archive_error_message error); false))
+
+(* A remote worker runs only on the toolchain bytes the remote holds, so that
+   every worker has the same ones: when another build's archive won the
+   publish, it discards its own build and restores that archive. *)
+val adopt_published_archive = ref false
+
+fun adopt_published_entry k =
+  (remove_tree (run_mutation k) (entry_dir_for_key k);
+   case restore_entry k of
+       Restored => ()
+     | _ => die "could not restore the published HOL toolchain archive")
 
 (* false when the legacy entry's sources cannot be listed. *)
 fun generate_legacy_theory_toolchain req k =
@@ -718,7 +730,9 @@ fun finish_entry jobs req k =
     val _ =
       case publication of
           NoPublication => ()
-        | Publish replace => publish_entry replace k
+        | Publish replace =>
+            if publish_entry replace k orelse not (!adopt_published_archive) then ()
+            else adopt_published_entry k
     val _ = ignore (build_analyser k)
   in
     holdir_for_key k
