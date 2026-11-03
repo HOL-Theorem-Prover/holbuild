@@ -6108,6 +6108,9 @@ fun store_add store heap {sha, src, save} =
       end
   end
 
+(* A blob a shared entry names that the remote cache no longer holds. *)
+exception MissingSharedBlob of string
+
 (* Puts blob `sha` of heap `heap`'s family at `dst`, from the store, which
    fetches it from the remote cache if it lacks it. *)
 fun place_shared_blob remote store heap {sha, dst, save} =
@@ -6119,7 +6122,9 @@ fun place_shared_blob remote store heap {sha, dst, save} =
         ensure_parent tmp;
         case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = sha, dst = tmp} of
             HolbuildCacheBackend.Hit => FS.rename {old = tmp, new = stored}
-          | _ => (remove_file tmp; raise Error ("the cache has no shared checkpoint blob " ^ sha))
+          | HolbuildCacheBackend.Miss => (remove_file tmp; raise MissingSharedBlob sha)
+          | HolbuildCacheBackend.Corrupt msg =>
+              (remove_file tmp; raise Error ("could not fetch shared checkpoint blob " ^ sha ^ ": " ^ msg))
       end
     (* Another worker's cap sweep may evict the family between the check
        and the link. *)
@@ -6247,16 +6252,25 @@ fun tree_path root rel =
   if rel = "" orelse escapes rel then raise Error ("shared checkpoint path leaves the checkpoint tree: " ^ rel)
   else Path.concat(root, rel)
 
-(* The files restored, with their SHA-256s, and the heap they are on. *)
-type shared_restore = {heap : string option, files : (string * string) list}
+(* The files restored, with their SHA-256s, and the heap they are on; and
+   the entries found naming blobs the cache no longer holds, with those
+   blobs, which the publish replaces. *)
+type shared_restore =
+  {heap : string option, files : (string * string) list, stale : string list, missing : string list}
 
-val nothing_restored : shared_restore = {heap = NONE, files = []}
+val nothing_restored : shared_restore = {heap = NONE, files = [], stale = [], missing = []}
 
 (* Before the run: the latest checkpoint the cache holds for this source,
    else the heap, placed in the action's checkpoint tree, which is empty. *)
 fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, deps_key, deps_loaded,
                                               requested_timeout, candidates, ...} : shared_context) =
   let
+    val stale = ref ([] : string list)
+    val missing = ref ([] : string list)
+    fun missing_blob key sha =
+      (warn ("the cache lost blob " ^ sha ^ " of shared entry " ^ key);
+       stale := key :: !stale; missing := sha :: !missing)
+    val no_files = {heap = NONE, files = []}
     fun wipe () = remove_tree checkpoint_root
     fun place heap (sha, dst) = place_shared_blob remote store heap {sha = sha, dst = dst, save = true}
     fun place_sidecar heap (sha, dst) = place_shared_blob remote store heap {sha = sha, dst = dst, save = false}
@@ -6275,63 +6289,67 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
         | [last] => saved_parent last = SOME deps_loaded
         | p :: (rest as q :: _) => saved_parent p = SOME q andalso chain_ok rest
     fun try_candidate (c : shared_candidate) =
-      case HolbuildRemoteCache.get_action remote (shared_checkpoint_key heap_key (#kind c) (#key c)) of
-          NONE => NONE
-        | SOME text =>
-            (let
-               val entries = shared_manifest_entries text
-               val (heap, _) = single "heap" entries
-               val (leaf, leaf_rel) = single "leaf" entries
-               val _ = if tree_path checkpoint_root leaf_rel = #path c then ()
-                       else raise Error "shared checkpoint manifest names another checkpoint"
-               val spine =
-                 List.mapPartial (fn ("spine", sha, rel) => SOME (sha, tree_path checkpoint_root rel) | _ => NONE)
-                                 entries
-               (* The spine's own records, so that a retry after HOL rejects
-                  the leaf resumes from the checkpoint under it. *)
-               val spine_sidecars =
-                 List.mapPartial
-                   (fn ("spine-sidecar", sha, rel) =>
-                         let val path = tree_path checkpoint_root rel
-                         in
-                           if List.exists (fn (_, p) => List.exists (fn suffix => path = p ^ suffix)
-                                                                    shared_sidecar_suffixes)
-                                          spine
-                           then SOME (sha, path)
-                           else raise Error ("unexpected shared checkpoint sidecar " ^ rel)
-                         end
-                     | _ => NONE)
-                   entries
-               val sidecars =
-                 List.mapPartial
-                   (fn ("sidecar", sha, suffix) =>
-                         if List.exists (fn s => s = suffix) (#sidecars c) then SOME (sha, #path c ^ suffix)
-                         else raise Error ("unexpected shared checkpoint sidecar " ^ suffix)
-                     | _ => NONE)
-                   entries
-               val restored = (heap, deps_loaded) :: spine @ spine_sidecars @ ((leaf, #path c) :: sidecars)
-             in
-               (* The small .ok first: a checkpoint with a laxer timeout than
-                  requested is skipped before its chain is fetched. *)
-               List.app (place_sidecar heap) sidecars;
-               if not (checkpoint_timeout_satisfies requested_timeout (#path c)) then (wipe (); NONE)
-               else
-                 (place_heap heap;
-                  List.app (place heap) spine;
-                  List.app (place_sidecar heap) spine_sidecars;
-                  place heap (leaf, #path c);
-                  if shared_heap_parent_ok ctx andalso chain_ok (#path c :: rev (map #2 spine)) andalso
-                     #accepts c () then
-                    (HolbuildStatus.message_stdout
-                       ("restored shared " ^ #kind c ^ " checkpoint " ^ leaf_rel ^ "\n");
-                     SOME {heap = SOME heap, files = map (fn (sha, path) => (path, sha)) restored})
-                  else (warn ("shared checkpoint failed validation: " ^ leaf_rel); wipe (); NONE))
-             end
-             handle e => (warn ("could not restore shared checkpoint: " ^ General.exnMessage e);
-                          wipe (); NONE))
+      let val key = shared_checkpoint_key heap_key (#kind c) (#key c)
+      in
+        case HolbuildRemoteCache.get_action remote key of
+            NONE => NONE
+          | SOME text =>
+              (let
+                 val entries = shared_manifest_entries text
+                 val (heap, _) = single "heap" entries
+                 val (leaf, leaf_rel) = single "leaf" entries
+                 val _ = if tree_path checkpoint_root leaf_rel = #path c then ()
+                         else raise Error "shared checkpoint manifest names another checkpoint"
+                 val spine =
+                   List.mapPartial (fn ("spine", sha, rel) => SOME (sha, tree_path checkpoint_root rel) | _ => NONE)
+                                   entries
+                 (* The spine's own records, so that a retry after HOL rejects
+                    the leaf resumes from the checkpoint under it. *)
+                 val spine_sidecars =
+                   List.mapPartial
+                     (fn ("spine-sidecar", sha, rel) =>
+                           let val path = tree_path checkpoint_root rel
+                           in
+                             if List.exists (fn (_, p) => List.exists (fn suffix => path = p ^ suffix)
+                                                                      shared_sidecar_suffixes)
+                                            spine
+                             then SOME (sha, path)
+                             else raise Error ("unexpected shared checkpoint sidecar " ^ rel)
+                           end
+                       | _ => NONE)
+                     entries
+                 val sidecars =
+                   List.mapPartial
+                     (fn ("sidecar", sha, suffix) =>
+                           if List.exists (fn s => s = suffix) (#sidecars c) then SOME (sha, #path c ^ suffix)
+                           else raise Error ("unexpected shared checkpoint sidecar " ^ suffix)
+                       | _ => NONE)
+                     entries
+                 val restored = (heap, deps_loaded) :: spine @ spine_sidecars @ ((leaf, #path c) :: sidecars)
+               in
+                 (* The small .ok first: a checkpoint with a laxer timeout than
+                    requested is skipped before its chain is fetched. *)
+                 List.app (place_sidecar heap) sidecars;
+                 if not (checkpoint_timeout_satisfies requested_timeout (#path c)) then (wipe (); NONE)
+                 else
+                   (place_heap heap;
+                    List.app (place heap) spine;
+                    List.app (place_sidecar heap) spine_sidecars;
+                    place heap (leaf, #path c);
+                    if shared_heap_parent_ok ctx andalso chain_ok (#path c :: rev (map #2 spine)) andalso
+                       #accepts c () then
+                      (HolbuildStatus.message_stdout
+                         ("restored shared " ^ #kind c ^ " checkpoint " ^ leaf_rel ^ "\n");
+                       SOME {heap = SOME heap, files = map (fn (sha, path) => (path, sha)) restored})
+                    else (warn ("shared checkpoint failed validation: " ^ leaf_rel); wipe (); NONE))
+               end
+               handle MissingSharedBlob sha => (missing_blob key sha; wipe (); NONE)
+                    | e => (warn ("could not restore shared checkpoint: " ^ General.exnMessage e);
+                            wipe (); NONE))
+      end
     fun try_heap () =
       case HolbuildRemoteCache.get_action remote heap_key of
-          NONE => nothing_restored
+          NONE => no_files
         | SOME text =>
             (let val (heap, _) = single "heap" (shared_manifest_entries text)
              in
@@ -6339,14 +6357,17 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                if shared_heap_parent_ok ctx andalso deps_checkpoint_exists deps_loaded deps_key then
                  (HolbuildStatus.message_stdout "restored shared deps-loaded heap\n";
                   {heap = SOME heap, files = [(deps_loaded, heap)]})
-               else (warn "shared deps-loaded heap failed validation"; wipe (); nothing_restored)
+               else (warn "shared deps-loaded heap failed validation"; wipe (); no_files)
              end
-             handle e => (warn ("could not restore the shared heap: " ^ General.exnMessage e);
-                          wipe (); nothing_restored))
+             handle MissingSharedBlob sha => (missing_blob heap_key sha; wipe (); no_files)
+                  | e => (warn ("could not restore the shared heap: " ^ General.exnMessage e);
+                          wipe (); no_files))
+    val {heap, files} =
+      case first_some try_candidate candidates of
+          SOME restored => restored
+        | NONE => try_heap ()
   in
-    case first_some try_candidate candidates of
-        SOME restored => restored
-      | NONE => try_heap ()
+    {heap = heap, files = files, stale = !stale, missing = !missing}
   end
   handle e => (warn ("shared checkpoint restore failed: " ^ General.exnMessage e);
                remove_tree (#checkpoint_root ctx); nothing_restored)
@@ -6355,10 +6376,14 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
    if the heap under them is the published one, the new checkpoints. *)
 fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, deps_key, deps_loaded,
                                               candidates, ...} : shared_context)
-                               ({heap = restored_heap, files = restored} : shared_restore) =
+                               ({heap = restored_heap, files = restored, stale, missing} : shared_restore) =
   let
+    fun member x xs = List.exists (fn y => y = x) xs
+    (* An entry naming a blob the cache lost is replaced, as if absent. *)
+    fun present key = not (member key stale) andalso Option.isSome (HolbuildRemoteCache.get_action remote key)
+    (* has_blob knows only the blobs of the entries this process read. *)
     fun upload_sha path sha =
-        if HolbuildRemoteCache.has_blob remote sha then sha
+        if HolbuildRemoteCache.has_blob remote sha andalso not (member sha missing) then sha
         else
           case HolbuildRemoteCache.publish_blob remote {hash = sha, src = path} of
               HolbuildCacheBackend.Published => sha
@@ -6369,7 +6394,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
        checkpoints on a heap that lost are chained to bytes no other worker
        has, so they stay local. *)
     fun publish_heap sha =
-      if Option.isSome (HolbuildRemoteCache.get_action remote heap_key) orelse
+      if present heap_key orelse
          not (shared_heap_parent_ok ctx) then NONE
       else
         let
@@ -6416,7 +6441,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
       let val key = shared_checkpoint_key heap_key (#kind c) (#key c)
       in
         if not (checkpoint_exists (#path c)) orelse was_restored (#path c) orelse not (#accepts c ()) orelse
-           Option.isSome (HolbuildRemoteCache.get_action remote key) then ()
+           present key then ()
         else
           case ancestors (#path c) of
               NONE => warn ("shared checkpoint chain is not on the heap: " ^ #path c)

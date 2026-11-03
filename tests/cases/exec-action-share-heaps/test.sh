@@ -241,3 +241,25 @@ worker v7 "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v7 0 "status=built"
 resumed v7 "theorem-context checkpoint after t4" "theorem_context checkpoint"
 same_outputs v7
+
+# The cache loses the heap's blob but keeps the entries naming it: the
+# worker loads cold, replaces the entries, and the next edit resumes again.
+heap_blob=$(find "$shared/checkpoint-store" -mindepth 1 -maxdepth 1 -type d -printf '%f\n')
+[[ -f "$tmpdir/remote/cas/$heap_blob" ]] || { echo "no heap blob $heap_blob in the cache" >&2; exit 1; }
+rm "$tmpdir/remote/cas/$heap_blob"
+write_t "T \\/ F" "rw[]" "ACCEPT_TAC TRUTH" "rw[]"
+export_t v8
+cold v8 0
+forget_local
+worker v8 "$shared_url" "$shared" "$spec_t" --share-heaps
+expect v8 0 "status=built"
+require_grep "the cache lost blob $heap_blob" "$tmpdir/v8.log"
+same_outputs v8
+write_t "T \\/ F" "rw[]" "ACCEPT_TAC TRUTH" "REWRITE_TAC []"
+export_t v9
+cold v9 0
+forget_local
+worker v9 "$shared_url" "$shared" "$spec_t" --share-heaps
+expect v9 0 "status=built"
+resumed v9 "theorem-context checkpoint after t4" "theorem_context checkpoint"
+same_outputs v9
