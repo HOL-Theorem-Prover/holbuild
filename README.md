@@ -724,6 +724,16 @@ Checkpoints are saved with `TheoryPP.include_docs` and
 their defaults; under `repl` this also overrides a value set in your HOL
 config. An unknown `THEORY` is an error.
 
+Without `--from`, `holbuild run script.sml` and `holbuild repl script.sml`
+choose `THEORY` themselves. holbuild finds the root-package theories the `.sml`
+scripts among the HOL arguments depend on (their `load` calls and the modules
+Holdep finds, as for build sources), takes the one with the most ancestors
+(when one has all the others as ancestors, that one), and starts from it as
+`--from` would. Its line names the theory and says it was inferred. Scripts
+that use no root-package theory, and a `repl` without scripts, start from
+`[run].heap` or the HOL base state as before. An explicit `--from` overrides
+the inferred theory.
+
 ## Proof steps and checkpoints
 
 By default, `holbuild` instruments modern theorem and explicit termination

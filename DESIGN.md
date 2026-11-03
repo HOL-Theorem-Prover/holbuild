@@ -852,7 +852,10 @@ only while its saved parent path still names the current `deps_loaded` or the
 toolchain base state (a moved project falls back to `deps_loaded`). `run` takes
 no project lock, so `--from` only reads ok-files; a concurrent build, `gc`, or
 eviction that removes the chosen checkpoint first makes the session fail to
-start rather than start from a wrong state.
+start rather than start from a wrong state. Without `--from`, sessions given
+`.sml` scripts take THEORY from the scripts' dependencies, found by the same
+`load`-call and Holdep analysis as build sources: of the root-package theories
+they reach, the one with the most ancestors.
 
 Current HOL versions also generate per-theory HTML documentation during
 `export_theory()` by default. Holbuild disables both historical spellings of that

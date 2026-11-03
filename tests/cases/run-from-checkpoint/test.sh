@@ -170,6 +170,53 @@ plain_trace=$(grep -o 'HTML_DOCS=[0-9]*' "$tmpdir/plain-trace.log")
 run_from "$tmpdir/from-trace.log" --from BTheory "$trace_script"
 require_grep "$plain_trace" "$tmpdir/from-trace.log"
 
+require_no_grep "holbuild: --from" "$tmpdir/plain-trace.log"
+
+# Without --from, run and repl given scripts start from the project theory the
+# scripts depend on that has the most ancestors.
+load_a_script=$tmpdir/load-a.sml
+cat > "$load_a_script" <<'SML'
+val _ = load "ATheory";
+val _ = print "LOAD_A_OK\n";
+SML
+load_b_script=$tmpdir/load-b.sml
+cat > "$load_b_script" <<'SML'
+val _ = load "BTheory";
+val _ = print "LOAD_B_OK\n";
+SML
+inferred="(inferred from the scripts' dependencies)"
+run_from "$tmpdir/infer-one.log" "$load_a_script" "$state_script"
+require_grep "holbuild: --from ATheory $inferred: starting from its final_context checkpoint" "$tmpdir/infer-one.log"
+require_grep "LOAD_A_OK" "$tmpdir/infer-one.log"
+require_grep "LOADED_STATE .*/AScript.sml.final_context.save" "$tmpdir/infer-one.log"
+
+# BTheory has ATheory as an ancestor, so a script using both starts from BTheory.
+both_script=$tmpdir/both.sml
+cat > "$both_script" <<'SML'
+val _ = (ATheory.a_thm; BTheory.b_thm; print "BOTH_BOUND_OK\n");
+SML
+run_from "$tmpdir/infer-both.log" "$both_script"
+require_grep "holbuild: --from BTheory $inferred: starting from its final_context checkpoint" "$tmpdir/infer-both.log"
+require_grep "BOTH_BOUND_OK" "$tmpdir/infer-both.log"
+
+# An explicit --from overrides the inferred theory.
+run_from "$tmpdir/infer-override.log" --from ATheory "$load_b_script"
+require_grep "holbuild: --from ATheory: starting from its final_context checkpoint" "$tmpdir/infer-override.log"
+require_grep "LOAD_B_OK" "$tmpdir/infer-override.log"
+require_no_grep "inferred" "$tmpdir/infer-override.log"
+
+infer_repl_log=$tmpdir/infer-repl.log
+printf 'val _ = (BTheory.b_thm; print "REPL_INFER_OK\\n");\n' |
+  (cd "$project" && timeout 60 "$HOLBUILD_BIN" repl "$load_b_script") > "$infer_repl_log" 2>&1
+require_grep "holbuild: --from BTheory $inferred: starting from its final_context checkpoint" "$infer_repl_log"
+require_grep "REPL_INFER_OK" "$infer_repl_log"
+
+bare_repl_log=$tmpdir/bare-repl.log
+printf 'val _ = print "BARE_REPL_OK\\n";\n' |
+  (cd "$project" && timeout 60 "$HOLBUILD_BIN" repl) > "$bare_repl_log" 2>&1
+require_grep "BARE_REPL_OK" "$bare_repl_log"
+require_no_grep "holbuild: --from" "$bare_repl_log"
+
 # final_context's saved parent is deps_loaded at its old absolute path, so after
 # the project directory moves only deps_loaded can load.
 moved=$tmpdir/moved
@@ -256,6 +303,12 @@ sed -i 's/^val _ = export_theory();$/val b5_thm = store_thm("b5_thm", ``T``, ACC
 (cd "$project" && "$HOLBUILD_BIN" build --skip-checkpoints BTheory) > "$tmpdir/skip.log" 2>&1 ||
   { cat "$tmpdir/skip.log" >&2; exit 1; }
 require_heap_fallback skip "$no_checkpoint_reason"
+
+# An inferred theory without a checkpoint falls back like an explicit --from.
+infer_fallback_log=$tmpdir/infer-fallback.log
+run_from "$infer_fallback_log" "$load_b_script"
+require_grep "holbuild: --from BTheory $inferred: $no_checkpoint_reason; starting from \[run\].heap $run_heap" "$infer_fallback_log"
+require_grep "LOAD_B_OK" "$infer_fallback_log"
 
 # Dependency-package theories have no checkpoints.
 dependency_log=$tmpdir/dependency.log

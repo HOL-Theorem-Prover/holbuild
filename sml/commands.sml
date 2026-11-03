@@ -116,7 +116,10 @@ fun repl_help () = print
   \  --from THEORY  Start from THEORY's build checkpoint: final_context (THEORY\n\
   \                 loaded) when current for THEORY's sources, else deps_loaded\n\
   \                 (its ancestors loaded) when only THEORY changed, else\n\
-  \                 [run].heap or the HOL base state. Does not build THEORY.\n\n\
+  \                 [run].heap or the HOL base state. Does not build THEORY.\n\
+  \                 Without --from, given .sml scripts, THEORY is inferred:\n\
+  \                 of the project theories the scripts depend on, the one\n\
+  \                 with the most ancestors.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun run_help () = print
@@ -131,7 +134,10 @@ fun run_help () = print
   \  --from THEORY  Start from THEORY's build checkpoint: final_context (THEORY\n\
   \                 loaded) when current for THEORY's sources, else deps_loaded\n\
   \                 (its ancestors loaded) when only THEORY changed, else\n\
-  \                 [run].heap or the HOL base state. Does not build THEORY.\n\n\
+  \                 [run].heap or the HOL base state. Does not build THEORY.\n\
+  \                 Without --from, given .sml scripts, THEORY is inferred:\n\
+  \                 of the project theories the scripts depend on, the one\n\
+  \                 with the most ancestors.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun execution_plan_help () = print
@@ -1771,6 +1777,52 @@ type run_start = {holstate : string, context_lines : string list}
 fun checkpoint_start path =
   {holstate = path, context_lines = HolbuildBuildExec.child_policy_reset_lines}
 
+(* Where run and repl start: an explicit --from theory, the theory inferred
+   from the script files HOL is given, or the fallback state (check). *)
+datatype run_from = FromTheory of string | FromScripts of string list | NoFrom
+
+(* The arguments HOL loads as scripts. *)
+fun script_args args =
+  List.filter
+    (fn arg => String.isSuffix ".sml" arg andalso
+               (OS.FileSys.access (arg, [OS.FileSys.A_READ]) handle OS.SysErr _ => false))
+    args
+
+(* Of the root-package theories SCRIPTS depend on, found by the dependency
+   analysis build applies to sources, the one with the most ancestors.  When
+   one of them has all the others as ancestors, that is the one. *)
+fun infer_from_theory tc project scripts =
+  let
+    val _ = configure_analyser_for_toolchain tc
+    val {index, components} = prepare_source_index "run.infer" (resolution_for_toolchain tc) project
+    val root = root_package_name project
+    fun referenced script =
+      let val {loads, holdep_mentions, ...} = HolbuildDependencies.extract script
+      in loads @ holdep_mentions end
+    fun root_source name =
+      List.exists (fn (source : HolbuildSourceIndex.source) =>
+                     #logical_name source = name andalso #package source = root)
+                  index
+    val targets =
+      List.foldr (fn (name, kept) => if List.exists (fn k => k = name) kept then kept else name :: kept)
+        [] (List.filter root_source (List.concat (map referenced scripts)))
+  in
+    if null targets then NONE
+    else
+      let
+        val plan = timed_phase "run.infer.plan"
+                     (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index targets)
+        val theories =
+          List.filter (fn node => theory_node node andalso HolbuildBuildPlan.package node = root)
+            (HolbuildBuildPlan.selected_nodes plan)
+        fun ancestors node = length (HolbuildBuildPlan.transitive_project_deps plan node)
+        fun deeper (node, NONE) = SOME node
+          | deeper (node, SOME best) = SOME (if ancestors node > ancestors best then node else best)
+      in
+        Option.map HolbuildBuildPlan.logical_name (List.foldl deeper NONE theories)
+      end
+  end
+
 (* A usable --from checkpoint takes precedence over [run].heap; without one,
    run starts from [run].heap when RUN_HEAP and it is configured, and from the
    base state otherwise. *)
@@ -1781,21 +1833,28 @@ fun run_start tc project run_heap from : run_start =
           (true, SOME heap) => (heap, "[run].heap " ^ heap)
         | _ => (HolbuildToolchain.base_state tc, "the HOL base state")
     val fallback_start = {holstate = fallback, context_lines = []}
-    fun note theory text =
-      HolbuildStatus.message_stderr ("holbuild: --from " ^ theory ^ ": " ^ text ^ "\n")
+    fun start label theory =
+      let
+        fun note text = HolbuildStatus.message_stderr ("holbuild: " ^ label ^ ": " ^ text ^ "\n")
+      in
+        case from_theory_state tc project theory of
+            HolbuildBuildExec.FinalContextState path =>
+              (note "starting from its final_context checkpoint"; checkpoint_start path)
+          | HolbuildBuildExec.DepsLoadedState {path, final_context_unusable} =>
+              (note (final_context_unusable ^ "; starting from its deps_loaded checkpoint, " ^
+                     "which has only its ancestors loaded");
+               checkpoint_start path)
+          | HolbuildBuildExec.NoRunFromState reason =>
+              (note (reason ^ "; starting from " ^ fallback_name); fallback_start)
+      end
   in
     case from of
-        NONE => fallback_start
-      | SOME theory =>
-          case from_theory_state tc project theory of
-              HolbuildBuildExec.FinalContextState path =>
-                (note theory "starting from its final_context checkpoint"; checkpoint_start path)
-            | HolbuildBuildExec.DepsLoadedState {path, final_context_unusable} =>
-                (note theory (final_context_unusable ^ "; starting from its deps_loaded checkpoint, " ^
-                              "which has only its ancestors loaded");
-                 checkpoint_start path)
-            | HolbuildBuildExec.NoRunFromState reason =>
-                (note theory (reason ^ "; starting from " ^ fallback_name); fallback_start)
+        NoFrom => fallback_start
+      | FromTheory theory => start ("--from " ^ theory) theory
+      | FromScripts scripts =>
+          case infer_from_theory tc project scripts of
+              NONE => fallback_start
+            | SOME theory => start ("--from " ^ theory ^ " (inferred from the scripts' dependencies)") theory
   end
 
 fun hol_run_argv tc holstate subcommand context user_args =
@@ -1824,8 +1883,15 @@ fun run_hol_status runner tc cli_jobs run_heap from subcommand user_args =
 fun run_hol_with runner tc cli_jobs subcommand args =
   let
     val (from, user_args) = split_run_from args
+    val run_from =
+      case from of
+          SOME theory => FromTheory theory
+        | NONE =>
+            (case script_args user_args of
+                 [] => NoFrom
+               | scripts => FromScripts scripts)
   in
-    if HolbuildToolchain.success (run_hol_status runner tc cli_jobs true from subcommand user_args) then ()
+    if HolbuildToolchain.success (run_hol_status runner tc cli_jobs true run_from subcommand user_args) then ()
     else raise Error ("hol " ^ subcommand ^ " failed")
   end
 
@@ -1932,7 +1998,7 @@ fun check_selector tc cli_jobs selector =
     fun cleanup () = OS.FileSys.remove script_path handle OS.SysErr _ => ()
     val status =
       (* A run heap may hold an older copy of the theory, which load would keep. *)
-      run_hol_status HolbuildToolchain.run tc cli_jobs false NONE "run" [script_path]
+      run_hol_status HolbuildToolchain.run tc cli_jobs false NoFrom "run" [script_path]
       handle e => (cleanup (); raise e)
   in
     cleanup ();
