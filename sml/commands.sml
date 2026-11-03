@@ -86,7 +86,13 @@ fun build_help () = print
   \  --retain-debug-artifacts\n\
   \  --emit-output-hashes\n\
   \  --warn-unreachable\n\
-  \  --trknl\n\n\
+  \  --trknl\n\
+  \  --remote-exec URL [--remote-only] [--detach | --attach BATCH-ID]\n\n\
+  \With --remote-exec, theories the remote cache lacks are built by the\n\
+  \coordinator's workers and restored from the remote cache. Needs\n\
+  \--remote-cache. A closure that can't run remotely or an unreachable\n\
+  \coordinator builds locally; --remote-only fails instead. --detach submits\n\
+  \the batch and exits; --attach follows a submitted batch and restores it.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun context_help () = print
@@ -940,7 +946,10 @@ fun prepare_source_index phase_prefix resolution project =
 
 (* What a planned build does: build its targets, or export their uncached
    theories for remote execution. *)
-datatype build_mode = BuildTargets | ExportActionSpecs of {upload : bool}
+datatype build_mode =
+    BuildTargets
+  | ExportActionSpecs of {upload : bool}
+  | RemoteExec of {url : string, remote_only : bool, detach : bool, attach : string option}
 
 fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, proof_steps, new_ir, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy}, targets) =
   let
@@ -1081,7 +1090,54 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           val build_options = build_options_for index entry_plan plan force_targets
       in
         timed_phase "action_spec.export"
-          (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key upload)
+          (fn () => print (HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key upload))
+      end
+    (* Theories the remote cache lacks go to the coordinator as a batch; once
+       it finishes, the ordinary build restores them from the remote cache. *)
+    fun remote_build {url, remote_only, detach, attach} =
+      let
+        val _ =
+          if Option.isSome (HolbuildRemoteCacheConfig.url ()) then ()
+          else raise Error "--remote-exec needs a remote cache: pass --remote-cache URL"
+        val (index, force_targets, entry_plan, plan, toolchain_key) = prepare_plan ()
+        val build_options = build_options_for index entry_plan plan force_targets
+        fun export upload =
+          timed_phase "action_spec.export"
+            (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key upload)
+        fun has_actions batch = List.exists (String.isPrefix "action ") (String.tokens (fn c => c = #"\n") batch)
+        fun build_locally () =
+          timed_phase "build.execute"
+            (fn () => HolbuildBuildExec.build build_options tc project plan toolchain_key jobs)
+        fun fall_back reason =
+          if remote_only then raise Error ("remote execution: " ^ reason)
+          else (HolbuildBuildExec.warn ("remote execution: " ^ reason ^ "; building locally");
+                build_locally ())
+        fun restore () =
+          if remote_only andalso has_actions (export false) then
+            raise Error "remote execution: the batch finished, but the remote cache still lacks some of its theories"
+          else build_locally ()
+        fun finish batch_id =
+          case HolbuildRemoteExec.follow url batch_id of
+              HolbuildRemoteExec.Done => restore ()
+            | HolbuildRemoteExec.Failed reason => fall_back ("batch " ^ batch_id ^ " " ^ reason)
+            | HolbuildRemoteExec.Unreachable reason =>
+                fall_back (reason ^ "; reattach with --attach " ^ batch_id)
+        fun submit batch =
+          if not (has_actions batch) then build_locally ()
+          else
+            case HolbuildRemoteExec.submit url batch of
+                HolbuildRemoteExec.Refused reason => fall_back reason
+              | HolbuildRemoteExec.Ok batch_id =>
+                  (HolbuildStatus.message_stderr ("holbuild: remote batch " ^ batch_id ^ "\n");
+                   if detach then () else finish batch_id)
+      in
+        case attach of
+            SOME batch_id => finish batch_id
+          | NONE =>
+              (case HolbuildRemoteExec.Ok (export true)
+                    handle HolbuildBuildExec.Error reason => HolbuildRemoteExec.Refused reason of
+                   HolbuildRemoteExec.Ok batch => submit batch
+                 | HolbuildRemoteExec.Refused reason => fall_back reason)
       end
     fun run_with_stat_cache f =
       (f (); finish_stat_cache stat_cache)
@@ -1094,6 +1150,9 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       | BuildTargets =>
           if dry_run then run_with_stat_cache describe_dry_run
           else HolbuildBuildExec.with_project_lock project "build" (fn () => run_with_stat_cache execute_build)
+      | RemoteExec remote =>
+          HolbuildBuildExec.with_project_lock project "build"
+            (fn () => run_with_stat_cache (fn () => remote_build remote))
   end
 
 fun build_once_with_prepared tc = build_once_with_prepared_mode BuildTargets tc
@@ -1183,8 +1242,26 @@ fun build_watch tc cli_jobs parsed =
     loop NONE
   end
 
+(* Takes build's remote-execution options out of its arguments. *)
+fun split_remote_exec_flags args =
+  let
+    fun loop (url, remote_only, detach, attach) acc xs =
+      case xs of
+          [] => ({url = url, remote_only = remote_only, detach = detach, attach = attach}, rev acc)
+        | ["--remote-exec"] => raise Error "--remote-exec requires URL"
+        | "--remote-exec" :: value :: rest => loop (SOME value, remote_only, detach, attach) acc rest
+        | "--remote-only" :: rest => loop (url, true, detach, attach) acc rest
+        | "--detach" :: rest => loop (url, remote_only, true, attach) acc rest
+        | ["--attach"] => raise Error "--attach requires BATCH-ID"
+        | "--attach" :: value :: rest => loop (url, remote_only, detach, SOME value) acc rest
+        | x :: rest => loop (url, remote_only, detach, attach) (x :: acc) rest
+  in
+    loop (NONE, false, false, NONE) [] args
+  end
+
 fun build tc cli_jobs args =
   let
+    val ({url, remote_only, detach, attach}, args) = split_remote_exec_flags args
     val parsed as ({dry_run, watch, repl_on_failure, ...}, _) = split_flags args
     val _ =
       if watch andalso HolbuildStatus.json_mode () then
@@ -1193,10 +1270,24 @@ fun build tc cli_jobs args =
         raise Error "--watch does not support --dry-run"
       else if watch andalso repl_on_failure then
         raise Error "--watch does not support --repl-on-failure"
+      else if not (Option.isSome url) andalso (remote_only orelse detach orelse Option.isSome attach) then
+        raise Error "--remote-only, --detach and --attach need --remote-exec URL"
+      else if Option.isSome url andalso (watch orelse dry_run) then
+        raise Error "--remote-exec does not support --watch or --dry-run"
+      else if Option.isSome url andalso HolbuildStatus.json_mode () then
+        raise Error "--json does not support --remote-exec yet"
+      else if detach andalso Option.isSome attach then
+        raise Error "--detach and --attach exclude each other"
       else ()
   in
-    if watch then build_watch tc cli_jobs parsed
-    else build_once tc cli_jobs parsed
+    case url of
+        SOME url =>
+          build_once_with_prepared_mode
+            (RemoteExec {url = url, remote_only = remote_only, detach = detach, attach = attach})
+            tc cli_jobs NONE parsed
+      | NONE =>
+          if watch then build_watch tc cli_jobs parsed
+          else build_once tc cli_jobs parsed
   end
 
 fun chomp text =

@@ -5263,7 +5263,7 @@ fun publish_spec_blob remote path =
     | HolbuildCacheBackend.Skipped => raise Error ("could not upload " ^ path ^ ": skipped")
 
 (* Writes the ActionSpec of every theory in the plan the remote cache can't
-   satisfy, uploads them and their sources with upload, and prints the batch. *)
+   satisfy, uploads them and their sources with upload, and returns the batch. *)
 fun export_action_specs (options : build_options) tc project plan toolchain_key upload =
   let
     val remote =
@@ -5334,7 +5334,7 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       if upload then List.app (publish_spec_blob remote) (unique_strings (List.concat (map #files exported)))
       else ()
   in
-    print (String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n")
+    String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n"
   end
 
 (* holbuild exec-action: a remote worker builds one ActionSpec in a fixed

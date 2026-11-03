@@ -1050,6 +1050,43 @@ from the store when the store and `checkpoints/` are on one mount, and copied
 otherwise. A bind mount counts as another mount even on the same filesystem,
 so in that layout restores copy: the store still saves downloads, not disk.
 
+### Building on remote workers
+
+`build --remote-exec URL` hands the theories the remote cache lacks to a
+remote-execution coordinator, which runs them on its workers with
+`exec-action`, then restores them as an ordinary build would:
+
+```sh
+holbuild --remote-cache https://cache.example.org build --remote-exec https://exec.example.org MyTheory
+```
+
+It exports and uploads the batch as `action-spec --upload` does, submits it
+with `POST URL/v1/batches`, and follows `GET URL/v1/batches/<id>/events`,
+printing each theory's state as it changes. When the batch is done, the build
+restores every theory from the remote cache. The coordinator's credentials go
+in a curl config file named by `HOLBUILD_REMOTE_EXEC_CURL_CONFIG`, such as
+`header = "Authorization: Bearer <token>"`, so they stay off the command line.
+
+The build never waits on remote execution alone. If the closure can't run
+remotely (see `action-spec`), the coordinator can't be reached or refuses the
+batch, or the batch fails, it warns and builds locally; with `--remote-only`
+it fails instead. With nothing to build remotely it goes straight to the
+local build.
+
+`--detach` submits the batch, prints its id (`holbuild: remote batch <id>`)
+and exits. `--attach <id>` follows that batch and then builds as above. A
+build that loses the event stream says how to reattach.
+
+The coordinator's protocol, in what holbuild uses of it:
+
+- `POST /v1/batches` with the batch text as the body answers 201 and
+  `{"batch_id": "<id>"}`; any other status refuses the batch.
+- `GET /v1/batches/<id>/events` streams one JSON object per line: an
+  `{"type": "action", "input_key", "theory", "state", "last_failure",
+  "log_sha256", ...}` when an action changes, and last `{"type": "batch",
+  "state": "done"|"failed"|"cancelled", "failure"}`. A failed action's log is
+  at `/cas/<log_sha256>` in the remote cache.
+
 Clean old project and cache state with:
 
 ```sh
