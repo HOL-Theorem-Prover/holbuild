@@ -92,7 +92,7 @@ val CURL_VERSION_ASYNCHDNS = 0wx80 : Word32.word
 val CURL_ERROR_SIZE = 0w256
 
 (* Seconds to wait for a connection, in both remote cache clients. *)
-val connect_timeout_seconds = 10
+val connect_timeout_seconds = 5
 
 val userpwd : string option ref = ref NONE
 
