@@ -55,6 +55,7 @@ fun blob_ref line =
         ["blob", _, hash] => SOME hash
       | _ =>
           if has_prefix "blob=" clean then SOME (take_token (String.extract(clean, 5, NONE)))
+          else if has_prefix "blob-sha1=" clean then SOME (take_token (String.extract(clean, 10, NONE)))
           else NONE
   end
 

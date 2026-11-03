@@ -26,6 +26,7 @@ use_hol("tools/Holmake/util/terminal_primitives.sig");
 use_hol("tools/Holmake/util/poly-terminal-prims.ML");
 use_hol("src/portableML/poly/SHA1_ML.sig");
 use_hol("src/portableML/poly/w64-SHA1.ML");
+use "sml/string_hash.sml";
 use_hol("src/portableML/poly/ConcIsaLib.sml");
 use_hol("src/portableML/Redblackset.sig");
 use_hol("src/portableML/Redblackset.sml");
