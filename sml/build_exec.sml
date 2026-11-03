@@ -1981,12 +1981,14 @@ fun copy_remote_cache_entry root url key =
         NONE => false
       | SOME manifest =>
           (HolbuildFSCacheBackend.ensure_layout local_cache;
+           (* Before the copy, which a build worker may restore as soon as
+              its manifest lands. *)
+           note_remote_copy key;
            HolbuildCacheTransfer.copy_entry
              {source = remote_cache_source_with_action remote key manifest,
               destination = fs_cache_destination local_cache,
               tmp_dir = HolbuildFSCacheBackend.tmp_dir local_cache}
              key;
-           note_remote_copy key;
            true)
   end
 
