@@ -148,12 +148,15 @@ fi
 require_grep '^holbuild: --machine-max-mem 4096 (4294967296 bytes) conflicts with 3221225472 bytes in' "$tmpdir/conflict.out"
 
 # The default budget leaves a quarter of MemTotal out, at most 30 GiB: 256 GiB
-# gives 226 GiB.
+# gives 226 GiB.  It is computed afresh, not written to DIR/budget.
 printf 'MemTotal:        268435456 kB\nMemAvailable:    268435456 kB\n' > "$tmpdir/large"
-HOLBUILD_TEST_MEMINFO=$tmpdir/large holbuild_in "$tmpdir/p1" --cooperate-dir "$tmpdir/large-coop" \
-  build --force P1aTheory > "$tmpdir/large.out" 2>&1 || { cat "$tmpdir/large.out" >&2; exit 1; }
-[[ "$(cat "$tmpdir/large-coop/budget")" == "$((226 * gib))" ]] ||
-  { echo "unexpected default budget: $(cat "$tmpdir/large-coop/budget")" >&2; exit 1; }
+if HOLBUILD_TEST_MEMINFO=$tmpdir/large holbuild_in "$tmpdir/p1" --cooperate-dir "$tmpdir/large-coop" \
+     --child-charge $((240 * 1024)) build --force P1aTheory > "$tmpdir/large.out" 2>&1; then
+  echo "charge above the default budget succeeded" >&2
+  exit 1
+fi
+require_grep "exceeds the machine budget of $((226 * 1024)) MiB" "$tmpdir/large.out"
+require_no_file "$tmpdir/large-coop/budget"
 
 # Heterogeneous charges in a 4 GiB budget: two 2 GiB children fit together, a
 # 3 GiB child fits with neither.  The charge is --child-charge, not --max-heap,
@@ -275,6 +278,34 @@ if sed -n '/^START Live2/q;p' "$events" | grep -q '^END Hold'; then
   exit 1
 fi
 wait "$hold_pid" || { cat "$tmpdir/hold.out" >&2; exit 1; }
+
+# A budget above the default lowers the margin to what it leaves out of
+# MemTotal: with 7 GiB of 8, Live3's 1 GiB plus 1 GiB fits in the 4 GiB
+# available less Hold2's 2 GiB still starting, where the reserve would be 2 GiB.
+: > "$events"
+make_project hold2 10 Hold2
+holbuild_in "$tmpdir/hold2" --cooperate-dir "$tmpdir/high-coop" --machine-max-mem 7168 \
+  --child-charge 2048 build --skip-checkpoints --skip-proof-steps > "$tmpdir/hold2.out" 2>&1 &
+hold_pid=$!
+for _ in $(seq 1 600); do
+  grep -q '^START Hold2' "$events" && break
+  sleep 0.1
+done
+grep -q '^START Hold2' "$events" || { echo "Hold2 did not start" >&2; cat "$tmpdir/hold2.out" >&2; exit 1; }
+write_meminfo $((4096 * 1024))
+make_project live3 0 Live3
+(cd "$tmpdir/live3" && HOLBUILD_TEST_MEMINFO=$tmpdir/meminfo timeout 60 "$HOLBUILD_BIN" \
+  --cooperate-dir "$tmpdir/high-coop" --max-heap 1024 \
+  build --skip-checkpoints --skip-proof-steps) > "$tmpdir/live3.out" 2>&1 || {
+  cat "$tmpdir/live3.out" >&2
+  exit 1
+}
+if sed -n '/^START Live3/q;p' "$events" | grep -q '^END Hold2'; then
+  echo "Live3 waited for Hold2 under a budget above the default" >&2
+  cat "$events" >&2
+  exit 1
+fi
+wait "$hold_pid" || { cat "$tmpdir/hold2.out" >&2; exit 1; }
 
 # When a node fails, a worker still waiting for memory gives up instead of
 # starting its child once the failed child's reservation frees up.  Fail and
