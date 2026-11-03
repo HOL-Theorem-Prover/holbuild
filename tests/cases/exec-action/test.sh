@@ -178,6 +178,28 @@ curl -fsS -X PUT --data-binary "@$tmpdir/extra-output" "$remote_url/cas/$spec_ex
 worker extra-output "$spec_extra"
 expect extra-output 4 "status=failed" "failure=spec-rejected"
 require_grep "the extra outputs do not match the action text" "$tmpdir/extra-output.log"
+# Or one whose package, though consistent with its action text, would put
+# files outside the action root.
+python3 - "$project/.holbuild/action-specs/$spec_a" "$tmpdir/escape" <<'PY'
+import hashlib, sys
+head, text = open(sys.argv[1], "rb").read().split(b"\naction-text\n", 1)
+old = [l for l in head.split(b"\n") if l.startswith(b"target ")][0].split(b" ")[1].split(b":")[0]
+text = text.replace(b"\npackage=" + old + b"\n", b"\npackage=../../x\n", 1)
+key = hashlib.sha256(text).hexdigest().encode()
+lines = []
+for line in head.split(b"\n"):
+    if line.startswith(b"input-key="): line = b"input-key=" + key
+    elif line.startswith(b"action-text-sha256="): line = b"action-text-sha256=" + key
+    elif line.startswith(b"target "): line = line.replace(old + b":", b"../../x:", 1)
+    elif line.startswith(b"source "): line = line.replace(b" " + old + b" ", b" ../../x ", 1)
+    lines.append(line)
+open(sys.argv[2], "wb").write(b"\n".join(lines) + b"\naction-text\n" + text)
+PY
+spec_escape=$(sha256sum "$tmpdir/escape" | cut -d' ' -f1)
+curl -fsS -X PUT --data-binary "@$tmpdir/escape" "$remote_url/cas/$spec_escape"
+worker escape "$spec_escape"
+expect escape 4 "status=failed" "failure=spec-rejected"
+require_grep "path ../../x leaves the action root" "$tmpdir/escape.log"
 worker absent "$(printf 'absent' | sha256sum | cut -d' ' -f1)"
 expect absent 4 "status=failed" "failure=spec-rejected"
 

@@ -5539,7 +5539,9 @@ fun verify_action_spec (spec : action_spec) =
     check (List.all (fn {suffix, ...} => suffix = ".ui" orelse suffix = ".uo") (#libs spec))
       "a library manifest is neither .ui nor .uo";
     List.app (fn path => check (not (escapes path)) ("path " ^ path ^ " leaves the action root"))
-      (#path (#source spec) :: map #path (#inputs spec @ #libraries spec) @
+      (#package spec :: map (#1 o target_name o #target) (#deps spec) @
+       map (#1 o target_name o #target) (#libs spec) @
+       #path (#source spec) :: map #path (#inputs spec @ #libraries spec) @
        map #stem (#deps spec) @ map #stem (#libs spec) @
        List.filter (CharVector.exists (fn c => c = #"/")) (List.concat (map #loads (#libs spec))) @
        [#sig_path (#outputs spec), #sml_path (#outputs spec), #data_path (#outputs spec)])
@@ -5772,17 +5774,33 @@ fun peak_rss_mb stage =
     | _ => NONE
   handle _ => NONE
 
-fun classify_run_failure log_text oom_before child_failed msg =
+val no_space = "No space left on device"
+
+(* Whether the filesystem holding dir can't take a small write.  The child's
+   log is no evidence either way: it is on that filesystem, and a handled
+   checkpoint write failure warns into it. *)
+fun out_of_space dir =
+  let val probe = Path.concat(dir, ".holbuild-space-probe")
+  in
+    (let val out = BinIO.openOut probe
+     in
+       (BinIO.output (out, Word8Vector.tabulate (1048576, fn _ => 0w0)); BinIO.closeOut out)
+       handle e => (BinIO.closeOut out handle _ => (); raise e)
+     end;
+     remove_file probe;
+     false)
+    handle e => (remove_file probe; String.isSubstring no_space (General.exnMessage e))
+  end
+
+fun classify_run_failure stage log_text oom_before child_failed msg =
   let
-    val text = msg ^ "\n" ^ log_text
-    fun has marker = String.isSubstring marker text
     val oom_killed =
       case (oom_before, cgroup_oom_kills ()) of
           ([earlier], [later]) => later > earlier
         | _ => false
   in
-    if oom_killed orelse has "Run out of store" then MemoryFailure
-    else if has "No space left on device" then DiskFailure
+    if oom_killed orelse String.isSubstring "Run out of store" (msg ^ "\n" ^ log_text) then MemoryFailure
+    else if (if child_failed then out_of_space stage else String.isSubstring no_space msg) then DiskFailure
     else if not child_failed then InternalFailure
     else if String.isPrefix "tactic timed out" msg then TacticTimeoutFailure
     else ProofFailure
@@ -6021,7 +6039,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, toolchain} =
                 let val log_text = read_text (build_log ()) handle _ => ""
                 in
                   raise ActionFailed
-                    (classify_run_failure log_text oom_before (!failed_child_runs > failed_before) msg, msg)
+                    (classify_run_failure stage log_text oom_before (!failed_child_runs > failed_before) msg, msg)
                 end
             val _ = peak := peak_rss_mb stage
             val _ = check_remote_publication remote spec
