@@ -2,10 +2,11 @@
 
    Independent holbuild processes that share DIR start a HOL child only while
    the reservations of all their running children, plus the new one, fit the
-   byte budget in DIR/budget, and while MemAvailable, less the charges of
-   children admitted in the last startup_seconds (which have not allocated
-   yet), covers the new one plus the reserve that the default budget leaves
-   outside itself.  Every child is charged the same --child-charge, an
+   byte budget, and while MemAvailable, less the charges of children admitted
+   in the last startup_seconds (which have not allocated yet), covers the new
+   one plus a margin kept free: the reserve that the default budget leaves
+   out of MemTotal, or what the budget leaves out if that is less, but at
+   least 1 GiB.  Every child is charged the same --child-charge, an
    expected size rather than its --max-heap ceiling, so the MemAvailable check
    is what holds children back when the running ones grow past their charge.
    With no reservation held in DIR, a child that fits the budget starts
@@ -21,9 +22,11 @@
    expires by time.
 
    Every holbuild process that shares DIR reads DIR/budget under DIR/lock at
-   each admission.  An operator resizes the domain by replacing that file
-   while holding DIR/lock; existing reservations then drain, and new
-   admissions use the new value. *)
+   each admission.  The file is written only from --machine-max-mem; without
+   it, the budget is MemTotal less the reserve, computed afresh each time, so
+   it follows the machine's size.  An operator resizes the domain by
+   replacing that file while holding DIR/lock; existing reservations then
+   drain, and new admissions use the new value. *)
 structure HolbuildMachineMemory =
 struct
 
@@ -168,9 +171,9 @@ fun mem_total () = #total (meminfo ())
 
 fun has_mem_available () = isSome (#available (meminfo ()))
 
-(* A quarter of MemTotal (at least 1 GiB) for the OS, page cache and
-   holbuild parents. *)
-fun reserve total = Int.max (1024 * mib, total div 4)
+(* A quarter of MemTotal, at least 1 GiB and at most 30 GiB, for the OS, page
+   cache and holbuild parents. *)
+fun reserve total = Int.max (1024 * mib, Int.min (total div 4, 30 * 1024 * mib))
 
 fun default_budget dir =
   case mem_total () of
@@ -181,7 +184,7 @@ fun default_budget dir =
           else raise Error ("machine memory is too small for a default budget in " ^ dir ^
                             "; pass --machine-max-mem MB")
         end
-    | NONE => raise Error ("cannot read MemTotal from /proc/meminfo to create " ^ budget_path dir ^
+    | NONE => raise Error ("cannot read MemTotal from /proc/meminfo for a default budget in " ^ dir ^
                            "; pass --machine-max-mem MB")
 
 (* Called under DIR/lock. *)
@@ -201,12 +204,12 @@ fun current_budget dir budget_mb =
               | NONE => budget
           end
       | NONE =>
-          let val budget = case budget_mb of SOME mb => mb * mib | NONE => default_budget dir
-          in
-            case create_file path (Int.toString budget ^ "\n") of
-                SOME fd => (close fd; budget)
-              | NONE => raise Error (path ^ " appeared while holding " ^ lock_path dir)
-          end
+          case budget_mb of
+              NONE => default_budget dir
+            | SOME mb =>
+                case create_file path (Int.toString (mb * mib) ^ "\n") of
+                    SOME fd => (close fd; mb * mib)
+                  | NONE => raise Error (path ^ " appeared while holding " ^ lock_path dir)
   end
 
 fun remove_file path = OS.FileSys.remove path handle OS.SysErr _ => ()
@@ -283,18 +286,23 @@ fun retry_delay () =
   Time.fromMilliseconds (500 + Time.toMicroseconds (Time.now ()) mod 250000 div 1000)
 
 (* MemAvailable, less what children still starting will take, must cover the
-   new child plus the reserve, whatever DIR/budget says: the budget caps
-   holbuild's reservations, while this keeps the machine from running out,
-   also when other work uses it.  Without MemAvailable, admission rests on
-   the reservations alone. *)
-fun live_shortfall charge starting =
+   new child plus a margin: the budget caps holbuild's reservations, while
+   this keeps the machine from running out, also when other work uses it.
+   The margin is the reserve, so a small budget doesn't starve, unless the
+   budget leaves less of MemTotal out than that: then what it leaves out, at
+   least 1 GiB, so that a budget set above the default can be used.  Without
+   MemAvailable, admission rests on the reservations alone. *)
+fun live_shortfall budget charge starting =
   case meminfo () of
       {total = SOME total, available = SOME available} =>
-        if available - starting >= charge + reserve total then NONE
-        else SOME ("MemAvailable is " ^ mib_text available ^
-                   (if starting > 0 then " less " ^ mib_text starting ^ " for children starting"
-                    else "") ^
-                   ", below the charge plus " ^ mib_text (reserve total) ^ " kept free")
+        let val margin = Int.min (reserve total, Int.max (1024 * mib, total - budget))
+        in
+          if available - starting >= charge + margin then NONE
+          else SOME ("MemAvailable is " ^ mib_text available ^
+                     (if starting > 0 then " less " ^ mib_text starting ^ " for children starting"
+                      else "") ^
+                     ", below the charge plus " ^ mib_text margin ^ " kept free")
+        end
     | _ => NONE
 
 fun acquire {dir, budget_mb, charge_mb} =
@@ -312,7 +320,7 @@ fun acquire {dir, budget_mb, charge_mb} =
         in
           if charge > budget then
             raise Error ("a child's reservation of " ^ mib_text charge ^ " (--child-charge or its default) " ^
-                         "exceeds the machine budget of " ^ mib_text budget ^ " in " ^ budget_path dir)
+                         "exceeds the machine budget of " ^ mib_text budget ^ " in " ^ dir)
           else
             let val {reserved, starting} = reserved_bytes dir
             in
@@ -320,7 +328,7 @@ fun acquire {dir, budget_mb, charge_mb} =
                 Wait (mib_text reserved ^ " of " ^ mib_text budget ^ " reserved in " ^ dir)
               else if reserved = 0 then Admitted (create_lease dir charge)
               else
-                case live_shortfall charge starting of
+                case live_shortfall budget charge starting of
                     NONE => Admitted (create_lease dir charge)
                   | SOME why => Wait why
             end

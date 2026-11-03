@@ -47,18 +47,23 @@ fun global_help () = print
   \  --cooperate-dir DIR          Share a machine memory budget with other holbuild\n\
   \                               processes using DIR (or $HOLBUILD_COOPERATE_DIR)\n\
   \  --machine-max-mem MB         Budget to record in DIR/budget if it is missing\n\
+  \                               (default without it: MemTotal less a reserve)\n\
   \  --child-charge MB            Reservation per child (default: --max-heap, at\n\
   \                               most 3072; --max-heap + 1024 without\n\
   \                               MemAvailable)\n\n\
   \With --cooperate-dir, each theory, generator or heap-export child reserves\n\
   \--child-charge, and starts only while all reservations in DIR plus its own fit\n\
-  \the budget in DIR/budget (default: MemTotal less a quarter), and, while other\n\
-  \children hold reservations, MemAvailable less the charges of children started\n\
-  \in the last 30 s covers its charge plus that quarter (at least 1 GiB).\n\
+  \the budget, and, while other children hold reservations, MemAvailable less the\n\
+  \charges of children started in the last 30 s covers its charge plus a margin.\n\
+  \The reserve is a quarter of MemTotal, at least 1 GiB and at most 30 GiB; the\n\
+  \margin is the reserve, or what the budget leaves out of MemTotal if that is\n\
+  \less (at least 1 GiB).\n\
   \This bounds admission; it does not enforce RSS. HOL toolchain builds, check,\n\
   \run and repl reserve nothing.\n\
-  \To resize, replace DIR/budget (a byte count) while holding DIR/lock:\n\
-  \  flock DIR/lock sh -c 'echo BYTES > DIR/budget.new && mv DIR/budget.new DIR/budget'\n\n\
+  \To set or resize the budget, write DIR/budget (a byte count) while holding\n\
+  \DIR/lock:\n\
+  \  flock DIR/lock sh -c 'echo BYTES > DIR/budget.new && mv DIR/budget.new DIR/budget'\n\
+  \To return to the default, remove it: flock DIR/lock rm DIR/budget\n\n\
   \Use `holbuild COMMAND --help` for command-specific help.\n"
 
 fun build_help () = print
