@@ -166,12 +166,12 @@ same_outputs() {
 forget_local() { rm -rf "$shared/checkpoints" "$shared/checkpoint-store"; }
 
 # resumed VERSION FROM KIND: the sharing worker restored a KIND checkpoint,
-# resumed from it as FROM, and HOL loaded it.
+# resumed from it as FROM, and kept it.
 resumed() {
   require_grep "restored shared $3" "$tmpdir/$1.log"
   require_grep "from: $2" "$tmpdir/$1.log"
-  if grep -q "discarding invalid checkpoint" "$tmpdir/$1.log"; then
-    echo "version $1: HOL could not load the restored state" >&2
+  if grep -q "discarding" "$tmpdir/$1.log"; then
+    echo "version $1: the build discarded the restored state" >&2
     cat "$tmpdir/$1.log" >&2
     exit 1
   fi

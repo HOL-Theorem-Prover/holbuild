@@ -6504,8 +6504,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
              | HolbuildCacheBackend.Miss => reject_spec ("the cache has no spec " ^ spec_sha256)
              | HolbuildCacheBackend.Corrupt msg => raise action_failed InternalFailure ("cannot fetch the spec: " ^ msg))
         val spec = parse_action_spec (read_text spec_path)
-        val _ = (input_key := #input_key spec; target := (#package spec, #logical spec))
+        val _ = input_key := #input_key spec
         val _ = verify_action_spec spec
+        (* Names the build log, so only once the names are known safe. *)
+        val _ = target := (#package spec, #logical spec)
         val tc =
           toolchain (#toolchain spec)
           handle e => raise action_failed ToolchainFailure (General.exnMessage e)
