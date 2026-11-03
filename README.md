@@ -368,6 +368,12 @@ toolchain builds nor `check`, `run` or `repl`.
   `flock`ed by holbuild and inherited by the child, so a killed holbuild's
   reservation ends with its children, with no timeout. A lease nobody holds no
   longer counts and is removed by the next process that scans `DIR`.
+- Each admission scans `DIR` while holding `DIR/lock`. A child waits for that
+  lock while another process holds it, printing
+  `holbuild: waiting Ns for machine-memory lock DIR/lock` every 30 s, for up
+  to `HOLBUILD_COOPERATE_LOCK_TIMEOUT` seconds (default 600; `0` waits with no
+  limit), and then the build fails. If `flock` itself fails (a filesystem
+  without it), the build fails at once.
 - For several users, create `DIR` writable by all of them (for example mode
   `1777`, or `2775` with a shared group) on a local filesystem. holbuild makes
   its files readable by everyone.
