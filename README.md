@@ -694,7 +694,12 @@ and they reuse theories built by `holbuild build --skip-proof-steps`; use
 `holbuild build` to check proof-step timeouts. Before starting HOL,
 `holbuild run` and `holbuild repl` build every target named by `[run].loads`,
 create an invocation-private project context under `.holbuild/`, and then load
-the configured targets followed by user arguments.
+the configured targets followed by user arguments. Two kinds of argument never
+reach HOL this way, wherever they appear: holbuild's global options and
+`-h`/`--help`, which holbuild takes itself, and Poly/ML runtime options
+(`--gcthreads`, `--maxheap`, `-H`, ...), which holbuild's own Poly/ML runtime
+removes from its command line, so holbuild rejects them where it can detect
+them (Linux).
 
 ## Proof steps and checkpoints
 
