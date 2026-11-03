@@ -164,10 +164,10 @@ fun publish_blob cache {hash, src} =
     else
       (copy_binary src blob;
        if verify_blob cache hash then HolbuildCacheBackend.Published
-       else HolbuildCacheBackend.Conflict blob)
+       else HolbuildCacheBackend.Failed blob)
   end
-  handle Error msg => HolbuildCacheBackend.Conflict msg
-       | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
+  handle Error msg => HolbuildCacheBackend.Failed msg
+       | e => HolbuildCacheBackend.Failed (General.exnMessage e)
 
 fun action_lock cache key = Path.concat(locks_dir cache, "action-" ^ key ^ ".lock")
 

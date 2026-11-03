@@ -6,7 +6,9 @@ type blob_hash = string
 type manifest_text = string
 type local_path = string
 
-datatype publish_result = Published | AlreadyPresent | Conflict of string | Skipped
+(* Conflict: the destination already holds a different value under this key.
+   Failed: the write itself did not complete (transport, HTTP status, I/O). *)
+datatype publish_result = Published | AlreadyPresent | Conflict of string | Failed of string | Skipped
 
 datatype action_publish_policy = PutIfAbsent | PutIfAbsentOrSame
 

@@ -181,6 +181,7 @@ fun publish {remote, identity, entry_dir, replace} =
         | result as HolbuildCacheBackend.AlreadyPresent => result
         | HolbuildCacheBackend.Skipped => die "remote cache skipped toolchain archive publication"
         | HolbuildCacheBackend.Conflict detail => die ("remote cache rejected toolchain archive: " ^ detail)
+        | HolbuildCacheBackend.Failed detail => die ("could not upload toolchain archive to remote cache: " ^ detail)
     fun put_action request =
       if replace then HolbuildRemoteCache.replace_action_unconditionally remote request
       else HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsentOrSame request
@@ -198,6 +199,7 @@ fun publish {remote, identity, entry_dir, replace} =
             | result as HolbuildCacheBackend.AlreadyPresent => result
             | HolbuildCacheBackend.Skipped => die "remote cache skipped toolchain action publication"
             | HolbuildCacheBackend.Conflict detail => die ("remote cache rejected toolchain action: " ^ detail)
+            | HolbuildCacheBackend.Failed detail => die ("could not upload toolchain action to remote cache: " ^ detail)
         end before cleanup ())
        handle e => (cleanup (); raise e))
   end
