@@ -243,7 +243,17 @@ set +e
   "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only) \
   > "$tmpdir/toolchain-only.log" 2>&1
 status=$?
+# The same without the build command word.
+(cd "$tmpdir/fake-project" &&
+  HOLBUILD_CACHE=$tmpdir/fake-cache HOLBUILD_CANONICAL_HOL_GIT=$fake_hol \
+  HOLBUILD_TEST_BUILD_COUNT=$tmpdir/fake-build-count \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" --remote-exec "$coordinator" --remote-only ATheory) \
+  > "$tmpdir/toolchain-only-implicit.log" 2>&1
+implicit_status=$?
 set -e
-[[ $status -eq 1 ]] || { echo "toolchain-only exited $status, wanted 1" >&2; cat "$tmpdir/toolchain-only.log" >&2; exit 1; }
-require_grep "HOL toolchain is in neither the local nor the remote cache, and --remote-only builds nothing locally" "$tmpdir/toolchain-only.log"
+for name in toolchain-only toolchain-only-implicit; do
+  [[ $name == toolchain-only ]] && code=$status || code=$implicit_status
+  [[ $code -eq 1 ]] || { echo "$name exited $code, wanted 1" >&2; cat "$tmpdir/$name.log" >&2; exit 1; }
+  require_grep "HOL toolchain could not be restored from a cache, and --remote-only builds nothing locally" "$tmpdir/$name.log"
+done
 [[ ! -s "$tmpdir/fake-build-count" ]] || { cat "$tmpdir/fake-build-count" >&2; exit 1; }

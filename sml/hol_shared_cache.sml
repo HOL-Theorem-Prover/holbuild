@@ -512,7 +512,7 @@ val restore_only = ref false
 
 fun build_entry jobs req k =
   if !restore_only then
-    die "the HOL toolchain is in neither the local nor the remote cache, and --remote-only builds nothing locally"
+    die "the HOL toolchain could not be restored from a cache, and --remote-only builds nothing locally"
   else
   let
     val final = entry_dir_for_key k
