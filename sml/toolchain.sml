@@ -179,9 +179,9 @@ fun readable path = FS.access(path, [FS.A_READ]) handle OS.SysErr _ => false
 fun require_readable path =
   if readable path then () else raise Error ("required toolchain file not readable: " ^ path)
 
-fun hash_text text = HolbuildHash.string_sha1 text
+fun hash_text text = HolbuildHash.string_sha256 text
 
-fun file_hash path = (require_readable path; HolbuildHash.file_sha1 path)
+fun file_hash path = (require_readable path; HolbuildHash.file_sha256 path)
 
 fun toolchain_key tc =
   hash_text

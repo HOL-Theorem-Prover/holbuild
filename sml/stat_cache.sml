@@ -14,7 +14,7 @@ type instance =
    hits : int ref,
    recomputes : int ref}
 
-val version = "holbuild-stat-cache-v3"
+val version = "holbuild-stat-cache-v4"
 
 fun empty_entries () = Binarymap.mkDict String.compare
 
@@ -109,15 +109,15 @@ fun drop_trailing_cr text =
 
 fun parse_entry line =
   case String.fields (fn c => c = #"\t") line of
-      [path_text, dev, ino, size_text, mtime_text, ctime_text, sha1] =>
+      [path_text, dev, ino, size_text, mtime_text, ctime_text, hash] =>
         (case (String.fromString path_text,
                Int.fromString size_text,
                LargeInt.fromString mtime_text,
                LargeInt.fromString ctime_text) of
              (SOME path, SOME size, SOME mtime_ns, SOME ctime_ns) =>
-               if HolbuildHash.valid_sha1 sha1 then
+               if HolbuildHash.valid_sha256 hash then
                  SOME (path, ({dev = dev, ino = ino, size = size,
-                               mtime_ns = mtime_ns, ctime_ns = ctime_ns}, sha1))
+                               mtime_ns = mtime_ns, ctime_ns = ctime_ns}, hash))
                else NONE
            | _ => NONE)
     | _ => NONE
@@ -157,10 +157,10 @@ fun load {path} =
     new_instance true (SOME path) entries
   end
 
-fun entry_line (path, ({dev, ino, size, mtime_ns, ctime_ns} : ident, sha1)) =
+fun entry_line (path, ({dev, ino, size, mtime_ns, ctime_ns} : ident, hash)) =
   String.concat
     [String.toString path, "\t", dev, "\t", ino, "\t", Int.toString size, "\t",
-     LargeInt.toString mtime_ns, "\t", LargeInt.toString ctime_ns, "\t", sha1, "\n"]
+     LargeInt.toString mtime_ns, "\t", LargeInt.toString ctime_ns, "\t", hash, "\n"]
 
 fun prune_missing_entries (instance : instance) =
   with_lock instance
@@ -196,11 +196,11 @@ fun flush (instance : instance) =
             write_text_atomically path text
           end
 
-fun file_sha1 (instance : instance) path =
-  if not (#enabled instance) then HolbuildHash.file_sha1 path
+fun file_sha256 (instance : instance) path =
+  if not (#enabled instance) then HolbuildHash.file_sha256 path
   else
     case stat_ident path of
-        NONE => HolbuildHash.file_sha1 path
+        NONE => HolbuildHash.file_sha256 path
       | SOME ident =>
           (* No combination of portable stat fields is a content identity:
              a same-size write can preserve inode, mtime, and ctime on a
@@ -208,10 +208,10 @@ fun file_sha1 (instance : instance) path =
              Therefore an entry is retained only as a record of a hash we
              computed; it must never be used to return a source hash without
              reading the source again. *)
-          rehash_file_sha1 instance path ident
+          rehash_file_sha256 instance path ident
 
-and rehash_file_sha1 (instance : instance) path ident =
-  let val sha1 = HolbuildHash.file_sha1 path
+and rehash_file_sha256 (instance : instance) path ident =
+  let val hash = HolbuildHash.file_sha256 path
   in
     (* The identity used to index the hash must describe the bytes we just
        read.  Otherwise a same-size write on a coarse-timestamp filesystem can
@@ -223,10 +223,10 @@ and rehash_file_sha1 (instance : instance) path ident =
               (fn () =>
                   (#recomputes instance := !(#recomputes instance) + 1;
                    #entries instance :=
-                     Binarymap.insert (!(#entries instance), path, (final_ident, sha1));
-                   sha1))
-          else file_sha1 instance path
-      | NONE => file_sha1 instance path
+                     Binarymap.insert (!(#entries instance), path, (final_ident, hash));
+                   hash))
+          else file_sha256 instance path
+      | NONE => file_sha256 instance path
   end
 
 end

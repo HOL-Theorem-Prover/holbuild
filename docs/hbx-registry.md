@@ -78,7 +78,7 @@ login`). Public repositories need no download token.
 ```json
 {
   "format": "holbuild-hbx-metadata-v1",
-  "archive_format": "holbuild-hbx-v1",
+  "archive_format": "holbuild-hbx-v2",
   "archive": "MyTheory.hbx",
   "sha256": "...",
   "size": "123456",

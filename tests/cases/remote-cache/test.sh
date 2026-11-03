@@ -405,7 +405,7 @@ assert_remote_proof_timeout 60.0
 cp "$clean_weaker_manifest" "$weaker_manifest"
 different_output=$tmpdir/different-output.dat
 printf 'different valid cached output\n' > "$different_output"
-different_output_hash=$(sha1sum "$different_output" | cut -d' ' -f1)
+different_output_hash=$(sha256sum "$different_output" | cut -d' ' -f1)
 cp "$different_output" "$weaker_cache/blobs/$different_output_hash"
 python3 - "$weaker_manifest" "$different_output_hash" <<'PY'
 import pathlib

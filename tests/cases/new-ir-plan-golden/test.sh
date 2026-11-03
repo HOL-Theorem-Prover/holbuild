@@ -704,12 +704,14 @@ Proof
 QED
 SML
 check_plan select_then1_plan <<'EXPECTED'
-holbuild proof-ir plan ATheory:select_then1_plan source=src/AScript.sml (5 steps)
+holbuild proof-ir plan ATheory:select_then1_plan source=src/AScript.sml (7 steps)
   00 step CONJ_TAC
   01 select matching-all [`T`] solve
-  02   step ACCEPT_TAC TRUTH
-  03 end
-  04 step ACCEPT_TAC TRUTH
+  02   each
+  03     step ACCEPT_TAC TRUTH
+  04   end
+  05 end
+  06 step ACCEPT_TAC TRUTH
 EXPECTED
 
 cat >> "$project/src/AScript.sml" <<'SML'

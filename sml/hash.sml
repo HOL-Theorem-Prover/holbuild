@@ -10,7 +10,6 @@ fun is_hex c = Char.isDigit c orelse
 
 fun valid_hex length text = size text = length andalso List.all is_hex (String.explode text)
 
-fun valid_sha1 text = valid_hex 40 text
 fun valid_sha256 text = valid_hex 64 text
 
 fun read_all path =
@@ -38,41 +37,29 @@ fun external_hash command_name valid path =
   end
   handle _ => NONE
 
-fun external_sha1 path = external_hash "sha1sum" valid_sha1 path
 fun external_sha256 path = external_hash "sha256sum" valid_sha256 path
 
 val small_file_limit = 196608
 
-(* Starting sha1sum costs ~0.6ms and SHA1_ML hashes ~66 MB/s, so SHA1_ML is
-   faster for files below ~40 KiB. *)
-val external_sha1_limit = 65536
+(* Starting sha256sum costs ~0.8ms and HolbuildSha256 hashes ~60 MB/s, so
+   hashing in SML is faster for files below ~50 KiB. *)
+val external_hash_limit = 65536
 
 fun large_file path =
-  (Position.toInt (OS.FileSys.fileSize path) >= external_sha1_limit)
+  (Position.toInt (OS.FileSys.fileSize path) >= external_hash_limit)
   handle Overflow => true
        | OS.SysErr _ => false
-
-fun vector_string bytes =
-  String.implode
-    (List.tabulate (Word8Vector.length bytes,
-                    fn i => Char.chr (Word8.toInt (Word8Vector.sub(bytes, i)))))
 
 fun read_binary_all path =
   let
     val input = BinIO.openIn path
-    fun loop chunks =
-      let val chunk = BinIO.inputN(input, 65536)
-      in
-        if Word8Vector.length chunk = 0 then String.concat (rev chunks)
-        else loop (vector_string chunk :: chunks)
-      end
-    val text = loop [] handle e => (BinIO.closeIn input; raise e)
+    val text = Byte.bytesToString (BinIO.inputAll input)
+               handle e => (BinIO.closeIn input; raise e)
   in
     BinIO.closeIn input;
     text
   end
 
-val string_sha1 = HolbuildStringHash.string_sha1
 fun string_sha256 text = HolbuildSha256.string_hex text
 
 fun string_sha256_large text =
@@ -98,31 +85,31 @@ fun string_sha256_large text =
     end
     handle _ => string_sha256 text
 
-fun file_sha1 path =
+fun file_sha256 path =
   if large_file path then
-    case external_sha1 path of
+    case external_sha256 path of
         SOME hash => hash
-      | NONE => SHA1_ML.sha1_file {filename = path}
-  else SHA1_ML.sha1_file {filename = path}
+      | NONE => string_sha256 (read_binary_all path)
+  else string_sha256 (read_binary_all path)
 
 (* Spawning one process per file, or hashing in SML, costs far more than the
-   hashing itself, so hash a batch of files with one sha1sum per chunk.  Any
+   hashing itself, so hash a batch of files with one sha256sum per chunk.  Any
    chunk whose output doesn't give one digest per file is hashed file by file. *)
-fun files_sha1 paths =
+fun files_sha256 paths =
   let
     val chunk_size = 256
     fun digest line =
       let val hex = if String.isPrefix "\\" line then String.extract(line, 1, NONE) else line
       in
-        if size hex >= 40 andalso valid_sha1 (String.substring(hex, 0, 40))
-        then SOME (String.map Char.toLower (String.substring(hex, 0, 40)))
+        if size hex >= 64 andalso valid_sha256 (String.substring(hex, 0, 64))
+        then SOME (String.map Char.toLower (String.substring(hex, 0, 64)))
         else NONE
       end
     fun external chunk =
       let
         val out = OS.FileSys.tmpName ()
         val command =
-          "sha1sum -- " ^ String.concatWith " " (map quote chunk) ^
+          "sha256sum -- " ^ String.concatWith " " (map quote chunk) ^
           " > " ^ quote out ^ " 2>/dev/null"
         val status = OS.Process.system command
         val lines =
@@ -140,7 +127,7 @@ fun files_sha1 paths =
     fun hash_chunk chunk =
       case external chunk of
           SOME digests => digests
-        | NONE => map file_sha1 chunk
+        | NONE => map file_sha256 chunk
     fun loop [] acc = List.concat (rev acc)
       | loop paths acc =
           let
@@ -151,10 +138,5 @@ fun files_sha1 paths =
   in
     loop paths []
   end
-
-fun file_sha256 path =
-  case external_sha256 path of
-      SOME hash => hash
-    | NONE => string_sha256 (read_binary_all path)
 
 end

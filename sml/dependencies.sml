@@ -303,10 +303,21 @@ fun write_file path text =
   let val out = TextIO.openOut path
   in TextIO.output(out, text); TextIO.closeOut out end
 
-fun run_analyser_batch analyser files =
+datatype 'a outcome = Done of 'a | Failed of exn
+
+fun outcome_value outcome =
+  case outcome of
+      Done value => value
+    | Failed e => raise e
+
+(* Runs one analyser process over files and returns its stdout with its
+   parsed response, or the error the response or exit status gives. *)
+fun analyse_files analyser files =
   let
-    val req = OS.FileSys.tmpName ()
-    val resp = OS.FileSys.tmpName ()
+    (* Not OS.FileSys.tmpName: it swaps the process umask, which races
+       when several analysers start at once. *)
+    val req = HolbuildTempPath.temporary "analyser-request"
+    val resp = HolbuildTempPath.temporary "analyser-response"
     fun file_line (id, path) = HolbuildAnalysisProtocol.join ["file", id, path, "deps"]
     val request = String.concatWith "\n"
       ([HolbuildAnalysisProtocol.join ["version", HolbuildAnalysisProtocol.protocol_version],
@@ -318,16 +329,69 @@ fun run_analyser_batch analyser files =
                                  args = analyser_min_heap_args () @
                                         ["--request", req, "--response", resp],
                                  stderr = HolbuildSpawn.Inherit}
-    val _ = print (#output run)
     val _ = OS.FileSys.remove req handle OS.SysErr _ => ()
+    val outcome =
+      (if HolbuildSpawn.succeeded run then Done (parse_analyser_response resp files)
+       else raise Error "holbuild-hol-analyser failed")
+      handle e => Failed e
+    val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
   in
-    if HolbuildSpawn.succeeded run then
-      let val deps = parse_analyser_response resp files
-          val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
-      in deps end
+    (#output run, outcome)
+  end
+
+fun run_analyser_batch analyser files =
+  let val (output, outcome) = analyse_files analyser files
+  in print output; outcome_value outcome end
+
+(* Starting an analyser costs about as much as analysing two or three
+   files, so each extra process gets at least this many. *)
+val min_files_per_analyser = 8
+val analyser_jobs = ref 1
+fun set_analyser_jobs n = analyser_jobs := Int.max (1, n)
+
+(* Analyses a frontier batch with up to !analyser_jobs processes at once,
+   the files dealt round-robin. The processes' stdout is printed and their
+   failures raised in process order, and the results come back in request
+   order, so the outcome is the one a single process gives. *)
+fun run_analyser_parallel analyser files =
+  let
+    val n = Int.min (!analyser_jobs, length files div min_files_per_analyser)
+  in
+    if n <= 1 then run_analyser_batch analyser files
     else
-      let val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
-      in raise Error "holbuild-hol-analyser failed" end
+      let
+        val chunks = Array.array (n, [])
+        val _ = List.foldl (fn (file, i) =>
+                  (Array.update (chunks, i mod n, file :: Array.sub (chunks, i mod n)); i + 1))
+                  0 files
+        val results = Array.array (n, NONE)
+        val mutex = Mutex.mutex ()
+        val cv = ConditionVar.conditionVar ()
+        val pending = ref n
+        fun worker i () =
+          let
+            val result = analyse_files analyser (rev (Array.sub (chunks, i)))
+                         handle e => ("", Failed e)
+          in
+            Mutex.lock mutex;
+            Array.update (results, i, SOME result);
+            pending := !pending - 1;
+            ConditionVar.broadcast cv;
+            Mutex.unlock mutex
+          end
+        val _ = List.tabulate (n, fn i => Thread.fork (worker i, []))
+        fun wait () =
+          if !pending = 0 then () else (ConditionVar.wait (cv, mutex); wait ())
+        val _ = (Mutex.lock mutex; wait (); Mutex.unlock mutex)
+        val outcomes = Array.foldr (fn (result, acc) => valOf result :: acc) [] results
+        val _ = List.app (print o #1) outcomes
+        val by_id =
+          List.foldl (fn ((id, deps), dict) => Binarymap.insert (dict, id, deps))
+            (Binarymap.mkDict String.compare)
+            (List.concat (map (outcome_value o #2) outcomes))
+      in
+        map (fn (id, _) => (id, Binarymap.find (by_id, id))) files
+      end
   end
 
 fun extract_with_analyser analyser source_path =
@@ -355,7 +419,7 @@ fun read_cache cache_path source_hash =
         version :: extractor :: hash_line :: rest =>
           if version = cache_version andalso
              extractor = "extractor=" ^ extractor_version andalso
-             hash_line = "source_sha1=" ^ source_hash then
+             hash_line = "source_sha256=" ^ source_hash then
             SOME {loads = values "load=" rest,
                   uses = values "use=" rest,
                   extra_deps = values "extra_dep=" rest,
@@ -377,7 +441,7 @@ fun cache_text source_hash ({loads, uses, extra_deps, extra_outputs, holdep_ment
   String.concatWith "\n"
     ([cache_version,
       "extractor=" ^ extractor_version,
-      "source_sha1=" ^ source_hash] @
+      "source_sha256=" ^ source_hash] @
      map (fn value => "load=" ^ value) loads @
      map (fn value => "use=" ^ value) uses @
      map (fn value => "extra_dep=" ^ value) extra_deps @
@@ -429,7 +493,7 @@ fun prefetch_cached_with_hash requests =
         | (SOME analyser, _) =>
             let
               val files = map (fn (id, {source_path, ...}) => (id, source_path)) (rev missing)
-              val results = run_analyser_batch analyser files
+              val results = run_analyser_parallel analyser files
               val missing_by_id =
                 List.foldl
                   (fn ((id, req), dict) => Binarymap.insert(dict, id, req))
@@ -453,7 +517,7 @@ fun prefetch_cached_with_hash requests =
 fun extract_cached {cache_path, source_path} =
   extract_cached_with_hash {cache_path = cache_path,
                             source_path = source_path,
-                            source_hash = HolbuildHash.file_sha1 source_path}
+                            source_hash = HolbuildHash.file_sha256 source_path}
 
 fun extract path = extract_uncached path
 

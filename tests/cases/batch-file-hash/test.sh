@@ -17,7 +17,7 @@ import pathlib
 import sys
 
 files = pathlib.Path(sys.argv[1])
-# More files than one sha1sum chunk, plus names sha1sum escapes in its output.
+# More files than one sha256sum chunk, plus names sha256sum escapes in its output.
 for i in range(300):
     (files / f"f{i:03}.sml").write_bytes(bytes((j * 31 + i) % 256 for j in range(i * 7)))
 (files / "with space.sml").write_text("space\n")
@@ -51,11 +51,11 @@ fun list_files () =
   in loop [] end
 
 val paths = list_files ()
-val batched = HolbuildHash.files_sha1 paths
+val batched = HolbuildHash.files_sha256 paths
 val expected =
   case OS.Process.getEnv "BATCH_FILE_HASH_EXPECT" of
       SOME digest => map (fn _ => digest) paths
-    | NONE => map (fn path => SHA1_ML.sha1_file {filename = path}) paths
+    | NONE => map (fn path => HolbuildSha256.string_hex (HolbuildHash.read_binary_all path)) paths
 val _ = if length paths < 300 then fail "expected at least 300 files" else ()
 val _ =
   ListPair.appEq
@@ -72,14 +72,14 @@ run_check() {
   require_grep "batch file hash test passed" "$tmpdir/$1.log"
 }
 
-run_check with-sha1sum
+run_check with-sha256sum
 
-# A sha1sum that reports a fixed digest per argument, escaping names the way
-# GNU sha1sum does, shows that the batch output is used and kept in order.
-sentinel=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+# A sha256sum that reports a fixed digest per argument, escaping names the way
+# GNU sha256sum does, shows that the batch output is used and kept in order.
+sentinel=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 fakedir="$tmpdir/fake"
 mkdir -p "$fakedir"
-cat > "$fakedir/sha1sum" <<SH
+cat > "$fakedir/sha256sum" <<SH
 #!/usr/bin/env bash
 [ "\$1" = "--" ] && shift
 for f in "\$@"; do
@@ -89,12 +89,12 @@ for f in "\$@"; do
   esac
 done
 SH
-chmod +x "$fakedir/sha1sum"
-PATH="$fakedir:$PATH" BATCH_FILE_HASH_EXPECT=$sentinel run_check fake-sha1sum
+chmod +x "$fakedir/sha256sum"
+PATH="$fakedir:$PATH" BATCH_FILE_HASH_EXPECT=$sentinel run_check fake-sha256sum
 
-# Without a working sha1sum every chunk falls back to hashing file by file.
+# Without a working sha256sum every chunk falls back to hashing file by file.
 shimdir="$tmpdir/shim"
 mkdir -p "$shimdir"
-printf '#!/bin/sh\nexit 1\n' > "$shimdir/sha1sum"
-chmod +x "$shimdir/sha1sum"
-PATH="$shimdir:$PATH" run_check failing-sha1sum
+printf '#!/bin/sh\nexit 1\n' > "$shimdir/sha256sum"
+chmod +x "$shimdir/sha256sum"
+PATH="$shimdir:$PATH" run_check failing-sha256sum

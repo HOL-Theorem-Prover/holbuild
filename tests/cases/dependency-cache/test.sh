@@ -113,8 +113,8 @@ SML
 (cd "$project" && "$HOLBUILD_BIN" build --dry-run ATheory) > "$tmpdir/library.log"
 sig_cache_file="$project/.holbuild/obj/src/Shared.ui.deps"
 sml_cache_file="$project/.holbuild/obj/src/Shared.uo.deps"
-require_grep "source_sha1=$(sha1sum < "$project/src/Shared.sig" | cut -d' ' -f1)" "$sig_cache_file"
-require_grep "source_sha1=$(sha1sum < "$project/src/Shared.sml" | cut -d' ' -f1)" "$sml_cache_file"
+require_grep "source_sha256=$(sha256sum < "$project/src/Shared.sig" | cut -d' ' -f1)" "$sig_cache_file"
+require_grep "source_sha256=$(sha256sum < "$project/src/Shared.sml" | cut -d' ' -f1)" "$sml_cache_file"
 
 touch -d '2000-01-01 00:00:00' "$sig_cache_file" "$sml_cache_file"
 (cd "$project" && "$HOLBUILD_BIN" build --dry-run ATheory) > "$tmpdir/library-again.log"

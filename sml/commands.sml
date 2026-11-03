@@ -32,6 +32,8 @@ fun global_help () = print
   \  executable NAME             Build a configured executable heap\n\
   \  clean THEORY...             Remove local build outputs\n\
   \  export -o FILE [TARGET ...]  Export cached build outputs\n\
+  \  action-spec [TARGET ...]   Export uncached theories for remote execution\n\
+  \  exec-action SPEC-SHA256    Run one exported theory action as a remote worker\n\
   \  import FILE                  Import cached build outputs\n\
   \  gc                          Remove stale project/cache state\n\n\
   \Global options:\n\
@@ -45,13 +47,26 @@ fun global_help () = print
   \  --prefetch-concurrency N\n\
   \  --cooperate-dir DIR          Share a machine memory budget with other holbuild\n\
   \                               processes using DIR (or $HOLBUILD_COOPERATE_DIR)\n\
-  \  --machine-max-mem MB         Budget to record in DIR/budget if it is missing\n\n\
+  \  --machine-max-mem MB         Budget to record in DIR/budget if it is missing\n\
+  \                               (default without it: MemTotal less a reserve)\n\
+  \  --child-charge MB            Reservation per child (default: --max-heap, at\n\
+  \                               most 3072; --max-heap + 1024 without\n\
+  \                               MemAvailable)\n\n\
   \With --cooperate-dir, each theory, generator or heap-export child reserves\n\
-  \--max-heap plus 1 GiB, and starts only while all reservations in DIR fit the\n\
-  \budget in DIR/budget (default: MemTotal less a quarter). This bounds admission;\n\
-  \it does not enforce RSS. HOL toolchain builds, check, run and repl reserve nothing.\n\
-  \To resize, replace DIR/budget (a byte count) while holding DIR/lock:\n\
-  \  flock DIR/lock sh -c 'echo BYTES > DIR/budget.new && mv DIR/budget.new DIR/budget'\n\n\
+  \--child-charge, and starts only while all reservations in DIR plus its own fit\n\
+  \the budget, and, while other children hold reservations, MemAvailable less the\n\
+  \charges of children started in the last 30 s covers its charge plus a margin.\n\
+  \The reserve is a quarter of MemTotal, at least 1 GiB and at most 30 GiB; the\n\
+  \margin is the reserve, or what the budget leaves out of MemTotal if that is\n\
+  \less (at least 1 GiB).\n\
+  \This bounds admission; it does not enforce RSS. HOL toolchain builds, check,\n\
+  \run and repl reserve nothing.\n\
+  \To set or resize the budget, write DIR/budget (a byte count) while holding\n\
+  \DIR/lock:\n\
+  \  flock DIR/lock sh -c 'echo BYTES > DIR/budget.new && mv DIR/budget.new DIR/budget'\n\
+  \To return to the default, remove it: flock DIR/lock rm DIR/budget\n\
+  \Waiting for DIR/lock gives up after $HOLBUILD_COOPERATE_LOCK_TIMEOUT seconds\n\
+  \(default 600; 0 for no limit).\n\n\
   \Use `holbuild COMMAND --help` for command-specific help.\n"
 
 fun build_help () = print
@@ -73,7 +88,13 @@ fun build_help () = print
   \  --retain-debug-artifacts\n\
   \  --emit-output-hashes\n\
   \  --warn-unreachable\n\
-  \  --trknl\n\n\
+  \  --trknl\n\
+  \  --remote-exec URL [--remote-only] [--detach | --attach BATCH-ID]\n\n\
+  \With --remote-exec, theories the remote cache lacks are built by the\n\
+  \coordinator's workers and restored from the remote cache. Needs\n\
+  \--remote-cache. A closure that can't run remotely or an unreachable\n\
+  \coordinator builds locally; --remote-only fails instead. --detach submits\n\
+  \the batch and exits; --attach follows a submitted batch and restores it.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun context_help () = print
@@ -86,13 +107,21 @@ fun context_help () = print
 fun repl_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] repl [ARG ...]\n\n\
-  \Start HOL REPL with project context. Extra arguments are passed to HOL.\n\n\
+  \Start HOL REPL with project context. Extra arguments are passed to HOL,\n\
+  \except two kinds, wherever they appear: holbuild's global options and\n\
+  \-h/--help, which holbuild takes itself, and Poly/ML runtime options\n\
+  \(--gcthreads, --maxheap, -H, ...), which holbuild's own runtime consumes;\n\
+  \holbuild rejects those where it can detect them (Linux).\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun run_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] run [ARG ...]\n\n\
-  \Run HOL with project context. Extra arguments are passed to HOL.\n\n\
+  \Run HOL with project context. Extra arguments are passed to HOL,\n\
+  \except two kinds, wherever they appear: holbuild's global options and\n\
+  \-h/--help, which holbuild takes itself, and Poly/ML runtime options\n\
+  \(--gcthreads, --maxheap, -H, ...), which holbuild's own runtime consumes;\n\
+  \holbuild rejects those where it can detect them (Linux).\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun execution_plan_help () = print
@@ -116,7 +145,8 @@ fun buildhol_help () = print
   \  holbuild [GLOBAL OPTIONS] buildhol [--trknl]\n\n\
   \Build/reuse the declared HOL tree and print its path. Use --trknl to select\n\
   \the tracing kernel. A configured remote cache restores toolchains and\n\
-  \publishes successful local builds automatically.\n\n\
+  \publishes successful local builds automatically. A global -j N is passed to\n\
+  \HOL's bin/build when the toolchain is built here.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun heap_help () = print
@@ -155,6 +185,35 @@ fun gc_help () = print
 fun cache_help () = print
   "`holbuild cache gc` is deprecated; use `holbuild gc --cache-only`.\n"
 
+fun action_spec_help () = print
+  "Usage:\n\
+  \  holbuild [GLOBAL OPTIONS] action-spec [--upload] [OPTIONS] [TARGET ...]\n\n\
+  \Plan TARGETs as build would and write the ActionSpec of every theory the\n\
+  \remote cache can't satisfy to .holbuild/action-specs/SHA256, then print the\n\
+  \action batch. With --upload, also upload the specs and their sources to the\n\
+  \remote cache. Takes build's cache and proof options. Needs --remote-cache.\n\n\
+  \Global options: see `holbuild --help`.\n"
+
+fun exec_action_help () = print
+  "Usage:\n\
+  \  holbuild --remote-cache URL [GLOBAL OPTIONS] exec-action SPEC-SHA256\n\
+  \      --cache-limit-gb N [--cache-reserve-gb N] [--share-heaps] [--result FILE]\n\n\
+  \Run the ActionSpec stored in the remote cache as SPEC-SHA256 (see\n\
+  \action-spec) and publish its result to the remote cache. The action runs in\n\
+  \CACHE/action, with checkpoints in CACHE/checkpoints, where CACHE is the cache\n\
+  \root. Writes a holbuild-action-result-v1 record to FILE, or to stdout.\n\n\
+  \Exit status: 0 built or cached; 1 proof or tactic-timeout failure; 2 out of\n\
+  \memory; 3 input-missing, publish, toolchain, disk or internal failure;\n\
+  \4 spec rejected.\n\n\
+  \--cache-limit-gb N   Before the action, evict least recently used\n\
+  \                     checkpoints, toolchains and local cache entries until\n\
+  \                     the cache root holds at most N GB minus the reserve.\n\
+  \--cache-reserve-gb N Room to keep free under the limit (default: a tenth).\n\
+  \--share-heaps        Resume from the deps-loaded heap and theorem checkpoints\n\
+  \                     other workers published, and publish this run's. The\n\
+  \                     host store CACHE/checkpoint-store keeps their files.\n\n\
+  \Global options: see `holbuild --help`.\n"
+
 fun export_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] export [--build] -o FILE [--metadata-out FILE] [TARGET ...]\n\n\
@@ -172,7 +231,7 @@ fun has_help_arg args = List.exists help_arg args
 
 val command_names =
   ["build", "context", "repl", "run", "execution-plan", "check", "buildhol", "heap", "executable",
-   "clean", "export", "import", "gc", "cache"]
+   "clean", "export", "import", "gc", "cache", "action-spec", "exec-action"]
 
 fun known_command command =
   List.exists (fn name => name = command) command_names orelse command = "goalfrag-plan"
@@ -193,6 +252,8 @@ fun command_help command =
     | "executable" => executable_help ()
     | "clean" => clean_help ()
     | "export" => export_help ()
+    | "action-spec" => action_spec_help ()
+    | "exec-action" => exec_action_help ()
     | "import" => import_help ()
     | "gc" => gc_help ()
     | "cache" => cache_help ()
@@ -654,7 +715,7 @@ fun print_execution_plan_selector new_ir project selector =
                   {project = project,
                    resolution = HolbuildProject.standard_resolution}
     val preparation = HolbuildPackagePrepare.prepare graph
-    val discovery = HolbuildSourceIndex.discover_prepared_with_inventories preparation
+    val discovery = HolbuildSourceIndex.discover_prepared_with_inventories [] preparation
     val components = HolbuildComponentProvider.load HolbuildComponentProvider.LiveProvider
                        {preparation = preparation, discovery = discovery}
     val index = HolbuildComponentProvider.sources components
@@ -726,27 +787,31 @@ fun parse_global_options args =
     loop NONE NONE NONE NONE NONE NONE NONE false HolbuildStatus.Normal args
   end
 
-(* --cooperate-dir and --machine-max-mem, removed from args. *)
+(* --cooperate-dir, --machine-max-mem and --child-charge, removed from args. *)
 fun parse_cooperation_options args =
   let
-    fun loop dir mem [] = (dir, mem, [])
-      | loop _ _ ("--cooperate-dir" :: "" :: _) = raise Error "--cooperate-dir requires DIR"
-      | loop _ mem ("--cooperate-dir" :: path :: xs) = loop (SOME path) mem xs
-      | loop _ _ ["--cooperate-dir"] = raise Error "--cooperate-dir requires DIR"
-      | loop dir _ ("--machine-max-mem" :: n :: xs) = loop dir (SOME (positive_int "--machine-max-mem" n)) xs
-      | loop _ _ ["--machine-max-mem"] = raise Error "--machine-max-mem requires MB"
-      | loop dir mem (arg :: xs) =
+    fun loop dir mem charge [] = (dir, mem, charge, [])
+      | loop _ _ _ ("--cooperate-dir" :: "" :: _) = raise Error "--cooperate-dir requires DIR"
+      | loop _ mem charge ("--cooperate-dir" :: path :: xs) = loop (SOME path) mem charge xs
+      | loop _ _ _ ["--cooperate-dir"] = raise Error "--cooperate-dir requires DIR"
+      | loop dir _ charge ("--machine-max-mem" :: n :: xs) = loop dir (SOME (positive_int "--machine-max-mem" n)) charge xs
+      | loop _ _ _ ["--machine-max-mem"] = raise Error "--machine-max-mem requires MB"
+      | loop dir mem _ ("--child-charge" :: n :: xs) = loop dir mem (SOME (positive_int "--child-charge" n)) xs
+      | loop _ _ _ ["--child-charge"] = raise Error "--child-charge requires MB"
+      | loop dir mem charge (arg :: xs) =
           if String.isPrefix "--cooperate-dir=" arg then
-            loop dir mem ("--cooperate-dir" :: String.extract (arg, size "--cooperate-dir=", NONE) :: xs)
+            loop dir mem charge ("--cooperate-dir" :: String.extract (arg, size "--cooperate-dir=", NONE) :: xs)
           else if String.isPrefix "--machine-max-mem=" arg then
-            loop dir (SOME (positive_int "--machine-max-mem" (String.extract (arg, size "--machine-max-mem=", NONE)))) xs
+            loop dir (SOME (positive_int "--machine-max-mem" (String.extract (arg, size "--machine-max-mem=", NONE)))) charge xs
+          else if String.isPrefix "--child-charge=" arg then
+            loop dir mem (SOME (positive_int "--child-charge" (String.extract (arg, size "--child-charge=", NONE)))) xs
           else
-            let val (dir', mem', rest) = loop dir mem xs in (dir', mem', arg :: rest) end
+            let val (dir', mem', charge', rest) = loop dir mem charge xs in (dir', mem', charge', arg :: rest) end
   in
-    loop NONE NONE args
+    loop NONE NONE NONE args
   end
 
-fun configure_cooperation dir budget_mb maxheap =
+fun configure_cooperation dir budget_mb charge_mb maxheap =
   let
     val dir =
       case dir of
@@ -756,11 +821,28 @@ fun configure_cooperation dir budget_mb maxheap =
                  SOME "" => NONE
                | env => env)
   in
-    case (dir, budget_mb, maxheap) of
-        (SOME dir, _, SOME mb) => HolbuildMachineMemory.configure {dir = dir, budget_mb = budget_mb, maxheap = mb}
-      | (SOME _, _, NONE) => raise Error "--cooperate-dir requires --max-heap MB, which sizes each child's reservation"
+    case (dir, budget_mb, charge_mb) of
+        (SOME dir, _, _) =>
+          let
+            val default = HolbuildMachineMemory.default_charge_mb
+            (* The flat default leans on the MemAvailable check; without it a
+               child is charged all it may reach, as before that check. *)
+            fun default_charge () =
+              if HolbuildMachineMemory.has_mem_available () then
+                Int.min (Option.getOpt (maxheap, default), default)
+              else
+                case maxheap of
+                    SOME mb => mb + 1024
+                  | NONE => raise Error ("--cooperate-dir requires --max-heap MB or --child-charge MB " ^
+                                         "where MemAvailable cannot be read")
+          in
+            HolbuildMachineMemory.configure
+              {dir = dir, budget_mb = budget_mb,
+               charge_mb = case charge_mb of SOME mb => mb | NONE => default_charge ()}
+          end
       | (NONE, SOME _, _) => raise Error "--machine-max-mem requires --cooperate-dir DIR"
-      | (NONE, NONE, _) => ()
+      | (NONE, NONE, SOME _) => raise Error "--child-charge requires --cooperate-dir DIR"
+      | (NONE, NONE, NONE) => ()
   end
 
 fun with_input path f =
@@ -857,12 +939,12 @@ fun prepare_source_index phase_prefix resolution project =
     val graph = timed_phase (phase_prefix ^ ".graph.resolve")
                   (fn () => HolbuildProjectGraph.resolve
                     {project = project, resolution = resolution})
-    val _ = timed_phase (phase_prefix ^ ".policies.prevalidate")
-              (fn () => HolbuildSourceIndex.prevalidate_graph graph)
+    val scans = timed_phase (phase_prefix ^ ".policies.prevalidate")
+                  (fn () => HolbuildSourceIndex.prevalidate_graph graph)
     val preparation = timed_phase (phase_prefix ^ ".generators.prepare")
                         (fn () => HolbuildPackagePrepare.prepare graph)
     val discovery = timed_phase (phase_prefix ^ ".inventory.construct")
-                      (fn () => HolbuildSourceIndex.discover_prepared_with_inventories preparation)
+                      (fn () => HolbuildSourceIndex.discover_prepared_with_inventories scans preparation)
     val components = timed_phase (phase_prefix ^ ".components.load")
                        (fn () => HolbuildComponentProvider.load
                          HolbuildComponentProvider.LiveProvider
@@ -882,7 +964,14 @@ fun build_generated_source_owners build components holdir index plan =
       [] => false
     | owners => (build (HolbuildBuildPlan.plan_targets components holdir index owners); true)
 
-fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, proof_steps, new_ir, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy}, targets) =
+(* What a planned build does: build its targets, or export their uncached
+   theories for remote execution. *)
+datatype build_mode =
+    BuildTargets
+  | ExportActionSpecs of {upload : bool}
+  | RemoteExec of {url : string, remote_only : bool, detach : bool, attach : string option}
+
+fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, proof_steps, new_ir, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy}, targets) =
   let
     val project =
       case prepared of
@@ -902,6 +991,7 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
       else (skip_checkpoints, proof_steps, new_ir)
     val _ = HolbuildStatus.set_retain_debug_artifacts retain_debug_artifacts
     val jobs = if repl_on_failure then 1 else effective_jobs project cli_jobs
+    val _ = HolbuildDependencies.set_analyser_jobs jobs
     val _ =
       if HolbuildStatus.json_mode () andalso dry_run then
         raise Error "--json does not support build --dry-run yet"
@@ -971,7 +1061,8 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
        repl_on_failure = repl_on_failure,
        emit_output_hashes = emit_output_hashes,
        allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy,
-       trknl = trknl}
+       trknl = trknl,
+       restore_only = (case mode of RemoteExec {remote_only, ...} => remote_only | _ => false)}
     fun prepared_sources () =
       case prepared of
           SOME {index, components, ...} => {index = index, components = components}
@@ -1022,15 +1113,90 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
           execute (prepare_plan (prepare_source_index "build" resolution project))
         else execute planned
       end
+    fun export_action_specs upload () =
+      let val (index, force_targets, entry_plan, plan, toolchain_key) = prepare_plan (prepared_sources ())
+          val build_options = build_options_for index entry_plan plan force_targets
+      in
+        timed_phase "action_spec.export"
+          (fn () => print (HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key upload))
+      end
+    (* Theories the remote cache lacks go to the coordinator as a batch; once
+       it finishes, the ordinary build restores them from the remote cache. *)
+    fun remote_build {url, remote_only, detach, attach} =
+      let
+        val _ =
+          if Option.isSome (HolbuildRemoteCacheConfig.url ()) then ()
+          else raise Error "--remote-exec needs a remote cache: pass --remote-cache URL"
+        val (index, force_targets, entry_plan, plan, toolchain_key) = prepare_plan (prepared_sources ())
+        val build_options = build_options_for index entry_plan plan force_targets
+        fun export upload =
+          timed_phase "action_spec.export"
+            (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key upload)
+        fun has_actions batch = List.exists (String.isPrefix "action ") (String.tokens (fn c => c = #"\n") batch)
+        fun build_locally () =
+          timed_phase "build.execute"
+            (fn () => HolbuildBuildExec.build build_options tc project plan toolchain_key jobs)
+        (* Under --remote-only the build options only restore (restore_only);
+           a detached build has nothing to fall back to. *)
+        fun fall_back reason =
+          if remote_only orelse detach then raise Error ("remote execution: " ^ reason)
+          else (HolbuildBuildExec.warn ("remote execution: " ^ reason ^ "; building locally");
+                build_locally ())
+        fun finish batch_id =
+          case HolbuildRemoteExec.follow url batch_id of
+              HolbuildRemoteExec.Done => build_locally ()
+            | HolbuildRemoteExec.Failed reason => fall_back ("batch " ^ batch_id ^ " " ^ reason)
+            | HolbuildRemoteExec.Unreachable reason =>
+                fall_back (reason ^ "; reattach with --attach " ^ batch_id)
+        fun submit batch =
+          if not (has_actions batch) then build_locally ()
+          else
+            case HolbuildRemoteExec.submit url batch of
+                HolbuildRemoteExec.Refused reason => fall_back reason
+              | HolbuildRemoteExec.Ok batch_id =>
+                  (HolbuildStatus.message_stderr ("holbuild: remote batch " ^ batch_id ^ "\n");
+                   if detach then () else finish batch_id)
+      in
+        case attach of
+            SOME batch_id => finish batch_id
+          | NONE =>
+              (case HolbuildRemoteExec.Ok (export true)
+                    handle HolbuildBuildExec.Error reason => HolbuildRemoteExec.Refused reason of
+                   HolbuildRemoteExec.Ok batch => submit batch
+                 | HolbuildRemoteExec.Refused reason => fall_back reason)
+      end
     fun run_with_stat_cache f =
       (f (); finish_stat_cache stat_cache)
       handle e => (finish_stat_cache stat_cache; raise e)
   in
-    if dry_run then run_with_stat_cache describe_dry_run
-    else HolbuildBuildExec.with_project_lock project "build" (fn () => run_with_stat_cache execute_build)
+    case mode of
+        ExportActionSpecs {upload} =>
+          HolbuildBuildExec.with_project_lock project "action-spec"
+            (fn () => run_with_stat_cache (export_action_specs upload))
+      | BuildTargets =>
+          if dry_run then run_with_stat_cache describe_dry_run
+          else HolbuildBuildExec.with_project_lock project "build" (fn () => run_with_stat_cache execute_build)
+      | RemoteExec remote =>
+          HolbuildBuildExec.with_project_lock project "build"
+            (fn () => run_with_stat_cache (fn () => remote_build remote))
   end
 
+fun build_once_with_prepared tc = build_once_with_prepared_mode BuildTargets tc
+
 fun build_once tc cli_jobs parsed = build_once_with_prepared tc cli_jobs NONE parsed
+
+fun action_spec_command tc cli_jobs args =
+  let
+    val upload = List.exists (fn arg => arg = "--upload") args
+    val parsed as ({dry_run, watch, trace_steps, repl_on_failure, execution_plan, ...}, _) =
+      split_flags (List.filter (fn arg => arg <> "--upload") args)
+    val _ =
+      if dry_run orelse watch orelse trace_steps orelse repl_on_failure orelse Option.isSome execution_plan then
+        raise Error "action-spec does not run builds: remove --dry-run, --watch, --trace-steps and --repl-on-failure"
+      else ()
+  in
+    build_once_with_prepared_mode (ExportActionSpecs {upload = upload}) tc cli_jobs NONE parsed
+  end
 
 fun build_iteration_error_message exn =
   case exn of
@@ -1102,9 +1268,31 @@ fun build_watch tc cli_jobs parsed =
     loop NONE
   end
 
+(* Takes build's remote-execution options out of its arguments. *)
+fun split_remote_exec_flags args =
+  let
+    fun loop (url, remote_only, detach, attach) acc xs =
+      case xs of
+          [] => ({url = url, remote_only = remote_only, detach = detach, attach = attach}, rev acc)
+        | "--remote-exec" :: value :: rest =>
+            if String.isPrefix "-" value then raise Error "--remote-exec requires URL"
+            else loop (SOME value, remote_only, detach, attach) acc rest
+        | ["--remote-exec"] => raise Error "--remote-exec requires URL"
+        | "--remote-only" :: rest => loop (url, true, detach, attach) acc rest
+        | "--detach" :: rest => loop (url, remote_only, true, attach) acc rest
+        | "--attach" :: value :: rest =>
+            if String.isPrefix "-" value then raise Error "--attach requires BATCH-ID"
+            else loop (url, remote_only, detach, SOME value) acc rest
+        | ["--attach"] => raise Error "--attach requires BATCH-ID"
+        | x :: rest => loop (url, remote_only, detach, attach) (x :: acc) rest
+  in
+    loop (NONE, false, false, NONE) [] args
+  end
+
 fun build tc cli_jobs args =
   let
-    val parsed as ({dry_run, watch, repl_on_failure, ...}, _) = split_flags args
+    val ({url, remote_only, detach, attach}, args) = split_remote_exec_flags args
+    val parsed as ({dry_run, watch, repl_on_failure, trace_steps, execution_plan, ...}, _) = split_flags args
     val _ =
       if watch andalso HolbuildStatus.json_mode () then
         raise Error "--json does not support build --watch yet"
@@ -1112,10 +1300,25 @@ fun build tc cli_jobs args =
         raise Error "--watch does not support --dry-run"
       else if watch andalso repl_on_failure then
         raise Error "--watch does not support --repl-on-failure"
+      else if not (Option.isSome url) andalso (remote_only orelse detach orelse Option.isSome attach) then
+        raise Error "--remote-only, --detach and --attach need --remote-exec URL"
+      else if Option.isSome url andalso
+              (watch orelse dry_run orelse trace_steps orelse repl_on_failure orelse Option.isSome execution_plan) then
+        raise Error "--remote-exec does not support --watch, --dry-run, --trace-steps, --execution-plan or --repl-on-failure"
+      else if Option.isSome url andalso HolbuildStatus.json_mode () then
+        raise Error "--json does not support --remote-exec yet"
+      else if detach andalso Option.isSome attach then
+        raise Error "--detach and --attach exclude each other"
       else ()
   in
-    if watch then build_watch tc cli_jobs parsed
-    else build_once tc cli_jobs parsed
+    case url of
+        SOME url =>
+          build_once_with_prepared_mode
+            (RemoteExec {url = url, remote_only = remote_only, detach = detach, attach = attach})
+            tc cli_jobs NONE parsed
+      | NONE =>
+          if watch then build_watch tc cli_jobs parsed
+          else build_once tc cli_jobs parsed
   end
 
 fun chomp text =
@@ -1229,7 +1432,8 @@ fun export_build_options trknl project index entry_plan plan =
      repl_on_failure = false,
      emit_output_hashes = false,
      allow_cache_timeout_discrepancy = false,
-     trknl = trknl}
+     trknl = trknl,
+     restore_only = false}
   end
 
 (* Heaps and executables build their ancestors plain: proof steps and their
@@ -1249,7 +1453,8 @@ fun heap_build_options trknl =
    repl_on_failure = false,
    emit_output_hashes = false,
    allow_cache_timeout_discrepancy = false,
-   trknl = trknl}
+   trknl = trknl,
+   restore_only = false}
 
 fun theory_node node =
   #kind (HolbuildBuildPlan.source_of node) = HolbuildSourceIndex.TheoryScript
@@ -1484,6 +1689,7 @@ fun build_heap_kind tc cli_jobs command target =
   let
     val project = timed_phase "project.discover" load_project
     val jobs = effective_jobs project cli_jobs
+    val _ = HolbuildDependencies.set_analyser_jobs jobs
     fun execute_heap () =
       let
         val HolbuildProject.Heap {output, objects, kind, ...} = heap_named project command target
@@ -1698,6 +1904,7 @@ fun dispatch tc jobs args =
     | "run" :: rest => (reject_json "run"; run_hol tc jobs "run" rest)
     | "repl" :: rest => (reject_json "repl"; repl_hol tc jobs rest)
     | "export" :: rest => (reject_json "export"; export_archive tc jobs rest)
+    | "action-spec" :: rest => (reject_json "action-spec"; action_spec_command tc jobs rest)
     | "import" :: rest => (reject_json "import"; import_archive rest)
     | cmd :: _ =>
         if known_command cmd then raise Error ("unknown command: " ^ cmd)
@@ -1768,31 +1975,31 @@ fun reject_holdir holdir =
       SOME _ => raise Error "--holdir is no longer supported; declare dependencies.hol"
     | NONE => ()
 
-fun project_hol_holdir kernel_variant project =
+fun project_hol_holdir kernel_variant jobs project =
   let val resolution = {kernel_variant = kernel_variant}
   in
     (ignore (HolbuildProjectGraph.resolve {project = project, resolution = resolution});
      case HolbuildProject.resolved_hol_dependency_with resolution project of
          SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev}, ...}) =>
-           HolbuildHolSharedCache.ensure_built_with_kernel
+           HolbuildHolSharedCache.ensure_built_with_kernel jobs
              {git = git, rev = rev, kernel_variant = kernel_variant}
        | _ => raise Error "schema 2 project has no dependencies.hol")
   end
 
-fun effective_toolchain_for kernel_variant holdir maxheap =
+fun effective_toolchain_for kernel_variant holdir maxheap jobs =
   let
     val project = load_project ()
     val _ = reject_holdir holdir
   in
-    {holdir = project_hol_holdir kernel_variant project, maxheap = maxheap,
+    {holdir = project_hol_holdir kernel_variant jobs project, maxheap = maxheap,
      kernel_variant = kernel_variant}
   end
 
-fun effective_toolchain holdir maxheap =
-  effective_toolchain_for HolbuildHolToolchainConfig.StandardKernel holdir maxheap
+fun effective_toolchain holdir maxheap jobs =
+  effective_toolchain_for HolbuildHolToolchainConfig.StandardKernel holdir maxheap jobs
 
-fun tracing_toolchain holdir maxheap =
-  effective_toolchain_for HolbuildHolToolchainConfig.TracingKernel holdir maxheap
+fun tracing_toolchain holdir maxheap jobs =
+  effective_toolchain_for HolbuildHolToolchainConfig.TracingKernel holdir maxheap jobs
 
 fun context_toolchain_for kernel_variant holdir maxheap =
   let
@@ -1814,14 +2021,76 @@ fun parse_buildhol_args args =
     | ["--trknl"] => HolbuildHolToolchainConfig.TracingKernel
     | _ => raise Error "usage: holbuild buildhol [--trknl]"
 
-fun buildhol holdir maxheap args =
+fun buildhol holdir maxheap jobs args =
   let
     val kernel_variant = parse_buildhol_args args
     val project = load_project ()
     val _ = reject_holdir holdir
-    val holdir = project_hol_holdir kernel_variant project
+    val holdir = project_hol_holdir kernel_variant jobs project
   in
     print (holdir ^ "\n")
+  end
+
+fun exec_action_command maxheap jobs args =
+  let
+    fun gb label text =
+      case Int.fromString text of
+          SOME n => if n >= 0 then IntInf.fromInt n * 1073741824
+                    else raise Error (label ^ " must be a non-negative integer")
+        | NONE => raise Error (label ^ " must be a non-negative integer")
+    fun parse (opts as {spec, result, limit, reserve, share}) rest =
+      case rest of
+          [] => opts
+        | "--result" :: file :: xs => parse {spec = spec, result = SOME file, limit = limit, reserve = reserve, share = share} xs
+        | "--cache-limit-gb" :: n :: xs =>
+            parse {spec = spec, result = result, limit = SOME (gb "--cache-limit-gb" n), reserve = reserve, share = share} xs
+        | "--cache-reserve-gb" :: n :: xs =>
+            parse {spec = spec, result = result, limit = limit, reserve = SOME (gb "--cache-reserve-gb" n), share = share} xs
+        | "--share-heaps" :: xs => parse {spec = spec, result = result, limit = limit, reserve = reserve, share = true} xs
+        | ["--result"] => raise Error "--result requires FILE"
+        | ["--cache-limit-gb"] => raise Error "--cache-limit-gb requires N"
+        | ["--cache-reserve-gb"] => raise Error "--cache-reserve-gb requires N"
+        | arg :: xs =>
+            if String.isPrefix "-" arg then raise Error ("unknown exec-action option: " ^ arg)
+            else
+              case spec of
+                  NONE => parse {spec = SOME arg, result = result, limit = limit, reserve = reserve, share = share} xs
+                | SOME _ => raise Error "exec-action takes one SPEC-SHA256"
+    val {spec, result, limit, reserve, share} =
+      parse {spec = NONE, result = NONE, limit = NONE, reserve = NONE, share = false} args
+    val spec = case spec of SOME s => s | NONE => raise Error "exec-action requires SPEC-SHA256"
+    val cache_cap =
+      case limit of
+          SOME limit => {limit_bytes = limit, reserve_bytes = Option.getOpt (reserve, limit div 10)}
+        | NONE => raise Error "exec-action requires --cache-limit-gb N"
+    fun toolchain {git, rev, kernel = _} =
+      let
+        (* Every worker must run the published archive's bytes, so a build
+           whose own publish lost is replaced by the stored archive. *)
+        val _ = HolbuildHolSharedCache.adopt_published_archive := true
+        val kernel_variant = HolbuildHolToolchainConfig.StandardKernel
+        val holdir = HolbuildHolSharedCache.ensure_built_with_kernel jobs
+                       {git = git, rev = rev, kernel_variant = kernel_variant}
+        val tc = {holdir = holdir, maxheap = maxheap, kernel_variant = kernel_variant}
+      in
+        configure_analyser_for_toolchain tc; tc
+      end
+    (* An error outside the action itself (no remote cache, the action lock,
+       writing the record) is an infrastructure failure, never a final one. *)
+    val code =
+      (HolbuildRemoteCacheConfig.setup_client ();
+       HolbuildBuildExec.exec_action
+         {spec_sha256 = spec, result_file = result, cache_cap = cache_cap, share_heaps = share,
+          toolchain = toolchain})
+      handle e =>
+        (HolbuildStatus.message_stderr
+           ("holbuild: exec-action failed: " ^
+            Option.getOpt (build_iteration_error_message e, General.exnMessage e) ^ "\n");
+         3)
+  in
+    TextIO.flushOut TextIO.stdOut;
+    TextIO.flushOut TextIO.stdErr;
+    Posix.Process.exit (Word8.fromInt code)
   end
 
 fun removed_legacy_proof_step_build_arg arg =
@@ -1839,30 +2108,35 @@ fun dispatch_with_options {holdir, source_dir, cache_dir, remote_cache, jobs, ma
    Option.app HolbuildRemoteCacheConfig.set_prefetch_concurrency prefetch_concurrency;
    if args = ["--help"] orelse args = ["-h"] then global_help ()
    else if maybe_handle_command_help args then () else
+   (* A build, explicit or implicit, under --remote-only must not build HOL. *)
+   (HolbuildHolSharedCache.restore_only := List.exists (fn arg => arg = "--remote-only") args;
    case args of
        "gc" :: rest => (reject_json "gc"; gc rest)
      | "cache" :: rest => (reject_json "cache"; HolbuildCache.dispatch rest)
      | "import" :: rest => (reject_json "import"; import_archive rest)
-     | "buildhol" :: rest => buildhol holdir maxheap rest
+     | "buildhol" :: rest => buildhol holdir maxheap jobs rest
+     | "exec-action" :: rest =>
+         (reject_json "exec-action"; reject_holdir holdir;
+          exec_action_command maxheap jobs rest)
      | "goalfrag-plan" :: _ => raise Error "goalfrag-plan has been removed; use execution-plan THEORY:THEOREM"
-     | [] => dispatch (effective_toolchain holdir maxheap) jobs args
+     | [] => dispatch (effective_toolchain holdir maxheap jobs) jobs args
      | "build" :: rest =>
          if List.exists removed_legacy_proof_step_build_arg rest then
            (case List.find removed_legacy_proof_step_build_arg rest of
                 SOME "--goalfrag" => raise Error "--goalfrag has been removed; proof steps are enabled by default"
               | SOME _ => raise Error "--goalfrag-plan has been removed; use execution-plan THEORY:THEOREM"
-              | NONE => dispatch (effective_toolchain holdir maxheap) jobs args)
+              | NONE => dispatch (effective_toolchain holdir maxheap jobs) jobs args)
          else if json andalso List.exists trace_steps_build_arg rest then
            raise Error "--json does not support --trace-steps until structured proof-step trace events exist"
          else if List.exists (fn arg => arg = "--trknl") rest then
-           dispatch (tracing_toolchain holdir maxheap) jobs args
-         else dispatch (effective_toolchain holdir maxheap) jobs args
+           dispatch (tracing_toolchain holdir maxheap jobs) jobs args
+         else dispatch (effective_toolchain holdir maxheap jobs) jobs args
      | "context" :: rest =>
          dispatch (context_toolchain_for (parse_context_args rest) holdir maxheap) jobs args
      | _ =>
          if List.exists (fn arg => arg = "--trknl") args then
-           dispatch (tracing_toolchain holdir maxheap) jobs args
-         else dispatch (effective_toolchain holdir maxheap) jobs args)
+           dispatch (tracing_toolchain holdir maxheap jobs) jobs args
+         else dispatch (effective_toolchain holdir maxheap jobs) jobs args))
 
 fun is_broken_pipe (IO.Io {cause = OS.SysErr (msg, _), ...}) = msg = "Broken pipe"
   | is_broken_pipe _ = false
@@ -1877,36 +2151,60 @@ fun install_signal_handlers () =
   end
 
 (* The process's own command line, without argv[0], or [] where /proc is
-   unavailable. *)
+   unavailable. Each argument ends in a NUL, so the last field is empty. *)
 fun process_arguments () =
   (case String.fields (fn c => c = #"\000") (with_input "/proc/self/cmdline" TextIO.inputAll) of
        [] => []
-     | _ :: args => args)
+     | _ :: args => (case rev args of "" :: rest => rev rest | _ => args))
   handle IO.Io _ => []
 
-(* The Poly/ML runtime removes --maxheap from the command line before
-   CommandLine.arguments, so holbuild can only see it in the process's own
-   arguments, and only where /proc exists. *)
-fun reject_runtime_maxheap () =
-  if List.exists (String.isPrefix "--maxheap") (process_arguments ()) then
-    raise Error "--maxheap is consumed by holbuild's Poly/ML runtime and does not reach child HOL processes; use --max-heap MB"
-  else ()
+(* The Poly/ML runtime removes its own options (--maxheap, --gcthreads, -H,
+   ...) and their values from the command line before CommandLine.arguments,
+   so they set holbuild's own runtime and never reach HOL. The process's own
+   arguments, readable where /proc exists, still hold them: those that
+   CommandLine.arguments lacks and that start with "-", as every runtime
+   option does, are such options. Others (an option's value; the program
+   path, when a dynamic loader started holbuild) are skipped. *)
+fun runtime_options args =
+  let
+    fun consumed [] _ = []
+      | consumed (x :: xs) (y :: ys) = if x = y then consumed xs ys else missing x xs (y :: ys)
+      | consumed (x :: xs) [] = missing x xs []
+    and missing x xs ys = if String.isPrefix "-" x then x :: consumed xs ys else consumed xs ys
+  in
+    consumed (process_arguments ()) args
+  end
+
+(* --maxheap would cap holbuild's own heap, never HOL's, so it is always an
+   error. Other runtime options may tune holbuild's own runtime on purpose,
+   except with run and repl, whose extra arguments are meant for HOL. *)
+fun reject_runtime_options options args =
+  let
+    val consumed = " is consumed by holbuild's Poly/ML runtime and does not reach child HOL processes"
+  in
+    case (List.find (String.isPrefix "--maxheap") options, options, args) of
+        (SOME arg, _, _) => raise Error (arg ^ consumed ^ "; use --max-heap MB")
+      | (NONE, arg :: _, command :: _) =>
+          if command = "run" orelse command = "repl" then raise Error (arg ^ consumed) else ()
+      | _ => ()
+  end
 
 fun main raw_args =
   (let
      val _ = install_signal_handlers ()
      val _ = HolbuildStatus.set_json_mode (List.exists (fn s => s = "--json") raw_args)
-     val _ = reject_runtime_maxheap ()
+     val runtime_options = runtime_options raw_args
      val _ =
        if raw_args = ["--version"] then
          (print ("holbuild " ^ HolbuildVersion.version ^ "\n"); OS.Process.exit OS.Process.success)
        else if raw_args = ["--help"] orelse raw_args = ["-h"]
        then (global_help (); OS.Process.exit OS.Process.success)
        else ()
-     val (cooperate_dir, machine_max_mem, raw_args) = parse_cooperation_options raw_args
+     val (cooperate_dir, machine_max_mem, child_charge, raw_args) = parse_cooperation_options raw_args
      val (options, args) = parse_global_options raw_args
+     val _ = reject_runtime_options runtime_options args
    in
-     configure_cooperation cooperate_dir machine_max_mem (#maxheap options);
+     configure_cooperation cooperate_dir machine_max_mem child_charge (#maxheap options);
      dispatch_with_options options args
    end)
   handle Thread.Interrupt => (HolbuildToolchain.cleanup_active_children (); err "interrupted")

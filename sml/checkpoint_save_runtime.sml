@@ -41,7 +41,12 @@ fun write_text_atomically path text =
    therefore be created at its final path, not at a temporary path that is later
    renamed. Replacement intentionally drops old metadata before writing the new
    save: an interrupted save may lose this checkpoint, but validation will not
-   pair stale metadata with partial save bytes. *)
+   pair stale metadata with partial save bytes.
+
+   Removing the old file before saveChild writes is also a contract that
+   exec-action --share-heaps relies on: an action's checkpoint tree holds hard
+   links to the host's shared store, and a save that wrote into an existing
+   file would rewrite the store's copy, and every other action's. *)
 fun begin_replacement path =
   (remove_file (ok_tmp_path path);
    remove_file (ok_path path);
