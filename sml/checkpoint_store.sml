@@ -77,22 +77,28 @@ fun metadata_matches_fields fields text =
     List.all (fn (key, value) => metadata_value key lines = SOME value) fields
   end
 
+fun current_matches path metadata_matches =
+  file_exists path andalso
+  (case current_metadata (ok_path path) of
+       SOME text => metadata_matches text
+     | NONE => false)
+
 fun checkpoint_matches warn path metadata_matches =
-  let
-    fun current_matches () =
-      file_exists path andalso
-      (case current_metadata (ok_path path) of
-           SOME text => metadata_matches text
-         | NONE => false)
-  in
-    remove_incomplete_residue warn path;
-    current_matches ()
-  end
+  (remove_incomplete_residue warn path;
+   current_matches path metadata_matches)
 
 fun ok_text_matches warn path expected_text =
   checkpoint_matches warn path (fn text => text = expected_text)
 
 fun ok_matches warn path fields =
   checkpoint_matches warn path (metadata_matches_fields fields)
+
+(* Read-only counterparts for callers that hold no project lock: incomplete
+   residue belongs to a build that may still be running, so leave it alone. *)
+fun ok_text_current path expected_text =
+  current_matches path (fn text => text = expected_text)
+
+fun ok_current path fields =
+  current_matches path (metadata_matches_fields fields)
 
 end
