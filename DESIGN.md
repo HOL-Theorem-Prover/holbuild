@@ -675,9 +675,9 @@ proof steps: tactic timeouts are a `build` check, and a timeout-free request can
 reuse any cached theory, including those built with `--skip-proof-steps`.
 
 Heaps requested by users remain project-local exported artifacts. Checkpoints are
-transient build/debug state. Normal successful theory builds may create them
-while running, but remove them after logical artifacts and metadata are written.
-Raw checkpoint bytes are never the semantic identity; they are local replay/debug
+local build/debug state, not exported artifacts. Successful theory builds keep
+reusable checkpoints until they are replaced or
+evicted, so later builds and `run --from` can start from them. Raw checkpoint bytes are never the semantic identity; they are local replay/debug
 breadcrumbs for an already-resolved graph, not retained outputs.
 
 `holbuild` should not use `hol buildheap` as the normal incremental-build
@@ -832,6 +832,15 @@ opts out of theorem instrumentation: with checkpoints still enabled, the build c
 still save and consult `deps_loaded`, but there are no
 theorem-context/end-of-proof/failed-prefix proof-navigation checkpoints and no
 tactic timeout enforcement for that build.
+`holbuild run --from THEORY` and `repl --from THEORY` start interactive sessions
+from THEORY's `deps_loaded` while it is current, and load THEORY on top when its
+metadata matches its current input key. `run` takes no project lock, so `--from`
+only reads ok-files and metadata; a concurrent build, `gc`, or eviction that
+removes the chosen checkpoint first makes the session fail to start rather than
+start from a wrong state. Without `--from`, sessions given `.sml` scripts take
+THEORY from the scripts' dependencies, found by the same `load`-call and Holdep
+analysis as build sources: of the root-package theories they reach, the one
+with the most ancestors.
 
 Current HOL versions also generate per-theory HTML documentation during
 `export_theory()` by default. Holbuild disables both historical spellings of that

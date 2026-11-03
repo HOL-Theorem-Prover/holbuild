@@ -327,12 +327,21 @@ fun write_plain_preload load_lines path =
    critical export path.  Keep this policy in its own first-loaded file: unlike
    the regular preload, it must also run when a child resumes from any saved
    checkpoint.  The trace was renamed in HOL, so tolerate either spelling. *)
+val child_policy_traces = ["TheoryPP.include_docs", "TheoryPP.include_html_docs"]
+
 fun write_child_policy path =
   write_text path
-    (String.concatWith "\n"
-       ["val _ = (Feedback.set_trace \"TheoryPP.include_docs\" 0 handle _ => ());",
-        "val _ = (Feedback.set_trace \"TheoryPP.include_html_docs\" 0 handle _ => ());"] ^
-     "\n")
+    (String.concat
+       (map (fn trace => "val _ = (Feedback.set_trace " ^ HolbuildToolchain.sml_string trace ^
+                         " 0 handle _ => ());\n")
+            child_policy_traces))
+
+(* Checkpoints are saved with the child policy in effect.  A `run --from`
+   session loads these lines so it exports theories as a plain run does. *)
+val child_policy_reset_lines =
+  map (fn trace => "val _ = (Feedback.reset_trace " ^ HolbuildToolchain.sml_string trace ^
+                   " handle _ => ());")
+      child_policy_traces
 
 fun generated_metadata_report_lines {parents_report, mldeps_report} =
   let
@@ -718,12 +727,15 @@ fun remove_theorem_checkpoints_for_deps base deps_key =
 fun remove_declaration_checkpoints_for_deps base deps_key =
   remove_tree (declaration_checkpoints_for_deps_root base deps_key)
 
-fun remove_deps_checkpoint_family base deps_key deps_loaded =
-  (* Delete source-context descendants before deleting/replacing the deps parent.
-     A deps heap path is stable for a deps_key, so surviving descendants must
-     never outlive deletion of that parent path. *)
+(* Delete these before deleting or replacing the deps parent.  A deps heap path
+   is stable for a deps_key, so surviving descendants must never outlive
+   deletion of that parent path. *)
+fun remove_deps_checkpoint_descendants base deps_key =
   (remove_theorem_checkpoints_for_deps base deps_key;
-   remove_declaration_checkpoints_for_deps base deps_key;
+   remove_declaration_checkpoints_for_deps base deps_key)
+
+fun remove_deps_checkpoint_family base deps_key deps_loaded =
+  (remove_deps_checkpoint_descendants base deps_key;
    remove_checkpoint deps_loaded)
 
 fun remove_checkpoint_family base =
@@ -2912,8 +2924,7 @@ fun write_theory_script policy root checkpoint_root base_context (action : theor
          deps_loaded_resume_message logical;
          {context = HolState deps_loaded, files = [staged_script], failure_checkpoints = [deps_loaded], failed_prefix_context = NONE})
       fun run_from_fresh_preload () =
-        (remove_theorem_checkpoints_for_deps base deps_key;
-         remove_declaration_checkpoints_for_deps base deps_key;
+        (remove_deps_checkpoint_descendants base deps_key;
          ensure_source_checkpoint_parents ();
          write_preload load_lines deps_loaded deps_ok preload;
          write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
@@ -3688,6 +3699,59 @@ fun build_config_lines_for_node options project node =
       HolbuildSourceIndex.TheoryScript => policy_config_lines (checkpoint_policy_for_node options project node)
     | HolbuildSourceIndex.Sml => policy_config_lines no_checkpoint_policy
     | HolbuildSourceIndex.Sig => policy_config_lines no_checkpoint_policy
+
+(* The saved HOL state `run --from` starts from, or why there is none.
+   deps_loaded has THEORY's ancestors loaded; LOAD is THEORY's generated module
+   when its built outputs are for its current source, so the session loads it
+   on top. *)
+datatype run_from_state =
+  DepsLoadedState of {path : string, load : string option}
+| NoRunFromState of string
+
+(* Checkpoints are current only for the keys a build of NODE would use now.
+   Run holds no project lock, so this only reads checkpoint files; a build, gc
+   or eviction that removes the chosen checkpoint before HOL loads it makes
+   the run fail rather than start from a wrong state. *)
+fun run_from_state tc project plan keys node =
+  let
+    val name = logical_name node
+    val deps_key = dependency_context_key (HolbuildToolchain.toolchain_key tc) plan keys node
+    val base = checkpoint_base project node
+    fun deps_loaded_current dir =
+      HolbuildCheckpointStore.ok_current (Path.concat(dir, "deps_loaded.save"))
+        [("kind", "deps_loaded"), ("deps_key", Path.file dir)]
+    val deps_dir = Path.concat(deps_checkpoint_root base, deps_key)
+    fun theory_built () =
+      case current_metadata (metadata_path project node) of
+          SOME text => metadata_input_key_matches (HolbuildBuildPlan.input_key_for keys node) text
+        | NONE => false
+    fun deps_changed () =
+      List.exists (fn dir => dir <> deps_dir andalso deps_loaded_current dir)
+        (children (deps_checkpoint_root base))
+    (* Generated files live under HOL's .hol/objs/; load takes the stem
+       beside it, as for the theory's other users. *)
+    fun theory_stem () =
+      let
+        val {dir, file} = Path.splitDirFile (#sml_path (generated_outputs node))
+        val objs_parent = Path.dir dir
+        val dir = if Path.file dir = "objs" andalso Path.file objs_parent = ".hol"
+                  then Path.dir objs_parent else dir
+      in Path.concat(dir, drop_suffix ".sml" file) end
+  in
+    if not (root_package_node project node) then
+      NoRunFromState (name ^ " is in dependency package " ^ package node ^
+                      "; holbuild keeps checkpoints only for root-package theories")
+    else if deps_loaded_current deps_dir then
+      DepsLoadedState {path = deps_loaded_path base deps_key,
+                       load = if theory_built () then SOME (theory_stem ()) else NONE}
+    else if deps_changed () then
+      NoRunFromState ("the dependencies or HOL toolchain of " ^ name ^
+                      " changed since its checkpoints were saved")
+    else
+      NoRunFromState (name ^ " has no current checkpoint (not built yet, restored from the cache " ^
+                      "without a local build, " ^
+                      "built with --skip-checkpoints, or removed by gc)")
+  end
 
 fun write_temp_text path text =
   let val out = TextIO.openOut path
