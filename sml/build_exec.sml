@@ -336,9 +336,9 @@ fun write_child_policy tc path =
                       (Path.mkAbsolute {path = HolbuildCacheConfig.cache_root (),
                                         relativeTo = FS.getDir ()})
     val configure =
-      "ignore (Meta.configureTheoryModuleCache {directory = " ^
+      "val _ = Meta.configureTheoryModuleCache {directory = " ^
       HolbuildToolchain.sml_string directory ^ ", base_state = " ^
-      HolbuildToolchain.sml_string (HolbuildToolchain.base_state tc) ^ "});"
+      HolbuildToolchain.sml_string (HolbuildToolchain.base_state tc) ^ "};"
     (* Older HOL installations keep their source loader.  Compile the call
        only after checking the optional capability in the live namespace. *)
     val module_cache =
