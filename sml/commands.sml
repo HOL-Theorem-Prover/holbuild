@@ -45,29 +45,34 @@ fun global_help () = print
   \  -j N, -jN, --jobs N\n\
   \  --max-heap MB\n\
   \  --gc-threads N               Poly/ML GC threads for child HOL processes\n\
-  \                               (default: 1 for theory builds, Poly/ML's own\n\
-  \                               default otherwise)\n\
+  \                               (default: 1)\n\
   \  --prefetch-concurrency N\n\
-  \  --cooperate-dir DIR          Share a machine memory budget with other holbuild\n\
-  \                               processes using DIR (or $HOLBUILD_COOPERATE_DIR)\n\
+  \  --cooperate-dir DIR          Share a machine memory and CPU budget with\n\
+  \                               other holbuild processes using DIR (or\n\
+  \                               $HOLBUILD_COOPERATE_DIR)\n\
   \  --machine-max-mem MB         Budget to record in DIR/budget if it is missing\n\
   \                               (default without it: MemTotal less a reserve)\n\
+  \  --machine-max-cpus N         CPU budget to record in DIR/cpus if it is missing\n\
+  \                               (default without it: online processors)\n\
   \  --child-charge MB            Reservation per child (default: --max-heap, at\n\
   \                               most 3072; --max-heap + 1024 without\n\
   \                               MemAvailable)\n\n\
   \With --cooperate-dir, each theory, generator or heap-export child reserves\n\
   \--child-charge, and starts only while all reservations in DIR plus its own fit\n\
-  \the budget, and, while other children hold reservations, MemAvailable less the\n\
-  \charges of children started in the last 30 s covers its charge plus a margin.\n\
+  \the budget, the children in DIR plus itself are no more than the CPU budget,\n\
+  \and, while other children hold reservations, MemAvailable less the charges of\n\
+  \children started in the last 30 s covers its charge plus a margin.\n\
   \The reserve is a quarter of MemTotal, at least 1 GiB and at most 30 GiB; the\n\
   \margin is the reserve, or what the budget leaves out of MemTotal if that is\n\
   \less (at least 1 GiB).\n\
-  \This bounds admission; it does not enforce RSS. HOL toolchain builds, check,\n\
-  \run and repl reserve nothing.\n\
+  \The HOL processes of run and check reserve the same way. This bounds\n\
+  \admission; it does not enforce RSS. HOL toolchain builds and repl reserve\n\
+  \nothing.\n\
   \To set or resize the budget, write DIR/budget (a byte count) while holding\n\
   \DIR/lock:\n\
   \  flock DIR/lock sh -c 'echo BYTES > DIR/budget.new && mv DIR/budget.new DIR/budget'\n\
-  \To return to the default, remove it: flock DIR/lock rm DIR/budget\n\n\
+  \To return to the default, remove it: flock DIR/lock rm DIR/budget\n\
+  \DIR/cpus (a processor count) works the same way.\n\n\
   \Use `holbuild COMMAND --help` for command-specific help.\n"
 
 fun build_help () = print
@@ -775,31 +780,36 @@ fun parse_global_options args =
     loop NONE NONE NONE NONE NONE NONE NONE NONE false HolbuildStatus.Normal args
   end
 
-(* --cooperate-dir, --machine-max-mem and --child-charge, removed from args. *)
+(* --cooperate-dir, --machine-max-mem, --machine-max-cpus and --child-charge,
+   removed from args. *)
 fun parse_cooperation_options args =
   let
-    fun loop dir mem charge [] = (dir, mem, charge, [])
-      | loop _ _ _ ("--cooperate-dir" :: "" :: _) = raise Error "--cooperate-dir requires DIR"
-      | loop _ mem charge ("--cooperate-dir" :: path :: xs) = loop (SOME path) mem charge xs
-      | loop _ _ _ ["--cooperate-dir"] = raise Error "--cooperate-dir requires DIR"
-      | loop dir _ charge ("--machine-max-mem" :: n :: xs) = loop dir (SOME (positive_int "--machine-max-mem" n)) charge xs
-      | loop _ _ _ ["--machine-max-mem"] = raise Error "--machine-max-mem requires MB"
-      | loop dir mem _ ("--child-charge" :: n :: xs) = loop dir mem (SOME (positive_int "--child-charge" n)) xs
-      | loop _ _ _ ["--child-charge"] = raise Error "--child-charge requires MB"
-      | loop dir mem charge (arg :: xs) =
+    fun loop dir mem cpus charge [] = (dir, mem, cpus, charge, [])
+      | loop _ _ _ _ ("--cooperate-dir" :: "" :: _) = raise Error "--cooperate-dir requires DIR"
+      | loop _ mem cpus charge ("--cooperate-dir" :: path :: xs) = loop (SOME path) mem cpus charge xs
+      | loop _ _ _ _ ["--cooperate-dir"] = raise Error "--cooperate-dir requires DIR"
+      | loop dir _ cpus charge ("--machine-max-mem" :: n :: xs) = loop dir (SOME (positive_int "--machine-max-mem" n)) cpus charge xs
+      | loop _ _ _ _ ["--machine-max-mem"] = raise Error "--machine-max-mem requires MB"
+      | loop dir mem _ charge ("--machine-max-cpus" :: n :: xs) = loop dir mem (SOME (positive_int "--machine-max-cpus" n)) charge xs
+      | loop _ _ _ _ ["--machine-max-cpus"] = raise Error "--machine-max-cpus requires N"
+      | loop dir mem cpus _ ("--child-charge" :: n :: xs) = loop dir mem cpus (SOME (positive_int "--child-charge" n)) xs
+      | loop _ _ _ _ ["--child-charge"] = raise Error "--child-charge requires MB"
+      | loop dir mem cpus charge (arg :: xs) =
           if String.isPrefix "--cooperate-dir=" arg then
-            loop dir mem charge ("--cooperate-dir" :: String.extract (arg, size "--cooperate-dir=", NONE) :: xs)
+            loop dir mem cpus charge ("--cooperate-dir" :: String.extract (arg, size "--cooperate-dir=", NONE) :: xs)
           else if String.isPrefix "--machine-max-mem=" arg then
-            loop dir (SOME (positive_int "--machine-max-mem" (String.extract (arg, size "--machine-max-mem=", NONE)))) charge xs
+            loop dir (SOME (positive_int "--machine-max-mem" (String.extract (arg, size "--machine-max-mem=", NONE)))) cpus charge xs
+          else if String.isPrefix "--machine-max-cpus=" arg then
+            loop dir mem (SOME (positive_int "--machine-max-cpus" (String.extract (arg, size "--machine-max-cpus=", NONE)))) charge xs
           else if String.isPrefix "--child-charge=" arg then
-            loop dir mem (SOME (positive_int "--child-charge" (String.extract (arg, size "--child-charge=", NONE)))) xs
+            loop dir mem cpus (SOME (positive_int "--child-charge" (String.extract (arg, size "--child-charge=", NONE)))) xs
           else
-            let val (dir', mem', charge', rest) = loop dir mem charge xs in (dir', mem', charge', arg :: rest) end
+            let val (dir', mem', cpus', charge', rest) = loop dir mem cpus charge xs in (dir', mem', cpus', charge', arg :: rest) end
   in
-    loop NONE NONE NONE args
+    loop NONE NONE NONE NONE args
   end
 
-fun configure_cooperation dir budget_mb charge_mb maxheap =
+fun configure_cooperation dir budget_mb cpus charge_mb maxheap =
   let
     val dir =
       case dir of
@@ -809,8 +819,8 @@ fun configure_cooperation dir budget_mb charge_mb maxheap =
                  SOME "" => NONE
                | env => env)
   in
-    case (dir, budget_mb, charge_mb) of
-        (SOME dir, _, _) =>
+    case (dir, budget_mb, cpus, charge_mb) of
+        (SOME dir, _, _, _) =>
           let
             val default = HolbuildMachineMemory.default_charge_mb
             (* The flat default leans on the MemAvailable check; without it a
@@ -825,12 +835,13 @@ fun configure_cooperation dir budget_mb charge_mb maxheap =
                                          "where MemAvailable cannot be read")
           in
             HolbuildMachineMemory.configure
-              {dir = dir, budget_mb = budget_mb,
+              {dir = dir, budget_mb = budget_mb, cpus = cpus,
                charge_mb = case charge_mb of SOME mb => mb | NONE => default_charge ()}
           end
-      | (NONE, SOME _, _) => raise Error "--machine-max-mem requires --cooperate-dir DIR"
-      | (NONE, NONE, SOME _) => raise Error "--child-charge requires --cooperate-dir DIR"
-      | (NONE, NONE, NONE) => ()
+      | (NONE, SOME _, _, _) => raise Error "--machine-max-mem requires --cooperate-dir DIR"
+      | (NONE, NONE, SOME _, _) => raise Error "--machine-max-cpus requires --cooperate-dir DIR"
+      | (NONE, NONE, NONE, SOME _) => raise Error "--child-charge requires --cooperate-dir DIR"
+      | (NONE, NONE, NONE, NONE) => ()
   end
 
 fun with_input path f =
@@ -1628,7 +1639,7 @@ fun run_hol_with runner tc cli_jobs subcommand user_args =
   else raise Error ("hol " ^ subcommand ^ " failed")
 
 fun run_hol tc cli_jobs subcommand user_args =
-  run_hol_with HolbuildToolchain.run tc cli_jobs subcommand user_args
+  run_hol_with HolbuildToolchain.run_hol tc cli_jobs subcommand user_args
 
 fun repl_hol tc cli_jobs user_args =
   run_hol_with HolbuildToolchain.run_interactive tc cli_jobs "repl" user_args
@@ -1730,7 +1741,7 @@ fun check_selector tc cli_jobs selector =
     fun cleanup () = OS.FileSys.remove script_path handle OS.SysErr _ => ()
     val status =
       (* A run heap may hold an older copy of the theory, which load would keep. *)
-      run_hol_status HolbuildToolchain.run tc cli_jobs false "run" [script_path]
+      run_hol_status HolbuildToolchain.run_hol tc cli_jobs false "run" [script_path]
       handle e => (cleanup (); raise e)
   in
     cleanup ();
@@ -2049,10 +2060,11 @@ fun main raw_args =
        else if raw_args = ["--help"] orelse raw_args = ["-h"]
        then (global_help (); OS.Process.exit OS.Process.success)
        else ()
-     val (cooperate_dir, machine_max_mem, child_charge, raw_args) = parse_cooperation_options raw_args
+     val (cooperate_dir, machine_max_mem, machine_max_cpus, child_charge, raw_args) =
+       parse_cooperation_options raw_args
      val (options, args) = parse_global_options raw_args
    in
-     configure_cooperation cooperate_dir machine_max_mem child_charge (#maxheap options);
+     configure_cooperation cooperate_dir machine_max_mem machine_max_cpus child_charge (#maxheap options);
      dispatch_with_options options args
    end)
   handle Thread.Interrupt => (HolbuildToolchain.cleanup_active_children (); err "interrupted")

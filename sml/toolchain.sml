@@ -20,25 +20,20 @@ fun hol tc = executable tc ["bin", "hol"]
 fun holmake tc = executable tc ["bin", "Holmake"]
 fun base_state tc = executable tc ["bin", "hol.state"]
 
-fun gcthreads_args gcthreads =
-  case gcthreads of
-      NONE => []
-    | SOME n => ["--gcthreads=" ^ Int.toString n]
-
 fun maxheap_args ({maxheap, ...} : t) =
   case maxheap of
       NONE => []
     | SOME n => ["--maxheap", Int.toString n]
 
+(* Holmake confines Poly/ML to one GC thread while playing theory scripts.
+   Every HOL process holbuild starts does the same unless --gc-threads says
+   otherwise: Poly/ML's own default, one GC thread per core, multiplies the
+   runnable threads of a machine running many HOL processes. *)
 fun hol_subcommand_argv (tc : t) subcommand =
-  hol tc :: gcthreads_args (#gcthreads tc) @ maxheap_args tc @ [subcommand]
+  hol tc :: "--gcthreads=" ^ Int.toString (Option.getOpt (#gcthreads tc, 1)) ::
+  maxheap_args tc @ [subcommand]
 
-(* Holmake deliberately confines Poly/ML to one GC thread while playing theory
-   scripts, so theory builds use one unless --gcthreads says otherwise;
-   interactive run/repl keep Poly/ML's default. *)
-fun theory_run_argv (tc : t) =
-  hol tc :: gcthreads_args (SOME (Option.getOpt (#gcthreads tc, 1))) @
-  maxheap_args tc @ ["run"]
+fun theory_run_argv tc = hol_subcommand_argv tc "run"
 
 fun quote s =
   "'" ^ String.translate (fn #"'" => "'\\''" | c => str c) s ^ "'"
@@ -157,6 +152,16 @@ fun timed_shell kind argv output script =
 
 fun run argv =
   timed_shell "run" argv NONE (command argv)
+
+(* The HOL process of run and check takes a machine reservation
+   (--cooperate-dir) like a theory child.  repl doesn't: it keeps the
+   terminal, so it isn't started in its own session. *)
+fun run_hol argv =
+  HolbuildMachineMemory.with_reservation
+    (fn lease =>
+        timed_system "run" argv NONE
+          (fn () => HolbuildProcessGroup.run_shell_inheriting lease (command argv)))
+  handle HolbuildMachineMemory.Error msg => raise Error msg
 
 fun run_interactive argv =
   timed_system "run_interactive" argv NONE (fn () => OS.Process.system (command argv))

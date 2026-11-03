@@ -67,8 +67,7 @@ for spelling in "--maxheap 4096" "--maxheap=4096" "--gcthreads 2" "--gcthreads=2
   require_grep "^holbuild: $expected\$" "$tmpdir/rejected.out"
 done
 
-# --gc-threads replaces the theory build's default of one GC thread, and reaches
-# run, which otherwise keeps Poly/ML's default.
+# Every HOL child gets one GC thread unless --gc-threads says otherwise.
 (cd "$project" && "$HOLBUILD_BIN" --gc-threads 3 build --force ATheory) > "$tmpdir/gcthreads.out" 2>&1 || {
   cat "$tmpdir/gcthreads.out" >&2
   exit 1
@@ -88,7 +87,7 @@ SML
   cat "$tmpdir/run.out" >&2
   exit 1
 }
-require_grep '^run-argv: .*/bin/hol run ' "$tmpdir/run.out"
+require_grep '^run-argv: .*/bin/hol --gcthreads=1 run ' "$tmpdir/run.out"
 (cd "$project" && "$HOLBUILD_BIN" --gc-threads=2 run "$tmpdir/argv.sml") > "$tmpdir/run.out" 2>&1 || {
   cat "$tmpdir/run.out" >&2
   exit 1

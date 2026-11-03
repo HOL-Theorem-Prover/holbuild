@@ -105,6 +105,11 @@ if "$HOLBUILD_BIN" --machine-max-mem 1024 build > "$tmpdir/no-dir.out" 2>&1; the
   exit 1
 fi
 require_grep 'machine-max-mem requires --cooperate-dir' "$tmpdir/no-dir.out"
+if "$HOLBUILD_BIN" --machine-max-cpus 1 build > "$tmpdir/no-dir-cpus.out" 2>&1; then
+  echo "--machine-max-cpus without --cooperate-dir succeeded" >&2
+  exit 1
+fi
+require_grep 'machine-max-cpus requires --cooperate-dir' "$tmpdir/no-dir-cpus.out"
 
 if "$HOLBUILD_BIN" --child-charge 1024 build > "$tmpdir/no-dir-charge.out" 2>&1; then
   echo "--child-charge without --cooperate-dir succeeded" >&2
@@ -187,6 +192,45 @@ awk '/^START A/ { n++; if (n > max) max = n } /^END A/ { n-- } END { exit !(max 
   exit 1
 }
 require_no_live_leases "$hetero"
+
+# Two processes, memory for many children but a CPU budget of one: children
+# never overlap, and the second waits visibly for a CPU slot.
+: > "$events"
+cpus=$tmpdir/cpus
+make_project c1 2 C1a C1b
+make_project c2 2 C2a C2b
+holbuild_in "$tmpdir/c1" --cooperate-dir "$cpus" --machine-max-cpus 1 --child-charge 1024 -j2 \
+  build --skip-checkpoints --skip-proof-steps > "$tmpdir/c1.out" 2>&1 &
+c1_pid=$!
+holbuild_in "$tmpdir/c2" --cooperate-dir "$cpus" --machine-max-cpus 1 --child-charge 1024 -j2 \
+  build --skip-checkpoints --skip-proof-steps > "$tmpdir/c2.out" 2>&1 &
+c2_pid=$!
+wait "$c1_pid" || { cat "$tmpdir/c1.out" >&2; exit 1; }
+wait "$c2_pid" || { cat "$tmpdir/c2.out" >&2; exit 1; }
+check_overlaps single
+cat "$tmpdir/c1.out" "$tmpdir/c2.out" > "$tmpdir/cpus.out"
+require_grep 'waiting for machine memory: needs 1024 MiB, 1 of 1 CPU slots in use in' "$tmpdir/cpus.out"
+[[ "$(cat "$cpus/cpus")" == 1 ]] || { echo "unexpected CPU budget: $(cat "$cpus/cpus")" >&2; exit 1; }
+require_no_live_leases "$cpus"
+if holbuild_in "$tmpdir/c1" --cooperate-dir "$cpus" --machine-max-cpus 2 --child-charge 1024 \
+     build --force C1aTheory > "$tmpdir/cpus-conflict.out" 2>&1; then
+  echo "conflicting --machine-max-cpus succeeded" >&2
+  exit 1
+fi
+require_grep '^holbuild: --machine-max-cpus 2 conflicts with 1 in' "$tmpdir/cpus-conflict.out"
+
+# The HOL process of run reserves too.
+if [[ -d /proc/self/fd ]]; then
+  cat > "$tmpdir/held.sml" <<SML
+val _ = OS.Process.system "ls -l /proc/self/fd 2>/dev/null | grep -q lease- && touch $tmpdir/run.held";
+SML
+  holbuild_in "$tmpdir/c1" --cooperate-dir "$cpus" run "$tmpdir/held.sml" > "$tmpdir/run.out" 2>&1 || {
+    cat "$tmpdir/run.out" >&2
+    exit 1
+  }
+  require_file "$tmpdir/run.held"
+  require_no_live_leases "$cpus"
+fi
 
 # A child larger than the whole budget fails at once instead of waiting.
 make_project big 0 Big
