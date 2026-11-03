@@ -25,6 +25,8 @@ gib=$((1024 * 1024 * 1024))
 # on how much memory the test machine has free.
 printf 'MemTotal:        67108864 kB\nMemAvailable:    67108864 kB\n' > "$tmpdir/plenty"
 export HOLBUILD_TEST_MEMINFO=$tmpdir/plenty
+# Likewise processors, except where the test exercises the CPU budget.
+export HOLBUILD_TEST_PROCESSORS=64
 events=$tmpdir/events.log
 : > "$events"
 
@@ -139,8 +141,8 @@ check_overlaps single
 cat "$tmpdir/p1.out" "$tmpdir/p2.out" > "$tmpdir/both.out"
 require_grep 'waiting for machine memory: needs 2048 MiB, 2048 MiB of 3072 MiB reserved' "$tmpdir/both.out"
 [[ "$(cat "$coop/budget")" == "$((3 * gib))" ]] || { echo "unexpected budget: $(cat "$coop/budget")" >&2; exit 1; }
-# Without --machine-max-cpus the CPU budget is the live processor count, never
-# written down.
+# Without --machine-max-cpus the CPU budget is the online processor count,
+# never written down.
 require_no_file "$coop/cpus"
 require_no_live_leases "$coop"
 if [[ -d /proc/self/fd ]]; then
@@ -221,6 +223,21 @@ if holbuild_in "$tmpdir/c1" --cooperate-dir "$cpus" --machine-max-cpus 2 --child
   exit 1
 fi
 require_grep '^holbuild: --machine-max-cpus 2 conflicts with 1 in' "$tmpdir/cpus-conflict.out"
+
+# Without DIR/cpus, the budget follows the online processor count.
+: > "$events"
+online=$tmpdir/online
+holbuild_in "$tmpdir/c1" --cooperate-dir "$online" --child-charge 1024 -j2 \
+  build --force=project --skip-checkpoints --skip-proof-steps > "$tmpdir/online1.out" 2>&1 &
+o1_pid=$!
+HOLBUILD_TEST_PROCESSORS=1 holbuild_in "$tmpdir/c2" --cooperate-dir "$online" --child-charge 1024 -j2 \
+  build --force=project --skip-checkpoints --skip-proof-steps > "$tmpdir/online2.out" 2>&1 &
+o2_pid=$!
+wait "$o1_pid" || { cat "$tmpdir/online1.out" >&2; exit 1; }
+wait "$o2_pid" || { cat "$tmpdir/online2.out" >&2; exit 1; }
+require_grep 'waiting for machine memory: needs 1024 MiB, [0-9]* of 1 CPU slots in use in' "$tmpdir/online2.out"
+require_no_file "$online/cpus"
+require_no_live_leases "$online"
 
 # A CPU budget of zero would admit nothing: it fails at once.
 zero_cpus=$tmpdir/zero-cpus

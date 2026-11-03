@@ -220,6 +220,12 @@ fun current_budget dir budget_mb =
                   | NONE => raise Error (path ^ " appeared while holding " ^ lock_path dir)
   end
 
+(* Tests point HOLBUILD_TEST_PROCESSORS at a stand-in count. *)
+fun online_processors () =
+  case Option.mapPartial Int.fromString (OS.Process.getEnv "HOLBUILD_TEST_PROCESSORS") of
+      SOME n => n
+    | NONE => Thread.numProcessors ()
+
 (* Called under DIR/lock. *)
 fun current_cpus dir cpus =
   let val path = cpus_path dir
@@ -240,7 +246,7 @@ fun current_cpus dir cpus =
           end
       | NONE =>
           case cpus of
-              NONE => Thread.numProcessors ()
+              NONE => online_processors ()
             | SOME n =>
                 case create_file path (Int.toString n ^ "\n") of
                     SOME fd => (close fd; n)
@@ -351,11 +357,15 @@ fun acquire {dir, budget_mb, cpus, charge_mb} =
     fun check_not_stopped () =
       if HolbuildProcessGroup.cleanup_count () = cleanups then ()
       else raise Error "build stopped while waiting for machine memory"
+    (* The explicit values are checked on the first attempt only, so that a
+       resize while this child waits doesn't fail it. *)
+    val explicit = ref {budget_mb = budget_mb, cpus = cpus}
     fun try () =
       with_coordinator dir (fn () =>
         let
-          val budget = current_budget dir budget_mb
-          val max_children = current_cpus dir cpus
+          val budget = current_budget dir (#budget_mb (!explicit))
+          val max_children = current_cpus dir (#cpus (!explicit))
+          val _ = explicit := {budget_mb = NONE, cpus = NONE}
           val _ = settings := SOME {dir = dir, budget_mb = NONE, cpus = NONE, charge_mb = charge_mb}
         in
           if charge > budget then
