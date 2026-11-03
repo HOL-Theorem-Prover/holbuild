@@ -215,10 +215,12 @@ datatype theory_load =
    to it, and `from` says where the file's bytes are read.  `script_dir` is
    the script's directory in the stage ("" when the script lies outside its
    package root), `extra_outputs` are declared relative to it, and
-   `source_file` is where the script is read from and what diagnostics name. *)
+   `source_file` is where the script is read from and what diagnostics name.
+   `inputs_key` hashes the extra inputs, for the checkpoint keys. *)
 type theory_action =
   {input_key : string,
    deps_key : string,
+   inputs_key : string option,
    package : string,
    logical : string,
    relative_path : string,
@@ -2344,9 +2346,8 @@ fun failed_prefix_ok proof_engine proof_timeout deps_key safe_name pre_hash head
      ("theorem_locations", theorem_location_schema),
      ("termination_goals", termination_goal_schema)]
 
-fun theorem_checkpoint_specs proof_engine proof_timeout project node deps_key inputs_key source proof_ir_plans (boundaries : HolbuildTheoryCheckpoints.boundary list) =
+fun theorem_checkpoint_specs proof_engine proof_timeout base deps_key inputs_key source proof_ir_plans (boundaries : HolbuildTheoryCheckpoints.boundary list) =
   let
-    val base = checkpoint_base project node
     fun pair (boundary, proof_ir_plan) =
       let
         val {kind, name, safe_name, theorem_start, theorem_stop, boundary = boundary_pos, tactic_start,
@@ -2379,28 +2380,25 @@ fun theorem_checkpoint_specs proof_engine proof_timeout project node deps_key in
     else raise Error "internal error: proof-IR plan count does not match theorem boundary count"
   end
 
-fun declaration_checkpoint_specs proof_engine proof_timeout project node deps_key inputs_key source terminations =
-  let val base = checkpoint_base project node
-  in
-    map (fn ({name, safe_name, definition_start, boundary, ...} : HolbuildTheoryCheckpoints.termination) =>
-            let
-              val prefix_hash =
-                script_prefix_key inputs_key (HolbuildTheoryCheckpoints.prefix_hash source boundary)
-              val checkpoint_key = declaration_checkpoint_key {name = name, safe_name = safe_name,
-                                                               boundary = boundary, deps_key = deps_key,
-                                                               proof_engine = proof_engine,
-                                                               prefix_hash = prefix_hash}
-            in
-              {name = name, safe_name = safe_name,
-               definition_start = definition_start, boundary = boundary,
-               prefix_hash = prefix_hash,
-               context_path = declaration_context_path base deps_key proof_engine prefix_hash safe_name,
-               context_ok = checkpoint_context_ok "definition_context" deps_key proof_engine proof_timeout prefix_hash checkpoint_key,
-               deps_key = deps_key,
-               checkpoint_key = checkpoint_key}
-            end)
-        terminations
-  end
+fun declaration_checkpoint_specs proof_engine proof_timeout base deps_key inputs_key source terminations =
+  map (fn ({name, safe_name, definition_start, boundary, ...} : HolbuildTheoryCheckpoints.termination) =>
+          let
+            val prefix_hash =
+              script_prefix_key inputs_key (HolbuildTheoryCheckpoints.prefix_hash source boundary)
+            val checkpoint_key = declaration_checkpoint_key {name = name, safe_name = safe_name,
+                                                             boundary = boundary, deps_key = deps_key,
+                                                             proof_engine = proof_engine,
+                                                             prefix_hash = prefix_hash}
+          in
+            {name = name, safe_name = safe_name,
+             definition_start = definition_start, boundary = boundary,
+             prefix_hash = prefix_hash,
+             context_path = declaration_context_path base deps_key proof_engine prefix_hash safe_name,
+             context_ok = checkpoint_context_ok "definition_context" deps_key proof_engine proof_timeout prefix_hash checkpoint_key,
+             deps_key = deps_key,
+             checkpoint_key = checkpoint_key}
+          end)
+      terminations
 
 fun dependency_context_key toolchain_key plan keys node =
   let
@@ -2827,6 +2825,7 @@ fun theory_action root plan keys toolchain_key holdir node : theory_action =
   in
     {input_key = HolbuildBuildPlan.input_key_for keys node,
      deps_key = dependency_context_key toolchain_key plan keys node,
+     inputs_key = HolbuildBuildPlan.extra_inputs_key plan node,
      package = package node,
      logical = logical_name node,
      relative_path = HolbuildBuildPlan.relative_path node,
@@ -3251,32 +3250,6 @@ fun run_theory_action cache_allowed policy tc root base_context (action : theory
       else ()
   in
     generated_metadata
-  end
-
-(* Builds a theory from its source in the project: runs its theory action with
-   the project's artifact root as action root, then puts the extra outputs in
-   the source tree and writes the theory's local load manifests. *)
-fun build_theory cache_allowed policy tc project base_context plan keys toolchain_key node source_text theorem_checkpoints declaration_checkpoints termination_diagnostics =
-  let
-    val root = project_artifact_root project
-    val action = theory_action root plan keys toolchain_key (#holdir tc) node
-    val generated_metadata =
-      run_theory_action cache_allowed policy tc root base_context action source_text
-                        theorem_checkpoints declaration_checkpoints termination_diagnostics
-    val stage = action_stage root action
-    val extra_output_paths = source_extra_output_paths plan node
-  in
-    claim_extra_outputs project node extra_output_paths;
-    List.app
-      (fn declaration =>
-          let val destination = source_extra_output_path node declaration
-          in ensure_parent destination;
-             copy_binary (staged_extra_output_path stage declaration) destination
-          end)
-      (#extra_outputs action);
-    record_materialized_extra_outputs project node extra_output_paths;
-    write_local_theory_manifests plan node generated_metadata;
-    remove_tree (stage_root_at root (#input_key action))
   end
 
 fun same_package_logical a b =
@@ -3786,34 +3759,33 @@ fun analyser_proof_ir_plan_sml (inputs : proof_ir_input list) =
               | NONE => raise Error ("missing proof-IR plan for theorem boundary " ^ Int.toString i)
         in List.tabulate(expected, require) end
 
-fun reject_unenforced_tactic_timeout policy node detail =
+fun reject_unenforced_tactic_timeout policy (action : theory_action) detail =
   case tactic_timeout policy of
       NONE => ()
     | SOME seconds =>
         raise Error ("cannot enforce requested tactic timeout of " ^
                      timeout_text (SOME seconds) ^ "s while building " ^
-                     logical_name node ^ " because theorem instrumentation is unavailable\n" ^
+                     #logical action ^ " because theorem instrumentation is unavailable\n" ^
                      detail)
 
-fun source_boundaries_for_node policy node source_text =
+fun source_boundaries_for_action policy (action : theory_action) source_text =
   SOME (detail_time_phase "build.exec.node.analyse_boundaries"
-          (fn () => discover_theorem_boundaries_recovering (source_file node) source_text))
+          (fn () => discover_theorem_boundaries_recovering (#source_file action) source_text))
   handle Error msg =>
-    (reject_unenforced_tactic_timeout policy node msg;
-     warn ("could not safely instrument theorem boundaries for " ^ logical_name node ^
+    (reject_unenforced_tactic_timeout policy action msg;
+     warn ("could not safely instrument theorem boundaries for " ^ #logical action ^
            "; building without proof steps/checkpoints for this theory\n" ^ msg);
      NONE)
 
-fun fallback_theory_checkpoints node msg =
-  (warn ("could not safely instrument theorem boundaries for " ^ logical_name node ^
+fun fallback_theory_checkpoints (action : theory_action) msg =
+  (warn ("could not safely instrument theorem boundaries for " ^ #logical action ^
          "; building without proof steps/checkpoints for this theory\n" ^ msg);
    [])
 
-fun theory_checkpoints_for_node policy project plan keys toolchain_key node source_text boundaries errors =
+fun theory_checkpoints_for_action policy root (action : theory_action) source_text boundaries errors =
   if not (proof_steps_enabled policy) andalso not (checkpoint_enabled policy) then []
   else
     let
-      val deps_key = dependency_context_key toolchain_key plan keys node
       val proof_ir_plans =
         if null boundaries then []
         else if proof_ir_enabled policy then
@@ -3828,18 +3800,19 @@ fun theory_checkpoints_for_node policy project plan keys toolchain_key node sour
         case errors of
             [] => ()
           | _ => warn ("HOL source parser recovered while instrumenting theorem boundaries for " ^
-                       logical_name node ^ "; using recovered theorem boundaries\n" ^
+                       #logical action ^ "; using recovered theorem boundaries\n" ^
                        String.concatWith "\n" errors)
     in
-      theorem_checkpoint_specs (proof_engine policy) (tactic_timeout policy) project node deps_key
-        (HolbuildBuildPlan.extra_inputs_key plan node) source_text proof_ir_plans boundaries
+      theorem_checkpoint_specs (proof_engine policy) (tactic_timeout policy)
+        (action_checkpoint_base root action) (#deps_key action)
+        (#inputs_key action) source_text proof_ir_plans boundaries
     end
     handle Error msg =>
-      (reject_unenforced_tactic_timeout policy node msg;
+      (reject_unenforced_tactic_timeout policy action msg;
        if proof_ir_enabled policy then raise Error msg
-       else fallback_theory_checkpoints node msg)
+       else fallback_theory_checkpoints action msg)
 
-fun termination_proof_plans_for_node policy node terminations =
+fun termination_proof_plans_for_action policy (action : theory_action) terminations =
   if null terminations orelse not (proof_ir_enabled policy) then terminations
   else
     let
@@ -3867,51 +3840,104 @@ fun termination_proof_plans_for_node policy node terminations =
       else raise Error "internal error: proof-IR plan count does not match termination count"
     end
     handle Error msg =>
-      (reject_unenforced_tactic_timeout policy node msg;
-       raise Error ("could not create termination proof plans for " ^ logical_name node ^ "\n" ^ msg))
+      (reject_unenforced_tactic_timeout policy action msg;
+       raise Error ("could not create termination proof plans for " ^ #logical action ^ "\n" ^ msg))
 
-fun termination_diagnostics_for_node policy node source_text =
+fun termination_diagnostics_for_action policy (action : theory_action) source_text =
   if not (proof_steps_enabled policy) then []
   else detail_time_phase "build.exec.node.analyse_terminations"
-         (fn () => discover_termination_diagnostics_strict (source_file node) source_text)
+         (fn () => discover_termination_diagnostics_strict (#source_file action) source_text)
     handle Error msg =>
-      (warn ("could not safely instrument termination diagnostics for " ^ logical_name node ^
+      (warn ("could not safely instrument termination diagnostics for " ^ #logical action ^
              "; building without termination goal diagnostics for this theory\n" ^ msg);
        [])
 
-fun source_spans_for_node policy node source_text =
+fun source_spans_for_action policy (action : theory_action) source_text =
   if proof_steps_enabled policy then
     let
       val combined =
         detail_time_phase "build.exec.node.analyse_boundaries"
           (fn () =>
               detail_time_phase "build.exec.node.analyse_terminations"
-                (fn () => discover_boundaries_and_terminations (source_file node) source_text))
+                (fn () => discover_boundaries_and_terminations (#source_file action) source_text))
     in
       {source_boundaries = SOME {boundaries = #boundaries combined, errors = #errors combined},
        termination_diagnostics = #terminations combined}
     end
     handle Error _ =>
-      {source_boundaries = source_boundaries_for_node policy node source_text,
-       termination_diagnostics = termination_diagnostics_for_node policy node source_text}
+      {source_boundaries = source_boundaries_for_action policy action source_text,
+       termination_diagnostics = termination_diagnostics_for_action policy action source_text}
   else
-    {source_boundaries = source_boundaries_for_node policy node source_text,
+    {source_boundaries = source_boundaries_for_action policy action source_text,
      termination_diagnostics = []}
 
-fun declaration_checkpoints_for_node policy project plan keys toolchain_key node source_text terminations =
+fun declaration_checkpoints_for_action policy root (action : theory_action) source_text terminations =
   if not (checkpoint_enabled policy) orelse not (proof_steps_enabled policy) then []
   else
-    let
-      val deps_key = dependency_context_key toolchain_key plan keys node
-      val inputs_key = HolbuildBuildPlan.extra_inputs_key plan node
-    in
-      declaration_checkpoint_specs (proof_engine policy) (tactic_timeout policy) project node deps_key
-        inputs_key source_text terminations
-    end
+    declaration_checkpoint_specs (proof_engine policy) (tactic_timeout policy)
+      (action_checkpoint_base root action) (#deps_key action)
+      (#inputs_key action) source_text terminations
     handle Error msg =>
-      (warn ("could not safely create termination-definition checkpoints for " ^ logical_name node ^
+      (warn ("could not safely create termination-definition checkpoints for " ^ #logical action ^
              "; building without termination-definition checkpoints for this theory\n" ^ msg);
        [])
+
+(* Builds a theory action in action root `root`: plans its proof steps and
+   checkpoints from the script, then runs it, again after discarding a
+   checkpoint HOL could not resume from.  Returns the generated theory's load
+   metadata, and leaves the stage to the caller, as `run_theory_action`. *)
+fun build_theory_action cache_allowed policy tc root base_context (action : theory_action) =
+  let
+    val source_text = read_text (#source_file action)
+    val source_spans = source_spans_for_action policy action source_text
+    val theorem_checkpoints =
+      case #source_boundaries source_spans of
+          NONE => []
+        | SOME {boundaries, errors} =>
+            theory_checkpoints_for_action policy root action source_text boundaries errors
+    val termination_diagnostics =
+      termination_proof_plans_for_action policy action (#termination_diagnostics source_spans)
+    val declaration_checkpoints =
+      declaration_checkpoints_for_action policy root action source_text termination_diagnostics
+    fun run retries_left =
+      let
+        val generated_metadata =
+          run_theory_action cache_allowed policy tc root base_context action source_text
+                            theorem_checkpoints declaration_checkpoints termination_diagnostics
+      in
+        remove_failed_prefix_checkpoints theorem_checkpoints;
+        generated_metadata
+      end
+      handle RetryInvalidCheckpoint =>
+        if retries_left <= 0 then raise RetryInvalidCheckpoint
+        else run (retries_left - 1)
+  in
+    run (length theorem_checkpoints + length declaration_checkpoints + 1)
+  end
+
+(* Builds a theory from its source in the project: runs its theory action with
+   the project's artifact root as action root, then puts the extra outputs in
+   the source tree and writes the theory's local load manifests. *)
+fun build_theory cache_allowed policy tc project base_context plan keys toolchain_key node =
+  let
+    val root = project_artifact_root project
+    val action = theory_action root plan keys toolchain_key (#holdir tc) node
+    val generated_metadata = build_theory_action cache_allowed policy tc root base_context action
+    val stage = action_stage root action
+    val extra_output_paths = source_extra_output_paths plan node
+  in
+    claim_extra_outputs project node extra_output_paths;
+    List.app
+      (fn declaration =>
+          let val destination = source_extra_output_path node declaration
+          in ensure_parent destination;
+             copy_binary (staged_extra_output_path stage declaration) destination
+          end)
+      (#extra_outputs action);
+    record_materialized_extra_outputs project node extra_output_paths;
+    write_local_theory_manifests plan node generated_metadata;
+    remove_tree (stage_root_at root (#input_key action))
+  end
 
 fun build_theory_node dat_hash_cache (options : build_options) tc project base_context plan keys toolchain_key node input_key =
   let
@@ -3942,31 +3968,10 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
          project plan keys input_key toolchain_key node metadata_checkpoints;
        HolbuildStatus.Restored)
     fun build_from_source () =
-      let
-        val source_text = read_text (source_file node)
-        val source_spans = source_spans_for_node policy node source_text
-        val source_boundaries = #source_boundaries source_spans
-        val theorem_checkpoints =
-          case source_boundaries of
-              NONE => []
-            | SOME {boundaries, errors} =>
-                theory_checkpoints_for_node policy project plan keys toolchain_key node source_text boundaries errors
-        val termination_diagnostics =
-          termination_proof_plans_for_node policy node (#termination_diagnostics source_spans)
-        val declaration_checkpoints =
-          declaration_checkpoints_for_node policy project plan keys toolchain_key node source_text termination_diagnostics
-        fun build_after_checkpoint_retries retries_left =
-          ((build_theory cache_allowed policy tc project base_context plan keys toolchain_key node source_text theorem_checkpoints declaration_checkpoints termination_diagnostics;
-            remove_failed_prefix_checkpoints theorem_checkpoints;
-            invalidate_node_dat_hash ();
-            write_metadata (#emit_output_hashes options) policy (tactic_timeout policy) project plan keys input_key toolchain_key node metadata_checkpoints;
-            HolbuildStatus.Built)
-           handle RetryInvalidCheckpoint =>
-             if retries_left <= 0 then raise RetryInvalidCheckpoint
-             else build_after_checkpoint_retries (retries_left - 1))
-      in
-        build_after_checkpoint_retries (length theorem_checkpoints + length declaration_checkpoints + 1)
-      end
+      (build_theory cache_allowed policy tc project base_context plan keys toolchain_key node;
+       invalidate_node_dat_hash ();
+       write_metadata (#emit_output_hashes options) policy (tactic_timeout policy) project plan keys input_key toolchain_key node metadata_checkpoints;
+       HolbuildStatus.Built)
       handle ExecutionPlanPrinted => (remove_tree stage; HolbuildStatus.Inspected)
     fun restore_or_build () =
       if not cache_restore_allowed then build_from_source ()
