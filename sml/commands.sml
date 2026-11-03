@@ -44,35 +44,27 @@ fun global_help () = print
   \  --quiet, --verbose, --verbosity LEVEL\n\
   \  -j N, -jN, --jobs N\n\
   \  --max-heap MB\n\
-  \  --gc-threads N               Poly/ML GC threads for child HOL processes\n\
-  \                               (default: 1)\n\
   \  --prefetch-concurrency N\n\
-  \  --cooperate-dir DIR          Share a machine memory and CPU budget with\n\
-  \                               other holbuild processes using DIR (or\n\
-  \                               $HOLBUILD_COOPERATE_DIR)\n\
+  \  --cooperate-dir DIR          Share a machine memory budget with other holbuild\n\
+  \                               processes using DIR (or $HOLBUILD_COOPERATE_DIR)\n\
   \  --machine-max-mem MB         Budget to record in DIR/budget if it is missing\n\
   \                               (default without it: MemTotal less a reserve)\n\
-  \  --machine-max-cpus N         CPU budget to record in DIR/cpus if it is missing\n\
-  \                               (default without it: online processors)\n\
   \  --child-charge MB            Reservation per child (default: --max-heap, at\n\
   \                               most 3072; --max-heap + 1024 without\n\
   \                               MemAvailable)\n\n\
   \With --cooperate-dir, each theory, generator or heap-export child reserves\n\
   \--child-charge, and starts only while all reservations in DIR plus its own fit\n\
-  \the budget, the children in DIR plus itself are no more than the CPU budget,\n\
-  \and, while other children hold reservations, MemAvailable less the charges of\n\
-  \children started in the last 30 s covers its charge plus a margin.\n\
+  \the budget, and, while other children hold reservations, MemAvailable less the\n\
+  \charges of children started in the last 30 s covers its charge plus a margin.\n\
   \The reserve is a quarter of MemTotal, at least 1 GiB and at most 30 GiB; the\n\
   \margin is the reserve, or what the budget leaves out of MemTotal if that is\n\
   \less (at least 1 GiB).\n\
-  \The HOL processes of run and check reserve the same way. This bounds\n\
-  \admission; it does not enforce RSS. HOL toolchain builds and repl reserve\n\
-  \nothing.\n\
+  \This bounds admission; it does not enforce RSS. HOL toolchain builds, check,\n\
+  \run and repl reserve nothing.\n\
   \To set or resize the budget, write DIR/budget (a byte count) while holding\n\
   \DIR/lock:\n\
   \  flock DIR/lock sh -c 'echo BYTES > DIR/budget.new && mv DIR/budget.new DIR/budget'\n\
-  \To return to the default, remove it: flock DIR/lock rm DIR/budget\n\
-  \DIR/cpus (a processor count) works the same way.\n\n\
+  \To return to the default, remove it: flock DIR/lock rm DIR/budget\n\n\
   \Use `holbuild COMMAND --help` for command-specific help.\n"
 
 fun build_help () = print
@@ -736,22 +728,21 @@ fun verbosity_value text =
 
 fun parse_global_options args =
   let
-    fun loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap gcthreads json verbosity rest =
+    fun loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap json verbosity rest =
       case rest of
-          [] => ({holdir = holdir, source_dir = source_dir, cache_dir = cache_dir, remote_cache = remote_cache, jobs = jobs, maxheap = maxheap, gcthreads = gcthreads, prefetch_concurrency = prefetch_concurrency, json = json, verbosity = verbosity}, [])
-        | "--json" :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap gcthreads true verbosity xs
-        | "--quiet" :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap gcthreads json HolbuildStatus.Quiet xs
-        | "--verbose" :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap gcthreads json HolbuildStatus.Verbose xs
-        | "--verbosity" :: level :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap gcthreads json (verbosity_value level) xs
-        | "--holdir" :: path :: xs => loop prefetch_concurrency (SOME path) source_dir cache_dir remote_cache jobs maxheap gcthreads json verbosity xs
-        | "--source-dir" :: path :: xs => loop prefetch_concurrency holdir (SOME path) cache_dir remote_cache jobs maxheap gcthreads json verbosity xs
-        | "--cache-dir" :: path :: xs => loop prefetch_concurrency holdir source_dir (SOME path) remote_cache jobs maxheap gcthreads json verbosity xs
-        | "--remote-cache" :: url :: xs => loop prefetch_concurrency holdir source_dir cache_dir (SOME url) jobs maxheap gcthreads json verbosity xs
-        | "--jobs" :: n :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache (SOME (positive_int "--jobs" n)) maxheap gcthreads json verbosity xs
-        | "-j" :: n :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache (SOME (positive_int "-j" n)) maxheap gcthreads json verbosity xs
-        | "--max-heap" :: n :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs (SOME (positive_int "--max-heap" n)) gcthreads json verbosity xs
-        | "--gc-threads" :: n :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap (SOME (positive_int "--gc-threads" n)) json verbosity xs
-        | "--prefetch-concurrency" :: n :: xs => loop (SOME (positive_int "--prefetch-concurrency" n)) holdir source_dir cache_dir remote_cache jobs maxheap gcthreads json verbosity xs
+          [] => ({holdir = holdir, source_dir = source_dir, cache_dir = cache_dir, remote_cache = remote_cache, jobs = jobs, maxheap = maxheap, prefetch_concurrency = prefetch_concurrency, json = json, verbosity = verbosity}, [])
+        | "--json" :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap true verbosity xs
+        | "--quiet" :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap json HolbuildStatus.Quiet xs
+        | "--verbose" :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap json HolbuildStatus.Verbose xs
+        | "--verbosity" :: level :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap json (verbosity_value level) xs
+        | "--holdir" :: path :: xs => loop prefetch_concurrency (SOME path) source_dir cache_dir remote_cache jobs maxheap json verbosity xs
+        | "--source-dir" :: path :: xs => loop prefetch_concurrency holdir (SOME path) cache_dir remote_cache jobs maxheap json verbosity xs
+        | "--cache-dir" :: path :: xs => loop prefetch_concurrency holdir source_dir (SOME path) remote_cache jobs maxheap json verbosity xs
+        | "--remote-cache" :: url :: xs => loop prefetch_concurrency holdir source_dir cache_dir (SOME url) jobs maxheap json verbosity xs
+        | "--jobs" :: n :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache (SOME (positive_int "--jobs" n)) maxheap json verbosity xs
+        | "-j" :: n :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache (SOME (positive_int "-j" n)) maxheap json verbosity xs
+        | "--max-heap" :: n :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs (SOME (positive_int "--max-heap" n)) json verbosity xs
+        | "--prefetch-concurrency" :: n :: xs => loop (SOME (positive_int "--prefetch-concurrency" n)) holdir source_dir cache_dir remote_cache jobs maxheap json verbosity xs
         | "--verbosity" :: [] => raise Error "--verbosity requires LEVEL"
         | "--holdir" :: [] => raise Error "--holdir requires PATH"
         | "--source-dir" :: [] => raise Error "--source-dir requires PATH"
@@ -760,65 +751,57 @@ fun parse_global_options args =
         | "--jobs" :: [] => raise Error "--jobs requires N"
         | "-j" :: [] => raise Error "-j requires N"
         | "--max-heap" :: [] => raise Error "--max-heap requires MB"
-        | "--gc-threads" :: [] => raise Error "--gc-threads requires N"
         | "--prefetch-concurrency" :: [] => raise Error "--prefetch-concurrency requires N"
         | arg :: xs =>
             if String.isPrefix "--verbosity=" arg then
-              loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap gcthreads json (verbosity_value (String.extract (arg, size "--verbosity=", NONE))) xs
+              loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap json (verbosity_value (String.extract (arg, size "--verbosity=", NONE))) xs
             else if String.isPrefix "--holdir=" arg then
-              loop prefetch_concurrency (SOME (String.extract (arg, size "--holdir=", NONE))) source_dir cache_dir remote_cache jobs maxheap gcthreads json verbosity xs
+              loop prefetch_concurrency (SOME (String.extract (arg, size "--holdir=", NONE))) source_dir cache_dir remote_cache jobs maxheap json verbosity xs
             else if String.isPrefix "--source-dir=" arg then
-              loop prefetch_concurrency holdir (SOME (String.extract (arg, size "--source-dir=", NONE))) cache_dir remote_cache jobs maxheap gcthreads json verbosity xs
+              loop prefetch_concurrency holdir (SOME (String.extract (arg, size "--source-dir=", NONE))) cache_dir remote_cache jobs maxheap json verbosity xs
             else if String.isPrefix "--cache-dir=" arg then
-              loop prefetch_concurrency holdir source_dir (SOME (String.extract (arg, size "--cache-dir=", NONE))) remote_cache jobs maxheap gcthreads json verbosity xs
+              loop prefetch_concurrency holdir source_dir (SOME (String.extract (arg, size "--cache-dir=", NONE))) remote_cache jobs maxheap json verbosity xs
             else if String.isPrefix "--remote-cache=" arg then
-              loop prefetch_concurrency holdir source_dir cache_dir (SOME (String.extract (arg, size "--remote-cache=", NONE))) jobs maxheap gcthreads json verbosity xs
+              loop prefetch_concurrency holdir source_dir cache_dir (SOME (String.extract (arg, size "--remote-cache=", NONE))) jobs maxheap json verbosity xs
             else if String.isPrefix "--jobs=" arg then
-              loop prefetch_concurrency holdir source_dir cache_dir remote_cache (SOME (positive_int "--jobs" (String.extract (arg, size "--jobs=", NONE)))) maxheap gcthreads json verbosity xs
+              loop prefetch_concurrency holdir source_dir cache_dir remote_cache (SOME (positive_int "--jobs" (String.extract (arg, size "--jobs=", NONE)))) maxheap json verbosity xs
             else if String.isPrefix "--max-heap=" arg then
-              loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs (SOME (positive_int "--max-heap" (String.extract (arg, size "--max-heap=", NONE)))) gcthreads json verbosity xs
-            else if String.isPrefix "--gc-threads=" arg then
-              loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap (SOME (positive_int "--gc-threads" (String.extract (arg, size "--gc-threads=", NONE)))) json verbosity xs
+              loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs (SOME (positive_int "--max-heap" (String.extract (arg, size "--max-heap=", NONE)))) json verbosity xs
             else if String.isPrefix "--prefetch-concurrency=" arg then
-              loop (SOME (positive_int "--prefetch-concurrency" (String.extract (arg, size "--prefetch-concurrency=", NONE)))) holdir source_dir cache_dir remote_cache jobs maxheap gcthreads json verbosity xs
+              loop (SOME (positive_int "--prefetch-concurrency" (String.extract (arg, size "--prefetch-concurrency=", NONE)))) holdir source_dir cache_dir remote_cache jobs maxheap json verbosity xs
             else if String.isPrefix "-j" arg andalso size arg > 2 then
-              loop prefetch_concurrency holdir source_dir cache_dir remote_cache (SOME (positive_int "-j" (String.extract (arg, 2, NONE)))) maxheap gcthreads json verbosity xs
+              loop prefetch_concurrency holdir source_dir cache_dir remote_cache (SOME (positive_int "-j" (String.extract (arg, 2, NONE)))) maxheap json verbosity xs
             else
-              let val (opts, args') = loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap gcthreads json verbosity xs in (opts, arg :: args') end
+              let val (opts, args') = loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap json verbosity xs in (opts, arg :: args') end
   in
-    loop NONE NONE NONE NONE NONE NONE NONE NONE false HolbuildStatus.Normal args
+    loop NONE NONE NONE NONE NONE NONE NONE false HolbuildStatus.Normal args
   end
 
-(* --cooperate-dir, --machine-max-mem, --machine-max-cpus and --child-charge,
-   removed from args. *)
+(* --cooperate-dir, --machine-max-mem and --child-charge, removed from args. *)
 fun parse_cooperation_options args =
   let
-    fun loop dir mem cpus charge [] = (dir, mem, cpus, charge, [])
-      | loop _ _ _ _ ("--cooperate-dir" :: "" :: _) = raise Error "--cooperate-dir requires DIR"
-      | loop _ mem cpus charge ("--cooperate-dir" :: path :: xs) = loop (SOME path) mem cpus charge xs
-      | loop _ _ _ _ ["--cooperate-dir"] = raise Error "--cooperate-dir requires DIR"
-      | loop dir _ cpus charge ("--machine-max-mem" :: n :: xs) = loop dir (SOME (positive_int "--machine-max-mem" n)) cpus charge xs
-      | loop _ _ _ _ ["--machine-max-mem"] = raise Error "--machine-max-mem requires MB"
-      | loop dir mem _ charge ("--machine-max-cpus" :: n :: xs) = loop dir mem (SOME (positive_int "--machine-max-cpus" n)) charge xs
-      | loop _ _ _ _ ["--machine-max-cpus"] = raise Error "--machine-max-cpus requires N"
-      | loop dir mem cpus _ ("--child-charge" :: n :: xs) = loop dir mem cpus (SOME (positive_int "--child-charge" n)) xs
-      | loop _ _ _ _ ["--child-charge"] = raise Error "--child-charge requires MB"
-      | loop dir mem cpus charge (arg :: xs) =
+    fun loop dir mem charge [] = (dir, mem, charge, [])
+      | loop _ _ _ ("--cooperate-dir" :: "" :: _) = raise Error "--cooperate-dir requires DIR"
+      | loop _ mem charge ("--cooperate-dir" :: path :: xs) = loop (SOME path) mem charge xs
+      | loop _ _ _ ["--cooperate-dir"] = raise Error "--cooperate-dir requires DIR"
+      | loop dir _ charge ("--machine-max-mem" :: n :: xs) = loop dir (SOME (positive_int "--machine-max-mem" n)) charge xs
+      | loop _ _ _ ["--machine-max-mem"] = raise Error "--machine-max-mem requires MB"
+      | loop dir mem _ ("--child-charge" :: n :: xs) = loop dir mem (SOME (positive_int "--child-charge" n)) xs
+      | loop _ _ _ ["--child-charge"] = raise Error "--child-charge requires MB"
+      | loop dir mem charge (arg :: xs) =
           if String.isPrefix "--cooperate-dir=" arg then
-            loop dir mem cpus charge ("--cooperate-dir" :: String.extract (arg, size "--cooperate-dir=", NONE) :: xs)
+            loop dir mem charge ("--cooperate-dir" :: String.extract (arg, size "--cooperate-dir=", NONE) :: xs)
           else if String.isPrefix "--machine-max-mem=" arg then
-            loop dir (SOME (positive_int "--machine-max-mem" (String.extract (arg, size "--machine-max-mem=", NONE)))) cpus charge xs
-          else if String.isPrefix "--machine-max-cpus=" arg then
-            loop dir mem (SOME (positive_int "--machine-max-cpus" (String.extract (arg, size "--machine-max-cpus=", NONE)))) charge xs
+            loop dir (SOME (positive_int "--machine-max-mem" (String.extract (arg, size "--machine-max-mem=", NONE)))) charge xs
           else if String.isPrefix "--child-charge=" arg then
-            loop dir mem cpus (SOME (positive_int "--child-charge" (String.extract (arg, size "--child-charge=", NONE)))) xs
+            loop dir mem (SOME (positive_int "--child-charge" (String.extract (arg, size "--child-charge=", NONE)))) xs
           else
-            let val (dir', mem', cpus', charge', rest) = loop dir mem cpus charge xs in (dir', mem', cpus', charge', arg :: rest) end
+            let val (dir', mem', charge', rest) = loop dir mem charge xs in (dir', mem', charge', arg :: rest) end
   in
-    loop NONE NONE NONE NONE args
+    loop NONE NONE NONE args
   end
 
-fun configure_cooperation dir budget_mb cpus charge_mb maxheap =
+fun configure_cooperation dir budget_mb charge_mb maxheap =
   let
     val dir =
       case dir of
@@ -828,8 +811,8 @@ fun configure_cooperation dir budget_mb cpus charge_mb maxheap =
                  SOME "" => NONE
                | env => env)
   in
-    case (dir, budget_mb, cpus, charge_mb) of
-        (SOME dir, _, _, _) =>
+    case (dir, budget_mb, charge_mb) of
+        (SOME dir, _, _) =>
           let
             val default = HolbuildMachineMemory.default_charge_mb
             (* The flat default leans on the MemAvailable check; without it a
@@ -844,13 +827,12 @@ fun configure_cooperation dir budget_mb cpus charge_mb maxheap =
                                          "where MemAvailable cannot be read")
           in
             HolbuildMachineMemory.configure
-              {dir = dir, budget_mb = budget_mb, cpus = cpus,
+              {dir = dir, budget_mb = budget_mb,
                charge_mb = case charge_mb of SOME mb => mb | NONE => default_charge ()}
           end
-      | (NONE, SOME _, _, _) => raise Error "--machine-max-mem requires --cooperate-dir DIR"
-      | (NONE, NONE, SOME _, _) => raise Error "--machine-max-cpus requires --cooperate-dir DIR"
-      | (NONE, NONE, NONE, SOME _) => raise Error "--child-charge requires --cooperate-dir DIR"
-      | (NONE, NONE, NONE, NONE) => ()
+      | (NONE, SOME _, _) => raise Error "--machine-max-mem requires --cooperate-dir DIR"
+      | (NONE, NONE, SOME _) => raise Error "--child-charge requires --cooperate-dir DIR"
+      | (NONE, NONE, NONE) => ()
   end
 
 fun with_input path f =
@@ -1739,7 +1721,7 @@ fun run_hol_with runner tc cli_jobs subcommand user_args =
   else raise Error ("hol " ^ subcommand ^ " failed")
 
 fun run_hol tc cli_jobs subcommand user_args =
-  run_hol_with HolbuildToolchain.run_hol tc cli_jobs subcommand user_args
+  run_hol_with HolbuildToolchain.run tc cli_jobs subcommand user_args
 
 fun repl_hol tc cli_jobs user_args =
   run_hol_with HolbuildToolchain.run_interactive tc cli_jobs "repl" user_args
@@ -1841,7 +1823,7 @@ fun check_selector tc cli_jobs selector =
     fun cleanup () = OS.FileSys.remove script_path handle OS.SysErr _ => ()
     val status =
       (* A run heap may hold an older copy of the theory, which load would keep. *)
-      run_hol_status HolbuildToolchain.run_hol tc cli_jobs false "run" [script_path]
+      run_hol_status HolbuildToolchain.run tc cli_jobs false "run" [script_path]
       handle e => (cleanup (); raise e)
   in
     cleanup ();
@@ -1965,27 +1947,27 @@ fun project_hol_holdir kernel_variant jobs project =
        | _ => raise Error "schema 2 project has no dependencies.hol")
   end
 
-fun effective_toolchain_for kernel_variant holdir maxheap gcthreads jobs =
+fun effective_toolchain_for kernel_variant holdir maxheap jobs =
   let
     val project = load_project ()
     val _ = reject_holdir holdir
   in
     {holdir = project_hol_holdir kernel_variant jobs project, maxheap = maxheap,
-     gcthreads = gcthreads, kernel_variant = kernel_variant}
+     kernel_variant = kernel_variant}
   end
 
-fun effective_toolchain holdir maxheap gcthreads jobs =
-  effective_toolchain_for HolbuildHolToolchainConfig.StandardKernel holdir maxheap gcthreads jobs
+fun effective_toolchain holdir maxheap jobs =
+  effective_toolchain_for HolbuildHolToolchainConfig.StandardKernel holdir maxheap jobs
 
-fun tracing_toolchain holdir maxheap gcthreads jobs =
-  effective_toolchain_for HolbuildHolToolchainConfig.TracingKernel holdir maxheap gcthreads jobs
+fun tracing_toolchain holdir maxheap jobs =
+  effective_toolchain_for HolbuildHolToolchainConfig.TracingKernel holdir maxheap jobs
 
-fun context_toolchain_for kernel_variant holdir maxheap gcthreads =
+fun context_toolchain_for kernel_variant holdir maxheap =
   let
     val _ = load_project ()
     val _ = reject_holdir holdir
   in
-    {holdir = "", maxheap = maxheap, gcthreads = gcthreads, kernel_variant = kernel_variant}
+    {holdir = "", maxheap = maxheap, kernel_variant = kernel_variant}
   end
 
 fun parse_context_args args =
@@ -2010,7 +1992,7 @@ fun buildhol holdir maxheap jobs args =
     print (holdir ^ "\n")
   end
 
-fun exec_action_command maxheap gcthreads jobs args =
+fun exec_action_command maxheap jobs args =
   let
     fun gb label text =
       case Int.fromString text of
@@ -2050,8 +2032,7 @@ fun exec_action_command maxheap gcthreads jobs args =
         val kernel_variant = HolbuildHolToolchainConfig.StandardKernel
         val holdir = HolbuildHolSharedCache.ensure_built_with_kernel jobs
                        {git = git, rev = rev, kernel_variant = kernel_variant}
-        val tc = {holdir = holdir, maxheap = maxheap, gcthreads = gcthreads,
-                  kernel_variant = kernel_variant}
+        val tc = {holdir = holdir, maxheap = maxheap, kernel_variant = kernel_variant}
       in
         configure_analyser_for_toolchain tc; tc
       end
@@ -2078,7 +2059,7 @@ fun removed_legacy_proof_step_build_arg arg =
 
 fun trace_steps_build_arg arg = arg = "--trace-steps" orelse arg = "--goalfrag-trace"
 
-fun dispatch_with_options {holdir, source_dir, cache_dir, remote_cache, jobs, maxheap, gcthreads, prefetch_concurrency, json, verbosity} args =
+fun dispatch_with_options {holdir, source_dir, cache_dir, remote_cache, jobs, maxheap, prefetch_concurrency, json, verbosity} args =
   (HolbuildStatus.set_json_mode json;
    HolbuildStatus.set_verbosity verbosity;
    HolbuildStatus.set_retain_debug_artifacts false;
@@ -2095,27 +2076,27 @@ fun dispatch_with_options {holdir, source_dir, cache_dir, remote_cache, jobs, ma
      | "buildhol" :: rest => buildhol holdir maxheap jobs rest
      | "exec-action" :: rest =>
          (reject_json "exec-action"; reject_holdir holdir;
-          exec_action_command maxheap gcthreads jobs rest)
+          exec_action_command maxheap jobs rest)
      | "goalfrag-plan" :: _ => raise Error "goalfrag-plan has been removed; use execution-plan THEORY:THEOREM"
-     | [] => dispatch (effective_toolchain holdir maxheap gcthreads jobs) jobs args
+     | [] => dispatch (effective_toolchain holdir maxheap jobs) jobs args
      | "build" :: rest =>
          (HolbuildHolSharedCache.restore_only := List.exists (fn arg => arg = "--remote-only") rest;
          if List.exists removed_legacy_proof_step_build_arg rest then
            (case List.find removed_legacy_proof_step_build_arg rest of
                 SOME "--goalfrag" => raise Error "--goalfrag has been removed; proof steps are enabled by default"
               | SOME _ => raise Error "--goalfrag-plan has been removed; use execution-plan THEORY:THEOREM"
-              | NONE => dispatch (effective_toolchain holdir maxheap gcthreads jobs) jobs args)
+              | NONE => dispatch (effective_toolchain holdir maxheap jobs) jobs args)
          else if json andalso List.exists trace_steps_build_arg rest then
            raise Error "--json does not support --trace-steps until structured proof-step trace events exist"
          else if List.exists (fn arg => arg = "--trknl") rest then
-           dispatch (tracing_toolchain holdir maxheap gcthreads jobs) jobs args
-         else dispatch (effective_toolchain holdir maxheap gcthreads jobs) jobs args)
+           dispatch (tracing_toolchain holdir maxheap jobs) jobs args
+         else dispatch (effective_toolchain holdir maxheap jobs) jobs args)
      | "context" :: rest =>
-         dispatch (context_toolchain_for (parse_context_args rest) holdir maxheap gcthreads) jobs args
+         dispatch (context_toolchain_for (parse_context_args rest) holdir maxheap) jobs args
      | _ =>
          if List.exists (fn arg => arg = "--trknl") args then
-           dispatch (tracing_toolchain holdir maxheap gcthreads jobs) jobs args
-         else dispatch (effective_toolchain holdir maxheap gcthreads jobs) jobs args)
+           dispatch (tracing_toolchain holdir maxheap jobs) jobs args
+         else dispatch (effective_toolchain holdir maxheap jobs) jobs args)
 
 fun is_broken_pipe (IO.Io {cause = OS.SysErr (msg, _), ...}) = msg = "Broken pipe"
   | is_broken_pipe _ = false
@@ -2137,38 +2118,29 @@ fun process_arguments () =
      | _ :: args => args)
   handle IO.Io _ => []
 
-(* The Poly/ML runtime removes its own options, such as --maxheap and
-   --gcthreads, from the command line before CommandLine.arguments, so holbuild
-   can only see them in the process's own arguments, and only where /proc
-   exists. *)
-fun reject_runtime_options () =
-  let
-    val args = process_arguments ()
-    fun reject runtime_option holbuild_option =
-      if List.exists (String.isPrefix runtime_option) args then
-        raise Error (runtime_option ^ " is consumed by holbuild's Poly/ML runtime and does not reach child HOL processes; use " ^ holbuild_option)
-      else ()
-  in
-    reject "--maxheap" "--max-heap MB";
-    reject "--gcthreads" "--gc-threads N"
-  end
+(* The Poly/ML runtime removes --maxheap from the command line before
+   CommandLine.arguments, so holbuild can only see it in the process's own
+   arguments, and only where /proc exists. *)
+fun reject_runtime_maxheap () =
+  if List.exists (String.isPrefix "--maxheap") (process_arguments ()) then
+    raise Error "--maxheap is consumed by holbuild's Poly/ML runtime and does not reach child HOL processes; use --max-heap MB"
+  else ()
 
 fun main raw_args =
   (let
      val _ = install_signal_handlers ()
      val _ = HolbuildStatus.set_json_mode (List.exists (fn s => s = "--json") raw_args)
-     val _ = reject_runtime_options ()
+     val _ = reject_runtime_maxheap ()
      val _ =
        if raw_args = ["--version"] then
          (print ("holbuild " ^ HolbuildVersion.version ^ "\n"); OS.Process.exit OS.Process.success)
        else if raw_args = ["--help"] orelse raw_args = ["-h"]
        then (global_help (); OS.Process.exit OS.Process.success)
        else ()
-     val (cooperate_dir, machine_max_mem, machine_max_cpus, child_charge, raw_args) =
-       parse_cooperation_options raw_args
+     val (cooperate_dir, machine_max_mem, child_charge, raw_args) = parse_cooperation_options raw_args
      val (options, args) = parse_global_options raw_args
    in
-     configure_cooperation cooperate_dir machine_max_mem machine_max_cpus child_charge (#maxheap options);
+     configure_cooperation cooperate_dir machine_max_mem child_charge (#maxheap options);
      dispatch_with_options options args
    end)
   handle Thread.Interrupt => (HolbuildToolchain.cleanup_active_children (); err "interrupted")
