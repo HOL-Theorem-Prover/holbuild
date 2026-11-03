@@ -715,7 +715,7 @@ fun print_execution_plan_selector new_ir project selector =
                   {project = project,
                    resolution = HolbuildProject.standard_resolution}
     val preparation = HolbuildPackagePrepare.prepare graph
-    val discovery = HolbuildSourceIndex.discover_prepared_with_inventories preparation
+    val discovery = HolbuildSourceIndex.discover_prepared_with_inventories [] preparation
     val components = HolbuildComponentProvider.load HolbuildComponentProvider.LiveProvider
                        {preparation = preparation, discovery = discovery}
     val index = HolbuildComponentProvider.sources components
@@ -939,12 +939,12 @@ fun prepare_source_index phase_prefix resolution project =
     val graph = timed_phase (phase_prefix ^ ".graph.resolve")
                   (fn () => HolbuildProjectGraph.resolve
                     {project = project, resolution = resolution})
-    val _ = timed_phase (phase_prefix ^ ".policies.prevalidate")
-              (fn () => HolbuildSourceIndex.prevalidate_graph graph)
+    val scans = timed_phase (phase_prefix ^ ".policies.prevalidate")
+                  (fn () => HolbuildSourceIndex.prevalidate_graph graph)
     val preparation = timed_phase (phase_prefix ^ ".generators.prepare")
                         (fn () => HolbuildPackagePrepare.prepare graph)
     val discovery = timed_phase (phase_prefix ^ ".inventory.construct")
-                      (fn () => HolbuildSourceIndex.discover_prepared_with_inventories preparation)
+                      (fn () => HolbuildSourceIndex.discover_prepared_with_inventories scans preparation)
     val components = timed_phase (phase_prefix ^ ".components.load")
                        (fn () => HolbuildComponentProvider.load
                          HolbuildComponentProvider.LiveProvider

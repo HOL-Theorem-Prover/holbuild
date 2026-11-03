@@ -86,18 +86,30 @@ fun trim text =
   in if r < l then "" else String.substring(text, l, r - l + 1) end
 
 fun poly_command () = Option.getOpt(OS.Process.getEnv "HOLBUILD_POLY", "poly")
-fun poly_version () =
+(* Memoise f on its argument's last value.  A build computes the toolchain
+   key many times, and neither poly nor holbuild's own sources change during
+   one process. *)
+fun memo_by cache arg f () =
   let
-    val poly = poly_command ()
+    val a = arg ()
+    fun compute () = let val value = f a in cache := SOME (a, value); value end
+  in
+    case !cache of
+        SOME (cached, value) => if cached = a then value else compute ()
+      | NONE => compute ()
+  end
+
+val poly_version = memo_by (ref NONE) poly_command (fn poly =>
+  let
     val run = HolbuildSpawn.run {program = poly, args = ["-v"], stderr = HolbuildSpawn.Merge}
   in
     if HolbuildSpawn.succeeded run then trim (#output run)
     else die ("command failed: " ^ quote poly ^ " -v\n" ^ #output run)
-  end
+  end)
 
-fun poly_executable_path () =
-  let val path = trim (command_output ("command -v " ^ quote (poly_command ())))
-  in FS.fullPath path end
+val poly_executable_path = memo_by (ref NONE) poly_command (fn poly =>
+  let val path = trim (command_output ("command -v " ^ quote poly))
+  in FS.fullPath path end)
 
 (* poly -v prints "Poly/ML 5.9.2 Release    RTS version: Arm64-5.9.2 (Git
    version v5.9.2)".  release is the text before "RTS version:", without the
@@ -459,12 +471,11 @@ fun analyser_source_dir () =
       SOME path => path
     | NONE => Path.concat(HolbuildRuntimePaths.source_root, "sml/analyser")
 
-fun analyser_source_path rel = Path.concat(analyser_source_dir (), rel)
-
-fun analyser_source_hash () =
+val analyser_source_hash = memo_by (ref NONE) analyser_source_dir (fn dir =>
   HolbuildHash.string_sha256
     (String.concatWith "\n"
-       (map (fn rel => rel ^ "=" ^ HolbuildHash.file_sha256 (analyser_source_path rel)) analyser_source_files))
+       (map (fn rel => rel ^ "=" ^ HolbuildHash.file_sha256 (Path.concat(dir, rel)))
+            analyser_source_files)))
 
 fun analyser_key_material () =
   String.concatWith "\n"
