@@ -391,21 +391,6 @@ fun write_theory_exporter {sig_path, path, parents_report, mldeps_report} =
     write_text path (String.concatWith "\n" lines ^ "\n")
   end
 
-fun generated_theory_stem sml_path =
-  drop_suffix ".sml" (hfs_unmapped_path sml_path)
-
-fun write_final_context_loader {sml_path, output, ok_text, path} =
-  let
-    val lines =
-      ["HolbuildRuntime.load " ^
-         HolbuildToolchain.sml_string (generated_theory_stem sml_path) ^ ";",
-       checkpoint_save_runtime_line (),
-       save_heap_line {label = "final_context", share_common_data = true,
-                       output = output, ok_text = ok_text}]
-  in
-    write_text path (String.concatWith "\n" lines ^ "\n")
-  end
-
 fun generated_outputs node =
   let val generated = #generated (source_artifacts node)
   in {sig_path = one_with_suffix ".sig" generated,
@@ -603,7 +588,6 @@ fun current_log_dir root package logical =
   Path.concat(Path.concat(Path.concat(Path.concat(root, ".holbuild/logs"), "current"), package), logical)
 
 fun current_build_log dir = Path.concat(dir, "build.log")
-fun current_final_context_log dir = Path.concat(dir, "final-context.log")
 fun current_checkpoint_failure_log dir = Path.concat(dir, "instrumented-failure.log")
 fun current_proof_trace_log dir = Path.concat(dir, "proof-trace.log")
 
@@ -717,8 +701,6 @@ fun declaration_checkpoints_for_deps_root base deps_key =
 
 fun declaration_checkpoint_dir base deps_key proof_engine prefix_hash =
   Path.concat(Path.concat(declaration_checkpoints_for_deps_root base deps_key, proof_engine), prefix_hash)
-
-fun final_context_path base = base ^ ".final_context.save"
 
 fun remove_legacy_checkpoint_family base =
   let
@@ -857,6 +839,8 @@ fun checkpoint_marker_base path =
       SOME (Path.concat(Path.dir path, drop_suffix ".theorems" name))
     else if has_suffix ".decls" name then
       SOME (Path.concat(Path.dir path, drop_suffix ".decls" name))
+    (* Older holbuild versions saved a .final_context.save beside each theory
+       checkpoint; it still belongs to that family, so cleaning removes it. *)
     else if has_suffix ".final_context.save.ok.tmp" name then
       SOME (Path.concat(Path.dir path, drop_suffix ".final_context.save.ok.tmp" name))
     else if has_suffix ".final_context.save.ok.bak" name then
@@ -2137,21 +2121,6 @@ fun write_local_theory_manifests plan node generated_metadata =
     write_object_manifest script_uo (script_loads @ [source_file node])
   end
 
-(* A source child used to write a one-entry stage manifest and then load it in
-   the already-exported session.  A fresh final-context child needs the same
-   parent/ML-dependency closure as an eventual consumer of the published
-   artifact, so construct its stage manifests from the runtime reports. *)
-fun write_staged_theory_manifests resolve logical stage generated_metadata =
-  let
-    val staged_sig = hfs_unmapped_path (staged_theory_file stage logical ".sig")
-    val staged_sml = hfs_unmapped_path (staged_theory_file stage logical ".sml")
-    val stem = generated_theory_stem staged_sml
-    val theory_loads = generated_theory_loads resolve generated_metadata
-  in
-    write_object_manifest (stem ^ ".ui") [staged_sig];
-    write_object_manifest (stem ^ ".uo") (theory_loads @ [staged_sml])
-  end
-
 fun remove_failed_cache_outputs project node =
   let
     val {sig_path, sml_path, data_path, script_uo, theory_ui, theory_uo} = theory_outputs node
@@ -2515,12 +2484,6 @@ fun checkpoint_ok_text_matches path expected_text =
 
 fun deps_checkpoint_ok_text deps_key =
   checkpoint_ok_text "deps_loaded" [("deps_key", deps_key)]
-
-fun final_context_ok_text deps_key input_key =
-  checkpoint_ok_text "final_context"
-    [("deps_key", deps_key),
-     ("input_key", input_key),
-     ("load_schema", "fresh_generated_theory_v1")]
 
 fun deps_checkpoint_exists path deps_key =
   checkpoint_ok_matches path [("kind", "deps_loaded"), ("deps_key", deps_key)]
@@ -3014,8 +2977,6 @@ fun run_theory_action cache_allowed policy tc root checkpoint_root base_context 
     val child_policy = Path.concat(stage, "holbuild-child-policy.sml")
     val preload = Path.concat(stage, "holbuild-preload.sml")
     val theory_exporter = Path.concat(stage, "holbuild-export-theory.sml")
-    val final_runtime = Path.concat(stage, "holbuild-final-context-runtime.sml")
-    val final_loader = Path.concat(stage, "holbuild-save-final-context.sml")
     val parents_report = Path.concat(stage, "holbuild-theory-parents.txt")
     val mldeps_report = Path.concat(stage, "holbuild-theory-mldeps.txt")
     val timeout_marker = Path.concat(stage, "holbuild-tactic-timeout.txt")
@@ -3024,7 +2985,6 @@ fun run_theory_action cache_allowed policy tc root checkpoint_root base_context 
     val checkpoint_base = action_checkpoint_base checkpoint_root action
     val deps_key = #deps_key action
     val deps_loaded = deps_loaded_path checkpoint_base deps_key
-    val final_context = final_context_path checkpoint_base
     val {sig_path, sml_path, data_path} = action_outputs root action
     val staged_sig = staged_theory_file stage logical ".sig"
     val staged_sml = staged_theory_file stage logical ".sml"
@@ -3043,27 +3003,17 @@ fun run_theory_action cache_allowed policy tc root checkpoint_root base_context 
        script above all) overwrite any input staged at the same path. *)
     val _ = List.app stage_input (#inputs action)
     val _ = write_child_policy child_policy
-    val _ = remove_file (current_final_context_log log_dir)
     val _ =
       write_theory_exporter
         {sig_path = staged_sig, path = theory_exporter,
          parents_report = SOME parents_report,
          mldeps_report = SOME mldeps_report}
     val _ = if checkpoint_enabled policy then ensure_parent deps_loaded else ()
-    val _ = if checkpoint_enabled policy then ensure_parent final_context else ()
     val _ =
       if checkpoint_enabled policy then
         List.app (fn {context_path, end_of_proof_path, failed_prefix_path, ...} =>
                     (ensure_parent context_path; ensure_parent end_of_proof_path; ensure_parent failed_prefix_path))
                  theorem_checkpoints
-      else ()
-    val _ =
-      if checkpoint_enabled policy then
-        (write_text final_runtime (runtime_line () ^ "\n");
-         write_final_context_loader
-           {sml_path = staged_sml, output = final_context,
-            ok_text = final_context_ok_text deps_key input_key,
-            path = final_loader})
       else ()
     val _ = remove_file timeout_marker
     val _ = remove_file plan_only_marker
@@ -3257,40 +3207,6 @@ fun run_theory_action cache_allowed policy tc root checkpoint_root base_context 
     val generated_metadata =
       read_generated_load_metadata {parents_report = parents_report,
                                     mldeps_report = mldeps_report}
-    fun final_context_checkpoint_retryable msg =
-      hol_state_load_failure msg orelse
-      selected_hol_state_missing_failure msg orelse
-      holbuild_runtime_missing_failure msg
-    fun run_final_context_from context include_runtime =
-      let
-        val files =
-          child_policy ::
-          ((if include_runtime then [final_runtime] else []) @ [final_loader])
-      in
-        validate_hol_context context;
-        detail_time_phase "build.exec.node.final_context"
-          (fn () =>
-              run_hol_files_to_log tc stage stage context files
-                "holbuild-final-context.log"
-                (SOME (current_final_context_log log_dir))
-                "hol run failed while loading generated theory for final context")
-      end
-    val _ =
-      if checkpoint_enabled policy then
-        ((write_staged_theory_manifests (action_load_stem root action) logical stage generated_metadata;
-          remove_checkpoint final_context;
-          if deps_checkpoint_exists deps_loaded deps_key then
-            (run_final_context_from (HolState deps_loaded) false
-             handle Error msg =>
-               if final_context_checkpoint_retryable msg then
-                 (remove_deps_checkpoint_family checkpoint_base deps_key deps_loaded;
-                  warn ("discarding invalid deps-loaded checkpoint before final-context retry: " ^ deps_loaded);
-                  run_final_context_from base_context true)
-               else raise Error msg)
-          else
-            run_final_context_from base_context true)
-         handle Error msg => (cleanup_json_stage stage_root; raise Error msg))
-      else ()
     val _ =
       if trknl_enabled policy then
         if file_exists staged_trace then
