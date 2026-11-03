@@ -99,7 +99,7 @@ fun json_debug_artifacts_fields ({log} : debug_artifacts) =
 
 fun debug_artifacts_empty artifacts = null (json_debug_artifacts_fields artifacts)
 
-fun short_hash text = String.substring(HolbuildHash.string_sha1 text, 0, 12)
+fun short_hash text = String.substring(HolbuildHash.string_sha256 text, 0, 12)
 
 fun json_node_key key label = label ^ "#" ^ short_hash key
 

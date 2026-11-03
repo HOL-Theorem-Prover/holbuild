@@ -84,7 +84,7 @@ fun link_or_copy {src, dst} =
        | e => raise Error ("could not link or copy " ^ src ^ " to " ^ dst ^ ": " ^ General.exnMessage e)
 
 fun file_hash_matches path hash =
-  path_exists path andalso HolbuildHash.file_sha1 path = hash
+  path_exists path andalso HolbuildHash.file_sha256 path = hash
   handle _ => false
 
 fun actions_dir cache = Path.concat(root cache, "actions")
@@ -143,11 +143,11 @@ fun fetch_blob cache {hash, dst} =
   in
     if not (path_exists blob) then HolbuildCacheBackend.Miss
     else if not (file_hash_matches blob hash) then
-      corrupt "cache blob SHA1 mismatch"
+      corrupt "cache blob SHA256 mismatch"
     else
       (link_or_copy {src = blob, dst = dst};
        if file_hash_matches dst hash then HolbuildCacheBackend.Hit
-       else (remove_file dst; corrupt "materialized blob SHA1 mismatch"))
+       else (remove_file dst; corrupt "materialized blob SHA256 mismatch"))
   end
   handle Error msg => HolbuildCacheBackend.Corrupt msg
        | e => HolbuildCacheBackend.Corrupt (General.exnMessage e)
@@ -158,7 +158,7 @@ fun publish_blob cache {hash, src} =
     val blob = blob_path cache hash
     val _ =
       if file_hash_matches src hash then ()
-      else raise Error ("blob SHA1 mismatch: expected " ^ hash)
+      else raise Error ("blob SHA256 mismatch: expected " ^ hash)
   in
     if verify_blob cache hash then HolbuildCacheBackend.AlreadyPresent
     else

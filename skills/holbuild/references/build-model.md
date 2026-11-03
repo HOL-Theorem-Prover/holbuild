@@ -46,7 +46,7 @@ hash(
   action kind (theory/sml/sig),
   logical target name,
   source package + relative path,
-  source content SHA-1,
+  source content SHA-256,
   dependency input keys (recursively),
   declared action policy (deps, loads, extra_deps, cache, always_reexecute),
   extra dependency hashes,

@@ -6,7 +6,7 @@ structure FS = OS.FileSys
 
 exception Error of string
 
-val format = "holbuild-hbx-v1"
+val format = "holbuild-hbx-v2"
 val payload_dir = "holbuild-cache"
 
 type metadata =
@@ -130,7 +130,7 @@ fun safe_package_dir package =
     fun safe_char c = if Char.isAlphaNum c orelse c = #"_" orelse c = #"-" then str c else "_"
     val readable = String.translate safe_char package
     val base = if readable = "" then "package" else readable
-    val hash = HolbuildHash.string_sha1 package
+    val hash = HolbuildHash.string_sha256 package
   in
     base ^ "-" ^ String.substring(hash, 0, 12)
   end

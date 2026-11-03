@@ -82,7 +82,7 @@ corrupt_manifest_log=$tmpdir/corrupt-manifest.log
 require_grep "cache entry unusable" "$corrupt_manifest_log"
 require_file "$project/.holbuild/obj/src/ATheory.dat"
 
-awk '{ if ($1 == "blob" && $2 == "sig") print "blob sig not-a-sha1"; else print }' "$manifest" > "$manifest.tmp"
+awk '{ if ($1 == "blob" && $2 == "sig") print "blob sig not-a-sha256"; else print }' "$manifest" > "$manifest.tmp"
 mv "$manifest.tmp" "$manifest"
 rm -rf "$project/.holbuild"
 invalid_hash_log=$tmpdir/invalid-hash.log

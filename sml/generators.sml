@@ -46,12 +46,12 @@ fun write_text path text =
   handle e => die ("could not write " ^ path ^ ": " ^ General.exnMessage e)
 
 fun file_hash label path =
-  if readable path then HolbuildHash.file_sha1 path
+  if readable path then HolbuildHash.file_sha256 path
   else die (label ^ " not found: " ^ path)
 
 fun output_hash path = file_hash "generator output" path
 
-fun hash_text text = HolbuildHash.string_sha1 text
+fun hash_text text = HolbuildHash.string_sha256 text
 
 fun abs_under root rel = HolbuildProject.abs_under root rel
 
@@ -103,7 +103,7 @@ fun input_line root generator rel =
   let val path = abs_under root rel
   in "input=" ^ rel ^ "@" ^ file_hash ("generator " ^ HolbuildProject.generator_name generator ^ " input") path end
 
-fun command_arg_line arg = "command_arg_sha1=" ^ hash_text arg
+fun command_arg_line arg = "command_arg_sha256=" ^ hash_text arg
 
 fun dependency_line dep_results dep =
   "dep=" ^ dep ^ "@" ^ dependency_result dep_results dep

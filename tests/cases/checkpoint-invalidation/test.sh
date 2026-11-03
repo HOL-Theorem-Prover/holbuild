@@ -74,7 +74,7 @@ src = Path("$project/src/AScript.sml").read_text()
 end = src.index("QED") + len("QED")
 Path("$tmpdir/prefix").write_text(src[:end])
 PY
-sha1sum "$tmpdir/prefix" | awk '{print $1}')
+sha256sum "$tmpdir/prefix" | awk '{print $1}')
 printf 'theorem_boundary first %s %s %s
 ' "$prefix_hash" "$context_path" "$end_path" >> "$metadata"
 
