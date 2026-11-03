@@ -2835,7 +2835,6 @@ fun theory_action root plan keys toolchain_key holdir node : theory_action =
                  map (staged "") (expand_extra_dep package_root (HolbuildProject.extra_input_path input)))
              (HolbuildProject.action_extra_inputs (source_policy node)))
     val {sig_path, sml_path, data_path, ...} = theory_outputs node
-    fun object_stem dep = root_relative root (load_stem dep)
   in
     {input_key = HolbuildBuildPlan.input_key_for keys node,
      deps_key = dependency_context_key toolchain_key plan keys node,
