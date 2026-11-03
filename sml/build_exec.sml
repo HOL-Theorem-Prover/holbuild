@@ -1484,6 +1484,10 @@ val cache_trace = HolbuildStatus.cache_trace
 fun hol_run_file_arg stage file =
   if canonical_path (Path.dir file) = canonical_path stage then Path.file file else file
 
+(* Children that ran and exited unsuccessfully.  exec-action tells a failure
+   of the HOL run itself from an error around it by this count. *)
+val failed_child_runs = ref 0
+
 fun run_hol_files_to_log tc stage workdir context files log_name current_log error_message =
   let
     val log = Path.concat(stage, log_name)
@@ -1500,9 +1504,10 @@ fun run_hol_files_to_log tc stage workdir context files log_name current_log err
     if HolbuildToolchain.success status then
       if echo_child_logs () then HolbuildStatus.message_stdout (read_text log handle _ => "") else ()
     else
-      raise Error (String.concatWith "\n"
-        [error_message,
-         child_log_detail detail_log])
+      (failed_child_runs := !failed_child_runs + 1;
+       raise Error (String.concatWith "\n"
+         [error_message,
+          child_log_detail detail_log]))
   end
 
 fun toolchain_base_context tc = HolState (HolbuildToolchain.base_state tc)
@@ -5166,8 +5171,15 @@ fun action_spec_text {root, plan, keys, action_toolchain_key, runtime, toolchain
     val {sig_path, sml_path, data_path} = #outputs action
     val input_lines =
       map (fn {path, from} => file_line "input" (token path) from) (#inputs action)
-    val library_lines =
-      map (fn lib => file_line "library" (token (library_source_path lib)) (source_file lib)) libraries
+    (* A library's key comes from its planned source hash, which the action
+       text doesn't carry, so the file shipped must be the one planned. *)
+    fun library_line lib =
+      let val line = file_line "library" (token (library_source_path lib)) (source_file lib)
+      in
+        if List.nth (String.tokens Char.isSpace line, 3) = HolbuildBuildPlan.source_hash plan lib then line
+        else raise Error ("library changed since the build was planned: " ^ source_file lib)
+      end
+    val library_lines = map library_line libraries
     val dep_lines =
       map (fn dep => String.concatWith " "
              ["dep theory", token (package dep ^ ":" ^ logical_name dep),
@@ -5688,7 +5700,8 @@ fun action_already_done root (spec : action_spec) =
   end
 
 (* Step 6: the remote now holds an entry for the action with this build's
-   outputs and a timeout contract at least as strict as the spec's. *)
+   outputs, a timeout contract at least as strict as the spec's, and every
+   blob it names (the publish only warns when an upload fails). *)
 fun check_remote_publication remote (spec : action_spec) =
   let
     val key = #input_key spec
@@ -5705,7 +5718,11 @@ fun check_remote_publication remote (spec : action_spec) =
           else if not (timeout_satisfies (#tactic_timeout spec)
                          (cache_manifest_proof_timeout (cache_manifest_lines theirs))) then
             fail "the remote cache's entry has a weaker timeout contract than requested"
-          else ()
+          else
+            case List.find (not o HolbuildRemoteCache.has_blob remote)
+                           (HolbuildCacheTransfer.unique_blobs theirs) of
+                SOME hash => fail ("the remote cache lacks blob " ^ hash ^ " of the action's entry")
+              | NONE => ()
   end
 
 (* The OOM killer's count for this process's cgroup (v2), if readable. *)
@@ -5732,7 +5749,7 @@ fun peak_rss_mb stage =
     | _ => NONE
   handle _ => NONE
 
-fun classify_run_failure log_text oom_before msg =
+fun classify_run_failure log_text oom_before child_failed msg =
   let
     val text = msg ^ "\n" ^ log_text
     fun has marker = String.isSubstring marker text
@@ -5743,6 +5760,7 @@ fun classify_run_failure log_text oom_before msg =
   in
     if oom_killed orelse has "Run out of store" then MemoryFailure
     else if has "No space left on device" then DiskFailure
+    else if not child_failed then InternalFailure
     else if String.isPrefix "tactic timed out" msg then TacticTimeoutFailure
     else ProofFailure
   end
@@ -5966,12 +5984,16 @@ fun exec_action {spec_sha256, result_file, cache_cap, toolchain} =
             val action = spec_theory_action root spec
             val stage = action_stage root action
             val oom_before = cgroup_oom_kills ()
+            val failed_before = !failed_child_runs
             val _ =
               ignore (build_theory_action true (spec_policy spec) tc root checkpoint_root
                         (toolchain_base_context tc) action)
               handle Error msg =>
                 let val log_text = read_text (build_log ()) handle _ => ""
-                in raise ActionFailed (classify_run_failure log_text oom_before msg, msg) end
+                in
+                  raise ActionFailed
+                    (classify_run_failure log_text oom_before (!failed_child_runs > failed_before) msg, msg)
+                end
             val _ = peak := peak_rss_mb stage
             val _ = check_remote_publication remote spec
           in
@@ -5987,11 +6009,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, toolchain} =
         (fn () =>
             let
               val _ =
-                Option.app (fn {limit_bytes, reserve_bytes} =>
-                               enforce_worker_cache_cap
-                                 {cache = cache, checkpoint_root = checkpoint_root,
-                                  limit_bytes = limit_bytes, reserve_bytes = reserve_bytes})
-                           cache_cap
+                let val {limit_bytes, reserve_bytes} = cache_cap
+                in
+                  enforce_worker_cache_cap
+                    {cache = cache, checkpoint_root = checkpoint_root,
+                     limit_bytes = limit_bytes, reserve_bytes = reserve_bytes}
+                end
               val (status, failure) = attempt ()
               val log = upload_log ()
             in

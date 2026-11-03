@@ -1019,7 +1019,7 @@ the run; `disk` means the disk filled. The exit status summarizes the record:
 | 3 | `input-missing`, `publish`, `toolchain`, `disk` or `internal`: retry or resubmit |
 | 4 | `spec-rejected` |
 
-`--cache-limit-gb N` caps what the worker keeps between actions: its
+The required `--cache-limit-gb N` caps what the worker keeps between actions: its
 checkpoints, its HOL toolchains with their analysers, and its local cache.
 Before each action, it evicts the least recently used until they fit in `N`
 GB minus a reserve for the action itself (`--cache-reserve-gb`, by default a

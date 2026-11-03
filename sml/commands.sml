@@ -181,7 +181,7 @@ fun action_spec_help () = print
 fun exec_action_help () = print
   "Usage:\n\
   \  holbuild --remote-cache URL [GLOBAL OPTIONS] exec-action SPEC-SHA256\n\
-  \      [--result FILE] [--cache-limit-gb N [--cache-reserve-gb N]]\n\n\
+  \      --cache-limit-gb N [--cache-reserve-gb N] [--result FILE]\n\n\
   \Run the ActionSpec stored in the remote cache as SPEC-SHA256 (see\n\
   \action-spec) and publish its result to the remote cache. The action runs in\n\
   \CACHE/action, with checkpoints in CACHE/checkpoints, where CACHE is the cache\n\
@@ -1919,10 +1919,9 @@ fun exec_action_command maxheap jobs args =
     val {spec, result, limit, reserve} = parse {spec = NONE, result = NONE, limit = NONE, reserve = NONE} args
     val spec = case spec of SOME s => s | NONE => raise Error "exec-action requires SPEC-SHA256"
     val cache_cap =
-      case (limit, reserve) of
-          (SOME limit, reserve) => SOME {limit_bytes = limit, reserve_bytes = Option.getOpt (reserve, limit div 10)}
-        | (NONE, SOME _) => raise Error "--cache-reserve-gb requires --cache-limit-gb"
-        | (NONE, NONE) => NONE
+      case limit of
+          SOME limit => {limit_bytes = limit, reserve_bytes = Option.getOpt (reserve, limit div 10)}
+        | NONE => raise Error "exec-action requires --cache-limit-gb N"
     fun toolchain {git, rev, kernel = _} =
       let
         (* Every worker must run the published archive's bytes, so a build

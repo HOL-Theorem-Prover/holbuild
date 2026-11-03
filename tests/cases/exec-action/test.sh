@@ -99,7 +99,7 @@ worker() {
   set +e
   (cd "$tmpdir/cwd-$name" &&
      HOLBUILD_CACHE=$cache "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$spec" \
-       --result "$tmpdir/$name.result" "$@") > "$tmpdir/$name.log" 2>&1
+       --cache-limit-gb 1000 --result "$tmpdir/$name.result" "$@") > "$tmpdir/$name.log" 2>&1
   worker_status=$?
   set -e
 }
@@ -216,6 +216,15 @@ worker "$(basename "$built_worker" | sed 's/^worker-//')" "$spec_a"
 expect "$(basename "$built_worker" | sed 's/^worker-//')" 0 "status=cached"
 require_file "$remote_root/ac/$ac_a"
 
+# Likewise for a blob of the entry the remote lost.
+lost_blob=$(grep -oE '[0-9a-f]{64}' "$remote_root/ac/$ac_a" | while read -r h; do
+              [[ -f "$remote_root/cas/$h" ]] && { echo "$h"; break; }; done)
+[[ -n "$lost_blob" ]] || { echo "no blob of A's entry in the remote" >&2; exit 1; }
+rm "$remote_root/cas/$lost_blob"
+worker "$(basename "$built_worker" | sed 's/^worker-//')" "$spec_a"
+expect "$(basename "$built_worker" | sed 's/^worker-//')" 0 "status=cached"
+require_file "$remote_root/cas/$lost_blob"
+
 # The rest of the chain builds in order on another worker.
 worker b "$spec_b"
 expect b 0 "status=built"
@@ -253,7 +262,24 @@ QED
 SML
 hb action-spec --upload DTheory > "$tmpdir/batch-d.txt"
 hb action-spec --upload --tactic-timeout 0.5 ETheory > "$tmpdir/batch-e.txt"
-worker d "$(spec_for "$tmpdir/batch-d.txt" worker:DTheory)"
+spec_d=$(spec_for "$tmpdir/batch-d.txt" worker:DTheory)
+
+# A failure around the HOL child, here a machine memory budget no child fits
+# in, is an infrastructure failure (exit 3), not a proof failure.
+link_hol_toolchain_cache "$tmpdir/worker-budget"
+mkdir -p "$tmpdir/coop" "$tmpdir/cwd-budget"
+set +e
+(cd "$tmpdir/cwd-budget" &&
+   HOLBUILD_CACHE=$tmpdir/worker-budget "$HOLBUILD_BIN" --remote-cache "$remote_url" \
+     --cooperate-dir "$tmpdir/coop" --machine-max-mem 1024 --child-charge 2048 \
+     exec-action "$spec_d" --cache-limit-gb 1000 --result "$tmpdir/budget.result") \
+  > "$tmpdir/budget.log" 2>&1
+worker_status=$?
+set -e
+expect budget 3 "status=failed" "failure=internal"
+require_grep "exceeds the machine budget" "$tmpdir/budget.log"
+
+worker d "$spec_d"
 expect d 1 "status=failed" "failure=proof"
 worker e "$(spec_for "$tmpdir/batch-e.txt" worker:ETheory)"
 expect e 1 "status=failed" "failure=tactic-timeout"
