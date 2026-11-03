@@ -333,7 +333,8 @@ val child_policy_traces = ["TheoryPP.include_docs", "TheoryPP.include_html_docs"
 fun write_child_policy tc path =
   let
     val directory = HolbuildCache.theory_modules_dir
-                      (HolbuildCacheConfig.cache_root ())
+                      (Path.mkAbsolute {path = HolbuildCacheConfig.cache_root (),
+                                        relativeTo = FS.getDir ()})
     val configure =
       "ignore (Meta.configureTheoryModuleCache {directory = " ^
       HolbuildToolchain.sml_string directory ^ ", base_state = " ^

@@ -78,7 +78,7 @@ SML
 
 build() {
   (cd "$project" && HOLBUILD_ECHO_CHILD_LOGS=1 \
-    "$HOLBUILD_BIN" -j1 build --skip-checkpoints DTheory) > "$1" 2>&1 ||
+    "$HOLBUILD_BIN" --cache-dir ../cache -j1 build --skip-checkpoints DTheory) > "$1" 2>&1 ||
     { cat "$1" >&2; return 1; }
 }
 rebuild() {
