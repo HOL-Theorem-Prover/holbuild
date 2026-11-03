@@ -19,7 +19,8 @@ mkdir -p \
   "$project/.holbuild/checkpoints/pkg/src/theory.deps/key" \
   "$cache/tmp/old" \
   "$cache/actions/old" \
-  "$cache/blobs"
+  "$cache/blobs" \
+  "$cache/theory-modules"
 
 cat > "$project/holproject.toml" <<TOML
 [holbuild]
@@ -46,6 +47,7 @@ printf 'prefix\n' > "$project/.holbuild/checkpoints/pkg/src/theory.deps/key/deps
 printf 'tmp\n' > "$cache/tmp/old/file"
 printf 'holbuild-cache-action-v2\nblob dat deadbeef\n' > "$cache/actions/old/manifest"
 printf 'blob\n' > "$cache/blobs/deadbeef"
+printf 'module\n' > "$cache/theory-modules/deadbeef.pmo"
 
 gc_log=$tmpdir/gc.log
 (cd "$project" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$tmpdir/ignored-cache" \
@@ -57,6 +59,7 @@ require_grep "checkpoint_gb_before=" "$gc_log"
 require_grep "checkpoint_gb_after=" "$gc_log"
 require_grep "checkpoint_max_gb=" "$gc_log"
 require_grep "cache gc: removed" "$gc_log"
+require_no_file "$cache/theory-modules/deadbeef.pmo"
 [[ ! -e "$project/.holbuild/stage/old-stage" ]] || { echo "gc left stale stage dir" >&2; exit 1; }
 [[ ! -e "$project/.holbuild/logs/old.log" ]] || { echo "gc left stale log" >&2; exit 1; }
 if find "$project/.holbuild/checkpoints" -type f -print -quit 2>/dev/null | grep -q .; then
