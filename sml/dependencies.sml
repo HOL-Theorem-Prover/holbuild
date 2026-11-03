@@ -314,8 +314,10 @@ fun outcome_value outcome =
    parsed response, or the error the response or exit status gives. *)
 fun analyse_files analyser files =
   let
-    val req = OS.FileSys.tmpName ()
-    val resp = OS.FileSys.tmpName ()
+    (* Not OS.FileSys.tmpName: it swaps the process umask, which races
+       when several analysers start at once. *)
+    val req = HolbuildTempPath.temporary "analyser-request"
+    val resp = HolbuildTempPath.temporary "analyser-response"
     fun file_line (id, path) = HolbuildAnalysisProtocol.join ["file", id, path, "deps"]
     val request = String.concatWith "\n"
       ([HolbuildAnalysisProtocol.join ["version", HolbuildAnalysisProtocol.protocol_version],

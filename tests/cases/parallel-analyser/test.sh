@@ -56,7 +56,23 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$request" ]
 [ -n "$response" ]
-grep -c '^file ' "$request" >> "$HOLBUILD_TEST_ANALYSER_LOG"
+files=$(grep -c '^file ' "$request")
+# With HOLBUILD_TEST_ANALYSER_PEERS=N, a process given more than one file
+# waits until N such processes have started, so the log shows whether they
+# overlapped.
+overlap=
+if [ -n "${HOLBUILD_TEST_ANALYSER_PEERS:-}" ] && [ "$files" -gt 1 ]; then
+  touch "$HOLBUILD_TEST_ANALYSER_LOG.peers.$$"
+  overlap=" serial"
+  for _ in $(seq 1 100); do
+    if [ "$(ls "$HOLBUILD_TEST_ANALYSER_LOG".peers.* | wc -l)" -ge "$HOLBUILD_TEST_ANALYSER_PEERS" ]; then
+      overlap=" overlapped"
+      break
+    fi
+    sleep 0.1
+  done
+fi
+printf '%s%s\n' "$files" "$overlap" >> "$HOLBUILD_TEST_ANALYSER_LOG"
 {
   printf 'version 1\nok\n'
   while read -r keyword id path _rest; do
@@ -128,7 +144,8 @@ plan() {
   local project=$1 jobs=$2 log=$3
   export HOLBUILD_TEST_ANALYSER_LOG=$log.analyser
   : > "$HOLBUILD_TEST_ANALYSER_LOG"
-  (cd "$project" && "$HOLBUILD_BIN" build --dry-run -j"$jobs" TopTheory) > "$log" 2> "$log.err"
+  (cd "$project" && HOLBUILD_TEST_ANALYSER_PEERS=${peers:-} \
+     "$HOLBUILD_BIN" build --dry-run -j"$jobs" TopTheory) > "$log" 2> "$log.err"
 }
 
 write_project "$tmpdir/serial"
@@ -138,7 +155,7 @@ if ! plan "$tmpdir/serial" 1 "$tmpdir/serial.log"; then
   cat "$tmpdir/serial.log" "$tmpdir/serial.log.err" >&2
   exit 1
 fi
-if ! plan "$tmpdir/parallel" 4 "$tmpdir/parallel.log"; then
+if ! peers=4 plan "$tmpdir/parallel" 4 "$tmpdir/parallel.log"; then
   echo "planning with -j4 failed" >&2
   cat "$tmpdir/parallel.log" "$tmpdir/parallel.log.err" >&2
   exit 1
@@ -150,8 +167,8 @@ if [ "$(sort -n "$tmpdir/serial.log.analyser" | tr '\n' ' ')" != "1 40 " ]; then
   cat "$tmpdir/serial.log.analyser" >&2
   exit 1
 fi
-if [ "$(sort -n "$tmpdir/parallel.log.analyser" | tr '\n' ' ')" != "1 10 10 10 10 " ]; then
-  echo "expected -j4 to split the 40-source frontier over four processes" >&2
+if [ "$(sort -n "$tmpdir/parallel.log.analyser" | tr '\n' ' ')" != "1 10 overlapped 10 overlapped 10 overlapped 10 overlapped " ]; then
+  echo "expected -j4 to split the 40-source frontier over four concurrent processes" >&2
   cat "$tmpdir/parallel.log.analyser" >&2
   exit 1
 fi
