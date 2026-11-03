@@ -612,8 +612,7 @@ corrupt entry as a cache miss and falls back to source.
 Shared dependency state is keyed by the same resolved action key and
 base-context key as the semantic artifacts, not by raw `.save` bytes. Two
 projects depending on the same package revision/toolchain can therefore
-materialize the same dependency final-context state into their own `.holbuild/`
-views. The state bundle is still only an accelerator: if validation, relocation,
+materialize the same dependency state into their own `.holbuild/` views. The state bundle is still only an accelerator: if validation, relocation,
 or toolchain checks fail, holbuild rebuilds the dependency from source or earlier
 validated state.
 
@@ -677,7 +676,7 @@ reuse any cached theory, including those built with `--skip-proof-steps`.
 
 Heaps requested by users remain project-local exported artifacts. Checkpoints are
 local build/debug state, not exported artifacts. Successful theory builds keep
-reusable checkpoints, including `final_context`, until they are replaced or
+reusable checkpoints until they are replaced or
 evicted, so later builds and `run --from` can start from them. Raw checkpoint bytes are never the semantic identity; they are local replay/debug
 breadcrumbs for an already-resolved graph, not retained outputs.
 
@@ -693,23 +692,14 @@ building a theory, the prover/runtime saves PolyML states at boundaries such as:
 deps_loaded.save         after resolved ancestors are loaded in topological order
 <thm>_context.save       after the theorem has been stored in the theory context
 <thm>_end_of_proof.save  after goal-fragment proof replay, for navigation
-final_context.save       after a clean consumer process loads the generated theory
 ```
 
-`final_context.save` must mean successor-ready, not merely immediately after
-`export_theory()`. Current HOL versions seal a theory when it is exported, so a
-single session cannot safely export and then re-incorporate the generated theory
-module. The source child therefore records generated load metadata, exports, and
-exits. Holbuild constructs complete stage load manifests from that metadata, then
-a separate child starts from the pre-theory dependency context (or the toolchain
-base state as a fallback), loads `FooTheory`, and saves `final_context.save`.
-This also ensures that the final context reflects the published consumer view,
-not arbitrary top-level SML bindings retained from the theory script.
-
-When checkpoints are disabled there is no persistent state that needs this
-second load, so source execution stops after export. Generated modules are loaded
-normally by dependent actions or explicit HOL consumers through their published
-manifests rather than being eagerly reloaded in a disposable source process.
+Holbuild saves no state after the theory is exported. Current HOL versions seal
+a theory when it is exported, so saving one would take a second process that
+loads the generated theory, and nothing would read the result. Source execution
+stops after export; generated modules are loaded by dependent actions or explicit
+HOL consumers through their published manifests. A generated module that fails to
+load therefore fails the first dependent theory, not its own build.
 
 Those checkpoints answer a different question from action keys:
 
@@ -815,8 +805,7 @@ For instrumented root-package actions, holbuild may create several local
 checkpoint classes while executing a theory action: `deps_loaded` after loading resolved dependencies,
 theorem context/end-of-proof states for modern AST `Theorem ... Proof ... QED`
 declarations, failed-prefix proof-navigation state after instrumented proof
-failures, and a final context created by loading the exported theory in a clean
-consumer child. Successful builds remove stale
+failures. Successful builds remove stale
 failed-prefix checkpoints for the rebuilt source but retain reusable dependency
 and theorem checkpoints for proof-edit resume until they are replaced or evicted.
 The project-local checkpoint budget defaults to 5 GiB and can be configured with
@@ -840,22 +829,18 @@ credits a family after its artifact roots have actually disappeared.
 `--skip-checkpoints` disables all `.save`/`.ok` creation while still running
 modern theorem proofs through the selected instrumentation runtime. `--skip-proof-steps`
 opts out of theorem instrumentation: with checkpoints still enabled, the build can
-still save and consult `deps_loaded` and save the final context in the separate
-consumer child, but there are no theorem-context/end-of-proof/failed-prefix
-proof-navigation checkpoints and no tactic timeout enforcement for that build.
-The final context is not a downstream canonical load context for builds, but
-`holbuild run --from THEORY` and `repl --from THEORY` start interactive
-sessions from it, or from `deps_loaded`, while it is current. A final context
-saved from `deps_loaded` is a PolyML child of that exact path, so it is removed
-whenever its `deps_loaded` parent is removed or rewritten, and `--from` uses it
-only while its saved parent path still names the current `deps_loaded` or the
-toolchain base state (a moved project falls back to `deps_loaded`). `run` takes
-no project lock, so `--from` only reads ok-files; a concurrent build, `gc`, or
-eviction that removes the chosen checkpoint first makes the session fail to
-start rather than start from a wrong state. Without `--from`, sessions given
-`.sml` scripts take THEORY from the scripts' dependencies, found by the same
-`load`-call and Holdep analysis as build sources: of the root-package theories
-they reach, the one with the most ancestors.
+still save and consult `deps_loaded`, but there are no
+theorem-context/end-of-proof/failed-prefix proof-navigation checkpoints and no
+tactic timeout enforcement for that build.
+`holbuild run --from THEORY` and `repl --from THEORY` start interactive sessions
+from THEORY's `deps_loaded` while it is current, and load THEORY on top when its
+metadata matches its current input key. `run` takes no project lock, so `--from`
+only reads ok-files and metadata; a concurrent build, `gc`, or eviction that
+removes the chosen checkpoint first makes the session fail to start rather than
+start from a wrong state. Without `--from`, sessions given `.sml` scripts take
+THEORY from the scripts' dependencies, found by the same `load`-call and Holdep
+analysis as build sources: of the root-package theories they reach, the one
+with the most ancestors.
 
 Current HOL versions also generate per-theory HTML documentation during
 `export_theory()` by default. Holbuild disables both historical spellings of that

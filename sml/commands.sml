@@ -113,10 +113,10 @@ fun repl_help () = print
   \(--gcthreads, --maxheap, -H, ...), which holbuild's own runtime consumes;\n\
   \holbuild rejects those where it can detect them (Linux).\n\n\
   \Options:\n\
-  \  --from THEORY  Start from THEORY's build checkpoint: final_context (THEORY\n\
-  \                 loaded) when current for THEORY's sources, else deps_loaded\n\
-  \                 (its ancestors loaded) when only THEORY changed, else\n\
-  \                 [run].heap or the HOL base state. Does not build THEORY.\n\
+  \  --from THEORY  Start from THEORY's deps_loaded build checkpoint (its\n\
+  \                 ancestors loaded) and load THEORY on top when it is built\n\
+  \                 for its current sources; without a current checkpoint,\n\
+  \                 from [run].heap or the HOL base state. Does not build THEORY.\n\
   \                 Without --from, given .sml scripts, THEORY is inferred:\n\
   \                 of the project theories the scripts depend on, the one\n\
   \                 with the most ancestors.\n\n\
@@ -131,10 +131,10 @@ fun run_help () = print
   \(--gcthreads, --maxheap, -H, ...), which holbuild's own runtime consumes;\n\
   \holbuild rejects those where it can detect them (Linux).\n\n\
   \Options:\n\
-  \  --from THEORY  Start from THEORY's build checkpoint: final_context (THEORY\n\
-  \                 loaded) when current for THEORY's sources, else deps_loaded\n\
-  \                 (its ancestors loaded) when only THEORY changed, else\n\
-  \                 [run].heap or the HOL base state. Does not build THEORY.\n\
+  \  --from THEORY  Start from THEORY's deps_loaded build checkpoint (its\n\
+  \                 ancestors loaded) and load THEORY on top when it is built\n\
+  \                 for its current sources; without a current checkpoint,\n\
+  \                 from [run].heap or the HOL base state. Does not build THEORY.\n\
   \                 Without --from, given .sml scripts, THEORY is inferred:\n\
   \                 of the project theories the scripts depend on, the one\n\
   \                 with the most ancestors.\n\n\
@@ -1798,11 +1798,12 @@ fun from_theory_state tc project theory =
     HolbuildBuildExec.run_from_state tc project plan keys node
   end
 
-(* The state HOL starts from, and the lines the run context loads first. *)
-type run_start = {holstate : string, context_lines : string list}
+(* The state HOL starts from, the lines the run context runs first, and the
+   modules it loads before [run].loads. *)
+type run_start = {holstate : string, context_lines : string list, loads : string list}
 
-fun checkpoint_start path =
-  {holstate = path, context_lines = HolbuildBuildExec.child_policy_reset_lines}
+fun checkpoint_start path loads =
+  {holstate = path, context_lines = HolbuildBuildExec.child_policy_reset_lines, loads = loads}
 
 (* Where run and repl start: an explicit --from theory, the theory inferred
    from the script files HOL is given, or the fallback state (check). *)
@@ -1860,18 +1861,19 @@ fun run_start tc project run_heap from : run_start =
       case (run_heap, HolbuildProject.abs_run_heap project) of
           (true, SOME heap) => (heap, "[run].heap " ^ heap)
         | _ => (HolbuildToolchain.base_state tc, "the HOL base state")
-    val fallback_start = {holstate = fallback, context_lines = []}
+    val fallback_start = {holstate = fallback, context_lines = [], loads = []}
     fun start label theory =
       let
         fun note text = HolbuildStatus.message_stderr ("holbuild: " ^ label ^ ": " ^ text ^ "\n")
       in
         case from_theory_state tc project theory of
-            HolbuildBuildExec.FinalContextState path =>
-              (note "starting from its final_context checkpoint"; checkpoint_start path)
-          | HolbuildBuildExec.DepsLoadedState {path, final_context_unusable} =>
-              (note (final_context_unusable ^ "; starting from its deps_loaded checkpoint, " ^
-                     "which has only its ancestors loaded");
-               checkpoint_start path)
+            HolbuildBuildExec.DepsLoadedState {path, load = SOME stem} =>
+              (note ("starting from its deps_loaded checkpoint and loading " ^ OS.Path.file stem);
+               checkpoint_start path [stem])
+          | HolbuildBuildExec.DepsLoadedState {path, load = NONE} =>
+              (note ("it is not built for its current source; starting from its deps_loaded " ^
+                     "checkpoint, which has only its ancestors loaded");
+               checkpoint_start path [])
           | HolbuildBuildExec.NoRunFromState reason =>
               (note (reason ^ "; starting from " ^ fallback_name); fallback_start)
       end
@@ -1911,12 +1913,12 @@ fun run_hol_status runner tc cli_jobs run_heap from subcommand user_args =
     val project =
       if null run_loads then configured_project
       else timed_phase "run.project.rediscover" load_project
-    val {holstate, context_lines} = run_start tc project run_heap from
+    val {holstate, context_lines, loads} = run_start tc project run_heap from
     val packages = resolved_packages (resolution_for_toolchain tc) project
     fun invoke context =
       runner (hol_run_argv tc holstate subcommand context user_args)
   in
-    HolbuildToolchain.with_run_context project packages context_lines invoke
+    HolbuildToolchain.with_run_context project packages context_lines loads invoke
   end
 
 fun run_hol_with runner tc cli_jobs subcommand args =

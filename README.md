@@ -722,8 +722,8 @@ starting state is:
 
 | Condition | State |
 | --- | --- |
-| `THEORY`'s `final_context` checkpoint matches its current input key and its parent state is still in place | `THEORY` and its ancestors loaded |
-| Only `THEORY` changed, or the project directory moved: its `deps_loaded` checkpoint matches its current dependencies | ancestors loaded, `THEORY` not loaded |
+| Its `deps_loaded` checkpoint matches its current dependencies and `THEORY` is built for its current source | ancestors loaded from the checkpoint, then `THEORY` loaded |
+| Only `THEORY` changed since it was built, or the project directory moved (`THEORY`'s objects name the old directory, so loading it fails with a warning): its `deps_loaded` checkpoint matches its current dependencies | ancestors loaded, `THEORY` not loaded |
 | Otherwise: not built yet, restored from the cache without a local build, built with `--skip-checkpoints`, checkpoints removed by `gc`, a dependency or the HOL toolchain changed, or `THEORY` is in a dependency package | `[run].heap` if configured, else the HOL base state |
 
 A usable checkpoint takes precedence over `[run].heap`. holbuild prints one
@@ -778,15 +778,12 @@ holbuild build --skip-checkpoints MyTheory
 - `--repl-on-failure` starts a HOL REPL from the newest useful checkpoint after a
   theory failure. It serialises the build and is not supported with `--json`.
 - `--skip-proof-steps` opts out of proof-step execution.
-- `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation. With no final
-  context to save, holbuild does not eagerly reload the just-exported generated
-  theory; dependents and explicit consumers load it normally through its manifest.
+- `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation.
 
 For source-executed theory builds, holbuild writes a live child log at
 `.holbuild/logs/current/<package>/<logical>/build.log`. You can inspect it during
 a long build with `tail -f`; after the child exits, the same path is kept as the
-latest log. When checkpoints are enabled, the separate generated-theory load and
-final-context save are recorded in `final-context.log` beside `build.log`.
+latest log.
 Up-to-date and cache-restored targets do not produce a new log; use
 `--force --no-cache` to regenerate one.
 

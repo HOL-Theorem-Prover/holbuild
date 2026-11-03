@@ -170,7 +170,6 @@ first_log=$tmpdir/first.log
 require_grep "holbuild checkpoint kind=deps_loaded" "$first_log"
 require_grep "holbuild checkpoint kind=end_of_proof" "$first_log"
 require_grep "holbuild checkpoint kind=theorem_context" "$first_log"
-require_grep "holbuild checkpoint kind=final_context" "$first_log"
 if grep -q '^[0-9][0-9]* subgoals:$' "$first_log"; then
   echo "proof IR child log leaked interactive goal-stack progress" >&2
   exit 1
@@ -268,7 +267,7 @@ if grep -q "theorem_boundary a_thm" "$skip_proof_steps_project/.holbuild/dep/rep
   exit 1
 fi
 # --skip-proof-steps does not create theorem context checkpoints,
-# but deps/final-context checkpoints persist for incremental rebuilds
+# but deps checkpoints persist for incremental rebuilds
 
 plain_replay_project=$tmpdir/plain-replay-project
 mkdir -p "$plain_replay_project/src"

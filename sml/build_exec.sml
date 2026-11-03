@@ -210,7 +210,7 @@ datatype theory_load =
 (* A theory action: everything building one theory needs, without the build
    plan.  Paths in the action root, the directory that holds `.holbuild/`,
    are relative to it and made absolute only when the action runs: the
-   preload's objects, `load_stems` and `outputs`.  `inputs` are staged under
+   preload's objects and `outputs`.  `inputs` are staged under
    the stage root, which mirrors the package layout; each `path` is relative
    to it, and `from` says where the file's bytes are read.  `script_dir` is
    the script's directory in the stage ("" when the script lies outside its
@@ -229,7 +229,6 @@ type theory_action =
    script_dir : string,
    inputs : {path : string, from : string} list,
    loads : theory_load list,
-   load_stems : (string * string) list,
    outputs : {sig_path : string, sml_path : string, data_path : string},
    extra_outputs : string list}
 
@@ -363,19 +362,8 @@ fun generated_metadata_report_lines {parents_report, mldeps_report} =
 fun export_theory_if_needed_line sig_path =
   "val _ = HolbuildRuntime.export_theory_if_needed " ^ HolbuildToolchain.sml_string sig_path ^ ";"
 
-fun hfs_unmapped_path path =
-  let
-    val {dir, file} = Path.splitDirFile path
-    val {dir = parent, file = leaf} = Path.splitDirFile dir
-  in
-    if leaf = "objs" andalso Path.file parent = ".hol" then
-      Path.concat(Path.dir parent, file)
-    else path
-  end
-
-(* Export now seals a theory in current HOL versions.  Keep metadata capture and
-   export in the source child, but never load the generated theory module there:
-   the consumer-style load belongs in a fresh process. *)
+(* Export now seals a theory in current HOL versions, so the source child
+   captures metadata and exports, but never loads the generated theory module. *)
 (* The exporter is the child's last file, so the child's peak resident set
    size is known there: it records /proc/self/status's VmHWM line beside
    itself, where it can, for a remote worker's result record. *)
@@ -396,21 +384,6 @@ fun write_theory_exporter {sig_path, path, parents_report, mldeps_report} =
                                        mldeps_report = mldeps_report} @
       [export_theory_if_needed_line sig_path,
        peak_rss_report_line (Path.concat(Path.dir path, peak_rss_report_name))]
-  in
-    write_text path (String.concatWith "\n" lines ^ "\n")
-  end
-
-fun generated_theory_stem sml_path =
-  drop_suffix ".sml" (hfs_unmapped_path sml_path)
-
-fun write_final_context_loader {sml_path, output, ok_text, path} =
-  let
-    val lines =
-      ["HolbuildRuntime.load " ^
-         HolbuildToolchain.sml_string (generated_theory_stem sml_path) ^ ";",
-       checkpoint_save_runtime_line (),
-       save_heap_line {label = "final_context", share_common_data = true,
-                       output = output, ok_text = ok_text}]
   in
     write_text path (String.concatWith "\n" lines ^ "\n")
   end
@@ -612,7 +585,6 @@ fun current_log_dir root package logical =
   Path.concat(Path.concat(Path.concat(Path.concat(root, ".holbuild/logs"), "current"), package), logical)
 
 fun current_build_log dir = Path.concat(dir, "build.log")
-fun current_final_context_log dir = Path.concat(dir, "final-context.log")
 fun current_checkpoint_failure_log dir = Path.concat(dir, "instrumented-failure.log")
 fun current_proof_trace_log dir = Path.concat(dir, "proof-trace.log")
 
@@ -727,8 +699,6 @@ fun declaration_checkpoints_for_deps_root base deps_key =
 fun declaration_checkpoint_dir base deps_key proof_engine prefix_hash =
   Path.concat(Path.concat(declaration_checkpoints_for_deps_root base deps_key, proof_engine), prefix_hash)
 
-fun final_context_path base = base ^ ".final_context.save"
-
 fun remove_legacy_checkpoint_family base =
   let
     val dir = Path.dir base
@@ -759,12 +729,10 @@ fun remove_declaration_checkpoints_for_deps base deps_key =
 
 (* Delete these before deleting or replacing the deps parent.  A deps heap path
    is stable for a deps_key, so surviving descendants must never outlive
-   deletion of that parent path.  final_context is not keyed on deps_key, but it
-   may be a child of this parent, and `run --from` loads it. *)
+   deletion of that parent path. *)
 fun remove_deps_checkpoint_descendants base deps_key =
   (remove_theorem_checkpoints_for_deps base deps_key;
-   remove_declaration_checkpoints_for_deps base deps_key;
-   remove_checkpoint (final_context_path base))
+   remove_declaration_checkpoints_for_deps base deps_key)
 
 fun remove_deps_checkpoint_family base deps_key deps_loaded =
   (remove_deps_checkpoint_descendants base deps_key;
@@ -871,6 +839,8 @@ fun checkpoint_marker_base path =
       SOME (Path.concat(Path.dir path, drop_suffix ".theorems" name))
     else if has_suffix ".decls" name then
       SOME (Path.concat(Path.dir path, drop_suffix ".decls" name))
+    (* Older holbuild versions saved a .final_context.save beside each theory
+       checkpoint; it still belongs to that family, so cleaning removes it. *)
     else if has_suffix ".final_context.save.ok.tmp" name then
       SOME (Path.concat(Path.dir path, drop_suffix ".final_context.save.ok.tmp" name))
     else if has_suffix ".final_context.save.ok.bak" name then
@@ -2120,10 +2090,6 @@ fun publish_theory_cache subject input_key proof_timeout staged_sig published_sm
    for HOL to find. *)
 fun plan_load_stem plan name = Option.map load_stem (HolbuildBuildPlan.node_named plan name)
 
-fun action_load_stem root (action : theory_action) name =
-  Option.map (fn (_, stem) => in_root root stem)
-    (List.find (fn (name', _) => name' = name) (#load_stems action))
-
 fun mldep_load_stem resolve dep = getOpt (resolve dep, dep)
 
 fun mldep_load_stems resolve mldeps = unique_strings (map (mldep_load_stem resolve) mldeps)
@@ -2167,21 +2133,6 @@ fun write_local_theory_manifests plan node generated_metadata =
     write_object_manifest theory_ui [sig_path];
     write_object_manifest theory_uo (theory_loads @ [sml_path]);
     write_object_manifest script_uo (script_loads @ [source_file node])
-  end
-
-(* A source child used to write a one-entry stage manifest and then load it in
-   the already-exported session.  A fresh final-context child needs the same
-   parent/ML-dependency closure as an eventual consumer of the published
-   artifact, so construct its stage manifests from the runtime reports. *)
-fun write_staged_theory_manifests resolve logical stage generated_metadata =
-  let
-    val staged_sig = hfs_unmapped_path (staged_theory_file stage logical ".sig")
-    val staged_sml = hfs_unmapped_path (staged_theory_file stage logical ".sml")
-    val stem = generated_theory_stem staged_sml
-    val theory_loads = generated_theory_loads resolve generated_metadata
-  in
-    write_object_manifest (stem ^ ".ui") [staged_sig];
-    write_object_manifest (stem ^ ".uo") (theory_loads @ [staged_sml])
   end
 
 fun remove_failed_cache_outputs project node =
@@ -2547,12 +2498,6 @@ fun checkpoint_ok_text_matches path expected_text =
 
 fun deps_checkpoint_ok_text deps_key =
   checkpoint_ok_text "deps_loaded" [("deps_key", deps_key)]
-
-fun final_context_ok_text deps_key input_key =
-  checkpoint_ok_text "final_context"
-    [("deps_key", deps_key),
-     ("input_key", input_key),
-     ("load_schema", "fresh_generated_theory_v1")]
 
 fun deps_checkpoint_exists path deps_key =
   checkpoint_ok_matches path [("kind", "deps_loaded"), ("deps_key", deps_key)]
@@ -2920,7 +2865,6 @@ fun theory_action root plan keys toolchain_key holdir node : theory_action =
                  map (staged "") (expand_extra_dep package_root (HolbuildProject.extra_input_path input)))
              (HolbuildProject.action_extra_inputs (source_policy node)))
     val {sig_path, sml_path, data_path, ...} = theory_outputs node
-    fun object_stem dep = root_relative root (load_stem dep)
   in
     {input_key = HolbuildBuildPlan.input_key_for keys node,
      deps_key = dependency_context_key toolchain_key plan keys node,
@@ -2933,9 +2877,6 @@ fun theory_action root plan keys toolchain_key holdir node : theory_action =
      script_dir = stage_script_dir,
      inputs = source_inputs @ manifest_inputs,
      loads = preload_loads root plan node,
-     load_stems =
-       map (fn dep => (logical_name dep, object_stem dep))
-           (HolbuildBuildPlan.transitive_project_deps plan node),
      outputs = {sig_path = root_relative root sig_path,
                 sml_path = root_relative root sml_path,
                 data_path = root_relative root data_path},
@@ -3045,8 +2986,6 @@ fun run_theory_action cache_allowed policy tc root checkpoint_root base_context 
     val child_policy = Path.concat(stage, "holbuild-child-policy.sml")
     val preload = Path.concat(stage, "holbuild-preload.sml")
     val theory_exporter = Path.concat(stage, "holbuild-export-theory.sml")
-    val final_runtime = Path.concat(stage, "holbuild-final-context-runtime.sml")
-    val final_loader = Path.concat(stage, "holbuild-save-final-context.sml")
     val parents_report = Path.concat(stage, "holbuild-theory-parents.txt")
     val mldeps_report = Path.concat(stage, "holbuild-theory-mldeps.txt")
     val timeout_marker = Path.concat(stage, "holbuild-tactic-timeout.txt")
@@ -3055,7 +2994,6 @@ fun run_theory_action cache_allowed policy tc root checkpoint_root base_context 
     val checkpoint_base = action_checkpoint_base checkpoint_root action
     val deps_key = #deps_key action
     val deps_loaded = deps_loaded_path checkpoint_base deps_key
-    val final_context = final_context_path checkpoint_base
     val {sig_path, sml_path, data_path} = action_outputs root action
     val staged_sig = staged_theory_file stage logical ".sig"
     val staged_sml = staged_theory_file stage logical ".sml"
@@ -3074,27 +3012,17 @@ fun run_theory_action cache_allowed policy tc root checkpoint_root base_context 
        script above all) overwrite any input staged at the same path. *)
     val _ = List.app stage_input (#inputs action)
     val _ = write_child_policy child_policy
-    val _ = remove_file (current_final_context_log log_dir)
     val _ =
       write_theory_exporter
         {sig_path = staged_sig, path = theory_exporter,
          parents_report = SOME parents_report,
          mldeps_report = SOME mldeps_report}
     val _ = if checkpoint_enabled policy then ensure_parent deps_loaded else ()
-    val _ = if checkpoint_enabled policy then ensure_parent final_context else ()
     val _ =
       if checkpoint_enabled policy then
         List.app (fn {context_path, end_of_proof_path, failed_prefix_path, ...} =>
                     (ensure_parent context_path; ensure_parent end_of_proof_path; ensure_parent failed_prefix_path))
                  theorem_checkpoints
-      else ()
-    val _ =
-      if checkpoint_enabled policy then
-        (write_text final_runtime (runtime_line () ^ "\n");
-         write_final_context_loader
-           {sml_path = staged_sml, output = final_context,
-            ok_text = final_context_ok_text deps_key input_key,
-            path = final_loader})
       else ()
     val _ = remove_file timeout_marker
     val _ = remove_file plan_only_marker
@@ -3288,40 +3216,6 @@ fun run_theory_action cache_allowed policy tc root checkpoint_root base_context 
     val generated_metadata =
       read_generated_load_metadata {parents_report = parents_report,
                                     mldeps_report = mldeps_report}
-    fun final_context_checkpoint_retryable msg =
-      hol_state_load_failure msg orelse
-      selected_hol_state_missing_failure msg orelse
-      holbuild_runtime_missing_failure msg
-    fun run_final_context_from context include_runtime =
-      let
-        val files =
-          child_policy ::
-          ((if include_runtime then [final_runtime] else []) @ [final_loader])
-      in
-        validate_hol_context context;
-        detail_time_phase "build.exec.node.final_context"
-          (fn () =>
-              run_hol_files_to_log tc stage stage context files
-                "holbuild-final-context.log"
-                (SOME (current_final_context_log log_dir))
-                "hol run failed while loading generated theory for final context")
-      end
-    val _ =
-      if checkpoint_enabled policy then
-        ((write_staged_theory_manifests (action_load_stem root action) logical stage generated_metadata;
-          remove_checkpoint final_context;
-          if deps_checkpoint_exists deps_loaded deps_key then
-            (run_final_context_from (HolState deps_loaded) false
-             handle Error msg =>
-               if final_context_checkpoint_retryable msg then
-                 (remove_deps_checkpoint_family checkpoint_base deps_key deps_loaded;
-                  warn ("discarding invalid deps-loaded checkpoint before final-context retry: " ^ deps_loaded);
-                  run_final_context_from base_context true)
-               else raise Error msg)
-          else
-            run_final_context_from base_context true)
-         handle Error msg => (cleanup_json_stage stage_root; raise Error msg))
-      else ()
     val _ =
       if trknl_enabled policy then
         if file_exists staged_trace then
@@ -3806,28 +3700,13 @@ fun build_config_lines_for_node options project node =
     | HolbuildSourceIndex.Sml => policy_config_lines no_checkpoint_policy
     | HolbuildSourceIndex.Sig => policy_config_lines no_checkpoint_policy
 
-(* The saved HOL state `run --from` starts from, or why there is none. *)
+(* The saved HOL state `run --from` starts from, or why there is none.
+   deps_loaded has THEORY's ancestors loaded; LOAD is THEORY's generated module
+   when its built outputs are for its current source, so the session loads it
+   on top. *)
 datatype run_from_state =
-  FinalContextState of string
-| DepsLoadedState of {path : string, final_context_unusable : string}
+  DepsLoadedState of {path : string, load : string option}
 | NoRunFromState of string
-
-fun same_file a b =
-  FS.compare (FS.fileId a, FS.fileId b) = EQUAL handle OS.SysErr _ => false
-
-(* Poly/ML loads a child state only from the parent path saved in its header,
-   so a final_context whose parent moved with the project directory, or is no
-   longer the current deps_loaded, cannot load.  NONE when it has no parent or
-   its parent is one of PARENTS, else why not. *)
-fun parent_mismatch path parents =
-  (case PolyML.SaveState.showParent path of
-       SOME parent =>
-         if List.exists (same_file parent) parents then NONE
-         else SOME ("its final_context checkpoint cannot load because its parent state " ^
-                    parent ^ " has moved or been replaced")
-     | NONE => NONE)
-  handle OS.SysErr (msg, _) => SOME ("its final_context checkpoint is unreadable: " ^ msg)
-       | Fail msg => SOME ("its final_context checkpoint is unreadable: " ^ msg)
 
 (* Checkpoints are current only for the keys a build of NODE would use now.
    Run holds no project lock, so this only reads checkpoint files; a build, gc
@@ -3838,17 +3717,14 @@ fun run_from_state tc project plan keys node =
     val name = logical_name node
     val deps_key = dependency_context_key (HolbuildToolchain.toolchain_key tc) plan keys node
     val base = checkpoint_base project node
-    val final_context = final_context_path base
     fun deps_loaded_current dir =
       HolbuildCheckpointStore.ok_current (Path.concat(dir, "deps_loaded.save"))
         [("kind", "deps_loaded"), ("deps_key", Path.file dir)]
     val deps_dir = Path.concat(deps_checkpoint_root base, deps_key)
-    val deps_loaded = deps_loaded_path base deps_key
-    fun final_context_unusable () =
-      if HolbuildCheckpointStore.ok_text_current final_context
-           (final_context_ok_text deps_key (HolbuildBuildPlan.input_key_for keys node)) then
-        parent_mismatch final_context [deps_loaded, HolbuildToolchain.base_state tc]
-      else SOME "no final_context checkpoint for its current source"
+    fun theory_built () =
+      case current_metadata (metadata_path project node) of
+          SOME text => metadata_input_key_matches (HolbuildBuildPlan.input_key_for keys node) text
+        | NONE => false
     fun deps_changed () =
       List.exists (fn dir => dir <> deps_dir andalso deps_loaded_current dir)
         (children (deps_checkpoint_root base))
@@ -3856,19 +3732,16 @@ fun run_from_state tc project plan keys node =
     if not (root_package_node project node) then
       NoRunFromState (name ^ " is in dependency package " ^ package node ^
                       "; holbuild keeps checkpoints only for root-package theories")
+    else if deps_loaded_current deps_dir then
+      DepsLoadedState {path = deps_loaded_path base deps_key,
+                       load = if theory_built () then SOME (load_stem node) else NONE}
+    else if deps_changed () then
+      NoRunFromState ("the dependencies or HOL toolchain of " ^ name ^
+                      " changed since its checkpoints were saved")
     else
-      case final_context_unusable () of
-          NONE => FinalContextState final_context
-        | SOME why =>
-            if deps_loaded_current deps_dir then
-              DepsLoadedState {path = deps_loaded, final_context_unusable = why}
-            else if deps_changed () then
-              NoRunFromState ("the dependencies or HOL toolchain of " ^ name ^
-                              " changed since its checkpoints were saved")
-            else
-              NoRunFromState (name ^ " has no current checkpoint (not built yet, restored from the cache " ^
-                              "without a local build, " ^
-                              "built with --skip-checkpoints, or removed by gc)")
+      NoRunFromState (name ^ " has no current checkpoint (not built yet, restored from the cache " ^
+                      "without a local build, " ^
+                      "built with --skip-checkpoints, or removed by gc)")
   end
 
 fun write_temp_text path text =
@@ -5719,7 +5592,6 @@ fun spec_theory_action root (spec : action_spec) : theory_action =
      script_dir = script_dir,
      inputs = map (fn {path, ...} => {path = path, from = in_root root (action_source_path package path)}) (#inputs spec),
      loads = #loads spec,
-     load_stems = spec_load_stems spec,
      outputs = #outputs spec,
      extra_outputs = #extra_outputs spec}
   end

@@ -36,30 +36,28 @@ During a theory build, checkpoints may be created at syntactic boundaries:
 | `<thm>_context.save` | Theorem stored in theory context | Resume before the next declaration |
 | `<thm>_end_of_proof.save` | Instrumented proof replay complete, before `drop_all` | Proof navigation/debug state, not successor-ready |
 | `<thm>_failed_prefix.save` | Failed proof after a reusable prefix | Fast rebuild after editing a failing suffix |
-| `final_context.save` | Generated theory sig/sml loaded in a clean consumer process; successor-ready | Debug/successor breadcrumb |
 
-Export seals a theory in current HOL versions. The source process therefore records load metadata, exports, and exits; a separate process starts from the pre-theory dependency context (or the toolchain base state), loads the generated theory, and saves `final_context.save`. This consumer-style context intentionally excludes arbitrary source-script SML bindings.
+Export seals a theory in current HOL versions, so no state is saved after it: the source process exports and exits, and dependents load the generated theory through its manifest. A generated theory that fails to load fails its first dependent.
 
 Successful source builds retain reusable deps/theorem-context checkpoints for future proof edits and clear stale failed-prefix checkpoints for that source. Failed/interrupted builds may leave failed-prefix and partial debug breadcrumbs. `holbuild gc` removes old checkpoint families and enforces the default 5GB project checkpoint budget.
 
 ## Checkpoint validity
 
 `.ok` metadata contains schema/versioned fields such as:
-- Checkpoint kind (`deps_loaded`, `theorem_context`, `end_of_proof`, `failed_prefix`, `final_context`)
+- Checkpoint kind (`deps_loaded`, `theorem_context`, `end_of_proof`, `failed_prefix`)
 - Dependency context key (`deps_key`)
 - Proof engine (`proof_ir_*`)
 - Source prefix/header/checkpoint keys
-- Final-context input key and fresh-load schema
 
 Replay eligibility requires exact metadata match. Invalid selected checkpoints are discarded and retried from an earlier valid context instead of surfacing as proof failures. Parent/child checkpoint families are removed atomically: theorem descendants must not outlive their `deps_loaded.save` parent.
 
 ## `--skip-checkpoints`
 
-Runs theorem proofs through proof steps without saving `.save`/`.ok` files. No `deps_loaded`, `final_context`, theorem-context, end-of-proof, or failed-prefix checkpoints are created. With no final context to persist, holbuild stops the source process after export rather than eagerly reloading the sealed theory; generated artifacts are loaded normally by dependents or explicit consumers.
+Runs theorem proofs through proof steps without saving `.save`/`.ok` files. No `deps_loaded`, theorem-context, end-of-proof, or failed-prefix checkpoints are created.
 
 ## `--skip-proof-steps`
 
-Opts out of proof-step execution. Source is sent through the plain `hol run` path. There is no per-tactic timeout, trace-step trace, theorem-context/end-of-proof/failed-prefix proof navigation, or instrumented goal diagnostics. Non-theorem dependency/final-context checkpoint machinery may still be used when checkpoints are enabled.
+Opts out of proof-step execution. Source is sent through the plain `hol run` path. There is no per-tactic timeout, trace-step trace, theorem-context/end-of-proof/failed-prefix proof navigation, or instrumented goal diagnostics. The `deps_loaded` checkpoint may still be used when checkpoints are enabled.
 
 **Incompatible**: `--skip-proof-steps` with `--tactic-timeout`, `--trace-steps`, or `--repl-on-failure`.
 
@@ -130,7 +128,6 @@ Plan lines are executable tactic/list-tactic operations. Indentation/body text i
   <safe_name>_failed_prefix.save[.ok]
   <safe_name>_failed_prefix.save.meta
   <safe_name>_failed_prefix.save.prefix
-.holbuild/checkpoints/<package>/<relative-path>.final_context.save[.ok]
 ```
 
 These are local project state, never the semantic identity of a build.
