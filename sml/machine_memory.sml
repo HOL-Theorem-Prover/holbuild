@@ -144,10 +144,21 @@ fun open_lock dir =
 
 (* DIR/lock is held only for a scan of DIR, but flock polling isn't fair, so
    with many processes sharing DIR a waiter can lose the race for minutes.
-   Waiting has no deadline: it reports every lock_wait_report_interval and
-   ends when the build stops. *)
+   Waiting reports every lock_wait_report_interval, ends when the build stops,
+   and gives up after HOLBUILD_COOPERATE_LOCK_TIMEOUT seconds (0: never), in
+   case a holder hangs with the lock. *)
 val coordinator_poll = Time.fromMilliseconds 20
 val lock_wait_report_interval = Time.fromSeconds 30
+val default_lock_timeout_s = 600
+
+fun lock_timeout_s () =
+  case OS.Process.getEnv "HOLBUILD_COOPERATE_LOCK_TIMEOUT" of
+      NONE => default_lock_timeout_s
+    | SOME text =>
+        if size text > 0 andalso size text <= 9 andalso CharVector.all Char.isDigit text
+        then valOf (Int.fromString text)
+        else raise Error ("HOLBUILD_COOPERATE_LOCK_TIMEOUT must be a whole number of seconds " ^
+                          "(0 for no limit), got " ^ HolbuildHash.quote text)
 
 fun report_lock_wait path waited =
   HolbuildStatus.message_stderr
@@ -156,6 +167,7 @@ fun report_lock_wait path waited =
 
 fun with_coordinator dir check_not_stopped f =
   let
+    val timeout_s = lock_timeout_s ()
     val path = lock_path dir
     val fd = open_lock dir
     val started = Time.now ()
@@ -164,10 +176,15 @@ fun with_coordinator dir check_not_stopped f =
       else
         let
           val now = Time.now ()
+          val waited = Time.- (now, started)
+          val _ =
+            if timeout_s > 0 andalso Time.>= (waited, Time.fromSeconds (Int.toLarge timeout_s))
+            then raise Error ("could not lock " ^ path ^ " for " ^ Int.toString timeout_s ^
+                              "s: another process holds it")
+            else ()
           val next_report =
             if Time.< (now, next_report) then next_report
-            else (report_lock_wait path (Time.- (now, started));
-                  Time.+ (now, lock_wait_report_interval))
+            else (report_lock_wait path waited; Time.+ (now, lock_wait_report_interval))
         in
           check_not_stopped ();
           OS.Process.sleep coordinator_poll;

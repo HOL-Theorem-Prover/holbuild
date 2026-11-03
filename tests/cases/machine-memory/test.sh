@@ -424,3 +424,39 @@ holder_pid=""
 require_grep "waiting [3-5][0-9]s for machine-memory lock $busy/lock" "$tmpdir/locked.out"
 require_grep "waiting [6-9][0-9]s for machine-memory lock $busy/lock" "$tmpdir/locked.out"
 require_grep '^END Locked' "$events"
+
+# A lock held past HOLBUILD_COOPERATE_LOCK_TIMEOUT fails the build without
+# starting the child; a timeout that isn't a whole number is an error.
+: > "$events"
+make_project timeout 0 Timeout
+flock "$busy/lock" bash -c '
+  for _ in $(seq 1 600); do
+    [[ -e "$1" ]] && exit 0
+    sleep 0.1
+  done' _ "$tmpdir/release" &
+holder_pid=$!
+for _ in $(seq 1 100); do
+  flock -n "$busy/lock" true || break
+  sleep 0.1
+done
+if (cd "$tmpdir/timeout" && HOLBUILD_COOPERATE_LOCK_TIMEOUT=2 timeout 60 "$HOLBUILD_BIN" \
+      --cooperate-dir "$busy" --machine-max-mem 3072 build --skip-checkpoints --skip-proof-steps) \
+     > "$tmpdir/timeout.out" 2>&1; then
+  echo "build succeeded while the machine-memory lock was held past its timeout" >&2
+  exit 1
+fi
+touch "$tmpdir/release"
+wait "$holder_pid"
+holder_pid=""
+require_grep "could not lock $busy/lock for 2s: another process holds it" "$tmpdir/timeout.out"
+if grep -q '^START Timeout' "$events"; then
+  echo "a child started while the machine-memory lock was held" >&2
+  exit 1
+fi
+if (cd "$tmpdir/timeout" && HOLBUILD_COOPERATE_LOCK_TIMEOUT=-1 timeout 60 "$HOLBUILD_BIN" \
+      --cooperate-dir "$busy" --machine-max-mem 3072 build --skip-checkpoints --skip-proof-steps) \
+     > "$tmpdir/bad-timeout.out" 2>&1; then
+  echo "a negative HOLBUILD_COOPERATE_LOCK_TIMEOUT was accepted" >&2
+  exit 1
+fi
+require_grep 'HOLBUILD_COOPERATE_LOCK_TIMEOUT must be a whole number of seconds' "$tmpdir/bad-timeout.out"
