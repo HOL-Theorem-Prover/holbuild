@@ -506,12 +506,14 @@ fun build_analyser k =
        out)
   end
 
-fun build_entry req k =
+fun build_entry jobs req k =
   let
     val final = entry_dir_for_key k
     val hol = holdir_for_key k
     val material = key_material req
     val run_command = run_mutation k
+    (* -j only sets bin/build's concurrency; it stays out of the key. *)
+    val jobs_arg = case jobs of NONE => "" | SOME n => "-j " ^ Int.toString n ^ " "
     fun fetch () =
       (ensure_dir (toolchains_dir ());
        if path_exists final then remove_tree run_command final else ();
@@ -525,7 +527,7 @@ fun build_entry req k =
       in
         run_in_dir run_command hol (quote (poly_command ()) ^ " --script tools/smart-configure.sml");
         run_in_dir run_command hol
-          ("bin/build " ^ effective_build_args (#kernel_variant req) hol);
+          ("bin/build " ^ jobs_arg ^ effective_build_args (#kernel_variant req) hol);
         if built hol then () else die ("HOL build did not produce bin/hol, bin/Holmake, bin/build, and bin/hol.state in " ^ hol);
         generate_hol_source_manifest k;
         if clean k hol then () else die ("HOL build left dirty checkout: " ^ hol ^ "\n" ^ dirty_status k hol);
@@ -691,27 +693,27 @@ fun generate_legacy_theory_toolchain req k =
 
 datatype publication = NoPublication | Publish of {replace : bool}
 
-fun restore_or_build_entry req k =
+fun restore_or_build_entry jobs req k =
   case restore_entry k of
       Restored => NoPublication
     | outcome =>
         (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_LOCAL_FALLBACK";
          wait_test_gate "HOLBUILD_TEST_TOOLCHAIN_LOCAL_FALLBACK_GATE";
-         ignore (build_entry req k);
+         ignore (build_entry jobs req k);
          Publish {replace = outcome = Rejected})
 
-fun finish_entry req k =
+fun finish_entry jobs req k =
   let
     val publication =
       if validate_entry req k then
         (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_REVALIDATED";
          NoPublication)
-      else restore_or_build_entry req k
+      else restore_or_build_entry jobs req k
     val _ = if hol_source_manifest_built k then () else generate_hol_source_manifest k
     val publication =
       if theory_toolchain_built k orelse generate_legacy_theory_toolchain req k then publication
       else
-        (ignore (build_entry req k); Publish {replace = false})
+        (ignore (build_entry jobs req k); Publish {replace = false})
     (* The analyser is not archived, so its build cannot stop publication. *)
     val _ =
       case publication of
@@ -722,7 +724,7 @@ fun finish_entry req k =
     holdir_for_key k
   end
 
-fun ensure_built_with_kernel req =
+fun ensure_built_with_kernel jobs req =
   let
     val k = key req
     val ak = analyser_key ()
@@ -735,7 +737,7 @@ fun ensure_built_with_kernel req =
         let val lock = acquire_lock k
         in
           (await_mutation_quiescence k;
-           finish_entry req k before release_lock lock)
+           finish_entry jobs req k before release_lock lock)
           handle error => (release_lock lock; raise error)
         end
   in
@@ -743,7 +745,7 @@ fun ensure_built_with_kernel req =
     holdir
   end
 
-fun ensure_built req = ensure_built_with_kernel (standard_request req)
+fun ensure_built jobs req = ensure_built_with_kernel jobs (standard_request req)
 
 (* Toolchain GC: installed toolchains are rebuildable cache entries, removed
    when unused for the retention period. An entry being built, restored or

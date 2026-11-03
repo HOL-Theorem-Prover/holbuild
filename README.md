@@ -214,6 +214,14 @@ through the action cache. Standard-kernel builds do not require trace outputs.
 Tracing is a property of the selected bootstrapped HOL kernel; holbuild does not
 pass `--trknl` to each child HOL process.
 
+`build --trknl` collects traces, not proof-development artifacts, so it builds
+root-package theories as `--skip-checkpoints --skip-proof-steps` would, as
+dependency packages always are. Kernel inference checking and the `.tr.gz`
+outputs are unaffected. An explicit debugging flag turns back on what it needs:
+`--trace-steps` and `--tactic-timeout` enable proof steps, and
+`--repl-on-failure` enables proof steps and checkpoints. Explicit
+`--skip-proof-steps` or `--skip-checkpoints` still conflicts with those flags.
+
 ## Common commands
 
 `build` is the default command, so it can usually be omitted:
@@ -293,7 +301,9 @@ Common global options:
   `.holconfig.toml`.
 - `--json`: emit newline-delimited JSON where supported.
 - `--quiet`, `--verbose`, `--verbosity LEVEL`: adjust status output.
-- `-j N`, `-jN`, `--jobs N`: build parallelism.
+- `-j N`, `-jN`, `--jobs N`: build parallelism. When holbuild builds a HOL
+  toolchain, it also passes `-j N` to HOL's `bin/build`; without it, `bin/build`
+  uses HOL's own default.
 - `--max-heap MB`: Poly/ML maximum heap size for child HOL processes. Do not
   use `--maxheap`: holbuild is itself a Poly/ML program, and its runtime takes
   `--maxheap MB` as the cap on holbuild's own heap, so the option never reaches
@@ -301,11 +311,14 @@ Common global options:
   where it can detect it (Linux), so there it cannot be used to cap holbuild's
   own heap either.
 - `--cooperate-dir DIR` (or `HOLBUILD_COOPERATE_DIR`): share a machine memory
-  budget with every holbuild process using `DIR`; requires `--max-heap`. See
-  below.
+  budget with every holbuild process using `DIR`. See below.
 - `--machine-max-mem MB`: the budget to record in `DIR/budget` when that file
   does not exist yet; a value that differs from the file at this process's
   first admission is an error.
+- `--child-charge MB`: what each child reserves against that budget. Defaults
+  to `--max-heap`, but at most 3072 (3072 without `--max-heap`); where
+  `MemAvailable` can't be read, to `--max-heap` + 1024, and then `--max-heap`
+  or `--child-charge` is required.
 - `--prefetch-concurrency N`: how many remote cache entries a build copies into
   the local cache at once, ahead of the build workers. Defaults to twice the
   build's jobs; only used with a remote cache.
@@ -315,14 +328,27 @@ Common global options:
 `-j` limits children within one holbuild process. Independent processes on one
 machine (several users, CI jobs, containers with a shared bind mount) can share
 a memory budget instead: with `--cooperate-dir DIR`, every theory, generator and
-heap-export child reserves its `--max-heap` plus 1 GiB, and starts only while
-the reservations of all processes using `DIR` fit the byte count in
-`DIR/budget`. A child that waits shows as `(waiting for memory)` in the status
-line, as a `waiting for machine memory` line otherwise, and as a
-`waiting_for_memory` event with `--json`. A child larger than the whole budget
-fails at once.
+heap-export child reserves `--child-charge`, and starts only while the
+reservations of all processes using `DIR` fit the byte count in `DIR/budget`,
+and `MemAvailable` covers the charge plus a quarter of `MemTotal` (at least
+1 GiB), whatever the budget. Children admitted in the last 30 seconds, which
+have not allocated yet, count against `MemAvailable` by their charge. The
+charge is an expected size, not a ceiling: `--max-heap` caps each child, and
+the `MemAvailable` check holds new children back when running ones, or
+anything else on the machine, grow. While no reservation is held in `DIR`, a
+child that fits the budget starts whatever `MemAvailable` says, so a build
+never waits on memory none of its children use. Where `/proc/meminfo` has no
+`MemAvailable` (outside Linux), only the reservations count, and the default
+charge is `--max-heap` + 1 GiB, what a child can reach. `/proc/meminfo` shows
+the whole machine, not a container's memory limit, so inside a
+memory-limited container set `--child-charge` to what a child can reach. A child
+that waits shows as `(waiting for memory)` in the status line, as a
+`waiting for machine memory` line otherwise, and as a `waiting_for_memory`
+event with `--json`. A charge larger than the whole budget fails at once.
 
-This bounds admission; it does not enforce RSS, and it covers neither HOL
+This bounds admission; it does not enforce RSS: children already running can
+still grow together, up to their `--max-heap`, past what the machine has left,
+since nothing re-checks a child once it has started. It covers neither HOL
 toolchain builds nor `check`, `run` or `repl`.
 
 - `DIR/budget` is created on first use from `--machine-max-mem`, or else
@@ -563,7 +589,9 @@ always_reexecute = true
   into the action key and copied into the action's stage directory at their
   path relative to the script, so `data/table.txt` for `src/FooScript.sml` is
   read as `../data/table.txt` (the stage mirrors the package layout, so such
-  copies stay inside it); absolute paths and `..` components are rejected.
+  copies stay inside it); absolute paths and `..` components are rejected. A
+  directory or glob names the files under it, skipping any `.holbuild/`
+  directory inside it.
 - `cache = false` disables global cache restore/publish for the action.
 - `always_reexecute = true` disables local up-to-date skipping for the action.
 
@@ -763,10 +791,10 @@ fetched when the theory is reached, as before. `HOLBUILD_CACHE_TRACE=1` shows
 the prefetch thread count as `remote cache prefetch threads: <n>` and each
 prefetched entry as `remote cache prefetched: <key>`.
 A missing HOL toolchain is restored from the same remote cache when its HOL
-commit, build arguments, installation path (with symlinks resolved, as HOL's
-build records it), platform, C library, Poly/ML runtime (release and
-architecture variant, as `poly -v` reports them) and resolved `poly`
-executable path match. The source-analysis helper is not archived; holbuild
+commit, build arguments other than `-j`, installation path (with symlinks
+resolved, as HOL's build records it), platform, C library, Poly/ML runtime
+(release and architecture variant, as `poly -v` reports them) and resolved
+`poly` executable path match. The source-analysis helper is not archived; holbuild
 rebuilds it against the restored toolchain. After a remote miss, a successful
 local toolchain build is published automatically unless another builder
 published it meanwhile; an archive that is missing its blob or fails to extract

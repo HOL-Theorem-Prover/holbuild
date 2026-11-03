@@ -45,11 +45,17 @@ fun global_help () = print
   \  --prefetch-concurrency N\n\
   \  --cooperate-dir DIR          Share a machine memory budget with other holbuild\n\
   \                               processes using DIR (or $HOLBUILD_COOPERATE_DIR)\n\
-  \  --machine-max-mem MB         Budget to record in DIR/budget if it is missing\n\n\
+  \  --machine-max-mem MB         Budget to record in DIR/budget if it is missing\n\
+  \  --child-charge MB            Reservation per child (default: --max-heap, at\n\
+  \                               most 3072; --max-heap + 1024 without\n\
+  \                               MemAvailable)\n\n\
   \With --cooperate-dir, each theory, generator or heap-export child reserves\n\
-  \--max-heap plus 1 GiB, and starts only while all reservations in DIR fit the\n\
-  \budget in DIR/budget (default: MemTotal less a quarter). This bounds admission;\n\
-  \it does not enforce RSS. HOL toolchain builds, check, run and repl reserve nothing.\n\
+  \--child-charge, and starts only while all reservations in DIR plus its own fit\n\
+  \the budget in DIR/budget (default: MemTotal less a quarter), and, while other\n\
+  \children hold reservations, MemAvailable less the charges of children started\n\
+  \in the last 30 s covers its charge plus that quarter (at least 1 GiB).\n\
+  \This bounds admission; it does not enforce RSS. HOL toolchain builds, check,\n\
+  \run and repl reserve nothing.\n\
   \To resize, replace DIR/budget (a byte count) while holding DIR/lock:\n\
   \  flock DIR/lock sh -c 'echo BYTES > DIR/budget.new && mv DIR/budget.new DIR/budget'\n\n\
   \Use `holbuild COMMAND --help` for command-specific help.\n"
@@ -116,7 +122,8 @@ fun buildhol_help () = print
   \  holbuild [GLOBAL OPTIONS] buildhol [--trknl]\n\n\
   \Build/reuse the declared HOL tree and print its path. Use --trknl to select\n\
   \the tracing kernel. A configured remote cache restores toolchains and\n\
-  \publishes successful local builds automatically.\n\n\
+  \publishes successful local builds automatically. A global -j N is passed to\n\
+  \HOL's bin/build when the toolchain is built here.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun heap_help () = print
@@ -726,27 +733,31 @@ fun parse_global_options args =
     loop NONE NONE NONE NONE NONE NONE NONE false HolbuildStatus.Normal args
   end
 
-(* --cooperate-dir and --machine-max-mem, removed from args. *)
+(* --cooperate-dir, --machine-max-mem and --child-charge, removed from args. *)
 fun parse_cooperation_options args =
   let
-    fun loop dir mem [] = (dir, mem, [])
-      | loop _ _ ("--cooperate-dir" :: "" :: _) = raise Error "--cooperate-dir requires DIR"
-      | loop _ mem ("--cooperate-dir" :: path :: xs) = loop (SOME path) mem xs
-      | loop _ _ ["--cooperate-dir"] = raise Error "--cooperate-dir requires DIR"
-      | loop dir _ ("--machine-max-mem" :: n :: xs) = loop dir (SOME (positive_int "--machine-max-mem" n)) xs
-      | loop _ _ ["--machine-max-mem"] = raise Error "--machine-max-mem requires MB"
-      | loop dir mem (arg :: xs) =
+    fun loop dir mem charge [] = (dir, mem, charge, [])
+      | loop _ _ _ ("--cooperate-dir" :: "" :: _) = raise Error "--cooperate-dir requires DIR"
+      | loop _ mem charge ("--cooperate-dir" :: path :: xs) = loop (SOME path) mem charge xs
+      | loop _ _ _ ["--cooperate-dir"] = raise Error "--cooperate-dir requires DIR"
+      | loop dir _ charge ("--machine-max-mem" :: n :: xs) = loop dir (SOME (positive_int "--machine-max-mem" n)) charge xs
+      | loop _ _ _ ["--machine-max-mem"] = raise Error "--machine-max-mem requires MB"
+      | loop dir mem _ ("--child-charge" :: n :: xs) = loop dir mem (SOME (positive_int "--child-charge" n)) xs
+      | loop _ _ _ ["--child-charge"] = raise Error "--child-charge requires MB"
+      | loop dir mem charge (arg :: xs) =
           if String.isPrefix "--cooperate-dir=" arg then
-            loop dir mem ("--cooperate-dir" :: String.extract (arg, size "--cooperate-dir=", NONE) :: xs)
+            loop dir mem charge ("--cooperate-dir" :: String.extract (arg, size "--cooperate-dir=", NONE) :: xs)
           else if String.isPrefix "--machine-max-mem=" arg then
-            loop dir (SOME (positive_int "--machine-max-mem" (String.extract (arg, size "--machine-max-mem=", NONE)))) xs
+            loop dir (SOME (positive_int "--machine-max-mem" (String.extract (arg, size "--machine-max-mem=", NONE)))) charge xs
+          else if String.isPrefix "--child-charge=" arg then
+            loop dir mem (SOME (positive_int "--child-charge" (String.extract (arg, size "--child-charge=", NONE)))) xs
           else
-            let val (dir', mem', rest) = loop dir mem xs in (dir', mem', arg :: rest) end
+            let val (dir', mem', charge', rest) = loop dir mem charge xs in (dir', mem', charge', arg :: rest) end
   in
-    loop NONE NONE args
+    loop NONE NONE NONE args
   end
 
-fun configure_cooperation dir budget_mb maxheap =
+fun configure_cooperation dir budget_mb charge_mb maxheap =
   let
     val dir =
       case dir of
@@ -756,11 +767,28 @@ fun configure_cooperation dir budget_mb maxheap =
                  SOME "" => NONE
                | env => env)
   in
-    case (dir, budget_mb, maxheap) of
-        (SOME dir, _, SOME mb) => HolbuildMachineMemory.configure {dir = dir, budget_mb = budget_mb, maxheap = mb}
-      | (SOME _, _, NONE) => raise Error "--cooperate-dir requires --max-heap MB, which sizes each child's reservation"
+    case (dir, budget_mb, charge_mb) of
+        (SOME dir, _, _) =>
+          let
+            val default = HolbuildMachineMemory.default_charge_mb
+            (* The flat default leans on the MemAvailable check; without it a
+               child is charged all it may reach, as before that check. *)
+            fun default_charge () =
+              if HolbuildMachineMemory.has_mem_available () then
+                Int.min (Option.getOpt (maxheap, default), default)
+              else
+                case maxheap of
+                    SOME mb => mb + 1024
+                  | NONE => raise Error ("--cooperate-dir requires --max-heap MB or --child-charge MB " ^
+                                         "where MemAvailable cannot be read")
+          in
+            HolbuildMachineMemory.configure
+              {dir = dir, budget_mb = budget_mb,
+               charge_mb = case charge_mb of SOME mb => mb | NONE => default_charge ()}
+          end
       | (NONE, SOME _, _) => raise Error "--machine-max-mem requires --cooperate-dir DIR"
-      | (NONE, NONE, _) => ()
+      | (NONE, NONE, SOME _) => raise Error "--child-charge requires --cooperate-dir DIR"
+      | (NONE, NONE, NONE) => ()
   end
 
 fun with_input path f =
@@ -879,6 +907,17 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
           SOME {project, ...} => project
         | NONE => timed_phase "project.discover" load_project
     val resolution = resolution_for_toolchain tc
+    val trknl = HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)
+    (* Tracing builds collect proof traces, so by default they skip the proof
+       development artifacts, as --skip-checkpoints --skip-proof-steps would.
+       An explicit debugging flag turns back on what it needs. *)
+    val debug_proof_steps = trace_steps orelse tactic_timeout_set orelse repl_on_failure
+    val (skip_checkpoints, proof_steps, new_ir) =
+      if trknl then
+        (skip_checkpoints orelse not repl_on_failure,
+         proof_steps andalso debug_proof_steps,
+         new_ir andalso debug_proof_steps)
+      else (skip_checkpoints, proof_steps, new_ir)
     val _ = HolbuildStatus.set_retain_debug_artifacts retain_debug_artifacts
     val jobs = if repl_on_failure then 1 else effective_jobs project cli_jobs
     val _ =
@@ -950,7 +989,7 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
        repl_on_failure = repl_on_failure,
        emit_output_hashes = emit_output_hashes,
        allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy,
-       trknl = HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)}
+       trknl = trknl}
     fun prepare_plan () =
       let
         val {index, components} =
@@ -1730,31 +1769,31 @@ fun reject_holdir holdir =
       SOME _ => raise Error "--holdir is no longer supported; declare dependencies.hol"
     | NONE => ()
 
-fun project_hol_holdir kernel_variant project =
+fun project_hol_holdir kernel_variant jobs project =
   let val resolution = {kernel_variant = kernel_variant}
   in
     (ignore (HolbuildProjectGraph.resolve {project = project, resolution = resolution});
      case HolbuildProject.resolved_hol_dependency_with resolution project of
          SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev}, ...}) =>
-           HolbuildHolSharedCache.ensure_built_with_kernel
+           HolbuildHolSharedCache.ensure_built_with_kernel jobs
              {git = git, rev = rev, kernel_variant = kernel_variant}
        | _ => raise Error "schema 2 project has no dependencies.hol")
   end
 
-fun effective_toolchain_for kernel_variant holdir maxheap =
+fun effective_toolchain_for kernel_variant holdir maxheap jobs =
   let
     val project = load_project ()
     val _ = reject_holdir holdir
   in
-    {holdir = project_hol_holdir kernel_variant project, maxheap = maxheap,
+    {holdir = project_hol_holdir kernel_variant jobs project, maxheap = maxheap,
      kernel_variant = kernel_variant}
   end
 
-fun effective_toolchain holdir maxheap =
-  effective_toolchain_for HolbuildHolToolchainConfig.StandardKernel holdir maxheap
+fun effective_toolchain holdir maxheap jobs =
+  effective_toolchain_for HolbuildHolToolchainConfig.StandardKernel holdir maxheap jobs
 
-fun tracing_toolchain holdir maxheap =
-  effective_toolchain_for HolbuildHolToolchainConfig.TracingKernel holdir maxheap
+fun tracing_toolchain holdir maxheap jobs =
+  effective_toolchain_for HolbuildHolToolchainConfig.TracingKernel holdir maxheap jobs
 
 fun context_toolchain_for kernel_variant holdir maxheap =
   let
@@ -1776,12 +1815,12 @@ fun parse_buildhol_args args =
     | ["--trknl"] => HolbuildHolToolchainConfig.TracingKernel
     | _ => raise Error "usage: holbuild buildhol [--trknl]"
 
-fun buildhol holdir maxheap args =
+fun buildhol holdir maxheap jobs args =
   let
     val kernel_variant = parse_buildhol_args args
     val project = load_project ()
     val _ = reject_holdir holdir
-    val holdir = project_hol_holdir kernel_variant project
+    val holdir = project_hol_holdir kernel_variant jobs project
   in
     print (holdir ^ "\n")
   end
@@ -1805,26 +1844,26 @@ fun dispatch_with_options {holdir, source_dir, cache_dir, remote_cache, jobs, ma
        "gc" :: rest => (reject_json "gc"; gc rest)
      | "cache" :: rest => (reject_json "cache"; HolbuildCache.dispatch rest)
      | "import" :: rest => (reject_json "import"; import_archive rest)
-     | "buildhol" :: rest => buildhol holdir maxheap rest
+     | "buildhol" :: rest => buildhol holdir maxheap jobs rest
      | "goalfrag-plan" :: _ => raise Error "goalfrag-plan has been removed; use execution-plan THEORY:THEOREM"
-     | [] => dispatch (effective_toolchain holdir maxheap) jobs args
+     | [] => dispatch (effective_toolchain holdir maxheap jobs) jobs args
      | "build" :: rest =>
          if List.exists removed_legacy_proof_step_build_arg rest then
            (case List.find removed_legacy_proof_step_build_arg rest of
                 SOME "--goalfrag" => raise Error "--goalfrag has been removed; proof steps are enabled by default"
               | SOME _ => raise Error "--goalfrag-plan has been removed; use execution-plan THEORY:THEOREM"
-              | NONE => dispatch (effective_toolchain holdir maxheap) jobs args)
+              | NONE => dispatch (effective_toolchain holdir maxheap jobs) jobs args)
          else if json andalso List.exists trace_steps_build_arg rest then
            raise Error "--json does not support --trace-steps until structured proof-step trace events exist"
          else if List.exists (fn arg => arg = "--trknl") rest then
-           dispatch (tracing_toolchain holdir maxheap) jobs args
-         else dispatch (effective_toolchain holdir maxheap) jobs args
+           dispatch (tracing_toolchain holdir maxheap jobs) jobs args
+         else dispatch (effective_toolchain holdir maxheap jobs) jobs args
      | "context" :: rest =>
          dispatch (context_toolchain_for (parse_context_args rest) holdir maxheap) jobs args
      | _ =>
          if List.exists (fn arg => arg = "--trknl") args then
-           dispatch (tracing_toolchain holdir maxheap) jobs args
-         else dispatch (effective_toolchain holdir maxheap) jobs args)
+           dispatch (tracing_toolchain holdir maxheap jobs) jobs args
+         else dispatch (effective_toolchain holdir maxheap jobs) jobs args)
 
 fun is_broken_pipe (IO.Io {cause = OS.SysErr (msg, _), ...}) = msg = "Broken pipe"
   | is_broken_pipe _ = false
@@ -1865,10 +1904,10 @@ fun main raw_args =
        else if raw_args = ["--help"] orelse raw_args = ["-h"]
        then (global_help (); OS.Process.exit OS.Process.success)
        else ()
-     val (cooperate_dir, machine_max_mem, raw_args) = parse_cooperation_options raw_args
+     val (cooperate_dir, machine_max_mem, child_charge, raw_args) = parse_cooperation_options raw_args
      val (options, args) = parse_global_options raw_args
    in
-     configure_cooperation cooperate_dir machine_max_mem (#maxheap options);
+     configure_cooperation cooperate_dir machine_max_mem child_charge (#maxheap options);
      dispatch_with_options options args
    end)
   handle Thread.Interrupt => (HolbuildToolchain.cleanup_active_children (); err "interrupted")

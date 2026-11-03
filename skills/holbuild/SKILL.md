@@ -57,6 +57,7 @@ members = ["src"]
 | `--no-cache` | Skip global cache restore/publish; local up-to-date checks still work |
 | `--skip-checkpoints` | No `.save`/`.ok` checkpoint files; theorem instrumentation still runs |
 | `--skip-proof-steps` | No proof-step execution; incompatible with timeout/trace-step/repl-on-failure flags |
+| `--trknl` | Tracing kernel; root theories default to `--skip-checkpoints --skip-proof-steps` unless `--trace-steps`/`--tactic-timeout`/`--repl-on-failure` asks for proof steps (and checkpoints, for repl) |
 | `--trace-steps` | Record detailed proof-step execution logs; use with `--force` to inspect up-to-date targets |
 | `--tactic-timeout SECONDS` | Root-package per-step timeout (default 2.5s, `0` disables); also manifest/local-config settable |
 | `--json` | Newline-delimited streaming JSON build events/errors on stdout; no retained log paths by default; not supported for dry-run/plan/trace/repl-on-failure |

@@ -943,9 +943,13 @@ fun sort_strings xs =
     List.foldl (fn (x, acc) => insert x acc) [] xs
   end
 
+(* Skips .holbuild directories: holbuild's own state, which other jobs change
+   while this one walks it. *)
 fun files_under abs rel =
   if is_dir abs then
-    List.concat (map (fn name => files_under (Path.concat(abs, name)) (join rel name)) (list_dir abs))
+    List.concat
+      (map (fn name => files_under (Path.concat(abs, name)) (join rel name))
+           (List.filter (fn name => name <> ".holbuild") (list_dir abs)))
   else if readable abs then [(rel, abs)]
   else []
 

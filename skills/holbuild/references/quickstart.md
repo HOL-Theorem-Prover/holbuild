@@ -71,7 +71,7 @@ holbuild --json build --retain-debug-artifacts FooTheory  # also retain/report f
 - `--source-dir PATH` — source tree for manifest discovery; `.holbuild/` artifacts are written under the shell cwd
 - `--cache-dir PATH` — override the global cache directory for this command
 - `--max-heap MB` — pass Poly/ML max heap to child HOL processes (not `--maxheap`, which holbuild's own Poly/ML runtime consumes)
-- `--cooperate-dir DIR` / `--machine-max-mem MB` — share a machine memory budget (`DIR/budget`) with other holbuild processes; each child reserves `--max-heap` + 1 GiB (see README)
+- `--cooperate-dir DIR` / `--machine-max-mem MB` / `--child-charge MB` — share a machine memory budget (`DIR/budget`) with other holbuild processes; each child reserves `--child-charge` (default `--max-heap`, at most 3072, or 3072 without `--max-heap`) and, while others hold reservations, starts only while `MemAvailable` also covers the charge plus a quarter of `MemTotal` (see README)
 - `-jN` / `--jobs N` — parallel workers. Default: `.holconfig.toml [build].jobs` or `max(1, nproc/2)`
 - `--prefetch-concurrency N` — remote cache entries copied ahead of the build at once (default twice `-j`)
 - `--json` — newline-delimited streaming JSON `message`, `node_started`, `node_finished`, `node_failed`, `waiting_for_memory`, `build_finished`, and `error` events on stdout (build only; no retained log paths by default; not dry-run/plan/trace/repl-on-failure)
@@ -87,6 +87,7 @@ holbuild --json build --retain-debug-artifacts FooTheory  # also retain/report f
 - `--no-cache` — skip global cache restore/publish; local `.holbuild/` up-to-date checks still work
 - `--skip-checkpoints` — no `.save`/`.ok` checkpoint files; theorem instrumentation still runs
 - `--skip-proof-steps` — no proof-step execution, hence no tactic timeout/trace-step/repl-on-failure support
+- `--trknl` — tracing kernel; root theories default to `--skip-checkpoints --skip-proof-steps`; `--trace-steps`/`--tactic-timeout` turn proof steps back on, `--repl-on-failure` proof steps and checkpoints
 - `--trace-steps` — record detailed proof-step execution logs; use with `--force` to inspect up-to-date targets
 - `--tactic-timeout SECONDS` — per-step timeout for root package (default 2.5s, `0` disables)
 - `--repl-on-failure` — serial build; on theory failure, start `hol repl` from failed-prefix or replay/deps checkpoint (requires checkpoints; no JSON)
