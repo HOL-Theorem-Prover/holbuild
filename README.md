@@ -818,11 +818,11 @@ key. Cache hits materialise validated artefacts into the local `.holbuild/`
 tree. Standard cache entries do not require a trace blob.
 
 Source, action and toolchain keys and cache blobs are SHA-256 digests, the
-digest Bazel-style remote caches use for `/cas/`. holbuild 0.12.3 switched
+digest Bazel-style remote caches use for `/cas/`. holbuild 0.13.0 switched
 them from SHA-1, so it reads none of the local cache entries, remote cache
 entries or HOL toolchains that earlier releases wrote: its first build of a
 project builds the toolchain and every theory again (or restores what other
-0.12.3 builds have published), and is never served an old entry. `holbuild gc`
+0.13.0 builds have published), and is never served an old entry. `holbuild gc`
 removes the old entries once they age out. Two uses of SHA-1 remain. A
 theory's `.dat` names each parent by the SHA-1 of the parent's `.dat` (HOL's
 format), and holbuild checks those names. Git dependency mirrors under the
