@@ -106,18 +106,20 @@ fun repl_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] repl [ARG ...]\n\n\
   \Start HOL REPL with project context. Extra arguments are passed to HOL,\n\
-  \except Poly/ML runtime options (--gcthreads, --maxheap, -H, ...):\n\
-  \holbuild's own runtime consumes those, so holbuild rejects them where\n\
-  \it can detect them (Linux).\n\n\
+  \except two kinds, wherever they appear: holbuild's global options and\n\
+  \-h/--help, which holbuild takes itself, and Poly/ML runtime options\n\
+  \(--gcthreads, --maxheap, -H, ...), which holbuild's own runtime consumes;\n\
+  \holbuild rejects those where it can detect them (Linux).\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun run_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] run [ARG ...]\n\n\
   \Run HOL with project context. Extra arguments are passed to HOL,\n\
-  \except Poly/ML runtime options (--gcthreads, --maxheap, -H, ...):\n\
-  \holbuild's own runtime consumes those, so holbuild rejects them where\n\
-  \it can detect them (Linux).\n\n\
+  \except two kinds, wherever they appear: holbuild's global options and\n\
+  \-h/--help, which holbuild takes itself, and Poly/ML runtime options\n\
+  \(--gcthreads, --maxheap, -H, ...), which holbuild's own runtime consumes;\n\
+  \holbuild rejects those where it can detect them (Linux).\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun execution_plan_help () = print
