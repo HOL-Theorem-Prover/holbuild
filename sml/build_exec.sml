@@ -210,7 +210,7 @@ datatype theory_load =
 (* A theory action: everything building one theory needs, without the build
    plan.  Paths in the action root, the directory that holds `.holbuild/`,
    are relative to it and made absolute only when the action runs: the
-   preload's objects, `load_stems` and `outputs`.  `inputs` are staged under
+   preload's objects and `outputs`.  `inputs` are staged under
    the stage root, which mirrors the package layout; each `path` is relative
    to it, and `from` says where the file's bytes are read.  `script_dir` is
    the script's directory in the stage ("" when the script lies outside its
@@ -229,7 +229,6 @@ type theory_action =
    script_dir : string,
    inputs : {path : string, from : string} list,
    loads : theory_load list,
-   load_stems : (string * string) list,
    outputs : {sig_path : string, sml_path : string, data_path : string},
    extra_outputs : string list}
 
@@ -354,19 +353,8 @@ fun generated_metadata_report_lines {parents_report, mldeps_report} =
 fun export_theory_if_needed_line sig_path =
   "val _ = HolbuildRuntime.export_theory_if_needed " ^ HolbuildToolchain.sml_string sig_path ^ ";"
 
-fun hfs_unmapped_path path =
-  let
-    val {dir, file} = Path.splitDirFile path
-    val {dir = parent, file = leaf} = Path.splitDirFile dir
-  in
-    if leaf = "objs" andalso Path.file parent = ".hol" then
-      Path.concat(Path.dir parent, file)
-    else path
-  end
-
-(* Export now seals a theory in current HOL versions.  Keep metadata capture and
-   export in the source child, but never load the generated theory module there:
-   the consumer-style load belongs in a fresh process. *)
+(* Export now seals a theory in current HOL versions, so the source child
+   captures metadata and exports, but never loads the generated theory module. *)
 (* The exporter is the child's last file, so the child's peak resident set
    size is known there: it records /proc/self/status's VmHWM line beside
    itself, where it can, for a remote worker's result record. *)
@@ -2072,10 +2060,6 @@ fun publish_theory_cache subject input_key proof_timeout staged_sig published_sm
    for HOL to find. *)
 fun plan_load_stem plan name = Option.map load_stem (HolbuildBuildPlan.node_named plan name)
 
-fun action_load_stem root (action : theory_action) name =
-  Option.map (fn (_, stem) => in_root root stem)
-    (List.find (fn (name', _) => name' = name) (#load_stems action))
-
 fun mldep_load_stem resolve dep = getOpt (resolve dep, dep)
 
 fun mldep_load_stems resolve mldeps = unique_strings (map (mldep_load_stem resolve) mldeps)
@@ -2864,9 +2848,6 @@ fun theory_action root plan keys toolchain_key holdir node : theory_action =
      script_dir = stage_script_dir,
      inputs = source_inputs @ manifest_inputs,
      loads = preload_loads root plan node,
-     load_stems =
-       map (fn dep => (logical_name dep, object_stem dep))
-           (HolbuildBuildPlan.transitive_project_deps plan node),
      outputs = {sig_path = root_relative root sig_path,
                 sml_path = root_relative root sml_path,
                 data_path = root_relative root data_path},
@@ -5538,7 +5519,6 @@ fun spec_theory_action root (spec : action_spec) : theory_action =
      script_dir = script_dir,
      inputs = map (fn {path, ...} => {path = path, from = in_root root (action_source_path package path)}) (#inputs spec),
      loads = #loads spec,
-     load_stems = spec_load_stems spec,
      outputs = #outputs spec,
      extra_outputs = #extra_outputs spec}
   end

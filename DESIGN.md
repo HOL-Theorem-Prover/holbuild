@@ -612,8 +612,7 @@ corrupt entry as a cache miss and falls back to source.
 Shared dependency state is keyed by the same resolved action key and
 base-context key as the semantic artifacts, not by raw `.save` bytes. Two
 projects depending on the same package revision/toolchain can therefore
-materialize the same dependency final-context state into their own `.holbuild/`
-views. The state bundle is still only an accelerator: if validation, relocation,
+materialize the same dependency state into their own `.holbuild/` views. The state bundle is still only an accelerator: if validation, relocation,
 or toolchain checks fail, holbuild rebuilds the dependency from source or earlier
 validated state.
 
