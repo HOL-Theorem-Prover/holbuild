@@ -150,10 +150,9 @@ val coordinator_poll = Time.fromMilliseconds 20
 val lock_wait_report_interval = Time.fromSeconds 30
 
 fun report_lock_wait path waited =
-  (TextIO.output (TextIO.stdErr,
-                  "holbuild: waiting " ^ LargeInt.toString (Time.toSeconds waited) ^
-                  "s for machine-memory lock " ^ path ^ "\n");
-   TextIO.flushOut TextIO.stdErr)
+  HolbuildStatus.message_stderr
+    ("holbuild: waiting " ^ LargeInt.toString (Time.toSeconds waited) ^
+     "s for machine-memory lock " ^ path ^ "\n")
 
 fun with_coordinator dir check_not_stopped f =
   let

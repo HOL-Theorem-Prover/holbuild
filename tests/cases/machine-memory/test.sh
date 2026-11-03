@@ -421,5 +421,6 @@ holbuild_in "$tmpdir/locked" --cooperate-dir "$busy" --machine-max-mem 3072 \
 }
 wait "$holder_pid"
 holder_pid=""
+require_grep "waiting [3-5][0-9]s for machine-memory lock $busy/lock" "$tmpdir/locked.out"
 require_grep "waiting [6-9][0-9]s for machine-memory lock $busy/lock" "$tmpdir/locked.out"
 require_grep '^END Locked' "$events"
