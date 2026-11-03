@@ -1484,9 +1484,10 @@ val cache_trace = HolbuildStatus.cache_trace
 fun hol_run_file_arg stage file =
   if canonical_path (Path.dir file) = canonical_path stage then Path.file file else file
 
-(* Children that ran and exited unsuccessfully.  exec-action tells a failure
-   of the HOL run itself from an error around it by this count. *)
-val failed_child_runs = ref 0
+(* The exit status of the latest HOL child, NONE while one is starting.
+   exec-action tells a failure of the HOL run itself from an error around
+   it, and an OOM kill from another failure, by this. *)
+val last_child_status : OS.Process.status option ref = ref NONE
 
 fun run_hol_files_to_log tc stage workdir context files log_name current_log error_message =
   let
@@ -1494,20 +1495,21 @@ fun run_hol_files_to_log tc stage workdir context files log_name current_log err
     val file_args = map (hol_run_file_arg workdir) files
     val _ = ensure_parent log
     val _ = create_current_log_link log current_log
+    val _ = last_child_status := NONE
     val status =
       HolbuildToolchain.run_in_dir_to_file workdir
         (HolbuildToolchain.theory_run_argv tc @ ["--noconfig"] @ hol_context_args context @ file_args)
         log
       handle HolbuildToolchain.Error msg => raise Error msg
+    val _ = last_child_status := SOME status
     val detail_log = finalize_current_log log current_log
   in
     if HolbuildToolchain.success status then
       if echo_child_logs () then HolbuildStatus.message_stdout (read_text log handle _ => "") else ()
     else
-      (failed_child_runs := !failed_child_runs + 1;
-       raise Error (String.concatWith "\n"
-         [error_message,
-          child_log_detail detail_log]))
+      raise Error (String.concatWith "\n"
+        [error_message,
+         child_log_detail detail_log])
   end
 
 fun toolchain_base_context tc = HolState (HolbuildToolchain.base_state tc)
@@ -5483,12 +5485,13 @@ fun action_text_value spec key =
 
 (* Step 1: the spec is for this holbuild, intact, and of an action a worker
    may run. *)
+fun escapes path = Path.isAbsolute path orelse path = ".." orelse String.isPrefix "../" path orelse
+                   String.isSubstring "/../" path
+
 fun verify_action_spec (spec : action_spec) =
   let
     val text_hash = HolbuildToolchain.hash_text (#action_text spec)
     fun check ok msg = if ok then () else reject_spec msg
-    fun escapes path = Path.isAbsolute path orelse path = ".." orelse String.isPrefix "../" path orelse
-                       String.isSubstring "/../" path
     (* The extra inputs are the files the action text names with their
        hashes: a manifest input by its path in the package, a script's by its
        path from the script's directory. *)
@@ -5641,7 +5644,9 @@ fun restore_spec_theory root (spec : action_spec) {key, subject, stem, extra_out
     ignore
       (install_cache_entry false cache key subject entry
          {outputs = {sig_path = sig_path, sml_path = sml_path, data_path = stem_path ^ ".dat"},
-          extra_destination = fn decl => in_root root (action_source_path (#1 (target_name subject)) decl),
+          extra_destination = fn decl =>
+            if escapes decl then raise Error ("cache entry " ^ key ^ " has an extra output outside the action root: " ^ decl)
+            else in_root root (action_source_path (#1 (target_name subject)) decl),
           write_manifests = write_manifests})
   end
 
@@ -5792,15 +5797,35 @@ fun out_of_space dir =
     handle e => (remove_file probe; String.isSubstring no_space (General.exnMessage e))
   end
 
-fun classify_run_failure stage log_text oom_before child_failed msg =
+(* The child's own report of a full disk; a checkpoint write that failed
+   only warned, and the run went on. *)
+fun child_reports_no_space log_text =
+  List.exists
+    (fn line => String.isSubstring no_space line andalso
+                not (String.isPrefix "holbuild: warning: dropping checkpoint" line))
+    (String.fields (fn c => c = #"\n") log_text)
+
+fun killed status =
+  case Posix.Process.fromStatus status of
+      Posix.Process.W_SIGNALED s => s = Posix.Signal.kill
+    | Posix.Process.W_EXITSTATUS w => w = 0w137
+    | _ => false
+
+fun classify_run_failure stage log_text oom_before msg =
   let
+    val (child_failed, child_killed) =
+      case !last_child_status of
+          SOME status => (not (OS.Process.isSuccess status), killed status)
+        | NONE => (false, false)
     val oom_killed =
-      case (oom_before, cgroup_oom_kills ()) of
-          ([earlier], [later]) => later > earlier
-        | _ => false
+      child_killed andalso
+      (case (oom_before, cgroup_oom_kills ()) of
+           ([earlier], [later]) => later > earlier
+         | _ => false)
   in
     if oom_killed orelse String.isSubstring "Run out of store" (msg ^ "\n" ^ log_text) then MemoryFailure
-    else if (if child_failed then out_of_space stage else String.isSubstring no_space msg) then DiskFailure
+    else if (if child_failed then child_reports_no_space log_text orelse out_of_space stage
+             else String.isSubstring no_space msg) then DiskFailure
     else if not child_failed then InternalFailure
     else if String.isPrefix "tactic timed out" msg then TacticTimeoutFailure
     else ProofFailure
@@ -6031,7 +6056,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, toolchain} =
                 | NONE => ()
             val stage = action_stage root action
             val oom_before = cgroup_oom_kills ()
-            val failed_before = !failed_child_runs
+            val _ = last_child_status := NONE
             val _ =
               ignore (build_theory_action true (spec_policy spec) tc root checkpoint_root
                         (toolchain_base_context tc) action)
@@ -6039,7 +6064,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, toolchain} =
                 let val log_text = read_text (build_log ()) handle _ => ""
                 in
                   raise ActionFailed
-                    (classify_run_failure stage log_text oom_before (!failed_child_runs > failed_before) msg, msg)
+                    (classify_run_failure stage log_text oom_before msg, msg)
                 end
             val _ = peak := peak_rss_mb stage
             val _ = check_remote_publication remote spec
