@@ -61,7 +61,8 @@ fun global_help () = print
   \run and repl reserve nothing.\n\
   \To set or resize the budget, write DIR/budget (a byte count) while holding\n\
   \DIR/lock:\n\
-  \  flock DIR/lock sh -c 'echo BYTES > DIR/budget.new && mv DIR/budget.new DIR/budget'\n\n\
+  \  flock DIR/lock sh -c 'echo BYTES > DIR/budget.new && mv DIR/budget.new DIR/budget'\n\
+  \To return to the default, remove it: flock DIR/lock rm DIR/budget\n\n\
   \Use `holbuild COMMAND --help` for command-specific help.\n"
 
 fun build_help () = print

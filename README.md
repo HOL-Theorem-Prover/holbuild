@@ -359,7 +359,10 @@ toolchain builds nor `check`, `run` or `repl`.
   `MemTotal` at each admission. To set or resize it, write the file while
   holding `DIR/lock`:
   `flock DIR/lock sh -c 'echo BYTES > DIR/budget.new && mv DIR/budget.new DIR/budget'`.
-  Running children keep their reservations; new ones use the new value.
+  Running children keep their reservations; new ones use the new value. To
+  return to the default, remove it: `flock DIR/lock rm DIR/budget`. A
+  `DIR/budget` that an older holbuild wrote with its default counts as set
+  this way, since nothing tells the two apart.
 - Each running child has a file `DIR/lease-*` holding its byte charge,
   `flock`ed by holbuild and inherited by the child, so a killed holbuild's
   reservation ends with its children, with no timeout. A lease nobody holds no

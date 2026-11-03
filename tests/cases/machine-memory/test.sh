@@ -148,7 +148,8 @@ fi
 require_grep '^holbuild: --machine-max-mem 4096 (4294967296 bytes) conflicts with 3221225472 bytes in' "$tmpdir/conflict.out"
 
 # The default budget leaves a quarter of MemTotal out, at most 30 GiB: 256 GiB
-# gives 226 GiB.  It is computed afresh, not written to DIR/budget.
+# gives 226 GiB.  It is computed afresh, not written to DIR/budget, so the
+# same DIR on 64 GiB then gives 48 GiB.
 printf 'MemTotal:        268435456 kB\nMemAvailable:    268435456 kB\n' > "$tmpdir/large"
 if HOLBUILD_TEST_MEMINFO=$tmpdir/large holbuild_in "$tmpdir/p1" --cooperate-dir "$tmpdir/large-coop" \
      --child-charge $((240 * 1024)) build --force P1aTheory > "$tmpdir/large.out" 2>&1; then
@@ -157,6 +158,12 @@ if HOLBUILD_TEST_MEMINFO=$tmpdir/large holbuild_in "$tmpdir/p1" --cooperate-dir 
 fi
 require_grep "exceeds the machine budget of $((226 * 1024)) MiB" "$tmpdir/large.out"
 require_no_file "$tmpdir/large-coop/budget"
+if holbuild_in "$tmpdir/p1" --cooperate-dir "$tmpdir/large-coop" \
+     --child-charge $((240 * 1024)) build --force P1aTheory > "$tmpdir/resized.out" 2>&1; then
+  echo "charge above the default budget succeeded" >&2
+  exit 1
+fi
+require_grep "exceeds the machine budget of $((48 * 1024)) MiB" "$tmpdir/resized.out"
 
 # Heterogeneous charges in a 4 GiB budget: two 2 GiB children fit together, a
 # 3 GiB child fits with neither.  The charge is --child-charge, not --max-heap,
@@ -300,6 +307,7 @@ make_project live3 0 Live3
   cat "$tmpdir/live3.out" >&2
   exit 1
 }
+require_grep '^START Live3' "$events"
 if sed -n '/^START Live3/q;p' "$events" | grep -q '^END Hold2'; then
   echo "Live3 waited for Hold2 under a budget above the default" >&2
   cat "$events" >&2
