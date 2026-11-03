@@ -32,6 +32,7 @@ fun global_help () = print
   \  executable NAME             Build a configured executable heap\n\
   \  clean THEORY...             Remove local build outputs\n\
   \  export -o FILE [TARGET ...]  Export cached build outputs\n\
+  \  action-spec [TARGET ...]   Export uncached theories for remote execution\n\
   \  import FILE                  Import cached build outputs\n\
   \  gc                          Remove stale project/cache state\n\n\
   \Global options:\n\
@@ -162,6 +163,15 @@ fun gc_help () = print
 fun cache_help () = print
   "`holbuild cache gc` is deprecated; use `holbuild gc --cache-only`.\n"
 
+fun action_spec_help () = print
+  "Usage:\n\
+  \  holbuild [GLOBAL OPTIONS] action-spec [--upload] [OPTIONS] [TARGET ...]\n\n\
+  \Plan TARGETs as build would and write the ActionSpec of every theory the\n\
+  \remote cache can't satisfy to .holbuild/action-specs/SHA256, then print the\n\
+  \action batch. With --upload, also upload the specs and their sources to the\n\
+  \remote cache. Takes build's cache and proof options. Needs --remote-cache.\n\n\
+  \Global options: see `holbuild --help`.\n"
+
 fun export_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] export [--build] -o FILE [--metadata-out FILE] [TARGET ...]\n\n\
@@ -179,7 +189,7 @@ fun has_help_arg args = List.exists help_arg args
 
 val command_names =
   ["build", "context", "repl", "run", "execution-plan", "check", "buildhol", "heap", "executable",
-   "clean", "export", "import", "gc", "cache"]
+   "clean", "export", "import", "gc", "cache", "action-spec"]
 
 fun known_command command =
   List.exists (fn name => name = command) command_names orelse command = "goalfrag-plan"
@@ -200,6 +210,7 @@ fun command_help command =
     | "executable" => executable_help ()
     | "clean" => clean_help ()
     | "export" => export_help ()
+    | "action-spec" => action_spec_help ()
     | "import" => import_help ()
     | "gc" => gc_help ()
     | "cache" => cache_help ()
@@ -900,7 +911,11 @@ fun prepare_source_index phase_prefix resolution project =
      components = components}
   end
 
-fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, proof_steps, new_ir, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy}, targets) =
+(* What a planned build does: build its targets, or export their uncached
+   theories for remote execution. *)
+datatype build_mode = BuildTargets | ExportActionSpecs of {upload : bool}
+
+fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, proof_steps, new_ir, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy}, targets) =
   let
     val project =
       case prepared of
@@ -1034,15 +1049,42 @@ fun build_once_with_prepared tc cli_jobs prepared ({dry_run, watch, force, use_c
         timed_phase "build.execute"
           (fn () => HolbuildBuildExec.build build_options tc project plan toolchain_key jobs)
       end
+    fun export_action_specs upload () =
+      let val (index, force_targets, entry_plan, plan, toolchain_key) = prepare_plan ()
+          val build_options = build_options_for index entry_plan plan force_targets
+      in
+        timed_phase "action_spec.export"
+          (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key upload)
+      end
     fun run_with_stat_cache f =
       (f (); finish_stat_cache stat_cache)
       handle e => (finish_stat_cache stat_cache; raise e)
   in
-    if dry_run then run_with_stat_cache describe_dry_run
-    else HolbuildBuildExec.with_project_lock project "build" (fn () => run_with_stat_cache execute_build)
+    case mode of
+        ExportActionSpecs {upload} =>
+          HolbuildBuildExec.with_project_lock project "action-spec"
+            (fn () => run_with_stat_cache (export_action_specs upload))
+      | BuildTargets =>
+          if dry_run then run_with_stat_cache describe_dry_run
+          else HolbuildBuildExec.with_project_lock project "build" (fn () => run_with_stat_cache execute_build)
   end
 
+fun build_once_with_prepared tc = build_once_with_prepared_mode BuildTargets tc
+
 fun build_once tc cli_jobs parsed = build_once_with_prepared tc cli_jobs NONE parsed
+
+fun action_spec_command tc cli_jobs args =
+  let
+    val upload = List.exists (fn arg => arg = "--upload") args
+    val parsed as ({dry_run, watch, trace_steps, repl_on_failure, execution_plan, ...}, _) =
+      split_flags (List.filter (fn arg => arg <> "--upload") args)
+    val _ =
+      if dry_run orelse watch orelse trace_steps orelse repl_on_failure orelse Option.isSome execution_plan then
+        raise Error "action-spec does not run builds: remove --dry-run, --watch, --trace-steps and --repl-on-failure"
+      else ()
+  in
+    build_once_with_prepared_mode (ExportActionSpecs {upload = upload}) tc cli_jobs NONE parsed
+  end
 
 fun build_iteration_error_message exn =
   case exn of
@@ -1699,6 +1741,7 @@ fun dispatch tc jobs args =
     | "run" :: rest => (reject_json "run"; run_hol tc jobs "run" rest)
     | "repl" :: rest => (reject_json "repl"; repl_hol tc jobs rest)
     | "export" :: rest => (reject_json "export"; export_archive tc jobs rest)
+    | "action-spec" :: rest => (reject_json "action-spec"; action_spec_command tc jobs rest)
     | "import" :: rest => (reject_json "import"; import_archive rest)
     | cmd :: _ =>
         if known_command cmd then raise Error ("unknown command: " ^ cmd)
