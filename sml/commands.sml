@@ -979,6 +979,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       else (skip_checkpoints, proof_steps, new_ir)
     val _ = HolbuildStatus.set_retain_debug_artifacts retain_debug_artifacts
     val jobs = if repl_on_failure then 1 else effective_jobs project cli_jobs
+    val _ = HolbuildDependencies.set_analyser_jobs jobs
     val _ =
       if HolbuildStatus.json_mode () andalso dry_run then
         raise Error "--json does not support build --dry-run yet"
@@ -1670,6 +1671,7 @@ fun build_heap_kind tc cli_jobs command target =
   let
     val project = timed_phase "project.discover" load_project
     val jobs = effective_jobs project cli_jobs
+    val _ = HolbuildDependencies.set_analyser_jobs jobs
     fun execute_heap () =
       let
         val HolbuildProject.Heap {output, objects, kind, ...} = heap_named project command target
