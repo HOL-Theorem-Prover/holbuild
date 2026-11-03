@@ -5634,27 +5634,14 @@ fun spec_policy (spec : action_spec) =
                     repl_on_failure = false,
                     trknl = false}
 
-val no_space = "No space left on device"
+val no_space = HolbuildCacheTransfer.no_space
+(* A failed child's log is no evidence of a full disk either way: it is on
+   that filesystem, and a handled checkpoint write failure warns into it. *)
+val out_of_space = HolbuildCacheTransfer.out_of_space
 
-(* Whether the filesystem holding dir can't take a small write.  The child's
-   log is no evidence either way: it is on that filesystem, and a handled
-   checkpoint write failure warns into it. *)
-fun out_of_space dir =
-  let val probe = Path.concat(dir, ".holbuild-space-probe")
-  in
-    (let val out = BinIO.openOut probe
-     in
-       (BinIO.output (out, Word8Vector.tabulate (1048576, fn _ => 0w0)); BinIO.closeOut out)
-       handle e => (BinIO.closeOut out handle _ => (); raise e)
-     end;
-     remove_file probe;
-     false)
-    handle e => (remove_file probe; String.isSubstring no_space (General.exnMessage e))
-  end
-
-(* A full disk is a disk failure, whichever step hit it.  A download that
-   failed for lack of space need not say so (curl reports only a failed
-   write, or leaves a short file), so the cache root is probed too. *)
+(* A full disk is a disk failure, whichever step hit it.  A failed download
+   need not say so (curl reports only a failed write, or leaves a short
+   file), so the cache root is probed too. *)
 fun action_failed failure msg =
   ActionFailed (if String.isSubstring no_space msg orelse out_of_space (cache_root ()) then DiskFailure
                 else failure, msg)
@@ -6075,9 +6062,10 @@ fun exception_failure e =
    A run's checkpoints are Poly/ML child states that name their parents by
    absolute path: each context checkpoint is a child of the one before it,
    back to the deps-loaded heap, whose parent is the toolchain's hol.state.
-   A published checkpoint's manifest lists that chain, the heap and the spine
-   between the heap and the checkpoint, by SHA-256, so a worker with the same
-   cache root restores exactly those bytes at the same paths.
+   A published checkpoint's manifest lists that chain by SHA-256: the heap,
+   the spine between the heap and the checkpoint, and each checkpoint's
+   records (.ok, with .meta and .prefix for a failed prefix), so a worker
+   with the same cache root restores exactly those bytes at the same paths.
 
    The host store, CACHE/checkpoint-store/<heap>/<sha256>, keeps the files of
    each published heap and the checkpoints built on it, one directory per
@@ -6167,6 +6155,9 @@ fun shared_checkpoint_key heap_key kind checkpoint_key =
 type shared_candidate =
   {kind : string, key : string, boundary : int, path : string, sidecars : string list,
    accepts : unit -> bool}
+
+(* The records a checkpoint's state may have beside it. *)
+val shared_sidecar_suffixes = [".ok", ".meta", ".prefix"]
 
 (* Later boundaries first and, at one boundary, a failed prefix before the
    context, the order in which a local build prefers them. *)
@@ -6296,6 +6287,21 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                val spine =
                  List.mapPartial (fn ("spine", sha, rel) => SOME (sha, tree_path checkpoint_root rel) | _ => NONE)
                                  entries
+               (* The spine's own records, so that a retry after HOL rejects
+                  the leaf resumes from the checkpoint under it. *)
+               val spine_sidecars =
+                 List.mapPartial
+                   (fn ("spine-sidecar", sha, rel) =>
+                         let val path = tree_path checkpoint_root rel
+                         in
+                           if List.exists (fn (_, p) => List.exists (fn suffix => path = p ^ suffix)
+                                                                    shared_sidecar_suffixes)
+                                          spine
+                           then SOME (sha, path)
+                           else raise Error ("unexpected shared checkpoint sidecar " ^ rel)
+                         end
+                     | _ => NONE)
+                   entries
                val sidecars =
                  List.mapPartial
                    (fn ("sidecar", sha, suffix) =>
@@ -6303,7 +6309,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                          else raise Error ("unexpected shared checkpoint sidecar " ^ suffix)
                      | _ => NONE)
                    entries
-               val restored = (heap, deps_loaded) :: spine @ ((leaf, #path c) :: sidecars)
+               val restored = (heap, deps_loaded) :: spine @ spine_sidecars @ ((leaf, #path c) :: sidecars)
              in
                (* The small .ok first: a checkpoint with a laxer timeout than
                   requested is skipped before its chain is fetched. *)
@@ -6312,6 +6318,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                else
                  (place_heap heap;
                   List.app (place heap) spine;
+                  List.app (place_sidecar heap) spine_sidecars;
                   place heap (leaf, #path c);
                   if shared_heap_parent_ok ctx andalso chain_ok (#path c :: rev (map #2 spine)) andalso
                      #accepts c () then
@@ -6408,7 +6415,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     fun publish_candidate heap (c : shared_candidate) =
       let val key = shared_checkpoint_key heap_key (#kind c) (#key c)
       in
-        if not (checkpoint_exists (#path c)) orelse was_restored (#path c) orelse
+        if not (checkpoint_exists (#path c)) orelse was_restored (#path c) orelse not (#accepts c ()) orelse
            Option.isSome (HolbuildRemoteCache.get_action remote key) then ()
         else
           case ancestors (#path c) of
@@ -6418,8 +6425,14 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                   val rel = valOf o tree_relative checkpoint_root
                   val spine = rev nearest_first
                   val sidecars = List.filter (fn suffix => file_exists (#path c ^ suffix)) (#sidecars c)
+                  fun sidecars_of role p =
+                    List.mapPartial
+                      (fn suffix => if file_exists (p ^ suffix) then SOME (role, p ^ suffix, rel (p ^ suffix))
+                                    else NONE)
+                      shared_sidecar_suffixes
                   val files =
                     map (fn p => ("spine", p, rel p)) spine @
+                    List.concat (map (sidecars_of "spine-sidecar") spine) @
                     [("leaf", #path c, rel (#path c))] @
                     map (fn suffix => ("sidecar", #path c ^ suffix, suffix)) sidecars
                   val entries = map (fn (role, path, arg) => (role, upload path, arg)) files
@@ -6429,7 +6442,8 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                                       (("heap", heap, "") :: entries)}
                 in
                   ListPair.app (fn ((role, path, _), (_, sha, _)) =>
-                                   store_add store heap {sha = sha, src = path, save = role <> "sidecar"})
+                                   store_add store heap
+                                     {sha = sha, src = path, save = role = "spine" orelse role = "leaf"})
                                (files, entries)
                 end
       end
