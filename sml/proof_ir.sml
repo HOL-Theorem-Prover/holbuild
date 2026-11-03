@@ -628,7 +628,8 @@ and plan_list_tactic source prefix lt =
     | LtQSelectThen (pats, body) =>
         [StepSelect {start_pos = #1 pats, end_pos = #2 (tactic_span body),
                      selector = SelectMatchingAll (source_text source pats),
-                     mode = SelectSolve, body = plan_tactic source body}]
+                     mode = SelectSolve,
+                     body = [each_step (tactic_span body) (plan_tactic source body)]}]
     | LtSelectThen (selector, body) =>
         [list_step (list_tactic_span lt)
            ("SELECT_LT_THEN (" ^ tactic_label source selector ^ ") (" ^ tactic_label source body ^ ")")
