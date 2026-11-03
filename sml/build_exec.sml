@@ -3728,22 +3728,13 @@ fun run_from_state tc project plan keys node =
     fun deps_changed () =
       List.exists (fn dir => dir <> deps_dir andalso deps_loaded_current dir)
         (children (deps_checkpoint_root base))
-    (* Generated files live under HOL's .hol/objs/; load takes the stem
-       beside it, as for the theory's other users. *)
-    fun theory_stem () =
-      let
-        val {dir, file} = Path.splitDirFile (#sml_path (generated_outputs node))
-        val objs_parent = Path.dir dir
-        val dir = if Path.file dir = "objs" andalso Path.file objs_parent = ".hol"
-                  then Path.dir objs_parent else dir
-      in Path.concat(dir, drop_suffix ".sml" file) end
   in
     if not (root_package_node project node) then
       NoRunFromState (name ^ " is in dependency package " ^ package node ^
                       "; holbuild keeps checkpoints only for root-package theories")
     else if deps_loaded_current deps_dir then
       DepsLoadedState {path = deps_loaded_path base deps_key,
-                       load = if theory_built () then SOME (theory_stem ()) else NONE}
+                       load = if theory_built () then SOME (load_stem node) else NONE}
     else if deps_changed () then
       NoRunFromState ("the dependencies or HOL toolchain of " ^ name ^
                       " changed since its checkpoints were saved")
