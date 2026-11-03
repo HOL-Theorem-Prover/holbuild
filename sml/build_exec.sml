@@ -5644,9 +5644,11 @@ fun restore_spec_theory root (spec : action_spec) {key, subject, stem, extra_out
     ignore
       (install_cache_entry false cache key subject entry
          {outputs = {sig_path = sig_path, sml_path = sml_path, data_path = stem_path ^ ".dat"},
+          (* Apart from the sources, so a restored output never replaces an
+             input the action fetched by its hash; the build reads none. *)
           extra_destination = fn decl =>
             if escapes decl then raise Error ("cache entry " ^ key ^ " has an extra output outside the action root: " ^ decl)
-            else in_root root (action_source_path (#1 (target_name subject)) decl),
+            else in_root root (normalize_path (String.concatWith "/" [".holbuild/action-extra", key, decl])),
           write_manifests = write_manifests})
   end
 
@@ -5805,20 +5807,22 @@ fun child_reports_no_space log_text =
                 not (String.isPrefix "holbuild: warning: dropping checkpoint" line))
     (String.fields (fn c => c = #"\n") log_text)
 
-fun killed status =
+(* The shell running the child reports its death by signal n as 128 + n. *)
+fun death_signal status =
   case Posix.Process.fromStatus status of
-      Posix.Process.W_SIGNALED s => s = Posix.Signal.kill
-    | Posix.Process.W_EXITSTATUS w => w = 0w137
-    | _ => false
+      Posix.Process.W_SIGNALED s => SOME s
+    | Posix.Process.W_EXITSTATUS w =>
+        if w > 0w128 then SOME (Posix.Signal.fromWord (SysWord.fromInt (Word8.toInt w - 128))) else NONE
+    | _ => NONE
 
 fun classify_run_failure stage log_text oom_before msg =
   let
-    val (child_failed, child_killed) =
+    val (child_failed, signal) =
       case !last_child_status of
-          SOME status => (not (OS.Process.isSuccess status), killed status)
-        | NONE => (false, false)
+          SOME status => (not (OS.Process.isSuccess status), death_signal status)
+        | NONE => (false, NONE)
     val oom_killed =
-      child_killed andalso
+      signal = SOME Posix.Signal.kill andalso
       (case (oom_before, cgroup_oom_kills ()) of
            ([earlier], [later]) => later > earlier
          | _ => false)
@@ -5828,6 +5832,7 @@ fun classify_run_failure stage log_text oom_before msg =
              else String.isSubstring no_space msg) then DiskFailure
     else if not child_failed then InternalFailure
     else if String.isPrefix "tactic timed out" msg then TacticTimeoutFailure
+    else if Option.isSome signal then InternalFailure
     else ProofFailure
   end
 
@@ -6014,7 +6019,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, toolchain} =
       handle e => (warn ("could not upload the action log: " ^ General.exnMessage e); NONE)
     fun run () =
       let
-        val _ = (empty_root (); ensure_dir root)
+        val _ = (HolbuildRemoveTree.remove_strict root; ensure_dir root)
         val spec_path = Path.concat(root, ".holbuild/action-spec")
         (* Only a spec the cache doesn't have is rejected; a failed fetch is
            retryable. *)

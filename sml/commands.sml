@@ -1937,8 +1937,9 @@ fun exec_action_command maxheap jobs args =
     (* An error outside the action itself (no remote cache, the action lock,
        writing the record) is an infrastructure failure, never a final one. *)
     val code =
-      HolbuildBuildExec.exec_action
-        {spec_sha256 = spec, result_file = result, cache_cap = cache_cap, toolchain = toolchain}
+      (HolbuildRemoteCacheConfig.setup_client ();
+       HolbuildBuildExec.exec_action
+         {spec_sha256 = spec, result_file = result, cache_cap = cache_cap, toolchain = toolchain})
       handle e =>
         (HolbuildStatus.message_stderr
            ("holbuild: exec-action failed: " ^

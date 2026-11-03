@@ -43,6 +43,11 @@ cat > "$project/src/AScript.sml" <<'SML'
 Theory A
 Ancestors bool
 
+fun holbuild_extra_outputs (_ : string list) = ()
+val _ = holbuild_extra_outputs ["results/A.nsv"]
+val _ = let val out = TextIO.openOut "results/A.nsv"
+        in TextIO.output (out, "A result\n"); TextIO.closeOut out end
+
 Theorem a_thm:
   T
 Proof
@@ -269,6 +274,7 @@ hb build CTheory > "$tmpdir/client.log" 2>&1 || { cat "$tmpdir/client.log" >&2; 
 for theory in A B C; do
   require_grep "${theory}Theory restored from cache" "$tmpdir/client.log"
 done
+require_grep "A result" "$project/src/results/A.nsv"
 
 # Proof failures and tactic timeouts are final failures (exit 1).
 cat > "$project/src/DScript.sml" <<'SML'
