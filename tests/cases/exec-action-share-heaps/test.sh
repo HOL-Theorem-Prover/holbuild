@@ -52,8 +52,9 @@ Proof
 QED
 SML
 
-# write_t FIRST LAST: theory T, its first theorem's statement and its last
-# theorem's proof varied.
+# write_t FIRST THIRD [FOURTH [FIFTH]]: theory T, its first theorem's
+# statement and its later theorems' proofs varied.  A theorem's context
+# checkpoint is the state after it.
 write_t() {
   cat > "$project/src/TScript.sml" <<SML
 Theory T
@@ -75,6 +76,18 @@ Theorem t3:
   T /\\ (1 = 1)
 Proof
   CONJ_TAC >- ACCEPT_TAC TRUTH >> $2
+QED
+
+Theorem t4:
+  T
+Proof
+  ${3:-simp[]}
+QED
+
+Theorem t5:
+  T
+Proof
+  ${4:-simp[]}
 QED
 SML
 }
@@ -152,6 +165,18 @@ same_outputs() {
 # Only the remote cache holds what an earlier run shared.
 forget_local() { rm -rf "$shared/checkpoints" "$shared/checkpoint-store"; }
 
+# resumed VERSION FROM KIND: the sharing worker restored a KIND checkpoint,
+# resumed from it as FROM, and HOL loaded it.
+resumed() {
+  require_grep "restored shared $3" "$tmpdir/$1.log"
+  require_grep "from: $2" "$tmpdir/$1.log"
+  if grep -q "discarding invalid checkpoint" "$tmpdir/$1.log"; then
+    echo "version $1: HOL could not load the restored state" >&2
+    cat "$tmpdir/$1.log" >&2
+    exit 1
+  fi
+}
+
 write_t "T" "simp[]"
 export_t v1
 worker v1 "$shared_url" "$shared" "$spec_t" --share-heaps
@@ -166,19 +191,17 @@ cold v2 0
 forget_local
 worker v2 "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v2 0 "status=built"
-require_grep "restored shared deps-loaded heap" "$tmpdir/v2.log"
-require_grep "from: deps-loaded checkpoint" "$tmpdir/v2.log"
+resumed v2 "deps-loaded checkpoint" "deps-loaded heap"
 same_outputs v2
 
-# An edit of the last theorem resumes from the context after the one before.
+# An edit of a late theorem resumes from the context after the one before.
 write_t "T \\/ F" "REFL_TAC"
 export_t v3
 cold v3 0
 forget_local
 worker v3 "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v3 0 "status=built"
-require_grep "restored shared theorem_context checkpoint" "$tmpdir/v3.log"
-require_grep "from: theorem-context checkpoint after t2" "$tmpdir/v3.log"
+resumed v3 "theorem-context checkpoint after t2" "theorem_context checkpoint"
 same_outputs v3
 
 # A failed proof shares its failed prefix, and the fixed proof resumes from it.
@@ -193,6 +216,28 @@ cold v5 0
 forget_local
 worker v5 "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v5 0 "status=built"
-require_grep "restored shared failed_prefix checkpoint" "$tmpdir/v5.log"
-require_grep "from: failed-prefix checkpoint in t3" "$tmpdir/v5.log"
+resumed v5 "failed-prefix checkpoint in t3" "failed_prefix checkpoint"
 same_outputs v5
+
+# A resume from a failed prefix saves no context for its theorem, so an
+# edit of the next theorem resumes from the failed prefix again, though the
+# proof it records no longer fails.
+write_t "T \\/ F" "rw[]" "ACCEPT_TAC TRUTH"
+export_t v6
+cold v6 0
+forget_local
+worker v6 "$shared_url" "$shared" "$spec_t" --share-heaps
+expect v6 0 "status=built"
+resumed v6 "failed-prefix checkpoint in t3" "failed_prefix checkpoint"
+same_outputs v6
+
+# The contexts saved after that resume, children of the failed prefix, were
+# shared too.
+write_t "T \\/ F" "rw[]" "ACCEPT_TAC TRUTH" "ACCEPT_TAC TRUTH"
+export_t v7
+cold v7 0
+forget_local
+worker v7 "$shared_url" "$shared" "$spec_t" --share-heaps
+expect v7 0 "status=built"
+resumed v7 "theorem-context checkpoint after t4" "theorem_context checkpoint"
+same_outputs v7

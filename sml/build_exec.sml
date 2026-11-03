@@ -3972,19 +3972,15 @@ fun action_checkpoints policy checkpoint_root (action : theory_action) source_te
    its checkpoints in checkpoint root `checkpoint_root`, again after
    discarding a checkpoint HOL could not resume from.  Returns the generated
    theory's load metadata, and leaves the stage to the caller, as
-   `run_theory_action`. *)
+   `run_theory_action`, and the failed-prefix checkpoints a successful run
+   made obsolete too: checkpoints saved after resuming from one are its
+   children. *)
 fun run_theory_action_checkpoints cache_allowed policy tc root checkpoint_root base_context (action : theory_action) source_text
       {theorem_checkpoints, declaration_checkpoints, termination_diagnostics} =
   let
     fun run retries_left =
-      let
-        val generated_metadata =
-          run_theory_action cache_allowed policy tc root checkpoint_root base_context action source_text
-                            theorem_checkpoints declaration_checkpoints termination_diagnostics
-      in
-        remove_failed_prefix_checkpoints theorem_checkpoints;
-        generated_metadata
-      end
+      run_theory_action cache_allowed policy tc root checkpoint_root base_context action source_text
+                        theorem_checkpoints declaration_checkpoints termination_diagnostics
       handle RetryInvalidCheckpoint =>
         if retries_left <= 0 then raise RetryInvalidCheckpoint
         else run (retries_left - 1)
@@ -3993,10 +3989,15 @@ fun run_theory_action_checkpoints cache_allowed policy tc root checkpoint_root b
   end
 
 fun build_theory_action cache_allowed policy tc root checkpoint_root base_context (action : theory_action) =
-  let val source_text = read_text (#source_file action)
+  let
+    val source_text = read_text (#source_file action)
+    val checkpoints = action_checkpoints policy checkpoint_root action source_text
+    val generated_metadata =
+      run_theory_action_checkpoints cache_allowed policy tc root checkpoint_root base_context action source_text
+        checkpoints
   in
-    run_theory_action_checkpoints cache_allowed policy tc root checkpoint_root base_context action source_text
-      (action_checkpoints policy checkpoint_root action source_text)
+    remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints);
+    generated_metadata
   end
 
 (* Builds a theory from its source in the project: runs its theory action with
@@ -5633,9 +5634,30 @@ fun spec_policy (spec : action_spec) =
                     repl_on_failure = false,
                     trknl = false}
 
-(* A full disk is a disk failure, whichever step hit it. *)
+val no_space = "No space left on device"
+
+(* Whether the filesystem holding dir can't take a small write.  The child's
+   log is no evidence either way: it is on that filesystem, and a handled
+   checkpoint write failure warns into it. *)
+fun out_of_space dir =
+  let val probe = Path.concat(dir, ".holbuild-space-probe")
+  in
+    (let val out = BinIO.openOut probe
+     in
+       (BinIO.output (out, Word8Vector.tabulate (1048576, fn _ => 0w0)); BinIO.closeOut out)
+       handle e => (BinIO.closeOut out handle _ => (); raise e)
+     end;
+     remove_file probe;
+     false)
+    handle e => (remove_file probe; String.isSubstring no_space (General.exnMessage e))
+  end
+
+(* A full disk is a disk failure, whichever step hit it.  A download that
+   failed for lack of space need not say so (curl reports only a failed
+   write, or leaves a short file), so the cache root is probed too. *)
 fun action_failed failure msg =
-  ActionFailed (if String.isSubstring "No space left on device" msg then DiskFailure else failure, msg)
+  ActionFailed (if String.isSubstring no_space msg orelse out_of_space (cache_root ()) then DiskFailure
+                else failure, msg)
 
 fun fetch_spec_blob remote {hash, dst} =
   (ensure_parent dst;
@@ -5803,24 +5825,6 @@ fun peak_rss_mb stage =
     | _ => NONE
   handle _ => NONE
 
-val no_space = "No space left on device"
-
-(* Whether the filesystem holding dir can't take a small write.  The child's
-   log is no evidence either way: it is on that filesystem, and a handled
-   checkpoint write failure warns into it. *)
-fun out_of_space dir =
-  let val probe = Path.concat(dir, ".holbuild-space-probe")
-  in
-    (let val out = BinIO.openOut probe
-     in
-       (BinIO.output (out, Word8Vector.tabulate (1048576, fn _ => 0w0)); BinIO.closeOut out)
-       handle e => (BinIO.closeOut out handle _ => (); raise e)
-     end;
-     remove_file probe;
-     false)
-    handle e => (remove_file probe; String.isSubstring no_space (General.exnMessage e))
-  end
-
 (* The child's own report of a full disk; a checkpoint write that failed
    only warned, and the run went on. *)
 fun child_reports_no_space log_text =
@@ -5944,13 +5948,43 @@ fun local_cache_families cache =
    used when an action restores from it or adds to it. *)
 fun share_store cache = Path.concat(cache, "checkpoint-store")
 
+(* An action holds a shared lease on each store family it uses until it
+   exits, so no other container's cap sweep evicts the family meanwhile.
+   fcntl locks are dropped when the process closes any descriptor for the
+   file, so a family is leased at most once per process, as toolchains are. *)
+fun store_lease_path dir = dir ^ ".lease"
+
+val store_leases = ref ([] : (string * HolbuildFileLock.t) list)
+
+fun holds_store_lease path = List.exists (fn (held, _) => held = path) (!store_leases)
+
+fun lease_store_family store heap =
+  let val path = store_lease_path (Path.concat(store, heap))
+  in
+    if holds_store_lease path then ()
+    else store_leases := (path, HolbuildFileLock.acquire_shared_path_wait {path = path}) :: !store_leases
+  end
+
 fun store_cache_families cache =
   List.map
     (fn dir =>
         {mtime = modified_time dir,
          evict = fn () =>
-           let val bytes = tree_bytes dir
-           in HolbuildCache.remove_tree dir; if path_exists dir then NONE else SOME bytes end})
+           let val lease = store_lease_path dir
+           in
+             if holds_store_lease lease then NONE
+             else
+               case HolbuildFileLock.try_acquire_path {path = lease, obsolete_kind = NONE}
+                    handle HolbuildFileLock.Error _ => NONE of
+                   NONE => NONE
+                 | SOME lock =>
+                     let val bytes = tree_bytes dir
+                     in
+                       (HolbuildCache.remove_tree dir handle e => (HolbuildFileLock.release lock; raise e));
+                       HolbuildFileLock.release lock;
+                       if path_exists dir then NONE else SOME bytes
+                     end
+           end})
     (List.filter (fn path => FS.isDir path handle OS.SysErr _ => false)
                  (HolbuildCache.children (share_store cache)))
 
@@ -6073,7 +6107,9 @@ fun touch_dir dir = Posix.FileSys.utime (dir, NONE) handle OS.SysErr _ => ()
 fun share_file save src dst = if save then link_or_copy_file src dst else copy_binary src dst
 
 fun store_add store heap {sha, src, save} =
-  let val dst = store_path store heap sha
+  let
+    val _ = lease_store_family store heap
+    val dst = store_path store heap sha
   in
     if file_exists dst then ()
     else
@@ -6102,6 +6138,7 @@ fun place_shared_blob remote store heap {sha, dst, save} =
     fun from_store () =
       file_exists stored andalso ((share_file save stored dst; true) handle Error _ => false)
   in
+    lease_store_family store heap;
     ensure_parent dst;
     if from_store () then () else (fetch (); share_file save stored dst)
   end
@@ -6507,7 +6544,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                 (ignore (run_theory_action_checkpoints true policy tc root checkpoint_root
                            (toolchain_base_context tc) action source_text checkpoints)
                  handle e => (publish_shared (); raise e));
-                publish_shared ()
+                (* After the publish: the checkpoints saved after resuming
+                   from a failed prefix are its children. *)
+                publish_shared ();
+                remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints)
               end
               handle Error msg =>
                 let val log_text = read_text (build_log ()) handle _ => ""

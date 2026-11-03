@@ -1042,12 +1042,13 @@ and platform, which is why every worker should use the same cache root.
 
 The checkpoint tree is then the action's own, emptied before and after it;
 the host store `<cache root>/checkpoint-store` keeps the shared files, one
-directory per heap, which the cache cap evicts as a unit. Worker containers
-on one host can share `checkpoint-store/` and `hol-toolchains/`, mounted from
-host directories, and keep the rest of the cache root to themselves. A
-restored file is
-hard-linked from the store when the store and `checkpoints/` are on one
-mount, and copied otherwise; a bind mount of either counts as another mount.
+directory per heap, which the cache cap evicts as a unit, unless an action
+on the host is using it. Worker containers on one host can share
+`checkpoint-store/` and `hol-toolchains/`, mounted from host directories, and
+keep the rest of the cache root to themselves. A restored file is hard-linked
+from the store when the store and `checkpoints/` are on one mount, and copied
+otherwise. A bind mount counts as another mount even on the same filesystem,
+so in that layout restores copy: the store still saves downloads, not disk.
 
 Clean old project and cache state with:
 
