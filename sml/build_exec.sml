@@ -5519,6 +5519,9 @@ fun verify_action_spec (spec : action_spec) =
       ("spec is for holbuild " ^ #version spec ^ ", this is " ^ HolbuildVersion.version);
     check (#runtime spec = runtime_identity ()) "spec is for different holbuild runtime sources";
     check (#kernel (#toolchain spec) = "stdknl") "spec is for a tracing kernel";
+    check (size (#deps_key spec) = 64 andalso
+           CharVector.all (fn c => Char.isDigit c orelse (c >= #"a" andalso c <= #"f")) (#deps_key spec))
+      "deps-key is not a SHA-256";
     check (text_hash = #input_key spec) "the action text does not hash to input-key";
     check (#action_text_sha256 spec = text_hash) "action-text-sha256 does not match the action text";
     check (action_text_value spec "package" = #package spec) "the action text names another package";
@@ -5612,7 +5615,7 @@ fun fetch_spec_blob remote {hash, dst} =
    case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = hash, dst = dst} of
        HolbuildCacheBackend.Hit => ()
      | HolbuildCacheBackend.Miss => raise ActionFailed (InputMissing ("blob " ^ hash), "blob " ^ hash ^ " is not in the cache")
-     | HolbuildCacheBackend.Corrupt msg => raise action_failed (InputMissing ("blob " ^ hash)) msg)
+     | HolbuildCacheBackend.Corrupt msg => raise action_failed InternalFailure ("cannot fetch blob " ^ hash ^ ": " ^ msg))
 
 (* Restores a theory the action depends on, or the action's own entry, into
    the action root, writing its load manifests with the spec's stems. *)
@@ -5718,7 +5721,7 @@ fun publish_action_entry remote key =
     ensure_dir tmp_dir;
     (List.app (fn hash => ignore (HolbuildCacheTransfer.copy_blob source destination tmp_dir hash (0, 0)))
        (HolbuildCacheTransfer.unique_blobs manifest)
-     handle e => raise ActionFailed (PublishFailure, "could not publish the entry: " ^ General.exnMessage e));
+     handle e => raise action_failed PublishFailure ("could not publish the entry: " ^ General.exnMessage e));
     ignore (#put_action destination HolbuildCacheBackend.PutIfAbsentOrSame {key = key, text = manifest})
   end
 
@@ -5997,10 +6000,17 @@ fun exec_action {spec_sha256, result_file, cache_cap, toolchain} =
            "cached")
         else
           let
-            (* A local entry that didn't restore must not stand in for this
-               build's when the publication is checked. *)
-            val _ = HolbuildCache.remove_action cache (#input_key spec)
             val action = spec_theory_action root spec
+            (* A local entry that didn't restore must not stand in for this
+               build's when the publication is checked, and, as in a local
+               build, its theory's checkpoints may hold parents other than
+               the ones now restored. *)
+            val _ =
+              case HolbuildCache.get_action cache (#input_key spec) of
+                  SOME _ =>
+                    (HolbuildCache.remove_action cache (#input_key spec);
+                     remove_checkpoint_family (action_checkpoint_base checkpoint_root action))
+                | NONE => ()
             val stage = action_stage root action
             val oom_before = cgroup_oom_kills ()
             val failed_before = !failed_child_runs
