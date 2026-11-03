@@ -107,7 +107,8 @@ fun repl_help () = print
   \  holbuild [GLOBAL OPTIONS] repl [ARG ...]\n\n\
   \Start HOL REPL with project context. Extra arguments are passed to HOL,\n\
   \except Poly/ML runtime options (--gcthreads, --maxheap, -H, ...):\n\
-  \holbuild's own runtime consumes those, so holbuild rejects them.\n\n\
+  \holbuild's own runtime consumes those, so holbuild rejects them where\n\
+  \it can detect them (Linux).\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun run_help () = print
@@ -115,7 +116,8 @@ fun run_help () = print
   \  holbuild [GLOBAL OPTIONS] run [ARG ...]\n\n\
   \Run HOL with project context. Extra arguments are passed to HOL,\n\
   \except Poly/ML runtime options (--gcthreads, --maxheap, -H, ...):\n\
-  \holbuild's own runtime consumes those, so holbuild rejects them.\n\n\
+  \holbuild's own runtime consumes those, so holbuild rejects them where\n\
+  \it can detect them (Linux).\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun execution_plan_help () = print
@@ -2127,12 +2129,15 @@ fun process_arguments () =
    ...) and their values from the command line before CommandLine.arguments,
    so they set holbuild's own runtime and never reach HOL. The process's own
    arguments, readable where /proc exists, still hold them: the first one that
-   CommandLine.arguments lacks is such an option. *)
+   CommandLine.arguments lacks and that starts with "-", as every runtime
+   option does, is such an option. Others (the program path, when a dynamic
+   loader started holbuild) never reached the runtime. *)
 fun reject_runtime_options args =
   let
-    fun consumed (x :: xs) (y :: ys) = if x = y then consumed xs ys else SOME x
-      | consumed (x :: _) [] = SOME x
-      | consumed [] _ = NONE
+    fun consumed [] _ = NONE
+      | consumed (x :: xs) (y :: ys) = if x = y then consumed xs ys else missing x xs (y :: ys)
+      | consumed (x :: xs) [] = missing x xs []
+    and missing x xs ys = if String.isPrefix "-" x then SOME x else consumed xs ys
   in
     case consumed (process_arguments ()) args of
         NONE => ()
