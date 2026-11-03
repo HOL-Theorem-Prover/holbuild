@@ -242,6 +242,9 @@ type t =
    resolved_plan_id : string,
    universe_key_index : key_index,
    universe_node_index : node Vector.vector,
+   selected_key_index : key_index,
+   selected_node_index : node Vector.vector,
+   selected_adjacency : int list Vector.vector,
    dependency_closure_cache : node list option array,
    dependency_context_key_cache : (string * string) option array,
    extra_inputs_key_cache : string option option array}
@@ -510,6 +513,34 @@ fun topo_sort_resolved nodes roots (graph : resolved_dependency_graph) =
   end
 
 
+(* Each selected node's resolved dependencies as positions in the selected
+   order, kept in edge order so closures come out as topo_sort_resolved
+   orders them. *)
+fun build_selected_adjacency key_index selected (graph : resolved_dependency_graph) =
+  Vector.fromList
+    (map (fn node =>
+            map (fn (edge : resolved_dependency_edge) => indexed_key_id key_index (#to_node edge))
+                (graph_values (#resolved graph) node))
+         selected)
+
+(* The same order as topo_sort_resolved over the selected nodes, walking
+   integer positions instead of looking up keys.  The selected nodes were
+   topologically sorted when the plan was built, so they have no cycle. *)
+fun selected_closure
+      ({selected_key_index, selected_node_index, selected_adjacency, ...} : t) roots =
+  let
+    val visited = Array.array(Vector.length selected_node_index, false)
+    fun visit (id, order) =
+      if Array.sub(visited, id) then order
+      else
+        (Array.update(visited, id, true);
+         Vector.sub(selected_node_index, id) ::
+           List.foldl visit order (Vector.sub(selected_adjacency, id)))
+    val root_ids = map (fn root => indexed_key_id selected_key_index (key root)) roots
+  in
+    rev (List.foldl visit [] root_ids)
+  end
+
 fun transitive_project_deps
       (plan as {dependency_closure_cache, universe_key_index, ...} : t) node =
   let val id = indexed_key_id universe_key_index (key node)
@@ -518,9 +549,7 @@ fun transitive_project_deps
         SOME dependencies => dependencies
       | NONE =>
           let
-            val dependencies =
-              topo_sort_resolved (selected_nodes plan)
-                (direct_project_deps plan node) (dependency_graph plan)
+            val dependencies = selected_closure plan (direct_project_deps plan node)
           in
             Array.update(dependency_closure_cache, id, SOME dependencies);
             dependencies
@@ -881,6 +910,7 @@ fun plan_selection components holdir sources selection =
     val _ = validate_extra_output_ownership analysis selected
     val universe_key_index = build_key_index nodes
     val universe_node_index = Vector.fromList nodes
+    val selected_key_index = build_key_index selected
     val dependency_closure_cache =
       Array.array(length nodes, NONE : node list option)
     val dependency_context_key_cache =
@@ -896,6 +926,10 @@ fun plan_selection components holdir sources selection =
      resolved_plan_id = resolved_plan_id,
      universe_key_index = universe_key_index,
      universe_node_index = universe_node_index,
+     selected_key_index = selected_key_index,
+     selected_node_index = Vector.fromList selected,
+     selected_adjacency =
+       build_selected_adjacency selected_key_index selected dependency_graph,
      dependency_closure_cache = dependency_closure_cache,
      dependency_context_key_cache = dependency_context_key_cache,
      extra_inputs_key_cache = extra_inputs_key_cache}
