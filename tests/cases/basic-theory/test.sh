@@ -126,6 +126,8 @@ cat > "$tmpdir/final-context-check.sml" <<'SML'
 val _ = ATheory.a_def;
 val _ = ATheory.a_thm;
 SML
+# A saved context must not depend on disposable compiled-module files.
+rm -rf "$HOLBUILD_CACHE/theory-modules"
 "$HOLDIR/bin/hol" run --noconfig --holstate "$final_context" \
   "$tmpdir/final-context-check.sml" > "$tmpdir/final-context-check.log" 2>&1
 if grep -q "deps_loaded=\|final_context=\|theorem_boundary" "$metadata"; then

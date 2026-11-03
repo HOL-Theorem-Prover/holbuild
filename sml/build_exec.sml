@@ -402,7 +402,8 @@ fun peak_rss_report_line path =
 fun write_theory_exporter {sig_path, path, parents_report, mldeps_report} =
   let
     val produce = "Meta.produceTheoryModule " ^
-      HolbuildToolchain.sml_string (drop_suffix ".sig" sig_path ^ ".sml") ^ ";"
+      HolbuildToolchain.sml_string
+        (hfs_unmapped_path (drop_suffix ".sig" sig_path ^ ".sml")) ^ ";"
     val module_producer =
       "val _ = case #lookupStruct PolyML.globalNameSpace \"Meta\" of " ^
       "NONE => () | SOME meta => " ^
