@@ -55,7 +55,8 @@ process_alive() {
 wait_for_process_exit() {
   local pid=$1
   local description=$2
-  for _ in $(seq 1 200); do
+  local polls=${3:-200}
+  for _ in $(seq 1 "$polls"); do
     process_alive "$pid" || return 0
     sleep 0.05
   done
@@ -362,6 +363,10 @@ wait_for_file "$race_waiting" \
 [[ ! -e "$race_revalidated" ]] ||
   fail "concurrent toolchain request revalidated before the active builder committed"
 touch "$release"
+# The waiter has no deadline of its own, so bound it here: a waiter that misses
+# the release fails this case instead of hanging until the CI job timeout.
+wait_for_process_exit "$first_builder" "active toolchain builder did not finish after release" 1200
+wait_for_process_exit "$second_builder" "concurrent toolchain request did not finish after release" 1200
 wait "$first_builder"
 wait "$second_builder"
 first_builder=
@@ -372,6 +377,7 @@ require_file "$race_revalidated"
 require_grep "removing obsolete directory HOL toolchain lock" "$dry_log"
 require_grep "Foo (sml, package b)" "$dry_log"
 require_grep "Foo (sml, package b)" "$race_log"
+require_grep "holbuild: waiting 0s for HOL toolchain lock held by pid=[0-9][0-9]* host=.* command=bootstrap HOL toolchain" "$race_log"
 [[ "$(wc -l < "$attempts" | tr -d ' ')" = "1" ]] ||
   fail "lock waiter rebuilt instead of consuming the committed toolchain entry"
 

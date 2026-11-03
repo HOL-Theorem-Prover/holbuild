@@ -239,8 +239,17 @@ QED
 val _ = export_theory();
 SML
 
-if (cd "$heap_project" && "$HOLBUILD_BIN" heap orphan) > "$tmpdir/heap.log" 2>&1; then
-  echo "heap build ignored package default tactic_timeout" >&2
+# Heaps build their ancestors without proof steps, so no step timeout applies.
+if ! (cd "$heap_project" && "$HOLBUILD_BIN" heap orphan) > "$tmpdir/heap.log" 2>&1; then
+  cat "$tmpdir/heap.log" >&2
+  echo "heap build applied a tactic timeout" >&2
   exit 1
 fi
-require_grep "tactic timed out after 0.1s while building OrphanTheory: slow_tac" "$tmpdir/heap.log"
+require_file "$heap_project/.holbuild/heap/orphan.save"
+
+# A heap reuses theories built by build --skip-proof-steps instead of rebuilding them.
+printf '(* edited *)\n' >> "$heap_project/src/OrphanScript.sml"
+(cd "$heap_project" && "$HOLBUILD_BIN" build --skip-proof-steps OrphanTheory) > "$tmpdir/heap-plain-build.log" 2>&1
+rm -rf "$heap_project/.holbuild"
+(cd "$heap_project" && "$HOLBUILD_BIN" heap orphan) > "$tmpdir/heap-reuse.log" 2>&1
+require_grep "OrphanTheory restored from cache" "$tmpdir/heap-reuse.log"

@@ -223,9 +223,15 @@ if grep -q "holbuild proof-ir before theorem=b_thm\|elapsed_ms=\|ATheory built\|
   echo "execution-plan executed the build instead of statically printing the plan" >&2
   exit 1
 fi
+# Seed theorem-context checkpoints before requesting a full proof trace.
+(cd "$trace_project" && "$HOLBUILD_BIN" build --force ATheory) > "$tmpdir/trace-seed.log" 2>&1
 trace_log=$tmpdir/proof-steps-trace.log
 (cd "$trace_project" && "$HOLBUILD_BIN" build --force --trace-steps ATheory) > "$trace_log" 2>&1
 require_grep "ATheory built" "$trace_log"
+if grep -q 'from: theorem-context checkpoint\|from: declaration-context checkpoint\|from: failed-prefix checkpoint' "$trace_log"; then
+  echo "--trace-steps reused a source checkpoint and omitted proof steps" >&2
+  exit 1
+fi
 if grep -q "holbuild proof-ir plan theorem=\|holbuild proof-ir before theorem=" "$trace_log"; then
   echo "--trace-steps should not dump successful proof traces to stdout" >&2
   exit 1
@@ -1227,6 +1233,23 @@ if grep -q "CANT_BACKUP_ANYMORE" "$proof_steps_shorten_edit_log"; then
   echo "proof-step failed-prefix replay could not rewind retained proof history" >&2
   exit 1
 fi
+
+# Failed-prefix checkpoints must also be ignored when collecting a full trace.
+trace_failed_prefix_log=$tmpdir/trace-failed-prefix.log
+if (cd "$proof_steps_shorten_project" && "$HOLBUILD_BIN" build --trace-steps ATheory) > "$trace_failed_prefix_log" 2>&1; then
+  echo "expected traced short suffix to fail" >&2
+  exit 1
+fi
+if grep -q 'from: failed-prefix checkpoint' "$trace_failed_prefix_log"; then
+  echo "--trace-steps resumed inside a proof instead of tracing its prefix" >&2
+  exit 1
+fi
+[[ "$(wc -c < "$proof_steps_shorten_counter" | tr -d ' ')" = 2 ]] || {
+  echo "--trace-steps did not execute the retained failed prefix" >&2
+  exit 1
+}
+require_grep 'holbuild proof-ir before theorem=shortened_proof_step_replay step=0' \
+  "$proof_steps_shorten_project/.holbuild/logs/current/replay/ATheory/build.log"
 
 proof_steps_resume_project=$tmpdir/proof-steps-resume-project
 proof_steps_resume_counter=$tmpdir/proof-steps-resume-count.txt

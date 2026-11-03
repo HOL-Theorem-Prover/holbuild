@@ -24,13 +24,16 @@ command -v inotifywait >/dev/null || {
   exit 1
 }
 
-project=$tmpdir/project
-mkdir -p "$project"
+project=$tmpdir/.dot/project
+mkdir -p "$project/src"
 write_project_file() {
   cat > "$project/holproject.toml" <<TOML
 $(write_schema2_prelude)
 [project]
 name = "watch-mode"
+
+[build]
+members = ["src"]
 TOML
 }
 
@@ -57,11 +60,14 @@ write_good_holbuild_file() {
 $(write_schema2_prelude)
 [project]
 name = "watch-mode"
+
+[build]
+members = ["src"]
 TOML
 }
 
 write_good_source() {
-  cat > "$project/AScript.sml" <<'SML'
+  cat > "$project/src/AScript.sml" <<'SML'
 open HolKernel boolLib bossLib;
 val _ = new_theory "A";
 val trivial = Q.store_thm ("trivial", `T`, rw []);
@@ -70,7 +76,7 @@ SML
 }
 
 write_bad_source() {
-  cat > "$project/AScript.sml" <<'SML'
+  cat > "$project/src/AScript.sml" <<'SML'
 open HolKernel boolLib bossLib;
 val _ = new_theory "A";
 val broken =
@@ -145,7 +151,7 @@ if [[ "$stable_count" -ne 1 ]]; then
   exit 1
 fi
 
-echo "(* edit one *)" >> "$project/AScript.sml"
+echo "(* edit one *)" >> "$project/src/AScript.sml"
 wait_for_count "waiting for changes" "$watch_log" 2 45
 sleep 1
 

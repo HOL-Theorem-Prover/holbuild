@@ -156,9 +156,16 @@ fun run_interactive argv =
 fun run_in_dir dir argv =
   timed_shell "run_in_dir" argv NONE ("cd " ^ quote dir ^ " && " ^ command argv)
 
+(* Theory children, generators and heap exports all start here, so this is
+   where they take a machine memory reservation (--cooperate-dir). *)
 fun run_in_dir_to_file dir argv output =
-  timed_shell "run_in_dir_to_file" argv (SOME output)
-    ("cd " ^ quote dir ^ " && " ^ command argv ^ " > " ^ quote output ^ " 2>&1")
+  HolbuildMachineMemory.with_reservation
+    (fn lease =>
+        timed_system "run_in_dir_to_file" argv (SOME output)
+          (fn () =>
+              HolbuildProcessGroup.run_shell_inheriting lease
+                ("cd " ^ quote dir ^ " && " ^ command argv ^ " > " ^ quote output ^ " 2>&1")))
+  handle HolbuildMachineMemory.Error msg => raise Error msg
 
 fun ensure_dir path =
   if path = "" orelse path = "." then ()
@@ -172,9 +179,9 @@ fun readable path = FS.access(path, [FS.A_READ]) handle OS.SysErr _ => false
 fun require_readable path =
   if readable path then () else raise Error ("required toolchain file not readable: " ^ path)
 
-fun hash_text text = HolbuildHash.string_sha1 text
+fun hash_text text = HolbuildHash.string_sha256 text
 
-fun file_hash path = (require_readable path; HolbuildHash.file_sha1 path)
+fun file_hash path = (require_readable path; HolbuildHash.file_sha256 path)
 
 fun toolchain_key tc =
   hash_text
@@ -293,17 +300,18 @@ fun run_context_nonce () =
     nonce
   end
 
+(* An SML file under the project's .holbuild/ private to this invocation. *)
+fun invocation_sml_file (project : HolbuildProject.t) prefix =
+  Path.concat
+    (Path.concat(HolbuildProject.artifact_root project, ".holbuild"),
+     prefix ^ "-" ^ HolbuildFileLock.current_pid_text () ^ "-" ^
+     run_context_nonce () ^ ".sml")
+
 fun write_run_context (project : HolbuildProject.t) packages prelude_lines =
   let
-    val root = HolbuildProject.artifact_root project
-    val hol_dir = Path.concat(root, ".holbuild")
-    val context =
-      Path.concat
-        (hol_dir,
-         "holbuild-run-context-" ^ HolbuildFileLock.current_pid_text () ^ "-" ^
-         run_context_nonce () ^ ".sml")
+    val context = invocation_sml_file project "holbuild-run-context"
     val load_dirs = run_context_load_path_dirs project packages
-    val _ = ensure_dir hol_dir
+    val _ = ensure_dir (Path.dir context)
     val out = TextIO.openOut context
       handle e => raise Error ("could not write " ^ context ^ ": " ^ General.exnMessage e)
     fun line s = TextIO.output(out, s ^ "\n")

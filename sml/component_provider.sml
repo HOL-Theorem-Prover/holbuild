@@ -158,7 +158,7 @@ fun source_hash (state as {hashes, ...} : analysis_state) source =
       | NONE =>
           let
             val value = HolbuildToolchain.time_phase "source.hash"
-                          (fn () => HolbuildHash.file_sha1 (#source_path source))
+                          (fn () => HolbuildHash.file_sha256 (#source_path source))
           in hashes := Binarymap.insert(!hashes, key, value); value end
   end
 
@@ -207,7 +207,7 @@ fun prefetch (state as {hashes, analyses, ...} : analysis_state) requests =
       List.filter (fn {source, ...} => not (Option.isSome (lookup (analysis_key source) (!hashes)))) fresh
     val digests =
       HolbuildToolchain.time_phase "source.hash"
-        (fn () => HolbuildHash.files_sha1 (map (fn {source, ...} => #source_path source) unhashed))
+        (fn () => HolbuildHash.files_sha256 (map (fn {source, ...} => #source_path source) unhashed))
     val _ =
       ListPair.appEq
         (fn ({source, ...}, digest) => hashes := Binarymap.insert(!hashes, analysis_key source, digest))

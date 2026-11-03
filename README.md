@@ -151,6 +151,11 @@ That revision is the HOL checkout used to analyse and build the project.
 $HOLBUILD_CACHE/hol-toolchains/<key>/hol
 ```
 
+Only one holbuild process builds or restores a given toolchain at a time.
+Another process that needs the same toolchain waits for it, however long that
+takes, and reports the owning process on stderr when the wait starts and every
+30 s.
+
 For schema 2 projects, the shared HOL toolchain is warmed with HOL's reduced
 `upto-hol` build sequence rather than a full default HOL build:
 
@@ -209,6 +214,14 @@ through the action cache. Standard-kernel builds do not require trace outputs.
 Tracing is a property of the selected bootstrapped HOL kernel; holbuild does not
 pass `--trknl` to each child HOL process.
 
+`build --trknl` collects traces, not proof-development artifacts, so it builds
+root-package theories as `--skip-checkpoints --skip-proof-steps` would, as
+dependency packages always are. Kernel inference checking and the `.tr.gz`
+outputs are unaffected. An explicit debugging flag turns back on what it needs:
+`--trace-steps` and `--tactic-timeout` enable proof steps, and
+`--repl-on-failure` enables proof steps and checkpoints. Explicit
+`--skip-proof-steps` or `--skip-checkpoints` still conflicts with those flags.
+
 ## Common commands
 
 `build` is the default command, so it can usually be omitted:
@@ -230,6 +243,7 @@ holbuild repl --from MyTheory
 holbuild context
 holbuild context --trknl
 holbuild execution-plan MyTheory:my_theorem
+holbuild check MyTheory
 holbuild buildhol
 holbuild buildhol --trknl
 holbuild build --trknl MyTheory
@@ -237,16 +251,28 @@ holbuild heap main
 holbuild executable runtests
 holbuild export -o build-output.hbx MyTheory
 holbuild import build-output.hbx
+holbuild --remote-cache URL action-spec --upload MyTheory
 holbuild clean MyTheory
 holbuild gc
 ```
+
+When a command, target, heap or executable, or an `execution-plan` theory or
+theorem isn't found, the error is followed by a line of up to three of the
+nearest known names, nearest first, ignoring case:
+
+```text
+holbuild: unknown build target: listLemasTheory
+did you mean listLemmasTheory?
+```
+
+The line is left out when no name is close.
 
 Global options go before the command, or before the target list when using the
 default build command:
 
 ```sh
 holbuild -j4 MyTheory
-holbuild --maxheap 4096 MyTheory
+holbuild --max-heap 4096 MyTheory
 holbuild --source-dir /path/to/project MyTheory
 holbuild --cache-dir /path/to/cache MyTheory
 holbuild --remote-cache http://cache.example.org MyTheory
@@ -277,9 +303,81 @@ Common global options:
   `.holconfig.toml`.
 - `--json`: emit newline-delimited JSON where supported.
 - `--quiet`, `--verbose`, `--verbosity LEVEL`: adjust status output.
-- `-j N`, `-jN`, `--jobs N`: build parallelism.
-- `--maxheap MB`, `--max-heap MB`: Poly/ML maximum heap size for child HOL
-  processes.
+- `-j N`, `-jN`, `--jobs N`: build parallelism. When holbuild builds a HOL
+  toolchain, it also passes `-j N` to HOL's `bin/build`; without it, `bin/build`
+  uses HOL's own default.
+- `--max-heap MB`: Poly/ML maximum heap size for child HOL processes. Do not
+  use `--maxheap`: holbuild is itself a Poly/ML program, and its runtime takes
+  `--maxheap MB` as the cap on holbuild's own heap, so the option never reaches
+  holbuild and child HOL processes run uncapped. holbuild rejects `--maxheap`
+  where it can detect it (Linux), so there it cannot be used to cap holbuild's
+  own heap either.
+- `--cooperate-dir DIR` (or `HOLBUILD_COOPERATE_DIR`): share a machine memory
+  budget with every holbuild process using `DIR`. See below.
+- `--machine-max-mem MB`: the budget to record in `DIR/budget` when that file
+  does not exist yet; a value that differs from the file at this process's
+  first admission is an error.
+- `--child-charge MB`: what each child reserves against that budget. Defaults
+  to `--max-heap`, but at most 3072 (3072 without `--max-heap`); where
+  `MemAvailable` can't be read, to `--max-heap` + 1024, and then `--max-heap`
+  or `--child-charge` is required.
+- `--prefetch-concurrency N`: how many remote cache entries a build copies into
+  the local cache at once, ahead of the build workers. Defaults to twice the
+  build's jobs; only used with a remote cache.
+
+### Sharing a machine's memory between holbuild processes
+
+`-j` limits children within one holbuild process. Independent processes on one
+machine (several users, CI jobs, containers with a shared bind mount) can share
+a memory budget instead: with `--cooperate-dir DIR`, every theory, generator and
+heap-export child reserves `--child-charge`, and starts only while the
+reservations of all processes using `DIR` fit the budget, and `MemAvailable`
+covers the charge plus a margin kept free. The reserve is a quarter of
+`MemTotal`, at least 1 GiB and at most 30 GiB; the default budget is
+`MemTotal` less the reserve, and the margin is the reserve, or what the budget
+leaves out of `MemTotal` if that is less (at least 1 GiB), so a budget set
+above the default can be used. Children admitted in the last 30 seconds,
+which have not allocated yet, count against `MemAvailable` by their charge.
+The charge is an expected size, not a ceiling: `--max-heap` caps each child,
+and the `MemAvailable` check holds new children back when running ones, or
+anything else on the machine, grow. While no reservation is held in `DIR`, a
+child that fits the budget starts whatever `MemAvailable` says, so a build
+never waits on memory none of its children use. Where `/proc/meminfo` has no
+`MemAvailable` (outside Linux), only the reservations count, and the default
+charge is `--max-heap` + 1 GiB, what a child can reach. `/proc/meminfo` shows
+the whole machine, not a container's memory limit, so inside a
+memory-limited container set `--child-charge` to what a child can reach. A child
+that waits shows as `(waiting for memory)` in the status line, as a
+`waiting for machine memory` line otherwise, and as a `waiting_for_memory`
+event with `--json`. A charge larger than the whole budget fails at once.
+
+This bounds admission; it does not enforce RSS: children already running can
+still grow together, up to their `--max-heap`, past what the machine has left,
+since nothing re-checks a child once it has started. It covers neither HOL
+toolchain builds nor `check`, `run` or `repl`.
+
+- The budget is the byte count in `DIR/budget`, which `--machine-max-mem`
+  creates on first use. Without that file, it is the default, recomputed from
+  `MemTotal` at each admission. To set or resize it, write the file while
+  holding `DIR/lock`:
+  `flock DIR/lock sh -c 'echo BYTES > DIR/budget.new && mv DIR/budget.new DIR/budget'`.
+  Running children keep their reservations; new ones use the new value. To
+  return to the default, remove it: `flock DIR/lock rm DIR/budget`. A
+  `DIR/budget` that an older holbuild wrote with its default counts as set
+  this way, since nothing tells the two apart.
+- Each running child has a file `DIR/lease-*` holding its byte charge,
+  `flock`ed by holbuild and inherited by the child, so a killed holbuild's
+  reservation ends with its children, with no timeout. A lease nobody holds no
+  longer counts and is removed by the next process that scans `DIR`.
+- Each admission scans `DIR` while holding `DIR/lock`. A child waits for that
+  lock while another process holds it, printing
+  `holbuild: waiting Ns for machine-memory lock DIR/lock` every 30 s, for up
+  to `HOLBUILD_COOPERATE_LOCK_TIMEOUT` seconds (default 600; `0` waits with no
+  limit), and then the build fails. If `flock` itself fails (a filesystem
+  without it), the build fails at once.
+- For several users, create `DIR` writable by all of them (for example mode
+  `1777`, or `2775` with a shared group) on a local filesystem. holbuild makes
+  its files readable by everyone.
 
 `holbuild build --watch MyTheory` runs an initial build, then watches project
 inputs with `inotifywait` and rebuilds after changes. The directory of each
@@ -287,6 +385,20 @@ manifest in use is watched as well (not recursively), so a `holbuild.toml` or
 `.holconfig.toml` appearing beside the manifest triggers a rebuild. Watch mode
 currently requires `inotifywait` from `inotify-tools` and does not support
 `--json`, `--dry-run`, or `--repl-on-failure`.
+
+`holbuild check MyTheory` builds the theory if needed, loads it in HOL and
+checks the tags of its stored theorems. It prints one line per
+theorem whose tag carries an oracle other than `DISK_THM` (for instance
+`MyTheory.my_theorem: cheat`) and one per axiom declared in the theory or its
+ancestors outside HOL itself, that is, in the root package or a dependency
+package (`DepTheory.my_axiom: axiom`). Theorems loaded from disk do not record
+which axioms they use, so every such axiom in the ancestry is reported. With
+findings it exits non-zero; otherwise it prints `MyTheory: clean (N theorems)`
+and exits zero. `holbuild check MyTheory:my_theorem` checks one theorem.
+The tags are those recorded in the built theory, which may have been restored
+from a cache; run `holbuild build --no-cache MyTheory` first to check a fresh
+build. HOL always starts from the toolchain's base state here, not from
+`[run].heap`, which may hold an older copy of the theory.
 
 `holbuild clean MyTheory` removes project-local generated artifacts, dependency
 metadata, and checkpoints for the named theory target. This is primarily a
@@ -488,10 +600,26 @@ always_reexecute = true
 
 - `deps` adds logical project dependencies.
 - `loads` adds modules/libraries to load before the action.
-- `extra_deps` adds package-root-relative filesystem inputs that should be
-  hashed into the action key; absolute paths and `..` components are rejected.
+- `extra_deps` adds package-root-relative filesystem inputs that are hashed
+  into the action key and copied into the action's stage directory at their
+  path relative to the script, so `data/table.txt` for `src/FooScript.sml` is
+  read as `../data/table.txt` (the stage mirrors the package layout, so such
+  copies stay inside it); absolute paths and `..` components are rejected. A
+  directory or glob names the files under it, skipping any `.holbuild/`
+  directory inside it.
 - `cache = false` disables global cache restore/publish for the action.
 - `always_reexecute = true` disables local up-to-date skipping for the action.
+
+Cache keys hash sources, not built outputs, so a cached theory is reusable only
+if its build is reproducible: a deterministic script, with its inputs declared
+and the same HOL toolchain, must produce a byte-identical `Theory.dat` in any
+project directory. A script that reads the clock, environment variables,
+undeclared files, or host paths must declare those files in `extra_deps`, or set
+`cache = false` for what can't be declared. Builds stay correct either way,
+because holbuild rejects a restored theory whose parents' `.dat` files differ
+from the local ones, but descendants of a nondeterministic theory then miss the
+cache wherever the local build of it differs from the one their cache entries
+were built against, and their rebuilt entries can't be published.
 
 Source files may also declare source-file-relative extra dependencies:
 
@@ -561,10 +689,18 @@ loads = ["MyLib"]
 to save the heap. `[[heap]].objects` may name theory and SML logical targets.
 `holbuild executable runtests` builds the listed logical objects and uses HOL
 `buildheap --exe=<main>` to produce an executable; `main` defaults to `"main"`
-and executable objects may also include signature targets. Before starting HOL,
+and executable objects may also include signature targets. Heap and executable
+targets build their objects without proof steps, so no tactic timeout applies
+and they reuse theories built by `holbuild build --skip-proof-steps`; use
+`holbuild build` to check proof-step timeouts. Before starting HOL,
 `holbuild run` and `holbuild repl` build every target named by `[run].loads`,
 create an invocation-private project context under `.holbuild/`, and then load
-the configured targets followed by user arguments.
+the configured targets followed by user arguments. Two kinds of argument never
+reach HOL this way, wherever they appear: holbuild's global options and
+`-h`/`--help`, which holbuild takes itself, and Poly/ML runtime options
+(`--gcthreads`, `--maxheap`, `-H`, ...), which holbuild's own Poly/ML runtime
+removes from its command line, so holbuild rejects them where it can detect
+them (Linux).
 
 `holbuild run --from THEORY` and `holbuild repl --from THEORY` start HOL from a
 checkpoint that building `THEORY` left behind, instead of loading its ancestry
@@ -613,6 +749,8 @@ holbuild build --skip-checkpoints MyTheory
   explicit termination proof. If a theorem and terminating definition have the
   same name, the theorem takes precedence.
 - `--tactic-timeout SECONDS` changes the per-step timeout; `0` disables it.
+  A step that times out fails the build even inside `TRY` or an `ORELSE`
+  alternative.
 - `--trace-steps` records proof-step traces in child logs.
 - `--repl-on-failure` starts a HOL REPL from the newest useful checkpoint after a
   theory failure. It serialises the build and is not supported with `--json`.
@@ -656,6 +794,18 @@ The global build cache stores selected semantic artefacts such as `Theory.sig`,
 key. Cache hits materialise validated artefacts into the local `.holbuild/`
 tree. Standard cache entries do not require a trace blob.
 
+Source, action and toolchain keys and cache blobs are SHA-256 digests, the
+digest Bazel-style remote caches use for `/cas/`. holbuild 0.12.3 switched
+them from SHA-1, so it reads none of the local cache entries, remote cache
+entries or HOL toolchains that earlier releases wrote: its first build of a
+project builds the toolchain and every theory again (or restores what other
+0.12.3 builds have published), and is never served an old entry. `holbuild gc`
+removes the old entries once they age out. Two uses of SHA-1 remain. A
+theory's `.dat` names each parent by the SHA-1 of the parent's `.dat` (HOL's
+format), and holbuild checks those names. Git dependency mirrors under the
+cache's `git/remotes/` keep their SHA-1-of-URL names, so existing mirrors
+stay in use.
+
 Completed theory artifacts are reused only when their recorded proof timeout
 satisfies the requested timeout. `--allow-cache-timeout-discrepancy` waives that
 check for project-local artifacts and all build-cache sources, including remote
@@ -675,13 +825,35 @@ HOLBUILD_REMOTE_CACHE_URL=https://cache.example.org holbuild build MyTheory
 ```
 
 Remote cache misses or errors fall back to the local cache/source build path.
-A missing HOL toolchain is restored from the same remote cache when its exact
-installation path, platform, and Poly/ML identity match. After a remote miss, a
-successful local toolchain build is published automatically; local and remote
-hits are not re-uploaded, and publication failure is only a warning.
+A request waits at most 5 s for its connection. After three requests in a row
+get no response at all (no connection, or a timeout), holbuild warns once and
+leaves the remote cache alone for the rest of the run, so an unreachable cache
+costs a build a bounded amount of time; an HTTP error status doesn't count
+towards the three, and any response resets the count. In the status line and
+`--json`'s `build_finished` event, `from_cache` counts every theory restored
+from a cache, and `from_remote` the ones among them whose entries this run
+copied from the remote cache.
+While a build runs, `--prefetch-concurrency` background threads (twice `-j` by
+default) also copy the remote entries of the plan's out-of-date theories into
+the local cache in build order, so a theory's restore usually finds its entry
+already local. This prefetch is best-effort and silent; whatever it misses is
+fetched when the theory is reached, as before. `HOLBUILD_CACHE_TRACE=1` shows
+the prefetch thread count as `remote cache prefetch threads: <n>` and each
+prefetched entry as `remote cache prefetched: <key>`.
+A missing HOL toolchain is restored from the same remote cache when its HOL
+commit, build arguments other than `-j`, installation path (with symlinks
+resolved, as HOL's build records it), platform, C library, Poly/ML runtime
+(release and architecture variant, as `poly -v` reports them) and resolved
+`poly` executable path match. The source-analysis helper is not archived; holbuild
+rebuilds it against the restored toolchain. After a remote miss, a successful
+local toolchain build is published automatically unless another builder
+published it meanwhile; an archive that is missing its blob or fails to extract
+or validate is replaced by the local build (a failed download is not). Local and remote hits are not re-uploaded, and publication
+failure is only a warning.
 
 The remote endpoint stores content blobs under `/cas/<sha256>` and holbuild
-cache metadata under `/ac/<action-key>`. CAS transfers use zstd compression when
+cache metadata under `/ac/<sha256>`; a blob's CAS digest is the same one
+holbuild uses locally. CAS transfers use zstd compression when
 supported by the server; action metadata stays small and is sent uncompressed.
 This is a live accelerator, not remote execution and not an immutable release
 registry. Remote cache contents are trusted build inputs: cache hits can load
@@ -689,11 +861,19 @@ Poly/ML objects, and restored toolchains execute cached binaries. Use an
 authenticated HTTPS endpoint with trusted writers. Content hashes detect
 corruption but do not authenticate the cache publisher.
 
+holbuild talks to the remote cache through libcurl (7.66 or later, with an
+asynchronous DNS resolver), loaded at run time: `libcurl.so.4` on Linux, the
+system `/usr/lib/libcurl.4.dylib` on macOS. If it can't be loaded or lacks
+those, holbuild says why once and runs the `curl` command for each request
+instead, as it did before it used libcurl. As with the curl command,
+`CURL_CA_BUNDLE`, `SSL_CERT_FILE` and `SSL_CERT_DIR` select the CA certificates
+that HTTPS connections trust.
+
 For private caches, put credentials in local/CI configuration, not in
 the project manifest. CLI `--remote-cache` overrides `HOLBUILD_REMOTE_CACHE_URL`,
 which overrides `.holconfig.toml`'s `[remote_cache].url`. `bazel-remote`
-supports HTTP Basic Auth; the safest holbuild path is to pass curl a config
-file:
+supports HTTP Basic Auth; the safest holbuild path is a credentials file in
+curl's config syntax:
 
 ```sh
 cat > "$RUNNER_TEMP/holbuild-remote-cache.curl" <<'EOF'
@@ -705,10 +885,14 @@ HOLBUILD_REMOTE_CACHE_CURL_CONFIG="$RUNNER_TEMP/holbuild-remote-cache.curl" \
 ```
 
 `HOLBUILD_REMOTE_CACHE_CURL_CONFIG` overrides `.holconfig.toml`'s
-`[remote_cache].curl_config`.
+`[remote_cache].curl_config`. Through libcurl, holbuild reads only the `user`
+option from this file (`user = "name:password"`, `user name:password` or
+`--user name:password`; `#` starts a comment line). A file with any other
+option (`proxy`, `cacert`, `netrc`, ...) makes holbuild say so once and use the
+`curl` command, which reads the whole file.
 
-The URL form `https://user:password@cache.example.org` also works with curl, but
-can expose credentials via process listings or shell history; prefer the config
+The URL form `https://user:password@cache.example.org` also works, but can
+expose credentials via process listings or shell history; prefer the config
 file form for CI and shared machines. holbuild redacts URL userinfo in its own
 remote-cache diagnostics, but it cannot hide secrets from the operating system if
 they are passed as command-line arguments.
@@ -732,6 +916,220 @@ loaded by Poly/ML.
 Use `holbuild export --metadata-out MyTheory.hbx.json` to write a registry
 metadata sidecar for static hosting or GitHub Releases; see
 [`docs/hbx-registry.md`](docs/hbx-registry.md).
+
+### Exporting theory actions for remote execution
+
+`action-spec` plans targets as `build` would, without building, and exports
+each theory the remote cache can't yet satisfy as an ActionSpec: a text blob
+with everything another machine needs to build that one theory from the remote
+cache alone. A theory counts as satisfied only if its remote entry would
+restore for this build: a usable manifest whose timeout contract is at least
+as strict as the one requested. The command takes `build`'s cache and proof
+options (`--tactic-timeout`, `--skip-proof-steps`, ...) and needs a remote
+cache:
+
+```sh
+holbuild --remote-cache https://cache.example.org action-spec --upload MyTheory
+```
+
+Each spec is written to `.holbuild/action-specs/<sha256>`, named by its
+SHA-256. With `--upload`, the specs and every source file they name are also
+uploaded to the remote cache's `/cas/`. The command prints the batch, the
+uncached theories with the uncached theories each waits for:
+
+```text
+holbuild-action-batch-v1
+action <input_key> <ac-key> <spec-sha256> <package>:<logical>
+edge <input_key> <parent input_key>
+```
+
+A theory is ready to build once all its `edge` parents' results are in the
+remote cache, that is once `/ac/<ac-key>` exists for each;
+`ac-key = sha256("holbuild-remote-ac-v1\n" ^ input_key ^ "\n")` is where
+holbuild stores a theory's entry. An edge names the nearest uncached theories
+a theory depends on, looking through libraries and cached theories.
+
+`action-spec` refuses a closure containing a theory that can't run remotely,
+and says which and why: one with `cache = false` or `always_reexecute`, a
+forced one (`--force`), one whose script or extra input lies outside its
+package root, one that loads a HOL theory or library by path, one with a path
+containing whitespace, and any theory with `--trknl`. Such a closure builds
+locally.
+
+An ActionSpec names no path on the exporting machine:
+
+```text
+holbuild-action-spec-v1
+holbuild-version=<version>
+holbuild-runtime=<sha256 of the holbuild sources a theory child loads>
+toolchain git=<url> rev=<rev> kernel=<variant>
+input-key=<input_key>
+action-text-sha256=<sha256 of the action text below>
+deps-key=<dependency context key>
+target <package>:<logical>
+source <package> <relpath> <sha256> <size>
+file input <relpath> <sha256> <size>
+file library <relpath> <sha256> <size>
+dep theory <package>:<logical> <stem> <input_key>
+lib <package>:<logical> <stem> <suffix> <load>...
+load theory|library|object <name-or-stem>
+output sig|sml|dat <relpath>
+output extra <declaration>
+option proof-steps=<bool>
+option tactic-timeout=<seconds|none>
+option new-ir=<bool>
+action-text
+<the action text, verbatim to the end of the blob>
+```
+
+- The action text is the one whose SHA-256 is `input-key`, so a reader can
+  check the spec against the key it claims. It names the source's SHA-256 and
+  the keys of the direct dependencies.
+- `source` is the theory's script, by its path in its package. `file input`
+  lines are its extra inputs, relative to the package root. `file library`
+  lines are the sources of the project libraries it loads, and `lib` lines are
+  those libraries' `.uo`/`.ui` manifests, with their loads in order.
+- Every other path (`file library`, a `dep theory` or `lib` object stem, a
+  `load object`, an `output`) is relative to the action root, the directory
+  that holds the `.holbuild/` tree. In a `lib` line, a load containing `/` is
+  such a path; any other load is a HOL name. Library sources are placed under
+  `.holbuild/action-src/<package>/`.
+- `dep theory` lines list every theory the target depends on, directly or not,
+  with the object stem its outputs restore to.
+- `deps-key` identifies the target's dependency context with the toolchain's
+  semantic identity, for naming a saved dependency heap.
+- The `option` lines are how the theory is run, which the action key leaves
+  out; the entry built under them carries the timeout contract the exporting
+  build will ask for.
+
+### Running one theory action as a remote worker
+
+`exec-action` builds the ActionSpec stored in the remote cache under
+`SPEC-SHA256`, with nothing but the remote cache as input, publishes the
+result there, and exits:
+
+```sh
+HOLBUILD_CACHE=/var/cache/holbuild holbuild --remote-cache https://cache.example.org \
+  --max-heap 32000 --cooperate-dir /var/lib/holbuild/memory \
+  exec-action SPEC-SHA256 --result result.txt --cache-limit-gb 200 [--share-heaps]
+```
+
+It runs in `<cache root>/action`, which it locks and empties before and after
+each action, and, without `--share-heaps` (below), keeps the theory's
+dependency heap and checkpoints in `<cache root>/checkpoints`, so a later run
+of an edited theory resumes from them as a local build does. A saved heap records the absolute paths it was
+built at, so every worker should use the same cache root. One `exec-action`
+runs per cache root at a time; a second waits for the first. The cache root
+is the worker's own: other holbuild commands shouldn't share it, since the
+cache cap below sweeps it.
+
+In order, it checks the spec (its holbuild version and runtime must equal the
+worker's, and its action text must hash to its input key and agree with its
+source and direct dependencies), ensures the HOL toolchain (restoring the
+remote toolchain archive, or building one, and when another worker's archive
+was published first, switching to that archive), fetches the sources by
+SHA-256, restores every dependency through the normal cache restore and its
+checks, and reports `cached` if the theory's own entry already restores.
+Otherwise it builds the theory as a local build would, with the spec's proof
+options, and checks that the remote cache then holds an entry for it whose
+outputs equal the build's. A missing dependency fails the action; the worker
+never builds one.
+
+It writes this record to `--result FILE`, or to stdout:
+
+```text
+holbuild-action-result-v1
+spec=<sha256>
+input-key=<input_key>
+status=built|cached|failed
+failure=proof|tactic-timeout|memory|input-missing|publish|toolchain|disk|spec-rejected|internal
+missing=theory <input_key> | blob <sha256>
+peak-rss-mb=<n>
+wall-ms=<n>
+log=<sha256> <size>
+```
+
+`failure` appears on failure, and `missing` with `input-missing`.
+`peak-rss-mb` is the HOL process's peak resident memory on a successful build.
+`log` is the build log, uploaded to `/cas/`. `memory` means Poly/ML ran out
+of heap or the container's cgroup `memory.events` counted an OOM kill during
+the run; `disk` means the disk filled. The exit status summarizes the record:
+
+| Exit | Meaning |
+|---|---|
+| 0 | built or cached |
+| 1 | `proof` or `tactic-timeout`: final, retrying won't help |
+| 2 | `memory`: retry with more memory |
+| 3 | `input-missing`, `publish`, `toolchain`, `disk` or `internal`: retry or resubmit |
+| 4 | `spec-rejected` |
+
+The required `--cache-limit-gb N` caps what the worker keeps between actions: its
+checkpoints, its HOL toolchains with their analysers, and its local cache.
+Before each action, it evicts the least recently used until they fit in `N`
+GB minus a reserve for the action itself (`--cache-reserve-gb`, by default a
+tenth of `N`). A theory's checkpoints go together, a toolchain goes with its
+analysers, and a toolchain another holbuild process is using is kept.
+
+With `--share-heaps`, workers share dependency heaps and checkpoints through
+the remote cache. Before the build, the worker restores the latest checkpoint
+another worker published for the theory's source, the way a local build
+picks one: the last theorem or definition context whose source prefix is
+unchanged, or a failed proof's prefix, with a timeout at least as strict as
+the spec's. If there's none, it restores the dependency heap; if there's no
+heap either, it loads the dependencies cold. After the build, successful or
+not, it publishes its heap if no other worker's is, and then, when the heap
+under them is the published one, the checkpoints it saved. A heap is shared
+only between workers with the same toolchain bytes, cache root, action root
+and platform, which is why every worker should use the same cache root.
+
+The checkpoint tree is then the action's own, emptied before and after it;
+the host store `<cache root>/checkpoint-store` keeps the shared files, one
+directory per heap, which the cache cap evicts as a unit, unless an action
+on the host is using it. Worker containers on one host can share
+`checkpoint-store/` and `hol-toolchains/`, mounted from host directories, and
+keep the rest of the cache root to themselves. A restored file is hard-linked
+from the store when the store and `checkpoints/` are on one mount, and copied
+otherwise. A bind mount counts as another mount even on the same filesystem,
+so in that layout restores copy: the store still saves downloads, not disk.
+
+### Building on remote workers
+
+`build --remote-exec URL` hands the theories the remote cache lacks to a
+remote-execution coordinator, which runs them on its workers with
+`exec-action`, then restores them as an ordinary build would:
+
+```sh
+holbuild --remote-cache https://cache.example.org build --remote-exec https://exec.example.org MyTheory
+```
+
+It exports and uploads the batch as `action-spec --upload` does, submits it
+with `POST URL/v1/batches`, and follows `GET URL/v1/batches/<id>/events`,
+printing each theory's state as it changes. When the batch is done, the build
+restores every theory from the remote cache. The coordinator's credentials go
+in a curl config file named by `HOLBUILD_REMOTE_EXEC_CURL_CONFIG`, such as
+`header = "Authorization: Bearer <token>"`, so they stay off the command line.
+
+The build never waits on remote execution alone. If the closure can't run
+remotely (see `action-spec`), the coordinator can't be reached or refuses the
+batch, or the batch fails, it warns and builds locally. With `--remote-only`
+it fails instead, and it never builds HOL or a theory locally: a HOL
+toolchain or a theory that doesn't restore from a cache is an error. With nothing to
+build remotely it goes straight to the local build.
+
+`--detach` submits the batch, prints its id (`holbuild: remote batch <id>`)
+and exits; if the batch can't be submitted, it fails rather than building
+locally. `--attach <id>` follows that batch and then builds as above. A build
+that loses the event stream says how to reattach.
+
+The coordinator's protocol, in what holbuild uses of it:
+
+- `POST /v1/batches` with the batch text as the body answers 201 and
+  `{"batch_id": "<id>"}`; any other status refuses the batch.
+- `GET /v1/batches/<id>/events` streams one JSON object per line: an
+  `{"type": "action", "input_key", "theory", "state", "last_failure",
+  "log_sha256", ...}` when an action changes, and last `{"type": "batch",
+  "state": "done"|"failed"|"cancelled", "failure"}`. A failed action's log is
+  at `/cas/<log_sha256>` in the remote cache.
 
 Clean old project and cache state with:
 
@@ -826,8 +1224,8 @@ run `make`. The pinned HOL revision is recorded in `vendor/hol/REV`.
 
 Useful caches:
 
-- `$HOLBUILD_CACHE/hol-toolchains`, keyed by the project HOL revision and Poly/ML
-  version.
+- `$HOLBUILD_CACHE/hol-toolchains`, keyed by the project HOL revision, HOL build
+  arguments, Poly/ML runtime and resolved `poly` path.
 
 ## Running holbuild's own tests
 

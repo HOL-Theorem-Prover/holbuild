@@ -6,17 +6,17 @@ structure FS = OS.FileSys
 
 exception Error of string
 
-type blob_entry = {sha1 : string, sha256 : string, size : string}
+type blob_entry = {sha256 : string, size : string}
 type blob_map = (string, blob_entry) Redblackmap.dict
 datatype t = RemoteCache of {base_url : string, blobs : blob_map ref}
 
-val metadata_header = "holbuild-remote-cache-action-v1"
+val metadata_header = "holbuild-remote-cache-action-v2"
 val manifest_marker = "manifest-text-v1\n"
 
 (* Large toolchain archives get a minutes-scale transfer bound without changing
    the existing theory-action policy. *)
-val curl_max_time_seconds = "30"
-val toolchain_curl_max_time_seconds = "1800"
+val curl_max_time_seconds = 30
+val toolchain_curl_max_time_seconds = 1800
 
 fun trim_trailing_slashes url =
   let
@@ -34,8 +34,6 @@ fun remote url =
 
 fun base_url (RemoteCache {base_url, ...}) = base_url
 fun blob_map (RemoteCache {blobs, ...}) = blobs
-
-fun quote s = HolbuildHash.quote s
 
 fun path_exists path = FS.access(path, []) handle OS.SysErr _ => false
 
@@ -63,12 +61,12 @@ fun write_text path text =
   end
 
 fun temp_path label =
-  Path.concat(Path.dir (FS.tmpName ()), "holbuild-remote-cache-" ^ label ^ "-" ^ Path.file (FS.tmpName ()))
+  HolbuildTempPath.temporary ("remote-cache-" ^ label)
 
-fun curl_config_arg () =
+fun curl_config_args () =
   case HolbuildRemoteCacheConfig.curl_config () of
-      SOME path => " --config " ^ quote path
-    | NONE => ""
+      SOME path => ["--config", path]
+    | NONE => []
 
 fun redact_userinfo url =
   let
@@ -98,79 +96,201 @@ fun redact_userinfo url =
           end
   end
 
-fun read_first_token path =
-  case String.tokens Char.isSpace (read_text path) of
+fun first_token text =
+  case String.tokens Char.isSpace text of
       token :: _ => token
     | [] => ""
 
 fun remove_file_before result path = (remove_file path; result)
 
-fun command_success command = OS.Process.isSuccess (OS.Process.system command)
+fun run program args =
+  HolbuildSpawn.run {program = program, args = args, stderr = HolbuildSpawn.Inherit}
 
-fun zstd_compress src dst =
-  command_success ("zstd -q -f -T0 -o " ^ quote dst ^ " " ^ quote src)
+fun completed_line text =
+  case List.find (String.isSubstring "Completed in") (String.fields (fn c => c = #"\n") text) of
+      SOME line => Substring.string (#2 (Substring.position "Completed in" (Substring.full line)))
+    | NONE => "no zstd completion line"
+
+(* Under HOLBUILD_CACHE_TRACE, zstd runs verbosely so its wall time and CPU
+   load show how much the -T0 threads compete with the build. *)
+fun zstd_compress url src dst =
+  if HolbuildStatus.cache_trace_enabled () then
+    let
+      val result = HolbuildSpawn.run {program = "zstd", args = ["-vv", "-f", "-T0", "-o", dst, src],
+                                      stderr = HolbuildSpawn.Merge}
+      val ok = HolbuildSpawn.succeeded result
+    in
+      HolbuildStatus.cache_trace
+        ("remote cache zstd " ^ redact_userinfo url ^ " " ^
+         (if ok then completed_line (#output result) else "failed: " ^ #output result));
+      ok
+    end
+  else
+    HolbuildSpawn.succeeded (run "zstd" ["-q", "-f", "-T0", "-o", dst, src])
 
 fun zstd_content_headers size =
-  " -H 'Content-Encoding: zstd' -H " ^ quote ("X-Digest-SizeBytes: " ^ size)
+  ["Content-Encoding: zstd", "X-Digest-SizeBytes: " ^ size]
 
-fun curl_get_with_timeout timeout_seconds {url, dst} =
+val restore_warning_emitted = ref false
+val restore_warning_mutex = Mutex.mutex ()
+
+fun warn_restore_once message =
   let
-    val code = temp_path "code"
-    val display_url = redact_userinfo url
+    val _ = Mutex.lock restore_warning_mutex
+    val emit = not (!restore_warning_emitted)
+    val _ = restore_warning_emitted := true
+    val _ = Mutex.unlock restore_warning_mutex
+  in
+    if emit then
+      (TextIO.output (TextIO.stdErr, "holbuild: warning: remote cache restore failed: " ^ message ^ "\n");
+       TextIO.flushOut TextIO.stdErr)
+    else ()
+  end
+
+(* Requests go through libcurl when HolbuildRemoteCacheConfig could set it
+   up, and otherwise through the curl command, which prints its own error
+   message. *)
+fun cli_status timeout_seconds options url =
+  let
+    val result =
+      run "curl" (["-q", "-sS", "-L", "--connect-timeout", Int.toString HolbuildHttp.connect_timeout_seconds,
+                   "--max-time", Int.toString timeout_seconds] @
+                  curl_config_args () @ options @ ["-w", "%{http_code}", url])
+  in
+    case (HolbuildSpawn.succeeded result, Int.fromString (first_token (#output result))) of
+        (true, SOME http_code) => HolbuildHttp.Response http_code
+      | _ => HolbuildHttp.Failed "the curl command failed"
+  end
+
+fun get_status timeout_seconds {url, dst} =
+  if HolbuildRemoteCacheConfig.uses_libcurl () then
+    HolbuildHttp.get {url = url, dst = dst, timeout = timeout_seconds}
+  else
     (* --compressed advertises curl-supported response encodings, including zstd
        when this curl build has zstd support, and streams decompressed bytes to dst. *)
-    val command = "curl -q -sS -L --compressed --max-time " ^ timeout_seconds ^ curl_config_arg () ^ " -o " ^ quote dst ^
-                  " -w '%{http_code}' " ^ quote url ^ " > " ^ quote code
-    val status = OS.Process.system command
-    val http_code = if path_exists code then read_first_token code else "000"
-    val _ = remove_file code
+    cli_status timeout_seconds ["--compressed", "-o", dst] url
+
+fun put_status timeout_seconds headers {url, src} =
+  if HolbuildRemoteCacheConfig.uses_libcurl () then
+    HolbuildHttp.put {url = url, src = src, headers = headers, timeout = timeout_seconds}
+  else
+    cli_status timeout_seconds
+               (List.concat (map (fn header => ["-H", header]) headers) @ ["-T", src, "-o", "/dev/null"]) url
+
+(* After this many requests in a row get no HTTP response at all (no
+   connection, or a timeout), the remote cache is off for the rest of the
+   process: every later request would likely wait as long again.  Any HTTP
+   response, an error status included, resets the count. *)
+val max_consecutive_transport_failures = 3
+val transport_failures = ref 0
+val transport_mutex = Mutex.mutex ()
+
+fun disabled () =
+  (Mutex.lock transport_mutex;
+   !transport_failures >= max_consecutive_transport_failures
+   before Mutex.unlock transport_mutex)
+
+fun record_transport_outcome result =
+  let
+    val _ = Mutex.lock transport_mutex
+    val previous = !transport_failures
+    val _ =
+      if previous >= max_consecutive_transport_failures then ()
+      else
+        case result of
+            HolbuildHttp.Failed _ => transport_failures := previous + 1
+          | HolbuildHttp.Response _ => transport_failures := 0
+    val now_disabled =
+      previous < max_consecutive_transport_failures andalso
+      !transport_failures >= max_consecutive_transport_failures
+    val _ = Mutex.unlock transport_mutex
   in
-    if not (OS.Process.isSuccess status) then HolbuildCacheBackend.Corrupt ("curl GET failed: " ^ display_url)
-    else if http_code = "200" then HolbuildCacheBackend.Hit
-    else if http_code = "404" then HolbuildCacheBackend.Miss
-    else HolbuildCacheBackend.Corrupt ("HTTP " ^ http_code ^ " from " ^ display_url)
+    case (now_disabled, result) of
+        (true, HolbuildHttp.Failed message) =>
+          (TextIO.output (TextIO.stdErr,
+             "holbuild: warning: remote cache disabled for the rest of this run after " ^
+             Int.toString max_consecutive_transport_failures ^
+             " requests in a row failed; the last: " ^ message ^ "\n");
+           TextIO.flushOut TextIO.stdErr)
+      | _ => ()
+  end
+
+(* Under HOLBUILD_CACHE_TRACE, one line per request: its wall time, then the
+   HTTP status and the size of the file received or sent. *)
+fun traced method url path request =
+  if not (HolbuildStatus.cache_trace_enabled ()) then request ()
+  else
+    let
+      val timer = Timer.startRealTimer ()
+      val result = request ()
+      val wall = LargeInt.toString (Time.toMilliseconds (Timer.checkRealTimer timer))
+      val outcome =
+        case result of
+            HolbuildHttp.Failed message => "failed: " ^ message
+          | HolbuildHttp.Response code =>
+              Int.toString code ^ " bytes=" ^
+              (if path_exists path then Position.toString (FS.fileSize path) else "0")
+    in
+      HolbuildStatus.cache_trace
+        ("remote cache " ^ method ^ " " ^ redact_userinfo url ^ " wall=" ^ wall ^ "ms " ^ outcome);
+      result
+    end
+
+(* NONE when the remote cache is disabled, without a request. *)
+fun send method url path request =
+  if disabled () then NONE
+  else
+    let val result = traced method url path request
+    in record_transport_outcome result; SOME result end
+
+fun curl_get_with_timeout timeout_seconds (request as {url, dst}) =
+  let val display_url = redact_userinfo url
+  in
+    case send "GET" url dst (fn () => get_status timeout_seconds request) of
+        NONE => HolbuildCacheBackend.Miss
+      | SOME (HolbuildHttp.Failed message) =>
+          HolbuildCacheBackend.Corrupt ("GET " ^ display_url ^ " failed: " ^ message)
+      | SOME (HolbuildHttp.Response 200) => HolbuildCacheBackend.Hit
+      | SOME (HolbuildHttp.Response 404) => HolbuildCacheBackend.Miss
+      | SOME (HolbuildHttp.Response code) =>
+          HolbuildCacheBackend.Corrupt ("HTTP " ^ Int.toString code ^ " from " ^ display_url)
   end
   handle e => (HolbuildCacheBackend.Corrupt (General.exnMessage e))
 
 fun curl_get request = curl_get_with_timeout curl_max_time_seconds request
 
 fun successful_put_code code =
-  code = "200" orelse code = "201" orelse code = "204"
+  code = 200 orelse code = 201 orelse code = 204
 
-fun curl_put_with_headers_timeout timeout_seconds headers {url, src} =
-  let
-    val code = temp_path "code"
-    val body = temp_path "body"
-    val display_url = redact_userinfo url
-    val command = "curl -q -sS -L --max-time " ^ timeout_seconds ^ curl_config_arg () ^ headers ^ " -T " ^ quote src ^
-                  " -o " ^ quote body ^ " -w '%{http_code}' " ^ quote url ^
-                  " > " ^ quote code
-    val status = OS.Process.system command
-    val http_code = if path_exists code then read_first_token code else "000"
-    val _ = remove_file code
-    val _ = remove_file body
+fun curl_put_with_headers_timeout timeout_seconds headers (request as {url, src}) =
+  let val display_url = redact_userinfo url
   in
-    if not (OS.Process.isSuccess status) then HolbuildCacheBackend.Conflict ("curl PUT failed: " ^ display_url)
-    else if successful_put_code http_code then HolbuildCacheBackend.Published
-    else HolbuildCacheBackend.Conflict ("HTTP " ^ http_code ^ " from " ^ display_url)
+    case send "PUT" url src (fn () => put_status timeout_seconds headers request) of
+        NONE => HolbuildCacheBackend.Skipped
+      | SOME (HolbuildHttp.Failed message) =>
+          HolbuildCacheBackend.Conflict ("PUT " ^ display_url ^ " failed: " ^ message)
+      | SOME (HolbuildHttp.Response code) =>
+          if successful_put_code code then HolbuildCacheBackend.Published
+          else HolbuildCacheBackend.Conflict ("HTTP " ^ Int.toString code ^ " from " ^ display_url)
   end
   handle e => (HolbuildCacheBackend.Conflict (General.exnMessage e))
 
 fun curl_put_with_headers headers request =
   curl_put_with_headers_timeout curl_max_time_seconds headers request
 
-fun curl_put request = curl_put_with_headers "" request
+fun curl_put request = curl_put_with_headers [] request
 
 fun curl_put_zstd_with_timeout timeout_seconds {url, src, size} =
   let val compressed = temp_path "zstd-put"
   in
-    if zstd_compress src compressed then
+    if disabled () then HolbuildCacheBackend.Skipped
+    else if zstd_compress url src compressed then
       curl_put_with_headers_timeout timeout_seconds (zstd_content_headers size)
         {url = url, src = compressed}
       before remove_file compressed
     else
       remove_file_before
-        (curl_put_with_headers_timeout timeout_seconds "" {url = url, src = src})
+        (curl_put_with_headers_timeout timeout_seconds [] {url = url, src = src})
         compressed
   end
   handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
@@ -184,15 +304,15 @@ fun remote_action_key key =
 fun action_url cache key = base_url cache ^ "/ac/" ^ remote_action_key key
 fun cas_url cache sha256 = base_url cache ^ "/cas/" ^ sha256
 
-fun lookup_blob cache sha1 =
-  Redblackmap.peek (!(blob_map cache), sha1)
+fun lookup_blob cache sha256 =
+  Redblackmap.peek (!(blob_map cache), sha256)
 
 fun remember_blob cache entry =
   let
     val blobs = blob_map cache
-    val {sha1, ...} = entry
+    val {sha256, ...} = entry
   in
-    blobs := Redblackmap.insert (!blobs, sha1, entry)
+    blobs := Redblackmap.insert (!blobs, sha256, entry)
   end
 
 fun split_at_marker text =
@@ -210,9 +330,9 @@ fun split_at_marker text =
 
 fun parse_blob_line line =
   case String.tokens Char.isSpace line of
-      ["blob", sha1, sha256, size] =>
-        if HolbuildHash.valid_sha1 sha1 andalso HolbuildHash.valid_sha256 sha256 then
-          SOME {sha1 = sha1, sha256 = sha256, size = size}
+      ["blob", sha256, size] =>
+        if HolbuildHash.valid_sha256 sha256 then
+          SOME {sha256 = sha256, size = size}
         else NONE
     | _ => NONE
 
@@ -261,7 +381,7 @@ fun metadata_text manifest blobs =
     ([metadata_header,
       "manifest-sha256 " ^ HolbuildHash.string_sha256 manifest,
       "manifest-size " ^ Int.toString (size manifest)] @
-     map (fn {sha1, sha256, size} => "blob " ^ sha1 ^ " " ^ sha256 ^ " " ^ size) blobs @
+     map (fn {sha256, size} => "blob " ^ sha256 ^ " " ^ size) blobs @
      [manifest_marker ^ manifest])
 
 fun get_action cache key =
@@ -279,7 +399,8 @@ fun get_action cache key =
             SOME manifest
           end
       | HolbuildCacheBackend.Miss => (cleanup (); NONE)
-      | HolbuildCacheBackend.Corrupt _ => (cleanup (); NONE)
+      | HolbuildCacheBackend.Corrupt message =>
+          (cleanup (); warn_restore_once message; NONE)
   end
   handle _ => NONE
 
@@ -306,8 +427,11 @@ fun publish_action_metadata cache key metadata =
     publish ()
   end
 
+(* Checked first, as the blobs an action lists go unpublished while the
+   remote cache is disabled. *)
 fun publish_action cache {key, text} =
-  publish_action_metadata cache key (action_metadata cache key text)
+  if disabled () then HolbuildCacheBackend.Skipped
+  else publish_action_metadata cache key (action_metadata cache key text)
   handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
 (* The HTTP write is unconditional.  Callers must authorize replacement from
@@ -315,28 +439,28 @@ fun publish_action cache {key, text} =
 fun replace_action_unconditionally cache request = publish_action cache request
 
 fun put_action cache policy {key, text} =
-  let
-    val url = action_url cache key
-    val metadata = action_metadata cache key text
-  in
-    case get_action cache key of
-        SOME existing =>
-          (case policy of
-               HolbuildCacheBackend.PutIfAbsent => HolbuildCacheBackend.Conflict url
-             | HolbuildCacheBackend.PutIfAbsentOrSame =>
-                 if existing = text then HolbuildCacheBackend.AlreadyPresent
-                 else HolbuildCacheBackend.Conflict url)
-      | NONE => publish_action_metadata cache key metadata
-  end
+  if disabled () then HolbuildCacheBackend.Skipped
+  else
+    let
+      val url = action_url cache key
+      val metadata = action_metadata cache key text
+    in
+      case get_action cache key of
+          SOME existing =>
+            (case policy of
+                 HolbuildCacheBackend.PutIfAbsent => HolbuildCacheBackend.Conflict url
+               | HolbuildCacheBackend.PutIfAbsentOrSame =>
+                   if existing = text then HolbuildCacheBackend.AlreadyPresent
+                   else HolbuildCacheBackend.Conflict url)
+        | NONE => publish_action_metadata cache key metadata
+    end
   handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
-fun has_blob cache sha1 = Option.isSome (lookup_blob cache sha1)
+fun has_blob cache sha256 = Option.isSome (lookup_blob cache sha256)
 
-fun verify_downloaded_blob path ({sha1, sha256, size} : blob_entry) =
+fun verify_downloaded_blob path ({sha256, size} : blob_entry) =
   if Position.toString (FS.fileSize path) <> size then
-    HolbuildCacheBackend.Corrupt ("downloaded blob size mismatch: " ^ sha1)
-  else if HolbuildHash.file_sha1 path <> sha1 then
-    HolbuildCacheBackend.Corrupt ("downloaded blob SHA1 mismatch: " ^ sha1)
+    HolbuildCacheBackend.Corrupt ("downloaded blob size mismatch: " ^ sha256)
   else if HolbuildHash.file_sha256 path <> sha256 then
     HolbuildCacheBackend.Corrupt ("downloaded blob SHA256 mismatch: " ^ sha256)
   else
@@ -352,6 +476,8 @@ fun fetch_blob_with_timeout timeout_seconds cache {hash, dst} =
         in
           case result of
               HolbuildCacheBackend.Hit => verify_downloaded_blob dst entry
+            | HolbuildCacheBackend.Corrupt message =>
+                (warn_restore_once message; result)
             | other => other
         end
         handle e => HolbuildCacheBackend.Corrupt (General.exnMessage e)
@@ -362,21 +488,30 @@ fun fetch_blob cache request =
 fun fetch_toolchain_blob cache request =
   fetch_blob_with_timeout toolchain_curl_max_time_seconds cache request
 
+(* Fetches a blob by its SHA-256 alone, without an action entry that lists
+   it, as a remote worker fetches its spec and sources. *)
+fun fetch_unlisted_blob cache {hash, dst} =
+  (case curl_get {url = cas_url cache hash, dst = dst} of
+       HolbuildCacheBackend.Hit =>
+         if HolbuildHash.file_sha256 dst = hash then HolbuildCacheBackend.Hit
+         else HolbuildCacheBackend.Corrupt ("downloaded blob SHA256 mismatch: " ^ hash)
+     | other => other)
+  handle e => HolbuildCacheBackend.Corrupt (General.exnMessage e)
+
 fun publish_blob_with_timeout timeout_seconds cache {hash, src} =
   let
-    val sha1 = HolbuildHash.file_sha1 src
     val sha256 = HolbuildHash.file_sha256 src
     val size = Position.toString (FS.fileSize src)
     val _ =
-      if sha1 = hash then ()
-      else raise Error ("blob SHA1 mismatch: expected " ^ hash ^ " got " ^ sha1)
+      if sha256 = hash then ()
+      else raise Error ("blob SHA256 mismatch: expected " ^ hash ^ " got " ^ sha256)
     val result =
       curl_put_zstd_with_timeout timeout_seconds
         {url = cas_url cache sha256, src = src, size = size}
   in
     case result of
-        HolbuildCacheBackend.Published => (remember_blob cache {sha1 = hash, sha256 = sha256, size = size}; result)
-      | HolbuildCacheBackend.AlreadyPresent => (remember_blob cache {sha1 = hash, sha256 = sha256, size = size}; result)
+        HolbuildCacheBackend.Published => (remember_blob cache {sha256 = sha256, size = size}; result)
+      | HolbuildCacheBackend.AlreadyPresent => (remember_blob cache {sha256 = sha256, size = size}; result)
       | other => other
   end
   handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)

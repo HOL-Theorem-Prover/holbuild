@@ -242,6 +242,7 @@ fun checkpoint_source_summary source_path source_text (checkpoint : HolbuildTheo
 
 val termination_goal_prefix = "holbuild termination condition goal for "
 val termination_goal_end = "holbuild termination condition goal end"
+val termination_definition_start_prefix = "holbuild termination definition start for "
 
 fun has_suffix suffix text =
   let val n = size text
@@ -288,7 +289,9 @@ fun last_termination_goal lines =
                 case parse_termination_goal_marker line of
                     SOME {name, definition_start} =>
                       loop rest (SOME {name = name, definition_start = definition_start, lines = []}) best
-                  | NONE => loop rest NONE best
+                  | NONE =>
+                      if String.isPrefix termination_definition_start_prefix line then loop rest NONE NONE
+                      else loop rest NONE best
   in
     loop lines NONE NONE
   end

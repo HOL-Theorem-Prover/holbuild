@@ -55,7 +55,6 @@ fun blob_ref line =
         ["blob", _, hash] => SOME hash
       | _ =>
           if has_prefix "blob=" clean then SOME (take_token (String.extract(clean, 5, NONE)))
-          else if has_prefix "blob-sha1=" clean then SOME (take_token (String.extract(clean, 10, NONE)))
           else NONE
   end
 
@@ -78,8 +77,20 @@ fun ensure_dir path =
 
 fun remove_file path = FS.remove path handle OS.SysErr _ => ()
 
+val temp_blob_counter = ref 0
+val temp_blob_mutex = Mutex.mutex ()
+
+fun next_temp_blob_id () =
+  (Mutex.lock temp_blob_mutex;
+   (temp_blob_counter := !temp_blob_counter + 1; !temp_blob_counter)
+   before Mutex.unlock temp_blob_mutex)
+
+(* Unique per copy: concurrent copies of one blob (parallel build workers,
+   prefetch, other holbuild processes) share tmp_dir. *)
 fun temp_blob_path tmp_dir hash =
-  Path.concat(tmp_dir, "holbuild-cache-transfer-" ^ hash ^ ".blob")
+  Path.concat(tmp_dir, String.concat ["holbuild-cache-transfer-", hash, "-",
+                                      HolbuildFileLock.current_pid_text (), "-",
+                                      Int.toString (next_temp_blob_id ()), ".blob"])
 
 fun fetch_blob_or_raise (source : source) hash path =
   case #fetch_blob source {hash = hash, dst = path} of
@@ -94,16 +105,43 @@ fun publish_blob_or_raise (destination : destination) hash path =
     | HolbuildCacheBackend.Skipped => (0, 0)
     | HolbuildCacheBackend.Conflict detail => raise Error ("destination cache blob conflict: " ^ hash ^ " (" ^ detail ^ ")")
 
+val no_space = "No space left on device"
+
+(* Whether the filesystem holding dir can't take a small write. *)
+fun out_of_space dir =
+  let val probe = Path.concat(dir, ".holbuild-space-probe")
+  in
+    (let val out = BinIO.openOut probe
+     in
+       (BinIO.output (out, Word8Vector.tabulate (1048576, fn _ => 0w0)); BinIO.closeOut out)
+       handle e => (BinIO.closeOut out handle _ => (); raise e)
+     end;
+     remove_file probe;
+     false)
+    handle e => (remove_file probe; String.isSubstring no_space (General.exnMessage e))
+  end
+
+(* A download that filled the disk need not say so (curl reports only a
+   failed write, or leaves a short file), and removing it frees the space:
+   probe while it is still there. *)
 fun copy_blob source destination tmp_dir hash (uploaded, reused) =
   let
     val path = temp_blob_path tmp_dir hash
-    val _ = fetch_blob_or_raise source hash path
-    val (uploaded', reused') = publish_blob_or_raise destination hash path
-    val _ = remove_file path
+    val (uploaded', reused') =
+      (fetch_blob_or_raise source hash path;
+       publish_blob_or_raise destination hash path)
+      handle e =>
+        let val full = out_of_space (Path.dir path)
+        in
+          remove_file path;
+          if full andalso not (String.isSubstring no_space (General.exnMessage e)) then
+            raise Error ("cache blob " ^ hash ^ ": " ^ no_space)
+          else raise e
+        end
   in
+    remove_file path;
     (uploaded + uploaded', reused + reused')
   end
-  handle e => (remove_file (temp_blob_path tmp_dir hash); raise e)
 
 fun put_action_or_raise (destination : destination) key text =
   case #put_action destination HolbuildCacheBackend.PutIfAbsentOrSame {key = key, text = text} of

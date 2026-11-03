@@ -63,6 +63,10 @@ Opts out of proof-step execution. Source is sent through the plain `hol run` pat
 
 **Incompatible**: `--skip-proof-steps` with `--tactic-timeout`, `--trace-steps`, or `--repl-on-failure`.
 
+## `--trknl` defaults
+
+A tracing-kernel build runs root-package theories as `--skip-checkpoints --skip-proof-steps` would; kernel checking and `.tr.gz` export are unchanged. `--trace-steps` or `--tactic-timeout` turns proof steps back on; `--repl-on-failure` turns on proof steps and checkpoints. Explicit `--skip-*` flags still conflict with them as above.
+
 ## Parser recovery
 
 HOL source parse errors are build failures. When HOLSourceParser recovery occurs, holbuild may warn and keep recovered theorem/resume boundaries for best-effort instrumentation and diagnostics before HOL reports the failing script-play status. This avoids the old all-or-nothing fallback where one later parse recovery could disable proof IR/timeouts for the whole theory.
@@ -149,7 +153,7 @@ With `--json`, failures are emitted as structured `error`/`node_failed` JSONL ev
 | `HOLBUILD_SHARE_COMMON_DATA` | Override `PolyML.shareCommonData` default for checkpoint saves |
 | `HOLBUILD_CHECKPOINT_TIMING` | `1`/`true` = print checkpoint save timing to stderr |
 | `HOLBUILD_ECHO_CHILD_LOGS` | `1`/`true` = echo child `hol run` log to stdout |
-| `HOLBUILD_CACHE_TRACE` | `1`/`true` = print cache decision trace |
+| `HOLBUILD_CACHE_TRACE` | `1`/`true` = print cache decision trace, one timing line per remote-cache request and zstd compression, and the machine-wide Linux CPU-pressure (PSI) delta over the build |
 | `HOLBUILD_STATUS` | `1`/`true` = enable status display, `0`/`false` = disable |
 | `HOLBUILD_TIMING_LOG` | Path for structured timing data (tool + coarse phase lines, including `build.keys` action-key computation) |
 | `HOLBUILD_TIMING_DETAIL` | Optional timing coarseness: unset/`coarse` logs coarse phases only; `fine` adds aggregate subphase lines; `trace` is reserved for future per-item detail |

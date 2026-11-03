@@ -128,7 +128,7 @@ fi
 
 key_a=$(theory_toolchain_key "$holdir_a")
 key_b=$(theory_toolchain_key "$holdir_b")
-if [[ ! "$key_a" =~ ^[0-9a-f]{40}$ || "$key_a" != "$key_b" ]]; then
+if [[ ! "$key_a" =~ ^[0-9a-f]{64}$ || "$key_a" != "$key_b" ]]; then
   echo "theory toolchain keys differ across cache roots: '$key_a' vs '$key_b'" >&2
   exit 1
 fi
@@ -177,6 +177,34 @@ if [[ "$(theory_toolchain_key "$holdir_c")" == "$key_a" ]]; then
 fi
 if [[ "$(input_key_for_root "$root_a")" == "$input_a" ]]; then
   echo "ATheory input key did not change with the HOL source" >&2
+  exit 1
+fi
+
+# A failing git status must report its stderr without deleting or rebuilding
+# a toolchain whose checkout still exists.
+real_git=$(command -v git)
+status_git=$tmpdir/status-git
+mkdir -p "$status_git"
+cat > "$status_git/git" <<SH
+#!/bin/sh
+for arg in "\$@"; do
+  if [ "\$arg" = status ]; then
+    echo 'git status fixture failure' >&2
+    exit 128
+  fi
+done
+exec "$real_git" "\$@"
+SH
+chmod +x "$status_git/git"
+builds_before=$(builds)
+if (cd "$project" && PATH="$status_git:$PATH" HOLBUILD_CACHE="$root_a" "$HOLBUILD_BIN" buildhol) > "$tmpdir/status-failed.log" 2>&1; then
+  echo "failing git status unexpectedly accepted" >&2
+  exit 1
+fi
+require_grep 'git status fixture failure' "$tmpdir/status-failed.log"
+require_file "$holdir_c/.git/HEAD"
+if [[ "$(builds)" != "$builds_before" ]]; then
+  echo "failing git status rebuilt the existing toolchain" >&2
   exit 1
 fi
 

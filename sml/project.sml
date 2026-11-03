@@ -69,7 +69,7 @@ type t =
     local_build_excludes : string list,
     local_build_exclude_globs : string list,
     local_build_jobs : int option,
-    build_tactic_timeout : real option,
+    build_tactic_timeout : real option option,
     checkpoint_limit_gb : int option,
     remote_cache_url : string option,
     remote_cache_curl_config : string option,
@@ -388,12 +388,13 @@ fun dependency_local_path_with resolution (project as {graph_artifact_root, ...}
                 SOME (hol_holdir resolution {git = git, rev = rev})
               else SOME (Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), name))
           | FromSource {from, path, ...} =>
-              (case hol_dependency project of
-                   SOME (Dependency {role = HolToolchainDependency,
-                                     source = GitSource {git, rev}, ...}) =>
-                     if from = "hol" then SOME (Path.concat(hol_holdir resolution {git = git, rev = rev}, path))
-                     else SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path))
-                 | _ => SOME (Path.concat(Path.concat(Path.concat(Path.concat(graph_artifact_root, ".holbuild"), "src"), from), path)))
+              (* The shim lives inside its from dependency's checkout, so an
+                 override of that dependency moves the shim with it. *)
+              (case List.find (fn Dependency {name, ...} => name = from) (#dependencies project) of
+                   SOME from_dep =>
+                     Option.map (fn from_root => Path.concat(from_root, path))
+                       (dependency_local_path_with resolution project from_dep)
+                 | NONE => die ("validated from dependency disappeared: " ^ from))
 
 fun dependency_local_path project dep = dependency_local_path_with standard_resolution project dep
 
@@ -722,7 +723,9 @@ fun describe_with resolution (project : t) =
     List.app (fn dep => print ("dependency: " ^ dependency_to_string project dep ^ "\n")) dependencies;
     List.app (fn override => print ("override: " ^ override_to_string override ^ "\n")) overrides;
     Option.app (fn jobs => print ("local build.jobs: " ^ Int.toString jobs ^ "\n")) local_build_jobs;
-    Option.app (fn t => print ("build.tactic_timeout: " ^ Real.toString t ^ "\n")) build_tactic_timeout;
+    Option.app (fn timeout => print ("build.tactic_timeout: " ^
+                (case timeout of NONE => "none" | SOME t => Real.toString t) ^ "\n"))
+               build_tactic_timeout;
     opt "run.heap: " run_heap;
     print ("run.loads: " ^ String.concatWith ", " run_loads ^ "\n");
     List.app (fn heap => print ("heap: " ^ heap_to_string heap ^ "\n")) heaps;

@@ -235,12 +235,17 @@ first_log=$tmpdir/first.log
   "$HOLBUILD_BIN" --remote-cache "$remote_url" build --tactic-timeout 0 ATheory) > "$first_log" 2>&1
 require_grep "ATheory built" "$first_log"
 require_grep "remote cache published:" "$first_log"
+require_grep "remote cache zstd .*/cas/[0-9a-f]* Completed in" "$first_log"
+require_grep "remote cache PUT .*/cas/[0-9a-f]* wall=[0-9]*ms 20[014] bytes=[0-9]*" "$first_log"
+if [[ -r /proc/pressure/cpu ]]; then
+  require_grep "system cpu pressure some delta: [0-9]*us" "$first_log"
+fi
 assert_remote_proof_timeout none
 
 second_log=$tmpdir/second.log
 (cd "$second" && HOLBUILD_CACHE="$second_cache" HOLBUILD_CACHE_TRACE=1 \
   "$HOLBUILD_BIN" --remote-cache "$remote_url" build --tactic-timeout 180 ATheory) > "$second_log" 2>&1
-require_grep "remote cache hydrated:" "$second_log"
+require_grep "remote cache \(hydrated\|prefetched\):" "$second_log"
 require_grep "insufficient tactic-timeout contract" "$second_log"
 require_grep "ATheory built" "$second_log"
 require_grep "remote cache published:" "$second_log"
@@ -277,7 +282,8 @@ TOML
 third_log=$tmpdir/third.log
 (cd "$third" && HOLBUILD_CACHE="$third_cache" HOLBUILD_CACHE_TRACE=1 \
   "$HOLBUILD_BIN" build ATheory) > "$third_log" 2>&1
-require_grep "remote cache hydrated:" "$third_log"
+require_grep "remote cache \(hydrated\|prefetched\):" "$third_log"
+require_grep "remote cache GET .*/cas/[0-9a-f]* wall=[0-9]*ms 200 bytes=[0-9]*" "$third_log"
 require_grep "cache hit: ATheory" "$third_log"
 require_grep "ATheory restored from cache" "$third_log"
 if grep -q "ATheory built" "$third_log"; then
@@ -399,7 +405,7 @@ assert_remote_proof_timeout 60.0
 cp "$clean_weaker_manifest" "$weaker_manifest"
 different_output=$tmpdir/different-output.dat
 printf 'different valid cached output\n' > "$different_output"
-different_output_hash=$(sha1sum "$different_output" | cut -d' ' -f1)
+different_output_hash=$(sha256sum "$different_output" | cut -d' ' -f1)
 cp "$different_output" "$weaker_cache/blobs/$different_output_hash"
 python3 - "$weaker_manifest" "$different_output_hash" <<'PY'
 import pathlib
@@ -437,7 +443,7 @@ discrepancy_restore_log=$tmpdir/discrepancy-restore.log
 (cd "$discrepancy" && HOLBUILD_CACHE="$discrepancy_cache" HOLBUILD_CACHE_TRACE=1 \
   "$HOLBUILD_BIN" --remote-cache "$remote_url" build \
   --allow-cache-timeout-discrepancy --tactic-timeout 30 ATheory) > "$discrepancy_restore_log" 2>&1
-require_grep "remote cache hydrated:" "$discrepancy_restore_log"
+require_grep "remote cache \(hydrated\|prefetched\):" "$discrepancy_restore_log"
 require_grep "ATheory restored from cache" "$discrepancy_restore_log"
 require_grep '^proof_timeout=60.0$' "$discrepancy_metadata"
 

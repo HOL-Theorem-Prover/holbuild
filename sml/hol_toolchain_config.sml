@@ -25,8 +25,6 @@ val standard = config StandardKernel
 val tracing = config TracingKernel
 val default = standard
 
-fun sequence_name UptoHol = "upto-hol"
-
 fun sequence_file UptoHol = "tools/sequences/upto-hol"
 
 fun sequence_args sequence = ["--seq=" ^ sequence_file sequence]
@@ -47,12 +45,8 @@ fun full_build_arg_list ({no_helpdocs, kernel_variant, ...} : t) =
 
 fun full_build_args_text config = String.concatWith " " (full_build_arg_list config)
 
-fun key_material_fields (config : t) =
-  ["build_sequence=" ^ sequence_name (#sequence config),
-   "build_sequence_file=" ^ sequence_file (#sequence config),
-   "no_helpdocs=" ^ Bool.toString (#no_helpdocs config),
-   "kernel_variant=" ^ kernel_variant_name (#kernel_variant config),
-   "build_args=" ^ build_args_text config]
+(* The build arguments carry the sequence, helpdocs and kernel choices. *)
+fun key_material_fields (config : t) = ["build_args=" ^ build_args_text config]
 
 fun required_sequence_file (config : t) = SOME (sequence_file (#sequence config))
 

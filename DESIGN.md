@@ -127,6 +127,19 @@ not the parent package artifact directory, so resolving `a -> b` creates
 For `from` dependencies, the source root is under `.holbuild/src/<from>/<path>`,
 but the shim manifest is read from the package that declares the dependency.
 
+A checkout already at its pinned commit is used without network access. Otherwise
+the commit is fetched into a bare mirror under `$HOLBUILD_CACHE/git/remotes`,
+shared by every project using that cache; creating a mirror and fetching into it
+are serialized by a per-mirror lock, and a new mirror is cloned to a temporary
+directory and renamed into place. Publishing a checkout is serialized by
+`.holbuild/locks/src/<package>.lock`, and HEAD is checked again under that lock.
+Temporary clones left by killed processes are removed under the lock that
+guards them, and a process waiting on either lock names the pid holding it.
+Every process that uses a checkout holds a shared lease,
+`.holbuild/locks/src/<package>.lease`, until it exits; replacing a checkout at
+another commit takes the lease exclusively and fails while another process holds
+it, so no process removes a tree another one is reading.
+
 The reserved `hol` package is the project HOL toolchain. It is
 materialized and built at a canonical shared cache path
 `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`; upstream HOL does not need a
@@ -143,8 +156,9 @@ bin/build --no-helpdocs
 A built HOL checkout is expected to contain `bin/hol`, `bin/build`, and
 `bin/hol.state`, and must be git-clean ignoring ignored build products. If a
 shared cache entry is dirty or incomplete, holbuild refuses to use it until the
-user removes it manually. The cache key includes the canonical HOL repository,
-revision, Poly/ML command/version, build arguments, and cache format version.
+user removes it manually. The cache key includes the HOL revision, the Poly/ML
+runtime (release and architecture variant), the resolved `poly` executable
+path, build arguments other than `-j`, and cache format version.
 
 ## Main binary and project-HOL helper direction
 
@@ -337,8 +351,9 @@ from the configured HOL toolchain context. `extra_deps` are filesystem
 dependencies whose expanded contents are hashed into the action key. Manifest
 entries are package-root-relative; source files may also declare source-file-relative
 extra dependencies with static literal `holbuild_extra_deps [...]` annotations.
-Entries may name files, directories, or simple globs, and source-declared entries
-are staged so matching relative filesystem reads work during the action.
+Entries may name files, directories, or simple globs (which skip `.holbuild/`
+directories inside them), and entries are staged so matching relative
+filesystem reads work during the action.
 Theory-script sources may declare deterministic, source-file-relative fixed
 output files with static literal `holbuild_extra_outputs [...]` annotations.
 These paths are part of the action identity and owned output set: successful
@@ -529,9 +544,20 @@ Different absolute paths under the same declared root may normalize to the same
 root-relative identity. Arbitrary outside-root paths are rejected or treated as
 uncacheable.
 
+Because input keys hash sources rather than outputs, sharing cache entries
+across machines rests on a reproducibility contract: a deterministic script,
+with its sources and extra inputs declared, under the same theory toolchain key,
+produces a byte-identical `Theory.dat` in any project directory and artifact
+cache. A script that reads the clock, the environment, undeclared files, or host
+paths has to declare the files as `extra_deps` or opt out with `cache = false`.
+
 If the same input key produces different output keys, that indicates
-nondeterminism or undeclared inputs; the safe response is to warn and disable
-cache use for that action.
+nondeterminism or undeclared inputs. The cache keeps the first entry and warns
+on the conflicting publish. Correctness doesn't depend on the contract: a
+restored theory whose recorded parent `.dat` hashes differ from the local
+parents is rejected and rebuilt. What a nondeterministic theory costs is cache
+hits: where the local parent's `.dat` differs from the one the cached children
+were built against, its whole subtree misses and can't republish.
 
 ## Global cache
 
@@ -569,12 +595,9 @@ an interrupted fallback rebuild should not warn repeatedly about the same known-
 entry. A successful cache hit refreshes the action manifest mtime for retention;
 this avoids relying on filesystem atime policy.
 
-Materialization preference for v1:
-
-```text
-1. reflink / copy-on-write clone
-2. copy
-```
+Cache blobs are materialized by an in-process copy. Reflink clones only help on
+copy-on-write filesystems and cost a `cp` process per blob, which is slower than
+copying small theory files.
 
 Avoid hardlinking cache blobs into project `.holbuild/`: even if cache blobs are meant
 to be immutable, project outputs are the local materialized build view and should
@@ -648,7 +671,9 @@ manifest entries. Executable heap targets are requested with `holbuild executabl
 NAME` from `[[executable]]` manifest entries. They are exported artifacts, not
 the normal incremental-build primitive: holbuild first builds the declared
 logical objects, then invokes HOL's public `buildheap` command on the selected
-object stems. Executable targets add `--exe=<main>`.
+object stems. Executable targets add `--exe=<main>`. The object build runs without
+proof steps: tactic timeouts are a `build` check, and a timeout-free request can
+reuse any cached theory, including those built with `--skip-proof-steps`.
 
 Heaps requested by users remain project-local exported artifacts. Checkpoints are
 local build/debug state, not exported artifacts. Successful theory builds keep
@@ -779,7 +804,11 @@ nodes. Dependency-package nodes instead use plain proof execution with checkpoin
 creation, proof steps, tactic timeouts, execution-plan targeting, step tracing,
 and failure REPL disabled; developers who need those facilities build the
 dependency as the root project. Kernel selection remains a toolchain property and
-is unchanged for dependency nodes. This effective per-node execution policy does
+is unchanged for dependency nodes. A tracing-kernel build (`--trknl`) defaults
+root-package nodes to the same plain policy, since it collects proof traces
+rather than proof-development state; an explicit `--trace-steps`,
+`--tactic-timeout` or `--repl-on-failure` re-enables the proof steps (and, for
+the REPL, checkpoints) it needs. This effective per-node execution policy does
 not enter final theory action keys.
 
 For instrumented root-package actions, holbuild may create several local
@@ -850,6 +879,15 @@ property of the declared entry point graph, not of the current request, except t
 but local metadata/cache records the timeout a successful build satisfied; a success under
 60s may satisfy a later 180s request, while a success under 180s does not satisfy a later
 60s request.
+
+A timeout is not a tactic failure: inside `TRY`, an `ORELSE`/`FIRST` alternative or a
+structural repeat body it fails the build at that step instead of taking the combinator's
+failure branch. It records no try, choice or repeat event for that body. The failed-prefix
+checkpoint is saved where the outermost such combinator started that body rather than
+inside it: at the `TRY` or choice's entry, or at the start of the timed-out iteration of a
+structural repeat. Tactic-level `REPEAT`/`rpt` is an opaque leaf (see above), so it is
+timed as one step and fails like any other leaf.
+
 `execution-plan THEORY:THEOREM` and `--trace-steps` are debugging/inspection paths.
 `holbuild execution-plan THEORY:THEOREM` is static inspection for proof steps: it
 discovers sources, finds the named theorem in the named theory script, pretty-prints

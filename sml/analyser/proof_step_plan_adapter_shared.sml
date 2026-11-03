@@ -224,7 +224,14 @@ and convert_step source step =
           HolbuildProofIr.StepSelect
             {start_pos = start_pos, end_pos = end_pos,
              selector = selector source selected, mode = select_mode mode,
-             body = converted}
+             (* Native >>~- applies the continuation to each selected goal. *)
+             body = case (selected, mode) of
+                        (ProofStepPlan.SelectMatchingAll _, ProofStepPlan.SelectSolve) =>
+                          let val (a, b) = plan_span "select body" converted
+                          in [HolbuildProofIr.StepEach
+                                {start_pos = a, end_pos = b, body = converted}]
+                          end
+                      | _ => converted}
         end
     | ProofStepPlan.Cases cases =>
         let val converted = map (convert_plan source) cases

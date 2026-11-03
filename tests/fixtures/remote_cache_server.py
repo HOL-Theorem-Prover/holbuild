@@ -39,6 +39,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with request_log.open("a", encoding="utf-8") as log:
             log.write(f"{self.command} {path}\n")
 
+    def authorized(self):
+        required = control / "authorization" if control is not None else None
+        if required is None or not required.exists():
+            return True
+        if self.headers.get("Authorization") == required.read_text().strip():
+            return True
+        self.send_response(401)
+        self.end_headers()
+        return False
+
     def gate_download(self):
         if control is None or "/cas/" not in self.path:
             return
@@ -60,6 +70,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.record_request()
+        if not self.authorized():
+            return
+        if control is not None and (control / "get-status").exists():
+            self.send_response(int((control / "get-status").read_text()))
+            self.end_headers()
+            return
         path = self.object_path()
         if path is None:
             return
@@ -83,6 +99,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_PUT(self):
         self.record_request()
+        if not self.authorized():
+            return
         path = self.object_path()
         if path is None:
             return

@@ -56,6 +56,8 @@ sig
   val verify_blob : t -> string -> bool
 
   val ensure_layout : t -> unit
+  (* Unlocked operations for callers holding with_action_publish_lock.
+     put_action acquires that lock itself and must not be nested inside it. *)
   val write_action : t -> {key : string, text : string} -> unit
   val remove_action : t -> string -> unit
   val touch_action : t -> string -> unit

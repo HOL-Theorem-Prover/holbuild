@@ -32,7 +32,9 @@ fun run wants source_path =
        P.join (["file", "1", source_path] @ wants),
        P.join ["end"]] ^ "\n"
     val _ = write_file req request
-    val status = OS.Process.system (HolbuildHash.quote (analyser ()) ^ " --request " ^ HolbuildHash.quote req ^
+    val status = OS.Process.system (HolbuildHash.quote (analyser ()) ^ " " ^
+                                    String.concatWith " " (HolbuildDependencies.analyser_min_heap_args ()) ^
+                                    " --request " ^ HolbuildHash.quote req ^
                                     " --response " ^ HolbuildHash.quote resp ^ " 2> " ^ HolbuildHash.quote err)
     val stderr = read_all err handle _ => ""
     val _ = OS.FileSys.remove req handle OS.SysErr _ => ()

@@ -125,6 +125,107 @@ if grep -q "ATheory is up to date" "$tmpdir/source-extra2.log"; then
   exit 1
 fi
 
+# Manifest inputs are staged at their script-relative paths, so the script can
+# read them the way it would read source-declared ones, and inputs reached
+# through ../ stay inside the action's stage.
+manifest_stage_project="$tmpdir/manifest_stage_policy"
+mkdir -p "$manifest_stage_project/src/a" "$manifest_stage_project/data"
+cat > "$manifest_stage_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "manifest_stage_policy"
+
+[build]
+members = ["src"]
+
+[actions.ATheory]
+extra_deps = ["src/a/side.txt", "data/message.txt"]
+TOML
+echo side > "$manifest_stage_project/src/a/side.txt"
+echo message > "$manifest_stage_project/data/message.txt"
+cat > "$manifest_stage_project/src/a/AScript.sml" <<'SML'
+fun read_input path =
+  let val input = TextIO.openIn path
+  in TextIO.inputAll input before TextIO.closeIn input end
+val _ = if read_input "side.txt" = "side\n" then () else raise Fail "bad side.txt"
+val _ = if read_input "../../data/message.txt" = "message\n" then () else raise Fail "bad message.txt"
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Theorem a_thm:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+val _ = export_theory();
+SML
+(cd "$manifest_stage_project" && "$HOLBUILD_BIN" build ATheory) > "$tmpdir/manifest-stage.log" 2>&1
+require_file "$manifest_stage_project/.holbuild/obj/src/a/ATheory.dat"
+if [[ -e "$manifest_stage_project/.holbuild/data" || -e "$manifest_stage_project/.holbuild/stage/data" ]]; then
+  echo "manifest extra input was staged outside the action's stage" >&2
+  exit 1
+fi
+
+# Staged inputs must not replace holbuild's own staged files: an input naming
+# the script's directory still runs the instrumented script (the tactic
+# timeout fires), and globs skip holbuild's state under .holbuild/.
+manifest_dir_project="$tmpdir/manifest_dir_policy"
+mkdir -p "$manifest_dir_project/src" "$manifest_dir_project/.holbuild"
+cat > "$manifest_dir_project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$(holbuild_pinned_hol_rev)"
+
+[project]
+name = "manifest_dir_policy"
+
+[build]
+members = ["src"]
+tactic_timeout = 0.1
+
+[actions.ATheory]
+extra_inputs = ["src", "*.txt"]
+TOML
+echo stray > "$manifest_dir_project/.holbuild/stray.txt"
+cat > "$manifest_dir_project/src/AScript.sml" <<'SML'
+val _ = if OS.FileSys.access ("../.holbuild", []) then raise Fail ".holbuild was staged" else ();
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+fun slow_tac g = (OS.Process.sleep (Time.fromReal 0.5); ACCEPT_TAC TRUTH g);
+Theorem a_thm:
+  T
+Proof
+  slow_tac
+QED
+val _ = export_theory();
+SML
+if (cd "$manifest_dir_project" && "$HOLBUILD_BIN" build ATheory) > "$tmpdir/manifest-dir.log" 2>&1; then
+  echo "staged extra input replaced the instrumented script" >&2
+  cat "$tmpdir/manifest-dir.log" >&2
+  exit 1
+fi
+require_grep "tactic timed out after 0.1s while building ATheory" "$tmpdir/manifest-dir.log"
+
+# Nor does holbuild's state under .holbuild/ change the action key.
+glob_project="$tmpdir/glob_policy"
+make_theory_project "$glob_project" '[actions.ATheory]
+extra_deps = ["*.txt"]'
+echo one > "$glob_project/extra.txt"
+(cd "$glob_project" && "$HOLBUILD_BIN" build ATheory) > "$tmpdir/glob1.log" 2>&1
+echo stray > "$glob_project/.holbuild/stray.txt"
+(cd "$glob_project" && "$HOLBUILD_BIN" --verbose build ATheory) > "$tmpdir/glob2.log" 2>&1
+require_grep "ATheory is up to date" "$tmpdir/glob2.log"
+
 always_project="$tmpdir/always_policy"
 make_theory_project "$always_project" '[actions.ATheory]
 always_reexecute = true'

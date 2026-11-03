@@ -1,9 +1,14 @@
 structure HolbuildStatus =
 struct
 
-datatype outcome = Built | UpToDate | Restored | Inspected
+(* RestoredRemote is a restore whose entry this process copied from the remote
+   cache; it counts towards from_cache as well. *)
+datatype outcome = Built | UpToDate | Restored | RestoredRemote | Inspected
 
-type active_node = {key : string, label : string, started_at : Time.time}
+(* thread is the worker building the node; waiting is set while that worker
+   waits for machine memory before launching the node's child. *)
+type active_node = {key : string, label : string, started_at : Time.time,
+                    thread : Thread.thread, waiting : bool}
 
 type t = {
   enabled : bool,
@@ -15,6 +20,7 @@ type t = {
   built : int ref,
   up_to_date : int ref,
   restored : int ref,
+  restored_remote : int ref,
   active : active_node list ref,
   started_at : Time.time,
   ended : bool ref,
@@ -96,7 +102,7 @@ fun json_debug_artifacts_fields ({log} : debug_artifacts) =
 
 fun debug_artifacts_empty artifacts = null (json_debug_artifacts_fields artifacts)
 
-fun short_hash text = String.substring(HolbuildHash.string_sha1 text, 0, 12)
+fun short_hash text = String.substring(HolbuildHash.string_sha256 text, 0, 12)
 
 fun json_node_key key label = label ^ "#" ^ short_hash key
 
@@ -341,13 +347,15 @@ fun terminal_width () =
 fun outcome_text Built = "built"
   | outcome_text UpToDate = "is up to date"
   | outcome_text Restored = "restored from cache"
+  | outcome_text RestoredRemote = "restored from cache"
   | outcome_text Inspected = "inspected"
 
-fun count_outcome ({built, up_to_date, restored, ...} : t) outcome =
+fun count_outcome ({built, up_to_date, restored, restored_remote, ...} : t) outcome =
   case outcome of
       Built => built := !built + 1
     | UpToDate => up_to_date := !up_to_date + 1
     | Restored => restored := !restored + 1
+    | RestoredRemote => (restored := !restored + 1; restored_remote := !restored_remote + 1)
     | Inspected => ()
 
 fun elapsed ({started_at, ...} : t) = Time.-(Time.now (), started_at)
@@ -360,14 +368,15 @@ fun remove_active key active = List.filter (fn {key = k, ...} => k <> key) activ
 
 fun find_active key active = List.find (fn {key = k, ...} => k = key) active
 
-fun active_labels active = map (fn {label, ...} => label) active
+fun active_labels active =
+  map (fn {label, waiting, ...} => if waiting then label ^ " (waiting for memory)" else label) active
 
 fun active_elapsed_text NONE = ""
   | active_elapsed_text (SOME {started_at, ...}) =
       " in " ^ Real.fmt (StringCvt.FIX (SOME 3))
         (Time.toReal (Time.-(Time.now (), started_at))) ^ "s"
 
-fun line ({total, jobs, finished, built, up_to_date, restored, active, ...} : t) =
+fun line ({total, jobs, finished, built, up_to_date, restored, restored_remote, active, ...} : t) =
   let
     val running = active_labels (!active)
     val prefix =
@@ -376,7 +385,8 @@ fun line ({total, jobs, finished, built, up_to_date, restored, active, ...} : t)
          " running=", Int.toString (length running), "/", Int.toString jobs,
          " built=", Int.toString (!built),
          " from_cache=", Int.toString (!restored),
-         " unchanged=", Int.toString (!up_to_date)]
+         " unchanged=", Int.toString (!up_to_date),
+         " from_remote=", Int.toString (!restored_remote)]
   in
     case running of
         [] => prefix
@@ -430,6 +440,7 @@ fun create {total, jobs} =
        built = ref 0,
        up_to_date = ref 0,
        restored = ref 0,
+       restored_remote = ref 0,
        active = ref [],
        started_at = Time.now (),
        ended = ref false,
@@ -446,7 +457,8 @@ fun start_node status key label =
         in
           if !ended then ()
           else
-            (active := {key = key, label = label, started_at = Time.now ()} :: remove_active key (!active);
+            (active := {key = key, label = label, started_at = Time.now (),
+                        thread = Thread.self (), waiting = false} :: remove_active key (!active);
              if json_mode () then
                emit_json "node_started" (json_node_fields key label)
              else if enabled then redraw status
@@ -487,7 +499,7 @@ fun finish_node status key label outcome =
 fun finish status =
   (with_lock status
      (fn () =>
-         let val {enabled, ended, total, finished, built, restored, up_to_date, ...} = status
+         let val {enabled, ended, total, finished, built, restored, restored_remote, up_to_date, ...} = status
          in
            if !ended then ()
            else
@@ -497,7 +509,8 @@ fun finish status =
                    json_int_field "total" total,
                    json_int_field "built" (!built),
                    json_int_field "from_cache" (!restored),
-                   json_int_field "unchanged" (!up_to_date)]
+                   json_int_field "unchanged" (!up_to_date),
+                   json_int_field "from_remote" (!restored_remote)]
               else if enabled then
                 (TextIO.output (TextIO.stdOut, "\r" ^ fit (!(#width status)) (final_line status) ^ clear_to_eol ^ "\n");
                  TextIO.flushOut TextIO.stdOut)
@@ -528,9 +541,59 @@ fun message_to stream_name stream text =
                     (TextIO.output (stream, text); TextIO.flushOut stream)
                 end)
 
+(* Marks the node built by the calling thread as waiting for machine memory
+   (SOME detail) or no longer waiting (NONE).  A wait outside any node, such
+   as a heap export, is reported without a label. *)
+fun set_waiting_for_memory detail =
+  let
+    val self = Thread.self ()
+    val waiting = Option.isSome detail
+    fun mark (node as {key, label, started_at, thread, ...} : active_node) =
+      if Thread.equal (thread, self) then
+        {key = key, label = label, started_at = started_at, thread = thread, waiting = waiting}
+      else node
+    fun announce label =
+      case detail of
+          NONE => ()
+        | SOME text =>
+            if json_mode () then
+              emit_json "waiting_for_memory"
+                ((case label of SOME (key, name) => json_node_fields key name | NONE => []) @
+                 [json_string_field "detail" text])
+            else if quiet_mode () then ()
+            else
+              (TextIO.output (TextIO.stdOut,
+                 Option.getOpt (Option.map #2 label, "holbuild") ^
+                 " waiting for machine memory: " ^ text ^ "\n");
+               TextIO.flushOut TextIO.stdOut)
+  in
+    case !current_status of
+        NONE => announce NONE
+      | SOME status =>
+          with_lock status (fn () =>
+            let
+              val {enabled, active, ended, ...} = status
+              val own = List.find (fn {thread, ...} => Thread.equal (thread, self)) (!active)
+            in
+              if !ended then ()
+              else
+                (active := map mark (!active);
+                 if enabled andalso not (json_mode ()) then redraw status
+                 else announce (Option.map (fn {key, label, ...} => (key, label)) own))
+            end)
+  end
+
 fun message_stdout text = message_to "stdout" TextIO.stdOut text
 fun message_stderr text = message_to "stderr" TextIO.stdErr text
 fun message stream text = message_to "stdout" stream text
+
+fun cache_trace_enabled () =
+  case OS.Process.getEnv "HOLBUILD_CACHE_TRACE" of
+      SOME s => s = "1" orelse s = "true" orelse s = "yes"
+    | NONE => false
+
+fun cache_trace line =
+  if cache_trace_enabled () then message_stdout (line ^ "\n") else ()
 
 fun fail_with_debug_artifacts status key label msg artifacts =
   (with_lock status
