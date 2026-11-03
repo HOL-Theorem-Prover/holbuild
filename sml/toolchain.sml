@@ -8,8 +8,7 @@ datatype kernel_variant = datatype HolbuildHolToolchainConfig.kernel_variant
 val kernel_variant_name = HolbuildHolToolchainConfig.kernel_variant_name
 val kernel_variant_tracing = HolbuildHolToolchainConfig.kernel_variant_tracing
 
-type t = {holdir : string, maxheap : int option, gcthreads : int option,
-          kernel_variant : kernel_variant}
+type t = {holdir : string, maxheap : int option, kernel_variant : kernel_variant}
 
 exception Error of string
 
@@ -20,20 +19,18 @@ fun hol tc = executable tc ["bin", "hol"]
 fun holmake tc = executable tc ["bin", "Holmake"]
 fun base_state tc = executable tc ["bin", "hol.state"]
 
-fun maxheap_args ({maxheap, ...} : t) =
+fun poly_runtime_args ({maxheap, ...} : t) =
   case maxheap of
       NONE => []
     | SOME n => ["--maxheap", Int.toString n]
 
-(* Holmake confines Poly/ML to one GC thread while playing theory scripts.
-   Every HOL process holbuild starts does the same unless --gc-threads says
-   otherwise: Poly/ML's own default, one GC thread per core, multiplies the
-   runnable threads of a machine running many HOL processes. *)
-fun hol_subcommand_argv (tc : t) subcommand =
-  hol tc :: "--gcthreads=" ^ Int.toString (Option.getOpt (#gcthreads tc, 1)) ::
-  maxheap_args tc @ [subcommand]
+fun hol_subcommand_argv tc subcommand =
+  hol tc :: poly_runtime_args tc @ [subcommand]
 
-fun theory_run_argv tc = hol_subcommand_argv tc "run"
+(* Holmake deliberately confines Poly/ML to one GC thread while playing theory
+   scripts.  Keep that build policy separate from interactive run/repl use. *)
+fun theory_run_argv tc =
+  hol tc :: "--gcthreads=1" :: poly_runtime_args tc @ ["run"]
 
 fun quote s =
   "'" ^ String.translate (fn #"'" => "'\\''" | c => str c) s ^ "'"
@@ -152,16 +149,6 @@ fun timed_shell kind argv output script =
 
 fun run argv =
   timed_shell "run" argv NONE (command argv)
-
-(* The HOL process of run and check takes a machine reservation
-   (--cooperate-dir) like a theory child.  repl doesn't: it keeps the
-   terminal, so it isn't started in its own session. *)
-fun run_hol argv =
-  HolbuildMachineMemory.with_reservation
-    (fn lease =>
-        timed_system "run" argv NONE
-          (fn () => HolbuildProcessGroup.run_shell_inheriting lease (command argv)))
-  handle HolbuildMachineMemory.Error msg => raise Error msg
 
 fun run_interactive argv =
   timed_system "run_interactive" argv NONE (fn () => OS.Process.system (command argv))
