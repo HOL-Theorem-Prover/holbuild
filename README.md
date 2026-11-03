@@ -252,6 +252,7 @@ holbuild --version
 holbuild --help
 holbuild repl
 holbuild run script.sml
+holbuild repl --from MyTheory
 holbuild context
 holbuild context --trknl
 holbuild execution-plan MyTheory:my_theorem
@@ -655,6 +656,18 @@ ordinary outputs, cleaning followed
 by a normal build may restore them from cache; use existing no-cache or impure /
 always-reexecute controls when source execution is required.
 
+A theory may write SML sources (`.sml` or `.sig`) as extra outputs, as EmitML
+code does. A plan made before the theory runs has no node for such a source, so
+when a planned theory declares one, holbuild builds the planned theories that
+declare SML outputs first and then plans again over the sources they wrote. A
+source that uses a generated structure names its theory in `deps`, so that a
+fresh checkout plans the theory:
+
+```toml
+[actions.UseLib]
+deps = ["GenTheory"]
+```
+
 ### Generated source
 
 Generated HOL source can be declared with `[[generate]]` entries:
@@ -713,6 +726,39 @@ reach HOL this way, wherever they appear: holbuild's global options and
 (`--gcthreads`, `--maxheap`, `-H`, ...), which holbuild's own Poly/ML runtime
 removes from its command line, so holbuild rejects them where it can detect
 them (Linux).
+
+`holbuild run --from THEORY` and `holbuild repl --from THEORY` start HOL from a
+checkpoint that building `THEORY` left behind, instead of loading its ancestry
+again. `THEORY` is a logical name or source path; only root-package theories
+have checkpoints. `--from` must come before the arguments passed to HOL. The
+starting state is:
+
+| Condition | State |
+| --- | --- |
+| `THEORY`'s `final_context` checkpoint matches its current input key and its parent state is still in place | `THEORY` and its ancestors loaded |
+| Only `THEORY` changed, or the project directory moved: its `deps_loaded` checkpoint matches its current dependencies | ancestors loaded, `THEORY` not loaded |
+| Otherwise: not built yet, restored from the cache without a local build, built with `--skip-checkpoints`, checkpoints removed by `gc`, a dependency or the HOL toolchain changed, or `THEORY` is in a dependency package | `[run].heap` if configured, else the HOL base state |
+
+A usable checkpoint takes precedence over `[run].heap`. holbuild prints one
+line naming the state it chose and, on fallback, why. `--from` does not build
+`THEORY` itself. To refresh its checkpoints when `THEORY` is up to date or a
+cache hit, run `holbuild build --force --no-cache THEORY`.
+`[run].loads` are still built first and loaded on top of the chosen state.
+Checkpoints are saved with `TheoryPP.include_docs` and
+`TheoryPP.include_html_docs` off, so a session started from one resets both to
+their defaults; under `repl` this also overrides a value set in your HOL
+config. An unknown `THEORY` is an error.
+
+Without `--from`, `holbuild run script.sml` and `holbuild repl script.sml`
+choose `THEORY` themselves. holbuild finds the root-package theories the `.sml`
+scripts among the HOL arguments depend on (their `load` calls and the modules
+Holdep finds, as for build sources), takes the one with the most ancestors
+(when one has all the others as ancestors, that one), and starts from it as
+`--from` would. Its line names the theory and says it was inferred. Scripts
+that use no root-package theory, and a `repl` without scripts, start from
+`[run].heap` or the HOL base state as before; so do scripts whose analysis
+fails, with a line saying why. An explicit `--from` overrides the inferred
+theory.
 
 ## Proof steps and checkpoints
 
