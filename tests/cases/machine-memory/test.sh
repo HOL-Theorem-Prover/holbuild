@@ -413,8 +413,8 @@ for _ in $(seq 1 100); do
   flock -n "$busy/lock" true || break
   sleep 0.1
 done
-holbuild_in "$tmpdir/locked" --cooperate-dir "$busy" --machine-max-mem 3072 \
-  build --skip-checkpoints --skip-proof-steps > "$tmpdir/locked.out" 2>&1 || {
+(cd "$tmpdir/locked" && timeout 400 "$HOLBUILD_BIN" --cooperate-dir "$busy" --machine-max-mem 3072 \
+  build --skip-checkpoints --skip-proof-steps) > "$tmpdir/locked.out" 2>&1 || {
   echo "build waiting on a held machine-memory lock failed" >&2
   cat "$tmpdir/locked.out" >&2
   exit 1
