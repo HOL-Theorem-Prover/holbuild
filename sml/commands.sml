@@ -21,8 +21,8 @@ fun global_help () = print
   \Primary command:\n\
   \  [build] [TARGET ...]        Build project targets\n\n\
   \Project interaction:\n\
-  \  repl [ARG ...]              Start HOL REPL with project context\n\
-  \  run [ARG ...]               Run HOL with project context\n\
+  \  repl [--from THEORY] [ARG ...]  Start HOL REPL with project context\n\
+  \  run [--from THEORY] [ARG ...]   Run HOL with project context\n\
   \  context [--trknl]          Show resolved project context\n\n\
   \Inspection and advanced commands:\n\
   \  execution-plan T:THM        Inspect proof-step execution plan\n\
@@ -106,22 +106,38 @@ fun context_help () = print
 
 fun repl_help () = print
   "Usage:\n\
-  \  holbuild [GLOBAL OPTIONS] repl [ARG ...]\n\n\
+  \  holbuild [GLOBAL OPTIONS] repl [--from THEORY] [ARG ...]\n\n\
   \Start HOL REPL with project context. Extra arguments are passed to HOL,\n\
   \except two kinds, wherever they appear: holbuild's global options and\n\
   \-h/--help, which holbuild takes itself, and Poly/ML runtime options\n\
   \(--gcthreads, --maxheap, -H, ...), which holbuild's own runtime consumes;\n\
   \holbuild rejects those where it can detect them (Linux).\n\n\
+  \Options:\n\
+  \  --from THEORY  Start from THEORY's build checkpoint: final_context (THEORY\n\
+  \                 loaded) when current for THEORY's sources, else deps_loaded\n\
+  \                 (its ancestors loaded) when only THEORY changed, else\n\
+  \                 [run].heap or the HOL base state. Does not build THEORY.\n\
+  \                 Without --from, given .sml scripts, THEORY is inferred:\n\
+  \                 of the project theories the scripts depend on, the one\n\
+  \                 with the most ancestors.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun run_help () = print
   "Usage:\n\
-  \  holbuild [GLOBAL OPTIONS] run [ARG ...]\n\n\
+  \  holbuild [GLOBAL OPTIONS] run [--from THEORY] [ARG ...]\n\n\
   \Run HOL with project context. Extra arguments are passed to HOL,\n\
   \except two kinds, wherever they appear: holbuild's global options and\n\
   \-h/--help, which holbuild takes itself, and Poly/ML runtime options\n\
   \(--gcthreads, --maxheap, -H, ...), which holbuild's own runtime consumes;\n\
   \holbuild rejects those where it can detect them (Linux).\n\n\
+  \Options:\n\
+  \  --from THEORY  Start from THEORY's build checkpoint: final_context (THEORY\n\
+  \                 loaded) when current for THEORY's sources, else deps_loaded\n\
+  \                 (its ancestors loaded) when only THEORY changed, else\n\
+  \                 [run].heap or the HOL base state. Does not build THEORY.\n\
+  \                 Without --from, given .sml scripts, THEORY is inferred:\n\
+  \                 of the project theories the scripts depend on, the one\n\
+  \                 with the most ancestors.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun execution_plan_help () = print
@@ -1399,7 +1415,7 @@ fun parse_export_args args =
 fun root_package_name project =
   HolbuildProject.package_name (HolbuildProject.project_package project)
 
-fun export_build_options trknl project index entry_plan plan =
+fun default_build_options trknl project index entry_plan plan =
   let
     fun default_tactic_timeout () =
       case #build_tactic_timeout project of
@@ -1434,6 +1450,22 @@ fun export_build_options trknl project index entry_plan plan =
      allow_cache_timeout_discrepancy = false,
      trknl = trknl,
      restore_only = false}
+  end
+
+(* Input keys a plain `holbuild build` uses for PLAN's nodes; they name the
+   cache entries and checkpoints that build leaves behind. *)
+fun default_build_input_keys tc project index components plan =
+  let
+    val explicit_entry_targets =
+      map #2 (HolbuildTacticTimeoutPolicy.explicit_entries project index)
+    val entry_plan =
+      if null explicit_entry_targets then NONE
+      else SOME (timed_phase "entry_timeout.plan"
+                   (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index explicit_entry_targets))
+    val action_toolchain_key = HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key
+    val options = default_build_options (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)) project index entry_plan plan
+  in
+    HolbuildBuildPlan.input_keys (HolbuildBuildExec.build_config_lines_for_node options project) action_toolchain_key plan
   end
 
 (* Heaps and executables build their ancestors plain: proof steps and their
@@ -1568,15 +1600,7 @@ fun export_archive tc jobs args =
     val targets = timed_phase "targets.default" (fn () => default_build_targets resolution project index requested_targets)
     val _ = reject_object_targets targets
     val plan = timed_phase "build.plan" (fn () => build_target_plan resolution components (#holdir tc) project index requested_targets targets)
-    val explicit_entry_targets =
-      map #2 (HolbuildTacticTimeoutPolicy.explicit_entries project index)
-    val entry_plan =
-      if null explicit_entry_targets then NONE
-      else SOME (timed_phase "entry_timeout.plan"
-                   (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index explicit_entry_targets))
-    val action_toolchain_key = HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key
-    val options = export_build_options (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)) project index entry_plan plan
-    val keys = HolbuildBuildPlan.input_keys (HolbuildBuildExec.build_config_lines_for_node options project) action_toolchain_key plan
+    val keys = default_build_input_keys tc project index components plan
     val entries = export_entries project plan keys
     val cache = HolbuildFSCacheBackend.default () handle HolbuildFSCacheBackend.Error msg => raise Error msg
     val metadata = hbx_export_metadata project
@@ -1726,19 +1750,158 @@ fun build_heap_kind tc cli_jobs command target =
 fun build_heap tc cli_jobs target = build_heap_kind tc cli_jobs "heap" target
 fun build_executable tc cli_jobs target = build_heap_kind tc cli_jobs "executable" target
 
-fun hol_args_for_project tc project run_heap subcommand context user_args =
+(* `--from THEORY` options lead the HOL arguments; everything after them is
+   passed to HOL unchanged. *)
+fun split_run_from args =
   let
-    val heap_args =
-      case (run_heap, HolbuildProject.abs_run_heap project) of
-          (true, SOME heap) => ["--holstate", heap]
-        | _ => ["--holstate", HolbuildToolchain.base_state tc]
+    fun select NONE theory =
+          if theory = "" then raise Error "--from requires THEORY" else SOME theory
+      | select (SOME _) _ = raise Error "--from given more than once"
+    fun loop from rest =
+      case rest of
+          "--from" :: theory :: xs => loop (select from theory) xs
+        | ["--from"] => raise Error "--from requires THEORY"
+        | arg :: xs =>
+            if String.isPrefix "--from=" arg then
+              loop (select from (String.extract (arg, size "--from=", NONE))) xs
+            else (from, rest)
+        | [] => (from, [])
   in
-    HolbuildToolchain.hol_subcommand_argv tc subcommand @ heap_args @ [context] @ user_args
+    loop NONE args
   end
+
+(* A .sig/.sml pair shares a logical name; a theory's name is unique. *)
+fun from_theory_node plan theory =
+  let
+    val nodes = HolbuildBuildPlan.lookup plan theory
+  in
+    case (List.filter theory_node nodes, nodes) of
+        (node :: _, _) => node
+      | ([], node :: _) =>
+          raise Error ("--from requires a theory target, not " ^ HolbuildBuildPlan.logical_name node)
+      | ([], []) => raise Error ("--from " ^ theory ^ ": unknown build target: " ^ theory)
+  end
+
+fun from_theory_state tc project theory =
+  let
+    val {index, components} = prepare_source_index "run.from" (resolution_for_toolchain tc) project
+    val target = hd (HolbuildSourceIndex.resolve_path_targets index [theory])
+                 handle HolbuildSourceIndex.Error msg => raise Error ("--from " ^ theory ^ ": " ^ msg)
+    val plan = timed_phase "run.from.plan"
+                 (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index [target])
+                 handle HolbuildBuildPlan.Error msg => raise Error ("--from " ^ theory ^ ": " ^ msg)
+                      | HolbuildBuildPlan.UnknownTarget unknown =>
+                          raise Error ("--from " ^ theory ^ ": " ^ HolbuildBuildPlan.unknown_target_message unknown)
+    val node = from_theory_node plan target
+    val keys = default_build_input_keys tc project index components plan
+  in
+    HolbuildBuildExec.run_from_state tc project plan keys node
+  end
+
+(* The state HOL starts from, and the lines the run context loads first. *)
+type run_start = {holstate : string, context_lines : string list}
+
+fun checkpoint_start path =
+  {holstate = path, context_lines = HolbuildBuildExec.child_policy_reset_lines}
+
+(* Where run and repl start: an explicit --from theory, the theory inferred
+   from the script files HOL is given, or the fallback state (check). *)
+datatype run_from = FromTheory of string | FromScripts of string list | NoFrom
+
+(* The arguments HOL loads as scripts. *)
+fun script_args args =
+  List.filter
+    (fn arg => String.isSuffix ".sml" arg andalso
+               (OS.FileSys.access (arg, [OS.FileSys.A_READ]) handle OS.SysErr _ => false))
+    args
+
+(* Of the root-package theories SCRIPTS depend on, found by the dependency
+   analysis build applies to sources, the one with the most ancestors.  When
+   one of them has all the others as ancestors, that is the one. *)
+fun infer_from_theory tc project scripts =
+  let
+    val _ = configure_analyser_for_toolchain tc
+    val {index, components} = prepare_source_index "run.infer" (resolution_for_toolchain tc) project
+    val root = root_package_name project
+    fun referenced script =
+      let val {loads, holdep_mentions, ...} = HolbuildDependencies.extract script
+      in loads @ holdep_mentions end
+    fun root_source name =
+      List.exists (fn (source : HolbuildSourceIndex.source) =>
+                     #logical_name source = name andalso #package source = root)
+                  index
+    val targets =
+      List.foldr (fn (name, kept) => if List.exists (fn k => k = name) kept then kept else name :: kept)
+        [] (List.filter root_source (List.concat (map referenced scripts)))
+  in
+    if null targets then NONE
+    else
+      let
+        val plan = timed_phase "run.infer.plan"
+                     (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index targets)
+        val theories =
+          List.filter (fn node => theory_node node andalso HolbuildBuildPlan.package node = root)
+            (HolbuildBuildPlan.selected_nodes plan)
+        fun ancestors node =
+          length (List.filter theory_node (HolbuildBuildPlan.transitive_project_deps plan node))
+        fun deeper (node, NONE) = SOME node
+          | deeper (node, SOME best) = SOME (if ancestors node > ancestors best then node else best)
+      in
+        Option.map HolbuildBuildPlan.logical_name (List.foldl deeper NONE theories)
+      end
+  end
+
+(* A usable --from checkpoint takes precedence over [run].heap; without one,
+   run starts from [run].heap when RUN_HEAP and it is configured, and from the
+   base state otherwise. *)
+fun run_start tc project run_heap from : run_start =
+  let
+    val (fallback, fallback_name) =
+      case (run_heap, HolbuildProject.abs_run_heap project) of
+          (true, SOME heap) => (heap, "[run].heap " ^ heap)
+        | _ => (HolbuildToolchain.base_state tc, "the HOL base state")
+    val fallback_start = {holstate = fallback, context_lines = []}
+    fun start label theory =
+      let
+        fun note text = HolbuildStatus.message_stderr ("holbuild: " ^ label ^ ": " ^ text ^ "\n")
+      in
+        case from_theory_state tc project theory of
+            HolbuildBuildExec.FinalContextState path =>
+              (note "starting from its final_context checkpoint"; checkpoint_start path)
+          | HolbuildBuildExec.DepsLoadedState {path, final_context_unusable} =>
+              (note (final_context_unusable ^ "; starting from its deps_loaded checkpoint, " ^
+                     "which has only its ancestors loaded");
+               checkpoint_start path)
+          | HolbuildBuildExec.NoRunFromState reason =>
+              (note (reason ^ "; starting from " ^ fallback_name); fallback_start)
+      end
+  in
+    case from of
+        NoFrom => fallback_start
+      | FromTheory theory => start ("--from " ^ theory) theory
+      | FromScripts scripts =>
+          (* Nobody asked for a theory, so a script or project the analysis or
+             checkpoint lookup cannot handle starts HOL as it would without
+             inference. *)
+          (case infer_from_theory tc project scripts of
+               NONE => fallback_start
+             | SOME theory => start ("--from " ^ theory ^ " (inferred from the scripts' dependencies)") theory)
+          handle exn =>
+            case build_iteration_error_message exn of
+                SOME msg =>
+                  (HolbuildStatus.message_stderr
+                     ("holbuild: could not infer --from from the scripts' dependencies: " ^ msg ^
+                      "; starting from " ^ fallback_name ^ "\n");
+                   fallback_start)
+              | NONE => raise exn
+  end
+
+fun hol_run_argv tc holstate subcommand context user_args =
+  HolbuildToolchain.hol_subcommand_argv tc subcommand @ ["--holstate", holstate, context] @ user_args
 
 (* With run_heap false, HOL starts from the toolchain's base state even when
    [run].heap is configured. *)
-fun run_hol_status runner tc cli_jobs run_heap subcommand user_args =
+fun run_hol_status runner tc cli_jobs run_heap from subcommand user_args =
   let
     val configured_project = timed_phase "project.discover" load_project
     val run_loads = #run_loads configured_project
@@ -1748,16 +1911,28 @@ fun run_hol_status runner tc cli_jobs run_heap subcommand user_args =
     val project =
       if null run_loads then configured_project
       else timed_phase "run.project.rediscover" load_project
+    val {holstate, context_lines} = run_start tc project run_heap from
     val packages = resolved_packages (resolution_for_toolchain tc) project
     fun invoke context =
-      runner (hol_args_for_project tc project run_heap subcommand context user_args)
+      runner (hol_run_argv tc holstate subcommand context user_args)
   in
-    HolbuildToolchain.with_run_context project packages invoke
+    HolbuildToolchain.with_run_context project packages context_lines invoke
   end
 
-fun run_hol_with runner tc cli_jobs subcommand user_args =
-  if HolbuildToolchain.success (run_hol_status runner tc cli_jobs true subcommand user_args) then ()
-  else raise Error ("hol " ^ subcommand ^ " failed")
+fun run_hol_with runner tc cli_jobs subcommand args =
+  let
+    val (from, user_args) = split_run_from args
+    val run_from =
+      case from of
+          SOME theory => FromTheory theory
+        | NONE =>
+            (case script_args user_args of
+                 [] => NoFrom
+               | scripts => FromScripts scripts)
+  in
+    if HolbuildToolchain.success (run_hol_status runner tc cli_jobs true run_from subcommand user_args) then ()
+    else raise Error ("hol " ^ subcommand ^ " failed")
+  end
 
 fun run_hol tc cli_jobs subcommand user_args =
   run_hol_with HolbuildToolchain.run tc cli_jobs subcommand user_args
@@ -1862,7 +2037,7 @@ fun check_selector tc cli_jobs selector =
     fun cleanup () = OS.FileSys.remove script_path handle OS.SysErr _ => ()
     val status =
       (* A run heap may hold an older copy of the theory, which load would keep. *)
-      run_hol_status HolbuildToolchain.run tc cli_jobs false "run" [script_path]
+      run_hol_status HolbuildToolchain.run tc cli_jobs false NoFrom "run" [script_path]
       handle e => (cleanup (); raise e)
   in
     cleanup ();
