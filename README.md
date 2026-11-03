@@ -311,11 +311,19 @@ Common global options:
   holbuild and child HOL processes run uncapped. holbuild rejects `--maxheap`
   where it can detect it (Linux), so there it cannot be used to cap holbuild's
   own heap either.
+- `--gc-threads N`: number of Poly/ML garbage-collection threads for child HOL
+  processes. Defaults to 1, as Holmake uses for theory builds, rather than
+  Poly/ML's default of one per core. Do not
+  use `--gcthreads`: like `--maxheap`, holbuild's own runtime takes it, and
+  holbuild rejects it where it can detect it.
 - `--cooperate-dir DIR` (or `HOLBUILD_COOPERATE_DIR`): share a machine memory
-  budget with every holbuild process using `DIR`. See below.
+  and CPU budget with every holbuild process using `DIR`. See below.
 - `--machine-max-mem MB`: the budget to record in `DIR/budget` when that file
   does not exist yet; a value that differs from the file at this process's
   first admission is an error.
+- `--machine-max-cpus N`: the CPU budget to record in `DIR/cpus` when that
+  file does not exist yet; a value that differs from the file at this
+  process's first admission is an error.
 - `--child-charge MB`: what each child reserves against that budget. Defaults
   to `--max-heap`, but at most 3072 (3072 without `--max-heap`); where
   `MemAvailable` can't be read, to `--max-heap` + 1024, and then `--max-heap`
@@ -324,14 +332,19 @@ Common global options:
   the local cache at once, ahead of the build workers. Defaults to twice the
   build's jobs; only used with a remote cache.
 
-### Sharing a machine's memory between holbuild processes
+### Sharing a machine's memory and CPUs between holbuild processes
 
 `-j` limits children within one holbuild process. Independent processes on one
 machine (several users, CI jobs, containers with a shared bind mount) can share
-a memory budget instead: with `--cooperate-dir DIR`, every theory, generator and
-heap-export child reserves `--child-charge`, and starts only while the
-reservations of all processes using `DIR` fit the budget, and `MemAvailable`
-covers the charge plus a margin kept free. The reserve is a quarter of
+a memory and CPU budget instead: with `--cooperate-dir DIR`, every theory, generator and
+heap-export child, and the HOL process of `run` and `check`, reserves
+`--child-charge`, and starts only while the
+reservations of all processes using `DIR` fit the budget, the running
+children of all those processes, plus the new one, are no more than the CPU
+budget, and `MemAvailable` covers the charge plus a margin kept free. The CPU
+budget defaults to the machine's online processors: each child is a HOL
+process that keeps a core busy, so a machine with memory to spare still takes
+in no more of them than it has cores. The reserve is a quarter of
 `MemTotal`, at least 1 GiB and at most 30 GiB; the default budget is
 `MemTotal` less the reserve, and the margin is the reserve, or what the budget
 leaves out of `MemTotal` if that is less (at least 1 GiB), so a budget set
@@ -346,14 +359,14 @@ never waits on memory none of its children use. Where `/proc/meminfo` has no
 charge is `--max-heap` + 1 GiB, what a child can reach. `/proc/meminfo` shows
 the whole machine, not a container's memory limit, so inside a
 memory-limited container set `--child-charge` to what a child can reach. A child
-that waits shows as `(waiting for memory)` in the status line, as a
-`waiting for machine memory` line otherwise, and as a `waiting_for_memory`
+that waits, for memory or a CPU, shows as `(waiting for memory)` in the status
+line, as a `waiting for machine memory` line otherwise, and as a `waiting_for_memory`
 event with `--json`. A charge larger than the whole budget fails at once.
 
 This bounds admission; it does not enforce RSS: children already running can
 still grow together, up to their `--max-heap`, past what the machine has left,
 since nothing re-checks a child once it has started. It covers neither HOL
-toolchain builds nor `check`, `run` or `repl`.
+toolchain builds nor `repl`, which keeps the terminal.
 
 - The budget is the byte count in `DIR/budget`, which `--machine-max-mem`
   creates on first use. Without that file, it is the default, recomputed from
@@ -364,6 +377,10 @@ toolchain builds nor `check`, `run` or `repl`.
   return to the default, remove it: `flock DIR/lock rm DIR/budget`. A
   `DIR/budget` that an older holbuild wrote with its default counts as set
   this way, since nothing tells the two apart.
+- The CPU budget is the processor count in `DIR/cpus`, which
+  `--machine-max-cpus` creates on first use, and is set, resized and removed
+  the same way as `DIR/budget`. Without that file, it is the machine's online
+  processors, read at each admission.
 - Each running child has a file `DIR/lease-*` holding its byte charge,
   `flock`ed by holbuild and inherited by the child, so a killed holbuild's
   reservation ends with its children, with no timeout. A lease nobody holds no
