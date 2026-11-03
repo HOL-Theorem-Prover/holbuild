@@ -325,6 +325,24 @@ require_grep "FALLBACK_RUN_OK" "$base_log"
 require_grep "LOADED_STATE .*/bin/hol.state$" "$base_log"
 require_no_grep "LOADED_STATE $run_heap" "$base_log"
 
+# A source the analysis rejects makes inference fall back instead of failing
+# the run.
+cat > "$project/src/BrokenScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = load "NoSuchModuleAnywhere";
+val _ = new_theory "Broken";
+val _ = export_theory();
+SML
+broken_script=$tmpdir/broken.sml
+cat > "$broken_script" <<'SML'
+val _ = (load "BrokenTheory"; print "BROKEN_LOADED\n") handle _ => print "BROKEN_LOAD_FAILED_OK\n";
+SML
+broken_log=$tmpdir/broken.log
+run_from "$broken_log" "$broken_script"
+require_grep "holbuild: could not infer --from from the scripts' dependencies: .*; starting from the HOL base state$" "$broken_log"
+require_grep "BROKEN_LOAD_FAILED_OK" "$broken_log"
+rm "$project/src/BrokenScript.sml"
+
 expect_run_failure() {
   local name=$1
   local message=$2

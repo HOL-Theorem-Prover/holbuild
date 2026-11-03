@@ -1815,7 +1815,8 @@ fun infer_from_theory tc project scripts =
         val theories =
           List.filter (fn node => theory_node node andalso HolbuildBuildPlan.package node = root)
             (HolbuildBuildPlan.selected_nodes plan)
-        fun ancestors node = length (HolbuildBuildPlan.transitive_project_deps plan node)
+        fun ancestors node =
+          length (List.filter theory_node (HolbuildBuildPlan.transitive_project_deps plan node))
         fun deeper (node, NONE) = SOME node
           | deeper (node, SOME best) = SOME (if ancestors node > ancestors best then node else best)
       in
@@ -1852,9 +1853,24 @@ fun run_start tc project run_heap from : run_start =
         NoFrom => fallback_start
       | FromTheory theory => start ("--from " ^ theory) theory
       | FromScripts scripts =>
-          case infer_from_theory tc project scripts of
-              NONE => fallback_start
-            | SOME theory => start ("--from " ^ theory ^ " (inferred from the scripts' dependencies)") theory
+          let
+            (* Nobody asked for a theory, so a script or project the analysis
+               cannot handle starts HOL as it would without inference. *)
+            fun cannot_infer msg =
+              (HolbuildStatus.message_stderr
+                 ("holbuild: could not infer --from from the scripts' dependencies: " ^ msg ^
+                  "; starting from " ^ fallback_name ^ "\n");
+               NONE)
+            val inferred =
+              infer_from_theory tc project scripts
+              handle HolbuildDependencies.Error msg => cannot_infer msg
+                   | HolbuildSourceIndex.Error msg => cannot_infer msg
+                   | HolbuildBuildPlan.Error msg => cannot_infer msg
+          in
+            case inferred of
+                NONE => fallback_start
+              | SOME theory => start ("--from " ^ theory ^ " (inferred from the scripts' dependencies)") theory
+          end
   end
 
 fun hol_run_argv tc holstate subcommand context user_args =
