@@ -72,6 +72,12 @@ def server() -> Iterator[Server]:
 
         def do_POST(self) -> None:
             body = self.body()
+            if self.path.startswith("/moved/"):
+                self.send_response(303)
+                self.send_header("Location", self.path.removeprefix("/moved"))
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if self.path.endswith("/complete"):
                 state.completed.append(body)
             self.reply(200, json.dumps({"accepted": True}) if self.path.endswith("/complete") else '{"lease_s": 3}')
@@ -207,3 +213,8 @@ def test_also_claim_accepts_repeats_and_commas(tmp_path: Path, server: Server) -
     args = worker_args(tmp_path, server, "--tier", "high", "--also-claim", "standard,high", "--also-claim", "standard")
 
     assert args.also_claim == ["standard", "high", "standard"]
+
+
+def test_coordinator_redirects_are_not_followed(server: Server) -> None:
+    with pytest.raises(RuntimeError, match="claim answered 303"):
+        Coordinator(server.url + "/moved", "w").claim(["standard"], "w")

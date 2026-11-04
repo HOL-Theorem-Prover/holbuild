@@ -20,7 +20,7 @@ RUN git clone -b "$POLYML_TAG" --depth 1 "$POLYML_REPO" /src/polyml \
 FROM ${PYTHON_IMAGE}
 # A C toolchain and GMP for polyc, which builds holbuild and HOL; git, curl and zstd for holbuild itself.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends build-essential ca-certificates curl git libgmp-dev zstd \
+ && apt-get install -y --no-install-recommends build-essential ca-certificates curl git libgmp-dev tini zstd \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=polyml /opt/polyml /opt/polyml
 COPY --from=ghcr.io/astral-sh/uv:0.13.4 /uv /usr/local/bin/uv
@@ -33,4 +33,5 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-default-groups
 COPY alembic.ini entrypoint.sh ./
 COPY remote_exec remote_exec/
-ENTRYPOINT ["/opt/remote-exec/entrypoint.sh"]
+# tini reaps the processes holbuild orphans, which the worker as PID 1 would leave as zombies.
+ENTRYPOINT ["/usr/bin/tini", "--", "/opt/remote-exec/entrypoint.sh"]

@@ -67,6 +67,14 @@ jobs:
           done
           docker logs coordinator
           exit 1
+      - name: Check that orphaned processes are reaped
+        run: |
+          docker run --rm holbuild-remote-exec python3 -c '
+          import pathlib, subprocess, time
+          subprocess.run(["sh", "-c", "sleep 1 &"])
+          time.sleep(3)
+          zombies = [p for p in pathlib.Path("/proc").glob("[0-9]*/status") if "\nState:\tZ" in p.read_text()]
+          assert not zombies, zombies'
       - name: Build a holbuild release the way a worker does
         run: |
           docker run --rm -v releases:/opt/holbuild-releases holbuild-remote-exec python3 -c \

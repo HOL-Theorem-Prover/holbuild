@@ -46,8 +46,17 @@ class Unreleased(Exception):
     """The action was exported by a holbuild version that has no release to build."""
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuses redirects, which would send the worker token to wherever they point."""
+
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
 class Coordinator:
     """The worker endpoints of the coordinator."""
+
+    opener = urllib.request.build_opener(NoRedirect)
 
     def __init__(self, url: str, token: str) -> None:
         self.url = url.rstrip("/")
@@ -61,7 +70,7 @@ class Coordinator:
             headers={"Authorization": f"Bearer {self.token}", "Content-Type": content_type},
         )
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with self.opener.open(request, timeout=30) as response:
                 payload = response.read()
                 return response.status, json.loads(payload) if payload else None
         except urllib.error.HTTPError as error:
