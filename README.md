@@ -1141,6 +1141,9 @@ and exits; if the batch can't be submitted, it fails rather than building
 locally. `--attach <id>` follows that batch and then builds as above. A build
 that loses the event stream says how to reattach.
 
+[`remote-exec/`](remote-exec/README.md) has a coordinator and a worker loop
+that speak this protocol, and a container image with both.
+
 The coordinator's protocol, in what holbuild uses of it:
 
 - `POST /v1/batches` with the batch text as the body answers 201 and
