@@ -1,4 +1,5 @@
 import logging
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from conftest import CLIENT_TOKEN, WORKER_TOKEN
 from remote_exec import app as app_module
-from remote_exec.coordinator import Coordinator, HighWaterMark, QueueCounts, burst_demand, is_auth_failure
+from remote_exec.coordinator import Coordinator, QueueCounts, burst_demand, is_auth_failure
 from test_coordinator import claim, input_key, submit
 
 CLIENT = {"Authorization": f"Bearer {CLIENT_TOKEN}"}
@@ -37,19 +38,6 @@ def test_burst_demand(queue: QueueCounts, expected: int) -> None:
     assert burst_demand(queue, warm_workers=2, max_burst_workers=16) == expected
 
 
-def test_high_water_mark_rises_at_once_and_falls_only_after_the_hold() -> None:
-    mark = HighWaterMark(hold_s=900)
-
-    assert mark.update(0, 2) == 2
-    assert mark.update(10, 8) == 8
-    assert mark.update(20, 1) == 8  # a narrow point in the build
-    assert mark.update(500, 3) == 8
-    assert mark.update(909, 0) == 8
-    assert mark.update(911, 0) == 3  # 8 is older than the hold; 3 is not
-    assert mark.update(1401, 0) == 0
-    assert mark.update(1402, 5) == 5
-
-
 def scaled_coordinator(coordinator: Coordinator, tmp_path: Path, script: str) -> tuple[Coordinator, Path]:
     """A coordinator with 1 warm worker, at most 4 burst ones, a 100 s hold, and a scale command running
     ``script`` with the count appended to ``tmp_path/scaled``."""
@@ -64,30 +52,41 @@ def scaled_coordinator(coordinator: Coordinator, tmp_path: Path, script: str) ->
     return scaled, calls
 
 
-async def test_sweep_runs_the_scale_command_when_the_held_target_changes(
+async def test_sweep_runs_the_scale_command_when_the_held_target_changes_and_keeps_it_across_restarts(
     http: httpx.AsyncClient, coordinator: Coordinator, tmp_path: Path
 ) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    now = start
+
+    def at(seconds: float) -> None:
+        nonlocal now
+        now = start + timedelta(seconds=seconds)
+
     scaled, calls = scaled_coordinator(coordinator, tmp_path, "")
-    now = 0.0
     scaled.clock = lambda: now
 
     await scaled.sweep()  # once at start, so a restarted coordinator corrects the fleet
     await submit(http, ["a", "b", "c"])
     await scaled.sweep()
     assert await claim(http) is not None
-    now = 50.0
+    at(50)
     await scaled.sweep()  # same demand: running counts as much as ready
     for _ in range(2):
         assert await claim(http) is not None
     async with scaled.engine.begin() as connection:
         await connection.execute(sa.text("UPDATE actions SET state = 'cancelled'"))
-    now = 60.0
+    at(60)
     await scaled.sweep()  # the queue is empty but the hold keeps the workers
     assert calls.read_text().split() == ["0", "2"]
-    now = 151.0
-    await scaled.sweep()
 
-    assert calls.read_text().split() == ["0", "2", "0"]
+    restarted, _ = scaled_coordinator(coordinator, tmp_path, "")
+    restarted.clock = lambda: now
+    at(70)
+    await restarted.sweep()  # still inside the hold of the demand the first process recorded
+    at(151)
+    await restarted.sweep()
+
+    assert calls.read_text().split() == ["0", "2", "2", "0"]
 
 
 async def test_queue_reports_counts_and_the_desired_burst_workers(
@@ -106,9 +105,8 @@ async def test_queue_reports_counts_and_the_desired_burst_workers(
         "ready_high": 0,
         "running_standard": 1,
         "running_high": 0,
-        "desired_burst_workers": 0,  # the fixture's own coordinator serves the route and hasn't swept
+        "desired_burst_workers": 1,  # what the other coordinator's sweep recorded
     }
-    assert (await scaled.queue()).desired_burst_workers == 1
     assert (await http.get("/v1/queue", headers=WORKER)).status_code == 401
 
 
@@ -166,6 +164,23 @@ async def test_database_refusing_the_credentials_is_recognized(remote_exec_engin
         async with remote_exec_engine.connect() as connection:
             await connection.execute(sa.text("SELECT * FROM no_such_table"))
     assert not is_auth_failure(other.value)
+
+
+async def test_request_meeting_a_refused_login_exits_the_process(
+    coordinator: Coordinator, remote_exec_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exits: list[int] = []
+    monkeypatch.setattr(app_module.os, "_exit", exits.append)
+    refused = create_async_engine(remote_exec_engine.url.set(username="no_such_role", password="x"))
+    app = app_module.create_app(Coordinator(refused, coordinator.cache, coordinator.settings), coordinator.settings)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://coordinator.test") as client:
+            response = await client.get("/v1/queue", headers=CLIENT)
+    finally:
+        await refused.dispose()
+
+    assert (response.status_code, exits) == (500, [1])
 
 
 def test_auth_failure_exits_the_process(monkeypatch: pytest.MonkeyPatch) -> None:

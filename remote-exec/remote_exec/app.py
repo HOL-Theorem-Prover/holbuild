@@ -15,7 +15,6 @@ from uuid import UUID
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, SecretStr
-from sqlalchemy.exc import DBAPIError
 
 from remote_exec.coordinator import ActionStatus, Coordinator, ResultMismatch, Settings, is_auth_failure
 from remote_exec.formats import FormatError, parse_batch, parse_result
@@ -83,11 +82,11 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
     client = [Depends(bearer(settings.client_token))]
     worker = [Depends(bearer(settings.worker_token))]
 
-    @app.exception_handler(DBAPIError)
-    async def database_error(_: Request, error: DBAPIError) -> JSONResponse:
+    # A refused login reaches requests as asyncpg's own error when a new connection opens, so check every error.
+    @app.exception_handler(Exception)
+    async def unhandled(_: Request, error: Exception) -> JSONResponse:
         exit_on_auth_failure(error)
-        logger.error("database error: %s", error)
-        return JSONResponse({"detail": "database error"}, status_code=500)
+        return JSONResponse({"detail": "internal error"}, status_code=500)
 
     @app.post("/v1/batches", status_code=201, dependencies=client)
     async def submit(request: Request, profile: str = "default") -> dict[str, UUID]:

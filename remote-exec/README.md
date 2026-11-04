@@ -15,13 +15,12 @@ a container image with both.
 ## Overview
 
 - **Coordinator** (`remote_exec/app.py`, `remote_exec/coordinator.py`): a
-  FastAPI service over Postgres. All scheduling state is in the database, so
-  replicas can run behind a load balancer; only the burst worker count
-  (see Scaling) is kept per process.
-- **Postgres**: batches, their dependency edges, leases, failures and
-  peak-memory hints. It never holds a pointer to a result. An action is done
-  when its key is in the cache's `/ac/`, so losing the database loses batch
-  status and costs rebuilds, never a wrong build.
+  stateless FastAPI service over Postgres. Any number of replicas can run
+  behind a load balancer; all shared state is in the database.
+- **Postgres**: batches, their dependency edges, leases, failures, peak-memory
+  hints and recent worker demand. It never holds a pointer to a result. An
+  action is done when its key is in the cache's `/ac/`, so losing the database
+  loses batch status and costs rebuilds, never a wrong build.
 - **Worker loop** (`remote_exec/worker.py`): claims an action, runs `holbuild
   exec-action` on it with the holbuild release that exported it, heartbeats
   while it runs, and reports the result record.
@@ -172,7 +171,8 @@ waits on run alone, then many become ready together. Following the queue
 exactly would stop burst workers at every narrow point and start them again
 seconds later. So the target is the highest demand of the last
 `REMOTE_EXEC_SCALE_DOWN_HOLD_S` seconds: it rises at once and falls only after
-demand has stayed lower for that long.
+demand has stayed lower for that long. Each sweep records its demand in the
+database, so a restarted coordinator keeps holding the target.
 
 `GET /v1/queue` reports the counts and the target. With `REMOTE_EXEC_SCALE_CMD`
 set, the coordinator also runs `<command> <target>` after a start and whenever
@@ -274,8 +274,7 @@ gets 401. Errors are JSON `{"detail": "<message>"}`.
 `GET /v1/queue`
 
 - 200 `{"waiting": 0, "ready_standard": 0, "ready_high": 0, "running_standard": 0, "running_high": 0, "desired_burst_workers": 0}`:
-  the unfinished actions of running batches, and the burst worker target of
-  this replica's last sweep
+  the unfinished actions of running batches, and the burst worker target
 
 ### Worker
 

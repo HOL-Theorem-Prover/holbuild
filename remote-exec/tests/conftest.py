@@ -71,7 +71,7 @@ async def cache() -> FakeCache:
 @pytest_asyncio.fixture
 async def coordinator(remote_exec_engine: AsyncEngine, cache: FakeCache) -> AsyncIterator[Coordinator]:
     async with remote_exec_engine.begin() as connection:
-        await connection.execute(sa.text("TRUNCATE batches, actions, edges, leases, peak_hints"))
+        await connection.execute(sa.text("TRUNCATE batches, actions, edges, leases, peak_hints, burst_demand"))
     settings = Settings(
         database_url="unused",
         client_token=SecretStr(CLIENT_TOKEN),

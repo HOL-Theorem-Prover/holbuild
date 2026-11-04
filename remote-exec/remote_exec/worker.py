@@ -11,6 +11,7 @@ Each action runs on the holbuild release that exported it, which the worker buil
 import argparse
 import contextlib
 import fcntl
+import http.client
 import json
 import os
 import re
@@ -35,6 +36,10 @@ RELEASE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 COMPLETE = ".complete"  # stamp file of a finished release build
 # ECS task scale-in protection lasts this long unless a heartbeat renews it, so a dead worker loses it.
 PROTECTION_MINUTES = 10
+
+
+# What a request to the coordinator raises when it or the network fails; ValueError covers a reply that isn't JSON.
+COORDINATOR_ERRORS = (OSError, RuntimeError, http.client.HTTPException, ValueError)
 
 
 class Unreleased(Exception):
@@ -129,7 +134,14 @@ class Releases:
         if self.curl_config is not None:
             command += ["-K", self.curl_config]
         command.append(f"{self.remote_cache.rstrip('/')}/cas/{spec_sha256}")
-        spec = subprocess.run(command, check=True, capture_output=True, text=True, timeout=120).stdout
+        # Not check=True: its error would print the command line, and the cache URL may carry credentials.
+        try:
+            fetched = subprocess.run(command, capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"fetching spec {spec_sha256} from the remote cache timed out") from None
+        if fetched.returncode != 0:
+            raise RuntimeError(f"fetching spec {spec_sha256} from the remote cache failed: {fetched.stderr.strip()}")
+        spec = fetched.stdout
         versions = [
             line.removeprefix("holbuild-version=") for line in spec.splitlines() if line.startswith("holbuild-version=")
         ]
@@ -226,7 +238,7 @@ class Lease:
         while not self.done.wait(self.interval):
             try:
                 alive = self.coordinator.heartbeat(self.token)
-            except (OSError, RuntimeError) as error:
+            except COORDINATOR_ERRORS as error:
                 print(f"heartbeat failed, carrying on: {error}", file=sys.stderr)
                 continue
             if not alive:
@@ -345,7 +357,7 @@ def main() -> None:
     while True:
         try:
             claim = coordinator.claim(tiers, args.name)
-        except (OSError, RuntimeError) as error:
+        except COORDINATOR_ERRORS as error:
             print(f"claim failed: {error}", file=sys.stderr)
             claim = None
         if claim is None:
@@ -353,7 +365,7 @@ def main() -> None:
             continue
         try:
             run_one(coordinator, args, releases, protection, claim)
-        except (OSError, RuntimeError, subprocess.SubprocessError, tarfile.TarError) as error:
+        except (*COORDINATOR_ERRORS, subprocess.SubprocessError, tarfile.TarError) as error:
             # The lease expires and the coordinator retries; a rerun finds a published result cached.
             print(f"action failed in the worker: {error}", file=sys.stderr)
 

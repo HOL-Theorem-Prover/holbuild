@@ -30,7 +30,7 @@ ENV PATH=/opt/remote-exec/.venv/bin:/opt/polyml/bin:$PATH \
 
 WORKDIR /opt/remote-exec
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-default-groups
 COPY alembic.ini entrypoint.sh ./
 COPY remote_exec remote_exec/
 ENTRYPOINT ["/opt/remote-exec/entrypoint.sh"]

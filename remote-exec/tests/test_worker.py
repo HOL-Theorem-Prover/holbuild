@@ -19,6 +19,7 @@ RECORD = f"holbuild-action-result-v1\nspec={SPEC}\ninput-key={'6' * 64}\nstatus=
 # to its --result file.
 FAKE_HOLBUILD = f"""#!/bin/sh
 echo "$@" >> "$FAKE_HOLBUILD_LOG"
+sleep 2  # long enough for a heartbeat at the 1 s interval of a 3 s lease
 while [ "$#" -gt 0 ]; do
   if [ "$1" = --result ]; then printf '{RECORD}' > "$2"; fi
   shift
@@ -173,8 +174,9 @@ def test_worker_runs_the_action_on_the_release_that_exported_it(
         logs[1].read_text().split()[7],
         "--share-heaps",
     ]
-    *held, released = (tmp_path / "protection").read_text().split()  # "on" again on each heartbeat
+    *held, released = (tmp_path / "protection").read_text().split()
     assert (set(held), released) == ({"on"}, "off")
+    assert len(held) >= 2  # renewed on a heartbeat
 
 
 def test_action_of_an_unreleased_holbuild_is_rejected(tmp_path: Path, server: Server, logs: tuple[Path, Path]) -> None:

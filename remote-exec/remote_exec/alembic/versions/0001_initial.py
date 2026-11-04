@@ -74,6 +74,9 @@ STATEMENTS = [
         PRIMARY KEY (package, theory, profile)
     )
     """,
+    # One row per sweep: the burst workers the queue needed then. The target is the maximum over the hold.
+    "CREATE TABLE burst_demand (at timestamptz NOT NULL, workers integer NOT NULL)",
+    "CREATE INDEX burst_demand_at ON burst_demand (at)",
 ]
 
 
@@ -84,4 +87,4 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.execute("DROP TABLE peak_hints, leases, edges, actions, batches")
+    op.execute("DROP TABLE burst_demand, peak_hints, leases, edges, actions, batches")

@@ -7,10 +7,10 @@ is a batch row first, then its actions and leases, so a completion, an expiry an
 import asyncio
 import logging
 import shlex
-import time
-from collections import defaultdict, deque
+from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -114,23 +114,6 @@ def burst_demand(counts: QueueCounts, warm_workers: int, max_burst_workers: int)
     return min(demand, max_burst_workers)
 
 
-class HighWaterMark:
-    """The largest value of the last ``hold_s`` seconds, so a dip in demand scales in only once it has lasted."""
-
-    def __init__(self, hold_s: float) -> None:
-        self.hold_s = hold_s
-        # (time, value), values strictly decreasing: the first is the maximum of the window.
-        self.samples: deque[tuple[float, int]] = deque()
-
-    def update(self, now: float, value: int) -> int:
-        while self.samples and self.samples[-1][1] <= value:
-            self.samples.pop()
-        self.samples.append((now, value))
-        while self.samples[0][0] < now - self.hold_s:
-            self.samples.popleft()
-        return self.samples[0][1]
-
-
 def is_auth_failure(error: BaseException) -> bool:
     """Whether ``error``, or an error it wraps, is the database refusing the coordinator's credentials."""
     seen: BaseException | None = error
@@ -169,9 +152,7 @@ class Coordinator:
         self.engine = engine
         self.cache = cache
         self.settings = settings
-        self.clock: Callable[[], float] = time.monotonic
-        self.burst = HighWaterMark(settings.scale_down_hold_s)
-        self.desired_burst_workers = 0
+        self.clock: Callable[[], datetime] = lambda: datetime.now(UTC)
         self.scaled_to: int | None = None  # what the scale command last accepted
 
     @classmethod
@@ -511,7 +492,16 @@ class Coordinator:
             )
 
     async def queue(self) -> QueueStatus:
+        """The unfinished actions and the burst worker target: the highest demand of the last
+        ``scale_down_hold_s`` seconds, which the sweeps of every replica record."""
         async with self.engine.connect() as conn:
+            desired = await conn.scalar(
+                sa.text(
+                    "SELECT coalesce(max(workers), 0) FROM burst_demand "
+                    "WHERE at >= CAST(:now AS timestamptz) - make_interval(secs => :hold)"
+                ),
+                {"now": self.clock(), "hold": self.settings.scale_down_hold_s},
+            )
             rows = await conn.execute(
                 sa.text(
                     "SELECT state, tier, count(*) FROM actions "
@@ -526,28 +516,39 @@ class Coordinator:
             running_standard=count.get(("running", "standard"), 0),
             running_high=count.get(("running", "high"), 0),
         )
-        return QueueStatus(counts, self.desired_burst_workers)
+        return QueueStatus(counts, desired)
 
     async def sweep(self) -> None:
         """The periodic pass: expired leases, releases a failed HEAD left waiting, retention, then the burst
-        worker count, which the scale command gets whenever it changes.
+        worker target, which the scale command gets whenever it changes.
 
-        A failing scale command is logged and retried on the next sweep; it never stops the sweep.
+        The demand samples behind the target are in the database, so a restarted coordinator keeps holding it. A
+        failing scale command is logged and retried on the next sweep; it never stops the sweep.
         """
         await self.expire_leases()
         await self.release()
         await self.delete_expired()
         counts = (await self.queue()).counts
         demand = burst_demand(counts, self.settings.warm_workers, self.settings.max_burst_workers)
-        self.desired_burst_workers = self.burst.update(self.clock(), demand)
-        if self.settings.scale_cmd is None or self.desired_burst_workers == self.scaled_to:
+        now = self.clock()
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                sa.text("DELETE FROM burst_demand WHERE at < CAST(:now AS timestamptz) - make_interval(secs => :hold)"),
+                {"now": now, "hold": self.settings.scale_down_hold_s},
+            )
+            await conn.execute(
+                sa.text("INSERT INTO burst_demand (at, workers) VALUES (:now, :workers)"),
+                {"now": now, "workers": demand},
+            )
+        desired = (await self.queue()).desired_burst_workers
+        if self.settings.scale_cmd is None or desired == self.scaled_to:
             return
         try:
-            await self._scale(self.settings.scale_cmd, self.desired_burst_workers)
+            await self._scale(self.settings.scale_cmd, desired)
         except (OSError, ScaleCommandError) as error:
-            logger.warning("scaling to %d burst workers failed: %s", self.desired_burst_workers, error)
+            logger.warning("scaling to %d burst workers failed: %s", desired, error)
             return
-        self.scaled_to = self.desired_burst_workers
+        self.scaled_to = desired
 
     async def _scale(self, scale_cmd: str, workers: int) -> None:
         process = await asyncio.create_subprocess_exec(*shlex.split(scale_cmd), str(workers))
