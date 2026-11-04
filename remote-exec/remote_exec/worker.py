@@ -114,7 +114,7 @@ class Protection:
                 )
                 with urllib.request.urlopen(request, timeout=30):
                     pass
-        except (OSError, subprocess.SubprocessError) as error:
+        except Exception as error:  # noqa: BLE001  # protection is best effort and must never stop an action
             print(f"setting scale-in protection to {enabled} failed: {error}", file=sys.stderr)
 
 
@@ -130,7 +130,8 @@ class Releases:
 
     def spec_version(self, spec_sha256: str) -> str:
         """The ``holbuild-version`` of the action spec stored in the remote cache's ``/cas/``."""
-        command = ["curl", "-fsSL", "--retry", "3"]
+        # -g: no URL globbing, whose errors print the URL with any credentials in it.
+        command = ["curl", "-fsSLg", "--retry", "3"]
         if self.curl_config is not None:
             command += ["-K", self.curl_config]
         command.append(f"{self.remote_cache.rstrip('/')}/cas/{spec_sha256}")

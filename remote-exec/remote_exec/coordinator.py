@@ -501,7 +501,7 @@ class Coordinator:
 
     async def queue(self) -> QueueStatus:
         """The unfinished actions and the burst worker target: the highest demand of the last
-        ``scale_down_hold_s`` seconds, which the sweeps of every replica record."""
+        ``scale_down_hold_s`` seconds, which the sweeps of every replica record, and of now."""
         async with self.engine.connect() as conn:
             desired = await conn.scalar(HELD_TARGET, self._held_target_params(self.clock()))
             rows = await conn.execute(
@@ -518,7 +518,8 @@ class Coordinator:
             running_standard=count.get(("running", "standard"), 0),
             running_high=count.get(("running", "high"), 0),
         )
-        return QueueStatus(counts, desired)
+        demand = burst_demand(counts, self.settings.warm_workers, self.settings.max_burst_workers)
+        return QueueStatus(counts, max(desired, demand))
 
     async def sweep(self) -> None:
         """The periodic pass: expired leases, releases a failed HEAD left waiting, retention, then the burst

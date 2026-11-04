@@ -221,6 +221,7 @@ async def test_zero_hold_follows_demand_and_the_cap_applies_to_held_demand(
     await capped.sweep()
 
     assert calls.read_text().split() == ["3", "1"]
+    assert (await unheld.queue()).desired_burst_workers == 3
 
 
 def test_settings_errors_do_not_print_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
