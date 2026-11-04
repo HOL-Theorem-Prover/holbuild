@@ -220,3 +220,19 @@ rm -rf "$slow/.holbuild"
 run_check SlowTheory 0
 require_grep "SlowTheory restored from cache" "$log"
 require_grep "^SlowTheory: clean (1 theorem)$" "$log"
+
+# [run].loads build plain too: the load is the checked theory, edited and
+# built by build --skip-proof-steps --skip-checkpoints.
+cat >> "$slow/holproject.toml" <<'TOML'
+
+[run]
+loads = ["SlowTheory"]
+TOML
+printf '(* edited again *)\n' >> "$slow/src/SlowScript.sml"
+(cd "$slow" && "$HOLBUILD_BIN" build --skip-proof-steps --skip-checkpoints SlowTheory) > "$tmpdir/slow-plain-build2.log" 2>&1
+run_check SlowTheory 0
+require_grep "^SlowTheory: clean (1 theorem)$" "$log"
+if find "$slow/.holbuild" -name '*.save' -print -quit | grep -q .; then
+  echo "check left checkpoints behind building [run].loads" >&2
+  exit 1
+fi

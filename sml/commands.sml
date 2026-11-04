@@ -418,10 +418,9 @@ fun default_build_request targets =
     allow_cache_timeout_discrepancy = false},
    targets)
 
-(* check builds its target plain, as heaps do: step timeouts are build's
-   check, and a timeout-free request without checkpoints reuses any built or
-   cached theory, including ones from build --skip-proof-steps
-   --skip-checkpoints, and leaves no checkpoints behind. *)
+(* check builds plain: step timeouts are build's check, and a timeout-free
+   request reuses any built or cached theory, including ones from build
+   --skip-proof-steps --skip-checkpoints. It saves no checkpoints. *)
 fun plain_build_request targets =
   ({dry_run = false, watch = false, force = HolbuildBuildExec.ForceNone,
     use_cache = true, verify_cache = true, no_stat_cache = false,
@@ -1918,14 +1917,14 @@ fun hol_run_argv tc holstate subcommand context user_args =
   HolbuildToolchain.hol_subcommand_argv tc subcommand @ ["--holstate", holstate, context] @ user_args
 
 (* With run_heap false, HOL starts from the toolchain's base state even when
-   [run].heap is configured. *)
-fun run_hol_status runner tc cli_jobs run_heap from subcommand user_args =
+   [run].heap is configured. build_request builds the [run].loads targets. *)
+fun run_hol_status runner tc cli_jobs build_request run_heap from subcommand user_args =
   let
     val configured_project = timed_phase "project.discover" load_project
     val run_loads = #run_loads configured_project
     val _ =
       if null run_loads then ()
-      else build_once tc cli_jobs (default_build_request run_loads)
+      else build_once tc cli_jobs (build_request run_loads)
     val project =
       if null run_loads then configured_project
       else timed_phase "run.project.rediscover" load_project
@@ -1948,7 +1947,7 @@ fun run_hol_with runner tc cli_jobs subcommand args =
                  [] => NoFrom
                | scripts => FromScripts scripts)
   in
-    if HolbuildToolchain.success (run_hol_status runner tc cli_jobs true run_from subcommand user_args) then ()
+    if HolbuildToolchain.success (run_hol_status runner tc cli_jobs default_build_request true run_from subcommand user_args) then ()
     else raise Error ("hol " ^ subcommand ^ " failed")
   end
 
@@ -2055,7 +2054,7 @@ fun check_selector tc cli_jobs selector =
     fun cleanup () = OS.FileSys.remove script_path handle OS.SysErr _ => ()
     val status =
       (* A run heap may hold an older copy of the theory, which load would keep. *)
-      run_hol_status HolbuildToolchain.run tc cli_jobs false NoFrom "run" [script_path]
+      run_hol_status HolbuildToolchain.run tc cli_jobs plain_build_request false NoFrom "run" [script_path]
       handle e => (cleanup (); raise e)
   in
     cleanup ();
