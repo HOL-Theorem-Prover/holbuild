@@ -1,0 +1,93 @@
+import asyncio
+import os
+from collections.abc import AsyncIterator
+from pathlib import Path
+
+import httpx
+import pytest_asyncio
+import sqlalchemy as sa
+from alembic.config import Config as AlembicConfig
+from pydantic import SecretStr
+from sqlalchemy.engine import URL, make_url
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+
+from alembic import command
+from remote_exec.app import create_app
+from remote_exec.coordinator import Coordinator, Settings
+
+REMOTE_EXEC_DIR = Path(__file__).resolve().parents[1]
+CLIENT_TOKEN = "client-secret"
+WORKER_TOKEN = "worker-secret"
+
+
+class FakeCache:
+    """bazel-remote's ``HEAD /ac/<key>``: 200 for ``keys``, 503 for ``broken``, 404 otherwise."""
+
+    def __init__(self) -> None:
+        self.keys: set[str] = set()
+        self.broken: set[str] = set()
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        assert request.method == "HEAD"
+        key = request.url.path.removeprefix("/ac/")
+        if key in self.broken:
+            return httpx.Response(503)
+        return httpx.Response(200 if key in self.keys else 404)
+
+
+def upgrade(url: URL) -> None:
+    config = AlembicConfig(str(REMOTE_EXEC_DIR / "alembic.ini"))
+    config.set_main_option("sqlalchemy.url", url.render_as_string(hide_password=False))
+    command.upgrade(config, "head")
+
+
+@pytest_asyncio.fixture(scope="session")
+async def remote_exec_engine() -> AsyncIterator[AsyncEngine]:
+    # A Postgres role that may create databases, e.g. postgresql+asyncpg://postgres:postgres@localhost/postgres.
+    admin_url = make_url(os.environ["REMOTE_EXEC_TEST_DATABASE_URL"])
+    database = f"remote_exec_test_{os.environ.get('PYTEST_XDIST_WORKER', 'main')}"
+    test_url = admin_url.set(database=database)
+    admin = create_async_engine(admin_url, isolation_level="AUTOCOMMIT")
+    async with admin.connect() as connection:
+        await connection.execute(sa.text(f'drop database if exists "{database}" with (force)'))
+        await connection.execute(sa.text(f'create database "{database}"'))
+    # alembic's env drives migrations through asyncio.run, so it runs on a thread without a loop.
+    await asyncio.to_thread(upgrade, test_url)
+    engine = create_async_engine(test_url)
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
+        async with admin.connect() as connection:
+            await connection.execute(sa.text(f'drop database if exists "{database}" with (force)'))
+        await admin.dispose()
+
+
+@pytest_asyncio.fixture
+async def cache() -> FakeCache:
+    return FakeCache()
+
+
+@pytest_asyncio.fixture
+async def coordinator(remote_exec_engine: AsyncEngine, cache: FakeCache) -> AsyncIterator[Coordinator]:
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(sa.text("TRUNCATE batches, actions, edges, leases, peak_hints, burst_demand"))
+    settings = Settings(
+        database_url="unused",
+        client_token=SecretStr(CLIENT_TOKEN),
+        worker_token=SecretStr(WORKER_TOKEN),
+        cache_url="http://cache.test",
+        lease_seconds=60,
+        max_attempts=3,
+        standard_tier_mb=1000,
+        events_poll_seconds=0.01,
+    )
+    async with httpx.AsyncClient(base_url=settings.cache_url, transport=httpx.MockTransport(cache.handle)) as client:
+        yield Coordinator(remote_exec_engine, client, settings)
+
+
+@pytest_asyncio.fixture
+async def http(coordinator: Coordinator) -> AsyncIterator[httpx.AsyncClient]:
+    app = create_app(coordinator, coordinator.settings)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://coordinator.test") as client:
+        yield client
