@@ -31,7 +31,8 @@ SCALE_CMD_TIMEOUT_S = 60
 class Settings(BaseSettings):
     """The coordinator's configuration, from ``REMOTE_EXEC_*`` environment variables."""
 
-    model_config = SettingsConfigDict(env_prefix="REMOTE_EXEC_")
+    # hide_input_in_errors: a validation error would otherwise print every setting, credentials included.
+    model_config = SettingsConfigDict(env_prefix="REMOTE_EXEC_", hide_input_in_errors=True)
 
     database_url: str  # postgresql+asyncpg://...
     client_token: SecretStr
@@ -145,6 +146,13 @@ REFRESH_CHILDREN = sa.text(
 )
 
 
+# The burst worker target at :now: the highest demand recorded in the hold before it, under the current cap.
+HELD_TARGET = sa.text(
+    "SELECT least(coalesce(max(workers), 0), :cap) FROM burst_demand "
+    "WHERE at >= CAST(:now AS timestamptz) - make_interval(secs => :hold)"
+)
+
+
 class Coordinator:
     """Owns the database engine and the cache client; every rule of the coordinator lives here."""
 
@@ -159,7 +167,7 @@ class Coordinator:
     def from_settings(cls, settings: Settings) -> "Coordinator":
         return cls(
             create_async_engine(settings.database_url, pool_pre_ping=True),
-            httpx.AsyncClient(base_url=settings.cache_url, timeout=30),
+            httpx.AsyncClient(base_url=settings.cache_url, timeout=30, follow_redirects=True),
             settings,
         )
 
@@ -495,13 +503,7 @@ class Coordinator:
         """The unfinished actions and the burst worker target: the highest demand of the last
         ``scale_down_hold_s`` seconds, which the sweeps of every replica record."""
         async with self.engine.connect() as conn:
-            desired = await conn.scalar(
-                sa.text(
-                    "SELECT coalesce(max(workers), 0) FROM burst_demand "
-                    "WHERE at >= CAST(:now AS timestamptz) - make_interval(secs => :hold)"
-                ),
-                {"now": self.clock(), "hold": self.settings.scale_down_hold_s},
-            )
+            desired = await conn.scalar(HELD_TARGET, self._held_target_params(self.clock()))
             rows = await conn.execute(
                 sa.text(
                     "SELECT state, tier, count(*) FROM actions "
@@ -540,7 +542,7 @@ class Coordinator:
                 sa.text("INSERT INTO burst_demand (at, workers) VALUES (:now, :workers)"),
                 {"now": now, "workers": demand},
             )
-        desired = (await self.queue()).desired_burst_workers
+            desired = await conn.scalar(HELD_TARGET, self._held_target_params(now))
         if self.settings.scale_cmd is None or desired == self.scaled_to:
             return
         try:
@@ -549,6 +551,9 @@ class Coordinator:
             logger.warning("scaling to %d burst workers failed: %s", desired, error)
             return
         self.scaled_to = desired
+
+    def _held_target_params(self, now: datetime) -> dict[str, object]:
+        return {"now": now, "hold": self.settings.scale_down_hold_s, "cap": self.settings.max_burst_workers}
 
     async def _scale(self, scale_cmd: str, workers: int) -> None:
         process = await asyncio.create_subprocess_exec(*shlex.split(scale_cmd), str(workers))

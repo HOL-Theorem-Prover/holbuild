@@ -130,7 +130,7 @@ class Releases:
 
     def spec_version(self, spec_sha256: str) -> str:
         """The ``holbuild-version`` of the action spec stored in the remote cache's ``/cas/``."""
-        command = ["curl", "-fsS", "--retry", "3"]
+        command = ["curl", "-fsSL", "--retry", "3"]
         if self.curl_config is not None:
             command += ["-K", self.curl_config]
         command.append(f"{self.remote_cache.rstrip('/')}/cas/{spec_sha256}")

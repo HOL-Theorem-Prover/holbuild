@@ -5,12 +5,13 @@ from typing import Any
 
 import httpx
 import pytest
+from pydantic import ValidationError
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from conftest import CLIENT_TOKEN, WORKER_TOKEN
 from remote_exec import app as app_module
-from remote_exec.coordinator import Coordinator, QueueCounts, burst_demand, is_auth_failure
+from remote_exec.coordinator import Coordinator, QueueCounts, Settings, burst_demand, is_auth_failure
 from test_coordinator import claim, input_key, submit
 
 CLIENT = {"Authorization": f"Bearer {CLIENT_TOKEN}"}
@@ -105,8 +106,9 @@ async def test_queue_reports_counts_and_the_desired_burst_workers(
         "ready_high": 0,
         "running_standard": 1,
         "running_high": 0,
-        "desired_burst_workers": 1,  # what the other coordinator's sweep recorded
+        "desired_burst_workers": 0,  # the route's coordinator has no burst workers to ask for
     }
+    assert (await scaled.queue()).desired_burst_workers == 1
     assert (await http.get("/v1/queue", headers=WORKER)).status_code == 401
 
 
@@ -205,3 +207,27 @@ def test_httpx_requests_are_not_logged(monkeypatch: pytest.MonkeyPatch) -> None:
     app_module.app()
 
     assert not logging.getLogger("httpx").isEnabledFor(logging.INFO)
+
+
+async def test_zero_hold_follows_demand_and_the_cap_applies_to_held_demand(
+    http: httpx.AsyncClient, coordinator: Coordinator, tmp_path: Path
+) -> None:
+    scaled, calls = scaled_coordinator(coordinator, tmp_path, "")
+    unheld = Coordinator(scaled.engine, scaled.cache, scaled.settings.model_copy(update={"scale_down_hold_s": 0.0}))
+    await submit(http, ["a", "b", "c", "d"])
+
+    await unheld.sweep()
+    capped = Coordinator(scaled.engine, scaled.cache, scaled.settings.model_copy(update={"max_burst_workers": 1}))
+    await capped.sweep()
+
+    assert calls.read_text().split() == ["3", "1"]
+
+
+def test_settings_errors_do_not_print_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("REMOTE_EXEC_CACHE_URL", "https://user:cachesecret@cache.test")
+    monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", "workersecret")
+
+    with pytest.raises(ValidationError) as error:
+        Settings()  # pyright: ignore[reportCallIssue]
+
+    assert "secret" not in str(error.value)
