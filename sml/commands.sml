@@ -154,6 +154,8 @@ fun check_help () = print
   \oracle other than DISK_THM (cheat, for instance) and per axiom declared in\n\
   \THEORY or its ancestors outside HOL itself, and exits non-zero if there are\n\
   \any. Otherwise prints a clean line and exits zero.\n\n\
+  \The build runs without proof steps or checkpoints, so it reuses theories\n\
+  \built by build --skip-proof-steps and applies no step timeout.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun buildhol_help () = print
@@ -410,6 +412,19 @@ fun default_build_request targets =
   ({dry_run = false, watch = false, force = HolbuildBuildExec.ForceNone,
     use_cache = true, verify_cache = true, no_stat_cache = false,
     skip_checkpoints = false, proof_steps = true, new_ir = true,
+    tactic_timeout = NONE, tactic_timeout_set = false, execution_plan = NONE,
+    trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
+    warn_unreachable = false, emit_output_hashes = false,
+    allow_cache_timeout_discrepancy = false},
+   targets)
+
+(* check builds plain: step timeouts are build's check, and a timeout-free
+   request reuses any built or cached theory, including ones from build
+   --skip-proof-steps --skip-checkpoints. It saves no checkpoints. *)
+fun plain_build_request targets =
+  ({dry_run = false, watch = false, force = HolbuildBuildExec.ForceNone,
+    use_cache = true, verify_cache = true, no_stat_cache = false,
+    skip_checkpoints = true, proof_steps = false, new_ir = false,
     tactic_timeout = NONE, tactic_timeout_set = false, execution_plan = NONE,
     trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
     warn_unreachable = false, emit_output_hashes = false,
@@ -1902,14 +1917,14 @@ fun hol_run_argv tc holstate subcommand context user_args =
   HolbuildToolchain.hol_subcommand_argv tc subcommand @ ["--holstate", holstate, context] @ user_args
 
 (* With run_heap false, HOL starts from the toolchain's base state even when
-   [run].heap is configured. *)
-fun run_hol_status runner tc cli_jobs run_heap from subcommand user_args =
+   [run].heap is configured. build_request builds the [run].loads targets. *)
+fun run_hol_status runner tc cli_jobs build_request run_heap from subcommand user_args =
   let
     val configured_project = timed_phase "project.discover" load_project
     val run_loads = #run_loads configured_project
     val _ =
       if null run_loads then ()
-      else build_once tc cli_jobs (default_build_request run_loads)
+      else build_once tc cli_jobs (build_request run_loads)
     val project =
       if null run_loads then configured_project
       else timed_phase "run.project.rediscover" load_project
@@ -1932,7 +1947,7 @@ fun run_hol_with runner tc cli_jobs subcommand args =
                  [] => NoFrom
                | scripts => FromScripts scripts)
   in
-    if HolbuildToolchain.success (run_hol_status runner tc cli_jobs true run_from subcommand user_args) then ()
+    if HolbuildToolchain.success (run_hol_status runner tc cli_jobs default_build_request true run_from subcommand user_args) then ()
     else raise Error ("hol " ^ subcommand ^ " failed")
   end
 
@@ -2031,7 +2046,7 @@ fun check_selector tc cli_jobs selector =
     val project = timed_phase "project.discover" load_project
     val {index, ...} = prepare_source_index "check" (resolution_for_toolchain tc) project
     val source = find_theory_source "check" index theory
-    val _ = build_once tc cli_jobs (default_build_request [#logical_name source])
+    val _ = build_once tc cli_jobs (plain_build_request [#logical_name source])
     val script_path = HolbuildToolchain.invocation_sml_file project "holbuild-check"
     val _ = write_text_file script_path
               (check_script {logical_name = #logical_name source, theorem = theorem,
@@ -2039,7 +2054,7 @@ fun check_selector tc cli_jobs selector =
     fun cleanup () = OS.FileSys.remove script_path handle OS.SysErr _ => ()
     val status =
       (* A run heap may hold an older copy of the theory, which load would keep. *)
-      run_hol_status HolbuildToolchain.run tc cli_jobs false NoFrom "run" [script_path]
+      run_hol_status HolbuildToolchain.run tc cli_jobs plain_build_request false NoFrom "run" [script_path]
       handle e => (cleanup (); raise e)
   in
     cleanup ();
