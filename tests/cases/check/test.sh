@@ -178,3 +178,45 @@ path.write_text(path.read_text().replace("  F\nProof\n  cheat\n", "  T\nProof\n 
 PY
 run_check CheatTheory 0
 require_grep "^CheatTheory: clean (2 theorems)$" "$log"
+
+# check builds plain, as heap does: no step timeout, no checkpoints, and it
+# reuses theories built by build --skip-proof-steps --skip-checkpoints.
+slow=$tmpdir/slow
+mkdir -p "$slow/src"
+{
+  write_schema2_prelude
+  cat <<'TOML'
+[project]
+name = "slow"
+
+[build]
+members = ["src"]
+tactic_timeout = 0.1
+TOML
+} > "$slow/holproject.toml"
+cat > "$slow/src/SlowScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Slow";
+fun slow_tac g = (OS.Process.sleep (Time.fromReal 0.45); ACCEPT_TAC TRUTH g);
+Theorem slow_thm:
+  T
+Proof
+  slow_tac
+QED
+val _ = export_theory();
+SML
+
+project=$slow
+run_check SlowTheory 0
+require_grep "^SlowTheory: clean (1 theorem)$" "$log"
+if find "$slow/.holbuild" -name '*.save' -print -quit | grep -q .; then
+  echo "check left checkpoints behind" >&2
+  exit 1
+fi
+
+printf '(* edited *)\n' >> "$slow/src/SlowScript.sml"
+(cd "$slow" && "$HOLBUILD_BIN" build --skip-proof-steps --skip-checkpoints SlowTheory) > "$tmpdir/slow-plain-build.log" 2>&1
+rm -rf "$slow/.holbuild"
+run_check SlowTheory 0
+require_grep "SlowTheory restored from cache" "$log"
+require_grep "^SlowTheory: clean (1 theorem)$" "$log"

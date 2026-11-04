@@ -154,6 +154,8 @@ fun check_help () = print
   \oracle other than DISK_THM (cheat, for instance) and per axiom declared in\n\
   \THEORY or its ancestors outside HOL itself, and exits non-zero if there are\n\
   \any. Otherwise prints a clean line and exits zero.\n\n\
+  \The build runs without proof steps or checkpoints, so it reuses theories\n\
+  \built by build --skip-proof-steps and applies no step timeout.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun buildhol_help () = print
@@ -410,6 +412,20 @@ fun default_build_request targets =
   ({dry_run = false, watch = false, force = HolbuildBuildExec.ForceNone,
     use_cache = true, verify_cache = true, no_stat_cache = false,
     skip_checkpoints = false, proof_steps = true, new_ir = true,
+    tactic_timeout = NONE, tactic_timeout_set = false, execution_plan = NONE,
+    trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
+    warn_unreachable = false, emit_output_hashes = false,
+    allow_cache_timeout_discrepancy = false},
+   targets)
+
+(* check builds its target plain, as heaps do: step timeouts are build's
+   check, and a timeout-free request without checkpoints reuses any built or
+   cached theory, including ones from build --skip-proof-steps
+   --skip-checkpoints, and leaves no checkpoints behind. *)
+fun plain_build_request targets =
+  ({dry_run = false, watch = false, force = HolbuildBuildExec.ForceNone,
+    use_cache = true, verify_cache = true, no_stat_cache = false,
+    skip_checkpoints = true, proof_steps = false, new_ir = false,
     tactic_timeout = NONE, tactic_timeout_set = false, execution_plan = NONE,
     trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
     warn_unreachable = false, emit_output_hashes = false,
@@ -2031,7 +2047,7 @@ fun check_selector tc cli_jobs selector =
     val project = timed_phase "project.discover" load_project
     val {index, ...} = prepare_source_index "check" (resolution_for_toolchain tc) project
     val source = find_theory_source "check" index theory
-    val _ = build_once tc cli_jobs (default_build_request [#logical_name source])
+    val _ = build_once tc cli_jobs (plain_build_request [#logical_name source])
     val script_path = HolbuildToolchain.invocation_sml_file project "holbuild-check"
     val _ = write_text_file script_path
               (check_script {logical_name = #logical_name source, theorem = theorem,

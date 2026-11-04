@@ -395,7 +395,9 @@ package (`DepTheory.my_axiom: axiom`). Theorems loaded from disk do not record
 which axioms they use, so every such axiom in the ancestry is reported. With
 findings it exits non-zero; otherwise it prints `MyTheory: clean (N theorems)`
 and exits zero. `holbuild check MyTheory:my_theorem` checks one theorem.
-The tags are those recorded in the built theory, which may have been restored
+Like `heap`, `check` builds without proof steps or checkpoints: it applies no
+step timeout (that is `build`'s check) and reuses theories built by
+`holbuild build --skip-proof-steps`. The tags are those recorded in the built theory, which may have been restored
 from a cache; run `holbuild build --no-cache MyTheory` first to check a fresh
 build. HOL always starts from the toolchain's base state here, not from
 `[run].heap`, which may hold an older copy of the theory.
