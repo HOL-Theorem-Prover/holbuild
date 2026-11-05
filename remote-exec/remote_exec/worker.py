@@ -36,6 +36,7 @@ RELEASE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 COMPLETE = ".complete"  # stamp file of a finished release build
 # ECS task scale-in protection lasts this long unless a heartbeat renews it, so a dead worker loses it.
 PROTECTION_MINUTES = 10
+CLAIM_RETRY_SECONDS = 5  # least time between two claims that found nothing
 
 
 # What a request to the coordinator raises when it or the network fails; ValueError covers a reply that isn't JSON.
@@ -62,7 +63,7 @@ class Coordinator:
         self.url = url.rstrip("/")
         self.token = token
 
-    def post(self, path: str, body: bytes, content_type: str) -> tuple[int, Any]:
+    def post(self, path: str, body: bytes, content_type: str, timeout: float = 30) -> tuple[int, Any]:
         request = urllib.request.Request(
             self.url + path,
             data=body,
@@ -70,15 +71,16 @@ class Coordinator:
             headers={"Authorization": f"Bearer {self.token}", "Content-Type": content_type},
         )
         try:
-            with self.opener.open(request, timeout=30) as response:
+            with self.opener.open(request, timeout=timeout) as response:
                 payload = response.read()
                 return response.status, json.loads(payload) if payload else None
         except urllib.error.HTTPError as error:
             return error.code, error.read().decode(errors="replace")
 
-    def claim(self, tiers: list[str], worker: str) -> dict[str, Any] | None:
-        body = {"tier": tiers[0], "also_claim": tiers[1:], "worker": worker}
-        status, response = self.post("/v1/work/claim", json.dumps(body).encode(), "application/json")
+    def claim(self, tiers: list[str], worker: str, wait_s: float) -> dict[str, Any] | None:
+        """An action, waiting up to ``wait_s`` seconds for one, or None."""
+        body = {"tier": tiers[0], "also_claim": tiers[1:], "worker": worker, "wait_s": wait_s}
+        status, response = self.post("/v1/work/claim", json.dumps(body).encode(), "application/json", 30 + wait_s)
         if status == 204:
             return None
         if status != 200:
@@ -171,7 +173,7 @@ class Releases:
         if os.path.exists(os.path.join(directory, COMPLETE)):
             return executable
         os.makedirs(self.root, exist_ok=True)
-        with open(os.path.join(self.root, ".lock"), "a") as lock:
+        with open(os.path.join(self.root, f"v{version}.lock"), "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             if not os.path.exists(os.path.join(directory, COMPLETE)):
                 self._build(version, directory)
@@ -311,6 +313,13 @@ def tier_list(text: str) -> list[str]:
     return tiers
 
 
+def claim_wait_seconds(text: str) -> float:
+    seconds = float(text)
+    if not 0 <= seconds <= 50:
+        raise argparse.ArgumentTypeError(f"{text} is not between 0 and 50")
+    return seconds
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--coordinator", required=True, help="coordinator base URL")
@@ -343,7 +352,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "finishes, to keep a scaler from stopping a busy worker",
     )
     parser.add_argument("--name", default=f"{socket.gethostname()}:{os.getpid()}", help="worker name in leases")
-    parser.add_argument("--poll-seconds", type=float, default=5.0, help="wait after an empty claim")
+    parser.add_argument(
+        "--claim-wait-seconds",
+        type=claim_wait_seconds,
+        default=20.0,
+        help="how long a claim waits at the coordinator for an action to become ready (at most 50)",
+    )
     return parser.parse_args(argv)
 
 
@@ -367,13 +381,15 @@ def main() -> None:
     # Exit through Python on SIGTERM, so run_one's cleanup stops the running action.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
     while True:
+        started = time.monotonic()
         try:
-            claim = coordinator.claim(tiers, args.name)
+            claim = coordinator.claim(tiers, args.name, args.claim_wait_seconds)
         except COORDINATOR_ERRORS as error:
             print(f"claim failed: {error}", file=sys.stderr)
             claim = None
         if claim is None:
-            time.sleep(args.poll_seconds)
+            # A claim that failed at once, or a coordinator that doesn't wait, isn't retried in a tight loop.
+            time.sleep(max(0.0, CLAIM_RETRY_SECONDS - (time.monotonic() - started)))
             continue
         try:
             run_one(coordinator, args, releases, protection, claim)

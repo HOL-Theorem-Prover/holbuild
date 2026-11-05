@@ -5,11 +5,12 @@ is a batch row first, then its actions and leases, so a completion, an expiry an
 """
 
 import asyncio
+import contextlib
 import logging
 import re
 import shlex
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
@@ -24,6 +25,8 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_en
 from remote_exec.formats import Batch, Result
 
 logger = logging.getLogger(__name__)
+
+CLAIM_RECHECK_SECONDS = 5  # how often a waiting claim looks for actions another coordinator process made ready
 
 # A holbuild remote-cache entry lists its blobs as `blob <sha256> <size>` lines before the manifest it carries.
 ENTRY_BLOB = re.compile(r"^blob ([0-9a-f]{64}) [0-9]+$", re.MULTILINE)
@@ -169,6 +172,8 @@ class Coordinator:
         self.settings = settings
         self.clock: Callable[[], datetime] = lambda: datetime.now(UTC)
         self.scaled_to: int | None = None  # what the scale command last accepted
+        # Set, and replaced by a fresh one, whenever release makes an action ready, to wake waiting claims.
+        self.made_ready = asyncio.Event()
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "Coordinator":
@@ -258,9 +263,35 @@ class Coordinator:
             await self._end_batch(conn, batch_id, "cancelled", None)
             return "cancelled"
 
-    async def claim(self, tiers: list[str], worker: str) -> Claim | None:
-        """Lease a ready action to ``worker``, or None if none: of the first of ``tiers`` that has one, the oldest
-        batch's first (by theory)."""
+    async def claim(
+        self,
+        tiers: list[str],
+        worker: str,
+        wait_s: float = 0,
+        disconnected: Callable[[], Awaitable[bool]] | None = None,
+    ) -> Claim | None:
+        """Lease a ready action to ``worker``, waiting up to ``wait_s`` seconds for one, or None if none became
+        ready: of the first of ``tiers`` that has one, the oldest batch's first (by theory).
+
+        A wait ends early once ``disconnected`` says the worker has gone, so no action is leased to nobody. It is
+        woken when this process's ``release`` makes an action ready, and rechecks every ``CLAIM_RECHECK_SECONDS``
+        for actions another coordinator process made ready.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait_s
+        while True:
+            # Taken before the attempt, so an action made ready during it still wakes the wait below.
+            made_ready = self.made_ready
+            claimed = await self._claim(tiers, worker)
+            remaining = deadline - loop.time()
+            if claimed is not None or remaining <= 0:
+                return claimed
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(made_ready.wait(), min(remaining, CLAIM_RECHECK_SECONDS))
+            if disconnected is not None and await disconnected():
+                return None
+
+    async def _claim(self, tiers: list[str], worker: str) -> Claim | None:
         async with self.engine.begin() as conn:
             row = (
                 await conn.execute(
@@ -427,13 +458,16 @@ class Coordinator:
                 answers = [present[ac_key] for _, ac_key in parents]
                 if all(answers):
                     async with self.engine.begin() as conn:
-                        await conn.execute(
+                        updated = await conn.execute(
                             sa.text(
                                 "UPDATE actions SET state = 'ready' WHERE batch_id = :batch_id "
                                 "AND input_key = :input_key AND state = 'waiting' AND remaining_deps = 0"
                             ),
                             {"batch_id": candidate_batch, "input_key": input_key},
                         )
+                    if updated.rowcount:
+                        self.made_ready.set()
+                        self.made_ready = asyncio.Event()
                 for parent, ac_key in parents:
                     if present[ac_key] is False:
                         requeued |= await self._requeue_evicted(candidate_batch, parent)

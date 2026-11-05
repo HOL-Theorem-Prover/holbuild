@@ -28,6 +28,7 @@ class ClaimRequest(BaseModel):
     tier: Tier
     also_claim: list[Tier] = Field(default_factory=list)  # tried in order once `tier` has nothing ready
     worker: str
+    wait_s: float = Field(default=0, ge=0, le=50)  # how long to wait for an action when none is ready
 
 
 def exit_on_auth_failure(error: BaseException) -> None:
@@ -135,9 +136,9 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         return {**asdict(status.counts), "desired_burst_workers": status.desired_burst_workers}
 
     @app.post("/v1/work/claim", dependencies=worker, response_model=None)
-    async def claim(request: ClaimRequest) -> dict[str, object] | Response:
-        tiers = [request.tier, *(t for t in request.also_claim if t != request.tier)]
-        claimed = await coordinator.claim(tiers, request.worker)
+    async def claim(body: ClaimRequest, request: Request) -> dict[str, object] | Response:
+        tiers = [body.tier, *(t for t in body.also_claim if t != body.tier)]
+        claimed = await coordinator.claim(tiers, body.worker, body.wait_s, request.is_disconnected)
         if claimed is None:
             return Response(status_code=204)
         return asdict(claimed)

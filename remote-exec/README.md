@@ -16,7 +16,9 @@ a container image with both.
 
 - **Coordinator** (`remote_exec/app.py`, `remote_exec/coordinator.py`): a
   stateless FastAPI service over Postgres. Any number of replicas can run
-  behind a load balancer; all shared state is in the database.
+  behind a load balancer; all shared state is in the database. A claim
+  waiting for work is woken at once by its own process and rechecks every
+  5 s for work another process made ready.
 - **Postgres**: batches, their dependency edges, leases, failures, peak-memory
   hints and recent worker demand. It never holds a pointer to a result. An
   action is done when its key is in the cache's `/ac/`, so losing the database
@@ -72,7 +74,7 @@ A worker:
 docker run -e REMOTE_EXEC_WORKER_TOKEN=... -e HOLBUILD_REMOTE_CACHE_CURL_CONFIG_CONTENT='user = "user:pass"' \
   holbuild-remote-exec worker --coordinator https://exec.example.org --remote-cache https://cache.example.org \
   --cache-limit-gb 200 [--tier standard|high] [--also-claim standard] [--max-heap MB] [--cooperate-dir DIR] \
-  [--share-heaps] [--holbuild-releases-dir DIR] [--protection-cmd COMMAND]
+  [--share-heaps] [--holbuild-releases-dir DIR] [--protection-cmd COMMAND] [--claim-wait-seconds 20]
 ```
 
 The remote cache's credentials are a curl config, as holbuild reads it from
@@ -209,8 +211,9 @@ there on first use: the worker downloads its source tarball
 (`--holbuild-source-url`, by default the GitHub archive of tag `v<version>`),
 runs `make bin/holbuild` in place, since holbuild finds its runtime sources
 where it was built, and marks the directory complete. Workers on one host can
-share the directory: they build under an `flock` on its `.lock`, so a release
-is built once and the others wait for it.
+share the directory: they build a release under an `flock` on its
+`v<version>.lock`, so it is built once and the others wait for it, while
+other versions build alongside.
 
 An action from a version with no release (a development build, or a tarball
 that doesn't exist) is refused: the worker reports a `spec-rejected` result,
@@ -292,11 +295,13 @@ gets 401. Errors are JSON `{"detail": "<message>"}`.
 
 ### Worker
 
-`POST /v1/work/claim` with `{"tier": "standard|high", "also_claim": ["standard|high", …], "worker": "<name>"}`
-(`also_claim` is optional)
+`POST /v1/work/claim` with `{"tier": "standard|high", "also_claim": ["standard|high", …], "worker": "<name>", "wait_s": 20}`
+(`also_claim` and `wait_s` are optional; `wait_s` is how long the coordinator
+holds the request open for an action to become ready, 0 by default and at
+most 50, so that a proxy's usual 60 s idle timeout doesn't cut it)
 
 - 200 `{"attempt_token": "<uuid>", "spec_sha256": "<sha256>", "input_key": "<sha256>", "theory": "<package>:<theory>", "lease_s": 120}`
-- 204 when nothing is ready for the tier
+- 204 when nothing became ready for the tier within `wait_s`
 
 `POST /v1/work/<attempt_token>/heartbeat`, no body
 

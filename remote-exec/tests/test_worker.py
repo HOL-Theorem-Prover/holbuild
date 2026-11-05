@@ -3,6 +3,7 @@ import io
 import json
 import tarfile
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -34,9 +35,9 @@ FAKE_MAKEFILE = """bin/holbuild:
 """
 
 
-def release_tarball(path: Path, version: str) -> None:
+def release_tarball(path: Path, version: str, makefile: str = FAKE_MAKEFILE) -> None:
     with tarfile.open(path, "w:gz") as tar:
-        for name, text in {"Makefile": FAKE_MAKEFILE, "fake-holbuild": FAKE_HOLBUILD}.items():
+        for name, text in {"Makefile": makefile, "fake-holbuild": FAKE_HOLBUILD}.items():
             data = text.encode()
             info = tarfile.TarInfo(f"holbuild-{version}/{name}")
             info.size = len(data)
@@ -51,6 +52,7 @@ class Server:
     specs: dict[str, str] = field(default_factory=dict)
     completed: list[str] = field(default_factory=list)
     protection: list[dict[str, object]] = field(default_factory=list)
+    claims: list[dict[str, object]] = field(default_factory=list)
 
 
 @pytest.fixture
@@ -79,6 +81,9 @@ def server() -> Iterator[Server]:
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
+            if self.path == "/v1/work/claim":
+                state.claims.append(json.loads(body))
+                return self.reply(204)
             if self.path.endswith("/complete"):
                 state.completed.append(body)
             self.reply(200, json.dumps({"accepted": True}) if self.path.endswith("/complete") else '{"lease_s": 3}')
@@ -126,6 +131,34 @@ def test_release_is_built_once_for_concurrent_workers(tmp_path: Path, server: Se
     assert found == [str(tmp_path / "releases/v1.2.3/bin/holbuild")] * 4
     assert logs[0].read_text() == "build\n"
     assert (tmp_path / "releases/v1.2.3/.complete").exists()
+
+
+def test_a_release_builds_while_another_version_is_being_built(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path]
+) -> None:
+    hold = tmp_path / "hold"
+    hold.touch()
+    slow_makefile = FAKE_MAKEFILE.replace(
+        "bin/holbuild:\n", f"bin/holbuild:\n\twhile [ -e {hold} ]; do sleep 0.1; done\n"
+    )
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3", slow_makefile)
+    release_tarball(tmp_path / "holbuild-1.2.4.tar.gz", "1.2.4")
+    slow = threading.Thread(target=lambda: releases(tmp_path, server).holbuild("1.2.3"))
+    slow.start()
+    try:
+        for _ in range(300):
+            if (tmp_path / "releases/v1.2.3/Makefile").exists():
+                break
+            time.sleep(0.1)
+        other = threading.Thread(target=lambda: releases(tmp_path, server).holbuild("1.2.4"), daemon=True)
+        other.start()
+        other.join(timeout=30)
+        assert not other.is_alive()
+        assert (tmp_path / "releases/v1.2.4/.complete").exists()
+        assert not (tmp_path / "releases/v1.2.3/.complete").exists()
+    finally:
+        hold.unlink()
+        slow.join()
 
 
 def test_versions_without_a_release_are_refused(tmp_path: Path, server: Server, logs: tuple[Path, Path]) -> None:
@@ -234,6 +267,17 @@ def test_also_claim_accepts_repeats_and_commas(tmp_path: Path, server: Server) -
     assert args.also_claim == ["standard", "high", "standard"]
 
 
+def test_claim_asks_the_coordinator_to_wait(server: Server) -> None:
+    assert Coordinator(server.url, "w").claim(["standard", "high"], "w", 20) is None
+    assert server.claims == [{"tier": "standard", "also_claim": ["high"], "worker": "w", "wait_s": 20}]
+
+
+def test_claim_wait_is_at_most_50_seconds(tmp_path: Path, server: Server) -> None:
+    assert worker_args(tmp_path, server, "--claim-wait-seconds", "50").claim_wait_seconds == 50
+    with pytest.raises(SystemExit):
+        worker_args(tmp_path, server, "--claim-wait-seconds", "51")
+
+
 def test_coordinator_redirects_are_not_followed(server: Server) -> None:
     with pytest.raises(RuntimeError, match="claim answered 303"):
-        Coordinator(server.url + "/moved", "w").claim(["standard"], "w")
+        Coordinator(server.url + "/moved", "w").claim(["standard"], "w", 0)
