@@ -102,18 +102,38 @@ fun regex_escape text =
     (fn c => if Char.contains ".[]()*+?{}|^$\\" c then "\\" ^ str c else str c)
     text
 
+fun skipped_dir_name name =
+  (name <> "." andalso String.isPrefix "." name) orelse name = "_build"
+
+fun drop_trailing_slashes path =
+  if size path > 1 andalso String.isSuffix "/" path
+  then drop_trailing_slashes (String.substring(path, 0, size path - 1))
+  else path
+
+(* Whether `path` lies in a skipped directory below `dir`. *)
+fun under_skipped_dir dir path =
+  String.isPrefix (dir ^ "/") path andalso
+  (case rev (String.fields (fn c => c = #"/") (String.extract(path, size dir + 1, NONE))) of
+       _ :: parent_dirs => List.exists skipped_dir_name parent_dirs
+     | [] => false)
+
 (* Changes in the directories the source index skips (dot-directories such
    as .holbuild/ and .hol/, and _build/) don't matter.  inotifywait matches
    --exclude against each event's full path, so those names are anchored
    below the watched directories: an ancestor with such a name must not hide
-   every event under it. *)
+   every event under it.  A directory with another watched path in such a
+   directory below it is left out, so that path's events still arrive. *)
 fun exclude_option paths =
-  case List.filter is_dir paths of
-      [] => ""
-    | dirs =>
-        " --exclude " ^
-        quote ("^(" ^ String.concatWith "|" (map regex_escape dirs) ^
-               ")/(.*/)?(\\.[^/]+|_build)/")
+  let
+    fun excludable dir = not (List.exists (under_skipped_dir dir) paths)
+  in
+    case List.filter excludable (map drop_trailing_slashes (List.filter is_dir paths)) of
+        [] => ""
+      | dirs =>
+          " --exclude " ^
+          quote ("^(" ^ String.concatWith "|" (map regex_escape dirs) ^
+                 ")/(.*/)?(\\.[^/]+|_build)/")
+  end
 
 fun inotify_tree_command paths =
   "inotifywait -q -r" ^ exclude_option paths ^

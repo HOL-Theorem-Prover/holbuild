@@ -140,6 +140,9 @@ wait_for_exit() {
 
 write_project_file
 write_good_source
+# Directories the source index skips, below a watched one: writes there must
+# not trigger a rebuild.
+mkdir -p "$project/src/.hol" "$project/src/_build"
 watch_log=$tmpdir/watch.log
 (trap - INT; cd "$project" && exec "$WATCH_HOLBUILD_BIN" build --watch ATheory) >"$watch_log" 2>&1 &
 watch_pid=$!
@@ -149,6 +152,16 @@ sleep 2
 stable_count=$(grep -c -- "waiting for changes" "$watch_log" 2>/dev/null || true)
 if [[ "$stable_count" -ne 1 ]]; then
   echo "watch mode retriggered without source changes" >&2
+  cat "$watch_log" >&2
+  exit 1
+fi
+
+echo "noise" > "$project/src/.hol/noise"
+echo "noise" > "$project/src/_build/noise"
+sleep 2
+skipped_count=$(grep -c -- "waiting for changes" "$watch_log" 2>/dev/null || true)
+if [[ "$skipped_count" -ne 1 ]]; then
+  echo "watch mode rebuilt after writes in skipped directories" >&2
   cat "$watch_log" >&2
   exit 1
 fi
