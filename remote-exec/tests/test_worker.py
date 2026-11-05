@@ -16,12 +16,13 @@ from remote_exec.worker import Coordinator, Protection, Releases, Unreleased, fa
 SPEC = "5" * 64
 RECORD = f"holbuild-action-result-v1\nspec={SPEC}\ninput-key={'6' * 64}\nstatus=built\n"
 
-# A stand-in holbuild source tree: `make bin/holbuild` installs a script that logs its arguments and writes RECORD
-# to its --result file, or crashes without one when FAKE_HOLBUILD_CRASH is set.
+# A stand-in holbuild source tree: `make bin/holbuild` installs a script that logs its arguments and environment and
+# writes RECORD to its --result file, or crashes without one when HOLBUILD_FAKE_CRASH is set.
 FAKE_HOLBUILD = f"""#!/bin/sh
-echo "$@" >> "$FAKE_HOLBUILD_LOG"
+echo "$@" >> "$HOLBUILD_FAKE_LOG"
+env > "$HOLBUILD_FAKE_LOG.env"
 sleep 2  # long enough for a heartbeat at the 1 s interval of a 3 s lease
-[ -z "$FAKE_HOLBUILD_CRASH" ] || exit 70
+[ -z "$HOLBUILD_FAKE_CRASH" ] || exit 70
 while [ "$#" -gt 0 ]; do
   if [ "$1" = --result ]; then printf '{RECORD}' > "$2"; fi
   shift
@@ -109,7 +110,7 @@ def server() -> Iterator[Server]:
 def logs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
     build_log, holbuild_log = tmp_path / "builds", tmp_path / "holbuild-calls"
     monkeypatch.setenv("FAKE_BUILD_LOG", str(build_log))
-    monkeypatch.setenv("FAKE_HOLBUILD_LOG", str(holbuild_log))
+    monkeypatch.setenv("HOLBUILD_FAKE_LOG", str(holbuild_log))
     return build_log, holbuild_log
 
 
@@ -219,12 +220,40 @@ def test_worker_runs_the_action_on_the_release_that_exported_it(
     assert len(held) >= 2  # renewed on a heartbeat
 
 
+def test_action_runs_without_the_worker_token(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+    monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", "worker-secret")
+    monkeypatch.setenv("UNRELATED", "1")
+    monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_CURL_CONFIG", str(tmp_path / "cache.curl"))
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.test:3128")
+
+    run_one(
+        Coordinator(server.url, "w"),
+        worker_args(tmp_path, server),
+        releases(tmp_path, server),
+        Protection(None, None),
+        claim(),
+    )
+
+    env = dict(line.split("=", 1) for line in Path(f"{logs[1]}.env").read_text().splitlines() if "=" in line)
+    assert "REMOTE_EXEC_WORKER_TOKEN" not in env
+    assert "UNRELATED" not in env
+    assert env["HTTPS_PROXY"] == "http://proxy.test:3128"
+    assert env["HOLBUILD_CACHE"] == str(tmp_path / "cache")
+    assert env["HOLBUILD_REMOTE_CACHE_CURL_CONFIG"] == str(tmp_path / "cache.curl")
+    assert env["PATH"]
+
+
 def test_action_that_ends_without_a_record_is_reported_for_a_retry(
     tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
     server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
-    monkeypatch.setenv("FAKE_HOLBUILD_CRASH", "1")
+    monkeypatch.setenv("HOLBUILD_FAKE_CRASH", "1")
 
     run_one(
         Coordinator(server.url, "w"),
