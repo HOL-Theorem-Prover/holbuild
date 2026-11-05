@@ -116,6 +116,23 @@ if (cd "$locked_bad_project" && "$HOLBUILD_BIN" build) > "$locked_bad_log" 2>&1;
   wait "$first_pid" || true
   exit 1
 fi
+# Planning can execute demanded generators, so these commands must also
+# reject a concurrent project mutation before inspecting missing members.
+for command in dry-run run-from export; do
+  case "$command" in
+    dry-run) args=(build --dry-run ATheory) ;;
+    run-from) args=(run --from ATheory) ;;
+    export) args=(export --output "$tmpdir/locked.hbx" ATheory) ;;
+  esac
+  if (cd "$locked_bad_project" && "$HOLBUILD_BIN" "${args[@]}") > "$tmpdir/$command.log" 2>&1; then
+    echo "concurrent $command unexpectedly succeeded" >&2
+    kill "$lock_holder" 2>/dev/null || true
+    wait "$lock_holder" 2>/dev/null || true
+    wait "$first_pid" || true
+    exit 1
+  fi
+  require_grep "project is already being modified" "$tmpdir/$command.log"
+done
 kill "$lock_holder" 2>/dev/null || true
 wait "$lock_holder" 2>/dev/null || true
 require_grep "project is already being modified" "$locked_bad_log"

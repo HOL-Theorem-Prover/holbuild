@@ -1225,7 +1225,9 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           HolbuildBuildExec.with_project_lock project "action-spec"
             (fn () => run_with_stat_cache (export_action_specs upload))
       | BuildTargets =>
-          if dry_run then run_with_stat_cache describe_dry_run
+          if dry_run then
+            HolbuildBuildExec.with_project_lock project "build --dry-run"
+              (fn () => run_with_stat_cache describe_dry_run)
           else HolbuildBuildExec.with_project_lock project "build" (fn () => run_with_stat_cache execute_build)
       | RemoteExec remote =>
           HolbuildBuildExec.with_project_lock project "build"
@@ -1631,27 +1633,32 @@ fun export_archive tc jobs args =
     val ExportArgs {build_first, output, metadata_out, targets = requested_targets} = parse_export_args args
     val _ = if build_first then build tc jobs requested_targets else ()
     val project = timed_phase "project.discover" load_project
-    val resolution = resolution_for_toolchain tc
-    val {index, components} = prepare_source_index "export" resolution project
-    val targets = timed_phase "targets.default" (fn () => default_build_targets resolution project index requested_targets)
-    val _ = reject_object_targets targets
-    val plan = timed_phase "build.plan" (fn () => build_target_plan resolution components (#holdir tc) project index requested_targets targets)
-    val keys = default_build_input_keys tc project index components plan
-    val entries = export_entries project plan keys
-    val cache = HolbuildFSCacheBackend.default () handle HolbuildFSCacheBackend.Error msg => raise Error msg
-    val metadata = hbx_export_metadata project
+    fun execute_export () =
+      let
+        val resolution = resolution_for_toolchain tc
+        val {index, components} = prepare_source_index "export" resolution project
+        val targets = timed_phase "targets.default" (fn () => default_build_targets resolution project index requested_targets)
+        val _ = reject_object_targets targets
+        val plan = timed_phase "build.plan" (fn () => build_target_plan resolution components (#holdir tc) project index requested_targets targets)
+        val keys = default_build_input_keys tc project index components plan
+        val entries = export_entries project plan keys
+        val cache = HolbuildFSCacheBackend.default () handle HolbuildFSCacheBackend.Error msg => raise Error msg
+        val metadata = hbx_export_metadata project
+      in
+        HolbuildCacheArchive.create_export {archive_path = output,
+                                            source = fs_cache_source cache,
+                                            entries = entries,
+                                            targets = targets,
+                                            metadata = metadata};
+        Option.app (fn path => write_export_metadata {path = path,
+                                                      archive_path = output,
+                                                      targets = targets,
+                                                      action_count = length entries,
+                                                      metadata = metadata}) metadata_out;
+        print ("exported " ^ Int.toString (length entries) ^ " cache action(s) to " ^ output ^ "\n")
+      end
   in
-    HolbuildCacheArchive.create_export {archive_path = output,
-                                        source = fs_cache_source cache,
-                                        entries = entries,
-                                        targets = targets,
-                                        metadata = metadata};
-    Option.app (fn path => write_export_metadata {path = path,
-                                                  archive_path = output,
-                                                  targets = targets,
-                                                  action_count = length entries,
-                                                  metadata = metadata}) metadata_out;
-    print ("exported " ^ Int.toString (length entries) ^ " cache action(s) to " ^ output ^ "\n")
+    HolbuildBuildExec.with_project_lock project "export" execute_export
   end
 
 fun fs_cache_destination cache : HolbuildCacheTransfer.destination =
@@ -1949,7 +1956,9 @@ fun run_hol_status runner tc cli_jobs build_request run_heap from subcommand use
     val project =
       if null run_loads then configured_project
       else timed_phase "run.project.rediscover" load_project
-    val {holstate, context_lines, loads} = run_start tc project run_heap from
+    val {holstate, context_lines, loads} =
+      HolbuildBuildExec.with_project_lock project "run context"
+        (fn () => run_start tc project run_heap from)
     val packages = resolved_packages (resolution_for_toolchain tc) project
     fun invoke context =
       runner (hol_run_argv tc holstate subcommand context user_args)
