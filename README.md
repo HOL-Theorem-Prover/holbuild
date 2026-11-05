@@ -1133,8 +1133,9 @@ in a curl config file named by `HOLBUILD_REMOTE_EXEC_CURL_CONFIG`, such as
 `header = "Authorization: Bearer <token>"`, so they stay off the command line.
 
 When the batch ends, one line says how many of its theories the remote
-workers built (`holbuild: remote execution: remote workers built 3 of 3
-theories`), or, when the build falls back, why and how many they built.
+workers finished, built or found cached (`holbuild: remote execution: remote
+workers finished 3 of 3 theories`), or, when the build falls back, why and
+how many they finished.
 
 The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the
