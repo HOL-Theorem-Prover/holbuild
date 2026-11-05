@@ -24,7 +24,9 @@ command -v inotifywait >/dev/null || {
   exit 1
 }
 
-project=$tmpdir/.dot/project
+# Ancestors named like directories the watch skips (dot-directories, _build)
+# must not hide the project from it.
+project=$tmpdir/_build/.dot/project
 mkdir -p "$project/src"
 write_project_file() {
   cat > "$project/holproject.toml" <<TOML

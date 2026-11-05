@@ -95,8 +95,28 @@ fun ensure_inotifywait () =
 
 fun sleep_debounce () = OS.Process.sleep (Time.fromReal 0.25)
 
+fun is_dir path = FS.isDir path handle OS.SysErr _ => false
+
+fun regex_escape text =
+  String.translate
+    (fn c => if Char.contains ".[]()*+?{}|^$\\" c then "\\" ^ str c else str c)
+    text
+
+(* Changes in the directories the source index skips (dot-directories such
+   as .holbuild/ and .hol/, and _build/) don't matter.  inotifywait matches
+   --exclude against each event's full path, so those names are anchored
+   below the watched directories: an ancestor with such a name must not hide
+   every event under it. *)
+fun exclude_option paths =
+  case List.filter is_dir paths of
+      [] => ""
+    | dirs =>
+        " --exclude " ^
+        quote ("^(" ^ String.concatWith "|" (map regex_escape dirs) ^
+               ")/(.*/)?(\\.[^/]+|_build)/")
+
 fun inotify_tree_command paths =
-  "inotifywait -q -r --exclude " ^ quote "/(\\.holbuild|\\.git|_build)/" ^
+  "inotifywait -q -r" ^ exclude_option paths ^
   " -e close_write,move,create,delete,attrib -- " ^
   String.concatWith " " (map quote paths) ^ " >/dev/null 2>&1"
 
