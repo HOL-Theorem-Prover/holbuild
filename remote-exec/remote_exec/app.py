@@ -28,7 +28,7 @@ class ClaimRequest(BaseModel):
     tier: Tier
     also_claim: list[Tier] = Field(default_factory=list)  # tried in order once `tier` has nothing ready
     worker: str
-    wait_s: float = Field(default=0, ge=0, le=60)  # how long to wait for an action when none is ready
+    wait_s: float = Field(default=0, ge=0, le=50)  # how long to wait for an action when none is ready
 
 
 def exit_on_auth_failure(error: BaseException) -> None:

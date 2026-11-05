@@ -315,8 +315,8 @@ def tier_list(text: str) -> list[str]:
 
 def claim_wait_seconds(text: str) -> float:
     seconds = float(text)
-    if not 0 <= seconds <= 60:
-        raise argparse.ArgumentTypeError(f"{text} is not between 0 and 60")
+    if not 0 <= seconds <= 50:
+        raise argparse.ArgumentTypeError(f"{text} is not between 0 and 50")
     return seconds
 
 
@@ -356,7 +356,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--claim-wait-seconds",
         type=claim_wait_seconds,
         default=20.0,
-        help="how long a claim waits at the coordinator for an action to become ready (at most 60)",
+        help="how long a claim waits at the coordinator for an action to become ready (at most 50)",
     )
     return parser.parse_args(argv)
 

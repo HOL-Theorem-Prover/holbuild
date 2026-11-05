@@ -272,10 +272,10 @@ def test_claim_asks_the_coordinator_to_wait(server: Server) -> None:
     assert server.claims == [{"tier": "standard", "also_claim": ["high"], "worker": "w", "wait_s": 20}]
 
 
-def test_claim_wait_is_at_most_a_minute(tmp_path: Path, server: Server) -> None:
-    assert worker_args(tmp_path, server, "--claim-wait-seconds", "60").claim_wait_seconds == 60
+def test_claim_wait_is_at_most_50_seconds(tmp_path: Path, server: Server) -> None:
+    assert worker_args(tmp_path, server, "--claim-wait-seconds", "50").claim_wait_seconds == 50
     with pytest.raises(SystemExit):
-        worker_args(tmp_path, server, "--claim-wait-seconds", "61")
+        worker_args(tmp_path, server, "--claim-wait-seconds", "51")
 
 
 def test_coordinator_redirects_are_not_followed(server: Server) -> None:

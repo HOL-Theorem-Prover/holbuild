@@ -295,9 +295,9 @@ gets 401. Errors are JSON `{"detail": "<message>"}`.
 ### Worker
 
 `POST /v1/work/claim` with `{"tier": "standard|high", "also_claim": ["standard|high", …], "worker": "<name>", "wait_s": 20}`
-(`also_claim` and `wait_s` are optional; `wait_s`, at most 60, is how long
-the coordinator holds the request open for an action to become ready, 0 by
-default)
+(`also_claim` and `wait_s` are optional; `wait_s` is how long the coordinator
+holds the request open for an action to become ready, 0 by default and at
+most 50, so that a proxy's usual 60 s idle timeout doesn't cut it)
 
 - 200 `{"attempt_token": "<uuid>", "spec_sha256": "<sha256>", "input_key": "<sha256>", "theory": "<package>:<theory>", "lease_s": 120}`
 - 204 when nothing became ready for the tier within `wait_s`

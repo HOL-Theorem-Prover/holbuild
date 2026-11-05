@@ -244,7 +244,10 @@ async def test_unknown_token_and_mismatched_result_are_refused(http: httpx.Async
     assert (await http.post(f"/v1/work/{uuid4()}/heartbeat", headers=WORKER)).status_code == 409
 
 
-async def test_a_waiting_claim_takes_an_action_that_becomes_ready_meanwhile(http: httpx.AsyncClient) -> None:
+async def test_a_waiting_claim_takes_an_action_that_becomes_ready_meanwhile(
+    http: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only the wake can end the wait in time
     body = {"tier": "standard", "worker": "w1", "wait_s": 30}
     waiting = asyncio.create_task(http.post("/v1/work/claim", json=body, headers=WORKER))
     await asyncio.sleep(0.5)
@@ -285,7 +288,7 @@ async def test_a_waiting_claim_ends_empty_after_its_wait(http: httpx.AsyncClient
     body = {"tier": "standard", "worker": "w1", "wait_s": 0.3}
     response = await http.post("/v1/work/claim", json=body, headers=WORKER)
     assert response.status_code == 204
-    body["wait_s"] = 61
+    body["wait_s"] = 51
     assert (await http.post("/v1/work/claim", json=body, headers=WORKER)).status_code == 422
 
 
