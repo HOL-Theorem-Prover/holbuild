@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -20,19 +21,36 @@ CLIENT_TOKEN = "client-secret"
 WORKER_TOKEN = "worker-secret"
 
 
+def entry_blob(key: str) -> str:
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
 class FakeCache:
-    """bazel-remote's ``HEAD /ac/<key>``: 200 for ``keys``, 503 for ``broken``, 404 otherwise."""
+    """bazel-remote holding holbuild entries: ``GET /ac/<key>`` answers 503 for ``broken``, an entry listing the
+    blob ``entry_blob(key)`` for ``keys``, and 404 otherwise; ``HEAD /cas/<blob>`` answers 404 for the blobs of the
+    keys in ``lost`` and 200 for the others."""
 
     def __init__(self) -> None:
         self.keys: set[str] = set()
         self.broken: set[str] = set()
+        self.lost: set[str] = set()
 
     def handle(self, request: httpx.Request) -> httpx.Response:
-        assert request.method == "HEAD"
-        key = request.url.path.removeprefix("/ac/")
+        path = request.url.path
+        if request.method == "HEAD" and path.startswith("/cas/"):
+            return httpx.Response(404 if path.removeprefix("/cas/") in map(entry_blob, self.lost) else 200)
+        assert request.method == "GET" and path.startswith("/ac/")
+        key = path.removeprefix("/ac/")
         if key in self.broken:
             return httpx.Response(503)
-        return httpx.Response(200 if key in self.keys else 404)
+        if key not in self.keys:
+            return httpx.Response(404)
+        blob = entry_blob(key)
+        return httpx.Response(
+            200,
+            text=f"holbuild-remote-cache-action-v2\nmanifest-sha256 0\nmanifest-size 0\nblob {blob} 3\n"
+            f"manifest-text-v1\nblob dat {blob}\n",
+        )
 
 
 def upgrade(url: URL) -> None:

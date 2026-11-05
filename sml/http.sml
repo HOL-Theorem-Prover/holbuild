@@ -77,6 +77,7 @@ val CURLOPT_ERRORBUFFER = 10010
 val CURLOPT_TIMEOUT = 13
 val CURLOPT_CONNECTTIMEOUT = 78
 val CURLOPT_HTTPHEADER = 10023
+val CURLOPT_NOBODY = 44
 val CURLOPT_UPLOAD = 46
 val CURLOPT_FOLLOWLOCATION = 52
 val CURLOPT_HTTPGET = 80
@@ -269,6 +270,15 @@ fun get {url, dst, timeout} =
   with_file dst "wb" (fn output =>
     request {url = url, timeout = timeout, output = output,
              set_options = fn easy => check "HTTPGET" (setopt_long (easy, CURLOPT_HTTPGET, 1))})
+
+(* Asks for url with HEAD.  HTTPGET first clears a pooled handle's upload
+   from an earlier put, which NOBODY alone leaves in place before libcurl
+   7.72; the next get or put, setting HTTPGET or UPLOAD, turns NOBODY off. *)
+fun head {url, timeout} =
+  with_file "/dev/null" "wb" (fn sink =>
+    request {url = url, timeout = timeout, output = sink,
+             set_options = fn easy => (check "HTTPGET" (setopt_long (easy, CURLOPT_HTTPGET, 1));
+                                       check "NOBODY" (setopt_long (easy, CURLOPT_NOBODY, 1)))})
 
 (* Uploads src to url with PUT and the given extra request headers; the
    response body is discarded. *)
