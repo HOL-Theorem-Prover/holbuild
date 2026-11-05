@@ -45,7 +45,7 @@ fun global_help () = print
   \  -j N, -jN, --jobs N\n\
   \  --max-heap MB\n\
   \  --prefetch-concurrency N     Remote cache entries to prefetch at once\n\
-  \                               (default: 25 or 2 * jobs, whichever is larger)\n\
+  \                               (default: 50 or 2 * jobs, whichever is larger)\n\
   \  --cooperate-dir DIR          Share a machine memory budget with other holbuild\n\
   \                               processes using DIR (or $HOLBUILD_COOPERATE_DIR)\n\
   \  --machine-max-mem MB         Budget to record in DIR/budget if it is missing\n\

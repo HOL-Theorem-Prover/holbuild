@@ -322,7 +322,7 @@ Common global options:
   `MemAvailable` can't be read, to `--max-heap` + 1024, and then `--max-heap`
   or `--child-charge` is required.
 - `--prefetch-concurrency N`: how many remote cache entries a build copies into
-  the local cache at once, ahead of the build workers. Defaults to 25 or twice
+  the local cache at once, ahead of the build workers. Defaults to 50 or twice
   the build's jobs, whichever is larger; only used with a remote cache.
 
 ### Sharing a machine's memory between holbuild processes
@@ -856,7 +856,7 @@ towards the three, and any response resets the count. In the status line and
 `--json`'s `build_finished` event, `from_cache` counts every theory restored
 from a cache, and `from_remote` the ones among them whose entries this run
 copied from the remote cache.
-While a build runs, `--prefetch-concurrency` background threads (by default 25
+While a build runs, `--prefetch-concurrency` background threads (by default 50
 or twice `-j`, whichever is larger) also copy the remote entries of the plan's
 out-of-date theories into the local cache in build order, so a theory's restore
 usually finds its entry already local. This prefetch is best-effort and silent;

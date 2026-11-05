@@ -4931,7 +4931,7 @@ fun prefetch_key (options : build_options) project keys node =
       | _ => NONE
   end
 
-(* Starts --prefetch-concurrency (default max(25, 2 * jobs)) background
+(* Starts --prefetch-concurrency (default max(50, 2 * jobs)) background
    threads that hydrate the plan's remote theory cache entries into the local
    cache, in build order, while the build runs; returns a function that drops
    the nodes not yet started and waits for the copies in flight.  The build
@@ -4966,7 +4966,7 @@ fun start_remote_cache_prefetch (options : build_options) project plan keys jobs
                 | SOME node => ((prefetch node handle _ => ()); worker ())
             val count =
               Int.min (Option.getOpt (!HolbuildRemoteCacheConfig.prefetch_concurrency,
-                                      Int.max (25, 2 * jobs)),
+                                      Int.max (50, 2 * jobs)),
                        length (!pending))
             val _ = cache_trace ("remote cache prefetch threads: " ^ Int.toString count)
             val threads = List.tabulate (count, fn _ => Thread.fork (worker, []))

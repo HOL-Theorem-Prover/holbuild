@@ -7,7 +7,7 @@ val override_url : string option ref = ref NONE
 val local_url : string option ref = ref NONE
 val local_curl_config : string option ref = ref NONE
 (* How many threads copy remote theory entries ahead of the build; NONE
-   means max(25, 2 * jobs). *)
+   means max(50, 2 * jobs). *)
 val prefetch_concurrency : int option ref = ref NONE
 
 fun nonempty label text =

@@ -225,7 +225,7 @@ if grep -q "remote cache prefetched: \($broken_key\|$absent_key\)" "$consumer_lo
   exit 1
 fi
 
-# Without the option, the prefetch runs max(25, 2 * jobs) threads, bounded by
+# Without the option, the prefetch runs max(50, 2 * jobs) threads, bounded by
 # the plan's four nodes.
 consumer_log=$tmpdir/default.log
 (cd "$consumer" && HOLBUILD_CACHE="$consumer_cache" HOLBUILD_CACHE_TRACE=1 \
