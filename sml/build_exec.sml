@@ -6042,11 +6042,14 @@ fun exception_failure e =
    The host store, CACHE/checkpoint-store/<heap>/<sha256>, keeps the files of
    each published heap and the checkpoints built on it, one directory per
    heap, and never writes one in place.  The action's checkpoint tree is its
-   own: emptied before and after the action and filled from the store, by
-   hard links where both are on one mount and by copies otherwise.  A save
-   over a linked file can't write through the link because checkpoint saving
-   unlinks the old file first (HolbuildCheckpointSaveRuntime.begin_replacement),
-   and an evicted store file stays readable through the action's own link. *)
+   own: emptied before and after the action and filled from the store, its
+   Poly/ML states by hard links where both are on one mount and by symbolic
+   links otherwise, its records by copies.  A save over a linked file can't
+   write through the link because checkpoint saving unlinks the old file
+   first (HolbuildCheckpointSaveRuntime.begin_replacement).  A store file
+   stays readable through the action's own link: a hard link outlives an
+   eviction, and a symbolic one points into a family the action leases until
+   it exits, which no cap sweep evicts. *)
 
 fun store_path store heap sha = Path.concat(Path.concat(store, heap), sha)
 
