@@ -159,13 +159,16 @@ grep '^edge' "$tmpdir/batch2.txt" > "$tmpdir/edges2.txt"
 printf 'edge %s %s\n' "$key_c" "$key_b" > "$tmpdir/edges2.expected"
 diff -u "$tmpdir/edges2.expected" "$tmpdir/edges2.txt"
 
-# A's entry whose blobs expired from the remote cache counts as uncached.
+# A's entry whose blobs expired from the remote cache counts as uncached,
+# through libcurl where the host has it and through the curl CLI.
 ac_a=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key_a" | sha256sum | cut -d' ' -f1)
 blob_a=$(awk '$1 == "blob" { print $2; exit }' "$remote_root/ac/$ac_a")
 [[ -n "$blob_a" ]] || { cat "$remote_root/ac/$ac_a" >&2; exit 1; }
 mv "$remote_root/cas/$blob_a" "$tmpdir/blob-a"
 hb action-spec CTheory > "$tmpdir/batch-expired.txt"
 [[ $(grep -c '^action' "$tmpdir/batch-expired.txt") -eq 3 ]] || { cat "$tmpdir/batch-expired.txt" >&2; exit 1; }
+HOLBUILD_TEST_LIBCURL=libholbuild-test-no-such-curl.so hb action-spec CTheory > "$tmpdir/batch-expired-cli.txt"
+[[ $(grep -c '^action' "$tmpdir/batch-expired-cli.txt") -eq 3 ]] || { cat "$tmpdir/batch-expired-cli.txt" >&2; exit 1; }
 mv "$tmpdir/blob-a" "$remote_root/cas/$blob_a"
 
 # A stricter timeout than A's entry was built with makes A uncached again.
