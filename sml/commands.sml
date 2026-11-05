@@ -1343,6 +1343,16 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         case attach of
             SOME batch_id => finish batch_id
           | NONE =>
+              (* A theory that writes SML sources runs before the rest of the
+                 build is planned (execute_build), which a batch can't do. *)
+              if not (null (HolbuildBuildPlan.generated_source_owners plan)) then
+                let val reason = "theories that write SML sources build before the rest is planned"
+                in
+                  if remote_only orelse detach then raise Error ("remote execution: " ^ reason)
+                  else (HolbuildBuildExec.warn ("remote execution: " ^ reason ^ "; building locally");
+                        execute_build ())
+                end
+              else
               (case HolbuildRemoteExec.Ok (export true)
                     handle HolbuildBuildExec.Error reason => HolbuildRemoteExec.Refused reason of
                    HolbuildRemoteExec.Ok batch => submit batch

@@ -1179,7 +1179,9 @@ won't stream it), it cancels the batch before building locally. With
 `--remote-only` it fails instead, and it never builds HOL or a theory
 locally: a HOL toolchain or a theory that doesn't restore from a cache is an
 error. With nothing to build remotely it says so and goes straight to the
-local build.
+local build. A build that includes a theory writing SML sources (see
+`holbuild_extra_outputs`) builds locally too, or fails under `--remote-only`:
+those theories have to run before the rest of the build can be planned.
 
 `--detach` submits the batch, prints its id (`holbuild: remote batch <id>`)
 and exits; if the batch can't be submitted, it fails rather than building
