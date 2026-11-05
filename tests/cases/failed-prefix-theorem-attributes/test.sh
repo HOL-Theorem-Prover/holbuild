@@ -32,7 +32,9 @@ TOML
 
 # foo_simp is [simp] and [local]: a theorem resumed from its failed-prefix
 # checkpoint must keep both, so uses_simp proves by simp alone and the theory's
-# signature leaves foo_simp out.
+# signature leaves foo_simp out.  Its proof's first step clears the overload
+# its statement uses, so the resumed theorem must not parse the statement
+# again.
 write_source() {
   local tail=$1
   cat > "$project/src/AScript.sml" <<SML
@@ -40,10 +42,12 @@ open HolKernel Parse boolLib bossLib;
 val _ = new_theory "A";
 
 val foo_def = new_definition ("foo_def", \`\`foo = T\`\`);
+val _ = overload_on ("hbtrue", \`\`T\`\`);
 
 Theorem foo_simp[simp,local]:
-  foo /\\ T
+  foo /\\ hbtrue
 Proof
+  (fn g => (Parse.temp_clear_overloads_on "hbtrue"; ALL_TAC g)) >>
   conj_tac >- simp [foo_def] >>
   $tail
 QED
@@ -74,6 +78,11 @@ if ! (cd "$project" && "$HOLBUILD_BIN" build ATheory) >"$resume_log" 2>&1; then
   exit 1
 fi
 require_grep "from: failed-prefix checkpoint in foo_simp" "$resume_log"
+if grep -q "discarding" "$resume_log"; then
+  echo "the failed-prefix resume fell back to a fresh run" >&2
+  cat "$resume_log" >&2
+  exit 1
+fi
 require_grep "ATheory built" "$resume_log"
 
 sig=$project/.holbuild/obj/src/ATheory.sig
