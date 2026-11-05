@@ -37,6 +37,10 @@ COMPLETE = ".complete"  # stamp file of a finished release build
 # ECS task scale-in protection lasts this long unless a heartbeat renews it, so a dead worker loses it.
 PROTECTION_MINUTES = 10
 CLAIM_RETRY_SECONDS = 5  # least time between two claims that found nothing
+# What exec-action runs with besides holbuild's own HOLBUILD_* settings: what curl, git and the locale read. The rest
+# of the worker's environment, its coordinator token above all, stays out of the builds' environment.
+EXEC_ACTION_ENV = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR")
+PROXY_ENV = ("http_proxy", "https_proxy", "all_proxy", "no_proxy")  # in either case
 
 
 # What a request to the coordinator raises when it or the network fails; ValueError covers a reply that isn't JSON.
@@ -212,6 +216,14 @@ def failed_record(spec_sha256: str, failure: str) -> str:
     return f"holbuild-action-result-v1\nspec={spec_sha256}\ninput-key=\nstatus=failed\nfailure={failure}\n"
 
 
+def exec_action_env() -> dict[str, str]:
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if name in EXEC_ACTION_ENV or name.lower() in PROXY_ENV or name.startswith("HOLBUILD_")
+    }
+
+
 def exec_action_command(args: argparse.Namespace, holbuild: str, spec: str, result: str) -> list[str]:
     command = [holbuild, "--remote-cache", args.remote_cache]
     if args.max_heap is not None:
@@ -284,7 +296,9 @@ def run_one(
         with tempfile.TemporaryDirectory() as scratch:
             result = os.path.join(scratch, "result")
             # Its own session, so a lost lease stops holbuild's HOL children with it.
-            process = subprocess.Popen(exec_action_command(args, holbuild, spec, result), start_new_session=True)
+            process = subprocess.Popen(
+                exec_action_command(args, holbuild, spec, result), env=exec_action_env(), start_new_session=True
+            )
             try:
                 while process.poll() is None:
                     if lease.lost.wait(1):
