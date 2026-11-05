@@ -8,9 +8,10 @@ event: done when RUN exits 0, failed otherwise.  Each action is reported
 running twice first, as a coordinator repeats unchanged states.  Control
 files in STATE change the answers: `refuse` makes POST answer 400, `drop`
 ends the next event stream before the final event (and is removed), `down`
-makes the event stream and POST /v1/batches/<id>/cancel answer 503, `skip`
-reports the batch done without running RUN.  Otherwise the cancel answers
-200.  Every request is logged to STATE/requests.log.
+makes the event stream and POST /v1/batches/<id>/cancel answer 503, `ended`
+makes the event stream answer 503 and the cancel answer that the batch is
+already done, `skip` reports the batch done without running RUN.  Otherwise
+the cancel answers that it cancelled the batch.  Every request is logged to STATE/requests.log.
 """
 
 import json
@@ -43,6 +44,8 @@ class Handler(BaseHTTPRequestHandler):
         self.log_request_line()
         body = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
         if self.path.startswith("/v1/batches/") and self.path.endswith("/cancel"):
+            if (state / "ended").exists():
+                return self.answer(200, {"state": "done"})
             if (state / "down").exists():
                 return self.answer(503, {"detail": "restarting"})
             return self.answer(200, {"state": "cancelled"})
@@ -61,7 +64,7 @@ class Handler(BaseHTTPRequestHandler):
         batch = state / f"{parts[3]}.batch" if len(parts) == 5 and parts[4] == "events" else None
         if batch is None or not batch.exists():
             return self.answer(404, {"detail": "no such batch"})
-        if (state / "down").exists():
+        if (state / "down").exists() or (state / "ended").exists():
             return self.answer(503, {"detail": "restarting"})
         ok = (state / "skip").exists() or subprocess.run([run, str(batch)]).returncode == 0
         self.send_response(200)
