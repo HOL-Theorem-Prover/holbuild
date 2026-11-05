@@ -110,12 +110,15 @@ fun drop_trailing_slashes path =
   then drop_trailing_slashes (String.substring(path, 0, size path - 1))
   else path
 
-(* Whether `path` lies in a skipped directory below `dir`. *)
+(* Whether `path` is or lies in a skipped directory below `dir`. *)
 fun under_skipped_dir dir path =
   String.isPrefix (dir ^ "/") path andalso
-  (case rev (String.fields (fn c => c = #"/") (String.extract(path, size dir + 1, NONE))) of
-       _ :: parent_dirs => List.exists skipped_dir_name parent_dirs
-     | [] => false)
+  let
+    val names = String.fields (fn c => c = #"/") (String.extract(path, size dir + 1, NONE))
+    val dir_names = if is_dir path then names else List.take (names, length names - 1)
+  in
+    List.exists skipped_dir_name dir_names
+  end
 
 (* Changes in the directories the source index skips (dot-directories such
    as .holbuild/ and .hol/, and _build/) don't matter.  inotifywait matches

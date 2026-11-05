@@ -25,9 +25,10 @@ command -v inotifywait >/dev/null || {
 }
 
 # Ancestors named like directories the watch skips (dot-directories, _build)
-# must not hide the project from it.
+# must not hide the project from it, nor a skipped directory around a member
+# (lib/.hidden) hide that member.
 project=$tmpdir/_build/.dot/project
-mkdir -p "$project/src"
+mkdir -p "$project/src" "$project/lib/.hidden"
 write_project_file() {
   cat > "$project/holproject.toml" <<TOML
 $(write_schema2_prelude)
@@ -35,7 +36,7 @@ $(write_schema2_prelude)
 name = "watch-mode"
 
 [build]
-members = ["src"]
+members = ["src", "lib", "lib/.hidden"]
 TOML
 }
 
@@ -200,6 +201,13 @@ sleep 1
 
 rm "$project/holbuild.toml"
 wait_for_count "waiting for changes" "$watch_log" 9 45
+sleep 1
+
+cat > "$project/lib/.hidden/BScript.sml" <<'SML'
+Theory B
+Ancestors bool
+SML
+wait_for_count "waiting for changes" "$watch_log" 10 45
 
 kill -INT "$watch_pid"
 wait_for_exit "$watch_pid" 10
