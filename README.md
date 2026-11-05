@@ -859,10 +859,11 @@ copied from the remote cache.
 While a build runs, `--prefetch-concurrency` background threads (by default 25
 or twice `-j`, whichever is larger) also copy the remote entries of the plan's
 out-of-date theories into the local cache in build order, so a theory's restore
-usually finds its entry already local. This prefetch is best-effort and silent; whatever it misses is
-fetched when the theory is reached, as before. `HOLBUILD_CACHE_TRACE=1` shows
-the prefetch thread count as `remote cache prefetch threads: <n>` and each
-prefetched entry as `remote cache prefetched: <key>`.
+usually finds its entry already local. This prefetch is best-effort and silent;
+whatever it misses is fetched when the theory is reached, as before.
+`HOLBUILD_CACHE_TRACE=1` shows the prefetch thread count as
+`remote cache prefetch threads: <n>` and each prefetched entry as
+`remote cache prefetched: <key>`.
 A missing HOL toolchain is restored from the same remote cache when its HOL
 commit, build arguments other than `-j`, installation path (with symlinks
 resolved, as HOL's build records it), platform, C library, Poly/ML runtime
