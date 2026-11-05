@@ -274,7 +274,7 @@ async def test_peak_above_the_standard_tier_places_the_next_batch_high(
     await claim_named(http, "a", "high")
 
 
-@pytest.mark.parametrize("failure", ["publish", "toolchain"])
+@pytest.mark.parametrize("failure", ["publish", "toolchain", "internal"])
 async def test_infrastructure_failures_retry_up_to_max_attempts(http: httpx.AsyncClient, failure: str) -> None:
     batch_id = await submit(http, ["a"])
     for _ in range(2):
@@ -311,7 +311,7 @@ async def test_result_without_an_input_key_is_matched_by_its_spec(http: httpx.As
     assert (await batch(http, batch_id))["failure"] == "pkg:a: spec-rejected"
 
 
-@pytest.mark.parametrize("failure", ["proof", "tactic-timeout", "spec-rejected", "internal"])
+@pytest.mark.parametrize("failure", ["proof", "tactic-timeout", "spec-rejected"])
 async def test_final_failures_fail_the_batch_and_cancel_the_rest(http: httpx.AsyncClient, failure: str) -> None:
     batch_id = await submit(http, ["a", "b", "c"], [("c", "a")])
     token_a = await claim_named(http, "a")
@@ -358,15 +358,21 @@ async def test_missing_transitive_dependency_holds_the_child_until_rebuilt(
 
 
 @pytest.mark.parametrize("missing", [f"blob {'b' * 64}", f"theory {input_key('outside')}"])
-async def test_other_missing_inputs_fail_the_batch_for_resubmission(http: httpx.AsyncClient, missing: str) -> None:
+async def test_other_missing_inputs_retry_then_fail_the_batch_for_resubmission(
+    http: httpx.AsyncClient, missing: str
+) -> None:
     batch_id = await submit(http, ["a"])
-    token = await claim_named(http, "a")
     record = result("a", "failed", "input-missing", missing=missing)
-    assert (await complete(http, token, record)).status_code == 200
+    for _ in range(2):
+        token = await claim_named(http, "a")
+        assert (await complete(http, token, record)).status_code == 200
+        assert await states(http, batch_id) == {"a": "ready"}
 
+    token = await claim_named(http, "a")
+    assert (await complete(http, token, record)).status_code == 200
     status = await batch(http, batch_id)
     assert status["state"] == "failed"
-    assert status["failure"].startswith("resubmit: ")
+    assert status["failure"] == f"resubmit: pkg:a is still missing {missing} after 3 attempts"
 
 
 async def test_cancel_revokes_leases_and_stops_claims(http: httpx.AsyncClient) -> None:
@@ -398,7 +404,6 @@ async def test_retention_deletes_old_terminal_batches_and_stale_hints(
 ) -> None:
     old_done = await submit(http, ["a"])
     await build(http, cache, "a")
-    old_running = await submit(http, ["b"])
     recent_done = await submit(http, [])
     async with remote_exec_engine.begin() as connection:
         await connection.execute(
@@ -410,8 +415,35 @@ async def test_retention_deletes_old_terminal_batches_and_stale_hints(
     await coordinator.sweep()
 
     assert (await http.get(f"/v1/batches/{old_done}", headers=CLIENT)).status_code == 404
-    assert (await batch(http, old_running))["state"] == "running"
     assert (await batch(http, recent_done))["state"] == "done"
     async with remote_exec_engine.connect() as connection:
         assert await connection.scalar(sa.text("SELECT count(*) FROM peak_hints")) == 0
-        assert await connection.scalar(sa.text("SELECT count(*) FROM actions")) == 1
+        assert await connection.scalar(sa.text("SELECT count(*) FROM actions")) == 0
+
+
+async def test_batches_past_the_deadline_fail_and_then_expire(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any
+) -> None:
+    # A high-tier action no worker takes would keep its batch running forever.
+    overdue = await submit(http, ["a", "b"])
+    token = await claim_named(http, "a")
+    current = await submit(http, ["c"])
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(
+            sa.text("UPDATE batches SET created_at = now() - interval '13 hours' WHERE id = :id"), {"id": UUID(overdue)}
+        )
+
+    await coordinator.sweep()
+
+    status = await batch(http, overdue)
+    assert (status["state"], status["failure"]) == ("failed", "deadline: still running after 12 h")
+    assert await states(http, overdue) == {"a": "cancelled", "b": "cancelled"}
+    assert (await http.post(f"/v1/work/{token}/heartbeat", headers=WORKER)).status_code == 409
+    assert (await batch(http, current))["state"] == "running"
+
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(
+            sa.text("UPDATE batches SET created_at = now() - interval '30 days' WHERE id = :id"), {"id": UUID(overdue)}
+        )
+    await coordinator.sweep()
+    assert (await http.get(f"/v1/batches/{overdue}", headers=CLIENT)).status_code == 404

@@ -7,8 +7,10 @@ workers), then streams one action event per action and the batch's final
 event: done when RUN exits 0, failed otherwise.  Each action is reported
 running twice first, as a coordinator repeats unchanged states.  Control
 files in STATE change the answers: `refuse` makes POST answer 400, `drop`
-ends the event stream before the final event, `skip` reports the batch done
-without running RUN.  Every request is logged to STATE/requests.log.
+ends the next event stream before the final event (and is removed), `down`
+makes the event stream and POST /v1/batches/<id>/cancel answer 503, `skip`
+reports the batch done without running RUN.  Otherwise the cancel answers
+200.  Every request is logged to STATE/requests.log.
 """
 
 import json
@@ -39,7 +41,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self.log_request_line()
-        body = self.rfile.read(int(self.headers["Content-Length"])).decode()
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
+        if self.path.startswith("/v1/batches/") and self.path.endswith("/cancel"):
+            if (state / "down").exists():
+                return self.answer(503, {"detail": "restarting"})
+            return self.answer(200, {"state": "cancelled"})
         if self.path != "/v1/batches":
             return self.answer(404, {"detail": "Not Found"})
         if (state / "refuse").exists():
@@ -55,6 +61,8 @@ class Handler(BaseHTTPRequestHandler):
         batch = state / f"{parts[3]}.batch" if len(parts) == 5 and parts[4] == "events" else None
         if batch is None or not batch.exists():
             return self.answer(404, {"detail": "no such batch"})
+        if (state / "down").exists():
+            return self.answer(503, {"detail": "restarting"})
         ok = (state / "skip").exists() or subprocess.run([run, str(batch)]).returncode == 0
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
@@ -72,6 +80,7 @@ class Handler(BaseHTTPRequestHandler):
                          "last_failure": None if ok else "proof", "log_sha256": None}
                 self.wfile.write((json.dumps(event) + "\n").encode())
         if (state / "drop").exists():
+            (state / "drop").unlink()
             return
         final = {"type": "batch", "state": "done" if ok else "failed",
                  "failure": None if ok else "an action failed"}

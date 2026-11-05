@@ -1132,17 +1132,27 @@ restores every theory from the remote cache. The coordinator's credentials go
 in a curl config file named by `HOLBUILD_REMOTE_EXEC_CURL_CONFIG`, such as
 `header = "Authorization: Bearer <token>"`, so they stay off the command line.
 
+When the batch ends, one line says how many of its theories the remote
+workers finished, built or found cached (`holbuild: remote execution: remote
+workers finished 3 of 3 theories`), or, when the build falls back, why and
+how many they finished.
+
 The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the
-batch, or the batch fails, it warns and builds locally. With `--remote-only`
-it fails instead, and it never builds HOL or a theory locally: a HOL
-toolchain or a theory that doesn't restore from a cache is an error. With nothing to
-build remotely it goes straight to the local build.
+batch, or the batch fails, it warns and builds locally. An event stream that
+breaks is reattached; one that stays unreachable through four reattaches
+(about 15 seconds of backoff) is given up on. When the build stops following
+a batch that may still run (the stream was given up on, or the coordinator
+won't stream it), it cancels the batch before building locally. With
+`--remote-only` it fails instead, and it never builds HOL or a theory
+locally: a HOL toolchain or a theory that doesn't restore from a cache is an
+error. With nothing to build remotely it says so and goes straight to the
+local build.
 
 `--detach` submits the batch, prints its id (`holbuild: remote batch <id>`)
 and exits; if the batch can't be submitted, it fails rather than building
-locally. `--attach <id>` follows that batch and then builds as above. A build
-that loses the event stream says how to reattach.
+locally. `--attach <id>` follows that batch and then builds as above. A
+`--remote-only` build that loses the event stream says how to reattach.
 
 [`remote-exec/`](remote-exec/README.md) has a coordinator and a worker loop
 that speak this protocol, and a container image with both.
@@ -1155,7 +1165,9 @@ The coordinator's protocol, in what holbuild uses of it:
   `{"type": "action", "input_key", "theory", "state", "last_failure",
   "log_sha256", ...}` when an action changes, and last `{"type": "batch",
   "state": "done"|"failed"|"cancelled", "failure"}`. A failed action's log is
-  at `/cas/<log_sha256>` in the remote cache.
+  at `/cas/<log_sha256>` in the remote cache. A stream may start over: it
+  sends every action's current state first.
+- `POST /v1/batches/<id>/cancel` cancels a running batch.
 
 Clean old project and cache state with:
 

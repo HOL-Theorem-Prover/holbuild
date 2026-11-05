@@ -10,16 +10,17 @@ from pathlib import Path
 
 import pytest
 
-from remote_exec.worker import Coordinator, Protection, Releases, Unreleased, parse_args, rejected_record, run_one
+from remote_exec.worker import Coordinator, Protection, Releases, Unreleased, failed_record, parse_args, run_one
 
 SPEC = "5" * 64
 RECORD = f"holbuild-action-result-v1\nspec={SPEC}\ninput-key={'6' * 64}\nstatus=built\n"
 
 # A stand-in holbuild source tree: `make bin/holbuild` installs a script that logs its arguments and writes RECORD
-# to its --result file.
+# to its --result file, or crashes without one when FAKE_HOLBUILD_CRASH is set.
 FAKE_HOLBUILD = f"""#!/bin/sh
 echo "$@" >> "$FAKE_HOLBUILD_LOG"
 sleep 2  # long enough for a heartbeat at the 1 s interval of a 3 s lease
+[ -z "$FAKE_HOLBUILD_CRASH" ] || exit 70
 while [ "$#" -gt 0 ]; do
   if [ "$1" = --result ]; then printf '{RECORD}' > "$2"; fi
   shift
@@ -185,6 +186,24 @@ def test_worker_runs_the_action_on_the_release_that_exported_it(
     assert len(held) >= 2  # renewed on a heartbeat
 
 
+def test_action_that_ends_without_a_record_is_reported_for_a_retry(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+    monkeypatch.setenv("FAKE_HOLBUILD_CRASH", "1")
+
+    run_one(
+        Coordinator(server.url, "w"),
+        worker_args(tmp_path, server),
+        releases(tmp_path, server),
+        Protection(None, None),
+        claim(),
+    )
+
+    assert server.completed == [failed_record(SPEC, "internal")]
+
+
 def test_action_of_an_unreleased_holbuild_is_rejected(tmp_path: Path, server: Server, logs: tuple[Path, Path]) -> None:
     server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.4\n"
 
@@ -196,7 +215,7 @@ def test_action_of_an_unreleased_holbuild_is_rejected(tmp_path: Path, server: Se
         claim(),
     )
 
-    assert server.completed == [rejected_record(SPEC)]
+    assert server.completed == [failed_record(SPEC, "spec-rejected")]
     assert not logs[1].exists()
 
 

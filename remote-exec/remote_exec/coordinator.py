@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     # A theory whose peak hint reaches this goes to the high-memory tier; set it to what a standard worker holds.
     standard_tier_mb: int = 16000
     retention_hours: int = 168
+    # A batch still running this long after its submission fails, so nothing keeps it, or workers for it, alive.
+    batch_deadline_hours: float = 12.0
     hint_ttl_days: int = 30
     sweep_seconds: float = 5.0
     events_poll_seconds: float = 1.0
@@ -248,8 +250,7 @@ class Coordinator:
             state = await self._lock_batch(conn, batch_id)
             if state != "running":
                 return state
-            await conn.execute(sa.text("UPDATE batches SET state = 'cancelled' WHERE id = :id"), {"id": batch_id})
-            await self._stop_actions(conn, batch_id)
+            await self._end_batch(conn, batch_id, "cancelled", None)
             return "cancelled"
 
     async def claim(self, tiers: list[str], worker: str) -> Claim | None:
@@ -376,17 +377,12 @@ class Coordinator:
                 )
                 await self._retry(conn, batch_id, action.input_key)
             elif action.attempts < self.settings.max_attempts and (
-                result.failure in ("publish", "toolchain")
+                result.failure in ("publish", "toolchain", "internal")
                 or (result.failure == "disk" and action.last_failure != "disk")
             ):
                 await self._retry(conn, batch_id, action.input_key)
-            elif result.failure == "input-missing" and result.missing is not None and result.missing.kind == "theory":
-                await self._requeue_missing(conn, batch_id, action.input_key, action.attempts, result.missing.key)
             elif result.failure == "input-missing":
-                missing = f"{result.missing.kind} {result.missing.key}" if result.missing else "an input"
-                await self._fail_batch(
-                    conn, batch_id, action.input_key, f"resubmit: {action.theory} is missing {missing}"
-                )
+                await self._input_missing(conn, batch_id, action.input_key, action.theory, action.attempts, result)
             else:
                 await self._fail_batch(conn, batch_id, action.input_key, f"{action.theory}: {result.failure}")
         await self.release(batch_id)
@@ -480,6 +476,26 @@ class Coordinator:
                 else:
                     await self._retry(conn, batch_id, lease.input_key)
 
+    async def fail_overdue(self) -> None:
+        """Fail the batches still running ``batch_deadline_hours`` after their submission: one that can't finish,
+        such as a high-tier action with no high-tier worker or a parent check the cache keeps refusing, would
+        otherwise run, and be kept from retention, forever."""
+        hours = self.settings.batch_deadline_hours
+        async with self.engine.connect() as conn:
+            overdue = list(
+                await conn.scalars(
+                    sa.text(
+                        "SELECT id FROM batches WHERE state = 'running' "
+                        "AND created_at < now() - make_interval(secs => :secs)"
+                    ),
+                    {"secs": hours * 3600},
+                )
+            )
+        for batch_id in overdue:
+            async with self.engine.begin() as conn:
+                if await self._lock_batch(conn, batch_id) == "running":
+                    await self._end_batch(conn, batch_id, "failed", f"deadline: still running after {hours:g} h")
+
     async def delete_expired(self) -> None:
         """Delete terminal batches past the retention period, a bounded number at a time, and stale peak hints."""
         while True:
@@ -529,6 +545,7 @@ class Coordinator:
         failing scale command is logged and retried on the next sweep; it never stops the sweep.
         """
         await self.expire_leases()
+        await self.fail_overdue()
         await self.release()
         await self.delete_expired()
         counts = (await self.queue()).counts
@@ -574,7 +591,10 @@ class Coordinator:
             return None
         if response.status_code == 200:
             return True
-        return False if response.status_code == 404 else None
+        if response.status_code == 404:
+            return False
+        logger.warning("HEAD /ac/%s answered %d; its children wait for the next sweep", ac_key, response.status_code)
+        return None
 
     async def _requeue_evicted(self, batch_id: UUID, parent: str) -> bool:
         """Re-queue a done parent whose key the cache no longer holds; True when it was."""
@@ -600,35 +620,40 @@ class Coordinator:
             await self._requeue(conn, batch_id, parent)
             return True
 
-    async def _requeue_missing(
-        self, conn: AsyncConnection, batch_id: UUID, input_key: str, attempts: int, missing: str
+    async def _input_missing(
+        self, conn: AsyncConnection, batch_id: UUID, input_key: str, theory: str, attempts: int, result: Result
     ) -> None:
-        """Handle ``input-missing`` naming a theory: re-queue it if the batch builds it, else ask to resubmit.
+        """Handle ``input-missing``: re-queue a missing theory the batch builds, and retry on anything else, since a
+        restore that fails on a network error reports its input missing too; once the action used up its
+        attempts, fail the batch for resubmission.
 
         The missing theory may be a transitive dependency, which the batch has no edge for; the edge added here
         holds the action back until that theory is rebuilt and its key answers ``HEAD /ac/`` again.
         """
-        theory = await conn.scalar(
-            sa.text("SELECT theory FROM actions WHERE batch_id = :batch_id AND input_key = :input_key"),
-            {"batch_id": batch_id, "input_key": missing},
-        )
-        if theory is None:
-            await self._fail_batch(conn, batch_id, input_key, f"resubmit: theory {missing} is no longer in the cache")
-            return
-        if attempts >= self.settings.max_attempts:
-            await self._fail_batch(
-                conn, batch_id, input_key, f"{theory}: still missing after {attempts} attempts of a child"
+        missing = result.missing
+        rebuilt = None
+        if missing is not None and missing.kind == "theory":
+            rebuilt = await conn.scalar(
+                sa.text("SELECT theory FROM actions WHERE batch_id = :batch_id AND input_key = :input_key"),
+                {"batch_id": batch_id, "input_key": missing.key},
             )
-            return
-        await conn.execute(
-            sa.text(
-                "INSERT INTO edges (batch_id, input_key, parent_key) VALUES (:batch_id, :input_key, :missing) "
-                "ON CONFLICT DO NOTHING"
-            ),
-            {"batch_id": batch_id, "input_key": input_key, "missing": missing},
-        )
-        await self._set_state(conn, batch_id, input_key, "waiting")
-        await self._requeue(conn, batch_id, missing)
+        if attempts >= self.settings.max_attempts:
+            what = rebuilt or (f"{missing.kind} {missing.key}" if missing else "an input")
+            await self._fail_batch(
+                conn, batch_id, input_key, f"resubmit: {theory} is still missing {what} after {attempts} attempts"
+            )
+        elif rebuilt is not None and missing is not None:
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO edges (batch_id, input_key, parent_key) VALUES (:batch_id, :input_key, :missing) "
+                    "ON CONFLICT DO NOTHING"
+                ),
+                {"batch_id": batch_id, "input_key": input_key, "missing": missing.key},
+            )
+            await self._set_state(conn, batch_id, input_key, "waiting")
+            await self._requeue(conn, batch_id, missing.key)
+        else:
+            await self._retry(conn, batch_id, input_key)
 
     async def _requeue(self, conn: AsyncConnection, batch_id: UUID, input_key: str) -> None:
         await conn.execute(
@@ -660,14 +685,15 @@ class Coordinator:
 
     async def _fail_batch(self, conn: AsyncConnection, batch_id: UUID, input_key: str, failure: str) -> None:
         """Fail ``input_key`` finally and with it the batch; its other unfinished actions are cancelled."""
-        await conn.execute(
-            sa.text("UPDATE batches SET state = 'failed', failure = :failure WHERE id = :id"),
-            {"id": batch_id, "failure": failure},
-        )
         await self._set_state(conn, batch_id, input_key, "failed")
-        await self._stop_actions(conn, batch_id)
+        await self._end_batch(conn, batch_id, "failed", failure)
 
-    async def _stop_actions(self, conn: AsyncConnection, batch_id: UUID) -> None:
+    async def _end_batch(self, conn: AsyncConnection, batch_id: UUID, state: str, failure: str | None) -> None:
+        """Give a running batch its final state; its unfinished actions are cancelled and their leases revoked."""
+        await conn.execute(
+            sa.text("UPDATE batches SET state = :state, failure = :failure WHERE id = :id"),
+            {"id": batch_id, "state": state, "failure": failure},
+        )
         await conn.execute(
             sa.text(
                 "UPDATE actions SET state = 'cancelled' "

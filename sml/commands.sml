@@ -1173,14 +1173,33 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           if remote_only orelse detach then raise Error ("remote execution: " ^ reason)
           else (HolbuildBuildExec.warn ("remote execution: " ^ reason ^ "; building locally");
                 build_locally ())
+        fun finished {built, total} =
+          if total = 0 then "the coordinator reported no theories"
+          else "remote workers finished " ^ Int.toString built ^ " of " ^ Int.toString total ^ " theories"
+        (* A batch the build stops following to build locally is cancelled
+           (a finished one is left as it is); a --remote-only build fails
+           instead, and says how to reattach when the batch may still run. *)
+        fun abandon batch_id reason =
+          if remote_only then fall_back reason
+          else if HolbuildRemoteExec.cancel url batch_id then fall_back (reason ^ ", cancelled the batch")
+          else fall_back reason
         fun finish batch_id =
           case HolbuildRemoteExec.follow url batch_id of
-              HolbuildRemoteExec.Done => build_locally ()
-            | HolbuildRemoteExec.Failed reason => fall_back ("batch " ^ batch_id ^ " " ^ reason)
-            | HolbuildRemoteExec.Unreachable reason =>
-                fall_back (reason ^ "; reattach with --attach " ^ batch_id)
+              (HolbuildRemoteExec.Done, progress) =>
+                (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ finished progress ^ "\n");
+                 build_locally ())
+            | (HolbuildRemoteExec.Failed reason, progress) =>
+                fall_back ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress)
+            | (HolbuildRemoteExec.Unfollowable reason, progress) =>
+                abandon batch_id ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress)
+            | (HolbuildRemoteExec.Unreachable reason, progress) =>
+                if remote_only
+                then fall_back (reason ^ "; " ^ finished progress ^ "; reattach with --attach " ^ batch_id)
+                else abandon batch_id (reason ^ "; " ^ finished progress)
         fun submit batch =
-          if not (has_actions batch) then build_locally ()
+          if not (has_actions batch) then
+            (HolbuildStatus.message_stderr "holbuild: remote execution: the remote cache has every theory\n";
+             build_locally ())
           else
             case HolbuildRemoteExec.submit url batch of
                 HolbuildRemoteExec.Refused reason => fall_back reason
