@@ -475,6 +475,7 @@ fun blob_present cache sha256 =
         SOME (HolbuildHttp.Response 404) => false
       | _ => true
   end
+  handle _ => true
 
 fun verify_downloaded_blob path ({sha256, size} : blob_entry) =
   if Position.toString (FS.fileSize path) <> size then

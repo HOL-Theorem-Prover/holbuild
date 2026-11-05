@@ -165,8 +165,9 @@ ac_a=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key_a" | sha256sum | cut -d' ' -f1
 blob_a=$(awk '$1 == "blob" { print $2; exit }' "$remote_root/ac/$ac_a")
 [[ -n "$blob_a" ]] || { cat "$remote_root/ac/$ac_a" >&2; exit 1; }
 mv "$remote_root/cas/$blob_a" "$tmpdir/blob-a"
-hb action-spec CTheory > "$tmpdir/batch-expired.txt"
+hb action-spec CTheory > "$tmpdir/batch-expired.txt" 2> "$tmpdir/batch-expired.err"
 [[ $(grep -c '^action' "$tmpdir/batch-expired.txt") -eq 3 ]] || { cat "$tmpdir/batch-expired.txt" >&2; exit 1; }
+if grep -q "using the curl command" "$tmpdir/batch-expired.err"; then cat "$tmpdir/batch-expired.err" >&2; exit 1; fi
 HOLBUILD_TEST_LIBCURL=libholbuild-test-no-such-curl.so hb action-spec CTheory > "$tmpdir/batch-expired-cli.txt"
 [[ $(grep -c '^action' "$tmpdir/batch-expired-cli.txt") -eq 3 ]] || { cat "$tmpdir/batch-expired-cli.txt" >&2; exit 1; }
 mv "$tmpdir/blob-a" "$remote_root/cas/$blob_a"
