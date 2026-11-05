@@ -811,8 +811,32 @@ Important paths:
 ```text
 .holbuild/src/<package>               # dependency source checkouts
 .holbuild/packages/<package>          # package build artefacts
+.holbuild/plan/<fingerprint>          # plan records
 $HOLBUILD_CACHE/hol-toolchains/       # built HOL toolchains and analysers
 ```
+
+### The plan record
+
+Planning a build discovers every source, analyses its dependencies and
+computes every action key. After it plans, holbuild writes what it found to
+a plan record in `.holbuild/plan/`, and the next build with the same
+non-file inputs (holbuild version, working directory, command line,
+`HOLBUILD_*` environment, manifests and `.holconfig.toml`, package roots)
+starts from it: it checks each recorded file and directory with `stat`,
+hashes again only the files whose size, modification time, change time or
+inode moved (and any recorded within a second of its last change), analyses
+again the sources whose content changed, and recomputes the keys of those
+nodes and everything that depends on them. A source or directory added,
+removed, renamed or made readable, or a changed dependency, sends the build
+back to full planning. So does a build whose targets leave out a root with
+its own tactic timeout, and a project with `[[generate]]` steps or with
+theories that write SML sources, for which no record is kept; `--watch`
+always plans in full. The four newest records are kept.
+
+`--verbose` prints which way a build planned and why, and the timing log has
+a `plan.record` phase. `HOLBUILD_PLAN_RECORD=off` turns the record off;
+`HOLBUILD_PLAN_RECORD=check` plans in full as well, and fails the build if
+the two plans differ in any source, dependency edge, fact or key.
 
 The global build cache stores selected semantic artefacts such as `Theory.sig`,
 `Theory.sml`, `Theory.dat`, and tracing-kernel `Theory.tr.gz` files by action
@@ -1290,6 +1314,10 @@ Repository tests resolve the schema 2 HOL toolchain cache automatically:
 ```sh
 make test
 ```
+
+The runner sets `HOLBUILD_PLAN_RECORD=check` unless it is already set, so
+every build in the suite that plans from a plan record is also checked
+against full planning.
 
 To reuse an explicit checkout instead, pass `HOLDIR=/path/to/built/HOL`. By
 default the checkout must be at the revision recorded in `vendor/hol/REV`.

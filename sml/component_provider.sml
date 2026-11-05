@@ -135,9 +135,33 @@ fun lookup key entries = Binarymap.peek(entries, key)
 fun analysis_key (source : HolbuildSourceIndex.source) =
   #package source ^ "\000" ^ HolbuildSourceIndex.source_id source
 
+(* The analysis an earlier planning run made, as the plan record kept it:
+   each analysed source with its content hash and dependency facts. *)
+fun restored_analysis_state preparation entries : analysis_state =
+  let
+    fun add ((source, hash, deps), (hashes, analyses)) =
+      let val key = analysis_key source
+      in
+        (Binarymap.insert(hashes, key, hash),
+         Binarymap.insert(analyses, key,
+           {node_id = HolbuildSourceIndex.source_id source, source_hash = hash,
+            symbolic_dependencies = deps}))
+      end
+    val (hashes, analyses) =
+      List.foldl add (Binarymap.mkDict String.compare, Binarymap.mkDict String.compare) entries
+  in
+    {provider = LiveProvider, preparation = preparation,
+     hashes = ref hashes, analyses = ref analyses}
+  end
+
 fun ensure_output ({preparation, ...} : analysis_state)
                   (source : HolbuildSourceIndex.source) relative_path =
   HolbuildPackagePrepare.ensure_output preparation (#package source) relative_path
+
+(* Whether planning may run generators, which can rewrite files planning
+   has already read. *)
+fun runs_generators ({preparation, ...} : analysis_state) =
+  HolbuildPackagePrepare.requires_live_preparation preparation
 
 fun ensure_extra_input state (source : HolbuildSourceIndex.source) base relative_path =
   let

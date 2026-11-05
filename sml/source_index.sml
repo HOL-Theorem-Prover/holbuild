@@ -65,7 +65,14 @@ fun drop_suffix suffix s =
   if has_suffix suffix s then String.substring(s, 0, size s - size suffix)
   else raise Error ("expected suffix " ^ suffix ^ " in " ^ s)
 
-fun join root rel = if rel = "" then root else Path.concat(root, rel)
+(* Path.concat, without its parse and rebuild of both paths when ROOT is
+   non-empty and REL relative: discovery and the plan record join paths for
+   every source. *)
+fun join root rel =
+  if rel = "" then root
+  else if root = "" orelse String.isPrefix "/" rel then Path.concat(root, rel)
+  else if String.isSuffix "/" root then root ^ rel
+  else root ^ "/" ^ rel
 
 fun normalize_path path = Path.mkCanonical path handle Path.InvalidArc => path
 
@@ -138,29 +145,28 @@ fun source_node_id package_id kind origin logical_name relative_path (canonical_
        framed_list "objects" (#objects canonical_artifacts) @
        framed_list "theory_data" (#theory_data canonical_artifacts)))
 
-fun make_source package package_id package_root policies generated_paths kind logical_name source_path relative_path artifacts =
+fun source_origin generated_paths relative_path =
+  if List.exists (fn path => path = relative_path) generated_paths then
+    GeneratedSource
+  else DeclaredSource
+
+fun canonical_artifacts_for kind logical_name relative_path =
+  case kind of
+      TheoryScript => theory_artifacts "" relative_path logical_name
+    | Sml => sml_artifacts "" relative_path
+    | Sig => sig_artifacts "" relative_path
+
+fun source_with_ids package package_id package_root policy origin kind logical_name source_path relative_path artifacts
+                    {id, policy_id, execution_policy_id} =
   let
-    val origin =
-      if List.exists (fn path => path = relative_path) generated_paths then
-        GeneratedSource
-      else DeclaredSource
-    val policy = HolbuildProject.action_policy_for policies logical_name
-    val canonical_artifacts =
-      case kind of
-          TheoryScript => theory_artifacts "" relative_path logical_name
-        | Sml => sml_artifacts "" relative_path
-        | Sig => sig_artifacts "" relative_path
-    val policy_id = HolbuildHash.string_sha256 (policy_render policy)
-    val execution_policy_id =
-      HolbuildHash.string_sha256 (execution_policy_render policy)
     val node =
-      {id = source_node_id package_id kind origin logical_name relative_path canonical_artifacts policy_id,
+      {id = id,
        package_id = package_id,
        relative_path = relative_path,
        logical_name = logical_name,
        kind = kind,
        origin = origin,
-       canonical_artifacts = canonical_artifacts,
+       canonical_artifacts = canonical_artifacts_for kind logical_name relative_path,
        policy_id = policy_id,
        execution_policy_id = execution_policy_id,
        policy = policy}
@@ -174,6 +180,38 @@ fun make_source package package_id package_root policies generated_paths kind lo
      relative_path = relative_path,
      artifacts = artifacts,
      policy = policy}
+  end
+
+fun make_source package package_id package_root policies generated_paths kind logical_name source_path relative_path artifacts =
+  let
+    val origin = source_origin generated_paths relative_path
+    val policy = HolbuildProject.action_policy_for policies logical_name
+    val policy_id = HolbuildHash.string_sha256 (policy_render policy)
+    val ids =
+      {id = source_node_id package_id kind origin logical_name relative_path
+              (canonical_artifacts_for kind logical_name relative_path) policy_id,
+       policy_id = policy_id,
+       execution_policy_id = HolbuildHash.string_sha256 (execution_policy_render policy)}
+  in
+    source_with_ids package package_id package_root policy origin kind logical_name source_path relative_path artifacts ids
+  end
+
+(* A source an earlier discovery found, rebuilt from the identities the plan
+   record kept instead of hashing them again. *)
+fun restore_source package package_id {kind, logical_name, source_path, relative_path, ids} =
+  let
+    val artifact_root = HolbuildProject.package_artifact_root package
+    val generated_paths =
+      List.concat (map HolbuildProject.generator_outputs (HolbuildProject.package_generators package))
+    val artifacts =
+      case kind of
+          TheoryScript => theory_artifacts artifact_root relative_path logical_name
+        | Sml => sml_artifacts artifact_root relative_path
+        | Sig => sig_artifacts artifact_root relative_path
+  in
+    source_with_ids (HolbuildProject.package_name package) package_id (HolbuildProject.package_root package)
+      (HolbuildProject.action_policy_for (HolbuildProject.package_action_policies package) logical_name)
+      (source_origin generated_paths relative_path) kind logical_name source_path relative_path artifacts ids
   end
 
 fun generated_theory_artifact file =
@@ -276,22 +314,74 @@ fun scan_file package package_id source_root artifact_root policies generated_pa
       NONE => acc
     | SOME source => source :: acc
 
+fun source_or_manifest name =
+  has_suffix ".sml" name orelse has_suffix ".sig" name orelse
+  List.exists (fn manifest => manifest = name) HolbuildManifestUtil.manifest_filenames
+
+(* An entry of directory PATH whose appearance, disappearance, renaming or
+   change of kind can change what discovery finds, tagged with its kind: a
+   subdirectory discovery may walk (d), a source or a manifest that makes a
+   subdirectory a package of its own (f), or a link with such a name (l),
+   which discovery skips but a manifest search follows.  D and F mark
+   entries discovery skips because it cannot read them. *)
+fun classified_entry path name =
+  if String.isPrefix "." name then NONE
+  else
+    let val path' = join path name
+    in
+      if is_link path' then
+        if source_or_manifest name then SOME ("l" ^ name) else NONE
+      else if is_dir path' then
+        if name = "_build" then NONE
+        else SOME ((if is_readable path' then "d" else "D") ^ name)
+      else if source_or_manifest name then SOME ((if is_readable path' then "f" else "F") ^ name)
+      else NONE
+    end
+
+(* Sorted: the order readDir lists entries in can change with the entries. *)
+fun classified_names path names = sort_unique_strings (List.mapPartial (classified_entry path) names)
+
+fun classified_entries path = classified_names path (list_dir path)
+
+(* Making an entry readable changes no directory's stat. *)
+fun unreadable_entry entry = String.isPrefix "D" entry orelse String.isPrefix "F" entry
+fun entry_name entry = String.extract (entry, 1, NONE)
+
+(* The directories discovery listed, each with its stat taken before the
+   listing and its classified entries, so a later run can tell from a stat
+   whether discovery would find the same sources.  Subdirectories discovery
+   skips because they hold a manifest are listed too: removing the manifest
+   would make discovery walk them. *)
+val observed_dirs : (string * HolbuildStatCache.ident option * string list) list ref = ref []
+
+fun observe_dir path stamp entries = observed_dirs := (path, stamp, entries) :: !observed_dirs
+
+fun observe_boundary_dir path =
+  let val stamp = HolbuildStatCache.stat_ident path
+  in observe_dir path stamp (classified_entries path) end
+  handle Error _ => ()
+
 fun scan_dir package package_id source_root artifact_root policies generated_paths excludes exclude_globs path acc =
   let
+    val stamp = HolbuildStatCache.stat_ident path
     fun scan_name (name, acc) =
       let val path' = join path name
       in
         if is_link path' then acc
         else if is_dir path' then
-          if skip_dir name orelse not (is_readable path') orelse contains_manifest path' orelse
-             excluded excludes exclude_globs (relative_path source_root path') then acc
+          if skip_dir name orelse not (is_readable path') then acc
+          else if contains_manifest path' then (observe_boundary_dir path'; acc)
+          else if excluded excludes exclude_globs (relative_path source_root path') then acc
           else scan_dir package package_id source_root artifact_root policies generated_paths excludes exclude_globs path' acc
         else if String.isPrefix "." name then acc
         else if is_readable path' then scan_file package package_id source_root artifact_root policies generated_paths excludes exclude_globs path' acc
         else acc
       end
+    val names = list_dir_if_readable path
+    val result = List.foldl scan_name acc names
   in
-    List.foldl scan_name acc (list_dir_if_readable path)
+    observe_dir path stamp (classified_names path names);
+    result
   end
 
 fun compare_source (a : source, b : source) =
@@ -444,7 +534,8 @@ fun prevalidate_package package =
 
 (* Scans of the packages discovery may reuse, keyed by scan_key. *)
 fun prevalidate_graph graph =
-  List.mapPartial prevalidate_package (HolbuildProjectGraph.packages graph)
+  (observed_dirs := [];
+   List.mapPartial prevalidate_package (HolbuildProjectGraph.packages graph))
 
 fun deduplicate_sources sources =
   let
