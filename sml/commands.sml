@@ -1189,6 +1189,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ finished progress ^ "\n");
                  build_locally ())
             | (HolbuildRemoteExec.Failed reason, progress) =>
+                fall_back ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress)
+            | (HolbuildRemoteExec.Unfollowable reason, progress) =>
                 abandon batch_id ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress)
             | (HolbuildRemoteExec.Unreachable reason, progress) =>
                 if remote_only

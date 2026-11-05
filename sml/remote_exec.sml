@@ -13,6 +13,7 @@ datatype attempt = Ok of string | Refused of string
 
 datatype outcome = Done
                  | Failed of string       (* the batch failed or was cancelled *)
+                 | Unfollowable of string (* the coordinator won't stream it; it may still run *)
                  | Unreachable of string  (* the coordinator couldn't be asked *)
 
 (* How many of a batch's actions are done, of how many, as its events last
@@ -176,7 +177,7 @@ fun follow url batch_id : outcome * progress =
         case !outcome of
             SOME outcome => outcome
           | NONE =>
-              if not broken then Failed ("can't be followed (HTTP " ^ Int.toString status ^ "): " ^ text)
+              if not broken then Unfollowable ("can't be followed (HTTP " ^ Int.toString status ^ "): " ^ text)
               else if !received then again 1 reattach_delays_seconds
               else
                 case delays of

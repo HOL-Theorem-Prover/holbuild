@@ -1141,8 +1141,9 @@ The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the
 batch, or the batch fails, it warns and builds locally. An event stream that
 breaks is reattached; one that stays unreachable through four reattaches
-(about 15 seconds of backoff) is given up on, and the build cancels the batch
-before building locally. With
+(about 15 seconds of backoff) is given up on. When the build stops following
+a batch that may still run (the stream was given up on, or the coordinator
+won't stream it), it cancels the batch before building locally. With
 `--remote-only` it fails instead, and it never builds HOL or a theory
 locally: a HOL toolchain or a theory that doesn't restore from a cache is an
 error. With nothing to build remotely it says so and goes straight to the
