@@ -1341,13 +1341,19 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                    if detach then () else finish batch_id)
         (* A theory that writes SML sources runs before the rest of the build
            is planned (execute_build), which neither a batch nor the restore
-           build of this plan does. *)
+           build of this plan does.  Under --remote-only, execute_build only
+           restores (restore_only). *)
         val writes_sources = not (null (HolbuildBuildPlan.generated_source_owners plan))
         val reason = "theories that write SML sources build before the rest is planned"
       in
-        if writes_sources andalso (remote_only orelse detach) then raise Error ("remote execution: " ^ reason)
+        if writes_sources andalso detach then raise Error ("remote execution: " ^ reason)
+        else if writes_sources andalso remote_only then
+          (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "; restoring from the cache\n");
+           execute_build ())
         else if writes_sources then
-          (HolbuildBuildExec.warn ("remote execution: " ^ reason ^ "; building locally"); execute_build ())
+          (HolbuildBuildExec.warn ("remote execution: " ^ reason ^ "; building locally");
+           Option.app (fn batch_id => ignore (HolbuildRemoteExec.cancel url batch_id)) attach;
+           execute_build ())
         else
           case attach of
               SOME batch_id => finish batch_id
