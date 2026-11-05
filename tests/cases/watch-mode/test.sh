@@ -24,8 +24,11 @@ command -v inotifywait >/dev/null || {
   exit 1
 }
 
-project=$tmpdir/.dot/project
-mkdir -p "$project/src"
+# Ancestors named like directories the watch skips (_build, .holbuild, .git)
+# must not hide the project from it, and other dot-directories are watched
+# (lib/.hidden is a member).
+project=$tmpdir/_build/.dot/project
+mkdir -p "$project/src" "$project/lib/.hidden"
 write_project_file() {
   cat > "$project/holproject.toml" <<TOML
 $(write_schema2_prelude)
@@ -33,7 +36,7 @@ $(write_schema2_prelude)
 name = "watch-mode"
 
 [build]
-members = ["src"]
+members = ["src", "lib", "lib/.hidden"]
 TOML
 }
 
@@ -138,6 +141,9 @@ wait_for_exit() {
 
 write_project_file
 write_good_source
+# holbuild's own directories below a watched one: writes there must
+# not trigger a rebuild.
+mkdir -p "$project/src/.holbuild" "$project/src/_build"
 watch_log=$tmpdir/watch.log
 (trap - INT; cd "$project" && exec "$WATCH_HOLBUILD_BIN" build --watch ATheory) >"$watch_log" 2>&1 &
 watch_pid=$!
@@ -147,6 +153,16 @@ sleep 2
 stable_count=$(grep -c -- "waiting for changes" "$watch_log" 2>/dev/null || true)
 if [[ "$stable_count" -ne 1 ]]; then
   echo "watch mode retriggered without source changes" >&2
+  cat "$watch_log" >&2
+  exit 1
+fi
+
+echo "noise" > "$project/src/.holbuild/noise"
+echo "noise" > "$project/src/_build/noise"
+sleep 2
+skipped_count=$(grep -c -- "waiting for changes" "$watch_log" 2>/dev/null || true)
+if [[ "$skipped_count" -ne 1 ]]; then
+  echo "watch mode rebuilt after writes in skipped directories" >&2
   cat "$watch_log" >&2
   exit 1
 fi
@@ -185,6 +201,13 @@ sleep 1
 
 rm "$project/holbuild.toml"
 wait_for_count "waiting for changes" "$watch_log" 9 45
+sleep 1
+
+cat > "$project/lib/.hidden/BScript.sml" <<'SML'
+Theory B
+Ancestors bool
+SML
+wait_for_count "waiting for changes" "$watch_log" 10 45
 
 kill -INT "$watch_pid"
 wait_for_exit "$watch_pid" 10
