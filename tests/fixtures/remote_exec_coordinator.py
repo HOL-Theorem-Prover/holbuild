@@ -8,9 +8,9 @@ event: done when RUN exits 0, failed otherwise.  Each action is reported
 running twice first, as a coordinator repeats unchanged states.  Control
 files in STATE change the answers: `refuse` makes POST answer 400, `drop`
 ends the next event stream before the final event (and is removed), `down`
-makes the event stream answer 503, `skip` reports the batch done without
-running RUN.  POST /v1/batches/<id>/cancel answers 200.  Every request is
-logged to STATE/requests.log.
+makes the event stream and POST /v1/batches/<id>/cancel answer 503, `skip`
+reports the batch done without running RUN.  Otherwise the cancel answers
+200.  Every request is logged to STATE/requests.log.
 """
 
 import json
@@ -43,6 +43,8 @@ class Handler(BaseHTTPRequestHandler):
         self.log_request_line()
         body = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
         if self.path.startswith("/v1/batches/") and self.path.endswith("/cancel"):
+            if (state / "down").exists():
+                return self.answer(503, {"detail": "restarting"})
             return self.answer(200, {"state": "cancelled"})
         if self.path != "/v1/batches":
             return self.answer(404, {"detail": "Not Found"})

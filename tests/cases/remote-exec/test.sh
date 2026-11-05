@@ -167,7 +167,7 @@ require_grep "BTheory built" "$tmpdir/refused.log"
 rm "$state/refuse"
 
 # A dropped stream is reattached; one that stays down is given up on, and
-# the batch cancelled.
+# the batch cancelled if the coordinator answers.
 write_theories five
 touch "$state/drop"
 run dropped 0 build --remote-exec "$coordinator" BTheory
@@ -180,9 +180,13 @@ touch "$state/down"
 run down 0 build --remote-exec "$coordinator" BTheory
 [[ $(grep -c "answered HTTP 503 to the event stream for batch b4.*; reattaching" "$tmpdir/down.log") -eq 4 ]] ||
   { cat "$tmpdir/down.log" >&2; exit 1; }
-require_grep "the coordinator reported no theories, cancelled the batch; building locally" "$tmpdir/down.log"
-require_grep "^POST /v1/batches/b4/cancel " "$state/requests.log"
+require_grep "could not cancel remote batch b4 (HTTP 503)" "$tmpdir/down.log"
+require_grep "the coordinator reported no theories; building locally" "$tmpdir/down.log"
 require_grep "BTheory built" "$tmpdir/down.log"
+write_theories five-down-only
+run down-only 1 build --remote-exec "$coordinator" --remote-only BTheory
+require_grep "the coordinator reported no theories; reattach with --attach b5" "$tmpdir/down-only.log"
+refute_grep "^POST /v1/batches/b5/cancel " "$state/requests.log"
 rm "$state/down"
 run unknown-only 1 build --remote-exec "$coordinator" --remote-only --attach nope BTheory
 require_grep "batch nope can't be followed (HTTP 404): .*no such batch" "$tmpdir/unknown-only.log"
@@ -202,10 +206,11 @@ write_theories six
 touch "$state/fail"
 run failed-only 1 build --remote-exec "$coordinator" --remote-only BTheory
 require_grep "remote rx:ATheory: failed (proof)" "$tmpdir/failed-only.log"
-require_grep "remote execution: batch b6 failed: an action failed; remote workers finished 0 of 2 theories" "$tmpdir/failed-only.log"
+require_grep "remote execution: batch b7 failed: an action failed; remote workers finished 0 of 2 theories" "$tmpdir/failed-only.log"
 run failed 0 build --remote-exec "$coordinator" BTheory
+require_grep "remote workers finished 0 of 2 theories, cancelled the batch; building locally" "$tmpdir/failed.log"
 require_grep "BTheory built" "$tmpdir/failed.log"
-require_grep "^POST /v1/batches/b7/cancel " "$state/requests.log"
+require_grep "^POST /v1/batches/b8/cancel " "$state/requests.log"
 rm "$state/fail"
 
 # A closure that can't run remotely (a forced action) is built locally.

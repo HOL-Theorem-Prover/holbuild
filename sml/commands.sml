@@ -1181,7 +1181,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
            instead, and says how to reattach when the batch may still run. *)
         fun abandon batch_id reason =
           if remote_only then fall_back reason
-          else (HolbuildRemoteExec.cancel url batch_id; fall_back (reason ^ ", cancelled the batch"))
+          else if HolbuildRemoteExec.cancel url batch_id then fall_back (reason ^ ", cancelled the batch")
+          else fall_back reason
         fun finish batch_id =
           case HolbuildRemoteExec.follow url batch_id of
               (HolbuildRemoteExec.Done, progress) =>
@@ -1190,7 +1191,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             | (HolbuildRemoteExec.Failed reason, progress) =>
                 abandon batch_id ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress)
             | (HolbuildRemoteExec.Unreachable reason, progress) =>
-                if remote_only then fall_back (reason ^ "; reattach with --attach " ^ batch_id)
+                if remote_only
+                then fall_back (reason ^ "; " ^ finished progress ^ "; reattach with --attach " ^ batch_id)
                 else abandon batch_id (reason ^ "; " ^ finished progress)
         fun submit batch =
           if not (has_actions batch) then

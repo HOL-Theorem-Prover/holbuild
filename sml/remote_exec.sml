@@ -203,11 +203,13 @@ fun cancel url batch_id =
          stderr = HolbuildSpawn.Merge}
     val (lines, status) = split_status (#output result)
   in
-    if status >= 200 andalso status < 300 then ()
-    else HolbuildStatus.message_stderr
-           ("holbuild: warning: could not cancel remote batch " ^ batch_id ^
-            (if status = 0 then "" else " (HTTP " ^ Int.toString status ^ ")") ^
-            (case lines of [] => "" | _ => ": " ^ String.concatWith " " lines) ^ "\n")
+    if status >= 200 andalso status < 300 then true
+    else
+      (HolbuildStatus.message_stderr
+         ("holbuild: warning: could not cancel remote batch " ^ batch_id ^
+          (if status = 0 then "" else " (HTTP " ^ Int.toString status ^ ")") ^
+          (case lines of [] => "" | _ => ": " ^ String.concatWith " " lines) ^ "\n");
+       false)
   end
 
 end
