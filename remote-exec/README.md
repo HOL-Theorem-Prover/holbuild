@@ -54,6 +54,7 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_MAX_ATTEMPTS` | claims of one action before a retryable failure becomes final | 3 |
 | `REMOTE_EXEC_STANDARD_TIER_MB` | peak memory from which a theory goes to the high-memory tier | 16000 |
 | `REMOTE_EXEC_RETENTION_HOURS` | age after which a finished batch is deleted | 168 |
+| `REMOTE_EXEC_BATCH_DEADLINE_HOURS` | age at which a batch still running fails | 12 |
 | `REMOTE_EXEC_HINT_TTL_DAYS` | age after which an unused peak hint is deleted | 30 |
 | `REMOTE_EXEC_SWEEP_SECONDS` | period of the sweep (lease expiry, releases, retention, scaling) | 5 |
 | `REMOTE_EXEC_WARM_WORKERS` | always-on standard-tier workers | 0 |
@@ -136,11 +137,15 @@ finally (`failed`, with a `failure` message), or the client cancels it
   | `failure` | What happens |
   |---|---|
   | `memory` | on the standard tier, once more on the high-memory tier; on the high tier, final |
-  | `publish`, `toolchain` | retried, until the action has been claimed `MAX_ATTEMPTS` times |
+  | `publish`, `toolchain`, `internal` | retried, until the action has been claimed `MAX_ATTEMPTS` times |
   | `disk` | retried once; a second `disk` in a row, or `MAX_ATTEMPTS` claims, is final |
   | `input-missing` naming a theory of the batch | that theory is built again and the action waits for it, until the action has been claimed `MAX_ATTEMPTS` times |
-  | any other `input-missing` (a blob, or a theory cached at export) | the batch fails with `resubmit: …`; the client exports a new batch |
-  | `proof`, `tactic-timeout`, `spec-rejected`, `internal` | final |
+  | any other `input-missing` (a blob, or a theory cached at export) | retried, since a restore that fails on a network error reports its input missing too; after `MAX_ATTEMPTS` claims the batch fails with `resubmit: …`, and the client exports a new batch |
+  | `proof`, `tactic-timeout`, `spec-rejected` | final |
+
+  A worker whose `exec-action` ends without a result record (it crashed or
+  was killed) reports `internal` for it, so it is retried at once rather
+  than when its lease expires.
 
   A retried action waits again like a child, so it runs only once its
   parents' keys answer `HEAD /ac/` again (one may have been rebuilt
@@ -152,6 +157,10 @@ finally (`failed`, with a `failure` message), or the client cancels it
   the high-memory tier; with no hint it starts on the standard one. `profile`
   is the client's name for the run options it submitted the batch with, since
   they change how much memory a build takes.
+- **Deadline.** A batch still running `BATCH_DEADLINE_HOURS` after its
+  submission fails with `deadline: …`, so one that can't finish (a high-tier
+  action with no high-tier worker, a parent check the cache keeps refusing,
+  a client that went away) neither runs nor keeps workers busy forever.
 - **Retention.** The sweep deletes finished batches older than
   `RETENTION_HOURS`, at most 100 per statement, never a running one, and peak
   hints not used for `HINT_TTL_DAYS`.

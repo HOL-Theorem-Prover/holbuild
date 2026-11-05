@@ -1173,14 +1173,26 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           if remote_only orelse detach then raise Error ("remote execution: " ^ reason)
           else (HolbuildBuildExec.warn ("remote execution: " ^ reason ^ "; building locally");
                 build_locally ())
+        fun built {built, total} =
+          if total = 0 then "remote workers built nothing"
+          else "remote workers built " ^ Int.toString built ^ " of " ^ Int.toString total ^ " theories"
+        (* A batch the build stops following is cancelled, unless the build
+           fails instead and says how to reattach. *)
         fun finish batch_id =
           case HolbuildRemoteExec.follow url batch_id of
-              HolbuildRemoteExec.Done => build_locally ()
-            | HolbuildRemoteExec.Failed reason => fall_back ("batch " ^ batch_id ^ " " ^ reason)
-            | HolbuildRemoteExec.Unreachable reason =>
-                fall_back (reason ^ "; reattach with --attach " ^ batch_id)
+              (HolbuildRemoteExec.Done, progress) =>
+                (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ built progress ^ "\n");
+                 build_locally ())
+            | (HolbuildRemoteExec.Failed reason, progress) =>
+                fall_back ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ built progress)
+            | (HolbuildRemoteExec.Unreachable reason, progress) =>
+                if remote_only then fall_back (reason ^ "; reattach with --attach " ^ batch_id)
+                else (HolbuildRemoteExec.cancel url batch_id;
+                      fall_back (reason ^ "; " ^ built progress ^ ", cancelled the batch"))
         fun submit batch =
-          if not (has_actions batch) then build_locally ()
+          if not (has_actions batch) then
+            (HolbuildStatus.message_stderr "holbuild: remote execution: the remote cache has every theory\n";
+             build_locally ())
           else
             case HolbuildRemoteExec.submit url batch of
                 HolbuildRemoteExec.Refused reason => fall_back reason

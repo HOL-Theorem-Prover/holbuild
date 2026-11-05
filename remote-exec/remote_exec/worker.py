@@ -204,9 +204,10 @@ class Releases:
             pass
 
 
-def rejected_record(spec_sha256: str) -> str:
-    """The result record of an action the worker won't run, which fails it finally like exec-action's own."""
-    return f"holbuild-action-result-v1\nspec={spec_sha256}\ninput-key=\nstatus=failed\nfailure=spec-rejected\n"
+def failed_record(spec_sha256: str, failure: str) -> str:
+    """A result record the worker writes itself: ``spec-rejected`` for an action it won't run, which fails it
+    finally like exec-action's own, or ``internal`` for one exec-action ended without a record, which is retried."""
+    return f"holbuild-action-result-v1\nspec={spec_sha256}\ninput-key=\nstatus=failed\nfailure={failure}\n"
 
 
 def exec_action_command(args: argparse.Namespace, holbuild: str, spec: str, result: str) -> list[str]:
@@ -274,7 +275,7 @@ def run_one(
             holbuild = releases.holbuild(releases.spec_version(spec))
         except Unreleased as error:
             print(f"refusing {spec}: {error}", file=sys.stderr)
-            coordinator.complete(token, rejected_record(spec))
+            coordinator.complete(token, failed_record(spec, "spec-rejected"))
             return
         if lease.lost.is_set():
             return
@@ -293,8 +294,9 @@ def run_one(
                     os.killpg(process.pid, signal.SIGTERM)
                 process.wait()
             if not os.path.exists(result) or os.path.getsize(result) == 0:
-                # No record to report; the lease expires and the coordinator retries the action.
+                # It crashed or was killed; the coordinator retries the action now rather than when the lease expires.
                 print(f"exec-action exited {process.returncode} without a result record", file=sys.stderr)
+                coordinator.complete(token, failed_record(spec, "internal"))
                 return
             with open(result) as file:
                 coordinator.complete(token, file.read())
