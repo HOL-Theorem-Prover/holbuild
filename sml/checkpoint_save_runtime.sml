@@ -45,8 +45,8 @@ fun write_text_atomically path text =
 
    Removing the old file before saveChild writes is also a contract that
    exec-action --share-heaps relies on: an action's checkpoint tree holds hard
-   links to the host's shared store, and a save that wrote into an existing
-   file would rewrite the store's copy, and every other action's. *)
+   or symbolic links to the host's shared store, and a save that wrote into an
+   existing file would rewrite the store's copy, and every other action's. *)
 fun begin_replacement path =
   (remove_file (ok_tmp_path path);
    remove_file (ok_path path);

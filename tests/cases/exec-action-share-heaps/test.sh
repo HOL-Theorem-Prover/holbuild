@@ -13,7 +13,9 @@ source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
 server_pids=()
+other_fs=""
 cleanup() {
+  [[ -z "$other_fs" ]] || rm -rf "$other_fs"
   for pid in ${server_pids[@]+"${server_pids[@]}"}; do
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -263,3 +265,23 @@ worker v9 "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v9 0 "status=built"
 resumed v9 "theorem-context checkpoint after t4" "theorem_context checkpoint"
 same_outputs v9
+
+# A store on another file system than the action's checkpoints, as a store
+# on its own mount is: hard links fail there, so the worker links the
+# store's states symbolically, and resumes from them.
+if [[ -d /dev/shm && -w /dev/shm && $(stat -c %d /dev/shm) != $(stat -c %d "$tmpdir") ]]; then
+  other_fs=$(mktemp -d /dev/shm/holbuild-share-heaps.XXXXXX)
+  write_t "T \\/ F" "rw[]" "ACCEPT_TAC TRUTH" "MATCH_ACCEPT_TAC TRUTH"
+  export_t v10
+  cold v10 0
+  forget_local
+  mkdir -p "$shared"
+  ln -s "$other_fs" "$shared/checkpoint-store"
+  worker v10 "$shared_url" "$shared" "$spec_t" --share-heaps
+  expect v10 0 "status=built"
+  require_grep "the checkpoint store is on another file system; linking its states symbolically" "$tmpdir/v10.log"
+  resumed v10 "theorem-context checkpoint after t4" "theorem_context checkpoint"
+  same_outputs v10
+else
+  echo "skipping the cross-file-system store: no /dev/shm on another file system"
+fi

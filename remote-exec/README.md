@@ -138,7 +138,7 @@ finally (`failed`, with a `failure` message), or the client cancels it
 
   | `failure` | What happens |
   |---|---|
-  | `memory` | on the standard tier, once more on the high-memory tier; on the high tier, final |
+  | `memory` | on the standard tier, retried on the high-memory tier; on the high tier, retried there, until the action has been claimed `MAX_ATTEMPTS` times |
   | `publish`, `toolchain`, `internal` | retried, until the action has been claimed `MAX_ATTEMPTS` times |
   | `disk` | retried once; a second `disk` in a row, or `MAX_ATTEMPTS` claims, is final |
   | `input-missing` naming a theory of the batch | that theory is built again and the action waits for it, until the action has been claimed `MAX_ATTEMPTS` times |
@@ -152,9 +152,13 @@ finally (`failed`, with a `failure` message), or the client cancels it
   A retried action waits again like a child, so it runs only once the cache
   holds its parents again (one may have been rebuilt meanwhile); an expired lease is retried the same way. A final failure fails
   the batch and cancels its unfinished actions.
-- **Placement.** Each built result's `peak-rss-mb` is stored as a hint for
-  `(package, theory, profile)`; a memory failure on the standard tier stores
-  `STANDARD_TIER_MB`. A theory whose hint reaches `STANDARD_TIER_MB` starts on
+- **Placement.** Each built result's `peak-rss-mb` raises the hint for
+  `(package, theory, profile)`, and a memory failure on the standard tier
+  raises it to `STANDARD_TIER_MB`; a run that takes less never lowers it,
+  since on a host without hard per-container memory limits a quiet run says
+  little. A theory moved to the high-memory tier so stays there while it is
+  built at least every `HINT_TTL_DAYS`; a memory failure on the high tier is
+  retried, so one caused by a neighbour doesn't fail the batch. A theory whose hint reaches `STANDARD_TIER_MB` starts on
   the high-memory tier; with no hint it starts on the standard one. `profile`
   is the client's name for the run options it submitted the batch with, since
   they change how much memory a build takes.

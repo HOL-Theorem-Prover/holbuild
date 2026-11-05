@@ -1112,10 +1112,13 @@ the host store `<cache root>/checkpoint-store` keeps the shared files, one
 directory per heap, which the cache cap evicts as a unit, unless an action
 on the host is using it. Worker containers on one host can share
 `checkpoint-store/` and `hol-toolchains/`, mounted from host directories, and
-keep the rest of the cache root to themselves. A restored file is hard-linked
-from the store when the store and `checkpoints/` are on one mount, and copied
-otherwise. A bind mount counts as another mount even on the same filesystem,
-so in that layout restores copy: the store still saves downloads, not disk.
+keep the rest of the cache root to themselves. A restored Poly/ML state is
+hard-linked from the store when the store and `checkpoints/` are on one
+mount, and otherwise symbolically linked, which the action's lease on the
+heap's directory keeps valid until it exits; a bind mount counts as another
+mount even on the same filesystem. The small records beside the states are
+copied, and so are the files an action adds to the store when the store is
+on another mount, since its own tree is emptied after it.
 
 ### Building on remote workers
 

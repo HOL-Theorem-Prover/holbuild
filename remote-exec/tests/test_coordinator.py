@@ -257,7 +257,9 @@ async def test_unknown_token_and_mismatched_result_are_refused(http: httpx.Async
     assert (await http.post(f"/v1/work/{uuid4()}/heartbeat", headers=WORKER)).status_code == 409
 
 
-async def test_memory_failure_retries_once_on_the_high_tier_and_records_the_hint(http: httpx.AsyncClient) -> None:
+async def test_memory_failure_moves_to_the_high_tier_and_retries_up_to_max_attempts(
+    http: httpx.AsyncClient, cache: FakeCache
+) -> None:
     batch_id = await submit(http, ["a"])
     token = await claim_named(http, "a")
     assert (await complete(http, token, result("a", "failed", "memory"))).status_code == 200
@@ -265,10 +267,19 @@ async def test_memory_failure_retries_once_on_the_high_tier_and_records_the_hint
     assert await claim(http, "standard") is None
     token = await claim_named(http, "a", "high")
     assert (await complete(http, token, result("a", "failed", "memory"))).status_code == 200
+    assert await states(http, batch_id) == {"a": "ready"}
+    token = await claim_named(http, "a", "high")
+    assert (await complete(http, token, result("a", "failed", "memory"))).status_code == 200
     status = await batch(http, batch_id)
     assert (status["state"], status["failure"]) == ("failed", "pkg:a: memory")
 
-    # The next batch places the theory on the high tier from the start.
+    # The next batch places the theory on the high tier from the start, and a
+    # run that takes less memory doesn't lower the hint.
+    await submit(http, ["a"])
+    assert await claim(http, "standard") is None
+    token = await claim_named(http, "a", "high")
+    cache.keys.add(ac_key("a"))
+    assert (await complete(http, token, result("a", "built", peak_rss_mb="100"))).status_code == 200
     await submit(http, ["a"])
     assert await claim(http, "standard") is None
     await claim_named(http, "a", "high")
