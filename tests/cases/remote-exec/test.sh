@@ -372,9 +372,15 @@ SML
   > "$tmpdir/generated-only.log" 2>&1 && { cat "$tmpdir/generated-only.log" >&2; exit 1; }
 require_grep "remote execution: theories that write SML sources build before the rest is planned" "$tmpdir/generated-only.log"
 refute_grep "GenTheory built" "$tmpdir/generated-only.log"
+for flags in "--detach" "--remote-only --attach b1"; do
+  # shellcheck disable=SC2086
+  (cd "$generated" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" $flags UseLib) \
+    > "$tmpdir/generated-flags.log" 2>&1 && { cat "$tmpdir/generated-flags.log" >&2; exit 1; }
+  require_grep "remote execution: theories that write SML sources build before the rest is planned" "$tmpdir/generated-flags.log"
+done
 (cd "$generated" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" UseLib) \
   > "$tmpdir/generated.log" 2>&1 || { cat "$tmpdir/generated.log" >&2; exit 1; }
 require_grep "theories that write SML sources build before the rest is planned; building locally" "$tmpdir/generated.log"
 require_grep "GenTheory built" "$tmpdir/generated.log"
 require_grep "UseLib built" "$tmpdir/generated.log"
-refute_grep "^POST /v1/batches" "$state/requests.log"
+refute_grep "^POST /v1/batches\|^GET /v1/batches" "$state/requests.log"

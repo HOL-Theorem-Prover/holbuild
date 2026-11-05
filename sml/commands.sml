@@ -1339,24 +1339,23 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               | HolbuildRemoteExec.Ok batch_id =>
                   (HolbuildStatus.message_stderr ("holbuild: remote batch " ^ batch_id ^ "\n");
                    if detach then () else finish batch_id)
+        (* A theory that writes SML sources runs before the rest of the build
+           is planned (execute_build), which neither a batch nor the restore
+           build of this plan does. *)
+        val writes_sources = not (null (HolbuildBuildPlan.generated_source_owners plan))
+        val reason = "theories that write SML sources build before the rest is planned"
       in
-        case attach of
-            SOME batch_id => finish batch_id
-          | NONE =>
-              (* A theory that writes SML sources runs before the rest of the
-                 build is planned (execute_build), which a batch can't do. *)
-              if not (null (HolbuildBuildPlan.generated_source_owners plan)) then
-                let val reason = "theories that write SML sources build before the rest is planned"
-                in
-                  if remote_only orelse detach then raise Error ("remote execution: " ^ reason)
-                  else (HolbuildBuildExec.warn ("remote execution: " ^ reason ^ "; building locally");
-                        execute_build ())
-                end
-              else
-              (case HolbuildRemoteExec.Ok (export true)
-                    handle HolbuildBuildExec.Error reason => HolbuildRemoteExec.Refused reason of
-                   HolbuildRemoteExec.Ok batch => submit batch
-                 | HolbuildRemoteExec.Refused reason => fall_back reason)
+        if writes_sources andalso (remote_only orelse detach) then raise Error ("remote execution: " ^ reason)
+        else if writes_sources then
+          (HolbuildBuildExec.warn ("remote execution: " ^ reason ^ "; building locally"); execute_build ())
+        else
+          case attach of
+              SOME batch_id => finish batch_id
+            | NONE =>
+                (case HolbuildRemoteExec.Ok (export true)
+                      handle HolbuildBuildExec.Error reason => HolbuildRemoteExec.Refused reason of
+                     HolbuildRemoteExec.Ok batch => submit batch
+                   | HolbuildRemoteExec.Refused reason => fall_back reason)
       end
     fun run_with_stat_cache f =
       (f (); finish_stat_cache stat_cache)
