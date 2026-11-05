@@ -97,6 +97,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def do_HEAD(self):
+        self.record_request()
+        if not self.authorized():
+            return
+        path = self.object_path()
+        if path is None:
+            return
+        self.send_response(200 if path.is_file() else 404)
+        self.end_headers()
+
     def do_PUT(self):
         self.record_request()
         if not self.authorized():

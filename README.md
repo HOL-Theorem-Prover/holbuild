@@ -947,7 +947,9 @@ each theory the remote cache can't yet satisfy as an ActionSpec: a text blob
 with everything another machine needs to build that one theory from the remote
 cache alone. A theory counts as satisfied only if its remote entry would
 restore for this build: a usable manifest whose timeout contract is at least
-as strict as the one requested. The command takes `build`'s cache and proof
+as strict as the one requested, and every blob it names still in the cache
+(`HEAD /cas/<sha256>` answering anything but 404), since a cache may expire
+an entry's blobs before the entry. The command takes `build`'s cache and proof
 options (`--tactic-timeout`, `--skip-proof-steps`, ...) and needs a remote
 cache:
 
@@ -1144,8 +1146,9 @@ The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the
 batch, or the batch fails, it warns and builds locally. An event stream that
 breaks is reattached; one that stays unreachable through four reattaches
-(about 15 seconds of backoff) is given up on, and the build cancels the batch
-before building locally. With
+(about 15 seconds of backoff) is given up on. When the build stops following
+a batch that may still run (the stream was given up on, or the coordinator
+won't stream it), it cancels the batch before building locally. With
 `--remote-only` it fails instead, and it never builds HOL or a theory
 locally: a HOL toolchain or a theory that doesn't restore from a cache is an
 error. With nothing to build remotely it says so and goes straight to the

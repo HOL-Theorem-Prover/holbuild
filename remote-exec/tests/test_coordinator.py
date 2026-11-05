@@ -179,6 +179,21 @@ async def test_child_is_released_only_once_every_parent_key_is_in_the_cache(
     assert await states(http, batch_id) == {"a": "done", "b": "done", "c": "ready"}
 
 
+async def test_a_parent_whose_blob_expired_is_built_again_before_its_child_is_released(
+    http: httpx.AsyncClient, cache: FakeCache
+) -> None:
+    batch_id = await submit(http, ["a", "b"], [("b", "a")])
+    token = await claim_named(http, "a")
+    cache.keys.add(ac_key("a"))
+    cache.lost.add(ac_key("a"))
+    assert (await complete(http, token, result("a", "built"))).status_code == 200
+    assert await states(http, batch_id) == {"a": "ready", "b": "waiting"}
+
+    cache.lost.clear()
+    await build(http, cache, "a")
+    assert await states(http, batch_id) == {"a": "done", "b": "ready"}
+
+
 async def test_retried_action_waits_for_a_parent_requeued_while_it_ran(
     http: httpx.AsyncClient, cache: FakeCache
 ) -> None:

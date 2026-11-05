@@ -191,6 +191,9 @@ rm "$state/down"
 run unknown-only 1 build --remote-exec "$coordinator" --remote-only --attach nope BTheory
 require_grep "batch nope can't be followed (HTTP 404): .*no such batch" "$tmpdir/unknown-only.log"
 refute_grep "reattach" "$tmpdir/unknown-only.log"
+run unknown 0 build --remote-exec "$coordinator" --attach nope BTheory
+require_grep "batch nope can't be followed (HTTP 404): .*, cancelled the batch; building locally" "$tmpdir/unknown.log"
+require_grep "^POST /v1/batches/nope/cancel " "$state/requests.log"
 
 # A batch reported done whose results aren't in the remote cache: with
 # --remote-only nothing is built locally.
@@ -208,9 +211,9 @@ run failed-only 1 build --remote-exec "$coordinator" --remote-only BTheory
 require_grep "remote rx:ATheory: failed (proof)" "$tmpdir/failed-only.log"
 require_grep "remote execution: batch b7 failed: an action failed; remote workers finished 0 of 2 theories" "$tmpdir/failed-only.log"
 run failed 0 build --remote-exec "$coordinator" BTheory
-require_grep "remote workers finished 0 of 2 theories, cancelled the batch; building locally" "$tmpdir/failed.log"
+require_grep "batch b8 failed: an action failed; remote workers finished 0 of 2 theories; building locally" "$tmpdir/failed.log"
 require_grep "BTheory built" "$tmpdir/failed.log"
-require_grep "^POST /v1/batches/b8/cancel " "$state/requests.log"
+refute_grep "^POST /v1/batches/b8/cancel " "$state/requests.log"
 rm "$state/fail"
 
 # A closure that can't run remotely (a forced action) is built locally.

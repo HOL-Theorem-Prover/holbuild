@@ -51,7 +51,7 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_DATABASE_URL` | the coordinator's database (`postgresql+asyncpg://…`) | required |
 | `REMOTE_EXEC_CLIENT_TOKEN` | bearer token clients send | required |
 | `REMOTE_EXEC_WORKER_TOKEN` | bearer token workers send | required |
-| `REMOTE_EXEC_CACHE_URL` | remote cache base URL, for the `HEAD /ac/<ac-key>` readiness check; credentials go in its userinfo | required |
+| `REMOTE_EXEC_CACHE_URL` | remote cache base URL, for the readiness check of parents' entries and blobs; credentials go in its userinfo | required |
 | `REMOTE_EXEC_LEASE_SECONDS` | lease length; a heartbeat renews it | 120 |
 | `REMOTE_EXEC_MAX_ATTEMPTS` | claims of one action before a retryable failure becomes final | 3 |
 | `REMOTE_EXEC_STANDARD_TIER_MB` | peak memory from which a theory goes to the high-memory tier | 16000 |
@@ -125,9 +125,11 @@ finally (`failed`, with a `failure` message), or the client cancels it
 
 ## Scheduling rules
 
-- **Release.** When all of an action's parents are done, the coordinator sends
-  `HEAD /ac/<ac-key>` for each parent and makes the action ready only when
-  every one answers 200. A parent the cache doesn't hold (404) is built again.
+- **Release.** When all of an action's parents are done, the coordinator
+  fetches each parent's entry, `GET /ac/<ac-key>`, and sends `HEAD /cas/<sha>`
+  for each blob it lists, and makes the action ready only when every one
+  answers 200. A parent whose entry or a blob of it the cache doesn't hold
+  (404; blobs can expire before the entry naming them) is built again.
   When the cache can't be reached, the action waits for the next sweep. This
   is only a readiness hint; `exec-action` validates its inputs itself.
 - **Claims** take the oldest batch's ready action of the worker's tier (or,
@@ -154,9 +156,8 @@ finally (`failed`, with a `failure` message), or the client cancels it
   was killed) reports `internal` for it, so it is retried at once rather
   than when its lease expires.
 
-  A retried action waits again like a child, so it runs only once its
-  parents' keys answer `HEAD /ac/` again (one may have been rebuilt
-  meanwhile); an expired lease is retried the same way. A final failure fails
+  A retried action waits again like a child, so it runs only once the cache
+  holds its parents again (one may have been rebuilt meanwhile); an expired lease is retried the same way. A final failure fails
   the batch and cancels its unfinished actions.
 - **Placement.** Each built result's `peak-rss-mb` raises the hint for
   `(package, theory, profile)`, and a memory failure on the standard tier
