@@ -216,6 +216,15 @@ require_grep "BTheory built" "$tmpdir/failed.log"
 refute_grep "^POST /v1/batches/b8/cancel " "$state/requests.log"
 rm "$state/fail"
 
+# A batch that ended while its stream was down isn't reported cancelled.
+write_theories ended
+touch "$state/ended"
+run ended 0 build --remote-exec "$coordinator" BTheory
+require_grep "^POST /v1/batches/b9/cancel " "$state/requests.log"
+require_grep "the coordinator reported no theories; building locally" "$tmpdir/ended.log"
+refute_grep "cancel" "$tmpdir/ended.log"
+rm "$state/ended"
+
 # A closure that can't run remotely (a forced action) is built locally.
 run forced-only 1 build --remote-exec "$coordinator" --remote-only --force BTheory
 require_grep "can't run remotely: it is forced" "$tmpdir/forced-only.log"

@@ -1172,7 +1172,9 @@ The coordinator's protocol, in what holbuild uses of it:
   "state": "done"|"failed"|"cancelled", "failure"}`. A failed action's log is
   at `/cas/<log_sha256>` in the remote cache. A stream may start over: it
   sends every action's current state first.
-- `POST /v1/batches/<id>/cancel` cancels a running batch.
+- `POST /v1/batches/<id>/cancel` cancels a running batch and answers
+  `{"state": "<state>"}`: `cancelled`, or the end a batch that already
+  ended reached.
 
 Clean old project and cache state with:
 
