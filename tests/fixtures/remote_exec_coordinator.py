@@ -7,7 +7,8 @@ workers), then streams one action event per action and the batch's final
 event: done when RUN exits 0, failed otherwise.  Each action is reported
 running twice first, as a coordinator repeats unchanged states.  Control
 files in STATE change the answers: `refuse` makes POST answer 400, `drop`
-ends the next event stream before the final event (and is removed), `down`
+ends the next event stream before the final event (and is removed), `cut`
+ends it midway through its first action event (and is removed), `down`
 makes the event stream and POST /v1/batches/<id>/cancel answer 503, `skip`
 reports the batch done without running RUN.  Otherwise the cancel answers
 200.  Every request is logged to STATE/requests.log.
@@ -74,6 +75,10 @@ class Handler(BaseHTTPRequestHandler):
                     running = {"type": "action", "input_key": fields[1], "theory": fields[4],
                                "state": "running", "tier": "standard", "attempts": 1,
                                "last_failure": None, "log_sha256": None}
+                    if (state / "cut").exists():
+                        (state / "cut").unlink()
+                        self.wfile.write(json.dumps(running)[:30].encode())
+                        return
                     self.wfile.write((json.dumps(running) + "\n").encode())
                 event = {"type": "action", "input_key": fields[1], "theory": fields[4],
                          "state": "done" if ok else "failed", "tier": "standard", "attempts": 1,

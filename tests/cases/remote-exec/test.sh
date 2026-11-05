@@ -222,6 +222,14 @@ require_grep "can't run remotely: it is forced" "$tmpdir/forced-only.log"
 run forced 0 build --remote-exec "$coordinator" --force BTheory
 require_grep "BTheory built" "$tmpdir/forced.log"
 
+# A stream cut midway through an event: the partial line is no theory.
+write_theories cut
+touch "$state/cut"
+run cut 0 build --remote-exec "$coordinator" BTheory
+require_grep 'lost the event stream for batch b[0-9]*: {"type": "action", "input_key"; reattaching' "$tmpdir/cut.log"
+require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/cut.log"
+refute_grep "remote ?" "$tmpdir/cut.log"
+
 # The coordinator's credentials come from a curl config file.
 printf 'header = "Authorization: Bearer stub-token"\n' > "$tmpdir/coordinator.curl"
 write_theories seven
