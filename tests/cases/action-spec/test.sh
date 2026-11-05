@@ -159,6 +159,15 @@ grep '^edge' "$tmpdir/batch2.txt" > "$tmpdir/edges2.txt"
 printf 'edge %s %s\n' "$key_c" "$key_b" > "$tmpdir/edges2.expected"
 diff -u "$tmpdir/edges2.expected" "$tmpdir/edges2.txt"
 
+# A's entry whose blobs expired from the remote cache counts as uncached.
+ac_a=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key_a" | sha256sum | cut -d' ' -f1)
+blob_a=$(awk '$1 == "blob" { print $2; exit }' "$remote_root/ac/$ac_a")
+[[ -n "$blob_a" ]] || { cat "$remote_root/ac/$ac_a" >&2; exit 1; }
+mv "$remote_root/cas/$blob_a" "$tmpdir/blob-a"
+hb action-spec CTheory > "$tmpdir/batch-expired.txt"
+[[ $(grep -c '^action' "$tmpdir/batch-expired.txt") -eq 3 ]] || { cat "$tmpdir/batch-expired.txt" >&2; exit 1; }
+mv "$tmpdir/blob-a" "$remote_root/cas/$blob_a"
+
 # A stricter timeout than A's entry was built with makes A uncached again.
 hb action-spec --tactic-timeout 1 ATheory > "$tmpdir/batch-strict.txt"
 [[ $(grep -c '^action' "$tmpdir/batch-strict.txt") -eq 1 ]] || { cat "$tmpdir/batch-strict.txt" >&2; exit 1; }

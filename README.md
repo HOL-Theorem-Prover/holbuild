@@ -947,7 +947,9 @@ each theory the remote cache can't yet satisfy as an ActionSpec: a text blob
 with everything another machine needs to build that one theory from the remote
 cache alone. A theory counts as satisfied only if its remote entry would
 restore for this build: a usable manifest whose timeout contract is at least
-as strict as the one requested. The command takes `build`'s cache and proof
+as strict as the one requested, and every blob it names still in the cache
+(`HEAD /cas/<sha256>` answering anything but 404), since a cache may expire
+an entry's blobs before the entry. The command takes `build`'s cache and proof
 options (`--tactic-timeout`, `--skip-proof-steps`, ...) and needs a remote
 cache:
 
