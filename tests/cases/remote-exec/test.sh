@@ -340,3 +340,56 @@ run repl-url-missing 1 repl --remote-exec --remote-only < /dev/null
 require_grep "remote-exec requires URL" "$tmpdir/repl-url-missing.log"
 run run-from-flag 1 run --from --remote-only --remote-exec "$coordinator" "$tmpdir/run-script.sml"
 require_grep "from requires THEORY" "$tmpdir/run-from-flag.log"
+
+# A theory that writes SML sources runs before the rest is planned, which a
+# batch can't do, so such a build stays local; --remote-only fails.
+generated=$tmpdir/generated
+mkdir -p "$generated/src"
+cat > "$generated/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxgen"
+
+[build]
+members = ["src"]
+
+[actions.UseLib]
+deps = ["GenTheory"]
+TOML
+cat > "$generated/src/GenScript.sml" <<SML
+Theory Gen
+
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_outputs ["GenML.sml"];
+val () = let val out = TextIO.openOut "GenML.sml"
+         in TextIO.output (out, "structure GenML = struct val x = 42 end\n"); TextIO.closeOut out end;
+SML
+cat > "$generated/src/UseLib.sml" <<SML
+structure UseLib = struct val y = GenML.x + 1 end
+SML
+: > "$state/requests.log"
+(cd "$generated" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --detach UseLib) \
+  > "$tmpdir/generated-detach.log" 2>&1 && { cat "$tmpdir/generated-detach.log" >&2; exit 1; }
+require_grep "remote execution: theories that write SML sources build before the rest is planned" "$tmpdir/generated-detach.log"
+refute_grep "GenTheory built" "$tmpdir/generated-detach.log"
+# --remote-only restores, so with nothing cached it fails without building.
+(cd "$generated" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only UseLib) \
+  > "$tmpdir/generated-only.log" 2>&1 && { cat "$tmpdir/generated-only.log" >&2; exit 1; }
+require_grep "build before the rest is planned; restoring from the cache" "$tmpdir/generated-only.log"
+refute_grep "GenTheory built" "$tmpdir/generated-only.log"
+(cd "$generated" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" UseLib) \
+  > "$tmpdir/generated.log" 2>&1 || { cat "$tmpdir/generated.log" >&2; exit 1; }
+require_grep "theories that write SML sources build before the rest is planned; building locally" "$tmpdir/generated.log"
+require_grep "GenTheory built" "$tmpdir/generated.log"
+require_grep "UseLib built" "$tmpdir/generated.log"
+# Once GenTheory is in the remote cache, --remote-only restores it in a
+# fresh copy of the project, writing GenML.sml, and builds UseLib on it.
+mkdir -p "$tmpdir/generated-copy"
+cp -r "$generated/src" "$generated/holproject.toml" "$tmpdir/generated-copy/"
+rm -f "$tmpdir/generated-copy/src/GenML.sml"
+(cd "$tmpdir/generated-copy" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only UseLib) \
+  > "$tmpdir/generated-restore.log" 2>&1 || { cat "$tmpdir/generated-restore.log" >&2; exit 1; }
+require_grep "GenTheory restored from cache" "$tmpdir/generated-restore.log"
+require_grep "UseLib built" "$tmpdir/generated-restore.log"
+require_file "$tmpdir/generated-copy/src/GenML.sml"
+refute_grep "^POST /v1/batches\\|^GET /v1/batches" "$state/requests.log"
