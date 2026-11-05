@@ -52,6 +52,7 @@ class Server:
     specs: dict[str, str] = field(default_factory=dict)
     completed: list[str] = field(default_factory=list)
     protection: list[dict[str, object]] = field(default_factory=list)
+    claims: list[dict[str, object]] = field(default_factory=list)
 
 
 @pytest.fixture
@@ -80,6 +81,9 @@ def server() -> Iterator[Server]:
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
+            if self.path == "/v1/work/claim":
+                state.claims.append(json.loads(body))
+                return self.reply(204)
             if self.path.endswith("/complete"):
                 state.completed.append(body)
             self.reply(200, json.dumps({"accepted": True}) if self.path.endswith("/complete") else '{"lease_s": 3}')
@@ -261,6 +265,17 @@ def test_also_claim_accepts_repeats_and_commas(tmp_path: Path, server: Server) -
     args = worker_args(tmp_path, server, "--tier", "high", "--also-claim", "standard,high", "--also-claim", "standard")
 
     assert args.also_claim == ["standard", "high", "standard"]
+
+
+def test_claim_asks_the_coordinator_to_wait(server: Server) -> None:
+    assert Coordinator(server.url, "w").claim(["standard", "high"], "w", 20) is None
+    assert server.claims == [{"tier": "standard", "also_claim": ["high"], "worker": "w", "wait_s": 20}]
+
+
+def test_claim_wait_is_at_most_a_minute(tmp_path: Path, server: Server) -> None:
+    assert worker_args(tmp_path, server, "--claim-wait-seconds", "60").claim_wait_seconds == 60
+    with pytest.raises(SystemExit):
+        worker_args(tmp_path, server, "--claim-wait-seconds", "61")
 
 
 def test_coordinator_redirects_are_not_followed(server: Server) -> None:

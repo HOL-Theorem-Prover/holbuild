@@ -136,9 +136,9 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         return {**asdict(status.counts), "desired_burst_workers": status.desired_burst_workers}
 
     @app.post("/v1/work/claim", dependencies=worker, response_model=None)
-    async def claim(request: ClaimRequest) -> dict[str, object] | Response:
-        tiers = [request.tier, *(t for t in request.also_claim if t != request.tier)]
-        claimed = await coordinator.claim(tiers, request.worker, request.wait_s)
+    async def claim(body: ClaimRequest, request: Request) -> dict[str, object] | Response:
+        tiers = [body.tier, *(t for t in body.also_claim if t != body.tier)]
+        claimed = await coordinator.claim(tiers, body.worker, body.wait_s, request.is_disconnected)
         if claimed is None:
             return Response(status_code=204)
         return asdict(claimed)

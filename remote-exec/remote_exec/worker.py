@@ -313,6 +313,13 @@ def tier_list(text: str) -> list[str]:
     return tiers
 
 
+def claim_wait_seconds(text: str) -> float:
+    seconds = float(text)
+    if not 0 <= seconds <= 60:
+        raise argparse.ArgumentTypeError(f"{text} is not between 0 and 60")
+    return seconds
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--coordinator", required=True, help="coordinator base URL")
@@ -347,7 +354,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--name", default=f"{socket.gethostname()}:{os.getpid()}", help="worker name in leases")
     parser.add_argument(
         "--claim-wait-seconds",
-        type=float,
+        type=claim_wait_seconds,
         default=20.0,
         help="how long a claim waits at the coordinator for an action to become ready (at most 60)",
     )

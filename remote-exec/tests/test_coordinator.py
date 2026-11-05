@@ -8,6 +8,7 @@ import httpx
 import pytest
 import sqlalchemy as sa
 
+from remote_exec import coordinator as coordinator_module
 from remote_exec.coordinator import Coordinator
 from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache
 
@@ -253,6 +254,31 @@ async def test_a_waiting_claim_takes_an_action_that_becomes_ready_meanwhile(http
     response = await asyncio.wait_for(waiting, 10)
     assert response.status_code == 200, response.text
     assert response.json()["theory"] == "pkg:a"
+
+
+async def test_a_waiting_claim_whose_worker_left_leases_nothing(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    async def gone() -> bool:
+        return True
+
+    waiting = asyncio.create_task(coordinator.claim(["standard"], "w1", 30, gone))
+    await asyncio.sleep(0.5)
+    batch_id = await submit(http, ["a"])
+    assert await asyncio.wait_for(waiting, 10) is None
+    assert await states(http, batch_id) == {"a": "ready"}
+
+
+async def test_a_waiting_claim_finds_an_action_another_coordinator_process_made_ready(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 0.2)
+    other = Coordinator(coordinator.engine, coordinator.cache, coordinator.settings)
+    waiting = asyncio.create_task(other.claim(["standard"], "w1", 30))
+    await asyncio.sleep(0.5)
+    await submit(http, ["a"])
+    claimed = await asyncio.wait_for(waiting, 10)
+    assert claimed is not None and claimed.theory == "pkg:a"
 
 
 async def test_a_waiting_claim_ends_empty_after_its_wait(http: httpx.AsyncClient) -> None:

@@ -5,10 +5,11 @@ is a batch row first, then its actions and leases, so a completion, an expiry an
 """
 
 import asyncio
+import contextlib
 import logging
 import shlex
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
@@ -23,6 +24,8 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_en
 from remote_exec.formats import Batch, Result
 
 logger = logging.getLogger(__name__)
+
+CLAIM_RECHECK_SECONDS = 5  # how often a waiting claim looks for actions another coordinator process made ready
 
 # A scale command that runs longer than this is killed, so it can't stall the sweep.
 SCALE_CMD_TIMEOUT_S = 60
@@ -255,9 +258,20 @@ class Coordinator:
             await self._end_batch(conn, batch_id, "cancelled", None)
             return "cancelled"
 
-    async def claim(self, tiers: list[str], worker: str, wait_s: float = 0) -> Claim | None:
+    async def claim(
+        self,
+        tiers: list[str],
+        worker: str,
+        wait_s: float = 0,
+        disconnected: Callable[[], Awaitable[bool]] | None = None,
+    ) -> Claim | None:
         """Lease a ready action to ``worker``, waiting up to ``wait_s`` seconds for one, or None if none became
-        ready: of the first of ``tiers`` that has one, the oldest batch's first (by theory)."""
+        ready: of the first of ``tiers`` that has one, the oldest batch's first (by theory).
+
+        A wait ends early once ``disconnected`` says the worker has gone, so no action is leased to nobody. It is
+        woken when this process's ``release`` makes an action ready, and rechecks every ``CLAIM_RECHECK_SECONDS``
+        for actions another coordinator process made ready.
+        """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wait_s
         while True:
@@ -267,9 +281,9 @@ class Coordinator:
             remaining = deadline - loop.time()
             if claimed is not None or remaining <= 0:
                 return claimed
-            try:
-                await asyncio.wait_for(made_ready.wait(), remaining)
-            except TimeoutError:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(made_ready.wait(), min(remaining, CLAIM_RECHECK_SECONDS))
+            if disconnected is not None and await disconnected():
                 return None
 
     async def _claim(self, tiers: list[str], worker: str) -> Claim | None:

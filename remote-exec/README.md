@@ -16,7 +16,9 @@ a container image with both.
 
 - **Coordinator** (`remote_exec/app.py`, `remote_exec/coordinator.py`): a
   stateless FastAPI service over Postgres. Any number of replicas can run
-  behind a load balancer; all shared state is in the database.
+  behind a load balancer; all shared state is in the database. A claim
+  waiting for work is woken at once by its own process and rechecks every
+  5 s for work another process made ready.
 - **Postgres**: batches, their dependency edges, leases, failures, peak-memory
   hints and recent worker demand. It never holds a pointer to a result. An
   action is done when its key is in the cache's `/ac/`, so losing the database
