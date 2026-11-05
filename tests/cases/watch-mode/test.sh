@@ -24,9 +24,9 @@ command -v inotifywait >/dev/null || {
   exit 1
 }
 
-# Ancestors named like directories the watch skips (dot-directories, _build)
-# must not hide the project from it, nor a skipped directory around a member
-# (lib/.hidden) hide that member.
+# Ancestors named like directories the watch skips (_build, .holbuild, .git)
+# must not hide the project from it, and other dot-directories are watched
+# (lib/.hidden is a member).
 project=$tmpdir/_build/.dot/project
 mkdir -p "$project/src" "$project/lib/.hidden"
 write_project_file() {
@@ -141,9 +141,9 @@ wait_for_exit() {
 
 write_project_file
 write_good_source
-# Directories the source index skips, below a watched one: writes there must
+# holbuild's own directories below a watched one: writes there must
 # not trigger a rebuild.
-mkdir -p "$project/src/.hol" "$project/src/_build"
+mkdir -p "$project/src/.holbuild" "$project/src/_build"
 watch_log=$tmpdir/watch.log
 (trap - INT; cd "$project" && exec "$WATCH_HOLBUILD_BIN" build --watch ATheory) >"$watch_log" 2>&1 &
 watch_pid=$!
@@ -157,7 +157,7 @@ if [[ "$stable_count" -ne 1 ]]; then
   exit 1
 fi
 
-echo "noise" > "$project/src/.hol/noise"
+echo "noise" > "$project/src/.holbuild/noise"
 echo "noise" > "$project/src/_build/noise"
 sleep 2
 skipped_count=$(grep -c -- "waiting for changes" "$watch_log" 2>/dev/null || true)
