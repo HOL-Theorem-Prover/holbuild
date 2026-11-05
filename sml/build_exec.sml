@@ -2733,7 +2733,6 @@ fun failed_prefix_resume_source policy timeout_marker plan_only_marker source_na
        new_ir = proof_ir_enabled policy}
     val prelude = HolbuildTheoryCheckpoints.runtime_reinstall_prelude runtime_config
     fun source_slice start stop = String.substring(source, start, stop - start)
-    val theorem_binding = #safe_name checkpoint
     val finish_failed_prefix_call =
       String.concat
         ["HolbuildProofRuntime.finish_failed_prefix ",
@@ -2742,15 +2741,9 @@ fun failed_prefix_resume_source policy timeout_marker plan_only_marker source_na
          HolbuildToolchain.sml_string (#tactic_text checkpoint),
          " " ^ HolbuildToolchain.sml_string (#failed_prefix_path checkpoint) ^
          " " ^ HolbuildToolchain.sml_string (#failed_prefix_ok checkpoint)]
-    val theorem_save_line =
-      String.concat
-        ["val ", theorem_binding, " = HolbuildRuntime.save_thm_at (",
-         HolbuildToolchain.sml_string source_name, ", ",
-         Int.toString (HolbuildTheoryCheckpoints.line_at source (#theorem_start checkpoint)), ") (",
-         HolbuildToolchain.sml_string (#name checkpoint), ", ",
-         finish_failed_prefix_call,
-         ");\n"]
-    val resume_replay_block =
+    (* Replay the theorem's own source with the resumed proof as its tactic, so
+       the theorem keeps its name and attributes ([simp], [local], ...). *)
+    val replay_source =
       String.concat
         [HolbuildTheoryCheckpoints.source_line_pragma source (#theorem_start checkpoint),
          source_slice (#theorem_start checkpoint) (#tactic_start checkpoint),
@@ -2761,8 +2754,7 @@ fun failed_prefix_resume_source policy timeout_marker plan_only_marker source_na
       case #proof_ir_plan checkpoint of
           SOME expr => "val _ = HolbuildProofRuntime.set_theorem_plan (SOME (" ^ expr ^ "));\n"
         | NONE => "val _ = HolbuildProofRuntime.set_theorem_plan NONE;\n"
-    val replay_block =
-      plan_line ^ (if #kind checkpoint = "resume" then resume_replay_block else theorem_save_line)
+    val replay_block = plan_line ^ replay_source
     val suffix =
       HolbuildTheoryCheckpoints.instrument
         {source = source,
