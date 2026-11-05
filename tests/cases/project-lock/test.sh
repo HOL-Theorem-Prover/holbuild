@@ -133,6 +133,21 @@ for command in dry-run run-from export; do
   fi
   require_grep "project is already being modified" "$tmpdir/$command.log"
 done
+# A collector script with no project-theory references does not plan targets;
+# generators may run one inside the parent's locked build.
+mkdir -p "$locked_bad_project/src"
+sed -i 's/members = \["missing"\]/members = ["src"]/' "$locked_bad_project/holproject.toml"
+cat > "$locked_bad_project/collect.sml" <<'SML'
+val _ = print "COLLECTOR_OK\n";
+SML
+if ! (cd "$locked_bad_project" && "$HOLBUILD_BIN" run collect.sml) > "$tmpdir/collector.log" 2>&1; then
+  cat "$tmpdir/collector.log" >&2
+  kill "$lock_holder" 2>/dev/null || true
+  wait "$lock_holder" 2>/dev/null || true
+  wait "$first_pid" || true
+  exit 1
+fi
+require_grep "COLLECTOR_OK" "$tmpdir/collector.log"
 kill "$lock_holder" 2>/dev/null || true
 wait "$lock_holder" 2>/dev/null || true
 require_grep "project is already being modified" "$locked_bad_log"

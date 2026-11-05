@@ -1826,6 +1826,7 @@ fun from_theory_node plan theory =
   end
 
 fun from_theory_state tc project theory =
+  HolbuildBuildExec.with_project_lock project "run context" (fn () =>
   let
     val {index, components} = prepare_source_index "run.from" (resolution_for_toolchain tc) project
     val target = hd (HolbuildSourceIndex.resolve_path_targets index [theory])
@@ -1839,7 +1840,7 @@ fun from_theory_state tc project theory =
     val keys = default_build_input_keys tc project index components plan
   in
     HolbuildBuildExec.run_from_state tc project plan keys node
-  end
+  end)
 
 (* The state HOL starts from, the lines the run context runs first, and the
    modules it loads before [run].loads. *)
@@ -1880,6 +1881,7 @@ fun infer_from_theory tc project scripts =
   in
     if null targets then NONE
     else
+      HolbuildBuildExec.with_project_lock project "run inference" (fn () =>
       let
         val plan = timed_phase "run.infer.plan"
                      (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index targets)
@@ -1892,7 +1894,7 @@ fun infer_from_theory tc project scripts =
           | deeper (node, SOME best) = SOME (if ancestors node > ancestors best then node else best)
       in
         Option.map HolbuildBuildPlan.logical_name (List.foldl deeper NONE theories)
-      end
+      end)
   end
 
 (* A usable --from checkpoint takes precedence over [run].heap; without one,
@@ -1956,9 +1958,7 @@ fun run_hol_status runner tc cli_jobs build_request run_heap from subcommand use
     val project =
       if null run_loads then configured_project
       else timed_phase "run.project.rediscover" load_project
-    val {holstate, context_lines, loads} =
-      HolbuildBuildExec.with_project_lock project "run context"
-        (fn () => run_start tc project run_heap from)
+    val {holstate, context_lines, loads} = run_start tc project run_heap from
     val packages = resolved_packages (resolution_for_toolchain tc) project
     fun invoke context =
       runner (hol_run_argv tc holstate subcommand context user_args)
