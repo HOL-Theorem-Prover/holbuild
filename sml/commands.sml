@@ -107,7 +107,8 @@ fun context_help () = print
 
 fun repl_help () = print
   "Usage:\n\
-  \  holbuild [GLOBAL OPTIONS] repl [--from THEORY] [ARG ...]\n\n\
+  \  holbuild [GLOBAL OPTIONS] repl [--from THEORY] [--remote-exec URL [--remote-only]]\n\
+  \         [ARG ...]\n\n\
   \Start HOL REPL with project context. Extra arguments are passed to HOL,\n\
   \except two kinds, wherever they appear: holbuild's global options and\n\
   \-h/--help, which holbuild takes itself, and Poly/ML runtime options\n\
@@ -120,12 +121,16 @@ fun repl_help () = print
   \                 from [run].heap or the HOL base state. Does not build THEORY.\n\
   \                 Without --from, given .sml scripts, THEORY is inferred:\n\
   \                 of the project theories the scripts depend on, the one\n\
-  \                 with the most ancestors.\n\n\
+  \                 with the most ancestors.\n\
+  \  --remote-exec URL  Build the [run].loads targets as `build --remote-exec`\n\
+  \                 does, on the coordinator's workers, then start HOL locally.\n\
+  \                 With --remote-only, fails instead of building locally.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun run_help () = print
   "Usage:\n\
-  \  holbuild [GLOBAL OPTIONS] run [--from THEORY] [ARG ...]\n\n\
+  \  holbuild [GLOBAL OPTIONS] run [--from THEORY] [--remote-exec URL [--remote-only]]\n\
+  \         [ARG ...]\n\n\
   \Run HOL with project context. Extra arguments are passed to HOL,\n\
   \except two kinds, wherever they appear: holbuild's global options and\n\
   \-h/--help, which holbuild takes itself, and Poly/ML runtime options\n\
@@ -138,7 +143,10 @@ fun run_help () = print
   \                 from [run].heap or the HOL base state. Does not build THEORY.\n\
   \                 Without --from, given .sml scripts, THEORY is inferred:\n\
   \                 of the project theories the scripts depend on, the one\n\
-  \                 with the most ancestors.\n\n\
+  \                 with the most ancestors.\n\
+  \  --remote-exec URL  Build the [run].loads targets as `build --remote-exec`\n\
+  \                 does, on the coordinator's workers, then start HOL locally.\n\
+  \                 With --remote-only, fails instead of building locally.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun execution_plan_help () = print
@@ -1785,24 +1793,31 @@ fun build_heap_kind tc cli_jobs command target =
 fun build_heap tc cli_jobs target = build_heap_kind tc cli_jobs "heap" target
 fun build_executable tc cli_jobs target = build_heap_kind tc cli_jobs "executable" target
 
-(* `--from THEORY` options lead the HOL arguments; everything after them is
-   passed to HOL unchanged. *)
-fun split_run_from args =
+(* `--from THEORY`, `--remote-exec URL` and `--remote-only` lead the HOL
+   arguments; everything after them is passed to HOL unchanged. *)
+fun split_run_options args =
   let
     fun select NONE theory =
           if theory = "" then raise Error "--from requires THEORY" else SOME theory
       | select (SOME _) _ = raise Error "--from given more than once"
-    fun loop from rest =
+    fun loop (from, url, remote_only) rest =
       case rest of
-          "--from" :: theory :: xs => loop (select from theory) xs
+          "--from" :: theory :: xs =>
+            if String.isPrefix "-" theory then raise Error "--from requires THEORY"
+            else loop (select from theory, url, remote_only) xs
         | ["--from"] => raise Error "--from requires THEORY"
+        | "--remote-exec" :: value :: xs =>
+            if String.isPrefix "-" value then raise Error "--remote-exec requires URL"
+            else loop (from, SOME value, remote_only) xs
+        | ["--remote-exec"] => raise Error "--remote-exec requires URL"
+        | "--remote-only" :: xs => loop (from, url, true) xs
         | arg :: xs =>
             if String.isPrefix "--from=" arg then
-              loop (select from (String.extract (arg, size "--from=", NONE))) xs
-            else (from, rest)
-        | [] => (from, [])
+              loop (select from (String.extract (arg, size "--from=", NONE)), url, remote_only) xs
+            else ({from = from, url = url, remote_only = remote_only}, rest)
+        | [] => ({from = from, url = url, remote_only = remote_only}, [])
   in
-    loop NONE args
+    loop (NONE, NONE, false) args
   end
 
 (* A .sig/.sml pair shares a logical name; a theory's name is unique. *)
@@ -1937,14 +1952,15 @@ fun hol_run_argv tc holstate subcommand context user_args =
   HolbuildToolchain.hol_subcommand_argv tc subcommand @ ["--holstate", holstate, context] @ user_args
 
 (* With run_heap false, HOL starts from the toolchain's base state even when
-   [run].heap is configured. build_request builds the [run].loads targets. *)
-fun run_hol_status runner tc cli_jobs build_request run_heap from subcommand user_args =
+   [run].heap is configured. build_request builds the [run].loads targets, in
+   build_mode (locally, or on remote workers). *)
+fun run_hol_status runner tc cli_jobs build_mode build_request run_heap from subcommand user_args =
   let
     val configured_project = timed_phase "project.discover" load_project
     val run_loads = #run_loads configured_project
     val _ =
       if null run_loads then ()
-      else build_once tc cli_jobs (build_request run_loads)
+      else build_once_with_prepared_mode build_mode tc cli_jobs NONE (build_request run_loads)
     val project =
       if null run_loads then configured_project
       else timed_phase "run.project.rediscover" load_project
@@ -1958,7 +1974,13 @@ fun run_hol_status runner tc cli_jobs build_request run_heap from subcommand use
 
 fun run_hol_with runner tc cli_jobs subcommand args =
   let
-    val (from, user_args) = split_run_from args
+    val ({from, url, remote_only}, user_args) = split_run_options args
+    val build_mode =
+      case url of
+          SOME url => RemoteExec {url = url, remote_only = remote_only, detach = false, attach = NONE}
+        | NONE =>
+            if remote_only then raise Error "--remote-only needs --remote-exec URL"
+            else BuildTargets
     val run_from =
       case from of
           SOME theory => FromTheory theory
@@ -1967,7 +1989,7 @@ fun run_hol_with runner tc cli_jobs subcommand args =
                  [] => NoFrom
                | scripts => FromScripts scripts)
   in
-    if HolbuildToolchain.success (run_hol_status runner tc cli_jobs default_build_request true run_from subcommand user_args) then ()
+    if HolbuildToolchain.success (run_hol_status runner tc cli_jobs build_mode default_build_request true run_from subcommand user_args) then ()
     else raise Error ("hol " ^ subcommand ^ " failed")
   end
 
@@ -2074,7 +2096,7 @@ fun check_selector tc cli_jobs selector =
     fun cleanup () = OS.FileSys.remove script_path handle OS.SysErr _ => ()
     val status =
       (* A run heap may hold an older copy of the theory, which load would keep. *)
-      run_hol_status HolbuildToolchain.run tc cli_jobs plain_build_request false NoFrom "run" [script_path]
+      run_hol_status HolbuildToolchain.run tc cli_jobs BuildTargets plain_build_request false NoFrom "run" [script_path]
       handle e => (cleanup (); raise e)
   in
     cleanup ();
