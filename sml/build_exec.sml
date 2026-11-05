@@ -5095,8 +5095,8 @@ fun excluded_reason (options : build_options) project (action : theory_action) n
             | _ => NONE
 
 (* Whether the remote cache holds an entry this build would restore: usable,
-   and with a timeout contract at least as strict as the one requested.
-   Checked from the manifest alone; restoring still checks the blobs. *)
+   and with a timeout contract at least as strict as the one requested,
+   whose blobs the cache still holds. *)
 fun remote_entry_satisfies remote (options : build_options) project plan node input_key =
   case HolbuildRemoteCache.get_action remote input_key of
       NONE => false
@@ -5109,7 +5109,8 @@ fun remote_entry_satisfies remote (options : build_options) project plan node in
            not (Option.isSome (transient_stage_mldep_in_manifest text)) andalso
            map #1 extra_hashes = source_extra_output_declarations plan node andalso
            cache_timeout_satisfies (#allow_cache_timeout_discrepancy options) requested
-             (cache_manifest_proof_timeout lines)
+             (cache_manifest_proof_timeout lines) andalso
+           List.all (HolbuildRemoteCache.blob_present remote) (HolbuildCacheTransfer.unique_blobs text)
          end
          handle _ => false)
 

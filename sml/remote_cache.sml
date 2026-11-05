@@ -170,6 +170,12 @@ fun get_status timeout_seconds {url, dst} =
        when this curl build has zstd support, and streams decompressed bytes to dst. *)
     cli_status timeout_seconds ["--compressed", "-o", dst] url
 
+fun head_status timeout_seconds url =
+  if HolbuildRemoteCacheConfig.uses_libcurl () then
+    HolbuildHttp.head {url = url, timeout = timeout_seconds}
+  else
+    cli_status timeout_seconds ["-I", "-o", "/dev/null"] url
+
 fun put_status timeout_seconds headers {url, src} =
   if HolbuildRemoteCacheConfig.uses_libcurl () then
     HolbuildHttp.put {url = url, src = src, headers = headers, timeout = timeout_seconds}
@@ -457,6 +463,19 @@ fun put_action cache policy {key, text} =
   handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
 fun has_blob cache sha256 = Option.isSome (lookup_blob cache sha256)
+
+(* Whether the remote cache answers for the blob.  An action entry can
+   outlive its blobs (an object store expires each object on its own), so
+   an entry whose blobs are gone isn't usable.  Only a 404 says the blob is
+   gone; no answer, or another status, says nothing about it. *)
+fun blob_present cache sha256 =
+  let val url = cas_url cache sha256
+  in
+    case send "HEAD" url "" (fn () => head_status curl_max_time_seconds url) of
+        SOME (HolbuildHttp.Response 404) => false
+      | _ => true
+  end
+  handle _ => true
 
 fun verify_downloaded_blob path ({sha256, size} : blob_entry) =
   if Position.toString (FS.fileSize path) <> size then

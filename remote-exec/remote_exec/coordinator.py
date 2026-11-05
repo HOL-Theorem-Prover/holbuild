@@ -6,6 +6,7 @@ is a batch row first, then its actions and leases, so a completion, an expiry an
 
 import asyncio
 import logging
+import re
 import shlex
 from collections import defaultdict
 from collections.abc import Callable
@@ -23,6 +24,10 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_en
 from remote_exec.formats import Batch, Result
 
 logger = logging.getLogger(__name__)
+
+# A holbuild remote-cache entry lists its blobs as `blob <sha256> <size>` lines before the manifest it carries.
+ENTRY_BLOB = re.compile(r"^blob ([0-9a-f]{64}) [0-9]+$", re.MULTILINE)
+ENTRY_MANIFEST_MARKER = "manifest-text-v1\n"
 
 # A scale command that runs longer than this is killed, so it can't stall the sweep.
 SCALE_CMD_TIMEOUT_S = 60
@@ -389,10 +394,10 @@ class Coordinator:
         return True
 
     async def release(self, batch_id: UUID | None = None) -> None:
-        """Make waiting actions whose parents are all done ready, once every parent's key answers ``HEAD /ac/``.
+        """Make waiting actions whose parents are all done ready, once the cache holds each parent's entry and blobs.
 
         A parent the cache doesn't hold is re-queued; a parent the cache can't be asked about leaves its children
-        waiting for the next sweep. No transaction is open during the HEADs.
+        waiting for the next sweep. No transaction is open during the cache requests.
         """
         while True:
             async with self.engine.connect() as conn:
@@ -585,15 +590,28 @@ class Coordinator:
             raise ScaleCommandError(f"{scale_cmd} {workers} exited {code}")
 
     async def _in_cache(self, ac_key: str) -> bool | None:
+        """Whether the cache holds entry ``ac_key`` and every blob it lists, which can expire before it; None when
+        the cache can't tell."""
         try:
-            response = await self.cache.head(f"/ac/{ac_key}")
+            response = await self.cache.get(f"/ac/{ac_key}")
+            if response.status_code == 200:
+                for blob in ENTRY_BLOB.findall(response.text.partition(ENTRY_MANIFEST_MARKER)[0]):
+                    response = await self.cache.head(f"/cas/{blob}")
+                    if response.status_code != 200:
+                        break
         except httpx.HTTPError:
             return None
         if response.status_code == 200:
             return True
         if response.status_code == 404:
             return False
-        logger.warning("HEAD /ac/%s answered %d; its children wait for the next sweep", ac_key, response.status_code)
+        request = response.request
+        logger.warning(
+            "%s %s answered %d; its children wait for the next sweep",
+            request.method,
+            request.url.path,
+            response.status_code,
+        )
         return None
 
     async def _requeue_evicted(self, batch_id: UUID, parent: str) -> bool:
@@ -628,7 +646,7 @@ class Coordinator:
         attempts, fail the batch for resubmission.
 
         The missing theory may be a transitive dependency, which the batch has no edge for; the edge added here
-        holds the action back until that theory is rebuilt and its key answers ``HEAD /ac/`` again.
+        holds the action back until that theory is rebuilt and the cache holds it again.
         """
         missing = result.missing
         rebuilt = None
