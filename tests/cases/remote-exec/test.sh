@@ -297,3 +297,44 @@ for name in toolchain-only toolchain-only-implicit; do
   require_grep "HOL toolchain could not be restored from a cache, and --remote-only builds nothing locally" "$tmpdir/$name.log"
 done
 [[ ! -s "$tmpdir/fake-build-count" ]] || { cat "$tmpdir/fake-build-count" >&2; exit 1; }
+
+# run and repl build their [run].loads on the remote workers, as build
+# --remote-exec does, then start HOL locally.
+cat >> "$project/holproject.toml" <<TOML
+
+[run]
+loads = ["BTheory"]
+TOML
+printf 'val _ = (BTheory.b_thm; print "RUN_REMOTE_OK\\n");\n' > "$tmpdir/run-script.sml"
+printf 'val _ = (BTheory.b_thm; print "REPL_REMOTE_OK\\n");\n' > "$tmpdir/repl-input.sml"
+write_theories run
+: > "$state/ran"
+run run-remote 0 run --remote-exec "$coordinator" "$tmpdir/run-script.sml"
+require_grep "holbuild: remote batch b[0-9]*$" "$tmpdir/run-remote.log"
+require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/run-remote.log"
+require_grep "BTheory restored from cache" "$tmpdir/run-remote.log"
+refute_grep "Theory built" "$tmpdir/run-remote.log"
+require_grep "RUN_REMOTE_OK" "$tmpdir/run-remote.log"
+[[ $(grep -c . "$state/ran") -eq 2 ]] || { cat "$state/ran" >&2; exit 1; }
+write_theories repl
+run repl-remote 0 repl --remote-exec "$coordinator" --remote-only < "$tmpdir/repl-input.sml"
+require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/repl-remote.log"
+refute_grep "Theory built" "$tmpdir/repl-remote.log"
+require_grep "REPL_REMOTE_OK" "$tmpdir/repl-remote.log"
+
+# An unreachable coordinator: run builds locally; with --remote-only, repl
+# fails before HOL starts.
+write_theories run-unreachable
+run run-unreachable 0 run --remote-exec "$unreachable" "$tmpdir/run-script.sml"
+require_grep "could not reach the coordinator at $unreachable.*; building locally" "$tmpdir/run-unreachable.log"
+require_grep "BTheory built" "$tmpdir/run-unreachable.log"
+require_grep "RUN_REMOTE_OK" "$tmpdir/run-unreachable.log"
+write_theories repl-unreachable
+run repl-unreachable-only 1 repl --remote-exec "$unreachable" --remote-only < "$tmpdir/repl-input.sml"
+require_grep "remote execution: could not reach the coordinator at $unreachable" "$tmpdir/repl-unreachable-only.log"
+refute_grep "Theory built\|REPL_REMOTE_OK" "$tmpdir/repl-unreachable-only.log"
+
+run run-no-url 1 run --remote-only "$tmpdir/run-script.sml"
+require_grep "remote-only needs --remote-exec URL" "$tmpdir/run-no-url.log"
+run repl-url-missing 1 repl --remote-exec --remote-only < /dev/null
+require_grep "remote-exec requires URL" "$tmpdir/repl-url-missing.log"
