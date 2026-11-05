@@ -2742,10 +2742,13 @@ fun failed_prefix_resume_source policy timeout_marker plan_only_marker source_na
          " " ^ HolbuildToolchain.sml_string (#failed_prefix_path checkpoint) ^
          " " ^ HolbuildToolchain.sml_string (#failed_prefix_ok checkpoint)]
     (* "Theorem name[attrs]", "Triviality name": the source up to the colon
-       that ends the theorem's header, outside its attribute list. *)
+       that ends the theorem's header, outside comments and its attribute
+       list. *)
     fun header_end i depth =
       if i >= #tactic_start checkpoint then
         raise Error ("no header colon in theorem " ^ #name checkpoint)
+      else if HolbuildTheoryCheckpoints.starts_with source i "(*" then
+        header_end (HolbuildTheoryCheckpoints.skip_comment source i) depth
       else
         case String.sub(source, i) of
             #"[" => header_end (i + 1) (depth + 1)
@@ -2755,12 +2758,12 @@ fun failed_prefix_resume_source policy timeout_marker plan_only_marker source_na
     (* A theorem binds the resumed proof through HOL's own `Theorem name[attrs]
        = thm` form, which keeps its attributes ([simp], [local], ...) without
        parsing the statement again after the proof prefix has run. *)
-    val theorem_replay =
+    fun theorem_replay () =
       String.concat
         [HolbuildTheoryCheckpoints.source_line_pragma source (#theorem_start checkpoint),
          source_slice (#theorem_start checkpoint) (header_end (#theorem_start checkpoint) 0),
          " =\n  (", finish_failed_prefix_call, ");\n"]
-    val resume_replay =
+    fun resume_replay () =
       String.concat
         [HolbuildTheoryCheckpoints.source_line_pragma source (#theorem_start checkpoint),
          source_slice (#theorem_start checkpoint) (#tactic_start checkpoint),
@@ -2772,7 +2775,7 @@ fun failed_prefix_resume_source policy timeout_marker plan_only_marker source_na
           SOME expr => "val _ = HolbuildProofRuntime.set_theorem_plan (SOME (" ^ expr ^ "));\n"
         | NONE => "val _ = HolbuildProofRuntime.set_theorem_plan NONE;\n"
     val replay_block =
-      plan_line ^ (if #kind checkpoint = "resume" then resume_replay else theorem_replay)
+      plan_line ^ (if #kind checkpoint = "resume" then resume_replay () else theorem_replay ())
     val suffix =
       HolbuildTheoryCheckpoints.instrument
         {source = source,

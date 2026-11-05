@@ -34,7 +34,8 @@ TOML
 # checkpoint must keep both, so uses_simp proves by simp alone and the theory's
 # signature leaves foo_simp out.  Its proof's first step clears the overload
 # its statement uses, so the resumed theorem must not parse the statement
-# again.
+# again.  The comment in its header holds a colon and a bracket, which
+# must not end the header.
 write_source() {
   local tail=$1
   cat > "$project/src/AScript.sml" <<SML
@@ -44,7 +45,7 @@ val _ = new_theory "A";
 val foo_def = new_definition ("foo_def", \`\`foo = T\`\`);
 val _ = overload_on ("hbtrue", \`\`T\`\`);
 
-Theorem foo_simp[simp,local]:
+Theorem foo_simp[simp,local] (* note: [ *):
   foo /\\ hbtrue
 Proof
   (fn g => (Parse.temp_clear_overloads_on "hbtrue"; ALL_TAC g)) >>
