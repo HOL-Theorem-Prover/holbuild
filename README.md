@@ -681,6 +681,14 @@ source or through a manifest/inline `extra_deps` declaration. Its transitive
 generators do not require their command-line tools to be installed. Broad groups
 and default roots still demand every generated output they select.
 
+By default, a demanded generator runs only when its command, declared inputs,
+dependency results or output bytes have changed. For collectors that inspect
+state beyond declared files, set `always_reexecute = true` on that `[[generate]]`
+entry. It executes once per command (once per build iteration with `--watch`),
+before consumers are hashed, and still runs only when demanded. Unchanged output
+bytes let consumers reuse their existing keys; changed bytes invalidate them.
+Omitting the flag or setting it to `false` preserves the default behaviour.
+
 ### Heaps and run contexts
 
 ```toml

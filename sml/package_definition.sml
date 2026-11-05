@@ -34,7 +34,8 @@ datatype generator =
       command : string list,
       inputs : string list,
       outputs : string list,
-      deps : string list }
+      deps : string list,
+      always_reexecute : bool }
 
 datatype group =
   Group of
@@ -215,7 +216,8 @@ fun parse_generator value =
           val _ = if name = "" then die "generate.name must not be empty" else ()
           val _ = if null command then die ("generate." ^ name ^ ".command must not be empty") else ()
           val _ = if null outputs then die ("generate." ^ name ^ ".outputs must not be empty") else ()
-        in Generator {name = name, command = command, inputs = inputs, outputs = outputs, deps = deps} end
+        in Generator {name = name, command = command, inputs = inputs, outputs = outputs, deps = deps,
+                      always_reexecute = Option.getOpt(bool_at table ["always_reexecute"], false)} end
     | _ => die "generate entries must be tables"
 
 fun parse_generators table =
@@ -488,7 +490,7 @@ fun validate_generate_entry value =
   case value of
       TOML.TABLE generate =>
         require_known_fields "generate"
-          ["name", "command", "inputs", "outputs", "deps"] generate
+          ["name", "command", "inputs", "outputs", "deps", "always_reexecute"] generate
     | _ => die "generate entries must be tables"
 
 fun validate_groups_table table =
@@ -631,9 +633,10 @@ fun action_input_text ({logical, extra_inputs} : action_input_policy) =
 fun action_execution_text
       ({logical, impure, cache, always_reexecute} : action_execution_policy) =
   fields [logical, bool_text impure, bool_text cache, bool_text always_reexecute]
-fun generator_text (Generator {name, command, inputs, outputs, deps}) =
-  fields [name, string_sequence command, string_sequence inputs,
-          string_sequence outputs, string_sequence deps]
+fun generator_text (Generator {name, command, inputs, outputs, deps, always_reexecute}) =
+  fields ([name, string_sequence command, string_sequence inputs,
+           string_sequence outputs, string_sequence deps] @
+          (if always_reexecute then ["always_reexecute=true"] else []))
 
 fun metadata_text ({name, version} : package_metadata) =
   fields ["package-metadata-v1", name, optional atom version]

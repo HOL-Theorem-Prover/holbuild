@@ -1304,6 +1304,7 @@ fun build_watch tc cli_jobs parsed =
           | NONE => raise exn
     fun loop previous_paths =
       let
+        val _ = HolbuildGenerators.begin_command ()
         val {prepared, watch_set = previous} = current_watch_state resolution previous_paths
         val _ = attempt prepared
         (* Recompute the watch set after the build so inputs created during the
@@ -2311,7 +2312,8 @@ fun removed_legacy_proof_step_build_arg arg =
 fun trace_steps_build_arg arg = arg = "--trace-steps" orelse arg = "--goalfrag-trace"
 
 fun dispatch_with_options {holdir, source_dir, cache_dir, remote_cache, jobs, maxheap, prefetch_concurrency, json, verbosity} args =
-  (HolbuildStatus.set_json_mode json;
+  (HolbuildGenerators.begin_command ();
+   HolbuildStatus.set_json_mode json;
    HolbuildStatus.set_verbosity verbosity;
    HolbuildStatus.set_retain_debug_artifacts false;
    Option.app HolbuildProject.set_source_dir source_dir;

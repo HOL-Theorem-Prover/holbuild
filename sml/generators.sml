@@ -196,18 +196,35 @@ fun verify_outputs package generator =
     List.app verify (HolbuildProject.generator_outputs generator)
   end
 
+(* A command may demand several outputs or replan after building generated
+   sources. Refresh each opted-in generator only once across those demands. *)
+val refreshed_results = ref (Binarymap.mkDict String.compare)
+  : (string, string * string) Binarymap.dict ref
+
+fun begin_command () = refreshed_results := Binarymap.mkDict String.compare
+
 fun run_one package dep_results generator =
   let
+    val refresh = HolbuildProject.generator_always_reexecute generator
     val key = input_key package dep_results generator
     val _ =
-      if metadata_up_to_date package generator key then ()
+      if not refresh andalso metadata_up_to_date package generator key then ()
       else (run_command package generator;
             verify_outputs package generator;
             write_text (metadata_path package generator) (metadata_text package generator key))
     val result = hash_text (read_text (metadata_path package generator))
+    val result = (HolbuildProject.generator_name generator, result)
+    val _ = if refresh then
+              refreshed_results := Binarymap.insert(!refreshed_results, generator_stem package generator, result)
+            else ()
   in
-    (HolbuildProject.generator_name generator, result)
+    result
   end
+
+fun run_once package dep_results generator =
+  case Binarymap.peek(!refreshed_results, generator_stem package generator) of
+      SOME result => result
+    | NONE => run_one package dep_results generator
 
 fun duplicate_name names =
   case names of
@@ -361,7 +378,7 @@ fun run_selected package requested =
         fun wanted generator =
           List.exists (fn name => name = HolbuildProject.generator_name generator) selected
         fun run (generator, dep_results) =
-          if wanted generator then run_one package dep_results generator :: dep_results
+          if wanted generator then run_once package dep_results generator :: dep_results
           else dep_results
       in
         ignore (List.foldl run [] ordered)

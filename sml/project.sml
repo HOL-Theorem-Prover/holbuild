@@ -348,6 +348,7 @@ fun generator_command (Generator {command, ...}) = command
 fun generator_inputs (Generator {inputs, ...}) = inputs
 fun generator_outputs (Generator {outputs, ...}) = outputs
 fun generator_deps (Generator {deps, ...}) = deps
+fun generator_always_reexecute (Generator {always_reexecute, ...}) = always_reexecute
 
 fun group_name (Group {name, ...}) = name
 fun group_includes (Group {includes, ...}) = includes
