@@ -6083,6 +6083,23 @@ fun store_add store heap {sha, src, save} =
 (* A blob a shared entry names that the remote cache no longer holds. *)
 exception MissingSharedBlob of string
 
+val noted_store_mount = ref false
+
+(* A Poly/ML state from the store, hard-linked; across file systems, where a
+   store on its own mount puts it, symbolically linked, which is safe while
+   this process leases the state's family. *)
+fun place_state stored dst =
+  (remove_file dst;
+   Posix.FileSys.link {old = stored, new = dst}
+   handle OS.SysErr (_, err) =>
+     if err <> SOME Posix.Error.xdev then copy_binary stored dst
+     else
+       (if !noted_store_mount then ()
+        else (noted_store_mount := true;
+              HolbuildStatus.message_stderr
+                "holbuild: the checkpoint store is on another file system; linking its states symbolically\n");
+        Posix.FileSys.symlink {old = Path.mkAbsolute {path = stored, relativeTo = FS.getDir ()}, new = dst}))
+
 (* Puts blob `sha` of heap `heap`'s family at `dst`, from the store, which
    fetches it from the remote cache if it lacks it. *)
 fun place_shared_blob remote store heap {sha, dst, save} =
@@ -6098,14 +6115,14 @@ fun place_shared_blob remote store heap {sha, dst, save} =
           | HolbuildCacheBackend.Corrupt msg =>
               (remove_file tmp; raise Error ("could not fetch shared checkpoint blob " ^ sha ^ ": " ^ msg))
       end
+    fun place () = if save then place_state stored dst else copy_binary stored dst
     (* Another worker's cap sweep may evict the family between the check
        and the link. *)
-    fun from_store () =
-      file_exists stored andalso ((share_file save stored dst; true) handle Error _ => false)
+    fun from_store () = file_exists stored andalso ((place (); true) handle Error _ => false)
   in
     lease_store_family store heap;
     ensure_parent dst;
-    if from_store () then () else (fetch (); share_file save stored dst)
+    if from_store () then () else (fetch (); place ())
   end
 
 fun shared_heap_key tc root (action : theory_action) =

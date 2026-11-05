@@ -377,7 +377,7 @@ class Coordinator:
                 )
                 await self._retry(conn, batch_id, action.input_key)
             elif action.attempts < self.settings.max_attempts and (
-                result.failure in ("publish", "toolchain", "internal")
+                result.failure in ("publish", "toolchain", "internal", "memory")
                 or (result.failure == "disk" and action.last_failure != "disk")
             ):
                 await self._retry(conn, batch_id, action.input_key)
@@ -704,11 +704,13 @@ class Coordinator:
         await conn.execute(sa.text("DELETE FROM leases WHERE batch_id = :id"), {"id": batch_id})
 
     async def _record_peak(self, conn: AsyncConnection, package: str, theory: str, profile: str, peak: int) -> None:
+        """Raise the theory's peak hint to ``peak``; a run that took less, perhaps with a quieter neighbour, keeps it."""
         await conn.execute(
             sa.text(
                 "INSERT INTO peak_hints (package, theory, profile, peak_rss_mb) "
                 "VALUES (:package, :theory, :profile, :peak) "
-                "ON CONFLICT (package, theory, profile) DO UPDATE SET peak_rss_mb = :peak, updated_at = now()"
+                "ON CONFLICT (package, theory, profile) DO UPDATE "
+                "SET peak_rss_mb = GREATEST(peak_hints.peak_rss_mb, :peak), updated_at = now()"
             ),
             {"package": package, "theory": theory, "profile": profile, "peak": peak},
         )
