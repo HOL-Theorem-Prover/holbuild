@@ -1156,18 +1156,18 @@ locally: a HOL toolchain or a theory that doesn't restore from a cache is an
 error. With nothing to build remotely it says so and goes straight to the
 local build.
 
-`run` and `repl` take `--remote-exec URL` and `--remote-only` too, before the
-arguments passed to HOL, and build their `[run].loads` targets this way
-before they start HOL locally:
-
-```sh
-holbuild --remote-cache https://cache.example.org run --remote-exec https://exec.example.org script.sml
-```
-
 `--detach` submits the batch, prints its id (`holbuild: remote batch <id>`)
 and exits; if the batch can't be submitted, it fails rather than building
 locally. `--attach <id>` follows that batch and then builds as above. A
 `--remote-only` build that loses the event stream says how to reattach.
+
+`run` and `repl` take `--remote-exec URL` and `--remote-only` too, before the
+arguments passed to HOL, and build their `[run].loads` targets this way
+before they start HOL locally (they don't take `--detach` or `--attach`):
+
+```sh
+holbuild --remote-cache https://cache.example.org run --remote-exec https://exec.example.org script.sml
+```
 
 [`remote-exec/`](remote-exec/README.md) has a coordinator and a worker loop
 that speak this protocol, and a container image with both.

@@ -338,3 +338,5 @@ run run-no-url 1 run --remote-only "$tmpdir/run-script.sml"
 require_grep "remote-only needs --remote-exec URL" "$tmpdir/run-no-url.log"
 run repl-url-missing 1 repl --remote-exec --remote-only < /dev/null
 require_grep "remote-exec requires URL" "$tmpdir/repl-url-missing.log"
+run run-from-flag 1 run --from --remote-only --remote-exec "$coordinator" "$tmpdir/run-script.sml"
+require_grep "from requires THEORY" "$tmpdir/run-from-flag.log"

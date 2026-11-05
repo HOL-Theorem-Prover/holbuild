@@ -1802,7 +1802,9 @@ fun split_run_options args =
       | select (SOME _) _ = raise Error "--from given more than once"
     fun loop (from, url, remote_only) rest =
       case rest of
-          "--from" :: theory :: xs => loop (select from theory, url, remote_only) xs
+          "--from" :: theory :: xs =>
+            if String.isPrefix "-" theory then raise Error "--from requires THEORY"
+            else loop (select from theory, url, remote_only) xs
         | ["--from"] => raise Error "--from requires THEORY"
         | "--remote-exec" :: value :: xs =>
             if String.isPrefix "-" value then raise Error "--remote-exec requires URL"
