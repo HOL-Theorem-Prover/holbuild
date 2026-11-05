@@ -7,11 +7,13 @@ workers), then streams one action event per action and the batch's final
 event: done when RUN exits 0, failed otherwise.  Each action is reported
 running twice first, as a coordinator repeats unchanged states.  Control
 files in STATE change the answers: `refuse` makes POST answer 400, `drop`
-ends the next event stream before the final event (and is removed), `down`
+ends the next event stream before the final event (and is removed), `cut`
+ends it midway through its first action event (and is removed), `down`
 makes the event stream and POST /v1/batches/<id>/cancel answer 503, `ended`
 makes the event stream answer 503 and the cancel answer that the batch is
 already done, `skip` reports the batch done without running RUN.  Otherwise
-the cancel answers that it cancelled the batch.  Every request is logged to STATE/requests.log.
+the cancel answers that it cancelled the batch.  Every request is logged to
+STATE/requests.log.
 """
 
 import json
@@ -67,8 +69,13 @@ class Handler(BaseHTTPRequestHandler):
         if (state / "down").exists() or (state / "ended").exists():
             return self.answer(503, {"detail": "restarting"})
         ok = (state / "skip").exists() or subprocess.run([run, str(batch)]).returncode == 0
+        cut = (state / "cut").exists()
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
+        if cut:
+            # More than is sent, so curl reports the stream cut short.
+            (state / "cut").unlink()
+            self.send_header("Content-Length", "1000")
         self.end_headers()
         for line in batch.read_text().splitlines():
             fields = line.split()
@@ -77,6 +84,9 @@ class Handler(BaseHTTPRequestHandler):
                     running = {"type": "action", "input_key": fields[1], "theory": fields[4],
                                "state": "running", "tier": "standard", "attempts": 1,
                                "last_failure": None, "log_sha256": None}
+                    if cut:
+                        self.wfile.write(json.dumps(running)[:30].encode())
+                        return
                     self.wfile.write((json.dumps(running) + "\n").encode())
                 event = {"type": "action", "input_key": fields[1], "theory": fields[4],
                          "state": "done" if ok else "failed", "tier": "standard", "attempts": 1,

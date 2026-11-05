@@ -128,8 +128,11 @@ fun report_action line =
 fun follow url batch_id : outcome * progress =
   let
     val states : (string * string) list ref = ref []
+    (* A line cut off by a dropped connection, perhaps with curl's error
+       after it, is no event. *)
+    fun complete line = Substring.isSuffix "}" (Substring.dropr Char.isSpace (Substring.full line))
     fun on_line outcome received others line =
-      case json_string_field "type" line of
+      case (if complete line then json_string_field "type" line else NONE) of
           SOME "action" =>
             let
               val key = Option.getOpt (json_string_field "input_key" line, "")
