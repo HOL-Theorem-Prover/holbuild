@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 from typing import Any
@@ -240,6 +241,26 @@ async def test_unknown_token_and_mismatched_result_are_refused(http: httpx.Async
     assert (await complete(http, token, result("b", "built"))).status_code == 400
     assert (await complete(http, token, "holbuild-action-result-v1\nstatus=weird\n")).status_code == 400
     assert (await http.post(f"/v1/work/{uuid4()}/heartbeat", headers=WORKER)).status_code == 409
+
+
+async def test_a_waiting_claim_takes_an_action_that_becomes_ready_meanwhile(http: httpx.AsyncClient) -> None:
+    body = {"tier": "standard", "worker": "w1", "wait_s": 30}
+    waiting = asyncio.create_task(http.post("/v1/work/claim", json=body, headers=WORKER))
+    await asyncio.sleep(0.5)
+    assert not waiting.done()
+
+    await submit(http, ["a"])
+    response = await asyncio.wait_for(waiting, 10)
+    assert response.status_code == 200, response.text
+    assert response.json()["theory"] == "pkg:a"
+
+
+async def test_a_waiting_claim_ends_empty_after_its_wait(http: httpx.AsyncClient) -> None:
+    body = {"tier": "standard", "worker": "w1", "wait_s": 0.3}
+    response = await http.post("/v1/work/claim", json=body, headers=WORKER)
+    assert response.status_code == 204
+    body["wait_s"] = 61
+    assert (await http.post("/v1/work/claim", json=body, headers=WORKER)).status_code == 422
 
 
 async def test_memory_failure_moves_to_the_high_tier_and_retries_up_to_max_attempts(
