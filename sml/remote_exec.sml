@@ -194,8 +194,10 @@ fun follow url batch_id : outcome * progress =
       total = length (!states)})
   end
 
-(* Asks the coordinator to cancel a batch; a failure only warns, since the
-   coordinator ends an abandoned batch at its deadline anyway. *)
+(* Asks the coordinator to cancel a batch; true when it did.  It answers
+   with the batch's state, which for a batch that already ended is that
+   end, not "cancelled".  A failure only warns, since the coordinator ends
+   an abandoned batch at its deadline anyway. *)
 fun cancel url batch_id =
   let
     val result =
@@ -203,11 +205,12 @@ fun cancel url batch_id =
         {program = "curl",
          args = curl_args (endpoint url ("/v1/batches/" ^ batch_id ^ "/cancel"))
                   ["--max-time", Int.toString request_max_time_seconds, "-X", "POST",
-                   "-o", "/dev/null", "-w", "%{http_code}"],
+                   "-w", "\n%{http_code}"],
          stderr = HolbuildSpawn.Merge}
     val (lines, status) = split_status (#output result)
   in
-    if status >= 200 andalso status < 300 then true
+    if status >= 200 andalso status < 300 then
+      json_string_field "state" (String.concatWith "\n" lines) = SOME "cancelled"
     else
       (HolbuildStatus.message_stderr
          ("holbuild: warning: could not cancel remote batch " ^ batch_id ^
