@@ -1099,6 +1099,12 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       case prepared of
           SOME {index, components, ...} => {index = index, components = components}
         | NONE => prepare_source_index "build" resolution project
+    type planned =
+      {index : HolbuildSourceIndex.t, targets : string list, entry_plan : HolbuildBuildPlan.t option,
+       plan : HolbuildBuildPlan.t, toolchain_key : string,
+       components : HolbuildComponentProvider.project_components option}
+    fun entry_targets index =
+      if proof_steps then map #2 (HolbuildTacticTimeoutPolicy.explicit_entries project index) else []
     fun prepare_plan {index, components} =
       let
         val requested_targets = targets
@@ -1106,48 +1112,167 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         val _ = reject_object_targets targets
         val plan = timed_phase "build.plan" (fn () => build_target_plan resolution components (#holdir tc) project index requested_targets targets)
         val entry_plan =
-          if proof_steps then
-            let
-              val entry_targets =
-                map #2 (HolbuildTacticTimeoutPolicy.explicit_entries project index)
-            in
-              if null entry_targets then NONE
-              else SOME (timed_phase "entry_timeout.plan"
-                           (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index entry_targets))
-            end
-          else NONE
-        val _ = if warn_unreachable andalso null requested_targets then
-                  warn_unreachable_root_scripts resolution project index plan
-                else ()
+          case entry_targets index of
+              [] => NONE
+            | entry_targets =>
+                SOME (timed_phase "entry_timeout.plan"
+                        (fn () => HolbuildBuildPlan.plan_targets components (#holdir tc) index entry_targets))
         val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
       in
-        (index, targets, entry_plan, plan, toolchain_key)
+        {index = index, targets = targets, entry_plan = entry_plan, plan = plan,
+         toolchain_key = toolchain_key, components = SOME components}
+      end
+    fun action_toolchain_key toolchain_key = HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)
+    fun with_options (planned as {index, targets, entry_plan, plan, ...}) =
+      (planned, build_options_for index entry_plan plan targets)
+    (* The input keys of a plan, which the plan keeps for execution.  Only
+       for plans with no theory that writes SML sources: until those run,
+       an extra input naming such a source does not exist. *)
+    fun input_keys ({plan, toolchain_key, ...} : planned, options) =
+      HolbuildBuildPlan.input_keys (HolbuildBuildExec.build_config_lines_for_node options project)
+        (action_toolchain_key toolchain_key) plan
+    fun warn_unreachable_for ({index, plan, ...} : planned) =
+      if warn_unreachable andalso null targets then
+        warn_unreachable_root_scripts resolution project index plan
+      else ()
+    fun plan_with_record () =
+      let
+        val start_ns = Time.toNanoseconds (Time.now ())
+        val record_mode = HolbuildPlanRecord.mode ()
+        val graph = timed_phase "build.graph.resolve"
+                      (fn () => HolbuildProjectGraph.resolve {project = project, resolution = resolution})
+        val record_dir = HolbuildPlanRecord.record_dir project
+        val fingerprint = HolbuildPlanRecord.fingerprint
+                            {project = project, graph = graph, holdir = #holdir tc, kernel_variant = #kernel_variant tc}
+        fun say text = if HolbuildStatus.verbose_mode () then HolbuildStatus.message_stderr ("holbuild: plan: " ^ text ^ "\n") else ()
+        val attempt =
+          case record_mode of
+              HolbuildPlanRecord.Off => HolbuildPlanRecord.Fallback "plan record is off"
+            | _ => timed_phase "plan.record" (fn () =>
+                     HolbuildPlanRecord.restore {dir = record_dir, graph = graph, tc = tc, fingerprint = fingerprint, start_ns = start_ns})
+        fun context {members, dirs, stamps, index, targets, toolchain_key} : HolbuildPlanRecord.context =
+          {fingerprint = fingerprint, start_ns = start_ns,
+           toolchain = {hol = HolbuildToolchain.hol tc, state = HolbuildToolchain.base_state tc, key = toolchain_key},
+           action_toolchain_key = action_toolchain_key toolchain_key,
+           graph = graph, members = members, dirs = dirs, stamps = stamps, index = index, targets = targets}
+        fun write context plan keys =
+          case timed_phase "plan.record.write"
+                 (fn () => HolbuildPlanRecord.write record_dir context plan keys) of
+              HolbuildPlanRecord.Written => ()
+            | HolbuildPlanRecord.NotWritten reason => say ("plan record not written: " ^ reason)
+        (* Check mode plans in full only to compare, and keeps the record
+           the restored plan wrote, so the suite reads such records back. *)
+        fun full {reason, record} =
+          let
+            val _ = say ("full (" ^ reason ^ ")")
+            val members = HolbuildPlanRecord.member_kinds graph
+            val planned as ({index, targets, plan, toolchain_key, ...}, _) =
+              with_options (prepare_plan (prepare_source_index "build" resolution project))
+            val unrecorded =
+              if not record then NONE
+              else if List.exists (not o null o HolbuildProject.package_generators) (HolbuildProjectGraph.packages graph)
+              then SOME "the project has generators"
+              else if not (null (HolbuildBuildPlan.generated_source_owners plan))
+              then SOME "theories write SML sources"
+              else NONE
+            val _ =
+              case unrecorded of
+                  SOME why => say ("plan record not written: " ^ why)
+                | NONE =>
+                    if not record then ()
+                    else
+                      write (context {members = members, dirs = rev (!HolbuildSourceIndex.observed_dirs),
+                                      stamps = Binarymap.mkDict String.compare, index = index,
+                                      targets = targets, toolchain_key = toolchain_key})
+                        plan (input_keys planned)
+          in
+            planned
+          end
+        fun restored {index, targets, plan, toolchain_key, changed, record, stamps, rehashed} =
+          let
+            (* With every root that has its own tactic timeout selected, the
+               plan holds each such root's closure, which is all the entry
+               plan would add. *)
+            val entry_plan =
+              case entry_targets index of
+                  [] => NONE
+                | entry_targets =>
+                    if List.all (fn target => List.exists (fn node => HolbuildBuildPlan.logical_name node = target)
+                                                          (HolbuildBuildPlan.selected_nodes plan))
+                                entry_targets
+                    then SOME plan
+                    else raise HolbuildPlanRecord.Fall "a root with its own tactic timeout is not selected"
+            val planned =
+              with_options {index = index, targets = targets, entry_plan = entry_plan, plan = plan,
+                            toolchain_key = toolchain_key, components = NONE}
+            val keys = input_keys planned
+            val changed_keys = HolbuildPlanRecord.changed_keys record plan keys
+            val _ = say ("from record (" ^ Int.toString rehashed ^ " files rehashed, " ^
+                         Int.toString changed_keys ^ " keys changed)")
+            val _ =
+              if changed orelse changed_keys > 0 then
+                write (context {members = #members record,
+                                dirs = map (fn {path, entries, ...} =>
+                                              (path, Binarymap.peek(stamps, path), entries)) (#dirs record),
+                                stamps = stamps, index = index, targets = targets,
+                                toolchain_key = toolchain_key})
+                  plan keys
+              else ()
+          in
+            (* Check mode builds from the record too, once full planning agrees. *)
+            case record_mode of
+                HolbuildPlanRecord.Check =>
+                  let val from_full = full {reason = "checking the plan record", record = false}
+                  in HolbuildPlanRecord.compare ((#1 planned, keys), (#1 from_full, input_keys from_full)) end
+              | _ => ();
+            planned
+          end
+      in
+        case attempt of
+            HolbuildPlanRecord.Fallback reason => full {reason = reason, record = record_mode <> HolbuildPlanRecord.Off}
+          | HolbuildPlanRecord.Restored restored_plan =>
+              restored restored_plan
+              handle HolbuildPlanRecord.Fall reason => full {reason = reason, record = true}
+      end
+    (* Plans the build, from the plan record when it applies. *)
+    fun plan_build () =
+      let
+        val planned as (sources, _) =
+          case prepared of
+              SOME _ => with_options (prepare_plan (prepared_sources ()))
+            | NONE => if watch then with_options (prepare_plan (prepared_sources ())) else plan_with_record ()
+      in
+        warn_unreachable_for sources;
+        planned
       end
     fun describe_dry_run () =
-      let val (index, force_targets, entry_plan, plan, toolchain_key) = prepare_plan (prepared_sources ())
-          val build_options = build_options_for index entry_plan plan force_targets
+      let val ({plan, toolchain_key, ...}, build_options) = plan_build ()
       in
         timed_phase "dry_run.describe"
           (fn () => HolbuildBuildPlan.describe (HolbuildBuildExec.build_config_lines_for_node build_options project)
-                      (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan)
+                      (action_toolchain_key toolchain_key) plan)
       end
     fun execute_build () =
       let
-        fun execute (index, force_targets, entry_plan, plan, toolchain_key) =
+        fun execute (options, plan, toolchain_key) =
           timed_phase "build.execute"
-            (fn () => HolbuildBuildExec.build (build_options_for index entry_plan plan force_targets)
-                        tc project plan toolchain_key jobs)
-        val sources = prepared_sources ()
-        val planned as (index, _, entry_plan, plan, toolchain_key) = prepare_plan sources
-        fun build_owners owner_plan = execute (index, [], entry_plan, owner_plan, toolchain_key)
+            (fn () => HolbuildBuildExec.build options tc project plan toolchain_key jobs)
+        val ({index, entry_plan, plan, toolchain_key, components, ...}, options) = plan_build ()
+        fun build_owners owner_plan =
+          execute (build_options_for index entry_plan owner_plan [], owner_plan, toolchain_key)
       in
-        if build_generated_source_owners build_owners (#components sources) (#holdir tc) index plan then
-          execute (prepare_plan (prepare_source_index "build" resolution project))
-        else execute planned
+        case components of
+            (* A plan from the record has no theory that writes SML sources. *)
+            NONE => execute (options, plan, toolchain_key)
+          | SOME components =>
+              if build_generated_source_owners build_owners components (#holdir tc) index plan then
+                let val (planned as {plan, toolchain_key, ...}, options) =
+                      with_options (prepare_plan (prepare_source_index "build" resolution project))
+                in warn_unreachable_for planned; execute (options, plan, toolchain_key) end
+              else execute (options, plan, toolchain_key)
       end
     fun export_action_specs upload () =
-      let val (index, force_targets, entry_plan, plan, toolchain_key) = prepare_plan (prepared_sources ())
-          val build_options = build_options_for index entry_plan plan force_targets
+      let val ({plan, toolchain_key, ...}, build_options) = plan_build ()
       in
         timed_phase "action_spec.export"
           (fn () => print (HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key upload))
@@ -1159,8 +1284,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         val _ =
           if Option.isSome (HolbuildRemoteCacheConfig.url ()) then ()
           else raise Error "--remote-exec needs a remote cache: pass --remote-cache URL"
-        val (index, force_targets, entry_plan, plan, toolchain_key) = prepare_plan (prepared_sources ())
-        val build_options = build_options_for index entry_plan plan force_targets
+        val ({plan, toolchain_key, ...}, build_options) = plan_build ()
         fun export upload =
           timed_phase "action_spec.export"
             (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key upload)
@@ -2434,6 +2558,7 @@ fun main raw_args =
        | HolbuildSourceIndex.ErrorWithDebugArtifacts (msg, artifacts) => err_with_debug_artifacts msg artifacts
        | HolbuildDependencies.Error msg => err msg
        | HolbuildBuildPlan.Error msg => err msg
+       | HolbuildPlanRecord.Error msg => err msg
        | HolbuildBuildPlan.UnknownTarget unknown => err (HolbuildBuildPlan.unknown_target_message unknown)
        | HolbuildBuildExec.Error msg => err msg
        | HolbuildBuildExec.ErrorWithDebugArtifacts (msg, artifacts) => err_with_debug_artifacts msg artifacts
