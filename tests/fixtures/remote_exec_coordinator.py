@@ -65,8 +65,13 @@ class Handler(BaseHTTPRequestHandler):
         if (state / "down").exists():
             return self.answer(503, {"detail": "restarting"})
         ok = (state / "skip").exists() or subprocess.run([run, str(batch)]).returncode == 0
+        cut = (state / "cut").exists()
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
+        if cut:
+            # More than is sent, so curl reports the stream cut short.
+            (state / "cut").unlink()
+            self.send_header("Content-Length", "1000")
         self.end_headers()
         for line in batch.read_text().splitlines():
             fields = line.split()
@@ -75,8 +80,7 @@ class Handler(BaseHTTPRequestHandler):
                     running = {"type": "action", "input_key": fields[1], "theory": fields[4],
                                "state": "running", "tier": "standard", "attempts": 1,
                                "last_failure": None, "log_sha256": None}
-                    if (state / "cut").exists():
-                        (state / "cut").unlink()
+                    if cut:
                         self.wfile.write(json.dumps(running)[:30].encode())
                         return
                     self.wfile.write((json.dumps(running) + "\n").encode())

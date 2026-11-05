@@ -226,7 +226,7 @@ require_grep "BTheory built" "$tmpdir/forced.log"
 write_theories cut
 touch "$state/cut"
 run cut 0 build --remote-exec "$coordinator" BTheory
-require_grep 'lost the event stream for batch b[0-9]*: {"type": "action", "input_key"; reattaching' "$tmpdir/cut.log"
+require_grep 'lost the event stream for batch b[0-9]*: {"type": "action", "input_key"curl: (18) .*; reattaching' "$tmpdir/cut.log"
 require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/cut.log"
 refute_grep "remote ?" "$tmpdir/cut.log"
 
