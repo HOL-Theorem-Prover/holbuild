@@ -6,6 +6,7 @@ is a batch row first, then its actions and leases, so a completion, an expiry an
 
 import asyncio
 import contextlib
+import graphlib
 import logging
 import re
 import shlex
@@ -125,6 +126,34 @@ def burst_demand(counts: QueueCounts, warm_workers: int, max_burst_workers: int)
     return min(demand, max_burst_workers)
 
 
+@dataclass(frozen=True)
+class Priority:
+    """Where an action stands in its batch's DAG; claims take the deepest, then the widest, first."""
+
+    critical_depth: int  # edges on the longest path from the action to one nothing in the batch depends on
+    descendant_count: int  # actions of the batch that depend on it, directly or transitively
+
+
+def dag_priorities(keys: list[str], edges: list[tuple[str, str]]) -> dict[str, Priority]:
+    """The priority of each of ``keys`` in the DAG of ``edges``, ``(input_key, parent input_key)`` pairs.
+
+    Raises graphlib.CycleError when the edges form a cycle, a self-edge included.
+    """
+    children: dict[str, set[str]] = {key: set() for key in keys}
+    for child, parent in edges:
+        children[parent].add(child)
+    bit = {key: 1 << index for index, key in enumerate(keys)}
+    depth: dict[str, int] = {}
+    descendants: dict[str, int] = {}  # a bitset of ``bit``s
+    # With each action's children as its predecessors, the order visits children before their parents.
+    for key in graphlib.TopologicalSorter(children).static_order():
+        depth[key] = max((depth[c] + 1 for c in children[key]), default=0)
+        descendants[key] = 0
+        for c in children[key]:
+            descendants[key] |= bit[c] | descendants[c]
+    return {key: Priority(depth[key], descendants[key].bit_count()) for key in keys}
+
+
 def is_auth_failure(error: BaseException) -> bool:
     """Whether ``error``, or an error it wraps, is the database refusing the coordinator's credentials."""
     seen: BaseException | None = error
@@ -154,6 +183,34 @@ REFRESH_KEYS = sa.text(REFRESH.format(selected="SELECT unnest(CAST(:keys AS text
 REFRESH_CHILDREN = sa.text(
     REFRESH.format(selected="SELECT input_key FROM edges WHERE batch_id = :batch_id AND parent_key = ANY(:keys)")
 )
+
+
+# The ready action to claim next; see Coordinator.claim.
+CLAIM = sa.text("""
+WITH running_batches AS (
+    SELECT b.id, b.created_at,
+        count(a.input_key) FILTER (WHERE a.state = 'running') AS running_count,
+        max(a.last_claimed_at) AS last_claimed_at
+    FROM batches b
+    LEFT JOIN actions a ON a.batch_id = b.id
+    WHERE b.state = 'running'
+    GROUP BY b.id, b.created_at
+)
+SELECT a.batch_id, a.input_key, a.spec_sha256, a.theory
+FROM actions a
+JOIN running_batches b ON b.id = a.batch_id
+WHERE a.state = 'ready' AND a.tier = ANY(CAST(:tiers AS text[]))
+ORDER BY
+    array_position(CAST(:tiers AS text[]), a.tier),
+    b.running_count,
+    b.last_claimed_at NULLS FIRST,
+    b.created_at,
+    a.critical_depth DESC,
+    a.descendant_count DESC,
+    a.theory,
+    a.input_key
+LIMIT 1 FOR UPDATE OF a SKIP LOCKED
+""")
 
 
 # The burst worker target at :now: the highest demand recorded in the hold before it, under the current cap.
@@ -193,6 +250,7 @@ class Coordinator:
         parents: defaultdict[str, int] = defaultdict(int)
         for child, _ in batch.edges:
             parents[child] += 1
+        priority = dag_priorities([a.input_key for a in batch.actions], batch.edges)
         packages = [a.theory.split(":", 1)[0] for a in batch.actions]
         names = [a.theory.split(":", 1)[1] for a in batch.actions]
         async with self.engine.begin() as conn:
@@ -214,8 +272,10 @@ class Coordinator:
                 await conn.execute(
                     sa.text(
                         "INSERT INTO actions "
-                        "(batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier) "
-                        "VALUES (:batch_id, :input_key, :ac_key, :spec, :theory, :remaining, 'waiting', :tier)"
+                        "(batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier, "
+                        "critical_depth, descendant_count) "
+                        "VALUES (:batch_id, :input_key, :ac_key, :spec, :theory, :remaining, 'waiting', :tier, "
+                        ":depth, :descendants)"
                     ),
                     [
                         {
@@ -226,6 +286,8 @@ class Coordinator:
                             "theory": a.theory,
                             "remaining": parents[a.input_key],
                             "tier": "high" if a.theory in high else "standard",
+                            "depth": priority[a.input_key].critical_depth,
+                            "descendants": priority[a.input_key].descendant_count,
                         }
                         for a in batch.actions
                     ],
@@ -271,7 +333,9 @@ class Coordinator:
         disconnected: Callable[[], Awaitable[bool]] | None = None,
     ) -> Claim | None:
         """Lease a ready action to ``worker``, waiting up to ``wait_s`` seconds for one, or None if none became
-        ready: of the first of ``tiers`` that has one, the oldest batch's first (by theory).
+        ready: of the first of ``tiers`` that has one, the batch with the fewest running actions, then the one
+        that least recently had one claimed, then the oldest; within it, the action with the deepest chain of
+        dependents, then the most dependents.
 
         A wait ends early once ``disconnected`` says the worker has gone, so no action is leased to nobody. It is
         woken when this process's ``release`` makes an action ready, and rechecks every ``CLAIM_RECHECK_SECONDS``
@@ -293,24 +357,16 @@ class Coordinator:
 
     async def _claim(self, tiers: list[str], worker: str) -> Claim | None:
         async with self.engine.begin() as conn:
-            row = (
-                await conn.execute(
-                    sa.text(
-                        "SELECT a.batch_id, a.input_key, a.spec_sha256, a.theory FROM actions a "
-                        "JOIN batches b ON b.id = a.batch_id "
-                        "WHERE a.state = 'ready' AND a.tier = ANY(CAST(:tiers AS text[])) AND b.state = 'running' "
-                        "ORDER BY array_position(CAST(:tiers AS text[]), a.tier), b.created_at, a.theory, a.input_key "
-                        "LIMIT 1 FOR UPDATE OF a SKIP LOCKED"
-                    ),
-                    {"tiers": tiers},
-                )
-            ).first()
+            # A batch's running count and last claim are read without locking its row, so concurrent claims see
+            # only each other's committed leases, which at worst lets workers waking together pick the same
+            # batch. Locking or updating the batch row here, after the action row, would invert the lock order.
+            row = (await conn.execute(CLAIM, {"tiers": tiers})).first()
             if row is None:
                 return None
             token = uuid4()
             await conn.execute(
                 sa.text(
-                    "UPDATE actions SET state = 'running', attempts = attempts + 1 "
+                    "UPDATE actions SET state = 'running', attempts = attempts + 1, last_claimed_at = now() "
                     "WHERE batch_id = :batch_id AND input_key = :input_key"
                 ),
                 {"batch_id": row.batch_id, "input_key": row.input_key},
@@ -694,18 +750,62 @@ class Coordinator:
             await self._fail_batch(
                 conn, batch_id, input_key, f"resubmit: {theory} is still missing {what} after {attempts} attempts"
             )
-        elif rebuilt is not None and missing is not None:
-            await conn.execute(
-                sa.text(
-                    "INSERT INTO edges (batch_id, input_key, parent_key) VALUES (:batch_id, :input_key, :missing) "
-                    "ON CONFLICT DO NOTHING"
-                ),
-                {"batch_id": batch_id, "input_key": input_key, "missing": missing.key},
-            )
+        elif (
+            rebuilt is not None and missing is not None and await self._add_edge(conn, batch_id, input_key, missing.key)
+        ):
             await self._set_state(conn, batch_id, input_key, "waiting")
             await self._requeue(conn, batch_id, missing.key)
         else:
             await self._retry(conn, batch_id, input_key)
+
+    async def _add_edge(self, conn: AsyncConnection, batch_id: UUID, child: str, parent: str) -> bool:
+        """Make ``child`` depend on ``parent``, updating the priorities it changes; False, adding nothing, when the
+        edge would close a cycle: a theory can't be missing itself or a theory that depends on it, so the result is
+        wrong and the action is retried as for an input that isn't the batch's."""
+        edges = [
+            (row.input_key, row.parent_key)
+            for row in await conn.execute(
+                sa.text("SELECT input_key, parent_key FROM edges WHERE batch_id = :batch_id"), {"batch_id": batch_id}
+            )
+        ]
+        current = {
+            row.input_key: Priority(row.critical_depth, row.descendant_count)
+            for row in await conn.execute(
+                sa.text("SELECT input_key, critical_depth, descendant_count FROM actions WHERE batch_id = :batch_id"),
+                {"batch_id": batch_id},
+            )
+        }
+        try:
+            priority = dag_priorities(list(current), [*edges, (child, parent)])
+        except graphlib.CycleError:
+            return False
+        await conn.execute(
+            sa.text(
+                "INSERT INTO edges (batch_id, input_key, parent_key) VALUES (:batch_id, :child, :parent) "
+                "ON CONFLICT DO NOTHING"
+            ),
+            {"batch_id": batch_id, "child": child, "parent": parent},
+        )
+        # Only ``parent`` and what it depends on can change, and nothing does when the edge was there already;
+        # leaving the other rows alone keeps concurrent claims from skipping them.
+        changed = [key for key, p in priority.items() if p != current[key]]
+        if changed:
+            await conn.execute(
+                sa.text(
+                    "UPDATE actions SET critical_depth = :depth, descendant_count = :descendants "
+                    "WHERE batch_id = :batch_id AND input_key = :input_key"
+                ),
+                [
+                    {
+                        "batch_id": batch_id,
+                        "input_key": key,
+                        "depth": priority[key].critical_depth,
+                        "descendants": priority[key].descendant_count,
+                    }
+                    for key in changed
+                ],
+            )
+        return True
 
     async def _requeue(self, conn: AsyncConnection, batch_id: UUID, input_key: str) -> None:
         await conn.execute(
