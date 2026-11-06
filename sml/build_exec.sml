@@ -3285,6 +3285,7 @@ fun run_theory_action cache_allowed policy tc root checkpoint_root base_context 
                                       (if trknl_enabled policy then SOME staged_trace else NONE)
                                       staged_extra_outputs generated_metadata)
       else ()
+    val _ = remove_file (current_checkpoint_failure_log log_dir)
   in
     generated_metadata
   end
