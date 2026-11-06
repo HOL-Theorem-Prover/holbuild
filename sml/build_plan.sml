@@ -251,8 +251,6 @@ type t =
    selected_graph_id : string,
    selected_plan_id : string,
    resolved_plan_id : string,
-   universe_key_index : key_index,
-   universe_node_index : node Vector.vector,
    selected_key_index : key_index,
    selected_node_index : node Vector.vector,
    selected_adjacency : int list Vector.vector,
@@ -434,12 +432,14 @@ fun unresolved_dependencies plan node =
 fun reverse_dependency_edges plan node =
   graph_values (#reverse (dependency_graph plan)) node
 
+(* Resolved edges lead from selected nodes to selected nodes: the selection
+   is closed under them. *)
 fun direct_project_deps
-      (plan as {universe_key_index, universe_node_index, ...} : t) node =
+      (plan as {selected_key_index, selected_node_index, ...} : t) node =
   let
     fun target (edge : resolved_dependency_edge) =
-      Vector.sub(universe_node_index,
-                 indexed_key_id universe_key_index (#to_node edge))
+      Vector.sub(selected_node_index,
+                 indexed_key_id selected_key_index (#to_node edge))
   in
     unique_nodes (map target (resolved_dependency_edges plan node))
   end
@@ -571,8 +571,8 @@ fun selected_closure
   end
 
 fun transitive_project_deps
-      (plan as {dependency_closure_cache, universe_key_index, ...} : t) node =
-  let val id = indexed_key_id universe_key_index (key node)
+      (plan as {dependency_closure_cache, selected_key_index, ...} : t) node =
+  let val id = indexed_key_id selected_key_index (key node)
   in
     case Array.sub(dependency_closure_cache, id) of
         SOME dependencies => dependencies
@@ -585,8 +585,9 @@ fun transitive_project_deps
           end
   end
 
-fun plan_node_id ({universe_key_index, ...} : t) node =
-  indexed_key_id universe_key_index (key node)
+(* A selected node's position, which indexes the plan's per-node caches. *)
+fun plan_node_id ({selected_key_index, ...} : t) node =
+  indexed_key_id selected_key_index (key node)
 
 fun cached_dependency_context_key
       (plan as {dependency_context_key_cache, ...} : t) node context_id =
@@ -920,18 +921,16 @@ fun assemble {nodes, name_index, roots, selected, analysis, dependency_graph, re
      selected_graph_id = selected_graph_id,
      selected_plan_id = selected_plan_id,
      resolved_plan_id = resolved_plan_id,
-     universe_key_index = build_key_index nodes,
-     universe_node_index = Vector.fromList nodes,
      selected_key_index = selected_key_index,
      selected_node_index = Vector.fromList selected,
      selected_adjacency =
        build_selected_adjacency selected_key_index selected dependency_graph,
-     dependency_closure_cache = Array.array(length nodes, NONE),
-     dependency_context_key_cache = Array.array(length nodes, NONE),
-     extra_inputs_key_cache = Array.array(length nodes, NONE),
+     dependency_closure_cache = Array.array(length selected, NONE),
+     dependency_context_key_cache = Array.array(length selected, NONE),
+     extra_inputs_key_cache = Array.array(length selected, NONE),
      input_expansions = ref (Binarymap.mkDict String.compare),
      input_hashes = ref (Binarymap.mkDict String.compare),
-     known_input_keys = Array.array(length nodes, NONE)}
+     known_input_keys = Array.array(length selected, NONE)}
   end
 
 fun plan_selection components holdir sources selection =

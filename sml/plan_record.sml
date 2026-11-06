@@ -4,8 +4,10 @@
    A record lives in .holbuild/plan/<fingerprint>, where the fingerprint
    hashes every planning input that is not a scanned file.  It keeps the stat
    and hash of each selected source and extra-input file, the stat and
-   classified entries of each directory discovery listed, every discovered
-   source, and per selected node everything execute reads from the plan.
+   classified entries of each directory discovery listed for a package other
+   than HOL or a pinned git checkout, every discovered source, and per
+   selected node
+   everything execute reads from the plan.
 
    A file counts as unchanged only when its size, mtime, ctime, inode and
    device all match, as in git's index.  A file or directory modified within
@@ -20,7 +22,7 @@ structure SC = HolbuildStatCache
 
 exception Error of string
 
-val format = "holbuild-plan-record-v1"
+val format = "holbuild-plan-record-v2"
 val kept_records = 4
 
 datatype mode = Off | On | Check
@@ -170,13 +172,15 @@ type stamped_dir = {path : string, stamp : stamp, racy : bool}
 (* A discovered source, by position of its package in the record. *)
 type source_entry =
   {package : int, kind : SI.kind, logical_name : string, relative_path : string,
-   source_path : string, id : string, policy_id : string, execution_policy_id : string}
+   source_path : string}
 
+(* EDGES holds the node's edges as the record encodes them. *)
 type node_entry =
   {source : int, hash : string, deps : HolbuildDependencies.t,
    symbolic : (string * BP.dependency_reason) list,
    resolved : (int * string * BP.dependency_reason) list,
    external : (string * BP.external_dependency_kind * BP.dependency_reason) list,
+   edges : string list,
    config_lines : string list, input_key : string, extra_inputs_key : string option}
 
 type expansion = {base : string, decl : string, files : (string * string) list, dirs : string list}
@@ -244,6 +248,14 @@ fun compact_edges deps symbolic resolved external =
   end
   handle Subscript => raise Irregular
 
+fun encoded_edges deps symbolic resolved external =
+  let val {declared, external, resolved} = compact_edges deps symbolic resolved external
+  in
+    [items (map (fn (name, reason) => parts [name, reason_text reason]) declared),
+     external,
+     items (map (fn (position, target) => parts [int_text position, int_text target]) resolved)]
+  end
+
 fun expand_edges deps declared external_codes resolved =
   let
     val symbolic = extracted_symbolic deps @ declared
@@ -274,21 +286,14 @@ fun encode ({fingerprint, toolchain, action_toolchain_key, packages, members, di
              expansions, sources, roots, selected, targets, ids} : t) =
   let
     val roots_of = Vector.fromList (map (fn (_, root) => root) packages)
-    fun source ({package, kind, logical_name, relative_path, source_path, id, policy_id, execution_policy_id} : source_entry) =
+    fun source ({package, kind, logical_name, relative_path, source_path} : source_entry) =
       line "S" [int_text package, kind_char kind, logical_name, relative_path,
                 if source_path = default_source_path (Vector.sub(roots_of, package)) relative_path
-                then "" else check_text source_path,
-                id, policy_id, execution_policy_id]
-    fun node ({source, hash, deps, symbolic, resolved, external, config_lines, input_key, extra_inputs_key} : node_entry) =
-      let val {declared, external, resolved} = compact_edges deps symbolic resolved external
-      in
-        line "N"
-          ([int_text source, hash, input_key, getOpt (extra_inputs_key, ""), items config_lines] @
-           deps_fields deps @
-           [items (map (fn (name, reason) => parts [name, reason_text reason]) declared),
-            external,
-            items (map (fn (position, target) => parts [int_text position, int_text target]) resolved)])
-      end
+                then "" else check_text source_path]
+    fun node ({source, hash, deps, edges, config_lines, input_key, extra_inputs_key, ...} : node_entry) =
+      line "N"
+        ([int_text source, hash, input_key, getOpt (extra_inputs_key, ""), items config_lines] @
+         deps_fields deps @ edges)
   in
     String.concat
       ([format ^ "\n",
@@ -318,9 +323,17 @@ fun encode ({fingerprint, toolchain, action_toolchain_key, packages, members, di
        ["E\n"])
   end
 
+(* In pieces: in a fresh Poly/ML 5.9.2 process, TextIO.inputAll of a file of
+   about 3 to 3.8 MB mostly aborts with "Run out of store", the heap-sizing
+   problem behind HolbuildDependencies.analyser_min_heap_mb. *)
 fun read_text path =
-  let val input = TextIO.openIn path
-  in TextIO.inputAll input before TextIO.closeIn input
+  let
+    val input = TextIO.openIn path
+    fun loop pieces =
+      case TextIO.inputN (input, 65536) of
+          "" => String.concat (rev pieces)
+        | piece => loop (piece :: pieces)
+  in loop [] before TextIO.closeIn input
      handle e => (TextIO.closeIn input; raise e)
   end
 
@@ -336,15 +349,14 @@ fun decode text : t =
     val input_dirs = ref [] val expansions = ref [] val sources = ref [] val selected = ref []
     val complete = ref false
     val package_roots = ref (Vector.fromList [])
-    fun source_line [package, kind, logical, rel, path, id, policy_id, execution_policy_id] =
+    fun source_line [package, kind, logical, rel, path] =
           let val package = parse_int package
               val _ = if Vector.length (!package_roots) = length (!packages) then ()
                       else package_roots := Vector.fromList (rev (map #2 (!packages)))
               val root = Vector.sub(!package_roots, package) handle Subscript => bad "package index"
           in
             {package = package, kind = parse_kind kind, logical_name = logical, relative_path = rel,
-             source_path = if path = "" then default_source_path root rel else path,
-             id = id, policy_id = policy_id, execution_policy_id = execution_policy_id}
+             source_path = if path = "" then default_source_path root rel else path}
           end
       | source_line _ = bad "source"
     fun deps_of [loads, uses, extra_deps, extra_outputs, holdep_mentions] =
@@ -369,7 +381,8 @@ fun decode text : t =
                    {source = parse_int source, hash = hash, input_key = input_key,
                     extra_inputs_key = if extra_key = "" then NONE else SOME extra_key,
                     config_lines = split_items config, deps = deps,
-                    symbolic = #symbolic edges, resolved = #resolved edges, external = #external edges}
+                    symbolic = #symbolic edges, resolved = #resolved edges, external = #external edges,
+                    edges = [declared, external, resolved]}
                  end
              | _ => bad "node")
       | node_line _ = bad "node"
@@ -434,8 +447,38 @@ fun decode text : t =
 
 fun read_optional path = SOME (read_text path) handle IO.Io _ => NONE
 
+(* HOL and the packages inside it, which the toolchain's stamp covers. *)
 fun is_hol_package package =
-  HolbuildPackageProvenance.is_implicit_hol (HolbuildProject.package_provenance package)
+  case HolbuildPackageProvenance.snapshot (HolbuildProject.package_provenance package) of
+      HolbuildPackageProvenance.ToolchainSnapshot _ => true
+    | _ => false
+
+(* A git dependency holbuild checked out at its pinned revision: the record
+   keeps the files planning read there, but not what its directories hold. *)
+fun is_pinned_git_package package =
+  let val provenance = HolbuildProject.package_provenance package
+  in
+    case (HolbuildPackageProvenance.snapshot provenance, HolbuildPackageProvenance.retrieval provenance) of
+        (HolbuildPackageProvenance.GitSnapshot _, HolbuildPackageProvenance.DeclaredGitRetrieval _) => true
+      | (HolbuildPackageProvenance.GitSnapshot _, HolbuildPackageProvenance.AlternateGitRetrieval _) => true
+      | _ => false
+  end
+
+(* The directories of OBSERVED, as discovery listed them, that the record
+   watches: not those a scan of HOL or of a pinned checkout listed, whose
+   entries change only with the pin. *)
+fun watched_dirs graph observed =
+  let
+    val fixed =
+      map HolbuildProject.package_name
+        (List.filter (fn p => is_hol_package p orelse is_pinned_git_package p)
+           (HolbuildProjectGraph.packages graph))
+  in
+    List.mapPartial
+      (fn (package, path, stamp, entries) =>
+         if List.exists (fn name => name = package) fixed then NONE else SOME (path, stamp, entries))
+      observed
+  end
 
 fun recorded_env_var entry =
   String.isPrefix "HOLBUILD_" entry andalso
@@ -534,30 +577,15 @@ fun prune_records dir =
 
 datatype write_outcome = Written | NotWritten of string
 
-(* The record of PLAN and its KEYS. *)
+(* The record of PLAN and its KEYS.  A plan restored from PRIOR has its
+   sources, roots and dependency edges, so only what the files and keys say
+   is taken from the plan. *)
 fun build ({fingerprint, start_ns, toolchain, action_toolchain_key, graph, members, dirs,
-            stamps, index, targets} : context) plan keys : t =
+            stamps, index, targets} : context) prior plan keys : t =
   let
     val packages = HolbuildProjectGraph.packages graph
     val hol_roots = map HolbuildProject.package_root (List.filter is_hol_package packages)
     fun in_hol path = List.exists (fn root => under root path) hol_roots
-    val package_names = map HolbuildProject.package_name packages
-    val package_ids =
-      List.foldl (fn ((i, name), map) => Binarymap.insert(map, name, i)) (Binarymap.mkDict String.compare)
-        (ListPair.zip (List.tabulate (length package_names, fn i => i), package_names))
-    fun package_index name =
-      case Binarymap.peek(package_ids, name) of
-          SOME i => i
-        | NONE => raise Error ("source of unknown package " ^ name)
-    val positions =
-      #2 (List.foldl (fn (source : SI.source, (i, map)) =>
-                        (i + 1, Binarymap.insert(map, #package source ^ "\000" ^ #relative_path source ^ "\000" ^ #logical_name source, i)))
-                     (0, Binarymap.mkDict String.compare) index)
-    fun position_of_key key =
-      case Binarymap.peek(positions, key) of
-          SOME i => i
-        | NONE => raise Error ("planned node missing from the discovered sources: " ^ String.toString key)
-    fun position node = position_of_key (BP.key node)
     fun stamp_of path =
       case Binarymap.peek(stamps, path) of
           SOME st => st
@@ -566,29 +594,75 @@ fun build ({fingerprint, start_ns, toolchain, action_toolchain_key, graph, membe
                      | NONE => raise Unrecordable ("cannot stat " ^ path))
     val racy = racy_at start_ns
     val selected = BP.selected_nodes plan
-    fun source_entry (source : SI.source) =
-      {package = package_index (#package source), kind = #kind source, logical_name = #logical_name source,
-       relative_path = #relative_path source, source_path = #source_path source,
-       id = SI.source_id source, policy_id = #policy_id (SI.node_of source),
-       execution_policy_id = #execution_policy_id (SI.node_of source)}
-    fun node_entry node =
+    fun known_of node =
       let
         val known =
           case BP.known_input_key plan node of
               SOME known => known
             | NONE => raise Error ("no input key for " ^ BP.logical_name node)
-        val _ = if #input_key known = BP.input_key_for keys node then ()
-                else raise Error ("stale input key for " ^ BP.logical_name node)
       in
-        {source = position node, hash = BP.source_hash plan node, deps = BP.dependencies plan node,
-         symbolic = map (fn BP.SymbolicDependency {name, reason, ...} => (name, reason))
-                      (BP.symbolic_dependencies plan node),
-         resolved = map (fn {to_node, symbolic_name, reason, ...} => (position_of_key to_node, symbolic_name, reason))
-                      (BP.resolved_dependency_edges plan node),
-         external = map (fn {name, kind, reason, ...} => (name, kind, reason)) (BP.external_dependencies plan node),
-         config_lines = #config_lines known, input_key = #input_key known,
-         extra_inputs_key = #extra_inputs_key known}
+        if #input_key known = BP.input_key_for keys node then known
+        else raise Error ("stale input key for " ^ BP.logical_name node)
       end
+    fun from_plan () =
+      let
+        val package_names = map HolbuildProject.package_name packages
+        val package_ids =
+          List.foldl (fn ((i, name), map) => Binarymap.insert(map, name, i)) (Binarymap.mkDict String.compare)
+            (ListPair.zip (List.tabulate (length package_names, fn i => i), package_names))
+        fun package_index name =
+          case Binarymap.peek(package_ids, name) of
+              SOME i => i
+            | NONE => raise Error ("source of unknown package " ^ name)
+        val positions =
+          #2 (List.foldl (fn (source : SI.source, (i, map)) =>
+                            (i + 1, Binarymap.insert(map, #package source ^ "\000" ^ #relative_path source ^ "\000" ^ #logical_name source, i)))
+                         (0, Binarymap.mkDict String.compare) index)
+        fun position_of_key key =
+          case Binarymap.peek(positions, key) of
+              SOME i => i
+            | NONE => raise Error ("planned node missing from the discovered sources: " ^ String.toString key)
+        fun position node = position_of_key (BP.key node)
+        fun source_entry (source : SI.source) =
+          {package = package_index (#package source), kind = #kind source, logical_name = #logical_name source,
+           relative_path = #relative_path source, source_path = #source_path source}
+        fun node_entry node =
+          let
+            val known = known_of node
+            val deps = BP.dependencies plan node
+            val symbolic = map (fn BP.SymbolicDependency {name, reason, ...} => (name, reason))
+                             (BP.symbolic_dependencies plan node)
+            val resolved = map (fn {to_node, symbolic_name, reason, ...} => (position_of_key to_node, symbolic_name, reason))
+                             (BP.resolved_dependency_edges plan node)
+            val external = map (fn {name, kind, reason, ...} => (name, kind, reason)) (BP.external_dependencies plan node)
+          in
+            {source = position node, hash = BP.source_hash plan node, deps = deps,
+             symbolic = symbolic, resolved = resolved, external = external,
+             edges = encoded_edges deps symbolic resolved external,
+             config_lines = #config_lines known, input_key = #input_key known,
+             extra_inputs_key = #extra_inputs_key known}
+          end
+      in
+        {sources = map source_entry index, roots = map position (BP.root_nodes plan),
+         selected = map node_entry selected}
+      end
+    fun from_record (record : t) =
+      {sources = #sources record, roots = #roots record,
+       selected =
+         ListPair.mapEq
+           (fn (node, {source, deps, symbolic, resolved, external, edges, ...} : node_entry) =>
+              let val known = known_of node
+              in
+                {source = source, hash = BP.source_hash plan node, deps = deps,
+                 symbolic = symbolic, resolved = resolved, external = external, edges = edges,
+                 config_lines = #config_lines known, input_key = #input_key known,
+                 extra_inputs_key = #extra_inputs_key known}
+              end)
+           (selected, #selected record)}
+    val {sources, roots, selected = node_entries} =
+      case prior of
+          SOME record => from_record record
+        | NONE => from_plan ()
     val source_files =
       List.mapPartial
         (fn node =>
@@ -608,11 +682,8 @@ fun build ({fingerprint, start_ns, toolchain, action_toolchain_key, graph, membe
       map (fn path => let val st = stamp_of path in {path = path, stamp = st, racy = racy st} end)
         (SI.sort_unique_strings (List.concat (map (fn (_, _, {dirs, ...}) => dirs) expansions)))
     val dir_entries =
-      List.mapPartial
-        (fn (path, SOME st, entries) =>
-              if in_hol path then NONE
-              else SOME {path = path, stamp = st, racy = racy st, entries = entries}
-          | (path, NONE, _) => raise Unrecordable ("cannot stat " ^ path))
+      map (fn (path, SOME st, entries) => {path = path, stamp = st, racy = racy st, entries = entries}
+            | (path, NONE, _) => raise Unrecordable ("cannot stat " ^ path))
         dirs
     val hol_stamp = stamp_of (#hol toolchain)
     val state_stamp = stamp_of (#state toolchain)
@@ -627,9 +698,9 @@ fun build ({fingerprint, start_ns, toolchain, action_toolchain_key, graph, membe
      files = file_entries,
      input_dirs = input_dir_entries,
      expansions = map (fn (base, decl, {files, dirs}) => {base = base, decl = decl, files = files, dirs = dirs}) expansions,
-     sources = map source_entry index,
-     roots = map position (BP.root_nodes plan),
-     selected = map node_entry selected,
+     sources = sources,
+     roots = roots,
+     selected = node_entries,
      targets = targets,
      ids = {resolution_context_id = BP.resolution_context_id plan,
             selected_graph_id = BP.selected_graph_id plan,
@@ -637,9 +708,10 @@ fun build ({fingerprint, start_ns, toolchain, action_toolchain_key, graph, membe
             resolved_plan_id = BP.resolved_plan_id plan}}
   end
 
-(* Writes the record of PLAN and its KEYS into DIR, or says why not. *)
-fun write dir context plan keys =
-  let val record = build context plan keys
+(* Writes the record of PLAN and its KEYS into DIR, or says why not; PRIOR
+   is the record PLAN was restored from. *)
+fun write dir context prior plan keys =
+  let val record = build context prior plan keys
   in
     write_record (OS.Path.concat (dir, #fingerprint record)) (encode record);
     prune_records dir;
@@ -765,10 +837,9 @@ fun restore {dir, graph, tc : HolbuildToolchain.t, fingerprint, start_ns} =
     val package_vector = Vector.fromList packages
     val package_ids = Vector.map SI.source_graph_package_id package_vector
     val sources =
-      map (fn ({package, kind, logical_name, relative_path, source_path, id, policy_id, execution_policy_id} : source_entry) =>
+      map (fn ({package, kind, logical_name, relative_path, source_path} : source_entry) =>
              SI.restore_source (Vector.sub(package_vector, package)) (Vector.sub(package_ids, package))
-               {kind = kind, logical_name = logical_name, source_path = source_path, relative_path = relative_path,
-                ids = {id = id, policy_id = policy_id, execution_policy_id = execution_policy_id}})
+               {kind = kind, logical_name = logical_name, source_path = source_path, relative_path = relative_path})
         (#sources record)
       handle Subscript => fall "malformed plan record: package index"
     val source_vector = Vector.fromList sources
@@ -877,6 +948,8 @@ fun changed_keys (record : t) plan keys =
 
 (* ---- Check mode ---- *)
 
+(* A source as the plan reads it; restored sources keep no node identities
+   or canonical artifacts (SI.restore_source). *)
 fun source_text (source : SI.source) =
   let
     val node = #node source
@@ -886,9 +959,8 @@ fun source_text (source : SI.source) =
     String.concatWith " "
       [#package source, #package_root source, SI.kind_string (#kind source), #logical_name source,
        #source_path source, #relative_path source, artifacts (#artifacts source),
-       #id node, #package_id node, #relative_path node, #logical_name node, SI.kind_string (#kind node),
-       SI.origin_tag (#origin node), artifacts (#canonical_artifacts node), #policy_id node,
-       #execution_policy_id node, SI.policy_render (#policy node), SI.execution_policy_render (#policy node),
+       #package_id node, #relative_path node, #logical_name node, SI.kind_string (#kind node),
+       SI.origin_tag (#origin node), SI.policy_render (#policy node), SI.execution_policy_render (#policy node),
        SI.policy_render (#policy source)]
   end
 

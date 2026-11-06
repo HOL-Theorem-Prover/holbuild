@@ -546,6 +546,135 @@ from_subdirectory() {
   expect_plan "full (no plan record for these inputs)" "$p/src"
 }
 
+# A package with the default members ["."] names its sources by plain paths
+# under its root, so the record leaves them out of S lines, and a source
+# that is also an extra input of its own directory is one file to the record.
+default_members() {
+  local p=$tmpdir/default-members
+  mkdir -p "$p"
+  cat > "$p/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$hol_rev"
+
+[project]
+name = "default-members"
+TOML
+  theory "$p/AScript.sml" A
+  cat >> "$p/AScript.sml" <<'SML'
+fun holbuild_extra_deps (_ : string list) = ()
+val _ = holbuild_extra_deps ["."]
+SML
+  sleep 1.1
+  expect_plan "full (no plan record for these inputs)" "$p"
+  local records=("$p"/.holbuild/plan/*)
+  python3 - "${records[@]}" <<'PY'
+import sys
+path, = sys.argv[1:]
+for line in open(path, encoding="latin-1").read().split("\n"):
+    if line.startswith("S") and line[1:].split("\x01")[4] != "":
+        sys.exit("S line names a default path: " + repr(line))
+PY
+  printf '\n(* edited *)\n' >> "$p/AScript.sml"
+  expect_plan "from record (1 files rehashed, 1 keys changed)" "$p"
+}
+
+# A build planned from the record rewrites it from the record it read; the
+# result is byte for byte what full planning writes for the same tree.
+restored_write_matches_full() {
+  local p=$tmpdir/restored-write
+  mkdir -p "$p/data"
+  echo one > "$p/data/a.txt"
+  make_project "$p" '
+[actions.BTheory]
+extra_inputs = ["data"]'
+  expect_plan "full (no plan record for these inputs)" "$p"
+  printf '\n(* edited *)\n' >> "$p/src/DScript.sml"
+  echo two > "$p/data/b.txt"
+  # Let both edits age past the racy window, so both writes see the same
+  # stamps.
+  sleep 1.1
+  expect_plan "from record (" "$p"
+  local record
+  record=$(ls "$p"/.holbuild/plan/*)
+  mv "$record" "$tmpdir/restored-record"
+  expect_plan "full (no plan record for these inputs)" "$p"
+  if ! cmp "$record" "$tmpdir/restored-record"; then
+    echo "the record written from a restored plan differs from full planning's" >&2
+    exit 1
+  fi
+}
+
+# A path override inside a pinned checkout is still watched, also below a
+# shim of that checkout rooted inside the override, and a shim at "." of the
+# checkout names the checkout's root itself.
+package_in_pinned_checkout() {
+  local p=$tmpdir/in-pinned
+  library_package "$tmpdir/outer" outer Outer
+  mkdir -p "$tmpdir/outer/lib"
+  echo "structure OuterLib = struct val value = 1 end" > "$tmpdir/outer/lib/OuterLib.sml"
+  local rev
+  rev=$(init_git_repo "$tmpdir/outer")
+  using_project "$p" outer Outer "git = \"$tmpdir/outer\"
+rev = \"$rev\""
+  expect_plan "full (no plan record for these inputs)" "$p"
+  local inner=$p/.holbuild/src/outer/inner
+  library_package "$inner" inner Inner
+  mkdir -p "$p/shims" "$inner/src/lib"
+  cat > "$p/shims/innerlib.toml" <<'TOML'
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[project]
+name = "innerlib"
+
+[build]
+members = ["lib"]
+TOML
+  cat > "$p/shims/outerlib.toml" <<'TOML'
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[project]
+name = "outerlib"
+
+[build]
+members = ["lib"]
+TOML
+  cat >> "$p/holproject.toml" <<'TOML'
+
+[dependencies.inner]
+git = "https://example.invalid/inner.git"
+rev = "1111111111111111111111111111111111111111"
+
+[dependencies.outerlib]
+from = "outer"
+path = "."
+manifest = "shims/outerlib.toml"
+
+[dependencies.innerlib]
+from = "outer"
+path = "inner/src"
+manifest = "shims/innerlib.toml"
+TOML
+  printf '[overrides.inner]\npath = "%s"\n' "$inner" > "$p/.holconfig.toml"
+  sleep 1.1
+  expect_plan "full (no plan record for these inputs)" "$p"
+  expect_plan "from record (" "$p"
+  if grep -q '/\./' "$p"/.holbuild/plan/*; then
+    echo "the record names a path through /./" >&2
+    exit 1
+  fi
+  echo "structure Inner2 = struct end" > "$inner/src/Inner2.sml"
+  expect_plan "full (sources added, removed or renamed in $inner/src)" "$p"
+}
+
 noop
 racy_entries_are_rehashed
 edit_with_restored_mtime
@@ -572,3 +701,6 @@ entry_kinds
 incoming_edge_order
 default_mode_rewrites
 from_subdirectory
+default_members
+restored_write_matches_full
+package_in_pinned_checkout
