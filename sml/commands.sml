@@ -1347,10 +1347,12 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           let
             val {add, stop} =
               HolbuildBuildExec.start_remote_exec_prefetch build_options tc project plan toolchain_key jobs in_batch
-            val follow = if remote_only then HolbuildRemoteExec.follow else HolbuildRemoteExec.follow_cancellable
+            fun follow_batch () =
+              (HolbuildRemoteExec.follow url batch_id add before stop ())
+              handle e => (stop (); raise e)
           in
-            (follow url batch_id add before stop ())
-            handle e => (stop (); raise e)
+            if remote_only then follow_batch ()
+            else HolbuildRemoteExec.while_followed url batch_id follow_batch
           end
         fun finish in_batch batch_id =
           case follow in_batch batch_id of

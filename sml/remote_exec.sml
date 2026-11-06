@@ -230,9 +230,10 @@ val cancel = cancel_within request_max_time_seconds
    than leave it running for nobody until its deadline. *)
 val followed : (string * string) option ref = ref NONE
 
-fun follow_cancellable url batch_id on_done =
+(* Runs f, which follows the batch, with the batch registered as followed. *)
+fun while_followed url batch_id f =
   (followed := SOME (url, batch_id);
-   follow url batch_id on_done before followed := NONE)
+   f () before followed := NONE)
   handle e => (followed := NONE; raise e)
 
 (* Whoever interrupts a build may kill it soon after, so this waits briefly. *)

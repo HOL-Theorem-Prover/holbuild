@@ -162,6 +162,8 @@ run refused-only 75 build --remote-exec "$coordinator" --remote-only BTheory
 require_grep "coordinator refused the batch (HTTP 400): .*batch refused by the stub" "$tmpdir/refused-only.log"
 run refused-detach 1 build --remote-exec "$coordinator" --detach BTheory
 refute_grep "Theory built" "$tmpdir/refused-detach.log"
+run refused-only-detach 1 build --remote-exec "$coordinator" --remote-only --detach BTheory
+refute_grep "Theory built" "$tmpdir/refused-only-detach.log"
 run refused 0 build --remote-exec "$coordinator" BTheory
 require_grep "BTheory built" "$tmpdir/refused.log"
 rm "$state/refuse"

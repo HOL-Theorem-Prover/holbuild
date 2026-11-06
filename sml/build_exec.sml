@@ -5014,6 +5014,7 @@ fun start_background_pool limit work =
            else if !active < limit then (active := !active + 1; true)
            else (back := item :: !back; false))
       then ignore (Thread.fork (fn () => worker item, []))
+           handle e => (with_lock (fn () => active := !active - 1); raise e)
       else ()
     fun wait () =
       if with_lock (fn () => !active) > 0 then (OS.Process.sleep (Time.fromReal 0.05); wait ())
