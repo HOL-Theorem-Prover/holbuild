@@ -1,7 +1,7 @@
 HOLDIR ?= $(HOLBUILD_HOLDIR)
 HOLBUILD_KEEP_TEST_LOGS ?=
 POLYC ?= polyc
-POLY ?= $(dir $(shell command -v $(POLYC)))poly
+POLY ?= $(dir $(realpath $(shell command -v $(POLYC))))poly
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 DATADIR ?= $(PREFIX)/share/holbuild
