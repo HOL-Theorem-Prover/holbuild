@@ -583,6 +583,32 @@ PY
   expect_plan "from record (1 files rehashed, 1 keys changed)" "$p"
 }
 
+# A build planned from the record rewrites it from the record it read; the
+# result is byte for byte what full planning writes for the same tree.
+restored_write_matches_full() {
+  local p=$tmpdir/restored-write
+  mkdir -p "$p/data"
+  echo one > "$p/data/a.txt"
+  make_project "$p" '
+[actions.BTheory]
+extra_inputs = ["data"]'
+  expect_plan "full (no plan record for these inputs)" "$p"
+  printf '\n(* edited *)\n' >> "$p/src/DScript.sml"
+  echo two > "$p/data/b.txt"
+  # Let both edits age past the racy window, so both writes see the same
+  # stamps.
+  sleep 1.1
+  expect_plan "from record (" "$p"
+  local record
+  record=$(ls "$p"/.holbuild/plan/*)
+  mv "$record" "$tmpdir/restored-record"
+  expect_plan "full (no plan record for these inputs)" "$p"
+  if ! cmp "$record" "$tmpdir/restored-record"; then
+    echo "the record written from a restored plan differs from full planning's" >&2
+    exit 1
+  fi
+}
+
 noop
 racy_entries_are_rehashed
 edit_with_restored_mtime
@@ -610,3 +636,4 @@ incoming_edge_order
 default_mode_rewrites
 from_subdirectory
 default_members
+restored_write_matches_full

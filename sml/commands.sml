@@ -1163,9 +1163,9 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
            toolchain = {hol = HolbuildToolchain.hol tc, state = HolbuildToolchain.base_state tc, key = toolchain_key},
            action_toolchain_key = action_toolchain_key toolchain_key,
            graph = graph, members = members, dirs = dirs, stamps = stamps, index = index, targets = targets}
-        fun write context plan keys =
+        fun write context prior plan keys =
           case timed_phase "plan.record.write"
-                 (fn () => HolbuildPlanRecord.write record_dir context plan keys) of
+                 (fn () => HolbuildPlanRecord.write record_dir context prior plan keys) of
               HolbuildPlanRecord.Written => ()
             | HolbuildPlanRecord.NotWritten reason => say ("plan record not written: " ^ reason)
         (* Check mode plans in full only to compare, and keeps the record
@@ -1192,7 +1192,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                       write (context {members = members, dirs = rev (!HolbuildSourceIndex.observed_dirs),
                                       stamps = Binarymap.mkDict String.compare, index = index,
                                       targets = targets, toolchain_key = toolchain_key})
-                        plan (input_keys planned)
+                        NONE plan (input_keys planned)
           in
             planned
           end
@@ -1224,7 +1224,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                               (path, Binarymap.peek(stamps, path), entries)) (#dirs record),
                                 stamps = stamps, index = index, targets = targets,
                                 toolchain_key = toolchain_key})
-                  plan keys
+                  (SOME record) plan keys
               else ()
           in
             (* Check mode builds from the record too, once full planning agrees. *)
