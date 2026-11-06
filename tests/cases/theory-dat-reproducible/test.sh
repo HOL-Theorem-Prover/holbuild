@@ -92,7 +92,7 @@ build_root() {
   local project=$root/project
   write_project "$project" "$a_extra"
   link_hol_toolchain_cache "$root/cache"
-  (cd "$project" && HOLBUILD_CACHE="$root/cache" "$HOLBUILD_BIN" build CTheory) > "$root/build.log" 2>&1
+  (cd "$project" && HOLBUILD_CACHE="$root/cache" "$HOLBUILD_BIN" build CTheory) > "$root/build.log" 2>&1 || { cat "$root/build.log" >&2; exit 1; }
   for theory in "${theories[@]}"; do
     require_grep "$theory built" "$root/build.log"
   done
@@ -118,6 +118,9 @@ compare_roots() {
     cmp -s "$first/project/.holbuild/obj/src/$theory.dat" \
       "$second/project/.holbuild/obj/src/$theory.dat" ||
       echo "$theory.dat differs"
+    cmp -s "$first/project/.holbuild/obj/src/$theory.sml" \
+      "$second/project/.holbuild/obj/src/$theory.sml" ||
+      echo "$theory.sml differs"
   done
 }
 
@@ -147,5 +150,58 @@ if ! grep -qx "ATheory.dat differs" <<< "$nondet_differences" ||
    grep -q "input keys differ" <<< "$nondet_differences"; then
   echo "comparison did not report exactly a .dat difference for the time-dependent ATheory:" >&2
   echo "${nondet_differences:-(no differences)}" >&2
+  exit 1
+fi
+
+# Load independent parents in opposite orders while keeping the sources and
+# action keys identical. Explicit deps order the build without preloading them.
+write_parent_order_project() {
+  local project=$1
+  mkdir -p "$project/src"
+  cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "parent-order"
+[build]
+members = ["src"]
+[actions.CTheory]
+deps = ["ATheory", "BTheory"]
+TOML
+  for name in A B; do
+    cat > "$project/src/${name}Script.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "$name";
+val _ = new_constant ("${name}_constant", bool);
+val _ = export_theory ();
+SML
+  done
+  cat > "$project/src/CScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val names = ["A", "B"];
+val ordered = if OS.Process.getEnv "HOLBUILD_TEST_PARENT_ORDER" = SOME "reverse"
+              then rev names else names;
+val _ = List.app (fn name => load (name ^ "Theory")) ordered;
+val _ = new_theory "C";
+val _ = export_theory ();
+SML
+}
+
+for order in forward reverse; do
+  root=$tmpdir/parent-order-$order
+  write_parent_order_project "$root/project"
+  link_hol_toolchain_cache "$root/cache"
+  (cd "$root/project" && HOLBUILD_CACHE="$root/cache" HOLBUILD_TEST_PARENT_ORDER="$order" \
+    "$HOLBUILD_BIN" build CTheory) > "$root/build.log" 2>&1 || { cat "$root/build.log" >&2; exit 1; }
+  for theory in "${theories[@]}"; do
+    require_grep "$theory built" "$root/build.log"
+  done
+  (cd "$root/project" && HOLBUILD_CACHE="$root/cache" "$HOLBUILD_BIN" build --dry-run CTheory) > "$root/dry-run.log" 2>&1
+  awk '/^[A-Za-z0-9_]+ \(theory,/ {name = $1} /^  input_key:/ {print name, $2}' \
+    "$root/dry-run.log" > "$root/input-keys"
+done
+differences=$(compare_roots "$tmpdir/parent-order-forward" "$tmpdir/parent-order-reverse")
+if [[ -n "$differences" ]]; then
+  echo "theory exports depend on parent load order:" >&2
+  echo "$differences" >&2
   exit 1
 fi

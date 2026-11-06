@@ -370,7 +370,20 @@ nondet_child_log=$tmpdir/nondet-child.log
 for child in BTheory CTheory; do
   require_grep "cache miss: $child .*(parent outputs differ)" "$nondet_child_log"
   require_grep "$child built" "$nondet_child_log"
-  # The existing entry stays: it is consistent with the parent entry it was
-  # built on, and the conflict says the parent build is not reproducible.
-  require_grep "cache entry already exists with different outputs for $child" "$nondet_child_log"
 done
+if grep -q "cache entry already exists with different outputs" "$nondet_child_log"; then
+  echo "rejected child cache entries were not replaced" >&2
+  exit 1
+fi
+
+# Keep the newly built parent and discard only the children: the replacement
+# entries must now restore against that parent, without another rebuild.
+rm "$nondet_project/.holbuild/obj/src/"{B,C}Theory.dat
+(cd "$nondet_project" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" build BTheory CTheory) > "$tmpdir/nondet-restored.log" 2>&1
+for child in BTheory CTheory; do
+  require_grep "$child restored from cache" "$tmpdir/nondet-restored.log"
+done
+if grep -q "parent outputs differ" "$tmpdir/nondet-restored.log"; then
+  echo "replacement child cache entries still disagree with their parent" >&2
+  exit 1
+fi

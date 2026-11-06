@@ -548,8 +548,10 @@ Because input keys hash sources rather than outputs, sharing cache entries
 across machines rests on a reproducibility contract: a deterministic script,
 with its sources and extra inputs declared, under the same theory toolchain key,
 produces a byte-identical `Theory.dat` in any project directory and artifact
-cache. A script that reads the clock, the environment, undeclared files, or host
-paths has to declare the files as `extra_deps` or opt out with `cache = false`.
+cache. The exporter canonicalizes the parent header by theory name, preserving
+the remaining payload, and updates the embedded data hash in `Theory.sml`.
+The generated parent load metadata uses the same order. A script that reads
+the clock, the environment, undeclared files, or host paths has to declare the files as `extra_deps` or opt out with `cache = false`.
 
 If the same input key produces different output keys, that indicates
 nondeterminism or undeclared inputs. The cache keeps the first entry and warns
@@ -557,7 +559,10 @@ on the conflicting publish. Correctness doesn't depend on the contract: a
 restored theory whose recorded parent `.dat` hashes differ from the local
 parents is rejected and rebuilt. What a nondeterministic theory costs is cache
 hits: where the local parent's `.dat` differs from the one the cached children
-were built against, its whole subtree misses and can't republish.
+were built against, its whole subtree misses. A local entry rejected on restore
+is removed under the publication lock only if its manifest is unchanged, so a
+successful rebuild can publish a replacement. Other output conflicts still keep
+the first entry; remote publication and archive import still reject conflicts.
 
 ## Global cache
 

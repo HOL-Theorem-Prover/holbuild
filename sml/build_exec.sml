@@ -379,10 +379,13 @@ fun peak_rss_report_line path =
 
 fun write_theory_exporter {sig_path, path, parents_report, mldeps_report} =
   let
+    (* A resumed checkpoint can contain an older runtime helper. *)
     val lines =
+      ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (runtime_helper_path ()) ^ ";"] @
       generated_metadata_report_lines {parents_report = parents_report,
                                        mldeps_report = mldeps_report} @
       [export_theory_if_needed_line sig_path,
+       "val _ = HolbuildRuntime.normalize_theory_export " ^ HolbuildToolchain.sml_string sig_path ^ ";",
        peak_rss_report_line (Path.concat(Path.dir path, peak_rss_report_name))]
   in
     write_text path (String.concatWith "\n" lines ^ "\n")
@@ -4054,14 +4057,28 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
     fun invalidate_node_dat_hash () =
       invalidate_cached_file_hash dat_hash_cache (#data_path (theory_outputs node))
     fun materialize_valid_cache () =
-      case materialize_theory_cache (#verify_cache options) allow_timeout_discrepancy
-             project plan input_key (tactic_timeout policy) (trknl_enabled policy) node of
-          CacheMiss => CacheMiss
-        | restored as CacheRestored _ =>
-            if theory_parent_hashes_match dat_hash_cache plan node NONE then restored
-            else (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
-                               input_key ^ " (parent outputs differ)");
-                  remove_failed_cache_outputs project node; CacheMiss)
+      let
+        val root = cache_root ()
+        val existing = ensure_local_cache_entry root input_key
+        fun discard_entry () =
+          case existing of
+              SOME text => ignore (drop_cache_manifest_if_unchanged root input_key text)
+            | NONE => ()
+      in
+        case existing of
+            NONE => (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
+                                  input_key ^ " (no manifest)"); CacheMiss)
+          | SOME _ =>
+              case materialize_theory_cache (#verify_cache options) allow_timeout_discrepancy
+                     project plan input_key (tactic_timeout policy) (trknl_enabled policy) node of
+                  CacheMiss => (discard_entry (); CacheMiss)
+                | restored as CacheRestored _ =>
+                    if theory_parent_hashes_match dat_hash_cache plan node NONE then restored
+                    else (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
+                                       input_key ^ " (parent outputs differ)");
+                          discard_entry ();
+                          remove_failed_cache_outputs project node; CacheMiss)
+      end
     fun restore_from_cache built_timeout =
       (remove_tree stage;
        invalidate_node_dat_hash ();
