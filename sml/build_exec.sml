@@ -2407,7 +2407,8 @@ fun script_prefix_key NONE source_prefix_hash = source_prefix_hash
          "\nextra_inputs=" ^ inputs_key ^ "\n")
 
 fun failed_prefix_diagnostic_key proof_engine = proof_engine ^ ":finish_goal_state_v2"
-fun failed_prefix_resume_schema_key proof_engine = proof_engine ^ ":dependency_prefix_history_v1"
+(* Failed-prefix heaps retain the proof runtime and its compiled tactic refs. *)
+fun failed_prefix_resume_schema_key proof_engine = proof_engine ^ ":dependency_prefix_history_v2"
 
 fun failed_prefix_ok proof_engine proof_timeout deps_key safe_name pre_hash header_hash =
   checkpoint_ok_text "failed_prefix"
