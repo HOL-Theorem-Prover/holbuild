@@ -1473,6 +1473,23 @@ fun hol_run_file_arg stage file =
    it, and an OOM kill from another failure, by this. *)
 val last_child_status : OS.Process.status option ref = ref NONE
 
+(* HOL's `use` remembers a source parse error in the heap and, with
+   failOnError set as `hol run` sets it, exits with failure after the next
+   top-level declaration.  A checkpoint saved after such an error (holbuild
+   before 0.13.7 saved them) carries it, so a run from it exits on its first
+   declaration before printing anything.
+   A failure exit with an empty log is reported with this marker; a death by
+   signal (the shell's 128 + n) is not. *)
+val hol_silent_exit_marker = "HOL exited without output"
+
+fun silent_exit_detail status log =
+  case Posix.Process.fromStatus status of
+      Posix.Process.W_EXITSTATUS w =>
+        if w <= 0w128 andalso file_size log = 0 then
+          [hol_silent_exit_marker ^ " (exit status " ^ Word8.fmt StringCvt.DEC w ^ ")"]
+        else []
+    | _ => []
+
 fun run_hol_files_to_log tc stage workdir context files log_name current_log error_message =
   let
     val log = Path.concat(stage, log_name)
@@ -1492,8 +1509,7 @@ fun run_hol_files_to_log tc stage workdir context files log_name current_log err
       if echo_child_logs () then HolbuildStatus.message_stdout (read_text log handle _ => "") else ()
     else
       raise Error (String.concatWith "\n"
-        [error_message,
-         child_log_detail detail_log])
+        ([error_message] @ silent_exit_detail status log @ [child_log_detail detail_log]))
   end
 
 fun toolchain_base_context tc = HolState (HolbuildToolchain.base_state tc)
@@ -1529,6 +1545,16 @@ fun holbuild_runtime_missing_failure text =
 
 fun hol_static_error_failure text =
   Option.isSome (find_substring "Static Errors" text)
+
+(* The marker is the line after the first, where run_hol_files_to_log puts
+   it; the child's own output comes later, after "--- child log tail ---". *)
+fun hol_silent_exit_line text =
+  case String.fields (fn c => c = #"\n") text of
+      _ :: second :: _ =>
+        if String.isPrefix hol_silent_exit_marker second then SOME second else NONE
+    | _ => NONE
+
+fun hol_silent_exit_failure text = Option.isSome (hol_silent_exit_line text)
 
 (* Defensive recovery for already-invalid checkpoint artifacts. Holbuild should
    preserve parent/child heap families atomically; this path is not a substitute
@@ -3095,7 +3121,10 @@ fun run_theory_action cache_allowed policy tc root checkpoint_root base_context 
                   | SOME output_path => read_text output_path handle _ => ""
               val failure_text = msg ^ "\n" ^ output_text
             in
-              if List.exists (fn marker => String.isSubstring marker failure_text)
+              (* A silent exit means a checkpoint saved after a source parse
+                 error, which holbuild before 0.13.7 wrote. *)
+              if hol_silent_exit_failure msg orelse
+                 List.exists (fn marker => String.isSubstring marker failure_text)
                    ["failed-prefix checkpoint cannot rewind",
                     "failed-prefix checkpoint history does not match metadata",
                     "failed-prefix proof path is not present in current proof-ir plan",
@@ -3135,7 +3164,9 @@ fun run_theory_action cache_allowed policy tc root checkpoint_root base_context 
           else
             case String.fields (fn c => c = #"\n") msg of
                 [] => "hol run failed while building theory script\n"
-              | first :: _ => first ^ "\n"
+              | first :: _ =>
+                  first ^ "\n" ^
+                  (case hol_silent_exit_line msg of SOME line => line ^ "\n" | NONE => "")
         val detail =
           String.concat
             [case trace_context of NONE => "" | SOME text => text,

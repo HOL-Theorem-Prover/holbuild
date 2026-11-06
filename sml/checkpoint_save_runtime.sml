@@ -70,6 +70,10 @@ fun discard_checkpoint path =
    remove_file (ok_path path);
    remove_file path)
 
+(* After a source parse error QUse's error flag is set, and a heap saved then
+   keeps it: `hol run` from that heap exits with failure after its first
+   declaration, printing nothing.  So no checkpoint is saved once the flag is
+   set, and an older one at the same path is removed. *)
 fun save_checkpoint ({label, default_share, path, ok_text, depth} :
                      {label : string, default_share : bool, path : string,
                       ok_text : string, depth : int}) =
@@ -101,7 +105,8 @@ fun save_checkpoint ({label, default_share, path, ok_text, depth} :
         ()
       end
   in
-    save ()
+    if QUse.hadError () then discard_checkpoint path
+    else save ()
     handle e =>
       if checkpoint_io_failure e then
         (discard_checkpoint path; warn_checkpoint_failure label path e)

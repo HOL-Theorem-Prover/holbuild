@@ -475,6 +475,11 @@ fun save_failed_prefix_checkpoint () =
         if not (kind = "theorem" orelse kind = "resume") orelse
            not (!checkpoint_enabled_ref) orelse
            !failed_prefix_resume_active_ref then ()
+        else if QUse.hadError () then
+          (* No checkpoint after a parse error: see HolbuildCheckpointSaveRuntime. *)
+          (HolbuildCheckpointSaveRuntime.discard_checkpoint failed_prefix_path;
+           app (fn suffix => OS.FileSys.remove (failed_prefix_path ^ suffix) handle OS.SysErr _ => ())
+               [".meta", ".prefix"])
         else
           let
             val prefix_end = !successful_prefix_end_ref
