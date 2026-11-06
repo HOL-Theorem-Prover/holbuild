@@ -37,7 +37,6 @@ echo upstream-hol-without-holproject > "$hol_repo/README"
 git -C "$hol_repo" add .
 git -C "$hol_repo" commit -q -m hol
 hol_rev=$(git -C "$hol_repo" rev-parse HEAD)
-export HOLBUILD_CANONICAL_HOL_GIT="$hol_repo"
 
 repo=$tmpdir/dep-repo
 mkdir -p "$repo"

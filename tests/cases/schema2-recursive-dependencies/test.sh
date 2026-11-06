@@ -32,7 +32,6 @@ TOML
 
 hol=$tmpdir/hol
 hol_rev=$(make_repo "$hol" hol)
-export HOLBUILD_CANONICAL_HOL_GIT="$hol"
 
 b=$tmpdir/b
 b_rev=$(make_repo "$b" b "

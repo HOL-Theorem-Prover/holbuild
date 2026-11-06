@@ -22,7 +22,7 @@ rev = "<exact-40-character-commit>"
 
 The `hol` dependency is special:
 
-- it must point at the canonical HOL repository
+- it may point at HOL or a fork of it; the commit, not the URL, identifies the shared toolchain
 - it uses an exact commit hash, not a branch/tag/range
 - upstream HOL does not need a manifest; holbuild uses its built-in HOL manifest for package metadata
 - built HOL trees are shared under `$HOLBUILD_CACHE/hol-toolchains/<key>/hol`

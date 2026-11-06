@@ -321,14 +321,14 @@ TOML
 : > "$tmpdir/fake-build-count"
 set +e
 (cd "$tmpdir/fake-project" &&
-  HOLBUILD_CACHE=$tmpdir/fake-cache HOLBUILD_CANONICAL_HOL_GIT=$fake_hol \
+  HOLBUILD_CACHE=$tmpdir/fake-cache \
   HOLBUILD_TEST_BUILD_COUNT=$tmpdir/fake-build-count \
   "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only) \
   > "$tmpdir/toolchain-only.log" 2>&1
 status=$?
 # The same without the build command word.
 (cd "$tmpdir/fake-project" &&
-  HOLBUILD_CACHE=$tmpdir/fake-cache HOLBUILD_CANONICAL_HOL_GIT=$fake_hol \
+  HOLBUILD_CACHE=$tmpdir/fake-cache \
   HOLBUILD_TEST_BUILD_COUNT=$tmpdir/fake-build-count \
   "$HOLBUILD_BIN" --remote-cache "$remote_url" --remote-exec "$coordinator" --remote-only ATheory) \
   > "$tmpdir/toolchain-only-implicit.log" 2>&1
