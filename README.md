@@ -830,7 +830,8 @@ nodes and everything that depends on them. A source or directory added,
 removed, renamed or made readable, or a changed dependency, sends the build
 back to full planning, except inside HOL and the git dependencies holbuild
 checked out at their pinned revision: there only the files planning read are
-checked, so a file added by hand to such a checkout goes unnoticed. So does a build whose targets leave out a root with
+checked, so a file added by hand to such a checkout (a source or a
+`holproject.toml`) goes unnoticed. So does a build whose targets leave out a root with
 its own tactic timeout, and a project with `[[generate]]` steps or with
 theories that write SML sources, for which no record is kept; `--watch`
 always plans in full. The four newest records are kept.
