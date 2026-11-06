@@ -146,3 +146,48 @@ jobs:
         run: >-
           make HOLDIR="$HOLDIR" test
           TESTS="tactic-parse-compatibility proof-step-runtime-semantics proof-ir-branch-composition-behavior failed-prefix-structural-edit checkpoint-recovery termination-diagnostics"
+
+  theory-modules:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      HOLBUILD_TEST_HOL_GIT: https://github.com/SequentAI/HOL.git
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Read compiled initializer HOL pin
+        id: module-hol4-pin
+        run: echo "hol4-ref=$(tr -d '[:space:]' < tests/HOL_THEORY_MODULES_REV)" >> "$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/setup-polyml
+        id: polyml
+
+      - name: Configure holbuild test cache
+        run: echo "HOLBUILD_CACHE=$HOME/.cache/holbuild" >> "$GITHUB_ENV"
+
+      - name: Restore compiled initializer HOL toolchain cache
+        id: module-hol-toolchain-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.cache/holbuild/hol-toolchains
+          key: hol-toolchains-theory-modules-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ steps.module-hol4-pin.outputs.hol4-ref }}-v1
+
+      - name: Build holbuild
+        run: make
+
+      - name: Run compiled initializer integration tests
+        env:
+          TMPDIR: ${{ runner.temp }}
+          HOLBUILD_TEST_JOBS: '4'
+          HOLBUILD_TEST_HOL_REV: ${{ steps.module-hol4-pin.outputs.hol4-ref }}
+          HOLBUILD_TEST_REQUIRE_THEORY_MODULES: '1'
+        run: >-
+          tests/run.sh theory-modules basic-theory checkpoint-extra-inputs
+          checkpoint-recovery exec-action exec-action-share-heaps
+
+      - name: Save compiled initializer HOL toolchain cache
+        if: steps.module-hol-toolchain-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ~/.cache/holbuild/hol-toolchains
+          key: hol-toolchains-theory-modules-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ steps.module-hol4-pin.outputs.hol4-ref }}-v1

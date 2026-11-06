@@ -28,6 +28,9 @@ The same holbuild executable supports the current HOL pin in `vendor/hol/REV`
 and the legacy compatibility floor recorded in `tests/HOL_LEGACY_TACTICS_REV`
 (`e395eb6e69054ff6f7cef9d1107fd1a04dd5848f`). CI covers those two revisions;
 this is not a guarantee for every intervening or future HOL commit.
+Compiled initializer integration is also checked against the public HOL fork
+revision in `tests/HOL_THEORY_MODULES_REV`, which includes the optional loader
+API; the main and legacy jobs continue checking source-loader compatibility.
 
 Compatibility boundaries select implementations by the installed HOL API,
 not branch names or revision ordering. In particular, the analyser retains its
@@ -35,6 +38,19 @@ legacy planner when `ProofStepPlan` is absent and supports both shared-parser
 constructor shapes, before and after HOL added combinator-token spans. Small
 adapter tests cover both shapes without adding a third HOL toolchain to CI.
 The new token annotations do not change existing proof-step labels or extents.
+
+On HOL and Poly/ML versions supporting compiled theory initializers, holbuild
+automatically caches their compiled code under `<cache root>/theory-modules`.
+Loading a cached initializer still reads the theory data, registers its types,
+constants and theorems, and runs its load hooks in the usual dependency order.
+ML libraries retain their usual source-loading behavior. Older toolchains and
+missing or incompatible module files use the source loader automatically.
+
+These module files belong to one exact HOL saved state. They stay in the local
+cache, including on remote workers, and do not change portable theory artifacts
+or remote cache keys. Checkpoint-free builds also produce and use them. Cache
+garbage collection and worker cache limits include the module files; deleting
+them only causes source loading and regeneration.
 
 ## Install from source
 
@@ -1359,6 +1375,13 @@ and generated test manifests use the same revision:
 env -u HOLDIR -u HOLBUILD_HOLDIR \
   HOLBUILD_TEST_HOL_REV=<full-40-character-commit> make test
 ```
+
+The focused `theory-modules` CI job selects the public HOL fork with
+`HOLBUILD_TEST_HOL_GIT` and the commit in `tests/HOL_THEORY_MODULES_REV`.
+It sets `HOLBUILD_TEST_REQUIRE_THEORY_MODULES=1` so an unsupported toolchain
+fails this job instead of checking only the source fallback. The ordinary
+suite also runs the same case on its default HOL revision, where the source
+fallback remains valid.
 
 ## Release process
 

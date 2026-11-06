@@ -20,7 +20,7 @@ schema = 2
 minimum_version = "0.10.0"
 
 [dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+git = "${HOLBUILD_TEST_HOL_GIT:-https://github.com/HOL-Theorem-Prover/HOL.git}"
 rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
@@ -124,6 +124,8 @@ load "$project/.holbuild/obj/src/ATheory";
 val _ = ATheory.a_def;
 val _ = ATheory.a_thm;
 SML
+# Published artifacts must remain loadable after disposable modules are removed.
+rm -rf "$HOLBUILD_CACHE/theory-modules"
 "$HOLDIR/bin/hol" run --noconfig --holstate "$HOLDIR/bin/hol.state" \
   "$tmpdir/published-load.sml" > "$tmpdir/published-load.log" 2>&1
 if grep -q "deps_loaded=\|final_context=\|theorem_boundary" "$metadata"; then

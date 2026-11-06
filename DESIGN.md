@@ -160,6 +160,15 @@ user removes it manually. The cache key includes the HOL revision, the Poly/ML
 runtime (release and architecture variant), the resolved `poly` executable
 path, build arguments other than `-j`, and cache format version.
 
+Compiled theory initializers are an optional local cache under
+`$HOLBUILD_CACHE/theory-modules`. When the installed HOL exposes the loader
+API, each child configures it with its exact base saved state and caches the
+initializer after normalizing exported theory files. Consumers apply cached
+code in their current kernel, replaying registration and load hooks in the
+source loader's order. Missing or incompatible code uses the source loader.
+These runtime-specific files are outside portable theory artifacts and action
+keys; cache GC and remote-worker byte limits account for them separately.
+
 ## Main binary and project-HOL helper direction
 
 The intended split is that `bin/holbuild` becomes a portable build coordinator,

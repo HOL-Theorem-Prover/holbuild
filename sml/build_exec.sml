@@ -329,12 +329,31 @@ fun write_plain_preload load_lines path =
    checkpoint.  The trace was renamed in HOL, so tolerate either spelling. *)
 val child_policy_traces = ["TheoryPP.include_docs", "TheoryPP.include_html_docs"]
 
-fun write_child_policy path =
-  write_text path
-    (String.concat
-       (map (fn trace => "val _ = (Feedback.set_trace " ^ HolbuildToolchain.sml_string trace ^
-                         " 0 handle _ => ());\n")
-            child_policy_traces))
+fun write_child_policy tc path =
+  let
+    val directory = HolbuildCache.theory_modules_dir
+                      (Path.mkAbsolute {path = HolbuildCacheConfig.cache_root (),
+                                        relativeTo = FS.getDir ()})
+    val configure =
+      "val _ = Meta.configureTheoryModuleCache {directory = " ^
+      HolbuildToolchain.sml_string directory ^ ", base_state = " ^
+      HolbuildToolchain.sml_string (HolbuildToolchain.base_state tc) ^ "};"
+    (* Older HOL installations keep their source loader.  Compile the call
+       only after checking the optional capability in the live namespace. *)
+    val module_cache =
+      "val _ = case #lookupStruct PolyML.globalNameSpace \"Meta\" of " ^
+      "NONE => () | SOME meta => " ^
+      "if Option.isSome (#lookupVal (PolyML.NameSpace.Structures.contents meta) " ^
+      "\"configureTheoryModuleCache\") then " ^
+      "CompilerSpecific.quietbind " ^ HolbuildToolchain.sml_string configure ^
+      "else ();"
+  in
+    write_text path
+      (String.concat
+         (map (fn trace => "val _ = (Feedback.set_trace " ^ HolbuildToolchain.sml_string trace ^
+                           " 0 handle _ => ());\n")
+              child_policy_traces) ^ module_cache ^ "\n")
+  end
 
 (* Checkpoints are saved with the child policy in effect.  A `run --from`
    session loads these lines so it exports theories as a plain run does. *)
@@ -362,6 +381,16 @@ fun generated_metadata_report_lines {parents_report, mldeps_report} =
 fun export_theory_if_needed_line sig_path =
   "val _ = HolbuildRuntime.export_theory_if_needed " ^ HolbuildToolchain.sml_string sig_path ^ ";"
 
+fun hfs_unmapped_path path =
+  let
+    val {dir, file} = Path.splitDirFile path
+    val {dir = parent, file = leaf} = Path.splitDirFile dir
+  in
+    if leaf = "objs" andalso Path.file parent = ".hol" then
+      Path.concat(Path.dir parent, file)
+    else path
+  end
+
 (* Export now seals a theory in current HOL versions, so the source child
    captures metadata and exports, but never loads the generated theory module. *)
 (* The exporter is the child's last file, so the child's peak resident set
@@ -379,11 +408,21 @@ fun peak_rss_report_line path =
 
 fun write_theory_exporter {sig_path, path, parents_report, mldeps_report} =
   let
+    val produce = "Meta.produceTheoryModule " ^
+      HolbuildToolchain.sml_string
+        (hfs_unmapped_path (drop_suffix ".sig" sig_path ^ ".sml")) ^ ";"
+    val module_producer =
+      "val _ = case #lookupStruct PolyML.globalNameSpace \"Meta\" of " ^
+      "NONE => () | SOME meta => " ^
+      "if Option.isSome (#lookupVal (PolyML.NameSpace.Structures.contents meta) " ^
+      "\"produceTheoryModule\") then CompilerSpecific.quietbind " ^
+      HolbuildToolchain.sml_string produce ^ " else ();"
     val lines =
       generated_metadata_report_lines {parents_report = parents_report,
                                        mldeps_report = mldeps_report} @
       [export_theory_if_needed_line sig_path,
        "val _ = HolbuildRuntime.normalize_theory_export " ^ HolbuildToolchain.sml_string sig_path ^ ";",
+       module_producer,
        peak_rss_report_line (Path.concat(Path.dir path, peak_rss_report_name))]
   in
     write_text path (String.concatWith "\n" lines ^ "\n")
@@ -3056,7 +3095,7 @@ fun run_theory_action cache_allowed policy tc root checkpoint_root base_context 
     (* Extra inputs go in first, so holbuild's own files (the instrumented
        script above all) overwrite any input staged at the same path. *)
     val _ = List.app stage_input (#inputs action)
-    val _ = write_child_policy child_policy
+    val _ = write_child_policy tc child_policy
     val _ =
       write_theory_exporter
         {sig_path = staged_sig, path = theory_exporter,
@@ -6091,6 +6130,20 @@ fun store_cache_families cache =
     (List.filter (fn path => FS.isDir path handle OS.SysErr _ => false)
                  (HolbuildCache.children (share_store cache)))
 
+(* Factory modules have no on-disk module parents.  Once loaded their code
+   is resident, so concurrent eviction only makes a later load use source. *)
+fun module_cache_families cache =
+  List.map
+    (fn path =>
+       {mtime = modified_time path,
+        evict = fn () =>
+          let val bytes = tree_bytes path
+          in
+            HolbuildCache.remove_tree path;
+            if path_exists path then NONE else SOME bytes
+          end})
+    (HolbuildCache.children (HolbuildCache.theory_modules_dir cache))
+
 (* A toolchain retired but not yet removed when its remover stopped. *)
 fun toolchain_trash_family () =
   {mtime = Time.zeroTime,
@@ -6107,6 +6160,7 @@ fun toolchain_trash_family () =
 fun worker_cache_bytes {cache, checkpoint_root} =
   total_checkpoint_bytes (collect_checkpoint_families checkpoint_root) +
   tree_bytes (share_store cache) +
+  tree_bytes (HolbuildCache.theory_modules_dir cache) +
   List.foldl (fn (path, total) => total + tree_bytes path)
              (0 : Position.int) (HolbuildHolSharedCache.toolchain_trash ()) +
   List.foldl (fn (k, total) => total + tree_bytes (HolbuildHolSharedCache.entry_dir_for_key k))
@@ -6120,7 +6174,8 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
     val families =
       sort_by_mtime_ascending (fn ({mtime, ...} : cache_family) => mtime)
         (toolchain_trash_family () :: checkpoint_cache_families checkpoint_root @
-         store_cache_families cache @ toolchain_cache_families () @ local_cache_families cache)
+         store_cache_families cache @ module_cache_families cache @
+         toolchain_cache_families () @ local_cache_families cache)
     val target = limit_bytes - reserve_bytes
     fun sweep total remaining =
       if total <= target then total
