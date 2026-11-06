@@ -242,8 +242,10 @@ fun discover () =
                      " found in --source-dir/current directory or parents")
   end
 
-fun abs_under root path =
-  if Path.isAbsolute path then path else Path.concat(root, path)
+(* "." names ROOT itself, not ROOT/. *)
+fun abs_under root "." = root
+  | abs_under root path =
+      if Path.isAbsolute path then path else Path.concat(root, path)
 
 fun abs_member ({root, ...} : t) member = abs_under root member
 fun abs_run_heap ({root, run_heap, ...} : t) = Option.map (abs_under root) run_heap
@@ -392,7 +394,7 @@ fun dependency_local_path_with resolution (project as {graph_artifact_root, ...}
                  override of that dependency moves the shim with it. *)
               (case List.find (fn Dependency {name, ...} => name = from) (#dependencies project) of
                    SOME from_dep =>
-                     Option.map (fn from_root => Path.concat(from_root, path))
+                     Option.map (fn from_root => abs_under from_root path)
                        (dependency_local_path_with resolution project from_dep)
                  | NONE => die ("validated from dependency disappeared: " ^ from))
 
@@ -637,10 +639,14 @@ fun dependency_package_with resolution artifact_parent project
 fun dependency_package artifact_parent project dep =
   dependency_package_with standard_resolution artifact_parent project dep
 
-fun same_dependency_source (GitSource a, GitSource b) = #git a = #git b andalso #rev a = #rev b
-  | same_dependency_source (FromSource a, FromSource b) =
+(* A commit names the same sources in every repository that has it, so two
+   hol dependencies at one rev agree whatever their URLs: a HOL fork and HOL
+   itself can meet in one graph. *)
+fun same_dependency_source role (GitSource a, GitSource b) =
+      #rev a = #rev b andalso (role = HolToolchainDependency orelse #git a = #git b)
+  | same_dependency_source _ (FromSource a, FromSource b) =
       #from a = #from b andalso #path a = #path b andalso #manifest a = #manifest b
-  | same_dependency_source _ = false
+  | same_dependency_source _ _ = false
 
 fun packages_with resolution project =
   case cached_graph_with resolution project of

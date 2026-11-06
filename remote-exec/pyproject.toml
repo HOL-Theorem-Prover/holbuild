@@ -1,0 +1,34 @@
+[project]
+name = "holbuild-remote-exec"
+version = "0.1.0"
+description = "Coordinator and worker loop for holbuild's remote execution"
+requires-python = ">=3.12"
+dependencies = [
+  "alembic==1.16.2",
+  "asyncpg==0.31.0",
+  "fastapi==0.136.3",
+  "httpx==0.28.1",
+  "pydantic-settings==2.10.1",
+  "sqlalchemy[asyncio]==2.0.41",
+  "uvicorn[standard]==0.35.0",
+]
+
+[dependency-groups]
+test = [
+  "pytest==9.0.3",
+  "pytest-asyncio==1.3.0",
+]
+
+[tool.uv]
+package = false
+default-groups = ["test"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+
+[tool.ruff]
+line-length = 120

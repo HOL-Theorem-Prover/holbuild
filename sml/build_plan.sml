@@ -229,6 +229,17 @@ fun build_key_index nodes =
     Vector.fromList (sort_pairs compare_pair_key (enumerate 0 nodes))
   end
 
+(* What an extra-input declaration expanded to: its files, each as
+   (declared relative path, absolute path), and the directories walked to
+   find them. *)
+type input_expansion = {files : (string * string) list, dirs : string list}
+
+(* A node's input key as an earlier computation found it, with what it was
+   computed from besides the node's own source and inputs. *)
+type known_input_key =
+  {toolchain_key : string, config_lines : string list, dep_keys : string list,
+   input_key : string, extra_inputs_key : string option}
+
 type t =
   {universe : node list,
    roots : node list,
@@ -240,14 +251,15 @@ type t =
    selected_graph_id : string,
    selected_plan_id : string,
    resolved_plan_id : string,
-   universe_key_index : key_index,
-   universe_node_index : node Vector.vector,
    selected_key_index : key_index,
    selected_node_index : node Vector.vector,
    selected_adjacency : int list Vector.vector,
    dependency_closure_cache : node list option array,
    dependency_context_key_cache : (string * string) option array,
-   extra_inputs_key_cache : string option option array}
+   extra_inputs_key_cache : string option option array,
+   input_expansions : (string, input_expansion) Binarymap.dict ref,
+   input_hashes : (string, string) Binarymap.dict ref,
+   known_input_keys : known_input_key option array}
 
 fun universe_nodes ({universe, ...} : t) = universe
 fun root_nodes ({roots, ...} : t) = roots
@@ -344,10 +356,14 @@ fun bootstrap_dependency_names components analysis node =
 
 fun unique_nodes nodes =
   let
-    fun add (node, kept) =
-      if member (key node) (map key kept) then kept else node :: kept
+    fun add (node, (seen, kept)) =
+      let val node_key = key node
+      in
+        if Option.isSome (Binarymap.peek(seen, node_key)) then (seen, kept)
+        else (Binarymap.insert(seen, node_key, ()), node :: kept)
+      end
   in
-    rev (List.foldl add [] nodes)
+    rev (#2 (List.foldl add (Binarymap.mkDict String.compare, []) nodes))
   end
 
 fun bootstrap_holdep_project_deps analysis lookup node =
@@ -416,12 +432,14 @@ fun unresolved_dependencies plan node =
 fun reverse_dependency_edges plan node =
   graph_values (#reverse (dependency_graph plan)) node
 
+(* Resolved edges lead from selected nodes to selected nodes: the selection
+   is closed under them. *)
 fun direct_project_deps
-      (plan as {universe_key_index, universe_node_index, ...} : t) node =
+      (plan as {selected_key_index, selected_node_index, ...} : t) node =
   let
     fun target (edge : resolved_dependency_edge) =
-      Vector.sub(universe_node_index,
-                 indexed_key_id universe_key_index (#to_node edge))
+      Vector.sub(selected_node_index,
+                 indexed_key_id selected_key_index (#to_node edge))
   in
     unique_nodes (map target (resolved_dependency_edges plan node))
   end
@@ -553,8 +571,8 @@ fun selected_closure
   end
 
 fun transitive_project_deps
-      (plan as {dependency_closure_cache, universe_key_index, ...} : t) node =
-  let val id = indexed_key_id universe_key_index (key node)
+      (plan as {dependency_closure_cache, selected_key_index, ...} : t) node =
+  let val id = indexed_key_id selected_key_index (key node)
   in
     case Array.sub(dependency_closure_cache, id) of
         SOME dependencies => dependencies
@@ -567,8 +585,9 @@ fun transitive_project_deps
           end
   end
 
-fun plan_node_id ({universe_key_index, ...} : t) node =
-  indexed_key_id universe_key_index (key node)
+(* A selected node's position, which indexes the plan's per-node caches. *)
+fun plan_node_id ({selected_key_index, ...} : t) node =
+  indexed_key_id selected_key_index (key node)
 
 fun cached_dependency_context_key
       (plan as {dependency_context_key_cache, ...} : t) node context_id =
@@ -642,9 +661,24 @@ fun dependency_reason_text ExtractedLoad = "extracted-load"
   | dependency_reason_text DeclaredExtraInput = "extra-input"
   | dependency_reason_text SignatureCompanionReason = "signature-companion"
 
+fun dependency_pairs_from pairs = Vector.fromList (sort_pairs compare_pair_key pairs)
+
 fun dependency_pairs nodes values_for =
-  Vector.fromList
-    (sort_pairs compare_pair_key (map (fn node => (key node, values_for node)) nodes))
+  dependency_pairs_from (map (fn node => (key node, values_for node)) nodes)
+
+fun reverse_dependency_pairs nodes resolved =
+  let
+    val all_edges = List.concat (map (graph_values resolved) nodes)
+    val incoming_index =
+      List.foldr
+        (fn (edge : resolved_dependency_edge, index) =>
+          Binarymap.insert(index, #to_node edge,
+            edge :: getOpt(Binarymap.peek(index, #to_node edge), [])))
+        (Binarymap.mkDict String.compare) all_edges
+    fun incoming node = getOpt(Binarymap.peek(incoming_index, key node), [])
+  in
+    dependency_pairs nodes incoming
+  end
 
 fun build_resolved_dependency_graph components analysis lookup selected =
   let
@@ -736,15 +770,7 @@ fun build_resolved_dependency_graph components analysis lookup selected =
     val resolved = dependency_pairs selected resolved_for
     val external = dependency_pairs selected external_for
     val unresolved = dependency_pairs selected unresolved_for
-    val all_edges = List.concat (map resolved_for selected)
-    val incoming_index =
-      List.foldr
-        (fn (edge : resolved_dependency_edge, index) =>
-          Binarymap.insert(index, #to_node edge,
-            edge :: getOpt(Binarymap.peek(index, #to_node edge), [])))
-        (Binarymap.mkDict String.compare) all_edges
-    fun incoming node = getOpt(Binarymap.peek(incoming_index, key node), [])
-    val reverse = dependency_pairs selected incoming
+    val reverse = reverse_dependency_pairs selected resolved
   in
     {symbolic = symbolic, resolved = resolved, external = external,
      unresolved = unresolved, reverse = reverse}
@@ -884,6 +910,29 @@ fun write_test_dependency_graph graph_id plan_id resolved_id (graph : resolved_d
           val _ = each_vector unresolved (#unresolved graph)
         in TextIO.closeOut output end
 
+fun assemble {nodes, name_index, roots, selected, analysis, dependency_graph, resolution_context_id,
+              selected_graph_id, selected_plan_id, resolved_plan_id} : t =
+  let
+    val selected_key_index = build_key_index selected
+  in
+    {universe = nodes, roots = roots, selected = selected, name_index = name_index, analysis = analysis,
+     dependency_graph = dependency_graph,
+     resolution_context_id = resolution_context_id,
+     selected_graph_id = selected_graph_id,
+     selected_plan_id = selected_plan_id,
+     resolved_plan_id = resolved_plan_id,
+     selected_key_index = selected_key_index,
+     selected_node_index = Vector.fromList selected,
+     selected_adjacency =
+       build_selected_adjacency selected_key_index selected dependency_graph,
+     dependency_closure_cache = Array.array(length selected, NONE),
+     dependency_context_key_cache = Array.array(length selected, NONE),
+     extra_inputs_key_cache = Array.array(length selected, NONE),
+     input_expansions = ref (Binarymap.mkDict String.compare),
+     input_hashes = ref (Binarymap.mkDict String.compare),
+     known_input_keys = Array.array(length selected, NONE)}
+  end
+
 fun plan_selection components holdir sources selection =
   let
     val provider = HolbuildComponentProvider.provider components
@@ -919,31 +968,54 @@ fun plan_selection components holdir sources selection =
     val _ = reject_graph_unresolved dependency_graph selected
     val _ = reject_source_uses analysis selected
     val _ = validate_extra_output_ownership analysis selected
-    val universe_key_index = build_key_index nodes
-    val universe_node_index = Vector.fromList nodes
-    val selected_key_index = build_key_index selected
-    val dependency_closure_cache =
-      Array.array(length nodes, NONE : node list option)
-    val dependency_context_key_cache =
-      Array.array(length nodes, NONE : (string * string) option)
-    val extra_inputs_key_cache =
-      Array.array(length nodes, NONE : string option option)
   in
-    {universe = nodes, roots = roots, selected = selected, name_index = index, analysis = analysis,
-     dependency_graph = dependency_graph,
-     resolution_context_id = resolution_context_id,
-     selected_graph_id = selected_graph_id,
-     selected_plan_id = selected_plan_id,
-     resolved_plan_id = resolved_plan_id,
-     universe_key_index = universe_key_index,
-     universe_node_index = universe_node_index,
-     selected_key_index = selected_key_index,
-     selected_node_index = Vector.fromList selected,
-     selected_adjacency =
-       build_selected_adjacency selected_key_index selected dependency_graph,
-     dependency_closure_cache = dependency_closure_cache,
-     dependency_context_key_cache = dependency_context_key_cache,
-     extra_inputs_key_cache = extra_inputs_key_cache}
+    assemble {nodes = nodes, name_index = index, roots = roots, selected = selected, analysis = analysis,
+              dependency_graph = dependency_graph, resolution_context_id = resolution_context_id,
+              selected_graph_id = selected_graph_id, selected_plan_id = selected_plan_id,
+              resolved_plan_id = resolved_plan_id}
+  end
+
+(* The plan an earlier planning run made over the same discovered sources,
+   from what the plan record kept: the selection, each selected node's
+   analysis and dependency edges, and the plan's identities.  Nodes are given
+   by position in SOURCES; EDGES has one entry per selected node, in order. *)
+fun restore {holdir, sources, roots, selected, analysis, edges,
+             resolution_context_id, selected_graph_id, selected_plan_id, resolved_plan_id} =
+  let
+    val external_dirs = [normalize_path (Path.concat(holdir, "sigobj"))]
+    val universe = Vector.fromList (map (make_node external_dirs) sources)
+    val nodes = Vector.foldr (op ::) [] universe
+    val selected_nodes = map (fn i => Vector.sub(universe, i)) selected
+    val keys = Vector.map key universe
+    fun edge_target i = Vector.sub(keys, i)
+    val selected_edges =
+      ListPair.mapEq
+        (fn ((i, node), {symbolic, resolved, external}) =>
+           let val from = Vector.sub(keys, i)
+           in
+             (node,
+              map (fn (name, reason) => SymbolicDependency {from_node = from, name = name, reason = reason}) symbolic,
+              map (fn (target, name, reason) =>
+                     {from_node = from, to_node = edge_target target, symbolic_name = name, reason = reason})
+                  resolved,
+              map (fn (name, kind, reason) => {from_node = from, name = name, kind = kind, reason = reason})
+                  external)
+           end)
+        (ListPair.zipEq (selected, selected_nodes), edges)
+    fun pairs value = dependency_pairs_from (map (fn entry as (node, _, _, _) => (key node, value entry)) selected_edges)
+    val resolved = pairs #3
+    val dependency_graph =
+      {symbolic = pairs #2, resolved = resolved, external = pairs #4,
+       unresolved = pairs (fn _ => []),
+       reverse = reverse_dependency_pairs selected_nodes resolved}
+    val _ = validate_extra_output_ownership analysis selected_nodes
+  in
+    assemble {nodes = nodes, name_index = build_name_index nodes,
+              roots = map (fn i => Vector.sub(universe, i)) roots,
+              selected = selected_nodes, analysis = analysis,
+              dependency_graph = dependency_graph, resolution_context_id = resolution_context_id,
+              selected_graph_id = selected_graph_id, selected_plan_id = selected_plan_id,
+              resolved_plan_id = resolved_plan_id}
   end
 
 fun plan_all components holdir sources =
@@ -988,40 +1060,77 @@ fun sort_strings xs =
     List.foldl (fn (x, acc) => insert x acc) [] xs
   end
 
-(* Skips .holbuild directories: holbuild's own state, which other jobs change
-   while this one walks it. *)
-fun files_under abs rel =
+(* The readable files under ABS, and the paths whose stat moves when the
+   files could change: the directories walked and the unreadable files
+   skipped, whose change of mode moves only their own stat.  Skips .holbuild
+   directories: holbuild's own state, which other jobs change while this one
+   walks it. *)
+fun files_under abs rel (files, dirs) =
   if is_dir abs then
-    List.concat
-      (map (fn name => files_under (Path.concat(abs, name)) (join rel name))
-           (List.filter (fn name => name <> ".holbuild") (list_dir abs)))
-  else if readable abs then [(rel, abs)]
-  else []
+    List.foldl (fn (name, acc) => files_under (Path.concat(abs, name)) (join rel name) acc)
+      (files, abs :: dirs)
+      (List.filter (fn name => name <> ".holbuild") (list_dir abs))
+  else if readable abs then ((rel, abs) :: files, dirs)
+  else (files, abs :: dirs)
 
-fun expand_extra_dep base decl =
+fun walked_files_under abs rel =
+  let val (files, dirs) = files_under abs rel ([], [])
+  in {files = rev files, dirs = rev dirs} end
+
+fun expand_extra_dep_walk base decl : input_expansion =
   if path_has_glob decl then
-    let
-      val root = base
-      val all = files_under root ""
-    in
-      List.filter (fn (rel, _) => HolbuildSourceIndex.glob_match decl rel) all
-    end
+    let val {files, dirs} = walked_files_under base ""
+    in {files = List.filter (fn (rel, _) => HolbuildSourceIndex.glob_match decl rel) files, dirs = dirs} end
   else
     let val abs = normalize_path (if Path.isAbsolute decl then decl else Path.concat(base, decl))
     in
-      if is_dir abs then files_under abs decl
-      else if readable abs then [(decl, abs)]
+      if is_dir abs then walked_files_under abs decl
+      else if readable abs then {files = [(decl, abs)], dirs = []}
       else raise Error ("extra dependency not found: " ^ abs)
     end
 
-fun extra_dep_lines label base decls =
-  let
-    fun line decl =
-      let val expanded = sort_strings (map (fn (rel, abs) => rel ^ "@" ^ file_hash abs) (expand_extra_dep base decl))
-      in (label ^ "_decl=" ^ decl) :: map (fn s => label ^ "=" ^ s) expanded end
-  in
-    List.concat (map line decls)
-  end
+fun expand_extra_dep base decl = #files (expand_extra_dep_walk base decl)
+
+fun expansion_key base decl = base ^ "\000" ^ decl
+
+(* Expansions and file hashes are kept for the life of the plan, so a plan's
+   input keys and the plan record name the same files and contents, except
+   where generators run: a generator a later declaration triggers can rewrite
+   a file an earlier one read. *)
+fun keeps_inputs plan = not (HolbuildComponentProvider.runs_generators (analysis_state plan))
+
+fun input_expansion (plan as {input_expansions, ...} : t) base decl =
+  case if keeps_inputs plan then Binarymap.peek(!input_expansions, expansion_key base decl) else NONE of
+      SOME expansion => expansion
+    | NONE =>
+        let val expansion = expand_extra_dep_walk base decl
+        in input_expansions := Binarymap.insert(!input_expansions, expansion_key base decl, expansion);
+           expansion
+        end
+
+fun remember_input_expansion ({input_expansions, ...} : t) base decl expansion =
+  input_expansions := Binarymap.insert(!input_expansions, expansion_key base decl, expansion)
+
+fun input_hash (plan as {input_hashes, ...} : t) path =
+  case if keeps_inputs plan then Binarymap.peek(!input_hashes, path) else NONE of
+      SOME hash => hash
+    | NONE =>
+        let val hash = file_hash path
+        in input_hashes := Binarymap.insert(!input_hashes, path, hash); hash end
+
+fun remember_input_hash ({input_hashes, ...} : t) path hash =
+  input_hashes := Binarymap.insert(!input_hashes, path, hash)
+
+(* Every extra-input expansion the plan made, as (base, declaration, expansion). *)
+fun input_expansions ({input_expansions, ...} : t) =
+  map (fn (key, expansion) =>
+         case String.fields (fn c => c = #"\000") key of
+             [base, decl] => (base, decl, expansion)
+           | _ => raise Error ("internal malformed expansion key: " ^ String.toString key))
+      (Binarymap.listItems (!input_expansions))
+
+(* Every extra-input file the plan hashed, with its hash. *)
+fun input_hashes ({input_hashes, ...} : t) = Binarymap.listItems (!input_hashes)
 
 fun bool_text true = "true"
   | bool_text false = "false"
@@ -1033,32 +1142,40 @@ fun lookup_key keys dep =
       SOME input_key => input_key
     | NONE => raise Error ("missing action key for dependency: " ^ logical_name dep)
 
+(* The node's extra-input declarations, manifest-declared first, as
+   (label, base directory, declaration). *)
+fun extra_input_decls plan node =
+  let
+    val source = source_of node
+    val manifest =
+      map (fn input => ("extra_dep", #package_root source, HolbuildProject.extra_input_path input))
+        (HolbuildProject.action_extra_inputs (#policy source))
+    val declared =
+      map (fn decl => ("source_extra_dep", Path.dir (#source_path source), decl))
+        (#extra_deps (dependencies plan node))
+  in
+    manifest @ declared
+  end
+
 (* The node's manifest-declared and source-declared extra inputs, each with
    the content hashes of the files it names. *)
 fun extra_input_lines plan node =
   let
     val source = source_of node
-    val analysis = analysis_state plan
-    val extra_inputs = HolbuildProject.action_extra_inputs (#policy source)
+    val decls = extra_input_decls plan node
     val _ =
       List.app
-        (fn input => HolbuildComponentProvider.ensure_extra_input analysis source
-          (#package_root source) (HolbuildProject.extra_input_path input))
-        extra_inputs
-    val source_extra_deps = #extra_deps (deps_of analysis node)
-    val _ =
-      List.app
-        (HolbuildComponentProvider.ensure_extra_input analysis source
-          (Path.dir (#source_path source)))
-        source_extra_deps
-    val manifest_extra_dep_lines =
-      List.concat (map (fn input =>
-        extra_dep_lines "extra_dep" (#package_root source)
-          [HolbuildProject.extra_input_path input]) extra_inputs)
-    val source_extra_dep_lines =
-      extra_dep_lines "source_extra_dep" (Path.dir (#source_path source)) source_extra_deps
+        (fn (_, base, decl) =>
+           HolbuildComponentProvider.ensure_extra_input (analysis_state plan) source base decl)
+        decls
+    fun lines (label, base, decl) =
+      (label ^ "_decl=" ^ decl) ::
+      map (fn line => label ^ "=" ^ line)
+        (sort_strings
+          (map (fn (rel, abs) => rel ^ "@" ^ input_hash plan abs)
+             (#files (input_expansion plan base decl))))
   in
-    manifest_extra_dep_lines @ source_extra_dep_lines
+    List.concat (map lines decls)
   end
 
 fun remember_extra_inputs_key (plan as {extra_inputs_key_cache, ...} : t) node lines =
@@ -1123,9 +1240,42 @@ fun action_text_with plan config_lines_for_node toolchain_key keys node =
     String.concatWith "\n" lines ^ "\n"
   end
 
+(* A node keeps a known input key while what it was computed from is the
+   same: the node's source and inputs (whoever remembered the key vouches for
+   those), the toolchain key, its config lines and its dependencies' keys. *)
+fun input_key_with (plan as {known_input_keys, extra_inputs_key_cache, ...} : t)
+                   config_lines_for_node toolchain_key keys node =
+  let
+    val id = plan_node_id plan node
+    val config_lines = config_lines_for_node node
+    val dep_keys = map (lookup_key keys) (direct_project_deps plan node)
+    fun fresh () =
+      let val input_key = hash_text (action_text_with plan config_lines_for_node toolchain_key keys node)
+      in
+        Array.update(known_input_keys, id,
+          SOME {toolchain_key = toolchain_key, config_lines = config_lines, dep_keys = dep_keys,
+                input_key = input_key, extra_inputs_key = extra_inputs_key plan node});
+        input_key
+      end
+  in
+    case Array.sub(known_input_keys, id) of
+        SOME (known : known_input_key) =>
+          if #toolchain_key known = toolchain_key andalso #config_lines known = config_lines andalso
+             #dep_keys known = dep_keys then
+            (Array.update(extra_inputs_key_cache, id, SOME (#extra_inputs_key known));
+             #input_key known)
+          else fresh ()
+      | NONE => fresh ()
+  end
+
 fun add_input_key_with plan config_lines_for_node toolchain_key (node, keys) =
-  Binarymap.insert(keys, key node,
-                   hash_text (action_text_with plan config_lines_for_node toolchain_key keys node))
+  Binarymap.insert(keys, key node, input_key_with plan config_lines_for_node toolchain_key keys node)
+
+fun known_input_key (plan as {known_input_keys, ...} : t) node =
+  Array.sub(known_input_keys, plan_node_id plan node)
+
+fun remember_input_key (plan as {known_input_keys, ...} : t) node known =
+  Array.update(known_input_keys, plan_node_id plan node, SOME known)
 
 fun compute_input_keys_with plan config_lines_for_node toolchain_key =
   List.foldl

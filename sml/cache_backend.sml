@@ -62,4 +62,6 @@ sig
   val remove_action : t -> string -> unit
   val touch_action : t -> string -> unit
   val with_action_publish_lock : t -> string -> (unit -> 'a) -> (unit -> 'a) -> 'a
+  (* Waits for a concurrent publisher before running the callback. *)
+  val with_action_publish_lock_wait : t -> string -> (unit -> 'a) -> 'a
 end

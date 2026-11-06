@@ -73,7 +73,7 @@ holbuild --json build --retain-debug-artifacts FooTheory  # also retain/report f
 - `--max-heap MB` — pass Poly/ML max heap to child HOL processes (not `--maxheap`, which holbuild's own Poly/ML runtime consumes)
 - `--cooperate-dir DIR` / `--machine-max-mem MB` / `--child-charge MB` — share a machine memory budget (`DIR/budget`) with other holbuild processes; each child reserves `--child-charge` (default `--max-heap`, at most 3072, or 3072 without `--max-heap`) and, while others hold reservations, starts only while `MemAvailable` also covers the charge plus a margin of a quarter of `MemTotal`, at most 30 GiB, or less when the budget is set above its default (see README)
 - `-jN` / `--jobs N` — parallel workers. Default: `.holconfig.toml [build].jobs` or `max(1, nproc/2)`
-- `--prefetch-concurrency N` — remote cache entries copied ahead of the build at once (default twice `-j`)
+- `--prefetch-concurrency N` — remote cache entries copied ahead of the build at once (default 50 or twice `-j`, whichever is larger)
 - `--json` — newline-delimited streaming JSON `message`, `node_started`, `node_finished`, `node_failed`, `waiting_for_memory`, `build_finished`, and `error` events on stdout (build only; no retained log paths by default; not dry-run/plan/trace/repl-on-failure)
 - normal non-TTY output suppresses unchanged node lines
 - `--quiet` / `--verbosity quiet` — suppress per-node success lines

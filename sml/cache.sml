@@ -359,6 +359,9 @@ fun with_lock root f =
 fun with_action_publish_lock root key publish skip =
   HolbuildFSCacheBackend.with_action_publish_lock (filesystem_cache root) key publish skip
 
+fun with_action_publish_lock_wait root key publish =
+  HolbuildFSCacheBackend.with_action_publish_lock_wait (filesystem_cache root) key publish
+
 fun gc_root root days =
   if not (path_exists root) then
     print ("cache not found: " ^ root ^ "\n")

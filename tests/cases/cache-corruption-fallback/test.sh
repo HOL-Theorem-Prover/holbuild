@@ -94,3 +94,20 @@ rm -rf "$project/.holbuild"
 repaired_manifest_log=$tmpdir/repaired-manifest.log
 (cd "$project" && "$HOLBUILD_BIN" build ATheory) > "$repaired_manifest_log" 2>&1
 require_grep "ATheory restored from cache" "$repaired_manifest_log"
+
+# Intact blobs do not make malformed proof-policy metadata usable. A rebuild
+# must repair the manifest so a subsequent fresh workspace can restore it.
+sed 's/^proof-timeout=.*/proof-timeout=garbage/' "$manifest" > "$manifest.tmp"
+mv "$manifest.tmp" "$manifest"
+rm -rf "$project/.holbuild"
+invalid_timeout_log=$tmpdir/invalid-timeout.log
+(cd "$project" && "$HOLBUILD_BIN" build ATheory) > "$invalid_timeout_log" 2>&1
+require_grep "cache manifest invalid proof-timeout" "$invalid_timeout_log"
+require_grep "ATheory built" "$invalid_timeout_log"
+if grep -q '^proof-timeout=garbage$' "$manifest"; then
+  echo "successful rebuild retained the invalid timeout metadata" >&2
+  exit 1
+fi
+rm -rf "$project/.holbuild"
+(cd "$project" && "$HOLBUILD_BIN" build ATheory) > "$tmpdir/repaired-timeout.log" 2>&1
+require_grep "ATheory restored from cache" "$tmpdir/repaired-timeout.log"

@@ -95,7 +95,6 @@ name = "hol"
 TOML
 } > "$schema2_repo/holproject.toml"
 schema2_rev=$(init_git_repo "$schema2_repo")
-export HOLBUILD_CANONICAL_HOL_GIT="$schema2_repo"
 
 make_project minimum_version_omitted
 cat > "$tmpdir/minimum_version_omitted/holproject.toml" <<TOML

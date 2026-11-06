@@ -76,7 +76,7 @@ use "sml/package_component.sml";
 use "sml/dependencies.sml";
 use "sml/component_provider.sml";
 use "sml/build_plan.sml";
-use "sml/checkpoint_save_runtime.sml";
+use "sml/plan_record.sml";
 use "sml/theory_checkpoints.sml";
 use "sml/checkpoint_store.sml";
 use "sml/theory_diagnostics.sml";

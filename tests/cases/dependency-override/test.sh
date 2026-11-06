@@ -52,7 +52,6 @@ git -C "$hol" init -q
 git_identity "$hol"
 echo upstream-hol-without-holproject > "$hol/README"
 hol_rev=$(commit_repo "$hol")
-export HOLBUILD_CANONICAL_HOL_GIT="$hol"
 
 leaf=$tmpdir/leaf
 make_project_dir "$leaf" leaf "
@@ -295,13 +294,13 @@ path = "../shim-foo"
 TOML
 
 shim_log=$tmpdir/shim.log
-(cd "$shim_project" && env -u HOLBUILD_CANONICAL_HOL_GIT "$HOLBUILD_BIN" context) > "$shim_log"
+(cd "$shim_project" && "$HOLBUILD_BIN" context) > "$shim_log"
 require_grep "package-source-root: keccak $shim_foo\$" "$shim_log"
 require_grep "package-root: keccak $shim_foo/sub/lib\$" "$shim_log"
 require_grep "dependency: keccak \[from=foo, path=sub/lib, manifest=shims/keccak.toml, local=$shim_foo/sub/lib," "$shim_log"
 
 rm -rf "$shim_project/.holbuild"
-(cd "$shim_project" && env -u HOLBUILD_CANONICAL_HOL_GIT "$HOLBUILD_BIN" build) > "$tmpdir/shim-build.log" 2>&1 ||
+(cd "$shim_project" && "$HOLBUILD_BIN" build) > "$tmpdir/shim-build.log" 2>&1 ||
   { cat "$tmpdir/shim-build.log" >&2; exit 1; }
 if [ -e "$shim_project/.holbuild/src/foo" ]; then
   echo "overridden from dependency was materialized into .holbuild/src" >&2

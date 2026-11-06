@@ -58,18 +58,30 @@ local
   (* LOCK_EX and LOCK_NB have these values on Linux and the BSDs. *)
   val lock_ex = 2
   val lock_nb = 4
+  (* Foreign caches flock's address on the first call without synchronising,
+     so concurrent first calls can jump to a half-written address
+     (HolbuildHttp has the details).  One call at a time; errno is read
+     before unlocking. *)
+  val flock_mutex = Mutex.mutex ()
+  fun flock fd =
+    (Mutex.lock flock_mutex;
+     (if flock_call (SysWord.toInt (Posix.FileSys.fdToWord fd), lock_ex + lock_nb) = 0 then NONE
+      else SOME (Error.getLastError ()))
+     before Mutex.unlock flock_mutex)
 in
   (* False when another descriptor holds the lock (EWOULDBLOCK, which is EAGAIN
      on Linux and the BSDs).  Any other failure, such as a filesystem without
      flock, raises: waiting would never end. *)
   fun try_lock path fd =
-    flock_call (SysWord.toInt (Posix.FileSys.fdToWord fd), lock_ex + lock_nb) = 0 orelse
-    let val err = Error.fromWord (Error.getLastError ())
-    in
-      if err = Posix.Error.again orelse err = Posix.Error.intr
-      then false
-      else raise Error (path ^ ": flock: " ^ OS.errorMsg err)
-    end
+    case flock fd of
+        NONE => true
+      | SOME errno =>
+          let val err = Error.fromWord errno
+          in
+            if err = Posix.Error.again orelse err = Posix.Error.intr
+            then false
+            else raise Error (path ^ ": flock: " ^ OS.errorMsg err)
+          end
 end
 
 val file_mode =

@@ -29,7 +29,9 @@ Ancestors bool
 Theorem a_thm:
   T
 Proof
-  simp[]
+  (if OS.Process.getEnv "HOLBUILD_TEST_FAIL_PROOF" = SOME "1" then
+     raise Fail "forced proof failure"
+   else ALL_TAC) >> simp[]
 QED
 SML
 
@@ -39,6 +41,21 @@ weak_build_log=$tmpdir/weak-build.log
 (cd "$project" && "$HOLBUILD_BIN" build --tactic-timeout 0 ATheory) > "$weak_build_log" 2>&1
 require_grep "ATheory built" "$weak_build_log"
 require_grep '^proof_timeout=none$' "$metadata"
+
+# A policy-only miss must retain the usable weak entry if rechecking fails.
+manifest=$(find "$HOLBUILD_CACHE/actions" -name manifest -print -quit)
+cp "$manifest" "$tmpdir/weak-manifest"
+rm -rf "$project/.holbuild"
+if (cd "$project" && HOLBUILD_TEST_FAIL_PROOF=1 "$HOLBUILD_BIN" build \
+  --tactic-timeout 60 ATheory) > "$tmpdir/strict-failure.log" 2>&1; then
+  echo "forced proof failure unexpectedly succeeded" >&2
+  exit 1
+fi
+require_grep "forced proof failure" "$tmpdir/strict-failure.log"
+cmp "$tmpdir/weak-manifest" "$manifest" || {
+  echo "failed policy recheck removed or changed the usable cache entry" >&2
+  exit 1
+}
 
 rm -rf "$project/.holbuild"
 restore_log=$tmpdir/restore.log

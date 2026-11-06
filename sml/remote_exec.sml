@@ -12,11 +12,20 @@ struct
 datatype attempt = Ok of string | Refused of string
 
 datatype outcome = Done
-                 | Failed of string       (* the batch failed or was cancelled *)
+                 | Failed of string       (* the batch failed *)
+                 | Cancelled              (* someone cancelled the batch *)
+                 | Unfollowable of string (* the coordinator won't stream it; it may still run *)
                  | Unreachable of string  (* the coordinator couldn't be asked *)
+
+(* How many of a batch's actions are done, of how many, as its events last
+   said. *)
+type progress = {built : int, total : int}
 
 val connect_timeout_seconds = 10
 val request_max_time_seconds = 60
+(* Waits before each reattach to an event stream that broke without
+   delivering an event, long enough to ride out a coordinator restart. *)
+val reattach_delays_seconds = [1, 2, 4, 8]
 
 fun curl_config_args () =
   case OS.Process.getEnv "HOLBUILD_REMOTE_EXEC_CURL_CONFIG" of
@@ -112,50 +121,131 @@ fun report_action line =
   end
 
 (* Follows a batch's event stream until the batch finishes, printing each
-   action whose state changes. *)
-fun follow url batch_id : outcome =
+   action whose state changes, and passing on_done the input key of each
+   action that becomes done.  A stream that breaks (the connection drops,
+   or the coordinator answers 5xx while it restarts) is reattached: after a
+   second when it delivered events, since a proxy may close an idle stream,
+   and after each of reattach_delays_seconds in a row when it delivered none.
+   The coordinator ends a batch at its deadline, so this ends too. *)
+fun follow url batch_id (on_done : string -> unit) : outcome * progress =
   let
     val states : (string * string) list ref = ref []
-    val outcome : outcome option ref = ref NONE
-    val others : string list ref = ref []
-    fun on_line line =
-      case json_string_field "type" line of
+    (* A line cut off by a dropped connection, perhaps with curl's error
+       after it, is no event. *)
+    fun complete line = Substring.isSuffix "}" (Substring.dropr Char.isSpace (Substring.full line))
+    fun on_line outcome received others line =
+      case (if complete line then json_string_field "type" line else NONE) of
           SOME "action" =>
             let
               val key = Option.getOpt (json_string_field "input_key" line, "")
               val state = Option.getOpt (json_string_field "state" line, "")
             in
+              received := true;
               if List.exists (fn entry => entry = (key, state)) (!states) then ()
               else (states := (key, state) :: List.filter (fn (k, _) => k <> key) (!states);
-                    report_action line)
+                    report_action line;
+                    if state = "done" then on_done key else ())
             end
         | SOME "batch" =>
             outcome :=
               SOME (case json_string_field "state" line of
                         SOME "done" => Done
+                      | SOME "cancelled" => Cancelled
                       | SOME state =>
                           Failed (state ^ (case json_string_field "failure" line of
                                                SOME failure => ": " ^ failure
                                              | NONE => ""))
                       | NONE => Failed "finished in an unknown state")
         | _ => others := line :: !others
-    val _ =
-      HolbuildSpawn.run_lines
-        {program = "curl",
-         args = curl_args (endpoint url ("/v1/batches/" ^ batch_id ^ "/events"))
-                  ["-N", "-w", "\n%{http_code}"],
-         stderr = HolbuildSpawn.Merge}
-        on_line
-    val (lines, status) = split_status (String.concat (rev (!others)))
-    val text = String.concatWith "\n" lines
+    fun attach delays =
+      let
+        val outcome : outcome option ref = ref NONE
+        val received = ref false
+        val others : string list ref = ref []
+        val _ =
+          HolbuildSpawn.run_lines
+            {program = "curl",
+             args = curl_args (endpoint url ("/v1/batches/" ^ batch_id ^ "/events"))
+                      ["-N", "-w", "\n%{http_code}"],
+             stderr = HolbuildSpawn.Merge}
+            (on_line outcome received others)
+        val (lines, status) = split_status (String.concat (rev (!others)))
+        val text = String.concatWith "\n" lines
+        val broken = status = 0 orelse (status >= 200 andalso status < 300) orelse status >= 500
+        val reason =
+          (if status >= 500 then "the coordinator answered HTTP " ^ Int.toString status ^ " to"
+           else "lost") ^ " the event stream for batch " ^ batch_id ^
+          (if text = "" then "" else ": " ^ text)
+        fun again delay delays =
+          (HolbuildStatus.message_stderr ("holbuild: " ^ reason ^ "; reattaching\n");
+           OS.Process.sleep (Time.fromSeconds (Int.toLarge delay));
+           attach delays)
+      in
+        case !outcome of
+            SOME outcome => outcome
+          | NONE =>
+              if not broken then Unfollowable ("can't be followed (HTTP " ^ Int.toString status ^ "): " ^ text)
+              else if !received then again 1 reattach_delays_seconds
+              else
+                case delays of
+                    [] => Unreachable reason
+                  | delay :: rest => again delay rest
+      end
+    val outcome = attach reattach_delays_seconds
   in
-    case !outcome of
-        SOME outcome => outcome
-      | NONE =>
-          if status = 0 orelse (status >= 200 andalso status < 300) then
-            Unreachable ("lost the coordinator's event stream for batch " ^ batch_id ^
-                         (if text = "" then "" else ": " ^ text))
-          else Failed ("can't be followed (HTTP " ^ Int.toString status ^ "): " ^ text)
+    (outcome,
+     {built = length (List.filter (fn (_, state) => state = "done") (!states)),
+      total = length (!states)})
   end
+
+(* Asks the coordinator to cancel a batch; true when it did.  It answers
+   with the batch's state, which for a batch that already ended is that
+   end, not "cancelled".  A failure only warns, since the coordinator ends
+   an abandoned batch at its deadline anyway. *)
+fun cancel_within max_time_seconds url batch_id =
+  let
+    val result =
+      HolbuildSpawn.run
+        {program = "curl",
+         args = curl_args (endpoint url ("/v1/batches/" ^ batch_id ^ "/cancel"))
+                  ["--max-time", Int.toString max_time_seconds, "-X", "POST",
+                   "-w", "\n%{http_code}"],
+         stderr = HolbuildSpawn.Merge}
+    val (lines, status) = split_status (#output result)
+  in
+    if status >= 200 andalso status < 300 then
+      json_string_field "state" (String.concatWith "\n" lines) = SOME "cancelled"
+    else
+      (HolbuildStatus.message_stderr
+         ("holbuild: warning: could not cancel remote batch " ^ batch_id ^
+          (if status = 0 then "" else " (HTTP " ^ Int.toString status ^ ")") ^
+          (case lines of [] => "" | _ => ": " ^ String.concatWith " " lines) ^ "\n");
+       false)
+  end
+
+val cancel = cancel_within request_max_time_seconds
+
+(* The batch a build is following and would cancel if it stopped following
+   it, so that an interrupted build cancels it too (cancel_followed) rather
+   than leave it running for nobody until its deadline. *)
+val followed : (string * string) option ref = ref NONE
+
+(* Runs f, which follows the batch, with the batch registered as followed. *)
+fun while_followed url batch_id f =
+  (followed := SOME (url, batch_id);
+   f () before followed := NONE)
+  handle e => (followed := NONE; raise e)
+
+(* Whoever interrupts a build may kill it soon after, so this waits briefly. *)
+val interrupt_cancel_seconds = 5
+
+fun cancel_followed () =
+  case !followed of
+      NONE => ()
+    | SOME (url, batch_id) =>
+        (followed := NONE;
+         if cancel_within interrupt_cancel_seconds url batch_id
+         then HolbuildStatus.message_stderr ("holbuild: cancelled remote batch " ^ batch_id ^ "\n")
+         else ())
 
 end

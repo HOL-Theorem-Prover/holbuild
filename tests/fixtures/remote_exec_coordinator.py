@@ -7,14 +7,23 @@ workers), then streams one action event per action and the batch's final
 event: done when RUN exits 0, failed otherwise.  Each action is reported
 running twice first, as a coordinator repeats unchanged states.  Control
 files in STATE change the answers: `refuse` makes POST answer 400, `drop`
-ends the event stream before the final event, `skip` reports the batch done
-without running RUN.  Every request is logged to STATE/requests.log.
+ends the next event stream before the final event (and is removed), `cut`
+ends it midway through its first action event (and is removed), `down`
+makes the event stream and POST /v1/batches/<id>/cancel answer 503, `ended`
+makes the event stream answer 503 and the cancel answer that the batch is
+already done, `skip` reports the batch done without running RUN, `hang` streams one
+running event and then nothing until `hang` is removed, without running RUN, `hold`
+holds the stream after the first action's final event until `hold` is removed, and
+`cancelled` reports every action and the batch cancelled without running RUN.  Otherwise
+the cancel answers that it cancelled the batch.  Every request is logged to
+STATE/requests.log.
 """
 
 import json
 import pathlib
 import subprocess
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 state = pathlib.Path(sys.argv[2])
@@ -39,7 +48,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self.log_request_line()
-        body = self.rfile.read(int(self.headers["Content-Length"])).decode()
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
+        if self.path.startswith("/v1/batches/") and self.path.endswith("/cancel"):
+            if (state / "ended").exists():
+                return self.answer(200, {"state": "done"})
+            if (state / "down").exists():
+                return self.answer(503, {"detail": "restarting"})
+            return self.answer(200, {"state": "cancelled"})
         if self.path != "/v1/batches":
             return self.answer(404, {"detail": "Not Found"})
         if (state / "refuse").exists():
@@ -55,9 +70,32 @@ class Handler(BaseHTTPRequestHandler):
         batch = state / f"{parts[3]}.batch" if len(parts) == 5 and parts[4] == "events" else None
         if batch is None or not batch.exists():
             return self.answer(404, {"detail": "no such batch"})
-        ok = (state / "skip").exists() or subprocess.run([run, str(batch)]).returncode == 0
+        if (state / "down").exists() or (state / "ended").exists():
+            return self.answer(503, {"detail": "restarting"})
+        if (state / "hang").exists():
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.end_headers()
+            action = next(line.split() for line in batch.read_text().splitlines() if line.startswith("action "))
+            running = {"type": "action", "input_key": action[1], "theory": action[4], "state": "running",
+                       "tier": "standard", "attempts": 1, "last_failure": None, "log_sha256": None}
+            self.wfile.write((json.dumps(running) + "\n").encode())
+            self.wfile.flush()
+            for _ in range(600):
+                if not (state / "hang").exists():
+                    break
+                time.sleep(0.1)
+            return
+        cancelled = (state / "cancelled").exists()
+        ok = cancelled or (state / "skip").exists() or subprocess.run([run, str(batch)]).returncode == 0
+        final_state = "cancelled" if cancelled else "done" if ok else "failed"
+        cut = (state / "cut").exists()
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
+        if cut:
+            # More than is sent, so curl reports the stream cut short.
+            (state / "cut").unlink()
+            self.send_header("Content-Length", "1000")
         self.end_headers()
         for line in batch.read_text().splitlines():
             fields = line.split()
@@ -66,14 +104,23 @@ class Handler(BaseHTTPRequestHandler):
                     running = {"type": "action", "input_key": fields[1], "theory": fields[4],
                                "state": "running", "tier": "standard", "attempts": 1,
                                "last_failure": None, "log_sha256": None}
+                    if cut:
+                        self.wfile.write(json.dumps(running)[:30].encode())
+                        return
                     self.wfile.write((json.dumps(running) + "\n").encode())
                 event = {"type": "action", "input_key": fields[1], "theory": fields[4],
-                         "state": "done" if ok else "failed", "tier": "standard", "attempts": 1,
+                         "state": final_state, "tier": "standard", "attempts": 1,
                          "last_failure": None if ok else "proof", "log_sha256": None}
                 self.wfile.write((json.dumps(event) + "\n").encode())
+                self.wfile.flush()
+                for _ in range(600):
+                    if not (state / "hold").exists():
+                        break
+                    time.sleep(0.1)
         if (state / "drop").exists():
+            (state / "drop").unlink()
             return
-        final = {"type": "batch", "state": "done" if ok else "failed",
+        final = {"type": "batch", "state": final_state,
                  "failure": None if ok else "an action failed"}
         self.wfile.write((json.dumps(final) + "\n").encode())
 

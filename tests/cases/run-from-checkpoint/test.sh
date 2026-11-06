@@ -133,30 +133,32 @@ require_heap_fallback() {
 }
 no_checkpoint_reason="BTheory has no current checkpoint (not built yet, restored from the cache without a local build, built with --skip-checkpoints, or removed by gc)"
 
-# Current final_context: BTheory is bound before any load, and loading it again
-# is a no-op rather than a second copy of the theory.
-final_script=$tmpdir/final.sml
-cat > "$final_script" <<'SML'
-val _ = (BTheory.b_thm; print "FINAL_CONTEXT_BOUND_OK\n");
+# BTheory built for its current source: the session starts from its
+# deps_loaded checkpoint and loads BTheory on top, so BTheory is bound before
+# the script's own load, which is then a no-op.
+built_script=$tmpdir/built.sml
+cat > "$built_script" <<'SML'
+val _ = (BTheory.b_thm; print "THEORY_BOUND_OK\n");
 val _ = load "BTheory";
-val _ = print "FINAL_CONTEXT_RELOAD_OK\n";
+val _ = print "THEORY_RELOAD_OK\n";
 SML
-final_log=$tmpdir/final.log
-run_from "$final_log" --from BTheory "$final_script" "$state_script"
-require_grep "holbuild: --from BTheory: starting from its final_context checkpoint" "$final_log"
-require_grep "FINAL_CONTEXT_BOUND_OK" "$final_log"
-require_grep "FINAL_CONTEXT_RELOAD_OK" "$final_log"
-require_grep "LOADED_STATE .*/BScript.sml.final_context.save" "$final_log"
+loaded_b="starting from its deps_loaded checkpoint and loading BTheory"
+built_log=$tmpdir/built.log
+run_from "$built_log" --from BTheory "$built_script" "$state_script"
+require_grep "holbuild: --from BTheory: $loaded_b" "$built_log"
+require_grep "THEORY_BOUND_OK" "$built_log"
+require_grep "THEORY_RELOAD_OK" "$built_log"
+require_grep "LOADED_STATE .*/BScript.sml.deps/.*/deps_loaded.save" "$built_log"
 
 source_log=$tmpdir/source-path.log
-run_from "$source_log" --from src/BScript.sml "$final_script"
-require_grep "holbuild: --from src/BScript.sml: starting from its final_context checkpoint" "$source_log"
-require_grep "FINAL_CONTEXT_BOUND_OK" "$source_log"
+run_from "$source_log" --from src/BScript.sml "$built_script"
+require_grep "holbuild: --from src/BScript.sml: $loaded_b" "$source_log"
+require_grep "THEORY_BOUND_OK" "$source_log"
 
 repl_log=$tmpdir/repl.log
 printf 'val _ = (BTheory.b_thm; print "REPL_FROM_OK\\n");\n' |
   (cd "$project" && timeout 60 "$HOLBUILD_BIN" repl --from=BTheory) > "$repl_log" 2>&1
-require_grep "starting from its final_context checkpoint" "$repl_log"
+require_grep "$loaded_b" "$repl_log"
 require_grep "REPL_FROM_OK" "$repl_log"
 
 # A --from session exports theories with the same trace settings as a plain run,
@@ -186,9 +188,9 @@ val _ = print "LOAD_B_OK\n";
 SML
 inferred="(inferred from the scripts' dependencies)"
 run_from "$tmpdir/infer-one.log" "$load_a_script" "$state_script"
-require_grep "holbuild: --from ATheory $inferred: starting from its final_context checkpoint" "$tmpdir/infer-one.log"
+require_grep "holbuild: --from ATheory $inferred: starting from its deps_loaded checkpoint and loading ATheory" "$tmpdir/infer-one.log"
 require_grep "LOAD_A_OK" "$tmpdir/infer-one.log"
-require_grep "LOADED_STATE .*/AScript.sml.final_context.save" "$tmpdir/infer-one.log"
+require_grep "LOADED_STATE .*/AScript.sml.deps/.*/deps_loaded.save" "$tmpdir/infer-one.log"
 
 # BTheory has ATheory as an ancestor, so a script using both starts from BTheory.
 both_script=$tmpdir/both.sml
@@ -196,19 +198,19 @@ cat > "$both_script" <<'SML'
 val _ = (ATheory.a_thm; BTheory.b_thm; print "BOTH_BOUND_OK\n");
 SML
 run_from "$tmpdir/infer-both.log" "$both_script"
-require_grep "holbuild: --from BTheory $inferred: starting from its final_context checkpoint" "$tmpdir/infer-both.log"
+require_grep "holbuild: --from BTheory $inferred: $loaded_b" "$tmpdir/infer-both.log"
 require_grep "BOTH_BOUND_OK" "$tmpdir/infer-both.log"
 
 # An explicit --from overrides the inferred theory.
 run_from "$tmpdir/infer-override.log" --from ATheory "$load_b_script"
-require_grep "holbuild: --from ATheory: starting from its final_context checkpoint" "$tmpdir/infer-override.log"
+require_grep "holbuild: --from ATheory: starting from its deps_loaded checkpoint and loading ATheory" "$tmpdir/infer-override.log"
 require_grep "LOAD_B_OK" "$tmpdir/infer-override.log"
 require_no_grep "inferred" "$tmpdir/infer-override.log"
 
 infer_repl_log=$tmpdir/infer-repl.log
 printf 'val _ = (BTheory.b_thm; print "REPL_INFER_OK\\n");\n' |
   (cd "$project" && timeout 60 "$HOLBUILD_BIN" repl "$load_b_script") > "$infer_repl_log" 2>&1
-require_grep "holbuild: --from BTheory $inferred: starting from its final_context checkpoint" "$infer_repl_log"
+require_grep "holbuild: --from BTheory $inferred: $loaded_b" "$infer_repl_log"
 require_grep "REPL_INFER_OK" "$infer_repl_log"
 
 bare_repl_log=$tmpdir/bare-repl.log
@@ -217,8 +219,8 @@ printf 'val _ = print "BARE_REPL_OK\\n";\n' |
 require_grep "BARE_REPL_OK" "$bare_repl_log"
 require_no_grep "holbuild: --from" "$bare_repl_log"
 
-# final_context's saved parent is deps_loaded at its old absolute path, so after
-# the project directory moves only deps_loaded can load.
+# After the project directory moves, deps_loaded still loads, but BTheory's
+# objects name the old directory: the session warns and keeps its ancestors.
 moved=$tmpdir/moved
 mv "$project" "$moved"
 moved_log=$tmpdir/moved.log
@@ -226,28 +228,18 @@ if ! (cd "$moved" && "$HOLBUILD_BIN" run --from BTheory "$deps_script") > "$move
   cat "$moved_log" >&2
   exit 1
 fi
-require_grep "holbuild: --from BTheory: its final_context checkpoint cannot load because its parent state $project/.*/deps_loaded.save has moved or been replaced; starting from its deps_loaded checkpoint" "$moved_log"
+require_grep "holbuild: --from BTheory: $loaded_b" "$moved_log"
+require_grep "holbuild: could not load BTheory: .*; continuing with its ancestors loaded" "$moved_log"
 require_grep "DEPS_LOADED_BOUND_OK" "$moved_log"
 require_grep "B_NOT_LOADED" "$moved_log"
 mv "$moved" "$project"
-
-# A final_context that is not a saved state, with its ok-file still current,
-# falls back to deps_loaded instead of aborting the run.
-final_context_file=$(find "$project/.holbuild/checkpoints" -name 'BScript.sml.final_context.save')
-cp "$final_context_file" "$tmpdir/final_context.save.good"
-echo garbage > "$final_context_file"
-unreadable_log=$tmpdir/unreadable.log
-run_from "$unreadable_log" --from BTheory "$deps_script"
-require_grep "holbuild: --from BTheory: its final_context checkpoint is unreadable: .*; starting from its deps_loaded checkpoint" "$unreadable_log"
-require_grep "B_NOT_LOADED" "$unreadable_log"
-cp "$tmpdir/final_context.save.good" "$final_context_file"
 
 # Only BTheory is stale: its ancestors come from deps_loaded.
 sed -i 's/^val _ = export_theory();$/val b2_thm = store_thm("b2_thm", ``T``, ACCEPT_TAC TRUTH);\nval _ = export_theory();/' \
   "$project/src/BScript.sml"
 deps_log=$tmpdir/deps.log
 run_from "$deps_log" --from BTheory "$deps_script"
-require_grep "holbuild: --from BTheory: no final_context checkpoint for its current source; starting from its deps_loaded checkpoint" "$deps_log"
+require_grep "holbuild: --from BTheory: it is not built for its current source; starting from its deps_loaded checkpoint, which has only its ancestors loaded" "$deps_log"
 require_grep "DEPS_LOADED_BOUND_OK" "$deps_log"
 require_grep "B_NOT_LOADED" "$deps_log"
 
@@ -264,14 +256,14 @@ rm -rf "$project/.holbuild"
   { cat "$tmpdir/cache-hit.log" >&2; exit 1; }
 require_heap_fallback cache "$no_checkpoint_reason"
 
-# A static error discards and rewrites deps_loaded; the final_context saved on
-# top of the old deps_loaded must go with it, even once the source is reverted.
+# A static error discards and rewrites deps_loaded; once the source is
+# reverted, a session starts from the rewritten one.
 sed -i 's/^val _ = export_theory();$/val b3_thm = store_thm("b3_thm", ``T``, ACCEPT_TAC TRUTH);\nval _ = export_theory();/' \
   "$project/src/BScript.sml"
 (cd "$project" && "$HOLBUILD_BIN" build BTheory) > "$tmpdir/fresh.log" 2>&1 ||
   { cat "$tmpdir/fresh.log" >&2; exit 1; }
-run_from "$tmpdir/fresh-run.log" --from BTheory "$final_script"
-require_grep "starting from its final_context checkpoint" "$tmpdir/fresh-run.log"
+run_from "$tmpdir/fresh-run.log" --from BTheory "$built_script"
+require_grep "$loaded_b" "$tmpdir/fresh-run.log"
 cp "$project/src/BScript.sml" "$tmpdir/BScript.sml.good"
 sed -i 's/^val _ = export_theory();$/val bad : int = "typo";\nval _ = export_theory();/' \
   "$project/src/BScript.sml"
@@ -291,8 +283,8 @@ sed -i 's/^val _ = export_theory();$/val b4_thm = store_thm("b4_thm", ``T``, ACC
   "$project/src/BScript.sml"
 (cd "$project" && "$HOLBUILD_BIN" build BTheory) > "$tmpdir/pre-gc.log" 2>&1 ||
   { cat "$tmpdir/pre-gc.log" >&2; exit 1; }
-run_from "$tmpdir/pre-gc-run.log" --from BTheory "$final_script"
-require_grep "starting from its final_context checkpoint" "$tmpdir/pre-gc-run.log"
+run_from "$tmpdir/pre-gc-run.log" --from BTheory "$built_script"
+require_grep "$loaded_b" "$tmpdir/pre-gc-run.log"
 (cd "$project" && "$HOLBUILD_BIN" gc --clean-only --retention-days 0) > "$tmpdir/gc.log" 2>&1 ||
   { cat "$tmpdir/gc.log" >&2; exit 1; }
 require_heap_fallback gc "$no_checkpoint_reason"
