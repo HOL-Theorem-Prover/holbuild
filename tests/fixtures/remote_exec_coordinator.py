@@ -11,7 +11,8 @@ ends the next event stream before the final event (and is removed), `cut`
 ends it midway through its first action event (and is removed), `down`
 makes the event stream and POST /v1/batches/<id>/cancel answer 503, `ended`
 makes the event stream answer 503 and the cancel answer that the batch is
-already done, `skip` reports the batch done without running RUN.  Otherwise
+already done, `skip` reports the batch done without running RUN, `hang` streams one
+running event and then nothing until `hang` is removed, without running RUN.  Otherwise
 the cancel answers that it cancelled the batch.  Every request is logged to
 STATE/requests.log.
 """
@@ -20,6 +21,7 @@ import json
 import pathlib
 import subprocess
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 state = pathlib.Path(sys.argv[2])
@@ -68,6 +70,20 @@ class Handler(BaseHTTPRequestHandler):
             return self.answer(404, {"detail": "no such batch"})
         if (state / "down").exists() or (state / "ended").exists():
             return self.answer(503, {"detail": "restarting"})
+        if (state / "hang").exists():
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.end_headers()
+            action = next(line.split() for line in batch.read_text().splitlines() if line.startswith("action "))
+            running = {"type": "action", "input_key": action[1], "theory": action[4], "state": "running",
+                       "tier": "standard", "attempts": 1, "last_failure": None, "log_sha256": None}
+            self.wfile.write((json.dumps(running) + "\n").encode())
+            self.wfile.flush()
+            for _ in range(600):
+                if not (state / "hang").exists():
+                    break
+                time.sleep(0.1)
+            return
         ok = (state / "skip").exists() or subprocess.run([run, str(batch)]).returncode == 0
         cut = (state / "cut").exists()
         self.send_response(200)
