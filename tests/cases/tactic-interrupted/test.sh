@@ -13,8 +13,9 @@ trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
 # Poly/ML raises Interrupt in a thread whose stack can't grow.  A step
-# interrupted before its tactic timeout is reported as a stack overflow, not as
-# a timeout, and TRY doesn't take its failure branch for it.  overflow_tac
+# interrupted before its tactic timeout is reported as interrupted (stack
+# overflow or out of memory), not as a timeout, and TRY doesn't take its
+# failure branch for it.  overflow_tac
 # raises Interrupt itself, as the runtime would, without exhausting memory.
 write_project() {
   local project=$1 proof=$2
@@ -29,7 +30,7 @@ git = "https://github.com/HOL-Theorem-Prover/HOL.git"
 rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
-name = "tactic-stack-overflow"
+name = "tactic-interrupted"
 
 [build]
 members = ["src"]
@@ -59,7 +60,7 @@ for proof in "  CONJ_TAC >> overflow_tac >> simp[]" "  CONJ_TAC >> TRY overflow_
     cat "$tmpdir/build.log" >&2
     exit 1
   fi
-  require_grep "holbuild tactic stack overflow (interrupted by Poly/ML): overflow_tac" "$tmpdir/build.log"
+  require_grep "holbuild tactic interrupted by Poly/ML (stack overflow or out of memory): overflow_tac" "$tmpdir/build.log"
   if grep -q "timed out" "$tmpdir/build.log"; then
     echo "interrupted step was reported as a timeout: $proof" >&2
     cat "$tmpdir/build.log" >&2

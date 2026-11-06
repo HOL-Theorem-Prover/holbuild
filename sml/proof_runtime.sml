@@ -201,11 +201,11 @@ fun timeout_message label seconds =
    fails the build. *)
 exception TacticTimeout of string
 
-(* Raised when a proof step is interrupted before the tactic timeout.  Poly/ML
-   interrupts a thread whose stack can't grow, so this is a stack overflow,
-   such as a runaway recursion in the tactic.  Combinators propagate it like
-   TacticTimeout. *)
-exception TacticStackOverflow of string
+(* Raised when the Poly/ML runtime interrupts a proof step before the tactic
+   timeout: it interrupts a thread whose stack can't grow (a stack overflow,
+   such as a runaway recursion) and, when the heap is exhausted, every thread.
+   Combinators propagate it like TacticTimeout. *)
+exception TacticInterrupted of string
 
 fun with_tactic_timeout label f x =
   case !tactic_timeout_ref of
@@ -216,7 +216,7 @@ fun with_tactic_timeout label f x =
            (write_timeout_marker label seconds;
             raise TacticTimeout (timeout_message label seconds))
               | FunctionInterrupted =>
-           raise TacticStackOverflow ("holbuild tactic stack overflow (interrupted by Poly/ML): " ^ label))
+           raise TacticInterrupted ("holbuild tactic interrupted by Poly/ML (stack overflow or out of memory): " ^ label))
 
 fun save_checkpoint label default_share path ok_text depth =
   if not (!checkpoint_enabled_ref) then ()
@@ -757,7 +757,7 @@ fun report_step_failure_with_goals label goals e =
       (TacticTimeout _, true) =>
         (print_step_failure_goal_state label goals;
          raise e)
-    | (TacticStackOverflow _, true) =>
+    | (TacticInterrupted _, true) =>
         (print_step_failure_goal_state label goals;
          raise e)
     | (_, true) =>
@@ -1388,7 +1388,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
                       (discard_suppressed_failure_diagnostic ();
                        record_or_replay_event (HolbuildProofIr.ChoiceEvent (path, n)))
                   | SOME (e as TacticTimeout _) => raise_body_timeout saved e
-                  | SOME (e as TacticStackOverflow _) => raise_body_timeout saved e
+                  | SOME (e as TacticInterrupted _) => raise_body_timeout saved e
                   | SOME e =>
                       (restore_runtime_state saved;
                        attempt (n + 1) (alt_line + 1 + HolbuildProofIr.display_line_count_list body) rest (SOME (e, diagnostic)))
@@ -1427,7 +1427,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
           in case result of
                  NONE => record_or_replay_event (HolbuildProofIr.TryEvent (path, true))
                | SOME (e as TacticTimeout _) => raise_body_timeout saved e
-               | SOME (e as TacticStackOverflow _) => raise_body_timeout saved e
+               | SOME (e as TacticInterrupted _) => raise_body_timeout saved e
                | SOME _ =>
                    (restore_runtime_state saved;
                     discard_suppressed_failure_diagnostic ();
@@ -1449,7 +1449,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
                    val result = (with_expected_failures_suppressed (fn () => run_list (d + 1) (path @ [HolbuildProofIr.PathRepeat iter]) 0 body); NONE) handle e => SOME e
                in case result of
                       SOME (e as TacticTimeout _) => raise_body_timeout saved e
-                    | SOME (e as TacticStackOverflow _) => raise_body_timeout saved e
+                    | SOME (e as TacticInterrupted _) => raise_body_timeout saved e
                     | SOME _ =>
                         (restore_runtime_state saved;
                          discard_suppressed_failure_diagnostic ();
