@@ -41,6 +41,13 @@ CLAIM_RETRY_SECONDS = 5  # least time between two claims that found nothing
 # of the worker's environment, its coordinator token above all, stays out of the builds' environment.
 EXEC_ACTION_ENV = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR")
 PROXY_ENV = ("http_proxy", "https_proxy", "all_proxy", "no_proxy")  # in either case
+# holbuild's --cooperate-dir admission, as in sml/machine_memory.sml: the --child-charge default caps a child's charge
+# at this many MiB (default_charge_mb), and a lease this young still counts against MemAvailable (startup_seconds).
+DEFAULT_CHARGE_MIB = 3072
+STARTUP_SECONDS = 30
+MEMORY_POLL_SECONDS = 2  # between two looks at the host's memory while waiting to claim
+MIB = 2**20
+GIB = 1024 * MIB
 
 
 # What a request to the coordinator raises when it or the network fails; ValueError covers a reply that isn't JSON.
@@ -208,6 +215,91 @@ class Releases:
         subprocess.run(["make", "bin/holbuild"], cwd=directory, check=True, stdout=2)
         with open(os.path.join(directory, COMPLETE), "w"):
             pass
+
+
+def reserve(total: int) -> int:
+    """What holbuild's default budget leaves out of MemTotal (``reserve`` in sml/machine_memory.sml)."""
+    return max(GIB, min(total // 4, 30 * GIB))
+
+
+@dataclass(frozen=True)
+class HostMemory:
+    """What holbuild's ``--cooperate-dir`` admission reads, in bytes: ``/proc/meminfo``, the dir's budget, and the
+    charges of the leases held in it, all and those whose child is still starting."""
+
+    total: int | None
+    available: int | None
+    budget: int | None
+    reserved: int
+    starting: int
+
+    @classmethod
+    def read(cls, directory: str) -> "HostMemory":
+        meminfo: dict[str, int] = {}
+        with open(os.environ.get("HOLBUILD_TEST_MEMINFO", "/proc/meminfo")) as file:
+            for line in file:
+                match = re.fullmatch(r"(\w+):\s+(\d+) kB", line.strip())
+                if match:
+                    meminfo[match[1]] = int(match[2]) * 1024
+        total = meminfo.get("MemTotal")
+        budget = None if total is None else total - reserve(total)
+        reserved = starting = 0
+        # Lease files are probed under DIR/lock, as holbuild scans them: a probe's flock on a lease another
+        # process has just created, before it locks it, would make that process's admission fail.
+        with contextlib.suppress(FileNotFoundError), open(os.path.join(directory, "lock")) as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with contextlib.suppress(FileNotFoundError), open(os.path.join(directory, "budget")) as file:
+                budget = int(file.read())
+            for name in os.listdir(directory):
+                if not name.startswith("lease-"):
+                    continue
+                with contextlib.suppress(FileNotFoundError), open(os.path.join(directory, name)) as lease:
+                    try:
+                        fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        continue  # nobody holds it: its child is gone
+                    except BlockingIOError:
+                        pass
+                    charge = int(lease.read())
+                    reserved += charge
+                    if time.time() - os.fstat(lease.fileno()).st_mtime < STARTUP_SECONDS:
+                        starting += charge
+        return cls(total, meminfo.get("MemAvailable"), budget, reserved, starting)
+
+    def shortfall(self, charge: int) -> str | None:
+        """Why holbuild's admission (``acquire`` and ``live_shortfall`` in sml/machine_memory.sml) would hold back a
+        child charged ``charge`` bytes now, or None if it would start it."""
+        # With no lease held, holbuild starts a child that fits the budget whatever MemAvailable says, and fails one
+        # that doesn't; with no budget, it fails too. Neither is worth waiting for.
+        if self.reserved == 0 or self.budget is None:
+            return None
+        if self.reserved + charge > self.budget:
+            return f"{self.reserved // MIB} of {self.budget // MIB} MiB reserved"
+        if self.total is None or self.available is None:
+            return None
+        margin = min(reserve(self.total), max(GIB, self.total - self.budget))
+        if self.available - self.starting < charge + margin:
+            return (
+                f"MemAvailable {self.available // MIB} MiB, less {self.starting // MIB} MiB for children "
+                f"starting, is below {charge // MIB} MiB plus {margin // MIB} MiB kept free"
+            )
+        return None
+
+
+def child_charge(max_heap: int | None) -> int:
+    """The bytes holbuild charges a child by default: ``--max-heap``, at most DEFAULT_CHARGE_MIB."""
+    return min(max_heap or DEFAULT_CHARGE_MIB, DEFAULT_CHARGE_MIB) * MIB
+
+
+def wait_for_memory(directory: str, charge: int) -> None:
+    """Return once holbuild's admission in ``directory`` would start a child charged ``charge`` bytes, so that a
+    worker on a host whose memory is taken doesn't claim an action only to wait on it while other hosts could run it.
+    A check, not a reservation: workers racing past it still wait in exec-action's own admission."""
+    logged = False
+    while (why := HostMemory.read(directory).shortfall(charge)) is not None:
+        if not logged:
+            print(f"waiting for memory before claiming: {why}", file=sys.stderr, flush=True)
+            logged = True
+        time.sleep(MEMORY_POLL_SECONDS)
 
 
 def failed_record(spec_sha256: str, failure: str) -> str:
@@ -394,7 +486,10 @@ def main() -> None:
     tiers = list(dict.fromkeys([args.tier, *args.also_claim]))
     # Exit through Python on SIGTERM, so run_one's cleanup stops the running action.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
+    charge = child_charge(args.max_heap)
     while True:
+        if args.cooperate_dir is not None:
+            wait_for_memory(args.cooperate_dir, charge)
         started = time.monotonic()
         try:
             claim = coordinator.claim(tiers, args.name, args.claim_wait_seconds)
