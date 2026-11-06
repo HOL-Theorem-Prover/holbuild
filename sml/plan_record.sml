@@ -4,8 +4,9 @@
    A record lives in .holbuild/plan/<fingerprint>, where the fingerprint
    hashes every planning input that is not a scanned file.  It keeps the stat
    and hash of each selected source and extra-input file, the stat and
-   classified entries of each directory discovery listed outside HOL and
-   pinned git checkouts, every discovered source, and per selected node
+   classified entries of each directory discovery listed for a package other
+   than HOL or a pinned git checkout, every discovered source, and per
+   selected node
    everything execute reads from the plan.
 
    A file counts as unchanged only when its size, mtime, ctime, inode and
@@ -561,8 +562,19 @@ fun build ({fingerprint, start_ns, toolchain, action_toolchain_key, graph, membe
     val packages = HolbuildProjectGraph.packages graph
     val hol_roots = map HolbuildProject.package_root (List.filter is_hol_package packages)
     fun in_hol path = List.exists (fn root => under root path) hol_roots
-    val pinned_roots = map HolbuildProject.package_root (List.filter is_pinned_git_package packages)
-    fun in_pinned path = List.exists (fn root => under root path) pinned_roots
+    (* A directory is left out when each package with the deepest root above
+       it is HOL or a pinned checkout, whose files change only with the pin. *)
+    val roots =
+      map (fn p => (HolbuildProject.package_root p, is_hol_package p orelse is_pinned_git_package p))
+        packages
+    fun pinned_dir path =
+      let
+        val owners = List.filter (fn (root, _) => under root path) roots
+        val deepest = List.foldl (fn ((root, _), n) => Int.max(size root, n)) ~1 owners
+      in
+        not (null owners) andalso
+        List.all (fn (root, pinned) => pinned orelse size root < deepest) owners
+      end
     fun stamp_of path =
       case Binarymap.peek(stamps, path) of
           SOME st => st
@@ -661,7 +673,7 @@ fun build ({fingerprint, start_ns, toolchain, action_toolchain_key, graph, membe
     val dir_entries =
       List.mapPartial
         (fn (path, SOME st, entries) =>
-              if in_hol path orelse in_pinned path then NONE
+              if pinned_dir path then NONE
               else SOME {path = path, stamp = st, racy = racy st, entries = entries}
           | (path, NONE, _) => raise Unrecordable ("cannot stat " ^ path))
         dirs

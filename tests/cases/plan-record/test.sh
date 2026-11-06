@@ -609,6 +609,56 @@ extra_inputs = ["data"]'
   fi
 }
 
+# A package inside a pinned checkout, here a path override and a shim at
+# the checkout's root, is still watched like any mutable package, and the
+# shim's "." names the checkout's root itself.
+package_in_pinned_checkout() {
+  local p=$tmpdir/in-pinned
+  library_package "$tmpdir/outer" outer Outer
+  mkdir -p "$tmpdir/outer/lib"
+  echo "structure OuterLib = struct val value = 1 end" > "$tmpdir/outer/lib/OuterLib.sml"
+  local rev
+  rev=$(init_git_repo "$tmpdir/outer")
+  using_project "$p" outer Outer "git = \"$tmpdir/outer\"
+rev = \"$rev\""
+  expect_plan "full (no plan record for these inputs)" "$p"
+  local inner=$p/.holbuild/src/outer/inner
+  library_package "$inner" inner Inner
+  mkdir -p "$p/shims"
+  cat > "$p/shims/outerlib.toml" <<'TOML'
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[project]
+name = "outerlib"
+
+[build]
+members = ["lib"]
+TOML
+  cat >> "$p/holproject.toml" <<'TOML'
+
+[dependencies.inner]
+git = "https://example.invalid/inner.git"
+rev = "1111111111111111111111111111111111111111"
+
+[dependencies.outerlib]
+from = "outer"
+path = "."
+manifest = "shims/outerlib.toml"
+TOML
+  printf '[overrides.inner]\npath = "%s"\n' "$inner" > "$p/.holconfig.toml"
+  sleep 1.1
+  expect_plan "full (no plan record for these inputs)" "$p"
+  expect_plan "from record (" "$p"
+  if grep -q '/\./' "$p"/.holbuild/plan/*; then
+    echo "the record names a path through /./" >&2
+    exit 1
+  fi
+  echo "structure Inner2 = struct end" > "$inner/src/Inner2.sml"
+  expect_plan "full (sources added, removed or renamed in $inner/src)" "$p"
+}
+
 noop
 racy_entries_are_rehashed
 edit_with_restored_mtime
@@ -637,3 +687,4 @@ default_mode_rewrites
 from_subdirectory
 default_members
 restored_write_matches_full
+package_in_pinned_checkout
