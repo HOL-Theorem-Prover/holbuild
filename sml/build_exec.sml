@@ -1843,8 +1843,10 @@ fun cache_manifest_outputs_equal input_key left right =
 
 fun cache_entry_usable root input_key text =
   let
+    val lines = cache_manifest_lines text
+    val _ = cache_manifest_proof_timeout lines
     val {sig_hash, sml_hash, dat_hash, trace_hash, extra_hashes, ...} =
-      cache_manifest_blobs_from_lines input_key (cache_manifest_lines text)
+      cache_manifest_blobs_from_lines input_key lines
   in
     HolbuildCache.verify_blob root sig_hash andalso
     HolbuildCache.verify_blob root sml_hash andalso
