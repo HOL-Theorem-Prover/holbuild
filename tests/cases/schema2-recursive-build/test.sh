@@ -169,7 +169,6 @@ echo fake-state > bin/hol.state
 SH
 chmod +x "$hol/bin/build"
 hol_rev=$(init_git_repo "$hol")
-export HOLBUILD_CANONICAL_HOL_GIT="$hol"
 
 fakebin=$tmpdir/fakebin
 mkdir -p "$fakebin"
@@ -581,6 +580,29 @@ if [ -e "$shared_hol/configured" ] || [ -e "$shared_hol/built" ]; then
   exit 1
 fi
 
+# A HOL fork names the same commit under another URL.  The commit identifies
+# the sources, so the fork's project shares the built toolchain.
+fork_root=$tmpdir/fork-root
+mkdir -p "$fork_root"
+cat > "$fork_root/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[project]
+name = "fork-root"
+
+[dependencies.hol]
+git = "file://$hol"
+rev = "$hol_rev"
+TOML
+(cd "$fork_root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" "$HOLBUILD_BIN" buildhol) > "$tmpdir/fork-buildhol.log"
+require_grep "$shared_hol" "$tmpdir/fork-buildhol.log"
+if [ -e "$shared_hol/configured" ] || [ -e "$shared_hol/built" ]; then
+  echo "HOL fork URL rebuilt the shared toolchain" >&2
+  exit 1
+fi
+
 # Older pinned HOL revisions predate tools/sequences/upto-hol.  They must keep
 # working through the historical full-build path instead of becoming
 # unbuildable when the reduced toolchain sequence is unavailable.
@@ -636,7 +658,7 @@ rev = "$legacy_hol_rev"
 TOML
 legacy_log=$tmpdir/legacy-hol.log
 (cd "$legacy_root" && env -u HOLDIR -u HOLBUILD_HOLDIR \
-  HOLBUILD_CANONICAL_HOL_GIT="$legacy_hol" HOLBUILD_POLY="$fakebin/poly" \
+  HOLBUILD_POLY="$fakebin/poly" \
   "$HOLBUILD_BIN" buildhol) > "$legacy_log" 2>&1
 require_grep "falling back to full HOL build" "$legacy_log"
 legacy_shared_hol=$(tail -n 1 "$legacy_log")

@@ -68,7 +68,6 @@ remote_root=$tmpdir/remote
 server_control=$tmpdir/server-control
 start_remote_cache_server "$remote_root" "$tmpdir/server" "$server_control"
 
-export HOLBUILD_CANONICAL_HOL_GIT=$hol
 export HOLBUILD_POLY=$fakebin/poly
 export HOLBUILD_POLYC=$fakebin/polyc
 export HOLBUILD_TEST_BUILD_COUNT=$build_count

@@ -89,7 +89,6 @@ val _ = export_theory();
 SML
 
 unset HOLDIR HOLBUILD_HOLDIR HOLBUILD_REMOTE_CACHE_URL
-export HOLBUILD_CANONICAL_HOL_GIT=$hol
 export HOLBUILD_POLY=$fakebin/poly
 export HOLBUILD_POLYC=$fakebin/polyc
 export HOLBUILD_TEST_BUILD_COUNT=$build_count

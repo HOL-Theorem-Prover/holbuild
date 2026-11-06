@@ -193,7 +193,6 @@ git -C "$hol" init -q
 git_identity "$hol"
 echo upstream-hol > "$hol/README"
 hol_rev=$(commit_repo "$hol")
-export HOLBUILD_CANONICAL_HOL_GIT="$hol"
 
 write_dependency_manifest() {
   local file=$1 name=$2

@@ -639,10 +639,14 @@ fun dependency_package_with resolution artifact_parent project
 fun dependency_package artifact_parent project dep =
   dependency_package_with standard_resolution artifact_parent project dep
 
-fun same_dependency_source (GitSource a, GitSource b) = #git a = #git b andalso #rev a = #rev b
-  | same_dependency_source (FromSource a, FromSource b) =
+(* A commit names the same sources in every repository that has it, so two
+   hol dependencies at one rev agree whatever their URLs: a HOL fork and HOL
+   itself can meet in one graph. *)
+fun same_dependency_source role (GitSource a, GitSource b) =
+      #rev a = #rev b andalso (role = HolToolchainDependency orelse #git a = #git b)
+  | same_dependency_source _ (FromSource a, FromSource b) =
       #from a = #from b andalso #path a = #path b andalso #manifest a = #manifest b
-  | same_dependency_source _ = false
+  | same_dependency_source _ _ = false
 
 fun packages_with resolution project =
   case cached_graph_with resolution project of

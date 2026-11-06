@@ -8,7 +8,6 @@ exception Error of string
 
 val format_version = "holbuild-hol-toolchain-v2"
 val theory_toolchain_format = "holbuild-theory-toolchain-v1"
-val default_canonical_git = "https://github.com/HOL-Theorem-Prover/HOL.git"
 val standard_kernel = HolbuildHolToolchainConfig.StandardKernel
 
 fun toolchain_config kernel_variant = HolbuildHolToolchainConfig.config kernel_variant
@@ -50,12 +49,6 @@ fun remove_tree run_command path =
 fun cache_root () =
   HolbuildCacheConfig.cache_root ()
   handle HolbuildCacheConfig.Error msg => die msg
-
-fun canonical_git () = Option.getOpt(OS.Process.getEnv "HOLBUILD_CANONICAL_HOL_GIT", default_canonical_git)
-
-fun validate_git git =
-  if git = canonical_git () then ()
-  else die ("dependencies.hol.git must be the canonical HOL repository: " ^ canonical_git ())
 
 fun command_output_using run_command command =
   let
@@ -131,8 +124,8 @@ fun poly_version_parts version =
   end
 
 (* The local toolchain key names what a built toolchain depends on:
-   - rev: the HOL sources (a full commit; the git URL must be the canonical
-     one, so it adds nothing);
+   - rev: the HOL sources (a full commit, which names the same sources in
+     every repository that has it, so the git URL adds nothing);
    - build_args: the build sequence, helpdocs and kernel;
    - poly_rts: the Poly/ML runtime release and architecture variant that the
      exported heaps need;
@@ -142,15 +135,12 @@ fun poly_version_parts version =
      executable share a toolchain.
    It is part of the remote archive identity, so nothing here may split on
    differences that leave a restored toolchain working. *)
-fun key_material {git, rev, kernel_variant} =
-  let val _ = validate_git git
-  in
-    String.concatWith "\n"
-      ([format_version, "rev=" ^ rev,
-        "poly_rts=" ^ #rts (poly_version_parts (poly_version ())),
-        "poly_path=" ^ poly_executable_path ()] @
-       HolbuildHolToolchainConfig.key_material_fields (toolchain_config kernel_variant))
-  end
+fun key_material {git = _, rev, kernel_variant} =
+  String.concatWith "\n"
+    ([format_version, "rev=" ^ rev,
+      "poly_rts=" ^ #rts (poly_version_parts (poly_version ())),
+      "poly_path=" ^ poly_executable_path ()] @
+     HolbuildHolToolchainConfig.key_material_fields (toolchain_config kernel_variant))
 
 fun key req = HolbuildHash.string_sha256 (key_material req)
 fun standard_request {git, rev} = {git = git, rev = rev, kernel_variant = standard_kernel}
