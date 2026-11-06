@@ -153,10 +153,11 @@ fun termination_tactic_prefix ({name, definition_start, tactic_text, proof_ir_pl
            String.concat
              ["(HolbuildProofRuntime.termination_tactic ",
               HolbuildToolchain.sml_string name, " ",
-              HolbuildToolchain.sml_string tactic_text, " (", plan, ") ("]]
+              HolbuildToolchain.sml_string tactic_text, " (", plan, ") (",
+              "HolbuildTacticCompat.delay_tactic (fn () => ("]]
 
 fun termination_tactic_suffix ({proof_ir_plan, ...} : termination) =
-  case proof_ir_plan of NONE => "))" | SOME _ => "))))"
+  case proof_ir_plan of NONE => "))" | SOME _ => "))))))"
 
 fun save_declaration_context_line ({safe_name, context_path, context_ok, ...} : declaration_checkpoint) =
   String.concat
@@ -355,7 +356,7 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
     fun loop pos events acc =
       case events of
           [] => String.concat (rev (source_slice pos n :: acc))
-        | CheckpointEvent (checkpoint as {theorem_start, boundary, ...}) :: rest =>
+        | CheckpointEvent (checkpoint as {theorem_start, boundary, tactic_start, tactic_end, ...}) :: rest =>
             if boundary <= start_offset then loop pos rest acc
             else
               let
@@ -366,7 +367,11 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
                   (boundary_pragma ::
                    "val _ = holbuild_save_theorem_context();\n" ::
                    "\n" ::
-                   source_slice theorem_start boundary ::
+                   source_slice tactic_end boundary ::
+                   "))" ::
+                   source_slice tactic_start tactic_end ::
+                   "HolbuildTacticCompat.delay_tactic (fn () => (" ::
+                   source_slice theorem_start tactic_start ::
                    theorem_pragma ::
                    begin_theorem_line checkpoint ::
                    source_slice pos theorem_start ::

@@ -55,8 +55,8 @@ val failed_plan_position_ref = ref NONE : (int * string * string) option ref
 val failed_goal_state_printed_ref = ref false
 val suppress_expected_failure_diagnostics_ref = ref false
 val suppressed_failure_diagnostic_ref = ref (NONE : (unit -> unit) option)
-val compiled_tactic_ref = ref Tactical.ALL_TAC
-val compiled_list_tactic_ref = ref Tactical.ALL_LT
+val compiled_tactic_ref = ref (fn () => Tactical.ALL_TAC)
+val compiled_list_tactic_ref = ref (fn () => Tactical.ALL_LT)
 val proof_history_ref = ref (NONE : goalStack.gstk History.history option)
 val history_step_count_ref = ref 0
 val branch_tail_count_ref = ref ([] : int list)
@@ -793,13 +793,13 @@ fun take_goals n goals =
 fun top_input_goals () = take_goals 1 (history_top_goals())
 
 fun compile_tactic label program =
-  if quse_string ("HolbuildProofRuntime.compiled_tactic_ref := (" ^ program ^ ");") then
+  if quse_string ("HolbuildProofRuntime.compiled_tactic_ref := (fn () => (" ^ program ^ "));") then
     !compiled_tactic_ref
   else
     raise Fail ("tactic fragment did not compile: " ^ label)
 
 fun compile_list_tactic label program =
-  if quse_string ("HolbuildProofRuntime.compiled_list_tactic_ref := (" ^ program ^ ");") then
+  if quse_string ("HolbuildProofRuntime.compiled_list_tactic_ref := (fn () => (" ^ program ^ "));") then
     !compiled_list_tactic_ref
   else
     raise Fail ("list tactic fragment did not compile: " ^ label)
@@ -827,27 +827,34 @@ fun active_focus_snapshot label =
          end
          handle e => if tail_count = 0 andalso history_is_proved () then {goals = [], total_count = 0, generated_count = 0, tail_count = tail_count} else raise e)
 
-fun apply_focus_list_tactic label list_tactic =
+fun apply_focus_list_tactic label make_list_tactic =
   let
     val {goals, total_count, generated_count, ...} = active_focus_snapshot label
     val input_goals = take_goals generated_count goals
-    val scoped_list_tactic =
-      case !branch_tail_count_ref of
-          [] => list_tactic
-        | _ => Tactical.SPLIT_LT generated_count (list_tactic, Tactical.ALL_LT)
+    (* Compile outside the budget, but construct the tactic once inside it:
+       rule arguments can do arbitrary work before returning a tactic. *)
+    fun expand history =
+      let
+        val list_tactic = make_list_tactic ()
+        val scoped_list_tactic =
+          case !branch_tail_count_ref of
+              [] => list_tactic
+            | _ => Tactical.SPLIT_LT generated_count (list_tactic, Tactical.ALL_LT)
+      in
+        HolbuildTacticCompat.expand_listf (current_proof_context ()) scoped_list_tactic history
+      end
   in
     (if generated_count = 0 then
        (if total_count = 0 then ()
         else append_history (HolbuildTacticCompat.expand_listf (current_proof_context ()) Tactical.ALL_LT))
      else
-       append_history_with_timeout label
-         (HolbuildTacticCompat.expand_listf (current_proof_context ()) scoped_list_tactic))
+       append_history_with_timeout label expand)
     handle e => report_step_failure_with_goals label input_goals e
   end
 
 fun apply_tactic_step label program =
-  let val tactic = compile_tactic label program
-  in apply_focus_list_tactic label (Tactical.ALLGOALS tactic) end
+  let val make_tactic = compile_tactic label program
+  in apply_focus_list_tactic label (fn () => Tactical.ALLGOALS (make_tactic ())) end
 
 fun no_open_goals () =
   ((history_top_goals (); false)
@@ -913,7 +920,7 @@ fun matching_selector_count label selector goals =
       NONE => if null goals then NONE else SOME 1
     | SOME program =>
         let
-          val tac = compile_tactic label program
+          val tac = compile_tactic label program ()
           val probe = HolbuildTacticCompat.run_tactic (current_proof_context ()) tac
           fun loop [] count = SOME count
             | loop (g :: rest) count =
@@ -976,7 +983,7 @@ fun reorder_focused_front_after label front_count middle_count =
               val (front_thms, tail_thms) = Lib.split_after front_count rest_thms
             in front_thms @ middle_thms @ tail_thms end
         in (middle @ front @ tail, validate) end
-    in apply_focus_list_tactic label (HolbuildTacticCompat.lift_list_tactic reorder) end
+    in apply_focus_list_tactic label (fn () => HolbuildTacticCompat.lift_list_tactic reorder) end
 
 fun restore_focused_group_order label lengths =
   case List.filter (fn n => n <> 0) lengths of
@@ -994,7 +1001,7 @@ fun restore_focused_group_order label lengths =
                   val (normal_groups, tail_thms) = split_by_lengths nonzero_lengths thms
                 in List.concat (rev normal_groups) @ tail_thms end
             in (List.concat groups @ tail, validate) end
-        in apply_focus_list_tactic label (HolbuildTacticCompat.lift_list_tactic reorder) end
+        in apply_focus_list_tactic label (fn () => HolbuildTacticCompat.lift_list_tactic reorder) end
 
 fun step proof_step =
   case proof_step of
