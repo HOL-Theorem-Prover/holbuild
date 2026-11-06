@@ -35,6 +35,7 @@ val load = fn _ => raise Fail "shadowed load";
 val use = fn _ => raise Fail "shadowed use";
 val print = fn _ => raise Fail "shadowed print";
 val length = fn _ => 0;
+val size = 0;
 SML
 
 (cd "$project" && "$HOLBUILD_BIN" build HygieneTheory) > "$tmpdir/build.log" 2>&1

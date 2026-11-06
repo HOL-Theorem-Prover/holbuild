@@ -383,6 +383,7 @@ fun write_theory_exporter {sig_path, path, parents_report, mldeps_report} =
       generated_metadata_report_lines {parents_report = parents_report,
                                        mldeps_report = mldeps_report} @
       [export_theory_if_needed_line sig_path,
+       "val _ = HolbuildRuntime.normalize_theory_export " ^ HolbuildToolchain.sml_string sig_path ^ ";",
        peak_rss_report_line (Path.concat(Path.dir path, peak_rss_report_name))]
   in
     write_text path (String.concatWith "\n" lines ^ "\n")
@@ -1796,7 +1797,7 @@ fun drop_cache_manifest_if_unchanged root input_key old_text =
               (HolbuildCache.remove_action root input_key; dropped := true)
             else ()
         | NONE => ()
-    val _ = HolbuildCache.with_action_publish_lock root input_key drop (fn () => ())
+    val _ = HolbuildCache.with_action_publish_lock_wait root input_key drop
   in
     !dropped
   end
@@ -1804,7 +1805,7 @@ fun drop_cache_manifest_if_unchanged root input_key old_text =
 fun transient_cache_manifest_error root input_key manifest manifest_text dep =
   let
     val dropped = drop_cache_manifest_if_unchanged root input_key manifest_text
-    val action = if dropped then "; deleted cache manifest" else "; cache manifest not deleted because action lock is busy or manifest changed"
+    val action = if dropped then "; deleted cache manifest" else "; cache manifest not deleted because manifest changed"
   in
     raise Error ("cache manifest contains transient stage mldep: " ^ dep ^ action)
   end
@@ -1842,8 +1843,10 @@ fun cache_manifest_outputs_equal input_key left right =
 
 fun cache_entry_usable root input_key text =
   let
+    val lines = cache_manifest_lines text
+    val _ = cache_manifest_proof_timeout lines
     val {sig_hash, sml_hash, dat_hash, trace_hash, extra_hashes, ...} =
-      cache_manifest_blobs_from_lines input_key (cache_manifest_lines text)
+      cache_manifest_blobs_from_lines input_key lines
   in
     HolbuildCache.verify_blob root sig_hash andalso
     HolbuildCache.verify_blob root sml_hash andalso
@@ -2498,7 +2501,9 @@ fun dependency_context_key toolchain_key plan keys node =
             val key =
               HolbuildToolchain.hash_text
                 (String.concatWith "\n"
-                   (["holbuild-dependency-context-v1",
+                   (* Local heaps must contain the export-normalizing runtime.
+                      Artifact action keys remain compatible. *)
+                   (["holbuild-dependency-context-v2",
                      "toolchain_key=" ^ toolchain_key] @ project_lines @ theory_lines @ lib_lines) ^ "\n")
           in
             HolbuildBuildPlan.remember_dependency_context_key plan node context_id key;
@@ -3618,12 +3623,15 @@ fun theory_parent_hash_matches dat_hash_cache parent_hashes dep =
              | SOME recorded_hash => recorded_hash = parent_hash)
   end
 
-fun child_dat_parent_hashes_match dat_hash_cache plan node =
+fun dat_parent_hashes_match dat_hash_cache plan node dat_path =
   let
-    val parent_hashes = parse_dat_parent_hashes (read_text (#data_path (theory_outputs node)))
+    val parent_hashes = parse_dat_parent_hashes (read_text dat_path)
   in List.all (theory_parent_hash_matches dat_hash_cache parent_hashes)
               (project_theory_parent_deps parent_hashes (project_theory_deps plan node))
   end
+
+fun child_dat_parent_hashes_match dat_hash_cache plan node =
+  dat_parent_hashes_match dat_hash_cache plan node (#data_path (theory_outputs node))
 
 fun metadata_parent_hashes_match dat_hash_cache plan node text =
   let
@@ -4054,14 +4062,39 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
     fun invalidate_node_dat_hash () =
       invalidate_cached_file_hash dat_hash_cache (#data_path (theory_outputs node))
     fun materialize_valid_cache () =
-      case materialize_theory_cache (#verify_cache options) allow_timeout_discrepancy
-             project plan input_key (tactic_timeout policy) (trknl_enabled policy) node of
-          CacheMiss => CacheMiss
-        | restored as CacheRestored _ =>
-            if theory_parent_hashes_match dat_hash_cache plan node NONE then restored
-            else (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
-                               input_key ^ " (parent outputs differ)");
-                  remove_failed_cache_outputs project node; CacheMiss)
+      let
+        val root = cache_root ()
+        val existing = ensure_local_cache_entry root input_key
+        fun discard_entry () =
+          case existing of
+              SOME text => ignore (drop_cache_manifest_if_unchanged root input_key text)
+            | NONE => ()
+        fun reject_parents () =
+          (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
+                        input_key ^ " (parent outputs differ)");
+           discard_entry ();
+           remove_failed_cache_outputs project node; CacheMiss)
+        fun cached_parents_match text =
+          let
+            val {dat_hash, ...} = cache_manifest_blobs_from_lines input_key (cache_manifest_lines text)
+          in
+            dat_parent_hashes_match dat_hash_cache plan node (HolbuildCache.blob_path root dat_hash)
+          end
+          handle _ => false
+      in
+        case existing of
+            NONE => (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
+                                  input_key ^ " (no manifest)"); CacheMiss)
+          | SOME text =>
+              case materialize_theory_cache (#verify_cache options) allow_timeout_discrepancy
+                     project plan input_key (tactic_timeout policy) (trknl_enabled policy) node of
+                  (* A policy miss can also hide stale parent outputs. Preserve
+                     compatible weaker-policy entries if rechecking fails. *)
+                  CacheMiss => if cached_parents_match text then CacheMiss else reject_parents ()
+                | restored as CacheRestored _ =>
+                    if theory_parent_hashes_match dat_hash_cache plan node NONE then restored
+                    else reject_parents ()
+      end
     fun restore_from_cache built_timeout =
       (remove_tree stage;
        invalidate_node_dat_hash ();
