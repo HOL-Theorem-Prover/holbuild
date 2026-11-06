@@ -619,14 +619,18 @@ if its build is reproducible: a deterministic script, with its inputs declared
 and the same HOL toolchain, must produce a byte-identical `Theory.dat` in any
 project directory. holbuild sorts the exported parent list by theory name and
 updates the data hash in `Theory.sml`, so parent load order does not change
-these outputs. A script that reads the clock, environment variables,
+these outputs for new exports. Existing valid cache bundles are not rewritten;
+older parent orders can still conflict with new bundles during cache import.
+A script that reads the clock, environment variables,
 undeclared files, or host paths must declare those files in `extra_deps`, or set
 `cache = false` for what can't be declared. Builds stay correct either way,
 because holbuild rejects a restored theory whose parents' `.dat` files differ
 from the local ones, but descendants of a nondeterministic theory then miss the
 cache wherever the local build of it differs from the one their cache entries
-were built against. A rejected local cache entry is removed so the rebuilt
-child can replace it; this does not change the remote cache's conflict checks.
+were built against. A parent-incompatible local cache entry is removed so the
+rebuilt child can replace it; this does not change the remote cache's conflict
+checks. An entry rejected only by the requested proof policy is retained until
+a successful rebuild can publish its stronger contract.
 
 Source files may also declare source-file-relative extra dependencies:
 

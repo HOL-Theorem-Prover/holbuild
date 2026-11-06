@@ -52,13 +52,52 @@ val _ = assert "short hash should be skipped" (recorded "Short" = NONE)
 val _ = assert "duplicate parent should keep first occurrence" (recorded "Dup" = SOME hash_dup_first)
 val _ = assert "unexpected parser map size" (Binarymap.numItems hashes = 3)
 
+val cache = valOf (OS.Process.getEnv "HOLBUILD_CACHE")
+val ready = valOf (OS.Process.getEnv "HOLBUILD_TEST_LOCK_READY")
+val key = String.implode (List.tabulate (64, fn _ => #"a"))
+val _ = HolbuildBuildExec.write_text ready "ready"
+val _ = assert "busy publisher left the rejected manifest behind"
+  (HolbuildBuildExec.drop_cache_manifest_if_unchanged cache key "rejected\n")
+
 val _ = print "parent-hash parser unit tests passed\n"
 SML
 
-"${HOLBUILD_POLY:-poly}" < "$tmpdir/parent-hash-parser-test.sml" > "$tmpdir/parent-hash-parser-test.log" 2>&1 || {
-  cat "$tmpdir/parent-hash-parser-test.log" >&2
-  exit 1
-}
+# Hold the same fcntl lock as a concurrent publisher. Release it after the
+# invalidation caller starts; a nonblocking skip must fail the assertion.
+HOLBUILD_TEST_LOCK_READY="$tmpdir/lock-ready" python3 - "$tmpdir" <<'PYTEST'
+import fcntl
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+tmp = Path(sys.argv[1])
+cache = Path(os.environ["HOLBUILD_CACHE"])
+key = "a" * 64
+manifest = cache / "actions" / key / "manifest"
+manifest.parent.mkdir(parents=True, exist_ok=True)
+manifest.write_text("rejected\n")
+lock_path = cache / "locks" / f"action-{key}.lock"
+lock_path.parent.mkdir(parents=True, exist_ok=True)
+with lock_path.open("a+") as lock, (tmp / "parent-hash-parser-test.sml").open() as source, (tmp / "parent-hash-parser-test.log").open("w") as log:
+    fcntl.lockf(lock, fcntl.LOCK_EX)
+    with subprocess.Popen([os.environ.get("HOLBUILD_POLY", "poly")], stdin=source,
+                          stdout=log, stderr=subprocess.STDOUT) as child:
+        deadline = time.monotonic() + 60
+        while not Path(os.environ["HOLBUILD_TEST_LOCK_READY"]).exists():
+            if child.poll() is not None or time.monotonic() >= deadline:
+                child.kill()
+                raise SystemExit("invalidation caller did not start")
+            time.sleep(0.01)
+        try:
+            child.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        fcntl.lockf(lock, fcntl.LOCK_UN)
+        if child.wait(timeout=60) != 0:
+            raise SystemExit("parent-hash parser/invalidation test failed")
+PYTEST
 grep -q "parent-hash parser unit tests passed" "$tmpdir/parent-hash-parser-test.log"
 
 project=$tmpdir/project

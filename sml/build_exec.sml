@@ -1799,7 +1799,7 @@ fun drop_cache_manifest_if_unchanged root input_key old_text =
               (HolbuildCache.remove_action root input_key; dropped := true)
             else ()
         | NONE => ()
-    val _ = HolbuildCache.with_action_publish_lock root input_key drop (fn () => ())
+    val _ = HolbuildCache.with_action_publish_lock_wait root input_key drop
   in
     !dropped
   end
@@ -1807,7 +1807,7 @@ fun drop_cache_manifest_if_unchanged root input_key old_text =
 fun transient_cache_manifest_error root input_key manifest manifest_text dep =
   let
     val dropped = drop_cache_manifest_if_unchanged root input_key manifest_text
-    val action = if dropped then "; deleted cache manifest" else "; cache manifest not deleted because action lock is busy or manifest changed"
+    val action = if dropped then "; deleted cache manifest" else "; cache manifest not deleted because manifest changed"
   in
     raise Error ("cache manifest contains transient stage mldep: " ^ dep ^ action)
   end
@@ -4071,7 +4071,7 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
           | SOME _ =>
               case materialize_theory_cache (#verify_cache options) allow_timeout_discrepancy
                      project plan input_key (tactic_timeout policy) (trknl_enabled policy) node of
-                  CacheMiss => (discard_entry (); CacheMiss)
+                  CacheMiss => CacheMiss
                 | restored as CacheRestored _ =>
                     if theory_parent_hashes_match dat_hash_cache plan node NONE then restored
                     else (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
