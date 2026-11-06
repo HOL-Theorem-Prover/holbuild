@@ -198,13 +198,13 @@ fun follow url batch_id : outcome * progress =
    with the batch's state, which for a batch that already ended is that
    end, not "cancelled".  A failure only warns, since the coordinator ends
    an abandoned batch at its deadline anyway. *)
-fun cancel url batch_id =
+fun cancel_within max_time_seconds url batch_id =
   let
     val result =
       HolbuildSpawn.run
         {program = "curl",
          args = curl_args (endpoint url ("/v1/batches/" ^ batch_id ^ "/cancel"))
-                  ["--max-time", Int.toString request_max_time_seconds, "-X", "POST",
+                  ["--max-time", Int.toString max_time_seconds, "-X", "POST",
                    "-w", "\n%{http_code}"],
          stderr = HolbuildSpawn.Merge}
     val (lines, status) = split_status (#output result)
@@ -218,5 +218,29 @@ fun cancel url batch_id =
           (case lines of [] => "" | _ => ": " ^ String.concatWith " " lines) ^ "\n");
        false)
   end
+
+val cancel = cancel_within request_max_time_seconds
+
+(* The batch a build is following and would cancel if it stopped following
+   it, so that an interrupted build cancels it too (cancel_followed) rather
+   than leave it running for nobody until its deadline. *)
+val followed : (string * string) option ref = ref NONE
+
+fun follow_cancellable url batch_id =
+  (followed := SOME (url, batch_id);
+   follow url batch_id before followed := NONE)
+  handle e => (followed := NONE; raise e)
+
+(* Whoever interrupts a build may kill it soon after, so this waits briefly. *)
+val interrupt_cancel_seconds = 5
+
+fun cancel_followed () =
+  case !followed of
+      NONE => ()
+    | SOME (url, batch_id) =>
+        (followed := NONE;
+         if cancel_within interrupt_cancel_seconds url batch_id
+         then HolbuildStatus.message_stderr ("holbuild: cancelled remote batch " ^ batch_id ^ "\n")
+         else ())
 
 end

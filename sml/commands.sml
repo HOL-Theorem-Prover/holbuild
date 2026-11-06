@@ -1317,8 +1317,12 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           if remote_only then fall_back reason
           else if HolbuildRemoteExec.cancel url batch_id then fall_back (reason ^ ", cancelled the batch")
           else fall_back reason
+        (* A batch that abandon would cancel is cancelled on an interrupt too. *)
+        fun follow batch_id =
+          if remote_only then HolbuildRemoteExec.follow url batch_id
+          else HolbuildRemoteExec.follow_cancellable url batch_id
         fun finish batch_id =
-          case HolbuildRemoteExec.follow url batch_id of
+          case follow batch_id of
               (HolbuildRemoteExec.Done, progress) =>
                 (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ finished progress ^ "\n");
                  build_locally ())
@@ -2517,7 +2521,10 @@ fun is_broken_pipe (IO.Io {cause = OS.SysErr (msg, _), ...}) = msg = "Broken pip
 
 fun install_signal_handlers () =
   let
-    fun handler _ = (HolbuildToolchain.cleanup_active_children (); err "interrupted")
+    fun handler _ =
+      (HolbuildToolchain.cleanup_active_children ();
+       HolbuildRemoteExec.cancel_followed ();
+       err "interrupted")
     val _ = Signal.signal (Posix.Signal.int, Signal.SIG_HANDLE handler)
     val _ = Signal.signal (Posix.Signal.term, Signal.SIG_HANDLE handler)
   in
@@ -2581,7 +2588,10 @@ fun main raw_args =
      configure_cooperation cooperate_dir machine_max_mem child_charge (#maxheap options);
      dispatch_with_options options args
    end)
-  handle Thread.Interrupt => (HolbuildToolchain.cleanup_active_children (); err "interrupted")
+  handle Thread.Interrupt =>
+           (HolbuildToolchain.cleanup_active_children ();
+            HolbuildRemoteExec.cancel_followed ();
+            err "interrupted")
        | Error msg => err msg
        | HolbuildToolchain.Error msg => err msg
        | HolbuildProject.Error msg => err msg

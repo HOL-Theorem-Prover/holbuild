@@ -225,6 +225,46 @@ require_grep "the coordinator reported no theories; building locally" "$tmpdir/e
 refute_grep "cancel" "$tmpdir/ended.log"
 rm "$state/ended"
 
+# An interrupted build cancels the batch it follows, unless --remote-only
+# (which can reattach to it).
+# interrupt NAME ARGS...: starts hb with ARGS, logging to $tmpdir/NAME.log,
+# and sends holbuild SIGTERM once it follows its batch.  HOLBUILD_BIN may be
+# a wrapper that runs holbuild as its child, as tests/run.sh's does, so the
+# signal goes to $! itself only when it has no children.
+interrupt() {
+  local name=$1
+  shift
+  (cd "$project" && exec "$HOLBUILD_BIN" --remote-cache "$remote_url" "$@") > "$tmpdir/$name.log" 2>&1 &
+  local pid=$!
+  for _ in {1..600}; do
+    grep -q "remote rx:ATheory: running" "$tmpdir/$name.log" && break
+    sleep 0.1
+  done
+  require_grep "remote rx:ATheory: running" "$tmpdir/$name.log"
+  local targets
+  targets=$(pgrep -P "$pid" || echo "$pid")
+  # shellcheck disable=SC2086
+  kill -TERM $targets
+  set +e
+  wait "$pid"
+  local status=$?
+  set -e
+  [[ $status -ne 0 ]] || { echo "$name exited 0 after SIGTERM" >&2; cat "$tmpdir/$name.log" >&2; exit 1; }
+}
+write_theories interrupted
+touch "$state/hang"
+interrupt interrupted build --remote-exec "$coordinator" BTheory
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/interrupted.log")
+require_grep "^POST /v1/batches/$batch/cancel " "$state/requests.log"
+require_grep "holbuild: cancelled remote batch $batch" "$tmpdir/interrupted.log"
+require_grep "holbuild: interrupted" "$tmpdir/interrupted.log"
+refute_grep "Theory built" "$tmpdir/interrupted.log"
+interrupt interrupted-only build --remote-exec "$coordinator" --remote-only BTheory
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/interrupted-only.log")
+refute_grep "^POST /v1/batches/$batch/cancel " "$state/requests.log"
+refute_grep "cancelled" "$tmpdir/interrupted-only.log"
+rm "$state/hang"
+
 # A closure that can't run remotely (a forced action) is built locally.
 run forced-only 1 build --remote-exec "$coordinator" --remote-only --force BTheory
 require_grep "can't run remotely: it is forced" "$tmpdir/forced-only.log"
