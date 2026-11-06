@@ -12,7 +12,8 @@ struct
 datatype attempt = Ok of string | Refused of string
 
 datatype outcome = Done
-                 | Failed of string       (* the batch failed or was cancelled *)
+                 | Failed of string       (* the batch failed *)
+                 | Cancelled              (* someone cancelled the batch *)
                  | Unfollowable of string (* the coordinator won't stream it; it may still run *)
                  | Unreachable of string  (* the coordinator couldn't be asked *)
 
@@ -120,12 +121,13 @@ fun report_action line =
   end
 
 (* Follows a batch's event stream until the batch finishes, printing each
-   action whose state changes.  A stream that breaks (the connection drops,
+   action whose state changes, and passing on_done the input key of each
+   action that becomes done.  A stream that breaks (the connection drops,
    or the coordinator answers 5xx while it restarts) is reattached: after a
    second when it delivered events, since a proxy may close an idle stream,
    and after each of reattach_delays_seconds in a row when it delivered none.
    The coordinator ends a batch at its deadline, so this ends too. *)
-fun follow url batch_id : outcome * progress =
+fun follow url batch_id (on_done : string -> unit) : outcome * progress =
   let
     val states : (string * string) list ref = ref []
     (* A line cut off by a dropped connection, perhaps with curl's error
@@ -141,12 +143,14 @@ fun follow url batch_id : outcome * progress =
               received := true;
               if List.exists (fn entry => entry = (key, state)) (!states) then ()
               else (states := (key, state) :: List.filter (fn (k, _) => k <> key) (!states);
-                    report_action line)
+                    report_action line;
+                    if state = "done" then on_done key else ())
             end
         | SOME "batch" =>
             outcome :=
               SOME (case json_string_field "state" line of
                         SOME "done" => Done
+                      | SOME "cancelled" => Cancelled
                       | SOME state =>
                           Failed (state ^ (case json_string_field "failure" line of
                                                SOME failure => ": " ^ failure
@@ -226,9 +230,10 @@ val cancel = cancel_within request_max_time_seconds
    than leave it running for nobody until its deadline. *)
 val followed : (string * string) option ref = ref NONE
 
-fun follow_cancellable url batch_id =
+(* Runs f, which follows the batch, with the batch registered as followed. *)
+fun while_followed url batch_id f =
   (followed := SOME (url, batch_id);
-   follow url batch_id before followed := NONE)
+   f () before followed := NONE)
   handle e => (followed := NONE; raise e)
 
 (* Whoever interrupts a build may kill it soon after, so this waits briefly. *)
