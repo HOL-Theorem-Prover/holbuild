@@ -129,11 +129,12 @@ fun quse_string s =
   end
 
 exception FunctionTimeout
+exception FunctionInterrupted
 
 datatype 'a timeout_result = TimeoutResult of 'a | TimeoutException of exn
 
 fun capture_timeout f x = TimeoutResult (f x)
-  handle Interrupt => raise Interrupt | e => TimeoutException e
+  handle e => TimeoutException e
 
 fun release_timeout (TimeoutResult y) = y
   | release_timeout (TimeoutException e) = raise e
@@ -180,11 +181,12 @@ fun timeout seconds f x =
     val _ = Mutex.unlock m
     val _ = Thread.setAttributes curattrib
     val _ = if completed then () else interruptkill worker
+    (* An Interrupt before the deadline didn't come from interruptkill. *)
     val result =
       if not completed then TimeoutException FunctionTimeout
       else case !resultref of
           NONE => TimeoutException FunctionTimeout
-        | SOME (TimeoutException Interrupt) => TimeoutException FunctionTimeout
+        | SOME (TimeoutException Interrupt) => TimeoutException FunctionInterrupted
         | SOME r => r
   in
     release_timeout result
@@ -199,6 +201,12 @@ fun timeout_message label seconds =
    fails the build. *)
 exception TacticTimeout of string
 
+(* Raised when the Poly/ML runtime interrupts a proof step before the tactic
+   timeout: it interrupts a thread whose stack can't grow (a stack overflow,
+   such as a runaway recursion) and, when the heap is exhausted, every thread.
+   Combinators propagate it like TacticTimeout. *)
+exception TacticInterrupted of string
+
 fun with_tactic_timeout label f x =
   case !tactic_timeout_ref of
       NONE => f x
@@ -206,7 +214,9 @@ fun with_tactic_timeout label f x =
         (timeout seconds f x
          handle FunctionTimeout =>
            (write_timeout_marker label seconds;
-            raise TacticTimeout (timeout_message label seconds)))
+            raise TacticTimeout (timeout_message label seconds))
+              | FunctionInterrupted =>
+           raise TacticInterrupted ("holbuild tactic interrupted by Poly/ML (stack overflow or out of memory): " ^ label))
 
 fun save_checkpoint label default_share path ok_text depth =
   if not (!checkpoint_enabled_ref) then ()
@@ -745,6 +755,9 @@ fun emit_step_failure_diagnostic label goals =
 fun report_step_failure_with_goals label goals e =
   case (e, !suppress_expected_failure_diagnostics_ref) of
       (TacticTimeout _, true) =>
+        (print_step_failure_goal_state label goals;
+         raise e)
+    | (TacticInterrupted _, true) =>
         (print_step_failure_goal_state label goals;
          raise e)
     | (_, true) =>
@@ -1375,6 +1388,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
                       (discard_suppressed_failure_diagnostic ();
                        record_or_replay_event (HolbuildProofIr.ChoiceEvent (path, n)))
                   | SOME (e as TacticTimeout _) => raise_body_timeout saved e
+                  | SOME (e as TacticInterrupted _) => raise_body_timeout saved e
                   | SOME e =>
                       (restore_runtime_state saved;
                        attempt (n + 1) (alt_line + 1 + HolbuildProofIr.display_line_count_list body) rest (SOME (e, diagnostic)))
@@ -1413,6 +1427,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
           in case result of
                  NONE => record_or_replay_event (HolbuildProofIr.TryEvent (path, true))
                | SOME (e as TacticTimeout _) => raise_body_timeout saved e
+               | SOME (e as TacticInterrupted _) => raise_body_timeout saved e
                | SOME _ =>
                    (restore_runtime_state saved;
                     discard_suppressed_failure_diagnostic ();
@@ -1434,6 +1449,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
                    val result = (with_expected_failures_suppressed (fn () => run_list (d + 1) (path @ [HolbuildProofIr.PathRepeat iter]) 0 body); NONE) handle e => SOME e
                in case result of
                       SOME (e as TacticTimeout _) => raise_body_timeout saved e
+                    | SOME (e as TacticInterrupted _) => raise_body_timeout saved e
                     | SOME _ =>
                         (restore_runtime_state saved;
                          discard_suppressed_failure_diagnostic ();
