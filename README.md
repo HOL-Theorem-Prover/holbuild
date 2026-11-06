@@ -790,8 +790,8 @@ For source-executed theory builds, holbuild writes a live child log at
 `.holbuild/logs/current/<package>/<logical>/build.log`. You can inspect it during
 a long build with `tail -f`; after the child exits, the same path is kept as the
 latest log.
-When an instrumented build fails, `instrumented-failure.log` in the same
-directory retains its diagnostics. A later successful source execution removes
+In text mode, an instrumented build failure leaves its diagnostics in
+`instrumented-failure.log` in the same directory. A later successful source execution removes
 that failure log, including when execution resumes from a checkpoint.
 Up-to-date and cache-restored targets do not produce a new log; use
 `--force --no-cache` to regenerate one.
