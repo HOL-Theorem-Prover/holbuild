@@ -61,11 +61,11 @@ fun resolve_package_closure resolution project =
     fun seen_source name seen =
       Option.map #2 (List.find (fn (seen_name, _) => seen_name = name) seen)
     fun add_dependency parent_project
-          (dep as HolbuildProject.Dependency {name, source, ...},
+          (dep as HolbuildProject.Dependency {name, source, role, ...},
            (seen, packages)) =
       case seen_source name seen of
           SOME previous =>
-            if HolbuildProject.same_dependency_source (previous, source) then
+            if HolbuildProject.same_dependency_source role (previous, source) then
               (seen, packages)
             else raise Error ("conflicting dependency " ^ name)
         | NONE =>

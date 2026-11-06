@@ -33,10 +33,11 @@ TOML
 hol=$tmpdir/hol
 hol_rev=$(make_repo "$hol" hol)
 
+# b names hol under another URL at the same commit, as a HOL fork would.
 b=$tmpdir/b
 b_rev=$(make_repo "$b" b "
 [dependencies.hol]
-git = \"$hol\"
+git = \"file://$hol\"
 rev = \"$hol_rev\"
 ")
 

@@ -45,7 +45,7 @@ fun local_git_abs root git =
 
 fun validate_override_table (name, table) =
   (require_safe_materialized_dependency_name ("overrides." ^ name) name;
-   if name = "hol" then die "dependencies.hol cannot be overridden; set dependencies.hol.git to a local path instead" else ();
+   if name = "hol" then die "dependencies.hol cannot be overridden; point dependencies.hol.git at a local repository (an absolute path or file:// URL) instead" else ();
    require_known_fields ("overrides." ^ name) ["path", "git"] table;
    case (string_field table "path", string_field table "git") of
        (SOME _, NONE) => () | (NONE, SOME _) => ()
