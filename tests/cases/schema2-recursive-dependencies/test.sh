@@ -146,3 +146,36 @@ if (cd "$conflict" && "$HOLBUILD_BIN" context) > "$tmpdir/conflict.log" 2>&1; th
   exit 1
 fi
 require_grep 'conflicting dependency b' "$tmpdir/conflict.log"
+
+# hol at one commit under another URL agrees with a's, and the root's own
+# declaration is the one kept, though the walk meets a's first.
+alias_root=$tmpdir/alias-root
+mkdir -p "$alias_root"
+cat > "$alias_root/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[project]
+name = "alias-root"
+
+[dependencies.a]
+git = "$a"
+rev = "$a_rev"
+
+[dependencies.hol]
+git = "$hol/.git"
+rev = "$hol_rev"
+TOML
+(cd "$alias_root" && "$HOLBUILD_BIN" context) > "$tmpdir/alias-root.log"
+require_grep "package-origin: hol .*$hol/\.git" "$tmpdir/alias-root.log"
+
+# hol at another commit still conflicts.
+git -C "$hol" commit -q --allow-empty -m second
+hol_rev2=$(git -C "$hol" rev-parse HEAD)
+sed -i "s/$hol_rev/$hol_rev2/" "$alias_root/holproject.toml"
+if (cd "$alias_root" && "$HOLBUILD_BIN" context) > "$tmpdir/hol-conflict.log" 2>&1; then
+  echo "hol at two commits unexpectedly accepted" >&2
+  exit 1
+fi
+require_grep 'conflicting dependency hol' "$tmpdir/hol-conflict.log"

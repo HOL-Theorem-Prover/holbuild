@@ -60,6 +60,20 @@ fun resolve_package_closure resolution project =
     val artifact_parent = #graph_artifact_root (project : HolbuildProject.t)
     fun seen_source name seen =
       Option.map #2 (List.find (fn (seen_name, _) => seen_name = name) seen)
+    val root_hol =
+      List.find (fn HolbuildProject.Dependency {name, ...} => name = "hol")
+        (#dependencies (project : HolbuildProject.t))
+    (* hol dependencies at one commit agree whatever their URLs; the root's
+       own declaration, when it agrees, is the one the graph keeps, whichever
+       the walk meets first. *)
+    fun preferred parent_project (dep as HolbuildProject.Dependency {source, role, ...}) =
+      case root_hol of
+          SOME (root_dep as HolbuildProject.Dependency {source = root_source, ...}) =>
+            if role = HolbuildPackageDefinition.HolToolchainDependency andalso
+               HolbuildProject.same_dependency_source role (root_source, source)
+            then (project, root_dep, root_source)
+            else (parent_project, dep, source)
+        | NONE => (parent_project, dep, source)
     fun add_dependency parent_project
           (dep as HolbuildProject.Dependency {name, source, role, ...},
            (seen, packages)) =
@@ -70,6 +84,7 @@ fun resolve_package_closure resolution project =
             else raise Error ("conflicting dependency " ^ name)
         | NONE =>
             let
+              val (parent_project, dep, source) = preferred parent_project dep
               val (package, dep_project) =
                 HolbuildProject.dependency_package_with
                   resolution artifact_parent parent_project dep
