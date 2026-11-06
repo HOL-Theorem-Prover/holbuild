@@ -521,9 +521,15 @@ fun build_analyser k =
    rather than build HOL locally. *)
 val restore_only = ref false
 
+(* Set when --remote-only stops for a reason a local build would get past;
+   holbuild then exits with status 75 (EX_TEMPFAIL), so that whoever ran it
+   can tell such a stop from an error and build locally instead. *)
+val local_build_needed = ref false
+
 fun build_entry jobs req k =
   if !restore_only then
-    die "the HOL toolchain could not be restored from a cache, and --remote-only builds nothing locally"
+    (local_build_needed := true;
+     die "the HOL toolchain could not be restored from a cache, and --remote-only builds nothing locally")
   else
   let
     val final = entry_dir_for_key k

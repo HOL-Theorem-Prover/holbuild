@@ -116,9 +116,16 @@ refute_grep() {
 }
 
 # Submit and follow: the workers build both theories, and the client restores
-# them from the remote cache without building anything itself.
+# them from the remote cache without building anything itself, having copied
+# each into the local cache as the batch finished it.
 write_theories one
-run follow 0 build --remote-exec "$coordinator" BTheory
+HOLBUILD_CACHE_TRACE=1 run follow 0 build --remote-exec "$coordinator" BTheory
+finished_line=$(grep -n "remote execution: remote workers finished" "$tmpdir/follow.log" | cut -d: -f1)
+for key in $(awk '$1 == "action" { print $2 }' "$state/b1.batch"); do
+  prefetched_line=$(grep -n "remote cache prefetched: $key$" "$tmpdir/follow.log" | cut -d: -f1)
+  [[ -n $prefetched_line && $prefetched_line -lt $finished_line ]] ||
+    { echo "$key not prefetched while following" >&2; cat "$tmpdir/follow.log" >&2; exit 1; }
+done
 require_grep "holbuild: remote batch b1" "$tmpdir/follow.log"
 require_grep "holbuild: remote rx:BTheory: done" "$tmpdir/follow.log"
 [[ $(grep -c "remote rx:BTheory: running" "$tmpdir/follow.log") -eq 1 ]] || { cat "$tmpdir/follow.log" >&2; exit 1; }
@@ -146,10 +153,10 @@ refute_grep "Theory built" "$tmpdir/attach.log"
 [[ $(grep -c '^POST' "$state/requests.log") -eq 2 ]] || { cat "$state/requests.log" >&2; exit 1; }
 
 # A coordinator that can't be reached, refuses the batch, or loses the
-# event stream: the build goes on locally, or fails with --remote-only or
-# --detach.
+# event stream: the build goes on locally, or fails with --remote-only (exit
+# status 75, so a caller can build locally) or --detach (1).
 write_theories three
-run unreachable-only 1 build --remote-exec "$unreachable" --remote-only BTheory
+run unreachable-only 75 build --remote-exec "$unreachable" --remote-only BTheory
 require_grep "remote execution: could not reach the coordinator at $unreachable" "$tmpdir/unreachable-only.log"
 refute_grep "Theory built" "$tmpdir/unreachable-only.log"
 run unreachable 0 build --remote-exec "$unreachable" BTheory
@@ -158,7 +165,7 @@ require_grep "BTheory built" "$tmpdir/unreachable.log"
 
 write_theories four
 touch "$state/refuse"
-run refused-only 1 build --remote-exec "$coordinator" --remote-only BTheory
+run refused-only 75 build --remote-exec "$coordinator" --remote-only BTheory
 require_grep "coordinator refused the batch (HTTP 400): .*batch refused by the stub" "$tmpdir/refused-only.log"
 run refused-detach 1 build --remote-exec "$coordinator" --detach BTheory
 refute_grep "Theory built" "$tmpdir/refused-detach.log"
@@ -184,11 +191,11 @@ require_grep "could not cancel remote batch b4 (HTTP 503)" "$tmpdir/down.log"
 require_grep "the coordinator reported no theories; building locally" "$tmpdir/down.log"
 require_grep "BTheory built" "$tmpdir/down.log"
 write_theories five-down-only
-run down-only 1 build --remote-exec "$coordinator" --remote-only BTheory
+run down-only 75 build --remote-exec "$coordinator" --remote-only BTheory
 require_grep "the coordinator reported no theories; reattach with --attach b5" "$tmpdir/down-only.log"
 refute_grep "^POST /v1/batches/b5/cancel " "$state/requests.log"
 rm "$state/down"
-run unknown-only 1 build --remote-exec "$coordinator" --remote-only --attach nope BTheory
+run unknown-only 75 build --remote-exec "$coordinator" --remote-only --attach nope BTheory
 require_grep "batch nope can't be followed (HTTP 404): .*no such batch" "$tmpdir/unknown-only.log"
 refute_grep "reattach" "$tmpdir/unknown-only.log"
 run unknown 0 build --remote-exec "$coordinator" --attach nope BTheory
@@ -196,10 +203,11 @@ require_grep "batch nope can't be followed (HTTP 404): .*, cancelled the batch; 
 require_grep "^POST /v1/batches/nope/cancel " "$state/requests.log"
 
 # A batch reported done whose results aren't in the remote cache: with
-# --remote-only nothing is built locally.
+# --remote-only nothing is built locally, and the exit status says a local
+# build would go on.
 write_theories five-skip
 touch "$state/skip"
-run skipped-only 1 build --remote-exec "$coordinator" --remote-only BTheory
+run skipped-only 75 build --remote-exec "$coordinator" --remote-only BTheory
 require_grep "ATheory is not in the remote cache, and --remote-only builds nothing locally" "$tmpdir/skipped-only.log"
 refute_grep "Theory built" "$tmpdir/skipped-only.log"
 rm "$state/skip"
@@ -207,7 +215,7 @@ rm "$state/skip"
 # A failed batch falls back too.
 write_theories six
 touch "$state/fail"
-run failed-only 1 build --remote-exec "$coordinator" --remote-only BTheory
+run failed-only 75 build --remote-exec "$coordinator" --remote-only BTheory
 require_grep "remote rx:ATheory: failed (proof)" "$tmpdir/failed-only.log"
 require_grep "remote execution: batch b7 failed: an action failed; remote workers finished 0 of 2 theories" "$tmpdir/failed-only.log"
 run failed 0 build --remote-exec "$coordinator" BTheory
@@ -266,7 +274,7 @@ refute_grep "cancelled" "$tmpdir/interrupted-only.log"
 rm "$state/hang"
 
 # A closure that can't run remotely (a forced action) is built locally.
-run forced-only 1 build --remote-exec "$coordinator" --remote-only --force BTheory
+run forced-only 75 build --remote-exec "$coordinator" --remote-only --force BTheory
 require_grep "can't run remotely: it is forced" "$tmpdir/forced-only.log"
 run forced 0 build --remote-exec "$coordinator" --force BTheory
 require_grep "BTheory built" "$tmpdir/forced.log"
@@ -297,8 +305,8 @@ require_grep "attach requires BATCH-ID" "$tmpdir/id-missing.log"
 run trace 1 build --remote-exec "$coordinator" --trace-steps BTheory
 require_grep "does not support .*--trace-steps" "$tmpdir/trace.log"
 
-# With --remote-only, a HOL toolchain that no cache holds is an error rather
-# than a local HOL build.
+# With --remote-only, a HOL toolchain that no cache holds is an error (exit
+# status 75) rather than a local HOL build.
 fake_hol=$tmpdir/fake-hol
 write_fake_hol "$fake_hol"
 fake_rev=$(init_git_repo "$fake_hol")
@@ -333,7 +341,7 @@ implicit_status=$?
 set -e
 for name in toolchain-only toolchain-only-implicit; do
   [[ $name == toolchain-only ]] && code=$status || code=$implicit_status
-  [[ $code -eq 1 ]] || { echo "$name exited $code, wanted 1" >&2; cat "$tmpdir/$name.log" >&2; exit 1; }
+  [[ $code -eq 75 ]] || { echo "$name exited $code, wanted 75" >&2; cat "$tmpdir/$name.log" >&2; exit 1; }
   require_grep "HOL toolchain could not be restored from a cache, and --remote-only builds nothing locally" "$tmpdir/$name.log"
 done
 [[ ! -s "$tmpdir/fake-build-count" ]] || { cat "$tmpdir/fake-build-count" >&2; exit 1; }
@@ -370,7 +378,7 @@ require_grep "could not reach the coordinator at $unreachable.*; building locall
 require_grep "BTheory built" "$tmpdir/run-unreachable.log"
 require_grep "RUN_REMOTE_OK" "$tmpdir/run-unreachable.log"
 write_theories repl-unreachable
-run repl-unreachable-only 1 repl --remote-exec "$unreachable" --remote-only < "$tmpdir/repl-input.sml"
+run repl-unreachable-only 75 repl --remote-exec "$unreachable" --remote-only < "$tmpdir/repl-input.sml"
 require_grep "remote execution: could not reach the coordinator at $unreachable" "$tmpdir/repl-unreachable-only.log"
 refute_grep "Theory built\|REPL_REMOTE_OK" "$tmpdir/repl-unreachable-only.log"
 
@@ -413,8 +421,12 @@ SML
 require_grep "remote execution: theories that write SML sources build before the rest is planned" "$tmpdir/generated-detach.log"
 refute_grep "GenTheory built" "$tmpdir/generated-detach.log"
 # --remote-only restores, so with nothing cached it fails without building.
+set +e
 (cd "$generated" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only UseLib) \
-  > "$tmpdir/generated-only.log" 2>&1 && { cat "$tmpdir/generated-only.log" >&2; exit 1; }
+  > "$tmpdir/generated-only.log" 2>&1
+status=$?
+set -e
+[[ $status -eq 75 ]] || { echo "generated-only exited $status, wanted 75" >&2; cat "$tmpdir/generated-only.log" >&2; exit 1; }
 require_grep "build before the rest is planned; restoring from the cache" "$tmpdir/generated-only.log"
 refute_grep "GenTheory built" "$tmpdir/generated-only.log"
 (cd "$generated" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" UseLib) \

@@ -3,12 +3,22 @@ struct
 
 exception Error of string
 
+(* EX_TEMPFAIL, the exit status of a --remote-only build that stopped where
+   a local build would go on (HolbuildHolSharedCache.local_build_needed).
+   Poly/ML's OS.Process.status is the exit code, but opaque. *)
+val local_build_needed_status : OS.Process.status = RunCall.unsafeCast (75 : int)
+
 fun err_with_debug_artifacts msg artifacts =
   (if HolbuildStatus.json_mode () then HolbuildStatus.error_with_debug_artifacts msg artifacts
    else HolbuildStatus.message_stderr ("holbuild: " ^ msg ^ "\n");
-   OS.Process.exit OS.Process.failure)
+   OS.Process.exit (if !HolbuildHolSharedCache.local_build_needed then local_build_needed_status
+                    else OS.Process.failure))
 
 fun err msg = err_with_debug_artifacts msg HolbuildStatus.no_debug_artifacts
+
+(* An interrupted build fails, whatever stopped it, so that nobody builds
+   locally what its user stopped. *)
+fun err_interrupted () = (HolbuildHolSharedCache.local_build_needed := false; err "interrupted")
 
 fun warn msg = HolbuildStatus.message_stderr ("holbuild: warning: " ^ msg ^ "\n")
 
@@ -94,8 +104,9 @@ fun build_help () = print
   \With --remote-exec, theories the remote cache lacks are built by the\n\
   \coordinator's workers and restored from the remote cache. Needs\n\
   \--remote-cache. A closure that can't run remotely or an unreachable\n\
-  \coordinator builds locally; --remote-only fails instead. --detach submits\n\
-  \the batch and exits; --attach follows a submitted batch and restores it.\n\n\
+  \coordinator builds locally; --remote-only fails instead, with exit\n\
+  \status 75. --detach submits the batch and exits; --attach follows a\n\
+  \submitted batch and restores it.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun context_help () = print
@@ -1297,14 +1308,21 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         fun export upload =
           timed_phase "action_spec.export"
             (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key upload)
-        fun has_actions batch = List.exists (String.isPrefix "action ") (String.tokens (fn c => c = #"\n") batch)
+        fun batch_keys batch =
+          List.mapPartial (fn line => case String.tokens Char.isSpace line of
+                                          "action" :: key :: _ => SOME key
+                                        | _ => NONE)
+                          (String.tokens (fn c => c = #"\n") batch)
         fun build_locally () =
           timed_phase "build.execute"
             (fn () => HolbuildBuildExec.build build_options tc project plan toolchain_key jobs)
         (* Under --remote-only the build options only restore (restore_only);
            a detached build has nothing to fall back to. *)
         fun fall_back reason =
-          if remote_only orelse detach then raise Error ("remote execution: " ^ reason)
+          if remote_only then
+            (HolbuildHolSharedCache.local_build_needed := true;
+             raise Error ("remote execution: " ^ reason))
+          else if detach then raise Error ("remote execution: " ^ reason)
           else (HolbuildBuildExec.warn ("remote execution: " ^ reason ^ "; building locally");
                 build_locally ())
         fun finished {built, total} =
@@ -1317,12 +1335,21 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           if remote_only then fall_back reason
           else if HolbuildRemoteExec.cancel url batch_id then fall_back (reason ^ ", cancelled the batch")
           else fall_back reason
-        (* A batch that abandon would cancel is cancelled on an interrupt too. *)
-        fun follow batch_id =
-          if remote_only then HolbuildRemoteExec.follow url batch_id
-          else HolbuildRemoteExec.follow_cancellable url batch_id
-        fun finish batch_id =
-          case follow batch_id of
+        (* A batch that abandon would cancel is cancelled on an interrupt too.
+           While it runs, the entries of the theories outside it, which the
+           remote cache already holds, and of those it finishes are copied
+           into the local cache, for the build that follows to restore. *)
+        fun follow in_batch batch_id =
+          let
+            val {add, stop} =
+              HolbuildBuildExec.start_remote_exec_prefetch build_options tc project plan toolchain_key jobs in_batch
+            val follow = if remote_only then HolbuildRemoteExec.follow else HolbuildRemoteExec.follow_cancellable
+          in
+            (follow url batch_id add before stop ())
+            handle e => (stop (); raise e)
+          end
+        fun finish in_batch batch_id =
+          case follow in_batch batch_id of
               (HolbuildRemoteExec.Done, progress) =>
                 (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ finished progress ^ "\n");
                  build_locally ())
@@ -1335,7 +1362,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 then fall_back (reason ^ "; " ^ finished progress ^ "; reattach with --attach " ^ batch_id)
                 else abandon batch_id (reason ^ "; " ^ finished progress)
         fun submit batch =
-          if not (has_actions batch) then
+          if null (batch_keys batch) then
             (HolbuildStatus.message_stderr "holbuild: remote execution: the remote cache has every theory\n";
              build_locally ())
           else
@@ -1343,7 +1370,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 HolbuildRemoteExec.Refused reason => fall_back reason
               | HolbuildRemoteExec.Ok batch_id =>
                   (HolbuildStatus.message_stderr ("holbuild: remote batch " ^ batch_id ^ "\n");
-                   if detach then () else finish batch_id)
+                   if detach then () else finish (batch_keys batch) batch_id)
         (* A theory that writes SML sources runs before the rest of the build
            is planned (execute_build), which neither a batch nor the restore
            build of this plan does.  Under --remote-only, execute_build only
@@ -1361,7 +1388,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
            execute_build ())
         else
           case attach of
-              SOME batch_id => finish batch_id
+              SOME batch_id => finish [] batch_id
             | NONE =>
                 (case HolbuildRemoteExec.Ok (export true)
                       handle HolbuildBuildExec.Error reason => HolbuildRemoteExec.Refused reason of
@@ -2524,7 +2551,7 @@ fun install_signal_handlers () =
     fun handler _ =
       (HolbuildToolchain.cleanup_active_children ();
        HolbuildRemoteExec.cancel_followed ();
-       err "interrupted")
+       err_interrupted ())
     val _ = Signal.signal (Posix.Signal.int, Signal.SIG_HANDLE handler)
     val _ = Signal.signal (Posix.Signal.term, Signal.SIG_HANDLE handler)
   in
@@ -2588,7 +2615,7 @@ fun main raw_args =
      configure_cooperation cooperate_dir machine_max_mem child_charge (#maxheap options);
      dispatch_with_options options args
    end)
-  handle Thread.Interrupt => (HolbuildToolchain.cleanup_active_children (); err "interrupted")
+  handle Thread.Interrupt => (HolbuildToolchain.cleanup_active_children (); err_interrupted ())
        | Error msg => err msg
        | HolbuildToolchain.Error msg => err msg
        | HolbuildProject.Error msg => err msg

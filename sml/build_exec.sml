@@ -4071,7 +4071,8 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
        if copied_from_remote input_key then HolbuildStatus.RestoredRemote else HolbuildStatus.Restored)
     fun build_from_source () =
       if #restore_only options then
-        raise Error (logical_name node ^ " is not in the remote cache, and --remote-only builds nothing locally")
+        (HolbuildHolSharedCache.local_build_needed := true;
+         raise Error (logical_name node ^ " is not in the remote cache, and --remote-only builds nothing locally"))
       else
       (build_theory cache_allowed policy tc project base_context plan keys toolchain_key node;
        invalidate_node_dat_hash ();
@@ -4977,6 +4978,54 @@ fun prefetch_key (options : build_options) project keys node =
       | _ => NONE
   end
 
+(* Runs `work` on each item added, on up to `limit` background threads, in
+   the order added; an item added while fewer than `limit` run starts at
+   once.  Returns {add, stop}: stop drops the items not yet started and
+   waits for those in flight.  Failures are silent: for a prefetch, the
+   demand restore of the same key retries and reports. *)
+fun start_background_pool limit work =
+  let
+    val front = ref [] and back = ref []
+    val active = ref 0
+    val stopped = ref false
+    val mutex = Mutex.mutex ()
+    fun with_lock f =
+      (Mutex.lock mutex; f () before Mutex.unlock mutex)
+      handle e => (Mutex.unlock mutex; raise e)
+    fun pop () =
+      case !front of
+          item :: rest => (front := rest; SOME item)
+        | [] =>
+            case rev (!back) of
+                [] => NONE
+              | item :: rest => (front := rest; back := []; SOME item)
+    (* A thread ends only once nothing is queued, under the lock add takes,
+       so no added item is left behind. *)
+    fun worker item =
+      ((work item handle _ => ());
+       case with_lock (fn () => case pop () of
+                                    NONE => (active := !active - 1; NONE)
+                                  | next => next) of
+           SOME next => worker next
+         | NONE => ())
+    fun add item =
+      if with_lock (fn () =>
+           if !stopped then false
+           else if !active < limit then (active := !active + 1; true)
+           else (back := item :: !back; false))
+      then ignore (Thread.fork (fn () => worker item, []))
+      else ()
+    fun wait () =
+      if with_lock (fn () => !active) > 0 then (OS.Process.sleep (Time.fromReal 0.05); wait ())
+      else ()
+    fun stop () = (with_lock (fn () => (stopped := true; front := []; back := [])); wait ())
+  in
+    {add = add, stop = stop}
+  end
+
+fun prefetch_limit jobs =
+  Option.getOpt (!HolbuildRemoteCacheConfig.prefetch_concurrency, Int.max (50, 2 * jobs))
+
 (* Starts --prefetch-concurrency (default max(50, 2 * jobs)) background
    threads that hydrate the plan's remote theory cache entries into the local
    cache, in build order, while the build runs; returns a function that drops
@@ -4990,40 +5039,47 @@ fun start_remote_cache_prefetch (options : build_options) project plan keys jobs
         else
           let
             val root = cache_root ()
-            val pending = ref (HolbuildBuildPlan.selected_nodes plan)
-            val mutex = Mutex.mutex ()
-            fun with_lock f =
-              (Mutex.lock mutex; f () before Mutex.unlock mutex)
-              handle e => (Mutex.unlock mutex; raise e)
-            fun next () =
-              with_lock (fn () =>
-                case !pending of
-                    [] => NONE
-                  | node :: rest => (pending := rest; SOME node))
+            val nodes = HolbuildBuildPlan.selected_nodes plan
             fun prefetch node =
               case prefetch_key options project keys node of
                   SOME key => prefetch_remote_cache_key root url key
                 | NONE => ()
-            (* Silent on failure: the demand restore of the same key retries
-               and reports. *)
-            fun worker () =
-              case next () of
-                  NONE => ()
-                | SOME node => ((prefetch node handle _ => ()); worker ())
-            val count =
-              Int.min (Option.getOpt (!HolbuildRemoteCacheConfig.prefetch_concurrency,
-                                      Int.max (50, 2 * jobs)),
-                       length (!pending))
-            val _ = cache_trace ("remote cache prefetch threads: " ^ Int.toString count)
-            val threads = List.tabulate (count, fn _ => Thread.fork (worker, []))
-            fun wait_threads () =
-              if List.exists Thread.isActive threads then
-                (OS.Process.sleep (Time.fromReal 0.05); wait_threads ())
-              else ()
+            val limit = prefetch_limit jobs
+            val _ = cache_trace ("remote cache prefetch threads: " ^ Int.toString (Int.min (limit, length nodes)))
+            val {add, stop} = start_background_pool limit prefetch
           in
-            fn () => (with_lock (fn () => pending := []); wait_threads ())
+            List.app add nodes;
+            stop
           end
     | NONE => (fn () => ())
+
+(* For build --remote-exec while it follows its batch: starts copying into
+   the local cache the remote entries of the plan's theories outside the
+   batch (batch_keys), which the remote cache already holds, as
+   start_remote_cache_prefetch does.  Returns {add, stop}: add copies the
+   entry of one more key, as the batch finishes its action; stop drops the
+   copies not yet started and waits for those in flight, so the build that
+   follows finds every finished one in the local cache. *)
+fun start_remote_exec_prefetch (options : build_options) tc project plan toolchain_key jobs batch_keys =
+  case HolbuildRemoteCacheConfig.url () of
+      SOME url =>
+        if not (#use_cache options) then {add = fn _ => (), stop = fn () => ()}
+        else
+          let
+            val root = cache_root ()
+            val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
+                         (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
+            val in_batch = Redblackset.addList (Redblackset.empty String.compare, batch_keys)
+            val pool as {add, ...} = start_background_pool (prefetch_limit jobs) (prefetch_remote_cache_key root url)
+          in
+            List.app (fn node =>
+                         case prefetch_key options project keys node of
+                             SOME key => if Redblackset.member (in_batch, key) then () else add key
+                           | NONE => ())
+                     (HolbuildBuildPlan.selected_nodes plan);
+            pool
+          end
+    | NONE => {add = fn _ => (), stop = fn () => ()}
 
 (* Linux PSI: total microseconds runnable tasks, machine-wide, waited for a CPU.
    NONE where /proc/pressure/cpu doesn't exist (e.g. macOS). *)
