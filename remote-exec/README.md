@@ -159,8 +159,8 @@ finally (`failed`, with a `failure` message), or the client cancels it
   | `memory` | on the standard tier, retried on the high-memory tier; on the high tier, retried there, until the action has been claimed `MAX_ATTEMPTS` times |
   | `publish`, `toolchain`, `internal` | retried, until the action has been claimed `MAX_ATTEMPTS` times |
   | `disk` | retried once; a second `disk` in a row, or `MAX_ATTEMPTS` claims, is final |
-  | `input-missing` naming a theory of the batch | that theory is built again and the action waits for it, until the action has been claimed `MAX_ATTEMPTS` times |
-  | any other `input-missing` (a blob, or a theory cached at export) | retried, since a restore that fails on a network error reports its input missing too; after `MAX_ATTEMPTS` claims the batch fails with `resubmit: …`; the next build exports a new batch |
+  | `input-missing` naming a theory of the batch other than the action itself or one that depends on it | that theory is built again and the action waits for it, until the action has been claimed `MAX_ATTEMPTS` times |
+  | any other `input-missing` (a blob, a theory cached at export, or one that can't be the action's input) | retried, since a restore that fails on a network error reports its input missing too; after `MAX_ATTEMPTS` claims the batch fails with `resubmit: …`; the next build exports a new batch |
   | `proof`, `tactic-timeout`, `spec-rejected` | final |
 
   A worker whose `exec-action` ends without a result record (it crashed or
