@@ -1,6 +1,9 @@
 import argparse
+import contextlib
+import fcntl
 import io
 import json
+import os
 import tarfile
 import threading
 import time
@@ -11,7 +14,19 @@ from pathlib import Path
 
 import pytest
 
-from remote_exec.worker import Coordinator, Protection, Releases, Unreleased, failed_record, parse_args, run_one
+from remote_exec import worker
+from remote_exec.worker import (
+    Coordinator,
+    HostMemory,
+    Protection,
+    Releases,
+    Unreleased,
+    child_charge,
+    failed_record,
+    parse_args,
+    run_one,
+    wait_for_memory,
+)
 
 SPEC = "5" * 64
 RECORD = f"holbuild-action-result-v1\nspec={SPEC}\ninput-key={'6' * 64}\nstatus=built\n"
@@ -310,3 +325,106 @@ def test_claim_wait_is_at_most_50_seconds(tmp_path: Path, server: Server) -> Non
 def test_coordinator_redirects_are_not_followed(server: Server) -> None:
     with pytest.raises(RuntimeError, match="claim answered 303"):
         Coordinator(server.url + "/moved", "w").claim(["standard"], "w", 0)
+
+
+GIB = 1024**3
+
+
+@dataclass
+class Host:
+    """A cooperate dir as holbuild leaves it, on a 64 GiB host (default budget 48 GiB, margin 16 GiB)."""
+
+    dir: Path
+    meminfo: Path
+    held: contextlib.ExitStack
+
+    def available(self, available: int) -> None:
+        self.meminfo.write_text(f"MemTotal: {64 * GIB // 1024} kB\nMemAvailable: {available // 1024} kB\n")
+
+    def lease(self, charge: int, *, held: bool = True, age_s: float = 60) -> None:
+        """A lease of ``charge`` bytes, locked until the test ends when ``held``, created ``age_s`` ago."""
+        path = self.dir / f"lease-{len(os.listdir(self.dir))}"
+        path.write_text(f"{charge}\n")
+        os.utime(path, (time.time() - age_s,) * 2)
+        if held:
+            fd = os.open(path, os.O_RDONLY)
+            self.held.callback(os.close, fd)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+
+    def memory(self) -> HostMemory:
+        return HostMemory.read(str(self.dir))
+
+
+@pytest.fixture
+def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Host]:
+    directory = tmp_path / "cooperate"
+    directory.mkdir()
+    (directory / "lock").touch()
+    monkeypatch.setenv("HOLBUILD_TEST_MEMINFO", str(tmp_path / "meminfo"))
+    with contextlib.ExitStack() as held:
+        state = Host(directory, tmp_path / "meminfo", held)
+        state.available(40 * GIB)
+        yield state
+
+
+def test_a_child_charge_is_the_max_heap_up_to_3072_mib() -> None:
+    assert [child_charge(m) for m in (None, 2048, 8192)] == [3072 * 2**20, 2048 * 2**20, 3072 * 2**20]
+
+
+def test_memory_is_short_while_held_leases_leave_too_little_available(host: Host) -> None:
+    host.lease(3 * GIB)
+    assert host.memory().shortfall(3 * GIB) is None
+
+    host.available(18 * GIB)
+    assert "below 3072 MiB plus 16384 MiB kept free" in str(host.memory().shortfall(3 * GIB))
+
+
+def test_children_still_starting_count_against_available_memory(host: Host) -> None:
+    host.available(21 * GIB)
+    host.lease(3 * GIB)
+    assert host.memory().shortfall(3 * GIB) is None
+
+    host.lease(3 * GIB, age_s=0)
+    assert "less 3072 MiB for children starting" in str(host.memory().shortfall(3 * GIB))
+
+
+def test_memory_is_short_while_held_leases_fill_the_budget(host: Host) -> None:
+    (host.dir / "budget").write_text(f"{8 * GIB}\n")
+    host.lease(3 * GIB)
+    assert host.memory().shortfall(3 * GIB) is None
+
+    host.lease(3 * GIB)
+    assert host.memory().shortfall(3 * GIB) == "6144 of 8192 MiB reserved"
+
+
+def test_leases_nobody_holds_do_not_count(host: Host) -> None:
+    host.available(GIB)
+    host.lease(60 * GIB, held=False)
+
+    assert host.memory().reserved == 0
+    assert host.memory().shortfall(3 * GIB) is None
+
+
+def test_with_no_lease_held_a_child_starts_whatever_is_available(host: Host) -> None:
+    host.available(GIB)
+    assert host.memory().shortfall(3 * GIB) is None
+    (host.dir / "lock").unlink()
+    assert host.memory().shortfall(3 * GIB) is None
+
+
+def test_worker_waits_for_memory_and_says_so_once(
+    host: Host, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(worker, "MEMORY_POLL_SECONDS", 0.05)
+    host.available(10 * GIB)
+    host.lease(3 * GIB)
+    waiter = threading.Thread(target=wait_for_memory, args=(str(host.dir), 3 * GIB), daemon=True)
+    waiter.start()
+    time.sleep(0.5)
+    assert waiter.is_alive()
+
+    host.available(20 * GIB)
+    waiter.join(timeout=10)
+
+    assert not waiter.is_alive()
+    assert capsys.readouterr().err.count("waiting for memory before claiming") == 1

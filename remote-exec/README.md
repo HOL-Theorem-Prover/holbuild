@@ -92,7 +92,10 @@ token from the worker's `/proc/<pid>/environ`. Outside the image,
 `python3 -m remote_exec.worker` runs the worker; it uses only the standard
 library and `curl`. High-tier workers run with a larger `--max-heap` on bigger
 machines; `--also-claim standard` lets them take standard-tier work when no
-high-tier action is ready.
+high-tier action is ready. With `--cooperate-dir`, a worker claims only while
+holbuild's memory admission in that directory would start one more child
+there, so an action a busy host couldn't start yet stays at the coordinator
+for a worker on another host.
 
 ## Batches and actions
 
