@@ -115,6 +115,10 @@ for ext in dat sig sml; do
 done
 log=$project/.holbuild/logs/current/theory-modules/DTheory/build.log
 if grep -q 'module-cache unsupported' "$log"; then
+  if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
+    echo 'compiled initializer test requires module support' >&2
+    exit 1
+  fi
   echo 'source loader checked; compiled initializers unsupported by this toolchain'
   exit 0
 fi

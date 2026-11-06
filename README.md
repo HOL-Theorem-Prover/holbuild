@@ -28,6 +28,9 @@ The same holbuild executable supports the current HOL pin in `vendor/hol/REV`
 and the legacy compatibility floor recorded in `tests/HOL_LEGACY_TACTICS_REV`
 (`e395eb6e69054ff6f7cef9d1107fd1a04dd5848f`). CI covers those two revisions;
 this is not a guarantee for every intervening or future HOL commit.
+Compiled initializer integration is also checked against the public HOL fork
+revision in `tests/HOL_THEORY_MODULES_REV`, which includes the optional loader
+API; the main and legacy jobs continue checking source-loader compatibility.
 
 Compatibility boundaries select implementations by the installed HOL API,
 not branch names or revision ordering. In particular, the analyser retains its
@@ -1372,6 +1375,13 @@ and generated test manifests use the same revision:
 env -u HOLDIR -u HOLBUILD_HOLDIR \
   HOLBUILD_TEST_HOL_REV=<full-40-character-commit> make test
 ```
+
+The focused `theory-modules` CI job selects the public HOL fork with
+`HOLBUILD_TEST_HOL_GIT` and the commit in `tests/HOL_THEORY_MODULES_REV`.
+It sets `HOLBUILD_TEST_REQUIRE_THEORY_MODULES=1` so an unsupported toolchain
+fails this job instead of checking only the source fallback. The ordinary
+suite also runs the same case on its default HOL revision, where the source
+fallback remains valid.
 
 ## Release process
 

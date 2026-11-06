@@ -381,6 +381,16 @@ fun generated_metadata_report_lines {parents_report, mldeps_report} =
 fun export_theory_if_needed_line sig_path =
   "val _ = HolbuildRuntime.export_theory_if_needed " ^ HolbuildToolchain.sml_string sig_path ^ ";"
 
+fun hfs_unmapped_path path =
+  let
+    val {dir, file} = Path.splitDirFile path
+    val {dir = parent, file = leaf} = Path.splitDirFile dir
+  in
+    if leaf = "objs" andalso Path.file parent = ".hol" then
+      Path.concat(Path.dir parent, file)
+    else path
+  end
+
 (* Export now seals a theory in current HOL versions, so the source child
    captures metadata and exports, but never loads the generated theory module. *)
 (* The exporter is the child's last file, so the child's peak resident set
