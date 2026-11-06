@@ -323,9 +323,17 @@ fun encode ({fingerprint, toolchain, action_toolchain_key, packages, members, di
        ["E\n"])
   end
 
+(* In pieces: in a fresh Poly/ML 5.9.2 process, TextIO.inputAll of a file of
+   about 3 to 3.8 MB mostly aborts with "Run out of store", the heap-sizing
+   problem behind HolbuildDependencies.analyser_min_heap_mb. *)
 fun read_text path =
-  let val input = TextIO.openIn path
-  in TextIO.inputAll input before TextIO.closeIn input
+  let
+    val input = TextIO.openIn path
+    fun loop pieces =
+      case TextIO.inputN (input, 65536) of
+          "" => String.concat (rev pieces)
+        | piece => loop (piece :: pieces)
+  in loop [] before TextIO.closeIn input
      handle e => (TextIO.closeIn input; raise e)
   end
 
