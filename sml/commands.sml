@@ -1189,7 +1189,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 | NONE =>
                     if not record then ()
                     else
-                      write (context {members = members, dirs = rev (!HolbuildSourceIndex.observed_dirs),
+                      write (context {members = members,
+                                      dirs = HolbuildPlanRecord.watched_dirs graph (rev (!HolbuildSourceIndex.observed_dirs)),
                                       stamps = Binarymap.mkDict String.compare, index = index,
                                       targets = targets, toolchain_key = toolchain_key})
                         NONE plan (input_keys planned)

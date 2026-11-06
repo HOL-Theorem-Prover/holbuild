@@ -609,9 +609,9 @@ extra_inputs = ["data"]'
   fi
 }
 
-# A package inside a pinned checkout, here a path override and a shim at
-# the checkout's root, is still watched like any mutable package, and the
-# shim's "." names the checkout's root itself.
+# A path override inside a pinned checkout is still watched, also below a
+# shim of that checkout rooted inside the override, and a shim at "." of the
+# checkout names the checkout's root itself.
 package_in_pinned_checkout() {
   local p=$tmpdir/in-pinned
   library_package "$tmpdir/outer" outer Outer
@@ -624,7 +624,18 @@ rev = \"$rev\""
   expect_plan "full (no plan record for these inputs)" "$p"
   local inner=$p/.holbuild/src/outer/inner
   library_package "$inner" inner Inner
-  mkdir -p "$p/shims"
+  mkdir -p "$p/shims" "$inner/src/lib"
+  cat > "$p/shims/innerlib.toml" <<'TOML'
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[project]
+name = "innerlib"
+
+[build]
+members = ["lib"]
+TOML
   cat > "$p/shims/outerlib.toml" <<'TOML'
 [holbuild]
 schema = 2
@@ -646,6 +657,11 @@ rev = "1111111111111111111111111111111111111111"
 from = "outer"
 path = "."
 manifest = "shims/outerlib.toml"
+
+[dependencies.innerlib]
+from = "outer"
+path = "inner/src"
+manifest = "shims/innerlib.toml"
 TOML
   printf '[overrides.inner]\npath = "%s"\n' "$inner" > "$p/.holconfig.toml"
   sleep 1.1

@@ -456,6 +456,22 @@ fun is_pinned_git_package package =
       | _ => false
   end
 
+(* The directories of OBSERVED, as discovery listed them, that the record
+   watches: not those a scan of HOL or of a pinned checkout listed, whose
+   entries change only with the pin. *)
+fun watched_dirs graph observed =
+  let
+    val fixed =
+      map HolbuildProject.package_name
+        (List.filter (fn p => is_hol_package p orelse is_pinned_git_package p)
+           (HolbuildProjectGraph.packages graph))
+  in
+    List.mapPartial
+      (fn (package, path, stamp, entries) =>
+         if List.exists (fn name => name = package) fixed then NONE else SOME (path, stamp, entries))
+      observed
+  end
+
 fun recorded_env_var entry =
   String.isPrefix "HOLBUILD_" entry andalso
   not (String.isPrefix "HOLBUILD_TIMING_" entry) andalso
@@ -562,19 +578,6 @@ fun build ({fingerprint, start_ns, toolchain, action_toolchain_key, graph, membe
     val packages = HolbuildProjectGraph.packages graph
     val hol_roots = map HolbuildProject.package_root (List.filter is_hol_package packages)
     fun in_hol path = List.exists (fn root => under root path) hol_roots
-    (* A directory is left out when each package with the deepest root above
-       it is HOL or a pinned checkout, whose files change only with the pin. *)
-    val roots =
-      map (fn p => (HolbuildProject.package_root p, is_hol_package p orelse is_pinned_git_package p))
-        packages
-    fun pinned_dir path =
-      let
-        val owners = List.filter (fn (root, _) => under root path) roots
-        val deepest = List.foldl (fn ((root, _), n) => Int.max(size root, n)) ~1 owners
-      in
-        not (null owners) andalso
-        List.all (fn (root, pinned) => pinned orelse size root < deepest) owners
-      end
     fun stamp_of path =
       case Binarymap.peek(stamps, path) of
           SOME st => st
@@ -671,11 +674,8 @@ fun build ({fingerprint, start_ns, toolchain, action_toolchain_key, graph, membe
       map (fn path => let val st = stamp_of path in {path = path, stamp = st, racy = racy st} end)
         (SI.sort_unique_strings (List.concat (map (fn (_, _, {dirs, ...}) => dirs) expansions)))
     val dir_entries =
-      List.mapPartial
-        (fn (path, SOME st, entries) =>
-              if pinned_dir path then NONE
-              else SOME {path = path, stamp = st, racy = racy st, entries = entries}
-          | (path, NONE, _) => raise Unrecordable ("cannot stat " ^ path))
+      map (fn (path, SOME st, entries) => {path = path, stamp = st, racy = racy st, entries = entries}
+            | (path, NONE, _) => raise Unrecordable ("cannot stat " ^ path))
         dirs
     val hol_stamp = stamp_of (#hol toolchain)
     val state_stamp = stamp_of (#state toolchain)

@@ -373,18 +373,19 @@ fun classified_entries path = classified_names path (list_dir path)
 fun unreadable_entry entry = String.isPrefix "D" entry orelse String.isPrefix "F" entry
 fun entry_name entry = String.extract (entry, 1, NONE)
 
-(* The directories discovery listed, each with its stat taken before the
-   listing and its classified entries, so a later run can tell from a stat
+(* The directories discovery listed, each with the package whose scan listed
+   it, its stat taken before the listing and its classified entries, so a later run can tell from a stat
    whether discovery would find the same sources.  Subdirectories discovery
    skips because they hold a manifest are listed too: removing the manifest
    would make discovery walk them. *)
-val observed_dirs : (string * HolbuildStatCache.ident option * string list) list ref = ref []
+val observed_dirs : (string * string * HolbuildStatCache.ident option * string list) list ref = ref []
 
-fun observe_dir path stamp entries = observed_dirs := (path, stamp, entries) :: !observed_dirs
+fun observe_dir package path stamp entries =
+  observed_dirs := (package, path, stamp, entries) :: !observed_dirs
 
-fun observe_boundary_dir path =
+fun observe_boundary_dir package path =
   let val stamp = HolbuildStatCache.stat_ident path
-  in observe_dir path stamp (classified_entries path) end
+  in observe_dir package path stamp (classified_entries path) end
   handle Error _ => ()
 
 fun scan_dir package package_id source_root artifact_root policies generated_paths excludes exclude_globs path acc =
@@ -396,7 +397,7 @@ fun scan_dir package package_id source_root artifact_root policies generated_pat
         if is_link path' then acc
         else if is_dir path' then
           if skip_dir name orelse not (is_readable path') then acc
-          else if contains_manifest path' then (observe_boundary_dir path'; acc)
+          else if contains_manifest path' then (observe_boundary_dir package path'; acc)
           else if excluded excludes exclude_globs (relative_path source_root path') then acc
           else scan_dir package package_id source_root artifact_root policies generated_paths excludes exclude_globs path' acc
         else if String.isPrefix "." name then acc
@@ -406,7 +407,7 @@ fun scan_dir package package_id source_root artifact_root policies generated_pat
     val names = list_dir_if_readable path
     val result = List.foldl scan_name acc names
   in
-    observe_dir path stamp (classified_names path names);
+    observe_dir package path stamp (classified_names path names);
     result
   end
 
