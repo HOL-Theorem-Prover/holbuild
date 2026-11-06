@@ -12,7 +12,8 @@ struct
 datatype attempt = Ok of string | Refused of string
 
 datatype outcome = Done
-                 | Failed of string       (* the batch failed or was cancelled *)
+                 | Failed of string       (* the batch failed *)
+                 | Cancelled              (* someone cancelled the batch *)
                  | Unfollowable of string (* the coordinator won't stream it; it may still run *)
                  | Unreachable of string  (* the coordinator couldn't be asked *)
 
@@ -149,6 +150,7 @@ fun follow url batch_id (on_done : string -> unit) : outcome * progress =
             outcome :=
               SOME (case json_string_field "state" line of
                         SOME "done" => Done
+                      | SOME "cancelled" => Cancelled
                       | SOME state =>
                           Failed (state ^ (case json_string_field "failure" line of
                                                SOME failure => ": " ^ failure

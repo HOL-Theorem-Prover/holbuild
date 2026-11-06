@@ -1168,9 +1168,9 @@ holbuild --remote-cache https://cache.example.org build --remote-exec https://ex
 It exports and uploads the batch as `action-spec --upload` does, submits it
 with `POST URL/v1/batches`, and follows `GET URL/v1/batches/<id>/events`,
 printing each theory's state as it changes. While it follows the batch, it
-copies into the local cache the remote cache entries of the theories the batch
-leaves out, which the remote cache already holds, and of each theory as the
-batch finishes it, `--prefetch-concurrency` at a time. When the batch is done,
+copies into the local cache the remote cache entry of each theory as the batch
+finishes it, and those of the theories a submitted batch leaves out, which the
+remote cache already holds, `--prefetch-concurrency` at a time. When the batch is done,
 the build restores every theory from the local cache, or from the remote cache
 whatever is not there yet. The coordinator's credentials go
 in a curl config file named by `HOLBUILD_REMOTE_EXEC_CURL_CONFIG`, such as
@@ -1193,9 +1193,10 @@ interrupted (SIGINT or SIGTERM) while it follows a batch cancels it too. With
 locally: a HOL toolchain or a theory that doesn't restore from a cache is an
 error. Such a `--remote-only` build exits with status 75 (`EX_TEMPFAIL`),
 whenever it stops where a build without `--remote-only` would go on locally,
-so that a caller can tell this from an error and build locally itself; an
-error on the command line or in the project, or an interrupt, exits with
-status 1. With nothing to build remotely it says so and goes straight to the
+so that a caller can tell this from an error and build locally itself. An
+error on the command line or in the project, a batch someone cancelled, or an
+interrupt exits with status 1, though a HOL toolchain that doesn't restore is
+found first, before the command line is checked. With nothing to build remotely it says so and goes straight to the
 local build. A build that includes a theory writing SML sources (see
 `holbuild_extra_outputs`) builds locally too, since those theories have to
 run before the rest of the build can be planned; with `--remote-only` it

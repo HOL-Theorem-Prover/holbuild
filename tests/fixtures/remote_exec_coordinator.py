@@ -12,7 +12,9 @@ ends it midway through its first action event (and is removed), `down`
 makes the event stream and POST /v1/batches/<id>/cancel answer 503, `ended`
 makes the event stream answer 503 and the cancel answer that the batch is
 already done, `skip` reports the batch done without running RUN, `hang` streams one
-running event and then nothing until `hang` is removed, without running RUN.  Otherwise
+running event and then nothing until `hang` is removed, without running RUN, `hold`
+holds the stream after the first action's final event until `hold` is removed, and
+`cancelled` reports every action and the batch cancelled without running RUN.  Otherwise
 the cancel answers that it cancelled the batch.  Every request is logged to
 STATE/requests.log.
 """
@@ -84,7 +86,9 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 time.sleep(0.1)
             return
-        ok = (state / "skip").exists() or subprocess.run([run, str(batch)]).returncode == 0
+        cancelled = (state / "cancelled").exists()
+        ok = cancelled or (state / "skip").exists() or subprocess.run([run, str(batch)]).returncode == 0
+        final_state = "cancelled" if cancelled else "done" if ok else "failed"
         cut = (state / "cut").exists()
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
@@ -105,13 +109,18 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     self.wfile.write((json.dumps(running) + "\n").encode())
                 event = {"type": "action", "input_key": fields[1], "theory": fields[4],
-                         "state": "done" if ok else "failed", "tier": "standard", "attempts": 1,
+                         "state": final_state, "tier": "standard", "attempts": 1,
                          "last_failure": None if ok else "proof", "log_sha256": None}
                 self.wfile.write((json.dumps(event) + "\n").encode())
+                self.wfile.flush()
+                for _ in range(600):
+                    if not (state / "hold").exists():
+                        break
+                    time.sleep(0.1)
         if (state / "drop").exists():
             (state / "drop").unlink()
             return
-        final = {"type": "batch", "state": "done" if ok else "failed",
+        final = {"type": "batch", "state": final_state,
                  "failure": None if ok else "an action failed"}
         self.wfile.write((json.dumps(final) + "\n").encode())
 

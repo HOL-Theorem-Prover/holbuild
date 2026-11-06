@@ -116,16 +116,9 @@ refute_grep() {
 }
 
 # Submit and follow: the workers build both theories, and the client restores
-# them from the remote cache without building anything itself, having copied
-# each into the local cache as the batch finished it.
+# them from the remote cache without building anything itself.
 write_theories one
-HOLBUILD_CACHE_TRACE=1 run follow 0 build --remote-exec "$coordinator" BTheory
-finished_line=$(grep -n "remote execution: remote workers finished" "$tmpdir/follow.log" | cut -d: -f1)
-for key in $(awk '$1 == "action" { print $2 }' "$state/b1.batch"); do
-  prefetched_line=$(grep -n "remote cache prefetched: $key$" "$tmpdir/follow.log" | cut -d: -f1)
-  [[ -n $prefetched_line && $prefetched_line -lt $finished_line ]] ||
-    { echo "$key not prefetched while following" >&2; cat "$tmpdir/follow.log" >&2; exit 1; }
-done
+run follow 0 build --remote-exec "$coordinator" BTheory
 require_grep "holbuild: remote batch b1" "$tmpdir/follow.log"
 require_grep "holbuild: remote rx:BTheory: done" "$tmpdir/follow.log"
 [[ $(grep -c "remote rx:BTheory: running" "$tmpdir/follow.log") -eq 1 ]] || { cat "$tmpdir/follow.log" >&2; exit 1; }
@@ -257,7 +250,7 @@ interrupt() {
   wait "$pid"
   local status=$?
   set -e
-  [[ $status -ne 0 ]] || { echo "$name exited 0 after SIGTERM" >&2; cat "$tmpdir/$name.log" >&2; exit 1; }
+  [[ $status -eq 1 ]] || { echo "$name exited $status after SIGTERM, wanted 1" >&2; cat "$tmpdir/$name.log" >&2; exit 1; }
 }
 write_theories interrupted
 touch "$state/hang"
@@ -445,3 +438,57 @@ require_grep "GenTheory restored from cache" "$tmpdir/generated-restore.log"
 require_grep "UseLib built" "$tmpdir/generated-restore.log"
 require_file "$tmpdir/generated-copy/src/GenML.sml"
 refute_grep "^POST /v1/batches\\|^GET /v1/batches" "$state/requests.log"
+
+# A theory the batch finishes is copied into the local cache while the
+# batch still runs: the stub holds the stream after ATheory's final event.
+write_theories streaming
+: > "$state/requests.log"
+touch "$state/hold"
+(cd "$project" && HOLBUILD_CACHE_TRACE=1 exec "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" BTheory) \
+  > "$tmpdir/streaming.log" 2>&1 &
+streaming_pid=$!
+for _ in {1..600}; do
+  grep -q "remote rx:ATheory: done" "$tmpdir/streaming.log" && break
+  sleep 0.1
+done
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/streaming.log")
+a_key=$(awk '$1 == "action" && $5 == "rx:ATheory" { print $2 }' "$state/$batch.batch")
+for _ in {1..600}; do
+  grep -q "remote cache prefetched: $a_key$" "$tmpdir/streaming.log" && break
+  sleep 0.1
+done
+require_grep "remote cache prefetched: $a_key$" "$tmpdir/streaming.log"
+refute_grep "remote workers finished\|remote rx:BTheory: done" "$tmpdir/streaming.log"
+rm "$state/hold"
+wait "$streaming_pid" || { cat "$tmpdir/streaming.log" >&2; exit 1; }
+require_grep "BTheory restored from cache" "$tmpdir/streaming.log"
+
+# The theories outside a submitted batch, which the remote cache already
+# holds, are copied while it runs too: a fresh copy of the project, with a
+# cache of its own, changes only BTheory.
+seeded=$tmpdir/seeded
+mkdir -p "$seeded"
+cp -r "$project/src" "$project/holproject.toml" "$seeded/"
+sed -i 's/(\* streaming \*)/(* seeded *)/' "$seeded/src/BScript.sml"
+link_hol_toolchain_cache "$tmpdir/seeded-cache"
+(cd "$seeded" && HOLBUILD_CACHE=$tmpdir/seeded-cache HOLBUILD_CACHE_TRACE=1 \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" BTheory) \
+  > "$tmpdir/seeded.log" 2>&1 || { cat "$tmpdir/seeded.log" >&2; exit 1; }
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/seeded.log")
+refute_grep "rx:ATheory" "$state/$batch.batch"
+finished_line=$(grep -n "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/seeded.log" | cut -d: -f1)
+seeded_line=$(grep -n "remote cache prefetched: $a_key$" "$tmpdir/seeded.log" | head -n 1 | cut -d: -f1)
+[[ -n $finished_line && -n $seeded_line && $seeded_line -lt $finished_line ]] ||
+  { echo "ATheory not prefetched while following" >&2; cat "$tmpdir/seeded.log" >&2; exit 1; }
+require_grep "ATheory restored from cache" "$tmpdir/seeded.log"
+
+# A batch someone cancelled: --remote-only fails with status 1, since a local
+# build would redo what was stopped; without it the build goes on locally.
+write_theories cancelled
+touch "$state/cancelled"
+run cancelled-only 1 build --remote-exec "$coordinator" --remote-only BTheory
+require_grep "remote execution: batch b[0-9]* cancelled; remote workers finished 0 of 2 theories" "$tmpdir/cancelled-only.log"
+run cancelled 0 build --remote-exec "$coordinator" BTheory
+require_grep "batch b[0-9]* cancelled; remote workers finished 0 of 2 theories; building locally" "$tmpdir/cancelled.log"
+require_grep "BTheory built" "$tmpdir/cancelled.log"
+rm "$state/cancelled"

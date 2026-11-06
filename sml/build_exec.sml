@@ -5055,11 +5055,11 @@ fun start_remote_cache_prefetch (options : build_options) project plan keys jobs
 
 (* For build --remote-exec while it follows its batch: starts copying into
    the local cache the remote entries of the plan's theories outside the
-   batch (batch_keys), which the remote cache already holds, as
-   start_remote_cache_prefetch does.  Returns {add, stop}: add copies the
-   entry of one more key, as the batch finishes its action; stop drops the
-   copies not yet started and waits for those in flight, so the build that
-   follows finds every finished one in the local cache. *)
+   batch, given its keys (SOME batch_keys), which the remote cache already
+   holds, as start_remote_cache_prefetch does.  Returns {add, stop}: add
+   copies the entry of one more key, as the batch finishes its action; stop
+   drops the copies not yet started, which the build's own prefetch makes,
+   and waits for those in flight. *)
 fun start_remote_exec_prefetch (options : build_options) tc project plan toolchain_key jobs batch_keys =
   case HolbuildRemoteCacheConfig.url () of
       SOME url =>
@@ -5067,16 +5067,21 @@ fun start_remote_exec_prefetch (options : build_options) tc project plan toolcha
         else
           let
             val root = cache_root ()
-            val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
-                         (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
-            val in_batch = Redblackset.addList (Redblackset.empty String.compare, batch_keys)
             val pool as {add, ...} = start_background_pool (prefetch_limit jobs) (prefetch_remote_cache_key root url)
+            fun seed batch_keys =
+              let
+                val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
+                             (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
+                val in_batch = Redblackset.addList (Redblackset.empty String.compare, batch_keys)
+              in
+                List.app (fn node =>
+                             case prefetch_key options project keys node of
+                                 SOME key => if Redblackset.member (in_batch, key) then () else add key
+                               | NONE => ())
+                         (HolbuildBuildPlan.selected_nodes plan)
+              end
           in
-            List.app (fn node =>
-                         case prefetch_key options project keys node of
-                             SOME key => if Redblackset.member (in_batch, key) then () else add key
-                           | NONE => ())
-                     (HolbuildBuildPlan.selected_nodes plan);
+            Option.app seed batch_keys;
             pool
           end
     | NONE => {add = fn _ => (), stop = fn () => ()}

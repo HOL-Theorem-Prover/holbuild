@@ -8,17 +8,19 @@ exception Error of string
    Poly/ML's OS.Process.status is the exit code, but opaque. *)
 val local_build_needed_status : OS.Process.status = RunCall.unsafeCast (75 : int)
 
+(* An interrupted build exits with status 1, whatever else stopped it, so
+   that nobody builds locally what its user stopped.  Set before anything
+   else the interrupt does, since build threads may still fail after it. *)
+val interrupted = ref false
+
 fun err_with_debug_artifacts msg artifacts =
   (if HolbuildStatus.json_mode () then HolbuildStatus.error_with_debug_artifacts msg artifacts
    else HolbuildStatus.message_stderr ("holbuild: " ^ msg ^ "\n");
-   OS.Process.exit (if !HolbuildHolSharedCache.local_build_needed then local_build_needed_status
+   OS.Process.exit (if !HolbuildHolSharedCache.local_build_needed andalso not (!interrupted)
+                    then local_build_needed_status
                     else OS.Process.failure))
 
 fun err msg = err_with_debug_artifacts msg HolbuildStatus.no_debug_artifacts
-
-(* An interrupted build fails, whatever stopped it, so that nobody builds
-   locally what its user stopped. *)
-fun err_interrupted () = (HolbuildHolSharedCache.local_build_needed := false; err "interrupted")
 
 fun warn msg = HolbuildStatus.message_stderr ("holbuild: warning: " ^ msg ^ "\n")
 
@@ -1319,10 +1321,10 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         (* Under --remote-only the build options only restore (restore_only);
            a detached build has nothing to fall back to. *)
         fun fall_back reason =
-          if remote_only then
+          if detach then raise Error ("remote execution: " ^ reason)
+          else if remote_only then
             (HolbuildHolSharedCache.local_build_needed := true;
              raise Error ("remote execution: " ^ reason))
-          else if detach then raise Error ("remote execution: " ^ reason)
           else (HolbuildBuildExec.warn ("remote execution: " ^ reason ^ "; building locally");
                 build_locally ())
         fun finished {built, total} =
@@ -1336,9 +1338,11 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           else if HolbuildRemoteExec.cancel url batch_id then fall_back (reason ^ ", cancelled the batch")
           else fall_back reason
         (* A batch that abandon would cancel is cancelled on an interrupt too.
-           While it runs, the entries of the theories outside it, which the
-           remote cache already holds, and of those it finishes are copied
-           into the local cache, for the build that follows to restore. *)
+           While it runs, the entries of the theories it finishes, and of a
+           submitted batch the theories outside it, which the remote cache
+           already holds, are copied into the local cache, for the build
+           that follows to restore.  An attached batch's theories are
+           unknown, so none of the others are copied before it ends. *)
         fun follow in_batch batch_id =
           let
             val {add, stop} =
@@ -1355,6 +1359,13 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                  build_locally ())
             | (HolbuildRemoteExec.Failed reason, progress) =>
                 fall_back ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress)
+            | (HolbuildRemoteExec.Cancelled, progress) =>
+                let val reason = "batch " ^ batch_id ^ " cancelled; " ^ finished progress
+                in
+                  (* Whoever cancelled it stopped this work, so a --remote-only
+                     build doesn't ask for it to be built locally instead. *)
+                  if remote_only then raise Error ("remote execution: " ^ reason) else fall_back reason
+                end
             | (HolbuildRemoteExec.Unfollowable reason, progress) =>
                 abandon batch_id ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress)
             | (HolbuildRemoteExec.Unreachable reason, progress) =>
@@ -1370,7 +1381,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 HolbuildRemoteExec.Refused reason => fall_back reason
               | HolbuildRemoteExec.Ok batch_id =>
                   (HolbuildStatus.message_stderr ("holbuild: remote batch " ^ batch_id ^ "\n");
-                   if detach then () else finish (batch_keys batch) batch_id)
+                   if detach then () else finish (SOME (batch_keys batch)) batch_id)
         (* A theory that writes SML sources runs before the rest of the build
            is planned (execute_build), which neither a batch nor the restore
            build of this plan does.  Under --remote-only, execute_build only
@@ -1388,7 +1399,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
            execute_build ())
         else
           case attach of
-              SOME batch_id => finish [] batch_id
+              SOME batch_id => finish NONE batch_id
             | NONE =>
                 (case HolbuildRemoteExec.Ok (export true)
                       handle HolbuildBuildExec.Error reason => HolbuildRemoteExec.Refused reason of
@@ -2549,9 +2560,10 @@ fun is_broken_pipe (IO.Io {cause = OS.SysErr (msg, _), ...}) = msg = "Broken pip
 fun install_signal_handlers () =
   let
     fun handler _ =
-      (HolbuildToolchain.cleanup_active_children ();
+      (interrupted := true;
+       HolbuildToolchain.cleanup_active_children ();
        HolbuildRemoteExec.cancel_followed ();
-       err_interrupted ())
+       err "interrupted")
     val _ = Signal.signal (Posix.Signal.int, Signal.SIG_HANDLE handler)
     val _ = Signal.signal (Posix.Signal.term, Signal.SIG_HANDLE handler)
   in
@@ -2615,7 +2627,7 @@ fun main raw_args =
      configure_cooperation cooperate_dir machine_max_mem child_charge (#maxheap options);
      dispatch_with_options options args
    end)
-  handle Thread.Interrupt => (HolbuildToolchain.cleanup_active_children (); err_interrupted ())
+  handle Thread.Interrupt => (interrupted := true; HolbuildToolchain.cleanup_active_children (); err "interrupted")
        | Error msg => err msg
        | HolbuildToolchain.Error msg => err msg
        | HolbuildProject.Error msg => err msg
