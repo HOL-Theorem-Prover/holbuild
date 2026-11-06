@@ -22,8 +22,15 @@ fun library_name () =
 
 local
   open Foreign
-  val curl = getSymbol (loadLibraryIndirect library_name)
-  val libc = getSymbol (loadExecutable ())
+  (* Foreign looks a symbol up on its first call and caches the address with
+     an unsynchronised byte-by-byte copy, so threads making their first call
+     through the same symbol at once can read a half-written address and jump
+     to it.  setup resolves every symbol here before any thread starts. *)
+  val symbols : symbol list ref = ref []
+  fun recorded lookup name =
+    let val symbol = lookup name in symbols := symbol :: !symbols; symbol end
+  val curl = recorded (getSymbol (loadLibraryIndirect library_name))
+  val libc = recorded (getSymbol (loadExecutable ()))
 
   (* curl_easy_setopt and curl_easy_getinfo take their third argument
      through `...`.  x86-64 and Linux arm64 pass it like a fixed third
@@ -55,6 +62,8 @@ in
   val multi_info_read = buildCall2 (curl "curl_multi_info_read", (cPointer, cStar cInt), cPointer)
   val fopen = buildCall2 (libc "fopen", (cString, cString), cPointer)
   val fclose = buildCall1 (libc "fclose", cPointer, cInt)
+
+  fun resolve_symbols () = List.app (ignore o symbolAsAddress) (!symbols)
 
   (* libcurl's connection sockets are not close-on-exec, so without this
      every child holbuild starts would inherit the open connections.  A
@@ -102,8 +111,9 @@ fun version_text number =
 
 (* Loads libcurl, checks that it can run transfers without blocking the GC,
    and initialises it.  Must run before the process starts any other
-   thread: before libcurl 7.84, curl_global_init is not thread-safe even
-   against threads that never use curl.  Raises Error, or Foreign.Foreign if
+   thread: it resolves every foreign symbol this structure calls, and
+   before libcurl 7.84 curl_global_init is not thread-safe even against
+   threads that never use curl.  Raises Error, or Foreign.Foreign if
    libcurl can't be loaded. *)
 fun setup {user} =
   let
@@ -122,8 +132,10 @@ fun setup {user} =
       raise Error ("libcurl " ^ version_text number ^ " is older than 7.66")
     else if Word32.andb (features, CURL_VERSION_ASYNCHDNS) = 0w0 then
       raise Error ("libcurl " ^ version_text number ^ " has no asynchronous DNS resolver")
-    else if global_init CURL_GLOBAL_DEFAULT <> 0 then raise Error "curl_global_init failed"
-    else userpwd := user
+    else
+      (resolve_symbols ();
+       if global_init CURL_GLOBAL_DEFAULT <> 0 then raise Error "curl_global_init failed"
+       else userpwd := user)
   end
 
 fun check what code =
