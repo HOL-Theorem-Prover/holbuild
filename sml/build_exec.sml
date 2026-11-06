@@ -2615,7 +2615,7 @@ fun failed_prefix_metadata path =
           case (value "proof_ir_failed_prefix_version", value "step_count", value "prefix_end",
                 value "path", value "focus", value "prefix_signature", value "history_count") of
               (SOME version, SOME step_count_text, SOME _, SOME _, SOME _, prefix_signature, SOME _) =>
-                if version = "4" then
+                if version = "5" then
                   Option.mapPartial
                     (fn step_count =>
                        if step_count = 0 orelse Option.isSome prefix_signature then
