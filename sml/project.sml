@@ -242,8 +242,10 @@ fun discover () =
                      " found in --source-dir/current directory or parents")
   end
 
-fun abs_under root path =
-  if Path.isAbsolute path then path else Path.concat(root, path)
+(* "." names ROOT itself, not ROOT/. *)
+fun abs_under root "." = root
+  | abs_under root path =
+      if Path.isAbsolute path then path else Path.concat(root, path)
 
 fun abs_member ({root, ...} : t) member = abs_under root member
 fun abs_run_heap ({root, run_heap, ...} : t) = Option.map (abs_under root) run_heap
@@ -392,7 +394,7 @@ fun dependency_local_path_with resolution (project as {graph_artifact_root, ...}
                  override of that dependency moves the shim with it. *)
               (case List.find (fn Dependency {name, ...} => name = from) (#dependencies project) of
                    SOME from_dep =>
-                     Option.map (fn from_root => Path.concat(from_root, path))
+                     Option.map (fn from_root => abs_under from_root path)
                        (dependency_local_path_with resolution project from_dep)
                  | NONE => die ("validated from dependency disappeared: " ^ from))
 

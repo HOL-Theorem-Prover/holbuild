@@ -4,8 +4,9 @@
    A record lives in .holbuild/plan/<fingerprint>, where the fingerprint
    hashes every planning input that is not a scanned file.  It keeps the stat
    and hash of each selected source and extra-input file, the stat and
-   classified entries of each directory discovery listed, every discovered
-   source, and per selected node everything execute reads from the plan.
+   classified entries of each directory discovery listed outside HOL and
+   pinned git checkouts, every discovered source, and per selected node
+   everything execute reads from the plan.
 
    A file counts as unchanged only when its size, mtime, ctime, inode and
    device all match, as in git's index.  A file or directory modified within
@@ -20,7 +21,7 @@ structure SC = HolbuildStatCache
 
 exception Error of string
 
-val format = "holbuild-plan-record-v1"
+val format = "holbuild-plan-record-v2"
 val kept_records = 4
 
 datatype mode = Off | On | Check
@@ -170,7 +171,7 @@ type stamped_dir = {path : string, stamp : stamp, racy : bool}
 (* A discovered source, by position of its package in the record. *)
 type source_entry =
   {package : int, kind : SI.kind, logical_name : string, relative_path : string,
-   source_path : string, id : string, policy_id : string, execution_policy_id : string}
+   source_path : string}
 
 type node_entry =
   {source : int, hash : string, deps : HolbuildDependencies.t,
@@ -274,11 +275,10 @@ fun encode ({fingerprint, toolchain, action_toolchain_key, packages, members, di
              expansions, sources, roots, selected, targets, ids} : t) =
   let
     val roots_of = Vector.fromList (map (fn (_, root) => root) packages)
-    fun source ({package, kind, logical_name, relative_path, source_path, id, policy_id, execution_policy_id} : source_entry) =
+    fun source ({package, kind, logical_name, relative_path, source_path} : source_entry) =
       line "S" [int_text package, kind_char kind, logical_name, relative_path,
                 if source_path = default_source_path (Vector.sub(roots_of, package)) relative_path
-                then "" else check_text source_path,
-                id, policy_id, execution_policy_id]
+                then "" else check_text source_path]
     fun node ({source, hash, deps, symbolic, resolved, external, config_lines, input_key, extra_inputs_key} : node_entry) =
       let val {declared, external, resolved} = compact_edges deps symbolic resolved external
       in
@@ -336,15 +336,14 @@ fun decode text : t =
     val input_dirs = ref [] val expansions = ref [] val sources = ref [] val selected = ref []
     val complete = ref false
     val package_roots = ref (Vector.fromList [])
-    fun source_line [package, kind, logical, rel, path, id, policy_id, execution_policy_id] =
+    fun source_line [package, kind, logical, rel, path] =
           let val package = parse_int package
               val _ = if Vector.length (!package_roots) = length (!packages) then ()
                       else package_roots := Vector.fromList (rev (map #2 (!packages)))
               val root = Vector.sub(!package_roots, package) handle Subscript => bad "package index"
           in
             {package = package, kind = parse_kind kind, logical_name = logical, relative_path = rel,
-             source_path = if path = "" then default_source_path root rel else path,
-             id = id, policy_id = policy_id, execution_policy_id = execution_policy_id}
+             source_path = if path = "" then default_source_path root rel else path}
           end
       | source_line _ = bad "source"
     fun deps_of [loads, uses, extra_deps, extra_outputs, holdep_mentions] =
@@ -434,8 +433,22 @@ fun decode text : t =
 
 fun read_optional path = SOME (read_text path) handle IO.Io _ => NONE
 
+(* HOL and the packages inside it, which the toolchain's stamp covers. *)
 fun is_hol_package package =
-  HolbuildPackageProvenance.is_implicit_hol (HolbuildProject.package_provenance package)
+  case HolbuildPackageProvenance.snapshot (HolbuildProject.package_provenance package) of
+      HolbuildPackageProvenance.ToolchainSnapshot _ => true
+    | _ => false
+
+(* A git dependency holbuild checked out at its pinned revision: the record
+   keeps the files planning read there, but not what its directories hold. *)
+fun is_pinned_git_package package =
+  let val provenance = HolbuildProject.package_provenance package
+  in
+    case (HolbuildPackageProvenance.snapshot provenance, HolbuildPackageProvenance.retrieval provenance) of
+        (HolbuildPackageProvenance.GitSnapshot _, HolbuildPackageProvenance.DeclaredGitRetrieval _) => true
+      | (HolbuildPackageProvenance.GitSnapshot _, HolbuildPackageProvenance.AlternateGitRetrieval _) => true
+      | _ => false
+  end
 
 fun recorded_env_var entry =
   String.isPrefix "HOLBUILD_" entry andalso
@@ -541,6 +554,8 @@ fun build ({fingerprint, start_ns, toolchain, action_toolchain_key, graph, membe
     val packages = HolbuildProjectGraph.packages graph
     val hol_roots = map HolbuildProject.package_root (List.filter is_hol_package packages)
     fun in_hol path = List.exists (fn root => under root path) hol_roots
+    val pinned_roots = map HolbuildProject.package_root (List.filter is_pinned_git_package packages)
+    fun in_pinned path = List.exists (fn root => under root path) pinned_roots
     val package_names = map HolbuildProject.package_name packages
     val package_ids =
       List.foldl (fn ((i, name), map) => Binarymap.insert(map, name, i)) (Binarymap.mkDict String.compare)
@@ -568,9 +583,7 @@ fun build ({fingerprint, start_ns, toolchain, action_toolchain_key, graph, membe
     val selected = BP.selected_nodes plan
     fun source_entry (source : SI.source) =
       {package = package_index (#package source), kind = #kind source, logical_name = #logical_name source,
-       relative_path = #relative_path source, source_path = #source_path source,
-       id = SI.source_id source, policy_id = #policy_id (SI.node_of source),
-       execution_policy_id = #execution_policy_id (SI.node_of source)}
+       relative_path = #relative_path source, source_path = #source_path source}
     fun node_entry node =
       let
         val known =
@@ -610,7 +623,7 @@ fun build ({fingerprint, start_ns, toolchain, action_toolchain_key, graph, membe
     val dir_entries =
       List.mapPartial
         (fn (path, SOME st, entries) =>
-              if in_hol path then NONE
+              if in_hol path orelse in_pinned path then NONE
               else SOME {path = path, stamp = st, racy = racy st, entries = entries}
           | (path, NONE, _) => raise Unrecordable ("cannot stat " ^ path))
         dirs
@@ -765,10 +778,9 @@ fun restore {dir, graph, tc : HolbuildToolchain.t, fingerprint, start_ns} =
     val package_vector = Vector.fromList packages
     val package_ids = Vector.map SI.source_graph_package_id package_vector
     val sources =
-      map (fn ({package, kind, logical_name, relative_path, source_path, id, policy_id, execution_policy_id} : source_entry) =>
+      map (fn ({package, kind, logical_name, relative_path, source_path} : source_entry) =>
              SI.restore_source (Vector.sub(package_vector, package)) (Vector.sub(package_ids, package))
-               {kind = kind, logical_name = logical_name, source_path = source_path, relative_path = relative_path,
-                ids = {id = id, policy_id = policy_id, execution_policy_id = execution_policy_id}})
+               {kind = kind, logical_name = logical_name, source_path = source_path, relative_path = relative_path})
         (#sources record)
       handle Subscript => fall "malformed plan record: package index"
     val source_vector = Vector.fromList sources
@@ -877,6 +889,8 @@ fun changed_keys (record : t) plan keys =
 
 (* ---- Check mode ---- *)
 
+(* A source as the plan reads it; restored sources keep no node identities
+   or canonical artifacts (SI.restore_source). *)
 fun source_text (source : SI.source) =
   let
     val node = #node source
@@ -886,9 +900,8 @@ fun source_text (source : SI.source) =
     String.concatWith " "
       [#package source, #package_root source, SI.kind_string (#kind source), #logical_name source,
        #source_path source, #relative_path source, artifacts (#artifacts source),
-       #id node, #package_id node, #relative_path node, #logical_name node, SI.kind_string (#kind node),
-       SI.origin_tag (#origin node), artifacts (#canonical_artifacts node), #policy_id node,
-       #execution_policy_id node, SI.policy_render (#policy node), SI.execution_policy_render (#policy node),
+       #package_id node, #relative_path node, #logical_name node, SI.kind_string (#kind node),
+       SI.origin_tag (#origin node), SI.policy_render (#policy node), SI.execution_policy_render (#policy node),
        SI.policy_render (#policy source)]
   end
 

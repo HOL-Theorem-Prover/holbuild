@@ -132,8 +132,10 @@ fun new_analysis_state components : analysis_state =
 
 fun lookup key entries = Binarymap.peek(entries, key)
 
+(* A package's file names one source, whose node identity sources the plan
+   record restores do not keep. *)
 fun analysis_key (source : HolbuildSourceIndex.source) =
-  #package source ^ "\000" ^ HolbuildSourceIndex.source_id source
+  #package source ^ "\000" ^ #relative_path source
 
 (* The analysis an earlier planning run made, as the plan record kept it:
    each analysed source with its content hash and dependency facts. *)

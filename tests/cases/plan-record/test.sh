@@ -546,6 +546,43 @@ from_subdirectory() {
   expect_plan "full (no plan record for these inputs)" "$p/src"
 }
 
+# A package with the default members ["."] names its sources by plain paths
+# under its root, so the record leaves them out of S lines, and a source
+# that is also an extra input of its own directory is one file to the record.
+default_members() {
+  local p=$tmpdir/default-members
+  mkdir -p "$p"
+  cat > "$p/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$hol_rev"
+
+[project]
+name = "default-members"
+TOML
+  theory "$p/AScript.sml" A
+  cat >> "$p/AScript.sml" <<'SML'
+fun holbuild_extra_deps (_ : string list) = ()
+val _ = holbuild_extra_deps ["."]
+SML
+  sleep 1.1
+  expect_plan "full (no plan record for these inputs)" "$p"
+  local records=("$p"/.holbuild/plan/*)
+  python3 - "${records[@]}" <<'PY'
+import sys
+path, = sys.argv[1:]
+for line in open(path, encoding="latin-1").read().split("\n"):
+    if line.startswith("S") and line[1:].split("\x01")[4] != "":
+        sys.exit("S line names a default path: " + repr(line))
+PY
+  printf '\n(* edited *)\n' >> "$p/AScript.sml"
+  expect_plan "from record (1 files rehashed, 1 keys changed)" "$p"
+}
+
 noop
 racy_entries_are_rehashed
 edit_with_restored_mtime
@@ -572,3 +609,4 @@ entry_kinds
 incoming_edge_order
 default_mode_rewrites
 from_subdirectory
+default_members

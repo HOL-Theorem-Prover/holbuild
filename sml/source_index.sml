@@ -70,7 +70,8 @@ fun drop_suffix suffix s =
    every source. *)
 fun join root rel =
   if rel = "" then root
-  else if root = "" orelse String.isPrefix "/" rel then Path.concat(root, rel)
+  else if String.isPrefix "/" rel then Path.concat(root, rel)
+  else if root = "" then rel
   else if String.isSuffix "/" root then root ^ rel
   else root ^ "/" ^ rel
 
@@ -86,22 +87,43 @@ fun relative_path root path =
     else path
   end
 
-fun dirname rel = #dir (Path.splitDirFile rel)
-fun filename rel = #file (Path.splitDirFile rel)
+(* Path.splitDirFile and Path.splitBaseExt on a relative path, by scanning
+   for its last separator: the plan record rebuilds the artifacts of every
+   discovered source. *)
+fun last_index c text =
+  let fun loop i = if i < 0 then NONE else if String.sub(text, i) = c then SOME i else loop (i - 1)
+  in loop (size text - 1) end
 
-fun obj_path artifact_root rel ext =
-  let val {base, ...} = Path.splitBaseExt rel
-  in join artifact_root (join "obj" (base ^ ext)) end
+fun dirname rel =
+  case last_index #"/" rel of
+      NONE => ""
+    | SOME 0 => "/"
+    | SOME i => String.substring(rel, 0, i)
+fun filename rel =
+  case last_index #"/" rel of
+      NONE => rel
+    | SOME i => String.extract(rel, i + 1, NONE)
 
-fun theory_obj_path artifact_root rel name ext = join artifact_root (join "obj" (join (dirname rel) (name ^ ext)))
-fun dat_path root rel name = theory_obj_path root rel name ".dat"
+(* REL without its extension, as Path.splitBaseExt finds it: a final dot
+   that neither starts nor ends the file name. *)
+fun base_of rel =
+  let val start = case last_index #"/" rel of NONE => 0 | SOME i => i + 1
+  in
+    case last_index #"." rel of
+        SOME i => if i > start andalso i < size rel - 1 then String.substring(rel, 0, i) else rel
+      | NONE => rel
+  end
+
+fun obj_path artifact_root rel ext = join artifact_root (join "obj" (base_of rel ^ ext))
 
 fun theory_artifacts root rel theory =
-  { generated = [theory_obj_path root rel theory ".sig",
-                 theory_obj_path root rel theory ".sml"],
-    objects = [obj_path root rel ".uo", theory_obj_path root rel theory ".ui",
-               theory_obj_path root rel theory ".uo"],
-    theory_data = [dat_path root rel theory] }
+  let val dir = join root (join "obj" (dirname rel))
+      fun at ext = join dir (theory ^ ext)
+  in
+    { generated = [at ".sig", at ".sml"],
+      objects = [obj_path root rel ".uo", at ".ui", at ".uo"],
+      theory_data = [at ".dat"] }
+  end
 
 fun sml_artifacts root rel =
   { generated = [], objects = [obj_path root rel ".ui", obj_path root rel ".uo"], theory_data = [] }
@@ -157,7 +179,7 @@ fun canonical_artifacts_for kind logical_name relative_path =
     | Sig => sig_artifacts "" relative_path
 
 fun source_with_ids package package_id package_root policy origin kind logical_name source_path relative_path artifacts
-                    {id, policy_id, execution_policy_id} =
+                    canonical_artifacts {id, policy_id, execution_policy_id} =
   let
     val node =
       {id = id,
@@ -166,7 +188,7 @@ fun source_with_ids package package_id package_root policy origin kind logical_n
        logical_name = logical_name,
        kind = kind,
        origin = origin,
-       canonical_artifacts = canonical_artifacts_for kind logical_name relative_path,
+       canonical_artifacts = canonical_artifacts,
        policy_id = policy_id,
        execution_policy_id = execution_policy_id,
        policy = policy}
@@ -187,18 +209,21 @@ fun make_source package package_id package_root policies generated_paths kind lo
     val origin = source_origin generated_paths relative_path
     val policy = HolbuildProject.action_policy_for policies logical_name
     val policy_id = HolbuildHash.string_sha256 (policy_render policy)
+    val canonical_artifacts = canonical_artifacts_for kind logical_name relative_path
     val ids =
-      {id = source_node_id package_id kind origin logical_name relative_path
-              (canonical_artifacts_for kind logical_name relative_path) policy_id,
+      {id = source_node_id package_id kind origin logical_name relative_path canonical_artifacts policy_id,
        policy_id = policy_id,
        execution_policy_id = HolbuildHash.string_sha256 (execution_policy_render policy)}
   in
-    source_with_ids package package_id package_root policy origin kind logical_name source_path relative_path artifacts ids
+    source_with_ids package package_id package_root policy origin kind logical_name source_path relative_path artifacts
+      canonical_artifacts ids
   end
 
-(* A source an earlier discovery found, rebuilt from the identities the plan
-   record kept instead of hashing them again. *)
-fun restore_source package package_id {kind, logical_name, source_path, relative_path, ids} =
+(* A source an earlier discovery found, as the plan record kept it.  Its
+   node keeps no identities and no canonical artifacts: they serve only
+   package inventories and plan identities, which full planning computes
+   and the record keeps whole. *)
+fun restore_source package package_id {kind, logical_name, source_path, relative_path} =
   let
     val artifact_root = HolbuildProject.package_artifact_root package
     val generated_paths =
@@ -211,7 +236,8 @@ fun restore_source package package_id {kind, logical_name, source_path, relative
   in
     source_with_ids (HolbuildProject.package_name package) package_id (HolbuildProject.package_root package)
       (HolbuildProject.action_policy_for (HolbuildProject.package_action_policies package) logical_name)
-      (source_origin generated_paths relative_path) kind logical_name source_path relative_path artifacts ids
+      (source_origin generated_paths relative_path) kind logical_name source_path relative_path artifacts
+      {generated = [], objects = [], theory_data = []} {id = "", policy_id = "", execution_policy_id = ""}
   end
 
 fun generated_theory_artifact file =
