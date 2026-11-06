@@ -139,6 +139,57 @@ async def test_claim_leases_once_and_skips_locked_rows(
     assert await claim(http) is None
 
 
+async def test_one_worker_takes_turns_between_batches(http: httpx.AsyncClient, cache: FakeCache) -> None:
+    for prefix in "abc":
+        await submit(http, [f"{prefix}1", f"{prefix}2"])
+
+    # With nothing running, the batch that least recently had a claim goes next, not the oldest again.
+    for name in ["a1", "b1", "c1", "a2", "b2", "c2"]:
+        await build(http, cache, name)
+
+
+async def test_a_new_batch_goes_ahead_of_a_wide_one_holding_workers(http: httpx.AsyncClient) -> None:
+    await submit(http, ["w1", "w2", "w3", "w4"])
+    for name in ["w1", "w2", "w3"]:
+        await claim_named(http, name)
+
+    await submit(http, ["n1", "n2"])
+    await claim_named(http, "n1")
+    # The new batch was claimed from last, but it still runs fewer actions.
+    await claim_named(http, "n2")
+    await claim_named(http, "w4")
+
+
+async def test_claims_take_the_deepest_then_the_widest_action_of_a_batch_first(
+    http: httpx.AsyncClient, remote_exec_engine: Any
+) -> None:
+    # A diamond d <- l, r <- j, a spine b1 <- b2 <- b3, a fan f <- f1..f4 and a lone a. d and b1 both head two
+    # levels of dependents, d three of them (j counted once) and b1 two; f heads one level of four.
+    diamond = [("l", "d"), ("r", "d"), ("j", "l"), ("j", "r")]
+    spine = [("b2", "b1"), ("b3", "b2")]
+    fan = [(f"f{i}", "f") for i in range(1, 5)]
+    names = ["a", "d", "j", "l", "r", "b1", "b2", "b3", "f", "f1", "f2", "f3", "f4"]
+    await submit(http, names, diamond + spine + fan)
+
+    async with remote_exec_engine.connect() as connection:
+        rows = await connection.execute(sa.text("SELECT theory, critical_depth, descendant_count FROM actions"))
+        priority = {theory.removeprefix("pkg:"): (depth, count) for theory, depth, count in rows}
+    assert priority == {
+        "a": (0, 0),
+        "d": (2, 3),
+        "l": (1, 1),
+        "r": (1, 1),
+        "j": (0, 0),
+        "b1": (2, 2),
+        "b2": (1, 1),
+        "b3": (0, 0),
+        "f": (1, 4),
+        **{f"f{i}": (0, 0) for i in range(1, 5)},
+    }
+    for name in ["d", "b1", "f", "a"]:
+        await claim_named(http, name)
+
+
 async def test_built_parent_releases_child_only_once_its_key_is_in_the_cache(
     http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
 ) -> None:
@@ -430,6 +481,50 @@ async def test_missing_transitive_dependency_holds_the_child_until_rebuilt(
 
     await build(http, cache, "a")
     await build(http, cache, "c")
+    assert (await batch(http, batch_id))["state"] == "done"
+
+
+async def test_an_edge_added_for_a_missing_theory_raises_its_priority(
+    http: httpx.AsyncClient, cache: FakeCache, remote_exec_engine: Any
+) -> None:
+    batch_id = await submit(http, ["a", "b"])
+    await build(http, cache, "a")
+    token = await claim_named(http, "b")
+
+    cache.keys.discard(ac_key("a"))
+    record = result("b", "failed", "input-missing", missing=f"theory {input_key('a')}")
+    assert (await complete(http, token, record)).status_code == 200
+    assert await states(http, batch_id) == {"a": "ready", "b": "waiting"}
+    async with remote_exec_engine.connect() as connection:
+        rows = await connection.execute(sa.text("SELECT theory, critical_depth, descendant_count FROM actions"))
+        assert {theory: (depth, count) for theory, depth, count in rows} == {"pkg:a": (1, 1), "pkg:b": (0, 0)}
+
+
+@pytest.mark.parametrize(
+    ("names", "edges", "missing"),
+    [(["a"], [], "a"), (["a", "b"], [("b", "a")], "b")],
+    ids=["itself", "its dependent"],
+)
+async def test_an_action_missing_itself_or_its_dependent_is_retried_without_an_edge(
+    http: httpx.AsyncClient,
+    cache: FakeCache,
+    remote_exec_engine: Any,
+    names: list[str],
+    edges: list[tuple[str, str]],
+    missing: str,
+) -> None:
+    batch_id = await submit(http, names, edges)
+    token = await claim_named(http, "a")
+
+    record = result("a", "failed", "input-missing", missing=f"theory {input_key(missing)}")
+    assert (await complete(http, token, record)).status_code == 200
+    assert (await states(http, batch_id))["a"] == "ready"
+    async with remote_exec_engine.connect() as connection:
+        stored = set(await connection.execute(sa.text("SELECT input_key, parent_key FROM edges")))
+    assert stored == {(input_key(child), input_key(parent)) for child, parent in edges}
+
+    for name in names:
+        await build(http, cache, name)
     assert (await batch(http, batch_id))["state"] == "done"
 
 

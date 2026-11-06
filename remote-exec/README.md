@@ -135,10 +135,18 @@ finally (`failed`, with a `failure` message), or the client cancels it
   (404; blobs can expire before the entry naming them) is built again.
   When the cache can't be reached, the action waits for the next sweep. This
   is only a readiness hint; `exec-action` validates its inputs itself.
-- **Claims** take the oldest batch's ready action of the worker's tier (or,
-  when it has none, of its `also_claim` tiers, in order) with
-  `FOR UPDATE SKIP LOCKED`, write a lease with an expiry and commit; no
-  transaction stays open while the worker builds. An expired lease returns the
+- **Claims** take a ready action of the worker's tier (or, when it has none,
+  of its `also_claim` tiers, in order, so a burst worker builds every ready
+  high-tier action before standard overflow) with `FOR UPDATE SKIP LOCKED`,
+  write a lease with an expiry and commit; no transaction stays open while
+  the worker builds. Among the running batches, the claim picks the one with
+  the fewest running actions, then the one that least recently had an action
+  claimed (one that never had goes first), then the oldest: a new batch gets
+  the next free worker even while a wide one holds the rest, and batches
+  take turns when there are more of them than workers. Within the batch, it
+  picks the action with the longest chain of dependents in the batch, then
+  the one with the most dependents, then by theory name, so the critical
+  path starts first and the ready frontier widens fastest. An expired lease returns the
   action to waiting (see Retries), or fails it once it has been claimed `MAX_ATTEMPTS` times.
   A heartbeat or completion with an expired or revoked token is refused, and
   the completion is dropped. Since a worker may run an action twice after a
@@ -151,8 +159,8 @@ finally (`failed`, with a `failure` message), or the client cancels it
   | `memory` | on the standard tier, retried on the high-memory tier; on the high tier, retried there, until the action has been claimed `MAX_ATTEMPTS` times |
   | `publish`, `toolchain`, `internal` | retried, until the action has been claimed `MAX_ATTEMPTS` times |
   | `disk` | retried once; a second `disk` in a row, or `MAX_ATTEMPTS` claims, is final |
-  | `input-missing` naming a theory of the batch | that theory is built again and the action waits for it, until the action has been claimed `MAX_ATTEMPTS` times |
-  | any other `input-missing` (a blob, or a theory cached at export) | retried, since a restore that fails on a network error reports its input missing too; after `MAX_ATTEMPTS` claims the batch fails with `resubmit: …`; the next build exports a new batch |
+  | `input-missing` naming a theory of the batch other than the action itself or one that depends on it | that theory is built again and the action waits for it, until the action has been claimed `MAX_ATTEMPTS` times |
+  | any other `input-missing` (a blob, a theory cached at export, or one that can't be the action's input) | retried, since a restore that fails on a network error reports its input missing too; after `MAX_ATTEMPTS` claims the batch fails with `resubmit: …`; the next build exports a new batch |
   | `proof`, `tactic-timeout`, `spec-rejected` | final |
 
   A worker whose `exec-action` ends without a result record (it crashed or
