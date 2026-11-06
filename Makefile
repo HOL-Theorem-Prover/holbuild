@@ -1,6 +1,7 @@
 HOLDIR ?= $(HOLBUILD_HOLDIR)
 HOLBUILD_KEEP_TEST_LOGS ?=
 POLYC ?= polyc
+POLY ?= $(dir $(shell command -v $(POLYC)))poly
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 DATADIR ?= $(PREFIX)/share/holbuild
@@ -25,9 +26,14 @@ check-vendored-hol:
 	done < vendor/hol/FILES
 
 bin/holbuild: sml/holbuild-script.sml sml/sha256.sml sml/spawn.sml sml/hash.sml sml/temp_path.sml sml/remove_tree.sml sml/stat_cache.sml sml/version.sml sml/suggest.sml sml/builtin_manifests.sml sml/hol_source_manifest.sml sml/cache_config.sml sml/http.sml sml/remote_cache_config.sml sml/git_cache.sml sml/file_lock.sml sml/cache_backend.sml sml/theory_cache_manifest.sml sml/fs_cache_backend.sml sml/cache_transfer.sml sml/remote_cache.sml sml/tar_archive.sml sml/cache_archive.sml sml/toolchain_archive.sml sml/hol_shared_cache.sml sml/manifest_util.sml sml/package_definition.sml sml/package_provenance.sml sml/local_config.sml sml/project_graph.sml sml/analyser/analysis_protocol.sml sml/analyser/dependency_extract.sml sml/analyser/theory_span_extract.sml sml/analyser/proof_step_plan_adapter_legacy.sml sml/analyser/proof_step_plan_adapter_shared.sml sml/analyser/tactic_parse_capabilities.sml sml/analyser/tactic_parse_adapter_legacy.sml sml/analyser/tactic_parse_adapter_token_spans.sml sml/analyser/proof_ir_extract.sml sml/analyser/analyser_main.sml sml/analyser/holbuild-hol-analyser-script.sml sml/project.sml sml/toolchain.sml sml/status.sml sml/machine_memory.sml sml/generators.sml sml/package_prepare.sml sml/source_index.sml sml/package_component.sml sml/dependencies.sml sml/component_provider.sml sml/build_plan.sml sml/plan_record.sml sml/holbuild_runtime.sml sml/checkpoint_save_runtime.sml sml/proof_ir_types.sml sml/proof_ir.sml sml/tactic_compat_runtime.sml sml/proof_runtime.sml sml/theory_checkpoints.sml sml/checkpoint_store.sml sml/theory_diagnostics.sml sml/project_lock.sml sml/theory_spans.sml sml/build_exec.sml sml/cache.sml sml/watch.sml sml/remote_exec.sml sml/commands.sml vendor/hol/REV vendor/hol/FILES $(VENDORED_HOL_FILES) | check-vendored-hol
+# polyc's own compile step, but with one GC thread: Poly/ML 5.9.2 can abort
+# with more than ~100 GC threads (polyml/polyml#327). polyc then links.
 bin/holbuild: sml/process_group.sml sml/tactic_timeout_policy.sml
 	@mkdir -p bin
-	$(POLYC) -o $@ sml/holbuild-script.sml
+	echo 'val () = use "sml/holbuild-script.sml"; val () = PolyML.export("$@.o", main);' | \
+		$(POLY) -q --error-exit --gcthreads=1
+	$(POLYC) -o $@ $@.o
+	rm -f $@.o
 
 install: bin/holbuild
 	install -d "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(DATADIR)/copyrights"
@@ -44,5 +50,5 @@ ifeq ($(strip $(TESTS)),)
 endif
 
 clean:
-	rm -f bin/holbuild
+	rm -f bin/holbuild bin/holbuild.o
 	rmdir bin 2>/dev/null || true

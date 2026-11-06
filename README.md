@@ -51,8 +51,9 @@ If `polyc` is not on `PATH`, select it at build time with `POLYC`:
 make POLYC=/custom/polyml/bin/polyc
 ```
 
-`POLYC` selects the compiler used to build the `holbuild` executable. It is
-separate from `HOLBUILD_POLY`, which selects the `poly` executable used when
+`POLYC` selects the compiler used to build the `holbuild` executable, and
+`POLY` the `poly` it compiles with (by default the one next to `POLYC`). They
+are separate from `HOLBUILD_POLY`, which selects the `poly` executable used when
 holbuild builds or runs project HOL toolchains.
 
 Check the resulting binary:
