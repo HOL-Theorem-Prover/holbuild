@@ -153,19 +153,23 @@ async def test_a_new_batch_goes_ahead_of_a_wide_one_holding_workers(http: httpx.
     for name in ["w1", "w2", "w3"]:
         await claim_named(http, name)
 
-    await submit(http, ["n"])
-    await claim_named(http, "n")
+    await submit(http, ["n1", "n2"])
+    await claim_named(http, "n1")
+    # The new batch was claimed from last, but it still runs fewer actions.
+    await claim_named(http, "n2")
     await claim_named(http, "w4")
 
 
 async def test_claims_take_the_deepest_then_the_widest_action_of_a_batch_first(
     http: httpx.AsyncClient, remote_exec_engine: Any
 ) -> None:
-    # A spine s1 <- s2 <- s3, a diamond d <- l, r <- j, and a lone a: d and s1 both head two levels of dependents,
-    # d three of them (j counted once), s1 two.
+    # A diamond d <- l, r <- j, a spine b1 <- b2 <- b3, a fan f <- f1..f4 and a lone a. d and b1 both head two
+    # levels of dependents, d three of them (j counted once) and b1 two; f heads one level of four.
     diamond = [("l", "d"), ("r", "d"), ("j", "l"), ("j", "r")]
-    spine = [("s2", "s1"), ("s3", "s2")]
-    await submit(http, ["a", "d", "j", "l", "r", "s1", "s2", "s3"], diamond + spine)
+    spine = [("b2", "b1"), ("b3", "b2")]
+    fan = [(f"f{i}", "f") for i in range(1, 5)]
+    names = ["a", "d", "j", "l", "r", "b1", "b2", "b3", "f", "f1", "f2", "f3", "f4"]
+    await submit(http, names, diamond + spine + fan)
 
     async with remote_exec_engine.connect() as connection:
         rows = await connection.execute(sa.text("SELECT theory, critical_depth, descendant_count FROM actions"))
@@ -176,11 +180,13 @@ async def test_claims_take_the_deepest_then_the_widest_action_of_a_batch_first(
         "l": (1, 1),
         "r": (1, 1),
         "j": (0, 0),
-        "s1": (2, 2),
-        "s2": (1, 1),
-        "s3": (0, 0),
+        "b1": (2, 2),
+        "b2": (1, 1),
+        "b3": (0, 0),
+        "f": (1, 4),
+        **{f"f{i}": (0, 0) for i in range(1, 5)},
     }
-    for name in ["d", "s1", "a"]:
+    for name in ["d", "b1", "f", "a"]:
         await claim_named(http, name)
 
 
