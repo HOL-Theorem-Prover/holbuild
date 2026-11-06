@@ -552,8 +552,11 @@ cache. The exporter canonicalizes the parent header by theory name, preserving
 the remaining payload, and updates the embedded data hash in `Theory.sml`.
 The generated parent load metadata uses the same order. Existing valid bundles
 remain usable without changing action keys; they are not canonicalized on
-restore, so importing a mixture of old and new bundles can still conflict. A script that reads
-the clock, the environment, undeclared files, or host paths has to declare the files as `extra_deps` or opt out with `cache = false`.
+restore, so importing a mixture of old and new bundles can still conflict.
+The local dependency-context checkpoint format changes to prevent resuming a
+heap with an older export runtime; artifact action keys do not change.
+A script that reads the clock, the environment, undeclared files, or host paths
+has to declare the files as `extra_deps` or opt out with `cache = false`.
 
 If the same input key produces different output keys, that indicates
 nondeterminism or undeclared inputs. The cache keeps the first entry and warns
@@ -564,8 +567,9 @@ hits: where the local parent's `.dat` differs from the one the cached children
 were built against, its whole subtree misses. A parent-incompatible local entry
 is removed after waiting for the publication lock, only if its manifest is
 unchanged, so a successful rebuild can publish a replacement. Policy-only
-rejections retain the entry until a successful rebuild can publish. Other output conflicts still keep
-the first entry; remote publication and archive import still reject conflicts.
+rejections retain the entry until a successful rebuild can publish. Other output
+conflicts still keep the first entry; remote publication and archive import
+still reject conflicts.
 
 ## Global cache
 

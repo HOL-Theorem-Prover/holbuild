@@ -400,7 +400,7 @@ QED
 val _ = export_theory();
 SML
 
-(cd "$nondet_project" && "$HOLBUILD_BIN" build BTheory CTheory) > "$tmpdir/nondet-initial.log" 2>&1
+(cd "$nondet_project" && "$HOLBUILD_BIN" build --tactic-timeout 0 BTheory CTheory) > "$tmpdir/nondet-initial.log" 2>&1
 rm -rf "$nondet_project/.holbuild"
 (cd "$nondet_project" && "$HOLBUILD_BIN" build --force ATheory) > "$tmpdir/nondet-parent.log" 2>&1
 require_grep "ATheory built" "$tmpdir/nondet-parent.log"
@@ -415,14 +415,29 @@ if grep -q "cache entry already exists with different outputs" "$nondet_child_lo
   exit 1
 fi
 
-# Keep the newly built parent and discard only the children: the replacement
-# entries must now restore against that parent, without another rebuild.
-rm "$nondet_project/.holbuild/obj/src/"{B,C}Theory.dat
-(cd "$nondet_project" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" build BTheory CTheory) > "$tmpdir/nondet-restored.log" 2>&1
-for child in BTheory CTheory; do
-  require_grep "$child restored from cache" "$tmpdir/nondet-restored.log"
+# Check both the combined parent/policy miss above and a parent-only miss.
+for pass in 1 2; do
+  rm "$nondet_project/.holbuild/obj/src/"{B,C}Theory.dat
+  (cd "$nondet_project" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" build BTheory CTheory) > "$tmpdir/nondet-restored.log" 2>&1
+  for child in BTheory CTheory; do
+    require_grep "$child restored from cache" "$tmpdir/nondet-restored.log"
+  done
+  if grep -q "parent outputs differ" "$tmpdir/nondet-restored.log"; then
+    echo "replacement child cache entries still disagree with their parent" >&2
+    exit 1
+  fi
+  if [[ "$pass" == 1 ]]; then
+    # Reexecute the clock read rather than resuming past it from a checkpoint.
+    rm -rf "$nondet_project/.holbuild"
+    (cd "$nondet_project" && "$HOLBUILD_BIN" build --force ATheory) > "$tmpdir/nondet-parent.log" 2>&1
+    (cd "$nondet_project" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" build BTheory CTheory) > "$nondet_child_log" 2>&1
+    for child in BTheory CTheory; do
+      require_grep "cache miss: $child .*(parent outputs differ)" "$nondet_child_log"
+      require_grep "$child built" "$nondet_child_log"
+    done
+    if grep -q "cache entry already exists with different outputs" "$nondet_child_log"; then
+      echo "rejected child cache entries were not replaced" >&2
+      exit 1
+    fi
+  fi
 done
-if grep -q "parent outputs differ" "$tmpdir/nondet-restored.log"; then
-  echo "replacement child cache entries still disagree with their parent" >&2
-  exit 1
-fi

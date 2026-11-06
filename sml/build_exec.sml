@@ -379,9 +379,7 @@ fun peak_rss_report_line path =
 
 fun write_theory_exporter {sig_path, path, parents_report, mldeps_report} =
   let
-    (* A resumed checkpoint can contain an older runtime helper. *)
     val lines =
-      ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (runtime_helper_path ()) ^ ";"] @
       generated_metadata_report_lines {parents_report = parents_report,
                                        mldeps_report = mldeps_report} @
       [export_theory_if_needed_line sig_path,
@@ -2501,7 +2499,9 @@ fun dependency_context_key toolchain_key plan keys node =
             val key =
               HolbuildToolchain.hash_text
                 (String.concatWith "\n"
-                   (["holbuild-dependency-context-v1",
+                   (* Local heaps must contain the export-normalizing runtime.
+                      Artifact action keys remain compatible. *)
+                   (["holbuild-dependency-context-v2",
                      "toolchain_key=" ^ toolchain_key] @ project_lines @ theory_lines @ lib_lines) ^ "\n")
           in
             HolbuildBuildPlan.remember_dependency_context_key plan node context_id key;
@@ -3621,12 +3621,15 @@ fun theory_parent_hash_matches dat_hash_cache parent_hashes dep =
              | SOME recorded_hash => recorded_hash = parent_hash)
   end
 
-fun child_dat_parent_hashes_match dat_hash_cache plan node =
+fun dat_parent_hashes_match dat_hash_cache plan node dat_path =
   let
-    val parent_hashes = parse_dat_parent_hashes (read_text (#data_path (theory_outputs node)))
+    val parent_hashes = parse_dat_parent_hashes (read_text dat_path)
   in List.all (theory_parent_hash_matches dat_hash_cache parent_hashes)
               (project_theory_parent_deps parent_hashes (project_theory_deps plan node))
   end
+
+fun child_dat_parent_hashes_match dat_hash_cache plan node =
+  dat_parent_hashes_match dat_hash_cache plan node (#data_path (theory_outputs node))
 
 fun metadata_parent_hashes_match dat_hash_cache plan node text =
   let
@@ -4064,20 +4067,31 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
           case existing of
               SOME text => ignore (drop_cache_manifest_if_unchanged root input_key text)
             | NONE => ()
+        fun reject_parents () =
+          (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
+                        input_key ^ " (parent outputs differ)");
+           discard_entry ();
+           remove_failed_cache_outputs project node; CacheMiss)
+        fun cached_parents_match text =
+          let
+            val {dat_hash, ...} = cache_manifest_blobs_from_lines input_key (cache_manifest_lines text)
+          in
+            dat_parent_hashes_match dat_hash_cache plan node (HolbuildCache.blob_path root dat_hash)
+          end
+          handle _ => false
       in
         case existing of
             NONE => (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
                                   input_key ^ " (no manifest)"); CacheMiss)
-          | SOME _ =>
+          | SOME text =>
               case materialize_theory_cache (#verify_cache options) allow_timeout_discrepancy
                      project plan input_key (tactic_timeout policy) (trknl_enabled policy) node of
-                  CacheMiss => CacheMiss
+                  (* A policy miss can also hide stale parent outputs. Preserve
+                     compatible weaker-policy entries if rechecking fails. *)
+                  CacheMiss => if cached_parents_match text then CacheMiss else reject_parents ()
                 | restored as CacheRestored _ =>
                     if theory_parent_hashes_match dat_hash_cache plan node NONE then restored
-                    else (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
-                                       input_key ^ " (parent outputs differ)");
-                          discard_entry ();
-                          remove_failed_cache_outputs project node; CacheMiss)
+                    else reject_parents ()
       end
     fun restore_from_cache built_timeout =
       (remove_tree stage;
