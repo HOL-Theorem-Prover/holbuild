@@ -230,7 +230,7 @@ rm "$state/ended"
 # interrupt NAME ARGS...: starts hb with ARGS, logging to $tmpdir/NAME.log,
 # and sends holbuild SIGTERM once it follows its batch.  HOLBUILD_BIN may be
 # a wrapper that runs holbuild as its child, as tests/run.sh's does, so the
-# signal goes to $! itself only when it has no children.
+# signal goes to that child if there is one, else to $! itself.
 interrupt() {
   local name=$1
   shift
@@ -242,7 +242,7 @@ interrupt() {
   done
   require_grep "remote rx:ATheory: running" "$tmpdir/$name.log"
   local targets
-  targets=$(pgrep -P "$pid" || echo "$pid")
+  targets=$(pgrep -x holbuild -P "$pid" || echo "$pid")
   # shellcheck disable=SC2086
   kill -TERM $targets
   set +e

@@ -2588,10 +2588,7 @@ fun main raw_args =
      configure_cooperation cooperate_dir machine_max_mem child_charge (#maxheap options);
      dispatch_with_options options args
    end)
-  handle Thread.Interrupt =>
-           (HolbuildToolchain.cleanup_active_children ();
-            HolbuildRemoteExec.cancel_followed ();
-            err "interrupted")
+  handle Thread.Interrupt => (HolbuildToolchain.cleanup_active_children (); err "interrupted")
        | Error msg => err msg
        | HolbuildToolchain.Error msg => err msg
        | HolbuildProject.Error msg => err msg
