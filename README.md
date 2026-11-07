@@ -1328,7 +1328,9 @@ rebuild or recheck against the cached parents. A submission
 answered 502, 503 or 504, as a proxy in front of the coordinator answers
 while it restarts, is retried, and an event stream that breaks is
 reattached; either is given up on once the coordinator stays unavailable for
-about two and a half minutes (retries back off to 8 seconds apart). When the build stops following
+about two and a half minutes (retries back off to 8 seconds apart). A
+reattached stream that breaks again before any action changes state counts
+as unavailable too, since it only repeats what the build already knows. When the build stops following
 a batch that may still run (the stream was given up on, or the coordinator
 won't stream it), it cancels the batch before building locally; one
 interrupted (SIGINT or SIGTERM) while it follows a batch cancels it too. With

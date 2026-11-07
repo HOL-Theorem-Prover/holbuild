@@ -61,6 +61,8 @@ class Settings(BaseSettings):
     hint_ttl_days: int = 30
     sweep_seconds: float = 5.0
     events_poll_seconds: float = 1.0
+    # An event stream with nothing to send this long sends a blank line, shorter than proxies' idle timeouts.
+    events_keepalive_seconds: float = 15.0
     # Database connections the coordinator holds at most, and how long a request waits for one before it fails.
     database_pool_size: int = 20
     database_pool_timeout_s: float = 10.0
