@@ -100,6 +100,14 @@ holbuild's memory admission in that directory would start one more child
 there, so an action a busy host couldn't start yet stays at the coordinator
 for a worker on another host.
 
+Each claim and heartbeat also reports the worker's host: its id (the kernel's
+`boot_id`, the same in every container on the host), the share of CPU time
+idle since the worker's last report (iowait counts as busy), its memory as
+holbuild's admission sees it, whether that admission would hold a child back
+now, and how often and how long the worker waited for memory before claiming
+since its last report. `GET /v1/queue` lists them, so a reader can tell
+whether hosts have CPU to spare or are short of memory.
+
 ## Batches and actions
 
 A batch is the text `holbuild action-spec --upload` prints:
@@ -311,20 +319,34 @@ gets 401. Errors are JSON `{"detail": "<message>"}`.
 
 `GET /v1/queue`
 
-- 200 `{"waiting": 0, "ready_standard": 0, "ready_high": 0, "running_standard": 0, "running_high": 0, "desired_burst_workers": 0}`:
-  the unfinished actions of running batches, and the burst worker target
+- 200 `{"waiting": 0, "ready_standard": 0, "ready_high": 0, "running_standard": 0, "running_high": 0, "desired_burst_workers": 0, "hosts": [<host>, …]}`:
+  the unfinished actions of running batches, the burst worker target, and the
+  hosts whose workers reported to this coordinator process in the last 2
+  minutes, by id. A host is its workers' latest report, `age_s` seconds old,
+  except that `cpu_idle_pct` is the latest one measured, and `memory_waits`
+  and `memory_wait_s` add up every report this process took from the host:
+  ```json
+  {"id": "<boot_id>", "cpu_idle_pct": 31.5, "mem_total": 133680000000, "mem_available": 61200000000, "budget": 120800000000, "reserved": 92300000000, "leases": 29, "memory_short": false, "memory_waits": 0, "memory_wait_s": 0.0, "age_s": 1.2}
+  ```
+  Memory is in bytes: `MemTotal` and `MemAvailable`, the `--cooperate-dir`
+  budget, the charges of the leases held there and their number;
+  `memory_short` is true when admission would hold back a child of the
+  worker's `--max-heap` now.
 
 ### Worker
 
-`POST /v1/work/claim` with `{"tier": "standard|high", "also_claim": ["standard|high", …], "worker": "<name>", "wait_s": 20}`
-(`also_claim` and `wait_s` are optional; `wait_s` is how long the coordinator
+`POST /v1/work/claim` with `{"tier": "standard|high", "also_claim": ["standard|high", …], "worker": "<name>", "wait_s": 20, "host": <report>}`
+(`also_claim`, `wait_s` and `host` are optional; `wait_s` is how long the coordinator
 holds the request open for an action to become ready, 0 by default and at
-most 50, so that a proxy's usual 60 s idle timeout doesn't cut it)
+most 50, so that a proxy's usual 60 s idle timeout doesn't cut it; `host` is
+the worker's report of its host, a host of `GET /v1/queue` without `age_s`,
+with `cpu_idle_pct` null when the worker last reported under a second ago,
+and the memory waits since its last report)
 
 - 200 `{"attempt_token": "<uuid>", "spec_sha256": "<sha256>", "input_key": "<sha256>", "theory": "<package>:<theory>", "lease_s": 120}`
 - 204 when nothing became ready for the tier within `wait_s`
 
-`POST /v1/work/<attempt_token>/heartbeat`, no body
+`POST /v1/work/<attempt_token>/heartbeat`, with no body or `{"host": <report>}`
 
 - 200 `{"lease_s": 120}`: the lease now runs `lease_s` seconds from now
 - 409 when the lease expired or was revoked (the batch was cancelled or
