@@ -55,9 +55,9 @@ Replay eligibility requires exact metadata match. Invalid selected checkpoints a
 
 Runs theorem proofs through proof steps without saving `.save`/`.ok` files. No `deps_loaded`, theorem-context, end-of-proof, or failed-prefix checkpoints are created.
 
-## `--target-checkpoints-only`
+## Target-only theorem checkpoints and `--all-checkpoints`
 
-Saves theorem-context, end-of-proof, declaration and failed-prefix checkpoints only in the requested targets (the default targets when none are given). Every root-package theory still saves its `deps_loaded` checkpoint and runs with proof steps and step timeouts; non-targets just get no new theorem checkpoints to resume an edit from. Theory outputs and keys don't change. Under `--remote-exec`, a non-target's action spec says `option theorem-checkpoints=false` and the worker skips them too; specs without the flag are unchanged.
+By default, theorem-context, end-of-proof, declaration and failed-prefix checkpoints are saved only in the requested targets (the default targets when none are given, or every root-package theory when there are none). Every root-package theory still saves its `deps_loaded` checkpoint and runs with proof steps and step timeouts. An edit to a non-target starts from `deps_loaded`; building it as a target saves its theorem checkpoints. `--all-checkpoints` saves them in every root-package theory. Theory outputs and keys don't change either way. Under `--remote-exec`, a non-target's action spec says `option theorem-checkpoints=false` and the worker skips them too.
 
 ## `--skip-proof-steps`
 

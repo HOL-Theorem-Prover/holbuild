@@ -3929,8 +3929,8 @@ fun assoc_timeout _ [] = NONE
 fun effective_tactic_timeout proof_steps node_timeout =
   if proof_steps then node_timeout else NONE
 
-(* Whether --target-checkpoints-only, if given, leaves NODE its theorem
-   checkpoints. *)
+(* Whether NODE saves theorem checkpoints: it is a requested target, or the
+   build saves them everywhere (--all-checkpoints). *)
 fun checkpoint_target_node ({checkpoint_targets, ...} : build_options) node =
   case checkpoint_targets of
       NONE => true
@@ -5722,8 +5722,8 @@ fun theory_load_spec_line token (LoadTheory name) = "load theory " ^ token name
 fun bool_option name value = "option " ^ name ^ "=" ^ bool_text value
 
 (* The spec text and the files a worker fetches by content hash for it. *)
-(* A worker saves theorem checkpoints unless the spec says otherwise, so the
-   specs of builds without --target-checkpoints-only are unchanged. *)
+(* A worker saves theorem checkpoints unless the spec says otherwise: a
+   spec without the line, as older clients write, means true. *)
 fun action_spec_text {root, plan, keys, action_toolchain_key, runtime, toolchain_line} policy
                      theorem_checkpoints (action : theory_action) node action_text =
   let

@@ -95,8 +95,9 @@ fun build_help () = print
   \  --allow-cache-timeout-discrepancy\n\
   \  --no-stat-cache\n\
   \  --skip-checkpoints\n\
-  \  --target-checkpoints-only\n\
-  \      Save theorem checkpoints only in the requested targets.\n\
+  \  --all-checkpoints\n\
+  \      Save theorem checkpoints in every root-package theory, not only in\n\
+  \      the requested targets.\n\
   \  --skip-proof-steps\n\
   \  --tactic-timeout SECONDS\n\
   \  --trace-steps\n\
@@ -351,15 +352,15 @@ fun split_flags args =
       extract_flag "--emit-output-hashes" args
     val (allow_cache_timeout_discrepancy, args_without_allow_discrepancy) =
       extract_flag "--allow-cache-timeout-discrepancy" args_without_emit_output_hashes
-    val (target_checkpoints_only, build_args) =
-      extract_flag "--target-checkpoints-only" args_without_allow_discrepancy
+    val (all_checkpoints, build_args) =
+      extract_flag "--all-checkpoints" args_without_allow_discrepancy
     fun loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable rest =
       case rest of
           [] => ({dry_run = dry, watch = watch, force = force, use_cache = use_cache,
                   verify_cache = verify_cache,
                   no_stat_cache = no_stat_cache,
                   skip_checkpoints = skip_checkpoints,
-                  target_checkpoints_only = target_checkpoints_only,
+                  all_checkpoints = all_checkpoints,
                   proof_steps = proof_steps, new_ir = new_ir,
                   tactic_timeout = tactic_timeout,
                   tactic_timeout_set = tactic_timeout_set,
@@ -440,7 +441,7 @@ fun split_flags args =
 fun default_build_request targets =
   ({dry_run = false, watch = false, force = HolbuildBuildExec.ForceNone,
     use_cache = true, verify_cache = true, no_stat_cache = false,
-    skip_checkpoints = false, target_checkpoints_only = false, proof_steps = true, new_ir = true,
+    skip_checkpoints = false, all_checkpoints = false, proof_steps = true, new_ir = true,
     tactic_timeout = NONE, tactic_timeout_set = false, execution_plan = NONE,
     trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
     warn_unreachable = false, emit_output_hashes = false,
@@ -453,7 +454,7 @@ fun default_build_request targets =
 fun plain_build_request targets =
   ({dry_run = false, watch = false, force = HolbuildBuildExec.ForceNone,
     use_cache = true, verify_cache = true, no_stat_cache = false,
-    skip_checkpoints = true, target_checkpoints_only = false, proof_steps = false, new_ir = false,
+    skip_checkpoints = true, all_checkpoints = false, proof_steps = false, new_ir = false,
     tactic_timeout = NONE, tactic_timeout_set = false, execution_plan = NONE,
     trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
     warn_unreachable = false, emit_output_hashes = false,
@@ -1031,7 +1032,7 @@ datatype build_mode =
   | ExportActionSpecs of {upload : bool}
   | RemoteExec of {url : string, remote_only : bool, detach : bool, attach : string option}
 
-fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, target_checkpoints_only, proof_steps, new_ir, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy}, targets) =
+fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, all_checkpoints, proof_steps, new_ir, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy}, targets) =
   let
     val project =
       case prepared of
@@ -1080,9 +1081,9 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       case #build_tactic_timeout project of
           NONE => SOME 2.5
         | SOME timeout => timeout
-    (* With --target-checkpoints-only, the theories that save theorem
-       checkpoints. *)
-    fun checkpoint_targets targets = if target_checkpoints_only then SOME targets else NONE
+    (* The theories that save theorem checkpoints: the requested targets,
+       or with --all-checkpoints every root-package theory. *)
+    fun checkpoint_targets targets = if all_checkpoints then NONE else SOME targets
     fun build_options_for index entry_plan plan force_targets checkpoint_targets =
       {use_cache = use_cache,
        verify_cache = verify_cache,

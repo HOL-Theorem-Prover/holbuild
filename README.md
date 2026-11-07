@@ -851,7 +851,7 @@ holbuild build --trace-steps --force MyTheory
 holbuild build --repl-on-failure MyTheory
 holbuild build --skip-proof-steps MyTheory
 holbuild build --skip-checkpoints MyTheory
-holbuild build --target-checkpoints-only MyTheory
+holbuild build --all-checkpoints MyTheory
 ```
 
 - `execution-plan THEORY:NAME` prints the proof-step plan for one theorem or
@@ -865,13 +865,15 @@ holbuild build --target-checkpoints-only MyTheory
   theory failure. It serialises the build and is not supported with `--json`.
 - `--skip-proof-steps` opts out of proof-step execution.
 - `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation.
-- `--target-checkpoints-only` saves theorem checkpoints only in the requested
-  targets (the default targets when none are given). Other root-package theories
-  still save their `deps_loaded` checkpoint and run with proof steps and step
-  timeouts, so a cold build writes far fewer `.save` files, but those theories
-  get no new theorem checkpoints to resume an edit from. Theory outputs and
-  cache keys are the same as without it. Under `--remote-exec`, the action specs
-  carry it to the workers.
+- `--all-checkpoints` saves theorem checkpoints in every root-package theory
+  the build runs. By default only the requested targets save them (the default
+  targets when none are given, or every root-package theory when there are
+  none); the other theories still save their `deps_loaded` checkpoint and run
+  with proof steps and step timeouts, so a cold build writes far fewer `.save`
+  files. An edit to such a theory starts from its `deps_loaded` checkpoint, and
+  building it as a target saves its theorem checkpoints. Theory outputs and
+  cache keys are the same either way. Under `--remote-exec`, the action specs
+  carry the choice to the workers.
 
 For source-executed theory builds, holbuild writes a live child log at
 `.holbuild/logs/current/<package>/<logical>/build.log`. You can inspect it during
@@ -1130,7 +1132,7 @@ output extra <declaration>
 option proof-steps=<bool>
 option tactic-timeout=<seconds|none>
 option new-ir=<bool>
-option theorem-checkpoints=false   (only under --target-checkpoints-only)
+option theorem-checkpoints=false   (only for a theory that saves none)
 action-text
 <the action text, verbatim to the end of the blob>
 ```
