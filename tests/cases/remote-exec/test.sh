@@ -35,11 +35,14 @@ cat > "$tmpdir/run-batch" <<SH
 set -eu
 [[ ! -e "$state/fail" ]] || exit 1
 cd "$tmpdir/worker-cwd"
+share=
+[[ ! -e "$state/share-heaps" ]] || share=--share-heaps
 awk '\$1 == "action" { print \$4, \$5 }' "\$1" | while read -r spec theory; do
   echo "\$theory" >> "$state/ran"
   HOLBUILD_CACHE="$tmpdir/worker-cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" \
-    exec-action "\$spec" --cache-limit-gb 1000 --result "$tmpdir/worker.result" \
+    exec-action "\$spec" --cache-limit-gb 1000 --result "$tmpdir/worker.result" \$share \
     >> "$tmpdir/worker.log" 2>&1
+  echo "\$theory \$(grep '^status=' "$tmpdir/worker.result")" >> "$state/results"
 done
 SH
 chmod +x "$tmpdir/run-batch"
@@ -494,3 +497,94 @@ run cancelled 0 build --remote-exec "$coordinator" BTheory
 require_grep "batch b[0-9]* cancelled; remote workers finished 0 of 2 theories; building locally" "$tmpdir/cancelled.log"
 require_grep "BTheory built" "$tmpdir/cancelled.log"
 rm "$state/cancelled"
+
+# Early cutoff on the workers.  A <- B <- C, built with shared heaps: a
+# proof-only edit of A rebuilds A and reuses the earlier builds of B and C,
+# whose dependencies' outputs are unchanged; an edit that changes A's
+# outputs rebuilds them; and an edited B, on unchanged dependency outputs,
+# resumes from the deps heap its last build shared.
+project=$tmpdir/cutoff
+mkdir -p "$project/src"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxc"
+
+[build]
+members = ["src"]
+TOML
+# write_cutoff A-STAMP B-STAMP [A-EXTRA]
+write_cutoff() {
+  cat > "$project/src/AScript.sml" <<SML
+Theory A
+Ancestors bool
+
+Theorem a_thm:
+  T
+Proof
+  simp[] (* $1 *)
+QED
+${3:-}
+SML
+  cat > "$project/src/BScript.sml" <<SML
+Theory B
+Ancestors A
+
+Theorem b_thm:
+  T
+Proof
+  ACCEPT_TAC a_thm (* $2 *)
+QED
+SML
+  cat > "$project/src/CScript.sml" <<SML
+Theory C
+Ancestors B
+
+Theorem c_thm:
+  T
+Proof
+  ACCEPT_TAC b_thm
+QED
+SML
+}
+# results STATUS...: the workers' statuses for A, B and C in this batch.
+results() {
+  local want="rxc:ATheory status=$1
+rxc:BTheory status=$2
+rxc:CTheory status=$3"
+  [[ "$(< "$state/results")" == "$want" ]] ||
+    { echo "worker results:" >&2; cat "$state/results" "$tmpdir/worker.log" >&2; exit 1; }
+  : > "$state/results"
+  : > "$tmpdir/worker.log"
+}
+touch "$state/share-heaps"
+: > "$state/results"
+: > "$tmpdir/worker.log"
+
+write_cutoff one one
+run cutoff-v1 0 build --remote-exec "$coordinator" CTheory
+results built built built
+
+write_cutoff two one
+run cutoff-proof 0 build --remote-exec "$coordinator" CTheory
+require_grep "remote workers finished 3 of 3 theories" "$tmpdir/cutoff-proof.log"
+refute_grep "Theory built" "$tmpdir/cutoff-proof.log"
+require_grep "early cutoff: rxc:BTheory reuses" "$tmpdir/worker.log"
+require_grep "early cutoff: rxc:CTheory reuses" "$tmpdir/worker.log"
+results built cached cached
+
+a2=$'Theorem a2_thm:\n  T\nProof\n  simp[]\nQED'
+write_cutoff three one "$a2"
+run cutoff-output 0 build --remote-exec "$coordinator" CTheory
+refute_grep "early cutoff" "$tmpdir/worker.log"
+results built built built
+
+write_cutoff four four "$a2"
+run cutoff-dependent 0 build --remote-exec "$coordinator" CTheory
+require_grep "BTheory restored from cache" "$tmpdir/cutoff-dependent.log"
+refute_grep "Theory built" "$tmpdir/cutoff-dependent.log"
+grep -A1 "^resuming BTheory$" "$tmpdir/worker.log" | grep -q "from: deps-loaded checkpoint" ||
+  { echo "B did not resume from the shared deps heap" >&2; cat "$tmpdir/worker.log" >&2; exit 1; }
+require_grep "early cutoff: rxc:CTheory reuses" "$tmpdir/worker.log"
+results built built cached
+rm "$state/share-heaps"
