@@ -107,13 +107,20 @@ fun publish_blob_or_raise (destination : destination) hash path =
 
 val no_space = "No space left on device"
 
-(* Whether the filesystem holding dir can't take a small write. *)
+(* Built once, into the executable's heap: the probe runs after a failed
+   copy, and allocating its 1 MB there in one piece takes Poly/ML 5.9.2's
+   large-object path, which can run a small heap out of store. *)
+val probe_chunk = Word8Vector.tabulate (65536, fn _ => 0w0)
+
+(* Whether the filesystem holding dir can't take a small write (1 MB). *)
 fun out_of_space dir =
   let val probe = Path.concat(dir, ".holbuild-space-probe")
   in
     (let val out = BinIO.openOut probe
      in
-       (BinIO.output (out, Word8Vector.tabulate (1048576, fn _ => 0w0)); BinIO.closeOut out)
+       (let fun write 0 = () | write n = (BinIO.output (out, probe_chunk); write (n - 1))
+        in write 16 end;
+        BinIO.closeOut out)
        handle e => (BinIO.closeOut out handle _ => (); raise e)
      end;
      remove_file probe;
