@@ -180,9 +180,10 @@ fun check_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] check THEORY[:THEOREM]\n\
   \  holbuild [GLOBAL OPTIONS] check --fingerprint THEORY\n\n\
-  \Build THEORY if needed, load it in HOL and check the tags of its stored\n\
+  \Build THEORY if needed, load it in HOL and check the tags and hypotheses of its stored\n\
   \theorems, or of THEOREM alone. Prints one line per theorem that depends on an\n\
-  \oracle other than DISK_THM (cheat, for instance), per axiom declared in\n\
+  \oracle other than DISK_THM (cheat, for instance), per theorem with\n\
+  \undischarged hypotheses, per axiom declared in\n\
   \THEORY or its ancestors outside HOL itself, and per use of a kernel-bypass\n\
   \call (Thm.disk_thm, RunCall, ...) in the sources THEORY is built from outside\n\
   \HOL, and exits non-zero if there are any. Otherwise prints a clean line and\n\
