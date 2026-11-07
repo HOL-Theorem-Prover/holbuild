@@ -542,8 +542,8 @@ input key is effectively the hash of its own source content plus the DAG heads
 (input keys) of its resolved dependencies, along with toolchain/config facts.
 Therefore any source byte change — including proof edits or comments — changes
 that action's input key and changes the input keys of dependents. Every key in
-a plan is known before anything runs, and a cache entry never depends on
-semantic equivalence of generated theory outputs.
+a plan is known before anything runs, and no cache key depends on semantic
+equivalence of generated theory outputs.
 
 Locally, a key miss isn't always a rebuild (early cutoff). With each theory's
 metadata, holbuild records two more hashes:

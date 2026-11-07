@@ -4329,12 +4329,17 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
        write_metadata (#emit_output_hashes options) policy (tactic_timeout policy) project plan keys input_key toolchain_key node metadata_checkpoints;
        HolbuildStatus.Built)
       handle ExecutionPlanPrinted => (remove_tree stage; HolbuildStatus.Inspected)
+    (* The metadata goes before the outputs are replaced, so outputs of an
+       interrupted restore or build are never taken for those of the last one
+       (by the up-to-date check or early cutoff).  Printing the execution plan
+       replaces nothing. *)
     fun restore_or_build () =
-      if not cache_restore_allowed then build_from_source ()
-      else
-        case materialize_valid_cache () of
-            CacheRestored built_timeout => restore_from_cache built_timeout
-          | CacheMiss => build_from_source ()
+      (if execution_plan_only policy then () else remove_file (metadata_path project node);
+       if not cache_restore_allowed then build_from_source ()
+       else
+         case materialize_valid_cache () of
+             CacheRestored built_timeout => restore_from_cache built_timeout
+           | CacheMiss => build_from_source ())
     (* Early cutoff: on an input-key miss, the outputs on disk are still the
        ones a build would produce when the theory's own inputs and everything
        its dependencies produced are as they were at its last build.  Returns
