@@ -69,7 +69,7 @@ theory actions also produce `.tr.gz` Poly/ML exports.
 
 **Any source byte change** (including comments/proof edits) changes the action key, and the keys of all dependents. Cache keys never depend on generated outputs. Still, a dependent whose key changed is not rebuilt when its own inputs and its dependencies' outputs are unchanged (early cutoff, below), locally or on remote workers.
 
-Proof engine/checkpoint/timeout/trace flags are intentionally not final artifact action-key inputs. Switching `--skip-checkpoints`, `--skip-proof-steps`, or root tactic timeout should not rebuild an otherwise up-to-date semantic artifact.
+Proof engine/checkpoint/timeout/trace flags are intentionally not final artifact action-key inputs. Switching `--skip-checkpoints`, `--all-checkpoints`, `--skip-proof-steps`, or root tactic timeout should not rebuild an otherwise up-to-date semantic artifact.
 
 `extra_deps` are filesystem dependencies outside the normal HOL dependency graph. Manifest entries are package-root-relative; source annotations of the form `holbuild_extra_deps ["../data/table.txt"]` are source-file-relative. Entries may name files, directories, or simple globs. Expanded contents are hashed into the action key, and source-declared entries are staged so matching relative filesystem reads work during the action.
 

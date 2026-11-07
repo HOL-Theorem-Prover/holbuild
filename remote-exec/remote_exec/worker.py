@@ -29,7 +29,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 DEFAULT_SOURCE_URL = "https://github.com/HOL-Theorem-Prover/holbuild/archive/refs/tags/v{version}.tar.gz"
@@ -47,6 +47,9 @@ PROXY_ENV = ("http_proxy", "https_proxy", "all_proxy", "no_proxy")  # in either 
 DEFAULT_CHARGE_MIB = 3072
 STARTUP_SECONDS = 30
 MEMORY_POLL_SECONDS = 2  # between two looks at the host's memory while waiting to claim
+BOOT_ID = "/proc/sys/kernel/random/boot_id"  # one per host and boot, the same in every container on the host
+PROC_STAT = "/proc/stat"
+CPU_SAMPLE_SECONDS = 1.0  # least time a worker measures the host's idle CPU over
 MIB = 2**20
 GIB = 1024 * MIB
 
@@ -69,13 +72,14 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class Coordinator:
-    """The worker endpoints of the coordinator."""
+    """The worker endpoints of the coordinator. Claims and heartbeats carry ``host``'s report, when given."""
 
     opener = urllib.request.build_opener(NoRedirect)
 
-    def __init__(self, url: str, token: str) -> None:
+    def __init__(self, url: str, token: str, host: "HostTelemetry | None" = None) -> None:
         self.url = url.rstrip("/")
         self.token = token
+        self.host = host
 
     def post(self, path: str, body: bytes, content_type: str, timeout: float = 30) -> tuple[int, Any]:
         request = urllib.request.Request(
@@ -91,10 +95,16 @@ class Coordinator:
         except urllib.error.HTTPError as error:
             return error.code, error.read().decode(errors="replace")
 
+    def post_reporting(self, path: str, body: dict[str, Any], timeout: float = 30) -> tuple[int, Any]:
+        """``post`` a JSON body with the host's report in it, or none when there is none."""
+        report = None if self.host is None else self.host.report()
+        host = None if report is None else asdict(report)
+        return self.post(path, json.dumps({**body, "host": host}).encode(), "application/json", timeout)
+
     def claim(self, tiers: list[str], worker: str, wait_s: float) -> dict[str, Any] | None:
         """An action, waiting up to ``wait_s`` seconds for one, or None."""
         body = {"tier": tiers[0], "also_claim": tiers[1:], "worker": worker, "wait_s": wait_s}
-        status, response = self.post("/v1/work/claim", json.dumps(body).encode(), "application/json", 30 + wait_s)
+        status, response = self.post_reporting("/v1/work/claim", body, 30 + wait_s)
         if status == 204:
             return None
         if status != 200:
@@ -102,7 +112,7 @@ class Coordinator:
         return response
 
     def heartbeat(self, token: str) -> bool:
-        status, body = self.post(f"/v1/work/{token}/heartbeat", b"", "application/json")
+        status, body = self.post_reporting(f"/v1/work/{token}/heartbeat", {})
         if status not in (200, 409):
             raise RuntimeError(f"heartbeat answered {status}: {body}")
         return status == 200
@@ -243,16 +253,19 @@ def reserve(total: int) -> int:
 @dataclass(frozen=True)
 class HostMemory:
     """What holbuild's ``--cooperate-dir`` admission reads, in bytes: ``/proc/meminfo``, the dir's budget, and the
-    charges of the leases held in it, all and those whose child is still starting."""
+    charges of the leases held in it, all and those whose child is still starting, and how many leases are held.
+    With no dir, only ``/proc/meminfo``."""
 
     total: int | None
     available: int | None
     budget: int | None
     reserved: int
     starting: int
+    leases: int
 
     @classmethod
-    def read(cls, directory: str) -> "HostMemory":
+    def read(cls, directory: str | None, *, wait: bool = True) -> "HostMemory":
+        """Read it now. Without ``wait``, raises BlockingIOError if a holbuild admission holds the dir's lock."""
         meminfo: dict[str, int] = {}
         with open(os.environ.get("HOLBUILD_TEST_MEMINFO", "/proc/meminfo")) as file:
             for line in file:
@@ -261,11 +274,13 @@ class HostMemory:
                     meminfo[match[1]] = int(match[2]) * 1024
         total = meminfo.get("MemTotal")
         budget = None if total is None else total - reserve(total)
-        reserved = starting = 0
+        reserved = starting = leases = 0
+        if directory is None:
+            return cls(total, meminfo.get("MemAvailable"), budget, reserved, starting, leases)
         # Lease files are probed under DIR/lock, as holbuild scans them: a probe's flock on a lease another
         # process has just created, before it locks it, would make that process's admission fail.
         with contextlib.suppress(FileNotFoundError), open(os.path.join(directory, "lock")) as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            fcntl.flock(lock, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
             with contextlib.suppress(FileNotFoundError), open(os.path.join(directory, "budget")) as file:
                 budget = int(file.read())
             for name in os.listdir(directory):
@@ -279,9 +294,10 @@ class HostMemory:
                         pass
                     charge = int(lease.read())
                     reserved += charge
+                    leases += 1
                     if time.time() - os.fstat(lease.fileno()).st_mtime < STARTUP_SECONDS:
                         starting += charge
-        return cls(total, meminfo.get("MemAvailable"), budget, reserved, starting)
+        return cls(total, meminfo.get("MemAvailable"), budget, reserved, starting, leases)
 
     def shortfall(self, charge: int) -> str | None:
         """Why holbuild's admission (``acquire`` and ``live_shortfall`` in sml/machine_memory.sml) would hold back a
@@ -308,16 +324,90 @@ def child_charge(max_heap: int | None) -> int:
     return min(max_heap or DEFAULT_CHARGE_MIB, DEFAULT_CHARGE_MIB) * MIB
 
 
-def wait_for_memory(directory: str, charge: int) -> None:
+def wait_for_memory(directory: str, charge: int) -> bool:
     """Return once holbuild's admission in ``directory`` would start a child charged ``charge`` bytes, so that a
     worker on a host whose memory is taken doesn't claim an action only to wait on it while other hosts could run it.
-    A check, not a reservation: workers racing past it still wait in exec-action's own admission."""
+    A check, not a reservation: workers racing past it still wait in exec-action's own admission.
+
+    Returns whether it waited."""
     logged = False
     while (why := HostMemory.read(directory).shortfall(charge)) is not None:
         if not logged:
             print(f"waiting for memory before claiming: {why}", file=sys.stderr, flush=True)
             logged = True
         time.sleep(MEMORY_POLL_SECONDS)
+    return logged
+
+
+def cpu_times(stat_line: str) -> tuple[int, int]:
+    """Idle and total time of all CPUs from the first line of /proc/stat. iowait isn't idle: a host whose cores
+    wait on its disks has no room for more workers. guest and guest_nice are already counted in user and nice."""
+    name, *fields = stat_line.split()
+    if name != "cpu" or len(fields) < 8:
+        raise ValueError(f"expected the cpu line of /proc/stat, got {stat_line!r}")
+    times = [int(f) for f in fields[:8]]
+    return times[3], sum(times)
+
+
+@dataclass(frozen=True)
+class HostReport:
+    """A worker's report of its host to the coordinator; memory in bytes as in HostMemory, and ``memory_short`` when
+    admission would hold a child back now or held this worker back since its last report."""
+
+    id: str
+    cpu_idle_pct: float | None  # since the CPU sample it was last measured from, None under CPU_SAMPLE_SECONDS ago
+    mem_total: int | None
+    mem_available: int | None
+    budget: int | None
+    reserved: int
+    leases: int
+    memory_short: bool
+
+
+class HostTelemetry:
+    """What a worker reports of its host with each claim and heartbeat, which come from two threads."""
+
+    def __init__(self, cooperate_dir: str | None, charge: int) -> None:
+        with open(BOOT_ID) as file:
+            self.id = file.read().strip()
+        self.cooperate_dir = cooperate_dir
+        self.charge = charge
+        self.lock = threading.Lock()
+        self.cpu: tuple[float, int, int] | None = None  # when, idle and total of the CPU sample measured from
+        self.waited = False  # whether wait_for_memory held the worker back since the last report
+
+    def report(self) -> HostReport | None:
+        """The host now, or None when it can't be read now. It doesn't wait for the cooperate dir's lock, which
+        would hold up the heartbeat that renews a running action's lease: while an admission holds it, there is no
+        report."""
+        try:
+            memory = HostMemory.read(self.cooperate_dir, wait=False)
+            with open(PROC_STAT) as file:
+                idle, total = cpu_times(file.readline())
+        except (OSError, ValueError) as error:
+            if not isinstance(error, BlockingIOError):
+                print(f"reading the host for the coordinator failed: {error}", file=sys.stderr)
+            return None
+        now = time.monotonic()
+        with self.lock:
+            waited, self.waited = self.waited, False
+            idle_pct = None
+            if self.cpu is None or now - self.cpu[0] >= CPU_SAMPLE_SECONDS:
+                # The kernel's iowait count can go backwards (Documentation/filesystems/proc.rst), so a share
+                # outside 0-100 is no measurement.
+                if self.cpu is not None and total > self.cpu[2] and 0 <= idle - self.cpu[1] <= total - self.cpu[2]:
+                    idle_pct = round(100 * (idle - self.cpu[1]) / (total - self.cpu[2]), 1)
+                self.cpu = (now, idle, total)
+        return HostReport(
+            self.id,
+            idle_pct,
+            memory.total,
+            memory.available,
+            memory.budget,
+            memory.reserved,
+            memory.leases,
+            memory.shortfall(self.charge) is not None or waited,
+        )
 
 
 def failed_record(spec_sha256: str, failure: str) -> str:
@@ -493,7 +583,13 @@ def main() -> None:
     # exec-action's --cache-limit-gb sweeps the whole cache root, so it must be the worker's own.
     if not os.environ.get("HOLBUILD_CACHE"):
         sys.exit("HOLBUILD_CACHE is not set; give the worker its own cache root")
-    coordinator = Coordinator(args.coordinator, token)
+    charge = child_charge(args.max_heap)
+    try:
+        host: HostTelemetry | None = HostTelemetry(args.cooperate_dir, charge)
+    except OSError as error:
+        print(f"not reporting the host to the coordinator: {error}", file=sys.stderr)
+        host = None
+    coordinator = Coordinator(args.coordinator, token, host)
     releases = Releases(
         args.holbuild_releases_dir,
         args.holbuild_source_url,
@@ -504,10 +600,9 @@ def main() -> None:
     tiers = list(dict.fromkeys([args.tier, *args.also_claim]))
     # Exit through Python on SIGTERM, so run_one's cleanup stops the running action.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
-    charge = child_charge(args.max_heap)
     while True:
-        if args.cooperate_dir is not None:
-            wait_for_memory(args.cooperate_dir, charge)
+        if args.cooperate_dir is not None and wait_for_memory(args.cooperate_dir, charge) and host is not None:
+            host.waited = True
         started = time.monotonic()
         try:
             claim = coordinator.claim(tiers, args.name, args.claim_wait_seconds)

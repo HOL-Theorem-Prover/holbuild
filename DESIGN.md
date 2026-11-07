@@ -925,6 +925,10 @@ opts out of theorem instrumentation: with checkpoints still enabled, the build c
 still save and consult `deps_loaded`, but there are no
 theorem-context/end-of-proof/failed-prefix proof-navigation checkpoints and no
 tactic timeout enforcement for that build.
+Theorem, declaration and failed-prefix checkpoints are saved only in the
+requested targets (with none given, the default targets, or every root-package
+theory when there are none); every theory keeps `deps_loaded` and proof steps.
+`--all-checkpoints` saves them in every root-package theory.
 `holbuild run --from THEORY` and `repl --from THEORY` start interactive sessions
 from THEORY's `deps_loaded` while it is current, and load THEORY on top when its
 metadata matches its current input key. `run` takes no project lock, so `--from`
@@ -1018,7 +1022,7 @@ debugging mode that retains durable failure logs and reports them as
 `debug_artifacts.log`, without retaining internal stage directories. Proof engine, checkpoint creation, tactic timeout, planning, and tracing are execution/debug policy,
 not final artifact semantics. They must not be included in the final theory
 action key or local metadata comparison for `.uo/.ui/.dat`: switching
-`--skip-proof-steps`, `--skip-checkpoints`, or root tactic timeout should not rebuild
+`--skip-proof-steps`, `--skip-checkpoints`, `--all-checkpoints`, or root tactic timeout should not rebuild
 an otherwise up-to-date semantic artifact when its recorded timeout contract
 satisfies the request. `--allow-cache-timeout-discrepancy` explicitly waives that
 completed-artifact check for both project metadata and every build-cache origin;

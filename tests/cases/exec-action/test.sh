@@ -131,7 +131,7 @@ expect() {
 spec_for() { awk -v want="$2" '$1 == "action" && $5 == want { print $4 }' "$1"; }
 key_for() { awk -v want="$2" '$1 == "action" && $5 == want { print $2 }' "$1"; }
 
-hb action-spec --upload CTheory > "$tmpdir/batch.txt"
+hb action-spec --upload --all-checkpoints CTheory > "$tmpdir/batch.txt"
 spec_a=$(spec_for "$tmpdir/batch.txt" worker:ATheory)
 spec_b=$(spec_for "$tmpdir/batch.txt" worker:BTheory)
 spec_c=$(spec_for "$tmpdir/batch.txt" worker:CTheory)
@@ -322,3 +322,44 @@ worker d "$spec_d"
 expect d 1 "status=failed" "failure=proof"
 worker e "$(spec_for "$tmpdir/batch-e.txt" worker:ETheory)"
 expect e 1 "status=failed" "failure=tactic-timeout"
+
+# Target-only theorem checkpoints reach the worker: a theory that isn't a
+# target keeps its deps heap but saves no theorem checkpoints. A target's
+# spec, and every spec under --all-checkpoints, doesn't mention them.
+cat > "$project/src/FScript.sml" <<'SML'
+Theory F
+
+Theorem f_thm:
+  T
+Proof
+  simp[]
+QED
+SML
+cat > "$project/src/GScript.sml" <<'SML'
+Theory G
+Ancestors F
+
+Theorem g_thm:
+  T
+Proof
+  ACCEPT_TAC f_thm
+QED
+SML
+hb action-spec --upload GTheory > "$tmpdir/batch-g.txt"
+spec_f=$(spec_for "$tmpdir/batch-g.txt" worker:FTheory)
+spec_g=$(spec_for "$tmpdir/batch-g.txt" worker:GTheory)
+require_grep '^option theorem-checkpoints=false$' "$project/.holbuild/action-specs/$spec_f"
+for spec in "$spec_g" "$spec_a" "$spec_d"; do
+  if grep -q 'theorem-checkpoints' "$project/.holbuild/action-specs/$spec"; then
+    echo "a target's or an --all-checkpoints spec names theorem-checkpoints" >&2
+    exit 1
+  fi
+done
+worker f "$spec_f"
+expect f 0 "spec=$spec_f" "status=built"
+find "$tmpdir/worker-f/checkpoints" -name 'deps_loaded.save' | grep -q . ||
+  { echo "the non-target worker kept no deps heap" >&2; exit 1; }
+if find "$tmpdir/worker-f/checkpoints" -path '*.theorems*' -type f | grep -q .; then
+  echo "the non-target worker saved theorem checkpoints" >&2
+  exit 1
+fi

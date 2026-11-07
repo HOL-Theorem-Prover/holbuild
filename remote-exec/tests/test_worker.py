@@ -18,10 +18,12 @@ from remote_exec import worker
 from remote_exec.worker import (
     Coordinator,
     HostMemory,
+    HostTelemetry,
     Protection,
     Releases,
     Unreleased,
     child_charge,
+    cpu_times,
     failed_record,
     parse_args,
     run_one,
@@ -69,6 +71,7 @@ class Server:
     completed: list[str] = field(default_factory=list)
     protection: list[dict[str, object]] = field(default_factory=list)
     claims: list[dict[str, object]] = field(default_factory=list)
+    heartbeats: list[dict[str, object]] = field(default_factory=list)
     unavailable: int = 0  # how many more completes answer 502, as a proxy does while the coordinator restarts
 
 
@@ -106,6 +109,8 @@ def server() -> Iterator[Server]:
                     state.unavailable -= 1
                     return self.reply(502)
                 state.completed.append(body)
+            if self.path.endswith("/heartbeat"):
+                state.heartbeats.append(json.loads(body))
             self.reply(200, json.dumps({"accepted": True}) if self.path.endswith("/complete") else '{"lease_s": 3}')
 
         def do_PUT(self) -> None:
@@ -371,7 +376,7 @@ def test_also_claim_accepts_repeats_and_commas(tmp_path: Path, server: Server) -
 
 def test_claim_asks_the_coordinator_to_wait(server: Server) -> None:
     assert Coordinator(server.url, "w").claim(["standard", "high"], "w", 20) is None
-    assert server.claims == [{"tier": "standard", "also_claim": ["high"], "worker": "w", "wait_s": 20}]
+    assert server.claims == [{"tier": "standard", "also_claim": ["high"], "worker": "w", "wait_s": 20, "host": None}]
 
 
 def test_claim_wait_is_at_most_50_seconds(tmp_path: Path, server: Server) -> None:
@@ -486,3 +491,118 @@ def test_worker_waits_for_memory_and_says_so_once(
 
     assert not waiter.is_alive()
     assert capsys.readouterr().err.count("waiting for memory before claiming") == 1
+
+
+def test_wait_for_memory_says_whether_it_waited(host: Host, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(worker, "MEMORY_POLL_SECONDS", 0.05)
+    assert not wait_for_memory(str(host.dir), 3 * GIB)
+    host.available(10 * GIB)
+    host.lease(3 * GIB)
+    threading.Timer(0.2, host.available, (20 * GIB,)).start()
+    assert wait_for_memory(str(host.dir), 3 * GIB)
+
+
+def test_iowait_is_not_idle_cpu_time() -> None:
+    # user nice system idle iowait irq softirq steal guest guest_nice
+    assert cpu_times("cpu  10 1 5 100 20 0 2 0 7 0") == (100, 138)
+    with pytest.raises(ValueError, match="cpu line"):
+        cpu_times("cpu0 1 2 3 4 5 6 7 8")
+
+
+@pytest.fixture
+def telemetry(host: Host, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[HostTelemetry, Path]]:
+    """A HostTelemetry over ``host``'s dir and a /proc/stat the test writes, with no least CPU sample time."""
+    (tmp_path / "boot_id").write_text("b0a7\n")
+    stat = tmp_path / "stat"
+    stat.write_text("cpu  0 0 0 0 0 0 0 0 0 0\n")
+    monkeypatch.setattr(worker, "BOOT_ID", str(tmp_path / "boot_id"))
+    monkeypatch.setattr(worker, "PROC_STAT", str(stat))
+    monkeypatch.setattr(worker, "CPU_SAMPLE_SECONDS", 0)
+    yield HostTelemetry(str(host.dir), 3 * GIB), stat
+
+
+def test_host_report_has_idle_cpu_since_the_last_report_and_admissions_view(
+    host: Host, telemetry: tuple[HostTelemetry, Path]
+) -> None:
+    reporter, stat = telemetry
+    host.lease(3 * GIB)
+    host.lease(3 * GIB)
+    first = reporter.report()
+    assert first is not None
+    assert (first.id, first.cpu_idle_pct, first.leases, first.reserved) == ("b0a7", None, 2, 6 * GIB)
+    assert (first.mem_total, first.mem_available, first.memory_short) == (64 * GIB, 40 * GIB, False)
+
+    stat.write_text("cpu  300 0 0 100 0 0 0 0 0 0\n")
+    assert (report := reporter.report()) is not None and report.cpu_idle_pct == 25.0
+    host.available(10 * GIB)
+    stat.write_text("cpu  350 0 0 400 50 0 0 0 0 0\n")
+    second = reporter.report()
+    assert second is not None
+    assert (second.cpu_idle_pct, second.memory_short) == (75.0, True)
+
+
+def test_cpu_is_measured_over_at_least_the_least_sample_time(
+    telemetry: tuple[HostTelemetry, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reporter, stat = telemetry
+    monkeypatch.setattr(worker, "CPU_SAMPLE_SECONDS", 3600)
+    reporter.report()
+    stat.write_text("cpu  300 0 0 100 0 0 0 0 0 0\n")
+    assert reporter.report().cpu_idle_pct is None
+    assert reporter.cpu is not None and reporter.cpu[2] == 0  # still measuring from the first sample
+
+
+def test_claims_and_heartbeats_carry_the_host_report(telemetry: tuple[HostTelemetry, Path], server: Server) -> None:
+    reporter, _ = telemetry
+    coordinator = Coordinator(server.url, "w", reporter)
+    assert coordinator.claim(["standard"], "w", 0) is None
+    assert coordinator.heartbeat("t")
+    claimed, beat = server.claims[0]["host"], server.heartbeats[0]["host"]
+    assert isinstance(claimed, dict) and isinstance(beat, dict)
+    assert (claimed["id"], claimed["mem_total"], beat["id"]) == ("b0a7", 64 * GIB, "b0a7")
+
+
+def test_cpu_counters_going_backwards_give_no_idle_share(telemetry: tuple[HostTelemetry, Path]) -> None:
+    reporter, stat = telemetry
+    stat.write_text("cpu  100 0 0 100 50 0 0 0 0 0\n")
+    reporter.report()
+    stat.write_text("cpu  100 0 0 200 40 0 0 0 0 0\n")  # iowait fell by 10 while idle rose by 100
+    assert reporter.report().cpu_idle_pct is None
+
+
+def test_no_report_while_an_admission_holds_the_lock_or_the_host_cannot_be_read(
+    host: Host, telemetry: tuple[HostTelemetry, Path], server: Server
+) -> None:
+    reporter, stat = telemetry
+    host.lease(3 * GIB)
+    coordinator = Coordinator(server.url, "w", reporter)
+    with open(host.dir / "lock") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        assert coordinator.heartbeat("t")
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        assert coordinator.heartbeat("t")
+    stat.write_text("intr 1\n")
+    assert coordinator.heartbeat("t")
+
+    reports = [beat["host"] for beat in server.heartbeats]
+    assert reports[0] is None and reports[2] is None
+    assert isinstance(reports[1], dict) and reports[1]["leases"] == 1
+
+
+def test_a_wait_for_memory_shows_as_memory_short_in_the_next_report(
+    host: Host, telemetry: tuple[HostTelemetry, Path]
+) -> None:
+    reporter, _ = telemetry
+    host.lease(3 * GIB)
+    reporter.waited = True
+    report = reporter.report()
+    assert report is not None and report.memory_short
+    report = reporter.report()
+    assert report is not None and not report.memory_short
+
+
+def test_a_worker_without_telemetry_sends_no_host(server: Server) -> None:
+    coordinator = Coordinator(server.url, "w")
+    assert coordinator.claim(["standard"], "w", 0) is None
+    assert coordinator.heartbeat("t")
+    assert server.claims[0]["host"] is None and server.heartbeats[0]["host"] is None

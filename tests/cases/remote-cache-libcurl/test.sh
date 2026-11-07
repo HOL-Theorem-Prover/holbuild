@@ -105,7 +105,12 @@ for table in ("/proc/net/tcp", "/proc/net/tcp6"):
             next(lines)
             inodes.update(line.split()[9] for line in lines)
 fd_dir = f"/proc/{sys.argv[1]}/fd"
-links = [os.readlink(os.path.join(fd_dir, fd)) for fd in os.listdir(fd_dir)]
+links = []
+for fd in os.listdir(fd_dir):
+    try:
+        links.append(os.readlink(os.path.join(fd_dir, fd)))
+    except FileNotFoundError:
+        pass  # closed since listed: the pool's reaper closes connections at any time
 print(sum(link.startswith("socket:[") and link[8:-1] in inodes for link in links))
 PY
 python3 "$tmpdir/server.py" "$tmpdir/port" "$tmpdir" &

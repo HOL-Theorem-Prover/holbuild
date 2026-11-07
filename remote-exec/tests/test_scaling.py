@@ -11,7 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from conftest import CLIENT_TOKEN, WORKER_TOKEN
 from remote_exec import app as app_module
-from remote_exec.coordinator import Coordinator, QueueCounts, Settings, burst_demand, is_auth_failure
+from remote_exec import coordinator as coordinator_module
+from remote_exec.coordinator import Coordinator, HostReport, QueueCounts, Settings, burst_demand, is_auth_failure
 from test_coordinator import claim, input_key, submit
 
 CLIENT = {"Authorization": f"Bearer {CLIENT_TOKEN}"}
@@ -107,6 +108,7 @@ async def test_queue_reports_counts_and_the_desired_burst_workers(
         "running_standard": 1,
         "running_high": 0,
         "desired_burst_workers": 0,  # the route's coordinator has no burst workers to ask for
+        "hosts": [],
     }
     assert (await scaled.queue()).desired_burst_workers == 1
     assert (await http.get("/v1/queue", headers=WORKER)).status_code == 401
@@ -251,3 +253,82 @@ def test_settings_errors_do_not_print_credentials(monkeypatch: pytest.MonkeyPatc
         Settings()  # pyright: ignore[reportCallIssue]
 
     assert "secret" not in str(error.value)
+
+
+def host_report(host_id: str, cpu_idle_pct: float | None) -> dict[str, Any]:
+    return {
+        "id": host_id,
+        "cpu_idle_pct": cpu_idle_pct,
+        "mem_total": 64 << 30,
+        "mem_available": 40 << 30,
+        "budget": 52 << 30,
+        "reserved": 6 << 30,
+        "leases": 2,
+        "memory_short": False,
+    }
+
+
+async def test_queue_lists_the_hosts_workers_reported(http: httpx.AsyncClient, coordinator: Coordinator) -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    coordinator.clock = lambda: now
+    await submit(http, ["a"])
+    response = await http.post(
+        "/v1/work/claim",
+        json={"tier": "standard", "worker": "w1", "host": host_report("h1", 30.0)},
+        headers=WORKER,
+    )
+    token = response.json()["attempt_token"]
+    now += timedelta(seconds=10)
+    heartbeat = {"host": host_report("h1", None)}
+    assert (await http.post(f"/v1/work/{token}/heartbeat", json=heartbeat, headers=WORKER)).status_code == 200
+    await http.post(
+        "/v1/work/claim",
+        json={"tier": "high", "worker": "w2", "host": host_report("h2", 80.0)},
+        headers=WORKER,
+    )
+    now += timedelta(seconds=5)
+
+    hosts = (await http.get("/v1/queue", headers=CLIENT)).json()["hosts"]
+    assert hosts == [
+        {**host_report("h1", 30.0), "age_s": 5.0},  # the last idle share measured
+        {**host_report("h2", 80.0), "age_s": 5.0},
+    ]
+
+    now += timedelta(seconds=120)
+    assert (await http.get("/v1/queue", headers=CLIENT)).json()["hosts"] == []
+    assert coordinator.hosts == {}
+
+
+async def test_a_heartbeat_with_no_body_still_extends_the_lease(http: httpx.AsyncClient) -> None:
+    await submit(http, ["a"])
+    claimed = await claim(http)
+    assert claimed is not None
+    response = await http.post(f"/v1/work/{claimed['attempt_token']}/heartbeat", headers=WORKER)
+    assert response.status_code == 200
+    assert (await http.get("/v1/queue", headers=CLIENT)).json()["hosts"] == []
+
+
+async def test_a_malformed_host_report_is_refused(http: httpx.AsyncClient) -> None:
+    for report in (
+        {**host_report("h1", 30.0), "leases": "many"},
+        host_report("h" * 65, 30.0),
+        {**host_report("h1", 30.0), "reserved": 2**53 + 1},
+        {**host_report("h1", 30.0), "leases": -1},
+        host_report("h1", 101.0),
+    ):
+        response = await http.post(
+            "/v1/work/claim", json={"tier": "standard", "worker": "w1", "host": report}, headers=WORKER
+        )
+        assert response.status_code == 422
+
+
+async def test_reports_from_more_hosts_than_it_remembers_are_dropped(
+    coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "MAX_HOSTS", 2)
+    for host_id in ("h1", "h2", "h3"):
+        coordinator.report_host(HostReport(**host_report(host_id, 50.0)))
+    coordinator.report_host(HostReport(**host_report("h1", 10.0)))
+
+    assert [host.report.cpu_idle_pct for host in (await coordinator.queue()).hosts] == [10.0, 50.0]
+    assert sorted(coordinator.hosts) == ["h1", "h2"]
