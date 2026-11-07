@@ -1462,12 +1462,16 @@ of date when the remote cache's entry changes. So before it checks for the
 theory's own entry, the worker replaces its copies that differ from the
 remote cache's entries with those: the copies of the theories the build
 loads directly or through project libraries, and, when a restored
-dependency doesn't match its parents, all of them. It does the same for the theory's own entry when that doesn't
-match the restored parents. A theory still built against local copies of
-its parents that differ from the remote cache's (an entry replaced during
-the build) is not published but fails as a `publish` failure, and the
-worker drops those copies for the action's retry. A missing dependency
-fails the action; the worker never builds one.
+dependency doesn't match its parents, all of them. It does the same for the
+theory's own entry when that doesn't match the restored parents. A theory
+still built against local copies of its parents that differ from the remote
+cache's (an entry replaced during the build) is not published but fails as a
+`publish` failure, and the worker drops those copies for the action's retry.
+A missing dependency fails the action; the worker never builds one. When the
+remote cache gives no answer, answers 429 or 5xx, or is in its 60-second
+cooldown after requests got no response, whatever the worker was fetching or
+publishing, the action fails as `unavailable` rather than reading that as a
+miss or a conflict: the cache failed, not the action.
 
 A run spec (`holbuild-run-spec-v1`, see "Exporting script runs for remote
 execution") is checked the same way, its run text against its `run-key`,
@@ -1522,7 +1526,7 @@ holbuild-action-result-v1
 spec=<sha256>
 input-key=<input_key>
 status=built|cached|failed
-failure=proof|tactic-timeout|script|timeout|memory|input-missing|publish|toolchain|disk|spec-rejected|internal
+failure=proof|tactic-timeout|script|timeout|memory|input-missing|publish|toolchain|disk|spec-rejected|internal|unavailable
 missing=theory <input_key> | blob <sha256>
 peak-rss-mb=<n>
 wall-ms=<n>
@@ -1541,7 +1545,7 @@ the run; `disk` means the disk filled. The exit status summarizes the record:
 | 0 | built or cached |
 | 1 | `proof`, `tactic-timeout`, `script` or `timeout`: final, retrying won't help |
 | 2 | `memory`: retry with more memory |
-| 3 | `input-missing`, `publish`, `toolchain`, `disk` or `internal`: retry or resubmit |
+| 3 | `input-missing`, `publish`, `toolchain`, `disk`, `internal` or `unavailable`: retry or resubmit |
 | 4 | `spec-rejected` |
 
 The required `--cache-limit-gb N` caps what the worker keeps between actions: its
