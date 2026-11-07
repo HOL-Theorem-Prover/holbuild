@@ -196,7 +196,7 @@ require_grep "^POST /v1/batches/nope/cancel " "$state/requests.log"
 refute_grep "reattach" "$tmpdir/unknown-only.log"
 run unknown 0 build --remote-exec "$coordinator" --attach nope BTheory
 require_grep "batch nope can't be followed (HTTP 404): .*, cancelled the batch; building locally" "$tmpdir/unknown.log"
-require_grep "^POST /v1/batches/nope/cancel " "$state/requests.log"
+[[ $(grep -c "^POST /v1/batches/nope/cancel " "$state/requests.log") -eq 2 ]] || { echo "wanted a cancel of batch nope from each of unknown-only and unknown" >&2; exit 1; }
 
 # A batch reported done whose results aren't in the remote cache: with
 # --remote-only nothing is built locally, and the exit status says a local
@@ -415,14 +415,17 @@ SML
   > "$tmpdir/generated-detach.log" 2>&1 && { cat "$tmpdir/generated-detach.log" >&2; exit 1; }
 require_grep "remote execution: theories that write SML sources build before the rest is planned" "$tmpdir/generated-detach.log"
 refute_grep "GenTheory built" "$tmpdir/generated-detach.log"
-# --remote-only restores, so with nothing cached it fails without building.
+# --remote-only restores, so with nothing cached it fails without building,
+# and cancels a batch it was to attach to.
 set +e
-(cd "$generated" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only UseLib) \
+(cd "$generated" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only --attach genb UseLib) \
   > "$tmpdir/generated-only.log" 2>&1
 status=$?
 set -e
 [[ $status -eq 75 ]] || { echo "generated-only exited $status, wanted 75" >&2; cat "$tmpdir/generated-only.log" >&2; exit 1; }
 require_grep "build before the rest is planned; restoring from the cache" "$tmpdir/generated-only.log"
+require_grep "^POST /v1/batches/genb/cancel " "$state/requests.log"
+: > "$state/requests.log"
 refute_grep "GenTheory built" "$tmpdir/generated-only.log"
 (cd "$generated" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" UseLib) \
   > "$tmpdir/generated.log" 2>&1 || { cat "$tmpdir/generated.log" >&2; exit 1; }

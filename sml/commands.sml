@@ -1393,6 +1393,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         if writes_sources andalso detach then raise Error ("remote execution: " ^ reason)
         else if writes_sources andalso remote_only then
           (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "; restoring from the cache\n");
+           Option.app (fn batch_id => ignore (HolbuildRemoteExec.cancel url batch_id)) attach;
            execute_build ())
         else if writes_sources then
           (HolbuildBuildExec.warn ("remote execution: " ^ reason ^ "; building locally");
