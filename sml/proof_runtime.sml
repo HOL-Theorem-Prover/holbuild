@@ -539,42 +539,42 @@ fun failed_prefix_texts () =
    and put back if anything fails: a failed write leaves the old checkpoint
    usable.  Moving them rather than writing over them also leaves copies
    hard-linked elsewhere alone (see HolbuildCheckpointSaveRuntime.begin_replacement). *)
+(* The new checkpoint is written under a temporary name and renamed into place
+   only once complete, so a process killed mid-save leaves the old one intact.
+   Renaming the heap is safe here: a heap's header names only its parent, and
+   this failing process saves no child under it.  Renames also replace the old
+   directory entries rather than writing into the old files, which may be links
+   into a shared store (see HolbuildCheckpointSaveRuntime.begin_replacement).
+   The old .ok goes first and the new .ok last, so the files are never resumed
+   as a mixed set. *)
 fun advance_failed_prefix_checkpoint path ok_text depth =
   let
-    (* .ok is moved first and put back last: a .save is resumed only with it. *)
-    val files = map (fn suffix => path ^ suffix) [".ok", "", ".meta", ".prefix"]
-    fun aside file = file ^ ".old"
+    val new = path ^ ".new"
+    val suffixes = ["", ".meta", ".prefix", ".ok"]
     fun exists file = OS.FileSys.access (file, []) handle OS.SysErr _ => false
     fun remove file = OS.FileSys.remove file handle OS.SysErr _ => ()
-    val moved = ref ([] : string list)
-    fun move_aside file =
-      if exists file then
-        (OS.FileSys.rename {old = file, new = aside file}; moved := file :: !moved)
-      else ()
-    fun restore_moved () =
-      app (fn file => OS.FileSys.rename {old = aside file, new = file} handle OS.SysErr _ => ()) (!moved)
-    fun warn e = HolbuildCheckpointSaveRuntime.warn_checkpoint_failure "failed_prefix" path e
-    fun io_failure e = HolbuildCheckpointSaveRuntime.checkpoint_io_failure e
-    fun save () =
-      let val (meta_text, prefix_text) = failed_prefix_texts ()
-      in
-        save_checkpoint "failed_prefix" false path ok_text depth;
-        (* save_checkpoint drops the checkpoint on an I/O failure; then no .ok. *)
-        if exists (path ^ ".ok") then
-          (HolbuildCheckpointSaveRuntime.write_text_atomically (path ^ ".meta") meta_text;
-           HolbuildCheckpointSaveRuntime.write_text_atomically (path ^ ".prefix") prefix_text;
-           app (remove o aside) files)
-        else (app remove files; restore_moved ())
-      end
-      handle e =>
-        (app remove files;
-         restore_moved ();
-         if io_failure e then warn e else raise e)
+    fun discard_new () =
+      app (fn suffix => (remove (new ^ suffix); remove (new ^ suffix ^ ".tmp"))) suffixes
+    fun install () =
+      (remove (path ^ ".ok");
+       app (fn suffix => OS.FileSys.rename {old = new ^ suffix, new = path ^ suffix}) suffixes)
   in
-    app (remove o aside) files;
-    (app move_aside files; save ())
+    (discard_new ();
+     let val (meta_text, prefix_text) = failed_prefix_texts ()
+     in
+       save_checkpoint "failed_prefix" false new ok_text depth;
+       (* save_checkpoint drops the checkpoint on an I/O failure; then no .ok. *)
+       if exists (new ^ ".ok") then
+         (HolbuildCheckpointSaveRuntime.write_text_atomically (new ^ ".meta") meta_text;
+          HolbuildCheckpointSaveRuntime.write_text_atomically (new ^ ".prefix") prefix_text;
+          install ())
+       else discard_new ()
+     end)
     handle e =>
-      if io_failure e then (restore_moved (); warn e) else raise e
+      (discard_new ();
+       if HolbuildCheckpointSaveRuntime.checkpoint_io_failure e then
+         HolbuildCheckpointSaveRuntime.warn_checkpoint_failure "failed_prefix" new e
+       else raise e)
   end
 
 (* A resumed proof saves only when it got past the prefix it restored: one that

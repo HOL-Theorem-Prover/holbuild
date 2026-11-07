@@ -102,10 +102,10 @@ step_count() { sed -n 's/^step_count=//p' "$checkpoint.meta"; }
 
 checkpoint_sums() { sha256sum "$checkpoint" "$checkpoint.ok" "$checkpoint.meta" "$checkpoint.prefix"; }
 
-require_no_aside_files() {
-  if find "$project/.holbuild/checkpoints" -name '*.old' | grep -q .; then
-    find "$project/.holbuild/checkpoints" -name '*.old' >&2
-    echo "$1: moved-aside checkpoint files were left behind" >&2
+require_no_temporary_files() {
+  if find "$project/.holbuild/checkpoints" -name '*.new*' | grep -q .; then
+    find "$project/.holbuild/checkpoints" -name '*.new*' >&2
+    echo "$1: temporary checkpoint files were left behind" >&2
     exit 1
   fi
 }
@@ -131,7 +131,7 @@ require_grep "restoring proof-ir prefix with $seed_steps successful leaf steps" 
 expect_count 3 "first advance"
 first_steps=$(step_count)
 (( first_steps > seed_steps )) || { echo "checkpoint stayed at $first_steps steps after a resume got past it" >&2; exit 1; }
-require_no_aside_files "first advance"
+require_no_temporary_files "first advance"
 
 # It moves forward again from the moved checkpoint: the earlier steps, the
 # ones in the CONJ_TAC branch included, aren't rerun, and the failure is on
@@ -143,7 +143,7 @@ require_grep "^ *3 = 3" "$tmpdir/second.log"
 expect_count 4 "second advance"
 second_steps=$(step_count)
 (( second_steps > first_steps )) || { echo "checkpoint stayed at $second_steps steps after a second resume got past it" >&2; exit 1; }
-require_no_aside_files "second advance"
+require_no_temporary_files "second advance"
 
 # A resume that fails at the step it restored leaves the checkpoint alone.
 sums=$(checkpoint_sums)
@@ -152,23 +152,28 @@ require_grep "restoring proof-ir prefix with $second_steps successful leaf steps
 expect_count 4 "same-step resume"
 [[ "$(checkpoint_sums)" = "$sums" ]] || { echo "a resume that failed at the restored step rewrote the checkpoint" >&2; exit 1; }
 
-# The resume gets further but can't write the new checkpoint's .ok: the old
-# checkpoint stays in place, whole.
-edit 'FAIL_TAC "second advance"' \
-  "(fn g => (OS.FileSys.mkDir \"$checkpoint.ok.tmp\"; ALL_TAC g)) >> FAIL_TAC \"failed write\""
-if (cd "$project" && "$HOLBUILD_BIN" build ATheory) >"$tmpdir/failed-write.log" 2>&1; then
-  echo "expected the failed-write build to fail" >&2
-  exit 1
-fi
-require_grep "failed write" "$tmpdir/failed-write.log"
-require_grep "dropping checkpoint kind=failed_prefix" \
-  "$project/.holbuild/logs/current/failed-prefix-advance/ATheory/build.log"
-rmdir "$checkpoint.ok.tmp"
-[[ "$(checkpoint_sums)" = "$sums" ]] || { echo "a failed checkpoint write lost the old checkpoint" >&2; exit 1; }
-require_no_aside_files "failed write"
+# The resume gets further but can't write one of the new checkpoint's files
+# (the .ok, which the heap save handles, or the .meta, written after it): the
+# old checkpoint stays in place, whole.
+failed_write() {
+  local blocker="$checkpoint.new.$1.tmp"
+  edit "$2" "(fn g => (OS.FileSys.mkDir \"$blocker\"; ALL_TAC g)) >> FAIL_TAC \"failed $1 write\""
+  if (cd "$project" && "$HOLBUILD_BIN" build ATheory) >"$tmpdir/failed-$1.log" 2>&1; then
+    echo "expected the failed $1 write build to fail" >&2
+    exit 1
+  fi
+  require_grep "failed $1 write" "$tmpdir/failed-$1.log"
+  require_grep "dropping checkpoint kind=failed_prefix path=$checkpoint.new" \
+    "$project/.holbuild/logs/current/failed-prefix-advance/ATheory/build.log"
+  rmdir "$blocker"
+  [[ "$(checkpoint_sums)" = "$sums" ]] || { echo "a failed $1 write lost the old checkpoint" >&2; exit 1; }
+  require_no_temporary_files "failed $1 write"
+}
+failed_write ok 'FAIL_TAC "second advance"'
+failed_write meta "(fn g => (OS.FileSys.mkDir \"$checkpoint.new.ok.tmp\"; ALL_TAC g)) >> FAIL_TAC \"failed ok write\""
 
 # The checkpoint that survived resumes, and the proof finishes from it.
-edit "(fn g => (OS.FileSys.mkDir \"$checkpoint.ok.tmp\"; ALL_TAC g)) >> FAIL_TAC \"failed write\"" \
+edit "(fn g => (OS.FileSys.mkDir \"$checkpoint.new.meta.tmp\"; ALL_TAC g)) >> FAIL_TAC \"failed meta write\"" \
   'ACCEPT_TAC (REFL ``3``)'
 if ! (cd "$project" && "$HOLBUILD_BIN" build ATheory) >"$tmpdir/fixed.log" 2>&1; then
   cat "$tmpdir/fixed.log" >&2
