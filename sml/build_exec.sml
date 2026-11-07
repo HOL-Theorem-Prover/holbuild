@@ -5756,22 +5756,18 @@ fun publish_spec_blob remote path =
     | HolbuildCacheBackend.Conflict message => raise Error ("could not upload " ^ path ^ ": " ^ message)
     | HolbuildCacheBackend.Skipped => raise Error ("could not upload " ^ path ^ ": skipped")
 
-(* The input keys of the plan's theories around the one whose input key is
-   missing: those it depends on (below), and it and those that depend on it
-   (above). *)
-fun theory_keys_around (options : build_options) tc project plan toolchain_key missing =
+(* The input keys of the plan's theories whose input key is missing or that
+   depend on that theory. *)
+fun theory_keys_depending_on (options : build_options) tc project plan toolchain_key missing =
   let
     val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
                  (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
     val key_of = HolbuildBuildPlan.input_key_for keys
-    val theories = List.filter is_theory_node (HolbuildBuildPlan.selected_nodes plan)
-    fun below_of node = List.filter is_theory_node (HolbuildBuildPlan.transitive_project_deps plan node)
-    fun above node = key_of node = missing orelse List.exists (fn dep => key_of dep = missing) (below_of node)
+    fun depends node =
+      key_of node = missing orelse
+      List.exists (fn dep => key_of dep = missing) (HolbuildBuildPlan.transitive_project_deps plan node)
   in
-    {below = case List.find (fn node => key_of node = missing) theories of
-                 SOME node => map key_of (below_of node)
-               | NONE => [],
-     above = map key_of (List.filter above theories)}
+    map key_of (List.filter (fn node => is_theory_node node andalso depends node) (HolbuildBuildPlan.selected_nodes plan))
   end
 
 (* Drops the local cache's entry for key when its outputs differ from the
@@ -5786,13 +5782,6 @@ fun drop_local_copy_if_stale remote key =
           drop_cache_manifest_if_unchanged cache key mine
       | _ => false
   end
-
-(* drop_local_copy_if_stale for each of keys, against the configured remote
-   cache. *)
-fun drop_stale_local_copies keys =
-  case HolbuildRemoteCacheConfig.url () of
-      SOME url => List.app (ignore o drop_local_copy_if_stale (HolbuildRemoteCache.remote url)) keys
-    | NONE => ()
 
 (* Drops the local cache's entries for keys, so that a build restores them
    from the remote cache. *)

@@ -1235,8 +1235,7 @@ holds, as when a nondeterministic theory was built twice; the workers can't
 use it, and the coordinator fails the batch for resubmission naming it
 (`resubmit: ... theory <input_key>`). Such a batch is resubmitted once first,
 with that theory and every theory that depends on it, for the workers to
-rebuild or recheck against the cached parents; local cache copies of its
-parents that differ from the remote cache's are dropped first. A submission
+rebuild or recheck against the cached parents. A submission
 answered 502, 503 or 504, as a proxy in front of the coordinator answers
 while it restarts, is retried, and an event stream that breaks is
 reattached; either is given up on once the coordinator stays unavailable for
