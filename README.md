@@ -670,6 +670,11 @@ ordinary outputs, cleaning followed
 by a normal build may restore them from cache; use existing no-cache or impure /
 always-reexecute controls when source execution is required.
 
+When such an action needs source execution, holbuild reruns its script from the
+start: script checkpoints retain ML state, not the files the script wrote.
+The dependency-loaded checkpoint remains reusable, and proof checkpoints remain
+available for diagnostics.
+
 A theory may write SML sources (`.sml` or `.sig`) as extra outputs, as EmitML
 code does. A plan made before the theory runs has no node for such a source, so
 when a planned theory declares one, holbuild builds the planned theories that

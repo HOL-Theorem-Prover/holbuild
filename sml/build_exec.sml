@@ -3033,12 +3033,15 @@ fun write_theory_script policy root checkpoint_root base_context (action : theor
       fun failed_prefix_at_least_as_late failed NONE = true
         | failed_prefix_at_least_as_late failed (SOME replay) =
             #boundary (#checkpoint failed) >= #boundary replay
+      (* Saved ML state does not include files written by the script.  Replay
+         the whole script to recreate declared outputs in the fresh stage. *)
+      val script_replay_allowed = null (#extra_outputs action)
       val failed_prefix =
-        if proof_steps_enabled policy andalso not (trace_steps policy) then
+        if script_replay_allowed andalso proof_steps_enabled policy andalso not (trace_steps policy) then
           best_failed_prefix_checkpoint (tactic_timeout policy) checkpoints
         else NONE
       val replay =
-        if trace_steps policy then NONE
+        if not script_replay_allowed orelse trace_steps policy then NONE
         else replay_candidate policy base checkpoints declaration_checkpoints
     in
       case failed_prefix of
