@@ -283,6 +283,7 @@ def test_action_runs_without_the_worker_token(
     release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
     server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
     monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", "worker-secret")
+    monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN", "worker-secret")
     monkeypatch.setenv("UNRELATED", "1")
     monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
     monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_CURL_CONFIG", str(tmp_path / "cache.curl"))
@@ -299,6 +300,8 @@ def test_action_runs_without_the_worker_token(
 
     env = dict(line.split("=", 1) for line in Path(f"{logs[1]}.env").read_text().splitlines() if "=" in line)
     assert "REMOTE_EXEC_WORKER_TOKEN" not in env
+    assert "HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN" not in env
+    assert "worker-secret" not in env.values()
     assert "UNRELATED" not in env
     assert env["HTTPS_PROXY"] == "http://proxy.test:3128"
     assert env["HOLBUILD_CACHE"] == str(tmp_path / "cache")
@@ -909,6 +912,7 @@ def test_without_a_cooperate_dir_an_action_s_time_is_all_exec(
 
 def test_bootstrap_spec_uses_second_node_when_primary_is_unreachable(tmp_path: Path, server: Server) -> None:
     import hashlib
+
     from remote_exec.cache import ranked_nodes
 
     nodes = ["http://127.0.0.1:1", server.url]
@@ -967,3 +971,61 @@ def test_bootstrap_spec_distinguishes_miss_from_outage(
         ring.spec_version(SPEC)
     assert type(caught.value) is error
     assert len(asked) == len(statuses)
+
+
+def test_worker_discovery_auth_uses_a_private_file_and_cleans_it_on_exit(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", 'worker-"secret')
+    monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_DISCOVERY_URL", server.url + "/v1/cache/members")
+    monkeypatch.setattr(worker, "parse_args", lambda: worker_args(tmp_path, server))
+    monkeypatch.setattr(worker, "refresh_cache_members", lambda _c, membership, _url, now: membership.current(now))
+    paths: list[Path] = []
+
+    def claim_then_exit(*_: object) -> None:
+        config = Path(os.environ["HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG"])
+        paths.append(config)
+        assert config.stat().st_mode & 0o777 == 0o600
+        assert config.parent.stat().st_mode & 0o777 == 0o700
+        assert config.read_text() == 'header = "Authorization: Bearer worker-\\"secret"\n'
+        assert 'worker-"secret' not in worker.exec_action_env().values()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(worker, "claim_reporting", claim_then_exit)
+    with pytest.raises(KeyboardInterrupt):
+        worker.main()
+    assert len(paths) == 1 and not paths[0].exists()
+
+
+def test_worker_refreshes_bootstrap_membership_after_memory_and_claim_waits(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", "worker-secret")
+    monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_DISCOVERY_URL", server.url + "/v1/cache/members")
+    args = worker_args(tmp_path, server)
+    args.cooperate_dir = str(tmp_path / "cooperate")
+    monkeypatch.setattr(worker, "parse_args", lambda: args)
+    monkeypatch.setattr(worker, "HostTelemetry", lambda *_: None)
+    events: list[str] = []
+    monkeypatch.setattr(worker, "wait_for_memory", lambda *_: events.append("memory") or False)
+    monkeypatch.setattr(worker, "claim_reporting", lambda *_: events.append("claim") or claim())
+
+    def refresh(_coordinator, membership, _url, now):
+        events.append("refresh")
+        membership.allowed.append("https://joined.example")
+        membership.update("holbuild-cache-members-v1\n" + server.url + "\nhttps://joined.example\n", now)
+        return membership.current(now)
+
+    def run(_coordinator, _args, releases, *_rest):
+        assert "https://joined.example" in releases.remote_cache
+        assert releases.joining
+        events.append("run")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(worker, "refresh_cache_members", refresh)
+    monkeypatch.setattr(worker, "run_one", run)
+    with pytest.raises(KeyboardInterrupt):
+        worker.main()
+    assert events == ["memory", "claim", "refresh", "run"]
