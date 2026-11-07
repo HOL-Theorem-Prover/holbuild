@@ -14,7 +14,7 @@ from remote_exec import coordinator as coordinator_module
 from remote_exec.app import create_app
 from remote_exec.coordinator import Coordinator
 from remote_exec.formats import parse_result
-from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache, entry_blob
+from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache
 
 CLIENT = {"Authorization": f"Bearer {CLIENT_TOKEN}"}
 WORKER = {"Authorization": f"Bearer {WORKER_TOKEN}"}
@@ -234,37 +234,24 @@ async def test_child_is_released_only_once_every_parent_key_is_in_the_cache(
     assert await states(http, batch_id) == {"a": "done", "b": "done", "c": "ready"}
 
 
-async def test_a_parent_whose_blob_expired_is_built_again_before_its_child_is_released(
+async def test_a_parent_whose_blob_expired_is_built_again_once_its_child_cant_restore_it(
     http: httpx.AsyncClient, cache: FakeCache
 ) -> None:
+    # The cache holds the entry of "a" (a release asks for nothing more), but one of its blobs has expired, so the
+    # worker that runs "b" can't restore "a" and reports it missing.
     batch_id = await submit(http, ["a", "b"], [("b", "a")])
-    token = await claim_named(http, "a")
-    cache.keys.add(ac_key("a"))
-    cache.lost.add(ac_key("a"))
-    assert (await complete(http, token, result("a", "built"))).status_code == 200
-    assert await states(http, batch_id) == {"a": "ready", "b": "waiting"}
-
-    cache.lost.clear()
     await build(http, cache, "a")
     assert await states(http, batch_id) == {"a": "done", "b": "ready"}
+    token = await claim_named(http, "b")
+    record = result("b", "failed", "input-missing", missing=f"theory {input_key('a')}")
+    assert (await complete(http, token, record)).status_code == 200
+    assert await states(http, batch_id) == {"a": "ready", "b": "waiting"}
 
-
-async def test_a_parent_whose_blob_only_the_proxy_backend_holds_is_fetched_by_get(
-    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
-) -> None:
-    batch_id = await submit(http, ["a", "b"], [("b", "a")])
-    token = await claim_named(http, "a")
-    cache.keys.add(ac_key("a"))
-    cache.proxied.add(ac_key("a"))
-    cache.proxy_down = True
-    assert (await complete(http, token, result("a", "built"))).status_code == 200
-    # Neither HEAD nor GET can tell: "a" stays done and "b" waits for the next sweep.
-    assert await states(http, batch_id) == {"a": "done", "b": "waiting"}
-
-    cache.proxy_down = False
-    await coordinator.sweep()
+    # Building "a" again uploads its blobs again.
+    await build(http, cache, "a")
     assert await states(http, batch_id) == {"a": "done", "b": "ready"}
-    assert not cache.proxied
+    await build(http, cache, "b")
+    assert (await batch(http, batch_id))["state"] == "done"
 
 
 async def test_a_parent_found_in_the_cache_is_not_asked_about_again_until_an_input_goes_missing(
@@ -287,34 +274,28 @@ async def test_a_parent_found_in_the_cache_is_not_asked_about_again_until_an_inp
     assert await states(http, batch_id) == {"a": "done", "b": "done", "c": "done", "d": "ready"}
 
 
-async def test_a_remembered_parent_whose_blob_expired_is_built_again_once_a_child_misses_it(
-    http: httpx.AsyncClient, cache: FakeCache
-) -> None:
-    batch_id = await submit(http, ["a", "b", "c"], [("b", "a"), ("c", "a")])
-    await build(http, cache, "a")
-    assert await states(http, batch_id) == {"a": "done", "b": "ready", "c": "ready"}
-
-    # A blob of "a" expires after it was found whole; "b" can't restore it.
-    cache.lost.add(ac_key("a"))
-    token = await claim_named(http, "b")
-    record = result("b", "failed", "input-missing", missing=f"blob {entry_blob(ac_key('a'))}")
-    assert (await complete(http, token, record)).status_code == 200
-    assert (await states(http, batch_id))["a"] == "ready"
-    assert (await states(http, batch_id))["b"] == "waiting"
-
-    cache.lost.clear()
-    await build(http, cache, "a")
-    assert (await states(http, batch_id))["b"] == "ready"
-
-
 async def test_concurrent_releases_share_one_check_of_a_parent(cache: FakeCache, coordinator: Coordinator) -> None:
     cache.keys.add(ac_key("a"))
     cache.hold = asyncio.Event()
-    checks = [asyncio.create_task(coordinator._in_cache(ac_key("a"))) for _ in range(5)]
+    checks = [asyncio.create_task(coordinator._in_cache(ac_key("a"), asyncio.Semaphore(1))) for _ in range(5)]
     await asyncio.sleep(0.1)  # every check is waiting on the first one's GET
     cache.hold.set()
     assert await asyncio.gather(*checks) == [True] * 5
     assert cache.asked == [ac_key("a")]
+
+
+async def test_releases_sharing_a_check_spend_one_request_of_their_limit_on_it(
+    cache: FakeCache, coordinator: Coordinator
+) -> None:
+    cache.keys |= {ac_key("a"), ac_key("b")}
+    cache.hold = asyncio.Event()
+    limit = asyncio.Semaphore(2)
+    # Three releases ask about "a" and one about "b": one request each is in flight, the two the limit allows.
+    checks = [asyncio.create_task(coordinator._in_cache_all({ac_key(name)}, limit)) for name in ["a", "a", "a", "b"]]
+    await asyncio.wait_for(wait_until(lambda: cache.held == 2), 5)
+    cache.hold.set()
+    assert [present for check in checks for present in (await check).values()] == [True] * 4
+    assert sorted(cache.asked) == sorted([ac_key("a"), ac_key("b")])
 
 
 async def test_a_check_begun_before_an_input_went_missing_is_not_remembered(
@@ -322,12 +303,12 @@ async def test_a_check_begun_before_an_input_went_missing_is_not_remembered(
 ) -> None:
     cache.keys.add(ac_key("a"))
     cache.hold = asyncio.Event()
-    check = asyncio.create_task(coordinator._in_cache(ac_key("a")))
+    check = asyncio.create_task(coordinator._in_cache(ac_key("a"), asyncio.Semaphore(1)))
     await asyncio.sleep(0.1)
     coordinator._forget_cache_findings()  # what an input-missing result does
     cache.hold.set()
     assert await check is True
-    assert await coordinator._in_cache(ac_key("a")) is True
+    assert await coordinator._in_cache(ac_key("a"), asyncio.Semaphore(1)) is True
     assert cache.asked == [ac_key("a"), ac_key("a")]
 
 
