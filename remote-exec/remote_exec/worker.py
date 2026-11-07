@@ -32,6 +32,8 @@ from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from remote_exec.cache import cache_nodes, ranked_nodes
+
 DEFAULT_SOURCE_URL = "https://github.com/HOL-Theorem-Prover/holbuild/archive/refs/tags/v{version}.tar.gz"
 RELEASE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 COMPLETE = ".complete"  # stamp file of a finished release build
@@ -191,23 +193,42 @@ class Releases:
         """The ``holbuild-version`` of the action spec stored in the remote cache's ``/cas/``."""
         # -g: no URL globbing, whose errors print the URL with any credentials in it.
         # The status follows the body on its own line: 000 when there was no answer.
-        command = ["curl", "-fsSLg", "--retry", "3", "-w", "\n%{http_code}"]
+        nodes = cache_nodes(self.remote_cache)
+        command = ["curl", "-fsSLg", "-w", "\n%{http_code}"]
+        if len(nodes) == 1:
+            command += ["--retry", "3"]
+        else:
+            command += ["--connect-timeout", "5", "--speed-limit", "1", "--speed-time", "30"]
         if self.curl_config is not None:
             command += ["-K", self.curl_config]
-        command.append(f"{self.remote_cache.rstrip('/')}/cas/{spec_sha256}")
-        # Not check=True: its error would print the command line, and the cache URL may carry credentials.
-        try:
-            fetched = subprocess.run(command, capture_output=True, text=True, timeout=120)
-        except subprocess.TimeoutExpired:
-            raise CacheUnavailable(f"fetching spec {spec_sha256} from the remote cache timed out") from None
-        spec, _, status = fetched.stdout.rpartition("\n")
-        if fetched.returncode != 0:
+        unavailable: str | None = None
+        missing: str | None = None
+        failure = f"spec {spec_sha256} is missing from the remote cache"
+        for node in ranked_nodes(nodes, spec_sha256)[:2]:
+            # Not check=True: its error would print credentials in the command line.
+            try:
+                fetched = subprocess.run(
+                    [*command, f"{node}/cas/{spec_sha256}"], capture_output=True, text=True, timeout=120
+                )
+            except subprocess.TimeoutExpired:
+                unavailable = f"fetching spec {spec_sha256} from the remote cache timed out"
+                continue
+            spec, _, status = fetched.stdout.rpartition("\n")
+            if fetched.returncode == 0:
+                break
             failure = f"fetching spec {spec_sha256} from the remote cache failed: {fetched.stderr.strip()}"
-            # Only an answer of 4xx, such as 404 for a spec the cache lost, won't come right by asking again; no
-            # answer, 429, 5xx or a transfer cut short may well.
             if fetched.returncode == 22 and status.startswith("4") and status != "429":
+                if status == "404":
+                    missing = failure
+                    continue
                 raise RuntimeError(failure)
-            raise CacheUnavailable(failure)
+            unavailable = failure
+        else:
+            if missing is not None:
+                raise RuntimeError(missing)
+            if unavailable is not None:
+                raise CacheUnavailable(unavailable)
+            raise RuntimeError(failure)
         versions = [
             line.removeprefix("holbuild-version=") for line in spec.splitlines() if line.startswith("holbuild-version=")
         ]
@@ -521,10 +542,11 @@ def exec_action_env() -> dict[str, str]:
     }
 
 
-def exec_action_command(args: argparse.Namespace, holbuild: str, spec: str, result: str) -> list[str]:
+def exec_action_command(
+    args: argparse.Namespace, holbuild: str, spec: str, result: str, max_heap_mb: int | None
+) -> list[str]:
     command = [holbuild, "--remote-cache", args.remote_cache]
-    if args.max_heap is not None:
-        command += ["--max-heap", str(args.max_heap)]
+    command += ["--max-heap", str(args.max_heap if max_heap_mb is None else max_heap_mb)]
     if args.cooperate_dir is not None:
         command += ["--cooperate-dir", args.cooperate_dir]
     command += ["exec-action", spec, "--cache-limit-gb", str(args.cache_limit_gb), "--result", result]
@@ -643,7 +665,9 @@ def execute(
         spans = ExecSpans()
         stepped = time.monotonic()
         process = subprocess.Popen(
-            exec_action_command(args, holbuild, spec, result), env=exec_action_env(), start_new_session=True
+            exec_action_command(args, holbuild, spec, result, claim.get("max_heap_mb")),
+            env=exec_action_env(),
+            start_new_session=True
         )
         try:
             while process.poll() is None:
@@ -693,7 +717,10 @@ def claim_wait_seconds(text: str) -> float:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--coordinator", required=True, help="coordinator base URL")
-    parser.add_argument("--remote-cache", required=True, help="remote cache URL passed to holbuild")
+    parser.add_argument(
+        "--remote-cache", default=os.environ.get("HOLBUILD_REMOTE_CACHE_URL"),
+        help="comma-separated remote cache URLs passed to holbuild (or HOLBUILD_REMOTE_CACHE_URL)",
+    )
     parser.add_argument("--cache-limit-gb", required=True, type=int, help="holbuild exec-action --cache-limit-gb")
     parser.add_argument("--tier", choices=("standard", "high"), default="standard")
     parser.add_argument(
@@ -703,7 +730,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=[],
         help="tiers to claim from when --tier has nothing ready, in order (repeatable or comma-separated)",
     )
-    parser.add_argument("--max-heap", type=int, help="holbuild --max-heap MB")
+    parser.add_argument("--max-heap", type=int, default=12000, help="default holbuild --max-heap MB (default: %(default)s)")
     parser.add_argument("--cooperate-dir", help="holbuild --cooperate-dir, shared by a host's workers")
     parser.add_argument("--share-heaps", action="store_true", help="holbuild exec-action --share-heaps")
     parser.add_argument(
@@ -728,7 +755,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=20.0,
         help="how long a claim waits at the coordinator for an action to become ready (at most 50)",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not args.remote_cache:
+        parser.error("--remote-cache or HOLBUILD_REMOTE_CACHE_URL is required")
+    try:
+        args.remote_cache = ",".join(cache_nodes(args.remote_cache))
+    except ValueError as error:
+        parser.error(str(error))
+    return args
 
 
 def main() -> None:

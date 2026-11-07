@@ -233,30 +233,43 @@ def claim() -> dict[str, object]:
     return {"attempt_token": "t1", "spec_sha256": SPEC, "input_key": "6" * 64, "theory": "pkg:A", "lease_s": 3}
 
 
+@pytest.mark.parametrize(
+    ("worker_heap", "batch_heap", "expected_heap"),
+    [(None, None, 12000), (14000, None, 14000), (14000, 4096, 4096), (None, 16000, 16000)],
+)
 def test_worker_runs_the_action_on_the_release_that_exported_it(
-    tmp_path: Path, server: Server, logs: tuple[Path, Path]
+    tmp_path: Path,
+    server: Server,
+    logs: tuple[Path, Path],
+    worker_heap: int | None,
+    batch_heap: int | None,
+    expected_heap: int,
 ) -> None:
     release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
     server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
     switch = tmp_path / "protect"
     switch.write_text(f'#!/bin/sh\necho "$1" >> {tmp_path}/protection\n')
     switch.chmod(0o755)
-    args = worker_args(tmp_path, server, "--protection-cmd", str(switch))
+    extra = [] if worker_heap is None else ["--max-heap", str(worker_heap)]
+    args = worker_args(tmp_path, server, "--protection-cmd", str(switch), *extra)
+    claimed = {**claim(), "max_heap_mb": batch_heap}
 
     run_one(
-        Coordinator(server.url, "w"), args, releases(tmp_path, server), Protection(str(switch), None), claim(), Phases()
+        Coordinator(server.url, "w"), args, releases(tmp_path, server), Protection(str(switch), None), claimed, Phases()
     )
 
     assert server.completed == [RECORD]
     assert logs[1].read_text().split() == [
         "--remote-cache",
         server.url,
+        "--max-heap",
+        str(expected_heap),
         "exec-action",
         SPEC,
         "--cache-limit-gb",
         "50",
         "--result",
-        logs[1].read_text().split()[7],
+        logs[1].read_text().split()[9],
         "--share-heaps",
     ]
     *held, released = (tmp_path / "protection").read_text().split()
@@ -892,3 +905,65 @@ def test_without_a_cooperate_dir_an_action_s_time_is_all_exec(
 
     seconds = phases.take()
     assert seconds["exec"] >= 2 and seconds["before_hol"] == seconds["hol"] == seconds["after_hol"] == 0
+
+
+def test_bootstrap_spec_uses_second_node_when_primary_is_unreachable(tmp_path: Path, server: Server) -> None:
+    import hashlib
+    from remote_exec.cache import ranked_nodes
+
+    nodes = ["http://127.0.0.1:1", server.url]
+    digest = next(
+        key for i in range(100)
+        if ranked_nodes(nodes, key := hashlib.sha256(str(i).encode()).hexdigest())[0] == nodes[0]
+    )
+    server.specs[digest] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+    ring = Releases(str(tmp_path), "unused", ",".join(nodes), None)
+    assert ring.spec_version(digest) == "1.2.3"
+
+
+@pytest.mark.parametrize("status", [404, 429, 503])
+def test_bootstrap_spec_falls_back_before_parsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    from remote_exec.cache import ranked_nodes
+
+    nodes = ["http://one.test", "http://two.test"]
+    asked: list[str] = []
+
+    def fetch(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        asked.append(command[-1])
+        assert "--retry" not in command
+        if len(asked) == 1:
+            return subprocess.CompletedProcess(command, 22, f"\n{status}", "HTTP error")
+        return subprocess.CompletedProcess(command, 0, "holbuild-version=1.2.3\n\n200", "")
+
+    monkeypatch.setattr(subprocess, "run", fetch)
+    assert Releases(str(tmp_path), "unused", ",".join(nodes), None).spec_version(SPEC) == "1.2.3"
+    assert asked == [f"{node}/cas/{SPEC}" for node in ranked_nodes(nodes, SPEC)]
+
+
+def test_worker_cache_ring_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_URL", "http://one.test/,http://two.test///,http://one.test")
+    args = parse_args(["--coordinator", "http://exec.test", "--cache-limit-gb", "2"])
+    assert args.remote_cache == "http://one.test,http://two.test"
+
+
+@pytest.mark.parametrize("statuses", [(503, 404), (404, 503), (404, 404), (503, 429), (404, 403), (403,)])
+def test_bootstrap_spec_distinguishes_miss_from_outage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, statuses: tuple[int, ...]
+) -> None:
+    asked: list[str] = []
+
+    def fetch(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        status = statuses[len(asked)]
+        asked.append(command[-1])
+        return subprocess.CompletedProcess(command, 22, f"\n{status}", f"HTTP {status}")
+
+    monkeypatch.setattr(subprocess, "run", fetch)
+    ring = Releases(str(tmp_path), "unused", "http://one.test,http://two.test", None)
+    error = CacheUnavailable if statuses == (503, 429) else RuntimeError
+    message = "HTTP 403" if 403 in statuses else "HTTP 429" if error is CacheUnavailable else "HTTP 404"
+    with pytest.raises(error, match=message) as caught:
+        ring.spec_version(SPEC)
+    assert type(caught.value) is error
+    assert len(asked) == len(statuses)

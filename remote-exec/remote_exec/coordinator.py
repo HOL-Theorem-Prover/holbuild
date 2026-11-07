@@ -9,6 +9,7 @@ import contextlib
 import graphlib
 import json
 import logging
+import os
 import shlex
 import time
 from collections import defaultdict, deque
@@ -21,10 +22,11 @@ from uuid import UUID, uuid4
 import asyncpg
 import httpx
 import sqlalchemy as sa
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
+from remote_exec.cache import cache_nodes, ranked_nodes
 from remote_exec.formats import Batch, Result
 
 logger = logging.getLogger(__name__)
@@ -62,7 +64,8 @@ class Settings(BaseSettings):
     database_url: str  # postgresql+asyncpg://...
     client_token: SecretStr
     worker_token: SecretStr
-    cache_url: str  # bazel-remote base URL; HEAD <cache_url>/ac/<ac-key>
+    cache_url: str = Field(default_factory=lambda: os.environ.get("HOLBUILD_REMOTE_CACHE_URL", ""))
+
     lease_seconds: int = 120
     max_attempts: int = 3
     # A theory whose peak hint reaches this goes to the high-memory tier; set it to what a standard worker holds.
@@ -85,6 +88,10 @@ class Settings(BaseSettings):
     scale_down_hold_s: float = 900.0
     scale_cmd: str | None = None  # run as `<scale_cmd> <desired burst workers>` when that number changes
 
+    @field_validator("cache_url")
+    @classmethod
+    def normalize_cache_url(cls, value: str) -> str:
+        return ",".join(cache_nodes(value))
 
 class ScaleCommandError(RuntimeError):
     """The scale command failed or timed out."""
@@ -101,6 +108,7 @@ class Claim:
     input_key: str
     theory: str
     lease_s: int
+    max_heap_mb: int | None
 
 
 @dataclass(frozen=True)
@@ -324,7 +332,7 @@ WITH run_capacity AS MATERIALIZED (
         SELECT count(*) FROM actions WHERE state = 'running' AND class = 'run'
     ) < :run_slots AS available
 ), ready_batches AS MATERIALIZED (
-    SELECT b.id, b.created_at,
+    SELECT b.id, b.created_at, b.max_heap_mb,
         (SELECT count(*) FROM actions r WHERE r.batch_id = b.id AND r.state = 'running') AS running_count,
         (SELECT max(c.last_claimed_at) FROM actions c WHERE c.batch_id = b.id) AS last_claimed_at
     FROM batches b
@@ -333,7 +341,7 @@ WITH run_capacity AS MATERIALIZED (
         AND (class = 'build' OR (SELECT available FROM run_capacity))
     )
 )
-SELECT a.batch_id, a.input_key, a.spec_sha256, a.theory
+SELECT a.batch_id, a.input_key, a.spec_sha256, a.theory, b.max_heap_mb
 FROM actions a
 JOIN ready_batches b ON b.id = a.batch_id
 WHERE a.state = 'ready' AND a.tier = ANY(CAST(:tiers AS text[]))
@@ -366,6 +374,7 @@ class Coordinator:
         self.engine = engine
         self.cache = cache
         self.settings = settings
+        self.cache_nodes = cache_nodes(settings.cache_url)
         self.clock: Callable[[], datetime] = lambda: datetime.now(UTC)
         self.scaler: ScaleRun | None = None  # the scale command's last run
         # How many actions this process's release has made ready, and the claims waiting, by the tiers they take
@@ -405,7 +414,6 @@ class Coordinator:
             ),
             # Every connection stays open between requests, so bursts of them don't each open a new TLS connection.
             httpx.AsyncClient(
-                base_url=settings.cache_url,
                 timeout=30,
                 follow_redirects=True,
                 limits=httpx.Limits(max_connections=100, max_keepalive_connections=100),
@@ -421,7 +429,9 @@ class Coordinator:
         await self.cache.aclose()
         await self.engine.dispose()
 
-    async def submit(self, batch: Batch, profile: str, action_class: str = "build") -> UUID:
+    async def submit(
+        self, batch: Batch, profile: str, action_class: str = "build", max_heap_mb: int | None = None
+    ) -> UUID:
         """Store a batch; its actions without uncached parents become ready."""
         batch_id = uuid4()
         parents: defaultdict[str, int] = defaultdict(int)
@@ -442,8 +452,16 @@ class Coordinator:
             )
             high = {theory for theory, peak in hints if peak >= self.settings.standard_tier_mb}
             await conn.execute(
-                sa.text("INSERT INTO batches (id, state, profile) VALUES (:id, :state, :profile)"),
-                {"id": batch_id, "state": "running" if batch.actions else "done", "profile": profile},
+                sa.text(
+                    "INSERT INTO batches (id, state, profile, max_heap_mb) "
+                    "VALUES (:id, :state, :profile, :max_heap_mb)"
+                ),
+                {
+                    "id": batch_id,
+                    "state": "running" if batch.actions else "done",
+                    "profile": profile,
+                    "max_heap_mb": max_heap_mb,
+                },
             )
             if batch.actions:
                 await conn.execute(
@@ -607,7 +625,7 @@ class Coordinator:
                     "lease": self.settings.lease_seconds,
                 },
             )
-        return Claim(token, row.spec_sha256, row.input_key, row.theory, self.settings.lease_seconds)
+        return Claim(token, row.spec_sha256, row.input_key, row.theory, self.settings.lease_seconds, row.max_heap_mb)
 
     def _wake_claim(self, tier: str) -> None:
         """Count an action of ``tier`` made ready, and wake the longest waiting claim that takes it."""
@@ -1079,24 +1097,35 @@ class Coordinator:
 
     async def _check_cache(self, ac_key: str, limit: asyncio.Semaphore) -> bool | None:
         forgotten = self.cache_forgotten
-        try:
-            async with limit:
-                response = await self.cache.get(f"/ac/{ac_key}")
-        except httpx.HTTPError:
-            return None
-        if response.status_code == 200:
-            if self.cache_forgotten == forgotten:  # else an input went missing since this check began
-                self.found_in_cache[ac_key] = asyncio.get_running_loop().time()
-            return True
-        if response.status_code == 404:
+        missing = False
+        failure: httpx.Response | None = None
+        for node in ranked_nodes(self.cache_nodes, ac_key)[:2]:
+            try:
+                async with limit:
+                    response = await self.cache.get(f"{node}/ac/{ac_key}")
+            except httpx.HTTPError:
+                continue
+            if response.status_code == 200:
+                if self.cache_forgotten == forgotten:  # else an input went missing since this check began
+                    self.found_in_cache[ac_key] = asyncio.get_running_loop().time()
+                return True
+            if response.status_code == 404:
+                missing = True
+                continue
+            failure = response
+            if response.status_code != 429 and not 500 <= response.status_code < 600:
+                missing = False
+                break
+        if missing:
             return False
-        request = response.request
-        logger.warning(
-            "%s %s answered %d; its children wait for the next sweep",
-            request.method,
-            request.url.path,
-            response.status_code,
-        )
+        if failure is not None:
+            request = failure.request
+            logger.warning(
+                "%s %s answered %d; its children wait for the next sweep",
+                request.method,
+                request.url.path,
+                failure.status_code,
+            )
         return None
 
     async def _requeue_evicted(self, batch_id: UUID, parent: str) -> bool:

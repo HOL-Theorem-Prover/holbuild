@@ -51,6 +51,11 @@ runs finish and cancel queued run batches. Use the current image to run
 `alembic downgrade 0004` before starting the older image, whose migration
 code does not know revision `0005`.
 
+Migration `0007` adds a nullable `batches.max_heap_mb` column. Old clients
+leave it null; new workers use their default when an old coordinator omits
+it from a claim. Before rolling back to an older image, use the current image
+to run `alembic downgrade 0006`.
+
 Migration `0006` adds a nullable column for each action's phase timings.
 To roll back to an image predating `0006`, use the current image to run
 `alembic downgrade 0005` first, then run the older image's `migrate` and
@@ -93,6 +98,21 @@ docker run -e REMOTE_EXEC_WORKER_TOKEN=... -e HOLBUILD_REMOTE_CACHE_CURL_CONFIG_
   [--share-heaps] [--holbuild-releases-dir DIR] [--protection-cmd COMMAND] [--claim-wait-seconds 20]
 ```
 
+The coordinator's `REMOTE_EXEC_CACHE_URL` (or `HOLBUILD_REMOTE_CACHE_URL` as a
+fallback) and the worker's `--remote-cache` (or `HOLBUILD_REMOTE_CACHE_URL`)
+accept comma-separated cache nodes. Whitespace separators also work; trailing
+slashes and duplicate nodes are removed. Inline credentials are excluded from
+node identity, so they agree with curl-config authentication. Use the same
+node hostnames and paths as the clients:
+coordinator reads and worker bootstrap spec downloads use holbuild's digest
+ranking and second-node fallback, including a read's 404 during handoff.
+See the top-level README's remote-cache configuration for the routing contract.
+
+Before enabling multiple cache nodes, upgrade the coordinator, workers and
+submitting clients to a release that supports cache rings, and drain batches
+whose specs name older holbuild releases. Workers run the release named in
+each spec; an older release treats the entire list as one URL.
+
 The remote cache's credentials are a curl config, as holbuild reads it from
 the file `HOLBUILD_REMOTE_CACHE_CURL_CONFIG` names; the entrypoint writes
 `HOLBUILD_REMOTE_CACHE_CURL_CONFIG_CONTENT` to such a file, readable only by
@@ -106,8 +126,8 @@ out of the builds' environment (and out of what they log or pass on). A
 build runs as the worker's user, so one that goes looking can still read the
 token from the worker's `/proc/<pid>/environ`. Outside the image,
 `python3 -m remote_exec.worker` runs the worker; it uses only the standard
-library and `curl`. High-tier workers run with a larger `--max-heap` on bigger
-machines; `--also-claim standard` lets them take standard-tier work when no
+library and `curl`. A batch can override the worker's `--max-heap` default
+(12000 MB); `--also-claim standard` lets them take standard-tier work when no
 high-tier action is ready. With `--cooperate-dir`, a worker claims only while
 holbuild's memory admission in that directory would start one more child
 there, so an action a busy host couldn't start yet stays at the coordinator
@@ -150,6 +170,12 @@ holbuild-action-batch-v1
 action <input_key> <ac-key> <spec-sha256> <package>:<theory>
 edge <input_key> <parent input_key>
 ```
+
+The client sends its `--max-heap MB` as the optional positive integer query
+parameter `max_heap_mb` on `POST /v1/batches`. The coordinator stores it with
+the batch and returns it on `/v1/work/claim`; workers pass it to `exec-action`.
+When absent or null, the worker uses its own `--max-heap` setting. This limit
+is execution policy and does not change action keys.
 
 A batch has one class: `build` (the default) or `run`, selected with
 `POST /v1/batches?class=run`. Run actions execute submitted scripts in cached
