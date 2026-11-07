@@ -9,6 +9,11 @@ source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
 cleanup() {
+  touch "$tmpdir/control/action-get-release" 2>/dev/null || true
+  if [[ -n "${export_pid:-}" ]]; then
+    kill "$export_pid" 2>/dev/null || true
+    wait "$export_pid" 2>/dev/null || true
+  fi
   if [[ -n "${server_pid:-}" ]]; then
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
@@ -18,7 +23,7 @@ cleanup() {
 trap cleanup EXIT
 
 remote_root=$tmpdir/remote
-start_remote_cache_server "$remote_root" "$tmpdir/server"
+start_remote_cache_server "$remote_root" "$tmpdir/server" "$tmpdir/control"
 use_case_cache "$tmpdir/cache"
 
 project=$tmpdir/project
@@ -124,6 +129,39 @@ printf 'edge %s %s\nedge %s %s\n' "$key_b" "$key_a" "$key_c" "$key_b" | sort > "
 diff -u "$tmpdir/edges1.expected" "$tmpdir/edges1.txt"
 [[ $(grep -c '^action' "$tmpdir/batch1.txt") -eq 3 ]] || { cat "$tmpdir/batch1.txt" >&2; exit 1; }
 
+# Serial and concurrent checks emit identical ordered batches. Hold AC GETs
+# until two are in flight: a serial exporter cannot reach the release.
+hb --prefetch-concurrency 1 action-spec CTheory > "$tmpdir/batch-serial.txt"
+diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-serial.txt"
+touch "$tmpdir/control/action-get-enable"
+(cd "$project" && exec "$HOLBUILD_BIN" --remote-cache "$remote_url" \
+  --prefetch-concurrency 2 action-spec CTheory) \
+  > "$tmpdir/batch-parallel.txt" 2> "$tmpdir/check-progress.log" &
+export_pid=$!
+for _ in {1..500}; do
+  count=$(cat "$tmpdir/control/action-get-count" 2>/dev/null || echo 0)
+  [[ "$count" -ge 2 ]] && break
+  kill -0 "$export_pid" 2>/dev/null || break
+  sleep 0.01
+done
+[[ "$count" -eq 2 ]] || {
+  echo "expected two concurrent action checks, observed $count" >&2
+  exit 1
+}
+touch "$tmpdir/control/action-get-release"
+wait "$export_pid"
+unset export_pid
+rm "$tmpdir/control/action-get-enable"
+diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-parallel.txt"
+require_grep '^checking remote cache: 0/3 theories$' "$tmpdir/check-progress.log"
+require_grep '^checking remote cache: 3/3 theories$' "$tmpdir/check-progress.log"
+hb --quiet action-spec CTheory > "$tmpdir/batch-quiet.txt" 2> "$tmpdir/quiet.log"
+diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-quiet.txt"
+if grep -q 'checking remote cache:' "$tmpdir/quiet.log"; then
+  echo "quiet export printed progress" >&2
+  exit 1
+fi
+
 spec_b=$(awk -v key="$key_b" '$1 == "action" && $2 == key { print $4 }' "$tmpdir/batch1.txt")
 spec_b_path=$project/.holbuild/action-specs/$spec_b
 require_grep "^file input src/data.txt " "$spec_b_path"
@@ -152,6 +190,8 @@ done
 hb build ATheory > "$tmpdir/build-a.log" 2>&1
 hb action-spec CTheory > "$tmpdir/batch2.txt"
 check_specs "$tmpdir/batch2.txt"
+hb --prefetch-concurrency 1 action-spec CTheory > "$tmpdir/batch2-serial.txt"
+diff -u "$tmpdir/batch2.txt" "$tmpdir/batch2-serial.txt"
 awk '$1 == "action" { print $2 }' "$tmpdir/batch2.txt" | sort > "$tmpdir/actions2.txt"
 printf '%s\n%s\n' "$key_b" "$key_c" | sort > "$tmpdir/actions2.expected"
 diff -u "$tmpdir/actions2.expected" "$tmpdir/actions2.txt"
@@ -170,6 +210,8 @@ hb action-spec CTheory > "$tmpdir/batch-expired.txt" 2> "$tmpdir/batch-expired.e
 if grep -q "using the curl command" "$tmpdir/batch-expired.err"; then cat "$tmpdir/batch-expired.err" >&2; exit 1; fi
 HOLBUILD_TEST_LIBCURL=libholbuild-test-no-such-curl.so hb action-spec CTheory > "$tmpdir/batch-expired-cli.txt"
 [[ $(grep -c '^action' "$tmpdir/batch-expired-cli.txt") -eq 3 ]] || { cat "$tmpdir/batch-expired-cli.txt" >&2; exit 1; }
+hb --prefetch-concurrency 1 action-spec CTheory > "$tmpdir/batch-expired-serial.txt"
+diff -u "$tmpdir/batch-expired.txt" "$tmpdir/batch-expired-serial.txt"
 mv "$tmpdir/blob-a" "$remote_root/cas/$blob_a"
 
 # A stricter timeout than A's entry was built with makes A uncached again.
