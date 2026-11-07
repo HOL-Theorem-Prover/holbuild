@@ -5324,11 +5324,7 @@ fun prefetch_key (options : build_options) project keys node =
    once.  Returns {add, drain, stop}: drain waits for all added work; stop drops
    the items not yet started and waits for those in flight.  Failures are
    silent: for a prefetch, the demand restore of the same key retries and
-   reports.  Once stop has waited, the remote cache connections the threads
-   left idle are closed: the server closes an idle connection after a
-   while, and one no later request reuses would stay half-closed until the
-   process exits.  drain keeps the pool's share of them, up to
-   HolbuildHttp.max_idle, for the next requests. *)
+   reports. *)
 fun start_background_pool limit work =
   let
     val front = ref [] and back = ref []
@@ -5350,27 +5346,23 @@ fun start_background_pool limit work =
     fun worker item =
       ((work item handle _ => ());
        case with_lock (fn () => case pop () of
-                                    NONE => (active := !active - 1; HolbuildHttp.release_idle (); NONE)
+                                    NONE => (active := !active - 1; NONE)
                                   | next => next) of
            SOME next => worker next
          | NONE => ())
-    (* Each thread holds a reservation of a pooled connection (see
-       HolbuildHttp.max_idle) for as long as it counts in active. *)
     fun add item =
       if with_lock (fn () =>
            if !stopped then false
-           else if !active < limit then (active := !active + 1; HolbuildHttp.reserve_idle (); true)
+           else if !active < limit then (active := !active + 1; true)
            else (back := item :: !back; false))
       then ignore (Thread.fork (fn () => worker item, []))
-           handle e => (with_lock (fn () => (active := !active - 1; HolbuildHttp.release_idle ()));
-                        raise e)
+           handle e => (with_lock (fn () => active := !active - 1); raise e)
       else ()
     fun wait () =
       if with_lock (fn () => !active) > 0 then (OS.Process.sleep (Time.fromReal 0.05); wait ())
       else ()
     fun stop () =
-      (with_lock (fn () => (stopped := true; front := []; back := [])); wait ();
-       HolbuildHttp.close_idle ())
+      (with_lock (fn () => (stopped := true; front := []; back := [])); wait ())
   in
     {add = add, drain = wait, stop = stop}
   end
@@ -5833,7 +5825,7 @@ fun drop_local_cache_entries keys =
    With local_resumable, a theory built here for its current input key, and
    not forced, stays out unchecked, unless a theory in the batch depends on
    it and it can't be published from the local cache. *)
-fun export_batch (options : build_options) tc project plan toolchain_key jobs {upload, local_resumable, forced} =
+fun export_action_specs (options : build_options) tc project plan toolchain_key jobs {upload, local_resumable, forced} =
   let
     val remote =
       case HolbuildRemoteCacheConfig.url () of
@@ -6000,12 +5992,6 @@ fun export_batch (options : build_options) tc project plan toolchain_key jobs {u
   in
     String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n"
   end
-
-(* The check pool leaves up to HolbuildHttp.max_idle connections idle for the
-   uploads; none is reused after the export, so they are closed. *)
-fun export_action_specs options tc project plan toolchain_key jobs flags =
-  (export_batch options tc project plan toolchain_key jobs flags before HolbuildHttp.close_idle ())
-  handle e => (HolbuildHttp.close_idle (); raise e)
 
 (* holbuild exec-action: a remote worker builds one ActionSpec in a fixed
    action root under the cache root, with only the remote cache as input, and
