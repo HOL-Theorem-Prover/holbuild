@@ -117,6 +117,7 @@ fun version_text number =
    libcurl can't be loaded. *)
 fun setup {user} =
   let
+    val _ = HolbuildOffline.require_online "initialize the HTTP client"
     (* Fields of curl_version_info_data present since its first version.
        get32's offset counts 32-bit words: version_num is at byte 16 and
        features at byte 32 on 64-bit platforms. *)
@@ -276,6 +277,7 @@ fun c_string_at p =
    resolver. *)
 fun transfer ({easy, multi, errors} : connection) =
   let
+    val _ = HolbuildOffline.require_online "send an HTTP request"
     val running = ref 0
     val code = ref 0
     fun read_done () =
@@ -315,6 +317,7 @@ fun with_file path mode f =
    output.  set_options sets the request's own options; the data pointers
    are cleared afterwards, so the pooled handle keeps none of them. *)
 fun request {url, timeout, output, set_options} =
+  (HolbuildOffline.require_online "send an HTTP request";
   with_handle (fn connection as {easy, ...} =>
     (check "TIMEOUT" (setopt_long (easy, CURLOPT_TIMEOUT, timeout));
      check "URL" (setopt_str (easy, CURLOPT_URL, url));
@@ -322,7 +325,7 @@ fun request {url, timeout, output, set_options} =
      set_options easy;
      transfer connection
      before List.app (fn option => ignore (setopt_ptr (easy, option, Foreign.Memory.null)))
-              [CURLOPT_WRITEDATA, CURLOPT_READDATA, CURLOPT_HTTPHEADER]))
+              [CURLOPT_WRITEDATA, CURLOPT_READDATA, CURLOPT_HTTPHEADER])))
 
 (* Downloads url into dst, decoding any content encoding. *)
 fun get {url, dst, timeout} =

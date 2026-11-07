@@ -199,7 +199,7 @@ fun built holdir =
 fun dirty_status k holdir =
   trim
     (command_output_using (run_mutation_output k)
-       ("git -C " ^ quote holdir ^ " status --porcelain --ignored=no"))
+       (HolbuildOffline.git_command () ^ " -C " ^ quote holdir ^ " status --porcelain --ignored=no"))
 fun clean k holdir = dirty_status k holdir = ""
 
 fun effective_build_args kernel_variant holdir =
@@ -274,7 +274,7 @@ fun legacy_hol_source_files k holdir =
   let
     (* Not command_output_using: git's stderr must not mix with the paths. *)
     val {status, output} =
-      run_mutation_output k ("git -C " ^ quote holdir ^ " ls-files -z 2>/dev/null")
+      run_mutation_output k (HolbuildOffline.git_command () ^ " -C " ^ quote holdir ^ " ls-files -z 2>/dev/null")
   in
     if OS.Process.isSuccess status then SOME (String.tokens (fn c => c = #"\000") output)
     else NONE
@@ -332,17 +332,20 @@ fun theory_toolchain_key_for_holdir holdir =
 fun validate_entry req k =
   let val dir = entry_dir_for_key k
       val holdir = holdir_for_key k
+      fun invalid message =
+        (HolbuildOffline.require_online ("repair HOL toolchain " ^ #rev req ^ " at " ^ holdir);
+         die message)
   in
     if not (path_exists dir) then false
     else if not (path_exists (ok_for_key k)) then false
     else if not (built holdir) then
-      die ("broken HOL toolchain cache entry: " ^ dir ^ "\nremove it with: rm -rf " ^ quote dir)
+      invalid ("broken HOL toolchain cache entry: " ^ dir ^ "\nremove it with: rm -rf " ^ quote dir)
     else if not (path_exists (Path.concat(holdir, ".git"))) then false
     else
       let val output = dirty_status k holdir
       in
         if output = "" then true
-        else die ("dirty HOL toolchain cache entry: " ^ dir ^ "\n" ^ output ^ "\nremove it with: rm -rf " ^ quote dir)
+        else invalid ("dirty HOL toolchain cache entry: " ^ dir ^ "\n" ^ output ^ "\nremove it with: rm -rf " ^ quote dir)
       end
   end
 
@@ -517,6 +520,7 @@ val restore_only = ref false
 val local_build_needed = ref false
 
 fun build_entry jobs req k =
+  (HolbuildOffline.require_online ("prepare HOL toolchain " ^ #rev req ^ " at " ^ holdir_for_key k);
   if !restore_only then
     (local_build_needed := true;
      die "the HOL toolchain could not be restored from a cache, and --remote-only builds nothing locally")
@@ -532,8 +536,8 @@ fun build_entry jobs req k =
       (ensure_dir (toolchains_dir ());
        if path_exists final then remove_tree run_command final else ();
        ensure_dir final;
-       run_in_dir run_command final ("git clone " ^ quote (#git req) ^ " " ^ quote hol);
-       run_in_dir run_command hol ("git checkout --detach " ^ quote (#rev req)))
+       run_in_dir run_command final (HolbuildOffline.git_command () ^ " clone " ^ quote (#git req) ^ " " ^ quote hol);
+       run_in_dir run_command hol (HolbuildOffline.git_command () ^ " checkout --detach " ^ quote (#rev req)))
     fun build () =
       let
         val _ = fetch ()
@@ -552,7 +556,7 @@ fun build_entry jobs req k =
       end
   in
     build () handle e => (remove_tree run_command final; raise e)
-  end
+  end)
 
 fun wait_test_gate variable =
   case OS.Process.getEnv variable of
@@ -648,6 +652,7 @@ datatype restore_outcome = Restored | NotRestored | Rejected
 
 fun restore_entry k =
   let
+    val _ = HolbuildOffline.require_online ("restore HOL toolchain at " ^ holdir_for_key k)
     val final = entry_dir_for_key k
     (* The analyser is not archived; finish_entry builds it for restored and
        locally built entries alike. *)
@@ -720,13 +725,14 @@ fun generate_legacy_theory_toolchain req k =
 datatype publication = NoPublication | Publish of {replace : bool}
 
 fun restore_or_build_entry jobs req k =
+  (HolbuildOffline.require_online ("prepare HOL toolchain " ^ #rev req ^ " at " ^ holdir_for_key k);
   case restore_entry k of
       Restored => NoPublication
     | outcome =>
         (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_LOCAL_FALLBACK";
          wait_test_gate "HOLBUILD_TEST_TOOLCHAIN_LOCAL_FALLBACK_GATE";
          ignore (build_entry jobs req k);
-         Publish {replace = outcome = Rejected})
+         Publish {replace = outcome = Rejected}))
 
 fun finish_entry jobs req k =
   let

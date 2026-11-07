@@ -5849,6 +5849,7 @@ fun drop_local_cache_entries keys =
    it and it can't be published from the local cache. *)
 fun export_action_specs (options : build_options) tc project plan toolchain_key jobs {upload, local_resumable, forced} =
   let
+    val _ = if upload then HolbuildOffline.require_online "upload action specs" else ()
     val remote =
       case HolbuildRemoteCacheConfig.url () of
           SOME url => HolbuildRemoteCache.remote url
@@ -7379,6 +7380,7 @@ fun publish_early_cutoff remote pair_key input_key =
    `toolchain` ensures the spec's HOL toolchain and returns it. *)
 fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
   let
+    val _ = HolbuildOffline.require_online "execute a remote action"
     val start = Time.now ()
     val remote =
       case HolbuildRemoteCacheConfig.url () of

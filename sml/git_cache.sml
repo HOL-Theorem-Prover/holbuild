@@ -136,10 +136,11 @@ fun remove_temp_dirs {dir, prefix} =
    path that exists always holds a complete clone. Runs under the mirror lock. *)
 fun clone_remote git dir =
   let
+    val _ = HolbuildOffline.require_online "clone a dependency mirror"
     val tmp = dir ^ ".tmp-" ^ HolbuildFileLock.current_pid_text ()
   in
     remove_temp_dirs {dir = Path.dir dir, prefix = Path.file dir ^ ".tmp-"};
-    (run ("git clone --bare " ^ quote git ^ " " ^ quote tmp);
+    (run (HolbuildOffline.git_command () ^ " clone --bare " ^ quote git ^ " " ^ quote tmp);
      let val out = TextIO.openOut (dir ^ ".holbuild-url")
      in TextIO.output(out, git ^ "\n"); TextIO.closeOut out end;
      FS.rename {old = tmp, new = dir})
@@ -147,8 +148,8 @@ fun clone_remote git dir =
   end
 
 fun verify_commit remote rev =
-  (run ("git -C " ^ quote remote ^ " cat-file -e " ^ quote (rev ^ "^{commit}"));
-   trim (command_output ("git -C " ^ quote remote ^ " rev-parse " ^ quote (rev ^ "^{commit}"))))
+  (run (HolbuildOffline.git_command () ^ " -C " ^ quote remote ^ " cat-file -e " ^ quote (rev ^ "^{commit}"));
+   trim (command_output (HolbuildOffline.git_command () ^ " -C " ^ quote remote ^ " rev-parse " ^ quote (rev ^ "^{commit}"))))
 
 fun has_commit remote rev = (ignore (verify_commit remote rev); true) handle Error _ => false
 
@@ -163,17 +164,17 @@ fun ensure_commit git rev =
     else
       with_lock (remote ^ ".lock")
         (fn () =>
-            (if path_exists remote then () else clone_remote git remote;
+            (HolbuildOffline.require_online ("fetch dependency revision " ^ rev);
+             if path_exists remote then () else clone_remote git remote;
              if has_commit remote rev then ()
-             else run ("git -C " ^ quote remote ^ " fetch origin " ^ quote rev)));
+             else run (HolbuildOffline.git_command () ^ " -C " ^ quote remote ^ " fetch origin " ^ quote rev)));
     (remote, verify_commit remote rev)
   end
 
 fun materialized_head dest =
   if path_exists dest then
     let
-      val run = HolbuildSpawn.run {program = "git", args = ["-C", dest, "rev-parse", "HEAD"],
-                                   stderr = HolbuildSpawn.Discard}
+      val run = HolbuildOffline.git_run ["-C", dest, "rev-parse", "HEAD"]
     in
       if HolbuildSpawn.succeeded run then SOME (trim (#output run)) else NONE
     end
@@ -227,13 +228,14 @@ fun materialize {name, git, rev, artifact_root} =
     (* Runs under the checkout lock. *)
     fun checkout () =
       let
+        val _ = HolbuildOffline.require_online ("materialize dependency " ^ name ^ " at " ^ rev)
         val (remote, commit) = ensure_commit git rev
         val tmp_prefix = ".tmp-" ^ name ^ "-"
         val tmp = Path.concat(src_root, tmp_prefix ^ HolbuildFileLock.current_pid_text ())
       in
         remove_temp_dirs {dir = src_root, prefix = tmp_prefix};
-        (run ("git clone " ^ quote remote ^ " " ^ quote tmp);
-         run ("git -C " ^ quote tmp ^ " checkout --detach " ^ quote commit);
+        (run (HolbuildOffline.git_command () ^ " clone " ^ quote remote ^ " " ^ quote tmp);
+         run (HolbuildOffline.git_command () ^ " -C " ^ quote tmp ^ " checkout --detach " ^ quote commit);
          publish_checkout {tmp = tmp, dest = dest, lease = lease})
         handle e => (remove_if_exists tmp; raise e)
       end
