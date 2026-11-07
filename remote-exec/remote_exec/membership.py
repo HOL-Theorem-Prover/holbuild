@@ -43,11 +43,18 @@ class Membership:
     attempted: float = float('-inf')
     succeeded: float = float('-inf')
     members: list[str] = field(default_factory=list)
+    joined: float = float('-inf')
 
     def update(self, text: str, now: float) -> None:
         members = parse_members(text, self.defaults, self.allowed)
+        if set(members) - set(self.members or self.defaults):
+            self.joined = now
         self.members = members
         self.succeeded = now
 
     def current(self, now: float) -> list[str]:
         return self.members if self.members and now - self.succeeded < STALE_SECONDS else self.defaults
+
+    def joining(self, now: float) -> bool:
+        """Cover async write-back to a former owner for sixty seconds after observing a join."""
+        return now - self.joined < STALE_SECONDS

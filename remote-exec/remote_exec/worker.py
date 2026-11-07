@@ -29,11 +29,11 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
-from remote_exec.membership import REFRESH_SECONDS, Membership
 from remote_exec.cache import cache_nodes, ranked_nodes
+from remote_exec.membership import REFRESH_SECONDS, Membership
 
 DEFAULT_SOURCE_URL = "https://github.com/HOL-Theorem-Prover/holbuild/archive/refs/tags/v{version}.tar.gz"
 RELEASE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
@@ -189,6 +189,7 @@ class Releases:
     source_url: str
     remote_cache: str
     curl_config: str | None
+    joining: bool = field(default=False, kw_only=True)
 
     def spec_version(self, spec_sha256: str) -> str:
         """The ``holbuild-version`` of the action spec stored in the remote cache's ``/cas/``."""
@@ -205,11 +206,13 @@ class Releases:
         unavailable: str | None = None
         missing: str | None = None
         failure = f"spec {spec_sha256} is missing from the remote cache"
-        for node in ranked_nodes(nodes, spec_sha256)[:2]:
+        for attempt, node in enumerate(ranked_nodes(nodes, spec_sha256), 1):
+            if attempt > 2 and not self.joining and missing is not None:
+                raise RuntimeError(missing)
             # Not check=True: its error would print credentials in the command line.
             try:
                 fetched = subprocess.run(
-                    [*command, f"{node}/cas/{spec_sha256}"], capture_output=True, text=True, timeout=120
+                    [*command, f"{node}/cas/{spec_sha256}"], check=False, capture_output=True, text=True, timeout=120
                 )
             except subprocess.TimeoutExpired:
                 unavailable = f"fetching spec {spec_sha256} from the remote cache timed out"
@@ -813,14 +816,15 @@ def main() -> None:
     if discovery_url:
         if discovery_url != coordinator.url + "/v1/cache/members":
             sys.exit("cache discovery must use this worker's coordinator /v1/cache/members endpoint")
-        from remote_exec.cache import cache_nodes
         membership = Membership(cache_nodes(args.remote_cache),
                                 cache_nodes(os.environ.get("HOLBUILD_REMOTE_CACHE_ALLOWED_URLS", args.remote_cache)))
         # The SML child's curl config is created in holbuild's private temporary directory.
         os.environ["HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN"] = token
     while True:
         if membership is not None and discovery_url is not None:
-            releases.remote_cache = ",".join(refresh_cache_members(coordinator, membership, discovery_url, time.monotonic()))
+            now = time.monotonic()
+            nodes = refresh_cache_members(coordinator, membership, discovery_url, now)
+            releases = replace(releases, remote_cache=",".join(nodes), joining=membership.joining(now))
         if args.cooperate_dir is not None:
             with phases.timed("memory_wait"):
                 waited = wait_for_memory(args.cooperate_dir, charge)

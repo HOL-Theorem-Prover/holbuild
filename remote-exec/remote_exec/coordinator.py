@@ -26,9 +26,10 @@ from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
+from remote_exec.cache import cache_nodes, node_identity, ranked_nodes
 from remote_exec.cache_pool import CachePool, CacheSlot, CommandAdapter, cache_target
-from remote_exec.cache import cache_nodes, ranked_nodes
 from remote_exec.formats import Batch, Result
+from remote_exec.membership import REFRESH_SECONDS, Membership
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +90,7 @@ class Settings(BaseSettings):
     scale_down_hold_s: float = 900.0
     cache_pool_cmd: str | None = None
     cache_slots: list[CacheSlot] = Field(default_factory=list)
-    cache_workers_per_node: int = Field(default=0, ge=0)
+    cache_workers_per_node: int = Field(default=15, ge=0)
     cache_drain_seconds: int = Field(default=60, ge=60)
     scale_cmd: str | None = None  # run as `<scale_cmd> <desired burst workers>` when that number changes
 
@@ -380,6 +381,8 @@ class Coordinator:
         self.cache = cache
         self.settings = settings
         self.cache_nodes = cache_nodes(settings.cache_url)
+        self.membership = Membership(self.cache_nodes, [slot.url for slot in settings.cache_slots])
+        self.membership_lock = asyncio.Lock()
         self.clock: Callable[[], datetime] = lambda: datetime.now(UTC)
         self.cache_pool = (CachePool(engine, settings.cache_slots, CommandAdapter(settings.cache_pool_cmd),
                                      drain_seconds=settings.cache_drain_seconds, hold_seconds=settings.scale_down_hold_s)
@@ -1108,11 +1111,32 @@ class Coordinator:
         self.cache_checks.clear()
         self.cache_forgotten += 1
 
+    async def cache_read_nodes(self, digest: str) -> list[str]:
+        """Refresh ready slots at most once per thirty seconds, retaining the permanent fallback."""
+        if self.cache_pool is None:
+            return ranked_nodes(self.cache_nodes, digest)[:2]
+        now = asyncio.get_running_loop().time()
+        if now - self.membership.attempted >= REFRESH_SECONDS:
+            async with self.membership_lock:
+                if now - self.membership.attempted >= REFRESH_SECONDS:
+                    self.membership.attempted = now
+                    try:
+                        members = self.cache_nodes + await self.cache_pool.ready_urls()
+                        text = "holbuild-cache-members-v1\n" + "\n".join(node_identity(url) for url in members)
+                        self.membership.update(text, now)
+                    except sa.exc.SQLAlchemyError:
+                        logger.warning("cache membership query failed; retaining the permanent fallback")
+        return ranked_nodes(self.membership.current(now), digest)
+
     async def _check_cache(self, ac_key: str, limit: asyncio.Semaphore) -> bool | None:
         forgotten = self.cache_forgotten
         missing = False
         failure: httpx.Response | None = None
-        for node in ranked_nodes(self.cache_nodes, ac_key)[:2]:
+        nodes = await self.cache_read_nodes(ac_key)
+        joining = self.membership.joining(asyncio.get_running_loop().time())
+        for attempt, node in enumerate(nodes, 1):
+            if attempt > 2 and not joining and missing:
+                break
             try:
                 async with limit:
                     response = await self.cache.get(f"{node}/ac/{ac_key}")

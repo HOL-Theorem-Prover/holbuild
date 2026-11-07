@@ -216,7 +216,7 @@ async def test_cancelled_controller_releases_leadership_before_returning_connect
     assert len([r for r in p.calls if r.op == "inventory"]) == 2
 
 
-@pytest.mark.parametrize(("workers", "ratio", "expected"), [(0, 60, 0), (1, 60, 1), (60, 60, 1), (61, 60, 2),
-                                                          (240, 60, 4), (1000, 60, 4), (240, 0, 0)])
+@pytest.mark.parametrize(("workers", "ratio", "expected"), [(0, 15, 0), (1, 15, 1), (15, 15, 1), (16, 15, 2),
+                                                          (60, 15, 4), (240, 15, 4), (240, 0, 0)])
 def test_worker_mapping_is_bounded_and_zero_ratio_disables_capacity(workers: int, ratio: int, expected: int) -> None:
     assert cache_target(workers, ratio, 4) == expected

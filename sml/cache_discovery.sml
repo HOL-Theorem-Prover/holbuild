@@ -11,6 +11,9 @@ val attempted = ref Time.zeroTime
 val succeeded = ref Time.zeroTime
 val members : string list ref = ref []
 val scope = ref ""
+val joined = ref Time.zeroTime
+
+fun joining () = Time.< (Time.- (Time.now (), !joined), Time.fromSeconds stale_seconds)
 
 fun env name =
   case OS.Process.getEnv name of SOME "" => NONE | value => value
@@ -68,7 +71,7 @@ fun fetch url defaults =
     val token_file = case env "HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN" of
         NONE => NONE
       | SOME token =>
-          if String.exists (fn c => c = #"\r" orelse c = #"\n" orelse c = #"\"" orelse c = #"\\") token then
+          if List.exists (fn c => c = #"\r" orelse c = #"\n" orelse c = #"\"" orelse c = #"\\") (String.explode token) then
             raise Error "invalid cache discovery token"
           else
             let
@@ -83,7 +86,7 @@ fun fetch url defaults =
         val result = HolbuildSpawn.run {
           program = "curl", stderr = HolbuildSpawn.Discard,
           args = ["-q", "-fsSg", "--connect-timeout", "2", "--max-time", "5", "--max-filesize", "16384"] @
-            config_args () @ (case token_file of NONE => [] | SOME path => ["--config", path]) @ [url]}
+            (case token_file of NONE => config_args () | SOME path => ["--config", path]) @ [url]}
       in
         if HolbuildSpawn.succeeded result then SOME (parse defaults (allowed defaults) (#output result)) else NONE
       end
@@ -98,7 +101,7 @@ fun urls defaults =
       val _ = Mutex.lock mutex
       val requested_scope = String.concatWith "," defaults
       val _ = if !scope <> requested_scope andalso not (!refreshing) then
-          (scope := requested_scope; attempted := Time.zeroTime; succeeded := Time.zeroTime; members := [])
+          (scope := requested_scope; attempted := Time.zeroTime; succeeded := Time.zeroTime; members := []; joined := Time.zeroTime)
         else ()
       val same_scope = !scope = requested_scope
       val update = same_scope andalso not (!refreshing) andalso
@@ -112,7 +115,11 @@ fun urls defaults =
         else NONE) handle e => (if update then release () else (); raise e)
       val _ = Mutex.lock mutex
       val _ = if update then
-          ((case fetched of SOME nodes => (members := nodes; succeeded := now) | NONE => ()); refreshing := false)
+          ((case fetched of SOME nodes =>
+              (if List.exists (fn node => not (List.exists (fn old => old = node)
+                    (if null (!members) then defaults else !members))) nodes then joined := now else ();
+               members := nodes; succeeded := now)
+            | NONE => ()); refreshing := false)
         else ()
       val result = if not same_scope orelse null (!members) orelse
                      Time.>= (Time.- (now, !succeeded), Time.fromSeconds stale_seconds)

@@ -91,3 +91,84 @@ async def test_members_endpoint_auth_and_no_credentials_before_or_after_ready(ht
     assert len(response.text.splitlines()) == 3
     slots = await http.get('/v1/cache/slots', headers={'Authorization': f'Bearer {CLIENT_TOKEN}'})
     assert slots.json() == [{'slot': 'c', 'url': 'https://cache-c.example', 'owner': 'instance', 'phase': 'drain', 'error': None}]
+
+
+def test_join_grace_expires_without_steady_state_miss_amplification() -> None:
+    defaults = ALLOWED[:2]
+    all_nodes = [*defaults, *[f'https://cache-{n}.example' for n in range(3, 7)]]
+    membership = Membership(defaults, all_nodes)
+    membership.update('holbuild-cache-members-v1\n' + '\n'.join(all_nodes), 0)
+    assert membership.joining(59)
+    # A successful unchanged refresh keeps the ring but does not extend the join grace.
+    membership.update('holbuild-cache-members-v1\n' + '\n'.join(all_nodes), 30)
+    assert not membership.joining(60)
+
+
+async def test_coordinator_reads_a_former_owner_below_rank_two_only_during_join_grace(coordinator, monkeypatch) -> None:
+    import asyncio
+    from unittest.mock import AsyncMock, Mock
+
+    import httpx
+
+    from remote_exec.cache import node_identity, ranked_nodes
+
+    nodes = [f'https://cache-{n}.example' for n in range(1, 7)]
+    coordinator.cache_nodes = nodes[:2]
+    coordinator.membership = Membership(nodes[:2], nodes)
+    coordinator.cache_pool = Mock(ready_urls=AsyncMock(return_value=nodes[2:]))
+    key = 'new-entry'
+    former = ranked_nodes(nodes, key)[-1]
+    asked = []
+    other_status = [404]
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        url = node_identity(str(request.url).removesuffix('/ac/' + key))
+        asked.append(url)
+        return httpx.Response(200 if url == former else other_status[0])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as cache:
+        monkeypatch.setattr(coordinator, 'cache', cache)
+        assert await coordinator._check_cache(key, asyncio.Semaphore(1)) is True
+        assert len(asked) == 6
+        coordinator.membership.joined -= 61
+        asked.clear()
+        assert await coordinator._check_cache(key, asyncio.Semaphore(1)) is False
+        assert len(asked) == 2
+        coordinator.cache_pool.ready_urls.assert_awaited_once()
+        other_status[0] = 503
+        asked.clear()
+        assert await coordinator._check_cache(key, asyncio.Semaphore(1)) is True
+        assert len(asked) == 6
+
+
+def test_worker_spec_reads_all_members_in_join_grace_and_two_otherwise(monkeypatch) -> None:
+    import subprocess
+    from dataclasses import replace
+
+    from remote_exec.cache import ranked_nodes
+    from remote_exec.worker import Releases
+
+    nodes = [f'https://cache-{n}.example' for n in range(1, 7)]
+    key = 'new-spec'
+    former = ranked_nodes(nodes, key)[-1]
+    asked = []
+    other_status = [404]
+
+    def curl(command: list[str], **_kwargs) -> subprocess.CompletedProcess:
+        url = command[-1].removesuffix('/cas/' + key)
+        asked.append(url)
+        return subprocess.CompletedProcess(command, 0 if url == former else 22,
+                                           stdout='holbuild-version=1.2.3\n200' if url == former else f'\n{other_status[0]}', stderr='')
+
+    monkeypatch.setattr(subprocess, 'run', curl)
+    releases = Releases('unused', 'unused', ','.join(nodes), None, joining=True)
+    assert releases.spec_version(key) == '1.2.3'
+    assert len(asked) == 6
+    asked.clear()
+    with pytest.raises(RuntimeError):
+        replace(releases, joining=False).spec_version(key)
+    assert len(asked) == 2
+    other_status[0] = 503
+    asked.clear()
+    assert replace(releases, joining=False).spec_version(key) == '1.2.3'
+    assert len(asked) == 6

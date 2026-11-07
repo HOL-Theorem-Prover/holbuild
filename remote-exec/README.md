@@ -520,6 +520,11 @@ cache requests. Discovery uses `HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG`
 bearer header; workers supply their existing token privately to the child.
 Discovery never follows redirects. If it fails, the last complete ring remains
 usable for 60 seconds, after which requests use the permanent configuration.
+For 60 seconds after observing a joined member, GET/HEAD can try every ready
+member to find an object whose former owner has not uploaded it yet. Outside
+that join grace, a miss tries at most two nodes. If both nodes fail with
+transport errors, 429 or 5xx, reads can continue through the snapshot so stale
+readers can bypass concurrent drains. Writes always keep the two-node bound.
 
 ### Capacity adapter
 
@@ -541,8 +546,9 @@ controller keeps reconciling and heartbeating hooks when capacity is disabled,
 so disabling scale-out can still drain existing instances.
 
 `REMOTE_EXEC_CACHE_WORKERS_PER_NODE` maps the existing held burst-worker target
-to cache capacity by ceiling division, capped at the number of slots. Zero
-(the default) requests no temporary capacity. Choose and validate the ratio
+to cache capacity by ceiling division, capped at the number of slots. The
+default is 15 worker tasks per added cache; zero requests no temporary capacity.
+This counts worker tasks rather than their hosts. Validate the configured ratio
 with deployment load before enabling it. Provider CPU scale-out recommendations
 are combined with the worker floor by the same capacity writer and held for
 `REMOTE_EXEC_SCALE_DOWN_HOLD_S`; they cannot lower the worker target.
