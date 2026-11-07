@@ -1192,7 +1192,8 @@ A TARGET is a project theory (a logical name as `build` takes it, or
 project theory must already be in the local cache for its current inputs;
 otherwise that target is refused with `build it first`, the others are still
 exported, and the command exits 1. `--support` files must lie under the
-script's directory and are named relative to it. `--load` names a library: one
+script's directory and are named by their given path relative to it, without
+resolving symbolic links. `--load` names a library: one
 in the toolchain's `sigobj`, or a source the project plans (including the
 implicit `hol` package's libraries). The command takes `build`'s cache and
 proof options and prints one line per exported target:

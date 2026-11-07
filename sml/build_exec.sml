@@ -6146,21 +6146,27 @@ fun planned_node plan kind want {package = wanted_package, logical} =
       | _ => raise Error ("run-action: several packages have " ^ logical ^ "; name it as PACKAGE:" ^ logical)
   end
 
-fun full_path what path =
-  FS.fullPath path handle OS.SysErr _ => raise Error ("run-action: no " ^ what ^ " " ^ path)
+(* PATH as an absolute path, named as given: symbolic links are kept, since
+   a script opens its files by these names. *)
+fun given_file what path =
+  let val full = normalize_path (Path.mkAbsolute {path = path, relativeTo = FS.getDir ()})
+  in
+    if (not (FS.isDir full) handle OS.SysErr _ => false) then full
+    else raise Error ("run-action: no " ^ what ^ " " ^ path)
+  end
 
 (* The caller's script, and its support files by their path relative to the
    script's directory, sorted. *)
 fun run_files script supports =
   let
-    val script = full_path "script" script
-    val prefix = Path.dir script ^ "/"
+    val script = given_file "script" script
+    val dir = Path.dir script
     fun support path =
-      let val full = full_path "support file" path
+      let val rel = Path.mkRelative {path = given_file "support file" path, relativeTo = dir}
       in
-        if String.isPrefix prefix full then
-          {rel = run_token "support file" (String.extract (full, size prefix, NONE)), path = full}
-        else raise Error ("run-action: support file " ^ path ^ " is not under the script's directory " ^ Path.dir script)
+        if escapes_root rel then
+          raise Error ("run-action: support file " ^ path ^ " is not under the script's directory " ^ dir)
+        else {rel = run_token "support file" rel, path = Path.concat (dir, rel)}
       end
     val supports = map support supports
     val rels = map #rel supports

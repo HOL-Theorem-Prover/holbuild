@@ -104,6 +104,20 @@ if run_export --support "$tmpdir/outside.txt" --output o hol:bool > /dev/null 2>
 fi
 require_grep "is not under the script's directory" "$tmpdir/outside.err"
 
+# A support file is named as given, a symbolic link included, and contained
+# by that name.
+ln -s conf.txt "$runner/data/alias.txt"
+ln -s ../outside.txt "$runner/outer.txt"
+run_export --support "$runner/data/alias.txt" --support "$runner/outer.txt" --output o hol:bool > "$tmpdir/links.txt"
+links_spec=$project/.holbuild/run-specs/$(awk '{ print $3 }' "$tmpdir/links.txt")
+grep -q '^file support data/alias.txt ' "$links_spec"
+grep -q '^file support outer.txt ' "$links_spec"
+sed -n '/^run-text$/,$p' "$links_spec" | grep -q '^support=data/alias.txt@'
+if run_export --support "$runner/../outside.txt" --output o hol:bool > /dev/null 2>&1; then
+  echo "a support file reached through .. was accepted" >&2
+  exit 1
+fi
+
 # An unbuilt context is refused, while the others are still exported.
 if run_export --output o spec:CTheory hol:bool > "$tmpdir/unbuilt.out" 2> "$tmpdir/unbuilt.err"; then
   echo "an unbuilt context was exported" >&2
