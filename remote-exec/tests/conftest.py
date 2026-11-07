@@ -40,9 +40,11 @@ class FakeCache:
         self.proxy_down = False
         self.asked: list[str] = []
         self.hold: asyncio.Event | None = None  # while set to an unset event, entry requests wait for it
+        self.held = 0  # how many entry requests have waited for it
 
     async def handle_async(self, request: httpx.Request) -> httpx.Response:
         if self.hold is not None and request.url.path.startswith("/ac/"):
+            self.held += 1
             await self.hold.wait()
         return self.handle(request)
 

@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 CLAIM_RECHECK_SECONDS = 5  # how often a waiting claim looks for actions another coordinator process made ready
 # How long a cache entry found whole, blobs included, is taken to still be there without asking the cache again.
 IN_CACHE_TRUST_SECONDS = 60
+# How many parents' cache entries one release pass checks at once.
+RELEASE_CHECKS = 32
 
 # A holbuild remote-cache entry lists its blobs as `blob <sha256> <size>` lines before the manifest it carries.
 ENTRY_BLOB = re.compile(r"^blob ([0-9a-f]{64}) [0-9]+$", re.MULTILINE)
@@ -704,9 +706,10 @@ class Coordinator:
         completion nor the sweep waits on the cache requests it makes.
 
         One task runs the releases asked for, a pass at a time: the requests that arrive during a pass are run
-        together in the next, so a burst of completions in one batch costs one more pass, not one each. What is
-        releasable is read from the database on each pass, so requests lost with the process are made again by
-        the next sweep.
+        together in the next, so a burst of completions in one batch costs one more pass, not one each. Batches
+        asked for by name run before a pass over every batch, so a completion's children don't wait on the cache
+        checks of all the others. What is releasable is read from the database on each pass, so requests lost
+        with the process are made again by the next sweep.
         """
         self.release_pending.add(batch_id)
         if self.releaser is None or self.releaser.done():
@@ -715,7 +718,7 @@ class Coordinator:
     async def _run_releases(self) -> None:
         while self.release_pending:
             pending, self.release_pending = self.release_pending, set()
-            for batch_id in [None] if None in pending else pending:
+            for batch_id in sorted(pending, key=lambda batch_id: batch_id is None):
                 try:
                     await self.release(batch_id)
                 except Exception:
@@ -736,11 +739,14 @@ class Coordinator:
             async with self.engine.connect() as conn:
                 rows = await conn.execute(RELEASABLE, {"batch_id": batch_id})
                 candidates = {(row.batch_id, row.input_key): list(row.parents) for row in rows}
-            present: dict[str, bool | None] = {}
-            for parents in candidates.values():
-                for _, ac_key in parents:
-                    if ac_key not in present:
-                        present[ac_key] = await self._in_cache(ac_key)
+            keys = list(dict.fromkeys(ac_key for parents in candidates.values() for _, ac_key in parents))
+            checks = asyncio.Semaphore(RELEASE_CHECKS)
+
+            async def in_cache(ac_key: str) -> bool | None:
+                async with checks:
+                    return await self._in_cache(ac_key)
+
+            present = dict(zip(keys, await asyncio.gather(*map(in_cache, keys)), strict=True))
             ready: defaultdict[UUID, list[str]] = defaultdict(list)
             for (candidate_batch, input_key), parents in candidates.items():
                 if all(present[ac_key] for _, ac_key in parents):

@@ -351,6 +351,42 @@ async def test_completions_and_sweeps_answer_while_releases_wait_on_the_cache(
     assert sorted(cache.asked) == sorted([ac_key("a"), ac_key("b")])  # the sweep's pass found both remembered
 
 
+async def test_a_release_checks_every_parent_in_the_cache_at_once(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
+) -> None:
+    batch_id = await submit(http, ["a", "b", "c"], [("c", "a"), ("c", "b")])
+    tokens = await claim_all(http, 2)
+    cache.keys |= {ac_key("a"), ac_key("b")}
+    cache.hold = asyncio.Event()
+    for name in ("a", "b"):
+        assert await coordinator.complete(UUID(tokens[name]), parse_result(result(name, "built")))
+
+    async def both_asked() -> None:
+        while cache.held < 2:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(both_asked(), 5)  # one check at a time would leave "b" unasked while "a" is held
+    cache.hold.set()
+    await coordinator.released()
+    assert (await states(http, batch_id))["c"] == "ready"
+
+
+async def test_a_batch_asked_for_is_released_before_every_batch(
+    coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    released: list[UUID | None] = []
+
+    async def release(batch_id: UUID | None = None) -> None:
+        released.append(batch_id)
+
+    monkeypatch.setattr(coordinator, "release", release)
+    batch_id = uuid4()
+    coordinator.request_release()  # the sweep's
+    coordinator.request_release(batch_id)  # a completion's
+    await coordinator.released()
+    assert released == [batch_id, None]
+
+
 async def test_retried_action_waits_for_a_parent_requeued_while_it_ran(
     http: httpx.AsyncClient, cache: FakeCache
 ) -> None:
