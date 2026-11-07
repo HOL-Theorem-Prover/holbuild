@@ -80,7 +80,7 @@ Unknown fields in recognized tables are **errors**, not silently ignored. This c
 
 When present, `[holbuild].minimum_version` must be an exact semantic version `MAJOR.MINOR.PATCH` and requires the running holbuild version to be at least that version. `[holbuild].required_version` is rejected.
 
-Tables validated: `[holbuild]`, `[project]`, `[build]` (including `root_groups` and `groups`), `[build.groups.*]`, `[run]`, `[dependencies.*]`, `[actions.*]`, `[[generate]]`, `[[heap]]`, `[[executable]]`.
+Tables validated: `[holbuild]`, `[project]`, `[build]` (including `root_groups` and `groups`), `[build.groups.*]`, `[run]`, `[dependencies.*]`, `[actions.*]`, `[[generate]]`, `[generate_templates.*]`, `[[heap]]`, `[[executable]]`.
 
 ## Dependency resolution
 
@@ -188,6 +188,35 @@ Rules:
 - If an output is missing or its content changed from the generator metadata, holbuild reruns the step
 - After running, every declared output must exist
 - Generated files are normal visible source-tree files; include their directory in `[build].members`
+
+Optional shorthand for repeated declarations:
+
+```toml
+[generate_templates.packet]
+command = ["python3", "tools/packet.py", "{file}.spec"]
+inputs = ["tools/packet.py", "{file}.spec"]
+outputs = ["{file}Script.sml"]
+
+[[generate]]
+name = "packets"
+template = "packet"
+files = ["gen/Alpha", "gen/Beta"]
+```
+
+`template` selects a `[generate_templates.<name>]` table, which accepts only
+`command`, `inputs`, and `outputs` string arrays. Arrays on the generator replace
+the corresponding template arrays; templates cannot reference other templates.
+`name`, `files`, and `deps` remain per-generator fields.
+
+With `files`, each element of `command`, `inputs`, or `outputs` containing
+`{file}` expands in place once per listed stem, in order. All occurrences within
+an element use the same stem; literal elements stay once. This remains one
+generator invocation, even for several files. Supporting inputs need not have
+outputs: override `inputs` with the complete array, including those dependencies.
+`files` also works without a template; it is a nonempty array of nonempty
+strings, never a glob. Without `files`, strings remain literal. Expanded paths
+pass the usual package-relative validation and output ownership checks before
+source discovery. Exactly equivalent expanded arrays preserve generator keys.
 
 ## Duplicate logical names
 

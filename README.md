@@ -721,6 +721,46 @@ source or through a manifest/inline `extra_deps` declaration. Its transitive
 generators do not require their command-line tools to be installed. Broad groups
 and default roots still demand every generated output they select.
 
+For repeated commands and file families, share the arrays in a named template
+and list the selected file stems once:
+
+```toml
+[generate_templates.packet]
+command = ["python3", "tools/packet.py", "{file}.spec"]
+inputs = ["tools/packet.py", "{file}.spec"]
+outputs = ["{file}Script.sml"]
+
+[[generate]]
+name = "packet-batch"
+template = "packet"
+files = ["gen/Alpha", "gen/Beta"]
+
+[[generate]]
+name = "packet-with-library"
+template = "packet"
+files = ["gen/Gamma"]
+inputs = ["tools/packet.py", "{file}.spec", "data/library.spec"]
+```
+
+Each `[[generate]]` still declares one invocation: the first runs the command
+once with both `gen/Alpha.spec` and `gen/Beta.spec`. In `command`, `inputs`, and
+`outputs`, each array element containing `{file}` expands in place into one
+element per listed stem, in list order. Literal elements remain once; repeated
+`{file}` occurrences within one element use the same stem. The stems are
+explicit strings, with no globbing or filesystem discovery.
+
+Templates accept only `command`, `inputs`, and `outputs`. An array supplied on
+the generator replaces the template's entire array, so supporting inputs and
+compiler options stay explicit. Templates do not inherit from other templates;
+`name`, `files`, and `deps` belong to each generator. `files` can also be used
+without a template and must contain at least one nonempty string. Without
+`files`, all array strings remain literal, including `{file}`.
+
+Expansion happens during manifest parsing, before normal path validation,
+output ownership checks and source discovery. The expanded records determine
+generator state and cache identities: replacing explicit arrays with an exactly
+equivalent template preserves them. No generator runs during parsing.
+
 ### Heaps and run contexts
 
 ```toml
