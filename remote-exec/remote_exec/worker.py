@@ -596,10 +596,10 @@ def run_one(
     protection: Protection,
     claim: dict[str, Any],
     phases: Phases,
-) -> None:
+) -> bool:
     """Run one claimed action to its end, or until its lease is lost, and report it, adding its phases' time to
     ``phases``. An error in the worker is reported for a retry and then raised, so that ``main`` waits before it
-    claims again."""
+    claims again. True when exec-action reported the remote cache ``unavailable``, after which ``main`` waits too."""
     token = claim["attempt_token"]
     spec = claim["spec_sha256"]
     print(f"running {claim['theory']} ({claim['input_key']})", file=sys.stderr, flush=True)
@@ -616,9 +616,11 @@ def run_one(
             with phases.timed("complete"):
                 coordinator.complete(token, failed_record(spec, "internal"), claim["lease_s"])
             raise
-        if record is not None:
-            with phases.timed("complete"):
-                coordinator.complete(token, record, claim["lease_s"])
+        if record is None:
+            return False
+        with phases.timed("complete"):
+            coordinator.complete(token, record, claim["lease_s"])
+        return "failure=unavailable" in record.splitlines()
 
 
 def execute(
@@ -769,11 +771,17 @@ def main() -> None:
                 time.sleep(max(0.0, CLAIM_RETRY_SECONDS - (time.monotonic() - started)))
             continue
         try:
-            run_one(coordinator, args, releases, protection, claim, phases)
+            unavailable = run_one(coordinator, args, releases, protection, claim, phases)
         except Exception as error:  # noqa: BLE001  # run_one reported it where it could; the worker goes on
             # Else the lease expires and the coordinator retries; a rerun finds a published result cached. Waiting
             # keeps a worker from failing ready action after ready action while the cache or the coordinator is down.
             print(f"action failed in the worker: {error}", file=sys.stderr)
+            with phases.timed("idle"):
+                time.sleep(CLAIM_RETRY_SECONDS)
+            continue
+        if unavailable:
+            # The coordinator readies the action again at once, so without the wait the worker would claim it
+            # straight back while the cache is still down.
             with phases.timed("idle"):
                 time.sleep(CLAIM_RETRY_SECONDS)
 
