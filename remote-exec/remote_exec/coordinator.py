@@ -367,6 +367,11 @@ LIMIT 1 FOR UPDATE OF a SKIP LOCKED
 """)
 
 
+def _claim_rank(tiers: list[str], host_id: str | None) -> tuple[bool, bool, str]:
+    """Pack standard work onto warm workers first, then hosts in a stable order."""
+    return tiers[0] != "standard", host_id is None, host_id or ""
+
+
 class Coordinator:
     """Owns the database engine and the cache client; every rule of the coordinator lives here."""
 
@@ -385,10 +390,10 @@ class Coordinator:
                                      launch_timeout_seconds=settings.cache_launch_timeout_seconds)
                            if settings.cache_pool_cmd else None)
         self.scaler: ScaleRun | None = None  # the scale command's last run
-        # How many actions this process's release has made ready, and the claims waiting, by the tiers they take
-        # and the future that wakes them, oldest first; see claim.
+        # How many actions this process's release has made ready, and waiting claims' tiers, host and wake,
+        # oldest first (the tie-breaker within a host); see claim.
         self.made_ready = 0
-        self.claim_waiters: list[tuple[list[str], asyncio.Future[None]]] = []
+        self.claim_waiters: list[tuple[list[str], str | None, asyncio.Future[str]]] = []
         # When each cache entry was last found, the checks of the cache under way, and how many times
         # input-missing results forgot both; see _in_cache.
         self.found_in_cache: dict[str, float] = {}
@@ -548,6 +553,7 @@ class Coordinator:
         worker: str,
         wait_s: float = 0,
         disconnected: Callable[[], Awaitable[bool]] | None = None,
+        host_id: str | None = None,
     ) -> Claim | None:
         """Lease a ready action to ``worker``, waiting up to ``wait_s`` seconds for one, or None if none became
         ready: of the first of ``tiers`` that has one, the batch with the fewest running actions, then the one
@@ -555,26 +561,35 @@ class Coordinator:
         dependents, then the most dependents.
 
         A wait ends early once ``disconnected`` says the worker has gone, so no action is leased to nobody. Each
-        action this process's ``release`` makes ready wakes the longest waiting claim that takes its tier, not
-        every waiting claim, so hundreds of waiting workers don't all query for it. Waits recheck every
+        action this process's ``release`` makes ready wakes one compatible claim, preferring warm workers then
+        hosts in canonical order, with FIFO ties. Unwoken claims defer each tier to better-ranked waiters, so
+        polling workers don't spread work back onto tail hosts. Waits recheck every
         ``CLAIM_RECHECK_SECONDS``, for actions another coordinator process made ready and for an action whose
         woken claim took another one or lost it to another claim; a claim woken that leaves without trying wakes
         the next.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wait_s
+        rank = _claim_rank(tiers, host_id)
         woken: asyncio.Future[str] = loop.create_future()  # done once a wake was handed to this claim
         try:
             while True:
                 # Taken before the attempt, so an action made ready during it is tried at once, not waited for.
                 made_ready = self.made_ready
-                claimed = await self._claim(tiers, worker)
+                eligible_tiers = tiers if woken.done() else [
+                    tier for tier in tiers
+                    if not any(
+                        tier in w_tiers and not w_woken.done() and _claim_rank(w_tiers, w_host) < rank
+                        for w_tiers, w_host, w_woken in self.claim_waiters
+                    )
+                ]
+                claimed = await self._claim(eligible_tiers, worker) if eligible_tiers else None
                 remaining = deadline - loop.time()
                 if claimed is not None or remaining <= 0:
                     return claimed
                 woken = loop.create_future()
                 if self.made_ready == made_ready:
-                    waiter = (tiers, woken)
+                    waiter = (tiers, host_id, woken)
                     self.claim_waiters.append(waiter)
                     try:
                         with contextlib.suppress(TimeoutError):
@@ -636,14 +651,16 @@ class Coordinator:
         return Claim(token, row.spec_sha256, row.input_key, row.theory, self.settings.lease_seconds, row.max_heap_mb)
 
     def _wake_claim(self, tier: str) -> None:
-        """Count an action of ``tier`` made ready, and wake the longest waiting claim that takes it."""
+        """Count an action of ``tier`` made ready, and wake its best-ranked compatible claim, with FIFO ties."""
         self.made_ready += 1
-        for waiter in self.claim_waiters:
-            tiers, woken = waiter
-            if tier in tiers and not woken.done():
-                woken.set_result(tier)
-                self.claim_waiters.remove(waiter)
-                return
+        waiter = min(
+            (w for w in self.claim_waiters if tier in w[0] and not w[2].done()),
+            key=lambda w: _claim_rank(w[0], w[1]),
+            default=None,
+        )
+        if waiter is not None:
+            waiter[2].set_result(tier)
+            self.claim_waiters.remove(waiter)
 
     def _pass_wake(self, woken: asyncio.Future[str]) -> None:
         """Hand the wake of a claim leaving without trying, if it got one, to the next claim that takes its tier."""
