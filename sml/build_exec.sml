@@ -5996,7 +5996,7 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
         val path = Path.concat(spec_dir, spec_sha256)
         val _ = (ensure_dir spec_dir; write_text path text)
       in
-        {files = files @ [path], lines = String.concatWith " "
+        {files = files, spec = path, lines = String.concatWith " "
           ["action", #input_key action, HolbuildRemoteCache.remote_action_key (#input_key action),
            spec_sha256, package node ^ ":" ^ logical_name node] ::
         map (fn parent => "edge " ^ #input_key action ^ " " ^ HolbuildBuildPlan.input_key_for keys parent)
@@ -6012,16 +6012,24 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
     fun with_failure_lock f =
       (Mutex.lock failure_mutex; f () before Mutex.unlock failure_mutex)
       handle e => (Mutex.unlock failure_mutex; raise e)
-    fun uploaded remote path =
+    (* A worker rejects a spec it can't fetch rather than reporting it
+       missing, so a spec the ledger hid would never be uploaded again: specs
+       always go up. *)
+    fun uploaded remote (path, is_spec) =
       with_failure_lock (fn () => !upload_failed) orelse
       (let val hash = HolbuildHash.file_sha256 path
        in
-         if known ("blob " ^ hash) then ()
+         if is_spec then publish_spec_blob remote {hash = hash, path = path}
+         else if known ("blob " ^ hash) then ()
          else (publish_spec_blob remote {hash = hash, path = path}; learn ("blob " ^ hash))
        end;
        true)
       handle e => (with_failure_lock (fn () => upload_failed := true); raise e)
-    val files = if upload then unique_strings (List.concat (map #files exported)) else []
+    val files =
+      if upload then
+        map (fn path => (path, false)) (unique_strings (List.concat (map #files exported))) @
+        map (fn {spec, ...} => (spec, true)) exported
+      else []
     val _ =
       if null files then ()
       else HolbuildToolchain.time_phase "action_spec.upload" (fn () =>

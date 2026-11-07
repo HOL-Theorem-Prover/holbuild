@@ -781,6 +781,14 @@ write_broken one-only
 run proof-only 1 build --remote-exec "$coordinator" --remote-only BTheory
 require_grep "proof failed on a remote worker while building BTheory" "$tmpdir/proof-only.log"
 require_grep "^theorem: b_thm (line 4)$" "$tmpdir/proof-only.log"
+# The same edit again, its spec gone from the remote cache meanwhile: the
+# export uploads the spec again, though the remote ledger knows its hash.
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/proof-only.log")
+b_spec=$(awk '$1 == "action" && $5 == "rxp:BTheory" { print $4 }' "$state/$batch.batch")
+rm "$remote_root/cas/$b_spec"
+run proof-only-again 1 build --remote-exec "$coordinator" --remote-only BTheory
+require_grep "proof failed on a remote worker while building BTheory" "$tmpdir/proof-only-again.log"
+[[ -f "$remote_root/cas/$b_spec" ]] || { echo "the export did not upload the spec again" >&2; exit 1; }
 
 # Without the log in the cache (the workers drop it), the build builds only
 # the failed theory locally, which fails on the same proof: not C, which
