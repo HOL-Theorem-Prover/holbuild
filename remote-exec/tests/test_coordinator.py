@@ -687,6 +687,25 @@ async def test_infrastructure_failures_retry_up_to_max_attempts(http: httpx.Asyn
     assert (status["state"], status["failure"]) == ("failed", f"pkg:a: {failure}")
 
 
+async def test_an_action_its_worker_could_not_start_is_retried_without_using_an_attempt(
+    http: httpx.AsyncClient,
+) -> None:
+    batch_id = await submit(http, ["a"])
+    for _ in range(4):
+        token = await claim_named(http, "a")
+        assert (await complete(http, token, result("a", "failed", "unavailable"))).status_code == 200
+        assert await states(http, batch_id) == {"a": "ready"}
+
+    # Still all three attempts left: the third infrastructure failure is the one that fails the batch.
+    for _ in range(2):
+        token = await claim_named(http, "a")
+        assert (await complete(http, token, result("a", "failed", "internal"))).status_code == 200
+        assert await states(http, batch_id) == {"a": "ready"}
+    token = await claim_named(http, "a")
+    assert (await complete(http, token, result("a", "failed", "internal"))).status_code == 200
+    assert (await batch(http, batch_id))["state"] == "failed"
+
+
 async def test_disk_failure_retries_once(http: httpx.AsyncClient) -> None:
     batch_id = await submit(http, ["a"])
     token = await claim_named(http, "a")

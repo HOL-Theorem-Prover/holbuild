@@ -686,6 +686,15 @@ class Coordinator:
                     {"batch_id": batch_id, "input_key": action.input_key},
                 )
                 await self._retry(conn, batch_id, action.input_key)
+            elif result.failure == "unavailable":
+                # The worker couldn't start it, so it doesn't count as an attempt.
+                await conn.execute(
+                    sa.text(
+                        "UPDATE actions SET attempts = attempts - 1 WHERE batch_id = :batch_id AND input_key = :input_key"
+                    ),
+                    {"batch_id": batch_id, "input_key": action.input_key},
+                )
+                await self._retry(conn, batch_id, action.input_key)
             elif action.attempts < self.settings.max_attempts and (
                 result.failure in ("publish", "toolchain", "internal", "memory")
                 or (result.failure == "disk" and action.last_failure != "disk")
