@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+from collections.abc import Callable
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -330,6 +331,52 @@ async def test_a_check_begun_before_an_input_went_missing_is_not_remembered(
     assert cache.asked == [ac_key("a"), ac_key("a")]
 
 
+async def wait_until(condition: Callable[[], bool]) -> None:
+    while not condition():
+        await asyncio.sleep(0.01)
+
+
+async def test_a_release_asks_the_cache_about_its_parents_at_once(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
+) -> None:
+    batch_id = await submit(http, ["a", "b", "c"], [("c", "a"), ("c", "b")])
+    tokens = await claim_all(http, 2)
+    cache.keys |= {ac_key("a"), ac_key("b")}
+    cache.hold = asyncio.Event()
+    for name in ("a", "b"):
+        assert await coordinator.complete(UUID(tokens[name]), parse_result(result(name, "built")))
+    try:
+        await asyncio.wait_for(wait_until(lambda: cache.held == 2), 5)
+    finally:
+        cache.hold.set()
+    await coordinator.released()
+    assert await states(http, batch_id) == {"a": "done", "b": "done", "c": "ready"}
+
+
+async def test_a_batch_asked_for_is_released_during_a_pass_over_every_batch(
+    coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    passing = asyncio.Event()
+    released: list[UUID | None] = []
+
+    async def release(batch_id: UUID | None = None) -> None:
+        if batch_id is None:
+            await passing.wait()
+        released.append(batch_id)
+
+    monkeypatch.setattr(coordinator, "release", release)
+    batch_id = uuid4()
+    coordinator.request_release()  # the sweep's
+    await asyncio.sleep(0)
+    coordinator.request_release(batch_id)  # a completion's
+    try:
+        await asyncio.wait_for(wait_until(lambda: released == [batch_id]), 5)
+    finally:
+        passing.set()
+    await coordinator.released()
+    assert released == [batch_id, None]
+
+
 async def test_completions_and_sweeps_answer_while_releases_wait_on_the_cache(
     http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
 ) -> None:
@@ -343,7 +390,7 @@ async def test_completions_and_sweeps_answer_while_releases_wait_on_the_cache(
         completed = coordinator.complete(UUID(tokens[name]), parse_result(result(name, "built")))
         assert await asyncio.wait_for(completed, 5)
     await asyncio.wait_for(coordinator.sweep(), 5)
-    assert coordinator.releaser is not None and not coordinator.releaser.done()
+    assert not all(releaser.done() for releaser in coordinator.releasers.values())
 
     cache.hold.set()
     await coordinator.released()

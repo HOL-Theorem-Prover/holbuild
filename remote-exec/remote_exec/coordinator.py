@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 CLAIM_RECHECK_SECONDS = 5  # how often a waiting claim looks for actions another coordinator process made ready
 # How long a cache entry found whole, blobs included, is taken to still be there without asking the cache again.
 IN_CACHE_TRUST_SECONDS = 60
+# How many parents the releases ask the cache about at once, within the cache client's 100 connections.
+RELEASE_CACHE_CHECKS = 64
 
 # A holbuild remote-cache entry lists its blobs as `blob <sha256> <size>` lines before the manifest it carries.
 ENTRY_BLOB = re.compile(r"^blob ([0-9a-f]{64}) [0-9]+$", re.MULTILINE)
@@ -350,10 +352,12 @@ class Coordinator:
         self.found_in_cache: dict[str, float] = {}
         self.cache_checks: dict[str, asyncio.Task[bool | None]] = {}
         self.cache_forgotten = 0
-        # The batches whose releases were asked for and not yet started, None for every batch, and the task that
-        # runs them; see request_release.
+        # The batches whose releases were asked for and not yet started, None for every batch, the tasks that
+        # run them, one for every batch's and one for single batches', and how many cache checks they may have
+        # under way; see request_release.
         self.release_pending: set[UUID | None] = set()
-        self.releaser: asyncio.Task[None] | None = None
+        self.releasers: dict[bool, asyncio.Task[None]] = {}
+        self.release_cache_checks = asyncio.Semaphore(RELEASE_CACHE_CHECKS)
         # What workers reported of their hosts, by host id, and when. Kept in memory: each coordinator process
         # knows the hosts whose workers' requests reached it.
         self.hosts: dict[str, tuple[datetime, HostReport]] = {}
@@ -387,10 +391,10 @@ class Coordinator:
         )
 
     async def aclose(self) -> None:
-        if self.releaser is not None:
-            self.releaser.cancel()
+        for releaser in self.releasers.values():
+            releaser.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await self.releaser
+                await releaser
         await self.cache.aclose()
         await self.engine.dispose()
 
@@ -712,19 +716,21 @@ class Coordinator:
         """Have ``release`` run for ``batch_id``, or every batch, in the background, so neither a worker's
         completion nor the sweep waits on the cache requests it makes.
 
-        One task runs the releases asked for, a pass at a time: the requests that arrive during a pass are run
-        together in the next, so a burst of completions in one batch costs one more pass, not one each. What is
-        releasable is read from the database on each pass, so requests lost with the process are made again by
-        the next sweep.
+        Two tasks run the releases asked for, a pass at a time: one the passes over every batch, which the sweep
+        asks for, and one those of single batches, so that a completion's or a submission's release doesn't wait
+        behind a pass over the whole queue. The requests that arrive during a pass are run together in the next,
+        so a burst of completions in one batch costs one more pass, not one each. What is releasable is read from
+        the database on each pass, so requests lost with the process are made again by the next sweep.
         """
         self.release_pending.add(batch_id)
-        if self.releaser is None or self.releaser.done():
-            self.releaser = asyncio.get_running_loop().create_task(self._run_releases())
+        every = batch_id is None
+        if every not in self.releasers or self.releasers[every].done():
+            self.releasers[every] = asyncio.get_running_loop().create_task(self._run_releases(every))
 
-    async def _run_releases(self) -> None:
-        while self.release_pending:
-            pending, self.release_pending = self.release_pending, set()
-            for batch_id in [None] if None in pending else pending:
+    async def _run_releases(self, every: bool) -> None:
+        while pending := {batch_id for batch_id in self.release_pending if (batch_id is None) == every}:
+            self.release_pending -= pending
+            for batch_id in pending:
                 try:
                     await self.release(batch_id)
                 except Exception:
@@ -732,8 +738,8 @@ class Coordinator:
 
     async def released(self) -> None:
         """Wait until no release asked for is pending or running."""
-        while self.releaser is not None and not self.releaser.done():
-            await asyncio.shield(self.releaser)
+        while running := [releaser for releaser in self.releasers.values() if not releaser.done()]:
+            await asyncio.shield(asyncio.gather(*running))
 
     async def release(self, batch_id: UUID | None = None) -> None:
         """Make waiting actions whose parents are all done ready, once the cache holds each parent's entry and blobs.
@@ -745,11 +751,7 @@ class Coordinator:
             async with self.engine.connect() as conn:
                 rows = await conn.execute(RELEASABLE, {"batch_id": batch_id})
                 candidates = {(row.batch_id, row.input_key): list(row.parents) for row in rows}
-            present: dict[str, bool | None] = {}
-            for parents in candidates.values():
-                for _, ac_key in parents:
-                    if ac_key not in present:
-                        present[ac_key] = await self._in_cache(ac_key)
+            present = await self._in_cache_all({ac_key for parents in candidates.values() for _, ac_key in parents})
             ready: defaultdict[UUID, list[str]] = defaultdict(list)
             for (candidate_batch, input_key), parents in candidates.items():
                 if all(present[ac_key] for _, ac_key in parents):
@@ -938,6 +940,15 @@ class Coordinator:
             raise ScaleCommandError(f"{scale_cmd} {workers} ran longer than {SCALE_CMD_TIMEOUT_S} s") from None
         if code != 0:
             raise ScaleCommandError(f"{scale_cmd} {workers} exited {code}")
+
+    async def _in_cache_all(self, ac_keys: set[str]) -> dict[str, bool | None]:
+        """``_in_cache`` of each of ``ac_keys``, ``RELEASE_CACHE_CHECKS`` at a time across the releases."""
+
+        async def check(ac_key: str) -> tuple[str, bool | None]:
+            async with self.release_cache_checks:
+                return ac_key, await self._in_cache(ac_key)
+
+        return dict(await asyncio.gather(*map(check, ac_keys)))
 
     async def _in_cache(self, ac_key: str) -> bool | None:
         """Whether the cache holds entry ``ac_key`` and every blob it lists, which can expire before it; None when
