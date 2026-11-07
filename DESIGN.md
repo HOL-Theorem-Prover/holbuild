@@ -537,17 +537,47 @@ input key   = can I reuse a cached build for these sources and resolved deps?
 output key  = what semantic artifact did this build actually produce?
 ```
 
-For v1, downstream invalidation also uses dependency input keys. A target's
+Downstream invalidation of cache keys uses dependency input keys. A target's
 input key is effectively the hash of its own source content plus the DAG heads
 (input keys) of its resolved dependencies, along with toolchain/config facts.
 Therefore any source byte change — including proof edits or comments — changes
-that action's input key and changes the input keys of dependents. This is
-conservative and avoids relying on semantic equivalence of generated theory
-outputs.
+that action's input key and changes the input keys of dependents. Every key in
+a plan is known before anything runs, and no cache key depends on semantic
+equivalence of generated theory outputs.
 
-A build may record output hashes, such as `FooTheory.dat`, generated theory
-interface/source hashes, or checkpoint byte hashes, for diagnostics and future
-cache analysis. V1 must not use output hashes to skip rebuilding dependents.
+Locally, a key miss isn't always a rebuild (early cutoff). With each theory's
+metadata, holbuild records two more hashes:
+
+```text
+self_input_key  = hash(the action text, with dependencies named but not keyed)
+deps_output_key = hash(the output digest of every node in the transitive
+                       project-dependency closure)
+```
+
+A theory's output digest covers what its dependents load: `Theory.dat`,
+`.sig` and `.sml`, its `.uo`/`.ui` load manifests (which carry its ML
+dependencies), its kernel trace if present, and its declared extra outputs. An
+ML library's load manifest names only its source, so a library's digest covers
+its own `self_input_key` as well as its objects and extra outputs; what it loads
+is in the closure with its own digest. When a theory's input key misses, but
+its outputs exist, its parent `.dat` hashes match, and both recorded hashes
+match the current ones, the outputs on disk are what a build would produce:
+holbuild keeps them and rewrites the metadata under the new input key. Any
+missing output or mismatch builds as before. When the local cache holds a
+usable entry under the old input key and none under the new one, early cutoff
+copies that entry to the new key, since it describes the same outputs; this
+lets commands that read the cache by current key, such as `export`, find it,
+and the copy is published to a configured remote cache as a build's entry would be.
+
+The dependency context of a theory's checkpoints (`deps_loaded.save` and the
+theorem checkpoints above it) is keyed the same way, on `deps_output_key`, so a
+theory edited after an upstream edit that left outputs unchanged still resumes
+from its checkpoints. Remote action specs, which are written before their
+dependencies are built, key it on dependency input keys, and so does
+`run --from` unless every dependency's metadata matches its current input key,
+since `run` builds nothing and the outputs on disk may be stale.
+
+A build may also record output hashes for diagnostics (`--emit-output-hashes`).
 
 Different absolute paths under the same declared root may normalize to the same
 root-relative identity. Arbitrary outside-root paths are rejected or treated as

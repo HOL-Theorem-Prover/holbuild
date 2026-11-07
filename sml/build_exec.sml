@@ -2519,7 +2519,10 @@ fun declaration_checkpoint_specs proof_engine proof_timeout base deps_key inputs
           end)
       terminations
 
-fun dependency_context_key toolchain_key plan keys node =
+(* The dependency context keyed on the dependencies' input keys.  Remote
+   action specs and key dumps use this one: it is known before anything is
+   built. *)
+fun dependency_input_context_key toolchain_key plan keys node =
   let
     val project_deps = HolbuildBuildPlan.transitive_project_deps plan node
     val project_lines = map (fn dep => "project " ^ HolbuildBuildPlan.key dep ^ " " ^
@@ -2739,6 +2742,131 @@ val theory_manifest_version = "1"
 fun policy_config_lines _ =
   ["theory_manifest_version=" ^ theory_manifest_version]
 
+(* The files a node hands its dependents, by role, plus a line for what they
+   don't show.  A theory hands over its generated files, its load manifests
+   (which carry its ML dependencies), its kernel trace if it has one, and its
+   extra outputs.  An ML library's load manifest only names its source, so a
+   library's own inputs stand in for its content.  What a dependency loads in
+   turn is in the dependent's closure too, with its own digest. *)
+fun output_digest_parts toolchain_key plan node =
+  let
+    (* HOL's loader reads the remapped copies, which are separate files. *)
+    fun with_remapped files =
+      files @ map (fn (role, path) => ("remapped " ^ role, hfs_remapped_path path)) files
+    val extras =
+      ListPair.zip (map (fn declaration => "extra " ^ declaration)
+                        (source_extra_output_declarations plan node),
+                    source_extra_output_paths plan node)
+  in
+    case #kind (HolbuildBuildPlan.source_of node) of
+        HolbuildSourceIndex.TheoryScript =>
+          let
+            val {sig_path, sml_path, data_path, theory_ui, theory_uo, ...} = theory_outputs node
+            val trace_path = drop_suffix ".dat" data_path ^ ".tr.gz"
+          in
+            ([], with_remapped
+                   ([("dat", data_path), ("sig", sig_path), ("sml", sml_path),
+                     ("ui", theory_ui), ("uo", theory_uo)] @
+                    (if file_exists trace_path then [("trace", trace_path)] else [])) @
+                 extras)
+          end
+      | _ =>
+          (["self " ^ HolbuildBuildPlan.self_input_key plan
+                        (fn _ => policy_config_lines no_checkpoint_policy) toolchain_key node],
+           with_remapped (map (fn path => ("object", path)) (#objects (source_artifacts node))) @
+           extras)
+  end
+
+(* Computes and remembers the output digests of NODES, hashing all their files
+   in one batch.  A node with a missing output gets none. *)
+fun remember_output_digests toolchain_key plan nodes =
+  let
+    val parts =
+      List.mapPartial
+        (fn node =>
+            let val (lines, files) = output_digest_parts toolchain_key plan node
+            in
+              if List.all (fn (_, path) => file_exists path) files
+              then SOME (node, lines, files)
+              else NONE
+            end
+            handle _ => NONE)
+        nodes
+    val hashes = HolbuildHash.files_sha256 (List.concat (map (fn (_, _, files) => map #2 files) parts))
+    fun digest [] _ = ()
+      | digest ((node, lines, files) :: rest) hashes =
+          let
+            val n = length files
+            val file_lines =
+              ListPair.map (fn ((role, _), hash) => role ^ " " ^ hash) (files, List.take(hashes, n))
+          in
+            HolbuildBuildPlan.remember_output_digest plan node
+              (HolbuildToolchain.hash_text
+                 (String.concatWith "\n" ("holbuild-output-digest-v1" :: lines @ file_lines) ^ "\n"));
+            digest rest (List.drop(hashes, n))
+          end
+  in
+    digest parts hashes
+  end
+  handle _ => ()
+
+(* A hash of everything NODE loads from its project dependencies: the output
+   digest of each node in its closure.  NONE when an output is missing.
+   Digests are memoized for the build; build_one forgets a node's digest when
+   it finishes, since only then are its outputs final. *)
+fun deps_output_key toolchain_key plan node =
+  let
+    val deps = HolbuildBuildPlan.transitive_project_deps plan node
+    fun cached dep = HolbuildBuildPlan.cached_output_digest plan dep
+    val _ =
+      case List.filter (fn dep => not (Option.isSome (cached dep))) deps of
+          [] => ()
+        | missing => remember_output_digests toolchain_key plan missing
+    fun line dep =
+      case cached dep of
+          SOME digest => SOME (HolbuildBuildPlan.key dep ^ " " ^ digest)
+        | NONE => NONE
+    val lines = map line deps
+  in
+    if List.all Option.isSome lines then
+      SOME (HolbuildToolchain.hash_text
+              (String.concatWith "\n" ("holbuild-deps-output-v1" :: map valOf lines) ^ "\n"))
+    else NONE
+  end
+
+(* The key of a theory's loaded dependencies (deps_loaded.save and the
+   checkpoints above it).  Keyed on what the dependencies produced, so an edit
+   that leaves their outputs unchanged keeps the dependents' checkpoints; on
+   their input keys when an output is missing. *)
+fun dependency_context_key toolchain_key plan keys node =
+  case deps_output_key toolchain_key plan node of
+      NONE => dependency_input_context_key toolchain_key plan keys node
+    | SOME outputs_key =>
+        let
+          val context_id = "outputs " ^ toolchain_key ^ " " ^ outputs_key
+        in
+          case HolbuildBuildPlan.cached_dependency_context_key plan node context_id of
+              SOME key => key
+            | NONE =>
+                let
+                  val theory_lines =
+                    map (fn dep => "external_theory " ^ dep)
+                        (HolbuildBuildPlan.direct_external_theories plan node)
+                  val lib_lines =
+                    map (fn dep => "external_lib " ^ dep)
+                        (HolbuildBuildPlan.direct_external_libs plan node)
+                  val key =
+                    HolbuildToolchain.hash_text
+                      (String.concatWith "\n"
+                         (["holbuild-dependency-context-v3",
+                           "toolchain_key=" ^ toolchain_key,
+                           "deps_output_key=" ^ outputs_key] @ theory_lines @ lib_lines) ^ "\n")
+                in
+                  HolbuildBuildPlan.remember_dependency_context_key plan node context_id key;
+                  key
+                end
+        end
+
 fun plain_source_from_checkpoint source_name source_text start_offset =
   String.concat
     [if start_offset <= 0 then ""
@@ -2926,7 +3054,7 @@ fun run_failure_repl tc policy theorem_checkpoints failure_checkpoints deps_load
           end
 
 (* The theory action that builds `node` in action root `root`. *)
-fun theory_action root plan keys toolchain_key holdir node : theory_action =
+fun theory_action root plan keys toolchain_key holdir deps_key node : theory_action =
   let
     val package_root = #package_root (HolbuildBuildPlan.source_of node)
     val script_dir = Path.dir (source_file node)
@@ -2951,7 +3079,7 @@ fun theory_action root plan keys toolchain_key holdir node : theory_action =
     val {sig_path, sml_path, data_path, ...} = theory_outputs node
   in
     {input_key = HolbuildBuildPlan.input_key_for keys node,
-     deps_key = dependency_context_key toolchain_key plan keys node,
+     deps_key = deps_key,
      inputs_key = HolbuildBuildPlan.extra_inputs_key plan node,
      package = package node,
      logical = logical_name node,
@@ -3497,6 +3625,21 @@ fun dependency_context_lines plan keys toolchain_key node =
         ["dependency_context_key=" ^ dependency_context_key toolchain_key plan keys node]
     | _ => []
 
+fun node_self_input_key checkpoint_policy plan toolchain_key node =
+  HolbuildBuildPlan.self_input_key plan (fn _ => policy_config_lines checkpoint_policy)
+    toolchain_key node
+
+(* What early cutoff compares on a later key miss: the theory's own inputs and
+   what its dependencies produced when it was built. *)
+fun early_cutoff_lines checkpoint_policy plan toolchain_key node =
+  case #kind (HolbuildBuildPlan.source_of node) of
+      HolbuildSourceIndex.TheoryScript =>
+        ("self_input_key=" ^ node_self_input_key checkpoint_policy plan toolchain_key node) ::
+        (case deps_output_key toolchain_key plan node of
+             SOME key => ["deps_output_key=" ^ key]
+           | NONE => [])
+    | _ => []
+
 fun action_policy_lines plan node =
   let
     val policy = source_policy node
@@ -3549,6 +3692,7 @@ fun metadata_core_lines checkpoint_policy proof_timeout project plan keys input_
      "logical=" ^ #logical_name source,
      "source=" ^ #relative_path source] @
     dependency_context_lines plan keys toolchain_key node @
+    early_cutoff_lines checkpoint_policy plan toolchain_key node @
     parent_hash_metadata_lines plan node @
     proof_timeout_lines proof_timeout node @
     action_policy_lines plan node @
@@ -3811,7 +3955,18 @@ datatype run_from_state =
 fun run_from_state tc project plan keys node =
   let
     val name = logical_name node
-    val deps_key = dependency_context_key (HolbuildToolchain.toolchain_key tc) plan keys node
+    val toolchain_key = HolbuildToolchain.toolchain_key tc
+    fun built_for_current_source dep =
+      case current_metadata (metadata_path project dep) of
+          SOME text => metadata_input_key_matches (HolbuildBuildPlan.input_key_for keys dep) text
+        | NONE => false
+    (* Run builds nothing, so the dependencies' outputs on disk can be older
+       than their sources: key on them only when every one is built for its
+       current source. *)
+    val deps_key =
+      if List.all built_for_current_source (HolbuildBuildPlan.transitive_project_deps plan node)
+      then dependency_context_key toolchain_key plan keys node
+      else dependency_input_context_key toolchain_key plan keys node
     val base = checkpoint_base project node
     fun deps_loaded_current dir =
       HolbuildCheckpointStore.ok_current (Path.concat(dir, "deps_loaded.save"))
@@ -4072,7 +4227,8 @@ fun build_theory_action cache_allowed policy tc root checkpoint_root base_contex
 fun build_theory cache_allowed policy tc project base_context plan keys toolchain_key node =
   let
     val root = project_artifact_root project
-    val action = theory_action root plan keys toolchain_key (#holdir tc) node
+    val action = theory_action root plan keys toolchain_key (#holdir tc)
+                   (dependency_context_key toolchain_key plan keys node) node
     val generated_metadata =
       build_theory_action cache_allowed policy tc root (default_checkpoint_root root) base_context action
     val stage = action_stage root action
@@ -4090,6 +4246,32 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
     write_local_theory_manifests plan node generated_metadata;
     remove_tree (stage_root_at root (#input_key action))
   end
+
+(* After early cutoff, the theory's cache entry under its old input key also
+   describes its outputs for the new one, so the entry is copied to the new
+   key, where commands that read the cache by current key (export) find it,
+   and published to the remote cache as a build would.  Only a usable entry
+   is copied, and only where the new key has none. *)
+fun alias_cache_entry old_key new_key =
+  let
+    val root = cache_root ()
+    fun alias () =
+      case (HolbuildCache.get_action root new_key, HolbuildCache.get_action root old_key) of
+          (NONE, SOME old_text) =>
+            if cache_entry_usable root old_key old_text then
+              (HolbuildCache.write_action root
+                 {key = new_key,
+                  text = replace_all ("\ninput_key=" ^ old_key ^ "\n") ("\ninput_key=" ^ new_key ^ "\n")
+                                     old_text};
+               true)
+            else false
+        | _ => false
+  in
+    if HolbuildCache.with_action_publish_lock root new_key alias (fn () => false)
+    then publish_remote_cache_key_if_usable root new_key
+    else ()
+  end
+  handle e => warn ("could not alias cache entry: " ^ General.exnMessage e)
 
 fun build_theory_node dat_hash_cache (options : build_options) tc project base_context plan keys toolchain_key node input_key =
   let
@@ -4154,19 +4336,62 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
        write_metadata (#emit_output_hashes options) policy (tactic_timeout policy) project plan keys input_key toolchain_key node metadata_checkpoints;
        HolbuildStatus.Built)
       handle ExecutionPlanPrinted => (remove_tree stage; HolbuildStatus.Inspected)
+    (* The metadata goes before the outputs are replaced, so outputs of an
+       interrupted restore or build are never taken for those of the last one
+       (by the up-to-date check or early cutoff).  Printing the execution plan
+       replaces nothing. *)
     fun restore_or_build () =
-      if not cache_restore_allowed then build_from_source ()
-      else
-        case materialize_valid_cache () of
-            CacheRestored built_timeout => restore_from_cache built_timeout
-          | CacheMiss => build_from_source ()
+      (if execution_plan_only policy then () else remove_file (metadata_path project node);
+       if not cache_restore_allowed then build_from_source ()
+       else
+         case materialize_valid_cache () of
+             CacheRestored built_timeout => restore_from_cache built_timeout
+           | CacheMiss => build_from_source ())
+    (* Early cutoff: on an input-key miss, the outputs on disk are still the
+       ones a build would produce when the theory's own inputs and everything
+       its dependencies produced are as they were at its last build.  Returns
+       that build's metadata. *)
+    fun early_cutoff_metadata () =
+      if List.all (output_exists_for_node node) (output_paths policy plan node) andalso
+         List.all file_exists (source_extra_output_paths plan node) then
+        case current_metadata (metadata_path project node) of
+            NONE => NONE
+          | SOME text =>
+              let val lines = metadata_lines text
+              in
+                if metadata_value "self_input_key" lines =
+                     SOME (node_self_input_key policy plan toolchain_key node) andalso
+                   (case deps_output_key toolchain_key plan node of
+                        SOME key => metadata_value "deps_output_key" lines = SOME key
+                      | NONE => false) andalso
+                   metadata_timeout_satisfies allow_timeout_discrepancy policy node text andalso
+                   theory_parent_hashes_match dat_hash_cache plan node (SOME text)
+                then SOME text
+                else NONE
+              end
+      else NONE
+    fun reuse_outputs text =
+      (remove_tree stage;
+       if cache_allowed then
+         case metadata_value "input_key" (metadata_lines text) of
+             SOME old_key => alias_cache_entry old_key input_key
+           | NONE => ()
+       else ();
+       write_metadata (#emit_output_hashes options) policy
+         (if allow_timeout_discrepancy then metadata_proof_timeout text else tactic_timeout policy)
+         project plan keys input_key toolchain_key node metadata_checkpoints;
+       cache_trace ("early cutoff: " ^ logical_name node ^ " (dependency outputs unchanged)");
+       HolbuildStatus.UpToDate)
   in
-    if not forced andalso not (always_reexecute node) andalso
-       up_to_date dat_hash_cache (#emit_output_hashes options) allow_timeout_discrepancy
-         policy project plan keys input_key toolchain_key node metadata_checkpoints then
+    if forced orelse always_reexecute node then restore_or_build ()
+    else if up_to_date dat_hash_cache (#emit_output_hashes options) allow_timeout_discrepancy
+              policy project plan keys input_key toolchain_key node metadata_checkpoints then
       (remove_tree stage;
        HolbuildStatus.UpToDate)
-    else restore_or_build ()
+    else
+      case early_cutoff_metadata () of
+          SOME text => reuse_outputs text
+        | NONE => restore_or_build ()
   end
 
 fun build_node dat_hash_cache options tc project base_context plan keys toolchain_key node =
@@ -4232,6 +4457,8 @@ fun build_one dat_hash_cache status options tc project base_context plan keys to
     val _ = HolbuildStatus.start_node status key label
     val outcome = build_node dat_hash_cache options tc project base_context plan keys toolchain_key node
   in
+    (* Its outputs are final now; a digest taken earlier may be stale. *)
+    HolbuildBuildPlan.forget_output_digest plan node;
     HolbuildStatus.finish_node status key label outcome;
     outcome
   end
@@ -4996,7 +5223,7 @@ fun dump_key_row toolchain_key plan keys node =
     val dependency_key =
       case #kind (HolbuildBuildPlan.source_of node) of
           HolbuildSourceIndex.TheoryScript =>
-            SOME (dependency_context_key toolchain_key plan keys node)
+            SOME (dependency_input_context_key toolchain_key plan keys node)
         | _ => NONE
     val line =
       case dependency_key of
@@ -5193,6 +5420,7 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
                  (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
     val _ = dump_keys_if_requested (build_config_lines_for_node options project) toolchain_key plan keys
     val dat_hash_cache = new_file_hash_cache ()
+    val _ = HolbuildBuildPlan.forget_output_digests plan
   in
     let
       val status = HolbuildStatus.create {total = length (HolbuildBuildPlan.selected_nodes plan), jobs = jobs}
@@ -5374,7 +5602,7 @@ fun action_spec_text {root, plan, keys, action_toolchain_key, runtime, toolchain
        toolchain_line,
        "input-key=" ^ #input_key action,
        "action-text-sha256=" ^ HolbuildToolchain.hash_text action_text,
-       "deps-key=" ^ dependency_context_key action_toolchain_key plan keys node,
+       "deps-key=" ^ dependency_input_context_key action_toolchain_key plan keys node,
        "target " ^ token context,
        String.concatWith " "
          ["source", token (#package action), token (#relative_path action),
@@ -5440,7 +5668,10 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
     val action_toolchain_key = HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)
     val keys = HolbuildBuildPlan.input_keys config_lines action_toolchain_key plan
     val theories = List.filter is_theory_node (HolbuildBuildPlan.selected_nodes plan)
-    val actions = map (fn node => (node, theory_action root plan keys toolchain_key (#holdir tc) node)) theories
+    val actions =
+      map (fn node => (node, theory_action root plan keys toolchain_key (#holdir tc)
+                               (dependency_input_context_key toolchain_key plan keys node) node))
+          theories
     val _ =
       List.app
         (fn (node, action) =>

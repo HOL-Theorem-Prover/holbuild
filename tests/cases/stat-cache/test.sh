@@ -291,6 +291,8 @@ val _ = print "";
 SML
 edit_json=$tmpdir/edit.json
 (cd "$project" && "$HOLBUILD_BIN" --json build --no-cache BTheory) > "$edit_json" 2>&1
-assert_json_field built 2 "$edit_json"
+# The edit leaves A's outputs as they were, so B keeps its outputs under its
+# new key (early cutoff) and counts as unchanged.
+assert_json_field built 1 "$edit_json"
 assert_json_field from_cache 0 "$edit_json"
-assert_json_field unchanged 0 "$edit_json"
+assert_json_field unchanged 1 "$edit_json"
