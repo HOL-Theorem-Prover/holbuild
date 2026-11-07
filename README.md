@@ -299,6 +299,7 @@ holbuild context
 holbuild context --trknl
 holbuild execution-plan MyTheory:my_theorem
 holbuild check MyTheory
+holbuild check --fingerprint MyTheory
 holbuild buildhol
 holbuild buildhol --trknl
 holbuild build --trknl MyTheory
@@ -490,9 +491,15 @@ theorem whose tag carries an oracle other than `DISK_THM` (for instance
 `MyTheory.my_theorem: cheat`) and one per axiom declared in the theory or its
 ancestors outside HOL itself, that is, in the root package or a dependency
 package (`DepTheory.my_axiom: axiom`). Theorems loaded from disk do not record
-which axioms they use, so every such axiom in the ancestry is reported. With
-findings it exits non-zero; otherwise it prints `MyTheory: clean (N theorems)`
-and exits zero. `holbuild check MyTheory:my_theorem` checks one theorem.
+which axioms they use, so every such axiom in the ancestry is reported. It also
+scans the sources the theory is built from outside HOL (theory scripts and the
+SML libraries they load) for calls that can forge a theorem or change the
+logical context without leaving an oracle or axiom in the built theory, such as
+`Thm.disk_thm`, `Thm.mk_axiom_thm`, `TheoryReader` and `RunCall`, and prints one
+line per use (`mypkg:src/MyScript.sml:12: kernel bypass: disk_thm`). Names in
+comments and string literals don't count; the scan is a backstop, not a
+sandbox. With findings it exits non-zero; otherwise it prints
+`MyTheory: clean (N theorems)` and exits zero. `holbuild check MyTheory:my_theorem` checks one theorem.
 `check` builds the theory, and any `[run].loads`, without proof steps or
 checkpoints: it applies no step timeout (that is `build`'s check) and reuses
 theories built by `holbuild build --skip-proof-steps`. The tags are those
@@ -500,6 +507,36 @@ recorded in the built theory, which may have been restored from a cache;
 run `holbuild build --no-cache MyTheory` first to check a fresh build. HOL
 always starts from the toolchain's base state here, not from `[run].heap`,
 which may hold an older copy of the theory.
+
+`holbuild check --fingerprint MyTheory` builds and loads the theory the same
+way and prints one tab-separated line per axiom, definition and theorem stored
+in it and in each of its ancestors, HOL's own theories included, sorted
+bytewise so that two runs diff cleanly:
+
+```text
+fingerprint	DepTheory	axiom	my_axiom	9a02…(64 hex digits)	-
+fingerprint	MyTheory	theorem	my_theorem	3f1c…	-
+fingerprint	MyTheory	theorem	other_theorem	77d0…	cheat
+```
+
+Build progress and HOL's own messages share stdout, so keep the lines that
+start with `fingerprint` and a tab (`grep '^fingerprint'`). After that column
+come the theory, the kind (`axiom`, `definition` or `theorem`), the
+name, the statement's fingerprint and the theorem's oracles other than
+`DISK_THM`, comma-separated, or `-` for none. The fingerprint is the SHA-256 of
+the statement's term structure, hypotheses included: constants and types by
+theory and name, free variables by name and type, bound variables by de Bruijn
+index. It doesn't depend on pretty-printing or on how the theory was built, and
+alpha-equivalent statements get the same one. Comparing the output before and
+after a change shows whether any existing statement or definition changed, an
+axiom appeared, or an oracle was added or dropped. `[local]` theorems are not
+stored in the theory and are not listed. The command exits zero; it reports,
+and the comparison is the caller's.
+
+Every HOL session holbuild starts, theory builds included, has the same
+function as `HolbuildFingerprint.thm : thm -> string`, and
+`HolbuildFingerprint.term : term -> string` for a statement not yet proved:
+`HolbuildFingerprint.term t` equals the fingerprint of a theorem `|- t`.
 
 `holbuild clean MyTheory` removes project-local generated artifacts, dependency
 metadata, and checkpoints for the named theory target. This is primarily a
@@ -1304,7 +1341,8 @@ A *run* is an SML script run in the context of a built theory: HOL started
 from the toolchain, the theory's ancestry restorable, libraries loaded, and
 the script's declared output files kept. Its result is keyed by what it
 reads, so the same run is done once. `run-action --export-only` writes and
-uploads the run spec of each target; this release does not run or fetch them.
+uploads the run spec of each target, which a worker runs with `exec-action`
+(below); this release does not submit or fetch them.
 
 ```sh
 holbuild --remote-cache https://cache.example.org run-action --export-only \
@@ -1377,7 +1415,8 @@ run-text
 - `context` names the theory to restore, as a `dep theory` line does.
 - `file context-script` lines are the scripts of the context theory and of
   every theory it depends on, under `.holbuild/action-src/<package>/`, for
-  scripts that read their ancestry's sources.
+  scripts that read their ancestry's sources. For a project context the
+  first is the context theory's own.
 - `run-load` lines are the libraries to load, in order: a project library by
   its `lib` line's name, a toolchain library as `HOLLIB:<name>`.
 - `output` lines are the file names the script must write.
@@ -1430,6 +1469,52 @@ requests got no response, whatever the worker was fetching or publishing,
 the action fails as `unavailable` rather than reading that as a miss or a
 conflict: the cache failed, not the action.
 
+A run spec (`holbuild-run-spec-v1`, see "Exporting script runs for remote
+execution") is checked the same way, its run text against its `run-key`,
+and reported `cached`, without installing the toolchain or starting HOL, if
+the remote cache holds the run's entry with every output. Otherwise the
+worker fetches the context and ancestry scripts, library sources and the
+script with its support files, restores the dependencies, and a project
+context theory like one of them (a HOL context's objects and script come
+with the toolchain), and runs, in the script's directory,
+
+```sh
+hol run --noconfig --holstate <toolchain>/bin/hol.state <prelude> <script>
+```
+
+where the prelude puts the action root's object directories on `loadPath`
+and loads the `run-load` libraries in order (a project or `hol` package
+library compiles from source as it loads). The script loads the context
+theory itself, and is given:
+
+| Variable | Value |
+|---|---|
+| `HOLBUILD_RUN_ROOT` | the action root, holding the restored context under `.holbuild/` |
+| `HOLBUILD_RUN_CONTEXT` | `<package>:<logical>`, or `HOL:<logical>` |
+| `HOLBUILD_RUN_CONTEXT_KEY` | the context theory's input key; for a HOL context, the semantic toolchain key |
+| `HOLBUILD_RUN_SOURCE` | the context theory's script: under the root, or for a HOL context in the toolchain's source tree (empty if it has none) |
+| `HOLBUILD_RUN_OUTPUT_DIR` | the directory to write each declared output in |
+| `HOLBUILD_RUN_SCRATCH` | an empty directory of its own, removed with the root |
+
+Its support files are beside it, under the names they were exported with.
+If HOL exits 0 having written every declared output as a file, the worker
+uploads the outputs to `/cas/` and puts the run's entry at its key:
+
+```text
+holbuild-cache-action-v4
+input_key=<run_key>
+kind=run
+parent <input_key>              (a project context's; none for a HOL context)
+blob output:<name> <sha256>     (one per output, sorted by name)
+```
+
+and checks that the remote cache then holds an entry with these outputs, as
+for a theory. A script that fails, or leaves a declared output unwritten,
+fails as `script`; one still running when its `option timeout` elapses is
+killed with its process group and fails as `timeout`. Neither publishes
+anything, and both are final: rerunning the same script on the same
+context does the same.
+
 It writes this record to `--result FILE`, or to stdout:
 
 ```text
@@ -1437,7 +1522,7 @@ holbuild-action-result-v1
 spec=<sha256>
 input-key=<input_key>
 status=built|cached|failed
-failure=proof|tactic-timeout|memory|input-missing|publish|toolchain|disk|spec-rejected|internal|unavailable
+failure=proof|tactic-timeout|script|timeout|memory|input-missing|publish|toolchain|disk|spec-rejected|internal|unavailable
 missing=theory <input_key> | blob <sha256>
 peak-rss-mb=<n>
 wall-ms=<n>
@@ -1445,15 +1530,16 @@ log=<sha256> <size>
 ```
 
 `failure` appears on failure, and `missing` with `input-missing`.
+For a run, `input-key` is its run key and `built` means it ran.
 `peak-rss-mb` is the HOL process's peak resident memory on a successful build.
-`log` is the build log, uploaded to `/cas/`. `memory` means Poly/ML ran out
+`log` is the build log, or the run's HOL output, uploaded to `/cas/`. `memory` means Poly/ML ran out
 of heap or the container's cgroup `memory.events` counted an OOM kill during
 the run; `disk` means the disk filled. The exit status summarizes the record:
 
 | Exit | Meaning |
 |---|---|
 | 0 | built or cached |
-| 1 | `proof` or `tactic-timeout`: final, retrying won't help |
+| 1 | `proof`, `tactic-timeout`, `script` or `timeout`: final, retrying won't help |
 | 2 | `memory`: retry with more memory |
 | 3 | `input-missing`, `publish`, `toolchain`, `disk`, `internal` or `unavailable`: retry or resubmit |
 | 4 | `spec-rejected` |

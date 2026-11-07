@@ -557,7 +557,8 @@ fun blob_present cache sha256 =
         SOME (HolbuildHttp.Response 404) => false
       | _ => true
   end
-  handle _ => true
+  handle e as Unavailable _ => raise e
+       | _ => true
 
 (* An optional upload probe must not disable PUTs when a server drops HEADs.
    Leave the breaker to the normal cache requests, and skip only confirmed hits. *)

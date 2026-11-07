@@ -43,6 +43,7 @@ require_file "$tmpdir/project/.holbuild/obj/ATheory.dat"
 require_file "$tmpdir/relocated/share/holbuild/LICENSE"
 require_file "$tmpdir/relocated/share/holbuild/copyrights/smlnj.txt"
 require_file "$tmpdir/relocated/share/holbuild/sml/analyser/analyser_main.sml"
+require_file "$tmpdir/relocated/share/holbuild/sml/diagnostic_limits.sml"
 
 use_case_cache "$tmpdir/custom-cache"
 (cd "$tmpdir/project" && "$tmpdir/custom-bin/holbuild" build --force=full ATheory) > "$tmpdir/custom-build.log" 2>&1

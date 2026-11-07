@@ -178,12 +178,23 @@ fun execution_plan_help () = print
 
 fun check_help () = print
   "Usage:\n\
-  \  holbuild [GLOBAL OPTIONS] check THEORY[:THEOREM]\n\n\
+  \  holbuild [GLOBAL OPTIONS] check THEORY[:THEOREM]\n\
+  \  holbuild [GLOBAL OPTIONS] check --fingerprint THEORY\n\n\
   \Build THEORY if needed, load it in HOL and check the tags of its stored\n\
   \theorems, or of THEOREM alone. Prints one line per theorem that depends on an\n\
-  \oracle other than DISK_THM (cheat, for instance) and per axiom declared in\n\
-  \THEORY or its ancestors outside HOL itself, and exits non-zero if there are\n\
-  \any. Otherwise prints a clean line and exits zero.\n\n\
+  \oracle other than DISK_THM (cheat, for instance), per axiom declared in\n\
+  \THEORY or its ancestors outside HOL itself, and per use of a kernel-bypass\n\
+  \call (Thm.disk_thm, RunCall, ...) in the sources THEORY is built from outside\n\
+  \HOL, and exits non-zero if there are any. Otherwise prints a clean line and\n\
+  \exits zero.\n\n\
+  \With --fingerprint, print instead one line per axiom, definition and theorem\n\
+  \stored in THEORY and each of its ancestors, HOL's included, sorted:\n\
+  \  fingerprint<TAB>THEORY<TAB>KIND<TAB>NAME<TAB>FINGERPRINT<TAB>ORACLES\n\
+  \KIND is axiom, definition or theorem; FINGERPRINT is the SHA-256 of the\n\
+  \statement's term structure, the same for alpha-equivalent statements;\n\
+  \ORACLES lists the oracles other than DISK_THM, comma-separated, or is -.\n\
+  \A script computes the same fingerprint with HolbuildFingerprint.thm or\n\
+  \HolbuildFingerprint.term.\n\n\
   \The build runs without proof steps or checkpoints, so it reuses theories\n\
   \built by build --skip-proof-steps and applies no step timeout.\n\n\
   \Global options: see `holbuild --help`.\n"
@@ -247,12 +258,13 @@ fun exec_action_help () = print
   \  holbuild --remote-cache URL [GLOBAL OPTIONS] exec-action SPEC-SHA256\n\
   \      --cache-limit-gb N [--cache-reserve-gb N] [--share-heaps] [--result FILE]\n\n\
   \Run the ActionSpec stored in the remote cache as SPEC-SHA256 (see\n\
-  \action-spec) and publish its result to the remote cache. The action runs in\n\
-  \CACHE/action, with checkpoints in CACHE/checkpoints, where CACHE is the cache\n\
-  \root. Writes a holbuild-action-result-v1 record to FILE, or to stdout.\n\n\
-  \Exit status: 0 built or cached; 1 proof or tactic-timeout failure; 2 out of\n\
-  \memory; 3 input-missing, publish, toolchain, disk or internal failure;\n\
-  \4 spec rejected.\n\n\
+  \action-spec), or the run spec (see run-action), and publish its result to\n\
+  \the remote cache. The action runs in CACHE/action, with checkpoints in\n\
+  \CACHE/checkpoints, where CACHE is the cache root. Writes a\n\
+  \holbuild-action-result-v1 record to FILE, or to stdout.\n\n\
+  \Exit status: 0 built or cached; 1 proof, tactic-timeout, script or timeout\n\
+  \failure; 2 out of memory; 3 input-missing, publish, toolchain, disk or\n\
+  \internal failure; 4 spec rejected.\n\n\
   \--cache-limit-gb N   Before the action, evict least recently used\n\
   \                     checkpoints, toolchains and local cache entries until\n\
   \                     the cache root holds at most N GB minus the reserve.\n\
@@ -2449,11 +2461,12 @@ fun parse_check_selector selector =
 
 (* The theory names HOL itself does not declare: those of the root package
    and its dependency packages.  Axioms in these theories are findings. *)
-fun project_theory_names tc project index =
+fun hol_package_id tc project =
+  HolbuildProjectGraph.hol
+    (HolbuildProjectGraph.resolve {project = project, resolution = resolution_for_toolchain tc})
+
+fun project_theory_names hol index =
   let
-    val graph = HolbuildProjectGraph.resolve
-                  {project = project, resolution = resolution_for_toolchain tc}
-    val hol = HolbuildProjectGraph.hol graph
     fun project_theory source =
       theory_source source andalso #package_id (#node source) <> hol
   in
@@ -2461,10 +2474,85 @@ fun project_theory_names tc project index =
         (List.filter project_theory index)
   end
 
+(* Calls that can forge a theorem or change the logical context while leaving
+   no oracle tag or axiom in the exported theory: HOL kernel and theory-loading
+   internals, and Poly/ML escapes that defeat type abstraction or run code a
+   source scan can't see.  Calls that leave a tag (mk_thm, mk_oracle_thm) or an
+   axiom (new_axiom) are reported from the loaded theory instead. *)
+val kernel_bypass_names =
+  ["disk_thm", "Tag.read_disk_tag", "mk_axiom_thm", "register_replayed_axiom",
+   "upd_binding", "incorporate_types", "incorporate_consts", "link_parents",
+   "TheoryReader", "RunCall", "unsafeCast", "PolyML.compiler", "PolyML.Compiler",
+   "PolyML.use", "OS.Process.system", "Unix.execute"]
+
+(* text with its comments and string literals blanked, newlines kept, so that
+   names in them are not reported and line numbers still hold. *)
+fun blank_comments_and_strings text =
+  let
+    val n = size text
+    val out = CharArray.tabulate (n, fn i => String.sub (text, i))
+    fun blank (i, stop) =
+      if i >= stop then ()
+      else
+        ((if String.sub (text, i) = #"\n" then () else CharArray.update (out, i, #" "));
+         blank (i + 1, stop))
+    fun at i c = i < n andalso String.sub (text, i) = c
+    fun code i =
+      if i >= n then ()
+      else if at i #"(" andalso at (i + 1) #"*" then
+        let val stop = HolbuildDependencies.skip_comment text (i + 2)
+        in blank (i, stop); code stop end
+      else if at i #"\"" then
+        let val (_, stop) = HolbuildDependencies.scan_string text (i + 1)
+        in blank (i, stop); code stop end
+      else code (i + 1)
+  in
+    code 0;
+    CharArray.vector out
+  end
+
+(* The kernel-bypass names a source text uses, as (line, name), in order. *)
+fun kernel_bypass_uses text =
+  let
+    val code = blank_comments_and_strings text
+    val n = size code
+    fun boundary i = i < 0 orelse i >= n orelse not (HolbuildDependencies.is_word_char (String.sub (code, i)))
+    fun name_at i name =
+      i + size name <= n andalso String.sub (code, i) = String.sub (name, 0) andalso
+      boundary (i - 1) andalso boundary (i + size name) andalso
+      String.substring (code, i, size name) = name
+    fun scan i line acc =
+      if i >= n then rev acc
+      else
+        let
+          val acc = List.foldl (fn (name, acc) => if name_at i name then (line, name) :: acc else acc)
+                               acc kernel_bypass_names
+          val line = if String.sub (code, i) = #"\n" then line + 1 else line
+        in scan (i + 1) line acc end
+  in
+    scan 0 1 []
+  end
+
+(* Kernel-bypass findings in the sources a theory is built from, outside HOL. *)
+fun kernel_bypass_findings tc hol components index logical_name =
+  let
+    val plan = HolbuildBuildPlan.plan_targets components (#holdir tc) index [logical_name]
+    val sources =
+      List.filter (fn source => #package_id (#node source) <> hol)
+                  (map HolbuildBuildPlan.source_of (HolbuildBuildPlan.selected_nodes plan))
+    fun findings source =
+      map (fn (line, name) =>
+              #package source ^ ":" ^ #relative_path source ^ ":" ^ Int.toString line ^
+              ": kernel bypass: " ^ name)
+          (kernel_bypass_uses (read_text (#source_path source)))
+  in
+    List.concat (map findings sources)
+  end
+
 (* An SML script for `hol run` that loads the theory and prints the
    findings.  Theorems loaded from disk keep their oracles but not the axioms
    they depend on, so axioms are found by scanning the ancestry instead. *)
-fun check_script {logical_name, theorem, project_theories} =
+fun check_script {logical_name, theorem, project_theories, source_findings} =
   let
     val sml_string = HolbuildToolchain.sml_string
     val theory = HolbuildBuildExec.theory_name_from_logical logical_name
@@ -2479,6 +2567,7 @@ fun check_script {logical_name, theorem, project_theories} =
        "  val theory = " ^ sml_string theory,
        "  val selected : string option = " ^ selected,
        "  val project_theories = " ^ HolbuildToolchain.sml_list project_theories,
+       "  val source_findings = " ^ HolbuildToolchain.sml_list source_findings,
        "  fun out s = (TextIO.output(TextIO.stdOut, s ^ \"\\n\"); TextIO.flushOut TextIO.stdOut)",
        "  fun fail s = (TextIO.output(TextIO.stdErr, \"holbuild: \" ^ s ^ \"\\n\");",
        "                TextIO.flushOut TextIO.stdErr; OS.Process.exit OS.Process.failure)",
@@ -2501,6 +2590,7 @@ fun check_script {logical_name, theorem, project_theories} =
        "    map (fn (name, _) => qualified thy name ^ \": axiom\")",
        "        (Listsort.sort by_name (DB.axioms thy))",
        "  val findings =",
+       "    source_findings @",
        "    List.concat (map theorem_oracles checked) @",
        "    List.concat (map theory_axioms",
        "                   (List.filter project_theory (theory :: Theory.ancestry theory)))",
@@ -2519,17 +2609,53 @@ fun check_script {logical_name, theorem, project_theories} =
        ""]
   end
 
-fun check_selector tc cli_jobs selector =
+(* An SML script for `hol run` that loads the theory and prints one line per
+   axiom, definition and theorem stored in it and its ancestors.  The lines
+   start with "fingerprint" to tell them from build and HOL messages, which
+   share stdout. *)
+fun fingerprint_script logical_name =
   let
-    val {theory, theorem} = parse_check_selector selector
+    val sml_string = HolbuildToolchain.sml_string
+  in
+    String.concatWith "\n"
+      [HolbuildToolchain.run_load_line logical_name,
+       "local",
+       "  val theory = " ^ sml_string (HolbuildBuildExec.theory_name_from_logical logical_name),
+       "  fun oracles th =",
+       "    case Listsort.sort String.compare",
+       "           (List.filter (fn s => s <> \"DISK_THM\") (#1 (Tag.dest_tag (Thm.tag th)))) of",
+       "        [] => \"-\"",
+       "      | names => String.concatWith \",\" names",
+       "  fun items thy (kind, stored) =",
+       "    map (fn (name, th) =>",
+       "            String.concatWith \"\\t\"",
+       "              [\"fingerprint\", thy ^ \"Theory\", kind, name, HolbuildFingerprint.thm th,",
+       "               oracles th] ^ \"\\n\")",
+       "        (stored thy)",
+       "  fun theory_items thy =",
+       "    List.concat (map (items thy)",
+       "      [(\"axiom\", DB.axioms), (\"definition\", DB.definitions), (\"theorem\", DB.theorems)])",
+       "  val lines = List.concat (map theory_items (theory :: Theory.ancestry theory))",
+       "in",
+       "  val _ = List.app (fn line => TextIO.output (TextIO.stdOut, line))",
+       "                   (Listsort.sort String.compare lines)",
+       "  val _ = TextIO.flushOut TextIO.stdOut",
+       "end;",
+       ""]
+  end
+
+(* Builds THEORY if needed, then runs the script make_script writes for it in
+   a fresh HOL session, and exits non-zero if that fails. *)
+fun run_check_script tc cli_jobs theory make_script =
+  let
     val project = timed_phase "project.discover" load_project
-    val {index, ...} = prepare_source_index "check" (resolution_for_toolchain tc) project
+    val {index, components} = prepare_source_index "check" (resolution_for_toolchain tc) project
     val source = find_theory_source "check" index theory
     val _ = build_once tc cli_jobs (plain_build_request [#logical_name source])
     val script_path = HolbuildToolchain.invocation_sml_file project "holbuild-check"
     val _ = write_text_file script_path
-              (check_script {logical_name = #logical_name source, theorem = theorem,
-                             project_theories = project_theory_names tc project index})
+              (make_script {project = project, index = index, components = components,
+                            logical_name = #logical_name source})
     fun cleanup () = OS.FileSys.remove script_path handle OS.SysErr _ => ()
     val status =
       (* A run heap may hold an older copy of the theory, which load would keep. *)
@@ -2540,10 +2666,31 @@ fun check_selector tc cli_jobs selector =
     if HolbuildToolchain.success status then () else OS.Process.exit OS.Process.failure
   end
 
+fun check_selector tc cli_jobs selector =
+  let
+    val {theory, theorem} = parse_check_selector selector
+    fun make_script {project, index, components, logical_name} =
+      let val hol = hol_package_id tc project
+      in
+        check_script {logical_name = logical_name, theorem = theorem,
+                      project_theories = project_theory_names hol index,
+                      source_findings = kernel_bypass_findings tc hol components index logical_name}
+      end
+  in
+    run_check_script tc cli_jobs theory make_script
+  end
+
+fun check_fingerprint tc cli_jobs theory =
+  case parse_check_selector theory of
+      {theory, theorem = NONE} =>
+        run_check_script tc cli_jobs theory (fingerprint_script o #logical_name)
+    | _ => raise Error "check --fingerprint takes a theory, not THEORY:THEOREM"
+
 fun check_command tc cli_jobs args =
   case args of
-      [selector] => check_selector tc cli_jobs selector
-    | _ => raise Error "usage: holbuild check THEORY[:THEOREM]"
+      ["--fingerprint", theory] => check_fingerprint tc cli_jobs theory
+    | [selector] => check_selector tc cli_jobs selector
+    | _ => raise Error "usage: holbuild check THEORY[:THEOREM] | check --fingerprint THEORY"
 
 fun removed_legacy_plan_command _ _ =
   raise Error "goalfrag-plan has been removed; use execution-plan THEORY:THEOREM"

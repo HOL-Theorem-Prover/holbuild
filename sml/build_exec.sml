@@ -151,11 +151,7 @@ fun write_object_manifest path lines =
 fun dependency_sml dep = one_with_suffix ".sml" (#generated (source_artifacts dep))
 fun dependency_sig dep = one_with_suffix ".sig" (#generated (source_artifacts dep))
 
-fun runtime_helper_path () =
-  Path.concat(HolbuildRuntimePaths.runtime_root (), "sml/holbuild_runtime.sml")
-
-fun runtime_line () =
-  "use " ^ HolbuildToolchain.sml_string (runtime_helper_path ()) ^ ";"
+val runtime_line = HolbuildToolchain.runtime_line
 
 fun load_theory_line name = "HolbuildRuntime.load " ^ HolbuildToolchain.sml_string name ^ ";"
 
@@ -1813,6 +1809,13 @@ fun cache_manifest_blobs_from_lines key lines =
   HolbuildTheoryCacheManifest.cache_manifest_blobs_from_lines key lines
   handle HolbuildTheoryCacheManifest.Error msg => raise Error msg
 
+val is_run_manifest = HolbuildTheoryCacheManifest.is_run_manifest
+val run_manifest_text = HolbuildTheoryCacheManifest.run_manifest_text
+
+fun run_manifest_outputs key text =
+  HolbuildTheoryCacheManifest.run_manifest_outputs key text
+  handle HolbuildTheoryCacheManifest.Error msg => raise Error msg
+
 fun transient_stage_mldep_in_manifest text =
   first_some
     (fn line =>
@@ -1863,17 +1866,21 @@ fun cache_manifest_contract key text =
 
 val timeout_at_least_as_strong = HolbuildTheoryCacheManifest.timeout_at_least_as_strong
 
+(* A run's entry (kind=run) is compared by its declared outputs. *)
 fun cache_manifest_outputs_equal input_key left right =
-  let
-    val left_blobs = cache_manifest_blobs_from_lines input_key (cache_manifest_lines left)
-    val right_blobs = cache_manifest_blobs_from_lines input_key (cache_manifest_lines right)
-  in
-    #sig_hash left_blobs = #sig_hash right_blobs andalso
-    #sml_hash left_blobs = #sml_hash right_blobs andalso
-    #dat_hash left_blobs = #dat_hash right_blobs andalso
-    #trace_hash left_blobs = #trace_hash right_blobs andalso
-    #extra_hashes left_blobs = #extra_hashes right_blobs
-  end
+  if is_run_manifest left orelse is_run_manifest right then
+    run_manifest_outputs input_key left = run_manifest_outputs input_key right
+  else
+    let
+      val left_blobs = cache_manifest_blobs_from_lines input_key (cache_manifest_lines left)
+      val right_blobs = cache_manifest_blobs_from_lines input_key (cache_manifest_lines right)
+    in
+      #sig_hash left_blobs = #sig_hash right_blobs andalso
+      #sml_hash left_blobs = #sml_hash right_blobs andalso
+      #dat_hash left_blobs = #dat_hash right_blobs andalso
+      #trace_hash left_blobs = #trace_hash right_blobs andalso
+      #extra_hashes left_blobs = #extra_hashes right_blobs
+    end
 
 fun cache_entry_usable root input_key text =
   let
@@ -2523,6 +2530,35 @@ fun declaration_checkpoint_specs proof_engine proof_timeout base deps_key inputs
           end)
       terminations
 
+(* The holbuild sources a theory child loads, directly or through the HOL
+   analyser that instruments its script.  They end up in saved heaps, so local
+   dependency heaps are keyed on them and a worker runs only specs exported by
+   holbuild with the same sources. *)
+val runtime_source_files =
+  HolbuildToolchain.runtime_files @
+  ["sml/checkpoint_save_runtime.sml", "sml/proof_runtime.sml", "sml/tactic_compat_runtime.sml",
+   "sml/diagnostic_limits.sml"] @
+  map (fn file => normalize_path (Path.concat("sml/analyser", file)))
+      HolbuildHolSharedCache.analyser_source_files
+
+val runtime_identity_memo : string option ref = ref NONE
+
+fun runtime_identity () =
+  case !runtime_identity_memo of
+      SOME identity => identity
+    | NONE =>
+        let
+          fun line rel =
+            rel ^ " " ^ HolbuildHash.file_sha256 (Path.concat(HolbuildRuntimePaths.runtime_root (), rel))
+          val identity =
+            HolbuildToolchain.hash_text
+              (String.concatWith "\n"
+                 ("holbuild-runtime-v1" :: map line (sort_strings (unique_strings runtime_source_files))) ^ "\n")
+        in
+          runtime_identity_memo := SOME identity;
+          identity
+        end
+
 (* The dependency context keyed on the dependencies' input keys.  Remote
    action specs and key dumps use this one: it is known before anything is
    built. *)
@@ -2547,10 +2583,11 @@ fun dependency_input_context_key toolchain_key plan keys node =
             val key =
               HolbuildToolchain.hash_text
                 (String.concatWith "\n"
-                   (* Local heaps must contain the export-normalizing runtime.
-                      Artifact action keys remain compatible. *)
+                   (* Local heaps contain the runtime, so they are keyed on it.
+                      Artifact action keys don't depend on it. *)
                    (["holbuild-dependency-context-v2",
-                     "toolchain_key=" ^ toolchain_key] @ project_lines @ theory_lines @ lib_lines) ^ "\n")
+                     "toolchain_key=" ^ toolchain_key,
+                     "runtime=" ^ runtime_identity ()] @ project_lines @ theory_lines @ lib_lines) ^ "\n")
           in
             HolbuildBuildPlan.remember_dependency_context_key plan node context_id key;
             key
@@ -2869,6 +2906,7 @@ fun dependency_context_key toolchain_key plan keys node =
                       (String.concatWith "\n"
                          (["holbuild-dependency-context-v3",
                            "toolchain_key=" ^ toolchain_key,
+                           "runtime=" ^ runtime_identity (),
                            "deps_output_key=" ^ outputs_key] @ theory_lines @ lib_lines) ^ "\n")
                 in
                   HolbuildBuildPlan.remember_dependency_context_key plan node context_id key;
@@ -3117,25 +3155,6 @@ fun action_checkpoint_base checkpoint_root (action : theory_action) =
 fun action_outputs root ({outputs = {sig_path, sml_path, data_path}, ...} : theory_action) =
   {sig_path = in_root root sig_path, sml_path = in_root root sml_path,
    data_path = in_root root data_path}
-
-(* The holbuild sources a theory child loads, directly or through the HOL
-   analyser that instruments its script.  They end up in saved heaps, so a
-   worker runs only specs exported by holbuild with the same sources. *)
-val runtime_source_files =
-  ["sml/checkpoint_save_runtime.sml", "sml/holbuild_runtime.sml",
-   "sml/proof_runtime.sml", "sml/tactic_compat_runtime.sml", "sml/diagnostic_limits.sml"] @
-  map (fn file => normalize_path (Path.concat("sml/analyser", file)))
-      HolbuildHolSharedCache.analyser_source_files
-
-fun runtime_identity () =
-  let
-    fun line rel =
-      rel ^ " " ^ HolbuildHash.file_sha256 (Path.concat(HolbuildRuntimePaths.runtime_root (), rel))
-  in
-    HolbuildToolchain.hash_text
-      (String.concatWith "\n"
-         ("holbuild-runtime-v1" :: map line (sort_strings (unique_strings runtime_source_files))) ^ "\n")
-  end
 
 (* The shared heap and checkpoint store: one family per heap directory,
    used when an action restores from it or adds to it. *)
@@ -6671,6 +6690,8 @@ datatype action_failure =
   | SpecRejected
   | InternalFailure
   | UnavailableFailure  (* the remote cache didn't answer; not the action's fault *)
+  | ScriptFailure  (* a run's script failed or left a declared output unwritten *)
+  | TimeoutFailure  (* a run outlasted its option timeout *)
 
 exception ActionFailed of action_failure * string
 
@@ -6684,10 +6705,14 @@ fun failure_name ProofFailure = "proof"
   | failure_name SpecRejected = "spec-rejected"
   | failure_name InternalFailure = "internal"
   | failure_name UnavailableFailure = "unavailable"
+  | failure_name ScriptFailure = "script"
+  | failure_name TimeoutFailure = "timeout"
 
 (* 1 is final, 2 retries on more memory, 3 retries or resubmits, 4 rejects. *)
 fun failure_exit_code ProofFailure = 1
   | failure_exit_code TacticTimeoutFailure = 1
+  | failure_exit_code ScriptFailure = 1
+  | failure_exit_code TimeoutFailure = 1
   | failure_exit_code MemoryFailure = 2
   | failure_exit_code SpecRejected = 4
   | failure_exit_code _ = 3
@@ -6711,11 +6736,12 @@ type action_spec =
    proof_steps : bool, tactic_timeout : real option, new_ir : bool,
    theorem_checkpoints : bool, action_text : string}
 
-fun split_spec_text text =
-  let val marker = "\naction-text\n"
+(* A spec's lines, and the text after its SECTION line. *)
+fun split_spec_text section text =
+  let val marker = "\n" ^ section ^ "\n"
       val (head, rest) = Substring.position marker (Substring.full text)
   in
-    if Substring.size rest = 0 then reject_spec "spec has no action-text section"
+    if Substring.size rest = 0 then reject_spec ("spec has no " ^ section ^ " section")
     else (Substring.string head, Substring.string (Substring.triml (size marker) rest))
   end
 
@@ -6726,13 +6752,24 @@ fun target_name text =
         else reject_spec ("malformed target " ^ text)
     | _ => reject_spec ("malformed target " ^ text)
 
+fun spec_key_value text =
+  case Substring.position "=" (Substring.full text) of
+      (key, value) =>
+        if Substring.size value = 0 then reject_spec ("malformed spec line: " ^ text)
+        else (Substring.string key, Substring.string (Substring.triml 1 value))
+
+fun spec_toolchain line (git, rev, kernel) =
+  case (spec_key_value git, spec_key_value rev, spec_key_value kernel) of
+      (("git", g), ("rev", r), ("kernel", k)) => {git = g, rev = r, kernel = k}
+    | _ => reject_spec ("malformed toolchain line: " ^ line)
+
 fun spec_bool name text =
   case text of "true" => true | "false" => false
      | _ => reject_spec ("option " ^ name ^ " is not a boolean: " ^ text)
 
 fun parse_action_spec text : action_spec =
   let
-    val (head, action_text) = split_spec_text text
+    val (head, action_text) = split_spec_text "action-text" text
     val lines = List.filter (fn line => line <> "") (String.fields (fn c => c = #"\n") head)
     val _ =
       case lines of
@@ -6751,17 +6788,10 @@ fun parse_action_spec text : action_spec =
     val outputs = ref ([] : (string * string) list)
     val extra_outputs = ref []
     fun push r x = r := x :: !r
-    fun key_value text =
-      case Substring.position "=" (Substring.full text) of
-          (key, value) =>
-            if Substring.size value = 0 then reject_spec ("malformed spec line: " ^ text)
-            else (Substring.string key, Substring.string (Substring.triml 1 value))
+    val key_value = spec_key_value
     fun line text =
       case String.tokens (fn c => c = #" ") text of
-          ["toolchain", git, rev, kernel] =>
-            (case (key_value git, key_value rev, key_value kernel) of
-                 (("git", g), ("rev", r), ("kernel", k)) => toolchain := SOME {git = g, rev = r, kernel = k}
-               | _ => reject_spec ("malformed toolchain line: " ^ text))
+          ["toolchain", git, rev, kernel] => toolchain := SOME (spec_toolchain text (git, rev, kernel))
         | ["target", t] => target := SOME t
         | ["source", package, path, sha256, size] =>
             source := SOME (package, {path = path, sha256 = sha256, size = size})
@@ -6816,10 +6846,13 @@ fun parse_action_spec text : action_spec =
      action_text = action_text}
   end
 
-fun action_text_values (spec : action_spec) prefix =
+(* The values of TEXT's lines that start with PREFIX. *)
+fun text_values text prefix =
   List.mapPartial
     (fn line => if String.isPrefix prefix line then SOME (String.extract(line, size prefix, NONE)) else NONE)
-    (String.fields (fn c => c = #"\n") (#action_text spec))
+    (String.fields (fn c => c = #"\n") text)
+
+fun action_text_values (spec : action_spec) prefix = text_values (#action_text spec) prefix
 
 fun action_text_value spec key =
   case action_text_values spec (key ^ "=") of
@@ -6914,7 +6947,17 @@ fun spec_inputs_key (spec : action_spec) =
 fun action_source_path package path =
   normalize_path (String.concatWith "/" [".holbuild/action-src", package, path])
 
-fun spec_load_stems (spec : action_spec) =
+(* What a worker restores for a spec: library sources and load manifests,
+   and the theories it needs from the cache. *)
+type spec_deps =
+  {libraries : spec_file list,
+   deps : {target : string, stem : string, key : string} list,
+   libs : {target : string, stem : string, suffix : string, loads : string list} list}
+
+fun theory_spec_deps (spec : action_spec) : spec_deps =
+  {libraries = #libraries spec, deps = #deps spec, libs = #libs spec}
+
+fun spec_load_stems (spec : spec_deps) =
   let
     fun add ((name, stem), acc) =
       if List.exists (fn (n, _) => n = name) acc then acc else acc @ [(name, stem)]
@@ -6984,7 +7027,7 @@ fun fetch_spec_blob remote {hash, dst} =
 
 (* Restores a theory the action depends on, or the action's own entry, into
    the action root, writing its load manifests with the spec's stems. *)
-fun restore_spec_theory root (spec : action_spec) {key, subject, stem, extra_outputs, requested_timeout} =
+fun restore_spec_theory root (spec : spec_deps) {key, subject, stem, extra_outputs, requested_timeout} =
   let
     val cache = cache_root ()
     val entry =
@@ -7021,7 +7064,7 @@ fun records_parent recorded ({target, ...} : {target : string, stem : string, ke
    for its key changes.  This drops the local copies of the spec's
    dependencies selected by wanted whose outputs differ from the remote's,
    so that the next restore takes the remote's; true when it dropped one. *)
-fun drop_stale_dep_copies remote (spec : action_spec) wanted =
+fun drop_stale_dep_copies remote (spec : spec_deps) wanted =
   List.foldl (fn (dep, dropped) => (wanted dep andalso drop_local_copy_if_stale remote (#key dep)) orelse dropped)
              false (#deps spec)
 
@@ -7030,7 +7073,7 @@ fun dat_records_parent path = records_parent (parse_dat_parent_hashes (read_text
 
 (* Each restored theory's .dat records the hashes of its parents' .dat
    files; every parent the spec places must match. *)
-fun spec_parent_hashes_match root (spec : action_spec) data_path =
+fun spec_parent_hashes_match root (spec : spec_deps) data_path =
   let
     val recorded = parse_dat_parent_hashes (read_text data_path)
   in
@@ -7044,11 +7087,8 @@ fun spec_parent_hashes_match root (spec : action_spec) data_path =
 
 (* Step 3: sources and library manifests from the spec, dependency theories
    from the cache. *)
-fun hydrate_action_root remote root (spec : action_spec) =
+fun hydrate_spec_deps remote root (spec : spec_deps) =
   let
-    val package = #package spec
-    fun fetch_file {path, sha256, ...} =
-      fetch_spec_blob remote {hash = sha256, dst = in_root root (action_source_path package path)}
     fun fetch_library {path, sha256, ...} =
       fetch_spec_blob remote {hash = sha256, dst = in_root root path}
     fun lib_load load = if CharVector.exists (fn c => c = #"/") load then in_root root load else load
@@ -7064,8 +7104,6 @@ fun hydrate_action_root remote root (spec : action_spec) =
                           ("dependency " ^ target ^ " (" ^ key ^ ") is not restorable from the cache: " ^
                            General.exnMessage e)
   in
-    fetch_file (#source spec);
-    List.app fetch_file (#inputs spec);
     List.app fetch_library (#libraries spec);
     List.app write_lib (#libs spec);
     List.app restore_dep (#deps spec);
@@ -7080,16 +7118,27 @@ fun hydrate_action_root remote root (spec : action_spec) =
       (#deps spec)
   end
 
+fun hydrate_action_root remote root (spec : action_spec) =
+  let
+    val package = #package spec
+    fun fetch_file {path, sha256, ...} =
+      fetch_spec_blob remote {hash = sha256, dst = in_root root (action_source_path package path)}
+  in
+    fetch_file (#source spec);
+    List.app fetch_file (#inputs spec);
+    hydrate_spec_deps remote root (theory_spec_deps spec)
+  end
+
 (* Step 4: the action's own entry restores with full validation. *)
 fun action_already_done root (spec : action_spec) =
   let
     val {sig_path, sml_path, data_path} = #outputs spec
     val stem = drop_suffix ".dat" data_path
   in
-    (restore_spec_theory root spec
+    (restore_spec_theory root (theory_spec_deps spec)
        {key = #input_key spec, subject = #package spec ^ ":" ^ #logical spec, stem = stem,
         extra_outputs = SOME (#extra_outputs spec), requested_timeout = #tactic_timeout spec};
-     spec_parent_hashes_match root spec (in_root root data_path))
+     spec_parent_hashes_match root (theory_spec_deps spec) (in_root root data_path))
     handle e as HolbuildRemoteCache.Unavailable _ => raise e
          | _ => false
   end
@@ -7113,7 +7162,7 @@ fun resident_misfits_parents remote root (spec : action_spec) resident =
         HolbuildCacheBackend.Hit =>
           let val recorded = dat_records_parent path
           in
-            not (spec_parent_hashes_match root spec path) andalso
+            not (spec_parent_hashes_match root (theory_spec_deps spec) path) andalso
             List.all (fn dep => not (recorded dep) orelse as_remote (#key dep)) (#deps spec)
           end
       | _ => false
@@ -7910,11 +7959,11 @@ fun reuse_earlier_build remote root (spec : action_spec) pair_key =
           val data_path = #data_path (#outputs spec)
         in
           sha256_text old_key andalso old_key <> new_key andalso
-          (restore_spec_theory root spec
+          (restore_spec_theory root (theory_spec_deps spec)
              {key = old_key, subject = #package spec ^ ":" ^ #logical spec,
               stem = drop_suffix ".dat" data_path, extra_outputs = SOME (#extra_outputs spec),
               requested_timeout = #tactic_timeout spec};
-           spec_parent_hashes_match root spec (in_root root data_path)) andalso
+           spec_parent_hashes_match root (theory_spec_deps spec) (in_root root data_path)) andalso
           (case HolbuildCache.get_action cache old_key of
                NONE => false
              | SOME old_text =>
@@ -7940,6 +7989,315 @@ fun publish_early_cutoff remote pair_key input_key =
     | _ => warn "could not publish the early cutoff entry"
   handle HolbuildRemoteCache.Unavailable msg => warn ("could not publish the early cutoff entry: " ^ msg)
 
+(* Run specs on a worker: a caller's script run in a theory's context (see
+   README, "Running one theory action as a remote worker").  The spec
+   carries the context's dependency lines as a theory's ActionSpec does, so
+   the action root is hydrated the same way. *)
+
+type run_spec =
+  {version : string, runtime : string,
+   toolchain : {git : string, rev : string, kernel : string},
+   run_key : string,
+   context : string,  (* <package>:<logical>, or HOL:<logical> for the toolchain's *)
+   (* A project context, restored like a dependency. *)
+   context_theory : {target : string, stem : string, key : string} option,
+   deps : spec_deps,
+   context_scripts : spec_file list,
+   script : {sha256 : string, size : string},
+   supports : spec_file list,
+   run_loads : string list, outputs : string list, timeout : int option,
+   run_text : string}
+
+fun parse_run_spec text : run_spec =
+  let
+    val (head, run_text) = split_spec_text "run-text" text
+    val lines = List.filter (fn line => line <> "") (String.fields (fn c => c = #"\n") head)
+    val _ =
+      case lines of
+          first :: _ => if first = run_spec_header then ()
+                        else reject_spec ("not a run spec: " ^ HolbuildHash.quote first)
+        | [] => reject_spec "empty spec"
+    val values = ref ([] : (string * string) list)
+    val toolchain = ref NONE
+    val context = ref NONE
+    val script = ref NONE
+    val timeout = ref NONE
+    val libraries = ref []
+    val deps = ref []
+    val libs = ref []
+    val context_scripts = ref []
+    val supports = ref []
+    val run_loads = ref []
+    val outputs = ref []
+    fun push r x = r := x :: !r
+    fun set r what x =
+      case !r of
+          NONE => r := SOME x
+        | SOME _ => reject_spec ("spec has more than one " ^ what)
+    fun file path sha256 size = {path = path, sha256 = sha256, size = size}
+    fun line text =
+      case String.tokens (fn c => c = #" ") text of
+          ["toolchain", git, rev, kernel] => set toolchain "toolchain" (spec_toolchain text (git, rev, kernel))
+        | ["context", name] => set context "context" (name, NONE)
+        | ["context", name, stem, key] => set context "context" (name, SOME {target = name, stem = stem, key = key})
+        | ["file", "library", path, sha256, size] => push libraries (file path sha256 size)
+        | ["dep", "theory", t, stem, key] => push deps {target = t, stem = stem, key = key}
+        | "lib" :: t :: stem :: suffix :: lib_loads =>
+            push libs {target = t, stem = stem, suffix = suffix, loads = lib_loads}
+        (* The context theory's own preload: the script loads the context. *)
+        | ["load", kind, _] =>
+            if List.exists (fn k => k = kind) ["theory", "library", "object"] then ()
+            else reject_spec ("unknown spec line: " ^ text)
+        | ["file", "context-script", path, sha256, size] => push context_scripts (file path sha256 size)
+        | ["script", sha256, size] => set script "script" {sha256 = sha256, size = size}
+        | ["file", "support", path, sha256, size] => push supports (file path sha256 size)
+        | ["run-load", name] => push run_loads name
+        | ["output", name] => push outputs name
+        | ["option", option] =>
+            (case spec_key_value option of
+                 ("timeout", seconds) =>
+                   (case Int.fromString seconds of
+                        SOME n =>
+                          if n > 0 andalso Int.toString n = seconds then set timeout "timeout" n
+                          else reject_spec ("malformed option timeout: " ^ seconds)
+                      | NONE => reject_spec ("malformed option timeout: " ^ seconds))
+               | _ => reject_spec ("unknown spec option: " ^ option))
+        | [single] => push values (spec_key_value single)
+        | _ => reject_spec ("unknown spec line: " ^ text)
+    val _ = List.app line (tl lines)
+    fun value key =
+      case List.find (fn (k, _) => k = key) (!values) of
+          SOME (_, v) => v
+        | NONE => reject_spec ("spec has no " ^ key)
+    val (context, context_theory) =
+      case !context of SOME c => c | NONE => reject_spec "spec has no context"
+  in
+    {version = value "holbuild-version", runtime = value "holbuild-runtime",
+     toolchain = (case !toolchain of SOME t => t | NONE => reject_spec "spec has no toolchain"),
+     run_key = value "run-key", context = context, context_theory = context_theory,
+     deps = {libraries = rev (!libraries), deps = rev (!deps), libs = rev (!libs)},
+     context_scripts = rev (!context_scripts),
+     script = (case !script of SOME s => s | NONE => reject_spec "spec has no script"),
+     supports = rev (!supports), run_loads = rev (!run_loads), outputs = rev (!outputs),
+     timeout = !timeout, run_text = run_text}
+  end
+
+(* Where a worker puts the caller's script; its support files go beside it. *)
+val run_source_dir = ".holbuild/run-src"
+val run_script_name = "holbuild-run-script.sml"
+
+(* The theories a run restores: its dependencies and a project context. *)
+fun run_spec_deps (spec : run_spec) : spec_deps =
+  let val {libraries, deps, libs} = #deps spec
+  in
+    {libraries = libraries, libs = libs,
+     deps = deps @ (case #context_theory spec of SOME theory => [theory] | NONE => [])}
+  end
+
+fun run_text_value (spec : run_spec) key =
+  case text_values (#run_text spec) (key ^ "=") of
+      [value] => value
+    | _ => reject_spec ("the run text has no single " ^ key ^ " line")
+
+(* The lib line a project run-load names. *)
+fun run_load_lib (spec : run_spec) name =
+  List.find (fn {target, ...} => target = name) (#libs (#deps spec))
+
+(* Step 1 for a run: the spec is for this holbuild, intact, and its paths
+   stay in the action root. *)
+fun verify_run_spec (spec : run_spec) =
+  let
+    fun check ok msg = if ok then () else reject_spec msg
+    val text_values = text_values (#run_text spec)
+    val single = run_text_value spec
+    val {libraries, deps, libs} = #deps spec
+    fun valid_output name = (ignore (output_name name); true) handle Error _ => false
+    fun run_load_ok name =
+      if String.isPrefix "HOLLIB:" name then
+        size name > size "HOLLIB:" andalso not (CharVector.exists (fn c => c = #"/") name)
+      else Option.isSome (run_load_lib spec name)
+    (* A run-load and its load= line, as run-action writes them: HOLLIB:x and
+       hol:x as x, any other pkg:x as pkg:x@<its input key>. *)
+    fun run_load_matches (name, value) =
+      case String.fields (fn c => c = #":") name of
+          ["HOLLIB", x] => value = x
+        | ["hol", x] => value = x
+        | [_, _] =>
+            String.isPrefix (name ^ "@") value andalso
+            sha256_text (String.extract (value, size name + 1, NONE))
+        | _ => false
+    val support_paths = map #path (#supports spec)
+  in
+    check (#version spec = HolbuildVersion.version)
+      ("spec is for holbuild " ^ #version spec ^ ", this is " ^ HolbuildVersion.version);
+    check (#runtime spec = runtime_identity ()) "spec is for different holbuild runtime sources";
+    check (#kernel (#toolchain spec) = "stdknl") "spec is for a tracing kernel";
+    check (HolbuildToolchain.hash_text (#run_text spec) = #run_key spec) "the run text does not hash to run-key";
+    check (String.isPrefix "holbuild-run-v1\n" (#run_text spec)) "the run text is not a holbuild-run-v1 text";
+    check (single "context" =
+             (case #context_theory spec of
+                  SOME {key, ...} => #context spec ^ "@" ^ key
+                | NONE => #context spec))
+      "the run text names another context";
+    (case #context_theory spec of
+         SOME {key, ...} => check (sha256_text key) "the context's key is not a SHA-256"
+       | NONE => check (String.isPrefix "HOL:" (#context spec)) "a toolchain context has no HOL: name");
+    check (single "script" = #sha256 (#script spec)) "the script's SHA-256 does not match the run text";
+    check (sort_strings (text_values "support=") =
+           sort_strings (map (fn {path, sha256, ...} => path ^ "@" ^ sha256) (#supports spec)))
+      "the support files do not match the run text";
+    check (not (null (#outputs spec)) andalso List.all valid_output (#outputs spec) andalso
+           length (unique_strings (#outputs spec)) = length (#outputs spec))
+      "the outputs are not distinct names a script can write";
+    check (sort_strings (text_values "output=") = sort_strings (#outputs spec))
+      "the outputs do not match the run text";
+    check (List.all (sha256_text o #key) deps) "a dependency's key is not a SHA-256";
+    check (List.all (fn {suffix, ...} => suffix = ".ui" orelse suffix = ".uo") libs)
+      "a library manifest is neither .ui nor .uo";
+    check (List.all run_load_ok (#run_loads spec)) "a run-load names no library of the spec";
+    check (ListPair.allEq run_load_matches (#run_loads spec, text_values "load="))
+      "the run-loads do not match the run text";
+    check (not (List.exists (fn path => normalize_path path = run_script_name) support_paths))
+      ("a support file is named " ^ run_script_name);
+    List.app (fn path => check (not (escapes path)) ("path " ^ path ^ " leaves the action root"))
+      (map (#1 o target_name o #target) (deps @ (case #context_theory spec of SOME t => [t] | NONE => [])) @
+       map (#1 o target_name o #target) libs @
+       map #path (libraries @ #context_scripts spec) @ support_paths @
+       map #stem deps @ map #stem libs @
+       (case #context_theory spec of SOME {stem, ...} => [stem] | NONE => []) @
+       List.filter (CharVector.exists (fn c => c = #"/")) (List.concat (map #loads libs)))
+  end
+
+(* The script of a toolchain theory, beside its objects in HOL's source
+   tree, or "" if there is none. *)
+fun toolchain_theory_script holdir theory =
+  let
+    val objects = Path.dir (FS.realPath (Path.concat (Path.concat (holdir, "sigobj"), theory ^ ".uo")))
+    val dir =
+      if Path.file objects = "objs" andalso Path.file (Path.dir objects) = ".hol" then Path.dir (Path.dir objects)
+      else objects
+    val script = Path.concat (dir, drop_suffix "Theory" theory ^ "Script.sml")
+  in
+    if file_exists script then script else ""
+  end
+  handle OS.SysErr _ => ""
+
+(* The run's entry in the remote cache, if it has one with every output. *)
+fun remote_run_entry remote (spec : run_spec) =
+  case HolbuildRemoteCache.get_action remote (#run_key spec) of
+      NONE => NONE
+    | SOME text =>
+        let val outputs = run_manifest_outputs (#run_key spec) text
+        in
+          if sort_strings (map #1 outputs) = sort_strings (#outputs spec) then SOME (text, outputs) else NONE
+        end
+        handle Error _ => NONE
+
+fun run_already_done remote spec =
+  case remote_run_entry remote spec of
+      SOME (_, outputs) => List.all (HolbuildRemoteCache.blob_present remote o #2) outputs
+    | NONE => false
+
+(* Steps 3 to 6 for a run: hydrate the root, run the script, publish. *)
+fun exec_run remote root tc (spec : run_spec) log =
+  let
+    val src = in_root root run_source_dir
+    val output_dir = in_root root ".holbuild/run-output"
+    val scratch = in_root root ".holbuild/run-scratch"
+    fun fetch {path, sha256, ...} = fetch_spec_blob remote {hash = sha256, dst = in_root root path}
+    val script = Path.concat (src, run_script_name)
+    val _ = fetch_spec_blob remote {hash = #sha256 (#script spec), dst = script}
+    val _ = List.app (fn {path, sha256, ...} => fetch_spec_blob remote {hash = sha256, dst = Path.concat (src, path)})
+                     (#supports spec)
+    val _ = List.app fetch (#context_scripts spec)
+    val deps = run_spec_deps spec
+    val _ = hydrate_spec_deps remote root deps
+    val _ = (ensure_dir output_dir; ensure_dir scratch)
+    fun load name =
+      if String.isPrefix "HOLLIB:" name then String.extract (name, size "HOLLIB:", NONE)
+      else case run_load_lib spec name of
+               SOME {stem, ...} => in_root root stem
+             | NONE => reject_spec ("run-load " ^ name ^ " names no library of the spec")
+    val prelude = in_root root ".holbuild/run-prelude.sml"
+    val _ =
+      HolbuildToolchain.write_run_prelude prelude
+        {prelude_lines = [], load_dirs = HolbuildToolchain.load_path_dirs_under (in_root root ".holbuild"),
+         from_loads = [], loads = map load (#run_loads spec)}
+    (* The first context script is the project context's own. *)
+    val (context_key, source) =
+      case (#context_theory spec, #context_scripts spec) of
+          (SOME {key, ...}, {path, ...} :: _) => (key, in_root root path)
+        | (SOME {key, ...}, []) => (key, "")
+        | (NONE, _) =>
+            (run_text_value spec "toolchain",
+             toolchain_theory_script (#holdir tc) (#2 (target_name (#context spec))))
+    val env =
+      ["HOLBUILD_RUN_ROOT=" ^ root,
+       "HOLBUILD_RUN_CONTEXT=" ^ #context spec,
+       "HOLBUILD_RUN_CONTEXT_KEY=" ^ context_key,
+       "HOLBUILD_RUN_SOURCE=" ^ source,
+       "HOLBUILD_RUN_OUTPUT_DIR=" ^ output_dir,
+       "HOLBUILD_RUN_SCRATCH=" ^ scratch]
+    val argv =
+      "env" :: env @ HolbuildToolchain.hol_subcommand_argv tc "run" @
+      ["--noconfig", "--holstate", HolbuildToolchain.base_state tc, prelude, run_script_name]
+    val oom_before = cgroup_oom_kills ()
+    val _ = last_child_status := NONE
+    val {status, timed_out} =
+      (case #timeout spec of
+           SOME seconds =>
+             HolbuildToolchain.run_in_dir_to_file_until src argv log
+               (Time.fromSeconds (LargeInt.fromInt seconds))
+         | NONE => {status = HolbuildToolchain.run_in_dir_to_file src argv log, timed_out = false})
+      handle HolbuildToolchain.Error msg => raise action_failed InternalFailure msg
+    val _ = last_child_status := SOME status
+    val _ =
+      if timed_out then
+        raise ActionFailed (TimeoutFailure,
+                            "the script ran past its timeout of " ^
+                            Int.toString (valOf (#timeout spec)) ^ " s and was killed")
+      else if HolbuildToolchain.success status then ()
+      else
+        let
+          val msg = "the script failed"
+          val failure =
+            case classify_run_failure root (read_text log handle _ => "") oom_before msg of
+                ProofFailure => ScriptFailure
+              | failure => failure
+        in
+          raise ActionFailed (failure, msg ^ "\n" ^ child_log_detail log)
+        end
+    fun output name =
+      let val path = Path.concat (output_dir, name)
+      in
+        (* Only a regular file: hashing a FIFO would block for ever. *)
+        if (Posix.FileSys.ST.isReg (Posix.FileSys.stat path) handle OS.SysErr _ => false) then (name, path)
+        else raise ActionFailed (ScriptFailure, "the script did not write its declared output " ^ name)
+      end
+    val files = map output (sort_strings (#outputs spec))
+    fun publish (name, path) =
+      let val hash = HolbuildHash.file_sha256 path
+      in
+        case HolbuildRemoteCache.publish_blob remote {hash = hash, src = path} of
+            HolbuildCacheBackend.Published => (name, hash)
+          | HolbuildCacheBackend.AlreadyPresent => (name, hash)
+          | _ => raise action_failed PublishFailure ("could not publish output " ^ name)
+      end
+    val outputs = map publish files
+    val manifest =
+      run_manifest_text {input_key = #run_key spec, parent = Option.map #key (#context_theory spec),
+                         outputs = outputs}
+    val _ =
+      HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsentOrSame
+        {key = #run_key spec, text = manifest}
+  in
+    case remote_run_entry remote spec of
+        NONE => raise ActionFailed (PublishFailure, "the remote cache holds no entry for the run after publishing")
+      | SOME (resident, _) =>
+          if cache_manifest_outputs_equal (#run_key spec) manifest resident then ()
+          else raise ActionFailed (PublishFailure, "the remote cache holds different outputs for the run")
+  end
+
 (* Runs one ActionSpec, writes its result record and returns the exit code.
    `toolchain` ensures the spec's HOL toolchain and returns it. *)
 fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
@@ -7963,7 +8321,11 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
        worker cache cap bounds it.  With them it is the action's own, filled
        from the store. *)
     fun empty_root () = (remove_tree root; if share_heaps then remove_tree checkpoint_root else ())
-    fun build_log () = current_build_log (current_log_dir root (#1 (!target)) (#2 (!target)))
+    val run_log = ref NONE
+    fun build_log () =
+      case !run_log of
+          SOME path => path
+        | NONE => current_build_log (current_log_dir root (#1 (!target)) (#2 (!target)))
     fun upload_log () =
       let val path = build_log ()
       in
@@ -7993,7 +8355,40 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                HolbuildCacheBackend.Hit => ()
              | HolbuildCacheBackend.Miss => reject_spec ("the cache has no spec " ^ spec_sha256)
              | HolbuildCacheBackend.Corrupt msg => raise action_failed InternalFailure ("cannot fetch the spec: " ^ msg))
-        val spec = parse_action_spec (read_text spec_path)
+        val spec_text = read_text spec_path
+      in
+        if String.isPrefix (run_spec_header ^ "\n") spec_text then run_script spec_text
+        else run_theory spec_text
+      end
+    and run_script spec_text =
+      let
+        val spec = parse_run_spec spec_text
+        val _ = input_key := #run_key spec
+        val _ = verify_run_spec spec
+      in
+        (* The coordinator may have checked the cache already; a run that
+           another worker finished since needs no HOL. *)
+        if run_already_done remote spec then "cached"
+        else
+          let
+            val tc =
+              toolchain (#toolchain spec)
+              handle e as HolbuildRemoteCache.Unavailable _ => raise e
+                   | e => raise action_failed ToolchainFailure (General.exnMessage e)
+            val _ =
+              if HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key =
+                 run_text_value spec "toolchain" then ()
+              else raise ActionFailed (ToolchainFailure, "the toolchain's identity does not match the run text")
+            val log = Path.concat(root, ".holbuild/run.log")
+          in
+            run_log := SOME log;
+            exec_run remote root tc spec log;
+            "built"
+          end
+      end
+    and run_theory spec_text =
+      let
+        val spec = parse_action_spec spec_text
         val _ = input_key := #input_key spec
         val _ = verify_action_spec spec
         (* Names the build log, so only once the names are known safe. *)
@@ -8074,7 +8469,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
             (* Outputs built against out-of-date local copies of the parents
                never reach the remote; the retry restores the remote's. *)
             val _ =
-              if drop_stale_dep_copies remote spec (dat_records_parent (in_root root (#data_path (#outputs spec))))
+              if drop_stale_dep_copies remote (theory_spec_deps spec) (dat_records_parent (in_root root (#data_path (#outputs spec))))
               then raise ActionFailed (PublishFailure, "built against out-of-date local copies of its parents")
               else ()
             val _ = check_remote_publication remote root spec
@@ -8109,7 +8504,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
               val failure =
                 case (failure, log) of
                     (SOME (kind, msg), NONE) =>
-                      if (kind = ProofFailure orelse kind = TacticTimeoutFailure) andalso
+                      if List.exists (fn final => kind = final)
+                           [ProofFailure, TacticTimeoutFailure, ScriptFailure, TimeoutFailure] andalso
                          file_exists (build_log ()) then
                         SOME (if Option.isSome (!log_unavailable) then UnavailableFailure else PublishFailure,
                               "could not upload the build log of a " ^ failure_name kind ^ " failure: " ^ msg)
