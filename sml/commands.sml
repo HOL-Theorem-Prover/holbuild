@@ -1473,7 +1473,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                            ["action", run_key, HolbuildRemoteCache.remote_action_key run_key, spec_sha256, name])
                      exported) ^ "\n"
             val query = "?class=run" ^ (case profile of SOME p => "&profile=" ^ p | NONE => "")
-            fun on_change (key, state, failure) = states := (key, (state, failure)) :: !states
+            fun on_change (key, state, failure, _) = states := (key, (state, failure)) :: !states
           in
             case HolbuildRemoteExec.submit_with_query url query batch of
                 HolbuildRemoteExec.Refused reason => stopped := SOME (reason, true)
@@ -1621,7 +1621,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             val no_log = "could not fetch the failed theory's build log"
           in
             HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "\n");
-            HolbuildBuildExec.build (HolbuildBuildExec.restore_only_options build_options)
+            HolbuildBuildExec.build (HolbuildBuildExec.remote_restore_options true build_options)
               tc project plan toolchain_key jobs
             handle HolbuildBuildExec.Error _ => ()
                  | HolbuildBuildExec.ErrorWithDebugArtifacts _ => ();
@@ -1650,10 +1650,17 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           let
             val {add, stop} =
               HolbuildBuildExec.start_remote_exec_prefetch build_options tc project plan toolchain_key jobs in_batch
+            val logs = ref []
+            fun on_change (key, state, _, log) =
+              if state = "done" then (add key; logs := (key, log) :: !logs) else ()
             fun follow_batch () =
-              (HolbuildRemoteExec.follow url batch_id
-                 (fn (key, state, _) => if state = "done" then add key else ())
-               before stop ())
+              let
+                val result = HolbuildRemoteExec.follow url batch_id on_change
+                val _ = stop ()
+                val _ = HolbuildBuildExec.restore_remote_build_logs build_options tc project plan toolchain_key (rev (!logs))
+              in
+                result
+              end
               handle e => (stop (); raise e)
           in
             HolbuildRemoteExec.while_followed url batch_id follow_batch
@@ -1671,7 +1678,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           case follow in_batch batch_id of
               (HolbuildRemoteExec.Done, progress) =>
                 (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ finished progress ^ "\n");
-                 build_locally ())
+                 HolbuildBuildExec.build (HolbuildBuildExec.remote_restore_options (#restore_only build_options) build_options)
+                   tc project plan toolchain_key jobs)
             | (HolbuildRemoteExec.Failed (reason, SOME failure), progress) =>
                 proof_failed ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress) failure
             | (HolbuildRemoteExec.Failed (reason, NONE), progress) =>
@@ -2000,8 +2008,8 @@ fun build tc cli_jobs args =
       else if not (Option.isSome url) andalso (remote_only orelse detach orelse Option.isSome attach) then
         raise Error "--remote-only, --detach and --attach need --remote-exec URL"
       else if Option.isSome url andalso
-              (watch orelse dry_run orelse trace_steps orelse repl_on_failure orelse Option.isSome execution_plan) then
-        raise Error "--remote-exec does not support --watch, --dry-run, --trace-steps, --execution-plan or --repl-on-failure"
+              (watch orelse dry_run orelse repl_on_failure orelse Option.isSome execution_plan) then
+        raise Error "--remote-exec does not support --watch, --dry-run, --execution-plan or --repl-on-failure"
       else if Option.isSome url andalso HolbuildStatus.json_mode () then
         raise Error "--json does not support --remote-exec yet"
       else if detach andalso Option.isSome attach then

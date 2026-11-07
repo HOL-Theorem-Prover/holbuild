@@ -141,6 +141,30 @@ expect b 3 unavailable "remote cache server error: HTTP 500 for GET .*/ac/$ac"
 rm "$control/ac-get-status-$ac"
 spec=$spec_a
 
+# A traced rerun must return its new log even though the theory outputs are
+# already published. An outage during that upload retries the action.
+spec=$(python3 - "$remote_root/cas/$spec" "$remote_root/cas" <<'PYTHON'
+import hashlib
+import pathlib
+import sys
+source, cas = map(pathlib.Path, sys.argv[1:])
+data = source.read_text().replace("\naction-text\n", "\noption trace-steps=true\naction-text\n").encode()
+sha = hashlib.sha256(data).hexdigest()
+(cas / sha).write_bytes(data)
+print(sha)
+PYTHON
+)
+echo 500 > "$control/cas-put-status"
+worker traced-log
+expect traced-log 3 unavailable "could not upload the required build log"
+require_grep '^status=failed$' "$tmpdir/traced-log.result"
+rm "$control/cas-put-status"
+worker traced-log
+[[ "$worker_status" == 0 ]] || { cat "$tmpdir/traced-log.log" >&2; exit 1; }
+require_grep '^status=built$' "$tmpdir/traced-log.result"
+require_grep '^log=[0-9a-f]* ' "$tmpdir/traced-log.result"
+spec=$spec_a
+
 # A remote entry with other outputs is a real conflict: a worker that builds
 # the action reports `publish`.
 python3 - "$remote_root/ac/$ac" <<'PY'

@@ -283,11 +283,11 @@ require_grep "^POST /v1/batches/$batch/cancel " "$state/requests.log"
 require_grep "holbuild: cancelled remote batch $batch" "$tmpdir/interrupted-only.log"
 rm "$state/hang"
 
-# A closure that can't run remotely (a forced action) is built locally.
-run forced-only 75 build --remote-exec "$coordinator" --remote-only --force BTheory
-require_grep "can't run remotely: it is forced" "$tmpdir/forced-only.log"
+# Forced builds execute on the workers, including under --remote-only.
+run forced-only 0 build --remote-exec "$coordinator" --remote-only --force BTheory
+require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/forced-only.log"
 run forced 0 build --remote-exec "$coordinator" --force BTheory
-require_grep "BTheory built" "$tmpdir/forced.log"
+refute_grep "BTheory built\|building locally" "$tmpdir/forced.log"
 
 # A stream cut midway through an event: the partial line is no theory.
 write_theories cut
@@ -339,8 +339,9 @@ run url-missing 1 build --remote-exec --remote-only BTheory
 require_grep "remote-exec requires URL" "$tmpdir/url-missing.log"
 run id-missing 1 build --remote-exec "$coordinator" --attach --remote-only BTheory
 require_grep "attach requires BATCH-ID" "$tmpdir/id-missing.log"
-run trace 1 build --remote-exec "$coordinator" --trace-steps BTheory
-require_grep "does not support .*--trace-steps" "$tmpdir/trace.log"
+run trace 0 build --remote-exec "$coordinator" --remote-only --trace-steps BTheory
+require_grep "proof step trace log:" "$tmpdir/trace.log"
+require_grep "holbuild proof-ir trace:" "$tmpdir/trace.log"
 
 # With --remote-only, a HOL toolchain that no cache holds is an error (exit
 # status 75) rather than a local HOL build.
@@ -943,3 +944,71 @@ in_copy stale-build-client --remote-cache "$remote_url" build --remote-exec "$co
   > "$tmpdir/stale-build-again.log" 2>&1 || { cat "$tmpdir/stale-build-again.log" "$tmpdir/worker.log" >&2; exit 1; }
 require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/stale-build-again.log"
 require_grep "PTheory restored from cache" "$tmpdir/stale-build-again.log"
+
+# A warm client's forced target must still run on a warm worker, while its
+# ancestor stays cached. The log must be from that execution, not a local HOL.
+project=$tmpdir/force-project
+mkdir -p "$project/src"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxf"
+[build]
+members = ["src"]
+TOML
+write_theories forced-traced
+cat >> "$project/src/BScript.sml" <<'SML'
+val _ = print "remote execution verdict: PASS\n"
+SML
+run force-seed 0 build --remote-exec "$coordinator" --remote-only BTheory
+: > "$state/results"
+HOLBUILD_TIMING_LOG=$tmpdir/force-target.timing run force-target 0 build --remote-exec "$coordinator" --remote-only --force=theory BTheory
+require_grep "^rxf:BTheory status=built$" "$state/results"
+[[ $(wc -l < "$state/results") -eq 1 ]] || { cat "$state/results" >&2; exit 1; }
+refute_grep "Theory built\|building locally" "$tmpdir/force-target.log"
+[[ $(local_hol_runs "$tmpdir/force-target.timing") -eq 0 ]] || { cat "$tmpdir/force-target.timing" >&2; exit 1; }
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/force-target.log")
+key=$(awk '$1 == "action" { print $2 }' "$state/$batch.batch")
+spec=$(awk '$1 == "action" { print $4 }' "$state/$batch.batch")
+require_grep '^option force=true$' "$remote_root/cas/$spec"
+log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$state/result-$key")
+local_log=$project/.holbuild/logs/current/rxf/BTheory/build.log
+[[ -n $log_sha && $(sha256sum < "$local_log" | cut -d' ' -f1) == "$log_sha" ]] ||
+  { echo "forced log is not the worker's log" >&2; exit 1; }
+require_grep 'remote execution verdict: PASS' "$local_log"
+
+for flag in --force=project --force=full --force --force-project --force-full; do
+  : > "$state/results"
+  run force-scope 0 build --remote-exec "$coordinator" --remote-only "$flag" BTheory
+  [[ $(wc -l < "$state/results") -eq 2 ]] || { cat "$state/results" >&2; exit 1; }
+  require_grep '^rxf:ATheory status=built$' "$state/results"
+  require_grep '^rxf:BTheory status=built$' "$state/results"
+done
+
+# Trace policy applies to the root package's theories and bypasses both
+# worker whole-action reuse and checkpoint replay, also with shared heaps.
+touch "$state/share-heaps"
+for flag in --trace-steps --goalfrag-trace; do
+  : > "$state/results"
+  HOLBUILD_TIMING_LOG=$tmpdir/trace-target.timing run trace-target 0 build --remote-exec "$coordinator" --remote-only "$flag" BTheory
+  require_grep '^rxf:ATheory status=built$' "$state/results"
+  require_grep '^rxf:BTheory status=built$' "$state/results"
+  require_grep 'holbuild proof-ir trace:' "$tmpdir/trace-target.log"
+  require_grep 'proof step trace log: .*rxf/BTheory/proof-trace.log' "$tmpdir/trace-target.log"
+  require_grep 'theorem=b_thm' "$local_log"
+  cmp "$local_log" "$project/.holbuild/logs/current/rxf/BTheory/proof-trace.log"
+  [[ $(local_hol_runs "$tmpdir/trace-target.timing") -eq 0 ]] || { cat "$tmpdir/trace-target.timing" >&2; exit 1; }
+  batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/trace-target.log")
+  spec=$(awk '$1 == "action" && $5 == "rxf:BTheory" { print $4 }' "$state/$batch.batch")
+  require_grep '^option trace-steps=true$' "$remote_root/cas/$spec"
+done
+rm "$state/share-heaps"
+
+# A lost required log fails closed instead of silently succeeding or
+# repeating a forced build on the client.
+touch "$state/drop-log"
+run force-log-missing 75 build --remote-exec "$coordinator" --remote-only --force=theory BTheory
+require_grep 'could not fetch the remote build log for rxf:BTheory' "$tmpdir/force-log-missing.log"
+refute_grep 'Theory built\|building locally' "$tmpdir/force-log-missing.log"
+[[ ! -e "$local_log" ]] || { echo 'stale forced log survived' >&2; exit 1; }
+rm "$state/drop-log"

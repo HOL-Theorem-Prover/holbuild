@@ -163,6 +163,9 @@ class Handler(BaseHTTPRequestHandler):
                         event["log_sha256"] = record["log"].split()[0] if "log" in record else None
                     else:
                         event["state"], event["last_failure"] = "done", None
+                if event["state"] == "done" and result.exists() and not cancelled:
+                    record = dict(line.split("=", 1) for line in result.read_text().splitlines()[1:])
+                    event["log_sha256"] = record["log"].split()[0] if "log" in record else None
                 self.wfile.write((json.dumps(event) + "\n").encode())
                 self.wfile.flush()
                 for _ in range(600):

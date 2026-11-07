@@ -1283,9 +1283,8 @@ holbuild stores a theory's entry. An edge names the nearest uncached theories
 a theory depends on, looking through libraries and cached theories.
 
 `action-spec` refuses a closure containing a theory that can't run remotely,
-and says which and why: one with `cache = false` or `always_reexecute`, a
-forced one (`--force`), one whose script or extra input lies outside its
-package root, one that loads a HOL theory or library by path, one with a path
+and says which and why: one with `cache = false` or `always_reexecute`,
+one whose script or extra input lies outside its package root, one that loads a HOL theory or library by path, one with a path
 containing whitespace, and any theory with `--trknl`. Such a closure builds
 locally.
 
@@ -1312,6 +1311,8 @@ option proof-steps=<bool>
 option tactic-timeout=<seconds|none>
 option new-ir=<bool>
 option theorem-checkpoints=false   (only for a theory that saves none)
+option force=true                 (only for a forced theory)
+option trace-steps=true           (only for a traced theory)
 action-text
 <the action text, verbatim to the end of the blob>
 ```
@@ -1334,7 +1335,9 @@ action-text
   semantic identity, for naming a saved dependency heap.
 - The `option` lines are how the theory is run, which the action key leaves
   out; the entry built under them carries the timeout contract the exporting
-  build will ask for.
+  build will ask for. Optional `force` and `trace-steps` default to false.
+  Either disables whole-action cache reuse and early cutoff on the worker;
+  `trace-steps` also enables proof-step tracing and requires `proof-steps=true`.
 
 ### Exporting script runs for remote execution
 
@@ -1459,7 +1462,8 @@ once), restores every dependency through the normal cache restore and its
 checks, and reports `cached` if the theory's own entry already restores, or
 if an earlier build of the same action text on byte-identical dependency
 outputs left one, which it then publishes under the action's input key (early
-cutoff, DESIGN.md). Otherwise it builds the theory as a local build would,
+cutoff, DESIGN.md). Forced and traced actions bypass both reuse checks.
+Otherwise it builds the theory as a local build would,
 with the spec's proof options, publishes it to the remote cache (a local
 build would publish it at once; the worker waits for the checks below), and
 checks that the remote cache then holds an entry for it whose outputs equal
@@ -1609,6 +1613,24 @@ that aren't already built here, to a remote-execution coordinator, which runs th
 ```sh
 holbuild --remote-cache https://cache.example.org build --remote-exec https://exec.example.org MyTheory
 ```
+
+`--force`, `--force=theory`, `--force=project` and `--force=full` also run
+on the workers, including with `--remote-only`. Forced theories go into the
+batch even when their outputs are already built locally or cached remotely.
+`--force=theory` forces only the requested targets; their ancestors reuse the
+cache as usual. Valid proof checkpoints remain reusable.
+
+`--trace-steps` (also the deprecated `--goalfrag-trace`) sends every theory
+whose proof policy enables tracing to the workers even if it is cached.
+The worker executes its proof steps without theorem-checkpoint replay.
+
+Completed actions' build logs are fetched into
+`.holbuild/logs/current/<package>/<theory>/build.log`. Traced theories also
+write `proof-trace.log` there and print a trace summary and its log path.
+A forced or traced build fails if its required log cannot be returned;
+it never reports success with an old or absent log. The client restores the
+finished outputs without forcing a second build locally. Detached builds
+return their logs when attached.
 
 It exports and uploads the batch as `action-spec --upload` does, submits it
 with `POST URL/v1/batches`, and follows `GET URL/v1/batches/<id>/events`,

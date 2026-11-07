@@ -5844,19 +5844,19 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
     end
   end
 
-(* The build options of a build that only restores from the caches. *)
-fun restore_only_options ({use_cache, verify_cache, force, force_targets, skip_checkpoints, checkpoint_targets, proof_steps,
-                           new_ir, proof_scope, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure,
+(* After remote execution, force and tracing have already been fulfilled. *)
+fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets, skip_checkpoints, checkpoint_targets, proof_steps,
+                           new_ir, proof_scope, node_tactic_timeouts, execution_plan, repl_on_failure,
                            emit_output_hashes, allow_cache_timeout_discrepancy, trknl, ...} : build_options)
     : build_options =
-  {use_cache = use_cache, verify_cache = verify_cache, force = force, force_targets = force_targets,
+  {use_cache = use_cache, verify_cache = verify_cache, force = ForceNone, force_targets = force_targets,
    skip_checkpoints = skip_checkpoints, checkpoint_targets = checkpoint_targets,
    proof_steps = proof_steps, new_ir = new_ir, proof_scope = proof_scope,
    node_tactic_timeouts = node_tactic_timeouts, execution_plan = execution_plan,
-   trace_steps = trace_steps, repl_on_failure = repl_on_failure,
+   trace_steps = false, repl_on_failure = repl_on_failure,
    emit_output_hashes = emit_output_hashes,
    allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy, trknl = trknl,
-   restore_only = true}
+   restore_only = restore_only}
 
 (* The plan's node whose action has input key `input_key`. *)
 fun node_with_input_key (options : build_options) tc project plan toolchain_key input_key =
@@ -5866,6 +5866,63 @@ fun node_with_input_key (options : build_options) tc project plan toolchain_key 
   in
     List.find (fn node => HolbuildBuildPlan.input_key_for keys node = input_key)
               (HolbuildBuildPlan.selected_nodes plan)
+  end
+
+(* Fetch a worker's log to the same location as a local theory build. *)
+fun fetch_remote_build_log project node log_sha256 =
+  let
+    val log = current_build_log (current_log_dir (project_artifact_root project) (package node) (logical_name node))
+  in
+    ensure_parent log;
+    remove_file log;
+    case HolbuildRemoteCacheConfig.url () of
+        NONE => NONE
+      | SOME url =>
+          case HolbuildRemoteCache.fetch_unlisted_blob (HolbuildRemoteCache.remote url)
+                 {hash = log_sha256, dst = log} of
+              HolbuildCacheBackend.Hit => SOME log
+            | _ => (remove_file log; NONE)
+  end
+
+(* Logs belong to this execution, not the cached theory entry. *)
+fun restore_remote_build_logs (options : build_options) tc project plan toolchain_key logs =
+  let
+    val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
+                 (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
+    val nodes = List.foldl
+      (fn (node, table) => Redblackmap.insert (table, HolbuildBuildPlan.input_key_for keys node, node))
+      (Redblackmap.mkDict String.compare) (HolbuildBuildPlan.selected_nodes plan)
+    fun restore (key, sha) =
+      case Redblackmap.peek (nodes, key) of
+          NONE => ()
+        | SOME node =>
+            let
+              val traced = trace_steps (checkpoint_policy_for_node options project node)
+              val required = force_node options project node orelse traced
+              val log = Option.mapPartial (fetch_remote_build_log project node) sha
+              val reason = "could not fetch the remote build log for " ^ package node ^ ":" ^ logical_name node
+            in
+              case log of
+                  NONE =>
+                    if required then
+                      (remove_file (current_build_log
+                         (current_log_dir (project_artifact_root project) (package node) (logical_name node)));
+                       HolbuildHolSharedCache.local_build_needed := true;
+                       raise Error reason)
+                    else if Option.isSome sha then warn reason else ()
+                | SOME path =>
+                    if not traced then ()
+                    else
+                      let val trace = current_proof_trace_log
+                                        (current_log_dir (project_artifact_root project) (package node) (logical_name node))
+                      in
+                        ignore (preserve_log path trace);
+                        Option.app HolbuildStatus.message_stdout (HolbuildTheoryDiagnostics.summarize_trace_steps path);
+                        HolbuildStatus.message_stdout ("proof step trace log: " ^ trace ^ "\n")
+                      end
+            end
+  in
+    List.app restore logs
   end
 
 (* The error of theory `node`, whose proof failed on a remote worker
@@ -5878,22 +5935,13 @@ fun remote_proof_failure (options : build_options) tc project plan toolchain_key
     val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
                  (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
     val root = project_artifact_root project
-    fun fetch log =
-      case HolbuildRemoteCacheConfig.url () of
-          NONE => false
-        | SOME url =>
-            (ensure_parent log;
-             case HolbuildRemoteCache.fetch_unlisted_blob (HolbuildRemoteCache.remote url)
-                    {hash = log_sha256, dst = log} of
-                 HolbuildCacheBackend.Hit => true
-               | _ => (remove_file log; false))
     fun diagnose node =
       let
         val action = theory_action root plan keys toolchain_key
                        (dependency_context_key toolchain_key plan keys node) node
         val log = current_build_log (current_log_dir root (#package action) (#logical action))
       in
-        if not (fetch log) then NONE
+        if not (Option.isSome (fetch_remote_build_log project node log_sha256)) then NONE
         else
           let
             val policy = checkpoint_policy_for_node options project node
@@ -5945,10 +5993,9 @@ fun hol_load_by_path (LoadTheory name) = CharVector.exists (fn c => c = #"/") na
   | hol_load_by_path (LoadObject _) = false
 
 (* Why a theory can't run remotely, if it can't. *)
-fun excluded_reason (options : build_options) project (action : theory_action) node =
+fun excluded_reason (action : theory_action) node =
   if always_reexecute node then SOME "it sets always_reexecute"
   else if not (cache_enabled node) then SOME "it sets cache = false"
-  else if force_node options project node then SOME "it is forced"
   else if escapes_root (HolbuildBuildPlan.relative_path node) then
     SOME "its script lies outside its package root"
   else
@@ -6072,7 +6119,7 @@ fun dependency_spec_lines root plan keys token deps =
 (* A worker saves theorem checkpoints unless the spec says otherwise: a
    spec without the line, as older clients write, means true. *)
 fun action_spec_text {root, plan, keys, action_toolchain_key, runtime, toolchain_line} policy
-                     theorem_checkpoints (action : theory_action) node action_text =
+                     theorem_checkpoints forced (action : theory_action) node action_text =
   let
     val context = #package action ^ ":" ^ #logical action
     val token = spec_token context
@@ -6107,6 +6154,8 @@ fun action_spec_text {root, plan, keys, action_toolchain_key, runtime, toolchain
        "option tactic-timeout=" ^ timeout_text (tactic_timeout policy),
        bool_option "new-ir" (proof_ir_enabled policy)] @
       (if theorem_checkpoints then [] else [bool_option "theorem-checkpoints" false]) @
+      (if forced then [bool_option "force" true] else []) @
+      (if trace_steps policy then [bool_option "trace-steps" true] else []) @
       ["action-text"]
   in
     {text = String.concatWith "\n" lines ^ "\n" ^ action_text,
@@ -6313,7 +6362,7 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
     val _ =
       List.app
         (fn (node, action) =>
-            case excluded_reason options project action node of
+            case excluded_reason action node of
                 SOME reason =>
                   raise Error ("action-spec: " ^ package node ^ ":" ^ logical_name node ^
                                " can't run remotely: " ^ reason)
@@ -6324,7 +6373,9 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
        current inputs, under a timeout contract as strict as the one
        requested) needs no worker, so only the others go through the remote
        cache. *)
-    fun is_forced (_, action) = List.exists (fn key => key = #input_key action) forced
+    fun is_forced (node, action) =
+      force_node options project node orelse trace_steps (checkpoint_policy_for_node options project node) orelse
+      List.exists (fn key => key = #input_key action) forced
     fun built_here (node, action) =
       local_resumable andalso not (is_forced (node, action)) andalso
       (case current_metadata (metadata_path project node) of
@@ -6377,7 +6428,7 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
           else raise Error ("internal error: action text of " ^ logical_name node ^ " does not hash to its input key")
         val {text, files} =
           action_spec_text context (checkpoint_policy_for_node options project node)
-            (checkpoint_target_node options node) action node action_text
+            (checkpoint_target_node options node) (force_node options project node) action node action_text
         val spec_sha256 = HolbuildHash.string_sha256 text
         val path = Path.concat(spec_dir, spec_sha256)
         val _ = (ensure_dir spec_dir; write_text path text)
@@ -6695,7 +6746,7 @@ fun plan_runs tc project planned jobs
                   val action = theory_action root plan keys toolchain_key
                                  (dependency_input_context_key toolchain_key plan keys node) node
                   val _ =
-                    case excluded_reason options project action node of
+                    case excluded_reason action node of
                         SOME reason => raise Error ("run-action: " ^ name ^ " can't run remotely: " ^ reason)
                       | NONE => ()
                   val deps = HolbuildBuildPlan.transitive_project_deps plan node
@@ -6916,7 +6967,7 @@ type action_spec =
    outputs : {sig_path : string, sml_path : string, data_path : string},
    extra_outputs : string list,
    proof_steps : bool, tactic_timeout : real option, new_ir : bool,
-   theorem_checkpoints : bool, action_text : string}
+   theorem_checkpoints : bool, force : bool, trace_steps : bool, action_text : string}
 
 (* A spec's lines, and the text after its SECTION line. *)
 fun split_spec_text section text =
@@ -7025,6 +7076,14 @@ fun parse_action_spec text : action_spec =
        (case List.find (fn (k, _) => k = "option theorem-checkpoints") (!values) of
             SOME (_, v) => spec_bool "theorem-checkpoints" v
           | NONE => true),
+     force =
+       (case List.find (fn (k, _) => k = "option force") (!values) of
+            SOME (_, v) => spec_bool "force" v
+          | NONE => false),
+     trace_steps =
+       (case List.find (fn (k, _) => k = "option trace-steps") (!values) of
+            SOME (_, v) => spec_bool "trace-steps" v
+          | NONE => false),
      action_text = action_text}
   end
 
@@ -7083,6 +7142,7 @@ fun verify_action_spec (spec : action_spec) =
       ("spec is for holbuild " ^ #version spec ^ ", this is " ^ HolbuildVersion.version);
     check (#runtime spec = runtime_identity ()) "spec is for different holbuild runtime sources";
     check (#kernel (#toolchain spec) = "stdknl") "spec is for a tracing kernel";
+    check (not (#trace_steps spec) orelse #proof_steps spec) "trace-steps requires proof-steps";
     check (sha256_text (#deps_key spec)) "deps-key is not a SHA-256";
     check (List.all (sha256_text o #key) (#deps spec)) "a dependency's key is not a SHA-256";
     check (text_hash = #input_key spec) "the action text does not hash to input-key";
@@ -7185,7 +7245,7 @@ fun spec_policy share_heaps (spec : action_spec) =
                     new_ir = #new_ir spec,
                     tactic_timeout = effective_tactic_timeout (#proof_steps spec) (#tactic_timeout spec),
                     execution_plan = NONE,
-                    trace_steps = false,
+                    trace_steps = #trace_steps spec,
                     repl_on_failure = false,
                     trknl = false}
 
@@ -8538,6 +8598,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
         (f () before record ()) handle e => (record (); raise e)
       end
     val log_unavailable = ref NONE
+    val log_required = ref false
     (* Without shared heaps the checkpoint tree outlives the action root, so
        a rerun after an edit resumes from the checkpoints before it; the
        worker cache cap bounds it.  With them it is the action's own, filled
@@ -8616,6 +8677,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
         val _ = verify_action_spec spec
         (* Names the build log, so only once the names are known safe. *)
         val _ = target := (#package spec, #logical spec)
+        val forced = #force spec orelse #trace_steps spec
+        val _ = log_required := forced
         val _ = publish_builds_remotely := false
         val tc =
           phase "toolchain" (fn () => toolchain (#toolchain spec))
@@ -8629,11 +8692,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
         val (done, cutoff) =
           phase "cutoff" (fn () =>
             let
-              val done = action_already_done root spec
+              val done = not forced andalso action_already_done root spec
               val cutoff = if done then NONE else spec_early_cutoff root spec
             in
               (done orelse
-               (case cutoff of
+               (not forced andalso
+                case cutoff of
                     SOME {pair_key, ...} => reuse_earlier_build remote root spec pair_key
                   | NONE => false),
                cutoff)
@@ -8657,7 +8721,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
               case HolbuildCache.get_action cache (#input_key spec) of
                   SOME _ =>
                     (HolbuildCache.remove_action cache (#input_key spec);
-                     remove_checkpoint_family (action_checkpoint_base checkpoint_root action))
+                     if forced then () else remove_checkpoint_family (action_checkpoint_base checkpoint_root action))
                 | NONE => ()
             val stage = action_stage root action
             val policy = spec_policy share_heaps spec
@@ -8742,7 +8806,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                         SOME (if Option.isSome (!log_unavailable) then UnavailableFailure else PublishFailure,
                               "could not upload the build log of a " ^ failure_name kind ^ " failure: " ^ msg)
                       else failure
+                  | (NONE, NONE) =>
+                      if status = "built" andalso !log_required then
+                        SOME (if Option.isSome (!log_unavailable) then UnavailableFailure else PublishFailure,
+                              "could not upload the required build log")
+                      else NONE
                   | _ => failure
+              val status = if Option.isSome failure then "failed" else status
             in
               empty_root ();
               (status, failure, log)
