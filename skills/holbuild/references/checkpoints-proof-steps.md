@@ -61,7 +61,7 @@ By default, theorem-context, end-of-proof, declaration and failed-prefix checkpo
 
 ## Host deps heaps
 
-Every `deps_loaded.save` is also kept once per host in `$HOLBUILD_CACHE/checkpoint-store/`, keyed without the project directory, so worktrees of one project share it by hard link. A theory with no valid `deps_loaded` resumes from the stored one; a stored heap with the wrong parent is ignored, and one HOL can't resume from is replaced. Each build evicts stored heaps no tree links that no build used for a day, and `holbuild gc` evicts those unused within the retention window. In a theory resumed from another tree's heap, `Meta.fileDirMap()` (TacticToe's file lookups) names that tree's directories; loading is unaffected.
+Every `deps_loaded.save` is also kept once per host in `$HOLBUILD_CACHE/checkpoint-store/`, keyed without the project directory, so worktrees of one project share it by hard link. A theory with no valid `deps_loaded` resumes from the stored one; a stored heap with the wrong parent is ignored, and one HOL can't resume from is replaced. Each build evicts stored heaps no tree links that no build used for a day, and `holbuild gc` evicts those unused within the retention window that no tree links. In a theory resumed from another tree's heap, `Meta.fileDirMap()` (TacticToe's file lookups) names that tree's directories; loading is unaffected.
 
 ## `--skip-proof-steps`
 

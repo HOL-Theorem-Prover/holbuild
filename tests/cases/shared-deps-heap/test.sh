@@ -141,7 +141,14 @@ mkdir -p "$gc_cache"
 cp -a "$store" "$gc_cache/"
 family=$(dirname "${stored#"$store/"}")
 touch -d '60 days ago' "$gc_cache/checkpoint-store/$family"
+# A heap a tree still links stays, however old: removing it frees nothing.
+linked=$gc_cache/checkpoint-store/linked-family
+mkdir -p "$linked"
+cp "$stored" "$linked/deps_loaded.save"
+ln "$linked/deps_loaded.save" "$tmpdir/tree-link"
+touch -d '60 days ago' "$linked"
 HOLBUILD_CACHE=$gc_cache "$HOLBUILD_BIN" gc --cache-only --days 30 > "$tmpdir/gc.log" 2>&1 \
   || { cat "$tmpdir/gc.log" >&2; exit 1; }
 [[ ! -e "$gc_cache/checkpoint-store/$family" ]] || { echo "gc kept a stale store family" >&2; exit 1; }
+[[ -e "$linked" ]] || { echo "gc removed a store heap a tree still links" >&2; exit 1; }
 require_grep "checkpoint store gc: removed families=1" "$tmpdir/gc.log"

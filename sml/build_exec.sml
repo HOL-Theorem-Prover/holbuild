@@ -4475,11 +4475,12 @@ fun file_id path =
   in SOME (Posix.FileSys.ST.dev st, Posix.FileSys.ST.ino st) end
   handle OS.SysErr _ => NONE
 
-(* A file's identity and change time: a file saved where a discarded one
-   was can reuse its inode number. *)
+(* A file's identity and modification time: a file saved where a discarded
+   one was can reuse its inode number.  Not its change time, which links made
+   by other trees change. *)
 fun file_stamp path =
   let val st = Posix.FileSys.stat path
-  in SOME (Posix.FileSys.ST.dev st, Posix.FileSys.ST.ino st, Posix.FileSys.ST.ctime st) end
+  in SOME (Posix.FileSys.ST.dev st, Posix.FileSys.ST.ino st, Posix.FileSys.ST.mtime st) end
   handle OS.SysErr _ => NONE
 
 fun stamp_id stamp = Option.map (fn (dev, ino, _) => (dev, ino)) stamp
@@ -4494,12 +4495,14 @@ fun publish_local_heap tc heap_context (action : theory_action) deps_loaded prio
     val now = file_stamp deps_loaded
     val {store, heap, stored} = local_heap_location tc heap_context action
   in
-    if now = prior then ()
+    if now = prior orelse stamp_id now = file_id stored then ()
     else if deps_checkpoint_exists deps_loaded (#deps_key action) then
       let val tmp = store_temp stored
       in
+        (* rename leaves tmp in place when both name one file. *)
         with_store_family_lease store heap (fn () =>
-          (ensure_parent tmp; link_or_copy_file deps_loaded tmp; FS.rename {old = tmp, new = stored})
+          (ensure_parent tmp; link_or_copy_file deps_loaded tmp; FS.rename {old = tmp, new = stored};
+           remove_file tmp)
           handle e => (remove_file tmp; raise e))
       end
     else if List.exists (fn id => Option.isSome id andalso file_id stored = id) [stamp_id prior, placed] then

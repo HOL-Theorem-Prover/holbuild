@@ -902,7 +902,7 @@ state is ignored, and one HOL can't resume from is discarded and replaced by
 the build's fresh heap. Each build removes stored heaps no tree links any
 more (its checkpoint budget evicted them, or the tree was deleted) that no
 build used for a day, and `holbuild gc` removes every store directory no
-build used within the retention window. A heap keeps HOL's record of the directories
+build used within the retention window, except a heap a tree still links. A heap keeps HOL's record of the directories
 its files were loaded from, so in a theory resumed from another tree's heap
 `Meta.fileDirMap()` (used only by TacticToe's file lookups) names that
 tree's directories, as it names the old ones after a project is moved;
