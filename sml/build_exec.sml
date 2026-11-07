@@ -667,15 +667,6 @@ fun holpath_reference path dir name =
     SOME ("$(" ^ name ^ ")/" ^ String.extract(path, size dir + 1, NONE))
   else NONE
 
-(* The script's path in recorded theorem locations, in holpathdb form so that
-   a cached theory carries no path of the checkout that built it: HOL's own
-   sources under `$(HOLDIR)`, as HOL records them, and other packages under
-   their package name. *)
-fun located_source_name holdir node =
-  case holpath_reference (canonical_path (source_file node)) (canonical_path holdir) "HOLDIR" of
-      SOME name => name
-    | NONE => "$(" ^ package node ^ ")/" ^ HolbuildBuildPlan.relative_path node
-
 fun holpath_stage_references path =
   let
     val canonical = canonical_path path
@@ -2383,9 +2374,11 @@ fun discover_boundaries_and_terminations source_path source_text =
   handle HolbuildTheoryCheckpoints.Error msg => raise Error msg
 
 (* Context checkpoints hold the theorems saved so far, with their recorded
-   locations; this names how those were recorded, so that states saved before
-   staged scripts carried location pragmas are not resumed. *)
-val theorem_location_schema = "source_pragmas_v1"
+   locations; this names how those were recorded, so that states saved with
+   other locations are not resumed: v1 states may come from before staged
+   scripts carried location pragmas, or from a worker that recorded a source
+   under the HOL toolchain under its package name rather than `$(HOLDIR)`. *)
+val theorem_location_schema = "source_pragmas_v2"
 
 (* Context checkpoints also hold the theorem numbering HOL assigned so far.
    States saved while termination goals were derived by a second Hol_defn
@@ -3057,7 +3050,7 @@ fun run_failure_repl tc policy theorem_checkpoints failure_checkpoints deps_load
           end
 
 (* The theory action that builds `node` in action root `root`. *)
-fun theory_action root plan keys toolchain_key holdir deps_key node : theory_action =
+fun theory_action root plan keys toolchain_key deps_key node : theory_action =
   let
     val package_root = #package_root (HolbuildBuildPlan.source_of node)
     val script_dir = Path.dir (source_file node)
@@ -3088,7 +3081,7 @@ fun theory_action root plan keys toolchain_key holdir deps_key node : theory_act
      logical = logical_name node,
      relative_path = HolbuildBuildPlan.relative_path node,
      source_file = source_file node,
-     source_name = located_source_name holdir node,
+     source_name = HolbuildBuildPlan.source_name plan node,
      script_dir = stage_script_dir,
      inputs = source_inputs @ manifest_inputs,
      loads = preload_loads root plan node,
@@ -4238,7 +4231,7 @@ fun build_theory_action cache_allowed policy tc root checkpoint_root base_contex
 fun build_theory cache_allowed policy tc project base_context plan keys toolchain_key node =
   let
     val root = project_artifact_root project
-    val action = theory_action root plan keys toolchain_key (#holdir tc)
+    val action = theory_action root plan keys toolchain_key
                    (dependency_context_key toolchain_key plan keys node) node
     val generated_metadata =
       build_theory_action cache_allowed policy tc root (default_checkpoint_root root) base_context action
@@ -5520,7 +5513,7 @@ fun remote_proof_failure (options : build_options) tc project plan toolchain_key
                | _ => (remove_file log; false))
     fun diagnose node =
       let
-        val action = theory_action root plan keys toolchain_key (#holdir tc)
+        val action = theory_action root plan keys toolchain_key
                        (dependency_context_key toolchain_key plan keys node) node
         val log = current_build_log (current_log_dir root (#package action) (#logical action))
       in
@@ -5772,7 +5765,7 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
     val keys = HolbuildBuildPlan.input_keys config_lines action_toolchain_key plan
     val theories = List.filter is_theory_node (HolbuildBuildPlan.selected_nodes plan)
     val actions =
-      map (fn node => (node, theory_action root plan keys toolchain_key (#holdir tc)
+      map (fn node => (node, theory_action root plan keys toolchain_key
                                (dependency_input_context_key toolchain_key plan keys node) node))
           theories
     val _ =
@@ -6109,7 +6102,7 @@ fun spec_theory_action root (spec : action_spec) deps_key : theory_action =
      logical = #logical spec,
      relative_path = path,
      source_file = in_root root (action_source_path package path),
-     source_name = "$(" ^ package ^ ")/" ^ path,
+     source_name = action_text_value spec "source-name",
      script_dir = script_dir,
      inputs = map (fn {path, ...} => {path = path, from = in_root root (action_source_path package path)}) (#inputs spec),
      loads = #loads spec,
