@@ -4246,8 +4246,9 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
 
 (* After early cutoff, the theory's cache entry under its old input key also
    describes its outputs for the new one, so the entry is copied to the new
-   key, where commands that read the cache by current key (export) find it.
-   Only a usable entry is copied, and only where the new key has none. *)
+   key, where commands that read the cache by current key (export) find it,
+   and published to the remote cache as a build would.  Only a usable entry
+   is copied, and only where the new key has none. *)
 fun alias_cache_entry old_key new_key =
   let
     val root = cache_root ()
@@ -4255,14 +4256,17 @@ fun alias_cache_entry old_key new_key =
       case (HolbuildCache.get_action root new_key, HolbuildCache.get_action root old_key) of
           (NONE, SOME old_text) =>
             if cache_entry_usable root old_key old_text then
-              HolbuildCache.write_action root
-                {key = new_key,
-                 text = replace_all ("\ninput_key=" ^ old_key ^ "\n") ("\ninput_key=" ^ new_key ^ "\n")
-                                    old_text}
-            else ()
-        | _ => ()
+              (HolbuildCache.write_action root
+                 {key = new_key,
+                  text = replace_all ("\ninput_key=" ^ old_key ^ "\n") ("\ninput_key=" ^ new_key ^ "\n")
+                                     old_text};
+               true)
+            else false
+        | _ => false
   in
-    HolbuildCache.with_action_publish_lock root new_key alias (fn () => ())
+    if HolbuildCache.with_action_publish_lock root new_key alias (fn () => false)
+    then publish_remote_cache_key_if_usable root new_key
+    else ()
   end
   handle e => warn ("could not alias cache entry: " ^ General.exnMessage e)
 

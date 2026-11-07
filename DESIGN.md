@@ -566,8 +566,8 @@ holbuild keeps them and rewrites the metadata under the new input key. Any
 missing output or mismatch builds as before. When the local cache holds a
 usable entry under the old input key and none under the new one, early cutoff
 copies that entry to the new key, since it describes the same outputs; this
-lets commands that read the cache by current key, such as `export`, find it.
-Nothing is published to a remote cache.
+lets commands that read the cache by current key, such as `export`, find it,
+and the copy is published to a configured remote cache as a build's entry would be.
 
 The dependency context of a theory's checkpoints (`deps_loaded.save` and the
 theorem checkpoints above it) is keyed the same way, on `deps_output_key`, so a

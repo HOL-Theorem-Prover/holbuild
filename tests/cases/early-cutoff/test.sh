@@ -8,7 +8,8 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
-cleanup() { rm -rf "$tmpdir"; }
+server_pid=
+cleanup() { [[ -z "$server_pid" ]] || kill "$server_pid" 2>/dev/null || true; rm -rf "$tmpdir"; }
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
@@ -118,13 +119,19 @@ c_deps_loaded_stamp=$(stat -c '%i %Y' "$c_deps_loaded")
 # A proof-only edit leaves A's outputs as they were, so B and C are reused,
 # and Util, whose load manifest only names its unchanged source, too.
 write_a "ALL_TAC >> ACCEPT_TAC TRUTH" "one"
-build "$tmpdir/proof-edit.log"
+start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
+HOLBUILD_REMOTE_CACHE_URL=$remote_url build "$tmpdir/proof-edit.log"
 [[ "$(sha256sum "$a_dat")" == "$a_dat_hash" ]] || { echo "proof edit changed ATheory.dat" >&2; exit 1; }
 require_grep "ATheory built" "$tmpdir/proof-edit.log"
 require_cutoff BTheory "$tmpdir/proof-edit.log"
 require_cutoff CTheory "$tmpdir/proof-edit.log"
 [[ "$(grep '^input_key=' "$dep/BScript.sml.key")" != "$b_key" ]] ||
   { echo "B's metadata kept its old input key" >&2; exit 1; }
+# A configured remote cache gets the reused theories' entries under their
+# new keys, as it would from a rebuild.
+b_remote_ac=$(printf 'holbuild-remote-ac-v1\n%s\n' "$(sed -n 's/^input_key=//p' "$dep/BScript.sml.key")" |
+               sha256sum | cut -d' ' -f1)
+require_file "$tmpdir/remote/ac/$b_remote_ac"
 # The cache entries of the reused theories are aliased to their new keys,
 # so commands that read the cache by current key find them.
 (cd "$project" && "$HOLBUILD_BIN" export -o "$tmpdir/cutoff.hbx" CTheory) > "$tmpdir/export.log" 2>&1 ||
