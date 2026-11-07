@@ -5363,7 +5363,7 @@ fun start_remote_cache_prefetch (options : build_options) project plan keys jobs
 
 (* For build --remote-exec while it follows its batch: starts copying into
    the local cache the remote entries of the plan's theories outside the
-   batch, given its keys (SOME batch_keys), which the remote cache already
+   batch, given its keys (SOME batch_keys), that the remote cache already
    holds, as start_remote_cache_prefetch does.  Returns {add, stop}: add
    copies the entry of one more key, as the batch finishes its action; stop
    drops the copies not yet started, which the build's own prefetch makes,

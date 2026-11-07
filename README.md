@@ -1203,10 +1203,10 @@ It exports and uploads the batch as `action-spec --upload` does, submits it
 with `POST URL/v1/batches`, and follows `GET URL/v1/batches/<id>/events`,
 printing each theory's state as it changes. While it follows the batch, it
 copies into the local cache the remote cache entry of each theory as the batch
-finishes it, and those of the theories a submitted batch leaves out, which the
+finishes it, and those of the theories outside a submitted batch that the
 remote cache already holds, `--prefetch-concurrency` at a time. When the batch is done,
-the build restores every theory from the local cache, or from the remote cache
-whatever is not there yet. The coordinator's credentials go
+the build restores those theories from the local cache, or from the remote cache
+whatever is not there yet, and builds the ones left out of the batch (below). The coordinator's credentials go
 in a curl config file named by `HOLBUILD_REMOTE_EXEC_CURL_CONFIG`, such as
 `header = "Authorization: Bearer <token>"`, so they stay off the command line.
 

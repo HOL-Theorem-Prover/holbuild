@@ -510,7 +510,17 @@ require_grep "remote execution: nothing to build remotely" "$tmpdir/leaf-local.l
 require_grep "resuming BTheory" "$tmpdir/leaf-local.log"
 require_grep "BTheory built" "$tmpdir/leaf-local.log"
 refute_grep "^POST /v1/batches" "$state/requests.log"
-# --detach submits it.
+# A theory with current checkpoints that another theory in the batch depends
+# on goes in: ATheory, built locally above, changes, so BTheory does too.
+find "$project/.holbuild/checkpoints" -path '*AScript*' -name deps_loaded.save | grep -q . ||
+  { echo "ATheory has no deps_loaded checkpoint" >&2; exit 1; }
+sed -i 's/(\* cancelled \*)/(* not-leaf *)/' "$project/src/AScript.sml"
+run not-leaf 0 build --remote-exec "$coordinator" BTheory
+refute_grep "stays out of the batch" "$tmpdir/not-leaf.log"
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/not-leaf.log")
+require_grep "^action .* rx:ATheory$" "$state/$batch.batch"
+require_grep "^action .* rx:BTheory$" "$state/$batch.batch"
+# --detach submits a checkpointed leaf.
 sed -i 's/(\* leaf-local \*)/(* leaf-detach *)/' "$project/src/BScript.sml"
 run leaf-detach 0 build --remote-exec "$coordinator" --detach BTheory
 refute_grep "stays out of the batch" "$tmpdir/leaf-detach.log"

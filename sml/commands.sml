@@ -1344,7 +1344,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           else fall_back reason
         (* A batch that abandon would cancel is cancelled on an interrupt too.
            While it runs, the entries of the theories it finishes, and of a
-           submitted batch the theories outside it, which the remote cache
+           submitted batch the theories outside it that the remote cache
            already holds, are copied into the local cache, for the build
            that follows to restore.  An attached batch's theories are
            unknown, so none of the others are copied before it ends. *)
