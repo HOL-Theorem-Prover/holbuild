@@ -202,6 +202,12 @@ fun disabled () =
   (Mutex.lock transport_mutex;
    disabled_unlocked () before Mutex.unlock transport_mutex)
 
+(* Advisory requests leave recovery probes to send. *)
+fun tripped () =
+  (Mutex.lock transport_mutex;
+   !transport_failures >= max_consecutive_transport_failures
+   before Mutex.unlock transport_mutex)
+
 fun begin_request () =
   let
     val _ = Mutex.lock transport_mutex
@@ -517,7 +523,7 @@ fun blob_present cache sha256 =
 (* An optional upload probe must not disable PUTs when a server drops HEADs.
    Leave the breaker to the normal cache requests, and skip only confirmed hits. *)
 fun blob_confirmed_present cache sha256 =
-  if disabled () then false
+  if tripped () then false
   else
     let val url = cas_url cache sha256
     in traced "HEAD" url "" (fn () => head_status curl_max_time_seconds url) = HolbuildHttp.Response 200 end
