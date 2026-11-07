@@ -203,14 +203,55 @@ fun parse_heaps table =
           end
   in loop [] heaps; heaps end
 
-fun parse_generator value =
+fun expand_generator_file file text =
+  let val (prefix, suffix) = Substring.position "{file}" (Substring.full text)
+  in
+    if Substring.isEmpty suffix then text
+    else Substring.string prefix ^ file ^
+         expand_generator_file file (Substring.string (Substring.triml 6 suffix))
+  end
+
+fun parse_generator templates value =
   case value of
       TOML.TABLE table =>
         let
           val name = case string_field table "name" of SOME s => s | NONE => die "[[generate]] entry requires name"
-          val command = required_string_array_field ("generate." ^ name) table "command"
-          val inputs = package_relative_paths ("generate." ^ name ^ ".inputs") (string_array_field table "inputs")
-          val outputs = package_relative_paths ("generate." ^ name ^ ".outputs") (required_string_array_field ("generate." ^ name) table "outputs")
+          val context = "generate." ^ name
+          val template =
+            case string_field table "template" of
+                NONE => []
+              | SOME key =>
+                  (case List.find (fn (name, _) => name = key) templates of
+                       SOME (_, fields) => fields
+                     | NONE => die (context ^ " references unknown generate template: " ^ key))
+          val files = string_array_field_opt table "files"
+          val _ =
+            case files of
+                NONE => ()
+              | SOME [] => die (context ^ ".files must not be empty")
+              | SOME values =>
+                  if List.exists (fn value => value = "") values then
+                    die (context ^ ".files entries must not be empty")
+                  else ()
+          fun array field required =
+            let
+              val values =
+                case lookup table [field] of
+                    SOME _ => required_string_array_field context table field
+                  | NONE =>
+                      if required then required_string_array_field context template field
+                      else string_array_field template field
+              fun expand text =
+                case files of
+                    NONE => [text]
+                  | SOME values =>
+                      if String.isSubstring "{file}" text then
+                        map (fn file => expand_generator_file file text) values
+                      else [text]
+            in List.concat (map expand values) end
+          val command = array "command" true
+          val inputs = package_relative_paths (context ^ ".inputs") (array "inputs" false)
+          val outputs = package_relative_paths (context ^ ".outputs") (array "outputs" true)
           val deps = string_array_field table "deps"
           val _ = if name = "" then die "generate.name must not be empty" else ()
           val _ = if null command then die ("generate." ^ name ^ ".command must not be empty") else ()
@@ -219,10 +260,12 @@ fun parse_generator value =
     | _ => die "generate entries must be tables"
 
 fun parse_generators table =
-  case lookup table ["generate"] of
+  let val templates = named_table_entries table ["generate_templates"]
+  in case lookup table ["generate"] of
       NONE => []
-    | SOME (TOML.ARRAY values) => map parse_generator values
+    | SOME (TOML.ARRAY values) => map (parse_generator templates) values
     | SOME _ => die "generate must be an array of tables"
+  end
 
 fun parse_runtime table : runtime =
   let val run = table_field table ["run"]
@@ -488,8 +531,14 @@ fun validate_generate_entry value =
   case value of
       TOML.TABLE generate =>
         require_known_fields "generate"
-          ["name", "command", "inputs", "outputs", "deps"] generate
+          ["name", "command", "inputs", "outputs", "deps", "template", "files"] generate
     | _ => die "generate entries must be tables"
+
+fun validate_generate_template (name, table) =
+  (require_known_fields ("generate_templates." ^ name)
+     ["command", "inputs", "outputs"] table;
+   List.app (fn field => ignore (string_array_field table field))
+     ["command", "inputs", "outputs"])
 
 fun validate_groups_table table =
   let
@@ -520,7 +569,7 @@ fun validate_image_entries table section fields =
 fun validate_manifest table =
   (require_known_fields "manifest"
      ["holbuild", "project", "build", "dependencies", "run", "heap",
-      "executable", "actions", "generate"] table;
+      "executable", "actions", "generate", "generate_templates"] table;
    Option.app (require_known_fields "project" ["name", "version"])
      (table_field table ["project"]);
    Option.app
@@ -536,6 +585,8 @@ fun validate_manifest table =
      (named_table_entries table ["dependencies"]);
    validate_actions table;
    validate_groups_table table;
+   List.app validate_generate_template
+     (named_table_entries table ["generate_templates"]);
    (case lookup table ["generate"] of
         NONE => ()
       | SOME (TOML.ARRAY values) => List.app validate_generate_entry values
