@@ -1254,6 +1254,9 @@ Before exporting a batch, remote-cache existence checks run concurrently using
 `--prefetch-concurrency` (the same limit as restore prefetch). Progress on stderr
 reports `checking remote cache: N/M theories`, unless `--quiet` is given.
 The batch keeps the plan's theory order and includes entries with missing blobs.
+Its specs and sources are then uploaded the same way, `--prefetch-concurrency`
+at a time, reporting `uploading to remote cache: N/M files`; after the first
+upload that fails, the rest are skipped and the build falls back (below).
 
 `build --remote-exec URL` hands the theories the remote cache lacks, and
 that aren't already built here, to a remote-execution coordinator, which runs them on its workers with

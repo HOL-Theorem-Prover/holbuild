@@ -205,6 +205,11 @@ fun take () =
 
 fun give connection = with_pool_lock (fn () => idle := connection :: !idle)
 
+(* Closes the pooled connections no request is using; the next request
+   opens a new one. *)
+fun close_idle () =
+  List.app close (with_pool_lock (fn () => !idle before idle := []))
+
 (* A connection whose request raised may be left mid-transfer, so it is
    closed rather than pooled. *)
 fun with_handle f =
