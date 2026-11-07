@@ -67,7 +67,7 @@ are Poly/ML heaps and stay keyed by the exact toolchain key (`bin/hol` and
 `bin/hol.state` hashes). So do all action keys under a tracing kernel, whose
 theory actions also produce `.tr.gz` Poly/ML exports.
 
-**Any source byte change** (including comments/proof edits) changes the action key and cascades to all dependents. This is conservative — v1 does not attempt semantic equivalence of generated outputs.
+**Any source byte change** (including comments/proof edits) changes the action key, and the keys of all dependents. Cache keys never depend on generated outputs. Locally, though, a dependent whose key changed is not rebuilt when its own inputs and its dependencies' outputs are unchanged (early cutoff, below).
 
 Proof engine/checkpoint/timeout/trace flags are intentionally not final artifact action-key inputs. Switching `--skip-checkpoints`, `--skip-proof-steps`, or root tactic timeout should not rebuild an otherwise up-to-date semantic artifact.
 
@@ -82,6 +82,8 @@ A node is up-to-date when:
 2. Local metadata `.key` file has matching `input_key`
 
 The check is intentionally cheap — does not recompute dependency-context closures for unchanged nodes.
+
+On a key miss, a theory keeps its outputs (early cutoff) when they exist, its `.key` metadata records the same `self_input_key` (its action text with dependencies named but not keyed) and the same `deps_output_key` (a hash of what its transitive project dependencies produced), and its parents' `.dat` hashes match. holbuild then rewrites the metadata under the new key and copies the local cache entry to it. `HOLBUILD_CACHE_TRACE=1` prints `early cutoff: <theory> (dependency outputs unchanged)`. Checkpoints are keyed on `deps_output_key` too, so a theory edited after an output-neutral upstream edit resumes from its saved `deps_loaded.save`.
 
 ## Cache
 
