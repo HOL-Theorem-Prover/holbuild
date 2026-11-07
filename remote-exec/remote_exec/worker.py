@@ -412,7 +412,9 @@ class HostTelemetry:
 
 def failed_record(spec_sha256: str, failure: str) -> str:
     """A result record the worker writes itself: ``spec-rejected`` for an action it won't run, which fails it
-    finally like exec-action's own, or ``internal`` for one exec-action ended without a record, which is retried."""
+    finally like exec-action's own; ``internal`` for one exec-action ended without a record or whose release didn't
+    build, which is retried; or ``unavailable`` for one whose spec the cache didn't give, which is retried without
+    counting the attempt."""
     return f"holbuild-action-result-v1\nspec={spec_sha256}\ninput-key=\nstatus=failed\nfailure={failure}\n"
 
 
@@ -486,11 +488,20 @@ def run_one(
     print(f"running {claim['theory']} ({claim['input_key']})", file=sys.stderr, flush=True)
     with Lease(coordinator, token, claim["lease_s"], protection).held() as lease:
         try:
-            holbuild = releases.holbuild(releases.spec_version(spec))
+            version = releases.spec_version(spec)
+        except RuntimeError:
+            # The cache didn't give the spec, as while it restarts: the action is retried without counting it.
+            coordinator.complete(token, failed_record(spec, "unavailable"), claim["lease_s"])
+            raise
+        try:
+            holbuild = releases.holbuild(version)
         except Unreleased as error:
             print(f"refusing {spec}: {error}", file=sys.stderr)
             coordinator.complete(token, failed_record(spec, "spec-rejected"), claim["lease_s"])
             return
+        except (OSError, subprocess.SubprocessError, tarfile.TarError):
+            coordinator.complete(token, failed_record(spec, "internal"), claim["lease_s"])
+            raise
         if lease.lost.is_set():
             return
         with tempfile.TemporaryDirectory() as scratch:
@@ -616,8 +627,11 @@ def main() -> None:
         try:
             run_one(coordinator, args, releases, protection, claim)
         except (*COORDINATOR_ERRORS, subprocess.SubprocessError, tarfile.TarError) as error:
-            # The lease expires and the coordinator retries; a rerun finds a published result cached.
+            # Reported for a retry where it could be, else the lease expires and the coordinator retries; a rerun
+            # finds a published result cached. Waiting first keeps a worker from failing ready action after ready
+            # action while the cache or the coordinator is down.
             print(f"action failed in the worker: {error}", file=sys.stderr)
+            time.sleep(CLAIM_RETRY_SECONDS)
 
 
 if __name__ == "__main__":

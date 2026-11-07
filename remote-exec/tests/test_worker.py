@@ -4,6 +4,7 @@ import fcntl
 import io
 import json
 import os
+import subprocess
 import tarfile
 import threading
 import time
@@ -288,6 +289,41 @@ def test_action_that_ends_without_a_record_is_reported_for_a_retry(
     )
 
     assert server.completed == [failed_record(SPEC, "internal")]
+
+
+def test_action_whose_spec_the_cache_does_not_give_is_reported_unavailable(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path]
+) -> None:
+    with pytest.raises(RuntimeError, match="fetching spec"):
+        run_one(
+            Coordinator(server.url, "w"),
+            worker_args(tmp_path, server),
+            releases(tmp_path, server),
+            Protection(None, None),
+            claim(),
+        )
+
+    assert server.completed == [failed_record(SPEC, "unavailable")]
+    assert not logs[1].exists()
+
+
+def test_action_whose_release_does_not_build_is_reported_for_a_retry(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path]
+) -> None:
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3", "bin/holbuild:\n\texit 1\n")
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+
+    with pytest.raises(subprocess.CalledProcessError):
+        run_one(
+            Coordinator(server.url, "w"),
+            worker_args(tmp_path, server),
+            releases(tmp_path, server),
+            Protection(None, None),
+            claim(),
+        )
+
+    assert server.completed == [failed_record(SPEC, "internal")]
+    assert not logs[1].exists()
 
 
 def test_action_of_an_unreleased_holbuild_is_rejected(tmp_path: Path, server: Server, logs: tuple[Path, Path]) -> None:
