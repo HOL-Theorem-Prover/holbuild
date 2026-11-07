@@ -6117,12 +6117,21 @@ fun hydrate_action_root remote root (spec : action_spec) =
     List.app fetch_library (#libraries spec);
     List.app write_lib (#libs spec);
     List.app restore_dep (#deps spec);
-    List.app
-      (fn {target, stem, key} =>
-          if spec_parent_hashes_match root spec (in_root root (stem ^ ".dat")) then ()
-          else raise ActionFailed (ParentsDiffer key,
-                                   "dependency " ^ target ^ " does not match its parents in the cache"))
-      (#deps spec)
+    case List.find (fn {stem, ...} => not (spec_parent_hashes_match root spec (in_root root (stem ^ ".dat"))))
+                   (#deps spec) of
+        NONE => ()
+      | SOME _ =>
+          (* This worker's own cache may hold an entry the remote cache
+             rejected; restore every dependency from the remote again before
+             reporting a mismatch the remote cache itself holds. *)
+          (List.app (fn {key, ...} => HolbuildCache.remove_action (cache_root ()) key) (#deps spec);
+           List.app restore_dep (#deps spec);
+           List.app
+             (fn {target, stem, key} =>
+                 if spec_parent_hashes_match root spec (in_root root (stem ^ ".dat")) then ()
+                 else raise ActionFailed (ParentsDiffer key,
+                                          "dependency " ^ target ^ " does not match its parents in the cache"))
+             (#deps spec))
   end
 
 (* Step 4: the action's own entry restores with full validation. *)

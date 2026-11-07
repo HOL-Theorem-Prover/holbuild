@@ -1145,9 +1145,10 @@ log=<sha256> <size>
 ```
 
 `failure` appears on failure, and `missing` with `input-missing`.
-`missing-reason=parents` says the missing theory's cache entry is there, but
-the parent outputs it recorded differ from the ones the cache holds, so
-restoring it again can't succeed.
+`missing-reason=parents` says the missing theory's entry in the remote cache
+is there, but the parent outputs it recorded differ from the ones the remote
+cache holds, so restoring it again can't succeed. The worker checks this after
+restoring every dependency from the remote cache, not only from its own.
 `peak-rss-mb` is the HOL process's peak resident memory on a successful build.
 `log` is the build log, uploaded to `/cas/`. `memory` means Poly/ML ran out
 of heap or the container's cgroup `memory.events` counted an OOM kill during

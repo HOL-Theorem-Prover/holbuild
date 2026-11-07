@@ -269,9 +269,8 @@ expect b 0 "status=built"
 worker c "$spec_c"
 expect c 0 "status=built"
 
-# A cached theory whose parent in the cache isn't the one it was built against
-# can't be restored, however often the worker retries, and says so.  Here the
-# worker's own cache holds an A whose .dat differs from the one B recorded.
+# A worker whose own cache holds an A whose .dat differs from the one B
+# recorded restores A again from the remote, which holds the matching one.
 key_b=$(key_for "$tmpdir/batch.txt" worker:BTheory)
 stale=$tmpdir/worker-stale
 link_hol_toolchain_cache "$stale"
@@ -285,8 +284,33 @@ awk '$1 == "blob" { print $3 }' "$built_worker/actions/$key_a/manifest" | while 
 done
 sed "s/$dat_a/$stale_dat/" "$built_worker/actions/$key_a/manifest" > "$stale/actions/$key_a/manifest"
 worker stale "$spec_c"
-expect stale 3 "status=failed" "failure=input-missing" "missing=theory $key_b" "missing-reason=parents"
-require_grep "does not match its parents in the cache" "$tmpdir/stale.log"
+expect stale 0 "status=cached"
+
+# A cached theory whose parent in the remote cache isn't the one it was built
+# against can't be restored, however often the worker retries, and says so.
+cp "$remote_root/ac/$ac_a" "$tmpdir/ac_a.orig"
+cp "$tmpdir/stale.dat" "$remote_root/cas/$stale_dat"
+python3 - "$tmpdir/ac_a.orig" "$remote_root/ac/$ac_a" "$dat_a" "$stale_dat" "$(stat -c %s "$tmpdir/stale.dat")" <<'PY'
+import hashlib, sys
+src, dst, old, new, new_size = sys.argv[1:]
+marker = b"manifest-text-v1\n"
+header, manifest = open(src, "rb").read().split(marker, 1)
+manifest = manifest.replace(old.encode(), new.encode())
+lines = []
+for line in header.split(b"\n"):
+    if line.startswith(b"manifest-sha256 "):
+        line = b"manifest-sha256 " + hashlib.sha256(manifest).hexdigest().encode()
+    elif line.startswith(b"manifest-size "):
+        line = b"manifest-size " + str(len(manifest)).encode()
+    elif line.startswith(b"blob " + old.encode() + b" "):
+        line = b"blob " + new.encode() + b" " + new_size.encode()
+    lines.append(line)
+open(dst, "wb").write(b"\n".join(lines) + marker + manifest)
+PY
+worker stale2 "$spec_c"
+expect stale2 3 "status=failed" "failure=input-missing" "missing=theory $key_b" "missing-reason=parents"
+require_grep "does not match its parents in the cache" "$tmpdir/stale2.log"
+cp "$tmpdir/ac_a.orig" "$remote_root/ac/$ac_a"
 
 # The original checkout restores all three results without building.
 hb build CTheory > "$tmpdir/client.log" 2>&1 || { cat "$tmpdir/client.log" >&2; exit 1; }

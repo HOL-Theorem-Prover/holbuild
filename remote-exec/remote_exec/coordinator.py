@@ -733,8 +733,9 @@ class Coordinator:
     ) -> None:
         """Handle ``input-missing``: re-queue a missing theory the batch builds, and retry on anything else, since a
         restore that fails on a network error reports its input missing too; once the action used up its
-        attempts, fail the batch for resubmission. A theory the batch doesn't build whose cached parents differ
-        from the ones it was built against fails the batch at once: a retry restores the same entries.
+        attempts, fail the batch for resubmission. A theory the batch doesn't build whose parents in the remote
+        cache differ from the ones it was built against fails the batch at once: the worker already restored them
+        from the remote, so a retry restores the same entries.
 
         The missing theory may be a transitive dependency, which the batch has no edge for; the edge added here
         holds the action back until that theory is rebuilt and the cache holds it again.
