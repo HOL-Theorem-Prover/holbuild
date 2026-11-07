@@ -205,6 +205,41 @@ fun run_shell_inheriting inherit script =
 
 fun run_shell script = run_shell_inheriting NONE script
 
+(* As run_shell_inheriting, but once DEADLINE passes the child's group is
+   killed: the shell first, whose parent watch then kills the rest of the
+   group.  The shell stays unreaped until its output ends, so its pid can't
+   be reused while the watcher may still signal it. *)
+fun run_shell_inheriting_until inherit deadline script =
+  let
+    val mutex = Mutex.mutex ()
+    val finished = ref false
+    val timed_out = ref false
+    fun locked f =
+      (Mutex.lock mutex; f () before Mutex.unlock mutex)
+      handle e => (Mutex.unlock mutex; raise e)
+    fun consume process =
+      let
+        fun watch () =
+          if locked (fn () =>
+                       !finished orelse
+                       (Time.>= (Time.now (), deadline) andalso
+                        (timed_out := true;
+                         kill_group_forcefully {id = ~1, process = process};
+                         true)))
+          then ()
+          else (OS.Process.sleep (Time.fromReal 0.1); watch ())
+        val _ = Thread.fork (watch, [])
+        fun finish () = locked (fn () => finished := true)
+      in
+        (copy_child_stdout process handle e => (finish (); raise e));
+        finish ();
+        Unix.reap process
+      end
+    val status = run_shell_process NONE inherit script consume
+  in
+    {status = status, timed_out = locked (fn () => !timed_out)}
+  end
+
 fun run_shell_output script = run_shell_process NONE NONE script reap_with_output
 
 fun run_shell_with_mutation_lease {lease_path, script} =
