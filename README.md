@@ -1829,6 +1829,10 @@ holbuild --remote-cache https://cache.example.org run-action \
   [--option timeout=SECONDS] [--closure] TARGET...
 ```
 
+The project write lock covers planning, cache checks, and spec export. It
+is released before submitting or following the batch and fetching outputs,
+so another command can build the same project while the remote run is in flight.
+
 The targets, the script, its support files, `--load` libraries, outputs,
 timeout and `--closure` are those of `run-action --export-only` (see
 "Exporting script runs for remote execution"), as is the run key: the

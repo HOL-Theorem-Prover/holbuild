@@ -13,7 +13,7 @@ source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
 cleanup() {
-  for pid in ${server_pid:-} ${coordinator_pid:-}; do
+  for pid in ${run_pid:-} ${server_pid:-} ${coordinator_pid:-}; do
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
@@ -245,3 +245,39 @@ rm "$state/cancelled"
 run no-coordinator 1 --script "$runner/fresh.sml" hol:bool
 require_grep 'pass --remote-exec URL' "$tmpdir/no-coordinator.err"
 run no-coordinator-remote-only 75 --remote-only --script "$runner/fresh.sml" hol:bool
+
+# Following a remote batch must leave the project available to local builds.
+# hold keeps the event stream open after the action's done event.
+script concurrent.sml concurrent
+touch "$state/hold"
+(cd "$project" && exec "$HOLBUILD_BIN" --remote-cache "$remote_url" run-action \
+  --outputs-dir "$out" --output first --output second --remote-exec "$coordinator" \
+  --script "$runner/concurrent.sml" rr:CTheory) \
+  > "$tmpdir/concurrent.out" 2> "$tmpdir/concurrent.err" &
+run_pid=$!
+for _ in {1..600}; do
+  grep -q 'remote rr:CTheory: done' "$tmpdir/concurrent.err" && break
+  kill -0 "$run_pid" 2>/dev/null || break
+  sleep 0.1
+done
+require_grep 'remote rr:CTheory: done' "$tmpdir/concurrent.err"
+kill -0 "$run_pid"
+require_no_file "$project/.holbuild/locks/project.lock.owner"
+python3 - "$project/.holbuild/locks/project.lock" <<'PYLOCK'
+import fcntl
+import sys
+
+with open(sys.argv[1], "r+") as lock:
+    fcntl.lockf(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+PYLOCK
+hb build CTheory > "$tmpdir/concurrent-build.log" 2>&1 || {
+  cat "$tmpdir/concurrent-build.log" >&2
+  exit 1
+}
+kill -0 "$run_pid"
+rm "$state/hold"
+wait "$run_pid"
+unset run_pid
+concurrent_key=$(line concurrent rr:CTheory done)
+[[ $(< "$out/rr/CTheory/KEY") == "$concurrent_key" ]]
+[[ $(< "$out/rr/CTheory/first") == rr:CTheory ]]
