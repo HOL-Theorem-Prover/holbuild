@@ -165,6 +165,13 @@ fun resubmit_theory_key reason =
           scan (String.extract (reason, start, NONE))
         end
 
+(* Whether the coordinator failed the batch for resubmission because a
+   worker found a blob missing ("missing blob <sha256>"). *)
+fun resubmit_missing_blob reason =
+  case HolbuildStatus.find_substring "resubmit: " reason of
+      NONE => false
+    | SOME start => Option.isSome (HolbuildStatus.find_substring "missing blob " (String.extract (reason, start, NONE)))
+
 fun report_action line =
   let
     val field = fn name => json_string_field name line

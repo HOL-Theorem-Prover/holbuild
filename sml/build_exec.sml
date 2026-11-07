@@ -5772,17 +5772,30 @@ fun uncached_parents plan uncached node =
     rev parents
   end
 
-fun publish_spec_blob remote path =
-  let val hash = HolbuildHash.file_sha256 path
-  in
-    if HolbuildRemoteCache.blob_confirmed_present remote hash then ()
-    else
-      case HolbuildRemoteCache.publish_blob remote {hash = hash, src = path} of
-          HolbuildCacheBackend.Published => ()
-        | HolbuildCacheBackend.AlreadyPresent => ()
-        | HolbuildCacheBackend.Conflict message => raise Error ("could not upload " ^ path ^ ": " ^ message)
-        | HolbuildCacheBackend.Skipped => raise Error ("could not upload " ^ path ^ ": skipped")
-  end
+fun publish_spec_blob remote {hash, path} =
+  if HolbuildRemoteCache.blob_confirmed_present remote hash then ()
+  else
+    case HolbuildRemoteCache.publish_hashed_blob remote {hash = hash, src = path} of
+        HolbuildCacheBackend.Published => ()
+      | HolbuildCacheBackend.AlreadyPresent => ()
+      | HolbuildCacheBackend.Conflict message => raise Error ("could not upload " ^ path ^ ": " ^ message)
+      | HolbuildCacheBackend.Skipped => raise Error ("could not upload " ^ path ^ ": skipped")
+
+(* The remote ledger: what an earlier export from this project found the
+   remote cache at a URL to hold, one "theory <input key>" or "blob <sha256>"
+   per line, so that the next export doesn't ask again.  The remote cache can
+   lose either; a worker that finds one missing fails its batch, and the
+   build then forgets the ledger (forget_remote_ledger) and resubmits. *)
+fun remote_ledger_dir project = Path.concat(project_artifact_root project, ".holbuild/remote-ledger")
+
+fun remote_ledger_path project remote =
+  Path.concat(remote_ledger_dir project, HolbuildHash.string_sha256 (HolbuildRemoteCache.base_url remote))
+
+fun read_remote_ledger path =
+  Binaryset.addList (Binaryset.empty String.compare, String.tokens (fn c => c = #"\n") (read_text path))
+  handle IO.Io _ => Binaryset.empty String.compare
+
+fun forget_remote_ledger project = remove_tree (remote_ledger_dir project)
 
 (* The input keys of the plan's theories whose input key is missing or that
    depend on that theory. *)
@@ -5827,7 +5840,7 @@ fun drop_local_cache_entries keys =
    With local_resumable, a theory built here for its current input key, and
    not forced, stays out unchecked, unless a theory in the batch depends on
    it and it can't be published from the local cache. *)
-fun export_action_specs (options : build_options) tc project plan toolchain_key jobs {upload, local_resumable, forced} =
+fun export_action_specs (options : build_options) tc project plan toolchain_key jobs {upload, local_resumable, forced, ledger} =
   let
     val remote =
       case HolbuildRemoteCacheConfig.url () of
@@ -5839,6 +5852,18 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       else if not (#use_cache options) then
         raise Error "action-spec: a remote action's result is its cache entry, so --no-cache can't apply"
       else ()
+    val ledger_path = remote_ledger_path project remote
+    val ledger_known =
+      if ledger then read_remote_ledger ledger_path else Binaryset.empty String.compare
+    val learned = ref ledger_known
+    val ledger_mutex = Mutex.mutex ()
+    fun known item = Binaryset.member (ledger_known, item)
+    fun learn item =
+      if not ledger then ()
+      else
+        (Mutex.lock ledger_mutex;
+         (learned := Binaryset.add (!learned, item); Mutex.unlock ledger_mutex)
+         handle e => (Mutex.unlock ledger_mutex; raise e))
     val root = project_artifact_root project
     val config_lines = build_config_lines_for_node options project
     val action_toolchain_key = HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)
@@ -5931,10 +5956,12 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
     fun available remote (node, action) =
       let val key = #input_key action
       in
-        remote_entry_satisfies remote options project plan node key orelse
-        upload andalso local_entry_satisfies options project plan node key andalso
-        (publish_remote_cache_key (cache_root ()) key;
-         remote_entry_satisfies remote options project plan node key)
+        known ("theory " ^ key) orelse
+        (remote_entry_satisfies remote options project plan node key orelse
+         upload andalso local_entry_satisfies options project plan node key andalso
+         (publish_remote_cache_key (cache_root ()) key;
+          remote_entry_satisfies remote options project plan node key)) andalso
+        (learn ("theory " ^ key); true)
       end
     val unavailable =
       failing "checking remote cache" "theories" available
@@ -5984,13 +6011,24 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       handle e => (Mutex.unlock failure_mutex; raise e)
     fun uploaded remote path =
       with_failure_lock (fn () => !upload_failed) orelse
-      (publish_spec_blob remote path; true)
+      (let val hash = HolbuildHash.file_sha256 path
+       in
+         if known ("blob " ^ hash) then ()
+         else (publish_spec_blob remote {hash = hash, path = path}; learn ("blob " ^ hash))
+       end;
+       true)
       handle e => (with_failure_lock (fn () => upload_failed := true); raise e)
     val files = if upload then unique_strings (List.concat (map #files exported)) else []
     val _ =
       if null files then ()
       else HolbuildToolchain.time_phase "action_spec.upload" (fn () =>
              ignore (failing "uploading to remote cache" "files" uploaded files))
+    val _ =
+      if not ledger orelse Binaryset.numItems (!learned) = Binaryset.numItems ledger_known then ()
+      else
+        (ensure_parent ledger_path;
+         write_text_atomic ledger_path
+           (String.concat (map (fn line => line ^ "\n") (Binaryset.listItems (!learned)))))
   in
     String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n"
   end
