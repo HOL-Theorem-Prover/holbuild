@@ -126,6 +126,45 @@ ignored_plan_log=$tmpdir/ignored-termination-plan.log
 require_grep "holbuild proof-ir plan termination ATheory:ignored_def source=src/AScript.sml (" "$ignored_plan_log"
 require_grep "ignored termination tactic ran" "$ignored_plan_log"
 
+# A theorem must not hide a same-name termination proof from explicit selectors.
+selector_project=$tmpdir/selector-project
+mkdir -p "$selector_project/src"
+cp "$success_project/holproject.toml" "$selector_project/holproject.toml"
+cat > "$selector_project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Definition shared_def:
+  shared n = if n = 0 then 0 else shared (n - 1)
+Termination
+  WF_REL_TAC `measure I` >> simp[]
+End
+Theorem shared_def:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+val _ = export_theory();
+SML
+for selector in ATheory:shared_def ATheory:theorem:shared_def; do
+  (cd "$selector_project" && "$HOLBUILD_BIN" execution-plan "$selector") > "$tmpdir/theorem-plan.log" 2>&1
+  require_grep "holbuild proof-ir plan ATheory:shared_def source=" "$tmpdir/theorem-plan.log"
+  require_grep "ACCEPT_TAC TRUTH" "$tmpdir/theorem-plan.log"
+done
+(cd "$selector_project" && "$HOLBUILD_BIN" execution-plan ATheory:termination:shared_def) > "$tmpdir/explicit-termination-plan.log" 2>&1
+require_grep "holbuild proof-ir plan termination ATheory:shared_def source=" "$tmpdir/explicit-termination-plan.log"
+require_grep "WF_REL_TAC" "$tmpdir/explicit-termination-plan.log"
+
+for selector in '' ATheory ':shared_def' 'ATheory:' 'ATheory::shared_def' \
+    ':theorem:shared_def' 'ATheory:termination:' 'ATheory:definition:shared_def' \
+    'ATheory:theorem:shared_def:extra'; do
+  if (cd "$selector_project" && "$HOLBUILD_BIN" execution-plan "$selector") > "$tmpdir/invalid-selector.log" 2>&1; then
+    echo "invalid selector '$selector' unexpectedly succeeded" >&2
+    exit 1
+  fi
+  require_grep "invalid execution-plan selector:" "$tmpdir/invalid-selector.log"
+  require_grep "expected THEORY:NAME, THEORY:theorem:NAME or THEORY:termination:NAME" "$tmpdir/invalid-selector.log"
+done
+
 success_log=$tmpdir/success.log
 (cd "$success_project" && "$HOLBUILD_BIN" build --trace-steps ATheory) > "$success_log" 2>&1
 require_grep "ATheory built" "$success_log"
