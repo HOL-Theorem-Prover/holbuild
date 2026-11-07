@@ -4300,25 +4300,27 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
           handle _ => false
         (* A local entry built against other parent outputs can sit beside a
            remote entry built against these, so once the local one is dropped
-           the remote one gets a try; one that another build published
-           meanwhile gets the same try instead.  Either way only once. *)
+           the remote one gets a try, unless the local one came from there; an
+           entry another build published meanwhile gets the try instead.  Only
+           one retry either way. *)
         fun materialize retry existing =
           let
-            fun retry_with text = if retry then materialize false text else CacheMiss
+            fun from_remote () =
+              if not (copied_from_remote input_key) andalso hydrate_remote_cache_key root input_key then
+                case HolbuildCache.get_action root input_key of
+                    SOME text => materialize false text
+                  | NONE => CacheMiss
+              else CacheMiss
             fun reject_parents () =
               (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
                             input_key ^ " (parent outputs differ)");
                remove_failed_cache_outputs project node;
-               if drop_cache_manifest_if_unchanged root input_key existing then
-                 if not (copied_from_remote input_key) andalso hydrate_remote_cache_key root input_key then
-                   case HolbuildCache.get_action root input_key of
-                       SOME text => retry_with text
-                     | NONE => CacheMiss
-                 else CacheMiss
+               ignore (drop_cache_manifest_if_unchanged root input_key existing);
+               if not retry then CacheMiss
                else
                  case HolbuildCache.get_action root input_key of
-                     SOME text => retry_with text
-                   | NONE => CacheMiss)
+                     NONE => from_remote ()
+                   | SOME text => if text = existing then CacheMiss else materialize false text)
           in
             case materialize_theory_cache (#verify_cache options) allow_timeout_discrepancy
                    project plan input_key (tactic_timeout policy) (trknl_enabled policy) node of
