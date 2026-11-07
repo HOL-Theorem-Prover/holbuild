@@ -104,8 +104,9 @@ fun build_help () = print
   \  --warn-unreachable\n\
   \  --trknl\n\
   \  --remote-exec URL [--remote-only] [--detach | --attach BATCH-ID]\n\n\
-  \With --remote-exec, theories the remote cache lacks are built by the\n\
-  \coordinator's workers and restored from the remote cache, except a\n\
+  \With --remote-exec, theories the remote cache lacks and that aren't\n\
+  \built here for their current inputs are built by the coordinator's\n\
+  \workers and restored from the remote cache, except a\n\
   \theory nothing else in the batch depends on, which builds locally when\n\
   \its local checkpoints are current, or when it is the only theory to\n\
   \build and its dependencies are built here (not with --detach; see the\n\
