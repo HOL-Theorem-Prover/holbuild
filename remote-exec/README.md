@@ -58,7 +58,7 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_DATABASE_URL` | the coordinator's database (`postgresql+asyncpg://…`) | required |
 | `REMOTE_EXEC_CLIENT_TOKEN` | bearer token clients send | required |
 | `REMOTE_EXEC_WORKER_TOKEN` | bearer token workers send | required |
-| `REMOTE_EXEC_CACHE_URL` | remote cache base URL, for the readiness check of parents' entries and blobs; credentials go in its userinfo | required |
+| `REMOTE_EXEC_CACHE_URL` | remote cache base URL, for the readiness check of parents' entries; credentials go in its userinfo | required |
 | `REMOTE_EXEC_LEASE_SECONDS` | lease length; a heartbeat renews it | 120 |
 | `REMOTE_EXEC_MAX_ATTEMPTS` | claims of one action before a retryable failure becomes final | 3 |
 | `REMOTE_EXEC_STANDARD_TIER_MB` | peak memory from which a theory goes to the high-memory tier | 16000 |
@@ -178,19 +178,18 @@ a run batch and cancels its unfinished actions.
 ## Scheduling rules
 
 - **Release.** When all of an action's parents are done, the coordinator
-  fetches each parent's entry, `GET /ac/<ac-key>`, and sends `HEAD /cas/<sha>`
-  for each blob it lists, and makes the action ready only when every one
-  answers 200. A parent whose entry or a blob of it the cache doesn't hold
-  (404; blobs can expire before the entry naming them) is built again.
-  When the cache can't be reached, the action waits for the next sweep. This
-  is only a readiness hint; `exec-action` validates its inputs itself. An
-  entry found whole is trusted for 60 s without asking again, so a child
-  released on it after the cache evicted it reports `input-missing`, spending
-  one attempt; any `input-missing` result makes the coordinator process that
-  gets it forget every entry it found, so its next release asks again and
-  rebuilds the parent. Other coordinator processes keep trusting their own
-  findings until the 60 s run out, so with several the child may spend
-  another attempt.
+  fetches each parent's entry, `GET /ac/<ac-key>`, and makes the action ready
+  when every one answers 200. A parent whose entry the cache doesn't hold
+  (404) is built again. When the cache can't be reached, the action waits for
+  the next sweep. This is only a readiness hint; `exec-action` validates its
+  inputs itself. The entry's blobs aren't asked about: holbuild uploads them
+  before the entry, and one that expires before it makes the child that
+  restores the parent report `input-missing` for that parent, which is then
+  built again (see Retries); the child spends one attempt on it. An entry
+  found is trusted for 60 s without asking again, so a child released on it
+  after the cache evicted it reports `input-missing` the same way; any
+  `input-missing` result makes the coordinator process that gets it forget
+  every entry it found, so its next release asks again.
 - **Claims** take builds before runs across all tiers the worker accepts,
   then prefer the worker's tier over its `also_claim` tiers, in order. A
   burst worker takes a standard-tier build before a high-tier run.

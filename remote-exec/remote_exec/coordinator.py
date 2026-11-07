@@ -8,7 +8,6 @@ import asyncio
 import contextlib
 import graphlib
 import logging
-import re
 import shlex
 import time
 from collections import defaultdict, deque
@@ -30,16 +29,12 @@ from remote_exec.formats import Batch, Result
 logger = logging.getLogger(__name__)
 
 CLAIM_RECHECK_SECONDS = 5  # how often a waiting claim looks for actions another coordinator process made ready
-# How long a cache entry found whole, blobs included, is taken to still be there without asking the cache again.
+# How long a cache entry found is taken to still be there without asking the cache again.
 IN_CACHE_TRUST_SECONDS = 60
 # How many parents a release asks the cache about at once. At most two releases run at once (a pass over every
 # batch and one of single batches), so together they stay within the cache client's 100 connections.
 RELEASE_CACHE_CHECKS = 48
 RELEASE_SLOW_SECONDS = 5.0  # a release pass that takes this long is logged
-
-# A holbuild remote-cache entry lists its blobs as `blob <sha256> <size>` lines before the manifest it carries.
-ENTRY_BLOB = re.compile(r"^blob ([0-9a-f]{64}) [0-9]+$", re.MULTILINE)
-ENTRY_MANIFEST_MARKER = "manifest-text-v1\n"
 
 # A statement, or a transaction left idle, that runs longer than this is ended by the database, so one stuck
 # query can't hold a connection, or the locks it took, for good.
@@ -365,7 +360,7 @@ class Coordinator:
         # and the future that wakes them, oldest first; see claim.
         self.made_ready = 0
         self.claim_waiters: list[tuple[list[str], asyncio.Future[None]]] = []
-        # When each cache entry was last found whole, the checks of the cache under way, and how many times
+        # When each cache entry was last found, the checks of the cache under way, and how many times
         # input-missing results forgot both; see _in_cache.
         self.found_in_cache: dict[str, float] = {}
         self.cache_checks: dict[str, asyncio.Task[bool | None]] = {}
@@ -770,7 +765,7 @@ class Coordinator:
             await asyncio.shield(asyncio.gather(*running))
 
     async def release(self, batch_id: UUID | None = None) -> None:
-        """Make waiting actions whose parents are all done ready, once the cache holds each parent's entry and blobs.
+        """Make waiting actions whose parents are all done ready, once the cache holds each parent's entry.
 
         A parent the cache doesn't hold is re-queued; a parent the cache can't be asked about leaves its children
         waiting for the next sweep. Each batch's actions are made ready as soon as the cache has answered for that
@@ -1032,10 +1027,14 @@ class Coordinator:
         return dict(await asyncio.gather(*map(check, ac_keys)))
 
     async def _in_cache(self, ac_key: str) -> bool | None:
-        """Whether the cache holds entry ``ac_key`` and every blob it lists, which can expire before it; None when
-        the cache can't tell.
+        """Whether the cache holds entry ``ac_key``; None when the cache can't tell.
 
-        An entry found whole is taken to be there for ``IN_CACHE_TRUST_SECONDS`` without asking again, and
+        The entry's blobs aren't asked about: holbuild uploads them before it, and one that expires before it makes
+        the children that restore it report ``input-missing`` for the parent, which re-queues the parent. Asking
+        would cost a request per blob, and bazel-remote can't answer ``HEAD`` for a blob only its proxy backend
+        holds without copying it from there first.
+
+        An entry found is taken to be there for ``IN_CACHE_TRUST_SECONDS`` without asking again, and
         concurrent calls share one check, since each completion releases its batch and every concurrent release
         would otherwise ask about the same parents. One evicted meanwhile makes its children report
         ``input-missing``, which forgets every entry found and every check under way.
@@ -1065,19 +1064,6 @@ class Coordinator:
         forgotten = self.cache_forgotten
         try:
             response = await self.cache.get(f"/ac/{ac_key}")
-            if response.status_code == 200:
-                for blob in ENTRY_BLOB.findall(response.text.partition(ENTRY_MANIFEST_MARKER)[0]):
-                    response = await self.cache.head(f"/cas/{blob}")
-                    if response.status_code == 502:
-                        # bazel-remote answers HEAD for a blob held only by its proxy backend with Content-Length
-                        # -1, which a reverse proxy in front of it turns into 502. A GET copies the blob from the
-                        # backend before it answers, so its status alone is enough: the body is never read.
-                        async with self.cache.stream(
-                            "GET", f"/cas/{blob}", headers={"Accept-Encoding": "zstd"}
-                        ) as response:
-                            pass
-                    if response.status_code != 200:
-                        break
         except httpx.HTTPError:
             return None
         if response.status_code == 200:
