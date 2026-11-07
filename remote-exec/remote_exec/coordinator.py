@@ -967,6 +967,14 @@ class Coordinator:
             if response.status_code == 200:
                 for blob in ENTRY_BLOB.findall(response.text.partition(ENTRY_MANIFEST_MARKER)[0]):
                     response = await self.cache.head(f"/cas/{blob}")
+                    if response.status_code == 502:
+                        # bazel-remote answers HEAD for a blob held only by its proxy backend with Content-Length
+                        # -1, which a reverse proxy in front of it turns into 502. A GET copies the blob from the
+                        # backend before it answers, so its status alone is enough: the body is never read.
+                        async with self.cache.stream(
+                            "GET", f"/cas/{blob}", headers={"Accept-Encoding": "zstd"}
+                        ) as response:
+                            pass
                     if response.status_code != 200:
                         break
         except httpx.HTTPError:
