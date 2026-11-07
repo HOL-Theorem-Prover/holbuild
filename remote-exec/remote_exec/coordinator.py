@@ -171,25 +171,44 @@ def is_auth_failure(error: BaseException) -> bool:
     return False
 
 
+# A batch's actions are found by key and their edges by subqueries per action and per edge, never by joins. The
+# database can't estimate how many rows a batch it hasn't analyzed yet holds, so a join could read every edge and
+# action of a large new batch once per action.
+
 # Recompute remaining_deps of the selected waiting or ready actions from their parents' states; an action with
 # a parent that isn't done goes back to waiting.
 REFRESH = """
-UPDATE actions c SET remaining_deps = n.remaining,
-    state = CASE WHEN n.remaining > 0 THEN 'waiting' ELSE c.state END
-FROM (
-    SELECT a.input_key, count(p.input_key) FILTER (WHERE p.state <> 'done') AS remaining
-    FROM actions a
-    LEFT JOIN edges e ON e.batch_id = a.batch_id AND e.input_key = a.input_key
-    LEFT JOIN actions p ON p.batch_id = e.batch_id AND p.input_key = e.parent_key
-    WHERE a.batch_id = :batch_id AND a.input_key IN ({selected})
-    GROUP BY a.input_key
-) n
-WHERE c.batch_id = :batch_id AND c.input_key = n.input_key AND c.state IN ('waiting', 'ready')
-"""
-REFRESH_KEYS = sa.text(REFRESH.format(selected="SELECT unnest(CAST(:keys AS text[]))"))
-REFRESH_CHILDREN = sa.text(
-    REFRESH.format(selected="SELECT input_key FROM edges WHERE batch_id = :batch_id AND parent_key = ANY(:keys)")
+UPDATE actions c SET (remaining_deps, state) = (
+    SELECT n.remaining, CASE WHEN n.remaining > 0 THEN 'waiting' ELSE c.state END
+    FROM (
+        SELECT count(*) AS remaining FROM edges e
+        WHERE e.batch_id = c.batch_id AND e.input_key = c.input_key AND (
+            SELECT p.state FROM actions p WHERE p.batch_id = e.batch_id AND p.input_key = e.parent_key
+        ) <> 'done'
+    ) n
 )
+WHERE c.batch_id = :batch_id AND c.input_key = ANY({selected}) AND c.state IN ('waiting', 'ready')
+"""
+REFRESH_KEYS = sa.text(REFRESH.format(selected="CAST(:keys AS text[])"))
+REFRESH_CHILDREN = sa.text(
+    REFRESH.format(
+        selected="ARRAY(SELECT input_key FROM edges WHERE batch_id = :batch_id AND parent_key = ANY(:keys))"
+    )
+)
+
+# The waiting actions whose parents are all done, with each parent's input and action-cache keys; see
+# Coordinator.release.
+RELEASABLE = sa.text("""
+SELECT a.batch_id, a.input_key, ARRAY(
+    SELECT ROW(e.parent_key, (
+        SELECT p.ac_key FROM actions p WHERE p.batch_id = e.batch_id AND p.input_key = e.parent_key
+    ))
+    FROM edges e WHERE e.batch_id = a.batch_id AND e.input_key = a.input_key
+) AS parents
+FROM actions a JOIN batches b ON b.id = a.batch_id
+WHERE a.state = 'waiting' AND a.remaining_deps = 0 AND b.state = 'running'
+AND (CAST(:batch_id AS uuid) IS NULL OR a.batch_id = :batch_id)
+""")
 
 
 # The ready action to claim next; see Coordinator.claim. Only the batches with a ready action of the tiers are
@@ -508,22 +527,8 @@ class Coordinator:
         """
         while True:
             async with self.engine.connect() as conn:
-                rows = await conn.execute(
-                    sa.text(
-                        "SELECT a.batch_id, a.input_key, p.input_key AS parent, p.ac_key FROM actions a "
-                        "JOIN batches b ON b.id = a.batch_id "
-                        "LEFT JOIN edges e ON e.batch_id = a.batch_id AND e.input_key = a.input_key "
-                        "LEFT JOIN actions p ON p.batch_id = e.batch_id AND p.input_key = e.parent_key "
-                        "WHERE a.state = 'waiting' AND a.remaining_deps = 0 AND b.state = 'running' "
-                        "AND (CAST(:batch_id AS uuid) IS NULL OR a.batch_id = :batch_id)"
-                    ),
-                    {"batch_id": batch_id},
-                )
-                candidates: defaultdict[tuple[UUID, str], list[tuple[str, str]]] = defaultdict(list)
-                for row in rows:
-                    parents = candidates[row.batch_id, row.input_key]
-                    if row.parent is not None:
-                        parents.append((row.parent, row.ac_key))
+                rows = await conn.execute(RELEASABLE, {"batch_id": batch_id})
+                candidates = {(row.batch_id, row.input_key): list(row.parents) for row in rows}
             present: dict[str, bool | None] = {}
             for parents in candidates.values():
                 for _, ac_key in parents:

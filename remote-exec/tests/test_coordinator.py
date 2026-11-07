@@ -393,6 +393,52 @@ async def test_a_claim_reads_no_finished_actions(
     assert (await claim(http))["theory"] == "pkg:a"
 
 
+async def test_releasing_reads_each_selected_actions_edges_by_key(
+    coordinator: Coordinator, remote_exec_engine: Any
+) -> None:
+    """Finding the releasable actions and recounting a completed action's children read a few pages per action,
+    even in a batch the database's statistics don't know yet, as after every submit."""
+    old, new = uuid4(), uuid4()
+    width, layers, parents = 10, 20, 5
+
+    async def add(connection: Any, batch_id: UUID) -> None:
+        values = {"id": batch_id, "width": width, "parents": parents, "n": width * layers}
+        await connection.execute(
+            sa.text("INSERT INTO batches (id, state, profile) VALUES (:id, 'running', 'default')"), values
+        )
+        await connection.execute(
+            sa.text(
+                "INSERT INTO actions (batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier) "
+                "SELECT :id, 'k' || g, 'ac' || g, 's', 'pkg:t' || g, CASE WHEN g < :width THEN 0 ELSE :parents END, "
+                "'waiting', 'standard' FROM generate_series(0, :n - 1) g"
+            ),
+            values,
+        )
+        await connection.execute(  # each action after the first layer has parents in the layer before it
+            sa.text(
+                "INSERT INTO edges (batch_id, input_key, parent_key) "
+                "SELECT :id, 'k' || g, 'k' || ((g / :width - 1) * :width + (g + p) % :width) "
+                "FROM generate_series(:width, :n - 1) g, generate_series(0, :parents - 1) p"
+            ),
+            values,
+        )
+
+    async with remote_exec_engine.begin() as connection:  # autovacuum can't see this transaction
+        await add(connection, old)
+        await connection.execute(sa.text("ANALYZE"))
+        await add(connection, new)
+        batch_id = new
+        roots = [f"k{i}" for i in range(width)]
+        for query, parameters in [
+            (coordinator_module.REFRESH_CHILDREN, {"batch_id": batch_id, "keys": roots}),
+            (coordinator_module.RELEASABLE, {"batch_id": batch_id}),
+        ]:
+            plan = await connection.scalar(sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {query.text}"), parameters)
+            pages = plan[0]["Plan"]["Shared Hit Blocks"] + plan[0]["Plan"]["Shared Read Blocks"]
+            assert pages < 50 * width, query.text
+        await connection.rollback()
+
+
 async def test_memory_failure_moves_to_the_high_tier_and_retries_up_to_max_attempts(
     http: httpx.AsyncClient, cache: FakeCache
 ) -> None:
