@@ -52,7 +52,39 @@ or remote cache keys. Checkpoint-free builds also produce and use them. Cache
 garbage collection and worker cache limits include the module files; deleting
 them only causes source loading and regeneration.
 
-## Install from source
+## Install
+
+### Download a release
+
+Download the archive for your platform and `SHA256SUMS` from the
+[GitHub Releases page](https://github.com/HOL-Theorem-Prover/holbuild/releases):
+
+- `holbuild-vX.Y.Z-linux-x86_64.tar.gz`: Linux x86_64, glibc 2.35 or newer.
+- `holbuild-vX.Y.Z-macos-arm64.tar.gz`: macOS 15 or newer, Apple Silicon.
+
+Verify the archive against its line in `SHA256SUMS` (`shasum -a 256` works on
+both platforms), then extract it:
+
+```sh
+tar -xzf holbuild-vX.Y.Z-linux-x86_64.tar.gz
+export PATH="$PWD/holbuild-vX.Y.Z-linux-x86_64/bin:$PATH"
+holbuild --version
+```
+
+Keep the extracted directory together: `bin/holbuild` loads runtime and
+analyser sources from `share/holbuild`. You can move the directory or symlink
+the executable into a directory already on `PATH`.
+
+The executable includes the Poly/ML runtime, so running it does not require
+an installed Poly/ML. Building HOL toolchains still requires `poly` and
+`polyc`, plus HOL's other build dependencies. Archives include holbuild's
+`LICENSE`, the SML/NJ notice, and Poly/ML's license in `share/holbuild`.
+The same release also offers `polyml-v5.9.2-seq3-source.tar.gz`, the exact
+Poly/ML sources used for both binaries. Poly/ML is built with
+`--disable-shared --without-gmp`; the holbuild sources for rebuilding/relinking
+are available at the release tag.
+
+### Build from source
 
 You need Poly/ML. The small set of HOL source files needed to compile the
 `holbuild` executable is vendored under `vendor/hol`.
@@ -98,6 +130,12 @@ $HOME/.local/bin/holbuild
 ```
 
 You can override the destination with `PREFIX`, `BINDIR`, or `DESTDIR`.
+Installation also places runtime sources and notices in
+`$PREFIX/share/holbuild`; keep that directory beside `$PREFIX/bin` when moving
+an installation.
+Custom `BINDIR`/`DATADIR` layouts are also supported: `make install` rebuilds
+the executable with that data path. Keep custom data at the configured path;
+use the standard layout for an installation that can move as a directory.
 
 ## A minimal project
 
@@ -875,6 +913,16 @@ holbuild build --all-checkpoints MyTheory
 - `--trace-steps` records proof-step traces in child logs.
 - `--repl-on-failure` starts a HOL REPL from the newest useful checkpoint after a
   theory failure. It serialises the build and is not supported with `--json`.
+- `HOLBUILD_FAILED_GOALS_LIMIT` sets the byte limit for the all-input-goals
+  section of `instrumented-failure.log`; `HOLBUILD_GOAL_STATE_LIMIT` separately
+  sets the top-goal preview limit in text and JSON diagnostics. Both default to
+  `4096`. Set either environment variable to a nonnegative decimal integer to
+  change its limit, or to `0` or `unlimited` to disable truncation. Invalid values
+  fail the build with an error. For example,
+  `HOLBUILD_FAILED_GOALS_LIMIT=65536 holbuild build MyTheory` keeps a larger goal
+  log while retaining bounded summaries. These settings are read at runtime,
+  including after checkpoint restores; no rebuild of holbuild is needed. For
+  remote execution, the log limit uses the worker's environment.
 - `--skip-proof-steps` opts out of proof-step execution.
 - `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation.
 - `--all-checkpoints` saves theorem checkpoints in every theory included by
@@ -1536,14 +1584,18 @@ Maintainer checklist:
    git push origin "v$version"
    ```
 
-4. Create a GitHub Release from that tag:
-   - GitHub repository → Releases → Draft a new release.
-   - Select the tag, for example `vX.Y.Z`.
-   - Use the tag as the title.
-   - Summarise user-visible changes.
+4. The **Release binaries** workflow builds Linux x86_64 and macOS arm64
+   archives, then tests downloaded copies on fresh runners without Poly/ML.
+   Only after both platforms pass does it attach the archives and
+   `SHA256SUMS`, plus the shared Poly/ML source archive, to the release. It
+   creates a release with generated notes if none exists for the tag; an existing release (including a draft) retains
+   its notes and publication state. Summarise user-visible changes in those
+   notes, and publish the draft if you prepared one.
 
-There is currently no workflow that automatically publishes a GitHub Release
-from a pushed tag.
+The workflow also checks packaging on relevant pull requests without
+publishing anything. To rebuild assets, rerun the tag's workflow; uploads
+replace assets with the same names. A manual workflow run only builds and
+tests; publication requires a version-tag push.
 
 ## More detail
 

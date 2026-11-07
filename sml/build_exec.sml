@@ -152,7 +152,7 @@ fun dependency_sml dep = one_with_suffix ".sml" (#generated (source_artifacts de
 fun dependency_sig dep = one_with_suffix ".sig" (#generated (source_artifacts dep))
 
 fun runtime_helper_path () =
-  Path.concat(HolbuildRuntimePaths.source_root, "sml/holbuild_runtime.sml")
+  Path.concat(HolbuildRuntimePaths.runtime_root (), "sml/holbuild_runtime.sml")
 
 fun runtime_line () =
   "use " ^ HolbuildToolchain.sml_string (runtime_helper_path ()) ^ ";"
@@ -256,7 +256,7 @@ fun checkpoint_ok_v1 () = HolbuildCheckpointStore.ok_v1 ()
 fun checkpoint_ok_text kind fields = HolbuildCheckpointStore.ok_text kind fields
 
 fun checkpoint_save_runtime_helper_path () =
-  Path.concat(HolbuildRuntimePaths.source_root, "sml/checkpoint_save_runtime.sml")
+  Path.concat(HolbuildRuntimePaths.runtime_root (), "sml/checkpoint_save_runtime.sml")
 
 fun checkpoint_save_runtime_line () =
   "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";"
@@ -2442,7 +2442,7 @@ fun script_prefix_key NONE NONE source_prefix_hash = source_prefix_hash
             (case inputs_key of SOME key => ["extra_inputs=", key, "\n"] | NONE => []) @
             (case source_name of SOME name => ["source_name=", name, "\n"] | NONE => [])))
 
-fun failed_prefix_diagnostic_key proof_engine = proof_engine ^ ":finish_goal_state_v2"
+fun failed_prefix_diagnostic_key proof_engine = proof_engine ^ ":finish_goal_state_v3"
 (* Failed-prefix heaps retain the proof runtime and its compiled tactic refs. *)
 fun failed_prefix_resume_schema_key proof_engine = proof_engine ^ ":dependency_prefix_history_v3"
 
@@ -5575,14 +5575,14 @@ val action_batch_header = "holbuild-action-batch-v1"
    worker runs only specs exported by holbuild with the same sources. *)
 val runtime_source_files =
   ["sml/checkpoint_save_runtime.sml", "sml/holbuild_runtime.sml",
-   "sml/proof_runtime.sml", "sml/tactic_compat_runtime.sml"] @
+   "sml/proof_runtime.sml", "sml/tactic_compat_runtime.sml", "sml/diagnostic_limits.sml"] @
   map (fn file => normalize_path (Path.concat("sml/analyser", file)))
       HolbuildHolSharedCache.analyser_source_files
 
 fun runtime_identity () =
   let
     fun line rel =
-      rel ^ " " ^ HolbuildHash.file_sha256 (Path.concat(HolbuildRuntimePaths.source_root, rel))
+      rel ^ " " ^ HolbuildHash.file_sha256 (Path.concat(HolbuildRuntimePaths.runtime_root (), rel))
   in
     HolbuildToolchain.hash_text
       (String.concatWith "\n"

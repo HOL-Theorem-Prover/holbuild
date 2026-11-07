@@ -20,6 +20,7 @@ FAILURES = frozenset(
         "internal",
         "script",
         "timeout",
+        "unavailable",
     }
 )
 

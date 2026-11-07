@@ -1,11 +1,54 @@
 structure HolbuildRuntimePaths =
 struct
-  val source_root = OS.FileSys.getDir ()
+  val compile_source_root = OS.FileSys.getDir ()
+  val compile_datadir = OS.Process.getEnv "HOLBUILD_COMPILE_DATADIR"
+  val resolved_root = ref NONE
+
+  fun executable_path () =
+    OS.FileSys.fullPath "/proc/self/exe"
+    handle OS.SysErr _ =>
+      let
+        val name = CommandLine.name ()
+        val path = Option.getOpt (OS.Process.getEnv "PATH", "")
+        fun executable dir =
+          let val file = OS.Path.concat (if dir = "" then "." else dir, name)
+          in OS.FileSys.access (file, [OS.FileSys.A_EXEC]) end
+          handle OS.SysErr _ => false
+      in
+        OS.FileSys.fullPath
+          (if OS.Path.dir name <> "" then name
+           else case List.find executable (String.fields (fn c => c = #":") path) of
+                    SOME dir => OS.Path.concat (if dir = "" then "." else dir, name)
+                  | NONE => name)
+      end
+
+  (* Exported executables retain compile-time values; resolve data only when run. *)
+  fun runtime_root () =
+    case !resolved_root of
+        SOME root => root
+      | NONE =>
+        let
+          fun has_runtime root =
+            OS.FileSys.access (OS.Path.concat (root, "sml/holbuild_runtime.sml"),
+                               [OS.FileSys.A_READ])
+            handle OS.SysErr _ => false
+          val root =
+            (let val prefix = OS.Path.concat (OS.Path.dir (executable_path ()), "..")
+             in case List.find has_runtime
+                       ([OS.Path.concat (prefix, "share/holbuild"), prefix] @
+                        (case compile_datadir of SOME dir => [dir] | NONE => [])) of
+                    SOME dir => OS.FileSys.fullPath dir
+                  | NONE => compile_source_root
+             end handle OS.SysErr _ => compile_source_root)
+        in
+          resolved_root := SOME root;
+          root
+        end
 end
 
 fun path_join (a, b) = OS.Path.concat(a, b);
 
-val vendored_hol_source = path_join(HolbuildRuntimePaths.source_root, "vendor/hol");
+val vendored_hol_source = path_join(HolbuildRuntimePaths.compile_source_root, "vendor/hol");
 
 fun use_hol rel = use (path_join(vendored_hol_source, rel));
 
@@ -41,6 +84,7 @@ use "sml/temp_path.sml";
 use "sml/remove_tree.sml";
 use "sml/stat_cache.sml";
 use "sml/version.sml";
+use "sml/diagnostic_limits.sml";
 use "sml/suggest.sml";
 use "sml/hol_toolchain_config.sml";
 use "sml/builtin_manifests.sml";

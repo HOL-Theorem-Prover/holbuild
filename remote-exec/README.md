@@ -220,11 +220,17 @@ a run batch and cancels its unfinished actions.
   | `disk` | retried once; a second `disk` in a row, or `MAX_ATTEMPTS` claims, is final |
   | `input-missing` naming a theory of the batch other than the action itself or one that depends on it | that theory is built again and the action waits for it, until the action has been claimed `MAX_ATTEMPTS` times |
   | any other `input-missing` (a blob, a theory cached at export, or one that can't be the action's input) | retried, since a restore that fails on a network error reports its input missing too; after `MAX_ATTEMPTS` claims the batch fails with `resubmit: …`, naming the theory as `theory <input_key>`; the client resubmits once with that theory and every theory that depends on it, and otherwise the next build exports a new batch |
+  | `unavailable` | retried without counting the claim |
   | `proof`, `tactic-timeout`, `spec-rejected`, `script`, `timeout` | final; `script` means the script failed or omitted an output, `timeout` means it exceeded its time limit |
 
-  A worker whose `exec-action` ends without a result record (it crashed or
-  was killed) reports `internal` for it, so it is retried at once rather
-  than when its lease expires.
+  A worker that gets no answer from the cache for the action's spec, 429,
+  5xx or a transfer cut short, as while the cache restarts, reports
+  `unavailable`. Any other error
+  in the worker (`exec-action` ended without a result record because it
+  crashed or was killed, the release didn't build, the cache doesn't have the
+  spec) is reported as `internal`, so the action is retried at once rather
+  than when its lease expires. After either, the worker waits before it
+  claims again, so a cache outage doesn't run it through the ready actions.
 
   A retried action waits again like a child, so it runs only once the cache
   holds its parents again, or held them within the 60 s above (one may have

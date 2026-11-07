@@ -371,7 +371,7 @@ require_grep "expected failure" "$failure_log"
 require_grep "failed tactic top input goal:" "$failure_log"
 require_grep "plan position: 00 step FAIL_TAC" "$failure_log"
 require_grep "failed tactic input goals: 1" "$failure_log"
-require_grep "top goal exceeded 4 KiB" "$failure_log"
+require_grep "showing first 4096 bytes" "$failure_log"
 require_grep "full top goal is in the instrumented log referenced below" "$failure_log"
 require_grep "theorem: b_thm (line " "$failure_log"
 require_grep "proof: line " "$failure_log"
@@ -408,7 +408,7 @@ val summary =
     | NONE => (TextIO.output(TextIO.stdErr, "missing large-goal summary\\n");
                OS.Process.exit OS.Process.failure);
 val _ = require_substring "failed tactic input goals: 1" summary;
-val _ = require_substring "top goal exceeded 4 KiB; showing first 4096 bytes" summary;
+val _ = require_substring "showing first 4096 bytes" summary;
 val _ = require_substring "full top goal is in the instrumented log referenced below" summary;
 val log_reference =
   HolbuildBuildExec.retained_log_reference
@@ -419,6 +419,23 @@ val _ = require_substring "only read targeted ranges if explicitly needed" log_r
 val _ = OS.Process.exit OS.Process.success;
 SML
 HOLBUILD_HOLDIR="$HOLDIR" HOLDIR="$HOLDIR" poly < "$synthetic_large_goal_check" > "$tmpdir/synthetic-large-goal-check.log" 2>&1
+
+printf 'holbuild end failed tactic top input goal\n' >> "$synthetic_large_goal_log"
+cat > "$synthetic_large_goal_check" <<SML
+OS.FileSys.chDir "$repo_root";
+use "sml/holbuild-script.sml";
+val state = valOf (HolbuildTheoryDiagnostics.read_goal_state "$synthetic_large_goal_log");
+val _ = if size (#top_goal state) = 70001 andalso not (#marker_truncated state) then ()
+        else raise Fail "large preview was cut by the log reader";
+val summary = HolbuildTheoryDiagnostics.goal_state_summary true state;
+val _ = if String.isSubstring "top goal truncated" summary then
+          raise Fail "complete large preview reported truncation" else ();
+val _ = OS.Process.exit OS.Process.success;
+SML
+for limit in 100000 0 unlimited; do
+  HOLBUILD_GOAL_STATE_LIMIT=$limit poly --error-exit < "$synthetic_large_goal_check" \
+    > "$tmpdir/synthetic-large-goal-$limit.log" 2>&1
+done
 
 multi_goal_project=$tmpdir/multi-goal-project
 mkdir -p "$multi_goal_project/src"
@@ -562,6 +579,93 @@ require_file "$multi_goal_large_child_log"
 require_grep "holbuild all failed tactic input goals:" "$multi_goal_large_child_log"
 require_grep "holbuild failed tactic input goals truncated after 4096 bytes" "$multi_goal_large_child_log"
 require_grep "holbuild end all failed tactic input goals" "$multi_goal_large_child_log"
+
+# Reuse the failed checkpoint with changed settings, without rebuilding holbuild.
+for limit in 16384 0 unlimited; do
+  configured_log=$tmpdir/multi-goal-$limit.log
+  if (cd "$multi_goal_large_project" && HOLBUILD_FAILED_GOALS_LIMIT=$limit \
+      "$HOLBUILD_BIN" build ATheory) > "$configured_log" 2>&1; then
+    echo "expected large multi-goal proof to fail build" >&2
+    exit 1
+  fi
+  require_grep "from: failed-prefix checkpoint" "$configured_log"
+  require_grep "showing first 4096 bytes" "$configured_log"
+  python3 - "$multi_goal_large_child_log" <<'PYTHON'
+import sys
+from pathlib import Path
+text = Path(sys.argv[1]).read_text()
+goals = text.split("holbuild all failed tactic input goals:\n", 1)[1].split(
+    "holbuild end all failed tactic input goals", 1)[0]
+assert "truncated after" not in goals, goals[-200:]
+assert goals.count("p" * 5000) == 2, "missing full input goals"
+PYTHON
+done
+
+# Old failed-prefix heaps capture the pre-configuration diagnostic printer.
+python3 - "$multi_goal_large_project/.holbuild/checkpoints" <<'PYTHON'
+import sys
+from pathlib import Path
+markers = list(Path(sys.argv[1]).rglob("*failed_prefix.save.ok"))
+assert markers, "missing failed-prefix marker"
+for marker in markers:
+    text = marker.read_text().replace(":finish_goal_state_v3", ":finish_goal_state_v2")
+    marker.write_text(text)
+PYTHON
+upgrade_log=$tmpdir/upgrade.log
+if (cd "$multi_goal_large_project" && HOLBUILD_FAILED_GOALS_LIMIT=16384 \
+    "$HOLBUILD_BIN" build ATheory) > "$upgrade_log" 2>&1; then
+  echo "expected large multi-goal proof to fail build" >&2
+  exit 1
+fi
+if grep -q "from: failed-prefix checkpoint" "$upgrade_log"; then
+  echo "restored failed-prefix checkpoint with the old diagnostic printer" >&2
+  exit 1
+fi
+require_grep "multi goal large failure" "$upgrade_log"
+if grep -q "truncated after" "$multi_goal_large_child_log"; then
+  echo "upgraded failure log still truncated at the old limit" >&2
+  exit 1
+fi
+
+# The summary limit is independent, including structured truncation metadata.
+for limit in 128 16384 0 unlimited; do
+  configured_json=$tmpdir/summary-$limit.json
+  if (cd "$multi_goal_large_project" && HOLBUILD_FAILED_GOALS_LIMIT=128 \
+      HOLBUILD_GOAL_STATE_LIMIT=$limit "$HOLBUILD_BIN" --json build \
+      --retain-debug-artifacts ATheory) > "$configured_json" 2>&1; then
+    echo "expected large multi-goal proof to fail build" >&2
+    exit 1
+  fi
+  require_grep "truncated after 128 bytes" "$multi_goal_large_child_log"
+  python3 - "$configured_json" "$limit" <<'PYTHON'
+import json
+import sys
+from pathlib import Path
+events = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+failures = [e for e in events if e.get("event") == "node_failed"]
+assert failures, "missing structured proof failure"
+for event in failures:
+    failure = event["failure"]
+    truncated = sys.argv[2] == "128"
+    assert failure.get("top_goal_truncated", False) == truncated, failure
+    if truncated:
+        assert failure["top_goal_preview_bytes"] == 128, failure
+    else:
+        assert any("p" * 5000 in e.get("message", "") for e in events), failure
+PYTHON
+done
+
+# Reject malformed settings even when every target is already up to date.
+for name in HOLBUILD_FAILED_GOALS_LIMIT HOLBUILD_GOAL_STATE_LIMIT; do
+  for value in -1 1oops ''; do
+    invalid_log=$tmpdir/invalid-limit.log
+    if (cd "$project" && env "$name=$value" "$HOLBUILD_BIN" build ATheory) > "$invalid_log" 2>&1; then
+      echo "accepted invalid $name=$value" >&2
+      exit 1
+    fi
+    require_grep "$name=$value: expected a nonnegative integer byte limit or unlimited" "$invalid_log"
+  done
+done
 
 a_thm_context=$(find "$failure_project/.holbuild/checkpoints" -name '*a_thm_context.save' -print -quit)
 require_file "$a_thm_context"
