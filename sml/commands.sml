@@ -1367,19 +1367,22 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             | (HolbuildRemoteExec.Failed reason, progress) =>
                 let
                   val reason = "batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress
-                  val forced =
+                  val {below, above = forced} =
                     case (resubmit, HolbuildRemoteExec.resubmit_theory_key reason) of
                         (true, SOME missing) =>
-                          HolbuildBuildExec.theory_keys_depending_on build_options tc project plan toolchain_key missing
-                      | _ => []
+                          HolbuildBuildExec.theory_keys_around build_options tc project plan toolchain_key missing
+                      | _ => {below = [], above = []}
                 in
                   if null forced then fall_back reason
                   else
                     (HolbuildStatus.message_stderr
                        ("holbuild: remote execution: " ^ reason ^ "; resubmitting with " ^
                         Int.toString (length forced) ^ " theories rebuilt or rechecked\n");
-                     (* Their local entries may be the ones that don't fit. *)
+                     (* Their local entries may be the ones that don't fit, and
+                        local copies of their parents may differ from the
+                        remote's, which the workers build against. *)
                      HolbuildBuildExec.drop_local_cache_entries forced;
+                     HolbuildBuildExec.drop_stale_local_copies below;
                      export_and_submit false forced)
                 end
             | (HolbuildRemoteExec.Cancelled, progress) =>

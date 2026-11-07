@@ -2137,6 +2137,10 @@ fun publish_cache_manifest root cache_key subject staged_sig published_sml stage
       | NONE => write_manifest manifest
   end
 
+(* False in exec-action, which publishes a build's entry to the remote cache
+   itself once it has checked it. *)
+val publish_builds_remotely = ref true
+
 fun publish_theory_cache subject input_key proof_timeout staged_sig published_sml staged_dat
                          staged_trace staged_extras {parents, mldeps} =
   let
@@ -2149,7 +2153,7 @@ fun publish_theory_cache subject input_key proof_timeout staged_sig published_sm
     fun skip_locked_publish () = ()
   in
     (HolbuildCache.with_action_publish_lock root input_key publish skip_locked_publish;
-     publish_remote_cache_key_if_usable root input_key)
+     if !publish_builds_remotely then publish_remote_cache_key_if_usable root input_key else ())
     handle e => warn ("could not publish cache entry: " ^ General.exnMessage e)
   end
 
@@ -5669,19 +5673,43 @@ fun publish_spec_blob remote path =
     | HolbuildCacheBackend.Conflict message => raise Error ("could not upload " ^ path ^ ": " ^ message)
     | HolbuildCacheBackend.Skipped => raise Error ("could not upload " ^ path ^ ": skipped")
 
-(* The input keys of the plan's theories whose input key is missing or that
-   depend on that theory. *)
-fun theory_keys_depending_on (options : build_options) tc project plan toolchain_key missing =
+(* The input keys of the plan's theories around the one whose input key is
+   missing: those it depends on (below), and it and those that depend on it
+   (above). *)
+fun theory_keys_around (options : build_options) tc project plan toolchain_key missing =
   let
     val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
                  (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
     val key_of = HolbuildBuildPlan.input_key_for keys
-    fun depends node =
-      key_of node = missing orelse
-      List.exists (fn dep => key_of dep = missing) (HolbuildBuildPlan.transitive_project_deps plan node)
+    val theories = List.filter is_theory_node (HolbuildBuildPlan.selected_nodes plan)
+    fun below_of node = List.filter is_theory_node (HolbuildBuildPlan.transitive_project_deps plan node)
+    fun above node = key_of node = missing orelse List.exists (fn dep => key_of dep = missing) (below_of node)
   in
-    map key_of (List.filter (fn node => is_theory_node node andalso depends node) (HolbuildBuildPlan.selected_nodes plan))
+    {below = case List.find (fn node => key_of node = missing) theories of
+                 SOME node => map key_of (below_of node)
+               | NONE => [],
+     above = map key_of (List.filter above theories)}
   end
+
+(* Drops the local cache's entry for key when its outputs differ from the
+   remote cache's, so that the next restore takes the remote's; true when it
+   dropped it. *)
+fun drop_local_copy_if_stale remote key =
+  let val cache = cache_root ()
+  in
+    case (HolbuildCache.get_action cache key, HolbuildRemoteCache.get_action remote key) of
+        (SOME mine, SOME theirs) =>
+          not (cache_manifest_outputs_equal key mine theirs handle _ => false) andalso
+          drop_cache_manifest_if_unchanged cache key mine
+      | _ => false
+  end
+
+(* drop_local_copy_if_stale for each of keys, against the configured remote
+   cache. *)
+fun drop_stale_local_copies keys =
+  case HolbuildRemoteCacheConfig.url () of
+      SOME url => List.app (ignore o drop_local_copy_if_stale (HolbuildRemoteCache.remote url)) keys
+    | NONE => ()
 
 (* Drops the local cache's entries for keys, so that a build restores them
    from the remote cache. *)
@@ -6129,17 +6157,8 @@ fun records_parent recorded ({target, ...} : {target : string, stem : string, ke
    dependencies selected by wanted whose outputs differ from the remote's,
    so that the next restore takes the remote's; true when it dropped one. *)
 fun drop_stale_dep_copies remote (spec : action_spec) wanted =
-  let
-    val cache = cache_root ()
-    fun stale key =
-      case (HolbuildCache.get_action cache key, HolbuildRemoteCache.get_action remote key) of
-          (SOME mine, SOME theirs) =>
-            not (cache_manifest_outputs_equal key mine theirs handle _ => false) andalso
-            drop_cache_manifest_if_unchanged cache key mine
-        | _ => false
-  in
-    List.foldl (fn (dep, dropped) => (wanted dep andalso stale (#key dep)) orelse dropped) false (#deps spec)
-  end
+  List.foldl (fn (dep, dropped) => (wanted dep andalso drop_local_copy_if_stale remote (#key dep)) orelse dropped)
+             false (#deps spec)
 
 (* The dependencies a restored or built .dat records as parents. *)
 fun dat_records_parent path = records_parent (parse_dat_parent_hashes (read_text path))
@@ -7178,6 +7197,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
         val _ = verify_action_spec spec
         (* Names the build log, so only once the names are known safe. *)
         val _ = target := (#package spec, #logical spec)
+        val _ = publish_builds_remotely := false
         val tc =
           toolchain (#toolchain spec)
           handle e => raise action_failed ToolchainFailure (General.exnMessage e)

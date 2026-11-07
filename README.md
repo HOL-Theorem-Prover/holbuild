@@ -1128,9 +1128,10 @@ checks, and reports `cached` if the theory's own entry already restores, or
 if an earlier build of the same action text on byte-identical dependency
 outputs left one, which it then publishes under the action's input key (early
 cutoff, DESIGN.md). Otherwise it builds the theory as a local build would,
-with the spec's proof options, and checks that the remote cache then holds an
-entry for it whose outputs equal the build's. An entry there with other
-outputs is replaced only when it records parents other than the restored
+with the spec's proof options, publishes it to the remote cache (a local
+build would publish it at once; the worker waits for the checks below), and
+checks that the remote cache then holds an entry for it whose outputs equal
+the build's. An entry there with other outputs is replaced only when it records parents other than the restored
 ones, each restored from an entry with the remote cache's outputs, since no
 build against them can use it. The worker's local copy of an entry goes out
 of date when the remote cache's entry changes, so when restored parents don't
@@ -1235,7 +1236,8 @@ theory was built twice; the workers can't use it, and the coordinator fails
 the batch for resubmission naming it (`resubmit: ... theory <input_key>`).
 Such a batch is resubmitted once first, with that theory and every theory
 that depends on it, for the workers to rebuild or recheck against the cached
-parents. A submission
+parents; local copies of its parents that differ from the remote cache's are
+dropped, so that the build restores the parents the workers used. A submission
 answered 502, 503 or 504, as a proxy in front of the coordinator answers
 while it restarts, is retried, and an event stream that breaks is
 reattached; either is given up on once the coordinator stays unavailable for
