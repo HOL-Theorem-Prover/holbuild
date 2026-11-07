@@ -73,6 +73,7 @@ class Server:
     claims: list[dict[str, object]] = field(default_factory=list)
     heartbeats: list[dict[str, object]] = field(default_factory=list)
     unavailable: int = 0  # how many more completes answer 502, as a proxy does while the coordinator restarts
+    heartbeat_statuses: list[int] = field(default_factory=list)  # what the next heartbeats answer, then 200
 
 
 @pytest.fixture
@@ -111,6 +112,8 @@ def server() -> Iterator[Server]:
                 state.completed.append(body)
             if self.path.endswith("/heartbeat"):
                 state.heartbeats.append(json.loads(body))
+                if state.heartbeat_statuses:
+                    return self.reply(state.heartbeat_statuses.pop(0))
             self.reply(200, json.dumps({"accepted": True}) if self.path.endswith("/complete") else '{"lease_s": 3}')
 
         def do_PUT(self) -> None:
@@ -564,16 +567,40 @@ def test_memory_waits_are_reported_once(telemetry: tuple[HostTelemetry, Path], s
     assert (beat["memory_waits"], beat["memory_wait_s"]) == (0, 0.0)
 
 
-def test_memory_waits_of_a_report_that_may_have_been_taken_are_not_sent_again(
+def test_memory_waits_go_with_the_next_report_only_when_the_coordinator_cannot_have_taken_them(
     telemetry: tuple[HostTelemetry, Path], server: Server
 ) -> None:
     reporter, _ = telemetry
     reporter.waited(4.0)
     with pytest.raises(OSError):
-        Coordinator("http://127.0.0.1:1", "w", reporter).claim(["standard"], "w", 0)
-    assert Coordinator(server.url, "w", reporter).claim(["standard"], "w", 0) is None
-    claimed = server.claims[0]["host"]
-    assert isinstance(claimed, dict) and claimed["memory_waits"] == 0
+        Coordinator("http://127.0.0.1:1", "w", reporter).claim(["standard"], "w", 0)  # refused
+    coordinator = Coordinator(server.url, "w", reporter)
+    server.heartbeat_statuses = [502, 200, 503]  # a 502 from a proxy with no coordinator behind it
+    with pytest.raises(RuntimeError, match="answered 502"):
+        coordinator.heartbeat("t")
+    assert coordinator.heartbeat("t")
+    reporter.waited(1.0)
+    with pytest.raises(RuntimeError, match="answered 503"):
+        coordinator.heartbeat("t")
+    assert coordinator.heartbeat("t")
+
+    waits = [beat["host"]["memory_waits"] for beat in server.heartbeats]  # type: ignore[index]
+    assert waits == [1, 1, 1, 0]
+
+
+def test_a_report_does_not_wait_for_an_admission_holding_the_lock(
+    host: Host, telemetry: tuple[HostTelemetry, Path]
+) -> None:
+    reporter, _ = telemetry
+    host.lease(3 * GIB)
+    with open(host.dir / "lock") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        first = reporter.report()
+        assert (first.mem_total, first.leases) == (64 * GIB, 0)  # /proc/meminfo alone
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        assert reporter.report().leases == 1
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        assert reporter.report().leases == 1  # the last reading
 
 
 def test_a_worker_without_telemetry_sends_no_host(server: Server) -> None:

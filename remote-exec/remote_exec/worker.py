@@ -96,10 +96,24 @@ class Coordinator:
             return error.code, error.read().decode(errors="replace")
 
     def post_reporting(self, path: str, body: dict[str, Any], timeout: float = 30) -> tuple[int, Any]:
-        """``post`` a JSON body with the host's report in it. A report is sent once: one the coordinator may have
-        taken before failing isn't sent again, so its memory waits are never counted twice."""
-        report = None if self.host is None else asdict(self.host.report())
-        return self.post(path, json.dumps({**body, "host": report}).encode(), "application/json", timeout)
+        """``post`` a JSON body with the host's report in it. A report that can't have reached the coordinator, as
+        when nothing listened or the proxy found no coordinator (502), goes back to be sent with the next; one that
+        may have been taken isn't sent again, so its memory waits are never counted twice. A coordinator that
+        restarts forgets its hosts, so a 502 from one that took the report and then died loses nothing."""
+        if self.host is None:
+            return self.post(path, json.dumps({**body, "host": None}).encode(), "application/json", timeout)
+        report = self.host.report()
+        try:
+            status, response = self.post(
+                path, json.dumps({**body, "host": asdict(report)}).encode(), "application/json", timeout
+            )
+        except urllib.error.URLError as error:
+            if isinstance(error.reason, ConnectionRefusedError):
+                self.host.unsent(report)
+            raise
+        if status == 502:
+            self.host.unsent(report)
+        return status, response
 
     def claim(self, tiers: list[str], worker: str, wait_s: float) -> dict[str, Any] | None:
         """An action, waiting up to ``wait_s`` seconds for one, or None."""
@@ -264,7 +278,8 @@ class HostMemory:
     leases: int
 
     @classmethod
-    def read(cls, directory: str | None) -> "HostMemory":
+    def read(cls, directory: str | None, *, wait: bool = True) -> "HostMemory":
+        """Read it now. Without ``wait``, raises BlockingIOError if a holbuild admission holds the dir's lock."""
         meminfo: dict[str, int] = {}
         with open(os.environ.get("HOLBUILD_TEST_MEMINFO", "/proc/meminfo")) as file:
             for line in file:
@@ -279,7 +294,7 @@ class HostMemory:
         # Lease files are probed under DIR/lock, as holbuild scans them: a probe's flock on a lease another
         # process has just created, before it locks it, would make that process's admission fail.
         with contextlib.suppress(FileNotFoundError), open(os.path.join(directory, "lock")) as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            fcntl.flock(lock, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
             with contextlib.suppress(FileNotFoundError), open(os.path.join(directory, "budget")) as file:
                 budget = int(file.read())
             for name in os.listdir(directory):
@@ -376,6 +391,7 @@ class HostTelemetry:
         self.charge = charge
         self.lock = threading.Lock()
         self.cpu: tuple[float, int, int] | None = None  # when, idle and total of the CPU sample measured from
+        self.memory: HostMemory | None = None  # the last reading
         self.memory_waits = 0
         self.memory_wait_s = 0.0
 
@@ -386,8 +402,14 @@ class HostTelemetry:
             self.memory_wait_s += seconds
 
     def report(self) -> HostReport:
-        """The host now, with the waits since the last report, which it takes."""
-        memory = HostMemory.read(self.cooperate_dir)
+        """The host now, with the waits not yet reported, which it takes. It doesn't wait for the cooperate dir's
+        lock, which would hold up the heartbeat that renews a running action's lease: while an admission holds the
+        lock, the memory is the last reading, or ``/proc/meminfo`` alone before the first."""
+        try:
+            memory = HostMemory.read(self.cooperate_dir, wait=False)
+        except BlockingIOError:
+            memory = self.memory or HostMemory.read(None)
+        self.memory = memory
         with open(PROC_STAT) as file:
             idle, total = cpu_times(file.readline())
         now = time.monotonic()
@@ -411,6 +433,12 @@ class HostTelemetry:
             waits,
             round(wait_s, 1),
         )
+
+    def unsent(self, report: HostReport) -> None:
+        """Keep the waits of a report that didn't reach the coordinator for the next one."""
+        with self.lock:
+            self.memory_waits += report.memory_waits
+            self.memory_wait_s += report.memory_wait_s
 
 
 def failed_record(spec_sha256: str, failure: str) -> str:
