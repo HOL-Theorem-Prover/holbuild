@@ -2448,7 +2448,7 @@ fun script_prefix_key NONE NONE source_prefix_hash = source_prefix_hash
 
 fun failed_prefix_diagnostic_key proof_engine = proof_engine ^ ":finish_goal_state_v2"
 (* Failed-prefix heaps retain the proof runtime and its compiled tactic refs. *)
-fun failed_prefix_resume_schema_key proof_engine = proof_engine ^ ":dependency_prefix_history_v2"
+fun failed_prefix_resume_schema_key proof_engine = proof_engine ^ ":dependency_prefix_history_v3"
 
 fun failed_prefix_ok proof_engine proof_timeout deps_key safe_name pre_hash header_hash =
   checkpoint_ok_text "failed_prefix"
@@ -7219,7 +7219,9 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                     [("leaf", #path c, rel (#path c))] @
                     map (fn suffix => ("sidecar", #path c ^ suffix, suffix)) sidecars
                   val entries = map (fn (role, path, arg) => (role, upload path, arg)) files
-                  val _ = HolbuildRemoteCache.publish_action remote
+                  (* An unconditional write: it replaces a failed prefix's
+                     entry, as above. *)
+                  val _ = HolbuildRemoteCache.replace_action_unconditionally remote
                             {key = key,
                              text = shared_manifest "holbuild-shared-checkpoint-v1" (SOME (#kind c))
                                       (("heap", heap, "") :: entries)}
