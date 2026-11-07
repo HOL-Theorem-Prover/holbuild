@@ -423,8 +423,8 @@ class HostTelemetry:
 def failed_record(spec_sha256: str, failure: str) -> str:
     """A result record the worker writes itself: ``spec-rejected`` for an action it won't run, which fails it
     finally like exec-action's own; ``unavailable`` for one whose spec the cache couldn't give (no answer, 429 or
-    5xx, or cut it short), which is retried without counting the attempt; or ``internal`` for any other error in the worker, such as
-    exec-action ending without a record, which is retried."""
+    5xx, or a transfer cut short), which is retried without counting the attempt; or ``internal`` for any other
+    error in the worker, such as exec-action ending without a record, which is retried."""
     return f"holbuild-action-result-v1\nspec={spec_sha256}\ninput-key=\nstatus=failed\nfailure={failure}\n"
 
 
