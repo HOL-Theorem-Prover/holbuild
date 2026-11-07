@@ -101,14 +101,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(int((control / "get-status").read_text()))
             self.end_headers()
             return
-        if (
-            control is not None
-            and self.path.startswith("/ac/")
-            and (control / "ac-get-status").exists()
-        ):
-            self.send_response(int((control / "ac-get-status").read_text()))
-            self.end_headers()
-            return
+        if control is not None and self.path.startswith("/ac/"):
+            key = urllib.parse.urlparse(self.path).path.rsplit("/", 1)[-1]
+            for name in (f"ac-get-status-{key}", "ac-get-status"):
+                if (control / name).exists():
+                    self.send_response(int((control / name).read_text()))
+                    self.end_headers()
+                    return
         path = self.object_path()
         if path is None:
             return

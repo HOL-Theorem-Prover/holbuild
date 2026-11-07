@@ -47,6 +47,16 @@ Proof
   simp[]
 QED
 SML
+cat > "$project/src/BScript.sml" <<'SML'
+Theory B
+Ancestors A
+
+Theorem b_thm:
+  T
+Proof
+  simp[]
+QED
+SML
 
 (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload ATheory) > "$tmpdir/batch.txt"
 spec=$(awk '$1 == "action" && $5 == "worker:ATheory" { print $4 }' "$tmpdir/batch.txt")
@@ -118,6 +128,18 @@ rm "$control/ac-get-status"
 worker w
 grep -qx 'status=cached' "$tmpdir/w.result" || { cat "$tmpdir/w.result" "$tmpdir/w.log" >&2; exit 1; }
 require_file "$remote_root/ac/$ac"
+
+# Hydrating a dependency: B's worker fetches A's entry, and the cache
+# answers 500 for it.  That is not a missing input.
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload BTheory) > "$tmpdir/batch-b.txt"
+spec_a=$spec
+spec=$(awk '$1 == "action" && $5 == "worker:BTheory" { print $4 }' "$tmpdir/batch-b.txt")
+[[ -n "$spec" ]] || { cat "$tmpdir/batch-b.txt" >&2; exit 1; }
+echo 500 > "$control/ac-get-status-$ac"
+worker b
+expect b 3 unavailable "remote cache server error: HTTP 500 for GET .*/ac/$ac"
+rm "$control/ac-get-status-$ac"
+spec=$spec_a
 
 # A remote entry with other outputs is a real conflict: a worker that builds
 # the action reports `publish`.
