@@ -234,3 +234,45 @@ def test_worker_mapping_is_bounded_and_zero_ratio_disables_capacity(workers: int
 def test_slot_identity_requires_credential_free_https(url: str) -> None:
     with pytest.raises(ValueError):
         CacheSlot(name="slot", url=url)
+
+
+async def test_failed_readiness_deadline_drains_before_releasing_failed_launch(pool: CachePool) -> None:
+    p = provider(pool)
+    p.instances = [Instance(id="failed", state="launching")]
+    p.ready = False
+    await launch(pool)
+    assert await phase(pool, "failed") == "ready"
+    p.now += timedelta(seconds=901)
+    restarted = CachePool(pool.engine, pool.slots, p, drain_seconds=60)
+    await restarted.reconcile(p.now)
+    assert await phase(pool, "failed") == "drain"
+    await restarted.reconcile(p.now)
+    await restarted.reconcile(p.now + timedelta(seconds=59))
+    assert not any(r.op in {"flush", "stop", "withdraw", "terminate"} for r in p.calls)
+    p.durable = True
+    for _ in range(4):
+        await restarted.reconcile(p.now + timedelta(seconds=60))
+    operations = [r.op for r in p.calls if r.instance == "failed"]
+    assert operations.index("drain") < operations.index("flush") < operations.index("stop")
+    assert operations.index("stop") < operations.index("withdraw") < operations.index("terminate")
+    p.instances = [Instance(id="failed", state="gone"), Instance(id="replacement", state="launching")]
+    await restarted.reconcile(p.now + timedelta(seconds=61))
+    assert await phase(pool, "failed") is None
+    assert await phase(pool, "replacement") == "boot"
+
+
+async def test_explicit_launch_failure_enters_verified_cleanup(pool: CachePool, monkeypatch) -> None:
+    p = provider(pool)
+    p.instances = [Instance(id="failed", state="launching")]
+    await pool.reconcile(p.now)
+    original = p.call
+
+    async def fail_configure(request: AdapterRequest) -> AdapterResponse:
+        if request.op == "boot":
+            return AdapterResponse(done=False, error="configuration failed")
+        return await original(request)
+
+    monkeypatch.setattr(p, "call", fail_configure)
+    await pool.reconcile(p.now)
+    assert await phase(pool, "failed") == "drain"
+    assert not any(r.op == "terminate" for r in p.calls)

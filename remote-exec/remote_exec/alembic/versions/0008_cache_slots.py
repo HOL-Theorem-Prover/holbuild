@@ -21,6 +21,7 @@ def upgrade() -> None:
             owner text NOT NULL UNIQUE,
             phase text NOT NULL CHECK (phase IN
                 ('boot','dns','ready','admit','serving','drain','flush','stop','withdraw','terminate')),
+            assigned_at timestamptz NOT NULL DEFAULT clock_timestamp(),
             token text,
             context text,
             error text,

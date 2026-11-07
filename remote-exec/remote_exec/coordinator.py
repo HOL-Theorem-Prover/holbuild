@@ -92,6 +92,7 @@ class Settings(BaseSettings):
     cache_slots: list[CacheSlot] = Field(default_factory=list)
     cache_workers_per_node: int = Field(default=15, ge=0)
     cache_drain_seconds: int = Field(default=60, ge=60)
+    cache_launch_timeout_seconds: int = Field(default=900, gt=0)
     scale_cmd: str | None = None  # run as `<scale_cmd> <desired burst workers>` when that number changes
 
     @field_validator("cache_url")
@@ -380,7 +381,8 @@ class Coordinator:
         self.cache_pool = (CachePool(engine, settings.cache_slots, CommandAdapter(settings.cache_pool_cmd),
                                      drain_seconds=settings.cache_drain_seconds, hold_seconds=settings.scale_down_hold_s,
                                      workers_per_node=settings.cache_workers_per_node,
-                                     max_workers=settings.max_burst_workers)
+                                     max_workers=settings.max_burst_workers,
+                                     launch_timeout_seconds=settings.cache_launch_timeout_seconds)
                            if settings.cache_pool_cmd else None)
         self.scaler: ScaleRun | None = None  # the scale command's last run
         # How many actions this process's release has made ready, and the claims waiting, by the tiers they take

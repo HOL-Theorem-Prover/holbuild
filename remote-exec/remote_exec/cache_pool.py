@@ -117,6 +117,7 @@ class Member:
     url: str
     owner: str
     phase: Phase
+    assigned_at: datetime
     token: str | None
     context: str | None
     ingress_stopped_at: datetime | None
@@ -141,7 +142,7 @@ class CachePool:
     """Own the slot registry; only the elected controller may advance lifecycle state."""
 
     def __init__(self, engine: AsyncEngine, slots: list[CacheSlot], adapter: CommandAdapter, *, drain_seconds: int,
-                 hold_seconds: float = 900, workers_per_node: int = 0, max_workers: int = 240) -> None:
+                 hold_seconds: float = 900, workers_per_node: int = 0, max_workers: int = 240, launch_timeout_seconds: int = 900) -> None:
         if drain_seconds < 60:
             raise ValueError("cache drain must be at least 60 seconds")
         if not 1 <= len(slots) <= 4 or len({s.name for s in slots}) != len(slots):
@@ -155,6 +156,7 @@ class CachePool:
         self.hold_seconds = hold_seconds
         self.workers_per_node = workers_per_node
         self.max_workers = max_workers
+        self.launch_timeout_seconds = launch_timeout_seconds
 
     async def ready_urls(self) -> list[str]:
         async with self.engine.connect() as conn:
@@ -171,7 +173,7 @@ class CachePool:
 
     async def _members(self, conn: AsyncConnection) -> list[Member]:
         rows = (await conn.execute(sa.text(
-            "SELECT slot, url, owner, phase, token, context, ingress_stopped_at FROM cache_slots ORDER BY slot"
+            "SELECT slot, url, owner, phase, assigned_at, token, context, ingress_stopped_at FROM cache_slots ORDER BY slot"
         ))).mappings()
         return [Member(**row) for row in rows]
 
@@ -227,8 +229,8 @@ class CachePool:
             if slot is None:
                 break
             await conn.execute(sa.text(
-                "INSERT INTO cache_slots (slot,url,owner,phase) VALUES (:slot,:url,:owner,'boot')"
-            ), {"slot": slot.name, "url": slot.url, "owner": instance.id})
+                "INSERT INTO cache_slots (slot,url,owner,phase,assigned_at) VALUES (:slot,:url,:owner,'boot',:now)"
+            ), {"slot": slot.name, "url": slot.url, "owner": instance.id, "now": now})
 
     async def _reconcile_member(self, conn: AsyncConnection, member: Member, instance: Instance | None,
                                 now: datetime) -> None:
@@ -255,6 +257,11 @@ class CachePool:
         }:
             await self._save(conn, member, "drain")
             return
+        if member.phase in {"boot", "dns", "ready", "admit"} and (
+            now - member.assigned_at
+        ).total_seconds() >= self.launch_timeout_seconds:
+            await self._save(conn, member, "drain", error="launch readiness deadline expired")
+            return
         await self._advance(conn, member, now)
 
     async def _save(self, conn: AsyncConnection, member: Member, phase: Phase, *,
@@ -277,6 +284,9 @@ class CachePool:
             context=member.context
         ))
         if not result.done or (member.phase == "flush" and not result.durable):
+            if result.error and member.phase in {"boot", "dns", "ready", "admit"}:
+                await self._save(conn, member, "drain", error=result.error)
+                return
             if result.error:
                 logger.warning("cache %s %s: %s", member.slot, member.phase, result.error)
             await self._save(conn, member, member.phase, token=result.token, context=result.context, error=result.error)

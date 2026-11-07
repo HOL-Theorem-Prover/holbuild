@@ -574,3 +574,10 @@ release before enabling capacity. Exercise concurrent claims, failed boots,
 failed drains, stale readers, DNS ownership and a real scale-out/scale-in cycle
 in the deployment environment. Rollback requests zero temporary capacity and
 uses the same drain path while retaining the permanent ring and registry.
+
+Launch assignment time is persisted. `REMOTE_EXEC_CACHE_LAUNCH_TIMEOUT_SECONDS`
+(default 900) bounds configuration/readiness retries across coordinator restarts.
+An explicit adapter launch error or an expired deadline starts the same verified
+drain path, then the adapter abandons the unadmitted launch after backend stop
+and DNS withdrawal. Heartbeats continue during cleanup; a failed launch cannot
+become a serving member. A provider hook deadline remains a failure boundary.
