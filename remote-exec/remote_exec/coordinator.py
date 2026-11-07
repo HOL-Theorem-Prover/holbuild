@@ -200,11 +200,21 @@ class HostStatus:
 
 
 @dataclass(frozen=True)
+class ScaleRun:
+    """A run of the scale command: the burst worker target it got, when, and why it failed (None if it didn't)."""
+
+    workers: int
+    at: datetime
+    error: str | None
+
+
+@dataclass(frozen=True)
 class QueueStatus:
     counts: QueueCounts
     desired_burst_workers: int
     hosts: list[HostStatus]
     phases: PhaseTotals
+    scaler: ScaleRun | None  # the scale command's last run in this process
 
 
 def burst_demand(counts: QueueCounts, warm_workers: int, max_burst_workers: int, run_slots: int = 30) -> int:
@@ -357,7 +367,7 @@ class Coordinator:
         self.cache = cache
         self.settings = settings
         self.clock: Callable[[], datetime] = lambda: datetime.now(UTC)
-        self.scaled_to: int | None = None  # what the scale command last accepted
+        self.scaler: ScaleRun | None = None  # the scale command's last run
         # How many actions this process's release has made ready, and the claims waiting, by the tiers they take
         # and the future that wakes them, oldest first; see claim.
         self.made_ready = 0
@@ -926,8 +936,8 @@ class Coordinator:
 
     async def queue(self) -> QueueStatus:
         """The unfinished actions, the burst worker target: the highest demand of the last ``scale_down_hold_s``
-        seconds, which the sweeps of every replica record, and of now, and the hosts whose workers reported to this
-        process in the last ``HOST_REPORT_SECONDS``, by id."""
+        seconds, which the sweeps of every replica record, and of now, the hosts whose workers reported to this
+        process in the last ``HOST_REPORT_SECONDS``, by id, and this process's last run of the scale command."""
         async with self.engine.connect() as conn:
             desired = await conn.scalar(HELD_TARGET, self._held_target_params(self.clock()))
             rows = await conn.execute(
@@ -966,7 +976,11 @@ class Coordinator:
         }
         hosts = [HostStatus(report, round((now - at).total_seconds(), 1)) for at, report in self.hosts.values()]
         return QueueStatus(
-            counts, max(desired, demand), sorted(hosts, key=lambda h: h.report.id), self._phase_totals(now)
+            counts,
+            max(desired, demand),
+            sorted(hosts, key=lambda h: h.report.id),
+            self._phase_totals(now),
+            self.scaler,
         )
 
     async def sweep(self) -> None:
@@ -998,14 +1012,16 @@ class Coordinator:
                 {"now": now, "workers": demand},
             )
             desired = await conn.scalar(HELD_TARGET, self._held_target_params(now))
-        if self.settings.scale_cmd is None or desired == self.scaled_to:
+        last = self.scaler
+        if self.settings.scale_cmd is None or (last is not None and last.error is None and last.workers == desired):
             return
         try:
             await self._scale(self.settings.scale_cmd, desired)
         except (OSError, ScaleCommandError) as error:
             logger.warning("scaling to %d burst workers failed: %s", desired, error)
+            self.scaler = ScaleRun(desired, now, str(error))
             return
-        self.scaled_to = desired
+        self.scaler = ScaleRun(desired, now, None)
 
     def _held_target_params(self, now: datetime) -> dict[str, object]:
         return {"now": now, "hold": self.settings.scale_down_hold_s, "cap": self.settings.max_burst_workers}

@@ -5992,6 +5992,15 @@ fun local_entry_satisfies options project plan node input_key =
       | SOME text => entry_satisfies options project plan node input_key (HolbuildCache.verify_blob root) text
   end
 
+(* Whether the remote cache holds an entry this build would restore,
+   after publishing the local cache's entry there, with PUBLISH, when only
+   the local cache holds one. *)
+fun remote_available remote options project plan node input_key publish =
+  remote_entry_satisfies remote options project plan node input_key orelse
+  publish andalso local_entry_satisfies options project plan node input_key andalso
+  (publish_remote_cache_key (cache_root ()) input_key;
+   remote_entry_satisfies remote options project plan node input_key)
+
 (* Where a worker places a library's source, relative to its action root. *)
 fun library_source_path node =
   normalize_path (String.concatWith "/"
@@ -6345,11 +6354,8 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       let val key = #input_key action
       in
         known ("theory " ^ key) orelse
-        (remote_entry_satisfies remote options project plan node key orelse
-         upload andalso local_entry_satisfies options project plan node key andalso
-         (publish_remote_cache_key (cache_root ()) key;
-          remote_entry_satisfies remote options project plan node key)) andalso
-        (learn ("theory " ^ key); true)
+        (remote_available remote options project plan node key upload andalso
+         (learn ("theory " ^ key); true))
       end
     val unavailable =
       failing "checking remote cache" "theories" available
@@ -6421,7 +6427,14 @@ datatype run_load =
 
 type run_request =
   {contexts : run_context list, script : string, supports : string list,
-   loads : run_load list, outputs : string list, timeout : int option}
+   loads : run_load list, outputs : string list, timeout : int option, closure : bool}
+
+(* A run's context, resolved against the plan. *)
+datatype resolved_context = ToolchainContext of string | PlannedContext of HolbuildBuildPlan.node
+
+(* A run of a request: its context's name (PACKAGE:THEORY, or HOL:XTheory),
+   the run text's context= value, and its run key. *)
+type run = {name : string, context : string, run_key : string}
 
 fun run_token what text =
   if text <> "" andalso not (CharVector.exists (fn c => Char.isSpace c orelse Char.isCntrl c) text)
@@ -6456,8 +6469,11 @@ fun qualified_name text =
         else raise Error ("run-action: expected NAME or PACKAGE:NAME, got " ^ HolbuildHash.quote text)
     | _ => raise Error ("run-action: expected NAME or PACKAGE:NAME, got " ^ HolbuildHash.quote text)
 
+(* A fetched run's directory holds KEY and CONTEXT beside its outputs. *)
 fun output_name text =
-  if text <> "" andalso String.sub (text, 0) <> #"." andalso
+  if text = "KEY" orelse text = "CONTEXT" then
+    raise Error ("run-action: KEY and CONTEXT are not output names: a fetched run's directory holds them")
+  else if text <> "" andalso String.sub (text, 0) <> #"." andalso
      CharVector.all (fn c => Char.isAlphaNum c orelse c = #"." orelse c = #"_" orelse c = #"-") text
   then text
   else raise Error ("run-action: output name " ^ HolbuildHash.quote text ^
@@ -6466,7 +6482,7 @@ fun output_name text =
 (* The request a run-action command line makes: hol:X is a toolchain theory
    when sigobj has it (X or XTheory), hol:* every one; a library sigobj has
    is the toolchain's; the rest are planned as build targets. *)
-fun run_request holdir {targets, script, supports, loads, outputs, timeout} : run_request =
+fun run_request holdir {targets, script, supports, loads, outputs, timeout, closure} : run_request =
   let
     fun context target =
       if target = "hol:*" then map HolContext (toolchain_theories holdir)
@@ -6488,7 +6504,7 @@ fun run_request holdir {targets, script, supports, loads, outputs, timeout} : ru
     else if length (unique_strings outputs) <> length outputs then raise Error "run-action: an --output is declared twice"
     else
       {contexts = List.concat (map context targets), script = script, supports = supports,
-       loads = map load loads, outputs = sort_strings outputs, timeout = timeout}
+       loads = map load loads, outputs = sort_strings outputs, timeout = timeout, closure = closure}
   end
 
 (* The build targets to plan for a request. *)
@@ -6550,13 +6566,36 @@ fun unique_nodes nodes =
                       if List.exists (fn n => HolbuildBuildPlan.key n = HolbuildBuildPlan.key node) acc then acc
                       else node :: acc) [] nodes)
 
-(* Writes the run spec of each context of REQUEST under .holbuild/run-specs,
-   uploads the specs and every file they name to the remote cache, and
-   returns a line "<context> <run_key> <spec_sha256>" for each context
-   exported, and whether a project context was refused because the local
-   cache has no entry for it.  PLANNED is the plan of the request's
-   run_planning_targets, NONE when it has none. *)
-fun export_run_specs tc project planned jobs ({contexts, script, supports, loads, outputs, timeout} : run_request) =
+(* A run's entry in the remote cache, if it has one with exactly the
+   declared OUTPUTS: its text and its (name, sha256) outputs. *)
+fun remote_run_entry remote run_key outputs =
+  case HolbuildRemoteCache.get_action remote run_key of
+      NONE => NONE
+    | SOME text =>
+        let val found = run_manifest_outputs run_key text
+        in
+          if sort_strings (map #1 found) = sort_strings outputs then SOME (text, found) else NONE
+        end
+        handle Error _ => NONE
+
+(* Whether the remote cache holds a run's entry and every output it names. *)
+fun run_already_done remote run_key outputs =
+  case remote_run_entry remote run_key outputs of
+      SOME (_, found) => List.all (HolbuildRemoteCache.blob_present remote o #2) found
+    | NONE => false
+
+(* The runs of REQUEST, one per context: with --closure, each project
+   context's dependency theories follow the contexts named.  Each run has
+   its context's name, the run text's context= value, its run key and the
+   theories a worker restores for it; computing them reads no cache.
+   EXPORT writes the run specs of the runs given under .holbuild/run-specs
+   and uploads the specs and every file they name to the remote cache.  A
+   theory a worker restores that the remote cache lacks is published there
+   from the local cache first; a run with one that neither cache holds is
+   refused, and EXPORT returns it among the refused.  PLANNED is the plan of
+   the request's run_planning_targets, NONE when it has none. *)
+fun plan_runs tc project planned jobs
+              ({contexts, script, supports, loads, outputs, timeout, closure} : run_request) =
   let
     val remote =
       case HolbuildRemoteCacheConfig.url () of
@@ -6608,19 +6647,33 @@ fun export_run_specs tc project planned jobs ({contexts, script, supports, loads
       map load_key_line loads @
       map (fn name => "output=" ^ name) outputs
     val spec_dir = Path.concat (root, ".holbuild/run-specs")
-    val refused = ref false
-    fun refuse name =
-      (refused := true;
-       HolbuildStatus.message_stderr
-         ("holbuild: run-action: " ^ name ^ " is not in the local cache for its current inputs; build it first\n");
-       NONE)
-    fun export context =
+    val named =
+      map (fn HolContext theory => ToolchainContext theory
+            | ProjectContext wanted =>
+                PlannedContext (planned_node (#plan (the_plan ())) "theory" is_theory_node wanted))
+          contexts
+    val expanded =
+      if closure then
+        named @
+        List.concat (map (fn PlannedContext node =>
+                               map PlannedContext (List.filter is_theory_node
+                                              (HolbuildBuildPlan.transitive_project_deps (#plan (the_plan ())) node))
+                           | ToolchainContext _ => [])
+                         named)
+      else named
+    fun context_name (ToolchainContext theory) = "HOL:" ^ theory
+      | context_name (PlannedContext node) = package node ^ ":" ^ logical_name node
+    val expanded =
+      rev (List.foldl (fn (c, acc) =>
+                          if List.exists (fn c' => context_name c' = context_name c) acc then acc else c :: acc)
+                      [] expanded)
+    fun run context =
       let
-        (* THEORIES have their scripts shipped; REQUIRED must be built here. *)
+        (* THEORIES are restored by the worker and have their scripts shipped. *)
         val (name, key_line, context_line, {library_lines, dep_lines, lib_lines, library_files}, load_lines,
-             theories, required) =
+             theories) =
           case context of
-              HolContext theory =>
+              ToolchainContext theory =>
                 let
                   val name = "HOL:" ^ theory
                   val extras = unique_nodes load_closure
@@ -6629,15 +6682,14 @@ fun export_run_specs tc project planned jobs ({contexts, script, supports, loads
                       SOME {plan, keys, ...} =>
                         (name, "context=" ^ name, "context " ^ name,
                          dependency_spec_lines root plan keys (spec_token name) extras, [],
-                         List.filter is_theory_node extras, List.filter is_theory_node extras)
+                         List.filter is_theory_node extras)
                     | NONE =>
                         (name, "context=" ^ name, "context " ^ name,
-                         {library_lines = [], dep_lines = [], lib_lines = [], library_files = []}, [], [], [])
+                         {library_lines = [], dep_lines = [], lib_lines = [], library_files = []}, [], [])
                 end
-            | ProjectContext wanted =>
+            | PlannedContext node =>
                 let
                   val {options, plan, keys, toolchain_key} = the_plan ()
-                  val node = planned_node plan "theory" is_theory_node wanted
                   val name = package node ^ ":" ^ logical_name node
                   val token = spec_token name
                   val action = theory_action root plan keys toolchain_key
@@ -6660,68 +6712,147 @@ fun export_run_specs tc project planned jobs ({contexts, script, supports, loads
                     lib_lines = #lib_lines context_lines @ #lib_lines extra_lines,
                     library_files = #library_files context_lines @ #library_files extra_lines},
                    map (theory_load_spec_line token) (#loads action),
-                   node :: List.filter is_theory_node (deps @ extras),
-                   node :: List.filter is_theory_node extras)
+                   node :: List.filter is_theory_node (deps @ extras))
                 end
-        val missing =
-          case planned of
-              SOME {options, plan, keys, ...} =>
-                List.find (fn node => not (local_entry_satisfies options project plan node
-                                             (HolbuildBuildPlan.input_key_for keys node)))
-                          required
-            | NONE => NONE
-      in
-        case missing of
-            SOME node => refuse (if package node ^ ":" ^ logical_name node = name then name
-                                 else name ^ " needs " ^ package node ^ ":" ^ logical_name node ^ ", which")
-          | NONE =>
-              let
-                val run_text =
-                  String.concatWith "\n"
-                    (["holbuild-run-v1", "toolchain=" ^ action_toolchain_key, key_line] @ run_text_tail) ^ "\n"
-                val run_key = HolbuildToolchain.hash_text run_text
-                val token = spec_token name
-                (* The context's key names each script's planned hash, so the
-                   file shipped must be the one planned. *)
-                fun script_line node =
-                  let val line = file_line "context-script" (token (library_source_path node)) (source_file node)
-                  in
-                    if List.nth (String.tokens Char.isSpace line, 3) =
-                       HolbuildBuildPlan.source_hash (#plan (the_plan ())) node
-                    then line
-                    else raise Error ("theory script changed since the build was planned: " ^ source_file node)
-                  end
-                val script_lines = map script_line theories
-                val lines =
-                  [run_spec_header,
-                   "holbuild-version=" ^ HolbuildVersion.version,
-                   "holbuild-runtime=" ^ runtime,
-                   toolchain_line,
-                   "run-key=" ^ run_key,
-                   context_line] @
-                  library_lines @ dep_lines @ lib_lines @ load_lines @ script_lines @
-                  ["script " ^ script_sha256 ^ " " ^ Position.toString (FS.fileSize script)] @
-                  map (fn {rel, path} => file_line "support" rel path) supports @
-                  map run_load_line loads @
-                  map (fn output => "output " ^ output) outputs @
-                  (case timeout of SOME seconds => ["option timeout=" ^ Int.toString seconds] | NONE => []) @
-                  ["run-text"]
-                val text = String.concatWith "\n" lines ^ "\n" ^ run_text
-                val spec_sha256 = HolbuildHash.string_sha256 text
-                val path = Path.concat (spec_dir, spec_sha256)
-                val _ = (ensure_dir spec_dir; write_text path text)
+        val run_text =
+          String.concatWith "\n"
+            (["holbuild-run-v1", "toolchain=" ^ action_toolchain_key, key_line] @ run_text_tail) ^ "\n"
+        val run_key = HolbuildToolchain.hash_text run_text
+        fun write () =
+          let
+            val token = spec_token name
+            (* The context's key names each script's planned hash, so the
+               file shipped must be the one planned. *)
+            fun script_line node =
+              let val line = file_line "context-script" (token (library_source_path node)) (source_file node)
               in
-                SOME {line = String.concatWith " " [name, run_key, spec_sha256],
-                      files = script :: map #path supports @ map source_file theories @ library_files @ [path]}
+                if List.nth (String.tokens Char.isSpace line, 3) =
+                   HolbuildBuildPlan.source_hash (#plan (the_plan ())) node
+                then line
+                else raise Error ("theory script changed since the build was planned: " ^ source_file node)
               end
+            val lines =
+              [run_spec_header,
+               "holbuild-version=" ^ HolbuildVersion.version,
+               "holbuild-runtime=" ^ runtime,
+               toolchain_line,
+               "run-key=" ^ run_key,
+               context_line] @
+              library_lines @ dep_lines @ lib_lines @ load_lines @ map script_line theories @
+              ["script " ^ script_sha256 ^ " " ^ Position.toString (FS.fileSize script)] @
+              map (fn {rel, path} => file_line "support" rel path) supports @
+              map run_load_line loads @
+              map (fn output => "output " ^ output) outputs @
+              (case timeout of SOME seconds => ["option timeout=" ^ Int.toString seconds] | NONE => []) @
+              ["run-text"]
+            val text = String.concatWith "\n" lines ^ "\n" ^ run_text
+            val spec_sha256 = HolbuildHash.string_sha256 text
+            val path = Path.concat (spec_dir, spec_sha256)
+            val _ = (ensure_dir spec_dir; write_text path text)
+          in
+            {spec_sha256 = spec_sha256,
+             files = script :: map #path supports @ map source_file theories @ library_files @ [path]}
+          end
+      in
+        {run = {name = name, context = String.extract (key_line, size "context=", NONE), run_key = run_key},
+         theories = theories, write = write}
       end
-    val exported = List.mapPartial export contexts
-    val _ =
-      upload_spec_files remote jobs {known = fn _ => false, learn = fn _ => ()}
-        (List.concat (map #files exported))
+    val runs = map run expanded
+    fun key_of node = HolbuildBuildPlan.input_key_for (#keys (the_plan ())) node
+    fun export wanted =
+      let
+        fun chosen ({run, ...} : {run : run, theories : HolbuildBuildPlan.node list,
+                                  write : unit -> {spec_sha256 : string, files : string list}}) =
+          List.exists (fn (r : run) => #run_key r = #run_key run) wanted
+        val runs = List.filter chosen runs
+        val theories = unique_nodes (List.concat (map #theories runs))
+        (* A theory the remote cache still lacks though the local cache
+           holds it failed to publish, which a later try may not. *)
+        val unavailable =
+          case planned of
+              NONE => []
+            | SOME {options, plan, ...} =>
+                let
+                  val unavailable =
+                    failing_on_pool remote jobs "checking remote cache" "theories"
+                      (fn remote => fn node => remote_available remote options project plan node (key_of node) true)
+                      theories
+                in
+                  case List.find (fn node => local_entry_satisfies options project plan node (key_of node))
+                                 unavailable of
+                      SOME node =>
+                        raise Error ("could not publish " ^ package node ^ ":" ^ logical_name node ^
+                                     " to the remote cache")
+                    | NONE => unavailable
+                end
+        fun is_unavailable node =
+          List.exists (fn n => HolbuildBuildPlan.key n = HolbuildBuildPlan.key node) unavailable
+        fun refuse (run : run) node =
+          let val needed = package node ^ ":" ^ logical_name node
+          in
+            HolbuildStatus.message_stderr
+              ("holbuild: run-action: " ^
+               (if needed = #name run then #name run else #name run ^ " needs " ^ needed ^ ", which") ^
+               " is not in the local or remote cache for its current inputs; build it first\n")
+          end
+        val (refused, ready) =
+          List.partition (fn {theories, ...} => List.exists is_unavailable theories) runs
+        val _ =
+          List.app (fn {run, theories, ...} => refuse run (valOf (List.find is_unavailable theories))) refused
+        val written = map (fn {run, write, ...} => (run, write ())) ready
+        val _ = upload_spec_files remote jobs {known = fn _ => false, learn = fn _ => ()}
+                    (List.concat (map (#files o #2) written))
+      in
+        {exported = map (fn (run, {spec_sha256, ...}) => (run, spec_sha256)) written,
+         refused = map #run refused}
+      end
   in
-    {lines = map #line exported, refused = !refused}
+    {remote = remote, runs = map #run runs, export = export}
   end
+
+(* run-action --export-only: exports every run of REQUEST and returns a
+   line "<context> <run_key> <spec_sha256>" for each run exported, and
+   whether a run was refused. *)
+fun export_run_specs tc project planned jobs request =
+  let
+    val {runs, export, ...} = plan_runs tc project planned jobs request
+    val {exported, refused} = export runs
+  in
+    {lines = map (fn ({name, run_key, ...} : run, spec_sha256) => String.concatWith " " [name, run_key, spec_sha256])
+                 exported,
+     refused = not (null refused)}
+  end
+
+(* Fetches a run's entry and outputs from the remote cache into
+   DIR/<package>/<theory>, as KEY (the run key), CONTEXT (the run text's
+   context= value) and the declared outputs, replacing what was there;
+   false when it can't fetch any of them. *)
+fun fetch_run remote dir outputs ({name, context, run_key} : run) =
+  case remote_run_entry remote run_key outputs of
+      NONE => false
+    | SOME (_, found) =>
+        let
+          val (package, theory) =
+            case String.fields (fn c => c = #":") name of
+                [package, theory] => (package, theory)
+              | _ => raise Error ("internal error: run context " ^ name)
+          val final = Path.concat (Path.concat (dir, package), theory)
+          val tmp = final ^ ".fetch-" ^ LargeInt.toString (SysWord.toLargeInt (Posix.Process.pidToWord (Posix.ProcEnv.getpid ())))
+          fun fetched (output, hash) =
+            HolbuildRemoteCache.fetch_blob remote {hash = hash, dst = Path.concat (tmp, output)} =
+            HolbuildCacheBackend.Hit
+          val _ = (remove_tree tmp; ensure_dir tmp)
+          val _ = if (FS.isDir tmp handle OS.SysErr _ => false) then ()
+                  else raise Error ("run-action: could not create " ^ tmp)
+        in
+          if List.all fetched found then
+            (write_text (Path.concat (tmp, "KEY")) (run_key ^ "\n");
+             write_text (Path.concat (tmp, "CONTEXT")) (context ^ "\n");
+             remove_tree final;
+             FS.rename {old = tmp, new = final};
+             true)
+          else (remove_tree tmp; false)
+        end
 
 (* holbuild exec-action: a remote worker builds one ActionSpec in a fixed
    action root under the cache root, with only the remote cache as input, and
@@ -8314,22 +8445,6 @@ fun toolchain_theory_script holdir theory =
   end
   handle OS.SysErr _ => ""
 
-(* The run's entry in the remote cache, if it has one with every output. *)
-fun remote_run_entry remote (spec : run_spec) =
-  case HolbuildRemoteCache.get_action remote (#run_key spec) of
-      NONE => NONE
-    | SOME text =>
-        let val outputs = run_manifest_outputs (#run_key spec) text
-        in
-          if sort_strings (map #1 outputs) = sort_strings (#outputs spec) then SOME (text, outputs) else NONE
-        end
-        handle Error _ => NONE
-
-fun run_already_done remote spec =
-  case remote_run_entry remote spec of
-      SOME (_, outputs) => List.all (HolbuildRemoteCache.blob_present remote o #2) outputs
-    | NONE => false
-
 (* Steps 3 to 6 for a run: hydrate the root, run the script, publish. *)
 fun exec_run remote root tc (spec : run_spec) log =
   let
@@ -8423,7 +8538,7 @@ fun exec_run remote root tc (spec : run_spec) log =
       HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsentOrSame
         {key = #run_key spec, text = manifest}
   in
-    case remote_run_entry remote spec of
+    case remote_run_entry remote (#run_key spec) (#outputs spec) of
         NONE => raise ActionFailed (PublishFailure, "the remote cache holds no entry for the run after publishing")
       | SOME (resident, _) =>
           if cache_manifest_outputs_equal (#run_key spec) manifest resident then ()
@@ -8510,7 +8625,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
       in
         (* The coordinator may have checked the cache already; a run that
            another worker finished since needs no HOL. *)
-        if run_already_done remote spec then "cached"
+        if run_already_done remote (#run_key spec) (#outputs spec) then "cached"
         else
           let
             val tc =
