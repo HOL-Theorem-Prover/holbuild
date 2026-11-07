@@ -671,9 +671,17 @@ fun build ({fingerprint, start_ns, toolchain, action_toolchain_key, graph, membe
         selected
     val expansions = BP.input_expansions plan
     val input_files = BP.input_hashes plan
-    val file_hashes =
+    val known_hashes =
       List.foldl (fn ((path, hash), map) => Binarymap.insert(map, path, hash))
         (Binarymap.mkDict String.compare) (source_files @ input_files)
+    (* The SML sources theories write, which a restore checks are unchanged. *)
+    val file_hashes =
+      List.foldl
+        (fn (path, hashes) =>
+           if Option.isSome (Binarymap.peek(hashes, path)) then hashes
+           else Binarymap.insert(hashes, path, HolbuildHash.file_sha256 path
+                                              handle _ => raise Unrecordable ("cannot read " ^ path)))
+        known_hashes (List.concat (map (BP.generated_sources plan) (BP.generated_source_owner_nodes plan)))
     val file_entries =
       map (fn (path, hash) => let val st = stamp_of path
                               in {path = path, stamp = st, racy = racy st, hash = hash} end)
@@ -916,6 +924,12 @@ fun restore {dir, graph, tc : HolbuildToolchain.t, fingerprint, start_ns} =
       case (hash_of abs, Binarymap.peek(recorded_hashes, abs)) of
           (SOME now, SOME recorded) => now = recorded
         | _ => false
+    (* The plan holds the SML sources theories write as the record found
+       them; whether those theories are up to date the caller checks. *)
+    val _ =
+      List.app
+        (fn path => if file_unchanged ("", path) then () else fall ("a generated SML source changed: " ^ path))
+        (List.concat (map (BP.generated_sources plan) (BP.generated_source_owner_nodes plan)))
     fun inputs_unchanged node =
       List.all
         (fn (_, base, decl) =>

@@ -685,8 +685,11 @@ available for diagnostics.
 A theory may write SML sources (`.sml` or `.sig`) as extra outputs, as EmitML
 code does. A plan made before the theory runs has no node for such a source, so
 when a planned theory declares one, holbuild builds the planned theories that
-declare SML outputs first and then plans again over the sources they wrote. A
-source that uses a generated structure names its theory in `deps`, so that a
+declare SML outputs first and then plans again over the sources they wrote.
+Only outputs that discovery would find count: a `.sml` or `.sig` file whose
+name and directories don't start with `.` and that isn't under `_build`, so
+SML written under a directory such as `.emit/` for another compiler doesn't.
+A source that uses a generated structure names its theory in `deps`, so that a
 fresh checkout plans the theory:
 
 ```toml
@@ -872,9 +875,12 @@ checked out at their pinned revision: there only the files planning read are
 checked, so edits to their content are still caught, but a change made by
 hand to such a checkout's directories (an added source or `holproject.toml`,
 a file replaced by a symlink) goes unnoticed. So does a build whose targets leave out a root with
-its own tactic timeout, and a project with `[[generate]]` steps or with
-theories that write SML sources, for which no record is kept; `--watch`
-always plans in full. The four newest records are kept.
+its own tactic timeout, and a project with `[[generate]]` steps, for which
+no record is kept; `--watch` always plans in full. With theories that write
+SML sources, the record keeps the plan made once they are up to date, with
+the sources they wrote, and a later build uses it only while every such
+theory is still up to date and its sources are unchanged; then it builds
+without running those theories first or planning again. The four newest records are kept.
 
 `--verbose` prints which way a build planned and why, and the timing log has
 a `plan.record` phase. `HOLBUILD_PLAN_RECORD=off` turns the record off;

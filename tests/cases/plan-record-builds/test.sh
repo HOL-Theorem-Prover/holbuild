@@ -148,14 +148,19 @@ root_tactic_timeouts() {
   expect_build "full (a root with its own tactic timeout is not selected)" "$p" "$tmpdir/root-timeout4.log" --dry-run ATheory
 }
 
-# A theory may write an SML source that another action names as an input;
-# the source exists only once that theory has run.
+# A theory may write an SML source that another action names as an input
+# or loads; the source exists only once that theory has run. The plan made
+# after it ran is recorded, and a restored plan keeps it while the theory is
+# up to date and its source unchanged.
 generated_extra_input() {
   local p=$tmpdir/generated
   make_project "$p" '
 [actions.UseTheory]
 deps = ["GenTheory"]
-extra_inputs = ["src/GenML.sml"]'
+extra_inputs = ["src/GenML.sml"]
+
+[actions.UseLib]
+deps = ["GenTheory"]'
   cat > "$p/src/GenScript.sml" <<'SML'
 open HolKernel Parse boolLib bossLib;
 val _ = new_theory "Gen";
@@ -170,9 +175,27 @@ open HolKernel Parse boolLib bossLib;
 val _ = new_theory "Use";
 val _ = export_theory();
 SML
+  echo 'structure UseLib = struct val y = GenML.x + 1 end' > "$p/src/UseLib.sml"
+  sleep 1.1
   expect_build "full (no plan record" "$p" "$tmpdir/generated1.log"
-  require_grep "plan record not written: theories write SML sources" "$tmpdir/generated1.log"
+  require_grep "plan record not written: GenTheory writes SML sources and is not up to date" "$tmpdir/generated1.log"
+  require_grep "holbuild: plan: full (theories that write SML sources ran)" "$tmpdir/generated1.log"
+  require_grep "UseLib built" "$tmpdir/generated1.log"
   require_file "$p/src/GenML.sml"
+  expect_build "from record" "$p" "$tmpdir/generated2.log"
+  require_no_grep "theories that write SML sources ran" "$tmpdir/generated2.log"
+  # An edit to the writer plans in full, runs it first, and records the
+  # plan made after it.
+  sed -i 's/x = 42/x = 43/' "$p/src/GenScript.sml"
+  expect_build "full (GenTheory writes SML sources and is not up to date)" "$p" "$tmpdir/generated3.log"
+  require_grep "holbuild: plan: full (theories that write SML sources ran)" "$tmpdir/generated3.log"
+  require_grep "x = 43" "$p/src/GenML.sml"
+  require_grep "UseLib built" "$tmpdir/generated3.log"
+  expect_build "from record" "$p" "$tmpdir/generated4.log"
+  # So does a hand edit of the written source.
+  echo 'structure GenML = struct val x = 44 end' > "$p/src/GenML.sml"
+  expect_build "full (a generated SML source changed: " "$p" "$tmpdir/generated5.log"
+  require_grep "UseLib built" "$tmpdir/generated5.log"
 }
 
 # A generator that runs for BTheory's declared input rewrites a file
