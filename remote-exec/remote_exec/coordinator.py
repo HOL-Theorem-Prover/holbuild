@@ -58,12 +58,12 @@ class Settings(BaseSettings):
     """The coordinator's configuration, from ``REMOTE_EXEC_*`` environment variables."""
 
     # hide_input_in_errors: a validation error would otherwise print every setting, credentials included.
-    model_config = SettingsConfigDict(env_prefix="REMOTE_EXEC_", hide_input_in_errors=True)
+    model_config = SettingsConfigDict(env_prefix="REMOTE_EXEC_", hide_input_in_errors=True, populate_by_name=True)
 
     database_url: str  # postgresql+asyncpg://...
     client_token: SecretStr
     worker_token: SecretStr
-    cache_url: str = Field(validation_alias=AliasChoices("cache_url", "REMOTE_EXEC_CACHE_URL", "HOLBUILD_REMOTE_CACHE_URL"))
+    cache_url: str = Field(validation_alias=AliasChoices("REMOTE_EXEC_CACHE_URL", "HOLBUILD_REMOTE_CACHE_URL"))
 
     lease_seconds: int = 120
     max_attempts: int = 3

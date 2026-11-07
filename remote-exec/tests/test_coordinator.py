@@ -1454,6 +1454,7 @@ async def test_cache_ring_does_not_retry_authorization_errors(coordinator: Coord
 def test_cache_ring_settings_accept_both_environment_names(monkeypatch: pytest.MonkeyPatch) -> None:
     from remote_exec.coordinator import Settings
 
+    monkeypatch.setenv("CACHE_URL", "http://stray.test")
     monkeypatch.delenv("REMOTE_EXEC_CACHE_URL", raising=False)
     monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_URL", "http://one.test/,http://two.test/,http://one.test")
     args = dict(database_url="unused", client_token="client", worker_token="worker")
