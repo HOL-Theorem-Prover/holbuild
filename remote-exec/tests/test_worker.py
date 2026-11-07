@@ -17,6 +17,7 @@ import pytest
 
 from remote_exec import worker
 from remote_exec.worker import (
+    CacheUnavailable,
     Coordinator,
     HostMemory,
     HostTelemetry,
@@ -291,10 +292,25 @@ def test_action_that_ends_without_a_record_is_reported_for_a_retry(
     assert server.completed == [failed_record(SPEC, "internal")]
 
 
-def test_action_whose_spec_the_cache_does_not_give_is_reported_unavailable(
+def test_action_whose_spec_an_unreachable_cache_does_not_give_is_reported_unavailable(
     tmp_path: Path, server: Server, logs: tuple[Path, Path]
 ) -> None:
-    with pytest.raises(RuntimeError, match="fetching spec"):
+    unreachable = Releases(
+        str(tmp_path / "releases"), f"file://{tmp_path}/holbuild-{{version}}.tar.gz", "http://127.0.0.1:1", None
+    )
+    with pytest.raises(CacheUnavailable, match="fetching spec"):
+        run_one(
+            Coordinator(server.url, "w"), worker_args(tmp_path, server), unreachable, Protection(None, None), claim()
+        )
+
+    assert server.completed == [failed_record(SPEC, "unavailable")]
+    assert not logs[1].exists()
+
+
+def test_action_whose_spec_the_cache_lost_is_reported_for_a_counted_retry(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path]
+) -> None:
+    with pytest.raises(RuntimeError, match="404"):
         run_one(
             Coordinator(server.url, "w"),
             worker_args(tmp_path, server),
@@ -303,7 +319,7 @@ def test_action_whose_spec_the_cache_does_not_give_is_reported_unavailable(
             claim(),
         )
 
-    assert server.completed == [failed_record(SPEC, "unavailable")]
+    assert server.completed == [failed_record(SPEC, "internal")]
     assert not logs[1].exists()
 
 

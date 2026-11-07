@@ -185,11 +185,11 @@ finally (`failed`, with a `failure` message), or the client cancels it
 
   A worker whose `exec-action` ends without a result record (it crashed or
   was killed), or whose holbuild release fails to build, reports `internal`
-  for it, so it is retried at once rather than when its lease expires. A
-  worker that can't fetch the action's spec from the cache, as while the
-  cache restarts, reports `unavailable`. After either, the worker waits
-  before it claims again, so a cache outage doesn't run it through the
-  ready actions.
+  for it, so it is retried at once rather than when its lease expires; so
+  does one whose cache doesn't have the action's spec. A worker that gets no
+  answer from the cache for the spec, or 429 or 5xx, as while the cache
+  restarts, reports `unavailable`. After either, the worker waits before it
+  claims again, so a cache outage doesn't run it through the ready actions.
 
   A retried action waits again like a child, so it runs only once the cache
   holds its parents again, or held them within the 60 s above (one may have

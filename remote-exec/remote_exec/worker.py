@@ -64,6 +64,10 @@ class Unreleased(Exception):
     """The action was exported by a holbuild version that has no release to build."""
 
 
+class CacheUnavailable(RuntimeError):
+    """The remote cache couldn't be reached or answered 429 or 5xx, as while it restarts."""
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     """Refuses redirects, which would send the worker token to wherever they point."""
 
@@ -181,7 +185,8 @@ class Releases:
     def spec_version(self, spec_sha256: str) -> str:
         """The ``holbuild-version`` of the action spec stored in the remote cache's ``/cas/``."""
         # -g: no URL globbing, whose errors print the URL with any credentials in it.
-        command = ["curl", "-fsSLg", "--retry", "3"]
+        # The status follows the body on its own line: 000 when there was no answer.
+        command = ["curl", "-fsSLg", "--retry", "3", "-w", "\n%{http_code}"]
         if self.curl_config is not None:
             command += ["-K", self.curl_config]
         command.append(f"{self.remote_cache.rstrip('/')}/cas/{spec_sha256}")
@@ -189,10 +194,16 @@ class Releases:
         try:
             fetched = subprocess.run(command, capture_output=True, text=True, timeout=120)
         except subprocess.TimeoutExpired:
-            raise RuntimeError(f"fetching spec {spec_sha256} from the remote cache timed out") from None
+            raise CacheUnavailable(f"fetching spec {spec_sha256} from the remote cache timed out") from None
+        spec, _, status = fetched.stdout.rpartition("\n")
         if fetched.returncode != 0:
-            raise RuntimeError(f"fetching spec {spec_sha256} from the remote cache failed: {fetched.stderr.strip()}")
-        spec = fetched.stdout
+            failure = f"fetching spec {spec_sha256} from the remote cache failed: {fetched.stderr.strip()}"
+            # Anything else, such as 404 for a spec the cache lost, won't come right by asking again.
+            raise (
+                CacheUnavailable(failure)
+                if status in ("000", "429") or status.startswith("5")
+                else RuntimeError(failure)
+            )
         versions = [
             line.removeprefix("holbuild-version=") for line in spec.splitlines() if line.startswith("holbuild-version=")
         ]
@@ -412,9 +423,9 @@ class HostTelemetry:
 
 def failed_record(spec_sha256: str, failure: str) -> str:
     """A result record the worker writes itself: ``spec-rejected`` for an action it won't run, which fails it
-    finally like exec-action's own; ``internal`` for one exec-action ended without a record or whose release didn't
-    build, which is retried; or ``unavailable`` for one whose spec the cache didn't give, which is retried without
-    counting the attempt."""
+    finally like exec-action's own; ``internal`` for one exec-action ended without a record, or whose spec or
+    release the worker couldn't get, which is retried; or ``unavailable`` for one whose spec the cache couldn't give
+    (no answer, 429 or 5xx), which is retried without counting the attempt."""
     return f"holbuild-action-result-v1\nspec={spec_sha256}\ninput-key=\nstatus=failed\nfailure={failure}\n"
 
 
@@ -489,9 +500,12 @@ def run_one(
     with Lease(coordinator, token, claim["lease_s"], protection).held() as lease:
         try:
             version = releases.spec_version(spec)
-        except RuntimeError:
-            # The cache didn't give the spec, as while it restarts: the action is retried without counting it.
+        except CacheUnavailable:
+            # The cache couldn't give the spec, as while it restarts: the action is retried without counting it.
             coordinator.complete(token, failed_record(spec, "unavailable"), claim["lease_s"])
+            raise
+        except RuntimeError:
+            coordinator.complete(token, failed_record(spec, "internal"), claim["lease_s"])
             raise
         try:
             holbuild = releases.holbuild(version)
