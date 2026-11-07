@@ -1,0 +1,123 @@
+structure HolbuildCacheDiscovery =
+struct
+
+exception Error of string
+
+val refresh_seconds = 30
+val stale_seconds = 60
+val mutex = Mutex.mutex ()
+val refreshing = ref false
+val attempted = ref Time.zeroTime
+val succeeded = ref Time.zeroTime
+val members : string list ref = ref []
+val scope = ref ""
+
+fun env name =
+  case OS.Process.getEnv name of SOME "" => NONE | value => value
+
+fun endpoint () = env "HOLBUILD_REMOTE_CACHE_DISCOVERY_URL"
+fun enabled () = Option.isSome (endpoint ()) andalso not (HolbuildOffline.enabled ())
+
+fun userinfo url =
+  let
+    val identity = HolbuildRemoteCacheConfig.node_identity url
+    val (scheme, _) = Substring.position "://" (Substring.full url)
+    val start = Substring.size scheme + 3
+  in String.substring (url, start, size url - size identity) end
+
+fun with_userinfo auth url =
+  if auth = "" then url
+  else
+    let val (scheme, rest) = Substring.position "://" (Substring.full url)
+    in Substring.string scheme ^ "://" ^ auth ^ Substring.string (Substring.triml 3 rest) end
+
+(* The API can select local configured identities, never supply credentials or a new credential recipient. *)
+fun parse defaults allowed text =
+  let
+    val identity = HolbuildRemoteCacheConfig.node_identity
+    val lines = String.tokens (fn c => c = #"\n" orelse c = #"\r") text
+    val urls = case lines of
+        "holbuild-cache-members-v1" :: urls => urls
+      | _ => raise Error "bad cache membership header"
+    fun resolve url =
+      if identity url <> url then raise Error "cache membership contained credentials"
+      else case List.find (fn known => identity known = url) allowed of
+          SOME known => known
+        | NONE => raise Error "cache membership contained an unconfigured endpoint"
+    val nodes = map resolve urls
+    val _ = if List.all (fn url => List.exists (fn node => identity node = identity url) nodes) defaults then ()
+            else raise Error "cache membership omitted a permanent endpoint"
+  in HolbuildRemoteCacheConfig.urls (String.concatWith "," nodes) end
+
+fun allowed defaults =
+  let
+    val auth = userinfo (hd defaults)
+    val extra = case env "HOLBUILD_REMOTE_CACHE_ALLOWED_URLS" of
+        NONE => []
+      | SOME text => map (fn url => if userinfo url = "" then with_userinfo auth url else url)
+          (HolbuildRemoteCacheConfig.urls text)
+  in HolbuildRemoteCacheConfig.urls (String.concatWith "," (defaults @ extra)) end
+
+fun config_args () =
+  case env "HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG" of
+      SOME path => ["--config", path]
+    | NONE => (case env "HOLBUILD_REMOTE_EXEC_CURL_CONFIG" of SOME path => ["--config", path] | NONE => [])
+
+fun fetch url defaults =
+  let
+    val token_file = case env "HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN" of
+        NONE => NONE
+      | SOME token =>
+          if String.exists (fn c => c = #"\r" orelse c = #"\n" orelse c = #"\"" orelse c = #"\\") token then
+            raise Error "invalid cache discovery token"
+          else
+            let
+              val path = HolbuildTempPath.temporary "cache-discovery-auth"
+              val out = TextIO.openOut path
+              val _ = TextIO.output (out, "header = \"Authorization: Bearer " ^ token ^ "\"\n")
+              val _ = TextIO.closeOut out
+            in SOME path end
+    fun remove () = case token_file of NONE => () | SOME path => OS.FileSys.remove path
+    fun get () =
+      let
+        val result = HolbuildSpawn.run {
+          program = "curl", stderr = HolbuildSpawn.Discard,
+          args = ["-q", "-fsSg", "--connect-timeout", "2", "--max-time", "5", "--max-filesize", "16384"] @
+            config_args () @ (case token_file of NONE => [] | SOME path => ["--config", path]) @ [url]}
+      in
+        if HolbuildSpawn.succeeded result then SOME (parse defaults (allowed defaults) (#output result)) else NONE
+      end
+  in (get () before remove ()) handle e => (remove (); raise e) end
+
+(* Only the refresher waits for HTTP. Other cache threads keep using the most recent complete ring. *)
+fun urls defaults =
+  if not (enabled ()) then defaults
+  else
+    let
+      val now = Time.now ()
+      val _ = Mutex.lock mutex
+      val requested_scope = String.concatWith "," defaults
+      val _ = if !scope <> requested_scope andalso not (!refreshing) then
+          (scope := requested_scope; attempted := Time.zeroTime; succeeded := Time.zeroTime; members := [])
+        else ()
+      val same_scope = !scope = requested_scope
+      val update = same_scope andalso not (!refreshing) andalso
+        Time.>= (Time.- (now, !attempted), Time.fromSeconds refresh_seconds)
+      val _ = if update then (refreshing := true; attempted := now) else ()
+      val _ = Mutex.unlock mutex
+      fun release () = (Mutex.lock mutex; refreshing := false; Mutex.unlock mutex)
+      val fetched = (if update then
+          (case endpoint () of SOME url => fetch url defaults | NONE => NONE)
+          handle Error _ => NONE | OS.SysErr _ => NONE | IO.Io _ => NONE
+        else NONE) handle e => (if update then release () else (); raise e)
+      val _ = Mutex.lock mutex
+      val _ = if update then
+          ((case fetched of SOME nodes => (members := nodes; succeeded := now) | NONE => ()); refreshing := false)
+        else ()
+      val result = if not same_scope orelse null (!members) orelse
+                     Time.>= (Time.- (now, !succeeded), Time.fromSeconds stale_seconds)
+                   then defaults else !members
+      val _ = Mutex.unlock mutex
+    in result end
+
+end

@@ -32,6 +32,8 @@ from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from remote_exec.membership import REFRESH_SECONDS, Membership
+
 DEFAULT_SOURCE_URL = "https://github.com/HOL-Theorem-Prover/holbuild/archive/refs/tags/v{version}.tar.gz"
 RELEASE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 COMPLETE = ".complete"  # stamp file of a finished release build
@@ -734,6 +736,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def refresh_cache_members(coordinator: Coordinator, membership: Membership, url: str, now: float) -> list[str]:
+    """Fetch one bounded, nonredirecting snapshot, retaining static cache access when discovery fails."""
+    if now - membership.attempted >= REFRESH_SECONDS:
+        membership.attempted = now
+        request = urllib.request.Request(url, headers={"Authorization": f"Bearer {coordinator.token}"})
+        try:
+            with coordinator.opener.open(request, timeout=5) as response:
+                data = response.read(16385)
+                if response.status != 200 or len(data) > 16384:
+                    raise ValueError("invalid cache membership response")
+                membership.update(data.decode(), now)
+        except (OSError, ValueError):
+            pass
+    return membership.current(now)
+
+
 def main() -> None:
     args = parse_args()
     token = os.environ.get("REMOTE_EXEC_WORKER_TOKEN")
@@ -760,7 +778,19 @@ def main() -> None:
     # Exit through Python on SIGTERM, so run_one's cleanup stops the running action.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
     phases = Phases()
+    discovery_url = os.environ.get("HOLBUILD_REMOTE_CACHE_DISCOVERY_URL")
+    membership = None
+    if discovery_url:
+        if discovery_url != coordinator.url + "/v1/cache/members":
+            sys.exit("cache discovery must use this worker's coordinator /v1/cache/members endpoint")
+        from remote_exec.cache import cache_nodes
+        membership = Membership(cache_nodes(args.remote_cache),
+                                cache_nodes(os.environ.get("HOLBUILD_REMOTE_CACHE_ALLOWED_URLS", args.remote_cache)))
+        # The SML child's curl config is created in holbuild's private temporary directory.
+        os.environ["HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN"] = token
     while True:
+        if membership is not None and discovery_url is not None:
+            releases.remote_cache = ",".join(refresh_cache_members(coordinator, membership, discovery_url, time.monotonic()))
         if args.cooperate_dir is not None:
             with phases.timed("memory_wait"):
                 waited = wait_for_memory(args.cooperate_dir, charge)

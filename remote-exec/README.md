@@ -473,3 +473,78 @@ The tests need a Postgres role that may create databases:
 ```bash
 REMOTE_EXEC_TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost/postgres uv run pytest
 ```
+
+## Temporary cache members
+
+The coordinator can keep a stable permanent cache ring while adding temporary
+members with worker demand. `GET /v1/cache/members` accepts either the client
+or worker bearer token and returns `text/plain`:
+
+```text
+holbuild-cache-members-v1
+https://cache-a.example
+https://cache-b.example
+https://cache-c.example
+```
+
+The permanent configured URLs are always present. The API carries canonical
+identities without credentials. A temporary member appears only after its
+adapter has verified DNS, TLS and authenticated CAS write/read readiness.
+`GET /v1/cache/slots` (client token) lists each assigned slot, owner, lifecycle
+phase and last operation error; it omits provider operation tokens.
+
+Clients refresh membership every 30 seconds when the deployment sets
+`HOLBUILD_REMOTE_CACHE_DISCOVERY_URL`. Set `HOLBUILD_REMOTE_CACHE_ALLOWED_URLS`
+to the comma-separated identities allowed to receive the cache credential,
+including the permanent pair and every reserved temporary identity. Discovery
+can only select from that list. A response containing credentials, an unknown
+endpoint or an omitted permanent member is rejected. Existing inline cache
+credentials and `HOLBUILD_REMOTE_CACHE_CURL_CONFIG` continue to authenticate
+cache requests. Discovery uses `HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG`
+(or `HOLBUILD_REMOTE_EXEC_CURL_CONFIG`), a curl config holding the coordinator
+bearer header; workers supply their existing token privately to the child.
+Discovery never follows redirects. If it fails, the last complete ring remains
+usable for 60 seconds, after which requests use the permanent configuration.
+
+### Capacity adapter
+
+`REMOTE_EXEC_CACHE_POOL_CMD` is a deployment-owned executable, not a shell
+snippet. The coordinator sends one JSON request on stdin, reads one JSON
+response from stdout, and limits each invocation to 20 seconds. Keep cloud
+SDKs and permissions in the deployment layer. The adapter protocol's typed
+request and response are `AdapterRequest` and `AdapterResponse` in
+`remote_exec/cache_pool.py`. Long operations return a token and are polled;
+commands must be idempotent across retries and coordinator crashes. Opaque
+provider ownership data is persisted separately from operation tokens, before
+any DNS publication.
+
+Configure one to four `REMOTE_EXEC_CACHE_SLOTS` as a JSON list of
+`{"name":"slot-c","url":"https://cache-c.example"}`. The existing Postgres
+database stores ownership; a dedicated advisory lock elects one controller,
+without holding a database transaction open during provider calls. The
+controller keeps reconciling and heartbeating hooks when capacity is disabled,
+so disabling scale-out can still drain existing instances.
+
+`REMOTE_EXEC_CACHE_WORKERS_PER_NODE` maps the existing held burst-worker target
+to cache capacity by ceiling division, capped at the number of slots. Zero
+(the default) requests no temporary capacity. Choose and validate the ratio
+with deployment load before enabling it. Provider CPU scale-out recommendations
+are combined with the worker floor by the same capacity writer and held for
+`REMOTE_EXEC_SCALE_DOWN_HOLD_S`; they cannot lower the worker target.
+
+A retiring member leaves discovery, then its ingress stops gracefully. The
+adapter records when ingress actually finished stopping. Only after at least
+`REMOTE_EXEC_CACHE_DRAIN_SECONDS` (minimum and default 60) may the controller
+ask for durability verification. It stops the backend, withdraws only that
+owner's DNS, and completes termination only after positive durability proof.
+A timer alone is insufficient. Failed operations retain the slot and hook and
+are reported through the slot endpoint and coordinator logs. A finite provider
+hook timeout or a host crash remains a failure boundary, not a successful
+drain. Slot reuse waits for authoritative termination confirmation and DNS
+cleanup; missing inventory alone is not confirmation.
+
+Deploy the discovery-capable release to clients and every worker-selected
+release before enabling capacity. Exercise concurrent claims, failed boots,
+failed drains, stale readers, DNS ownership and a real scale-out/scale-in cycle
+in the deployment environment. Rollback requests zero temporary capacity and
+uses the same drain path while retaining the permanent ring and registry.
