@@ -946,7 +946,6 @@ in_copy stale-build-client --remote-cache "$remote_url" build --remote-exec "$co
 require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/stale-build-again.log"
 require_grep "PTheory restored from cache" "$tmpdir/stale-build-again.log"
 
-
 # The client cap must reach the HOL child, before Poly/ML consumes --maxheap.
 copy_nondet heap-cap rxheap
 cat > "$tmpdir/heap-cap/src/HeapScript.sml" <<'SML'
@@ -963,4 +962,6 @@ SML
 in_copy heap-cap --max-heap 4096 --remote-cache "$remote_url" build \
   --remote-exec "$coordinator" --remote-only HeapTheory > "$tmpdir/heap-cap.log" 2>&1 ||
   { cat "$tmpdir/heap-cap.log" "$tmpdir/worker.log" >&2; exit 1; }
-require_grep '^heap-child-argv: .*/bin/hol .*--maxheap 4096 run ' "$tmpdir/worker.log"
+heap_key=$(awk '$1 == "action" && $5 == "rxheap:HeapTheory" { print $2 }' "$state/"*.batch)
+heap_log=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$state/result-$heap_key")
+require_grep '^heap-child-argv: .*/bin/hol .*--maxheap 4096 run ' "$remote_root/cas/$heap_log"
