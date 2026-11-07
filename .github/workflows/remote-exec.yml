@@ -67,6 +67,12 @@ jobs:
           done
           docker logs coordinator
           exit 1
+      - name: Check the provers run
+        run: |
+          for prover in eprover vampire zipperposition z3 cvc5; do
+            docker run --rm holbuild-remote-exec "$prover" --version
+          done
+          docker run --rm holbuild-remote-exec sh -c 'test "$HOL4_Z3_EXECUTABLE" = /opt/provers/bin/z3 && test -x "$HOL4_CVC_EXECUTABLE"'
       - name: Check that orphaned processes are reaped
         run: |
           docker run --rm holbuild-remote-exec python3 -c '

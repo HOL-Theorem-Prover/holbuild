@@ -274,6 +274,7 @@ def test_action_runs_without_the_worker_token(
     monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
     monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_CURL_CONFIG", str(tmp_path / "cache.curl"))
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.test:3128")
+    monkeypatch.setenv("HOL4_Z3_EXECUTABLE", "/opt/provers/bin/z3")
 
     run_one(
         Coordinator(server.url, "w"),
@@ -290,6 +291,7 @@ def test_action_runs_without_the_worker_token(
     assert env["HTTPS_PROXY"] == "http://proxy.test:3128"
     assert env["HOLBUILD_CACHE"] == str(tmp_path / "cache")
     assert env["HOLBUILD_REMOTE_CACHE_CURL_CONFIG"] == str(tmp_path / "cache.curl")
+    assert env["HOL4_Z3_EXECUTABLE"] == "/opt/provers/bin/z3"
     assert env["PATH"]
 
 

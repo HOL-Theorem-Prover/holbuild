@@ -30,8 +30,10 @@ a container image with both.
 ## Running
 
 The image (`docker build -t holbuild-remote-exec remote-exec`, on amd64 or
-arm64) has Python with the coordinator's pinned dependencies, Poly/ML, and
-what building holbuild and HOL takes. Its entrypoint takes `migrate`,
+arm64) has Python with the coordinator's pinned dependencies, Poly/ML, what
+building holbuild and HOL takes, and the provers HOL's hammer and HolSmt call
+(E, Vampire, Zipperposition, z3 and cvc5, pinned in `provers.sh`, on `PATH`
+and in the `HOL4_*` variables the builds get). Its entrypoint takes `migrate`,
 `coordinator` or `worker`:
 
 ```bash
@@ -95,11 +97,11 @@ its user, so the credentials can come from the environment. `HOLBUILD_CACHE`
 is `/var/cache/holbuild` in the image. It must be the worker's own cache root:
 `exec-action --cache-limit-gb` sweeps the whole root before each action, so a
 root shared with ordinary builds would lose their cache. `exec-action` runs
-with only the worker's `HOLBUILD_*` variables, `PATH`, `HOME`, `TMPDIR`, the
-locale, and curl's certificate and proxy settings, so the worker token stays
-out of the builds' environment (and out of what they log or pass on). A
-build runs as the worker's user, so one that goes looking can still read the
-token from the worker's `/proc/<pid>/environ`. Outside the image,
+with only the worker's `HOLBUILD_*` and `HOL4_*` variables, `PATH`, `HOME`,
+`TMPDIR`, the locale, and curl's certificate and proxy settings, so the worker
+token stays out of the builds' environment (and out of what they log or pass
+on). A build runs as the worker's user, so one that goes looking can still
+read the token from the worker's `/proc/<pid>/environ`. Outside the image,
 `python3 -m remote_exec.worker` runs the worker; it uses only the standard
 library and `curl`. High-tier workers run with a larger `--max-heap` on bigger
 machines; `--also-claim standard` lets them take standard-tier work when no

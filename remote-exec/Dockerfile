@@ -17,14 +17,26 @@ RUN git clone -b "$POLYML_TAG" --depth 1 "$POLYML_REPO" /src/polyml \
  && make -j"$(nproc)" \
  && make install
 
+FROM ${PYTHON_IMAGE} AS provers
+# The automated provers the hammer and HolSmt call, at the releases provers.sh pins.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl unzip \
+ && rm -rf /var/lib/apt/lists/*
+COPY provers.sh /provers.sh
+RUN /provers.sh
+
 FROM ${PYTHON_IMAGE}
 # A C toolchain and GMP for polyc, which builds holbuild and HOL; git, curl and zstd for holbuild itself.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends build-essential ca-certificates curl git libgmp-dev tini zstd \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=polyml /opt/polyml /opt/polyml
+COPY --from=provers /opt/provers /opt/provers
 COPY --from=ghcr.io/astral-sh/uv:0.13.4 /uv /usr/local/bin/uv
-ENV PATH=/opt/remote-exec/.venv/bin:/opt/polyml/bin:$PATH \
+# The hammer finds its provers on PATH; HolSmt reads its own variables. The worker passes PATH and HOL4_* to the builds.
+ENV PATH=/opt/remote-exec/.venv/bin:/opt/polyml/bin:/opt/provers/bin:$PATH \
+    HOL4_Z3_EXECUTABLE=/opt/provers/bin/z3 \
+    HOL4_CVC_EXECUTABLE=/opt/provers/bin/cvc5 \
     HOLBUILD_CACHE=/var/cache/holbuild \
     UV_PYTHON_DOWNLOADS=never
 

@@ -38,8 +38,9 @@ COMPLETE = ".complete"  # stamp file of a finished release build
 # ECS task scale-in protection lasts this long unless a heartbeat renews it, so a dead worker loses it.
 PROTECTION_MINUTES = 10
 CLAIM_RETRY_SECONDS = 5  # least time between two claims that found nothing
-# What exec-action runs with besides holbuild's own HOLBUILD_* settings: what curl, git and the locale read. The rest
-# of the worker's environment, its coordinator token above all, stays out of the builds' environment.
+# What exec-action runs with besides holbuild's own HOLBUILD_* settings and HOL's HOL4_* ones (where HolSmt finds its
+# solvers): what curl, git and the locale read. The rest of the worker's environment, its coordinator token above all,
+# stays out of the builds' environment.
 EXEC_ACTION_ENV = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR")
 PROXY_ENV = ("http_proxy", "https_proxy", "all_proxy", "no_proxy")  # in either case
 # holbuild's --cooperate-dir admission, as in sml/machine_memory.sml: the --child-charge default caps a child's charge
@@ -517,7 +518,7 @@ def exec_action_env() -> dict[str, str]:
     return {
         name: value
         for name, value in os.environ.items()
-        if name in EXEC_ACTION_ENV or name.lower() in PROXY_ENV or name.startswith("HOLBUILD_")
+        if name in EXEC_ACTION_ENV or name.lower() in PROXY_ENV or name.startswith(("HOLBUILD_", "HOL4_"))
     }
 
 
