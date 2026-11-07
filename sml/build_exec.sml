@@ -5986,7 +5986,10 @@ fun restore_remote_build_logs (options : build_options) tc project plan toolchai
       end
     (* Check all required logs before printing any trace: a missing one may
        send the whole build back to local execution. *)
-    val restored = List.mapPartial restore (HolbuildBuildPlan.selected_nodes plan)
+    val theories = List.filter
+      (fn node => #kind (HolbuildBuildPlan.source_of node) = HolbuildSourceIndex.TheoryScript)
+      (HolbuildBuildPlan.selected_nodes plan)
+    val restored = List.mapPartial restore theories
     fun report (node, traced, path) =
       if not traced then ()
       else

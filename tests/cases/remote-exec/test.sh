@@ -959,8 +959,12 @@ name = "rxf"
 members = ["src"]
 TOML
 write_theories forced-traced
+cat > "$project/src/helperLib.sml" <<'SML'
+structure helperLib = struct val verdict = "remote execution verdict: PASS\n" end
+SML
+sed -i '/^Ancestors A$/a Libs helperLib' "$project/src/BScript.sml"
 cat >> "$project/src/BScript.sml" <<'SML'
-val _ = print "remote execution verdict: PASS\n"
+val _ = print helperLib.verdict
 SML
 run force-seed 0 build --remote-exec "$coordinator" --remote-only BTheory
 : > "$state/results"
