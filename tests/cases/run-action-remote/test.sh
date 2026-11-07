@@ -186,12 +186,17 @@ run fetch-missing 0 --fetch-only --script "$runner/other.sml" rr:CTheory
 line fetch-missing rr:CTheory missing > /dev/null
 [[ $(posts) == "$before" ]]
 
-# Outputs that can't be written are an error, not a missing run.
-touch "$tmpdir/a-file"
+# Outputs that can't be written are an error, not a missing run; every
+# target still gets its line.
 saved_out=$out
-out=$tmpdir/a-file
-run unwritable 1 --fetch-only --script "$runner/run.sml" rr:CTheory
+out=$tmpdir/unwritable-out
+mkdir -p "$out"
+touch "$out/rr"
+run unwritable 1 --fetch-only --script "$runner/run.sml" hol:bool rr:CTheory
 require_grep 'could not create' "$tmpdir/unwritable.err"
+line unwritable HOL:boolTheory cached > /dev/null
+line unwritable rr:CTheory missing > /dev/null
+[[ $(< "$out/HOL/boolTheory/first") == HOL:boolTheory ]]
 out=$saved_out
 
 # One run of a batch fails its script: the other is done all the same, and

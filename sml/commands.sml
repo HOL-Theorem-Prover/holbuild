@@ -1524,10 +1524,16 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         val to_fetch = List.mapPartial (fn (run, status) =>
                                            if status = "done" orelse status = "cached" then SOME run else NONE)
                                        ended
+        (* A fetch that raises (an output directory it can't write, say)
+           counts as not fetched; its error is raised once every line is out. *)
+        val fetches = map (fn run => (run, ref NONE)) to_fetch
         val not_fetched =
-          HolbuildBuildExec.failing_on_pool remote jobs "fetching from remote cache" "runs"
-            (fn remote => fn run => HolbuildBuildExec.fetch_run remote outputs_dir outputs run)
-            to_fetch
+          map #1 (HolbuildBuildExec.failing_on_pool remote jobs "fetching from remote cache" "runs"
+                    (fn remote => fn (run, error) =>
+                        HolbuildBuildExec.fetch_run remote outputs_dir outputs run
+                        handle e => (error := SOME e; false))
+                    fetches)
+        val fetch_error = List.find Option.isSome (map (! o #2) fetches)
         (* Without --fetch-only every run listed ended, so one that didn't
            fetch was lost on the way, which a later try may not lose. *)
         val _ =
@@ -1542,6 +1548,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                      print (String.concatWith " "
                               [name, run_key, if has (map #run_key not_fetched) run then "missing" else status] ^ "\n"))
                  ended;
+        (case fetch_error of SOME (SOME e) => raise e | _ => ());
         case !stopped of
             SOME (reason, true) =>
               (HolbuildHolSharedCache.local_build_needed := true;
