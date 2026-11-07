@@ -91,9 +91,11 @@ fun write_text path text =
 
 (* Submits a batch; Ok carries its id.  A 502, 503 or 504 answer, as from a
    proxy while the coordinator restarts, is retried after each of
-   retry_delays_seconds.  Other errors aren't: a 500 may come after the
-   coordinator stored the batch, and a retry would store it again.  An
-   unreachable coordinator is refused at once. *)
+   retry_delays_seconds; other errors, a coordinator's own 500 among them,
+   aren't, and an unreachable coordinator is refused at once.  A gateway
+   error that comes after the coordinator stored the batch (it was stopped
+   between storing and answering) leaves a copy that nobody follows: it runs
+   to its end or deadline, repeating work whose results the cache dedupes. *)
 fun submit url batch_text : attempt =
   let
     val body = HolbuildTempPath.temporary "remote-exec-batch"

@@ -511,5 +511,7 @@ echo 10 > "$state/unavailable"
 run unavailable-detach 1 build --remote-exec "$coordinator" --remote-only --detach BTheory
 [[ $(grep -c "coordinator refused the batch (HTTP 502): .*restarting.*; retrying" "$tmpdir/unavailable-detach.log") -eq 4 ]] ||
   { cat "$tmpdir/unavailable-detach.log" >&2; exit 1; }
-require_grep "coordinator refused the batch (HTTP 502): .*restarting.*$" "$tmpdir/unavailable-detach.log"
+# The four retries, then the refusal that ends it.
+[[ $(grep -c "coordinator refused the batch (HTTP 502)" "$tmpdir/unavailable-detach.log") -eq 5 ]] ||
+  { cat "$tmpdir/unavailable-detach.log" >&2; exit 1; }
 rm "$state/unavailable"
