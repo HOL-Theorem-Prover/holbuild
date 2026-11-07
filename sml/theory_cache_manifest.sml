@@ -149,6 +149,57 @@ fun cache_manifest_blobs_from_lines input_key lines =
     end
   end
 
+(* A run's entry (kind=run): its declared outputs, as blob output:<name>
+   lines, and the context theory's input key as its parent, if it has one.
+   Theory consumers read only kind=theory, so they reject it. *)
+fun is_run_manifest text = List.exists (fn line => line = "kind=run") (cache_manifest_lines text)
+
+fun run_manifest_text {input_key, parent, outputs} =
+  String.concatWith "\n"
+    (["holbuild-cache-action-v4", "input_key=" ^ input_key, "kind=run"] @
+     (case parent of SOME key => ["parent " ^ key] | NONE => []) @
+     map (fn (name, hash) => "blob output:" ^ name ^ " " ^ hash) outputs) ^ "\n"
+
+(* The (name, sha256) outputs of a run's entry, in its order. *)
+fun run_manifest_outputs input_key text =
+  let
+    fun line (text, (saw_header, saw_input, saw_kind, parents, outputs)) =
+      if text = "holbuild-cache-action-v4" then
+        if saw_header then raise Error "cache manifest duplicate header"
+        else (true, saw_input, saw_kind, parents, outputs)
+      else if text = "input_key=" ^ input_key then
+        if saw_input then raise Error "cache manifest duplicate input key"
+        else (saw_header, true, saw_kind, parents, outputs)
+      else if String.isPrefix "input_key=" text then raise Error "cache manifest input key mismatch"
+      else if text = "kind=run" then
+        if saw_kind then raise Error "cache manifest duplicate kind"
+        else (saw_header, saw_input, true, parents, outputs)
+      else if String.isPrefix "kind=" text then raise Error "cache manifest is not a run's"
+      else
+        case String.tokens Char.isSpace text of
+            ["parent", key] =>
+              if parents = 0 then (saw_header, saw_input, saw_kind, 1, outputs)
+              else raise Error "cache manifest has more than one parent"
+          | ["blob", role, hash] =>
+              if String.isPrefix "output:" role andalso size role > size "output:" then
+                let val name = String.extract (role, size "output:", NONE)
+                in
+                  if List.exists (fn (n, _) => n = name) outputs then
+                    raise Error ("cache manifest duplicate blob role: " ^ role)
+                  else (saw_header, saw_input, saw_kind, parents, (name, require_sha256 role hash) :: outputs)
+                end
+              else raise Error ("cache manifest unknown blob role: " ^ role)
+          | _ => raise Error ("cache manifest unknown line: " ^ text)
+    val (saw_header, saw_input, saw_kind, _, outputs) =
+      List.foldl line (false, false, false, 0, []) (cache_manifest_lines text)
+  in
+    if not saw_header then raise Error "cache manifest missing header"
+    else if not saw_input then raise Error "cache manifest missing input key"
+    else if not saw_kind then raise Error "cache manifest missing kind"
+    else if null outputs then raise Error "cache manifest has no outputs"
+    else rev outputs
+  end
+
 fun explicit_cache_manifest_proof_timeouts lines =
   List.mapPartial
     (fn line =>
