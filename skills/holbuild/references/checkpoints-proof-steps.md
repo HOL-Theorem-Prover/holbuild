@@ -55,6 +55,10 @@ Replay eligibility requires exact metadata match. Invalid selected checkpoints a
 
 Runs theorem proofs through proof steps without saving `.save`/`.ok` files. No `deps_loaded`, theorem-context, end-of-proof, or failed-prefix checkpoints are created.
 
+## Host deps heaps
+
+Every `deps_loaded.save` is also kept once per host in `$HOLBUILD_CACHE/checkpoint-store/`, keyed without the project directory, so worktrees of one project share it by hard link. A theory with no valid `deps_loaded` resumes from the stored one; a stored heap with the wrong parent is ignored, and one HOL can't resume from is replaced. `holbuild gc` evicts stored heaps unused within the retention window.
+
 ## `--skip-proof-steps`
 
 Opts out of proof-step execution. Source is sent through the plain `hol run` path. There is no per-tactic timeout, trace-step trace, theorem-context/end-of-proof/failed-prefix proof navigation, or instrumented goal diagnostics. The `deps_loaded` checkpoint may still be used when checkpoints are enabled.

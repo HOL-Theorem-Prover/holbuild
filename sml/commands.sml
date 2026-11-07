@@ -2481,7 +2481,9 @@ fun run_project_gc (days, max_checkpoints_gb_option) =
 fun gc args =
   let
     val (days, max_checkpoints_gb, scope) = parse_gc_args args
-    fun cache_gc () = HolbuildCache.gc_root (HolbuildCache.cache_root ()) days
+    fun cache_gc () =
+      (HolbuildCache.gc_root (HolbuildCache.cache_root ()) days;
+       HolbuildBuildExec.gc_checkpoint_store days)
   in
     case scope of
         GcProjectAndCache => (run_project_gc (days, max_checkpoints_gb); cache_gc ())

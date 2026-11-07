@@ -4336,16 +4336,132 @@ fun build_theory_action cache_allowed policy tc root checkpoint_root base_contex
     generated_metadata
   end
 
+(* The host's deps heaps.  A theory's deps_loaded state is a child of the
+   toolchain's base state with its dependencies loaded: it depends on its
+   dependencies' input keys and their theories' .dat files (a theory build
+   need not be reproducible), its loads (by root-relative path), the toolchain and
+   the holbuild runtime, but not on the project root, so one copy in the host
+   store, CACHE/checkpoint-store/<key>/deps_loaded.save, serves every
+   worktree of a project, hard-linked into each.  (The deps key won't do: it
+   hashes the dependencies' load manifests, which name their files by
+   absolute path.)  Anything wrong with a stored heap falls back to loading
+   the dependencies afresh, as without the store. *)
+fun local_heap_context dat_hash_cache toolchain_key plan keys node =
+  let
+    fun is_theory dep = #kind (HolbuildBuildPlan.source_of dep) = HolbuildSourceIndex.TheoryScript
+    fun line dep =
+      Option.map (fn hash => HolbuildBuildPlan.key dep ^ " " ^ hash)
+                 (cached_file_hash dat_hash_cache (#data_path (theory_outputs dep)))
+    val lines = map line (List.filter is_theory (HolbuildBuildPlan.transitive_project_deps plan node))
+  in
+    if List.all Option.isSome lines then
+      SOME (String.concatWith "\n"
+              (("inputs " ^ dependency_input_context_key toolchain_key plan keys node) :: map valOf lines))
+    else NONE
+  end
+
+fun local_heap_key tc heap_context (action : theory_action) =
+  let
+    fun load_line (LoadTheory name) = "theory " ^ name
+      | load_line (LoadLibrary name) = "library " ^ name
+      | load_line (LoadObject stem) = "object " ^ stem
+  in
+    HolbuildHash.string_sha256
+      (String.concatWith "\n"
+         ["holbuild-local-heap-v1",
+          "deps=" ^ HolbuildHash.string_sha256 heap_context,
+          "loads=" ^ HolbuildHash.string_sha256 (String.concatWith "\n" (map load_line (#loads action)) ^ "\n"),
+          "toolchain-exact=" ^ HolbuildToolchain.toolchain_key tc,
+          "holdir=" ^ FS.fullPath (#holdir tc),
+          "runtime=" ^ runtime_identity ()] ^ "\n")
+  end
+
+fun local_heap_location tc heap_context action =
+  let
+    val store = share_store (HolbuildCache.cache_root ())
+    val heap = local_heap_key tc heap_context action
+  in
+    {store = store, heap = heap, stored = store_path store heap "deps_loaded.save"}
+  end
+
+fun same_file a b =
+  let val (sa, sb) = (Posix.FileSys.stat a, Posix.FileSys.stat b)
+  in Posix.FileSys.ST.dev sa = Posix.FileSys.ST.dev sb andalso Posix.FileSys.ST.ino sa = Posix.FileSys.ST.ino sb end
+  handle OS.SysErr _ => false
+
+(* Links a valid deps_loaded into the store: if the store has none, or, with
+   `replace`, a different one, as after a build this heap served. *)
+fun store_local_heap replace tc heap_context (action : theory_action) deps_loaded =
+  (if not (deps_checkpoint_exists deps_loaded (#deps_key action)) then ()
+   else
+     let val {store, heap, stored} = local_heap_location tc heap_context action
+     in
+       lease_store_family store heap;
+       if file_exists stored andalso (not replace orelse same_file stored deps_loaded) then
+         touch_dir (Path.concat(store, heap))
+       else
+         let val tmp = store_temp stored
+         in
+           (ensure_parent tmp; link_or_copy_file deps_loaded tmp; FS.rename {old = tmp, new = stored})
+           handle e => (remove_file tmp; raise e)
+         end
+     end)
+  handle e => warn ("could not add a deps heap to the host store: " ^ General.exnMessage e)
+
+(* Before a theory runs: a missing deps_loaded comes from the store, if it
+   holds one whose parent is this build's base state; one the theory has is
+   added to the store. *)
+fun restore_local_heap tc heap_context base_context checkpoint_root (action : theory_action) =
+  let
+    val base = action_checkpoint_base checkpoint_root action
+    val deps_key = #deps_key action
+    val deps_loaded = deps_loaded_path base deps_key
+    val {store, heap, stored} = local_heap_location tc heap_context action
+    fun parent_ok () =
+      case saved_parent deps_loaded of
+          SOME parent =>
+            (FS.fullPath parent = FS.fullPath (hol_context_path base_context) handle OS.SysErr _ => false)
+        | NONE => false
+  in
+    if deps_checkpoint_exists deps_loaded deps_key then store_local_heap false tc heap_context action deps_loaded
+    else if not (file_exists stored) then ()
+    else
+      ((* Checkpoints on an earlier deps_loaded aren't children of this one. *)
+       remove_deps_checkpoint_descendants base deps_key;
+       lease_store_family store heap;
+       ensure_parent deps_loaded;
+       place_state stored deps_loaded;
+       if parent_ok () then
+         (write_text (checkpoint_ok_path deps_loaded) (deps_checkpoint_ok_text deps_key);
+          touch_dir (Path.concat(store, heap)))
+       else remove_checkpoint deps_loaded)
+      handle e =>
+        (remove_checkpoint deps_loaded;
+         warn ("could not restore a deps heap from the host store: " ^ General.exnMessage e))
+  end
+
 (* Builds a theory from its source in the project: runs its theory action with
    the project's artifact root as action root, then puts the extra outputs in
    the source tree and writes the theory's local load manifests. *)
-fun build_theory cache_allowed policy tc project base_context plan keys toolchain_key node =
+fun build_theory dat_hash_cache cache_allowed policy tc project base_context plan keys toolchain_key node =
   let
     val root = project_artifact_root project
     val action = theory_action root plan keys toolchain_key
                    (dependency_context_key toolchain_key plan keys node) node
+    val checkpoint_root = default_checkpoint_root root
+    val heap_context =
+      if checkpoint_enabled policy then local_heap_context dat_hash_cache toolchain_key plan keys node
+      else NONE
+    val _ =
+      Option.app (fn heap_context => restore_local_heap tc heap_context base_context checkpoint_root action)
+                 heap_context
     val generated_metadata =
-      build_theory_action cache_allowed policy tc root (default_checkpoint_root root) base_context action
+      build_theory_action cache_allowed policy tc root checkpoint_root base_context action
+    val _ =
+      Option.app (fn heap_context =>
+                     store_local_heap true tc heap_context action
+                       (deps_loaded_path (action_checkpoint_base checkpoint_root action) (#deps_key action)))
+                 heap_context
     val stage = action_stage root action
     val extra_output_paths = source_extra_output_paths plan node
   in
@@ -4463,7 +4579,7 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
         (HolbuildHolSharedCache.local_build_needed := true;
          raise Error (logical_name node ^ " is not in the remote cache, and --remote-only builds nothing locally"))
       else
-      (build_theory cache_allowed policy tc project base_context plan keys toolchain_key node;
+      (build_theory dat_hash_cache cache_allowed policy tc project base_context plan keys toolchain_key node;
        invalidate_node_dat_hash ();
        write_metadata (#emit_output_hashes options) policy (tactic_timeout policy) project plan keys input_key toolchain_key node metadata_checkpoints;
        HolbuildStatus.Built)
@@ -6741,6 +6857,22 @@ fun store_cache_families cache =
            end})
     (List.filter (fn path => FS.isDir path handle OS.SysErr _ => false)
                  (HolbuildCache.children (share_store cache)))
+
+(* holbuild gc: the store's families no build used within DAYS, except one
+   a running process leases. *)
+fun gc_checkpoint_store days =
+  let
+    val cutoff = retention_cutoff days
+    val removed =
+      List.foldl
+        (fn ({mtime, evict}, n) =>
+            if Time.<(mtime, cutoff) andalso Option.isSome (evict ()) then n + 1 else n)
+        0 (store_cache_families (HolbuildCache.cache_root ()))
+  in
+    (* stderr: gc's stdout is its one summary line. *)
+    if removed = 0 then ()
+    else TextIO.output (TextIO.stdErr, "checkpoint store gc: removed families=" ^ Int.toString removed ^ "\n")
+  end
 
 (* Factory modules have no on-disk module parents.  Once loaded their code
    is resident, so concurrent eviction only makes a later load use source. *)

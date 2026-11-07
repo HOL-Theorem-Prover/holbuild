@@ -867,6 +867,19 @@ holbuild build --skip-checkpoints MyTheory
 - `--skip-proof-steps` opts out of proof-step execution.
 - `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation.
 
+A theory's `deps_loaded` checkpoint, its dependencies loaded into the
+toolchain's base state, is also kept once per host in
+`$HOLBUILD_CACHE/checkpoint-store/`, keyed by the dependencies' input keys
+and their theories' `.dat` files, the theory's loads (by path relative to the project), the toolchain and the
+holbuild runtime. The project's directory isn't part of the key, so every
+worktree or copy of a project that uses the cache shares one heap per
+dependency set: a theory with no valid `deps_loaded` hard-links the stored
+one (a copy across file systems) and resumes from it, and one it saves is
+linked into the store. A stored heap whose parent isn't the build's base
+state is ignored, and one HOL can't resume from is discarded and replaced by
+the build's fresh heap. `holbuild gc` removes stored heaps no build used
+within the retention window.
+
 For source-executed theory builds, holbuild writes a live child log at
 `.holbuild/logs/current/<package>/<logical>/build.log`. You can inspect it during
 a long build with `tail -f`; after the child exits, the same path is kept as the
