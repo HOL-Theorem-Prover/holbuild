@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import os
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -121,15 +122,21 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             # Each poll reads only the actions written since the last one, maybe some again, so `seen` drops repeats.
             seen: dict[str, ActionStatus] = {}
             changed: tuple[BatchStatus, int] | None = first
+            last_line = time.monotonic()
             while changed is not None:
                 batch, since = changed
                 for action in batch.actions:
                     if seen.get(action.input_key) != action:
                         seen[action.input_key] = action
                         yield json.dumps({"type": "action", **asdict(action)}) + "\n"
+                        last_line = time.monotonic()
                 if batch.state != "running":
                     yield json.dumps({"type": "batch", "state": batch.state, "failure": batch.failure}) + "\n"
                     return
+                # A blank line, which clients skip, keeps a proxy from closing a quiet stream as idle.
+                if time.monotonic() - last_line >= settings.events_keepalive_seconds:
+                    yield "\n"
+                    last_line = time.monotonic()
                 await asyncio.sleep(settings.events_poll_seconds)
                 changed = await coordinator.changes(batch_id, since)
 

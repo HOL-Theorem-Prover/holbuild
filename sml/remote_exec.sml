@@ -30,7 +30,7 @@ val connect_timeout_seconds = 10
 val request_max_time_seconds = 60
 (* Waits before each retry of a request the coordinator couldn't answer (a
    submission a proxy answered 502-504, an event stream that broke without
-   delivering an event): doubling up to 8 seconds, about two and a half
+   delivering a state change): doubling up to 8 seconds, about two and a half
    minutes in all, long enough to ride out a coordinator restart such as an
    image upgrade.  Tests shorten them with HOLBUILD_TEST_RETRY_DELAYS,
    comma-separated seconds. *)
@@ -181,9 +181,13 @@ fun report_action line =
    action whose state changes, and passing on_done the input key of each
    action that becomes done.  A stream that breaks (the connection drops,
    or the coordinator answers 5xx while it restarts) is reattached: after a
-   second when it delivered events, since a proxy may close an idle stream,
-   and after each of retry_delays_seconds in a row when it delivered none.
-   The coordinator ends a batch at its deadline, so this ends too.  A failed
+   second when it delivered a state change, and after each of
+   retry_delays_seconds in a row when it delivered none.  Every stream
+   starts with the states of all the batch's actions, so a state seen
+   before is no change, and a stream that only repeats them before it
+   breaks counts against the retries.  The coordinator writes a blank line
+   on a quiet stream, so a proxy doesn't close a healthy one for being
+   idle.  The coordinator ends a batch at its deadline, so this ends too.  A failed
    batch comes with the action whose proof failed, when one did. *)
 fun follow url batch_id (on_done : string -> unit) : outcome * progress =
   let
@@ -192,14 +196,13 @@ fun follow url batch_id (on_done : string -> unit) : outcome * progress =
     (* A line cut off by a dropped connection, perhaps with curl's error
        after it, is no event. *)
     fun complete line = Substring.isSuffix "}" (Substring.dropr Char.isSpace (Substring.full line))
-    fun on_line outcome received others line =
+    fun on_line outcome changed others line =
       case (if complete line then json_string_field "type" line else NONE) of
           SOME "action" =>
             let
               val key = Option.getOpt (json_string_field "input_key" line, "")
               val state = Option.getOpt (json_string_field "state" line, "")
             in
-              received := true;
               (case (state, json_string_field "last_failure" line, json_string_field "log_sha256" line) of
                    ("failed", SOME kind, SOME log_sha256) =>
                      if kind = "proof" orelse kind = "tactic-timeout" then
@@ -208,6 +211,7 @@ fun follow url batch_id (on_done : string -> unit) : outcome * progress =
                  | _ => ());
               if List.exists (fn entry => entry = (key, state)) (!states) then ()
               else (states := (key, state) :: List.filter (fn (k, _) => k <> key) (!states);
+                    changed := true;
                     report_action line;
                     if state = "done" then on_done key else ())
             end
@@ -226,7 +230,7 @@ fun follow url batch_id (on_done : string -> unit) : outcome * progress =
     fun attach delays =
       let
         val outcome : outcome option ref = ref NONE
-        val received = ref false
+        val changed = ref false
         val others : string list ref = ref []
         val _ =
           HolbuildSpawn.run_lines
@@ -234,7 +238,7 @@ fun follow url batch_id (on_done : string -> unit) : outcome * progress =
              args = curl_args (endpoint url ("/v1/batches/" ^ batch_id ^ "/events"))
                       ["-N", "-w", "\n%{http_code}"],
              stderr = HolbuildSpawn.Merge}
-            (on_line outcome received others)
+            (on_line outcome changed others)
         val (lines, status) = split_status (String.concat (rev (!others)))
         val text = String.concatWith "\n" lines
         val broken = status = 0 orelse (status >= 200 andalso status < 300) orelse status >= 500
@@ -251,7 +255,7 @@ fun follow url batch_id (on_done : string -> unit) : outcome * progress =
             SOME outcome => outcome
           | NONE =>
               if not broken then Unfollowable ("can't be followed (HTTP " ^ Int.toString status ^ "): " ^ text)
-              else if !received then again 1 (retry_delays_seconds ())
+              else if !changed then again 1 (retry_delays_seconds ())
               else
                 case delays of
                     [] => Unreachable reason
