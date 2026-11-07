@@ -289,7 +289,7 @@ class CachePool:
         ))
         if not result.done or (member.phase == "flush" and not result.durable):
             if result.error and member.phase in {"boot", "dns", "ready", "admit"}:
-                await self._save(conn, member, "drain", error=result.error)
+                await self._save(conn, member, "drain", context=result.context, error=result.error)
                 return
             if result.error:
                 logger.warning("cache %s %s: %s", member.slot, member.phase, result.error)
@@ -298,7 +298,7 @@ class CachePool:
         if member.phase == "drain":
             if result.ingress_stopped_at is None or result.ingress_stopped_at.tzinfo is None:
                 raise AdapterError("ingress drain completed without its stop timestamp")
-            await self._save(conn, member, "flush", stopped_at=result.ingress_stopped_at)
+            await self._save(conn, member, "flush", context=result.context, stopped_at=result.ingress_stopped_at)
             return
         following: dict[Phase, Phase] = {
             "boot": "dns", "dns": "ready", "ready": "admit", "admit": "serving",

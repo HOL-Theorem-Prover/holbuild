@@ -207,7 +207,7 @@ class Releases:
         missing: str | None = None
         failure = f"spec {spec_sha256} is missing from the remote cache"
         for attempt, node in enumerate(ranked_nodes(nodes, spec_sha256), 1):
-            if attempt > 2 and not self.joining and missing is not None:
+            if attempt == 3 and not self.joining and missing is not None:
                 raise RuntimeError(missing)
             # Not check=True: its error would print credentials in the command line.
             try:

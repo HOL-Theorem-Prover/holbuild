@@ -269,13 +269,23 @@ async def test_explicit_launch_failure_enters_verified_cleanup(pool: CachePool, 
 
     async def fail_configure(request: AdapterRequest) -> AdapterResponse:
         if request.op == "boot":
-            return AdapterResponse(done=False, error="configuration failed")
+            return AdapterResponse(done=False, error="configuration failed", context="failed-context")
+        if request.op == "drain":
+            assert request.context == "failed-context"
+            return AdapterResponse(done=True, ingress_stopped_at=p.now, context="drained-context")
+        if request.op == "flush":
+            assert request.context == "drained-context"
+            return AdapterResponse(done=True, durable=True)
         return await original(request)
 
     monkeypatch.setattr(p, "call", fail_configure)
     await pool.reconcile(p.now)
     assert await phase(pool, "failed") == "drain"
     assert not any(r.op == "terminate" for r in p.calls)
+    await pool.reconcile(p.now)
+    assert await phase(pool, "failed") == "flush"
+    await pool.reconcile(p.now + timedelta(seconds=61))
+    assert await phase(pool, "failed") == "stop"
 
 
 async def test_lost_launch_admission_acknowledgement_recovers_after_deadline(pool: CachePool) -> None:

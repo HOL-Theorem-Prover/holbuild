@@ -1127,7 +1127,7 @@ class Coordinator:
         nodes = await self.cache_read_nodes(ac_key)
         joining = self.membership.joining(asyncio.get_running_loop().time())
         for attempt, node in enumerate(nodes, 1):
-            if attempt > 2 and not joining and missing:
+            if attempt == 3 and not joining and missing:
                 break
             try:
                 async with limit:

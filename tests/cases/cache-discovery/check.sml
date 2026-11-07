@@ -45,7 +45,7 @@ val _ = ignore (RC.routed_status "GET" ranked "" request);
 val _ = assert "steady-state misses retain two-node bound" (length (!asked) = 2);
 val _ = asked := [];
 fun two_retired url = (asked := !asked @ [url];
-  HolbuildHttp.Response (if url = former then 200 else 503));
+  HolbuildHttp.Response (if url = former then 200 else if url = List.nth (ranked, 2) then 404 else 503));
 val _ = assert "stale readers bypass concurrent drained listeners on transport errors"
   (#2 (RC.routed_status "GET" ranked "" two_retired) = HolbuildHttp.Response 200 andalso length (!asked) = 6);
 val _ = D.attempted := Time.zeroTime;

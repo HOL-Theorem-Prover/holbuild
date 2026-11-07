@@ -123,14 +123,16 @@ async def test_coordinator_reads_a_former_owner_below_rank_two_only_during_join_
     coordinator.membership = Membership(nodes[:2], nodes)
     coordinator.cache_pool = Mock(ready_urls=AsyncMock(return_value=nodes[2:]))
     key = 'new-entry'
-    former = ranked_nodes(nodes, key)[-1]
+    ranked = ranked_nodes(nodes, key)
+    former = ranked[-1]
     asked = []
     other_status = [404]
 
     def handle(request: httpx.Request) -> httpx.Response:
         url = node_identity(str(request.url).removesuffix('/ac/' + key))
         asked.append(url)
-        return httpx.Response(200 if url == former else other_status[0])
+        status = 404 if other_status[0] == 503 and url == ranked[2] else other_status[0]
+        return httpx.Response(200 if url == former else status)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as cache:
         monkeypatch.setattr(coordinator, 'cache', cache)
@@ -156,15 +158,17 @@ def test_worker_spec_reads_all_members_in_join_grace_and_two_otherwise(monkeypat
 
     nodes = [f'https://cache-{n}.example' for n in range(1, 7)]
     key = 'new-spec'
-    former = ranked_nodes(nodes, key)[-1]
+    ranked = ranked_nodes(nodes, key)
+    former = ranked[-1]
     asked = []
     other_status = [404]
 
     def curl(command: list[str], **_kwargs) -> subprocess.CompletedProcess:
         url = command[-1].removesuffix('/cas/' + key)
         asked.append(url)
+        status = 404 if other_status[0] == 503 and url == ranked[2] else other_status[0]
         return subprocess.CompletedProcess(command, 0 if url == former else 22,
-                                           stdout='holbuild-version=1.2.3\n200' if url == former else f'\n{other_status[0]}', stderr='')
+                                           stdout='holbuild-version=1.2.3\n200' if url == former else f'\n{status}', stderr='')
 
     monkeypatch.setattr(subprocess, 'run', curl)
     releases = Releases('unused', 'unused', ','.join(nodes), None, joining=True)

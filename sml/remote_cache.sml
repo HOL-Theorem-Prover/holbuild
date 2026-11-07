@@ -304,7 +304,7 @@ fun routed_status method urls path request =
     val grace = read andalso HolbuildCacheDiscovery.joining ()
     fun loop [] _ missing last = Option.getOpt (missing, last)
       | loop (node :: rest) count missing last =
-          if count >= 2 andalso not grace andalso (not read orelse Option.isSome missing) then
+          if count >= 2 andalso not grace andalso (not read orelse (count = 2 andalso Option.isSome missing)) then
             Option.getOpt (missing, last)
           else
             let
