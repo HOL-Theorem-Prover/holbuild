@@ -204,6 +204,12 @@ if (cd "$project" && "$HOLBUILD_BIN" build BTheory --proof-scope) > "$missing_sc
   exit 1
 fi
 require_grep 'proof-scope.*root.*all' "$missing_scope_log"
+disabled_scope_log=$tmpdir/disabled-scope.log
+if (cd "$project" && "$HOLBUILD_BIN" build --skip-proof-steps --proof-scope=all BTheory) > "$disabled_scope_log" 2>&1; then
+  echo "audit scope silently disabled proof instrumentation" >&2
+  exit 1
+fi
+require_grep 'proof-scope=all requires proof steps' "$disabled_scope_log"
 
 python3 - "$HOLBUILD_CACHE" <<'PY'
 import pathlib

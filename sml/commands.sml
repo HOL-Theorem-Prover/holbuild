@@ -1087,6 +1087,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         raise Error "proof steps are required for proof IR; remove --skip-proof-steps"
       else if not proof_steps andalso tactic_timeout_set then
         raise Error "--tactic-timeout requires proof steps; remove --skip-proof-steps"
+      else if not proof_steps andalso proof_scope = HolbuildTacticTimeoutPolicy.ProofAll then
+        raise Error "--proof-scope=all requires proof steps; remove --skip-proof-steps"
       else if not proof_steps andalso trace_steps then
         raise Error "--trace-steps requires proof steps; remove --skip-proof-steps"
       else if not proof_steps andalso repl_on_failure then

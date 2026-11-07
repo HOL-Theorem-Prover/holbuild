@@ -233,9 +233,9 @@ pass `--trknl` to each child HOL process.
 
 `build --trknl` collects traces, not proof-development artifacts, so it builds
 root-package theories as `--skip-checkpoints --skip-proof-steps` would, as
-dependency packages always are. Kernel inference checking and the `.tr.gz`
+dependency packages are by default. Kernel inference checking and the `.tr.gz`
 outputs are unaffected. An explicit debugging flag turns back on what it needs:
-`--trace-steps` and `--tactic-timeout` enable proof steps, and
+`--trace-steps`, `--tactic-timeout`, and `--proof-scope=all` enable proof steps, and
 `--repl-on-failure` enables proof steps and checkpoints. Explicit
 `--skip-proof-steps` or `--skip-checkpoints` still conflicts with those flags.
 
@@ -871,13 +871,14 @@ holbuild build --all-checkpoints MyTheory
   Use `--force=full --no-cache` for a full audit. Otherwise holbuild warns that
   up-to-date and cache-restored actions are not checked. Scope and timeout
   do not change action keys; existing timeout compatibility checks still apply
-  when reusing outputs.
+  when reusing outputs. `all` conflicts with `--skip-proof-steps`.
 - `--trace-steps` records proof-step traces in child logs.
 - `--repl-on-failure` starts a HOL REPL from the newest useful checkpoint after a
   theory failure. It serialises the build and is not supported with `--json`.
 - `--skip-proof-steps` opts out of proof-step execution.
 - `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation.
-- `--all-checkpoints` saves theorem checkpoints in every root-package theory
+- `--all-checkpoints` saves theorem checkpoints in every theory included by
+  `--proof-scope` (root-package theories by default) that
   the build runs. By default only the requested targets save them (the default
   targets when none are given, or every root-package theory when there are
   none); the other theories still save their `deps_loaded` checkpoint and run
