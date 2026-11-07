@@ -5966,13 +5966,17 @@ fun restore_remote_build_logs (options : build_options) tc project plan toolchai
     val log_table = List.foldl
       (fn ((key, sha), table) => Redblackmap.insert (table, key, sha))
       (Redblackmap.mkDict String.compare) logs
+    fun required_log node =
+      force_node options project node orelse trace_steps (checkpoint_policy_for_node options project node)
     fun restore node =
       let
         val traced = trace_steps (checkpoint_policy_for_node options project node)
-        val required = force_node options project node orelse traced
+        val required = required_log node
         val key = HolbuildBuildPlan.input_key_for keys node
         val reported = Redblackmap.peek (log_table, key)
-        val log = Option.mapPartial (fetch_remote_build_log project node) (Option.join reported)
+        val log =
+          Option.mapPartial (fetch_remote_build_log project node) (Option.join reported)
+          handle e as HolbuildRemoteCache.Unavailable _ => if required then raise e else NONE
         val reason =
           (if Option.isSome reported then "could not fetch the remote build log for "
            else "remote batch did not execute the required theory ") ^ package node ^ ":" ^ logical_name node
@@ -5994,7 +5998,10 @@ fun restore_remote_build_logs (options : build_options) tc project plan toolchai
         let val dir = current_log_dir (project_artifact_root project) (package node) (logical_name node)
         in remove_file (current_build_log dir); remove_file (current_proof_trace_log dir) end
       else ()) theories
-    val restored = List.mapPartial restore theories
+    (* An optional log outage must not put the transport into cooldown before
+       the required logs have been fetched. *)
+    val restored = List.mapPartial restore
+      (List.filter required_log theories @ List.filter (not o required_log) theories)
     fun report (node, traced, path) =
       if not traced then ()
       else
@@ -6203,7 +6210,7 @@ fun dependency_spec_lines root plan keys token deps =
 (* A worker saves theorem checkpoints unless the spec says otherwise: a
    spec without the line, as older clients write, means true. *)
 fun action_spec_text {root, plan, keys, action_toolchain_key, runtime, toolchain_line} policy
-                     theorem_checkpoints forced (action : theory_action) node action_text =
+                     {theorem_checkpoints, forced, skip_checkpoints} (action : theory_action) node action_text =
   let
     val context = #package action ^ ":" ^ #logical action
     val token = spec_token context
@@ -6238,6 +6245,7 @@ fun action_spec_text {root, plan, keys, action_toolchain_key, runtime, toolchain
        "option tactic-timeout=" ^ timeout_text (tactic_timeout policy),
        bool_option "new-ir" (proof_ir_enabled policy)] @
       (if theorem_checkpoints then [] else [bool_option "theorem-checkpoints" false]) @
+      (if skip_checkpoints then [bool_option "skip-checkpoints" true] else []) @
       (if forced then [bool_option "force" true] else []) @
       (if trace_steps policy then [bool_option "trace-steps" true] else []) @
       ["action-text"]
@@ -6512,7 +6520,9 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
           else raise Error ("internal error: action text of " ^ logical_name node ^ " does not hash to its input key")
         val {text, files} =
           action_spec_text context (checkpoint_policy_for_node options project node)
-            (checkpoint_target_node options node) (force_node options project node) action node action_text
+            {theorem_checkpoints = checkpoint_target_node options node,
+             forced = force_node options project node, skip_checkpoints = #skip_checkpoints options}
+            action node action_text
         val spec_sha256 = HolbuildHash.string_sha256 text
         val path = Path.concat(spec_dir, spec_sha256)
         val _ = (ensure_dir spec_dir; write_text path text)
@@ -7051,7 +7061,7 @@ type action_spec =
    outputs : {sig_path : string, sml_path : string, data_path : string},
    extra_outputs : string list,
    proof_steps : bool, tactic_timeout : real option, new_ir : bool,
-   theorem_checkpoints : bool, force : bool, trace_steps : bool, action_text : string}
+   theorem_checkpoints : bool, skip_checkpoints : bool, force : bool, trace_steps : bool, action_text : string}
 
 (* A spec's lines, and the text after its SECTION line. *)
 fun split_spec_text section text =
@@ -7160,6 +7170,10 @@ fun parse_action_spec text : action_spec =
        (case List.find (fn (k, _) => k = "option theorem-checkpoints") (!values) of
             SOME (_, v) => spec_bool "theorem-checkpoints" v
           | NONE => true),
+     skip_checkpoints =
+       (case List.find (fn (k, _) => k = "option skip-checkpoints") (!values) of
+            SOME (_, v) => spec_bool "skip-checkpoints" v
+          | NONE => false),
      force =
        (case List.find (fn (k, _) => k = "option force") (!values) of
             SOME (_, v) => spec_bool "force" v
@@ -7323,8 +7337,9 @@ fun spec_theory_action root (spec : action_spec) deps_key : theory_action =
    deps-loaded heap either: nothing would share it, and the run's checkpoint
    tree is emptied after it. *)
 fun spec_policy share_heaps (spec : action_spec) =
-  CheckpointPolicy {checkpoint = not share_heaps orelse #theorem_checkpoints spec,
-                    theorem_checkpoints = #theorem_checkpoints spec,
+  CheckpointPolicy {checkpoint = not (#skip_checkpoints spec) andalso
+                                   (not share_heaps orelse #theorem_checkpoints spec),
+                    theorem_checkpoints = not (#skip_checkpoints spec) andalso #theorem_checkpoints spec,
                     proof_steps = #proof_steps spec,
                     new_ir = #new_ir spec,
                     tactic_timeout = effective_tactic_timeout (#proof_steps spec) (#tactic_timeout spec),

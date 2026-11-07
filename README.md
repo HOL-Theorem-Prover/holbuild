@@ -972,7 +972,7 @@ Useful commands and options:
 holbuild execution-plan MyTheory:my_theorem
 holbuild build --tactic-timeout 10 MyTheory
 holbuild build --force=full --no-cache --proof-scope=all --tactic-timeout 5 MyTheory
-holbuild build --trace-steps --force MyTheory
+holbuild build --trace-steps MyTheory
 holbuild build --repl-on-failure MyTheory
 holbuild build --skip-proof-steps MyTheory
 holbuild build --skip-checkpoints MyTheory
@@ -994,7 +994,9 @@ holbuild build --all-checkpoints MyTheory
   up-to-date and cache-restored actions are not checked. Scope and timeout
   do not change action keys; existing timeout compatibility checks still apply
   when reusing outputs. `all` conflicts with `--skip-proof-steps`.
-- `--trace-steps` records proof-step traces in child logs.
+- `--trace-steps` executes and records proof-step traces for theories covered by
+  the selected proof scope, including up-to-date theories. It skips checkpoint
+  replay so their trace covers every proof step.
 - `--repl-on-failure` starts a HOL REPL from the newest useful checkpoint after a
   theory failure. It serialises the build and is not supported with `--json`.
 - `HOLBUILD_FAILED_GOALS_LIMIT` sets the byte limit for the all-input-goals
@@ -1332,6 +1334,7 @@ option proof-steps=<bool>
 option tactic-timeout=<seconds|none>
 option new-ir=<bool>
 option theorem-checkpoints=false   (only for a theory that saves none)
+option skip-checkpoints=true      (when checkpoint reuse is disabled)
 option force=true                 (only for a forced theory)
 option trace-steps=true            (only for a traced theory)
 action-text
@@ -1356,9 +1359,11 @@ action-text
   semantic identity, for naming a saved dependency heap.
 - The `option` lines are how the theory is run, which the action key leaves
   out; the entry built under them carries the timeout contract the exporting
-  build will ask for. Optional `force` and `trace-steps` default to false.
-  Either disables whole-action cache reuse and early cutoff on the worker;
-  `trace-steps` also enables proof-step tracing and requires `proof-steps=true`.
+  build will ask for. Optional `force`, `trace-steps` and `skip-checkpoints`
+  default to false. `force` or `trace-steps` disables whole-action cache reuse
+  and early cutoff on the worker; `trace-steps` also enables proof-step tracing
+  and requires `proof-steps=true`. `skip-checkpoints` disables checkpoint reuse
+  and saving, including shared heaps.
 
 ### Exporting script runs for remote execution
 

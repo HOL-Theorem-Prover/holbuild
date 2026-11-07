@@ -1131,7 +1131,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       else if HolbuildStatus.json_mode () andalso trace_steps then
         raise Error "--json does not support --trace-steps until structured proof-step trace events exist"
       else if dry_run andalso trace_steps then
-        raise Error "--trace-steps requires build execution; use --force to inspect up-to-date targets"
+        raise Error "--trace-steps requires build execution; remove --dry-run"
       else if dry_run andalso repl_on_failure then
         raise Error "--repl-on-failure requires build execution"
       else if HolbuildStatus.json_mode () andalso repl_on_failure then
@@ -1687,8 +1687,10 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                       SOME reason => fall_back reason
                     | NONE =>
                         (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ finished progress ^ "\n");
-                         HolbuildBuildExec.build (HolbuildBuildExec.remote_restore_options (#restore_only build_options) build_options)
-                           tc project plan toolchain_key jobs)
+                         timed_phase "build.execute"
+                           (fn () => HolbuildBuildExec.build
+                             (HolbuildBuildExec.remote_restore_options (#restore_only build_options) build_options)
+                             tc project plan toolchain_key jobs))
                 end
             | ((HolbuildRemoteExec.Failed (reason, SOME failure), progress), _) =>
                 proof_failed ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress) failure

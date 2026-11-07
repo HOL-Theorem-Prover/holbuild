@@ -21,7 +21,7 @@ cleanup() {
 trap cleanup EXIT
 
 remote_root=$tmpdir/remote
-start_remote_cache_server "$remote_root" "$tmpdir/server"
+start_remote_cache_server "$remote_root" "$tmpdir/server" "$tmpdir/cache-control"
 use_case_cache "$tmpdir/cache"
 
 # The stand-in for the workers: runs the batch's actions in order (parents
@@ -50,6 +50,9 @@ awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec the
   cp "$tmpdir/worker.result" "$state/result-\$key"
   if [[ -e "$state/drop-log" ]] || { [[ -e "$state/drop-success-log" ]] && [[ \$status -eq 0 ]]; }; then
     rm -f "$remote_root/cas/\$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/worker.result")"
+  fi
+  if [[ -e "$state/optional-log-outage" && \$theory == *:ATheory ]]; then
+    echo 500 > "$tmpdir/cache-control/cas-get-status-\$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/worker.result")"
   fi
   # A failed action fails the batch, naming the theory or blob it found
   # missing.
@@ -963,6 +966,7 @@ cat > "$project/src/helperLib.sml" <<'SML'
 structure helperLib = struct val verdict = "remote execution verdict: PASS\n" end
 SML
 sed -i '/^Ancestors A$/a Libs helperLib' "$project/src/BScript.sml"
+sed -i '/^Theorem b_thm:/i val _ = print "probe-before-theorem\\n";' "$project/src/BScript.sml"
 cat >> "$project/src/BScript.sml" <<'SML'
 val _ = print helperLib.verdict
 SML
@@ -990,6 +994,19 @@ for flag in --force=project --force=full --force --force-project --force-full; d
   require_grep '^rxf:ATheory status=built$' "$state/results"
   require_grep '^rxf:BTheory status=built$' "$state/results"
 done
+
+# Explicitly skipping checkpoints must survive the remote boundary, with
+# both persistent worker checkpoint trees and shared heaps.
+for shared in no yes; do
+  [[ $shared == no ]] || touch "$state/share-heaps"
+  run checkpoint-seed 0 build --remote-exec "$coordinator" --remote-only --force=theory BTheory
+  run skip-checkpoints 0 build --remote-exec "$coordinator" --remote-only --force=theory --skip-checkpoints BTheory
+  require_grep '^probe-before-theorem$' "$local_log"
+  batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/skip-checkpoints.log")
+  spec=$(awk '$1 == "action" { print $4 }' "$state/$batch.batch")
+  require_grep '^option skip-checkpoints=true$' "$remote_root/cas/$spec"
+done
+rm "$state/share-heaps"
 
 # Trace policy applies to the root package's theories and bypasses both
 # worker whole-action reuse and checkpoint replay, also with shared heaps.
@@ -1069,6 +1086,25 @@ require_grep 'review regression' "$tmpdir/trace-failed-child.log"
 refute_grep 'could not fetch the remote build log\|before theorem=a_thm' "$tmpdir/trace-failed-child.log"
 rm "$state/drop-success-log"
 
+
+# An outage fetching an ordinary ancestor's optional log must not discard
+# the forced target's result or require local HOL execution.
+project=$tmpdir/optional-log-project
+mkdir -p "$project/src"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxoptional"
+[build]
+members = ["src"]
+TOML
+write_theories optional-log-outage
+touch "$state/optional-log-outage"
+HOLBUILD_TIMING_LOG=$tmpdir/optional-log.timing run optional-log 0 build --remote-exec "$coordinator" --remote-only --force=theory BTheory
+require_grep 'could not fetch the remote build log for rxoptional:ATheory' "$tmpdir/optional-log.log"
+[[ $(local_hol_runs "$tmpdir/optional-log.timing") -eq 0 ]] || { cat "$tmpdir/optional-log.timing" >&2; exit 1; }
+require_grep 'build.execute' "$tmpdir/optional-log.timing"
+rm "$state/optional-log-outage"
 
 # The client cap must reach the HOL child, before Poly/ML consumes --maxheap.
 copy_nondet heap-cap rxheap
