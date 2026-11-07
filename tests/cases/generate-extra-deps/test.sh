@@ -12,11 +12,13 @@ cleanup() { cleanup_temp_dir "$tmpdir"; }
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
-for mode in manifest-directory manifest-glob source-directory source-glob source-wide-glob; do
+for mode in manifest-directory manifest-glob source-directory source-glob source-wide-glob source-explicit-hidden; do
   project=$tmpdir/$mode
   mkdir -p "$project/src"
   printf 'first\n' > "$project/input.txt"
-  declaration=data
+  generated_dir=data
+  [[ $mode != source-explicit-hidden ]] || generated_dir=data/.holbuild
+  declaration=$generated_dir
   [[ $mode != *-glob ]] || declaration='data/*.txt'
   [[ $mode != source-wide-glob ]] || declaration='*.txt'
   unrelated=src/database/unrelated.txt
@@ -44,9 +46,9 @@ TOML
 
 [[generate]]
 name = "$output"
-command = ["sh", "-c", "mkdir -p src/data/nested; cp input.txt src/data/$output.txt; printf x >> $output.count"]
+command = ["sh", "-c", "mkdir -p src/$generated_dir/nested; cp input.txt src/$generated_dir/$output.txt; printf x >> $output.count"]
 inputs = ["input.txt"]
-outputs = ["src/data/$output.txt"]
+outputs = ["src/$generated_dir/$output.txt"]
 TOML
   done
   # The counter for the nested output lives outside the selected directory.
@@ -57,6 +59,11 @@ TOML
 name = "unrelated"
 command = ["generator-that-must-not-run"]
 outputs = ["$unrelated"]
+
+[[generate]]
+name = "hidden"
+command = ["hidden-generator-that-must-not-run"]
+outputs = ["src/$generated_dir/.holbuild/unrelated.txt"]
 TOML
   if [[ $mode == source-* ]]; then
     cat > "$project/src/AScript.sml" <<SML
@@ -64,13 +71,13 @@ fun holbuild_extra_deps (_ : string list) = ()
 val () = holbuild_extra_deps ["$declaration"]
 SML
   fi
-  cat >> "$project/src/AScript.sml" <<'SML'
+  cat >> "$project/src/AScript.sml" <<SML
 fun holbuild_extra_outputs (_ : string list) = ()
 val () = holbuild_extra_outputs ["seen.out"]
 val () = let
   fun read path = let val input = TextIO.openIn path
                   in TextIO.inputAll input before TextIO.closeIn input end
-  val contents = read "data/one.txt" ^ read "data/nested/two.txt"
+  val contents = read "$generated_dir/one.txt" ^ read "$generated_dir/nested/two.txt"
   val output = TextIO.openOut "seen.out"
 in
   TextIO.output(output, contents);
