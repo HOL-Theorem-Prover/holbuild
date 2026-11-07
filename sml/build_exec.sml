@@ -5919,7 +5919,8 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
     val action_lines = List.concat (map #lines exported)
     (* Specs share their library sources, so each file goes up once. *)
     val _ =
-      if upload then List.app (publish_spec_blob remote) (unique_strings (List.concat (map #files exported)))
+      if upload then HolbuildToolchain.time_phase "action_spec.upload" (fn () =>
+        List.app (publish_spec_blob remote) (unique_strings (List.concat (map #files exported))))
       else ()
   in
     String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n"
