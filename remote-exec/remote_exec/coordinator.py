@@ -758,9 +758,15 @@ class Coordinator:
                 for row in rows:
                     candidates[row.batch_id][row.input_key] = list(row.parents)
             limit = asyncio.Semaphore(RELEASE_CACHE_CHECKS)
-            requeued = await asyncio.gather(
-                *(self._release_batch(batch, actions, limit) for batch, actions in candidates.items())
+            results = await asyncio.gather(
+                *(self._release_batch(batch, actions, limit) for batch, actions in candidates.items()),
+                return_exceptions=True,  # one batch's failure doesn't cut the others' releases short
             )
+            for batch, result in zip(candidates, results, strict=True):
+                if isinstance(result, BaseException):
+                    if not isinstance(result, Exception):
+                        raise result
+                    logger.error("releasing %s failed", batch, exc_info=result)
             if (seconds := time.monotonic() - started) >= RELEASE_SLOW_SECONDS:
                 logger.warning(
                     "releasing %s took %.1f s: %d candidates in %d batches",
@@ -769,7 +775,7 @@ class Coordinator:
                     sum(map(len, candidates.values())),
                     len(candidates),
                 )
-            if not any(requeued):
+            if True not in results:
                 return
 
     async def _release_batch(

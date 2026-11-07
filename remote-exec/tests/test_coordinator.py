@@ -392,6 +392,44 @@ async def test_a_pass_over_every_batch_releases_each_batch_without_waiting_for_t
     assert await states(http, slow) == {"a": "done", "ca": "ready"}
 
 
+async def test_a_pass_over_every_batch_finishes_the_others_when_one_batch_fails(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    failing = await submit(http, ["x", "cx"], [("cx", "x")])
+    held = await submit(http, ["y", "cy"], [("cy", "y")])
+    tokens = await claim_all(http, 2)
+    cache.keys |= {ac_key("x"), ac_key("y")}
+    cache.broken |= {ac_key("x"), ac_key("y")}
+    for name in ("x", "y"):
+        assert await coordinator.complete(UUID(tokens[name]), parse_result(result(name, "built")))
+    await coordinator.released()
+
+    # Writing "cx" ready fails while the cache is still answering for "cy"'s parent.
+    lock_batch = coordinator._lock_batch
+    failed = asyncio.Event()
+
+    async def fail_one(conn: Any, batch_id: UUID) -> str | None:
+        if batch_id == UUID(failing):
+            failed.set()
+            raise RuntimeError("lost the database")
+        return await lock_batch(conn, batch_id)
+
+    monkeypatch.setattr(coordinator, "_lock_batch", fail_one)
+    cache.broken.clear()
+    cache.hold, cache.hold_only = asyncio.Event(), {ac_key("y")}
+    coordinator.request_release()
+    released = asyncio.ensure_future(coordinator.released())
+    try:
+        await asyncio.wait_for(failed.wait(), 5)
+        await asyncio.sleep(0.1)
+        assert not released.done()
+    finally:
+        cache.hold.set()
+    await asyncio.wait_for(released, 5)
+    assert await stored_state(coordinator, held, "cy") == "ready"
+    assert await stored_state(coordinator, failing, "cx") == "waiting"
+
+
 async def test_a_batch_asked_for_is_released_during_a_pass_over_every_batch(
     http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
