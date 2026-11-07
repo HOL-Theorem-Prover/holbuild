@@ -1406,7 +1406,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       in
         timed_phase "action_spec.export"
           (fn () => print (HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key jobs
-                             {upload = upload, local_resumable = false, forced = []}))
+                             {upload = upload, local_resumable = false, forced = [], ledger = false}))
       end
     fun export_run_specs request () =
       let
@@ -1433,7 +1433,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         fun export forced =
           timed_phase "action_spec.export"
             (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key jobs
-                        {upload = true, local_resumable = not detach, forced = forced})
+                        {upload = true, local_resumable = not detach, forced = forced, ledger = true})
         fun batch_keys batch =
           List.mapPartial (fn line => case String.tokens Char.isSpace line of
                                           "action" :: key :: _ => SOME key
@@ -1525,7 +1525,10 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
            then can't use it, and the coordinator fails the batch for
            resubmission naming it.  It is resubmitted once, with that theory
            and every theory that depends on it in the batch, for the workers
-           to rebuild or recheck against the cached parents. *)
+           to rebuild or recheck against the cached parents.  A theory or
+           blob the remote ledger took the remote cache to hold may be gone
+           too: the ledger is forgotten, and a batch missing a blob is
+           resubmitted once, for the export to upload it again. *)
         fun finish resubmit in_batch batch_id =
           case follow in_batch batch_id of
               (HolbuildRemoteExec.Done, progress) =>
@@ -1541,12 +1544,15 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                         (true, SOME missing) =>
                           HolbuildBuildExec.theory_keys_depending_on build_options tc project plan toolchain_key missing
                       | _ => []
+                  val missing_blob = resubmit andalso HolbuildRemoteExec.resubmit_missing_blob reason
                 in
-                  if null forced then fall_back reason
+                  if null forced andalso not missing_blob then fall_back reason
                   else
                     (HolbuildStatus.message_stderr
-                       ("holbuild: remote execution: " ^ reason ^ "; resubmitting with " ^
-                        Int.toString (length forced) ^ " theories rebuilt or rechecked\n");
+                       ("holbuild: remote execution: " ^ reason ^ "; resubmitting" ^
+                        (if null forced then ""
+                         else " with " ^ Int.toString (length forced) ^ " theories rebuilt or rechecked") ^ "\n");
+                     HolbuildBuildExec.forget_remote_ledger project;
                      (* Their local entries may be the ones that don't fit. *)
                      HolbuildBuildExec.drop_local_cache_entries forced;
                      export_and_submit false forced)

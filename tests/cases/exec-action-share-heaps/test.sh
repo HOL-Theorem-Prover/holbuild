@@ -181,8 +181,21 @@ resumed() {
 
 write_t "T" "simp[]"
 export_t v1
+# A, a dependency of the target, has no theorem checkpoints: nothing to share.
+[[ ! -e "$shared/checkpoint-store" ]] || { echo "the dependency A shared a heap" >&2; exit 1; }
+requests=$tmpdir/server/requests.log
+before_v1=$(wc -l < "$requests")
 worker v1 "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v1 0 "status=built"
+# With no heap published yet, the worker's restore, before its first upload,
+# looked for no checkpoint on it.
+tail -n +"$((before_v1 + 1))" "$requests" | awk '$1 == "PUT" { exit } $1 == "GET" { print $2 }' | grep '^/ac/' \
+  | sort -u | while read -r path; do
+  if [[ -f "$tmpdir/remote$path" ]] && grep -q "holbuild-shared-checkpoint-v1" "$tmpdir/remote$path"; then
+    echo "v1 looked for the checkpoint $path before any heap was shared" >&2
+    exit 1
+  fi
+done
 [[ -d "$shared/checkpoint-store" ]] || { echo "v1 added nothing to the store" >&2; exit 1; }
 [[ ! -e "$shared/checkpoints" ]] || { echo "the private checkpoint tree outlived the action" >&2; exit 1; }
 
@@ -285,10 +298,24 @@ write_t "T \\/ F" "rw[]" "ACCEPT_TAC TRUTH" "REWRITE_TAC []"
 export_t v9
 cold v9 0
 forget_local
+before_v9=$(wc -l < "$requests")
 worker v9 "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v9 0 "status=built"
 resumed v9 "theorem-context checkpoint after t4" "theorem_context checkpoint"
 same_outputs v9
+
+# The worker keeps the sources it fetched: running the spec again fetches
+# none of them.
+source_get="GET /cas/$(sha256sum "$project/src/TScript.sml" | cut -d' ' -f1)"
+before_again=$(wc -l < "$requests")
+worker v9-again "$shared_url" "$shared" "$spec_t" --share-heaps
+expect v9-again 0 "status=cached"
+tail -n +"$((before_v9 + 1))" "$requests" | head -n "$((before_again - before_v9))" | grep -qxF "$source_get" \
+  || { echo "v9 fetched no source" >&2; exit 1; }
+if tail -n +"$((before_again + 1))" "$requests" | grep -qxF "$source_get"; then
+  echo "running the spec again fetched its source again" >&2
+  exit 1
+fi
 
 # A store on another file system than the action's checkpoints, as a store
 # on its own mount is: hard links fail there, so the worker links the

@@ -118,13 +118,18 @@ at 2001 "$checkpoints/OldScript.deps/key/deps_loaded.save"
 at 2005 "$checkpoints/NewScript.deps/key/deps_loaded.save"
 
 # Local cache entries: blob1 is shared, so it goes with entry2, its newest
-# user; an unreferenced blob goes first.
+# user; a blob no entry names goes when it was last used, as an old one is
+# and a recent one isn't.
 blob1=$(printf 1 | sha256sum | cut -d' ' -f1)
 blob2=$(printf 2 | sha256sum | cut -d' ' -f1)
 orphan=$(printf 3 | sha256sum | cut -d' ' -f1)
 sparse "$cache/blobs/$blob1" 1
 sparse "$cache/blobs/$blob2" 1
+recent_orphan=$(printf 4 | sha256sum | cut -d' ' -f1)
 echo orphan > "$cache/blobs/$orphan"
+echo recent > "$cache/blobs/$recent_orphan"
+at 2000 "$cache/blobs/$orphan"
+at 2006 "$cache/blobs/$recent_orphan"
 mkdir -p "$cache/actions/entry1" "$cache/actions/entry2"
 printf 'blob sig %s\n' "$blob1" > "$cache/actions/entry1/manifest"
 printf 'blob sig %s\nblob dat %s\n' "$blob1" "$blob2" > "$cache/actions/entry2/manifest"
@@ -160,7 +165,8 @@ evicted "$cache/actions/entry1" "an old cache entry"
 evicted "$cache/actions/entry2" "a cache entry needed to get under the cap"
 evicted "$cache/blobs/$blob1" "a blob whose entries were evicted"
 evicted "$cache/blobs/$blob2" "a blob whose entry was evicted"
-evicted "$cache/blobs/$orphan" "an unreferenced blob"
+evicted "$cache/blobs/$orphan" "an old unreferenced blob"
+kept "$cache/blobs/$recent_orphan" "a recently used unreferenced blob"
 evicted "$cache/theory-modules/old.pmo" "an old compiled theory module"
 
 # Under the cap (5 GB and a little, with 6 GB of room), nothing is evicted.

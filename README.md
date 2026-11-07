@@ -1447,7 +1447,8 @@ worker's, and its action text must hash to its input key and agree with its
 source and direct dependencies), ensures the HOL toolchain (restoring the
 remote toolchain archive, or building one, and when another worker's archive
 was published first, switching to that archive), fetches the sources by
-SHA-256, restores every dependency through the normal cache restore and its
+SHA-256 (keeping them in the cache root's blob store, so it fetches each
+once), restores every dependency through the normal cache restore and its
 checks, and reports `cached` if the theory's own entry already restores, or
 if an earlier build of the same action text on byte-identical dependency
 outputs left one, which it then publishes under the action's input key (early
@@ -1526,11 +1527,17 @@ failure=proof|tactic-timeout|script|timeout|memory|input-missing|publish|toolcha
 missing=theory <input_key> | blob <sha256>
 peak-rss-mb=<n>
 wall-ms=<n>
+phase-ms=<phase>:<n>,...
 log=<sha256> <size>
 ```
 
 `failure` appears on failure, and `missing` with `input-missing`.
 For a run, `input-key` is its run key and `built` means it ran.
+`phase-ms` gives the wall time of each phase that ran, in order: `cap` (the
+cache cap sweep), `spec`, `toolchain`, `hydrate` (sources, libraries and
+dependencies), `cutoff` (whether an earlier build stands), `restore` (shared
+checkpoints), `hol`, `publish` (shared checkpoints), `check` (the
+publication checks) and `log`; stderr ends with the same times and `wall`.
 `peak-rss-mb` is the HOL process's peak resident memory on a successful build.
 `log` is the build log, or the run's HOL output, uploaded to `/cas/`. `memory` means Poly/ML ran out
 of heap or the container's cgroup `memory.events` counted an OOM kill during
@@ -1621,7 +1628,9 @@ restore from the remote cache what the batch's theories depend on, so when a
 theory in the batch depends on one, holbuild publishes its local cache entry
 there first; it goes in the batch only when it has no usable local entry or
 the publish fails. `--detach` follows no local build, so it checks and
-submits such theories like any other.
+submits such theories like any other. What these checks and the source
+uploads find the remote cache to hold is kept in `.holbuild/remote-ledger/`,
+so a later build doesn't ask again.
 
 The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the
@@ -1631,7 +1640,10 @@ holds, as when a nondeterministic theory was built twice; the workers can't
 use it, and the coordinator fails the batch for resubmission naming it
 (`resubmit: ... theory <input_key>`). Such a batch is resubmitted once first,
 with that theory and every theory that depends on it, for the workers to
-rebuild or recheck against the cached parents. A submission
+rebuild or recheck against the cached parents. The remote cache may also have
+lost a theory or source the remote ledger says it holds: on a resubmission
+for either, the build forgets the ledger, and a batch missing a blob
+(`resubmit: ... blob <sha256>`) is resubmitted once too, uploading it again. A submission
 answered 5xx, as a proxy in front of the coordinator answers while it
 restarts or the coordinator itself answers while it's overloaded, or 429,
 is retried, and an event stream that breaks is reattached; either is given up on once the coordinator stays unavailable for
