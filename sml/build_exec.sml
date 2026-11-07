@@ -7159,15 +7159,26 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     fun member x xs = List.exists (fn y => y = x) xs
     (* An entry naming a blob the cache lost is replaced, as if absent. *)
     fun present key = not (member key stale) andalso Option.isSome (HolbuildRemoteCache.get_action remote key)
+    (* Every checkpoint's manifest names its whole spine, so the same files
+       come up for each candidate; none changes while this runs. *)
+    val hashes = ref (Redblackmap.mkDict String.compare)
+    fun hash path =
+      case Redblackmap.peek (!hashes, path) of
+          SOME sha => sha
+        | NONE =>
+            let val sha = HolbuildHash.file_sha256 path
+            in hashes := Redblackmap.insert (!hashes, path, sha); sha end
+    val uploaded = ref (Redblackset.empty String.compare)
     (* has_blob knows only the blobs of the entries this process read. *)
     fun upload_sha path sha =
-        if HolbuildRemoteCache.has_blob remote sha andalso not (member sha missing) then sha
+        if Redblackset.member (!uploaded, sha) orelse
+           HolbuildRemoteCache.has_blob remote sha andalso not (member sha missing) then sha
         else
-          case HolbuildRemoteCache.publish_blob remote {hash = sha, src = path} of
-              HolbuildCacheBackend.Published => sha
-            | HolbuildCacheBackend.AlreadyPresent => sha
+          case HolbuildRemoteCache.publish_hashed_blob remote {hash = sha, src = path} of
+              HolbuildCacheBackend.Published => (uploaded := Redblackset.add (!uploaded, sha); sha)
+            | HolbuildCacheBackend.AlreadyPresent => (uploaded := Redblackset.add (!uploaded, sha); sha)
             | _ => raise Error ("could not upload " ^ path)
-    fun upload path = upload_sha path (HolbuildHash.file_sha256 path)
+    fun upload path = upload_sha path (hash path)
     (* A heap this run saved is published only where no other worker's is:
        checkpoints on a heap that lost are chained to bytes no other worker
        has, so they stay local. *)
@@ -7187,13 +7198,13 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     val heap =
       if not (deps_checkpoint_exists deps_loaded deps_key) then NONE
       else
-        let val current = HolbuildHash.file_sha256 deps_loaded
+        let val current = hash deps_loaded
         in
           (* A restored heap Poly failed to load was replaced by this run's. *)
           if restored_heap = SOME current then restored_heap else publish_heap current
         end
     fun was_restored path =
-      List.exists (fn (p, sha) => p = path andalso (HolbuildHash.file_sha256 path = sha handle _ => false))
+      List.exists (fn (p, sha) => p = path andalso (hash path = sha handle _ => false))
                   restored
     val parents = ref (Redblackmap.mkDict String.compare)
     fun parent p =
