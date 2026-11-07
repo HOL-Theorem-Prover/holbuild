@@ -968,7 +968,16 @@ Important paths:
 .holbuild/packages/<package>          # package build artefacts
 .holbuild/plan/<fingerprint>          # plan records
 $HOLBUILD_CACHE/hol-toolchains/       # built HOL toolchains and analysers
+$HOLBUILD_CACHE/analysis/             # sources' dependency analyses
 ```
+
+Planning analyses each source for its dependencies (its `load`s, `use`s,
+Holdep mentions and declared extra inputs and outputs) and keeps the result in
+`.holbuild/obj` and in the cache's `analysis/` directory. An entry there is
+named after the source's content, the analyser's version and the HOL sources
+the analyser is built against, so another checkout of the same sources on the
+machine reads it instead of analysing again, and a different HOL pin never
+uses it.
 
 ### The plan record
 
@@ -1459,6 +1468,12 @@ run, unless `--quiet` is given. Progress never goes to stdout, which keeps the
 locking/discovery and does not require a HOL toolchain. Project checkpoint GC
 uses `.holconfig.toml`'s `[build].checkpoint_limit_gb` unless overridden with
 `--max-checkpoints-gb`.
+
+Cache GC removes the dependency analyses under `analysis/` that no build has
+read or written within the retention period. A build that finds its analyses
+in `.holbuild/obj` doesn't count as a use, so such an entry can go while a
+checkout still uses the project's copy; the next fresh checkout analyses that
+source again.
 
 Cache GC also removes installed HOL toolchains under `hol-toolchains/` that no
 holbuild command has used within the retention period; a removed toolchain is

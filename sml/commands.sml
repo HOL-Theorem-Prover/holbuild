@@ -979,8 +979,7 @@ fun context (tc : HolbuildToolchain.t) args =
 fun timed_phase name f = HolbuildToolchain.time_phase name f
 
 fun configure_analyser_for_toolchain ({holdir, ...} : HolbuildToolchain.t) =
-  if holdir = "" then HolbuildDependencies.clear_analyser_path ()
-  else HolbuildDependencies.set_analyser_path (HolbuildHolSharedCache.analyser_path_for_holdir holdir)
+  HolbuildDependencies.configure_analyser_for_holdir holdir
 
 fun begin_stat_cache _ _ =
   (* A portable stat record cannot establish file content identity, so this
