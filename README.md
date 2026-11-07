@@ -1784,8 +1784,8 @@ output names, so the same run is done once. The command:
    `failed` gives the run's failure class: `script` (the script raised or
    left a declared output unwritten), `timeout` (it outlived
    `--option timeout`) or another of `exec-action`'s classes. `missing` is a
-   run that didn't end: refused, left in a batch that stopped, or whose
-   entry the fetch couldn't read.
+   run that didn't end (refused, or left in a batch that stopped), or whose
+   entry or outputs couldn't be fetched.
 
 What the script gets on the worker is in "Running one theory action as a
 remote worker": the `HOLBUILD_RUN_*` variables, among them
@@ -1802,14 +1802,14 @@ locally: without `--remote-exec` or one of `--fetch-only` and
 Exit status:
 
 - 0 when every run ended `done`, `cached` or `failed` (a failed script is a
-  result), or is `missing` only because the remote cache lacks its entry, as
-  with `--fetch-only`.
+  result); with `--fetch-only`, also when some are `missing`.
 - 75 (`EX_TEMPFAIL`) when the coordinator can't take or finish the batch:
   the export or upload fails, the submission is refused or the coordinator
   unreachable, the event stream is lost (the batch is left running, so its
   results reach the cache for the next try), the coordinator won't stream it
-  (it's cancelled), or the batch fails as a whole; and with `--remote-only`
-  when no `--remote-exec` is given.
+  (it's cancelled), the batch fails as a whole, a theory a run needs that
+  only the local cache holds fails to publish, or a run that ended can't be
+  fetched; and with `--remote-only` when no `--remote-exec` is given.
 - 1 for errors on the command line or in the project, a batch someone
   cancelled, an interrupt (which cancels the batch), or a target refused
   with `build it first` (after the others ran).

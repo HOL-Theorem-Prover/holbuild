@@ -6712,13 +6712,25 @@ fun plan_runs tc project planned jobs
           List.exists (fn (r : run) => #run_key r = #run_key run) wanted
         val runs = List.filter chosen runs
         val theories = unique_nodes (List.concat (map #theories runs))
+        (* A theory the remote cache still lacks though the local cache
+           holds it failed to publish, which a later try may not. *)
         val unavailable =
           case planned of
               NONE => []
             | SOME {options, plan, ...} =>
-                failing_on_pool remote jobs "checking remote cache" "theories"
-                  (fn remote => fn node => remote_available remote options project plan node (key_of node) true)
-                  theories
+                let
+                  val unavailable =
+                    failing_on_pool remote jobs "checking remote cache" "theories"
+                      (fn remote => fn node => remote_available remote options project plan node (key_of node) true)
+                      theories
+                in
+                  case List.find (fn node => local_entry_satisfies options project plan node (key_of node))
+                                 unavailable of
+                      SOME node =>
+                        raise Error ("could not publish " ^ package node ^ ":" ^ logical_name node ^
+                                     " to the remote cache")
+                    | NONE => unavailable
+                end
         fun is_unavailable node =
           List.exists (fn n => HolbuildBuildPlan.key n = HolbuildBuildPlan.key node) unavailable
         fun refuse (run : run) node =
@@ -6759,7 +6771,7 @@ fun export_run_specs tc project planned jobs request =
 (* Fetches a run's entry and outputs from the remote cache into
    DIR/<package>/<theory>, as KEY (the run key), CONTEXT (the run text's
    context= value) and the declared outputs, replacing what was there;
-   false when the remote cache lacks any of them. *)
+   false when it can't fetch any of them. *)
 fun fetch_run remote dir outputs ({name, context, run_key} : run) =
   case remote_run_entry remote run_key outputs of
       NONE => false
@@ -6775,6 +6787,8 @@ fun fetch_run remote dir outputs ({name, context, run_key} : run) =
             HolbuildRemoteCache.fetch_blob remote {hash = hash, dst = Path.concat (tmp, output)} =
             HolbuildCacheBackend.Hit
           val _ = (remove_tree tmp; ensure_dir tmp)
+          val _ = if (FS.isDir tmp handle OS.SysErr _ => false) then ()
+                  else raise Error ("run-action: could not create " ^ tmp)
         in
           if List.all fetched found then
             (write_text (Path.concat (tmp, "KEY")) (run_key ^ "\n");

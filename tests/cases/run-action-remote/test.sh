@@ -186,6 +186,14 @@ run fetch-missing 0 --fetch-only --script "$runner/other.sml" rr:CTheory
 line fetch-missing rr:CTheory missing > /dev/null
 [[ $(posts) == "$before" ]]
 
+# Outputs that can't be written are an error, not a missing run.
+touch "$tmpdir/a-file"
+saved_out=$out
+out=$tmpdir/a-file
+run unwritable 1 --fetch-only --script "$runner/run.sml" rr:CTheory
+require_grep 'could not create' "$tmpdir/unwritable.err"
+out=$saved_out
+
 # One run of a batch fails its script: the other is done all the same, and
 # the command ends 0. --closure adds C's ancestry, A.
 script mixed.sml 2

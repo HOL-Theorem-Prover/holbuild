@@ -304,8 +304,9 @@ fun run_action_help () = print
   \--export-only   Only write and upload each run's spec and print\n\
   \                `CONTEXT RUN-KEY SPEC-SHA256`.\n\n\
   \Exits 0 when every run ended (done, cached, failed or, with --fetch-only,\n\
-  \missing), 75 when the coordinator can't take or finish the batch, and 1\n\
-  \on errors, a cancelled batch, or a TARGET that isn't built.\n\n\
+  \missing), 75 when the coordinator can't take or finish the batch or an\n\
+  \ended run can't be fetched, and 1 on errors, a cancelled batch, or a\n\
+  \TARGET that isn't built.\n\n\
   \Takes build's cache and proof options. Needs --remote-cache.\n\n\
   \Global options: see `holbuild --help`.\n"
 
@@ -1527,6 +1528,15 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           HolbuildBuildExec.failing_on_pool remote jobs "fetching from remote cache" "runs"
             (fn remote => fn run => HolbuildBuildExec.fetch_run remote outputs_dir outputs run)
             to_fetch
+        (* Without --fetch-only every run listed ended, so one that didn't
+           fetch was lost on the way, which a later try may not lose. *)
+        val _ =
+          case (not_fetched, !stopped) of
+              (_ :: _, NONE) =>
+                if fetch_only then ()
+                else stopped := SOME ("could not fetch the outputs of " ^ Int.toString (length not_fetched) ^
+                                      " runs from the remote cache", true)
+            | _ => ()
       in
         List.app (fn (run as {name, run_key, ...} : HolbuildBuildExec.run, status) =>
                      print (String.concatWith " "
