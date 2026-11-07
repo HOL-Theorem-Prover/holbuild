@@ -5793,6 +5793,33 @@ fun start_background_pool limit work =
     {add = add, drain = wait, stop = stop}
   end
 
+(* Runs work on each of items, up to 4 at a time, for a worker's transfers,
+   and raises what a serial loop would: the failure of the first item that
+   fails.  Items after a failed one are skipped if not yet started. *)
+fun transfer_all work items =
+  case items of
+      [] => ()
+    | [item] => work item
+    | _ =>
+        let
+          val failure = ref NONE
+          val mutex = Mutex.mutex ()
+          fun with_lock f = (Mutex.lock mutex; f () before Mutex.unlock mutex)
+          fun after_failure i =
+            with_lock (fn () => case !failure of SOME (j, _) => j < i | NONE => false)
+          fun note i e =
+            with_lock (fn () =>
+              case !failure of
+                  SOME (j, _) => if j < i then () else failure := SOME (i, e)
+                | NONE => failure := SOME (i, e))
+          fun run (i, item) = if after_failure i then () else work item handle e => note i e
+          val {add, drain, stop} = start_background_pool 4 run
+        in
+          (List.app add (ListPair.zip (List.tabulate (length items, fn i => i), items)); drain ())
+          handle e => (stop (); raise e);
+          case !failure of SOME (_, e) => raise e | NONE => ()
+        end
+
 fun prefetch_limit jobs =
   Option.getOpt (!HolbuildRemoteCacheConfig.prefetch_concurrency, Int.max (50, 2 * jobs))
 
@@ -7361,12 +7388,19 @@ fun spec_parent_hashes_match_in dat_hashes root (spec : spec_deps) data_path =
 fun spec_parent_hashes_match root spec data_path =
   spec_parent_hashes_match_in (new_file_hash_cache ()) root spec data_path
 
-(* Step 3: sources and library manifests from the spec, dependency theories
-   from the cache. *)
-fun hydrate_spec_deps remote root (spec : spec_deps) =
+(* Step 3: the caller's files, given as {hash, dst}, and the spec's
+   libraries and library manifests from the spec, dependency theories from
+   the cache.  The transfers run in parallel. *)
+fun hydrate_spec_deps remote root files (spec : spec_deps) =
   let
-    fun fetch_library {path, sha256, ...} =
-      fetch_spec_blob remote {hash = sha256, dst = in_root root path}
+    fun library {path, sha256, ...} = {hash = sha256, dst = in_root root path}
+    (* A path listed twice gets its last hash, as fetching in order would
+       leave it; fetch_unlisted_blob writes dst in place. *)
+    fun last_per_dst items =
+      #2 (List.foldr (fn (item as {dst, ...} : {hash : string, dst : string}, (seen, kept)) =>
+                         if Binaryset.member (seen, dst) then (seen, kept)
+                         else (Binaryset.add (seen, dst), item :: kept))
+                     (Binaryset.empty String.compare, []) items)
     fun lib_load load = if CharVector.exists (fn c => c = #"/") load then in_root root load else load
     fun write_lib {stem, suffix, loads, ...} =
       (ensure_parent (in_root root stem);
@@ -7381,9 +7415,9 @@ fun hydrate_spec_deps remote root (spec : spec_deps) =
                           ("dependency " ^ target ^ " (" ^ key ^ ") is not restorable from the cache: " ^
                            General.exnMessage e)
   in
-    List.app fetch_library (#libraries spec);
+    transfer_all (fetch_spec_blob remote) (last_per_dst (files @ map library (#libraries spec)));
     List.app write_lib (#libs spec);
-    List.app restore_dep (#deps spec);
+    transfer_all restore_dep (#deps spec);
     List.app
       (fn {target, stem, key} =>
           if spec_parent_hashes_match_in dat_hashes root spec (in_root root (stem ^ ".dat")) then ()
@@ -7398,12 +7432,9 @@ fun hydrate_spec_deps remote root (spec : spec_deps) =
 fun hydrate_action_root remote root (spec : action_spec) =
   let
     val package = #package spec
-    fun fetch_file {path, sha256, ...} =
-      fetch_spec_blob remote {hash = sha256, dst = in_root root (action_source_path package path)}
+    fun file {path, sha256, ...} = {hash = sha256, dst = in_root root (action_source_path package path)}
   in
-    fetch_file (#source spec);
-    List.app fetch_file (#inputs spec);
-    hydrate_spec_deps remote root (theory_spec_deps spec)
+    hydrate_spec_deps remote root (map file (#source spec :: #inputs spec)) (theory_spec_deps spec)
   end
 
 (* Step 4: the action's own entry restores with full validation. *)
@@ -7464,7 +7495,7 @@ fun publish_action_entry remote root (spec : action_spec) =
         | NONE => raise ActionFailed (PublishFailure, "the build published no local cache entry")
   in
     ensure_dir tmp_dir;
-    (List.app (fn hash => ignore (HolbuildCacheTransfer.copy_blob source destination tmp_dir hash (0, 0)))
+    (transfer_all (fn hash => ignore (HolbuildCacheTransfer.copy_blob source destination tmp_dir hash (0, 0)))
        (HolbuildCacheTransfer.unique_blobs manifest)
      handle e as HolbuildRemoteCache.Unavailable _ => raise e
           | e => raise action_failed PublishFailure ("could not publish the entry: " ^ General.exnMessage e));
@@ -7952,10 +7983,10 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     fun wipe () = remove_tree checkpoint_root
     fun place heap (sha, dst) = place_shared_blob remote store heap {sha = sha, dst = dst, save = true}
     fun place_sidecar heap (sha, dst) = place_shared_blob remote store heap {sha = sha, dst = dst, save = false}
-    fun place_heap heap =
-      (place heap (heap, deps_loaded);
-       write_text (checkpoint_ok_path deps_loaded) (deps_checkpoint_ok_text deps_key);
+    fun heap_placed heap =
+      (write_text (checkpoint_ok_path deps_loaded) (deps_checkpoint_ok_text deps_key);
        touch_dir (Path.concat(store, heap)))
+    fun place_heap heap = (place heap (heap, deps_loaded); heap_placed heap)
     fun single role entries =
       case List.filter (fn (r, _, _) => r = role) entries of
           [(_, sha, arg)] => (sha, arg)
@@ -8013,10 +8044,10 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                  (List.app (place_sidecar heap) sidecars;
                  if not (checkpoint_timeout_satisfies requested_timeout (#path c)) then (wipe (); NONE)
                  else
-                   (place_heap heap;
-                    List.app (place heap) spine;
-                    List.app (place_sidecar heap) spine_sidecars;
-                    place heap (leaf, #path c);
+                   (transfer_all (fn (placer, file) => placer heap file)
+                      ((place, (heap, deps_loaded)) :: map (fn f => (place, f)) spine @
+                       map (fn f => (place_sidecar, f)) spine_sidecars @ [(place, (leaf, #path c))]);
+                    heap_placed heap;
                     if shared_heap_parent_ok ctx andalso chain_ok (#path c :: rev (map #2 spine)) andalso
                        #accepts c () then
                       (HolbuildStatus.message_stdout
@@ -8076,15 +8107,27 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
             in hashes := Redblackmap.insert (!hashes, path, sha); sha end
     val uploaded = ref (Redblackset.empty String.compare)
     (* has_blob knows only the blobs of the entries this process read. *)
-    fun upload_sha path sha =
-        if Redblackset.member (!uploaded, sha) orelse
-           HolbuildRemoteCache.has_blob remote sha andalso not (member sha missing) then sha
-        else
-          case HolbuildRemoteCache.publish_hashed_blob remote {hash = sha, src = path} of
-              HolbuildCacheBackend.Published => (uploaded := Redblackset.add (!uploaded, sha); sha)
-            | HolbuildCacheBackend.AlreadyPresent => (uploaded := Redblackset.add (!uploaded, sha); sha)
-            | _ => raise Error ("could not upload " ^ path)
-    fun upload path = upload_sha path (hash path)
+    fun needs_upload sha =
+      not (Redblackset.member (!uploaded, sha) orelse
+           HolbuildRemoteCache.has_blob remote sha andalso not (member sha missing))
+    fun put path sha =
+      case HolbuildRemoteCache.publish_hashed_blob remote {hash = sha, src = path} of
+          HolbuildCacheBackend.Published => ()
+        | HolbuildCacheBackend.AlreadyPresent => ()
+        | _ => raise Error ("could not upload " ^ path)
+    (* Puts the blobs of (path, sha256) pairs the cache may lack, in
+       parallel, each once. *)
+    fun upload_all pairs =
+      let
+        val pending =
+          #2 (List.foldl (fn ((path, sha), (seen, kept)) =>
+                             if Redblackset.member (seen, sha) orelse not (needs_upload sha) then (seen, kept)
+                             else (Redblackset.add (seen, sha), (path, sha) :: kept))
+                         (Redblackset.empty String.compare, []) pairs)
+      in
+        transfer_all (fn (path, sha) => put path sha) (rev pending);
+        uploaded := Redblackset.addList (!uploaded, map #2 pending)
+      end
     (* A heap this run saved is published only where no other worker's is:
        checkpoints on a heap that lost are chained to bytes no other worker
        has, so they stay local. *)
@@ -8094,7 +8137,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
       else
         let
           val manifest = shared_manifest "holbuild-shared-heap-v1" NONE [("heap", sha, "")]
-          val _ = upload_sha deps_loaded sha
+          val _ = upload_all [(deps_loaded, sha)]
           val _ = HolbuildRemoteCache.publish_action remote {key = heap_key, text = manifest}
         in
           if HolbuildRemoteCache.get_action remote heap_key = SOME manifest then
@@ -8161,7 +8204,8 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                     List.concat (map (sidecars_of "spine-sidecar") spine) @
                     [("leaf", #path c, rel (#path c))] @
                     map (fn suffix => ("sidecar", #path c ^ suffix, suffix)) sidecars
-                  val entries = map (fn (role, path, arg) => (role, upload path, arg)) files
+                  val entries = map (fn (role, path, arg) => (role, hash path, arg)) files
+                  val _ = upload_all (map (fn (_, path, _) => (path, hash path)) files)
                   (* An unconditional write: it replaces a failed prefix's
                      entry, as above. *)
                   val _ = HolbuildRemoteCache.replace_action_unconditionally remote
@@ -8491,14 +8535,13 @@ fun exec_run remote root tc (spec : run_spec) log =
     val src = in_root root run_source_dir
     val output_dir = in_root root ".holbuild/run-output"
     val scratch = in_root root ".holbuild/run-scratch"
-    fun fetch {path, sha256, ...} = fetch_spec_blob remote {hash = sha256, dst = in_root root path}
     val script = Path.concat (src, run_script_name)
-    val _ = fetch_spec_blob remote {hash = #sha256 (#script spec), dst = script}
-    val _ = List.app (fn {path, sha256, ...} => fetch_spec_blob remote {hash = sha256, dst = Path.concat (src, path)})
-                     (#supports spec)
-    val _ = List.app fetch (#context_scripts spec)
+    val files =
+      {hash = #sha256 (#script spec), dst = script} ::
+      map (fn {path, sha256, ...} => {hash = sha256, dst = Path.concat (src, path)}) (#supports spec) @
+      map (fn {path, sha256, ...} => {hash = sha256, dst = in_root root path}) (#context_scripts spec)
     val deps = run_spec_deps spec
-    val _ = hydrate_spec_deps remote root deps
+    val _ = hydrate_spec_deps remote root files deps
     val _ = (ensure_dir output_dir; ensure_dir scratch)
     fun load name =
       if String.isPrefix "HOLLIB:" name then String.extract (name, size "HOLLIB:", NONE)
