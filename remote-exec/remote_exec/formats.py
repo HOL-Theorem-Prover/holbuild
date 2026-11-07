@@ -9,7 +9,20 @@ THEORY = re.compile(r"[^\s:]+:\S+")
 PHASE = re.compile(r"[a-z]+")
 
 FAILURES = frozenset(
-    {"proof", "tactic-timeout", "memory", "input-missing", "publish", "toolchain", "disk", "spec-rejected", "internal", "unavailable"}
+    {
+        "proof",
+        "tactic-timeout",
+        "memory",
+        "input-missing",
+        "publish",
+        "toolchain",
+        "disk",
+        "spec-rejected",
+        "internal",
+        "script",
+        "timeout",
+        "unavailable",
+    }
 )
 
 

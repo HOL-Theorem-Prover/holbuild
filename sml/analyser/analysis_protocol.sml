@@ -41,4 +41,18 @@ fun unescape s =
 fun join fields = String.concatWith " " (map escape fields)
 fun split line = map unescape (String.tokens (fn c => c = #" ") line)
 
+(* Nested fields use the same escaping, with separators that preserve empty
+   values. The tag keeps an empty attribute list a nonempty outer field. *)
+fun encode_proof_attrs attrs =
+  String.concatWith "\n" ("attrs" ::
+    map (fn (key, values) => String.concatWith "\t" (map escape (key :: values))) attrs)
+
+fun decode_proof_attrs text =
+  case String.fields (fn c => c = #"\n") text of
+      "attrs" :: rows =>
+        map (fn row => case map unescape (String.fields (fn c => c = #"\t") row) of
+                          key :: values => (key, values)
+                        | [] => raise Fail "bad proof attribute record") rows
+    | _ => raise Fail "bad proof attributes"
+
 end

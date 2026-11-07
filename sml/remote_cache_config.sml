@@ -18,9 +18,9 @@ fun normalize_curl_config path = nonempty "remote cache curl config" path
 
 fun set_url url = override_url := SOME (normalize_url url)
 fun set_local_url NONE = local_url := NONE
-  | set_local_url (SOME url) = local_url := SOME (normalize_url url)
+  | set_local_url (SOME url) = if HolbuildOffline.enabled () then () else local_url := SOME (normalize_url url)
 fun set_local_curl_config NONE = local_curl_config := NONE
-  | set_local_curl_config (SOME path) = local_curl_config := SOME (normalize_curl_config path)
+  | set_local_curl_config (SOME path) = if HolbuildOffline.enabled () then () else local_curl_config := SOME (normalize_curl_config path)
 
 fun set_prefetch_concurrency n = prefetch_concurrency := SOME n
 
@@ -31,6 +31,7 @@ fun env_url () =
     | NONE => NONE
 
 fun configured_url () =
+  if HolbuildOffline.enabled () then NONE else
   case !override_url of
       SOME url => SOME url
     | NONE =>
@@ -39,6 +40,7 @@ fun configured_url () =
           | NONE => !local_url
 
 fun curl_config () =
+  if HolbuildOffline.enabled () then NONE else
   case OS.Process.getEnv "HOLBUILD_REMOTE_CACHE_CURL_CONFIG" of
       SOME path => SOME (normalize_curl_config path)
     | NONE => !local_curl_config

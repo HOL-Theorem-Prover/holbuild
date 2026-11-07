@@ -152,6 +152,7 @@ fun warn_restore_once message =
    message. *)
 fun cli_status options url =
   let
+    val _ = HolbuildOffline.require_online "contact the remote cache"
     val result =
       run "curl" (["-q", "-sS", "-L", "--connect-timeout", Int.toString HolbuildHttp.connect_timeout_seconds,
                    "--speed-limit", "1", "--speed-time", Int.toString stall_timeout_seconds,

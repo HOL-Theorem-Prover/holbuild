@@ -359,6 +359,8 @@ Common global options:
   `HOLBUILD_SOURCE_DIR` or the current working directory.
 - `--cache-dir PATH`: global cache directory. Overrides `HOLBUILD_CACHE` and the
   platform default cache location.
+- `--offline`: disable holbuild-managed network access. Also enabled by
+  `HOLBUILD_OFFLINE=1`; see [Offline builds](#offline-builds).
 - `--remote-cache URL`: optional Bazel-style HTTP remote cache endpoint. Also
   configurable with `HOLBUILD_REMOTE_CACHE_URL` or project-local
   `.holconfig.toml`.
@@ -386,6 +388,39 @@ Common global options:
   the local cache at once, ahead of the build workers. Defaults to 50 or twice
   the build's jobs, whichever is larger; also limits remote-cache existence
   checks before batch export. Only used with a remote cache.
+
+### Offline builds
+
+Use `holbuild --offline build MyTheory` (or `HOLBUILD_OFFLINE=1`) to build
+using only dependencies and HOL toolchains already available locally. First
+prepare the same project and cache directory with offline mode unset:
+
+```sh
+holbuild buildhol
+holbuild context
+holbuild build MyTheory
+holbuild --offline build MyTheory
+```
+
+A missing or wrong-revision dependency checkout fails before clone or fetch,
+even if its commit is in a local bare mirror. A missing or invalid HOL
+toolchain also fails before restore or replacement. The error names what needs
+preparing; rerun without `--offline` and with `HOLBUILD_OFFLINE` unset. Valid
+local toolchains can regenerate analyser and source metadata offline.
+Local artifact caching stays enabled, including reads and writes.
+
+Offline mode ignores remote-cache settings in the environment and
+`.holconfig.toml`, including HTTP-client setup. Explicit `--remote-cache` or
+`--remote-exec` conflicts with offline mode and fails before project work.
+`action-spec` and `exec-action` require a remote cache; help, version and
+other local commands remain available. Setting
+`HOLBUILD_OFFLINE=0` leaves online behavior unchanged; `--offline` always
+enables offline mode.
+
+This policy covers holbuild-managed Git, remote-cache and coordinator access,
+including Git's implicit fetching of missing objects. It is not a network
+sandbox: user generators, build scripts and invoked programs can still access
+the network themselves.
 
 ### Sharing a machine's memory between holbuild processes
 
@@ -877,9 +912,17 @@ theory.
 By default, `holbuild` instruments modern theorem and explicit termination
 proofs in the root package and executes them as proof steps. This gives better
 failure locations, per-step tactic timeouts, and optional traces. Theorem proofs
-also support failed-prefix checkpoints; termination proofs currently replay from
-the preceding clean definition/theorem/dependency checkpoint. Theories in
-dependency packages build without proof-step instrumentation or checkpoints
+without proof execution attributes also support failed-prefix checkpoints;
+termination proofs currently replay from the preceding clean
+definition/theorem/dependency checkpoint.
+
+`Proof[...]` attributes such as `exclude_simps` and `exclude_frags`, including
+those on `Resume`, remain active across the entire stepped proof. They retain
+leaf diagnostics, timeouts and traces. Attributed proofs save theorem-context state
+after the declaration is bound and the temporary modifier has unwound; they do not
+save or restore failed-prefix checkpoints.
+
+Theories in dependency packages build without proof-step instrumentation or checkpoints
 by default. To audit their proofs too, select `--proof-scope=all`.
 
 Useful commands and options:
@@ -968,7 +1011,16 @@ Important paths:
 .holbuild/packages/<package>          # package build artefacts
 .holbuild/plan/<fingerprint>          # plan records
 $HOLBUILD_CACHE/hol-toolchains/       # built HOL toolchains and analysers
+$HOLBUILD_CACHE/analysis/             # sources' dependency analyses
 ```
+
+Planning analyses each source for its dependencies (its `load`s, `use`s,
+Holdep mentions and declared extra inputs and outputs) and keeps the result in
+`.holbuild/obj` and in the cache's `analysis/` directory. An entry there is
+named after the source's content, the analyser's version and the HOL sources
+the analyser is built against, so another checkout of the same sources on the
+machine reads it instead of analysing again, and a different HOL pin never
+uses it.
 
 ### The plan record
 
@@ -1471,6 +1523,12 @@ run, unless `--quiet` is given. Progress never goes to stdout, which keeps the
 locking/discovery and does not require a HOL toolchain. Project checkpoint GC
 uses `.holconfig.toml`'s `[build].checkpoint_limit_gb` unless overridden with
 `--max-checkpoints-gb`.
+
+Cache GC removes the dependency analyses under `analysis/` that no build has
+read or written within the retention period. A build that finds its analyses
+in `.holbuild/obj` doesn't count as a use, so such an entry can go while a
+checkout still uses the project's copy; the next fresh checkout analyses that
+source again.
 
 Cache GC also removes installed HOL toolchains under `hol-toolchains/` that no
 holbuild command has used within the retention period; a removed toolchain is

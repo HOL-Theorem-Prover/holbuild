@@ -67,10 +67,10 @@ fun read_all_file path =
   in TextIO.inputAll input before TextIO.closeIn input end
 
 fun emit_boundary ({kind, name, safe_name, theorem_start, theorem_stop, boundary, tactic_start,
-                    tactic_end, tactic_text, has_proof_attrs, prefix_hash} : S.boundary) =
+                    tactic_end, tactic_text, proof_attrs, prefix_hash} : S.boundary) =
   P.join ["boundary", kind, name, safe_name, Int.toString theorem_start, Int.toString theorem_stop,
           Int.toString boundary, Int.toString tactic_start, Int.toString tactic_end,
-          if has_proof_attrs then "1" else "0", prefix_hash, tactic_text]
+          P.encode_proof_attrs proof_attrs, prefix_hash, tactic_text]
 
 fun emit_termination ({name, safe_name, definition_start, definition_stop, boundary, quote_start,
                        quote_end, quote_text, tactic_start, tactic_end, tactic_text} : S.termination) =
@@ -116,6 +116,32 @@ fun step_sml step =
         "HolbuildProofIr.StepTry {start_pos=" ^ sml_int start_pos ^ ", end_pos=" ^ sml_int end_pos ^
         ", body=" ^ plan_sml body ^ "}"
 and plan_sml steps = sml_list (map step_sml steps)
+
+(* Factories are compiled at the original tactic slot, where HOL supplies its
+   lexical readers. Constructing a tactic remains the runtime step's work. *)
+fun factories_sml steps =
+  let
+    fun add text texts = if List.exists (fn old => old = text) texts then texts else text :: texts
+    fun add_option NONE texts = texts | add_option (SOME text) texts = add text texts
+    fun collect (step, (tactics, lists)) =
+      case step of
+          HolbuildProofIr.StepTactic {program, ...} => (add program tactics, lists)
+        | HolbuildProofIr.StepList {program, ...} => (tactics, add program lists)
+        | HolbuildProofIr.StepSelect {selector, body, ...} =>
+            List.foldl collect
+              (add_option (HolbuildProofIr.selector_program selector) tactics,
+               add_option (HolbuildProofIr.selector_list_tactic selector) lists) body
+        | HolbuildProofIr.StepEach {body, ...} => List.foldl collect (tactics, lists) body
+        | HolbuildProofIr.StepCases {cases, ...} => List.foldl (fn (body, acc) => List.foldl collect acc body) (tactics, lists) cases
+        | HolbuildProofIr.StepChoice {alternatives, ...} => List.foldl (fn (body, acc) => List.foldl collect acc body) (tactics, lists) alternatives
+        | HolbuildProofIr.StepRepeat {body, ...} => List.foldl collect (tactics, lists) body
+        | HolbuildProofIr.StepTry {body, ...} => List.foldl collect (tactics, lists) body
+    val (tactics, lists) = List.foldl collect ([], []) steps
+    fun factory program = "(" ^ sml_string program ^ ", fn () => (" ^ program ^ "))"
+  in
+    "{tactics=" ^ sml_list (map factory (rev tactics)) ^
+    ", list_tactics=" ^ sml_list (map factory (rev lists)) ^ "}"
+  end
 
 fun selector_fields HolbuildProofIr.SelectFirst = ["first"]
   | selector_fields (HolbuildProofIr.SelectMatchingFirst pats) = ["matching-first", pats]
@@ -167,12 +193,12 @@ fun emit_steps steps =
   in List.concat (map one steps) end
 
 fun emit_proof_plan ({name, tactic_start, tactic_end, steps} : PI.theorem_plan) =
-  P.join ["begin-proof-ir", name, Int.toString tactic_start, Int.toString tactic_end, plan_sml steps] ::
+  P.join ["begin-proof-ir", name, Int.toString tactic_start, Int.toString tactic_end, plan_sml steps, factories_sml steps] ::
   emit_steps steps @
   [P.join ["end-proof-ir", name]]
 
 fun emit_proof_plan_with_id id ({name, tactic_start, tactic_end, steps} : PI.theorem_plan) =
-  P.join ["begin-proof-ir", id, name, Int.toString tactic_start, Int.toString tactic_end, plan_sml steps] ::
+  P.join ["begin-proof-ir", id, name, Int.toString tactic_start, Int.toString tactic_end, plan_sml steps, factories_sml steps] ::
   emit_steps steps @
   [P.join ["end-proof-ir", id]]
 

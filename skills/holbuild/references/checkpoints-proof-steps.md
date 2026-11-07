@@ -11,6 +11,12 @@ When proof steps are enabled (default), holbuild instruments modern theorem decl
 
 The runtime is **proof IR**. It lowers `HOLSourceAST.exp` directly and executes exact HOL tactic/list-tactic boundaries for recognized constructs. If the proof-IR planner cannot parse/decompose a recovered tactic expression, it falls back to a whole-tactic leaf so the proof still runs under the installed runtime. `--goalfrag` and `goalfrag-plan` have been removed. The old `--new-ir` flag is a deprecated no-op because proof IR is default.
 
+Proof execution attributes (`Proof[...]` and attributed `Resume`) run through the
+stepped proof engine inside HOL's native modifier scope. They retain leaf
+diagnostics, timeouts and tracing, but never save or restore failed-prefix
+checkpoints. Their theorem-context checkpoint is saved after the declaration
+and modifier have completed, like an ordinary theorem.
+
 This enables:
 - Per-step tactic timeouts (`--tactic-timeout`)
 - PolyML checkpoint saves at dependency/theorem/proof boundaries
@@ -22,7 +28,7 @@ This enables:
 Simple theorem forms are **not** theorem-checkpoint-instrumented in v1:
 - `Theorem name = thm` (no proof body)
 - `store_thm`, `save_thm`, `Q.store_thm` calls
-- `Resume` / `Finalise` declarations
+- `Finalise` declarations
 
 These still execute normally during build, just without theorem-context/failed-prefix proof checkpoints.
 

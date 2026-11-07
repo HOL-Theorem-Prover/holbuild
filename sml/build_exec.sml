@@ -2469,7 +2469,7 @@ fun theorem_checkpoint_specs proof_engine proof_timeout base deps_key inputs_key
     fun pair (boundary, proof_ir_plan) =
       let
         val {kind, name, safe_name, theorem_start, theorem_stop, boundary = boundary_pos, tactic_start,
-             tactic_end, tactic_text, has_proof_attrs, prefix_hash = source_prefix_hash} = boundary
+             tactic_end, tactic_text, proof_attrs, prefix_hash = source_prefix_hash} = boundary
         val prefix_hash = script_prefix_key inputs_key source_name source_prefix_hash
         val checkpoint_key = theorem_checkpoint_key {kind = kind, name = name, safe_name = safe_name,
                                                      boundary = boundary_pos, deps_key = deps_key,
@@ -2481,7 +2481,7 @@ fun theorem_checkpoint_specs proof_engine proof_timeout base deps_key inputs_key
         {kind = kind, name = name, safe_name = safe_name, theorem_start = theorem_start,
          theorem_stop = theorem_stop, boundary = boundary_pos,
          tactic_start = tactic_start, tactic_end = tactic_end,
-         tactic_text = tactic_text, has_proof_attrs = has_proof_attrs,
+         tactic_text = tactic_text, proof_attrs = proof_attrs,
          prefix_hash = prefix_hash,
          context_path = theorem_context_path base deps_key proof_engine prefix_hash safe_name,
          context_ok = theorem_checkpoint_ok "theorem_context" deps_key proof_engine proof_timeout prefix_hash checkpoint_key,
@@ -2489,7 +2489,8 @@ fun theorem_checkpoint_specs proof_engine proof_timeout base deps_key inputs_key
          failed_prefix_ok = failed_prefix_ok proof_engine proof_timeout deps_key safe_name pre_hash header_hash,
          deps_key = deps_key,
          checkpoint_key = checkpoint_key,
-         proof_ir_plan = proof_ir_plan}
+         proof_ir_plan = Option.map #1 proof_ir_plan,
+         proof_ir_factories = Option.map #2 proof_ir_plan}
       end
   in
     if length proof_ir_plans = length boundaries then ListPair.map pair (boundaries, proof_ir_plans)
@@ -2679,8 +2680,9 @@ fun checkpoint_ok_text_matches_ordered requested_timeout path expected_text =
                     checkpoint_timeout_satisfies requested_timeout path
      | NONE => false)
 
-fun failed_prefix_checkpoint requested_timeout checkpoint =
-  if checkpoint_ok_text_matches_ordered requested_timeout (#failed_prefix_path checkpoint) (#failed_prefix_ok checkpoint) then
+fun failed_prefix_checkpoint requested_timeout (checkpoint : HolbuildTheoryCheckpoints.checkpoint) =
+  if not (null (#proof_attrs checkpoint)) then NONE
+  else if checkpoint_ok_text_matches_ordered requested_timeout (#failed_prefix_path checkpoint) (#failed_prefix_ok checkpoint) then
     case failed_prefix_metadata (#failed_prefix_path checkpoint) of
         SOME {step_count, metadata_text} =>
           SOME {checkpoint = checkpoint, step_count = step_count, metadata_text = metadata_text}
@@ -4049,7 +4051,7 @@ fun analyser_proof_ir_plan_sml (inputs : proof_ir_input list) =
                            raise Error "holbuild-hol-analyser failed")
           val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
           val expected = length inputs
-          val result = Array.array(expected, NONE : string option)
+          val result = Array.array(expected, NONE : (string * string) option)
           fun store id expr =
             case Int.fromString id of
                 SOME i => if i >= 0 andalso i < expected then Array.update(result, i, SOME expr)
@@ -4060,7 +4062,7 @@ fun analyser_proof_ir_plan_sml (inputs : proof_ir_input list) =
                 [] => ()
               | line :: more =>
                   (case HolbuildAnalysisProtocol.split line of
-                       "begin-proof-ir" :: id :: _ :: _ :: _ :: expr :: _ => (store id expr; loop more)
+                       ["begin-proof-ir", id, _, _, _, expr, factories] => (store id (expr, factories); loop more)
                      | _ => loop more)
           val _ = loop (String.tokens (fn c => c = #"\n") text)
           fun require i =
@@ -4143,7 +4145,7 @@ fun termination_proof_plans_for_action policy (action : theory_action) terminati
            boundary = boundary, quote_start = quote_start, quote_end = quote_end,
            quote_text = quote_text, tactic_start = tactic_start,
            tactic_end = tactic_end, tactic_text = tactic_text,
-           proof_ir_plan = plan}
+           proof_ir_plan = Option.map #1 plan}
         end
     in
       if length plans = length terminations then ListPair.map attach (terminations, plans)
@@ -5842,6 +5844,7 @@ fun drop_local_cache_entries keys =
    it and it can't be published from the local cache. *)
 fun export_action_specs (options : build_options) tc project plan toolchain_key jobs {upload, local_resumable, forced, ledger} =
   let
+    val _ = if upload then HolbuildOffline.require_online "upload action specs" else ()
     val remote =
       case HolbuildRemoteCacheConfig.url () of
           SOME url => HolbuildRemoteCache.remote url
@@ -7444,6 +7447,7 @@ fun publish_early_cutoff remote pair_key input_key =
    `toolchain` ensures the spec's HOL toolchain and returns it. *)
 fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
   let
+    val _ = HolbuildOffline.require_online "execute a remote action"
     val start = Time.now ()
     val remote =
       case HolbuildRemoteCacheConfig.url () of
