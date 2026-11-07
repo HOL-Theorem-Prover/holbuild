@@ -690,6 +690,51 @@ async def test_events_stream_action_states_then_the_batch(http: httpx.AsyncClien
     assert events[0]["log_sha256"] == "a" * 64
 
 
+async def test_changes_reads_only_the_actions_written_since_the_last_read(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, remote_exec_engine: Any
+) -> None:
+    """An event stream's polls read what changed since the previous one, including a write that committed after
+    a poll began, and not every action of the batch again."""
+    batch_id = UUID(await submit(http, ["a", "b"]))
+
+    def names(changed: tuple[Any, int] | None) -> set[str]:
+        assert changed is not None
+        return {action.theory for action in changed[0].actions}
+
+    first = await coordinator.changes(batch_id, 0)
+    assert first is not None and names(first) == {"pkg:a", "pkg:b"}
+    assert names(await coordinator.changes(batch_id, first[1])) == set()
+
+    await build(http, cache, "a")
+    async with remote_exec_engine.connect() as late:
+        await late.execute(
+            sa.text("UPDATE actions SET attempts = 1 WHERE batch_id = :id AND theory = 'pkg:b'"), {"id": batch_id}
+        )
+        during = await coordinator.changes(batch_id, first[1])  # b's write is uncommitted
+        assert during is not None and names(during) == {"pkg:a"}
+        await late.commit()
+    assert names(await coordinator.changes(batch_id, during[1])) == {"pkg:b"}
+
+    async with remote_exec_engine.begin() as connection:  # many settled actions don't make a poll read more
+        await connection.execute(
+            sa.text(
+                "INSERT INTO actions (batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier) "
+                "SELECT :id, 'k' || g, 'ac', 's', 'pkg:t' || g, 0, 'done', 'standard' FROM generate_series(1, 20000) g"
+            ),
+            {"id": batch_id},
+        )
+        await connection.execute(sa.text("ANALYZE actions"))
+    settled = await coordinator.changes(batch_id, 0)
+    assert settled is not None
+    async with remote_exec_engine.begin() as connection:
+        plan = await connection.scalar(
+            sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {coordinator_module.CHANGED_ACTIONS.text}"),
+            {"batch_id": batch_id, "since": str(settled[1])},
+        )
+    assert plan[0]["Plan"]["Actual Rows"] == 0
+    assert plan[0]["Plan"]["Shared Hit Blocks"] + plan[0]["Plan"]["Shared Read Blocks"] < 20
+
+
 async def test_retention_deletes_old_terminal_batches_and_stale_hints(
     http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, remote_exec_engine: Any
 ) -> None:
