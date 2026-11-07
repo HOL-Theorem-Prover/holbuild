@@ -3963,6 +3963,26 @@ datatype run_from_state =
   DepsLoadedState of {path : string, load : string option}
 | NoRunFromState of string
 
+(* Whether every project dependency of NODE is built here for its current
+   source, rather than older than it or not built. *)
+fun deps_built_for_current_sources project plan keys node =
+  let
+    fun built_for_current_source dep =
+      case current_metadata (metadata_path project dep) of
+          SOME text => metadata_input_key_matches (HolbuildBuildPlan.input_key_for keys dep) text
+        | NONE => false
+  in
+    List.all built_for_current_source (HolbuildBuildPlan.transitive_project_deps plan node)
+  end
+
+(* The key of NODE's dependency context as things stand, before anything is
+   built: the dependencies' outputs on disk can be older than their sources,
+   so key on them only when every one is built for its current source. *)
+fun current_dependency_context_key toolchain_key project plan keys node =
+  if deps_built_for_current_sources project plan keys node
+  then dependency_context_key toolchain_key plan keys node
+  else dependency_input_context_key toolchain_key plan keys node
+
 (* Checkpoints are current only for the keys a build of NODE would use now.
    Run holds no project lock, so this only reads checkpoint files; a build, gc
    or eviction that removes the chosen checkpoint before HOL loads it makes
@@ -3971,17 +3991,7 @@ fun run_from_state tc project plan keys node =
   let
     val name = logical_name node
     val toolchain_key = HolbuildToolchain.toolchain_key tc
-    fun built_for_current_source dep =
-      case current_metadata (metadata_path project dep) of
-          SOME text => metadata_input_key_matches (HolbuildBuildPlan.input_key_for keys dep) text
-        | NONE => false
-    (* Run builds nothing, so the dependencies' outputs on disk can be older
-       than their sources: key on them only when every one is built for its
-       current source. *)
-    val deps_key =
-      if List.all built_for_current_source (HolbuildBuildPlan.transitive_project_deps plan node)
-      then dependency_context_key toolchain_key plan keys node
-      else dependency_input_context_key toolchain_key plan keys node
+    val deps_key = current_dependency_context_key toolchain_key project plan keys node
     val base = checkpoint_base project node
     fun deps_loaded_current dir =
       HolbuildCheckpointStore.ok_current (Path.concat(dir, "deps_loaded.save"))
@@ -5314,9 +5324,10 @@ fun prefetch_key (options : build_options) project keys node =
 
 (* Runs `work` on each item added, on up to `limit` background threads, in
    the order added; an item added while fewer than `limit` run starts at
-   once.  Returns {add, stop}: stop drops the items not yet started and
-   waits for those in flight.  Failures are silent: for a prefetch, the
-   demand restore of the same key retries and reports. *)
+   once.  Returns {add, drain, stop}: drain waits for all added work; stop drops
+   the items not yet started and waits for those in flight.  Failures are
+   silent: for a prefetch, the demand restore of the same key retries and
+   reports. *)
 fun start_background_pool limit work =
   let
     val front = ref [] and back = ref []
@@ -5355,7 +5366,7 @@ fun start_background_pool limit work =
       else ()
     fun stop () = (with_lock (fn () => (stopped := true; front := []; back := [])); wait ())
   in
-    {add = add, stop = stop}
+    {add = add, drain = wait, stop = stop}
   end
 
 fun prefetch_limit jobs =
@@ -5381,7 +5392,7 @@ fun start_remote_cache_prefetch (options : build_options) project plan keys jobs
                 | NONE => ()
             val limit = prefetch_limit jobs
             val _ = cache_trace ("remote cache prefetch threads: " ^ Int.toString (Int.min (limit, length nodes)))
-            val {add, stop} = start_background_pool limit prefetch
+            val {add, stop, ...} = start_background_pool limit prefetch
           in
             List.app add nodes;
             stop
@@ -5390,7 +5401,7 @@ fun start_remote_cache_prefetch (options : build_options) project plan keys jobs
 
 (* For build --remote-exec while it follows its batch: starts copying into
    the local cache the remote entries of the plan's theories outside the
-   batch, given its keys (SOME batch_keys), which the remote cache already
+   batch, given its keys (SOME batch_keys), that the remote cache already
    holds, as start_remote_cache_prefetch does.  Returns {add, stop}: add
    copies the entry of one more key, as the batch finishes its action; stop
    drops the copies not yet started, which the build's own prefetch makes,
@@ -5402,7 +5413,7 @@ fun start_remote_exec_prefetch (options : build_options) tc project plan toolcha
         else
           let
             val root = cache_root ()
-            val pool as {add, ...} = start_background_pool (prefetch_limit jobs) (prefetch_remote_cache_key root url)
+            val {add, stop, ...} = start_background_pool (prefetch_limit jobs) (prefetch_remote_cache_key root url)
             fun seed batch_keys =
               let
                 val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
@@ -5417,7 +5428,7 @@ fun start_remote_exec_prefetch (options : build_options) tc project plan toolcha
               end
           in
             Option.app seed batch_keys;
-            pool
+            {add = add, stop = stop}
           end
     | NONE => {add = fn _ => (), stop = fn () => ()}
 
@@ -5795,8 +5806,18 @@ fun drop_local_cache_entries keys =
 
 (* Writes the ActionSpec of every theory in the plan the remote cache can't
    satisfy, or whose input key is in forced, uploads them and their sources
-   with upload, and returns the batch. *)
-fun export_action_specs (options : build_options) tc project plan toolchain_key upload forced =
+   with upload, and returns the batch.
+   With local_resumable, a leaf of the batch (no theory in it depends on it)
+   is left out, for the local build that follows to build, when its local
+   build would resume from a checkpoint, or when it is the only theory to
+   build and its project dependencies are all built here for their current
+   sources (and it has some, or was built here before).  Either is faster
+   than running it on a worker, which loads the dependencies from the cache
+   and has none of the project's checkpoints, and the local build leaves
+   checkpoints for the next one.  remote_only
+   builds nothing locally, so under it only the first leaves are left out,
+   and the message says to build them without it. *)
+fun export_action_specs (options : build_options) tc project plan toolchain_key jobs {upload, local_resumable, remote_only, forced} =
   let
     val remote =
       case HolbuildRemoteCacheConfig.url () of
@@ -5826,14 +5847,89 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
                                " can't run remotely: " ^ reason)
               | NONE => ())
         actions
+    datatype cache_check = Hit | Miss | CheckFailed of exn
+    val checks = map (fn action => (action, ref Miss)) actions
+    val total = length actions
+    val completed = ref 0
+    val next_report = ref (Time.now ())
+    val progress_mutex = Mutex.mutex ()
+    fun report () =
+      let val now = Time.now ()
+      in
+        if not (HolbuildStatus.quiet_mode ()) andalso
+           (!completed = total orelse Time.>= (now, !next_report)) then
+          (HolbuildStatus.message_stderr
+             ("checking remote cache: " ^ Int.toString (!completed) ^ "/" ^
+              Int.toString total ^ " theories\n");
+           next_report := Time.+ (now, Time.fromSeconds 5))
+        else ()
+      end
+    fun check ((node, action), result) =
+      let
+        (* Each check owns the mutable blob metadata, as restore prefetch does. *)
+        val remote = HolbuildRemoteCache.remote (HolbuildRemoteCache.base_url remote)
+      in
+      (result := ((if not (List.exists (fn key => key = #input_key action) forced) andalso
+                      remote_entry_satisfies remote options project plan node (#input_key action)
+                   then Hit else Miss) handle e => CheckFailed e);
+       Mutex.lock progress_mutex;
+       ((completed := !completed + 1; report ()) before Mutex.unlock progress_mutex)
+       handle e => (Mutex.unlock progress_mutex; raise e))
+      end
+    val _ = report ()
+    val {add, drain, stop} = start_background_pool (prefetch_limit jobs) check
+    val _ = (List.app add checks; drain ()) handle e => (stop (); raise e)
     val uncached_actions =
-      List.filter
-        (fn (node, action) =>
-            List.exists (fn key => key = #input_key action) forced orelse
-            not (remote_entry_satisfies remote options project plan node (#input_key action)))
-        actions
-    val uncached_keys = map (HolbuildBuildPlan.key o #1) uncached_actions
-    fun uncached node = List.exists (fn k => k = HolbuildBuildPlan.key node) uncached_keys
+      List.mapPartial (fn (action, result) =>
+        case !result of Hit => NONE | Miss => SOME action | CheckFailed e => raise e) checks
+    fun uncached_in actions node =
+      List.exists (fn (n, _) => HolbuildBuildPlan.key n = HolbuildBuildPlan.key node) actions
+    fun leaf parent_keys node = not (List.exists (fn k => k = HolbuildBuildPlan.key node) parent_keys)
+    (* Every checkpoint a build resumes from sits on the theory's deps_loaded
+       checkpoint for its current dependencies. *)
+    fun resumable node =
+      let val deps_key = current_dependency_context_key toolchain_key project plan keys node
+      in deps_checkpoint_exists (deps_loaded_path (checkpoint_base project node) deps_key) deps_key end
+    (* A theory without project dependencies has them all built anywhere, so
+       it also needs a build of its own here, to be a theory worked on here. *)
+    fun deps_built_here node =
+      deps_built_for_current_sources project plan keys node andalso
+      (not (null (HolbuildBuildPlan.transitive_project_deps plan node)) orelse
+       isSome (current_metadata (metadata_path project node)))
+    (* Many theories changed on dependencies built here, as after a merge,
+       build faster side by side on the workers; one alone is an edit loop. *)
+    val alone = length uncached_actions = 1
+    fun local_reason parent_keys (node, _) =
+      if not (leaf parent_keys node andalso
+              checkpoint_enabled (checkpoint_policy_for_node options project node)) then NONE
+      else if resumable node then
+        SOME ("to resume from its local checkpoints" ^
+              (if remote_only then "; --remote-only builds nothing locally, so build it without --remote-only"
+               else ""))
+      else if not remote_only andalso alone andalso deps_built_here node then
+        SOME "to build on its dependencies built here"
+      else NONE
+    val (local_actions, uncached_actions) =
+      if local_resumable then
+        let
+          val parent_keys =
+            List.concat (map (fn (node, _) =>
+                                 map HolbuildBuildPlan.key
+                                     (uncached_parents plan (uncached_in uncached_actions) node))
+                             uncached_actions)
+          val reasons = map (fn action => (action, local_reason parent_keys action)) uncached_actions
+        in
+          (List.mapPartial (fn ((node, _), SOME reason) => SOME (node, reason) | (_, NONE) => NONE) reasons,
+           List.mapPartial (fn (action, NONE) => SOME action | (_, SOME _) => NONE) reasons)
+        end
+      else ([], uncached_actions)
+    val _ =
+      List.app (fn (node, reason) =>
+                   HolbuildStatus.message_stderr
+                     ("holbuild: remote execution: " ^ package node ^ ":" ^ logical_name node ^
+                      " stays out of the batch, " ^ reason ^ "\n"))
+               local_actions
+    val uncached = uncached_in uncached_actions
     val toolchain_line =
       case HolbuildProject.resolved_hol_dependency_with {kernel_variant = #kernel_variant tc} project of
           SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev}, ...}) =>

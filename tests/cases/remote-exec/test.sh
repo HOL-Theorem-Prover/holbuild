@@ -147,7 +147,7 @@ require_grep "^edge " "$state/b1.batch"
 # With everything cached there is nothing to submit.
 run cached 0 build --remote-exec "$coordinator" BTheory
 refute_grep "remote batch" "$tmpdir/cached.log"
-require_grep "remote execution: the remote cache has every theory" "$tmpdir/cached.log"
+require_grep "remote execution: nothing to build remotely" "$tmpdir/cached.log"
 
 # Detach and reattach.
 write_theories two
@@ -512,6 +512,73 @@ require_grep "batch b[0-9]* cancelled; remote workers finished 0 of 2 theories; 
 require_grep "BTheory built" "$tmpdir/cancelled.log"
 rm "$state/cancelled"
 
+# A leaf of the batch whose local build would resume from a checkpoint stays
+# out of it and builds locally: BTheory, built locally just above, changes
+# alone.  --remote-only then builds nothing and exits 75.
+sed -i 's/(\* cancelled \*)/(* leaf-local *)/' "$project/src/BScript.sml"
+: > "$state/requests.log"
+run leaf-local-only 75 build --remote-exec "$coordinator" --remote-only BTheory
+require_grep "remote execution: rx:BTheory stays out of the batch, to resume from its local checkpoints; --remote-only builds nothing locally, so build it without --remote-only" "$tmpdir/leaf-local-only.log"
+require_grep "BTheory is not in the remote cache, and --remote-only builds nothing locally" "$tmpdir/leaf-local-only.log"
+run leaf-local 0 build --remote-exec "$coordinator" BTheory
+require_grep "remote execution: rx:BTheory stays out of the batch, to resume from its local checkpoints" "$tmpdir/leaf-local.log"
+require_grep "remote execution: nothing to build remotely" "$tmpdir/leaf-local.log"
+require_grep "resuming BTheory" "$tmpdir/leaf-local.log"
+require_grep "BTheory built" "$tmpdir/leaf-local.log"
+refute_grep "^POST /v1/batches" "$state/requests.log"
+# A theory with current checkpoints that another theory in the batch depends
+# on goes in: ATheory, built locally above, changes, so BTheory does too.
+find "$project/.holbuild/checkpoints" -path '*AScript*' -name deps_loaded.save | grep -q . ||
+  { echo "ATheory has no deps_loaded checkpoint" >&2; exit 1; }
+sed -i 's/(\* cancelled \*)/(* not-leaf *)/' "$project/src/AScript.sml"
+run not-leaf 0 build --remote-exec "$coordinator" BTheory
+refute_grep "stays out of the batch" "$tmpdir/not-leaf.log"
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/not-leaf.log")
+require_grep "^action .* rx:ATheory$" "$state/$batch.batch"
+require_grep "^action .* rx:BTheory$" "$state/$batch.batch"
+# --detach submits a checkpointed leaf.
+sed -i 's/(\* leaf-local \*)/(* leaf-detach *)/' "$project/src/BScript.sml"
+run leaf-detach 0 build --remote-exec "$coordinator" --detach BTheory
+refute_grep "stays out of the batch" "$tmpdir/leaf-detach.log"
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/leaf-detach.log")
+require_grep "^action .* rx:BTheory$" "$state/$batch.batch"
+refute_grep "Theory built" "$tmpdir/leaf-detach.log"
+# Without checkpoints, a leaf whose dependencies are built here stays out
+# too, and its build leaves them; --remote-only, which can't build it here,
+# sends it to the workers.
+rm -r "$project/.holbuild/checkpoints"
+sed -i 's/(\* leaf-detach \*)/(* leaf-remote *)/' "$project/src/BScript.sml"
+run leaf-remote-only 0 build --remote-exec "$coordinator" --remote-only BTheory
+refute_grep "stays out of the batch" "$tmpdir/leaf-remote-only.log"
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/leaf-remote-only.log")
+require_grep "^action .* rx:BTheory$" "$state/$batch.batch"
+require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/leaf-remote-only.log"
+require_grep "BTheory restored from cache" "$tmpdir/leaf-remote-only.log"
+sed -i 's/(\* leaf-remote \*)/(* leaf-deps *)/' "$project/src/BScript.sml"
+: > "$state/requests.log"
+run leaf-deps 0 build --remote-exec "$coordinator" BTheory
+require_grep "remote execution: rx:BTheory stays out of the batch, to build on its dependencies built here" "$tmpdir/leaf-deps.log"
+require_grep "BTheory built" "$tmpdir/leaf-deps.log"
+refute_grep "^POST /v1/batches" "$state/requests.log"
+find "$project/.holbuild/checkpoints" -path '*BScript*' -name deps_loaded.save | grep -q . ||
+  { echo "BTheory's build left no deps_loaded checkpoint" >&2; exit 1; }
+# Two such leaves, as after a merge, both go to the workers; so does a
+# theory with no project dependencies that was never built here.
+rm -r "$project/.holbuild/checkpoints"
+sed -i 's/(\* leaf-deps \*)/(* leaf-many *)/' "$project/src/BScript.sml"
+printf 'Theory C\nAncestors A\n\nTheorem c_thm:\n  T\nProof\n  simp[]\nQED\n' > "$project/src/CScript.sml"
+run leaf-many 0 build --remote-exec "$coordinator" BTheory CTheory
+refute_grep "stays out of the batch" "$tmpdir/leaf-many.log"
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/leaf-many.log")
+require_grep "^action .* rx:BTheory$" "$state/$batch.batch"
+require_grep "^action .* rx:CTheory$" "$state/$batch.batch"
+printf 'Theory D\nAncestors bool\n\nTheorem d_thm:\n  T\nProof\n  simp[]\nQED\n' > "$project/src/DScript.sml"
+run leaf-cold 0 build --remote-exec "$coordinator" DTheory
+refute_grep "stays out of the batch" "$tmpdir/leaf-cold.log"
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/leaf-cold.log")
+require_grep "^action .* rx:DTheory$" "$state/$batch.batch"
+rm "$project/src/CScript.sml" "$project/src/DScript.sml"
+
 # A submission answered 502 while the coordinator restarts is retried, and
 # given up on when it stays down.
 write_theories restarting
@@ -677,6 +744,17 @@ refute_grep "Theory built\|building locally" "$tmpdir/proof.log"
 [[ $(sha256sum < "$project/.holbuild/logs/current/rxp/BTheory/build.log" | cut -d' ' -f1) == "$log_sha" ]] ||
   { echo "the local build log is not the worker's" >&2; exit 1; }
 [[ $(local_hol_runs "$tmpdir/proof.timing") -eq 0 ]] || { cat "$tmpdir/proof.timing" >&2; exit 1; }
+# Then B alone changes: it builds here, on A restored above, rather than
+# from scratch on a worker, and leaves checkpoints for the next build.
+sed -i 's/(\* one \*)/(* one-local *)/' "$project/src/BScript.sml"
+: > "$state/requests.log"
+HOLBUILD_TIMING_LOG=$tmpdir/proof-local.timing run proof-local 1 build --remote-exec "$coordinator" BTheory
+require_grep "remote execution: rxp:BTheory stays out of the batch, to build on its dependencies built here" "$tmpdir/proof-local.log"
+require_grep "^holbuild: theorem: b_thm (line 4)$" "$tmpdir/proof-local.log"
+refute_grep "^POST /v1/batches" "$state/requests.log"
+[[ $(local_hol_runs "$tmpdir/proof-local.timing") -gt 0 ]] || { cat "$tmpdir/proof-local.timing" >&2; exit 1; }
+find "$project/.holbuild/checkpoints" -path '*BScript*' -name deps_loaded.save | grep -q . ||
+  { echo "BTheory's failed build left no deps_loaded checkpoint" >&2; exit 1; }
 
 # --remote-only reports it the same way: a local build wouldn't help, so
 # the exit status is 1, not 75.
