@@ -51,6 +51,9 @@ QED
 SML
 }
 outputs() { (cd "$1/.holbuild/obj/src" && sha256sum ATheory.sig ATheory.sml ATheory.dat BTheory.sig BTheory.sml BTheory.dat); }
+# Each build uses the cache, which turns the store on, but misses its action
+# entries, so the theories build from source.
+build_uncached() { rm -rf "$HOLBUILD_CACHE/actions" "$HOLBUILD_CACHE/blobs"; "$HOLBUILD_BIN" build "$@"; }
 deps_heap() { find "$1/.holbuild/checkpoints/heaps/src/$2Script.sml.deps" -name deps_loaded.save | head -n 1; }
 
 first=$tmpdir/first
@@ -59,7 +62,7 @@ make_tree "$first"
 make_tree "$second"
 
 # The first tree's build adds its deps heaps to the store, by hard link.
-(cd "$first" && "$HOLBUILD_BIN" build --no-cache BTheory) > "$tmpdir/first.log" 2>&1 \
+(cd "$first" && build_uncached BTheory) > "$tmpdir/first.log" 2>&1 \
   || { cat "$tmpdir/first.log" >&2; exit 1; }
 first_outputs=$(outputs "$first")
 first_heap=$(deps_heap "$first" B)
@@ -85,7 +88,7 @@ fi
 # builds the same outputs: nothing in the heap points into the deleted tree.
 stored_id=$(stat -c %d:%i "$stored")
 rm -rf "$first"
-(cd "$second" && "$HOLBUILD_BIN" build --no-cache BTheory) > "$tmpdir/second.log" 2>&1 \
+(cd "$second" && build_uncached BTheory) > "$tmpdir/second.log" 2>&1 \
   || { cat "$tmpdir/second.log" >&2; exit 1; }
 grep -A1 '^resuming BTheory' "$tmpdir/second.log" | grep -q 'from: deps-loaded checkpoint' \
   || { echo "the second tree did not resume B from the shared deps heap" >&2; cat "$tmpdir/second.log" >&2; exit 1; }
@@ -110,16 +113,35 @@ cat > "$own/src/ownLib.sml" <<'SML'
 structure ownLib = struct val own_thm = boolTheory.TRUTH end
 SML
 sed -i 's/^Theorem b_thm:/val _ = load ("own" ^ "Lib");\n\nTheorem b_thm:/' "$own/src/BScript.sml"
-(cd "$own" && "$HOLBUILD_BIN" build --no-cache ownLib && "$HOLBUILD_BIN" build --no-cache BTheory) > "$tmpdir/own.log" 2>&1 \
+(cd "$own" && build_uncached ownLib && build_uncached BTheory) > "$tmpdir/own.log" 2>&1 \
   || { cat "$tmpdir/own.log" >&2; exit 1; }
 grep -A1 '^resuming BTheory' "$tmpdir/own.log" | grep -q 'from: deps-loaded checkpoint' \
   || { echo "the tree with its own module did not resume B from the shared deps heap" >&2; cat "$tmpdir/own.log" >&2; exit 1; }
+if grep -q 'discarding invalid checkpoint' "$tmpdir/own.log"; then
+  echo "the tree with its own module could not resume from the shared deps heap" >&2
+  cat "$tmpdir/own.log" >&2
+  exit 1
+fi
+[[ "$(stat -c %d:%i "$(deps_heap "$own" B)")" == "$stored_id" ]] \
+  || { echo "the own-module tree's deps heap is not the stored one" >&2; exit 1; }
+
+# A build with --no-cache neither resumes from the store nor adds to it.
+nocache=$tmpdir/nocache
+make_tree "$nocache"
+(cd "$nocache" && "$HOLBUILD_BIN" build --no-cache BTheory) > "$tmpdir/nocache.log" 2>&1 \
+  || { cat "$tmpdir/nocache.log" >&2; exit 1; }
+if grep -A1 '^resuming BTheory' "$tmpdir/nocache.log" | grep -q 'from: deps-loaded checkpoint'; then
+  echo "a --no-cache build resumed from the stored heap" >&2
+  exit 1
+fi
+[[ "$(stat -c %d:%i "$stored")" == "$stored_id" ]] \
+  || { echo "a --no-cache build changed the stored heap" >&2; exit 1; }
 
 # A tree whose dependencies differ doesn't resume from the store's heap.
 changed=$tmpdir/changed
 make_tree "$changed"
 printf 'structure helperExtra = struct val n = 1 end\n' >> "$changed/src/helperLib.sml"
-(cd "$changed" && "$HOLBUILD_BIN" build --no-cache BTheory) > "$tmpdir/changed.log" 2>&1 \
+(cd "$changed" && build_uncached BTheory) > "$tmpdir/changed.log" 2>&1 \
   || { cat "$tmpdir/changed.log" >&2; exit 1; }
 if grep -A1 '^resuming BTheory' "$tmpdir/changed.log" | grep -q 'from: deps-loaded checkpoint'; then
   echo "a tree with other dependencies resumed from the stored heap" >&2
@@ -131,7 +153,7 @@ third=$tmpdir/third
 make_tree "$third"
 printf 'not a heap\n' > "$tmpdir/bogus" && cp "$tmpdir/bogus" "$stored.tmp-bogus"
 mv "$stored.tmp-bogus" "$stored"
-(cd "$third" && "$HOLBUILD_BIN" build --no-cache BTheory) > "$tmpdir/third.log" 2>&1 \
+(cd "$third" && build_uncached BTheory) > "$tmpdir/third.log" 2>&1 \
   || { cat "$tmpdir/third.log" >&2; exit 1; }
 if grep -A1 '^resuming BTheory' "$tmpdir/third.log" | grep -q 'from: deps-loaded checkpoint'; then
   echo "the third tree resumed from a bogus stored heap" >&2
@@ -151,7 +173,7 @@ cp "$stored" "$tmpdir/stale"
 printf '\xff\xff\xff\xff' | dd of="$tmpdir/stale" bs=1 seek=68 conv=notrunc status=none
 mv "$tmpdir/stale" "$stored"
 stale_sum=$(sha256sum < "$stored")
-if (cd "$fourth" && "$HOLBUILD_BIN" build --no-cache BTheory) > "$tmpdir/fourth.log" 2>&1; then
+if (cd "$fourth" && build_uncached BTheory) > "$tmpdir/fourth.log" 2>&1; then
   echo "the failing theory built" >&2
   exit 1
 fi

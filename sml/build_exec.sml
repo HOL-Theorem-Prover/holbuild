@@ -4590,7 +4590,7 @@ fun build_theory dat_hash_cache cache_allowed policy tc project base_context pla
                    (dependency_context_key toolchain_key plan keys node) node
     val checkpoint_root = default_checkpoint_root root
     val heap_context =
-      if checkpoint_enabled policy then local_heap_context dat_hash_cache toolchain_key plan keys node
+      if cache_allowed andalso checkpoint_enabled policy then local_heap_context dat_hash_cache toolchain_key plan keys node
       else NONE
     val placed =
       Option.mapPartial
