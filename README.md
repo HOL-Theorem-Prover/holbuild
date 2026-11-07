@@ -346,7 +346,8 @@ Common global options:
   or `--child-charge` is required.
 - `--prefetch-concurrency N`: how many remote cache entries a build copies into
   the local cache at once, ahead of the build workers. Defaults to 50 or twice
-  the build's jobs, whichever is larger; only used with a remote cache.
+  the build's jobs, whichever is larger; also limits remote-cache existence
+  checks before batch export. Only used with a remote cache.
 
 ### Sharing a machine's memory between holbuild processes
 
@@ -1193,6 +1194,11 @@ copied, and so are the files an action adds to the store when the store is
 on another mount, since its own tree is emptied after it.
 
 ### Building on remote workers
+
+Before exporting a batch, remote-cache existence checks run concurrently using
+`--prefetch-concurrency` (the same limit as restore prefetch). Progress on stderr
+reports `checking remote cache: N/M theories`, unless `--quiet` is given.
+The batch keeps the plan's theory order and includes entries with missing blobs.
 
 `build --remote-exec URL` hands the theories the remote cache lacks to a
 remote-execution coordinator, which runs them on its workers with

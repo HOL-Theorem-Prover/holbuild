@@ -5310,9 +5310,10 @@ fun prefetch_key (options : build_options) project keys node =
 
 (* Runs `work` on each item added, on up to `limit` background threads, in
    the order added; an item added while fewer than `limit` run starts at
-   once.  Returns {add, stop}: stop drops the items not yet started and
-   waits for those in flight.  Failures are silent: for a prefetch, the
-   demand restore of the same key retries and reports. *)
+   once.  Returns {add, drain, stop}: drain waits for all added work; stop drops
+   the items not yet started and waits for those in flight.  Failures are
+   silent: for a prefetch, the demand restore of the same key retries and
+   reports. *)
 fun start_background_pool limit work =
   let
     val front = ref [] and back = ref []
@@ -5351,7 +5352,7 @@ fun start_background_pool limit work =
       else ()
     fun stop () = (with_lock (fn () => (stopped := true; front := []; back := [])); wait ())
   in
-    {add = add, stop = stop}
+    {add = add, drain = wait, stop = stop}
   end
 
 fun prefetch_limit jobs =
@@ -5377,7 +5378,7 @@ fun start_remote_cache_prefetch (options : build_options) project plan keys jobs
                 | NONE => ()
             val limit = prefetch_limit jobs
             val _ = cache_trace ("remote cache prefetch threads: " ^ Int.toString (Int.min (limit, length nodes)))
-            val {add, stop} = start_background_pool limit prefetch
+            val {add, stop, ...} = start_background_pool limit prefetch
           in
             List.app add nodes;
             stop
@@ -5398,7 +5399,7 @@ fun start_remote_exec_prefetch (options : build_options) tc project plan toolcha
         else
           let
             val root = cache_root ()
-            val pool as {add, ...} = start_background_pool (prefetch_limit jobs) (prefetch_remote_cache_key root url)
+            val {add, stop, ...} = start_background_pool (prefetch_limit jobs) (prefetch_remote_cache_key root url)
             fun seed batch_keys =
               let
                 val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
@@ -5413,7 +5414,7 @@ fun start_remote_exec_prefetch (options : build_options) tc project plan toolcha
               end
           in
             Option.app seed batch_keys;
-            pool
+            {add = add, stop = stop}
           end
     | NONE => {add = fn _ => (), stop = fn () => ()}
 
@@ -5754,7 +5755,7 @@ fun publish_spec_blob remote path =
 
 (* Writes the ActionSpec of every theory in the plan the remote cache can't
    satisfy, uploads them and their sources with upload, and returns the batch. *)
-fun export_action_specs (options : build_options) tc project plan toolchain_key upload =
+fun export_action_specs (options : build_options) tc project plan toolchain_key jobs upload =
   let
     val remote =
       case HolbuildRemoteCacheConfig.url () of
@@ -5784,11 +5785,40 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
                                " can't run remotely: " ^ reason)
               | NONE => ())
         actions
+    datatype cache_check = Hit | Miss | CheckFailed of exn
+    val checks = map (fn action => (action, ref Miss)) actions
+    val total = length actions
+    val completed = ref 0
+    val next_report = ref (Time.now ())
+    val progress_mutex = Mutex.mutex ()
+    fun report () =
+      let val now = Time.now ()
+      in
+        if not (HolbuildStatus.quiet_mode ()) andalso
+           (!completed = total orelse Time.>= (now, !next_report)) then
+          (HolbuildStatus.message_stderr
+             ("checking remote cache: " ^ Int.toString (!completed) ^ "/" ^
+              Int.toString total ^ " theories\n");
+           next_report := Time.+ (now, Time.fromSeconds 5))
+        else ()
+      end
+    fun check ((node, action), result) =
+      let
+        (* Each check owns the mutable blob metadata, as restore prefetch does. *)
+        val remote = HolbuildRemoteCache.remote (HolbuildRemoteCache.base_url remote)
+      in
+      (result := ((if remote_entry_satisfies remote options project plan node (#input_key action)
+                   then Hit else Miss) handle e => CheckFailed e);
+       Mutex.lock progress_mutex;
+       ((completed := !completed + 1; report ()) before Mutex.unlock progress_mutex)
+       handle e => (Mutex.unlock progress_mutex; raise e))
+      end
+    val _ = report ()
+    val {add, drain, stop} = start_background_pool (prefetch_limit jobs) check
+    val _ = (List.app add checks; drain ()) handle e => (stop (); raise e)
     val uncached_actions =
-      List.filter
-        (fn (node, action) =>
-            not (remote_entry_satisfies remote options project plan node (#input_key action)))
-        actions
+      List.mapPartial (fn (action, result) =>
+        case !result of Hit => NONE | Miss => SOME action | CheckFailed e => raise e) checks
     val uncached_keys = map (HolbuildBuildPlan.key o #1) uncached_actions
     fun uncached node = List.exists (fn k => k = HolbuildBuildPlan.key node) uncached_keys
     val toolchain_line =
