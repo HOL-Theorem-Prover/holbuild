@@ -224,6 +224,14 @@ a run batch and cancels its unfinished actions.
 - **Claims** take builds before runs across all tiers the worker accepts,
   then prefer the worker's tier over its `also_claim` tiers, in order. A
   burst worker takes a standard-tier build before a high-tier run.
+  Within each coordinator process, waiting claims prefer standard-primary
+  workers for standard work, then hosts in ascending host-id order, with
+  FIFO ties. Claims without a host report follow known hosts of the same
+  primary tier. Polling claims defer each tier to better-ranked waiters;
+  a waiting standard-only worker still leaves high work available to burst
+  workers. This packs work so excess tail hosts can drain for scale-in.
+  Packing is best effort among that process's waiting claims; it neither
+  moves running actions nor coordinates host preference across replicas.
   Run admission is serialized across coordinator replicas and permits at
   most `REMOTE_EXEC_RUN_SLOTS` running run actions fleet-wide; 0 pauses new
   runs without stopping actions already running. Build claims never wait

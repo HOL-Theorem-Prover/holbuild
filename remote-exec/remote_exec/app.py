@@ -182,7 +182,10 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         if body.phases is not None:
             coordinator.report_phases(body.phases)
         tiers = [body.tier, *(t for t in body.also_claim if t != body.tier)]
-        claimed = await coordinator.claim(tiers, body.worker, body.wait_s, request.is_disconnected)
+        claimed = await coordinator.claim(
+            tiers, body.worker, body.wait_s, request.is_disconnected,
+            host_id=None if body.host is None else body.host.id,
+        )
         if claimed is None:
             return Response(status_code=204)
         return asdict(claimed)
