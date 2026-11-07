@@ -284,10 +284,15 @@ fun run_context_load_path_dirs (project : HolbuildProject.t) packages =
            [] object_roots)
   end
 
-fun runtime_helper_path () =
-  Path.concat(HolbuildRuntimePaths.runtime_root (), "sml/holbuild_runtime.sml")
+(* The holbuild runtime every HOL session holbuild starts loads first: the
+   helpers holbuild's generated code calls, and HolbuildFingerprint, which
+   scripts may call. *)
+val runtime_files = ["sml/holbuild_runtime.sml", "sml/sha256.sml", "sml/fingerprint_runtime.sml"]
 
-fun runtime_line () = "use " ^ sml_string (runtime_helper_path ()) ^ ";"
+fun runtime_line () =
+  String.concatWith " "
+    (map (fn file => "use " ^ sml_string (Path.concat(HolbuildRuntimePaths.runtime_root (), file)) ^ ";")
+         runtime_files)
 
 fun run_load_line name = "val _ = HolbuildRuntime.load " ^ sml_string name ^ ";"
 

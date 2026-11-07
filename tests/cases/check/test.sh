@@ -86,6 +86,44 @@ QED
 val _ = export_theory();
 SML
 
+cat > "$project/src/FpScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Fp";
+Definition flip_def:
+  flip b = ~b
+End
+Theorem lam_x:
+  (\\x:bool. x) = (\\x. x)
+Proof
+  simp[]
+QED
+Theorem lam_y:
+  (\\y:bool. y) = (\\y. y)
+Proof
+  simp[]
+QED
+Theorem lam_neg:
+  (\\x:bool. ~x) = (\\x. ~x)
+Proof
+  simp[]
+QED
+val _ =
+  let val out = TextIO.openOut "$tmpdir/term-fingerprint.txt"
+  in
+    TextIO.output (out, HolbuildFingerprint.term \`\`(\\z:bool. z) = (\\z. z)\`\` ^ "\\n");
+    TextIO.closeOut out
+  end;
+val _ = export_theory();
+SML
+cat > "$project/src/BypassScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Bypass";
+(* RunCall.unsafeCast in a comment is not a use. *)
+val _ = "PolyML.compiler in a string is not one either";
+val forge = Thm.disk_thm;
+val _ = export_theory();
+SML
+
 # Expects the check of $1 to exit with status $2; leaves its output in $log.
 run_check() {
   local selector=$1 expected=$2 status
@@ -140,6 +178,87 @@ require_grep "^BaseTheory.magic_ax: axiom$" "$log"
 # A theory's own axioms are findings too.
 run_check BaseTheory 1
 require_grep "^BaseTheory.magic_ax: axiom$" "$log"
+
+# Kernel-bypass calls in a theory's sources are findings; names in comments
+# and strings are not.
+run_check BypassTheory 1
+require_grep "^consumer:src/BypassScript.sml:5: kernel bypass: disk_thm$" "$log"
+require_grep "^BypassTheory: 1 finding$" "$log"
+require_no_grep "RunCall\|unsafeCast\|PolyML" "$log"
+
+# Expects check --fingerprint $1 to exit with status $2; leaves its output in
+# $log and the fingerprint lines alone in $lines.
+run_fingerprint() {
+  local theory=$1 expected=$2 status
+  log=$tmpdir/fingerprint-${theory//:/-}.log
+  lines=$log.lines
+  set +e
+  (cd "$project" && "$HOLBUILD_BIN" check --fingerprint "$theory") > "$log" 2>&1
+  status=$?
+  set -e
+  if [[ $status -ne $expected ]]; then
+    echo "check --fingerprint $theory exited $status, expected $expected" >&2
+    cat "$log" >&2
+    exit 1
+  fi
+  grep '^fingerprint	' "$log" > "$lines" || true
+}
+
+fingerprint_of() {
+  awk -F '\t' -v thy="$1" -v kind="$2" -v name="$3" \
+    '$2 == thy && $3 == kind && $4 == name { print $5 }' "$4"
+}
+
+run_fingerprint FpTheory 0
+fp_lines=$lines
+if ! LC_ALL=C sort -c "$fp_lines"; then
+  echo "fingerprint lines are not sorted" >&2
+  exit 1
+fi
+line_format='^fingerprint\t[A-Za-z0-9_]+Theory\t(axiom|definition|theorem)\t[^\t]+\t[0-9a-f]{64}\t[^\t]+$'
+if grep -qvP "$line_format" "$fp_lines"; then
+  echo "malformed fingerprint line" >&2
+  grep -vP "$line_format" "$fp_lines" >&2
+  exit 1
+fi
+require_grep "^fingerprint	FpTheory	definition	flip_def	[0-9a-f]*	-$" "$fp_lines"
+require_grep "^fingerprint	FpTheory	theorem	lam_x	[0-9a-f]*	-$" "$fp_lines"
+# Definitions and axioms are not listed again as theorems.
+require_no_grep "^fingerprint	FpTheory	theorem	flip_def	" "$fp_lines"
+# HOL's own theories are part of the ancestry.
+require_grep "^fingerprint	boolTheory	axiom	ETA_AX	" "$fp_lines"
+lam_x=$(fingerprint_of FpTheory theorem lam_x "$fp_lines")
+lam_y=$(fingerprint_of FpTheory theorem lam_y "$fp_lines")
+lam_neg=$(fingerprint_of FpTheory theorem lam_neg "$fp_lines")
+if [[ -z "$lam_x" || "$lam_x" != "$lam_y" || "$lam_x" == "$lam_neg" ]]; then
+  echo "alpha-equivalent statements must agree and different ones differ: $lam_x $lam_y $lam_neg" >&2
+  exit 1
+fi
+# The script's in-session fingerprint of the statement is the same.
+if [[ "$(cat "$tmpdir/term-fingerprint.txt")" != "$lam_x" ]]; then
+  echo "HolbuildFingerprint.term disagrees with check --fingerprint" >&2
+  exit 1
+fi
+
+# A rebuild gives the same lines.
+echo "(* rebuilt *)" >> "$project/src/FpScript.sml"
+run_fingerprint FpTheory 0
+require_grep "FpTheory built" "$log"
+if ! cmp -s "$fp_lines" "$lines"; then
+  echo "fingerprints changed across a rebuild" >&2
+  diff "$fp_lines" "$lines" >&2 || true
+  exit 1
+fi
+
+run_fingerprint CheatTheory 0
+require_grep "^fingerprint	CheatTheory	theorem	cheated_thm	[0-9a-f]*	cheat$" "$lines"
+require_grep "^fingerprint	CheatTheory	theorem	fine_thm	[0-9a-f]*	-$" "$lines"
+
+run_fingerprint UsesTheory 0
+require_grep "^fingerprint	BaseTheory	axiom	magic_ax	[0-9a-f]*	-$" "$lines"
+
+run_fingerprint CheatTheory:fine_thm 1
+require_grep "holbuild: check --fingerprint takes a theory, not THEORY:THEOREM" "$log"
 
 run_check CheatTheory:missing_thm 1
 require_grep "holbuild: theorem not found: CheatTheory.missing_thm" "$log"

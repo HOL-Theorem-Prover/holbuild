@@ -151,11 +151,7 @@ fun write_object_manifest path lines =
 fun dependency_sml dep = one_with_suffix ".sml" (#generated (source_artifacts dep))
 fun dependency_sig dep = one_with_suffix ".sig" (#generated (source_artifacts dep))
 
-fun runtime_helper_path () =
-  Path.concat(HolbuildRuntimePaths.runtime_root (), "sml/holbuild_runtime.sml")
-
-fun runtime_line () =
-  "use " ^ HolbuildToolchain.sml_string (runtime_helper_path ()) ^ ";"
+val runtime_line = HolbuildToolchain.runtime_line
 
 fun load_theory_line name = "HolbuildRuntime.load " ^ HolbuildToolchain.sml_string name ^ ";"
 
@@ -5574,8 +5570,9 @@ val action_batch_header = "holbuild-action-batch-v1"
    analyser that instruments its script.  They end up in saved heaps, so a
    worker runs only specs exported by holbuild with the same sources. *)
 val runtime_source_files =
-  ["sml/checkpoint_save_runtime.sml", "sml/holbuild_runtime.sml",
-   "sml/proof_runtime.sml", "sml/tactic_compat_runtime.sml", "sml/diagnostic_limits.sml"] @
+  HolbuildToolchain.runtime_files @
+  ["sml/checkpoint_save_runtime.sml", "sml/proof_runtime.sml", "sml/tactic_compat_runtime.sml",
+   "sml/diagnostic_limits.sml"] @
   map (fn file => normalize_path (Path.concat("sml/analyser", file)))
       HolbuildHolSharedCache.analyser_source_files
 
