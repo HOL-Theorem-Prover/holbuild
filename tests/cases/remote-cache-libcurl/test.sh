@@ -246,58 +246,55 @@ fun socket_count request =
   end
 val self = Int.toString (SysWord.toInt (Posix.Process.pidToWord (Posix.ProcEnv.getpid ())))
 val has_proc = OS.FileSys.access ("/proc/self/fd", [])
-fun own_sockets () =
+fun sockets () =
   socket_count {program = "python3", args = [dir ^ "/tcp-sockets.py", self],
                 stderr = HolbuildSpawn.Inherit}
 val _ =
   if has_proc then
-    (let val pooled = own_sockets ()
+    (let val pooled = sockets ()
      in assert ("the reserved pool holds " ^ Int.toString pooled ^ " connections, expected more than 4")
                (pooled > 4)
      end;
      assert "a spawned child inherits no connection"
             (socket_count {program = "sh", args = ["-c", "python3 \"$0\" $$", dir ^ "/tcp-sockets.py"],
-                           stderr = HolbuildSpawn.Inherit} = 0);
-     HolbuildHttp.close_idle ();
-     assert "close_idle closes the pooled connections"
-            (socket_count {program = "python3", args = [dir ^ "/tcp-sockets.py", self],
-                           stderr = HolbuildSpawn.Inherit} = 0);
-     (* A background pool keeps its connections for the next requests when
-        drained, and closes them when stopped. *)
-     let
-       val {add, drain, stop} =
-         HolbuildBuildExec.start_background_pool 4
-           (fn i => ignore (HolbuildHttp.get {url = url ^ "/fast", timeout = 30,
-                                              dst = dir ^ "/pool-" ^ Int.toString i ^ ".out"}))
-       fun sockets () = socket_count {program = "python3", args = [dir ^ "/tcp-sockets.py", self],
-                                      stderr = HolbuildSpawn.Inherit}
-     in
-       List.app add (List.tabulate (8, fn i => i));
-       drain ();
-       assert "a drained pool keeps its connections" (sockets () > 0);
-       stop ();
-       assert "a stopped pool closes its connections" (sockets () = 0)
-     end)
+                           stderr = HolbuildSpawn.Inherit} = 0))
   else ()
 val _ = List.app HolbuildHttp.release_idle (List.tabulate (16, fn _ => ()))
 val _ =
   if has_proc then
-    let val pooled = own_sockets ()
+    let val pooled = sockets ()
     in
       assert "the pool keeps its connections" (pooled > 0);
       assert ("the parent holds " ^ Int.toString pooled ^ " connections, above the cap of 4")
-             (pooled <= 4)
+             (pooled <= 4);
+      HolbuildHttp.close_idle ();
+      assert "close_idle closes the pooled connections" (sockets () = 0);
+      (* A background pool keeps its connections for the next requests when
+         drained, and closes them when stopped. *)
+      let
+        val {add, drain, stop} =
+          HolbuildBuildExec.start_background_pool 4
+            (fn i => ignore (HolbuildHttp.get {url = url ^ "/fast", timeout = 30,
+                                               dst = dir ^ "/pool-" ^ Int.toString i ^ ".out"}))
+      in
+        List.app add (List.tabulate (8, fn i => i));
+        drain ();
+        assert "a drained pool keeps its connections" (sockets () > 0);
+        stop ();
+        assert "a stopped pool closes its connections" (sockets () = 0)
+      end
     end
   else ()
 
 (* A background pool's threads each reserve a pooled connection while they
    run, and give the reservations up once their work is done. *)
+val _ = wait_for "earlier reservations to end" (fn () => !HolbuildHttp.reserved = 0) (in_10s ())
 val most_reserved = ref 0
 val _ =
   let
     val {add, drain, ...} =
       HolbuildBuildExec.start_background_pool 8 (fn i =>
-        (ignore (HolbuildHttp.get {url = url ^ "/fast", dst = dir ^ "/pool-" ^ Int.toString i, timeout = 30});
+        (ignore (HolbuildHttp.get {url = url ^ "/fast", dst = dir ^ "/reserving-" ^ Int.toString i, timeout = 30});
          record (fn () => most_reserved := Int.max (!most_reserved, !HolbuildHttp.reserved))))
   in
     List.app add (List.tabulate (32, fn i => i)); drain ()
