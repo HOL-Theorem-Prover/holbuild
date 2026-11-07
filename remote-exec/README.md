@@ -116,6 +116,8 @@ workers do when they aren't running HOL:
 - `memory_wait`: waiting for the host's memory before claiming;
 - `claim`: in claim requests, waiting ones included;
 - `idle`: sleeping after a claim that got nothing or failed;
+- `lease`: taking and giving up a claimed action's lease: setting and
+  clearing scale-in protection, and stopping the heartbeat;
 - `release`: finding and, on first use, building the action's holbuild release;
 - `before_hol`, `hol`, `after_hol`: running `exec-action`, split at the start
   of its first HOL child and the end of its last (fetching and restoring
@@ -350,7 +352,7 @@ gets 401. Errors are JSON `{"detail": "<message>"}`.
   minutes, by id, and the sums of the phase reports it got in the last 10
   minutes (see "Running"):
   ```json
-  {"window_s": 600, "reports": 4210, "seconds": {"memory_wait": 0.0, "claim": 812.4, "idle": 0.0, "release": 31.0, "before_hol": 40210.7, "hol": 52300.2, "after_hol": 44102.9, "exec": 0.0, "complete": 950.3}}
+  {"window_s": 600, "reports": 4210, "seconds": {"memory_wait": 0.0, "claim": 812.4, "idle": 0.0, "lease": 12.5, "release": 31.0, "before_hol": 40210.7, "hol": 52300.2, "after_hol": 44102.9, "exec": 0.0, "complete": 950.3}}
   ```
   A phase's share of the workers' time is its seconds over the sum of all.
   A host is its workers' latest report, `age_s` seconds old,

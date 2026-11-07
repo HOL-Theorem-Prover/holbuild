@@ -60,6 +60,10 @@ COORDINATOR_ERRORS = (OSError, RuntimeError, http.client.HTTPException, ValueErr
 COMPLETE_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0)
 
 
+class ClaimRefused(RuntimeError):
+    """The coordinator answered a claim with an error status."""
+
+
 class Unreleased(Exception):
     """The action was exported by a holbuild version that has no release to build."""
 
@@ -109,7 +113,7 @@ class Coordinator:
         if status == 204:
             return None
         if status != 200:
-            raise RuntimeError(f"claim answered {status}: {response}")
+            raise ClaimRefused(f"claim answered {status}: {response}")
         return response
 
     def heartbeat(self, token: str) -> bool:
@@ -417,7 +421,7 @@ class Phases:
     nothing, finding the action's release, running exec-action (before, while and after it has HOL children, or all
     of it as ``exec`` when they can't be seen) and reporting the result."""
 
-    NAMES = ("memory_wait", "claim", "idle", "release", "before_hol", "hol", "after_hol", "exec", "complete")
+    NAMES = ("memory_wait", "claim", "idle", "lease", "release", "before_hol", "hol", "after_hol", "exec", "complete")
 
     def __init__(self) -> None:
         self.seconds = dict.fromkeys(self.NAMES, 0.0)
@@ -530,15 +534,18 @@ class Lease:
         self.thread = threading.Thread(target=self._beat, daemon=True)
 
     @contextlib.contextmanager
-    def held(self) -> Iterator["Lease"]:
-        self.protection.set(enabled=True)
-        self.thread.start()
+    def held(self, phases: Phases) -> Iterator["Lease"]:
+        """Holds the lease, adding the time taking and giving it up blocks for to ``phases``' ``lease``."""
+        with phases.timed("lease"):
+            self.protection.set(enabled=True)
+            self.thread.start()
         try:
             yield self
         finally:
             self.done.set()
-            self.thread.join()
-            self.protection.set(enabled=False)
+            with phases.timed("lease"):
+                self.thread.join()
+                self.protection.set(enabled=False)
 
     def _beat(self) -> None:
         while not self.done.wait(self.interval):
@@ -554,6 +561,22 @@ class Lease:
             self.protection.set(enabled=True)
 
 
+def claim_reporting(
+    coordinator: Coordinator, tiers: list[str], worker: str, wait_s: float, phases: Phases
+) -> dict[str, Any] | None:
+    """``Coordinator.claim``, reporting ``phases`` with it, or None when the claim failed. The phases reported
+    start again once the coordinator answered, even with an error, since it has them then."""
+    report = phases.take()
+    try:
+        with phases.timed("claim"):
+            return coordinator.claim(tiers, worker, wait_s, report)
+    except COORDINATOR_ERRORS as error:
+        print(f"claim failed: {error}", file=sys.stderr)
+        if not isinstance(error, ClaimRefused):
+            phases.put_back(report)
+        return None
+
+
 def run_one(
     coordinator: Coordinator,
     args: argparse.Namespace,
@@ -567,7 +590,7 @@ def run_one(
     token = claim["attempt_token"]
     spec = claim["spec_sha256"]
     print(f"running {claim['theory']} ({claim['input_key']})", file=sys.stderr, flush=True)
-    with Lease(coordinator, token, claim["lease_s"], protection).held() as lease:
+    with Lease(coordinator, token, claim["lease_s"], protection).held(phases) as lease:
         try:
             with phases.timed("release"):
                 holbuild = releases.holbuild(releases.spec_version(spec))
@@ -709,14 +732,7 @@ def main() -> None:
             if waited and host is not None:
                 host.waited = True
         started = time.monotonic()
-        report = phases.take()
-        try:
-            with phases.timed("claim"):
-                claim = coordinator.claim(tiers, args.name, args.claim_wait_seconds, report)
-        except COORDINATOR_ERRORS as error:
-            print(f"claim failed: {error}", file=sys.stderr)
-            phases.put_back(report)
-            claim = None
+        claim = claim_reporting(coordinator, tiers, args.name, args.claim_wait_seconds, phases)
         if claim is None:
             # A claim that failed at once, or a coordinator that doesn't wait, isn't retried in a tight loop.
             with phases.timed("idle"):

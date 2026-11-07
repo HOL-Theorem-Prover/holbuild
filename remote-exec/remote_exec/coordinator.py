@@ -159,13 +159,15 @@ PhaseSeconds = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 @dataclass(frozen=True)
 class PhaseReport:
     """Where a worker's time went since its last report (``Phases`` in worker.py), in seconds: waiting for memory
-    before a claim, in claim requests, sleeping after a claim got nothing, finding the action's holbuild release,
+    before a claim, in claim requests, sleeping after a claim got nothing, taking and giving up an action's lease
+    (scale-in protection, the heartbeat thread), finding the action's holbuild release,
     in exec-action before its first HOL child, from then to its last HOL child's end, after it, all of exec-action
     when the worker can't see HOL children, and reporting the result."""
 
     memory_wait: PhaseSeconds = 0
     claim: PhaseSeconds = 0
     idle: PhaseSeconds = 0
+    lease: PhaseSeconds = 0
     release: PhaseSeconds = 0
     before_hol: PhaseSeconds = 0
     hol: PhaseSeconds = 0

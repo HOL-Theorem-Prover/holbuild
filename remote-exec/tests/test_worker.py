@@ -22,11 +22,13 @@ from remote_exec.worker import (
     ExecSpans,
     HostMemory,
     HostTelemetry,
+    Lease,
     Phases,
     Protection,
     Releases,
     Unreleased,
     child_charge,
+    claim_reporting,
     cpu_times,
     failed_record,
     parse_args,
@@ -650,6 +652,35 @@ def test_phases_taken_start_again_and_can_be_put_back() -> None:
     phases.add("hol", 1.0)
     phases.put_back(taken)
     assert phases.take()["hol"] == 3.0
+
+
+@pytest.mark.parametrize(("answer", "kept"), [((500, "busy"), 0.0), (OSError("refused"), 2.0)])
+def test_reported_phases_start_again_once_the_coordinator_answered_the_claim(
+    monkeypatch: pytest.MonkeyPatch, answer: tuple[int, str] | OSError, kept: float
+) -> None:
+    def post(*args: object) -> tuple[int, str]:
+        if isinstance(answer, OSError):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(Coordinator, "post", post)
+    phases = Phases()
+    phases.add("hol", 2.0)
+
+    assert claim_reporting(Coordinator("http://127.0.0.1:9", "w"), ["standard"], "w", 0, phases) is None
+    assert phases.take()["hol"] == kept
+
+
+def test_taking_and_giving_up_a_lease_counts_as_lease(tmp_path: Path, server: Server) -> None:
+    switch = tmp_path / "protect"
+    switch.write_text("#!/bin/sh\nsleep 0.5\n")
+    switch.chmod(0o755)
+    phases = Phases()
+
+    with Lease(Coordinator(server.url, "w"), "t1", 60, Protection(str(switch), None)).held(phases):
+        pass
+
+    assert phases.take()["lease"] >= 1.0
 
 
 @contextlib.contextmanager
