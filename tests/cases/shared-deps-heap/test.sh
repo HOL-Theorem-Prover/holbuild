@@ -101,6 +101,20 @@ if [[ "$first_outputs" != "$(outputs "$second")" ]]; then
   exit 1
 fi
 
+# A tree resuming from the stored heap searches its own directories: its
+# theory loads a module of its own, built beforehand, that isn't in the
+# preload.
+own=$tmpdir/own
+make_tree "$own"
+cat > "$own/src/ownLib.sml" <<'SML'
+structure ownLib = struct val own_thm = boolTheory.TRUTH end
+SML
+sed -i 's/^Theorem b_thm:/val _ = load ("own" ^ "Lib");\n\nTheorem b_thm:/' "$own/src/BScript.sml"
+(cd "$own" && "$HOLBUILD_BIN" build --no-cache ownLib && "$HOLBUILD_BIN" build --no-cache BTheory) > "$tmpdir/own.log" 2>&1 \
+  || { cat "$tmpdir/own.log" >&2; exit 1; }
+grep -A1 '^resuming BTheory' "$tmpdir/own.log" | grep -q 'from: deps-loaded checkpoint' \
+  || { echo "the tree with its own module did not resume B from the shared deps heap" >&2; cat "$tmpdir/own.log" >&2; exit 1; }
+
 # A tree whose dependencies differ doesn't resume from the store's heap.
 changed=$tmpdir/changed
 make_tree "$changed"
