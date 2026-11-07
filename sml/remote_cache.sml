@@ -183,40 +183,70 @@ fun put_status timeout_seconds headers {url, src} =
     cli_status timeout_seconds
                (List.concat (map (fn header => ["-H", header]) headers) @ ["-T", src, "-o", "/dev/null"]) url
 
-(* After this many requests in a row get no HTTP response at all (no
-   connection, or a timeout), the remote cache is off for the rest of the
-   process: every later request would likely wait as long again.  Any HTTP
-   response, an error status included, resets the count. *)
+(* No HTTP response counts as a transport failure; any HTTP status resets
+   the count. After tripping, only one request probes each cooldown. *)
 val max_consecutive_transport_failures = 3
+val transport_cooldown = Time.fromSeconds 60
 val transport_failures = ref 0
+val retry_after = ref Time.zeroTime
+val probe_in_flight = ref false
+val transport_generation = ref 0
 val transport_mutex = Mutex.mutex ()
+
+(* A check never reserves the probe: publication checks this before send. *)
+fun disabled_unlocked () =
+  !transport_failures >= max_consecutive_transport_failures andalso
+  (!probe_in_flight orelse Time.< (Time.now (), !retry_after))
 
 fun disabled () =
   (Mutex.lock transport_mutex;
-   !transport_failures >= max_consecutive_transport_failures
-   before Mutex.unlock transport_mutex)
+   disabled_unlocked () before Mutex.unlock transport_mutex)
 
-fun record_transport_outcome result =
+fun begin_request () =
   let
     val _ = Mutex.lock transport_mutex
-    val previous = !transport_failures
+    val admission =
+      if disabled_unlocked () then NONE
+      else
+        let
+          val probe = !transport_failures >= max_consecutive_transport_failures
+          val _ = if probe then probe_in_flight := true else ()
+        in SOME (!transport_generation, probe) end
+  in admission before Mutex.unlock transport_mutex end
+
+fun record_transport_outcome (generation, probe) result =
+  let
+    val _ = Mutex.lock transport_mutex
+    val current = generation = !transport_generation
     val _ =
-      if previous >= max_consecutive_transport_failures then ()
+      if not current then ()
       else
         case result of
-            HolbuildHttp.Failed _ => transport_failures := previous + 1
+            HolbuildHttp.Failed _ =>
+              if probe then () else transport_failures := !transport_failures + 1
           | HolbuildHttp.Response _ => transport_failures := 0
-    val now_disabled =
-      previous < max_consecutive_transport_failures andalso
+    val tripped = current andalso
       !transport_failures >= max_consecutive_transport_failures
+    val recovered = current andalso probe andalso not tripped
+    val _ = if current then probe_in_flight := false else ()
+    (* Ignore completions from requests admitted before this trip. *)
+    val _ = if tripped then
+      (retry_after := Time.+ (Time.now (), transport_cooldown);
+       transport_generation := !transport_generation + 1)
+      else ()
     val _ = Mutex.unlock transport_mutex
   in
-    case (now_disabled, result) of
-        (true, HolbuildHttp.Failed message) =>
+    case (tripped, recovered, result) of
+        (true, _, HolbuildHttp.Failed message) =>
           (TextIO.output (TextIO.stdErr,
-             "holbuild: warning: remote cache disabled for the rest of this run after " ^
-             Int.toString max_consecutive_transport_failures ^
-             " requests in a row failed; the last: " ^ message ^ "\n");
+             "holbuild: warning: remote cache disabled for 60 seconds after " ^
+             (if probe then "a recovery probe failed"
+              else Int.toString max_consecutive_transport_failures ^
+                   " requests in a row failed") ^
+             "; the last: " ^ message ^ "\n");
+           TextIO.flushOut TextIO.stdErr)
+      | (_, true, _) =>
+          (TextIO.output (TextIO.stdErr, "holbuild: remote cache available again\n");
            TextIO.flushOut TextIO.stdErr)
       | _ => ()
   end
@@ -244,10 +274,17 @@ fun traced method url path request =
 
 (* NONE when the remote cache is disabled, without a request. *)
 fun send method url path request =
-  if disabled () then NONE
-  else
-    let val result = traced method url path request
-    in record_transport_outcome result; SOME result end
+  case begin_request () of
+      NONE => NONE
+    | SOME admission =>
+        let
+          val result = traced method url path request
+            handle e =>
+              ((if #2 admission then
+                  record_transport_outcome admission (HolbuildHttp.Failed (General.exnMessage e))
+                else ());
+               raise e)
+        in record_transport_outcome admission result; SOME result end
 
 fun curl_get_with_timeout timeout_seconds (request as {url, dst}) =
   let val display_url = redact_userinfo url
