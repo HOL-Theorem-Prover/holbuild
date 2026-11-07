@@ -182,6 +182,24 @@ extra_output_in_source_dir() {
   expect_plan "from record (0 files rehashed, 0 keys changed)" "$p"
 }
 
+# SML files a theory writes where discovery never looks, as under a
+# dot-directory, are not sources: the plan can be recorded before it runs.
+hidden_sml_outputs() {
+  local p=$tmpdir/hidden-outputs
+  make_project "$p"
+  cat >> "$p/src/AScript.sml" <<'SML'
+fun holbuild_extra_outputs (_ : string list) = ()
+val _ = holbuild_extra_outputs [".emit/RunML.sml", ".emit/json/T.sig", "_build/X.sml", ".Y.sml"]
+SML
+  sleep 1.1
+  expect_plan "full (no plan record for these inputs)" "$p"
+  if grep -q "plan record not written" "$tmpdir/plan.log"; then
+    cat "$tmpdir/plan.log" >&2
+    exit 1
+  fi
+  expect_plan "from record (0 files rehashed, 0 keys changed)" "$p"
+}
+
 extra_inputs() {
   local p=$tmpdir/extra-inputs
   mkdir -p "$p/data/dir" "$tmpdir/shared"
@@ -685,6 +703,7 @@ source_removed
 source_renamed
 backup_file_in_source_dir
 extra_output_in_source_dir
+hidden_sml_outputs
 extra_inputs
 manifest_edit
 holconfig_edit

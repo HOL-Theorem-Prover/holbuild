@@ -1152,8 +1152,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
     fun with_options (planned as {index, targets, entry_plan, plan, ...}) =
       (planned, build_options_for index entry_plan plan targets)
     (* The input keys of a plan, which the plan keeps for execution.  Only
-       for plans with no theory that writes SML sources: until those run,
-       an extra input naming such a source does not exist. *)
+       for plans whose theories that write SML sources are up to date: until
+       those run, an extra input naming such a source may not exist. *)
     fun input_keys ({plan, toolchain_key, ...} : planned, options) =
       HolbuildBuildPlan.input_keys (HolbuildBuildExec.build_config_lines_for_node options project)
         (action_toolchain_key toolchain_key) plan
@@ -1161,7 +1161,26 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       if warn_unreachable andalso null targets then
         warn_unreachable_root_scripts resolution project index plan
       else ()
-    fun plan_with_record () =
+    (* The first theory that writes SML sources and is not up to date, whose
+       sources a plan cannot yet hold as they will be.  KEYS are computed
+       only once every such theory's outputs exist, since an extra input
+       may name one. *)
+    fun stale_source_owner ({plan, toolchain_key, ...} : planned, options) keys =
+      let
+        val owners = HolbuildBuildPlan.generated_source_owner_nodes plan
+        fun outputs_exist owner =
+          List.all (fn declaration => OS.FileSys.access (HolbuildBuildPlan.extra_output_path owner declaration, []))
+            (#extra_outputs (HolbuildBuildPlan.dependencies plan owner))
+      in
+        case List.find (not o outputs_exist) owners of
+            SOME owner => SOME owner
+          | NONE =>
+              List.find (not o HolbuildBuildExec.node_is_up_to_date options project plan (keys ()) toolchain_key)
+                owners
+      end
+    (* Plans from the record when it holds; AFTER_OWNERS plans again, in
+       full, once the theories that write SML sources have run. *)
+    fun plan_with_record after_owners =
       let
         val start_ns = Time.toNanoseconds (Time.now ())
         val record_mode = HolbuildPlanRecord.mode ()
@@ -1174,7 +1193,9 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         val attempt =
           case record_mode of
               HolbuildPlanRecord.Off => HolbuildPlanRecord.Fallback "plan record is off"
-            | _ => timed_phase "plan.record" (fn () =>
+            | _ =>
+              if after_owners then HolbuildPlanRecord.Fallback "theories that write SML sources ran"
+              else timed_phase "plan.record" (fn () =>
                      HolbuildPlanRecord.restore {dir = record_dir, graph = graph, tc = tc, fingerprint = fingerprint, start_ns = start_ns})
         fun context {members, dirs, stamps, index, targets, toolchain_key} : HolbuildPlanRecord.context =
           {fingerprint = fingerprint, start_ns = start_ns,
@@ -1194,24 +1215,22 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             val members = HolbuildPlanRecord.member_kinds graph
             val planned as ({index, targets, plan, toolchain_key, ...}, _) =
               with_options (prepare_plan (prepare_source_index "build" resolution project))
-            val unrecorded =
-              if not record then NONE
-              else if List.exists (not o null o HolbuildProject.package_generators) (HolbuildProjectGraph.packages graph)
-              then SOME "the project has generators"
-              else if not (null (HolbuildBuildPlan.generated_source_owners plan))
-              then SOME "theories write SML sources"
-              else NONE
+            fun record_plan () =
+              case stale_source_owner planned (fn () => input_keys planned) of
+                  SOME owner =>
+                    say ("plan record not written: " ^ HolbuildBuildPlan.logical_name owner ^
+                         " writes SML sources and is not up to date")
+              | NONE =>
+                  write (context {members = members,
+                                  dirs = HolbuildPlanRecord.watched_dirs graph (rev (!HolbuildSourceIndex.observed_dirs)),
+                                  stamps = Binarymap.mkDict String.compare, index = index,
+                                  targets = targets, toolchain_key = toolchain_key})
+                    NONE plan (input_keys planned)
             val _ =
-              case unrecorded of
-                  SOME why => say ("plan record not written: " ^ why)
-                | NONE =>
-                    if not record then ()
-                    else
-                      write (context {members = members,
-                                      dirs = HolbuildPlanRecord.watched_dirs graph (rev (!HolbuildSourceIndex.observed_dirs)),
-                                      stamps = Binarymap.mkDict String.compare, index = index,
-                                      targets = targets, toolchain_key = toolchain_key})
-                        NONE plan (input_keys planned)
+              if not record then ()
+              else if List.exists (not o null o HolbuildProject.package_generators) (HolbuildProjectGraph.packages graph)
+              then say "plan record not written: the project has generators"
+              else record_plan ()
           in
             planned
           end
@@ -1233,6 +1252,14 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               with_options {index = index, targets = targets, entry_plan = entry_plan, plan = plan,
                             toolchain_key = toolchain_key, components = NONE}
             val keys = input_keys planned
+            (* The record's generated sources hold only while their writers
+               would not run again. *)
+            val _ =
+              case stale_source_owner planned (fn () => keys) of
+                  SOME owner =>
+                    raise HolbuildPlanRecord.Fall (HolbuildBuildPlan.logical_name owner ^
+                                                   " writes SML sources and is not up to date")
+                | NONE => ()
             val changed_keys = HolbuildPlanRecord.changed_keys record plan keys
             val _ = say ("from record (" ^ Int.toString rehashed ^ " files rehashed, " ^
                          Int.toString changed_keys ^ " keys changed)")
@@ -1267,7 +1294,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         val planned as (sources, _) =
           case prepared of
               SOME _ => with_options (prepare_plan (prepared_sources ()))
-            | NONE => if watch then with_options (prepare_plan (prepared_sources ())) else plan_with_record ()
+            | NONE => if watch then with_options (prepare_plan (prepared_sources ())) else plan_with_record false
       in
         warn_unreachable_for sources;
         planned
@@ -1287,14 +1314,18 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         val ({index, entry_plan, plan, toolchain_key, components, ...}, options) = plan_build ()
         fun build_owners owner_plan =
           execute (build_options_for index entry_plan owner_plan [], owner_plan, toolchain_key)
+        fun replan () =
+          if Option.isSome prepared orelse watch
+          then with_options (prepare_plan (prepare_source_index "build" resolution project))
+          else plan_with_record true
       in
         case components of
-            (* A plan from the record has no theory that writes SML sources. *)
+            (* A plan from the record holds the generated sources as their
+               up-to-date writers left them. *)
             NONE => execute (options, plan, toolchain_key)
           | SOME components =>
               if build_generated_source_owners build_owners components (#holdir tc) index plan then
-                let val (planned as {plan, toolchain_key, ...}, options) =
-                      with_options (prepare_plan (prepare_source_index "build" resolution project))
+                let val (planned as {plan, toolchain_key, ...}, options) = replan ()
                 in warn_unreachable_for planned; execute (options, plan, toolchain_key) end
               else execute (options, plan, toolchain_key)
       end

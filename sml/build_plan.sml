@@ -279,16 +279,28 @@ fun selected_graph_id ({selected_graph_id, ...} : t) = selected_graph_id
 fun selected_plan_id ({selected_plan_id, ...} : t) = selected_plan_id
 fun resolved_plan_id ({resolved_plan_id, ...} : t) = resolved_plan_id
 
-(* The selected theories that declare an SML source (.sml or .sig) among their
-   extra outputs.  Until such a theory runs, its sources are missing or may be
-   stale, so the plan cannot have a node for them or a key for their content. *)
-fun generated_source_owners plan =
+(* The extra outputs of NODE that discovery would find as SML sources (.sml
+   or .sig): not in a directory or file it skips, such as a dot-directory. *)
+fun generated_sources plan node =
   let
-    fun is_source path = path_has_suffix ".sml" path orelse path_has_suffix ".sig" path
-    fun declares_source node = List.exists is_source (#extra_outputs (dependencies plan node))
+    fun discoverable declaration =
+      case rev (path_components declaration) of
+          name :: dirs =>
+            (path_has_suffix ".sml" name orelse path_has_suffix ".sig" name) andalso
+            not (String.isPrefix "." name) andalso
+            not (List.exists HolbuildSourceIndex.skip_dir dirs)
+        | [] => false
   in
-    unique_strings (map logical_name (List.filter declares_source (selected_nodes plan)))
+    map (extra_output_path node) (List.filter discoverable (#extra_outputs (dependencies plan node)))
   end
+
+(* The selected theories that write SML sources discovery finds.  Until such
+   a theory runs, its sources are missing or may be stale, so the plan cannot
+   have a node for them or a key for their content. *)
+fun generated_source_owner_nodes plan =
+  List.filter (not o null o generated_sources plan) (selected_nodes plan)
+
+fun generated_source_owners plan = unique_strings (map logical_name (generated_source_owner_nodes plan))
 
 fun find_key_id index node_key =
   let
