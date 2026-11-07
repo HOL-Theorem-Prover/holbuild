@@ -32,7 +32,8 @@ STATEMENTS = [
 
 
 def upgrade() -> None:
-    # asyncpg runs one statement per execute.
+    # Takes an exclusive lock on actions until the index is built, so run it with the coordinator stopped, as the image's
+    # `migrate` before the coordinator starts does. asyncpg runs one statement per execute.
     for statement in STATEMENTS:
         op.execute(statement)
 

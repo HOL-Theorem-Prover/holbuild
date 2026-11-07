@@ -355,8 +355,9 @@ class Coordinator:
         """The batch with only the actions written by transactions numbered ``since`` or later, and the ``since``
         to pass next time; ``since`` 0 gives every action.
 
-        The next ``since`` is the oldest transaction still running when this one read, so an action written by a
-        transaction that commits later is read next time, maybe again.
+        The next ``since`` is the oldest transaction still running on the server when this one read, so an action
+        written by a transaction that commits later is read next time, maybe again. A long transaction anywhere on
+        the server holds ``since`` back, so polls reread what changed since it began until it ends.
         """
         async with self.engine.connect() as conn:
             await conn.execution_options(isolation_level="REPEATABLE READ")  # both reads see one snapshot
