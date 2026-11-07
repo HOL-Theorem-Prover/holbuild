@@ -238,7 +238,11 @@ val _ = denied "HTTP setup" (fn () => HolbuildHttp.setup {user = NONE});
 val _ = denied "libcurl GET" (fn () => ignore (HolbuildHttp.get {url=url, dst=tmp ^ "/get", timeout=1}));
 val _ = denied "libcurl HEAD" (fn () => ignore (HolbuildHttp.head {url=url, timeout=1}));
 val _ = denied "libcurl PUT" (fn () => ignore (HolbuildHttp.put {url=url, src=tmp ^ "/version", headers=[], timeout=1}));
-val _ = denied "curl CLI" (fn () => ignore (HolbuildRemoteCache.cli_status 1 [] url));
+val _ = HolbuildRemoteCacheConfig.libcurl_ready := SOME false;
+val _ = assert "curl CLI"
+  (case HolbuildRemoteCache.curl_get {url=url, dst=tmp ^ "/cli-get"} of
+       HolbuildCacheBackend.Corrupt message => String.isSubstring "offline" message
+     | _ => false);
 val _ = denied "submit" (fn () => ignore (HolbuildRemoteExec.submit url "batch"));
 val _ = denied "follow" (fn () => ignore (HolbuildRemoteExec.follow url "batch" (fn _ => ())));
 val _ = denied "cancel" (fn () => ignore (HolbuildRemoteExec.cancel url "batch"));
