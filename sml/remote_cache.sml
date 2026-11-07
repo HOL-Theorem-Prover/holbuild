@@ -6,6 +6,16 @@ structure FS = OS.FileSys
 
 exception Error of string
 
+(* The remote cache gave no usable answer: no answer at all, 429, 5xx, or
+   the breaker below holds requests back.  Raised only when fail_closed. *)
+exception Unavailable of string
+
+(* Set by exec-action, whose result counts only once the remote cache holds
+   it: a request the cache doesn't answer raises Unavailable rather than
+   reading as a miss, a skipped write or a conflict.  A build leaves it off
+   and goes on without the remote cache. *)
+val fail_closed = ref false
+
 type blob_entry = {sha256 : string, size : string}
 type blob_map = (string, blob_entry) Redblackmap.dict
 datatype t = RemoteCache of {base_url : string, blobs : blob_map ref}
@@ -199,9 +209,17 @@ fun disabled_unlocked () =
   !transport_failures >= max_consecutive_transport_failures andalso
   (!probe_in_flight orelse Time.< (Time.now (), !retry_after))
 
+val disabled_message = "the remote cache is disabled after repeated failures"
+
+(* Every caller skips a write when this holds; with fail_closed it raises. *)
 fun disabled () =
-  (Mutex.lock transport_mutex;
-   disabled_unlocked () before Mutex.unlock transport_mutex)
+  let
+    val _ = Mutex.lock transport_mutex
+    val result = disabled_unlocked ()
+    val _ = Mutex.unlock transport_mutex
+  in
+    if result andalso !fail_closed then raise Unavailable disabled_message else result
+  end
 
 (* Advisory requests leave recovery probes to send. *)
 fun tripped () =
@@ -279,10 +297,26 @@ fun traced method url path request =
       result
     end
 
-(* NONE when the remote cache is disabled, without a request. *)
+fun require_answer method url result =
+  let val request = method ^ " " ^ redact_userinfo url
+  in
+    case result of
+        HolbuildHttp.Failed message =>
+          raise Unavailable ("no answer from the remote cache to " ^ request ^ ": " ^ message)
+      | HolbuildHttp.Response code =>
+          if code = 429 orelse code >= 500 then
+            raise Unavailable ("remote cache server error: HTTP " ^ Int.toString code ^ " for " ^ request)
+          else ()
+  end
+
+(* NONE when the remote cache is disabled, without a request.  With
+   fail_closed, raises Unavailable instead, and for no answer, 429 or 5xx. *)
 fun send method url path request =
   case begin_request () of
-      NONE => NONE
+      NONE =>
+        if !fail_closed then
+          raise Unavailable (disabled_message ^ "; not sent: " ^ method ^ " " ^ redact_userinfo url)
+        else NONE
     | SOME admission =>
         let
           val result = traced method url path request
@@ -291,7 +325,11 @@ fun send method url path request =
                   record_transport_outcome admission (HolbuildHttp.Failed (General.exnMessage e))
                 else ());
                raise e)
-        in record_transport_outcome admission result; SOME result end
+        in
+          record_transport_outcome admission result;
+          if !fail_closed then require_answer method url result else ();
+          SOME result
+        end
 
 fun curl_get (request as {url, dst}) =
   let val display_url = redact_userinfo url
@@ -305,7 +343,8 @@ fun curl_get (request as {url, dst}) =
       | SOME (HolbuildHttp.Response code) =>
           HolbuildCacheBackend.Corrupt ("HTTP " ^ Int.toString code ^ " from " ^ display_url)
   end
-  handle e => (HolbuildCacheBackend.Corrupt (General.exnMessage e))
+  handle e as Unavailable _ => raise e
+       | e => (HolbuildCacheBackend.Corrupt (General.exnMessage e))
 
 fun successful_put_code code =
   code = 200 orelse code = 201 orelse code = 204
@@ -321,24 +360,28 @@ fun curl_put_with_headers headers (request as {url, src}) =
           if successful_put_code code then HolbuildCacheBackend.Published
           else HolbuildCacheBackend.Conflict ("HTTP " ^ Int.toString code ^ " from " ^ display_url)
   end
-  handle e => (HolbuildCacheBackend.Conflict (General.exnMessage e))
+  handle e as Unavailable _ => raise e
+       | e => (HolbuildCacheBackend.Conflict (General.exnMessage e))
 
 fun curl_put request = curl_put_with_headers [] request
 
 fun curl_put_zstd {url, src, size} =
-  let val compressed = temp_path "zstd-put"
+  let
+    val compressed = temp_path "zstd-put"
+    fun put () =
+      if zstd_compress url src compressed then
+        curl_put_with_headers (zstd_content_headers size)
+          {url = url, src = compressed}
+      else
+        curl_put_with_headers [] {url = url, src = src}
   in
     if disabled () then HolbuildCacheBackend.Skipped
-    else if zstd_compress url src compressed then
-      curl_put_with_headers (zstd_content_headers size)
-        {url = url, src = compressed}
-      before remove_file compressed
     else
-      remove_file_before
-        (curl_put_with_headers [] {url = url, src = src})
-        compressed
+      (* Unavailable passes through the PUT; the copy goes either way. *)
+      remove_file_before (put () handle e => (remove_file compressed; raise e)) compressed
   end
-  handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
+  handle e as Unavailable _ => raise e
+       | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
 fun remote_action_key key =
   HolbuildHash.string_sha256 ("holbuild-remote-ac-v1\n" ^ key ^ "\n")
@@ -444,7 +487,8 @@ fun get_action cache key =
       | HolbuildCacheBackend.Corrupt message =>
           (cleanup (); warn_restore_once message; NONE)
   end
-  handle _ => NONE
+  handle e as Unavailable _ => raise e
+       | _ => NONE
 
 fun action_metadata cache key text =
   let
@@ -474,7 +518,8 @@ fun publish_action_metadata cache key metadata =
 fun publish_action cache {key, text} =
   if disabled () then HolbuildCacheBackend.Skipped
   else publish_action_metadata cache key (action_metadata cache key text)
-  handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
+  handle e as Unavailable _ => raise e
+       | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
 (* The HTTP write is unconditional.  Callers must authorize replacement from
    action-kind-specific semantics before using this operation. *)
@@ -496,7 +541,8 @@ fun put_action cache policy {key, text} =
                    else HolbuildCacheBackend.Conflict url)
         | NONE => publish_action_metadata cache key metadata
     end
-  handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
+  handle e as Unavailable _ => raise e
+       | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
 fun has_blob cache sha256 = Option.isSome (lookup_blob cache sha256)
 
@@ -511,7 +557,8 @@ fun blob_present cache sha256 =
         SOME (HolbuildHttp.Response 404) => false
       | _ => true
   end
-  handle _ => true
+  handle e as Unavailable _ => raise e
+       | _ => true
 
 (* An optional upload probe must not disable PUTs when a server drops HEADs.
    Leave the breaker to the normal cache requests, and skip only confirmed hits. *)
@@ -544,7 +591,8 @@ fun fetch_blob cache {hash, dst} =
                 (warn_restore_once message; result)
             | other => other
         end
-        handle e => HolbuildCacheBackend.Corrupt (General.exnMessage e)
+        handle e as Unavailable _ => raise e
+             | e => HolbuildCacheBackend.Corrupt (General.exnMessage e)
 
 (* Fetches a blob by its SHA-256 alone, without an action entry that lists
    it, as a remote worker fetches its spec and sources. *)
@@ -554,7 +602,8 @@ fun fetch_unlisted_blob cache {hash, dst} =
          if HolbuildHash.file_sha256 dst = hash then HolbuildCacheBackend.Hit
          else HolbuildCacheBackend.Corrupt ("downloaded blob SHA256 mismatch: " ^ hash)
      | other => other)
-  handle e => HolbuildCacheBackend.Corrupt (General.exnMessage e)
+  handle e as Unavailable _ => raise e
+       | e => HolbuildCacheBackend.Corrupt (General.exnMessage e)
 
 fun publish_blob cache {hash, src} =
   let
@@ -571,6 +620,7 @@ fun publish_blob cache {hash, src} =
       | HolbuildCacheBackend.AlreadyPresent => (remember_blob cache {sha256 = sha256, size = size}; result)
       | other => other
   end
-  handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
+  handle e as Unavailable _ => raise e
+       | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
 end

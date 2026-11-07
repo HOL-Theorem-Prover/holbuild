@@ -1470,7 +1470,11 @@ doesn't match its parents, or the theory was built against local copies of
 its parents that differ from the remote cache's, the worker drops those
 copies, for the action's retry to restore the remote cache's; such a build
 is not published but fails as a `publish` failure. A missing dependency
-fails the action; the worker never builds one.
+fails the action; the worker never builds one. When the remote cache gives
+no answer, answers 429 or 5xx, or is in its 60-second cooldown after
+requests got no response, whatever the worker was fetching or publishing,
+the action fails as `unavailable` rather than reading that as a miss or a
+conflict: the cache failed, not the action.
 
 A run spec (`holbuild-run-spec-v1`, see "Exporting script runs for remote
 execution") is checked the same way, its run text against its `run-key`,
@@ -1525,7 +1529,7 @@ holbuild-action-result-v1
 spec=<sha256>
 input-key=<input_key>
 status=built|cached|failed
-failure=proof|tactic-timeout|script|timeout|memory|input-missing|publish|toolchain|disk|spec-rejected|internal
+failure=proof|tactic-timeout|script|timeout|memory|input-missing|publish|toolchain|disk|spec-rejected|internal|unavailable
 missing=theory <input_key> | blob <sha256>
 peak-rss-mb=<n>
 wall-ms=<n>
@@ -1544,7 +1548,7 @@ the run; `disk` means the disk filled. The exit status summarizes the record:
 | 0 | built or cached |
 | 1 | `proof`, `tactic-timeout`, `script` or `timeout`: final, retrying won't help |
 | 2 | `memory`: retry with more memory |
-| 3 | `input-missing`, `publish`, `toolchain`, `disk` or `internal`: retry or resubmit |
+| 3 | `input-missing`, `publish`, `toolchain`, `disk`, `internal` or `unavailable`: retry or resubmit |
 | 4 | `spec-rejected` |
 
 The required `--cache-limit-gb N` caps what the worker keeps between actions: its

@@ -42,7 +42,7 @@ SPEC = "5" * 64
 RECORD = f"holbuild-action-result-v1\nspec={SPEC}\ninput-key={'6' * 64}\nstatus=built\n"
 
 # A stand-in holbuild source tree: `make bin/holbuild` installs a script that logs its arguments and environment and
-# writes RECORD to its --result file, or crashes without one when HOLBUILD_FAKE_CRASH is set.
+# writes RECORD (or HOLBUILD_FAKE_RECORD) to its --result file, or crashes without one when HOLBUILD_FAKE_CRASH is set.
 FAKE_HOLBUILD = f"""#!/bin/sh
 echo "$@" >> "$HOLBUILD_FAKE_LOG"
 env > "$HOLBUILD_FAKE_LOG.env"
@@ -51,7 +51,7 @@ env > "$HOLBUILD_FAKE_LOG.env"
 if [ -n "$HOLBUILD_FAKE_LEASE" ]; then sleep 1; (exec 3>"$HOLBUILD_FAKE_LEASE"; sleep 2); sleep 1; else sleep 2; fi
 [ -z "$HOLBUILD_FAKE_CRASH" ] || exit 70
 while [ "$#" -gt 0 ]; do
-  if [ "$1" = --result ]; then printf '{RECORD}' > "$2"; fi
+  if [ "$1" = --result ]; then printf '%s' "${{HOLBUILD_FAKE_RECORD:-{RECORD}}}" > "$2"; fi
   shift
 done
 """
@@ -291,6 +291,53 @@ def test_action_runs_without_the_worker_token(
     assert env["HOLBUILD_CACHE"] == str(tmp_path / "cache")
     assert env["HOLBUILD_REMOTE_CACHE_CURL_CONFIG"] == str(tmp_path / "cache.curl")
     assert env["PATH"]
+
+
+def test_action_exec_action_found_the_cache_unavailable_for_is_reported_as_it_said(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+    record = f"holbuild-action-result-v1\nspec={SPEC}\ninput-key={'6' * 64}\nstatus=failed\nfailure=unavailable\n"
+    monkeypatch.setenv("HOLBUILD_FAKE_RECORD", record)
+
+    unavailable = run_one(
+        Coordinator(server.url, "w"),
+        worker_args(tmp_path, server),
+        releases(tmp_path, server),
+        Protection(None, None),
+        claim(),
+        Phases(),
+    )
+
+    assert unavailable
+    assert server.completed == [record]
+
+
+def test_worker_waits_before_claiming_again_after_the_cache_was_unavailable(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", "w")
+    monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(worker, "parse_args", lambda: worker_args(tmp_path, server))
+    events: list[str] = []
+    monkeypatch.setattr(worker, "claim_reporting", lambda *_: events.append("claim") or claim())
+    outcomes = iter([True, False, False])
+
+    def run(*_: object) -> bool:
+        try:
+            return next(outcomes)
+        except StopIteration:
+            raise KeyboardInterrupt from None
+
+    monkeypatch.setattr(worker, "run_one", run)
+    monkeypatch.setattr(worker.time, "sleep", lambda seconds: events.append(f"sleep {seconds}"))
+
+    with pytest.raises(KeyboardInterrupt):
+        worker.main()
+
+    # Only the unavailable action is followed by a wait.
+    assert events == ["claim", f"sleep {worker.CLAIM_RETRY_SECONDS}", "claim", "claim", "claim"]
 
 
 def test_action_that_ends_without_a_record_is_reported_for_a_retry(
