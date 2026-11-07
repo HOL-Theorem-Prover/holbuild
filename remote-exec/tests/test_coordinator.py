@@ -12,6 +12,7 @@ import sqlalchemy as sa
 from remote_exec import coordinator as coordinator_module
 from remote_exec.app import create_app
 from remote_exec.coordinator import Coordinator
+from remote_exec.formats import parse_result
 from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache, entry_blob
 
 CLIENT = {"Authorization": f"Bearer {CLIENT_TOKEN}"}
@@ -309,6 +310,27 @@ async def test_a_check_begun_before_an_input_went_missing_is_not_remembered(
     assert await check is True
     assert await coordinator._in_cache(ac_key("a")) is True
     assert cache.asked == [ac_key("a"), ac_key("a")]
+
+
+async def test_completions_and_sweeps_answer_while_releases_wait_on_the_cache(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
+) -> None:
+    batch_id = await submit(http, ["a", "b", "c"], [("c", "a"), ("c", "b")])
+    tokens = await claim_all(http, 2)
+    cache.keys |= {ac_key("a"), ac_key("b")}
+    cache.hold = asyncio.Event()
+
+    # Neither the completions nor the sweep wait for the release that asks the held cache about "c"'s parents.
+    for name in ("a", "b"):
+        completed = coordinator.complete(UUID(tokens[name]), parse_result(result(name, "built")))
+        assert await asyncio.wait_for(completed, 5)
+    await asyncio.wait_for(coordinator.sweep(), 5)
+    assert coordinator.releaser is not None and not coordinator.releaser.done()
+
+    cache.hold.set()
+    await coordinator.released()
+    assert await states(http, batch_id) == {"a": "done", "b": "done", "c": "ready"}
+    assert sorted(cache.asked) == sorted([ac_key("a"), ac_key("b")])  # the sweep's pass found both remembered
 
 
 async def test_retried_action_waits_for_a_parent_requeued_while_it_ran(

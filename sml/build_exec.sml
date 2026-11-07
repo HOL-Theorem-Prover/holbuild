@@ -2448,7 +2448,7 @@ fun script_prefix_key NONE NONE source_prefix_hash = source_prefix_hash
 
 fun failed_prefix_diagnostic_key proof_engine = proof_engine ^ ":finish_goal_state_v2"
 (* Failed-prefix heaps retain the proof runtime and its compiled tactic refs. *)
-fun failed_prefix_resume_schema_key proof_engine = proof_engine ^ ":dependency_prefix_history_v2"
+fun failed_prefix_resume_schema_key proof_engine = proof_engine ^ ":dependency_prefix_history_v3"
 
 fun failed_prefix_ok proof_engine proof_timeout deps_key safe_name pre_hash header_hash =
   checkpoint_ok_text "failed_prefix"
@@ -2712,7 +2712,7 @@ fun best_failed_prefix_checkpoint requested_timeout checkpoints =
 
 datatype force_level = ForceNone | ForceTargets | ForceProject | ForceAll
 
-type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, checkpoint_targets : string list option, proof_steps : bool, new_ir : bool, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool}
+type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, checkpoint_targets : string list option, proof_steps : bool, new_ir : bool, proof_scope : HolbuildTacticTimeoutPolicy.proof_scope, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool}
 
 (* checkpoint: the theory saves checkpoints at all, its deps_loaded state
    included.  theorem_checkpoints: it also saves them per theorem and
@@ -4095,8 +4095,8 @@ fun checkpoint_target_node ({checkpoint_targets, ...} : build_options) node =
       NONE => true
     | SOME targets => force_target_node targets node
 
-fun checkpoint_policy_for_node (options as {skip_checkpoints, proof_steps, new_ir, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure, trknl, ...} : build_options) project node =
-  if root_package_node project node then
+fun checkpoint_policy_for_node (options as {skip_checkpoints, proof_steps, new_ir, proof_scope, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure, trknl, ...} : build_options) project node =
+  if HolbuildTacticTimeoutPolicy.includes_node proof_scope project node then
     CheckpointPolicy {checkpoint = not skip_checkpoints,
                       theorem_checkpoints =
                         (* The REPL starts from a failed proof wherever it is. *)
@@ -5826,12 +5826,12 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
 
 (* The build options of a build that only restores from the caches. *)
 fun restore_only_options ({use_cache, verify_cache, force, force_targets, skip_checkpoints, checkpoint_targets, proof_steps,
-                           new_ir, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure,
+                           new_ir, proof_scope, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure,
                            emit_output_hashes, allow_cache_timeout_discrepancy, trknl, ...} : build_options)
     : build_options =
   {use_cache = use_cache, verify_cache = verify_cache, force = force, force_targets = force_targets,
    skip_checkpoints = skip_checkpoints, checkpoint_targets = checkpoint_targets,
-   proof_steps = proof_steps, new_ir = new_ir,
+   proof_steps = proof_steps, new_ir = new_ir, proof_scope = proof_scope,
    node_tactic_timeouts = node_tactic_timeouts, execution_plan = execution_plan,
    trace_steps = trace_steps, repl_on_failure = repl_on_failure,
    emit_output_hashes = emit_output_hashes,
@@ -7432,11 +7432,17 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
       in
         loop path []
       end
+    (* A failed prefix's key doesn't say how far the prefix goes, so a run
+       that resumed from the shared one and saved another in its place (it got
+       further, or the restored one didn't validate) replaces the entry. *)
+    fun replaces_restored path =
+      List.exists (fn (p, sha) => p = path andalso (HolbuildHash.file_sha256 path <> sha handle _ => false))
+                  restored
     fun publish_candidate heap (c : shared_candidate) =
       let val key = shared_checkpoint_key heap_key (#kind c) (#key c)
       in
         if not (checkpoint_exists (#path c)) orelse was_restored (#path c) orelse not (#accepts c ()) orelse
-           present key then ()
+           (present key andalso not (#kind c = "failed_prefix" andalso replaces_restored (#path c))) then ()
         else
           case ancestors (#path c) of
               NONE => warn ("shared checkpoint chain is not on the heap: " ^ #path c)
@@ -7456,7 +7462,9 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                     [("leaf", #path c, rel (#path c))] @
                     map (fn suffix => ("sidecar", #path c ^ suffix, suffix)) sidecars
                   val entries = map (fn (role, path, arg) => (role, upload path, arg)) files
-                  val _ = HolbuildRemoteCache.publish_action remote
+                  (* An unconditional write: it replaces a failed prefix's
+                     entry, as above. *)
+                  val _ = HolbuildRemoteCache.replace_action_unconditionally remote
                             {key = key,
                              text = shared_manifest "holbuild-shared-checkpoint-v1" (SOME (#kind c))
                                       (("heap", heap, "") :: entries)}

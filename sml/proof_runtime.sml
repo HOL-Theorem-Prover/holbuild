@@ -20,6 +20,9 @@ val trace_current_theorem_ref = ref ""
 val theorem_info_ref = ref NONE : (string * string * string * string * string * string * string * string * string * bool * int) option ref
 val context_info_ref = ref NONE : (string * string * int) option ref
 val failed_prefix_resume_active_ref = ref false
+(* While a failed-prefix resume runs, the step count of the prefix it restored,
+   once known. *)
+val failed_prefix_resumed_step_count_ref = ref (NONE : int option)
 val proving_with_proof_ir_ref = ref false
 (* The context handed to the installed prover for the proof being run: every
    step, selector probe and nested proof runs in it.  A failed-prefix
@@ -485,13 +488,106 @@ fun parse_leaf_snapshot_text text =
            | _ => NONE)
     | _ => NONE
 
+(* The .meta and .prefix texts of a failed-prefix checkpoint at the current
+   step.  Limits the proof history to what the metadata needs, so call it just
+   before saving the heap. *)
+fun failed_prefix_texts () =
+  let
+    val prefix_end = !successful_prefix_end_ref
+    val step_count = !successful_step_count_ref
+    val leaf_signature_lines =
+      case (!active_plan_ref, step_count, !successful_path_ref) of
+          (SOME plan, n, path) =>
+            if n = 0 then []
+            else (case step_at_path plan path of
+                      SOME step => ["leaf_signature=" ^ step_signature_text step ^ "\n"]
+                    | NONE => [])
+        | _ => []
+    val prefix_signature_lines =
+      case !successful_leaf_snapshots_ref of
+          ({prefix_signature = SOME saved_signature, ...} : leaf_snapshot) :: _ =>
+            ["prefix_signature=" ^ saved_signature ^ "\n"]
+        | _ => []
+    val meta_text =
+      String.concat (["proof_ir_failed_prefix_version=5\n",
+                      "step_count=", Int.toString step_count, "\n",
+                      "prefix_end=", Int.toString prefix_end, "\n",
+                      "path=", path_text (!successful_path_ref), "\n",
+                      "focus=", int_list_text (!successful_branch_tail_counts_ref), "\n",
+                      "history_count=", Int.toString (!history_step_count_ref), "\n"] @
+                     leaf_signature_lines @ prefix_signature_lines @
+                     map (fn snap => "leaf=" ^ leaf_snapshot_text snap ^ "\n") (rev (!successful_leaf_snapshots_ref)) @
+                     map (fn frame => "frame=" ^ structural_frame_text frame ^ "\n") (!successful_frames_ref) @
+                     map (fn event => "event=" ^ dynamic_event_text event ^ "\n") (rev (!dynamic_events_ref)))
+    val _ =
+      (case !proof_history_ref of
+           NONE => ()
+         | SOME history =>
+             proof_history_ref := SOME (History.set_limit history (Int.max(15, !history_step_count_ref + 1))))
+  in
+    (meta_text, String.substring(!active_tactic_text_ref, 0, prefix_end))
+  end
+
+(* A resumed proof runs in the heap it loaded from path, the last state in
+   Poly's hierarchy, at depth.  Saving at depth - 1 writes the new heap as a
+   child of that heap's parent, which stays as it is, and replaces the loaded
+   heap in the hierarchy.  Poly read the loaded heap whole, so the process no
+   longer needs its file.
+
+   The new checkpoint is written under a temporary name and renamed into place
+   once complete, so a process killed mid-save leaves the old one intact; only
+   the few renames that install it can leave neither.  Renaming the heap is
+   safe here: a heap's header names only its parent, and this failing process
+   saves no child under it.  Renames also replace the old directory entries
+   rather than writing into the old files, which may be links into a shared
+   store (see HolbuildCheckpointSaveRuntime.begin_replacement).  The old .ok
+   goes first and the new .ok last, so the files are never resumed as a mixed
+   set. *)
+fun advance_failed_prefix_checkpoint path ok_text depth =
+  let
+    val new = path ^ ".new"
+    val suffixes = ["", ".meta", ".prefix", ".ok"]
+    fun exists file = OS.FileSys.access (file, []) handle OS.SysErr _ => false
+    fun remove file = OS.FileSys.remove file handle OS.SysErr _ => ()
+    fun discard_new () =
+      app (fn suffix => (remove (new ^ suffix); remove (new ^ suffix ^ ".tmp"))) suffixes
+    fun install () =
+      (remove (path ^ ".ok");
+       app (fn suffix => OS.FileSys.rename {old = new ^ suffix, new = path ^ suffix}) suffixes)
+  in
+    (discard_new ();
+     let val (meta_text, prefix_text) = failed_prefix_texts ()
+     in
+       save_checkpoint "failed_prefix" false new ok_text depth;
+       (* save_checkpoint drops the checkpoint on an I/O failure; then no .ok. *)
+       if exists (new ^ ".ok") then
+         (HolbuildCheckpointSaveRuntime.write_text_atomically (new ^ ".meta") meta_text;
+          HolbuildCheckpointSaveRuntime.write_text_atomically (new ^ ".prefix") prefix_text;
+          install ())
+       else discard_new ()
+     end)
+    handle e =>
+      (discard_new ();
+       if HolbuildCheckpointSaveRuntime.checkpoint_io_failure e then
+         HolbuildCheckpointSaveRuntime.warn_checkpoint_failure "failed_prefix" new e
+       else raise e)
+  end
+
+(* A resumed proof saves only when it got past the prefix it restored: one that
+   fails at the same step would save the same state again. *)
 fun save_failed_prefix_checkpoint () =
   case !theorem_info_ref of
       NONE => ()
     | SOME (kind, _, _, _, _, _, _, failed_prefix_path, failed_prefix_ok, _, depth) =>
         if not (kind = "theorem" orelse kind = "resume") orelse
-           not (!checkpoint_enabled_ref) orelse
-           !failed_prefix_resume_active_ref then ()
+           not (!checkpoint_enabled_ref) then ()
+        else if !failed_prefix_resume_active_ref then
+          (case !failed_prefix_resumed_step_count_ref of
+               SOME resumed =>
+                 if !successful_step_count_ref > resumed andalso not (QUse.hadError ()) then
+                   advance_failed_prefix_checkpoint failed_prefix_path failed_prefix_ok (depth - 1)
+                 else ()
+             | NONE => ())
         else if QUse.hadError () then
           (* No checkpoint after a parse error: see HolbuildCheckpointSaveRuntime. *)
           (HolbuildCheckpointSaveRuntime.discard_checkpoint failed_prefix_path;
@@ -499,40 +595,10 @@ fun save_failed_prefix_checkpoint () =
                [".meta", ".prefix"])
         else
           let
-            val prefix_end = !successful_prefix_end_ref
-            val step_count = !successful_step_count_ref
-            val leaf_signature_lines =
-              case (!active_plan_ref, step_count, !successful_path_ref) of
-                  (SOME plan, n, path) =>
-                    if n = 0 then []
-                    else (case step_at_path plan path of
-                              SOME step => ["leaf_signature=" ^ step_signature_text step ^ "\n"]
-                            | NONE => [])
-                | _ => []
-            val prefix_signature_lines =
-              case !successful_leaf_snapshots_ref of
-                  ({prefix_signature = SOME saved_signature, ...} : leaf_snapshot) :: _ =>
-                    ["prefix_signature=" ^ saved_signature ^ "\n"]
-                | _ => []
-            val meta_text =
-              String.concat (["proof_ir_failed_prefix_version=5\n",
-                              "step_count=", Int.toString step_count, "\n",
-                              "prefix_end=", Int.toString prefix_end, "\n",
-                              "path=", path_text (!successful_path_ref), "\n",
-                              "focus=", int_list_text (!successful_branch_tail_counts_ref), "\n",
-                              "history_count=", Int.toString (!history_step_count_ref), "\n"] @
-                             leaf_signature_lines @ prefix_signature_lines @
-                             map (fn snap => "leaf=" ^ leaf_snapshot_text snap ^ "\n") (rev (!successful_leaf_snapshots_ref)) @
-                             map (fn frame => "frame=" ^ structural_frame_text frame ^ "\n") (!successful_frames_ref) @
-                             map (fn event => "event=" ^ dynamic_event_text event ^ "\n") (rev (!dynamic_events_ref)))
-            val _ =
-              (case !proof_history_ref of
-                   NONE => ()
-                 | SOME history =>
-                     proof_history_ref := SOME (History.set_limit history (Int.max(15, !history_step_count_ref + 1))))
+            val (meta_text, prefix_text) = failed_prefix_texts ()
             val _ = save_checkpoint "failed_prefix" false failed_prefix_path failed_prefix_ok depth
             val _ = write_text_file (failed_prefix_path ^ ".meta") meta_text
-            val _ = write_text_file (failed_prefix_path ^ ".prefix") (String.substring(!active_tactic_text_ref, 0, prefix_end))
+            val _ = write_text_file (failed_prefix_path ^ ".prefix") prefix_text
           in () end
 
 fun restore_failed_prefix_checkpoint_info (name, tactic_text, failed_prefix_path, failed_prefix_ok) =
@@ -1889,8 +1955,10 @@ fun resumable_failed_prefix_metadata plan metadata =
 fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path failed_prefix_ok =
   let
     val old_resume_active = !failed_prefix_resume_active_ref
+    val old_resumed_step_count = !failed_prefix_resumed_step_count_ref
     fun restore_resume_flag () =
-      failed_prefix_resume_active_ref := old_resume_active
+      (failed_prefix_resume_active_ref := old_resume_active;
+       failed_prefix_resumed_step_count_ref := old_resumed_step_count)
     val _ = failed_prefix_resume_active_ref := true
     val result =
       with_proof_ir_execution (current_proof_context ()) (fn () =>
@@ -1925,6 +1993,7 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
           val _ = trace_plan name plan
           val _ = stop_after_plan_if_requested ()
           val metadata = resume_metadata
+          val _ = failed_prefix_resumed_step_count_ref := SOME (#step_count metadata)
           val resume_display =
             if #step_count metadata = 0 andalso #path metadata = [] then 0
             else case path_display_index plan (#path metadata) of
@@ -1936,7 +2005,8 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
           val _ = successful_frames_ref := #frames metadata
           val _ = current_frames_ref := #frames metadata
           val _ = resume_frames_ref := #frames metadata
-          val _ = successful_leaf_snapshots_ref := take_at_most (#step_count metadata) (#leaves metadata)
+          (* Metadata lists leaves oldest first; the ref holds them newest first. *)
+          val _ = successful_leaf_snapshots_ref := rev (take_at_most (#step_count metadata) (#leaves metadata))
           val _ = branch_tail_count_ref := #focus metadata
           val _ = successful_branch_tail_counts_ref := #focus metadata
           val _ = dynamic_events_ref := rev (#events metadata)
@@ -2003,6 +2073,7 @@ fun install ({checkpoint_enabled, tactic_timeout, timeout_marker, plan_theorem, 
    failed_goal_state_printed_ref := false;
    suppressed_failure_diagnostic_ref := NONE;
    failed_prefix_resume_active_ref := false;
+   failed_prefix_resumed_step_count_ref := NONE;
    proving_with_proof_ir_ref := false;
    HolbuildTacticCompat.install_prover proof_ir_prover)
 
