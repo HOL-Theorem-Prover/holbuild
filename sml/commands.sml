@@ -1475,7 +1475,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             val query = "?class=run" ^ (case profile of SOME p => "&profile=" ^ p | NONE => "")
             fun on_change (key, state, failure) = states := (key, (state, failure)) :: !states
           in
-            case HolbuildRemoteExec.submit_with_query url query (#maxheap tc) batch of
+            (* A run never runs here, so an unreachable coordinator is waited for. *)
+            case HolbuildRemoteExec.submit_with_query true url query (#maxheap tc) batch of
                 HolbuildRemoteExec.Refused reason => stopped := SOME (reason, true)
               | HolbuildRemoteExec.Ok batch_id =>
                   let
@@ -1713,7 +1714,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             (HolbuildStatus.message_stderr "holbuild: remote execution: nothing to build remotely\n";
              build_locally ())
           else
-            case HolbuildRemoteExec.submit url (#maxheap tc) batch of
+            case HolbuildRemoteExec.submit (remote_only orelse detach) url (#maxheap tc) batch of
                 HolbuildRemoteExec.Refused reason => fall_back reason
               | HolbuildRemoteExec.Ok batch_id =>
                   (HolbuildStatus.message_stderr ("holbuild: remote batch " ^ batch_id ^ "\n");
