@@ -113,6 +113,8 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             batch = parse_batch(await text_body(request))
         except FormatError as error:
             raise HTTPException(400, str(error)) from error
+        if action_class == "run" and batch.edges:
+            raise HTTPException(400, "run batches require independent actions: dependency edges are not allowed")
         return {"batch_id": await coordinator.submit(batch, profile, action_class)}
 
     @app.get("/v1/batches/{batch_id}", dependencies=client)

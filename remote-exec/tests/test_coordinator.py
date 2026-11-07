@@ -1040,6 +1040,19 @@ async def test_batch_class_defaults_to_build_and_rejects_unknown_classes(
     assert response.status_code == 422
 
 
+async def test_run_batches_reject_dependency_edges_before_storing_actions(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    response = await http.post(
+        "/v1/batches?class=run", content=batch_text(["a", "b"], [("b", "a")]), headers=CLIENT
+    )
+    assert response.status_code == 400
+    assert "dependency edges are not allowed" in response.json()["detail"]
+    async with coordinator.engine.connect() as connection:
+        assert await connection.scalar(sa.text("SELECT count(*) FROM batches")) == 0
+    await submit(http, ["a", "b"], [("b", "a")])
+
+
 async def test_builds_beat_older_runs_across_all_accepted_tiers(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:

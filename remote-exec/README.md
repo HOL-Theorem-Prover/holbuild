@@ -131,6 +131,8 @@ A batch has one class: `build` (the default) or `run`, selected with
 `POST /v1/batches?class=run`. Run actions execute submitted scripts in cached
 HOL contexts through the same worker protocol. The coordinator stores the
 class on every action and treats its `input_key` as opaque.
+Run batches contain independent actions and accept no dependency edges;
+submitting a run batch with an `edge` returns 400.
 
 Each `action` line is one theory to build or one script to run; each `edge`
 says a theory needs another theory of the same batch first. Parents that were already cached at
