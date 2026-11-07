@@ -35,6 +35,12 @@ class FakeCache:
         self.broken: set[str] = set()
         self.lost: set[str] = set()
         self.asked: list[str] = []
+        self.hold: asyncio.Event | None = None  # while set to an unset event, entry requests wait for it
+
+    async def handle_async(self, request: httpx.Request) -> httpx.Response:
+        if self.hold is not None and request.url.path.startswith("/ac/"):
+            await self.hold.wait()
+        return self.handle(request)
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -102,7 +108,7 @@ async def coordinator(remote_exec_engine: AsyncEngine, cache: FakeCache) -> Asyn
         standard_tier_mb=1000,
         events_poll_seconds=0.01,
     )
-    async with httpx.AsyncClient(base_url=settings.cache_url, transport=httpx.MockTransport(cache.handle)) as client:
+    async with httpx.AsyncClient(base_url=settings.cache_url, transport=httpx.MockTransport(cache.handle_async)) as client:
         yield Coordinator(remote_exec_engine, client, settings)
 
 

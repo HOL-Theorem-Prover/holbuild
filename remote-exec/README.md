@@ -140,8 +140,11 @@ finally (`failed`, with a `failure` message), or the client cancels it
   is only a readiness hint; `exec-action` validates its inputs itself. An
   entry found whole is trusted for 60 s without asking again, so a child
   released on it after the cache evicted it reports `input-missing`, spending
-  one attempt; any `input-missing` result makes the coordinator forget every
-  entry it found, so the next release asks again and rebuilds the parent.
+  one attempt; any `input-missing` result makes the coordinator process that
+  gets it forget every entry it found, so its next release asks again and
+  rebuilds the parent. Other coordinator processes keep trusting their own
+  findings until the 60 s run out, so with several the child may spend
+  another attempt.
 - **Claims** take a ready action of the worker's tier (or, when it has none,
   of its `also_claim` tiers, in order, so a burst worker builds every ready
   high-tier action before standard overflow) with `FOR UPDATE SKIP LOCKED`,

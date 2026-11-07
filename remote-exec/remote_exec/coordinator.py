@@ -423,29 +423,31 @@ class Coordinator:
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wait_s
-        while True:
-            # Taken before the attempt, so an action made ready during it is tried at once instead of waited for.
-            made_ready = self.made_ready
-            claimed = await self._claim(tiers, worker)
-            remaining = deadline - loop.time()
-            if claimed is not None or remaining <= 0:
-                return claimed
-            woken: asyncio.Future[str] = loop.create_future()
-            if self.made_ready == made_ready:
-                waiter = (tiers, woken)
-                self.claim_waiters.append(waiter)
-                try:
-                    with contextlib.suppress(TimeoutError):
-                        await asyncio.wait_for(asyncio.shield(woken), min(remaining, CLAIM_RECHECK_SECONDS))
-                except asyncio.CancelledError:
+        woken: asyncio.Future[str] = loop.create_future()  # done once a wake was handed to this claim
+        try:
+            while True:
+                # Taken before the attempt, so an action made ready during it is tried at once, not waited for.
+                made_ready = self.made_ready
+                claimed = await self._claim(tiers, worker)
+                remaining = deadline - loop.time()
+                if claimed is not None or remaining <= 0:
+                    return claimed
+                woken = loop.create_future()
+                if self.made_ready == made_ready:
+                    waiter = (tiers, woken)
+                    self.claim_waiters.append(waiter)
+                    try:
+                        with contextlib.suppress(TimeoutError):
+                            await asyncio.wait_for(asyncio.shield(woken), min(remaining, CLAIM_RECHECK_SECONDS))
+                    finally:
+                        with contextlib.suppress(ValueError):
+                            self.claim_waiters.remove(waiter)
+                if disconnected is not None and await disconnected():
                     self._pass_wake(woken)
-                    raise
-                finally:
-                    with contextlib.suppress(ValueError):
-                        self.claim_waiters.remove(waiter)
-            if disconnected is not None and await disconnected():
-                self._pass_wake(woken)
-                return None
+                    return None
+        except asyncio.CancelledError:
+            self._pass_wake(woken)
+            raise
 
     async def _claim(self, tiers: list[str], worker: str) -> Claim | None:
         async with self.engine.begin() as conn:

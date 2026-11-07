@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import hashlib
 import json
 from typing import Any
@@ -288,8 +289,26 @@ async def test_a_remembered_parent_whose_blob_expired_is_built_again_once_a_chil
 
 async def test_concurrent_releases_share_one_check_of_a_parent(cache: FakeCache, coordinator: Coordinator) -> None:
     cache.keys.add(ac_key("a"))
-    assert await asyncio.gather(*(coordinator._in_cache(ac_key("a")) for _ in range(5))) == [True] * 5
+    cache.hold = asyncio.Event()
+    checks = [asyncio.create_task(coordinator._in_cache(ac_key("a"))) for _ in range(5)]
+    await asyncio.sleep(0.1)  # every check is waiting on the first one's GET
+    cache.hold.set()
+    assert await asyncio.gather(*checks) == [True] * 5
     assert cache.asked == [ac_key("a")]
+
+
+async def test_a_check_begun_before_an_input_went_missing_is_not_remembered(
+    cache: FakeCache, coordinator: Coordinator
+) -> None:
+    cache.keys.add(ac_key("a"))
+    cache.hold = asyncio.Event()
+    check = asyncio.create_task(coordinator._in_cache(ac_key("a")))
+    await asyncio.sleep(0.1)
+    coordinator._forget_cache_findings()  # what an input-missing result does
+    cache.hold.set()
+    assert await check is True
+    assert await coordinator._in_cache(ac_key("a")) is True
+    assert cache.asked == [ac_key("a"), ac_key("a")]
 
 
 async def test_retried_action_waits_for_a_parent_requeued_while_it_ran(
@@ -420,6 +439,33 @@ async def test_an_action_made_ready_wakes_a_waiting_claim_that_takes_its_tier(
     for task in standard:
         task.cancel()
     await asyncio.gather(*standard, return_exceptions=True)
+
+
+async def test_a_woken_claim_cancelled_hands_its_wake_to_the_next(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only wakes end the waits in time
+    first = asyncio.create_task(coordinator.claim(["standard"], "w1", 30))
+    await asyncio.sleep(0.2)
+    second = asyncio.create_task(coordinator.claim(["standard"], "w2", 30))
+    await asyncio.sleep(0.2)
+    claim_once = coordinator._claim
+    hold = asyncio.Event()
+
+    async def held(tiers: list[str], worker: str) -> Any:
+        if worker == "w1":
+            await hold.wait()  # cancelled while trying, after its wake
+        return await claim_once(tiers, worker)
+
+    monkeypatch.setattr(coordinator, "_claim", held)
+    await submit(http, ["a"])
+    await asyncio.sleep(0.2)
+    assert not second.done()
+    first.cancel()
+    claimed = await asyncio.wait_for(second, 10)
+    assert claimed is not None and claimed.theory == "pkg:a"
+    with contextlib.suppress(asyncio.CancelledError):
+        await first
 
 
 async def test_a_waiting_claim_whose_worker_left_leases_nothing(
