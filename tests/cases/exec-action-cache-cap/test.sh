@@ -131,6 +131,9 @@ printf 'blob sig %s\n' "$blob1" > "$cache/actions/entry1/manifest"
 printf 'blob sig %s\nblob dat %s\n' "$blob1" "$blob2" > "$cache/actions/entry2/manifest"
 at 2001 "$cache/actions/entry1/manifest"
 at 2003 "$cache/actions/entry2/manifest"
+mkdir -p "$cache/theory-modules"
+printf 'old module\n' > "$cache/theory-modules/old.pmo"
+at 1999 "$cache/theory-modules/old.pmo"
 
 # 10 GB in all; a 6 GB cap with a 1 GB reserve leaves room for 5 GB, which
 # evicting everything but the pinned toolchain and the newest checkpoints
@@ -159,6 +162,7 @@ evicted "$cache/actions/entry2" "a cache entry needed to get under the cap"
 evicted "$cache/blobs/$blob1" "a blob whose entries were evicted"
 evicted "$cache/blobs/$blob2" "a blob whose entry was evicted"
 evicted "$cache/blobs/$orphan" "an unreferenced blob"
+evicted "$cache/theory-modules/old.pmo" "an old compiled theory module"
 
 # Under the cap (5 GB and a little, with 6 GB of room), nothing is evicted.
 sparse "$checkpoints/OldScript.deps/key/deps_loaded.save" 1

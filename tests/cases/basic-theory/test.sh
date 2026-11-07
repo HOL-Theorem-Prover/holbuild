@@ -62,20 +62,16 @@ first_timing=$tmpdir/first.tool-timing
   HOLBUILD_TIMING_LOG="$first_timing" HOLBUILD_TIMING_DETAIL=fine HOLBUILD_CHECKPOINT_TIMING=1 HOLBUILD_SHARE_COMMON_DATA=0 HOLBUILD_ECHO_CHILD_LOGS=1 \
   "$HOLBUILD_BIN" --max-heap 4096 build ATheory) > "$first_log" 2>&1
 require_grep "holbuild checkpoint kind=deps_loaded share=false" "$first_log"
+require_grep "holbuild checkpoint kind=final_context share=false" "$first_log"
 require_grep $'^phase\tname=build\.keys\tstatus=ok\tms=' "$first_timing"
 require_grep $'^phase\tname=build\.exec\.node\.analyse_boundaries\tstatus=ok\tms=' "$first_timing"
 require_grep $'^phase\tname=build\.exec\.node\.analyse_terminations\tstatus=ok\tms=' "$first_timing"
 require_grep $'^phase\tname=build\.exec\.node\.child_run\tstatus=ok\tms=' "$first_timing"
+require_grep $'^phase\tname=build\.exec\.node\.final_context\tstatus=ok\tms=' "$first_timing"
 require_grep $'^phase\tname=build\.exec\.checkpoint_budget\tstatus=ok\tms=' "$first_timing"
 require_grep $'^phase\tname=build\.exec\.publish_cache\tstatus=ok\tms=' "$first_timing"
 require_file "$project/.holbuild/logs/current/basic/ATheory/build.log"
-# Nothing reads a heap saved after export, so a checkpointed build saves none.
-if grep -q "holbuild checkpoint kind=final_context" "$first_log" ||
-   grep -q $'^phase\tname=build\.exec\.node\.final_context\t' "$first_timing" ||
-   [[ -e "$project/.holbuild/logs/current/basic/ATheory/final-context.log" ]]; then
-  echo "checkpointed build ran a post-export final-context child" >&2
-  exit 1
-fi
+require_file "$project/.holbuild/logs/current/basic/ATheory/final-context.log"
 
 coarse_timing=$tmpdir/coarse.tool-timing
 (cd "$project" && HOLBUILD_TIMING_LOG="$coarse_timing" "$HOLBUILD_BIN" build --dry-run ATheory) > /dev/null
@@ -115,17 +111,25 @@ if ! find "$project/.holbuild/checkpoints" \( -name '*.save' -o -name '*.save.ok
   echo "successful build should retain checkpoint files for incremental rebuilds" >&2
   exit 1
 fi
-if find "$project/.holbuild/checkpoints" -name '*.final_context.save*' -print -quit | grep -q .; then
-  echo "checkpointed build saved a final_context.save" >&2
+final_context=$(find "$project/.holbuild/checkpoints" -type f -name '*.final_context.save' -print -quit)
+if [[ -z "$final_context" ]]; then
+  echo "successful build did not retain final_context.save" >&2
   exit 1
 fi
-cat > "$tmpdir/published-load.sml" <<SML
-load "$project/.holbuild/obj/src/ATheory";
+require_file "$final_context.ok"
+require_grep '^holbuild-checkpoint-ok-v2$' "$final_context.ok"
+require_grep '^kind=final_context$' "$final_context.ok"
+require_grep '^deps_key=' "$final_context.ok"
+require_grep '^input_key=' "$final_context.ok"
+require_grep '^load_schema=fresh_generated_theory_v1$' "$final_context.ok"
+cat > "$tmpdir/final-context-check.sml" <<'SML'
 val _ = ATheory.a_def;
 val _ = ATheory.a_thm;
 SML
-"$HOLDIR/bin/hol" run --noconfig --holstate "$HOLDIR/bin/hol.state" \
-  "$tmpdir/published-load.sml" > "$tmpdir/published-load.log" 2>&1
+# A saved context must not depend on disposable compiled-module files.
+rm -rf "$HOLBUILD_CACHE/theory-modules"
+"$HOLDIR/bin/hol" run --noconfig --holstate "$final_context" \
+  "$tmpdir/final-context-check.sml" > "$tmpdir/final-context-check.log" 2>&1
 if grep -q "deps_loaded=\|final_context=\|theorem_boundary" "$metadata"; then
   echo "metadata should not retain checkpoint paths" >&2
   exit 1
@@ -401,7 +405,7 @@ skip_log=$tmpdir/skip.log
 (cd "$skip_project" && \
   HOLBUILD_CHECKPOINT_TIMING=1 HOLBUILD_ECHO_CHILD_LOGS=1 "$HOLBUILD_BIN" build --skip-checkpoints --no-cache ATheory) \
   > "$skip_log" 2>&1
-if grep -q "holbuild checkpoint kind=deps_loaded" "$skip_log"; then
+if grep -q "holbuild checkpoint kind=deps_loaded\|holbuild checkpoint kind=final_context" "$skip_log"; then
   echo "--skip-checkpoints created theory checkpoints" >&2
   exit 1
 fi
@@ -410,6 +414,10 @@ require_file "$skip_project/.holbuild/obj/src/ATheory.sml"
 require_file "$skip_project/.holbuild/obj/src/ATheory.dat"
 if find "$skip_project/.holbuild/checkpoints" \( -name '*.save' -o -name '*.save.ok' \) -print -quit 2>/dev/null | grep -q .; then
   echo "--skip-checkpoints left checkpoint files" >&2
+  exit 1
+fi
+if [[ -e "$skip_project/.holbuild/logs/current/basic/ATheory/final-context.log" ]]; then
+  echo "--skip-checkpoints ran a generated-theory final-context child" >&2
   exit 1
 fi
 cat > "$tmpdir/skip-checkpoints-load.sml" <<SML

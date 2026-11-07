@@ -64,6 +64,7 @@ QED'
 
 {
   echo "Theory SourceCtx"
+  echo 'fun ignore (_ : bool) = raise Fail "script ignore"'
   source_input_prelude source_ctx
   input_flag_sml
   printf '\n%s\n' "$marker_theorem"
