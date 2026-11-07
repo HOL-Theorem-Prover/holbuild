@@ -7,6 +7,7 @@ is a batch row first, then its actions and leases, so a completion, an expiry an
 import asyncio
 import contextlib
 import graphlib
+import json
 import logging
 import re
 import shlex
@@ -116,6 +117,7 @@ class ActionStatus:
     attempts: int
     last_failure: str | None
     log_sha256: str | None
+    timings: dict[str, int] | None  # the last result's, in milliseconds; see formats.Result
 
 
 @dataclass(frozen=True)
@@ -303,7 +305,7 @@ AND (CAST(:batch_id AS uuid) IS NULL OR a.batch_id = :batch_id)
 
 # The actions of a batch written by transactions numbered :since or later; see Coordinator.changes.
 CHANGED_ACTIONS = sa.text("""
-SELECT input_key, theory, state, tier, attempts, last_failure, log_sha256 FROM actions
+SELECT input_key, theory, state, tier, attempts, last_failure, log_sha256, CAST(timings AS text) FROM actions
 WHERE batch_id = :batch_id AND changed_xid >= CAST(CAST(:since AS text) AS xid8)
 ORDER BY theory, input_key
 """)
@@ -497,7 +499,7 @@ class Coordinator:
             if batch is None:
                 return None
             actions = await conn.execute(CHANGED_ACTIONS, {"batch_id": batch_id, "since": str(since)})
-            status = BatchStatus(batch_id, batch.state, batch.failure, [ActionStatus(*row) for row in actions])
+            status = BatchStatus(batch_id, batch.state, batch.failure, [ActionStatus(*row[:-1], json.loads(row[-1]) if row[-1] is not None else None) for row in actions])
             return status, int(batch.xmin)
 
     async def cancel(self, batch_id: UUID) -> str | None:
@@ -691,12 +693,14 @@ class Coordinator:
                 )
             await conn.execute(
                 sa.text(
-                    "UPDATE actions SET log_sha256 = :log, last_failure = :failure "
+                    "UPDATE actions SET log_sha256 = :log, last_failure = :failure, "
+                    "timings = CAST(CAST(:timings AS text) AS jsonb) "
                     "WHERE batch_id = :batch_id AND input_key = :input_key"
                 ),
                 {
                     "log": result.log_sha256,
                     "failure": result.failure,
+                    "timings": json.dumps(result.timings) if result.timings is not None else None,
                     "batch_id": batch_id,
                     "input_key": lease.input_key,
                 },

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 SHA256 = re.compile(r"[0-9a-f]{64}")
 THEORY = re.compile(r"[^\s:]+:\S+")
+PHASE = re.compile(r"[a-z]+")
 
 FAILURES = frozenset(
     {
@@ -58,6 +59,7 @@ class Result:
     missing: Missing | None
     peak_rss_mb: int | None
     log_sha256: str | None
+    timings: dict[str, int] | None = None  # milliseconds: each phase's, and the whole run's as "wall"
 
 
 def _expect(pattern: re.Pattern[str], value: str, what: str) -> str:
@@ -140,6 +142,17 @@ def parse_result(text: str) -> Result:
     if peak is not None and not peak.isdigit():
         raise FormatError(f"bad peak-rss-mb: {peak!r}")
     log = fields.get("log")
+    timings: dict[str, int] = {}
+    for item in fields["phase-ms"].split(",") if "phase-ms" in fields else []:
+        name, sep, ms = item.partition(":")
+        if not (sep and PHASE.fullmatch(name) and ms.isdigit()) or name in timings:
+            raise FormatError(f"bad phase-ms: {fields['phase-ms']!r}")
+        timings[name] = int(ms)
+    wall = fields.get("wall-ms")
+    if wall is not None:
+        if not wall.isdigit() or "wall" in timings:
+            raise FormatError(f"bad wall-ms: {wall!r}")
+        timings["wall"] = int(wall)
     return Result(
         spec_sha256=_expect(SHA256, fields.get("spec", ""), "spec"),
         input_key=_expect(SHA256, fields["input-key"], "input-key") if fields.get("input-key") else None,
@@ -148,4 +161,5 @@ def parse_result(text: str) -> Result:
         missing=missing,
         peak_rss_mb=int(peak) if peak is not None else None,
         log_sha256=_expect(SHA256, log.split(" ")[0], "log") if log else None,
+        timings=timings or None,
     )

@@ -556,21 +556,29 @@ fun fetch_unlisted_blob cache {hash, dst} =
      | other => other)
   handle e => HolbuildCacheBackend.Corrupt (General.exnMessage e)
 
-fun publish_blob cache {hash, src} =
+fun put_blob cache {hash, src} =
   let
-    val sha256 = HolbuildHash.file_sha256 src
     val size = Position.toString (FS.fileSize src)
-    val _ =
-      if sha256 = hash then ()
-      else raise Error ("blob SHA256 mismatch: expected " ^ hash ^ " got " ^ sha256)
     val result =
-      curl_put_zstd {url = cas_url cache sha256, src = src, size = size}
+      curl_put_zstd {url = cas_url cache hash, src = src, size = size}
   in
     case result of
-        HolbuildCacheBackend.Published => (remember_blob cache {sha256 = sha256, size = size}; result)
-      | HolbuildCacheBackend.AlreadyPresent => (remember_blob cache {sha256 = sha256, size = size}; result)
+        HolbuildCacheBackend.Published => (remember_blob cache {sha256 = hash, size = size}; result)
+      | HolbuildCacheBackend.AlreadyPresent => (remember_blob cache {sha256 = hash, size = size}; result)
       | other => other
   end
   handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
+
+fun publish_blob cache {hash, src} =
+  let val sha256 = HolbuildHash.file_sha256 src
+  in
+    if sha256 = hash then put_blob cache {hash = hash, src = src}
+    else HolbuildCacheBackend.Conflict ("blob SHA256 mismatch: expected " ^ hash ^ " got " ^ sha256)
+  end
+  handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
+
+(* For a src the caller hashed in this process and has not changed since:
+   the upload skips hashing it again. *)
+val publish_hashed_blob = put_blob
 
 end

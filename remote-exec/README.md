@@ -51,6 +51,10 @@ runs finish and cancel queued run batches. Use the current image to run
 `alembic downgrade 0004` before starting the older image, whose migration
 code does not know revision `0005`.
 
+Migration `0006` adds a nullable column for each action's phase timings.
+Images predating it ignore the column, so rolling back past it needs no
+downgrade.
+
 The coordinator reads its settings from the environment:
 
 | Variable | Meaning | Default |
@@ -356,7 +360,8 @@ An unknown class returns 422.
         "tier": "standard|high",
         "attempts": 1,
         "last_failure": "<failure class>|null",
-        "log_sha256": "<sha256 of the last run's build log in /cas/>|null"
+        "log_sha256": "<sha256 of the last run's build log in /cas/>|null",
+        "timings": {"<phase>": <ms>, ..., "wall": <ms>}|null
       }
     ]
   }
@@ -377,7 +382,7 @@ An unknown class returns 422.
   stream with nothing to send for `REMOTE_EXEC_EVENTS_KEEPALIVE_SECONDS` sends
   an empty line, which clients skip, so a proxy doesn't close it as idle:
   ```json
-  {"type": "action", "input_key": "…", "theory": "…", "state": "…", "tier": "…", "attempts": 1, "last_failure": null, "log_sha256": null}
+  {"type": "action", "input_key": "…", "theory": "…", "state": "…", "tier": "…", "attempts": 1, "last_failure": null, "log_sha256": null, "timings": null}
   {"type": "batch", "state": "done|failed|cancelled", "failure": "<message>|null"}
   ```
   A client detaches by closing the connection and reattaches by opening the
