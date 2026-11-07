@@ -7864,6 +7864,16 @@ fun verify_run_spec (spec : run_spec) =
       if String.isPrefix "HOLLIB:" name then
         size name > size "HOLLIB:" andalso not (CharVector.exists (fn c => c = #"/") name)
       else Option.isSome (run_load_lib spec name)
+    (* A run-load and its load= line, as run-action writes them: HOLLIB:x and
+       hol:x as x, any other pkg:x as pkg:x@<its input key>. *)
+    fun run_load_matches (name, value) =
+      case String.fields (fn c => c = #":") name of
+          ["HOLLIB", x] => value = x
+        | ["hol", x] => value = x
+        | [_, _] =>
+            String.isPrefix (name ^ "@") value andalso
+            sha256_text (String.extract (value, size name + 1, NONE))
+        | _ => false
     val support_paths = map #path (#supports spec)
   in
     check (#version spec = HolbuildVersion.version)
@@ -7893,6 +7903,8 @@ fun verify_run_spec (spec : run_spec) =
     check (List.all (fn {suffix, ...} => suffix = ".ui" orelse suffix = ".uo") libs)
       "a library manifest is neither .ui nor .uo";
     check (List.all run_load_ok (#run_loads spec)) "a run-load names no library of the spec";
+    check (ListPair.allEq run_load_matches (#run_loads spec, text_values "load="))
+      "the run-loads do not match the run text";
     check (not (List.exists (fn path => normalize_path path = run_script_name) support_paths))
       ("a support file is named " ^ run_script_name);
     List.app (fn path => check (not (escapes path)) ("path " ^ path ^ " leaves the action root"))
@@ -7983,7 +7995,7 @@ fun exec_run remote root tc (spec : run_spec) log =
       (case #timeout spec of
            SOME seconds =>
              HolbuildToolchain.run_in_dir_to_file_until src argv log
-               (Time.+ (Time.now (), Time.fromSeconds (LargeInt.fromInt seconds)))
+               (Time.fromSeconds (LargeInt.fromInt seconds))
          | NONE => {status = HolbuildToolchain.run_in_dir_to_file src argv log, timed_out = false})
       handle HolbuildToolchain.Error msg => raise action_failed InternalFailure msg
     val _ = last_child_status := SOME status
@@ -8006,7 +8018,8 @@ fun exec_run remote root tc (spec : run_spec) log =
     fun output name =
       let val path = Path.concat (output_dir, name)
       in
-        if file_exists path andalso not (FS.isDir path) then (name, path)
+        (* Only a regular file: hashing a FIFO would block for ever. *)
+        if (Posix.FileSys.ST.isReg (Posix.FileSys.stat path) handle OS.SysErr _ => false) then (name, path)
         else raise ActionFailed (ScriptFailure, "the script did not write its declared output " ^ name)
       end
     val files = map output (sort_strings (#outputs spec))

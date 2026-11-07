@@ -167,8 +167,9 @@ fun run_in_dir_to_file dir argv output =
                 ("cd " ^ quote dir ^ " && " ^ command argv ^ " > " ^ quote output ^ " 2>&1")))
   handle HolbuildMachineMemory.Error msg => raise Error msg
 
-(* As run_in_dir_to_file, killing the child once DEADLINE passes. *)
-fun run_in_dir_to_file_until dir argv output deadline =
+(* As run_in_dir_to_file, killing the child once it has run for LIMIT.  The
+   clock starts once the memory reservation is granted. *)
+fun run_in_dir_to_file_until dir argv output limit =
   let
     val timed_out = ref false
     val status =
@@ -178,7 +179,7 @@ fun run_in_dir_to_file_until dir argv output deadline =
               (fn () =>
                   let
                     val result =
-                      HolbuildProcessGroup.run_shell_inheriting_until lease deadline
+                      HolbuildProcessGroup.run_shell_inheriting_until lease (Time.+ (Time.now (), limit))
                         ("cd " ^ quote dir ^ " && " ^ command argv ^ " > " ^ quote output ^ " 2>&1")
                   in
                     timed_out := #timed_out result;

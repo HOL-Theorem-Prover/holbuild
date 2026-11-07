@@ -94,6 +94,12 @@ val out = TextIO.openOut (OS.Path.concat (valOf (OS.Process.getEnv "HOLBUILD_RUN
 val _ = (TextIO.output (out, "only\n"); TextIO.closeOut out);
 SML
 echo 'val _ = OS.Process.sleep (Time.fromSeconds 300);' > "$runner/sleep.sml"
+cat > "$runner/fifo.sml" <<'SML'
+val dir = valOf (OS.Process.getEnv "HOLBUILD_RUN_OUTPUT_DIR");
+val _ = Posix.FileSys.mkfifo (OS.Path.concat (dir, "first"), Posix.FileSys.S.irwxu);
+val out = TextIO.openOut (OS.Path.concat (dir, "second"));
+val _ = (TextIO.output (out, "x\n"); TextIO.closeOut out);
+SML
 
 hb() {
   (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" "$@")
@@ -226,6 +232,23 @@ for script in raise one; do
   require_no_file "$(ac_file "$key")"
 done
 require_grep 'did not write its declared output second' "$tmpdir/one.log"
+
+# An output that is not a regular file fails as script rather than blocking
+# the worker on it.
+read -r key spec < <(export_run fifo.sml hol:bool)
+worker fifo "$spec"
+expect fifo 1 status=failed failure=script
+require_no_file "$(ac_file "$key")"
+
+# A spec whose run-loads differ from its run text's is rejected: the run key
+# covers the loads.
+read -r key spec < <(export_run run.sml --support "$runner/data/conf.txt" --load helperLib run:CTheory)
+grep -v '^run-load ' "$remote_root/cas/$spec" > "$tmpdir/tampered-spec"
+tampered=$(sha256sum "$tmpdir/tampered-spec" | awk '{ print $1 }')
+cp "$tmpdir/tampered-spec" "$remote_root/cas/$tampered"
+worker tampered "$tampered"
+expect tampered 4 status=failed failure=spec-rejected
+require_grep 'the run-loads do not match the run text' "$tmpdir/tampered.log"
 
 # A script past its timeout is killed with its process group.
 read -r key spec < <(export_run sleep.sml --option timeout=5 hol:bool)
