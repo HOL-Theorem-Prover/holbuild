@@ -607,6 +607,17 @@ require_grep "^action .* rx:BTheory$" "$state/$batch.batch"
 require_grep "^action .* rx:CTheory$" "$state/$batch.batch"
 require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/built-here-batch.log"
 [[ -e "$remote_root/ac/$ac_a" ]] || { echo "ATheory was not published" >&2; exit 1; }
+# Without a local cache entry to publish, it goes to the workers.
+rm "$remote_root/ac/$ac_a"
+rm -r "$HOLBUILD_CACHE/actions/$key_a"
+rm -rf "$project/.holbuild/checkpoints"
+sed -i 's/(\* built-here-batch \*)/(* built-here-unpublished *)/' "$project/src/BScript.sml"
+sed -i 's/simp\[\]$/simp[] (* unpublished *)/' "$project/src/CScript.sml"
+run built-here-unpublished 0 build --remote-exec "$coordinator" BTheory CTheory
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/built-here-unpublished.log")
+require_grep "^action $key_a .* rx:ATheory$" "$state/$batch.batch"
+require_grep "^edge [0-9a-f]* $key_a$" "$state/$batch.batch"
+require_grep "remote execution: remote workers finished 3 of 3 theories" "$tmpdir/built-here-unpublished.log"
 rm "$project/src/CScript.sml"
 
 # A submission answered 502 while the coordinator restarts is retried, and

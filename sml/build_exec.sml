@@ -5309,9 +5309,7 @@ fun prefetch_key (options : build_options) project keys node =
     case #kind (HolbuildBuildPlan.source_of node) of
         HolbuildSourceIndex.TheoryScript =>
           if cache_enabled node andalso not (force_node options project node) andalso
-             not (case current_metadata (metadata_path project node) of
-                      SOME text => metadata_input_key_matches input_key text
-                    | NONE => false) then
+             not (built_here_for project node input_key) then
             SOME input_key
           else NONE
       | _ => NONE
@@ -5858,9 +5856,18 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
               case !result of Pass => NONE | Fail => SOME item | CheckFailed e => raise e) checks
           end
       end
-    (* A theory built here for its current inputs needs no worker, so only
-       the others go through the remote cache. *)
-    fun built_here (node, action) = local_resumable andalso built_here_for project node (#input_key action)
+    (* A theory the local build takes as up to date (built here for its
+       current inputs, under a timeout contract as strict as the one
+       requested) needs no worker, so only the others go through the remote
+       cache. *)
+    fun built_here (node, action) =
+      local_resumable andalso
+      (case current_metadata (metadata_path project node) of
+           SOME text =>
+             metadata_input_key_matches (#input_key action) text andalso
+             metadata_timeout_satisfies (#allow_cache_timeout_discrepancy options)
+               (checkpoint_policy_for_node options project node) node text
+         | NONE => false)
     val (here_actions, other_actions) = List.partition built_here actions
     val uncached_actions =
       failing (fn remote => fn (node, action) =>
