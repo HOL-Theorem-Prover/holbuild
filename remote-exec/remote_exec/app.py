@@ -22,6 +22,7 @@ from remote_exec.coordinator import (
     BatchStatus,
     Coordinator,
     HostReport,
+    PhaseReport,
     ResultMismatch,
     Settings,
     is_auth_failure,
@@ -39,6 +40,7 @@ class ClaimRequest(BaseModel):
     worker: str
     wait_s: float = Field(default=0, ge=0, le=50)  # how long to wait for an action when none is ready
     host: HostReport | None = None
+    phases: PhaseReport | None = None  # where the worker's time went since its last claim
 
 
 class HeartbeatRequest(BaseModel):
@@ -168,12 +170,15 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             **{k: v for k, v in asdict(status.counts).items() if k != "high_run"},
             "desired_burst_workers": status.desired_burst_workers,
             "hosts": [{**asdict(host.report), "age_s": host.age_s} for host in status.hosts],
+            "phases": asdict(status.phases),
         }
 
     @app.post("/v1/work/claim", dependencies=worker, response_model=None)
     async def claim(body: ClaimRequest, request: Request) -> dict[str, object] | Response:
         if body.host is not None:
             coordinator.report_host(body.host)
+        if body.phases is not None:
+            coordinator.report_phases(body.phases)
         tiers = [body.tier, *(t for t in body.also_claim if t != body.tier)]
         claimed = await coordinator.claim(tiers, body.worker, body.wait_s, request.is_disconnected)
         if claimed is None:

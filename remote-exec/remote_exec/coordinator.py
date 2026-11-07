@@ -10,9 +10,9 @@ import graphlib
 import logging
 import re
 import shlex
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID, uuid4
@@ -47,6 +47,9 @@ SCALE_CMD_TIMEOUT_S = 60
 HOST_REPORT_SECONDS = 120
 # Hosts the coordinator remembers at most; a report from another host beyond them is dropped.
 MAX_HOSTS = 1000
+# The queue sums the phase reports of workers' last this many seconds; at most MAX_PHASE_REPORTS are kept.
+PHASE_WINDOW_SECONDS = 600
+MAX_PHASE_REPORTS = 100_000
 
 
 class Settings(BaseSettings):
@@ -152,6 +155,40 @@ class HostReport:
     memory_short: bool
 
 
+# Seconds of a worker's time in one phase since its last report. No upper bound: a worker that couldn't report
+# for long sends it all at once, and a refused report would refuse the claim it comes with.
+PhaseSeconds = Annotated[float, Field(ge=0, allow_inf_nan=False)]
+
+
+@dataclass(frozen=True)
+class PhaseReport:
+    """Where a worker's time went since its last report (``Phases`` in worker.py), in seconds: waiting for memory
+    before a claim, in claim requests, sleeping after a claim got nothing, taking and giving up an action's lease
+    (scale-in protection, the heartbeat thread), finding the action's holbuild release,
+    in exec-action before its first HOL child, from then to its last HOL child's end, after it, all of exec-action
+    when the worker can't see HOL children, and reporting the result."""
+
+    memory_wait: PhaseSeconds = 0
+    claim: PhaseSeconds = 0
+    idle: PhaseSeconds = 0
+    lease: PhaseSeconds = 0
+    release: PhaseSeconds = 0
+    before_hol: PhaseSeconds = 0
+    hol: PhaseSeconds = 0
+    after_hol: PhaseSeconds = 0
+    exec: PhaseSeconds = 0
+    complete: PhaseSeconds = 0
+
+
+@dataclass(frozen=True)
+class PhaseTotals:
+    """The phase reports workers sent this process in the last ``window_s`` seconds, and their sums."""
+
+    window_s: int
+    reports: int
+    seconds: PhaseReport
+
+
 @dataclass(frozen=True)
 class HostStatus:
     """A host's latest report, ``age_s`` seconds old, with the latest ``cpu_idle_pct`` measured."""
@@ -165,6 +202,7 @@ class QueueStatus:
     counts: QueueCounts
     desired_burst_workers: int
     hosts: list[HostStatus]
+    phases: PhaseTotals
 
 
 def burst_demand(counts: QueueCounts, warm_workers: int, max_burst_workers: int, run_slots: int = 30) -> int:
@@ -334,6 +372,8 @@ class Coordinator:
         # What workers reported of their hosts, by host id, and when. Kept in memory: each coordinator process
         # knows the hosts whose workers' requests reached it.
         self.hosts: dict[str, tuple[datetime, HostReport]] = {}
+        # The phase reports of the last PHASE_WINDOW_SECONDS, oldest first, and when each came; also in memory.
+        self.phase_reports: deque[tuple[datetime, PhaseReport]] = deque(maxlen=MAX_PHASE_REPORTS)
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "Coordinator":
@@ -581,6 +621,19 @@ class Coordinator:
         if previous is not None and report.cpu_idle_pct is None:
             report = replace(report, cpu_idle_pct=previous[1].cpu_idle_pct)
         self.hosts[report.id] = (self.clock(), report)
+
+    def report_phases(self, report: PhaseReport) -> None:
+        """Take a worker's report of where its time went."""
+        self.phase_reports.append((self.clock(), report))
+
+    def _phase_totals(self, now: datetime) -> PhaseTotals:
+        while self.phase_reports and (now - self.phase_reports[0][0]).total_seconds() >= PHASE_WINDOW_SECONDS:
+            self.phase_reports.popleft()
+        sums = {
+            field.name: round(sum(getattr(report, field.name) for _, report in self.phase_reports), 1)
+            for field in fields(PhaseReport)
+        }
+        return PhaseTotals(PHASE_WINDOW_SECONDS, len(self.phase_reports), PhaseReport(**sums))
 
     async def heartbeat(self, token: UUID) -> bool:
         """Extend a live lease; False when it expired or was revoked, so the worker should stop."""
@@ -874,7 +927,9 @@ class Coordinator:
             if (now - at).total_seconds() < HOST_REPORT_SECONDS
         }
         hosts = [HostStatus(report, round((now - at).total_seconds(), 1)) for at, report in self.hosts.values()]
-        return QueueStatus(counts, max(desired, demand), sorted(hosts, key=lambda h: h.report.id))
+        return QueueStatus(
+            counts, max(desired, demand), sorted(hosts, key=lambda h: h.report.id), self._phase_totals(now)
+        )
 
     async def sweep(self) -> None:
         """The periodic pass: expired leases, a release of every batch in the background (for actions those
@@ -965,6 +1020,14 @@ class Coordinator:
             if response.status_code == 200:
                 for blob in ENTRY_BLOB.findall(response.text.partition(ENTRY_MANIFEST_MARKER)[0]):
                     response = await self.cache.head(f"/cas/{blob}")
+                    if response.status_code == 502:
+                        # bazel-remote answers HEAD for a blob held only by its proxy backend with Content-Length
+                        # -1, which a reverse proxy in front of it turns into 502. A GET copies the blob from the
+                        # backend before it answers, so its status alone is enough: the body is never read.
+                        async with self.cache.stream(
+                            "GET", f"/cas/{blob}", headers={"Accept-Encoding": "zstd"}
+                        ) as response:
+                            pass
                     if response.status_code != 200:
                         break
         except httpx.HTTPError:

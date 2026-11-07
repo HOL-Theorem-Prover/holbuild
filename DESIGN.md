@@ -767,7 +767,6 @@ building a theory, the prover/runtime saves PolyML states at boundaries such as:
 ```text
 deps_loaded.save         after resolved ancestors are loaded in topological order
 <thm>_context.save       after the theorem has been stored in the theory context
-<thm>_end_of_proof.save  after goal-fragment proof replay, for navigation
 ```
 
 Holbuild saves no state after the theory is exported. Current HOL versions seal
@@ -872,14 +871,13 @@ whole-tactic prover path. Normal theorem bodies should not fall back to timing t
 entire theorem as one coarse tactic; if they need coarser treatment for a
 validation-shape bug, the runtime should merge the specific branch/list/select
 shape rather than hide the whole theorem inside `TAC_PROOF`. The
-`<thm>_end_of_proof.save` checkpoint is saved before `drop_all`, so it preserves
-proof-manager history for navigation; `<thm>_context.save` is saved after the
-expanded theorem declaration stores the theorem in the theory context. If a later
-source edit leaves an earlier retained theorem prefix byte-identical and the
-resolved dependency context still matches, a dirty/debug rebuild can load the
-nearest valid theorem-context checkpoint and replay only the suffix to
-`export_theory()`. End-of-proof checkpoints are proof-navigation states, not
-successor-ready contexts, and are not used for dependency replay.
+`<thm>_context.save` checkpoint is saved after the expanded theorem declaration
+stores the theorem in the theory context. If a later source edit leaves an
+earlier retained theorem prefix byte-identical and the resolved dependency
+context still matches, a dirty/debug rebuild can load the nearest valid
+theorem-context checkpoint and replay only the suffix to `export_theory()`.
+No state is saved at the end of a successful proof: nothing would resume from
+it, since the theorem-context checkpoint is the successor-ready state.
 
 Proof instrumentation is separable from PolyML checkpoint creation and
 retention. The command's requested proof-debugging policy applies to root-package
@@ -896,7 +894,7 @@ not enter final theory action keys.
 
 For instrumented root-package actions, holbuild may create several local
 checkpoint classes while executing a theory action: `deps_loaded` after loading resolved dependencies,
-theorem context/end-of-proof states for modern AST `Theorem ... Proof ... QED`
+theorem-context states for modern AST `Theorem ... Proof ... QED`
 declarations, failed-prefix proof-navigation state after instrumented proof
 failures. Successful builds remove stale
 failed-prefix checkpoints for the rebuilt source but retain reusable dependency
@@ -923,7 +921,7 @@ credits a family after its artifact roots have actually disappeared.
 modern theorem proofs through the selected instrumentation runtime. `--skip-proof-steps`
 opts out of theorem instrumentation: with checkpoints still enabled, the build can
 still save and consult `deps_loaded`, but there are no
-theorem-context/end-of-proof/failed-prefix proof-navigation checkpoints and no
+theorem-context/failed-prefix proof-navigation checkpoints and no
 tactic timeout enforcement for that build.
 Theorem, declaration and failed-prefix checkpoints are saved only in the
 requested targets (with none given, the default targets, or every root-package
@@ -1045,7 +1043,7 @@ appropriate.
 Other theorem-producing syntax, such as simple `Theorem name = thm` declarations,
 `store_thm` calls, `Resume`, or `Finalise`, is not checkpoint-instrumented in v1.
 Those declarations still execute during normal source builds/replays, but they do
-not produce theorem-context/end-of-proof checkpoints unless later modeled from the
+not produce theorem-context checkpoints unless later modeled from the
 AST with correct proof-manager state. Do not add ad hoc text-scanned wrappers for
 these forms.
 
