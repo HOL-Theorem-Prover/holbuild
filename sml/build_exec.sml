@@ -7118,16 +7118,16 @@ fun hydrate_spec_deps remote root (spec : spec_deps) direct =
   end
 
 (* The stems of the project objects the build loads: the ones its preload
-   names and, through the libraries among them, the ones those load. *)
+   names and, through the libraries among them (a library with a signature
+   has a manifest for each), the ones those load. *)
 fun spec_loaded_stems (spec : action_spec) =
   let
     fun visit (stem, seen) =
       if List.exists (fn s => s = stem) seen then seen
       else
-        case List.find (fn lib => #stem lib = stem) (#libs spec) of
-            NONE => stem :: seen
-          | SOME {loads, ...} =>
-              List.foldl visit (stem :: seen) (List.filter (CharVector.exists (fn c => c = #"/")) loads)
+        List.foldl visit (stem :: seen)
+          (List.concat (map (fn {loads, ...} => List.filter (CharVector.exists (fn c => c = #"/")) loads)
+                            (List.filter (fn lib => #stem lib = stem) (#libs spec))))
   in
     List.foldl visit [] (List.mapPartial (fn LoadObject stem => SOME stem | _ => NONE) (#loads spec))
   end

@@ -415,9 +415,13 @@ rm "$tmpdir/worker-stale-own/actions/$key_n/manifest"
 worker stale-own "$spec_m"
 expect stale-own 0 "spec=$spec_m" "status=cached"
 
-# Likewise for a parent the theory loads only through a project library.
+# Likewise for a parent the theory loads only through a project library's
+# implementation, behind its signature.
+cat > "$project/src/nLib.sig" <<'SML'
+signature nLib = sig val loaded : bool end
+SML
 cat > "$project/src/nLib.sml" <<'SML'
-structure nLib = struct local open NTheory in val loaded = true end end
+structure nLib :> nLib = struct local open NTheory in val loaded = true end end
 SML
 cat > "$project/src/QScript.sml" <<'SML'
 Theory Q
