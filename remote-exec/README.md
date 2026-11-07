@@ -52,8 +52,9 @@ runs finish and cancel queued run batches. Use the current image to run
 code does not know revision `0005`.
 
 Migration `0006` adds a nullable column for each action's phase timings.
-Images predating it ignore the column, so rolling back past it needs no
-downgrade.
+To roll back to an image predating `0006`, use the current image to run
+`alembic downgrade 0005` first, then run the older image's `migrate` and
+`coordinator`; that image's migration code does not know revision `0006`.
 
 The coordinator reads its settings from the environment:
 
