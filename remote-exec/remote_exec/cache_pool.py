@@ -257,6 +257,10 @@ class CachePool:
         }:
             await self._save(conn, member, "drain")
             return
+        # A completed launch hook can precede its persisted acknowledgement after a crash.
+        if member.phase == "admit" and instance.state == "running":
+            await self._advance(conn, member, now)
+            return
         if member.phase in {"boot", "dns", "ready", "admit"} and (
             now - member.assigned_at
         ).total_seconds() >= self.launch_timeout_seconds:

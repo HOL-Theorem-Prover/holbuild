@@ -276,3 +276,16 @@ async def test_explicit_launch_failure_enters_verified_cleanup(pool: CachePool, 
     await pool.reconcile(p.now)
     assert await phase(pool, "failed") == "drain"
     assert not any(r.op == "terminate" for r in p.calls)
+
+
+async def test_lost_launch_admission_acknowledgement_recovers_after_deadline(pool: CachePool) -> None:
+    p = provider(pool)
+    p.instances = [Instance(id="admitted", state="launching")]
+    for _ in range(4):
+        await pool.reconcile(p.now)
+    assert await phase(pool, "admitted") == "admit"
+    p.instances = [Instance(id="admitted", state="running")]
+    restarted = CachePool(pool.engine, pool.slots, p, drain_seconds=60)
+    await restarted.reconcile(p.now + timedelta(seconds=901))
+    assert await phase(pool, "admitted") == "serving"
+    assert not any(r.op in {"drain", "stop", "terminate"} for r in p.calls)

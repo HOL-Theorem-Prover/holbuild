@@ -581,3 +581,6 @@ An explicit adapter launch error or an expired deadline starts the same verified
 drain path, then the adapter abandons the unadmitted launch after backend stop
 and DNS withdrawal. Heartbeats continue during cleanup; a failed launch cannot
 become a serving member. A provider hook deadline remains a failure boundary.
+
+If provider inventory confirms that a launch was admitted but its acknowledgement
+was lost, reconciliation resumes admission even after the launch deadline.
