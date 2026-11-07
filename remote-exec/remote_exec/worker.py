@@ -644,7 +644,9 @@ def execute(
         spans = ExecSpans()
         stepped = time.monotonic()
         process = subprocess.Popen(
-            exec_action_command(args, holbuild, spec, result, claim.get("max_heap_mb")), env=exec_action_env(), start_new_session=True
+            exec_action_command(args, holbuild, spec, result, claim.get("max_heap_mb")),
+            env=exec_action_env(),
+            start_new_session=True
         )
         try:
             while process.poll() is None:

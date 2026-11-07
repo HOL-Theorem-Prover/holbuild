@@ -238,8 +238,12 @@ def claim() -> dict[str, object]:
     [(None, None, 12000), (14000, None, 14000), (14000, 4096, 4096), (None, 16000, 16000)],
 )
 def test_worker_runs_the_action_on_the_release_that_exported_it(
-    tmp_path: Path, server: Server, logs: tuple[Path, Path],
-    worker_heap: int | None, batch_heap: int | None, expected_heap: int
+    tmp_path: Path,
+    server: Server,
+    logs: tuple[Path, Path],
+    worker_heap: int | None,
+    batch_heap: int | None,
+    expected_heap: int,
 ) -> None:
     release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
     server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
