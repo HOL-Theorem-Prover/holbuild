@@ -497,11 +497,19 @@ require_grep "batch b[0-9]* cancelled; remote workers finished 0 of 2 theories; 
 require_grep "BTheory built" "$tmpdir/cancelled.log"
 rm "$state/cancelled"
 
-# A submission the coordinator answers 5xx while it restarts is retried.
+# A submission answered 502 while the coordinator restarts is retried, and
+# given up on when it stays down.
 write_theories restarting
 echo 2 > "$state/unavailable"
 run restarting-only 0 build --remote-exec "$coordinator" --remote-only BTheory
 [[ $(grep -c "coordinator refused the batch (HTTP 502): .*restarting.*; retrying" "$tmpdir/restarting-only.log") -eq 2 ]] ||
   { cat "$tmpdir/restarting-only.log" >&2; exit 1; }
 require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/restarting-only.log"
+rm "$state/unavailable"
+write_theories unavailable
+echo 10 > "$state/unavailable"
+run unavailable-detach 1 build --remote-exec "$coordinator" --remote-only --detach BTheory
+[[ $(grep -c "coordinator refused the batch (HTTP 502): .*restarting.*; retrying" "$tmpdir/unavailable-detach.log") -eq 4 ]] ||
+  { cat "$tmpdir/unavailable-detach.log" >&2; exit 1; }
+require_grep "coordinator refused the batch (HTTP 502): .*restarting.*$" "$tmpdir/unavailable-detach.log"
 rm "$state/unavailable"

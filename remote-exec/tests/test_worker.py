@@ -323,6 +323,37 @@ def test_a_result_is_given_up_on_when_the_lease_would_run_out(server: Server, mo
     assert server.unavailable > 900
 
 
+def test_a_result_is_reported_again_while_the_coordinator_is_unreachable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(worker, "COMPLETE_RETRY_DELAYS", (0.01,))
+    attempts = []
+
+    def unreachable(*args: object) -> tuple[int, object]:
+        attempts.append(args)
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(Coordinator, "post", unreachable)
+
+    with pytest.raises(RuntimeError, match="complete failed"):
+        Coordinator("http://127.0.0.1:9", "w").complete("t1", RECORD, 0.2)
+
+    assert len(attempts) > 1
+
+
+@pytest.mark.parametrize(("status", "raised"), [(409, False), (400, True)])
+def test_a_result_the_coordinator_turns_down_is_not_reported_again(
+    monkeypatch: pytest.MonkeyPatch, status: int, raised: bool
+) -> None:
+    attempts = []
+    monkeypatch.setattr(Coordinator, "post", lambda *args: attempts.append(args) or (status, "no"))
+
+    with pytest.raises(RuntimeError) if raised else contextlib.nullcontext():
+        Coordinator("http://127.0.0.1:9", "w").complete("t1", RECORD, 60)
+
+    assert len(attempts) == 1
+
+
 def test_ecs_task_protection_is_set_and_cleared(server: Server) -> None:
     protection = Protection(None, server.url)
 

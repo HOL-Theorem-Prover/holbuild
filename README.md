@@ -1217,9 +1217,9 @@ how many they finished.
 
 The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the
-batch, or the batch fails, it warns and builds locally. A submission the
-coordinator answers with a server error (5xx), as a proxy does while the
-coordinator restarts, is retried, and an event stream that breaks is
+batch, or the batch fails, it warns and builds locally. A submission
+answered 502, 503 or 504, as a proxy in front of the coordinator answers
+while it restarts, is retried, and an event stream that breaks is
 reattached; either is given up on once the coordinator stays unavailable for
 about two and a half minutes (retries back off to 8 seconds apart). When the build stops following
 a batch that may still run (the stream was given up on, or the coordinator

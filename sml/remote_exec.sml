@@ -24,11 +24,11 @@ type progress = {built : int, total : int}
 val connect_timeout_seconds = 10
 val request_max_time_seconds = 60
 (* Waits before each retry of a request the coordinator couldn't answer (a
-   submission it answered 5xx, an event stream that broke without delivering
-   an event): doubling up to 8 seconds, about two and a half minutes in all,
-   long enough to ride out a coordinator restart such as an image upgrade.
-   Tests shorten them with HOLBUILD_TEST_RETRY_DELAYS, comma-separated
-   seconds. *)
+   submission a proxy answered 502-504, an event stream that broke without
+   delivering an event): doubling up to 8 seconds, about two and a half
+   minutes in all, long enough to ride out a coordinator restart such as an
+   image upgrade.  Tests shorten them with HOLBUILD_TEST_RETRY_DELAYS,
+   comma-separated seconds. *)
 fun retry_delays_seconds () =
   case OS.Process.getEnv "HOLBUILD_TEST_RETRY_DELAYS" of
       SOME text => List.mapPartial Int.fromString (String.tokens (fn c => c = #",") text)
@@ -89,9 +89,11 @@ fun write_text path text =
   let val out = TextIO.openOut path
   in (TextIO.output (out, text); TextIO.closeOut out) handle e => (TextIO.closeOut out; raise e) end
 
-(* Submits a batch; Ok carries its id.  A 5xx answer, as from a proxy while
-   the coordinator restarts, is retried after each of retry_delays_seconds;
-   an unreachable coordinator is refused at once. *)
+(* Submits a batch; Ok carries its id.  A 502, 503 or 504 answer, as from a
+   proxy while the coordinator restarts, is retried after each of
+   retry_delays_seconds.  Other errors aren't: a 500 may come after the
+   coordinator stored the batch, and a retry would store it again.  An
+   unreachable coordinator is refused at once. *)
 fun submit url batch_text : attempt =
   let
     val body = HolbuildTempPath.temporary "remote-exec-batch"
@@ -117,7 +119,7 @@ fun submit url batch_text : attempt =
         else if status = 0 then
           Refused ("could not reach the coordinator at " ^ HolbuildRemoteCache.redact_userinfo url ^
                    (if text = "" then "" else ": " ^ text))
-        else if status >= 500 then
+        else if status >= 502 andalso status <= 504 then
           case delays of
               [] => Refused refusal
             | delay :: rest =>
