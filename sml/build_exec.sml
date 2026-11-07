@@ -5961,40 +5961,44 @@ fun restore_remote_build_logs (options : build_options) tc project plan toolchai
   let
     val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
                  (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
-    val nodes = List.foldl
-      (fn (node, table) => Redblackmap.insert (table, HolbuildBuildPlan.input_key_for keys node, node))
-      (Redblackmap.mkDict String.compare) (HolbuildBuildPlan.selected_nodes plan)
-    fun restore (key, sha) =
-      case Redblackmap.peek (nodes, key) of
-          NONE => ()
-        | SOME node =>
-            let
-              val traced = trace_steps (checkpoint_policy_for_node options project node)
-              val required = force_node options project node orelse traced
-              val log = Option.mapPartial (fetch_remote_build_log project node) sha
-              val reason = "could not fetch the remote build log for " ^ package node ^ ":" ^ logical_name node
-            in
-              case log of
-                  NONE =>
-                    if required then
-                      (remove_file (current_build_log
-                         (current_log_dir (project_artifact_root project) (package node) (logical_name node)));
-                       HolbuildHolSharedCache.local_build_needed := true;
-                       raise Error reason)
-                    else if Option.isSome sha then warn reason else ()
-                | SOME path =>
-                    if not traced then ()
-                    else
-                      let val trace = current_proof_trace_log
-                                        (current_log_dir (project_artifact_root project) (package node) (logical_name node))
-                      in
-                        ignore (preserve_log path trace);
-                        Option.app HolbuildStatus.message_stdout (HolbuildTheoryDiagnostics.summarize_trace_steps path);
-                        HolbuildStatus.message_stdout ("proof step trace log: " ^ trace ^ "\n")
-                      end
-            end
+    val log_table = List.foldl
+      (fn ((key, sha), table) => Redblackmap.insert (table, key, sha))
+      (Redblackmap.mkDict String.compare) logs
+    fun restore node =
+      let
+        val traced = trace_steps (checkpoint_policy_for_node options project node)
+        val required = force_node options project node orelse traced
+        val key = HolbuildBuildPlan.input_key_for keys node
+        val reported = Redblackmap.peek (log_table, key)
+        val log = Option.mapPartial (fetch_remote_build_log project node) (Option.join reported)
+        val reason =
+          (if Option.isSome reported then "could not fetch the remote build log for "
+           else "remote batch did not execute the required theory ") ^ package node ^ ":" ^ logical_name node
+      in
+        case log of
+            NONE =>
+              if required then
+                (remove_file (current_build_log
+                   (current_log_dir (project_artifact_root project) (package node) (logical_name node)));
+                 raise Error reason)
+              else (if Option.isSome (Option.join reported) then warn reason else (); NONE)
+          | SOME path => SOME (node, traced, path)
+      end
+    (* Check all required logs before printing any trace: a missing one may
+       send the whole build back to local execution. *)
+    val restored = List.mapPartial restore (HolbuildBuildPlan.selected_nodes plan)
+    fun report (node, traced, path) =
+      if not traced then ()
+      else
+        let val trace = current_proof_trace_log
+                          (current_log_dir (project_artifact_root project) (package node) (logical_name node))
+        in
+          ignore (preserve_log path trace);
+          Option.app HolbuildStatus.message_stdout (HolbuildTheoryDiagnostics.summarize_trace_steps path);
+          HolbuildStatus.message_stdout ("proof step trace log: " ^ trace ^ "\n")
+        end
   in
-    List.app restore logs
+    List.app report restored
   end
 
 (* The error of theory `node`, whose proof failed on a remote worker

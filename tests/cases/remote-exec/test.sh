@@ -48,7 +48,7 @@ awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec the
     >> "$tmpdir/worker.log" 2>&1 || status=\$?
   echo "\$theory \$(grep '^status=' "$tmpdir/worker.result")" >> "$state/results"
   cp "$tmpdir/worker.result" "$state/result-\$key"
-  if [[ -e "$state/drop-log" ]]; then
+  if [[ -e "$state/drop-log" ]] || { [[ -e "$state/drop-success-log" ]] && [[ \$status -eq 0 ]]; }; then
     rm -f "$remote_root/cas/\$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/worker.result")"
   fi
   # A failed action fails the batch, naming the theory or blob it found
@@ -1013,7 +1013,41 @@ run force-log-missing 75 build --remote-exec "$coordinator" --remote-only --forc
 require_grep 'could not fetch the remote build log for rxf:BTheory' "$tmpdir/force-log-missing.log"
 refute_grep 'Theory built\|building locally' "$tmpdir/force-log-missing.log"
 [[ ! -e "$local_log" ]] || { echo 'stale forced log survived' >&2; exit 1; }
+run force-log-local 0 build --remote-exec "$coordinator" --force=theory BTheory
+require_grep 'could not fetch the remote build log.*building locally' "$tmpdir/force-log-local.log"
+require_grep 'BTheory built' "$tmpdir/force-log-local.log"
+require_grep 'remote execution verdict: PASS' "$local_log"
 rm "$state/drop-log"
+
+# An attached batch must cover the requested forced/traced targets.
+run attach-parent 0 build --remote-exec "$coordinator" --detach --force=theory ATheory
+parent_batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/attach-parent.log")
+for flag in --force=theory --trace-steps; do
+  run attach-missing 75 build --remote-exec "$coordinator" --remote-only --attach "$parent_batch" "$flag" BTheory
+  require_grep 'remote batch did not execute the required theory rxf:BTheory' "$tmpdir/attach-missing.log"
+  refute_grep 'holbuild proof-ir trace:' "$tmpdir/attach-missing.log"
+done
+
+# Requeued actions replace the previous execution's now-evicted log.
+touch "$state/requeue-log"
+run trace-requeued 0 build --remote-exec "$coordinator" --remote-only --trace-steps BTheory
+[[ $(grep -c '^proof step trace log:' "$tmpdir/trace-requeued.log") -eq 2 ]] ||
+  { cat "$tmpdir/trace-requeued.log" >&2; exit 1; }
+require_grep 'theorem=b_thm' "$local_log"
+rm "$state/requeue-log"
+
+# A completed ancestor's missing log cannot hide cancellation or the failed
+# child's proof diagnostic, or print traces from a batch that will be retried.
+touch "$state/drop-success-log" "$state/cancel-after-actions"
+run trace-cancelled 1 build --remote-exec "$coordinator" --remote-only --trace-steps BTheory
+require_grep 'remote execution: batch .* cancelled' "$tmpdir/trace-cancelled.log"
+refute_grep 'could not fetch the remote build log\|holbuild proof-ir trace:' "$tmpdir/trace-cancelled.log"
+rm "$state/cancel-after-actions"
+sed -i 's/ACCEPT_TAC a_thm/FAIL_TAC "review regression"/' "$project/src/BScript.sml"
+run trace-failed-child 1 build --remote-exec "$coordinator" --remote-only --trace-steps BTheory
+require_grep 'review regression' "$tmpdir/trace-failed-child.log"
+refute_grep 'could not fetch the remote build log\|before theorem=a_thm' "$tmpdir/trace-failed-child.log"
+rm "$state/drop-success-log"
 
 
 # The client cap must reach the HOL child, before Poly/ML consumes --maxheap.

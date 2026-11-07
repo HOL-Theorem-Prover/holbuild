@@ -143,17 +143,9 @@ spec=$spec_a
 
 # A traced rerun must return its new log even though the theory outputs are
 # already published. An outage during that upload retries the action.
-spec=$(python3 - "$remote_root/cas/$spec" "$remote_root/cas" <<'PYTHON'
-import hashlib
-import pathlib
-import sys
-source, cas = map(pathlib.Path, sys.argv[1:])
-data = source.read_text().replace("\naction-text\n", "\noption trace-steps=true\naction-text\n").encode()
-sha = hashlib.sha256(data).hexdigest()
-(cas / sha).write_bytes(data)
-print(sha)
-PYTHON
-)
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --trace-steps --upload ATheory) > "$tmpdir/batch-traced.txt"
+spec=$(awk '$1 == "action" && $5 == "worker:ATheory" { print $4 }' "$tmpdir/batch-traced.txt")
+[[ -n "$spec" ]] || { cat "$tmpdir/batch-traced.txt" >&2; exit 1; }
 printf 'holbuild proof-ir before theorem=a_thm ' > "$control/cas-put-reject-text"
 worker traced-log
 expect traced-log 3 unavailable "could not upload the required build log"

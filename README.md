@@ -1314,7 +1314,7 @@ option tactic-timeout=<seconds|none>
 option new-ir=<bool>
 option theorem-checkpoints=false   (only for a theory that saves none)
 option force=true                 (only for a forced theory)
-option trace-steps=true           (only for a traced theory)
+option trace-steps=true            (only for a traced theory)
 action-text
 <the action text, verbatim to the end of the blob>
 ```
@@ -1629,8 +1629,9 @@ The worker executes its proof steps without theorem-checkpoint replay.
 Completed actions' build logs are fetched into
 `.holbuild/logs/current/<package>/<theory>/build.log`. Traced theories also
 write `proof-trace.log` there and print a trace summary and its log path.
-A forced or traced build fails if its required log cannot be returned;
-it never reports success with an old or absent log. The client restores the
+A forced or traced build falls back locally if its required log cannot be
+returned; with `--remote-only` it fails with status 75. It never reports
+success with an old or absent log. The client restores the
 finished outputs without forcing a second build locally. Detached builds
 return their logs when attached.
 
