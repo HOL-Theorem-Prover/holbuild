@@ -6141,8 +6141,13 @@ fun hydrate_action_root remote root (spec : action_spec) =
     List.app
       (fn {target, stem, key} =>
           if spec_parent_hashes_match root spec (in_root root (stem ^ ".dat")) then ()
-          else raise ActionFailed (InputMissing ("theory " ^ key),
-                                   "dependency " ^ target ^ " does not match its parents in the cache"))
+          else
+            (* The worker's local copy may be one the remote has since
+               replaced, so the next attempt restores the remote's. *)
+            (Option.app (ignore o drop_cache_manifest_if_unchanged (cache_root ()) key)
+               (HolbuildCache.get_action (cache_root ()) key);
+             raise ActionFailed (InputMissing ("theory " ^ key),
+                                 "dependency " ^ target ^ " does not match its parents in the cache")))
       (#deps spec)
   end
 
@@ -6160,16 +6165,31 @@ fun action_already_done root (spec : action_spec) =
   end
 
 (* Whether the remote's entry for the action, given by its manifest, records
-   parents other than those restored in the action root: no build that
-   restores them can use it. *)
+   parents other than the remote's own, as restored in the action root: no
+   build that restores them can use it.  Each parent it records must have
+   been restored from an entry with the remote's outputs, since one from the
+   worker's local cache may be out of date. *)
 fun resident_misfits_parents remote root (spec : action_spec) resident =
   let
     val {dat_hash, ...} = cache_manifest_blobs_from_lines (#input_key spec) (cache_manifest_lines resident)
     val path = in_root root ".holbuild/resident.dat"
+    fun as_remote key =
+      case (HolbuildCache.get_action (cache_root ()) key, HolbuildRemoteCache.get_action remote key) of
+          (SOME mine, SOME theirs) => cache_manifest_outputs_equal key mine theirs
+        | _ => false
   in
     ensure_parent path;
     case HolbuildRemoteCache.fetch_blob remote {hash = dat_hash, dst = path} of
-        HolbuildCacheBackend.Hit => not (spec_parent_hashes_match root spec path)
+        HolbuildCacheBackend.Hit =>
+          let val recorded = parse_dat_parent_hashes (read_text path)
+          in
+            not (spec_parent_hashes_match root spec path) andalso
+            List.all
+              (fn {target, key, ...} =>
+                  not (Option.isSome (Binarymap.peek (recorded, theory_name_from_logical (#2 (target_name target))))) orelse
+                  as_remote key)
+              (#deps spec)
+          end
       | _ => false
   end
   handle _ => false

@@ -547,9 +547,17 @@ mkdir -p "$tmpdir/nondet-client"
 cp -r "$nondet/src" "$nondet/holproject.toml" "$tmpdir/nondet-client/"
 nondet=$tmpdir/nondet-client
 link_hol_toolchain_cache "$tmpdir/nondet-client-cache"
-HOLBUILD_CACHE=$tmpdir/nondet-client-cache hn build --remote-exec "$coordinator" --remote-only PTheory \
+HOLBUILD_CACHE=$tmpdir/nondet-client-cache HOLBUILD_CACHE_TRACE=1 \
+  hn build --remote-exec "$coordinator" --remote-only PTheory \
   > "$tmpdir/nondet.log" 2>&1 || { cat "$tmpdir/nondet.log" "$tmpdir/worker.log" >&2; exit 1; }
 require_grep "failed: resubmit: .*; resubmitting with 2 theories rebuilt or rechecked" "$tmpdir/nondet.log"
+# The first batch copied MTheory's unusable entry into the local cache, which
+# the resubmission drops so that the rebuilt one is restored.
+m_key=$(sed -n 's/.*still missing theory \([0-9a-f]*\) .*/\1/p' "$tmpdir/nondet.log")
+prefetched_line=$(grep -n "remote cache prefetched: $m_key$" "$tmpdir/nondet.log" | head -n 1 | cut -d: -f1)
+resubmit_line=$(grep -n "resubmitting with" "$tmpdir/nondet.log" | cut -d: -f1)
+[[ -n $m_key && -n $prefetched_line && $prefetched_line -lt $resubmit_line ]] ||
+  { echo "MTheory not prefetched before the resubmission" >&2; cat "$tmpdir/nondet.log" >&2; exit 1; }
 require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/nondet.log"
 require_grep "MTheory restored from cache" "$tmpdir/nondet.log"
 require_grep "PTheory restored from cache" "$tmpdir/nondet.log"

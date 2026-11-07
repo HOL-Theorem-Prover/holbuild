@@ -722,7 +722,7 @@ class Coordinator:
                 return False
             if action.attempts >= self.settings.max_attempts:
                 await self._fail_batch(
-                    conn, batch_id, parent, f"resubmit: {action.theory} is not in the cache after it built"
+                    conn, batch_id, parent, f"resubmit: {action.theory} (theory {parent}) is not in the cache after it built"
                 )
                 return False
             await self._requeue(conn, batch_id, parent)
@@ -746,7 +746,9 @@ class Coordinator:
                 {"batch_id": batch_id, "input_key": missing.key},
             )
         if attempts >= self.settings.max_attempts:
-            what = rebuilt or (f"{missing.kind} {missing.key}" if missing else "an input")
+            what = f"{missing.kind} {missing.key}" if missing else "an input"
+            if rebuilt is not None:
+                what = f"{rebuilt} ({what})"
             await self._fail_batch(
                 conn, batch_id, input_key, f"resubmit: {theory} is still missing {what} after {attempts} attempts"
             )
