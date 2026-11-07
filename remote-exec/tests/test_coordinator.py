@@ -424,18 +424,26 @@ async def test_releasing_reads_each_selected_actions_edges_by_key(
         )
 
     async with remote_exec_engine.begin() as connection:  # autovacuum can't see this transaction
+        await connection.execute(sa.text("SET LOCAL statement_timeout = '10s'"))  # the old plans run for minutes
         await add(connection, old)
         await connection.execute(sa.text("ANALYZE"))
         await add(connection, new)
-        batch_id = new
         roots = [f"k{i}" for i in range(width)]
+        await connection.execute(
+            sa.text("UPDATE actions SET state = 'done' WHERE batch_id = :id AND input_key = ANY(:keys)"),
+            {"id": new, "keys": roots},
+        )
         for query, parameters in [
-            (coordinator_module.REFRESH_CHILDREN, {"batch_id": batch_id, "keys": roots}),
-            (coordinator_module.RELEASABLE, {"batch_id": batch_id}),
+            # Leaves the roots' children releasable, so RELEASABLE looks up their parents.
+            (coordinator_module.REFRESH_CHILDREN, {"batch_id": new, "keys": roots}),
+            (coordinator_module.RELEASABLE, {"batch_id": new}),
         ]:
             plan = await connection.scalar(sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {query.text}"), parameters)
             pages = plan[0]["Plan"]["Shared Hit Blocks"] + plan[0]["Plan"]["Shared Read Blocks"]
             assert pages < 50 * width, query.text
+        releasable = await connection.execute(coordinator_module.RELEASABLE, {"batch_id": new})
+        children = {f"k{i}": parents for i in range(width, 2 * width)}
+        assert {row.input_key: len(row.parents) for row in releasable} == children
         await connection.rollback()
 
 
