@@ -32,7 +32,6 @@ val src = dir ^ "/source";
 val dst = dir ^ "/download";
 fun fetch remote digest = RC.fetch_unlisted_blob remote {hash = digest, dst = dst};
 fun publish remote digest = RC.put_blob remote {hash = digest, src = src};
-fun unavailable action = (action (); false) handle RC.Unavailable _ => true;
 
 (* Expectations come from Python's hashlib against actual node URLs. *)
 val vectors = String.tokens (fn c => c = #"\n") (RC.read_text (dir ^ "/vectors"));
@@ -92,12 +91,28 @@ val _ = clear primary "get-status";
 val _ = RC.remove_file (stored backup "cas" digest);
 val _ = assert "both missing" (fetch cache digest = CB.Miss);
 val _ = put primary "get-status" "503";
-val _ = assert "transient plus missing is unavailable" (unavailable (fn () => ignore (fetch cache digest)));
+val _ = assert "transient plus missing is a miss" (fetch cache digest = CB.Miss);
 val _ = put backup "get-status" "503";
-val _ = assert "both transient" (unavailable (fn () => ignore (fetch cache digest)));
+val _ = assert "both transient reports backup"
+  ((ignore (fetch auth_cache digest); false)
+   handle RC.Unavailable message =>
+     String.isSubstring (RC.redact_userinfo (authenticated backup) ^ "/cas/" ^ digest) message andalso
+     not (String.isSubstring "user:pass" message));
 val _ = clear primary "get-status";
-val _ = assert "missing plus transient is unavailable" (unavailable (fn () => ignore (fetch cache digest)));
+val _ = assert "missing plus transient is a miss" (fetch cache digest = CB.Miss);
+val _ = put backup "get-status" "403";
+val _ = assert "backup authorization failure overrides miss and names backup"
+  (case fetch auth_cache digest of
+       CB.Corrupt message => String.isSubstring (RC.redact_userinfo (authenticated backup) ^ "/cas/" ^ digest) message andalso
+                             not (String.isSubstring "user:pass" message)
+     | _ => false);
 val _ = clear backup "get-status";
+val _ = put primary "head-status" "503";
+val _ = assert "HEAD transient plus missing" (not (RC.blob_present cache digest));
+val _ = clear primary "head-status";
+val _ = put backup "head-status" "503";
+val _ = assert "HEAD missing plus transient" (not (RC.blob_present cache digest));
+val _ = clear backup "head-status";
 
 val down = "http://127.0.0.1:1";
 val degraded = RC.remote (down ^ "," ^ one);

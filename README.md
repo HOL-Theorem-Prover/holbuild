@@ -1166,8 +1166,9 @@ nodes are tried. Reads try the second node after a 404, connection failure,
 timeout, 429 or 5xx; writes do so after a connection failure, timeout, 429 or
 5xx. A single-node list keeps the ordinary single-cache behavior. A successful
 backup keeps the ring available; the circuit breaker below counts the final
-outcome of a request. A miss on one node and a transient failure on the other
-remain a transient failure. Replicas should share a backing store: the second
+outcome of a request. If neither node hits, a 404 from either node gives a miss, even if the
+other node failed transiently; this allows a new action to build and publish
+on the healthy node. Two transient failures remain unavailable. Replicas should share a backing store: the second
 node covers handoff while a newly added node cannot yet see a recent upload.
 
 Remote cache misses or errors fall back to the local cache/source build path.

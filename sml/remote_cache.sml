@@ -311,10 +311,11 @@ fun routed_status method urls path request =
           if retry then
             let val next = traced method backup path (fn () => request backup)
             in
-              if transient result andalso next = HolbuildHttp.Response 404 then result else next
+              if result = HolbuildHttp.Response 404 andalso transient next then (primary, result)
+              else (backup, next)
             end
-          else result
-      | [] => result
+          else (primary, result)
+      | [] => (primary, result)
   end
 
 (* NONE when the remote cache is disabled, without a request.  With
@@ -327,7 +328,7 @@ fun send_result method url request =
         else NONE
     | SOME admission =>
         let
-          val result = request ()
+          val (answered_url, result) = request ()
             handle e =>
               ((if #2 admission then
                   record_transport_outcome admission (HolbuildHttp.Failed (General.exnMessage e))
@@ -335,28 +336,25 @@ fun send_result method url request =
                raise e)
         in
           record_transport_outcome admission result;
-          if !fail_closed then require_answer method url result else ();
-          SOME result
+          if !fail_closed then require_answer method answered_url result else ();
+          SOME (answered_url, result)
         end
 
 fun send method url path request =
-  send_result method url (fn () => traced method url path request)
+  Option.map #2 (send_result method url (fn () => (url, traced method url path request)))
 
 fun send_urls method urls path request =
   send_result method (hd urls) (fn () => routed_status method urls path request)
 
 fun curl_get_urls {urls, dst} =
-  let val display_url = redact_userinfo (hd urls)
-  in
-    case send_urls "GET" urls dst (fn url => get_status {url = url, dst = dst}) of
+  (case send_urls "GET" urls dst (fn url => get_status {url = url, dst = dst}) of
         NONE => HolbuildCacheBackend.Miss
-      | SOME (HolbuildHttp.Failed message) =>
-          HolbuildCacheBackend.Corrupt ("GET " ^ display_url ^ " failed: " ^ message)
-      | SOME (HolbuildHttp.Response 200) => HolbuildCacheBackend.Hit
-      | SOME (HolbuildHttp.Response 404) => HolbuildCacheBackend.Miss
-      | SOME (HolbuildHttp.Response code) =>
-          HolbuildCacheBackend.Corrupt ("HTTP " ^ Int.toString code ^ " from " ^ display_url)
-  end
+      | SOME (url, HolbuildHttp.Failed message) =>
+          HolbuildCacheBackend.Corrupt ("GET " ^ redact_userinfo url ^ " failed: " ^ message)
+      | SOME (_, HolbuildHttp.Response 200) => HolbuildCacheBackend.Hit
+      | SOME (_, HolbuildHttp.Response 404) => HolbuildCacheBackend.Miss
+      | SOME (url, HolbuildHttp.Response code) =>
+          HolbuildCacheBackend.Corrupt ("HTTP " ^ Int.toString code ^ " from " ^ redact_userinfo url))
   handle e as Unavailable _ => raise e
        | e => (HolbuildCacheBackend.Corrupt (General.exnMessage e))
 
@@ -366,16 +364,13 @@ fun successful_put_code code =
   code = 200 orelse code = 201 orelse code = 204
 
 fun curl_put_urls headers {urls, src} =
-  let val display_url = redact_userinfo (hd urls)
-  in
-    case send_urls "PUT" urls src (fn url => put_status headers {url = url, src = src}) of
+  (case send_urls "PUT" urls src (fn url => put_status headers {url = url, src = src}) of
         NONE => HolbuildCacheBackend.Skipped
-      | SOME (HolbuildHttp.Failed message) =>
-          HolbuildCacheBackend.Conflict ("PUT " ^ display_url ^ " failed: " ^ message)
-      | SOME (HolbuildHttp.Response code) =>
+      | SOME (url, HolbuildHttp.Failed message) =>
+          HolbuildCacheBackend.Conflict ("PUT " ^ redact_userinfo url ^ " failed: " ^ message)
+      | SOME (url, HolbuildHttp.Response code) =>
           if successful_put_code code then HolbuildCacheBackend.Published
-          else HolbuildCacheBackend.Conflict ("HTTP " ^ Int.toString code ^ " from " ^ display_url)
-  end
+          else HolbuildCacheBackend.Conflict ("HTTP " ^ Int.toString code ^ " from " ^ redact_userinfo url))
   handle e as Unavailable _ => raise e
        | e => (HolbuildCacheBackend.Conflict (General.exnMessage e))
 
@@ -572,7 +567,7 @@ fun blob_present cache sha256 =
   let val urls = cas_urls cache sha256
   in
     case send_urls "HEAD" urls "" head_status of
-        SOME (HolbuildHttp.Response 404) => false
+        SOME (_, HolbuildHttp.Response 404) => false
       | _ => true
   end
   handle e as Unavailable _ => raise e
@@ -584,7 +579,7 @@ fun blob_confirmed_present cache sha256 =
   if tripped () then false
   else
     let val urls = cas_urls cache sha256
-    in routed_status "HEAD" urls "" head_status = HolbuildHttp.Response 200 end
+    in #2 (routed_status "HEAD" urls "" head_status) = HolbuildHttp.Response 200 end
     handle _ => false
 
 fun verify_downloaded_blob path ({sha256, size} : blob_entry) =

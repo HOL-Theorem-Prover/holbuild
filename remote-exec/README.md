@@ -103,6 +103,11 @@ coordinator reads and worker bootstrap spec downloads use holbuild's digest
 ranking and second-node fallback, including a read's 404 during handoff.
 See the top-level README's remote-cache configuration for the routing contract.
 
+Before enabling multiple cache nodes, upgrade the coordinator, workers and
+submitting clients to a release that supports cache rings, and drain batches
+whose specs name older holbuild releases. Workers run the release named in
+each spec; an older release treats the entire list as one URL.
+
 The remote cache's credentials are a curl config, as holbuild reads it from
 the file `HOLBUILD_REMOTE_CACHE_CURL_CONFIG` names; the entrypoint writes
 `HOLBUILD_REMOTE_CACHE_CURL_CONFIG_CONTENT` to such a file, readable only by

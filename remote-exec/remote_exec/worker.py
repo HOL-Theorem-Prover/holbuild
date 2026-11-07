@@ -202,6 +202,7 @@ class Releases:
         if self.curl_config is not None:
             command += ["-K", self.curl_config]
         unavailable: str | None = None
+        missing: str | None = None
         failure = f"spec {spec_sha256} is missing from the remote cache"
         for node in ranked_nodes(nodes, spec_sha256)[:2]:
             # Not check=True: its error would print credentials in the command line.
@@ -218,10 +219,13 @@ class Releases:
             failure = f"fetching spec {spec_sha256} from the remote cache failed: {fetched.stderr.strip()}"
             if fetched.returncode == 22 and status.startswith("4") and status != "429":
                 if status == "404":
+                    missing = failure
                     continue
                 raise RuntimeError(failure)
             unavailable = failure
         else:
+            if missing is not None:
+                raise RuntimeError(missing)
             if unavailable is not None:
                 raise CacheUnavailable(unavailable)
             raise RuntimeError(failure)

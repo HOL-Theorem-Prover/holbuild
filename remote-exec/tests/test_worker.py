@@ -933,3 +933,24 @@ def test_worker_cache_ring_from_environment(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_URL", "http://one.test/,http://two.test///,http://one.test")
     args = parse_args(["--coordinator", "http://exec.test", "--cache-limit-gb", "2"])
     assert args.remote_cache == "http://one.test,http://two.test"
+
+
+@pytest.mark.parametrize("statuses", [(503, 404), (404, 503), (404, 404), (503, 429), (404, 403), (403,)])
+def test_bootstrap_spec_distinguishes_miss_from_outage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, statuses: tuple[int, ...]
+) -> None:
+    asked: list[str] = []
+
+    def fetch(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        status = statuses[len(asked)]
+        asked.append(command[-1])
+        return subprocess.CompletedProcess(command, 22, f"\n{status}", f"HTTP {status}")
+
+    monkeypatch.setattr(subprocess, "run", fetch)
+    ring = Releases(str(tmp_path), "unused", "http://one.test,http://two.test", None)
+    error = CacheUnavailable if statuses == (503, 429) else RuntimeError
+    message = "HTTP 403" if 403 in statuses else "HTTP 429" if error is CacheUnavailable else "HTTP 404"
+    with pytest.raises(error, match=message) as caught:
+        ring.spec_version(SPEC)
+    assert type(caught.value) is error
+    assert len(asked) == len(statuses)

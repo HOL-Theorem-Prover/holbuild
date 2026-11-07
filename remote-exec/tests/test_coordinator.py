@@ -1396,9 +1396,9 @@ async def test_cache_ring_routes_digests_independently_of_configuration_order(co
 
 
 @pytest.mark.parametrize("primary", [404, 503, 429, "connection", "timeout"])
-@pytest.mark.parametrize("secondary", [200, 404, 503])
+@pytest.mark.parametrize("secondary", [200, 404, 503, 403, "connection"])
 async def test_cache_ring_read_fallback(
-    coordinator: Coordinator, primary: int | str, secondary: int
+    coordinator: Coordinator, primary: int | str, secondary: int | str, caplog: pytest.LogCaptureFixture
 ) -> None:
     from remote_exec.cache import ranked_nodes
 
@@ -1416,15 +1416,24 @@ async def test_cache_ring_read_fallback(
             if primary == "timeout":
                 raise httpx.ReadTimeout("timeout", request=request)
             return httpx.Response(primary)
+        if secondary == "connection":
+            raise httpx.ConnectError("unreachable", request=request)
         return httpx.Response(secondary)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
         ring = Coordinator(coordinator.engine, client, coordinator.settings)
         ring.cache_nodes = nodes
         result = await ring._check_cache(digest, asyncio.Semaphore(1))
-    expected = True if secondary == 200 else False if primary == secondary == 404 else None
+    expected = (True if secondary == 200 else None if secondary == 403
+                else False if 404 in (primary, secondary) else None)
     assert result is expected
     assert asked == ranked[:2]
+    if expected is not None:
+        assert not caplog.records
+    else:
+        status = secondary if isinstance(secondary, int) else primary
+        if isinstance(status, int):
+            assert f"answered {status}" in caplog.text
     assert (digest in ring.found_in_cache) == (expected is True)
 
 

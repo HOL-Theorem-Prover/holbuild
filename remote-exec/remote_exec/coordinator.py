@@ -1085,38 +1085,35 @@ class Coordinator:
 
     async def _check_cache(self, ac_key: str, limit: asyncio.Semaphore) -> bool | None:
         forgotten = self.cache_forgotten
-        uncertain = False
-        response: httpx.Response | None = None
+        missing = False
+        failure: httpx.Response | None = None
         for node in ranked_nodes(self.cache_nodes, ac_key)[:2]:
             try:
                 async with limit:
                     response = await self.cache.get(f"{node}/ac/{ac_key}")
             except httpx.HTTPError:
-                response = None
-                uncertain = True
                 continue
-            if response.status_code == 429 or 500 <= response.status_code < 600:
-                uncertain = True
-                continue
+            if response.status_code == 200:
+                if self.cache_forgotten == forgotten:  # else an input went missing since this check began
+                    self.found_in_cache[ac_key] = asyncio.get_running_loop().time()
+                return True
             if response.status_code == 404:
+                missing = True
                 continue
-            break
-        else:
-            if not uncertain:
-                return False
-            if response is None:
-                return None
-        if response.status_code == 200:
-            if self.cache_forgotten == forgotten:  # else an input went missing since this check began
-                self.found_in_cache[ac_key] = asyncio.get_running_loop().time()
-            return True
-        request = response.request
-        logger.warning(
-            "%s %s answered %d; its children wait for the next sweep",
-            request.method,
-            request.url.path,
-            response.status_code,
-        )
+            failure = response
+            if response.status_code != 429 and not 500 <= response.status_code < 600:
+                missing = False
+                break
+        if missing:
+            return False
+        if failure is not None:
+            request = failure.request
+            logger.warning(
+                "%s %s answered %d; its children wait for the next sweep",
+                request.method,
+                request.url.path,
+                failure.status_code,
+            )
         return None
 
     async def _requeue_evicted(self, batch_id: UUID, parent: str) -> bool:
