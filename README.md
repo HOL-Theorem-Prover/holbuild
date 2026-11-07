@@ -649,9 +649,10 @@ undeclared files, or host paths must declare those files in `extra_deps`, or set
 because holbuild rejects a restored theory whose parents' `.dat` files differ
 from the local ones, but descendants of a nondeterministic theory then miss the
 cache wherever the local build of it differs from the one their cache entries
-were built against. A parent-incompatible local cache entry is removed so the
-rebuilt child can replace it; this does not change the remote cache's conflict
-checks. An entry rejected only by the requested proof policy is retained until
+were built against. A parent-incompatible local cache entry is removed, and
+the remote cache's entry for the same key is tried before rebuilding; a rebuilt
+child replaces the local entry, which does not change the remote cache's
+conflict checks. An entry rejected only by the requested proof policy is retained until
 a successful rebuild can publish its stronger contract.
 
 Source files may also declare source-file-relative extra dependencies:

@@ -2732,7 +2732,10 @@ fun execution_plan_only (CheckpointPolicy {execution_plan = SOME _, trace_steps 
 fun bool_text true = "true"
   | bool_text false = "false"
 
-val theory_manifest_version = "1"
+(* 2: before 0.13.11 a theory's .dat listed its parents in load order, so one
+   key could name several outputs, and a cached child could disagree with the
+   cached parent under its parent's key. *)
+val theory_manifest_version = "2"
 
 (* Final theory artifacts are semantic products of source bytes, resolved deps,
    toolchain, and declared action policy. Execution strategy is deliberately not
@@ -4288,16 +4291,6 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
     fun materialize_valid_cache () =
       let
         val root = cache_root ()
-        val existing = ensure_local_cache_entry root input_key
-        fun discard_entry () =
-          case existing of
-              SOME text => ignore (drop_cache_manifest_if_unchanged root input_key text)
-            | NONE => ()
-        fun reject_parents () =
-          (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
-                        input_key ^ " (parent outputs differ)");
-           discard_entry ();
-           remove_failed_cache_outputs project node; CacheMiss)
         fun cached_parents_match text =
           let
             val {dat_hash, ...} = cache_manifest_blobs_from_lines input_key (cache_manifest_lines text)
@@ -4305,19 +4298,46 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
             dat_parent_hashes_match dat_hash_cache plan node (HolbuildCache.blob_path root dat_hash)
           end
           handle _ => false
+        (* A local entry built against other parent outputs can sit beside a
+           remote entry built against these, so once the local one is dropped
+           the remote one gets a try, unless the local one came from there; an
+           entry another build published meanwhile gets the try instead.  Only
+           one retry either way. *)
+        fun materialize retry existing =
+          let
+            (* A failed copy may have met an entry another build just published. *)
+            fun from_remote () =
+              if copied_from_remote input_key then CacheMiss
+              else
+                (ignore (hydrate_remote_cache_key root input_key);
+                 case HolbuildCache.get_action root input_key of
+                     SOME text => materialize false text
+                   | NONE => CacheMiss)
+            fun reject_parents () =
+              (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
+                            input_key ^ " (parent outputs differ)");
+               remove_failed_cache_outputs project node;
+               ignore (drop_cache_manifest_if_unchanged root input_key existing);
+               if not retry then CacheMiss
+               else
+                 case HolbuildCache.get_action root input_key of
+                     NONE => from_remote ()
+                   | SOME text => if text = existing then CacheMiss else materialize false text)
+          in
+            case materialize_theory_cache (#verify_cache options) allow_timeout_discrepancy
+                   project plan input_key (tactic_timeout policy) (trknl_enabled policy) node of
+                (* A policy miss can also hide stale parent outputs. Preserve
+                   compatible weaker-policy entries if rechecking fails. *)
+                CacheMiss => if cached_parents_match existing then CacheMiss else reject_parents ()
+              | restored as CacheRestored _ =>
+                  if theory_parent_hashes_match dat_hash_cache plan node NONE then restored
+                  else reject_parents ()
+          end
       in
-        case existing of
+        case ensure_local_cache_entry root input_key of
             NONE => (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
                                   input_key ^ " (no manifest)"); CacheMiss)
-          | SOME text =>
-              case materialize_theory_cache (#verify_cache options) allow_timeout_discrepancy
-                     project plan input_key (tactic_timeout policy) (trknl_enabled policy) node of
-                  (* A policy miss can also hide stale parent outputs. Preserve
-                     compatible weaker-policy entries if rechecking fails. *)
-                  CacheMiss => if cached_parents_match text then CacheMiss else reject_parents ()
-                | restored as CacheRestored _ =>
-                    if theory_parent_hashes_match dat_hash_cache plan node NONE then restored
-                    else reject_parents ()
+          | SOME text => materialize true text
       end
     fun restore_from_cache built_timeout =
       (remove_tree stage;
