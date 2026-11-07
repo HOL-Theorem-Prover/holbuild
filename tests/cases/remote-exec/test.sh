@@ -194,11 +194,12 @@ require_grep "the coordinator reported no theories; reattach with --attach b5" "
 refute_grep "^POST /v1/batches/b5/cancel " "$state/requests.log"
 rm "$state/down"
 run unknown-only 75 build --remote-exec "$coordinator" --remote-only --attach nope BTheory
-require_grep "batch nope can't be followed (HTTP 404): .*no such batch" "$tmpdir/unknown-only.log"
+require_grep "batch nope can't be followed (HTTP 404): .*no such batch.*, cancelled the batch" "$tmpdir/unknown-only.log"
+require_grep "^POST /v1/batches/nope/cancel " "$state/requests.log"
 refute_grep "reattach" "$tmpdir/unknown-only.log"
 run unknown 0 build --remote-exec "$coordinator" --attach nope BTheory
 require_grep "batch nope can't be followed (HTTP 404): .*, cancelled the batch; building locally" "$tmpdir/unknown.log"
-require_grep "^POST /v1/batches/nope/cancel " "$state/requests.log"
+[[ $(grep -c "^POST /v1/batches/nope/cancel " "$state/requests.log") -eq 2 ]] || { echo "wanted a cancel of batch nope from each of unknown-only and unknown" >&2; exit 1; }
 
 # A batch reported done whose results aren't in the remote cache: with
 # --remote-only nothing is built locally, and the exit status says a local
@@ -231,8 +232,7 @@ require_grep "the coordinator reported no theories; building locally" "$tmpdir/e
 refute_grep "cancel" "$tmpdir/ended.log"
 rm "$state/ended"
 
-# An interrupted build cancels the batch it follows, unless --remote-only
-# (which can reattach to it).
+# An interrupted build cancels the batch it follows, --remote-only too.
 # interrupt NAME ARGS...: starts hb with ARGS, logging to $tmpdir/NAME.log,
 # and sends holbuild SIGTERM once it follows its batch.  HOLBUILD_BIN may be
 # a wrapper that runs holbuild as its child, as tests/run.sh's does, so the
@@ -267,8 +267,8 @@ require_grep "holbuild: interrupted" "$tmpdir/interrupted.log"
 refute_grep "Theory built" "$tmpdir/interrupted.log"
 interrupt interrupted-only build --remote-exec "$coordinator" --remote-only BTheory
 batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/interrupted-only.log")
-refute_grep "^POST /v1/batches/$batch/cancel " "$state/requests.log"
-refute_grep "cancelled" "$tmpdir/interrupted-only.log"
+require_grep "^POST /v1/batches/$batch/cancel " "$state/requests.log"
+require_grep "holbuild: cancelled remote batch $batch" "$tmpdir/interrupted-only.log"
 rm "$state/hang"
 
 # A closure that can't run remotely (a forced action) is built locally.
@@ -418,14 +418,17 @@ SML
   > "$tmpdir/generated-detach.log" 2>&1 && { cat "$tmpdir/generated-detach.log" >&2; exit 1; }
 require_grep "remote execution: theories that write SML sources build before the rest is planned" "$tmpdir/generated-detach.log"
 refute_grep "GenTheory built" "$tmpdir/generated-detach.log"
-# --remote-only restores, so with nothing cached it fails without building.
+# --remote-only restores, so with nothing cached it fails without building,
+# and cancels a batch it was to attach to.
 set +e
-(cd "$generated" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only UseLib) \
+(cd "$generated" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only --attach genb UseLib) \
   > "$tmpdir/generated-only.log" 2>&1
 status=$?
 set -e
 [[ $status -eq 75 ]] || { echo "generated-only exited $status, wanted 75" >&2; cat "$tmpdir/generated-only.log" >&2; exit 1; }
 require_grep "build before the rest is planned; restoring from the cache" "$tmpdir/generated-only.log"
+require_grep "^POST /v1/batches/genb/cancel " "$state/requests.log"
+: > "$state/requests.log"
 refute_grep "GenTheory built" "$tmpdir/generated-only.log"
 (cd "$generated" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" UseLib) \
   > "$tmpdir/generated.log" 2>&1 || { cat "$tmpdir/generated.log" >&2; exit 1; }

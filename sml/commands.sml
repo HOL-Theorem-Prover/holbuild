@@ -1331,12 +1331,11 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         fun finished {built, total} =
           if total = 0 then "the coordinator reported no theories"
           else "remote workers finished " ^ Int.toString built ^ " of " ^ Int.toString total ^ " theories"
-        (* A batch the build stops following to build locally is cancelled
-           (a finished one is left as it is); a --remote-only build fails
-           instead, and says how to reattach when the batch may still run. *)
+        (* A batch the build stops following is cancelled (a finished one is
+           left as it is), before it builds locally or, under --remote-only,
+           fails for its caller to build locally. *)
         fun abandon batch_id reason =
-          if remote_only then fall_back reason
-          else if HolbuildRemoteExec.cancel url batch_id then fall_back (reason ^ ", cancelled the batch")
+          if HolbuildRemoteExec.cancel url batch_id then fall_back (reason ^ ", cancelled the batch")
           else fall_back reason
         (* A batch that abandon would cancel is cancelled on an interrupt too.
            While it runs, the entries of the theories it finishes, and of a
@@ -1352,8 +1351,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               (HolbuildRemoteExec.follow url batch_id add before stop ())
               handle e => (stop (); raise e)
           in
-            if remote_only then follow_batch ()
-            else HolbuildRemoteExec.while_followed url batch_id follow_batch
+            HolbuildRemoteExec.while_followed url batch_id follow_batch
           end
         fun finish in_batch batch_id =
           case follow in_batch batch_id of
@@ -1395,6 +1393,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         if writes_sources andalso detach then raise Error ("remote execution: " ^ reason)
         else if writes_sources andalso remote_only then
           (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "; restoring from the cache\n");
+           Option.app (fn batch_id => ignore (HolbuildRemoteExec.cancel url batch_id)) attach;
            execute_build ())
         else if writes_sources then
           (HolbuildBuildExec.warn ("remote execution: " ^ reason ^ "; building locally");
