@@ -122,6 +122,18 @@ require_grep 'discarding invalid checkpoint after HOL state load failure' "$tmpd
 [[ "$(deps_heap "$fourth" B)" -ef "$stored" ]] \
   || { echo "the store does not hold the failed build's fresh heap" >&2; exit 1; }
 
+# A build sweeps store heaps no tree links that no build used within a day,
+# and keeps one a tree still links, however old.
+family=$(dirname "$stored")
+orphan=$store/orphan-family
+mkdir -p "$orphan"
+cp "$stored" "$orphan/deps_loaded.save"
+touch -d '2 days ago' "$orphan" "$family"
+(cd "$second" && "$HOLBUILD_BIN" build BTheory) > "$tmpdir/sweep.log" 2>&1 \
+  || { cat "$tmpdir/sweep.log" >&2; exit 1; }
+[[ ! -e "$orphan" ]] || { echo "a build kept an unlinked, unused store heap" >&2; exit 1; }
+[[ -e "$stored" ]] || { echo "a build swept a store heap a tree still links" >&2; exit 1; }
+
 # gc removes families no build used within the retention window. It runs
 # on its own cache, so it can't touch the suite's shared toolchains.
 gc_cache=$tmpdir/gc-cache

@@ -888,8 +888,10 @@ dependency set: a theory with no valid `deps_loaded` hard-links the stored
 one (a copy across file systems) and resumes from it, and one it saves is
 linked into the store. A stored heap whose parent isn't the build's base
 state is ignored, and one HOL can't resume from is discarded and replaced by
-the build's fresh heap. `holbuild gc` removes stored heaps no build used
-within the retention window. A heap keeps HOL's record of the directories
+the build's fresh heap. Each build removes stored heaps no tree links any
+more (its checkpoint budget evicted them, or the tree was deleted) that no
+build used for a day, and `holbuild gc` removes every store directory no
+build used within the retention window. A heap keeps HOL's record of the directories
 its files were loaded from, so in a theory resumed from another tree's heap
 `Meta.fileDirMap()` (used only by TacticToe's file lookups) names that
 tree's directories, as it names the old ones after a project is moved;
@@ -1270,8 +1272,8 @@ and platform, which is why every worker should use the same cache root.
 
 The checkpoint tree is then the action's own, emptied before and after it;
 the host store `<cache root>/checkpoint-store` keeps the shared files, one
-directory per heap, which the cache cap evicts as a unit, unless an action
-on the host is using it. Worker containers on one host can share
+directory per heap, which the cache cap and `holbuild gc` evict as a unit,
+unless an action on the host is using it. Worker containers on one host can share
 `checkpoint-store/` and `hol-toolchains/`, mounted from host directories, and
 keep the rest of the cache root to themselves. A restored Poly/ML state is
 hard-linked from the store when the store and `checkpoints/` are on one
