@@ -1366,3 +1366,89 @@ async def test_run_memory_failure_uses_the_existing_profile_hint_and_high_tier(
     await claim_named(http, "b")
     assert await claim(http) is None
     await claim_named(http, "a", "high")
+
+
+async def test_cache_ring_routes_digests_independently_of_configuration_order(coordinator: Coordinator) -> None:
+    from remote_exec.cache import cache_nodes, ranked_nodes
+
+    nodes = ["http://one.test/cache", "http://two.test/cache"]
+    assert cache_nodes(f" {nodes[0]}///, {nodes[1]}/ {nodes[0]} ") == nodes
+    asked: list[str] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        asked.append(str(request.url))
+        return httpx.Response(200)
+
+    owners = set()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+        ring = Coordinator(coordinator.engine, client, coordinator.settings)
+        for i in range(32):
+            digest = input_key(str(i))
+            expected = max(nodes, key=lambda node: hashlib.sha256(f"{node}:{digest}".encode()).hexdigest())
+            owners.add(expected)
+            assert ranked_nodes(nodes, digest) == ranked_nodes(list(reversed(nodes)), digest)
+            for order in (nodes, list(reversed(nodes))):
+                ring.cache_nodes = order
+                assert await ring._check_cache(digest, asyncio.Semaphore(1)) is True
+                assert asked[-1] == f"{expected}/ac/{digest}"
+    assert owners == set(nodes)
+    assert len(asked) == 64  # successful primary reads never contact a backup
+
+
+@pytest.mark.parametrize("primary", [404, 503, 429, "connection", "timeout"])
+@pytest.mark.parametrize("secondary", [200, 404, 503])
+async def test_cache_ring_read_fallback(
+    coordinator: Coordinator, primary: int | str, secondary: int
+) -> None:
+    from remote_exec.cache import ranked_nodes
+
+    digest = input_key("handoff")
+    nodes = ["http://one.test", "http://two.test", "http://three.test"]
+    ranked = ranked_nodes(nodes, digest)
+    asked: list[str] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        node = str(request.url).removesuffix(f"/ac/{digest}")
+        asked.append(node)
+        if node == ranked[0]:
+            if primary == "connection":
+                raise httpx.ConnectError("unreachable", request=request)
+            if primary == "timeout":
+                raise httpx.ReadTimeout("timeout", request=request)
+            return httpx.Response(primary)
+        return httpx.Response(secondary)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+        ring = Coordinator(coordinator.engine, client, coordinator.settings)
+        ring.cache_nodes = nodes
+        result = await ring._check_cache(digest, asyncio.Semaphore(1))
+    expected = True if secondary == 200 else False if primary == secondary == 404 else None
+    assert result is expected
+    assert asked == ranked[:2]
+    assert (digest in ring.found_in_cache) == (expected is True)
+
+
+async def test_cache_ring_does_not_retry_authorization_errors(coordinator: Coordinator) -> None:
+    asked = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        asked.append(request)
+        return httpx.Response(401)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+        ring = Coordinator(coordinator.engine, client, coordinator.settings)
+        ring.cache_nodes = ["http://one.test", "http://two.test"]
+        assert await ring._check_cache(input_key("secret"), asyncio.Semaphore(1)) is None
+    assert len(asked) == 1
+
+
+def test_cache_ring_settings_accept_both_environment_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    from remote_exec.coordinator import Settings
+
+    monkeypatch.delenv("REMOTE_EXEC_CACHE_URL", raising=False)
+    monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_URL", "http://one.test/,http://two.test/,http://one.test")
+    args = dict(database_url="unused", client_token="client", worker_token="worker")
+    assert Settings(**args).cache_url == "http://one.test,http://two.test"
+    monkeypatch.setenv("REMOTE_EXEC_CACHE_URL", "http://explicit.test/")
+    assert Settings(**args).cache_url == "http://explicit.test"
+    assert Settings(**args, cache_url="http://argument.test/").cache_url == "http://argument.test"

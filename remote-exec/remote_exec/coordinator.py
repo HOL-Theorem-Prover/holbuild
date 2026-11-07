@@ -21,10 +21,11 @@ from uuid import UUID, uuid4
 import asyncpg
 import httpx
 import sqlalchemy as sa
-from pydantic import Field, SecretStr
+from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
+from remote_exec.cache import cache_nodes, ranked_nodes
 from remote_exec.formats import Batch, Result
 
 logger = logging.getLogger(__name__)
@@ -62,7 +63,8 @@ class Settings(BaseSettings):
     database_url: str  # postgresql+asyncpg://...
     client_token: SecretStr
     worker_token: SecretStr
-    cache_url: str  # bazel-remote base URL; HEAD <cache_url>/ac/<ac-key>
+    cache_url: str = Field(validation_alias=AliasChoices("cache_url", "REMOTE_EXEC_CACHE_URL", "HOLBUILD_REMOTE_CACHE_URL"))
+
     lease_seconds: int = 120
     max_attempts: int = 3
     # A theory whose peak hint reaches this goes to the high-memory tier; set it to what a standard worker holds.
@@ -85,6 +87,10 @@ class Settings(BaseSettings):
     scale_down_hold_s: float = 900.0
     scale_cmd: str | None = None  # run as `<scale_cmd> <desired burst workers>` when that number changes
 
+    @field_validator("cache_url")
+    @classmethod
+    def normalize_cache_url(cls, value: str) -> str:
+        return ",".join(cache_nodes(value))
 
 class ScaleCommandError(RuntimeError):
     """The scale command failed or timed out."""
@@ -366,6 +372,7 @@ class Coordinator:
         self.engine = engine
         self.cache = cache
         self.settings = settings
+        self.cache_nodes = cache_nodes(settings.cache_url)
         self.clock: Callable[[], datetime] = lambda: datetime.now(UTC)
         self.scaler: ScaleRun | None = None  # the scale command's last run
         # How many actions this process's release has made ready, and the claims waiting, by the tiers they take
@@ -405,7 +412,6 @@ class Coordinator:
             ),
             # Every connection stays open between requests, so bursts of them don't each open a new TLS connection.
             httpx.AsyncClient(
-                base_url=settings.cache_url,
                 timeout=30,
                 follow_redirects=True,
                 limits=httpx.Limits(max_connections=100, max_keepalive_connections=100),
@@ -1079,17 +1085,31 @@ class Coordinator:
 
     async def _check_cache(self, ac_key: str, limit: asyncio.Semaphore) -> bool | None:
         forgotten = self.cache_forgotten
-        try:
-            async with limit:
-                response = await self.cache.get(f"/ac/{ac_key}")
-        except httpx.HTTPError:
-            return None
+        uncertain = False
+        response: httpx.Response | None = None
+        for node in ranked_nodes(self.cache_nodes, ac_key)[:2]:
+            try:
+                async with limit:
+                    response = await self.cache.get(f"{node}/ac/{ac_key}")
+            except httpx.HTTPError:
+                response = None
+                uncertain = True
+                continue
+            if response.status_code == 429 or 500 <= response.status_code < 600:
+                uncertain = True
+                continue
+            if response.status_code == 404:
+                continue
+            break
+        else:
+            if not uncertain:
+                return False
+            if response is None:
+                return None
         if response.status_code == 200:
             if self.cache_forgotten == forgotten:  # else an input went missing since this check began
                 self.found_in_cache[ac_key] = asyncio.get_running_loop().time()
             return True
-        if response.status_code == 404:
-            return False
         request = response.request
         logger.warning(
             "%s %s answered %d; its children wait for the next sweep",

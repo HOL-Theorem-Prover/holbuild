@@ -13,7 +13,20 @@ val prefetch_concurrency : int option ref = ref NONE
 fun nonempty label text =
   if text = "" then raise Error (label ^ " must not be empty") else text
 
-fun normalize_url url = nonempty "remote cache URL" url
+(* Commas and whitespace separate nodes; their normalized spelling is the ring identity. *)
+fun urls text =
+  let
+    fun normalize url = Substring.string (Substring.dropr (fn c => c = #"/") (Substring.full url))
+    fun add (url, acc) = if List.exists (fn old => old = url) acc then acc else acc @ [url]
+    val nodes = List.foldl add []
+      (map normalize (String.tokens (fn c => c = #"," orelse Char.isSpace c) text))
+  in
+    if null nodes orelse List.exists (fn url => url = "") nodes then
+      raise Error "remote cache URL must not be empty"
+    else nodes
+  end
+
+fun normalize_url url = String.concatWith "," (urls url)
 fun normalize_curl_config path = nonempty "remote cache curl config" path
 
 fun set_url url = override_url := SOME (normalize_url url)

@@ -18,7 +18,7 @@ val fail_closed = ref false
 
 type blob_entry = {sha256 : string, size : string}
 type blob_map = (string, blob_entry) Redblackmap.dict
-datatype t = RemoteCache of {base_url : string, blobs : blob_map ref}
+datatype t = RemoteCache of {urls : string list, blobs : blob_map ref}
 
 val metadata_header = "holbuild-remote-cache-action-v2"
 val manifest_marker = "manifest-text-v1\n"
@@ -28,21 +28,31 @@ val manifest_marker = "manifest-text-v1\n"
    HolbuildHttp.max_transfer_seconds. *)
 val stall_timeout_seconds = 30
 
-fun trim_trailing_slashes url =
-  let
-    fun loop n =
-      if n > 0 andalso String.sub(url, n - 1) = #"/" then loop (n - 1) else n
-    val n = loop (size url)
-  in
-    if n = 0 then url else String.substring(url, 0, n)
-  end
-
 fun empty_blob_map () = Redblackmap.mkDict String.compare
 
 fun remote url =
-  RemoteCache {base_url = trim_trailing_slashes url, blobs = ref (empty_blob_map ())}
+  RemoteCache {urls = HolbuildRemoteCacheConfig.urls url, blobs = ref (empty_blob_map ())}
 
-fun base_url (RemoteCache {base_url, ...}) = base_url
+fun base_url (RemoteCache {urls, ...}) = String.concatWith "," urls
+
+(* Descending SHA256(URL: digest), then ascending URL on a tie, in both clients. *)
+fun ranked_urls (RemoteCache {urls, ...}) digest =
+  let
+    fun score url = (HolbuildHash.string_sha256 (url ^ ":" ^ digest), url)
+    fun compare ((a, u), (b, v)) =
+      case String.compare (b, a) of EQUAL => String.compare (u, v) | order => order
+  in
+    case urls of
+        [_] => urls
+      | _ => map #2 (Redblackset.listItems (Redblackset.fromList compare (map score urls)))
+  end
+
+fun request_urls cache kind digest =
+  let val ranked = ranked_urls cache digest
+  in map (fn url => url ^ "/" ^ kind ^ "/" ^ digest)
+       (List.take (ranked, Int.min (2, length ranked)))
+  end
+
 fun blob_map (RemoteCache {blobs, ...}) = blobs
 
 fun path_exists path = FS.access(path, []) handle OS.SysErr _ => false
@@ -309,9 +319,31 @@ fun require_answer method url result =
           else ()
   end
 
+fun transient (HolbuildHttp.Failed _) = true
+  | transient (HolbuildHttp.Response code) = code = 429 orelse (code >= 500 andalso code < 600)
+
+(* The breaker observes the whole request: a dead primary must not disable a healthy backup. *)
+fun routed_status method urls path request =
+  let
+    val primary = hd urls
+    val result = traced method primary path (fn () => request primary)
+    val retry = transient result orelse
+      ((method = "GET" orelse method = "HEAD") andalso result = HolbuildHttp.Response 404)
+  in
+    case tl urls of
+        backup :: _ =>
+          if retry then
+            let val next = traced method backup path (fn () => request backup)
+            in
+              if transient result andalso next = HolbuildHttp.Response 404 then result else next
+            end
+          else result
+      | [] => result
+  end
+
 (* NONE when the remote cache is disabled, without a request.  With
    fail_closed, raises Unavailable instead, and for no answer, 429 or 5xx. *)
-fun send method url path request =
+fun send_result method url request =
   case begin_request () of
       NONE =>
         if !fail_closed then
@@ -319,7 +351,7 @@ fun send method url path request =
         else NONE
     | SOME admission =>
         let
-          val result = traced method url path request
+          val result = request ()
             handle e =>
               ((if #2 admission then
                   record_transport_outcome admission (HolbuildHttp.Failed (General.exnMessage e))
@@ -331,10 +363,16 @@ fun send method url path request =
           SOME result
         end
 
-fun curl_get (request as {url, dst}) =
-  let val display_url = redact_userinfo url
+fun send method url path request =
+  send_result method url (fn () => traced method url path request)
+
+fun send_urls method urls path request =
+  send_result method (hd urls) (fn () => routed_status method urls path request)
+
+fun curl_get_urls {urls, dst} =
+  let val display_url = redact_userinfo (hd urls)
   in
-    case send "GET" url dst (fn () => get_status request) of
+    case send_urls "GET" urls dst (fn url => get_status {url = url, dst = dst}) of
         NONE => HolbuildCacheBackend.Miss
       | SOME (HolbuildHttp.Failed message) =>
           HolbuildCacheBackend.Corrupt ("GET " ^ display_url ^ " failed: " ^ message)
@@ -346,13 +384,15 @@ fun curl_get (request as {url, dst}) =
   handle e as Unavailable _ => raise e
        | e => (HolbuildCacheBackend.Corrupt (General.exnMessage e))
 
+fun curl_get {url, dst} = curl_get_urls {urls = [url], dst = dst}
+
 fun successful_put_code code =
   code = 200 orelse code = 201 orelse code = 204
 
-fun curl_put_with_headers headers (request as {url, src}) =
-  let val display_url = redact_userinfo url
+fun curl_put_urls headers {urls, src} =
+  let val display_url = redact_userinfo (hd urls)
   in
-    case send "PUT" url src (fn () => put_status headers request) of
+    case send_urls "PUT" urls src (fn url => put_status headers {url = url, src = src}) of
         NONE => HolbuildCacheBackend.Skipped
       | SOME (HolbuildHttp.Failed message) =>
           HolbuildCacheBackend.Conflict ("PUT " ^ display_url ^ " failed: " ^ message)
@@ -363,17 +403,19 @@ fun curl_put_with_headers headers (request as {url, src}) =
   handle e as Unavailable _ => raise e
        | e => (HolbuildCacheBackend.Conflict (General.exnMessage e))
 
+fun curl_put_with_headers headers {url, src} = curl_put_urls headers {urls = [url], src = src}
+
 fun curl_put request = curl_put_with_headers [] request
 
-fun curl_put_zstd {url, src, size} =
+fun curl_put_zstd {urls, src, size} =
   let
     val compressed = temp_path "zstd-put"
     fun put () =
-      if zstd_compress url src compressed then
-        curl_put_with_headers (zstd_content_headers size)
-          {url = url, src = compressed}
+      if zstd_compress (hd urls) src compressed then
+        curl_put_urls (zstd_content_headers size)
+          {urls = urls, src = compressed}
       else
-        curl_put_with_headers [] {url = url, src = src}
+        curl_put_urls [] {urls = urls, src = src}
   in
     if disabled () then HolbuildCacheBackend.Skipped
     else
@@ -386,8 +428,8 @@ fun curl_put_zstd {url, src, size} =
 fun remote_action_key key =
   HolbuildHash.string_sha256 ("holbuild-remote-ac-v1\n" ^ key ^ "\n")
 
-fun action_url cache key = base_url cache ^ "/ac/" ^ remote_action_key key
-fun cas_url cache sha256 = base_url cache ^ "/cas/" ^ sha256
+fun action_urls cache key = request_urls cache "ac" (remote_action_key key)
+fun cas_urls cache sha256 = request_urls cache "cas" sha256
 
 fun lookup_blob cache sha256 =
   Redblackmap.peek (!(blob_map cache), sha256)
@@ -474,7 +516,7 @@ fun get_action cache key =
     val tmp = temp_path "action"
     fun cleanup () = remove_file tmp
   in
-    case curl_get {url = action_url cache key, dst = tmp} of
+    case curl_get_urls {urls = action_urls cache key, dst = tmp} of
         HolbuildCacheBackend.Hit =>
           let
             val {blobs, manifest} = metadata_manifest (read_text tmp)
@@ -504,10 +546,10 @@ fun action_metadata cache key text =
 fun publish_action_metadata cache key metadata =
   let
     val tmp = temp_path "action-put"
-    val url = action_url cache key
+    val urls = action_urls cache key
     fun cleanup () = remove_file tmp
     fun publish () =
-      ((write_text tmp metadata; curl_put {url = url, src = tmp} before cleanup ())
+      ((write_text tmp metadata; curl_put_urls [] {urls = urls, src = tmp} before cleanup ())
        handle e => (cleanup (); raise e))
   in
     publish ()
@@ -529,16 +571,16 @@ fun put_action cache policy {key, text} =
   if disabled () then HolbuildCacheBackend.Skipped
   else
     let
-      val url = action_url cache key
+      val urls = action_urls cache key
       val metadata = action_metadata cache key text
     in
       case get_action cache key of
           SOME existing =>
             (case policy of
-                 HolbuildCacheBackend.PutIfAbsent => HolbuildCacheBackend.Conflict url
+                 HolbuildCacheBackend.PutIfAbsent => HolbuildCacheBackend.Conflict (hd urls)
                | HolbuildCacheBackend.PutIfAbsentOrSame =>
                    if existing = text then HolbuildCacheBackend.AlreadyPresent
-                   else HolbuildCacheBackend.Conflict url)
+                   else HolbuildCacheBackend.Conflict (hd urls))
         | NONE => publish_action_metadata cache key metadata
     end
   handle e as Unavailable _ => raise e
@@ -551,9 +593,9 @@ fun has_blob cache sha256 = Option.isSome (lookup_blob cache sha256)
    an entry whose blobs are gone isn't usable.  Only a 404 says the blob is
    gone; no answer, or another status, says nothing about it. *)
 fun blob_present cache sha256 =
-  let val url = cas_url cache sha256
+  let val urls = cas_urls cache sha256
   in
-    case send "HEAD" url "" (fn () => head_status url) of
+    case send_urls "HEAD" urls "" head_status of
         SOME (HolbuildHttp.Response 404) => false
       | _ => true
   end
@@ -565,8 +607,8 @@ fun blob_present cache sha256 =
 fun blob_confirmed_present cache sha256 =
   if tripped () then false
   else
-    let val url = cas_url cache sha256
-    in traced "HEAD" url "" (fn () => head_status url) = HolbuildHttp.Response 200 end
+    let val urls = cas_urls cache sha256
+    in routed_status "HEAD" urls "" head_status = HolbuildHttp.Response 200 end
     handle _ => false
 
 fun verify_downloaded_blob path ({sha256, size} : blob_entry) =
@@ -583,7 +625,7 @@ fun fetch_blob cache {hash, dst} =
     | SOME entry =>
         let
           val {sha256, ...} = entry
-          val result = curl_get {url = cas_url cache sha256, dst = dst}
+          val result = curl_get_urls {urls = cas_urls cache sha256, dst = dst}
         in
           case result of
               HolbuildCacheBackend.Hit => verify_downloaded_blob dst entry
@@ -597,7 +639,7 @@ fun fetch_blob cache {hash, dst} =
 (* Fetches a blob by its SHA-256 alone, without an action entry that lists
    it, as a remote worker fetches its spec and sources. *)
 fun fetch_unlisted_blob cache {hash, dst} =
-  (case curl_get {url = cas_url cache hash, dst = dst} of
+  (case curl_get_urls {urls = cas_urls cache hash, dst = dst} of
        HolbuildCacheBackend.Hit =>
          if HolbuildHash.file_sha256 dst = hash then HolbuildCacheBackend.Hit
          else HolbuildCacheBackend.Corrupt ("downloaded blob SHA256 mismatch: " ^ hash)
@@ -609,7 +651,7 @@ fun put_blob cache {hash, src} =
   let
     val size = Position.toString (FS.fileSize src)
     val result =
-      curl_put_zstd {url = cas_url cache hash, src = src, size = size}
+      curl_put_zstd {urls = cas_urls cache hash, src = src, size = size}
   in
     case result of
         HolbuildCacheBackend.Published => (remember_blob cache {sha256 = hash, size = size}; result)
