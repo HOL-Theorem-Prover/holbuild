@@ -55,6 +55,10 @@ Replay eligibility requires exact metadata match. Invalid selected checkpoints a
 
 Runs theorem proofs through proof steps without saving `.save`/`.ok` files. No `deps_loaded`, theorem-context, end-of-proof, or failed-prefix checkpoints are created.
 
+## `--target-checkpoints-only`
+
+Saves theorem-context, end-of-proof, declaration and failed-prefix checkpoints only in the requested targets (the default targets when none are given). Every root-package theory still saves its `deps_loaded` checkpoint and runs with proof steps and step timeouts. An edit to a non-target theory then restarts it from `deps_loaded`. Theory outputs and keys don't change.
+
 ## `--skip-proof-steps`
 
 Opts out of proof-step execution. Source is sent through the plain `hol run` path. There is no per-tactic timeout, trace-step trace, theorem-context/end-of-proof/failed-prefix proof navigation, or instrumented goal diagnostics. The `deps_loaded` checkpoint may still be used when checkpoints are enabled.

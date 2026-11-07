@@ -851,6 +851,7 @@ holbuild build --trace-steps --force MyTheory
 holbuild build --repl-on-failure MyTheory
 holbuild build --skip-proof-steps MyTheory
 holbuild build --skip-checkpoints MyTheory
+holbuild build --target-checkpoints-only MyTheory
 ```
 
 - `execution-plan THEORY:NAME` prints the proof-step plan for one theorem or
@@ -864,6 +865,12 @@ holbuild build --skip-checkpoints MyTheory
   theory failure. It serialises the build and is not supported with `--json`.
 - `--skip-proof-steps` opts out of proof-step execution.
 - `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation.
+- `--target-checkpoints-only` saves theorem checkpoints only in the requested
+  targets (the default targets when none are given). Other root-package theories
+  still save their `deps_loaded` checkpoint and run with proof steps and step
+  timeouts, so a cold build writes far fewer `.save` files, but an edit to one of
+  them restarts it from its `deps_loaded` state rather than from its last
+  unchanged theorem. Theory outputs and cache keys are the same as without it.
 
 For source-executed theory builds, holbuild writes a live child log at
 `.holbuild/logs/current/<package>/<logical>/build.log`. You can inspect it during
