@@ -7064,34 +7064,45 @@ fun hydrate_action_root remote root (spec : action_spec) =
       handle e => raise action_failed (InputMissing ("theory " ^ key))
                           ("dependency " ^ target ^ " (" ^ key ^ ") is not restorable from the cache: " ^
                            General.exnMessage e)
+    fun misfit () =
+      List.find (fn {stem, ...} => not (spec_parent_hashes_match root spec (in_root root (stem ^ ".dat"))))
+                (#deps spec)
+    fun refresh wanted = if drop_stale_dep_copies remote spec wanted then List.app restore_dep (#deps spec) else ()
   in
     fetch_file (#source spec);
     List.app fetch_file (#inputs spec);
     List.app fetch_library (#libraries spec);
     List.app write_lib (#libs spec);
     List.app restore_dep (#deps spec);
-    List.app
-      (fn {target, stem, key} =>
-          if spec_parent_hashes_match root spec (in_root root (stem ^ ".dat")) then ()
-          else
-            (* Out-of-date local copies would fail the next attempt too. *)
-            (ignore (drop_stale_dep_copies remote spec (fn _ => true));
-             raise ActionFailed (InputMissing ("theory " ^ key),
-                                 "dependency " ^ target ^ " does not match its parents in the cache")))
-      (#deps spec)
+    (* A worker's local copies go out of date when the remote's entries for
+       their keys change, and are replaced by the remote's: those of the
+       theories the build loads directly, which it would record as parents
+       even when they fit the rest, and any that don't fit the others. *)
+    refresh (fn {stem, ...} => List.exists (fn load => load = LoadObject stem) (#loads spec));
+    if Option.isSome (misfit ()) then refresh (fn _ => true) else ();
+    case misfit () of
+        NONE => ()
+      | SOME {target, key, ...} =>
+          raise ActionFailed (InputMissing ("theory " ^ key),
+                              "dependency " ^ target ^ " does not match its parents in the cache")
   end
 
-(* Step 4: the action's own entry restores with full validation. *)
-fun action_already_done root (spec : action_spec) =
+(* Step 4: the action's own entry restores with full validation, the
+   remote's when the local copy doesn't fit the restored parents and differs
+   from it. *)
+fun action_already_done remote root (spec : action_spec) =
   let
     val {sig_path, sml_path, data_path} = #outputs spec
     val stem = drop_suffix ".dat" data_path
+    fun restored () =
+      (restore_spec_theory root spec
+         {key = #input_key spec, subject = #package spec ^ ":" ^ #logical spec, stem = stem,
+          extra_outputs = SOME (#extra_outputs spec), requested_timeout = #tactic_timeout spec};
+       spec_parent_hashes_match root spec (in_root root data_path))
+      handle _ => false
   in
-    (restore_spec_theory root spec
-       {key = #input_key spec, subject = #package spec ^ ":" ^ #logical spec, stem = stem,
-        extra_outputs = SOME (#extra_outputs spec), requested_timeout = #tactic_timeout spec};
-     spec_parent_hashes_match root spec (in_root root data_path))
-    handle _ => false
+    restored () orelse
+    ((drop_local_copy_if_stale remote (#input_key spec) handle _ => false) andalso restored ())
   end
 
 (* Whether the remote's entry for the action, given by its manifest, records
@@ -8000,7 +8011,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
              action_text_value spec "toolchain" then ()
           else raise ActionFailed (ToolchainFailure, "the toolchain's identity does not match the action text")
         val _ = hydrate_action_root remote root spec
-        val done = action_already_done root spec
+        val done = action_already_done remote root spec
         val cutoff = if done then NONE else spec_early_cutoff root spec
       in
         if done orelse

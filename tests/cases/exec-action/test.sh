@@ -363,3 +363,54 @@ if find "$tmpdir/worker-f/checkpoints" -path '*.theorems*' -type f | grep -q .; 
   echo "the non-target worker saved theorem checkpoints" >&2
   exit 1
 fi
+
+# A warm worker's local copies go out of date when the remote's entries for
+# their keys change, as for a nondeterministic theory built twice: the worker
+# replaces them by the remote's in the same attempt.  stale_worker NAME
+# THEORY: a worker cache holding THEORY and its ancestors built apart from the
+# remote, from a copy of the project.
+cat > "$project/src/NScript.sml" <<'SML'
+Theory N
+Ancestors bool
+
+val _ = save_thm ("n" ^ LargeInt.toString (Time.toMicroseconds (Time.now ())), TRUTH);
+SML
+for theory in M:N P:M; do
+  cat > "$project/src/${theory%%:*}Script.sml" <<SML
+Theory ${theory%%:*}
+Ancestors ${theory##*:}
+
+Theorem ${theory%%:*}_thm:
+  T
+Proof
+  simp[]
+QED
+SML
+done
+stale_worker() {
+  mkdir -p "$tmpdir/copy-$1"
+  cp -r "$project/src" "$project/holproject.toml" "$tmpdir/copy-$1/"
+  link_hol_toolchain_cache "$tmpdir/worker-$1"
+  (cd "$tmpdir/copy-$1" && HOLBUILD_CACHE=$tmpdir/worker-$1 "$HOLBUILD_BIN" build "$2") \
+    > "$tmpdir/copy-$1.log" 2>&1 || { cat "$tmpdir/copy-$1.log" >&2; exit 1; }
+}
+stale_worker stale-deps MTheory
+stale_worker stale-own MTheory
+hb action-spec --upload MTheory > "$tmpdir/batch-m.txt"
+spec_m=$(spec_for "$tmpdir/batch-m.txt" worker:MTheory)
+key_n=$(key_for "$tmpdir/batch-m.txt" worker:NTheory)
+hb build MTheory > "$tmpdir/remote-m.log" 2>&1 || { cat "$tmpdir/remote-m.log" >&2; exit 1; }
+hb action-spec --upload PTheory > "$tmpdir/batch-p.txt"
+spec_p=$(spec_for "$tmpdir/batch-p.txt" worker:PTheory)
+[[ -n $spec_m && -n $key_n && -n $spec_p ]] || { cat "$tmpdir/batch-m.txt" "$tmpdir/batch-p.txt" >&2; exit 1; }
+
+# The worker's NTheory and MTheory differ from the remote's: it restores the
+# remote's and builds PTheory.
+worker stale-deps "$spec_p"
+expect stale-deps 0 "spec=$spec_p" "status=built"
+
+# The worker's MTheory doesn't fit the remote's NTheory, which it doesn't
+# hold: it restores the remote's MTheory rather than building it.
+rm "$tmpdir/worker-stale-own/actions/$key_n/manifest"
+worker stale-own "$spec_m"
+expect stale-own 0 "spec=$spec_m" "status=cached"
