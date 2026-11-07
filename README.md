@@ -1126,8 +1126,10 @@ SHA-256, restores every dependency through the normal cache restore and its
 checks, and reports `cached` if the theory's own entry already restores.
 Otherwise it builds the theory as a local build would, with the spec's proof
 options, and checks that the remote cache then holds an entry for it whose
-outputs equal the build's. A missing dependency fails the action; the worker
-never builds one.
+outputs equal the build's. An entry there with other outputs is replaced only
+when it records parents other than the restored ones, since no build against
+them can use it. A missing dependency fails the action; the worker never
+builds one.
 
 It writes this record to `--result FILE`, or to stdout:
 
@@ -1217,7 +1219,13 @@ how many they finished.
 
 The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the
-batch, or the batch fails, it warns and builds locally. An event stream that
+batch, or the batch fails, it warns and builds locally. A theory the remote
+cache holds may not fit the parents it holds, as when a nondeterministic
+theory was built twice; the workers can't use it, and the coordinator fails
+the batch for resubmission naming it (`resubmit: ... theory <input_key>`).
+Such a batch is resubmitted once first, with that theory and every theory
+that depends on it, for the workers to rebuild or recheck against the cached
+parents. An event stream that
 breaks is reattached; one that stays unreachable through four reattaches
 (about 15 seconds of backoff) is given up on. When the build stops following
 a batch that may still run (the stream was given up on, or the coordinator

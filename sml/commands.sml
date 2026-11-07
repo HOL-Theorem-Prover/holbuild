@@ -1298,7 +1298,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       let val ({plan, toolchain_key, ...}, build_options) = plan_build ()
       in
         timed_phase "action_spec.export"
-          (fn () => print (HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key upload))
+          (fn () => print (HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key upload []))
       end
     (* Theories the remote cache lacks go to the coordinator as a batch; once
        it finishes, the ordinary build restores them from the remote cache. *)
@@ -1308,9 +1308,9 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           if Option.isSome (HolbuildRemoteCacheConfig.url ()) then ()
           else raise Error "--remote-exec needs a remote cache: pass --remote-cache URL"
         val ({plan, toolchain_key, ...}, build_options) = plan_build ()
-        fun export upload =
+        fun export forced =
           timed_phase "action_spec.export"
-            (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key upload)
+            (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key true forced)
         fun batch_keys batch =
           List.mapPartial (fn line => case String.tokens Char.isSpace line of
                                           "action" :: key :: _ => SOME key
@@ -1355,13 +1355,35 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             if remote_only then follow_batch ()
             else HolbuildRemoteExec.while_followed url batch_id follow_batch
           end
-        fun finish in_batch batch_id =
+        (* A theory the remote cache holds may not fit the parents it holds,
+           as when a nondeterministic theory was built twice; the workers
+           then can't use it, and the coordinator fails the batch for
+           resubmission naming it.  It is resubmitted once, with that theory
+           and every theory that depends on it in the batch, for the workers
+           to rebuild or recheck against the cached parents. *)
+        fun finish resubmit in_batch batch_id =
           case follow in_batch batch_id of
               (HolbuildRemoteExec.Done, progress) =>
                 (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ finished progress ^ "\n");
                  build_locally ())
             | (HolbuildRemoteExec.Failed reason, progress) =>
-                fall_back ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress)
+                let
+                  val reason = "batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress
+                  val forced =
+                    case (resubmit, HolbuildRemoteExec.resubmit_theory_key reason) of
+                        (true, SOME missing) =>
+                          HolbuildBuildExec.theory_keys_depending_on build_options tc project plan toolchain_key missing
+                      | _ => []
+                in
+                  if null forced then fall_back reason
+                  else
+                    (HolbuildStatus.message_stderr
+                       ("holbuild: remote execution: " ^ reason ^ "; resubmitting with " ^
+                        Int.toString (length forced) ^ " theories rebuilt or rechecked\n");
+                     (* Their local entries may be the ones that don't fit. *)
+                     HolbuildBuildExec.drop_local_cache_entries forced;
+                     export_and_submit false forced)
+                end
             | (HolbuildRemoteExec.Cancelled, progress) =>
                 let val reason = "batch " ^ batch_id ^ " cancelled; " ^ finished progress
                 in
@@ -1375,7 +1397,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 if remote_only
                 then fall_back (reason ^ "; " ^ finished progress ^ "; reattach with --attach " ^ batch_id)
                 else abandon batch_id (reason ^ "; " ^ finished progress)
-        fun submit batch =
+        and submit resubmit batch =
           if null (batch_keys batch) then
             (HolbuildStatus.message_stderr "holbuild: remote execution: the remote cache has every theory\n";
              build_locally ())
@@ -1384,7 +1406,12 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 HolbuildRemoteExec.Refused reason => fall_back reason
               | HolbuildRemoteExec.Ok batch_id =>
                   (HolbuildStatus.message_stderr ("holbuild: remote batch " ^ batch_id ^ "\n");
-                   if detach then () else finish (SOME (batch_keys batch)) batch_id)
+                   if detach then () else finish resubmit (SOME (batch_keys batch)) batch_id)
+        and export_and_submit resubmit forced =
+          case HolbuildRemoteExec.Ok (export forced)
+               handle HolbuildBuildExec.Error reason => HolbuildRemoteExec.Refused reason of
+              HolbuildRemoteExec.Ok batch => submit resubmit batch
+            | HolbuildRemoteExec.Refused reason => fall_back reason
         (* A theory that writes SML sources runs before the rest of the build
            is planned (execute_build), which neither a batch nor the restore
            build of this plan does.  Under --remote-only, execute_build only
@@ -1402,12 +1429,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
            execute_build ())
         else
           case attach of
-              SOME batch_id => finish NONE batch_id
-            | NONE =>
-                (case HolbuildRemoteExec.Ok (export true)
-                      handle HolbuildBuildExec.Error reason => HolbuildRemoteExec.Refused reason of
-                     HolbuildRemoteExec.Ok batch => submit batch
-                   | HolbuildRemoteExec.Refused reason => fall_back reason)
+              SOME batch_id => finish true NONE batch_id
+            | NONE => export_and_submit true []
       end
     fun run_with_stat_cache f =
       (f (); finish_stat_cache stat_cache)

@@ -107,6 +107,28 @@ fun submit url batch_text : attempt =
     else Refused ("coordinator refused the batch (HTTP " ^ Int.toString status ^ "): " ^ text)
   end
 
+(* The input key of the theory a failed batch's workers could not use, when
+   the coordinator failed it for resubmission naming the theory as
+   "theory <input_key>". *)
+fun resubmit_theory_key reason =
+  case HolbuildStatus.find_substring "resubmit: " reason of
+      NONE => NONE
+    | SOME start =>
+        let
+          fun scan text =
+            case HolbuildStatus.find_substring "theory " text of
+                NONE => NONE
+              | SOME i =>
+                  let
+                    val rest = String.extract (text, i + size "theory ", NONE)
+                    val key = Substring.string (Substring.takel Char.isHexDigit (Substring.full rest))
+                  in
+                    if HolbuildHash.valid_hex 64 key then SOME key else scan rest
+                  end
+        in
+          scan (String.extract (reason, start, NONE))
+        end
+
 fun report_action line =
   let
     val field = fn name => json_string_field name line

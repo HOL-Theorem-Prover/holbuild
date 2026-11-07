@@ -39,7 +39,8 @@ awk '\$1 == "action" { print \$4, \$5 }' "\$1" | while read -r spec theory; do
   echo "\$theory" >> "$state/ran"
   HOLBUILD_CACHE="$tmpdir/worker-cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" \
     exec-action "\$spec" --cache-limit-gb 1000 --result "$tmpdir/worker.result" \
-    >> "$tmpdir/worker.log" 2>&1
+    >> "$tmpdir/worker.log" 2>&1 ||
+    { sed -n 's/^missing=theory //p' "$tmpdir/worker.result" > "$state/missing"; exit 1; }
 done
 SH
 chmod +x "$tmpdir/run-batch"
@@ -494,3 +495,63 @@ run cancelled 0 build --remote-exec "$coordinator" BTheory
 require_grep "batch b[0-9]* cancelled; remote workers finished 0 of 2 theories; building locally" "$tmpdir/cancelled.log"
 require_grep "BTheory built" "$tmpdir/cancelled.log"
 rm "$state/cancelled"
+
+# A theory the remote cache holds that doesn't fit its cached parent, as
+# when a nondeterministic parent was built twice: the workers can't use it,
+# so the batch is resubmitted with it and its dependents, whose workers
+# rebuild it and replace its entry.
+nondet=$tmpdir/nondet
+mkdir -p "$nondet/src"
+cat > "$nondet/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxnd"
+
+[build]
+members = ["src"]
+TOML
+cat > "$nondet/src/NScript.sml" <<'SML'
+Theory N
+Ancestors bool
+
+val _ = save_thm ("n" ^ LargeInt.toString (Time.toMicroseconds (Time.now ())), TRUTH);
+SML
+for theory in M:N P:M; do
+  cat > "$nondet/src/${theory%%:*}Script.sml" <<SML
+Theory ${theory%%:*}
+Ancestors ${theory##*:}
+
+Theorem ${theory%%:*}_thm:
+  T
+Proof
+  simp[]
+QED
+SML
+done
+hn() {
+  (cd "$nondet" && "$HOLBUILD_BIN" --remote-cache "$remote_url" "$@")
+}
+n_ac=$(hn action-spec MTheory | awk '$1 == "action" && $5 == "rxnd:NTheory" { print $3 }')
+[[ -n $n_ac ]] || { echo "no action for NTheory" >&2; exit 1; }
+hn build MTheory > "$tmpdir/nondet-first.log" 2>&1 || { cat "$tmpdir/nondet-first.log" >&2; exit 1; }
+rm "$remote_root/ac/$n_ac"
+# A fresh copy of the project, with a cache of its own, builds NTheory again.
+mkdir -p "$tmpdir/nondet-again"
+cp -r "$nondet/src" "$nondet/holproject.toml" "$tmpdir/nondet-again/"
+link_hol_toolchain_cache "$tmpdir/nondet-again-cache"
+(cd "$tmpdir/nondet-again" && HOLBUILD_CACHE=$tmpdir/nondet-again-cache \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" build NTheory) > "$tmpdir/nondet-again.log" 2>&1 ||
+  { cat "$tmpdir/nondet-again.log" >&2; exit 1; }
+require_grep "NTheory built" "$tmpdir/nondet-again.log"
+mkdir -p "$tmpdir/nondet-client"
+cp -r "$nondet/src" "$nondet/holproject.toml" "$tmpdir/nondet-client/"
+nondet=$tmpdir/nondet-client
+link_hol_toolchain_cache "$tmpdir/nondet-client-cache"
+HOLBUILD_CACHE=$tmpdir/nondet-client-cache hn build --remote-exec "$coordinator" --remote-only PTheory \
+  > "$tmpdir/nondet.log" 2>&1 || { cat "$tmpdir/nondet.log" "$tmpdir/worker.log" >&2; exit 1; }
+require_grep "failed: resubmit: .*; resubmitting with 2 theories rebuilt or rechecked" "$tmpdir/nondet.log"
+require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/nondet.log"
+require_grep "MTheory restored from cache" "$tmpdir/nondet.log"
+require_grep "PTheory restored from cache" "$tmpdir/nondet.log"
+refute_grep "Theory built" "$tmpdir/nondet.log"
+require_grep "replacing remote cache entry .*: its recorded parents differ from the cache's" "$tmpdir/worker.log"

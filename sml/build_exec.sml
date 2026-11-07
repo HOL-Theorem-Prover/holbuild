@@ -5649,9 +5649,34 @@ fun publish_spec_blob remote path =
     | HolbuildCacheBackend.Conflict message => raise Error ("could not upload " ^ path ^ ": " ^ message)
     | HolbuildCacheBackend.Skipped => raise Error ("could not upload " ^ path ^ ": skipped")
 
+(* The input keys of the plan's theories whose input key is missing or that
+   depend on that theory. *)
+fun theory_keys_depending_on (options : build_options) tc project plan toolchain_key missing =
+  let
+    val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
+                 (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
+    val key_of = HolbuildBuildPlan.input_key_for keys
+    fun depends node =
+      key_of node = missing orelse
+      List.exists (fn dep => key_of dep = missing) (HolbuildBuildPlan.transitive_project_deps plan node)
+  in
+    map key_of (List.filter (fn node => is_theory_node node andalso depends node) (HolbuildBuildPlan.selected_nodes plan))
+  end
+
+(* Drops the local cache's entries for keys, so that a build restores them
+   from the remote cache. *)
+fun drop_local_cache_entries keys =
+  let val root = cache_root ()
+  in
+    List.app (fn key => HolbuildCache.with_action_publish_lock_wait root key
+                          (fn () => HolbuildCache.remove_action root key))
+             keys
+  end
+
 (* Writes the ActionSpec of every theory in the plan the remote cache can't
-   satisfy, uploads them and their sources with upload, and returns the batch. *)
-fun export_action_specs (options : build_options) tc project plan toolchain_key upload =
+   satisfy, or whose input key is in forced, uploads them and their sources
+   with upload, and returns the batch. *)
+fun export_action_specs (options : build_options) tc project plan toolchain_key upload forced =
   let
     val remote =
       case HolbuildRemoteCacheConfig.url () of
@@ -5684,6 +5709,7 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
     val uncached_actions =
       List.filter
         (fn (node, action) =>
+            List.exists (fn key => key = #input_key action) forced orelse
             not (remote_entry_satisfies remote options project plan node (#input_key action)))
         actions
     val uncached_keys = map (HolbuildBuildPlan.key o #1) uncached_actions
@@ -6133,11 +6159,28 @@ fun action_already_done root (spec : action_spec) =
     handle _ => false
   end
 
-(* Uploads every blob of the local entry for key, raising if one fails (the
-   build's own publish only warns), then puts the action.  A different entry
-   already there is left for check_remote_publication to judge. *)
-fun publish_action_entry remote key =
+(* Whether the remote's entry for the action, given by its manifest, records
+   parents other than those restored in the action root: no build that
+   restores them can use it. *)
+fun resident_misfits_parents remote root (spec : action_spec) resident =
   let
+    val {dat_hash, ...} = cache_manifest_blobs_from_lines (#input_key spec) (cache_manifest_lines resident)
+    val path = in_root root ".holbuild/resident.dat"
+  in
+    ensure_parent path;
+    case HolbuildRemoteCache.fetch_blob remote {hash = dat_hash, dst = path} of
+        HolbuildCacheBackend.Hit => not (spec_parent_hashes_match root spec path)
+      | _ => false
+  end
+  handle _ => false
+
+(* Uploads every blob of the local entry for the action, raising if one fails
+   (the build's own publish only warns), then puts the action.  A different
+   entry already there is replaced when it records parents other than the
+   restored ones, and otherwise left for check_remote_publication to judge. *)
+fun publish_action_entry remote root (spec : action_spec) =
+  let
+    val key = #input_key spec
     val local_cache = HolbuildFSCacheBackend.filesystem (cache_root ())
     val source = fs_cache_source local_cache
     val destination = remote_cache_destination remote
@@ -6151,16 +6194,25 @@ fun publish_action_entry remote key =
     (List.app (fn hash => ignore (HolbuildCacheTransfer.copy_blob source destination tmp_dir hash (0, 0)))
        (HolbuildCacheTransfer.unique_blobs manifest)
      handle e => raise action_failed PublishFailure ("could not publish the entry: " ^ General.exnMessage e));
+    case HolbuildRemoteCache.get_action remote key of
+        SOME resident =>
+          if not (cache_manifest_outputs_equal key resident manifest handle _ => false) andalso
+             resident_misfits_parents remote root spec resident
+          then
+            (warn ("replacing remote cache entry " ^ key ^ ": its recorded parents differ from the cache's");
+             ignore (HolbuildRemoteCache.replace_action_unconditionally remote {key = key, text = manifest}))
+          else ()
+      | NONE => ();
     ignore (#put_action destination HolbuildCacheBackend.PutIfAbsentOrSame {key = key, text = manifest})
   end
 
 (* Step 6: publish the entry, then check that the remote holds an entry for
    the action with this build's outputs and a timeout contract at least as
    strict as the spec's. *)
-fun check_remote_publication remote (spec : action_spec) =
+fun check_remote_publication remote root (spec : action_spec) =
   let
     val key = #input_key spec
-    val _ = publish_action_entry remote key
+    val _ = publish_action_entry remote root spec
     val local_manifest = HolbuildCache.get_action (cache_root ()) key
     val remote_manifest = HolbuildRemoteCache.get_action remote key
     fun fail msg = raise ActionFailed (PublishFailure, msg)
@@ -6970,7 +7022,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
         if action_already_done root spec then
           (* The entry may have come from the worker's local cache, so make
              sure the remote, where the result counts, holds it too. *)
-          (check_remote_publication remote spec;
+          (check_remote_publication remote root spec;
            "cached")
         else
           let
@@ -7022,7 +7074,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                     (classify_run_failure stage log_text oom_before msg, msg)
                 end
             val _ = peak := peak_rss_mb stage
-            val _ = check_remote_publication remote spec
+            val _ = check_remote_publication remote root spec
           in
             "built"
           end
