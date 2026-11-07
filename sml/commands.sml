@@ -56,7 +56,7 @@ fun global_help () = print
   \  --quiet, --verbose, --verbosity LEVEL\n\
   \  -j N, -jN, --jobs N\n\
   \  --max-heap MB\n\
-  \  --prefetch-concurrency N     Remote cache entries to prefetch at once\n\
+  \  --prefetch-concurrency N     Remote cache checks/prefetches at once\n\
   \                               (default: 50 or 2 * jobs, whichever is larger)\n\
   \  --cooperate-dir DIR          Share a machine memory budget with other holbuild\n\
   \                               processes using DIR (or $HOLBUILD_COOPERATE_DIR)\n\
@@ -1302,7 +1302,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       let val ({plan, toolchain_key, ...}, build_options) = plan_build ()
       in
         timed_phase "action_spec.export"
-          (fn () => print (HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key
+          (fn () => print (HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key jobs
                              {upload = upload, local_resumable = false, remote_only = false}))
       end
     (* Theories the remote cache lacks go to the coordinator as a batch; once
@@ -1315,7 +1315,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         val ({plan, toolchain_key, ...}, build_options) = plan_build ()
         fun export upload =
           timed_phase "action_spec.export"
-            (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key
+            (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key jobs
                         {upload = upload, local_resumable = not detach, remote_only = remote_only})
         fun batch_keys batch =
           List.mapPartial (fn line => case String.tokens Char.isSpace line of
