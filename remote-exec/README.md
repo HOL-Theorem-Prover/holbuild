@@ -51,6 +51,11 @@ runs finish and cancel queued run batches. Use the current image to run
 `alembic downgrade 0004` before starting the older image, whose migration
 code does not know revision `0005`.
 
+Migration `0007` adds a nullable `batches.max_heap_mb` column. Old clients
+leave it null; new workers use their default when an old coordinator omits
+it from a claim. Before rolling back to an older image, use the current image
+to run `alembic downgrade 0006`.
+
 Migration `0006` adds a nullable column for each action's phase timings.
 To roll back to an image predating `0006`, use the current image to run
 `alembic downgrade 0005` first, then run the older image's `migrate` and
@@ -121,8 +126,8 @@ out of the builds' environment (and out of what they log or pass on). A
 build runs as the worker's user, so one that goes looking can still read the
 token from the worker's `/proc/<pid>/environ`. Outside the image,
 `python3 -m remote_exec.worker` runs the worker; it uses only the standard
-library and `curl`. High-tier workers run with a larger `--max-heap` on bigger
-machines; `--also-claim standard` lets them take standard-tier work when no
+library and `curl`. A batch can override the worker's `--max-heap` default
+(12000 MB); `--also-claim standard` lets them take standard-tier work when no
 high-tier action is ready. With `--cooperate-dir`, a worker claims only while
 holbuild's memory admission in that directory would start one more child
 there, so an action a busy host couldn't start yet stays at the coordinator
@@ -165,6 +170,12 @@ holbuild-action-batch-v1
 action <input_key> <ac-key> <spec-sha256> <package>:<theory>
 edge <input_key> <parent input_key>
 ```
+
+The client sends its `--max-heap MB` as the optional positive integer query
+parameter `max_heap_mb` on `POST /v1/batches`. The coordinator stores it with
+the batch and returns it on `/v1/work/claim`; workers pass it to `exec-action`.
+When absent or null, the worker uses its own `--max-heap` setting. This limit
+is execution policy and does not change action keys.
 
 A batch has one class: `build` (the default) or `run`, selected with
 `POST /v1/batches?class=run`. Run actions execute submitted scripts in cached

@@ -233,30 +233,43 @@ def claim() -> dict[str, object]:
     return {"attempt_token": "t1", "spec_sha256": SPEC, "input_key": "6" * 64, "theory": "pkg:A", "lease_s": 3}
 
 
+@pytest.mark.parametrize(
+    ("worker_heap", "batch_heap", "expected_heap"),
+    [(None, None, 12000), (14000, None, 14000), (14000, 4096, 4096), (None, 16000, 16000)],
+)
 def test_worker_runs_the_action_on_the_release_that_exported_it(
-    tmp_path: Path, server: Server, logs: tuple[Path, Path]
+    tmp_path: Path,
+    server: Server,
+    logs: tuple[Path, Path],
+    worker_heap: int | None,
+    batch_heap: int | None,
+    expected_heap: int,
 ) -> None:
     release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
     server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
     switch = tmp_path / "protect"
     switch.write_text(f'#!/bin/sh\necho "$1" >> {tmp_path}/protection\n')
     switch.chmod(0o755)
-    args = worker_args(tmp_path, server, "--protection-cmd", str(switch))
+    extra = [] if worker_heap is None else ["--max-heap", str(worker_heap)]
+    args = worker_args(tmp_path, server, "--protection-cmd", str(switch), *extra)
+    claimed = {**claim(), "max_heap_mb": batch_heap}
 
     run_one(
-        Coordinator(server.url, "w"), args, releases(tmp_path, server), Protection(str(switch), None), claim(), Phases()
+        Coordinator(server.url, "w"), args, releases(tmp_path, server), Protection(str(switch), None), claimed, Phases()
     )
 
     assert server.completed == [RECORD]
     assert logs[1].read_text().split() == [
         "--remote-cache",
         server.url,
+        "--max-heap",
+        str(expected_heap),
         "exec-action",
         SPEC,
         "--cache-limit-gb",
         "50",
         "--result",
-        logs[1].read_text().split()[7],
+        logs[1].read_text().split()[9],
         "--share-heaps",
     ]
     *held, released = (tmp_path / "protection").read_text().split()

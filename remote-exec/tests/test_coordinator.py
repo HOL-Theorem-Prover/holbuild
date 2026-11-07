@@ -1477,3 +1477,26 @@ def test_cache_ring_identity_ignores_credentials_but_preserves_request_urls() ->
         assert ranked_nodes(authenticated, digest) == [
             url.replace("://", "://user:pass@") for url in ranked_nodes(bare, digest)
         ]
+
+
+@pytest.mark.parametrize("action_class", ["build", "run"])
+@pytest.mark.parametrize("max_heap_mb", [None, 4096, 16000])
+async def test_claim_carries_its_batch_heap_limit(
+    http: httpx.AsyncClient, action_class: str, max_heap_mb: int | None
+) -> None:
+    params = {"class": action_class}
+    if max_heap_mb is not None:
+        params["max_heap_mb"] = str(max_heap_mb)
+    await submit(http, ["A", "B"], **params)
+    first, second = await claim(http), await claim(http)
+    assert first is not None and second is not None
+    assert first["max_heap_mb"] == second["max_heap_mb"] == max_heap_mb
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "bad", "2147483648"])
+async def test_submit_rejects_invalid_heap_limit(http: httpx.AsyncClient, value: str) -> None:
+    response = await http.post(
+        "/v1/batches", params={"max_heap_mb": value}, content=batch_text(["A"]), headers=CLIENT
+    )
+    assert response.status_code == 422
+    assert await claim(http) is None
