@@ -69,13 +69,19 @@ stored=$(find "$store" -name deps_loaded.save -samefile "$first_heap")
 
 # With the first tree gone, the second resumes from the store's heaps and
 # builds the same outputs: nothing in the heap points into the deleted tree.
+stored_id=$(stat -c %d:%i "$stored")
 rm -rf "$first"
 (cd "$second" && "$HOLBUILD_BIN" build --no-cache BTheory) > "$tmpdir/second.log" 2>&1 \
   || { cat "$tmpdir/second.log" >&2; exit 1; }
 grep -A1 '^resuming BTheory' "$tmpdir/second.log" | grep -q 'from: deps-loaded checkpoint' \
   || { echo "the second tree did not resume B from the shared deps heap" >&2; cat "$tmpdir/second.log" >&2; exit 1; }
-[[ "$(deps_heap "$second" B)" -ef "$stored" ]] \
-  || { echo "the second tree's deps heap is a copy, not the store's" >&2; exit 1; }
+if grep -q 'discarding invalid checkpoint' "$tmpdir/second.log"; then
+  echo "the second tree could not resume from the shared deps heap" >&2
+  cat "$tmpdir/second.log" >&2
+  exit 1
+fi
+[[ "$(stat -c %d:%i "$(deps_heap "$second" B)")" == "$stored_id" ]] \
+  || { echo "the second tree's deps heap is not the stored one" >&2; exit 1; }
 if [[ "$first_outputs" != "$(outputs "$second")" ]]; then
   echo "a shared deps heap changed theory outputs" >&2
   exit 1
@@ -100,15 +106,18 @@ fi
 fourth=$tmpdir/fourth
 make_tree "$fourth"
 sed -i 's/ACCEPT_TAC helperLib.helper_thm/NO_TAC/' "$fourth/src/BScript.sml"
-good_size=$(stat -c %s "$stored")
-head -c $((good_size * 9 / 10)) "$stored" > "$tmpdir/truncated"
-mv "$tmpdir/truncated" "$stored"
-truncated_sum=$(sha256sum < "$stored")
+# Poly/ML checks the parent's time stamp in the header (bytes 68-75 on
+# 64-bit hosts) when it loads the state, not when it reads the parent name.
+cp "$stored" "$tmpdir/stale"
+printf '\xff\xff\xff\xff' | dd of="$tmpdir/stale" bs=1 seek=68 conv=notrunc status=none
+mv "$tmpdir/stale" "$stored"
+stale_sum=$(sha256sum < "$stored")
 if (cd "$fourth" && "$HOLBUILD_BIN" build --no-cache BTheory) > "$tmpdir/fourth.log" 2>&1; then
   echo "the failing theory built" >&2
   exit 1
 fi
-[[ "$(sha256sum < "$stored")" != "$truncated_sum" ]] \
+require_grep 'discarding invalid checkpoint after HOL state load failure' "$tmpdir/fourth.log"
+[[ "$(sha256sum < "$stored")" != "$stale_sum" ]] \
   || { echo "a failed build kept a stored heap HOL could not resume from" >&2; cat "$tmpdir/fourth.log" >&2; exit 1; }
 [[ "$(deps_heap "$fourth" B)" -ef "$stored" ]] \
   || { echo "the store does not hold the failed build's fresh heap" >&2; exit 1; }

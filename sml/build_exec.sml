@@ -4402,33 +4402,36 @@ fun local_heap_location tc heap_context action =
     {store = store, heap = heap, stored = store_path store heap "deps_loaded.save"}
   end
 
-fun same_file a b =
-  let val (sa, sb) = (Posix.FileSys.stat a, Posix.FileSys.stat b)
-  in Posix.FileSys.ST.dev sa = Posix.FileSys.ST.dev sb andalso Posix.FileSys.ST.ino sa = Posix.FileSys.ST.ino sb end
-  handle OS.SysErr _ => false
+fun file_id path =
+  let val st = Posix.FileSys.stat path
+  in SOME (Posix.FileSys.ST.dev st, Posix.FileSys.ST.ino st) end
+  handle OS.SysErr _ => NONE
 
-(* Links a valid deps_loaded into the store: if the store has none, or, with
-   `replace`, a different one, as after a build this heap served. *)
-fun store_local_heap replace tc heap_context (action : theory_action) deps_loaded =
-  (if not (deps_checkpoint_exists deps_loaded (#deps_key action)) then ()
-   else
-     let val {store, heap, stored} = local_heap_location tc heap_context action
-     in
-       lease_store_family store heap;
-       if file_exists stored andalso (not replace orelse same_file stored deps_loaded) then
-         touch_dir (Path.concat(store, heap))
-       else
-         let val tmp = store_temp stored
-         in
-           (ensure_parent tmp; link_or_copy_file deps_loaded tmp; FS.rename {old = tmp, new = stored})
-           handle e => (remove_file tmp; raise e)
-         end
-     end)
+(* After a theory runs, given its deps_loaded's file prior the run: a heap
+   the run saved goes into the store, replacing what is there; if the run
+   discarded the heap it started from and saved none, the store loses that
+   heap too.  A heap the run didn't touch stays as it is: it may hold an
+   earlier runtime than the key says. *)
+fun publish_local_heap tc heap_context (action : theory_action) deps_loaded prior =
+  let
+    val now = file_id deps_loaded
+    val {store, heap, stored} = local_heap_location tc heap_context action
+  in
+    if now = prior then ()
+    else if deps_checkpoint_exists deps_loaded (#deps_key action) then
+      let val tmp = store_temp stored
+      in
+        lease_store_family store heap;
+        (ensure_parent tmp; link_or_copy_file deps_loaded tmp; FS.rename {old = tmp, new = stored})
+        handle e => (remove_file tmp; raise e)
+      end
+    else if Option.isSome prior andalso file_id stored = prior then remove_file stored
+    else ()
+  end
   handle e => warn ("could not add a deps heap to the host store: " ^ General.exnMessage e)
 
 (* Before a theory runs: a missing deps_loaded comes from the store, if it
-   holds one whose parent is this build's base state; one the theory has is
-   added to the store. *)
+   holds one whose parent is this build's base state. *)
 fun restore_local_heap tc heap_context base_context checkpoint_root (action : theory_action) =
   let
     val base = action_checkpoint_base checkpoint_root action
@@ -4441,8 +4444,7 @@ fun restore_local_heap tc heap_context base_context checkpoint_root (action : th
             (FS.fullPath parent = FS.fullPath (hol_context_path base_context) handle OS.SysErr _ => false)
         | NONE => false
   in
-    if deps_checkpoint_exists deps_loaded deps_key then store_local_heap false tc heap_context action deps_loaded
-    else if not (file_exists stored) then ()
+    if deps_checkpoint_exists deps_loaded deps_key orelse not (file_exists stored) then ()
     else
       ((* Checkpoints on an earlier deps_loaded aren't children of this one. *)
        remove_deps_checkpoint_descendants base deps_key;
@@ -4474,12 +4476,12 @@ fun build_theory dat_hash_cache cache_allowed policy tc project base_context pla
     val _ =
       Option.app (fn heap_context => restore_local_heap tc heap_context base_context checkpoint_root action)
                  heap_context
+    val deps_loaded = deps_loaded_path (action_checkpoint_base checkpoint_root action) (#deps_key action)
+    val prior = file_id deps_loaded
     (* Also after a failure: a stored heap HOL couldn't resume from was
        replaced here by a fresh one, which the store takes in its place. *)
     fun publish_heap () =
-      Option.app (fn heap_context =>
-                     store_local_heap true tc heap_context action
-                       (deps_loaded_path (action_checkpoint_base checkpoint_root action) (#deps_key action)))
+      Option.app (fn heap_context => publish_local_heap tc heap_context action deps_loaded prior)
                  heap_context
     val generated_metadata =
       build_theory_action cache_allowed policy tc root checkpoint_root base_context action
