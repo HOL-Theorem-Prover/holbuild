@@ -70,16 +70,17 @@ fun discard_checkpoint path =
    remove_file (ok_path path);
    remove_file path)
 
-(* Runs F with the load path's entries under ROOT taken out.  HOL puts every
-   project directory on the load path when it starts, so a heap saved with
-   them would search this tree from any other tree that resumes from it; one
-   that starts from the heap adds its own again. *)
-fun without_load_path_under root f =
+(* Runs F with only the toolchain's entries on the load path.  HOL adds the
+   project's directories (and its external includes) when it starts, so a
+   heap saved with them would search this tree from any other tree that
+   resumes from it; one that starts from the heap adds its own again. *)
+fun with_toolchain_load_path f =
   let
     val path = !Meta.loadPath
-    fun under dir = dir = root orelse String.isPrefix (root ^ "/") dir
+    val holdir = Systeml.HOLDIR
+    fun toolchain dir = dir = holdir orelse String.isPrefix (holdir ^ "/") dir
   in
-    Meta.loadPath := List.filter (not o under) path;
+    Meta.loadPath := List.filter toolchain path;
     (f () handle e => (Meta.loadPath := path; raise e));
     Meta.loadPath := path
   end

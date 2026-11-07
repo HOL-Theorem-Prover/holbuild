@@ -71,15 +71,20 @@ stored=$(find "$store" -name deps_loaded.save -samefile "$first_heap")
 [[ -n "$stored" ]] || { echo "B's deps heap is not linked into the store" >&2; find "$store" >&2; exit 1; }
 
 # HOL puts the project's directories on the load path when it starts; the
-# stored heap must not keep the first tree's, or a later load in another tree
-# could find files in this one.
+# stored heap keeps only the toolchain's entries, so a later load in another
+# tree can't find files in this one.
 mkdir -p "$tmpdir/elsewhere"
-printf 'val _ = app (fn d => print ("loadpath " ^ d ^ "\\n")) (!Meta.loadPath);\n' > "$tmpdir/loadpath.sml"
+cat > "$tmpdir/loadpath.sml" <<'SML'
+val _ = print ("holdir " ^ Systeml.HOLDIR ^ "\n");
+val _ = app (fn d => print ("loadpath " ^ d ^ "\n")) (!Meta.loadPath);
+SML
 (cd "$tmpdir/elsewhere" && "$HOLDIR/bin/hol" run --noconfig --holstate "$stored" "$tmpdir/loadpath.sml") \
   > "$tmpdir/loadpath.log" 2>&1 || { cat "$tmpdir/loadpath.log" >&2; exit 1; }
-require_grep '^loadpath ' "$tmpdir/loadpath.log"
-if grep -q -e "^loadpath $first" -e "^loadpath $(cd "$first" && pwd -P)" "$tmpdir/loadpath.log"; then
-  echo "the stored heap's load path names the tree that saved it" >&2
+holdir=$(sed -n 's/^holdir //p' "$tmpdir/loadpath.log")
+[[ -n "$holdir" ]] || { cat "$tmpdir/loadpath.log" >&2; exit 1; }
+require_grep "^loadpath $holdir/sigobj\$" "$tmpdir/loadpath.log"
+if grep '^loadpath ' "$tmpdir/loadpath.log" | grep -v -e "^loadpath $holdir/" -e "^loadpath $holdir\$" | grep -q .; then
+  echo "the stored heap's load path has entries outside the toolchain" >&2
   cat "$tmpdir/loadpath.log" >&2
   exit 1
 fi

@@ -307,18 +307,17 @@ fun preload_loads root plan node =
   map (fn dep => LoadObject (root_relative root (load_stem dep)))
       (List.filter loadable_project_dep (project_preload_deps plan node))
 
-(* The deps heap leaves out the project's directories, which HOL put on the
-   load path: other trees of the project resume from it. *)
-fun write_preload root load_lines deps_loaded deps_ok path =
+(* The deps heap keeps only the toolchain's load path, not the project's
+   directories HOL put there: other trees of the project resume from it. *)
+fun write_preload load_lines deps_loaded deps_ok path =
   let
     val save = save_heap_expr {label = "deps_loaded", share_common_data = true,
                                output = deps_loaded, ok_text = deps_ok}
     val lines = runtime_line () ::
                 (load_lines @
                  [checkpoint_save_runtime_line (),
-                  "val _ = HolbuildCheckpointSaveRuntime.without_load_path_under " ^
-                  HolbuildToolchain.sml_string (FS.fullPath root handle OS.SysErr _ => root) ^
-                  " (fn () => " ^ save ^ ");"])
+                  "val _ = HolbuildCheckpointSaveRuntime.with_toolchain_load_path (fn () => " ^
+                  save ^ ");"])
   in
     write_text path (String.concatWith "\n" lines ^ "\n")
   end
@@ -3310,7 +3309,7 @@ fun write_theory_script policy root checkpoint_root base_context (action : theor
       fun run_from_fresh_preload () =
         (remove_deps_checkpoint_descendants base deps_key;
          ensure_source_checkpoint_parents ();
-         write_preload root load_lines deps_loaded deps_ok preload;
+         write_preload load_lines deps_loaded deps_ok preload;
          write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
          {context = base_context, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
       fun run_from_failed_prefix {checkpoint, step_count, metadata_text} =
