@@ -556,7 +556,16 @@ deps_output_key = hash(the output digest of every node in the transitive
 
 A theory's output digest covers what its dependents load: `Theory.dat`,
 `.sig` and `.sml`, its `.uo`/`.ui` load manifests (which carry its ML
-dependencies), its kernel trace if present, and its declared extra outputs. An
+dependencies), its kernel trace if present, and its declared extra outputs. The
+`.dat` counts by its digest rather than its bytes: the hash literal in
+`Theory.sml`, which the exporter sets to the SHA-1 of the data without the
+parts a proof edit changes (each theorem's dependency record and source
+location, and the parents' hashes), so an edit that changes only proofs leaves
+the digest, and with it every dependent, as it was. Children record that
+literal as the parent's hash and HOL's `link_parents` compares it at load, so
+a kept child still loads after its parent's proof-only edit. The `.dat` bytes
+stay as HOL wrote them, since other tools read the dependency records and
+locations. An
 ML library's load manifest names only its source, so a library's digest covers
 its own `self_input_key` as well as its objects and extra outputs; what it loads
 is in the closure with its own digest. When a theory's input key misses, but
@@ -582,8 +591,9 @@ stale.
 
 A remote worker (`exec-action`) makes the same decision once it has restored
 the action's dependencies. It hashes what the action loads from them, as
-restored in its action root: each dependency theory's `.dat`, `.sig`, `.sml`
-and load manifests, and the library sources and manifests the spec ships.
+restored in its action root: each dependency theory's `.dat` (by its digest,
+as above), `.sig`, `.sml` and load manifests, and the library sources and
+manifests the spec ships.
 With the action text, dependencies named but not keyed, that hash gives a pair
 key, and the remote cache maps the pair to the input key of the last build
 on it (an action entry `holbuild-early-cutoff-v1` with one `input-key=` line).
@@ -618,7 +628,7 @@ across machines rests on a reproducibility contract: a deterministic script,
 with its sources and extra inputs declared, under the same theory toolchain key,
 produces a byte-identical `Theory.dat` in any project directory and artifact
 cache. The exporter canonicalizes the parent header by theory name, preserving
-the remaining payload, and updates the embedded data hash in `Theory.sml`.
+the remaining payload, and writes the data's digest as the hash in `Theory.sml`.
 The generated parent load metadata uses the same order. Every action key
 includes `theory_manifest_version`, which changes whenever holbuild changes what
 a theory exports, so entries from exporters with different outputs never share
