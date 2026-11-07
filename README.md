@@ -1218,18 +1218,26 @@ workers finished, built or found cached (`holbuild: remote execution: remote
 workers finished 3 of 3 theories`), or, when the build falls back, why and
 how many they finished.
 
-A theory that no other theory in the batch depends on stays out of the batch
-when its local build would resume from one of its checkpoints (see
-[Proof steps and checkpoints](#proof-steps-and-checkpoints)): its
-`deps_loaded` checkpoint, on which every other checkpoint it resumes from
-sits, matches its current dependencies, which needs them built for their
-current sources. A worker has none of the project's checkpoints and would run
-it from scratch, so the build that follows the batch builds it locally
-instead, which is what an edit-and-rebuild loop on one theory needs. holbuild
-says so for each such theory (`holbuild: remote execution: rx:BTheory stays
-out of the batch, to resume from its local checkpoints`). With
-`--remote-only` it is not built: the line says to build it without
-`--remote-only`, and the build exits with status 75, as below. `--detach` submits every theory the remote cache lacks.
+A theory that no other theory in the batch depends on stays out of the batch,
+for the build that follows it to build locally, when either holds:
+
+- its local build would resume from one of its checkpoints (see
+  [Proof steps and checkpoints](#proof-steps-and-checkpoints)): its
+  `deps_loaded` checkpoint, on which every other checkpoint it resumes from
+  sits, matches its current dependencies;
+- every project theory it depends on is built here for its current source,
+  and it has at least one, or was itself built here before.
+
+A worker has none of the project's checkpoints, runs the theory from scratch
+and loads its dependencies from the cache. Built locally, it resumes from its
+checkpoints, or leaves them for the next build, which is what an
+edit-and-rebuild loop on one theory needs. holbuild says so for each such
+theory (`holbuild: remote execution: rx:BTheory stays out of the batch, to
+resume from its local checkpoints`, or `..., to build on its dependencies
+built here`). `--remote-only` builds nothing locally, so it sends the second
+kind to the workers. It doesn't build the first kind: the line says to build
+it without `--remote-only`, and the build exits with status 75, as below.
+`--detach` submits every theory the remote cache lacks.
 
 The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the

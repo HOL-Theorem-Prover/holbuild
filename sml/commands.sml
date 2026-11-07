@@ -107,7 +107,8 @@ fun build_help () = print
   \With --remote-exec, theories the remote cache lacks are built by the\n\
   \coordinator's workers and restored from the remote cache, except a\n\
   \theory nothing else in the batch depends on whose local checkpoints\n\
-  \are current, which builds locally (not with --detach). Needs\n\
+  \are current, or whose dependencies are built here, which builds\n\
+  \locally (not with --detach; see the README). Needs\n\
   \--remote-cache. A closure that can't run remotely or an unreachable\n\
   \coordinator builds locally; --remote-only fails instead, with exit\n\
   \status 75. --detach submits the batch and exits; --attach follows a\n\

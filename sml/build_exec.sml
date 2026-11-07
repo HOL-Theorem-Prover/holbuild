@@ -3959,20 +3959,25 @@ datatype run_from_state =
   DepsLoadedState of {path : string, load : string option}
 | NoRunFromState of string
 
-(* The key of NODE's dependency context as things stand, before anything is
-   built: the dependencies' outputs on disk can be older than their sources,
-   so key on them only when every one is built for its current source. *)
-fun current_dependency_context_key toolchain_key project plan keys node =
+(* Whether every project dependency of NODE is built here for its current
+   source, rather than older than it or not built. *)
+fun deps_built_for_current_sources project plan keys node =
   let
     fun built_for_current_source dep =
       case current_metadata (metadata_path project dep) of
           SOME text => metadata_input_key_matches (HolbuildBuildPlan.input_key_for keys dep) text
         | NONE => false
   in
-    if List.all built_for_current_source (HolbuildBuildPlan.transitive_project_deps plan node)
-    then dependency_context_key toolchain_key plan keys node
-    else dependency_input_context_key toolchain_key plan keys node
+    List.all built_for_current_source (HolbuildBuildPlan.transitive_project_deps plan node)
   end
+
+(* The key of NODE's dependency context as things stand, before anything is
+   built: the dependencies' outputs on disk can be older than their sources,
+   so key on them only when every one is built for its current source. *)
+fun current_dependency_context_key toolchain_key project plan keys node =
+  if deps_built_for_current_sources project plan keys node
+  then dependency_context_key toolchain_key plan keys node
+  else dependency_input_context_key toolchain_key plan keys node
 
 (* Checkpoints are current only for the keys a build of NODE would use now.
    Run holds no project lock, so this only reads checkpoint files; a build, gc
@@ -5760,10 +5765,14 @@ fun publish_spec_blob remote path =
 (* Writes the ActionSpec of every theory in the plan the remote cache can't
    satisfy, uploads them and their sources with upload, and returns the batch.
    With local_resumable, a leaf of the batch (no theory in it depends on it)
-   whose local build would resume from a checkpoint is left out, for the local
-   build that follows to build: that is faster than running it from scratch
-   on a worker, which has none of the project's checkpoints.  Under
-   remote_only, which builds nothing locally, the message says so. *)
+   is left out, for the local build that follows to build, when its local
+   build would resume from a checkpoint, or when its project dependencies are
+   all built here for their current sources (and it has some, or was built
+   here before).  Either is faster than running it on a worker, which loads
+   the dependencies from the cache and has none of the project's checkpoints,
+   and the local build leaves checkpoints for the next one.  remote_only
+   builds nothing locally, so under it only the first leaves are left out,
+   and the message says to build them without it. *)
 fun export_action_specs (options : build_options) tc project plan toolchain_key {upload, local_resumable, remote_only} =
   let
     val remote =
@@ -5806,10 +5815,23 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
        checkpoint for its current dependencies. *)
     fun resumable node =
       let val deps_key = current_dependency_context_key toolchain_key project plan keys node
-      in
-        checkpoint_enabled (checkpoint_policy_for_node options project node) andalso
-        deps_checkpoint_exists (deps_loaded_path (checkpoint_base project node) deps_key) deps_key
-      end
+      in deps_checkpoint_exists (deps_loaded_path (checkpoint_base project node) deps_key) deps_key end
+    (* A theory without project dependencies has them all built anywhere, so
+       it also needs a build of its own here, to be a theory worked on here. *)
+    fun deps_built_here node =
+      deps_built_for_current_sources project plan keys node andalso
+      (not (null (HolbuildBuildPlan.transitive_project_deps plan node)) orelse
+       isSome (current_metadata (metadata_path project node)))
+    fun local_reason parent_keys (node, _) =
+      if not (leaf parent_keys node andalso
+              checkpoint_enabled (checkpoint_policy_for_node options project node)) then NONE
+      else if resumable node then
+        SOME ("to resume from its local checkpoints" ^
+              (if remote_only then "; --remote-only builds nothing locally, so build it without --remote-only"
+               else ""))
+      else if not remote_only andalso deps_built_here node then
+        SOME "to build on its dependencies built here"
+      else NONE
     val (local_actions, uncached_actions) =
       if local_resumable then
         let
@@ -5818,17 +5840,17 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
                                  map HolbuildBuildPlan.key
                                      (uncached_parents plan (uncached_in uncached_actions) node))
                              uncached_actions)
+          val reasons = map (fn action => (action, local_reason parent_keys action)) uncached_actions
         in
-          List.partition (fn (node, _) => leaf parent_keys node andalso resumable node) uncached_actions
+          (List.mapPartial (fn ((node, _), SOME reason) => SOME (node, reason) | (_, NONE) => NONE) reasons,
+           List.mapPartial (fn (action, NONE) => SOME action | (_, SOME _) => NONE) reasons)
         end
       else ([], uncached_actions)
     val _ =
-      List.app (fn (node, _) =>
+      List.app (fn (node, reason) =>
                    HolbuildStatus.message_stderr
                      ("holbuild: remote execution: " ^ package node ^ ":" ^ logical_name node ^
-                      " stays out of the batch, to resume from its local checkpoints" ^
-                      (if remote_only then "; --remote-only builds nothing locally, so build it without --remote-only"
-                       else "") ^ "\n"))
+                      " stays out of the batch, " ^ reason ^ "\n"))
                local_actions
     val uncached = uncached_in uncached_actions
     val toolchain_line =
