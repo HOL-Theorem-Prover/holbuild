@@ -199,10 +199,10 @@ fun option_string_sml NONE = "NONE : string option"
 fun proof_ir_runtime_helper_path () =
   case OS.Process.getEnv "HOLBUILD_PROOF_IR_RUNTIME" of
       SOME path => path
-    | NONE => OS.Path.concat(HolbuildRuntimePaths.source_root, "sml/proof_runtime.sml")
+    | NONE => OS.Path.concat(HolbuildRuntimePaths.runtime_root (), "sml/proof_runtime.sml")
 
 fun source_helper_path relative =
-  OS.Path.concat(HolbuildRuntimePaths.source_root, relative)
+  OS.Path.concat(HolbuildRuntimePaths.runtime_root (), relative)
 
 fun sha256_runtime_helper_path () = source_helper_path "sml/sha256.sml"
 
@@ -212,7 +212,7 @@ fun tactic_compat_runtime_helper_path () =
   source_helper_path "sml/tactic_compat_runtime.sml"
 
 fun checkpoint_save_runtime_helper_path () =
-  OS.Path.concat(HolbuildRuntimePaths.source_root, "sml/checkpoint_save_runtime.sml")
+  OS.Path.concat(HolbuildRuntimePaths.runtime_root (), "sml/checkpoint_save_runtime.sml")
 
 fun declaration_checkpoint_runtime_prelude [] = ""
   | declaration_checkpoint_runtime_prelude _ =

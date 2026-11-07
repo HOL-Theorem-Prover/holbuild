@@ -459,7 +459,7 @@ fun touch_last_used k = write_file (last_used_for_key k) "" handle IO.Io _ => ()
 fun analyser_source_dir () =
   case OS.Process.getEnv "HOLBUILD_ANALYSER_SRC" of
       SOME path => path
-    | NONE => Path.concat(HolbuildRuntimePaths.source_root, "sml/analyser")
+    | NONE => Path.concat(HolbuildRuntimePaths.runtime_root (), "sml/analyser")
 
 val analyser_source_hash = memo_by (ref NONE) analyser_source_dir (fn dir =>
   HolbuildHash.string_sha256

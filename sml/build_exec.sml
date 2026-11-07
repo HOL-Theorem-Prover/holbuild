@@ -152,7 +152,7 @@ fun dependency_sml dep = one_with_suffix ".sml" (#generated (source_artifacts de
 fun dependency_sig dep = one_with_suffix ".sig" (#generated (source_artifacts dep))
 
 fun runtime_helper_path () =
-  Path.concat(HolbuildRuntimePaths.source_root, "sml/holbuild_runtime.sml")
+  Path.concat(HolbuildRuntimePaths.runtime_root (), "sml/holbuild_runtime.sml")
 
 fun runtime_line () =
   "use " ^ HolbuildToolchain.sml_string (runtime_helper_path ()) ^ ";"
@@ -256,7 +256,7 @@ fun checkpoint_ok_v1 () = HolbuildCheckpointStore.ok_v1 ()
 fun checkpoint_ok_text kind fields = HolbuildCheckpointStore.ok_text kind fields
 
 fun checkpoint_save_runtime_helper_path () =
-  Path.concat(HolbuildRuntimePaths.source_root, "sml/checkpoint_save_runtime.sml")
+  Path.concat(HolbuildRuntimePaths.runtime_root (), "sml/checkpoint_save_runtime.sml")
 
 fun checkpoint_save_runtime_line () =
   "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";"
@@ -5582,7 +5582,7 @@ val runtime_source_files =
 fun runtime_identity () =
   let
     fun line rel =
-      rel ^ " " ^ HolbuildHash.file_sha256 (Path.concat(HolbuildRuntimePaths.source_root, rel))
+      rel ^ " " ^ HolbuildHash.file_sha256 (Path.concat(HolbuildRuntimePaths.runtime_root (), rel))
   in
     HolbuildToolchain.hash_text
       (String.concatWith "\n"
