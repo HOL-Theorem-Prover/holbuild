@@ -104,12 +104,18 @@ struct
                         Cons(Cons(thy, Cons(Integer _, Cons(_, Cons(oracles, Symbol "nil")))),
                              Cons(terms, Cons(saved, Cons(Integer _, Symbol "nil")))))) =
             Cons(Symbol "tag-th", List [thy, oracles, terms, saved])
+        | thydata (Cons(Symbol "tag-ch", code as Integer _)) = Cons(Symbol "tag-ch", code)
         | thydata (Cons(a, b)) = Cons(thydata a, thydata b)
+        | thydata (Integer i) =
+            (* A bare integer is ThyDataSexp's Int, or a shared-string index in a
+               codec of its own (GrammarAncestry writes its theory names so).
+               Read it as the string it would name: a string's index depends on
+               the proofs, and a changed string must not hide behind its index. *)
+            if 0 <= i andalso i < Vector.length string_table
+            then Cons(Symbol "index", String (Vector.sub(string_table, i)))
+            else Integer i
         | thydata atom = atom
-      (* GrammarAncestry writes its theory names as bare string indices. *)
-      fun entry (Cons(key as String "GrammarAncestry", ancestry)) =
-            Cons(key, List (map str (items "grammar ancestry" ancestry)))
-        | entry (Cons(key, data)) = Cons(key, thydata data)
+      fun entry (Cons(key, data)) = Cons(key, thydata data)
         | entry _ = fail "loadable data"
       val loadable' = List (map entry (items "loadable-thydata" (tagged "loadable-thydata" loadable)))
     in
