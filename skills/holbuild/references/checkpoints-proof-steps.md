@@ -95,12 +95,18 @@ For full semantic production builds of large projects, use `--tactic-timeout 0`.
 
 On a rebuild after source edit:
 1. Compute theorem boundaries and dependency context from current source/project state
-2. Try a valid failed-prefix checkpoint first when one matches the theorem header/pre-theorem bytes
-3. Otherwise try the newest valid theorem-context checkpoint whose source prefix and dependency context match
+2. Find a valid failed-prefix checkpoint matching the theorem header/pre-theorem bytes and the newest valid context checkpoint matching the source prefix and dependency context
+3. Use whichever has the later source boundary, preferring the failed prefix on a tie
 4. Otherwise try a valid `deps_loaded.save`
 5. Re-execute only the remaining suffix when replay succeeds
 
 `always_reexecute = true` disables local up-to-date skipping and checkpoint replay for that action.
+
+`--force=theory` bypasses cached outputs for the targets while retaining this
+checkpoint replay order. For a fresh source execution while retaining cache hits
+for ancestors, use `holbuild clean FooTheory` followed by `holbuild build
+--force=theory FooTheory`. Cleaning alone can restore the theory from the global
+cache.
 
 ## Plan and trace inspection
 

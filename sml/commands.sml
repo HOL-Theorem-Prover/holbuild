@@ -90,6 +90,7 @@ fun build_help () = print
   \  --watch\n\
   \  --dry-run\n\
   \  --force[=theory|project|full]\n\
+  \      Bypass cached outputs; valid checkpoints, including failed prefixes, may resume.\n\
   \  --no-cache\n\
   \  --allow-cache-timeout-discrepancy\n\
   \  --no-stat-cache\n\

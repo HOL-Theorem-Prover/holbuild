@@ -306,8 +306,14 @@ holbuild --allow-cache-timeout-discrepancy --tactic-timeout 5 MyTheory
 holbuild --tactic-timeout 5 MyTheory
 holbuild --watch MyTheory
 holbuild --dry-run MyTheory
-holbuild clean MyTheory && holbuild --no-cache MyTheory
+holbuild clean MyTheory && holbuild build --force=theory MyTheory
 ```
+
+`--force=theory` bypasses cached outputs for the requested targets, but still
+reuses valid checkpoints, including failed proof prefixes. To execute a theory
+from the beginning while retaining cache hits for its ancestors, run
+`holbuild clean MyTheory` followed by `holbuild build --force=theory MyTheory`;
+cleaning alone permits a global cache hit.
 
 Common global options:
 
