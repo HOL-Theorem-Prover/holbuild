@@ -12,7 +12,6 @@ type checkpoint = {kind : string, name : string, safe_name : string, theorem_sta
                    tactic_end : int, tactic_text : string,
                    has_proof_attrs : bool, prefix_hash : string,
                    context_path : string, context_ok : string,
-                   end_of_proof_path : string, end_of_proof_ok : string,
                    failed_prefix_path : string, failed_prefix_ok : string,
                    deps_key : string, checkpoint_key : string,
                    proof_ir_plan : string option}
@@ -115,7 +114,6 @@ fun discover_from_report {source, report} : boundary list =
                    (String.tokens (fn c => c = #"\n") report))
 
 fun begin_theorem_line ({kind, name, tactic_text, context_path, context_ok,
-                         end_of_proof_path, end_of_proof_ok,
                          failed_prefix_path, failed_prefix_ok,
                          has_proof_attrs, proof_ir_plan, ...} : checkpoint) =
   String.concat
@@ -128,8 +126,6 @@ fun begin_theorem_line ({kind, name, tactic_text, context_path, context_ok,
      HolbuildToolchain.sml_string tactic_text, ", ",
      HolbuildToolchain.sml_string context_path, ", ",
      HolbuildToolchain.sml_string context_ok, ", ",
-     HolbuildToolchain.sml_string end_of_proof_path, ", ",
-     HolbuildToolchain.sml_string end_of_proof_ok, ", ",
      HolbuildToolchain.sml_string failed_prefix_path, ", ",
      HolbuildToolchain.sml_string failed_prefix_ok, ", ",
      if has_proof_attrs then "true" else "false",
