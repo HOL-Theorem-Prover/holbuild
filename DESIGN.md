@@ -563,14 +563,19 @@ is in the closure with its own digest. When a theory's input key misses, but
 its outputs exist, its parent `.dat` hashes match, and both recorded hashes
 match the current ones, the outputs on disk are what a build would produce:
 holbuild keeps them and rewrites the metadata under the new input key. Any
-missing output or mismatch builds as before. Early cutoff publishes nothing:
-cache entries are only ever written by a build of their input key.
+missing output or mismatch builds as before. When the local cache holds a
+usable entry under the old input key and none under the new one, early cutoff
+copies that entry to the new key, since it describes the same outputs; this
+lets commands that read the cache by current key, such as `export`, find it.
+Nothing is published to a remote cache.
 
 The dependency context of a theory's checkpoints (`deps_loaded.save` and the
 theorem checkpoints above it) is keyed the same way, on `deps_output_key`, so a
 theory edited after an upstream edit that left outputs unchanged still resumes
 from its checkpoints. Remote action specs, which are written before their
-dependencies are built, key it on dependency input keys.
+dependencies are built, key it on dependency input keys, and so does
+`run --from` unless every dependency's metadata matches its current input key,
+since `run` builds nothing and the outputs on disk may be stale.
 
 A build may also record output hashes for diagnostics (`--emit-output-hashes`).
 

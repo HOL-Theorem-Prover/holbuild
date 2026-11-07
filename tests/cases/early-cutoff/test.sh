@@ -125,6 +125,10 @@ require_cutoff BTheory "$tmpdir/proof-edit.log"
 require_cutoff CTheory "$tmpdir/proof-edit.log"
 [[ "$(grep '^input_key=' "$dep/BScript.sml.key")" != "$b_key" ]] ||
   { echo "B's metadata kept its old input key" >&2; exit 1; }
+# The cache entries of the reused theories are aliased to their new keys,
+# so commands that read the cache by current key find them.
+(cd "$project" && "$HOLBUILD_BIN" export -o "$tmpdir/cutoff.hbx" CTheory) > "$tmpdir/export.log" 2>&1 ||
+  { cat "$tmpdir/export.log" >&2; exit 1; }
 # The new keys are recorded, so the next build is a plain up-to-date check.
 build "$tmpdir/noop.log"
 if grep -q "built\|early cutoff" "$tmpdir/noop.log"; then
@@ -133,13 +137,16 @@ if grep -q "built\|early cutoff" "$tmpdir/noop.log"; then
   exit 1
 fi
 
-# Another output-neutral edit to A together with an edit to C: C rebuilds,
-# but from the dependency context it saved before.
-write_a "ACCEPT_TAC TRUTH" "one"
+# A third output-neutral variant of A, so every input key below it differs
+# from the first build's, together with an edit to C: C rebuilds, but from
+# the dependency context it saved in the first build.
+write_a "ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH" "one"
 write_c "ALL_TAC >> ACCEPT_TAC b_thm"
 build "$tmpdir/downstream-edit.log"
 require_cutoff BTheory "$tmpdir/downstream-edit.log"
 require_grep "CTheory built" "$tmpdir/downstream-edit.log"
+[[ "$(grep '^input_key=' "$dep/BScript.sml.key")" != "$b_key" ]] ||
+  { echo "B's input key is the first build's again" >&2; exit 1; }
 [[ "$(grep '^dependency_context_key=' "$dep/CScript.sml.key")" == "$c_context" ]] ||
   { echo "C's dependency context key moved after an output-neutral edit" >&2; exit 1; }
 [[ "$(deps_loaded)" == "$c_deps_loaded" && "$(stat -c '%i %Y' "$c_deps_loaded")" == "$c_deps_loaded_stamp" ]] ||

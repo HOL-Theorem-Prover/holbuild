@@ -2750,6 +2750,9 @@ fun policy_config_lines _ =
    turn is in the dependent's closure too, with its own digest. *)
 fun output_digest_parts toolchain_key plan node =
   let
+    (* HOL's loader reads the remapped copies, which are separate files. *)
+    fun with_remapped files =
+      files @ map (fn (role, path) => ("remapped " ^ role, hfs_remapped_path path)) files
     val extras =
       ListPair.zip (map (fn declaration => "extra " ^ declaration)
                         (source_extra_output_declarations plan node),
@@ -2761,15 +2764,17 @@ fun output_digest_parts toolchain_key plan node =
             val {sig_path, sml_path, data_path, theory_ui, theory_uo, ...} = theory_outputs node
             val trace_path = drop_suffix ".dat" data_path ^ ".tr.gz"
           in
-            ([], [("dat", data_path), ("sig", sig_path), ("sml", sml_path),
-                  ("ui", theory_ui), ("uo", theory_uo)] @
-                 (if file_exists trace_path then [("trace", trace_path)] else []) @
+            ([], with_remapped
+                   ([("dat", data_path), ("sig", sig_path), ("sml", sml_path),
+                     ("ui", theory_ui), ("uo", theory_uo)] @
+                    (if file_exists trace_path then [("trace", trace_path)] else [])) @
                  extras)
           end
       | _ =>
           (["self " ^ HolbuildBuildPlan.self_input_key plan
                         (fn _ => policy_config_lines no_checkpoint_policy) toolchain_key node],
-           map (fn path => ("object", path)) (#objects (source_artifacts node)) @ extras)
+           with_remapped (map (fn path => ("object", path)) (#objects (source_artifacts node))) @
+           extras)
   end
 
 (* Computes and remembers the output digests of NODES, hashing all their files
@@ -3947,7 +3952,18 @@ datatype run_from_state =
 fun run_from_state tc project plan keys node =
   let
     val name = logical_name node
-    val deps_key = dependency_context_key (HolbuildToolchain.toolchain_key tc) plan keys node
+    val toolchain_key = HolbuildToolchain.toolchain_key tc
+    fun built_for_current_source dep =
+      case current_metadata (metadata_path project dep) of
+          SOME text => metadata_input_key_matches (HolbuildBuildPlan.input_key_for keys dep) text
+        | NONE => false
+    (* Run builds nothing, so the dependencies' outputs on disk can be older
+       than their sources: key on them only when every one is built for its
+       current source. *)
+    val deps_key =
+      if List.all built_for_current_source (HolbuildBuildPlan.transitive_project_deps plan node)
+      then dependency_context_key toolchain_key plan keys node
+      else dependency_input_context_key toolchain_key plan keys node
     val base = checkpoint_base project node
     fun deps_loaded_current dir =
       HolbuildCheckpointStore.ok_current (Path.concat(dir, "deps_loaded.save"))
@@ -4228,6 +4244,28 @@ fun build_theory cache_allowed policy tc project base_context plan keys toolchai
     remove_tree (stage_root_at root (#input_key action))
   end
 
+(* After early cutoff, the theory's cache entry under its old input key also
+   describes its outputs for the new one, so the entry is copied to the new
+   key, where commands that read the cache by current key (export) find it.
+   Only a usable entry is copied, and only where the new key has none. *)
+fun alias_cache_entry old_key new_key =
+  let
+    val root = cache_root ()
+    fun alias () =
+      case (HolbuildCache.get_action root new_key, HolbuildCache.get_action root old_key) of
+          (NONE, SOME old_text) =>
+            if cache_entry_usable root old_key old_text then
+              HolbuildCache.write_action root
+                {key = new_key,
+                 text = replace_all ("\ninput_key=" ^ old_key ^ "\n") ("\ninput_key=" ^ new_key ^ "\n")
+                                    old_text}
+            else ()
+        | _ => ()
+  in
+    HolbuildCache.with_action_publish_lock root new_key alias (fn () => ())
+  end
+  handle e => warn ("could not alias cache entry: " ^ General.exnMessage e)
+
 fun build_theory_node dat_hash_cache (options : build_options) tc project base_context plan keys toolchain_key node input_key =
   let
     val policy = checkpoint_policy_for_node options project node
@@ -4322,6 +4360,11 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
       else NONE
     fun reuse_outputs text =
       (remove_tree stage;
+       if cache_allowed then
+         case metadata_value "input_key" (metadata_lines text) of
+             SOME old_key => alias_cache_entry old_key input_key
+           | NONE => ()
+       else ();
        write_metadata (#emit_output_hashes options) policy
          (if allow_timeout_discrepancy then metadata_proof_timeout text else tactic_timeout policy)
          project plan keys input_key toolchain_key node metadata_checkpoints;
