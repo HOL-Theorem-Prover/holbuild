@@ -211,6 +211,14 @@ AND (CAST(:batch_id AS uuid) IS NULL OR a.batch_id = :batch_id)
 """)
 
 
+# The actions of a batch written by transactions numbered :since or later; see Coordinator.changes.
+CHANGED_ACTIONS = sa.text("""
+SELECT input_key, theory, state, tier, attempts, last_failure, log_sha256 FROM actions
+WHERE batch_id = :batch_id AND changed_xid >= CAST(CAST(:since AS text) AS xid8)
+ORDER BY theory, input_key
+""")
+
+
 # The ready action to claim next; see Coordinator.claim. Only the batches with a ready action of the tiers are
 # ranked, each from its own index entries, so a claim reads neither finished batches nor finished actions.
 CLAIM = sa.text("""
@@ -340,20 +348,33 @@ class Coordinator:
         return batch_id
 
     async def get(self, batch_id: UUID) -> BatchStatus | None:
+        changed = await self.changes(batch_id, 0)
+        return None if changed is None else changed[0]
+
+    async def changes(self, batch_id: UUID, since: int) -> tuple[BatchStatus, int] | None:
+        """The batch with only the actions written by transactions numbered ``since`` or later, and the ``since``
+        to pass next time; ``since`` 0 gives every action.
+
+        The next ``since`` is the oldest transaction still running on the server when this one read, so an action
+        written by a transaction that commits later is read next time, maybe again. A long transaction anywhere on
+        the server holds ``since`` back, so polls reread what changed since it began until it ends.
+        """
         async with self.engine.connect() as conn:
+            await conn.execution_options(isolation_level="REPEATABLE READ")  # both reads see one snapshot
             batch = (
-                await conn.execute(sa.text("SELECT state, failure FROM batches WHERE id = :id"), {"id": batch_id})
+                await conn.execute(
+                    sa.text(
+                        "SELECT state, failure, CAST(pg_snapshot_xmin(pg_current_snapshot()) AS text) AS xmin "
+                        "FROM batches WHERE id = :id"
+                    ),
+                    {"id": batch_id},
+                )
             ).first()
             if batch is None:
                 return None
-            actions = await conn.execute(
-                sa.text(
-                    "SELECT input_key, theory, state, tier, attempts, last_failure, log_sha256 FROM actions "
-                    "WHERE batch_id = :id ORDER BY theory, input_key"
-                ),
-                {"id": batch_id},
-            )
-            return BatchStatus(batch_id, batch.state, batch.failure, [ActionStatus(*row) for row in actions])
+            actions = await conn.execute(CHANGED_ACTIONS, {"batch_id": batch_id, "since": str(since)})
+            status = BatchStatus(batch_id, batch.state, batch.failure, [ActionStatus(*row) for row in actions])
+            return status, int(batch.xmin)
 
     async def cancel(self, batch_id: UUID) -> str | None:
         """Cancel a running batch; its leases go, so its workers' heartbeats and completions are refused."""

@@ -690,6 +690,96 @@ async def test_events_stream_action_states_then_the_batch(http: httpx.AsyncClien
     assert events[0]["log_sha256"] == "a" * 64
 
 
+async def test_changes_reads_only_the_actions_written_since_the_last_read(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, remote_exec_engine: Any
+) -> None:
+    """An event stream's polls read what changed since the previous one, including a write that committed after
+    a poll began, and not every action of the batch again."""
+    batch_id = UUID(await submit(http, ["a", "b"]))
+
+    def names(changed: tuple[Any, int] | None) -> set[str]:
+        assert changed is not None
+        return {action.theory for action in changed[0].actions}
+
+    first = await coordinator.changes(batch_id, 0)
+    assert first is not None and names(first) == {"pkg:a", "pkg:b"}
+    assert names(await coordinator.changes(batch_id, first[1])) == set()
+
+    await build(http, cache, "a")
+    async with remote_exec_engine.connect() as late:
+        await late.execute(
+            sa.text("UPDATE actions SET attempts = 1 WHERE batch_id = :id AND theory = 'pkg:b'"), {"id": batch_id}
+        )
+        during = await coordinator.changes(batch_id, first[1])  # b's write is uncommitted
+        assert during is not None and names(during) == {"pkg:a"}
+        await late.commit()
+    assert names(await coordinator.changes(batch_id, during[1])) == {"pkg:b"}
+
+    async with remote_exec_engine.begin() as connection:  # many settled actions don't make a poll read more
+        await connection.execute(
+            sa.text(
+                "INSERT INTO actions (batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier) "
+                "SELECT :id, 'k' || g, 'ac', 's', 'pkg:t' || g, 0, 'done', 'standard' FROM generate_series(1, 20000) g"
+            ),
+            {"id": batch_id},
+        )
+        await connection.execute(sa.text("ANALYZE actions"))
+    settled = await coordinator.changes(batch_id, 0)
+    assert settled is not None
+    async with remote_exec_engine.begin() as connection:
+        plan = await connection.scalar(
+            sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {coordinator_module.CHANGED_ACTIONS.text}"),
+            {"batch_id": batch_id, "since": str(settled[1])},
+        )
+    assert plan[0]["Plan"]["Actual Rows"] == 0
+    assert plan[0]["Plan"]["Shared Hit Blocks"] + plan[0]["Plan"]["Shared Read Blocks"] < 20
+
+
+async def test_event_streams_of_a_large_batch_poll_only_its_changes(
+    http: httpx.AsyncClient,
+    cache: FakeCache,
+    coordinator: Coordinator,
+    remote_exec_engine: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Several streams following a batch of 10,000 actions each read the whole batch once, then only the actions
+    that change, and still deliver every change."""
+    batch_id = await submit(http, ["a", "b"], [("b", "a")])
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(
+            sa.text(
+                "INSERT INTO actions (batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier) "
+                "SELECT :id, 'k' || g, 'ac', 's', 'pkg:t' || g, 0, 'done', 'standard' FROM generate_series(1, 10000) g"
+            ),
+            {"id": batch_id},
+        )
+    reads: list[int] = []
+    changes = coordinator.changes
+
+    async def counted(batch: UUID, since: int) -> Any:
+        changed = await changes(batch, since)
+        reads.append(0 if changed is None else len(changed[0].actions))
+        return changed
+
+    monkeypatch.setattr(coordinator, "changes", counted)
+
+    async def follow() -> list[dict[str, Any]]:
+        async with http.stream("GET", f"/v1/batches/{batch_id}/events", headers=CLIENT) as response:
+            return [json.loads(line) async for line in response.aiter_lines() if line]
+
+    streams = [asyncio.create_task(follow()) for _ in range(3)]
+    while len(reads) < 6:  # each stream's full read and its first poll after it
+        await asyncio.sleep(0.01)
+    await build(http, cache, "a")
+    await build(http, cache, "b")
+    for events in await asyncio.gather(*streams):
+        last = {e["theory"]: e["state"] for e in events if e["type"] == "action"}
+        assert (last["pkg:a"], last["pkg:b"], len(last)) == ("done", "done", 10002)
+        assert events[-1] == {"type": "batch", "state": "done", "failure": None}
+    assert sorted(reads)[-3:] == [10002] * 3  # one full read per stream
+    assert sorted(reads)[-4] <= 2  # the rest read a and b at most
+
+
 async def test_retention_deletes_old_terminal_batches_and_stale_hints(
     http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, remote_exec_engine: Any
 ) -> None:

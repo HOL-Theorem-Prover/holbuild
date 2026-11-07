@@ -16,7 +16,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, SecretStr
 
-from remote_exec.coordinator import ActionStatus, Coordinator, ResultMismatch, Settings, is_auth_failure
+from remote_exec.coordinator import ActionStatus, BatchStatus, Coordinator, ResultMismatch, Settings, is_auth_failure
 from remote_exec.formats import FormatError, parse_batch, parse_result
 
 logger = logging.getLogger(__name__)
@@ -113,12 +113,16 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
 
     @app.get("/v1/batches/{batch_id}/events", dependencies=client)
     async def events(batch_id: UUID) -> StreamingResponse:
-        if await coordinator.get(batch_id) is None:
+        first = await coordinator.changes(batch_id, 0)
+        if first is None:
             raise HTTPException(404, f"no batch {batch_id}")
 
         async def lines() -> AsyncIterator[str]:
+            # Each poll reads only the actions written since the last one, maybe some again, so `seen` drops repeats.
             seen: dict[str, ActionStatus] = {}
-            while (batch := await coordinator.get(batch_id)) is not None:
+            changed: tuple[BatchStatus, int] | None = first
+            while changed is not None:
+                batch, since = changed
                 for action in batch.actions:
                     if seen.get(action.input_key) != action:
                         seen[action.input_key] = action
@@ -127,6 +131,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
                     yield json.dumps({"type": "batch", "state": batch.state, "failure": batch.failure}) + "\n"
                     return
                 await asyncio.sleep(settings.events_poll_seconds)
+                changed = await coordinator.changes(batch_id, since)
 
         return StreamingResponse(lines(), media_type="application/x-ndjson")
 
