@@ -82,6 +82,10 @@ async def test_members_endpoint_auth_and_no_credentials_before_or_after_ready(ht
     response = await http.get('/v1/cache/members', headers={'Authorization': f'Bearer {CLIENT_TOKEN}'})
     assert len(response.text.splitlines()) == 3
     async with coordinator.engine.begin() as conn:
+        await conn.execute(sa.text("UPDATE cache_slots SET phase='admit' WHERE slot='c'"))
+    response = await http.get('/v1/cache/members', headers={'Authorization': f'Bearer {CLIENT_TOKEN}'})
+    assert len(response.text.splitlines()) == 3
+    async with coordinator.engine.begin() as conn:
         await conn.execute(sa.text("UPDATE cache_slots SET phase='serving' WHERE slot='c'"))
     response = await http.get('/v1/cache/members', headers={'Authorization': f'Bearer {WORKER_TOKEN}'})
     assert response.text == SNAPSHOT

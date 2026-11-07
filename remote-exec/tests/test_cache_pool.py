@@ -95,8 +95,9 @@ async def test_no_discovery_until_readiness_and_launch_hook_not_completed_before
         assert await pool.ready_urls() == []
     p.ready = True
     await pool.reconcile(p.now)
-    assert await pool.ready_urls() == ["https://cache-3.example"]
+    assert await pool.ready_urls() == []
     await pool.reconcile(p.now)
+    assert await pool.ready_urls() == ["https://cache-3.example"]
     operations = [r.op for r in p.calls if r.instance == "a"]
     assert operations.index("boot") < operations.index("dns") < operations.index("ready") < operations.index("admit")
 

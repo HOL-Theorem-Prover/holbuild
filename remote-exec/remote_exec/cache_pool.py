@@ -154,7 +154,7 @@ class CachePool:
     async def ready_urls(self) -> list[str]:
         async with self.engine.connect() as conn:
             return list((await conn.scalars(sa.text(
-                "SELECT url FROM cache_slots WHERE phase IN ('admit', 'serving') ORDER BY slot"
+                "SELECT url FROM cache_slots WHERE phase = 'serving' ORDER BY slot"
             ))).all())
 
     async def status(self) -> list[SlotStatus]:
