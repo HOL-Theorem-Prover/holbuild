@@ -51,6 +51,10 @@ runs finish and cancel queued run batches. Use the current image to run
 `alembic downgrade 0004` before starting the older image, whose migration
 code does not know revision `0005`.
 
+Migration `0006` adds a nullable column for each action's phase timings.
+Images predating it ignore the column, so rolling back past it needs no
+downgrade.
+
 The coordinator reads its settings from the environment:
 
 | Variable | Meaning | Default |
