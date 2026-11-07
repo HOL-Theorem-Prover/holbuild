@@ -28,6 +28,8 @@ from remote_exec.formats import Batch, Result
 logger = logging.getLogger(__name__)
 
 CLAIM_RECHECK_SECONDS = 5  # how often a waiting claim looks for actions another coordinator process made ready
+# How long a cache entry found whole, blobs included, is taken to still be there without asking the cache again.
+IN_CACHE_TRUST_SECONDS = 60
 
 # A holbuild remote-cache entry lists its blobs as `blob <sha256> <size>` lines before the manifest it carries.
 ENTRY_BLOB = re.compile(r"^blob ([0-9a-f]{64}) [0-9]+$", re.MULTILINE)
@@ -266,8 +268,12 @@ class Coordinator:
         self.settings = settings
         self.clock: Callable[[], datetime] = lambda: datetime.now(UTC)
         self.scaled_to: int | None = None  # what the scale command last accepted
-        # Set, and replaced by a fresh one, whenever release makes an action ready, to wake waiting claims.
-        self.made_ready = asyncio.Event()
+        # How many actions this process's release has made ready, and the claims waiting, by the tiers they take
+        # and the future that wakes them, oldest first; see claim.
+        self.made_ready = 0
+        self.claim_waiters: list[tuple[list[str], asyncio.Future[None]]] = []
+        # When each cache entry was last found whole; see _in_cache.
+        self.found_in_cache: dict[str, float] = {}
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "Coordinator":
@@ -285,7 +291,13 @@ class Coordinator:
                     }
                 },
             ),
-            httpx.AsyncClient(base_url=settings.cache_url, timeout=30, follow_redirects=True),
+            # Every connection stays open between requests, so bursts of them don't each open a new TLS connection.
+            httpx.AsyncClient(
+                base_url=settings.cache_url,
+                timeout=30,
+                follow_redirects=True,
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=100),
+            ),
             settings,
         )
 
@@ -399,21 +411,30 @@ class Coordinator:
         that least recently had one claimed, then the oldest; within it, the action with the deepest chain of
         dependents, then the most dependents.
 
-        A wait ends early once ``disconnected`` says the worker has gone, so no action is leased to nobody. It is
-        woken when this process's ``release`` makes an action ready, and rechecks every ``CLAIM_RECHECK_SECONDS``
-        for actions another coordinator process made ready.
+        A wait ends early once ``disconnected`` says the worker has gone, so no action is leased to nobody. Each
+        action this process's ``release`` makes ready wakes the longest waiting claim that takes its tier, not
+        every waiting claim, so hundreds of waiting workers don't all query for it. Waits recheck every
+        ``CLAIM_RECHECK_SECONDS``, for actions another coordinator process made ready and for a wake whose claim
+        lost the action to another.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wait_s
         while True:
-            # Taken before the attempt, so an action made ready during it still wakes the wait below.
+            # Taken before the attempt, so an action made ready during it is tried at once instead of waited for.
             made_ready = self.made_ready
             claimed = await self._claim(tiers, worker)
             remaining = deadline - loop.time()
             if claimed is not None or remaining <= 0:
                 return claimed
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(made_ready.wait(), min(remaining, CLAIM_RECHECK_SECONDS))
+            if self.made_ready == made_ready:
+                waiter = (tiers, loop.create_future())
+                self.claim_waiters.append(waiter)
+                try:
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(waiter[1], min(remaining, CLAIM_RECHECK_SECONDS))
+                finally:
+                    with contextlib.suppress(ValueError):
+                        self.claim_waiters.remove(waiter)
             if disconnected is not None and await disconnected():
                 return None
 
@@ -447,6 +468,16 @@ class Coordinator:
                 },
             )
         return Claim(token, row.spec_sha256, row.input_key, row.theory, self.settings.lease_seconds)
+
+    def _wake_claim(self, tier: str) -> None:
+        """Count an action of ``tier`` made ready, and wake the longest waiting claim that takes it."""
+        self.made_ready += 1
+        for waiter in self.claim_waiters:
+            tiers, woken = waiter
+            if tier in tiers and not woken.done():
+                woken.set_result(None)
+                self.claim_waiters.remove(waiter)
+                return
 
     async def heartbeat(self, token: UUID) -> bool:
         """Extend a live lease; False when it expired or was revoked, so the worker should stop."""
@@ -536,6 +567,7 @@ class Coordinator:
             ):
                 await self._retry(conn, batch_id, action.input_key)
             elif result.failure == "input-missing":
+                self.found_in_cache.clear()
                 await self._input_missing(conn, batch_id, action.input_key, action.theory, action.attempts, result)
             else:
                 await self._fail_batch(conn, batch_id, action.input_key, f"{action.theory}: {result.failure}")
@@ -562,16 +594,16 @@ class Coordinator:
                 answers = [present[ac_key] for _, ac_key in parents]
                 if all(answers):
                     async with self.engine.begin() as conn:
-                        updated = await conn.execute(
+                        tier = await conn.scalar(
                             sa.text(
                                 "UPDATE actions SET state = 'ready' WHERE batch_id = :batch_id "
-                                "AND input_key = :input_key AND state = 'waiting' AND remaining_deps = 0"
+                                "AND input_key = :input_key AND state = 'waiting' AND remaining_deps = 0 "
+                                "RETURNING tier"
                             ),
                             {"batch_id": candidate_batch, "input_key": input_key},
                         )
-                    if updated.rowcount:
-                        self.made_ready.set()
-                        self.made_ready = asyncio.Event()
+                    if tier is not None:
+                        self._wake_claim(tier)
                 for parent, ac_key in parents:
                     if present[ac_key] is False:
                         requeued |= await self._requeue_evicted(candidate_batch, parent)
@@ -691,6 +723,10 @@ class Coordinator:
         await self.fail_overdue()
         await self.release()
         await self.delete_expired()
+        now = asyncio.get_running_loop().time()
+        self.found_in_cache = {
+            key: at for key, at in self.found_in_cache.items() if now - at < IN_CACHE_TRUST_SECONDS
+        }
         counts = (await self.queue()).counts
         demand = burst_demand(counts, self.settings.warm_workers, self.settings.max_burst_workers)
         now = self.clock()
@@ -729,7 +765,15 @@ class Coordinator:
 
     async def _in_cache(self, ac_key: str) -> bool | None:
         """Whether the cache holds entry ``ac_key`` and every blob it lists, which can expire before it; None when
-        the cache can't tell."""
+        the cache can't tell.
+
+        An entry found whole is taken to be there for ``IN_CACHE_TRUST_SECONDS`` without asking again, since each
+        completion releases its batch and every concurrent release would otherwise ask about the same parents. One
+        evicted meanwhile makes its children report ``input-missing``, which forgets every entry found.
+        """
+        now = asyncio.get_running_loop().time()
+        if now - self.found_in_cache.get(ac_key, -IN_CACHE_TRUST_SECONDS) < IN_CACHE_TRUST_SECONDS:
+            return True
         try:
             response = await self.cache.get(f"/ac/{ac_key}")
             if response.status_code == 200:
@@ -740,6 +784,7 @@ class Coordinator:
         except httpx.HTTPError:
             return None
         if response.status_code == 200:
+            self.found_in_cache[ac_key] = now
             return True
         if response.status_code == 404:
             return False

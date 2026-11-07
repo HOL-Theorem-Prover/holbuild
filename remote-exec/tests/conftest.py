@@ -28,12 +28,13 @@ def entry_blob(key: str) -> str:
 class FakeCache:
     """bazel-remote holding holbuild entries: ``GET /ac/<key>`` answers 503 for ``broken``, an entry listing the
     blob ``entry_blob(key)`` for ``keys``, and 404 otherwise; ``HEAD /cas/<blob>`` answers 404 for the blobs of the
-    keys in ``lost`` and 200 for the others."""
+    keys in ``lost`` and 200 for the others. ``asked`` lists the keys of the entries asked for."""
 
     def __init__(self) -> None:
         self.keys: set[str] = set()
         self.broken: set[str] = set()
         self.lost: set[str] = set()
+        self.asked: list[str] = []
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -41,6 +42,7 @@ class FakeCache:
             return httpx.Response(404 if path.removeprefix("/cas/") in map(entry_blob, self.lost) else 200)
         assert request.method == "GET" and path.startswith("/ac/")
         key = path.removeprefix("/ac/")
+        self.asked.append(key)
         if key in self.broken:
             return httpx.Response(503)
         if key not in self.keys:
