@@ -1206,8 +1206,8 @@ Before exporting a batch, remote-cache existence checks run concurrently using
 reports `checking remote cache: N/M theories`, unless `--quiet` is given.
 The batch keeps the plan's theory order and includes entries with missing blobs.
 
-`build --remote-exec URL` hands the theories the remote cache lacks to a
-remote-execution coordinator, which runs them on its workers with
+`build --remote-exec URL` hands the theories the remote cache lacks, and
+that aren't already built here, to a remote-execution coordinator, which runs them on its workers with
 `exec-action`, then restores them as an ordinary build would:
 
 ```sh
@@ -1229,6 +1229,16 @@ When the batch ends, one line says how many of its theories the remote
 workers finished, built or found cached (`holbuild: remote execution: remote
 workers finished 3 of 3 theories`), or, when the build falls back, why and
 how many they finished.
+
+A theory built here for its current inputs (the worktree's `.holbuild/dep`
+metadata holds its current input key) needs no worker, so it isn't checked
+against the remote cache and stays out of the batch, even when the remote
+cache lacks it, as when its publish after a local build failed. The workers
+restore from the remote cache what the batch's theories depend on, so when a
+theory in the batch depends on one, holbuild publishes its local cache entry
+there first; it goes in the batch only when it has no usable local entry or
+the publish fails. `--detach` follows no local build, so it checks and
+submits such theories like any other.
 
 A theory that no other theory in the batch depends on stays out of the batch,
 for the build that follows it to build locally, when either holds:
