@@ -8,8 +8,8 @@ event: done when RUN exits 0, failed otherwise.  In a failed batch, an action
 RUN left a result for (STATE/result-<input key>, as exec-action writes it) is
 reported as that result says: done, or failed with its failure and log.  Each
 action is reported running twice first, as a coordinator repeats unchanged
-states.  Control
-files in STATE change the answers: `refuse` makes POST answer 400, `drop`
+states.  Control files in STATE change the answers: `refuse` makes POST answer
+400, `unavailable`, holding a count, makes that many POSTs answer 502, `drop`
 ends the next event stream before the final event (and is removed), `cut`
 ends it midway through its first action event (and is removed), `down`
 makes the event stream and POST /v1/batches/<id>/cancel answer 503, `ended`
@@ -62,6 +62,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.answer(404, {"detail": "Not Found"})
         if (state / "refuse").exists():
             return self.answer(400, {"detail": "batch refused by the stub"})
+        unavailable = state / "unavailable"
+        if unavailable.exists() and int(unavailable.read_text()) > 0:
+            unavailable.write_text(str(int(unavailable.read_text()) - 1))
+            return self.answer(502, {"detail": "restarting"})
         batch_id = f"b{len(list(state.glob('*.batch'))) + 1}"
         (state / f"{batch_id}.batch").write_text(body)
         # Whitespace around the colon is valid JSON the client must accept.

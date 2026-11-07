@@ -205,3 +205,87 @@ if [[ -n "$differences" ]]; then
   echo "$differences" >&2
   exit 1
 fi
+
+# A theory's cache key covers its inputs, not its outputs, so holbuild must
+# never change what a theory exports without bumping theory_manifest_version
+# (sml/build_exec.sml): entries from before and after would share keys.  The
+# golden file pins one fixture's outputs per HOL revision and version.
+write_golden_project() {
+  local project=$1
+  mkdir -p "$project/src"
+  cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "theory-golden"
+[build]
+members = ["src"]
+[actions.GoldenTheory]
+deps = ["ZetaTheory", "AlphaTheory"]
+TOML
+  for name in Zeta Alpha; do
+    lower=$(tr '[:upper:]' '[:lower:]' <<< "$name")
+    cat > "$project/src/${name}Script.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "$name";
+
+Definition ${lower}_def:
+  $lower = T
+End
+
+val _ = export_theory ();
+SML
+  done
+  cat > "$project/src/GoldenScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = List.app (fn name => load (name ^ "Theory")) ["Zeta", "Alpha"];
+val _ = new_theory "Golden";
+
+Definition both_def:
+  both = (zeta /\ alpha)
+End
+
+Theorem both_thm:
+  both
+Proof
+  simp[both_def, ZetaTheory.zeta_def, AlphaTheory.alpha_def]
+QED
+
+val _ = export_theory ();
+SML
+}
+
+golden_root=$tmpdir/golden
+write_golden_project "$golden_root/project"
+link_hol_toolchain_cache "$golden_root/cache"
+(cd "$golden_root/project" && HOLBUILD_CACHE="$golden_root/cache" "$HOLBUILD_BIN" build GoldenTheory) \
+  > "$golden_root/build.log" 2>&1 || { cat "$golden_root/build.log" >&2; exit 1; }
+manifest_version=$(sed -n 's/^val theory_manifest_version = "\(.*\)"$/\1/p' "$HOLBUILD_ROOT/sml/build_exec.sml")
+[[ -n "$manifest_version" ]] || { echo "theory_manifest_version not found in sml/build_exec.sml" >&2; exit 1; }
+hol_rev=$(holbuild_pinned_hol_rev)
+if [[ "$hol_rev" != "$(tr -d '[:space:]' < "$HOLBUILD_ROOT/vendor/hol/REV")" ]]; then
+  echo "skipping golden outputs: HOL $hol_rev is not vendor/hol/REV"
+  exit 0
+fi
+obj=$golden_root/project/.holbuild/obj/src
+prefix="hol=$hol_rev version=$manifest_version"
+actual=$prefix
+for suffix in sig sml dat; do
+  actual+=" $suffix=$(sha256sum "$obj/GoldenTheory.$suffix" | cut -d' ' -f1)"
+done
+golden_file=$SCRIPT_DIR/golden-outputs
+expected=$(grep "^$prefix " "$golden_file" || true)
+if [[ $(grep -c . <<< "$expected") -gt 1 ]]; then
+  echo "$golden_file has more than one line for $prefix; outputs changed without a theory_manifest_version bump" >&2
+  exit 1
+fi
+if [[ -z "$expected" ]]; then
+  echo "$golden_file has no line for $prefix; add:" >&2
+  echo "  $actual" >&2
+  exit 1
+fi
+if [[ "$expected" != "$actual" ]]; then
+  echo "holbuild changed GoldenTheory's outputs: bump theory_manifest_version and add a line for the new version" >&2
+  echo "  expected: $expected" >&2
+  echo "  actual:   $actual" >&2
+  exit 1
+fi

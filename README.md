@@ -649,9 +649,10 @@ undeclared files, or host paths must declare those files in `extra_deps`, or set
 because holbuild rejects a restored theory whose parents' `.dat` files differ
 from the local ones, but descendants of a nondeterministic theory then miss the
 cache wherever the local build of it differs from the one their cache entries
-were built against. A parent-incompatible local cache entry is removed so the
-rebuilt child can replace it; this does not change the remote cache's conflict
-checks. An entry rejected only by the requested proof policy is retained until
+were built against. A parent-incompatible local cache entry is removed, and
+the remote cache's entry for the same key is tried before rebuilding; a rebuilt
+child replaces the local entry, which does not change the remote cache's
+conflict checks. An entry rejected only by the requested proof policy is retained until
 a successful rebuild can publish its stronger contract.
 
 Source files may also declare source-file-relative extra dependencies:
@@ -1219,13 +1220,18 @@ how many they finished.
 
 The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the
-batch, or the batch fails other than by a failed proof (below), it warns and builds locally. An event stream that
-breaks is reattached; one that stays unreachable through four reattaches
-(about 15 seconds of backoff) is given up on. When the build stops following
+batch, or the batch fails other than by a failed proof (below), it warns and
+builds locally. A submission
+answered 502, 503 or 504, as a proxy in front of the coordinator answers
+while it restarts, is retried, and an event stream that breaks is
+reattached; either is given up on once the coordinator stays unavailable for
+about two and a half minutes (retries back off to 8 seconds apart). When the build stops following
 a batch that may still run (the stream was given up on, or the coordinator
 won't stream it), it cancels the batch before building locally; one
 interrupted (SIGINT or SIGTERM) while it follows a batch cancels it too. With
-`--remote-only` it fails instead, leaves an interrupted build's batch running, and it never builds HOL or a theory
+`--remote-only` it cancels a batch the coordinator won't stream, or an
+interrupted build's, the same way but then fails instead of building locally,
+and it never builds HOL or a theory
 locally: a HOL toolchain or a theory that doesn't restore from a cache is an
 error. Such a `--remote-only` build exits with status 75 (`EX_TEMPFAIL`),
 whenever it stops where a build without `--remote-only` would go on locally,
