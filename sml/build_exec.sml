@@ -3115,6 +3115,97 @@ fun action_outputs root ({outputs = {sig_path, sml_path, data_path}, ...} : theo
   {sig_path = in_root root sig_path, sml_path = in_root root sml_path,
    data_path = in_root root data_path}
 
+(* The holbuild sources a theory child loads, directly or through the HOL
+   analyser that instruments its script.  They end up in saved heaps, so a
+   worker runs only specs exported by holbuild with the same sources. *)
+val runtime_source_files =
+  ["sml/checkpoint_save_runtime.sml", "sml/holbuild_runtime.sml",
+   "sml/proof_runtime.sml", "sml/tactic_compat_runtime.sml"] @
+  map (fn file => normalize_path (Path.concat("sml/analyser", file)))
+      HolbuildHolSharedCache.analyser_source_files
+
+fun runtime_identity () =
+  let
+    fun line rel =
+      rel ^ " " ^ HolbuildHash.file_sha256 (Path.concat(HolbuildRuntimePaths.source_root, rel))
+  in
+    HolbuildToolchain.hash_text
+      (String.concatWith "\n"
+         ("holbuild-runtime-v1" :: map line (sort_strings (unique_strings runtime_source_files))) ^ "\n")
+  end
+
+(* The shared heap and checkpoint store: one family per heap directory,
+   used when an action restores from it or adds to it. *)
+fun share_store cache = Path.concat(cache, "checkpoint-store")
+
+(* An action holds a shared lease on each store family it uses until it
+   exits, so no other container's cap sweep evicts the family meanwhile.
+   fcntl locks are dropped when the process closes any descriptor for the
+   file, so a family is leased at most once per process, as toolchains are. *)
+fun store_lease_path dir = dir ^ ".lease"
+
+val store_leases = ref ([] : (string * HolbuildFileLock.t) list)
+
+fun holds_store_lease path = List.exists (fn (held, _) => held = path) (!store_leases)
+
+fun lease_store_family store heap =
+  let val path = store_lease_path (Path.concat(store, heap))
+  in
+    if holds_store_lease path then ()
+    else store_leases := (path, HolbuildFileLock.acquire_shared_path_wait {path = path}) :: !store_leases
+  end
+
+fun store_path store heap sha = Path.concat(Path.concat(store, heap), sha)
+
+(* A name no process, in this container or another, also picks. *)
+fun store_temp path =
+  HolbuildTempPath.near path ("." ^ LargeInt.toString (Time.toNanoseconds (Time.now ())) ^ ".tmp")
+
+fun link_or_copy_file src dst =
+  (ensure_parent dst;
+   remove_file dst;
+   Posix.FileSys.link {old = src, new = dst}
+   handle OS.SysErr _ => copy_binary src dst)
+
+fun touch_dir dir = Posix.FileSys.utime (dir, NONE) handle OS.SysErr _ => ()
+
+(* Only Poly/ML states are linked: the run writes a failed prefix's .meta and
+   .prefix in place. *)
+fun share_file save src dst = if save then link_or_copy_file src dst else copy_binary src dst
+
+fun store_add store heap {sha, src, save} =
+  let
+    val _ = lease_store_family store heap
+    val dst = store_path store heap sha
+  in
+    if file_exists dst then ()
+    else
+      let val tmp = store_temp dst
+      in
+        (ensure_parent tmp; share_file save src tmp; FS.rename {old = tmp, new = dst})
+        handle e => (remove_file tmp; raise e)
+      end
+  end
+
+val noted_store_mount = ref false
+
+(* A Poly/ML state from the store, hard-linked; across file systems, where a
+   store on its own mount puts it, symbolically linked, which is safe while
+   this process leases the state's family. *)
+fun place_state stored dst =
+  (remove_file dst;
+   Posix.FileSys.link {old = stored, new = dst}
+   handle OS.SysErr (_, err) =>
+     if err <> SOME Posix.Error.xdev then copy_binary stored dst
+     else
+       (if !noted_store_mount then ()
+        else (noted_store_mount := true;
+              HolbuildStatus.message_stderr
+                "holbuild: the checkpoint store is on another file system; linking its states symbolically\n");
+        Posix.FileSys.symlink {old = Path.mkAbsolute {path = stored, relativeTo = FS.getDir ()}, new = dst}))
+
+fun saved_parent path = PolyML.SaveState.showParent path handle _ => NONE
+
 fun write_theory_script policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
   let
     val source_name = #source_name action
@@ -5572,25 +5663,6 @@ fun remote_proof_failure (options : build_options) tc project plan toolchain_key
 val action_spec_header = "holbuild-action-spec-v1"
 val action_batch_header = "holbuild-action-batch-v1"
 
-(* The holbuild sources a theory child loads, directly or through the HOL
-   analyser that instruments its script.  They end up in saved heaps, so a
-   worker runs only specs exported by holbuild with the same sources. *)
-val runtime_source_files =
-  ["sml/checkpoint_save_runtime.sml", "sml/holbuild_runtime.sml",
-   "sml/proof_runtime.sml", "sml/tactic_compat_runtime.sml"] @
-  map (fn file => normalize_path (Path.concat("sml/analyser", file)))
-      HolbuildHolSharedCache.analyser_source_files
-
-fun runtime_identity () =
-  let
-    fun line rel =
-      rel ^ " " ^ HolbuildHash.file_sha256 (Path.concat(HolbuildRuntimePaths.source_root, rel))
-  in
-    HolbuildToolchain.hash_text
-      (String.concatWith "\n"
-         ("holbuild-runtime-v1" :: map line (sort_strings (unique_strings runtime_source_files))) ^ "\n")
-  end
-
 fun spec_token context text =
   if text <> "" andalso not (CharVector.exists (fn c => Char.isSpace c orelse Char.isCntrl c) text)
   then text
@@ -6647,27 +6719,6 @@ fun local_cache_families cache =
     List.map entry_family entries
   end
 
-(* The shared heap and checkpoint store: one family per heap directory,
-   used when an action restores from it or adds to it. *)
-fun share_store cache = Path.concat(cache, "checkpoint-store")
-
-(* An action holds a shared lease on each store family it uses until it
-   exits, so no other container's cap sweep evicts the family meanwhile.
-   fcntl locks are dropped when the process closes any descriptor for the
-   file, so a family is leased at most once per process, as toolchains are. *)
-fun store_lease_path dir = dir ^ ".lease"
-
-val store_leases = ref ([] : (string * HolbuildFileLock.t) list)
-
-fun holds_store_lease path = List.exists (fn (held, _) => held = path) (!store_leases)
-
-fun lease_store_family store heap =
-  let val path = store_lease_path (Path.concat(store, heap))
-  in
-    if holds_store_lease path then ()
-    else store_leases := (path, HolbuildFileLock.acquire_shared_path_wait {path = path}) :: !store_leases
-  end
-
 fun store_cache_families cache =
   List.map
     (fn dir =>
@@ -6811,57 +6862,8 @@ fun exception_failure e =
    eviction, and a symbolic one points into a family the action leases until
    it exits, which no cap sweep evicts. *)
 
-fun store_path store heap sha = Path.concat(Path.concat(store, heap), sha)
-
-(* A name no process, in this container or another, also picks. *)
-fun store_temp path =
-  HolbuildTempPath.near path ("." ^ LargeInt.toString (Time.toNanoseconds (Time.now ())) ^ ".tmp")
-
-fun link_or_copy_file src dst =
-  (ensure_parent dst;
-   remove_file dst;
-   Posix.FileSys.link {old = src, new = dst}
-   handle OS.SysErr _ => copy_binary src dst)
-
-fun touch_dir dir = Posix.FileSys.utime (dir, NONE) handle OS.SysErr _ => ()
-
-(* Only Poly/ML states are linked: the run writes a failed prefix's .meta and
-   .prefix in place. *)
-fun share_file save src dst = if save then link_or_copy_file src dst else copy_binary src dst
-
-fun store_add store heap {sha, src, save} =
-  let
-    val _ = lease_store_family store heap
-    val dst = store_path store heap sha
-  in
-    if file_exists dst then ()
-    else
-      let val tmp = store_temp dst
-      in
-        (ensure_parent tmp; share_file save src tmp; FS.rename {old = tmp, new = dst})
-        handle e => (remove_file tmp; raise e)
-      end
-  end
-
 (* A blob a shared entry names that the remote cache no longer holds. *)
 exception MissingSharedBlob of string
-
-val noted_store_mount = ref false
-
-(* A Poly/ML state from the store, hard-linked; across file systems, where a
-   store on its own mount puts it, symbolically linked, which is safe while
-   this process leases the state's family. *)
-fun place_state stored dst =
-  (remove_file dst;
-   Posix.FileSys.link {old = stored, new = dst}
-   handle OS.SysErr (_, err) =>
-     if err <> SOME Posix.Error.xdev then copy_binary stored dst
-     else
-       (if !noted_store_mount then ()
-        else (noted_store_mount := true;
-              HolbuildStatus.message_stderr
-                "holbuild: the checkpoint store is on another file system; linking its states symbolically\n");
-        Posix.FileSys.symlink {old = Path.mkAbsolute {path = stored, relativeTo = FS.getDir ()}, new = dst}))
 
 (* Puts blob `sha` of heap `heap`'s family at `dst`, from the store, which
    fetches it from the remote cache if it lacks it. *)
@@ -6989,8 +6991,6 @@ fun shared_context cache checkpoint_root tc root policy (action : theory_action)
      requested_timeout = tactic_timeout policy,
      candidates = shared_candidates policy base checkpoints}
   end
-
-fun saved_parent path = PolyML.SaveState.showParent path handle _ => NONE
 
 fun shared_heap_parent_ok ({deps_loaded, base_state, ...} : shared_context) =
   case saved_parent deps_loaded of
