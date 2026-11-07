@@ -301,11 +301,41 @@ fun project_preload_deps plan node =
     List.filter needed (HolbuildBuildPlan.direct_project_deps plan node)
   end
 
+(* PROTOTYPE: the canonical load order starts with the
+   theory's heaviest direct project theory parent, the one with the largest
+   project closure (ties by logical name).  Loading it first makes the state
+   after that load a prefix of the cold load, so a saved heap of the parent's
+   theory state can stand in for it. *)
+fun is_theory_node dep =
+  #kind (HolbuildBuildPlan.source_of dep) = HolbuildSourceIndex.TheoryScript
+
+fun heaviest_parent plan node =
+  let
+    fun weight dep = length (HolbuildBuildPlan.transitive_project_deps plan dep)
+    fun better (a, b) =
+      let val (wa, wb) = (weight a, weight b)
+      in wa > wb orelse (wa = wb andalso logical_name a < logical_name b) end
+    fun pick (dep, NONE) = SOME dep
+      | pick (dep, SOME best) = SOME (if better (dep, best) then dep else best)
+  in
+    List.foldl pick NONE (List.filter is_theory_node (project_preload_deps plan node))
+  end
+
 fun preload_loads root plan node =
-  map LoadTheory (HolbuildBuildPlan.direct_external_theories plan node) @
-  map LoadLibrary (HolbuildBuildPlan.direct_external_libs plan node) @
-  map (fn dep => LoadObject (root_relative root (load_stem dep)))
-      (List.filter loadable_project_dep (project_preload_deps plan node))
+  let
+    val deps = List.filter loadable_project_dep (project_preload_deps plan node)
+    val first = case heaviest_parent plan node of
+                    NONE => []
+                  | SOME p => [LoadObject (root_relative root (load_stem p))]
+    val rest = List.filter (fn dep => case heaviest_parent plan node of
+                                          NONE => true
+                                        | SOME p => HolbuildBuildPlan.key dep <> HolbuildBuildPlan.key p) deps
+  in
+    first @
+    map LoadTheory (HolbuildBuildPlan.direct_external_theories plan node) @
+    map LoadLibrary (HolbuildBuildPlan.direct_external_libs plan node) @
+    map (fn dep => LoadObject (root_relative root (load_stem dep))) rest
+  end
 
 fun write_preload load_lines deps_loaded deps_ok path =
   let
@@ -2127,7 +2157,17 @@ fun write_local_theory_manifests plan node generated_metadata =
   let
     val {sig_path, sml_path, script_uo, theory_ui, theory_uo, ...} = theory_outputs node
     val deps = HolbuildBuildPlan.direct_project_deps plan node
-    val theory_loads = generated_theory_loads (plan_load_stem plan) generated_metadata
+    val theory_loads0 = generated_theory_loads (plan_load_stem plan) generated_metadata
+    (* PROTOTYPE: the heaviest parent's stem first, as in the preload. *)
+    val theory_loads =
+      case heaviest_parent plan node of
+          NONE => theory_loads0
+        | SOME p =>
+            let val stem = load_stem p
+            in if List.exists (fn l => l = stem) theory_loads0
+               then stem :: List.filter (fn l => l <> stem) theory_loads0
+               else theory_loads0
+            end
     val script_loads = direct_external_loads plan node @ project_load_stems deps
   in
     write_object_manifest theory_ui [sig_path];
@@ -3696,7 +3736,9 @@ fun proof_engine (CheckpointPolicy {proof_steps = false, ...}) = "plain_v1"
 
 fun build_config_lines_for_node options project node =
   case #kind (HolbuildBuildPlan.source_of node) of
-      HolbuildSourceIndex.TheoryScript => policy_config_lines (checkpoint_policy_for_node options project node)
+      (* PROTOTYPE: a distinct key so prototype outputs never share
+         cache entries with stock holbuild's. *)
+      HolbuildSourceIndex.TheoryScript => policy_config_lines (checkpoint_policy_for_node options project node) @ ["proto_canonical_order=1"]
     | HolbuildSourceIndex.Sml => policy_config_lines no_checkpoint_policy
     | HolbuildSourceIndex.Sig => policy_config_lines no_checkpoint_policy
 
@@ -3973,12 +4015,108 @@ fun build_theory_action cache_allowed policy tc root checkpoint_root base_contex
 (* Builds a theory from its source in the project: runs its theory action with
    the project's artifact root as action root, then puts the extra outputs in
    the source tree and writes the theory's local load manifests. *)
+(* PROTOTYPE: parent heaps.  A parent heap holds a
+   theory's state loaded cold and nothing else: no script, no script libs.
+   It is built lazily, the first time a child needs it, for theories with two
+   or more direct dependents in the build, from the nearest parent heap along
+   the heaviest-parent chain (that chain is the prefix the canonical order
+   loads first).  Heaps live outside the checkpoint directory, so the
+   checkpoint cap never evicts them. *)
+val parent_heap_mutex = Mutex.mutex ()
+val parent_heap_cv = ConditionVar.conditionVar ()
+val parent_heaps_building : string list ref = ref []
+
+fun parent_heap_dir root = Path.concat(root, ".holbuild/parent-heaps")
+
+fun parent_heap_path root keys p =
+  Path.concat(parent_heap_dir root,
+              logical_name p ^ "-" ^ HolbuildBuildPlan.input_key_for keys p ^ ".save")
+
+fun parent_heap_ready path = file_exists path andalso file_exists (path ^ ".ok")
+
+fun proto_note msg = HolbuildStatus.message_stderr ("holbuild-proto: " ^ msg ^ "\n")
+
+fun claim_parent_heap path =
+  let
+    fun wait () =
+      if List.exists (fn x => x = path) (!parent_heaps_building)
+      then (ConditionVar.wait (parent_heap_cv, parent_heap_mutex); wait ())
+      else ()
+    val _ = Mutex.lock parent_heap_mutex
+    val _ = wait ()
+    val claimed = not (parent_heap_ready path)
+    val _ = if claimed then parent_heaps_building := path :: !parent_heaps_building else ()
+  in
+    Mutex.unlock parent_heap_mutex; claimed
+  end
+
+fun release_parent_heap path =
+  (Mutex.lock parent_heap_mutex;
+   parent_heaps_building := List.filter (fn x => x <> path) (!parent_heaps_building);
+   ConditionVar.broadcast parent_heap_cv;
+   Mutex.unlock parent_heap_mutex)
+
+fun theory_dependents plan p =
+  length (List.filter is_theory_node (HolbuildBuildPlan.direct_project_dependents plan p))
+
+fun ensure_parent_heap tc root plan keys base p =
+  let val path = parent_heap_path root keys p
+  in
+    if parent_heap_ready path then SOME path
+    else if theory_dependents plan p < 2 then NONE
+    else
+      let
+        fun build () =
+          let
+            val start = parent_start_context tc root plan keys base p
+            val stage = Path.concat(parent_heap_dir root, "stage-" ^ Path.file path)
+            val policy_file = Path.concat(stage, "holbuild-child-policy.sml")
+            val script = Path.concat(stage, "holbuild-parent-heap.sml")
+            val t0 = Time.now ()
+            val _ = remove_tree stage
+            val _ = ensure_dir stage
+            val _ = write_child_policy policy_file
+            val _ =
+              write_text script
+                (String.concatWith "\n"
+                   [runtime_line (),
+                    load_project_line (in_root root (load_stem p)),
+                    checkpoint_save_runtime_line (),
+                    save_heap_line {label = "parent_heap", share_common_data = true, output = path,
+                                    ok_text = checkpoint_ok_text "parent_heap" [("theory", logical_name p)]}] ^ "\n")
+            val _ =
+              run_hol_files_to_log tc stage stage start [policy_file, script] "holbuild-parent-heap.log" NONE
+                ("parent heap build failed for " ^ logical_name p)
+          in
+            proto_note ("built parent heap " ^ logical_name p ^ " from " ^ hol_context_path start ^
+                        " in " ^ Time.toString (Time.-(Time.now (), t0)) ^ "s");
+            remove_tree stage
+          end
+      in
+        if claim_parent_heap path then
+          ((build () handle e => warn ("parent heap: " ^ General.exnMessage e));
+           release_parent_heap path)
+        else ();
+        if parent_heap_ready path then SOME path else NONE
+      end
+  end
+
+and parent_start_context tc root plan keys base node =
+  case heaviest_parent plan node of
+      NONE => base
+    | SOME p =>
+        case ensure_parent_heap tc root plan keys base p of
+            SOME path => HolState path
+          | NONE => parent_start_context tc root plan keys base p
+
 fun build_theory cache_allowed policy tc project base_context plan keys toolchain_key node =
   let
     val root = project_artifact_root project
     val action = theory_action root plan keys toolchain_key (#holdir tc) node
+    val start_context = parent_start_context tc root plan keys base_context node
+    val _ = proto_note (logical_name node ^ " starts from " ^ hol_context_path start_context)
     val generated_metadata =
-      build_theory_action cache_allowed policy tc root (default_checkpoint_root root) base_context action
+      build_theory_action cache_allowed policy tc root (default_checkpoint_root root) start_context action
     val stage = action_stage root action
     val extra_output_paths = source_extra_output_paths plan node
   in

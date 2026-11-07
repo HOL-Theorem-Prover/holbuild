@@ -426,6 +426,18 @@ fun direct_project_deps
     unique_nodes (map target (resolved_dependency_edges plan node))
   end
 
+(* PROTOTYPE: the project nodes that depend directly on
+   `node`, from the universe's reverse edges. *)
+fun direct_project_dependents
+      (plan as {universe_key_index, universe_node_index, ...} : t) node =
+  let
+    fun source (edge : resolved_dependency_edge) =
+      Vector.sub(universe_node_index,
+                 indexed_key_id universe_key_index (#from_node edge))
+  in
+    unique_nodes (map source (reverse_dependency_edges plan node))
+  end
+
 fun direct_external_theories plan node =
   unique_strings
     (List.mapPartial
