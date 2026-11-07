@@ -281,13 +281,14 @@ def test_action_that_ends_without_a_record_is_reported_for_a_retry(
     server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
     monkeypatch.setenv("HOLBUILD_FAKE_CRASH", "1")
 
-    run_one(
-        Coordinator(server.url, "w"),
-        worker_args(tmp_path, server),
-        releases(tmp_path, server),
-        Protection(None, None),
-        claim(),
-    )
+    with pytest.raises(RuntimeError, match="exited 70 without a result record"):
+        run_one(
+            Coordinator(server.url, "w"),
+            worker_args(tmp_path, server),
+            releases(tmp_path, server),
+            Protection(None, None),
+            claim(),
+        )
 
     assert server.completed == [failed_record(SPEC, "internal")]
 

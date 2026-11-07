@@ -423,9 +423,9 @@ class HostTelemetry:
 
 def failed_record(spec_sha256: str, failure: str) -> str:
     """A result record the worker writes itself: ``spec-rejected`` for an action it won't run, which fails it
-    finally like exec-action's own; ``internal`` for one exec-action ended without a record, or whose spec or
-    release the worker couldn't get, which is retried; or ``unavailable`` for one whose spec the cache couldn't give
-    (no answer, 429 or 5xx), which is retried without counting the attempt."""
+    finally like exec-action's own; ``unavailable`` for one whose spec the cache couldn't give (no answer, 429 or
+    5xx), which is retried without counting the attempt; or ``internal`` for any other error in the worker, such as
+    exec-action ending without a record, which is retried."""
     return f"holbuild-action-result-v1\nspec={spec_sha256}\ninput-key=\nstatus=failed\nfailure={failure}\n"
 
 
@@ -493,55 +493,58 @@ def run_one(
     protection: Protection,
     claim: dict[str, Any],
 ) -> None:
-    """Run one claimed action to its end, or until its lease is lost, and report it."""
+    """Run one claimed action to its end, or until its lease is lost, and report it. An error in the worker is
+    reported for a retry and then raised, so that ``main`` waits before it claims again."""
     token = claim["attempt_token"]
     spec = claim["spec_sha256"]
     print(f"running {claim['theory']} ({claim['input_key']})", file=sys.stderr, flush=True)
     with Lease(coordinator, token, claim["lease_s"], protection).held() as lease:
         try:
-            version = releases.spec_version(spec)
+            record = execute(args, releases, lease, claim)
         except CacheUnavailable:
             # The cache couldn't give the spec, as while it restarts: the action is retried without counting it.
             coordinator.complete(token, failed_record(spec, "unavailable"), claim["lease_s"])
             raise
-        except RuntimeError:
+        except Exception:
+            # The coordinator retries the action now rather than when the lease expires.
             coordinator.complete(token, failed_record(spec, "internal"), claim["lease_s"])
             raise
+        if record is not None:
+            coordinator.complete(token, record, claim["lease_s"])
+
+
+def execute(args: argparse.Namespace, releases: Releases, lease: Lease, claim: dict[str, Any]) -> str | None:
+    """The result record of the claimed action, or None once its lease is lost."""
+    spec = claim["spec_sha256"]
+    try:
+        holbuild = releases.holbuild(releases.spec_version(spec))
+    except Unreleased as error:
+        print(f"refusing {spec}: {error}", file=sys.stderr)
+        return failed_record(spec, "spec-rejected")
+    if lease.lost.is_set():
+        return None
+    with tempfile.TemporaryDirectory() as scratch:
+        result = os.path.join(scratch, "result")
+        # Its own session, so a lost lease stops holbuild's HOL children with it.
+        process = subprocess.Popen(
+            exec_action_command(args, holbuild, spec, result), env=exec_action_env(), start_new_session=True
+        )
         try:
-            holbuild = releases.holbuild(version)
-        except Unreleased as error:
-            print(f"refusing {spec}: {error}", file=sys.stderr)
-            coordinator.complete(token, failed_record(spec, "spec-rejected"), claim["lease_s"])
-            return
-        except (OSError, subprocess.SubprocessError, tarfile.TarError):
-            coordinator.complete(token, failed_record(spec, "internal"), claim["lease_s"])
-            raise
-        if lease.lost.is_set():
-            return
-        with tempfile.TemporaryDirectory() as scratch:
-            result = os.path.join(scratch, "result")
-            # Its own session, so a lost lease stops holbuild's HOL children with it.
-            process = subprocess.Popen(
-                exec_action_command(args, holbuild, spec, result), env=exec_action_env(), start_new_session=True
-            )
-            try:
-                while process.poll() is None:
-                    if lease.lost.wait(1):
-                        return
-            finally:
-                # A lost lease, Ctrl-C or SIGTERM (see main) stops the action rather than leaving it running
-                # unreported. The group outlives holbuild while a HOL child is still in it.
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGTERM)
-                process.wait()
-            if not os.path.exists(result) or os.path.getsize(result) == 0:
-                # It crashed or was killed; the coordinator retries the action now rather than when the lease expires.
-                print(f"exec-action exited {process.returncode} without a result record", file=sys.stderr)
-                coordinator.complete(token, failed_record(spec, "internal"), claim["lease_s"])
-                return
-            with open(result) as file:
-                coordinator.complete(token, file.read(), claim["lease_s"])
-            print(f"{claim['theory']}: exit {process.returncode}", file=sys.stderr, flush=True)
+            while process.poll() is None:
+                if lease.lost.wait(1):
+                    return None
+        finally:
+            # A lost lease, Ctrl-C or SIGTERM (see main) stops the action rather than leaving it running
+            # unreported. The group outlives holbuild while a HOL child is still in it.
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
+            process.wait()
+        if not os.path.exists(result) or os.path.getsize(result) == 0:
+            raise RuntimeError(f"exec-action exited {process.returncode} without a result record")
+        with open(result) as file:
+            record = file.read()
+    print(f"{claim['theory']}: exit {process.returncode}", file=sys.stderr, flush=True)
+    return record
 
 
 def tier_list(text: str) -> list[str]:
@@ -640,10 +643,9 @@ def main() -> None:
             continue
         try:
             run_one(coordinator, args, releases, protection, claim)
-        except (*COORDINATOR_ERRORS, subprocess.SubprocessError, tarfile.TarError) as error:
-            # Reported for a retry where it could be, else the lease expires and the coordinator retries; a rerun
-            # finds a published result cached. Waiting first keeps a worker from failing ready action after ready
-            # action while the cache or the coordinator is down.
+        except Exception as error:  # noqa: BLE001  # run_one reported it where it could; the worker goes on
+            # Else the lease expires and the coordinator retries; a rerun finds a published result cached. Waiting
+            # keeps a worker from failing ready action after ready action while the cache or the coordinator is down.
             print(f"action failed in the worker: {error}", file=sys.stderr)
             time.sleep(CLAIM_RETRY_SECONDS)
 
