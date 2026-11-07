@@ -5327,7 +5327,8 @@ fun prefetch_key (options : build_options) project keys node =
    reports.  Once stop has waited, the remote cache connections the threads
    left idle are closed: the server closes an idle connection after a
    while, and one no later request reuses would stay half-closed until the
-   process exits.  drain keeps them for the next pool's requests. *)
+   process exits.  drain keeps the pool's share of them, up to
+   HolbuildHttp.max_idle, for the next requests. *)
 fun start_background_pool limit work =
   let
     val front = ref [] and back = ref []
@@ -5349,17 +5350,20 @@ fun start_background_pool limit work =
     fun worker item =
       ((work item handle _ => ());
        case with_lock (fn () => case pop () of
-                                    NONE => (active := !active - 1; NONE)
+                                    NONE => (active := !active - 1; HolbuildHttp.release_idle (); NONE)
                                   | next => next) of
            SOME next => worker next
          | NONE => ())
+    (* Each thread holds a reservation of a pooled connection (see
+       HolbuildHttp.max_idle) for as long as it counts in active. *)
     fun add item =
       if with_lock (fn () =>
            if !stopped then false
-           else if !active < limit then (active := !active + 1; true)
+           else if !active < limit then (active := !active + 1; HolbuildHttp.reserve_idle (); true)
            else (back := item :: !back; false))
       then ignore (Thread.fork (fn () => worker item, []))
-           handle e => (with_lock (fn () => active := !active - 1); raise e)
+           handle e => (with_lock (fn () => (active := !active - 1; HolbuildHttp.release_idle ()));
+                        raise e)
       else ()
     fun wait () =
       if with_lock (fn () => !active) > 0 then (OS.Process.sleep (Time.fromReal 0.05); wait ())
@@ -5775,11 +5779,16 @@ fun uncached_parents plan uncached node =
   end
 
 fun publish_spec_blob remote path =
-  case HolbuildRemoteCache.publish_blob remote {hash = HolbuildHash.file_sha256 path, src = path} of
-      HolbuildCacheBackend.Published => ()
-    | HolbuildCacheBackend.AlreadyPresent => ()
-    | HolbuildCacheBackend.Conflict message => raise Error ("could not upload " ^ path ^ ": " ^ message)
-    | HolbuildCacheBackend.Skipped => raise Error ("could not upload " ^ path ^ ": skipped")
+  let val hash = HolbuildHash.file_sha256 path
+  in
+    if HolbuildRemoteCache.blob_confirmed_present remote hash then ()
+    else
+      case HolbuildRemoteCache.publish_blob remote {hash = hash, src = path} of
+          HolbuildCacheBackend.Published => ()
+        | HolbuildCacheBackend.AlreadyPresent => ()
+        | HolbuildCacheBackend.Conflict message => raise Error ("could not upload " ^ path ^ ": " ^ message)
+        | HolbuildCacheBackend.Skipped => raise Error ("could not upload " ^ path ^ ": skipped")
+  end
 
 (* The input keys of the plan's theories whose input key is missing or that
    depend on that theory. *)
@@ -5992,8 +6001,8 @@ fun export_batch (options : build_options) tc project plan toolchain_key jobs {u
     String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n"
   end
 
-(* The check and upload pools leave their connections idle for each other;
-   none is reused after the export, so they are closed. *)
+(* The check pool leaves up to HolbuildHttp.max_idle connections idle for the
+   uploads; none is reused after the export, so they are closed. *)
 fun export_action_specs options tc project plan toolchain_key jobs flags =
   (export_batch options tc project plan toolchain_key jobs flags before HolbuildHttp.close_idle ())
   handle e => (HolbuildHttp.close_idle (); raise e)
