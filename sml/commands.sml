@@ -56,7 +56,7 @@ fun global_help () = print
   \  --quiet, --verbose, --verbosity LEVEL\n\
   \  -j N, -jN, --jobs N\n\
   \  --max-heap MB\n\
-  \  --prefetch-concurrency N     Remote cache entries to prefetch at once\n\
+  \  --prefetch-concurrency N     Remote cache checks/prefetches at once\n\
   \                               (default: 50 or 2 * jobs, whichever is larger)\n\
   \  --cooperate-dir DIR          Share a machine memory budget with other holbuild\n\
   \                               processes using DIR (or $HOLBUILD_COOPERATE_DIR)\n\
@@ -105,7 +105,11 @@ fun build_help () = print
   \  --trknl\n\
   \  --remote-exec URL [--remote-only] [--detach | --attach BATCH-ID]\n\n\
   \With --remote-exec, theories the remote cache lacks are built by the\n\
-  \coordinator's workers and restored from the remote cache. Needs\n\
+  \coordinator's workers and restored from the remote cache, except a\n\
+  \theory nothing else in the batch depends on, which builds locally when\n\
+  \its local checkpoints are current, or when it is the only theory to\n\
+  \build and its dependencies are built here (not with --detach; see the\n\
+  \README). Needs\n\
   \--remote-cache. A closure that can't run remotely or an unreachable\n\
   \coordinator builds locally; --remote-only fails instead, with exit\n\
   \status 75. --detach submits the batch and exits; --attach follows a\n\
@@ -1298,7 +1302,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       let val ({plan, toolchain_key, ...}, build_options) = plan_build ()
       in
         timed_phase "action_spec.export"
-          (fn () => print (HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key upload))
+          (fn () => print (HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key jobs
+                             {upload = upload, local_resumable = false, remote_only = false}))
       end
     (* Theories the remote cache lacks go to the coordinator as a batch; once
        it finishes, the ordinary build restores them from the remote cache. *)
@@ -1310,7 +1315,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         val ({plan, toolchain_key, ...}, build_options) = plan_build ()
         fun export upload =
           timed_phase "action_spec.export"
-            (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key upload)
+            (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key jobs
+                        {upload = upload, local_resumable = not detach, remote_only = remote_only})
         fun batch_keys batch =
           List.mapPartial (fn line => case String.tokens Char.isSpace line of
                                           "action" :: key :: _ => SOME key
@@ -1382,7 +1388,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           end
         (* A batch that abandon would cancel is cancelled on an interrupt too.
            While it runs, the entries of the theories it finishes, and of a
-           submitted batch the theories outside it, which the remote cache
+           submitted batch the theories outside it that the remote cache
            already holds, are copied into the local cache, for the build
            that follows to restore.  An attached batch's theories are
            unknown, so none of the others are copied before it ends. *)
@@ -1420,7 +1426,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 else abandon batch_id (reason ^ "; " ^ finished progress)
         fun submit batch =
           if null (batch_keys batch) then
-            (HolbuildStatus.message_stderr "holbuild: remote execution: the remote cache has every theory\n";
+            (HolbuildStatus.message_stderr "holbuild: remote execution: nothing to build remotely\n";
              build_locally ())
           else
             case HolbuildRemoteExec.submit url batch of

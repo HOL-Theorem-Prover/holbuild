@@ -68,8 +68,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         while not (control / f"{stem}-release").exists():
             time.sleep(0.01)
 
+    def gate_action_get(self) -> None:
+        if control is None or not self.path.startswith("/ac/"):
+            return
+        if not (control / "action-get-enable").exists():
+            return
+        with action_put_lock:
+            count_file = control / "action-get-count"
+            count = int(count_file.read_text()) if count_file.exists() else 0
+            count_file.write_text(str(count + 1))
+        while not (control / "action-get-release").exists():
+            time.sleep(0.01)
+
     def do_GET(self):
         self.record_request()
+        self.gate_action_get()
         if not self.authorized():
             return
         if control is not None and (control / "get-status").exists():
