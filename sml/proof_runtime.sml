@@ -534,19 +534,15 @@ fun failed_prefix_texts () =
    heap in the hierarchy.  Poly read the loaded heap whole, so the process no
    longer needs its file.
 
-   The new heap is written at its final path, since the hierarchy, and so any
-   later child heap, names it by path.  So the old files are moved aside first
-   and put back if anything fails: a failed write leaves the old checkpoint
-   usable.  Moving them rather than writing over them also leaves copies
-   hard-linked elsewhere alone (see HolbuildCheckpointSaveRuntime.begin_replacement). *)
-(* The new checkpoint is written under a temporary name and renamed into place
-   only once complete, so a process killed mid-save leaves the old one intact.
-   Renaming the heap is safe here: a heap's header names only its parent, and
-   this failing process saves no child under it.  Renames also replace the old
-   directory entries rather than writing into the old files, which may be links
-   into a shared store (see HolbuildCheckpointSaveRuntime.begin_replacement).
-   The old .ok goes first and the new .ok last, so the files are never resumed
-   as a mixed set. *)
+   The new checkpoint is written under a temporary name and renamed into place
+   once complete, so a process killed mid-save leaves the old one intact; only
+   the few renames that install it can leave neither.  Renaming the heap is
+   safe here: a heap's header names only its parent, and this failing process
+   saves no child under it.  Renames also replace the old directory entries
+   rather than writing into the old files, which may be links into a shared
+   store (see HolbuildCheckpointSaveRuntime.begin_replacement).  The old .ok
+   goes first and the new .ok last, so the files are never resumed as a mixed
+   set. *)
 fun advance_failed_prefix_checkpoint path ok_text depth =
   let
     val new = path ^ ".new"

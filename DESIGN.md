@@ -828,7 +828,8 @@ hierarchy, as a child of the loaded heap's parent: it replaces the loaded heap
 in the hierarchy and leaves the parent as it is. Poly read the loaded heap
 whole, so its file can go. The new checkpoint's files are written under a
 temporary name and renamed into place once all of them are complete, so a
-process killed mid-save leaves the old checkpoint usable. A heap's header names
+process killed mid-save leaves the old checkpoint usable; only the few renames
+that install the new one can leave neither. A heap's header names
 only its parent, and the failing process saves nothing under the new heap, so
 renaming it keeps it loadable.
 If snapshot validation, history rewind, or structural resume fails, replay is

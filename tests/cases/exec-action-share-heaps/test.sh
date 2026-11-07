@@ -212,6 +212,30 @@ export_t v4
 worker v4 "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v4 1 "status=failed" "failure=proof"
 require_grep "seeded failure" "$tmpdir/v4.log"
+# A resume that gets past the shared failed prefix and fails later shares
+# the later prefix in its place, and the next resume starts from that.
+restored_steps() {
+  sed -n 's/.*restoring proof-ir prefix with \([0-9]*\) successful leaf steps.*/\1/p' "$tmpdir/$1.log" | tail -1
+}
+write_t "T \\/ F" "ALL_TAC >> FAIL_TAC \"later failure\""
+export_t v4a
+forget_local
+worker v4a "$shared_url" "$shared" "$spec_t" --share-heaps
+expect v4a 1 "status=failed" "failure=proof"
+require_grep "later failure" "$tmpdir/v4a.log"
+resumed v4a "failed-prefix checkpoint in t3" "failed_prefix checkpoint"
+forget_local
+worker v4b "$shared_url" "$shared" "$spec_t" --share-heaps
+expect v4b 1 "status=failed" "failure=proof"
+resumed v4b "failed-prefix checkpoint in t3" "failed_prefix checkpoint"
+v4a_steps=$(restored_steps v4a)
+v4b_steps=$(restored_steps v4b)
+[[ -n "$v4a_steps" && -n "$v4b_steps" && "$v4b_steps" -gt "$v4a_steps" ]] || {
+  echo "the resume after a later failure restored $v4b_steps steps, the one before $v4a_steps" >&2
+  cat "$tmpdir/v4b.log" >&2
+  exit 1
+}
+
 write_t "T \\/ F" "rw[]"
 export_t v5
 cold v5 0

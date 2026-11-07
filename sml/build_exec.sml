@@ -7189,11 +7189,17 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
       in
         loop path []
       end
+    (* A failed prefix's key doesn't say how far the prefix goes, so a run
+       that resumed from the shared one and saved another in its place (it got
+       further, or the restored one didn't validate) replaces the entry. *)
+    fun replaces_restored path =
+      List.exists (fn (p, sha) => p = path andalso (HolbuildHash.file_sha256 path <> sha handle _ => false))
+                  restored
     fun publish_candidate heap (c : shared_candidate) =
       let val key = shared_checkpoint_key heap_key (#kind c) (#key c)
       in
         if not (checkpoint_exists (#path c)) orelse was_restored (#path c) orelse not (#accepts c ()) orelse
-           present key then ()
+           (present key andalso not (#kind c = "failed_prefix" andalso replaces_restored (#path c))) then ()
         else
           case ancestors (#path c) of
               NONE => warn ("shared checkpoint chain is not on the heap: " ^ #path c)
