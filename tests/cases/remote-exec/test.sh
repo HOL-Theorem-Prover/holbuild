@@ -538,10 +538,20 @@ require_grep "^action .* rx:BTheory$" "$state/$batch.batch"
 require_grep "^action .* rx:CTheory$" "$state/$batch.batch"
 require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/built-here-batch.log"
 [[ -e "$remote_root/ac/$ac_a" ]] || { echo "ATheory was not published" >&2; exit 1; }
+# A theory edited alone goes to the workers too, though its dependencies are
+# built here and its local checkpoints are current.
+find "$project/.holbuild/checkpoints" -path '*BScript*' -name deps_loaded.save | grep -q . ||
+  { echo "BTheory has no deps_loaded checkpoint" >&2; exit 1; }
+sed -i 's/(\* built-here-batch \*)/(* built-here-alone *)/' "$project/src/BScript.sml"
+run built-here-alone 0 build --remote-exec "$coordinator" BTheory
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/built-here-alone.log")
+require_grep "^action .* rx:BTheory$" "$state/$batch.batch"
+refute_grep "^action .* rx:ATheory$" "$state/$batch.batch"
+require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/built-here-alone.log"
 # Without a local cache entry to publish, it goes to the workers.
 rm "$remote_root/ac/$ac_a"
 rm -r "$HOLBUILD_CACHE/actions/$key_a"
-sed -i 's/(\* built-here-batch \*)/(* built-here-unpublished *)/' "$project/src/BScript.sml"
+sed -i 's/(\* built-here-alone \*)/(* built-here-unpublished *)/' "$project/src/BScript.sml"
 sed -i 's/simp\[\]$/simp[] (* unpublished *)/' "$project/src/CScript.sml"
 run built-here-unpublished 0 build --remote-exec "$coordinator" BTheory CTheory
 batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/built-here-unpublished.log")
