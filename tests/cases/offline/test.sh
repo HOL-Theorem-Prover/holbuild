@@ -243,7 +243,7 @@ val _ = assert "curl CLI"
   (case HolbuildRemoteCache.curl_get {url=url, dst=tmp ^ "/cli-get"} of
        HolbuildCacheBackend.Corrupt message => String.isSubstring "offline" message
      | _ => false);
-val _ = denied "submit" (fn () => ignore (HolbuildRemoteExec.submit url "batch"));
+val _ = denied "submit" (fn () => ignore (HolbuildRemoteExec.submit url NONE "batch"));
 val _ = denied "follow" (fn () => ignore (HolbuildRemoteExec.follow url "batch" (fn _ => ())));
 val _ = denied "cancel" (fn () => ignore (HolbuildRemoteExec.cancel url "batch"));
 val _ = denied "restore" (fn () => ignore (HolbuildHolSharedCache.restore_entry "missing"));

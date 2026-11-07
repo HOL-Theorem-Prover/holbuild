@@ -101,6 +101,7 @@ class Claim:
     input_key: str
     theory: str
     lease_s: int
+    max_heap_mb: int | None
 
 
 @dataclass(frozen=True)
@@ -324,7 +325,7 @@ WITH run_capacity AS MATERIALIZED (
         SELECT count(*) FROM actions WHERE state = 'running' AND class = 'run'
     ) < :run_slots AS available
 ), ready_batches AS MATERIALIZED (
-    SELECT b.id, b.created_at,
+    SELECT b.id, b.created_at, b.max_heap_mb,
         (SELECT count(*) FROM actions r WHERE r.batch_id = b.id AND r.state = 'running') AS running_count,
         (SELECT max(c.last_claimed_at) FROM actions c WHERE c.batch_id = b.id) AS last_claimed_at
     FROM batches b
@@ -333,7 +334,7 @@ WITH run_capacity AS MATERIALIZED (
         AND (class = 'build' OR (SELECT available FROM run_capacity))
     )
 )
-SELECT a.batch_id, a.input_key, a.spec_sha256, a.theory
+SELECT a.batch_id, a.input_key, a.spec_sha256, a.theory, b.max_heap_mb
 FROM actions a
 JOIN ready_batches b ON b.id = a.batch_id
 WHERE a.state = 'ready' AND a.tier = ANY(CAST(:tiers AS text[]))
@@ -421,7 +422,9 @@ class Coordinator:
         await self.cache.aclose()
         await self.engine.dispose()
 
-    async def submit(self, batch: Batch, profile: str, action_class: str = "build") -> UUID:
+    async def submit(
+        self, batch: Batch, profile: str, action_class: str = "build", max_heap_mb: int | None = None
+    ) -> UUID:
         """Store a batch; its actions without uncached parents become ready."""
         batch_id = uuid4()
         parents: defaultdict[str, int] = defaultdict(int)
@@ -442,8 +445,16 @@ class Coordinator:
             )
             high = {theory for theory, peak in hints if peak >= self.settings.standard_tier_mb}
             await conn.execute(
-                sa.text("INSERT INTO batches (id, state, profile) VALUES (:id, :state, :profile)"),
-                {"id": batch_id, "state": "running" if batch.actions else "done", "profile": profile},
+                sa.text(
+                    "INSERT INTO batches (id, state, profile, max_heap_mb) "
+                    "VALUES (:id, :state, :profile, :max_heap_mb)"
+                ),
+                {
+                    "id": batch_id,
+                    "state": "running" if batch.actions else "done",
+                    "profile": profile,
+                    "max_heap_mb": max_heap_mb,
+                },
             )
             if batch.actions:
                 await conn.execute(
@@ -607,7 +618,7 @@ class Coordinator:
                     "lease": self.settings.lease_seconds,
                 },
             )
-        return Claim(token, row.spec_sha256, row.input_key, row.theory, self.settings.lease_seconds)
+        return Claim(token, row.spec_sha256, row.input_key, row.theory, self.settings.lease_seconds, row.max_heap_mb)
 
     def _wake_claim(self, tier: str) -> None:
         """Count an action of ``tier`` made ready, and wake the longest waiting claim that takes it."""
