@@ -819,6 +819,16 @@ holbuild can opportunistically choose the longest still-valid leaf prefix, rewin
 the retained HOL proof history by history operations—not merely successful leaf
 count—to that prefix, restore the recorded structural focus state, and continue
 from the current Proof-IR plan.
+A resumed proof that gets past the restored prefix and fails later saves a new
+failed-prefix checkpoint in place of the one it resumed from, so the next
+rebuild starts from the later failure; one that fails at the restored step
+leaves the checkpoint alone. The resumed process runs in the heap it loaded
+from that checkpoint, so the new heap is saved one level up Poly's hierarchy,
+as a child of the loaded heap's parent: it replaces the loaded heap in the
+hierarchy and leaves the parent as it is. Poly read the loaded heap whole, so
+its file can go. Child heaps name their parent by path, so the new heap is
+written at the checkpoint's own path, not renamed into place; the old files are
+moved aside first and put back if the save fails.
 If snapshot validation, history rewind, or structural resume fails, replay is
 rejected and holbuild falls back to an earlier valid checkpoint. Future
 incrementality work should make this opportunistic reuse fire in more structural
