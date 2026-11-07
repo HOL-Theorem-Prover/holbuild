@@ -312,6 +312,10 @@ class Coordinator:
         self.found_in_cache: dict[str, float] = {}
         self.cache_checks: dict[str, asyncio.Task[bool | None]] = {}
         self.cache_forgotten = 0
+        # The batches whose releases were asked for and not yet started, None for every batch, and the task that
+        # runs them; see request_release.
+        self.release_pending: set[UUID | None] = set()
+        self.releaser: asyncio.Task[None] | None = None
         # What workers reported of their hosts, by host id, and when. Kept in memory: each coordinator process
         # knows the hosts whose workers' requests reached it.
         self.hosts: dict[str, tuple[datetime, HostReport]] = {}
@@ -343,6 +347,10 @@ class Coordinator:
         )
 
     async def aclose(self) -> None:
+        if self.releaser is not None:
+            self.releaser.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.releaser
         await self.cache.aclose()
         await self.engine.dispose()
 
@@ -635,8 +643,35 @@ class Coordinator:
                 await self._input_missing(conn, batch_id, action.input_key, action.theory, action.attempts, result)
             else:
                 await self._fail_batch(conn, batch_id, action.input_key, f"{action.theory}: {result.failure}")
-        await self.release(batch_id)
+        self.request_release(batch_id)
         return True
+
+    def request_release(self, batch_id: UUID | None = None) -> None:
+        """Have ``release`` run for ``batch_id``, or every batch, in the background, so neither a worker's
+        completion nor the sweep waits on the cache requests it makes.
+
+        One task runs the releases asked for, a pass at a time: the requests that arrive during a pass are run
+        together in the next, so a burst of completions in one batch costs one more pass, not one each. What is
+        releasable is read from the database on each pass, so requests lost with the process are made again by
+        the next sweep.
+        """
+        self.release_pending.add(batch_id)
+        if self.releaser is None or self.releaser.done():
+            self.releaser = asyncio.get_running_loop().create_task(self._run_releases())
+
+    async def _run_releases(self) -> None:
+        while self.release_pending:
+            pending, self.release_pending = self.release_pending, set()
+            for batch_id in [None] if None in pending else pending:
+                try:
+                    await self.release(batch_id)
+                except Exception:
+                    logger.exception("releasing %s failed", "every batch" if batch_id is None else batch_id)
+
+    async def released(self) -> None:
+        """Wait until no release asked for is pending or running."""
+        while self.releaser is not None and not self.releaser.done():
+            await asyncio.shield(self.releaser)
 
     async def release(self, batch_id: UUID | None = None) -> None:
         """Make waiting actions whose parents are all done ready, once the cache holds each parent's entry and blobs.
@@ -683,7 +718,7 @@ class Coordinator:
     async def expire_leases(self) -> None:
         """Send the actions of expired leases back to waiting, or fail them once they used up their attempts.
 
-        ``sweep`` releases them afterwards.
+        ``sweep`` asks for their release afterwards.
         """
         async with self.engine.connect() as conn:
             expired = list(
@@ -791,8 +826,9 @@ class Coordinator:
         return QueueStatus(counts, max(desired, demand), sorted(hosts, key=lambda h: h.report.id))
 
     async def sweep(self) -> None:
-        """The periodic pass: expired leases, releases a failed HEAD left waiting, retention, then the burst
-        worker target, which the scale command gets whenever it changes.
+        """The periodic pass: expired leases, a release of every batch in the background (for actions those
+        leases or a failed HEAD left waiting), retention, then the burst worker target, which the scale command gets
+        whenever it changes.
 
         The demand samples behind the target are in the database, so a restarted coordinator keeps holding it. A
         failing scale command is logged and retried on the next sweep; it never stops the sweep.
@@ -801,7 +837,7 @@ class Coordinator:
         self.found_in_cache = {key: at for key, at in self.found_in_cache.items() if at > trusted_since}
         await self.expire_leases()
         await self.fail_overdue()
-        await self.release()
+        self.request_release()
         await self.delete_expired()
         counts = (await self.queue()).counts
         demand = burst_demand(counts, self.settings.warm_workers, self.settings.max_burst_workers)

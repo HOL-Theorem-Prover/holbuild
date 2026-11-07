@@ -109,11 +109,26 @@ async def coordinator(remote_exec_engine: AsyncEngine, cache: FakeCache) -> Asyn
         events_poll_seconds=0.01,
     )
     async with httpx.AsyncClient(base_url=settings.cache_url, transport=httpx.MockTransport(cache.handle_async)) as client:
-        yield Coordinator(remote_exec_engine, client, settings)
+        coordinator = Coordinator(remote_exec_engine, client, settings)
+        yield coordinator
+        await coordinator.released()
+
+
+class Settled(httpx.ASGITransport):
+    """Answers each request once the releases it asked for have run, so a test sees their effect."""
+
+    def __init__(self, app: object, coordinator: Coordinator) -> None:
+        super().__init__(app=app)
+        self.coordinator = coordinator
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        response = await super().handle_async_request(request)
+        await self.coordinator.released()
+        return response
 
 
 @pytest_asyncio.fixture
 async def http(coordinator: Coordinator) -> AsyncIterator[httpx.AsyncClient]:
     app = create_app(coordinator, coordinator.settings)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://coordinator.test") as client:
+    async with httpx.AsyncClient(transport=Settled(app, coordinator), base_url="http://coordinator.test") as client:
         yield client
