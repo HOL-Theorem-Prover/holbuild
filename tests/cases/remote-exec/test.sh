@@ -561,6 +561,22 @@ require_grep "BTheory built" "$tmpdir/leaf-deps.log"
 refute_grep "^POST /v1/batches" "$state/requests.log"
 find "$project/.holbuild/checkpoints" -path '*BScript*' -name deps_loaded.save | grep -q . ||
   { echo "BTheory's build left no deps_loaded checkpoint" >&2; exit 1; }
+# Two such leaves, as after a merge, both go to the workers; so does a
+# theory with no project dependencies that was never built here.
+rm -r "$project/.holbuild/checkpoints"
+sed -i 's/(\* leaf-deps \*)/(* leaf-many *)/' "$project/src/BScript.sml"
+printf 'Theory C\nAncestors A\n\nTheorem c_thm:\n  T\nProof\n  simp[]\nQED\n' > "$project/src/CScript.sml"
+run leaf-many 0 build --remote-exec "$coordinator" BTheory CTheory
+refute_grep "stays out of the batch" "$tmpdir/leaf-many.log"
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/leaf-many.log")
+require_grep "^action .* rx:BTheory$" "$state/$batch.batch"
+require_grep "^action .* rx:CTheory$" "$state/$batch.batch"
+printf 'Theory D\nAncestors bool\n\nTheorem d_thm:\n  T\nProof\n  simp[]\nQED\n' > "$project/src/DScript.sml"
+run leaf-cold 0 build --remote-exec "$coordinator" DTheory
+refute_grep "stays out of the batch" "$tmpdir/leaf-cold.log"
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/leaf-cold.log")
+require_grep "^action .* rx:DTheory$" "$state/$batch.batch"
+rm "$project/src/CScript.sml" "$project/src/DScript.sml"
 
 # A submission answered 502 while the coordinator restarts is retried, and
 # given up on when it stays down.

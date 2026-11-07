@@ -1225,8 +1225,10 @@ for the build that follows it to build locally, when either holds:
   [Proof steps and checkpoints](#proof-steps-and-checkpoints)): its
   `deps_loaded` checkpoint, on which every other checkpoint it resumes from
   sits, matches its current dependencies;
-- every project theory it depends on is built here for its current source,
-  and it has at least one, or was itself built here before.
+- it is the only theory to build, and every project theory it depends on is
+  built here for its current source, and it has at least one, or was itself
+  built here before. Several such theories, as after a merge, build faster
+  side by side on the workers.
 
 A worker has none of the project's checkpoints, runs the theory from scratch
 and loads its dependencies from the cache. Built locally, it resumes from its

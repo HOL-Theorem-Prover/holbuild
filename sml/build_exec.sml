@@ -5766,9 +5766,9 @@ fun publish_spec_blob remote path =
    satisfy, uploads them and their sources with upload, and returns the batch.
    With local_resumable, a leaf of the batch (no theory in it depends on it)
    is left out, for the local build that follows to build, when its local
-   build would resume from a checkpoint, or when its project dependencies are
-   all built here for their current sources (and it has some, or was built
-   here before).  Either is faster than running it on a worker, which loads
+   build would resume from a checkpoint, or when it is the only theory to
+   build and its project dependencies are all built here for their current
+   sources (and it has some, or was built here before).  Either is faster than running it on a worker, which loads
    the dependencies from the cache and has none of the project's checkpoints,
    and the local build leaves checkpoints for the next one.  remote_only
    builds nothing locally, so under it only the first leaves are left out,
@@ -5822,6 +5822,9 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       deps_built_for_current_sources project plan keys node andalso
       (not (null (HolbuildBuildPlan.transitive_project_deps plan node)) orelse
        isSome (current_metadata (metadata_path project node)))
+    (* Many theories changed on dependencies built here, as after a merge,
+       build faster side by side on the workers; one alone is an edit loop. *)
+    val alone = length uncached_actions = 1
     fun local_reason parent_keys (node, _) =
       if not (leaf parent_keys node andalso
               checkpoint_enabled (checkpoint_policy_for_node options project node)) then NONE
@@ -5829,7 +5832,7 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
         SOME ("to resume from its local checkpoints" ^
               (if remote_only then "; --remote-only builds nothing locally, so build it without --remote-only"
                else ""))
-      else if not remote_only andalso deps_built_here node then
+      else if not remote_only andalso alone andalso deps_built_here node then
         SOME "to build on its dependencies built here"
       else NONE
     val (local_actions, uncached_actions) =
