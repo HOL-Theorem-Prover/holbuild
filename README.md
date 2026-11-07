@@ -269,6 +269,7 @@ holbuild executable runtests
 holbuild export -o build-output.hbx MyTheory
 holbuild import build-output.hbx
 holbuild --remote-cache URL action-spec --upload MyTheory
+holbuild --remote-cache URL run-action --export-only --script s.sml --output out MyTheory
 holbuild clean MyTheory
 holbuild gc
 ```
@@ -1170,6 +1171,89 @@ action-text
 - The `option` lines are how the theory is run, which the action key leaves
   out; the entry built under them carries the timeout contract the exporting
   build will ask for.
+
+### Exporting script runs for remote execution
+
+A *run* is an SML script run in the context of a built theory: HOL started
+from the toolchain, the theory's ancestry restorable, libraries loaded, and
+the script's declared output files kept. Its result is keyed by what it
+reads, so the same run is done once. `run-action --export-only` writes and
+uploads the run spec of each target; this release does not run or fetch them.
+
+```sh
+holbuild --remote-cache https://cache.example.org run-action --export-only \
+  --script run.sml [--support F]... [--load L]... --output N... \
+  [--option timeout=SECONDS] TARGET...
+```
+
+A TARGET is a project theory (a logical name as `build` takes it, or
+`<package>:<logical>`), a theory of the HOL toolchain (`hol:bool` or
+`hol:boolTheory`), or `hol:*` for every theory in the toolchain's `sigobj`. A
+project theory must already be in the local cache for its current inputs;
+otherwise that target is refused with `build it first`, the others are still
+exported, and the command exits 1. `--support` files must lie under the
+script's directory and are named relative to it. `--load` names a library: one
+in the toolchain's `sigobj`, or a source the project plans (including the
+implicit `hol` package's libraries). The command takes `build`'s cache and
+proof options and prints one line per exported target:
+
+```text
+<context> <run_key> <spec-sha256>
+```
+
+The spec is written to `.holbuild/run-specs/<spec-sha256>` and uploaded to
+`/cas/` with every file it names. The run key is the SHA-256 of the run text:
+
+```text
+holbuild-run-v1
+toolchain=<semantic toolchain key>
+context=<package>:<logical>@<input_key>   (or context=HOL:<logical>)
+script=<sha256>
+support=<relpath>@<sha256>                  (sorted)
+load=<package>:<logical>@<input_key>        (a project library; in order)
+load=<name>                                 (a toolchain or hol package library)
+output=<name>                               (sorted)
+```
+
+The toolchain key fixes HOL's own theories and libraries, so they carry no
+key of their own. Options such as the timeout stay out of the key: a longer
+timeout doesn't make a new run. A run's result is stored, like a theory's,
+under `ac-key = sha256("holbuild-remote-ac-v1\n" ^ run_key ^ "\n")`.
+
+A run spec names no path on the exporting machine:
+
+```text
+holbuild-run-spec-v1
+holbuild-version=<version>
+holbuild-runtime=<sha256 of the holbuild sources a theory child loads>
+toolchain git=<url> rev=<rev> kernel=<variant>
+run-key=<run_key>
+context <package>:<logical> <stem> <input_key>   (or context HOL:<logical>)
+file library <relpath> <sha256> <size>
+dep theory <package>:<logical> <stem> <input_key>
+lib <package>:<logical> <stem> <suffix> <load>...
+load theory|library|object <name-or-stem>
+file context-script <relpath> <sha256> <size>
+script <sha256> <size>
+file support <relpath> <sha256> <size>
+run-load <package>:<logical>|HOLLIB:<name>
+output <name>
+option timeout=<seconds>                         (only when given)
+run-text
+<the run text, verbatim to the end of the blob>
+```
+
+- For a project context, the `toolchain`, `file library`, `dep theory`, `lib`
+  and `load` lines are the context theory's ActionSpec lines, followed by the
+  `file library`, `lib` and `dep theory` lines of what the `--load` libraries
+  need beyond them. A HOL context has only the latter.
+- `context` names the theory to restore, as a `dep theory` line does.
+- `file context-script` lines are the scripts of the context theory and of
+  every theory it depends on, under `.holbuild/action-src/<package>/`, for
+  scripts that read their ancestry's sources.
+- `run-load` lines are the libraries to load, in order: a project library by
+  its `lib` line's name, a toolchain library as `HOLLIB:<name>`.
+- `output` lines are the file names the script must write.
 
 ### Running one theory action as a remote worker
 
