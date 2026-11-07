@@ -260,7 +260,8 @@ type t =
    extra_inputs_key_cache : string option option array,
    input_expansions : (string, input_expansion) Binarymap.dict ref,
    input_hashes : (string, string) Binarymap.dict ref,
-   known_input_keys : known_input_key option array}
+   known_input_keys : known_input_key option array,
+   holdir : string}
 
 fun universe_nodes ({universe, ...} : t) = universe
 fun root_nodes ({roots, ...} : t) = roots
@@ -938,7 +939,7 @@ fun write_test_dependency_graph graph_id plan_id resolved_id (graph : resolved_d
         in TextIO.closeOut output end
 
 fun assemble {nodes, name_index, roots, selected, analysis, dependency_graph, resolution_context_id,
-              selected_graph_id, selected_plan_id, resolved_plan_id} : t =
+              selected_graph_id, selected_plan_id, resolved_plan_id, holdir} : t =
   let
     val selected_key_index = build_key_index selected
   in
@@ -958,7 +959,8 @@ fun assemble {nodes, name_index, roots, selected, analysis, dependency_graph, re
      extra_inputs_key_cache = Array.array(length selected, NONE),
      input_expansions = ref (Binarymap.mkDict String.compare),
      input_hashes = ref (Binarymap.mkDict String.compare),
-     known_input_keys = Array.array(length selected, NONE)}
+     known_input_keys = Array.array(length selected, NONE),
+     holdir = holdir}
   end
 
 fun plan_selection components holdir sources selection =
@@ -1000,7 +1002,7 @@ fun plan_selection components holdir sources selection =
     assemble {nodes = nodes, name_index = index, roots = roots, selected = selected, analysis = analysis,
               dependency_graph = dependency_graph, resolution_context_id = resolution_context_id,
               selected_graph_id = selected_graph_id, selected_plan_id = selected_plan_id,
-              resolved_plan_id = resolved_plan_id}
+              resolved_plan_id = resolved_plan_id, holdir = holdir}
   end
 
 (* The plan an earlier planning run made over the same discovered sources,
@@ -1043,7 +1045,7 @@ fun restore {holdir, sources, roots, selected, analysis, edges,
               selected = selected_nodes, analysis = analysis,
               dependency_graph = dependency_graph, resolution_context_id = resolution_context_id,
               selected_graph_id = selected_graph_id, selected_plan_id = selected_plan_id,
-              resolved_plan_id = resolved_plan_id}
+              resolved_plan_id = resolved_plan_id, holdir = holdir}
   end
 
 fun plan_all components holdir sources =
@@ -1226,6 +1228,30 @@ fun extra_inputs_key (plan as {extra_inputs_key_cache, ...} : t) node =
       SOME value => value
     | NONE => raise Error ("internal error: extra-inputs key not computed for " ^ logical_name node)
 
+(* The script's path in recorded theorem locations, in holpathdb form so that
+   a cached theory carries no path of the checkout that built it: a package's
+   sources under its package name by default, and sources under the HOL
+   toolchain under `$(HOLDIR)`, as HOL records its own theories. *)
+fun default_source_name package relative_path = "$(" ^ package ^ ")/" ^ relative_path
+
+(* The script's recorded path when it isn't the default: a package can sit
+   under the toolchain without being `hol`, so this needs the source's path,
+   which only the planning side has.  The action text carries it to workers. *)
+fun toolchain_source_name ({holdir, ...} : t) node =
+  let
+    val path = normalize_path (#source_path (source_of node))
+    val dir = normalize_path holdir
+  in
+    if holdir <> "" andalso String.isPrefix (dir ^ "/") path then
+      SOME ("$(HOLDIR)/" ^ String.extract(path, size dir + 1, NONE))
+    else NONE
+  end
+
+fun source_name plan node =
+  case toolchain_source_name plan node of
+      SOME name => name
+    | NONE => default_source_name (package node) (#relative_path (source_of node))
+
 (* The lines of a node's action, with each project dependency written by
    DEP_TEXT and the node's extra inputs as INPUT_LINES. *)
 fun action_lines_with plan config_lines_for_node toolchain_key dep_text input_lines node =
@@ -1253,8 +1279,11 @@ fun action_lines_with plan config_lines_for_node toolchain_key dep_text input_li
      "package=" ^ #package source,
      "logical=" ^ #logical_name source,
      "source=" ^ #relative_path source,
-     "source-sha256=" ^ source_hash,
-     "cache=" ^ bool_text (HolbuildProject.action_cache_enabled policy),
+     "source-sha256=" ^ source_hash] @
+    (case (#kind source, toolchain_source_name plan node) of
+         (HolbuildSourceIndex.TheoryScript, SOME name) => ["source-name=" ^ name]
+       | _ => []) @
+    ["cache=" ^ bool_text (HolbuildProject.action_cache_enabled policy),
      "always_reexecute=" ^ bool_text (HolbuildProject.action_always_reexecute policy)] @
     config_lines_for_node node @
     declared_dep_lines @

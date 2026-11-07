@@ -667,15 +667,6 @@ fun holpath_reference path dir name =
     SOME ("$(" ^ name ^ ")/" ^ String.extract(path, size dir + 1, NONE))
   else NONE
 
-(* The script's path in recorded theorem locations, in holpathdb form so that
-   a cached theory carries no path of the checkout that built it: HOL's own
-   sources under `$(HOLDIR)`, as HOL records them, and other packages under
-   their package name. *)
-fun located_source_name holdir node =
-  case holpath_reference (canonical_path (source_file node)) (canonical_path holdir) "HOLDIR" of
-      SOME name => name
-    | NONE => "$(" ^ package node ^ ")/" ^ HolbuildBuildPlan.relative_path node
-
 fun holpath_stage_references path =
   let
     val canonical = canonical_path path
@@ -2440,13 +2431,16 @@ fun pre_theorem_hash source theorem_start =
 
 (* Checkpoints save state from running the script up to a boundary.  Besides
    the source prefix, that run may have read the node's extra inputs, so
-   their contents are part of the prefix identity.  Without extra inputs the
-   key is the plain source prefix hash. *)
-fun script_prefix_key NONE source_prefix_hash = source_prefix_hash
-  | script_prefix_key (SOME inputs_key) source_prefix_hash =
+   their contents are part of the prefix identity, and the theorems it saved
+   carry the script's recorded path, so a path other than the package default
+   is too.  Without either the key is the plain source prefix hash. *)
+fun script_prefix_key NONE NONE source_prefix_hash = source_prefix_hash
+  | script_prefix_key inputs_key source_name source_prefix_hash =
       HolbuildToolchain.hash_text
-        ("holbuild-script-prefix-v1\nsource_prefix=" ^ source_prefix_hash ^
-         "\nextra_inputs=" ^ inputs_key ^ "\n")
+        (String.concat
+           (["holbuild-script-prefix-v1\nsource_prefix=", source_prefix_hash, "\n"] @
+            (case inputs_key of SOME key => ["extra_inputs=", key, "\n"] | NONE => []) @
+            (case source_name of SOME name => ["source_name=", name, "\n"] | NONE => [])))
 
 fun failed_prefix_diagnostic_key proof_engine = proof_engine ^ ":finish_goal_state_v2"
 (* Failed-prefix heaps retain the proof runtime and its compiled tactic refs. *)
@@ -2465,19 +2459,24 @@ fun failed_prefix_ok proof_engine proof_timeout deps_key safe_name pre_hash head
      ("theorem_locations", theorem_location_schema),
      ("termination_goals", termination_goal_schema)]
 
-fun theorem_checkpoint_specs proof_engine proof_timeout base deps_key inputs_key source proof_ir_plans (boundaries : HolbuildTheoryCheckpoints.boundary list) =
+fun nondefault_source_name (action : theory_action) =
+  if #source_name action = HolbuildBuildPlan.default_source_name (#package action) (#relative_path action)
+  then NONE
+  else SOME (#source_name action)
+
+fun theorem_checkpoint_specs proof_engine proof_timeout base deps_key inputs_key source_name source proof_ir_plans (boundaries : HolbuildTheoryCheckpoints.boundary list) =
   let
     fun pair (boundary, proof_ir_plan) =
       let
         val {kind, name, safe_name, theorem_start, theorem_stop, boundary = boundary_pos, tactic_start,
              tactic_end, tactic_text, has_proof_attrs, prefix_hash = source_prefix_hash} = boundary
-        val prefix_hash = script_prefix_key inputs_key source_prefix_hash
+        val prefix_hash = script_prefix_key inputs_key source_name source_prefix_hash
         val checkpoint_key = theorem_checkpoint_key {kind = kind, name = name, safe_name = safe_name,
                                                      boundary = boundary_pos, deps_key = deps_key,
                                                      proof_engine = proof_engine,
                                                      prefix_hash = prefix_hash}
         val header_hash = theorem_header_hash source theorem_start tactic_start
-        val pre_hash = script_prefix_key inputs_key (pre_theorem_hash source theorem_start)
+        val pre_hash = script_prefix_key inputs_key source_name (pre_theorem_hash source theorem_start)
       in
         {kind = kind, name = name, safe_name = safe_name, theorem_start = theorem_start,
          theorem_stop = theorem_stop, boundary = boundary_pos,
@@ -2499,11 +2498,11 @@ fun theorem_checkpoint_specs proof_engine proof_timeout base deps_key inputs_key
     else raise Error "internal error: proof-IR plan count does not match theorem boundary count"
   end
 
-fun declaration_checkpoint_specs proof_engine proof_timeout base deps_key inputs_key source terminations =
+fun declaration_checkpoint_specs proof_engine proof_timeout base deps_key inputs_key source_name source terminations =
   map (fn ({name, safe_name, definition_start, boundary, ...} : HolbuildTheoryCheckpoints.termination) =>
           let
             val prefix_hash =
-              script_prefix_key inputs_key (HolbuildTheoryCheckpoints.prefix_hash source boundary)
+              script_prefix_key inputs_key source_name (HolbuildTheoryCheckpoints.prefix_hash source boundary)
             val checkpoint_key = declaration_checkpoint_key {name = name, safe_name = safe_name,
                                                              boundary = boundary, deps_key = deps_key,
                                                              proof_engine = proof_engine,
@@ -3057,7 +3056,7 @@ fun run_failure_repl tc policy theorem_checkpoints failure_checkpoints deps_load
           end
 
 (* The theory action that builds `node` in action root `root`. *)
-fun theory_action root plan keys toolchain_key holdir deps_key node : theory_action =
+fun theory_action root plan keys toolchain_key deps_key node : theory_action =
   let
     val package_root = #package_root (HolbuildBuildPlan.source_of node)
     val script_dir = Path.dir (source_file node)
@@ -3088,7 +3087,7 @@ fun theory_action root plan keys toolchain_key holdir deps_key node : theory_act
      logical = logical_name node,
      relative_path = HolbuildBuildPlan.relative_path node,
      source_file = source_file node,
-     source_name = located_source_name holdir node,
+     source_name = HolbuildBuildPlan.source_name plan node,
      script_dir = stage_script_dir,
      inputs = source_inputs @ manifest_inputs,
      loads = preload_loads root plan node,
@@ -4114,7 +4113,7 @@ fun theory_checkpoints_for_action policy checkpoint_root (action : theory_action
     in
       theorem_checkpoint_specs (proof_engine policy) (tactic_timeout policy)
         (action_checkpoint_base checkpoint_root action) (#deps_key action)
-        (#inputs_key action) source_text proof_ir_plans boundaries
+        (#inputs_key action) (nondefault_source_name action) source_text proof_ir_plans boundaries
     end
     handle Error msg =>
       (reject_unenforced_tactic_timeout policy action msg;
@@ -4185,7 +4184,7 @@ fun declaration_checkpoints_for_action policy checkpoint_root (action : theory_a
   else
     declaration_checkpoint_specs (proof_engine policy) (tactic_timeout policy)
       (action_checkpoint_base checkpoint_root action) (#deps_key action)
-      (#inputs_key action) source_text terminations
+      (#inputs_key action) (nondefault_source_name action) source_text terminations
     handle Error msg =>
       (warn ("could not safely create termination-definition checkpoints for " ^ #logical action ^
              "; building without termination-definition checkpoints for this theory\n" ^ msg);
@@ -4248,7 +4247,7 @@ fun build_theory_action cache_allowed policy tc root checkpoint_root base_contex
 fun build_theory cache_allowed policy tc project base_context plan keys toolchain_key node =
   let
     val root = project_artifact_root project
-    val action = theory_action root plan keys toolchain_key (#holdir tc)
+    val action = theory_action root plan keys toolchain_key
                    (dependency_context_key toolchain_key plan keys node) node
     val generated_metadata =
       build_theory_action cache_allowed policy tc root (default_checkpoint_root root) base_context action
@@ -5531,7 +5530,7 @@ fun remote_proof_failure (options : build_options) tc project plan toolchain_key
                | _ => (remove_file log; false))
     fun diagnose node =
       let
-        val action = theory_action root plan keys toolchain_key (#holdir tc)
+        val action = theory_action root plan keys toolchain_key
                        (dependency_context_key toolchain_key plan keys node) node
         val log = current_build_log (current_log_dir root (#package action) (#logical action))
       in
@@ -5793,7 +5792,7 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
     val keys = HolbuildBuildPlan.input_keys config_lines action_toolchain_key plan
     val theories = List.filter is_theory_node (HolbuildBuildPlan.selected_nodes plan)
     val actions =
-      map (fn node => (node, theory_action root plan keys toolchain_key (#holdir tc)
+      map (fn node => (node, theory_action root plan keys toolchain_key
                                (dependency_input_context_key toolchain_key plan keys node) node))
           theories
     val _ =
@@ -6205,7 +6204,11 @@ fun spec_theory_action root (spec : action_spec) deps_key : theory_action =
      logical = #logical spec,
      relative_path = path,
      source_file = in_root root (action_source_path package path),
-     source_name = "$(" ^ package ^ ")/" ^ path,
+     source_name =
+       (case action_text_values spec "source-name=" of
+            [] => HolbuildBuildPlan.default_source_name package path
+          | [name] => name
+          | _ => reject_spec "the action text has more than one source-name line"),
      script_dir = script_dir,
      inputs = map (fn {path, ...} => {path = path, from = in_root root (action_source_path package path)}) (#inputs spec),
      loads = #loads spec,
