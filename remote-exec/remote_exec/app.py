@@ -17,7 +17,15 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, SecretStr
 
-from remote_exec.coordinator import ActionStatus, BatchStatus, Coordinator, ResultMismatch, Settings, is_auth_failure
+from remote_exec.coordinator import (
+    ActionStatus,
+    BatchStatus,
+    Coordinator,
+    HostReport,
+    ResultMismatch,
+    Settings,
+    is_auth_failure,
+)
 from remote_exec.formats import FormatError, parse_batch, parse_result
 
 logger = logging.getLogger(__name__)
@@ -30,6 +38,11 @@ class ClaimRequest(BaseModel):
     also_claim: list[Tier] = Field(default_factory=list)  # tried in order once `tier` has nothing ready
     worker: str
     wait_s: float = Field(default=0, ge=0, le=50)  # how long to wait for an action when none is ready
+    host: HostReport | None = None
+
+
+class HeartbeatRequest(BaseModel):
+    host: HostReport | None = None
 
 
 def exit_on_auth_failure(error: BaseException) -> None:
@@ -143,12 +156,18 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         return StreamingResponse(lines(), media_type="application/x-ndjson")
 
     @app.get("/v1/queue", dependencies=client)
-    async def queue() -> dict[str, int]:
+    async def queue() -> dict[str, object]:
         status = await coordinator.queue()
-        return {**asdict(status.counts), "desired_burst_workers": status.desired_burst_workers}
+        return {
+            **asdict(status.counts),
+            "desired_burst_workers": status.desired_burst_workers,
+            "hosts": [{**asdict(host.report), "age_s": host.age_s} for host in status.hosts],
+        }
 
     @app.post("/v1/work/claim", dependencies=worker, response_model=None)
     async def claim(body: ClaimRequest, request: Request) -> dict[str, object] | Response:
+        if body.host is not None:
+            coordinator.report_host(body.host)
         tiers = [body.tier, *(t for t in body.also_claim if t != body.tier)]
         claimed = await coordinator.claim(tiers, body.worker, body.wait_s, request.is_disconnected)
         if claimed is None:
@@ -156,7 +175,9 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         return asdict(claimed)
 
     @app.post("/v1/work/{attempt_token}/heartbeat", dependencies=worker)
-    async def heartbeat(attempt_token: UUID) -> dict[str, int]:
+    async def heartbeat(attempt_token: UUID, body: HeartbeatRequest | None = None) -> dict[str, int]:
+        if body is not None and body.host is not None:
+            coordinator.report_host(body.host)
         if not await coordinator.heartbeat(attempt_token):
             raise HTTPException(409, "lease expired or revoked; stop the action")
         return {"lease_s": settings.lease_seconds}

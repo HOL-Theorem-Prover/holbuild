@@ -98,3 +98,24 @@ if ! grep -q 'fragment: FAIL_TAC "boom"' "$repl_log"; then
   cat "$repl_log" >&2
   exit 1
 fi
+
+# A failure in a dependency of the requested target also opens the REPL at
+# the failed proof: --repl-on-failure saves theorem checkpoints everywhere.
+cat > "$project/src/BScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib ATheory;
+
+val _ = new_theory "B";
+val _ = export_theory();
+SML
+rm -rf "$project/.holbuild/checkpoints"
+dep_log=$tmpdir/repl-dependency.log
+if printf 'val _ = OS.Process.exit OS.Process.success;\n' |
+   "$HOLBUILD_BIN" build --repl-on-failure --force --no-cache BTheory >"$dep_log" 2>&1; then
+  echo "expected the failing dependency to fail the build" >&2
+  exit 1
+fi
+if ! grep -q "checkpoint: .*fail_thm_failed_prefix.save" "$dep_log"; then
+  echo "a failing dependency's repl did not start from its failed-prefix checkpoint" >&2
+  cat "$dep_log" >&2
+  exit 1
+fi

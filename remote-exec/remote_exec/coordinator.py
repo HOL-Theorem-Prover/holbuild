@@ -12,14 +12,15 @@ import re
 import shlex
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from typing import Annotated
 from uuid import UUID, uuid4
 
 import asyncpg
 import httpx
 import sqlalchemy as sa
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
@@ -41,6 +42,11 @@ DATABASE_STATEMENT_TIMEOUT = "60s"
 
 # A scale command that runs longer than this is killed, so it can't stall the sweep.
 SCALE_CMD_TIMEOUT_S = 60
+
+# A host none of whose workers reported for this long is left out of the queue's hosts, and forgotten.
+HOST_REPORT_SECONDS = 120
+# Hosts the coordinator remembers at most; a report from another host beyond them is dropped.
+MAX_HOSTS = 1000
 
 
 class Settings(BaseSettings):
@@ -122,10 +128,39 @@ class QueueCounts:
     running_high: int
 
 
+# What a host report's counts and sizes may be: JSON's exact integers.
+Amount = Annotated[int, Field(ge=0, le=2**53)]
+
+
+@dataclass(frozen=True)
+class HostReport:
+    """What a worker reports of its host with a claim or heartbeat (``HostReport`` in worker.py): the share of CPU
+    time idle lately, memory in bytes as holbuild's ``--cooperate-dir`` admission sees it, and whether that
+    admission would hold a child back now or held the worker back since its last report."""
+
+    id: Annotated[str, Field(max_length=64)]  # the host's boot_id
+    cpu_idle_pct: Annotated[float, Field(ge=0, le=100)] | None
+    mem_total: Amount | None
+    mem_available: Amount | None
+    budget: Amount | None
+    reserved: Amount
+    leases: Amount
+    memory_short: bool
+
+
+@dataclass(frozen=True)
+class HostStatus:
+    """A host's latest report, ``age_s`` seconds old, with the latest ``cpu_idle_pct`` measured."""
+
+    report: HostReport
+    age_s: float
+
+
 @dataclass(frozen=True)
 class QueueStatus:
     counts: QueueCounts
     desired_burst_workers: int
+    hosts: list[HostStatus]
 
 
 def burst_demand(counts: QueueCounts, warm_workers: int, max_burst_workers: int) -> int:
@@ -277,6 +312,9 @@ class Coordinator:
         self.found_in_cache: dict[str, float] = {}
         self.cache_checks: dict[str, asyncio.Task[bool | None]] = {}
         self.cache_forgotten = 0
+        # What workers reported of their hosts, by host id, and when. Kept in memory: each coordinator process
+        # knows the hosts whose workers' requests reached it.
+        self.hosts: dict[str, tuple[datetime, HostReport]] = {}
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "Coordinator":
@@ -496,6 +534,15 @@ class Coordinator:
             self.made_ready -= 1
             self._wake_claim(woken.result())
 
+    def report_host(self, report: HostReport) -> None:
+        """Take a worker's report of its host. A report without ``cpu_idle_pct`` keeps the host's last one."""
+        previous = self.hosts.get(report.id)
+        if previous is None and len(self.hosts) >= MAX_HOSTS:
+            return
+        if previous is not None and report.cpu_idle_pct is None:
+            report = replace(report, cpu_idle_pct=previous[1].cpu_idle_pct)
+        self.hosts[report.id] = (self.clock(), report)
+
     async def heartbeat(self, token: UUID) -> bool:
         """Extend a live lease; False when it expired or was revoked, so the worker should stop."""
         async with self.engine.begin() as conn:
@@ -714,8 +761,9 @@ class Coordinator:
             )
 
     async def queue(self) -> QueueStatus:
-        """The unfinished actions and the burst worker target: the highest demand of the last
-        ``scale_down_hold_s`` seconds, which the sweeps of every replica record, and of now."""
+        """The unfinished actions, the burst worker target: the highest demand of the last ``scale_down_hold_s``
+        seconds, which the sweeps of every replica record, and of now, and the hosts whose workers reported to this
+        process in the last ``HOST_REPORT_SECONDS``, by id."""
         async with self.engine.connect() as conn:
             desired = await conn.scalar(HELD_TARGET, self._held_target_params(self.clock()))
             rows = await conn.execute(
@@ -733,7 +781,14 @@ class Coordinator:
             running_high=count.get(("running", "high"), 0),
         )
         demand = burst_demand(counts, self.settings.warm_workers, self.settings.max_burst_workers)
-        return QueueStatus(counts, max(desired, demand))
+        now = self.clock()
+        self.hosts = {
+            host: (at, report)
+            for host, (at, report) in self.hosts.items()
+            if (now - at).total_seconds() < HOST_REPORT_SECONDS
+        }
+        hosts = [HostStatus(report, round((now - at).total_seconds(), 1)) for at, report in self.hosts.values()]
+        return QueueStatus(counts, max(desired, demand), sorted(hosts, key=lambda h: h.report.id))
 
     async def sweep(self) -> None:
         """The periodic pass: expired leases, releases a failed HEAD left waiting, retention, then the burst
