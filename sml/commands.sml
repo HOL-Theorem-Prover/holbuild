@@ -1335,13 +1335,55 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         fun finished {built, total} =
           if total = 0 then "the coordinator reported no theories"
           else "remote workers finished " ^ Int.toString built ^ " of " ^ Int.toString total ^ " theories"
-        (* A batch the build stops following to build locally is cancelled
-           (a finished one is left as it is); a --remote-only build fails
-           instead, and says how to reattach when the batch may still run. *)
+        (* A batch the build stops following is cancelled (a finished one is
+           left as it is), before it builds locally or, under --remote-only,
+           fails for its caller to build locally. *)
         fun abandon batch_id reason =
-          if remote_only then fall_back reason
-          else if HolbuildRemoteExec.cancel url batch_id then fall_back (reason ^ ", cancelled the batch")
+          if HolbuildRemoteExec.cancel url batch_id then fall_back (reason ^ ", cancelled the batch")
           else fall_back reason
+        (* Builds theory `logical` and what it needs, and nothing else. *)
+        fun build_theory_locally logical =
+          let
+            val {index, components} = prepare_source_index "build" resolution project
+            val theory_plan = HolbuildBuildPlan.plan_targets components (#holdir tc) index [logical]
+            val entry_plan =
+              case entry_targets index of
+                  [] => NONE
+                | entry_targets => SOME (HolbuildBuildPlan.plan_targets components (#holdir tc) index entry_targets)
+          in
+            timed_phase "build.execute"
+              (fn () => HolbuildBuildExec.build (build_options_for index entry_plan theory_plan targets)
+                          tc project theory_plan toolchain_key jobs)
+          end
+        (* A batch that failed because a proof did: a local build would fail
+           the same way, so the build restores what the cache holds, reports
+           the failure from the worker's build log and stops, building nothing
+           locally.  Without the log, it builds the failed theory locally
+           for its diagnostic. *)
+        fun proof_failed reason ({input_key, kind, log_sha256} : HolbuildRemoteExec.proof_failure) =
+          let
+            val no_log = "could not fetch the failed theory's build log"
+          in
+            HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "\n");
+            HolbuildBuildExec.build (HolbuildBuildExec.restore_only_options build_options)
+              tc project plan toolchain_key jobs
+            handle HolbuildBuildExec.Error _ => ()
+                 | HolbuildBuildExec.ErrorWithDebugArtifacts _ => ();
+            (* The restore stops at a theory the cache lacks, the failed one if
+               no other, which isn't why this build fails. *)
+            HolbuildHolSharedCache.local_build_needed := false;
+            case HolbuildBuildExec.node_with_input_key build_options tc project plan toolchain_key input_key of
+                NONE => fall_back no_log
+              | SOME node =>
+                  case HolbuildBuildExec.remote_proof_failure build_options tc project plan toolchain_key node
+                         {kind = kind, log_sha256 = log_sha256} of
+                      SOME error => raise error
+                    | NONE =>
+                        if remote_only then fall_back no_log
+                        else (HolbuildBuildExec.warn ("remote execution: " ^ no_log ^ "; building " ^
+                                                      HolbuildBuildPlan.logical_name node ^ " locally");
+                              build_theory_locally (HolbuildBuildPlan.logical_name node))
+          end
         (* A batch that abandon would cancel is cancelled on an interrupt too.
            While it runs, the entries of the theories it finishes, and of a
            submitted batch the theories outside it that the remote cache
@@ -1356,16 +1398,17 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               (HolbuildRemoteExec.follow url batch_id add before stop ())
               handle e => (stop (); raise e)
           in
-            if remote_only then follow_batch ()
-            else HolbuildRemoteExec.while_followed url batch_id follow_batch
+            HolbuildRemoteExec.while_followed url batch_id follow_batch
           end
         fun finish in_batch batch_id =
           case follow in_batch batch_id of
               (HolbuildRemoteExec.Done, progress) =>
                 (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ finished progress ^ "\n");
                  build_locally ())
-            | (HolbuildRemoteExec.Failed reason, progress) =>
+            | (HolbuildRemoteExec.Failed (reason, NONE), progress) =>
                 fall_back ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress)
+            | (HolbuildRemoteExec.Failed (reason, SOME failure), progress) =>
+                proof_failed ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress) failure
             | (HolbuildRemoteExec.Cancelled, progress) =>
                 let val reason = "batch " ^ batch_id ^ " cancelled; " ^ finished progress
                 in
@@ -1399,6 +1442,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         if writes_sources andalso detach then raise Error ("remote execution: " ^ reason)
         else if writes_sources andalso remote_only then
           (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "; restoring from the cache\n");
+           Option.app (fn batch_id => ignore (HolbuildRemoteExec.cancel url batch_id)) attach;
            execute_build ())
         else if writes_sources then
           (HolbuildBuildExec.warn ("remote execution: " ^ reason ^ "; building locally");

@@ -168,6 +168,25 @@ async def test_database_refusing_the_credentials_is_recognized(remote_exec_engin
     assert not is_auth_failure(other.value)
 
 
+async def test_the_coordinators_connections_are_bounded(
+    coordinator: Coordinator, remote_exec_engine: AsyncEngine
+) -> None:
+    url = remote_exec_engine.url.render_as_string(hide_password=False)
+    settings = coordinator.settings.model_copy(update={"database_url": url, "database_pool_size": 3})
+    bounded = Coordinator.from_settings(settings)
+    try:
+        async with bounded.engine.connect() as connection:
+            timeouts = await connection.execute(
+                sa.text(
+                    "SELECT current_setting('statement_timeout'), current_setting('idle_in_transaction_session_timeout')"
+                )
+            )
+            assert timeouts.one() == ("1min", "1min")
+        assert bounded.engine.pool.size() == 3  # pyright: ignore[reportAttributeAccessIssue]
+    finally:
+        await bounded.aclose()
+
+
 async def test_request_meeting_a_refused_login_exits_the_process(
     coordinator: Coordinator, remote_exec_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
 ) -> None:

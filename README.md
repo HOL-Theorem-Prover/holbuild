@@ -649,9 +649,10 @@ undeclared files, or host paths must declare those files in `extra_deps`, or set
 because holbuild rejects a restored theory whose parents' `.dat` files differ
 from the local ones, but descendants of a nondeterministic theory then miss the
 cache wherever the local build of it differs from the one their cache entries
-were built against. A parent-incompatible local cache entry is removed so the
-rebuilt child can replace it; this does not change the remote cache's conflict
-checks. An entry rejected only by the requested proof policy is retained until
+were built against. A parent-incompatible local cache entry is removed, and
+the remote cache's entry for the same key is tried before rebuilding; a rebuilt
+child replaces the local entry, which does not change the remote cache's
+conflict checks. An entry rejected only by the requested proof policy is retained until
 a successful rebuild can publish its stronger contract.
 
 Source files may also declare source-file-relative extra dependencies:
@@ -1123,11 +1124,13 @@ source and direct dependencies), ensures the HOL toolchain (restoring the
 remote toolchain archive, or building one, and when another worker's archive
 was published first, switching to that archive), fetches the sources by
 SHA-256, restores every dependency through the normal cache restore and its
-checks, and reports `cached` if the theory's own entry already restores.
-Otherwise it builds the theory as a local build would, with the spec's proof
-options, and checks that the remote cache then holds an entry for it whose
-outputs equal the build's. A missing dependency fails the action; the worker
-never builds one.
+checks, and reports `cached` if the theory's own entry already restores, or
+if an earlier build of the same action text on byte-identical dependency
+outputs left one, which it then publishes under the action's input key (early
+cutoff, DESIGN.md). Otherwise it builds the theory as a local build would,
+with the spec's proof options, and checks that the remote cache then holds an
+entry for it whose outputs equal the build's. A missing dependency fails the
+action; the worker never builds one.
 
 It writes this record to `--result FILE`, or to stdout:
 
@@ -1230,13 +1233,18 @@ out of the batch, to resume from its local checkpoints`). With
 
 The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the
-batch, or the batch fails, it warns and builds locally. An event stream that
-breaks is reattached; one that stays unreachable through four reattaches
-(about 15 seconds of backoff) is given up on. When the build stops following
+batch, or the batch fails other than by a failed proof (below), it warns and
+builds locally. A submission
+answered 502, 503 or 504, as a proxy in front of the coordinator answers
+while it restarts, is retried, and an event stream that breaks is
+reattached; either is given up on once the coordinator stays unavailable for
+about two and a half minutes (retries back off to 8 seconds apart). When the build stops following
 a batch that may still run (the stream was given up on, or the coordinator
 won't stream it), it cancels the batch before building locally; one
 interrupted (SIGINT or SIGTERM) while it follows a batch cancels it too. With
-`--remote-only` it fails instead, leaves an interrupted build's batch running, and it never builds HOL or a theory
+`--remote-only` it cancels a batch the coordinator won't stream, or an
+interrupted build's, the same way but then fails instead of building locally,
+and it never builds HOL or a theory
 locally: a HOL toolchain or a theory that doesn't restore from a cache is an
 error. Such a `--remote-only` build exits with status 75 (`EX_TEMPFAIL`),
 whenever it stops where a build without `--remote-only` would go on locally,
@@ -1248,6 +1256,15 @@ local build. A build that includes a theory writing SML sources (see
 `holbuild_extra_outputs`) builds locally too, since those theories have to
 run before the rest of the build can be planned; with `--remote-only` it
 only restores from the cache, and with `--detach` it fails.
+
+A batch that fails because a theory's proof failed on a worker (failure
+`proof` or `tactic-timeout`) isn't built locally, since a local build would
+fail the same way. The build restores what the cache holds, as `--remote-only`
+does, fetches the worker's build log from the remote cache into
+`.holbuild/logs/current/<package>/<theory>/build.log`, prints the diagnostic a
+local build would, and exits with status 1, with or without `--remote-only`.
+If that log can't be fetched, the build builds just the failed theory locally,
+for its diagnostic; with `--remote-only` it fails with status 75 instead.
 
 `--detach` submits the batch, prints its id (`holbuild: remote batch <id>`)
 and exits; if the batch can't be submitted, it fails rather than building

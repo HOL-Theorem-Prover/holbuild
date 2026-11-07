@@ -58,6 +58,8 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_RETENTION_HOURS` | age after which a finished batch is deleted | 168 |
 | `REMOTE_EXEC_BATCH_DEADLINE_HOURS` | age at which a batch still running fails | 12 |
 | `REMOTE_EXEC_HINT_TTL_DAYS` | age after which an unused peak hint is deleted | 30 |
+| `REMOTE_EXEC_DATABASE_POOL_SIZE` | database connections the coordinator holds at most | 20 |
+| `REMOTE_EXEC_DATABASE_POOL_TIMEOUT_S` | how long a request waits for a free connection before it fails | 10 |
 | `REMOTE_EXEC_SWEEP_SECONDS` | period of the sweep (lease expiry, releases, retention, scaling) | 5 |
 | `REMOTE_EXEC_WARM_WORKERS` | always-on standard-tier workers | 0 |
 | `REMOTE_EXEC_MAX_BURST_WORKERS` | most burst workers to ask for | 0 |
@@ -333,6 +335,10 @@ record `exec-action --result` wrote as the body (`text/plain`)
   (a record with an empty `input-key`, which `exec-action` writes when it
   couldn't read the spec, is matched by its spec alone)
 - 409 when the token is stale; the result is dropped
+
+A worker that can't reach the coordinator or gets a 5xx, as while the
+coordinator restarts, retries a `complete` until the action's lease would run
+out.
 
 ## Tests
 

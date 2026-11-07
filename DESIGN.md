@@ -573,9 +573,30 @@ The dependency context of a theory's checkpoints (`deps_loaded.save` and the
 theorem checkpoints above it) is keyed the same way, on `deps_output_key`, so a
 theory edited after an upstream edit that left outputs unchanged still resumes
 from its checkpoints. Remote action specs, which are written before their
-dependencies are built, key it on dependency input keys, and so does
-`run --from` unless every dependency's metadata matches its current input key,
-since `run` builds nothing and the outputs on disk may be stale.
+dependencies are built, key it on dependency input keys (a worker re-keys it,
+below), and so does `run --from` unless every dependency's metadata matches its
+current input key, since `run` builds nothing and the outputs on disk may be
+stale.
+
+### Early cutoff on remote workers
+
+A remote worker (`exec-action`) makes the same decision once it has restored
+the action's dependencies. It hashes what the action loads from them, as
+restored in its action root: each dependency theory's `.dat`, `.sig`, `.sml`
+and load manifests, and the library sources and manifests the spec ships.
+With the action text, dependencies named but not keyed, that hash gives a pair
+key, and the remote cache maps the pair to the input key of the last build
+on it (an action entry `holbuild-early-cutoff-v1` with one `input-key=` line).
+On a hit, the worker restores that build's entry with the checks a dependency
+restore makes (the timeout contract, the extra outputs, and the parent `.dat`
+hashes its `.dat` records), copies it to the action's input key, publishes it
+there and reports `cached`. On a miss or any doubt it builds, and then points
+the pair at its own entry. The build's dependency context, which keys its
+checkpoints and its shared heap, is keyed on the same hash of dependency
+outputs, so a theory edited after an output-neutral upstream edit resumes
+from the heap and checkpoints shared before it. These hashes cover files
+that name the action root, so they hold for one cache root, as shared heaps
+do; local builds publish no pairs.
 
 A build may also record output hashes for diagnostics (`--emit-output-hashes`).
 
@@ -589,11 +610,11 @@ with its sources and extra inputs declared, under the same theory toolchain key,
 produces a byte-identical `Theory.dat` in any project directory and artifact
 cache. The exporter canonicalizes the parent header by theory name, preserving
 the remaining payload, and updates the embedded data hash in `Theory.sml`.
-The generated parent load metadata uses the same order. Existing valid bundles
-remain usable without changing action keys; they are not canonicalized on
-restore, so importing a mixture of old and new bundles can still conflict.
-The local dependency-context checkpoint format changes to prevent resuming a
-heap with an older export runtime; artifact action keys do not change.
+The generated parent load metadata uses the same order. Every action key
+includes `theory_manifest_version`, which changes whenever holbuild changes what
+a theory exports, so entries from exporters with different outputs never share
+a key (ML library entries are invalidated along with theories); `tests/cases/theory-dat-reproducible/golden-outputs` pins one fixture's
+outputs per version to catch an unbumped change.
 A script that reads the clock, the environment, undeclared files, or host paths
 has to declare the files as `extra_deps` or opt out with `cache = false`.
 
@@ -605,7 +626,9 @@ parents is rejected and rebuilt. What a nondeterministic theory costs is cache
 hits: where the local parent's `.dat` differs from the one the cached children
 were built against, its whole subtree misses. A parent-incompatible local entry
 is removed after waiting for the publication lock, only if its manifest is
-unchanged, so a successful rebuild can publish a replacement. Policy-only
+unchanged, so a successful rebuild can publish a replacement; before
+rebuilding, the remote cache's entry for the key gets one try, since it may
+have been built against the parents being restored. Policy-only
 rejections retain the entry until a successful rebuild can publish. Other output
 conflicts still keep the first entry; remote publication and archive import
 still reject conflicts.
