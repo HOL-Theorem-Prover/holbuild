@@ -18,20 +18,30 @@ trap cleanup EXIT
 # Every request must carry the test credentials; /slow answers after 3 s,
 # /gated once the file gate-release exists in the test directory (writing
 # gate-event there on arrival), /missing with 404 and /error with 500, and
-# PUT /store/<name> keeps a body that GET /store/<name> returns.
+# PUT /store/<name> keeps a body that GET /store/<name> returns, and
+# /connections returns how many connections the server has accepted.
 cat > "$tmpdir/server.py" <<'PY'
 import base64
 import http.server
 import pathlib
 import sys
+import threading
 import time
 
 credentials = "Basic " + base64.b64encode(b"name:secret").decode()
 stored = {}
+connections = 0
+connections_lock = threading.Lock()
 test_dir = pathlib.Path(sys.argv[2])
 
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        global connections
+        with connections_lock:
+            connections += 1
+        super().setup()
 
     def reply(self, status, body):
         try:
@@ -57,6 +67,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(404, b"not found\n")
         elif self.path == "/error":
             self.reply(500, b"server error\n")
+        elif self.path == "/connections":
+            with connections_lock:
+                count = connections
+            self.reply(200, str(count).encode())
         elif self.path.startswith("/store/"):
             self.reply(200, stored[self.path])
         else:
@@ -198,9 +212,8 @@ val _ = assert "the handle works after a timeout"
                 = HolbuildHttp.Response 200)
 
 (* Concurrent requests share the pool without mixing up transfers: each of
-   16 threads uploads 25 bodies and reads each back.  The pool keeps at most
-   4 of the connections they open. *)
-val _ = HolbuildHttp.set_max_idle 4
+   16 threads uploads 25 bodies and reads each back, reusing pooled
+   connections, so the server accepts at most one connection per thread. *)
 fun write_file path text =
   let val output = TextIO.openOut path in TextIO.output (output, text); TextIO.closeOut output end
 val results_mutex = Mutex.mutex ()
@@ -234,9 +247,18 @@ fun burst () =
    List.app (fn thread => ignore (Thread.fork (fn () => client thread, []))) (List.tabulate (16, fn i => i));
    wait_for "the concurrent requests" (fn () => !finished = 16) (Time.+ (Time.now (), Time.fromSeconds 60));
    assert ("concurrent requests failed: " ^ String.concatWith ", " (!failures)) (null (!failures)))
+fun accepted () =
+  (assert "GET /connections"
+          (HolbuildHttp.get {url = url ^ "/connections", dst = dir ^ "/connections.out", timeout = 30}
+           = HolbuildHttp.Response 200);
+   valOf (Int.fromString (read_file (dir ^ "/connections.out"))))
+val accepted_before = accepted ()
 val _ = burst ()
+val opened = accepted () - accepted_before
+val _ = assert ("the burst opened " ^ Int.toString opened ^ " connections for 16 threads")
+               (opened <= 16)
 
-(* The pooled connections are still open, at most 4 of them, and a child
+(* The pooled connections stay open for the next requests, and a child
    must not inherit them. *)
 fun socket_count request =
   let val result = HolbuildSpawn.run request
@@ -250,66 +272,23 @@ val has_proc = OS.FileSys.access ("/proc/self/fd", [])
 fun sockets () =
   socket_count {program = "python3", args = [dir ^ "/tcp-sockets.py", self],
                 stderr = HolbuildSpawn.Inherit}
-fun check_pooled what low high =
-  if has_proc then
-    let val pooled = sockets ()
-    in
-      assert (what ^ ": the parent holds " ^ Int.toString pooled ^ " connections, expected " ^
-              Int.toString low ^ " to " ^ Int.toString high)
-             (low <= pooled andalso pooled <= high)
-    end
-  else ()
-val _ = check_pooled "after the burst" 1 4
+
+(* HOLBUILD_TEST_HTTP_IDLE_MS, set for this script, closes a connection
+   unused for 2 s.  The pool empties without another request, and a later
+   request opens a connection that is closed in turn. *)
 val _ =
   if has_proc then
-    assert "a spawned child inherits no connection"
-           (socket_count {program = "sh", args = ["-c", "python3 \"$0\" $$", dir ^ "/tcp-sockets.py"],
-                          stderr = HolbuildSpawn.Inherit} = 0)
+    (assert "the burst's connections are pooled" (sockets () > 0);
+     assert "a spawned child inherits no connection"
+            (socket_count {program = "sh", args = ["-c", "python3 \"$0\" $$", dir ^ "/tcp-sockets.py"],
+                           stderr = HolbuildSpawn.Inherit} = 0);
+     wait_for "the idle connections to be closed" (fn () => sockets () = 0) (in_10s ());
+     assert "a request after the pool emptied"
+            (HolbuildHttp.get {url = url ^ "/fast", dst = dir ^ "/after-idle.out", timeout = 30}
+             = HolbuildHttp.Response 200);
+     assert "its connection is pooled" (sockets () = 1);
+     wait_for "that connection to be closed" (fn () => sockets () = 0) (in_10s ()))
   else ()
-
-(* Each reservation, as a background pool's threads make, lets the pool keep
-   one more connection until it ends. *)
-val _ = List.app HolbuildHttp.reserve_idle (List.tabulate (16, fn _ => ()))
-val _ = burst ()
-val _ = check_pooled "during the reservations" 5 20
-val _ = List.app HolbuildHttp.release_idle (List.tabulate (16, fn _ => ()))
-val _ = check_pooled "after the reservations" 1 4
-
-val _ =
-  if has_proc then
-    (HolbuildHttp.close_idle ();
-     assert "close_idle closes the pooled connections" (sockets () = 0);
-     (* A background pool keeps up to 4 connections for the next requests
-        when drained, and closes them when stopped. *)
-     let
-       val {add, drain, stop} =
-         HolbuildBuildExec.start_background_pool 4
-           (fn i => ignore (HolbuildHttp.get {url = url ^ "/fast", timeout = 30,
-                                              dst = dir ^ "/pool-" ^ Int.toString i ^ ".out"}))
-     in
-       List.app add (List.tabulate (8, fn i => i));
-       drain ();
-       assert "a drained pool keeps its connections" (sockets () > 0);
-       stop ();
-       assert "a stopped pool closes its connections" (sockets () = 0)
-     end)
-  else ()
-
-(* A background pool's threads each reserve a pooled connection while they
-   run, and give the reservations up once their work is done. *)
-val most_reserved = ref 0
-val _ =
-  let
-    val {add, drain, ...} =
-      HolbuildBuildExec.start_background_pool 8 (fn i =>
-        (ignore (HolbuildHttp.get {url = url ^ "/fast", dst = dir ^ "/reserving-" ^ Int.toString i, timeout = 30});
-         record (fn () => most_reserved := Int.max (!most_reserved, !HolbuildHttp.reserved))))
-  in
-    List.app add (List.tabulate (32, fn i => i)); drain ()
-  end
-val _ = assert ("a pool of 8 threads reserved at most " ^ Int.toString (!most_reserved))
-               (!most_reserved >= 2 andalso !most_reserved <= 8)
-val _ = assert "a drained pool holds no reservations" (!HolbuildHttp.reserved = 0)
 
 (* A transfer waiting on a response must not hold up another thread's GC.
    The server holds /gated until gate-release exists. *)
@@ -357,7 +336,7 @@ SML
 printf 'user = "name:secret"\n' > "$tmpdir/user.curl"
 # --error-exit makes an uncaught exception fail the script; without it, the
 # REPL reports the exception and carries on with the next declaration.
-HOLBUILD_REMOTE_CACHE_CURL_CONFIG=$tmpdir/user.curl "${HOLBUILD_POLY:-poly}" --error-exit < "$tmpdir/http-test.sml" > "$tmpdir/http-test.log" 2>&1 || {
+HOLBUILD_TEST_HTTP_IDLE_MS=2000 HOLBUILD_REMOTE_CACHE_CURL_CONFIG=$tmpdir/user.curl "${HOLBUILD_POLY:-poly}" --error-exit < "$tmpdir/http-test.sml" > "$tmpdir/http-test.log" 2>&1 || {
   cat "$tmpdir/http-test.log" >&2
   exit 1
 }
