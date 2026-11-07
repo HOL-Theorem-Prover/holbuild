@@ -6098,6 +6098,31 @@ fun restore_spec_theory root (spec : action_spec) {key, subject, stem, extra_out
           write_manifests = write_manifests})
   end
 
+(* Whether a theory's .dat, given by the parent hashes it records, records
+   the dependency as a parent. *)
+fun records_parent recorded ({target, ...} : {target : string, stem : string, key : string}) =
+  Option.isSome (Binarymap.peek (recorded, theory_name_from_logical (#2 (target_name target))))
+
+(* A worker's local copy of an entry goes out of date when the remote's entry
+   for its key changes.  This drops the local copies of the spec's
+   dependencies selected by wanted whose outputs differ from the remote's,
+   so that the next restore takes the remote's; true when it dropped one. *)
+fun drop_stale_dep_copies remote (spec : action_spec) wanted =
+  let
+    val cache = cache_root ()
+    fun stale key =
+      case (HolbuildCache.get_action cache key, HolbuildRemoteCache.get_action remote key) of
+          (SOME mine, SOME theirs) =>
+            not (cache_manifest_outputs_equal key mine theirs handle _ => false) andalso
+            drop_cache_manifest_if_unchanged cache key mine
+        | _ => false
+  in
+    List.foldl (fn (dep, dropped) => (wanted dep andalso stale (#key dep)) orelse dropped) false (#deps spec)
+  end
+
+(* The dependencies a restored or built .dat records as parents. *)
+fun dat_records_parent path = records_parent (parse_dat_parent_hashes (read_text path))
+
 (* Each restored theory's .dat records the hashes of its parents' .dat
    files; every parent the spec places must match. *)
 fun spec_parent_hashes_match root (spec : action_spec) data_path =
@@ -6142,10 +6167,8 @@ fun hydrate_action_root remote root (spec : action_spec) =
       (fn {target, stem, key} =>
           if spec_parent_hashes_match root spec (in_root root (stem ^ ".dat")) then ()
           else
-            (* The worker's local copy may be one the remote has since
-               replaced, so the next attempt restores the remote's. *)
-            (Option.app (ignore o drop_cache_manifest_if_unchanged (cache_root ()) key)
-               (HolbuildCache.get_action (cache_root ()) key);
+            (* Out-of-date local copies would fail the next attempt too. *)
+            (ignore (drop_stale_dep_copies remote spec (fn _ => true));
              raise ActionFailed (InputMissing ("theory " ^ key),
                                  "dependency " ^ target ^ " does not match its parents in the cache")))
       (#deps spec)
@@ -6181,14 +6204,10 @@ fun resident_misfits_parents remote root (spec : action_spec) resident =
     ensure_parent path;
     case HolbuildRemoteCache.fetch_blob remote {hash = dat_hash, dst = path} of
         HolbuildCacheBackend.Hit =>
-          let val recorded = parse_dat_parent_hashes (read_text path)
+          let val recorded = dat_records_parent path
           in
             not (spec_parent_hashes_match root spec path) andalso
-            List.all
-              (fn {target, key, ...} =>
-                  not (Option.isSome (Binarymap.peek (recorded, theory_name_from_logical (#2 (target_name target))))) orelse
-                  as_remote key)
-              (#deps spec)
+            List.all (fn dep => not (recorded dep) orelse as_remote (#key dep)) (#deps spec)
           end
       | _ => false
   end
@@ -7037,9 +7056,16 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
           if HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key =
              action_text_value spec "toolchain" then ()
           else raise ActionFailed (ToolchainFailure, "the toolchain's identity does not match the action text")
-        val _ = hydrate_action_root remote root spec
+        fun restored () = (hydrate_action_root remote root spec; action_already_done root spec)
+        (* The theory's entry restores, but perhaps only against local
+           copies of its parents that are out of date; then it is judged
+           again against the remote's. *)
+        val already_done =
+          restored () andalso
+          (not (drop_stale_dep_copies remote spec (dat_records_parent (in_root root (#data_path (#outputs spec)))))
+           orelse restored ())
       in
-        if action_already_done root spec then
+        if already_done then
           (* The entry may have come from the worker's local cache, so make
              sure the remote, where the result counts, holds it too. *)
           (check_remote_publication remote root spec;
@@ -7094,6 +7120,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                     (classify_run_failure stage log_text oom_before msg, msg)
                 end
             val _ = peak := peak_rss_mb stage
+            (* Outputs built against out-of-date local copies of the parents
+               never reach the remote; the retry restores the remote's. *)
+            val _ =
+              if drop_stale_dep_copies remote spec (dat_records_parent (in_root root (#data_path (#outputs spec))))
+              then raise ActionFailed (PublishFailure, "built against out-of-date local copies of its parents")
+              else ()
             val _ = check_remote_publication remote root spec
           in
             "built"
