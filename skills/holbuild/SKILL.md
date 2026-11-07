@@ -16,7 +16,8 @@ holbuild build                           # all, or [build].roots closure if conf
 holbuild build --dry-run FooTheory       # show plan without building
 holbuild context                         # show manifest info
 holbuild execution-plan FooTheory:thm    # static proof-IR plan for one theorem
-holbuild check FooTheory[:thm]           # no cheats/oracles, no non-HOL axioms in ancestry; exit 1 otherwise
+holbuild check FooTheory[:thm]           # no cheats/oracles, no non-HOL axioms in ancestry, no kernel-bypass calls in sources; exit 1 otherwise
+holbuild check --fingerprint FooTheory   # one line per axiom/definition/theorem in the ancestry: theory, kind, name, statement hash, oracles
 holbuild build --force --trace-steps FooTheory
 holbuild gc                              # clean project residue + global cache
 ```
