@@ -35,11 +35,13 @@ fun remote url =
 
 fun base_url (RemoteCache {urls, ...}) = String.concatWith "," urls
 
-(* Descending SHA256(URL: digest), then ascending URL on a tie, in both clients. *)
+(* Authentication does not change node identity; full URLs are kept for requests. *)
 fun ranked_urls (RemoteCache {urls, ...}) digest =
   let
-    fun score url = (HolbuildHash.string_sha256 (url ^ ":" ^ digest), url)
-    fun compare ((a, u), (b, v)) =
+    fun score url =
+      let val identity = HolbuildRemoteCacheConfig.node_identity url
+      in ((HolbuildHash.string_sha256 (identity ^ ":" ^ digest), identity), url) end
+    fun compare (((a, u), _), ((b, v), _)) =
       case String.compare (b, a) of EQUAL => String.compare (u, v) | order => order
   in
     case urls of
@@ -88,33 +90,7 @@ fun curl_config_args () =
       SOME path => ["--config", path]
     | NONE => []
 
-fun redact_userinfo url =
-  let
-    val marker = "://"
-    val marker_len = size marker
-    val url_len = size url
-    fun marker_at i = i + marker_len <= url_len andalso String.substring(url, i, marker_len) = marker
-    fun find_marker i =
-      if i + marker_len > url_len then NONE
-      else if marker_at i then SOME i else find_marker (i + 1)
-    fun slash_or_end i =
-      if i >= url_len orelse String.sub(url, i) = #"/" then i else slash_or_end (i + 1)
-    fun at_before limit i =
-      if i >= limit then NONE
-      else if String.sub(url, i) = #"@" then SOME i else at_before limit (i + 1)
-  in
-    case find_marker 0 of
-        NONE => url
-      | SOME scheme_end =>
-          let
-            val auth_start = scheme_end + marker_len
-            val path_start = slash_or_end auth_start
-          in
-            case at_before path_start auth_start of
-                NONE => url
-              | SOME at => String.substring(url, 0, auth_start) ^ "<redacted>@" ^ String.extract(url, at + 1, NONE)
-          end
-  end
+val redact_userinfo = HolbuildRemoteCacheConfig.replace_userinfo "<redacted>@"
 
 fun first_token text =
   case String.tokens Char.isSpace text of

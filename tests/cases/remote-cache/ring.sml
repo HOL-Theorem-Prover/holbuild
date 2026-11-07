@@ -11,6 +11,13 @@ fun assert message ok = if ok then () else raise Fail message;
 val cache = RC.remote (one ^ "///, " ^ two ^ "/ " ^ one);
 val reversed = RC.remote (two ^ "," ^ one);
 val _ = assert "normalize ring" (RC.base_url cache = one ^ "," ^ two);
+fun authenticated url = "http://user:pass@" ^ String.extract (url, 7, NONE);
+val auth_cache = RC.remote (authenticated one ^ "," ^ authenticated two ^ "," ^ one);
+val _ = assert "identity deduplicates credentials" (RC.base_url auth_cache = authenticated one ^ "," ^ authenticated two);
+val _ = assert "IPv6 and path userinfo"
+  (HolbuildRemoteCacheConfig.node_identity "http://user:p@ss@[::1]:8080/path@name" = "http://[::1]:8080/path@name");
+val _ = assert "query userinfo remains outside authority"
+  (HolbuildRemoteCacheConfig.node_identity "http://host?name@value" = "http://host?name@value");
 val _ = HolbuildRemoteCacheConfig.set_url (RC.base_url cache);
 val _ = if env "RING_TRANSPORT" = "libcurl" then HolbuildRemoteCacheConfig.setup_client () else ();
 val _ = assert "requested HTTP transport"
@@ -33,6 +40,8 @@ fun check_vector line =
   let
     val [digest, primary, backup] = String.tokens Char.isSpace line
     val _ = assert "SML/Python ranking agrees" (RC.ranked_urls cache digest = [primary, backup])
+    val _ = assert "credentials do not change rankings"
+      (RC.ranked_urls auth_cache digest = map authenticated [primary, backup])
     val _ = assert "order independent" (RC.ranked_urls reversed digest = [primary, backup])
     val _ = RC.write_text src digest
     (* curl PUT takes arbitrary digest paths; publish a real digest below. *)
@@ -53,6 +62,9 @@ val digest = HolbuildHash.string_sha256 text;
 val [primary, backup] = RC.ranked_urls cache digest;
 val _ = RC.write_text src text;
 val _ = RC.write_text (stored backup "cas" digest) text;
+val _ = put backup "authorization" "Basic dXNlcjpwYXNz";
+val _ = assert "request keeps inline credentials" (fetch auth_cache digest = CB.Hit);
+val _ = clear backup "authorization";
 val _ = assert "GET 404 handoff" (fetch cache digest = CB.Hit andalso RC.read_text dst = text);
 val _ = assert "HEAD 404 handoff" (RC.blob_present cache digest andalso RC.blob_confirmed_present cache digest);
 val key = "handoff-action";

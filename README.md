@@ -1155,11 +1155,13 @@ HOLBUILD_REMOTE_CACHE_URL=https://cache.example.org holbuild build MyTheory
 To spread the cache across replicas, give a comma-separated list of base URLs
 in `--remote-cache`, `HOLBUILD_REMOTE_CACHE_URL`, or `.holconfig.toml`'s `url`.
 Whitespace can also separate URLs. Trailing slashes and duplicate nodes are
-removed. Every client and worker must use the same normalized URL spellings
+removed. Node identity also excludes authority userinfo (`user:password@`),
+so inline credentials and curl-config credentials give the same ranking;
+the HTTP request retains its full URL. Every client and worker must use the same normalized URL spellings
 and node set; different public/private hostnames give different rankings.
 
 For each `/ac/<digest>` or `/cas/<digest>` request, nodes rank by descending
-SHA256 of `URL + ":" + digest` (ascending URL breaks a tie). Only the first two
+SHA256 of `node identity + ":" + digest` (ascending identity breaks a tie). Only the first two
 nodes are tried. Reads try the second node after a 404, connection failure,
 timeout, 429 or 5xx; writes do so after a connection failure, timeout, 429 or
 5xx. A single-node list keeps the ordinary single-cache behavior. A successful

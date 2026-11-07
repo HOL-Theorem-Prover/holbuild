@@ -1452,3 +1452,19 @@ def test_cache_ring_settings_accept_both_environment_names(monkeypatch: pytest.M
     monkeypatch.setenv("REMOTE_EXEC_CACHE_URL", "http://explicit.test/")
     assert Settings(**args).cache_url == "http://explicit.test"
     assert Settings(**args, cache_url="http://argument.test/").cache_url == "http://argument.test"
+
+
+def test_cache_ring_identity_ignores_credentials_but_preserves_request_urls() -> None:
+    from remote_exec.cache import cache_nodes, node_identity, ranked_nodes
+
+    bare = ["https://one.test/path", "https://two.test/path"]
+    authenticated = [url.replace("://", "://user:pass@") for url in bare]
+    assert cache_nodes(",".join([*authenticated, *bare])) == authenticated
+    assert node_identity("http://u:p@ss@[::1]:8080/path@name") == "http://[::1]:8080/path@name"
+    assert node_identity("http://host?name@value") == "http://host?name@value"
+    assert node_identity("http://host#name@value") == "http://host#name@value"
+    for i in range(32):
+        digest = input_key(str(i))
+        assert ranked_nodes(authenticated, digest) == [
+            url.replace("://", "://user:pass@") for url in ranked_nodes(bare, digest)
+        ]

@@ -13,11 +13,35 @@ val prefetch_concurrency : int option ref = ref NONE
 fun nonempty label text =
   if text = "" then raise Error (label ^ " must not be empty") else text
 
+(* Change only authority userinfo; preserve the spelling of the host and path. *)
+fun replace_userinfo replacement url =
+  let
+    val (scheme, rest) = Substring.position "://" (Substring.full url)
+  in
+    if Substring.isEmpty rest then url
+    else
+      let
+        val start = Substring.size scheme + 3
+        val authority = Substring.takel (fn c => c <> #"/" andalso c <> #"?" andalso c <> #"#")
+          (Substring.triml 3 rest)
+        fun last_at i =
+          if i < start then NONE
+          else if String.sub (url, i) = #"@" then SOME i else last_at (i - 1)
+      in
+        case last_at (start + Substring.size authority - 1) of
+            NONE => url
+          | SOME at => String.substring (url, 0, start) ^ replacement ^ String.extract (url, at + 1, NONE)
+      end
+  end
+
+val node_identity = replace_userinfo ""
+
 (* Commas and whitespace separate nodes; their normalized spelling is the ring identity. *)
 fun urls text =
   let
     fun normalize url = Substring.string (Substring.dropr (fn c => c = #"/") (Substring.full url))
-    fun add (url, acc) = if List.exists (fn old => old = url) acc then acc else acc @ [url]
+    fun add (url, acc) =
+      if List.exists (fn old => node_identity old = node_identity url) acc then acc else acc @ [url]
     val nodes = List.foldl add []
       (map normalize (String.tokens (fn c => c = #"," orelse Char.isSpace c) text))
   in

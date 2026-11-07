@@ -96,7 +96,9 @@ docker run -e REMOTE_EXEC_WORKER_TOKEN=... -e HOLBUILD_REMOTE_CACHE_CURL_CONFIG_
 The coordinator's `REMOTE_EXEC_CACHE_URL` (or `HOLBUILD_REMOTE_CACHE_URL` as a
 fallback) and the worker's `--remote-cache` (or `HOLBUILD_REMOTE_CACHE_URL`)
 accept comma-separated cache nodes. Whitespace separators also work; trailing
-slashes and duplicate nodes are removed. Use the same URLs as the clients:
+slashes and duplicate nodes are removed. Inline credentials are excluded from
+node identity, so they agree with curl-config authentication. Use the same
+node hostnames and paths as the clients:
 coordinator reads and worker bootstrap spec downloads use holbuild's digest
 ranking and second-node fallback, including a read's 404 during handoff.
 See the top-level README's remote-cache configuration for the routing contract.
