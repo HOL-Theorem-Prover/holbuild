@@ -10,6 +10,7 @@ source "$SCRIPT_DIR/../../lib.sh"
 tmpdir=$(make_temp_dir)
 cleanup() {
   touch "$tmpdir/control/action-get-release" 2>/dev/null || true
+  touch "$tmpdir/control/cas-put-release" 2>/dev/null || true
   if [[ -n "${export_pid:-}" ]]; then
     kill "$export_pid" 2>/dev/null || true
     wait "$export_pid" 2>/dev/null || true
@@ -185,6 +186,51 @@ done
 for file in BScript.sml helperLib.sml data.txt; do
   require_file "$remote_root/cas/$(sha256sum "$project/src/$file" | cut -d' ' -f1)"
 done
+
+# The uploads run concurrently too: hold CAS PUTs until two are in flight,
+# which a serial uploader cannot reach.
+rm -rf "$remote_root/cas"
+touch "$tmpdir/control/cas-put-enable"
+(cd "$project" && exec "$HOLBUILD_BIN" --remote-cache "$remote_url" \
+  --prefetch-concurrency 2 action-spec --upload CTheory) \
+  > "$tmpdir/batch-upload-parallel.txt" 2> "$tmpdir/upload-progress.log" &
+export_pid=$!
+for _ in {1..500}; do
+  count=$(cat "$tmpdir/control/cas-put-count" 2>/dev/null || echo 0)
+  [[ "$count" -ge 2 ]] && break
+  kill -0 "$export_pid" 2>/dev/null || break
+  sleep 0.01
+done
+[[ "$count" -eq 2 ]] || {
+  echo "expected two concurrent uploads, observed $count" >&2
+  exit 1
+}
+touch "$tmpdir/control/cas-put-release"
+wait "$export_pid"
+unset export_pid
+rm "$tmpdir/control/cas-put-enable" "$tmpdir/control/cas-put-release"
+diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-upload-parallel.txt"
+for spec in $(awk '$1 == "action" { print $4 }' "$tmpdir/batch1.txt"); do
+  cmp "$project/.holbuild/action-specs/$spec" "$remote_root/cas/$spec"
+done
+total=$(sed -n 's|^uploading to remote cache: 0/\([0-9][0-9]*\) files$|\1|p' "$tmpdir/upload-progress.log")
+[[ -n "$total" ]] || { cat "$tmpdir/upload-progress.log" >&2; exit 1; }
+require_grep "^uploading to remote cache: $total/$total files\$" "$tmpdir/upload-progress.log"
+
+# After the first upload fails, the rest are skipped and the export fails.
+echo 500 > "$tmpdir/control/cas-put-status"
+: > "$request_log"
+if hb --prefetch-concurrency 1 action-spec --upload CTheory > /dev/null 2> "$tmpdir/upload-failure.log"; then
+  echo "an export whose upload failed succeeded" >&2
+  exit 1
+fi
+rm "$tmpdir/control/cas-put-status"
+require_grep 'could not upload .*HTTP 500' "$tmpdir/upload-failure.log"
+[[ $(grep -c '^PUT /cas/' "$request_log") -eq 1 ]] || {
+  echo "uploads went on after the first failure:" >&2
+  grep '^PUT /cas/' "$request_log" >&2
+  exit 1
+}
 
 # Once A is in the remote cache, only B and C are left, and B waits for nothing.
 hb build ATheory > "$tmpdir/build-a.log" 2>&1

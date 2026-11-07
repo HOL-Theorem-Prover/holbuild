@@ -247,6 +247,10 @@ val _ =
                            stderr = HolbuildSpawn.Inherit} > 0);
      assert "a spawned child inherits no connection"
             (socket_count {program = "sh", args = ["-c", "python3 \"$0\" $$", dir ^ "/tcp-sockets.py"],
+                           stderr = HolbuildSpawn.Inherit} = 0);
+     HolbuildHttp.close_idle ();
+     assert "close_idle closes the pooled connections"
+            (socket_count {program = "python3", args = [dir ^ "/tcp-sockets.py", self],
                            stderr = HolbuildSpawn.Inherit} = 0))
   else ()
 

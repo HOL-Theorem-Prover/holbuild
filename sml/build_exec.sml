@@ -5322,7 +5322,10 @@ fun prefetch_key (options : build_options) project keys node =
    once.  Returns {add, drain, stop}: drain waits for all added work; stop drops
    the items not yet started and waits for those in flight.  Failures are
    silent: for a prefetch, the demand restore of the same key retries and
-   reports. *)
+   reports.  Once drain or stop has waited, the remote cache connections the
+   threads left idle are closed: the server closes an idle connection after
+   a while, and one no later request reuses would stay half-open until the
+   process exits. *)
 fun start_background_pool limit work =
   let
     val front = ref [] and back = ref []
@@ -5359,9 +5362,10 @@ fun start_background_pool limit work =
     fun wait () =
       if with_lock (fn () => !active) > 0 then (OS.Process.sleep (Time.fromReal 0.05); wait ())
       else ()
-    fun stop () = (with_lock (fn () => (stopped := true; front := []; back := [])); wait ())
+    fun drain () = (wait (); HolbuildHttp.close_idle ())
+    fun stop () = (with_lock (fn () => (stopped := true; front := []; back := [])); drain ())
   in
-    {add = add, drain = wait, stop = stop}
+    {add = add, drain = drain, stop = stop}
   end
 
 fun prefetch_limit jobs =
@@ -5804,37 +5808,43 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
                                " can't run remotely: " ^ reason)
               | NONE => ())
         actions
+    (* Runs work on every item on the prefetch pool and waits for them all,
+       reporting "<doing>: <done>/<total> <items>" at most every 5 s.  Each
+       item gets its own remote cache value, as restore prefetch does: the
+       blob metadata it remembers is mutable. *)
+    fun on_pool doing items_name work items =
+      let
+        val total = length items
+        val completed = ref 0
+        val next_report = ref (Time.now ())
+        val progress_mutex = Mutex.mutex ()
+        fun report () =
+          let val now = Time.now ()
+          in
+            if not (HolbuildStatus.quiet_mode ()) andalso
+               (!completed = total orelse Time.>= (now, !next_report)) then
+              (HolbuildStatus.message_stderr
+                 (doing ^ ": " ^ Int.toString (!completed) ^ "/" ^
+                  Int.toString total ^ " " ^ items_name ^ "\n");
+               next_report := Time.+ (now, Time.fromSeconds 5))
+            else ()
+          end
+        fun run item =
+          (work (HolbuildRemoteCache.remote (HolbuildRemoteCache.base_url remote)) item;
+           Mutex.lock progress_mutex;
+           ((completed := !completed + 1; report ()) before Mutex.unlock progress_mutex)
+           handle e => (Mutex.unlock progress_mutex; raise e))
+        val _ = report ()
+        val {add, drain, stop} = start_background_pool (prefetch_limit jobs) run
+      in
+        (List.app add items; drain ()) handle e => (stop (); raise e)
+      end
     datatype cache_check = Hit | Miss | CheckFailed of exn
     val checks = map (fn action => (action, ref Miss)) actions
-    val total = length actions
-    val completed = ref 0
-    val next_report = ref (Time.now ())
-    val progress_mutex = Mutex.mutex ()
-    fun report () =
-      let val now = Time.now ()
-      in
-        if not (HolbuildStatus.quiet_mode ()) andalso
-           (!completed = total orelse Time.>= (now, !next_report)) then
-          (HolbuildStatus.message_stderr
-             ("checking remote cache: " ^ Int.toString (!completed) ^ "/" ^
-              Int.toString total ^ " theories\n");
-           next_report := Time.+ (now, Time.fromSeconds 5))
-        else ()
-      end
-    fun check ((node, action), result) =
-      let
-        (* Each check owns the mutable blob metadata, as restore prefetch does. *)
-        val remote = HolbuildRemoteCache.remote (HolbuildRemoteCache.base_url remote)
-      in
-      (result := ((if remote_entry_satisfies remote options project plan node (#input_key action)
-                   then Hit else Miss) handle e => CheckFailed e);
-       Mutex.lock progress_mutex;
-       ((completed := !completed + 1; report ()) before Mutex.unlock progress_mutex)
-       handle e => (Mutex.unlock progress_mutex; raise e))
-      end
-    val _ = report ()
-    val {add, drain, stop} = start_background_pool (prefetch_limit jobs) check
-    val _ = (List.app add checks; drain ()) handle e => (stop (); raise e)
+    fun check remote ((node, action), result) =
+      result := ((if remote_entry_satisfies remote options project plan node (#input_key action)
+                  then Hit else Miss) handle e => CheckFailed e)
+    val _ = on_pool "checking remote cache" "theories" check checks
     val uncached_actions =
       List.mapPartial (fn (action, result) =>
         case !result of Hit => NONE | Miss => SOME action | CheckFailed e => raise e) checks
@@ -5917,10 +5927,23 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       end
     val exported = map export uncached_actions
     val action_lines = List.concat (map #lines exported)
-    (* Specs share their library sources, so each file goes up once. *)
+    (* Specs share their library sources, so each file goes up once.  After
+       the first failure the uploads not yet started are skipped, for the
+       caller to fall back at once. *)
+    val upload_failure = ref NONE
+    val failure_mutex = Mutex.mutex ()
+    fun failed () = (Mutex.lock failure_mutex; isSome (!upload_failure) before Mutex.unlock failure_mutex)
+    fun upload_file remote path =
+      if failed () then ()
+      else publish_spec_blob remote path
+           handle e => (Mutex.lock failure_mutex;
+                        (if isSome (!upload_failure) then () else upload_failure := SOME e);
+                        Mutex.unlock failure_mutex)
+    val files = if upload then unique_strings (List.concat (map #files exported)) else []
     val _ =
-      if upload then List.app (publish_spec_blob remote) (unique_strings (List.concat (map #files exported)))
-      else ()
+      if null files then ()
+      else (on_pool "uploading to remote cache" "files" upload_file files;
+            case !upload_failure of SOME e => raise e | NONE => ())
   in
     String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n"
   end

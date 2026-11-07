@@ -80,6 +80,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         while not (control / "action-get-release").exists():
             time.sleep(0.01)
 
+    def gate_cas_put(self) -> None:
+        if control is None or not self.path.startswith("/cas/"):
+            return
+        if not (control / "cas-put-enable").exists():
+            return
+        with action_put_lock:
+            count_file = control / "cas-put-count"
+            count = int(count_file.read_text()) if count_file.exists() else 0
+            count_file.write_text(str(count + 1))
+        while not (control / "cas-put-release").exists():
+            time.sleep(0.01)
+
     def do_GET(self):
         self.record_request()
         self.gate_action_get()
@@ -128,6 +140,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path is None:
             return
         data = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self.gate_cas_put()
+        if (
+            control is not None
+            and self.path.startswith("/cas/")
+            and (control / "cas-put-status").exists()
+        ):
+            self.send_response(int((control / "cas-put-status").read_text()))
+            self.end_headers()
+            return
         if self.headers.get("Content-Encoding") == "zstd":
             data = subprocess.check_output(["zstd", "-q", "-d", "-c"], input=data)
         action_sequence = (
