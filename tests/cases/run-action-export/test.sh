@@ -126,7 +126,7 @@ key_helper=$(plan_key helperLib)
 [[ -n "$key_c" && -n "$key_helper" ]] || { cat "$tmpdir/plan.txt" >&2; exit 1; }
 
 run_export --support "$runner/data/conf.txt" --load helperLib --load bossLib \
-  --output tacdata --output manifest --option timeout=60 spec:CTheory hol:arithmetic \
+  --output result --output manifest --option timeout=60 spec:CTheory hol:arithmetic \
   > "$tmpdir/export1.txt"
 
 # Checks the export's specs: each is in the remote CAS under its hash, with
@@ -165,7 +165,7 @@ for line in lines:
         expected = ["holbuild-run-v1", toolchain_key, f"context=spec:CTheory@{key_c}",
                     f"script={script_sha}", f"support=data/conf.txt@{conf_sha}",
                     f"load=spec:helperLib@{key_helper}", "load=bossLib",
-                    "output=manifest", "output=tacdata"]
+                    "output=manifest", "output=result"]
         assert run_text.decode() == "\n".join(expected) + "\n", run_text
         ctx = [l for l in head if l.startswith(context_prefixes)]
         assert ctx == [l for l in action_lines if l.startswith(context_prefixes)], (ctx, action_lines)
@@ -174,7 +174,7 @@ for line in lines:
         assert scripts == [f".holbuild/action-src/spec/src/{t}Script.sml" for t in "ABC"], scripts
         assert ["run-load spec:helperLib", "run-load HOLLIB:bossLib"] == \
             [l for l in head if l.startswith("run-load ")], head
-        assert ["output manifest", "output tacdata"] == [l for l in head if l.startswith("output ")], head
+        assert ["output manifest", "output result"] == [l for l in head if l.startswith("output ")], head
         assert "file support data/conf.txt " + conf_sha + " 5" in head, head
     elif context == "HOL:arithmeticTheory":
         assert "context HOL:arithmeticTheory" in head, head
@@ -194,13 +194,13 @@ c_run_key=$(key_of spec:CTheory "$tmpdir/keys1.txt")
 
 # The timeout is no part of the key.
 run_export --support "$runner/data/conf.txt" --load helperLib --load bossLib \
-  --output tacdata --output manifest --option timeout=7200 spec:CTheory > "$tmpdir/export2.txt"
+  --output result --output manifest --option timeout=7200 spec:CTheory > "$tmpdir/export2.txt"
 [[ $(key_of spec:CTheory "$tmpdir/export2.txt") == "$c_run_key" ]]
 [[ $(awk '{ print $3 }' "$tmpdir/export2.txt") != $(awk '$1 == "spec:CTheory" { print $3 }' "$tmpdir/export1.txt") ]]
 
 # A renamed output is a different run.
 run_export --support "$runner/data/conf.txt" --load helperLib --load bossLib \
-  --output tacdata --output status spec:CTheory > "$tmpdir/export3.txt"
+  --output result --output status spec:CTheory > "$tmpdir/export3.txt"
 [[ $(key_of spec:CTheory "$tmpdir/export3.txt") != "$c_run_key" ]]
 
 # So is a run in a changed context.
@@ -214,11 +214,13 @@ QED
 SML
 hb build CTheory > /dev/null
 run_export --support "$runner/data/conf.txt" --load helperLib --load bossLib \
-  --output tacdata --output manifest spec:CTheory > "$tmpdir/export4.txt"
+  --output result --output manifest spec:CTheory > "$tmpdir/export4.txt"
 [[ $(key_of spec:CTheory "$tmpdir/export4.txt") != "$c_run_key" ]]
 
-# hol:* is every theory of the toolchain.
-run_export --output o 'hol:*' > "$tmpdir/all.txt"
+# hol:* is every theory of the toolchain.  Its ~70 spec uploads stay under
+# the fixture server's listen backlog.
+hb --prefetch-concurrency 4 run-action --export-only --script "$runner/run.sml" \
+  --output o 'hol:*' > "$tmpdir/all.txt"
 grep -q '^HOL:boolTheory ' "$tmpdir/all.txt"
 grep -q '^HOL:arithmeticTheory ' "$tmpdir/all.txt"
 if grep -q '^HOL:Theory ' "$tmpdir/all.txt"; then
@@ -227,10 +229,19 @@ if grep -q '^HOL:Theory ' "$tmpdir/all.txt"; then
 fi
 
 # A library of the hol package is fixed by the toolchain, so its load line
-# carries no key; the spec ships its sources like a project library's.
-run_export --load tacticToe --output o hol:bool > "$tmpdir/ttt.txt"
-ttt_spec=$project/.holbuild/run-specs/$(awk '{ print $3 }' "$tmpdir/ttt.txt")
-sed -n '/^run-text$/,$p' "$ttt_spec" | grep -qx 'load=tacticToe'
-grep -qx 'run-load hol:tacticToe' "$ttt_spec"
-grep -q '^lib hol:tacticToe .* \.uo ' "$ttt_spec"
-grep -q '^file library \.holbuild/action-src/hol/src/tactictoe/src/tacticToe\.sml ' "$ttt_spec"
+# carries no key; the spec ships its sources like a project library's, and
+# restores the hol package theories it needs, which must be built first.
+if run_export --load sortingSyntax --output o hol:bool > /dev/null 2> "$tmpdir/sorting-unbuilt.err"; then
+  echo "a load whose theory isn't built was exported" >&2
+  exit 1
+fi
+require_grep 'HOL:boolTheory needs hol:sortingTheory, which is not in the local cache' "$tmpdir/sorting-unbuilt.err"
+hb build sortingTheory > /dev/null
+run_export --load sortingSyntax --output o hol:bool > "$tmpdir/sorting.txt"
+sorting_spec=$project/.holbuild/run-specs/$(awk '{ print $3 }' "$tmpdir/sorting.txt")
+sed -n '/^run-text$/,$p' "$sorting_spec" | grep -qx 'load=sortingSyntax'
+grep -qx 'run-load hol:sortingSyntax' "$sorting_spec"
+grep -q '^lib hol:sortingSyntax .* \.uo ' "$sorting_spec"
+grep -q '^file library \.holbuild/action-src/hol/src/sort/sortingSyntax\.sml ' "$sorting_spec"
+grep -q '^dep theory hol:sortingTheory ' "$sorting_spec"
+grep -q '^file context-script \.holbuild/action-src/hol/src/sort/sortingScript\.sml ' "$sorting_spec"

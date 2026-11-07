@@ -6308,9 +6308,17 @@ fun export_run_specs tc project planned jobs ({contexts, script, supports, loads
                     (["holbuild-run-v1", "toolchain=" ^ action_toolchain_key, key_line] @ run_text_tail) ^ "\n"
                 val run_key = HolbuildToolchain.hash_text run_text
                 val token = spec_token name
-                val script_lines =
-                  map (fn node => file_line "context-script" (token (library_source_path node)) (source_file node))
-                      theories
+                (* The context's key names each script's planned hash, so the
+                   file shipped must be the one planned. *)
+                fun script_line node =
+                  let val line = file_line "context-script" (token (library_source_path node)) (source_file node)
+                  in
+                    if List.nth (String.tokens Char.isSpace line, 3) =
+                       HolbuildBuildPlan.source_hash (#plan (the_plan ())) node
+                    then line
+                    else raise Error ("theory script changed since the build was planned: " ^ source_file node)
+                  end
+                val script_lines = map script_line theories
                 val lines =
                   [run_spec_header,
                    "holbuild-version=" ^ HolbuildVersion.version,
