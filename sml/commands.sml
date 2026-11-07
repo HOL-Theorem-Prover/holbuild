@@ -1397,6 +1397,17 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           (fn () => HolbuildBuildPlan.describe (HolbuildBuildExec.build_config_lines_for_node build_options project)
                       (action_toolchain_key toolchain_key) plan)
       end
+    (* Plans again, in full, once the theories that write SML sources ran. *)
+    fun replan () =
+      let
+        val planned =
+          if Option.isSome prepared orelse watch
+          then with_options (prepare_plan (prepare_source_index "build" resolution project))
+          else plan_with_record true
+      in
+        warn_unreachable_for (#1 planned);
+        planned
+      end
     fun execute_build () =
       let
         fun execute (options, plan, toolchain_key) =
@@ -1405,10 +1416,6 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         val ({index, entry_plan, plan, toolchain_key, components, ...}, options) = plan_build ()
         fun build_owners owner_plan =
           execute (build_options_for index entry_plan owner_plan [] (#checkpoint_targets options), owner_plan, toolchain_key)
-        fun replan () =
-          if Option.isSome prepared orelse watch
-          then with_options (prepare_plan (prepare_source_index "build" resolution project))
-          else plan_with_record true
       in
         case components of
             (* A plan from the record holds the generated sources as their
@@ -1416,8 +1423,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             NONE => execute (options, plan, toolchain_key)
           | SOME components =>
               if build_generated_source_owners build_owners components (#holdir tc) index plan then
-                let val (planned as {plan, toolchain_key, ...}, options) = replan ()
-                in warn_unreachable_for planned; execute (options, plan, toolchain_key) end
+                let val ({plan, toolchain_key, ...}, options) = replan ()
+                in execute (options, plan, toolchain_key) end
               else execute (options, plan, toolchain_key)
       end
     fun export_action_specs upload () =
@@ -1560,12 +1567,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       end
     (* Theories the remote cache lacks go to the coordinator as a batch; once
        it finishes, the ordinary build restores them from the remote cache. *)
-    fun remote_build {url, remote_only, detach, attach} =
+    fun remote_plan {url, remote_only, detach} (plan, build_options, toolchain_key) attach =
       let
-        val _ =
-          if Option.isSome (HolbuildRemoteCacheConfig.url ()) then ()
-          else raise Error "--remote-exec needs a remote cache: pass --remote-cache URL"
-        val ({plan, toolchain_key, ...}, build_options) = plan_build ()
         fun export forced =
           timed_phase "action_spec.export"
             (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key jobs
@@ -1723,26 +1726,54 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                handle HolbuildBuildExec.Error reason => HolbuildRemoteExec.Refused reason of
               HolbuildRemoteExec.Ok batch => submit resubmit batch
             | HolbuildRemoteExec.Refused reason => fall_back reason
-        (* A theory that writes SML sources runs before the rest of the build
-           is planned (execute_build), which neither a batch nor the restore
-           build of this plan does.  Under --remote-only, execute_build only
-           restores (restore_only). *)
-        val writes_sources = not (null (HolbuildBuildPlan.generated_source_owners plan))
-        val reason = "theories that write SML sources build before the rest is planned"
       in
-        if writes_sources andalso detach then raise Error ("remote execution: " ^ reason)
-        else if writes_sources andalso remote_only then
-          (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "; restoring from the cache\n");
-           Option.app (fn batch_id => ignore (HolbuildRemoteExec.cancel url batch_id)) attach;
-           execute_build ())
-        else if writes_sources then
-          (HolbuildBuildExec.warn ("remote execution: " ^ reason ^ "; building locally");
-           Option.app (fn batch_id => ignore (HolbuildRemoteExec.cancel url batch_id)) attach;
-           execute_build ())
-        else
-          case attach of
-              SOME batch_id => finish true NONE batch_id
-            | NONE => export_and_submit true []
+        case attach of
+            SOME batch_id => finish true NONE batch_id
+          | NONE => export_and_submit true []
+      end
+    (* A theory that writes SML sources runs before the rest of the build is
+       planned, as in execute_build: its batch goes first, and once its
+       restore has written the sources, the rest is planned again and goes as
+       a second batch.  A plan from the record, or one whose such theories
+       are up to date, already holds their sources.  A single batch to leave
+       running or attach to can't span the two. *)
+    fun remote_build {url, remote_only, detach, attach} =
+      let
+        val _ =
+          if Option.isSome (HolbuildRemoteCacheConfig.url ()) then ()
+          else raise Error "--remote-exec needs a remote cache: pass --remote-cache URL"
+        val remote = remote_plan {url = url, remote_only = remote_only, detach = detach}
+        val planned as ({index, entry_plan, plan, toolchain_key, components, ...}, build_options) = plan_build ()
+        val stale_owner =
+          case components of
+              NONE => NONE
+            | SOME _ => stale_source_owner planned (fn () => input_keys planned)
+        val reason = "theories that write SML sources build before the rest is planned, " ^
+                     "which one batch can't span"
+      in
+        case (components, stale_owner) of
+            (SOME components, SOME _) =>
+              if detach then raise Error ("remote execution: " ^ reason)
+              else if Option.isSome attach then
+                (Option.app (fn batch_id => ignore (HolbuildRemoteExec.cancel url batch_id)) attach;
+                 if remote_only then
+                   (HolbuildHolSharedCache.local_build_needed := true;
+                    raise Error ("remote execution: " ^ reason))
+                 else (HolbuildBuildExec.warn ("remote execution: " ^ reason ^ "; building locally");
+                       execute_build ()))
+              else
+                let
+                  val owner_plan =
+                    HolbuildBuildPlan.plan_targets components (#holdir tc) index
+                      (HolbuildBuildPlan.generated_source_owners plan)
+                  val () =
+                    remote (owner_plan, build_options_for index entry_plan owner_plan []
+                                               (#checkpoint_targets build_options), toolchain_key) NONE
+                  val ({plan, toolchain_key, ...}, build_options) = replan ()
+                in
+                  remote (plan, build_options, toolchain_key) NONE
+                end
+          | _ => remote (plan, build_options, toolchain_key) attach
       end
     fun run_with_stat_cache f =
       (f (); finish_stat_cache stat_cache)

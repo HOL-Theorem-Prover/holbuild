@@ -1691,10 +1691,13 @@ so that a caller can tell this from an error and build locally itself. An
 error on the command line or in the project, a batch someone cancelled, or an
 interrupt exits with status 1, though a HOL toolchain that doesn't restore is
 found first, before the command line is checked. With nothing to build remotely it says so and goes straight to the
-local build. A build that includes a theory writing SML sources (see
-`holbuild_extra_outputs`) builds locally too, since those theories have to
-run before the rest of the build can be planned; with `--remote-only` it
-only restores from the cache, and with `--detach` it fails.
+local build. A theory writing SML sources (see `holbuild_extra_outputs`) has
+to run before the rest of the build can be planned, so when such a theory
+isn't up to date, it goes to the workers in a batch of its own; restoring it
+writes its sources, and the rest of the build is planned again and goes as a
+second batch. One batch can't span the two, so such a build fails with
+`--detach`, and with `--attach` it cancels the batch and builds locally
+(`--remote-only`: fails).
 
 A batch that fails because a theory's proof failed on a worker (failure
 `proof` or `tactic-timeout`) isn't built locally, since a local build would
