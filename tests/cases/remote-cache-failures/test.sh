@@ -45,17 +45,21 @@ cat > "$tmpdir/shims/curl" <<'SH'
 set -euo pipefail
 printf '%s\n' "$*" >> "$HOLBUILD_TEST_CURL_LOG"
 connect_timeout=
+speed_limit=
+speed_time=
 max_time=
 put=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --connect-timeout) connect_timeout=$2; shift 2 ;;
+    --speed-limit) speed_limit=$2; shift 2 ;;
+    --speed-time) speed_time=$2; shift 2 ;;
     --max-time) max_time=$2; shift 2 ;;
     -T) put=1; shift 2 ;;
     *) shift ;;
   esac
 done
-[[ "$connect_timeout" == 5 && "$max_time" == 30 ]] || {
+[[ "$connect_timeout" == 5 && "$speed_limit" == 1 && "$speed_time" == 30 && "$max_time" == 1800 ]] || {
   echo "missing curl timeout policy" >&2
   exit 99
 }
@@ -97,7 +101,7 @@ build_with_failure() {
       HOLBUILD_TEST_CURL_LOG="$curl_log" HOLBUILD_TEST_HTTP_CODE="$http_code" \
       HOLBUILD_TEST_CURL_STATUS="$curl_status" HOLBUILD_TEST_LIBCURL=libholbuild-test-no-such-curl.so \
       "$HOLBUILD_BIN" -j2 --remote-cache http://cache.invalid build ATheory BTheory CTheory) > "$log" 2>&1
-    require_grep 'connect-timeout 5 --max-time 30' "$curl_log"
+    require_grep 'connect-timeout 5 --speed-limit 1 --speed-time 30 --max-time 1800' "$curl_log"
     if grep -q 'missing curl timeout policy' "$log"; then
       cat "$log" >&2
       exit 1

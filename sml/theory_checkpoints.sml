@@ -12,7 +12,6 @@ type checkpoint = {kind : string, name : string, safe_name : string, theorem_sta
                    tactic_end : int, tactic_text : string,
                    proof_attrs : (string * string list) list, prefix_hash : string,
                    context_path : string, context_ok : string,
-                   end_of_proof_path : string, end_of_proof_ok : string,
                    failed_prefix_path : string, failed_prefix_ok : string,
                    deps_key : string, checkpoint_key : string,
                    proof_ir_plan : string option, proof_ir_factories : string option}
@@ -77,7 +76,6 @@ fun prefix_hash text boundary =
   HolbuildToolchain.hash_text (String.substring(text, 0, boundary))
 
 fun begin_theorem_line ({kind, name, tactic_text, context_path, context_ok,
-                         end_of_proof_path, end_of_proof_ok,
                          failed_prefix_path, failed_prefix_ok,
                          proof_attrs, proof_ir_plan, ...} : checkpoint) =
   String.concat
@@ -90,8 +88,6 @@ fun begin_theorem_line ({kind, name, tactic_text, context_path, context_ok,
      HolbuildToolchain.sml_string tactic_text, ", ",
      HolbuildToolchain.sml_string context_path, ", ",
      HolbuildToolchain.sml_string context_ok, ", ",
-     HolbuildToolchain.sml_string end_of_proof_path, ", ",
-     HolbuildToolchain.sml_string end_of_proof_ok, ", ",
      HolbuildToolchain.sml_string failed_prefix_path, ", ",
      HolbuildToolchain.sml_string failed_prefix_ok, ", ",
      "[" ^ String.concatWith ", "
@@ -167,10 +163,10 @@ fun option_string_sml NONE = "NONE : string option"
 fun proof_ir_runtime_helper_path () =
   case OS.Process.getEnv "HOLBUILD_PROOF_IR_RUNTIME" of
       SOME path => path
-    | NONE => OS.Path.concat(HolbuildRuntimePaths.source_root, "sml/proof_runtime.sml")
+    | NONE => OS.Path.concat(HolbuildRuntimePaths.runtime_root (), "sml/proof_runtime.sml")
 
 fun source_helper_path relative =
-  OS.Path.concat(HolbuildRuntimePaths.source_root, relative)
+  OS.Path.concat(HolbuildRuntimePaths.runtime_root (), relative)
 
 fun sha256_runtime_helper_path () = source_helper_path "sml/sha256.sml"
 
@@ -180,14 +176,15 @@ fun tactic_compat_runtime_helper_path () =
   source_helper_path "sml/tactic_compat_runtime.sml"
 
 fun checkpoint_save_runtime_helper_path () =
-  OS.Path.concat(HolbuildRuntimePaths.source_root, "sml/checkpoint_save_runtime.sml")
+  OS.Path.concat(HolbuildRuntimePaths.runtime_root (), "sml/checkpoint_save_runtime.sml")
 
 fun declaration_checkpoint_runtime_prelude [] = ""
   | declaration_checkpoint_runtime_prelude _ =
       runtime_lines ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";"]
 
 fun runtime_install_lines {checkpoint_enabled, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} =
-  ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (sha256_runtime_helper_path ()) ^ ";",
+  ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (source_helper_path "sml/diagnostic_limits.sml") ^ ";",
+   "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (sha256_runtime_helper_path ()) ^ ";",
    "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (proof_ir_helper_path ()) ^ ";",
    "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";",
    "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (tactic_compat_runtime_helper_path ()) ^ ";",

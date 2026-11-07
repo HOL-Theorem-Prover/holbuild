@@ -99,11 +99,23 @@ for mode in plain steps; do
   project=$tmpdir/$mode
   make_project "$project"
   cat "$tmpdir/prelude.sml" > "$project/src/AScript.sml"
+  if [[ "$mode" == plain ]]; then
+    # HOL records theorem source lines in its artifacts; keep both helpers four lines tall.
+    printf 'fun check_metadata expected = ();\n\n\n\n' >> "$project/src/AScript.sml"
+  else
+    cat >> "$project/src/AScript.sml" <<'SML'
+fun check_metadata expected =
+  case !HolbuildProofRuntime.theorem_info_ref of
+      SOME info => if #8 info = expected then () else raise Fail "attribute metadata changed"
+    | NONE => raise Fail "missing theorem metadata";
+SML
+  fi
   cat >> "$project/src/AScript.sml" <<'SML'
 Theorem exclusions:
   T /\ T
 Proof[exclude_simps=attr_a_def,exclude_frags=ATTR_FRAG]
-  (early (); ALL_TAC) >> nested_tac >> context_check >> CONJ_TAC
+  (check_metadata [("exclude_simps", ["attr_a_def"]), ("exclude_frags", ["ATTR_FRAG"])];
+   early (); ALL_TAC) >> nested_tac >> context_check >> CONJ_TAC
   >- (later (); ACCEPT_TAC TRUTH)
   >- (if aconv (reduced (srw_ss()) ``attr_c``) ``T`` = expected_inline_change
       then () else raise Fail "inline reader escaped native lexical context";
@@ -132,7 +144,8 @@ val _ = check_restored ();
 Theorem custom:
   T
 Proof[flip=first second,remove=third,flip=fourth]
-  (observe (); ALL_TAC) >> context_observe >> ACCEPT_TAC TRUTH
+  (check_metadata [("flip", ["first", "second"]), ("remove", ["third"]), ("flip", ["fourth"])];
+   observe (); ALL_TAC) >> context_observe >> ACCEPT_TAC TRUTH
 QED
 val _ = check_restored ();
 Theorem lexical_reader:
@@ -172,30 +185,22 @@ for ext in sml sig dat; do
 done
 require_grep 'holbuild proof-ir before theorem=exclusions' "$tmpdir/steps.log"
 require_grep 'holbuild proof-ir before theorem=partial\[right\]' "$tmpdir/steps.log"
-require_file "$(find "$tmpdir/steps/.holbuild/checkpoints" -name 'exclusions_end_of_proof.save' -print -quit)"
-
-# Restored navigation heaps must retain history, but no temporary simpset.
-cat > "$tmpdir/navigation.sml" <<'SML'
+# The only successful checkpoint is after the native statement has bound its theorem.
+if find "$tmpdir/steps/.holbuild/checkpoints" -name '*end_of_proof*' -o -name '*failed_prefix.save*' | grep -q .; then
+  echo 'attributed proofs saved a removed or unsafe checkpoint' >&2
+  exit 1
+fi
+cat > "$tmpdir/context.sml" <<'SML'
 val _ = check_restored ();
 val _ = if isSome (!HolbuildProofRuntime.proof_factories_ref) then
-          raise Fail "temporary factories survived in end checkpoint" else ();
-val _ = HolbuildProofRuntime.backup_n 1;
-val _ = if null (HolbuildProofRuntime.history_top_goals ()) then
-          raise Fail "missing attributed proof history" else ();
-val _ = print "ATTR_NAVIGATION_OK\n";
+          raise Fail "temporary factories survived in context checkpoint" else ();
+val _ = print "ATTR_CONTEXT_OK\n";
 SML
 for name in exclusions custom partial_right_; do
-  end_state=$(find "$tmpdir/steps/.holbuild/checkpoints" -name "${name}_end_of_proof.save" -print -quit)
-  expected='[("exclude_simps", ["attr_a_def"]), ("exclude_frags", ["ATTR_FRAG"])]'
-  if [[ "$name" == custom ]]; then
-    expected='[("flip", ["first", "second"]), ("remove", ["third"]), ("flip", ["fourth"])]'
-  fi
-  cat > "$tmpdir/metadata.sml" <<SML
-val SOME info = !HolbuildProofRuntime.theorem_info_ref;
-val _ = if #10 info = $expected then () else raise Fail "attribute metadata changed";
-SML
-  "$HOLDIR/bin/hol" run --noconfig --holstate "$end_state" "$tmpdir/metadata.sml" "$tmpdir/navigation.sml" > "$tmpdir/navigation-$name.log" 2>&1
-  require_grep 'ATTR_NAVIGATION_OK' "$tmpdir/navigation-$name.log"
+  context_state=$(find "$tmpdir/steps/.holbuild/checkpoints" -name "${name}_context.save" -print -quit)
+  require_file "$context_state"
+  "$HOLDIR/bin/hol" run --noconfig --holstate "$context_state" "$tmpdir/context.sml" > "$tmpdir/context-$name.log" 2>&1
+  require_grep 'ATTR_CONTEXT_OK' "$tmpdir/context-$name.log"
 done
 
 for mode in plain steps; do

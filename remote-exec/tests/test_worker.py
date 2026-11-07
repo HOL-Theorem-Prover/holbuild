@@ -4,6 +4,8 @@ import fcntl
 import io
 import json
 import os
+import signal
+import subprocess
 import tarfile
 import threading
 import time
@@ -16,17 +18,23 @@ import pytest
 
 from remote_exec import worker
 from remote_exec.worker import (
+    CacheUnavailable,
     Coordinator,
+    ExecSpans,
     HostMemory,
     HostTelemetry,
+    Lease,
+    Phases,
     Protection,
     Releases,
     Unreleased,
     child_charge,
+    claim_reporting,
     cpu_times,
     failed_record,
     parse_args,
     run_one,
+    runs_hol,
     wait_for_memory,
 )
 
@@ -38,7 +46,9 @@ RECORD = f"holbuild-action-result-v1\nspec={SPEC}\ninput-key={'6' * 64}\nstatus=
 FAKE_HOLBUILD = f"""#!/bin/sh
 echo "$@" >> "$HOLBUILD_FAKE_LOG"
 env > "$HOLBUILD_FAKE_LOG.env"
-sleep 2  # long enough for a heartbeat at the 1 s interval of a 3 s lease
+# long enough for a heartbeat at the 1 s interval of a 3 s lease; HOLBUILD_FAKE_LEASE: in a child holding that file
+# open, as a HOL child holds its admission lease
+if [ -n "$HOLBUILD_FAKE_LEASE" ]; then sleep 1; (exec 3>"$HOLBUILD_FAKE_LEASE"; sleep 2); sleep 1; else sleep 2; fi
 [ -z "$HOLBUILD_FAKE_CRASH" ] || exit 70
 while [ "$#" -gt 0 ]; do
   if [ "$1" = --result ]; then printf '{RECORD}' > "$2"; fi
@@ -73,6 +83,7 @@ class Server:
     claims: list[dict[str, object]] = field(default_factory=list)
     heartbeats: list[dict[str, object]] = field(default_factory=list)
     unavailable: int = 0  # how many more completes answer 502, as a proxy does while the coordinator restarts
+    cut_short: bool = False  # whether /cas/ answers close the connection before the body they announce is sent
 
 
 @pytest.fixture
@@ -90,6 +101,13 @@ def server() -> Iterator[Server]:
             self.wfile.write(body.encode())
 
         def do_GET(self) -> None:
+            if state.cut_short:
+                self.send_response(200)
+                self.send_header("Content-Length", "1000")
+                self.end_headers()
+                self.wfile.write(b"holbuild-action-spec-v1\n")
+                self.close_connection = True
+                return
             spec = state.specs.get(self.path.removeprefix("/cas/"))
             self.reply(404) if spec is None else self.reply(200, spec)
 
@@ -225,7 +243,9 @@ def test_worker_runs_the_action_on_the_release_that_exported_it(
     switch.chmod(0o755)
     args = worker_args(tmp_path, server, "--protection-cmd", str(switch))
 
-    run_one(Coordinator(server.url, "w"), args, releases(tmp_path, server), Protection(str(switch), None), claim())
+    run_one(
+        Coordinator(server.url, "w"), args, releases(tmp_path, server), Protection(str(switch), None), claim(), Phases()
+    )
 
     assert server.completed == [RECORD]
     assert logs[1].read_text().split() == [
@@ -261,6 +281,7 @@ def test_action_runs_without_the_worker_token(
         releases(tmp_path, server),
         Protection(None, None),
         claim(),
+        Phases(),
     )
 
     env = dict(line.split("=", 1) for line in Path(f"{logs[1]}.env").read_text().splitlines() if "=" in line)
@@ -279,15 +300,91 @@ def test_action_that_ends_without_a_record_is_reported_for_a_retry(
     server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
     monkeypatch.setenv("HOLBUILD_FAKE_CRASH", "1")
 
-    run_one(
-        Coordinator(server.url, "w"),
-        worker_args(tmp_path, server),
-        releases(tmp_path, server),
-        Protection(None, None),
-        claim(),
-    )
+    with pytest.raises(RuntimeError, match="exited 70 without a result record"):
+        run_one(
+            Coordinator(server.url, "w"),
+            worker_args(tmp_path, server),
+            releases(tmp_path, server),
+            Protection(None, None),
+            claim(),
+            Phases(),
+        )
 
     assert server.completed == [failed_record(SPEC, "internal")]
+
+
+def test_action_whose_spec_an_unreachable_cache_does_not_give_is_reported_unavailable(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path]
+) -> None:
+    unreachable = Releases(
+        str(tmp_path / "releases"), f"file://{tmp_path}/holbuild-{{version}}.tar.gz", "http://127.0.0.1:1", None
+    )
+    with pytest.raises(CacheUnavailable, match="fetching spec"):
+        run_one(
+            Coordinator(server.url, "w"),
+            worker_args(tmp_path, server),
+            unreachable,
+            Protection(None, None),
+            claim(),
+            Phases(),
+        )
+
+    assert server.completed == [failed_record(SPEC, "unavailable")]
+    assert not logs[1].exists()
+
+
+def test_action_whose_spec_transfer_is_cut_short_is_reported_unavailable(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path]
+) -> None:
+    server.cut_short = True
+    with pytest.raises(CacheUnavailable, match="fetching spec"):
+        run_one(
+            Coordinator(server.url, "w"),
+            worker_args(tmp_path, server),
+            releases(tmp_path, server),
+            Protection(None, None),
+            claim(),
+            Phases(),
+        )
+
+    assert server.completed == [failed_record(SPEC, "unavailable")]
+
+
+def test_action_whose_spec_the_cache_lost_is_reported_for_a_counted_retry(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path]
+) -> None:
+    with pytest.raises(RuntimeError, match="404"):
+        run_one(
+            Coordinator(server.url, "w"),
+            worker_args(tmp_path, server),
+            releases(tmp_path, server),
+            Protection(None, None),
+            claim(),
+            Phases(),
+        )
+
+    assert server.completed == [failed_record(SPEC, "internal")]
+    assert not logs[1].exists()
+
+
+def test_action_whose_release_does_not_build_is_reported_for_a_retry(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path]
+) -> None:
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3", "bin/holbuild:\n\texit 1\n")
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+
+    with pytest.raises(subprocess.CalledProcessError):
+        run_one(
+            Coordinator(server.url, "w"),
+            worker_args(tmp_path, server),
+            releases(tmp_path, server),
+            Protection(None, None),
+            claim(),
+            Phases(),
+        )
+
+    assert server.completed == [failed_record(SPEC, "internal")]
+    assert not logs[1].exists()
 
 
 def test_action_of_an_unreleased_holbuild_is_rejected(tmp_path: Path, server: Server, logs: tuple[Path, Path]) -> None:
@@ -299,6 +396,7 @@ def test_action_of_an_unreleased_holbuild_is_rejected(tmp_path: Path, server: Se
         releases(tmp_path, server),
         Protection(None, None),
         claim(),
+        Phases(),
     )
 
     assert server.completed == [failed_record(SPEC, "spec-rejected")]
@@ -375,8 +473,10 @@ def test_also_claim_accepts_repeats_and_commas(tmp_path: Path, server: Server) -
 
 
 def test_claim_asks_the_coordinator_to_wait(server: Server) -> None:
-    assert Coordinator(server.url, "w").claim(["standard", "high"], "w", 20) is None
-    assert server.claims == [{"tier": "standard", "also_claim": ["high"], "worker": "w", "wait_s": 20, "host": None}]
+    assert Coordinator(server.url, "w").claim(["standard", "high"], "w", 20, {"hol": 1.5}) is None
+    assert server.claims == [
+        {"tier": "standard", "also_claim": ["high"], "worker": "w", "wait_s": 20, "phases": {"hol": 1.5}, "host": None}
+    ]
 
 
 def test_claim_wait_is_at_most_50_seconds(tmp_path: Path, server: Server) -> None:
@@ -387,7 +487,7 @@ def test_claim_wait_is_at_most_50_seconds(tmp_path: Path, server: Server) -> Non
 
 def test_coordinator_redirects_are_not_followed(server: Server) -> None:
     with pytest.raises(RuntimeError, match="claim answered 303"):
-        Coordinator(server.url + "/moved", "w").claim(["standard"], "w", 0)
+        Coordinator(server.url + "/moved", "w").claim(["standard"], "w", 0, {})
 
 
 GIB = 1024**3
@@ -555,7 +655,7 @@ def test_cpu_is_measured_over_at_least_the_least_sample_time(
 def test_claims_and_heartbeats_carry_the_host_report(telemetry: tuple[HostTelemetry, Path], server: Server) -> None:
     reporter, _ = telemetry
     coordinator = Coordinator(server.url, "w", reporter)
-    assert coordinator.claim(["standard"], "w", 0) is None
+    assert coordinator.claim(["standard"], "w", 0, {}) is None
     assert coordinator.heartbeat("t")
     claimed, beat = server.claims[0]["host"], server.heartbeats[0]["host"]
     assert isinstance(claimed, dict) and isinstance(beat, dict)
@@ -603,6 +703,145 @@ def test_a_wait_for_memory_shows_as_memory_short_in_the_next_report(
 
 def test_a_worker_without_telemetry_sends_no_host(server: Server) -> None:
     coordinator = Coordinator(server.url, "w")
-    assert coordinator.claim(["standard"], "w", 0) is None
+    assert coordinator.claim(["standard"], "w", 0, {}) is None
     assert coordinator.heartbeat("t")
     assert server.claims[0]["host"] is None and server.heartbeats[0]["host"] is None
+
+
+def test_exec_time_splits_at_the_first_and_last_hol_child() -> None:
+    spans = ExecSpans()
+    for seconds, hol in [(2, False), (1, False), (1, True), (3, False), (1, True), (2, False), (0.5, False)]:
+        spans.step(seconds, hol=hol)
+
+    # The gap between the two HOL children counts as HOL.
+    assert (spans.before_hol, spans.hol, spans.after_hol) == (3, 5, 2.5)
+
+
+def test_exec_time_without_a_hol_child_is_all_before_hol() -> None:
+    spans = ExecSpans()
+    spans.step(2, hol=False)
+    spans.step(1, hol=False)
+
+    assert (spans.before_hol, spans.hol, spans.after_hol) == (3, 0, 0)
+
+
+def test_phases_taken_start_again_and_can_be_put_back() -> None:
+    phases = Phases()
+    phases.add("hol", 2.0)
+    phases.add("claim", 0.25)
+
+    taken = phases.take()
+    assert taken == {**dict.fromkeys(Phases.NAMES, 0.0), "hol": 2.0, "claim": 0.25}
+    assert phases.take() == dict.fromkeys(Phases.NAMES, 0.0)
+    phases.add("hol", 1.0)
+    phases.put_back(taken)
+    assert phases.take()["hol"] == 3.0
+
+
+@pytest.mark.parametrize(("answer", "kept"), [((500, "busy"), 0.0), (OSError("refused"), 2.0)])
+def test_reported_phases_start_again_once_the_coordinator_answered_the_claim(
+    monkeypatch: pytest.MonkeyPatch, answer: tuple[int, str] | OSError, kept: float
+) -> None:
+    def post(*args: object) -> tuple[int, str]:
+        if isinstance(answer, OSError):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(Coordinator, "post", post)
+    phases = Phases()
+    phases.add("hol", 2.0)
+
+    assert claim_reporting(Coordinator("http://127.0.0.1:9", "w"), ["standard"], "w", 0, phases) is None
+    assert phases.take()["hol"] == kept
+
+
+def test_taking_and_giving_up_a_lease_counts_as_lease(tmp_path: Path, server: Server) -> None:
+    switch = tmp_path / "protect"
+    switch.write_text("#!/bin/sh\nsleep 0.5\n")
+    switch.chmod(0o755)
+    phases = Phases()
+
+    with Lease(Coordinator(server.url, "w"), "t1", 60, Protection(str(switch), None)).held(phases):
+        pass
+
+    assert phases.take()["lease"] >= 1.0
+
+
+@contextlib.contextmanager
+def process_tree(tmp_path: Path, holder: str) -> Iterator[int]:
+    """A shell whose child holds the file ``holder`` open, as holbuild's HOL child holds its lease."""
+    ready = tmp_path / "ready"
+    process = subprocess.Popen(
+        ["sh", "-c", f'(exec 3>"{holder}"; touch "{ready}"; sleep 30) & wait'], start_new_session=True
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        yield process.pid
+    finally:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+
+
+def test_a_descendant_holding_a_lease_runs_hol(tmp_path: Path) -> None:
+    cooperate = tmp_path / "cooperate"
+    cooperate.mkdir()
+    with process_tree(tmp_path, str(cooperate / "lease-1")) as pid:
+        assert runs_hol(pid, str(cooperate))
+    with process_tree(tmp_path, str(cooperate / "lock")) as pid:
+        assert not runs_hol(pid, str(cooperate))
+
+
+def test_a_lease_the_process_itself_holds_is_not_a_hol_child(tmp_path: Path) -> None:
+    cooperate = tmp_path / "cooperate"
+    cooperate.mkdir()
+    with open(cooperate / "lease-1", "w"):
+        assert not runs_hol(os.getpid(), str(cooperate))
+
+
+def test_an_action_s_time_is_split_around_its_hol_child(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+    cooperate = tmp_path / "cooperate"
+    cooperate.mkdir()
+    monkeypatch.setenv("HOLBUILD_FAKE_LEASE", str(cooperate / "lease-1"))
+    phases = Phases()
+
+    started = time.monotonic()
+    run_one(
+        Coordinator(server.url, "w"),
+        worker_args(tmp_path, server, "--cooperate-dir", str(cooperate)),
+        releases(tmp_path, server),
+        Protection(None, None),
+        claim(),
+        phases,
+    )
+
+    seconds = phases.take()
+    assert server.completed == [RECORD]
+    assert seconds["before_hol"] >= 0.5 and seconds["hol"] >= 1 and seconds["after_hol"] >= 0.5
+    assert seconds["release"] > 0 and seconds["complete"] > 0 and seconds["exec"] == 0
+    assert sum(seconds.values()) == pytest.approx(time.monotonic() - started, abs=0.5)
+
+
+def test_without_a_cooperate_dir_an_action_s_time_is_all_exec(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path]
+) -> None:
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+    phases = Phases()
+
+    run_one(
+        Coordinator(server.url, "w"),
+        worker_args(tmp_path, server),
+        releases(tmp_path, server),
+        Protection(None, None),
+        claim(),
+        phases,
+    )
+
+    seconds = phases.take()
+    assert seconds["exec"] >= 2 and seconds["before_hol"] == seconds["hol"] == seconds["after_hol"] == 0

@@ -15,8 +15,7 @@ fun checkpoint attrs : HolbuildTheoryCheckpoints.checkpoint =
    theorem_start = 0, theorem_stop = 0, boundary = 0,
    tactic_start = 0, tactic_end = 0, tactic_text = "",
    proof_attrs = attrs, prefix_hash = "",
-   context_path = "", context_ok = "", end_of_proof_path = "",
-   end_of_proof_ok = "", failed_prefix_path = path,
+   context_path = "", context_ok = "", failed_prefix_path = path,
    failed_prefix_ok = ok_text, deps_key = "", checkpoint_key = "",
    proof_ir_plan = NONE, proof_ir_factories = NONE};
 
