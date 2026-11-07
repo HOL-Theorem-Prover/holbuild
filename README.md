@@ -875,6 +875,16 @@ holbuild build --all-checkpoints MyTheory
 - `--trace-steps` records proof-step traces in child logs.
 - `--repl-on-failure` starts a HOL REPL from the newest useful checkpoint after a
   theory failure. It serialises the build and is not supported with `--json`.
+- `HOLBUILD_FAILED_GOALS_LIMIT` sets the byte limit for the all-input-goals
+  section of `instrumented-failure.log`; `HOLBUILD_GOAL_STATE_LIMIT` separately
+  sets the top-goal preview limit in text and JSON diagnostics. Both default to
+  `4096`. Set either environment variable to a nonnegative decimal integer to
+  change its limit, or to `0` or `unlimited` to disable truncation. Invalid values
+  fail the build with an error. For example,
+  `HOLBUILD_FAILED_GOALS_LIMIT=65536 holbuild build MyTheory` keeps a larger goal
+  log while retaining bounded summaries. These settings are read at runtime,
+  including after checkpoint restores; no rebuild of holbuild is needed. For
+  remote execution, the log limit uses the worker's environment.
 - `--skip-proof-steps` opts out of proof-step execution.
 - `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation.
 - `--all-checkpoints` saves theorem checkpoints in every theory included by

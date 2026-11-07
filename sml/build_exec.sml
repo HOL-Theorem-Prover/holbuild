@@ -2446,7 +2446,7 @@ fun script_prefix_key NONE NONE source_prefix_hash = source_prefix_hash
             (case inputs_key of SOME key => ["extra_inputs=", key, "\n"] | NONE => []) @
             (case source_name of SOME name => ["source_name=", name, "\n"] | NONE => [])))
 
-fun failed_prefix_diagnostic_key proof_engine = proof_engine ^ ":finish_goal_state_v2"
+fun failed_prefix_diagnostic_key proof_engine = proof_engine ^ ":finish_goal_state_v3"
 (* Failed-prefix heaps retain the proof runtime and its compiled tactic refs. *)
 fun failed_prefix_resume_schema_key proof_engine = proof_engine ^ ":dependency_prefix_history_v3"
 
@@ -5596,7 +5596,7 @@ val action_batch_header = "holbuild-action-batch-v1"
    worker runs only specs exported by holbuild with the same sources. *)
 val runtime_source_files =
   ["sml/checkpoint_save_runtime.sml", "sml/holbuild_runtime.sml",
-   "sml/proof_runtime.sml", "sml/tactic_compat_runtime.sml"] @
+   "sml/proof_runtime.sml", "sml/tactic_compat_runtime.sml", "sml/diagnostic_limits.sml"] @
   map (fn file => normalize_path (Path.concat("sml/analyser", file)))
       HolbuildHolSharedCache.analyser_source_files
 
