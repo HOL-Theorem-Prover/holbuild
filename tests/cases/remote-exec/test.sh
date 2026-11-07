@@ -296,6 +296,18 @@ require_grep 'lost the event stream for batch b[0-9]*: {"type": "action", "input
 require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/cut.log"
 refute_grep "remote ?" "$tmpdir/cut.log"
 
+# A stream that only repeats states it sent before breaking is no progress:
+# after the first stream, the retries run out and the build goes local,
+# rather than reattaching for as long as the streams keep breaking.
+write_theories replay
+echo 10 > "$state/replay"
+run replay 0 build --remote-exec "$coordinator" BTheory
+[[ $(grep -c "lost the event stream for batch b[0-9]*: curl: (18) .*; reattaching" "$tmpdir/replay.log") -eq 5 ]] ||
+  { cat "$tmpdir/replay.log" >&2; exit 1; }
+require_grep "remote workers finished 0 of 1 theories, cancelled the batch; building locally" "$tmpdir/replay.log"
+require_grep "BTheory built" "$tmpdir/replay.log"
+rm "$state/replay"
+
 # The coordinator's credentials come from a curl config file.
 printf 'header = "Authorization: Bearer stub-token"\n' > "$tmpdir/coordinator.curl"
 write_theories seven

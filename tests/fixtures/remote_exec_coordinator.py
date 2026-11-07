@@ -11,7 +11,9 @@ action is reported running twice first, as a coordinator repeats unchanged
 states.  Control files in STATE change the answers: `refuse` makes POST answer
 400, `unavailable`, holding a count, makes that many POSTs answer 502, `drop`
 ends the next event stream before the final event (and is removed), `cut`
-ends it midway through its first action event (and is removed), `down`
+ends it midway through its first action event (and is removed), `replay`,
+holding a count, makes that many event streams send the first action's running
+state and then break, without running RUN, `down`
 makes the event stream and POST /v1/batches/<id>/cancel answer 503, `ended`
 makes the event stream answer 503 and the cancel answer that the batch is
 already done, `skip` reports the batch done without running RUN, `hang` streams one
@@ -94,6 +96,19 @@ class Handler(BaseHTTPRequestHandler):
                 if not (state / "hang").exists():
                     break
                 time.sleep(0.1)
+            return
+        replay = state / "replay"
+        if replay.exists() and int(replay.read_text()) > 0:
+            replay.write_text(str(int(replay.read_text()) - 1))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            # More than is sent, so curl reports the stream cut short.
+            self.send_header("Content-Length", "1000")
+            self.end_headers()
+            action = next(line.split() for line in batch.read_text().splitlines() if line.startswith("action "))
+            running = {"type": "action", "input_key": action[1], "theory": action[4], "state": "running",
+                       "tier": "standard", "attempts": 1, "last_failure": None, "log_sha256": None}
+            self.wfile.write((json.dumps(running) + "\n").encode())
             return
         cancelled = (state / "cancelled").exists()
         ok = cancelled or (state / "skip").exists() or subprocess.run([run, str(batch)]).returncode == 0

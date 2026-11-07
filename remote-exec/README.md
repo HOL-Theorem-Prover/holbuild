@@ -60,6 +60,7 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_HINT_TTL_DAYS` | age after which an unused peak hint is deleted | 30 |
 | `REMOTE_EXEC_DATABASE_POOL_SIZE` | database connections the coordinator holds at most | 20 |
 | `REMOTE_EXEC_DATABASE_POOL_TIMEOUT_S` | how long a request waits for a free connection before it fails | 10 |
+| `REMOTE_EXEC_EVENTS_KEEPALIVE_SECONDS` | how long an event stream stays quiet before it sends an empty line | 15 |
 | `REMOTE_EXEC_SWEEP_SECONDS` | period of the sweep (lease expiry, releases, retention, scaling) | 5 |
 | `REMOTE_EXEC_WARM_WORKERS` | always-on standard-tier workers | 0 |
 | `REMOTE_EXEC_MAX_BURST_WORKERS` | most burst workers to ask for | 0 |
@@ -297,7 +298,9 @@ gets 401. Errors are JSON `{"detail": "<message>"}`.
 
 - 200, `application/x-ndjson`: one JSON object per line. It starts with every
   action's current state, then sends an action again whenever any of its
-  fields changes, and ends with one batch line when the batch finishes:
+  fields changes, and ends with one batch line when the batch finishes. A
+  stream with nothing to send for `REMOTE_EXEC_EVENTS_KEEPALIVE_SECONDS` sends
+  an empty line, which clients skip, so a proxy doesn't close it as idle:
   ```json
   {"type": "action", "input_key": "…", "theory": "…", "state": "…", "tier": "…", "attempts": 1, "last_failure": null, "log_sha256": null}
   {"type": "batch", "state": "done|failed|cancelled", "failure": "<message>|null"}

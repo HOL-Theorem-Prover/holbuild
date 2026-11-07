@@ -9,6 +9,7 @@ import pytest
 import sqlalchemy as sa
 
 from remote_exec import coordinator as coordinator_module
+from remote_exec.app import create_app
 from remote_exec.coordinator import Coordinator
 from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache
 
@@ -688,6 +689,38 @@ async def test_events_stream_action_states_then_the_batch(http: httpx.AsyncClien
 
     assert [(e["type"], e["state"]) for e in events] == [("action", "done"), ("batch", "done")]
     assert events[0]["log_sha256"] == "a" * 64
+
+
+async def test_events_keep_a_quiet_stream_alive_with_blank_lines(
+    coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """While nothing changes, a stream sends blank lines, so a proxy doesn't close it as idle."""
+    settings = coordinator.settings.model_copy(update={"events_keepalive_seconds": 0.0})
+    polls: list[int] = []
+    changes = coordinator.changes
+
+    async def counted(batch: UUID, since: int) -> Any:
+        polls.append(since)
+        return await changes(batch, since)
+
+    monkeypatch.setattr(coordinator, "changes", counted)
+    transport = httpx.ASGITransport(app=create_app(coordinator, settings))
+    async with httpx.AsyncClient(transport=transport, base_url="http://coordinator.test") as http:
+        batch_id = await submit(http, ["a"])
+
+        async def follow() -> list[str]:
+            async with http.stream("GET", f"/v1/batches/{batch_id}/events", headers=CLIENT) as response:
+                return [line async for line in response.aiter_lines()]
+
+        stream = asyncio.create_task(follow())
+        while len(polls) < 3:
+            await asyncio.sleep(0.01)
+        await build(http, cache, "a")
+        lines = await stream
+
+    assert "" in lines
+    events = [json.loads(line) for line in lines if line]
+    assert events[-1] == {"type": "batch", "state": "done", "failure": None}
 
 
 async def test_changes_reads_only_the_actions_written_since_the_last_read(
