@@ -2732,7 +2732,10 @@ fun execution_plan_only (CheckpointPolicy {execution_plan = SOME _, trace_steps 
 fun bool_text true = "true"
   | bool_text false = "false"
 
-val theory_manifest_version = "1"
+(* 2: before 0.13.11 a theory's .dat listed its parents in load order, so one
+   key could name several outputs, and a cached child could disagree with the
+   cached parent under its parent's key. *)
+val theory_manifest_version = "2"
 
 (* Final theory artifacts are semantic products of source bytes, resolved deps,
    toolchain, and declared action policy. Execution strategy is deliberately not
@@ -4288,16 +4291,6 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
     fun materialize_valid_cache () =
       let
         val root = cache_root ()
-        val existing = ensure_local_cache_entry root input_key
-        fun discard_entry () =
-          case existing of
-              SOME text => ignore (drop_cache_manifest_if_unchanged root input_key text)
-            | NONE => ()
-        fun reject_parents () =
-          (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
-                        input_key ^ " (parent outputs differ)");
-           discard_entry ();
-           remove_failed_cache_outputs project node; CacheMiss)
         fun cached_parents_match text =
           let
             val {dat_hash, ...} = cache_manifest_blobs_from_lines input_key (cache_manifest_lines text)
@@ -4305,19 +4298,46 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
             dat_parent_hashes_match dat_hash_cache plan node (HolbuildCache.blob_path root dat_hash)
           end
           handle _ => false
+        (* A local entry built against other parent outputs can sit beside a
+           remote entry built against these, so once the local one is dropped
+           the remote one gets a try, unless the local one came from there; an
+           entry another build published meanwhile gets the try instead.  Only
+           one retry either way. *)
+        fun materialize retry existing =
+          let
+            (* A failed copy may have met an entry another build just published. *)
+            fun from_remote () =
+              if copied_from_remote input_key then CacheMiss
+              else
+                (ignore (hydrate_remote_cache_key root input_key);
+                 case HolbuildCache.get_action root input_key of
+                     SOME text => materialize false text
+                   | NONE => CacheMiss)
+            fun reject_parents () =
+              (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
+                            input_key ^ " (parent outputs differ)");
+               remove_failed_cache_outputs project node;
+               ignore (drop_cache_manifest_if_unchanged root input_key existing);
+               if not retry then CacheMiss
+               else
+                 case HolbuildCache.get_action root input_key of
+                     NONE => from_remote ()
+                   | SOME text => if text = existing then CacheMiss else materialize false text)
+          in
+            case materialize_theory_cache (#verify_cache options) allow_timeout_discrepancy
+                   project plan input_key (tactic_timeout policy) (trknl_enabled policy) node of
+                (* A policy miss can also hide stale parent outputs. Preserve
+                   compatible weaker-policy entries if rechecking fails. *)
+                CacheMiss => if cached_parents_match existing then CacheMiss else reject_parents ()
+              | restored as CacheRestored _ =>
+                  if theory_parent_hashes_match dat_hash_cache plan node NONE then restored
+                  else reject_parents ()
+          end
       in
-        case existing of
+        case ensure_local_cache_entry root input_key of
             NONE => (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
                                   input_key ^ " (no manifest)"); CacheMiss)
-          | SOME text =>
-              case materialize_theory_cache (#verify_cache options) allow_timeout_discrepancy
-                     project plan input_key (tactic_timeout policy) (trknl_enabled policy) node of
-                  (* A policy miss can also hide stale parent outputs. Preserve
-                     compatible weaker-policy entries if rechecking fails. *)
-                  CacheMiss => if cached_parents_match text then CacheMiss else reject_parents ()
-                | restored as CacheRestored _ =>
-                    if theory_parent_hashes_match dat_hash_cache plan node NONE then restored
-                    else reject_parents ()
+          | SOME text => materialize true text
       end
     fun restore_from_cache built_timeout =
       (remove_tree stage;
@@ -6018,14 +6038,15 @@ fun spec_load_stems (spec : action_spec) =
        map (fn {target, stem, ...} => (#2 (target_name target), stem)) (#libs spec))
   end
 
-fun spec_theory_action root (spec : action_spec) : theory_action =
+(* The spec's theory action, its checkpoints keyed on DEPS_KEY. *)
+fun spec_theory_action root (spec : action_spec) deps_key : theory_action =
   let
     val package = #package spec
     val path = #path (#source spec)
     val script_dir = case Path.dir path of "" => "" | dir => normalize_path dir
   in
     {input_key = #input_key spec,
-     deps_key = #deps_key spec,
+     deps_key = deps_key,
      inputs_key = spec_inputs_key spec,
      package = package,
      logical = #logical spec,
@@ -6996,6 +7017,114 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
   end
   handle e => warn ("shared checkpoint publish failed: " ^ General.exnMessage e)
 
+(* Early cutoff for an action (DESIGN.md, "Early cutoff on remote
+   workers").  Its spec is written before its dependencies are built, so
+   the worker decides once they are restored: an earlier build of the same
+   own inputs on dependency outputs that are byte for byte these produced
+   the outputs this build would.  The remote cache maps that pair to the
+   earlier build's input key. *)
+val early_cutoff_header = "holbuild-early-cutoff-v1"
+
+type early_cutoff = {pair_key : string, deps_key : string}
+
+fun unkeyed_dep_line line =
+  if String.isPrefix "dep=" line then
+    case String.fields (fn c => c = #"@") line of
+        [target, _] => target
+      | _ => line
+  else line
+
+(* The pair key, and the key of the dependency context (deps_loaded.save and
+   the checkpoints above it) on the same dependency outputs, from the files
+   restored in ROOT.  Those name ROOT, so both keys are for one action root,
+   as the shared heap key is.  NONE when a file can't be read. *)
+fun spec_early_cutoff root (spec : action_spec) : early_cutoff option =
+  let
+    val text_lines = String.fields (fn c => c = #"\n") (#action_text spec)
+    val self_key =
+      HolbuildHash.string_sha256
+        (String.concatWith "\n" ("holbuild-remote-self-input-v1" :: map unkeyed_dep_line text_lines))
+    val theory_files =
+      List.concat
+        (map (fn {stem, ...} => map (fn suffix => in_root root stem ^ suffix)
+                                    [".dat", ".sig", ".sml", ".ui", ".uo"])
+             (#deps spec))
+    val theory_lines =
+      ListPair.map (fn (path, hash) => "theory-file " ^ path ^ " " ^ hash)
+        (theory_files, HolbuildHash.files_sha256 theory_files)
+    val library_lines = map (fn {path, sha256, ...} => "library " ^ path ^ " " ^ sha256) (#libraries spec)
+    val lib_lines =
+      map (fn {target, stem, suffix, loads} => String.concatWith " " ("lib" :: target :: stem :: suffix :: loads))
+          (#libs spec)
+    val deps_output_key =
+      HolbuildHash.string_sha256
+        (String.concatWith "\n"
+           ("holbuild-remote-deps-output-v1" :: theory_lines @ library_lines @ lib_lines) ^ "\n")
+    val dep_lines = map unkeyed_dep_line (List.filter (String.isPrefix "dep=") text_lines)
+  in
+    SOME {pair_key =
+            HolbuildHash.string_sha256
+              (String.concatWith "\n"
+                 [early_cutoff_header, "self=" ^ self_key, "deps-output=" ^ deps_output_key] ^ "\n"),
+          deps_key =
+            HolbuildHash.string_sha256
+              (String.concatWith "\n"
+                 (["holbuild-remote-dependency-context-v1",
+                   "toolchain=" ^ action_text_value spec "toolchain",
+                   "deps-output=" ^ deps_output_key] @ dep_lines) ^ "\n")}
+  end
+  handle e => (warn ("no early cutoff: " ^ General.exnMessage e); NONE)
+
+(* Restores the entry of the earlier build the pair names as this action's
+   outputs, and copies it to the action's input key in the local cache.
+   False on a miss, and on any doubt: the entry's timeout contract, extra
+   outputs, or recorded parents don't fit. *)
+fun reuse_earlier_build remote root (spec : action_spec) pair_key =
+  case HolbuildRemoteCache.get_action remote pair_key of
+      NONE => false
+    | SOME text =>
+        let
+          val cache = cache_root ()
+          val new_key = #input_key spec
+          val old_key =
+            case String.tokens (fn c => c = #"\n") text of
+                [header, line] =>
+                  if header = early_cutoff_header andalso String.isPrefix "input-key=" line
+                  then String.extract(line, size "input-key=", NONE)
+                  else ""
+              | _ => ""
+          val data_path = #data_path (#outputs spec)
+        in
+          sha256_text old_key andalso old_key <> new_key andalso
+          (restore_spec_theory root spec
+             {key = old_key, subject = #package spec ^ ":" ^ #logical spec,
+              stem = drop_suffix ".dat" data_path, extra_outputs = SOME (#extra_outputs spec),
+              requested_timeout = #tactic_timeout spec};
+           spec_parent_hashes_match root spec (in_root root data_path)) andalso
+          (case HolbuildCache.get_action cache old_key of
+               NONE => false
+             | SOME old_text =>
+                 (HolbuildCache.remove_action cache new_key;
+                  HolbuildCache.write_action cache
+                    {key = new_key,
+                     text = replace_all ("\ninput_key=" ^ old_key ^ "\n") ("\ninput_key=" ^ new_key ^ "\n")
+                                        old_text};
+                  HolbuildStatus.message_stderr
+                    ("holbuild: early cutoff: " ^ #package spec ^ ":" ^ #logical spec ^
+                     " reuses the build of " ^ old_key ^ "\n");
+                  true))
+        end
+  handle e => (warn ("early cutoff failed, building: " ^ General.exnMessage e); false)
+
+(* After a build: the pair names this action's entry, replacing an entry
+   whose build may have left the cache. *)
+fun publish_early_cutoff remote pair_key input_key =
+  case HolbuildRemoteCache.publish_action remote
+         {key = pair_key, text = early_cutoff_header ^ "\ninput-key=" ^ input_key ^ "\n"} of
+      HolbuildCacheBackend.Published => ()
+    | HolbuildCacheBackend.AlreadyPresent => ()
+    | _ => warn "could not publish the early cutoff entry"
+
 (* Runs one ActionSpec, writes its result record and returns the exit code.
    `toolchain` ensures the spec's HOL toolchain and returns it. *)
 fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
@@ -7057,22 +7186,34 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
              action_text_value spec "toolchain" then ()
           else raise ActionFailed (ToolchainFailure, "the toolchain's identity does not match the action text")
         fun restored () = (hydrate_action_root remote root spec; action_already_done root spec)
+        fun dropped_stale_parents () =
+          drop_stale_dep_copies remote spec (dat_records_parent (in_root root (#data_path (#outputs spec))))
+        val stale = ActionFailed (PublishFailure, "built against out-of-date local copies of its parents")
         (* The theory's entry restores, but perhaps only against local
            copies of its parents that are out of date; then it is judged
            again against the remote's. *)
-        val already_done =
-          restored () andalso
-          (not (drop_stale_dep_copies remote spec (dat_records_parent (in_root root (#data_path (#outputs spec)))))
-           orelse restored ())
+        val done = restored () andalso (not (dropped_stale_parents ()) orelse restored ())
+        val cutoff = if done then NONE else spec_early_cutoff root spec
+        (* A reused earlier build, like a build, never reaches the remote
+           when it fits only out-of-date local copies of the parents; the
+           retry restores the remote's. *)
+        val reused =
+          not done andalso
+          (case cutoff of
+               SOME {pair_key, ...} => reuse_earlier_build remote root spec pair_key
+             | NONE => false) andalso
+          (not (dropped_stale_parents ()) orelse raise stale)
       in
-        if already_done then
+        if done orelse reused then
           (* The entry may have come from the worker's local cache, so make
              sure the remote, where the result counts, holds it too. *)
           (check_remote_publication remote root spec;
            "cached")
         else
           let
-            val action = spec_theory_action root spec
+            val action =
+              spec_theory_action root spec
+                (case cutoff of SOME {deps_key, ...} => deps_key | NONE => #deps_key spec)
             (* A local entry that didn't restore must not stand in for this
                build's when the publication is checked, and, as in a local
                build, its theory's checkpoints may hold parents other than
@@ -7120,13 +7261,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                     (classify_run_failure stage log_text oom_before msg, msg)
                 end
             val _ = peak := peak_rss_mb stage
-            (* Outputs built against out-of-date local copies of the parents
-               never reach the remote; the retry restores the remote's. *)
-            val _ =
-              if drop_stale_dep_copies remote spec (dat_records_parent (in_root root (#data_path (#outputs spec))))
-              then raise ActionFailed (PublishFailure, "built against out-of-date local copies of its parents")
-              else ()
+            val _ = if dropped_stale_parents () then raise stale else ()
             val _ = check_remote_publication remote root spec
+            val _ =
+              case cutoff of
+                  SOME {pair_key, ...} => publish_early_cutoff remote pair_key (#input_key spec)
+                | NONE => ()
           in
             "built"
           end

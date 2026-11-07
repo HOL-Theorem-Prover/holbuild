@@ -12,6 +12,7 @@ import argparse
 import contextlib
 import fcntl
 import http.client
+import itertools
 import json
 import os
 import re
@@ -52,6 +53,8 @@ GIB = 1024 * MIB
 
 # What a request to the coordinator raises when it or the network fails; ValueError covers a reply that isn't JSON.
 COORDINATOR_ERRORS = (OSError, RuntimeError, http.client.HTTPException, ValueError)
+# Waits before each retry of a result report the coordinator couldn't take, as while it restarts; then 8 s apart.
+COMPLETE_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0)
 
 
 class Unreleased(Exception):
@@ -104,12 +107,27 @@ class Coordinator:
             raise RuntimeError(f"heartbeat answered {status}: {body}")
         return status == 200
 
-    def complete(self, token: str, record: str) -> None:
-        status, body = self.post(f"/v1/work/{token}/complete", record.encode(), "text/plain")
-        if status == 409:
-            print(f"result dropped as stale: {body}", file=sys.stderr)
-        elif status != 200:
-            raise RuntimeError(f"complete answered {status}: {body}")
+    def complete(self, token: str, record: str, retry_s: float) -> None:
+        """Report an action's result. A coordinator that can't be reached or answers 5xx, as while it restarts, is
+        asked again for up to ``retry_s`` seconds, so the result isn't lost while the action's lease still holds."""
+        deadline = time.monotonic() + retry_s
+        delays = itertools.chain(COMPLETE_RETRY_DELAYS, itertools.repeat(COMPLETE_RETRY_DELAYS[-1]))
+        while True:
+            try:
+                status, body = self.post(f"/v1/work/{token}/complete", record.encode(), "text/plain")
+            except COORDINATOR_ERRORS as error:
+                status, body = None, error
+            if status == 200:
+                return
+            if status == 409:
+                print(f"result dropped as stale: {body}", file=sys.stderr)
+                return
+            failure = f"complete failed: {body}" if status is None else f"complete answered {status}: {body}"
+            delay = next(delays)
+            if (status is not None and status < 500) or time.monotonic() + delay > deadline:
+                raise RuntimeError(failure)
+            print(f"{failure}; retrying in {delay:g} s", file=sys.stderr)
+            time.sleep(delay)
 
 
 class Protection:
@@ -381,7 +399,7 @@ def run_one(
             holbuild = releases.holbuild(releases.spec_version(spec))
         except Unreleased as error:
             print(f"refusing {spec}: {error}", file=sys.stderr)
-            coordinator.complete(token, failed_record(spec, "spec-rejected"))
+            coordinator.complete(token, failed_record(spec, "spec-rejected"), claim["lease_s"])
             return
         if lease.lost.is_set():
             return
@@ -404,10 +422,10 @@ def run_one(
             if not os.path.exists(result) or os.path.getsize(result) == 0:
                 # It crashed or was killed; the coordinator retries the action now rather than when the lease expires.
                 print(f"exec-action exited {process.returncode} without a result record", file=sys.stderr)
-                coordinator.complete(token, failed_record(spec, "internal"))
+                coordinator.complete(token, failed_record(spec, "internal"), claim["lease_s"])
                 return
             with open(result) as file:
-                coordinator.complete(token, file.read())
+                coordinator.complete(token, file.read(), claim["lease_s"])
             print(f"{claim['theory']}: exit {process.returncode}", file=sys.stderr, flush=True)
 
 

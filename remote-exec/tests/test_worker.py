@@ -69,6 +69,7 @@ class Server:
     completed: list[str] = field(default_factory=list)
     protection: list[dict[str, object]] = field(default_factory=list)
     claims: list[dict[str, object]] = field(default_factory=list)
+    unavailable: int = 0  # how many more completes answer 502, as a proxy does while the coordinator restarts
 
 
 @pytest.fixture
@@ -101,6 +102,9 @@ def server() -> Iterator[Server]:
                 state.claims.append(json.loads(body))
                 return self.reply(204)
             if self.path.endswith("/complete"):
+                if state.unavailable > 0:
+                    state.unavailable -= 1
+                    return self.reply(502)
                 state.completed.append(body)
             self.reply(200, json.dumps({"accepted": True}) if self.path.endswith("/complete") else '{"lease_s": 3}')
 
@@ -294,6 +298,60 @@ def test_action_of_an_unreleased_holbuild_is_rejected(tmp_path: Path, server: Se
 
     assert server.completed == [failed_record(SPEC, "spec-rejected")]
     assert not logs[1].exists()
+
+
+def test_a_result_is_reported_again_while_the_coordinator_restarts(
+    server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(worker, "COMPLETE_RETRY_DELAYS", (0.01,))
+    server.unavailable = 3
+
+    Coordinator(server.url, "w").complete("t1", RECORD, 3)
+
+    assert server.completed == [RECORD]
+    assert server.unavailable == 0
+
+
+def test_a_result_is_given_up_on_when_the_lease_would_run_out(server: Server, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(worker, "COMPLETE_RETRY_DELAYS", (0.01,))
+    server.unavailable = 1000
+
+    with pytest.raises(RuntimeError, match="complete answered 502"):
+        Coordinator(server.url, "w").complete("t1", RECORD, 0.2)
+
+    assert server.completed == []
+    assert server.unavailable > 900
+
+
+def test_a_result_is_reported_again_while_the_coordinator_is_unreachable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(worker, "COMPLETE_RETRY_DELAYS", (0.01,))
+    attempts = []
+
+    def unreachable(*args: object) -> tuple[int, object]:
+        attempts.append(args)
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(Coordinator, "post", unreachable)
+
+    with pytest.raises(RuntimeError, match="complete failed"):
+        Coordinator("http://127.0.0.1:9", "w").complete("t1", RECORD, 0.2)
+
+    assert len(attempts) > 1
+
+
+@pytest.mark.parametrize(("status", "raised"), [(409, False), (400, True)])
+def test_a_result_the_coordinator_turns_down_is_not_reported_again(
+    monkeypatch: pytest.MonkeyPatch, status: int, raised: bool
+) -> None:
+    attempts = []
+    monkeypatch.setattr(Coordinator, "post", lambda *args: attempts.append(args) or (status, "no"))
+
+    with pytest.raises(RuntimeError) if raised else contextlib.nullcontext():
+        Coordinator("http://127.0.0.1:9", "w").complete("t1", RECORD, 60)
+
+    assert len(attempts) == 1
 
 
 def test_ecs_task_protection_is_set_and_cleared(server: Server) -> None:

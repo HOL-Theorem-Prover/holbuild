@@ -334,6 +334,10 @@ record `exec-action --result` wrote as the body (`text/plain`)
   couldn't read the spec, is matched by its spec alone)
 - 409 when the token is stale; the result is dropped
 
+A worker that can't reach the coordinator or gets a 5xx, as while the
+coordinator restarts, retries a `complete` until the action's lease would run
+out.
+
 ## Tests
 
 The tests need a Postgres role that may create databases:
