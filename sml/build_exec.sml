@@ -5775,11 +5775,16 @@ fun uncached_parents plan uncached node =
   end
 
 fun publish_spec_blob remote path =
-  case HolbuildRemoteCache.publish_blob remote {hash = HolbuildHash.file_sha256 path, src = path} of
-      HolbuildCacheBackend.Published => ()
-    | HolbuildCacheBackend.AlreadyPresent => ()
-    | HolbuildCacheBackend.Conflict message => raise Error ("could not upload " ^ path ^ ": " ^ message)
-    | HolbuildCacheBackend.Skipped => raise Error ("could not upload " ^ path ^ ": skipped")
+  let val hash = HolbuildHash.file_sha256 path
+  in
+    if HolbuildRemoteCache.blob_confirmed_present remote hash then ()
+    else
+      case HolbuildRemoteCache.publish_blob remote {hash = hash, src = path} of
+          HolbuildCacheBackend.Published => ()
+        | HolbuildCacheBackend.AlreadyPresent => ()
+        | HolbuildCacheBackend.Conflict message => raise Error ("could not upload " ^ path ^ ": " ^ message)
+        | HolbuildCacheBackend.Skipped => raise Error ("could not upload " ^ path ^ ": skipped")
+  end
 
 (* The input keys of the plan's theories whose input key is missing or that
    depend on that theory. *)

@@ -16,10 +16,22 @@ use "sml/holbuild-script.sml";
 (* Advance the clock without sleeping or changing the production cooldown. *)
 val clock = ref Time.zeroTime;
 structure Time = struct open Time fun now () = !clock end;
+val advisory_heads = ref 0;
+structure HolbuildHttp = struct
+  open HolbuildHttp
+  fun head _ = (advisory_heads := !advisory_heads + 1; Response 200)
+end;
+structure HolbuildRemoteCacheConfig = struct
+  open HolbuildRemoteCacheConfig
+  fun uses_libcurl () = true
+end;
 use "sml/remote_cache.sml";
 
 fun assert message condition = if condition then () else raise Fail message;
 fun advance seconds = clock := Time.+ (!clock, Time.fromSeconds seconds);
+val remote = HolbuildRemoteCache.remote "http://stub";
+fun advisory_head () = HolbuildRemoteCache.blob_confirmed_present remote "blob";
+val _ = assert "healthy transport allows advisory HEAD" (advisory_head () andalso !advisory_heads = 1);
 val requests = ref 0;
 fun request result () = (requests := !requests + 1; result);
 fun send result = HolbuildRemoteCache.send "GET" "stub" "" (request result);
@@ -67,6 +79,7 @@ val _ = start_gated missing;
 val _ = send failed;
 val _ = finish_gated ();
 val _ = assert "late success leaves the breaker tripped" (HolbuildRemoteCache.disabled ());
+val _ = assert "advisory HEAD skips during cooldown" (not (advisory_head ()) andalso !advisory_heads = 1);
 val before_skip = !requests;
 val _ = assert "requests skip during cooldown" (send missing = NONE);
 val _ = advance 59;
@@ -75,6 +88,7 @@ val _ = advance 1;
 (* Repeated outer checks must not consume the probe. *)
 val _ = assert "cooldown expires" (not (HolbuildRemoteCache.disabled ()));
 val _ = assert "disabled does not reserve a probe" (not (HolbuildRemoteCache.disabled ()));
+val _ = assert "advisory HEAD leaves recovery to normal requests" (not (advisory_head ()) andalso !advisory_heads = 1);
 val _ = start_gated failed;
 val before_burst = !requests;
 
@@ -93,6 +107,7 @@ val _ = Mutex.lock mutex;
 val _ = while !remaining > 0 do ConditionVar.wait (changed, mutex);
 val _ = Mutex.unlock mutex;
 val _ = assert "only one concurrent probe" (not (!unexpected) andalso !requests = before_burst);
+val _ = assert "advisory HEAD skips during recovery probe" (not (advisory_head ()) andalso !advisory_heads = 1);
 val _ = finish_gated ();
 val _ = assert "failed probe starts a fresh cooldown" (send missing = NONE);
 val _ = advance 59;
@@ -101,6 +116,7 @@ val _ = advance 1;
 val _ = assert "an HTTP error recovers transport" (send (HolbuildHttp.Response 503) = SOME (HolbuildHttp.Response 503));
 val _ = assert "cache reopens" (not (HolbuildRemoteCache.disabled ()));
 val _ = assert "normal requests resume" (send missing = SOME missing);
+val _ = assert "advisory HEAD resumes after recovery" (advisory_head () andalso !advisory_heads = 2);
 
 (* An exception must release the probe as a failure, not wedge it forever. *)
 val _ = send failed;
