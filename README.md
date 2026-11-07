@@ -1245,7 +1245,8 @@ worker's, and its action text must hash to its input key and agree with its
 source and direct dependencies), ensures the HOL toolchain (restoring the
 remote toolchain archive, or building one, and when another worker's archive
 was published first, switching to that archive), fetches the sources by
-SHA-256, restores every dependency through the normal cache restore and its
+SHA-256 (keeping them in the cache root's blob store, so it fetches each
+once), restores every dependency through the normal cache restore and its
 checks, and reports `cached` if the theory's own entry already restores, or
 if an earlier build of the same action text on byte-identical dependency
 outputs left one, which it then publishes under the action's input key (early

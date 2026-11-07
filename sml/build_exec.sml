@@ -6316,12 +6316,27 @@ fun action_failed failure msg =
   ActionFailed (if String.isSubstring no_space msg orelse out_of_space (cache_root ()) then DiskFailure
                 else failure, msg)
 
+(* A worker keeps the spec's sources and libraries in its local blob store,
+   so it fetches each once rather than once per action.  One no cache entry
+   names is evicted on its own when least recently used
+   (local_cache_families). *)
 fun fetch_spec_blob remote {hash, dst} =
-  (ensure_parent dst;
-   case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = hash, dst = dst} of
-       HolbuildCacheBackend.Hit => ()
-     | HolbuildCacheBackend.Miss => raise ActionFailed (InputMissing ("blob " ^ hash), "blob " ^ hash ^ " is not in the cache")
-     | HolbuildCacheBackend.Corrupt msg => raise action_failed InternalFailure ("cannot fetch blob " ^ hash ^ ": " ^ msg))
+  let
+    val cache = cache_root ()
+    fun fetch_remote () =
+      case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = hash, dst = dst} of
+          HolbuildCacheBackend.Hit =>
+            (case HolbuildCache.publish_blob cache {hash = hash, src = dst} of
+                 HolbuildCacheBackend.Conflict msg => warn ("could not keep blob " ^ hash ^ ": " ^ msg)
+               | _ => ())
+        | HolbuildCacheBackend.Miss => raise ActionFailed (InputMissing ("blob " ^ hash), "blob " ^ hash ^ " is not in the cache")
+        | HolbuildCacheBackend.Corrupt msg => raise action_failed InternalFailure ("cannot fetch blob " ^ hash ^ ": " ^ msg)
+  in
+    ensure_parent dst;
+    case HolbuildCache.fetch_blob cache {hash = hash, dst = dst} of
+        HolbuildCacheBackend.Hit => HolbuildCache.touch (HolbuildCache.blob_path cache hash)
+      | _ => fetch_remote ()
+  end
 
 (* Restores a theory the action depends on, or the action's own entry, into
    the action root, writing its load manifests with the spec's stems. *)
@@ -6654,12 +6669,14 @@ fun local_cache_families cache =
            if path_exists dir then NONE
            else SOME (freed + remove_paths (List.concat (map release (Redblackset.listItems blobs))))
          end}
+    (* A blob no entry names, such as a spec's source, goes when it was
+       last used. *)
+    fun orphan_family path = {mtime = modified_time path, evict = fn () => SOME (remove_paths [path])}
     val orphans =
       List.filter (fn path => not (Option.isSome (Redblackmap.peek (!users, Path.file path))))
                   (HolbuildCache.children blobs_dir)
   in
-    {mtime = Time.zeroTime, evict = fn () => SOME (remove_paths orphans)} ::
-    List.map entry_family entries
+    List.map orphan_family orphans @ List.map entry_family entries
   end
 
 (* The shared heap and checkpoint store: one family per heap directory,
