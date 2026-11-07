@@ -248,6 +248,24 @@ async def test_a_parent_whose_blob_expired_is_built_again_before_its_child_is_re
     assert await states(http, batch_id) == {"a": "done", "b": "ready"}
 
 
+async def test_a_parent_whose_blob_only_the_proxy_backend_holds_is_fetched_by_get(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
+) -> None:
+    batch_id = await submit(http, ["a", "b"], [("b", "a")])
+    token = await claim_named(http, "a")
+    cache.keys.add(ac_key("a"))
+    cache.proxied.add(ac_key("a"))
+    cache.proxy_down = True
+    assert (await complete(http, token, result("a", "built"))).status_code == 200
+    # Neither HEAD nor GET can tell: "a" stays done and "b" waits for the next sweep.
+    assert await states(http, batch_id) == {"a": "done", "b": "waiting"}
+
+    cache.proxy_down = False
+    await coordinator.sweep()
+    assert await states(http, batch_id) == {"a": "done", "b": "ready"}
+    assert not cache.proxied
+
+
 async def test_a_parent_found_in_the_cache_is_not_asked_about_again_until_an_input_goes_missing(
     http: httpx.AsyncClient, cache: FakeCache
 ) -> None:
