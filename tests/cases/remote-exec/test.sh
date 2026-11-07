@@ -524,94 +524,24 @@ require_grep "batch b[0-9]* cancelled; remote workers finished 0 of 2 theories; 
 require_grep "BTheory built" "$tmpdir/cancelled.log"
 rm "$state/cancelled"
 
-# A leaf of the batch whose local build would resume from a checkpoint stays
-# out of it and builds locally: BTheory, built locally just above, changes
-# alone.  --remote-only then builds nothing and exits 75.
-sed -i 's/(\* cancelled \*)/(* leaf-local *)/' "$project/src/BScript.sml"
-: > "$state/requests.log"
-run leaf-local-only 75 build --remote-exec "$coordinator" --remote-only BTheory
-require_grep "remote execution: rx:BTheory stays out of the batch, to resume from its local checkpoints; --remote-only builds nothing locally, so build it without --remote-only" "$tmpdir/leaf-local-only.log"
-require_grep "BTheory is not in the remote cache, and --remote-only builds nothing locally" "$tmpdir/leaf-local-only.log"
-run leaf-local 0 build --remote-exec "$coordinator" BTheory
-require_grep "remote execution: rx:BTheory stays out of the batch, to resume from its local checkpoints" "$tmpdir/leaf-local.log"
-require_grep "remote execution: nothing to build remotely" "$tmpdir/leaf-local.log"
-require_grep "resuming BTheory" "$tmpdir/leaf-local.log"
-require_grep "BTheory built" "$tmpdir/leaf-local.log"
-refute_grep "^POST /v1/batches" "$state/requests.log"
-# A theory with current checkpoints that another theory in the batch depends
-# on goes in: ATheory, built locally above, changes, so BTheory does too.
-find "$project/.holbuild/checkpoints" -path '*AScript*' -name deps_loaded.save | grep -q . ||
-  { echo "ATheory has no deps_loaded checkpoint" >&2; exit 1; }
-sed -i 's/(\* cancelled \*)/(* not-leaf *)/' "$project/src/AScript.sml"
-run not-leaf 0 build --remote-exec "$coordinator" BTheory
-refute_grep "stays out of the batch" "$tmpdir/not-leaf.log"
-batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/not-leaf.log")
-require_grep "^action .* rx:ATheory$" "$state/$batch.batch"
-require_grep "^action .* rx:BTheory$" "$state/$batch.batch"
-# --detach submits a checkpointed leaf.
-sed -i 's/(\* leaf-local \*)/(* leaf-detach *)/' "$project/src/BScript.sml"
-run leaf-detach 0 build --remote-exec "$coordinator" --detach BTheory
-refute_grep "stays out of the batch" "$tmpdir/leaf-detach.log"
-batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/leaf-detach.log")
-require_grep "^action .* rx:BTheory$" "$state/$batch.batch"
-refute_grep "Theory built" "$tmpdir/leaf-detach.log"
-# Without checkpoints, a leaf whose dependencies are built here stays out
-# too, and its build leaves them; --remote-only, which can't build it here,
-# sends it to the workers.
-rm -r "$project/.holbuild/checkpoints"
-sed -i 's/(\* leaf-detach \*)/(* leaf-remote *)/' "$project/src/BScript.sml"
-run leaf-remote-only 0 build --remote-exec "$coordinator" --remote-only BTheory
-refute_grep "stays out of the batch" "$tmpdir/leaf-remote-only.log"
-batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/leaf-remote-only.log")
-require_grep "^action .* rx:BTheory$" "$state/$batch.batch"
-require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/leaf-remote-only.log"
-require_grep "BTheory restored from cache" "$tmpdir/leaf-remote-only.log"
-sed -i 's/(\* leaf-remote \*)/(* leaf-deps *)/' "$project/src/BScript.sml"
-: > "$state/requests.log"
-run leaf-deps 0 build --remote-exec "$coordinator" BTheory
-require_grep "remote execution: rx:BTheory stays out of the batch, to build on its dependencies built here" "$tmpdir/leaf-deps.log"
-require_grep "BTheory built" "$tmpdir/leaf-deps.log"
-refute_grep "^POST /v1/batches" "$state/requests.log"
-find "$project/.holbuild/checkpoints" -path '*BScript*' -name deps_loaded.save | grep -q . ||
-  { echo "BTheory's build left no deps_loaded checkpoint" >&2; exit 1; }
-# Two such leaves, as after a merge, both go to the workers; so does a
-# theory with no project dependencies that was never built here.
-rm -r "$project/.holbuild/checkpoints"
-sed -i 's/(\* leaf-deps \*)/(* leaf-many *)/' "$project/src/BScript.sml"
-printf 'Theory C\nAncestors A\n\nTheorem c_thm:\n  T\nProof\n  simp[]\nQED\n' > "$project/src/CScript.sml"
-run leaf-many 0 build --remote-exec "$coordinator" BTheory CTheory
-refute_grep "stays out of the batch" "$tmpdir/leaf-many.log"
-batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/leaf-many.log")
-require_grep "^action .* rx:BTheory$" "$state/$batch.batch"
-require_grep "^action .* rx:CTheory$" "$state/$batch.batch"
-printf 'Theory D\nAncestors bool\n\nTheorem d_thm:\n  T\nProof\n  simp[]\nQED\n' > "$project/src/DScript.sml"
-run leaf-cold 0 build --remote-exec "$coordinator" DTheory
-refute_grep "stays out of the batch" "$tmpdir/leaf-cold.log"
-batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/leaf-cold.log")
-require_grep "^action .* rx:DTheory$" "$state/$batch.batch"
-rm "$project/src/CScript.sml" "$project/src/DScript.sml"
-
 # A theory built here for its current source needs no worker, though the
 # remote cache lacks it (its publish failed, say): with ATheory's remote
-# entry gone, BTheory changing alone sends nothing to the workers.
+# entry gone, nothing goes to the workers.
 write_theories built-here
 run built-here-base 0 build BTheory
 key_a=$(awk -F= '/^input_key=/ { print $2; exit }' "$project/.holbuild/dep/rx/src/AScript.sml.key")
 ac_a=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key_a" | sha256sum | cut -d' ' -f1)
 rm "$remote_root/ac/$ac_a"
-sed -i 's/(\* built-here \*)/(* built-here-leaf *)/' "$project/src/BScript.sml"
 : > "$state/requests.log"
 run built-here 0 build --remote-exec "$coordinator" BTheory
-require_grep "remote execution: rx:BTheory stays out of the batch" "$tmpdir/built-here.log"
+require_grep "remote execution: nothing to build remotely" "$tmpdir/built-here.log"
 refute_grep "^POST /v1/batches" "$state/requests.log"
-refute_grep "ATheory built" "$tmpdir/built-here.log"
-require_grep "BTheory built" "$tmpdir/built-here.log"
+refute_grep "Theory built" "$tmpdir/built-here.log"
 [[ ! -e "$remote_root/ac/$ac_a" ]] || { echo "ATheory published with no batch to need it" >&2; exit 1; }
 # A theory in the batch that depends on it gets it from the remote cache,
 # where it goes from the local cache rather than to the workers: BTheory and
 # CTheory change together, so both go to the workers, and ATheory doesn't.
-rm -r "$project/.holbuild/checkpoints"
-sed -i 's/(\* built-here-leaf \*)/(* built-here-batch *)/' "$project/src/BScript.sml"
+sed -i 's/(\* built-here \*)/(* built-here-batch *)/' "$project/src/BScript.sml"
 printf 'Theory C\nAncestors A\n\nTheorem c_thm:\n  T\nProof\n  simp[]\nQED\n' > "$project/src/CScript.sml"
 run built-here-batch 0 build --remote-exec "$coordinator" BTheory CTheory
 batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/built-here-batch.log")
@@ -620,11 +550,20 @@ require_grep "^action .* rx:BTheory$" "$state/$batch.batch"
 require_grep "^action .* rx:CTheory$" "$state/$batch.batch"
 require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/built-here-batch.log"
 [[ -e "$remote_root/ac/$ac_a" ]] || { echo "ATheory was not published" >&2; exit 1; }
+# A theory edited alone goes to the workers too, though its dependencies are
+# built here and its local checkpoints are current.
+find "$project/.holbuild/checkpoints" -path '*BScript*' -name deps_loaded.save | grep -q . ||
+  { echo "BTheory has no deps_loaded checkpoint" >&2; exit 1; }
+sed -i 's/(\* built-here-batch \*)/(* built-here-alone *)/' "$project/src/BScript.sml"
+run built-here-alone 0 build --remote-exec "$coordinator" BTheory
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/built-here-alone.log")
+require_grep "^action .* rx:BTheory$" "$state/$batch.batch"
+refute_grep "^action .* rx:ATheory$" "$state/$batch.batch"
+require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/built-here-alone.log"
 # Without a local cache entry to publish, it goes to the workers.
 rm "$remote_root/ac/$ac_a"
 rm -r "$HOLBUILD_CACHE/actions/$key_a"
-rm -rf "$project/.holbuild/checkpoints"
-sed -i 's/(\* built-here-batch \*)/(* built-here-unpublished *)/' "$project/src/BScript.sml"
+sed -i 's/(\* built-here-alone \*)/(* built-here-unpublished *)/' "$project/src/BScript.sml"
 sed -i 's/simp\[\]$/simp[] (* unpublished *)/' "$project/src/CScript.sml"
 run built-here-unpublished 0 build --remote-exec "$coordinator" BTheory CTheory
 batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/built-here-unpublished.log")
@@ -798,17 +737,6 @@ refute_grep "Theory built\|building locally" "$tmpdir/proof.log"
 [[ $(sha256sum < "$project/.holbuild/logs/current/rxp/BTheory/build.log" | cut -d' ' -f1) == "$log_sha" ]] ||
   { echo "the local build log is not the worker's" >&2; exit 1; }
 [[ $(local_hol_runs "$tmpdir/proof.timing") -eq 0 ]] || { cat "$tmpdir/proof.timing" >&2; exit 1; }
-# Then B alone changes: it builds here, on A restored above, rather than
-# from scratch on a worker, and leaves checkpoints for the next build.
-sed -i 's/(\* one \*)/(* one-local *)/' "$project/src/BScript.sml"
-: > "$state/requests.log"
-HOLBUILD_TIMING_LOG=$tmpdir/proof-local.timing run proof-local 1 build --remote-exec "$coordinator" BTheory
-require_grep "remote execution: rxp:BTheory stays out of the batch, to build on its dependencies built here" "$tmpdir/proof-local.log"
-require_grep "^holbuild: theorem: b_thm (line 4)$" "$tmpdir/proof-local.log"
-refute_grep "^POST /v1/batches" "$state/requests.log"
-[[ $(local_hol_runs "$tmpdir/proof-local.timing") -gt 0 ]] || { cat "$tmpdir/proof-local.timing" >&2; exit 1; }
-find "$project/.holbuild/checkpoints" -path '*BScript*' -name deps_loaded.save | grep -q . ||
-  { echo "BTheory's failed build left no deps_loaded checkpoint" >&2; exit 1; }
 
 # --remote-only reports it the same way: a local build wouldn't help, so
 # the exit status is 1, not 75.
