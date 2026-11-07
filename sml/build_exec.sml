@@ -5322,10 +5322,10 @@ fun prefetch_key (options : build_options) project keys node =
    once.  Returns {add, drain, stop}: drain waits for all added work; stop drops
    the items not yet started and waits for those in flight.  Failures are
    silent: for a prefetch, the demand restore of the same key retries and
-   reports.  Once drain or stop has waited, the remote cache connections the
-   threads left idle are closed: the server closes an idle connection after
-   a while, and one no later request reuses would stay half-open until the
-   process exits. *)
+   reports.  Once stop has waited, the remote cache connections the threads
+   left idle are closed: the server closes an idle connection after a
+   while, and one no later request reuses would stay half-closed until the
+   process exits.  drain keeps them for the next pool's requests. *)
 fun start_background_pool limit work =
   let
     val front = ref [] and back = ref []
@@ -5362,10 +5362,11 @@ fun start_background_pool limit work =
     fun wait () =
       if with_lock (fn () => !active) > 0 then (OS.Process.sleep (Time.fromReal 0.05); wait ())
       else ()
-    fun drain () = (wait (); HolbuildHttp.close_idle ())
-    fun stop () = (with_lock (fn () => (stopped := true; front := []; back := [])); drain ())
+    fun stop () =
+      (with_lock (fn () => (stopped := true; front := []; back := [])); wait ();
+       HolbuildHttp.close_idle ())
   in
-    {add = add, drain = drain, stop = stop}
+    {add = add, drain = wait, stop = stop}
   end
 
 fun prefetch_limit jobs =
@@ -5778,7 +5779,7 @@ fun publish_spec_blob remote path =
    checkpoints for the next one.  remote_only
    builds nothing locally, so under it only the first leaves are left out,
    and the message says to build them without it. *)
-fun export_action_specs (options : build_options) tc project plan toolchain_key jobs {upload, local_resumable, remote_only} =
+fun export_batch (options : build_options) tc project plan toolchain_key jobs {upload, local_resumable, remote_only} =
   let
     val remote =
       case HolbuildRemoteCacheConfig.url () of
@@ -5942,11 +5943,18 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
     val files = if upload then unique_strings (List.concat (map #files exported)) else []
     val _ =
       if null files then ()
-      else (on_pool "uploading to remote cache" "files" upload_file files;
-            case !upload_failure of SOME e => raise e | NONE => ())
+      else HolbuildToolchain.time_phase "action_spec.upload" (fn () =>
+             (on_pool "uploading to remote cache" "files" upload_file files;
+              case !upload_failure of SOME e => raise e | NONE => ()))
   in
     String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n"
   end
+
+(* The check and upload pools leave their connections idle for each other;
+   none is reused after the export, so they are closed. *)
+fun export_action_specs options tc project plan toolchain_key jobs flags =
+  (export_batch options tc project plan toolchain_key jobs flags before HolbuildHttp.close_idle ())
+  handle e => (HolbuildHttp.close_idle (); raise e)
 
 (* holbuild exec-action: a remote worker builds one ActionSpec in a fixed
    action root under the cache root, with only the remote cache as input, and
