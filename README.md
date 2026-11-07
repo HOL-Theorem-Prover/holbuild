@@ -1230,14 +1230,14 @@ how many they finished.
 
 The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the
-batch, or the batch fails, it warns and builds locally. A theory the remote
-cache holds may not fit the parents it holds, as when a nondeterministic
-theory was built twice; the workers can't use it, and the coordinator fails
-the batch for resubmission naming it (`resubmit: ... theory <input_key>`).
-Such a batch is resubmitted once first, with that theory and every theory
-that depends on it, for the workers to rebuild or recheck against the cached
-parents; local copies of its parents that differ from the remote cache's are
-dropped, so that the build restores the parents the workers used. A submission
+batch, or the batch fails other than by a failed proof (below), it warns and
+builds locally. A theory the remote cache holds may not fit the parents it
+holds, as when a nondeterministic theory was built twice; the workers can't
+use it, and the coordinator fails the batch for resubmission naming it
+(`resubmit: ... theory <input_key>`). Such a batch is resubmitted once first,
+with that theory and every theory that depends on it, for the workers to
+rebuild or recheck against the cached parents; local cache copies of its
+parents that differ from the remote cache's are dropped first. A submission
 answered 502, 503 or 504, as a proxy in front of the coordinator answers
 while it restarts, is retried, and an event stream that breaks is
 reattached; either is given up on once the coordinator stays unavailable for
@@ -1259,6 +1259,15 @@ local build. A build that includes a theory writing SML sources (see
 `holbuild_extra_outputs`) builds locally too, since those theories have to
 run before the rest of the build can be planned; with `--remote-only` it
 only restores from the cache, and with `--detach` it fails.
+
+A batch that fails because a theory's proof failed on a worker (failure
+`proof` or `tactic-timeout`) isn't built locally, since a local build would
+fail the same way. The build restores what the cache holds, as `--remote-only`
+does, fetches the worker's build log from the remote cache into
+`.holbuild/logs/current/<package>/<theory>/build.log`, prints the diagnostic a
+local build would, and exits with status 1, with or without `--remote-only`.
+If that log can't be fetched, the build builds just the failed theory locally,
+for its diagnostic; with `--remote-only` it fails with status 75 instead.
 
 `--detach` submits the batch, prints its id (`holbuild: remote batch <id>`)
 and exits; if the batch can't be submitted, it fails rather than building

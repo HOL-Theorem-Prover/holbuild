@@ -87,6 +87,8 @@ On a key miss, a theory keeps its outputs (early cutoff) when they exist, its `.
 
 Under `--remote-exec`, every dependent of an edited theory is still submitted, since its spec is written before its dependencies are built. The worker hashes the dependency outputs it restored and, when an earlier build of the same action text on the same outputs left an entry, reuses it (`holbuild: early cutoff: <theory> reuses the build of <key>` in the worker's log, status `cached`) instead of running HOL. Its shared heap and checkpoints are keyed on the same hash.
 
+A proof that fails on a remote worker (`proof` or `tactic-timeout`) isn't rebuilt locally: the build restores what the cache holds, writes the worker's build log to `.holbuild/logs/current/<package>/<theory>/build.log`, prints the usual diagnostic from it (`proof failed on a remote worker while building <theory>`), and exits 1. Fix the proof and build again.
+
 ## Cache
 
 Global cache path: `--cache-dir PATH` > `$HOLBUILD_CACHE` > `$XDG_CACHE_HOME/holbuild` > `~/.cache/holbuild/`

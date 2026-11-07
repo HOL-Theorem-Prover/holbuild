@@ -11,8 +11,13 @@ struct
 (* A step that yields text (a batch, a batch id) or says why it couldn't. *)
 datatype attempt = Ok of string | Refused of string
 
+(* An action that failed for good because its proof did, and the cache
+   blob that holds its worker's build log. *)
+type proof_failure = {input_key : string, kind : string, log_sha256 : string}
+
 datatype outcome = Done
-                 | Failed of string       (* the batch failed *)
+                 | Failed of string * proof_failure option
+                                          (* the batch failed, and the proof that failed it *)
                  | Cancelled              (* someone cancelled the batch *)
                  | Unfollowable of string (* the coordinator won't stream it; it may still run *)
                  | Unreachable of string  (* the coordinator couldn't be asked *)
@@ -178,10 +183,12 @@ fun report_action line =
    or the coordinator answers 5xx while it restarts) is reattached: after a
    second when it delivered events, since a proxy may close an idle stream,
    and after each of retry_delays_seconds in a row when it delivered none.
-   The coordinator ends a batch at its deadline, so this ends too. *)
+   The coordinator ends a batch at its deadline, so this ends too.  A failed
+   batch comes with the action whose proof failed, when one did. *)
 fun follow url batch_id (on_done : string -> unit) : outcome * progress =
   let
     val states : (string * string) list ref = ref []
+    val proof_failure : proof_failure option ref = ref NONE
     (* A line cut off by a dropped connection, perhaps with curl's error
        after it, is no event. *)
     fun complete line = Substring.isSuffix "}" (Substring.dropr Char.isSpace (Substring.full line))
@@ -193,6 +200,12 @@ fun follow url batch_id (on_done : string -> unit) : outcome * progress =
               val state = Option.getOpt (json_string_field "state" line, "")
             in
               received := true;
+              (case (state, json_string_field "last_failure" line, json_string_field "log_sha256" line) of
+                   ("failed", SOME kind, SOME log_sha256) =>
+                     if kind = "proof" orelse kind = "tactic-timeout" then
+                       proof_failure := SOME {input_key = key, kind = kind, log_sha256 = log_sha256}
+                     else ()
+                 | _ => ());
               if List.exists (fn entry => entry = (key, state)) (!states) then ()
               else (states := (key, state) :: List.filter (fn (k, _) => k <> key) (!states);
                     report_action line;
@@ -206,8 +219,9 @@ fun follow url batch_id (on_done : string -> unit) : outcome * progress =
                       | SOME state =>
                           Failed (state ^ (case json_string_field "failure" line of
                                                SOME failure => ": " ^ failure
-                                             | NONE => ""))
-                      | NONE => Failed "finished in an unknown state")
+                                             | NONE => ""),
+                                  !proof_failure)
+                      | NONE => Failed ("finished in an unknown state", !proof_failure))
         | _ => others := line :: !others
     fun attach delays =
       let

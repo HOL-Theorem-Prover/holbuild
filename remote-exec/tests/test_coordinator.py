@@ -358,6 +358,41 @@ async def test_a_waiting_claim_ends_empty_after_its_wait(http: httpx.AsyncClient
     assert (await http.post("/v1/work/claim", json=body, headers=WORKER)).status_code == 422
 
 
+async def test_a_claim_reads_no_finished_actions(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any
+) -> None:
+    """A claim reads the same few pages however many finished actions running and retained batches hold, so
+    claims stay cheap on a busy fleet."""
+    await submit(http, ["a"])
+
+    async def pages_read() -> int:
+        async with remote_exec_engine.begin() as connection:
+            await connection.execute(sa.text("ANALYZE"))
+            plan = await connection.scalar(
+                sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {coordinator_module.CLAIM.text}"),
+                {"tiers": ["standard"]},
+            )
+            await connection.rollback()
+        return plan[0]["Plan"]["Shared Hit Blocks"] + plan[0]["Plan"]["Shared Read Blocks"]
+
+    before = await pages_read()
+    async with remote_exec_engine.begin() as connection:
+        # A running batch's finished actions, and a retained batch's.
+        await connection.execute(
+            sa.text("INSERT INTO batches (id, state, profile) VALUES (:id, 'done', 'default')"), {"id": uuid4()}
+        )
+        await connection.execute(
+            sa.text(
+                "INSERT INTO actions (batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier, "
+                "last_claimed_at) "
+                "SELECT b.id, b.state || g, 'ac', 's', 'pkg:t' || g, 0, 'done', 'standard', now() "
+                "FROM batches b, generate_series(1, 20000) g"
+            )
+        )
+    assert await pages_read() < before + 20
+    assert (await claim(http))["theory"] == "pkg:a"
+
+
 async def test_memory_failure_moves_to_the_high_tier_and_retries_up_to_max_attempts(
     http: httpx.AsyncClient, cache: FakeCache
 ) -> None:
