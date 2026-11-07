@@ -170,12 +170,15 @@ fun ensure_extra_input ({preparation, ...} : analysis_state)
   let
     val absolute = OS.Path.mkCanonical (OS.Path.concat(base, relative_path))
     val prefix = if String.isSuffix "/" absolute then absolute else absolute ^ "/"
+    val base_path = OS.Path.mkCanonical base
+    val base_prefix = if String.isSuffix "/" base_path then base_path else base_path ^ "/"
     val glob = CharVector.exists (fn c => c = #"*" orelse c = #"?") relative_path
     fun matches output =
       let
         val path = OS.Path.mkCanonical (OS.Path.concat(#package_root source, output))
       in
         if glob then
+          String.isPrefix base_prefix path andalso
           HolbuildSourceIndex.glob_match relative_path
             (HolbuildSourceIndex.relative_path base path)
         else path = absolute orelse String.isPrefix prefix path
