@@ -3188,6 +3188,51 @@ fun write_theory_script policy root checkpoint_root base_context (action : theor
     end
   end
 
+(* The diagnostic of a theory script that failed, from its build's output:
+   where in the script it failed, the goal state, and what HOL said. *)
+fun failure_detail policy source_file source_text theorem_checkpoints termination_diagnostics failure_output msg =
+  let
+    val failure_output_path = captured_output_path_option failure_output
+    val goal_state =
+      Option.mapPartial
+        (HolbuildTheoryDiagnostics.summarize_goal_state_with_log_reference
+           (captured_output_has_retained_log failure_output))
+        failure_output_path
+    val plan_position = Option.mapPartial HolbuildTheoryDiagnostics.plan_position_summary failure_output_path
+    val trace_context = if trace_steps policy then Option.mapPartial HolbuildTheoryDiagnostics.summarize_trace_steps failure_output_path else NONE
+    val static_error = Option.mapPartial (fn path => HolbuildTheoryDiagnostics.static_error_summary source_file source_text (String.fields (fn c => c = #"\n") (read_text path))) failure_output_path
+    val source_context = Option.mapPartial
+      (HolbuildTheoryDiagnostics.summarize_failed_fragment_source
+         source_file source_text theorem_checkpoints termination_diagnostics)
+      failure_output_path
+    val termination_context =
+      Option.mapPartial
+        (HolbuildTheoryDiagnostics.summarize_termination_goal_source
+           source_file source_text termination_diagnostics)
+        failure_output_path
+    val child_failure =
+      if Option.isSome static_error then NONE
+      else Option.mapPartial HolbuildTheoryDiagnostics.child_failure_summary failure_output_path
+    val fallback =
+      if Option.isSome child_failure then ""
+      else
+        case String.fields (fn c => c = #"\n") msg of
+            [] => "hol run failed while building theory script\n"
+          | first :: _ =>
+              first ^ "\n" ^
+              (case hol_silent_exit_line msg of SOME line => line ^ "\n" | NONE => "")
+  in
+    String.concat
+      [case trace_context of NONE => "" | SOME text => text,
+       case static_error of NONE => "" | SOME text => text,
+       case source_context of NONE => "" | SOME text => text,
+       case termination_context of NONE => "" | SOME text => text,
+       case plan_position of NONE => "" | SOME text => text,
+       case goal_state of NONE => "" | SOME text => text,
+       case child_failure of NONE => fallback | SOME text => text,
+       retained_log_reference failure_output]
+  end
+
 (* Runs a theory action in action root `root`: stages its inputs, runs HOL,
    installs the theory's outputs under `root` and, when `cache_allowed`,
    publishes them to the cache.  Returns the generated theory's load metadata,
@@ -3315,49 +3360,12 @@ fun run_theory_action cache_allowed policy tc root checkpoint_root base_context 
               else false
             end
     fun checkpoint_failure_error msg =
-      let
-        val failure_output = checkpoint_failure_output log_dir stage
-        val failure_output_path = captured_output_path_option failure_output
-        val goal_state =
-          Option.mapPartial
-            (HolbuildTheoryDiagnostics.summarize_goal_state_with_log_reference
-               (captured_output_has_retained_log failure_output))
-            failure_output_path
-        val plan_position = Option.mapPartial HolbuildTheoryDiagnostics.plan_position_summary failure_output_path
-        val trace_context = if trace_steps policy then Option.mapPartial HolbuildTheoryDiagnostics.summarize_trace_steps failure_output_path else NONE
-        val static_error = Option.mapPartial (fn path => HolbuildTheoryDiagnostics.static_error_summary source_file source_text (String.fields (fn c => c = #"\n") (read_text path))) failure_output_path
-        val source_context = Option.mapPartial
-          (HolbuildTheoryDiagnostics.summarize_failed_fragment_source
-             source_file source_text theorem_checkpoints termination_diagnostics)
-          failure_output_path
-        val termination_context =
-          Option.mapPartial
-            (HolbuildTheoryDiagnostics.summarize_termination_goal_source
-               source_file source_text termination_diagnostics)
-            failure_output_path
-        val child_failure =
-          if Option.isSome static_error then NONE
-          else Option.mapPartial HolbuildTheoryDiagnostics.child_failure_summary failure_output_path
-        val fallback =
-          if Option.isSome child_failure then ""
-          else
-            case String.fields (fn c => c = #"\n") msg of
-                [] => "hol run failed while building theory script\n"
-              | first :: _ =>
-                  first ^ "\n" ^
-                  (case hol_silent_exit_line msg of SOME line => line ^ "\n" | NONE => "")
-        val detail =
-          String.concat
-            [case trace_context of NONE => "" | SOME text => text,
-             case static_error of NONE => "" | SOME text => text,
-             case source_context of NONE => "" | SOME text => text,
-             case termination_context of NONE => "" | SOME text => text,
-             case plan_position of NONE => "" | SOME text => text,
-             case goal_state of NONE => "" | SOME text => text,
-             case child_failure of NONE => fallback | SOME text => text,
-             retained_log_reference failure_output]
+      let val failure_output = checkpoint_failure_output log_dir stage
       in
-        error_with_captured_output detail failure_output
+        error_with_captured_output
+          (failure_detail policy source_file source_text theorem_checkpoints termination_diagnostics
+             failure_output msg)
+          failure_output
       end
     val build_log = Path.concat(stage, "holbuild-build.log")
     val _ =
@@ -5466,6 +5474,81 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
                    clear_checkpoint_index_dirty budget_state;
                    raise e)
     end
+  end
+
+(* The build options of a build that only restores from the caches. *)
+fun restore_only_options ({use_cache, verify_cache, force, force_targets, skip_checkpoints, proof_steps,
+                           new_ir, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure,
+                           emit_output_hashes, allow_cache_timeout_discrepancy, trknl, ...} : build_options)
+    : build_options =
+  {use_cache = use_cache, verify_cache = verify_cache, force = force, force_targets = force_targets,
+   skip_checkpoints = skip_checkpoints, proof_steps = proof_steps, new_ir = new_ir,
+   node_tactic_timeouts = node_tactic_timeouts, execution_plan = execution_plan,
+   trace_steps = trace_steps, repl_on_failure = repl_on_failure,
+   emit_output_hashes = emit_output_hashes,
+   allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy, trknl = trknl,
+   restore_only = true}
+
+(* The plan's node whose action has input key `input_key`. *)
+fun node_with_input_key (options : build_options) tc project plan toolchain_key input_key =
+  let
+    val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
+                 (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
+  in
+    List.find (fn node => HolbuildBuildPlan.input_key_for keys node = input_key)
+              (HolbuildBuildPlan.selected_nodes plan)
+  end
+
+(* The error of theory `node`, whose proof failed on a remote worker
+   (failure kind `proof` or `tactic-timeout`): the diagnostic a local build
+   would give, from the worker's build log, which the remote cache holds as
+   blob `log_sha256`.  The log goes where a local build leaves it.  NONE when
+   the log can't be fetched.  Runs no HOL. *)
+fun remote_proof_failure (options : build_options) tc project plan toolchain_key node {kind, log_sha256} =
+  let
+    val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
+                 (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
+    val root = project_artifact_root project
+    fun fetch log =
+      case HolbuildRemoteCacheConfig.url () of
+          NONE => false
+        | SOME url =>
+            (ensure_parent log;
+             case HolbuildRemoteCache.fetch_unlisted_blob (HolbuildRemoteCache.remote url)
+                    {hash = log_sha256, dst = log} of
+                 HolbuildCacheBackend.Hit => true
+               | _ => (remove_file log; false))
+    fun diagnose node =
+      let
+        val action = theory_action root plan keys toolchain_key (#holdir tc)
+                       (dependency_context_key toolchain_key plan keys node) node
+        val log = current_build_log (current_log_dir root (#package action) (#logical action))
+      in
+        if not (fetch log) then NONE
+        else
+          let
+            val policy = checkpoint_policy_for_node options project node
+            val source_file = #source_file action
+            val source_text = read_text source_file
+            (* The script's proof units, to place the failure in it. *)
+            val {theorem_checkpoints, termination_diagnostics, ...} =
+              action_checkpoints policy (default_checkpoint_root root) action source_text
+              handle Error _ =>
+                {theorem_checkpoints = [], declaration_checkpoints = [], termination_diagnostics = []}
+            val heading =
+              (if kind = "tactic-timeout" then "tactic timed out" else "proof failed") ^
+              " on a remote worker while building " ^ #logical action
+            val output = SOME (RetainedLog log)
+          in
+            SOME (error_with_captured_output
+                    (heading ^ "\n" ^
+                     failure_detail policy source_file source_text theorem_checkpoints termination_diagnostics
+                       output "hol run failed while building theory script")
+                    output)
+          end
+      end
+  in
+    diagnose node handle Error _ => NONE
   end
 
 (* ActionSpecs: a theory action serialized for a remote worker, and the batch

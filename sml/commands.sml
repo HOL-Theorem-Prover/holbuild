@@ -1337,6 +1337,49 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         fun abandon batch_id reason =
           if HolbuildRemoteExec.cancel url batch_id then fall_back (reason ^ ", cancelled the batch")
           else fall_back reason
+        (* Builds theory `logical` and what it needs, and nothing else. *)
+        fun build_theory_locally logical =
+          let
+            val {index, components} = prepare_source_index "build" resolution project
+            val theory_plan = HolbuildBuildPlan.plan_targets components (#holdir tc) index [logical]
+            val entry_plan =
+              case entry_targets index of
+                  [] => NONE
+                | entry_targets => SOME (HolbuildBuildPlan.plan_targets components (#holdir tc) index entry_targets)
+          in
+            timed_phase "build.execute"
+              (fn () => HolbuildBuildExec.build (build_options_for index entry_plan theory_plan targets)
+                          tc project theory_plan toolchain_key jobs)
+          end
+        (* A batch that failed because a proof did: a local build would fail
+           the same way, so the build restores what the cache holds, reports
+           the failure from the worker's build log and stops, building nothing
+           locally.  Without the log, it builds the failed theory locally
+           for its diagnostic. *)
+        fun proof_failed reason ({input_key, kind, log_sha256} : HolbuildRemoteExec.proof_failure) =
+          let
+            val no_log = "could not fetch the failed theory's build log"
+          in
+            HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "\n");
+            HolbuildBuildExec.build (HolbuildBuildExec.restore_only_options build_options)
+              tc project plan toolchain_key jobs
+            handle HolbuildBuildExec.Error _ => ()
+                 | HolbuildBuildExec.ErrorWithDebugArtifacts _ => ();
+            (* The restore stops at a theory the cache lacks, the failed one if
+               no other, which isn't why this build fails. *)
+            HolbuildHolSharedCache.local_build_needed := false;
+            case HolbuildBuildExec.node_with_input_key build_options tc project plan toolchain_key input_key of
+                NONE => fall_back no_log
+              | SOME node =>
+                  case HolbuildBuildExec.remote_proof_failure build_options tc project plan toolchain_key node
+                         {kind = kind, log_sha256 = log_sha256} of
+                      SOME error => raise error
+                    | NONE =>
+                        if remote_only then fall_back no_log
+                        else (HolbuildBuildExec.warn ("remote execution: " ^ no_log ^ "; building " ^
+                                                      HolbuildBuildPlan.logical_name node ^ " locally");
+                              build_theory_locally (HolbuildBuildPlan.logical_name node))
+          end
         (* A batch that abandon would cancel is cancelled on an interrupt too.
            While it runs, the entries of the theories it finishes, and of a
            submitted batch the theories outside it, which the remote cache
@@ -1358,8 +1401,10 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               (HolbuildRemoteExec.Done, progress) =>
                 (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ finished progress ^ "\n");
                  build_locally ())
-            | (HolbuildRemoteExec.Failed reason, progress) =>
+            | (HolbuildRemoteExec.Failed (reason, NONE), progress) =>
                 fall_back ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress)
+            | (HolbuildRemoteExec.Failed (reason, SOME failure), progress) =>
+                proof_failed ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress) failure
             | (HolbuildRemoteExec.Cancelled, progress) =>
                 let val reason = "batch " ^ batch_id ^ " cancelled; " ^ finished progress
                 in

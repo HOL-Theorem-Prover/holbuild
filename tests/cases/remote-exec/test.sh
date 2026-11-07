@@ -25,7 +25,8 @@ start_remote_cache_server "$remote_root" "$tmpdir/server"
 use_case_cache "$tmpdir/cache"
 
 # The stand-in for the workers: runs the batch's actions in order (parents
-# come before children) in a cache root and directory of their own.
+# come before children) in a cache root and directory of their own, until
+# one fails, leaving each action's result for the stub to report.
 state=$tmpdir/coordinator
 mkdir -p "$state"
 link_hol_toolchain_cache "$tmpdir/worker-cache"
@@ -37,12 +38,19 @@ set -eu
 cd "$tmpdir/worker-cwd"
 share=
 [[ ! -e "$state/share-heaps" ]] || share=--share-heaps
-awk '\$1 == "action" { print \$4, \$5 }' "\$1" | while read -r spec theory; do
+awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec theory; do
   echo "\$theory" >> "$state/ran"
+  status=0
   HOLBUILD_CACHE="$tmpdir/worker-cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" \
     exec-action "\$spec" --cache-limit-gb 1000 --result "$tmpdir/worker.result" \$share \
-    >> "$tmpdir/worker.log" 2>&1
+    >> "$tmpdir/worker.log" 2>&1 || status=\$?
   echo "\$theory \$(grep '^status=' "$tmpdir/worker.result")" >> "$state/results"
+  cp "$tmpdir/worker.result" "$state/result-\$key"
+  if [[ -e "$state/drop-log" ]]; then
+    rm -f "$remote_root/cas/\$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/worker.result")"
+  fi
+  # A failed action fails the batch.
+  [[ \$status -eq 0 ]] || exit 1
 done
 SH
 chmod +x "$tmpdir/run-batch"
@@ -612,3 +620,91 @@ grep -A1 "^resuming BTheory$" "$tmpdir/worker.log" | grep -q "from: deps-loaded 
 require_grep "early cutoff: rxc:CTheory reuses" "$tmpdir/worker.log"
 results built built cached
 rm "$state/share-heaps"
+
+# A proof that fails on a worker: the build restores what the workers
+# finished, reports the failure from the worker's build log, and exits 1
+# without running HOL locally.  A <- B, with B's proof broken.
+project=$tmpdir/proof
+mkdir -p "$project/src"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxp"
+
+[build]
+members = ["src"]
+TOML
+# write_broken STAMP: A proves, B doesn't.
+write_broken() {
+  cat > "$project/src/AScript.sml" <<SML
+Theory A
+Ancestors bool
+
+Theorem a_thm:
+  T
+Proof
+  simp[] (* $1 *)
+QED
+SML
+  cat > "$project/src/BScript.sml" <<SML
+Theory B
+Ancestors A
+
+Theorem b_thm:
+  F
+Proof
+  simp[] (* $1 *)
+QED
+SML
+}
+# The theory builds a run starts: a local build would run HOL here.
+local_hol_runs() { grep -c "kind=run_in_dir_to_file" "$1" || true; }
+write_broken one
+HOLBUILD_TIMING_LOG=$tmpdir/proof.timing run proof 1 build --remote-exec "$coordinator" BTheory
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/proof.log")
+log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$state/result-$(awk '$1 == "action" && $5 == "rxp:BTheory" { print $2 }' "$state/$batch.batch")")
+require_grep "remote rxp:BTheory: failed (proof), log /cas/$log_sha" "$tmpdir/proof.log"
+require_grep "remote execution: batch $batch failed: an action failed; remote workers finished 1 of 2 theories" "$tmpdir/proof.log"
+require_grep "ATheory restored from cache" "$tmpdir/proof.log"
+require_grep "proof failed on a remote worker while building BTheory" "$tmpdir/proof.log"
+# What only B's log yields: where the proof failed, and its goal.
+require_grep "^theorem: b_thm (line 4)$" "$tmpdir/proof.log"
+require_grep "^> 7 |   simp\[\] (\* one \*)$" "$tmpdir/proof.log"
+require_grep 'Failed to prove theorem "b_thm"' "$tmpdir/proof.log"
+require_grep "instrumented log: .*/.holbuild/logs/current/rxp/BTheory/build.log" "$tmpdir/proof.log"
+refute_grep "Theory built\|building locally" "$tmpdir/proof.log"
+[[ $(sha256sum < "$project/.holbuild/logs/current/rxp/BTheory/build.log" | cut -d' ' -f1) == "$log_sha" ]] ||
+  { echo "the local build log is not the worker's" >&2; exit 1; }
+[[ $(local_hol_runs "$tmpdir/proof.timing") -eq 0 ]] || { cat "$tmpdir/proof.timing" >&2; exit 1; }
+
+# --remote-only reports it the same way: a local build wouldn't help, so
+# the exit status is 1, not 75.
+write_broken one-only
+run proof-only 1 build --remote-exec "$coordinator" --remote-only BTheory
+require_grep "proof failed on a remote worker while building BTheory" "$tmpdir/proof-only.log"
+require_grep "^theorem: b_thm (line 4)$" "$tmpdir/proof-only.log"
+
+# Without the log in the cache (the workers drop it), the build builds only
+# the failed theory locally, which fails on the same proof: not C, which
+# doesn't need B and which the batch, failed at B, didn't finish.
+write_broken two
+cat > "$project/src/CScript.sml" <<SML
+Theory C
+Ancestors bool
+
+Theorem c_thm:
+  T
+Proof
+  simp[]
+QED
+SML
+touch "$state/drop-log"
+HOLBUILD_TIMING_LOG=$tmpdir/proof-nolog.timing run proof-nolog 1 build --remote-exec "$coordinator" BTheory CTheory
+rm "$state/drop-log"
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/proof-nolog.log")
+awk '$1 == "action" { print $5 }' "$state/$batch.batch" | tail -n 1 | grep -qx "rxp:CTheory" ||
+  { echo "C is not after B in the batch" >&2; cat "$state/$batch.batch" >&2; exit 1; }
+require_grep "could not fetch the failed theory's build log; building BTheory locally" "$tmpdir/proof-nolog.log"
+require_grep "^holbuild: theorem: b_thm (line 4)$" "$tmpdir/proof-nolog.log"
+refute_grep "on a remote worker\|CTheory built" "$tmpdir/proof-nolog.log"
+[[ $(local_hol_runs "$tmpdir/proof-nolog.timing") -gt 0 ]] || { cat "$tmpdir/proof-nolog.timing" >&2; exit 1; }

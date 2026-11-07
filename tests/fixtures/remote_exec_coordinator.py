@@ -4,10 +4,12 @@
 POST /v1/batches stores the batch as STATE/<id>.batch and answers 201 with its
 id.  GET /v1/batches/<id>/events runs `RUN <batch file>` (a stand-in for the
 workers), then streams one action event per action and the batch's final
-event: done when RUN exits 0, failed otherwise.  Each action is reported
-running twice first, as a coordinator repeats unchanged states.  Control
-files in STATE change the answers: `refuse` makes POST answer 400,
-`unavailable`, holding a count, makes that many POSTs answer 502, `drop`
+event: done when RUN exits 0, failed otherwise.  In a failed batch, an action
+RUN left a result for (STATE/result-<input key>, as exec-action writes it) is
+reported as that result says: done, or failed with its failure and log.  Each
+action is reported running twice first, as a coordinator repeats unchanged
+states.  Control files in STATE change the answers: `refuse` makes POST answer
+400, `unavailable`, holding a count, makes that many POSTs answer 502, `drop`
 ends the next event stream before the final event (and is removed), `cut`
 ends it midway through its first action event (and is removed), `down`
 makes the event stream and POST /v1/batches/<id>/cancel answer 503, `ended`
@@ -116,6 +118,14 @@ class Handler(BaseHTTPRequestHandler):
                 event = {"type": "action", "input_key": fields[1], "theory": fields[4],
                          "state": final_state, "tier": "standard", "attempts": 1,
                          "last_failure": None if ok else "proof", "log_sha256": None}
+                result = state / f"result-{fields[1]}"
+                if not ok and result.exists():
+                    record = dict(line.split("=", 1) for line in result.read_text().splitlines()[1:])
+                    if record["status"] == "failed":
+                        event["last_failure"] = record["failure"]
+                        event["log_sha256"] = record["log"].split()[0] if "log" in record else None
+                    else:
+                        event["state"], event["last_failure"] = "done", None
                 self.wfile.write((json.dumps(event) + "\n").encode())
                 self.wfile.flush()
                 for _ in range(600):
