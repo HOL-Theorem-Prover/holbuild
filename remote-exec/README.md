@@ -123,7 +123,8 @@ workers do when they aren't running HOL:
 
 - `memory_wait`: waiting for the host's memory before claiming;
 - `claim`: in claim requests, waiting ones included;
-- `idle`: sleeping after a claim that got nothing or failed;
+- `idle`: sleeping after a claim that got nothing or failed, or after an
+  action failed in the worker;
 - `lease`: taking and giving up a claimed action's lease: setting and
   clearing scale-in protection, and stopping the heartbeat;
 - `release`: finding and, on first use, building the action's holbuild release;
