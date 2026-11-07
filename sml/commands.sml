@@ -46,11 +46,13 @@ fun global_help () = print
   \  export -o FILE [TARGET ...]  Export cached build outputs\n\
   \  action-spec [TARGET ...]   Export uncached theories for remote execution\n\
   \  exec-action SPEC-SHA256    Run one exported theory action as a remote worker\n\
+  \  run-action TARGET ...      Export a script's runs for remote workers\n\
   \  import FILE                  Import cached build outputs\n\
   \  gc                          Remove stale project/cache state\n\n\
   \Global options:\n\
   \  --source-dir PATH\n\
   \  --cache-dir PATH\n\
+  \  --offline                  No managed network access (or HOLBUILD_OFFLINE=1)\n\
   \  --remote-cache URL\n\
   \  --json\n\
   \  --quiet, --verbose, --verbosity LEVEL\n\
@@ -271,6 +273,25 @@ fun exec_action_help () = print
   \                     host store CACHE/checkpoint-store keeps their files.\n\n\
   \Global options: see `holbuild --help`.\n"
 
+fun run_action_help () = print
+  "Usage:\n\
+  \  holbuild [GLOBAL OPTIONS] run-action --export-only --script S [--support F]...\n\
+  \      [--load L]... --output N... [--option timeout=SECONDS] [OPTIONS] TARGET...\n\n\
+  \Export a run of script S in the context of each TARGET for remote workers:\n\
+  \write its run spec to .holbuild/run-specs/SHA256, upload the spec and every\n\
+  \file it names to the remote cache, and print `CONTEXT RUN-KEY SPEC-SHA256`.\n\
+  \This release only exports; running and fetching come later.\n\n\
+  \A TARGET is a project theory (a logical name as build takes, or\n\
+  \PACKAGE:NAME), a theory of the HOL toolchain (hol:bool or hol:boolTheory),\n\
+  \or hol:* for every theory of the toolchain. A project theory must be built\n\
+  \(in the local cache) first.\n\n\
+  \--support F     A file the script reads, under the script's directory.\n\
+  \--load L        A library to load before the script, in order.\n\
+  \--output N      A file the script writes; at least one.\n\
+  \--option timeout=SECONDS  How long the run may take; not part of its key.\n\n\
+  \Takes build's cache and proof options. Needs --remote-cache.\n\n\
+  \Global options: see `holbuild --help`.\n"
+
 fun export_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] export [--build] -o FILE [--metadata-out FILE] [TARGET ...]\n\n\
@@ -288,7 +309,7 @@ fun has_help_arg args = List.exists help_arg args
 
 val command_names =
   ["build", "context", "repl", "run", "execution-plan", "check", "buildhol", "heap", "executable",
-   "clean", "export", "import", "gc", "cache", "action-spec", "exec-action"]
+   "clean", "export", "import", "gc", "cache", "action-spec", "exec-action", "run-action"]
 
 fun known_command command =
   List.exists (fn name => name = command) command_names orelse command = "goalfrag-plan"
@@ -311,6 +332,7 @@ fun command_help command =
     | "export" => export_help ()
     | "action-spec" => action_spec_help ()
     | "exec-action" => exec_action_help ()
+    | "run-action" => run_action_help ()
     | "import" => import_help ()
     | "gc" => gc_help ()
     | "cache" => cache_help ()
@@ -753,7 +775,7 @@ fun analyser_proof_ir_plan_for_unit (unit : execution_plan_unit) =
           [] => found
         | line :: more =>
             (case HolbuildAnalysisProtocol.split line of
-                 ["begin-proof-ir", "0", _, _, _, _] => loop more true [] found
+                 ["begin-proof-ir", "0", _, _, _, _, _] => loop more true [] found
                | ["end-proof-ir", "0"] => loop more false [] (SOME (parse_proof_steps (rev acc)))
                | fields as "proof-step" :: _ =>
                    if active then loop more active (fields :: acc) found
@@ -829,6 +851,8 @@ fun parse_global_options args =
     fun loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap json verbosity rest =
       case rest of
           [] => ({holdir = holdir, source_dir = source_dir, cache_dir = cache_dir, remote_cache = remote_cache, jobs = jobs, maxheap = maxheap, prefetch_concurrency = prefetch_concurrency, json = json, verbosity = verbosity}, [])
+        | "--offline" :: xs =>
+            (HolbuildOffline.enable (); loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap json verbosity xs)
         | "--json" :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap true verbosity xs
         | "--quiet" :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap json HolbuildStatus.Quiet xs
         | "--verbose" :: xs => loop prefetch_concurrency holdir source_dir cache_dir remote_cache jobs maxheap json HolbuildStatus.Verbose xs
@@ -990,8 +1014,7 @@ fun context (tc : HolbuildToolchain.t) args =
 fun timed_phase name f = HolbuildToolchain.time_phase name f
 
 fun configure_analyser_for_toolchain ({holdir, ...} : HolbuildToolchain.t) =
-  if holdir = "" then HolbuildDependencies.clear_analyser_path ()
-  else HolbuildDependencies.set_analyser_path (HolbuildHolSharedCache.analyser_path_for_holdir holdir)
+  HolbuildDependencies.configure_analyser_for_holdir holdir
 
 fun begin_stat_cache _ _ =
   (* A portable stat record cannot establish file content identity, so this
@@ -1057,6 +1080,7 @@ fun build_generated_source_owners build components holdir index plan =
 datatype build_mode =
     BuildTargets
   | ExportActionSpecs of {upload : bool}
+  | ExportRunSpecs of HolbuildBuildExec.run_request
   | RemoteExec of {url : string, remote_only : bool, detach : bool, attach : string option}
 
 fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, all_checkpoints, proof_steps, new_ir, proof_scope, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy}, targets) =
@@ -1383,6 +1407,20 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           (fn () => print (HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key jobs
                              {upload = upload, local_resumable = false, forced = []}))
       end
+    fun export_run_specs request () =
+      let
+        val planned =
+          if null targets then NONE
+          else
+            let val ({plan, toolchain_key, ...}, options) = plan_build ()
+            in SOME {options = options, plan = plan, toolchain_key = toolchain_key} end
+        val {lines, refused} =
+          timed_phase "run_action.export"
+            (fn () => HolbuildBuildExec.export_run_specs tc project planned jobs request)
+      in
+        List.app (fn line => print (line ^ "\n")) lines;
+        if refused then raise Error "run-action: some targets aren't built; see above" else ()
+      end
     (* Theories the remote cache lacks go to the coordinator as a batch; once
        it finishes, the ordinary build restores them from the remote cache. *)
     fun remote_build {url, remote_only, detach, attach} =
@@ -1569,6 +1607,9 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         ExportActionSpecs {upload} =>
           HolbuildBuildExec.with_project_lock project "action-spec"
             (fn () => run_with_stat_cache (export_action_specs upload))
+      | ExportRunSpecs request =>
+          HolbuildBuildExec.with_project_lock project "run-action"
+            (fn () => run_with_stat_cache (export_run_specs request))
       | BuildTargets =>
           if dry_run then run_with_stat_cache describe_dry_run
           else HolbuildBuildExec.with_project_lock project "build" (fn () => run_with_stat_cache execute_build)
@@ -1592,6 +1633,71 @@ fun action_spec_command tc cli_jobs args =
       else ()
   in
     build_once_with_prepared_mode (ExportActionSpecs {upload = upload}) tc cli_jobs NONE parsed
+  end
+
+val run_action_usage =
+  "usage: holbuild run-action --export-only --script S [--support F]... [--load L]...\n\
+  \       --output N... [--option timeout=SECONDS] TARGET..."
+
+fun run_action_command tc cli_jobs args =
+  let
+    val export_only = ref false
+    val script = ref NONE
+    val supports = ref []
+    val loads = ref []
+    val outputs = ref []
+    val timeout = ref NONE
+    fun push r x = r := !r @ [x]
+    fun timeout_option text =
+      let
+        val value = if String.isPrefix "timeout=" text then String.extract (text, size "timeout=", NONE) else ""
+        val bad = Error ("run-action: expected --option timeout=SECONDS, a positive integer, got " ^ text)
+      in
+        case Int.fromString value of
+            SOME seconds => if seconds > 0 andalso Int.toString seconds = value then seconds else raise bad
+          | NONE => raise bad
+      end
+    fun parse args =
+      case args of
+          [] => []
+        | "--export-only" :: rest => (export_only := true; parse rest)
+        | "--script" :: path :: rest =>
+            (case !script of
+                 NONE => (script := SOME path; parse rest)
+               | SOME _ => raise Error "run-action takes one --script")
+        | "--support" :: path :: rest => (push supports path; parse rest)
+        | "--load" :: name :: rest => (push loads name; parse rest)
+        | "--output" :: name :: rest => (push outputs name; parse rest)
+        | "--option" :: text :: rest => (timeout := SOME (timeout_option text); parse rest)
+        | [flag] =>
+            if List.exists (fn f => f = flag) ["--script", "--support", "--load", "--output", "--option"]
+            then raise Error ("run-action: " ^ flag ^ " requires a value")
+            else [flag]
+        | arg :: rest => arg :: parse rest
+    val rest = parse args
+    val _ =
+      if !export_only then ()
+      else raise Error ("run-action: this holbuild only exports run specs, with --export-only; " ^
+                        "it doesn't run them yet\n" ^ run_action_usage)
+    val (flags as {dry_run, watch, trace_steps, repl_on_failure, execution_plan, use_cache, ...}, targets) =
+      split_flags rest
+    val _ =
+      if dry_run orelse watch orelse trace_steps orelse repl_on_failure orelse Option.isSome execution_plan then
+        raise Error "run-action does not run builds: remove --dry-run, --watch, --trace-steps and --repl-on-failure"
+      else if not use_cache then
+        raise Error "run-action: a run's context comes from the cache, so --no-cache can't apply"
+      else ()
+    val script =
+      case !script of
+          SOME path => path
+        | NONE => raise Error ("run-action needs --script\n" ^ run_action_usage)
+    val request =
+      HolbuildBuildExec.run_request (#holdir tc)
+        {targets = targets, script = script, supports = !supports, loads = !loads,
+         outputs = !outputs, timeout = !timeout}
+  in
+    build_once_with_prepared_mode (ExportRunSpecs request) tc cli_jobs NONE
+      (flags, HolbuildBuildExec.run_planning_targets request)
   end
 
 fun build_iteration_error_message exn =
@@ -1741,7 +1847,7 @@ fun command_output command =
   handle _ => NONE
 
 fun git_output root args =
-  command_output ("git -C " ^ HolbuildHash.quote root ^ " " ^ args)
+  command_output (HolbuildOffline.git_command () ^ " -C " ^ HolbuildHash.quote root ^ " " ^ args)
 
 fun current_utc_timestamp () =
   Date.fmt "%Y-%m-%dT%H:%M:%SZ" (Date.fromTimeUniv (Time.now ()))
@@ -2616,6 +2722,7 @@ fun dispatch tc jobs args =
     | "repl" :: rest => (reject_json "repl"; repl_hol tc jobs rest)
     | "export" :: rest => (reject_json "export"; export_archive tc jobs rest)
     | "action-spec" :: rest => (reject_json "action-spec"; action_spec_command tc jobs rest)
+    | "run-action" :: rest => (reject_json "run-action"; run_action_command tc jobs rest)
     | "import" :: rest => (reject_json "import"; import_archive rest)
     | cmd :: _ =>
         if known_command cmd then raise Error ("unknown command: " ^ cmd)
@@ -2817,7 +2924,8 @@ fun dispatch_with_options {holdir, source_dir, cache_dir, remote_cache, jobs, ma
    Option.app HolbuildCacheConfig.set_cache_root cache_dir;
    Option.app HolbuildRemoteCacheConfig.set_url remote_cache;
    Option.app HolbuildRemoteCacheConfig.set_prefetch_concurrency prefetch_concurrency;
-   if args = ["--help"] orelse args = ["-h"] then global_help ()
+   if args = ["--version"] then print ("holbuild " ^ HolbuildVersion.version ^ "\n")
+   else if args = ["--help"] orelse args = ["-h"] then global_help ()
    else if maybe_handle_command_help args then () else
    (* A build, explicit or implicit, under --remote-only must not build HOL. *)
    (HolbuildHolSharedCache.restore_only := List.exists (fn arg => arg = "--remote-only") args;
@@ -2906,6 +3014,7 @@ fun reject_runtime_options options args =
 
 fun main raw_args =
   (let
+     val _ = HolbuildOffline.initialize ()
      val _ = install_signal_handlers ()
      val _ = HolbuildStatus.set_json_mode (List.exists (fn s => s = "--json") raw_args)
      val runtime_options = runtime_options raw_args
@@ -2917,12 +3026,26 @@ fun main raw_args =
        else ()
      val (cooperate_dir, machine_max_mem, child_charge, raw_args) = parse_cooperation_options raw_args
      val (options, args) = parse_global_options raw_args
+     val _ =
+       if HolbuildOffline.enabled () then
+         (if Option.isSome (#remote_cache options) then
+            raise Error "--offline conflicts with explicit --remote-cache" else ();
+          if List.exists (fn arg => arg = "--remote-exec") args then
+            raise Error "--offline conflicts with explicit --remote-exec" else ();
+          if has_help_arg args then () else case args of
+              "exec-action" :: _ => HolbuildOffline.require_online "execute a remote action"
+            | "action-spec" :: rest =>
+                if List.exists (fn arg => arg = "--upload") rest then
+                  HolbuildOffline.require_online "upload action specs" else ()
+            | _ => ())
+       else ()
      val _ = reject_runtime_options runtime_options args
    in
      configure_cooperation cooperate_dir machine_max_mem child_charge (#maxheap options);
      dispatch_with_options options args
    end)
   handle Thread.Interrupt => (interrupted := true; HolbuildToolchain.cleanup_active_children (); err "interrupted")
+       | HolbuildOffline.Error msg => err msg
        | Error msg => err msg
        | HolbuildToolchain.Error msg => err msg
        | HolbuildProject.Error msg => err msg

@@ -104,6 +104,7 @@ fun write_text path text =
    deadline, repeating work whose results the cache dedupes. *)
 fun submit url batch_text : attempt =
   let
+    val _ = HolbuildOffline.require_online "submit a remote batch"
     val body = HolbuildTempPath.temporary "remote-exec-batch"
     val _ = write_text body batch_text
     fun post delays =
@@ -192,6 +193,7 @@ fun report_action line =
    batch comes with the action whose proof failed, when one did. *)
 fun follow url batch_id (on_done : string -> unit) : outcome * progress =
   let
+    val _ = HolbuildOffline.require_online "follow a remote batch"
     val states : (string * string) list ref = ref []
     val proof_failure : proof_failure option ref = ref NONE
     (* A line cut off by a dropped connection, perhaps with curl's error
@@ -275,6 +277,7 @@ fun follow url batch_id (on_done : string -> unit) : outcome * progress =
    an abandoned batch at its deadline anyway. *)
 fun cancel_within max_time_seconds url batch_id =
   let
+    val _ = HolbuildOffline.require_online "cancel a remote batch"
     val result =
       HolbuildSpawn.run
         {program = "curl",

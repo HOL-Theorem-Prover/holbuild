@@ -428,8 +428,8 @@ class HostTelemetry:
 class Phases:
     """The seconds this worker spent in each phase since it last reported them (``PhaseReport`` in the
     coordinator). Between them they cover its time: waiting for memory, claiming, sleeping after a claim got
-    nothing, finding the action's release, running exec-action (before, while and after it has HOL children, or all
-    of it as ``exec`` when they can't be seen) and reporting the result."""
+    nothing or an action failed in the worker, finding the action's release, running exec-action (before, while
+    and after it has HOL children, or all of it as ``exec`` when they can't be seen) and reporting the result."""
 
     NAMES = ("memory_wait", "claim", "idle", "lease", "release", "before_hol", "hol", "after_hol", "exec", "complete")
 

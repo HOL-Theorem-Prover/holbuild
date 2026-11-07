@@ -141,6 +141,9 @@ SML
 
 plan() {
   local project=$1 jobs=$2 log=$3
+  # Both copies have the same sources: drop the first's shared analyses so
+  # the second analyses its sources too.
+  rm -rf "$HOLBUILD_CACHE/analysis"
   export HOLBUILD_TEST_ANALYSER_LOG=$log.analyser
   : > "$HOLBUILD_TEST_ANALYSER_LOG"
   (cd "$project" && HOLBUILD_TEST_ANALYSER_PEERS=${peers:-} \

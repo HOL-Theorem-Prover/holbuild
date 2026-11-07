@@ -53,7 +53,7 @@ fun run wants source_path =
 fun parse_boundary fields =
   case fields of
       ["boundary", kind, name, safe_name, theorem_start, theorem_stop, boundary,
-       tactic_start, tactic_end, has_attrs, prefix_hash, tactic_text] =>
+       tactic_start, tactic_end, proof_attrs, prefix_hash, tactic_text] =>
         {kind = kind, name = name, safe_name = safe_name,
          theorem_start = int "theorem_start" theorem_start,
          theorem_stop = int "theorem_stop" theorem_stop,
@@ -61,7 +61,7 @@ fun parse_boundary fields =
          tactic_start = int "tactic_start" tactic_start,
          tactic_end = int "tactic_end" tactic_end,
          tactic_text = tactic_text,
-         has_proof_attrs = has_attrs = "1",
+         proof_attrs = P.decode_proof_attrs proof_attrs,
          prefix_hash = prefix_hash}
     | _ => raise HolbuildTheoryCheckpoints.Error "bad analyser boundary record"
 

@@ -866,8 +866,22 @@ safe leaf-level checkpointing. Tactic-level goal reordering such as
 `REVERSE_LT` remains a list-step when it is written as a list tactic. List-level
 `REPEAT_LT` likewise remains an opaque list-step.
 
-Attributed proofs and declarations with no parsed tactic body use a conservative
-whole-tactic prover path. Normal theorem bodies should not fall back to timing the
+Proof execution attributes (`Proof[...]` and attributed `Resume`) surround the
+whole decomposed plan with HOL's native modifier. The analyser preserves ordered
+attribute keys and values separately from theorem registration attributes and
+Resume's label and `smlname`. The injected tactic entry consumes a one-shot plan
+runner inside the original expanded tactic wrapper, preserving custom modifier
+construction, composition order, and the installed HOL's context and ambient
+simpset behavior. Lazy factories for attributed leaves and selectors are compiled
+inside that tactic slot, retaining HOL's lexical context readers while tactic
+construction stays within the step timeout. Nested prover calls continue through HOL's ordinary prover.
+
+Attributed bodies retain step diagnostics, timeouts, and traces,
+but cannot save or restore mid-proof/failed-prefix checkpoints: a saved heap
+inside a temporary modifier cannot replay its unwind. Their normal theorem-context
+checkpoint is saved after the native declaration and modifier have returned.
+Declarations with no parsed tactic body retain the whole-tactic prover path.
+Normal theorem bodies should not fall back to timing the
 entire theorem as one coarse tactic; if they need coarser treatment for a
 validation-shape bug, the runtime should merge the specific branch/list/select
 shape rather than hide the whole theorem inside `TAC_PROOF`. The
@@ -944,8 +958,8 @@ HTML files live only in the disposable stage and are not cache or build artifact
 skipping them removes pretty-printing and I/O from the theory export transaction.
 
 When proof steps are enabled, holbuild applies a tactic timeout to each
-executable proof step, and to the conservative whole-tactic path used for
-attributed/opaque proof cases. The proof-step engine is holbuild's proof IR: it still
+executable proof step, including attributed proofs, and to the whole-tactic path
+for declarations with no parsed tactic body. The proof-step engine is holbuild's proof IR: it still
 uses HOLSource parser recovery, but lowers `HOLSourceAST.exp` directly.
 `--goalfrag` and `goalfrag-plan` have been removed. The old `--new-ir` build flag is
 accepted as a deprecated no-op because proof IR is now the default. The CLI default is

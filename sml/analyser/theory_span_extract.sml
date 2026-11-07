@@ -6,7 +6,7 @@ exception Error of string
 type boundary = {kind : string, name : string, safe_name : string, theorem_start : int,
                  theorem_stop : int, boundary : int, tactic_start : int,
                  tactic_end : int, tactic_text : string,
-                 has_proof_attrs : bool, prefix_hash : string}
+                 proof_attrs : (string * string list) list, prefix_hash : string}
 
 type termination = {name : string, safe_name : string, definition_start : int,
                     definition_stop : int, boundary : int,
@@ -44,15 +44,20 @@ fun slice text start stop =
   else String.substring(text, start, stop - start)
 fun prefix_hash text boundary = HolbuildHash.string_sha256 (String.substring(text, 0, boundary))
 
-fun bool_digit true = "1" | bool_digit false = "0"
 fun attr_args NONE = [] | attr_args (SOME {attrs, ...}) = #args attrs
+fun proof_kvals args =
+  map (fn {key = (_, key), bind} =>
+    (key, case bind of NONE => [] | SOME {vals, ...} => map #2 vals)) args
 fun resume_label_and_attrs id attrs =
   let val args = attr_args attrs
       val (label, rest) = case args of {key, bind = NONE} :: rest => (#2 key, rest) | _ => ("", args)
       fun is_smlname {key = (_, "smlname"), ...} = true | is_smlname _ = false
-      val proof_attrs = List.filter (not o is_smlname) rest
+      fun remove_smlname [] = []
+        | remove_smlname (arg :: rest) =
+            if is_smlname arg then rest else arg :: remove_smlname rest
+      val proof_attrs = proof_kvals (remove_smlname rest)
       val suffix = if label = "" then "" else "[" ^ label ^ "]"
-  in {name = id ^ suffix, has_attrs = not (null proof_attrs)} end
+  in {name = id ^ suffix, proof_attrs = proof_attrs} end
 
 fun parser_reader source_text = let val fed = ref false in fn _ => if !fed then "" else (fed := true; source_text) end
 fun ignore_parse_error _ _ _ = ()
@@ -84,23 +89,23 @@ fun parse_error_text source_path source_text _ (start, _) msg =
 fun raise_parse_error source_path source_text loc span msg = raise Error (parse_error_text source_path source_text loc span msg)
 
 fun boundaries_from_result source result =
-  let fun boundary kind name theorem_start theorem_stop tactic_start tactic_end has_attrs =
+  let fun boundary kind name theorem_start theorem_stop tactic_start tactic_end proof_attrs =
         let val b = statement_boundary source theorem_stop
         in {kind = kind, name = name, safe_name = safe_name name, theorem_start = theorem_start,
             theorem_stop = theorem_stop, boundary = b, tactic_start = tactic_start, tactic_end = tactic_end,
-            tactic_text = slice source tactic_start tactic_end, has_proof_attrs = has_attrs,
+            tactic_text = slice source tactic_start tactic_end, proof_attrs = proof_attrs,
             prefix_hash = prefix_hash source b} end
       fun loop acc =
         case #parseDec result () of
             NONE => rev acc
           | SOME (HOLSourceAST.HOLTheoremDecl {theorem_, id = (_, name), proof_, tac, stop, ...}) =>
               let val (ts, te) = HOLSourceAST.expSpan tac
-                  val has_attrs = case proof_ of SOME {attrs = SOME _, ...} => true | _ => false
-              in loop (boundary "theorem" name theorem_ stop ts te has_attrs :: acc) end
+                  val proof_attrs = case proof_ of SOME {attrs, ...} => proof_kvals (attr_args attrs) | NONE => []
+              in loop (boundary "theorem" name theorem_ stop ts te proof_attrs :: acc) end
           | SOME (HOLSourceAST.HOLResume {resume_, id = (_, id_name), attrs, tac, stop, ...}) =>
               let val (ts, te) = HOLSourceAST.expSpan tac
-                  val {name, has_attrs} = resume_label_and_attrs id_name attrs
-              in loop (boundary "resume" name resume_ stop ts te has_attrs :: acc) end
+                  val {name, proof_attrs} = resume_label_and_attrs id_name attrs
+              in loop (boundary "resume" name resume_ stop ts te proof_attrs :: acc) end
           | SOME _ => loop acc
   in loop [] end
 

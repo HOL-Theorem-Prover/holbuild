@@ -308,6 +308,7 @@ holbuild executable runtests
 holbuild export -o build-output.hbx MyTheory
 holbuild import build-output.hbx
 holbuild --remote-cache URL action-spec --upload MyTheory
+holbuild --remote-cache URL run-action --export-only --script s.sml --output out MyTheory
 holbuild clean MyTheory
 holbuild gc
 ```
@@ -360,6 +361,8 @@ Common global options:
   `HOLBUILD_SOURCE_DIR` or the current working directory.
 - `--cache-dir PATH`: global cache directory. Overrides `HOLBUILD_CACHE` and the
   platform default cache location.
+- `--offline`: disable holbuild-managed network access. Also enabled by
+  `HOLBUILD_OFFLINE=1`; see [Offline builds](#offline-builds).
 - `--remote-cache URL`: optional Bazel-style HTTP remote cache endpoint. Also
   configurable with `HOLBUILD_REMOTE_CACHE_URL` or project-local
   `.holconfig.toml`.
@@ -387,6 +390,39 @@ Common global options:
   the local cache at once, ahead of the build workers. Defaults to 50 or twice
   the build's jobs, whichever is larger; also limits remote-cache existence
   checks before batch export. Only used with a remote cache.
+
+### Offline builds
+
+Use `holbuild --offline build MyTheory` (or `HOLBUILD_OFFLINE=1`) to build
+using only dependencies and HOL toolchains already available locally. First
+prepare the same project and cache directory with offline mode unset:
+
+```sh
+holbuild buildhol
+holbuild context
+holbuild build MyTheory
+holbuild --offline build MyTheory
+```
+
+A missing or wrong-revision dependency checkout fails before clone or fetch,
+even if its commit is in a local bare mirror. A missing or invalid HOL
+toolchain also fails before restore or replacement. The error names what needs
+preparing; rerun without `--offline` and with `HOLBUILD_OFFLINE` unset. Valid
+local toolchains can regenerate analyser and source metadata offline.
+Local artifact caching stays enabled, including reads and writes.
+
+Offline mode ignores remote-cache settings in the environment and
+`.holconfig.toml`, including HTTP-client setup. Explicit `--remote-cache` or
+`--remote-exec` conflicts with offline mode and fails before project work.
+`action-spec` and `exec-action` require a remote cache; help, version and
+other local commands remain available. Setting
+`HOLBUILD_OFFLINE=0` leaves online behavior unchanged; `--offline` always
+enables offline mode.
+
+This policy covers holbuild-managed Git, remote-cache and coordinator access,
+including Git's implicit fetching of missing objects. It is not a network
+sandbox: user generators, build scripts and invoked programs can still access
+the network themselves.
 
 ### Sharing a machine's memory between holbuild processes
 
@@ -914,9 +950,17 @@ theory.
 By default, `holbuild` instruments modern theorem and explicit termination
 proofs in the root package and executes them as proof steps. This gives better
 failure locations, per-step tactic timeouts, and optional traces. Theorem proofs
-also support failed-prefix checkpoints; termination proofs currently replay from
-the preceding clean definition/theorem/dependency checkpoint. Theories in
-dependency packages build without proof-step instrumentation or checkpoints
+without proof execution attributes also support failed-prefix checkpoints;
+termination proofs currently replay from the preceding clean
+definition/theorem/dependency checkpoint.
+
+`Proof[...]` attributes such as `exclude_simps` and `exclude_frags`, including
+those on `Resume`, remain active across the entire stepped proof. They retain
+leaf diagnostics, timeouts and traces. Attributed proofs save theorem-context state
+after the declaration is bound and the temporary modifier has unwound; they do not
+save or restore failed-prefix checkpoints.
+
+Theories in dependency packages build without proof-step instrumentation or checkpoints
 by default. To audit their proofs too, select `--proof-scope=all`.
 
 Useful commands and options:
@@ -1005,7 +1049,16 @@ Important paths:
 .holbuild/packages/<package>          # package build artefacts
 .holbuild/plan/<fingerprint>          # plan records
 $HOLBUILD_CACHE/hol-toolchains/       # built HOL toolchains and analysers
+$HOLBUILD_CACHE/analysis/             # sources' dependency analyses
 ```
+
+Planning analyses each source for its dependencies (its `load`s, `use`s,
+Holdep mentions and declared extra inputs and outputs) and keeps the result in
+`.holbuild/obj` and in the cache's `analysis/` directory. An entry there is
+named after the source's content, the analyser's version and the HOL sources
+the analyser is built against, so another checkout of the same sources on the
+machine reads it instead of analysing again, and a different HOL pin never
+uses it.
 
 ### The plan record
 
@@ -1256,6 +1309,90 @@ action-text
   out; the entry built under them carries the timeout contract the exporting
   build will ask for.
 
+### Exporting script runs for remote execution
+
+A *run* is an SML script run in the context of a built theory: HOL started
+from the toolchain, the theory's ancestry restorable, libraries loaded, and
+the script's declared output files kept. Its result is keyed by what it
+reads, so the same run is done once. `run-action --export-only` writes and
+uploads the run spec of each target; this release does not run or fetch them.
+
+```sh
+holbuild --remote-cache https://cache.example.org run-action --export-only \
+  --script run.sml [--support F]... [--load L]... --output N... \
+  [--option timeout=SECONDS] TARGET...
+```
+
+A TARGET is a project theory (a logical name as `build` takes it, or
+`<package>:<logical>`), a theory of the HOL toolchain (`hol:bool` or
+`hol:boolTheory`), or `hol:*` for every theory in the toolchain's `sigobj`. A
+project theory must already be in the local cache for its current inputs;
+otherwise that target is refused with `build it first`, the others are still
+exported, and the command exits 1. `--support` files must lie under the
+script's directory and are named by their given path relative to it, without
+resolving symbolic links. `--load` names a library: one
+in the toolchain's `sigobj`, or a source the project plans (including the
+implicit `hol` package's libraries). The command takes `build`'s cache and
+proof options and prints one line per exported target:
+
+```text
+<context> <run_key> <spec-sha256>
+```
+
+The spec is written to `.holbuild/run-specs/<spec-sha256>` and uploaded to
+`/cas/` with every file it names. The run key is the SHA-256 of the run text:
+
+```text
+holbuild-run-v1
+toolchain=<semantic toolchain key>
+context=<package>:<logical>@<input_key>   (or context=HOL:<logical>)
+script=<sha256>
+support=<relpath>@<sha256>                  (sorted)
+load=<package>:<logical>@<input_key>        (a project library; in order)
+load=<name>                                 (a toolchain or hol package library)
+output=<name>                               (sorted)
+```
+
+The toolchain key fixes HOL's own theories and libraries, so they carry no
+key of their own. Options such as the timeout stay out of the key: a longer
+timeout doesn't make a new run. A run's result is stored, like a theory's,
+under `ac-key = sha256("holbuild-remote-ac-v1\n" ^ run_key ^ "\n")`.
+
+A run spec names no path on the exporting machine:
+
+```text
+holbuild-run-spec-v1
+holbuild-version=<version>
+holbuild-runtime=<sha256 of the holbuild sources a theory child loads>
+toolchain git=<url> rev=<rev> kernel=<variant>
+run-key=<run_key>
+context <package>:<logical> <stem> <input_key>   (or context HOL:<logical>)
+file library <relpath> <sha256> <size>
+dep theory <package>:<logical> <stem> <input_key>
+lib <package>:<logical> <stem> <suffix> <load>...
+load theory|library|object <name-or-stem>
+file context-script <relpath> <sha256> <size>
+script <sha256> <size>
+file support <relpath> <sha256> <size>
+run-load <package>:<logical>|HOLLIB:<name>
+output <name>
+option timeout=<seconds>                         (only when given)
+run-text
+<the run text, verbatim to the end of the blob>
+```
+
+- For a project context, the `toolchain`, `file library`, `dep theory`, `lib`
+  and `load` lines are the context theory's ActionSpec lines, followed by the
+  `file library`, `lib` and `dep theory` lines of what the `--load` libraries
+  need beyond them. A HOL context has only the latter.
+- `context` names the theory to restore, as a `dep theory` line does.
+- `file context-script` lines are the scripts of the context theory and of
+  every theory it depends on, under `.holbuild/action-src/<package>/`, for
+  scripts that read their ancestry's sources.
+- `run-load` lines are the libraries to load, in order: a project library by
+  its `lib` line's name, a toolchain library as `HOLLIB:<name>`.
+- `output` lines are the file names the script must write.
+
 ### Running one theory action as a remote worker
 
 `exec-action` builds the ActionSpec stored in the remote cache under
@@ -1496,6 +1633,12 @@ run, unless `--quiet` is given. Progress never goes to stdout, which keeps the
 locking/discovery and does not require a HOL toolchain. Project checkpoint GC
 uses `.holconfig.toml`'s `[build].checkpoint_limit_gb` unless overridden with
 `--max-checkpoints-gb`.
+
+Cache GC removes the dependency analyses under `analysis/` that no build has
+read or written within the retention period. A build that finds its analyses
+in `.holbuild/obj` doesn't count as a use, so such an entry can go while a
+checkout still uses the project's copy; the next fresh checkout analyses that
+source again.
 
 Cache GC also removes installed HOL toolchains under `hol-toolchains/` that no
 holbuild command has used within the retention period; a removed toolchain is
