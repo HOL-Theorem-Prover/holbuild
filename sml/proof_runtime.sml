@@ -80,11 +80,7 @@ fun env_bool name =
     | SOME "no" => SOME false
     | _ => NONE
 
-fun all_digits text =
-  size text > 0 andalso List.all Char.isDigit (String.explode text)
-
-fun strict_nonnegative_int text =
-  if all_digits text then Int.fromString text else NONE
+val strict_nonnegative_int = HolbuildDiagnosticLimits.strict_nonnegative_int
 
 fun strict_positive_int text =
   case strict_nonnegative_int text of
@@ -635,13 +631,14 @@ fun numbered_goal_text total (index, goal) =
   String.concat ["holbuild goal ", Int.toString index, " of ", Int.toString total, ":\n",
                  goal_text goal]
 
-val all_goals_limit = 4096
-
 fun limited_all_goals_text text =
-  if size text <= all_goals_limit then text
-  else
-    String.concat [String.substring(text, 0, all_goals_limit),
-                   "\nholbuild failed tactic input goals truncated after ", Int.toString all_goals_limit, " bytes\n"]
+  let val limit = HolbuildDiagnosticLimits.failed_goals ()
+  in
+    if limit = 0 orelse size text <= limit then text
+    else
+      String.concat [String.substring(text, 0, limit),
+                     "\nholbuild failed tactic input goals truncated after ", Int.toString limit, " bytes\n"]
+  end
 
 fun all_goals_text goals =
   if length goals <= 1 then ""

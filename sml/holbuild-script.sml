@@ -84,6 +84,7 @@ use "sml/temp_path.sml";
 use "sml/remove_tree.sml";
 use "sml/stat_cache.sml";
 use "sml/version.sml";
+use "sml/diagnostic_limits.sml";
 use "sml/suggest.sml";
 use "sml/hol_toolchain_config.sml";
 use "sml/builtin_manifests.sml";
