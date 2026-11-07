@@ -7,7 +7,10 @@ on:
     paths:
       - .github/workflows/release.yml
       - Makefile
-      - sml/holbuild-script.sml
+      - LICENSE
+      - sml/**
+      - vendor/hol/**
+      - tests/lib.sh
       - tests/cases/installed-runtime/**
   workflow_dispatch:
 
@@ -111,10 +114,16 @@ jobs:
           test -s "$root/share/holbuild/sml/holbuild_runtime.sml"
           if [[ "$PLATFORM" == linux-* ]]; then
             ldd "$root/bin/holbuild" | tee dependencies.txt
-            ! grep -E 'libpolyml|libgmp|not found' dependencies.txt
+            if grep -E 'libpolyml|libgmp|not found' dependencies.txt; then
+              echo 'Unexpected non-system or missing library dependency' >&2
+              exit 1
+            fi
           else
             otool -L "$root/bin/holbuild" | tee dependencies.txt
-            ! tail -n +2 dependencies.txt | grep -Ev '^[[:space:]]+(/usr/lib/|/System/Library/)'
+            if tail -n +2 dependencies.txt | grep -Ev '^[[:space:]]+(/usr/lib/|/System/Library/)'; then
+              echo 'Unexpected non-system library dependency' >&2
+              exit 1
+            fi
           fi
           version=${root#holbuild-v}
           version=${version%-$PLATFORM}
