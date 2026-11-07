@@ -16,6 +16,7 @@ trap cleanup EXIT
 
 # An HTTP/1.1 server, so libcurl keeps its connection open between requests.
 # Every request must carry the test credentials; /slow answers after 3 s,
+# /trickle sends its 6-byte body a byte every 0.5 s,
 # /gated once the file gate-release exists in the test directory (writing
 # gate-event there on arrival), /missing with 404 and /error with 500, and
 # PUT /store/<name> keeps a body that GET /store/<name> returns, and
@@ -58,6 +59,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/slow":
             time.sleep(3)
             self.reply(200, b"ok\n")
+        elif self.path == "/trickle":
+            try:
+                self.send_response(200)
+                self.send_header("Content-Length", "6")
+                self.end_headers()
+                for byte in b"slow!\n":
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                    time.sleep(0.5)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         elif self.path == "/gated":
             (test_dir / "gate-event").write_text("arrived\n")
             while not (test_dir / "gate-release").exists():
@@ -214,6 +226,12 @@ val _ = assert ("the 1 s timeout took " ^ Time.toString elapsed ^ " s")
                (Time.< (elapsed, Time.fromMilliseconds 2000))
 val _ = assert "the handle works after a timeout"
                (HolbuildHttp.get {url = url ^ "/fast", dst = dir ^ "/after-timeout.out", timeout = 30}
+                = HolbuildHttp.Response 200)
+
+(* The timeout bounds a stall, not the transfer: a body that keeps arriving
+   for longer than it completes. *)
+val _ = assert "a transfer that keeps moving outlasts the timeout"
+               (HolbuildHttp.get {url = url ^ "/trickle", dst = dir ^ "/trickle.out", timeout = 1}
                 = HolbuildHttp.Response 200)
 
 (* Concurrent requests share the pool without mixing up transfers: each of
