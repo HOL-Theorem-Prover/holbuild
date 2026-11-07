@@ -129,6 +129,31 @@ worker w
 grep -qx 'status=cached' "$tmpdir/w.result" || { cat "$tmpdir/w.result" "$tmpdir/w.log" >&2; exit 1; }
 require_file "$remote_root/ac/$ac"
 
+# A new action must build and publish with either the primary or backup down.
+# Its optional cache lookups and pre-PUT check see one transport failure and 404.
+for rank in primary backup; do
+  down=$(python3 - "$remote_url" "$ac" "$rank" <<'PYCODE'
+import hashlib, sys
+healthy, digest, rank = sys.argv[1:]
+score = lambda node: hashlib.sha256(f"{node}:{digest}".encode()).hexdigest()
+for i in range(10000):
+    node = f"http://127.0.0.1:1/{i}"
+    if (score(node) > score(healthy)) == (rank == "primary"):
+        print(node)
+        break
+else:
+    raise SystemExit("could not choose dead primary")
+PYCODE
+)
+  rm "$remote_root/ac/$ac"
+  worker "ring-$rank" "$down,$remote_url"
+  if [[ "$worker_status" != 0 ]]; then
+    cat "$tmpdir/ring-$rank.result" "$tmpdir/ring-$rank.log" >&2
+    exit 1
+  fi
+  require_file "$remote_root/ac/$ac"
+done
+
 # Hydrating a dependency: B's worker fetches A's entry, and the cache
 # answers 500 for it.  That is not a missing input.
 (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload BTheory) > "$tmpdir/batch-b.txt"
