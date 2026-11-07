@@ -3948,6 +3948,21 @@ datatype run_from_state =
   DepsLoadedState of {path : string, load : string option}
 | NoRunFromState of string
 
+(* The key of NODE's dependency context as things stand, before anything is
+   built: the dependencies' outputs on disk can be older than their sources,
+   so key on them only when every one is built for its current source. *)
+fun current_dependency_context_key toolchain_key project plan keys node =
+  let
+    fun built_for_current_source dep =
+      case current_metadata (metadata_path project dep) of
+          SOME text => metadata_input_key_matches (HolbuildBuildPlan.input_key_for keys dep) text
+        | NONE => false
+  in
+    if List.all built_for_current_source (HolbuildBuildPlan.transitive_project_deps plan node)
+    then dependency_context_key toolchain_key plan keys node
+    else dependency_input_context_key toolchain_key plan keys node
+  end
+
 (* Checkpoints are current only for the keys a build of NODE would use now.
    Run holds no project lock, so this only reads checkpoint files; a build, gc
    or eviction that removes the chosen checkpoint before HOL loads it makes
@@ -3956,17 +3971,7 @@ fun run_from_state tc project plan keys node =
   let
     val name = logical_name node
     val toolchain_key = HolbuildToolchain.toolchain_key tc
-    fun built_for_current_source dep =
-      case current_metadata (metadata_path project dep) of
-          SOME text => metadata_input_key_matches (HolbuildBuildPlan.input_key_for keys dep) text
-        | NONE => false
-    (* Run builds nothing, so the dependencies' outputs on disk can be older
-       than their sources: key on them only when every one is built for its
-       current source. *)
-    val deps_key =
-      if List.all built_for_current_source (HolbuildBuildPlan.transitive_project_deps plan node)
-      then dependency_context_key toolchain_key plan keys node
-      else dependency_input_context_key toolchain_key plan keys node
+    val deps_key = current_dependency_context_key toolchain_key project plan keys node
     val base = checkpoint_base project node
     fun deps_loaded_current dir =
       HolbuildCheckpointStore.ok_current (Path.concat(dir, "deps_loaded.save"))
@@ -5650,8 +5655,12 @@ fun publish_spec_blob remote path =
     | HolbuildCacheBackend.Skipped => raise Error ("could not upload " ^ path ^ ": skipped")
 
 (* Writes the ActionSpec of every theory in the plan the remote cache can't
-   satisfy, uploads them and their sources with upload, and returns the batch. *)
-fun export_action_specs (options : build_options) tc project plan toolchain_key upload =
+   satisfy, uploads them and their sources with upload, and returns the batch.
+   With local_resumable, a leaf of the batch (no theory in it depends on it)
+   whose local build would resume from a checkpoint is left out, for the local
+   build that follows to build: that is faster than running it from scratch
+   on a worker, which has none of the project's checkpoints. *)
+fun export_action_specs (options : build_options) tc project plan toolchain_key {upload, local_resumable} =
   let
     val remote =
       case HolbuildRemoteCacheConfig.url () of
@@ -5686,8 +5695,36 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
         (fn (node, action) =>
             not (remote_entry_satisfies remote options project plan node (#input_key action)))
         actions
-    val uncached_keys = map (HolbuildBuildPlan.key o #1) uncached_actions
-    fun uncached node = List.exists (fn k => k = HolbuildBuildPlan.key node) uncached_keys
+    fun uncached_in actions node =
+      List.exists (fn (n, _) => HolbuildBuildPlan.key n = HolbuildBuildPlan.key node) actions
+    fun leaf parent_keys node = not (List.exists (fn k => k = HolbuildBuildPlan.key node) parent_keys)
+    (* Every checkpoint a build resumes from sits on the theory's deps_loaded
+       checkpoint for its current dependencies. *)
+    fun resumable node =
+      let val deps_key = current_dependency_context_key toolchain_key project plan keys node
+      in
+        checkpoint_enabled (checkpoint_policy_for_node options project node) andalso
+        deps_checkpoint_exists (deps_loaded_path (checkpoint_base project node) deps_key) deps_key
+      end
+    val (local_actions, uncached_actions) =
+      if local_resumable then
+        let
+          val parent_keys =
+            List.concat (map (fn (node, _) =>
+                                 map HolbuildBuildPlan.key
+                                     (uncached_parents plan (uncached_in uncached_actions) node))
+                             uncached_actions)
+        in
+          List.partition (fn (node, _) => leaf parent_keys node andalso resumable node) uncached_actions
+        end
+      else ([], uncached_actions)
+    val _ =
+      List.app (fn (node, _) =>
+                   HolbuildStatus.message_stderr
+                     ("holbuild: remote execution: " ^ package node ^ ":" ^ logical_name node ^
+                      " builds locally, from its checkpoints\n"))
+               local_actions
+    val uncached = uncached_in uncached_actions
     val toolchain_line =
       case HolbuildProject.resolved_hol_dependency_with {kernel_variant = #kernel_variant tc} project of
           SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev}, ...}) =>

@@ -1298,7 +1298,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       let val ({plan, toolchain_key, ...}, build_options) = plan_build ()
       in
         timed_phase "action_spec.export"
-          (fn () => print (HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key upload))
+          (fn () => print (HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key
+                             {upload = upload, local_resumable = false}))
       end
     (* Theories the remote cache lacks go to the coordinator as a batch; once
        it finishes, the ordinary build restores them from the remote cache. *)
@@ -1310,7 +1311,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         val ({plan, toolchain_key, ...}, build_options) = plan_build ()
         fun export upload =
           timed_phase "action_spec.export"
-            (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key upload)
+            (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key
+                        {upload = upload, local_resumable = true})
         fun batch_keys batch =
           List.mapPartial (fn line => case String.tokens Char.isSpace line of
                                           "action" :: key :: _ => SOME key
@@ -1377,7 +1379,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 else abandon batch_id (reason ^ "; " ^ finished progress)
         fun submit batch =
           if null (batch_keys batch) then
-            (HolbuildStatus.message_stderr "holbuild: remote execution: the remote cache has every theory\n";
+            (HolbuildStatus.message_stderr "holbuild: remote execution: nothing to build remotely\n";
              build_locally ())
           else
             case HolbuildRemoteExec.submit url batch of

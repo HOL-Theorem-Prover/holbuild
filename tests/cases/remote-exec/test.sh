@@ -133,7 +133,7 @@ require_grep "^edge " "$state/b1.batch"
 # With everything cached there is nothing to submit.
 run cached 0 build --remote-exec "$coordinator" BTheory
 refute_grep "remote batch" "$tmpdir/cached.log"
-require_grep "remote execution: the remote cache has every theory" "$tmpdir/cached.log"
+require_grep "remote execution: nothing to build remotely" "$tmpdir/cached.log"
 
 # Detach and reattach.
 write_theories two
@@ -494,3 +494,27 @@ run cancelled 0 build --remote-exec "$coordinator" BTheory
 require_grep "batch b[0-9]* cancelled; remote workers finished 0 of 2 theories; building locally" "$tmpdir/cancelled.log"
 require_grep "BTheory built" "$tmpdir/cancelled.log"
 rm "$state/cancelled"
+
+# A leaf of the batch whose local build would resume from a checkpoint stays
+# out of it and builds locally: BTheory, built locally just above, changes
+# alone.  --remote-only then builds nothing and exits 75.  Without the
+# checkpoints it goes to the workers.
+sed -i 's/(\* cancelled \*)/(* leaf-local *)/' "$project/src/BScript.sml"
+: > "$state/requests.log"
+run leaf-local-only 75 build --remote-exec "$coordinator" --remote-only BTheory
+require_grep "remote execution: rx:BTheory builds locally, from its checkpoints" "$tmpdir/leaf-local-only.log"
+require_grep "BTheory is not in the remote cache, and --remote-only builds nothing locally" "$tmpdir/leaf-local-only.log"
+run leaf-local 0 build --remote-exec "$coordinator" BTheory
+require_grep "remote execution: rx:BTheory builds locally, from its checkpoints" "$tmpdir/leaf-local.log"
+require_grep "remote execution: nothing to build remotely" "$tmpdir/leaf-local.log"
+require_grep "resuming BTheory" "$tmpdir/leaf-local.log"
+require_grep "BTheory built" "$tmpdir/leaf-local.log"
+refute_grep "^POST /v1/batches" "$state/requests.log"
+rm -r "$project/.holbuild/checkpoints"
+sed -i 's/(\* leaf-local \*)/(* leaf-remote *)/' "$project/src/BScript.sml"
+run leaf-remote 0 build --remote-exec "$coordinator" BTheory
+refute_grep "builds locally, from its checkpoints" "$tmpdir/leaf-remote.log"
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/leaf-remote.log")
+require_grep "^action .* rx:BTheory$" "$state/$batch.batch"
+require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/leaf-remote.log"
+require_grep "BTheory restored from cache" "$tmpdir/leaf-remote.log"

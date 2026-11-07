@@ -1215,6 +1215,18 @@ workers finished, built or found cached (`holbuild: remote execution: remote
 workers finished 3 of 3 theories`), or, when the build falls back, why and
 how many they finished.
 
+A theory that no other theory in the batch depends on stays out of the batch
+when its local build would resume from one of its checkpoints (see
+[Proof steps and checkpoints](#proof-steps-and-checkpoints)): its
+`deps_loaded` checkpoint, on which every other checkpoint it resumes from
+sits, matches its current dependencies. A worker has none of the project's
+checkpoints and would run it from scratch, so the build that follows the
+batch builds it locally instead, which is what an edit-and-rebuild loop on
+one theory needs. holbuild says so for each such theory (`holbuild: remote
+execution: rx:BTheory builds locally, from its checkpoints`). With
+`--remote-only` it is not built, and the build exits with status 75, as
+below.
+
 The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the
 batch, or the batch fails, it warns and builds locally. An event stream that
