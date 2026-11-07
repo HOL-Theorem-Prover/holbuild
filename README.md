@@ -868,9 +868,10 @@ holbuild build --target-checkpoints-only MyTheory
 - `--target-checkpoints-only` saves theorem checkpoints only in the requested
   targets (the default targets when none are given). Other root-package theories
   still save their `deps_loaded` checkpoint and run with proof steps and step
-  timeouts, so a cold build writes far fewer `.save` files, but an edit to one of
-  them restarts it from its `deps_loaded` state rather than from its last
-  unchanged theorem. Theory outputs and cache keys are the same as without it.
+  timeouts, so a cold build writes far fewer `.save` files, but those theories
+  get no new theorem checkpoints to resume an edit from. Theory outputs and
+  cache keys are the same as without it. Under `--remote-exec` it applies to the
+  theories built here; workers keep their own checkpoints.
 
 For source-executed theory builds, holbuild writes a live child log at
 `.holbuild/logs/current/<package>/<logical>/build.log`. You can inspect it during

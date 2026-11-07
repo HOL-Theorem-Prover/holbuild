@@ -70,3 +70,23 @@ up_log=$tmpdir/up.log
 (cd "$project" && "$HOLBUILD_BIN" --verbose build BTheory) > "$up_log"
 require_grep "ATheory is up to date" "$up_log"
 require_grep "BTheory is up to date" "$up_log"
+
+# Nor any output: rebuilt from source without it, both are byte-identical.
+outputs() { (cd "$project/.holbuild/obj/src" && sha256sum ATheory.sig ATheory.sml ATheory.dat BTheory.sig BTheory.sml BTheory.dat); }
+flagged=$(outputs)
+(cd "$project" && "$HOLBUILD_BIN" build --force --no-cache BTheory) > "$tmpdir/plain.log" 2>&1 \
+  || { cat "$tmpdir/plain.log" >&2; exit 1; }
+has_save AScript.sml.theorems '*_context.save' || { echo "rebuild without the flag saved no dependency checkpoints" >&2; exit 1; }
+if [ "$flagged" != "$(outputs)" ]; then
+  echo "--target-checkpoints-only changed theory outputs" >&2
+  exit 1
+fi
+
+# With no targets and no roots, every root-package theory is a requested target.
+rm -rf "$project/.holbuild"
+(cd "$project" && "$HOLBUILD_BIN" build --target-checkpoints-only --no-cache) > "$tmpdir/all.log" 2>&1 \
+  || { cat "$tmpdir/all.log" >&2; exit 1; }
+for theory in A B; do
+  has_save "${theory}Script.sml.theorems" '*_context.save' \
+    || { echo "default build skipped theorem checkpoints in $theory" >&2; exit 1; }
+done

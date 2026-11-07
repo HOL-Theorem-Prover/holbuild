@@ -2712,7 +2712,7 @@ fun best_failed_prefix_checkpoint requested_timeout checkpoints =
 
 datatype force_level = ForceNone | ForceTargets | ForceProject | ForceAll
 
-type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, target_checkpoints_only : bool, proof_steps : bool, new_ir : bool, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool}
+type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, checkpoint_targets : string list option, proof_steps : bool, new_ir : bool, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool}
 
 (* checkpoint: the theory saves checkpoints at all, its deps_loaded state
    included.  theorem_checkpoints: it also saves them per theorem and
@@ -3929,12 +3929,14 @@ fun assoc_timeout _ [] = NONE
 fun effective_tactic_timeout proof_steps node_timeout =
   if proof_steps then node_timeout else NONE
 
-fun checkpoint_policy_for_node ({force_targets, skip_checkpoints, target_checkpoints_only, proof_steps, new_ir, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure, trknl, ...} : build_options) project node =
+fun checkpoint_policy_for_node ({skip_checkpoints, checkpoint_targets, proof_steps, new_ir, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure, trknl, ...} : build_options) project node =
   if root_package_node project node then
     CheckpointPolicy {checkpoint = not skip_checkpoints,
                       theorem_checkpoints =
                         not skip_checkpoints andalso
-                        (not target_checkpoints_only orelse force_target_node force_targets node),
+                        (case checkpoint_targets of
+                             NONE => true
+                           | SOME targets => force_target_node targets node),
                       proof_steps = proof_steps,
                       new_ir = new_ir,
                       tactic_timeout = effective_tactic_timeout proof_steps
@@ -5508,12 +5510,12 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
   end
 
 (* The build options of a build that only restores from the caches. *)
-fun restore_only_options ({use_cache, verify_cache, force, force_targets, skip_checkpoints, target_checkpoints_only, proof_steps,
+fun restore_only_options ({use_cache, verify_cache, force, force_targets, skip_checkpoints, checkpoint_targets, proof_steps,
                            new_ir, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure,
                            emit_output_hashes, allow_cache_timeout_discrepancy, trknl, ...} : build_options)
     : build_options =
   {use_cache = use_cache, verify_cache = verify_cache, force = force, force_targets = force_targets,
-   skip_checkpoints = skip_checkpoints, target_checkpoints_only = target_checkpoints_only,
+   skip_checkpoints = skip_checkpoints, checkpoint_targets = checkpoint_targets,
    proof_steps = proof_steps, new_ir = new_ir,
    node_tactic_timeouts = node_tactic_timeouts, execution_plan = execution_plan,
    trace_steps = trace_steps, repl_on_failure = repl_on_failure,
