@@ -733,7 +733,8 @@ class Coordinator:
     ) -> None:
         """Handle ``input-missing``: re-queue a missing theory the batch builds, and retry on anything else, since a
         restore that fails on a network error reports its input missing too; once the action used up its
-        attempts, fail the batch for resubmission.
+        attempts, fail the batch for resubmission. A theory the batch doesn't build whose cached parents differ
+        from the ones it was built against fails the batch at once: a retry restores the same entries.
 
         The missing theory may be a transitive dependency, which the batch has no edge for; the edge added here
         holds the action back until that theory is rebuilt and the cache holds it again.
@@ -745,7 +746,15 @@ class Coordinator:
                 sa.text("SELECT theory FROM actions WHERE batch_id = :batch_id AND input_key = :input_key"),
                 {"batch_id": batch_id, "input_key": missing.key},
             )
-        if attempts >= self.settings.max_attempts:
+        if rebuilt is None and missing is not None and result.missing_reason == "parents":
+            await self._fail_batch(
+                conn,
+                batch_id,
+                input_key,
+                f"resubmit: {theory} needs theory {missing.key}, whose cache entry doesn't match its parents in the "
+                "cache",
+            )
+        elif attempts >= self.settings.max_attempts:
             what = rebuilt or (f"{missing.kind} {missing.key}" if missing else "an input")
             await self._fail_batch(
                 conn, batch_id, input_key, f"resubmit: {theory} is still missing {what} after {attempts} attempts"

@@ -160,6 +160,7 @@ finally (`failed`, with a `failure` message), or the client cancels it
   | `publish`, `toolchain`, `internal` | retried, until the action has been claimed `MAX_ATTEMPTS` times |
   | `disk` | retried once; a second `disk` in a row, or `MAX_ATTEMPTS` claims, is final |
   | `input-missing` naming a theory of the batch other than the action itself or one that depends on it | that theory is built again and the action waits for it, until the action has been claimed `MAX_ATTEMPTS` times |
+  | `input-missing` with `missing-reason=parents` naming a theory the batch doesn't build | the batch fails at once with `resubmit: …`: the cache holds that theory, built against other parents, and retrying restores the same entries |
   | any other `input-missing` (a blob, a theory cached at export, or one that can't be the action's input) | retried, since a restore that fails on a network error reports its input missing too; after `MAX_ATTEMPTS` claims the batch fails with `resubmit: …`; the next build exports a new batch |
   | `proof`, `tactic-timeout`, `spec-rejected` | final |
 

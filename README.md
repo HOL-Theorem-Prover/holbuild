@@ -1138,12 +1138,16 @@ input-key=<input_key>
 status=built|cached|failed
 failure=proof|tactic-timeout|memory|input-missing|publish|toolchain|disk|spec-rejected|internal
 missing=theory <input_key> | blob <sha256>
+missing-reason=parents
 peak-rss-mb=<n>
 wall-ms=<n>
 log=<sha256> <size>
 ```
 
 `failure` appears on failure, and `missing` with `input-missing`.
+`missing-reason=parents` says the missing theory's cache entry is there, but
+the parent outputs it recorded differ from the ones the cache holds, so
+restoring it again can't succeed.
 `peak-rss-mb` is the HOL process's peak resident memory on a successful build.
 `log` is the build log, uploaded to `/cas/`. `memory` means Poly/ML ran out
 of heap or the container's cgroup `memory.events` counted an OOM kill during

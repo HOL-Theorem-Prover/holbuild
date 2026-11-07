@@ -43,6 +43,9 @@ class Result:
     status: str  # built | cached | failed
     failure: str | None
     missing: Missing | None
+    # "parents": the missing theory's cache entry is there, but its parents in the cache differ from the ones it
+    # was built against, so no retry can restore it.
+    missing_reason: str | None
     peak_rss_mb: int | None
     log_sha256: str | None
 
@@ -123,6 +126,9 @@ def parse_result(text: str) -> Result:
                 missing = Missing("blob", _expect(SHA256, key, "missing blob"))
             case _:
                 raise FormatError(f"bad missing: {fields['missing']!r}")
+    missing_reason = fields.get("missing-reason")
+    if missing_reason is not None and (missing_reason != "parents" or missing is None or missing.kind != "theory"):
+        raise FormatError(f"bad missing-reason: {missing_reason!r}")
     peak = fields.get("peak-rss-mb")
     if peak is not None and not peak.isdigit():
         raise FormatError(f"bad peak-rss-mb: {peak!r}")
@@ -133,6 +139,7 @@ def parse_result(text: str) -> Result:
         status=status,
         failure=failure,
         missing=missing,
+        missing_reason=missing_reason,
         peak_rss_mb=int(peak) if peak is not None else None,
         log_sha256=_expect(SHA256, log.split(" ")[0], "log") if log else None,
     )

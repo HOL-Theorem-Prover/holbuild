@@ -2732,7 +2732,10 @@ fun execution_plan_only (CheckpointPolicy {execution_plan = SOME _, trace_steps 
 fun bool_text true = "true"
   | bool_text false = "false"
 
-val theory_manifest_version = "1"
+(* 2: the exporter canonicalizes a theory's parent header (0.13.11), so a .dat
+   built before it can differ from one built since under the same key, and
+   their descendants can't share a cache. *)
+val theory_manifest_version = "2"
 
 (* Final theory artifacts are semantic products of source bytes, resolved deps,
    toolchain, and declared action policy. Execution strategy is deliberately not
@@ -5739,6 +5742,7 @@ datatype action_failure =
   | TacticTimeoutFailure
   | MemoryFailure
   | InputMissing of string  (* "theory <input_key>" or "blob <sha256>" *)
+  | ParentsDiffer of string  (* the input key of a cached theory whose parents in the cache differ *)
   | PublishFailure
   | ToolchainFailure
   | DiskFailure
@@ -5751,6 +5755,7 @@ fun failure_name ProofFailure = "proof"
   | failure_name TacticTimeoutFailure = "tactic-timeout"
   | failure_name MemoryFailure = "memory"
   | failure_name (InputMissing _) = "input-missing"
+  | failure_name (ParentsDiffer _) = "input-missing"
   | failure_name PublishFailure = "publish"
   | failure_name ToolchainFailure = "toolchain"
   | failure_name DiskFailure = "disk"
@@ -6115,7 +6120,7 @@ fun hydrate_action_root remote root (spec : action_spec) =
     List.app
       (fn {target, stem, key} =>
           if spec_parent_hashes_match root spec (in_root root (stem ^ ".dat")) then ()
-          else raise ActionFailed (InputMissing ("theory " ^ key),
+          else raise ActionFailed (ParentsDiffer key,
                                    "dependency " ^ target ^ " does not match its parents in the cache"))
       (#deps spec)
   end
@@ -6450,7 +6455,10 @@ fun result_text (spec_sha256, input_key) {status, failure, wall_ms, peak, log} =
           NONE => []
         | SOME (kind, _) =>
             ("failure=" ^ failure_name kind) ::
-            (case kind of InputMissing missing => ["missing=" ^ missing] | _ => [])) @
+            (case kind of
+                 InputMissing missing => ["missing=" ^ missing]
+               | ParentsDiffer key => ["missing=theory " ^ key, "missing-reason=parents"]
+               | _ => [])) @
      (case peak of SOME mb => ["peak-rss-mb=" ^ Int.toString mb] | NONE => []) @
      ["wall-ms=" ^ LargeInt.toString wall_ms] @
      (case log of SOME (sha, bytes) => ["log=" ^ sha ^ " " ^ bytes] | NONE => [])) ^ "\n"

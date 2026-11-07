@@ -269,6 +269,25 @@ expect b 0 "status=built"
 worker c "$spec_c"
 expect c 0 "status=built"
 
+# A cached theory whose parent in the cache isn't the one it was built against
+# can't be restored, however often the worker retries, and says so.  Here the
+# worker's own cache holds an A whose .dat differs from the one B recorded.
+key_b=$(key_for "$tmpdir/batch.txt" worker:BTheory)
+stale=$tmpdir/worker-stale
+link_hol_toolchain_cache "$stale"
+mkdir -p "$stale/actions/$key_a" "$stale/blobs"
+dat_a=$(awk '$1 == "blob" && $2 == "dat" { print $3 }' "$built_worker/actions/$key_a/manifest")
+{ cat "$built_worker/blobs/$dat_a"; echo; } > "$tmpdir/stale.dat"
+stale_dat=$(sha256sum "$tmpdir/stale.dat" | cut -d' ' -f1)
+cp "$tmpdir/stale.dat" "$stale/blobs/$stale_dat"
+awk '$1 == "blob" { print $3 }' "$built_worker/actions/$key_a/manifest" | while read -r h; do
+  [[ "$h" == "$dat_a" ]] || cp "$built_worker/blobs/$h" "$stale/blobs/$h"
+done
+sed "s/$dat_a/$stale_dat/" "$built_worker/actions/$key_a/manifest" > "$stale/actions/$key_a/manifest"
+worker stale "$spec_c"
+expect stale 3 "status=failed" "failure=input-missing" "missing=theory $key_b" "missing-reason=parents"
+require_grep "does not match its parents in the cache" "$tmpdir/stale.log"
+
 # The original checkout restores all three results without building.
 hb build CTheory > "$tmpdir/client.log" 2>&1 || { cat "$tmpdir/client.log" >&2; exit 1; }
 for theory in A B C; do

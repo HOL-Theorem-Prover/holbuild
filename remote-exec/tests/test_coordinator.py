@@ -546,6 +546,32 @@ async def test_other_missing_inputs_retry_then_fail_the_batch_for_resubmission(
     assert status["failure"] == f"resubmit: pkg:a is still missing {missing} after 3 attempts"
 
 
+async def test_a_theory_outside_the_batch_whose_parents_differ_fails_the_batch_at_once(
+    http: httpx.AsyncClient,
+) -> None:
+    batch_id = await submit(http, ["a"])
+    token = await claim_named(http, "a")
+    missing = input_key("outside")
+    record = result("a", "failed", "input-missing", missing=f"theory {missing}", missing_reason="parents")
+    assert (await complete(http, token, record)).status_code == 200
+    status = await batch(http, batch_id)
+    assert status["state"] == "failed"
+    assert status["failure"] == (
+        f"resubmit: pkg:a needs theory {missing}, whose cache entry doesn't match its parents in the cache"
+    )
+
+
+async def test_a_theory_the_batch_builds_whose_parents_differ_is_rebuilt(
+    http: httpx.AsyncClient, cache: FakeCache
+) -> None:
+    batch_id = await submit(http, ["a", "b"], [("b", "a")])
+    await build(http, cache, "a")
+    token = await claim_named(http, "b")
+    record = result("b", "failed", "input-missing", missing=f"theory {input_key('a')}", missing_reason="parents")
+    assert (await complete(http, token, record)).status_code == 200
+    assert await states(http, batch_id) == {"a": "ready", "b": "waiting"}
+
+
 async def test_cancel_revokes_leases_and_stops_claims(http: httpx.AsyncClient) -> None:
     batch_id = await submit(http, ["a", "b"])
     token = await claim_named(http, "a")

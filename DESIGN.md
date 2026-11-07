@@ -589,11 +589,11 @@ with its sources and extra inputs declared, under the same theory toolchain key,
 produces a byte-identical `Theory.dat` in any project directory and artifact
 cache. The exporter canonicalizes the parent header by theory name, preserving
 the remaining payload, and updates the embedded data hash in `Theory.sml`.
-The generated parent load metadata uses the same order. Existing valid bundles
-remain usable without changing action keys; they are not canonicalized on
-restore, so importing a mixture of old and new bundles can still conflict.
-The local dependency-context checkpoint format changes to prevent resuming a
-heap with an older export runtime; artifact action keys do not change.
+The generated parent load metadata uses the same order. Theory input keys
+carry a manifest version that marks this export format, so a canonical `.dat`
+never shares a key with one whose parents are in load order, whose descendants
+record a different parent hash. Dependency-context checkpoint keys likewise
+exclude heaps saved by an older export runtime.
 A script that reads the clock, the environment, undeclared files, or host paths
 has to declare the files as `extra_deps` or opt out with `cache = false`.
 
