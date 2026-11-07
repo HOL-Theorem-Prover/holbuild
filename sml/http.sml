@@ -234,6 +234,11 @@ fun release_idle () =
       else List.drop (!idle, keep) before idle := List.take (!idle, keep)
     end))
 
+(* Closes the pooled connections no request is using; the next request
+   opens a new one. *)
+fun close_idle () =
+  List.app close (with_pool_lock (fn () => !idle before idle := []))
+
 (* A connection whose request raised may be left mid-transfer, so it is
    closed rather than pooled. *)
 fun with_handle f =

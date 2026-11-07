@@ -635,6 +635,37 @@ async def test_other_missing_inputs_retry_then_fail_the_batch_for_resubmission(
     assert status["failure"] == f"resubmit: pkg:a is still missing {missing} after 3 attempts"
 
 
+async def test_a_rebuilt_theory_still_missing_fails_the_batch_naming_its_key(
+    http: httpx.AsyncClient, cache: FakeCache
+) -> None:
+    batch_id = await submit(http, ["a", "b"], [("b", "a")])
+    await build(http, cache, "a")
+    record = result("b", "failed", "input-missing", missing=f"theory {input_key('a')}")
+    for _ in range(2):
+        token = await claim_named(http, "b")
+        assert (await complete(http, token, record)).status_code == 200
+        await build(http, cache, "a")
+
+    token = await claim_named(http, "b")
+    assert (await complete(http, token, record)).status_code == 200
+    status = await batch(http, batch_id)
+    assert status["state"] == "failed"
+    assert status["failure"] == f"resubmit: pkg:b is still missing pkg:a (theory {input_key('a')}) after 3 attempts"
+
+
+async def test_a_theory_never_in_the_cache_after_it_built_fails_the_batch_naming_its_key(
+    http: httpx.AsyncClient,
+) -> None:
+    batch_id = await submit(http, ["a", "b"], [("b", "a")])
+    for _ in range(3):
+        token = await claim_named(http, "a")
+        assert (await complete(http, token, result("a", "built"))).status_code == 200
+
+    status = await batch(http, batch_id)
+    assert status["state"] == "failed"
+    assert status["failure"] == f"resubmit: pkg:a (theory {input_key('a')}) is not in the cache after it built"
+
+
 async def test_cancel_revokes_leases_and_stops_claims(http: httpx.AsyncClient) -> None:
     batch_id = await submit(http, ["a", "b"])
     token = await claim_named(http, "a")

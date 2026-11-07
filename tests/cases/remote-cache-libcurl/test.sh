@@ -257,7 +257,27 @@ val _ =
      end;
      assert "a spawned child inherits no connection"
             (socket_count {program = "sh", args = ["-c", "python3 \"$0\" $$", dir ^ "/tcp-sockets.py"],
-                           stderr = HolbuildSpawn.Inherit} = 0))
+                           stderr = HolbuildSpawn.Inherit} = 0);
+     HolbuildHttp.close_idle ();
+     assert "close_idle closes the pooled connections"
+            (socket_count {program = "python3", args = [dir ^ "/tcp-sockets.py", self],
+                           stderr = HolbuildSpawn.Inherit} = 0);
+     (* A background pool keeps its connections for the next requests when
+        drained, and closes them when stopped. *)
+     let
+       val {add, drain, stop} =
+         HolbuildBuildExec.start_background_pool 4
+           (fn i => ignore (HolbuildHttp.get {url = url ^ "/fast", timeout = 30,
+                                              dst = dir ^ "/pool-" ^ Int.toString i ^ ".out"}))
+       fun sockets () = socket_count {program = "python3", args = [dir ^ "/tcp-sockets.py", self],
+                                      stderr = HolbuildSpawn.Inherit}
+     in
+       List.app add (List.tabulate (8, fn i => i));
+       drain ();
+       assert "a drained pool keeps its connections" (sockets () > 0);
+       stop ();
+       assert "a stopped pool closes its connections" (sockets () = 0)
+     end)
   else ()
 val _ = List.app HolbuildHttp.release_idle (List.tabulate (16, fn _ => ()))
 val _ =
