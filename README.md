@@ -1135,9 +1135,18 @@ checks, and reports `cached` if the theory's own entry already restores, or
 if an earlier build of the same action text on byte-identical dependency
 outputs left one, which it then publishes under the action's input key (early
 cutoff, DESIGN.md). Otherwise it builds the theory as a local build would,
-with the spec's proof options, and checks that the remote cache then holds an
-entry for it whose outputs equal the build's. A missing dependency fails the
-action; the worker never builds one.
+with the spec's proof options, publishes it to the remote cache (a local
+build would publish it at once; the worker waits for the checks below), and
+checks that the remote cache then holds an entry for it whose outputs equal
+the build's. An entry there with other outputs is replaced only when it records parents other than the restored
+ones, each restored from an entry with the remote cache's outputs, since no
+build against them can use it. The worker's local copy of an entry goes out
+of date when the remote cache's entry changes, so when a restored dependency
+doesn't match its parents, or the theory was built against local copies of
+its parents that differ from the remote cache's, the worker drops those
+copies, for the action's retry to restore the remote cache's; such a build
+is not published but fails as a `publish` failure. A missing dependency
+fails the action; the worker never builds one.
 
 It writes this record to `--result FILE`, or to stdout:
 
@@ -1256,7 +1265,12 @@ it without `--remote-only`, and the build exits with status 75, as below.
 The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the
 batch, or the batch fails other than by a failed proof (below), it warns and
-builds locally. A submission
+builds locally. A theory the remote cache holds may not fit the parents it
+holds, as when a nondeterministic theory was built twice; the workers can't
+use it, and the coordinator fails the batch for resubmission naming it
+(`resubmit: ... theory <input_key>`). Such a batch is resubmitted once first,
+with that theory and every theory that depends on it, for the workers to
+rebuild or recheck against the cached parents. A submission
 answered 502, 503 or 504, as a proxy in front of the coordinator answers
 while it restarts, is retried, and an event stream that breaks is
 reattached; either is given up on once the coordinator stays unavailable for
