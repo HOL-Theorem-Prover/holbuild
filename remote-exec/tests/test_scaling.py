@@ -313,7 +313,13 @@ async def test_a_heartbeat_with_no_body_still_extends_the_lease(http: httpx.Asyn
 
 
 async def test_a_malformed_host_report_is_refused(http: httpx.AsyncClient) -> None:
-    for report in ({**host_report("h1", 30.0), "leases": "many"}, host_report("h" * 65, 30.0)):
+    for report in (
+        {**host_report("h1", 30.0), "leases": "many"},
+        host_report("h" * 65, 30.0),
+        host_report("h1", 30.0, 2**53 + 1),
+        host_report("h1", 30.0, 0, -1.0),
+        host_report("h1", 101.0),
+    ):
         response = await http.post(
             "/v1/work/claim", json={"tier": "standard", "worker": "w1", "host": report}, headers=WORKER
         )

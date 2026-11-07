@@ -126,6 +126,11 @@ class QueueCounts:
     running_high: int
 
 
+# What a host report's numbers may be: within JSON's exact integers, so sums stay readable.
+Amount = Annotated[int, Field(ge=0, le=2**53)]
+Seconds = Annotated[float, Field(ge=0, le=2**53)]
+
+
 @dataclass(frozen=True)
 class HostReport:
     """What a worker reports of its host with a claim or heartbeat (``HostReport`` in worker.py): the share of CPU
@@ -134,15 +139,15 @@ class HostReport:
     report."""
 
     id: Annotated[str, Field(max_length=64)]  # the host's boot_id
-    cpu_idle_pct: float | None
-    mem_total: int | None
-    mem_available: int | None
-    budget: int | None
-    reserved: int
-    leases: int
+    cpu_idle_pct: Annotated[float, Field(ge=0, le=100)] | None
+    mem_total: Amount | None
+    mem_available: Amount | None
+    budget: Amount | None
+    reserved: Amount
+    leases: Amount
     memory_short: bool
-    memory_waits: int
-    memory_wait_s: float
+    memory_waits: Amount
+    memory_wait_s: Seconds
 
 
 @dataclass(frozen=True)

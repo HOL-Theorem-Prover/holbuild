@@ -574,6 +574,8 @@ def test_memory_waits_go_with_the_next_report_only_when_the_coordinator_cannot_h
     reporter.waited(4.0)
     with pytest.raises(OSError):
         Coordinator("http://127.0.0.1:1", "w", reporter).claim(["standard"], "w", 0)  # refused
+    with pytest.raises(OSError):
+        Coordinator("http://coordinator.invalid", "w", reporter).claim(["standard"], "w", 0)  # no such name
     coordinator = Coordinator(server.url, "w", reporter)
     server.heartbeat_statuses = [502, 200, 503]  # a 502 from a proxy with no coordinator behind it
     with pytest.raises(RuntimeError, match="answered 502"):

@@ -97,7 +97,7 @@ class Coordinator:
 
     def post_reporting(self, path: str, body: dict[str, Any], timeout: float = 30) -> tuple[int, Any]:
         """``post`` a JSON body with the host's report in it. A report that can't have reached the coordinator, as
-        when nothing listened or the proxy found no coordinator (502), goes back to be sent with the next; one that
+        when its name didn't resolve, nothing listened or the proxy found no coordinator (502), goes back to be sent with the next; one that
         may have been taken isn't sent again, so its memory waits are never counted twice. A coordinator that
         restarts forgets its hosts, so a 502 from one that took the report and then died loses nothing."""
         if self.host is None:
@@ -108,7 +108,7 @@ class Coordinator:
                 path, json.dumps({**body, "host": asdict(report)}).encode(), "application/json", timeout
             )
         except urllib.error.URLError as error:
-            if isinstance(error.reason, ConnectionRefusedError):
+            if isinstance(error.reason, (ConnectionRefusedError, socket.gaierror)):
                 self.host.unsent(report)
             raise
         if status == 502:
