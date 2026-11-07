@@ -19,9 +19,24 @@ CLIENT = {"Authorization": f"Bearer {CLIENT_TOKEN}"}
 WORKER = {"Authorization": f"Bearer {WORKER_TOKEN}"}
 
 
-def counts(ready: int = 0, running: int = 0, ready_high: int = 0, running_high: int = 0) -> QueueCounts:
+def counts(
+    ready: int = 0,
+    running: int = 0,
+    ready_high: int = 0,
+    running_high: int = 0,
+    ready_run: int = 0,
+    running_run: int = 0,
+    high_run: int = 0,
+) -> QueueCounts:
     return QueueCounts(
-        waiting=0, ready_standard=ready, ready_high=ready_high, running_standard=running, running_high=running_high
+        waiting=0,
+        ready_standard=ready,
+        ready_high=ready_high,
+        running_standard=running,
+        running_high=running_high,
+        ready_run=ready_run,
+        running_run=running_run,
+        high_run=high_run,
     )
 
 
@@ -97,20 +112,26 @@ async def test_queue_reports_counts_and_the_desired_burst_workers(
     scaled, _ = scaled_coordinator(coordinator, tmp_path, "")
     await submit(http, ["a", "b", "c"], [("c", "a")])
     assert await claim(http) is not None
+    await submit(http, ["r1", "r2", "r3"], **{"class": "run"})
+    async with coordinator.engine.begin() as connection:
+        await connection.execute(sa.text("UPDATE actions SET tier = 'high' WHERE theory = 'pkg:r1'"))
+    assert await claim(http, "high") is not None
     await scaled.sweep()
 
     response = await http.get("/v1/queue", headers=CLIENT)
     assert response.status_code == 200
     assert response.json() == {
         "waiting": 1,
-        "ready_standard": 1,
+        "ready_standard": 3,
         "ready_high": 0,
         "running_standard": 1,
-        "running_high": 0,
+        "running_high": 1,
+        "ready_run": 2,
+        "running_run": 1,
         "desired_burst_workers": 0,  # the route's coordinator has no burst workers to ask for
         "hosts": [],
     }
-    assert (await scaled.queue()).desired_burst_workers == 1
+    assert (await scaled.queue()).desired_burst_workers == 4
     assert (await http.get("/v1/queue", headers=WORKER)).status_code == 401
 
 
@@ -332,3 +353,31 @@ async def test_reports_from_more_hosts_than_it_remembers_are_dropped(
 
     assert [host.report.cpu_idle_pct for host in (await coordinator.queue()).hosts] == [10.0, 50.0]
     assert sorted(coordinator.hosts) == ["h1", "h2"]
+
+
+@pytest.mark.parametrize(
+    ("queue", "slots", "expected"),
+    [
+        (counts(ready=50, ready_run=50), 2, 0),
+        (counts(ready=50, ready_run=50), 0, 0),
+        (counts(ready=53, running=1, ready_run=50), 2, 4),
+        (counts(ready=10, running=10, ready_run=10, running_run=10), 3, 1),
+        (counts(ready_high=50, ready_run=50, high_run=50), 2, 2),
+        (counts(ready_high=50, ready_run=50, high_run=50), 0, 0),
+        (counts(ready_high=53, ready_run=50, high_run=50), 2, 5),
+        (counts(ready_high=20, ready_run=10, high_run=10), 1, 11),
+        (counts(ready_high=50, ready_run=20, high_run=20), 2, 16),
+    ],
+)
+def test_burst_demand_caps_both_standard_and_high_run_contributions(
+    queue: QueueCounts, slots: int, expected: int
+) -> None:
+    assert burst_demand(queue, warm_workers=2, max_burst_workers=16, run_slots=slots) == expected
+
+
+def test_run_slots_defaults_to_thirty_and_rejects_negative_values(coordinator: Coordinator) -> None:
+    settings = coordinator.settings.model_dump()
+    settings.pop("run_slots")
+    assert Settings(**settings).run_slots == 30
+    with pytest.raises(ValidationError):
+        Settings(**settings, run_slots=-1)

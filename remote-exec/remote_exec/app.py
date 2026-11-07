@@ -13,7 +13,7 @@ from dataclasses import asdict
 from typing import Literal
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, SecretStr
 
@@ -104,12 +104,16 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         return JSONResponse({"detail": "internal error"}, status_code=500)
 
     @app.post("/v1/batches", status_code=201, dependencies=client)
-    async def submit(request: Request, profile: str = "default") -> dict[str, UUID]:
+    async def submit(
+        request: Request,
+        profile: str = "default",
+        action_class: Literal["build", "run"] = Query(default="build", alias="class"),
+    ) -> dict[str, UUID]:
         try:
             batch = parse_batch(await text_body(request))
         except FormatError as error:
             raise HTTPException(400, str(error)) from error
-        return {"batch_id": await coordinator.submit(batch, profile)}
+        return {"batch_id": await coordinator.submit(batch, profile, action_class)}
 
     @app.get("/v1/batches/{batch_id}", dependencies=client)
     async def status(batch_id: UUID) -> dict[str, object]:
@@ -159,7 +163,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
     async def queue() -> dict[str, object]:
         status = await coordinator.queue()
         return {
-            **asdict(status.counts),
+            **{k: v for k, v in asdict(status.counts).items() if k != "high_run"},
             "desired_burst_workers": status.desired_burst_workers,
             "hosts": [{**asdict(host.report), "age_s": host.age_s} for host in status.hosts],
         }

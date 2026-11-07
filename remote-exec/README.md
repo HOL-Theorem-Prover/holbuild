@@ -44,6 +44,13 @@ docker run -p 8090:8090 -e REMOTE_EXEC_DATABASE_URL=... -e REMOTE_EXEC_CLIENT_TO
 Without the image, from this directory: `uv sync`, then `uv run alembic
 upgrade head` and `uv run uvicorn --factory remote_exec.app:app --port 8090`.
 
+Migration `0005` adds the action class and its indexes; run migrations with
+the coordinator stopped. To roll back to an image predating `0005`, first
+pause run admission (`REMOTE_EXEC_RUN_SLOTS=0`, then restart), let running
+runs finish and cancel queued run batches. Use the current image to run
+`alembic downgrade 0004` before starting the older image, whose migration
+code does not know revision `0005`.
+
 The coordinator reads its settings from the environment:
 
 | Variable | Meaning | Default |
@@ -62,6 +69,7 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_DATABASE_POOL_TIMEOUT_S` | how long a request waits for a free connection before it fails | 10 |
 | `REMOTE_EXEC_EVENTS_KEEPALIVE_SECONDS` | how long an event stream stays quiet before it sends an empty line | 15 |
 | `REMOTE_EXEC_SWEEP_SECONDS` | period of the sweep (lease expiry, releases, retention, scaling) | 5 |
+| `REMOTE_EXEC_RUN_SLOTS` | fleet-wide running run-action cap; 0 pauses new run claims | 30 |
 | `REMOTE_EXEC_WARM_WORKERS` | always-on standard-tier workers | 0 |
 | `REMOTE_EXEC_MAX_BURST_WORKERS` | most burst workers to ask for | 0 |
 | `REMOTE_EXEC_SCALE_DOWN_HOLD_S` | how long a higher burst worker count is kept after demand drops | 900 |
@@ -119,8 +127,13 @@ action <input_key> <ac-key> <spec-sha256> <package>:<theory>
 edge <input_key> <parent input_key>
 ```
 
-Each `action` line is one theory to build; each `edge` says a theory needs
-another theory of the same batch first. Parents that were already cached at
+A batch has one class: `build` (the default) or `run`, selected with
+`POST /v1/batches?class=run`. Run actions execute submitted scripts in cached
+HOL contexts through the same worker protocol. The coordinator stores the
+class on every action and treats its `input_key` as opaque.
+
+Each `action` line is one theory to build or one script to run; each `edge`
+says a theory needs another theory of the same batch first. Parents that were already cached at
 export have no edge.
 
 An action moves through these states:
@@ -131,12 +144,15 @@ An action moves through these states:
 | `ready` | claimable by a worker of its tier |
 | `running` | leased to a worker |
 | `done` | built, or found already cached |
-| `failed` | failed finally; the batch failed with it |
+| `failed` | failed finally; a build batch fails with it, while other actions of a run batch continue |
 | `cancelled` | its batch was cancelled or failed |
 
 A batch is `running` until every action is `done` (then `done`), one fails
 finally (`failed`, with a `failure` message), or the client cancels it
-(`cancelled`).
+(`cancelled`). A run batch instead finishes `done` once every action is
+`done` or `failed`; each failed action retains its `last_failure` and log in
+status and events. A batch-level `deadline` or `resubmit` failure still ends
+a run batch and cancels its unfinished actions.
 
 ## Scheduling rules
 
@@ -154,9 +170,13 @@ finally (`failed`, with a `failure` message), or the client cancels it
   rebuilds the parent. Other coordinator processes keep trusting their own
   findings until the 60 s run out, so with several the child may spend
   another attempt.
-- **Claims** take a ready action of the worker's tier (or, when it has none,
-  of its `also_claim` tiers, in order, so a burst worker builds every ready
-  high-tier action before standard overflow) with `FOR UPDATE SKIP LOCKED`,
+- **Claims** take builds before runs across all tiers the worker accepts,
+  then prefer the worker's tier over its `also_claim` tiers, in order. A
+  burst worker takes a standard-tier build before a high-tier run.
+  Run admission is serialized across coordinator replicas and permits at
+  most `REMOTE_EXEC_RUN_SLOTS` running run actions fleet-wide; 0 pauses new
+  runs without stopping actions already running. Build claims never wait
+  for run admission. Claims select with `FOR UPDATE SKIP LOCKED`,
   write a lease with an expiry and commit; no transaction stays open while
   the worker builds. Among the running batches, the claim picks the one with
   the fewest running actions, then the one that least recently had an action
@@ -180,7 +200,7 @@ finally (`failed`, with a `failure` message), or the client cancels it
   | `disk` | retried once; a second `disk` in a row, or `MAX_ATTEMPTS` claims, is final |
   | `input-missing` naming a theory of the batch other than the action itself or one that depends on it | that theory is built again and the action waits for it, until the action has been claimed `MAX_ATTEMPTS` times |
   | any other `input-missing` (a blob, a theory cached at export, or one that can't be the action's input) | retried, since a restore that fails on a network error reports its input missing too; after `MAX_ATTEMPTS` claims the batch fails with `resubmit: …`, naming the theory as `theory <input_key>`; the client resubmits once with that theory and every theory that depends on it, and otherwise the next build exports a new batch |
-  | `proof`, `tactic-timeout`, `spec-rejected` | final |
+  | `proof`, `tactic-timeout`, `spec-rejected`, `script`, `timeout` | final; `script` means the script failed or omitted an output, `timeout` means it exceeded its time limit |
 
   A worker whose `exec-action` ends without a result record (it crashed or
   was killed) reports `internal` for it, so it is retried at once rather
@@ -189,7 +209,9 @@ finally (`failed`, with a `failure` message), or the client cancels it
   A retried action waits again like a child, so it runs only once the cache
   holds its parents again, or held them within the 60 s above (one may have
   been rebuilt meanwhile); an expired lease is retried the same way. A final failure fails
-  the batch and cancels its unfinished actions.
+  a build batch and cancels its unfinished actions; a final run-action
+  failure affects only that action. Exhausted leases record `internal` on
+  the failed run action.
 - **Placement.** Each built result's `peak-rss-mb` raises the hint for
   `(package, theory, profile)`, and a memory failure on the standard tier
   raises it to `STANDARD_TIER_MB`; a run that takes less never lowers it,
@@ -216,7 +238,15 @@ which an external scaler starts and stops. On every sweep the coordinator
 works out how many burst workers the queue needs: every ready or running
 action beyond the warm workers, but at least one per ready or running
 high-tier action, since warm workers take only standard-tier work, and at
-most `REMOTE_EXEC_MAX_BURST_WORKERS`.
+most `REMOTE_EXEC_MAX_BURST_WORKERS`. Runs contribute only up to
+`REMOTE_EXEC_RUN_SLOTS` in both the total and high-tier demand terms;
+high-tier builds remain uncapped except by `MAX_BURST_WORKERS`:
+
+```text
+active = ready_build + running_build + min(RUN_SLOTS, ready_run + running_run)
+high = ready_high_build + running_high_build + min(RUN_SLOTS, ready_high_run + running_high_run)
+demand = min(MAX_BURST_WORKERS, max(0, active - WARM_WORKERS, high))
+```
 
 A build's dependency graph narrows and widens: a few theories everything else
 waits on run alone, then many become ready together. Following the queue
@@ -275,8 +305,9 @@ gets 401. Errors are JSON `{"detail": "<message>"}`.
 
 ### Client
 
-`POST /v1/batches?profile=<name>` with the batch text as the body
-(`text/plain`). `profile` defaults to `default`.
+`POST /v1/batches?profile=<name>&class=build|run` with the batch text as the body
+(`text/plain`). `profile` defaults to `default`; `class` defaults to `build`.
+An unknown class returns 422.
 
 - 201 `{"batch_id": "<uuid>"}`
 - 400 when the batch is malformed (bad header or line, duplicate action, an
@@ -328,10 +359,12 @@ gets 401. Errors are JSON `{"detail": "<message>"}`.
 
 `GET /v1/queue`
 
-- 200 `{"waiting": 0, "ready_standard": 0, "ready_high": 0, "running_standard": 0, "running_high": 0, "desired_burst_workers": 0, "hosts": [<host>, …]}`:
+- 200 `{"waiting": 0, "ready_standard": 0, "ready_high": 0, "running_standard": 0, "running_high": 0, "ready_run": 0, "running_run": 0, "desired_burst_workers": 0, "hosts": [<host>, …]}`:
   the unfinished actions of running batches, the burst worker target, and the
   hosts whose workers reported to this coordinator process in the last 2
-  minutes, by id. A host is its workers' latest report, `age_s` seconds old,
+  minutes, by id. Tier counts include both classes; `ready_run` and
+  `running_run` are the run subsets across tiers. A host is its workers'
+  latest report, `age_s` seconds old,
   except that `cpu_idle_pct` is the latest one measured:
   ```json
   {"id": "<boot_id>", "cpu_idle_pct": 31.5, "mem_total": 133680000000, "mem_available": 61200000000, "budget": 120800000000, "reserved": 92300000000, "leases": 29, "memory_short": false, "age_s": 1.2}
