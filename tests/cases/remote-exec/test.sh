@@ -1122,6 +1122,52 @@ heap_key=$(awk '$1 == "action" && $5 == "rxheap:HeapTheory" { print $2 }' "$stat
 heap_log=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$state/result-$heap_key")
 require_grep '^heap-child-argv: .*/bin/hol .*--maxheap 4096 run ' "$remote_root/cas/$heap_log"
 
+# A worker strengthens a timeout-free entry, while the client still has its
+# older local manifest. The restore must pick up the stronger remote contract.
+copy_nondet timeout-contract rxtimeout
+cat > "$tmpdir/timeout-contract/src/TimeoutScript.sml" <<'SML'
+Theory Timeout
+Ancestors bool
+
+Theorem timeout_thm:
+  T
+Proof
+  simp[]
+QED
+SML
+in_copy timeout-contract --remote-cache "$remote_url" build --tactic-timeout 0 TimeoutTheory \
+  > "$tmpdir/timeout-seed.log" 2>&1 || { cat "$tmpdir/timeout-seed.log" >&2; exit 1; }
+timeout_metadata=$tmpdir/timeout-contract/.holbuild/dep/rxtimeout/src/TimeoutScript.sml.key
+require_grep '^proof_timeout=none$' "$timeout_metadata"
+cp "$timeout_metadata" "$tmpdir/timeout-weak-metadata"
+timeout_key=$(sed -n 's/^input_key=//p' "$timeout_metadata")
+timeout_manifest=$tmpdir/timeout-contract-cache/actions/$timeout_key/manifest
+cp "$timeout_manifest" "$tmpdir/timeout-weak-manifest"
+timeout_ac=$(printf 'holbuild-remote-ac-v1\n%s\n' "$timeout_key" | sha256sum | cut -d' ' -f1)
+require_grep '^proof-timeout=none$' "$remote_root/ac/$timeout_ac"
+in_copy timeout-contract --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only --tactic-timeout 2.5 TimeoutTheory > "$tmpdir/timeout-strict.log" 2>&1 ||
+  { cat "$tmpdir/timeout-strict.log" "$tmpdir/worker.log" >&2; exit 1; }
+require_grep 'remote execution: remote workers finished 1 of 1 theories' "$tmpdir/timeout-strict.log"
+require_grep 'TimeoutTheory restored from cache' "$tmpdir/timeout-strict.log"
+refute_grep 'Theory built' "$tmpdir/timeout-strict.log"
+require_grep '^proof-timeout=2.5$' "$remote_root/ac/$timeout_ac"
+require_grep '^proof-timeout=2.5$' "$timeout_manifest"
+require_grep '^proof_timeout=2.5$' "$timeout_metadata"
+
+# The remote entry can already be strong before planning, so no batch runs.
+# Put back the client's older manifest and metadata to exercise that case.
+cp "$tmpdir/timeout-weak-manifest" "$timeout_manifest"
+cp "$tmpdir/timeout-weak-metadata" "$timeout_metadata"
+in_copy timeout-contract --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only --tactic-timeout 2.5 TimeoutTheory > "$tmpdir/timeout-cached.log" 2>&1 ||
+  { cat "$tmpdir/timeout-cached.log" >&2; exit 1; }
+require_grep 'remote execution: nothing to build remotely' "$tmpdir/timeout-cached.log"
+require_grep 'TimeoutTheory restored from cache' "$tmpdir/timeout-cached.log"
+refute_grep 'remote batch\|Theory built' "$tmpdir/timeout-cached.log"
+require_grep '^proof-timeout=2.5$' "$timeout_manifest"
+require_grep '^proof_timeout=2.5$' "$timeout_metadata"
+
 # Two-phase generated_source_owners remote build: Phase 1 builds Gen2Theory on
 # the remote worker and restores Gen2ML.sml; Phase 2 replans and builds
 # AfterGenTheory (which depends on Use2Lib -> Gen2ML) on the remote worker.

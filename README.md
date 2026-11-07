@@ -751,7 +751,9 @@ always_reexecute = true
   read as `../data/table.txt` (the stage mirrors the package layout, so such
   copies stay inside it); absolute paths and `..` components are rejected. A
   directory or glob names the files under it, skipping any `.holbuild/`
-  directory inside it.
+  directory inside it. Before hashing or staging these files, holbuild runs
+  the generators whose declared outputs match the file, directory, or glob,
+  including outputs that do not exist yet. Unrelated generators stay idle.
 - `cache = false` disables global cache restore/publish for the action.
 - `always_reexecute = true` disables local up-to-date skipping for the action.
 
@@ -1675,6 +1677,11 @@ the build restores those theories from the local cache, or from the remote cache
 whatever is not there yet. The coordinator's credentials go
 in a curl config file named by `HOLBUILD_REMOTE_EXEC_CURL_CONFIG`, such as
 `header = "Authorization: Bearer <token>"`, so they stay off the command line.
+
+If a local cache entry has a weaker tactic-timeout contract than requested,
+restore refreshes it from the remote cache once. This picks up a stronger
+contract published by a worker without discarding the older entry when the
+remote has no usable replacement.
 
 When the batch ends, one line says how many of its theories the remote
 workers finished, built or found cached (`holbuild: remote execution: remote

@@ -26,8 +26,10 @@ from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
-from remote_exec.cache import cache_nodes, ranked_nodes
+from remote_exec.cache import cache_nodes, node_identity, ranked_nodes
+from remote_exec.cache_pool import HELD_TARGET, CachePool, CacheSlot, CommandAdapter
 from remote_exec.formats import Batch, Result
+from remote_exec.membership import REFRESH_SECONDS, Membership
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +88,11 @@ class Settings(BaseSettings):
     warm_workers: int = 0
     max_burst_workers: int = 0
     scale_down_hold_s: float = 900.0
+    cache_pool_cmd: str | None = None
+    cache_slots: list[CacheSlot] = Field(default_factory=list)
+    cache_workers_per_node: int = Field(default=15, ge=0)
+    cache_drain_seconds: int = Field(default=60, ge=60)
+    cache_launch_timeout_seconds: int = Field(default=900, gt=0)
     scale_cmd: str | None = None  # run as `<scale_cmd> <desired burst workers>` when that number changes
 
     @field_validator("cache_url")
@@ -360,11 +367,9 @@ LIMIT 1 FOR UPDATE OF a SKIP LOCKED
 """)
 
 
-# The burst worker target at :now: the highest demand recorded in the hold before it, under the current cap.
-HELD_TARGET = sa.text(
-    "SELECT least(coalesce(max(workers), 0), :cap) FROM burst_demand "
-    "WHERE at >= CAST(:now AS timestamptz) - make_interval(secs => :hold)"
-)
+def _claim_rank(tiers: list[str], host_id: str | None) -> tuple[bool, bool, str]:
+    """Pack standard work onto warm workers first, then hosts in a stable order."""
+    return tiers[0] != "standard", host_id is None, host_id or ""
 
 
 class Coordinator:
@@ -375,12 +380,20 @@ class Coordinator:
         self.cache = cache
         self.settings = settings
         self.cache_nodes = cache_nodes(settings.cache_url)
+        self.membership = Membership(self.cache_nodes, [slot.url for slot in settings.cache_slots])
+        self.membership_lock = asyncio.Lock()
         self.clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+        self.cache_pool = (CachePool(engine, settings.cache_slots, CommandAdapter(settings.cache_pool_cmd),
+                                     drain_seconds=settings.cache_drain_seconds, hold_seconds=settings.scale_down_hold_s,
+                                     workers_per_node=settings.cache_workers_per_node,
+                                     max_workers=settings.max_burst_workers,
+                                     launch_timeout_seconds=settings.cache_launch_timeout_seconds)
+                           if settings.cache_pool_cmd else None)
         self.scaler: ScaleRun | None = None  # the scale command's last run
-        # How many actions this process's release has made ready, and the claims waiting, by the tiers they take
-        # and the future that wakes them, oldest first; see claim.
+        # How many actions this process's release has made ready, and waiting claims' tiers, host and wake,
+        # oldest first (the tie-breaker within a host); see claim.
         self.made_ready = 0
-        self.claim_waiters: list[tuple[list[str], asyncio.Future[None]]] = []
+        self.claim_waiters: list[tuple[list[str], str | None, asyncio.Future[str]]] = []
         # When each cache entry was last found, the checks of the cache under way, and how many times
         # input-missing results forgot both; see _in_cache.
         self.found_in_cache: dict[str, float] = {}
@@ -540,6 +553,7 @@ class Coordinator:
         worker: str,
         wait_s: float = 0,
         disconnected: Callable[[], Awaitable[bool]] | None = None,
+        host_id: str | None = None,
     ) -> Claim | None:
         """Lease a ready action to ``worker``, waiting up to ``wait_s`` seconds for one, or None if none became
         ready: of the first of ``tiers`` that has one, the batch with the fewest running actions, then the one
@@ -547,26 +561,35 @@ class Coordinator:
         dependents, then the most dependents.
 
         A wait ends early once ``disconnected`` says the worker has gone, so no action is leased to nobody. Each
-        action this process's ``release`` makes ready wakes the longest waiting claim that takes its tier, not
-        every waiting claim, so hundreds of waiting workers don't all query for it. Waits recheck every
+        action this process's ``release`` makes ready wakes one compatible claim, preferring warm workers then
+        hosts in canonical order, with FIFO ties. Unwoken claims defer each tier to better-ranked waiters, so
+        polling workers don't spread work back onto tail hosts. Waits recheck every
         ``CLAIM_RECHECK_SECONDS``, for actions another coordinator process made ready and for an action whose
         woken claim took another one or lost it to another claim; a claim woken that leaves without trying wakes
         the next.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wait_s
+        rank = _claim_rank(tiers, host_id)
         woken: asyncio.Future[str] = loop.create_future()  # done once a wake was handed to this claim
         try:
             while True:
                 # Taken before the attempt, so an action made ready during it is tried at once, not waited for.
                 made_ready = self.made_ready
-                claimed = await self._claim(tiers, worker)
+                eligible_tiers = tiers if woken.done() else [
+                    tier for tier in tiers
+                    if not any(
+                        tier in w_tiers and not w_woken.done() and _claim_rank(w_tiers, w_host) < rank
+                        for w_tiers, w_host, w_woken in self.claim_waiters
+                    )
+                ]
+                claimed = await self._claim(eligible_tiers, worker) if eligible_tiers else None
                 remaining = deadline - loop.time()
                 if claimed is not None or remaining <= 0:
                     return claimed
                 woken = loop.create_future()
                 if self.made_ready == made_ready:
-                    waiter = (tiers, woken)
+                    waiter = (tiers, host_id, woken)
                     self.claim_waiters.append(waiter)
                     try:
                         with contextlib.suppress(TimeoutError):
@@ -628,14 +651,16 @@ class Coordinator:
         return Claim(token, row.spec_sha256, row.input_key, row.theory, self.settings.lease_seconds, row.max_heap_mb)
 
     def _wake_claim(self, tier: str) -> None:
-        """Count an action of ``tier`` made ready, and wake the longest waiting claim that takes it."""
+        """Count an action of ``tier`` made ready, and wake its best-ranked compatible claim, with FIFO ties."""
         self.made_ready += 1
-        for waiter in self.claim_waiters:
-            tiers, woken = waiter
-            if tier in tiers and not woken.done():
-                woken.set_result(tier)
-                self.claim_waiters.remove(waiter)
-                return
+        waiter = min(
+            (w for w in self.claim_waiters if tier in w[0] and not w[2].done()),
+            key=lambda w: _claim_rank(w[0], w[1]),
+            default=None,
+        )
+        if waiter is not None:
+            waiter[2].set_result(tier)
+            self.claim_waiters.remove(waiter)
 
     def _pass_wake(self, woken: asyncio.Future[str]) -> None:
         """Hand the wake of a claim leaving without trying, if it got one, to the next claim that takes its tier."""
@@ -1095,11 +1120,32 @@ class Coordinator:
         self.cache_checks.clear()
         self.cache_forgotten += 1
 
+    async def cache_read_nodes(self, digest: str) -> list[str]:
+        """Refresh ready slots at most once per thirty seconds, retaining the permanent fallback."""
+        if self.cache_pool is None:
+            return ranked_nodes(self.cache_nodes, digest)[:2]
+        now = asyncio.get_running_loop().time()
+        if now - self.membership.attempted >= REFRESH_SECONDS:
+            async with self.membership_lock:
+                if now - self.membership.attempted >= REFRESH_SECONDS:
+                    self.membership.attempted = now
+                    try:
+                        members = self.cache_nodes + await self.cache_pool.ready_urls()
+                        text = "holbuild-cache-members-v1\n" + "\n".join(node_identity(url) for url in members)
+                        self.membership.update(text, now)
+                    except sa.exc.SQLAlchemyError:
+                        logger.warning("cache membership query failed; retaining the permanent fallback")
+        return ranked_nodes(self.membership.current(now), digest)
+
     async def _check_cache(self, ac_key: str, limit: asyncio.Semaphore) -> bool | None:
         forgotten = self.cache_forgotten
         missing = False
         failure: httpx.Response | None = None
-        for node in ranked_nodes(self.cache_nodes, ac_key)[:2]:
+        nodes = await self.cache_read_nodes(ac_key)
+        joining = self.membership.joining(asyncio.get_running_loop().time())
+        for attempt, node in enumerate(nodes, 1):
+            if attempt == 3 and not joining and missing:
+                break
             try:
                 async with limit:
                     response = await self.cache.get(f"{node}/ac/{ac_key}")

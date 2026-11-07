@@ -620,6 +620,123 @@ async def test_a_woken_claim_cancelled_hands_its_wake_to_the_next(
         await first
 
 
+@pytest.mark.parametrize(
+    ("tier", "workers", "order"),
+    [
+        ("standard", [(["high", "standard"], "host-a"), (["standard"], "warm")], [1, 0]),
+        ("standard", [(["high", "standard"], "host-b"), (["high", "standard"], "host-a")], [1, 0]),
+        ("high", [(["standard"], "warm"), (["high", "standard"], "host-b")], [1]),
+        ("high", [(["high"], None), (["high"], "host-a"), (["high"], "host-a")], [1, 2, 0]),
+    ],
+)
+async def test_wakes_pack_compatible_hosts_with_fifo_ties(
+    coordinator: Coordinator, tier: str, workers: list[tuple[list[str], str | None]], order: list[int]
+) -> None:
+    loop = asyncio.get_running_loop()
+    wakes = [loop.create_future() for _ in workers]
+    coordinator.claim_waiters = [(tiers, host, wake) for (tiers, host), wake in zip(workers, wakes)]
+    cancelled = loop.create_future()
+    cancelled.cancel()
+    coordinator.claim_waiters.insert(0, ([tier], "host-0", cancelled))
+    for index in order:
+        coordinator._wake_claim(tier)
+        assert wakes[index].result() == tier
+        assert all(wake.done() == (i in order[:order.index(index) + 1]) for i, wake in enumerate(wakes))
+    coordinator._wake_claim(tier)
+    assert coordinator.made_ready == len(order) + 1
+
+
+@pytest.mark.parametrize("waiting_tiers", [["high", "standard"], ["standard"]])
+async def test_new_tail_host_claim_defers_ready_work_to_a_better_waiter(
+    http: httpx.AsyncClient, coordinator: Coordinator, waiting_tiers: list[str]
+) -> None:
+    batch_id = await submit(http, ["a"])
+    wake = asyncio.get_running_loop().create_future()
+    waiter = (waiting_tiers, "host-a", wake)
+    coordinator.claim_waiters.append(waiter)
+    assert await coordinator.claim(["high", "standard"], "tail", host_id="host-b") is None
+    assert await states(http, batch_id) == {"a": "ready"}
+    coordinator.claim_waiters.remove(waiter)
+    claimed = await coordinator.claim(waiting_tiers, "preferred", host_id="host-a")
+    assert claimed is not None and claimed.theory == "pkg:a"
+
+
+async def test_rechecking_tail_host_defers_ready_work_to_a_better_waiter(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 0.01)
+    attempts = 0
+    checks = 0
+    batch_id = ""
+    claim_once = coordinator._claim
+    wake = asyncio.get_running_loop().create_future()
+    waiter = (["high", "standard"], "host-a", wake)
+
+    async def counted(tiers: list[str], worker: str) -> Any:
+        nonlocal attempts
+        attempts += 1
+        return await claim_once(tiers, worker)
+
+    async def disconnected() -> bool:
+        nonlocal checks, batch_id
+        checks += 1
+        if checks == 1:
+            # The polling claim has left claim_waiters, so this ready action doesn't wake it.
+            batch_id = await submit(http, ["a"])
+            coordinator.claim_waiters.append(waiter)
+        return checks == 2
+
+    monkeypatch.setattr(coordinator, "_claim", counted)
+    assert await coordinator.claim(["high", "standard"], "tail", 10, disconnected, "host-b") is None
+    assert checks == 2 and attempts == 1
+    assert await states(http, batch_id) == {"a": "ready"}
+    coordinator.claim_waiters.remove(waiter)
+    claimed = await coordinator.claim(["high", "standard"], "preferred", host_id="host-a")
+    assert claimed is not None and claimed.theory == "pkg:a"
+
+
+async def test_burst_can_claim_high_while_warm_waits_for_standard(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    await submit(http, ["a", "b"])
+    async with coordinator.engine.begin() as conn:
+        await conn.execute(sa.text("UPDATE actions SET tier = 'high' WHERE theory = 'pkg:b'"))
+    wake = asyncio.get_running_loop().create_future()
+    coordinator.claim_waiters.append((["standard"], "warm", wake))
+    claimed = await coordinator.claim(["high", "standard"], "burst", host_id="host-a")
+    assert claimed is not None and claimed.theory == "pkg:b"
+    assert not wake.done()
+
+
+async def test_explicitly_woken_claim_is_not_blocked_by_a_new_better_waiter(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await submit(http, ["a"])
+    claim_once = coordinator._claim
+    attempts = 0
+
+    async def missed(tiers: list[str], worker: str) -> Any:
+        nonlocal attempts
+        attempts += 1
+        return None if attempts == 1 else await claim_once(tiers, worker)
+
+    monkeypatch.setattr(coordinator, "_claim", missed)
+    waiting = asyncio.create_task(coordinator.claim(["standard"], "tail", 10, host_id="host-b"))
+    try:
+        async with asyncio.timeout(5):
+            while not coordinator.claim_waiters:
+                await asyncio.sleep(0)
+        coordinator._wake_claim("standard")
+        # A new better waiter must not block the explicit wake before the tail host resumes.
+        wake = asyncio.get_running_loop().create_future()
+        coordinator.claim_waiters.append((["standard"], "host-a", wake))
+        claimed = await asyncio.wait_for(waiting, 5)
+        assert claimed is not None and claimed.theory == "pkg:a"
+    finally:
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+
+
 async def test_a_waiting_claim_whose_worker_left_leases_nothing(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
