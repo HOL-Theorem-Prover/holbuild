@@ -757,9 +757,13 @@ fun build_resolved_dependency_graph components analysis lookup selected =
       let
         fun one (SymbolicDependency {from_node, name, reason}) =
           case reason of
+              (* A project module is loaded by path; by name, only a
+                 project-aware loadPath would find it. *)
               DeclaredActionLoad =>
-                [{from_node = from_node, name = name,
-                  kind = ExternalLibrary, reason = reason}]
+                if no_candidate node reason name then
+                  [{from_node = from_node, name = name,
+                    kind = ExternalLibrary, reason = reason}]
+                else []
             | DeclaredExtraInput =>
                 [{from_node = from_node, name = name,
                   kind = ExternalInput, reason = reason}]

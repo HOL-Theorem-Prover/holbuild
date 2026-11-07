@@ -626,7 +626,9 @@ always_reexecute = true
 ```
 
 - `deps` adds logical project dependencies.
-- `loads` adds modules/libraries to load before the action.
+- `loads` adds modules/libraries to load before the action. A name that is a
+  project module is loaded from its object path, like an inferred dependency;
+  any other name is loaded by name from HOL's load path.
 - `extra_deps` adds package-root-relative filesystem inputs that are hashed
   into the action key and copied into the action's stage directory at their
   path relative to the script, so `data/table.txt` for `src/FooScript.sml` is
