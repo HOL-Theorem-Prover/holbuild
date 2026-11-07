@@ -7449,8 +7449,12 @@ fun spec_parent_hashes_match root spec data_path =
   spec_parent_hashes_match_in (new_file_hash_cache ()) root spec data_path
 
 (* Step 3: sources and library manifests from the spec, dependency theories
-   from the cache. *)
-fun hydrate_spec_deps remote root (spec : spec_deps) =
+   from the cache.  A worker's local copy of an entry goes out of date when
+   the remote's entry for its key changes; the remote's replaces it for the
+   dependencies selected by direct, which a build records as parents even
+   when their copies fit the rest, and for all of them when one doesn't fit
+   the others. *)
+fun hydrate_spec_deps remote root (spec : spec_deps) direct =
   let
     fun fetch_library {path, sha256, ...} =
       fetch_spec_blob remote {hash = sha256, dst = in_root root path}
@@ -7458,7 +7462,6 @@ fun hydrate_spec_deps remote root (spec : spec_deps) =
     fun write_lib {stem, suffix, loads, ...} =
       (ensure_parent (in_root root stem);
        write_object_manifest (in_root root (stem ^ suffix)) (map lib_load loads))
-    val dat_hashes = new_file_hash_cache ()
     fun restore_dep {target, stem, key} =
       (ensure_parent (in_root root stem);
        restore_spec_theory root spec
@@ -7467,19 +7470,41 @@ fun hydrate_spec_deps remote root (spec : spec_deps) =
            | e => raise action_failed (InputMissing ("theory " ^ key))
                           ("dependency " ^ target ^ " (" ^ key ^ ") is not restorable from the cache: " ^
                            General.exnMessage e)
+    (* One check of the restored files, hashing each once. *)
+    fun misfit () =
+      let val dat_hashes = new_file_hash_cache ()
+      in
+        List.find
+          (fn {stem, ...} => not (spec_parent_hashes_match_in dat_hashes root spec (in_root root (stem ^ ".dat"))))
+          (#deps spec)
+      end
+    fun refresh wanted = if drop_stale_dep_copies remote spec wanted then List.app restore_dep (#deps spec) else ()
   in
     List.app fetch_library (#libraries spec);
     List.app write_lib (#libs spec);
     List.app restore_dep (#deps spec);
-    List.app
-      (fn {target, stem, key} =>
-          if spec_parent_hashes_match_in dat_hashes root spec (in_root root (stem ^ ".dat")) then ()
-          else
-            (* Out-of-date local copies would fail the next attempt too. *)
-            (ignore (drop_stale_dep_copies remote spec (fn _ => true));
-             raise ActionFailed (InputMissing ("theory " ^ key),
-                                 "dependency " ^ target ^ " does not match its parents in the cache")))
-      (#deps spec)
+    refresh direct;
+    if Option.isSome (misfit ()) then refresh (fn _ => true) else ();
+    case misfit () of
+        NONE => ()
+      | SOME {target, key, ...} =>
+          raise ActionFailed (InputMissing ("theory " ^ key),
+                              "dependency " ^ target ^ " does not match its parents in the cache")
+  end
+
+(* The stems of the project objects the build loads: the ones its preload
+   names and, through the libraries among them (a library with a signature
+   has a manifest for each), the ones those load. *)
+fun spec_loaded_stems (spec : action_spec) =
+  let
+    fun visit (stem, seen) =
+      if List.exists (fn s => s = stem) seen then seen
+      else
+        List.foldl visit (stem :: seen)
+          (List.concat (map (fn {loads, ...} => List.filter (CharVector.exists (fn c => c = #"/")) loads)
+                            (List.filter (fn lib => #stem lib = stem) (#libs spec))))
+  in
+    List.foldl visit [] (List.mapPartial (fn LoadObject stem => SOME stem | _ => NONE) (#loads spec))
   end
 
 fun hydrate_action_root remote root (spec : action_spec) =
@@ -7491,20 +7516,29 @@ fun hydrate_action_root remote root (spec : action_spec) =
     fetch_file (#source spec);
     List.app fetch_file (#inputs spec);
     hydrate_spec_deps remote root (theory_spec_deps spec)
+      (fn {stem, ...} => List.exists (fn loaded => loaded = stem) (spec_loaded_stems spec))
   end
 
-(* Step 4: the action's own entry restores with full validation. *)
-fun action_already_done root (spec : action_spec) =
+(* Step 4: the action's own entry restores with full validation, the
+   remote's when the local copy doesn't fit the restored parents and differs
+   from it. *)
+fun action_already_done remote root (spec : action_spec) =
   let
     val {sig_path, sml_path, data_path} = #outputs spec
     val stem = drop_suffix ".dat" data_path
+    fun restored () =
+      (restore_spec_theory root (theory_spec_deps spec)
+         {key = #input_key spec, subject = #package spec ^ ":" ^ #logical spec, stem = stem,
+          extra_outputs = SOME (#extra_outputs spec), requested_timeout = #tactic_timeout spec};
+       spec_parent_hashes_match root (theory_spec_deps spec) (in_root root data_path))
+      handle e as HolbuildRemoteCache.Unavailable _ => raise e
+           | _ => false
   in
-    (restore_spec_theory root (theory_spec_deps spec)
-       {key = #input_key spec, subject = #package spec ^ ":" ^ #logical spec, stem = stem,
-        extra_outputs = SOME (#extra_outputs spec), requested_timeout = #tactic_timeout spec};
-     spec_parent_hashes_match root (theory_spec_deps spec) (in_root root data_path))
-    handle e as HolbuildRemoteCache.Unavailable _ => raise e
-         | _ => false
+    restored () orelse
+    ((drop_local_copy_if_stale remote (#input_key spec)
+      handle e as HolbuildRemoteCache.Unavailable _ => raise e
+           | _ => false) andalso
+     restored ())
   end
 
 (* Whether the remote's entry for the action, given by its manifest, records
@@ -8585,7 +8619,7 @@ fun exec_run remote root tc (spec : run_spec) log =
                      (#supports spec)
     val _ = List.app fetch (#context_scripts spec)
     val deps = run_spec_deps spec
-    val _ = hydrate_spec_deps remote root deps
+    val _ = hydrate_spec_deps remote root deps (fn _ => false)
     val _ = (ensure_dir output_dir; ensure_dir scratch)
     fun load name =
       if String.isPrefix "HOLLIB:" name then String.extract (name, size "HOLLIB:", NONE)
@@ -8793,7 +8827,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
         val (done, cutoff) =
           phase "cutoff" (fn () =>
             let
-              val done = not forced andalso action_already_done root spec
+              val done = not forced andalso action_already_done remote root spec
               val cutoff = if done then NONE else spec_early_cutoff root spec
             in
               (done orelse
