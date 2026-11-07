@@ -309,6 +309,11 @@ holbuild --dry-run MyTheory
 holbuild clean MyTheory && holbuild --no-cache MyTheory
 ```
 
+`--force=theory` bypasses cached outputs for the requested targets, but still
+reuses valid checkpoints, including failed proof prefixes. To execute a theory
+from the beginning, run `holbuild clean MyTheory` followed by
+`holbuild build --no-cache MyTheory`; cleaning alone permits a global cache hit.
+
 Common global options:
 
 - `--source-dir PATH`: project source directory. Defaults to

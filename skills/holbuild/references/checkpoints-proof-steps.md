@@ -102,6 +102,11 @@ On a rebuild after source edit:
 
 `always_reexecute = true` disables local up-to-date skipping and checkpoint replay for that action.
 
+`--force=theory` bypasses cached outputs for the targets while retaining this
+checkpoint replay order. For a fresh source execution, use `holbuild clean
+FooTheory` followed by `holbuild build --no-cache FooTheory`. Cleaning alone can
+restore the theory from the global cache.
+
 ## Plan and trace inspection
 
 ```sh
