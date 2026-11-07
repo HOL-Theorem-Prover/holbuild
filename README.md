@@ -307,6 +307,7 @@ holbuild executable runtests
 holbuild export -o build-output.hbx MyTheory
 holbuild import build-output.hbx
 holbuild --remote-cache URL action-spec --upload MyTheory
+holbuild --remote-cache URL run-action --export-only --script s.sml --output out MyTheory
 holbuild clean MyTheory
 holbuild gc
 ```
@@ -980,6 +981,32 @@ holbuild build --all-checkpoints MyTheory
   cache keys are the same either way. Under `--remote-exec`, the action specs
   carry the choice to the workers.
 
+A theory's `deps_loaded` checkpoint, its dependencies loaded into the
+toolchain's base state, is also kept once per host in
+`$HOLBUILD_CACHE/checkpoint-store/`, keyed by the dependencies' input keys
+and their theories' `.dat` and generated `.sml` files, the theory's loads (by path relative to the project), the toolchain and the
+holbuild runtime. The project's directory isn't part of the key, so every
+worktree or copy of a project that uses the cache (not with `--no-cache`,
+nor for a theory with `cache = false`) shares one heap per
+dependency set: a theory with no valid `deps_loaded` hard-links the stored
+one (a copy across file systems) and resumes from it, and one it saves is
+linked into the store. A stored heap whose parent isn't the build's base
+state is ignored, and one HOL can't resume from is discarded and replaced by
+the build's fresh heap. The heap is saved without the project's directories,
+which HOL puts on `Meta.loadPath` when it starts, so a tree resuming from it
+searches only its own. Each build removes stored heaps no tree links any
+more (its checkpoint budget evicted them, or the tree was deleted) that no
+build used for a day, and `holbuild gc` removes every store directory no
+build used within the retention window, except a heap a tree still links. A heap keeps HOL's record of the directories
+its files were loaded from, so in a theory resumed from another tree's heap
+`Meta.fileDirMap()` names that tree's directories, as it names the old
+ones after a project is moved. Loading is unaffected, but TacticToe
+recording reads that map: its workers search those directories first
+(`tttUnfold`'s includes) and it finds ancestor scripts there
+(`tttManifest.find_script`). Run a local TacticToe recording in a tree
+whose `deps_loaded` heaps weren't restored from the store (build it with
+`--no-cache` from a clean checkout, say).
+
 For source-executed theory builds, holbuild writes a live child log at
 `.holbuild/logs/current/<package>/<logical>/build.log`. You can inspect it during
 a long build with `tail -f`; after the child exits, the same path is kept as the
@@ -1271,6 +1298,90 @@ action-text
   out; the entry built under them carries the timeout contract the exporting
   build will ask for.
 
+### Exporting script runs for remote execution
+
+A *run* is an SML script run in the context of a built theory: HOL started
+from the toolchain, the theory's ancestry restorable, libraries loaded, and
+the script's declared output files kept. Its result is keyed by what it
+reads, so the same run is done once. `run-action --export-only` writes and
+uploads the run spec of each target; this release does not run or fetch them.
+
+```sh
+holbuild --remote-cache https://cache.example.org run-action --export-only \
+  --script run.sml [--support F]... [--load L]... --output N... \
+  [--option timeout=SECONDS] TARGET...
+```
+
+A TARGET is a project theory (a logical name as `build` takes it, or
+`<package>:<logical>`), a theory of the HOL toolchain (`hol:bool` or
+`hol:boolTheory`), or `hol:*` for every theory in the toolchain's `sigobj`. A
+project theory must already be in the local cache for its current inputs;
+otherwise that target is refused with `build it first`, the others are still
+exported, and the command exits 1. `--support` files must lie under the
+script's directory and are named by their given path relative to it, without
+resolving symbolic links. `--load` names a library: one
+in the toolchain's `sigobj`, or a source the project plans (including the
+implicit `hol` package's libraries). The command takes `build`'s cache and
+proof options and prints one line per exported target:
+
+```text
+<context> <run_key> <spec-sha256>
+```
+
+The spec is written to `.holbuild/run-specs/<spec-sha256>` and uploaded to
+`/cas/` with every file it names. The run key is the SHA-256 of the run text:
+
+```text
+holbuild-run-v1
+toolchain=<semantic toolchain key>
+context=<package>:<logical>@<input_key>   (or context=HOL:<logical>)
+script=<sha256>
+support=<relpath>@<sha256>                  (sorted)
+load=<package>:<logical>@<input_key>        (a project library; in order)
+load=<name>                                 (a toolchain or hol package library)
+output=<name>                               (sorted)
+```
+
+The toolchain key fixes HOL's own theories and libraries, so they carry no
+key of their own. Options such as the timeout stay out of the key: a longer
+timeout doesn't make a new run. A run's result is stored, like a theory's,
+under `ac-key = sha256("holbuild-remote-ac-v1\n" ^ run_key ^ "\n")`.
+
+A run spec names no path on the exporting machine:
+
+```text
+holbuild-run-spec-v1
+holbuild-version=<version>
+holbuild-runtime=<sha256 of the holbuild sources a theory child loads>
+toolchain git=<url> rev=<rev> kernel=<variant>
+run-key=<run_key>
+context <package>:<logical> <stem> <input_key>   (or context HOL:<logical>)
+file library <relpath> <sha256> <size>
+dep theory <package>:<logical> <stem> <input_key>
+lib <package>:<logical> <stem> <suffix> <load>...
+load theory|library|object <name-or-stem>
+file context-script <relpath> <sha256> <size>
+script <sha256> <size>
+file support <relpath> <sha256> <size>
+run-load <package>:<logical>|HOLLIB:<name>
+output <name>
+option timeout=<seconds>                         (only when given)
+run-text
+<the run text, verbatim to the end of the blob>
+```
+
+- For a project context, the `toolchain`, `file library`, `dep theory`, `lib`
+  and `load` lines are the context theory's ActionSpec lines, followed by the
+  `file library`, `lib` and `dep theory` lines of what the `--load` libraries
+  need beyond them. A HOL context has only the latter.
+- `context` names the theory to restore, as a `dep theory` line does.
+- `file context-script` lines are the scripts of the context theory and of
+  every theory it depends on, under `.holbuild/action-src/<package>/`, for
+  scripts that read their ancestry's sources.
+- `run-load` lines are the libraries to load, in order: a project library by
+  its `lib` line's name, a toolchain library as `HOLLIB:<name>`.
+- `output` lines are the file names the script must write.
+
 ### Running one theory action as a remote worker
 
 `exec-action` builds the ActionSpec stored in the remote cache under
@@ -1371,8 +1482,8 @@ and platform, which is why every worker should use the same cache root.
 
 The checkpoint tree is then the action's own, emptied before and after it;
 the host store `<cache root>/checkpoint-store` keeps the shared files, one
-directory per heap, which the cache cap evicts as a unit, unless an action
-on the host is using it. Worker containers on one host can share
+directory per heap, which the cache cap and `holbuild gc` evict as a unit,
+unless an action on the host is using it. Worker containers on one host can share
 `checkpoint-store/` and `hol-toolchains/`, mounted from host directories, and
 keep the rest of the cache root to themselves. A restored Poly/ML state is
 hard-linked from the store when the store and `checkpoints/` are on one

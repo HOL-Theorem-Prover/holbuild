@@ -70,6 +70,21 @@ fun discard_checkpoint path =
    remove_file (ok_path path);
    remove_file path)
 
+(* Runs F with only the toolchain's entries on the load path.  HOL adds the
+   project's directories (and its external includes) when it starts, so a
+   heap saved with them would search this tree from any other tree that
+   resumes from it; one that starts from the heap adds its own again. *)
+fun with_toolchain_load_path f =
+  let
+    val path = !Meta.loadPath
+    val holdir = Systeml.HOLDIR
+    fun toolchain dir = dir = holdir orelse String.isPrefix (holdir ^ "/") dir
+  in
+    Meta.loadPath := List.filter toolchain path;
+    (f () handle e => (Meta.loadPath := path; raise e));
+    Meta.loadPath := path
+  end
+
 (* After a source parse error QUse's error flag is set, and a heap saved then
    keeps it: `hol run` from that heap exits with failure after its first
    declaration, printing nothing.  So no checkpoint is saved once the flag is

@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+from collections.abc import Callable
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -330,6 +331,136 @@ async def test_a_check_begun_before_an_input_went_missing_is_not_remembered(
     assert cache.asked == [ac_key("a"), ac_key("a")]
 
 
+async def wait_until(condition: Callable[[], bool]) -> None:
+    while not condition():
+        await asyncio.sleep(0.01)
+
+
+async def test_a_release_asks_the_cache_about_its_parents_at_once(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
+) -> None:
+    batch_id = await submit(http, ["a", "b", "c"], [("c", "a"), ("c", "b")])
+    tokens = await claim_all(http, 2)
+    cache.keys |= {ac_key("a"), ac_key("b")}
+    cache.hold = asyncio.Event()
+    for name in ("a", "b"):
+        assert await coordinator.complete(UUID(tokens[name]), parse_result(result(name, "built")))
+    try:
+        await asyncio.wait_for(wait_until(lambda: cache.held == 2), 5)
+    finally:
+        cache.hold.set()
+    await coordinator.released()
+    assert await states(http, batch_id) == {"a": "done", "b": "done", "c": "ready"}
+
+
+async def stored_state(coordinator: Coordinator, batch_id: str, name: str) -> str | None:
+    """The state of action ``name``, read without ``http``, whose requests wait for every release to finish."""
+    async with coordinator.engine.connect() as conn:
+        return await conn.scalar(
+            sa.text("SELECT state FROM actions WHERE batch_id = :batch_id AND input_key = :input_key"),
+            {"batch_id": UUID(batch_id), "input_key": input_key(name)},
+        )
+
+
+async def test_a_pass_over_every_batch_releases_each_batch_without_waiting_for_the_others(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
+) -> None:
+    slow = await submit(http, ["a", "ca"], [("ca", "a")])
+    quick = await submit(http, ["b", "cb"], [("cb", "b")])
+    tokens = await claim_all(http, 2)
+    # Both children's parents are done, but the cache can't answer for them yet, so both stay waiting.
+    cache.keys |= {ac_key("a"), ac_key("b")}
+    cache.broken |= {ac_key("a"), ac_key("b")}
+    for name in ("a", "b"):
+        assert await coordinator.complete(UUID(tokens[name]), parse_result(result(name, "built")))
+    await coordinator.released()
+
+    # The next pass over every batch releases "cb" while the cache is still answering for "ca"'s parent.
+    cache.broken.clear()
+    cache.hold, cache.hold_only = asyncio.Event(), {ac_key("a")}
+    coordinator.request_release()
+    try:
+        await asyncio.wait_for(wait_until(lambda: cache.held == 1), 5)
+        for _ in range(500):
+            if await stored_state(coordinator, quick, "cb") == "ready":
+                break
+            await asyncio.sleep(0.01)
+        assert await stored_state(coordinator, quick, "cb") == "ready"
+    finally:
+        cache.hold.set()
+    await coordinator.released()
+    assert await states(http, slow) == {"a": "done", "ca": "ready"}
+
+
+async def test_a_pass_over_every_batch_finishes_the_others_when_one_batch_fails(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    failing = await submit(http, ["x", "cx"], [("cx", "x")])
+    held = await submit(http, ["y", "cy"], [("cy", "y")])
+    tokens = await claim_all(http, 2)
+    cache.keys |= {ac_key("x"), ac_key("y")}
+    cache.broken |= {ac_key("x"), ac_key("y")}
+    for name in ("x", "y"):
+        assert await coordinator.complete(UUID(tokens[name]), parse_result(result(name, "built")))
+    await coordinator.released()
+
+    # Writing "cx" ready fails while the cache is still answering for "cy"'s parent.
+    lock_batch = coordinator._lock_batch
+    failed = asyncio.Event()
+
+    async def fail_one(conn: Any, batch_id: UUID) -> str | None:
+        if batch_id == UUID(failing):
+            failed.set()
+            raise RuntimeError("lost the database")
+        return await lock_batch(conn, batch_id)
+
+    monkeypatch.setattr(coordinator, "_lock_batch", fail_one)
+    cache.broken.clear()
+    cache.hold, cache.hold_only = asyncio.Event(), {ac_key("y")}
+    coordinator.request_release()
+    released = asyncio.ensure_future(coordinator.released())
+    try:
+        await asyncio.wait_for(failed.wait(), 5)
+        await asyncio.sleep(0.1)
+        assert not released.done()
+    finally:
+        cache.hold.set()
+    await asyncio.wait_for(released, 5)
+    assert await stored_state(coordinator, held, "cy") == "ready"
+    assert await stored_state(coordinator, failing, "cx") == "waiting"
+
+
+async def test_a_batch_asked_for_is_released_during_a_pass_over_every_batch(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "RELEASE_CACHE_CHECKS", 1)
+    passed = await submit(http, ["a1", "a2", "ca"], [("ca", "a1"), ("ca", "a2")])
+    asked = await submit(http, ["b", "cb"], [("cb", "b")])
+    tokens = await claim_all(http, 3)
+    # "ca"'s parents are done, but the cache can't answer for them yet, so "ca" stays waiting.
+    cache.keys |= {ac_key("a1"), ac_key("a2"), ac_key("b")}
+    cache.broken |= {ac_key("a1"), ac_key("a2")}
+    for name in ("a1", "a2"):
+        assert await coordinator.complete(UUID(tokens[name]), parse_result(result(name, "built")))
+    await coordinator.released()
+    assert (await states(http, passed))["ca"] == "waiting"
+
+    # A pass over every batch waits on the cache for "ca"'s parents, one at a time, while "b" completes: "cb" is
+    # released by the release "b"'s completion asks for, and wouldn't be by the held pass either.
+    cache.broken.clear()
+    cache.hold, cache.hold_only = asyncio.Event(), {ac_key("a1"), ac_key("a2")}
+    coordinator.request_release()
+    try:
+        await asyncio.wait_for(wait_until(lambda: cache.held == 1), 5)
+        assert await coordinator.complete(UUID(tokens["b"]), parse_result(result("b", "built")))
+        await asyncio.wait_for(wait_until(lambda: coordinator.releasers[False].done()), 5)
+        assert await stored_state(coordinator, asked, "cb") == "ready"
+    finally:
+        cache.hold.set()
+    await coordinator.released()
+    assert (await states(http, passed))["ca"] == "ready"
+
+
 async def test_completions_and_sweeps_answer_while_releases_wait_on_the_cache(
     http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
 ) -> None:
@@ -343,7 +474,7 @@ async def test_completions_and_sweeps_answer_while_releases_wait_on_the_cache(
         completed = coordinator.complete(UUID(tokens[name]), parse_result(result(name, "built")))
         assert await asyncio.wait_for(completed, 5)
     await asyncio.wait_for(coordinator.sweep(), 5)
-    assert coordinator.releaser is not None and not coordinator.releaser.done()
+    assert not all(releaser.done() for releaser in coordinator.releasers.values())
 
     cache.hold.set()
     await coordinator.released()

@@ -264,14 +264,14 @@ fun checkpoint_save_runtime_line () =
 (* PolyML child heaps remember their parent-chain filenames. The shared runtime
    helper saves checkpoints directly to the final .save path and publishes .ok
    metadata last via an atomic .ok.tmp rename. *)
-fun save_heap_line {label, share_common_data, output, ok_text} =
+fun save_heap_expr {label, share_common_data, output, ok_text} =
   String.concat
-    ["val _ = HolbuildCheckpointSaveRuntime.save_checkpoint {label = ",
+    ["HolbuildCheckpointSaveRuntime.save_checkpoint {label = ",
      HolbuildToolchain.sml_string label,
      ", default_share = ", if share_common_data then "true" else "false",
      ", path = ", HolbuildToolchain.sml_string output,
      ", ok_text = ", HolbuildToolchain.sml_string ok_text,
-     ", depth = HolbuildRuntime.save_hierarchy_depth ()};"]
+     ", depth = HolbuildRuntime.save_hierarchy_depth ()}"]
 
 fun direct_external_loads plan node =
   unique_strings
@@ -307,13 +307,17 @@ fun preload_loads root plan node =
   map (fn dep => LoadObject (root_relative root (load_stem dep)))
       (List.filter loadable_project_dep (project_preload_deps plan node))
 
+(* The deps heap keeps only the toolchain's load path, not the project's
+   directories HOL put there: other trees of the project resume from it. *)
 fun write_preload load_lines deps_loaded deps_ok path =
   let
+    val save = save_heap_expr {label = "deps_loaded", share_common_data = true,
+                               output = deps_loaded, ok_text = deps_ok}
     val lines = runtime_line () ::
                 (load_lines @
                  [checkpoint_save_runtime_line (),
-                  save_heap_line {label = "deps_loaded", share_common_data = true,
-                                  output = deps_loaded, ok_text = deps_ok}])
+                  "val _ = HolbuildCheckpointSaveRuntime.with_toolchain_load_path (fn () => " ^
+                  save ^ ");"])
   in
     write_text path (String.concatWith "\n" lines ^ "\n")
   end
@@ -3112,6 +3116,170 @@ fun action_outputs root ({outputs = {sig_path, sml_path, data_path}, ...} : theo
   {sig_path = in_root root sig_path, sml_path = in_root root sml_path,
    data_path = in_root root data_path}
 
+(* The holbuild sources a theory child loads, directly or through the HOL
+   analyser that instruments its script.  They end up in saved heaps, so a
+   worker runs only specs exported by holbuild with the same sources. *)
+val runtime_source_files =
+  ["sml/checkpoint_save_runtime.sml", "sml/holbuild_runtime.sml",
+   "sml/proof_runtime.sml", "sml/tactic_compat_runtime.sml", "sml/diagnostic_limits.sml"] @
+  map (fn file => normalize_path (Path.concat("sml/analyser", file)))
+      HolbuildHolSharedCache.analyser_source_files
+
+fun runtime_identity () =
+  let
+    fun line rel =
+      rel ^ " " ^ HolbuildHash.file_sha256 (Path.concat(HolbuildRuntimePaths.runtime_root (), rel))
+  in
+    HolbuildToolchain.hash_text
+      (String.concatWith "\n"
+         ("holbuild-runtime-v1" :: map line (sort_strings (unique_strings runtime_source_files))) ^ "\n")
+  end
+
+(* The shared heap and checkpoint store: one family per heap directory,
+   used when an action restores from it or adds to it. *)
+fun share_store cache = Path.concat(cache, "checkpoint-store")
+
+(* An action holds a shared lease on each store family it uses until it
+   exits, so no other container's cap sweep evicts the family meanwhile; a
+   build holds one only while it places or adds a heap.  fcntl locks are
+   dropped when the process closes any descriptor for the file, so a family
+   is leased at most once per process, as toolchains are, with a count of its
+   holders. *)
+fun store_lease_path dir = dir ^ ".lease"
+
+val store_leases = ref ([] : (string * HolbuildFileLock.t * int ref) list)
+(* A build's theory workers lease families from several threads. *)
+val store_leases_mutex = Mutex.mutex ()
+
+fun with_store_leases f =
+  (Mutex.lock store_leases_mutex;
+   (f () handle e => (Mutex.unlock store_leases_mutex; raise e))
+   before Mutex.unlock store_leases_mutex)
+
+fun find_store_lease path = List.find (fn (held, _, _) => held = path) (!store_leases)
+
+fun holds_store_lease path = with_store_leases (fn () => Option.isSome (find_store_lease path))
+
+fun lease_store_family store heap =
+  let val path = store_lease_path (Path.concat(store, heap))
+  in
+    with_store_leases (fn () =>
+      case find_store_lease path of
+          SOME (_, _, holders) => holders := !holders + 1
+        | NONE =>
+            store_leases := (path, HolbuildFileLock.acquire_shared_path_wait {path = path}, ref 1) :: !store_leases)
+  end
+
+fun release_store_family store heap =
+  let val path = store_lease_path (Path.concat(store, heap))
+  in
+    with_store_leases (fn () =>
+      case find_store_lease path of
+          SOME (_, lock, holders) =>
+            (holders := !holders - 1;
+             if !holders > 0 then ()
+             else
+               (store_leases := List.filter (fn (held, _, _) => held <> path) (!store_leases);
+                HolbuildFileLock.release lock))
+        | NONE => ())
+  end
+
+fun with_store_family_lease store heap f =
+  (lease_store_family store heap;
+   (f () handle e => (release_store_family store heap; raise e))
+   before release_store_family store heap)
+
+fun tree_bytes path =
+  if (FS.isLink path handle OS.SysErr _ => false) then 0
+  else if (FS.isDir path handle OS.SysErr _ => false) then
+    List.foldl (fn (child, total) => total + tree_bytes child) (0 : Position.int) (children path)
+  else file_size path
+
+fun modified_time path = FS.modTime path handle OS.SysErr _ => Time.zeroTime
+
+(* Removes a store family no process leases; the bytes freed, or NONE if kept. *)
+fun evict_store_family dir =
+  let val lease = store_lease_path dir
+  in
+    if holds_store_lease lease then NONE
+    else
+      case HolbuildFileLock.try_acquire_path {path = lease, obsolete_kind = NONE}
+           handle HolbuildFileLock.Error _ => NONE of
+          NONE => NONE
+        | SOME lock =>
+            let val bytes = tree_bytes dir
+            in
+              (HolbuildCache.remove_tree dir handle e => (HolbuildFileLock.release lock; raise e));
+              HolbuildFileLock.release lock;
+              if path_exists dir then NONE else SOME bytes
+            end
+  end
+
+(* A family that can't be removed stays; the others are still swept. *)
+fun try_evict_store_family dir =
+  evict_store_family dir
+  handle e => (warn ("could not remove store family " ^ dir ^ ": " ^ General.exnMessage e); NONE)
+
+fun store_families store =
+  List.filter (fn path => FS.isDir path handle OS.SysErr _ => false) (HolbuildCache.children store)
+
+(* How many links a host deps heap family's heap has: the store's own, and
+   one per tree that holds it.  0 for other families. *)
+fun store_heap_links dir =
+  Posix.FileSys.ST.nlink (Posix.FileSys.stat (Path.concat(dir, "deps_loaded.save")))
+  handle OS.SysErr _ => 0
+
+fun store_path store heap sha = Path.concat(Path.concat(store, heap), sha)
+
+(* A name no process, in this container or another, also picks. *)
+fun store_temp path =
+  HolbuildTempPath.near path ("." ^ LargeInt.toString (Time.toNanoseconds (Time.now ())) ^ ".tmp")
+
+fun link_or_copy_file src dst =
+  (ensure_parent dst;
+   remove_file dst;
+   Posix.FileSys.link {old = src, new = dst}
+   handle OS.SysErr _ => copy_binary src dst)
+
+fun touch_dir dir = Posix.FileSys.utime (dir, NONE) handle OS.SysErr _ => ()
+
+(* Only Poly/ML states are linked: the run writes a failed prefix's .meta and
+   .prefix in place. *)
+fun share_file save src dst = if save then link_or_copy_file src dst else copy_binary src dst
+
+fun store_add store heap {sha, src, save} =
+  let
+    val _ = lease_store_family store heap
+    val dst = store_path store heap sha
+  in
+    if file_exists dst then ()
+    else
+      let val tmp = store_temp dst
+      in
+        (ensure_parent tmp; share_file save src tmp; FS.rename {old = tmp, new = dst})
+        handle e => (remove_file tmp; raise e)
+      end
+  end
+
+val noted_store_mount = ref false
+
+(* A Poly/ML state from the store, hard-linked; across file systems, where a
+   store on its own mount puts it, symbolically linked, which is safe while
+   this process leases the state's family. *)
+fun place_state stored dst =
+  (remove_file dst;
+   Posix.FileSys.link {old = stored, new = dst}
+   handle OS.SysErr (_, err) =>
+     if err <> SOME Posix.Error.xdev then copy_binary stored dst
+     else
+       (if !noted_store_mount then ()
+        else (noted_store_mount := true;
+              HolbuildStatus.message_stderr
+                "holbuild: the checkpoint store is on another file system; linking its states symbolically\n");
+        Posix.FileSys.symlink {old = Path.mkAbsolute {path = stored, relativeTo = FS.getDir ()}, new = dst}))
+
+fun saved_parent path = PolyML.SaveState.showParent path handle _ => NONE
+
 fun write_theory_script policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
   let
     val source_name = #source_name action
@@ -4246,16 +4414,181 @@ fun build_theory_action cache_allowed policy tc root checkpoint_root base_contex
     generated_metadata
   end
 
+(* The host's deps heaps.  A theory's deps_loaded state is a child of the
+   toolchain's base state with its dependencies loaded: it depends on its
+   dependencies' input keys and their theories' .dat and generated .sml
+   files (a theory build need not be reproducible, and the .sml names the
+   theory's ML dependencies, which the .dat doesn't), its loads (by root-relative path), the toolchain and
+   the holbuild runtime, but not on the project root, so one copy in the host
+   store, CACHE/checkpoint-store/<key>/deps_loaded.save, serves every
+   worktree of a project, hard-linked into each.  (The deps key won't do: it
+   hashes the dependencies' load manifests, which name their files by
+   absolute path.)  Anything wrong with a stored heap falls back to loading
+   the dependencies afresh, as without the store. *)
+fun local_heap_context dat_hash_cache toolchain_key plan keys node =
+  let
+    fun is_theory dep = #kind (HolbuildBuildPlan.source_of dep) = HolbuildSourceIndex.TheoryScript
+    fun line dep =
+      let val {data_path, sml_path, ...} = theory_outputs dep
+      in
+        case (cached_file_hash dat_hash_cache data_path, cached_file_hash dat_hash_cache sml_path) of
+            (SOME dat, SOME sml) => SOME (HolbuildBuildPlan.key dep ^ " " ^ dat ^ " " ^ sml)
+          | _ => NONE
+      end
+    val lines = map line (List.filter is_theory (HolbuildBuildPlan.transitive_project_deps plan node))
+  in
+    if List.all Option.isSome lines then
+      SOME (String.concatWith "\n"
+              (("inputs " ^ dependency_input_context_key toolchain_key plan keys node) :: map valOf lines))
+    else NONE
+  end
+
+fun local_heap_key tc heap_context (action : theory_action) =
+  let
+    fun load_line (LoadTheory name) = "theory " ^ name
+      | load_line (LoadLibrary name) = "library " ^ name
+      | load_line (LoadObject stem) = "object " ^ stem
+  in
+    HolbuildHash.string_sha256
+      (String.concatWith "\n"
+         ["holbuild-local-heap-v1",
+          "deps=" ^ HolbuildHash.string_sha256 heap_context,
+          "loads=" ^ HolbuildHash.string_sha256 (String.concatWith "\n" (map load_line (#loads action)) ^ "\n"),
+          "toolchain-exact=" ^ HolbuildToolchain.toolchain_key tc,
+          "holdir=" ^ FS.fullPath (#holdir tc),
+          "runtime=" ^ runtime_identity ()] ^ "\n")
+  end
+
+fun local_heap_location tc heap_context action =
+  let
+    val store = share_store (HolbuildCache.cache_root ())
+    val heap = local_heap_key tc heap_context action
+  in
+    {store = store, heap = heap, stored = store_path store heap "deps_loaded.save"}
+  end
+
+fun file_id path =
+  let val st = Posix.FileSys.stat path
+  in SOME (Posix.FileSys.ST.dev st, Posix.FileSys.ST.ino st) end
+  handle OS.SysErr _ => NONE
+
+(* A file's identity and modification time: a file saved where a discarded
+   one was can reuse its inode number.  Not its change time, which links made
+   by other trees change. *)
+fun file_stamp path =
+  let val st = Posix.FileSys.stat path
+  in SOME (Posix.FileSys.ST.dev st, Posix.FileSys.ST.ino st, Posix.FileSys.ST.mtime st) end
+  handle OS.SysErr _ => NONE
+
+fun stamp_id stamp = Option.map (fn (dev, ino, _) => (dev, ino)) stamp
+
+(* After a theory runs, given its deps_loaded's file prior the run and the
+   store file the restore placed, if any: a heap the run saved goes into the
+   store, replacing what is there; if the run discarded the heap it started
+   from and saved none, the store loses that heap too.  A heap the run didn't
+   touch stays as it is: it may hold an earlier runtime than the key says. *)
+fun publish_local_heap tc heap_context (action : theory_action) deps_loaded prior placed =
+  let
+    val now = file_stamp deps_loaded
+    val {store, heap, stored} = local_heap_location tc heap_context action
+  in
+    if now = prior orelse stamp_id now = file_id stored then ()
+    else if deps_checkpoint_exists deps_loaded (#deps_key action) then
+      let val tmp = store_temp stored
+      in
+        (* rename leaves tmp in place when both name one file. *)
+        with_store_family_lease store heap (fn () =>
+          (ensure_parent tmp; link_or_copy_file deps_loaded tmp; FS.rename {old = tmp, new = stored};
+           remove_file tmp)
+          handle e => (remove_file tmp; raise e))
+      end
+    else if List.exists (fn id => Option.isSome id andalso file_id stored = id) [stamp_id prior, placed] then
+      remove_file stored
+    else ()
+  end
+  handle e => warn ("could not add a deps heap to the host store: " ^ General.exnMessage e)
+
+(* The store keeps a deps heap while a tree links it, or a build used it
+   within a day.  A tree's checkpoint budget evicting its heap, or the tree's
+   deletion, leaves the store's link the only one, which this removes. *)
+fun sweep_local_heap_store () =
+  let
+    val cutoff = Time.-(Time.now (), Time.fromSeconds 86400)
+    fun sweep dir =
+      if store_heap_links dir = 1 andalso Time.<(modified_time dir, cutoff) then ignore (try_evict_store_family dir) else ()
+  in
+    List.app sweep (store_families (share_store (HolbuildCache.cache_root ())))
+  end
+  handle e => warn ("could not sweep the host deps heap store: " ^ General.exnMessage e)
+
+(* Before a theory runs: a missing deps_loaded comes from the store, if it
+   holds one whose parent is this build's base state.  The store file placed,
+   identified as it was: a copy has an identity of its own. *)
+fun restore_local_heap tc heap_context base_context checkpoint_root (action : theory_action) =
+  let
+    val base = action_checkpoint_base checkpoint_root action
+    val deps_key = #deps_key action
+    val deps_loaded = deps_loaded_path base deps_key
+    fun parent_ok () =
+      case saved_parent deps_loaded of
+          SOME parent =>
+            (FS.fullPath parent = FS.fullPath (hol_context_path base_context) handle OS.SysErr _ => false)
+        | NONE => false
+    fun place {store, heap, stored} =
+      ((* Checkpoints on an earlier deps_loaded aren't children of this one. *)
+       remove_deps_checkpoint_descendants base deps_key;
+       with_store_family_lease store heap (fn () =>
+         let val placed = file_id stored
+         in
+           (* A copy across file systems: a symbolic link would follow the
+              store entry when another tree replaces it, under this tree's .ok. *)
+           link_or_copy_file stored deps_loaded;
+           if parent_ok () then
+             (write_text (checkpoint_ok_path deps_loaded) (deps_checkpoint_ok_text deps_key);
+              touch_dir (Path.concat(store, heap));
+              placed)
+           else (remove_checkpoint deps_loaded; NONE)
+         end))
+      handle e =>
+        (remove_checkpoint deps_loaded;
+         warn ("could not restore a deps heap from the host store: " ^ General.exnMessage e);
+         NONE)
+  in
+    if deps_checkpoint_exists deps_loaded deps_key then NONE
+    else
+      case (SOME (local_heap_location tc heap_context action)
+            handle e => (warn ("could not find the host store's deps heap: " ^ General.exnMessage e); NONE)) of
+          SOME location => if file_exists (#stored location) then place location else NONE
+        | NONE => NONE
+  end
+
 (* Builds a theory from its source in the project: runs its theory action with
    the project's artifact root as action root, then puts the extra outputs in
    the source tree and writes the theory's local load manifests. *)
-fun build_theory cache_allowed policy tc project base_context plan keys toolchain_key node =
+fun build_theory dat_hash_cache cache_allowed policy tc project base_context plan keys toolchain_key node =
   let
     val root = project_artifact_root project
     val action = theory_action root plan keys toolchain_key
                    (dependency_context_key toolchain_key plan keys node) node
+    val checkpoint_root = default_checkpoint_root root
+    val heap_context =
+      if cache_allowed andalso checkpoint_enabled policy then local_heap_context dat_hash_cache toolchain_key plan keys node
+      else NONE
+    val placed =
+      Option.mapPartial
+        (fn heap_context => restore_local_heap tc heap_context base_context checkpoint_root action)
+        heap_context
+    val deps_loaded = deps_loaded_path (action_checkpoint_base checkpoint_root action) (#deps_key action)
+    val prior = file_stamp deps_loaded
+    (* Also after a failure: a stored heap HOL couldn't resume from was
+       replaced here by a fresh one, which the store takes in its place. *)
+    fun publish_heap () =
+      Option.app (fn heap_context => publish_local_heap tc heap_context action deps_loaded prior placed)
+                 heap_context
     val generated_metadata =
-      build_theory_action cache_allowed policy tc root (default_checkpoint_root root) base_context action
+      build_theory_action cache_allowed policy tc root checkpoint_root base_context action
+      handle e => (publish_heap (); raise e)
+    val _ = publish_heap ()
     val stage = action_stage root action
     val extra_output_paths = source_extra_output_paths plan node
   in
@@ -4372,7 +4705,7 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
         (HolbuildHolSharedCache.local_build_needed := true;
          raise Error (logical_name node ^ " is not in the remote cache, and --remote-only builds nothing locally"))
       else
-      (build_theory cache_allowed policy tc project base_context plan keys toolchain_key node;
+      (build_theory dat_hash_cache cache_allowed policy tc project base_context plan keys toolchain_key node;
        invalidate_node_dat_hash ();
        write_metadata (#emit_output_hashes options) policy (tactic_timeout policy) project plan keys input_key toolchain_key node;
        HolbuildStatus.Built)
@@ -5456,6 +5789,7 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
     val _ = register_checkpoint_budget_bases budget_state
               (map (checkpoint_base project) (HolbuildBuildPlan.selected_nodes plan))
     val _ = enforce_checkpoint_budget_state_excluding budget_state []
+    val _ = sweep_local_heap_store ()
     val base_context = toolchain_base_context tc
     val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
                  (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
@@ -5573,25 +5907,6 @@ fun remote_proof_failure (options : build_options) tc project plan toolchain_key
 val action_spec_header = "holbuild-action-spec-v1"
 val action_batch_header = "holbuild-action-batch-v1"
 
-(* The holbuild sources a theory child loads, directly or through the HOL
-   analyser that instruments its script.  They end up in saved heaps, so a
-   worker runs only specs exported by holbuild with the same sources. *)
-val runtime_source_files =
-  ["sml/checkpoint_save_runtime.sml", "sml/holbuild_runtime.sml",
-   "sml/proof_runtime.sml", "sml/tactic_compat_runtime.sml", "sml/diagnostic_limits.sml"] @
-  map (fn file => normalize_path (Path.concat("sml/analyser", file)))
-      HolbuildHolSharedCache.analyser_source_files
-
-fun runtime_identity () =
-  let
-    fun line rel =
-      rel ^ " " ^ HolbuildHash.file_sha256 (Path.concat(HolbuildRuntimePaths.runtime_root (), rel))
-  in
-    HolbuildToolchain.hash_text
-      (String.concatWith "\n"
-         ("holbuild-runtime-v1" :: map line (sort_strings (unique_strings runtime_source_files))) ^ "\n")
-  end
-
 fun spec_token context text =
   if text <> "" andalso not (CharVector.exists (fn c => Char.isSpace c orelse Char.isCntrl c) text)
   then text
@@ -5691,11 +6006,37 @@ fun file_line role path from =
   String.concatWith " "
     ["file", role, path, HolbuildHash.file_sha256 from, Position.toString (FS.fileSize from)]
 
+fun dep_theory_line root keys token label dep =
+  String.concatWith " "
+    [label, token (package dep ^ ":" ^ logical_name dep),
+     token (root_relative root (load_stem dep)), HolbuildBuildPlan.input_key_for keys dep]
+
 fun theory_load_spec_line token (LoadTheory name) = "load theory " ^ token name
   | theory_load_spec_line token (LoadLibrary name) = "load library " ^ token name
   | theory_load_spec_line token (LoadObject stem) = "load object " ^ token stem
 
 fun bool_option name value = "option " ^ name ^ "=" ^ bool_text value
+
+(* The spec lines that make DEPS available to a worker: each library's
+   source, each theory to restore, and each library's load manifest. *)
+fun dependency_spec_lines root plan keys token deps =
+  let
+    val theory_deps = List.filter is_theory_node deps
+    val libraries = List.filter (not o is_theory_node) deps
+    (* A library's key comes from its planned source hash, which the action
+       text doesn't carry, so the file shipped must be the one planned. *)
+    fun library_line lib =
+      let val line = file_line "library" (token (library_source_path lib)) (source_file lib)
+      in
+        if List.nth (String.tokens Char.isSpace line, 3) = HolbuildBuildPlan.source_hash plan lib then line
+        else raise Error ("library changed since the build was planned: " ^ source_file lib)
+      end
+  in
+    {library_lines = map library_line libraries,
+     dep_lines = map (dep_theory_line root keys token "dep theory") theory_deps,
+     lib_lines = List.concat (map (library_manifest root plan) libraries),
+     library_files = map source_file libraries}
+  end
 
 (* The spec text and the files a worker fetches by content hash for it. *)
 (* A worker saves theorem checkpoints unless the spec says otherwise: a
@@ -5705,27 +6046,12 @@ fun action_spec_text {root, plan, keys, action_toolchain_key, runtime, toolchain
   let
     val context = #package action ^ ":" ^ #logical action
     val token = spec_token context
-    val deps = HolbuildBuildPlan.transitive_project_deps plan node
-    val theory_deps = List.filter is_theory_node deps
-    val libraries = List.filter (not o is_theory_node) deps
     val source = #source_file action
     val {sig_path, sml_path, data_path} = #outputs action
     val input_lines =
       map (fn {path, from} => file_line "input" (token path) from) (#inputs action)
-    (* A library's key comes from its planned source hash, which the action
-       text doesn't carry, so the file shipped must be the one planned. *)
-    fun library_line lib =
-      let val line = file_line "library" (token (library_source_path lib)) (source_file lib)
-      in
-        if List.nth (String.tokens Char.isSpace line, 3) = HolbuildBuildPlan.source_hash plan lib then line
-        else raise Error ("library changed since the build was planned: " ^ source_file lib)
-      end
-    val library_lines = map library_line libraries
-    val dep_lines =
-      map (fn dep => String.concatWith " "
-             ["dep theory", token (package dep ^ ":" ^ logical_name dep),
-              token (root_relative root (load_stem dep)), HolbuildBuildPlan.input_key_for keys dep])
-          theory_deps
+    val {library_lines, dep_lines, lib_lines, library_files} =
+      dependency_spec_lines root plan keys token (HolbuildBuildPlan.transitive_project_deps plan node)
     val lines =
       [action_spec_header,
        "holbuild-version=" ^ HolbuildVersion.version,
@@ -5741,7 +6067,7 @@ fun action_spec_text {root, plan, keys, action_toolchain_key, runtime, toolchain
       input_lines @
       library_lines @
       dep_lines @
-      List.concat (map (library_manifest root plan) libraries) @
+      lib_lines @
       map (theory_load_spec_line token) (#loads action) @
       ["output sig " ^ token sig_path,
        "output sml " ^ token sml_path,
@@ -5754,7 +6080,7 @@ fun action_spec_text {root, plan, keys, action_toolchain_key, runtime, toolchain
       ["action-text"]
   in
     {text = String.concatWith "\n" lines ^ "\n" ^ action_text,
-     files = source :: map #from (#inputs action) @ map source_file libraries}
+     files = source :: map #from (#inputs action) @ library_files}
   end
 
 (* A theory waits for the nearest uncached theories it depends on, looking
@@ -5836,6 +6162,84 @@ fun drop_local_cache_entries keys =
              keys
   end
 
+(* The spec line naming the HOL a worker installs: the project's git HOL. *)
+fun spec_toolchain_line (tc : HolbuildToolchain.t) project =
+  case HolbuildProject.resolved_hol_dependency_with {kernel_variant = #kernel_variant tc} project of
+      SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev}, ...}) =>
+        "toolchain git=" ^ spec_token "the HOL dependency" git ^ " rev=" ^ spec_token "the HOL dependency" rev ^
+        " kernel=" ^ HolbuildToolchain.kernel_variant_name (#kernel_variant tc)
+    | _ => raise Error "action-spec: the project has no git dependencies.hol"
+
+(* Runs PRED over ITEMS on the prefetch pool and returns, in order, the
+   items it fails for, reporting "<doing>: <done>/<total> <items_name>"
+   at most every 5 s. *)
+fun failing_on_pool remote jobs doing items_name pred items =
+  let
+    datatype check = Pass | Fail | CheckFailed of exn
+    val checks = map (fn item => (item, ref Fail)) items
+    val total = length items
+    val completed = ref 0
+    val next_report = ref (Time.now ())
+    val progress_mutex = Mutex.mutex ()
+    fun report () =
+      let val now = Time.now ()
+      in
+        if not (HolbuildStatus.quiet_mode ()) andalso
+           (!completed = total orelse Time.>= (now, !next_report)) then
+          (HolbuildStatus.message_stderr
+             (doing ^ ": " ^ Int.toString (!completed) ^ "/" ^
+              Int.toString total ^ " " ^ items_name ^ "\n");
+           next_report := Time.+ (now, Time.fromSeconds 5))
+        else ()
+      end
+    fun check (item, result) =
+      (* Each check owns the mutable blob metadata, as restore prefetch does. *)
+      (result := ((if pred (HolbuildRemoteCache.remote (HolbuildRemoteCache.base_url remote)) item
+                   then Pass else Fail) handle e => CheckFailed e);
+       Mutex.lock progress_mutex;
+       ((completed := !completed + 1; report ()) before Mutex.unlock progress_mutex)
+       handle e => (Mutex.unlock progress_mutex; raise e))
+  in
+    if null items then []
+    else
+      let
+        val _ = report ()
+        val {add, drain, stop} = start_background_pool (prefetch_limit jobs) check
+        val _ = (List.app add checks; drain ()) handle e => (stop (); raise e)
+      in
+        List.mapPartial (fn (item, result) =>
+          case !result of Pass => NONE | Fail => SOME item | CheckFailed e => raise e) checks
+      end
+  end
+
+(* Uploads FILES to the remote cache's CAS, those it lacks, on the prefetch
+   pool.  Specs share their sources, so each file goes up once.  After the
+   first failure the uploads not yet started are skipped, for the caller to
+   fall back at once.  A file whose (path, sha256) known holds is taken as
+   present; learn is told each sha256 uploaded or found present. *)
+fun upload_spec_files remote jobs {known, learn} files =
+  let
+    val upload_failed = ref false
+    val failure_mutex = Mutex.mutex ()
+    fun with_failure_lock f =
+      (Mutex.lock failure_mutex; f () before Mutex.unlock failure_mutex)
+      handle e => (Mutex.unlock failure_mutex; raise e)
+    fun uploaded remote path =
+      with_failure_lock (fn () => !upload_failed) orelse
+      (let val hash = HolbuildHash.file_sha256 path
+       in
+         if known (path, hash) then ()
+         else (publish_spec_blob remote {hash = hash, path = path}; learn hash)
+       end;
+       true)
+      handle e => (with_failure_lock (fn () => upload_failed := true); raise e)
+    val files = unique_strings files
+  in
+    if null files then ()
+    else HolbuildToolchain.time_phase "action_spec.upload" (fn () =>
+           ignore (failing_on_pool remote jobs "uploading to remote cache" "files" uploaded files))
+  end
+
 (* Writes the ActionSpec of every theory in the plan the remote cache can't
    satisfy, or whose input key is in forced, uploads them and their sources
    with upload, and returns the batch.
@@ -5885,47 +6289,7 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
                                " can't run remotely: " ^ reason)
               | NONE => ())
         actions
-    (* Runs PRED over ITEMS on the prefetch pool and returns, in order, the
-       items it fails for, reporting "<doing>: <done>/<total> <items_name>"
-       at most every 5 s. *)
-    fun failing doing items_name pred items =
-      let
-        datatype check = Pass | Fail | CheckFailed of exn
-        val checks = map (fn item => (item, ref Fail)) items
-        val total = length items
-        val completed = ref 0
-        val next_report = ref (Time.now ())
-        val progress_mutex = Mutex.mutex ()
-        fun report () =
-          let val now = Time.now ()
-          in
-            if not (HolbuildStatus.quiet_mode ()) andalso
-               (!completed = total orelse Time.>= (now, !next_report)) then
-              (HolbuildStatus.message_stderr
-                 (doing ^ ": " ^ Int.toString (!completed) ^ "/" ^
-                  Int.toString total ^ " " ^ items_name ^ "\n");
-               next_report := Time.+ (now, Time.fromSeconds 5))
-            else ()
-          end
-        fun check (item, result) =
-          (* Each check owns the mutable blob metadata, as restore prefetch does. *)
-          (result := ((if pred (HolbuildRemoteCache.remote (HolbuildRemoteCache.base_url remote)) item
-                       then Pass else Fail) handle e => CheckFailed e);
-           Mutex.lock progress_mutex;
-           ((completed := !completed + 1; report ()) before Mutex.unlock progress_mutex)
-           handle e => (Mutex.unlock progress_mutex; raise e))
-      in
-        if null items then []
-        else
-          let
-            val _ = report ()
-            val {add, drain, stop} = start_background_pool (prefetch_limit jobs) check
-            val _ = (List.app add checks; drain ()) handle e => (stop (); raise e)
-          in
-            List.mapPartial (fn (item, result) =>
-              case !result of Pass => NONE | Fail => SOME item | CheckFailed e => raise e) checks
-          end
-      end
+    val failing = failing_on_pool remote jobs
     (* A theory the local build takes as up to date (built here for its
        current inputs, under a timeout contract as strict as the one
        requested) needs no worker, so only the others go through the remote
@@ -5973,12 +6337,7 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       if null unavailable then uncached_actions
       else List.filter (fn (node, _) => uncached_in (uncached_actions @ unavailable) node) actions
     val uncached = uncached_in uncached_actions
-    val toolchain_line =
-      case HolbuildProject.resolved_hol_dependency_with {kernel_variant = #kernel_variant tc} project of
-          SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev}, ...}) =>
-            "toolchain git=" ^ spec_token "the HOL dependency" git ^ " rev=" ^ spec_token "the HOL dependency" rev ^
-            " kernel=" ^ HolbuildToolchain.kernel_variant_name (#kernel_variant tc)
-        | _ => raise Error "action-spec: the project has no git dependencies.hol"
+    val toolchain_line = spec_toolchain_line tc project
     val spec_dir = Path.concat(root, ".holbuild/action-specs")
     val context = {root = root, plan = plan, keys = keys, action_toolchain_key = action_toolchain_key,
                    runtime = runtime_identity (), toolchain_line = toolchain_line}
@@ -5996,7 +6355,7 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
         val path = Path.concat(spec_dir, spec_sha256)
         val _ = (ensure_dir spec_dir; write_text path text)
       in
-        {files = files, spec = path, lines = String.concatWith " "
+        {files = files @ [path], lines = String.concatWith " "
           ["action", #input_key action, HolbuildRemoteCache.remote_action_key (#input_key action),
            spec_sha256, package node ^ ":" ^ logical_name node] ::
         map (fn parent => "edge " ^ #input_key action ^ " " ^ HolbuildBuildPlan.input_key_for keys parent)
@@ -6004,36 +6363,17 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       end
     val exported = map export uncached_actions
     val action_lines = List.concat (map #lines exported)
-    (* Specs share their library sources, so each file goes up once.  After
-       the first failure the uploads not yet started are skipped, for the
-       caller to fall back at once. *)
-    val upload_failed = ref false
-    val failure_mutex = Mutex.mutex ()
-    fun with_failure_lock f =
-      (Mutex.lock failure_mutex; f () before Mutex.unlock failure_mutex)
-      handle e => (Mutex.unlock failure_mutex; raise e)
     (* A worker rejects a spec it can't fetch rather than reporting it
        missing, so a spec the ledger hid would never be uploaded again: specs
-       always go up. *)
-    fun uploaded remote (path, is_spec) =
-      with_failure_lock (fn () => !upload_failed) orelse
-      (let val hash = HolbuildHash.file_sha256 path
-       in
-         if is_spec then publish_spec_blob remote {hash = hash, path = path}
-         else if known ("blob " ^ hash) then ()
-         else (publish_spec_blob remote {hash = hash, path = path}; learn ("blob " ^ hash))
-       end;
-       true)
-      handle e => (with_failure_lock (fn () => upload_failed := true); raise e)
-    val files =
-      if upload then
-        map (fn path => (path, false)) (unique_strings (List.concat (map #files exported))) @
-        map (fn {spec, ...} => (spec, true)) exported
-      else []
+       skip the ledger. *)
+    fun is_spec path = String.isPrefix (spec_dir ^ "/") path
     val _ =
-      if null files then ()
-      else HolbuildToolchain.time_phase "action_spec.upload" (fn () =>
-             ignore (failing "uploading to remote cache" "files" uploaded files))
+      if upload then
+        upload_spec_files remote jobs
+          {known = fn (path, hash) => not (is_spec path) andalso known ("blob " ^ hash),
+           learn = fn hash => learn ("blob " ^ hash)}
+          (List.concat (map #files exported))
+      else ()
     val _ =
       if not ledger orelse Binaryset.numItems (!learned) = Binaryset.numItems ledger_known then ()
       else
@@ -6042,6 +6382,324 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
            (String.concat (map (fn line => line ^ "\n") (Binaryset.listItems (!learned)))))
   in
     String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n"
+  end
+
+(* Run specs: a caller's script to run in the context of a built theory, or
+   of a theory of the HOL toolchain, keyed by what it reads, for a remote
+   worker.  The README describes the formats. *)
+
+val run_spec_header = "holbuild-run-spec-v1"
+
+datatype run_context =
+    HolContext of string  (* a theory of the toolchain's sigobj, as XTheory *)
+  | ProjectContext of {package : string option, logical : string}
+
+datatype run_load =
+    ToolchainLoad of string  (* a library of the toolchain's sigobj *)
+  | PlannedLoad of {package : string option, logical : string}
+
+type run_request =
+  {contexts : run_context list, script : string, supports : string list,
+   loads : run_load list, outputs : string list, timeout : int option}
+
+fun run_token what text =
+  if text <> "" andalso not (CharVector.exists (fn c => Char.isSpace c orelse Char.isCntrl c) text)
+  then text
+  else raise Error ("run-action: " ^ what ^ " " ^ HolbuildHash.quote text ^ " is empty or contains whitespace")
+
+(* A theory's logical name, XTheory; the Theory structure itself is none. *)
+fun theory_logical_name name = size name > size "Theory" andalso has_suffix "Theory" name
+
+fun sigobj_has holdir name = FS.access (Path.concat (Path.concat (holdir, "sigobj"), name ^ ".uo"), [])
+
+(* Every theory of the toolchain, as XTheory. *)
+fun toolchain_theories holdir =
+  let
+    val dir = FS.openDir (Path.concat (holdir, "sigobj"))
+    fun loop acc =
+      case FS.readDir dir of
+          NONE => acc
+        | SOME file =>
+            loop (if has_suffix ".uo" file andalso theory_logical_name (drop_suffix ".uo" file)
+                  then drop_suffix ".uo" file :: acc else acc)
+  in
+    sort_strings (loop [] before FS.closeDir dir)
+  end
+
+fun qualified_name text =
+  case String.fields (fn c => c = #":") text of
+      [logical] => {package = NONE, logical = run_token "name" logical}
+    | [package, logical] =>
+        if package <> "" andalso logical <> "" then
+          {package = SOME (run_token "package" package), logical = run_token "name" logical}
+        else raise Error ("run-action: expected NAME or PACKAGE:NAME, got " ^ HolbuildHash.quote text)
+    | _ => raise Error ("run-action: expected NAME or PACKAGE:NAME, got " ^ HolbuildHash.quote text)
+
+fun output_name text =
+  if text <> "" andalso String.sub (text, 0) <> #"." andalso
+     CharVector.all (fn c => Char.isAlphaNum c orelse c = #"." orelse c = #"_" orelse c = #"-") text
+  then text
+  else raise Error ("run-action: output name " ^ HolbuildHash.quote text ^
+                    " must be letters, digits, '.', '_' and '-', not starting with '.'")
+
+(* The request a run-action command line makes: hol:X is a toolchain theory
+   when sigobj has it (X or XTheory), hol:* every one; a library sigobj has
+   is the toolchain's; the rest are planned as build targets. *)
+fun run_request holdir {targets, script, supports, loads, outputs, timeout} : run_request =
+  let
+    fun context target =
+      if target = "hol:*" then map HolContext (toolchain_theories holdir)
+      else
+        case qualified_name target of
+            name as {package = SOME "hol", logical} =>
+              let val theory = if theory_logical_name logical then logical else logical ^ "Theory"
+              in if sigobj_has holdir theory then [HolContext theory] else [ProjectContext name] end
+          | name => [ProjectContext name]
+    fun load text =
+      case qualified_name text of
+          name as {package = NONE, logical} =>
+            if sigobj_has holdir logical then ToolchainLoad logical else PlannedLoad name
+        | name => PlannedLoad name
+    val outputs = map output_name outputs
+  in
+    if null targets then raise Error "run-action: name at least one TARGET"
+    else if null outputs then raise Error "run-action: declare at least one --output"
+    else if length (unique_strings outputs) <> length outputs then raise Error "run-action: an --output is declared twice"
+    else
+      {contexts = List.concat (map context targets), script = script, supports = supports,
+       loads = map load loads, outputs = sort_strings outputs, timeout = timeout}
+  end
+
+(* The build targets to plan for a request. *)
+fun run_planning_targets ({contexts, loads, ...} : run_request) =
+  unique_strings
+    (List.mapPartial (fn ProjectContext {logical, ...} => SOME logical | HolContext _ => NONE) contexts @
+     List.mapPartial (fn PlannedLoad {logical, ...} => SOME logical | ToolchainLoad _ => NONE) loads)
+
+(* A library's .uo; its signature, a node of the same name, is its dependency. *)
+fun is_sml_node node = #kind (HolbuildBuildPlan.source_of node) = HolbuildSourceIndex.Sml
+
+fun planned_node plan kind want {package = wanted_package, logical} =
+  let
+    val text = (case wanted_package of SOME p => p ^ ":" | NONE => "") ^ logical
+    fun matches node =
+      logical_name node = logical andalso want node andalso
+      (case wanted_package of SOME p => package node = p | NONE => true)
+  in
+    case List.filter matches (HolbuildBuildPlan.selected_nodes plan) of
+        [node] => node
+      | [] => raise Error ("run-action: " ^ text ^ " is not a " ^ kind ^ " of the project")
+      | _ => raise Error ("run-action: several packages have " ^ logical ^ "; name it as PACKAGE:" ^ logical)
+  end
+
+(* PATH as an absolute path, named as given: symbolic links are kept, since
+   a script opens its files by these names. *)
+fun given_file what path =
+  let val full = normalize_path (Path.mkAbsolute {path = path, relativeTo = FS.getDir ()})
+  in
+    if (not (FS.isDir full) handle OS.SysErr _ => false) then full
+    else raise Error ("run-action: no " ^ what ^ " " ^ path)
+  end
+
+(* The caller's script, and its support files by their path relative to the
+   script's directory, sorted. *)
+fun run_files script supports =
+  let
+    val script = given_file "script" script
+    val dir = Path.dir script
+    fun support path =
+      let val rel = Path.mkRelative {path = given_file "support file" path, relativeTo = dir}
+      in
+        if escapes_root rel then
+          raise Error ("run-action: support file " ^ path ^ " is not under the script's directory " ^ dir)
+        else {rel = run_token "support file" rel, path = Path.concat (dir, rel)}
+      end
+    val supports = map support supports
+    val rels = map #rel supports
+    val _ = if length (unique_strings rels) = length rels then ()
+            else raise Error "run-action: a --support file is given twice"
+  in
+    {script = script,
+     supports = List.concat (map (fn rel => List.filter (fn s => #rel s = rel) supports) (sort_strings rels))}
+  end
+
+(* Nodes in order of first appearance. *)
+fun unique_nodes nodes =
+  rev (List.foldl (fn (node, acc) =>
+                      if List.exists (fn n => HolbuildBuildPlan.key n = HolbuildBuildPlan.key node) acc then acc
+                      else node :: acc) [] nodes)
+
+(* Writes the run spec of each context of REQUEST under .holbuild/run-specs,
+   uploads the specs and every file they name to the remote cache, and
+   returns a line "<context> <run_key> <spec_sha256>" for each context
+   exported, and whether a project context was refused because the local
+   cache has no entry for it.  PLANNED is the plan of the request's
+   run_planning_targets, NONE when it has none. *)
+fun export_run_specs tc project planned jobs ({contexts, script, supports, loads, outputs, timeout} : run_request) =
+  let
+    val remote =
+      case HolbuildRemoteCacheConfig.url () of
+          SOME url => HolbuildRemoteCache.remote url
+        | NONE => raise Error "run-action needs a remote cache: pass --remote-cache URL"
+    val _ =
+      if HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc) then
+        raise Error "run-action: tracing-kernel actions key on the exact HOL executable and stay local"
+      else ()
+    val root = project_artifact_root project
+    val action_toolchain_key = HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key
+    val toolchain_line = spec_toolchain_line tc project
+    val runtime = runtime_identity ()
+    val {script, supports} = run_files script supports
+    val script_sha256 = HolbuildHash.file_sha256 script
+    val planned =
+      Option.map (fn {options, plan, toolchain_key} =>
+                     {options = options, plan = plan, toolchain_key = toolchain_key,
+                      keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
+                               action_toolchain_key plan})
+                 planned
+    fun the_plan () =
+      case planned of
+          SOME p => p
+        | NONE => raise Error "internal error: run-action has project targets but no plan"
+    (* Each load with its planned node, if it has one. *)
+    val loads =
+      map (fn ToolchainLoad name => (NONE, run_token "library" name)
+            | PlannedLoad name =>
+                (SOME (planned_node (#plan (the_plan ())) "library" is_sml_node name), #logical name))
+          loads
+    (* Libraries of the hol package come with the toolchain, so the
+       toolchain key fixes them, as it does sigobj's. *)
+    fun load_key_line (NONE, name) = "load=" ^ name
+      | load_key_line (SOME node, _) =
+          if package node = "hol" then "load=" ^ logical_name node
+          else "load=" ^ package node ^ ":" ^ logical_name node ^ "@" ^
+               HolbuildBuildPlan.input_key_for (#keys (the_plan ())) node
+    fun run_load_line (NONE, name) = "run-load HOLLIB:" ^ name
+      | run_load_line (SOME node, _) = "run-load " ^ package node ^ ":" ^ logical_name node
+    val load_closure =
+      List.concat (List.mapPartial
+                     (fn (SOME node, _) => SOME (HolbuildBuildPlan.transitive_project_deps (#plan (the_plan ())) node @ [node])
+                       | (NONE, _) => NONE)
+                   loads)
+    val run_text_tail =
+      ["script=" ^ script_sha256] @
+      map (fn {rel, path} => "support=" ^ rel ^ "@" ^ HolbuildHash.file_sha256 path) supports @
+      map load_key_line loads @
+      map (fn name => "output=" ^ name) outputs
+    val spec_dir = Path.concat (root, ".holbuild/run-specs")
+    val refused = ref false
+    fun refuse name =
+      (refused := true;
+       HolbuildStatus.message_stderr
+         ("holbuild: run-action: " ^ name ^ " is not in the local cache for its current inputs; build it first\n");
+       NONE)
+    fun export context =
+      let
+        (* THEORIES have their scripts shipped; REQUIRED must be built here. *)
+        val (name, key_line, context_line, {library_lines, dep_lines, lib_lines, library_files}, load_lines,
+             theories, required) =
+          case context of
+              HolContext theory =>
+                let
+                  val name = "HOL:" ^ theory
+                  val extras = unique_nodes load_closure
+                in
+                  case planned of
+                      SOME {plan, keys, ...} =>
+                        (name, "context=" ^ name, "context " ^ name,
+                         dependency_spec_lines root plan keys (spec_token name) extras, [],
+                         List.filter is_theory_node extras, List.filter is_theory_node extras)
+                    | NONE =>
+                        (name, "context=" ^ name, "context " ^ name,
+                         {library_lines = [], dep_lines = [], lib_lines = [], library_files = []}, [], [], [])
+                end
+            | ProjectContext wanted =>
+                let
+                  val {options, plan, keys, toolchain_key} = the_plan ()
+                  val node = planned_node plan "theory" is_theory_node wanted
+                  val name = package node ^ ":" ^ logical_name node
+                  val token = spec_token name
+                  val action = theory_action root plan keys toolchain_key
+                                 (dependency_input_context_key toolchain_key plan keys node) node
+                  val _ =
+                    case excluded_reason options project action node of
+                        SOME reason => raise Error ("run-action: " ^ name ^ " can't run remotely: " ^ reason)
+                      | NONE => ()
+                  val deps = HolbuildBuildPlan.transitive_project_deps plan node
+                  val closure = node :: deps
+                  fun in_closure n = List.exists (fn c => HolbuildBuildPlan.key c = HolbuildBuildPlan.key n) closure
+                  val extras = List.filter (not o in_closure) (unique_nodes load_closure)
+                  val context_lines = dependency_spec_lines root plan keys token deps
+                  val extra_lines = dependency_spec_lines root plan keys token extras
+                in
+                  (name, "context=" ^ name ^ "@" ^ #input_key action,
+                   dep_theory_line root keys token "context" node,
+                   {library_lines = #library_lines context_lines @ #library_lines extra_lines,
+                    dep_lines = #dep_lines context_lines @ #dep_lines extra_lines,
+                    lib_lines = #lib_lines context_lines @ #lib_lines extra_lines,
+                    library_files = #library_files context_lines @ #library_files extra_lines},
+                   map (theory_load_spec_line token) (#loads action),
+                   node :: List.filter is_theory_node (deps @ extras),
+                   node :: List.filter is_theory_node extras)
+                end
+        val missing =
+          case planned of
+              SOME {options, plan, keys, ...} =>
+                List.find (fn node => not (local_entry_satisfies options project plan node
+                                             (HolbuildBuildPlan.input_key_for keys node)))
+                          required
+            | NONE => NONE
+      in
+        case missing of
+            SOME node => refuse (if package node ^ ":" ^ logical_name node = name then name
+                                 else name ^ " needs " ^ package node ^ ":" ^ logical_name node ^ ", which")
+          | NONE =>
+              let
+                val run_text =
+                  String.concatWith "\n"
+                    (["holbuild-run-v1", "toolchain=" ^ action_toolchain_key, key_line] @ run_text_tail) ^ "\n"
+                val run_key = HolbuildToolchain.hash_text run_text
+                val token = spec_token name
+                (* The context's key names each script's planned hash, so the
+                   file shipped must be the one planned. *)
+                fun script_line node =
+                  let val line = file_line "context-script" (token (library_source_path node)) (source_file node)
+                  in
+                    if List.nth (String.tokens Char.isSpace line, 3) =
+                       HolbuildBuildPlan.source_hash (#plan (the_plan ())) node
+                    then line
+                    else raise Error ("theory script changed since the build was planned: " ^ source_file node)
+                  end
+                val script_lines = map script_line theories
+                val lines =
+                  [run_spec_header,
+                   "holbuild-version=" ^ HolbuildVersion.version,
+                   "holbuild-runtime=" ^ runtime,
+                   toolchain_line,
+                   "run-key=" ^ run_key,
+                   context_line] @
+                  library_lines @ dep_lines @ lib_lines @ load_lines @ script_lines @
+                  ["script " ^ script_sha256 ^ " " ^ Position.toString (FS.fileSize script)] @
+                  map (fn {rel, path} => file_line "support" rel path) supports @
+                  map run_load_line loads @
+                  map (fn output => "output " ^ output) outputs @
+                  (case timeout of SOME seconds => ["option timeout=" ^ Int.toString seconds] | NONE => []) @
+                  ["run-text"]
+                val text = String.concatWith "\n" lines ^ "\n" ^ run_text
+                val spec_sha256 = HolbuildHash.string_sha256 text
+                val path = Path.concat (spec_dir, spec_sha256)
+                val _ = (ensure_dir spec_dir; write_text path text)
+              in
+                SOME {line = String.concatWith " " [name, run_key, spec_sha256],
+                      files = script :: map #path supports @ map source_file theories @ library_files @ [path]}
+              end
+      end
+    val exported = List.mapPartial export contexts
+    val _ =
+      upload_spec_files remote jobs {known = fn _ => false, learn = fn _ => ()}
+        (List.concat (map #files exported))
+  in
+    {lines = map #line exported, refused = !refused}
   end
 
 (* holbuild exec-action: a remote worker builds one ActionSpec in a fixed
@@ -6652,14 +7310,6 @@ fun classify_run_failure stage log_text oom_before msg =
 (* A family's eviction returns the bytes it freed, or NONE if it was kept. *)
 type cache_family = {mtime : Time.time, evict : unit -> Position.int option}
 
-fun tree_bytes path =
-  if (FS.isLink path handle OS.SysErr _ => false) then 0
-  else if (FS.isDir path handle OS.SysErr _ => false) then
-    List.foldl (fn (child, total) => total + tree_bytes child) (0 : Position.int) (children path)
-  else file_size path
-
-fun modified_time path = FS.modTime path handle OS.SysErr _ => Time.zeroTime
-
 fun checkpoint_cache_families checkpoint_root =
   List.map
     (fn ({base, mtime, bytes} : checkpoint_family) =>
@@ -6728,49 +7378,26 @@ fun local_cache_families cache =
     List.map orphan_family orphans @ List.map entry_family entries
   end
 
-(* The shared heap and checkpoint store: one family per heap directory,
-   used when an action restores from it or adds to it. *)
-fun share_store cache = Path.concat(cache, "checkpoint-store")
-
-(* An action holds a shared lease on each store family it uses until it
-   exits, so no other container's cap sweep evicts the family meanwhile.
-   fcntl locks are dropped when the process closes any descriptor for the
-   file, so a family is leased at most once per process, as toolchains are. *)
-fun store_lease_path dir = dir ^ ".lease"
-
-val store_leases = ref ([] : (string * HolbuildFileLock.t) list)
-
-fun holds_store_lease path = List.exists (fn (held, _) => held = path) (!store_leases)
-
-fun lease_store_family store heap =
-  let val path = store_lease_path (Path.concat(store, heap))
-  in
-    if holds_store_lease path then ()
-    else store_leases := (path, HolbuildFileLock.acquire_shared_path_wait {path = path}) :: !store_leases
-  end
-
 fun store_cache_families cache =
-  List.map
-    (fn dir =>
-        {mtime = modified_time dir,
-         evict = fn () =>
-           let val lease = store_lease_path dir
-           in
-             if holds_store_lease lease then NONE
-             else
-               case HolbuildFileLock.try_acquire_path {path = lease, obsolete_kind = NONE}
-                    handle HolbuildFileLock.Error _ => NONE of
-                   NONE => NONE
-                 | SOME lock =>
-                     let val bytes = tree_bytes dir
-                     in
-                       (HolbuildCache.remove_tree dir handle e => (HolbuildFileLock.release lock; raise e));
-                       HolbuildFileLock.release lock;
-                       if path_exists dir then NONE else SOME bytes
-                     end
-           end})
-    (List.filter (fn path => FS.isDir path handle OS.SysErr _ => false)
-                 (HolbuildCache.children (share_store cache)))
+  List.map (fn dir => {mtime = modified_time dir, evict = fn () => evict_store_family dir})
+           (store_families (share_store cache))
+
+(* holbuild gc: the store's families no build used within DAYS, except one
+   a running process leases or a heap a tree still links: removing that frees
+   nothing. *)
+fun gc_checkpoint_store days =
+  let
+    val cutoff = retention_cutoff days
+    fun removable dir = Time.<(modified_time dir, cutoff) andalso store_heap_links dir <= 1
+    val removed =
+      List.foldl
+        (fn (dir, n) => if removable dir andalso Option.isSome (try_evict_store_family dir) then n + 1 else n)
+        0 (store_families (share_store (HolbuildCache.cache_root ())))
+  in
+    (* stderr: gc's stdout is its one summary line. *)
+    if removed = 0 then ()
+    else TextIO.output (TextIO.stdErr, "checkpoint store gc: removed families=" ^ Int.toString removed ^ "\n")
+  end
 
 (* Factory modules have no on-disk module parents.  Once loaded their code
    is resident, so concurrent eviction only makes a later load use source. *)
@@ -6896,57 +7523,8 @@ fun exception_failure e =
    eviction, and a symbolic one points into a family the action leases until
    it exits, which no cap sweep evicts. *)
 
-fun store_path store heap sha = Path.concat(Path.concat(store, heap), sha)
-
-(* A name no process, in this container or another, also picks. *)
-fun store_temp path =
-  HolbuildTempPath.near path ("." ^ LargeInt.toString (Time.toNanoseconds (Time.now ())) ^ ".tmp")
-
-fun link_or_copy_file src dst =
-  (ensure_parent dst;
-   remove_file dst;
-   Posix.FileSys.link {old = src, new = dst}
-   handle OS.SysErr _ => copy_binary src dst)
-
-fun touch_dir dir = Posix.FileSys.utime (dir, NONE) handle OS.SysErr _ => ()
-
-(* Only Poly/ML states are linked: the run writes a failed prefix's .meta and
-   .prefix in place. *)
-fun share_file save src dst = if save then link_or_copy_file src dst else copy_binary src dst
-
-fun store_add store heap {sha, src, save} =
-  let
-    val _ = lease_store_family store heap
-    val dst = store_path store heap sha
-  in
-    if file_exists dst then ()
-    else
-      let val tmp = store_temp dst
-      in
-        (ensure_parent tmp; share_file save src tmp; FS.rename {old = tmp, new = dst})
-        handle e => (remove_file tmp; raise e)
-      end
-  end
-
 (* A blob a shared entry names that the remote cache no longer holds. *)
 exception MissingSharedBlob of string
-
-val noted_store_mount = ref false
-
-(* A Poly/ML state from the store, hard-linked; across file systems, where a
-   store on its own mount puts it, symbolically linked, which is safe while
-   this process leases the state's family. *)
-fun place_state stored dst =
-  (remove_file dst;
-   Posix.FileSys.link {old = stored, new = dst}
-   handle OS.SysErr (_, err) =>
-     if err <> SOME Posix.Error.xdev then copy_binary stored dst
-     else
-       (if !noted_store_mount then ()
-        else (noted_store_mount := true;
-              HolbuildStatus.message_stderr
-                "holbuild: the checkpoint store is on another file system; linking its states symbolically\n");
-        Posix.FileSys.symlink {old = Path.mkAbsolute {path = stored, relativeTo = FS.getDir ()}, new = dst}))
 
 (* Puts blob `sha` of heap `heap`'s family at `dst`, from the store, which
    fetches it from the remote cache if it lacks it. *)
@@ -7075,8 +7653,6 @@ fun shared_context cache checkpoint_root tc root policy (action : theory_action)
      requested_timeout = tactic_timeout policy,
      candidates = shared_candidates policy base checkpoints}
   end
-
-fun saved_parent path = PolyML.SaveState.showParent path handle _ => NONE
 
 fun shared_heap_parent_ok ({deps_loaded, base_state, ...} : shared_context) =
   case saved_parent deps_loaded of
