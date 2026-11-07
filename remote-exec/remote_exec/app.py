@@ -86,6 +86,17 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
                     logger.exception("sweep failed")
                 await asyncio.sleep(settings.sweep_seconds)
 
+        async def cache_pool_forever() -> None:
+            while True:
+                try:
+                    if coordinator.cache_pool is not None:
+                        await coordinator.cache_pool.reconcile(coordinator.clock())
+                except Exception as error:
+                    exit_on_auth_failure(error)
+                    logger.exception("cache pool reconciliation failed; keeping lifecycle ownership")
+                await asyncio.sleep(settings.sweep_seconds)
+
+        pool_controller = asyncio.create_task(cache_pool_forever()) if coordinator.cache_pool is not None else None
         sweeper = asyncio.create_task(sweep_forever())
         try:
             yield
@@ -93,11 +104,36 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             sweeper.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await sweeper
+            if pool_controller is not None:
+                pool_controller.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await pool_controller
             await coordinator.aclose()
 
     app = FastAPI(title="holbuild remote-exec coordinator", lifespan=lifespan)
     client = [Depends(bearer(settings.client_token))]
     worker = [Depends(bearer(settings.worker_token))]
+
+    def cache_reader(authorization: str | None = Header(default=None)) -> None:
+        supplied = (authorization or "").encode()
+        valid = [hmac.compare_digest(supplied, f"Bearer {token.get_secret_value()}".encode())
+                 for token in (settings.client_token, settings.worker_token)]
+        if not any(valid):
+            raise HTTPException(401, "bad or missing bearer token")
+
+    @app.get("/v1/cache/members", dependencies=[Depends(cache_reader)], response_class=Response)
+    async def cache_members() -> Response:
+        from remote_exec.cache import cache_nodes, node_identity
+
+        permanent = [node_identity(url) for url in cache_nodes(settings.cache_url)]
+        dynamic = await coordinator.cache_pool.ready_urls() if coordinator.cache_pool is not None else []
+        urls = list(dict.fromkeys(permanent + dynamic))
+        return Response("holbuild-cache-members-v1\n" + "\n".join(urls) + "\n", media_type="text/plain",
+                        headers={"Cache-Control": "no-store"})
+
+    @app.get("/v1/cache/slots", dependencies=client)
+    async def cache_slots() -> list[dict[str, object]]:
+        return [asdict(slot) for slot in await coordinator.cache_pool.status()] if coordinator.cache_pool else []
 
     # A refused login reaches requests as asyncpg's own error when a new connection opens, so check every error.
     @app.exception_handler(Exception)
@@ -182,7 +218,10 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         if body.phases is not None:
             coordinator.report_phases(body.phases)
         tiers = [body.tier, *(t for t in body.also_claim if t != body.tier)]
-        claimed = await coordinator.claim(tiers, body.worker, body.wait_s, request.is_disconnected)
+        claimed = await coordinator.claim(
+            tiers, body.worker, body.wait_s, request.is_disconnected,
+            host_id=None if body.host is None else body.host.id,
+        )
         if claimed is None:
             return Response(status_code=204)
         return asdict(claimed)

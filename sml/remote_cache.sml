@@ -38,6 +38,7 @@ fun base_url (RemoteCache {urls, ...}) = String.concatWith "," urls
 (* Authentication does not change node identity; full URLs are kept for requests. *)
 fun ranked_urls (RemoteCache {urls, ...}) digest =
   let
+    val urls = HolbuildCacheDiscovery.urls urls
     fun score url =
       let val identity = HolbuildRemoteCacheConfig.node_identity url
       in ((HolbuildHash.string_sha256 (identity ^ ":" ^ digest), identity), url) end
@@ -51,9 +52,7 @@ fun ranked_urls (RemoteCache {urls, ...}) digest =
 
 fun request_urls cache kind digest =
   let val ranked = ranked_urls cache digest
-  in map (fn url => url ^ "/" ^ kind ^ "/" ^ digest)
-       (List.take (ranked, Int.min (2, length ranked)))
-  end
+  in map (fn url => url ^ "/" ^ kind ^ "/" ^ digest) ranked end
 
 fun blob_map (RemoteCache {blobs, ...}) = blobs
 
@@ -301,22 +300,22 @@ fun transient (HolbuildHttp.Failed _) = true
 (* The breaker observes the whole request: a dead primary must not disable a healthy backup. *)
 fun routed_status method urls path request =
   let
-    val primary = hd urls
-    val result = traced method primary path (fn () => request primary)
-    val retry = transient result orelse
-      ((method = "GET" orelse method = "HEAD") andalso result = HolbuildHttp.Response 404)
-  in
-    case tl urls of
-        backup :: _ =>
-          if retry then
-            let val next = traced method backup path (fn () => request backup)
+    val read = method = "GET" orelse method = "HEAD"
+    val grace = read andalso HolbuildCacheDiscovery.joining ()
+    fun loop [] _ missing last = Option.getOpt (missing, last)
+      | loop (node :: rest) count missing last =
+          if count >= 2 andalso not grace andalso (not read orelse (count = 2 andalso Option.isSome missing)) then
+            Option.getOpt (missing, last)
+          else
+            let
+              val result = traced method node path (fn () => request node)
+              val missing = if read andalso result = HolbuildHttp.Response 404 then SOME (node, result) else missing
             in
-              if result = HolbuildHttp.Response 404 andalso transient next then (primary, result)
-              else (backup, next)
+              if transient result orelse (read andalso result = HolbuildHttp.Response 404) then
+                loop rest (count + 1) missing (node, result)
+              else (node, result)
             end
-          else (primary, result)
-      | [] => (primary, result)
-  end
+  in loop urls 0 NONE (hd urls, HolbuildHttp.Failed "no cache response") end
 
 (* NONE when the remote cache is disabled, without a request.  With
    fail_closed, raises Unavailable instead, and for no answer, 429 or 5xx. *)

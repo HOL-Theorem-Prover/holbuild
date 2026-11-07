@@ -2,6 +2,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -312,6 +313,22 @@ def host_report(host_id: str, cpu_idle_pct: float | None) -> dict[str, Any]:
         "leases": 2,
         "memory_short": False,
     }
+
+
+@pytest.mark.parametrize("host_id", [None, "host-a"])
+async def test_claim_forwards_optional_host_id(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch, host_id: str | None
+) -> None:
+    claim = AsyncMock(return_value=None)
+    monkeypatch.setattr(coordinator, "claim", claim)
+    body: dict[str, Any] = {"tier": "high", "also_claim": ["standard"], "worker": "w1"}
+    if host_id is not None:
+        body["host"] = host_report(host_id, 30.0)
+    response = await http.post("/v1/work/claim", json=body, headers=WORKER)
+    assert response.status_code == 204
+    assert claim.await_args is not None
+    assert claim.await_args.args[:3] == (["high", "standard"], "w1", 0)
+    assert claim.await_args.kwargs == {"host_id": host_id}
 
 
 async def test_queue_lists_the_hosts_workers_reported(http: httpx.AsyncClient, coordinator: Coordinator) -> None:
