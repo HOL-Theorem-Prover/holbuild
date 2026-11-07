@@ -51,6 +51,11 @@ runs finish and cancel queued run batches. Use the current image to run
 `alembic downgrade 0004` before starting the older image, whose migration
 code does not know revision `0005`.
 
+Migration `0007` adds a nullable `batches.max_heap_mb` column. Old clients
+leave it null; new workers use their default when an old coordinator omits
+it from a claim. Before rolling back to an older image, use the current image
+to run `alembic downgrade 0006`.
+
 Migration `0006` adds a nullable column for each action's phase timings.
 To roll back to an image predating `0006`, use the current image to run
 `alembic downgrade 0005` first, then run the older image's `migrate` and
@@ -93,6 +98,21 @@ docker run -e REMOTE_EXEC_WORKER_TOKEN=... -e HOLBUILD_REMOTE_CACHE_CURL_CONFIG_
   [--share-heaps] [--holbuild-releases-dir DIR] [--protection-cmd COMMAND] [--claim-wait-seconds 20]
 ```
 
+The coordinator's `REMOTE_EXEC_CACHE_URL` (or `HOLBUILD_REMOTE_CACHE_URL` as a
+fallback) and the worker's `--remote-cache` (or `HOLBUILD_REMOTE_CACHE_URL`)
+accept comma-separated cache nodes. Whitespace separators also work; trailing
+slashes and duplicate nodes are removed. Inline credentials are excluded from
+node identity, so they agree with curl-config authentication. Use the same
+node hostnames and paths as the clients:
+coordinator reads and worker bootstrap spec downloads use holbuild's digest
+ranking and second-node fallback, including a read's 404 during handoff.
+See the top-level README's remote-cache configuration for the routing contract.
+
+Before enabling multiple cache nodes, upgrade the coordinator, workers and
+submitting clients to a release that supports cache rings, and drain batches
+whose specs name older holbuild releases. Workers run the release named in
+each spec; an older release treats the entire list as one URL.
+
 The remote cache's credentials are a curl config, as holbuild reads it from
 the file `HOLBUILD_REMOTE_CACHE_CURL_CONFIG` names; the entrypoint writes
 `HOLBUILD_REMOTE_CACHE_CURL_CONFIG_CONTENT` to such a file, readable only by
@@ -106,8 +126,8 @@ out of the builds' environment (and out of what they log or pass on). A
 build runs as the worker's user, so one that goes looking can still read the
 token from the worker's `/proc/<pid>/environ`. Outside the image,
 `python3 -m remote_exec.worker` runs the worker; it uses only the standard
-library and `curl`. High-tier workers run with a larger `--max-heap` on bigger
-machines; `--also-claim standard` lets them take standard-tier work when no
+library and `curl`. A batch can override the worker's `--max-heap` default
+(12000 MB); `--also-claim standard` lets them take standard-tier work when no
 high-tier action is ready. With `--cooperate-dir`, a worker claims only while
 holbuild's memory admission in that directory would start one more child
 there, so an action a busy host couldn't start yet stays at the coordinator
@@ -150,6 +170,12 @@ holbuild-action-batch-v1
 action <input_key> <ac-key> <spec-sha256> <package>:<theory>
 edge <input_key> <parent input_key>
 ```
+
+The client sends its `--max-heap MB` as the optional positive integer query
+parameter `max_heap_mb` on `POST /v1/batches`. The coordinator stores it with
+the batch and returns it on `/v1/work/claim`; workers pass it to `exec-action`.
+When absent or null, the worker uses its own `--max-heap` setting. This limit
+is execution policy and does not change action keys.
 
 A batch has one class: `build` (the default) or `run`, selected with
 `POST /v1/batches?class=run`. Run actions execute submitted scripts in cached
@@ -462,3 +488,99 @@ The tests need a Postgres role that may create databases:
 ```bash
 REMOTE_EXEC_TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost/postgres uv run pytest
 ```
+
+## Temporary cache members
+
+The coordinator can keep a stable permanent cache ring while adding temporary
+members with worker demand. `GET /v1/cache/members` accepts either the client
+or worker bearer token and returns `text/plain`:
+
+```text
+holbuild-cache-members-v1
+https://cache-a.example
+https://cache-b.example
+https://cache-c.example
+```
+
+The permanent configured URLs are always present. The API carries canonical
+identities without credentials. A temporary member appears only after its
+adapter has verified DNS, TLS and authenticated CAS write/read readiness.
+`GET /v1/cache/slots` (client token) lists each assigned slot, owner, lifecycle
+phase and last operation error; it omits provider operation tokens.
+
+Clients refresh membership every 30 seconds when the deployment sets
+`HOLBUILD_REMOTE_CACHE_DISCOVERY_URL`. Set `HOLBUILD_REMOTE_CACHE_ALLOWED_URLS`
+to the comma-separated identities allowed to receive the cache credential,
+including the permanent pair and every reserved temporary identity. Discovery
+can only select from that list. A response containing credentials, an unknown
+endpoint or an omitted permanent member is rejected. Existing inline cache
+credentials and `HOLBUILD_REMOTE_CACHE_CURL_CONFIG` continue to authenticate
+cache requests. Discovery uses `HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG`
+(or `HOLBUILD_REMOTE_EXEC_CURL_CONFIG`), a curl config holding the coordinator
+bearer header. Workers write their token to a private curl configuration file
+for the child, keeping the bearer value out of build environments; this does
+not isolate builds from files owned by the worker user.
+Discovery never follows redirects. If it fails, the last complete ring remains
+usable for 60 seconds, after which requests use the permanent configuration.
+Recovery from permanent fallback counts as a new join.
+For 60 seconds after observing a joined member, GET/HEAD can try every ready
+member to find an object whose former owner has not uploaded it yet. Outside
+that join grace, a miss tries at most two nodes. If both nodes fail with
+transport errors, 429 or 5xx, reads can continue through the snapshot so stale
+readers can bypass concurrent drains. Writes always keep the two-node bound.
+
+### Capacity adapter
+
+`REMOTE_EXEC_CACHE_POOL_CMD` is a deployment-owned executable, not a shell
+snippet. The coordinator sends one JSON request on stdin, reads one JSON
+response from stdout, and limits each invocation to 20 seconds. Keep cloud
+SDKs and permissions in the deployment layer. The adapter protocol's typed
+request and response are `AdapterRequest` and `AdapterResponse` in
+`remote_exec/cache_pool.py`. Long operations return a token and are polled;
+commands must be idempotent across retries and coordinator crashes. Opaque
+provider ownership data is persisted separately from operation tokens, before
+any DNS publication.
+
+Configure one to four `REMOTE_EXEC_CACHE_SLOTS` as a JSON list of
+`{"name":"slot-c","url":"https://cache-c.example"}`. The existing Postgres
+database stores ownership; a dedicated advisory lock elects one controller,
+without holding a database transaction open during provider calls. The
+controller keeps reconciling and heartbeating hooks when capacity is disabled,
+so disabling scale-out can still drain existing instances.
+
+`REMOTE_EXEC_CACHE_WORKERS_PER_NODE` maps the existing held burst-worker target
+to cache capacity by ceiling division, capped at the number of slots. Each
+controller rereads shared held demand while holding the capacity writer lock;
+a delayed replica cannot overwrite it with a local snapshot. The
+default is 15 worker tasks per added cache; zero requests no temporary capacity.
+This counts worker tasks rather than their hosts. Validate the configured ratio
+with deployment load before enabling it. Provider CPU scale-out recommendations
+are combined with the worker floor by the same capacity writer and held for
+`REMOTE_EXEC_SCALE_DOWN_HOLD_S`; they cannot lower the worker target.
+
+A retiring member leaves discovery, then its ingress stops gracefully. The
+adapter records when ingress actually finished stopping. Only after at least
+`REMOTE_EXEC_CACHE_DRAIN_SECONDS` (minimum and default 60) may the controller
+ask for durability verification. It stops the backend, withdraws only that
+owner's DNS, and completes termination only after positive durability proof.
+A timer alone is insufficient. Failed operations retain the slot and hook and
+are reported through the slot endpoint and coordinator logs. A finite provider
+hook timeout or a host crash remains a failure boundary, not a successful
+drain. Slot reuse waits for authoritative termination confirmation and DNS
+cleanup; missing inventory alone is not confirmation.
+
+Deploy the discovery-capable release to clients and every worker-selected
+release before enabling capacity. Exercise concurrent claims, failed boots,
+failed drains, stale readers, DNS ownership and a real scale-out/scale-in cycle
+in the deployment environment. Rollback requests zero temporary capacity and
+uses the same drain path while retaining the permanent ring and registry.
+
+Launch assignment time is persisted. `REMOTE_EXEC_CACHE_LAUNCH_TIMEOUT_SECONDS`
+(default 900) bounds configuration/readiness retries across coordinator restarts.
+An explicit adapter launch error or an expired deadline starts the same verified
+drain path, then the adapter abandons the unadmitted launch after backend stop
+and DNS withdrawal. Heartbeats continue during cleanup; a failed launch cannot
+become a serving member. A provider hook deadline remains a failure boundary.
+
+If provider inventory confirms that a launch was admitted but its acknowledgement
+was lost, reconciliation resumes admission even after the launch deadline.

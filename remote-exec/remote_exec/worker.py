@@ -29,8 +29,11 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
+
+from remote_exec.cache import cache_nodes, ranked_nodes
+from remote_exec.membership import REFRESH_SECONDS, Membership
 
 DEFAULT_SOURCE_URL = "https://github.com/HOL-Theorem-Prover/holbuild/archive/refs/tags/v{version}.tar.gz"
 RELEASE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
@@ -186,28 +189,50 @@ class Releases:
     source_url: str
     remote_cache: str
     curl_config: str | None
+    joining: bool = field(default=False, kw_only=True)
 
     def spec_version(self, spec_sha256: str) -> str:
         """The ``holbuild-version`` of the action spec stored in the remote cache's ``/cas/``."""
         # -g: no URL globbing, whose errors print the URL with any credentials in it.
         # The status follows the body on its own line: 000 when there was no answer.
-        command = ["curl", "-fsSLg", "--retry", "3", "-w", "\n%{http_code}"]
+        nodes = cache_nodes(self.remote_cache)
+        command = ["curl", "-fsSLg", "-w", "\n%{http_code}"]
+        if len(nodes) == 1:
+            command += ["--retry", "3"]
+        else:
+            command += ["--connect-timeout", "5", "--speed-limit", "1", "--speed-time", "30"]
         if self.curl_config is not None:
             command += ["-K", self.curl_config]
-        command.append(f"{self.remote_cache.rstrip('/')}/cas/{spec_sha256}")
-        # Not check=True: its error would print the command line, and the cache URL may carry credentials.
-        try:
-            fetched = subprocess.run(command, capture_output=True, text=True, timeout=120)
-        except subprocess.TimeoutExpired:
-            raise CacheUnavailable(f"fetching spec {spec_sha256} from the remote cache timed out") from None
-        spec, _, status = fetched.stdout.rpartition("\n")
-        if fetched.returncode != 0:
+        unavailable: str | None = None
+        missing: str | None = None
+        failure = f"spec {spec_sha256} is missing from the remote cache"
+        for attempt, node in enumerate(ranked_nodes(nodes, spec_sha256), 1):
+            if attempt == 3 and not self.joining and missing is not None:
+                raise RuntimeError(missing)
+            # Not check=True: its error would print credentials in the command line.
+            try:
+                fetched = subprocess.run(
+                    [*command, f"{node}/cas/{spec_sha256}"], check=False, capture_output=True, text=True, timeout=120
+                )
+            except subprocess.TimeoutExpired:
+                unavailable = f"fetching spec {spec_sha256} from the remote cache timed out"
+                continue
+            spec, _, status = fetched.stdout.rpartition("\n")
+            if fetched.returncode == 0:
+                break
             failure = f"fetching spec {spec_sha256} from the remote cache failed: {fetched.stderr.strip()}"
-            # Only an answer of 4xx, such as 404 for a spec the cache lost, won't come right by asking again; no
-            # answer, 429, 5xx or a transfer cut short may well.
             if fetched.returncode == 22 and status.startswith("4") and status != "429":
+                if status == "404":
+                    missing = failure
+                    continue
                 raise RuntimeError(failure)
-            raise CacheUnavailable(failure)
+            unavailable = failure
+        else:
+            if missing is not None:
+                raise RuntimeError(missing)
+            if unavailable is not None:
+                raise CacheUnavailable(unavailable)
+            raise RuntimeError(failure)
         versions = [
             line.removeprefix("holbuild-version=") for line in spec.splitlines() if line.startswith("holbuild-version=")
         ]
@@ -517,14 +542,16 @@ def exec_action_env() -> dict[str, str]:
     return {
         name: value
         for name, value in os.environ.items()
-        if name in EXEC_ACTION_ENV or name.lower() in PROXY_ENV or name.startswith("HOLBUILD_")
+        if (name in EXEC_ACTION_ENV or name.lower() in PROXY_ENV or name.startswith("HOLBUILD_"))
+        and name != "HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN"
     }
 
 
-def exec_action_command(args: argparse.Namespace, holbuild: str, spec: str, result: str) -> list[str]:
+def exec_action_command(
+    args: argparse.Namespace, holbuild: str, spec: str, result: str, max_heap_mb: int | None
+) -> list[str]:
     command = [holbuild, "--remote-cache", args.remote_cache]
-    if args.max_heap is not None:
-        command += ["--max-heap", str(args.max_heap)]
+    command += ["--max-heap", str(args.max_heap if max_heap_mb is None else max_heap_mb)]
     if args.cooperate_dir is not None:
         command += ["--cooperate-dir", args.cooperate_dir]
     command += ["exec-action", spec, "--cache-limit-gb", str(args.cache_limit_gb), "--result", result]
@@ -643,7 +670,9 @@ def execute(
         spans = ExecSpans()
         stepped = time.monotonic()
         process = subprocess.Popen(
-            exec_action_command(args, holbuild, spec, result), env=exec_action_env(), start_new_session=True
+            exec_action_command(args, holbuild, spec, result, claim.get("max_heap_mb")),
+            env=exec_action_env(),
+            start_new_session=True
         )
         try:
             while process.poll() is None:
@@ -693,7 +722,10 @@ def claim_wait_seconds(text: str) -> float:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--coordinator", required=True, help="coordinator base URL")
-    parser.add_argument("--remote-cache", required=True, help="remote cache URL passed to holbuild")
+    parser.add_argument(
+        "--remote-cache", default=os.environ.get("HOLBUILD_REMOTE_CACHE_URL"),
+        help="comma-separated remote cache URLs passed to holbuild (or HOLBUILD_REMOTE_CACHE_URL)",
+    )
     parser.add_argument("--cache-limit-gb", required=True, type=int, help="holbuild exec-action --cache-limit-gb")
     parser.add_argument("--tier", choices=("standard", "high"), default="standard")
     parser.add_argument(
@@ -703,7 +735,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=[],
         help="tiers to claim from when --tier has nothing ready, in order (repeatable or comma-separated)",
     )
-    parser.add_argument("--max-heap", type=int, help="holbuild --max-heap MB")
+    parser.add_argument("--max-heap", type=int, default=12000, help="default holbuild --max-heap MB (default: %(default)s)")
     parser.add_argument("--cooperate-dir", help="holbuild --cooperate-dir, shared by a host's workers")
     parser.add_argument("--share-heaps", action="store_true", help="holbuild exec-action --share-heaps")
     parser.add_argument(
@@ -728,7 +760,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=20.0,
         help="how long a claim waits at the coordinator for an action to become ready (at most 50)",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not args.remote_cache:
+        parser.error("--remote-cache or HOLBUILD_REMOTE_CACHE_URL is required")
+    try:
+        args.remote_cache = ",".join(cache_nodes(args.remote_cache))
+    except ValueError as error:
+        parser.error(str(error))
+    return args
+
+
+def refresh_cache_members(coordinator: Coordinator, membership: Membership, url: str, now: float) -> list[str]:
+    """Fetch one bounded, nonredirecting snapshot, retaining static cache access when discovery fails."""
+    if now - membership.attempted >= REFRESH_SECONDS:
+        membership.attempted = now
+        request = urllib.request.Request(url, headers={"Authorization": f"Bearer {coordinator.token}"})
+        try:
+            with coordinator.opener.open(request, timeout=5) as response:
+                data = response.read(16385)
+                if response.status != 200 or len(data) > 16384:
+                    raise ValueError("invalid cache membership response")
+                membership.update(data.decode(), now)
+        except (OSError, ValueError, http.client.HTTPException):
+            pass
+    return membership.current(now)
 
 
 def main() -> None:
@@ -757,33 +812,53 @@ def main() -> None:
     # Exit through Python on SIGTERM, so run_one's cleanup stops the running action.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
     phases = Phases()
-    while True:
-        if args.cooperate_dir is not None:
-            with phases.timed("memory_wait"):
-                waited = wait_for_memory(args.cooperate_dir, charge)
-            if waited and host is not None:
-                host.waited = True
-        started = time.monotonic()
-        claim = claim_reporting(coordinator, tiers, args.name, args.claim_wait_seconds, phases)
-        if claim is None:
-            # A claim that failed at once, or a coordinator that doesn't wait, isn't retried in a tight loop.
-            with phases.timed("idle"):
-                time.sleep(max(0.0, CLAIM_RETRY_SECONDS - (time.monotonic() - started)))
-            continue
-        try:
-            unavailable = run_one(coordinator, args, releases, protection, claim, phases)
-        except Exception as error:  # noqa: BLE001  # run_one reported it where it could; the worker goes on
-            # Else the lease expires and the coordinator retries; a rerun finds a published result cached. Waiting
-            # keeps a worker from failing ready action after ready action while the cache or the coordinator is down.
-            print(f"action failed in the worker: {error}", file=sys.stderr)
-            with phases.timed("idle"):
-                time.sleep(CLAIM_RETRY_SECONDS)
-            continue
-        if unavailable:
-            # The coordinator readies the action again at once, so without the wait the worker would claim it
-            # straight back while the cache is still down.
-            with phases.timed("idle"):
-                time.sleep(CLAIM_RETRY_SECONDS)
+    discovery_url = os.environ.get("HOLBUILD_REMOTE_CACHE_DISCOVERY_URL")
+    membership = None
+    with contextlib.ExitStack() as resources:
+        if discovery_url:
+            if discovery_url != coordinator.url + "/v1/cache/members":
+                sys.exit("cache discovery must use this worker's coordinator /v1/cache/members endpoint")
+            membership = Membership(cache_nodes(args.remote_cache),
+                                    cache_nodes(os.environ.get("HOLBUILD_REMOTE_CACHE_ALLOWED_URLS", args.remote_cache)))
+            directory = resources.enter_context(tempfile.TemporaryDirectory(prefix="holbuild-cache-discovery-"))
+            config = os.path.join(directory, "auth.curl")
+            if "\r" in token or "\n" in token:
+                sys.exit("worker token must not contain a newline")
+            header = ("Authorization: Bearer " + token).replace("\\", "\\\\").replace('"', '\\"')
+            with open(config, "x", opener=lambda path, flags: os.open(path, flags, 0o600)) as out:
+                out.write('header = "' + header + '"\n')
+            os.environ["HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG"] = config
+        while True:
+            if args.cooperate_dir is not None:
+                with phases.timed("memory_wait"):
+                    waited = wait_for_memory(args.cooperate_dir, charge)
+                if waited and host is not None:
+                    host.waited = True
+            started = time.monotonic()
+            claim = claim_reporting(coordinator, tiers, args.name, args.claim_wait_seconds, phases)
+            if claim is None:
+                # A claim that failed at once, or a coordinator that doesn't wait, isn't retried in a tight loop.
+                with phases.timed("idle"):
+                    time.sleep(max(0.0, CLAIM_RETRY_SECONDS - (time.monotonic() - started)))
+                continue
+            if membership is not None and discovery_url is not None:
+                now = time.monotonic()
+                nodes = refresh_cache_members(coordinator, membership, discovery_url, now)
+                releases = replace(releases, remote_cache=",".join(nodes), joining=membership.joining(now))
+            try:
+                unavailable = run_one(coordinator, args, releases, protection, claim, phases)
+            except Exception as error:  # noqa: BLE001  # run_one reported it where it could; the worker goes on
+                # Else the lease expires and the coordinator retries; a rerun finds a published result cached. Waiting
+                # keeps a worker from failing ready action after ready action while the cache or the coordinator is down.
+                print(f"action failed in the worker: {error}", file=sys.stderr)
+                with phases.timed("idle"):
+                    time.sleep(CLAIM_RETRY_SECONDS)
+                continue
+            if unavailable:
+                # The coordinator readies the action again at once, so without the wait the worker would claim it
+                # straight back while the cache is still down.
+                with phases.timed("idle"):
+                    time.sleep(CLAIM_RETRY_SECONDS)
 
 
 if __name__ == "__main__":

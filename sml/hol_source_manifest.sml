@@ -115,23 +115,32 @@ fun sequence_dirs holdir seq_rel =
       in List.foldl parse_line acc (read_lines canonical) end
   in rev (parse_file [] (abs_seq seq_rel) []) end
 
+fun toolchain_dirs holdir =
+  let
+    val toolchain_rel = HolbuildHolToolchainConfig.sequence_file (#sequence HolbuildHolToolchainConfig.default)
+    val toolchain_path = Path.concat(holdir, toolchain_rel)
+  in
+    if readable toolchain_path then SOME (sequence_dirs holdir toolchain_rel)
+    else NONE
+  end
+
 fun post_toolchain_roots holdir =
   let
     val full = sequence_dirs holdir "tools/build/build-sequence"
-    val toolchain_rel = HolbuildHolToolchainConfig.sequence_file (#sequence HolbuildHolToolchainConfig.default)
-    val toolchain_path = Path.concat(holdir, toolchain_rel)
     (* sortingLib is an optional HOL library: it is not named by the default
        build sequence, but HOLSource's `Libs sortingLib` header form requires
        its source to be buildable when using the reduced upto-hol toolchain. *)
     val optional_roots =
       if is_dir (Path.concat(holdir, "src/sort")) then ["src/sort"] else []
   in
-    if readable toolchain_path then
-      setdiff full (sequence_dirs holdir toolchain_rel) @ optional_roots
-    else
-      (* A missing reduced sequence selects the legacy full-build fallback, so
-         every default-sequence source is already part of the toolchain. *)
-      []
+    case toolchain_dirs holdir of
+        SOME toolchain =>
+          {roots = setdiff full toolchain @ optional_roots,
+           toolchain_dirs = toolchain}
+      | NONE =>
+          (* A missing reduced sequence selects the legacy full-build fallback, so
+             every default-sequence source is already part of the toolchain. *)
+          {roots = [], toolchain_dirs = []}
   end
 
 fun split_lines text = String.tokens (fn c => c = #"\n") text
@@ -227,11 +236,11 @@ fun graph_nodes text =
 (* Toplevel compiler recipes declare object prerequisites that Holdep cannot
    infer when a signature or functor name differs from its source filename.
    Ordinary rules can have build-only prerequisites, so leave those alone. *)
-fun compile_loads holdir members (nodes : graph_node list) =
+fun compile_loads holdir toolchain_dirs members (nodes : graph_node list) =
   let
     val by_id = List.foldl (fn (node, dict) => Binarymap.insert(dict, #id node, node))
                   (Binarymap.mkDict Int.compare) nodes
-    fun source_object path =
+    fun dir_object dirs path =
       case rel_under holdir path of
           NONE => false
         | SOME rel =>
@@ -243,15 +252,17 @@ fun compile_loads holdir members (nodes : graph_node list) =
                   else source
             in
               has_suffix ".uo" rel andalso
-              member (#dir (Path.splitDirFile rel)) members andalso
+              member (#dir (Path.splitDirFile rel)) dirs andalso
               (readable source orelse readable script)
             end
+    val source_object = dir_object members
+    val toolchain_object = dir_object toolchain_dirs
     fun logical path = #base (Path.splitBaseExt (#file (Path.splitDirFile path)))
     fun load id =
       case Binarymap.peek(by_id, id) of
           NONE => NONE
         | SOME {target, ...} =>
-            if source_object target orelse
+            if source_object target orelse toolchain_object target orelse
                (has_suffix ".uo" target andalso
                 #dir (Path.splitDirFile target) = Path.concat(holdir, "sigobj")) then
               SOME (logical target)
@@ -266,7 +277,7 @@ fun compile_loads holdir members (nodes : graph_node list) =
     List.mapPartial policy nodes
   end
 
-fun holmake_sources run_command holdir roots =
+fun holmake_sources run_command holdir {roots, toolchain_dirs} =
   if null roots then {members = [], loads = []}
   else
     let
@@ -281,15 +292,17 @@ fun holmake_sources run_command holdir roots =
           | SOME target =>
               (case member_dir_from_target holdir (respell target) of
                    NONE => acc
-                 | SOME dir => insert_unique dir acc)
-      val members = rev (List.foldl add_line roots (split_lines text))
+                 | SOME dir =>
+                     if member dir toolchain_dirs then acc
+                     else insert_unique dir acc)
+      val members = rev (List.foldl add_line (setdiff roots toolchain_dirs) (split_lines text))
       val nodes =
         map (fn {id, target, dependencies, toplevel_compile} =>
                 {id = id, target = respell target, dependencies = dependencies,
                  toplevel_compile = toplevel_compile})
             (graph_nodes text)
     in
-      {members = members, loads = compile_loads holdir members nodes}
+      {members = members, loads = compile_loads holdir toolchain_dirs members nodes}
     end
 
 fun generate {holdir, manifest_path, members_path, run_command} =

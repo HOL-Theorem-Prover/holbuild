@@ -309,6 +309,7 @@ holbuild export -o build-output.hbx MyTheory
 holbuild import build-output.hbx
 holbuild --remote-cache URL action-spec --upload MyTheory
 holbuild --remote-cache URL run-action --export-only --script s.sml --output out MyTheory
+holbuild --remote-cache URL run-action --remote-exec URL --outputs-dir out --script s.sml --output out MyTheory
 holbuild clean MyTheory
 holbuild gc
 ```
@@ -363,7 +364,7 @@ Common global options:
   platform default cache location.
 - `--offline`: disable holbuild-managed network access. Also enabled by
   `HOLBUILD_OFFLINE=1`; see [Offline builds](#offline-builds).
-- `--remote-cache URL`: optional Bazel-style HTTP remote cache endpoint. Also
+- `--remote-cache URL`: optional comma-separated Bazel-style HTTP remote cache endpoints. Also
   configurable with `HOLBUILD_REMOTE_CACHE_URL` or project-local
   `.holconfig.toml`.
 - `--json`: emit newline-delimited JSON where supported.
@@ -371,7 +372,9 @@ Common global options:
 - `-j N`, `-jN`, `--jobs N`: build parallelism. When holbuild builds a HOL
   toolchain, it also passes `-j N` to HOL's `bin/build`; without it, `bin/build`
   uses HOL's own default.
-- `--max-heap MB`: Poly/ML maximum heap size for child HOL processes. Do not
+- `--max-heap MB`: Poly/ML maximum heap size for child HOL processes, including
+  remote workers. Without it, remote workers use their configured default
+  (12000 MB by default). Do not
   use `--maxheap`: holbuild is itself a Poly/ML program, and its runtime takes
   `--maxheap MB` as the cap on holbuild's own heap, so the option never reaches
   holbuild and child HOL processes run uncapped. holbuild rejects `--maxheap`
@@ -486,11 +489,13 @@ currently requires `inotifywait` from `inotify-tools` and does not support
 `--json`, `--dry-run`, or `--repl-on-failure`.
 
 `holbuild check MyTheory` builds the theory if needed, loads it in HOL and
-checks the tags of its stored theorems. It prints one line per
+checks the tags and hypotheses of its stored theorems. It prints one line per
 theorem whose tag carries an oracle other than `DISK_THM` (for instance
 `MyTheory.my_theorem: cheat`) and one per axiom declared in the theory or its
 ancestors outside HOL itself, that is, in the root package or a dependency
-package (`DepTheory.my_axiom: axiom`). Theorems loaded from disk do not record
+package (`DepTheory.my_axiom: axiom`). Each stored theorem with undischarged
+hypotheses is also a finding (`MyTheory.my_theorem: undischarged hypotheses`),
+even when it has no oracle tag. Theorems loaded from disk do not record
 which axioms they use, so every such axiom in the ancestry is reported. It also
 scans the sources the theory is built from outside HOL (theory scripts and the
 SML libraries they load) for calls that can forge a theorem or change the
@@ -1143,7 +1148,7 @@ checkpoint compatibility. When this waiver permits reuse, project metadata
 retains the artifact's recorded timeout, so a later build without the flag
 applies the strict check.
 
-A build can also consult and publish to one Bazel-style HTTP remote cache:
+A build can also consult and publish to Bazel-style HTTP remote caches:
 
 ```sh
 holbuild --remote-cache https://cache.example.org build MyTheory
@@ -1152,6 +1157,25 @@ HOLBUILD_REMOTE_CACHE_URL=https://cache.example.org holbuild build MyTheory
 # [remote_cache]
 # url = "https://cache.example.org"
 ```
+
+To spread the cache across replicas, give a comma-separated list of base URLs
+in `--remote-cache`, `HOLBUILD_REMOTE_CACHE_URL`, or `.holconfig.toml`'s `url`.
+Whitespace can also separate URLs. Trailing slashes and duplicate nodes are
+removed. Node identity also excludes authority userinfo (`user:password@`),
+so inline credentials and curl-config credentials give the same ranking;
+the HTTP request retains its full URL. Every client and worker must use the same normalized URL spellings
+and node set; different public/private hostnames give different rankings.
+
+For each `/ac/<digest>` or `/cas/<digest>` request, nodes rank by descending
+SHA256 of `node identity + ":" + digest` (ascending identity breaks a tie). Only the first two
+nodes are tried. Reads try the second node after a 404, connection failure,
+timeout, 429 or 5xx; writes do so after a connection failure, timeout, 429 or
+5xx. A single-node list keeps the ordinary single-cache behavior. A successful
+backup keeps the ring available; the circuit breaker below counts the final
+outcome of a request. If neither node hits, a 404 from either node gives a miss, even if the
+other node failed transiently; this allows a new action to build and publish
+on the healthy node. Two transient failures remain unavailable. Replicas should share a backing store: the second
+node covers handoff while a newly added node cannot yet see a recent upload.
 
 Remote cache misses or errors fall back to the local cache/source build path.
 A request waits at most 5 s for its connection. After three requests in a row
@@ -1344,7 +1368,8 @@ from the toolchain, the theory's ancestry restorable, libraries loaded, and
 the script's declared output files kept. Its result is keyed by what it
 reads, so the same run is done once. `run-action --export-only` writes and
 uploads the run spec of each target, which a worker runs with `exec-action`
-(below); this release does not submit or fetch them.
+(below); `run-action --remote-exec` also submits them and fetches their
+outputs (see "Running scripts on remote workers").
 
 ```sh
 holbuild --remote-cache https://cache.example.org run-action --export-only \
@@ -1354,10 +1379,15 @@ holbuild --remote-cache https://cache.example.org run-action --export-only \
 
 A TARGET is a project theory (a logical name as `build` takes it, or
 `<package>:<logical>`), a theory of the HOL toolchain (`hol:bool` or
-`hol:boolTheory`), or `hol:*` for every theory in the toolchain's `sigobj`. A
-project theory must already be in the local cache for its current inputs;
-otherwise that target is refused with `build it first`, the others are still
-exported, and the command exits 1. `--support` files must lie under the
+`hol:boolTheory`), or `hol:*` for every theory in the toolchain's `sigobj`.
+`--closure` adds, after the targets, every theory a project target depends
+on. The worker restores a project context, the theories it depends on and
+those the `--load` libraries need from the remote cache, so each must be
+there or in the local cache for its current inputs, from where it is
+published to the remote cache first. A target with one in neither is
+refused with `build it first`, the others are still exported, and the
+command exits 1. A fetched run's directory holds `KEY` and `CONTEXT`, so
+those aren't output names. `--support` files must lie under the
 script's directory and are named by their given path relative to it, without
 resolving symbolic links. `--load` names a library: one
 in the toolchain's `sigobj`, or a source the project plans (including the
@@ -1461,16 +1491,20 @@ checks that the remote cache then holds an entry for it whose outputs equal
 the build's. An entry there with other outputs is replaced only when it records parents other than the restored
 ones, each restored from an entry with the remote cache's outputs, since no
 build against them can use it. The worker's local copy of an entry goes out
-of date when the remote cache's entry changes, so when a restored dependency
-doesn't match its parents, or the theory was built against local copies of
-its parents that differ from the remote cache's, the worker drops those
-copies, for the action's retry to restore the remote cache's; such a build
-is not published but fails as a `publish` failure. A missing dependency
-fails the action; the worker never builds one. When the remote cache gives
-no answer, answers 429 or 5xx, or is in its 60-second cooldown after
-requests got no response, whatever the worker was fetching or publishing,
-the action fails as `unavailable` rather than reading that as a miss or a
-conflict: the cache failed, not the action.
+of date when the remote cache's entry changes. So before it checks for the
+theory's own entry, the worker replaces its copies that differ from the
+remote cache's entries with those: the copies of the theories the build
+loads directly or through project libraries, and, when a restored
+dependency doesn't match its parents, all of them. It does the same for the
+theory's own entry when that doesn't match the restored parents. A theory
+still built against local copies of its parents that differ from the remote
+cache's (an entry replaced during the build) is not published but fails as a
+`publish` failure, and the worker drops those copies for the action's retry.
+A missing dependency fails the action; the worker never builds one. When the
+remote cache gives no answer, answers 429 or 5xx, or is in its 60-second
+cooldown after requests got no response, whatever the worker was fetching or
+publishing, the action fails as `unavailable` rather than reading that as a
+miss or a conflict: the cache failed, not the action.
 
 A run spec (`holbuild-run-spec-v1`, see "Exporting script runs for remote
 execution") is checked the same way, its run text against its `run-key`,
@@ -1616,6 +1650,11 @@ whatever is not there yet. The coordinator's credentials go
 in a curl config file named by `HOLBUILD_REMOTE_EXEC_CURL_CONFIG`, such as
 `header = "Authorization: Bearer <token>"`, so they stay off the command line.
 
+If a local cache entry has a weaker tactic-timeout contract than requested,
+restore refreshes it from the remote cache once. This picks up a stronger
+contract published by a worker without discarding the older entry when the
+remote has no usable replacement.
+
 When the batch ends, one line says how many of its theories the remote
 workers finished, built or found cached (`holbuild: remote execution: remote
 workers finished 3 of 3 theories`), or, when the build falls back, why and
@@ -1748,6 +1787,85 @@ cleanup and the action/blob scan, which can take minutes on a large cache. Like
 `--cache-only`, and `--toolchains-only` are mutually exclusive.
 `--max-checkpoints-gb` applies only to project cleanup and is ignored with
 `--cache-only` or `--toolchains-only`.
+
+### Running scripts on remote workers
+
+`run-action --remote-exec URL` runs a script in the context of each target on
+a coordinator's workers, once per set of inputs, and fetches what the script
+writes:
+
+```sh
+holbuild --remote-cache https://cache.example.org run-action \
+  --remote-exec https://exec.example.org [--remote-only] --outputs-dir out \
+  [--profile P] --script run.sml [--support F]... [--load L]... --output N... \
+  [--option timeout=SECONDS] [--closure] TARGET...
+```
+
+The targets, the script, its support files, `--load` libraries, outputs,
+timeout and `--closure` are those of `run-action --export-only` (see
+"Exporting script runs for remote execution"), as is the run key: the
+SHA-256 of the run text, which names the toolchain, the context theory and
+its input key, the script's and support files' hashes, the loads and the
+output names, so the same run is done once. The command:
+
+1. Plans the targets and computes each run's key; it reads no build output
+   and builds nothing.
+2. Checks the remote cache for each run's entry (`/ac/<ac-key>`, `kind=run`,
+   with every declared output in `/cas/`); a run that has one is `cached`.
+3. Exports the others' specs, publishing first the theories they need that
+   only the local cache holds, and refusing a run that needs one neither
+   cache holds with `build it first`.
+4. Submits them as one batch with `POST URL/v1/batches?class=run` (and
+   `&profile=P` with `--profile`, the coordinator's memory profile), and
+   follows its events, printing each run's state as it changes, as
+   `build --remote-exec` does. A run batch has no edges, and an action that
+   fails fails only itself.
+5. Fetches each `done` or `cached` run's entry and outputs into
+   `D/<package>/<theory>/` (`D/HOL/<theory>/` for a toolchain theory),
+   replacing what was there: `KEY` holds the run key, `CONTEXT` the run
+   text's context (`<package>:<theory>@<input_key>` or `HOL:<theory>`), and
+   each declared output its file.
+6. Prints one line per run on stdout, in the targets' order:
+
+   ```text
+   <context> <run_key> done|cached|failed <class>|missing
+   ```
+
+   `failed` gives the run's failure class: `script` (the script raised or
+   left a declared output unwritten), `timeout` (it outlived
+   `--option timeout`) or another of `exec-action`'s classes. `missing` is a
+   run that didn't end (refused, or left in a batch that stopped), or whose
+   entry or outputs couldn't be fetched.
+
+What the script gets on the worker is in "Running one theory action as a
+remote worker": the `HOLBUILD_RUN_*` variables, among them
+`HOLBUILD_RUN_OUTPUT_DIR`, where it writes each declared output. Only a
+script that exits normally with every output written caches a result; a
+failed run caches nothing, so it runs again next time.
+
+`--fetch-only` fetches what the remote cache already holds and prints
+`cached` or `missing` for each run, without exporting, publishing or
+submitting anything, so it needs no `--remote-exec`. Runs never execute
+locally: without `--remote-exec` or one of `--fetch-only` and
+`--export-only`, the command is a usage error.
+
+Exit status:
+
+- 0 when every run ended `done`, `cached` or `failed` (a failed script is a
+  result); with `--fetch-only`, also when some are `missing`.
+- 75 (`EX_TEMPFAIL`) when the coordinator can't take or finish the batch:
+  the export or upload fails, the submission is refused or the coordinator
+  unreachable, the event stream is lost (the batch is left running, so its
+  results reach the cache for the next try), the coordinator won't stream it
+  (it's cancelled), the batch fails as a whole, a theory a run needs that
+  only the local cache holds fails to publish, or a run that ended can't be
+  fetched; and with `--remote-only` when no `--remote-exec` is given.
+- 1 for errors on the command line or in the project, a batch someone
+  cancelled, an interrupt (which cancels the batch), or a target refused
+  with `build it first` (after the others ran).
+
+Once the runs are planned, the per-run lines are printed whatever the exit
+status, except on an interrupt, so a caller can keep what did end.
 
 ## Local configuration
 

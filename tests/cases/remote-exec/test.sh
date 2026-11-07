@@ -36,12 +36,14 @@ cat > "$tmpdir/run-batch" <<SH
 set -eu
 [[ ! -e "$state/fail" ]] || exit 1
 cd "$tmpdir/worker-cwd"
+heap=()
+[[ ! -e "\${1%.batch}.heap" ]] || heap=(--max-heap "\$(cat "\${1%.batch}.heap")")
 share=
 [[ ! -e "$state/share-heaps" ]] || share=--share-heaps
 awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec theory; do
   echo "\$theory" >> "$state/ran"
   status=0
-  HOLBUILD_CACHE="$tmpdir/worker-cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" \
+  HOLBUILD_CACHE="$tmpdir/worker-cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" "\${heap[@]}" \
     exec-action "\$spec" --cache-limit-gb 1000 --result "$tmpdir/worker.result" \$share \
     >> "$tmpdir/worker.log" 2>&1 || status=\$?
   echo "\$theory \$(grep '^status=' "$tmpdir/worker.result")" >> "$state/results"
@@ -469,11 +471,13 @@ require_grep "build before the rest is planned; restoring from the cache" "$tmpd
 require_grep "^POST /v1/batches/genb/cancel " "$state/requests.log"
 : > "$state/requests.log"
 refute_grep "GenTheory built" "$tmpdir/generated-only.log"
-(cd "$generated" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" UseLib) \
+(cd "$generated" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only UseLib) \
   > "$tmpdir/generated.log" 2>&1 || { cat "$tmpdir/generated.log" >&2; exit 1; }
-require_grep "theories that write SML sources build before the rest is planned; building locally" "$tmpdir/generated.log"
-require_grep "GenTheory built" "$tmpdir/generated.log"
+require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/generated.log"
+require_grep "GenTheory restored from cache" "$tmpdir/generated.log"
 require_grep "UseLib built" "$tmpdir/generated.log"
+refute_grep "GenTheory built" "$tmpdir/generated.log"
+: > "$state/requests.log"
 # Once GenTheory is in the remote cache, --remote-only restores it in a
 # fresh copy of the project, writing GenML.sml, and builds UseLib on it.
 mkdir -p "$tmpdir/generated-copy"
@@ -905,9 +909,8 @@ worker_n() {
     > "$tmpdir/$1-worker.log" 2>&1 || { cat "$tmpdir/$1-worker.log" >&2; exit 1; }
 }
 
-# The remote's MTheory doesn't fit the worker's NTheory: the worker drops its
-# copy, so that the next attempt (here the resubmission) restores the
-# remote's.
+# The remote's MTheory doesn't fit the worker's NTheory: the worker replaces
+# its copy by the remote's and builds PTheory in the first batch.
 copy_nondet stale-dep rxnw
 worker_n stale-dep
 copy_nondet stale-dep-remote rxnw
@@ -916,12 +919,13 @@ in_copy stale-dep-remote --remote-cache "$remote_url" build MTheory > "$tmpdir/s
 copy_nondet stale-dep-client rxnw
 in_copy stale-dep-client --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only PTheory \
   > "$tmpdir/stale-dep.log" 2>&1 || { cat "$tmpdir/stale-dep.log" "$tmpdir/worker.log" >&2; exit 1; }
-require_grep "resubmitting with 2 theories rebuilt or rechecked" "$tmpdir/stale-dep.log"
-require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/stale-dep.log"
+refute_grep "resubmitting" "$tmpdir/stale-dep.log"
+require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/stale-dep.log"
 require_grep "PTheory restored from cache" "$tmpdir/stale-dep.log"
 
-# The worker builds MTheory against its own NTheory: the build isn't
-# published, and the next build's worker restores the remote's NTheory.
+# The worker's NTheory fits MTheory's other parents but differs from the
+# remote's: the worker replaces it by the remote's before building MTheory on
+# it, so the build is published and the batch finishes the first time.
 copy_nondet stale-build rxnv
 worker_n stale-build
 copy_nondet stale-build-remote rxnv
@@ -931,15 +935,246 @@ m_ac=$(in_copy stale-build-remote --remote-cache "$remote_url" action-spec PTheo
   awk '$1 == "action" && $5 == "rxnv:MTheory" { print $3 }')
 [[ -n $m_ac ]] || { echo "no action for MTheory" >&2; exit 1; }
 copy_nondet stale-build-client rxnv
-set +e
 in_copy stale-build-client --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only PTheory \
-  > "$tmpdir/stale-build-client.log" 2>&1
-status=$?
-set -e
-[[ $status -eq 75 ]] || { echo "stale-build-client exited $status, wanted 75" >&2; cat "$tmpdir/stale-build-client.log" >&2; exit 1; }
-require_grep "built against out-of-date local copies of its parents" "$tmpdir/worker.log"
-[[ ! -e $remote_root/ac/$m_ac ]] || { echo "MTheory built on a stale parent reached the remote" >&2; exit 1; }
-in_copy stale-build-client --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only PTheory \
-  > "$tmpdir/stale-build-again.log" 2>&1 || { cat "$tmpdir/stale-build-again.log" "$tmpdir/worker.log" >&2; exit 1; }
-require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/stale-build-again.log"
-require_grep "PTheory restored from cache" "$tmpdir/stale-build-again.log"
+  > "$tmpdir/stale-build-client.log" 2>&1 || { cat "$tmpdir/stale-build-client.log" "$tmpdir/worker.log" >&2; exit 1; }
+refute_grep "resubmitting" "$tmpdir/stale-build-client.log"
+require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/stale-build-client.log"
+require_grep "PTheory restored from cache" "$tmpdir/stale-build-client.log"
+require_file "$remote_root/ac/$m_ac"
+
+# The client cap must reach the HOL child, before Poly/ML consumes --maxheap.
+copy_nondet heap-cap rxheap
+cat > "$tmpdir/heap-cap/src/HeapScript.sml" <<'SML'
+Theory Heap
+Ancestors bool
+val _ =
+  let
+    val ins = TextIO.openIn "/proc/self/cmdline"
+    val text = TextIO.inputAll ins before TextIO.closeIn ins
+  in
+    print ("heap-child-argv: " ^ String.translate (fn #"\000" => " " | c => str c) text ^ "\n")
+  end
+SML
+in_copy heap-cap --max-heap 4096 --remote-cache "$remote_url" build \
+  --remote-exec "$coordinator" --remote-only HeapTheory > "$tmpdir/heap-cap.log" 2>&1 ||
+  { cat "$tmpdir/heap-cap.log" "$tmpdir/worker.log" >&2; exit 1; }
+heap_key=$(awk '$1 == "action" && $5 == "rxheap:HeapTheory" { print $2 }' "$state/"*.batch)
+heap_log=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$state/result-$heap_key")
+require_grep '^heap-child-argv: .*/bin/hol .*--maxheap 4096 run ' "$remote_root/cas/$heap_log"
+
+# A worker strengthens a timeout-free entry, while the client still has its
+# older local manifest. The restore must pick up the stronger remote contract.
+copy_nondet timeout-contract rxtimeout
+cat > "$tmpdir/timeout-contract/src/TimeoutScript.sml" <<'SML'
+Theory Timeout
+Ancestors bool
+
+Theorem timeout_thm:
+  T
+Proof
+  simp[]
+QED
+SML
+in_copy timeout-contract --remote-cache "$remote_url" build --tactic-timeout 0 TimeoutTheory \
+  > "$tmpdir/timeout-seed.log" 2>&1 || { cat "$tmpdir/timeout-seed.log" >&2; exit 1; }
+timeout_metadata=$tmpdir/timeout-contract/.holbuild/dep/rxtimeout/src/TimeoutScript.sml.key
+require_grep '^proof_timeout=none$' "$timeout_metadata"
+cp "$timeout_metadata" "$tmpdir/timeout-weak-metadata"
+timeout_key=$(sed -n 's/^input_key=//p' "$timeout_metadata")
+timeout_manifest=$tmpdir/timeout-contract-cache/actions/$timeout_key/manifest
+cp "$timeout_manifest" "$tmpdir/timeout-weak-manifest"
+timeout_ac=$(printf 'holbuild-remote-ac-v1\n%s\n' "$timeout_key" | sha256sum | cut -d' ' -f1)
+require_grep '^proof-timeout=none$' "$remote_root/ac/$timeout_ac"
+in_copy timeout-contract --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only --tactic-timeout 2.5 TimeoutTheory > "$tmpdir/timeout-strict.log" 2>&1 ||
+  { cat "$tmpdir/timeout-strict.log" "$tmpdir/worker.log" >&2; exit 1; }
+require_grep 'remote execution: remote workers finished 1 of 1 theories' "$tmpdir/timeout-strict.log"
+require_grep 'TimeoutTheory restored from cache' "$tmpdir/timeout-strict.log"
+refute_grep 'Theory built' "$tmpdir/timeout-strict.log"
+require_grep '^proof-timeout=2.5$' "$remote_root/ac/$timeout_ac"
+require_grep '^proof-timeout=2.5$' "$timeout_manifest"
+require_grep '^proof_timeout=2.5$' "$timeout_metadata"
+
+# The remote entry can already be strong before planning, so no batch runs.
+# Put back the client's older manifest and metadata to exercise that case.
+cp "$tmpdir/timeout-weak-manifest" "$timeout_manifest"
+cp "$tmpdir/timeout-weak-metadata" "$timeout_metadata"
+in_copy timeout-contract --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only --tactic-timeout 2.5 TimeoutTheory > "$tmpdir/timeout-cached.log" 2>&1 ||
+  { cat "$tmpdir/timeout-cached.log" >&2; exit 1; }
+require_grep 'remote execution: nothing to build remotely' "$tmpdir/timeout-cached.log"
+require_grep 'TimeoutTheory restored from cache' "$tmpdir/timeout-cached.log"
+refute_grep 'remote batch\|Theory built' "$tmpdir/timeout-cached.log"
+require_grep '^proof-timeout=2.5$' "$timeout_manifest"
+require_grep '^proof_timeout=2.5$' "$timeout_metadata"
+
+# Two-phase generated_source_owners remote build: Phase 1 builds Gen2Theory on
+# the remote worker and restores Gen2ML.sml; Phase 2 replans and builds
+# AfterGenTheory (which depends on Use2Lib -> Gen2ML) on the remote worker.
+gen2=$tmpdir/generated-two-phase
+mkdir -p "$gen2/src"
+link_hol_toolchain_cache "$tmpdir/generated-two-phase-cache"
+cat > "$gen2/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxgen2"
+
+[build]
+members = ["src"]
+
+[actions.Use2Lib]
+deps = ["Gen2Theory"]
+TOML
+cat > "$gen2/src/Gen2Script.sml" <<'SML'
+Theory Gen2
+Ancestors bool
+
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_outputs ["Gen2ML.sml"];
+val () = let val out = TextIO.openOut "Gen2ML.sml"
+         in TextIO.output (out, "structure Gen2ML = struct val k = 7 end\n"); TextIO.closeOut out end;
+val gen2_thm = save_thm("gen2_thm", TRUTH);
+SML
+cat > "$gen2/src/Use2Lib.sml" <<'SML'
+structure Use2Lib = struct val v = Gen2ML.k + 1 end
+SML
+cat > "$gen2/src/AfterGenScript.sml" <<'SML'
+Theory AfterGen
+Ancestors Gen2
+Libs Use2Lib
+
+val _ = if Use2Lib.v = 8 then () else raise Fail "bad Use2Lib.v";
+val after_gen_thm = save_thm("after_gen_thm", TRUTH);
+SML
+(cd "$gen2" && HOLBUILD_CACHE=$tmpdir/generated-two-phase-cache "$HOLBUILD_BIN" --remote-cache "$remote_url" \
+  build --remote-exec "$coordinator" --remote-only AfterGenTheory) > "$tmpdir/gen2.log" 2>&1 ||
+  { cat "$tmpdir/gen2.log" "$tmpdir/worker.log" >&2; exit 1; }
+require_grep "Gen2Theory restored from cache" "$tmpdir/gen2.log"
+require_grep "Use2Lib built" "$tmpdir/gen2.log"
+require_grep "AfterGenTheory restored from cache" "$tmpdir/gen2.log"
+refute_grep "Theory built" "$tmpdir/gen2.log"
+require_file "$gen2/src/Gen2ML.sml"
+
+# check and check --fingerprint pre-build on the remote coordinator and run the
+# check script locally; when a valid deps_loaded checkpoint exists, check
+# starts from it via FromTheory.
+copy_nondet check-remote rxchk
+cat > "$tmpdir/check-remote/src/ChkScript.sml" <<'SML'
+Theory Chk
+Ancestors bool
+val chk_thm = save_thm("chk_thm", TRUTH);
+SML
+in_copy check-remote --remote-cache "$remote_url" check ChkTheory:chk_thm \
+  --remote-exec "$coordinator" --remote-only > "$tmpdir/check-remote.log" 2>&1 ||
+  { cat "$tmpdir/check-remote.log" "$tmpdir/worker.log" >&2; exit 1; }
+require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/check-remote.log"
+require_grep "ChkTheory restored from cache" "$tmpdir/check-remote.log"
+require_grep "^ChkTheory.chk_thm: clean (1 theorem)$" "$tmpdir/check-remote.log"
+refute_grep "ChkTheory built" "$tmpdir/check-remote.log"
+
+copy_nondet check-fp-remote rxchkfp
+cat > "$tmpdir/check-fp-remote/src/ChkFpScript.sml" <<'SML'
+Theory ChkFp
+Ancestors bool
+val chk_fp_thm = save_thm("chk_fp_thm", TRUTH);
+SML
+in_copy check-fp-remote --remote-cache "$remote_url" check --fingerprint ChkFpTheory \
+  --remote-exec "$coordinator" --remote-only > "$tmpdir/check-fp-remote.log" 2>&1 ||
+  { cat "$tmpdir/check-fp-remote.log" "$tmpdir/worker.log" >&2; exit 1; }
+require_grep "ChkFpTheory restored from cache" "$tmpdir/check-fp-remote.log"
+require_grep "^fingerprint	ChkFpTheory	theorem	chk_fp_thm	" "$tmpdir/check-fp-remote.log"
+
+# run --remote-exec --remote-only builds/restores explicit --from theories and
+# script-inferred FromScripts theories (even when [run].loads is empty and when
+# --remote-exec / --remote-only trail the script argument).
+copy_nondet run-from-remote rxrunfrom
+cat > "$tmpdir/run-from-remote/src/RunFromScript.sml" <<'SML'
+Theory RunFrom
+Ancestors bool
+val run_from_thm = save_thm("run_from_thm", TRUTH);
+SML
+cat > "$tmpdir/run-from-remote/probe-from.sml" <<'SML'
+val _ = load "RunFromTheory";
+val _ = print ("RUN_FROM_THM=" ^ Int.toString (length (DB.thms "RunFrom")) ^ "\n");
+SML
+in_copy run-from-remote --remote-cache "$remote_url" run --from RunFromTheory \
+  "$tmpdir/run-from-remote/probe-from.sml" --remote-exec "$coordinator" --remote-only \
+  > "$tmpdir/run-from-remote.log" 2>&1 ||
+  { cat "$tmpdir/run-from-remote.log" "$tmpdir/worker.log" >&2; exit 1; }
+require_grep "RunFromTheory restored from cache" "$tmpdir/run-from-remote.log"
+require_grep "RUN_FROM_THM=1" "$tmpdir/run-from-remote.log"
+refute_grep "RunFromTheory built" "$tmpdir/run-from-remote.log"
+
+copy_nondet run-infer-remote rxruninf
+cat > "$tmpdir/run-infer-remote/src/RunInfScript.sml" <<'SML'
+Theory RunInf
+Ancestors bool
+val run_inf_thm = save_thm("run_inf_thm", TRUTH);
+SML
+cat > "$tmpdir/run-infer-remote/probe-infer.sml" <<'SML'
+val _ = load "RunInfTheory";
+val _ = print "RUN_INFER_OK\n";
+SML
+in_copy run-infer-remote --remote-cache "$remote_url" run \
+  "$tmpdir/run-infer-remote/probe-infer.sml" --remote-exec "$coordinator" --remote-only \
+  > "$tmpdir/run-infer-remote.log" 2>&1 ||
+  { cat "$tmpdir/run-infer-remote.log" "$tmpdir/worker.log" >&2; exit 1; }
+require_grep "RunInfTheory restored from cache" "$tmpdir/run-infer-remote.log"
+require_grep "RUN_INFER_OK" "$tmpdir/run-infer-remote.log"
+refute_grep "RunInfTheory built" "$tmpdir/run-infer-remote.log"
+
+# heap, executable, and export --build support --remote-exec --remote-only.
+copy_nondet heap-remote rxheapcmd
+cat >> "$tmpdir/heap-remote/holproject.toml" <<'TOML'
+
+[[heap]]
+name = "myheap"
+output = "myheap.heap"
+objects = ["HeapCmdTheory"]
+
+[[executable]]
+name = "myexe"
+output = "myexe.exe"
+objects = ["HeapCmdTheory", "ExeMain"]
+TOML
+cat > "$tmpdir/heap-remote/src/HeapCmdScript.sml" <<'SML'
+Theory HeapCmd
+Ancestors bool
+val heap_cmd_thm = save_thm("heap_cmd_thm", TRUTH);
+SML
+cat > "$tmpdir/heap-remote/src/ExeMain.sml" <<'SML'
+fun main () = print "EXE_REMOTE_OK\n"
+SML
+in_copy heap-remote --remote-cache "$remote_url" heap myheap \
+  --remote-exec "$coordinator" --remote-only > "$tmpdir/heap-remote.log" 2>&1 ||
+  { cat "$tmpdir/heap-remote.log" "$tmpdir/worker.log" >&2; exit 1; }
+require_grep "HeapCmdTheory restored from cache" "$tmpdir/heap-remote.log"
+refute_grep "HeapCmdTheory built" "$tmpdir/heap-remote.log"
+require_file "$tmpdir/heap-remote/myheap.heap"
+
+copy_nondet exe-remote rxexecmd
+cp "$tmpdir/heap-remote/holproject.toml" "$tmpdir/exe-remote/holproject.toml"
+sed -i 's/^name = "rxheapcmd"/name = "rxexecmd"/' "$tmpdir/exe-remote/holproject.toml"
+cp "$tmpdir/heap-remote/src/HeapCmdScript.sml" "$tmpdir/heap-remote/src/ExeMain.sml" "$tmpdir/exe-remote/src/"
+in_copy exe-remote --remote-cache "$remote_url" executable myexe \
+  --remote-exec "$coordinator" --remote-only > "$tmpdir/exe-remote.log" 2>&1 ||
+  { cat "$tmpdir/exe-remote.log" "$tmpdir/worker.log" >&2; exit 1; }
+require_grep "HeapCmdTheory restored from cache" "$tmpdir/exe-remote.log"
+require_grep "ExeMain built" "$tmpdir/exe-remote.log"
+refute_grep "HeapCmdTheory built" "$tmpdir/exe-remote.log"
+require_file "$tmpdir/exe-remote/myexe.exe"
+
+copy_nondet export-remote rxexpcmd
+cat > "$tmpdir/export-remote/src/ExpCmdScript.sml" <<'SML'
+Theory ExpCmd
+Ancestors bool
+val exp_cmd_thm = save_thm("exp_cmd_thm", TRUTH);
+SML
+in_copy export-remote --remote-cache "$remote_url" export --build \
+  --remote-exec "$coordinator" --remote-only -o "$tmpdir/expcmd.hbx" ExpCmdTheory \
+  > "$tmpdir/export-remote.log" 2>&1 ||
+  { cat "$tmpdir/export-remote.log" "$tmpdir/worker.log" >&2; exit 1; }
+require_grep "ExpCmdTheory restored from cache" "$tmpdir/export-remote.log"
+require_grep "exported .* cache action.* to $tmpdir/expcmd.hbx" "$tmpdir/export-remote.log"
+refute_grep "ExpCmdTheory built" "$tmpdir/export-remote.log"
+require_file "$tmpdir/expcmd.hbx"
