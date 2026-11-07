@@ -1134,13 +1134,12 @@ checks that the remote cache then holds an entry for it whose outputs equal
 the build's. An entry there with other outputs is replaced only when it records parents other than the restored
 ones, each restored from an entry with the remote cache's outputs, since no
 build against them can use it. The worker's local copy of an entry goes out
-of date when the remote cache's entry changes, so when restored parents don't
-match, or the theory's own entry restores, or it was built, against local
-copies of its parents that differ from the remote cache's, the worker drops
-those copies; it then judges the entry again against the remote cache's
-parents, and a build is not published but fails as a `publish` failure, for
-its retry to restore them. A missing dependency fails the action; the worker
-never builds one.
+of date when the remote cache's entry changes, so when a restored dependency
+doesn't match its parents, or the theory was built against local copies of
+its parents that differ from the remote cache's, the worker drops those
+copies, for the action's retry to restore the remote cache's; such a build
+is not published but fails as a `publish` failure. A missing dependency
+fails the action; the worker never builds one.
 
 It writes this record to `--result FILE`, or to stdout:
 

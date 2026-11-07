@@ -7288,26 +7288,14 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
           if HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key =
              action_text_value spec "toolchain" then ()
           else raise ActionFailed (ToolchainFailure, "the toolchain's identity does not match the action text")
-        fun restored () = (hydrate_action_root remote root spec; action_already_done root spec)
-        fun dropped_stale_parents () =
-          drop_stale_dep_copies remote spec (dat_records_parent (in_root root (#data_path (#outputs spec))))
-        val stale = ActionFailed (PublishFailure, "built against out-of-date local copies of its parents")
-        (* The theory's entry restores, but perhaps only against local
-           copies of its parents that are out of date; then it is judged
-           again against the remote's. *)
-        val done = restored () andalso (not (dropped_stale_parents ()) orelse restored ())
+        val _ = hydrate_action_root remote root spec
+        val done = action_already_done root spec
         val cutoff = if done then NONE else spec_early_cutoff root spec
-        (* A reused earlier build, like a build, never reaches the remote
-           when it fits only out-of-date local copies of the parents; the
-           retry restores the remote's. *)
-        val reused =
-          not done andalso
-          (case cutoff of
-               SOME {pair_key, ...} => reuse_earlier_build remote root spec pair_key
-             | NONE => false) andalso
-          (not (dropped_stale_parents ()) orelse raise stale)
       in
-        if done orelse reused then
+        if done orelse
+           (case cutoff of
+                SOME {pair_key, ...} => reuse_earlier_build remote root spec pair_key
+              | NONE => false) then
           (* The entry may have come from the worker's local cache, so make
              sure the remote, where the result counts, holds it too. *)
           (check_remote_publication remote root spec;
@@ -7364,7 +7352,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                     (classify_run_failure stage log_text oom_before msg, msg)
                 end
             val _ = peak := peak_rss_mb stage
-            val _ = if dropped_stale_parents () then raise stale else ()
+            (* Outputs built against out-of-date local copies of the parents
+               never reach the remote; the retry restores the remote's. *)
+            val _ =
+              if drop_stale_dep_copies remote spec (dat_records_parent (in_root root (#data_path (#outputs spec))))
+              then raise ActionFailed (PublishFailure, "built against out-of-date local copies of its parents")
+              else ()
             val _ = check_remote_publication remote root spec
             val _ =
               case cutoff of
