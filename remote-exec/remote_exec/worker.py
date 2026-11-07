@@ -101,9 +101,10 @@ class Coordinator:
         host = None if report is None else asdict(report)
         return self.post(path, json.dumps({**body, "host": host}).encode(), "application/json", timeout)
 
-    def claim(self, tiers: list[str], worker: str, wait_s: float) -> dict[str, Any] | None:
-        """An action, waiting up to ``wait_s`` seconds for one, or None."""
-        body = {"tier": tiers[0], "also_claim": tiers[1:], "worker": worker, "wait_s": wait_s}
+    def claim(self, tiers: list[str], worker: str, wait_s: float, phases: dict[str, float]) -> dict[str, Any] | None:
+        """An action, waiting up to ``wait_s`` seconds for one, or None. ``phases`` reports where the worker's time
+        went since its last claim."""
+        body = {"tier": tiers[0], "also_claim": tiers[1:], "worker": worker, "wait_s": wait_s, "phases": phases}
         status, response = self.post_reporting("/v1/work/claim", body, 30 + wait_s)
         if status == 204:
             return None
@@ -410,6 +411,86 @@ class HostTelemetry:
         )
 
 
+class Phases:
+    """The seconds this worker spent in each phase since it last reported them (``PhaseReport`` in the
+    coordinator). Between them they cover its time: waiting for memory, claiming, sleeping after a claim got
+    nothing, finding the action's release, running exec-action (before, while and after it has HOL children, or all
+    of it as ``exec`` when they can't be seen) and reporting the result."""
+
+    NAMES = ("memory_wait", "claim", "idle", "release", "before_hol", "hol", "after_hol", "exec", "complete")
+
+    def __init__(self) -> None:
+        self.seconds = dict.fromkeys(self.NAMES, 0.0)
+
+    def add(self, name: str, seconds: float) -> None:
+        self.seconds[name] += seconds
+
+    @contextlib.contextmanager
+    def timed(self, name: str) -> Iterator[None]:
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            self.add(name, time.monotonic() - started)
+
+    def take(self) -> dict[str, float]:
+        """The seconds so far, rounded, starting again from none."""
+        taken = {name: round(seconds, 3) for name, seconds in self.seconds.items()}
+        self.seconds = dict.fromkeys(self.NAMES, 0.0)
+        return taken
+
+    def put_back(self, taken: dict[str, float]) -> None:
+        """Add what ``take`` returned back in, when it couldn't be reported."""
+        for name, seconds in taken.items():
+            self.add(name, seconds)
+
+
+class ExecSpans:
+    """Splits exec-action's time, given in steps of the 1 s poll, into before its first HOL child, from then to
+    the end of its last one, and after. A gap between two HOL children counts as HOL, a child seen only once gets
+    its poll step."""
+
+    def __init__(self) -> None:
+        self.before_hol = self.hol = self.after_hol = 0.0
+
+    def step(self, seconds: float, *, hol: bool) -> None:
+        if hol:
+            self.hol += self.after_hol + seconds
+            self.after_hol = 0.0
+        elif self.hol:
+            self.after_hol += seconds
+        else:
+            self.before_hol += seconds
+
+
+def child_pids(pid: int) -> list[int]:
+    """The children of process ``pid``, none once it's gone."""
+    children: list[int] = []
+    with contextlib.suppress(OSError):
+        for task in os.listdir(f"/proc/{pid}/task"):
+            with contextlib.suppress(OSError), open(f"/proc/{pid}/task/{task}/children") as file:
+                children += [int(child) for child in file.read().split()]
+    return children
+
+
+def runs_hol(pid: int, cooperate_dir: str) -> bool:
+    """Whether a descendant of process ``pid`` holds a lease of ``cooperate_dir`` (canonical) open: a HOL child,
+    which inherits the lease holbuild's admission took for it. Process ``pid`` itself also opens other workers'
+    leases while it reads them, so it isn't looked at."""
+    prefix = os.path.join(cooperate_dir, "lease-")
+    pending = child_pids(pid)
+    while pending:
+        descendant = pending.pop()
+        with contextlib.suppress(OSError):
+            fds = f"/proc/{descendant}/fd"
+            for fd in os.listdir(fds):
+                with contextlib.suppress(OSError):
+                    if os.readlink(os.path.join(fds, fd)).startswith(prefix):
+                        return True
+        pending += child_pids(descendant)
+    return False
+
+
 def failed_record(spec_sha256: str, failure: str) -> str:
     """A result record the worker writes itself: ``spec-rejected`` for an action it won't run, which fails it
     finally like exec-action's own, or ``internal`` for one exec-action ended without a record, which is retried."""
@@ -479,23 +560,30 @@ def run_one(
     releases: Releases,
     protection: Protection,
     claim: dict[str, Any],
+    phases: Phases,
 ) -> None:
-    """Run one claimed action to its end, or until its lease is lost, and report it."""
+    """Run one claimed action to its end, or until its lease is lost, and report it, adding its phases' time to
+    ``phases``."""
     token = claim["attempt_token"]
     spec = claim["spec_sha256"]
     print(f"running {claim['theory']} ({claim['input_key']})", file=sys.stderr, flush=True)
     with Lease(coordinator, token, claim["lease_s"], protection).held() as lease:
         try:
-            holbuild = releases.holbuild(releases.spec_version(spec))
+            with phases.timed("release"):
+                holbuild = releases.holbuild(releases.spec_version(spec))
         except Unreleased as error:
             print(f"refusing {spec}: {error}", file=sys.stderr)
-            coordinator.complete(token, failed_record(spec, "spec-rejected"), claim["lease_s"])
+            with phases.timed("complete"):
+                coordinator.complete(token, failed_record(spec, "spec-rejected"), claim["lease_s"])
             return
         if lease.lost.is_set():
             return
         with tempfile.TemporaryDirectory() as scratch:
             result = os.path.join(scratch, "result")
             # Its own session, so a lost lease stops holbuild's HOL children with it.
+            cooperate_dir = None if args.cooperate_dir is None else os.path.realpath(args.cooperate_dir)
+            spans = ExecSpans()
+            stepped = time.monotonic()
             process = subprocess.Popen(
                 exec_action_command(args, holbuild, spec, result), env=exec_action_env(), start_new_session=True
             )
@@ -503,18 +591,31 @@ def run_one(
                 while process.poll() is None:
                     if lease.lost.wait(1):
                         return
+                    if cooperate_dir is not None:
+                        hol = runs_hol(process.pid, cooperate_dir)
+                        now = time.monotonic()
+                        spans.step(now - stepped, hol=hol)
+                        stepped = now
             finally:
                 # A lost lease, Ctrl-C or SIGTERM (see main) stops the action rather than leaving it running
                 # unreported. The group outlives holbuild while a HOL child is still in it.
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(process.pid, signal.SIGTERM)
                 process.wait()
+                if cooperate_dir is None:
+                    phases.add("exec", time.monotonic() - stepped)
+                else:
+                    spans.step(time.monotonic() - stepped, hol=False)
+                    phases.add("before_hol", spans.before_hol)
+                    phases.add("hol", spans.hol)
+                    phases.add("after_hol", spans.after_hol)
             if not os.path.exists(result) or os.path.getsize(result) == 0:
                 # It crashed or was killed; the coordinator retries the action now rather than when the lease expires.
                 print(f"exec-action exited {process.returncode} without a result record", file=sys.stderr)
-                coordinator.complete(token, failed_record(spec, "internal"), claim["lease_s"])
+                with phases.timed("complete"):
+                    coordinator.complete(token, failed_record(spec, "internal"), claim["lease_s"])
                 return
-            with open(result) as file:
+            with open(result) as file, phases.timed("complete"):
                 coordinator.complete(token, file.read(), claim["lease_s"])
             print(f"{claim['theory']}: exit {process.returncode}", file=sys.stderr, flush=True)
 
@@ -600,21 +701,29 @@ def main() -> None:
     tiers = list(dict.fromkeys([args.tier, *args.also_claim]))
     # Exit through Python on SIGTERM, so run_one's cleanup stops the running action.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
+    phases = Phases()
     while True:
-        if args.cooperate_dir is not None and wait_for_memory(args.cooperate_dir, charge) and host is not None:
-            host.waited = True
+        if args.cooperate_dir is not None:
+            with phases.timed("memory_wait"):
+                waited = wait_for_memory(args.cooperate_dir, charge)
+            if waited and host is not None:
+                host.waited = True
         started = time.monotonic()
+        report = phases.take()
         try:
-            claim = coordinator.claim(tiers, args.name, args.claim_wait_seconds)
+            with phases.timed("claim"):
+                claim = coordinator.claim(tiers, args.name, args.claim_wait_seconds, report)
         except COORDINATOR_ERRORS as error:
             print(f"claim failed: {error}", file=sys.stderr)
+            phases.put_back(report)
             claim = None
         if claim is None:
             # A claim that failed at once, or a coordinator that doesn't wait, isn't retried in a tight loop.
-            time.sleep(max(0.0, CLAIM_RETRY_SECONDS - (time.monotonic() - started)))
+            with phases.timed("idle"):
+                time.sleep(max(0.0, CLAIM_RETRY_SECONDS - (time.monotonic() - started)))
             continue
         try:
-            run_one(coordinator, args, releases, protection, claim)
+            run_one(coordinator, args, releases, protection, claim, phases)
         except (*COORDINATOR_ERRORS, subprocess.SubprocessError, tarfile.TarError) as error:
             # The lease expires and the coordinator retries; a rerun finds a published result cached.
             print(f"action failed in the worker: {error}", file=sys.stderr)
