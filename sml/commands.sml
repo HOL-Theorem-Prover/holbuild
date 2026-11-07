@@ -1312,7 +1312,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         fun export upload =
           timed_phase "action_spec.export"
             (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key
-                        {upload = upload, local_resumable = true})
+                        {upload = upload, local_resumable = not detach})
         fun batch_keys batch =
           List.mapPartial (fn line => case String.tokens Char.isSpace line of
                                           "action" :: key :: _ => SOME key

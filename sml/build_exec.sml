@@ -5722,7 +5722,7 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       List.app (fn (node, _) =>
                    HolbuildStatus.message_stderr
                      ("holbuild: remote execution: " ^ package node ^ ":" ^ logical_name node ^
-                      " builds locally, from its checkpoints\n"))
+                      " stays out of the batch, to resume from its local checkpoints\n"))
                local_actions
     val uncached = uncached_in uncached_actions
     val toolchain_line =
