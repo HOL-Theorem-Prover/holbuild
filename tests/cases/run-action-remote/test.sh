@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HOLBUILD_BIN=$1
+HOLDIR=$2
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../../lib.sh
+source "$SCRIPT_DIR/../../lib.sh"
+
+# run-action --remote-exec against a stub coordinator whose "workers" run
+# each run with exec-action, sharing only the remote cache with the client,
+# which then fetches every run's outputs.
+
+tmpdir=$(make_temp_dir)
+cleanup() {
+  for pid in ${server_pid:-} ${coordinator_pid:-}; do
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
+  cleanup_temp_dir "$tmpdir"
+}
+trap cleanup EXIT
+unset HOLBUILD_REMOTE_CACHE_URL
+
+remote_root=$tmpdir/remote
+start_remote_cache_server "$remote_root" "$tmpdir/server"
+use_case_cache "$tmpdir/cache"
+
+# The stand-in for the workers: runs every action of the batch in a cache
+# root and directory of their own, leaving each one's result for the stub
+# to report; in a run batch a failed action doesn't stop the others.
+state=$tmpdir/coordinator
+mkdir -p "$state"
+link_hol_toolchain_cache "$tmpdir/worker-cache"
+mkdir -p "$tmpdir/worker-cwd"
+cat > "$tmpdir/run-batch" <<SH
+#!/usr/bin/env bash
+set -eu
+cd "$tmpdir/worker-cwd"
+awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec theory; do
+  echo "\$theory" >> "$state/ran"
+  HOLBUILD_CACHE="$tmpdir/worker-cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" \
+    exec-action "\$spec" --cache-limit-gb 1000 --result "$state/result-\$key" \
+    >> "$tmpdir/worker.log" 2>&1 || true
+done
+SH
+chmod +x "$tmpdir/run-batch"
+python3 "$SCRIPT_DIR/../../fixtures/remote_exec_coordinator.py" \
+  "$state/port" "$state" "$tmpdir/run-batch" &
+coordinator_pid=$!
+for _ in {1..100}; do
+  [[ -s "$state/port" ]] && break
+  sleep 0.01
+done
+coordinator="http://127.0.0.1:$(< "$state/port")"
+export HOLBUILD_TEST_RETRY_DELAYS=0,0,0,0
+
+project=$tmpdir/project
+mkdir -p "$project/src"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rr"
+
+[build]
+members = ["src"]
+TOML
+cat > "$project/src/AScript.sml" <<'SML'
+Theory A
+Ancestors bool
+
+Theorem a_thm:
+  T
+Proof
+  simp[]
+QED
+SML
+cat > "$project/src/CScript.sml" <<'SML'
+Theory C
+Ancestors A
+
+Theorem c_thm:
+  T
+Proof
+  ACCEPT_TAC a_thm
+QED
+SML
+
+runner=$tmpdir/runner
+mkdir -p "$runner"
+# script NAME STAMP: a script that writes its context to its two outputs,
+# and raises in A's context; each stamp is a new run key.
+script() {
+  cat > "$runner/$1" <<SML
+(* $2 *)
+fun env name = valOf (OS.Process.getEnv name);
+fun write name text =
+  let val out = TextIO.openOut (OS.Path.concat (env "HOLBUILD_RUN_OUTPUT_DIR", name))
+  in TextIO.output (out, text); TextIO.closeOut out end;
+val _ = if env "HOLBUILD_RUN_CONTEXT" = "rr:ATheory" then raise Fail "no A" else ();
+val _ = write "first" (env "HOLBUILD_RUN_CONTEXT" ^ "\n");
+val _ = write "second" (env "HOLBUILD_RUN_CONTEXT_KEY" ^ "\n");
+SML
+}
+script run.sml 1
+
+out=$tmpdir/out
+hb() {
+  (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" "$@")
+}
+# run NAME EXPECTED-EXIT ARGS...: run-action with ARGS; stdout to
+# $tmpdir/NAME.out, stderr to $tmpdir/NAME.err.
+run() {
+  local name=$1 code=$2
+  shift 2
+  set +e
+  hb run-action --outputs-dir "$out" --output first --output second "$@" \
+    > "$tmpdir/$name.out" 2> "$tmpdir/$name.err"
+  local status=$?
+  set -e
+  if [[ "$status" != "$code" ]]; then
+    echo "$name exited $status, wanted $code" >&2
+    cat "$tmpdir/$name.out" "$tmpdir/$name.err" >&2
+    cat "$tmpdir/worker.log" >&2 2>/dev/null || true
+    exit 1
+  fi
+}
+# line NAME CONTEXT STATUS: the run's line, and its run key printed.
+line() {
+  local key
+  key=$(awk -v c="$2" '$1 == c { print $2 }' "$tmpdir/$1.out")
+  grep -qx -- "$2 $key $3" "$tmpdir/$1.out" || {
+    echo "$1 has no line '$2 <key> $3':" >&2
+    cat "$tmpdir/$1.out" "$tmpdir/$1.err" >&2
+    exit 1
+  }
+  echo "$key"
+}
+posts() { grep -c '^POST /v1/batches?' "$state/requests.log" || true; }
+ac_file() {
+  printf '%s/ac/%s' "$remote_root" \
+    "$(printf 'holbuild-remote-ac-v1\n%s\n' "$1" | sha256sum | awk '{ print $1 }')"
+}
+
+# C is built here only: the remote cache lacks it until a run needs it.
+(cd "$project" && "$HOLBUILD_BIN" build CTheory > /dev/null)
+(cd "$project" && "$HOLBUILD_BIN" build --dry-run CTheory) > "$tmpdir/plan.txt"
+key_c=$(awk '/^[^ ]/ { name = $1 } $1 == "input_key:" && name == "CTheory" { print $2 }' "$tmpdir/plan.txt")
+[[ -n "$key_c" ]] || { cat "$tmpdir/plan.txt" >&2; exit 1; }
+require_no_file "$(ac_file "$key_c")"
+
+# A toolchain context, run and fetched.
+run hol 0 --remote-exec "$coordinator" --script "$runner/run.sml" hol:bool
+hol_key=$(line hol HOL:boolTheory done)
+[[ $(< "$out/HOL/boolTheory/KEY") == "$hol_key" ]]
+[[ $(< "$out/HOL/boolTheory/CONTEXT") == HOL:boolTheory ]]
+[[ $(< "$out/HOL/boolTheory/first") == HOL:boolTheory ]]
+require_grep '^POST /v1/batches?class=run ' "$state/requests.log"
+
+# Two targets, one cached: only the other is submitted, with the profile;
+# C's entry is published from the local cache first.
+run two 0 --remote-exec "$coordinator" --profile p1 --script "$runner/run.sml" rr:CTheory hol:bool
+[[ $(line two HOL:boolTheory cached) == "$hol_key" ]]
+c_run=$(line two rr:CTheory done)
+require_grep '^POST /v1/batches?class=run&profile=p1 ' "$state/requests.log"
+[[ $(grep -c ' rr:CTheory$' "$state/b2.batch") -eq 1 ]]
+if grep -q 'HOL:boolTheory' "$state/b2.batch"; then
+  echo "a cached run was submitted" >&2
+  exit 1
+fi
+require_file "$(ac_file "$key_c")"
+[[ $(< "$out/rr/CTheory/KEY") == "$c_run" ]]
+[[ $(< "$out/rr/CTheory/CONTEXT") == "rr:CTheory@$key_c" ]]
+[[ $(< "$out/rr/CTheory/first") == rr:CTheory ]]
+[[ $(< "$out/rr/CTheory/second") == "$key_c" ]]
+
+# --fetch-only fetches what the cache holds and submits nothing, without a
+# coordinator; what it lacks is missing.
+rm -rf "$out"
+before=$(posts)
+run fetch 0 --fetch-only --script "$runner/run.sml" rr:CTheory
+[[ $(line fetch rr:CTheory cached) == "$c_run" ]]
+[[ $(< "$out/rr/CTheory/first") == rr:CTheory ]]
+script other.sml other
+run fetch-missing 0 --fetch-only --script "$runner/other.sml" rr:CTheory
+line fetch-missing rr:CTheory missing > /dev/null
+[[ $(posts) == "$before" ]]
+
+# One run of a batch fails its script: the other is done all the same, and
+# the command ends 0. --closure adds C's ancestry, A.
+script mixed.sml 2
+run mixed 0 --remote-exec "$coordinator" --closure --script "$runner/mixed.sml" rr:CTheory
+line mixed rr:ATheory "failed script" > /dev/null
+line mixed rr:CTheory done > /dev/null
+[[ $(wc -l < "$tmpdir/mixed.out") -eq 2 ]]
+
+# A context neither cache holds is refused; the others still run.
+cat > "$project/src/DScript.sml" <<'SML'
+Theory D
+Ancestors A
+
+Theorem d_thm:
+  T
+Proof
+  ACCEPT_TAC a_thm
+QED
+SML
+script refused.sml 3
+run refused 1 --remote-exec "$coordinator" --script "$runner/refused.sml" rr:DTheory hol:bool
+require_grep 'rr:DTheory is not in the local or remote cache for its current inputs; build it first' "$tmpdir/refused.err"
+line refused rr:DTheory missing > /dev/null
+line refused HOL:boolTheory done > /dev/null
+
+# A coordinator that refuses the batch, or whose stream stays down, can't
+# take it: 75. A cancelled batch is 1.
+script fresh.sml 4
+touch "$state/refuse"
+run refuse 75 --remote-exec "$coordinator" --script "$runner/fresh.sml" hol:bool
+line refuse HOL:boolTheory missing > /dev/null
+rm "$state/refuse"
+touch "$state/down"
+run down 75 --remote-exec "$coordinator" --script "$runner/fresh.sml" hol:bool
+require_grep 'is left running' "$tmpdir/down.err"
+rm "$state/down"
+touch "$state/cancelled"
+run cancelled 1 --remote-exec "$coordinator" --script "$runner/fresh.sml" hol:bool
+require_grep 'cancelled' "$tmpdir/cancelled.err"
+rm "$state/cancelled"
+
+# Runs never execute here: without a coordinator it is a usage error, 75
+# under --remote-only.
+run no-coordinator 1 --script "$runner/fresh.sml" hol:bool
+require_grep 'pass --remote-exec URL' "$tmpdir/no-coordinator.err"
+run no-coordinator-remote-only 75 --remote-only --script "$runner/fresh.sml" hol:bool

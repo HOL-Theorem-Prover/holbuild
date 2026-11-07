@@ -86,12 +86,12 @@ c_action_spec=$(awk '$1 == "action" && $5 == "spec:CTheory" { print $4 }' "$tmpd
 [[ -n "$c_action_spec" ]] || { cat "$tmpdir/batch.txt" >&2; exit 1; }
 cp "$project/.holbuild/action-specs/$c_action_spec" "$tmpdir/c-action-spec"
 
-# Without --export-only, the command says what it supports.
+# Without --export-only, a run needs a coordinator: runs never execute here.
 if hb run-action --script "$runner/run.sml" --output o spec:CTheory > "$tmpdir/no-export.out" 2> "$tmpdir/no-export.err"; then
-  echo "run-action without --export-only succeeded" >&2
+  echo "run-action without --export-only or --remote-exec succeeded" >&2
   exit 1
 fi
-require_grep 'with --export-only' "$tmpdir/no-export.err"
+require_grep 'pass --remote-exec URL' "$tmpdir/no-export.err"
 require_grep 'usage: holbuild run-action' "$tmpdir/no-export.err"
 hb run-action --help > "$tmpdir/help.out"
 require_grep 'run-action --export-only --script S' "$tmpdir/help.out"
@@ -123,7 +123,7 @@ if run_export --output o spec:CTheory hol:bool > "$tmpdir/unbuilt.out" 2> "$tmpd
   echo "an unbuilt context was exported" >&2
   exit 1
 fi
-require_grep 'spec:CTheory is not in the local cache for its current inputs; build it first' "$tmpdir/unbuilt.err"
+require_grep 'spec:CTheory is not in the local or remote cache for its current inputs; build it first' "$tmpdir/unbuilt.err"
 grep -q '^HOL:boolTheory ' "$tmpdir/unbuilt.out"
 if grep -q '^spec:CTheory ' "$tmpdir/unbuilt.out"; then
   echo "the unbuilt context was printed" >&2
@@ -249,7 +249,7 @@ if run_export --load sortingSyntax --output o hol:bool > /dev/null 2> "$tmpdir/s
   echo "a load whose theory isn't built was exported" >&2
   exit 1
 fi
-require_grep 'HOL:boolTheory needs hol:sortingTheory, which is not in the local cache' "$tmpdir/sorting-unbuilt.err"
+require_grep 'HOL:boolTheory needs hol:sortingTheory, which is not in the local or remote cache' "$tmpdir/sorting-unbuilt.err"
 hb build sortingTheory > /dev/null
 run_export --load sortingSyntax --output o hol:bool > "$tmpdir/sorting.txt"
 sorting_spec=$project/.holbuild/run-specs/$(awk '{ print $3 }' "$tmpdir/sorting.txt")

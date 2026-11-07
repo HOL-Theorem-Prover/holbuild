@@ -309,6 +309,7 @@ holbuild export -o build-output.hbx MyTheory
 holbuild import build-output.hbx
 holbuild --remote-cache URL action-spec --upload MyTheory
 holbuild --remote-cache URL run-action --export-only --script s.sml --output out MyTheory
+holbuild --remote-cache URL run-action --remote-exec URL --outputs-dir out --script s.sml --output out MyTheory
 holbuild clean MyTheory
 holbuild gc
 ```
@@ -1342,7 +1343,8 @@ from the toolchain, the theory's ancestry restorable, libraries loaded, and
 the script's declared output files kept. Its result is keyed by what it
 reads, so the same run is done once. `run-action --export-only` writes and
 uploads the run spec of each target, which a worker runs with `exec-action`
-(below); this release does not submit or fetch them.
+(below); `run-action --remote-exec` also submits them and fetches their
+outputs (see "Running scripts on remote workers").
 
 ```sh
 holbuild --remote-cache https://cache.example.org run-action --export-only \
@@ -1352,10 +1354,15 @@ holbuild --remote-cache https://cache.example.org run-action --export-only \
 
 A TARGET is a project theory (a logical name as `build` takes it, or
 `<package>:<logical>`), a theory of the HOL toolchain (`hol:bool` or
-`hol:boolTheory`), or `hol:*` for every theory in the toolchain's `sigobj`. A
-project theory must already be in the local cache for its current inputs;
-otherwise that target is refused with `build it first`, the others are still
-exported, and the command exits 1. `--support` files must lie under the
+`hol:boolTheory`), or `hol:*` for every theory in the toolchain's `sigobj`.
+`--closure` adds, after the targets, every theory a project target depends
+on. The worker restores a project context, the theories it depends on and
+those the `--load` libraries need from the remote cache, so each must be
+there or in the local cache for its current inputs, from where it is
+published to the remote cache first. A target with one in neither is
+refused with `build it first`, the others are still exported, and the
+command exits 1. A fetched run's directory holds `KEY` and `CONTEXT`, so
+those aren't output names. `--support` files must lie under the
 script's directory and are named by their given path relative to it, without
 resolving symbolic links. `--load` names a library: one
 in the toolchain's `sigobj`, or a source the project plans (including the
@@ -1730,6 +1737,85 @@ cleanup and the action/blob scan, which can take minutes on a large cache. Like
 `--cache-only`, and `--toolchains-only` are mutually exclusive.
 `--max-checkpoints-gb` applies only to project cleanup and is ignored with
 `--cache-only` or `--toolchains-only`.
+
+### Running scripts on remote workers
+
+`run-action --remote-exec URL` runs a script in the context of each target on
+a coordinator's workers, once per set of inputs, and fetches what the script
+writes:
+
+```sh
+holbuild --remote-cache https://cache.example.org run-action \
+  --remote-exec https://exec.example.org [--remote-only] --outputs-dir out \
+  [--profile P] --script run.sml [--support F]... [--load L]... --output N... \
+  [--option timeout=SECONDS] [--closure] TARGET...
+```
+
+The targets, the script, its support files, `--load` libraries, outputs,
+timeout and `--closure` are those of `run-action --export-only` (see
+"Exporting script runs for remote execution"), as is the run key: the
+SHA-256 of the run text, which names the toolchain, the context theory and
+its input key, the script's and support files' hashes, the loads and the
+output names, so the same run is done once. The command:
+
+1. Plans the targets and computes each run's key; it reads no build output
+   and builds nothing.
+2. Checks the remote cache for each run's entry (`/ac/<ac-key>`, `kind=run`,
+   with every declared output in `/cas/`); a run that has one is `cached`.
+3. Exports the others' specs, publishing first the theories they need that
+   only the local cache holds, and refusing a run that needs one neither
+   cache holds with `build it first`.
+4. Submits them as one batch with `POST URL/v1/batches?class=run` (and
+   `&profile=P` with `--profile`, the coordinator's memory profile), and
+   follows its events, printing each run's state as it changes, as
+   `build --remote-exec` does. A run batch has no edges, and an action that
+   fails fails only itself.
+5. Fetches each `done` or `cached` run's entry and outputs into
+   `D/<package>/<theory>/` (`D/HOL/<theory>/` for a toolchain theory),
+   replacing what was there: `KEY` holds the run key, `CONTEXT` the run
+   text's context (`<package>:<theory>@<input_key>` or `HOL:<theory>`), and
+   each declared output its file.
+6. Prints one line per run on stdout, in the targets' order:
+
+   ```text
+   <context> <run_key> done|cached|failed <class>|missing
+   ```
+
+   `failed` gives the run's failure class: `script` (the script raised or
+   left a declared output unwritten), `timeout` (it outlived
+   `--option timeout`) or another of `exec-action`'s classes. `missing` is a
+   run that didn't end: refused, left in a batch that stopped, or whose
+   entry the fetch couldn't read.
+
+What the script gets on the worker is in "Running one theory action as a
+remote worker": the `HOLBUILD_RUN_*` variables, among them
+`HOLBUILD_RUN_OUTPUT_DIR`, where it writes each declared output. Only a
+script that exits normally with every output written caches a result; a
+failed run caches nothing, so it runs again next time.
+
+`--fetch-only` fetches what the remote cache already holds and prints
+`cached` or `missing` for each run, without exporting, publishing or
+submitting anything, so it needs no `--remote-exec`. Runs never execute
+locally: without `--remote-exec` or one of `--fetch-only` and
+`--export-only`, the command is a usage error.
+
+Exit status:
+
+- 0 when every run ended `done`, `cached` or `failed` (a failed script is a
+  result), or is `missing` only because the remote cache lacks its entry, as
+  with `--fetch-only`.
+- 75 (`EX_TEMPFAIL`) when the coordinator can't take or finish the batch:
+  the export or upload fails, the submission is refused or the coordinator
+  unreachable, the event stream is lost (the batch is left running, so its
+  results reach the cache for the next try), the coordinator won't stream it
+  (it's cancelled), or the batch fails as a whole; and with `--remote-only`
+  when no `--remote-exec` is given.
+- 1 for errors on the command line or in the project, a batch someone
+  cancelled, an interrupt (which cancels the batch), or a target refused
+  with `build it first` (after the others ran).
+
+Once the runs are planned, the per-run lines are printed whatever the exit
+status, except on an interrupt, so a caller can keep what did end.
 
 ## Local configuration
 

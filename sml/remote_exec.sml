@@ -94,15 +94,15 @@ fun write_text path text =
   let val out = TextIO.openOut path
   in (TextIO.output (out, text); TextIO.closeOut out) handle e => (TextIO.closeOut out; raise e) end
 
-(* Submits a batch; Ok carries its id.  A 5xx answer (a proxy's 502-504
-   while the coordinator restarts, or the coordinator's own 500 while it's
-   overloaded) or a 429 is retried after each of retry_delays_seconds, since
+(* Submits a batch, with QUERY ("" or "?...") after the path; Ok carries
+   its id.  A 5xx answer (a proxy's 502-504 while the coordinator restarts,
+   or the coordinator's own 500 while it's overloaded) or a 429 is retried after each of retry_delays_seconds, since
    it passes like a restart; other 4xx errors aren't, and an unreachable
    coordinator is refused at once.  A gateway error that comes after the
    coordinator stored the batch (it was stopped between storing and
    answering) leaves a copy that nobody follows: it runs to its end or
    deadline, repeating work whose results the cache dedupes. *)
-fun submit url batch_text : attempt =
+fun submit_with_query url query batch_text : attempt =
   let
     val _ = HolbuildOffline.require_online "submit a remote batch"
     val body = HolbuildTempPath.temporary "remote-exec-batch"
@@ -112,7 +112,7 @@ fun submit url batch_text : attempt =
         val result =
           HolbuildSpawn.run
             {program = "curl",
-             args = curl_args (endpoint url "/v1/batches")
+             args = curl_args (endpoint url ("/v1/batches" ^ query))
                       ["--max-time", Int.toString request_max_time_seconds, "-X", "POST",
                        "-H", "Content-Type: text/plain", "--data-binary", "@" ^ body,
                        "-w", "\n%{http_code}"],
@@ -143,6 +143,8 @@ fun submit url batch_text : attempt =
     OS.FileSys.remove body handle OS.SysErr _ => ();
     outcome
   end
+
+fun submit url batch_text = submit_with_query url "" batch_text
 
 (* The input key of the theory a failed batch's workers could not use, when
    the coordinator failed it for resubmission naming the theory as
@@ -180,8 +182,8 @@ fun report_action line =
   end
 
 (* Follows a batch's event stream until the batch finishes, printing each
-   action whose state changes, and passing on_done the input key of each
-   action that becomes done.  A stream that breaks (the connection drops,
+   action whose state changes, and passing on_change the input key, the
+   new state and the last failure, if any, of each.  A stream that breaks (the connection drops,
    or the coordinator answers 5xx while it restarts) is reattached: after a
    second when it delivered a state change, and after each of
    retry_delays_seconds in a row when it delivered none.  Every stream
@@ -191,7 +193,7 @@ fun report_action line =
    on a quiet stream, so a proxy doesn't close a healthy one for being
    idle.  The coordinator ends a batch at its deadline, so this ends too.  A failed
    batch comes with the action whose proof failed, when one did. *)
-fun follow url batch_id (on_done : string -> unit) : outcome * progress =
+fun follow url batch_id (on_change : string * string * string option -> unit) : outcome * progress =
   let
     val _ = HolbuildOffline.require_online "follow a remote batch"
     val states : (string * string) list ref = ref []
@@ -216,7 +218,7 @@ fun follow url batch_id (on_done : string -> unit) : outcome * progress =
               else (states := (key, state) :: List.filter (fn (k, _) => k <> key) (!states);
                     changed := true;
                     report_action line;
-                    if state = "done" then on_done key else ())
+                    on_change (key, state, json_string_field "last_failure" line))
             end
         | SOME "batch" =>
             outcome :=

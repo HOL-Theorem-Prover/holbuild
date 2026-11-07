@@ -8,7 +8,10 @@ event: done when RUN exits 0, failed otherwise.  In a failed batch, an action
 RUN left a result for (STATE/result-<input key>, as exec-action writes it) is
 reported as that result says: done, or failed with its failure and log.  Each
 action is reported running twice first, as a coordinator repeats unchanged
-states.  Control files in STATE change the answers: `refuse` makes POST answer
+states.  A batch submitted with `?class=run` is a run batch: each action is
+reported from its result (failed `internal` without one) and the batch ends
+done all the same, as the coordinator ends a run batch whose actions failed;
+its query is in the request log.  Control files in STATE change the answers: `refuse` makes POST answer
 400, `unavailable`, holding a count, makes that many POSTs answer 502 (or the
 status `unavailable-status` holds), `drop`
 ends the next event stream before the final event (and is removed), `cut`
@@ -63,7 +66,8 @@ class Handler(BaseHTTPRequestHandler):
             if (state / "down").exists():
                 return self.answer(503, {"detail": "restarting"})
             return self.answer(200, {"state": "cancelled"})
-        if self.path != "/v1/batches":
+        path, _, query = self.path.partition("?")
+        if path != "/v1/batches":
             return self.answer(404, {"detail": "Not Found"})
         if (state / "refuse").exists():
             return self.answer(400, {"detail": "batch refused by the stub"})
@@ -75,6 +79,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.answer(status, {"detail": "restarting"})
         batch_id = f"b{len(list(state.glob('*.batch'))) + 1}"
         (state / f"{batch_id}.batch").write_text(body)
+        if "class=run" in query.split("&"):
+            (state / f"{batch_id}.run").touch()
         # Whitespace around the colon is valid JSON the client must accept.
         self.answer(201, {"batch_id": batch_id}, separators=(", ", " : "))
 
@@ -114,8 +120,10 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write((json.dumps(running) + "\n").encode())
             return
         cancelled = (state / "cancelled").exists()
+        run_class = batch.with_suffix(".run").exists()
         ok = cancelled or (state / "skip").exists() or subprocess.run([run, str(batch)]).returncode == 0
-        final_state = "cancelled" if cancelled else "done" if ok else "failed"
+        # A failed action of a run batch fails only itself.
+        final_state = "cancelled" if cancelled else "done" if ok or run_class else "failed"
         cut = (state / "cut").exists()
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
@@ -139,7 +147,15 @@ class Handler(BaseHTTPRequestHandler):
                          "state": final_state, "tier": "standard", "attempts": 1,
                          "last_failure": None if ok else "proof", "log_sha256": None}
                 result = state / f"result-{fields[1]}"
-                if not ok and result.exists():
+                if run_class and not cancelled:
+                    record = dict(line.split("=", 1) for line in result.read_text().splitlines()[1:]) \
+                        if result.exists() else {"status": "failed", "failure": "internal"}
+                    if record["status"] == "failed":
+                        event["state"], event["last_failure"] = "failed", record["failure"]
+                        event["log_sha256"] = record["log"].split()[0] if "log" in record else None
+                    else:
+                        event["state"], event["last_failure"] = "done", None
+                elif not ok and result.exists():
                     record = dict(line.split("=", 1) for line in result.read_text().splitlines()[1:])
                     if record["status"] == "failed":
                         event["last_failure"] = record["failure"]
