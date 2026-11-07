@@ -6,16 +6,16 @@ exception Error of string
 type boundary = {kind : string, name : string, safe_name : string, theorem_start : int,
                  theorem_stop : int, boundary : int, tactic_start : int,
                  tactic_end : int, tactic_text : string,
-                 has_proof_attrs : bool, prefix_hash : string}
+                 proof_attrs : (string * string list) list, prefix_hash : string}
 type checkpoint = {kind : string, name : string, safe_name : string, theorem_start : int,
                    theorem_stop : int, boundary : int, tactic_start : int,
                    tactic_end : int, tactic_text : string,
-                   has_proof_attrs : bool, prefix_hash : string,
+                   proof_attrs : (string * string list) list, prefix_hash : string,
                    context_path : string, context_ok : string,
                    end_of_proof_path : string, end_of_proof_ok : string,
                    failed_prefix_path : string, failed_prefix_ok : string,
                    deps_key : string, checkpoint_key : string,
-                   proof_ir_plan : string option}
+                   proof_ir_plan : string option, proof_ir_factories : string option}
 
 type termination = {name : string, safe_name : string, definition_start : int,
                     definition_stop : int, boundary : int,
@@ -76,48 +76,10 @@ fun safe_name name =
 fun prefix_hash text boundary =
   HolbuildToolchain.hash_text (String.substring(text, 0, boundary))
 
-fun parse_int field value =
-  case Int.fromString value of
-      SOME n => n
-    | NONE => raise Error ("bad AST theorem report integer for " ^ field ^ ": " ^ value)
-
-fun slice text start stop =
-  if start < 0 orelse stop < start orelse stop > size text then
-    raise Error "AST theorem report span is outside source text"
-  else String.substring(text, start, stop - start)
-
-fun boundary_from_report_line source line =
-  case String.tokens (fn c => c = #"\t") line of
-      [kind, name, theorem_start_s, theorem_stop_s,
-       tactic_start_s, tactic_end_s, attrs_s] =>
-        let
-          val _ = if kind = "theorem" orelse kind = "resume" then ()
-                  else raise Error ("bad AST proof-unit kind: " ^ kind)
-          val theorem_start = parse_int "theorem_start" theorem_start_s
-          val theorem_stop = parse_int "theorem_stop" theorem_stop_s
-          val tactic_start = parse_int "tactic_start" tactic_start_s
-          val tactic_end = parse_int "tactic_end" tactic_end_s
-          val boundary = statement_boundary source theorem_stop
-        in
-          {kind = kind, name = name, safe_name = safe_name name,
-           theorem_start = theorem_start, theorem_stop = theorem_stop,
-           boundary = boundary, tactic_start = tactic_start, tactic_end = tactic_end,
-           tactic_text = slice source tactic_start tactic_end,
-           has_proof_attrs = attrs_s = "1",
-           prefix_hash = prefix_hash source boundary}
-        end
-    | [] => raise Error "empty AST theorem report line"
-    | _ => raise Error ("bad AST theorem report line: " ^ line)
-
-fun discover_from_report {source, report} : boundary list =
-  map (boundary_from_report_line source)
-      (List.filter (fn line => line <> "")
-                   (String.tokens (fn c => c = #"\n") report))
-
 fun begin_theorem_line ({kind, name, tactic_text, context_path, context_ok,
                          end_of_proof_path, end_of_proof_ok,
                          failed_prefix_path, failed_prefix_ok,
-                         has_proof_attrs, proof_ir_plan, ...} : checkpoint) =
+                         proof_attrs, proof_ir_plan, ...} : checkpoint) =
   String.concat
     [(case proof_ir_plan of
           SOME expr => "val _ = HolbuildProofRuntime.set_theorem_plan (SOME (" ^ expr ^ "));\n"
@@ -132,7 +94,9 @@ fun begin_theorem_line ({kind, name, tactic_text, context_path, context_ok,
      HolbuildToolchain.sml_string end_of_proof_ok, ", ",
      HolbuildToolchain.sml_string failed_prefix_path, ", ",
      HolbuildToolchain.sml_string failed_prefix_ok, ", ",
-     if has_proof_attrs then "true" else "false",
+     "[" ^ String.concatWith ", "
+       (map (fn (key, values) => "(" ^ HolbuildToolchain.sml_string key ^ ", [" ^
+         String.concatWith ", " (map HolbuildToolchain.sml_string values) ^ "])") proof_attrs) ^ "]",
      ");\n"]
 
 fun begin_termination_line ({name, definition_start, ...} : termination) =
@@ -362,15 +326,22 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
               let
                 val theorem_pragma = resume_at theorem_start
                 val boundary_pragma = resume_at boundary
+                val factories =
+                  if null (#proof_attrs checkpoint) then "NONE"
+                  else case #proof_ir_factories checkpoint of
+                           NONE => "NONE"
+                         | SOME code => "SOME (" ^ code ^ ")"
+                val tactic_suffix = ")) (let\n" ^ generated_code_pragma source ^
+                  "in " ^ factories ^ " end)"
               in
                 loop boundary rest
                   (boundary_pragma ::
                    "val _ = holbuild_save_theorem_context();\n" ::
                    "\n" ::
                    source_slice tactic_end boundary ::
-                   "))" ::
+                   tactic_suffix ::
                    source_slice tactic_start tactic_end ::
-                   "HolbuildTacticCompat.delay_tactic (fn () => (" ::
+                   "HolbuildProofRuntime.proof_ir_tactic (fn () => (" ::
                    source_slice theorem_start tactic_start ::
                    theorem_pragma ::
                    begin_theorem_line checkpoint ::

@@ -17,7 +17,7 @@ val plan_only_marker_ref = ref (NONE : string option)
 val plan_active_ref = ref false
 val trace_active_ref = ref false
 val trace_current_theorem_ref = ref ""
-val theorem_info_ref = ref NONE : (string * string * string * string * string * string * string * string * string * bool * int) option ref
+val theorem_info_ref = ref NONE : (string * string * string * string * string * string * string * string * string * (string * string list) list * int) option ref
 val context_info_ref = ref NONE : (string * string * int) option ref
 val failed_prefix_resume_active_ref = ref false
 (* While a failed-prefix resume runs, the step count of the prefix it restored,
@@ -29,6 +29,9 @@ val proving_with_proof_ir_ref = ref false
    checkpoint saves it with the rest of the heap, so a resumed prefix runs in
    the context the original proof was given. *)
 val proof_context_ref = ref (NONE : HolbuildTacticCompat.proof_context option)
+val proof_factories_ref = ref (NONE : HolbuildTacticCompat.proof_factories option)
+val plan_runner_ref = ref (NONE : HolbuildTacticCompat.proof_runner option)
+val proof_ir_tactic = HolbuildTacticCompat.intercept_proof plan_runner_ref
 val active_tactic_text_ref = ref ""
 val active_plan_ref = ref (NONE : HolbuildProofIr.step list option)
 val successful_step_count_ref = ref 0
@@ -578,9 +581,9 @@ fun advance_failed_prefix_checkpoint path ok_text depth =
 fun save_failed_prefix_checkpoint () =
   case !theorem_info_ref of
       NONE => ()
-    | SOME (kind, _, _, _, _, _, _, failed_prefix_path, failed_prefix_ok, _, depth) =>
+    | SOME (kind, _, _, _, _, _, _, failed_prefix_path, failed_prefix_ok, proof_attrs, depth) =>
         if not (kind = "theorem" orelse kind = "resume") orelse
-           not (!checkpoint_enabled_ref) then ()
+           not (!checkpoint_enabled_ref) orelse not (null proof_attrs) then ()
         else if !failed_prefix_resume_active_ref then
           (case !failed_prefix_resumed_step_count_ref of
                SOME resumed =>
@@ -605,17 +608,17 @@ fun restore_failed_prefix_checkpoint_info (name, tactic_text, failed_prefix_path
   let val depth = length (PolyML.SaveState.showHierarchy())
   in
     theorem_info_ref := SOME ("theorem", name, tactic_text, "", "", "", "",
-                              failed_prefix_path, failed_prefix_ok, false, depth)
+                              failed_prefix_path, failed_prefix_ok, [], depth)
   end
 
 fun set_theorem_plan plan = active_plan_ref := plan
 
 fun begin_theorem (kind, name, tactic_text, context_path, context_ok,
-                   end_path, end_ok, failed_prefix_path, failed_prefix_ok, has_attrs) =
+                   end_path, end_ok, failed_prefix_path, failed_prefix_ok, proof_attrs) =
   let val depth = length (PolyML.SaveState.showHierarchy())
   in
     theorem_info_ref := SOME (kind, name, tactic_text, context_path, context_ok,
-                              end_path, end_ok, failed_prefix_path, failed_prefix_ok, has_attrs, depth);
+                              end_path, end_ok, failed_prefix_path, failed_prefix_ok, proof_attrs, depth);
     context_info_ref := SOME (context_path, context_ok, depth)
   end
 
@@ -866,16 +869,20 @@ fun take_goals n goals =
 fun top_input_goals () = take_goals 1 (history_top_goals())
 
 fun compile_tactic label program =
-  if quse_string ("HolbuildProofRuntime.compiled_tactic_ref := (fn () => (" ^ program ^ "));") then
-    !compiled_tactic_ref
-  else
-    raise Fail ("tactic fragment did not compile: " ^ label)
+  case Option.mapPartial (fn {tactics, ...} => List.find (fn (text, _) => text = program) tactics) (!proof_factories_ref) of
+      SOME (_, make) => make
+    | NONE =>
+        if quse_string ("HolbuildProofRuntime.compiled_tactic_ref := (fn () => (" ^ program ^ "));") then
+          !compiled_tactic_ref
+        else raise Fail ("tactic fragment did not compile: " ^ label)
 
 fun compile_list_tactic label program =
-  if quse_string ("HolbuildProofRuntime.compiled_list_tactic_ref := (fn () => (" ^ program ^ "));") then
-    !compiled_list_tactic_ref
-  else
-    raise Fail ("list tactic fragment did not compile: " ^ label)
+  case Option.mapPartial (fn {list_tactics, ...} => List.find (fn (text, _) => text = program) list_tactics) (!proof_factories_ref) of
+      SOME (_, make) => make
+    | NONE =>
+        if quse_string ("HolbuildProofRuntime.compiled_list_tactic_ref := (fn () => (" ^ program ^ "));") then
+          !compiled_list_tactic_ref
+        else raise Fail ("list tactic fragment did not compile: " ^ label)
 
 fun history_is_proved () =
   ((project_history goalStack.extract_thm; true) handle _ => false)
@@ -984,16 +991,15 @@ fun pop_branch_tail_count label =
       [] => raise Fail ("focus close without active focus: " ^ label)
     | _ :: rest => branch_tail_count_ref := rest
 
-fun selector_program HolbuildProofIr.SelectFirst = NONE
-  | selector_program (HolbuildProofIr.SelectMatchingFirst pats) = SOME ("Q.RENAME_TAC " ^ pats)
-  | selector_program (HolbuildProofIr.SelectMatchingAll pats) = SOME ("Q.RENAME_TAC " ^ pats)
 
 fun matching_selector_count label selector goals =
-  case selector_program selector of
+  case HolbuildProofIr.selector_program selector of
       NONE => if null goals then NONE else SOME 1
     | SOME program =>
+        let val make = compile_tactic label program
+        in with_tactic_timeout label (fn () =>
         let
-          val tac = compile_tactic label program ()
+          val tac = make ()
           val probe = HolbuildTacticCompat.run_tactic (current_proof_context ()) tac
           fun loop [] count = SOME count
             | loop (g :: rest) count =
@@ -1009,11 +1015,8 @@ fun matching_selector_count label selector goals =
                 if List.exists (fn g => Option.isSome (Lib.total probe g)) goals then SOME 1 else NONE
             | HolbuildProofIr.SelectMatchingAll _ => loop goals 0
             | _ => loop goals 0
-        end
+        end) () end
 
-fun selector_list_tactic HolbuildProofIr.SelectFirst = NONE
-  | selector_list_tactic (HolbuildProofIr.SelectMatchingFirst pats) = SOME ("Tactical.FIRST_LT (Q.RENAME_TAC " ^ pats ^ ")")
-  | selector_list_tactic (HolbuildProofIr.SelectMatchingAll pats) = SOME ("Tactical.SELECT_LT (Q.RENAME_TAC " ^ pats ^ ")")
 
 fun push_select_focus label selector =
   let
@@ -1024,7 +1027,7 @@ fun push_select_focus label selector =
           SOME n => n
         | NONE => raise Fail ("select with no matching focused goals: " ^ label)
     val _ =
-      case selector_list_tactic selector of
+      case HolbuildProofIr.selector_list_tactic selector of
           NONE => ()
         | SOME program =>
             apply_focus_list_tactic label (compile_list_tactic label program)
@@ -1645,18 +1648,35 @@ fun proof_ir_prove name end_path end_ok checkpoint_depth g original_tac tactic_t
     val plan = case !active_plan_ref of SOME p => p | NONE => raise Fail "internal error: proof-IR plan is not installed"
     val _ = trace_plan name plan
     val _ = stop_after_plan_if_requested ()
+    fun run factories ctxt goal =
+      let
+        val old_factories = !proof_factories_ref
+        val _ = proof_factories_ref := factories
+        val result = TraceOk (with_proof_ir_execution ctxt (fn () =>
+        let
+          val _ = init_history goal (HolbuildProofIr.display_step_count plan + 1)
+          val _ = run_steps plan
+                  handle e =>
+                    if !failed_goal_state_printed_ref then raise e
+                    else report_finish_failure name e
+        in
+          history_top_thm goal handle e => report_finish_failure name e
+        end)) handle e => TraceError e
+        val _ = proof_factories_ref := old_factories
+      in
+        case result of TraceOk th => th | TraceError e => raise e
+      end
+    (* HOL's supplied tactic owns the native modifier and its lexical scope.
+       The injected entry consumes this hook before running any nested proof. *)
+    val _ = plan_runner_ref := SOME run
+    val th = HolbuildTacticCompat.tac_proof (current_proof_context ()) (g, original_tac)
+             handle e => (plan_runner_ref := NONE; raise e)
+    val _ = plan_runner_ref := NONE
+    (* The native modifier has unwound; history is still available to navigate. *)
+    val _ = save_checkpoint "end_of_proof" false end_path end_ok checkpoint_depth
+    val _ = drop_all ()
   in
-    let
-            val _ = init_history g (HolbuildProofIr.display_step_count plan + 1)
-            val _ = run_steps plan
-                     handle e =>
-                       if !failed_goal_state_printed_ref then raise e
-                       else report_finish_failure name e
-            val th = history_top_thm g
-                     handle e => report_finish_failure name e
-            val _ = save_checkpoint "end_of_proof" false end_path end_ok checkpoint_depth
-            val _ = drop_all()
-          in th end
+    th
   end
 
 fun termination_tactic name tactic_text plan original_tac =
@@ -1664,7 +1684,7 @@ fun termination_tactic name tactic_text plan original_tac =
   let
     val depth = length (PolyML.SaveState.showHierarchy())
     val _ = theorem_info_ref := SOME ("termination", name, tactic_text,
-                                      "", "", "", "", "", "", false, depth)
+                                      "", "", "", "", "", "", [], depth)
     val _ = failed_step_end_ref := NONE
     val _ = failed_step_span_ref := NONE
     val _ = failed_plan_position_ref := NONE
@@ -2028,9 +2048,9 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
     result
   end
 
-fun prove_outer_theorem ctxt (g, tac) (_, name, tactic_text, _, _, end_path, end_ok, _, _, has_attrs, checkpoint_depth) =
+fun prove_outer_theorem ctxt (g, tac) (_, name, tactic_text, _, _, end_path, end_ok, _, _, _, checkpoint_depth) =
   let
-    val atomic = has_attrs orelse tactic_text = ""
+    val atomic = tactic_text = ""
     val th =
       with_proof_ir_execution ctxt (fn () =>
         with_theorem_trace name (fn () =>
@@ -2066,6 +2086,8 @@ fun install ({checkpoint_enabled, tactic_timeout, timeout_marker, plan_theorem, 
    plan_active_ref := false;
    trace_active_ref := false;
    theorem_info_ref := NONE;
+   plan_runner_ref := NONE;
+   proof_factories_ref := NONE;
    context_info_ref := NONE;
    failed_step_end_ref := NONE;
    failed_step_span_ref := NONE;

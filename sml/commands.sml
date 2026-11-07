@@ -742,7 +742,7 @@ fun analyser_proof_ir_plan_for_unit (unit : execution_plan_unit) =
           [] => found
         | line :: more =>
             (case HolbuildAnalysisProtocol.split line of
-                 ["begin-proof-ir", "0", _, _, _, _] => loop more true [] found
+                 ["begin-proof-ir", "0", _, _, _, _, _] => loop more true [] found
                | ["end-proof-ir", "0"] => loop more false [] (SOME (parse_proof_steps (rev acc)))
                | fields as "proof-step" :: _ =>
                    if active then loop more active (fields :: acc) found
