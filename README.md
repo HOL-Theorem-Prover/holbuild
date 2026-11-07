@@ -1320,9 +1320,9 @@ use it, and the coordinator fails the batch for resubmission naming it
 (`resubmit: ... theory <input_key>`). Such a batch is resubmitted once first,
 with that theory and every theory that depends on it, for the workers to
 rebuild or recheck against the cached parents. A submission
-answered 502, 503 or 504, as a proxy in front of the coordinator answers
-while it restarts, is retried, and an event stream that breaks is
-reattached; either is given up on once the coordinator stays unavailable for
+answered 5xx, as a proxy in front of the coordinator answers while it
+restarts or the coordinator itself answers while it's overloaded, or 429,
+is retried, and an event stream that breaks is reattached; either is given up on once the coordinator stays unavailable for
 about two and a half minutes (retries back off to 8 seconds apart). A
 reattached stream that breaks again before any action changes state counts
 as unavailable too, since it only repeats what the build already knows. When the build stops following

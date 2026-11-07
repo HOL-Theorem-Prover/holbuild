@@ -29,7 +29,7 @@ type progress = {built : int, total : int}
 val connect_timeout_seconds = 10
 val request_max_time_seconds = 60
 (* Waits before each retry of a request the coordinator couldn't answer (a
-   submission a proxy answered 502-504, an event stream that broke without
+   submission answered 5xx or 429, an event stream that broke without
    delivering a state change): doubling up to 8 seconds, about two and a half
    minutes in all, long enough to ride out a coordinator restart such as an
    image upgrade.  Tests shorten them with HOLBUILD_TEST_RETRY_DELAYS,
@@ -94,13 +94,14 @@ fun write_text path text =
   let val out = TextIO.openOut path
   in (TextIO.output (out, text); TextIO.closeOut out) handle e => (TextIO.closeOut out; raise e) end
 
-(* Submits a batch; Ok carries its id.  A 502, 503 or 504 answer, as from a
-   proxy while the coordinator restarts, is retried after each of
-   retry_delays_seconds; other errors, a coordinator's own 500 among them,
-   aren't, and an unreachable coordinator is refused at once.  A gateway
-   error that comes after the coordinator stored the batch (it was stopped
-   between storing and answering) leaves a copy that nobody follows: it runs
-   to its end or deadline, repeating work whose results the cache dedupes. *)
+(* Submits a batch; Ok carries its id.  A 5xx answer (a proxy's 502-504
+   while the coordinator restarts, or the coordinator's own 500 while it's
+   overloaded) or a 429 is retried after each of retry_delays_seconds, since
+   it passes like a restart; other 4xx errors aren't, and an unreachable
+   coordinator is refused at once.  A gateway error that comes after the
+   coordinator stored the batch (it was stopped between storing and
+   answering) leaves a copy that nobody follows: it runs to its end or
+   deadline, repeating work whose results the cache dedupes. *)
 fun submit url batch_text : attempt =
   let
     val body = HolbuildTempPath.temporary "remote-exec-batch"
@@ -126,7 +127,7 @@ fun submit url batch_text : attempt =
         else if status = 0 then
           Refused ("could not reach the coordinator at " ^ HolbuildRemoteCache.redact_userinfo url ^
                    (if text = "" then "" else ": " ^ text))
-        else if status >= 502 andalso status <= 504 then
+        else if status = 429 orelse status >= 500 then
           case delays of
               [] => Refused refusal
             | delay :: rest =>

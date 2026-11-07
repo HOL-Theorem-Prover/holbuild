@@ -590,6 +590,24 @@ run unavailable-detach 1 build --remote-exec "$coordinator" --remote-only --deta
 [[ $(grep -c "coordinator refused the batch (HTTP 502)" "$tmpdir/unavailable-detach.log") -eq 5 ]] ||
   { cat "$tmpdir/unavailable-detach.log" >&2; exit 1; }
 rm "$state/unavailable"
+# The coordinator's own 500 under load, and a 429, are retried the same way;
+# another 4xx is refused at once.
+for status in 500 429; do
+  write_theories "overloaded-$status"
+  echo 1 > "$state/unavailable"
+  echo "$status" > "$state/unavailable-status"
+  run "overloaded-$status" 0 build --remote-exec "$coordinator" --remote-only BTheory
+  [[ $(grep -c "coordinator refused the batch (HTTP $status): .*restarting.*; retrying" "$tmpdir/overloaded-$status.log") -eq 1 ]] ||
+    { cat "$tmpdir/overloaded-$status.log" >&2; exit 1; }
+  require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/overloaded-$status.log"
+done
+write_theories forbidden
+echo 1 > "$state/unavailable"
+echo 403 > "$state/unavailable-status"
+run forbidden 75 build --remote-exec "$coordinator" --remote-only BTheory
+require_grep "coordinator refused the batch (HTTP 403): .*restarting" "$tmpdir/forbidden.log"
+refute_grep "retrying" "$tmpdir/forbidden.log"
+rm "$state/unavailable" "$state/unavailable-status"
 
 # Early cutoff on the workers.  A <- B <- C, built with shared heaps: a
 # proof-only edit of A rebuilds A and reuses the earlier builds of B and C,

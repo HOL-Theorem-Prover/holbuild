@@ -9,7 +9,8 @@ RUN left a result for (STATE/result-<input key>, as exec-action writes it) is
 reported as that result says: done, or failed with its failure and log.  Each
 action is reported running twice first, as a coordinator repeats unchanged
 states.  Control files in STATE change the answers: `refuse` makes POST answer
-400, `unavailable`, holding a count, makes that many POSTs answer 502, `drop`
+400, `unavailable`, holding a count, makes that many POSTs answer 502 (or the
+status `unavailable-status` holds), `drop`
 ends the next event stream before the final event (and is removed), `cut`
 ends it midway through its first action event (and is removed), `replay`,
 holding a count, makes that many event streams send the first action's running
@@ -69,7 +70,9 @@ class Handler(BaseHTTPRequestHandler):
         unavailable = state / "unavailable"
         if unavailable.exists() and int(unavailable.read_text()) > 0:
             unavailable.write_text(str(int(unavailable.read_text()) - 1))
-            return self.answer(502, {"detail": "restarting"})
+            status_file = state / "unavailable-status"
+            status = int(status_file.read_text()) if status_file.exists() else 502
+            return self.answer(status, {"detail": "restarting"})
         batch_id = f"b{len(list(state.glob('*.batch'))) + 1}"
         (state / f"{batch_id}.batch").write_text(body)
         # Whitespace around the colon is valid JSON the client must accept.
