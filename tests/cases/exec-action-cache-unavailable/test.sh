@@ -154,11 +154,11 @@ sha = hashlib.sha256(data).hexdigest()
 print(sha)
 PYTHON
 )
-echo 500 > "$control/cas-put-status"
+printf 'holbuild proof-ir before theorem=a_thm ' > "$control/cas-put-reject-text"
 worker traced-log
 expect traced-log 3 unavailable "could not upload the required build log"
 require_grep '^status=failed$' "$tmpdir/traced-log.result"
-rm "$control/cas-put-status"
+rm "$control/cas-put-reject-text"
 worker traced-log
 [[ "$worker_status" == 0 ]] || { cat "$tmpdir/traced-log.log" >&2; exit 1; }
 require_grep '^status=built$' "$tmpdir/traced-log.result"
