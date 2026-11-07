@@ -3929,14 +3929,18 @@ fun assoc_timeout _ [] = NONE
 fun effective_tactic_timeout proof_steps node_timeout =
   if proof_steps then node_timeout else NONE
 
-fun checkpoint_policy_for_node ({skip_checkpoints, checkpoint_targets, proof_steps, new_ir, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure, trknl, ...} : build_options) project node =
+(* Whether --target-checkpoints-only, if given, leaves NODE its theorem
+   checkpoints. *)
+fun checkpoint_target_node ({checkpoint_targets, ...} : build_options) node =
+  case checkpoint_targets of
+      NONE => true
+    | SOME targets => force_target_node targets node
+
+fun checkpoint_policy_for_node (options as {skip_checkpoints, proof_steps, new_ir, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure, trknl, ...} : build_options) project node =
   if root_package_node project node then
     CheckpointPolicy {checkpoint = not skip_checkpoints,
                       theorem_checkpoints =
-                        not skip_checkpoints andalso
-                        (case checkpoint_targets of
-                             NONE => true
-                           | SOME targets => force_target_node targets node),
+                        not skip_checkpoints andalso checkpoint_target_node options node,
                       proof_steps = proof_steps,
                       new_ir = new_ir,
                       tactic_timeout = effective_tactic_timeout proof_steps
@@ -5718,8 +5722,10 @@ fun theory_load_spec_line token (LoadTheory name) = "load theory " ^ token name
 fun bool_option name value = "option " ^ name ^ "=" ^ bool_text value
 
 (* The spec text and the files a worker fetches by content hash for it. *)
+(* A worker saves theorem checkpoints unless the spec says otherwise, so the
+   specs of builds without --target-checkpoints-only are unchanged. *)
 fun action_spec_text {root, plan, keys, action_toolchain_key, runtime, toolchain_line} policy
-                     (action : theory_action) node action_text =
+                     theorem_checkpoints (action : theory_action) node action_text =
   let
     val context = #package action ^ ":" ^ #logical action
     val token = spec_token context
@@ -5767,8 +5773,9 @@ fun action_spec_text {root, plan, keys, action_toolchain_key, runtime, toolchain
       map (fn decl => "output extra " ^ token decl) (#extra_outputs action) @
       [bool_option "proof-steps" (proof_steps_enabled policy),
        "option tactic-timeout=" ^ timeout_text (tactic_timeout policy),
-       bool_option "new-ir" (proof_ir_enabled policy),
-       "action-text"]
+       bool_option "new-ir" (proof_ir_enabled policy)] @
+      (if theorem_checkpoints then [] else [bool_option "theorem-checkpoints" false]) @
+      ["action-text"]
   in
     {text = String.concatWith "\n" lines ^ "\n" ^ action_text,
      files = source :: map #from (#inputs action) @ map source_file libraries}
@@ -5980,7 +5987,7 @@ fun export_batch (options : build_options) tc project plan toolchain_key jobs {u
           else raise Error ("internal error: action text of " ^ logical_name node ^ " does not hash to its input key")
         val {text, files} =
           action_spec_text context (checkpoint_policy_for_node options project node)
-            action node action_text
+            (checkpoint_target_node options node) action node action_text
         val spec_sha256 = HolbuildHash.string_sha256 text
         val path = Path.concat(spec_dir, spec_sha256)
         val _ = (ensure_dir spec_dir; write_text path text)
@@ -6074,7 +6081,7 @@ type action_spec =
    outputs : {sig_path : string, sml_path : string, data_path : string},
    extra_outputs : string list,
    proof_steps : bool, tactic_timeout : real option, new_ir : bool,
-   action_text : string}
+   theorem_checkpoints : bool, action_text : string}
 
 fun split_spec_text text =
   let val marker = "\naction-text\n"
@@ -6174,6 +6181,10 @@ fun parse_action_spec text : action_spec =
      proof_steps = spec_bool "proof-steps" (value "option proof-steps"),
      tactic_timeout = tactic_timeout,
      new_ir = spec_bool "new-ir" (value "option new-ir"),
+     theorem_checkpoints =
+       (case List.find (fn (k, _) => k = "option theorem-checkpoints") (!values) of
+            SOME (_, v) => spec_bool "theorem-checkpoints" v
+          | NONE => true),
      action_text = action_text}
   end
 
@@ -6313,7 +6324,7 @@ fun spec_theory_action root (spec : action_spec) deps_key : theory_action =
 
 fun spec_policy (spec : action_spec) =
   CheckpointPolicy {checkpoint = true,
-                    theorem_checkpoints = true,
+                    theorem_checkpoints = #theorem_checkpoints spec,
                     proof_steps = #proof_steps spec,
                     new_ir = #new_ir spec,
                     tactic_timeout = effective_tactic_timeout (#proof_steps spec) (#tactic_timeout spec),

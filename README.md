@@ -870,8 +870,8 @@ holbuild build --target-checkpoints-only MyTheory
   still save their `deps_loaded` checkpoint and run with proof steps and step
   timeouts, so a cold build writes far fewer `.save` files, but those theories
   get no new theorem checkpoints to resume an edit from. Theory outputs and
-  cache keys are the same as without it. Under `--remote-exec` it applies to the
-  theories built here; workers keep their own checkpoints.
+  cache keys are the same as without it. Under `--remote-exec`, the action specs
+  carry it to the workers.
 
 For source-executed theory builds, holbuild writes a live child log at
 `.holbuild/logs/current/<package>/<logical>/build.log`. You can inspect it during
@@ -1130,6 +1130,7 @@ output extra <declaration>
 option proof-steps=<bool>
 option tactic-timeout=<seconds|none>
 option new-ir=<bool>
+option theorem-checkpoints=false   (only under --target-checkpoints-only)
 action-text
 <the action text, verbatim to the end of the blob>
 ```

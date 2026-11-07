@@ -322,3 +322,44 @@ worker d "$spec_d"
 expect d 1 "status=failed" "failure=proof"
 worker e "$(spec_for "$tmpdir/batch-e.txt" worker:ETheory)"
 expect e 1 "status=failed" "failure=tactic-timeout"
+
+# --target-checkpoints-only reaches the worker: a theory that isn't a target
+# keeps its deps heap but saves no theorem checkpoints. Specs without the
+# flag don't mention it.
+cat > "$project/src/FScript.sml" <<'SML'
+Theory F
+
+Theorem f_thm:
+  T
+Proof
+  simp[]
+QED
+SML
+cat > "$project/src/GScript.sml" <<'SML'
+Theory G
+Ancestors F
+
+Theorem g_thm:
+  T
+Proof
+  ACCEPT_TAC f_thm
+QED
+SML
+hb action-spec --upload --target-checkpoints-only GTheory > "$tmpdir/batch-g.txt"
+spec_f=$(spec_for "$tmpdir/batch-g.txt" worker:FTheory)
+spec_g=$(spec_for "$tmpdir/batch-g.txt" worker:GTheory)
+require_grep '^option theorem-checkpoints=false$' "$project/.holbuild/action-specs/$spec_f"
+for spec in "$spec_g" "$spec_a" "$spec_d"; do
+  if grep -q 'theorem-checkpoints' "$project/.holbuild/action-specs/$spec"; then
+    echo "a target's or a default spec names theorem-checkpoints" >&2
+    exit 1
+  fi
+done
+worker f "$spec_f"
+expect f 0 "spec=$spec_f" "status=built"
+find "$tmpdir/worker-f/checkpoints" -name 'deps_loaded.save' | grep -q . ||
+  { echo "the non-target worker kept no deps heap" >&2; exit 1; }
+if find "$tmpdir/worker-f/checkpoints" -path '*.theorems*' -type f | grep -q .; then
+  echo "the non-target worker saved theorem checkpoints" >&2
+  exit 1
+fi
