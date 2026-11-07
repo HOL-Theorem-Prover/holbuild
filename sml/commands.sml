@@ -105,12 +105,8 @@ fun build_help () = print
   \  --trknl\n\
   \  --remote-exec URL [--remote-only] [--detach | --attach BATCH-ID]\n\n\
   \With --remote-exec, theories the remote cache lacks and that aren't\n\
-  \built here for their current inputs are built by the coordinator's\n\
-  \workers and restored from the remote cache, except a\n\
-  \theory nothing else in the batch depends on, which builds locally when\n\
-  \its local checkpoints are current, or when it is the only theory to\n\
-  \build and its dependencies are built here (not with --detach; see the\n\
-  \README). Needs\n\
+  \built here for their current inputs (except with --detach) are built\n\
+  \by the coordinator's workers and restored from the remote cache. Needs\n\
   \--remote-cache. A closure that can't run remotely or an unreachable\n\
   \coordinator builds locally; --remote-only fails instead, with exit\n\
   \status 75. --detach submits the batch and exits; --attach follows a\n\
@@ -1336,7 +1332,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       in
         timed_phase "action_spec.export"
           (fn () => print (HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key jobs
-                             {upload = upload, local_resumable = false, remote_only = false, forced = []}))
+                             {upload = upload, local_resumable = false, forced = []}))
       end
     (* Theories the remote cache lacks go to the coordinator as a batch; once
        it finishes, the ordinary build restores them from the remote cache. *)
@@ -1349,7 +1345,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         fun export forced =
           timed_phase "action_spec.export"
             (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key jobs
-                        {upload = true, local_resumable = not detach, remote_only = remote_only, forced = forced})
+                        {upload = true, local_resumable = not detach, forced = forced})
         fun batch_keys batch =
           List.mapPartial (fn line => case String.tokens Char.isSpace line of
                                           "action" :: key :: _ => SOME key
