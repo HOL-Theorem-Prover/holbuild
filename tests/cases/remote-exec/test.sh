@@ -191,7 +191,8 @@ require_grep "the coordinator reported no theories; reattach with --attach b5" "
 refute_grep "^POST /v1/batches/b5/cancel " "$state/requests.log"
 rm "$state/down"
 run unknown-only 75 build --remote-exec "$coordinator" --remote-only --attach nope BTheory
-require_grep "batch nope can't be followed (HTTP 404): .*no such batch" "$tmpdir/unknown-only.log"
+require_grep "batch nope can't be followed (HTTP 404): .*no such batch.*, cancelled the batch" "$tmpdir/unknown-only.log"
+require_grep "^POST /v1/batches/nope/cancel " "$state/requests.log"
 refute_grep "reattach" "$tmpdir/unknown-only.log"
 run unknown 0 build --remote-exec "$coordinator" --attach nope BTheory
 require_grep "batch nope can't be followed (HTTP 404): .*, cancelled the batch; building locally" "$tmpdir/unknown.log"
@@ -228,8 +229,7 @@ require_grep "the coordinator reported no theories; building locally" "$tmpdir/e
 refute_grep "cancel" "$tmpdir/ended.log"
 rm "$state/ended"
 
-# An interrupted build cancels the batch it follows, unless --remote-only
-# (which can reattach to it).
+# An interrupted build cancels the batch it follows, --remote-only too.
 # interrupt NAME ARGS...: starts hb with ARGS, logging to $tmpdir/NAME.log,
 # and sends holbuild SIGTERM once it follows its batch.  HOLBUILD_BIN may be
 # a wrapper that runs holbuild as its child, as tests/run.sh's does, so the
@@ -264,8 +264,8 @@ require_grep "holbuild: interrupted" "$tmpdir/interrupted.log"
 refute_grep "Theory built" "$tmpdir/interrupted.log"
 interrupt interrupted-only build --remote-exec "$coordinator" --remote-only BTheory
 batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/interrupted-only.log")
-refute_grep "^POST /v1/batches/$batch/cancel " "$state/requests.log"
-refute_grep "cancelled" "$tmpdir/interrupted-only.log"
+require_grep "^POST /v1/batches/$batch/cancel " "$state/requests.log"
+require_grep "holbuild: cancelled remote batch $batch" "$tmpdir/interrupted-only.log"
 rm "$state/hang"
 
 # A closure that can't run remotely (a forced action) is built locally.

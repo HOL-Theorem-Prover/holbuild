@@ -1223,7 +1223,8 @@ breaks is reattached; one that stays unreachable through four reattaches
 a batch that may still run (the stream was given up on, or the coordinator
 won't stream it), it cancels the batch before building locally; one
 interrupted (SIGINT or SIGTERM) while it follows a batch cancels it too. With
-`--remote-only` it fails instead, leaves an interrupted build's batch running, and it never builds HOL or a theory
+`--remote-only` it cancels such a batch the same way but then fails instead of
+building locally, and it never builds HOL or a theory
 locally: a HOL toolchain or a theory that doesn't restore from a cache is an
 error. Such a `--remote-only` build exits with status 75 (`EX_TEMPFAIL`),
 whenever it stops where a build without `--remote-only` would go on locally,
