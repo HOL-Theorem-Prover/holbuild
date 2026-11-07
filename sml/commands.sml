@@ -105,10 +105,10 @@ fun build_help () = print
   \  --trknl\n\
   \  --remote-exec URL [--remote-only] [--detach | --attach BATCH-ID]\n\n\
   \With --remote-exec, theories the remote cache lacks and that aren't\n\
-  \built here for their current inputs are built by the coordinator's\n\
-  \workers and restored from the remote cache. Needs --remote-cache. A\n\
-  \closure that can't run remotely or an unreachable coordinator builds\n\
-  \locally; --remote-only fails instead, with exit\n\
+  \built here for their current inputs (except with --detach) are built\n\
+  \by the coordinator's workers and restored from the remote cache. Needs\n\
+  \--remote-cache. A closure that can't run remotely or an unreachable\n\
+  \coordinator builds locally; --remote-only fails instead, with exit\n\
   \status 75. --detach submits the batch and exits; --attach follows a\n\
   \submitted batch and restores it.\n\n\
   \Global options: see `holbuild --help`.\n"
