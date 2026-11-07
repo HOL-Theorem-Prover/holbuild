@@ -131,6 +131,9 @@ You can override the destination with `PREFIX`, `BINDIR`, or `DESTDIR`.
 Installation also places runtime sources and notices in
 `$PREFIX/share/holbuild`; keep that directory beside `$PREFIX/bin` when moving
 an installation.
+Custom `BINDIR`/`DATADIR` layouts are also supported: `make install` rebuilds
+the executable with that data path. Keep custom data at the configured path;
+use the standard layout for an installation that can move as a directory.
 
 ## A minimal project
 
@@ -1568,8 +1571,8 @@ Maintainer checklist:
 
 The workflow also checks packaging on relevant pull requests without
 publishing anything. To rebuild assets, rerun the tag's workflow; uploads
-replace assets with the same names. A manual workflow run on a branch only
-builds and tests, while a run on a version tag can also attach assets.
+replace assets with the same names. A manual workflow run only builds and
+tests; publication requires a version-tag push.
 
 ## More detail
 

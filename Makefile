@@ -35,11 +35,16 @@ bin/holbuild: sml/holbuild-script.sml sml/sha256.sml sml/spawn.sml sml/hash.sml 
 bin/holbuild: sml/process_group.sml sml/tactic_timeout_policy.sml
 	@mkdir -p bin
 	echo 'val () = use "sml/holbuild-script.sml"; val () = PolyML.export("$@.o", main);' | \
-		$(POLY) -q --error-exit --gcthreads=1
+		HOLBUILD_COMPILE_DATADIR="$(abspath $(DATADIR))" $(POLY) -q --error-exit --gcthreads=1
 	$(POLYC) -o $@ $@.o
 	rm -f $@.o
 
 install: bin/holbuild
+# Custom layouts can't locate their data relative to the executable. Re-export
+# with this install's DATADIR even if an earlier make used different options.
+ifneq ($(abspath $(DATADIR)),$(abspath $(BINDIR)/../share/holbuild))
+	$(MAKE) -B bin/holbuild
+endif
 	install -d "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(DATADIR)/copyrights"
 	install -m 755 bin/holbuild "$(DESTDIR)$(BINDIR)/holbuild"
 	install -m 644 vendor/hol/copyrights/smlnj.txt "$(DESTDIR)$(DATADIR)/copyrights/smlnj.txt"

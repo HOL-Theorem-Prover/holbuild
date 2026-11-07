@@ -15,6 +15,8 @@ mkdir -p "$tmpdir/source"
 cp -R "$HOLBUILD_ROOT/sml" "$HOLBUILD_ROOT/vendor" "$tmpdir/source/"
 cp "$HOLBUILD_ROOT/Makefile" "$HOLBUILD_ROOT/LICENSE" "$tmpdir/source/"
 make -C "$tmpdir/source" install PREFIX="$tmpdir/installed" > "$tmpdir/install.log" 2>&1
+make -C "$tmpdir/source" install PREFIX="$tmpdir/custom-prefix" \
+  BINDIR="$tmpdir/custom-bin" DATADIR="$tmpdir/custom-data" > "$tmpdir/custom-install.log" 2>&1
 rm -rf "$tmpdir/source"
 mv "$tmpdir/installed" "$tmpdir/relocated"
 mkdir -p "$tmpdir/project" "$tmpdir/links"
@@ -42,6 +44,13 @@ require_file "$tmpdir/relocated/share/holbuild/LICENSE"
 require_file "$tmpdir/relocated/share/holbuild/copyrights/smlnj.txt"
 require_file "$tmpdir/relocated/share/holbuild/sml/analyser/analyser_main.sml"
 
+use_case_cache "$tmpdir/custom-cache"
+(cd "$tmpdir/project" && "$tmpdir/custom-bin/holbuild" build --force=full ATheory) > "$tmpdir/custom-build.log" 2>&1
+require_file "$tmpdir/custom-data/sml/holbuild_runtime.sml"
+
 make -C "$HOLBUILD_ROOT" uninstall PREFIX="$tmpdir/relocated" > "$tmpdir/uninstall.log" 2>&1
 require_no_file "$tmpdir/relocated/bin/holbuild"
 require_no_file "$tmpdir/relocated/share/holbuild/sml/holbuild_runtime.sml"
+make -C "$HOLBUILD_ROOT" uninstall BINDIR="$tmpdir/custom-bin" DATADIR="$tmpdir/custom-data" > "$tmpdir/custom-uninstall.log" 2>&1
+require_no_file "$tmpdir/custom-bin/holbuild"
+require_no_file "$tmpdir/custom-data/sml/holbuild_runtime.sml"

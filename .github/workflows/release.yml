@@ -130,7 +130,7 @@ jobs:
           test "$("$root/bin/holbuild" --version)" = "holbuild $version"
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
     needs: smoke
     runs-on: ubuntu-22.04
     timeout-minutes: 5

@@ -1,6 +1,7 @@
 structure HolbuildRuntimePaths =
 struct
   val compile_source_root = OS.FileSys.getDir ()
+  val compile_datadir = OS.Process.getEnv "HOLBUILD_COMPILE_DATADIR"
   val resolved_root = ref NONE
 
   fun executable_path () =
@@ -34,7 +35,8 @@ struct
           val root =
             (let val prefix = OS.Path.concat (OS.Path.dir (executable_path ()), "..")
              in case List.find has_runtime
-                       [OS.Path.concat (prefix, "share/holbuild"), prefix] of
+                       ([OS.Path.concat (prefix, "share/holbuild"), prefix] @
+                        (case compile_datadir of SOME dir => [dir] | NONE => [])) of
                     SOME dir => OS.FileSys.fullPath dir
                   | NONE => compile_source_root
              end handle OS.SysErr _ => compile_source_root)
