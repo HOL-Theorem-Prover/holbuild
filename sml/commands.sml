@@ -38,7 +38,7 @@ fun global_help () = print
   \  context [--trknl]          Show resolved project context\n\n\
   \Inspection and advanced commands:\n\
   \  execution-plan T:THM        Inspect proof-step execution plan\n\
-  \  check THEORY[:THEOREM]      Check theorems for cheats, oracles and axioms\n\
+  \  check THEORY[:THEOREM]      Check for cheats, oracles, axioms and hypotheses\n\
   \  buildhol                    Build/reuse declared HOL and print its path\n\
   \  heap NAME                   Build a configured heap\n\
   \  executable NAME             Build a configured executable heap\n\
@@ -2778,6 +2778,9 @@ fun check_script {logical_name, theorem, project_theories, source_findings} =
        "    case List.filter (fn s => s <> \"DISK_THM\") (#1 (Tag.dest_tag (Thm.tag th))) of",
        "        [] => []",
        "      | oracles => [qualified theory name ^ \": \" ^ String.concatWith \", \" oracles]",
+       "  fun theorem_hypotheses (name, th) =",
+       "    if null (Thm.hyp th) then []",
+       "    else [qualified theory name ^ \": undischarged hypotheses\"]",
        "  fun project_theory thy = List.exists (fn t => t = thy) project_theories",
        "  fun theory_axioms thy =",
        "    map (fn (name, _) => qualified thy name ^ \": axiom\")",
@@ -2785,6 +2788,7 @@ fun check_script {logical_name, theorem, project_theories, source_findings} =
        "  val findings =",
        "    source_findings @",
        "    List.concat (map theorem_oracles checked) @",
+       "    List.concat (map theorem_hypotheses checked) @",
        "    List.concat (map theory_axioms",
        "                   (List.filter project_theory (theory :: Theory.ancestry theory)))",
        "  fun count n noun = Int.toString n ^ \" \" ^ noun ^ (if n = 1 then \"\" else \"s\")",

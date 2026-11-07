@@ -74,6 +74,13 @@ Proof
 QED
 val _ = export_theory();
 SML
+cat > "$project/src/HypothesesScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Hypotheses";
+val _ = save_thm ("assumed_thm", ASSUME ``F``);
+val _ = save_thm ("clean_thm", TRUTH);
+val _ = export_theory();
+SML
 cat > "$project/src/UsesScript.sml" <<'SML'
 open HolKernel Parse boolLib bossLib;
 open BaseTheory;
@@ -164,6 +171,20 @@ require_grep "^CheatTheory.fine_thm: clean (1 theorem)$" "$log"
 
 run_check CheatTheory:cheated_thm 1
 require_grep "^CheatTheory.cheated_thm: cheat$" "$log"
+
+# A stored assumption has no oracle tag, but still has an undischarged hypothesis.
+run_check HypothesesTheory 1
+require_grep "^HypothesesTheory.assumed_thm: undischarged hypotheses$" "$log"
+require_grep "^HypothesesTheory: 1 finding$" "$log"
+require_no_grep "^HypothesesTheory.clean_thm:" "$log"
+
+run_check HypothesesTheory:assumed_thm 1
+require_grep "^HypothesesTheory.assumed_thm: undischarged hypotheses$" "$log"
+require_grep "^HypothesesTheory.assumed_thm: 1 finding$" "$log"
+
+run_check HypothesesTheory:clean_thm 0
+require_grep "^HypothesesTheory.clean_thm: clean (1 theorem)$" "$log"
+require_no_grep "undischarged hypotheses" "$log"
 
 # Theorems loaded from disk do not record the axioms they use, so an axiom
 # anywhere in the ancestry outside HOL is a finding, here in a dependency.
