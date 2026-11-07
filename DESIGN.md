@@ -631,7 +631,9 @@ rebuilding, the remote cache's entry for the key gets one try, since it may
 have been built against the parents being restored. Policy-only
 rejections retain the entry until a successful rebuild can publish. Other output
 conflicts still keep the first entry; remote publication and archive import
-still reject conflicts.
+still reject conflicts, except that a remote-exec worker replaces a remote
+entry whose recorded parents differ from the parents it restored from the
+remote cache, since no build can use it.
 
 ## Global cache
 

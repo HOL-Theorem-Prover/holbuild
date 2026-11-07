@@ -17,7 +17,9 @@ makes the event stream answer 503 and the cancel answer that the batch is
 already done, `skip` reports the batch done without running RUN, `hang` streams one
 running event and then nothing until `hang` is removed, without running RUN, `hold`
 holds the stream after the first action's final event until `hold` is removed, and
-`cancelled` reports every action and the batch cancelled without running RUN.  Otherwise
+`cancelled` reports every action and the batch cancelled without running RUN.  When RUN
+fails having written a theory's input key to `missing` (which is removed), the batch
+fails for resubmission naming that theory, as the coordinator does.  Otherwise
 the cancel answers that it cancelled the batch.  Every request is logged to
 STATE/requests.log.
 """
@@ -135,8 +137,14 @@ class Handler(BaseHTTPRequestHandler):
         if (state / "drop").exists():
             (state / "drop").unlink()
             return
-        final = {"type": "batch", "state": final_state,
-                 "failure": None if ok else "an action failed"}
+        failure = None if ok else "an action failed"
+        missing = state / "missing"
+        if not ok and missing.exists():
+            key = missing.read_text().strip()
+            missing.unlink()
+            if key:
+                failure = f"resubmit: an action is still missing theory {key} after 3 attempts"
+        final = {"type": "batch", "state": final_state, "failure": failure}
         self.wfile.write((json.dumps(final) + "\n").encode())
 
 
