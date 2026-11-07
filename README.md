@@ -1244,7 +1244,8 @@ fail the same way. The build restores what the cache holds, as `--remote-only`
 does, fetches the worker's build log from the remote cache into
 `.holbuild/logs/current/<package>/<theory>/build.log`, prints the diagnostic a
 local build would, and exits with status 1, with or without `--remote-only`.
-If that log can't be fetched, the build falls back as for any failed batch.
+If that log can't be fetched, the build builds just the failed theory locally,
+for its diagnostic; with `--remote-only` it fails with status 75 instead.
 
 `--detach` submits the batch, prints its id (`holbuild: remote batch <id>`)
 and exits; if the batch can't be submitted, it fails rather than building
