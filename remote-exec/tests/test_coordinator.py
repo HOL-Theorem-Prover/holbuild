@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import hashlib
 import json
 from typing import Any
@@ -11,7 +12,7 @@ import sqlalchemy as sa
 from remote_exec import coordinator as coordinator_module
 from remote_exec.app import create_app
 from remote_exec.coordinator import Coordinator
-from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache
+from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache, entry_blob
 
 CLIENT = {"Authorization": f"Bearer {CLIENT_TOKEN}"}
 WORKER = {"Authorization": f"Bearer {WORKER_TOKEN}"}
@@ -246,6 +247,70 @@ async def test_a_parent_whose_blob_expired_is_built_again_before_its_child_is_re
     assert await states(http, batch_id) == {"a": "done", "b": "ready"}
 
 
+async def test_a_parent_found_in_the_cache_is_not_asked_about_again_until_an_input_goes_missing(
+    http: httpx.AsyncClient, cache: FakeCache
+) -> None:
+    batch_id = await submit(http, ["a", "b", "c", "d"], [("b", "a"), ("c", "a"), ("c", "b"), ("d", "a"), ("d", "c")])
+    await build(http, cache, "a")
+    await build(http, cache, "b")
+    # Releasing "c" needs "a" again, which was found whole when "b" was released.
+    assert cache.asked == [ac_key("a"), ac_key("b")]
+    assert await states(http, batch_id) == {"a": "done", "b": "done", "c": "ready", "d": "waiting"}
+
+    # A blob "c" needs expired: it goes back to waiting, and releasing it asks about both its parents again.
+    token = await claim_named(http, "c")
+    record = result("c", "failed", "input-missing", missing=f"blob {'b' * 64}")
+    assert (await complete(http, token, record)).status_code == 200
+    assert sorted(cache.asked[2:]) == sorted([ac_key("a"), ac_key("b")])
+    await build(http, cache, "c")
+    assert cache.asked[4:] == [ac_key("c")]
+    assert await states(http, batch_id) == {"a": "done", "b": "done", "c": "done", "d": "ready"}
+
+
+async def test_a_remembered_parent_whose_blob_expired_is_built_again_once_a_child_misses_it(
+    http: httpx.AsyncClient, cache: FakeCache
+) -> None:
+    batch_id = await submit(http, ["a", "b", "c"], [("b", "a"), ("c", "a")])
+    await build(http, cache, "a")
+    assert await states(http, batch_id) == {"a": "done", "b": "ready", "c": "ready"}
+
+    # A blob of "a" expires after it was found whole; "b" can't restore it.
+    cache.lost.add(ac_key("a"))
+    token = await claim_named(http, "b")
+    record = result("b", "failed", "input-missing", missing=f"blob {entry_blob(ac_key('a'))}")
+    assert (await complete(http, token, record)).status_code == 200
+    assert (await states(http, batch_id))["a"] == "ready"
+    assert (await states(http, batch_id))["b"] == "waiting"
+
+    cache.lost.clear()
+    await build(http, cache, "a")
+    assert (await states(http, batch_id))["b"] == "ready"
+
+
+async def test_concurrent_releases_share_one_check_of_a_parent(cache: FakeCache, coordinator: Coordinator) -> None:
+    cache.keys.add(ac_key("a"))
+    cache.hold = asyncio.Event()
+    checks = [asyncio.create_task(coordinator._in_cache(ac_key("a"))) for _ in range(5)]
+    await asyncio.sleep(0.1)  # every check is waiting on the first one's GET
+    cache.hold.set()
+    assert await asyncio.gather(*checks) == [True] * 5
+    assert cache.asked == [ac_key("a")]
+
+
+async def test_a_check_begun_before_an_input_went_missing_is_not_remembered(
+    cache: FakeCache, coordinator: Coordinator
+) -> None:
+    cache.keys.add(ac_key("a"))
+    cache.hold = asyncio.Event()
+    check = asyncio.create_task(coordinator._in_cache(ac_key("a")))
+    await asyncio.sleep(0.1)
+    coordinator._forget_cache_findings()  # what an input-missing result does
+    cache.hold.set()
+    assert await check is True
+    assert await coordinator._in_cache(ac_key("a")) is True
+    assert cache.asked == [ac_key("a"), ac_key("a")]
+
+
 async def test_retried_action_waits_for_a_parent_requeued_while_it_ran(
     http: httpx.AsyncClient, cache: FakeCache
 ) -> None:
@@ -324,6 +389,83 @@ async def test_a_waiting_claim_takes_an_action_that_becomes_ready_meanwhile(
     response = await asyncio.wait_for(waiting, 10)
     assert response.status_code == 200, response.text
     assert response.json()["theory"] == "pkg:a"
+
+
+async def test_an_action_made_ready_wakes_one_of_the_waiting_claims(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only wakes end the waits in time
+    attempts = 0
+    claim_once = coordinator._claim
+
+    async def counted(tiers: list[str], worker: str) -> Any:
+        nonlocal attempts
+        attempts += 1
+        return await claim_once(tiers, worker)
+
+    monkeypatch.setattr(coordinator, "_claim", counted)
+    waiting = [asyncio.create_task(coordinator.claim(["standard"], f"w{i}", 30)) for i in range(10)]
+    await asyncio.sleep(0.5)
+    assert attempts == 10
+
+    await submit(http, ["a"])
+    done, pending = await asyncio.wait(waiting, timeout=10, return_when=asyncio.FIRST_COMPLETED)
+    assert [task.result().theory for task in done] == ["pkg:a"]
+    await asyncio.sleep(0.5)
+    assert attempts == 11  # the other nine slept on
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def test_an_action_made_ready_wakes_a_waiting_claim_that_takes_its_tier(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only wakes end the waits in time
+    # "a" peaked above the standard tier, so the next batch places it high.
+    await submit(http, ["a"])
+    token = await claim_named(http, "a")
+    cache.keys.add(ac_key("a"))
+    assert (await complete(http, token, result("a", "built", peak_rss_mb="5000"))).status_code == 200
+
+    standard = [asyncio.create_task(coordinator.claim(["standard"], f"s{i}", 30)) for i in range(3)]
+    await asyncio.sleep(0.2)
+    high = asyncio.create_task(coordinator.claim(["high", "standard"], "h", 30))
+    await asyncio.sleep(0.2)
+    await submit(http, ["a"])
+    claimed = await asyncio.wait_for(high, 10)
+    assert claimed is not None and claimed.theory == "pkg:a"
+    assert not any(task.done() for task in standard)
+    for task in standard:
+        task.cancel()
+    await asyncio.gather(*standard, return_exceptions=True)
+
+
+async def test_a_woken_claim_cancelled_hands_its_wake_to_the_next(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only wakes end the waits in time
+    first = asyncio.create_task(coordinator.claim(["standard"], "w1", 30))
+    await asyncio.sleep(0.2)
+    second = asyncio.create_task(coordinator.claim(["standard"], "w2", 30))
+    await asyncio.sleep(0.2)
+    claim_once = coordinator._claim
+    hold = asyncio.Event()
+
+    async def held(tiers: list[str], worker: str) -> Any:
+        if worker == "w1":
+            await hold.wait()  # cancelled while trying, after its wake
+        return await claim_once(tiers, worker)
+
+    monkeypatch.setattr(coordinator, "_claim", held)
+    await submit(http, ["a"])
+    await asyncio.sleep(0.2)
+    assert not second.done()
+    first.cancel()
+    claimed = await asyncio.wait_for(second, 10)
+    assert claimed is not None and claimed.theory == "pkg:a"
+    with contextlib.suppress(asyncio.CancelledError):
+        await first
 
 
 async def test_a_waiting_claim_whose_worker_left_leases_nothing(
