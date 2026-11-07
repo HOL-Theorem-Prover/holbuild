@@ -1,6 +1,8 @@
 structure HolbuildTacticTimeoutPolicy =
 struct
 
+datatype proof_scope = ProofRoot | ProofAll
+
 fun timeout_min (NONE, timeout) = timeout
   | timeout_min (timeout, NONE) = timeout
   | timeout_min (SOME a, SOME b) = SOME (Real.min(a, b))
@@ -22,11 +24,16 @@ fun root_package_name project = HolbuildProject.package_name (HolbuildProject.pr
 
 fun root_package_node project node = HolbuildBuildPlan.package node = root_package_name project
 
+fun includes_node ProofRoot project node = root_package_node project node
+  | includes_node ProofAll _ _ = true
+
 fun add_root_node_timeout project timeout (node, acc) =
   if root_package_node project node then add_node_timeout node timeout acc else acc
 
-fun plan_timeouts project plan timeout =
-  List.foldl (add_root_node_timeout project timeout) [] (HolbuildBuildPlan.selected_nodes plan)
+fun plan_timeouts scope project plan timeout =
+  List.foldl
+    (fn (node, acc) => if includes_node scope project node then add_node_timeout node timeout acc else acc)
+    [] (HolbuildBuildPlan.selected_nodes plan)
 
 fun source_entry source = (#relative_path source, #logical_name source)
 

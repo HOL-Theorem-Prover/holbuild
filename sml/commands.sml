@@ -99,6 +99,7 @@ fun build_help () = print
   \      Save theorem checkpoints in every root-package theory, not only in\n\
   \      the requested targets.\n\
   \  --skip-proof-steps\n\
+  \  --proof-scope root|all (default: root)\n\
   \  --tactic-timeout SECONDS\n\
   \  --trace-steps\n\
   \  --repl-on-failure\n\
@@ -325,6 +326,12 @@ fun tactic_timeout_value text =
   let val seconds = nonnegative_real "--tactic-timeout" text
   in if seconds <= 0.0 then NONE else SOME seconds end
 
+fun proof_scope_value text =
+  case text of
+      "root" => HolbuildTacticTimeoutPolicy.ProofRoot
+    | "all" => HolbuildTacticTimeoutPolicy.ProofAll
+    | _ => raise Error ("--proof-scope must be root or all, got " ^ HolbuildHash.quote text)
+
 fun force_level_value text =
   case text of
       "none" => HolbuildBuildExec.ForceNone
@@ -354,14 +361,14 @@ fun split_flags args =
       extract_flag "--allow-cache-timeout-discrepancy" args_without_emit_output_hashes
     val (all_checkpoints, build_args) =
       extract_flag "--all-checkpoints" args_without_allow_discrepancy
-    fun loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable rest =
+    fun loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable rest =
       case rest of
           [] => ({dry_run = dry, watch = watch, force = force, use_cache = use_cache,
                   verify_cache = verify_cache,
                   no_stat_cache = no_stat_cache,
                   skip_checkpoints = skip_checkpoints,
                   all_checkpoints = all_checkpoints,
-                  proof_steps = proof_steps, new_ir = new_ir,
+                  proof_steps = proof_steps, new_ir = new_ir, proof_scope = proof_scope,
                   tactic_timeout = tactic_timeout,
                   tactic_timeout_set = tactic_timeout_set,
                   execution_plan = execution_plan,
@@ -372,55 +379,62 @@ fun split_flags args =
                   emit_output_hashes = emit_output_hashes,
                   allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy}, [])
         | "--dry-run" :: xs =>
-            loop true watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
+            loop true watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
         | "--watch" :: xs =>
-            loop dry true force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
+            loop dry true force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
         | "--force" :: xs =>
-            loop dry watch HolbuildBuildExec.ForceAll use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
+            loop dry watch HolbuildBuildExec.ForceAll use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
         | "--force-theory" :: xs =>
-            loop dry watch HolbuildBuildExec.ForceTargets use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
+            loop dry watch HolbuildBuildExec.ForceTargets use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
         | "--force-project" :: xs =>
-            loop dry watch HolbuildBuildExec.ForceProject use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
+            loop dry watch HolbuildBuildExec.ForceProject use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
         | "--force-full" :: xs =>
-            loop dry watch HolbuildBuildExec.ForceAll use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
+            loop dry watch HolbuildBuildExec.ForceAll use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
         | "--no-cache" :: xs =>
-            loop dry watch force false verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
+            loop dry watch force false verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
         | "--no-stat-cache" :: xs =>
-            loop dry watch force use_cache verify_cache true skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
+            loop dry watch force use_cache verify_cache true skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
         | "--skip-checkpoints" :: xs =>
-            loop dry watch force use_cache verify_cache no_stat_cache true proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
+            loop dry watch force use_cache verify_cache no_stat_cache true proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
         | "--skip-proof-steps" :: xs =>
-            loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints false false tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
+            loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints false false proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
         | "--skip-goalfrag" :: xs =>
             (warn "--skip-goalfrag is deprecated; use --skip-proof-steps";
-             loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints false false tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs)
+             loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints false false proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs)
         | "--goalfrag" :: _ =>
             raise Error "--goalfrag has been removed; proof steps are enabled by default"
         | "--new-ir" :: xs =>
             (warn "--new-ir is deprecated and has no effect; proof IR is the default";
-             loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps true tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs)
+             loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps true proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs)
         | "--goalfrag-plan" :: _ => raise Error "--goalfrag-plan has been removed; use execution-plan THEORY:THEOREM"
         | "--trace-steps" :: xs =>
-            loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan true repl_on_failure retain_debug_artifacts warn_unreachable xs
+            loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan true repl_on_failure retain_debug_artifacts warn_unreachable xs
         | "--goalfrag-trace" :: xs =>
             (warn "--goalfrag-trace is deprecated; use --trace-steps";
-             loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan true repl_on_failure retain_debug_artifacts warn_unreachable xs)
+             loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan true repl_on_failure retain_debug_artifacts warn_unreachable xs)
         | "--repl-on-failure" :: xs =>
-            loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps true retain_debug_artifacts warn_unreachable xs
+            loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps true retain_debug_artifacts warn_unreachable xs
         | "--retain-debug-artifacts" :: xs =>
-            loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure true warn_unreachable xs
+            loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure true warn_unreachable xs
         | "--warn-unreachable" :: xs =>
-            loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts true xs
+            loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts true xs
          | "--trknl" :: xs =>
-             loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
+             loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
+        | "--proof-scope" :: scope :: xs =>
+            loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir (proof_scope_value scope) tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
+        | "--proof-scope" :: [] => raise Error "--proof-scope requires root or all"
         | "--tactic-timeout" :: seconds :: xs =>
-            loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir (tactic_timeout_value seconds) true execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
+            loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope (tactic_timeout_value seconds) true execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
         | "--tactic-timeout" :: [] => raise Error "--tactic-timeout requires SECONDS"
         | x :: xs =>
             if String.isPrefix "--force=" x then
-              loop dry watch (force_level_value (String.extract (x, size "--force=", NONE))) use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
-            else if String.isPrefix "--tactic-timeout=" x then
+              loop dry watch (force_level_value (String.extract (x, size "--force=", NONE))) use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
+            else if String.isPrefix "--proof-scope=" x then
               loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir
+                   (proof_scope_value (String.extract (x, size "--proof-scope=", NONE)))
+                   tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
+            else if String.isPrefix "--tactic-timeout=" x then
+              loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope
                    (tactic_timeout_value (String.extract (x, size "--tactic-timeout=", NONE)))
                    true execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
             else if String.isPrefix "--goalfrag-plan=" x then
@@ -432,16 +446,17 @@ fun split_flags args =
             else if String.isPrefix "--" x then
               raise Error ("unknown build option: " ^ x)
             else
-              let val (flags, ys) = loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
+              let val (flags, ys) = loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
               in (flags, x :: ys) end
   in
-    loop false false HolbuildBuildExec.ForceNone true true false false true true NONE false NONE false false false false build_args
+    loop false false HolbuildBuildExec.ForceNone true true false false true true HolbuildTacticTimeoutPolicy.ProofRoot NONE false NONE false false false false build_args
   end
 
 fun default_build_request targets =
   ({dry_run = false, watch = false, force = HolbuildBuildExec.ForceNone,
     use_cache = true, verify_cache = true, no_stat_cache = false,
     skip_checkpoints = false, all_checkpoints = false, proof_steps = true, new_ir = true,
+    proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,
     tactic_timeout = NONE, tactic_timeout_set = false, execution_plan = NONE,
     trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
     warn_unreachable = false, emit_output_hashes = false,
@@ -455,6 +470,7 @@ fun plain_build_request targets =
   ({dry_run = false, watch = false, force = HolbuildBuildExec.ForceNone,
     use_cache = true, verify_cache = true, no_stat_cache = false,
     skip_checkpoints = true, all_checkpoints = false, proof_steps = false, new_ir = false,
+    proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,
     tactic_timeout = NONE, tactic_timeout_set = false, execution_plan = NONE,
     trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
     warn_unreachable = false, emit_output_hashes = false,
@@ -1032,7 +1048,7 @@ datatype build_mode =
   | ExportActionSpecs of {upload : bool}
   | RemoteExec of {url : string, remote_only : bool, detach : bool, attach : string option}
 
-fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, all_checkpoints, proof_steps, new_ir, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy}, targets) =
+fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, all_checkpoints, proof_steps, new_ir, proof_scope, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy}, targets) =
   let
     val project =
       case prepared of
@@ -1043,7 +1059,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
     (* Tracing builds collect proof traces, so by default they skip the proof
        development artifacts, as --skip-checkpoints --skip-proof-steps would.
        An explicit debugging flag turns back on what it needs. *)
-    val debug_proof_steps = trace_steps orelse tactic_timeout_set orelse repl_on_failure
+    val debug_proof_steps = trace_steps orelse tactic_timeout_set orelse repl_on_failure orelse
+                            proof_scope = HolbuildTacticTimeoutPolicy.ProofAll
     val (skip_checkpoints, proof_steps, new_ir) =
       if trknl then
         (skip_checkpoints orelse not repl_on_failure,
@@ -1070,10 +1087,17 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         raise Error "proof steps are required for proof IR; remove --skip-proof-steps"
       else if not proof_steps andalso tactic_timeout_set then
         raise Error "--tactic-timeout requires proof steps; remove --skip-proof-steps"
+      else if not proof_steps andalso proof_scope = HolbuildTacticTimeoutPolicy.ProofAll then
+        raise Error "--proof-scope=all requires proof steps; remove --skip-proof-steps"
       else if not proof_steps andalso trace_steps then
         raise Error "--trace-steps requires proof steps; remove --skip-proof-steps"
       else if not proof_steps andalso repl_on_failure then
         raise Error "--repl-on-failure requires proof steps; remove --skip-proof-steps"
+      else ()
+    val _ =
+      if proof_scope = HolbuildTacticTimeoutPolicy.ProofAll andalso
+         (force <> HolbuildBuildExec.ForceAll orelse use_cache) then
+        warn "proof-scope=all only checks actions that execute; up-to-date and cache-restored actions are not checked; use --force=full --no-cache for a full audit"
       else ()
     val stat_cache = begin_stat_cache project no_stat_cache
     fun default_tactic_timeout () =
@@ -1092,6 +1116,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
        checkpoint_targets = checkpoint_targets,
        proof_steps = proof_steps,
        new_ir = new_ir,
+       proof_scope = proof_scope,
        node_tactic_timeouts =
          let
            (* Resolve all manifest entries even when CLI policy wins, so invalid
@@ -1100,12 +1125,12 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
          in
            if not proof_steps then []
            else if tactic_timeout_set then
-             HolbuildTacticTimeoutPolicy.plan_timeouts project plan tactic_timeout
+             HolbuildTacticTimeoutPolicy.plan_timeouts proof_scope project plan tactic_timeout
            else
              let
                val selected =
                  HolbuildTacticTimeoutPolicy.combine_timeouts
-                   (HolbuildTacticTimeoutPolicy.plan_timeouts project plan
+                   (HolbuildTacticTimeoutPolicy.plan_timeouts proof_scope project plan
                       (default_tactic_timeout ()))
                    (HolbuildTacticTimeoutPolicy.entry_timeouts project index plan
                       (default_tactic_timeout ()))
@@ -1774,11 +1799,12 @@ fun default_build_options trknl project index entry_plan plan =
      checkpoint_targets = NONE,
      proof_steps = true,
      new_ir = true,
+     proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,
      node_tactic_timeouts =
        HolbuildTacticTimeoutPolicy.replace_timeouts
          (HolbuildTacticTimeoutPolicy.combine_timeouts
             (HolbuildTacticTimeoutPolicy.combine_timeouts
-               (HolbuildTacticTimeoutPolicy.plan_timeouts project plan
+               (HolbuildTacticTimeoutPolicy.plan_timeouts HolbuildTacticTimeoutPolicy.ProofRoot project plan
                   (default_tactic_timeout ()))
                (HolbuildTacticTimeoutPolicy.entry_timeouts project index plan
                   (default_tactic_timeout ())))
@@ -1825,6 +1851,7 @@ fun heap_build_options trknl =
    checkpoint_targets = NONE,
    proof_steps = false,
    new_ir = false,
+   proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,
    node_tactic_timeouts = [],
    execution_plan = NONE,
    trace_steps = false,

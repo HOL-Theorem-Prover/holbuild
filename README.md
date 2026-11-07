@@ -233,9 +233,9 @@ pass `--trknl` to each child HOL process.
 
 `build --trknl` collects traces, not proof-development artifacts, so it builds
 root-package theories as `--skip-checkpoints --skip-proof-steps` would, as
-dependency packages always are. Kernel inference checking and the `.tr.gz`
+dependency packages are by default. Kernel inference checking and the `.tr.gz`
 outputs are unaffected. An explicit debugging flag turns back on what it needs:
-`--trace-steps` and `--tactic-timeout` enable proof steps, and
+`--trace-steps`, `--tactic-timeout`, and `--proof-scope=all` enable proof steps, and
 `--repl-on-failure` enables proof steps and checkpoints. Explicit
 `--skip-proof-steps` or `--skip-checkpoints` still conflicts with those flags.
 
@@ -841,14 +841,15 @@ proofs in the root package and executes them as proof steps. This gives better
 failure locations, per-step tactic timeouts, and optional traces. Theorem proofs
 also support failed-prefix checkpoints; termination proofs currently replay from
 the preceding clean definition/theorem/dependency checkpoint. Theories in
-dependency packages build without proof-step instrumentation or checkpoints;
-to debug a dependency's proofs, build that package as the root project.
+dependency packages build without proof-step instrumentation or checkpoints
+by default. To audit their proofs too, select `--proof-scope=all`.
 
 Useful commands and options:
 
 ```sh
 holbuild execution-plan MyTheory:my_theorem
 holbuild build --tactic-timeout 10 MyTheory
+holbuild build --force=full --no-cache --proof-scope=all --tactic-timeout 5 MyTheory
 holbuild build --trace-steps --force MyTheory
 holbuild build --repl-on-failure MyTheory
 holbuild build --skip-proof-steps MyTheory
@@ -862,12 +863,22 @@ holbuild build --all-checkpoints MyTheory
 - `--tactic-timeout SECONDS` changes the per-step timeout; `0` disables it.
   A step that times out fails the build even inside `TRY` or an `ORELSE`
   alternative.
+- `--proof-scope root|all` (also `--proof-scope=root|all`) selects which
+  theories receive proof instrumentation and the invocation's timeout. `root`
+  is the default. `all` includes dependency theories in the selected build
+  plan; unselected theories and packages are untouched. Existing root-package
+  timeout overrides keep their usual scope.
+  Use `--force=full --no-cache` for a full audit. Otherwise holbuild warns that
+  up-to-date and cache-restored actions are not checked. Scope and timeout
+  do not change action keys; existing timeout compatibility checks still apply
+  when reusing outputs. `all` conflicts with `--skip-proof-steps`.
 - `--trace-steps` records proof-step traces in child logs.
 - `--repl-on-failure` starts a HOL REPL from the newest useful checkpoint after a
   theory failure. It serialises the build and is not supported with `--json`.
 - `--skip-proof-steps` opts out of proof-step execution.
 - `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation.
-- `--all-checkpoints` saves theorem checkpoints in every root-package theory
+- `--all-checkpoints` saves theorem checkpoints in every theory included by
+  `--proof-scope` (root-package theories by default) that
   the build runs. By default only the requested targets save them (the default
   targets when none are given, or every root-package theory when there are
   none); the other theories still save their `deps_loaded` checkpoint and run

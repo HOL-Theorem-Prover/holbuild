@@ -2712,7 +2712,7 @@ fun best_failed_prefix_checkpoint requested_timeout checkpoints =
 
 datatype force_level = ForceNone | ForceTargets | ForceProject | ForceAll
 
-type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, checkpoint_targets : string list option, proof_steps : bool, new_ir : bool, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool}
+type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, checkpoint_targets : string list option, proof_steps : bool, new_ir : bool, proof_scope : HolbuildTacticTimeoutPolicy.proof_scope, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool}
 
 (* checkpoint: the theory saves checkpoints at all, its deps_loaded state
    included.  theorem_checkpoints: it also saves them per theorem and
@@ -3936,8 +3936,8 @@ fun checkpoint_target_node ({checkpoint_targets, ...} : build_options) node =
       NONE => true
     | SOME targets => force_target_node targets node
 
-fun checkpoint_policy_for_node (options as {skip_checkpoints, proof_steps, new_ir, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure, trknl, ...} : build_options) project node =
-  if root_package_node project node then
+fun checkpoint_policy_for_node (options as {skip_checkpoints, proof_steps, new_ir, proof_scope, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure, trknl, ...} : build_options) project node =
+  if HolbuildTacticTimeoutPolicy.includes_node proof_scope project node then
     CheckpointPolicy {checkpoint = not skip_checkpoints,
                       theorem_checkpoints =
                         (* The REPL starts from a failed proof wherever it is. *)
@@ -5509,12 +5509,12 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
 
 (* The build options of a build that only restores from the caches. *)
 fun restore_only_options ({use_cache, verify_cache, force, force_targets, skip_checkpoints, checkpoint_targets, proof_steps,
-                           new_ir, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure,
+                           new_ir, proof_scope, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure,
                            emit_output_hashes, allow_cache_timeout_discrepancy, trknl, ...} : build_options)
     : build_options =
   {use_cache = use_cache, verify_cache = verify_cache, force = force, force_targets = force_targets,
    skip_checkpoints = skip_checkpoints, checkpoint_targets = checkpoint_targets,
-   proof_steps = proof_steps, new_ir = new_ir,
+   proof_steps = proof_steps, new_ir = new_ir, proof_scope = proof_scope,
    node_tactic_timeouts = node_tactic_timeouts, execution_plan = execution_plan,
    trace_steps = trace_steps, repl_on_failure = repl_on_failure,
    emit_output_hashes = emit_output_hashes,

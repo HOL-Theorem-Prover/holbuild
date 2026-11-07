@@ -43,7 +43,21 @@ QED
 val _ = export_theory();
 SML
 
+cat > "$dep/src/UnusedScript.sml" <<'SML'
+Theory Unused
+Ancestors bool
+val _ = raise Fail "unselected theory executed";
+SML
 dep_rev=$(init_git_repo "$dep")
+unused=$tmpdir/unused
+mkdir -p "$unused/src"
+sed 's/name = "dep"/name = "unused"/' "$dep/holproject.toml" > "$unused/holproject.toml"
+cat > "$unused/src/DormantScript.sml" <<'SML'
+Theory Dormant
+Ancestors bool
+val _ = raise Fail "unselected package executed";
+SML
+unused_rev=$(init_git_repo "$unused")
 {
   write_schema2_prelude
   cat <<TOML
@@ -52,10 +66,15 @@ name = "consumer"
 
 [build]
 members = ["src"]
+tactic_timeout = 0.1
 
 [dependencies.dep]
 git = "$dep"
 rev = "$dep_rev"
+
+[dependencies.unused]
+git = "$unused"
+rev = "$unused_rev"
 TOML
 } > "$project/holproject.toml"
 cat > "$project/src/BScript.sml" <<'SML'
@@ -112,6 +131,85 @@ if grep -q "tactic_timeout=\|proof_steps=\|goalfrag=" "$project/.holbuild/dep/de
   echo "changed root timeout leaked into final action metadata" >&2
   exit 1
 fi
+
+# Audit scope instruments selected dependencies, while ordinary consumer builds
+# above leave them alone. The unused dependency theory must never execute.
+dep_metadata=$project/.holbuild/dep/dep/src/AScript.sml.key
+root_metadata=$project/.holbuild/dep/consumer/src/BScript.sml.key
+grep '^input_key=' "$dep_metadata" > "$tmpdir/dep-root-input-key"
+grep '^input_key=' "$root_metadata" > "$tmpdir/root-root-input-key"
+audit_log=$tmpdir/audit.log
+if (cd "$project" && "$HOLBUILD_BIN" build --force=full --no-cache --proof-scope=all --tactic-timeout 0.1 BTheory) > "$audit_log" 2>&1; then
+  echo "expected dependency tactic to time out in audit scope" >&2
+  exit 1
+fi
+require_grep "tactic timed out after 0.1s while building ATheory: slow_tac" "$audit_log"
+require_grep "theorem: dep_slow_thm (line " "$audit_log"
+require_grep "source: .*AScript.sml:" "$audit_log"
+if grep -q "warning: proof-scope=all" "$audit_log"; then
+  echo "full source audit printed an incomplete-audit warning" >&2
+  exit 1
+fi
+audit_default_log=$tmpdir/audit-default.log
+if (cd "$project" && "$HOLBUILD_BIN" build --force=full --no-cache --proof-scope all BTheory) > "$audit_default_log" 2>&1; then
+  echo "expected dependency tactic to use the project default timeout" >&2
+  exit 1
+fi
+require_grep "tactic timed out after 0.1s while building ATheory: slow_tac" "$audit_default_log"
+
+audit_passing_log=$tmpdir/audit-passing.log
+(cd "$project" && "$HOLBUILD_BIN" build --force=full --no-cache --proof-scope all --tactic-timeout 1 BTheory) > "$audit_passing_log" 2>&1
+require_grep "ATheory built" "$audit_passing_log"
+require_grep "BTheory built" "$audit_passing_log"
+require_no_file "$project/.holbuild/packages/dep/obj/src/UnusedTheory.dat"
+require_no_file "$project/.holbuild/packages/unused/obj/src/DormantTheory.dat"
+if [[ -d "$project/.holbuild/checkpoints/unused" ]]; then
+  echo "audit scope created checkpoints for an unselected package" >&2
+  exit 1
+fi
+grep '^input_key=' "$dep_metadata" > "$tmpdir/dep-audit-input-key"
+grep '^input_key=' "$root_metadata" > "$tmpdir/root-audit-input-key"
+cmp "$tmpdir/dep-root-input-key" "$tmpdir/dep-audit-input-key"
+cmp "$tmpdir/root-root-input-key" "$tmpdir/root-audit-input-key"
+
+cp "$dep_metadata" "$tmpdir/dep-audit.key"
+cp "$root_metadata" "$tmpdir/root-audit.key"
+for scope in root all; do
+  reuse_log=$tmpdir/reuse-$scope.log
+  (cd "$project" && "$HOLBUILD_BIN" --verbose build --proof-scope "$scope" --tactic-timeout 2 BTheory) > "$reuse_log" 2>&1
+  require_grep "ATheory is up to date" "$reuse_log"
+  require_grep "BTheory is up to date" "$reuse_log"
+  cmp "$dep_metadata" "$tmpdir/dep-audit.key"
+  cmp "$root_metadata" "$tmpdir/root-audit.key"
+done
+require_grep "warning: proof-scope=all.*up-to-date.*cache-restored" "$tmpdir/reuse-all.log"
+for flag in --force=full --no-cache; do
+  warning_log=$tmpdir/warning.log
+  (cd "$project" && "$HOLBUILD_BIN" build --dry-run --proof-scope=all "$flag" BTheory) > "$warning_log" 2>&1
+  require_grep "warning: proof-scope=all.*up-to-date.*cache-restored" "$warning_log"
+done
+
+for args in '--proof-scope=invalid' '--proof-scope invalid'; do
+  invalid_scope_log=$tmpdir/invalid-scope.log
+  # Intentional word splitting exercises both option spellings.
+  if (cd "$project" && "$HOLBUILD_BIN" build $args BTheory) > "$invalid_scope_log" 2>&1; then
+    echo "invalid proof scope accepted: $args" >&2
+    exit 1
+  fi
+  require_grep 'proof-scope.*root.*all' "$invalid_scope_log"
+done
+missing_scope_log=$tmpdir/missing-scope.log
+if (cd "$project" && "$HOLBUILD_BIN" build BTheory --proof-scope) > "$missing_scope_log" 2>&1; then
+  echo "missing proof scope accepted" >&2
+  exit 1
+fi
+require_grep 'proof-scope.*root.*all' "$missing_scope_log"
+disabled_scope_log=$tmpdir/disabled-scope.log
+if (cd "$project" && "$HOLBUILD_BIN" build --skip-proof-steps --proof-scope=all BTheory) > "$disabled_scope_log" 2>&1; then
+  echo "audit scope silently disabled proof instrumentation" >&2
+  exit 1
+fi
+require_grep 'proof-scope=all requires proof steps' "$disabled_scope_log"
 
 python3 - "$HOLBUILD_CACHE" <<'PY'
 import pathlib
