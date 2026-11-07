@@ -589,10 +589,10 @@ with its sources and extra inputs declared, under the same theory toolchain key,
 produces a byte-identical `Theory.dat` in any project directory and artifact
 cache. The exporter canonicalizes the parent header by theory name, preserving
 the remaining payload, and updates the embedded data hash in `Theory.sml`.
-The generated parent load metadata uses the same order. Theory action keys
-include `theory_manifest_version`, which changes whenever holbuild changes what
+The generated parent load metadata uses the same order. Every action key
+includes `theory_manifest_version`, which changes whenever holbuild changes what
 a theory exports, so entries from exporters with different outputs never share
-a key; `tests/cases/theory-dat-reproducible/golden-outputs` pins one fixture's
+a key (ML library entries are invalidated along with theories); `tests/cases/theory-dat-reproducible/golden-outputs` pins one fixture's
 outputs per version to catch an unbumped change.
 A script that reads the clock, the environment, undeclared files, or host paths
 has to declare the files as `extra_deps` or opt out with `cache = false`.

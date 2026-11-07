@@ -4305,12 +4305,14 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
            one retry either way. *)
         fun materialize retry existing =
           let
+            (* A failed copy may have met an entry another build just published. *)
             fun from_remote () =
-              if not (copied_from_remote input_key) andalso hydrate_remote_cache_key root input_key then
-                case HolbuildCache.get_action root input_key of
-                    SOME text => materialize false text
-                  | NONE => CacheMiss
-              else CacheMiss
+              if copied_from_remote input_key then CacheMiss
+              else
+                (ignore (hydrate_remote_cache_key root input_key);
+                 case HolbuildCache.get_action root input_key of
+                     SOME text => materialize false text
+                   | NONE => CacheMiss)
             fun reject_parents () =
               (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
                             input_key ^ " (parent outputs differ)");
