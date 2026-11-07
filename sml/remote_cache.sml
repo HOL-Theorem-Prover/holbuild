@@ -468,17 +468,23 @@ fun has_blob cache sha256 = Option.isSome (lookup_blob cache sha256)
    outlive its blobs (an object store expires each object on its own), so
    an entry whose blobs are gone isn't usable.  Only a 404 says the blob is
    gone; no answer, or another status, says nothing about it. *)
-fun blob_presence cache sha256 =
+fun blob_present cache sha256 =
   let val url = cas_url cache sha256
   in
     case send "HEAD" url "" (fn () => head_status curl_max_time_seconds url) of
-        SOME (HolbuildHttp.Response 200) => SOME true
-      | SOME (HolbuildHttp.Response 404) => SOME false
-      | _ => NONE
+        SOME (HolbuildHttp.Response 404) => false
+      | _ => true
   end
-  handle _ => NONE
+  handle _ => true
 
-fun blob_present cache sha256 = Option.getOpt (blob_presence cache sha256, true)
+(* An optional upload probe must not disable PUTs when a server drops HEADs.
+   Leave the breaker to the normal cache requests, and skip only confirmed hits. *)
+fun blob_confirmed_present cache sha256 =
+  if disabled () then false
+  else
+    let val url = cas_url cache sha256
+    in traced "HEAD" url "" (fn () => head_status curl_max_time_seconds url) = HolbuildHttp.Response 200 end
+    handle _ => false
 
 fun verify_downloaded_blob path ({sha256, size} : blob_entry) =
   if Position.toString (FS.fileSize path) <> size then

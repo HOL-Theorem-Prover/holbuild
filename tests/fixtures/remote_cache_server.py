@@ -126,6 +126,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.record_request()
         if not self.authorized():
             return
+        if control is not None and (control / "head-disconnect").exists():
+            self.close_connection = True
+            return
         if control is not None and (control / "head-status").exists():
             self.send_response(int((control / "head-status").read_text()))
             self.end_headers()

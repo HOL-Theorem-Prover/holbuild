@@ -237,6 +237,29 @@ for client in libcurl cli; do
   diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-unknown-head.txt"
   [[ $(grep -c '^PUT /cas/' "$request_log") -eq 8 ]]
   rm "$tmpdir/control/head-status"
+  # Hold PUT responses until three follow failed HEADs. Counting optional
+  # HEAD failures against the breaker would suppress the third PUT.
+  rm "$tmpdir/control/cas-put-count"
+  touch "$tmpdir/control/head-disconnect" "$tmpdir/control/cas-put-enable"
+  (cd "$project" && exec "$HOLBUILD_BIN" --remote-cache "$remote_url" \
+    --prefetch-concurrency 3 action-spec --upload CTheory) \
+    > "$tmpdir/batch-head-disconnect.txt" 2> "$tmpdir/head-disconnect.log" &
+  export_pid=$!
+  for _ in {1..500}; do
+    count=$(cat "$tmpdir/control/cas-put-count" 2>/dev/null || echo 0)
+    [[ "$count" -ge 3 ]] && break
+    kill -0 "$export_pid" 2>/dev/null || break
+    sleep 0.01
+  done
+  [[ "$count" -eq 3 ]] || {
+    echo "expected three PUTs after failed HEADs, observed $count" >&2
+    exit 1
+  }
+  touch "$tmpdir/control/cas-put-release"
+  wait "$export_pid"
+  unset export_pid
+  rm "$tmpdir/control/head-disconnect" "$tmpdir/control/cas-put-enable" "$tmpdir/control/cas-put-release"
+  diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-head-disconnect.txt"
   unset HOLBUILD_TEST_LIBCURL
 done
 
@@ -245,12 +268,13 @@ missing_spec=$(awk '$1 == "action" { print $4; exit }' "$tmpdir/batch1.txt")
 rm "$remote_root/cas/$missing_spec"
 echo 500 > "$tmpdir/control/cas-put-status"
 : > "$request_log"
-if hb --prefetch-concurrency 1 action-spec --upload CTheory > /dev/null 2> "$tmpdir/upload-failure.log"; then
+if HOLBUILD_TIMING_LOG="$tmpdir/failed-upload.timing" hb --prefetch-concurrency 1 action-spec --upload CTheory > /dev/null 2> "$tmpdir/upload-failure.log"; then
   echo "an export whose upload failed succeeded" >&2
   exit 1
 fi
 rm "$tmpdir/control/cas-put-status"
 require_grep 'could not upload .*HTTP 500' "$tmpdir/upload-failure.log"
+require_grep 'name=action_spec.upload.*status=fail' "$tmpdir/failed-upload.timing"
 [[ $(grep -c '^PUT /cas/' "$request_log") -eq 1 ]] || {
   echo "uploads went on after the first failure:" >&2
   grep '^PUT /cas/' "$request_log" >&2
