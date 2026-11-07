@@ -4758,7 +4758,7 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
               else
                 (ignore (hydrate_remote_cache_key root input_key);
                  case HolbuildCache.get_action root input_key of
-                     SOME text => materialize false text
+                     SOME text => if text = existing then CacheMiss else materialize false text
                    | NONE => CacheMiss)
             fun reject_parents () =
               (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
@@ -4773,9 +4773,11 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
           in
             case materialize_theory_cache (#verify_cache options) allow_timeout_discrepancy
                    project plan input_key (tactic_timeout policy) (trknl_enabled policy) node of
-                (* A policy miss can also hide stale parent outputs. Preserve
-                   compatible weaker-policy entries if rechecking fails. *)
-                CacheMiss => if cached_parents_match existing then CacheMiss else reject_parents ()
+                (* A worker may have strengthened the remote timeout contract.
+                   Refresh without dropping the usable weaker local entry. *)
+                CacheMiss =>
+                  if not (cached_parents_match existing) then reject_parents ()
+                  else if retry then from_remote () else CacheMiss
               | restored as CacheRestored _ =>
                   if theory_parent_hashes_match dat_hash_cache plan node NONE then restored
                   else reject_parents ()
