@@ -4182,7 +4182,8 @@ fun source_spans_for_action policy (action : theory_action) source_text =
      termination_diagnostics = []}
 
 fun declaration_checkpoints_for_action policy checkpoint_root (action : theory_action) source_text terminations =
-  if not (checkpoint_enabled policy) orelse not (proof_steps_enabled policy) then []
+  if not (checkpoint_enabled policy) orelse not (theorem_checkpoints_enabled policy) orelse
+     not (proof_steps_enabled policy) then []
   else
     declaration_checkpoint_specs (proof_engine policy) (tactic_timeout policy)
       (action_checkpoint_base checkpoint_root action) (#deps_key action)
@@ -6289,8 +6290,11 @@ fun spec_theory_action root (spec : action_spec) deps_key : theory_action =
      extra_outputs = #extra_outputs spec}
   end
 
-fun spec_policy (spec : action_spec) =
-  CheckpointPolicy {checkpoint = true,
+(* With shared heaps a theory without theorem checkpoints saves no
+   deps-loaded heap either: nothing would share it, and the run's checkpoint
+   tree is emptied after it. *)
+fun spec_policy share_heaps (spec : action_spec) =
+  CheckpointPolicy {checkpoint = not share_heaps orelse #theorem_checkpoints spec,
                     theorem_checkpoints = #theorem_checkpoints spec,
                     proof_steps = #proof_steps spec,
                     new_ir = #new_ir spec,
@@ -6956,6 +6960,7 @@ fun shared_candidates policy base {theorem_checkpoints, declaration_checkpoints,
     fun insert c [] = [c]
       | insert c (d :: ds) = if before_ c d then c :: d :: ds else d :: insert c ds
   in
+    if not (theorem_checkpoints_enabled policy) then [] else
     List.foldl (fn (c, sorted) => insert c sorted) []
       ((if proof_steps_enabled policy then map failed theorem_checkpoints else []) @
        map theorem theorem_checkpoints @ map declaration declaration_checkpoints)
@@ -7050,7 +7055,9 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
           [] => true
         | [last] => saved_parent last = SOME deps_loaded
         | p :: (rest as q :: _) => saved_parent p = SOME q andalso chain_ok rest
-    fun try_candidate (c : shared_candidate) =
+    (* A checkpoint is chained to the heap its manifest names, so only those
+       on the heap now published under heap_key are restored. *)
+    fun try_candidate published_heap (c : shared_candidate) =
       let val key = shared_checkpoint_key heap_key (#kind c) (#key c)
       in
         case HolbuildRemoteCache.get_action remote key of
@@ -7089,9 +7096,10 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                      entries
                  val restored = (heap, deps_loaded) :: spine @ spine_sidecars @ ((leaf, #path c) :: sidecars)
                in
+                 if heap <> published_heap then NONE else
                  (* The small .ok first: a checkpoint with a laxer timeout than
                     requested is skipped before its chain is fetched. *)
-                 List.app (place_sidecar heap) sidecars;
+                 (List.app (place_sidecar heap) sidecars;
                  if not (checkpoint_timeout_satisfies requested_timeout (#path c)) then (wipe (); NONE)
                  else
                    (place_heap heap;
@@ -7103,31 +7111,34 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                       (HolbuildStatus.message_stdout
                          ("restored shared " ^ #kind c ^ " checkpoint " ^ leaf_rel ^ "\n");
                        SOME {heap = SOME heap, files = map (fn (sha, path) => (path, sha)) restored})
-                    else (warn ("shared checkpoint failed validation: " ^ leaf_rel); wipe (); NONE))
+                    else (warn ("shared checkpoint failed validation: " ^ leaf_rel); wipe (); NONE)))
                end
                handle MissingSharedBlob sha => (missing_blob key sha; wipe (); NONE)
                     | e => (warn ("could not restore shared checkpoint: " ^ General.exnMessage e);
                             wipe (); NONE))
       end
-    fun try_heap () =
+    fun try_heap heap =
+      (place_heap heap;
+       if shared_heap_parent_ok ctx andalso deps_checkpoint_exists deps_loaded deps_key then
+         (HolbuildStatus.message_stdout "restored shared deps-loaded heap\n";
+          {heap = SOME heap, files = [(deps_loaded, heap)]})
+       else (warn "shared deps-loaded heap failed validation"; wipe (); no_files))
+      handle MissingSharedBlob sha => (missing_blob heap_key sha; wipe (); no_files)
+           | e => (warn ("could not restore the shared heap: " ^ General.exnMessage e);
+                   wipe (); no_files)
+    (* No checkpoint is published without its heap, so without one there is
+       nothing to look for. *)
+    val {heap, files} =
       case HolbuildRemoteCache.get_action remote heap_key of
           NONE => no_files
         | SOME text =>
-            (let val (heap, _) = single "heap" (shared_manifest_entries text)
-             in
-               place_heap heap;
-               if shared_heap_parent_ok ctx andalso deps_checkpoint_exists deps_loaded deps_key then
-                 (HolbuildStatus.message_stdout "restored shared deps-loaded heap\n";
-                  {heap = SOME heap, files = [(deps_loaded, heap)]})
-               else (warn "shared deps-loaded heap failed validation"; wipe (); no_files)
-             end
-             handle MissingSharedBlob sha => (missing_blob heap_key sha; wipe (); no_files)
-                  | e => (warn ("could not restore the shared heap: " ^ General.exnMessage e);
-                          wipe (); no_files))
-    val {heap, files} =
-      case first_some try_candidate candidates of
-          SOME restored => restored
-        | NONE => try_heap ()
+            case (SOME (#1 (single "heap" (shared_manifest_entries text)))
+                  handle e => (warn ("could not restore the shared heap: " ^ General.exnMessage e); NONE)) of
+                NONE => no_files
+              | SOME heap =>
+                  case first_some (try_candidate heap) candidates of
+                      SOME restored => restored
+                    | NONE => try_heap heap
   in
     {heap = heap, files = files, stale = !stale, missing = !missing}
   end
@@ -7464,7 +7475,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                      remove_checkpoint_family (action_checkpoint_base checkpoint_root action))
                 | NONE => ()
             val stage = action_stage root action
-            val policy = spec_policy spec
+            val policy = spec_policy share_heaps spec
             val oom_before = cgroup_oom_kills ()
             val _ = last_child_status := NONE
             val _ =
@@ -7472,7 +7483,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                 val source_text = read_text (#source_file action)
                 val checkpoints = action_checkpoints policy checkpoint_root action source_text
                 val shared =
-                  if not share_heaps then NONE
+                  if not share_heaps orelse not (theorem_checkpoints_enabled policy) then NONE
                   else
                     SOME (shared_context cache checkpoint_root tc root policy action checkpoints)
                     handle e => (warn ("not sharing heaps: " ^ General.exnMessage e); NONE)

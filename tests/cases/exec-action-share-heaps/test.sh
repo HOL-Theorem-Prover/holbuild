@@ -181,8 +181,21 @@ resumed() {
 
 write_t "T" "simp[]"
 export_t v1
+# A, a dependency of the target, has no theorem checkpoints: nothing to share.
+[[ ! -e "$shared/checkpoint-store" ]] || { echo "the dependency A shared a heap" >&2; exit 1; }
+requests=$tmpdir/server/requests.log
+before_v1=$(wc -l < "$requests")
 worker v1 "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v1 0 "status=built"
+# With no heap published yet, the worker's restore, before its first upload,
+# looked for no checkpoint on it.
+tail -n +"$((before_v1 + 1))" "$requests" | awk '$1 == "PUT" { exit } $1 == "GET" { print $2 }' | grep '^/ac/' \
+  | sort -u | while read -r path; do
+  if [[ -f "$tmpdir/remote$path" ]] && grep -q "holbuild-shared-checkpoint-v1" "$tmpdir/remote$path"; then
+    echo "v1 looked for the checkpoint $path before any heap was shared" >&2
+    exit 1
+  fi
+done
 [[ -d "$shared/checkpoint-store" ]] || { echo "v1 added nothing to the store" >&2; exit 1; }
 [[ ! -e "$shared/checkpoints" ]] || { echo "the private checkpoint tree outlived the action" >&2; exit 1; }
 

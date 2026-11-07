@@ -613,7 +613,8 @@ rm "$state/unavailable" "$state/unavailable-status"
 # proof-only edit of A rebuilds A and reuses the earlier builds of B and C,
 # whose dependencies' outputs are unchanged; an edit that changes A's
 # outputs rebuilds them; and an edited B, on unchanged dependency outputs,
-# resumes from the deps heap its last build shared.
+# resumes from the deps heap its last build shared.  Only targets share
+# heaps, so those builds name B as a target.
 project=$tmpdir/cutoff
 mkdir -p "$project/src"
 cat > "$project/holproject.toml" <<TOML
@@ -686,12 +687,12 @@ results built cached cached
 
 a2=$'Theorem a2_thm:\n  T\nProof\n  simp[]\nQED'
 write_cutoff three one "$a2"
-run cutoff-output 0 build --remote-exec "$coordinator" CTheory
+run cutoff-output 0 build --remote-exec "$coordinator" BTheory CTheory
 refute_grep "early cutoff" "$tmpdir/worker.log"
 results built built built
 
 write_cutoff four four "$a2"
-run cutoff-dependent 0 build --remote-exec "$coordinator" CTheory
+run cutoff-dependent 0 build --remote-exec "$coordinator" BTheory CTheory
 require_grep "BTheory restored from cache" "$tmpdir/cutoff-dependent.log"
 refute_grep "Theory built" "$tmpdir/cutoff-dependent.log"
 grep -A1 "^resuming BTheory$" "$tmpdir/worker.log" | grep -q "from: deps-loaded checkpoint" ||
