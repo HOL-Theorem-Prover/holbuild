@@ -477,31 +477,67 @@ require_grep "which one batch can't span" "$tmpdir/generated-attach.log"
 require_grep "^POST /v1/batches/genb/cancel " "$state/requests.log"
 refute_grep "GenTheory built" "$tmpdir/generated-attach.log"
 # Without either, GenTheory goes to the workers, its restore writes GenML.sml,
-# and UseLib is planned and built on it.
-: > "$state/requests.log"
-: > "$state/ran"
-(cd "$generated" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only UseLib) \
-  > "$tmpdir/generated-only.log" 2>&1 || { cat "$tmpdir/generated-only.log" >&2; exit 1; }
+# and the rest is planned again: UseTheory goes as a second batch, and UseLib
+# is built on GenML.sml.
+write_use() {
+  cat > "$generated/src/UseScript.sml" <<SML
+Theory Use
+Ancestors Gen
+
+val y = GenML.x + $1;
+Theorem use_thm:
+  T
+Proof
+  simp[]
+QED
+SML
+}
+write_use 1
+gen_build() {
+  local log=$1
+  shift
+  : > "$state/requests.log"
+  : > "$state/ran"
+  (cd "$generated" && "$HOLBUILD_BIN" --remote-cache "$remote_url" --verbose build --remote-exec "$coordinator" "$@" UseLib UseTheory) \
+    > "$tmpdir/$log.log" 2>&1 || { cat "$tmpdir/$log.log" >&2; exit 1; }
+}
+gen_build generated-only --remote-only
+[[ $(grep -c '^POST /v1/batches[ ?]' "$state/requests.log") -eq 2 ]] || { cat "$state/requests.log" >&2; exit 1; }
 require_grep "^rxgen:GenTheory$" "$state/ran"
+require_grep "^rxgen:UseTheory$" "$state/ran"
 require_grep "GenTheory restored from cache" "$tmpdir/generated-only.log"
-refute_grep "GenTheory built" "$tmpdir/generated-only.log"
+require_grep "UseTheory restored from cache" "$tmpdir/generated-only.log"
+refute_grep "GenTheory built\|UseTheory built" "$tmpdir/generated-only.log"
 require_grep "UseLib built" "$tmpdir/generated-only.log"
 grep -q "val x = 42" "$generated/src/GenML.sml" || { cat "$generated/src/GenML.sml" >&2; exit 1; }
 # Once GenML.sml is up to date, the plan holds it, and nothing is submitted.
-: > "$state/requests.log"
-(cd "$generated" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only UseLib) \
-  > "$tmpdir/generated-again.log" 2>&1 || { cat "$tmpdir/generated-again.log" >&2; exit 1; }
+gen_build generated-again --remote-only
 refute_grep "SML sources" "$tmpdir/generated-again.log"
 refute_grep "^POST /v1/batches" "$state/requests.log"
+# A changed UseTheory goes to the workers as one batch, planned from the
+# record and, without it, in full.
+write_use 2
+gen_build generated-record --remote-only
+require_grep "^holbuild: plan: from record" "$tmpdir/generated-record.log"
+[[ $(grep -c '^POST /v1/batches[ ?]' "$state/requests.log") -eq 1 ]] || { cat "$state/requests.log" >&2; exit 1; }
+[[ $(cat "$state/ran") == rxgen:UseTheory ]] || { cat "$state/ran" >&2; exit 1; }
+require_grep "UseTheory restored from cache" "$tmpdir/generated-record.log"
+refute_grep "SML sources" "$tmpdir/generated-record.log"
+write_use 3
+HOLBUILD_PLAN_RECORD=off gen_build generated-full --remote-only
+require_grep "^holbuild: plan: full" "$tmpdir/generated-full.log"
+[[ $(grep -c '^POST /v1/batches[ ?]' "$state/requests.log") -eq 1 ]] || { cat "$state/requests.log" >&2; exit 1; }
+[[ $(cat "$state/ran") == rxgen:UseTheory ]] || { cat "$state/ran" >&2; exit 1; }
+require_grep "UseTheory restored from cache" "$tmpdir/generated-full.log"
+refute_grep "SML sources" "$tmpdir/generated-full.log"
 # Without --remote-only too, a changed GenTheory goes to the workers.
 write_gen "$generated" 43
-: > "$state/requests.log"
-: > "$state/ran"
-(cd "$generated" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" UseLib) \
-  > "$tmpdir/generated.log" 2>&1 || { cat "$tmpdir/generated.log" >&2; exit 1; }
+gen_build generated
 require_grep "^rxgen:GenTheory$" "$state/ran"
+require_grep "^rxgen:UseTheory$" "$state/ran"
 refute_grep "building locally" "$tmpdir/generated.log"
 require_grep "GenTheory restored from cache" "$tmpdir/generated.log"
+require_grep "UseTheory restored from cache" "$tmpdir/generated.log"
 require_grep "UseLib built" "$tmpdir/generated.log"
 grep -q "val x = 43" "$generated/src/GenML.sml" || { cat "$generated/src/GenML.sml" >&2; exit 1; }
 # Once GenTheory is in the remote cache, --remote-only restores it in a
