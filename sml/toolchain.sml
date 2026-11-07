@@ -285,7 +285,7 @@ fun run_context_load_path_dirs (project : HolbuildProject.t) packages =
   end
 
 fun runtime_helper_path () =
-  Path.concat(HolbuildRuntimePaths.source_root, "sml/holbuild_runtime.sml")
+  Path.concat(HolbuildRuntimePaths.runtime_root (), "sml/holbuild_runtime.sml")
 
 fun runtime_line () = "use " ^ sml_string (runtime_helper_path ()) ^ ";"
 

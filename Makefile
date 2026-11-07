@@ -6,6 +6,10 @@ PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 DATADIR ?= $(PREFIX)/share/holbuild
 VENDORED_HOL_FILES := $(shell sed 's|^|vendor/hol/|' vendor/hol/FILES)
+RUNTIME_SOURCES := sml/checkpoint_save_runtime.sml sml/holbuild_runtime.sml \
+	sml/proof_runtime.sml sml/tactic_compat_runtime.sml sml/sha256.sml \
+	sml/spawn.sml sml/hash.sml sml/proof_ir_types.sml sml/proof_ir.sml \
+	$(wildcard sml/analyser/*.sml)
 
 .PHONY: all check-vendored-hol install uninstall test golden-key-dump-check clean
 
@@ -39,9 +43,15 @@ install: bin/holbuild
 	install -d "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(DATADIR)/copyrights"
 	install -m 755 bin/holbuild "$(DESTDIR)$(BINDIR)/holbuild"
 	install -m 644 vendor/hol/copyrights/smlnj.txt "$(DESTDIR)$(DATADIR)/copyrights/smlnj.txt"
+	install -m 644 LICENSE "$(DESTDIR)$(DATADIR)/LICENSE"
+	@for file in $(RUNTIME_SOURCES); do \
+		install -d "$(DESTDIR)$(DATADIR)/$$(dirname "$$file")"; \
+		install -m 644 "$$file" "$(DESTDIR)$(DATADIR)/$$file" || exit; \
+	done
 
 uninstall:
-	rm -f "$(DESTDIR)$(BINDIR)/holbuild" "$(DESTDIR)$(DATADIR)/copyrights/smlnj.txt"
+	rm -f "$(DESTDIR)$(BINDIR)/holbuild" "$(DESTDIR)$(DATADIR)/copyrights/smlnj.txt" "$(DESTDIR)$(DATADIR)/LICENSE"
+	@for file in $(RUNTIME_SOURCES); do rm -f "$(DESTDIR)$(DATADIR)/$$file"; done
 
 test: bin/holbuild
 	HOLBUILD_KEEP_TEST_LOGS="$(HOLBUILD_KEEP_TEST_LOGS)" HOLDIR="$(HOLDIR)" tests/run.sh $(TESTS)

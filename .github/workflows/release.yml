@@ -1,0 +1,148 @@
+name: Release binaries
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - Makefile
+      - sml/holbuild-script.sml
+      - tests/cases/installed-runtime/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+          - os: macos-15
+            platform: macos-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build static Poly/ML
+        env:
+          POLYML_TAG: v5.9.2-seq3
+        run: |
+          git clone --depth 1 --branch "$POLYML_TAG" https://github.com/sequent-dev-bot/polyml.git "$RUNNER_TEMP/polyml"
+          cd "$RUNNER_TEMP/polyml"
+          ./configure --prefix="$RUNNER_TEMP/polyml-install" --disable-shared --without-gmp
+          make -j4
+          make install
+          echo "$RUNNER_TEMP/polyml-install/bin" >> "$GITHUB_PATH"
+
+      - name: Build and package holbuild
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          make
+          HOLBUILD_ROOT="$PWD" tests/cases/installed-runtime/test.sh "$PWD/bin/holbuild" ""
+          version=$(bin/holbuild --version | cut -d ' ' -f2)
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            test "$GITHUB_REF_NAME" = "v$version"
+          fi
+          name="holbuild-v$version-$PLATFORM"
+          stage="$RUNNER_TEMP/package/$name"
+          make install PREFIX=/ DESTDIR="$stage"
+          cp LICENSE "$stage/LICENSE"
+          cp "$RUNNER_TEMP/polyml/COPYING" "$stage/share/holbuild/copyrights/polyml-LGPL-2.1.txt"
+          git -C "$RUNNER_TEMP/polyml" archive --format=tar.gz --prefix=polyml/ HEAD > "$stage/share/holbuild/polyml-source.tar.gz"
+          git -C "$RUNNER_TEMP/polyml" rev-parse HEAD > "$stage/share/holbuild/polyml-revision.txt"
+          mkdir -p dist
+          tar -czf "dist/$name.tar.gz" -C "$RUNNER_TEMP/package" "$name"
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  smoke:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+          - os: macos-15
+            platform: macos-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      # No checkout or compiler setup: the build's source/install paths don't exist.
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: download
+
+      - name: Verify downloaded archive without Poly/ML
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          if command -v poly || command -v polyc; then
+            echo 'Smoke runner unexpectedly has Poly/ML installed' >&2
+            exit 1
+          fi
+          cd download
+          shasum -a 256 -c ./*.sha256
+          tar -xzf ./*.tar.gz
+          roots=(holbuild-*/)
+          test "${#roots[@]}" = 1
+          root=${roots[0]%/}
+          test -s "$root/LICENSE"
+          test -s "$root/share/holbuild/copyrights/smlnj.txt"
+          test -s "$root/share/holbuild/copyrights/polyml-LGPL-2.1.txt"
+          test -s "$root/share/holbuild/polyml-source.tar.gz"
+          test -s "$root/share/holbuild/sml/holbuild_runtime.sml"
+          if [[ "$PLATFORM" == linux-* ]]; then
+            ldd "$root/bin/holbuild" | tee dependencies.txt
+            ! grep -E 'libpolyml|libgmp|not found' dependencies.txt
+          else
+            otool -L "$root/bin/holbuild" | tee dependencies.txt
+            ! tail -n +2 dependencies.txt | grep -Ev '^[[:space:]]+(/usr/lib/|/System/Library/)'
+          fi
+          version=${root#holbuild-v}
+          version=${version%-$PLATFORM}
+          test "$("$root/bin/holbuild" --version)" = "holbuild $version"
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'
+    needs: smoke
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Attach verified binaries to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          cat ./*.sha256 > SHA256SUMS
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
+          fi
+          gh release upload "$TAG" ./*.tar.gz SHA256SUMS --clobber
