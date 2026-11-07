@@ -3962,17 +3962,17 @@ datatype run_from_state =
   DepsLoadedState of {path : string, load : string option}
 | NoRunFromState of string
 
+(* Whether NODE's last build here was for INPUT_KEY. *)
+fun built_here_for project node input_key =
+  case current_metadata (metadata_path project node) of
+      SOME text => metadata_input_key_matches input_key text
+    | NONE => false
+
 (* Whether every project dependency of NODE is built here for its current
    source, rather than older than it or not built. *)
 fun deps_built_for_current_sources project plan keys node =
-  let
-    fun built_for_current_source dep =
-      case current_metadata (metadata_path project dep) of
-          SOME text => metadata_input_key_matches (HolbuildBuildPlan.input_key_for keys dep) text
-        | NONE => false
-  in
-    List.all built_for_current_source (HolbuildBuildPlan.transitive_project_deps plan node)
-  end
+  List.all (fn dep => built_here_for project dep (HolbuildBuildPlan.input_key_for keys dep))
+           (HolbuildBuildPlan.transitive_project_deps plan node)
 
 (* The key of NODE's dependency context as things stand, before anything is
    built: the dependencies' outputs on disk can be older than their sources,
@@ -5313,9 +5313,7 @@ fun prefetch_key (options : build_options) project keys node =
     case #kind (HolbuildBuildPlan.source_of node) of
         HolbuildSourceIndex.TheoryScript =>
           if cache_enabled node andalso not (force_node options project node) andalso
-             not (case current_metadata (metadata_path project node) of
-                      SOME text => metadata_input_key_matches input_key text
-                    | NONE => false) then
+             not (built_here_for project node input_key) then
             SOME input_key
           else NONE
       | _ => NONE
@@ -5632,22 +5630,34 @@ fun excluded_reason (options : build_options) project (action : theory_action) n
 (* Whether the remote cache holds an entry this build would restore: usable,
    and with a timeout contract at least as strict as the one requested,
    whose blobs the cache still holds. *)
-fun remote_entry_satisfies remote (options : build_options) project plan node input_key =
+fun entry_satisfies (options : build_options) project plan node input_key blob_present text =
+  let
+    val lines = cache_manifest_lines text
+    val {extra_hashes, ...} = cache_manifest_blobs_from_lines input_key lines
+    val requested = tactic_timeout (checkpoint_policy_for_node options project node)
+  in
+    not (Option.isSome (transient_stage_mldep_in_manifest text)) andalso
+    map #1 extra_hashes = source_extra_output_declarations plan node andalso
+    cache_timeout_satisfies (#allow_cache_timeout_discrepancy options) requested
+      (cache_manifest_proof_timeout lines) andalso
+    List.all blob_present (HolbuildCacheTransfer.unique_blobs text)
+  end
+  handle _ => false
+
+fun remote_entry_satisfies remote options project plan node input_key =
   case HolbuildRemoteCache.get_action remote input_key of
       NONE => false
     | SOME text =>
-        (let
-           val lines = cache_manifest_lines text
-           val {extra_hashes, ...} = cache_manifest_blobs_from_lines input_key lines
-           val requested = tactic_timeout (checkpoint_policy_for_node options project node)
-         in
-           not (Option.isSome (transient_stage_mldep_in_manifest text)) andalso
-           map #1 extra_hashes = source_extra_output_declarations plan node andalso
-           cache_timeout_satisfies (#allow_cache_timeout_discrepancy options) requested
-             (cache_manifest_proof_timeout lines) andalso
-           List.all (HolbuildRemoteCache.blob_present remote) (HolbuildCacheTransfer.unique_blobs text)
-         end
-         handle _ => false)
+        entry_satisfies options project plan node input_key (HolbuildRemoteCache.blob_present remote) text
+
+(* The same for the local cache, whose blobs must also be intact. *)
+fun local_entry_satisfies options project plan node input_key =
+  let val root = cache_root ()
+  in
+    case HolbuildCache.get_action root input_key of
+        NONE => false
+      | SOME text => entry_satisfies options project plan node input_key (HolbuildCache.verify_blob root) text
+  end
 
 (* Where a worker places a library's source, relative to its action root. *)
 fun library_source_path node =
@@ -5811,16 +5821,19 @@ fun drop_local_cache_entries keys =
 (* Writes the ActionSpec of every theory in the plan the remote cache can't
    satisfy, or whose input key is in forced, uploads them and their sources
    with upload, and returns the batch.
-   With local_resumable, a leaf of the batch (no theory in it depends on it)
-   is left out, for the local build that follows to build, when its local
-   build would resume from a checkpoint, or when it is the only theory to
-   build and its project dependencies are all built here for their current
-   sources (and it has some, or was built here before).  Either is faster
-   than running it on a worker, which loads the dependencies from the cache
-   and has none of the project's checkpoints, and the local build leaves
-   checkpoints for the next one.  remote_only
-   builds nothing locally, so under it only the first leaves are left out,
-   and the message says to build them without it. *)
+   With local_resumable, a theory built here for its current input key, and
+   not forced, stays out unchecked, unless a theory in the batch depends on
+   it and it can't be published from the local cache.  Also with
+   local_resumable, a leaf of the batch (no theory in it depends on it) is
+   left out, for the local build that follows to build, when its local build
+   would resume from a checkpoint, or when it is the only theory to build and
+   its project dependencies are all built here for their current sources
+   (and it has some, or was built here before).  Either is faster than
+   running it on a worker, which loads the dependencies from the cache and
+   has none of the project's checkpoints, and the local build leaves
+   checkpoints for the next one.  remote_only builds nothing locally, so
+   under it only the first leaves are left out, and the message says to
+   build them without it. *)
 fun export_batch (options : build_options) tc project plan toolchain_key jobs {upload, local_resumable, remote_only, forced} =
   let
     val remote =
@@ -5851,12 +5864,13 @@ fun export_batch (options : build_options) tc project plan toolchain_key jobs {u
                                " can't run remotely: " ^ reason)
               | NONE => ())
         actions
-    (* Runs work on every item on the prefetch pool and waits for them all,
-       reporting "<doing>: <done>/<total> <items>" at most every 5 s.  Each
-       item gets its own remote cache value, as restore prefetch does: the
-       blob metadata it remembers is mutable. *)
-    fun on_pool doing items_name work items =
+    (* Runs PRED over ITEMS on the prefetch pool and returns, in order, the
+       items it fails for, reporting "<doing>: <done>/<total> <items_name>"
+       at most every 5 s. *)
+    fun failing doing items_name pred items =
       let
+        datatype check = Pass | Fail | CheckFailed of exn
+        val checks = map (fn item => (item, ref Fail)) items
         val total = length items
         val completed = ref 0
         val next_report = ref (Time.now ())
@@ -5872,26 +5886,44 @@ fun export_batch (options : build_options) tc project plan toolchain_key jobs {u
                next_report := Time.+ (now, Time.fromSeconds 5))
             else ()
           end
-        fun run item =
-          (work (HolbuildRemoteCache.remote (HolbuildRemoteCache.base_url remote)) item;
+        fun check (item, result) =
+          (* Each check owns the mutable blob metadata, as restore prefetch does. *)
+          (result := ((if pred (HolbuildRemoteCache.remote (HolbuildRemoteCache.base_url remote)) item
+                       then Pass else Fail) handle e => CheckFailed e);
            Mutex.lock progress_mutex;
            ((completed := !completed + 1; report ()) before Mutex.unlock progress_mutex)
            handle e => (Mutex.unlock progress_mutex; raise e))
-        val _ = report ()
-        val {add, drain, stop} = start_background_pool (prefetch_limit jobs) run
       in
-        (List.app add items; drain ()) handle e => (stop (); raise e)
+        if null items then []
+        else
+          let
+            val _ = report ()
+            val {add, drain, stop} = start_background_pool (prefetch_limit jobs) check
+            val _ = (List.app add checks; drain ()) handle e => (stop (); raise e)
+          in
+            List.mapPartial (fn (item, result) =>
+              case !result of Pass => NONE | Fail => SOME item | CheckFailed e => raise e) checks
+          end
       end
-    datatype cache_check = Hit | Miss | CheckFailed of exn
-    val checks = map (fn action => (action, ref Miss)) actions
-    fun check remote ((node, action), result) =
-      result := ((if not (List.exists (fn key => key = #input_key action) forced) andalso
-                     remote_entry_satisfies remote options project plan node (#input_key action)
-                  then Hit else Miss) handle e => CheckFailed e)
-    val _ = on_pool "checking remote cache" "theories" check checks
+    (* A theory the local build takes as up to date (built here for its
+       current inputs, under a timeout contract as strict as the one
+       requested) needs no worker, so only the others go through the remote
+       cache. *)
+    fun is_forced (_, action) = List.exists (fn key => key = #input_key action) forced
+    fun built_here (node, action) =
+      local_resumable andalso not (is_forced (node, action)) andalso
+      (case current_metadata (metadata_path project node) of
+           SOME text =>
+             metadata_input_key_matches (#input_key action) text andalso
+             metadata_timeout_satisfies (#allow_cache_timeout_discrepancy options)
+               (checkpoint_policy_for_node options project node) node text
+         | NONE => false)
+    val (here_actions, other_actions) = List.partition built_here actions
     val uncached_actions =
-      List.mapPartial (fn (action, result) =>
-        case !result of Hit => NONE | Miss => SOME action | CheckFailed e => raise e) checks
+      failing "checking remote cache" "theories" (fn remote => fn (node, action) =>
+                  not (is_forced (node, action)) andalso
+                  remote_entry_satisfies remote options project plan node (#input_key action))
+              other_actions
     fun uncached_in actions node =
       List.exists (fn (n, _) => HolbuildBuildPlan.key n = HolbuildBuildPlan.key node) actions
     fun leaf parent_keys node = not (List.exists (fn k => k = HolbuildBuildPlan.key node) parent_keys)
@@ -5939,6 +5971,29 @@ fun export_batch (options : build_options) tc project plan toolchain_key jobs {u
                      ("holbuild: remote execution: " ^ package node ^ ":" ^ logical_name node ^
                       " stays out of the batch, " ^ reason ^ "\n"))
                local_actions
+    (* The workers restore from the remote cache what the batch's theories
+       depend on, so each one built here goes there from the local cache
+       unless it is there already; one that can't joins the batch.  The
+       batch then holds every theory its theories depend on that the remote
+       cache lacks, as before. *)
+    val batch_deps =
+      List.foldl (fn ((node, _), set) =>
+                     Binaryset.addList (set, map HolbuildBuildPlan.key (HolbuildBuildPlan.transitive_project_deps plan node)))
+                 (Binaryset.empty String.compare) uncached_actions
+    fun available remote (node, action) =
+      let val key = #input_key action
+      in
+        remote_entry_satisfies remote options project plan node key orelse
+        upload andalso local_entry_satisfies options project plan node key andalso
+        (publish_remote_cache_key (cache_root ()) key;
+         remote_entry_satisfies remote options project plan node key)
+      end
+    val unavailable =
+      failing "checking remote cache" "theories" available
+        (List.filter (fn (node, _) => Binaryset.member (batch_deps, HolbuildBuildPlan.key node)) here_actions)
+    val uncached_actions =
+      if null unavailable then uncached_actions
+      else List.filter (fn (node, _) => uncached_in (uncached_actions @ unavailable) node) actions
     val uncached = uncached_in uncached_actions
     val toolchain_line =
       case HolbuildProject.resolved_hol_dependency_with {kernel_variant = #kernel_variant tc} project of
@@ -5974,21 +6029,20 @@ fun export_batch (options : build_options) tc project plan toolchain_key jobs {u
     (* Specs share their library sources, so each file goes up once.  After
        the first failure the uploads not yet started are skipped, for the
        caller to fall back at once. *)
-    val upload_failure = ref NONE
+    val upload_failed = ref false
     val failure_mutex = Mutex.mutex ()
-    fun failed () = (Mutex.lock failure_mutex; isSome (!upload_failure) before Mutex.unlock failure_mutex)
-    fun upload_file remote path =
-      if failed () then ()
-      else publish_spec_blob remote path
-           handle e => (Mutex.lock failure_mutex;
-                        (if isSome (!upload_failure) then () else upload_failure := SOME e);
-                        Mutex.unlock failure_mutex)
+    fun with_failure_lock f =
+      (Mutex.lock failure_mutex; f () before Mutex.unlock failure_mutex)
+      handle e => (Mutex.unlock failure_mutex; raise e)
+    fun uploaded remote path =
+      with_failure_lock (fn () => !upload_failed) orelse
+      (publish_spec_blob remote path; true)
+      handle e => (with_failure_lock (fn () => upload_failed := true); raise e)
     val files = if upload then unique_strings (List.concat (map #files exported)) else []
     val _ =
       if null files then ()
       else HolbuildToolchain.time_phase "action_spec.upload" (fn () =>
-             (on_pool "uploading to remote cache" "files" upload_file files;
-              case !upload_failure of SOME e => raise e | NONE => ()))
+             ignore (failing "uploading to remote cache" "files" uploaded files))
   in
     String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n"
   end
