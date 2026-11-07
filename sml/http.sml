@@ -190,10 +190,11 @@ val idle : connection list ref = ref []
 (* The most idle connections the pool keeps: one for each thread that makes
    requests, so each can reuse one.  max_idle covers the build's workers; a
    pool of background request threads (the remote cache prefetch and check)
-   reserves one more for each of its threads while it runs.  Once those
-   threads are done their connections are closed, rather than left idle for
-   the rest of the build, where they sit in CLOSE-WAIT after the server
-   closes its side. *)
+   reserves one more for each of its threads while it runs, since with the
+   workers' share alone most of its requests would open a new connection.
+   Once those threads are done their connections are closed, rather than
+   left idle for the rest of the build, where they sit in CLOSE-WAIT after
+   the server closes its side. *)
 val max_idle = ref 8
 val reserved = ref 0
 

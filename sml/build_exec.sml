@@ -5349,21 +5349,20 @@ fun start_background_pool limit work =
     fun worker item =
       ((work item handle _ => ());
        case with_lock (fn () => case pop () of
-                                    NONE => (active := !active - 1; NONE)
+                                    NONE => (active := !active - 1; HolbuildHttp.release_idle (); NONE)
                                   | next => next) of
            SOME next => worker next
-         | NONE => HolbuildHttp.release_idle ())
-    (* Each thread reserves a pooled connection of its own while it runs. *)
+         | NONE => ())
+    (* Each thread holds a reservation of a pooled connection (see
+       HolbuildHttp.max_idle) for as long as it counts in active. *)
     fun add item =
       if with_lock (fn () =>
            if !stopped then false
-           else if !active < limit then (active := !active + 1; true)
+           else if !active < limit then (active := !active + 1; HolbuildHttp.reserve_idle (); true)
            else (back := item :: !back; false))
-      then (HolbuildHttp.reserve_idle ();
-            ignore (Thread.fork (fn () => worker item, []))
-            handle e => (with_lock (fn () => active := !active - 1);
-                         HolbuildHttp.release_idle ();
-                         raise e))
+      then ignore (Thread.fork (fn () => worker item, []))
+           handle e => (with_lock (fn () => (active := !active - 1; HolbuildHttp.release_idle ()));
+                        raise e)
       else ()
     fun wait () =
       if with_lock (fn () => !active) > 0 then (OS.Process.sleep (Time.fromReal 0.05); wait ())
