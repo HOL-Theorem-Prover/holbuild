@@ -979,7 +979,9 @@ holbuild build --all-checkpoints MyTheory
 
 - `execution-plan THEORY:NAME` prints the proof-step plan for one theorem or
   explicit termination proof. If a theorem and terminating definition have the
-  same name, the theorem takes precedence.
+  same name, the theorem takes precedence. Use `THEORY:termination:NAME` to
+  select the termination proof, or `THEORY:theorem:NAME` to select only a theorem.
+  Both explicit forms restrict name suggestions to the selected kind.
 - `--tactic-timeout SECONDS` changes the per-step timeout; `0` disables it.
   A step that times out fails the build even inside `TRY` or an `ORELSE`
   alternative.

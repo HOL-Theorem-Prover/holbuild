@@ -37,7 +37,7 @@ fun global_help () = print
   \  run [--from THEORY] [ARG ...]   Run HOL with project context\n\
   \  context [--trknl]          Show resolved project context\n\n\
   \Inspection and advanced commands:\n\
-  \  execution-plan T:THM        Inspect proof-step execution plan\n\
+  \  execution-plan T:[KIND:]NAME Inspect proof-step execution plan\n\
   \  check THEORY[:THEOREM]      Check theorems for cheats, oracles and axioms\n\
   \  buildhol                    Build/reuse declared HOL and print its path\n\
   \  heap NAME                   Build a configured heap\n\
@@ -172,8 +172,11 @@ fun run_help () = print
 
 fun execution_plan_help () = print
   "Usage:\n\
-  \  holbuild [GLOBAL OPTIONS] execution-plan THEORY:THEOREM\n\n\
-  \Inspect the proof-step execution plan for a theorem.\n\n\
+  \  holbuild [GLOBAL OPTIONS] execution-plan THEORY:NAME\n\
+  \  holbuild [GLOBAL OPTIONS] execution-plan THEORY:theorem:NAME\n\
+  \  holbuild [GLOBAL OPTIONS] execution-plan THEORY:termination:NAME\n\n\
+  \Inspect a theorem or explicit termination proof's proof-step plan.\n\
+  \Without a kind, a theorem takes precedence over a same-name termination proof.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun check_help () = print
@@ -618,20 +621,32 @@ fun describe_source source =
   #package source ^ ":" ^ #relative_path source ^ " (" ^ #logical_name source ^ ")"
 
 fun parse_execution_plan_selector selector =
-  case String.fields (fn c => c = #":") selector of
-      [theory, theorem] =>
-        if theory = "" orelse theorem = "" then
-          raise Error "execution-plan requires THEORY:THEOREM"
-        else {theory = theory, theorem = theorem}
-    | _ => raise Error "execution-plan requires THEORY:THEOREM"
+  let
+    fun invalid () =
+      raise Error ("invalid execution-plan selector: " ^ selector ^
+                   "; expected THEORY:NAME, THEORY:theorem:NAME or THEORY:termination:NAME")
+    val fields = String.fields (fn c => c = #":") selector
+  in
+    if List.exists (fn s => s = "") fields then invalid ()
+    else
+      case fields of
+          [theory, theorem] => {theory = theory, theorem = theorem, kind = NONE}
+        | [theory, kind, theorem] =>
+            if kind = "theorem" orelse kind = "termination" then
+              {theory = theory, theorem = theorem, kind = SOME kind}
+            else invalid ()
+        | _ => invalid ()
+  end
 
 type execution_plan_unit = {kind : string, name : string, tactic_start : int,
                             tactic_end : int, tactic_text : string}
 
-fun theorem_match theorem source =
+fun theorem_match kind theorem source =
   let
     val text = read_text (#source_path source)
-    val boundaries = HolbuildBuildExec.discover_theorem_boundaries (#source_path source) text
+    val boundaries =
+      if kind = SOME "termination" then []
+      else HolbuildBuildExec.discover_theorem_boundaries (#source_path source) text
     val theorem_units =
       map (fn ({name, tactic_start, tactic_end, tactic_text, ...} : HolbuildTheoryCheckpoints.boundary) =>
              {kind = "theorem", name = name, tactic_start = tactic_start,
@@ -655,21 +670,23 @@ fun theorem_match theorem source =
       end
   in
     case theorem_matches of
-        [] => termination_match ()
+        [] => if kind = SOME "theorem" then NONE else termination_match ()
       | [unit] => SOME (source, unit)
       | _ => raise Error ("duplicate theorem in " ^ describe_source source ^ ": " ^ theorem)
   end
 
 (* The theorem and termination names theorem_match accepts for source. *)
-fun proof_unit_names source =
+fun proof_unit_names kind source =
   let
     val path = #source_path source
     val text = read_text path
   in
-    map (fn ({name, ...} : HolbuildTheoryCheckpoints.boundary) => name)
-        (HolbuildBuildExec.discover_theorem_boundaries path text) @
-    map (fn ({name, ...} : HolbuildTheoryCheckpoints.termination) => name)
-        (HolbuildBuildExec.discover_termination_diagnostics_strict path text)
+    (if kind = SOME "termination" then [] else
+       map (fn ({name, ...} : HolbuildTheoryCheckpoints.boundary) => name)
+           (HolbuildBuildExec.discover_theorem_boundaries path text)) @
+    (if kind = SOME "theorem" then [] else
+       map (fn ({name, ...} : HolbuildTheoryCheckpoints.termination) => name)
+           (HolbuildBuildExec.discover_termination_diagnostics_strict path text))
   end
 
 fun write_text_file path text =
@@ -829,16 +846,17 @@ fun find_theory_source command index theory =
         raise Error ("ambiguous theory for " ^ command ^ ": " ^ theory ^ " in " ^
                      String.concatWith ", " (map describe_source matches))
 
-fun find_theorem_in_source theorem source =
-  case theorem_match theorem source of
+fun find_theorem_in_source kind theorem source =
+  case theorem_match kind theorem source of
       SOME (_, unit) => unit
     | NONE =>
-        raise Error ("proof unit not found for execution-plan: " ^ #logical_name source ^ ":" ^ theorem ^
-                     HolbuildSuggest.did_you_mean theorem (proof_unit_names source))
+        raise Error ("proof unit not found for execution-plan: " ^ #logical_name source ^ ":" ^
+                     (case kind of NONE => "" | SOME k => k ^ ":") ^ theorem ^
+                     HolbuildSuggest.did_you_mean theorem (proof_unit_names kind source))
 
 fun print_execution_plan_selector new_ir project selector =
   let
-    val {theory, theorem} = parse_execution_plan_selector selector
+    val {theory, theorem, kind} = parse_execution_plan_selector selector
     val graph = HolbuildProjectGraph.resolve
                   {project = project,
                    resolution = HolbuildProject.standard_resolution}
@@ -849,7 +867,7 @@ fun print_execution_plan_selector new_ir project selector =
     val index = HolbuildComponentProvider.sources components
     val source = find_theory_source "execution-plan" index theory
   in
-    print_static_execution_plan project new_ir source theorem (SOME (find_theorem_in_source theorem source))
+    print_static_execution_plan project new_ir source theorem (SOME (find_theorem_in_source kind theorem source))
   end
 
 fun positive_int label text =
@@ -2892,7 +2910,7 @@ fun execution_plan_command tc args =
   (configure_analyser_for_toolchain tc;
    case args of
        [selector] => print_execution_plan_selector true (load_project ()) selector
-     | _ => raise Error "usage: holbuild execution-plan THEORY:THEOREM")
+     | _ => raise Error "usage: holbuild execution-plan THEORY:[theorem:|termination:]NAME")
 
 fun reject_json command =
   if HolbuildStatus.json_mode () then
