@@ -364,7 +364,7 @@ Common global options:
   platform default cache location.
 - `--offline`: disable holbuild-managed network access. Also enabled by
   `HOLBUILD_OFFLINE=1`; see [Offline builds](#offline-builds).
-- `--remote-cache URL`: optional Bazel-style HTTP remote cache endpoint. Also
+- `--remote-cache URL`: optional comma-separated Bazel-style HTTP remote cache endpoints. Also
   configurable with `HOLBUILD_REMOTE_CACHE_URL` or project-local
   `.holconfig.toml`.
 - `--json`: emit newline-delimited JSON where supported.
@@ -1144,7 +1144,7 @@ checkpoint compatibility. When this waiver permits reuse, project metadata
 retains the artifact's recorded timeout, so a later build without the flag
 applies the strict check.
 
-A build can also consult and publish to one Bazel-style HTTP remote cache:
+A build can also consult and publish to Bazel-style HTTP remote caches:
 
 ```sh
 holbuild --remote-cache https://cache.example.org build MyTheory
@@ -1153,6 +1153,25 @@ HOLBUILD_REMOTE_CACHE_URL=https://cache.example.org holbuild build MyTheory
 # [remote_cache]
 # url = "https://cache.example.org"
 ```
+
+To spread the cache across replicas, give a comma-separated list of base URLs
+in `--remote-cache`, `HOLBUILD_REMOTE_CACHE_URL`, or `.holconfig.toml`'s `url`.
+Whitespace can also separate URLs. Trailing slashes and duplicate nodes are
+removed. Node identity also excludes authority userinfo (`user:password@`),
+so inline credentials and curl-config credentials give the same ranking;
+the HTTP request retains its full URL. Every client and worker must use the same normalized URL spellings
+and node set; different public/private hostnames give different rankings.
+
+For each `/ac/<digest>` or `/cas/<digest>` request, nodes rank by descending
+SHA256 of `node identity + ":" + digest` (ascending identity breaks a tie). Only the first two
+nodes are tried. Reads try the second node after a 404, connection failure,
+timeout, 429 or 5xx; writes do so after a connection failure, timeout, 429 or
+5xx. A single-node list keeps the ordinary single-cache behavior. A successful
+backup keeps the ring available; the circuit breaker below counts the final
+outcome of a request. If neither node hits, a 404 from either node gives a miss, even if the
+other node failed transiently; this allows a new action to build and publish
+on the healthy node. Two transient failures remain unavailable. Replicas should share a backing store: the second
+node covers handoff while a newly added node cannot yet see a recent upload.
 
 Remote cache misses or errors fall back to the local cache/source build path.
 A request waits at most 5 s for its connection. After three requests in a row

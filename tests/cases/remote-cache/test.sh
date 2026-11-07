@@ -556,3 +556,40 @@ if [[ $(action_put_count) != 6 ]]; then
   exit 1
 fi
 assert_server_action_paths
+
+# Two real cache servers, with independent stores and failure controls, exercise
+# the same ring through libcurl and the command fallback.
+stop_remote_cache_server
+ring_dir=$tmpdir/ring
+start_remote_cache_server "$ring_dir/one/store" "$ring_dir/one/state" "$ring_dir/one/control"
+ring_one=$remote_url
+background_pids+=("$server_pid")
+server_pid=
+start_remote_cache_server "$ring_dir/two/store" "$ring_dir/two/state" "$ring_dir/two/control"
+ring_two=$remote_url
+python3 - "$ring_dir/vectors" "$ring_one" "$ring_two" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+nodes = sys.argv[2:]
+vectors = []
+owners = set()
+for i in range(32):
+    digest = hashlib.sha256(str(i).encode()).hexdigest()
+    ranked = sorted(nodes, key=lambda url: hashlib.sha256(f"{url}:{digest}".encode()).hexdigest(), reverse=True)
+    owners.add(ranked[0])
+    vectors.append(" ".join([digest, *ranked]))
+assert owners == set(nodes)
+pathlib.Path(sys.argv[1]).write_text("\n".join(vectors))
+PY
+for transport in libcurl cli; do
+  # Remove only this test's objects between runs, retaining the live servers.
+  find "$ring_dir/one/store" "$ring_dir/two/store" -type f -delete
+  RING_DIR="$ring_dir" RING_ONE="$ring_one" RING_TWO="$ring_two" RING_TRANSPORT="$transport" \
+    poly --script "$SCRIPT_DIR/ring.sml" > "$ring_dir/$transport.log" 2>&1 || {
+      cat "$ring_dir/$transport.log" >&2
+      exit 1
+    }
+  require_grep 'cache ring passed' "$ring_dir/$transport.log"
+done
