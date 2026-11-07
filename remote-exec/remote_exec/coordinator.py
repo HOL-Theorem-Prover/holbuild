@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 CLAIM_RECHECK_SECONDS = 5  # how often a waiting claim looks for actions another coordinator process made ready
 # How long a cache entry found is taken to still be there without asking the cache again.
 IN_CACHE_TRUST_SECONDS = 60
-# How many parents a release asks the cache about at once. At most two releases run at once (a pass over every
+# How many requests a release has in flight to the cache at once. At most two releases run at once (a pass over every
 # batch and one of single batches), so together they stay within the cache client's 100 connections.
 RELEASE_CACHE_CHECKS = 48
 RELEASE_SLOW_SECONDS = 5.0  # a release pass that takes this long is logged
@@ -1018,16 +1018,13 @@ class Coordinator:
             raise ScaleCommandError(f"{scale_cmd} {workers} exited {code}")
 
     async def _in_cache_all(self, ac_keys: set[str], limit: asyncio.Semaphore) -> dict[str, bool | None]:
-        """``_in_cache`` of each of ``ac_keys``, as many at a time as ``limit`` lets."""
+        """``_in_cache`` of each of ``ac_keys``, all at once."""
+        keys = list(ac_keys)
+        return dict(zip(keys, await asyncio.gather(*(self._in_cache(key, limit) for key in keys)), strict=True))
 
-        async def check(ac_key: str) -> tuple[str, bool | None]:
-            async with limit:
-                return ac_key, await self._in_cache(ac_key)
-
-        return dict(await asyncio.gather(*map(check, ac_keys)))
-
-    async def _in_cache(self, ac_key: str) -> bool | None:
-        """Whether the cache holds entry ``ac_key``; None when the cache can't tell.
+    async def _in_cache(self, ac_key: str, limit: asyncio.Semaphore) -> bool | None:
+        """Whether the cache holds entry ``ac_key``; None when the cache can't tell. A request it sends waits for
+        ``limit``.
 
         The entry's blobs aren't asked about: holbuild uploads them before it, and one that expires before it makes
         the children that restore it report ``input-missing`` for the parent, which re-queues the parent. Asking
@@ -1044,7 +1041,7 @@ class Coordinator:
             return True
         check = self.cache_checks.get(ac_key)
         if check is None:
-            check = asyncio.create_task(self._check_cache(ac_key))
+            check = asyncio.create_task(self._check_cache(ac_key, limit))
             self.cache_checks[ac_key] = check
 
             def done(_: object) -> None:
@@ -1060,10 +1057,11 @@ class Coordinator:
         self.cache_checks.clear()
         self.cache_forgotten += 1
 
-    async def _check_cache(self, ac_key: str) -> bool | None:
+    async def _check_cache(self, ac_key: str, limit: asyncio.Semaphore) -> bool | None:
         forgotten = self.cache_forgotten
         try:
-            response = await self.cache.get(f"/ac/{ac_key}")
+            async with limit:
+                response = await self.cache.get(f"/ac/{ac_key}")
         except httpx.HTTPError:
             return None
         if response.status_code == 200:

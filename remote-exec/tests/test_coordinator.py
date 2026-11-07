@@ -277,11 +277,25 @@ async def test_a_parent_found_in_the_cache_is_not_asked_about_again_until_an_inp
 async def test_concurrent_releases_share_one_check_of_a_parent(cache: FakeCache, coordinator: Coordinator) -> None:
     cache.keys.add(ac_key("a"))
     cache.hold = asyncio.Event()
-    checks = [asyncio.create_task(coordinator._in_cache(ac_key("a"))) for _ in range(5)]
+    checks = [asyncio.create_task(coordinator._in_cache(ac_key("a"), asyncio.Semaphore(1))) for _ in range(5)]
     await asyncio.sleep(0.1)  # every check is waiting on the first one's GET
     cache.hold.set()
     assert await asyncio.gather(*checks) == [True] * 5
     assert cache.asked == [ac_key("a")]
+
+
+async def test_releases_sharing_a_check_spend_one_request_of_their_limit_on_it(
+    cache: FakeCache, coordinator: Coordinator
+) -> None:
+    cache.keys |= {ac_key("a"), ac_key("b")}
+    cache.hold = asyncio.Event()
+    limit = asyncio.Semaphore(2)
+    # Three releases ask about "a" and one about "b": one request each is in flight, the two the limit allows.
+    checks = [asyncio.create_task(coordinator._in_cache_all({ac_key(name)}, limit)) for name in ["a", "a", "a", "b"]]
+    await asyncio.wait_for(wait_until(lambda: cache.held == 2), 5)
+    cache.hold.set()
+    assert [present for check in checks for present in (await check).values()] == [True] * 4
+    assert sorted(cache.asked) == sorted([ac_key("a"), ac_key("b")])
 
 
 async def test_a_check_begun_before_an_input_went_missing_is_not_remembered(
@@ -289,12 +303,12 @@ async def test_a_check_begun_before_an_input_went_missing_is_not_remembered(
 ) -> None:
     cache.keys.add(ac_key("a"))
     cache.hold = asyncio.Event()
-    check = asyncio.create_task(coordinator._in_cache(ac_key("a")))
+    check = asyncio.create_task(coordinator._in_cache(ac_key("a"), asyncio.Semaphore(1)))
     await asyncio.sleep(0.1)
     coordinator._forget_cache_findings()  # what an input-missing result does
     cache.hold.set()
     assert await check is True
-    assert await coordinator._in_cache(ac_key("a")) is True
+    assert await coordinator._in_cache(ac_key("a"), asyncio.Semaphore(1)) is True
     assert cache.asked == [ac_key("a"), ac_key("a")]
 
 
