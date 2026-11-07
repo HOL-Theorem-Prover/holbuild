@@ -11,7 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from conftest import CLIENT_TOKEN, WORKER_TOKEN
 from remote_exec import app as app_module
-from remote_exec.coordinator import Coordinator, QueueCounts, Settings, burst_demand, is_auth_failure
+from remote_exec import coordinator as coordinator_module
+from remote_exec.coordinator import Coordinator, HostReport, QueueCounts, Settings, burst_demand, is_auth_failure
 from test_coordinator import claim, input_key, submit
 
 CLIENT = {"Authorization": f"Bearer {CLIENT_TOKEN}"}
@@ -312,8 +313,20 @@ async def test_a_heartbeat_with_no_body_still_extends_the_lease(http: httpx.Asyn
 
 
 async def test_a_malformed_host_report_is_refused(http: httpx.AsyncClient) -> None:
-    report = {**host_report("h1", 30.0), "leases": "many"}
-    response = await http.post(
-        "/v1/work/claim", json={"tier": "standard", "worker": "w1", "host": report}, headers=WORKER
-    )
-    assert response.status_code == 422
+    for report in ({**host_report("h1", 30.0), "leases": "many"}, host_report("h" * 65, 30.0)):
+        response = await http.post(
+            "/v1/work/claim", json={"tier": "standard", "worker": "w1", "host": report}, headers=WORKER
+        )
+        assert response.status_code == 422
+
+
+async def test_reports_from_more_hosts_than_it_remembers_are_dropped(
+    coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "MAX_HOSTS", 2)
+    for host_id in ("h1", "h2", "h3"):
+        coordinator.report_host(HostReport(**host_report(host_id, 50.0)))
+    coordinator.report_host(HostReport(**host_report("h1", 10.0)))
+
+    assert [host.report.cpu_idle_pct for host in (await coordinator.queue()).hosts] == [10.0, 50.0]
+    assert sorted(coordinator.hosts) == ["h1", "h2"]

@@ -551,15 +551,10 @@ def test_cpu_is_measured_over_at_least_the_least_sample_time(
     assert reporter.cpu is not None and reporter.cpu[2] == 0  # still measuring from the first sample
 
 
-def test_memory_waits_are_reported_once_unless_the_coordinator_missed_them(
-    telemetry: tuple[HostTelemetry, Path], server: Server
-) -> None:
+def test_memory_waits_are_reported_once(telemetry: tuple[HostTelemetry, Path], server: Server) -> None:
     reporter, _ = telemetry
     reporter.waited(4.0)
     reporter.waited(2.5)
-    with pytest.raises(OSError):
-        Coordinator("http://127.0.0.1:1", "w", reporter).claim(["standard"], "w", 0)
-
     coordinator = Coordinator(server.url, "w", reporter)
     assert coordinator.claim(["standard"], "w", 0) is None
     assert coordinator.heartbeat("t")
@@ -567,6 +562,18 @@ def test_memory_waits_are_reported_once_unless_the_coordinator_missed_them(
     assert isinstance(claimed, dict) and isinstance(beat, dict)
     assert (claimed["id"], claimed["memory_waits"], claimed["memory_wait_s"]) == ("b0a7", 2, 6.5)
     assert (beat["memory_waits"], beat["memory_wait_s"]) == (0, 0.0)
+
+
+def test_memory_waits_of_a_report_that_may_have_been_taken_are_not_sent_again(
+    telemetry: tuple[HostTelemetry, Path], server: Server
+) -> None:
+    reporter, _ = telemetry
+    reporter.waited(4.0)
+    with pytest.raises(OSError):
+        Coordinator("http://127.0.0.1:1", "w", reporter).claim(["standard"], "w", 0)
+    assert Coordinator(server.url, "w", reporter).claim(["standard"], "w", 0) is None
+    claimed = server.claims[0]["host"]
+    assert isinstance(claimed, dict) and claimed["memory_waits"] == 0
 
 
 def test_a_worker_without_telemetry_sends_no_host(server: Server) -> None:

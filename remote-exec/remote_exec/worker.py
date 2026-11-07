@@ -96,21 +96,10 @@ class Coordinator:
             return error.code, error.read().decode(errors="replace")
 
     def post_reporting(self, path: str, body: dict[str, Any], timeout: float = 30) -> tuple[int, Any]:
-        """``post`` a JSON body with the host's report in it. A report the coordinator didn't answer, or answered
-        with a server error, goes back to be sent with the next."""
-        if self.host is None:
-            return self.post(path, json.dumps({**body, "host": None}).encode(), "application/json", timeout)
-        report = self.host.report()
-        try:
-            status, response = self.post(
-                path, json.dumps({**body, "host": asdict(report)}).encode(), "application/json", timeout
-            )
-        except COORDINATOR_ERRORS:
-            self.host.unsent(report)
-            raise
-        if status >= 500:
-            self.host.unsent(report)
-        return status, response
+        """``post`` a JSON body with the host's report in it. A report is sent once: one the coordinator may have
+        taken before failing isn't sent again, so its memory waits are never counted twice."""
+        report = None if self.host is None else asdict(self.host.report())
+        return self.post(path, json.dumps({**body, "host": report}).encode(), "application/json", timeout)
 
     def claim(self, tiers: list[str], worker: str, wait_s: float) -> dict[str, Any] | None:
         """An action, waiting up to ``wait_s`` seconds for one, or None."""
@@ -397,7 +386,7 @@ class HostTelemetry:
             self.memory_wait_s += seconds
 
     def report(self) -> HostReport:
-        """The host now, with the waits not yet reported, which it takes."""
+        """The host now, with the waits since the last report, which it takes."""
         memory = HostMemory.read(self.cooperate_dir)
         with open(PROC_STAT) as file:
             idle, total = cpu_times(file.readline())
@@ -422,12 +411,6 @@ class HostTelemetry:
             waits,
             round(wait_s, 1),
         )
-
-    def unsent(self, report: HostReport) -> None:
-        """Keep the waits of a report the coordinator didn't take for the next one."""
-        with self.lock:
-            self.memory_waits += report.memory_waits
-            self.memory_wait_s += report.memory_wait_s
 
 
 def failed_record(spec_sha256: str, failure: str) -> str:

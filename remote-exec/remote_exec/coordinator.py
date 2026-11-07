@@ -14,12 +14,13 @@ from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from typing import Annotated
 from uuid import UUID, uuid4
 
 import asyncpg
 import httpx
 import sqlalchemy as sa
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
@@ -42,6 +43,8 @@ SCALE_CMD_TIMEOUT_S = 60
 
 # A host none of whose workers reported for this long is left out of the queue's hosts, and forgotten.
 HOST_REPORT_SECONDS = 120
+# Hosts the coordinator remembers at most; a report from another host beyond them is dropped.
+MAX_HOSTS = 1000
 
 
 class Settings(BaseSettings):
@@ -130,7 +133,7 @@ class HostReport:
     that admission would hold a child back now, and the worker's waits for memory before claiming since its last
     report."""
 
-    id: str  # the host's boot_id
+    id: Annotated[str, Field(max_length=64)]  # the host's boot_id
     cpu_idle_pct: float | None
     mem_total: int | None
     mem_available: int | None
@@ -486,6 +489,8 @@ class Coordinator:
     def report_host(self, report: HostReport) -> None:
         """Take a worker's report of its host. A report without ``cpu_idle_pct`` keeps the host's last one."""
         previous = self.hosts.get(report.id)
+        if previous is None and len(self.hosts) >= MAX_HOSTS:
+            return
         if previous is not None:
             _, last = previous
             report = replace(
