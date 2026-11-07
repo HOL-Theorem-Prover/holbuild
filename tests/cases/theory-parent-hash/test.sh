@@ -8,7 +8,13 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
-cleanup() { rm -rf "$tmpdir"; }
+cleanup() {
+  if [[ -n "${server_pid:-}" ]]; then
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+  fi
+  rm -rf "$tmpdir"
+}
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
@@ -441,3 +447,39 @@ for pass in 1 2; do
     fi
   fi
 done
+
+# A local child entry built against other parent outputs can sit beside a
+# remote entry built against the parent being restored.  Dropping the local
+# entry must fall back to the remote one rather than rebuild (which
+# --remote-only, the fleet's mode, can't do).
+start_remote_cache_server "$tmpdir/remote" "$tmpdir/remote-server"
+fallback_project=$tmpdir/fallback-project
+cp -r "$nondet_project" "$fallback_project"
+rm -rf "$fallback_project/.holbuild"
+publisher_cache=$tmpdir/fallback-publisher-cache
+local_cache=$tmpdir/fallback-local-cache
+link_hol_toolchain_cache "$publisher_cache"
+link_hol_toolchain_cache "$local_cache"
+(cd "$fallback_project" && HOLBUILD_CACHE="$publisher_cache" \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" build --tactic-timeout 0 BTheory) > "$tmpdir/fallback-publish.log" 2>&1
+require_grep "BTheory built" "$tmpdir/fallback-publish.log"
+rm -rf "$fallback_project/.holbuild"
+(cd "$fallback_project" && HOLBUILD_CACHE="$local_cache" \
+  "$HOLBUILD_BIN" build --tactic-timeout 0 BTheory) > "$tmpdir/fallback-local.log" 2>&1
+require_grep "BTheory built" "$tmpdir/fallback-local.log"
+# Swap the local ATheory for the remote one; the local BTheory now disagrees.
+a_key=$(cd "$fallback_project" && HOLBUILD_CACHE="$local_cache" "$HOLBUILD_BIN" build --dry-run --tactic-timeout 0 BTheory |
+  awk '/^ATheory \(theory,/ {found = 1} found && /^  input_key:/ {print $2; exit}')
+[[ -n "$a_key" ]] || { echo "no ATheory input key in dry run" >&2; exit 1; }
+rm -rf "$local_cache/actions/$a_key"
+rm -rf "$fallback_project/.holbuild"
+fallback_log=$tmpdir/fallback-restore.log
+(cd "$fallback_project" && HOLBUILD_CACHE="$local_cache" HOLBUILD_CACHE_TRACE=1 \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" build --tactic-timeout 0 BTheory) > "$fallback_log" 2>&1 ||
+  { cat "$fallback_log" >&2; exit 1; }
+require_grep "cache miss: BTheory .*(parent outputs differ)" "$fallback_log"
+require_grep "BTheory restored from" "$fallback_log"
+if grep -q "BTheory built" "$fallback_log"; then
+  echo "BTheory was rebuilt instead of restored from the remote cache" >&2
+  exit 1
+fi

@@ -1,0 +1,4 @@
+# GoldenTheory's output hashes (see the end of test.sh), one line per HOL
+# revision and theory_manifest_version.  Lines are only ever added: when the
+# outputs change under an existing line, bump theory_manifest_version.
+hol=dc7c8919677fc57677a6b406a5d573fc0e605d8b version=2 sig=afc3df47540688c4911943bc94cdc2b528c257719077c446533148cf88c40d16 sml=61377388c1fc07f67d4f6813f57cbd9122f810ac6423e94fd507e15897f35593 dat=f396b25376d9514b53b3715947aaed81745d76c650723c8af0c6d7e54e1ae67d

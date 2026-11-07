@@ -589,11 +589,11 @@ with its sources and extra inputs declared, under the same theory toolchain key,
 produces a byte-identical `Theory.dat` in any project directory and artifact
 cache. The exporter canonicalizes the parent header by theory name, preserving
 the remaining payload, and updates the embedded data hash in `Theory.sml`.
-The generated parent load metadata uses the same order. Existing valid bundles
-remain usable without changing action keys; they are not canonicalized on
-restore, so importing a mixture of old and new bundles can still conflict.
-The local dependency-context checkpoint format changes to prevent resuming a
-heap with an older export runtime; artifact action keys do not change.
+The generated parent load metadata uses the same order. Theory action keys
+include `theory_manifest_version`, which changes whenever holbuild changes what
+a theory exports, so entries from exporters with different outputs never share
+a key; `tests/cases/theory-dat-reproducible/golden-outputs` pins one fixture's
+outputs per version to catch an unbumped change.
 A script that reads the clock, the environment, undeclared files, or host paths
 has to declare the files as `extra_deps` or opt out with `cache = false`.
 
@@ -605,7 +605,9 @@ parents is rejected and rebuilt. What a nondeterministic theory costs is cache
 hits: where the local parent's `.dat` differs from the one the cached children
 were built against, its whole subtree misses. A parent-incompatible local entry
 is removed after waiting for the publication lock, only if its manifest is
-unchanged, so a successful rebuild can publish a replacement. Policy-only
+unchanged, so a successful rebuild can publish a replacement; before
+rebuilding, the remote cache's entry for the key gets one try, since it may
+have been built against the parents being restored. Policy-only
 rejections retain the entry until a successful rebuild can publish. Other output
 conflicts still keep the first entry; remote publication and archive import
 still reject conflicts.
