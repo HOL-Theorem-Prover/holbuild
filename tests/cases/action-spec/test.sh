@@ -217,7 +217,32 @@ total=$(sed -n 's|^uploading to remote cache: 0/\([0-9][0-9]*\) files$|\1|p' "$t
 [[ -n "$total" ]] || { cat "$tmpdir/upload-progress.log" >&2; exit 1; }
 require_grep "^uploading to remote cache: $total/$total files\$" "$tmpdir/upload-progress.log"
 
+# Resident blobs are skipped through both HTTP clients. An unknown HEAD
+# response must still attempt the PUT, rather than assume a blob exists.
+for client in libcurl cli; do
+  if [[ "$client" == cli ]]; then
+    export HOLBUILD_TEST_LIBCURL=libholbuild-test-no-such-curl.so
+  fi
+  : > "$request_log"
+  hb action-spec --upload CTheory > "$tmpdir/batch-resident.txt"
+  diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-resident.txt"
+  [[ $(grep -c '^HEAD /cas/' "$request_log") -eq 8 ]]
+  if grep -q '^PUT /cas/' "$request_log"; then
+    echo "resident blobs were uploaded again" >&2
+    exit 1
+  fi
+  echo 503 > "$tmpdir/control/head-status"
+  : > "$request_log"
+  hb action-spec --upload CTheory > "$tmpdir/batch-unknown-head.txt"
+  diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-unknown-head.txt"
+  [[ $(grep -c '^PUT /cas/' "$request_log") -eq 8 ]]
+  rm "$tmpdir/control/head-status"
+  unset HOLBUILD_TEST_LIBCURL
+done
+
 # After the first upload fails, the rest are skipped and the export fails.
+missing_spec=$(awk '$1 == "action" { print $4; exit }' "$tmpdir/batch1.txt")
+rm "$remote_root/cas/$missing_spec"
 echo 500 > "$tmpdir/control/cas-put-status"
 : > "$request_log"
 if hb --prefetch-concurrency 1 action-spec --upload CTheory > /dev/null 2> "$tmpdir/upload-failure.log"; then

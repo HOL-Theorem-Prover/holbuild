@@ -5760,11 +5760,16 @@ fun uncached_parents plan uncached node =
   end
 
 fun publish_spec_blob remote path =
-  case HolbuildRemoteCache.publish_blob remote {hash = HolbuildHash.file_sha256 path, src = path} of
-      HolbuildCacheBackend.Published => ()
-    | HolbuildCacheBackend.AlreadyPresent => ()
-    | HolbuildCacheBackend.Conflict message => raise Error ("could not upload " ^ path ^ ": " ^ message)
-    | HolbuildCacheBackend.Skipped => raise Error ("could not upload " ^ path ^ ": skipped")
+  let val hash = HolbuildHash.file_sha256 path
+  in
+    if HolbuildRemoteCache.blob_presence remote hash = SOME true then ()
+    else
+      case HolbuildRemoteCache.publish_blob remote {hash = hash, src = path} of
+          HolbuildCacheBackend.Published => ()
+        | HolbuildCacheBackend.AlreadyPresent => ()
+        | HolbuildCacheBackend.Conflict message => raise Error ("could not upload " ^ path ^ ": " ^ message)
+        | HolbuildCacheBackend.Skipped => raise Error ("could not upload " ^ path ^ ": skipped")
+  end
 
 (* Writes the ActionSpec of every theory in the plan the remote cache can't
    satisfy, uploads them and their sources with upload, and returns the batch.
@@ -5942,7 +5947,8 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
     val files = if upload then unique_strings (List.concat (map #files exported)) else []
     val _ =
       if null files then ()
-      else (on_pool "uploading to remote cache" "files" upload_file files;
+      else (HolbuildToolchain.time_phase "action_spec.upload"
+              (fn () => on_pool "uploading to remote cache" "files" upload_file files);
             case !upload_failure of SOME e => raise e | NONE => ())
   in
     String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n"

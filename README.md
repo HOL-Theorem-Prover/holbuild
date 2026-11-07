@@ -1208,6 +1208,8 @@ The batch keeps the plan's theory order and includes entries with missing blobs.
 Its specs and sources are then uploaded the same way, `--prefetch-concurrency`
 at a time, reporting `uploading to remote cache: N/M files`; after the first
 upload that fails, the rest are skipped and the build falls back (below).
+Before compressing and uploading a file, it checks the CAS and skips the file
+only when the cache confirms it is already present.
 
 `build --remote-exec URL` hands the theories the remote cache lacks to a
 remote-execution coordinator, which runs them on its workers with
