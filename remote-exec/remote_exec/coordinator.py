@@ -33,6 +33,10 @@ CLAIM_RECHECK_SECONDS = 5  # how often a waiting claim looks for actions another
 ENTRY_BLOB = re.compile(r"^blob ([0-9a-f]{64}) [0-9]+$", re.MULTILINE)
 ENTRY_MANIFEST_MARKER = "manifest-text-v1\n"
 
+# A statement, or a transaction left idle, that runs longer than this is ended by the database, so one stuck
+# query can't hold a connection, or the locks it took, for good.
+DATABASE_STATEMENT_TIMEOUT = "60s"
+
 # A scale command that runs longer than this is killed, so it can't stall the sweep.
 SCALE_CMD_TIMEOUT_S = 60
 
@@ -245,6 +249,12 @@ class Coordinator:
                 pool_size=settings.database_pool_size,
                 max_overflow=0,
                 pool_timeout=settings.database_pool_timeout_s,
+                connect_args={
+                    "server_settings": {
+                        "statement_timeout": DATABASE_STATEMENT_TIMEOUT,
+                        "idle_in_transaction_session_timeout": DATABASE_STATEMENT_TIMEOUT,
+                    }
+                },
             ),
             httpx.AsyncClient(base_url=settings.cache_url, timeout=30, follow_redirects=True),
             settings,
