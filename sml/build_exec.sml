@@ -7117,6 +7117,21 @@ fun hydrate_spec_deps remote root (spec : spec_deps) direct =
                               "dependency " ^ target ^ " does not match its parents in the cache")
   end
 
+(* The stems of the project objects the build loads: the ones its preload
+   names and, through the libraries among them, the ones those load. *)
+fun spec_loaded_stems (spec : action_spec) =
+  let
+    fun visit (stem, seen) =
+      if List.exists (fn s => s = stem) seen then seen
+      else
+        case List.find (fn lib => #stem lib = stem) (#libs spec) of
+            NONE => stem :: seen
+          | SOME {loads, ...} =>
+              List.foldl visit (stem :: seen) (List.filter (CharVector.exists (fn c => c = #"/")) loads)
+  in
+    List.foldl visit [] (List.mapPartial (fn LoadObject stem => SOME stem | _ => NONE) (#loads spec))
+  end
+
 fun hydrate_action_root remote root (spec : action_spec) =
   let
     val package = #package spec
@@ -7126,7 +7141,7 @@ fun hydrate_action_root remote root (spec : action_spec) =
     fetch_file (#source spec);
     List.app fetch_file (#inputs spec);
     hydrate_spec_deps remote root (theory_spec_deps spec)
-      (fn {stem, ...} => List.exists (fn load => load = LoadObject stem) (#loads spec))
+      (fn {stem, ...} => List.exists (fn loaded => loaded = stem) (spec_loaded_stems spec))
   end
 
 (* Step 4: the action's own entry restores with full validation, the

@@ -1461,8 +1461,8 @@ build against them can use it. The worker's local copy of an entry goes out
 of date when the remote cache's entry changes. So before it checks for the
 theory's own entry, the worker replaces its copies that differ from the
 remote cache's entries with those: the copies of the theories the build
-loads directly, and, when a restored dependency doesn't match its parents,
-all of them. It does the same for the theory's own entry when that doesn't
+loads directly or through project libraries, and, when a restored
+dependency doesn't match its parents, all of them. It does the same for the theory's own entry when that doesn't
 match the restored parents. A theory still built against local copies of
 its parents that differ from the remote cache's (an entry replaced during
 the build) is not published but fails as a `publish` failure, and the

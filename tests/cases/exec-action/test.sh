@@ -414,3 +414,25 @@ expect stale-deps 0 "spec=$spec_p" "status=built"
 rm "$tmpdir/worker-stale-own/actions/$key_n/manifest"
 worker stale-own "$spec_m"
 expect stale-own 0 "spec=$spec_m" "status=cached"
+
+# Likewise for a parent the theory loads only through a project library.
+cat > "$project/src/nLib.sml" <<'SML'
+structure nLib = struct local open NTheory in val loaded = true end end
+SML
+cat > "$project/src/QScript.sml" <<'SML'
+Theory Q
+Ancestors bool
+Libs nLib
+
+Theorem q_thm:
+  T
+Proof
+  simp[]
+QED
+SML
+stale_worker stale-lib NTheory
+hb action-spec --upload QTheory > "$tmpdir/batch-q.txt"
+spec_q=$(spec_for "$tmpdir/batch-q.txt" worker:QTheory)
+[[ -n $spec_q ]] || { cat "$tmpdir/batch-q.txt" >&2; exit 1; }
+worker stale-lib "$spec_q"
+expect stale-lib 0 "spec=$spec_q" "status=built"
