@@ -541,8 +541,9 @@ async def test_a_waiting_claim_ends_empty_after_its_wait(http: httpx.AsyncClient
     assert (await http.post("/v1/work/claim", json=body, headers=WORKER)).status_code == 422
 
 
+@pytest.mark.parametrize("allow_run", [False, True])
 async def test_a_claim_reads_no_finished_actions(
-    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any, allow_run: bool
 ) -> None:
     """A claim reads the same few pages however many finished actions running and retained batches hold, so
     claims stay cheap on a busy fleet."""
@@ -553,7 +554,7 @@ async def test_a_claim_reads_no_finished_actions(
             await connection.execute(sa.text("ANALYZE"))
             plan = await connection.scalar(
                 sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {coordinator_module.CLAIM.text}"),
-                {"tiers": ["standard"]},
+                {"tiers": ["standard"], "allow_run": allow_run, "run_slots": 30},
             )
             await connection.rollback()
         return plan[0]["Plan"]["Shared Hit Blocks"] + plan[0]["Plan"]["Shared Read Blocks"]
@@ -1062,3 +1063,178 @@ async def test_batches_past_the_deadline_fail_and_then_expire(
         )
     await coordinator.sweep()
     assert (await http.get(f"/v1/batches/{overdue}", headers=CLIENT)).status_code == 404
+
+
+async def test_batch_class_defaults_to_build_and_rejects_unknown_classes(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    await submit(http, ["a"])
+    await submit(http, ["b"], **{"class": "run"})
+    async with coordinator.engine.connect() as connection:
+        rows = await connection.execute(sa.text("SELECT theory, class FROM actions ORDER BY theory"))
+        assert list(rows) == [("pkg:a", "build"), ("pkg:b", "run")]
+    response = await http.post("/v1/batches?class=other", content=batch_text(["c"]), headers=CLIENT)
+    assert response.status_code == 422
+
+
+async def test_run_batches_reject_dependency_edges_before_storing_actions(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    response = await http.post(
+        "/v1/batches?class=run", content=batch_text(["a", "b"], [("b", "a")]), headers=CLIENT
+    )
+    assert response.status_code == 400
+    assert "dependency edges are not allowed" in response.json()["detail"]
+    async with coordinator.engine.connect() as connection:
+        assert await connection.scalar(sa.text("SELECT count(*) FROM batches")) == 0
+    await submit(http, ["a", "b"], [("b", "a")])
+
+
+async def test_builds_beat_older_runs_across_all_accepted_tiers(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    await submit(http, ["run"], **{"class": "run"})
+    async with coordinator.engine.begin() as connection:
+        await connection.execute(sa.text("UPDATE actions SET tier = 'high'"))
+    await submit(http, ["build"])
+    body = {"tier": "high", "also_claim": ["standard"], "worker": "w"}
+    assert (await http.post("/v1/work/claim", json=body, headers=WORKER)).json()["theory"] == "pkg:build"
+    assert (await http.post("/v1/work/claim", json=body, headers=WORKER)).json()["theory"] == "pkg:run"
+
+
+async def test_run_slots_span_batches_and_free_on_completion(http: httpx.AsyncClient, coordinator: Coordinator) -> None:
+    coordinator.settings.run_slots = 2
+    for name in ("a", "b", "c"):
+        await submit(http, [name], **{"class": "run"})
+    token = await claim_named(http, "a")
+    await claim_named(http, "b")
+    assert await claim(http) is None
+    assert (await complete(http, token, result("a", "built"))).status_code == 200
+    await claim_named(http, "c")
+
+
+async def test_zero_run_slots_pauses_runs_and_keeps_builds_claimable(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.run_slots = 0
+    await submit(http, ["run"], **{"class": "run"})
+    assert await claim(http) is None
+    await submit(http, ["build"])
+    await claim_named(http, "build")
+    assert await claim(http) is None
+
+
+async def test_concurrent_claims_on_separate_coordinators_cannot_exceed_run_slots(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.run_slots = 2
+    replica = Coordinator(coordinator.engine, coordinator.cache, coordinator.settings)
+    for i in range(4):
+        await submit(http, [f"r{i}a", f"r{i}b", f"r{i}c"], **{"class": "run"})
+    claims = await asyncio.gather(*((coordinator, replica)[i % 2].claim(["standard"], f"worker{i}") for i in range(12)))
+    assert sum(c is not None for c in claims) == 2
+    async with coordinator.engine.connect() as connection:
+        assert await connection.scalar(sa.text("SELECT count(*) FROM actions WHERE state = 'running'")) == 2
+
+
+async def test_a_build_claim_does_not_wait_for_run_admission(http: httpx.AsyncClient, coordinator: Coordinator) -> None:
+    await submit(http, ["run"], **{"class": "run"})
+    acquiring = asyncio.Event()
+
+    def before_execute(_: object, __: object, statement: str, *args: object) -> None:
+        if "pg_advisory_xact_lock" in statement:
+            acquiring.set()
+
+    async with coordinator.engine.begin() as blocker:
+        await blocker.execute(sa.text("SELECT pg_advisory_xact_lock(1752132706, 1)"))
+        sa.event.listen(coordinator.engine.sync_engine, "before_cursor_execute", before_execute)
+        waiting = asyncio.create_task(coordinator.claim(["standard"], "run-worker"))
+        try:
+            await asyncio.wait_for(acquiring.wait(), 2)
+            await submit(http, ["build"])
+            await asyncio.wait_for(claim_named(http, "build"), 2)
+        finally:
+            sa.event.remove(coordinator.engine.sync_engine, "before_cursor_execute", before_execute)
+            waiting.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await waiting
+
+
+@pytest.mark.parametrize("failure", ["script", "timeout", "spec-rejected", "internal", "disk", "memory"])
+@pytest.mark.parametrize("failed_first", [True, False])
+async def test_final_run_failure_is_independent_and_visible_in_events(
+    http: httpx.AsyncClient, coordinator: Coordinator, failure: str, failed_first: bool
+) -> None:
+    coordinator.settings.max_attempts = 1
+    batch_id = await submit(http, ["a", "b"], **{"class": "run"})
+    if failure == "memory":
+        async with coordinator.engine.begin() as connection:
+            await connection.execute(sa.text("UPDATE actions SET tier = 'high' WHERE theory = 'pkg:a'"))
+    a = await claim_named(http, "a", "high" if failure == "memory" else "standard")
+    b = await claim_named(http, "b")
+    completions = [(a, result("a", "failed", failure)), (b, result("b", "built"))]
+    if not failed_first:
+        completions.reverse()
+    assert (await complete(http, *completions[0])).status_code == 200
+    assert (await batch(http, batch_id))["state"] == "running"
+    assert (await complete(http, *completions[1])).status_code == 200
+    status = await batch(http, batch_id)
+    assert (status["state"], status["failure"]) == ("done", None)
+    assert await states(http, batch_id) == {"a": "failed", "b": "done"}
+    events = [
+        json.loads(line)
+        for line in (await http.get(f"/v1/batches/{batch_id}/events", headers=CLIENT)).text.splitlines()
+        if line
+    ]
+    assert next(e for e in events if e.get("theory") == "pkg:a")["last_failure"] == failure
+    assert events[-1] == {"type": "batch", "state": "done", "failure": None}
+
+
+async def test_expired_run_attempt_fails_only_its_action(http: httpx.AsyncClient, coordinator: Coordinator) -> None:
+    coordinator.settings.max_attempts = 1
+    batch_id = await submit(http, ["a", "b"], **{"class": "run"})
+    await claim_named(http, "a")
+    async with coordinator.engine.begin() as connection:
+        await connection.execute(sa.text("UPDATE leases SET expires_at = now() - interval '1 second'"))
+    await coordinator.expire_leases()
+    status = await batch(http, batch_id)
+    assert status["state"] == "running"
+    assert await states(http, batch_id) == {"a": "failed", "b": "ready"}
+    assert status["actions"][0]["last_failure"] == "internal"
+    b = await claim_named(http, "b")
+    assert (await complete(http, b, result("b", "built"))).status_code == 200
+    assert (await batch(http, batch_id))["state"] == "done"
+
+
+async def test_run_resubmit_and_deadline_still_end_the_batch(http: httpx.AsyncClient, coordinator: Coordinator) -> None:
+    coordinator.settings.max_attempts = 1
+    batch_id = await submit(http, ["a", "b"], **{"class": "run"})
+    a = await claim_named(http, "a")
+    assert (await complete(http, a, result("a", "failed", "input-missing"))).status_code == 200
+    status = await batch(http, batch_id)
+    assert status["state"] == "failed" and status["failure"].startswith("resubmit:")
+    assert await states(http, batch_id) == {"a": "failed", "b": "cancelled"}
+    overdue = await submit(http, ["c", "d"], **{"class": "run"})
+    async with coordinator.engine.begin() as connection:
+        await connection.execute(sa.text("UPDATE batches SET created_at = now() - interval '1 day'"))
+    await coordinator.fail_overdue()
+    status = await batch(http, overdue)
+    assert status["state"] == "failed" and status["failure"].startswith("deadline:")
+    assert await states(http, overdue) == {"c": "cancelled", "d": "cancelled"}
+
+
+async def test_run_memory_failure_uses_the_existing_profile_hint_and_high_tier(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    batch_id = await submit(http, ["a"], profile="scripts", **{"class": "run"})
+    a = await claim_named(http, "a")
+    assert (await complete(http, a, result("a", "failed", "memory"))).status_code == 200
+    assert await claim(http) is None
+    a = await claim_named(http, "a", "high")
+    assert (await complete(http, a, result("a", "built"))).status_code == 200
+    assert (await batch(http, batch_id))["state"] == "done"
+    await submit(http, ["a"], profile="scripts", **{"class": "run"})
+    await submit(http, ["b"], profile="other", **{"class": "run"})
+    await claim_named(http, "b")
+    assert await claim(http) is None
+    await claim_named(http, "a", "high")
