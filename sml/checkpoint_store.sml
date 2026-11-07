@@ -34,6 +34,11 @@ fun remove_checkpoint path =
    remove_file (path ^ ".meta");
    remove_file (path ^ ".prefix");
    remove_file (path ^ ".steps");
+   (* A failed-prefix checkpoint's replacement, left by a process killed
+      while writing it. *)
+   app (fn suffix => (remove_file (path ^ ".new" ^ suffix);
+                      remove_file (path ^ ".new" ^ suffix ^ ".tmp")))
+       ["", ".ok", ".meta", ".prefix"];
    remove_file path)
 
 fun ok_v1 () = "holbuild-checkpoint-ok-v1\n"
