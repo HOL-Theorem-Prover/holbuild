@@ -1219,7 +1219,7 @@ how many they finished.
 
 The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the
-batch, or the batch fails, it warns and builds locally. An event stream that
+batch, or the batch fails other than by a failed proof (below), it warns and builds locally. An event stream that
 breaks is reattached; one that stays unreachable through four reattaches
 (about 15 seconds of backoff) is given up on. When the build stops following
 a batch that may still run (the stream was given up on, or the coordinator
@@ -1237,6 +1237,14 @@ local build. A build that includes a theory writing SML sources (see
 `holbuild_extra_outputs`) builds locally too, since those theories have to
 run before the rest of the build can be planned; with `--remote-only` it
 only restores from the cache, and with `--detach` it fails.
+
+A batch that fails because a theory's proof failed on a worker (failure
+`proof` or `tactic-timeout`) isn't built locally, since a local build would
+fail the same way. The build restores what the cache holds, as `--remote-only`
+does, fetches the worker's build log from the remote cache into
+`.holbuild/logs/current/<package>/<theory>/build.log`, prints the diagnostic a
+local build would, and exits with status 1, with or without `--remote-only`.
+If that log can't be fetched, the build falls back as for any failed batch.
 
 `--detach` submits the batch, prints its id (`holbuild: remote batch <id>`)
 and exits; if the batch can't be submitted, it fails rather than building

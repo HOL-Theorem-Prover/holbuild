@@ -1338,6 +1338,22 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           if remote_only then fall_back reason
           else if HolbuildRemoteExec.cancel url batch_id then fall_back (reason ^ ", cancelled the batch")
           else fall_back reason
+        (* A batch that failed because a proof did: a local build would fail
+           the same way, so the build restores what the cache holds, reports
+           the failure from the worker's build log and stops, building nothing
+           locally.  Without the log it falls back. *)
+        fun proof_failed reason (failure : HolbuildRemoteExec.proof_failure) =
+          (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "\n");
+           HolbuildBuildExec.build (HolbuildBuildExec.restore_only_options build_options)
+             tc project plan toolchain_key jobs
+           handle HolbuildBuildExec.Error _ => ()
+                | HolbuildBuildExec.ErrorWithDebugArtifacts _ => ();
+           (* The restore stops at a theory the cache lacks, the failed one if
+              no other, which isn't why this build fails. *)
+           HolbuildHolSharedCache.local_build_needed := false;
+           case HolbuildBuildExec.remote_proof_failure build_options tc project plan toolchain_key failure of
+               SOME error => raise error
+             | NONE => fall_back "could not fetch the failed theory's build log")
         (* A batch that abandon would cancel is cancelled on an interrupt too.
            While it runs, the entries of the theories it finishes, and of a
            submitted batch the theories outside it, which the remote cache
@@ -1360,8 +1376,10 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               (HolbuildRemoteExec.Done, progress) =>
                 (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ finished progress ^ "\n");
                  build_locally ())
-            | (HolbuildRemoteExec.Failed reason, progress) =>
+            | (HolbuildRemoteExec.Failed (reason, NONE), progress) =>
                 fall_back ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress)
+            | (HolbuildRemoteExec.Failed (reason, SOME failure), progress) =>
+                proof_failed ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress) failure
             | (HolbuildRemoteExec.Cancelled, progress) =>
                 let val reason = "batch " ^ batch_id ^ " cancelled; " ^ finished progress
                 in
