@@ -36,6 +36,19 @@ local
      in the context it was given instead, which needs no context pin. *)
   val context_goalstack = declares "src/proofman/goalStack.sig" "expand_listf_in"
 
+  val proof_interception =
+    "  type proof_factories = {tactics : (string * (unit -> Tactical.tactic)) list,\n" ^
+    "                          list_tactics : (string * (unit -> Tactical.list_tactic)) list}\n" ^
+    "  type proof_runner = proof_factories option -> proof_context -> Tactical.goal -> Thm.thm\n" ^
+    "  fun intercept_proof (runner : proof_runner option ref) make factories =\n" ^
+    "    lift_context_tactic (fn ctxt => fn goal =>\n" ^
+    "      case !runner of\n" ^
+    "          NONE => run_tactic ctxt (make ()) goal\n" ^
+    "        | SOME run =>\n" ^
+    "            (runner := NONE;\n" ^
+    "             let val th = run factories ctxt goal\n" ^
+    "             in ([], fn [] => th | _ => raise Fail \"proof IR validation received theorems\") end))\n"
+
   val legacy =
     "structure HolbuildTacticCompat = struct\n" ^
     "  type proof_context = unit\n" ^
@@ -47,6 +60,7 @@ local
     "  fun tac_proof (_ : proof_context) goal_tactic = Tactical.TAC_PROOF goal_tactic\n" ^
     "  fun expand_listf (_ : proof_context) list_tactic gstk = goalStack.expand_listf list_tactic gstk\n" ^
     "  fun install_prover (prover : proof_context -> Tactical.goal * Tactical.tactic -> Thm.thm) = Tactical.set_prover (prover ())\n" ^
+    proof_interception ^
     "end;\n"
 
   val contextual_expand_listf =
@@ -67,6 +81,7 @@ local
     "  fun tac_proof ctxt goal_tactic = Tactical.TAC_PROOF_in ctxt goal_tactic\n" ^
     contextual_expand_listf ^
     "  fun install_prover (prover : proof_context -> Tactical.goal * Tactical.tactic -> Thm.thm) = Tactical.set_prover prover\n" ^
+    proof_interception ^
     "end;\n"
 in
   val _ = compile (if context_tactics then contextual else legacy)

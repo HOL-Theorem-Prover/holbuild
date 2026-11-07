@@ -912,9 +912,17 @@ theory.
 By default, `holbuild` instruments modern theorem and explicit termination
 proofs in the root package and executes them as proof steps. This gives better
 failure locations, per-step tactic timeouts, and optional traces. Theorem proofs
-also support failed-prefix checkpoints; termination proofs currently replay from
-the preceding clean definition/theorem/dependency checkpoint. Theories in
-dependency packages build without proof-step instrumentation or checkpoints
+without proof execution attributes also support failed-prefix checkpoints;
+termination proofs currently replay from the preceding clean
+definition/theorem/dependency checkpoint.
+
+`Proof[...]` attributes such as `exclude_simps` and `exclude_frags`, including
+those on `Resume`, remain active across the entire stepped proof. They retain
+leaf diagnostics, timeouts and traces. Attributed proofs save theorem-context state
+after the declaration is bound and the temporary modifier has unwound; they do not
+save or restore failed-prefix checkpoints.
+
+Theories in dependency packages build without proof-step instrumentation or checkpoints
 by default. To audit their proofs too, select `--proof-scope=all`.
 
 Useful commands and options:

@@ -54,6 +54,15 @@ fun selector_text SelectFirst = "first"
   | selector_text (SelectMatchingFirst pats) = "matching-first " ^ pats
   | selector_text (SelectMatchingAll pats) = "matching-all " ^ pats
 
+fun selector_program SelectFirst = NONE
+  | selector_program (SelectMatchingFirst pats) = SOME ("Q.RENAME_TAC " ^ pats)
+  | selector_program (SelectMatchingAll pats) = SOME ("Q.RENAME_TAC " ^ pats)
+
+fun selector_list_tactic SelectFirst = NONE
+  | selector_list_tactic (SelectMatchingFirst pats) = SOME ("Tactical.FIRST_LT (Q.RENAME_TAC " ^ pats ^ ")")
+  | selector_list_tactic (SelectMatchingAll pats) = SOME ("Tactical.SELECT_LT (Q.RENAME_TAC " ^ pats ^ ")")
+
+
 fun mode_text SelectSolve = "solve"
   | mode_text SelectKeep = "keep"
 
