@@ -28,6 +28,8 @@ from remote_exec.formats import Batch, Result
 logger = logging.getLogger(__name__)
 
 CLAIM_RECHECK_SECONDS = 5  # how often a waiting claim looks for actions another coordinator process made ready
+# How long a cache entry found whole, blobs included, is taken to still be there without asking the cache again.
+IN_CACHE_TRUST_SECONDS = 60
 
 # A holbuild remote-cache entry lists its blobs as `blob <sha256> <size>` lines before the manifest it carries.
 ENTRY_BLOB = re.compile(r"^blob ([0-9a-f]{64}) [0-9]+$", re.MULTILINE)
@@ -266,8 +268,15 @@ class Coordinator:
         self.settings = settings
         self.clock: Callable[[], datetime] = lambda: datetime.now(UTC)
         self.scaled_to: int | None = None  # what the scale command last accepted
-        # Set, and replaced by a fresh one, whenever release makes an action ready, to wake waiting claims.
-        self.made_ready = asyncio.Event()
+        # How many actions this process's release has made ready, and the claims waiting, by the tiers they take
+        # and the future that wakes them, oldest first; see claim.
+        self.made_ready = 0
+        self.claim_waiters: list[tuple[list[str], asyncio.Future[None]]] = []
+        # When each cache entry was last found whole, the checks of the cache under way, and how many times
+        # input-missing results forgot both; see _in_cache.
+        self.found_in_cache: dict[str, float] = {}
+        self.cache_checks: dict[str, asyncio.Task[bool | None]] = {}
+        self.cache_forgotten = 0
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "Coordinator":
@@ -285,7 +294,13 @@ class Coordinator:
                     }
                 },
             ),
-            httpx.AsyncClient(base_url=settings.cache_url, timeout=30, follow_redirects=True),
+            # Every connection stays open between requests, so bursts of them don't each open a new TLS connection.
+            httpx.AsyncClient(
+                base_url=settings.cache_url,
+                timeout=30,
+                follow_redirects=True,
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=100),
+            ),
             settings,
         )
 
@@ -399,23 +414,40 @@ class Coordinator:
         that least recently had one claimed, then the oldest; within it, the action with the deepest chain of
         dependents, then the most dependents.
 
-        A wait ends early once ``disconnected`` says the worker has gone, so no action is leased to nobody. It is
-        woken when this process's ``release`` makes an action ready, and rechecks every ``CLAIM_RECHECK_SECONDS``
-        for actions another coordinator process made ready.
+        A wait ends early once ``disconnected`` says the worker has gone, so no action is leased to nobody. Each
+        action this process's ``release`` makes ready wakes the longest waiting claim that takes its tier, not
+        every waiting claim, so hundreds of waiting workers don't all query for it. Waits recheck every
+        ``CLAIM_RECHECK_SECONDS``, for actions another coordinator process made ready and for an action whose
+        woken claim took another one or lost it to another claim; a claim woken that leaves without trying wakes
+        the next.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wait_s
-        while True:
-            # Taken before the attempt, so an action made ready during it still wakes the wait below.
-            made_ready = self.made_ready
-            claimed = await self._claim(tiers, worker)
-            remaining = deadline - loop.time()
-            if claimed is not None or remaining <= 0:
-                return claimed
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(made_ready.wait(), min(remaining, CLAIM_RECHECK_SECONDS))
-            if disconnected is not None and await disconnected():
-                return None
+        woken: asyncio.Future[str] = loop.create_future()  # done once a wake was handed to this claim
+        try:
+            while True:
+                # Taken before the attempt, so an action made ready during it is tried at once, not waited for.
+                made_ready = self.made_ready
+                claimed = await self._claim(tiers, worker)
+                remaining = deadline - loop.time()
+                if claimed is not None or remaining <= 0:
+                    return claimed
+                woken = loop.create_future()
+                if self.made_ready == made_ready:
+                    waiter = (tiers, woken)
+                    self.claim_waiters.append(waiter)
+                    try:
+                        with contextlib.suppress(TimeoutError):
+                            await asyncio.wait_for(asyncio.shield(woken), min(remaining, CLAIM_RECHECK_SECONDS))
+                    finally:
+                        with contextlib.suppress(ValueError):
+                            self.claim_waiters.remove(waiter)
+                if disconnected is not None and await disconnected():
+                    self._pass_wake(woken)
+                    return None
+        except asyncio.CancelledError:
+            self._pass_wake(woken)
+            raise
 
     async def _claim(self, tiers: list[str], worker: str) -> Claim | None:
         async with self.engine.begin() as conn:
@@ -447,6 +479,22 @@ class Coordinator:
                 },
             )
         return Claim(token, row.spec_sha256, row.input_key, row.theory, self.settings.lease_seconds)
+
+    def _wake_claim(self, tier: str) -> None:
+        """Count an action of ``tier`` made ready, and wake the longest waiting claim that takes it."""
+        self.made_ready += 1
+        for waiter in self.claim_waiters:
+            tiers, woken = waiter
+            if tier in tiers and not woken.done():
+                woken.set_result(tier)
+                self.claim_waiters.remove(waiter)
+                return
+
+    def _pass_wake(self, woken: asyncio.Future[str]) -> None:
+        """Hand the wake of a claim leaving without trying, if it got one, to the next claim that takes its tier."""
+        if woken.done() and not woken.cancelled():
+            self.made_ready -= 1
+            self._wake_claim(woken.result())
 
     async def heartbeat(self, token: UUID) -> bool:
         """Extend a live lease; False when it expired or was revoked, so the worker should stop."""
@@ -536,6 +584,7 @@ class Coordinator:
             ):
                 await self._retry(conn, batch_id, action.input_key)
             elif result.failure == "input-missing":
+                self._forget_cache_findings()
                 await self._input_missing(conn, batch_id, action.input_key, action.theory, action.attempts, result)
             else:
                 await self._fail_batch(conn, batch_id, action.input_key, f"{action.theory}: {result.failure}")
@@ -557,21 +606,27 @@ class Coordinator:
                 for _, ac_key in parents:
                     if ac_key not in present:
                         present[ac_key] = await self._in_cache(ac_key)
-            requeued = False
+            ready: defaultdict[UUID, list[str]] = defaultdict(list)
             for (candidate_batch, input_key), parents in candidates.items():
-                answers = [present[ac_key] for _, ac_key in parents]
-                if all(answers):
-                    async with self.engine.begin() as conn:
-                        updated = await conn.execute(
-                            sa.text(
-                                "UPDATE actions SET state = 'ready' WHERE batch_id = :batch_id "
-                                "AND input_key = :input_key AND state = 'waiting' AND remaining_deps = 0"
-                            ),
-                            {"batch_id": candidate_batch, "input_key": input_key},
-                        )
-                    if updated.rowcount:
-                        self.made_ready.set()
-                        self.made_ready = asyncio.Event()
+                if all(present[ac_key] for _, ac_key in parents):
+                    ready[candidate_batch].append(input_key)
+            for candidate_batch, keys in ready.items():
+                # One transaction per batch, taking its lock before its actions' as every other writer does.
+                async with self.engine.begin() as conn:
+                    if await self._lock_batch(conn, candidate_batch) != "running":
+                        continue
+                    tiers = await conn.scalars(
+                        sa.text(
+                            "UPDATE actions SET state = 'ready' WHERE batch_id = :batch_id "
+                            "AND input_key = ANY(:keys) AND state = 'waiting' AND remaining_deps = 0 RETURNING tier"
+                        ),
+                        {"batch_id": candidate_batch, "keys": keys},
+                    )
+                    made_ready = list(tiers)
+                for tier in made_ready:
+                    self._wake_claim(tier)
+            requeued = False
+            for (candidate_batch, _), parents in candidates.items():
                 for parent, ac_key in parents:
                     if present[ac_key] is False:
                         requeued |= await self._requeue_evicted(candidate_batch, parent)
@@ -687,6 +742,8 @@ class Coordinator:
         The demand samples behind the target are in the database, so a restarted coordinator keeps holding it. A
         failing scale command is logged and retried on the next sweep; it never stops the sweep.
         """
+        trusted_since = asyncio.get_running_loop().time() - IN_CACHE_TRUST_SECONDS
+        self.found_in_cache = {key: at for key, at in self.found_in_cache.items() if at > trusted_since}
         await self.expire_leases()
         await self.fail_overdue()
         await self.release()
@@ -729,7 +786,36 @@ class Coordinator:
 
     async def _in_cache(self, ac_key: str) -> bool | None:
         """Whether the cache holds entry ``ac_key`` and every blob it lists, which can expire before it; None when
-        the cache can't tell."""
+        the cache can't tell.
+
+        An entry found whole is taken to be there for ``IN_CACHE_TRUST_SECONDS`` without asking again, and
+        concurrent calls share one check, since each completion releases its batch and every concurrent release
+        would otherwise ask about the same parents. One evicted meanwhile makes its children report
+        ``input-missing``, which forgets every entry found and every check under way.
+        """
+        now = asyncio.get_running_loop().time()
+        if now - self.found_in_cache.get(ac_key, -IN_CACHE_TRUST_SECONDS) < IN_CACHE_TRUST_SECONDS:
+            return True
+        check = self.cache_checks.get(ac_key)
+        if check is None:
+            check = asyncio.create_task(self._check_cache(ac_key))
+            self.cache_checks[ac_key] = check
+
+            def done(_: object) -> None:
+                if self.cache_checks.get(ac_key) is check:
+                    del self.cache_checks[ac_key]
+
+            check.add_done_callback(done)
+        # Shielded, so a caller cancelled leaves the check to the others.
+        return await asyncio.shield(check)
+
+    def _forget_cache_findings(self) -> None:
+        self.found_in_cache.clear()
+        self.cache_checks.clear()
+        self.cache_forgotten += 1
+
+    async def _check_cache(self, ac_key: str) -> bool | None:
+        forgotten = self.cache_forgotten
         try:
             response = await self.cache.get(f"/ac/{ac_key}")
             if response.status_code == 200:
@@ -740,6 +826,8 @@ class Coordinator:
         except httpx.HTTPError:
             return None
         if response.status_code == 200:
+            if self.cache_forgotten == forgotten:  # else an input went missing since this check began
+                self.found_in_cache[ac_key] = asyncio.get_running_loop().time()
             return True
         if response.status_code == 404:
             return False
@@ -869,7 +957,8 @@ class Coordinator:
         await conn.execute(REFRESH_CHILDREN, {"batch_id": batch_id, "keys": [input_key]})
 
     async def _retry(self, conn: AsyncConnection, batch_id: UUID, input_key: str) -> None:
-        """Send a failed or expired action back to waiting, so ``release`` checks its parents' keys again.
+        """Send a failed or expired action back to waiting, so ``release`` checks its parents' keys again, or
+        trusts what it found within ``IN_CACHE_TRUST_SECONDS``.
 
         A parent may have been re-queued while the action ran; going straight to ready would skip that check.
         """
