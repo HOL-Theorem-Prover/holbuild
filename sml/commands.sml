@@ -1443,6 +1443,10 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           (fn () => print (HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key jobs
                              {upload = upload, local_resumable = false, forced = [], ledger = false}))
       end
+    fun run_with_stat_cache f =
+      let val result = f ()
+      in finish_stat_cache stat_cache; result end
+      handle e => (finish_stat_cache stat_cache; raise e)
     fun planned_runs () =
       if null targets then NONE
       else
@@ -1462,23 +1466,35 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
        prints a line per run.  A run never runs here. *)
     fun remote_run {request, url, fetch_only, outputs_dir, profile} () =
       let
-        val {remote, runs, export} =
-          timed_phase "run_action.plan"
-            (fn () => HolbuildBuildExec.plan_runs tc project (planned_runs ()) jobs request)
         val outputs = #outputs request
         fun has keys ({run_key, ...} : HolbuildBuildExec.run) = List.exists (fn key => key = run_key) keys
-        val uncached =
-          if fetch_only then []
-          else
-            HolbuildBuildExec.failing_on_pool remote jobs "checking remote cache" "runs"
-              (fn remote => fn ({run_key, ...} : HolbuildBuildExec.run) =>
-                  HolbuildBuildExec.run_already_done remote run_key outputs)
-              runs
-        val refused : HolbuildBuildExec.run list ref = ref []
-        (* The latest state and failure of each run in the batch. *)
-        val states : (string * (string * string option)) list ref = ref []
         (* Why the runs didn't all end, and whether a later try may succeed. *)
         val stopped : (string * bool) option ref = ref NONE
+        val (remote, runs, uncached, {exported, refused}) =
+          HolbuildBuildExec.with_project_lock project "run-action"
+            (fn () => run_with_stat_cache (fn () =>
+              let
+                val {remote, runs, export} =
+                  timed_phase "run_action.plan"
+                    (fn () => HolbuildBuildExec.plan_runs tc project (planned_runs ()) jobs request)
+                val uncached =
+                  if fetch_only then []
+                  else
+                    HolbuildBuildExec.failing_on_pool remote jobs "checking remote cache" "runs"
+                      (fn remote => fn ({run_key, ...} : HolbuildBuildExec.run) =>
+                          HolbuildBuildExec.run_already_done remote run_key outputs)
+                      runs
+                val exported =
+                  case (uncached, url) of
+                      ([], _) => {exported = [], refused = []}
+                    | (_, NONE) => raise Error "internal error: run-action has runs to submit but no coordinator"
+                    | (_, SOME _) =>
+                        timed_phase "run_action.export" (fn () => export uncached)
+                        handle HolbuildBuildExec.Error reason =>
+                          (stopped := SOME (reason, true); {exported = [], refused = []})
+              in (remote, runs, uncached, exported) end))
+        (* The latest state and failure of each run in the batch. *)
+        val states : (string * (string * string option)) list ref = ref []
         fun submit_and_follow url exported =
           let
             val batch =
@@ -1515,16 +1531,10 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                   end
           end
         val _ =
-          case (uncached, url) of
+          case (exported, url) of
               ([], _) => ()
+            | (_, SOME url) => submit_and_follow url exported
             | (_, NONE) => raise Error "internal error: run-action has runs to submit but no coordinator"
-            | (_, SOME url) =>
-                case (SOME (timed_phase "run_action.export" (fn () => export uncached))
-                      handle HolbuildBuildExec.Error reason => (stopped := SOME (reason, true); NONE)) of
-                    NONE => ()
-                  | SOME {exported, refused = runs_refused} =>
-                      (refused := runs_refused;
-                       if null exported then () else submit_and_follow url exported)
         fun ended_as ({run_key, ...} : HolbuildBuildExec.run) =
           case List.find (fn (key, _) => key = run_key) (!states) of
               SOME (_, ("done", _)) => "done"
@@ -1534,7 +1544,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           map (fn run =>
                   (run,
                    if fetch_only orelse not (has (map #run_key uncached) run) then "cached"
-                   else if has (map #run_key (!refused)) run then "missing"
+                   else if has (map #run_key refused) run then "missing"
                    else ended_as run))
               runs
         val to_fetch = List.mapPartial (fn (run, status) =>
@@ -1571,7 +1581,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                raise Error ("remote execution: " ^ reason))
           | SOME (reason, false) => raise Error ("remote execution: " ^ reason)
           | NONE =>
-              if null (!refused) then ()
+              if null refused then ()
               else raise Error "run-action: some targets aren't built; see above"
       end
     (* Theories the remote cache lacks go to the coordinator as a batch; once
@@ -1776,9 +1786,6 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                   in warn_unreachable_for planned; remote_build_plan (build_options, plan, toolchain_key) NONE end
                 else remote_build_plan (build_options, plan, toolchain_key) attach
       end
-    fun run_with_stat_cache f =
-      (f (); finish_stat_cache stat_cache)
-      handle e => (finish_stat_cache stat_cache; raise e)
   in
     case mode of
         ExportActionSpecs {upload} =>
@@ -1787,9 +1794,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       | ExportRunSpecs request =>
           HolbuildBuildExec.with_project_lock project "run-action"
             (fn () => run_with_stat_cache (export_run_specs request))
-      | RemoteRun run =>
-          HolbuildBuildExec.with_project_lock project "run-action"
-            (fn () => run_with_stat_cache (remote_run run))
+      | RemoteRun run => remote_run run ()
       | BuildTargets =>
           if dry_run then run_with_stat_cache describe_dry_run
           else HolbuildBuildExec.with_project_lock project "build" (fn () => run_with_stat_cache execute_build)

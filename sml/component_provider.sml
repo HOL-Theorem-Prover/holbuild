@@ -165,13 +165,34 @@ fun ensure_output ({preparation, ...} : analysis_state)
 fun runs_generators ({preparation, ...} : analysis_state) =
   HolbuildPackagePrepare.requires_live_preparation preparation
 
-fun ensure_extra_input state (source : HolbuildSourceIndex.source) base relative_path =
+fun ensure_extra_input ({preparation, ...} : analysis_state)
+                       (source : HolbuildSourceIndex.source) base relative_path =
   let
     val absolute = OS.Path.mkCanonical (OS.Path.concat(base, relative_path))
-    val package_relative =
-      HolbuildSourceIndex.relative_path (#package_root source) absolute
+    (* Match the extra-input walk, which skips .holbuild children but accepts
+       an explicitly named file or starting directory inside .holbuild. *)
+    fun walked_from root path =
+      let
+        val root = OS.Path.mkCanonical root
+        val prefix = if String.isSuffix "/" root then root else root ^ "/"
+      in
+        String.isPrefix prefix path andalso
+        not (List.exists (fn part => part = ".holbuild")
+          (String.tokens (fn c => c = #"/") (String.extract(path, size prefix, NONE))))
+      end
+    val glob = CharVector.exists (fn c => c = #"*" orelse c = #"?") relative_path
+    fun matches output =
+      let
+        val path = OS.Path.mkCanonical (OS.Path.concat(#package_root source, output))
+      in
+        if glob then
+          walked_from base path andalso
+          HolbuildSourceIndex.glob_match relative_path
+            (HolbuildSourceIndex.relative_path base path)
+        else path = absolute orelse walked_from absolute path
+      end
   in
-    ensure_output state source package_relative
+    HolbuildPackagePrepare.ensure_outputs preparation (#package source) matches
   end
 
 fun source_hash (state as {hashes, ...} : analysis_state) source =
