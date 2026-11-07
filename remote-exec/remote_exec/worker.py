@@ -68,6 +68,10 @@ class Unreleased(Exception):
     """The action was exported by a holbuild version that has no release to build."""
 
 
+class CacheUnavailable(RuntimeError):
+    """The remote cache gave no answer, 429, 5xx or a transfer cut short, as while it restarts."""
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     """Refuses redirects, which would send the worker token to wherever they point."""
 
@@ -186,7 +190,8 @@ class Releases:
     def spec_version(self, spec_sha256: str) -> str:
         """The ``holbuild-version`` of the action spec stored in the remote cache's ``/cas/``."""
         # -g: no URL globbing, whose errors print the URL with any credentials in it.
-        command = ["curl", "-fsSLg", "--retry", "3"]
+        # The status follows the body on its own line: 000 when there was no answer.
+        command = ["curl", "-fsSLg", "--retry", "3", "-w", "\n%{http_code}"]
         if self.curl_config is not None:
             command += ["-K", self.curl_config]
         command.append(f"{self.remote_cache.rstrip('/')}/cas/{spec_sha256}")
@@ -194,10 +199,15 @@ class Releases:
         try:
             fetched = subprocess.run(command, capture_output=True, text=True, timeout=120)
         except subprocess.TimeoutExpired:
-            raise RuntimeError(f"fetching spec {spec_sha256} from the remote cache timed out") from None
+            raise CacheUnavailable(f"fetching spec {spec_sha256} from the remote cache timed out") from None
+        spec, _, status = fetched.stdout.rpartition("\n")
         if fetched.returncode != 0:
-            raise RuntimeError(f"fetching spec {spec_sha256} from the remote cache failed: {fetched.stderr.strip()}")
-        spec = fetched.stdout
+            failure = f"fetching spec {spec_sha256} from the remote cache failed: {fetched.stderr.strip()}"
+            # Only an answer of 4xx, such as 404 for a spec the cache lost, won't come right by asking again; no
+            # answer, 429, 5xx or a transfer cut short may well.
+            if fetched.returncode == 22 and status.startswith("4") and status != "429":
+                raise RuntimeError(failure)
+            raise CacheUnavailable(failure)
         versions = [
             line.removeprefix("holbuild-version=") for line in spec.splitlines() if line.startswith("holbuild-version=")
         ]
@@ -497,7 +507,9 @@ def runs_hol(pid: int, cooperate_dir: str) -> bool:
 
 def failed_record(spec_sha256: str, failure: str) -> str:
     """A result record the worker writes itself: ``spec-rejected`` for an action it won't run, which fails it
-    finally like exec-action's own, or ``internal`` for one exec-action ended without a record, which is retried."""
+    finally like exec-action's own; ``unavailable`` for one whose spec the cache couldn't give (no answer, 429 or
+    5xx, or a transfer cut short), which is retried without counting the attempt; or ``internal`` for any other
+    error in the worker, such as exec-action ending without a record, which is retried."""
     return f"holbuild-action-result-v1\nspec={spec_sha256}\ninput-key=\nstatus=failed\nfailure={failure}\n"
 
 
@@ -586,61 +598,79 @@ def run_one(
     phases: Phases,
 ) -> None:
     """Run one claimed action to its end, or until its lease is lost, and report it, adding its phases' time to
-    ``phases``."""
+    ``phases``. An error in the worker is reported for a retry and then raised, so that ``main`` waits before it
+    claims again."""
     token = claim["attempt_token"]
     spec = claim["spec_sha256"]
     print(f"running {claim['theory']} ({claim['input_key']})", file=sys.stderr, flush=True)
     with Lease(coordinator, token, claim["lease_s"], protection).held(phases) as lease:
         try:
-            with phases.timed("release"):
-                holbuild = releases.holbuild(releases.spec_version(spec))
-        except Unreleased as error:
-            print(f"refusing {spec}: {error}", file=sys.stderr)
+            record = execute(args, releases, lease, claim, phases)
+        except CacheUnavailable:
+            # The cache couldn't give the spec, as while it restarts: the action is retried without counting it.
             with phases.timed("complete"):
-                coordinator.complete(token, failed_record(spec, "spec-rejected"), claim["lease_s"])
-            return
-        if lease.lost.is_set():
-            return
-        with tempfile.TemporaryDirectory() as scratch:
-            result = os.path.join(scratch, "result")
-            # Its own session, so a lost lease stops holbuild's HOL children with it.
-            cooperate_dir = None if args.cooperate_dir is None else os.path.realpath(args.cooperate_dir)
-            spans = ExecSpans()
-            stepped = time.monotonic()
-            process = subprocess.Popen(
-                exec_action_command(args, holbuild, spec, result), env=exec_action_env(), start_new_session=True
-            )
-            try:
-                while process.poll() is None:
-                    if lease.lost.wait(1):
-                        return
-                    if cooperate_dir is not None:
-                        hol = runs_hol(process.pid, cooperate_dir)
-                        now = time.monotonic()
-                        spans.step(now - stepped, hol=hol)
-                        stepped = now
-            finally:
-                # A lost lease, Ctrl-C or SIGTERM (see main) stops the action rather than leaving it running
-                # unreported. The group outlives holbuild while a HOL child is still in it.
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGTERM)
-                process.wait()
-                if cooperate_dir is None:
-                    phases.add("exec", time.monotonic() - stepped)
-                else:
-                    spans.step(time.monotonic() - stepped, hol=False)
-                    phases.add("before_hol", spans.before_hol)
-                    phases.add("hol", spans.hol)
-                    phases.add("after_hol", spans.after_hol)
-            if not os.path.exists(result) or os.path.getsize(result) == 0:
-                # It crashed or was killed; the coordinator retries the action now rather than when the lease expires.
-                print(f"exec-action exited {process.returncode} without a result record", file=sys.stderr)
-                with phases.timed("complete"):
-                    coordinator.complete(token, failed_record(spec, "internal"), claim["lease_s"])
-                return
-            with open(result) as file, phases.timed("complete"):
-                coordinator.complete(token, file.read(), claim["lease_s"])
-            print(f"{claim['theory']}: exit {process.returncode}", file=sys.stderr, flush=True)
+                coordinator.complete(token, failed_record(spec, "unavailable"), claim["lease_s"])
+            raise
+        except Exception:
+            # The coordinator retries the action now rather than when the lease expires.
+            with phases.timed("complete"):
+                coordinator.complete(token, failed_record(spec, "internal"), claim["lease_s"])
+            raise
+        if record is not None:
+            with phases.timed("complete"):
+                coordinator.complete(token, record, claim["lease_s"])
+
+
+def execute(
+    args: argparse.Namespace, releases: Releases, lease: Lease, claim: dict[str, Any], phases: Phases
+) -> str | None:
+    """The result record of the claimed action, or None once its lease is lost."""
+    spec = claim["spec_sha256"]
+    try:
+        with phases.timed("release"):
+            holbuild = releases.holbuild(releases.spec_version(spec))
+    except Unreleased as error:
+        print(f"refusing {spec}: {error}", file=sys.stderr)
+        return failed_record(spec, "spec-rejected")
+    if lease.lost.is_set():
+        return None
+    with tempfile.TemporaryDirectory() as scratch:
+        result = os.path.join(scratch, "result")
+        # Its own session, so a lost lease stops holbuild's HOL children with it.
+        cooperate_dir = None if args.cooperate_dir is None else os.path.realpath(args.cooperate_dir)
+        spans = ExecSpans()
+        stepped = time.monotonic()
+        process = subprocess.Popen(
+            exec_action_command(args, holbuild, spec, result), env=exec_action_env(), start_new_session=True
+        )
+        try:
+            while process.poll() is None:
+                if lease.lost.wait(1):
+                    return None
+                if cooperate_dir is not None:
+                    hol = runs_hol(process.pid, cooperate_dir)
+                    now = time.monotonic()
+                    spans.step(now - stepped, hol=hol)
+                    stepped = now
+        finally:
+            # A lost lease, Ctrl-C or SIGTERM (see main) stops the action rather than leaving it running
+            # unreported. The group outlives holbuild while a HOL child is still in it.
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
+            process.wait()
+            if cooperate_dir is None:
+                phases.add("exec", time.monotonic() - stepped)
+            else:
+                spans.step(time.monotonic() - stepped, hol=False)
+                phases.add("before_hol", spans.before_hol)
+                phases.add("hol", spans.hol)
+                phases.add("after_hol", spans.after_hol)
+        if not os.path.exists(result) or os.path.getsize(result) == 0:
+            raise RuntimeError(f"exec-action exited {process.returncode} without a result record")
+        with open(result) as file:
+            record = file.read()
+    print(f"{claim['theory']}: exit {process.returncode}", file=sys.stderr, flush=True)
+    return record
 
 
 def tier_list(text: str) -> list[str]:
@@ -740,9 +770,12 @@ def main() -> None:
             continue
         try:
             run_one(coordinator, args, releases, protection, claim, phases)
-        except (*COORDINATOR_ERRORS, subprocess.SubprocessError, tarfile.TarError) as error:
-            # The lease expires and the coordinator retries; a rerun finds a published result cached.
+        except Exception as error:  # noqa: BLE001  # run_one reported it where it could; the worker goes on
+            # Else the lease expires and the coordinator retries; a rerun finds a published result cached. Waiting
+            # keeps a worker from failing ready action after ready action while the cache or the coordinator is down.
             print(f"action failed in the worker: {error}", file=sys.stderr)
+            with phases.timed("idle"):
+                time.sleep(CLAIM_RETRY_SECONDS)
 
 
 if __name__ == "__main__":
