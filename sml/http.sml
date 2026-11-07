@@ -247,7 +247,9 @@ fun give connection =
   if with_pool_lock (fn () =>
        (idle := (connection, Time.now ()) :: !idle; not (!reaping) before reaping := true))
   then ignore (Thread.fork (reaper, []))
-       handle e => (with_pool_lock (fn () => reaping := false); raise e)
+       handle e =>
+         (List.app (close o #1) (with_pool_lock (fn () => (reaping := false; !idle before idle := [])));
+          raise e)
   else ()
 
 (* A connection whose request raised may be left mid-transfer, so it is

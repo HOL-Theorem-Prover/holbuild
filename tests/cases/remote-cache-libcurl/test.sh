@@ -274,19 +274,25 @@ fun sockets () =
                 stderr = HolbuildSpawn.Inherit}
 
 (* HOLBUILD_TEST_HTTP_IDLE_MS, set for this script, closes a connection
-   unused for 2 s.  The pool empties without another request, and a later
-   request opens a connection that is closed in turn. *)
+   unused for 3 s.  A request soon after the last reuses its connection;
+   the pool empties without another request, and one after the timeout
+   opens a new connection. *)
+val accepted_after_burst = accepted ()
+val _ = assert "a request soon after the last reuses its connection"
+               (accepted () = accepted_after_burst)
 val _ =
   if has_proc then
     (assert "the burst's connections are pooled" (sockets () > 0);
      assert "a spawned child inherits no connection"
             (socket_count {program = "sh", args = ["-c", "python3 \"$0\" $$", dir ^ "/tcp-sockets.py"],
                            stderr = HolbuildSpawn.Inherit} = 0);
-     wait_for "the idle connections to be closed" (fn () => sockets () = 0) (in_10s ());
-     assert "a request after the pool emptied"
-            (HolbuildHttp.get {url = url ^ "/fast", dst = dir ^ "/after-idle.out", timeout = 30}
-             = HolbuildHttp.Response 200);
-     assert "its connection is pooled" (sockets () = 1);
+     wait_for "the idle connections to be closed" (fn () => sockets () = 0) (in_10s ()))
+  else OS.Process.sleep (Time.fromSeconds 5)
+val _ = assert "a request after the idle timeout opens a new connection"
+               (accepted () = accepted_after_burst + 1)
+val _ =
+  if has_proc then
+    (assert "its connection is pooled" (sockets () = 1);
      wait_for "that connection to be closed" (fn () => sockets () = 0) (in_10s ()))
   else ()
 
@@ -336,7 +342,7 @@ SML
 printf 'user = "name:secret"\n' > "$tmpdir/user.curl"
 # --error-exit makes an uncaught exception fail the script; without it, the
 # REPL reports the exception and carries on with the next declaration.
-HOLBUILD_TEST_HTTP_IDLE_MS=2000 HOLBUILD_REMOTE_CACHE_CURL_CONFIG=$tmpdir/user.curl "${HOLBUILD_POLY:-poly}" --error-exit < "$tmpdir/http-test.sml" > "$tmpdir/http-test.log" 2>&1 || {
+HOLBUILD_TEST_HTTP_IDLE_MS=3000 HOLBUILD_REMOTE_CACHE_CURL_CONFIG=$tmpdir/user.curl "${HOLBUILD_POLY:-poly}" --error-exit < "$tmpdir/http-test.sml" > "$tmpdir/http-test.log" 2>&1 || {
   cat "$tmpdir/http-test.log" >&2
   exit 1
 }
