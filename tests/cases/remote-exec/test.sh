@@ -53,6 +53,8 @@ done
 coordinator="http://127.0.0.1:$(< "$state/port")"
 # Nothing listens here.
 unreachable="http://127.0.0.1:9"
+# Four quick retries rather than the production schedule's minutes.
+export HOLBUILD_TEST_RETRY_DELAYS=0,0,0,0
 
 project=$tmpdir/project
 mkdir -p "$project/src"
@@ -494,3 +496,12 @@ run cancelled 0 build --remote-exec "$coordinator" BTheory
 require_grep "batch b[0-9]* cancelled; remote workers finished 0 of 2 theories; building locally" "$tmpdir/cancelled.log"
 require_grep "BTheory built" "$tmpdir/cancelled.log"
 rm "$state/cancelled"
+
+# A submission the coordinator answers 5xx while it restarts is retried.
+write_theories restarting
+echo 2 > "$state/unavailable"
+run restarting-only 0 build --remote-exec "$coordinator" --remote-only BTheory
+[[ $(grep -c "coordinator refused the batch (HTTP 502): .*restarting.*; retrying" "$tmpdir/restarting-only.log") -eq 2 ]] ||
+  { cat "$tmpdir/restarting-only.log" >&2; exit 1; }
+require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/restarting-only.log"
+rm "$state/unavailable"

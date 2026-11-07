@@ -23,9 +23,18 @@ type progress = {built : int, total : int}
 
 val connect_timeout_seconds = 10
 val request_max_time_seconds = 60
-(* Waits before each reattach to an event stream that broke without
-   delivering an event, long enough to ride out a coordinator restart. *)
-val reattach_delays_seconds = [1, 2, 4, 8]
+(* Waits before each retry of a request the coordinator couldn't answer (a
+   submission it answered 5xx, an event stream that broke without delivering
+   an event): doubling up to 8 seconds, about two and a half minutes in all,
+   long enough to ride out a coordinator restart such as an image upgrade.
+   Tests shorten them with HOLBUILD_TEST_RETRY_DELAYS, comma-separated
+   seconds. *)
+fun retry_delays_seconds () =
+  case OS.Process.getEnv "HOLBUILD_TEST_RETRY_DELAYS" of
+      SOME text => List.mapPartial Int.fromString (String.tokens (fn c => c = #",") text)
+    | NONE => [1, 2, 4] @ List.tabulate (18, fn _ => 8)
+
+fun retry_after delay = OS.Process.sleep (Time.fromSeconds (Int.toLarge delay))
 
 fun curl_config_args () =
   case OS.Process.getEnv "HOLBUILD_REMOTE_EXEC_CURL_CONFIG" of
@@ -80,31 +89,48 @@ fun write_text path text =
   let val out = TextIO.openOut path
   in (TextIO.output (out, text); TextIO.closeOut out) handle e => (TextIO.closeOut out; raise e) end
 
-(* Submits a batch; Ok carries its id. *)
+(* Submits a batch; Ok carries its id.  A 5xx answer, as from a proxy while
+   the coordinator restarts, is retried after each of retry_delays_seconds;
+   an unreachable coordinator is refused at once. *)
 fun submit url batch_text : attempt =
   let
     val body = HolbuildTempPath.temporary "remote-exec-batch"
     val _ = write_text body batch_text
-    val result =
-      HolbuildSpawn.run
-        {program = "curl",
-         args = curl_args (endpoint url "/v1/batches")
-                  ["--max-time", Int.toString request_max_time_seconds, "-X", "POST",
-                   "-H", "Content-Type: text/plain", "--data-binary", "@" ^ body,
-                   "-w", "\n%{http_code}"],
-         stderr = HolbuildSpawn.Merge}
-    val _ = OS.FileSys.remove body handle OS.SysErr _ => ()
-    val (lines, status) = split_status (#output result)
-    val text = String.concatWith "\n" lines
+    fun post delays =
+      let
+        val result =
+          HolbuildSpawn.run
+            {program = "curl",
+             args = curl_args (endpoint url "/v1/batches")
+                      ["--max-time", Int.toString request_max_time_seconds, "-X", "POST",
+                       "-H", "Content-Type: text/plain", "--data-binary", "@" ^ body,
+                       "-w", "\n%{http_code}"],
+             stderr = HolbuildSpawn.Merge}
+        val (lines, status) = split_status (#output result)
+        val text = String.concatWith "\n" lines
+        val refusal = "coordinator refused the batch (HTTP " ^ Int.toString status ^ "): " ^ text
+      in
+        if status = 201 then
+          case json_string_field "batch_id" text of
+              SOME id => Ok id
+            | NONE => Refused ("coordinator answered without a batch_id: " ^ text)
+        else if status = 0 then
+          Refused ("could not reach the coordinator at " ^ HolbuildRemoteCache.redact_userinfo url ^
+                   (if text = "" then "" else ": " ^ text))
+        else if status >= 500 then
+          case delays of
+              [] => Refused refusal
+            | delay :: rest =>
+                (HolbuildStatus.message_stderr ("holbuild: " ^ refusal ^ "; retrying\n");
+                 retry_after delay;
+                 post rest)
+        else Refused refusal
+      end
+    val outcome = post (retry_delays_seconds ())
+                  handle e => (OS.FileSys.remove body handle OS.SysErr _ => (); raise e)
   in
-    if status = 201 then
-      case json_string_field "batch_id" text of
-          SOME id => Ok id
-        | NONE => Refused ("coordinator answered without a batch_id: " ^ text)
-    else if status = 0 then
-      Refused ("could not reach the coordinator at " ^ HolbuildRemoteCache.redact_userinfo url ^
-               (if text = "" then "" else ": " ^ text))
-    else Refused ("coordinator refused the batch (HTTP " ^ Int.toString status ^ "): " ^ text)
+    OS.FileSys.remove body handle OS.SysErr _ => ();
+    outcome
   end
 
 fun report_action line =
@@ -125,7 +151,7 @@ fun report_action line =
    action that becomes done.  A stream that breaks (the connection drops,
    or the coordinator answers 5xx while it restarts) is reattached: after a
    second when it delivered events, since a proxy may close an idle stream,
-   and after each of reattach_delays_seconds in a row when it delivered none.
+   and after each of retry_delays_seconds in a row when it delivered none.
    The coordinator ends a batch at its deadline, so this ends too. *)
 fun follow url batch_id (on_done : string -> unit) : outcome * progress =
   let
@@ -178,20 +204,20 @@ fun follow url batch_id (on_done : string -> unit) : outcome * progress =
           (if text = "" then "" else ": " ^ text)
         fun again delay delays =
           (HolbuildStatus.message_stderr ("holbuild: " ^ reason ^ "; reattaching\n");
-           OS.Process.sleep (Time.fromSeconds (Int.toLarge delay));
+           retry_after delay;
            attach delays)
       in
         case !outcome of
             SOME outcome => outcome
           | NONE =>
               if not broken then Unfollowable ("can't be followed (HTTP " ^ Int.toString status ^ "): " ^ text)
-              else if !received then again 1 reattach_delays_seconds
+              else if !received then again 1 (retry_delays_seconds ())
               else
                 case delays of
                     [] => Unreachable reason
                   | delay :: rest => again delay rest
       end
-    val outcome = attach reattach_delays_seconds
+    val outcome = attach (retry_delays_seconds ())
   in
     (outcome,
      {built = length (List.filter (fn (_, state) => state = "done") (!states)),

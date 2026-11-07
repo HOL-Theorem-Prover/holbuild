@@ -69,6 +69,7 @@ class Server:
     completed: list[str] = field(default_factory=list)
     protection: list[dict[str, object]] = field(default_factory=list)
     claims: list[dict[str, object]] = field(default_factory=list)
+    unavailable: int = 0  # how many more completes answer 502, as a proxy does while the coordinator restarts
 
 
 @pytest.fixture
@@ -101,6 +102,9 @@ def server() -> Iterator[Server]:
                 state.claims.append(json.loads(body))
                 return self.reply(204)
             if self.path.endswith("/complete"):
+                if state.unavailable > 0:
+                    state.unavailable -= 1
+                    return self.reply(502)
                 state.completed.append(body)
             self.reply(200, json.dumps({"accepted": True}) if self.path.endswith("/complete") else '{"lease_s": 3}')
 
@@ -294,6 +298,29 @@ def test_action_of_an_unreleased_holbuild_is_rejected(tmp_path: Path, server: Se
 
     assert server.completed == [failed_record(SPEC, "spec-rejected")]
     assert not logs[1].exists()
+
+
+def test_a_result_is_reported_again_while_the_coordinator_restarts(
+    server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(worker, "COMPLETE_RETRY_DELAYS", (0.01,))
+    server.unavailable = 3
+
+    Coordinator(server.url, "w").complete("t1", RECORD, 3)
+
+    assert server.completed == [RECORD]
+    assert server.unavailable == 0
+
+
+def test_a_result_is_given_up_on_when_the_lease_would_run_out(server: Server, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(worker, "COMPLETE_RETRY_DELAYS", (0.01,))
+    server.unavailable = 1000
+
+    with pytest.raises(RuntimeError, match="complete answered 502"):
+        Coordinator(server.url, "w").complete("t1", RECORD, 0.2)
+
+    assert server.completed == []
+    assert server.unavailable > 900
 
 
 def test_ecs_task_protection_is_set_and_cleared(server: Server) -> None:
