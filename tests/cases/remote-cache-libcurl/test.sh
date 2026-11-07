@@ -279,8 +279,8 @@ val _ =
   if has_proc then
     (HolbuildHttp.close_idle ();
      assert "close_idle closes the pooled connections" (sockets () = 0);
-     (* A background pool keeps its connections for the next requests when
-        drained, and closes them when stopped. *)
+     (* A background pool keeps up to 4 connections for the next requests
+        when drained, and closes them when stopped. *)
      let
        val {add, drain, stop} =
          HolbuildBuildExec.start_background_pool 4
@@ -308,7 +308,7 @@ val _ =
     List.app add (List.tabulate (32, fn i => i)); drain ()
   end
 val _ = assert ("a pool of 8 threads reserved at most " ^ Int.toString (!most_reserved))
-               (!most_reserved >= 1 andalso !most_reserved <= 8)
+               (!most_reserved >= 2 andalso !most_reserved <= 8)
 val _ = assert "a drained pool holds no reservations" (!HolbuildHttp.reserved = 0)
 
 (* A transfer waiting on a response must not hold up another thread's GC.

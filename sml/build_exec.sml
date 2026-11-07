@@ -5327,7 +5327,8 @@ fun prefetch_key (options : build_options) project keys node =
    reports.  Once stop has waited, the remote cache connections the threads
    left idle are closed: the server closes an idle connection after a
    while, and one no later request reuses would stay half-closed until the
-   process exits.  drain keeps them for the next pool's requests. *)
+   process exits.  drain keeps the pool's share of them, up to
+   HolbuildHttp.max_idle, for the next requests. *)
 fun start_background_pool limit work =
   let
     val front = ref [] and back = ref []
@@ -6050,8 +6051,8 @@ fun export_batch (options : build_options) tc project plan toolchain_key jobs {u
     String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n"
   end
 
-(* The check and upload pools leave their connections idle for each other;
-   none is reused after the export, so they are closed. *)
+(* The check pool leaves up to HolbuildHttp.max_idle connections idle for the
+   uploads; none is reused after the export, so they are closed. *)
 fun export_action_specs options tc project plan toolchain_key jobs flags =
   (export_batch options tc project plan toolchain_key jobs flags before HolbuildHttp.close_idle ())
   handle e => (HolbuildHttp.close_idle (); raise e)
