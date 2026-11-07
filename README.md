@@ -489,11 +489,13 @@ currently requires `inotifywait` from `inotify-tools` and does not support
 `--json`, `--dry-run`, or `--repl-on-failure`.
 
 `holbuild check MyTheory` builds the theory if needed, loads it in HOL and
-checks the tags of its stored theorems. It prints one line per
+checks the tags and hypotheses of its stored theorems. It prints one line per
 theorem whose tag carries an oracle other than `DISK_THM` (for instance
 `MyTheory.my_theorem: cheat`) and one per axiom declared in the theory or its
 ancestors outside HOL itself, that is, in the root package or a dependency
-package (`DepTheory.my_axiom: axiom`). Theorems loaded from disk do not record
+package (`DepTheory.my_axiom: axiom`). Each stored theorem with undischarged
+hypotheses is also a finding (`MyTheory.my_theorem: undischarged hypotheses`),
+even when it has no oracle tag. Theorems loaded from disk do not record
 which axioms they use, so every such axiom in the ancestry is reported. It also
 scans the sources the theory is built from outside HOL (theory scripts and the
 SML libraries they load) for calls that can forge a theorem or change the
