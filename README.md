@@ -1487,16 +1487,20 @@ checks that the remote cache then holds an entry for it whose outputs equal
 the build's. An entry there with other outputs is replaced only when it records parents other than the restored
 ones, each restored from an entry with the remote cache's outputs, since no
 build against them can use it. The worker's local copy of an entry goes out
-of date when the remote cache's entry changes, so when a restored dependency
-doesn't match its parents, or the theory was built against local copies of
-its parents that differ from the remote cache's, the worker drops those
-copies, for the action's retry to restore the remote cache's; such a build
-is not published but fails as a `publish` failure. A missing dependency
-fails the action; the worker never builds one. When the remote cache gives
-no answer, answers 429 or 5xx, or is in its 60-second cooldown after
-requests got no response, whatever the worker was fetching or publishing,
-the action fails as `unavailable` rather than reading that as a miss or a
-conflict: the cache failed, not the action.
+of date when the remote cache's entry changes. So before it checks for the
+theory's own entry, the worker replaces its copies that differ from the
+remote cache's entries with those: the copies of the theories the build
+loads directly or through project libraries, and, when a restored
+dependency doesn't match its parents, all of them. It does the same for the
+theory's own entry when that doesn't match the restored parents. A theory
+still built against local copies of its parents that differ from the remote
+cache's (an entry replaced during the build) is not published but fails as a
+`publish` failure, and the worker drops those copies for the action's retry.
+A missing dependency fails the action; the worker never builds one. When the
+remote cache gives no answer, answers 429 or 5xx, or is in its 60-second
+cooldown after requests got no response, whatever the worker was fetching or
+publishing, the action fails as `unavailable` rather than reading that as a
+miss or a conflict: the cache failed, not the action.
 
 A run spec (`holbuild-run-spec-v1`, see "Exporting script runs for remote
 execution") is checked the same way, its run text against its `run-key`,

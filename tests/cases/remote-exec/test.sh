@@ -907,9 +907,8 @@ worker_n() {
     > "$tmpdir/$1-worker.log" 2>&1 || { cat "$tmpdir/$1-worker.log" >&2; exit 1; }
 }
 
-# The remote's MTheory doesn't fit the worker's NTheory: the worker drops its
-# copy, so that the next attempt (here the resubmission) restores the
-# remote's.
+# The remote's MTheory doesn't fit the worker's NTheory: the worker replaces
+# its copy by the remote's and builds PTheory in the first batch.
 copy_nondet stale-dep rxnw
 worker_n stale-dep
 copy_nondet stale-dep-remote rxnw
@@ -918,12 +917,13 @@ in_copy stale-dep-remote --remote-cache "$remote_url" build MTheory > "$tmpdir/s
 copy_nondet stale-dep-client rxnw
 in_copy stale-dep-client --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only PTheory \
   > "$tmpdir/stale-dep.log" 2>&1 || { cat "$tmpdir/stale-dep.log" "$tmpdir/worker.log" >&2; exit 1; }
-require_grep "resubmitting with 2 theories rebuilt or rechecked" "$tmpdir/stale-dep.log"
-require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/stale-dep.log"
+refute_grep "resubmitting" "$tmpdir/stale-dep.log"
+require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/stale-dep.log"
 require_grep "PTheory restored from cache" "$tmpdir/stale-dep.log"
 
-# The worker builds MTheory against its own NTheory: the build isn't
-# published, and the next build's worker restores the remote's NTheory.
+# The worker's NTheory fits MTheory's other parents but differs from the
+# remote's: the worker replaces it by the remote's before building MTheory on
+# it, so the build is published and the batch finishes the first time.
 copy_nondet stale-build rxnv
 worker_n stale-build
 copy_nondet stale-build-remote rxnv
@@ -933,18 +933,12 @@ m_ac=$(in_copy stale-build-remote --remote-cache "$remote_url" action-spec PTheo
   awk '$1 == "action" && $5 == "rxnv:MTheory" { print $3 }')
 [[ -n $m_ac ]] || { echo "no action for MTheory" >&2; exit 1; }
 copy_nondet stale-build-client rxnv
-set +e
 in_copy stale-build-client --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only PTheory \
-  > "$tmpdir/stale-build-client.log" 2>&1
-status=$?
-set -e
-[[ $status -eq 75 ]] || { echo "stale-build-client exited $status, wanted 75" >&2; cat "$tmpdir/stale-build-client.log" >&2; exit 1; }
-require_grep "built against out-of-date local copies of its parents" "$tmpdir/worker.log"
-[[ ! -e $remote_root/ac/$m_ac ]] || { echo "MTheory built on a stale parent reached the remote" >&2; exit 1; }
-in_copy stale-build-client --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only PTheory \
-  > "$tmpdir/stale-build-again.log" 2>&1 || { cat "$tmpdir/stale-build-again.log" "$tmpdir/worker.log" >&2; exit 1; }
-require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/stale-build-again.log"
-require_grep "PTheory restored from cache" "$tmpdir/stale-build-again.log"
+  > "$tmpdir/stale-build-client.log" 2>&1 || { cat "$tmpdir/stale-build-client.log" "$tmpdir/worker.log" >&2; exit 1; }
+refute_grep "resubmitting" "$tmpdir/stale-build-client.log"
+require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/stale-build-client.log"
+require_grep "PTheory restored from cache" "$tmpdir/stale-build-client.log"
+require_file "$remote_root/ac/$m_ac"
 
 # The client cap must reach the HOL child, before Poly/ML consumes --maxheap.
 copy_nondet heap-cap rxheap
