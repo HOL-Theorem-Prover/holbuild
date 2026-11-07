@@ -75,6 +75,7 @@ class Server:
     claims: list[dict[str, object]] = field(default_factory=list)
     heartbeats: list[dict[str, object]] = field(default_factory=list)
     unavailable: int = 0  # how many more completes answer 502, as a proxy does while the coordinator restarts
+    cut_short: bool = False  # whether /cas/ answers close the connection before the body they announce is sent
 
 
 @pytest.fixture
@@ -92,6 +93,13 @@ def server() -> Iterator[Server]:
             self.wfile.write(body.encode())
 
         def do_GET(self) -> None:
+            if state.cut_short:
+                self.send_response(200)
+                self.send_header("Content-Length", "1000")
+                self.end_headers()
+                self.wfile.write(b"holbuild-action-spec-v1\n")
+                self.close_connection = True
+                return
             spec = state.specs.get(self.path.removeprefix("/cas/"))
             self.reply(404) if spec is None else self.reply(200, spec)
 
@@ -306,6 +314,22 @@ def test_action_whose_spec_an_unreachable_cache_does_not_give_is_reported_unavai
 
     assert server.completed == [failed_record(SPEC, "unavailable")]
     assert not logs[1].exists()
+
+
+def test_action_whose_spec_transfer_is_cut_short_is_reported_unavailable(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path]
+) -> None:
+    server.cut_short = True
+    with pytest.raises(CacheUnavailable, match="fetching spec"):
+        run_one(
+            Coordinator(server.url, "w"),
+            worker_args(tmp_path, server),
+            releases(tmp_path, server),
+            Protection(None, None),
+            claim(),
+        )
+
+    assert server.completed == [failed_record(SPEC, "unavailable")]
 
 
 def test_action_whose_spec_the_cache_lost_is_reported_for_a_counted_retry(

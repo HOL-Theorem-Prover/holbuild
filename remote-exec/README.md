@@ -183,8 +183,9 @@ finally (`failed`, with a `failure` message), or the client cancels it
   | `unavailable` | retried without counting the claim |
   | `proof`, `tactic-timeout`, `spec-rejected` | final |
 
-  A worker that gets no answer from the cache for the action's spec, or 429
-  or 5xx, as while the cache restarts, reports `unavailable`. Any other error
+  A worker that gets no answer from the cache for the action's spec, 429,
+  5xx or a transfer cut short, as while the cache restarts, reports
+  `unavailable`. Any other error
   in the worker (`exec-action` ended without a result record because it
   crashed or was killed, the release didn't build, the cache doesn't have the
   spec) is reported as `internal`, so the action is retried at once rather

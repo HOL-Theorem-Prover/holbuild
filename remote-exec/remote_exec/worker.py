@@ -65,7 +65,7 @@ class Unreleased(Exception):
 
 
 class CacheUnavailable(RuntimeError):
-    """The remote cache couldn't be reached or answered 429 or 5xx, as while it restarts."""
+    """The remote cache gave no answer, 429, 5xx or a transfer cut short, as while it restarts."""
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -198,12 +198,11 @@ class Releases:
         spec, _, status = fetched.stdout.rpartition("\n")
         if fetched.returncode != 0:
             failure = f"fetching spec {spec_sha256} from the remote cache failed: {fetched.stderr.strip()}"
-            # Anything else, such as 404 for a spec the cache lost, won't come right by asking again.
-            raise (
-                CacheUnavailable(failure)
-                if status in ("000", "429") or status.startswith("5")
-                else RuntimeError(failure)
-            )
+            # Only an answer of 4xx, such as 404 for a spec the cache lost, won't come right by asking again; no
+            # answer, 429, 5xx or a transfer cut short may well.
+            if fetched.returncode == 22 and status.startswith("4") and status != "429":
+                raise RuntimeError(failure)
+            raise CacheUnavailable(failure)
         versions = [
             line.removeprefix("holbuild-version=") for line in spec.splitlines() if line.startswith("holbuild-version=")
         ]
@@ -424,7 +423,7 @@ class HostTelemetry:
 def failed_record(spec_sha256: str, failure: str) -> str:
     """A result record the worker writes itself: ``spec-rejected`` for an action it won't run, which fails it
     finally like exec-action's own; ``unavailable`` for one whose spec the cache couldn't give (no answer, 429 or
-    5xx), which is retried without counting the attempt; or ``internal`` for any other error in the worker, such as
+    5xx, or cut it short), which is retried without counting the attempt; or ``internal`` for any other error in the worker, such as
     exec-action ending without a record, which is retried."""
     return f"holbuild-action-result-v1\nspec={spec_sha256}\ninput-key=\nstatus=failed\nfailure={failure}\n"
 
