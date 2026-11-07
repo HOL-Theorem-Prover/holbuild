@@ -12,7 +12,15 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from conftest import CLIENT_TOKEN, WORKER_TOKEN
 from remote_exec import app as app_module
 from remote_exec import coordinator as coordinator_module
-from remote_exec.coordinator import Coordinator, HostReport, QueueCounts, Settings, burst_demand, is_auth_failure
+from remote_exec.coordinator import (
+    Coordinator,
+    HostReport,
+    QueueCounts,
+    ScaleRun,
+    Settings,
+    burst_demand,
+    is_auth_failure,
+)
 from test_coordinator import claim, input_key, submit
 
 CLIENT = {"Authorization": f"Bearer {CLIENT_TOKEN}"}
@@ -131,8 +139,13 @@ async def test_queue_reports_counts_and_the_desired_burst_workers(
         "desired_burst_workers": 0,  # the route's coordinator has no burst workers to ask for
         "hosts": [],
         "phases": None,  # see test_queue_sums_the_phases_workers_reported_in_the_last_ten_minutes
+        "scaler": None,  # nor a scale command
     }
     assert (await scaled.queue()).desired_burst_workers == 4
+
+    coordinator.scaler = ScaleRun(4, datetime(2026, 1, 1, 12, tzinfo=UTC), "scale 4 exited 1")
+    response = await http.get("/v1/queue", headers=CLIENT)
+    assert response.json()["scaler"] == {"workers": 4, "at": "2026-01-01T12:00:00+00:00", "error": "scale 4 exited 1"}
     assert (await http.get("/v1/queue", headers=WORKER)).status_code == 401
 
 
@@ -140,6 +153,8 @@ async def test_failing_scale_command_neither_stops_the_sweep_nor_counts_as_appli
     http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: AsyncEngine, tmp_path: Path
 ) -> None:
     scaled, calls = scaled_coordinator(coordinator, tmp_path, "exit 1")
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    scaled.clock = lambda: now
     await submit(http, ["a"])
     assert await claim(http) is not None
     async with remote_exec_engine.begin() as connection:
@@ -150,6 +165,15 @@ async def test_failing_scale_command_neither_stops_the_sweep_nor_counts_as_appli
 
     assert await claim(http) is not None  # the sweep expired the lease despite the failing command
     assert calls.read_text().split() == ["0", "0"]  # retried, since it never succeeded
+    assert (await scaled.queue()).scaler == ScaleRun(0, now, f"{tmp_path / 'scale'} 0 exited 1")
+
+    scaled_coordinator(coordinator, tmp_path, "")  # the command works again
+    now += timedelta(seconds=10)
+    await scaled.sweep()
+    await scaled.sweep()
+
+    assert calls.read_text().split() == ["0", "0", "0"]  # once it succeeded, not again for the same target
+    assert (await scaled.queue()).scaler == ScaleRun(0, now, None)
 
 
 async def test_also_claim_takes_the_other_tier_only_when_its_own_has_nothing(

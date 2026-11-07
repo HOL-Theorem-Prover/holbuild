@@ -171,6 +171,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             "desired_burst_workers": status.desired_burst_workers,
             "hosts": [{**asdict(host.report), "age_s": host.age_s} for host in status.hosts],
             "phases": asdict(status.phases),
+            "scaler": None if status.scaler is None else {**asdict(status.scaler), "at": status.scaler.at.isoformat()},
         }
 
     @app.post("/v1/work/claim", dependencies=worker, response_model=None)

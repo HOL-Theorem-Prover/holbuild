@@ -286,7 +286,8 @@ database, so a restarted coordinator keeps holding the target.
 `GET /v1/queue` reports the counts and the target. With `REMOTE_EXEC_SCALE_CMD`
 set, the coordinator also runs `<command> <target>` after a start and whenever
 the target changes; a command that fails or runs over 60 seconds is logged
-and run again on the next sweep, and never stops the sweep's other work. With
+and run again on the next sweep, and never stops the sweep's other work.
+`GET /v1/queue`'s `scaler` shows the command's last run in that process. With
 several coordinator replicas, give the command to one of them.
 
 ## Workers
@@ -386,11 +387,17 @@ An unknown class returns 422.
 
 `GET /v1/queue`
 
-- 200 `{"waiting": 0, "ready_standard": 0, "ready_high": 0, "running_standard": 0, "running_high": 0, "ready_run": 0, "running_run": 0, "desired_burst_workers": 0, "hosts": [<host>, …], "phases": <phases>}`:
+- 200 `{"waiting": 0, "ready_standard": 0, "ready_high": 0, "running_standard": 0, "running_high": 0, "ready_run": 0, "running_run": 0, "desired_burst_workers": 0, "hosts": [<host>, …], "phases": <phases>, "scaler": <scaler>}`:
   the unfinished actions of running batches, the burst worker target, the
   hosts whose workers reported to this coordinator process in the last 2
-  minutes, by id, and the sums of the phase reports it got in the last 10
-  minutes (see "Running"):
+  minutes, by id, the sums of the phase reports it got in the last 10
+  minutes (see "Running"), and the last run of `REMOTE_EXEC_SCALE_CMD` in
+  this process (`null` before its first), with the burst worker target it
+  got and its error (`null` when it exited 0):
+  ```json
+  {"workers": 8, "at": "2026-01-01T12:00:00+00:00", "error": "scale 8 exited 1"}
+  ```
+  The phases:
   ```json
   {"window_s": 600, "reports": 4210, "seconds": {"memory_wait": 0.0, "claim": 812.4, "idle": 0.0, "lease": 12.5, "release": 31.0, "before_hol": 40210.7, "hol": 52300.2, "after_hol": 44102.9, "exec": 0.0, "complete": 950.3}}
   ```
