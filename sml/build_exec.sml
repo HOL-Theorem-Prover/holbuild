@@ -4373,7 +4373,8 @@ fun source_spans_for_action policy (action : theory_action) source_text =
      termination_diagnostics = []}
 
 fun declaration_checkpoints_for_action policy checkpoint_root (action : theory_action) source_text terminations =
-  if not (checkpoint_enabled policy) orelse not (proof_steps_enabled policy) then []
+  if not (checkpoint_enabled policy) orelse not (theorem_checkpoints_enabled policy) orelse
+     not (proof_steps_enabled policy) then []
   else
     declaration_checkpoint_specs (proof_engine policy) (tactic_timeout policy)
       (action_checkpoint_base checkpoint_root action) (#deps_key action)
@@ -6129,17 +6130,30 @@ fun uncached_parents plan uncached node =
     rev parents
   end
 
-fun publish_spec_blob remote path =
-  let val hash = HolbuildHash.file_sha256 path
-  in
-    if HolbuildRemoteCache.blob_confirmed_present remote hash then ()
-    else
-      case HolbuildRemoteCache.publish_blob remote {hash = hash, src = path} of
-          HolbuildCacheBackend.Published => ()
-        | HolbuildCacheBackend.AlreadyPresent => ()
-        | HolbuildCacheBackend.Conflict message => raise Error ("could not upload " ^ path ^ ": " ^ message)
-        | HolbuildCacheBackend.Skipped => raise Error ("could not upload " ^ path ^ ": skipped")
-  end
+fun publish_spec_blob remote {hash, path} =
+  if HolbuildRemoteCache.blob_confirmed_present remote hash then ()
+  else
+    case HolbuildRemoteCache.publish_hashed_blob remote {hash = hash, src = path} of
+        HolbuildCacheBackend.Published => ()
+      | HolbuildCacheBackend.AlreadyPresent => ()
+      | HolbuildCacheBackend.Conflict message => raise Error ("could not upload " ^ path ^ ": " ^ message)
+      | HolbuildCacheBackend.Skipped => raise Error ("could not upload " ^ path ^ ": skipped")
+
+(* The remote ledger: what an earlier export from this project found the
+   remote cache at a URL to hold, one "theory <input key>" or "blob <sha256>"
+   per line, so that the next export doesn't ask again.  The remote cache can
+   lose either; a worker that finds one missing fails its batch, and the
+   build then forgets the ledger (forget_remote_ledger) and resubmits. *)
+fun remote_ledger_dir project = Path.concat(project_artifact_root project, ".holbuild/remote-ledger")
+
+fun remote_ledger_path project remote =
+  Path.concat(remote_ledger_dir project, HolbuildHash.string_sha256 (HolbuildRemoteCache.base_url remote))
+
+fun read_remote_ledger path =
+  Binaryset.addList (Binaryset.empty String.compare, String.tokens (fn c => c = #"\n") (read_text path))
+  handle IO.Io _ => Binaryset.empty String.compare
+
+fun forget_remote_ledger project = remove_tree (remote_ledger_dir project)
 
 (* The input keys of the plan's theories whose input key is missing or that
    depend on that theory. *)
@@ -6231,8 +6245,9 @@ fun failing_on_pool remote jobs doing items_name pred items =
 (* Uploads FILES to the remote cache's CAS, those it lacks, on the prefetch
    pool.  Specs share their sources, so each file goes up once.  After the
    first failure the uploads not yet started are skipped, for the caller to
-   fall back at once. *)
-fun upload_spec_files remote jobs files =
+   fall back at once.  A file whose (path, sha256) known holds is taken as
+   present; learn is told each sha256 uploaded or found present. *)
+fun upload_spec_files remote jobs {known, learn} files =
   let
     val upload_failed = ref false
     val failure_mutex = Mutex.mutex ()
@@ -6241,7 +6256,12 @@ fun upload_spec_files remote jobs files =
       handle e => (Mutex.unlock failure_mutex; raise e)
     fun uploaded remote path =
       with_failure_lock (fn () => !upload_failed) orelse
-      (publish_spec_blob remote path; true)
+      (let val hash = HolbuildHash.file_sha256 path
+       in
+         if known (path, hash) then ()
+         else (publish_spec_blob remote {hash = hash, path = path}; learn hash)
+       end;
+       true)
       handle e => (with_failure_lock (fn () => upload_failed := true); raise e)
     val files = unique_strings files
   in
@@ -6256,7 +6276,7 @@ fun upload_spec_files remote jobs files =
    With local_resumable, a theory built here for its current input key, and
    not forced, stays out unchecked, unless a theory in the batch depends on
    it and it can't be published from the local cache. *)
-fun export_action_specs (options : build_options) tc project plan toolchain_key jobs {upload, local_resumable, forced} =
+fun export_action_specs (options : build_options) tc project plan toolchain_key jobs {upload, local_resumable, forced, ledger} =
   let
     val _ = if upload then HolbuildOffline.require_online "upload action specs" else ()
     val remote =
@@ -6269,6 +6289,18 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       else if not (#use_cache options) then
         raise Error "action-spec: a remote action's result is its cache entry, so --no-cache can't apply"
       else ()
+    val ledger_path = remote_ledger_path project remote
+    val ledger_known =
+      if ledger then read_remote_ledger ledger_path else Binaryset.empty String.compare
+    val learned = ref ledger_known
+    val ledger_mutex = Mutex.mutex ()
+    fun known item = Binaryset.member (ledger_known, item)
+    fun learn item =
+      if not ledger then ()
+      else
+        (Mutex.lock ledger_mutex;
+         (learned := Binaryset.add (!learned, item); Mutex.unlock ledger_mutex)
+         handle e => (Mutex.unlock ledger_mutex; raise e))
     val root = project_artifact_root project
     val config_lines = build_config_lines_for_node options project
     val action_toolchain_key = HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)
@@ -6319,7 +6351,12 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
                      Binaryset.addList (set, map HolbuildBuildPlan.key (HolbuildBuildPlan.transitive_project_deps plan node)))
                  (Binaryset.empty String.compare) uncached_actions
     fun available remote (node, action) =
-      remote_available remote options project plan node (#input_key action) upload
+      let val key = #input_key action
+      in
+        known ("theory " ^ key) orelse
+        (remote_available remote options project plan node key upload andalso
+         (learn ("theory " ^ key); true))
+      end
     val unavailable =
       failing "checking remote cache" "theories" available
         (List.filter (fn (node, _) => Binaryset.member (batch_deps, HolbuildBuildPlan.key node)) here_actions)
@@ -6353,8 +6390,23 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       end
     val exported = map export uncached_actions
     val action_lines = List.concat (map #lines exported)
+    (* A worker rejects a spec it can't fetch rather than reporting it
+       missing, so a spec the ledger hid would never be uploaded again: specs
+       skip the ledger. *)
+    fun is_spec path = String.isPrefix (spec_dir ^ "/") path
     val _ =
-      if upload then upload_spec_files remote jobs (List.concat (map #files exported)) else ()
+      if upload then
+        upload_spec_files remote jobs
+          {known = fn (path, hash) => not (is_spec path) andalso known ("blob " ^ hash),
+           learn = fn hash => learn ("blob " ^ hash)}
+          (List.concat (map #files exported))
+      else ()
+    val _ =
+      if not ledger orelse Binaryset.numItems (!learned) = Binaryset.numItems ledger_known then ()
+      else
+        (ensure_parent ledger_path;
+         write_text_atomic ledger_path
+           (String.concat (map (fn line => line ^ "\n") (Binaryset.listItems (!learned)))))
   in
     String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n"
   end
@@ -6748,7 +6800,8 @@ fun plan_runs tc project planned jobs
         val _ =
           List.app (fn {run, theories, ...} => refuse run (valOf (List.find is_unavailable theories))) refused
         val written = map (fn {run, write, ...} => (run, write ())) ready
-        val _ = upload_spec_files remote jobs (List.concat (map (#files o #2) written))
+        val _ = upload_spec_files remote jobs {known = fn _ => false, learn = fn _ => ()}
+                    (List.concat (map (#files o #2) written))
       in
         {exported = map (fn (run, {spec_sha256, ...}) => (run, spec_sha256)) written,
          refused = map #run refused}
@@ -7122,8 +7175,11 @@ fun spec_theory_action root (spec : action_spec) deps_key : theory_action =
      extra_outputs = #extra_outputs spec}
   end
 
-fun spec_policy (spec : action_spec) =
-  CheckpointPolicy {checkpoint = true,
+(* With shared heaps a theory without theorem checkpoints saves no
+   deps-loaded heap either: nothing would share it, and the run's checkpoint
+   tree is emptied after it. *)
+fun spec_policy share_heaps (spec : action_spec) =
+  CheckpointPolicy {checkpoint = not share_heaps orelse #theorem_checkpoints spec,
                     theorem_checkpoints = #theorem_checkpoints spec,
                     proof_steps = #proof_steps spec,
                     new_ir = #new_ir spec,
@@ -7147,12 +7203,27 @@ fun classify_failure failure msg =
 
 fun action_failed failure msg = ActionFailed (classify_failure failure msg)
 
+(* A worker keeps the spec's sources and libraries in its local blob store,
+   so it fetches each once rather than once per action.  One no cache entry
+   names is evicted on its own when least recently used
+   (local_cache_families). *)
 fun fetch_spec_blob remote {hash, dst} =
-  (ensure_parent dst;
-   case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = hash, dst = dst} of
-       HolbuildCacheBackend.Hit => ()
-     | HolbuildCacheBackend.Miss => raise ActionFailed (InputMissing ("blob " ^ hash), "blob " ^ hash ^ " is not in the cache")
-     | HolbuildCacheBackend.Corrupt msg => raise action_failed InternalFailure ("cannot fetch blob " ^ hash ^ ": " ^ msg))
+  let
+    val cache = cache_root ()
+    fun fetch_remote () =
+      case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = hash, dst = dst} of
+          HolbuildCacheBackend.Hit =>
+            (case HolbuildCache.publish_blob cache {hash = hash, src = dst} of
+                 HolbuildCacheBackend.Conflict msg => warn ("could not keep blob " ^ hash ^ ": " ^ msg)
+               | _ => ())
+        | HolbuildCacheBackend.Miss => raise ActionFailed (InputMissing ("blob " ^ hash), "blob " ^ hash ^ " is not in the cache")
+        | HolbuildCacheBackend.Corrupt msg => raise action_failed InternalFailure ("cannot fetch blob " ^ hash ^ ": " ^ msg)
+  in
+    ensure_parent dst;
+    case HolbuildCache.fetch_blob cache {hash = hash, dst = dst} of
+        HolbuildCacheBackend.Hit => HolbuildCache.touch (HolbuildCache.blob_path cache hash)
+      | _ => fetch_remote ()
+  end
 
 (* Restores a theory the action depends on, or the action's own entry, into
    the action root, writing its load manifests with the spec's stems. *)
@@ -7201,8 +7272,9 @@ fun drop_stale_dep_copies remote (spec : spec_deps) wanted =
 fun dat_records_parent path = records_parent (parse_dat_parent_hashes (read_text path))
 
 (* Each restored theory's .dat records the hashes of its parents' .dat
-   files; every parent the spec places must match. *)
-fun spec_parent_hashes_match root (spec : spec_deps) data_path =
+   files; every parent the spec places must match.  dat_hashes memoizes the
+   parents' hashes across the checks of one set of restored files. *)
+fun spec_parent_hashes_match_in dat_hashes root (spec : spec_deps) data_path =
   let
     val recorded = parse_dat_parent_hashes (read_text data_path)
   in
@@ -7210,9 +7282,12 @@ fun spec_parent_hashes_match root (spec : spec_deps) data_path =
       (fn {target, stem, ...} =>
           case Binarymap.peek (recorded, theory_name_from_logical (#2 (target_name target))) of
               NONE => true
-            | SOME hash => (hol_dat_hash (in_root root (stem ^ ".dat")) = hash handle _ => false))
+            | SOME hash => cached_file_hash dat_hashes (in_root root (stem ^ ".dat")) = SOME hash)
       (#deps spec)
   end
+
+fun spec_parent_hashes_match root spec data_path =
+  spec_parent_hashes_match_in (new_file_hash_cache ()) root spec data_path
 
 (* Step 3: sources and library manifests from the spec, dependency theories
    from the cache. *)
@@ -7224,6 +7299,7 @@ fun hydrate_spec_deps remote root (spec : spec_deps) =
     fun write_lib {stem, suffix, loads, ...} =
       (ensure_parent (in_root root stem);
        write_object_manifest (in_root root (stem ^ suffix)) (map lib_load loads))
+    val dat_hashes = new_file_hash_cache ()
     fun restore_dep {target, stem, key} =
       (ensure_parent (in_root root stem);
        restore_spec_theory root spec
@@ -7238,7 +7314,7 @@ fun hydrate_spec_deps remote root (spec : spec_deps) =
     List.app restore_dep (#deps spec);
     List.app
       (fn {target, stem, key} =>
-          if spec_parent_hashes_match root spec (in_root root (stem ^ ".dat")) then ()
+          if spec_parent_hashes_match_in dat_hashes root spec (in_root root (stem ^ ".dat")) then ()
           else
             (* Out-of-date local copies would fail the next attempt too. *)
             (ignore (drop_stale_dep_copies remote spec (fn _ => true));
@@ -7482,12 +7558,14 @@ fun local_cache_families cache =
            if path_exists dir then NONE
            else SOME (freed + remove_paths (List.concat (map release (Redblackset.listItems blobs))))
          end}
+    (* A blob no entry names, such as a spec's source, goes when it was
+       last used. *)
+    fun orphan_family path = {mtime = modified_time path, evict = fn () => SOME (remove_paths [path])}
     val orphans =
       List.filter (fn path => not (Option.isSome (Redblackmap.peek (!users, Path.file path))))
                   (HolbuildCache.children blobs_dir)
   in
-    {mtime = Time.zeroTime, evict = fn () => SOME (remove_paths orphans)} ::
-    List.map entry_family entries
+    List.map orphan_family orphans @ List.map entry_family entries
   end
 
 fun store_cache_families cache =
@@ -7587,7 +7665,10 @@ fun with_action_root_lock cache f =
     handle e => (HolbuildFileLock.release lock; raise e)
   end
 
-fun result_text (spec_sha256, input_key) {status, failure, wall_ms, peak, log} =
+fun phases_text sep unit phases =
+  String.concatWith sep (map (fn (name, ms) => name ^ unit ^ LargeInt.toString ms) phases)
+
+fun result_text (spec_sha256, input_key) {status, failure, wall_ms, phases, peak, log} =
   String.concatWith "\n"
     ([action_result_header,
       "spec=" ^ spec_sha256,
@@ -7600,6 +7681,7 @@ fun result_text (spec_sha256, input_key) {status, failure, wall_ms, peak, log} =
             (case kind of InputMissing missing => ["missing=" ^ missing] | _ => [])) @
      (case peak of SOME mb => ["peak-rss-mb=" ^ Int.toString mb] | NONE => []) @
      ["wall-ms=" ^ LargeInt.toString wall_ms] @
+     (if null phases then [] else ["phase-ms=" ^ phases_text "," ":" phases]) @
      (case log of SOME (sha, bytes) => ["log=" ^ sha ^ " " ^ bytes] | NONE => [])) ^ "\n"
 
 fun exception_failure e =
@@ -7717,6 +7799,7 @@ fun shared_candidates policy base {theorem_checkpoints, declaration_checkpoints,
     fun insert c [] = [c]
       | insert c (d :: ds) = if before_ c d then c :: d :: ds else d :: insert c ds
   in
+    if not (theorem_checkpoints_enabled policy) then [] else
     List.foldl (fn (c, sorted) => insert c sorted) []
       ((if proof_steps_enabled policy then map failed theorem_checkpoints else []) @
        map theorem theorem_checkpoints @ map declaration declaration_checkpoints)
@@ -7809,7 +7892,9 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
           [] => true
         | [last] => saved_parent last = SOME deps_loaded
         | p :: (rest as q :: _) => saved_parent p = SOME q andalso chain_ok rest
-    fun try_candidate (c : shared_candidate) =
+    (* A checkpoint is chained to the heap its manifest names, so only those
+       on the heap now published under heap_key are restored. *)
+    fun try_candidate published_heap (c : shared_candidate) =
       let val key = shared_checkpoint_key heap_key (#kind c) (#key c)
       in
         case HolbuildRemoteCache.get_action remote key of
@@ -7848,9 +7933,10 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                      entries
                  val restored = (heap, deps_loaded) :: spine @ spine_sidecars @ ((leaf, #path c) :: sidecars)
                in
+                 if heap <> published_heap then NONE else
                  (* The small .ok first: a checkpoint with a laxer timeout than
                     requested is skipped before its chain is fetched. *)
-                 List.app (place_sidecar heap) sidecars;
+                 (List.app (place_sidecar heap) sidecars;
                  if not (checkpoint_timeout_satisfies requested_timeout (#path c)) then (wipe (); NONE)
                  else
                    (place_heap heap;
@@ -7862,31 +7948,34 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                       (HolbuildStatus.message_stdout
                          ("restored shared " ^ #kind c ^ " checkpoint " ^ leaf_rel ^ "\n");
                        SOME {heap = SOME heap, files = map (fn (sha, path) => (path, sha)) restored})
-                    else (warn ("shared checkpoint failed validation: " ^ leaf_rel); wipe (); NONE))
+                    else (warn ("shared checkpoint failed validation: " ^ leaf_rel); wipe (); NONE)))
                end
                handle MissingSharedBlob sha => (missing_blob key sha; wipe (); NONE)
                     | e => (warn ("could not restore shared checkpoint: " ^ General.exnMessage e);
                             wipe (); NONE))
       end
-    fun try_heap () =
+    fun try_heap heap =
+      (place_heap heap;
+       if shared_heap_parent_ok ctx andalso deps_checkpoint_exists deps_loaded deps_key then
+         (HolbuildStatus.message_stdout "restored shared deps-loaded heap\n";
+          {heap = SOME heap, files = [(deps_loaded, heap)]})
+       else (warn "shared deps-loaded heap failed validation"; wipe (); no_files))
+      handle MissingSharedBlob sha => (missing_blob heap_key sha; wipe (); no_files)
+           | e => (warn ("could not restore the shared heap: " ^ General.exnMessage e);
+                   wipe (); no_files)
+    (* No checkpoint is published without its heap, so without one there is
+       nothing to look for. *)
+    val {heap, files} =
       case HolbuildRemoteCache.get_action remote heap_key of
           NONE => no_files
         | SOME text =>
-            (let val (heap, _) = single "heap" (shared_manifest_entries text)
-             in
-               place_heap heap;
-               if shared_heap_parent_ok ctx andalso deps_checkpoint_exists deps_loaded deps_key then
-                 (HolbuildStatus.message_stdout "restored shared deps-loaded heap\n";
-                  {heap = SOME heap, files = [(deps_loaded, heap)]})
-               else (warn "shared deps-loaded heap failed validation"; wipe (); no_files)
-             end
-             handle MissingSharedBlob sha => (missing_blob heap_key sha; wipe (); no_files)
-                  | e => (warn ("could not restore the shared heap: " ^ General.exnMessage e);
-                          wipe (); no_files))
-    val {heap, files} =
-      case first_some try_candidate candidates of
-          SOME restored => restored
-        | NONE => try_heap ()
+            case (SOME (#1 (single "heap" (shared_manifest_entries text)))
+                  handle e => (warn ("could not restore the shared heap: " ^ General.exnMessage e); NONE)) of
+                NONE => no_files
+              | SOME heap =>
+                  case first_some (try_candidate heap) candidates of
+                      SOME restored => restored
+                    | NONE => try_heap heap
   in
     {heap = heap, files = files, stale = !stale, missing = !missing}
   end
@@ -7902,15 +7991,26 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     fun member x xs = List.exists (fn y => y = x) xs
     (* An entry naming a blob the cache lost is replaced, as if absent. *)
     fun present key = not (member key stale) andalso Option.isSome (HolbuildRemoteCache.get_action remote key)
+    (* Every checkpoint's manifest names its whole spine, so the same files
+       come up for each candidate; none changes while this runs. *)
+    val hashes = ref (Redblackmap.mkDict String.compare)
+    fun hash path =
+      case Redblackmap.peek (!hashes, path) of
+          SOME sha => sha
+        | NONE =>
+            let val sha = HolbuildHash.file_sha256 path
+            in hashes := Redblackmap.insert (!hashes, path, sha); sha end
+    val uploaded = ref (Redblackset.empty String.compare)
     (* has_blob knows only the blobs of the entries this process read. *)
     fun upload_sha path sha =
-        if HolbuildRemoteCache.has_blob remote sha andalso not (member sha missing) then sha
+        if Redblackset.member (!uploaded, sha) orelse
+           HolbuildRemoteCache.has_blob remote sha andalso not (member sha missing) then sha
         else
-          case HolbuildRemoteCache.publish_blob remote {hash = sha, src = path} of
-              HolbuildCacheBackend.Published => sha
-            | HolbuildCacheBackend.AlreadyPresent => sha
+          case HolbuildRemoteCache.publish_hashed_blob remote {hash = sha, src = path} of
+              HolbuildCacheBackend.Published => (uploaded := Redblackset.add (!uploaded, sha); sha)
+            | HolbuildCacheBackend.AlreadyPresent => (uploaded := Redblackset.add (!uploaded, sha); sha)
             | _ => raise Error ("could not upload " ^ path)
-    fun upload path = upload_sha path (HolbuildHash.file_sha256 path)
+    fun upload path = upload_sha path (hash path)
     (* A heap this run saved is published only where no other worker's is:
        checkpoints on a heap that lost are chained to bytes no other worker
        has, so they stay local. *)
@@ -7930,13 +8030,13 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     val heap =
       if not (deps_checkpoint_exists deps_loaded deps_key) then NONE
       else
-        let val current = HolbuildHash.file_sha256 deps_loaded
+        let val current = hash deps_loaded
         in
           (* A restored heap Poly failed to load was replaced by this run's. *)
           if restored_heap = SOME current then restored_heap else publish_heap current
         end
     fun was_restored path =
-      List.exists (fn (p, sha) => p = path andalso (HolbuildHash.file_sha256 path = sha handle _ => false))
+      List.exists (fn (p, sha) => p = path andalso (hash path = sha handle _ => false))
                   restored
     val parents = ref (Redblackmap.mkDict String.compare)
     fun parent p =
@@ -8428,6 +8528,15 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
     val input_key = ref ""
     val target = ref ("", "")
     val peak = ref NONE
+    (* Each phase's wall time, in the order they ran, for the result. *)
+    val phases = ref ([] : (string * LargeInt.int) list)
+    fun phase name f =
+      let
+        val t0 = Time.now ()
+        fun record () = phases := (name, Time.toMilliseconds (Time.-(Time.now (), t0))) :: !phases
+      in
+        (f () before record ()) handle e => (record (); raise e)
+      end
     val log_unavailable = ref NONE
     (* Without shared heaps the checkpoint tree outlives the action root, so
        a rerun after an edit resumes from the checkpoints before it; the
@@ -8463,11 +8572,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
         (* Only a spec the cache doesn't have is rejected; a failed fetch is
            retryable. *)
         val _ =
+          phase "spec" (fn () =>
           (ensure_parent spec_path;
            case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = spec_sha256, dst = spec_path} of
                HolbuildCacheBackend.Hit => ()
              | HolbuildCacheBackend.Miss => reject_spec ("the cache has no spec " ^ spec_sha256)
-             | HolbuildCacheBackend.Corrupt msg => raise action_failed InternalFailure ("cannot fetch the spec: " ^ msg))
+             | HolbuildCacheBackend.Corrupt msg => raise action_failed InternalFailure ("cannot fetch the spec: " ^ msg)))
         val spec_text = read_text spec_path
       in
         if String.isPrefix (run_spec_header ^ "\n") spec_text then run_script spec_text
@@ -8508,24 +8618,31 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
         val _ = target := (#package spec, #logical spec)
         val _ = publish_builds_remotely := false
         val tc =
-          toolchain (#toolchain spec)
+          phase "toolchain" (fn () => toolchain (#toolchain spec))
           handle e as HolbuildRemoteCache.Unavailable _ => raise e
                | e => raise action_failed ToolchainFailure (General.exnMessage e)
         val _ =
           if HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key =
              action_text_value spec "toolchain" then ()
           else raise ActionFailed (ToolchainFailure, "the toolchain's identity does not match the action text")
-        val _ = hydrate_action_root remote root spec
-        val done = action_already_done root spec
-        val cutoff = if done then NONE else spec_early_cutoff root spec
+        val _ = phase "hydrate" (fn () => hydrate_action_root remote root spec)
+        val (done, cutoff) =
+          phase "cutoff" (fn () =>
+            let
+              val done = action_already_done root spec
+              val cutoff = if done then NONE else spec_early_cutoff root spec
+            in
+              (done orelse
+               (case cutoff of
+                    SOME {pair_key, ...} => reuse_earlier_build remote root spec pair_key
+                  | NONE => false),
+               cutoff)
+            end)
       in
-        if done orelse
-           (case cutoff of
-                SOME {pair_key, ...} => reuse_earlier_build remote root spec pair_key
-              | NONE => false) then
+        if done then
           (* The entry may have come from the worker's local cache, so make
              sure the remote, where the result counts, holds it too. *)
-          (check_remote_publication remote root spec;
+          (phase "check" (fn () => check_remote_publication remote root spec);
            "cached")
         else
           let
@@ -8543,7 +8660,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                      remove_checkpoint_family (action_checkpoint_base checkpoint_root action))
                 | NONE => ()
             val stage = action_stage root action
-            val policy = spec_policy spec
+            val policy = spec_policy share_heaps spec
             val oom_before = cgroup_oom_kills ()
             val _ = last_child_status := NONE
             val _ =
@@ -8551,21 +8668,22 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                 val source_text = read_text (#source_file action)
                 val checkpoints = action_checkpoints policy checkpoint_root action source_text
                 val shared =
-                  if not share_heaps then NONE
+                  if not share_heaps orelse not (theorem_checkpoints_enabled policy) then NONE
                   else
                     SOME (shared_context cache checkpoint_root tc root policy action checkpoints)
                     handle e => (warn ("not sharing heaps: " ^ General.exnMessage e); NONE)
                 val restored =
                   case shared of
-                      SOME ctx => restore_shared_checkpoints remote ctx
+                      SOME ctx => phase "restore" (fn () => restore_shared_checkpoints remote ctx)
                     | NONE => nothing_restored
                 fun publish_shared () =
                   case shared of
-                      SOME ctx => publish_shared_checkpoints remote ctx restored
+                      SOME ctx => phase "publish" (fn () => publish_shared_checkpoints remote ctx restored)
                     | NONE => ()
               in
-                (ignore (run_theory_action_checkpoints true policy tc root checkpoint_root
-                           (toolchain_base_context tc) action source_text checkpoints)
+                (ignore (phase "hol" (fn () =>
+                           run_theory_action_checkpoints true policy tc root checkpoint_root
+                             (toolchain_base_context tc) action source_text checkpoints))
                  handle e => (publish_shared (); raise e));
                 (* After the publish: the checkpoints saved after resuming
                    from a failed prefix are its children. *)
@@ -8579,17 +8697,17 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                     (classify_run_failure stage log_text oom_before msg, msg)
                 end
             val _ = peak := peak_rss_mb stage
-            (* Outputs built against out-of-date local copies of the parents
-               never reach the remote; the retry restores the remote's. *)
             val _ =
-              if drop_stale_dep_copies remote (theory_spec_deps spec) (dat_records_parent (in_root root (#data_path (#outputs spec))))
-              then raise ActionFailed (PublishFailure, "built against out-of-date local copies of its parents")
-              else ()
-            val _ = check_remote_publication remote root spec
-            val _ =
-              case cutoff of
-                  SOME {pair_key, ...} => publish_early_cutoff remote pair_key (#input_key spec)
-                | NONE => ()
+              phase "check" (fn () =>
+                (* Outputs built against out-of-date local copies of the parents
+                   never reach the remote; the retry restores the remote's. *)
+                (if drop_stale_dep_copies remote (theory_spec_deps spec) (dat_records_parent (in_root root (#data_path (#outputs spec))))
+                 then raise ActionFailed (PublishFailure, "built against out-of-date local copies of its parents")
+                 else ();
+                 check_remote_publication remote root spec;
+                 case cutoff of
+                     SOME {pair_key, ...} => publish_early_cutoff remote pair_key (#input_key spec)
+                   | NONE => ()))
           in
             "built"
           end
@@ -8606,12 +8724,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
               val _ =
                 let val {limit_bytes, reserve_bytes} = cache_cap
                 in
-                  enforce_worker_cache_cap
-                    {cache = cache, checkpoint_root = checkpoint_root,
-                     limit_bytes = limit_bytes, reserve_bytes = reserve_bytes}
+                  phase "cap" (fn () =>
+                    enforce_worker_cache_cap
+                      {cache = cache, checkpoint_root = checkpoint_root,
+                       limit_bytes = limit_bytes, reserve_bytes = reserve_bytes})
                 end
               val (status, failure) = attempt ()
-              val log = upload_log ()
+              val log = phase "log" upload_log
               (* A final failure's log is its only diagnostic and nothing
                  retries the action to recover it. *)
               val failure =
@@ -8629,14 +8748,17 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
               (status, failure, log)
             end)
     val wall_ms = Time.toMilliseconds (Time.-(Time.now (), start))
+    val phases = rev (!phases)
     val text =
       result_text (spec_sha256, !input_key)
-        {status = status, failure = failure, wall_ms = wall_ms,
+        {status = status, failure = failure, wall_ms = wall_ms, phases = phases,
          peak = if status = "built" then !peak else NONE, log = log}
   in
     (case failure of
          SOME (_, msg) => HolbuildStatus.message_stderr ("holbuild: exec-action failed: " ^ msg ^ "\n")
        | NONE => ());
+    HolbuildStatus.message_stderr
+      ("holbuild: exec-action phases (ms): " ^ phases_text " " "=" (phases @ [("wall", wall_ms)]) ^ "\n");
     (case result_file of
          SOME path => write_text path text
        | NONE => print text);
