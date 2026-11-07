@@ -131,7 +131,7 @@ build_with_failure() {
     exit 1
   fi
   # Only requests that get no response at all turn the remote cache off.
-  disabled_count=$(grep -c 'warning: remote cache disabled for the rest of this run' "$log" || true)
+  disabled_count=$(grep -c 'warning: remote cache disabled for 60 seconds' "$log" || true)
   expected=0
   [[ "$failure" != transport ]] || expected=1
   if [[ "$disabled_count" != "$expected" ]]; then
@@ -175,7 +175,7 @@ local_seconds=$(build_seconds "$tmpdir/timed-local.log")
 unreachable_log=$tmpdir/timed-unreachable.log
 unreachable_seconds=$(build_seconds "$unreachable_log" --prefetch-concurrency 1 --remote-cache http://192.0.2.1)
 require_grep 'CTheory built' "$unreachable_log"
-require_grep 'warning: remote cache disabled for the rest of this run after 3 requests in a row failed' "$unreachable_log"
+require_grep 'warning: remote cache disabled for 60 seconds after 3 requests in a row failed' "$unreachable_log"
 requests=$(grep -c '^remote cache \(GET\|PUT\) ' "$unreachable_log" || true)
 if (( requests > 4 )); then
   echo "expected at most 4 requests to an unreachable cache, found $requests" >&2
