@@ -67,6 +67,20 @@ first_heap=$(deps_heap "$first" B)
 stored=$(find "$store" -name deps_loaded.save -samefile "$first_heap")
 [[ -n "$stored" ]] || { echo "B's deps heap is not linked into the store" >&2; find "$store" >&2; exit 1; }
 
+# HOL puts the project's directories on the load path when it starts; the
+# stored heap must not keep the first tree's, or a later load in another tree
+# could find files in this one.
+mkdir -p "$tmpdir/elsewhere"
+printf 'val _ = app (fn d => print ("loadpath " ^ d ^ "\\n")) (!Meta.loadPath);\n' > "$tmpdir/loadpath.sml"
+(cd "$tmpdir/elsewhere" && "$HOLDIR/bin/hol" run --noconfig --holstate "$stored" "$tmpdir/loadpath.sml") \
+  > "$tmpdir/loadpath.log" 2>&1 || { cat "$tmpdir/loadpath.log" >&2; exit 1; }
+require_grep '^loadpath ' "$tmpdir/loadpath.log"
+if grep -q "^loadpath $first" "$tmpdir/loadpath.log"; then
+  echo "the stored heap's load path names the tree that saved it" >&2
+  cat "$tmpdir/loadpath.log" >&2
+  exit 1
+fi
+
 # With the first tree gone, the second resumes from the store's heaps and
 # builds the same outputs: nothing in the heap points into the deleted tree.
 stored_id=$(stat -c %d:%i "$stored")
@@ -84,6 +98,17 @@ fi
   || { echo "the second tree's deps heap is not the stored one" >&2; exit 1; }
 if [[ "$first_outputs" != "$(outputs "$second")" ]]; then
   echo "a shared deps heap changed theory outputs" >&2
+  exit 1
+fi
+
+# A tree whose dependencies differ doesn't resume from the store's heap.
+changed=$tmpdir/changed
+make_tree "$changed"
+printf 'structure helperExtra = struct val n = 1 end\n' >> "$changed/src/helperLib.sml"
+(cd "$changed" && "$HOLBUILD_BIN" build --no-cache BTheory) > "$tmpdir/changed.log" 2>&1 \
+  || { cat "$tmpdir/changed.log" >&2; exit 1; }
+if grep -A1 '^resuming BTheory' "$tmpdir/changed.log" | grep -q 'from: deps-loaded checkpoint'; then
+  echo "a tree with other dependencies resumed from the stored heap" >&2
   exit 1
 fi
 

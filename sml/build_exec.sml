@@ -264,14 +264,14 @@ fun checkpoint_save_runtime_line () =
 (* PolyML child heaps remember their parent-chain filenames. The shared runtime
    helper saves checkpoints directly to the final .save path and publishes .ok
    metadata last via an atomic .ok.tmp rename. *)
-fun save_heap_line {label, share_common_data, output, ok_text} =
+fun save_heap_expr {label, share_common_data, output, ok_text} =
   String.concat
-    ["val _ = HolbuildCheckpointSaveRuntime.save_checkpoint {label = ",
+    ["HolbuildCheckpointSaveRuntime.save_checkpoint {label = ",
      HolbuildToolchain.sml_string label,
      ", default_share = ", if share_common_data then "true" else "false",
      ", path = ", HolbuildToolchain.sml_string output,
      ", ok_text = ", HolbuildToolchain.sml_string ok_text,
-     ", depth = HolbuildRuntime.save_hierarchy_depth ()};"]
+     ", depth = HolbuildRuntime.save_hierarchy_depth ()}"]
 
 fun direct_external_loads plan node =
   unique_strings
@@ -307,13 +307,18 @@ fun preload_loads root plan node =
   map (fn dep => LoadObject (root_relative root (load_stem dep)))
       (List.filter loadable_project_dep (project_preload_deps plan node))
 
-fun write_preload load_lines deps_loaded deps_ok path =
+(* The deps heap leaves out the project's directories, which HOL put on the
+   load path: other trees of the project resume from it. *)
+fun write_preload root load_lines deps_loaded deps_ok path =
   let
+    val save = save_heap_expr {label = "deps_loaded", share_common_data = true,
+                               output = deps_loaded, ok_text = deps_ok}
     val lines = runtime_line () ::
                 (load_lines @
                  [checkpoint_save_runtime_line (),
-                  save_heap_line {label = "deps_loaded", share_common_data = true,
-                                  output = deps_loaded, ok_text = deps_ok}])
+                  "val _ = HolbuildCheckpointSaveRuntime.without_load_path_under " ^
+                  HolbuildToolchain.sml_string (FS.fullPath root handle OS.SysErr _ => root) ^
+                  " (fn () => " ^ save ^ ");"])
   in
     write_text path (String.concatWith "\n" lines ^ "\n")
   end
@@ -3218,6 +3223,11 @@ fun evict_store_family dir =
             end
   end
 
+(* A family that can't be removed stays; the others are still swept. *)
+fun try_evict_store_family dir =
+  evict_store_family dir
+  handle e => (warn ("could not remove store family " ^ dir ^ ": " ^ General.exnMessage e); NONE)
+
 fun store_families store =
   List.filter (fn path => FS.isDir path handle OS.SysErr _ => false) (HolbuildCache.children store)
 
@@ -3309,7 +3319,7 @@ fun write_theory_script policy root checkpoint_root base_context (action : theor
       fun run_from_fresh_preload () =
         (remove_deps_checkpoint_descendants base deps_key;
          ensure_source_checkpoint_parents ();
-         write_preload load_lines deps_loaded deps_ok preload;
+         write_preload root load_lines deps_loaded deps_ok preload;
          write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
          {context = base_context, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
       fun run_from_failed_prefix {checkpoint, step_count, metadata_text} =
@@ -4518,7 +4528,7 @@ fun sweep_local_heap_store () =
   let
     val cutoff = Time.-(Time.now (), Time.fromSeconds 86400)
     fun sweep dir =
-      if store_heap_links dir = 1 andalso Time.<(modified_time dir, cutoff) then ignore (evict_store_family dir) else ()
+      if store_heap_links dir = 1 andalso Time.<(modified_time dir, cutoff) then ignore (try_evict_store_family dir) else ()
   in
     List.app sweep (store_families (share_store (HolbuildCache.cache_root ())))
   end
@@ -6980,7 +6990,7 @@ fun gc_checkpoint_store days =
     fun removable dir = Time.<(modified_time dir, cutoff) andalso store_heap_links dir <= 1
     val removed =
       List.foldl
-        (fn (dir, n) => if removable dir andalso Option.isSome (evict_store_family dir) then n + 1 else n)
+        (fn (dir, n) => if removable dir andalso Option.isSome (try_evict_store_family dir) then n + 1 else n)
         0 (store_families (share_store (HolbuildCache.cache_root ())))
   in
     (* stderr: gc's stdout is its one summary line. *)

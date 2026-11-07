@@ -70,6 +70,20 @@ fun discard_checkpoint path =
    remove_file (ok_path path);
    remove_file path)
 
+(* Runs F with the load path's entries under ROOT taken out.  HOL puts every
+   project directory on the load path when it starts, so a heap saved with
+   them would search this tree from any other tree that resumes from it; one
+   that starts from the heap adds its own again. *)
+fun without_load_path_under root f =
+  let
+    val path = !Meta.loadPath
+    fun under dir = dir = root orelse String.isPrefix (root ^ "/") dir
+  in
+    Meta.loadPath := List.filter (not o under) path;
+    (f () handle e => (Meta.loadPath := path; raise e));
+    Meta.loadPath := path
+  end
+
 (* After a source parse error QUse's error flag is set, and a heap saved then
    keeps it: `hol run` from that heap exits with failure after its first
    declaration, printing nothing.  So no checkpoint is saved once the flag is

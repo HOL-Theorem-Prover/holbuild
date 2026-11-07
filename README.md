@@ -899,7 +899,9 @@ dependency set: a theory with no valid `deps_loaded` hard-links the stored
 one (a copy across file systems) and resumes from it, and one it saves is
 linked into the store. A stored heap whose parent isn't the build's base
 state is ignored, and one HOL can't resume from is discarded and replaced by
-the build's fresh heap. Each build removes stored heaps no tree links any
+the build's fresh heap. The heap is saved without the project's directories,
+which HOL puts on `Meta.loadPath` when it starts, so a tree resuming from it
+searches only its own. Each build removes stored heaps no tree links any
 more (its checkpoint budget evicted them, or the tree was deleted) that no
 build used for a day, and `holbuild gc` removes every store directory no
 build used within the retention window, except a heap a tree still links. A heap keeps HOL's record of the directories
