@@ -6370,8 +6370,9 @@ fun drop_stale_dep_copies remote (spec : action_spec) wanted =
 fun dat_records_parent path = records_parent (parse_dat_parent_hashes (read_text path))
 
 (* Each restored theory's .dat records the hashes of its parents' .dat
-   files; every parent the spec places must match. *)
-fun spec_parent_hashes_match root (spec : action_spec) data_path =
+   files; every parent the spec places must match.  dat_hashes memoizes the
+   parents' hashes across the checks of one set of restored files. *)
+fun spec_parent_hashes_match_in dat_hashes root (spec : action_spec) data_path =
   let
     val recorded = parse_dat_parent_hashes (read_text data_path)
   in
@@ -6379,9 +6380,12 @@ fun spec_parent_hashes_match root (spec : action_spec) data_path =
       (fn {target, stem, ...} =>
           case Binarymap.peek (recorded, theory_name_from_logical (#2 (target_name target))) of
               NONE => true
-            | SOME hash => (hol_dat_hash (in_root root (stem ^ ".dat")) = hash handle _ => false))
+            | SOME hash => cached_file_hash dat_hashes (in_root root (stem ^ ".dat")) = SOME hash)
       (#deps spec)
   end
+
+fun spec_parent_hashes_match root spec data_path =
+  spec_parent_hashes_match_in (new_file_hash_cache ()) root spec data_path
 
 (* Step 3: sources and library manifests from the spec, dependency theories
    from the cache. *)
@@ -6396,6 +6400,7 @@ fun hydrate_action_root remote root (spec : action_spec) =
     fun write_lib {stem, suffix, loads, ...} =
       (ensure_parent (in_root root stem);
        write_object_manifest (in_root root (stem ^ suffix)) (map lib_load loads))
+    val dat_hashes = new_file_hash_cache ()
     fun restore_dep {target, stem, key} =
       (ensure_parent (in_root root stem);
        restore_spec_theory root spec
@@ -6411,7 +6416,7 @@ fun hydrate_action_root remote root (spec : action_spec) =
     List.app restore_dep (#deps spec);
     List.app
       (fn {target, stem, key} =>
-          if spec_parent_hashes_match root spec (in_root root (stem ^ ".dat")) then ()
+          if spec_parent_hashes_match_in dat_hashes root spec (in_root root (stem ^ ".dat")) then ()
           else
             (* Out-of-date local copies would fail the next attempt too. *)
             (ignore (drop_stale_dep_copies remote spec (fn _ => true));
