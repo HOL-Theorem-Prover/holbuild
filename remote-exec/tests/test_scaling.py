@@ -255,12 +255,9 @@ def test_settings_errors_do_not_print_credentials(monkeypatch: pytest.MonkeyPatc
     assert "secret" not in str(error.value)
 
 
-def host_report(
-    host_id: str, cpu_idle_pct: float | None, memory_waits: int = 0, memory_wait_s: float = 0, worker: str = "w1"
-) -> dict[str, Any]:
+def host_report(host_id: str, cpu_idle_pct: float | None) -> dict[str, Any]:
     return {
         "id": host_id,
-        "worker": worker,
         "cpu_idle_pct": cpu_idle_pct,
         "mem_total": 64 << 30,
         "mem_available": 40 << 30,
@@ -268,8 +265,6 @@ def host_report(
         "reserved": 6 << 30,
         "leases": 2,
         "memory_short": False,
-        "memory_waits": memory_waits,
-        "memory_wait_s": memory_wait_s,
     }
 
 
@@ -279,44 +274,29 @@ async def test_queue_lists_the_hosts_workers_reported(http: httpx.AsyncClient, c
     await submit(http, ["a"])
     response = await http.post(
         "/v1/work/claim",
-        json={"tier": "standard", "worker": "w1", "host": host_report("h1", 30.0, 1, 4.0)},
+        json={"tier": "standard", "worker": "w1", "host": host_report("h1", 30.0)},
         headers=WORKER,
     )
     token = response.json()["attempt_token"]
     now += timedelta(seconds=10)
-    heartbeat = {"host": host_report("h1", None, 1, 4.0)}
+    heartbeat = {"host": host_report("h1", None)}
     assert (await http.post(f"/v1/work/{token}/heartbeat", json=heartbeat, headers=WORKER)).status_code == 200
     await http.post(
         "/v1/work/claim",
-        json={"tier": "high", "worker": "w2", "host": host_report("h2", 80.0, worker="w2")},
+        json={"tier": "high", "worker": "w2", "host": host_report("h2", 80.0)},
         headers=WORKER,
     )
     now += timedelta(seconds=5)
 
     hosts = (await http.get("/v1/queue", headers=CLIENT)).json()["hosts"]
     assert hosts == [
-        {**host_report("h1", 30.0, 1, 4.0), "age_s": 5.0},  # the last idle share measured
-        {**host_report("h2", 80.0, worker="w2"), "age_s": 5.0},
+        {**host_report("h1", 30.0), "age_s": 5.0},  # the last idle share measured
+        {**host_report("h2", 80.0), "age_s": 5.0},
     ]
 
     now += timedelta(seconds=120)
     assert (await http.get("/v1/queue", headers=CLIENT)).json()["hosts"] == []
     assert coordinator.hosts == {}
-
-
-async def test_a_hosts_memory_waits_add_up_what_each_workers_totals_grew_by(coordinator: Coordinator) -> None:
-    def waits() -> tuple[int, float]:
-        _, report = coordinator.hosts["h1"]
-        return report.memory_waits, report.memory_wait_s
-
-    coordinator.report_host(HostReport(**host_report("h1", 50.0, 1, 4.0)))
-    coordinator.report_host(HostReport(**host_report("h1", 50.0, 3, 7.5)))
-    coordinator.report_host(HostReport(**host_report("h1", 50.0, 3, 7.5)))  # sent twice, or nothing new
-    assert waits() == (3, 7.5)
-    coordinator.report_host(HostReport(**host_report("h1", 50.0, 1, 2.0, worker="w2")))
-    assert waits() == (4, 9.5)
-    coordinator.report_host(HostReport(**host_report("h1", 50.0, 1, 1.0)))  # w1 restarted
-    assert waits() == (5, 10.5)
 
 
 async def test_a_heartbeat_with_no_body_still_extends_the_lease(http: httpx.AsyncClient) -> None:
@@ -332,9 +312,8 @@ async def test_a_malformed_host_report_is_refused(http: httpx.AsyncClient) -> No
     for report in (
         {**host_report("h1", 30.0), "leases": "many"},
         host_report("h" * 65, 30.0),
-        host_report("h1", 30.0, worker="w" * 129),
-        host_report("h1", 30.0, 2**53 + 1),
-        host_report("h1", 30.0, 0, -1.0),
+        {**host_report("h1", 30.0), "reserved": 2**53 + 1},
+        {**host_report("h1", 30.0), "leases": -1},
         host_report("h1", 101.0),
     ):
         response = await http.post(
@@ -348,7 +327,7 @@ async def test_reports_from_more_hosts_than_it_remembers_are_dropped(
 ) -> None:
     monkeypatch.setattr(coordinator_module, "MAX_HOSTS", 2)
     for host_id in ("h1", "h2", "h3"):
-        coordinator.report_host(HostReport(**host_report(host_id, 50.0, worker=host_id)))
+        coordinator.report_host(HostReport(**host_report(host_id, 50.0)))
     coordinator.report_host(HostReport(**host_report("h1", 10.0)))
 
     assert [host.report.cpu_idle_pct for host in (await coordinator.queue()).hosts] == [10.0, 50.0]

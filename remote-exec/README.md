@@ -102,10 +102,9 @@ for a worker on another host.
 
 Each claim and heartbeat also reports the worker's host: its id (the kernel's
 `boot_id`, the same in every container on the host), the share of CPU time
-idle since the worker's last report (iowait counts as busy), its memory as
-holbuild's admission sees it, whether that admission would hold a child back
-now, and how often and how long the worker has waited for memory before
-claiming since it started. `GET /v1/queue` lists them, so a reader can tell
+idle since the worker's previous CPU sample (iowait counts as busy), its
+memory as holbuild's admission sees it, and whether that admission would
+hold a child back now. `GET /v1/queue` lists them, so a reader can tell
 whether hosts have CPU to spare or are short of memory.
 
 ## Batches and actions
@@ -323,13 +322,9 @@ gets 401. Errors are JSON `{"detail": "<message>"}`.
   the unfinished actions of running batches, the burst worker target, and the
   hosts whose workers reported to this coordinator process in the last 2
   minutes, by id. A host is its workers' latest report, `age_s` seconds old,
-  except that `cpu_idle_pct` is the latest one measured, and `memory_waits`
-  and `memory_wait_s` count the waits its workers reported to this process
-  since it first heard from the host. Workers report their totals, so a
-  report lost or sent twice changes nothing; the coordinator adds what each
-  worker's totals grew by, or the totals of a restarted worker:
+  except that `cpu_idle_pct` is the latest one measured:
   ```json
-  {"id": "<boot_id>", "worker": "<the worker that reported last>", "cpu_idle_pct": 31.5, "mem_total": 133680000000, "mem_available": 61200000000, "budget": 120800000000, "reserved": 92300000000, "leases": 29, "memory_short": false, "memory_waits": 0, "memory_wait_s": 0.0, "age_s": 1.2}
+  {"id": "<boot_id>", "cpu_idle_pct": 31.5, "mem_total": 133680000000, "mem_available": 61200000000, "budget": 120800000000, "reserved": 92300000000, "leases": 29, "memory_short": false, "age_s": 1.2}
   ```
   Memory is in bytes: `MemTotal` and `MemAvailable`, the `--cooperate-dir`
   budget, the charges of the leases held there and their number;
@@ -343,8 +338,8 @@ gets 401. Errors are JSON `{"detail": "<message>"}`.
 holds the request open for an action to become ready, 0 by default and at
 most 50, so that a proxy's usual 60 s idle timeout doesn't cut it; `host` is
 the worker's report of its host, a host of `GET /v1/queue` without `age_s`,
-with the worker's own memory wait totals, and `cpu_idle_pct` measured since
-the worker's previous CPU sample, or null when that is under a second old)
+with `cpu_idle_pct` measured since the worker's previous CPU sample, or null
+when that is under a second old)
 
 - 200 `{"attempt_token": "<uuid>", "spec_sha256": "<sha256>", "input_key": "<sha256>", "theory": "<package>:<theory>", "lease_s": 120}`
 - 204 when nothing became ready for the tier within `wait_s`

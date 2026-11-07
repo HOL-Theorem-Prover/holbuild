@@ -323,20 +323,16 @@ def child_charge(max_heap: int | None) -> int:
     return min(max_heap or DEFAULT_CHARGE_MIB, DEFAULT_CHARGE_MIB) * MIB
 
 
-def wait_for_memory(directory: str, charge: int) -> float:
+def wait_for_memory(directory: str, charge: int) -> None:
     """Return once holbuild's admission in ``directory`` would start a child charged ``charge`` bytes, so that a
     worker on a host whose memory is taken doesn't claim an action only to wait on it while other hosts could run it.
-    A check, not a reservation: workers racing past it still wait in exec-action's own admission.
-
-    Returns the seconds it waited, 0 when it didn't."""
-    started = time.monotonic()
+    A check, not a reservation: workers racing past it still wait in exec-action's own admission."""
     logged = False
     while (why := HostMemory.read(directory).shortfall(charge)) is not None:
         if not logged:
             print(f"waiting for memory before claiming: {why}", file=sys.stderr, flush=True)
             logged = True
         time.sleep(MEMORY_POLL_SECONDS)
-    return time.monotonic() - started if logged else 0.0
 
 
 def cpu_times(stat_line: str) -> tuple[int, int]:
@@ -351,12 +347,10 @@ def cpu_times(stat_line: str) -> tuple[int, int]:
 
 @dataclass(frozen=True)
 class HostReport:
-    """A worker's report of its host to the coordinator; memory in bytes as in HostMemory, ``memory_short`` when
-    admission would hold a child back now, and the worker's waits for memory before claiming since it started:
-    totals, so a report lost or sent twice changes nothing."""
+    """A worker's report of its host to the coordinator; memory in bytes as in HostMemory, and ``memory_short`` when
+    admission would hold a child back now."""
 
     id: str
-    worker: str
     cpu_idle_pct: float | None  # since the CPU sample it was last measured from, None under CPU_SAMPLE_SECONDS ago
     mem_total: int | None
     mem_available: int | None
@@ -364,35 +358,24 @@ class HostReport:
     reserved: int
     leases: int
     memory_short: bool
-    memory_waits: int
-    memory_wait_s: float
 
 
 class HostTelemetry:
     """What a worker reports of its host with each claim and heartbeat, which come from two threads."""
 
-    def __init__(self, cooperate_dir: str | None, charge: int, worker: str) -> None:
+    def __init__(self, cooperate_dir: str | None, charge: int) -> None:
         with open(BOOT_ID) as file:
             self.id = file.read().strip()
-        self.worker = worker
         self.cooperate_dir = cooperate_dir
         self.charge = charge
         self.lock = threading.Lock()
         self.cpu: tuple[float, int, int] | None = None  # when, idle and total of the CPU sample measured from
         self.memory: HostMemory | None = None  # the last reading
-        self.memory_waits = 0
-        self.memory_wait_s = 0.0
-
-    def waited(self, seconds: float) -> None:
-        """Count a wait for memory before claiming."""
-        with self.lock:
-            self.memory_waits += 1
-            self.memory_wait_s += seconds
 
     def report(self) -> HostReport:
-        """The host now. It doesn't wait for the cooperate dir's
-        lock, which would hold up the heartbeat that renews a running action's lease: while an admission holds the
-        lock, the memory is the last reading, or ``/proc/meminfo`` alone before the first."""
+        """The host now. It doesn't wait for the cooperate dir's lock, which would hold up the heartbeat that renews
+        a running action's lease: while an admission holds the lock, the memory is the last reading, or
+        ``/proc/meminfo`` alone before the first."""
         try:
             memory = HostMemory.read(self.cooperate_dir, wait=False)
         except BlockingIOError:
@@ -409,10 +392,8 @@ class HostTelemetry:
                 if self.cpu is not None and total > self.cpu[2] and 0 <= idle - self.cpu[1] <= total - self.cpu[2]:
                     idle_pct = round(100 * (idle - self.cpu[1]) / (total - self.cpu[2]), 1)
                 self.cpu = (now, idle, total)
-            waits, wait_s = self.memory_waits, self.memory_wait_s
         return HostReport(
             self.id,
-            self.worker,
             idle_pct,
             memory.total,
             memory.available,
@@ -420,8 +401,6 @@ class HostTelemetry:
             memory.reserved,
             memory.leases,
             memory.shortfall(self.charge) is not None,
-            waits,
-            round(wait_s, 1),
         )
 
 
@@ -599,8 +578,7 @@ def main() -> None:
     if not os.environ.get("HOLBUILD_CACHE"):
         sys.exit("HOLBUILD_CACHE is not set; give the worker its own cache root")
     charge = child_charge(args.max_heap)
-    host = HostTelemetry(args.cooperate_dir, charge, args.name)
-    coordinator = Coordinator(args.coordinator, token, host)
+    coordinator = Coordinator(args.coordinator, token, HostTelemetry(args.cooperate_dir, charge))
     releases = Releases(
         args.holbuild_releases_dir,
         args.holbuild_source_url,
@@ -612,8 +590,8 @@ def main() -> None:
     # Exit through Python on SIGTERM, so run_one's cleanup stops the running action.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
     while True:
-        if args.cooperate_dir is not None and (waited := wait_for_memory(args.cooperate_dir, charge)):
-            host.waited(waited)
+        if args.cooperate_dir is not None:
+            wait_for_memory(args.cooperate_dir, charge)
         started = time.monotonic()
         try:
             claim = coordinator.claim(tiers, args.name, args.claim_wait_seconds)

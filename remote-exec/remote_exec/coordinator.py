@@ -45,10 +45,6 @@ SCALE_CMD_TIMEOUT_S = 60
 HOST_REPORT_SECONDS = 120
 # Hosts the coordinator remembers at most; a report from another host beyond them is dropped.
 MAX_HOSTS = 1000
-# A worker's memory wait totals are remembered this long after its last report, so that a worker that waited for
-# memory a while, reporting nothing, has only its new waits counted when it reports again; and for at most this many.
-WORKER_REPORT_SECONDS = 3600
-MAX_WORKERS = 10000
 
 
 class Settings(BaseSettings):
@@ -130,19 +126,17 @@ class QueueCounts:
     running_high: int
 
 
-# What a host report's numbers may be: within JSON's exact integers, so sums stay readable.
+# What a host report's counts and sizes may be: JSON's exact integers.
 Amount = Annotated[int, Field(ge=0, le=2**53)]
-Seconds = Annotated[float, Field(ge=0, le=2**53)]
 
 
 @dataclass(frozen=True)
 class HostReport:
     """What a worker reports of its host with a claim or heartbeat (``HostReport`` in worker.py): the share of CPU
-    time idle lately, memory in bytes as holbuild's ``--cooperate-dir`` admission sees it, whether that admission
-    would hold a child back now, and the worker's waits for memory before claiming since it started."""
+    time idle lately, memory in bytes as holbuild's ``--cooperate-dir`` admission sees it, and whether that
+    admission would hold a child back now."""
 
     id: Annotated[str, Field(max_length=64)]  # the host's boot_id
-    worker: Annotated[str, Field(max_length=128)]
     cpu_idle_pct: Annotated[float, Field(ge=0, le=100)] | None
     mem_total: Amount | None
     mem_available: Amount | None
@@ -150,14 +144,11 @@ class HostReport:
     reserved: Amount
     leases: Amount
     memory_short: bool
-    memory_waits: Amount
-    memory_wait_s: Seconds
 
 
 @dataclass(frozen=True)
 class HostStatus:
-    """A host's latest report, ``age_s`` seconds old, with the latest ``cpu_idle_pct`` measured and the memory
-    waits its workers reported to this coordinator process since it first heard from the host."""
+    """A host's latest report, ``age_s`` seconds old, with the latest ``cpu_idle_pct`` measured."""
 
     report: HostReport
     age_s: float
@@ -315,8 +306,6 @@ class Coordinator:
         # What workers reported of their hosts, by host id, and when. Kept in memory: each coordinator process
         # knows the hosts whose workers' requests reached it.
         self.hosts: dict[str, tuple[datetime, HostReport]] = {}
-        # Each worker's last reported memory wait totals, by worker, and when.
-        self.workers: dict[str, tuple[datetime, int, float]] = {}
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "Coordinator":
@@ -498,24 +487,13 @@ class Coordinator:
         return Claim(token, row.spec_sha256, row.input_key, row.theory, self.settings.lease_seconds)
 
     def report_host(self, report: HostReport) -> None:
-        """Take a worker's report of its host. A report without ``cpu_idle_pct`` keeps the host's last one; the
-        host's memory waits grow by what the worker's totals grew since its last report, or by the totals when they
-        are new or smaller, from a restarted worker."""
+        """Take a worker's report of its host. A report without ``cpu_idle_pct`` keeps the host's last one."""
         previous = self.hosts.get(report.id)
-        seen = self.workers.get(report.worker)
-        if (previous is None and len(self.hosts) >= MAX_HOSTS) or (seen is None and len(self.workers) >= MAX_WORKERS):
+        if previous is None and len(self.hosts) >= MAX_HOSTS:
             return
-        now = self.clock()
-        self.workers[report.worker] = (now, report.memory_waits, report.memory_wait_s)
-        waits, wait_s = report.memory_waits, report.memory_wait_s
-        if seen is not None and waits >= seen[1]:
-            waits, wait_s = waits - seen[1], max(0.0, wait_s - seen[2])
-        last = None if previous is None else previous[1]
-        if last is not None:
-            waits, wait_s = last.memory_waits + waits, last.memory_wait_s + wait_s
-            if report.cpu_idle_pct is None:
-                report = replace(report, cpu_idle_pct=last.cpu_idle_pct)
-        self.hosts[report.id] = (now, replace(report, memory_waits=waits, memory_wait_s=round(wait_s, 1)))
+        if previous is not None and report.cpu_idle_pct is None:
+            report = replace(report, cpu_idle_pct=previous[1].cpu_idle_pct)
+        self.hosts[report.id] = (self.clock(), report)
 
     async def heartbeat(self, token: UUID) -> bool:
         """Extend a live lease; False when it expired or was revoked, so the worker should stop."""
@@ -753,9 +731,6 @@ class Coordinator:
             host: (at, report)
             for host, (at, report) in self.hosts.items()
             if (now - at).total_seconds() < HOST_REPORT_SECONDS
-        }
-        self.workers = {
-            worker: seen for worker, seen in self.workers.items() if (now - seen[0]).total_seconds() < WORKER_REPORT_SECONDS
         }
         hosts = [HostStatus(report, round((now - at).total_seconds(), 1)) for at, report in self.hosts.values()]
         return QueueStatus(counts, max(desired, demand), sorted(hosts, key=lambda h: h.report.id))

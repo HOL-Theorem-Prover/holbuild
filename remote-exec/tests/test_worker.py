@@ -493,16 +493,6 @@ def test_worker_waits_for_memory_and_says_so_once(
     assert capsys.readouterr().err.count("waiting for memory before claiming") == 1
 
 
-def test_worker_waits_for_memory_returns_how_long_it_waited(host: Host, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(worker, "MEMORY_POLL_SECONDS", 0.2)
-    assert wait_for_memory(str(host.dir), 3 * GIB) == 0
-
-    host.available(10 * GIB)
-    host.lease(3 * GIB)
-    threading.Timer(0.5, host.available, (20 * GIB,)).start()
-    assert wait_for_memory(str(host.dir), 3 * GIB) >= 0.5
-
-
 def test_iowait_is_not_idle_cpu_time() -> None:
     # user nice system idle iowait irq softirq steal guest guest_nice
     assert cpu_times("cpu  10 1 5 100 20 0 2 0 7 0") == (100, 138)
@@ -519,7 +509,7 @@ def telemetry(host: Host, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> It
     monkeypatch.setattr(worker, "BOOT_ID", str(tmp_path / "boot_id"))
     monkeypatch.setattr(worker, "PROC_STAT", str(stat))
     monkeypatch.setattr(worker, "CPU_SAMPLE_SECONDS", 0)
-    yield HostTelemetry(str(host.dir), 3 * GIB, "w1"), stat
+    yield HostTelemetry(str(host.dir), 3 * GIB), stat
 
 
 def test_host_report_has_idle_cpu_since_the_last_report_and_admissions_view(
@@ -551,22 +541,14 @@ def test_cpu_is_measured_over_at_least_the_least_sample_time(
     assert reporter.cpu is not None and reporter.cpu[2] == 0  # still measuring from the first sample
 
 
-def test_memory_waits_are_reported_as_the_workers_totals(telemetry: tuple[HostTelemetry, Path], server: Server) -> None:
+def test_claims_and_heartbeats_carry_the_host_report(telemetry: tuple[HostTelemetry, Path], server: Server) -> None:
     reporter, _ = telemetry
-    reporter.waited(4.0)
-    reporter.waited(2.5)
     coordinator = Coordinator(server.url, "w", reporter)
     assert coordinator.claim(["standard"], "w", 0) is None
     assert coordinator.heartbeat("t")
     claimed, beat = server.claims[0]["host"], server.heartbeats[0]["host"]
     assert isinstance(claimed, dict) and isinstance(beat, dict)
-    assert (claimed["id"], claimed["worker"], claimed["memory_waits"], claimed["memory_wait_s"]) == (
-        "b0a7",
-        "w1",
-        2,
-        6.5,
-    )
-    assert (beat["memory_waits"], beat["memory_wait_s"]) == (2, 6.5)
+    assert (claimed["id"], claimed["mem_total"], beat["id"]) == ("b0a7", 64 * GIB, "b0a7")
 
 
 def test_cpu_counters_going_backwards_give_no_idle_share(telemetry: tuple[HostTelemetry, Path]) -> None:
