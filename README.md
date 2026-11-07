@@ -1274,10 +1274,16 @@ failure=proof|tactic-timeout|memory|input-missing|publish|toolchain|disk|spec-re
 missing=theory <input_key> | blob <sha256>
 peak-rss-mb=<n>
 wall-ms=<n>
+phase-ms=<phase>:<n>,...
 log=<sha256> <size>
 ```
 
 `failure` appears on failure, and `missing` with `input-missing`.
+`phase-ms` gives the wall time of each phase that ran, in order: `cap` (the
+cache cap sweep), `spec`, `toolchain`, `hydrate` (sources, libraries and
+dependencies), `cutoff` (whether an earlier build stands), `restore` (shared
+checkpoints), `hol`, `publish` (shared checkpoints), `check` (the
+publication checks) and `log`; stderr ends with the same times and `wall`.
 `peak-rss-mb` is the HOL process's peak resident memory on a successful build.
 `log` is the build log, uploaded to `/cas/`. `memory` means Poly/ML ran out
 of heap or the container's cgroup `memory.events` counted an OOM kill during

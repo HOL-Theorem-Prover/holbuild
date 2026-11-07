@@ -892,6 +892,22 @@ async def test_events_stream_action_states_then_the_batch(http: httpx.AsyncClien
     assert events[0]["log_sha256"] == "a" * 64
 
 
+async def test_batch_status_shows_each_actions_phase_timings(http: httpx.AsyncClient) -> None:
+    batch_id = await submit(http, ["a", "b"])
+    token = await claim_named(http, "a")
+    assert (await complete(http, token, result("a", "built", phase_ms="hydrate:812,hol:1500"))).status_code == 200
+
+    response = await http.get(f"/v1/batches/{batch_id}", headers=CLIENT)
+    timings = {a["theory"].removeprefix("pkg:"): a["timings"] for a in response.json()["actions"]}
+    assert timings == {"a": {"hydrate": 812, "hol": 1500, "wall": 10}, "b": None}
+
+
+async def test_a_malformed_phase_timing_is_refused(http: httpx.AsyncClient) -> None:
+    await submit(http, ["a"])
+    token = await claim_named(http, "a")
+    assert (await complete(http, token, result("a", "built", phase_ms="hydrate"))).status_code == 400
+
+
 async def test_events_keep_a_quiet_stream_alive_with_blank_lines(
     coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch
 ) -> None:

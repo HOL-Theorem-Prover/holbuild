@@ -6773,7 +6773,10 @@ fun with_action_root_lock cache f =
     handle e => (HolbuildFileLock.release lock; raise e)
   end
 
-fun result_text (spec_sha256, input_key) {status, failure, wall_ms, peak, log} =
+fun phases_text sep unit phases =
+  String.concatWith sep (map (fn (name, ms) => name ^ unit ^ LargeInt.toString ms) phases)
+
+fun result_text (spec_sha256, input_key) {status, failure, wall_ms, phases, peak, log} =
   String.concatWith "\n"
     ([action_result_header,
       "spec=" ^ spec_sha256,
@@ -6786,6 +6789,7 @@ fun result_text (spec_sha256, input_key) {status, failure, wall_ms, peak, log} =
             (case kind of InputMissing missing => ["missing=" ^ missing] | _ => [])) @
      (case peak of SOME mb => ["peak-rss-mb=" ^ Int.toString mb] | NONE => []) @
      ["wall-ms=" ^ LargeInt.toString wall_ms] @
+     (if null phases then [] else ["phase-ms=" ^ phases_text "," ":" phases]) @
      (case log of SOME (sha, bytes) => ["log=" ^ sha ^ " " ^ bytes] | NONE => [])) ^ "\n"
 
 fun exception_failure e =
@@ -7369,6 +7373,15 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
     val input_key = ref ""
     val target = ref ("", "")
     val peak = ref NONE
+    (* Each phase's wall time, in the order they ran, for the result. *)
+    val phases = ref ([] : (string * LargeInt.int) list)
+    fun phase name f =
+      let
+        val t0 = Time.now ()
+        fun record () = phases := (name, Time.toMilliseconds (Time.-(Time.now (), t0))) :: !phases
+      in
+        (f () before record ()) handle e => (record (); raise e)
+      end
     (* Without shared heaps the checkpoint tree outlives the action root, so
        a rerun after an edit resumes from the checkpoints before it; the
        worker cache cap bounds it.  With them it is the action's own, filled
@@ -7397,11 +7410,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
         (* Only a spec the cache doesn't have is rejected; a failed fetch is
            retryable. *)
         val _ =
+          phase "spec" (fn () =>
           (ensure_parent spec_path;
            case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = spec_sha256, dst = spec_path} of
                HolbuildCacheBackend.Hit => ()
              | HolbuildCacheBackend.Miss => reject_spec ("the cache has no spec " ^ spec_sha256)
-             | HolbuildCacheBackend.Corrupt msg => raise action_failed InternalFailure ("cannot fetch the spec: " ^ msg))
+             | HolbuildCacheBackend.Corrupt msg => raise action_failed InternalFailure ("cannot fetch the spec: " ^ msg)))
         val spec = parse_action_spec (read_text spec_path)
         val _ = input_key := #input_key spec
         val _ = verify_action_spec spec
@@ -7409,23 +7423,30 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
         val _ = target := (#package spec, #logical spec)
         val _ = publish_builds_remotely := false
         val tc =
-          toolchain (#toolchain spec)
+          phase "toolchain" (fn () => toolchain (#toolchain spec))
           handle e => raise action_failed ToolchainFailure (General.exnMessage e)
         val _ =
           if HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key =
              action_text_value spec "toolchain" then ()
           else raise ActionFailed (ToolchainFailure, "the toolchain's identity does not match the action text")
-        val _ = hydrate_action_root remote root spec
-        val done = action_already_done root spec
-        val cutoff = if done then NONE else spec_early_cutoff root spec
+        val _ = phase "hydrate" (fn () => hydrate_action_root remote root spec)
+        val (done, cutoff) =
+          phase "cutoff" (fn () =>
+            let
+              val done = action_already_done root spec
+              val cutoff = if done then NONE else spec_early_cutoff root spec
+            in
+              (done orelse
+               (case cutoff of
+                    SOME {pair_key, ...} => reuse_earlier_build remote root spec pair_key
+                  | NONE => false),
+               cutoff)
+            end)
       in
-        if done orelse
-           (case cutoff of
-                SOME {pair_key, ...} => reuse_earlier_build remote root spec pair_key
-              | NONE => false) then
+        if done then
           (* The entry may have come from the worker's local cache, so make
              sure the remote, where the result counts, holds it too. *)
-          (check_remote_publication remote root spec;
+          (phase "check" (fn () => check_remote_publication remote root spec);
            "cached")
         else
           let
@@ -7457,15 +7478,16 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                     handle e => (warn ("not sharing heaps: " ^ General.exnMessage e); NONE)
                 val restored =
                   case shared of
-                      SOME ctx => restore_shared_checkpoints remote ctx
+                      SOME ctx => phase "restore" (fn () => restore_shared_checkpoints remote ctx)
                     | NONE => nothing_restored
                 fun publish_shared () =
                   case shared of
-                      SOME ctx => publish_shared_checkpoints remote ctx restored
+                      SOME ctx => phase "publish" (fn () => publish_shared_checkpoints remote ctx restored)
                     | NONE => ()
               in
-                (ignore (run_theory_action_checkpoints true policy tc root checkpoint_root
-                           (toolchain_base_context tc) action source_text checkpoints)
+                (ignore (phase "hol" (fn () =>
+                           run_theory_action_checkpoints true policy tc root checkpoint_root
+                             (toolchain_base_context tc) action source_text checkpoints))
                  handle e => (publish_shared (); raise e));
                 (* After the publish: the checkpoints saved after resuming
                    from a failed prefix are its children. *)
@@ -7479,17 +7501,17 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                     (classify_run_failure stage log_text oom_before msg, msg)
                 end
             val _ = peak := peak_rss_mb stage
-            (* Outputs built against out-of-date local copies of the parents
-               never reach the remote; the retry restores the remote's. *)
             val _ =
-              if drop_stale_dep_copies remote spec (dat_records_parent (in_root root (#data_path (#outputs spec))))
-              then raise ActionFailed (PublishFailure, "built against out-of-date local copies of its parents")
-              else ()
-            val _ = check_remote_publication remote root spec
-            val _ =
-              case cutoff of
-                  SOME {pair_key, ...} => publish_early_cutoff remote pair_key (#input_key spec)
-                | NONE => ()
+              phase "check" (fn () =>
+                (* Outputs built against out-of-date local copies of the parents
+                   never reach the remote; the retry restores the remote's. *)
+                (if drop_stale_dep_copies remote spec (dat_records_parent (in_root root (#data_path (#outputs spec))))
+                 then raise ActionFailed (PublishFailure, "built against out-of-date local copies of its parents")
+                 else ();
+                 check_remote_publication remote root spec;
+                 case cutoff of
+                     SOME {pair_key, ...} => publish_early_cutoff remote pair_key (#input_key spec)
+                   | NONE => ()))
           in
             "built"
           end
@@ -7505,12 +7527,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
               val _ =
                 let val {limit_bytes, reserve_bytes} = cache_cap
                 in
-                  enforce_worker_cache_cap
-                    {cache = cache, checkpoint_root = checkpoint_root,
-                     limit_bytes = limit_bytes, reserve_bytes = reserve_bytes}
+                  phase "cap" (fn () =>
+                    enforce_worker_cache_cap
+                      {cache = cache, checkpoint_root = checkpoint_root,
+                       limit_bytes = limit_bytes, reserve_bytes = reserve_bytes})
                 end
               val (status, failure) = attempt ()
-              val log = upload_log ()
+              val log = phase "log" upload_log
               (* A final failure's log is its only diagnostic and nothing
                  retries the action to recover it. *)
               val failure =
@@ -7527,14 +7550,17 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
               (status, failure, log)
             end)
     val wall_ms = Time.toMilliseconds (Time.-(Time.now (), start))
+    val phases = rev (!phases)
     val text =
       result_text (spec_sha256, !input_key)
-        {status = status, failure = failure, wall_ms = wall_ms,
+        {status = status, failure = failure, wall_ms = wall_ms, phases = phases,
          peak = if status = "built" then !peak else NONE, log = log}
   in
     (case failure of
          SOME (_, msg) => HolbuildStatus.message_stderr ("holbuild: exec-action failed: " ^ msg ^ "\n")
        | NONE => ());
+    HolbuildStatus.message_stderr
+      ("holbuild: exec-action phases (ms): " ^ phases_text " " "=" (phases @ [("wall", wall_ms)]) ^ "\n");
     (case result_file of
          SOME path => write_text path text
        | NONE => print text);
