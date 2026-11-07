@@ -95,6 +95,24 @@ fi
 [[ "$(deps_heap "$third" B)" -ef "$stored" ]] \
   || { echo "a successful build did not replace the bogus stored heap" >&2; exit 1; }
 
+# A stored heap with the right parent that HOL can't resume from is
+# replaced by the fresh one, also when the theory then fails.
+fourth=$tmpdir/fourth
+make_tree "$fourth"
+sed -i 's/ACCEPT_TAC helperLib.helper_thm/NO_TAC/' "$fourth/src/BScript.sml"
+good_size=$(stat -c %s "$stored")
+head -c $((good_size * 9 / 10)) "$stored" > "$tmpdir/truncated"
+mv "$tmpdir/truncated" "$stored"
+truncated_sum=$(sha256sum < "$stored")
+if (cd "$fourth" && "$HOLBUILD_BIN" build --no-cache BTheory) > "$tmpdir/fourth.log" 2>&1; then
+  echo "the failing theory built" >&2
+  exit 1
+fi
+[[ "$(sha256sum < "$stored")" != "$truncated_sum" ]] \
+  || { echo "a failed build kept a stored heap HOL could not resume from" >&2; cat "$tmpdir/fourth.log" >&2; exit 1; }
+[[ "$(deps_heap "$fourth" B)" -ef "$stored" ]] \
+  || { echo "the store does not hold the failed build's fresh heap" >&2; exit 1; }
+
 # gc removes families no build used within the retention window. It runs
 # on its own cache, so it can't touch the suite's shared toolchains.
 gc_cache=$tmpdir/gc-cache

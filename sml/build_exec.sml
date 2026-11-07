@@ -4447,8 +4447,9 @@ fun restore_local_heap tc heap_context base_context checkpoint_root (action : th
       ((* Checkpoints on an earlier deps_loaded aren't children of this one. *)
        remove_deps_checkpoint_descendants base deps_key;
        lease_store_family store heap;
-       ensure_parent deps_loaded;
-       place_state stored deps_loaded;
+       (* A copy across file systems: a symbolic link would follow the store
+          entry when another tree replaces it, under this tree's .ok. *)
+       link_or_copy_file stored deps_loaded;
        if parent_ok () then
          (write_text (checkpoint_ok_path deps_loaded) (deps_checkpoint_ok_text deps_key);
           touch_dir (Path.concat(store, heap)))
@@ -4473,13 +4474,17 @@ fun build_theory dat_hash_cache cache_allowed policy tc project base_context pla
     val _ =
       Option.app (fn heap_context => restore_local_heap tc heap_context base_context checkpoint_root action)
                  heap_context
-    val generated_metadata =
-      build_theory_action cache_allowed policy tc root checkpoint_root base_context action
-    val _ =
+    (* Also after a failure: a stored heap HOL couldn't resume from was
+       replaced here by a fresh one, which the store takes in its place. *)
+    fun publish_heap () =
       Option.app (fn heap_context =>
                      store_local_heap true tc heap_context action
                        (deps_loaded_path (action_checkpoint_base checkpoint_root action) (#deps_key action)))
                  heap_context
+    val generated_metadata =
+      build_theory_action cache_allowed policy tc root checkpoint_root base_context action
+      handle e => (publish_heap (); raise e)
+    val _ = publish_heap ()
     val stage = action_stage root action
     val extra_output_paths = source_extra_output_paths plan node
   in
