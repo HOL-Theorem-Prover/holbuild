@@ -1217,21 +1217,28 @@ fun extra_inputs_key (plan as {extra_inputs_key_cache, ...} : t) node =
     | NONE => raise Error ("internal error: extra-inputs key not computed for " ^ logical_name node)
 
 (* The script's path in recorded theorem locations, in holpathdb form so that
-   a cached theory carries no path of the checkout that built it: sources under
-   the HOL toolchain under `$(HOLDIR)`, as HOL records its own theories, and
-   other packages' under their package name.  A package can sit under the
-   toolchain without being `hol`, so this needs the source's path, which only
-   the planning side has: the action text carries the result to workers. *)
-fun source_name ({holdir, ...} : t) node =
+   a cached theory carries no path of the checkout that built it: a package's
+   sources under its package name by default, and sources under the HOL
+   toolchain under `$(HOLDIR)`, as HOL records its own theories. *)
+fun default_source_name package relative_path = "$(" ^ package ^ ")/" ^ relative_path
+
+(* The script's recorded path when it isn't the default: a package can sit
+   under the toolchain without being `hol`, so this needs the source's path,
+   which only the planning side has.  The action text carries it to workers. *)
+fun toolchain_source_name ({holdir, ...} : t) node =
   let
-    val source = source_of node
-    val path = normalize_path (#source_path source)
+    val path = normalize_path (#source_path (source_of node))
     val dir = normalize_path holdir
   in
     if holdir <> "" andalso String.isPrefix (dir ^ "/") path then
-      "$(HOLDIR)/" ^ String.extract(path, size dir + 1, NONE)
-    else "$(" ^ #package source ^ ")/" ^ #relative_path source
+      SOME ("$(HOLDIR)/" ^ String.extract(path, size dir + 1, NONE))
+    else NONE
   end
+
+fun source_name plan node =
+  case toolchain_source_name plan node of
+      SOME name => name
+    | NONE => default_source_name (package node) (#relative_path (source_of node))
 
 (* The lines of a node's action, with each project dependency written by
    DEP_TEXT and the node's extra inputs as INPUT_LINES. *)
@@ -1261,8 +1268,8 @@ fun action_lines_with plan config_lines_for_node toolchain_key dep_text input_li
      "logical=" ^ #logical_name source,
      "source=" ^ #relative_path source,
      "source-sha256=" ^ source_hash] @
-    (case #kind source of
-         HolbuildSourceIndex.TheoryScript => ["source-name=" ^ source_name plan node]
+    (case (#kind source, toolchain_source_name plan node) of
+         (HolbuildSourceIndex.TheoryScript, SOME name) => ["source-name=" ^ name]
        | _ => []) @
     ["cache=" ^ bool_text (HolbuildProject.action_cache_enabled policy),
      "always_reexecute=" ^ bool_text (HolbuildProject.action_always_reexecute policy)] @
