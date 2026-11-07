@@ -36,12 +36,14 @@ cat > "$tmpdir/run-batch" <<SH
 set -eu
 [[ ! -e "$state/fail" ]] || exit 1
 cd "$tmpdir/worker-cwd"
+heap=()
+[[ ! -e "\${1%.batch}.heap" ]] || heap=(--max-heap "\$(cat "\${1%.batch}.heap")")
 share=
 [[ ! -e "$state/share-heaps" ]] || share=--share-heaps
 awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec theory; do
   echo "\$theory" >> "$state/ran"
   status=0
-  HOLBUILD_CACHE="$tmpdir/worker-cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" \
+  HOLBUILD_CACHE="$tmpdir/worker-cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" "\${heap[@]}" \
     exec-action "\$spec" --cache-limit-gb 1000 --result "$tmpdir/worker.result" \$share \
     >> "$tmpdir/worker.log" 2>&1 || status=\$?
   echo "\$theory \$(grep '^status=' "$tmpdir/worker.result")" >> "$state/results"
@@ -937,3 +939,23 @@ refute_grep "resubmitting" "$tmpdir/stale-build-client.log"
 require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/stale-build-client.log"
 require_grep "PTheory restored from cache" "$tmpdir/stale-build-client.log"
 require_file "$remote_root/ac/$m_ac"
+
+# The client cap must reach the HOL child, before Poly/ML consumes --maxheap.
+copy_nondet heap-cap rxheap
+cat > "$tmpdir/heap-cap/src/HeapScript.sml" <<'SML'
+Theory Heap
+Ancestors bool
+val _ =
+  let
+    val ins = TextIO.openIn "/proc/self/cmdline"
+    val text = TextIO.inputAll ins before TextIO.closeIn ins
+  in
+    print ("heap-child-argv: " ^ String.translate (fn #"\000" => " " | c => str c) text ^ "\n")
+  end
+SML
+in_copy heap-cap --max-heap 4096 --remote-cache "$remote_url" build \
+  --remote-exec "$coordinator" --remote-only HeapTheory > "$tmpdir/heap-cap.log" 2>&1 ||
+  { cat "$tmpdir/heap-cap.log" "$tmpdir/worker.log" >&2; exit 1; }
+heap_key=$(awk '$1 == "action" && $5 == "rxheap:HeapTheory" { print $2 }' "$state/"*.batch)
+heap_log=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$state/result-$heap_key")
+require_grep '^heap-child-argv: .*/bin/hol .*--maxheap 4096 run ' "$remote_root/cas/$heap_log"

@@ -521,10 +521,11 @@ def exec_action_env() -> dict[str, str]:
     }
 
 
-def exec_action_command(args: argparse.Namespace, holbuild: str, spec: str, result: str) -> list[str]:
+def exec_action_command(
+    args: argparse.Namespace, holbuild: str, spec: str, result: str, max_heap_mb: int | None
+) -> list[str]:
     command = [holbuild, "--remote-cache", args.remote_cache]
-    if args.max_heap is not None:
-        command += ["--max-heap", str(args.max_heap)]
+    command += ["--max-heap", str(args.max_heap if max_heap_mb is None else max_heap_mb)]
     if args.cooperate_dir is not None:
         command += ["--cooperate-dir", args.cooperate_dir]
     command += ["exec-action", spec, "--cache-limit-gb", str(args.cache_limit_gb), "--result", result]
@@ -643,7 +644,9 @@ def execute(
         spans = ExecSpans()
         stepped = time.monotonic()
         process = subprocess.Popen(
-            exec_action_command(args, holbuild, spec, result), env=exec_action_env(), start_new_session=True
+            exec_action_command(args, holbuild, spec, result, claim.get("max_heap_mb")),
+            env=exec_action_env(),
+            start_new_session=True
         )
         try:
             while process.poll() is None:
@@ -703,7 +706,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=[],
         help="tiers to claim from when --tier has nothing ready, in order (repeatable or comma-separated)",
     )
-    parser.add_argument("--max-heap", type=int, help="holbuild --max-heap MB")
+    parser.add_argument("--max-heap", type=int, default=12000, help="default holbuild --max-heap MB (default: %(default)s)")
     parser.add_argument("--cooperate-dir", help="holbuild --cooperate-dir, shared by a host's workers")
     parser.add_argument("--share-heaps", action="store_true", help="holbuild exec-action --share-heaps")
     parser.add_argument(

@@ -372,7 +372,9 @@ Common global options:
 - `-j N`, `-jN`, `--jobs N`: build parallelism. When holbuild builds a HOL
   toolchain, it also passes `-j N` to HOL's `bin/build`; without it, `bin/build`
   uses HOL's own default.
-- `--max-heap MB`: Poly/ML maximum heap size for child HOL processes. Do not
+- `--max-heap MB`: Poly/ML maximum heap size for child HOL processes, including
+  remote workers. Without it, remote workers use their configured default
+  (12000 MB by default). Do not
   use `--maxheap`: holbuild is itself a Poly/ML program, and its runtime takes
   `--maxheap MB` as the cap on holbuild's own heap, so the option never reaches
   holbuild and child HOL processes run uncapped. holbuild rejects `--maxheap`
