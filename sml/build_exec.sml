@@ -765,14 +765,6 @@ fun remove_deps_checkpoint_descendants base deps_key =
   (remove_theorem_checkpoints_for_deps base deps_key;
    remove_declaration_checkpoints_for_deps base deps_key)
 
-fun remove_deps_checkpoint_family base deps_key deps_loaded =
-  (remove_deps_checkpoint_descendants base deps_key;
-   remove_checkpoint deps_loaded)
-
-fun remove_checkpoint_family base =
-  (remove_legacy_checkpoint_family base;
-   remove_trees [base ^ ".theorems", base ^ ".decls", base ^ ".deps"])
-
 fun path_exists path = FS.access(path, []) handle OS.SysErr _ => false
 
 fun children dir =
@@ -791,6 +783,162 @@ fun children dir =
       FS.closeDir stream;
       result
     end
+
+fun file_size path = FS.fileSize path handle OS.SysErr _ => 0
+
+fun tree_bytes path =
+  if (FS.isLink path handle OS.SysErr _ => false) then 0
+  else if (FS.isDir path handle OS.SysErr _ => false) then
+    List.foldl (fn (child, total) => total + tree_bytes child) (0 : Position.int) (children path)
+  else file_size path
+
+fun modified_time path = FS.modTime path handle OS.SysErr _ => Time.zeroTime
+
+fun file_id path =
+  let val st = Posix.FileSys.stat path
+  in SOME (Posix.FileSys.ST.dev st, Posix.FileSys.ST.ino st) end
+  handle OS.SysErr _ => NONE
+
+(* The shared heap and checkpoint store: one family per heap directory,
+   used when an action restores from it or adds to it. *)
+fun share_store cache = Path.concat(cache, "checkpoint-store")
+
+(* An action holds a shared lease on each store family it uses until it
+   exits, so no other container's cap sweep evicts the family meanwhile; a
+   build holds one only while it places or adds a heap.  fcntl locks are
+   dropped when the process closes any descriptor for the file, so a family
+   is leased at most once per process, as toolchains are, with a count of its
+   holders. *)
+fun store_lease_path dir = dir ^ ".lease"
+
+val store_leases = ref ([] : (string * HolbuildFileLock.t * int ref) list)
+(* A build's theory workers lease families from several threads. *)
+val store_leases_mutex = Mutex.mutex ()
+
+fun with_store_leases f =
+  (Mutex.lock store_leases_mutex;
+   (f () handle e => (Mutex.unlock store_leases_mutex; raise e))
+   before Mutex.unlock store_leases_mutex)
+
+fun find_store_lease path = List.find (fn (held, _, _) => held = path) (!store_leases)
+
+fun lease_store_family store heap =
+  let val path = store_lease_path (Path.concat(store, heap))
+  in
+    with_store_leases (fn () =>
+      case find_store_lease path of
+          SOME (_, _, holders) => holders := !holders + 1
+        | NONE =>
+            store_leases := (path, HolbuildFileLock.acquire_shared_path_wait {path = path}, ref 1) :: !store_leases)
+  end
+
+fun release_store_family store heap =
+  let val path = store_lease_path (Path.concat(store, heap))
+  in
+    with_store_leases (fn () =>
+      case find_store_lease path of
+          SOME (_, lock, holders) =>
+            (holders := !holders - 1;
+             if !holders > 0 then ()
+             else
+               (store_leases := List.filter (fn (held, _, _) => held <> path) (!store_leases);
+                HolbuildFileLock.release lock))
+        | NONE => ())
+  end
+
+fun with_store_family_lease store heap f =
+  (lease_store_family store heap;
+   (f () handle e => (release_store_family store heap; raise e))
+   before release_store_family store heap)
+
+(* Removes a store family no process leases when ELIGIBLE () holds under the
+   exclusive lease lock; the bytes freed, or NONE if kept. *)
+fun evict_store_family_if eligible dir =
+  let val lease = store_lease_path dir
+  in
+    with_store_leases (fn () =>
+      if Option.isSome (find_store_lease lease) then NONE
+      else
+        case HolbuildFileLock.try_acquire_path {path = lease, obsolete_kind = NONE}
+             handle HolbuildFileLock.Error _ => NONE of
+            NONE => NONE
+          | SOME lock =>
+              if not (eligible () handle e => (HolbuildFileLock.release lock; raise e)) then
+                (HolbuildFileLock.release lock; NONE)
+              else
+                let val bytes = tree_bytes dir
+                in
+                  (HolbuildCache.remove_tree dir handle e => (HolbuildFileLock.release lock; raise e));
+                  HolbuildFileLock.release lock;
+                  if path_exists dir then NONE else SOME bytes
+                end)
+  end
+
+fun evict_store_family dir = evict_store_family_if (fn () => true) dir
+
+(* A family that can't be removed stays; the others are still swept. *)
+fun try_evict_store_family_if eligible dir =
+  evict_store_family_if eligible dir
+  handle e => (warn ("could not remove store family " ^ dir ^ ": " ^ General.exnMessage e); NONE)
+
+fun try_evict_store_family dir = try_evict_store_family_if (fn () => true) dir
+
+fun store_families store =
+  List.filter (fn path => FS.isDir path handle OS.SysErr _ => false) (HolbuildCache.children store)
+
+(* How many links a host deps heap family's heap has: the store's own, and
+   one per tree that holds it.  0 for other families. *)
+fun store_heap_links dir =
+  Posix.FileSys.ST.nlink (Posix.FileSys.stat (Path.concat(dir, "deps_loaded.save")))
+  handle OS.SysErr _ => 0
+
+fun try_evict_unlinked_store_family dir =
+  try_evict_store_family_if (fn () => store_heap_links dir = 1) dir
+
+fun shared_file_id path =
+  let val st = Posix.FileSys.stat path
+  in
+    if Posix.FileSys.ST.nlink st >= 2 then
+      SOME (Posix.FileSys.ST.dev st, Posix.FileSys.ST.ino st)
+    else NONE
+  end
+  handle OS.SysErr _ => NONE
+
+fun base_deps_loaded_paths base =
+  map (fn dir => Path.concat(dir, "deps_loaded.save")) (children (deps_checkpoint_root base))
+
+(* When removing worktree deps_loaded.save files leaves a shared store family
+   with only the store's own link (st_nlink = 1) and no active lease, evict
+   that store family immediately so checkpoint cleanup frees disk blocks. *)
+fun with_unlinked_store_eviction deps_paths remove =
+  let
+    val shared_ids = List.mapPartial shared_file_id deps_paths
+    val () = remove ()
+    fun matches_removed dir =
+      store_heap_links dir = 1 andalso
+      case file_id (Path.concat(dir, "deps_loaded.save")) of
+          SOME id => List.exists (fn removed_id => removed_id = id) shared_ids
+        | NONE => false
+    fun evict_if_orphaned dir =
+      if matches_removed dir then
+        ignore (try_evict_store_family_if (fn () => matches_removed dir) dir)
+      else ()
+  in
+    if null shared_ids then ()
+    else
+      (List.app evict_if_orphaned (store_families (share_store (HolbuildCache.cache_root ())))
+       handle e => warn ("could not evict unlinked store heap: " ^ General.exnMessage e))
+  end
+
+fun remove_deps_checkpoint_family base deps_key deps_loaded =
+  with_unlinked_store_eviction [deps_loaded] (fn () =>
+    (remove_deps_checkpoint_descendants base deps_key;
+     remove_checkpoint deps_loaded))
+
+fun remove_checkpoint_family base =
+  with_unlinked_store_eviction (base_deps_loaded_paths base) (fn () =>
+    (remove_legacy_checkpoint_family base;
+     remove_trees [base ^ ".theorems", base ^ ".decls", base ^ ".deps"]))
 
 fun failed_prefix_ok_artifact path =
   has_suffix "_failed_prefix.save.ok" path andalso path_exists (drop_suffix ".ok" path)
@@ -908,15 +1056,14 @@ fun checkpoint_family_base path =
   end
 
 fun remove_checkpoint_family_base base =
-  (remove_trees [base ^ ".theorems", base ^ ".decls", base ^ ".deps"];
-   remove_checkpoint (base ^ ".final_context.save");
-   remove_checkpoint base)
+  with_unlinked_store_eviction (base_deps_loaded_paths base) (fn () =>
+    (remove_trees [base ^ ".theorems", base ^ ".decls", base ^ ".deps"];
+     remove_checkpoint (base ^ ".final_context.save");
+     remove_checkpoint base))
 
 type checkpoint_family = {base : string, mtime : Time.time, bytes : Position.int}
 
 fun max_time (a, b) = if Time.<(a, b) then b else a
-
-fun file_size path = FS.fileSize path handle OS.SysErr _ => 0
 
 fun note_checkpoint_full_scan () =
   case OS.Process.getEnv "HOLBUILD_CHECKPOINT_SCAN_COUNTER" of
@@ -3156,100 +3303,6 @@ fun action_outputs root ({outputs = {sig_path, sml_path, data_path}, ...} : theo
   {sig_path = in_root root sig_path, sml_path = in_root root sml_path,
    data_path = in_root root data_path}
 
-(* The shared heap and checkpoint store: one family per heap directory,
-   used when an action restores from it or adds to it. *)
-fun share_store cache = Path.concat(cache, "checkpoint-store")
-
-(* An action holds a shared lease on each store family it uses until it
-   exits, so no other container's cap sweep evicts the family meanwhile; a
-   build holds one only while it places or adds a heap.  fcntl locks are
-   dropped when the process closes any descriptor for the file, so a family
-   is leased at most once per process, as toolchains are, with a count of its
-   holders. *)
-fun store_lease_path dir = dir ^ ".lease"
-
-val store_leases = ref ([] : (string * HolbuildFileLock.t * int ref) list)
-(* A build's theory workers lease families from several threads. *)
-val store_leases_mutex = Mutex.mutex ()
-
-fun with_store_leases f =
-  (Mutex.lock store_leases_mutex;
-   (f () handle e => (Mutex.unlock store_leases_mutex; raise e))
-   before Mutex.unlock store_leases_mutex)
-
-fun find_store_lease path = List.find (fn (held, _, _) => held = path) (!store_leases)
-
-fun holds_store_lease path = with_store_leases (fn () => Option.isSome (find_store_lease path))
-
-fun lease_store_family store heap =
-  let val path = store_lease_path (Path.concat(store, heap))
-  in
-    with_store_leases (fn () =>
-      case find_store_lease path of
-          SOME (_, _, holders) => holders := !holders + 1
-        | NONE =>
-            store_leases := (path, HolbuildFileLock.acquire_shared_path_wait {path = path}, ref 1) :: !store_leases)
-  end
-
-fun release_store_family store heap =
-  let val path = store_lease_path (Path.concat(store, heap))
-  in
-    with_store_leases (fn () =>
-      case find_store_lease path of
-          SOME (_, lock, holders) =>
-            (holders := !holders - 1;
-             if !holders > 0 then ()
-             else
-               (store_leases := List.filter (fn (held, _, _) => held <> path) (!store_leases);
-                HolbuildFileLock.release lock))
-        | NONE => ())
-  end
-
-fun with_store_family_lease store heap f =
-  (lease_store_family store heap;
-   (f () handle e => (release_store_family store heap; raise e))
-   before release_store_family store heap)
-
-fun tree_bytes path =
-  if (FS.isLink path handle OS.SysErr _ => false) then 0
-  else if (FS.isDir path handle OS.SysErr _ => false) then
-    List.foldl (fn (child, total) => total + tree_bytes child) (0 : Position.int) (children path)
-  else file_size path
-
-fun modified_time path = FS.modTime path handle OS.SysErr _ => Time.zeroTime
-
-(* Removes a store family no process leases; the bytes freed, or NONE if kept. *)
-fun evict_store_family dir =
-  let val lease = store_lease_path dir
-  in
-    if holds_store_lease lease then NONE
-    else
-      case HolbuildFileLock.try_acquire_path {path = lease, obsolete_kind = NONE}
-           handle HolbuildFileLock.Error _ => NONE of
-          NONE => NONE
-        | SOME lock =>
-            let val bytes = tree_bytes dir
-            in
-              (HolbuildCache.remove_tree dir handle e => (HolbuildFileLock.release lock; raise e));
-              HolbuildFileLock.release lock;
-              if path_exists dir then NONE else SOME bytes
-            end
-  end
-
-(* A family that can't be removed stays; the others are still swept. *)
-fun try_evict_store_family dir =
-  evict_store_family dir
-  handle e => (warn ("could not remove store family " ^ dir ^ ": " ^ General.exnMessage e); NONE)
-
-fun store_families store =
-  List.filter (fn path => FS.isDir path handle OS.SysErr _ => false) (HolbuildCache.children store)
-
-(* How many links a host deps heap family's heap has: the store's own, and
-   one per tree that holds it.  0 for other families. *)
-fun store_heap_links dir =
-  Posix.FileSys.ST.nlink (Posix.FileSys.stat (Path.concat(dir, "deps_loaded.save")))
-  handle OS.SysErr _ => 0
-
 fun store_path store heap sha = Path.concat(Path.concat(store, heap), sha)
 
 (* A name no process, in this container or another, also picks. *)
@@ -4488,11 +4541,6 @@ fun local_heap_location tc heap_context action =
     {store = store, heap = heap, stored = store_path store heap "deps_loaded.save"}
   end
 
-fun file_id path =
-  let val st = Posix.FileSys.stat path
-  in SOME (Posix.FileSys.ST.dev st, Posix.FileSys.ST.ino st) end
-  handle OS.SysErr _ => NONE
-
 (* A file's identity and modification time: a file saved where a discarded
    one was can reuse its inode number.  Not its change time, which links made
    by other trees change. *)
@@ -4529,16 +4577,40 @@ fun publish_local_heap tc heap_context (action : theory_action) deps_loaded prio
   end
   handle e => warn ("could not add a deps heap to the host store: " ^ General.exnMessage e)
 
-(* The store keeps a deps heap while a tree links it, or a build used it
-   within a day.  A tree's checkpoint budget evicting its heap, or the tree's
-   deletion, leaves the store's link the only one, which this removes. *)
+(* The store keeps a deps heap while a tree links it, or while unlinked heaps
+   used within a day fit within default_max_checkpoints_gb.  A tree's
+   checkpoint budget or clean evicts its store link immediately when no other
+   tree links it; this removes any older than a day or past the budget, such
+   as heaps left when a worktree was deleted directly. *)
 fun sweep_local_heap_store () =
   let
     val cutoff = Time.-(Time.now (), Time.fromSeconds 86400)
-    fun sweep dir =
-      if store_heap_links dir = 1 andalso Time.<(modified_time dir, cutoff) then ignore (try_evict_store_family dir) else ()
+    val max_bytes = gb_to_bytes default_max_checkpoints_gb
+    fun step (dir, remaining) =
+      if store_heap_links dir <> 1 then remaining
+      else
+        let val mtime = modified_time dir
+        in
+          if Time.<(modified_time dir, cutoff) andalso Option.isSome (try_evict_unlinked_store_family dir) then
+            remaining
+          else if store_heap_links dir = 1 then
+            {dir = dir, mtime = mtime, bytes = tree_bytes dir} :: remaining
+          else remaining
+        end
+    val remaining =
+      List.foldl step [] (store_families (share_store (HolbuildCache.cache_root ())))
+    val total =
+      List.foldl (fn ({bytes, ...}, sum) => sum + bytes) (0 : Position.int) remaining
+    fun evict_to_cap [] _ = ()
+      | evict_to_cap ({dir, ...} :: rest) current =
+          if current <= max_bytes then ()
+          else
+            case try_evict_unlinked_store_family dir of
+                SOME freed => evict_to_cap rest (current - freed)
+              | NONE => evict_to_cap rest current
   in
-    List.app sweep (store_families (share_store (HolbuildCache.cache_root ())))
+    if total <= max_bytes then ()
+    else evict_to_cap (sort_by_mtime_ascending #mtime remaining) total
   end
   handle e => warn ("could not sweep the host deps heap store: " ^ General.exnMessage e)
 
@@ -7641,7 +7713,9 @@ fun gc_checkpoint_store days =
     fun removable dir = Time.<(modified_time dir, cutoff) andalso store_heap_links dir <= 1
     val removed =
       List.foldl
-        (fn (dir, n) => if removable dir andalso Option.isSome (try_evict_store_family dir) then n + 1 else n)
+        (fn (dir, n) =>
+            if removable dir andalso Option.isSome (try_evict_store_family_if (fn () => removable dir) dir)
+            then n + 1 else n)
         0 (store_families (share_store (HolbuildCache.cache_root ())))
   in
     (* stderr: gc's stdout is its one summary line. *)

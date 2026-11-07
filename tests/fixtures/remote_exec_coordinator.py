@@ -36,6 +36,7 @@ import pathlib
 import subprocess
 import sys
 import time
+from urllib.parse import parse_qs
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 state = pathlib.Path(sys.argv[2])
@@ -80,6 +81,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.answer(status, {"detail": "restarting"})
         batch_id = f"b{len(list(state.glob('*.batch'))) + 1}"
         (state / f"{batch_id}.batch").write_text(body)
+        heap = parse_qs(query).get("max_heap_mb")
+        if heap:
+            (state / f"{batch_id}.heap").write_text(heap[0])
         if "class=run" in query.split("&"):
             (state / f"{batch_id}.run").touch()
         # Whitespace around the colon is valid JSON the client must accept.

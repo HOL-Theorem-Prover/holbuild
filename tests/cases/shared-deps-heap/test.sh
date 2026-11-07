@@ -11,6 +11,7 @@ tmpdir=$(make_temp_dir)
 cleanup() { rm -rf "$tmpdir"; }
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
+unset HOLBUILD_REMOTE_CACHE_URL
 store=$tmpdir/cache/checkpoint-store
 
 # Two worktrees of one project share the host's deps heaps.
@@ -218,3 +219,80 @@ HOLBUILD_CACHE=$gc_cache "$HOLBUILD_BIN" gc --cache-only --days 30 > "$tmpdir/gc
 [[ ! -e "$gc_cache/checkpoint-store/$family" ]] || { echo "gc kept a stale store family" >&2; exit 1; }
 [[ -e "$linked" ]] || { echo "gc removed a store heap a tree still links" >&2; exit 1; }
 require_grep "checkpoint store gc: removed families=1" "$tmpdir/gc.log"
+
+# Cleaning a project's checkpoints keeps the store family while another tree
+# links it or while a process leases it, and evicts it once the last tree link
+# goes with no lease held (retaining the .lease file).
+family_dir=$(dirname "$stored")
+fourth_heap=$(deps_heap "$fourth" B)
+third_heap=$(deps_heap "$third" B)
+ln -f "$stored" "$third_heap"
+(cd "$third" && "$HOLBUILD_BIN" gc --clean-only --days 0) > "$tmpdir/clean-linked.log" 2>&1 \
+  || { cat "$tmpdir/clean-linked.log" >&2; exit 1; }
+[[ -e "$stored" ]] || { echo "clean-only gc removed a store heap another tree still links" >&2; exit 1; }
+
+fourth_ok=$(cat "$fourth_heap.ok")
+python3 - "$family_dir.lease" <<'PY' > "$tmpdir/lease.ready" &
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.lockf(fd, fcntl.LOCK_SH)
+sys.stdout.write("locked\n")
+sys.stdout.flush()
+time.sleep(60)
+PY
+lease_pid=$!
+while [[ ! -s "$tmpdir/lease.ready" ]]; do sleep 0.02; done
+(cd "$fourth" && "$HOLBUILD_BIN" gc --clean-only --days 0) > "$tmpdir/clean-leased.log" 2>&1 \
+  || { kill "$lease_pid" 2>/dev/null || true; cat "$tmpdir/clean-leased.log" >&2; exit 1; }
+kill "$lease_pid" 2>/dev/null || true
+wait "$lease_pid" 2>/dev/null || true
+[[ -e "$stored" ]] || { echo "clean-only gc removed a leased store family" >&2; exit 1; }
+
+mkdir -p "$(dirname "$fourth_heap")"
+ln "$stored" "$fourth_heap"
+printf '%s\n' "$fourth_ok" > "$fourth_heap.ok"
+(cd "$fourth" && "$HOLBUILD_BIN" gc --clean-only --days 0) > "$tmpdir/clean-last.log" 2>&1 \
+  || { cat "$tmpdir/clean-last.log" >&2; exit 1; }
+[[ ! -e "$family_dir" ]] || { echo "clean-only gc kept an unlinked, unleased store family" >&2; exit 1; }
+[[ -e "$family_dir.lease" ]] || { echo "clean-only gc unlinked the store family lease file" >&2; exit 1; }
+
+# A build's local store sweep caps recent unlinked (st_nlink == 1) families at
+# 5 GB, evicting oldest first, not counting leased families that could not be
+# evicted, and leaving linked (st_nlink >= 2) and remote-exec families alone.
+orphan_leased=$store/cap-leased
+orphan_old=$store/cap-old
+orphan_new=$store/cap-new
+linked_big=$store/cap-linked
+remote_big=$store/cap-remote
+mkdir -p "$orphan_leased" "$orphan_old" "$orphan_new" "$linked_big" "$remote_big"
+truncate -s 2G "$orphan_leased/deps_loaded.save" "$orphan_old/deps_loaded.save" \
+  "$orphan_new/deps_loaded.save" "$linked_big/deps_loaded.save" \
+  "$remote_big/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+ln "$linked_big/deps_loaded.save" "$tmpdir/cap-linked-ref"
+touch -d '4 hours ago' "$remote_big"
+touch -d '3 hours ago' "$linked_big"
+touch -d '2 hours ago' "$orphan_leased"
+touch -d '1 hour ago' "$orphan_old"
+
+rm -f "$tmpdir/lease.ready"
+python3 - "$orphan_leased.lease" <<'PY' > "$tmpdir/lease.ready" &
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.lockf(fd, fcntl.LOCK_SH)
+sys.stdout.write("locked\n")
+sys.stdout.flush()
+time.sleep(60)
+PY
+lease_pid=$!
+while [[ ! -s "$tmpdir/lease.ready" ]]; do sleep 0.02; done
+(cd "$second" && "$HOLBUILD_BIN" build BTheory) > "$tmpdir/cap-sweep.log" 2>&1 \
+  || { kill "$lease_pid" 2>/dev/null || true; cat "$tmpdir/cap-sweep.log" >&2; exit 1; }
+kill "$lease_pid" 2>/dev/null || true
+wait "$lease_pid" 2>/dev/null || true
+
+[[ ! -e "$orphan_old" ]] || { echo "cap sweep kept the oldest unlinked family over budget" >&2; exit 1; }
+[[ -e "$orphan_old.lease" ]] || { echo "cap sweep removed the evicted family's lease file" >&2; exit 1; }
+[[ -e "$orphan_leased" ]] || { echo "cap sweep removed a leased family" >&2; exit 1; }
+[[ -e "$orphan_new" ]] || { echo "cap sweep removed a newer family within the 5 GB cap" >&2; exit 1; }
+[[ -e "$linked_big" ]] || { echo "cap sweep removed a linked store family" >&2; exit 1; }
+[[ -e "$remote_big" ]] || { echo "cap sweep removed a remote-exec store family" >&2; exit 1; }

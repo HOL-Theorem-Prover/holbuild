@@ -10,9 +10,17 @@ tmpdir=$(make_temp_dir)
 trap 'cleanup_temp_dir "$tmpdir"' EXIT
 use_case_cache "$tmpdir/cache"
 project=$tmpdir/project
-mkdir -p "$project/src" "$project/tools/sequences" "$project/tools/build"
-printf 'src\n' > "$project/tools/build/build-sequence"
-: > "$project/tools/sequences/upto-hol"
+mkdir -p "$project/src" "$project/src/simp/src" "$project/tools/sequences" "$project/tools/build"
+printf '#include sequences/upto-hol\nsrc\n' > "$project/tools/build/build-sequence"
+printf 'src/simp/src\n' > "$project/tools/sequences/upto-hol"
+cat > "$project/src/simp/src/BoolconvContextScript.sml" <<'SML'
+open HolKernel Parse boolLib;
+val _ = new_theory "BoolconvContext";
+val _ = export_theory ();
+SML
+cat > "$project/src/simp/src/Traverse.sml" <<'SML'
+structure Traverse = struct end
+SML
 cat > "$project/src/interface.sml" <<'SML'
 signature DIFFERENT_NAME = sig val witness : bool end
 SML
@@ -50,7 +58,7 @@ cat > "$tmpdir/graph" <<JSON
 {
   "node_id" : 3,
   "target" : "$project/src/FixtureSyntax.uo",
-  "dependencies" : [2],
+  "dependencies" : [2, 6],
   "command" : "%%MOSCOWML_INDICATOR%% -toplevel -c interface.ui factory.ui FixtureSyntax.sml"
 },
 {
@@ -58,6 +66,17 @@ cat > "$tmpdir/graph" <<JSON
   "target" : "$project/src/BuildOnly.uo",
   "dependencies" : [3],
   "command" : "echo "build-only dependency""
+},
+{
+  "node_id" : 5,
+  "target" : "$project/src/simp/src/BoolconvContextScript.sml",
+  "dependencies" : []
+},
+{
+  "node_id" : 6,
+  "target" : "$project/src/simp/src/Traverse.uo",
+  "dependencies" : [1],
+  "command" : "%%MOSCOWML_INDICATOR%% -c -toplevel Traverse.sml"
 }
 ]
 JSON
@@ -77,9 +96,17 @@ val _ = HolbuildHolSourceManifest.generate
    run_command = fn _ => {status = OS.Process.success, output = graph}};
 SML
 poly --script "$tmpdir/generate.sml" > "$tmpdir/generate.log" 2>&1
+if grep -qx 'src/simp/src' "$tmpdir/members" || grep -q '"src/simp/src"' "$project/holproject.toml"; then
+  echo 'included preloaded upto-hol directory in hol-source.manifest members' >&2
+  exit 1
+fi
+if grep -q 'actions."Traverse"' "$project/holproject.toml"; then
+  echo 'emitted action policy for preloaded upto-hol module' >&2
+  exit 1
+fi
 require_grep '\[actions."factory"\]' "$project/holproject.toml"
 require_grep 'loads = \["interface"\]' "$project/holproject.toml"
-require_grep 'loads = \["factory"\]' "$project/holproject.toml"
+require_grep 'loads = \["factory", "Traverse"\]' "$project/holproject.toml"
 if grep -q 'actions."BuildOnly"' "$project/holproject.toml"; then
   echo 'imported arbitrary recipe dependencies as loads' >&2
   exit 1

@@ -102,9 +102,12 @@ fun write_text path text =
    coordinator stored the batch (it was stopped between storing and
    answering) leaves a copy that nobody follows: it runs to its end or
    deadline, repeating work whose results the cache dedupes. *)
-fun submit_with_query url query batch_text : attempt =
+fun submit_with_query url query maxheap batch_text : attempt =
   let
     val _ = HolbuildOffline.require_online "submit a remote batch"
+    val query = query ^ (case maxheap of
+        NONE => ""
+      | SOME n => (if query = "" then "?" else "&") ^ "max_heap_mb=" ^ Int.toString n)
     val body = HolbuildTempPath.temporary "remote-exec-batch"
     val _ = write_text body batch_text
     fun post delays =
@@ -144,7 +147,7 @@ fun submit_with_query url query batch_text : attempt =
     outcome
   end
 
-fun submit url batch_text = submit_with_query url "" batch_text
+fun submit url maxheap batch_text = submit_with_query url "" maxheap batch_text
 
 (* The input key of the theory a failed batch's workers could not use, when
    the coordinator failed it for resubmission naming the theory as
