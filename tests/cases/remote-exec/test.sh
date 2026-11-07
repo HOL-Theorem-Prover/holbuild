@@ -579,6 +579,48 @@ batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/leaf-cold.log")
 require_grep "^action .* rx:DTheory$" "$state/$batch.batch"
 rm "$project/src/CScript.sml" "$project/src/DScript.sml"
 
+# A theory built here for its current source needs no worker, though the
+# remote cache lacks it (its publish failed, say): with ATheory's remote
+# entry gone, BTheory changing alone sends nothing to the workers.
+write_theories built-here
+run built-here-base 0 build BTheory
+key_a=$(awk -F= '/^input_key=/ { print $2; exit }' "$project/.holbuild/dep/rx/src/AScript.sml.key")
+ac_a=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key_a" | sha256sum | cut -d' ' -f1)
+rm "$remote_root/ac/$ac_a"
+sed -i 's/(\* built-here \*)/(* built-here-leaf *)/' "$project/src/BScript.sml"
+: > "$state/requests.log"
+run built-here 0 build --remote-exec "$coordinator" BTheory
+require_grep "remote execution: rx:BTheory stays out of the batch" "$tmpdir/built-here.log"
+refute_grep "^POST /v1/batches" "$state/requests.log"
+refute_grep "ATheory built" "$tmpdir/built-here.log"
+require_grep "BTheory built" "$tmpdir/built-here.log"
+[[ ! -e "$remote_root/ac/$ac_a" ]] || { echo "ATheory published with no batch to need it" >&2; exit 1; }
+# A theory in the batch that depends on it gets it from the remote cache,
+# where it goes from the local cache rather than to the workers: BTheory and
+# CTheory change together, so both go to the workers, and ATheory doesn't.
+rm -r "$project/.holbuild/checkpoints"
+sed -i 's/(\* built-here-leaf \*)/(* built-here-batch *)/' "$project/src/BScript.sml"
+printf 'Theory C\nAncestors A\n\nTheorem c_thm:\n  T\nProof\n  simp[]\nQED\n' > "$project/src/CScript.sml"
+run built-here-batch 0 build --remote-exec "$coordinator" BTheory CTheory
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/built-here-batch.log")
+refute_grep "^action .* rx:ATheory$" "$state/$batch.batch"
+require_grep "^action .* rx:BTheory$" "$state/$batch.batch"
+require_grep "^action .* rx:CTheory$" "$state/$batch.batch"
+require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/built-here-batch.log"
+[[ -e "$remote_root/ac/$ac_a" ]] || { echo "ATheory was not published" >&2; exit 1; }
+# Without a local cache entry to publish, it goes to the workers.
+rm "$remote_root/ac/$ac_a"
+rm -r "$HOLBUILD_CACHE/actions/$key_a"
+rm -rf "$project/.holbuild/checkpoints"
+sed -i 's/(\* built-here-batch \*)/(* built-here-unpublished *)/' "$project/src/BScript.sml"
+sed -i 's/simp\[\]$/simp[] (* unpublished *)/' "$project/src/CScript.sml"
+run built-here-unpublished 0 build --remote-exec "$coordinator" BTheory CTheory
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/built-here-unpublished.log")
+require_grep "^action $key_a .* rx:ATheory$" "$state/$batch.batch"
+require_grep "^edge [0-9a-f]* $key_a$" "$state/$batch.batch"
+require_grep "remote execution: remote workers finished 3 of 3 theories" "$tmpdir/built-here-unpublished.log"
+rm "$project/src/CScript.sml"
+
 # A submission answered 502 while the coordinator restarts is retried, and
 # given up on when it stays down.
 write_theories restarting
