@@ -5469,12 +5469,22 @@ fun restore_only_options ({use_cache, verify_cache, force, force_targets, skip_c
    allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy, trknl = trknl,
    restore_only = true}
 
-(* The error of a theory whose proof failed on a remote worker (failure
-   kind `proof` or `tactic-timeout`): the diagnostic a local build would
-   give, from the worker's build log, which the remote cache holds as blob
-   `log_sha256`.  The log goes where a local build leaves it.  NONE when the
-   theory isn't in the plan or the log can't be fetched.  Runs no HOL. *)
-fun remote_proof_failure (options : build_options) tc project plan toolchain_key {input_key, kind, log_sha256} =
+(* The plan's node whose action has input key `input_key`. *)
+fun node_with_input_key (options : build_options) tc project plan toolchain_key input_key =
+  let
+    val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
+                 (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
+  in
+    List.find (fn node => HolbuildBuildPlan.input_key_for keys node = input_key)
+              (HolbuildBuildPlan.selected_nodes plan)
+  end
+
+(* The error of theory `node`, whose proof failed on a remote worker
+   (failure kind `proof` or `tactic-timeout`): the diagnostic a local build
+   would give, from the worker's build log, which the remote cache holds as
+   blob `log_sha256`.  The log goes where a local build leaves it.  NONE when
+   the log can't be fetched.  Runs no HOL. *)
+fun remote_proof_failure (options : build_options) tc project plan toolchain_key node {kind, log_sha256} =
   let
     val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
                  (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
@@ -5518,10 +5528,7 @@ fun remote_proof_failure (options : build_options) tc project plan toolchain_key
           end
       end
   in
-    case List.find (fn node => HolbuildBuildPlan.input_key_for keys node = input_key)
-                   (HolbuildBuildPlan.selected_nodes plan) of
-        SOME node => (diagnose node handle Error _ => NONE)
-      | NONE => NONE
+    diagnose node handle Error _ => NONE
   end
 
 (* ActionSpecs: a theory action serialized for a remote worker, and the batch

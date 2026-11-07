@@ -643,6 +643,10 @@ require_grep "remote rxp:BTheory: failed (proof), log /cas/$log_sha" "$tmpdir/pr
 require_grep "remote execution: batch $batch failed: an action failed; remote workers finished 1 of 2 theories" "$tmpdir/proof.log"
 require_grep "ATheory restored from cache" "$tmpdir/proof.log"
 require_grep "proof failed on a remote worker while building BTheory" "$tmpdir/proof.log"
+# What only B's log yields: where the proof failed, and its goal.
+require_grep "^theorem: b_thm (line 4)$" "$tmpdir/proof.log"
+require_grep "^> 7 |   simp\[\] (\* one \*)$" "$tmpdir/proof.log"
+require_grep 'Failed to prove theorem "b_thm"' "$tmpdir/proof.log"
 require_grep "instrumented log: .*/.holbuild/logs/current/rxp/BTheory/build.log" "$tmpdir/proof.log"
 refute_grep "Theory built\|building locally" "$tmpdir/proof.log"
 [[ $(sha256sum < "$project/.holbuild/logs/current/rxp/BTheory/build.log" | cut -d' ' -f1) == "$log_sha" ]] ||
@@ -654,14 +658,29 @@ refute_grep "Theory built\|building locally" "$tmpdir/proof.log"
 write_broken one-only
 run proof-only 1 build --remote-exec "$coordinator" --remote-only BTheory
 require_grep "proof failed on a remote worker while building BTheory" "$tmpdir/proof-only.log"
+require_grep "^theorem: b_thm (line 4)$" "$tmpdir/proof-only.log"
 
-# Without the log in the cache (the workers drop it), the build falls back
-# to building locally, which fails on the same proof.
+# Without the log in the cache (the workers drop it), the build builds only
+# the failed theory locally, which fails on the same proof: not C, which
+# doesn't need B and which the batch, failed at B, didn't finish.
 write_broken two
+cat > "$project/src/CScript.sml" <<SML
+Theory C
+Ancestors bool
+
+Theorem c_thm:
+  T
+Proof
+  simp[]
+QED
+SML
 touch "$state/drop-log"
-HOLBUILD_TIMING_LOG=$tmpdir/proof-nolog.timing run proof-nolog 1 build --remote-exec "$coordinator" BTheory
+HOLBUILD_TIMING_LOG=$tmpdir/proof-nolog.timing run proof-nolog 1 build --remote-exec "$coordinator" BTheory CTheory
 rm "$state/drop-log"
-require_grep "could not fetch the failed theory's build log; building locally" "$tmpdir/proof-nolog.log"
-require_grep "rxp:BTheory: failed (proof), log /cas/" "$tmpdir/proof-nolog.log"
-refute_grep "on a remote worker" "$tmpdir/proof-nolog.log"
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/proof-nolog.log")
+awk '$1 == "action" { print $5 }' "$state/$batch.batch" | tail -n 1 | grep -qx "rxp:CTheory" ||
+  { echo "C is not after B in the batch" >&2; cat "$state/$batch.batch" >&2; exit 1; }
+require_grep "could not fetch the failed theory's build log; building BTheory locally" "$tmpdir/proof-nolog.log"
+require_grep "^holbuild: theorem: b_thm (line 4)$" "$tmpdir/proof-nolog.log"
+refute_grep "on a remote worker\|CTheory built" "$tmpdir/proof-nolog.log"
 [[ $(local_hol_runs "$tmpdir/proof-nolog.timing") -gt 0 ]] || { cat "$tmpdir/proof-nolog.timing" >&2; exit 1; }
