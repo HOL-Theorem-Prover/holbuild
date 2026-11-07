@@ -49,9 +49,10 @@ awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec the
   if [[ -e "$state/drop-log" ]]; then
     rm -f "$remote_root/cas/\$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/worker.result")"
   fi
-  # A failed action fails the batch, naming the theory it found missing.
+  # A failed action fails the batch, naming the theory or blob it found
+  # missing.
   [[ \$status -eq 0 ]] ||
-    { sed -n 's/^missing=theory //p' "$tmpdir/worker.result" > "$state/missing"; exit 1; }
+    { sed -n 's/^missing=//p' "$tmpdir/worker.result" > "$state/missing"; exit 1; }
 done
 SH
 chmod +x "$tmpdir/run-batch"
@@ -314,6 +315,21 @@ write_theories seven
 HOLBUILD_REMOTE_EXEC_CURL_CONFIG=$tmpdir/coordinator.curl run auth 0 build --remote-exec "$coordinator" BTheory
 require_grep "^POST /v1/batches Bearer stub-token$" "$state/requests.log"
 
+# The client remembers what the remote cache holds and doesn't ask again.  A
+# worker that finds something gone fails the batch; the client forgets what
+# it remembered, and the resubmitted batch builds.
+write_theories ledger
+run ledger-seed 0 build --remote-exec "$coordinator" --remote-only BTheory
+[[ -n $(ls "$project/.holbuild/remote-ledger") ]] || { echo "the export left no remote ledger" >&2; exit 1; }
+# ATheory changes and BScript.sml doesn't, so its blob is remembered.
+sed -i 's/(\* ledger \*)/(* ledger-a *)/' "$project/src/AScript.sml"
+b_source=$(sha256sum "$project/src/BScript.sml" | cut -d' ' -f1)
+rm "$remote_root/cas/$b_source" "$tmpdir/worker-cache/blobs/$b_source"
+run ledger 0 build --remote-exec "$coordinator" --remote-only BTheory
+require_grep "still missing blob $b_source after 3 attempts; .*; resubmitting$" "$tmpdir/ledger.log"
+require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/ledger.log"
+[[ -f "$remote_root/cas/$b_source" ]] || { echo "the resubmission did not upload BScript.sml again" >&2; exit 1; }
+
 # Flags that need --remote-exec, and ones it excludes.
 run no-url 1 build --remote-only BTheory
 require_grep "need --remote-exec URL" "$tmpdir/no-url.log"
@@ -560,8 +576,10 @@ batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/built-here-alone.log")
 require_grep "^action .* rx:BTheory$" "$state/$batch.batch"
 refute_grep "^action .* rx:ATheory$" "$state/$batch.batch"
 require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/built-here-alone.log"
-# Without a local cache entry to publish, it goes to the workers.
+# Without a local cache entry to publish, it goes to the workers.  The
+# remote ledger, which says the remote has it, goes too.
 rm "$remote_root/ac/$ac_a"
+rm -r "$project/.holbuild/remote-ledger"
 rm -r "$HOLBUILD_CACHE/actions/$key_a"
 sed -i 's/(\* built-here-alone \*)/(* built-here-unpublished *)/' "$project/src/BScript.sml"
 sed -i 's/simp\[\]$/simp[] (* unpublished *)/' "$project/src/CScript.sml"
@@ -613,7 +631,8 @@ rm "$state/unavailable" "$state/unavailable-status"
 # proof-only edit of A rebuilds A and reuses the earlier builds of B and C,
 # whose dependencies' outputs are unchanged; an edit that changes A's
 # outputs rebuilds them; and an edited B, on unchanged dependency outputs,
-# resumes from the deps heap its last build shared.
+# resumes from the deps heap its last build shared.  Only targets share
+# heaps, so those builds name B as a target.
 project=$tmpdir/cutoff
 mkdir -p "$project/src"
 cat > "$project/holproject.toml" <<TOML
@@ -686,12 +705,12 @@ results built cached cached
 
 a2=$'Theorem a2_thm:\n  T\nProof\n  simp[]\nQED'
 write_cutoff three one "$a2"
-run cutoff-output 0 build --remote-exec "$coordinator" CTheory
+run cutoff-output 0 build --remote-exec "$coordinator" BTheory CTheory
 refute_grep "early cutoff" "$tmpdir/worker.log"
 results built built built
 
 write_cutoff four four "$a2"
-run cutoff-dependent 0 build --remote-exec "$coordinator" CTheory
+run cutoff-dependent 0 build --remote-exec "$coordinator" BTheory CTheory
 require_grep "BTheory restored from cache" "$tmpdir/cutoff-dependent.log"
 refute_grep "Theory built" "$tmpdir/cutoff-dependent.log"
 grep -A1 "^resuming BTheory$" "$tmpdir/worker.log" | grep -q "from: deps-loaded checkpoint" ||
@@ -762,6 +781,14 @@ write_broken one-only
 run proof-only 1 build --remote-exec "$coordinator" --remote-only BTheory
 require_grep "proof failed on a remote worker while building BTheory" "$tmpdir/proof-only.log"
 require_grep "^theorem: b_thm (line 4)$" "$tmpdir/proof-only.log"
+# The same edit again, its spec gone from the remote cache meanwhile: the
+# export uploads the spec again, though the remote ledger knows its hash.
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/proof-only.log")
+b_spec=$(awk '$1 == "action" && $5 == "rxp:BTheory" { print $4 }' "$state/$batch.batch")
+rm "$remote_root/cas/$b_spec"
+run proof-only-again 1 build --remote-exec "$coordinator" --remote-only BTheory
+require_grep "proof failed on a remote worker while building BTheory" "$tmpdir/proof-only-again.log"
+[[ -f "$remote_root/cas/$b_spec" ]] || { echo "the export did not upload the spec again" >&2; exit 1; }
 
 # Without the log in the cache (the workers drop it), the build builds only
 # the failed theory locally, which fails on the same proof: not C, which
