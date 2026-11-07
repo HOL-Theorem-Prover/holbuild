@@ -502,7 +502,7 @@ rm "$state/cancelled"
 sed -i 's/(\* cancelled \*)/(* leaf-local *)/' "$project/src/BScript.sml"
 : > "$state/requests.log"
 run leaf-local-only 75 build --remote-exec "$coordinator" --remote-only BTheory
-require_grep "remote execution: rx:BTheory stays out of the batch, to resume from its local checkpoints" "$tmpdir/leaf-local-only.log"
+require_grep "remote execution: rx:BTheory stays out of the batch, to resume from its local checkpoints; --remote-only builds nothing locally, so build it without --remote-only" "$tmpdir/leaf-local-only.log"
 require_grep "BTheory is not in the remote cache, and --remote-only builds nothing locally" "$tmpdir/leaf-local-only.log"
 run leaf-local 0 build --remote-exec "$coordinator" BTheory
 require_grep "remote execution: rx:BTheory stays out of the batch, to resume from its local checkpoints" "$tmpdir/leaf-local.log"

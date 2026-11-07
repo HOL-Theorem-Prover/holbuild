@@ -1225,8 +1225,8 @@ it from scratch, so the build that follows the batch builds it locally
 instead, which is what an edit-and-rebuild loop on one theory needs. holbuild
 says so for each such theory (`holbuild: remote execution: rx:BTheory stays
 out of the batch, to resume from its local checkpoints`). With
-`--remote-only` it is not built, and the build exits with status 75, as
-below. `--detach` submits every theory the remote cache lacks.
+`--remote-only` it is not built: the line says to build it without
+`--remote-only`, and the build exits with status 75, as below. `--detach` submits every theory the remote cache lacks.
 
 The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the

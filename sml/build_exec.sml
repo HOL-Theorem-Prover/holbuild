@@ -5659,8 +5659,9 @@ fun publish_spec_blob remote path =
    With local_resumable, a leaf of the batch (no theory in it depends on it)
    whose local build would resume from a checkpoint is left out, for the local
    build that follows to build: that is faster than running it from scratch
-   on a worker, which has none of the project's checkpoints. *)
-fun export_action_specs (options : build_options) tc project plan toolchain_key {upload, local_resumable} =
+   on a worker, which has none of the project's checkpoints.  Under
+   remote_only, which builds nothing locally, the message says so. *)
+fun export_action_specs (options : build_options) tc project plan toolchain_key {upload, local_resumable, remote_only} =
   let
     val remote =
       case HolbuildRemoteCacheConfig.url () of
@@ -5722,7 +5723,9 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       List.app (fn (node, _) =>
                    HolbuildStatus.message_stderr
                      ("holbuild: remote execution: " ^ package node ^ ":" ^ logical_name node ^
-                      " stays out of the batch, to resume from its local checkpoints\n"))
+                      " stays out of the batch, to resume from its local checkpoints" ^
+                      (if remote_only then "; --remote-only builds nothing locally, so build it without --remote-only"
+                       else "") ^ "\n"))
                local_actions
     val uncached = uncached_in uncached_actions
     val toolchain_line =
