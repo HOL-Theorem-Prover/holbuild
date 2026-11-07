@@ -78,9 +78,11 @@ the executable into a directory already on `PATH`.
 The executable includes the Poly/ML runtime, so running it does not require
 an installed Poly/ML. Building HOL toolchains still requires `poly` and
 `polyc`, plus HOL's other build dependencies. Archives include holbuild's
-`LICENSE`, the SML/NJ notice, and Poly/ML's license and corresponding source
-in `share/holbuild`. Poly/ML is built with `--disable-shared --without-gmp`;
-the holbuild sources for rebuilding/relinking are available at the release tag.
+`LICENSE`, the SML/NJ notice, and Poly/ML's license in `share/holbuild`.
+The same release also offers `polyml-v5.9.2-seq3-source.tar.gz`, the exact
+Poly/ML sources used for both binaries. Poly/ML is built with
+`--disable-shared --without-gmp`; the holbuild sources for rebuilding/relinking
+are available at the release tag.
 
 ### Build from source
 
@@ -1564,8 +1566,8 @@ Maintainer checklist:
 4. The **Release binaries** workflow builds Linux x86_64 and macOS arm64
    archives, then tests downloaded copies on fresh runners without Poly/ML.
    Only after both platforms pass does it attach the archives and
-   `SHA256SUMS` to the release. It creates a release with generated notes if
-   none exists for the tag; an existing release (including a draft) retains
+   `SHA256SUMS`, plus the shared Poly/ML source archive, to the release. It
+   creates a release with generated notes if none exists for the tag; an existing release (including a draft) retains
    its notes and publication state. Summarise user-visible changes in those
    notes, and publish the draft if you prepared one.
 

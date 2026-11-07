@@ -21,6 +21,9 @@ defaults:
   run:
     shell: bash
 
+env:
+  POLYML_TAG: v5.9.2-seq3
+
 jobs:
   build:
     strategy:
@@ -37,8 +40,6 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Build static Poly/ML
-        env:
-          POLYML_TAG: v5.9.2-seq3
         run: |
           git clone --depth 1 --branch "$POLYML_TAG" https://github.com/sequent-dev-bot/polyml.git "$RUNNER_TEMP/polyml"
           cd "$RUNNER_TEMP/polyml"
@@ -62,11 +63,14 @@ jobs:
           make install PREFIX=/ DESTDIR="$stage"
           cp LICENSE "$stage/LICENSE"
           cp "$RUNNER_TEMP/polyml/COPYING" "$stage/share/holbuild/copyrights/polyml-LGPL-2.1.txt"
-          git -C "$RUNNER_TEMP/polyml" archive --format=tar.gz --prefix=polyml/ HEAD > "$stage/share/holbuild/polyml-source.tar.gz"
-          git -C "$RUNNER_TEMP/polyml" rev-parse HEAD > "$stage/share/holbuild/polyml-revision.txt"
           mkdir -p dist
           tar -czf "dist/$name.tar.gz" -C "$RUNNER_TEMP/package" "$name"
           (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+          if [[ "$PLATFORM" == linux-x86_64 ]]; then
+            source_name="polyml-$POLYML_TAG-source.tar.gz"
+            git -C "$RUNNER_TEMP/polyml" archive --format=tar.gz --prefix=polyml/ HEAD > "dist/$source_name"
+            (cd dist && shasum -a 256 "$source_name" > "$source_name.sha256")
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -103,14 +107,15 @@ jobs:
           fi
           cd download
           shasum -a 256 -c ./*.sha256
-          tar -xzf ./*.tar.gz
+          archives=(holbuild-*.tar.gz)
+          test "${#archives[@]}" = 1
+          tar -xzf "${archives[0]}"
           roots=(holbuild-*/)
           test "${#roots[@]}" = 1
           root=${roots[0]%/}
           test -s "$root/LICENSE"
           test -s "$root/share/holbuild/copyrights/smlnj.txt"
           test -s "$root/share/holbuild/copyrights/polyml-LGPL-2.1.txt"
-          test -s "$root/share/holbuild/polyml-source.tar.gz"
           test -s "$root/share/holbuild/sml/holbuild_runtime.sml"
           if [[ "$PLATFORM" == linux-* ]]; then
             ldd "$root/bin/holbuild" | tee dependencies.txt
