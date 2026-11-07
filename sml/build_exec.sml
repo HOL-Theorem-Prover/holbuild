@@ -2512,6 +2512,35 @@ fun declaration_checkpoint_specs proof_engine proof_timeout base deps_key inputs
           end)
       terminations
 
+(* The holbuild sources a theory child loads, directly or through the HOL
+   analyser that instruments its script.  They end up in saved heaps, so local
+   dependency heaps are keyed on them and a worker runs only specs exported by
+   holbuild with the same sources. *)
+val runtime_source_files =
+  HolbuildToolchain.runtime_files @
+  ["sml/checkpoint_save_runtime.sml", "sml/proof_runtime.sml", "sml/tactic_compat_runtime.sml",
+   "sml/diagnostic_limits.sml"] @
+  map (fn file => normalize_path (Path.concat("sml/analyser", file)))
+      HolbuildHolSharedCache.analyser_source_files
+
+val runtime_identity_memo : string option ref = ref NONE
+
+fun runtime_identity () =
+  case !runtime_identity_memo of
+      SOME identity => identity
+    | NONE =>
+        let
+          fun line rel =
+            rel ^ " " ^ HolbuildHash.file_sha256 (Path.concat(HolbuildRuntimePaths.runtime_root (), rel))
+          val identity =
+            HolbuildToolchain.hash_text
+              (String.concatWith "\n"
+                 ("holbuild-runtime-v1" :: map line (sort_strings (unique_strings runtime_source_files))) ^ "\n")
+        in
+          runtime_identity_memo := SOME identity;
+          identity
+        end
+
 (* The dependency context keyed on the dependencies' input keys.  Remote
    action specs and key dumps use this one: it is known before anything is
    built. *)
@@ -2536,10 +2565,11 @@ fun dependency_input_context_key toolchain_key plan keys node =
             val key =
               HolbuildToolchain.hash_text
                 (String.concatWith "\n"
-                   (* Local heaps must contain the export-normalizing runtime.
-                      Artifact action keys remain compatible. *)
+                   (* Local heaps contain the runtime, so they are keyed on it.
+                      Artifact action keys don't depend on it. *)
                    (["holbuild-dependency-context-v2",
-                     "toolchain_key=" ^ toolchain_key] @ project_lines @ theory_lines @ lib_lines) ^ "\n")
+                     "toolchain_key=" ^ toolchain_key,
+                     "runtime=" ^ runtime_identity ()] @ project_lines @ theory_lines @ lib_lines) ^ "\n")
           in
             HolbuildBuildPlan.remember_dependency_context_key plan node context_id key;
             key
@@ -2857,6 +2887,7 @@ fun dependency_context_key toolchain_key plan keys node =
                       (String.concatWith "\n"
                          (["holbuild-dependency-context-v3",
                            "toolchain_key=" ^ toolchain_key,
+                           "runtime=" ^ runtime_identity (),
                            "deps_output_key=" ^ outputs_key] @ theory_lines @ lib_lines) ^ "\n")
                 in
                   HolbuildBuildPlan.remember_dependency_context_key plan node context_id key;
@@ -5565,26 +5596,6 @@ fun remote_proof_failure (options : build_options) tc project plan toolchain_key
 
 val action_spec_header = "holbuild-action-spec-v1"
 val action_batch_header = "holbuild-action-batch-v1"
-
-(* The holbuild sources a theory child loads, directly or through the HOL
-   analyser that instruments its script.  They end up in saved heaps, so a
-   worker runs only specs exported by holbuild with the same sources. *)
-val runtime_source_files =
-  HolbuildToolchain.runtime_files @
-  ["sml/checkpoint_save_runtime.sml", "sml/proof_runtime.sml", "sml/tactic_compat_runtime.sml",
-   "sml/diagnostic_limits.sml"] @
-  map (fn file => normalize_path (Path.concat("sml/analyser", file)))
-      HolbuildHolSharedCache.analyser_source_files
-
-fun runtime_identity () =
-  let
-    fun line rel =
-      rel ^ " " ^ HolbuildHash.file_sha256 (Path.concat(HolbuildRuntimePaths.runtime_root (), rel))
-  in
-    HolbuildToolchain.hash_text
-      (String.concatWith "\n"
-         ("holbuild-runtime-v1" :: map line (sort_strings (unique_strings runtime_source_files))) ^ "\n")
-  end
 
 fun spec_token context text =
   if text <> "" andalso not (CharVector.exists (fn c => Char.isSpace c orelse Char.isCntrl c) text)

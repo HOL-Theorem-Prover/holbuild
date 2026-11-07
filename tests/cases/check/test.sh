@@ -210,7 +210,8 @@ fingerprint_of() {
 }
 
 run_fingerprint FpTheory 0
-fp_lines=$lines
+fp_lines=$tmpdir/fingerprint-before-rebuild.lines
+cp "$lines" "$fp_lines"
 if ! LC_ALL=C sort -c "$fp_lines"; then
   echo "fingerprint lines are not sorted" >&2
   exit 1
