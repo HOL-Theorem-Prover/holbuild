@@ -892,7 +892,7 @@ holbuild build --all-checkpoints MyTheory
 A theory's `deps_loaded` checkpoint, its dependencies loaded into the
 toolchain's base state, is also kept once per host in
 `$HOLBUILD_CACHE/checkpoint-store/`, keyed by the dependencies' input keys
-and their theories' `.dat` files, the theory's loads (by path relative to the project), the toolchain and the
+and their theories' `.dat` and generated `.sml` files, the theory's loads (by path relative to the project), the toolchain and the
 holbuild runtime. The project's directory isn't part of the key, so every
 worktree or copy of a project that uses the cache shares one heap per
 dependency set: a theory with no valid `deps_loaded` hard-links the stored

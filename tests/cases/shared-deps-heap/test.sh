@@ -75,7 +75,7 @@ printf 'val _ = app (fn d => print ("loadpath " ^ d ^ "\\n")) (!Meta.loadPath);\
 (cd "$tmpdir/elsewhere" && "$HOLDIR/bin/hol" run --noconfig --holstate "$stored" "$tmpdir/loadpath.sml") \
   > "$tmpdir/loadpath.log" 2>&1 || { cat "$tmpdir/loadpath.log" >&2; exit 1; }
 require_grep '^loadpath ' "$tmpdir/loadpath.log"
-if grep -q "^loadpath $first" "$tmpdir/loadpath.log"; then
+if grep -q -e "^loadpath $first" -e "^loadpath $(cd "$first" && pwd -P)" "$tmpdir/loadpath.log"; then
   echo "the stored heap's load path names the tree that saved it" >&2
   cat "$tmpdir/loadpath.log" >&2
   exit 1

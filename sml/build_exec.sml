@@ -4434,8 +4434,9 @@ fun build_theory_action cache_allowed policy tc root checkpoint_root base_contex
 
 (* The host's deps heaps.  A theory's deps_loaded state is a child of the
    toolchain's base state with its dependencies loaded: it depends on its
-   dependencies' input keys and their theories' .dat files (a theory build
-   need not be reproducible), its loads (by root-relative path), the toolchain and
+   dependencies' input keys and their theories' .dat and generated .sml
+   files (a theory build need not be reproducible, and the .sml names the
+   theory's ML dependencies, which the .dat doesn't), its loads (by root-relative path), the toolchain and
    the holbuild runtime, but not on the project root, so one copy in the host
    store, CACHE/checkpoint-store/<key>/deps_loaded.save, serves every
    worktree of a project, hard-linked into each.  (The deps key won't do: it
@@ -4446,8 +4447,12 @@ fun local_heap_context dat_hash_cache toolchain_key plan keys node =
   let
     fun is_theory dep = #kind (HolbuildBuildPlan.source_of dep) = HolbuildSourceIndex.TheoryScript
     fun line dep =
-      Option.map (fn hash => HolbuildBuildPlan.key dep ^ " " ^ hash)
-                 (cached_file_hash dat_hash_cache (#data_path (theory_outputs dep)))
+      let val {data_path, sml_path, ...} = theory_outputs dep
+      in
+        case (cached_file_hash dat_hash_cache data_path, cached_file_hash dat_hash_cache sml_path) of
+            (SOME dat, SOME sml) => SOME (HolbuildBuildPlan.key dep ^ " " ^ dat ^ " " ^ sml)
+          | _ => NONE
+      end
     val lines = map line (List.filter is_theory (HolbuildBuildPlan.transitive_project_deps plan node))
   in
     if List.all Option.isSome lines then
