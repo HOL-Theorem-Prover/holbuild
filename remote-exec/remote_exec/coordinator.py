@@ -134,7 +134,7 @@ Amount = Annotated[int, Field(ge=0, le=2**53)]
 class HostReport:
     """What a worker reports of its host with a claim or heartbeat (``HostReport`` in worker.py): the share of CPU
     time idle lately, memory in bytes as holbuild's ``--cooperate-dir`` admission sees it, and whether that
-    admission would hold a child back now."""
+    admission would hold a child back now or held the worker back since its last report."""
 
     id: Annotated[str, Field(max_length=64)]  # the host's boot_id
     cpu_idle_pct: Annotated[float, Field(ge=0, le=100)] | None

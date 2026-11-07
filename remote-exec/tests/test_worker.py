@@ -493,6 +493,15 @@ def test_worker_waits_for_memory_and_says_so_once(
     assert capsys.readouterr().err.count("waiting for memory before claiming") == 1
 
 
+def test_wait_for_memory_says_whether_it_waited(host: Host, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(worker, "MEMORY_POLL_SECONDS", 0.05)
+    assert not wait_for_memory(str(host.dir), 3 * GIB)
+    host.available(10 * GIB)
+    host.lease(3 * GIB)
+    threading.Timer(0.2, host.available, (20 * GIB,)).start()
+    assert wait_for_memory(str(host.dir), 3 * GIB)
+
+
 def test_iowait_is_not_idle_cpu_time() -> None:
     # user nice system idle iowait irq softirq steal guest guest_nice
     assert cpu_times("cpu  10 1 5 100 20 0 2 0 7 0") == (100, 138)
@@ -519,14 +528,16 @@ def test_host_report_has_idle_cpu_since_the_last_report_and_admissions_view(
     host.lease(3 * GIB)
     host.lease(3 * GIB)
     first = reporter.report()
+    assert first is not None
     assert (first.id, first.cpu_idle_pct, first.leases, first.reserved) == ("b0a7", None, 2, 6 * GIB)
     assert (first.mem_total, first.mem_available, first.memory_short) == (64 * GIB, 40 * GIB, False)
 
     stat.write_text("cpu  300 0 0 100 0 0 0 0 0 0\n")
-    assert reporter.report().cpu_idle_pct == 25.0
+    assert (report := reporter.report()) is not None and report.cpu_idle_pct == 25.0
     host.available(10 * GIB)
     stat.write_text("cpu  350 0 0 400 50 0 0 0 0 0\n")
     second = reporter.report()
+    assert second is not None
     assert (second.cpu_idle_pct, second.memory_short) == (75.0, True)
 
 
@@ -559,19 +570,35 @@ def test_cpu_counters_going_backwards_give_no_idle_share(telemetry: tuple[HostTe
     assert reporter.report().cpu_idle_pct is None
 
 
-def test_a_report_does_not_wait_for_an_admission_holding_the_lock(
+def test_no_report_while_an_admission_holds_the_lock_or_the_host_cannot_be_read(
+    host: Host, telemetry: tuple[HostTelemetry, Path], server: Server
+) -> None:
+    reporter, stat = telemetry
+    host.lease(3 * GIB)
+    coordinator = Coordinator(server.url, "w", reporter)
+    with open(host.dir / "lock") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        assert coordinator.heartbeat("t")
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        assert coordinator.heartbeat("t")
+    stat.write_text("intr 1\n")
+    assert coordinator.heartbeat("t")
+
+    reports = [beat["host"] for beat in server.heartbeats]
+    assert reports[0] is None and reports[2] is None
+    assert isinstance(reports[1], dict) and reports[1]["leases"] == 1
+
+
+def test_a_wait_for_memory_shows_as_memory_short_in_the_next_report(
     host: Host, telemetry: tuple[HostTelemetry, Path]
 ) -> None:
     reporter, _ = telemetry
     host.lease(3 * GIB)
-    with open(host.dir / "lock") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        first = reporter.report()
-        assert (first.mem_total, first.leases) == (64 * GIB, 0)  # /proc/meminfo alone
-        fcntl.flock(lock, fcntl.LOCK_UN)
-        assert reporter.report().leases == 1
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        assert reporter.report().leases == 1  # the last reading
+    reporter.waited = True
+    report = reporter.report()
+    assert report is not None and report.memory_short
+    report = reporter.report()
+    assert report is not None and not report.memory_short
 
 
 def test_a_worker_without_telemetry_sends_no_host(server: Server) -> None:

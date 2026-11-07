@@ -96,9 +96,10 @@ class Coordinator:
             return error.code, error.read().decode(errors="replace")
 
     def post_reporting(self, path: str, body: dict[str, Any], timeout: float = 30) -> tuple[int, Any]:
-        """``post`` a JSON body with the host's report in it."""
-        report = None if self.host is None else asdict(self.host.report())
-        return self.post(path, json.dumps({**body, "host": report}).encode(), "application/json", timeout)
+        """``post`` a JSON body with the host's report in it, or none when there is none."""
+        report = None if self.host is None else self.host.report()
+        host = None if report is None else asdict(report)
+        return self.post(path, json.dumps({**body, "host": host}).encode(), "application/json", timeout)
 
     def claim(self, tiers: list[str], worker: str, wait_s: float) -> dict[str, Any] | None:
         """An action, waiting up to ``wait_s`` seconds for one, or None."""
@@ -323,16 +324,19 @@ def child_charge(max_heap: int | None) -> int:
     return min(max_heap or DEFAULT_CHARGE_MIB, DEFAULT_CHARGE_MIB) * MIB
 
 
-def wait_for_memory(directory: str, charge: int) -> None:
+def wait_for_memory(directory: str, charge: int) -> bool:
     """Return once holbuild's admission in ``directory`` would start a child charged ``charge`` bytes, so that a
     worker on a host whose memory is taken doesn't claim an action only to wait on it while other hosts could run it.
-    A check, not a reservation: workers racing past it still wait in exec-action's own admission."""
+    A check, not a reservation: workers racing past it still wait in exec-action's own admission.
+
+    Returns whether it waited."""
     logged = False
     while (why := HostMemory.read(directory).shortfall(charge)) is not None:
         if not logged:
             print(f"waiting for memory before claiming: {why}", file=sys.stderr, flush=True)
             logged = True
         time.sleep(MEMORY_POLL_SECONDS)
+    return logged
 
 
 def cpu_times(stat_line: str) -> tuple[int, int]:
@@ -348,7 +352,7 @@ def cpu_times(stat_line: str) -> tuple[int, int]:
 @dataclass(frozen=True)
 class HostReport:
     """A worker's report of its host to the coordinator; memory in bytes as in HostMemory, and ``memory_short`` when
-    admission would hold a child back now."""
+    admission would hold a child back now or held this worker back since its last report."""
 
     id: str
     cpu_idle_pct: float | None  # since the CPU sample it was last measured from, None under CPU_SAMPLE_SECONDS ago
@@ -370,21 +374,23 @@ class HostTelemetry:
         self.charge = charge
         self.lock = threading.Lock()
         self.cpu: tuple[float, int, int] | None = None  # when, idle and total of the CPU sample measured from
-        self.memory: HostMemory | None = None  # the last reading
+        self.waited = False  # whether wait_for_memory held the worker back since the last report
 
-    def report(self) -> HostReport:
-        """The host now. It doesn't wait for the cooperate dir's lock, which would hold up the heartbeat that renews
-        a running action's lease: while an admission holds the lock, the memory is the last reading, or
-        ``/proc/meminfo`` alone before the first."""
+    def report(self) -> HostReport | None:
+        """The host now, or None when it can't be read now. It doesn't wait for the cooperate dir's lock, which
+        would hold up the heartbeat that renews a running action's lease: while an admission holds it, there is no
+        report."""
         try:
             memory = HostMemory.read(self.cooperate_dir, wait=False)
-        except BlockingIOError:
-            memory = self.memory or HostMemory.read(None)
-        self.memory = memory
-        with open(PROC_STAT) as file:
-            idle, total = cpu_times(file.readline())
+            with open(PROC_STAT) as file:
+                idle, total = cpu_times(file.readline())
+        except (OSError, ValueError) as error:
+            if not isinstance(error, BlockingIOError):
+                print(f"reading the host for the coordinator failed: {error}", file=sys.stderr)
+            return None
         now = time.monotonic()
         with self.lock:
+            waited, self.waited = self.waited, False
             idle_pct = None
             if self.cpu is None or now - self.cpu[0] >= CPU_SAMPLE_SECONDS:
                 # The kernel's iowait count can go backwards (Documentation/filesystems/proc.rst), so a share
@@ -400,7 +406,7 @@ class HostTelemetry:
             memory.budget,
             memory.reserved,
             memory.leases,
-            memory.shortfall(self.charge) is not None,
+            memory.shortfall(self.charge) is not None or waited,
         )
 
 
@@ -578,7 +584,12 @@ def main() -> None:
     if not os.environ.get("HOLBUILD_CACHE"):
         sys.exit("HOLBUILD_CACHE is not set; give the worker its own cache root")
     charge = child_charge(args.max_heap)
-    coordinator = Coordinator(args.coordinator, token, HostTelemetry(args.cooperate_dir, charge))
+    try:
+        host: HostTelemetry | None = HostTelemetry(args.cooperate_dir, charge)
+    except OSError as error:
+        print(f"not reporting the host to the coordinator: {error}", file=sys.stderr)
+        host = None
+    coordinator = Coordinator(args.coordinator, token, host)
     releases = Releases(
         args.holbuild_releases_dir,
         args.holbuild_source_url,
@@ -590,8 +601,8 @@ def main() -> None:
     # Exit through Python on SIGTERM, so run_one's cleanup stops the running action.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
     while True:
-        if args.cooperate_dir is not None:
-            wait_for_memory(args.cooperate_dir, charge)
+        if args.cooperate_dir is not None and wait_for_memory(args.cooperate_dir, charge) and host is not None:
+            host.waited = True
         started = time.monotonic()
         try:
             claim = coordinator.claim(tiers, args.name, args.claim_wait_seconds)

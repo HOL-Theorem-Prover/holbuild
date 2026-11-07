@@ -104,8 +104,10 @@ Each claim and heartbeat also reports the worker's host: its id (the kernel's
 `boot_id`, the same in every container on the host), the share of CPU time
 idle since the worker's previous CPU sample (iowait counts as busy), its
 memory as holbuild's admission sees it, and whether that admission would
-hold a child back now. `GET /v1/queue` lists them, so a reader can tell
-whether hosts have CPU to spare or are short of memory.
+hold a child back now or held the worker back since its last report. A
+report is left out when the host can't be read at once, as while an
+admission holds the cooperate dir's lock. `GET /v1/queue` lists them, so a
+reader can tell whether hosts have CPU to spare or are short of memory.
 
 ## Batches and actions
 
@@ -329,7 +331,8 @@ gets 401. Errors are JSON `{"detail": "<message>"}`.
   Memory is in bytes: `MemTotal` and `MemAvailable`, the `--cooperate-dir`
   budget, the charges of the leases held there and their number;
   `memory_short` is true when admission would hold back a child of the
-  worker's `--max-heap` now.
+  worker's `--max-heap` now, or held the worker back from claiming since its
+  previous report.
 
 ### Worker
 
