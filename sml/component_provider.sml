@@ -165,13 +165,23 @@ fun ensure_output ({preparation, ...} : analysis_state)
 fun runs_generators ({preparation, ...} : analysis_state) =
   HolbuildPackagePrepare.requires_live_preparation preparation
 
-fun ensure_extra_input state (source : HolbuildSourceIndex.source) base relative_path =
+fun ensure_extra_input ({preparation, ...} : analysis_state)
+                       (source : HolbuildSourceIndex.source) base relative_path =
   let
     val absolute = OS.Path.mkCanonical (OS.Path.concat(base, relative_path))
-    val package_relative =
-      HolbuildSourceIndex.relative_path (#package_root source) absolute
+    val prefix = if String.isSuffix "/" absolute then absolute else absolute ^ "/"
+    val glob = CharVector.exists (fn c => c = #"*" orelse c = #"?") relative_path
+    fun matches output =
+      let
+        val path = OS.Path.mkCanonical (OS.Path.concat(#package_root source, output))
+      in
+        if glob then
+          HolbuildSourceIndex.glob_match relative_path
+            (HolbuildSourceIndex.relative_path base path)
+        else path = absolute orelse String.isPrefix prefix path
+      end
   in
-    ensure_output state source package_relative
+    HolbuildPackagePrepare.ensure_outputs preparation (#package source) matches
   end
 
 fun source_hash (state as {hashes, ...} : analysis_state) source =
