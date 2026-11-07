@@ -1366,3 +1366,26 @@ async def test_run_memory_failure_uses_the_existing_profile_hint_and_high_tier(
     await claim_named(http, "b")
     assert await claim(http) is None
     await claim_named(http, "a", "high")
+
+
+@pytest.mark.parametrize("action_class", ["build", "run"])
+@pytest.mark.parametrize("max_heap_mb", [None, 4096, 16000])
+async def test_claim_carries_its_batch_heap_limit(
+    http: httpx.AsyncClient, action_class: str, max_heap_mb: int | None
+) -> None:
+    params = {"class": action_class}
+    if max_heap_mb is not None:
+        params["max_heap_mb"] = str(max_heap_mb)
+    await submit(http, ["A", "B"], **params)
+    first, second = await claim(http), await claim(http)
+    assert first is not None and second is not None
+    assert first["max_heap_mb"] == second["max_heap_mb"] == max_heap_mb
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "bad", "2147483648"])
+async def test_submit_rejects_invalid_heap_limit(http: httpx.AsyncClient, value: str) -> None:
+    response = await http.post(
+        "/v1/batches", params={"max_heap_mb": value}, content=batch_text(["A"]), headers=CLIENT
+    )
+    assert response.status_code == 422
+    assert await claim(http) is None
