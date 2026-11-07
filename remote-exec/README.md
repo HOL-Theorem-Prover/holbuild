@@ -109,6 +109,24 @@ report is left out when the host can't be read at once, as while an
 admission holds the cooperate dir's lock. `GET /v1/queue` lists them, so a
 reader can tell whether hosts have CPU to spare or are short of memory.
 
+Each claim also reports where the worker's time went since its previous
+claim, in seconds per phase, so a reader of `GET /v1/queue` can tell what
+workers do when they aren't running HOL:
+
+- `memory_wait`: waiting for the host's memory before claiming;
+- `claim`: in claim requests, waiting ones included;
+- `idle`: sleeping after a claim that got nothing or failed;
+- `lease`: taking and giving up a claimed action's lease: setting and
+  clearing scale-in protection, and stopping the heartbeat;
+- `release`: finding and, on first use, building the action's holbuild release;
+- `before_hol`, `hol`, `after_hol`: running `exec-action`, split at the start
+  of its first HOL child and the end of its last (fetching and restoring
+  inputs before, publishing outputs and checkpoints after). A HOL child is a
+  descendant of `exec-action` holding a `--cooperate-dir` lease, which the
+  worker looks for every second;
+- `exec`: all of `exec-action`, for a worker without `--cooperate-dir`;
+- `complete`: reporting the result.
+
 ## Batches and actions
 
 A batch is the text `holbuild action-spec --upload` prints:
@@ -328,10 +346,16 @@ gets 401. Errors are JSON `{"detail": "<message>"}`.
 
 `GET /v1/queue`
 
-- 200 `{"waiting": 0, "ready_standard": 0, "ready_high": 0, "running_standard": 0, "running_high": 0, "desired_burst_workers": 0, "hosts": [<host>, …]}`:
-  the unfinished actions of running batches, the burst worker target, and the
+- 200 `{"waiting": 0, "ready_standard": 0, "ready_high": 0, "running_standard": 0, "running_high": 0, "desired_burst_workers": 0, "hosts": [<host>, …], "phases": <phases>}`:
+  the unfinished actions of running batches, the burst worker target, the
   hosts whose workers reported to this coordinator process in the last 2
-  minutes, by id. A host is its workers' latest report, `age_s` seconds old,
+  minutes, by id, and the sums of the phase reports it got in the last 10
+  minutes (see "Running"):
+  ```json
+  {"window_s": 600, "reports": 4210, "seconds": {"memory_wait": 0.0, "claim": 812.4, "idle": 0.0, "lease": 12.5, "release": 31.0, "before_hol": 40210.7, "hol": 52300.2, "after_hol": 44102.9, "exec": 0.0, "complete": 950.3}}
+  ```
+  A phase's share of the workers' time is its seconds over the sum of all.
+  A host is its workers' latest report, `age_s` seconds old,
   except that `cpu_idle_pct` is the latest one measured:
   ```json
   {"id": "<boot_id>", "cpu_idle_pct": 31.5, "mem_total": 133680000000, "mem_available": 61200000000, "budget": 120800000000, "reserved": 92300000000, "leases": 29, "memory_short": false, "age_s": 1.2}
@@ -344,8 +368,10 @@ gets 401. Errors are JSON `{"detail": "<message>"}`.
 
 ### Worker
 
-`POST /v1/work/claim` with `{"tier": "standard|high", "also_claim": ["standard|high", …], "worker": "<name>", "wait_s": 20, "host": <report>}`
-(`also_claim`, `wait_s` and `host` are optional; `wait_s` is how long the coordinator
+`POST /v1/work/claim` with `{"tier": "standard|high", "also_claim": ["standard|high", …], "worker": "<name>", "wait_s": 20, "host": <report>, "phases": {"<phase>": <seconds>, …}}`
+(`also_claim`, `wait_s`, `host` and `phases` are optional; `phases` gives the
+seconds the worker spent in each phase since its previous claim, each
+non-negative, a missing phase 0; `wait_s` is how long the coordinator
 holds the request open for an action to become ready, 0 by default and at
 most 50, so that a proxy's usual 60 s idle timeout doesn't cut it; `host` is
 the worker's report of its host, a host of `GET /v1/queue` without `age_s`,

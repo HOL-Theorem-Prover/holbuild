@@ -101,7 +101,7 @@ async def test_queue_reports_counts_and_the_desired_burst_workers(
 
     response = await http.get("/v1/queue", headers=CLIENT)
     assert response.status_code == 200
-    assert response.json() == {
+    assert response.json() | {"phases": None} == {
         "waiting": 1,
         "ready_standard": 1,
         "ready_high": 0,
@@ -109,6 +109,7 @@ async def test_queue_reports_counts_and_the_desired_burst_workers(
         "running_high": 0,
         "desired_burst_workers": 0,  # the route's coordinator has no burst workers to ask for
         "hosts": [],
+        "phases": None,  # see test_queue_sums_the_phases_workers_reported_in_the_last_ten_minutes
     }
     assert (await scaled.queue()).desired_burst_workers == 1
     assert (await http.get("/v1/queue", headers=WORKER)).status_code == 401
@@ -297,6 +298,33 @@ async def test_queue_lists_the_hosts_workers_reported(http: httpx.AsyncClient, c
     now += timedelta(seconds=120)
     assert (await http.get("/v1/queue", headers=CLIENT)).json()["hosts"] == []
     assert coordinator.hosts == {}
+
+
+async def test_queue_sums_the_phases_workers_reported_in_the_last_ten_minutes(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    coordinator.clock = lambda: now
+    for phases in ({"claim": 0.5, "hol": 30.0}, {"after_hol": 12.0, "hol": 10.0}):
+        response = await http.post(
+            "/v1/work/claim", json={"tier": "standard", "worker": "w1", "phases": phases}, headers=WORKER
+        )
+        assert response.status_code == 204
+        now += timedelta(seconds=300)
+
+    seconds = dict.fromkeys(["memory_wait", "claim", "idle", "lease", "release", "before_hol", "exec", "complete"], 0.0)
+    totals = (await http.get("/v1/queue", headers=CLIENT)).json()["phases"]
+    assert totals == {"window_s": 600, "reports": 1, "seconds": {**seconds, "hol": 10.0, "after_hol": 12.0}}
+
+    now += timedelta(seconds=300)
+    assert (await http.get("/v1/queue", headers=CLIENT)).json()["phases"]["reports"] == 0
+
+
+async def test_a_negative_phase_report_is_refused(http: httpx.AsyncClient) -> None:
+    response = await http.post(
+        "/v1/work/claim", json={"tier": "standard", "worker": "w1", "phases": {"hol": -1}}, headers=WORKER
+    )
+    assert response.status_code == 422
 
 
 async def test_a_heartbeat_with_no_body_still_extends_the_lease(http: httpx.AsyncClient) -> None:

@@ -84,6 +84,8 @@ val CURLOPT_USERPWD = 10005
 val CURLOPT_READDATA = 10009
 val CURLOPT_ERRORBUFFER = 10010
 val CURLOPT_TIMEOUT = 13
+val CURLOPT_LOW_SPEED_LIMIT = 19
+val CURLOPT_LOW_SPEED_TIME = 20
 val CURLOPT_CONNECTTIMEOUT = 78
 val CURLOPT_HTTPHEADER = 10023
 val CURLOPT_NOBODY = 44
@@ -103,6 +105,10 @@ val CURL_ERROR_SIZE = 0w256
 
 (* Seconds to wait for a connection, in both remote cache clients. *)
 val connect_timeout_seconds = 5
+
+(* The longest any transfer may take, in both remote cache clients, however
+   steadily it moves data. *)
+val max_transfer_seconds = 1800
 
 val userpwd : string option ref = ref NONE
 
@@ -314,12 +320,17 @@ fun with_file path mode f =
   end
 
 (* Runs one request on a pooled connection, writing the response body to
-   output.  set_options sets the request's own options; the data pointers
-   are cleared afterwards, so the pooled handle keeps none of them. *)
+   output.  It fails once it has moved no data for timeout seconds, or after
+   max_transfer_seconds: a slow transfer that keeps moving, as a large upload
+   to a busy server, isn't cut off.  set_options sets the request's own
+   options; the data pointers are cleared afterwards, so the pooled handle
+   keeps none of them. *)
 fun request {url, timeout, output, set_options} =
   (HolbuildOffline.require_online "send an HTTP request";
   with_handle (fn connection as {easy, ...} =>
-    (check "TIMEOUT" (setopt_long (easy, CURLOPT_TIMEOUT, timeout));
+    (check "TIMEOUT" (setopt_long (easy, CURLOPT_TIMEOUT, max_transfer_seconds));
+     check "LOW_SPEED_LIMIT" (setopt_long (easy, CURLOPT_LOW_SPEED_LIMIT, 1));
+     check "LOW_SPEED_TIME" (setopt_long (easy, CURLOPT_LOW_SPEED_TIME, timeout));
      check "URL" (setopt_str (easy, CURLOPT_URL, url));
      check "WRITEDATA" (setopt_ptr (easy, CURLOPT_WRITEDATA, output));
      set_options easy;

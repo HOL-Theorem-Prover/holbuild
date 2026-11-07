@@ -1679,6 +1679,7 @@ fun split_remote_exec_flags args =
 
 fun build tc cli_jobs args =
   let
+    val _ = HolbuildDiagnosticLimits.validate ()
     val ({url, remote_only, detach, attach}, args) = split_remote_exec_flags args
     val parsed as ({dry_run, watch, repl_on_failure, trace_steps, execution_plan, ...}, _) = split_flags args
     val _ =

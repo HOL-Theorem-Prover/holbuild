@@ -391,7 +391,6 @@ fun failed_theorem_source_summary source_path source_text checkpoints label theo
                            SOME end_pos => end_span checkpoint end_pos
                          | NONE => {offset = #tactic_start checkpoint, width = 1}))
 
-val goal_state_limit = 4096
 val goal_state_start_marker = "holbuild failed tactic top input goal:"
 val goal_state_end_marker = "holbuild end failed tactic top input goal"
 val remaining_goals_marker = "holbuild failed tactic input goal count: "
@@ -433,7 +432,7 @@ fun top_goal_state_from_text text =
                 SOME {top_goal = String.substring(text, content_start, rel_end), marker_truncated = false}
             | NONE =>
                 SOME {top_goal = String.substring(text, content_start,
-                                                  Int.min(goal_state_limit, size text - content_start)),
+                                                  size text - content_start),
                       marker_truncated = true}
         end
 
@@ -452,7 +451,9 @@ fun plan_position_from_text text =
         end
 
 fun read_goal_state path =
-  let val text = read_prefix path 65536
+  let
+    val limit = HolbuildDiagnosticLimits.goal_state ()
+    val text = if limit = 0 then read_text path else read_prefix path (65536 + limit)
   in
     case top_goal_state_from_text text of
         NONE => NONE
@@ -495,8 +496,11 @@ fun find_failed_fragment_span lines =
     lines
 
 fun truncate_goal_state text =
-  if size text <= goal_state_limit then (false, text)
-  else (true, String.substring(text, 0, goal_state_limit))
+  let val limit = HolbuildDiagnosticLimits.goal_state ()
+  in
+    if limit = 0 orelse size text <= limit then (false, text)
+    else (true, String.substring(text, 0, limit))
+  end
 
 fun remaining_goals_summary NONE = ""
   | remaining_goals_summary (SOME n) = "failed tactic input goals: " ^ Int.toString n ^ "\n"
@@ -507,10 +511,10 @@ fun all_goals_log_summary log_available (SOME n) =
 
 fun truncation_summary log_available preview =
   if log_available then
-    String.concat ["top goal exceeded 4 KiB; showing first ",
+    String.concat ["top goal truncated; showing first ",
                    Int.toString (size preview), " bytes; full top goal is in the instrumented log referenced below\n"]
   else
-    String.concat ["top goal exceeded 4 KiB; showing first ",
+    String.concat ["top goal truncated; showing first ",
                    Int.toString (size preview), " bytes\n"]
 
 fun goal_state_summary log_available {remaining_goals, top_goal, marker_truncated} =
