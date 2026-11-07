@@ -187,6 +187,15 @@ fun new_connection () : connection =
 val pool_mutex = Mutex.mutex ()
 val idle : connection list ref = ref []
 
+(* The most idle connections the pool keeps.  A burst of requests (the
+   remote cache prefetch) opens a connection per thread; the pool keeps only
+   as many as the build's steady-state workers reuse and closes the rest,
+   whose sockets would otherwise idle, and once the server closes its side
+   sit in CLOSE-WAIT, for the whole build. *)
+val max_idle = ref 8
+
+fun set_max_idle n = max_idle := Int.max (1, n)
+
 fun with_pool_lock f =
   let
     val _ = Mutex.lock pool_mutex
@@ -203,7 +212,11 @@ fun take () =
       SOME connection => connection
     | NONE => new_connection ()
 
-fun give connection = with_pool_lock (fn () => idle := connection :: !idle)
+fun give connection =
+  if with_pool_lock (fn () =>
+       length (!idle) < !max_idle andalso (idle := connection :: !idle; true))
+  then ()
+  else close connection
 
 (* A connection whose request raised may be left mid-transfer, so it is
    closed rather than pooled. *)

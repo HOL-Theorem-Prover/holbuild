@@ -198,7 +198,9 @@ val _ = assert "the handle works after a timeout"
                 = HolbuildHttp.Response 200)
 
 (* Concurrent requests share the pool without mixing up transfers: each of
-   16 threads uploads 25 bodies and reads each back. *)
+   16 threads uploads 25 bodies and reads each back.  The pool keeps at most
+   4 of the connections they open. *)
+val _ = HolbuildHttp.set_max_idle 4
 fun write_file path text =
   let val output = TextIO.openOut path in TextIO.output (output, text); TextIO.closeOut output end
 val results_mutex = Mutex.mutex ()
@@ -231,7 +233,8 @@ val _ = List.app (fn thread => ignore (Thread.fork (fn () => client thread, []))
 val _ = wait_for "the concurrent requests" (fn () => !finished = 16) (Time.+ (Time.now (), Time.fromSeconds 60))
 val _ = assert ("concurrent requests failed: " ^ String.concatWith ", " (!failures)) (null (!failures))
 
-(* The pooled connection is still open; a child must not inherit it. *)
+(* The pooled connections are still open, at most 4 of them; a child must
+   not inherit them. *)
 fun socket_count request =
   let val result = HolbuildSpawn.run request
   in
@@ -242,9 +245,14 @@ fun socket_count request =
 val self = Int.toString (SysWord.toInt (Posix.Process.pidToWord (Posix.ProcEnv.getpid ())))
 val _ =
   if OS.FileSys.access ("/proc/self/fd", []) then
-    (assert "the parent holds the pooled connection"
-            (socket_count {program = "python3", args = [dir ^ "/tcp-sockets.py", self],
-                           stderr = HolbuildSpawn.Inherit} > 0);
+    (let
+       val pooled = socket_count {program = "python3", args = [dir ^ "/tcp-sockets.py", self],
+                                  stderr = HolbuildSpawn.Inherit}
+     in
+       assert "the parent holds the pooled connections" (pooled > 0);
+       assert ("the parent holds " ^ Int.toString pooled ^ " connections, above the cap of 4")
+              (pooled <= 4)
+     end;
      assert "a spawned child inherits no connection"
             (socket_count {program = "sh", args = ["-c", "python3 \"$0\" $$", dir ^ "/tcp-sockets.py"],
                            stderr = HolbuildSpawn.Inherit} = 0))
