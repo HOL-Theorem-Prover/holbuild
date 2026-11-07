@@ -1462,6 +1462,10 @@ def test_cache_ring_settings_accept_both_environment_names(monkeypatch: pytest.M
     monkeypatch.setenv("REMOTE_EXEC_CACHE_URL", "http://explicit.test/")
     assert Settings(**args).cache_url == "http://explicit.test"
     assert Settings(**args, cache_url="http://argument.test/").cache_url == "http://argument.test"
+    monkeypatch.delenv("REMOTE_EXEC_CACHE_URL")
+    monkeypatch.delenv("HOLBUILD_REMOTE_CACHE_URL")
+    with pytest.raises(ValueError, match="remote cache URL must not be empty"):
+        Settings(**args)
 
 
 def test_cache_ring_identity_ignores_credentials_but_preserves_request_urls() -> None:

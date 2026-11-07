@@ -9,6 +9,7 @@ import contextlib
 import graphlib
 import json
 import logging
+import os
 import shlex
 import time
 from collections import defaultdict, deque
@@ -21,7 +22,7 @@ from uuid import UUID, uuid4
 import asyncpg
 import httpx
 import sqlalchemy as sa
-from pydantic import AliasChoices, Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
@@ -58,12 +59,12 @@ class Settings(BaseSettings):
     """The coordinator's configuration, from ``REMOTE_EXEC_*`` environment variables."""
 
     # hide_input_in_errors: a validation error would otherwise print every setting, credentials included.
-    model_config = SettingsConfigDict(env_prefix="REMOTE_EXEC_", hide_input_in_errors=True, populate_by_name=True)
+    model_config = SettingsConfigDict(env_prefix="REMOTE_EXEC_", hide_input_in_errors=True)
 
     database_url: str  # postgresql+asyncpg://...
     client_token: SecretStr
     worker_token: SecretStr
-    cache_url: str = Field(validation_alias=AliasChoices("REMOTE_EXEC_CACHE_URL", "HOLBUILD_REMOTE_CACHE_URL"))
+    cache_url: str = Field(default_factory=lambda: os.environ.get("HOLBUILD_REMOTE_CACHE_URL", ""))
 
     lease_seconds: int = 120
     max_attempts: int = 3
