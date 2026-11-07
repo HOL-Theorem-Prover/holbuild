@@ -822,8 +822,6 @@ fun with_store_leases f =
 
 fun find_store_lease path = List.find (fn (held, _, _) => held = path) (!store_leases)
 
-fun holds_store_lease path = with_store_leases (fn () => Option.isSome (find_store_lease path))
-
 fun lease_store_family store heap =
   let val path = store_lease_path (Path.concat(store, heap))
   in
@@ -858,21 +856,22 @@ fun with_store_family_lease store heap f =
 fun evict_store_family_if eligible dir =
   let val lease = store_lease_path dir
   in
-    if holds_store_lease lease then NONE
-    else
-      case HolbuildFileLock.try_acquire_path {path = lease, obsolete_kind = NONE}
-           handle HolbuildFileLock.Error _ => NONE of
-          NONE => NONE
-        | SOME lock =>
-            if not (eligible () handle e => (HolbuildFileLock.release lock; raise e)) then
-              (HolbuildFileLock.release lock; NONE)
-            else
-              let val bytes = tree_bytes dir
-              in
-                (HolbuildCache.remove_tree dir handle e => (HolbuildFileLock.release lock; raise e));
-                HolbuildFileLock.release lock;
-                if path_exists dir then NONE else SOME bytes
-              end
+    with_store_leases (fn () =>
+      if Option.isSome (find_store_lease lease) then NONE
+      else
+        case HolbuildFileLock.try_acquire_path {path = lease, obsolete_kind = NONE}
+             handle HolbuildFileLock.Error _ => NONE of
+            NONE => NONE
+          | SOME lock =>
+              if not (eligible () handle e => (HolbuildFileLock.release lock; raise e)) then
+                (HolbuildFileLock.release lock; NONE)
+              else
+                let val bytes = tree_bytes dir
+                in
+                  (HolbuildCache.remove_tree dir handle e => (HolbuildFileLock.release lock; raise e));
+                  HolbuildFileLock.release lock;
+                  if path_exists dir then NONE else SOME bytes
+                end)
   end
 
 fun evict_store_family dir = evict_store_family_if (fn () => true) dir
