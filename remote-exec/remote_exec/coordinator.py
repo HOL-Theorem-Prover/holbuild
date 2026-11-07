@@ -33,6 +33,10 @@ CLAIM_RECHECK_SECONDS = 5  # how often a waiting claim looks for actions another
 ENTRY_BLOB = re.compile(r"^blob ([0-9a-f]{64}) [0-9]+$", re.MULTILINE)
 ENTRY_MANIFEST_MARKER = "manifest-text-v1\n"
 
+# A statement, or a transaction left idle, that runs longer than this is ended by the database, so one stuck
+# query can't hold a connection, or the locks it took, for good.
+DATABASE_STATEMENT_TIMEOUT = "60s"
+
 # A scale command that runs longer than this is killed, so it can't stall the sweep.
 SCALE_CMD_TIMEOUT_S = 60
 
@@ -57,6 +61,9 @@ class Settings(BaseSettings):
     hint_ttl_days: int = 30
     sweep_seconds: float = 5.0
     events_poll_seconds: float = 1.0
+    # Database connections the coordinator holds at most, and how long a request waits for one before it fails.
+    database_pool_size: int = 20
+    database_pool_timeout_s: float = 10.0
     # Burst workers: workers that a scaler starts and stops on top of `warm_workers` always-on ones.
     warm_workers: int = 0
     max_burst_workers: int = 0
@@ -185,20 +192,21 @@ REFRESH_CHILDREN = sa.text(
 )
 
 
-# The ready action to claim next; see Coordinator.claim.
+# The ready action to claim next; see Coordinator.claim. Only the batches with a ready action of the tiers are
+# ranked, each from its own index entries, so a claim reads neither finished batches nor finished actions.
 CLAIM = sa.text("""
-WITH running_batches AS (
+WITH ready_batches AS MATERIALIZED (
     SELECT b.id, b.created_at,
-        count(a.input_key) FILTER (WHERE a.state = 'running') AS running_count,
-        max(a.last_claimed_at) AS last_claimed_at
+        (SELECT count(*) FROM actions r WHERE r.batch_id = b.id AND r.state = 'running') AS running_count,
+        (SELECT max(c.last_claimed_at) FROM actions c WHERE c.batch_id = b.id) AS last_claimed_at
     FROM batches b
-    LEFT JOIN actions a ON a.batch_id = b.id
-    WHERE b.state = 'running'
-    GROUP BY b.id, b.created_at
+    WHERE b.state = 'running' AND b.id IN (
+        SELECT batch_id FROM actions WHERE state = 'ready' AND tier = ANY(CAST(:tiers AS text[]))
+    )
 )
 SELECT a.batch_id, a.input_key, a.spec_sha256, a.theory
 FROM actions a
-JOIN running_batches b ON b.id = a.batch_id
+JOIN ready_batches b ON b.id = a.batch_id
 WHERE a.state = 'ready' AND a.tier = ANY(CAST(:tiers AS text[]))
 ORDER BY
     array_position(CAST(:tiers AS text[]), a.tier),
@@ -235,7 +243,19 @@ class Coordinator:
     @classmethod
     def from_settings(cls, settings: Settings) -> "Coordinator":
         return cls(
-            create_async_engine(settings.database_url, pool_pre_ping=True),
+            create_async_engine(
+                settings.database_url,
+                pool_pre_ping=True,
+                pool_size=settings.database_pool_size,
+                max_overflow=0,
+                pool_timeout=settings.database_pool_timeout_s,
+                connect_args={
+                    "server_settings": {
+                        "statement_timeout": DATABASE_STATEMENT_TIMEOUT,
+                        "idle_in_transaction_session_timeout": DATABASE_STATEMENT_TIMEOUT,
+                    }
+                },
+            ),
             httpx.AsyncClient(base_url=settings.cache_url, timeout=30, follow_redirects=True),
             settings,
         )
