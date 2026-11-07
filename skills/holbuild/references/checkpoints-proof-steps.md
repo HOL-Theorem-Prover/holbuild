@@ -57,7 +57,7 @@ Runs theorem proofs through proof steps without saving `.save`/`.ok` files. No `
 
 ## Target-only theorem checkpoints and `--all-checkpoints`
 
-By default, theorem-context, end-of-proof, declaration and failed-prefix checkpoints are saved only in the requested targets (the default targets when none are given, or every root-package theory when there are none). Every root-package theory still saves its `deps_loaded` checkpoint and runs with proof steps and step timeouts. An edit to a non-target starts from `deps_loaded`; building it as a target saves its theorem checkpoints. `--all-checkpoints` saves them in every root-package theory. Theory outputs and keys don't change either way. Under `--remote-exec`, a non-target's action spec says `option theorem-checkpoints=false` and the worker skips them too.
+By default, theorem-context, end-of-proof, declaration and failed-prefix checkpoints are saved only in the requested targets (the default targets when none are given, or every root-package theory when there are none). Every root-package theory still saves its `deps_loaded` checkpoint and runs with proof steps and step timeouts. An edit to a non-target starts from `deps_loaded`; rebuilding it as a target (after an edit, or with `--force=theory`) saves its theorem checkpoints. `--repl-on-failure` saves them everywhere. `--all-checkpoints` saves them in every root-package theory. Theory outputs and keys don't change either way. Under `--remote-exec`, a non-target's action spec says `option theorem-checkpoints=false` and the worker skips them too.
 
 ## `--skip-proof-steps`
 

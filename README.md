@@ -871,7 +871,8 @@ holbuild build --all-checkpoints MyTheory
   none); the other theories still save their `deps_loaded` checkpoint and run
   with proof steps and step timeouts, so a cold build writes far fewer `.save`
   files. An edit to such a theory starts from its `deps_loaded` checkpoint, and
-  building it as a target saves its theorem checkpoints. Theory outputs and
+  rebuilding it as a target (after an edit, or with `--force=theory`) saves its
+  theorem checkpoints. `--repl-on-failure` saves them everywhere. Theory outputs and
   cache keys are the same either way. Under `--remote-exec`, the action specs
   carry the choice to the workers.
 

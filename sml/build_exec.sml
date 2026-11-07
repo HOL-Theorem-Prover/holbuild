@@ -3940,7 +3940,9 @@ fun checkpoint_policy_for_node (options as {skip_checkpoints, proof_steps, new_i
   if root_package_node project node then
     CheckpointPolicy {checkpoint = not skip_checkpoints,
                       theorem_checkpoints =
-                        not skip_checkpoints andalso checkpoint_target_node options node,
+                        (* The REPL starts from a failed proof wherever it is. *)
+                        not skip_checkpoints andalso
+                        (repl_on_failure orelse checkpoint_target_node options node),
                       proof_steps = proof_steps,
                       new_ir = new_ir,
                       tactic_timeout = effective_tactic_timeout proof_steps
