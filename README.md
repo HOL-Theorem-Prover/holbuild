@@ -1341,7 +1341,8 @@ A *run* is an SML script run in the context of a built theory: HOL started
 from the toolchain, the theory's ancestry restorable, libraries loaded, and
 the script's declared output files kept. Its result is keyed by what it
 reads, so the same run is done once. `run-action --export-only` writes and
-uploads the run spec of each target; this release does not run or fetch them.
+uploads the run spec of each target, which a worker runs with `exec-action`
+(below); this release does not submit or fetch them.
 
 ```sh
 holbuild --remote-cache https://cache.example.org run-action --export-only \
@@ -1414,7 +1415,8 @@ run-text
 - `context` names the theory to restore, as a `dep theory` line does.
 - `file context-script` lines are the scripts of the context theory and of
   every theory it depends on, under `.holbuild/action-src/<package>/`, for
-  scripts that read their ancestry's sources.
+  scripts that read their ancestry's sources. For a project context the
+  first is the context theory's own.
 - `run-load` lines are the libraries to load, in order: a project library by
   its `lib` line's name, a toolchain library as `HOLLIB:<name>`.
 - `output` lines are the file names the script must write.
@@ -1464,6 +1466,52 @@ copies, for the action's retry to restore the remote cache's; such a build
 is not published but fails as a `publish` failure. A missing dependency
 fails the action; the worker never builds one.
 
+A run spec (`holbuild-run-spec-v1`, see "Exporting script runs for remote
+execution") is checked the same way, its run text against its `run-key`,
+and reported `cached`, without installing the toolchain or starting HOL, if
+the remote cache holds the run's entry with every output. Otherwise the
+worker fetches the context and ancestry scripts, library sources and the
+script with its support files, restores the dependencies, and a project
+context theory like one of them (a HOL context's objects and script come
+with the toolchain), and runs, in the script's directory,
+
+```sh
+hol run --noconfig --holstate <toolchain>/bin/hol.state <prelude> <script>
+```
+
+where the prelude puts the action root's object directories on `loadPath`
+and loads the `run-load` libraries in order (a project or `hol` package
+library compiles from source as it loads). The script loads the context
+theory itself, and is given:
+
+| Variable | Value |
+|---|---|
+| `HOLBUILD_RUN_ROOT` | the action root, holding the restored context under `.holbuild/` |
+| `HOLBUILD_RUN_CONTEXT` | `<package>:<logical>`, or `HOL:<logical>` |
+| `HOLBUILD_RUN_CONTEXT_KEY` | the context theory's input key; for a HOL context, the semantic toolchain key |
+| `HOLBUILD_RUN_SOURCE` | the context theory's script: under the root, or for a HOL context in the toolchain's source tree (empty if it has none) |
+| `HOLBUILD_RUN_OUTPUT_DIR` | the directory to write each declared output in |
+| `HOLBUILD_RUN_SCRATCH` | an empty directory of its own, removed with the root |
+
+Its support files are beside it, under the names they were exported with.
+If HOL exits 0 having written every declared output as a file, the worker
+uploads the outputs to `/cas/` and puts the run's entry at its key:
+
+```text
+holbuild-cache-action-v4
+input_key=<run_key>
+kind=run
+parent <input_key>              (a project context's; none for a HOL context)
+blob output:<name> <sha256>     (one per output, sorted by name)
+```
+
+and checks that the remote cache then holds an entry with these outputs, as
+for a theory. A script that fails, or leaves a declared output unwritten,
+fails as `script`; one still running when its `option timeout` elapses is
+killed with its process group and fails as `timeout`. Neither publishes
+anything, and both are final: rerunning the same script on the same
+context does the same.
+
 It writes this record to `--result FILE`, or to stdout:
 
 ```text
@@ -1471,7 +1519,7 @@ holbuild-action-result-v1
 spec=<sha256>
 input-key=<input_key>
 status=built|cached|failed
-failure=proof|tactic-timeout|memory|input-missing|publish|toolchain|disk|spec-rejected|internal
+failure=proof|tactic-timeout|script|timeout|memory|input-missing|publish|toolchain|disk|spec-rejected|internal
 missing=theory <input_key> | blob <sha256>
 peak-rss-mb=<n>
 wall-ms=<n>
@@ -1480,20 +1528,21 @@ log=<sha256> <size>
 ```
 
 `failure` appears on failure, and `missing` with `input-missing`.
+For a run, `input-key` is its run key and `built` means it ran.
 `phase-ms` gives the wall time of each phase that ran, in order: `cap` (the
 cache cap sweep), `spec`, `toolchain`, `hydrate` (sources, libraries and
 dependencies), `cutoff` (whether an earlier build stands), `restore` (shared
 checkpoints), `hol`, `publish` (shared checkpoints), `check` (the
 publication checks) and `log`; stderr ends with the same times and `wall`.
 `peak-rss-mb` is the HOL process's peak resident memory on a successful build.
-`log` is the build log, uploaded to `/cas/`. `memory` means Poly/ML ran out
+`log` is the build log, or the run's HOL output, uploaded to `/cas/`. `memory` means Poly/ML ran out
 of heap or the container's cgroup `memory.events` counted an OOM kill during
 the run; `disk` means the disk filled. The exit status summarizes the record:
 
 | Exit | Meaning |
 |---|---|
 | 0 | built or cached |
-| 1 | `proof` or `tactic-timeout`: final, retrying won't help |
+| 1 | `proof`, `tactic-timeout`, `script` or `timeout`: final, retrying won't help |
 | 2 | `memory`: retry with more memory |
 | 3 | `input-missing`, `publish`, `toolchain`, `disk` or `internal`: retry or resubmit |
 | 4 | `spec-rejected` |

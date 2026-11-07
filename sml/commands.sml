@@ -258,12 +258,13 @@ fun exec_action_help () = print
   \  holbuild --remote-cache URL [GLOBAL OPTIONS] exec-action SPEC-SHA256\n\
   \      --cache-limit-gb N [--cache-reserve-gb N] [--share-heaps] [--result FILE]\n\n\
   \Run the ActionSpec stored in the remote cache as SPEC-SHA256 (see\n\
-  \action-spec) and publish its result to the remote cache. The action runs in\n\
-  \CACHE/action, with checkpoints in CACHE/checkpoints, where CACHE is the cache\n\
-  \root. Writes a holbuild-action-result-v1 record to FILE, or to stdout.\n\n\
-  \Exit status: 0 built or cached; 1 proof or tactic-timeout failure; 2 out of\n\
-  \memory; 3 input-missing, publish, toolchain, disk or internal failure;\n\
-  \4 spec rejected.\n\n\
+  \action-spec), or the run spec (see run-action), and publish its result to\n\
+  \the remote cache. The action runs in CACHE/action, with checkpoints in\n\
+  \CACHE/checkpoints, where CACHE is the cache root. Writes a\n\
+  \holbuild-action-result-v1 record to FILE, or to stdout.\n\n\
+  \Exit status: 0 built or cached; 1 proof, tactic-timeout, script or timeout\n\
+  \failure; 2 out of memory; 3 input-missing, publish, toolchain, disk or\n\
+  \internal failure; 4 spec rejected.\n\n\
   \--cache-limit-gb N   Before the action, evict least recently used\n\
   \                     checkpoints, toolchains and local cache entries until\n\
   \                     the cache root holds at most N GB minus the reserve.\n\
