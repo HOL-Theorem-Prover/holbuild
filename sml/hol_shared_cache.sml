@@ -692,7 +692,8 @@ fun restore_entry k =
         NONE => NotRestored
       | SOME url =>
           (restore url
-           handle error =>
+           handle error as HolbuildRemoteCache.Unavailable _ => (cleanup_restore_state k; raise error)
+                | error =>
              (cleanup_restore_state k;
               warn_restore (archive_error_message error);
               case error of
@@ -701,7 +702,10 @@ fun restore_entry k =
   end
 
 (* Whether this entry's own archive is the one the remote now holds; with no
-   remote there is nothing else it could hold. *)
+   remote there is nothing else it could hold. A failed
+   publish, an unavailable remote cache's too, only warns: a remote worker
+   then adopts the published archive, whose restore reports the cache
+   unavailable, so it never keeps bytes the remote doesn't hold. *)
 fun publish_entry {replace} k =
   case HolbuildRemoteCacheConfig.url () of
       NONE => true

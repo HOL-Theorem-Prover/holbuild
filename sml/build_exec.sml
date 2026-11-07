@@ -1992,7 +1992,8 @@ fun put_remote_theory_action remote _ (request as {key, text}) =
   in
     attempt remote_theory_publish_attempts
   end
-  handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
+  handle e as HolbuildRemoteCache.Unavailable _ => raise e
+       | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
 fun remote_cache_destination remote : HolbuildCacheTransfer.destination =
   {put_action = put_remote_theory_action remote,
@@ -2047,7 +2048,8 @@ fun hydrate_remote_cache_key root key =
            (cache_trace ("remote cache hydrated: " ^ key); true)
          else
            (cache_trace ("remote cache miss: " ^ key); false))
-        handle e =>
+        handle e as HolbuildRemoteCache.Unavailable _ => raise e
+             | e =>
           (* A full disk is not a miss: the entry would be unusable for any
              key, and a rebuild needs the space too. *)
           if String.isSubstring "No space left on device" (General.exnMessage e) then raise e
@@ -6668,6 +6670,7 @@ datatype action_failure =
   | DiskFailure
   | SpecRejected
   | InternalFailure
+  | UnavailableFailure  (* the remote cache didn't answer; not the action's fault *)
 
 exception ActionFailed of action_failure * string
 
@@ -6680,6 +6683,7 @@ fun failure_name ProofFailure = "proof"
   | failure_name DiskFailure = "disk"
   | failure_name SpecRejected = "spec-rejected"
   | failure_name InternalFailure = "internal"
+  | failure_name UnavailableFailure = "unavailable"
 
 (* 1 is final, 2 retries on more memory, 3 retries or resubmits, 4 rejects. *)
 fun failure_exit_code ProofFailure = 1
@@ -6965,9 +6969,11 @@ val out_of_space = HolbuildCacheTransfer.out_of_space
 (* A full disk is a disk failure, whichever step hit it.  A failed download
    need not say so (curl reports only a failed write, or leaves a short
    file), so the cache root is probed too. *)
-fun action_failed failure msg =
-  ActionFailed (if String.isSubstring no_space msg orelse out_of_space (cache_root ()) then DiskFailure
-                else failure, msg)
+fun classify_failure failure msg =
+  (if String.isSubstring no_space msg orelse out_of_space (cache_root ()) then DiskFailure
+   else failure, msg)
+
+fun action_failed failure msg = ActionFailed (classify_failure failure msg)
 
 fun fetch_spec_blob remote {hash, dst} =
   (ensure_parent dst;
@@ -7053,7 +7059,8 @@ fun hydrate_action_root remote root (spec : action_spec) =
       (ensure_parent (in_root root stem);
        restore_spec_theory root spec
          {key = key, subject = target, stem = stem, extra_outputs = NONE, requested_timeout = NONE})
-      handle e => raise action_failed (InputMissing ("theory " ^ key))
+      handle e as HolbuildRemoteCache.Unavailable _ => raise e
+           | e => raise action_failed (InputMissing ("theory " ^ key))
                           ("dependency " ^ target ^ " (" ^ key ^ ") is not restorable from the cache: " ^
                            General.exnMessage e)
   in
@@ -7083,7 +7090,8 @@ fun action_already_done root (spec : action_spec) =
        {key = #input_key spec, subject = #package spec ^ ":" ^ #logical spec, stem = stem,
         extra_outputs = SOME (#extra_outputs spec), requested_timeout = #tactic_timeout spec};
      spec_parent_hashes_match root spec (in_root root data_path))
-    handle _ => false
+    handle e as HolbuildRemoteCache.Unavailable _ => raise e
+         | _ => false
   end
 
 (* Whether the remote's entry for the action, given by its manifest, records
@@ -7110,7 +7118,8 @@ fun resident_misfits_parents remote root (spec : action_spec) resident =
           end
       | _ => false
   end
-  handle _ => false
+  handle e as HolbuildRemoteCache.Unavailable _ => raise e
+       | _ => false
 
 (* Uploads every blob of the local entry for the action, raising if one fails
    (the build's own publish only warns), then puts the action.  A different
@@ -7131,7 +7140,8 @@ fun publish_action_entry remote root (spec : action_spec) =
     ensure_dir tmp_dir;
     (List.app (fn hash => ignore (HolbuildCacheTransfer.copy_blob source destination tmp_dir hash (0, 0)))
        (HolbuildCacheTransfer.unique_blobs manifest)
-     handle e => raise action_failed PublishFailure ("could not publish the entry: " ^ General.exnMessage e));
+     handle e as HolbuildRemoteCache.Unavailable _ => raise e
+          | e => raise action_failed PublishFailure ("could not publish the entry: " ^ General.exnMessage e));
     case HolbuildRemoteCache.get_action remote key of
         SOME resident =>
           if not (cache_manifest_outputs_equal key resident manifest handle _ => false) andalso
@@ -7928,12 +7938,14 @@ fun publish_early_cutoff remote pair_key input_key =
       HolbuildCacheBackend.Published => ()
     | HolbuildCacheBackend.AlreadyPresent => ()
     | _ => warn "could not publish the early cutoff entry"
+  handle HolbuildRemoteCache.Unavailable msg => warn ("could not publish the early cutoff entry: " ^ msg)
 
 (* Runs one ActionSpec, writes its result record and returns the exit code.
    `toolchain` ensures the spec's HOL toolchain and returns it. *)
 fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
   let
     val _ = HolbuildOffline.require_online "execute a remote action"
+    val _ = HolbuildRemoteCache.fail_closed := true
     val start = Time.now ()
     val remote =
       case HolbuildRemoteCacheConfig.url () of
@@ -7945,6 +7957,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
     val input_key = ref ""
     val target = ref ("", "")
     val peak = ref NONE
+    val log_unavailable = ref NONE
     (* Without shared heaps the checkpoint tree outlives the action root, so
        a rerun after an edit resumes from the checkpoints before it; the
        worker cache cap bounds it.  With them it is the action's own, filled
@@ -7964,7 +7977,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
               | _ => (warn "could not upload the action log"; NONE)
           end
       end
-      handle e => (warn ("could not upload the action log: " ^ General.exnMessage e); NONE)
+      handle HolbuildRemoteCache.Unavailable msg =>
+               (warn ("could not upload the action log: " ^ msg); log_unavailable := SOME msg; NONE)
+           | e => (warn ("could not upload the action log: " ^ General.exnMessage e); NONE)
     fun run () =
       let
         val _ = (HolbuildRemoveTree.remove_strict root; ensure_dir root)
@@ -7986,7 +8001,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
         val _ = publish_builds_remotely := false
         val tc =
           toolchain (#toolchain spec)
-          handle e => raise action_failed ToolchainFailure (General.exnMessage e)
+          handle e as HolbuildRemoteCache.Unavailable _ => raise e
+               | e => raise action_failed ToolchainFailure (General.exnMessage e)
         val _ =
           if HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key =
              action_text_value spec "toolchain" then ()
@@ -8073,6 +8089,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
     fun attempt () =
       (run (), NONE)
       handle ActionFailed failure => ("failed", SOME failure)
+           | HolbuildRemoteCache.Unavailable msg => ("failed", SOME (classify_failure UnavailableFailure msg))
            | e => ("failed", SOME (exception_failure e))
     val (status, failure, log) =
       with_action_root_lock cache
@@ -8094,8 +8111,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                     (SOME (kind, msg), NONE) =>
                       if (kind = ProofFailure orelse kind = TacticTimeoutFailure) andalso
                          file_exists (build_log ()) then
-                        SOME (PublishFailure, "could not upload the build log of a " ^
-                                              failure_name kind ^ " failure: " ^ msg)
+                        SOME (if Option.isSome (!log_unavailable) then UnavailableFailure else PublishFailure,
+                              "could not upload the build log of a " ^ failure_name kind ^ " failure: " ^ msg)
                       else failure
                   | _ => failure
             in

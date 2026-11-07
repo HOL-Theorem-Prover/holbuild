@@ -226,7 +226,8 @@ a run batch and cancels its unfinished actions.
 
   A worker that gets no answer from the cache for the action's spec, 429,
   5xx or a transfer cut short, as while the cache restarts, reports
-  `unavailable`. Any other error
+  `unavailable`, as `exec-action` does when the cache fails it so while
+  fetching the action's inputs or publishing its result. Any other error
   in the worker (`exec-action` ended without a result record because it
   crashed or was killed, the release didn't build, the cache doesn't have the
   spec) is reported as `internal`, so the action is retried at once rather

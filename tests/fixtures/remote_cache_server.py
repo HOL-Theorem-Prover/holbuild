@@ -101,6 +101,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(int((control / "get-status").read_text()))
             self.end_headers()
             return
+        if (
+            control is not None
+            and self.path.startswith("/ac/")
+            and (control / "ac-get-status").exists()
+        ):
+            self.send_response(int((control / "ac-get-status").read_text()))
+            self.end_headers()
+            return
         path = self.object_path()
         if path is None:
             return
@@ -154,6 +162,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             and (control / "cas-put-status").exists()
         ):
             self.send_response(int((control / "cas-put-status").read_text()))
+            self.end_headers()
+            return
+        if (
+            control is not None
+            and self.path.startswith("/ac/")
+            and (control / "ac-put-status").exists()
+        ):
+            self.send_response(int((control / "ac-put-status").read_text()))
             self.end_headers()
             return
         if self.headers.get("Content-Encoding") == "zstd":
