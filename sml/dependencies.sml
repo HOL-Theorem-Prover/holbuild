@@ -463,29 +463,46 @@ fun cache_text source_hash ({loads, uses, extra_deps, extra_outputs, holdep_ment
      map (fn value => "mention=" ^ value) holdep_mentions) ^ "\n"
 
 fun write_cache cache_path source_hash deps =
-  let
-    val tmp = cache_path ^ ".tmp"
-    val _ = ensure_parent cache_path
-    val out = TextIO.openOut tmp
-    val _ = (TextIO.output(out, cache_text source_hash deps); TextIO.closeOut out)
-            handle e => (TextIO.closeOut out; raise e)
-    val _ = OS.FileSys.remove cache_path handle OS.SysErr _ => ()
-    val _ = OS.FileSys.rename {old = tmp, new = cache_path}
-            handle e => (OS.FileSys.remove tmp handle OS.SysErr _ => (); raise e)
-  in
-    ()
-  end
+  (ensure_parent cache_path;
+   HolbuildStatCache.write_text_atomically cache_path (cache_text source_hash deps))
+
+(* Besides the project's own copy, each analysis is kept in the shared cache
+   under a name derived from everything it depends on, so another checkout
+   of the same sources on this machine finds it instead of analysing again.
+   An entry's modification time is its last use, which `holbuild gc` goes by. *)
+fun shared_cache_path source_hash =
+  Path.concat(Path.concat(HolbuildCacheConfig.cache_root (), "analysis"),
+              HolbuildHash.string_sha256
+                (String.concatWith "\n"
+                   [cache_version, extractor_version, analyser_identity (), source_hash]))
+
+(* The project's copy, else the shared one, which is then copied into the
+   project. A shared entry that cannot be read is a miss. *)
+fun read_cached cache_path source_hash =
+  case read_cache cache_path source_hash of
+      SOME deps => SOME deps
+    | NONE =>
+        let val shared = shared_cache_path source_hash
+        in
+          case read_cache shared source_hash of
+              SOME deps =>
+                (OS.FileSys.setTime (shared, NONE) handle OS.SysErr _ => ();
+                 write_cache cache_path source_hash deps handle _ => ();
+                 SOME deps)
+            | NONE => NONE
+        end
+        handle _ => NONE
+
+fun write_cached cache_path source_hash deps =
+  (write_cache cache_path source_hash deps handle _ => ();
+   write_cache (shared_cache_path source_hash) source_hash deps handle _ => ())
 
 fun extract_cached_with_hash {cache_path, source_path, source_hash} =
-  case read_cache cache_path source_hash of
+  case read_cached cache_path source_hash of
       SOME deps => deps
     | NONE =>
-        let
-          val deps = extract_uncached source_path
-          val _ = write_cache cache_path source_hash deps handle _ => ()
-        in
-          deps
-        end
+        let val deps = extract_uncached source_path
+        in write_cached cache_path source_hash deps; deps end
 
 (* Returns, for each request, the dependency facts read from its cache or
    produced by the batch analyser run, or NONE if neither produced them. *)
@@ -496,7 +513,7 @@ fun prefetch_cached_with_hash requests =
           [] => []
         | x :: rest => (Int.toString i, x) :: enumerate (i + 1) rest
     fun cached_or_missing ((id, req as {cache_path, source_path, source_hash}), (cached, missing)) =
-      case read_cache cache_path source_hash of
+      case read_cached cache_path source_hash of
           SOME deps => ((id, deps) :: cached, missing)
         | NONE => (cached, (id, req) :: missing)
     val (cached, missing) = List.foldl cached_or_missing ([], []) (enumerate 1 requests)
@@ -515,7 +532,7 @@ fun prefetch_cached_with_hash requests =
                   missing
               fun store (id, deps) =
                 case Binarymap.peek(missing_by_id, id) of
-                    SOME {cache_path, source_hash, ...} => (write_cache cache_path source_hash deps handle _ => ())
+                    SOME {cache_path, source_hash, ...} => write_cached cache_path source_hash deps
                   | NONE => ()
             in
               List.app store results;
