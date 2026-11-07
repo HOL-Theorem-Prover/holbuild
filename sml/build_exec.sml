@@ -3143,12 +3143,14 @@ fun runtime_identity () =
 fun share_store cache = Path.concat(cache, "checkpoint-store")
 
 (* An action holds a shared lease on each store family it uses until it
-   exits, so no other container's cap sweep evicts the family meanwhile.
-   fcntl locks are dropped when the process closes any descriptor for the
-   file, so a family is leased at most once per process, as toolchains are. *)
+   exits, so no other container's cap sweep evicts the family meanwhile; a
+   build holds one only while it places or adds a heap.  fcntl locks are
+   dropped when the process closes any descriptor for the file, so a family
+   is leased at most once per process, as toolchains are, with a count of its
+   holders. *)
 fun store_lease_path dir = dir ^ ".lease"
 
-val store_leases = ref ([] : (string * HolbuildFileLock.t) list)
+val store_leases = ref ([] : (string * HolbuildFileLock.t * int ref) list)
 (* A build's theory workers lease families from several threads. *)
 val store_leases_mutex = Mutex.mutex ()
 
@@ -3157,16 +3159,38 @@ fun with_store_leases f =
    (f () handle e => (Mutex.unlock store_leases_mutex; raise e))
    before Mutex.unlock store_leases_mutex)
 
-fun holds_store_lease path =
-  with_store_leases (fn () => List.exists (fn (held, _) => held = path) (!store_leases))
+fun find_store_lease path = List.find (fn (held, _, _) => held = path) (!store_leases)
+
+fun holds_store_lease path = with_store_leases (fn () => Option.isSome (find_store_lease path))
 
 fun lease_store_family store heap =
   let val path = store_lease_path (Path.concat(store, heap))
   in
     with_store_leases (fn () =>
-      if List.exists (fn (held, _) => held = path) (!store_leases) then ()
-      else store_leases := (path, HolbuildFileLock.acquire_shared_path_wait {path = path}) :: !store_leases)
+      case find_store_lease path of
+          SOME (_, _, holders) => holders := !holders + 1
+        | NONE =>
+            store_leases := (path, HolbuildFileLock.acquire_shared_path_wait {path = path}, ref 1) :: !store_leases)
   end
+
+fun release_store_family store heap =
+  let val path = store_lease_path (Path.concat(store, heap))
+  in
+    with_store_leases (fn () =>
+      case find_store_lease path of
+          SOME (_, lock, holders) =>
+            (holders := !holders - 1;
+             if !holders > 0 then ()
+             else
+               (store_leases := List.filter (fn (held, _, _) => held <> path) (!store_leases);
+                HolbuildFileLock.release lock))
+        | NONE => ())
+  end
+
+fun with_store_family_lease store heap f =
+  (lease_store_family store heap;
+   (f () handle e => (release_store_family store heap; raise e))
+   before release_store_family store heap)
 
 fun tree_bytes path =
   if (FS.isLink path handle OS.SysErr _ => false) then 0
@@ -3196,6 +3220,12 @@ fun evict_store_family dir =
 
 fun store_families store =
   List.filter (fn path => FS.isDir path handle OS.SysErr _ => false) (HolbuildCache.children store)
+
+(* How many links a host deps heap family's heap has: the store's own, and
+   one per tree that holds it.  0 for other families. *)
+fun store_heap_links dir =
+  Posix.FileSys.ST.nlink (Posix.FileSys.stat (Path.concat(dir, "deps_loaded.save")))
+  handle OS.SysErr _ => 0
 
 fun store_path store heap sha = Path.concat(Path.concat(store, heap), sha)
 
@@ -4445,6 +4475,15 @@ fun file_id path =
   in SOME (Posix.FileSys.ST.dev st, Posix.FileSys.ST.ino st) end
   handle OS.SysErr _ => NONE
 
+(* A file's identity and change time: a file saved where a discarded one
+   was can reuse its inode number. *)
+fun file_stamp path =
+  let val st = Posix.FileSys.stat path
+  in SOME (Posix.FileSys.ST.dev st, Posix.FileSys.ST.ino st, Posix.FileSys.ST.ctime st) end
+  handle OS.SysErr _ => NONE
+
+fun stamp_id stamp = Option.map (fn (dev, ino, _) => (dev, ino)) stamp
+
 (* After a theory runs, given its deps_loaded's file prior the run and the
    store file the restore placed, if any: a heap the run saved goes into the
    store, replacing what is there; if the run discarded the heap it started
@@ -4452,18 +4491,18 @@ fun file_id path =
    touch stays as it is: it may hold an earlier runtime than the key says. *)
 fun publish_local_heap tc heap_context (action : theory_action) deps_loaded prior placed =
   let
-    val now = file_id deps_loaded
+    val now = file_stamp deps_loaded
     val {store, heap, stored} = local_heap_location tc heap_context action
   in
     if now = prior then ()
     else if deps_checkpoint_exists deps_loaded (#deps_key action) then
       let val tmp = store_temp stored
       in
-        lease_store_family store heap;
-        (ensure_parent tmp; link_or_copy_file deps_loaded tmp; FS.rename {old = tmp, new = stored})
-        handle e => (remove_file tmp; raise e)
+        with_store_family_lease store heap (fn () =>
+          (ensure_parent tmp; link_or_copy_file deps_loaded tmp; FS.rename {old = tmp, new = stored})
+          handle e => (remove_file tmp; raise e))
       end
-    else if List.exists (fn id => Option.isSome id andalso file_id stored = id) [prior, placed] then
+    else if List.exists (fn id => Option.isSome id andalso file_id stored = id) [stamp_id prior, placed] then
       remove_file stored
     else ()
   end
@@ -4475,11 +4514,8 @@ fun publish_local_heap tc heap_context (action : theory_action) deps_loaded prio
 fun sweep_local_heap_store () =
   let
     val cutoff = Time.-(Time.now (), Time.fromSeconds 86400)
-    fun unlinked dir =
-      Posix.FileSys.ST.nlink (Posix.FileSys.stat (Path.concat(dir, "deps_loaded.save"))) = 1
-      handle OS.SysErr _ => false
     fun sweep dir =
-      if unlinked dir andalso Time.<(modified_time dir, cutoff) then ignore (evict_store_family dir) else ()
+      if store_heap_links dir = 1 andalso Time.<(modified_time dir, cutoff) then ignore (evict_store_family dir) else ()
   in
     List.app sweep (store_families (share_store (HolbuildCache.cache_root ())))
   end
@@ -4493,33 +4529,37 @@ fun restore_local_heap tc heap_context base_context checkpoint_root (action : th
     val base = action_checkpoint_base checkpoint_root action
     val deps_key = #deps_key action
     val deps_loaded = deps_loaded_path base deps_key
-    val {store, heap, stored} = local_heap_location tc heap_context action
     fun parent_ok () =
       case saved_parent deps_loaded of
           SOME parent =>
             (FS.fullPath parent = FS.fullPath (hol_context_path base_context) handle OS.SysErr _ => false)
         | NONE => false
-  in
-    if deps_checkpoint_exists deps_loaded deps_key orelse not (file_exists stored) then NONE
-    else
+    fun place {store, heap, stored} =
       ((* Checkpoints on an earlier deps_loaded aren't children of this one. *)
        remove_deps_checkpoint_descendants base deps_key;
-       lease_store_family store heap;
-       let val placed = file_id stored
-       in
-         (* A copy across file systems: a symbolic link would follow the store
-            entry when another tree replaces it, under this tree's .ok. *)
-         link_or_copy_file stored deps_loaded;
-         if parent_ok () then
-           (write_text (checkpoint_ok_path deps_loaded) (deps_checkpoint_ok_text deps_key);
-            touch_dir (Path.concat(store, heap));
-            placed)
-         else (remove_checkpoint deps_loaded; NONE)
-       end)
+       with_store_family_lease store heap (fn () =>
+         let val placed = file_id stored
+         in
+           (* A copy across file systems: a symbolic link would follow the
+              store entry when another tree replaces it, under this tree's .ok. *)
+           link_or_copy_file stored deps_loaded;
+           if parent_ok () then
+             (write_text (checkpoint_ok_path deps_loaded) (deps_checkpoint_ok_text deps_key);
+              touch_dir (Path.concat(store, heap));
+              placed)
+           else (remove_checkpoint deps_loaded; NONE)
+         end))
       handle e =>
         (remove_checkpoint deps_loaded;
          warn ("could not restore a deps heap from the host store: " ^ General.exnMessage e);
          NONE)
+  in
+    if deps_checkpoint_exists deps_loaded deps_key then NONE
+    else
+      case (SOME (local_heap_location tc heap_context action)
+            handle e => (warn ("could not find the host store's deps heap: " ^ General.exnMessage e); NONE)) of
+          SOME location => if file_exists (#stored location) then place location else NONE
+        | NONE => NONE
   end
 
 (* Builds a theory from its source in the project: runs its theory action with
@@ -4539,7 +4579,7 @@ fun build_theory dat_hash_cache cache_allowed policy tc project base_context pla
         (fn heap_context => restore_local_heap tc heap_context base_context checkpoint_root action)
         heap_context
     val deps_loaded = deps_loaded_path (action_checkpoint_base checkpoint_root action) (#deps_key action)
-    val prior = file_id deps_loaded
+    val prior = file_stamp deps_loaded
     (* Also after a failure: a stored heap HOL couldn't resume from was
        replaced here by a fresh one, which the store takes in its place. *)
     fun publish_heap () =
@@ -6929,15 +6969,16 @@ fun store_cache_families cache =
            (store_families (share_store cache))
 
 (* holbuild gc: the store's families no build used within DAYS, except one
-   a running process leases. *)
+   a running process leases or a heap a tree still links: removing that frees
+   nothing. *)
 fun gc_checkpoint_store days =
   let
     val cutoff = retention_cutoff days
+    fun removable dir = Time.<(modified_time dir, cutoff) andalso store_heap_links dir <= 1
     val removed =
       List.foldl
-        (fn ({mtime, evict}, n) =>
-            if Time.<(mtime, cutoff) andalso Option.isSome (evict ()) then n + 1 else n)
-        0 (store_cache_families (HolbuildCache.cache_root ()))
+        (fn (dir, n) => if removable dir andalso Option.isSome (evict_store_family dir) then n + 1 else n)
+        0 (store_families (share_store (HolbuildCache.cache_root ())))
   in
     (* stderr: gc's stdout is its one summary line. *)
     if removed = 0 then ()

@@ -793,9 +793,10 @@ ML state omits filesystem writes. They replay the whole script from a valid
 `deps_loaded` checkpoint or the base context; script checkpoints are still
 retained for diagnostics. Raw `.save`
 bytes are diagnostic only and must not be used as stable semantic keys. The
-default build may retain successful local checkpoints for proof-edit resume, but
-does not materialize checkpoints from the global cache; cache restore recreates
-only logical theory artifacts and internal load manifests.
+default build may retain successful local checkpoints for proof-edit resume.
+From the global cache it materializes only `deps_loaded` heaps, from the host
+store, and checks each one's parent; cache restore recreates only logical theory
+artifacts and internal load manifests.
 
 Proof-edit incrementality should not key failed-prefix checkpoints by the full
 proof body hash. That would invalidate exactly the state a proof author needs
