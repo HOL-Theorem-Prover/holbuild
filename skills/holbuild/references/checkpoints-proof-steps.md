@@ -64,6 +64,10 @@ Runs theorem proofs through proof steps without saving `.save`/`.ok` files. No `
 
 By default, theorem-context, declaration and failed-prefix checkpoints are saved only in the requested targets (the default targets when none are given, or every root-package theory when there are none). Every root-package theory still saves its `deps_loaded` checkpoint and runs with proof steps and step timeouts. An edit to a non-target starts from `deps_loaded`; rebuilding it as a target (after an edit, or with `--force=theory`) saves its theorem checkpoints. `--repl-on-failure` saves them everywhere. `--all-checkpoints` saves them in every root-package theory. Theory outputs and keys don't change either way. Under `--remote-exec`, a non-target's action spec says `option theorem-checkpoints=false` and the worker skips them too.
 
+## Host deps heaps
+
+Unless the build has `--no-cache` or the theory `cache = false`, every `deps_loaded.save` is also kept once per host in `$HOLBUILD_CACHE/checkpoint-store/`, keyed without the project directory, so worktrees of one project share it by hard link. A theory with no valid `deps_loaded` resumes from the stored one; a stored heap with the wrong parent is ignored, and one HOL can't resume from is replaced. Each build evicts stored heaps no tree links that no build used for a day, and `holbuild gc` evicts those unused within the retention window that no tree links. In a theory resumed from another tree's heap, `Meta.fileDirMap()` names that tree's directories. Loading is unaffected, but TacticToe recording (`tttUnfold`'s includes, `tttManifest.find_script`) reads them, so run a local recording in a tree whose heaps weren't restored from the store (a clean checkout built with `--no-cache`, say).
+
 ## `--skip-proof-steps`
 
 Opts out of proof-step execution. Source is sent through the plain `hol run` path. There is no per-tactic timeout, trace-step trace, theorem-context/failed-prefix proof navigation, or instrumented goal diagnostics. The `deps_loaded` checkpoint may still be used when checkpoints are enabled.
