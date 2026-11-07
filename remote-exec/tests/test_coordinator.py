@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from remote_exec import coordinator as coordinator_module
 from remote_exec.app import create_app
 from remote_exec.coordinator import Coordinator
-from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache
+from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache, entry_blob
 
 CLIENT = {"Authorization": f"Bearer {CLIENT_TOKEN}"}
 WORKER = {"Authorization": f"Bearer {WORKER_TOKEN}"}
@@ -264,6 +264,32 @@ async def test_a_parent_found_in_the_cache_is_not_asked_about_again_until_an_inp
     await build(http, cache, "c")
     assert cache.asked[4:] == [ac_key("c")]
     assert await states(http, batch_id) == {"a": "done", "b": "done", "c": "done", "d": "ready"}
+
+
+async def test_a_remembered_parent_whose_blob_expired_is_built_again_once_a_child_misses_it(
+    http: httpx.AsyncClient, cache: FakeCache
+) -> None:
+    batch_id = await submit(http, ["a", "b", "c"], [("b", "a"), ("c", "a")])
+    await build(http, cache, "a")
+    assert await states(http, batch_id) == {"a": "done", "b": "ready", "c": "ready"}
+
+    # A blob of "a" expires after it was found whole; "b" can't restore it.
+    cache.lost.add(ac_key("a"))
+    token = await claim_named(http, "b")
+    record = result("b", "failed", "input-missing", missing=f"blob {entry_blob(ac_key('a'))}")
+    assert (await complete(http, token, record)).status_code == 200
+    assert (await states(http, batch_id))["a"] == "ready"
+    assert (await states(http, batch_id))["b"] == "waiting"
+
+    cache.lost.clear()
+    await build(http, cache, "a")
+    assert (await states(http, batch_id))["b"] == "ready"
+
+
+async def test_concurrent_releases_share_one_check_of_a_parent(cache: FakeCache, coordinator: Coordinator) -> None:
+    cache.keys.add(ac_key("a"))
+    assert await asyncio.gather(*(coordinator._in_cache(ac_key("a")) for _ in range(5))) == [True] * 5
+    assert cache.asked == [ac_key("a")]
 
 
 async def test_retried_action_waits_for_a_parent_requeued_while_it_ran(

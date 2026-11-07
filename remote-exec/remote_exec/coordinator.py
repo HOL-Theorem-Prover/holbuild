@@ -272,8 +272,11 @@ class Coordinator:
         # and the future that wakes them, oldest first; see claim.
         self.made_ready = 0
         self.claim_waiters: list[tuple[list[str], asyncio.Future[None]]] = []
-        # When each cache entry was last found whole; see _in_cache.
+        # When each cache entry was last found whole, the checks of the cache under way, and how many times
+        # input-missing results forgot both; see _in_cache.
         self.found_in_cache: dict[str, float] = {}
+        self.cache_checks: dict[str, asyncio.Task[bool | None]] = {}
+        self.cache_forgotten = 0
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "Coordinator":
@@ -414,8 +417,9 @@ class Coordinator:
         A wait ends early once ``disconnected`` says the worker has gone, so no action is leased to nobody. Each
         action this process's ``release`` makes ready wakes the longest waiting claim that takes its tier, not
         every waiting claim, so hundreds of waiting workers don't all query for it. Waits recheck every
-        ``CLAIM_RECHECK_SECONDS``, for actions another coordinator process made ready and for a wake whose claim
-        lost the action to another.
+        ``CLAIM_RECHECK_SECONDS``, for actions another coordinator process made ready and for an action whose
+        woken claim took another one or lost it to another claim; a claim woken that leaves without trying wakes
+        the next.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wait_s
@@ -426,16 +430,21 @@ class Coordinator:
             remaining = deadline - loop.time()
             if claimed is not None or remaining <= 0:
                 return claimed
+            woken: asyncio.Future[str] = loop.create_future()
             if self.made_ready == made_ready:
-                waiter = (tiers, loop.create_future())
+                waiter = (tiers, woken)
                 self.claim_waiters.append(waiter)
                 try:
                     with contextlib.suppress(TimeoutError):
-                        await asyncio.wait_for(waiter[1], min(remaining, CLAIM_RECHECK_SECONDS))
+                        await asyncio.wait_for(asyncio.shield(woken), min(remaining, CLAIM_RECHECK_SECONDS))
+                except asyncio.CancelledError:
+                    self._pass_wake(woken)
+                    raise
                 finally:
                     with contextlib.suppress(ValueError):
                         self.claim_waiters.remove(waiter)
             if disconnected is not None and await disconnected():
+                self._pass_wake(woken)
                 return None
 
     async def _claim(self, tiers: list[str], worker: str) -> Claim | None:
@@ -475,9 +484,15 @@ class Coordinator:
         for waiter in self.claim_waiters:
             tiers, woken = waiter
             if tier in tiers and not woken.done():
-                woken.set_result(None)
+                woken.set_result(tier)
                 self.claim_waiters.remove(waiter)
                 return
+
+    def _pass_wake(self, woken: asyncio.Future[str]) -> None:
+        """Hand the wake of a claim leaving without trying, if it got one, to the next claim that takes its tier."""
+        if woken.done() and not woken.cancelled():
+            self.made_ready -= 1
+            self._wake_claim(woken.result())
 
     async def heartbeat(self, token: UUID) -> bool:
         """Extend a live lease; False when it expired or was revoked, so the worker should stop."""
@@ -567,7 +582,7 @@ class Coordinator:
             ):
                 await self._retry(conn, batch_id, action.input_key)
             elif result.failure == "input-missing":
-                self.found_in_cache.clear()
+                self._forget_cache_findings()
                 await self._input_missing(conn, batch_id, action.input_key, action.theory, action.attempts, result)
             else:
                 await self._fail_batch(conn, batch_id, action.input_key, f"{action.theory}: {result.failure}")
@@ -589,21 +604,27 @@ class Coordinator:
                 for _, ac_key in parents:
                     if ac_key not in present:
                         present[ac_key] = await self._in_cache(ac_key)
-            requeued = False
+            ready: defaultdict[UUID, list[str]] = defaultdict(list)
             for (candidate_batch, input_key), parents in candidates.items():
-                answers = [present[ac_key] for _, ac_key in parents]
-                if all(answers):
-                    async with self.engine.begin() as conn:
-                        tier = await conn.scalar(
-                            sa.text(
-                                "UPDATE actions SET state = 'ready' WHERE batch_id = :batch_id "
-                                "AND input_key = :input_key AND state = 'waiting' AND remaining_deps = 0 "
-                                "RETURNING tier"
-                            ),
-                            {"batch_id": candidate_batch, "input_key": input_key},
-                        )
-                    if tier is not None:
-                        self._wake_claim(tier)
+                if all(present[ac_key] for _, ac_key in parents):
+                    ready[candidate_batch].append(input_key)
+            for candidate_batch, keys in ready.items():
+                # One transaction per batch, taking its lock before its actions' as every other writer does.
+                async with self.engine.begin() as conn:
+                    if await self._lock_batch(conn, candidate_batch) != "running":
+                        continue
+                    tiers = await conn.scalars(
+                        sa.text(
+                            "UPDATE actions SET state = 'ready' WHERE batch_id = :batch_id "
+                            "AND input_key = ANY(:keys) AND state = 'waiting' AND remaining_deps = 0 RETURNING tier"
+                        ),
+                        {"batch_id": candidate_batch, "keys": keys},
+                    )
+                    made_ready = list(tiers)
+                for tier in made_ready:
+                    self._wake_claim(tier)
+            requeued = False
+            for (candidate_batch, _), parents in candidates.items():
                 for parent, ac_key in parents:
                     if present[ac_key] is False:
                         requeued |= await self._requeue_evicted(candidate_batch, parent)
@@ -719,14 +740,12 @@ class Coordinator:
         The demand samples behind the target are in the database, so a restarted coordinator keeps holding it. A
         failing scale command is logged and retried on the next sweep; it never stops the sweep.
         """
+        trusted_since = asyncio.get_running_loop().time() - IN_CACHE_TRUST_SECONDS
+        self.found_in_cache = {key: at for key, at in self.found_in_cache.items() if at > trusted_since}
         await self.expire_leases()
         await self.fail_overdue()
         await self.release()
         await self.delete_expired()
-        now = asyncio.get_running_loop().time()
-        self.found_in_cache = {
-            key: at for key, at in self.found_in_cache.items() if now - at < IN_CACHE_TRUST_SECONDS
-        }
         counts = (await self.queue()).counts
         demand = burst_demand(counts, self.settings.warm_workers, self.settings.max_burst_workers)
         now = self.clock()
@@ -767,13 +786,34 @@ class Coordinator:
         """Whether the cache holds entry ``ac_key`` and every blob it lists, which can expire before it; None when
         the cache can't tell.
 
-        An entry found whole is taken to be there for ``IN_CACHE_TRUST_SECONDS`` without asking again, since each
-        completion releases its batch and every concurrent release would otherwise ask about the same parents. One
-        evicted meanwhile makes its children report ``input-missing``, which forgets every entry found.
+        An entry found whole is taken to be there for ``IN_CACHE_TRUST_SECONDS`` without asking again, and
+        concurrent calls share one check, since each completion releases its batch and every concurrent release
+        would otherwise ask about the same parents. One evicted meanwhile makes its children report
+        ``input-missing``, which forgets every entry found and every check under way.
         """
         now = asyncio.get_running_loop().time()
         if now - self.found_in_cache.get(ac_key, -IN_CACHE_TRUST_SECONDS) < IN_CACHE_TRUST_SECONDS:
             return True
+        check = self.cache_checks.get(ac_key)
+        if check is None:
+            check = asyncio.create_task(self._check_cache(ac_key))
+            self.cache_checks[ac_key] = check
+
+            def done(_: object) -> None:
+                if self.cache_checks.get(ac_key) is check:
+                    del self.cache_checks[ac_key]
+
+            check.add_done_callback(done)
+        # Shielded, so a caller cancelled leaves the check to the others.
+        return await asyncio.shield(check)
+
+    def _forget_cache_findings(self) -> None:
+        self.found_in_cache.clear()
+        self.cache_checks.clear()
+        self.cache_forgotten += 1
+
+    async def _check_cache(self, ac_key: str) -> bool | None:
+        forgotten = self.cache_forgotten
         try:
             response = await self.cache.get(f"/ac/{ac_key}")
             if response.status_code == 200:
@@ -784,7 +824,8 @@ class Coordinator:
         except httpx.HTTPError:
             return None
         if response.status_code == 200:
-            self.found_in_cache[ac_key] = now
+            if self.cache_forgotten == forgotten:  # else an input went missing since this check began
+                self.found_in_cache[ac_key] = asyncio.get_running_loop().time()
             return True
         if response.status_code == 404:
             return False
@@ -914,7 +955,8 @@ class Coordinator:
         await conn.execute(REFRESH_CHILDREN, {"batch_id": batch_id, "keys": [input_key]})
 
     async def _retry(self, conn: AsyncConnection, batch_id: UUID, input_key: str) -> None:
-        """Send a failed or expired action back to waiting, so ``release`` checks its parents' keys again.
+        """Send a failed or expired action back to waiting, so ``release`` checks its parents' keys again, or
+        trusts what it found within ``IN_CACHE_TRUST_SECONDS``.
 
         A parent may have been re-queued while the action ran; going straight to ready would skip that check.
         """
