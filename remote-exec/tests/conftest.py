@@ -28,12 +28,16 @@ def entry_blob(key: str) -> str:
 class FakeCache:
     """bazel-remote holding holbuild entries: ``GET /ac/<key>`` answers 503 for ``broken``, an entry listing the
     blob ``entry_blob(key)`` for ``keys``, and 404 otherwise; ``HEAD /cas/<blob>`` answers 404 for the blobs of the
-    keys in ``lost`` and 200 for the others. ``asked`` lists the keys of the entries asked for."""
+    keys in ``lost``, 502 for those of ``proxied`` (held only by the proxy backend, behind a reverse proxy) and 200
+    for the others. ``GET /cas/<blob>`` of a proxied blob answers 502 while ``proxy_down`` and otherwise copies it
+    from the backend, so it is no longer proxied. ``asked`` lists the keys of the entries asked for."""
 
     def __init__(self) -> None:
         self.keys: set[str] = set()
         self.broken: set[str] = set()
         self.lost: set[str] = set()
+        self.proxied: set[str] = set()
+        self.proxy_down = False
         self.asked: list[str] = []
         self.hold: asyncio.Event | None = None  # while set to an unset event, entry requests wait for it
 
@@ -44,8 +48,19 @@ class FakeCache:
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
-        if request.method == "HEAD" and path.startswith("/cas/"):
-            return httpx.Response(404 if path.removeprefix("/cas/") in map(entry_blob, self.lost) else 200)
+        if path.startswith("/cas/"):
+            blob = path.removeprefix("/cas/")
+            if blob in map(entry_blob, self.lost):
+                return httpx.Response(404)
+            proxied = {entry_blob(key): key for key in self.proxied}
+            if request.method == "HEAD":
+                return httpx.Response(502 if blob in proxied else 200)
+            assert request.method == "GET"
+            if blob in proxied:
+                if self.proxy_down:
+                    return httpx.Response(502)
+                self.proxied.discard(proxied[blob])
+            return httpx.Response(200, content=b"dat")
         assert request.method == "GET" and path.startswith("/ac/")
         key = path.removeprefix("/ac/")
         self.asked.append(key)

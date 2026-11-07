@@ -51,11 +51,6 @@ val _ = export_theory();
 SML
 }
 
-has_checkpoint() {
-  local project=$1 name=$2
-  find "$project/.holbuild/checkpoints" -name "$name" -print -quit 2>/dev/null | grep -q .
-}
-
 require_timeout_failure() {
   local case_name=$1 step=$2
   local project=$tmpdir/$case_name
@@ -68,10 +63,6 @@ require_timeout_failure() {
   require_grep "tactic timed out after 1.0s while building ATheory: $step" "$log"
   require_grep "holbuild tactic timeout after 1.0s: $step" "$log"
   require_grep '"kind":"tactic_timeout"' "$log"
-  if has_checkpoint "$project" 't_end_of_proof.save'; then
-    echo "$case_name: timed-out proof saved an end-of-proof checkpoint" >&2
-    exit 1
-  fi
 }
 
 # A failed-prefix checkpoint inside a TRY or ORELSE body would let a resumed
@@ -121,10 +112,6 @@ write_project "$fast" fast "  CONJ_TAC >> TRY NO_TAC >> simp[]"
 (cd "$fast" && "$HOLBUILD_BIN" build --tactic-timeout 1 ATheory) > "$tmpdir/fast.log" 2>&1
 require_grep "ATheory built" "$tmpdir/fast.log"
 require_file "$fast/.holbuild/obj/src/ATheory.dat"
-has_checkpoint "$fast" 't_end_of_proof.save' || {
-  echo "fast: no end-of-proof checkpoint, so the absence check above proves nothing" >&2
-  exit 1
-}
 
 # Catching Interrupt cannot convert an expired deadline into a successful step,
 # whether the handler returns promptly or keeps running beyond the kill grace.

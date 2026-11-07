@@ -195,7 +195,7 @@ fun input_goal_count_from_lines lines =
   Option.mapPartial (fn text => parse_decimal_prefix text 0)
                     (first_line_after "failed tactic input goals: " lines)
 
-val top_goal_preview_prefix = "top goal exceeded 4 KiB; showing first "
+val top_goal_preview_prefix = "top goal truncated; showing first "
 
 fun top_goal_truncated message =
   if String.isSubstring top_goal_preview_prefix message then SOME true else NONE

@@ -248,6 +248,24 @@ async def test_a_parent_whose_blob_expired_is_built_again_before_its_child_is_re
     assert await states(http, batch_id) == {"a": "done", "b": "ready"}
 
 
+async def test_a_parent_whose_blob_only_the_proxy_backend_holds_is_fetched_by_get(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
+) -> None:
+    batch_id = await submit(http, ["a", "b"], [("b", "a")])
+    token = await claim_named(http, "a")
+    cache.keys.add(ac_key("a"))
+    cache.proxied.add(ac_key("a"))
+    cache.proxy_down = True
+    assert (await complete(http, token, result("a", "built"))).status_code == 200
+    # Neither HEAD nor GET can tell: "a" stays done and "b" waits for the next sweep.
+    assert await states(http, batch_id) == {"a": "done", "b": "waiting"}
+
+    cache.proxy_down = False
+    await coordinator.sweep()
+    assert await states(http, batch_id) == {"a": "done", "b": "ready"}
+    assert not cache.proxied
+
+
 async def test_a_parent_found_in_the_cache_is_not_asked_about_again_until_an_input_goes_missing(
     http: httpx.AsyncClient, cache: FakeCache
 ) -> None:
@@ -667,6 +685,25 @@ async def test_infrastructure_failures_retry_up_to_max_attempts(http: httpx.Asyn
     assert (await complete(http, token, result("a", "failed", failure))).status_code == 200
     status = await batch(http, batch_id)
     assert (status["state"], status["failure"]) == ("failed", f"pkg:a: {failure}")
+
+
+async def test_an_action_its_worker_could_not_start_is_retried_without_using_an_attempt(
+    http: httpx.AsyncClient,
+) -> None:
+    batch_id = await submit(http, ["a"])
+    for _ in range(4):
+        token = await claim_named(http, "a")
+        assert (await complete(http, token, result("a", "failed", "unavailable"))).status_code == 200
+        assert await states(http, batch_id) == {"a": "ready"}
+
+    # Still all three attempts left: the third infrastructure failure is the one that fails the batch.
+    for _ in range(2):
+        token = await claim_named(http, "a")
+        assert (await complete(http, token, result("a", "failed", "internal"))).status_code == 200
+        assert await states(http, batch_id) == {"a": "ready"}
+    token = await claim_named(http, "a")
+    assert (await complete(http, token, result("a", "failed", "internal"))).status_code == 200
+    assert (await batch(http, batch_id))["state"] == "failed"
 
 
 async def test_disk_failure_retries_once(http: httpx.AsyncClient) -> None:
