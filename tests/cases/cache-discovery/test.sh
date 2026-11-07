@@ -18,8 +18,9 @@ for ((i=0; i<500; i++)); do
   sleep 0.01
 done
 [[ -f "$tmpdir/port" ]]
+printf '%s\n' 'header = "Authorization: Bearer fixture-token"' > "$tmpdir/discovery.curl"
 DISCOVERY_DIR="$tmpdir" \
 HOLBUILD_REMOTE_CACHE_DISCOVERY_URL="http://127.0.0.1:$(cat "$tmpdir/port")/members" \
-HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN=fixture-token \
+HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG="$tmpdir/discovery.curl" \
 HOLBUILD_REMOTE_CACHE_ALLOWED_URLS='http://c.example,http://d.example,http://e.example,http://f.example' \
 poly --script "$SCRIPT_DIR/check.sml"

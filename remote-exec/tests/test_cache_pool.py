@@ -221,3 +221,9 @@ async def test_cancelled_controller_releases_leadership_before_returning_connect
                                                           (60, 15, 4), (240, 15, 4), (240, 0, 0)])
 def test_worker_mapping_is_bounded_and_zero_ratio_disables_capacity(workers: int, ratio: int, expected: int) -> None:
     assert cache_target(workers, ratio, 4) == expected
+
+
+@pytest.mark.parametrize("url", ["http://cache.example", "https://u:p@cache.example", "https://cache.example#fragment"])
+def test_slot_identity_requires_credential_free_https(url: str) -> None:
+    with pytest.raises(ValueError):
+        CacheSlot(name="slot", url=url)

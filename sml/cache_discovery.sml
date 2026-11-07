@@ -68,29 +68,16 @@ fun config_args () =
 
 fun fetch url defaults =
   let
-    val token_file = case env "HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN" of
-        NONE => NONE
-      | SOME token =>
-          if List.exists (fn c => c = #"\r" orelse c = #"\n" orelse c = #"\"" orelse c = #"\\") (String.explode token) then
-            raise Error "invalid cache discovery token"
-          else
-            let
-              val path = HolbuildTempPath.temporary "cache-discovery-auth"
-              val out = TextIO.openOut path
-              val _ = TextIO.output (out, "header = \"Authorization: Bearer " ^ token ^ "\"\n")
-              val _ = TextIO.closeOut out
-            in SOME path end
-    fun remove () = case token_file of NONE => () | SOME path => OS.FileSys.remove path
     fun get () =
       let
         val result = HolbuildSpawn.run {
           program = "curl", stderr = HolbuildSpawn.Discard,
           args = ["-q", "-fsSg", "--connect-timeout", "2", "--max-time", "5", "--max-filesize", "16384"] @
-            (case token_file of NONE => config_args () | SOME path => ["--config", path]) @ [url]}
+            config_args () @ [url]}
       in
         if HolbuildSpawn.succeeded result then SOME (parse defaults (allowed defaults) (#output result)) else NONE
       end
-  in (get () before remove ()) handle e => (remove (); raise e) end
+  in get () end
 
 (* Only the refresher waits for HTTP. Other cache threads keep using the most recent complete ring. *)
 fun urls defaults =

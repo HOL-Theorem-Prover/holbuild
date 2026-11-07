@@ -33,8 +33,8 @@ class CacheSlot(BaseModel):
         from urllib.parse import urlsplit
 
         parsed = urlsplit(value)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
-            raise ValueError("cache slot URL must be an HTTP(S) URL without credentials")
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("cache slot URL must be an HTTPS URL without credentials")
         if parsed.query or parsed.fragment:
             raise ValueError("cache slot URL must not have a query or fragment")
         return value.rstrip("/")

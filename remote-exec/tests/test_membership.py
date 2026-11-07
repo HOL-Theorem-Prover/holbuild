@@ -1,6 +1,8 @@
 """Membership transitions preserve configured credentials and the permanent fallback."""
 
 
+import http.client
+
 import pytest
 import sqlalchemy as sa
 from conftest import CLIENT_TOKEN, WORKER_TOKEN
@@ -176,3 +178,16 @@ def test_worker_spec_reads_all_members_in_join_grace_and_two_otherwise(monkeypat
     asked.clear()
     assert replace(releases, joining=False).spec_version(key) == '1.2.3'
     assert len(asked) == 6
+
+
+@pytest.mark.parametrize("error", [http.client.BadStatusLine("broken"), http.client.IncompleteRead(b"partial")])
+def test_worker_protocol_failure_retains_then_expires_membership(monkeypatch, error) -> None:
+    from unittest.mock import Mock
+
+    coordinator = Coordinator("https://coordinator.example", "worker-token")
+    monkeypatch.setattr(coordinator, "opener", Mock(open=Mock(side_effect=error)))
+    membership = Membership(DEFAULTS, ALLOWED)
+    membership.update(SNAPSHOT, 0)
+    url = coordinator.url + "/v1/cache/members"
+    assert len(refresh_cache_members(coordinator, membership, url, 30)) == 3
+    assert refresh_cache_members(coordinator, membership, url, 60) == DEFAULTS

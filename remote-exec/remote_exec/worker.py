@@ -542,7 +542,8 @@ def exec_action_env() -> dict[str, str]:
     return {
         name: value
         for name, value in os.environ.items()
-        if name in EXEC_ACTION_ENV or name.lower() in PROXY_ENV or name.startswith("HOLBUILD_")
+        if (name in EXEC_ACTION_ENV or name.lower() in PROXY_ENV or name.startswith("HOLBUILD_"))
+        and name != "HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN"
     }
 
 
@@ -780,7 +781,7 @@ def refresh_cache_members(coordinator: Coordinator, membership: Membership, url:
                 if response.status != 200 or len(data) > 16384:
                     raise ValueError("invalid cache membership response")
                 membership.update(data.decode(), now)
-        except (OSError, ValueError):
+        except (OSError, ValueError, http.client.HTTPException):
             pass
     return membership.current(now)
 
@@ -813,44 +814,51 @@ def main() -> None:
     phases = Phases()
     discovery_url = os.environ.get("HOLBUILD_REMOTE_CACHE_DISCOVERY_URL")
     membership = None
-    if discovery_url:
-        if discovery_url != coordinator.url + "/v1/cache/members":
-            sys.exit("cache discovery must use this worker's coordinator /v1/cache/members endpoint")
-        membership = Membership(cache_nodes(args.remote_cache),
-                                cache_nodes(os.environ.get("HOLBUILD_REMOTE_CACHE_ALLOWED_URLS", args.remote_cache)))
-        # The SML child's curl config is created in holbuild's private temporary directory.
-        os.environ["HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN"] = token
-    while True:
-        if membership is not None and discovery_url is not None:
-            now = time.monotonic()
-            nodes = refresh_cache_members(coordinator, membership, discovery_url, now)
-            releases = replace(releases, remote_cache=",".join(nodes), joining=membership.joining(now))
-        if args.cooperate_dir is not None:
-            with phases.timed("memory_wait"):
-                waited = wait_for_memory(args.cooperate_dir, charge)
-            if waited and host is not None:
-                host.waited = True
-        started = time.monotonic()
-        claim = claim_reporting(coordinator, tiers, args.name, args.claim_wait_seconds, phases)
-        if claim is None:
-            # A claim that failed at once, or a coordinator that doesn't wait, isn't retried in a tight loop.
-            with phases.timed("idle"):
-                time.sleep(max(0.0, CLAIM_RETRY_SECONDS - (time.monotonic() - started)))
-            continue
-        try:
-            unavailable = run_one(coordinator, args, releases, protection, claim, phases)
-        except Exception as error:  # noqa: BLE001  # run_one reported it where it could; the worker goes on
-            # Else the lease expires and the coordinator retries; a rerun finds a published result cached. Waiting
-            # keeps a worker from failing ready action after ready action while the cache or the coordinator is down.
-            print(f"action failed in the worker: {error}", file=sys.stderr)
-            with phases.timed("idle"):
-                time.sleep(CLAIM_RETRY_SECONDS)
-            continue
-        if unavailable:
-            # The coordinator readies the action again at once, so without the wait the worker would claim it
-            # straight back while the cache is still down.
-            with phases.timed("idle"):
-                time.sleep(CLAIM_RETRY_SECONDS)
+    with contextlib.ExitStack() as resources:
+        if discovery_url:
+            if discovery_url != coordinator.url + "/v1/cache/members":
+                sys.exit("cache discovery must use this worker's coordinator /v1/cache/members endpoint")
+            membership = Membership(cache_nodes(args.remote_cache),
+                                    cache_nodes(os.environ.get("HOLBUILD_REMOTE_CACHE_ALLOWED_URLS", args.remote_cache)))
+            directory = resources.enter_context(tempfile.TemporaryDirectory(prefix="holbuild-cache-discovery-"))
+            config = os.path.join(directory, "auth.curl")
+            if "\r" in token or "\n" in token:
+                sys.exit("worker token must not contain a newline")
+            header = ("Authorization: Bearer " + token).replace("\\", "\\\\").replace('"', '\\"')
+            with open(config, "x", opener=lambda path, flags: os.open(path, flags, 0o600)) as out:
+                out.write('header = "' + header + '"\n')
+            os.environ["HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG"] = config
+        while True:
+            if membership is not None and discovery_url is not None:
+                now = time.monotonic()
+                nodes = refresh_cache_members(coordinator, membership, discovery_url, now)
+                releases = replace(releases, remote_cache=",".join(nodes), joining=membership.joining(now))
+            if args.cooperate_dir is not None:
+                with phases.timed("memory_wait"):
+                    waited = wait_for_memory(args.cooperate_dir, charge)
+                if waited and host is not None:
+                    host.waited = True
+            started = time.monotonic()
+            claim = claim_reporting(coordinator, tiers, args.name, args.claim_wait_seconds, phases)
+            if claim is None:
+                # A claim that failed at once, or a coordinator that doesn't wait, isn't retried in a tight loop.
+                with phases.timed("idle"):
+                    time.sleep(max(0.0, CLAIM_RETRY_SECONDS - (time.monotonic() - started)))
+                continue
+            try:
+                unavailable = run_one(coordinator, args, releases, protection, claim, phases)
+            except Exception as error:  # noqa: BLE001  # run_one reported it where it could; the worker goes on
+                # Else the lease expires and the coordinator retries; a rerun finds a published result cached. Waiting
+                # keeps a worker from failing ready action after ready action while the cache or the coordinator is down.
+                print(f"action failed in the worker: {error}", file=sys.stderr)
+                with phases.timed("idle"):
+                    time.sleep(CLAIM_RETRY_SECONDS)
+                continue
+            if unavailable:
+                # The coordinator readies the action again at once, so without the wait the worker would claim it
+                # straight back while the cache is still down.
+                with phases.timed("idle"):
+                    time.sleep(CLAIM_RETRY_SECONDS)
 
 
 if __name__ == "__main__":

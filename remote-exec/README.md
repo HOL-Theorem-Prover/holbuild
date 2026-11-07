@@ -517,7 +517,9 @@ endpoint or an omitted permanent member is rejected. Existing inline cache
 credentials and `HOLBUILD_REMOTE_CACHE_CURL_CONFIG` continue to authenticate
 cache requests. Discovery uses `HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG`
 (or `HOLBUILD_REMOTE_EXEC_CURL_CONFIG`), a curl config holding the coordinator
-bearer header; workers supply their existing token privately to the child.
+bearer header. Workers write their token to a private curl configuration file
+for the child, keeping the bearer value out of build environments; this does
+not isolate builds from files owned by the worker user.
 Discovery never follows redirects. If it fails, the last complete ring remains
 usable for 60 seconds, after which requests use the permanent configuration.
 For 60 seconds after observing a joined member, GET/HEAD can try every ready
