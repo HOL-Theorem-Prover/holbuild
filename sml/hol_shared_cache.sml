@@ -701,11 +701,16 @@ fun restore_entry k =
                 | _ => NotRestored))
   end
 
+(* A remote worker runs only on the toolchain bytes the remote holds, so that
+   every worker has the same ones: when another build's archive won the
+   publish, it discards its own build and restores that archive. *)
+val adopt_published_archive = ref false
+
 (* Whether this entry's own archive is the one the remote now holds; with no
-   remote there is nothing else it could hold. A failed
-   publish, an unavailable remote cache's too, only warns: a remote worker
-   then adopts the published archive, whose restore reports the cache
-   unavailable, so it never keeps bytes the remote doesn't hold. *)
+   remote there is nothing else it could hold. A failed publish only warns,
+   except that an unavailable remote cache is raised; a remote worker then
+   discards its unpublished build, so a retry doesn't run on bytes the remote
+   doesn't hold. *)
 fun publish_entry {replace} k =
   case HolbuildRemoteCacheConfig.url () of
       NONE => true
@@ -717,12 +722,12 @@ fun publish_entry {replace} k =
                entry_dir = entry_dir_for_key k,
                replace = replace} = HolbuildCacheBackend.Published
           else die "HOL toolchain is not complete enough to publish")
-         handle error => (warn_publish (archive_error_message error); false))
-
-(* A remote worker runs only on the toolchain bytes the remote holds, so that
-   every worker has the same ones: when another build's archive won the
-   publish, it discards its own build and restores that archive. *)
-val adopt_published_archive = ref false
+         handle error as HolbuildRemoteCache.Unavailable _ =>
+                  (if !adopt_published_archive then
+                     remove_tree (run_mutation k) (entry_dir_for_key k)
+                   else ();
+                   raise error)
+              | error => (warn_publish (archive_error_message error); false))
 
 fun adopt_published_entry k =
   (remove_tree (run_mutation k) (entry_dir_for_key k);

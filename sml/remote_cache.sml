@@ -366,17 +366,19 @@ fun curl_put_with_headers headers (request as {url, src}) =
 fun curl_put request = curl_put_with_headers [] request
 
 fun curl_put_zstd {url, src, size} =
-  let val compressed = temp_path "zstd-put"
+  let
+    val compressed = temp_path "zstd-put"
+    fun put () =
+      if zstd_compress url src compressed then
+        curl_put_with_headers (zstd_content_headers size)
+          {url = url, src = compressed}
+      else
+        curl_put_with_headers [] {url = url, src = src}
   in
     if disabled () then HolbuildCacheBackend.Skipped
-    else if zstd_compress url src compressed then
-      curl_put_with_headers (zstd_content_headers size)
-        {url = url, src = compressed}
-      before remove_file compressed
     else
-      remove_file_before
-        (curl_put_with_headers [] {url = url, src = src})
-        compressed
+      (* Unavailable passes through the PUT; the copy goes either way. *)
+      remove_file_before (put () handle e => (remove_file compressed; raise e)) compressed
   end
   handle e as Unavailable _ => raise e
        | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
