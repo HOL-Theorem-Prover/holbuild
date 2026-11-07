@@ -115,13 +115,15 @@ async def coordinator(remote_exec_engine: AsyncEngine, cache: FakeCache) -> Asyn
 
 
 class Settled(httpx.ASGITransport):
-    """Answers each request once the releases it asked for have run, so a test sees their effect."""
+    """Handles each request once the releases already asked for have run, and answers it once the ones it asked
+    for have too, so a test sees the effect of every release before its next request."""
 
     def __init__(self, app: object, coordinator: Coordinator) -> None:
         super().__init__(app=app)
         self.coordinator = coordinator
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        await self.coordinator.released()
         response = await super().handle_async_request(request)
         await self.coordinator.released()
         return response
