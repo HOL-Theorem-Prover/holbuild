@@ -1123,11 +1123,13 @@ source and direct dependencies), ensures the HOL toolchain (restoring the
 remote toolchain archive, or building one, and when another worker's archive
 was published first, switching to that archive), fetches the sources by
 SHA-256, restores every dependency through the normal cache restore and its
-checks, and reports `cached` if the theory's own entry already restores.
-Otherwise it builds the theory as a local build would, with the spec's proof
-options, and checks that the remote cache then holds an entry for it whose
-outputs equal the build's. A missing dependency fails the action; the worker
-never builds one.
+checks, and reports `cached` if the theory's own entry already restores, or
+if an earlier build of the same action text on byte-identical dependency
+outputs left one, which it then publishes under the action's input key (early
+cutoff, DESIGN.md). Otherwise it builds the theory as a local build would,
+with the spec's proof options, and checks that the remote cache then holds an
+entry for it whose outputs equal the build's. A missing dependency fails the
+action; the worker never builds one.
 
 It writes this record to `--result FILE`, or to stdout:
 

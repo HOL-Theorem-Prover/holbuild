@@ -573,9 +573,30 @@ The dependency context of a theory's checkpoints (`deps_loaded.save` and the
 theorem checkpoints above it) is keyed the same way, on `deps_output_key`, so a
 theory edited after an upstream edit that left outputs unchanged still resumes
 from its checkpoints. Remote action specs, which are written before their
-dependencies are built, key it on dependency input keys, and so does
-`run --from` unless every dependency's metadata matches its current input key,
-since `run` builds nothing and the outputs on disk may be stale.
+dependencies are built, key it on dependency input keys (a worker re-keys it,
+below), and so does `run --from` unless every dependency's metadata matches its
+current input key, since `run` builds nothing and the outputs on disk may be
+stale.
+
+### Early cutoff on remote workers
+
+A remote worker (`exec-action`) makes the same decision once it has restored
+the action's dependencies. It hashes what the action loads from them, as
+restored in its action root: each dependency theory's `.dat`, `.sig`, `.sml`
+and load manifests, and the library sources and manifests the spec ships.
+With the action text, dependencies named but not keyed, that hash gives a pair
+key, and the remote cache maps the pair to the input key of the last build
+on it (an action entry `holbuild-early-cutoff-v1` with one `input-key=` line).
+On a hit, the worker restores that build's entry with the checks a dependency
+restore makes (the timeout contract, the extra outputs, and the parent `.dat`
+hashes its `.dat` records), copies it to the action's input key, publishes it
+there and reports `cached`. On a miss or any doubt it builds, and then points
+the pair at its own entry. The build's dependency context, which keys its
+checkpoints and its shared heap, is keyed on the same hash of dependency
+outputs, so a theory edited after an output-neutral upstream edit resumes
+from the heap and checkpoints shared before it. These hashes cover files
+that name the action root, so they hold for one cache root, as shared heaps
+do; local builds publish no pairs.
 
 A build may also record output hashes for diagnostics (`--emit-output-hashes`).
 
