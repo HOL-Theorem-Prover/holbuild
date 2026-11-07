@@ -168,8 +168,13 @@ first_log=$tmpdir/first.log
   HOLBUILD_CHECKPOINT_TIMING=1 HOLBUILD_ECHO_CHILD_LOGS=1 "$HOLBUILD_BIN" build ATheory) \
   > "$first_log" 2>&1
 require_grep "holbuild checkpoint kind=deps_loaded" "$first_log"
-require_grep "holbuild checkpoint kind=end_of_proof" "$first_log"
 require_grep "holbuild checkpoint kind=theorem_context" "$first_log"
+# Resumes start only from theorem-context checkpoints; nothing is saved after a proof.
+if grep -q "holbuild checkpoint kind=end_of_proof" "$first_log" || \
+   find "$project/.holbuild/checkpoints" -name '*_end_of_proof.save*' | grep -q .; then
+  echo "build saved an end-of-proof checkpoint" >&2
+  exit 1
+fi
 if grep -q '^[0-9][0-9]* subgoals:$' "$first_log"; then
   echo "proof IR child log leaked interactive goal-stack progress" >&2
   exit 1
@@ -597,9 +602,7 @@ if [[ -e "$b_thm_failed_prefix" || -e "$b_thm_failed_prefix.ok" || \
   exit 1
 fi
 if [[ -e "$failure_project/.holbuild/checkpoints/replay/src/AScript.sml.b_thm_context.save" || \
-      -e "$failure_project/.holbuild/checkpoints/replay/src/AScript.sml.b_thm_context.save.ok" || \
-      -e "$failure_project/.holbuild/checkpoints/replay/src/AScript.sml.b_thm_end_of_proof.save" || \
-      -e "$failure_project/.holbuild/checkpoints/replay/src/AScript.sml.b_thm_end_of_proof.save.ok" ]]; then
+      -e "$failure_project/.holbuild/checkpoints/replay/src/AScript.sml.b_thm_context.save.ok" ]]; then
   echo "stale b_thm checkpoint survived failed proof" >&2
   exit 1
 fi

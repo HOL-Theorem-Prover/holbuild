@@ -24,7 +24,7 @@ Simple theorem forms are **not** theorem-checkpoint-instrumented in v1:
 - `store_thm`, `save_thm`, `Q.store_thm` calls
 - `Resume` / `Finalise` declarations
 
-These still execute normally during build, just without theorem-context/end-of-proof/failed-prefix proof checkpoints.
+These still execute normally during build, just without theorem-context/failed-prefix proof checkpoints.
 
 ## Checkpoint classes and retention
 
@@ -34,7 +34,6 @@ During a theory build, checkpoints may be created at syntactic boundaries:
 |------------|-------|---------|
 | `deps_loaded.save` | All resolved ancestors loaded in topological order | Resume from dependency context |
 | `<thm>_context.save` | Theorem stored in theory context | Resume before the next declaration |
-| `<thm>_end_of_proof.save` | Instrumented proof replay complete, before `drop_all` | Proof navigation/debug state, not successor-ready |
 | `<thm>_failed_prefix.save` | Failed proof after a reusable prefix | Fast rebuild after editing a failing suffix |
 
 Export seals a theory in current HOL versions, so no state is saved after it: the source process exports and exits, and dependents load the generated theory through its manifest. A generated theory that fails to load fails its first dependent.
@@ -44,7 +43,7 @@ Successful source builds retain reusable deps/theorem-context checkpoints for fu
 ## Checkpoint validity
 
 `.ok` metadata contains schema/versioned fields such as:
-- Checkpoint kind (`deps_loaded`, `theorem_context`, `end_of_proof`, `failed_prefix`)
+- Checkpoint kind (`deps_loaded`, `theorem_context`, `failed_prefix`)
 - Dependency context key (`deps_key`)
 - Proof engine (`proof_ir_*`)
 - Source prefix/header/checkpoint keys
@@ -53,15 +52,15 @@ Replay eligibility requires exact metadata match. Invalid selected checkpoints a
 
 ## `--skip-checkpoints`
 
-Runs theorem proofs through proof steps without saving `.save`/`.ok` files. No `deps_loaded`, theorem-context, end-of-proof, or failed-prefix checkpoints are created.
+Runs theorem proofs through proof steps without saving `.save`/`.ok` files. No `deps_loaded`, theorem-context or failed-prefix checkpoints are created.
 
 ## Target-only theorem checkpoints and `--all-checkpoints`
 
-By default, theorem-context, end-of-proof, declaration and failed-prefix checkpoints are saved only in the requested targets (the default targets when none are given, or every root-package theory when there are none). Every root-package theory still saves its `deps_loaded` checkpoint and runs with proof steps and step timeouts. An edit to a non-target starts from `deps_loaded`; rebuilding it as a target (after an edit, or with `--force=theory`) saves its theorem checkpoints. `--repl-on-failure` saves them everywhere. `--all-checkpoints` saves them in every root-package theory. Theory outputs and keys don't change either way. Under `--remote-exec`, a non-target's action spec says `option theorem-checkpoints=false` and the worker skips them too.
+By default, theorem-context, declaration and failed-prefix checkpoints are saved only in the requested targets (the default targets when none are given, or every root-package theory when there are none). Every root-package theory still saves its `deps_loaded` checkpoint and runs with proof steps and step timeouts. An edit to a non-target starts from `deps_loaded`; rebuilding it as a target (after an edit, or with `--force=theory`) saves its theorem checkpoints. `--repl-on-failure` saves them everywhere. `--all-checkpoints` saves them in every root-package theory. Theory outputs and keys don't change either way. Under `--remote-exec`, a non-target's action spec says `option theorem-checkpoints=false` and the worker skips them too.
 
 ## `--skip-proof-steps`
 
-Opts out of proof-step execution. Source is sent through the plain `hol run` path. There is no per-tactic timeout, trace-step trace, theorem-context/end-of-proof/failed-prefix proof navigation, or instrumented goal diagnostics. The `deps_loaded` checkpoint may still be used when checkpoints are enabled.
+Opts out of proof-step execution. Source is sent through the plain `hol run` path. There is no per-tactic timeout, trace-step trace, theorem-context/failed-prefix proof navigation, or instrumented goal diagnostics. The `deps_loaded` checkpoint may still be used when checkpoints are enabled.
 
 **Incompatible**: `--skip-proof-steps` with `--tactic-timeout`, `--trace-steps`, or `--repl-on-failure`.
 
@@ -133,7 +132,6 @@ Plan lines are executable tactic/list-tactic operations. Indentation/body text i
 .holbuild/checkpoints/<package>/<relative-path>.deps/<deps_key>/deps_loaded.save[.ok]
 .holbuild/checkpoints/<package>/<relative-path>.theorems/<deps_key>/<proof_engine>/<prefix_key>/
   <safe_name>_context.save[.ok]
-  <safe_name>_end_of_proof.save[.ok]
 .holbuild/checkpoints/<package>/<relative-path>.theorems/<deps_key>/<proof_engine>/.failed/
   <safe_name>_failed_prefix.save[.ok]
   <safe_name>_failed_prefix.save.meta

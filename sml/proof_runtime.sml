@@ -17,7 +17,7 @@ val plan_only_marker_ref = ref (NONE : string option)
 val plan_active_ref = ref false
 val trace_active_ref = ref false
 val trace_current_theorem_ref = ref ""
-val theorem_info_ref = ref NONE : (string * string * string * string * string * string * string * string * string * bool * int) option ref
+val theorem_info_ref = ref NONE : (string * string * string * string * string * string * string * bool * int) option ref
 val context_info_ref = ref NONE : (string * string * int) option ref
 val failed_prefix_resume_active_ref = ref false
 (* While a failed-prefix resume runs, the step count of the prefix it restored,
@@ -578,7 +578,7 @@ fun advance_failed_prefix_checkpoint path ok_text depth =
 fun save_failed_prefix_checkpoint () =
   case !theorem_info_ref of
       NONE => ()
-    | SOME (kind, _, _, _, _, _, _, failed_prefix_path, failed_prefix_ok, _, depth) =>
+    | SOME (kind, _, _, _, _, failed_prefix_path, failed_prefix_ok, _, depth) =>
         if not (kind = "theorem" orelse kind = "resume") orelse
            not (!checkpoint_enabled_ref) then ()
         else if !failed_prefix_resume_active_ref then
@@ -604,18 +604,18 @@ fun save_failed_prefix_checkpoint () =
 fun restore_failed_prefix_checkpoint_info (name, tactic_text, failed_prefix_path, failed_prefix_ok) =
   let val depth = length (PolyML.SaveState.showHierarchy())
   in
-    theorem_info_ref := SOME ("theorem", name, tactic_text, "", "", "", "",
+    theorem_info_ref := SOME ("theorem", name, tactic_text, "", "",
                               failed_prefix_path, failed_prefix_ok, false, depth)
   end
 
 fun set_theorem_plan plan = active_plan_ref := plan
 
 fun begin_theorem (kind, name, tactic_text, context_path, context_ok,
-                   end_path, end_ok, failed_prefix_path, failed_prefix_ok, has_attrs) =
+                   failed_prefix_path, failed_prefix_ok, has_attrs) =
   let val depth = length (PolyML.SaveState.showHierarchy())
   in
     theorem_info_ref := SOME (kind, name, tactic_text, context_path, context_ok,
-                              end_path, end_ok, failed_prefix_path, failed_prefix_ok, has_attrs, depth);
+                              failed_prefix_path, failed_prefix_ok, has_attrs, depth);
     context_info_ref := SOME (context_path, context_ok, depth)
   end
 
@@ -657,7 +657,7 @@ fun all_goals_text goals =
 
 fun active_theorem_name () =
   case !theorem_info_ref of
-      SOME (_, name, _, _, _, _, _, _, _, _, _) => SOME name
+      SOME (_, name, _, _, _, _, _, _, _) => SOME name
     | NONE => NONE
 
 fun failed_theorem_line () =
@@ -1639,7 +1639,7 @@ fun with_proof_ir_execution ctxt f =
     case result of TraceOk value => value | TraceError e => raise e
   end
 
-fun proof_ir_prove name end_path end_ok checkpoint_depth g original_tac tactic_text =
+fun proof_ir_prove name g original_tac tactic_text =
   let
     val _ = active_tactic_text_ref := tactic_text
     val plan = case !active_plan_ref of SOME p => p | NONE => raise Fail "internal error: proof-IR plan is not installed"
@@ -1654,7 +1654,6 @@ fun proof_ir_prove name end_path end_ok checkpoint_depth g original_tac tactic_t
                        else report_finish_failure name e
             val th = history_top_thm g
                      handle e => report_finish_failure name e
-            val _ = save_checkpoint "end_of_proof" false end_path end_ok checkpoint_depth
             val _ = drop_all()
           in th end
   end
@@ -1664,7 +1663,7 @@ fun termination_tactic name tactic_text plan original_tac =
   let
     val depth = length (PolyML.SaveState.showHierarchy())
     val _ = theorem_info_ref := SOME ("termination", name, tactic_text,
-                                      "", "", "", "", "", "", false, depth)
+                                      "", "", "", "", false, depth)
     val _ = failed_step_end_ref := NONE
     val _ = failed_step_span_ref := NONE
     val _ = failed_plan_position_ref := NONE
@@ -2028,14 +2027,14 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
     result
   end
 
-fun prove_outer_theorem ctxt (g, tac) (_, name, tactic_text, _, _, end_path, end_ok, _, _, has_attrs, checkpoint_depth) =
+fun prove_outer_theorem ctxt (g, tac) (_, name, tactic_text, _, _, _, _, has_attrs, _) =
   let
     val atomic = has_attrs orelse tactic_text = ""
     val th =
       with_proof_ir_execution ctxt (fn () =>
         with_theorem_trace name (fn () =>
           if atomic then atomic_prove name g tac
-          else proof_ir_prove name end_path end_ok checkpoint_depth g tac tactic_text))
+          else proof_ir_prove name g tac tactic_text))
     val _ = theorem_info_ref := NONE
   in
     th

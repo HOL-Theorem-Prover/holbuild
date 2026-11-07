@@ -1598,9 +1598,9 @@ fun invalid_checkpoint_retryable base_context run_context msg =
    holbuild_runtime_missing_failure msg orelse hol_static_error_failure msg) andalso
   hol_context_path run_context <> hol_context_path base_context
 
-fun theorem_context_or_end_path path
-      ({context_path, end_of_proof_path, ...} : HolbuildTheoryCheckpoints.checkpoint) =
-  path = context_path orelse path = end_of_proof_path
+fun theorem_context_path_matches path
+      ({context_path, ...} : HolbuildTheoryCheckpoints.checkpoint) =
+  path = context_path
 
 fun theorem_failed_prefix_path path
       ({failed_prefix_path, ...} : HolbuildTheoryCheckpoints.checkpoint) =
@@ -1620,7 +1620,7 @@ fun remove_loaded_checkpoint_descendants base deps_key deps_loaded theorem_check
     case List.find (theorem_failed_prefix_path loaded_path) theorem_checkpoints of
         SOME checkpoint => remove_checkpoint (#failed_prefix_path checkpoint)
       | NONE =>
-          case List.find (theorem_context_or_end_path loaded_path) theorem_checkpoints of
+          case List.find (theorem_context_path_matches loaded_path) theorem_checkpoints of
               SOME _ => remove_source_checkpoints_for_deps base deps_key
             | NONE =>
                 case List.find (declaration_context_path_matches loaded_path) declaration_checkpoints of
@@ -2343,10 +2343,6 @@ fun theorem_context_path base deps_key proof_engine prefix_hash safe_name =
   Path.concat(theorem_checkpoint_dir base deps_key proof_engine prefix_hash,
               safe_name ^ "_context.save")
 
-fun theorem_end_of_proof_path base deps_key proof_engine prefix_hash safe_name =
-  Path.concat(theorem_checkpoint_dir base deps_key proof_engine prefix_hash,
-              safe_name ^ "_end_of_proof.save")
-
 fun failed_prefix_checkpoint_dir base deps_key proof_engine =
   Path.concat(theorem_checkpoint_root base, Path.concat(Path.concat(deps_key, proof_engine), ".failed"))
 
@@ -2489,8 +2485,6 @@ fun theorem_checkpoint_specs proof_engine proof_timeout base deps_key inputs_key
          prefix_hash = prefix_hash,
          context_path = theorem_context_path base deps_key proof_engine prefix_hash safe_name,
          context_ok = theorem_checkpoint_ok "theorem_context" deps_key proof_engine proof_timeout prefix_hash checkpoint_key,
-         end_of_proof_path = theorem_end_of_proof_path base deps_key proof_engine prefix_hash safe_name,
-         end_of_proof_ok = theorem_checkpoint_ok "end_of_proof" deps_key proof_engine proof_timeout prefix_hash checkpoint_key,
          failed_prefix_path = theorem_failed_prefix_path base deps_key proof_engine safe_name,
          failed_prefix_ok = failed_prefix_ok proof_engine proof_timeout deps_key safe_name pre_hash header_hash,
          deps_key = deps_key,
@@ -2610,16 +2604,13 @@ fun declaration_context_checkpoint_exists requested_timeout base checkpoint =
     checkpoint_timeout_satisfies requested_timeout (#context_path checkpoint)
   end
 
-fun theorem_replay_failure_checkpoints checkpoint =
-  [#context_path checkpoint, #end_of_proof_path checkpoint]
-
 fun theorem_replay_candidates requested_timeout base checkpoints =
   List.mapPartial
     (fn checkpoint =>
         if theorem_context_checkpoint_exists requested_timeout base checkpoint then
           SOME {boundary = #boundary checkpoint, path = #context_path checkpoint,
                 safe_name = #safe_name checkpoint, kind = "theorem-context",
-                failure_checkpoints = theorem_replay_failure_checkpoints checkpoint}
+                failure_checkpoints = [#context_path checkpoint]}
         else NONE)
     checkpoints
 
@@ -3138,8 +3129,8 @@ fun write_theory_script policy root checkpoint_root base_context (action : theor
       fun ensure_source_checkpoint_parents () =
         if not (theorem_checkpoints_enabled policy) then ()
         else
-          (List.app (fn {context_path, end_of_proof_path, failed_prefix_path, ...} =>
-                       (ensure_parent context_path; ensure_parent end_of_proof_path; ensure_parent failed_prefix_path))
+          (List.app (fn {context_path, failed_prefix_path, ...} =>
+                       (ensure_parent context_path; ensure_parent failed_prefix_path))
                     checkpoints;
            List.app (fn {context_path, ...} => ensure_parent context_path) declaration_checkpoints)
       fun run_from_deps_checkpoint () =
@@ -3292,8 +3283,8 @@ fun run_theory_action cache_allowed policy tc root checkpoint_root base_context 
     val _ = if checkpoint_enabled policy then ensure_parent deps_loaded else ()
     val _ =
       if theorem_checkpoints_enabled policy then
-        List.app (fn {context_path, end_of_proof_path, failed_prefix_path, ...} =>
-                    (ensure_parent context_path; ensure_parent end_of_proof_path; ensure_parent failed_prefix_path))
+        List.app (fn {context_path, failed_prefix_path, ...} =>
+                    (ensure_parent context_path; ensure_parent failed_prefix_path))
                  theorem_checkpoints
       else ()
     val _ = remove_file timeout_marker
@@ -3688,19 +3679,12 @@ fun action_policy_lines plan node =
     source_extra_output_lines
   end
 
-fun theorem_boundary_line ({safe_name, prefix_hash, context_path, end_of_proof_path, ...} : HolbuildTheoryCheckpoints.checkpoint) =
-  "theorem_boundary " ^ safe_name ^ " " ^ prefix_hash ^ " " ^
-  context_path ^ " " ^ end_of_proof_path
-
-fun theorem_boundary_lines theorem_checkpoints =
-  map theorem_boundary_line theorem_checkpoints
-
 fun proof_timeout_lines proof_timeout node =
   case #kind (HolbuildBuildPlan.source_of node) of
       HolbuildSourceIndex.TheoryScript => ["proof_timeout=" ^ timeout_text proof_timeout]
     | _ => []
 
-fun metadata_core_lines checkpoint_policy proof_timeout project plan keys input_key toolchain_key node theorem_checkpoints =
+fun metadata_core_lines checkpoint_policy proof_timeout project plan keys input_key toolchain_key node =
   let
     val source = HolbuildBuildPlan.source_of node
   in
@@ -3716,18 +3700,14 @@ fun metadata_core_lines checkpoint_policy proof_timeout project plan keys input_
     parent_hash_metadata_lines plan node @
     proof_timeout_lines proof_timeout node @
     action_policy_lines plan node @
-    checkpoint_lines checkpoint_policy project node @
-    theorem_boundary_lines theorem_checkpoints
+    checkpoint_lines checkpoint_policy project node
   end
 
 fun lines_text lines = String.concatWith "\n" lines ^ "\n"
 
-fun metadata_core_text checkpoint_policy proof_timeout project plan keys input_key toolchain_key node theorem_checkpoints =
-  lines_text (metadata_core_lines checkpoint_policy proof_timeout project plan keys input_key toolchain_key node theorem_checkpoints)
-
-fun metadata_text emit_output_hashes checkpoint_policy proof_timeout project plan keys input_key toolchain_key node theorem_checkpoints =
+fun metadata_text emit_output_hashes checkpoint_policy proof_timeout project plan keys input_key toolchain_key node =
   lines_text
-    (metadata_core_lines checkpoint_policy proof_timeout project plan keys input_key toolchain_key node theorem_checkpoints @
+    (metadata_core_lines checkpoint_policy proof_timeout project plan keys input_key toolchain_key node @
      (if emit_output_hashes then output_hash_lines checkpoint_policy plan node else []))
 
 fun semantic_metadata_text text =
@@ -3763,9 +3743,9 @@ fun output_exists_for_node node path =
       HolbuildSourceIndex.TheoryScript => file_nonempty path
     | _ => file_exists path
 
-fun write_metadata emit_output_hashes checkpoint_policy proof_timeout project plan keys input_key toolchain_key node theorem_checkpoints =
+fun write_metadata emit_output_hashes checkpoint_policy proof_timeout project plan keys input_key toolchain_key node =
   write_text (metadata_path project node)
-             (metadata_text emit_output_hashes checkpoint_policy proof_timeout project plan keys input_key toolchain_key node theorem_checkpoints)
+             (metadata_text emit_output_hashes checkpoint_policy proof_timeout project plan keys input_key toolchain_key node)
 
 fun metadata_has_parent_hashes lines =
   metadata_value "parent_hashes" lines = SOME "v1"
@@ -3878,7 +3858,7 @@ fun theory_parent_hashes_match dat_hash_cache plan node metadata_text =
            | _ => true)
         handle _ => false)
 
-fun up_to_date dat_hash_cache emit_output_hashes allow_timeout_discrepancy checkpoint_policy project plan keys input_key toolchain_key node theorem_checkpoints =
+fun up_to_date dat_hash_cache emit_output_hashes allow_timeout_discrepancy checkpoint_policy project plan keys input_key toolchain_key node =
   detail_time_phase "build.exec.node.up_to_date"
     (fn () =>
         List.all (output_exists_for_node node) (output_paths checkpoint_policy plan node) andalso
@@ -3899,7 +3879,7 @@ fun up_to_date dat_hash_cache emit_output_hashes allow_timeout_discrepancy check
                      write_metadata emit_output_hashes checkpoint_policy
                        (if allow_timeout_discrepancy then metadata_proof_timeout text
                         else tactic_timeout checkpoint_policy)
-                       project plan keys input_key toolchain_key node theorem_checkpoints
+                       project plan keys input_key toolchain_key node
                    else ()
                in
                  metadata_ok andalso parents_ok
@@ -4318,7 +4298,6 @@ fun alias_cache_entry old_key new_key =
 fun build_theory_node dat_hash_cache (options : build_options) tc project base_context plan keys toolchain_key node input_key =
   let
     val policy = checkpoint_policy_for_node options project node
-    val metadata_checkpoints = []
     val stage = stage_dir project input_key
     val forced = force_node options project node
     val cache_allowed = #use_cache options andalso cache_enabled node
@@ -4383,7 +4362,7 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
        invalidate_node_dat_hash ();
        write_metadata (#emit_output_hashes options) policy
          (if allow_timeout_discrepancy then built_timeout else tactic_timeout policy)
-         project plan keys input_key toolchain_key node metadata_checkpoints;
+         project plan keys input_key toolchain_key node;
        if copied_from_remote input_key then HolbuildStatus.RestoredRemote else HolbuildStatus.Restored)
     fun build_from_source () =
       if #restore_only options then
@@ -4392,7 +4371,7 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
       else
       (build_theory cache_allowed policy tc project base_context plan keys toolchain_key node;
        invalidate_node_dat_hash ();
-       write_metadata (#emit_output_hashes options) policy (tactic_timeout policy) project plan keys input_key toolchain_key node metadata_checkpoints;
+       write_metadata (#emit_output_hashes options) policy (tactic_timeout policy) project plan keys input_key toolchain_key node;
        HolbuildStatus.Built)
       handle ExecutionPlanPrinted => (remove_tree stage; HolbuildStatus.Inspected)
     (* The metadata goes before the outputs are replaced, so outputs of an
@@ -4438,13 +4417,13 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
        else ();
        write_metadata (#emit_output_hashes options) policy
          (if allow_timeout_discrepancy then metadata_proof_timeout text else tactic_timeout policy)
-         project plan keys input_key toolchain_key node metadata_checkpoints;
+         project plan keys input_key toolchain_key node;
        cache_trace ("early cutoff: " ^ logical_name node ^ " (dependency outputs unchanged)");
        HolbuildStatus.UpToDate)
   in
     if forced orelse always_reexecute node then restore_or_build ()
     else if up_to_date dat_hash_cache (#emit_output_hashes options) allow_timeout_discrepancy
-              policy project plan keys input_key toolchain_key node metadata_checkpoints then
+              policy project plan keys input_key toolchain_key node then
       (remove_tree stage;
        HolbuildStatus.UpToDate)
     else
@@ -4462,18 +4441,18 @@ fun build_node dat_hash_cache options tc project base_context plan keys toolchai
       | HolbuildSourceIndex.Sml =>
           if not (force_node options project node) andalso not (always_reexecute node) andalso
              up_to_date dat_hash_cache (#emit_output_hashes options) (#allow_cache_timeout_discrepancy options)
-               no_checkpoint_policy project plan keys input_key toolchain_key node [] then
+               no_checkpoint_policy project plan keys input_key toolchain_key node then
             HolbuildStatus.UpToDate
           else (build_sml_like plan node ".uo";
-                write_metadata (#emit_output_hashes options) no_checkpoint_policy (tactic_timeout no_checkpoint_policy) project plan keys input_key toolchain_key node [];
+                write_metadata (#emit_output_hashes options) no_checkpoint_policy (tactic_timeout no_checkpoint_policy) project plan keys input_key toolchain_key node;
                 HolbuildStatus.Built)
       | HolbuildSourceIndex.Sig =>
           if not (force_node options project node) andalso not (always_reexecute node) andalso
              up_to_date dat_hash_cache (#emit_output_hashes options) (#allow_cache_timeout_discrepancy options)
-               no_checkpoint_policy project plan keys input_key toolchain_key node [] then
+               no_checkpoint_policy project plan keys input_key toolchain_key node then
             HolbuildStatus.UpToDate
           else (build_sml_like plan node ".ui";
-                write_metadata (#emit_output_hashes options) no_checkpoint_policy (tactic_timeout no_checkpoint_policy) project plan keys input_key toolchain_key node [];
+                write_metadata (#emit_output_hashes options) no_checkpoint_policy (tactic_timeout no_checkpoint_policy) project plan keys input_key toolchain_key node;
                 HolbuildStatus.Built)
   end
 
@@ -4487,7 +4466,7 @@ fun node_is_up_to_date options project plan keys toolchain_key node =
   not (force_node options project node) andalso not (always_reexecute node) andalso
   up_to_date (new_file_hash_cache ()) (#emit_output_hashes options) (#allow_cache_timeout_discrepancy options)
              (node_policy options project node) project plan keys (HolbuildBuildPlan.input_key_for keys node)
-             toolchain_key node []
+             toolchain_key node
 
 fun report_up_to_date_node status project keys node =
   let
