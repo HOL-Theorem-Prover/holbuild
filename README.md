@@ -889,7 +889,11 @@ one (a copy across file systems) and resumes from it, and one it saves is
 linked into the store. A stored heap whose parent isn't the build's base
 state is ignored, and one HOL can't resume from is discarded and replaced by
 the build's fresh heap. `holbuild gc` removes stored heaps no build used
-within the retention window.
+within the retention window. A heap keeps HOL's record of the directories
+its files were loaded from, so in a theory resumed from another tree's heap
+`Meta.fileDirMap()` (used only by TacticToe's file lookups) names that
+tree's directories, as it names the old ones after a project is moved;
+loading is unaffected.
 
 For source-executed theory builds, holbuild writes a live child log at
 `.holbuild/logs/current/<package>/<logical>/build.log`. You can inspect it during
