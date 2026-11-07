@@ -522,6 +522,7 @@ for the child, keeping the bearer value out of build environments; this does
 not isolate builds from files owned by the worker user.
 Discovery never follows redirects. If it fails, the last complete ring remains
 usable for 60 seconds, after which requests use the permanent configuration.
+Recovery from permanent fallback counts as a new join.
 For 60 seconds after observing a joined member, GET/HEAD can try every ready
 member to find an object whose former owner has not uploaded it yet. Outside
 that join grace, a miss tries at most two nodes. If both nodes fail with
@@ -548,7 +549,9 @@ controller keeps reconciling and heartbeating hooks when capacity is disabled,
 so disabling scale-out can still drain existing instances.
 
 `REMOTE_EXEC_CACHE_WORKERS_PER_NODE` maps the existing held burst-worker target
-to cache capacity by ceiling division, capped at the number of slots. The
+to cache capacity by ceiling division, capped at the number of slots. Each
+controller rereads shared held demand while holding the capacity writer lock;
+a delayed replica cannot overwrite it with a local snapshot. The
 default is 15 worker tasks per added cache; zero requests no temporary capacity.
 This counts worker tasks rather than their hosts. Validate the configured ratio
 with deployment load before enabling it. Provider CPU scale-out recommendations

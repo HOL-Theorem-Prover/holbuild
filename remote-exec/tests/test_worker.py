@@ -996,3 +996,36 @@ def test_worker_discovery_auth_uses_a_private_file_and_cleans_it_on_exit(
     with pytest.raises(KeyboardInterrupt):
         worker.main()
     assert len(paths) == 1 and not paths[0].exists()
+
+
+def test_worker_refreshes_bootstrap_membership_after_memory_and_claim_waits(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", "worker-secret")
+    monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_DISCOVERY_URL", server.url + "/v1/cache/members")
+    args = worker_args(tmp_path, server)
+    args.cooperate_dir = str(tmp_path / "cooperate")
+    monkeypatch.setattr(worker, "parse_args", lambda: args)
+    monkeypatch.setattr(worker, "HostTelemetry", lambda *_: None)
+    events: list[str] = []
+    monkeypatch.setattr(worker, "wait_for_memory", lambda *_: events.append("memory") or False)
+    monkeypatch.setattr(worker, "claim_reporting", lambda *_: events.append("claim") or claim())
+
+    def refresh(_coordinator, membership, _url, now):
+        events.append("refresh")
+        membership.allowed.append("https://joined.example")
+        membership.update("holbuild-cache-members-v1\n" + server.url + "\nhttps://joined.example\n", now)
+        return membership.current(now)
+
+    def run(_coordinator, _args, releases, *_rest):
+        assert "https://joined.example" in releases.remote_cache
+        assert releases.joining
+        events.append("run")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(worker, "refresh_cache_members", refresh)
+    monkeypatch.setattr(worker, "run_one", run)
+    with pytest.raises(KeyboardInterrupt):
+        worker.main()
+    assert events == ["memory", "claim", "refresh", "run"]

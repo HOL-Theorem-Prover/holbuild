@@ -54,6 +54,9 @@ val _ = assert "bad snapshot retains last complete ring" (D.urls defaults = node
 val _ = D.succeeded := Time.- (Time.now (), Time.fromSeconds 61);
 val _ = assert "stale discovery falls back to permanent pair" (D.urls defaults = defaults);
 val _ = D.attempted := Time.zeroTime;
+val _ = RC.write_text (dir ^ "/body") snapshot;
+val _ = assert "recovery from permanent fallback starts join grace" (D.urls defaults = nodes andalso D.joining ());
+val _ = D.attempted := Time.zeroTime;
 val _ = RC.write_text (dir ^ "/body") (header ^ String.concatWith "\n" (List.take (identities, 2)));
 val _ = assert "scale-in withdraws burst members" (D.urls defaults = defaults);
 val _ = print "cache discovery passed\n";

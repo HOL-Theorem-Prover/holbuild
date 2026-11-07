@@ -131,11 +131,17 @@ class SlotStatus:
     error: str | None
 
 
+HELD_TARGET = sa.text(
+    "SELECT least(coalesce(max(workers), 0), :cap) FROM burst_demand "
+    "WHERE at >= CAST(:now AS timestamptz) - make_interval(secs => :hold)"
+)
+
+
 class CachePool:
     """Own the slot registry; only the elected controller may advance lifecycle state."""
 
     def __init__(self, engine: AsyncEngine, slots: list[CacheSlot], adapter: CommandAdapter, *, drain_seconds: int,
-                 hold_seconds: float = 900) -> None:
+                 hold_seconds: float = 900, workers_per_node: int = 0, max_workers: int = 240) -> None:
         if drain_seconds < 60:
             raise ValueError("cache drain must be at least 60 seconds")
         if not 1 <= len(slots) <= 4 or len({s.name for s in slots}) != len(slots):
@@ -147,9 +153,8 @@ class CachePool:
         self.adapter = adapter
         self.drain_seconds = drain_seconds
         self.hold_seconds = hold_seconds
-        # The first sweep restores held demand before a restarted controller may change capacity.
-        self.target: int | None = None
-        self.scaling_enabled = False
+        self.workers_per_node = workers_per_node
+        self.max_workers = max_workers
 
     async def ready_urls(self) -> list[str]:
         async with self.engine.connect() as conn:
@@ -191,19 +196,20 @@ class CachePool:
         inventory = await self.adapter.call(AdapterRequest(op="inventory", owners=[m.owner for m in members]))
         instances = {instance.id: instance for instance in inventory.instances}
         # Inventory also supplies the provider's CPU-only scale-out recommendation. One writer owns capacity.
-        if self.target is not None:
-            await conn.execute(sa.text(
-                "DELETE FROM cache_cpu_demand WHERE at < CAST(:now AS timestamptz) - make_interval(secs => :hold)"
-            ), {"now": now, "hold": self.hold_seconds})
-            if inventory.cpu_target and self.scaling_enabled:
-                await conn.execute(sa.text("INSERT INTO cache_cpu_demand(at,target) VALUES (:now,:target)"),
-                                   {"now": now, "target": min(len(self.slots), inventory.cpu_target)})
-            cpu = await conn.scalar(sa.text("SELECT coalesce(max(target),0) FROM cache_cpu_demand"))
-            target = min(len(self.slots), max(self.target, cpu)) if self.scaling_enabled else 0
-            try:
-                await self.adapter.call(AdapterRequest(op="capacity", target=target))
-            except (AdapterError, OSError, TimeoutError) as error:
-                logger.warning("cache capacity request failed; continuing lifecycle hooks: %s", error)
+        workers = await conn.scalar(HELD_TARGET, {"now": now, "hold": self.hold_seconds, "cap": self.max_workers})
+        await conn.execute(sa.text(
+            "DELETE FROM cache_cpu_demand WHERE at < CAST(:now AS timestamptz) - make_interval(secs => :hold)"
+        ), {"now": now, "hold": self.hold_seconds})
+        if inventory.cpu_target and self.workers_per_node > 0:
+            await conn.execute(sa.text("INSERT INTO cache_cpu_demand(at,target) VALUES (:now,:target)"),
+                               {"now": now, "target": min(len(self.slots), inventory.cpu_target)})
+        cpu = await conn.scalar(sa.text("SELECT coalesce(max(target),0) FROM cache_cpu_demand"))
+        floor = cache_target(workers, self.workers_per_node, len(self.slots))
+        target = min(len(self.slots), max(floor, cpu)) if self.workers_per_node > 0 else 0
+        try:
+            await self.adapter.call(AdapterRequest(op="capacity", target=target))
+        except (AdapterError, OSError, TimeoutError) as error:
+            logger.warning("cache capacity request failed; continuing lifecycle hooks: %s", error)
         for member in members:
             try:
                 await self._reconcile_member(conn, member, instances.get(member.owner), now)

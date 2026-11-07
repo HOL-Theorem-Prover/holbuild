@@ -191,3 +191,15 @@ def test_worker_protocol_failure_retains_then_expires_membership(monkeypatch, er
     url = coordinator.url + "/v1/cache/members"
     assert len(refresh_cache_members(coordinator, membership, url, 30)) == 3
     assert refresh_cache_members(coordinator, membership, url, 60) == DEFAULTS
+
+
+def test_recovered_discovery_restarts_join_grace_after_permanent_fallback() -> None:
+    membership = Membership(DEFAULTS, ALLOWED)
+    membership.update(SNAPSHOT, 0)
+    assert membership.current(61) == DEFAULTS
+    assert not membership.joining(61)
+    membership.update(SNAPSHOT, 62)
+    assert len(membership.current(62)) == 3
+    assert membership.joining(62)
+    membership.update(SNAPSHOT, 92)
+    assert not membership.joining(122)

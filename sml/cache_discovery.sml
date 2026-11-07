@@ -100,16 +100,18 @@ fun urls defaults =
           (case endpoint () of SOME url => fetch url defaults | NONE => NONE)
           handle Error _ => NONE | OS.SysErr _ => NONE | IO.Io _ => NONE
         else NONE) handle e => (if update then release () else (); raise e)
+      val published = Time.now ()
       val _ = Mutex.lock mutex
       val _ = if update then
           ((case fetched of SOME nodes =>
               (if List.exists (fn node => not (List.exists (fn old => old = node)
-                    (if null (!members) then defaults else !members))) nodes then joined := now else ();
-               members := nodes; succeeded := now)
+                    (if null (!members) orelse Time.>= (Time.- (published, !succeeded), Time.fromSeconds stale_seconds)
+                     then defaults else !members))) nodes then joined := published else ();
+               members := nodes; succeeded := published)
             | NONE => ()); refreshing := false)
         else ()
       val result = if not same_scope orelse null (!members) orelse
-                     Time.>= (Time.- (now, !succeeded), Time.fromSeconds stale_seconds)
+                     Time.>= (Time.- (published, !succeeded), Time.fromSeconds stale_seconds)
                    then defaults else !members
       val _ = Mutex.unlock mutex
     in result end

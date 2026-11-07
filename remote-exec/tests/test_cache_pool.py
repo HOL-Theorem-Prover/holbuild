@@ -55,6 +55,7 @@ async def pool(remote_exec_engine: AsyncEngine) -> CachePool:
     async with remote_exec_engine.begin() as conn:
         await conn.execute(sa.text("DELETE FROM cache_slots"))
         await conn.execute(sa.text("DELETE FROM cache_cpu_demand"))
+        await conn.execute(sa.text("DELETE FROM burst_demand"))
     return CachePool(remote_exec_engine, [CacheSlot(name=str(n), url=f"https://cache-{n}.example") for n in range(3, 7)],
                      Provider(), drain_seconds=60)
 
@@ -153,7 +154,7 @@ async def test_leader_does_not_hold_database_transaction_during_adapter_io(pool:
         assert held == 0
         other = CachePool(pool.engine, pool.slots, p, drain_seconds=60)
         await asyncio.wait_for(other.reconcile(p.now), 1)
-        assert len(p.calls) == 1  # only the elected controller called the provider
+        assert len([r for r in p.calls if r.op == "inventory"]) == 1  # one elected controller
     finally:
         p.block.set()
         await running
@@ -163,8 +164,9 @@ async def test_leader_does_not_hold_database_transaction_during_adapter_io(pool:
 
 async def test_cpu_backup_cannot_lower_worker_floor_and_survives_restart_hold(pool: CachePool) -> None:
     p = provider(pool)
-    pool.scaling_enabled = True
-    pool.target = 3
+    pool.workers_per_node = 15
+    async with pool.engine.begin() as conn:
+        await conn.execute(sa.text("INSERT INTO burst_demand(at,workers) VALUES (:at,45)"), {"at": p.now})
     await pool.reconcile(p.now)
     assert [r.target for r in p.calls if r.op == "capacity"][-1] == 3
     p.cpu_target = 4
@@ -172,22 +174,27 @@ async def test_cpu_backup_cannot_lower_worker_floor_and_survives_restart_hold(po
     assert [r.target for r in p.calls if r.op == "capacity"][-1] == 4
     p.cpu_target = 0
     restarted = CachePool(pool.engine, pool.slots, p, drain_seconds=60, hold_seconds=900)
-    restarted.scaling_enabled = True
-    restarted.target = 0
+    restarted.workers_per_node = 15
     await restarted.reconcile(p.now + timedelta(seconds=899))
     assert [r.target for r in p.calls if r.op == "capacity"][-1] == 4
     await restarted.reconcile(p.now + timedelta(seconds=901))
     assert [r.target for r in p.calls if r.op == "capacity"][-1] == 0
-    restarted.scaling_enabled = False
+    restarted.workers_per_node = 0
     p.cpu_target = 4
     await restarted.reconcile(p.now + timedelta(seconds=902))
     assert [r.target for r in p.calls if r.op == "capacity"][-1] == 0
 
 
-async def test_restart_does_not_zero_capacity_before_worker_demand_is_restored(pool: CachePool) -> None:
+async def test_replicas_read_shared_worker_demand_before_each_capacity_write(pool: CachePool) -> None:
     p = provider(pool)
+    pool.workers_per_node = 15
+    other = CachePool(pool.engine, pool.slots, p, drain_seconds=60, workers_per_node=15)
+    await other.reconcile(p.now)
+    async with pool.engine.begin() as conn:
+        await conn.execute(sa.text("INSERT INTO burst_demand(at,workers) VALUES (:at,60)"), {"at": p.now})
     await pool.reconcile(p.now)
-    assert not any(r.op == "capacity" for r in p.calls)
+    await other.reconcile(p.now)
+    assert [r.target for r in p.calls if r.op == "capacity"] == [0, 4, 4]
 
 
 async def test_one_broken_instance_does_not_starve_other_launches_or_heartbeats(pool: CachePool) -> None:

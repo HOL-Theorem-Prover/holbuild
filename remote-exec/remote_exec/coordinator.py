@@ -27,7 +27,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
 from remote_exec.cache import cache_nodes, node_identity, ranked_nodes
-from remote_exec.cache_pool import CachePool, CacheSlot, CommandAdapter, cache_target
+from remote_exec.cache_pool import HELD_TARGET, CachePool, CacheSlot, CommandAdapter
 from remote_exec.formats import Batch, Result
 from remote_exec.membership import REFRESH_SECONDS, Membership
 
@@ -366,13 +366,6 @@ LIMIT 1 FOR UPDATE OF a SKIP LOCKED
 """)
 
 
-# The burst worker target at :now: the highest demand recorded in the hold before it, under the current cap.
-HELD_TARGET = sa.text(
-    "SELECT least(coalesce(max(workers), 0), :cap) FROM burst_demand "
-    "WHERE at >= CAST(:now AS timestamptz) - make_interval(secs => :hold)"
-)
-
-
 class Coordinator:
     """Owns the database engine and the cache client; every rule of the coordinator lives here."""
 
@@ -385,10 +378,10 @@ class Coordinator:
         self.membership_lock = asyncio.Lock()
         self.clock: Callable[[], datetime] = lambda: datetime.now(UTC)
         self.cache_pool = (CachePool(engine, settings.cache_slots, CommandAdapter(settings.cache_pool_cmd),
-                                     drain_seconds=settings.cache_drain_seconds, hold_seconds=settings.scale_down_hold_s)
+                                     drain_seconds=settings.cache_drain_seconds, hold_seconds=settings.scale_down_hold_s,
+                                     workers_per_node=settings.cache_workers_per_node,
+                                     max_workers=settings.max_burst_workers)
                            if settings.cache_pool_cmd else None)
-        if self.cache_pool is not None:
-            self.cache_pool.scaling_enabled = settings.cache_workers_per_node > 0
         self.scaler: ScaleRun | None = None  # the scale command's last run
         # How many actions this process's release has made ready, and the claims waiting, by the tiers they take
         # and the future that wakes them, oldest first; see claim.
@@ -1043,9 +1036,6 @@ class Coordinator:
                 {"now": now, "workers": demand},
             )
             desired = await conn.scalar(HELD_TARGET, self._held_target_params(now))
-        if self.cache_pool is not None:
-            self.cache_pool.target = cache_target(desired, self.settings.cache_workers_per_node,
-                                                 len(self.settings.cache_slots))
         last = self.scaler
         if self.settings.scale_cmd is None or (last is not None and last.error is None and last.workers == desired):
             return

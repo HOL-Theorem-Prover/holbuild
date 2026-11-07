@@ -47,7 +47,7 @@ class Membership:
 
     def update(self, text: str, now: float) -> None:
         members = parse_members(text, self.defaults, self.allowed)
-        if set(members) - set(self.members or self.defaults):
+        if set(members) - set(self.current(now)):
             self.joined = now
         self.members = members
         self.succeeded = now

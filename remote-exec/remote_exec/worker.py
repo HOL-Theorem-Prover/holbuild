@@ -829,10 +829,6 @@ def main() -> None:
                 out.write('header = "' + header + '"\n')
             os.environ["HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG"] = config
         while True:
-            if membership is not None and discovery_url is not None:
-                now = time.monotonic()
-                nodes = refresh_cache_members(coordinator, membership, discovery_url, now)
-                releases = replace(releases, remote_cache=",".join(nodes), joining=membership.joining(now))
             if args.cooperate_dir is not None:
                 with phases.timed("memory_wait"):
                     waited = wait_for_memory(args.cooperate_dir, charge)
@@ -845,6 +841,10 @@ def main() -> None:
                 with phases.timed("idle"):
                     time.sleep(max(0.0, CLAIM_RETRY_SECONDS - (time.monotonic() - started)))
                 continue
+            if membership is not None and discovery_url is not None:
+                now = time.monotonic()
+                nodes = refresh_cache_members(coordinator, membership, discovery_url, now)
+                releases = replace(releases, remote_cache=",".join(nodes), joining=membership.joining(now))
             try:
                 unavailable = run_one(coordinator, args, releases, protection, claim, phases)
             except Exception as error:  # noqa: BLE001  # run_one reported it where it could; the worker goes on
