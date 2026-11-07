@@ -256,6 +256,7 @@ type t =
    selected_adjacency : int list Vector.vector,
    dependency_closure_cache : node list option array,
    dependency_context_key_cache : (string * string) option array,
+   output_digest_cache : string option array,
    extra_inputs_key_cache : string option option array,
    input_expansions : (string, input_expansion) Binarymap.dict ref,
    input_hashes : (string, string) Binarymap.dict ref,
@@ -601,6 +602,20 @@ fun remember_dependency_context_key
   Array.update(dependency_context_key_cache, plan_node_id plan node,
                SOME (context_id, value))
 
+(* A node's output digest, memoized while its outputs stay as they are; see
+   output_digest in build_exec.sml. *)
+fun cached_output_digest (plan as {output_digest_cache, ...} : t) node =
+  Array.sub(output_digest_cache, plan_node_id plan node)
+
+fun remember_output_digest (plan as {output_digest_cache, ...} : t) node digest =
+  Array.update(output_digest_cache, plan_node_id plan node, SOME digest)
+
+fun forget_output_digest (plan as {output_digest_cache, ...} : t) node =
+  Array.update(output_digest_cache, plan_node_id plan node, NONE)
+
+fun forget_output_digests ({output_digest_cache, ...} : t) =
+  Array.modify (fn _ => NONE) output_digest_cache
+
 fun closure_external_theories plan node =
   unique_strings
     (List.concat (map (direct_external_theories plan)
@@ -927,6 +942,7 @@ fun assemble {nodes, name_index, roots, selected, analysis, dependency_graph, re
        build_selected_adjacency selected_key_index selected dependency_graph,
      dependency_closure_cache = Array.array(length selected, NONE),
      dependency_context_key_cache = Array.array(length selected, NONE),
+     output_digest_cache = Array.array(length selected, NONE),
      extra_inputs_key_cache = Array.array(length selected, NONE),
      input_expansions = ref (Binarymap.mkDict String.compare),
      input_hashes = ref (Binarymap.mkDict String.compare),
@@ -1198,14 +1214,14 @@ fun extra_inputs_key (plan as {extra_inputs_key_cache, ...} : t) node =
       SOME value => value
     | NONE => raise Error ("internal error: extra-inputs key not computed for " ^ logical_name node)
 
-fun action_text_with plan config_lines_for_node toolchain_key keys node =
+(* The lines of a node's action, with each project dependency written by
+   DEP_TEXT and the node's extra inputs as INPUT_LINES. *)
+fun action_lines_with plan config_lines_for_node toolchain_key dep_text input_lines node =
   let
     val source = source_of node
     val analysis = analysis_state plan
     val source_hash = source_hash_of analysis node
-    val project_deps =
-      map (fn dep => package dep ^ ":" ^ logical_name dep ^ "@" ^ lookup_key keys dep)
-        (direct_project_deps plan node)
+    val project_deps = map dep_text (direct_project_deps plan node)
     (* Toolchain objects are a function of the theory toolchain identity, so
        they are named but not hashed: their files carry the install path. *)
     val external_deps = map (fn name => "HOL:" ^ name) (direct_external_theories plan node)
@@ -1218,26 +1234,50 @@ fun action_text_with plan config_lines_for_node toolchain_key keys node =
     val source_extra_output_lines =
       map (fn output => "source_extra_output=" ^ output)
           (#extra_outputs (deps_of analysis node))
+  in
+    ["holbuild-action-v1",
+     "toolchain=" ^ toolchain_key,
+     "kind=" ^ kind_name source,
+     "package=" ^ #package source,
+     "logical=" ^ #logical_name source,
+     "source=" ^ #relative_path source,
+     "source-sha256=" ^ source_hash,
+     "cache=" ^ bool_text (HolbuildProject.action_cache_enabled policy),
+     "always_reexecute=" ^ bool_text (HolbuildProject.action_always_reexecute policy)] @
+    config_lines_for_node node @
+    declared_dep_lines @
+    declared_load_lines @
+    input_lines @
+    source_extra_output_lines @
+    map (fn dep => "dep=" ^ dep) (project_deps @ external_deps @ external_libs)
+  end
+
+fun action_text_with plan config_lines_for_node toolchain_key keys node =
+  let
     val input_lines = extra_input_lines plan node
     val _ = remember_extra_inputs_key plan node input_lines
-    val lines =
-      ["holbuild-action-v1",
-       "toolchain=" ^ toolchain_key,
-       "kind=" ^ kind_name source,
-       "package=" ^ #package source,
-       "logical=" ^ #logical_name source,
-       "source=" ^ #relative_path source,
-       "source-sha256=" ^ source_hash,
-       "cache=" ^ bool_text (HolbuildProject.action_cache_enabled policy),
-       "always_reexecute=" ^ bool_text (HolbuildProject.action_always_reexecute policy)] @
-      config_lines_for_node node @
-      declared_dep_lines @
-      declared_load_lines @
-      input_lines @
-      source_extra_output_lines @
-      map (fn dep => "dep=" ^ dep) (project_deps @ external_deps @ external_libs)
+    fun dep_text dep = package dep ^ ":" ^ logical_name dep ^ "@" ^ lookup_key keys dep
   in
-    String.concatWith "\n" lines ^ "\n"
+    String.concatWith "\n"
+      (action_lines_with plan config_lines_for_node toolchain_key dep_text input_lines node) ^ "\n"
+  end
+
+(* What the node's action key commits to besides its dependencies' keys: the
+   action lines with each project dependency named but not keyed.  Two builds
+   with the same self key differ only in what their dependencies produced.
+   Needs the node's input key computed, for its extra-inputs key. *)
+fun self_input_key plan config_lines_for_node toolchain_key node =
+  let
+    val input_lines =
+      case extra_inputs_key plan node of
+          NONE => []
+        | SOME key => ["extra_inputs=" ^ key]
+    fun dep_text dep = package dep ^ ":" ^ logical_name dep
+  in
+    hash_text
+      (String.concatWith "\n"
+         ("holbuild-self-input-v1" ::
+          action_lines_with plan config_lines_for_node toolchain_key dep_text input_lines node) ^ "\n")
   end
 
 (* A node keeps a known input key while what it was computed from is the

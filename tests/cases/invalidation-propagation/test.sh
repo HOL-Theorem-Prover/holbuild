@@ -57,7 +57,9 @@ bkey_after=$(grep '^input_key=' "$project/.holbuild/dep/invalidate/src/BScript.s
 
 [[ "$akey_before" != "$akey_after" ]] || { echo "A input key did not change" >&2; exit 1; }
 [[ "$bkey_before" != "$bkey_after" ]] || { echo "B input key did not change after dependency key changed" >&2; exit 1; }
-if grep -q "BTheory is up to date" "$rebuild_log"; then
-  echo "dependent BTheory was incorrectly up to date" >&2
+# The edit leaves A's outputs as they were, so B keeps its outputs under its
+# new key (early cutoff; tests/cases/early-cutoff covers when it may not).
+if grep -q "BTheory built" "$rebuild_log"; then
+  echo "dependent BTheory was rebuilt though A's outputs did not change" >&2
   exit 1
 fi
