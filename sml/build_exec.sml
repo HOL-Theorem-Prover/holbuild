@@ -4300,19 +4300,25 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
           handle _ => false
         (* A local entry built against other parent outputs can sit beside a
            remote entry built against these, so once the local one is dropped
-           the remote one gets a try. *)
-        fun materialize existing =
+           the remote one gets a try; one that another build published
+           meanwhile gets the same try instead.  Either way only once. *)
+        fun materialize retry existing =
           let
+            fun retry_with text = if retry then materialize false text else CacheMiss
             fun reject_parents () =
               (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
                             input_key ^ " (parent outputs differ)");
-               ignore (drop_cache_manifest_if_unchanged root input_key existing);
                remove_failed_cache_outputs project node;
-               if not (copied_from_remote input_key) andalso hydrate_remote_cache_key root input_key then
+               if drop_cache_manifest_if_unchanged root input_key existing then
+                 if not (copied_from_remote input_key) andalso hydrate_remote_cache_key root input_key then
+                   case HolbuildCache.get_action root input_key of
+                       SOME text => retry_with text
+                     | NONE => CacheMiss
+                 else CacheMiss
+               else
                  case HolbuildCache.get_action root input_key of
-                     SOME text => materialize text
-                   | NONE => CacheMiss
-               else CacheMiss)
+                     SOME text => retry_with text
+                   | NONE => CacheMiss)
           in
             case materialize_theory_cache (#verify_cache options) allow_timeout_discrepancy
                    project plan input_key (tactic_timeout policy) (trknl_enabled policy) node of
@@ -4327,7 +4333,7 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
         case ensure_local_cache_entry root input_key of
             NONE => (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
                                   input_key ^ " (no manifest)"); CacheMiss)
-          | SOME text => materialize text
+          | SOME text => materialize true text
       end
     fun restore_from_cache built_timeout =
       (remove_tree stage;

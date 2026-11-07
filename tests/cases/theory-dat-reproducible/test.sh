@@ -262,19 +262,30 @@ link_hol_toolchain_cache "$golden_root/cache"
 manifest_version=$(sed -n 's/^val theory_manifest_version = "\(.*\)"$/\1/p' "$HOLBUILD_ROOT/sml/build_exec.sml")
 [[ -n "$manifest_version" ]] || { echo "theory_manifest_version not found in sml/build_exec.sml" >&2; exit 1; }
 hol_rev=$(holbuild_pinned_hol_rev)
+if [[ "$hol_rev" != "$(tr -d '[:space:]' < "$HOLBUILD_ROOT/vendor/hol/REV")" ]]; then
+  echo "skipping golden outputs: HOL $hol_rev is not vendor/hol/REV"
+  exit 0
+fi
 obj=$golden_root/project/.holbuild/obj/src
-actual="hol=$hol_rev version=$manifest_version"
+prefix="hol=$hol_rev version=$manifest_version"
+actual=$prefix
 for suffix in sig sml dat; do
   actual+=" $suffix=$(sha256sum "$obj/GoldenTheory.$suffix" | cut -d' ' -f1)"
 done
 golden_file=$SCRIPT_DIR/golden-outputs
-if ! grep -qxF "$actual" "$golden_file"; then
-  echo "GoldenTheory's outputs are not in $golden_file:" >&2
+expected=$(grep "^$prefix " "$golden_file" || true)
+if [[ $(grep -c . <<< "$expected") -gt 1 ]]; then
+  echo "$golden_file has more than one line for $prefix; outputs changed without a theory_manifest_version bump" >&2
+  exit 1
+fi
+if [[ -z "$expected" ]]; then
+  echo "$golden_file has no line for $prefix; add:" >&2
   echo "  $actual" >&2
-  if grep -q "^hol=$hol_rev version=$manifest_version " "$golden_file"; then
-    echo "holbuild changed theory outputs: bump theory_manifest_version and add a line for the new version" >&2
-  else
-    echo "no line for this HOL revision and version yet: add the line above" >&2
-  fi
+  exit 1
+fi
+if [[ "$expected" != "$actual" ]]; then
+  echo "holbuild changed GoldenTheory's outputs: bump theory_manifest_version and add a line for the new version" >&2
+  echo "  expected: $expected" >&2
+  echo "  actual:   $actual" >&2
   exit 1
 fi
