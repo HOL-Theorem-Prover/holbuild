@@ -73,7 +73,6 @@ class Server:
     claims: list[dict[str, object]] = field(default_factory=list)
     heartbeats: list[dict[str, object]] = field(default_factory=list)
     unavailable: int = 0  # how many more completes answer 502, as a proxy does while the coordinator restarts
-    heartbeat_statuses: list[int] = field(default_factory=list)  # what the next heartbeats answer, then 200
 
 
 @pytest.fixture
@@ -112,8 +111,6 @@ def server() -> Iterator[Server]:
                 state.completed.append(body)
             if self.path.endswith("/heartbeat"):
                 state.heartbeats.append(json.loads(body))
-                if state.heartbeat_statuses:
-                    return self.reply(state.heartbeat_statuses.pop(0))
             self.reply(200, json.dumps({"accepted": True}) if self.path.endswith("/complete") else '{"lease_s": 3}')
 
         def do_PUT(self) -> None:
@@ -522,7 +519,7 @@ def telemetry(host: Host, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> It
     monkeypatch.setattr(worker, "BOOT_ID", str(tmp_path / "boot_id"))
     monkeypatch.setattr(worker, "PROC_STAT", str(stat))
     monkeypatch.setattr(worker, "CPU_SAMPLE_SECONDS", 0)
-    yield HostTelemetry(str(host.dir), 3 * GIB), stat
+    yield HostTelemetry(str(host.dir), 3 * GIB, "w1"), stat
 
 
 def test_host_report_has_idle_cpu_since_the_last_report_and_admissions_view(
@@ -554,7 +551,7 @@ def test_cpu_is_measured_over_at_least_the_least_sample_time(
     assert reporter.cpu is not None and reporter.cpu[2] == 0  # still measuring from the first sample
 
 
-def test_memory_waits_are_reported_once(telemetry: tuple[HostTelemetry, Path], server: Server) -> None:
+def test_memory_waits_are_reported_as_the_workers_totals(telemetry: tuple[HostTelemetry, Path], server: Server) -> None:
     reporter, _ = telemetry
     reporter.waited(4.0)
     reporter.waited(2.5)
@@ -563,31 +560,21 @@ def test_memory_waits_are_reported_once(telemetry: tuple[HostTelemetry, Path], s
     assert coordinator.heartbeat("t")
     claimed, beat = server.claims[0]["host"], server.heartbeats[0]["host"]
     assert isinstance(claimed, dict) and isinstance(beat, dict)
-    assert (claimed["id"], claimed["memory_waits"], claimed["memory_wait_s"]) == ("b0a7", 2, 6.5)
-    assert (beat["memory_waits"], beat["memory_wait_s"]) == (0, 0.0)
+    assert (claimed["id"], claimed["worker"], claimed["memory_waits"], claimed["memory_wait_s"]) == (
+        "b0a7",
+        "w1",
+        2,
+        6.5,
+    )
+    assert (beat["memory_waits"], beat["memory_wait_s"]) == (2, 6.5)
 
 
-def test_memory_waits_go_with_the_next_report_only_when_the_coordinator_cannot_have_taken_them(
-    telemetry: tuple[HostTelemetry, Path], server: Server
-) -> None:
-    reporter, _ = telemetry
-    reporter.waited(4.0)
-    with pytest.raises(OSError):
-        Coordinator("http://127.0.0.1:1", "w", reporter).claim(["standard"], "w", 0)  # refused
-    with pytest.raises(OSError):
-        Coordinator("http://coordinator.invalid", "w", reporter).claim(["standard"], "w", 0)  # no such name
-    coordinator = Coordinator(server.url, "w", reporter)
-    server.heartbeat_statuses = [502, 200, 503]  # a 502 from a proxy with no coordinator behind it
-    with pytest.raises(RuntimeError, match="answered 502"):
-        coordinator.heartbeat("t")
-    assert coordinator.heartbeat("t")
-    reporter.waited(1.0)
-    with pytest.raises(RuntimeError, match="answered 503"):
-        coordinator.heartbeat("t")
-    assert coordinator.heartbeat("t")
-
-    waits = [beat["host"]["memory_waits"] for beat in server.heartbeats]  # type: ignore[index]
-    assert waits == [1, 1, 1, 0]
+def test_cpu_counters_going_backwards_give_no_idle_share(telemetry: tuple[HostTelemetry, Path]) -> None:
+    reporter, stat = telemetry
+    stat.write_text("cpu  100 0 0 100 50 0 0 0 0 0\n")
+    reporter.report()
+    stat.write_text("cpu  100 0 0 200 40 0 0 0 0 0\n")  # iowait fell by 10 while idle rose by 100
+    assert reporter.report().cpu_idle_pct is None
 
 
 def test_a_report_does_not_wait_for_an_admission_holding_the_lock(

@@ -96,24 +96,9 @@ class Coordinator:
             return error.code, error.read().decode(errors="replace")
 
     def post_reporting(self, path: str, body: dict[str, Any], timeout: float = 30) -> tuple[int, Any]:
-        """``post`` a JSON body with the host's report in it. A report that can't have reached the coordinator, as
-        when its name didn't resolve, nothing listened or the proxy found no coordinator (502), goes back to be sent with the next; one that
-        may have been taken isn't sent again, so its memory waits are never counted twice. A coordinator that
-        restarts forgets its hosts, so a 502 from one that took the report and then died loses nothing."""
-        if self.host is None:
-            return self.post(path, json.dumps({**body, "host": None}).encode(), "application/json", timeout)
-        report = self.host.report()
-        try:
-            status, response = self.post(
-                path, json.dumps({**body, "host": asdict(report)}).encode(), "application/json", timeout
-            )
-        except urllib.error.URLError as error:
-            if isinstance(error.reason, (ConnectionRefusedError, socket.gaierror)):
-                self.host.unsent(report)
-            raise
-        if status == 502:
-            self.host.unsent(report)
-        return status, response
+        """``post`` a JSON body with the host's report in it."""
+        report = None if self.host is None else asdict(self.host.report())
+        return self.post(path, json.dumps({**body, "host": report}).encode(), "application/json", timeout)
 
     def claim(self, tiers: list[str], worker: str, wait_s: float) -> dict[str, Any] | None:
         """An action, waiting up to ``wait_s`` seconds for one, or None."""
@@ -367,10 +352,12 @@ def cpu_times(stat_line: str) -> tuple[int, int]:
 @dataclass(frozen=True)
 class HostReport:
     """A worker's report of its host to the coordinator; memory in bytes as in HostMemory, ``memory_short`` when
-    admission would hold a child back now, and the waits for memory before claiming since the last report."""
+    admission would hold a child back now, and the worker's waits for memory before claiming since it started:
+    totals, so a report lost or sent twice changes nothing."""
 
     id: str
-    cpu_idle_pct: float | None  # since this worker's last report; None when that was under CPU_SAMPLE_SECONDS ago
+    worker: str
+    cpu_idle_pct: float | None  # since the CPU sample it was last measured from, None under CPU_SAMPLE_SECONDS ago
     mem_total: int | None
     mem_available: int | None
     budget: int | None
@@ -384,9 +371,10 @@ class HostReport:
 class HostTelemetry:
     """What a worker reports of its host with each claim and heartbeat, which come from two threads."""
 
-    def __init__(self, cooperate_dir: str | None, charge: int) -> None:
+    def __init__(self, cooperate_dir: str | None, charge: int, worker: str) -> None:
         with open(BOOT_ID) as file:
             self.id = file.read().strip()
+        self.worker = worker
         self.cooperate_dir = cooperate_dir
         self.charge = charge
         self.lock = threading.Lock()
@@ -402,7 +390,7 @@ class HostTelemetry:
             self.memory_wait_s += seconds
 
     def report(self) -> HostReport:
-        """The host now, with the waits not yet reported, which it takes. It doesn't wait for the cooperate dir's
+        """The host now. It doesn't wait for the cooperate dir's
         lock, which would hold up the heartbeat that renews a running action's lease: while an admission holds the
         lock, the memory is the last reading, or ``/proc/meminfo`` alone before the first."""
         try:
@@ -416,13 +404,15 @@ class HostTelemetry:
         with self.lock:
             idle_pct = None
             if self.cpu is None or now - self.cpu[0] >= CPU_SAMPLE_SECONDS:
-                if self.cpu is not None and total > self.cpu[2]:
+                # The kernel's iowait count can go backwards (Documentation/filesystems/proc.rst), so a share
+                # outside 0-100 is no measurement.
+                if self.cpu is not None and total > self.cpu[2] and 0 <= idle - self.cpu[1] <= total - self.cpu[2]:
                     idle_pct = round(100 * (idle - self.cpu[1]) / (total - self.cpu[2]), 1)
                 self.cpu = (now, idle, total)
             waits, wait_s = self.memory_waits, self.memory_wait_s
-            self.memory_waits, self.memory_wait_s = 0, 0.0
         return HostReport(
             self.id,
+            self.worker,
             idle_pct,
             memory.total,
             memory.available,
@@ -433,12 +423,6 @@ class HostTelemetry:
             waits,
             round(wait_s, 1),
         )
-
-    def unsent(self, report: HostReport) -> None:
-        """Keep the waits of a report that didn't reach the coordinator for the next one."""
-        with self.lock:
-            self.memory_waits += report.memory_waits
-            self.memory_wait_s += report.memory_wait_s
 
 
 def failed_record(spec_sha256: str, failure: str) -> str:
@@ -615,7 +599,7 @@ def main() -> None:
     if not os.environ.get("HOLBUILD_CACHE"):
         sys.exit("HOLBUILD_CACHE is not set; give the worker its own cache root")
     charge = child_charge(args.max_heap)
-    host = HostTelemetry(args.cooperate_dir, charge)
+    host = HostTelemetry(args.cooperate_dir, charge, args.name)
     coordinator = Coordinator(args.coordinator, token, host)
     releases = Releases(
         args.holbuild_releases_dir,
