@@ -4728,7 +4728,7 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
   let
     val policy = checkpoint_policy_for_node options project node
     val stage = stage_dir project input_key
-    val forced = force_node options project node
+    val forced = force_node options project node orelse trace_steps policy
     val cache_allowed = #use_cache options andalso cache_enabled node
     val cache_restore_allowed = cache_allowed andalso not forced
     val allow_timeout_discrepancy = #allow_cache_timeout_discrepancy options
@@ -4893,6 +4893,7 @@ fun node_policy options project node =
 
 fun node_is_up_to_date options project plan keys toolchain_key node =
   not (force_node options project node) andalso not (always_reexecute node) andalso
+  not (trace_steps (node_policy options project node)) andalso
   up_to_date (new_file_hash_cache ()) (#emit_output_hashes options) (#allow_cache_timeout_discrepancy options)
              (node_policy options project node) project plan keys (HolbuildBuildPlan.input_key_for keys node)
              toolchain_key node
@@ -5947,13 +5948,14 @@ fun fetch_remote_build_log project node log_sha256 =
   in
     ensure_parent log;
     remove_file log;
-    case HolbuildRemoteCacheConfig.url () of
-        NONE => NONE
-      | SOME url =>
-          case HolbuildRemoteCache.fetch_unlisted_blob (HolbuildRemoteCache.remote url)
-                 {hash = log_sha256, dst = log} of
-              HolbuildCacheBackend.Hit => SOME log
-            | _ => (remove_file log; NONE)
+    (case HolbuildRemoteCacheConfig.url () of
+         NONE => NONE
+       | SOME url =>
+           case HolbuildRemoteCache.fetch_unlisted_blob (HolbuildRemoteCache.remote url)
+                  {hash = log_sha256, dst = log} of
+               HolbuildCacheBackend.Hit => SOME log
+             | _ => (remove_file log; NONE))
+    handle e => (remove_file log; raise e)
   end
 
 (* Logs belong to this execution, not the cached theory entry. *)
@@ -5977,10 +5979,7 @@ fun restore_remote_build_logs (options : build_options) tc project plan toolchai
       in
         case log of
             NONE =>
-              if required then
-                (remove_file (current_build_log
-                   (current_log_dir (project_artifact_root project) (package node) (logical_name node)));
-                 raise Error reason)
+              if required then raise Error reason
               else (if Option.isSome (Option.join reported) then warn reason else (); NONE)
           | SOME path => SOME (node, traced, path)
       end
@@ -5989,6 +5988,12 @@ fun restore_remote_build_logs (options : build_options) tc project plan toolchai
     val theories = List.filter
       (fn node => #kind (HolbuildBuildPlan.source_of node) = HolbuildSourceIndex.TheoryScript)
       (HolbuildBuildPlan.selected_nodes plan)
+    (* Clear every required target first, even if an earlier log is missing. *)
+    val _ = List.app (fn node =>
+      if force_node options project node orelse trace_steps (checkpoint_policy_for_node options project node) then
+        let val dir = current_log_dir (project_artifact_root project) (package node) (logical_name node)
+        in remove_file (current_build_log dir); remove_file (current_proof_trace_log dir) end
+      else ()) theories
     val restored = List.mapPartial restore theories
     fun report (node, traced, path) =
       if not traced then ()

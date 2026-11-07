@@ -173,9 +173,9 @@ class Handler(BaseHTTPRequestHandler):
                 if event["state"] == "done" and (state / "requeue-log").exists():
                     # The first execution's log was evicted; only the final
                     # execution's log is usable after the action is requeued.
-                    for old in [dict(event, log_sha256="0" * 64),
-                                dict(event, state="waiting", log_sha256=None)]:
-                        self.wfile.write((json.dumps(old) + "\n").encode())
+                    self.wfile.write((json.dumps(dict(event, log_sha256="0" * 64)) + "\n").encode())
+                    if not (state / "requeue-snapshot").exists():
+                        self.wfile.write((json.dumps(dict(event, state="waiting", log_sha256=None)) + "\n").encode())
                 self.wfile.write((json.dumps(event) + "\n").encode())
                 self.wfile.flush()
                 for _ in range(600):

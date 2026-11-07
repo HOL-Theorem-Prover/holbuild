@@ -1021,6 +1021,19 @@ run force-log-local 0 build --remote-exec "$coordinator" --force=theory BTheory
 require_grep 'could not fetch the remote build log.*building locally' "$tmpdir/force-log-local.log"
 require_grep 'BTheory built' "$tmpdir/force-log-local.log"
 require_grep 'remote execution verdict: PASS' "$local_log"
+run trace-log-missing 75 build --remote-exec "$coordinator" --remote-only --trace-steps BTheory
+for theory in ATheory BTheory; do
+  for log in build.log proof-trace.log; do
+    [[ ! -e "$project/.holbuild/logs/current/rxf/$theory/$log" ]] ||
+      { echo "stale trace log survived: $theory/$log" >&2; exit 1; }
+  done
+done
+run trace-log-local 0 build --remote-exec "$coordinator" --trace-steps BTheory
+require_grep 'could not fetch the remote build log.*building locally' "$tmpdir/trace-log-local.log"
+require_grep 'ATheory built' "$tmpdir/trace-log-local.log"
+require_grep 'BTheory built' "$tmpdir/trace-log-local.log"
+require_grep 'theorem=b_thm' "$local_log"
+cmp "$local_log" "$project/.holbuild/logs/current/rxf/BTheory/proof-trace.log"
 rm "$state/drop-log"
 
 # An attached batch must cover the requested forced/traced targets.
@@ -1034,11 +1047,14 @@ done
 
 # Requeued actions replace the previous execution's now-evicted log.
 touch "$state/requeue-log"
-run trace-requeued 0 build --remote-exec "$coordinator" --remote-only --trace-steps BTheory
-[[ $(grep -c '^proof step trace log:' "$tmpdir/trace-requeued.log") -eq 2 ]] ||
-  { cat "$tmpdir/trace-requeued.log" >&2; exit 1; }
-require_grep 'theorem=b_thm' "$local_log"
-rm "$state/requeue-log"
+for snapshot in no yes; do
+  [[ $snapshot == no ]] || touch "$state/requeue-snapshot"
+  run trace-requeued 0 build --remote-exec "$coordinator" --remote-only --trace-steps BTheory
+  [[ $(grep -c '^proof step trace log:' "$tmpdir/trace-requeued.log") -eq 2 ]] ||
+    { cat "$tmpdir/trace-requeued.log" >&2; exit 1; }
+  require_grep 'theorem=b_thm' "$local_log"
+done
+rm "$state/requeue-log" "$state/requeue-snapshot"
 
 # A completed ancestor's missing log cannot hide cancellation or the failed
 # child's proof diagnostic, or print traces from a batch that will be retried.

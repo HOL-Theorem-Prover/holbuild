@@ -206,7 +206,7 @@ fun report_action line =
 fun follow url batch_id (on_change : string * string * string option * string option -> unit) : outcome * progress =
   let
     val _ = HolbuildOffline.require_online "follow a remote batch"
-    val states : (string * string) list ref = ref []
+    val states : (string * (string * string option * string option)) list ref = ref []
     val proof_failure : proof_failure option ref = ref NONE
     (* A line cut off by a dropped connection, perhaps with curl's error
        after it, is no event. *)
@@ -217,6 +217,10 @@ fun follow url batch_id (on_change : string * string * string option * string op
             let
               val key = Option.getOpt (json_string_field "input_key" line, "")
               val state = Option.getOpt (json_string_field "state" line, "")
+              val failure = json_string_field "last_failure" line
+              val log = json_string_field "log_sha256" line
+              val previous = List.find (fn (k, _) => k = key) (!states)
+              val status = (state, failure, log)
             in
               (case (state, json_string_field "last_failure" line, json_string_field "log_sha256" line) of
                    ("failed", SOME kind, SOME log_sha256) =>
@@ -224,11 +228,14 @@ fun follow url batch_id (on_change : string * string * string option * string op
                        proof_failure := SOME {input_key = key, kind = kind, log_sha256 = log_sha256}
                      else ()
                  | _ => ());
-              if List.exists (fn entry => entry = (key, state)) (!states) then ()
-              else (states := (key, state) :: List.filter (fn (k, _) => k <> key) (!states);
-                    changed := true;
-                    report_action line;
-                    on_change (key, state, json_string_field "last_failure" line, json_string_field "log_sha256" line))
+              if previous = SOME (key, status) then ()
+              else
+                (states := (key, status) :: List.filter (fn (k, _) => k <> key) (!states);
+                 (* A new log can arrive in a repeated done snapshot after a
+                    missed requeue. Only state progress resets stream retries. *)
+                 if Option.map (fn (_, (s, _, _)) => s) previous = SOME state then ()
+                 else (changed := true; report_action line);
+                 on_change (key, state, failure, log))
             end
         | SOME "batch" =>
             outcome :=
@@ -279,7 +286,7 @@ fun follow url batch_id (on_change : string * string * string option * string op
     val outcome = attach (retry_delays_seconds ())
   in
     (outcome,
-     {built = length (List.filter (fn (_, state) => state = "done") (!states)),
+     {built = length (List.filter (fn (_, (state, _, _)) => state = "done") (!states)),
       total = length (!states)})
   end
 
