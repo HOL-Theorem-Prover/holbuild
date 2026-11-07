@@ -1275,7 +1275,7 @@ copies into the local cache the remote cache entry of each theory as the batch
 finishes it, and those of the theories outside a submitted batch that the
 remote cache already holds, `--prefetch-concurrency` at a time. When the batch is done,
 the build restores those theories from the local cache, or from the remote cache
-whatever is not there yet, and builds the ones left out of the batch (below). The coordinator's credentials go
+whatever is not there yet. The coordinator's credentials go
 in a curl config file named by `HOLBUILD_REMOTE_EXEC_CURL_CONFIG`, such as
 `header = "Authorization: Bearer <token>"`, so they stay off the command line.
 
@@ -1294,29 +1294,6 @@ theory in the batch depends on one, holbuild publishes its local cache entry
 there first; it goes in the batch only when it has no usable local entry or
 the publish fails. `--detach` follows no local build, so it checks and
 submits such theories like any other.
-
-A theory that no other theory in the batch depends on stays out of the batch,
-for the build that follows it to build locally, when either holds:
-
-- its local build would resume from one of its checkpoints (see
-  [Proof steps and checkpoints](#proof-steps-and-checkpoints)): its
-  `deps_loaded` checkpoint, on which every other checkpoint it resumes from
-  sits, matches its current dependencies;
-- it is the only theory to build, and every project theory it depends on is
-  built here for its current source, and it has at least one, or was itself
-  built here before. Several such theories, as after a merge, build faster
-  side by side on the workers.
-
-A worker has none of the project's checkpoints, runs the theory from scratch
-and loads its dependencies from the cache. Built locally, it resumes from its
-checkpoints, or leaves them for the next build, which is what an
-edit-and-rebuild loop on one theory needs. holbuild says so for each such
-theory (`holbuild: remote execution: rx:BTheory stays out of the batch, to
-resume from its local checkpoints`, or `..., to build on its dependencies
-built here`). `--remote-only` builds nothing locally, so it sends the second
-kind to the workers. It doesn't build the first kind: the line says to build
-it without `--remote-only`, and the build exits with status 75, as below.
-`--detach` submits every theory the remote cache lacks.
 
 The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the
