@@ -55,24 +55,26 @@ fun package_named graph name =
   List.find (fn package => HolbuildProject.package_name package = name)
     (HolbuildProjectGraph.packages graph)
 
-fun generator_for_output package relative_path =
-  List.find
-    (fn generator =>
-      List.exists (fn output => output = relative_path)
-        (HolbuildProject.generator_outputs generator))
-    (HolbuildProject.package_generators package)
-
-fun ensure_output ({graph, ...} : t) package_name relative_path =
+(* Run generators owning any output selected by the caller. *)
+fun ensure_outputs ({graph, ...} : t) package_name matches =
   case package_named graph package_name of
       NONE => ()
     | SOME package =>
-        (case generator_for_output package relative_path of
-             NONE => ()
-           | SOME generator =>
-               (HolbuildGenerators.run_selected package
-                  [HolbuildProject.generator_name generator]
-                handle HolbuildGenerators.Error msg => raise Error msg
-                     | HolbuildGenerators.ErrorWithDebugArtifacts (msg, artifacts) =>
-                         raise ErrorWithDebugArtifacts (msg, artifacts)))
+        let
+          val selected =
+            List.filter
+              (fn generator => List.exists matches
+                (HolbuildProject.generator_outputs generator))
+              (HolbuildProject.package_generators package)
+        in
+          HolbuildGenerators.run_selected package
+            (map HolbuildProject.generator_name selected)
+          handle HolbuildGenerators.Error msg => raise Error msg
+               | HolbuildGenerators.ErrorWithDebugArtifacts (msg, artifacts) =>
+                   raise ErrorWithDebugArtifacts (msg, artifacts)
+        end
+
+fun ensure_output preparation package_name relative_path =
+  ensure_outputs preparation package_name (fn output => output = relative_path)
 
 end

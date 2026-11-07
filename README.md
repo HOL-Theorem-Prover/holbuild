@@ -751,7 +751,9 @@ always_reexecute = true
   read as `../data/table.txt` (the stage mirrors the package layout, so such
   copies stay inside it); absolute paths and `..` components are rejected. A
   directory or glob names the files under it, skipping any `.holbuild/`
-  directory inside it.
+  directory inside it. Before hashing or staging these files, holbuild runs
+  the generators whose declared outputs match the file, directory, or glob,
+  including outputs that do not exist yet. Unrelated generators stay idle.
 - `cache = false` disables global cache restore/publish for the action.
 - `always_reexecute = true` disables local up-to-date skipping for the action.
 
