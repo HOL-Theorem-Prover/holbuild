@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from remote_exec import worker
+from remote_exec.auth import cache_discovery_token
 from remote_exec.worker import (
     CacheUnavailable,
     Coordinator,
@@ -1123,28 +1124,62 @@ def test_bootstrap_spec_distinguishes_miss_from_outage(
     assert len(asked) == len(statuses)
 
 
-def test_worker_discovery_auth_uses_a_private_file_and_cleans_it_on_exit(
-    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+def test_worker_discovery_exposes_only_a_scoped_token_to_the_action_and_cleans_it_on_exit(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", 'worker-"secret')
-    monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
-    monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_DISCOVERY_URL", server.url + "/v1/cache/members")
-    monkeypatch.setattr(worker, "parse_args", lambda: worker_args(tmp_path, server))
+    token = "worker-secret-discovery-test"
+    inherited_config = tmp_path / "coordinator.curl"
+    inherited_config.write_text(token)
+    cache_config = tmp_path / "cache.curl"
+    cache_config.write_text('user = "cache:password"\n')
+    monkeypatch.setattr(os, "environ", {
+        "PATH": os.environ["PATH"], "HOME": str(tmp_path),
+        "FAKE_BUILD_LOG": str(logs[0]), "HOLBUILD_FAKE_LOG": str(logs[1]),
+        "REMOTE_EXEC_WORKER_TOKEN": token,
+        "HOLBUILD_CACHE": str(tmp_path / "cache"),
+        "HOLBUILD_REMOTE_CACHE_CURL_CONFIG": str(cache_config),
+        "HOLBUILD_REMOTE_CACHE_DISCOVERY_URL": server.url + "/v1/cache/members",
+        "HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN": token,
+        "HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG": str(inherited_config),
+        "HOLBUILD_REMOTE_EXEC_CURL_CONFIG": str(inherited_config),
+        "HOLBUILD_REMOTE_EXEC_TOKEN": token,
+    })
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+    monkeypatch.setattr(worker, "parse_args", lambda: worker_args(
+        tmp_path, server, "--holbuild-source-url", f"file://{tmp_path}/holbuild-{{version}}.tar.gz",
+    ))
     monkeypatch.setattr(worker, "refresh_cache_members", lambda _c, membership, _url, now: membership.current(now))
     paths: list[Path] = []
 
-    def claim_then_exit(*_: object) -> None:
+    def claim_then_exit(*_: object) -> dict[str, object]:
+        if not paths:
+            paths.append(Path(os.environ["HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG"]))
+            return claim()
+        env = dict(line.split("=", 1) for line in Path(f"{logs[1]}.env").read_text().splitlines() if "=" in line)
+        assert "REMOTE_EXEC_WORKER_TOKEN" not in env
+        assert "HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN" not in env
+        assert not any(name.startswith("HOLBUILD_REMOTE_EXEC_") for name in env)
+        assert all(token not in value for value in env.values())
+        for value in env.values():
+            path = Path(value)
+            if path.is_file():
+                assert token.encode() not in path.read_bytes()
+        assert env["HOLBUILD_REMOTE_CACHE_DISCOVERY_URL"] == server.url + "/v1/cache/members"
+        assert env["HOLBUILD_REMOTE_CACHE_CURL_CONFIG"] == str(cache_config)
         config = Path(os.environ["HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG"])
-        paths.append(config)
+        assert env["HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG"] == str(config)
+        assert config != inherited_config
         assert config.stat().st_mode & 0o777 == 0o600
         assert config.parent.stat().st_mode & 0o777 == 0o700
-        assert config.read_text() == 'header = "Authorization: Bearer worker-\\"secret"\n'
-        assert 'worker-"secret' not in worker.exec_action_env().values()
+        assert config.read_text() == f'header = "Authorization: Bearer {cache_discovery_token(token)}"\n'
         raise KeyboardInterrupt
 
     monkeypatch.setattr(worker, "claim_reporting", claim_then_exit)
     with pytest.raises(KeyboardInterrupt):
         worker.main()
+    assert server.completed == [RECORD]
+    assert logs[1].read_text().split()[:2] == ["--remote-cache", server.url]
     assert len(paths) == 1 and not paths[0].exists()
 
 

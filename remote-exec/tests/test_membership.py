@@ -3,11 +3,13 @@
 
 import http.client
 
+import httpx
 import pytest
 import sqlalchemy as sa
 from conftest import CLIENT_TOKEN, WORKER_TOKEN
 from test_cache_pool import Provider
 
+from remote_exec.auth import cache_discovery_token
 from remote_exec.cache_pool import CachePool, CacheSlot
 from remote_exec.membership import Membership, parse_members
 from remote_exec.worker import Coordinator, refresh_cache_members
@@ -66,10 +68,10 @@ def test_worker_discovery_is_rate_limited_and_a_failure_does_not_disable_the_cac
 
 async def test_members_endpoint_auth_and_no_credentials_before_or_after_ready(http, coordinator) -> None:
     coordinator.settings.cache_url = ','.join(DEFAULTS)
-    for token in [None, 'wrong']:
+    for token in [None, 'wrong', cache_discovery_token('wrong-worker'), cache_discovery_token(CLIENT_TOKEN)]:
         response = await http.get('/v1/cache/members', headers={'Authorization': f'Bearer {token}'})
         assert response.status_code == 401
-    for token in [CLIENT_TOKEN, WORKER_TOKEN]:
+    for token in [CLIENT_TOKEN, WORKER_TOKEN, cache_discovery_token(WORKER_TOKEN)]:
         response = await http.get('/v1/cache/members', headers={'Authorization': f'Bearer {token}'})
         assert response.status_code == 200
         assert 'ci:' not in response.text and 'password' not in response.text
@@ -97,6 +99,26 @@ async def test_members_endpoint_auth_and_no_credentials_before_or_after_ready(ht
     assert len(response.text.splitlines()) == 3
     slots = await http.get('/v1/cache/slots', headers={'Authorization': f'Bearer {CLIENT_TOKEN}'})
     assert slots.json() == [{'slot': 'c', 'url': 'https://cache-c.example', 'owner': 'instance', 'phase': 'drain', 'error': None}]
+
+
+@pytest.mark.parametrize(("method", "path"), [
+    ("GET", "/v1/cache/slots"),
+    ("GET", "/v1/queue"),
+    ("GET", "/v1/batches/00000000-0000-0000-0000-000000000000"),
+    ("GET", "/v1/batches/00000000-0000-0000-0000-000000000000/events"),
+    ("POST", "/v1/batches"),
+    ("POST", "/v1/batches/00000000-0000-0000-0000-000000000000/cancel"),
+    ("POST", "/v1/work/claim"),
+    ("POST", "/v1/work/00000000-0000-0000-0000-000000000000/heartbeat"),
+    ("POST", "/v1/work/00000000-0000-0000-0000-000000000000/complete"),
+])
+async def test_discovery_token_cannot_use_client_or_worker_routes(
+    http: httpx.AsyncClient, method: str, path: str
+) -> None:
+    response = await http.request(method, path, headers={
+        "Authorization": f"Bearer {cache_discovery_token(WORKER_TOKEN)}",
+    }, json={"tier": "standard", "worker": "test"})
+    assert response.status_code == 401
 
 
 def test_join_grace_expires_without_steady_state_miss_amplification() -> None:

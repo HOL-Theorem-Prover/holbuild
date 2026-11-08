@@ -17,6 +17,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Res
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, SecretStr
 
+from remote_exec.auth import cache_discovery_token
 from remote_exec.coordinator import (
     ActionStatus,
     BatchStatus,
@@ -113,11 +114,13 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
     app = FastAPI(title="holbuild remote-exec coordinator", lifespan=lifespan)
     client = [Depends(bearer(settings.client_token))]
     worker = [Depends(bearer(settings.worker_token))]
+    discovery_token = cache_discovery_token(settings.worker_token.get_secret_value())
 
     def cache_reader(authorization: str | None = Header(default=None)) -> None:
         supplied = (authorization or "").encode()
-        valid = [hmac.compare_digest(supplied, f"Bearer {token.get_secret_value()}".encode())
-                 for token in (settings.client_token, settings.worker_token)]
+        valid = [hmac.compare_digest(supplied, f"Bearer {token}".encode())
+                 for token in (settings.client_token.get_secret_value(), settings.worker_token.get_secret_value(),
+                               discovery_token)]
         if not any(valid):
             raise HTTPException(401, "bad or missing bearer token")
 

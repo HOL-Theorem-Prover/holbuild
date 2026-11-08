@@ -522,8 +522,8 @@ REMOTE_EXEC_TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost/p
 ## Temporary cache members
 
 The coordinator can keep a stable permanent cache ring while adding temporary
-members with worker demand. `GET /v1/cache/members` accepts either the client
-or worker bearer token and returns `text/plain`:
+members with worker demand. `GET /v1/cache/members` accepts the client, worker,
+or derived read-only discovery bearer token and returns `text/plain`:
 
 ```text
 holbuild-cache-members-v1
@@ -549,9 +549,22 @@ endpoint or an omitted permanent member is rejected. Existing inline cache
 credentials and `HOLBUILD_REMOTE_CACHE_CURL_CONFIG` continue to authenticate
 cache requests. Discovery uses `HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG`
 (or `HOLBUILD_REMOTE_EXEC_CURL_CONFIG`), a curl config holding the coordinator
-bearer header. Workers write their token to a private curl configuration file
-for the child, keeping the bearer value out of build environments; this does
-not isolate builds from files owned by the worker user.
+bearer header. Workers instead write a derived read-only token to a temporary
+curl configuration file for the child: HMAC-SHA256 of `holbuild-cache-members-v1`
+keyed by the worker token, encoded as lowercase hex. Only the membership
+endpoint accepts this token; it cannot claim work, heartbeat, report results,
+submit batches or inspect the queue. The worker bearer is never written to
+this file, and `HOLBUILD_REMOTE_EXEC_*` settings are excluded from the child
+environment. Cache credentials remain separate. Builds still share the worker
+user and are not sandboxed from its other files or processes.
+
+Upgrade the coordinator before workers so it accepts derived discovery tokens.
+Older coordinators reject them, leaving child discovery on the permanent cache
+ring; workers never fall back to exposing their bearer. Existing clients and
+workers remain compatible with the upgraded coordinator. Workers keep passing
+the permanent ring as `--remote-cache`: it is the child's validation and stale
+fallback baseline, while live discovery updates the effective ring throughout
+an action. Python independently refreshes the ring for release-spec downloads.
 Discovery never follows redirects. If it fails, the last complete ring remains
 usable for 60 seconds, after which requests use the permanent configuration.
 Recovery from permanent fallback counts as a new join.

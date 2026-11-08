@@ -33,6 +33,7 @@ from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
+from remote_exec.auth import cache_discovery_token
 from remote_exec.cache import cache_nodes, ranked_nodes
 from remote_exec.membership import REFRESH_SECONDS, Membership
 
@@ -653,6 +654,7 @@ def exec_action_env() -> dict[str, str]:
         for name, value in os.environ.items()
         if (name in EXEC_ACTION_ENV or name.lower() in PROXY_ENV or name.startswith("HOLBUILD_"))
         and name != "HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN"
+        and not name.startswith("HOLBUILD_REMOTE_EXEC_")
     }
 
 
@@ -966,9 +968,8 @@ def main() -> None:
                                     cache_nodes(os.environ.get("HOLBUILD_REMOTE_CACHE_ALLOWED_URLS", args.remote_cache)))
             directory = resources.enter_context(tempfile.TemporaryDirectory(prefix="holbuild-cache-discovery-"))
             config = os.path.join(directory, "auth.curl")
-            if "\r" in token or "\n" in token:
-                sys.exit("worker token must not contain a newline")
-            header = ("Authorization: Bearer " + token).replace("\\", "\\\\").replace('"', '\\"')
+            # Builds share our uid, so file permissions cannot protect the worker bearer from them.
+            header = "Authorization: Bearer " + cache_discovery_token(token)
             with open(config, "x", opener=lambda path, flags: os.open(path, flags, 0o600)) as out:
                 out.write('header = "' + header + '"\n')
             os.environ["HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG"] = config
