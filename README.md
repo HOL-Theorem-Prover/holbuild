@@ -1407,8 +1407,9 @@ those aren't output names. `--support` files must lie under the
 script's directory and are named by their given path relative to it, without
 resolving symbolic links. `--load` names a library: one
 in the toolchain's `sigobj`, or a source the project plans (including the
-implicit `hol` package's libraries). The command takes `build`'s cache and
-proof options and prints one line per exported target:
+implicit `hol` package's libraries). The command takes `build`'s cache
+options, reuses timed and untimed contexts without checking proof-step
+timing, and prints one line per exported target:
 
 ```text
 <context> <run_key> <spec-sha256>

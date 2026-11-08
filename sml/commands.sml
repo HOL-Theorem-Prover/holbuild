@@ -1910,13 +1910,16 @@ fun run_action_command tc cli_jobs args =
             then raise Error ("run-action: " ^ flag ^ " requires a value")
             else [flag]
     val rest = parse args
-    val (flags as {dry_run, watch, trace_steps, repl_on_failure, execution_plan, use_cache, ...}, targets) =
+    val (flags as {dry_run, watch, trace_steps, repl_on_failure, execution_plan, use_cache,
+                   tactic_timeout_set, proof_scope, new_ir, ...}, targets) =
       split_flags ("--skip-proof-steps" :: rest)
     val _ =
       if dry_run orelse watch orelse trace_steps orelse repl_on_failure orelse Option.isSome execution_plan then
         raise Error "run-action does not run builds: remove --dry-run, --watch, --trace-steps and --repl-on-failure"
       else if not use_cache then
         raise Error "run-action: a run's context comes from the cache, so --no-cache can't apply"
+      else if tactic_timeout_set orelse proof_scope = HolbuildTacticTimeoutPolicy.ProofAll orelse new_ir then
+        raise Error "run-action does not check proof steps: remove --tactic-timeout, --proof-scope=all and --new-ir"
       else if !export_only andalso
               (!fetch_only orelse !remote_only orelse Option.isSome (!url) orelse
                Option.isSome (!outputs_dir) orelse Option.isSome (!profile)) then

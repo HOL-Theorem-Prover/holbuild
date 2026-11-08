@@ -263,3 +263,12 @@ grep -q '^lib hol:sortingSyntax .* \.uo ' "$sorting_spec"
 grep -q '^file library \.holbuild/action-src/hol/src/sort/sortingSyntax\.sml ' "$sorting_spec"
 grep -q '^dep theory hol:sortingTheory ' "$sorting_spec"
 grep -q '^file context-script \.holbuild/action-src/hol/src/sort/sortingScript\.sml ' "$sorting_spec"
+
+# Proof-only options name the caller's mistake, not the implicit plain policy.
+for option in --tactic-timeout=5 --proof-scope=all --new-ir; do
+  if run_export "$option" --output o hol:bool > /dev/null 2> "$tmpdir/proof-option.err"; then
+    echo "run-action accepted $option" >&2
+    exit 1
+  fi
+  require_grep 'run-action does not check proof steps' "$tmpdir/proof-option.err"
+done
