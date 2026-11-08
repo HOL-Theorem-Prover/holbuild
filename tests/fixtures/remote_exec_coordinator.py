@@ -167,6 +167,15 @@ class Handler(BaseHTTPRequestHandler):
                         event["log_sha256"] = record["log"].split()[0] if "log" in record else None
                     else:
                         event["state"], event["last_failure"] = "done", None
+                if event["state"] == "done" and result.exists() and not cancelled:
+                    record = dict(line.split("=", 1) for line in result.read_text().splitlines()[1:])
+                    event["log_sha256"] = record["log"].split()[0] if "log" in record else None
+                if event["state"] == "done" and (state / "requeue-log").exists():
+                    # The first execution's log was evicted; only the final
+                    # execution's log is usable after the action is requeued.
+                    self.wfile.write((json.dumps(dict(event, log_sha256="0" * 64)) + "\n").encode())
+                    if not (state / "requeue-snapshot").exists():
+                        self.wfile.write((json.dumps(dict(event, state="waiting", log_sha256=None)) + "\n").encode())
                 self.wfile.write((json.dumps(event) + "\n").encode())
                 self.wfile.flush()
                 for _ in range(600):
@@ -183,7 +192,8 @@ class Handler(BaseHTTPRequestHandler):
             missing.unlink()
             if what:
                 failure = f"resubmit: an action is still missing {what} after 3 attempts"
-        final = {"type": "batch", "state": final_state, "failure": failure}
+        final = {"type": "batch", "state": "cancelled" if (state / "cancel-after-actions").exists() else final_state,
+                 "failure": failure}
         self.wfile.write((json.dumps(final) + "\n").encode())
 
 
