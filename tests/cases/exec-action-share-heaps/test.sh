@@ -318,8 +318,8 @@ if tail -n +"$((before_again + 1))" "$requests" | grep -qxF "$source_get"; then
 fi
 
 # A store on another file system than the action's checkpoints, as a store
-# on its own mount is: hard links fail there, so the worker links the
-# store's states symbolically, and resumes from them.
+# on its own mount is: states are copied into private writable files, and
+# the worker still resumes from them.
 if [[ -d /dev/shm && -w /dev/shm && $(stat -c %d /dev/shm) != $(stat -c %d "$tmpdir") ]]; then
   other_fs=$(mktemp -d /dev/shm/holbuild-share-heaps.XXXXXX)
   write_t "T \\/ F" "rw[]" "ACCEPT_TAC TRUTH" "MATCH_ACCEPT_TAC TRUTH"
@@ -330,7 +330,10 @@ if [[ -d /dev/shm && -w /dev/shm && $(stat -c %d /dev/shm) != $(stat -c %d "$tmp
   ln -s "$other_fs" "$shared/checkpoint-store"
   worker v10 "$shared_url" "$shared" "$spec_t" --share-heaps
   expect v10 0 "status=built"
-  require_grep "the checkpoint store is on another file system; linking its states symbolically" "$tmpdir/v10.log"
+  if grep -q 'linking its states symbolically' "$tmpdir/v10.log"; then
+    echo 'sandboxed worker exposed linked checkpoint store states' >&2
+    exit 1
+  fi
   resumed v10 "theorem-context checkpoint after t4" "theorem_context checkpoint"
   same_outputs v10
 else

@@ -52,6 +52,11 @@ or remote cache keys. Checkpoint-free builds also produce and use them. Cache
 garbage collection and worker cache limits include the module files; deleting
 them only causes source loading and regeneration.
 
+Remote execution isolates submitted HOL code from worker credentials and shared
+writable caches. Worker hosts need Linux Landlock and libseccomp; see
+[action isolation](remote-exec/README.md#action-isolation) for prerequisites,
+the trust boundary and the client upgrade requirement.
+
 ## Install
 
 ### Download a release

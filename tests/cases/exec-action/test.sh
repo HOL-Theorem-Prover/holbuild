@@ -229,12 +229,9 @@ built_worker=$tmpdir/worker-$(basename "$built" .result)
 ac_a=$(awk '$1 == "action" && $5 == "worker:ATheory" { print $3 }' "$tmpdir/batch.txt")
 require_file "$remote_root/ac/$ac_a"
 
-# The action root is emptied after the run; the checkpoints are kept.
+# Both writable trees are discarded: another tenant must not inherit them.
 [[ ! -e "$built_worker/action" ]] || { echo "the action root was not emptied" >&2; exit 1; }
-find "$built_worker/checkpoints" -name 'deps_loaded.save' | grep -q . ||
-  { echo "the worker kept no deps heap" >&2; find "$built_worker" -maxdepth 3 >&2; exit 1; }
-find "$built_worker/checkpoints" -path '*.theorems*' -type f | grep -q . ||
-  { echo "the worker kept no theorem checkpoints" >&2; exit 1; }
+[[ ! -e "$built_worker/checkpoints" ]] || { echo "the worker retained private checkpoints" >&2; exit 1; }
 
 # A successful build reports its peak memory and uploads its log.
 require_grep '^peak-rss-mb=[1-9][0-9]*$' "$built"
@@ -399,12 +396,7 @@ for spec in "$spec_g" "$spec_a" "$spec_d"; do
 done
 worker f "$spec_f"
 expect f 0 "spec=$spec_f" "status=built"
-find "$tmpdir/worker-f/checkpoints" -name 'deps_loaded.save' | grep -q . ||
-  { echo "the non-target worker kept no deps heap" >&2; exit 1; }
-if find "$tmpdir/worker-f/checkpoints" -path '*.theorems*' -type f | grep -q .; then
-  echo "the non-target worker saved theorem checkpoints" >&2
-  exit 1
-fi
+[[ ! -e "$tmpdir/worker-f/checkpoints" ]] || { echo "the non-target worker retained private checkpoints" >&2; exit 1; }
 
 # A warm worker's local copies go out of date when the remote's entries for
 # their keys change, as for a nondeterministic theory built twice: the worker

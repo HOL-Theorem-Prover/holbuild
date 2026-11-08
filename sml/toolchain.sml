@@ -164,7 +164,7 @@ fun run_in_dir_to_file dir argv output =
         timed_system "run_in_dir_to_file" argv (SOME output)
           (fn () =>
               HolbuildProcessGroup.run_shell_inheriting lease
-                ("cd " ^ quote dir ^ " && " ^ command argv ^ " > " ^ quote output ^ " 2>&1")))
+                ("cd " ^ quote dir ^ " && " ^ command (HolbuildActionSandbox.wrap argv) ^ " > " ^ quote output ^ " 2>&1")))
   handle HolbuildMachineMemory.Error msg => raise Error msg
 
 (* As run_in_dir_to_file, killing the child once it has run for LIMIT.  The
@@ -180,7 +180,7 @@ fun run_in_dir_to_file_until dir argv output limit =
                   let
                     val result =
                       HolbuildProcessGroup.run_shell_inheriting_until lease (Time.+ (Time.now (), limit))
-                        ("cd " ^ quote dir ^ " && " ^ command argv ^ " > " ^ quote output ^ " 2>&1")
+                        ("cd " ^ quote dir ^ " && " ^ command (HolbuildActionSandbox.wrap argv) ^ " > " ^ quote output ^ " 2>&1")
                   in
                     timed_out := #timed_out result;
                     #status result

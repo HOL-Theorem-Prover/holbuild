@@ -172,11 +172,11 @@ fun trash_dir () = Path.concat(toolchains_dir (), ".trash")
 
 fun run_mutation k script =
   HolbuildProcessGroup.run_shell_with_mutation_lease
-    {lease_path = mutation_lease_path k, script = script}
+    {lease_path = mutation_lease_path k, script = HolbuildActionSandbox.bootstrap_command script}
 
 fun run_mutation_output k script =
   HolbuildProcessGroup.run_shell_output_with_mutation_lease
-    {lease_path = mutation_lease_path k, script = script}
+    {lease_path = mutation_lease_path k, script = HolbuildActionSandbox.bootstrap_command script}
 
 fun await_mutation_quiescence k =
   if OS.Process.isSuccess (run_mutation k ":") then ()

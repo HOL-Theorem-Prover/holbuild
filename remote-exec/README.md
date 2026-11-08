@@ -178,6 +178,43 @@ workers do when they aren't running HOL:
 - `exec`: all of `exec-action`, for a worker without `--cooperate-dir`;
 - `complete`: reporting the result.
 
+## Action isolation
+
+Workers require Linux on x86_64 or aarch64, Landlock ABI 1 or newer,
+Python 3, and `libseccomp.so.2`. The supplied image includes the userspace
+dependencies. The container's seccomp profile must permit Landlock and
+stacking another seccomp filter. `holbuild sandbox-check` exercises these
+requirements; workers reject a release whose check fails. Releases before
+0.13.52 are rejected because their HOL launch path has no mandatory sandbox.
+Upgrade submitting clients before replacing workers with this version.
+
+The worker and `exec-action` remain trusted: they fetch inputs, manage memory
+leases and publish results. Each HOL process runs with a Landlock filesystem
+policy and a seccomp syscall filter. It receives read access to its selected
+HOL toolchain, holbuild runtime, Poly/ML and system runtime files, and write
+access to fresh action, checkpoint, home and temporary directories. Shared
+cache files are copied into these directories. The directories are removed
+after the action, including when shared heaps are disabled. The child receives
+no cache credentials, worker token, inherited lease descriptors or Linux
+capabilities. Cross-process inspection, signals to other processes, metadata
+changes, links and special-file creation are denied. The supervisor kills
+and reaps descendants before validating and harvesting regular, unlinked
+output files. Unsupported confinement fails closed.
+
+HOL toolchain bootstrap executes trusted source. Workers accept the canonical
+HOL repository URLs by default; administrators may set the whitespace-separated
+`HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES` list for trusted mirrors or forks.
+Bootstrap compiler/build children also have credential settings removed from
+their environment. This restriction is worker configuration, not an action
+spec option. Administrators can grant additional read-only runtime directories
+with colon-separated `HOLBUILD_ACTION_READ_DIRS`; do not include credentials
+or shared writable state in these directories.
+
+This boundary protects worker credentials and shared filesystem state. It
+does not restrict network egress or replace authorization on the remote cache.
+The trusted HOL parser and compiler used before execution remain part of the
+worker's trusted code.
+
 ## Batches and actions
 
 A batch is the text `holbuild action-spec --upload` prints:
@@ -575,8 +612,8 @@ keyed by the worker token, encoded as lowercase hex. Only the membership
 endpoint accepts this token; it cannot claim work, heartbeat, report results,
 submit batches or inspect the queue. The worker bearer is never written to
 this file, and `HOLBUILD_REMOTE_EXEC_*` settings are excluded from the child
-environment. Cache credentials remain separate. Builds still share the worker
-user and are not sandboxed from its other files or processes.
+environment. Cache credentials remain separate and stay in trusted worker and
+`exec-action` processes; the HOL sandbox does not receive them.
 
 Upgrade the coordinator before workers so it accepts derived discovery tokens.
 Older coordinators reject them, leaving child discovery on the permanent cache
