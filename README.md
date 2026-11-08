@@ -912,7 +912,9 @@ and they reuse theories built by `holbuild build --skip-proof-steps`; use
 (on remote workers with `--remote-exec`; see
 [Building on remote workers](#building-on-remote-workers)), create an
 invocation-private project context under `.holbuild/`, and then load the
-configured targets followed by user arguments. Two kinds of argument never
+configured targets followed by user arguments. Like heap targets, these are
+built without proof steps, so no tactic timeout applies and theories built by
+`holbuild build --skip-proof-steps` are reused. Two kinds of argument never
 reach HOL this way, wherever they appear: holbuild's global options and
 `-h`/`--help`, which holbuild takes itself, and Poly/ML runtime options
 (`--gcthreads`, `--maxheap`, `-H`, ...), which holbuild's own Poly/ML runtime
@@ -1752,8 +1754,9 @@ locally. `--attach <id>` follows that batch and then builds as above. A
 `--remote-only` build that loses the event stream says how to reattach.
 
 `run` and `repl` take `--remote-exec URL` and `--remote-only` too, before the
-arguments passed to HOL, and build their `[run].loads` targets this way
-before they start HOL locally (they don't take `--detach` or `--attach`):
+arguments passed to HOL, and build their `[run].loads` targets, and any
+`--from` or inferred theory, this way (without proof steps) before they start
+HOL locally (they don't take `--detach` or `--attach`):
 
 ```sh
 holbuild --remote-cache https://cache.example.org run --remote-exec https://exec.example.org script.sml

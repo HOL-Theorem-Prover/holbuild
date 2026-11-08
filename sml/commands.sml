@@ -147,6 +147,8 @@ fun repl_help () = print
   \                 `build --remote-exec` does, on the coordinator's workers,\n\
   \                 then start HOL locally. With --remote-only, fails instead\n\
   \                 of building locally.\n\n\
+  \Targets are built without proof steps, as heap targets are: no step timeout\n\
+  \applies, and theories built by `build --skip-proof-steps` are reused.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun run_help () = print
@@ -170,6 +172,8 @@ fun run_help () = print
   \                 `build --remote-exec` does, on the coordinator's workers,\n\
   \                 then start HOL locally. With --remote-only, fails instead\n\
   \                 of building locally.\n\n\
+  \Targets are built without proof steps, as heap targets are: no step timeout\n\
+  \applies, and theories built by `build --skip-proof-steps` are reused.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun execution_plan_help () = print
@@ -508,17 +512,6 @@ fun split_flags args =
     loop false false HolbuildBuildExec.ForceNone true true false false true true HolbuildTacticTimeoutPolicy.ProofRoot NONE false NONE false false false false build_args
   end
 
-fun default_build_request targets =
-  ({dry_run = false, watch = false, force = HolbuildBuildExec.ForceNone,
-    use_cache = true, verify_cache = true, no_stat_cache = false,
-    skip_checkpoints = false, all_checkpoints = false, proof_steps = true, new_ir = true,
-    proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,
-    tactic_timeout = NONE, tactic_timeout_set = false, execution_plan = NONE,
-    trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
-    warn_unreachable = false, emit_output_hashes = false,
-    allow_cache_timeout_discrepancy = false},
-   targets)
-
 (* check builds plain: step timeouts are build's check, and a timeout-free
    request reuses any built or cached theory, including ones from build
    --skip-proof-steps --skip-checkpoints. It saves no checkpoints. *)
@@ -533,6 +526,10 @@ fun plain_build_request targets =
     allow_cache_timeout_discrepancy = false},
    targets)
 
+(* heap, executable, run and repl build without proof steps, so no step
+   timeout applies and they reuse any built or cached theory, including ones
+   from build --skip-proof-steps. Unlike check they keep deps_loaded
+   checkpoints. *)
 fun heap_build_request targets =
   ({dry_run = false, watch = false, force = HolbuildBuildExec.ForceNone,
     use_cache = true, verify_cache = true, no_stat_cache = false,
@@ -2771,7 +2768,7 @@ fun run_hol_with runner tc cli_jobs subcommand args =
                  [] => NoFrom
                | scripts => FromScripts scripts)
   in
-    if HolbuildToolchain.success (run_hol_status runner tc cli_jobs build_mode default_build_request true run_from subcommand user_args) then ()
+    if HolbuildToolchain.success (run_hol_status runner tc cli_jobs build_mode heap_build_request true run_from subcommand user_args) then ()
     else raise Error ("hol " ^ subcommand ^ " failed")
   end
 
