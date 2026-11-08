@@ -226,7 +226,7 @@ HOLBUILD_CACHE=$cache3 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action 
 set -e
 evicted "$cache3/blobs/$young" "a young orphan when nothing else could reach the target"
 
-# Reuse only a recent shared measurement with enough extra headroom.
+# Reuse a recent shared measurement within the current target.
 cache4=$tmpdir/cache4
 sparse "$cache4/blobs/first" 1
 sweep4() {
@@ -253,13 +253,20 @@ import pathlib, sys
 assert sum(map(int, pathlib.Path(sys.argv[1]).read_text().split()[3::2])) >= 3 * 1024 ** 3
 BYTES
 cp "$state" "$tmpdir/small-state"
-# Current reserve and private checkpoints participate in the headroom gate.
+# Current reserve and fresh private checkpoints participate in the target check.
 sweep4 100 50
 ! cmp -s "$state" "$tmpdir/small-state" || { echo "increased reserve reused a measurement" >&2; exit 1; }
 cp "$state" "$tmpdir/reserve-state"
-sparse "$cache4/checkpoints/pkg/PrivateScript.deps/key/deps_loaded.save" 70
+# Old shared data can be removed without dropping the new private checkpoint.
+at 2000 "$cache4/blobs/first"
+sparse "$cache4/checkpoints/pkg/PrivateScript.deps/key/deps_loaded.save" 97
 sweep4 100 1
-! cmp -s "$state" "$tmpdir/reserve-state" || { echo "private checkpoints were omitted from headroom" >&2; exit 1; }
+evicted "$state" "the measurement after private checkpoint growth caused eviction"
+evicted "$cache4/blobs/first" "old shared data before a new private checkpoint"
+kept "$cache4/checkpoints/pkg/PrivateScript.deps/key/deps_loaded.save" "the private checkpoint under the target"
+rm "$cache4/checkpoints/pkg/PrivateScript.deps/key/deps_loaded.save"
+sparse "$cache4/blobs/first" 1
+sweep4 100 1
 # Expired, future-dated and malformed state must all fall back to a scan.
 for measured in 0 999999999999999999999999 broken; do
   python3 - "$state" "$measured" <<'STAMP'
@@ -321,13 +328,22 @@ LOCK
 
 # A sibling's shared stamp must not omit this container's private modules.
 cp "$state" "$tmpdir/pre-module-state"
-sparse "$cache5/theory-modules/large.pmo" 70
+at 2000 "$cache4/blobs/first"
+sparse "$cache5/theory-modules/large.pmo" 97
 set +e
 HOLBUILD_CACHE=$cache5 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
   --result "$tmpdir/result" --cache-limit-gb 100 --cache-reserve-gb 1 > "$tmpdir/modules.log" 2>&1
 set -e
-! cmp -s "$state" "$tmpdir/pre-module-state" || { echo "private modules omitted from headroom" >&2; exit 1; }
+evicted "$state" "the measurement after private module growth caused eviction"
+evicted "$cache4/blobs/first" "old shared data before a new private module"
 kept "$cache5/theory-modules/large.pmo" "private modules under the target"
+rm "$cache5/theory-modules/large.pmo"
+sparse "$cache4/blobs/first" 1
+# Refresh through the aliases, preserving coverage of their apparent bytes.
+set +e
+HOLBUILD_CACHE=$cache5 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
+  --result "$tmpdir/result" --cache-limit-gb 100 --cache-reserve-gb 1 > "$tmpdir/modules-refresh.log" 2>&1
+set -e
 python3 - "$state" <<'ALIASES'
 import pathlib, sys
 assert sum(map(int, pathlib.Path(sys.argv[1]).read_text().split()[3::2])) >= 3 * 1024 ** 3
@@ -345,13 +361,21 @@ HOLBUILD_CACHE=$cache6 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action 
   --result "$tmpdir/result" --cache-limit-gb 100 --cache-reserve-gb 1 > "$tmpdir/partial.log" 2>&1
 set -e
 cmp "$state" "$tmpdir/pre-partial-state" || { echo "partial sharing thrashed the stamp" >&2; exit 1; }
-# Growing the private root near the target must force a live scan.
-sparse "$cache6/blobs/private" 80
+# Growing a differing private root over the target must force eviction.
+sparse "$cache6/blobs/private" 100
 set +e
 HOLBUILD_CACHE=$cache6 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
   --result "$tmpdir/result" --cache-limit-gb 100 --cache-reserve-gb 1 > "$tmpdir/partial-large.log" 2>&1
 set -e
-! cmp -s "$state" "$tmpdir/pre-partial-state" || { echo "private root growth omitted from headroom" >&2; exit 1; }
+evicted "$state" "the measurement after a differing private root exceeded the target"
+evicted "$cache6/blobs/private" "the differing private root over the target"
+# Seed a reusable stamp, then perform a separate small-cap eviction.
+sparse "$cache6/blobs/private" 2
+set +e
+HOLBUILD_CACHE=$cache6 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
+  --result "$tmpdir/result" --cache-limit-gb 100 --cache-reserve-gb 1 > "$tmpdir/partial-refresh.log" 2>&1
+set -e
+[[ -s "$state" ]] || { echo "no refreshed shared measurement" >&2; exit 1; }
 # A real eviction must invalidate, rather than publish pre-eviction totals.
 set +e
 HOLBUILD_CACHE=$cache6 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
@@ -435,3 +459,27 @@ env -u HOLBUILD_REMOTE_CACHE_URL "$HOLBUILD_BIN" exec-action "$absent" --cache-l
 status=$?
 set -e
 [[ $status -eq 3 ]] || { echo "exec-action without a remote exited $status, wanted 3" >&2; cat "$tmpdir/exec4.log" >&2; exit 1; }
+
+# Mature caches between the old extra-cushion ceiling and the eviction target
+# must reuse a fresh scan without dropping any retained data.
+sweep_mature() {
+  local status=0
+  HOLBUILD_CACHE=$mature_cache "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
+    --result "$tmpdir/mature-result" --cache-limit-gb "$1" --cache-reserve-gb "$2" \
+    > "$tmpdir/mature.log" 2>&1 || status=$?
+  [[ $status -eq 4 ]] || { cat "$tmpdir/mature.log" >&2; exit 1; }
+}
+for limits in "100 10 89" "400 40 359"; do
+  read -r limit reserve bytes <<< "$limits"
+  mature_cache=$tmpdir/mature-$limit
+  sparse "$mature_cache/checkpoint-store/family/heap" "$bytes"
+  sweep_mature "$limit" "$reserve"
+  mature_state=$mature_cache/locks/worker-cache-cap.state
+  cp "$mature_state" "$tmpdir/mature-state"
+  sweep_mature "$limit" "$reserve"
+  cmp "$mature_state" "$tmpdir/mature-state" || { echo "mature cache repeated a shared scan" >&2; exit 1; }
+  kept "$mature_cache/checkpoint-store/family/heap" "mature cached data under the target"
+  # An explicit zero reserve cannot safely reuse even a large cache's estimate.
+  sweep_mature "$limit" 0
+  ! cmp -s "$mature_state" "$tmpdir/mature-state" || { echo "zero-reserve cache reused a measurement" >&2; exit 1; }
+done

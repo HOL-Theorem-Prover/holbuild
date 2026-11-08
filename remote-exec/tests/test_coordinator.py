@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 from remote_exec import coordinator as coordinator_module
 from remote_exec.app import create_app
-from remote_exec.coordinator import Coordinator
+from remote_exec.coordinator import Coordinator, _claim_rank
 from remote_exec.formats import parse_result
 from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache
 
@@ -623,21 +623,30 @@ async def test_a_woken_claim_cancelled_hands_its_wake_to_the_next(
 @pytest.mark.parametrize(
     ("tier", "workers", "order"),
     [
-        ("standard", [(["high", "standard"], "host-a"), (["standard"], "warm")], [1, 0]),
-        ("standard", [(["high", "standard"], "host-b"), (["high", "standard"], "host-a")], [1, 0]),
-        ("high", [(["standard"], "warm"), (["high", "standard"], "host-b")], [1]),
-        ("high", [(["high"], None), (["high"], "host-a"), (["high"], "host-a")], [1, 2, 0]),
+        ("standard", [(["high", "standard"], "host-a", 0), (["standard"], "warm", 0)], [1, 0]),
+        ("standard", [(["high", "standard"], "host-b", 0), (["high", "standard"], "host-a", 0)], [1, 0]),
+        ("high", [(["standard"], "warm", 0), (["high", "standard"], "host-b", 0)], [1]),
+        ("high", [(["high"], None, 0), (["high"], "host-a", 0), (["high"], "host-a", 0)], [1, 2, 0]),
+        # Lower-rank hosts (an on-demand base) fill before higher-rank ones (spot), whatever their ids.
+        ("high", [(["high"], "host-a", 1), (["high"], "host-b", 0), (["high"], None, 0)], [1, 0, 2]),
+        (
+            "standard",
+            [(["high", "standard"], "host-a", 1), (["standard"], "warm", 0), (["high", "standard"], "host-b", 0)],
+            [1, 2, 0],
+        ),
     ],
 )
 async def test_wakes_pack_compatible_hosts_with_fifo_ties(
-    coordinator: Coordinator, tier: str, workers: list[tuple[list[str], str | None]], order: list[int]
+    coordinator: Coordinator, tier: str, workers: list[tuple[list[str], str | None, int]], order: list[int]
 ) -> None:
     loop = asyncio.get_running_loop()
     wakes = [loop.create_future() for _ in workers]
-    coordinator.claim_waiters = [(tiers, host, wake) for (tiers, host), wake in zip(workers, wakes)]
+    coordinator.claim_waiters = [
+        (tiers, _claim_rank(tiers, host, rank), wake) for (tiers, host, rank), wake in zip(workers, wakes)
+    ]
     cancelled = loop.create_future()
     cancelled.cancel()
-    coordinator.claim_waiters.insert(0, ([tier], "host-0", cancelled))
+    coordinator.claim_waiters.insert(0, ([tier], _claim_rank([tier], "host-0"), cancelled))
     for index in order:
         coordinator._wake_claim(tier)
         assert wakes[index].result() == tier
@@ -652,7 +661,7 @@ async def test_new_tail_host_claim_defers_ready_work_to_a_better_waiter(
 ) -> None:
     batch_id = await submit(http, ["a"])
     wake = asyncio.get_running_loop().create_future()
-    waiter = (waiting_tiers, "host-a", wake)
+    waiter = (waiting_tiers, _claim_rank(waiting_tiers, "host-a"), wake)
     coordinator.claim_waiters.append(waiter)
     assert await coordinator.claim(["high", "standard"], "tail", host_id="host-b") is None
     assert await states(http, batch_id) == {"a": "ready"}
@@ -670,7 +679,7 @@ async def test_rechecking_tail_host_defers_ready_work_to_a_better_waiter(
     batch_id = ""
     claim_once = coordinator._claim
     wake = asyncio.get_running_loop().create_future()
-    waiter = (["high", "standard"], "host-a", wake)
+    waiter = (["high", "standard"], _claim_rank(["high", "standard"], "host-a"), wake)
 
     async def counted(tiers: list[str], worker: str) -> Any:
         nonlocal attempts
@@ -702,7 +711,7 @@ async def test_burst_can_claim_high_while_warm_waits_for_standard(
     async with coordinator.engine.begin() as conn:
         await conn.execute(sa.text("UPDATE actions SET tier = 'high' WHERE theory = 'pkg:b'"))
     wake = asyncio.get_running_loop().create_future()
-    coordinator.claim_waiters.append((["standard"], "warm", wake))
+    coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "warm"), wake))
     claimed = await coordinator.claim(["high", "standard"], "burst", host_id="host-a")
     assert claimed is not None and claimed.theory == "pkg:b"
     assert not wake.done()
@@ -729,7 +738,7 @@ async def test_explicitly_woken_claim_is_not_blocked_by_a_new_better_waiter(
         coordinator._wake_claim("standard")
         # A new better waiter must not block the explicit wake before the tail host resumes.
         wake = asyncio.get_running_loop().create_future()
-        coordinator.claim_waiters.append((["standard"], "host-a", wake))
+        coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "host-a"), wake))
         claimed = await asyncio.wait_for(waiting, 5)
         assert claimed is not None and claimed.theory == "pkg:a"
     finally:
@@ -934,6 +943,19 @@ async def test_an_action_its_worker_could_not_start_is_retried_without_using_an_
     token = await claim_named(http, "a")
     assert (await complete(http, token, result("a", "failed", "internal"))).status_code == 200
     assert (await batch(http, batch_id))["state"] == "failed"
+
+
+async def test_unavailable_results_past_the_interruption_cap_use_attempts(http: httpx.AsyncClient) -> None:
+    batch_id = await submit(http, ["a"])
+    # Five refunded interruptions, then two counted ones: the third counted one fails the batch.
+    for _ in range(5 + 2):
+        token = await claim_named(http, "a")
+        assert (await complete(http, token, result("a", "failed", "unavailable"))).status_code == 200
+        assert await states(http, batch_id) == {"a": "ready"}
+    token = await claim_named(http, "a")
+    assert (await complete(http, token, result("a", "failed", "unavailable"))).status_code == 200
+    status = await batch(http, batch_id)
+    assert (status["state"], status["failure"]) == ("failed", "pkg:a: unavailable")
 
 
 async def test_disk_failure_retries_once(http: httpx.AsyncClient) -> None:

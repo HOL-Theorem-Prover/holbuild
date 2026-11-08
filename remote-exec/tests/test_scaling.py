@@ -319,7 +319,7 @@ def test_settings_errors_do_not_print_credentials(monkeypatch: pytest.MonkeyPatc
     assert "secret" not in str(error.value)
 
 
-def host_report(host_id: str, cpu_idle_pct: float | None) -> dict[str, Any]:
+def host_report(host_id: str, cpu_idle_pct: float | None, rank: int = 0) -> dict[str, Any]:
     return {
         "id": host_id,
         "cpu_idle_pct": cpu_idle_pct,
@@ -329,23 +329,25 @@ def host_report(host_id: str, cpu_idle_pct: float | None) -> dict[str, Any]:
         "reserved": 6 << 30,
         "leases": 2,
         "memory_short": False,
+        "rank": rank,
     }
 
 
-@pytest.mark.parametrize("host_id", [None, "host-a"])
-async def test_claim_forwards_optional_host_id(
-    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch, host_id: str | None
+@pytest.mark.parametrize(("host_id", "host_rank"), [(None, 0), ("host-a", 0), ("host-a", 1)])
+async def test_claim_forwards_optional_host_id_and_rank(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch, host_id: str | None,
+    host_rank: int,
 ) -> None:
     claim = AsyncMock(return_value=None)
     monkeypatch.setattr(coordinator, "claim", claim)
     body: dict[str, Any] = {"tier": "high", "also_claim": ["standard"], "worker": "w1"}
     if host_id is not None:
-        body["host"] = host_report(host_id, 30.0)
+        body["host"] = host_report(host_id, 30.0, host_rank)
     response = await http.post("/v1/work/claim", json=body, headers=WORKER)
     assert response.status_code == 204
     assert claim.await_args is not None
     assert claim.await_args.args[:3] == (["high", "standard"], "w1", 0)
-    assert claim.await_args.kwargs == {"host_id": host_id}
+    assert claim.await_args.kwargs == {"host_id": host_id, "host_rank": host_rank}
 
 
 async def test_queue_lists_the_hosts_workers_reported(http: httpx.AsyncClient, coordinator: Coordinator) -> None:
