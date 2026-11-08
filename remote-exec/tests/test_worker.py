@@ -1067,6 +1067,16 @@ def test_an_action_s_time_is_split_around_its_hol_child(
     cooperate.mkdir()
     monkeypatch.setenv("HOLBUILD_FAKE_LEASE", str(cooperate / "lease-1"))
     phases = Phases()
+    timed_phases: list[str] = []
+    original_timed = phases.timed
+
+    @contextlib.contextmanager
+    def timed(name: str) -> Iterator[None]:
+        timed_phases.append(name)
+        with original_timed(name):
+            yield
+
+    monkeypatch.setattr(phases, "timed", timed)
 
     started = time.monotonic()
     run_one(
@@ -1081,7 +1091,8 @@ def test_an_action_s_time_is_split_around_its_hol_child(
     seconds = phases.take()
     assert server.completed == [RECORD]
     assert seconds["before_hol"] >= 0.5 and seconds["hol"] >= 1 and seconds["after_hol"] >= 0.5
-    assert seconds["release"] > 0 and seconds["complete"] > 0 and seconds["exec"] == 0
+    assert timed_phases == ["lease", "release", "complete", "lease"]
+    assert seconds["exec"] == 0
     assert sum(seconds.values()) == pytest.approx(time.monotonic() - started, abs=0.5)
 
 
