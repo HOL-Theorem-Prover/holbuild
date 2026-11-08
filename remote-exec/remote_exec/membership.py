@@ -22,12 +22,11 @@ def credentialed_nodes(defaults: list[str], allowed: list[str]) -> dict[str, str
 
 
 def check_plain_http(defaults: list[str], allowed: list[str], curl_config: bool) -> None:
-    """Credentials, inline or from a curl config, reach a new endpoint only over HTTPS."""
+    """With credentials, inline or from a curl config, every endpoint discovery may select must be HTTPS."""
     if not curl_config and not any(urlsplit(url).username or urlsplit(url).password for url in defaults):
         return
-    permanent = {node_identity(url) for url in defaults}
-    for url in allowed:
-        if urlsplit(url).scheme != 'https' and node_identity(url) not in permanent:
+    for url in [*defaults, *allowed]:
+        if urlsplit(url).scheme != 'https':
             raise ValueError(f'cache credentials must not reach plain-HTTP endpoint {node_identity(url)}')
 
 

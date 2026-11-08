@@ -549,9 +549,9 @@ endpoint or an omitted permanent member is rejected. Existing inline cache
 credentials and `HOLBUILD_REMOTE_CACHE_CURL_CONFIG` continue to authenticate
 cache requests. Discovery uses `HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG`
 (or `HOLBUILD_REMOTE_EXEC_CURL_CONFIG`), a curl config holding the coordinator
-bearer header. Credentials, inline or from a cache curl config, never go to a
-plain `http://` endpoint discovery adds: clients skip discovery and workers
-refuse to start when the allowed list has one.
+bearer header. With credentials, inline or from a cache curl config, every
+allowed endpoint must be `https://`: otherwise clients skip discovery and
+workers refuse to start.
 Workers write their token to a private curl configuration file
 for the child, keeping the bearer value out of build environments; this does
 not isolate builds from files owned by the worker user.

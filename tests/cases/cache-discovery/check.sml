@@ -32,9 +32,10 @@ val _ = assert "a credential-free pool may use plain HTTP"
   (D.check_plain_http plain "http://g.example" = "http://g.example");
 val _ = HolbuildRemoteCacheConfig.set_local_curl_config (SOME (dir ^ "/cache.curl"));
 val _ = assert "a cache curl config counts as credentials"
-  (refused (fn () => D.check_plain_http plain "http://g.example") andalso
-   D.check_plain_http plain "http://a.example" = "http://a.example");
+  (refused (fn () => D.check_plain_http plain "http://g.example") andalso refused (fn () => D.allowed plain));
 val _ = HolbuildRemoteCacheConfig.set_local_curl_config NONE;
+val _ = assert "plain-HTTP permanent nodes with credentials disable discovery"
+  (refused (fn () => D.allowed ["http://ci:password@a.example"]));
 val digest = HolbuildHash.string_sha256 "join-window";
 val ranked = RC.ranked_urls cache digest;
 val former = List.last ranked;

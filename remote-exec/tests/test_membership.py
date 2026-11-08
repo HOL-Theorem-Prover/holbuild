@@ -35,7 +35,8 @@ def test_credentials_reach_new_endpoints_only_over_https() -> None:
         check_plain_http(['http://cache-a.example'], plain, curl_config=True)
     check_plain_http(DEFAULTS, ALLOWED, curl_config=True)
     check_plain_http(['http://cache-a.example'], plain, curl_config=False)
-    check_plain_http(['http://ci:password@cache-a.example'], ['http://cache-a.example'], curl_config=False)
+    with pytest.raises(ValueError, match='plain-HTTP endpoint http://cache-a.example'):
+        check_plain_http(['http://ci:password@cache-a.example'], ['http://cache-a.example'], curl_config=False)
 
 
 def test_discovery_keeps_complete_snapshots_and_expires_to_permanent_nodes() -> None:

@@ -1158,7 +1158,7 @@ def test_worker_refuses_plain_http_discovery_with_a_cache_curl_config(
     monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_ALLOWED_URLS", "http://burst.example")
     monkeypatch.setattr(worker, "parse_args", lambda: worker_args(tmp_path, server))
     monkeypatch.setattr(worker, "claim_reporting", lambda *_: pytest.fail("claimed with an unsafe cache allowlist"))
-    with pytest.raises(SystemExit, match="plain-HTTP endpoint http://burst.example"):
+    with pytest.raises(SystemExit, match="plain-HTTP endpoint"):
         worker.main()
 
 

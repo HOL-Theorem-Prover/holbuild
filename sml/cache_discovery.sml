@@ -52,16 +52,14 @@ fun parse defaults allowed text =
             else raise Error "cache membership omitted a permanent endpoint"
   in HolbuildRemoteCacheConfig.urls (String.concatWith "," nodes) end
 
-(* Credentials, inline or from a curl config, reach a new endpoint only over HTTPS. *)
+(* With credentials, inline or from a curl config, every endpoint discovery may select must be HTTPS. *)
 fun check_plain_http defaults url =
   let
-    val identity = HolbuildRemoteCacheConfig.node_identity
     val credentials = List.exists (fn node => userinfo node <> "") defaults orelse
       Option.isSome (HolbuildRemoteCacheConfig.curl_config ())
   in
-    if credentials andalso not (String.isPrefix "https://" (String.map Char.toLower url)) andalso
-       not (List.exists (fn node => identity node = identity url) defaults)
-    then raise Error ("cache credentials must not reach plain-HTTP endpoint " ^ identity url)
+    if credentials andalso not (String.isPrefix "https://" (String.map Char.toLower url))
+    then raise Error ("cache credentials must not reach plain-HTTP endpoint " ^ HolbuildRemoteCacheConfig.node_identity url)
     else url
   end
 
@@ -71,8 +69,8 @@ fun allowed defaults =
     val extra = case env "HOLBUILD_REMOTE_CACHE_ALLOWED_URLS" of
         NONE => []
       | SOME text => map (fn url => if userinfo url = "" then with_userinfo auth url else url)
-          (map (check_plain_http defaults) (HolbuildRemoteCacheConfig.urls text))
-  in HolbuildRemoteCacheConfig.urls (String.concatWith "," (defaults @ extra)) end
+          (HolbuildRemoteCacheConfig.urls text)
+  in map (check_plain_http defaults) (HolbuildRemoteCacheConfig.urls (String.concatWith "," (defaults @ extra))) end
 
 fun config_args () =
   case env "HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG" of
