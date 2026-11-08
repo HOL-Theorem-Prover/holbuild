@@ -69,3 +69,19 @@ log=$(sed -n 's/^log=\([^ ]*\) .*/\1/p' "$tmpdir/result")
 require_grep 'credential and cache attacks denied' "$tmpdir/remote/cas/$log"
 for dir in actions blobs locks cooperate; do require_grep '^original$' "$tmpdir/shared/$dir/other"; done
 [[ ! -e "$tmpdir/worker/action" && ! -e "$tmpdir/worker/checkpoints" ]]
+
+# Trust rejection is final, even for a warm/cached action. No source from an
+# unconfigured repository may reach toolchain bootstrap.
+sed 's|^toolchain git=[^ ]* |toolchain git=https://untrusted.invalid/HOL.git |' \
+  "$tmpdir/remote/cas/$spec" > "$tmpdir/rejected-spec"
+rejected=$(sha256sum "$tmpdir/rejected-spec" | cut -d' ' -f1)
+cp "$tmpdir/rejected-spec" "$tmpdir/remote/cas/$rejected"
+set +e
+HOLBUILD_CACHE="$tmpdir/worker" "$HOLBUILD_BIN" --remote-cache "$remote_url" \
+  exec-action "$rejected" --cache-limit-gb 1000 --result "$tmpdir/rejected.result" \
+  > "$tmpdir/rejected.log" 2>&1
+status=$?
+set -e
+[[ $status == 4 ]] || { cat "$tmpdir/rejected.log" "$tmpdir/rejected.result" >&2; exit 1; }
+require_grep '^failure=spec-rejected$' "$tmpdir/rejected.result"
+require_grep 'HOL repository is not trusted' "$tmpdir/rejected.log"

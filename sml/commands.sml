@@ -3289,9 +3289,10 @@ fun dispatch_with_options {holdir, source_dir, cache_dir, remote_cache, jobs, ma
    (HolbuildHolSharedCache.restore_only := List.exists (fn arg => arg = "--remote-only") args;
    case args of
        ["sandbox-check"] =>
+         (ignore (HolbuildActionSandbox.trusted_repositories ());
          if HolbuildToolchain.success
               (OS.Process.system ("python3 -I " ^ HolbuildToolchain.quote (HolbuildActionSandbox.helper ()) ^ " --check"))
-         then () else raise Error "exec-action sandbox is unavailable"
+         then () else raise Error "exec-action sandbox is unavailable")
      | "gc" :: rest => (reject_json "gc"; gc rest)
      | "cache" :: rest => (reject_json "cache"; HolbuildCache.dispatch rest)
      | "import" :: rest => (reject_json "import"; import_archive rest)
