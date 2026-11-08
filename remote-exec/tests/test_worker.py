@@ -1148,6 +1148,20 @@ def test_worker_discovery_auth_uses_a_private_file_and_cleans_it_on_exit(
     assert len(paths) == 1 and not paths[0].exists()
 
 
+def test_worker_refuses_plain_http_discovery_with_a_cache_curl_config(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", "worker-secret")
+    monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_DISCOVERY_URL", server.url + "/v1/cache/members")
+    monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_CURL_CONFIG", str(tmp_path / "cache.curl"))
+    monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_ALLOWED_URLS", "http://burst.example")
+    monkeypatch.setattr(worker, "parse_args", lambda: worker_args(tmp_path, server))
+    monkeypatch.setattr(worker, "claim_reporting", lambda *_: pytest.fail("claimed with an unsafe cache allowlist"))
+    with pytest.raises(SystemExit, match="plain-HTTP endpoint"):
+        worker.main()
+
+
 def test_worker_refreshes_bootstrap_membership_after_memory_and_claim_waits(
     tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
 ) -> None:

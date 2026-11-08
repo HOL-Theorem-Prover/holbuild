@@ -34,7 +34,7 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from remote_exec.cache import cache_nodes, ranked_nodes
-from remote_exec.membership import REFRESH_SECONDS, Membership
+from remote_exec.membership import REFRESH_SECONDS, Membership, check_plain_http
 
 DEFAULT_SOURCE_URL = "https://github.com/HOL-Theorem-Prover/holbuild/archive/refs/tags/v{version}.tar.gz"
 RELEASE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
@@ -962,8 +962,13 @@ def main() -> None:
         if discovery_url:
             if discovery_url != coordinator.url + "/v1/cache/members":
                 sys.exit("cache discovery must use this worker's coordinator /v1/cache/members endpoint")
-            membership = Membership(cache_nodes(args.remote_cache),
-                                    cache_nodes(os.environ.get("HOLBUILD_REMOTE_CACHE_ALLOWED_URLS", args.remote_cache)))
+            defaults = cache_nodes(args.remote_cache)
+            allowed = cache_nodes(os.environ.get("HOLBUILD_REMOTE_CACHE_ALLOWED_URLS", args.remote_cache))
+            try:
+                check_plain_http(defaults, allowed, bool(os.environ.get("HOLBUILD_REMOTE_CACHE_CURL_CONFIG")))
+            except ValueError as error:
+                sys.exit(str(error))
+            membership = Membership(defaults, allowed)
             directory = resources.enter_context(tempfile.TemporaryDirectory(prefix="holbuild-cache-discovery-"))
             config = os.path.join(directory, "auth.curl")
             if "\r" in token or "\n" in token:

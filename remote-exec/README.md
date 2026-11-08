@@ -549,7 +549,10 @@ endpoint or an omitted permanent member is rejected. Existing inline cache
 credentials and `HOLBUILD_REMOTE_CACHE_CURL_CONFIG` continue to authenticate
 cache requests. Discovery uses `HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG`
 (or `HOLBUILD_REMOTE_EXEC_CURL_CONFIG`), a curl config holding the coordinator
-bearer header. Workers write their token to a private curl configuration file
+bearer header. With credentials, inline or from a cache curl config, every
+allowed endpoint must be `https://`: otherwise clients skip discovery and
+workers refuse to start.
+Workers write their token to a private curl configuration file
 for the child, keeping the bearer value out of build environments; this does
 not isolate builds from files owned by the worker user.
 Discovery never follows redirects. If it fails, the last complete ring remains
@@ -574,7 +577,10 @@ provider ownership data is persisted separately from operation tokens, before
 any DNS publication.
 
 Configure one to four `REMOTE_EXEC_CACHE_SLOTS` as a JSON list of
-`{"name":"slot-c","url":"https://cache-c.example"}`. The existing Postgres
+`{"name":"slot-c","url":"https://cache-c.example"}`. A slot URL may be
+`http://` only for a credential-free cache on a private network: the
+coordinator then requires `REMOTE_EXEC_CACHE_URL` to be `http://` and carry no
+credentials, since discovery hands those to every slot. The existing Postgres
 database stores ownership; a dedicated advisory lock elects one controller,
 without holding a database transaction open during provider calls. The
 controller keeps reconciling and heartbeating hooks when capacity is disabled,

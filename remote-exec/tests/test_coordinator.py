@@ -1679,6 +1679,29 @@ def test_cache_ring_settings_accept_both_environment_names(monkeypatch: pytest.M
         Settings(**args)
 
 
+@pytest.mark.parametrize(("cache_url", "slot", "error"), [
+    ("http://ci:secret@one.test", "http://two.test", "without credentials"),
+    ("https://one.test", "http://two.test", "mix"),
+    ("http://one.test", "https://two.test", "mix"),
+])
+def test_plain_http_slots_refuse_credentials_and_mixed_schemes(cache_url: str, slot: str, error: str) -> None:
+    from remote_exec.coordinator import Settings
+
+    args = dict(database_url="unused", client_token="client", worker_token="worker", cache_url=cache_url)
+    with pytest.raises(ValueError, match=error):
+        Settings(**args, cache_slots=[{"name": "two", "url": slot}])
+
+
+def test_plain_http_slots_accept_a_credential_free_http_pool() -> None:
+    from remote_exec.coordinator import Settings
+
+    args = dict(database_url="unused", client_token="client", worker_token="worker")
+    assert Settings(**args, cache_url="http://one.test", cache_slots=[{"name": "two", "url": "http://two.test"}])
+    assert Settings(**args, cache_url="https://ci:secret@one.test",
+                    cache_slots=[{"name": "two", "url": "https://two.test"}])
+    assert Settings(**args, cache_url="http://ci:secret@one.test")
+
+
 def test_cache_ring_identity_ignores_credentials_but_preserves_request_urls() -> None:
     from remote_exec.cache import cache_nodes, node_identity, ranked_nodes
 
