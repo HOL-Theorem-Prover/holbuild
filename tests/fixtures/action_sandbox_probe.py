@@ -208,6 +208,13 @@ def worker(helper: Path, root: Path) -> None:
         readable,
         [secret, shared],
     )
+    for grant in (shared.parent, shared, shared / "actions", shared / "actions/other", secret):
+        try:
+            module["Policy"]([private], [grant], [secret, shared]).validate()
+        except module["SandboxError"]:
+            pass
+        else:
+            raise AssertionError(f"grant exposed protected path: {grant}")
     with (shared / "cooperate/lease-sentinel").open("w") as lease:
         fcntl.flock(lease, fcntl.LOCK_EX)
         os.set_inheritable(lease.fileno(), True)

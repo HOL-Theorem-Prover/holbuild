@@ -256,7 +256,7 @@ class Policy:
         for grant in self.readable + self.writable:
             if not grant.exists():
                 raise SandboxError(f"sandbox grant does not exist: {grant}")
-            if any(path == grant or grant in path.parents for path in self.forbidden):
+            if any(path == grant or grant in path.parents or path in grant.parents for path in self.forbidden):
                 raise SandboxError(f"sandbox grant contains protected worker state: {grant}")
 
     def validate_outputs(self) -> None:

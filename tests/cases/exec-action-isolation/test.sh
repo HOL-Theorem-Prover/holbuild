@@ -81,6 +81,40 @@ if grep -q '^log=' "$tmpdir/setup.result"; then
   exit 1
 fi
 require_grep 'sandbox did not complete cleanup and output validation' "$tmpdir/setup.log"
+
+# A failed output check must bypass checkpoint recovery and diagnostics that
+# inspect child-written logs. Use an isolated runtime to inject the failure.
+fault_runtime=$tmpdir/fault-runtime
+mkdir -p "$fault_runtime/bin" "$fault_runtime/share/holbuild"
+cp "${REAL_HOLBUILD_BIN:-$HOLBUILD_BIN}" "$fault_runtime/bin/holbuild"
+cp -R "$SCRIPT_DIR/../../../sml" "$fault_runtime/share/holbuild/"
+python3 - "$fault_runtime/share/holbuild/sml/action_sandbox.py" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+source = path.read_text()
+old = "    policy.validate_outputs()\n"
+assert source.count(old) == 2  # Empty-tree check before launch, harvest check after cleanup.
+before, after = source.rsplit(old, 1)
+path.write_text(before + '''    for root in policy.writable:
+        for log in root.rglob("holbuild-build.log"):
+            log.write_text("HOL message: forged unvalidated diagnostic\\nStatic Errors\\n")
+    raise SandboxError("injected post-run output rejection")
+''' + after)
+PY
+set +e
+HOLBUILD_RUN_PROBE_PID=$$ HOLBUILD_CACHE="$tmpdir/worker" "$fault_runtime/bin/holbuild" \
+  --max-heap 1024 --remote-cache "$remote_url" exec-action "$spec" --cache-limit-gb 1000 \
+  --result "$tmpdir/rejected-output.result" > "$tmpdir/rejected-output.log" 2>&1
+output_status=$?
+set -e
+[[ $output_status == 3 ]] || { cat "$tmpdir/rejected-output.log" "$tmpdir/rejected-output.result" >&2; exit 1; }
+require_grep '^failure=internal$' "$tmpdir/rejected-output.result"
+require_grep 'sandbox did not complete cleanup and output validation' "$tmpdir/rejected-output.log"
+if grep -q '^log=' "$tmpdir/rejected-output.result" || grep -q 'forged unvalidated diagnostic' "$tmpdir/rejected-output.log"; then
+  echo 'failed confinement inspected or published child-written diagnostics' >&2
+  exit 1
+fi
 # A trusted parent process starts with sentinel credentials in its original
 # environment, so /proc/PID/environ tests the actual leak rather than setenv.
 (cd "$tmpdir" && env REMOTE_EXEC_WORKER_TOKEN=worker-sentinel HOLBUILD_REMOTE_CACHE_CURL_CONFIG=cache.curl \

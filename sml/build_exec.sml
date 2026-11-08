@@ -1736,7 +1736,10 @@ fun run_hol_files_to_log tc stage workdir context files log_name current_log err
       HolbuildToolchain.run_in_dir_to_file workdir
         (HolbuildToolchain.theory_run_argv tc @ ["--noconfig"] @ hol_context_args context @ file_args)
         log
-      handle HolbuildToolchain.Error msg => raise Error msg
+      handle HolbuildToolchain.Error msg =>
+        if HolbuildActionSandbox.active () andalso not (!HolbuildActionSandbox.outputs_validated) then
+          raise HolbuildActionSandbox.Error msg
+        else raise Error msg
     val _ = last_child_status := SOME status
     val detail_log = finalize_current_log log current_log
   in
