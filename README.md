@@ -1448,6 +1448,7 @@ dep theory <package>:<logical> <stem> <input_key>
 lib <package>:<logical> <stem> <suffix> <load>...
 load theory|library|object <name-or-stem>
 file context-script <relpath> <sha256> <size>
+file input <relpath> <sha256> <size>
 script <sha256> <size>
 file support <relpath> <sha256> <size>
 run-load <package>:<logical>|HOLLIB:<name>
@@ -1466,6 +1467,13 @@ run-text
   every theory it depends on, under `.holbuild/action-src/<package>/`, for
   scripts that read their ancestry's sources. For a project context the
   first is the context theory's own.
+- `file input` lines carry the context theory's declared runtime files
+  (`holbuild_extra_deps` and manifest `extra_inputs`) under that same
+  package-relative source tree. A script replaying the context can run from
+  the directory of `HOLBUILD_RUN_SOURCE` so source-relative reads resolve.
+  Ancestors are restored as objects; their runtime inputs are not inherited.
+  Undeclared files are not copied, and inputs outside the package are refused.
+  These contents already contribute to the context input key and run key.
 - `run-load` lines are the libraries to load, in order: a project library by
   its `lib` line's name, a toolchain library as `HOLLIB:<name>`.
 - `output` lines are the file names the script must write.

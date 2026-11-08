@@ -27,7 +27,11 @@ start_remote_cache_server "$remote_root" "$tmpdir/server"
 use_case_cache "$tmpdir/cache"
 
 project=$tmpdir/project
-mkdir -p "$project/src"
+mkdir -p "$project/src" "$project/testdata"
+printf 'fixture\n' > "$project/testdata/value.txt"
+printf 'manifest\n' > "$project/testdata/manifest.txt"
+echo private > "$project/testdata/undeclared.txt"
+echo ancestor > "$project/testdata/ancestor.txt"
 cat > "$project/holproject.toml" <<TOML
 $(write_schema2_prelude)
 [project]
@@ -35,10 +39,16 @@ name = "run"
 
 [build]
 members = ["src"]
+
+[actions.CTheory]
+extra_inputs = ["testdata/manifest.txt", "testdata/value.txt"]
 TOML
 cat > "$project/src/AScript.sml" <<'SML'
 Theory A
 Ancestors bool
+
+fun holbuild_extra_deps (_ : string list) = ()
+val _ = holbuild_extra_deps ["../testdata/ancestor.txt"]
 
 Theorem a_thm:
   T
@@ -49,6 +59,9 @@ SML
 cat > "$project/src/CScript.sml" <<'SML'
 Theory C
 Ancestors A
+
+fun holbuild_extra_deps (_ : string list) = ()
+val _ = holbuild_extra_deps ["../testdata/value.txt"]
 
 Theorem c_thm:
   T
@@ -71,6 +84,16 @@ fun write name text =
   in TextIO.output (out, text); TextIO.closeOut out end;
 val _ = load "CTheory";
 val conf = let val i = TextIO.openIn "data/conf.txt" in TextIO.inputAll i before TextIO.closeIn i end;
+val sourceDir = OS.Path.dir (env "HOLBUILD_RUN_SOURCE");
+fun fixture name =
+  let val i = TextIO.openIn (OS.Path.concat (sourceDir, "../testdata/" ^ name))
+  in TextIO.inputAll i before TextIO.closeIn i end;
+val _ = if fixture "value.txt" = "fixture\n" andalso fixture "manifest.txt" = "manifest\n"
+  then () else raise Fail "wrong declared inputs";
+val _ = if OS.FileSys.access (OS.Path.concat (sourceDir, "../testdata/undeclared.txt"), [])
+  then raise Fail "undeclared input was shipped" else ();
+val _ = if OS.FileSys.access (OS.Path.concat (sourceDir, "../testdata/ancestor.txt"), [])
+  then raise Fail "ancestor input was shipped" else ();
 val scratch = OS.FileSys.isDir (env "HOLBUILD_RUN_SCRATCH");
 val _ = write "first"
   (String.concatWith "\n"
@@ -250,6 +273,45 @@ worker tampered "$tampered"
 expect tampered 4 status=failed failure=spec-rejected
 require_grep 'the run-loads do not match the run text' "$tmpdir/tampered.log"
 
+# Runtime inputs stay in the staged package and cannot alias another input.
+for malformed in escape duplicate; do
+  python3 - "$remote_root/cas/$spec" "$tmpdir/tampered-spec" "$malformed" <<'PYTEST'
+from pathlib import Path
+import sys
+src, dst, mode = sys.argv[1:]
+text = Path(src).read_text()
+line = next(line for line in text.splitlines() if line.startswith("file input "))
+if mode == "escape":
+    fields = line.split()
+    fields[2] = "../outside.txt"
+    text = text.replace(line, " ".join(fields), 1)
+else:
+    text = text.replace(line, line + "\n" + line, 1)
+Path(dst).write_text(text)
+PYTEST
+  tampered=$(sha256sum "$tmpdir/tampered-spec" | awk '{ print $1 }')
+  cp "$tmpdir/tampered-spec" "$remote_root/cas/$tampered"
+  worker "$malformed" "$tampered"
+  expect "$malformed" 4 status=failed failure=spec-rejected
+done
+require_grep 'not a canonical action-src path' "$tmpdir/escape.log"
+require_grep 'duplicate input paths' "$tmpdir/duplicate.log"
+
+# The same remote-ineligible declaration is refused by run-action too.
+echo outside > "$tmpdir/outside.txt"
+cat > "$project/src/DScript.sml" <<'SML'
+Theory D
+Ancestors bool
+fun holbuild_extra_deps (_ : string list) = ()
+val _ = holbuild_extra_deps ["../../outside.txt"]
+SML
+if export_run run.sml run:DTheory > "$tmpdir/escape.out" 2> "$tmpdir/escape.err"; then
+  echo "an escaping declared input was exported" >&2
+  exit 1
+fi
+require_grep 'extra input ../outside.txt lies outside its package root' "$tmpdir/escape.err"
+rm "$project/src/DScript.sml"
+
 # A script past its timeout is killed with its process group.
 read -r key spec < <(export_run sleep.sml --option timeout=5 hol:bool)
 started=$SECONDS
@@ -275,3 +337,9 @@ if pgrep -af "$tmpdir/worker-sleep/action"; then
   echo "the timed-out run left processes behind" >&2
   exit 1
 fi
+
+# A declared fixture edit changes the context and run key without a script edit.
+printf 'changed\n' > "$project/testdata/value.txt"
+hb build CTheory > /dev/null
+read -r fixture_key fixture_spec < <(export_run run.sml --support "$runner/data/conf.txt" --load helperLib run:CTheory)
+[[ "$fixture_key" != "$run_key2" ]]
