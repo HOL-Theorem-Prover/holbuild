@@ -210,6 +210,37 @@ async def test_one_broken_instance_does_not_starve_other_launches_or_heartbeats(
     assert errors == {"a": "fixture provider error", "b": None}
 
 
+@pytest.mark.parametrize("waiting_phase", ["serving", "flush"])
+async def test_clean_heartbeat_clears_error_without_rewriting_healthy_slot(pool: CachePool, waiting_phase: str) -> None:
+    p = provider(pool)
+    p.instances = [Instance(id="a", state="launching")]
+    await launch(pool)
+    if waiting_phase == "flush":
+        p.instances = [Instance(id="a", state="terminating")]
+        await pool.reconcile(p.now)
+        await pool.reconcile(p.now)
+    assert await phase(pool, "a") == waiting_phase
+
+    p.fail_owner = "a"
+    await pool.reconcile(p.now + timedelta(seconds=1))
+    assert p.calls[-1].op == "heartbeat"
+    [failed] = await pool.status()
+    assert failed.error == "fixture provider error"
+    assert failed.phase == waiting_phase
+
+    p.fail_owner = None
+    await pool.reconcile(p.now + timedelta(seconds=2))
+    [recovered] = await pool.status()
+    assert recovered.error is None
+    assert recovered.phase == waiting_phase
+
+    async with pool.engine.connect() as conn:
+        version = await conn.scalar(sa.text("SELECT xmin::text FROM cache_slots WHERE owner='a'"))
+    await pool.reconcile(p.now + timedelta(seconds=3))
+    async with pool.engine.connect() as conn:
+        assert await conn.scalar(sa.text("SELECT xmin::text FROM cache_slots WHERE owner='a'")) == version
+
+
 async def test_cancelled_controller_releases_leadership_before_returning_connection(pool: CachePool) -> None:
     p = provider(pool)
     p.block = asyncio.Event()

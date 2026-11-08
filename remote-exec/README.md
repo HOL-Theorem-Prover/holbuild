@@ -527,7 +527,9 @@ The permanent configured URLs are always present. The API carries canonical
 identities without credentials. A temporary member appears only after its
 adapter has verified DNS, TLS and authenticated CAS write/read readiness.
 `GET /v1/cache/slots` (client token) lists each assigned slot, owner, lifecycle
-phase and last operation error; it omits provider operation tokens.
+phase and last operation error; it omits provider operation tokens. A successful
+heartbeat clears a transient error even while a member is serving or waiting
+for its drain interval.
 
 Clients refresh membership every 30 seconds when the deployment sets
 `HOLBUILD_REMOTE_CACHE_DISCOVERY_URL`. Set `HOLBUILD_REMOTE_CACHE_ALLOWED_URLS`

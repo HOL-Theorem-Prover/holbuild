@@ -121,6 +121,7 @@ class Member:
     token: str | None
     context: str | None
     ingress_stopped_at: datetime | None
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -173,7 +174,8 @@ class CachePool:
 
     async def _members(self, conn: AsyncConnection) -> list[Member]:
         rows = (await conn.execute(sa.text(
-            "SELECT slot, url, owner, phase, assigned_at, token, context, ingress_stopped_at FROM cache_slots ORDER BY slot"
+            "SELECT slot, url, owner, phase, assigned_at, token, context, ingress_stopped_at, error "
+            "FROM cache_slots ORDER BY slot"
         ))).mappings()
         return [Member(**row) for row in rows]
 
@@ -278,10 +280,11 @@ class CachePool:
             "slot": member.slot, "owner": member.owner})
 
     async def _advance(self, conn: AsyncConnection, member: Member, now: datetime) -> None:
-        if member.phase == "serving":
-            return
-        if member.phase == "flush" and (member.ingress_stopped_at is None or
-                (now - member.ingress_stopped_at).total_seconds() < self.drain_seconds):
+        if member.phase == "serving" or (member.phase == "flush" and (member.ingress_stopped_at is None or
+                (now - member.ingress_stopped_at).total_seconds() < self.drain_seconds)):
+            if member.error is not None:
+                await conn.execute(sa.text("UPDATE cache_slots SET error = NULL WHERE slot = :slot AND owner = :owner"),
+                                   {"slot": member.slot, "owner": member.owner})
             return
         result = await self.adapter.call(AdapterRequest(
             op=member.phase, instance=member.owner, slot=member.slot, url=member.url, token=member.token,
