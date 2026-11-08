@@ -95,8 +95,21 @@ A worker:
 docker run -e REMOTE_EXEC_WORKER_TOKEN=... -e HOLBUILD_REMOTE_CACHE_CURL_CONFIG_CONTENT='user = "user:pass"' \
   holbuild-remote-exec worker --coordinator https://exec.example.org --remote-cache https://cache.example.org \
   --cache-limit-gb 200 [--tier standard|high] [--also-claim standard] [--max-heap MB] [--cooperate-dir DIR] \
-  [--share-heaps] [--holbuild-releases-dir DIR] [--protection-cmd COMMAND] [--claim-wait-seconds 20]
+  [--share-heaps] [--holbuild-releases-dir DIR] [--protection-cmd COMMAND] [--claim-wait-seconds 20] [--drain-seconds 20]
 ```
+
+On `SIGTERM`, a worker stops claiming and gives its running action up to
+`--drain-seconds` (20 by default) to finish and report its result. At the
+deadline it stops the action's process group and reports `unavailable`, so
+the coordinator retries immediately without counting the interrupted attempt.
+Waiting for work or preparing a release stops immediately. Repeated `SIGTERM`
+does not extend the deadline; interactive Ctrl-C retains its usual behavior.
+Leave at least 10 seconds between the drain window and the container's stop
+timeout for process cleanup and result reporting. For example, a 120-second
+container stop timeout allows `--drain-seconds 95`. An unreachable coordinator
+can still prevent reporting before the container is forcibly killed; its lease
+then expires normally. ECS protection is best effort, and a rejection in an
+HTTP-success response is logged along with transport failures.
 
 The coordinator's `REMOTE_EXEC_CACHE_URL` (or `HOLBUILD_REMOTE_CACHE_URL` as a
 fallback) and the worker's `--remote-cache` (or `HOLBUILD_REMOTE_CACHE_URL`)

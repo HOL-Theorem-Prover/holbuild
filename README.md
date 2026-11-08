@@ -912,7 +912,9 @@ and they reuse theories built by `holbuild build --skip-proof-steps`; use
 (on remote workers with `--remote-exec`; see
 [Building on remote workers](#building-on-remote-workers)), create an
 invocation-private project context under `.holbuild/`, and then load the
-configured targets followed by user arguments. Two kinds of argument never
+configured targets followed by user arguments. Like heap targets, these are
+built without proof steps, so no tactic timeout applies and theories built by
+`holbuild build --skip-proof-steps` are reused. Two kinds of argument never
 reach HOL this way, wherever they appear: holbuild's global options and
 `-h`/`--help`, which holbuild takes itself, and Poly/ML runtime options
 (`--gcthreads`, `--maxheap`, `-H`, ...), which holbuild's own Poly/ML runtime
@@ -1755,8 +1757,9 @@ locally. `--attach <id>` follows that batch and then builds as above. A
 `--remote-only` build that loses the event stream says how to reattach.
 
 `run` and `repl` take `--remote-exec URL` and `--remote-only` too, before the
-arguments passed to HOL, and build their `[run].loads` targets this way
-before they start HOL locally (they don't take `--detach` or `--attach`):
+arguments passed to HOL, and build their `[run].loads` targets, and any
+`--from` or inferred theory, this way (without proof steps) before they start
+HOL locally (they don't take `--detach` or `--attach`):
 
 ```sh
 holbuild --remote-cache https://cache.example.org run --remote-exec https://exec.example.org script.sml
@@ -1773,7 +1776,9 @@ The coordinator's protocol, in what holbuild uses of it:
   `{"type": "action", "input_key", "theory", "state", "last_failure",
   "log_sha256", ...}` when an action changes, and last `{"type": "batch",
   "state": "done"|"failed"|"cancelled", "failure"}`. A failed action's log is
-  at `/cas/<log_sha256>` in the remote cache. A stream may start over: it
+  at `/cas/<log_sha256>` in the remote cache. The log includes the action's
+  failure diagnostic even when it failed before starting HOL, provided the
+  worker can write and upload the log. A stream may start over: it
   sends every action's current state first.
 - `POST /v1/batches/<id>/cancel` cancels a running batch and answers
   `{"state": "<state>"}`: `cancelled`, or the end a batch that already

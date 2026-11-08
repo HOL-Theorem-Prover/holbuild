@@ -1288,6 +1288,37 @@ require_grep "RunInfTheory restored from cache" "$tmpdir/run-infer-remote.log"
 require_grep "RUN_INFER_OK" "$tmpdir/run-infer-remote.log"
 refute_grep "RunInfTheory built" "$tmpdir/run-infer-remote.log"
 
+# run pre-builds without proof steps, as heap does: an inferred theory the
+# workers built for build --skip-proof-steps is reused, with no second batch
+# demanding a step timeout its slow tactic exceeds.
+copy_nondet run-plain-remote rxrunplain
+sed -i 's/^members = \["src"\]$/&\ntactic_timeout = 0.1/' "$tmpdir/run-plain-remote/holproject.toml"
+require_grep '^tactic_timeout = 0.1$' "$tmpdir/run-plain-remote/holproject.toml"
+cat > "$tmpdir/run-plain-remote/src/RunSlowScript.sml" <<'SML'
+Theory RunSlow
+Ancestors bool
+fun slow_tac g = (OS.Process.sleep (Time.fromReal 0.45); ACCEPT_TAC TRUTH g);
+Theorem run_slow_thm:
+  T
+Proof
+  slow_tac
+QED
+SML
+cat > "$tmpdir/run-plain-remote/probe-slow.sml" <<'SML'
+val _ = load "RunSlowTheory";
+val _ = print "RUN_SLOW_OK\n";
+SML
+in_copy run-plain-remote --remote-cache "$remote_url" build --skip-proof-steps \
+  --remote-exec "$coordinator" --remote-only RunSlowTheory > "$tmpdir/run-plain-build.log" 2>&1 ||
+  { cat "$tmpdir/run-plain-build.log" "$tmpdir/worker.log" >&2; exit 1; }
+require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/run-plain-build.log"
+in_copy run-plain-remote --remote-cache "$remote_url" run \
+  "$tmpdir/run-plain-remote/probe-slow.sml" --remote-exec "$coordinator" --remote-only \
+  > "$tmpdir/run-plain-remote.log" 2>&1 ||
+  { cat "$tmpdir/run-plain-remote.log" "$tmpdir/worker.log" >&2; exit 1; }
+require_grep "RUN_SLOW_OK" "$tmpdir/run-plain-remote.log"
+refute_grep "remote batch\|RunSlowTheory built" "$tmpdir/run-plain-remote.log"
+
 # heap, executable, and export --build support --remote-exec --remote-only.
 copy_nondet heap-remote rxheapcmd
 cat >> "$tmpdir/heap-remote/holproject.toml" <<'TOML'

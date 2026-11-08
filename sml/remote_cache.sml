@@ -404,12 +404,17 @@ fun cas_urls cache sha256 = request_urls cache "cas" sha256
 fun lookup_blob cache sha256 =
   Redblackmap.peek (!(blob_map cache), sha256)
 
+(* A worker's transfer threads share one handle. *)
+val blobs_mutex = Mutex.mutex ()
+
 fun remember_blob cache entry =
   let
     val blobs = blob_map cache
     val {sha256, ...} = entry
   in
-    blobs := Redblackmap.insert (!blobs, sha256, entry)
+    Mutex.lock blobs_mutex;
+    blobs := Redblackmap.insert (!blobs, sha256, entry);
+    Mutex.unlock blobs_mutex
   end
 
 fun split_at_marker text =

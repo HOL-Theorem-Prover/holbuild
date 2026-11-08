@@ -263,9 +263,24 @@ worker "$(basename "$built_worker" | sed 's/^worker-//')" "$spec_a"
 expect "$(basename "$built_worker" | sed 's/^worker-//')" 0 "status=cached"
 require_file "$remote_root/cas/$lost_blob"
 
+# An input the remote lost fails the action as missing, with its blob named,
+# though the worker fetches inputs in parallel.
+data_blob=$(sha256sum "$project/src/data.txt" | cut -d' ' -f1)
+require_file "$remote_root/cas/$data_blob"
+mv "$remote_root/cas/$data_blob" "$tmpdir/data.blob"
+worker lost-input "$spec_b"
+expect lost-input 3 "status=failed" "failure=input-missing" "missing=blob $data_blob"
+mv "$tmpdir/data.blob" "$remote_root/cas/$data_blob"
+
 # The rest of the chain builds in order on another worker.
 worker b "$spec_b"
 expect b 0 "status=built"
+# Its record times the action and its phases.
+require_grep '^wall-ms=[0-9][0-9]*$' "$tmpdir/b.result"
+for phase in hydrate hol check; do
+  grep -qE "^phase-ms=(.*,)?$phase:[0-9]+(,|\$)" "$tmpdir/b.result" || {
+    echo "b's record lacks phase $phase:" >&2; cat "$tmpdir/b.result" >&2; exit 1; }
+done
 worker c "$spec_c"
 expect c 0 "status=built"
 
@@ -317,9 +332,36 @@ worker_status=$?
 set -e
 expect budget 3 "status=failed" "failure=internal"
 require_grep "exceeds the machine budget" "$tmpdir/budget.log"
+log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/budget.result")
+[[ -n "$log_sha" ]] || { echo "pre-HOL failure has no action log" >&2; exit 1; }
+curl -fsS "$remote_url/cas/$log_sha" > "$tmpdir/budget-action.log"
+require_grep "exceeds the machine budget" "$tmpdir/budget-action.log"
+
+# A malformed one-line theorem recovers a boundary with an empty tactic.
+# Its source diagnostic must survive protocol parsing and proof planning.
+cat > "$project/src/InlineScript.sml" <<'SML'
+Theory Inline
+Ancestors bool
+Theorem marker: T Proof simp[] QED
+SML
+hb action-spec --upload InlineTheory > "$tmpdir/batch-inline.txt"
+worker inline "$(spec_for "$tmpdir/batch-inline.txt" worker:InlineTheory)"
+expect inline 1 "status=failed" "failure=proof"
+log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/inline.result")
+[[ -n "$log_sha" ]] || { echo "malformed source has no action log" >&2; exit 1; }
+curl -fsS "$remote_url/cas/$log_sha" > "$tmpdir/inline-action.log"
+require_grep "a theorem's statement ends" "$tmpdir/inline-action.log"
+require_grep "InlineScript.sml:" "$tmpdir/inline-action.log"
+if grep -q "bad analyser boundary record" "$tmpdir/inline-action.log"; then
+  echo "malformed source lost its empty boundary field" >&2
+  exit 1
+fi
 
 worker d "$spec_d"
 expect d 1 "status=failed" "failure=proof"
+log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/d.result")
+curl -fsS "$remote_url/cas/$log_sha" > "$tmpdir/d-action.log"
+require_grep "d_bad" "$tmpdir/d-action.log"
 worker e "$(spec_for "$tmpdir/batch-e.txt" worker:ETheory)"
 expect e 1 "status=failed" "failure=tactic-timeout"
 
