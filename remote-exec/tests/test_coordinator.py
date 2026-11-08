@@ -1485,6 +1485,29 @@ async def test_run_memory_failure_uses_the_existing_profile_hint_and_high_tier(
     await claim_named(http, "a", "high")
 
 
+async def test_cached_targets_submitted_for_execution_still_run_and_return_the_new_log(
+    http: httpx.AsyncClient, cache: FakeCache,
+) -> None:
+    # Force/trace clients deliberately submit actions whose entries exist.
+    # The coordinator must wait for the worker, including a forced parent.
+    cache.keys.update([ac_key("a"), ac_key("b")])
+    batch_id = await submit(http, ["a", "b"], [("b", "a")])
+    token = await claim_named(http, "a")
+    assert await claim(http) is None
+    assert await states(http, batch_id) == {"a": "running", "b": "waiting"}
+    assert (await complete(http, token, result("a", "built"))).status_code == 200
+    token = await claim_named(http, "b")
+    record = result("b", "built").replace("log=" + "a" * 64, "log=" + "b" * 64)
+    assert (await complete(http, token, record)).status_code == 200
+    async with http.stream("GET", f"/v1/batches/{batch_id}/events", headers=CLIENT) as response:
+        events = [json.loads(line) async for line in response.aiter_lines() if line]
+    actions = {e["theory"]: e for e in events if e["type"] == "action"}
+    assert events[-1]["state"] == "done"
+    assert actions["pkg:a"]["log_sha256"] == "a" * 64
+    assert actions["pkg:b"]["log_sha256"] == "b" * 64
+    assert all(a["state"] == "done" and a["attempts"] == 1 for a in actions.values())
+
+
 async def test_cache_ring_routes_digests_independently_of_configuration_order(coordinator: Coordinator) -> None:
     from remote_exec.cache import cache_nodes, ranked_nodes
 
