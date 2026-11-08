@@ -202,8 +202,9 @@ fun new_connection () : connection =
      check "SOCKOPTFUNCTION" (setopt_fn (easy, CURLOPT_SOCKOPTFUNCTION, sockopt_cloexec));
      check "ERRORBUFFER" (setopt_ptr (easy, CURLOPT_ERRORBUFFER, errors));
      Option.app (fn user => check "USERPWD" (setopt_str (easy, CURLOPT_USERPWD, user))) (!userpwd);
-     (* Before the environment's CA settings, which may name a directory. *)
-     if no_ca_directory then check "CAPATH" (setopt_ptr (easy, CURLOPT_CAPATH, Foreign.Memory.null))
+     (* Before the environment's CA settings, which may name a directory.  A
+        TLS backend without CA directories refuses the option, which is fine. *)
+     if no_ca_directory then ignore (setopt_ptr (easy, CURLOPT_CAPATH, Foreign.Memory.null))
      else ();
      List.app (fn (name, option, value) => check name (setopt_str (easy, option, value))) (ca_options ());
      connection)

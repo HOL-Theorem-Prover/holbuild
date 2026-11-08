@@ -10,6 +10,7 @@ source "$SCRIPT_DIR/../../lib.sh"
 tmpdir=$(make_temp_dir)
 cleanup() {
   [[ -z "${server_pid:-}" ]] || kill "$server_pid" 2>/dev/null || true
+  [[ -z "${tls_server_pid:-}" ]] || kill "$tls_server_pid" 2>/dev/null || true
   cleanup_temp_dir "$tmpdir"
 }
 trap cleanup EXIT
@@ -137,6 +138,65 @@ done
 }
 HTTP_TEST_URL="http://127.0.0.1:$(< "$tmpdir/port")"
 export HTTP_TEST_URL HTTP_TEST_DIR=$tmpdir
+
+# An HTTPS server with a self-signed certificate, which writes how many
+# connections it has accepted to tls-accepted.
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=127.0.0.1 \
+  -addext subjectAltName=IP:127.0.0.1 -keyout "$tmpdir/key.pem" -out "$tmpdir/cert.pem" 2>/dev/null
+cat > "$tmpdir/tls-server.py" <<'PY'
+import http.server
+import pathlib
+import ssl
+import sys
+
+directory = pathlib.Path(sys.argv[2])
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain(directory / "cert.pem", directory / "key.pem")
+accepted = 0
+
+class Server(http.server.ThreadingHTTPServer):
+    def get_request(self):
+        global accepted
+        sock, address = super().get_request()
+        accepted += 1
+        (directory / "tls-accepted").write_text(str(accepted))
+        # The handshake runs in the request's thread, so a failed one blocks nothing.
+        return context.wrap_socket(sock, server_side=True, do_handshake_on_connect=False), address
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "3")
+        self.end_headers()
+        self.wfile.write(b"ok\n")
+
+    def log_message(self, *args):
+        pass
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (ssl.SSLError, OSError):
+            self.close_connection = True
+
+server = Server(("127.0.0.1", 0), Handler)
+(directory / "tls-port").write_text(str(server.server_address[1]))
+server.serve_forever()
+PY
+python3 "$tmpdir/tls-server.py" "$tmpdir/tls-port" "$tmpdir" &
+tls_server_pid=$!
+for _ in {1..100}; do
+  [[ -s "$tmpdir/tls-port" ]] && break
+  sleep 0.01
+done
+[[ -s "$tmpdir/tls-port" ]] || {
+  echo "test HTTPS server did not start" >&2
+  exit 1
+}
+HTTPS_TEST_URL="https://127.0.0.1:$(< "$tmpdir/tls-port")"
+export HTTPS_TEST_URL
 
 cat > "$tmpdir/http-test.sml" <<'SML'
 val root =
@@ -358,6 +418,41 @@ val _ = assert "SSL_CERT_DIR and SSL_CERT_FILE"
                (ca_options_with [("CURL_CA_BUNDLE", NONE)] = [("CAPATH", "/dir"), ("CAINFO", "/file")])
 val _ = assert "SSL_CERT_FILE alone" (ca_options_with [("SSL_CERT_DIR", NONE)] = [("CAINFO", "/file")])
 val _ = assert "no CA settings" (ca_options_with [("SSL_CERT_FILE", NONE)] = [])
+
+(* HTTPS to a server whose self-signed certificate only CURL_CA_BUNDLE names.
+   With a libcurl that caches the parsed CA bundle, new handles start without
+   libcurl's default CA directory; the bundle alone verifies the server. *)
+val tls_url = valOf (OS.Process.getEnv "HTTPS_TEST_URL")
+fun tls_accepted () =
+  if OS.FileSys.access (dir ^ "/tls-accepted", []) then valOf (Int.fromString (read_file (dir ^ "/tls-accepted")))
+  else 0
+fun tls_get () = HolbuildHttp.get {url = tls_url ^ "/", dst = dir ^ "/tls.out", timeout = 30}
+(* A handle takes the CA settings when it is made, so let the pool close the
+   ones the requests above left. *)
+fun wait_for_empty_pool () =
+  if has_proc then wait_for "the pooled connections to be closed" (fn () => sockets () = 0) (in_10s ())
+  else OS.Process.sleep (Time.fromSeconds 5)
+val clearing = !HolbuildHttp.clear_ca_directory
+val _ = wait_for_empty_pool ()
+val _ = ca_options_with [("CURL_CA_BUNDLE", SOME (dir ^ "/cert.pem"))]
+val _ = assert "HTTPS verifies the server against the CA bundle" (tls_get () = HolbuildHttp.Response 200)
+val _ = assert "a verified server keeps the CA directory cleared" (!HolbuildHttp.clear_ca_directory = clearing)
+
+(* Once the pool has closed that handle, a certificate the default CAs don't
+   verify fails, after one retry on a handle with libcurl's default CA
+   directory when the first had none, and later handles keep that default. *)
+val _ = wait_for_empty_pool ()
+val _ = ca_options_with [("CURL_CA_BUNDLE", NONE)]
+val accepted_before = tls_accepted ()
+val _ = assert "an unverified certificate is a transport failure"
+               (case tls_get () of HolbuildHttp.Failed _ => true | _ => false)
+val _ = assert "the request was retried once if the CA directory was cleared"
+               (tls_accepted () = accepted_before + (if clearing then 2 else 1))
+val _ = assert "the CA directory is no longer cleared" (not (!HolbuildHttp.clear_ca_directory))
+val accepted_before = tls_accepted ()
+val _ = assert "a later request fails without a retry"
+               (case tls_get () of HolbuildHttp.Failed _ => true | _ => false)
+val _ = assert "a later request connects once" (tls_accepted () = accepted_before + 1)
 
 val _ = print "http tests passed\n"
 SML
