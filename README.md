@@ -1618,10 +1618,10 @@ analysers, and a toolchain another holbuild process is using is kept.
 
 Workers sharing a host coordinate sweeps through `<cache root>/locks/gc.lock`;
 share `locks/` along with the cache directories. Private checkpoints and theory modules are sized
-on every action. Shared sizes can be reused for up to 60 seconds when the last
-measurement, current checkpoints and an extra cushion of the larger of 32 GiB
-or the reserve still fit under the target. Small caps and caches near their
-target are scanned live. This is a housekeeping limit: shared growth during
+on every action. With a positive reserve and a target of at least 64 GiB,
+shared sizes can be reused for up to 60 seconds when the last measurement plus
+current private sizes fit under the target. Smaller targets and zero-reserve
+runs are scanned live. This is a housekeeping limit: shared growth during
 that interval is accounted for at the next scan, rather than reserved on each
 write. Each cached root's device and inode must match the measurement; roots
 that differ are sized live, so partial directory sharing remains safe without

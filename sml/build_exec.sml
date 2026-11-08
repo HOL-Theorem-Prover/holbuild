@@ -7992,20 +7992,18 @@ fun cache_root_id path =
         SysWord.toString (Posix.FileSys.inoToWord ino)
 
 (* Evict least recently used families until the cache leaves reserve_bytes of
-   room under limit_bytes. Reuse a recent shared scan only with ample extra
-   headroom; private checkpoints and modules are always measured locally. *)
+   room under limit_bytes. Reuse a recent shared scan within the target;
+   private checkpoints and modules are always measured locally. Small caps
+   and zero reserves scan live. *)
 fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes} =
   let
-    fun private_cache () =
-      let val checkpoints = collect_checkpoint_families checkpoint_root
-      in (checkpoints, total_checkpoint_bytes checkpoints +
-                       cache_root_bytes (HolbuildCache.theory_modules_dir cache)) end
+    fun private_bytes () =
+      cache_root_bytes checkpoint_root + cache_root_bytes (HolbuildCache.theory_modules_dir cache)
     val roots = worker_cache_roots cache
     fun root_ids () = map (fn (path, _) => cache_root_id path) roots
     fun sum sizes = List.foldl (op +) (0 : Position.int) sizes
     val target = limit_bytes - reserve_bytes
     val state_path = Path.concat(HolbuildCache.locks_dir cache, "worker-cache-cap.state")
-    val headroom = IntInf.max(reserve_bytes, gb_to_bytes 32)
     fun parse_sizes [] = SOME []
       | parse_sizes (id :: bytes :: rest) =
           (case (IntInf.fromString bytes, parse_sizes rest) of
@@ -8013,6 +8011,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
              | _ => NONE)
       | parse_sizes _ = NONE
     fun recent_scan_fits private_bytes =
+      target >= gb_to_bytes 64 andalso reserve_bytes > 0 andalso
       (case String.tokens Char.isSpace (read_text state_path) of
            "holbuild-worker-cache-cap-v2" :: measured :: entries =>
              (case (LargeInt.fromString measured, parse_sizes entries) of
@@ -8025,7 +8024,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                                 are shared. Keep their hits without stamp churn. *)
                              (fn ((path, measure), (id, bytes)) =>
                                  if cache_root_id path = id then bytes else measure ())
-                             (roots, entries)) + private_bytes + headroom <= target
+                             (roots, entries)) + private_bytes () <= target
                     end
                 | _ => false)
          | _ => false)
@@ -8045,15 +8044,15 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                 sweep (total - Option.getOpt (freed, 0)) rest
               end
     fun scan () =
-      let val (checkpoints, private_bytes) = private_cache ()
+      let val private_size = private_bytes ()
       in
-        if recent_scan_fits private_bytes then ()
+        if recent_scan_fits (fn () => private_size) then ()
         else
           let
             val measured = Time.toNanoseconds (Time.now ())
             val ids = root_ids ()
             val sizes = map (fn (_, measure) => measure ()) roots
-            val total = sum sizes + private_bytes
+            val total = sum sizes + private_size
           in
             if total <= target then
               if ids <> root_ids () then remove_file state_path
@@ -8068,7 +8067,8 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                 val _ = remove_file state_path
                 val (local_families, young_orphans) = local_cache_families cache
                 val families =
-                  by_age (toolchain_trash_family () :: checkpoint_cache_families checkpoints @
+                  by_age (toolchain_trash_family () ::
+                          checkpoint_cache_families (collect_checkpoint_families checkpoint_root) @
                           store_cache_families cache @ module_cache_families cache @
                           toolchain_cache_families () @ local_families) @ by_age young_orphans
                 val after = sweep total families
@@ -8080,7 +8080,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
           end
       end
   in
-    if recent_scan_fits (#2 (private_cache ())) then ()
+    if recent_scan_fits private_bytes then ()
     else
       let
         (* gc.lock is also shared by explicit cache gc. The action-root
