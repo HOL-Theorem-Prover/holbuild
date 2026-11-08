@@ -61,6 +61,11 @@ To roll back to an image predating `0006`, use the current image to run
 `alembic downgrade 0005` first, then run the older image's `migrate` and
 `coordinator`; that image's migration code does not know revision `0006`.
 
+Migration `0009` adds `actions.interruptions` (default 0), which the
+coordinator reads when an action completes, so run it before the new image
+serves. To roll back to an image predating `0009`, use the current image to
+run `alembic downgrade 0008` first.
+
 The coordinator reads its settings from the environment:
 
 | Variable | Meaning | Default |
@@ -97,8 +102,8 @@ A worker:
 docker run -e REMOTE_EXEC_WORKER_TOKEN=... -e HOLBUILD_REMOTE_CACHE_CURL_CONFIG_CONTENT='user = "user:pass"' \
   holbuild-remote-exec worker --coordinator https://exec.example.org --remote-cache https://cache.example.org \
   --cache-limit-gb 200 [--tier standard|high] [--also-claim standard] [--max-heap MB] [--cooperate-dir DIR] \
-  [--share-heaps] [--holbuild-releases-dir DIR] [--protection-cmd COMMAND] [--claim-wait-seconds 20] [--drain-seconds 20]
-  [--host-rank 0]
+  [--share-heaps] [--holbuild-releases-dir DIR] [--protection-cmd COMMAND] [--claim-wait-seconds 20] \
+  [--drain-seconds 20] [--host-rank 0]
 ```
 
 `--host-rank` (0 to 1000, 0 by default) orders hosts for packing: claims go
