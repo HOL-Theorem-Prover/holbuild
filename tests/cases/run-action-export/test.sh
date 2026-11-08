@@ -340,3 +340,10 @@ if wait "$mutation_pid"; then
 fi
 mutation_pid=
 require_grep 'theory script changed since the build was planned' "$tmpdir/mutation.err"
+
+# Fetched metadata names cannot be declared script outputs.
+if run_export --output LOG hol:bool > /dev/null 2> "$tmpdir/log-output.err"; then
+  echo 'run-action accepted reserved output LOG' >&2
+  exit 1
+fi
+require_grep 'KEY, CONTEXT and LOG are not output names' "$tmpdir/log-output.err"

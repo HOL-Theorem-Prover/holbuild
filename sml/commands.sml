@@ -294,7 +294,8 @@ fun run_action_help () = print
   \set of inputs: runs the remote cache already holds aren't run again. The\n\
   \others go to the coordinator at URL as one batch; then every run's\n\
   \outputs are fetched into D/PACKAGE/THEORY (D/HOL/THEORY for a toolchain\n\
-  \theory), beside KEY (the run key) and CONTEXT, and one line per run is\n\
+  \theory), beside KEY (the run key) and CONTEXT. Failed runs fetch LOG when\n\
+  \available; a missing log warns without changing the run failure. A line is\n\
   \printed: `CONTEXT RUN-KEY done|cached|failed CLASS|missing`. Runs never\n\
   \execute locally.\n\n\
   \A TARGET is a project theory (a logical name as build takes, or\n\
@@ -1493,7 +1494,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                         handle HolbuildBuildExec.Error reason =>
                           (stopped := SOME (reason, true); {exported = [], refused = []})
               in (remote, runs, uncached, exported) end))
-        (* The latest state and failure of each run in the batch. *)
+        (* The latest state, failure and log of each run in the batch. *)
         val uncached_keys = run_keys uncached
         val refused_keys = run_keys refused
         val states = ref (Redblackmap.mkDict String.compare)
@@ -1507,7 +1508,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                            ["action", run_key, HolbuildRemoteCache.remote_action_key run_key, spec_sha256, name])
                      exported) ^ "\n"
             val query = "?class=run" ^ (case profile of SOME p => "&profile=" ^ p | NONE => "")
-            fun on_change (key, state, failure, _) = states := Redblackmap.insert (!states, key, (state, failure))
+            fun on_change (key, state, failure, log) = states := Redblackmap.insert (!states, key, (state, failure, log))
           in
             (* A run never runs here, so an unreachable coordinator is waited for. *)
             case HolbuildRemoteExec.submit_with_query true url query (#maxheap tc) batch of
@@ -1540,8 +1541,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             | (_, NONE) => raise Error "internal error: run-action has runs to submit but no coordinator"
         fun ended_as ({run_key, ...} : HolbuildBuildExec.run) =
           case Redblackmap.peek (!states, run_key) of
-              SOME ("done", _) => "done"
-            | SOME ("failed", failure) => "failed " ^ Option.getOpt (failure, "unknown")
+              SOME ("done", _, _) => "done"
+            | SOME ("failed", failure, _) => "failed " ^ Option.getOpt (failure, "unknown")
             | _ => "missing"
         val ended =
           map (fn run =>
@@ -1551,7 +1552,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                    else ended_as run))
               runs
         val to_fetch = List.mapPartial (fn (run, status) =>
-                                           if status = "done" orelse status = "cached" then SOME run else NONE)
+                                           if status <> "missing" then SOME run else NONE)
                                        ended
         (* A fetch that raises (an output directory it can't write, say)
            counts as not fetched; its error is raised once every line is out. *)
@@ -1559,7 +1560,10 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         val not_fetched =
           map #1 (HolbuildBuildExec.failing_on_pool remote jobs "fetching from remote cache" "runs"
                     (fn remote => fn (run, error) =>
-                        HolbuildBuildExec.fetch_run remote outputs_dir outputs run
+                        (case Redblackmap.peek (!states, #run_key run) of
+                             SOME ("failed", _, log) =>
+                               (HolbuildBuildExec.fetch_failed_run remote outputs_dir run log; true)
+                           | _ => HolbuildBuildExec.fetch_run remote outputs_dir outputs run)
                         handle e => (error := SOME e; false))
                     fetches)
         val not_fetched_keys = run_keys not_fetched
