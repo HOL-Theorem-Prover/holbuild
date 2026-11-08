@@ -64,6 +64,17 @@ SML
 spec=$(awk '$1 == "action" && $5 == "isolation:IsolatedTheory" {print $4}' "$tmpdir/batch")
 [[ -n "$spec" ]]
 link_hol_toolchain_cache "$tmpdir/worker"
+# A policy/setup failure is retryable infrastructure failure, never a final
+# failed proof. The protected completion marker is not writable by HOL.
+set +e
+HOLBUILD_ACTION_READ_DIRS="$tmpdir" HOLBUILD_CACHE="$tmpdir/worker" "$HOLBUILD_BIN" \
+  --max-heap 1024 --remote-cache "$remote_url" exec-action "$spec" --cache-limit-gb 1000 \
+  --result "$tmpdir/setup.result" > "$tmpdir/setup.log" 2>&1
+setup_status=$?
+set -e
+[[ $setup_status == 3 ]] || { cat "$tmpdir/setup.log" "$tmpdir/setup.result" >&2; exit 1; }
+require_grep '^failure=internal$' "$tmpdir/setup.result"
+require_grep 'sandbox did not complete cleanup and output validation' "$tmpdir/setup.log"
 # A trusted parent process starts with sentinel credentials in its original
 # environment, so /proc/PID/environ tests the actual leak rather than setenv.
 env REMOTE_EXEC_WORKER_TOKEN=worker-sentinel HOLBUILD_REMOTE_CACHE_CURL_CONFIG="$tmpdir/cache.curl" \

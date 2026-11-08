@@ -166,7 +166,8 @@ class Linux:
                  action: int | None = None) -> None:
             number = lib.seccomp_syscall_resolve_name(name.encode())
             # These Linux APIs are newer than some supported libseccomp tables.
-            number = {"setxattrat": 463, "removexattrat": 466, "file_setattr": 469}.get(name, number)
+            number = {"fchmodat2": 452, "setxattrat": 463, "removexattrat": 466,
+                      "file_setattr": 469}.get(name, number)
             if number < 0:
                 return  # syscall does not exist on the native architecture
             values = comparisons or []
@@ -208,7 +209,7 @@ class Linux:
             for name in ("prlimit64", "sched_setaffinity", "sched_setattr", "sched_setscheduler", "sched_setparam"):
                 deny(name, [Comparison(0, 1, 0, 0)])
             for cmd in (5, 6, 7, 8, 9, 10, 15, 36, 37, 38):
-                deny("fcntl", [Comparison(1, 4, cmd, 0)])  # EQ: locks and signal ownership
+                deny("fcntl", [Comparison(1, 7, 0xFFFFFFFF, cmd)])  # 32-bit command: locks and signal ownership
             deny("ioctl", error=errno.ENOTTY)
             for name, argument in (("open", 1), ("openat", 2)):
                 for access in (0, 3):
@@ -629,6 +630,7 @@ def main() -> int:
     parser.add_argument("--write", action="append", default=[])
     parser.add_argument("--read", action="append", default=[])
     parser.add_argument("--forbid", action="append", default=[])
+    parser.add_argument("--completed", type=Path)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     try:
@@ -644,14 +646,23 @@ def main() -> int:
         policy = Policy(
             [Path(path).resolve(strict=True) for path in args.write],
             [Path(path).resolve(strict=True) for path in args.read],
-            [Path(path).resolve() for path in args.forbid],
+            [Path(path).resolve() for path in args.forbid] +
+            ([args.completed.resolve()] if args.completed is not None else []),
         )
         if not policy.writable:
             raise SandboxError("missing private action directory")
         argv = args.command[1:] if args.command[:1] == ["--"] else args.command
-        return run(linux, policy, argv)
+        status = run(linux, policy, argv)
+        if args.completed is not None:
+            args.completed.write_text("validated\n")
+        return status
     except (OSError, SandboxError) as error:
         print(f"holbuild sandbox: {error}", file=sys.stderr)
+        if args.completed is not None:
+            try:
+                args.completed.write_text("failed\n")
+            except OSError:
+                pass  # Missing confirmation still fails closed in the parent.
         return 125
 
 

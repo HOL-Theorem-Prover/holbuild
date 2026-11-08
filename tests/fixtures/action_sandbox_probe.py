@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import platform
 import resource
 import runpy
 import shutil
@@ -50,6 +51,20 @@ def attack(root: Path, worker: int, secret: Path, shared: Path) -> None:
     refuses("join worker group", lambda: os.setpgid(0, os.getpgid(worker)))
     refuses("worker limits", lambda: resource.prlimit(worker, resource.RLIMIT_NOFILE))
     refuses("signal owner", lambda: fcntl.fcntl(1, fcntl.F_SETOWN, worker))
+    number = 25 if platform.machine() == "aarch64" else 72
+    read_fd, write_fd = os.pipe()
+    def raw(number: int, *args: object) -> None:
+        if libc.syscall(number, *args) < 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+    try:
+        for cmd, value in ((fcntl.F_SETOWN, worker), (10, signal.SIGKILL)):
+            refuses(f"high-bit fcntl {cmd}",
+                    lambda: raw(number, read_fd, ctypes.c_ulong((1 << 32) | cmd), value))
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+    refuses("old-table fchmodat2", lambda: raw(452, -100, os.fsencode(shared / "actions/other"), 0, 0))
     for directory in ("actions", "blobs", "locks", "cooperate"):
         path = shared / directory / "other"
         refuses(f"{directory} write", lambda: path.write_text("tampered"))
@@ -157,6 +172,9 @@ def worker(helper: Path, root: Path) -> None:
     module = runpy.run_path(str(helper), run_name="sandbox")
     linux = module["Linux"]()
     linux.abi = min(linux.abi, 2)  # Exercise the deployed kernel's policy on newer test hosts too.
+    # libseccomp 2.5.4 lacks this name even on kernels implementing the call.
+    resolve = linux.seccomp.seccomp_syscall_resolve_name
+    linux.seccomp.seccomp_syscall_resolve_name = lambda name: -1 if name == b"fchmodat2" else resolve(name)
     readable = [Path(path) for path in ("/usr", "/bin", "/lib", "/lib64", "/etc/ld.so.cache", "/dev/urandom") if Path(path).exists()]
     if prover := shutil.which("eprover"):
         os.environ["HOLBUILD_RUN_PROVER"] = prover
@@ -204,6 +222,44 @@ def worker(helper: Path, root: Path) -> None:
           f"process groups, sessions, threads and cleanup passed; prover={'passed' if prover else 'unavailable'}")
 
 
+def completion_probe(helper: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="holbuild-completion-probe-") as directory:
+        root = Path(directory)
+        private = root / "private"
+        private.mkdir()
+        completed = root / "completion"
+        for child_status, cleanup_failure in ((0, False), (1, False), (0, True)):
+            completed.write_text("pending\n")
+            module = runpy.run_path(str(helper), run_name="sandbox")
+            if cleanup_failure:
+                original = module["finish_children"]
+                def failed_cleanup(leader: int) -> int:
+                    original(leader)
+                    raise module["SandboxError"]("injected cleanup failure")
+                module["run"].__globals__["finish_children"] = failed_cleanup
+            code = (
+                "from pathlib import Path\n"
+                f"try: Path({str(completed)!r}).write_text('forged')\n"
+                "except PermissionError: pass\n"
+                "else: raise AssertionError('HOL could forge completion')\n"
+                f"Path({str(private / 'checkpoint')!r}).write_text('checkpoint')\n"
+                f"raise SystemExit({child_status})\n"
+            )
+            previous = sys.argv
+            try:
+                sys.argv = [str(helper), "--write", str(private), "--completed", str(completed)]
+                for path in ("/usr", "/bin", "/lib", "/lib64"):
+                    if Path(path).exists():
+                        sys.argv += ["--read", path]
+                sys.argv += ["--", sys.executable, "-I", "-c", code]
+                status = module["main"]()
+            finally:
+                sys.argv = previous
+            assert status == (125 if cleanup_failure else child_status), status
+            assert completed.read_text() == ("failed\n" if cleanup_failure else "validated\n")
+        print("completion protected from HOL; proof failure validated; cleanup failure withheld completion")
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "--attack":
         attack(Path(sys.argv[2]), int(sys.argv[3]), Path(sys.argv[4]), Path(sys.argv[5]))
@@ -212,6 +268,7 @@ if __name__ == "__main__":
     elif sys.argv[1] == "--worker":
         worker(Path(sys.argv[2]), Path(sys.argv[3]))
     else:
+        completion_probe(Path(sys.argv[1]))
         with tempfile.TemporaryDirectory(prefix="holbuild-sandbox-probe-") as directory:
             env = {**os.environ, "REMOTE_EXEC_WORKER_TOKEN": "worker-token-sentinel", "HOLBUILD_REMOTE_CACHE_CURL_CONFIG": f"{directory}/cache.curl"}
             process = subprocess.Popen([sys.executable, __file__, "--worker", sys.argv[1], directory], env=env)

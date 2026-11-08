@@ -7,9 +7,10 @@ exception Rejected of string
 val private_roots : (string * string) option ref = ref NONE
 val toolchain_root = ref ""
 val poly_root = ref ""
+val outputs_validated = ref false
 
 fun active () = Option.isSome (!private_roots)
-fun enable roots = private_roots := SOME roots
+fun enable roots = (outputs_validated := false; private_roots := SOME roots)
 fun disable () = private_roots := NONE
 
 fun protect_process () =
@@ -143,7 +144,7 @@ fun require_trusted_repository {git, rev = revision} =
 
 fun helper () = OS.Path.concat (HolbuildRuntimePaths.runtime_root (), "sml/action_sandbox.py")
 
-fun wrap argv =
+fun wrap completed argv =
   case !private_roots of
       NONE => argv
     | SOME (root, checkpoints) =>
@@ -175,7 +176,49 @@ fun wrap argv =
         fun options flag paths = List.concat (map (fn path => [flag, path]) paths)
       in
         ["python3", "-I", helper ()] @ options "--write" [full root, full checkpoints] @
-        options "--read" (map full readable) @ options "--forbid" forbidden @ ["--"] @ argv
+        options "--read" (map full readable) @ options "--forbid" forbidden @
+        ["--completed", completed, "--"] @ argv
       end
+
+(* Only the trusted supervisor can write this sibling of the private roots.
+   A child exit status alone cannot attest to cleanup or output validation. *)
+fun launch argv execute =
+  if not (active ()) then execute argv else
+  let
+    val _ = outputs_validated := false
+    val completed = OS.Path.concat
+      (OS.FileSys.fullPath (HolbuildCacheConfig.cache_root ()), "sandbox-" ^ HolbuildTempPath.suffix ())
+    fun remove () = OS.FileSys.remove completed handle OS.SysErr _ => ()
+    fun write text =
+      let val output = TextIO.openOut completed
+      in (TextIO.output(output, text); TextIO.closeOut output)
+         handle e => (TextIO.closeOut output; raise e)
+      end
+    fun completion () =
+      let val input = TextIO.openIn completed
+      in (TextIO.inputAll input before TextIO.closeIn input)
+         handle e => (TextIO.closeIn input; raise e)
+      end
+    fun await_completion deadline =
+      case completion () of
+          "validated\n" => true
+        | "failed\n" => false
+        | _ => if Time.>= (Time.now (), deadline) then false
+               else (OS.Process.sleep (Time.fromReal 0.01); await_completion deadline)
+    fun run () =
+      let
+        val _ = write "pending\n"
+        val result = execute (wrap completed argv)
+        (* A timeout reaps the outer shell before its watcher signals the
+           supervisor. Allow the supervisor's bounded cleanup to finish. *)
+        val _ = if await_completion (Time.+ (Time.now (), Time.fromSeconds 6))
+                then outputs_validated := true
+                else raise Error "HOL sandbox did not complete cleanup and output validation"
+      in
+        result
+      end
+  in
+    (run () before remove ()) handle e => (remove (); raise e)
+  end
 
 end

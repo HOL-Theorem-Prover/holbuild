@@ -9033,6 +9033,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                       SOME ctx => phase "restore" (fn () => restore_shared_checkpoints remote ctx)
                     | NONE => nothing_restored
                 fun publish_shared () =
+                  if not (!HolbuildActionSandbox.outputs_validated) then () else
                   case shared of
                       SOME ctx => phase "publish" (fn () => publish_shared_checkpoints remote ctx restored)
                     | NONE => ()
