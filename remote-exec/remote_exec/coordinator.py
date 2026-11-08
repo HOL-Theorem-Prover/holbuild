@@ -16,13 +16,14 @@ from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Self
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 import asyncpg
 import httpx
 import sqlalchemy as sa
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
@@ -100,6 +101,18 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_cache_url(cls, value: str) -> str:
         return ",".join(cache_nodes(value))
+
+    @model_validator(mode="after")
+    def plain_http_slots(self) -> Self:
+        """Discovery hands the permanent nodes' credentials to slots, so plain-HTTP slots need a credential-free HTTP pool."""
+        urls = [*(self.cache_url.split(",") if self.cache_url else []), *(slot.url for slot in self.cache_slots)]
+        parts = [urlsplit(url) for url in urls]
+        if any(part.scheme == "http" for part in parts) and self.cache_slots:
+            if any(part.username or part.password for part in parts):
+                raise ValueError("http:// cache slots need a cache URL without credentials")
+            if len({part.scheme for part in parts}) > 1:
+                raise ValueError("cache slots and the cache URL must not mix http:// and https://")
+        return self
 
 class ScaleCommandError(RuntimeError):
     """The scale command failed or timed out."""

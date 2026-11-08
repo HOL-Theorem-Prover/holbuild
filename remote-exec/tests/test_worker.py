@@ -1132,14 +1132,11 @@ def test_worker_discovery_exposes_only_a_scoped_token_to_the_action_and_cleans_i
     token = "worker-secret-discovery-test"
     inherited_config = tmp_path / "coordinator.curl"
     inherited_config.write_text(token)
-    cache_config = tmp_path / "cache.curl"
-    cache_config.write_text('user = "cache:password"\n')
     monkeypatch.setattr(os, "environ", {
         "PATH": os.environ["PATH"], "HOME": str(tmp_path),
         "FAKE_BUILD_LOG": str(logs[0]), "HOLBUILD_FAKE_LOG": str(logs[1]),
         "REMOTE_EXEC_WORKER_TOKEN": token,
         "HOLBUILD_CACHE": str(tmp_path / "cache"),
-        "HOLBUILD_REMOTE_CACHE_CURL_CONFIG": str(cache_config),
         "HOLBUILD_REMOTE_CACHE_DISCOVERY_URL": server.url + "/v1/cache/members",
         "HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN": token,
         "HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG": str(inherited_config),
@@ -1169,7 +1166,6 @@ def test_worker_discovery_exposes_only_a_scoped_token_to_the_action_and_cleans_i
             if path.is_file():
                 assert token.encode() not in path.read_bytes()
         assert env["HOLBUILD_REMOTE_CACHE_DISCOVERY_URL"] == server.url + "/v1/cache/members"
-        assert env["HOLBUILD_REMOTE_CACHE_CURL_CONFIG"] == str(cache_config)
         config = Path(env["HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG"])
         paths.append(config)
         assert config != inherited_config
@@ -1198,6 +1194,20 @@ def test_worker_rejects_newlines_before_an_http_error_can_print_its_token(
     assert str(error.value) == "worker token must not contain a newline"
     captured = capsys.readouterr()
     assert "worker-secret" not in captured.out + captured.err
+
+
+def test_worker_refuses_plain_http_discovery_with_a_cache_curl_config(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", "worker-secret")
+    monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_DISCOVERY_URL", server.url + "/v1/cache/members")
+    monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_CURL_CONFIG", str(tmp_path / "cache.curl"))
+    monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_ALLOWED_URLS", "http://burst.example")
+    monkeypatch.setattr(worker, "parse_args", lambda: worker_args(tmp_path, server))
+    monkeypatch.setattr(worker, "claim_reporting", lambda *_: pytest.fail("claimed with an unsafe cache allowlist"))
+    with pytest.raises(SystemExit, match="plain-HTTP endpoint"):
+        worker.main()
 
 
 def test_worker_refreshes_bootstrap_membership_after_memory_and_claim_waits(
