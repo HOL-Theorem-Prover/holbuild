@@ -99,6 +99,7 @@ val CURLOPT_CAPATH = 10097
 val CURLOPT_INFILESIZE_LARGE = 30115
 val CURLOPT_SOCKOPTFUNCTION = 20148
 val CURLINFO_RESPONSE_CODE = 0x200002
+val CURLE_PEER_FAILED_VERIFICATION = 60
 val CURL_GLOBAL_DEFAULT = 3
 val CURL_VERSION_ASYNCHDNS = 0wx80 : Word32.word
 val CURL_ERROR_SIZE = 0w256
@@ -111,6 +112,20 @@ val connect_timeout_seconds = 5
 val max_transfer_seconds = 1800
 
 val userpwd : string option ref = ref NONE
+
+(* libcurl keeps the CA store it parsed per multi handle (7.87 on), but only
+   for connections with no CA directory, and builds such as Debian's set one
+   by default.  Without that cache, each new connection parses the whole CA
+   bundle again: about 18 ms of CPU, and many times that with dozens of
+   threads connecting at once.  So while this holds, new handles clear the
+   default CA directory, leaving the CA bundle to name the trusted roots, and
+   load it once.  A certificate the bundle alone doesn't verify turns it off
+   for the process (request). *)
+val clear_ca_directory = ref false
+
+(* A transfer on a handle made with no CA directory failed to verify the
+   server's certificate. *)
+exception CaDirectoryNeeded
 
 fun version_text number =
   String.concatWith "." (map (fn unit => Int.toString (number div unit mod 256)) [65536, 256, 1])
@@ -142,7 +157,7 @@ fun setup {user} =
     else
       (resolve_symbols ();
        if global_init CURL_GLOBAL_DEFAULT <> 0 then raise Error "curl_global_init failed"
-       else userpwd := user)
+       else (userpwd := user; clear_ca_directory := number >= 0x075700))
   end
 
 fun check what code =
@@ -163,17 +178,18 @@ fun ca_options () =
           [("SSL_CERT_DIR", "CAPATH", CURLOPT_CAPATH), ("SSL_CERT_FILE", "CAINFO", CURLOPT_CAINFO)]
 
 type connection = {easy : Foreign.Memory.voidStar, multi : Foreign.Memory.voidStar,
-               errors : Foreign.Memory.voidStar}
+               errors : Foreign.Memory.voidStar, no_ca_directory : bool}
 
-fun close ({easy, multi, errors} : connection) =
+fun close ({easy, multi, errors, ...} : connection) =
   (if easy = Foreign.Memory.null then () else easy_cleanup easy;
    if multi = Foreign.Memory.null then () else ignore (multi_cleanup multi);
    Foreign.Memory.free errors)
 
 fun new_connection () : connection =
   let
-    val connection as {easy, multi, errors} =
-      {easy = easy_init (), multi = multi_init (), errors = Foreign.Memory.malloc CURL_ERROR_SIZE}
+    val connection as {easy, multi, errors, no_ca_directory} =
+      {easy = easy_init (), multi = multi_init (), errors = Foreign.Memory.malloc CURL_ERROR_SIZE,
+       no_ca_directory = !clear_ca_directory}
   in
     (if easy = Foreign.Memory.null orelse multi = Foreign.Memory.null then
        raise Error "could not create a libcurl handle"
@@ -186,6 +202,9 @@ fun new_connection () : connection =
      check "SOCKOPTFUNCTION" (setopt_fn (easy, CURLOPT_SOCKOPTFUNCTION, sockopt_cloexec));
      check "ERRORBUFFER" (setopt_ptr (easy, CURLOPT_ERRORBUFFER, errors));
      Option.app (fn user => check "USERPWD" (setopt_str (easy, CURLOPT_USERPWD, user))) (!userpwd);
+     (* Before the environment's CA settings, which may name a directory. *)
+     if no_ca_directory then check "CAPATH" (setopt_ptr (easy, CURLOPT_CAPATH, Foreign.Memory.null))
+     else ();
      List.app (fn (name, option, value) => check name (setopt_str (easy, option, value))) (ca_options ());
      connection)
     handle e => (close connection; raise e)
@@ -247,7 +266,10 @@ fun take () =
          case !idle of
              (connection, _) :: rest => (idle := rest; SOME connection)
            | [] => NONE) of
-      SOME connection => connection
+      SOME connection =>
+        if #no_ca_directory connection andalso not (!clear_ca_directory)
+        then (close connection; take ())
+        else connection
     | NONE => new_connection ()
 
 fun give connection =
@@ -281,7 +303,7 @@ fun c_string_at p =
    poll returns at least every 20 ms, rather than by a blocking
    curl_easy_perform.  DNS can't block here: setup requires an asynchronous
    resolver. *)
-fun transfer ({easy, multi, errors} : connection) =
+fun transfer ({easy, multi, errors, no_ca_directory} : connection) =
   let
     val _ = HolbuildOffline.require_online "send an HTTP request"
     val running = ref 0
@@ -303,7 +325,8 @@ fun transfer ({easy, multi, errors} : connection) =
     val _ = loop () handle e => (ignore (multi_remove_handle (multi, easy)); raise e)
     val _ = mcheck "curl_multi_remove_handle" (multi_remove_handle (multi, easy))
   in
-    if !code <> 0 then
+    if !code = CURLE_PEER_FAILED_VERIFICATION andalso no_ca_directory then raise CaDirectoryNeeded
+    else if !code <> 0 then
       Failed (easy_strerror (!code) ^
               (case c_string_at errors of "" => "" | detail => ": " ^ detail))
     else
@@ -325,7 +348,7 @@ fun with_file path mode f =
    to a busy server, isn't cut off.  set_options sets the request's own
    options; the data pointers are cleared afterwards, so the pooled handle
    keeps none of them. *)
-fun request {url, timeout, output, set_options} =
+fun request_once {url, timeout, output, set_options} =
   (HolbuildOffline.require_online "send an HTTP request";
   with_handle (fn connection as {easy, ...} =>
     (check "TIMEOUT" (setopt_long (easy, CURLOPT_TIMEOUT, max_transfer_seconds));
@@ -337,6 +360,12 @@ fun request {url, timeout, output, set_options} =
      transfer connection
      before List.app (fn option => ignore (setopt_ptr (easy, option, Foreign.Memory.null)))
               [CURLOPT_WRITEDATA, CURLOPT_READDATA, CURLOPT_HTTPHEADER])))
+
+(* Verification fails in the TLS handshake, before any data moves, so the
+   request can start again on a handle with libcurl's default CA directory. *)
+fun request args =
+  request_once args
+  handle CaDirectoryNeeded => (clear_ca_directory := false; request_once args)
 
 (* Downloads url into dst, decoding any content encoding. *)
 fun get {url, dst, timeout} =
