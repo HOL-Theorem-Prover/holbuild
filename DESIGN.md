@@ -561,7 +561,12 @@ dependencies), its kernel trace if present, and its declared extra outputs. The
 `Theory.sml`, which the exporter sets to the SHA-1 of the data without the
 parts a proof edit changes (each theorem's dependency record and source
 location, and the parents' hashes), so an edit that changes only proofs leaves
-the digest, and with it every dependent, as it was. Children record that
+the digest, and with it every dependent, as it was. Theory data counts by
+what it says, not by the string-table indices it says it with, which the
+proofs decide: data of a `ThyDataSexp` codec and HOL's own codecs are read
+that way, and a theory carrying data of a codec holbuild doesn't know is
+hashed as written (a warning says so), since its bare integers could be
+indices or integers. Children record that
 literal as the parent's hash and HOL's `link_parents` compares it at load, so
 a kept child still loads after its parent's proof-only edit. The `.dat` bytes
 stay as HOL wrote them, since other tools read the dependency records and

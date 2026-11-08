@@ -62,7 +62,7 @@ struct
           Cons(Symbol t, rest) => if t = tag then rest else fail tag
         | _ => fail tag
   in
-  fun normalized_theory_data data =
+  fun normalized_theory_data {sexp_coded : string -> bool} data =
     let
       val (header, core, incorporate, loadable) =
         case items "theory" data of
@@ -95,8 +95,9 @@ struct
                  class :: private :: _ => List [str i, oracles, class, private, terms]
                | _ => fail "theorem info")
         | thm _ = fail "theorem"
-      (* ThyDataSexp's encoding: shared strings and names by index; a theorem
-         as (tag-th (theory save-index dependencies oracles) terms theory anonymous-index). *)
+      (* ThyDataSexp's encoding: shared strings and names by index, an integer
+         as itself, and a theorem as
+         (tag-th (theory save-index dependencies oracles) terms theory anonymous-index). *)
       fun thydata (Cons(Symbol "tag-str", i as Integer _)) = Cons(Symbol "tag-str", str i)
         | thydata (Cons(Symbol "tag-knm", Cons(i as Integer _, j as Integer _))) =
             Cons(Symbol "tag-knm", Cons(str i, str j))
@@ -104,18 +105,22 @@ struct
                         Cons(Cons(thy, Cons(Integer _, Cons(_, Cons(oracles, Symbol "nil")))),
                              Cons(terms, Cons(saved, Cons(Integer _, Symbol "nil")))))) =
             Cons(Symbol "tag-th", List [thy, oracles, terms, saved])
-        | thydata (Cons(Symbol "tag-ch", code as Integer _)) = Cons(Symbol "tag-ch", code)
         | thydata (Cons(a, b)) = Cons(thydata a, thydata b)
-        | thydata (Integer i) =
-            (* A bare integer is ThyDataSexp's Int, or a shared-string index in a
-               codec of its own (GrammarAncestry writes its theory names so).
-               Read it as the string it would name: a string's index depends on
-               the proofs, and a changed string must not hide behind its index. *)
-            if 0 <= i andalso i < Vector.length string_table
-            then Cons(Symbol "index", String (Vector.sub(string_table, i)))
-            else Integer i
         | thydata atom = atom
-      fun entry (Cons(key, data)) = Cons(key, thydata data)
+      (* GrammarAncestry's: theory names as bare string indices. *)
+      fun indexed (i as Integer _) = str i
+        | indexed (Cons(a, b)) = Cons(indexed a, indexed b)
+        | indexed atom = atom
+      (* A codec of its own writes what it likes, so a bare integer may name
+         a string whose index the proofs decide: only data of a known
+         encoding is normalized, and the rest keeps the theory hashed as
+         written. *)
+      fun entry (Cons(key as String k, data)) =
+            Cons(key,
+                 if sexp_coded k then thydata data
+                 else if k = "GrammarAncestry" then indexed data
+                 else if k = "OpenTheoryMap" orelse k = "TexTokenMap" then data
+                 else raise Fail ("theory data " ^ k ^ " has an encoding holbuild doesn't know"))
         | entry _ = fail "loadable data"
       val loadable' = List (map entry (items "loadable-thydata" (tagged "loadable-thydata" loadable)))
     in
@@ -141,19 +146,21 @@ struct
      of the file when the data has an unexpected shape. *)
   fun theory_data_digest dat_path =
     let
-      fun as_written e =
+      fun as_written why =
         (TextIO.output (TextIO.stdErr,
-                        "holbuild: warning: hashing " ^ dat_path ^ " as written: " ^
-                        General.exnMessage e ^ "\n");
+                        "holbuild: warning: hashing " ^ dat_path ^ " as written: " ^ why ^ "\n");
          SHA1.sha1_file {filename = dat_path})
       (* Not HOLsexp.fromFile: HOLFileSys would remap the path again. *)
       fun read_data () =
         let val input = TextIO.openIn dat_path
         in HOLsexp.fromStream input before TextIO.closeIn input end
+      (* ThyDataSexp.new registers each key's load hook under this name. *)
+      val hooks = map #1 (Listener.listeners Theory.delta_hook)
+      fun sexp_coded key = List.exists (fn h => h = "ThmSetData.onload." ^ key) hooks
     in
-      sha1_string (serialize_sexp (normalized_theory_data (read_data ())))
-      handle e as Fail _ => as_written e
-           | e as Subscript => as_written e
+      sha1_string (serialize_sexp (normalized_theory_data {sexp_coded = sexp_coded} (read_data ())))
+      handle Fail why => as_written why
+           | Subscript => as_written "a string index is out of range"
     end
 
   (* Graph.fringe follows load order.  Canonicalize only the parent header,

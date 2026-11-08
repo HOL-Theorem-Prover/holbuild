@@ -26,18 +26,17 @@ name = "cutoff"
 members = ["src"]
 TOML
 
-# write_a PREFIX PROOF STATEMENT [NOTE]: PREFIX goes before a_thm, which
-# states STATEMENT and is proved by PROOF.  The datatype registers theorems
-# as theory data, whose records the digest normalizes too, and the note is
-# theory data of a codec of A's own, stored as a bare string-table index
-# like GrammarAncestry's theory names.
+# write_a PREFIX PROOF STATEMENT [PRECEDENCE] [NOTE]: PREFIX goes before
+# a_thm, which states STATEMENT and is proved by PROOF.  The datatype
+# registers theorems as theory data, whose records the digest normalizes
+# too, and the fixity a precedence, which is a bare integer there.  A note
+# is theory data of a codec of A's own, stored as a bare string-table index
+# like GrammarAncestry's theory names; holbuild can't tell such an index
+# from an integer, so it hashes a theory with data it doesn't know as written.
 write_a() {
-  cat > "$project/src/AScript.sml" <<SML
-open HolKernel Parse boolLib bossLib;
-val _ = new_theory "A";
-Datatype:
-  color = Red | Green
-End
+  local note=""
+  if [[ -n "${5:-}" ]]; then
+    note=$(cat <<SML
 val (write_note, _) =
   Theory.LoadableThyData.new {
     thydataty = "note", merge = op @, terms = Lib.K [], strings = (fn l => l),
@@ -45,7 +44,18 @@ val (write_note, _) =
     read = fn {strings, ...} => HOLsexp.list_decode (Option.map strings o HOLsexp.int_decode),
     write = fn {strings, ...} => HOLsexp.list_encode (HOLsexp.Integer o strings)
   };
-val _ = Theory.LoadableThyData.set_theory_data {thydataty = "note", data = write_note ["${4:-note}"]};
+val _ = Theory.LoadableThyData.set_theory_data {thydataty = "note", data = write_note ["$5"]};
+SML
+)
+  fi
+  cat > "$project/src/AScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Datatype:
+  color = Red | Green
+End
+val _ = set_fixity "myop" (Infixl ${4:-500});
+$note
 Theorem helper1:
   (1:num) + 1 = 2
 Proof
@@ -145,9 +155,21 @@ SML
   { cat "$tmpdir/run-load.log" >&2; exit 1; }
 require_grep "CTheory loaded" "$tmpdir/run-load.log"
 
-# A change to the note, a string the digest sees only through its index,
+# A precedence change, an integer among the theory data, rebuilds B.
+write_a $'(* a comment\n   of three\n   lines *)' "simp[helper2]" "(1:num) + 1 = 2" 501
+build "$tmpdir/precedence-edit.log"
+require_no_cutoff BTheory "$tmpdir/precedence-edit.log"
+require_grep "BTheory built" "$tmpdir/precedence-edit.log"
+
+# Data of a codec holbuild doesn't know keeps A hashed as written, so a
+# change to the note, which the data stores as a string-table index,
 # rebuilds B.
-write_a $'(* a comment\n   of three\n   lines *)' "simp[helper2]" "(1:num) + 1 = 2" "other"
+write_a $'(* a comment\n   of three\n   lines *)' "simp[helper2]" "(1:num) + 1 = 2" 501 note
+build "$tmpdir/note.log"
+grep -q "ATheory.dat as written: theory data note" "$project"/.holbuild/logs/current/*/ATheory/build.log ||
+  { echo "ATheory's build log has no warning that it is hashed as written" >&2
+    cat "$project"/.holbuild/logs/current/*/ATheory/build.log >&2; exit 1; }
+write_a $'(* a comment\n   of three\n   lines *)' "simp[helper2]" "(1:num) + 1 = 2" 501 other
 build "$tmpdir/note-edit.log"
 require_no_cutoff BTheory "$tmpdir/note-edit.log"
 require_grep "BTheory built" "$tmpdir/note-edit.log"
