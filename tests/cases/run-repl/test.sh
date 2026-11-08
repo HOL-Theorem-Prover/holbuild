@@ -179,3 +179,45 @@ if ! (cd "$no_run_loads" && "$HOLBUILD_BIN" run "$legacy_run_script") > "$legacy
   exit 1
 fi
 require_grep "LEGACY_LAYOUT_LOAD_OK" "$legacy_run_log"
+
+# run builds [run].loads without proof steps, as heap does: a theory built by
+# build --skip-proof-steps is reused, not rebuilt under a step timeout its
+# slow tactic exceeds.
+slow=$tmpdir/slow
+mkdir -p "$slow/src"
+{
+  write_schema2_prelude
+  cat <<'TOML'
+[project]
+name = "slowrun"
+
+[build]
+members = ["src"]
+tactic_timeout = 0.1
+
+[run]
+loads = ["SlowTheory"]
+TOML
+} > "$slow/holproject.toml"
+cat > "$slow/src/SlowScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Slow";
+fun slow_tac g = (OS.Process.sleep (Time.fromReal 0.45); ACCEPT_TAC TRUTH g);
+Theorem slow_thm:
+  T
+Proof
+  slow_tac
+QED
+val _ = export_theory();
+SML
+(cd "$slow" && "$HOLBUILD_BIN" build --skip-proof-steps SlowTheory) > "$tmpdir/slow-build.log" 2>&1 ||
+  { cat "$tmpdir/slow-build.log" >&2; exit 1; }
+printf 'val _ = (SlowTheory.slow_thm; print "SLOW_RUN_OK\\n");\n' > "$tmpdir/slow-run.sml"
+slow_run_log=$tmpdir/slow-run.log
+(cd "$slow" && "$HOLBUILD_BIN" run "$tmpdir/slow-run.sml") > "$slow_run_log" 2>&1 ||
+  { cat "$slow_run_log" >&2; exit 1; }
+require_grep "SLOW_RUN_OK" "$slow_run_log"
+if grep -q "SlowTheory built" "$slow_run_log"; then
+  echo "run rebuilt a theory built by build --skip-proof-steps" >&2
+  exit 1
+fi
