@@ -7949,34 +7949,63 @@ fun toolchain_trash_family () =
                  end)
              (0 : Position.int) (HolbuildHolSharedCache.toolchain_trash ()))}
 
-fun shared_worker_cache_bytes cache =
-  tree_bytes (share_store cache) +
-  tree_bytes (HolbuildCache.theory_modules_dir cache) +
-  List.foldl (fn (path, total) => total + tree_bytes path)
-             (0 : Position.int) (HolbuildHolSharedCache.toolchain_trash ()) +
-  List.foldl (fn (k, total) => total + tree_bytes (HolbuildHolSharedCache.entry_dir_for_key k))
-             (0 : Position.int) (HolbuildHolSharedCache.toolchain_keys ()) +
-  tree_bytes (HolbuildCache.actions_dir cache) + tree_bytes (HolbuildCache.blobs_dir cache)
+(* Follow a configured root alias, but never links found inside its tree. *)
+fun cache_root_bytes path = tree_bytes (FS.fullPath path) handle OS.SysErr _ => 0
+
+fun worker_cache_roots cache =
+  let fun tree path = (path, fn () => cache_root_bytes path)
+  in
+    [tree (share_store cache),
+     (HolbuildHolSharedCache.toolchains_dir (),
+      fn () =>
+        List.foldl (fn (path, total) => total + tree_bytes path)
+                   (0 : Position.int) (HolbuildHolSharedCache.toolchain_trash ()) +
+        List.foldl (fn (k, total) => total + tree_bytes (HolbuildHolSharedCache.entry_dir_for_key k))
+                   (0 : Position.int) (HolbuildHolSharedCache.toolchain_keys ())),
+     tree (HolbuildCache.actions_dir cache), tree (HolbuildCache.blobs_dir cache)]
+  end
+
+fun cache_root_id path =
+  case file_id path of
+      NONE => "-"
+    | SOME (dev, ino) =>
+        SysWord.toString (Posix.FileSys.devToWord dev) ^ ":" ^
+        SysWord.toString (Posix.FileSys.inoToWord ino)
 
 (* Evict least recently used families until the cache leaves reserve_bytes of
    room under limit_bytes. Reuse a recent shared scan only with ample extra
-   headroom; private checkpoints are always measured in this container. *)
+   headroom; private checkpoints and modules are always measured locally. *)
 fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes} =
   let
     val checkpoints = collect_checkpoint_families checkpoint_root
     val checkpoint_bytes = total_checkpoint_bytes checkpoints
+    val private_bytes = checkpoint_bytes + cache_root_bytes (HolbuildCache.theory_modules_dir cache)
+    val roots = worker_cache_roots cache
+    fun root_ids () = map (fn (path, _) => cache_root_id path) roots
+    fun sum sizes = List.foldl (op +) (0 : Position.int) sizes
     val target = limit_bytes - reserve_bytes
     val state_path = Path.concat(HolbuildCache.locks_dir cache, "worker-cache-cap.state")
     val headroom = IntInf.max(reserve_bytes, gb_to_bytes 32)
+    fun parse_sizes [] = SOME []
+      | parse_sizes (id :: bytes :: rest) =
+          (case (IntInf.fromString bytes, parse_sizes rest) of
+               (SOME bytes, SOME entries) => if bytes >= 0 then SOME ((id, bytes) :: entries) else NONE
+             | _ => NONE)
+      | parse_sizes _ = NONE
     fun recent_scan_fits () =
       (case String.tokens Char.isSpace (read_text state_path) of
-           ["holbuild-worker-cache-cap-v1", measured, bytes] =>
-             (case (LargeInt.fromString measured, IntInf.fromString bytes) of
-                  (SOME measured, SOME bytes) =>
+           "holbuild-worker-cache-cap-v2" :: measured :: entries =>
+             (case (LargeInt.fromString measured, parse_sizes entries) of
+                  (SOME measured, SOME entries) =>
                     let val age = Time.toNanoseconds (Time.now ()) - measured
                     in
-                      age >= 0 andalso age < 60000000000 andalso bytes >= 0 andalso
-                      bytes + checkpoint_bytes + headroom <= target
+                      age >= 0 andalso age < 60000000000 andalso length entries = length roots andalso
+                      sum (ListPair.map
+                             (* A private root can differ while its siblings
+                                are shared. Keep their hits without stamp churn. *)
+                             (fn ((path, measure), (id, bytes)) =>
+                                 if cache_root_id path = id then bytes else measure ())
+                             (roots, entries)) + private_bytes + headroom <= target
                     end
                 | _ => false)
          | _ => false)
@@ -8000,13 +8029,16 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
       else
         let
           val measured = Time.toNanoseconds (Time.now ())
-          val shared_bytes = shared_worker_cache_bytes cache
-          val total = shared_bytes + checkpoint_bytes
+          val ids = root_ids ()
+          val sizes = map (fn (_, measure) => measure ()) roots
+          val total = sum sizes + private_bytes
         in
           if total <= target then
-            write_text state_path
-              ("holbuild-worker-cache-cap-v1\n" ^ LargeInt.toString measured ^ "\n" ^
-               IntInf.toString shared_bytes ^ "\n")
+            if ids <> root_ids () then remove_file state_path
+            else write_text state_path
+              ("holbuild-worker-cache-cap-v2\n" ^ LargeInt.toString measured ^ "\n" ^
+               String.concat (ListPair.map (fn (id, bytes) => id ^ " " ^ IntInf.toString bytes ^ "\n")
+                                          (ids, sizes)))
           else
             let
               (* Eviction mixes private and shared families. Do not publish a

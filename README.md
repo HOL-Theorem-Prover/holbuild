@@ -1613,13 +1613,16 @@ tenth of `N`). A theory's checkpoints go together, a toolchain goes with its
 analysers, and a toolchain another holbuild process is using is kept.
 
 Workers sharing a host coordinate sweeps through `<cache root>/locks/gc.lock`;
-share `locks/` along with the cache directories. Private checkpoints are sized
+share `locks/` along with the cache directories. Private checkpoints and theory modules are sized
 on every action. Shared sizes can be reused for up to 60 seconds when the last
 measurement, current checkpoints and an extra cushion of the larger of 32 GiB
 or the reserve still fit under the target. Small caps and caches near their
 target are scanned live. This is a housekeeping limit: shared growth during
 that interval is accounted for at the next scan, rather than reserved on each
-write. Eviction lists are built only when the measured cache exceeds its target.
+write. Each cached root's device and inode must match the measurement; roots
+that differ are sized live, so partial directory sharing remains safe without
+repeatedly replacing a sibling's measurement. Eviction lists are built only
+when the measured cache exceeds its target.
 Unreferenced blobs younger than five minutes are evicted after other families,
 and are still removable if needed to reach the target.
 
