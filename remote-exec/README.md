@@ -187,8 +187,9 @@ workers do when they aren't running HOL:
 
 Workers require Linux on x86_64 or aarch64, Landlock ABI 1 or newer,
 Python 3, pidfds, `/proc` child lists and `libseccomp.so.2` with notification
-support. The supplied image includes the userspace
-dependencies. The container's seccomp profile must permit Landlock and
+support. Root workers need `CAP_SETPCAP` to drop their bounding capabilities
+and lock securebits; non-root workers need no added capabilities. The supplied
+image includes the userspace dependencies. The container's seccomp profile must permit Landlock and
 stacking a notifying seccomp filter. `holbuild sandbox-check` exercises these
 requirements; workers reject a release whose check fails. Releases before
 0.13.56 are rejected because their HOL launch path has no mandatory sandbox.
@@ -214,6 +215,11 @@ bounded process-tree scans rather than one atomic process-group signal; failure
 to complete cleanup fails the action and does not harvest outputs. This does
 not provide resource isolation against fork storms. Unsupported confinement
 fails closed.
+
+The child inherits only executable lookup, locale, timezone, certificate lookup
+and `HOLBUILD_RUN_*` settings. Other operator environment overrides use their
+runtime defaults. Cancellation kills the owned process tree, so buffered log
+tails may be lost. Mediated signals identify the supervisor as their sender.
 
 `--share-heaps` publishes heaps by dependency context and checkpoints by script
 prefix in the remote cache; use it only with a single tenant or trusted cache

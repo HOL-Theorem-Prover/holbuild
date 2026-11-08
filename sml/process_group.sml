@@ -123,6 +123,8 @@ fun mutation_lease_setup NONE = []
 
 (* The watcher closes fd 9: it ignores TERM and can outlive the script by a
    few hundred milliseconds, and must not keep holding the mutation lease. *)
+(* The EXIT trap keeps this shell alive instead of exec'ing its last command;
+   sandbox launchers use that stable shell PID to detect parent death. *)
 fun parent_watch_script parent_pid mutation_lease script =
   String.concatWith "\n"
     (["holbuild_parent=" ^ pid_text parent_pid] @
