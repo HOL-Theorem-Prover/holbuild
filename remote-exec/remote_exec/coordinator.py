@@ -85,6 +85,7 @@ class Settings(BaseSettings):
     database_pool_timeout_s: float = 10.0
     # Burst workers: workers that a scaler starts and stops on top of `warm_workers` always-on ones.
     run_slots: int = Field(default=30, ge=0)
+    run_floor: int = Field(default=0, ge=0)
     warm_workers: int = 0
     max_burst_workers: int = 0
     scale_down_hold_s: float = 900.0
@@ -335,7 +336,7 @@ ORDER BY theory, input_key
 # ranked, each from its own index entries, so a claim reads neither finished batches nor finished actions.
 CLAIM = sa.text("""
 WITH run_capacity AS MATERIALIZED (
-    SELECT :allow_run AND (
+    SELECT 'run' = ANY(CAST(:classes AS text[])) AND (
         SELECT count(*) FROM actions WHERE state = 'running' AND class = 'run'
     ) < :run_slots AS available
 ), ready_batches AS MATERIALIZED (
@@ -345,6 +346,7 @@ WITH run_capacity AS MATERIALIZED (
     FROM batches b
     WHERE b.state = 'running' AND b.id IN (
         SELECT batch_id FROM actions WHERE state = 'ready' AND tier = ANY(CAST(:tiers AS text[]))
+        AND class = ANY(CAST(:classes AS text[]))
         AND (class = 'build' OR (SELECT available FROM run_capacity))
     )
 )
@@ -352,6 +354,7 @@ SELECT a.batch_id, a.input_key, a.spec_sha256, a.theory, b.max_heap_mb
 FROM actions a
 JOIN ready_batches b ON b.id = a.batch_id
 WHERE a.state = 'ready' AND a.tier = ANY(CAST(:tiers AS text[]))
+AND a.class = ANY(CAST(:classes AS text[]))
 AND (a.class = 'build' OR (SELECT available FROM run_capacity))
 ORDER BY
     a.class,
@@ -609,8 +612,23 @@ class Coordinator:
             # A batch's running count and last claim are read without locking its row, so concurrent claims see
             # only each other's committed leases, which at worst lets workers waking together pick the same
             # batch. Locking or updating the batch row here, after the action row, would invert the lock order.
-            params = {"tiers": tiers, "allow_run": False, "run_slots": self.settings.run_slots}
-            row = (await conn.execute(CLAIM, params)).first()
+            params = {"tiers": tiers, "classes": ["build"], "run_slots": self.settings.run_slots}
+            floor = min(self.settings.run_floor, self.settings.run_slots)
+            row = None
+            if floor > 0 and await conn.scalar(
+                sa.text(
+                    "SELECT EXISTS (SELECT 1 FROM actions WHERE state = 'ready' AND class = 'run' "
+                    "AND tier = ANY(CAST(:tiers AS text[]))) AND "
+                    "(SELECT count(*) FROM actions WHERE state = 'running' AND class = 'run') < :floor"
+                ),
+                {"tiers": tiers, "floor": floor},
+            ):
+                # Build claims bypass this lock when the floor is full or no compatible run is ready.
+                # CLAIM rechecks capacity in a fresh snapshot after any preceding run admission commits.
+                await conn.execute(sa.text("SELECT pg_advisory_xact_lock(1752132706, 1)"))
+                row = (await conn.execute(CLAIM, {**params, "classes": ["run"], "run_slots": floor})).first()
+            if row is None:
+                row = (await conn.execute(CLAIM, params)).first()
             if row is None:
                 if self.settings.run_slots == 0 or not await conn.scalar(
                     sa.text(
@@ -624,7 +642,7 @@ class Coordinator:
                 # after the preceding claimant commits, so its running run counts against the cap.
                 # This advisory key is reserved for run admission; no batch writer takes it.
                 await conn.execute(sa.text("SELECT pg_advisory_xact_lock(1752132706, 1)"))
-                row = (await conn.execute(CLAIM, {**params, "allow_run": True})).first()
+                row = (await conn.execute(CLAIM, {**params, "classes": ["build", "run"]})).first()
                 if row is None:
                     return None
             token = uuid4()
