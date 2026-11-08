@@ -77,10 +77,11 @@ require_grep '^failure=internal$' "$tmpdir/setup.result"
 require_grep 'sandbox did not complete cleanup and output validation' "$tmpdir/setup.log"
 # A trusted parent process starts with sentinel credentials in its original
 # environment, so /proc/PID/environ tests the actual leak rather than setenv.
-env REMOTE_EXEC_WORKER_TOKEN=worker-sentinel HOLBUILD_REMOTE_CACHE_CURL_CONFIG="$tmpdir/cache.curl" \
+(cd "$tmpdir" && env REMOTE_EXEC_WORKER_TOKEN=worker-sentinel HOLBUILD_REMOTE_CACHE_CURL_CONFIG=cache.curl \
+  HOLBUILD_COOPERATE_DIR= \
   bash -c 'export HOLBUILD_RUN_PROBE_PID=$$; "$@"' worker \
   env HOLBUILD_CACHE="$tmpdir/worker" "$HOLBUILD_BIN" --max-heap 1024 --remote-cache "$remote_url" \
-  exec-action "$spec" --cache-limit-gb 1000 --result "$tmpdir/result" > "$tmpdir/worker.log" 2>&1 ||
+  exec-action "$spec" --cache-limit-gb 1000 --result "$tmpdir/result") > "$tmpdir/worker.log" 2>&1 ||
   { cat "$tmpdir/worker.log" "$tmpdir/result" >&2; exit 1; }
 require_grep '^status=built$' "$tmpdir/result"
 log=$(sed -n 's/^log=\([^ ]*\) .*/\1/p' "$tmpdir/result")

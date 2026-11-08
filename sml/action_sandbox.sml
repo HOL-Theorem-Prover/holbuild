@@ -161,7 +161,7 @@ fun wrap completed argv =
             "/etc/ssl/certs", "/etc/nsswitch.conf", "/etc/hosts", "/etc/resolv.conf", "/etc/gai.conf"] @
            fields "HOLBUILD_ACTION_READ_DIRS")
         val cache = full (HolbuildCacheConfig.cache_root ())
-        val forbidden =
+        val protected_paths =
           map (fn part => OS.Path.concat (cache, part))
               ["actions", "blobs", "locks", "cooperate", "checkpoint-store", "toolchain-trust"] @
           List.mapPartial
@@ -172,7 +172,11 @@ fun wrap completed argv =
                          String.isPrefix "HOLBUILD_SHARED_" name orelse name = "HOLBUILD_COOPERATE_DIR"
                       then SOME (String.concatWith "=" rest) else NONE
                   | [] => NONE)
-            (Posix.ProcEnv.environ ())
+            (Posix.ProcEnv.environ ()) @
+          (case !(HolbuildMachineMemory.settings) of SOME {dir, ...} => [dir] | NONE => [])
+        val forbidden = List.mapPartial
+          (fn path => if path = "" then NONE else
+             SOME (OS.Path.mkAbsolute {path = path, relativeTo = OS.FileSys.getDir ()})) protected_paths
         fun options flag paths = List.concat (map (fn path => [flag, path]) paths)
       in
         ["python3", "-I", helper ()] @ options "--write" [full root, full checkpoints] @

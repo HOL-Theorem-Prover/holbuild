@@ -9,6 +9,7 @@ from pathlib import Path
 import platform
 import resource
 import runpy
+import select
 import shutil
 import signal
 import threading
@@ -45,6 +46,7 @@ def attack(root: Path, worker: int, secret: Path, shared: Path) -> None:
     sibling = int((root / "future.pid").read_text())
     refuses("future sibling signals", lambda: os.kill(sibling, 0))
     libc = ctypes.CDLL(None, use_errno=True)
+    assert libc.prctl(15, b"\xff-action", 0, 0, 0) == 0  # /proc task names are bytes, not UTF-8.
     for option in (22, (1 << 32) | 22):
         result = libc.prctl(ctypes.c_ulong(option), 2, 0, 0, 0)
         assert result == -1 and ctypes.get_errno() == errno.EPERM, "replacement filter accepted"
@@ -82,8 +84,8 @@ def attack(root: Path, worker: int, secret: Path, shared: Path) -> None:
             pass
     assert not any("lease" in target or "cache.curl" in target or "seccomp" in target
                    for target in descriptors), descriptors
-    status = Path("/proc/self/status").read_text()
-    assert "CapEff:\t0000000000000000" in status
+    status = Path("/proc/self/status").read_bytes()
+    assert b"CapEff:\t0000000000000000" in status
     (root / "ordinary-output").write_text("ok")
     subprocess.run(["/bin/sh", "-c", "echo child > descendant-output"], check=True, cwd=root)
     if prover := os.environ.get("HOLBUILD_RUN_PROVER"):
@@ -96,6 +98,14 @@ def attack(root: Path, worker: int, secret: Path, shared: Path) -> None:
     elapsed = time.monotonic() - started
     assert timeout.returncode == 124 and elapsed < 1.5, (timeout.returncode, elapsed)
     (root / "timeout-seconds").write_text(str(elapsed))
+    zombie = os.fork()
+    if zombie == 0:
+        os.setsid()
+        os._exit(0)
+    os.waitid(os.P_PID, zombie, os.WEXITED | os.WNOWAIT)
+    os.kill(zombie, 0)
+    os.killpg(zombie, 0)
+    os.waitpid(zombie, 0)
     for session in (False, True):
         read_fd, write_fd = os.pipe()
         child = os.fork()
@@ -158,6 +168,7 @@ def worker(helper: Path, root: Path) -> None:
     checkpoints = root / "checkpoints"
     private.mkdir()
     checkpoints.mkdir()
+    (private / "supervisor.pid").write_text(str(os.getpid()))
     shared = root / "shared"
     for directory in ("actions", "blobs", "locks", "cooperate"):
         path = shared / directory
@@ -170,6 +181,12 @@ def worker(helper: Path, root: Path) -> None:
     probe = private / "probe.py"
     probe.write_bytes(Path(__file__).read_bytes())
     module = runpy.run_path(str(helper), run_name="sandbox")
+    if os.environ.get("HOLBUILD_RUN_SLOW_CLEANUP"):
+        finish = module["finish_children"]
+        def slow_cleanup(leader: int) -> int:
+            time.sleep(0.5)
+            return finish(leader)
+        module["run"].__globals__["finish_children"] = slow_cleanup
     linux = module["Linux"]()
     linux.abi = min(linux.abi, 2)  # Exercise the deployed kernel's policy on newer test hosts too.
     # libseccomp 2.5.4 lacks this name even on kernels implementing the call.
@@ -201,6 +218,7 @@ def worker(helper: Path, root: Path) -> None:
             else:
                 raise AssertionError("cancelled descendant survived")
         print("supervisor cancellation reaped detached descendants")
+        (private / "cancel-confirmed").write_text("reaped")
         return
     assert status == 0, status
     assert (private / "ordinary-output").read_text() == "ok"
@@ -311,3 +329,46 @@ if __name__ == "__main__":
                 if cancelled.poll() is None:
                     cancelled.terminate()
                     cancelled.wait(timeout=5)
+
+            outer_root = Path(directory) / "outer-cancel"
+            outer_root.mkdir()
+            with (outer_root / "log").open("w") as log:
+                outer = subprocess.Popen(
+                    ["/bin/sh", "-c", "trap ':' EXIT; \"$@\"", "outer", sys.executable,
+                     __file__, "--worker", sys.argv[1], str(outer_root)],
+                    env={**env, "HOLBUILD_RUN_CANCEL": "1", "HOLBUILD_RUN_SLOW_CLEANUP": "1"},
+                    start_new_session=True, stdout=log, stderr=subprocess.STDOUT,
+                )
+                supervisor = None
+                try:
+                    deadline = time.monotonic() + 10
+                    while not (outer_root / "action/cancel-ready").exists():
+                        assert outer.poll() is None, outer.returncode
+                        assert time.monotonic() < deadline, "outer cancellation action did not start"
+                        time.sleep(0.01)
+                    pid = int((outer_root / "action/supervisor.pid").read_text())
+                    supervisor = os.pidfd_open(pid)
+                    os.killpg(outer.pid, signal.SIGTERM)
+                    time.sleep(0.2)
+                    try:
+                        os.killpg(outer.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    assert not select.select([supervisor], [], [], 0)[0], "outer escalation killed reaper"
+                    assert select.select([supervisor], [], [], 5)[0], "reaper did not finish"
+                    assert (outer_root / "action/cancel-confirmed").read_text() == "reaped"
+                    try:
+                        os.waitpid(pid, 0)  # completion_probe made this driver a subreaper.
+                    except ChildProcessError:
+                        pass
+                finally:
+                    if supervisor is not None:
+                        try:
+                            signal.pidfd_send_signal(supervisor, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        os.close(supervisor)
+                    if outer.poll() is None:
+                        outer.kill()
+                    outer.wait()
+            print("outer cancellation escalation preserved slow descendant cleanup")

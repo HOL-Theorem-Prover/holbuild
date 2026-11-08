@@ -276,13 +276,13 @@ class Policy:
 
 
 def process_info(pid: int) -> tuple[int, int]:
-    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    fields = Path(f"/proc/{pid}/stat").read_bytes().rsplit(b")", 1)[1].split()
     return int(fields[1]), int(fields[2])  # parent PID, process group
 
 
 def thread_group(tid: int) -> int:
-    for line in Path(f"/proc/{tid}/status").read_text().splitlines():
-        if line.startswith("Tgid:"):
+    for line in Path(f"/proc/{tid}/status").read_bytes().splitlines():
+        if line.startswith(b"Tgid:"):
             return int(line.split()[1])
     raise SandboxError("missing process thread group")
 
@@ -295,6 +295,13 @@ class Process:
 
     def alive(self) -> bool:
         return not select.select([self.fd], [], [], 0)[0]
+
+    def exists(self) -> bool:
+        try:
+            self.send(0)  # Includes unreaped zombies, whose PID is still reserved.
+            return True
+        except ProcessLookupError:
+            return False
 
     def send(self, sig: int) -> None:
         signal.pidfd_send_signal(self.fd, sig)
@@ -323,20 +330,20 @@ def descendants() -> dict[int, Process]:
                     continue
                 try:
                     tasks = list(Path(f"/proc/{parent}/task").iterdir())
-                except FileNotFoundError:
+                except (FileNotFoundError, ProcessLookupError):
                     continue
                 children: set[int] = set()
                 for task in tasks:
                     try:
                         children.update(map(int, (task / "children").read_text().split()))
-                    except FileNotFoundError:
+                    except (FileNotFoundError, ProcessLookupError):
                         continue  # thread exited during the scan
                 for pid in children:
                     candidate = None
                     try:
                         candidate = Process(pid, os.pidfd_open(pid), 0)
                         ppid, candidate.group = process_info(pid)
-                        if ppid != parent or not candidate.alive() or (
+                        if ppid != parent or not candidate.exists() or (
                             pinned_parent is not None and not pinned_parent.alive()
                         ):
                             continue
@@ -493,9 +500,9 @@ class SignalBroker:
                 for process in processes.values():
                     try:
                         _, process.group = process_info(process.pid)
-                        if process.alive() and process.group == group:
+                        if process.exists() and process.group == group:
                             selected.append(process)
-                    except FileNotFoundError:
+                    except (FileNotFoundError, ProcessLookupError):
                         pass
                 if not selected:
                     # Probe with signal zero only; never send a real group
@@ -537,6 +544,12 @@ def run(linux: Linux, policy: Policy, argv: list[str]) -> int:
             env[key] = value
     if not argv:
         raise SandboxError("missing action command")
+    parent_fd = os.pidfd_open(os.getppid())
+    # The outer shell's watcher escalates to group SIGKILL after 200 ms.
+    # Keep this trusted reaper outside that group and watch its parent by
+    # pidfd, so cancellation still permits the bounded descendant cleanup.
+    if os.getpgrp() != os.getpid():
+        os.setpgid(0, 0)
     linux.prctl(36, 1)  # PR_SET_CHILD_SUBREAPER
     signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
     previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, signals)
@@ -583,11 +596,12 @@ def run(linux: Linux, policy: Policy, argv: list[str]) -> int:
         poller = select.poll()
         poller.register(wake_read, select.POLLIN)
         poller.register(leader_fd, select.POLLIN)
+        poller.register(parent_fd, select.POLLIN)
         poller.register(parent_socket, select.POLLIN)
         done = False
         while not done:
             for fd, _ in poller.poll():
-                if fd in (wake_read, leader_fd):
+                if fd in (wake_read, leader_fd, parent_fd):
                     done = True
                     break
                 if fd == parent_socket.fileno():
@@ -612,6 +626,7 @@ def run(linux: Linux, policy: Policy, argv: list[str]) -> int:
                 broker.close()
             parent_socket.close()
             os.close(leader_fd)
+            os.close(parent_fd)
             signal.pthread_sigmask(signal.SIG_BLOCK, signals)
             signal.set_wakeup_fd(previous_wakeup)
             for sig, handler in previous_handlers.items():

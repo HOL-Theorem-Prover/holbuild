@@ -217,6 +217,8 @@ fails closed.
 The supervisor confirms cleanup and output validation through a completion
 file outside the child's filesystem grants. Without that confirmation, the
 worker treats the run as an infrastructure failure and publishes no checkpoints.
+The supervisor watches its parent through a pidfd and runs in its own process
+group, so an outer timeout's forced group shutdown does not interrupt cleanup.
 
 HOL toolchain bootstrap executes trusted source. Before using a toolchain,
 workers require its revision to be a commit ancestor of an approved branch.
