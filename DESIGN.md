@@ -680,6 +680,10 @@ an interrupted fallback rebuild should not warn repeatedly about the same known-
 entry. A successful cache hit refreshes the action manifest mtime for retention;
 this avoids relying on filesystem atime policy.
 
+Large theory artifacts are read in 64 KiB pieces to avoid Poly/ML 5.9.2's
+small-heap whole-file allocation failure. Initializer path relocation keeps
+unmatched substring spans rather than allocating a list entry per character.
+
 Cache blobs are materialized by an in-process copy. Reflink clones only help on
 copy-on-write filesystems and cost a `cp` process per blob, which is slower than
 copying small theory files.

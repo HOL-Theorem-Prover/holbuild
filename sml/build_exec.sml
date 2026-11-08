@@ -76,8 +76,17 @@ fun link_or_copy {src, dst} =
   handle HolbuildCache.Error msg => raise Error msg
 
 fun read_text path =
-  let val input = TextIO.openIn path
-  in TextIO.inputAll input before TextIO.closeIn input end
+  let
+    val input = TextIO.openIn path
+    (* inputAll can exhaust Poly/ML 5.9.2's small initial heap on a
+       multi-megabyte artifact; use the plan-record reader's chunk size. *)
+    fun loop pieces =
+      case TextIO.inputN (input, 65536) of
+          "" => String.concat (rev pieces)
+        | piece => loop (piece :: pieces)
+  in loop [] before TextIO.closeIn input
+     handle e => (TextIO.closeIn input; raise e)
+  end
 
 fun write_text path text =
   let
@@ -96,16 +105,17 @@ fun write_text path text =
 fun replace_all needle replacement text =
   let
     val needle_len = size needle
-    val text_len = size text
-    fun loop i acc =
-      if i >= text_len then String.concat (rev acc)
-      else if i + needle_len <= text_len andalso
-              String.substring(text, i, needle_len) = needle then
-        loop (i + needle_len) (replacement :: acc)
-      else
-        loop (i + 1) (String.str (String.sub(text, i)) :: acc)
+    fun loop rest pieces =
+      let val (prefix, suffix) = Substring.position needle rest
+      in
+        if Substring.isEmpty suffix then
+          if null pieces then text else Substring.concat (rev (rest :: pieces))
+        else
+          loop (Substring.triml needle_len suffix)
+               (Substring.full replacement :: prefix :: pieces)
+      end
   in
-    if needle = "" then text else loop 0 []
+    if needle = "" then text else loop (Substring.full text) []
   end
 
 fun rewrite_all replacements text =
