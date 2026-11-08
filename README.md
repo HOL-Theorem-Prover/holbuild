@@ -1694,7 +1694,8 @@ how many they finished.
 
 A theory built here for its current inputs (the worktree's `.holbuild/dep`
 metadata holds its current input key, under a timeout contract at least as
-strict as the one requested) needs no worker, so it isn't checked
+strict as the one requested), or with a valid entry and intact blobs in the
+local cache, needs no worker, so it isn't checked
 against the remote cache and stays out of the batch, even when the remote
 cache lacks it, as when its publish after a local build failed. The workers
 restore from the remote cache what the batch's theories depend on, so when a

@@ -1387,3 +1387,66 @@ require_grep "ExpCmdTheory restored from cache" "$tmpdir/export-remote.log"
 require_grep "exported .* cache action.* to $tmpdir/expcmd.hbx" "$tmpdir/export-remote.log"
 refute_grep "ExpCmdTheory built" "$tmpdir/export-remote.log"
 require_file "$tmpdir/expcmd.hbx"
+
+# A fresh materialization can use local CAS entries without probing HTTP.
+# A worker that needs those entries must still receive them remotely.
+copy_nondet local-cas rxlocalcas
+cat > "$tmpdir/local-cas/src/LocalBaseScript.sml" <<'SML'
+Theory LocalBase
+Ancestors bool
+Theorem local_base: T
+Proof simp[] QED
+SML
+cat > "$tmpdir/local-cas/src/LocalMidScript.sml" <<'SML'
+Theory LocalMid
+Ancestors LocalBase
+Theorem local_mid: T
+Proof ACCEPT_TAC local_base QED
+SML
+in_copy local-cas build LocalMidTheory > "$tmpdir/local-cas-seed.log" 2>&1
+in_copy local-cas clean LocalBaseTheory LocalMidTheory > /dev/null
+: > "$request_log"
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only LocalMidTheory > "$tmpdir/local-cas-restore.log" 2>&1 ||
+  { cat "$tmpdir/local-cas-restore.log" >&2; exit 1; }
+require_grep 'LocalMidTheory restored from cache' "$tmpdir/local-cas-restore.log"
+refute_grep 'remote batch' "$tmpdir/local-cas-restore.log"
+refute_grep ' /ac/\| /cas/' "$request_log"
+
+cat > "$tmpdir/local-cas/src/LocalTopScript.sml" <<'SML'
+Theory LocalTop
+Ancestors LocalMid
+Theorem local_top: T
+Proof ACCEPT_TAC local_mid QED
+SML
+in_copy local-cas clean LocalBaseTheory LocalMidTheory > /dev/null
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only LocalTopTheory > "$tmpdir/local-cas-dependency.log" 2>&1 ||
+  { cat "$tmpdir/local-cas-dependency.log" "$tmpdir/worker.log" >&2; exit 1; }
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/local-cas-dependency.log")
+require_grep '^action .* rxlocalcas:LocalTopTheory$' "$state/$batch.batch"
+refute_grep '^action .* rxlocalcas:LocalBaseTheory$\|^action .* rxlocalcas:LocalMidTheory$' "$state/$batch.batch"
+require_grep 'remote workers finished 1 of 1 theories' "$tmpdir/local-cas-dependency.log"
+
+in_copy local-cas clean LocalMidTheory > /dev/null
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only --force=theory LocalMidTheory > "$tmpdir/local-cas-force.log" 2>&1 ||
+  { cat "$tmpdir/local-cas-force.log" "$tmpdir/worker.log" >&2; exit 1; }
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/local-cas-force.log")
+require_grep '^action .* rxlocalcas:LocalMidTheory$' "$state/$batch.batch"
+
+cat > "$tmpdir/local-cas/src/LocalDetachedScript.sml" <<'SML'
+Theory LocalDetached
+Ancestors bool
+Theorem local_detached: T
+Proof simp[] QED
+SML
+in_copy local-cas build LocalDetachedTheory > "$tmpdir/local-cas-detach-seed.log" 2>&1
+in_copy local-cas clean LocalDetachedTheory > /dev/null
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only --detach LocalDetachedTheory > "$tmpdir/local-cas-detach.log" 2>&1
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/local-cas-detach.log")
+require_grep '^action .* rxlocalcas:LocalDetachedTheory$' "$state/$batch.batch"
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only --attach "$batch" LocalDetachedTheory > "$tmpdir/local-cas-attach.log" 2>&1 ||
+  { cat "$tmpdir/local-cas-attach.log" "$tmpdir/worker.log" >&2; exit 1; }

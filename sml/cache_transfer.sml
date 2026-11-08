@@ -12,7 +12,10 @@ type source =
                   dst : HolbuildCacheBackend.local_path} -> HolbuildCacheBackend.fetch_result }
 
 type destination =
-  { put_action : HolbuildCacheBackend.action_publish_policy ->
+  (* has_blob must establish usable content, not just pathname existence.
+     publish_blob receives a transfer-owned file verified by fetch_blob. *)
+  { has_blob : HolbuildCacheBackend.blob_hash -> bool,
+    put_action : HolbuildCacheBackend.action_publish_policy ->
                  {key : HolbuildCacheBackend.action_key,
                   text : HolbuildCacheBackend.manifest_text} -> HolbuildCacheBackend.publish_result,
     publish_blob : {hash : HolbuildCacheBackend.blob_hash,
@@ -131,7 +134,9 @@ fun out_of_space dir =
 (* A download that filled the disk need not say so (curl reports only a
    failed write, or leaves a short file), and removing it frees the space:
    probe while it is still there. *)
-fun copy_blob source destination tmp_dir hash (uploaded, reused) =
+fun copy_blob source (destination : destination) tmp_dir hash (uploaded, reused) =
+  if #has_blob destination hash then (uploaded, reused + 1)
+  else
   let
     val path = temp_blob_path tmp_dir hash
     val (uploaded', reused') =

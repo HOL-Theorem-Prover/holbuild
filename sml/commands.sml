@@ -2381,8 +2381,9 @@ fun export_archive tc jobs args =
   end
 
 fun fs_cache_destination cache : HolbuildCacheTransfer.destination =
-  {put_action = HolbuildFSCacheBackend.put_action cache,
-   publish_blob = HolbuildFSCacheBackend.publish_blob cache}
+  {has_blob = HolbuildFSCacheBackend.verify_blob cache,
+   put_action = HolbuildFSCacheBackend.put_action cache,
+   publish_blob = HolbuildFSCacheBackend.consume_verified_blob cache}
 
 fun import_archive args =
   case args of

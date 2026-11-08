@@ -2125,8 +2125,9 @@ fun fs_cache_source cache : HolbuildCacheTransfer.source =
    fetch_blob = HolbuildFSCacheBackend.fetch_blob cache}
 
 fun fs_cache_destination cache : HolbuildCacheTransfer.destination =
-  {put_action = HolbuildFSCacheBackend.put_action cache,
-   publish_blob = HolbuildFSCacheBackend.publish_blob cache}
+  {has_blob = HolbuildFSCacheBackend.verify_blob cache,
+   put_action = HolbuildFSCacheBackend.put_action cache,
+   publish_blob = HolbuildFSCacheBackend.consume_verified_blob cache}
 
 (* The HTTP cache has no compare-and-swap operation.  Re-read after each
    authorized replacement and retry a weaker observation, but retain the
@@ -2189,8 +2190,9 @@ fun put_remote_theory_action remote _ (request as {key, text}) =
        | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
 fun remote_cache_destination remote : HolbuildCacheTransfer.destination =
-  {put_action = put_remote_theory_action remote,
-   publish_blob = HolbuildRemoteCache.publish_blob remote}
+  {has_blob = HolbuildRemoteCache.blob_confirmed_present remote,
+   put_action = put_remote_theory_action remote,
+   publish_blob = HolbuildRemoteCache.publish_hashed_blob remote}
 
 fun remote_cache_source_with_action remote key manifest : HolbuildCacheTransfer.source =
   {get_action = fn requested => if requested = key then SOME manifest else HolbuildRemoteCache.get_action remote requested,
@@ -6254,9 +6256,48 @@ fun library_manifest root plan node =
       | HolbuildSourceIndex.TheoryScript => []
   end
 
-fun file_line role path from =
+(* One export can name a shared library thousands of times. Reuse only
+   identities outside the filesystem's racy timestamp window; this table is
+   discarded after export and never substitutes for a planned source hash. *)
+fun export_file_hash () =
+  let
+    val start_ns = Time.toNanoseconds (Time.now ())
+    val hashes = ref (Redblackmap.mkDict String.compare)
+    val mutex = Mutex.mutex ()
+    fun locked f =
+      (Mutex.lock mutex;
+       (f () before Mutex.unlock mutex)
+       handle e => (Mutex.unlock mutex; raise e))
+    fun hash path =
+      case HolbuildStatCache.stat_ident path of
+          NONE => HolbuildHash.file_sha256 path
+        | SOME ident =>
+            let
+              val cached = locked (fn () => Redblackmap.peek (!hashes, path))
+              fun compute () =
+                let val digest = HolbuildHash.file_sha256 path
+                in
+                  case HolbuildStatCache.stat_ident path of
+                      SOME final_ident =>
+                        if not (HolbuildStatCache.same_ident (ident, final_ident)) then
+                          raise Error ("file changed while exporting: " ^ path)
+                        else
+                          (if HolbuildPlanRecord.racy_at start_ns ident then ()
+                           else locked (fn () => hashes := Redblackmap.insert (!hashes, path, (ident, digest)));
+                           digest)
+                    | NONE => raise Error ("file disappeared while exporting: " ^ path)
+                end
+            in
+              case cached of
+                  SOME (recorded, digest) =>
+                    if HolbuildStatCache.same_ident (ident, recorded) then digest else compute ()
+                | NONE => compute ()
+            end
+  in hash end
+
+fun file_line hash_file role path from =
   String.concatWith " "
-    ["file", role, path, HolbuildHash.file_sha256 from, Position.toString (FS.fileSize from)]
+    ["file", role, path, hash_file from, Position.toString (FS.fileSize from)]
 
 fun dep_theory_line root keys token label dep =
   String.concatWith " "
@@ -6271,14 +6312,14 @@ fun bool_option name value = "option " ^ name ^ "=" ^ bool_text value
 
 (* The spec lines that make DEPS available to a worker: each library's
    source, each theory to restore, and each library's load manifest. *)
-fun dependency_spec_lines root plan keys token deps =
+fun dependency_spec_lines hash_file root plan keys token deps =
   let
     val theory_deps = List.filter is_theory_node deps
     val libraries = List.filter (not o is_theory_node) deps
     (* A library's key comes from its planned source hash, which the action
        text doesn't carry, so the file shipped must be the one planned. *)
     fun library_line lib =
-      let val line = file_line "library" (token (library_source_path lib)) (source_file lib)
+      let val line = file_line hash_file "library" (token (library_source_path lib)) (source_file lib)
       in
         if List.nth (String.tokens Char.isSpace line, 3) = HolbuildBuildPlan.source_hash plan lib then line
         else raise Error ("library changed since the build was planned: " ^ source_file lib)
@@ -6293,7 +6334,7 @@ fun dependency_spec_lines root plan keys token deps =
 (* The spec text and the files a worker fetches by content hash for it. *)
 (* A worker saves theorem checkpoints unless the spec says otherwise: a
    spec without the line, as older clients write, means true. *)
-fun action_spec_text {root, plan, keys, action_toolchain_key, runtime, toolchain_line} policy
+fun action_spec_text hash_file {root, plan, keys, action_toolchain_key, runtime, toolchain_line} policy
                      {theorem_checkpoints, forced, skip_checkpoints} (action : theory_action) node action_text =
   let
     val context = #package action ^ ":" ^ #logical action
@@ -6301,9 +6342,9 @@ fun action_spec_text {root, plan, keys, action_toolchain_key, runtime, toolchain
     val source = #source_file action
     val {sig_path, sml_path, data_path} = #outputs action
     val input_lines =
-      map (fn {path, from} => file_line "input" (token path) from) (#inputs action)
+      map (fn {path, from} => file_line hash_file "input" (token path) from) (#inputs action)
     val {library_lines, dep_lines, lib_lines, library_files} =
-      dependency_spec_lines root plan keys token (HolbuildBuildPlan.transitive_project_deps plan node)
+      dependency_spec_lines hash_file root plan keys token (HolbuildBuildPlan.transitive_project_deps plan node)
     val lines =
       [action_spec_header,
        "holbuild-version=" ^ HolbuildVersion.version,
@@ -6315,7 +6356,7 @@ fun action_spec_text {root, plan, keys, action_toolchain_key, runtime, toolchain
        "target " ^ token context,
        String.concatWith " "
          ["source", token (#package action), token (#relative_path action),
-          HolbuildHash.file_sha256 source, Position.toString (FS.fileSize source)]] @
+          hash_file source, Position.toString (FS.fileSize source)]] @
       input_lines @
       library_lines @
       dep_lines @
@@ -6472,7 +6513,7 @@ fun failing_on_pool remote jobs doing items_name pred items =
    first failure the uploads not yet started are skipped, for the caller to
    fall back at once.  A file whose (path, sha256) known holds is taken as
    present; learn is told each sha256 uploaded or found present. *)
-fun upload_spec_files remote jobs {known, learn} files =
+fun upload_spec_files hash_file remote jobs {known, learn} files =
   let
     val upload_failed = ref false
     val failure_mutex = Mutex.mutex ()
@@ -6481,7 +6522,7 @@ fun upload_spec_files remote jobs {known, learn} files =
       handle e => (Mutex.unlock failure_mutex; raise e)
     fun uploaded remote path =
       with_failure_lock (fn () => !upload_failed) orelse
-      (let val hash = HolbuildHash.file_sha256 path
+      (let val hash = hash_file path
        in
          if known (path, hash) then ()
          else (publish_spec_blob remote {hash = hash, path = path}; learn hash)
@@ -6503,6 +6544,7 @@ fun upload_spec_files remote jobs {known, learn} files =
    it and it can't be published from the local cache. *)
 fun export_action_specs (options : build_options) tc project plan toolchain_key jobs {upload, local_resumable, forced, ledger} =
   let
+    val hash_file = export_file_hash ()
     val _ = if upload then HolbuildOffline.require_online "upload action specs" else ()
     val remote =
       case HolbuildRemoteCacheConfig.url () of
@@ -6545,21 +6587,21 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
               | NONE => ())
         actions
     val failing = failing_on_pool remote jobs
-    (* A theory the local build takes as up to date (built here for its
-       current inputs, under a timeout contract as strict as the one
-       requested) needs no worker, so only the others go through the remote
-       cache. *)
+    (* Materialized theories and valid local cache entries need no worker.
+       Dependencies of exported actions still go through the publication
+       pass below: a worker cannot restore from the client's local cache. *)
     fun is_forced (node, action) =
       force_node options project node orelse trace_steps (checkpoint_policy_for_node options project node) orelse
       List.exists (fn key => key = #input_key action) forced
     fun built_here (node, action) =
       local_resumable andalso not (is_forced (node, action)) andalso
-      (case current_metadata (metadata_path project node) of
+      ((case current_metadata (metadata_path project node) of
            SOME text =>
              metadata_input_key_matches (#input_key action) text andalso
              metadata_timeout_satisfies (#allow_cache_timeout_discrepancy options)
                (checkpoint_policy_for_node options project node) node text
          | NONE => false)
+       orelse local_entry_satisfies options project plan node (#input_key action))
     val (here_actions, other_actions) = List.partition built_here actions
     val uncached_actions =
       failing "checking remote cache" "theories" (fn remote => fn (node, action) =>
@@ -6603,7 +6645,7 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
           if HolbuildToolchain.hash_text action_text = #input_key action then ()
           else raise Error ("internal error: action text of " ^ logical_name node ^ " does not hash to its input key")
         val {text, files} =
-          action_spec_text context (checkpoint_policy_for_node options project node)
+          action_spec_text hash_file context (checkpoint_policy_for_node options project node)
             {theorem_checkpoints = checkpoint_target_node options node,
              forced = force_node options project node, skip_checkpoints = #skip_checkpoints options}
             action node action_text
@@ -6625,7 +6667,7 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
     fun is_spec path = String.isPrefix (spec_dir ^ "/") path
     val _ =
       if upload then
-        upload_spec_files remote jobs
+        upload_spec_files hash_file remote jobs
           {known = fn (path, hash) => not (is_spec path) andalso known ("blob " ^ hash),
            learn = fn hash => learn ("blob " ^ hash)}
           (List.concat (map #files exported))
@@ -6910,7 +6952,7 @@ fun plan_runs tc project planned jobs
                   case planned of
                       SOME {plan, keys, ...} =>
                         (name, "context=" ^ name, "context " ^ name,
-                         dependency_spec_lines root plan keys (spec_token name) extras, [],
+                         dependency_spec_lines HolbuildHash.file_sha256 root plan keys (spec_token name) extras, [],
                          List.filter is_theory_node extras)
                     | NONE =>
                         (name, "context=" ^ name, "context " ^ name,
@@ -6931,8 +6973,8 @@ fun plan_runs tc project planned jobs
                   val closure = node :: deps
                   fun in_closure n = List.exists (fn c => HolbuildBuildPlan.key c = HolbuildBuildPlan.key n) closure
                   val extras = List.filter (not o in_closure) (unique_nodes load_closure)
-                  val context_lines = dependency_spec_lines root plan keys token deps
-                  val extra_lines = dependency_spec_lines root plan keys token extras
+                  val context_lines = dependency_spec_lines HolbuildHash.file_sha256 root plan keys token deps
+                  val extra_lines = dependency_spec_lines HolbuildHash.file_sha256 root plan keys token extras
                 in
                   (name, "context=" ^ name ^ "@" ^ #input_key action,
                    dep_theory_line root keys token "context" node,
@@ -6953,7 +6995,7 @@ fun plan_runs tc project planned jobs
             (* The context's key names each script's planned hash, so the
                file shipped must be the one planned. *)
             fun script_line node =
-              let val line = file_line "context-script" (token (library_source_path node)) (source_file node)
+              let val line = file_line HolbuildHash.file_sha256 "context-script" (token (library_source_path node)) (source_file node)
               in
                 if List.nth (String.tokens Char.isSpace line, 3) =
                    HolbuildBuildPlan.source_hash (#plan (the_plan ())) node
@@ -6969,7 +7011,7 @@ fun plan_runs tc project planned jobs
                context_line] @
               library_lines @ dep_lines @ lib_lines @ load_lines @ map script_line theories @
               ["script " ^ script_sha256 ^ " " ^ Position.toString (FS.fileSize script)] @
-              map (fn {rel, path} => file_line "support" rel path) supports @
+              map (fn {rel, path} => file_line HolbuildHash.file_sha256 "support" rel path) supports @
               map run_load_line loads @
               map (fn output => "output " ^ output) outputs @
               (case timeout of SOME seconds => ["option timeout=" ^ Int.toString seconds] | NONE => []) @
@@ -7029,7 +7071,7 @@ fun plan_runs tc project planned jobs
         val _ =
           List.app (fn {run, theories, ...} => refuse run (valOf (List.find is_unavailable theories))) refused
         val written = map (fn {run, write, ...} => (run, write ())) ready
-        val _ = upload_spec_files remote jobs {known = fn _ => false, learn = fn _ => ()}
+        val _ = upload_spec_files HolbuildHash.file_sha256 remote jobs {known = fn _ => false, learn = fn _ => ()}
                     (List.concat (map (#files o #2) written))
       in
         {exported = map (fn (run, {spec_sha256, ...}) => (run, spec_sha256)) written,

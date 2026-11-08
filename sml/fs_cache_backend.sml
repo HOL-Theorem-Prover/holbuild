@@ -169,6 +169,21 @@ fun publish_blob cache {hash, src} =
   handle Error msg => HolbuildCacheBackend.Conflict msg
        | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
+(* Transfer owns src and its source backend verified it before returning Hit.
+   Rename preserves those bytes; a cross-filesystem copy uses the validating
+   publisher instead. Concurrent publishers install the same content hash. *)
+fun consume_verified_blob cache (request as {hash, src}) =
+  let val blob = blob_path cache hash
+  in
+    (ensure_parent blob;
+     FS.rename {old = src, new = blob};
+     HolbuildCacheBackend.Published)
+    handle e as OS.SysErr (_, SOME err) =>
+      if err = Posix.Error.xdev then publish_blob cache request
+      else HolbuildCacheBackend.Conflict (General.exnMessage e)
+  end
+  handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
+
 fun action_lock cache key = Path.concat(locks_dir cache, "action-" ^ key ^ ".lock")
 
 datatype action_lock_handle = ActionLockHandle of HolbuildFileLock.t
