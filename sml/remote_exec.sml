@@ -30,14 +30,15 @@ val connect_timeout_seconds = 10
 val request_max_time_seconds = 60
 (* Waits before each retry of a request the coordinator couldn't answer (a
    submission answered 5xx or 429, an event stream that broke without
-   delivering a state change): doubling up to 8 seconds, a little over three
-   minutes in all, long enough to ride out a coordinator restart such as an
-   image upgrade, or the move to a replacement instance.  Tests shorten them
+   delivering a state change): doubling up to 8 seconds, almost six minutes
+   in all, long enough to ride out a coordinator restart such as an image
+   upgrade (which pulls the new image first), or the move to a replacement
+   instance.  Tests shorten them
    with HOLBUILD_TEST_RETRY_DELAYS, comma-separated seconds. *)
 fun retry_delays_seconds () =
   case OS.Process.getEnv "HOLBUILD_TEST_RETRY_DELAYS" of
       SOME text => List.mapPartial Int.fromString (String.tokens (fn c => c = #",") text)
-    | NONE => [1, 2, 4] @ List.tabulate (23, fn _ => 8)
+    | NONE => [1, 2, 4] @ List.tabulate (43, fn _ => 8)
 
 fun retry_after delay = OS.Process.sleep (Time.fromSeconds (Int.toLarge delay))
 

@@ -1718,7 +1718,7 @@ for either, the build forgets the ledger, and a batch missing a blob
 answered 5xx, as a proxy in front of the coordinator answers while it
 restarts or the coordinator itself answers while it's overloaded, or 429,
 is retried, and an event stream that breaks is reattached; either is given up on once the coordinator stays unavailable for
-a little over three minutes (retries back off to 8 seconds apart). With
+almost six minutes (retries back off to 8 seconds apart). With
 `--remote-only` or `--detach`, which have no local build to fall back to, a
 submission that can't reach the coordinator at all is retried the same way;
 otherwise it builds locally at once. A
