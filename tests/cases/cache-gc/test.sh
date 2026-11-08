@@ -43,6 +43,12 @@ require_grep "removing obsolete directory cache gc lock" "$tmpdir/obsolete-gc.lo
 [[ -f "$obsolete_cache/locks/gc.lock" ]] || { echo "obsolete gc lock directory was not replaced" >&2; exit 1; }
 [[ ! -e "$obsolete_cache/locks/gc.lock.owner" ]] || { echo "obsolete gc lock owner survived" >&2; exit 1; }
 
+# Pause a real migrator on its warning, then replace the old directory with a
+# sibling's held lock. Migration must leave that file and its inode alone.
+if [[ $(uname -s) == Linux ]]; then
+  python3 "$SCRIPT_DIR/migration-race.py" "$HOLBUILD_BIN"
+fi
+
 live_cache=$tmpdir/live-cache
 mkdir -p "$live_cache/locks" "$live_cache/actions" "$live_cache/blobs" "$live_cache/tmp"
 python3 - "$live_cache/locks/gc.lock" "$live_cache/held" <<'PY' &
