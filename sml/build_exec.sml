@@ -7110,7 +7110,7 @@ fun fetch_run remote dir outputs ({name, context, run_key} : run) =
                 [package, theory] => (package, theory)
               | _ => raise Error ("internal error: run context " ^ name)
           val final = Path.concat (Path.concat (dir, package), theory)
-          val tmp = final ^ ".fetch-" ^ LargeInt.toString (SysWord.toLargeInt (Posix.Process.pidToWord (Posix.ProcEnv.getpid ())))
+          val tmp = HolbuildTempPath.near final ".fetch"
           fun fetched (output, hash) =
             HolbuildRemoteCache.fetch_blob remote {hash = hash, dst = Path.concat (tmp, output)} =
             HolbuildCacheBackend.Hit
