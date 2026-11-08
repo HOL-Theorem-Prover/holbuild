@@ -188,6 +188,10 @@ key_c=$(awk '/^[^ ]/ { name = $1 } $1 == "input_key:" && name == "CTheory" { pri
 # A run in a project context: its entry names the context as its parent and
 # holds both outputs, which hold what the script saw.
 read -r run_key spec < <(export_run run.sml --support "$runner/data/conf.txt" --load helperLib run:CTheory)
+require_grep '^context-input-layout=package-v1$' "$remote_root/cas/$spec"
+# Successful runs made before declared-input staging must not be reused.
+old_run_key=$(sed '1,/^run-text$/d; /^context-input-layout=/d' "$remote_root/cas/$spec" | sha256sum | cut -d' ' -f1)
+[[ "$run_key" != "$old_run_key" ]]
 worker run "$spec"
 expect run 0 status=built "input-key=$run_key"
 require_grep '^log=[0-9a-f]\{64\} [0-9]*$' "$tmpdir/run.result"
@@ -234,6 +238,10 @@ require_file "$(ac_file "$run_key2")"
 
 # A run in a toolchain theory's context has no parent.
 read -r hol_key hol_spec < <(export_run hol.sml hol:bool)
+if grep -q '^context-input-layout=' "$remote_root/cas/$hol_spec"; then
+  echo 'a toolchain context changed its input layout key' >&2
+  exit 1
+fi
 worker hol "$hol_spec"
 expect hol 0 status=built "input-key=$hol_key"
 if grep -q '^parent ' "$(ac_file "$hol_key")"; then

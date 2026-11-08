@@ -6955,9 +6955,15 @@ fun plan_runs tc project planned jobs
         val key_line = "context=" ^ name ^
           (case context of ToolchainContext _ => ""
              | PlannedContext node => "@" ^ HolbuildBuildPlan.input_key_for (#keys (the_plan ())) node)
+        val input_layout =
+          case context of
+              PlannedContext node =>
+                if Option.isSome (HolbuildBuildPlan.extra_inputs_key (#plan (the_plan ())) node)
+                then ["context-input-layout=package-v1"] else []
+            | ToolchainContext _ => []
         val run_text =
           String.concatWith "\n"
-            (["holbuild-run-v1", "toolchain=" ^ action_toolchain_key, key_line] @ run_text_tail) ^ "\n"
+            (["holbuild-run-v1", "toolchain=" ^ action_toolchain_key, key_line] @ input_layout @ run_text_tail) ^ "\n"
         val run_key = HolbuildToolchain.hash_text run_text
         fun prepare load_closure =
           let

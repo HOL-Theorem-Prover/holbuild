@@ -196,6 +196,7 @@ for line in lines:
             assert (cas / script_sha).exists(), context
     if context == "spec:CTheory":
         expected = ["holbuild-run-v1", toolchain_key, f"context=spec:CTheory@{key_c}",
+                    "context-input-layout=package-v1",
                     f"script={script_sha}", f"support=data/conf.txt@{conf_sha}",
                     f"load=spec:helperLib@{key_helper}", "load=bossLib",
                     "output=manifest", "output=result"]
@@ -224,6 +225,18 @@ grep -q 'option timeout=60' "$project/.holbuild/run-specs/$(awk '$1 == "spec:CTh
 
 key_of() { awk -v want="$1" '$1 == want { print $2 }' "$2"; }
 c_run_key=$(key_of spec:CTheory "$tmpdir/keys1.txt")
+
+# Input-free project contexts keep the complete pre-staging run text.
+run_export --output result spec:ATheory > "$tmpdir/no-inputs.txt"
+python3 - "$project/.holbuild/run-specs/$(awk '{print $3}' "$tmpdir/no-inputs.txt")" <<'PY'
+import pathlib, sys
+head, text = pathlib.Path(sys.argv[1]).read_text().split("\nrun-text\n", 1)
+context = next(line.split() for line in head.splitlines() if line.startswith("context "))
+script = next(line.split()[1] for line in head.splitlines() if line.startswith("script "))
+expected = ["holbuild-run-v1", text.splitlines()[1],
+            f"context={context[1]}@{context[3]}", f"script={script}", "output=result"]
+assert text == "\n".join(expected) + "\n", text
+PY
 
 # The timeout is no part of the key.
 run_export --support "$runner/data/conf.txt" --load helperLib --load bossLib \

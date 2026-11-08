@@ -1426,6 +1426,7 @@ The spec is written to `.holbuild/run-specs/<spec-sha256>` and uploaded to
 holbuild-run-v1
 toolchain=<semantic toolchain key>
 context=<package>:<logical>@<input_key>   (or context=HOL:<logical>)
+context-input-layout=package-v1          (only contexts declaring extra inputs)
 script=<sha256>
 support=<relpath>@<sha256>                  (sorted)
 load=<package>:<logical>@<input_key>        (a project library; in order)
@@ -1435,7 +1436,9 @@ output=<name>                               (sorted)
 
 The toolchain key fixes HOL's own theories and libraries, so they carry no
 key of their own. Options such as the timeout stay out of the key: a longer
-timeout doesn't make a new run. A run's result is stored, like a theory's,
+timeout doesn't make a new run. The input-layout marker distinguishes runs
+with staged declared inputs from earlier runs that could not read those files.
+Input-free and HOL context run keys are unchanged. A run's result is stored, like a theory's,
 under `ac-key = sha256("holbuild-remote-ac-v1\n" ^ run_key ^ "\n")`.
 
 A run spec names no path on the exporting machine:
