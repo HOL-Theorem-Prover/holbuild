@@ -43,6 +43,32 @@ require_grep "removing obsolete directory cache gc lock" "$tmpdir/obsolete-gc.lo
 [[ -f "$obsolete_cache/locks/gc.lock" ]] || { echo "obsolete gc lock directory was not replaced" >&2; exit 1; }
 [[ ! -e "$obsolete_cache/locks/gc.lock.owner" ]] || { echo "obsolete gc lock owner survived" >&2; exit 1; }
 
+# Pause a real migrator on its warning, then replace the old directory with a
+# sibling's held lock. Migration must leave that file and its inode alone.
+# The PID probe needs the binary itself, not the suite's timing wrapper.
+if [[ $(uname -s) == Linux ]]; then
+  python3 "$SCRIPT_DIR/migration-race.py" "${REAL_HOLBUILD_BIN:-$HOLBUILD_BIN}"
+fi
+
+# Checkpoint-store GC must also respect a worker's shared sweep lock.
+HOLBUILD_ROOT=${HOLBUILD_ROOT:-$(cd "$SCRIPT_DIR/../../.." && pwd)} \
+python3 - "$SCRIPT_DIR/store-lock.sml" "$tmpdir/store-lock-cache" <<'STORELOCK'
+import fcntl, os, pathlib, subprocess, sys
+script, cache = sys.argv[1:]
+root = pathlib.Path(cache)
+family = root / "checkpoint-store/old"
+family.mkdir(parents=True)
+os.utime(family, (1, 1))
+(root / "locks").mkdir()
+with (root / "locks/gc.lock").open("a") as lock:
+    fcntl.lockf(lock, fcntl.LOCK_EX)
+    result = subprocess.run(["poly", "--script", script],
+        env={**os.environ, "HOLBUILD_CACHE": cache}, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert b"store-lock-refused" in result.stdout, "checkpoint-store lock check did not run"
+    assert family.exists(), "checkpoint-store GC removed a family under a held lock"
+STORELOCK
+
 live_cache=$tmpdir/live-cache
 mkdir -p "$live_cache/locks" "$live_cache/actions" "$live_cache/blobs" "$live_cache/tmp"
 python3 - "$live_cache/locks/gc.lock" "$live_cache/held" <<'PY' &

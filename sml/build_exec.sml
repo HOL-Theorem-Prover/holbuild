@@ -807,10 +807,14 @@ fun children dir =
 fun file_size path = FS.fileSize path handle OS.SysErr _ => 0
 
 fun tree_bytes path =
-  if (FS.isLink path handle OS.SysErr _ => false) then 0
-  else if (FS.isDir path handle OS.SysErr _ => false) then
-    List.foldl (fn (child, total) => total + tree_bytes child) (0 : Position.int) (children path)
-  else file_size path
+  let val st = Posix.FileSys.lstat path
+  in
+    if Posix.FileSys.ST.isLink st then 0
+    else if Posix.FileSys.ST.isDir st then
+      List.foldl (fn (child, total) => total + tree_bytes child) (0 : Position.int) (children path)
+    else Posix.FileSys.ST.size st
+  end
+  handle OS.SysErr _ => 0
 
 fun modified_time path = FS.modTime path handle OS.SysErr _ => Time.zeroTime
 
@@ -7830,7 +7834,7 @@ fun classify_run_failure stage log_text oom_before msg =
     else ProofFailure
   end
 
-(* The worker cache cap: one LRU over everything a worker keeps between
+(* The worker cache cap covers everything a worker keeps between
    actions (its checkpoint tree, the toolchains with their analysers, and the
    local cache), swept before each action.  It extends the checkpoint budget
    sweep's family eviction to the whole cache root: a family goes whole, and a
@@ -7838,13 +7842,13 @@ fun classify_run_failure stage log_text oom_before msg =
 (* A family's eviction returns the bytes it freed, or NONE if it was kept. *)
 type cache_family = {mtime : Time.time, evict : unit -> Position.int option}
 
-fun checkpoint_cache_families checkpoint_root =
+fun checkpoint_cache_families families =
   List.map
     (fn ({base, mtime, bytes} : checkpoint_family) =>
         {mtime = mtime,
          evict = fn () => (remove_checkpoint_family_base base;
                            if checkpoint_family_root_exists base then NONE else SOME bytes)})
-    (collect_checkpoint_families checkpoint_root)
+    families
 
 fun toolchain_cache_families () =
   let
@@ -7896,14 +7900,16 @@ fun local_cache_families cache =
            if path_exists dir then NONE
            else SOME (freed + remove_paths (List.concat (map release (Redblackset.listItems blobs))))
          end}
-    (* A blob no entry names, such as a spec's source, goes when it was
-       last used. *)
+    (* An unpublished blob may belong to a sibling's in-flight transfer.
+       Prefer all other families until its five-minute grace has elapsed. *)
     fun orphan_family path = {mtime = modified_time path, evict = fn () => SOME (remove_paths [path])}
     val orphans =
       List.filter (fn path => not (Option.isSome (Redblackmap.peek (!users, Path.file path))))
                   (HolbuildCache.children blobs_dir)
+    val cutoff = Time.-(Time.now (), Time.fromSeconds 300)
+    val (young, old) = List.partition (fn path => Time.>=(modified_time path, cutoff)) orphans
   in
-    List.map orphan_family orphans @ List.map entry_family entries
+    (List.map orphan_family old @ List.map entry_family entries, List.map orphan_family young)
   end
 
 fun store_cache_families cache =
@@ -7915,18 +7921,24 @@ fun store_cache_families cache =
    nothing. *)
 fun gc_checkpoint_store days =
   let
+    val cache = HolbuildCache.cache_root ()
     val cutoff = retention_cutoff days
     fun removable dir = Time.<(modified_time dir, cutoff) andalso store_heap_links dir <= 1
-    val removed =
-      List.foldl
-        (fn (dir, n) =>
-            if removable dir andalso Option.isSome (try_evict_store_family_if (fn () => removable dir) dir)
-            then n + 1 else n)
-        0 (store_families (share_store (HolbuildCache.cache_root ())))
+    fun run () =
+      let
+        val removed =
+          List.foldl
+            (fn (dir, n) =>
+                if removable dir andalso Option.isSome (try_evict_store_family_if (fn () => removable dir) dir)
+                then n + 1 else n)
+            0 (store_families (share_store cache))
+      in
+        (* stderr: gc's stdout is its one summary line. *)
+        if removed = 0 then ()
+        else TextIO.output (TextIO.stdErr, "checkpoint store gc: removed families=" ^ Int.toString removed ^ "\n")
+      end
   in
-    (* stderr: gc's stdout is its one summary line. *)
-    if removed = 0 then ()
-    else TextIO.output (TextIO.stdErr, "checkpoint store gc: removed families=" ^ Int.toString removed ^ "\n")
+    if path_exists (share_store cache) then HolbuildCache.with_lock cache run else ()
   end
 
 (* Factory modules have no on-disk module parents.  Once loaded their code
@@ -7956,26 +7968,70 @@ fun toolchain_trash_family () =
                  end)
              (0 : Position.int) (HolbuildHolSharedCache.toolchain_trash ()))}
 
-fun worker_cache_bytes {cache, checkpoint_root} =
-  total_checkpoint_bytes (collect_checkpoint_families checkpoint_root) +
-  tree_bytes (share_store cache) +
-  tree_bytes (HolbuildCache.theory_modules_dir cache) +
-  List.foldl (fn (path, total) => total + tree_bytes path)
-             (0 : Position.int) (HolbuildHolSharedCache.toolchain_trash ()) +
-  List.foldl (fn (k, total) => total + tree_bytes (HolbuildHolSharedCache.entry_dir_for_key k))
-             (0 : Position.int) (HolbuildHolSharedCache.toolchain_keys ()) +
-  tree_bytes (HolbuildCache.actions_dir cache) + tree_bytes (HolbuildCache.blobs_dir cache)
+(* Follow a configured root alias, but never links found inside its tree. *)
+fun cache_root_bytes path = tree_bytes (FS.fullPath path) handle OS.SysErr _ => 0
+
+fun worker_cache_roots cache =
+  let fun tree path = (path, fn () => cache_root_bytes path)
+  in
+    [tree (share_store cache),
+     (HolbuildHolSharedCache.toolchains_dir (),
+      fn () =>
+        List.foldl (fn (path, total) => total + tree_bytes path)
+                   (0 : Position.int) (HolbuildHolSharedCache.toolchain_trash ()) +
+        List.foldl (fn (k, total) => total + tree_bytes (HolbuildHolSharedCache.entry_dir_for_key k))
+                   (0 : Position.int) (HolbuildHolSharedCache.toolchain_keys ())),
+     tree (HolbuildCache.actions_dir cache), tree (HolbuildCache.blobs_dir cache)]
+  end
+
+fun cache_root_id path =
+  case file_id path of
+      NONE => "-"
+    | SOME (dev, ino) =>
+        SysWord.toString (Posix.FileSys.devToWord dev) ^ ":" ^
+        SysWord.toString (Posix.FileSys.inoToWord ino)
 
 (* Evict least recently used families until the cache leaves reserve_bytes of
-   room under limit_bytes. *)
+   room under limit_bytes. Reuse a recent shared scan only with ample extra
+   headroom; private checkpoints and modules are always measured locally. *)
 fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes} =
   let
-    val families =
-      sort_by_mtime_ascending (fn ({mtime, ...} : cache_family) => mtime)
-        (toolchain_trash_family () :: checkpoint_cache_families checkpoint_root @
-         store_cache_families cache @ module_cache_families cache @
-         toolchain_cache_families () @ local_cache_families cache)
+    fun private_cache () =
+      let val checkpoints = collect_checkpoint_families checkpoint_root
+      in (checkpoints, total_checkpoint_bytes checkpoints +
+                       cache_root_bytes (HolbuildCache.theory_modules_dir cache)) end
+    val roots = worker_cache_roots cache
+    fun root_ids () = map (fn (path, _) => cache_root_id path) roots
+    fun sum sizes = List.foldl (op +) (0 : Position.int) sizes
     val target = limit_bytes - reserve_bytes
+    val state_path = Path.concat(HolbuildCache.locks_dir cache, "worker-cache-cap.state")
+    val headroom = IntInf.max(reserve_bytes, gb_to_bytes 32)
+    fun parse_sizes [] = SOME []
+      | parse_sizes (id :: bytes :: rest) =
+          (case (IntInf.fromString bytes, parse_sizes rest) of
+               (SOME bytes, SOME entries) => if bytes >= 0 then SOME ((id, bytes) :: entries) else NONE
+             | _ => NONE)
+      | parse_sizes _ = NONE
+    fun recent_scan_fits private_bytes =
+      (case String.tokens Char.isSpace (read_text state_path) of
+           "holbuild-worker-cache-cap-v2" :: measured :: entries =>
+             (case (LargeInt.fromString measured, parse_sizes entries) of
+                  (SOME measured, SOME entries) =>
+                    let val age = Time.toNanoseconds (Time.now ()) - measured
+                    in
+                      age >= 0 andalso age < 60000000000 andalso length entries = length roots andalso
+                      sum (ListPair.map
+                             (* A private root can differ while its siblings
+                                are shared. Keep their hits without stamp churn. *)
+                             (fn ((path, measure), (id, bytes)) =>
+                                 if cache_root_id path = id then bytes else measure ())
+                             (roots, entries)) + private_bytes + headroom <= target
+                    end
+                | _ => false)
+         | _ => false)
+      handle IO.Io _ => false
+           | OS.SysErr _ => false
+    fun by_age families = sort_by_mtime_ascending (fn ({mtime, ...} : cache_family) => mtime) families
     fun sweep total remaining =
       if total <= target then total
       else
@@ -7988,11 +8044,54 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
               in
                 sweep (total - Option.getOpt (freed, 0)) rest
               end
-    val after = sweep (worker_cache_bytes {cache = cache, checkpoint_root = checkpoint_root}) families
+    fun scan () =
+      let val (checkpoints, private_bytes) = private_cache ()
+      in
+        if recent_scan_fits private_bytes then ()
+        else
+          let
+            val measured = Time.toNanoseconds (Time.now ())
+            val ids = root_ids ()
+            val sizes = map (fn (_, measure) => measure ()) roots
+            val total = sum sizes + private_bytes
+          in
+            if total <= target then
+              if ids <> root_ids () then remove_file state_path
+              else write_text state_path
+                ("holbuild-worker-cache-cap-v2\n" ^ LargeInt.toString measured ^ "\n" ^
+                 String.concat (ListPair.map (fn (id, bytes) => id ^ " " ^ IntInf.toString bytes ^ "\n")
+                                            (ids, sizes)))
+            else
+              let
+                (* Eviction mixes private and shared families. Do not publish a
+                   shared-byte estimate derived from the mixed freed total. *)
+                val _ = remove_file state_path
+                val (local_families, young_orphans) = local_cache_families cache
+                val families =
+                  by_age (toolchain_trash_family () :: checkpoint_cache_families checkpoints @
+                          store_cache_families cache @ module_cache_families cache @
+                          toolchain_cache_families () @ local_families) @ by_age young_orphans
+                val after = sweep total families
+              in
+                if after <= target then ()
+                else warn ("worker cache holds " ^ gb_decimal_text after ^ " GB of entries in use, over the " ^
+                           gb_decimal_text target ^ " GB left under the cap after its reserve")
+              end
+          end
+      end
   in
-    if after <= target then ()
-    else warn ("worker cache holds " ^ gb_decimal_text after ^ " GB of entries in use, over the " ^
-               gb_decimal_text target ^ " GB left under the cap after its reserve")
+    if recent_scan_fits (#2 (private_cache ())) then ()
+    else
+      let
+        (* gc.lock is also shared by explicit cache gc. The action-root
+           lock lives outside locks/ and can be container-private. *)
+        val lock_path = HolbuildCache.gc_lock_path cache
+        val _ = HolbuildFileLock.remove_obsolete_lock_dir "cache gc" lock_path
+        val lock = HolbuildFileLock.acquire_exclusive_path_wait {path = lock_path}
+      in
+        (scan () before HolbuildFileLock.release lock)
+        handle e => (HolbuildFileLock.release lock; raise e)
+      end
   end
   handle e => warn ("worker cache sweep failed: " ^ General.exnMessage e)
 
