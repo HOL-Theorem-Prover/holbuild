@@ -6955,15 +6955,21 @@ fun plan_runs tc project planned jobs
         val key_line = "context=" ^ name ^
           (case context of ToolchainContext _ => ""
              | PlannedContext node => "@" ^ HolbuildBuildPlan.input_key_for (#keys (the_plan ())) node)
+        val input_layout =
+          case context of
+              PlannedContext node =>
+                if Option.isSome (HolbuildBuildPlan.extra_inputs_key (#plan (the_plan ())) node)
+                then ["context-input-layout=package-v1"] else []
+            | ToolchainContext _ => []
         val run_text =
           String.concatWith "\n"
-            (["holbuild-run-v1", "toolchain=" ^ action_toolchain_key, key_line] @ run_text_tail) ^ "\n"
+            (["holbuild-run-v1", "toolchain=" ^ action_toolchain_key, key_line] @ input_layout @ run_text_tail) ^ "\n"
         val run_key = HolbuildToolchain.hash_text run_text
         fun prepare load_closure =
           let
             (* THEORIES are restored by the worker and have their scripts shipped. *)
             val (context_line, {library_lines, dep_lines, lib_lines, library_files}, load_lines,
-                 theories) =
+                 theories, inputs) =
               case context of
                   ToolchainContext theory =>
                     let
@@ -6974,10 +6980,10 @@ fun plan_runs tc project planned jobs
                           SOME {plan, keys, ...} =>
                             ("context " ^ name,
                              dependency_spec_lines hash_file root plan keys (spec_token name) extras, [],
-                             List.filter is_theory_node extras)
+                             List.filter is_theory_node extras, [])
                         | NONE =>
                             ("context " ^ name,
-                             {library_lines = [], dep_lines = [], lib_lines = [], library_files = []}, [], [])
+                             {library_lines = [], dep_lines = [], lib_lines = [], library_files = []}, [], [], [])
                     end
                 | PlannedContext node =>
                     let
@@ -6990,6 +6996,19 @@ fun plan_runs tc project planned jobs
                         case excluded_reason action node of
                             SOME reason => raise Error ("run-action: " ^ name ^ " can't run remotely: " ^ reason)
                           | NONE => ()
+                      val planned_inputs = List.concat
+                        (map (fn (_, base, decl) =>
+                                map #2 (#files (HolbuildBuildPlan.input_expansion plan base decl)))
+                             (HolbuildBuildPlan.extra_input_decls plan node))
+                      val _ =
+                        if sort_strings (unique_strings planned_inputs) =
+                           sort_strings (unique_strings (map #from (#inputs action))) then ()
+                        else raise Error ("extra input files changed since the build was planned: " ^ name)
+                      val planned_hashes = HolbuildBuildPlan.input_hashes plan
+                      fun planned_hash from =
+                        case List.find (fn (path, _) => path = from) planned_hashes of
+                            SOME (_, hash) => hash
+                          | NONE => raise Error ("extra input was not hashed by the plan: " ^ from)
                       val deps = HolbuildBuildPlan.transitive_project_deps plan node
                       val closure = node :: deps
                       val in_closure = Binaryset.addList (Binaryset.empty String.compare, map HolbuildBuildPlan.key closure)
@@ -7003,7 +7022,12 @@ fun plan_runs tc project planned jobs
                         lib_lines = #lib_lines context_lines @ #lib_lines extra_lines,
                         library_files = #library_files context_lines @ #library_files extra_lines},
                        map (theory_load_spec_line token) (#loads action),
-                       node :: List.filter is_theory_node (deps @ extras))
+                       node :: List.filter is_theory_node (deps @ extras),
+                       map (fn {path, from} =>
+                              {path = normalize_path (String.concatWith "/"
+                                        [".holbuild/action-src", package node, path]),
+                               from = from, hash = planned_hash from})
+                           (#inputs action))
                     end
             fun write () =
               let
@@ -7018,6 +7042,18 @@ fun plan_runs tc project planned jobs
                     then line
                     else raise Error ("theory script changed since the build was planned: " ^ source_file node)
                   end
+                fun input_line {path, from, hash} =
+                  let
+                    val expected = hash
+                    val line = file_line hash_file "input" (token path) from
+                  in
+                    if List.nth (String.tokens Char.isSpace line, 3) = expected then line
+                    else raise Error ("extra input changed since the build was planned: " ^ from)
+                  end
+                val input_lines = unique_strings (map input_line inputs)
+                val input_paths = map (fn line => List.nth (String.tokens Char.isSpace line, 2)) input_lines
+                val _ = if length (unique_strings input_paths) = length input_paths then ()
+                        else raise Error ("run-action: conflicting extra inputs for " ^ name)
                 val lines =
                   [run_spec_header,
                    "holbuild-version=" ^ HolbuildVersion.version,
@@ -7025,7 +7061,7 @@ fun plan_runs tc project planned jobs
                    toolchain_line,
                    "run-key=" ^ run_key,
                    context_line] @
-                  library_lines @ dep_lines @ lib_lines @ load_lines @ map script_line theories @
+                  library_lines @ dep_lines @ lib_lines @ load_lines @ map script_line theories @ input_lines @
                   ["script " ^ script_sha256 ^ " " ^ Position.toString (FS.fileSize script)] @
                   map (fn {rel, path} => file_line hash_file "support" rel path) supports @
                   map run_load_line loads @
@@ -7038,7 +7074,7 @@ fun plan_runs tc project planned jobs
                 val _ = (ensure_dir spec_dir; write_text path text)
               in
                 {spec_sha256 = spec_sha256,
-                 files = script :: map #path supports @ map source_file theories @ library_files @ [path]}
+                 files = script :: map #path supports @ map source_file theories @ library_files @ map #from inputs @ [path]}
               end
           in {theories = theories, write = write} end
       in
@@ -8684,7 +8720,7 @@ type run_spec =
    (* A project context, restored like a dependency. *)
    context_theory : {target : string, stem : string, key : string} option,
    deps : spec_deps,
-   context_scripts : spec_file list,
+   context_scripts : spec_file list, inputs : spec_file list,
    script : {sha256 : string, size : string},
    supports : spec_file list,
    run_loads : string list, outputs : string list, timeout : int option,
@@ -8708,6 +8744,7 @@ fun parse_run_spec text : run_spec =
     val deps = ref []
     val libs = ref []
     val context_scripts = ref []
+    val inputs = ref []
     val supports = ref []
     val run_loads = ref []
     val outputs = ref []
@@ -8731,6 +8768,7 @@ fun parse_run_spec text : run_spec =
             if List.exists (fn k => k = kind) ["theory", "library", "object"] then ()
             else reject_spec ("unknown spec line: " ^ text)
         | ["file", "context-script", path, sha256, size] => push context_scripts (file path sha256 size)
+        | ["file", "input", path, sha256, size] => push inputs (file path sha256 size)
         | ["script", sha256, size] => set script "script" {sha256 = sha256, size = size}
         | ["file", "support", path, sha256, size] => push supports (file path sha256 size)
         | ["run-load", name] => push run_loads name
@@ -8758,7 +8796,7 @@ fun parse_run_spec text : run_spec =
      toolchain = (case !toolchain of SOME t => t | NONE => reject_spec "spec has no toolchain"),
      run_key = value "run-key", context = context, context_theory = context_theory,
      deps = {libraries = rev (!libraries), deps = rev (!deps), libs = rev (!libs)},
-     context_scripts = rev (!context_scripts),
+     context_scripts = rev (!context_scripts), inputs = rev (!inputs),
      script = (case !script of SOME s => s | NONE => reject_spec "spec has no script"),
      supports = rev (!supports), run_loads = rev (!run_loads), outputs = rev (!outputs),
      timeout = !timeout, run_text = run_text}
@@ -8809,7 +8847,23 @@ fun verify_run_spec (spec : run_spec) =
             sha256_text (String.extract (value, size name + 1, NONE))
         | _ => false
     val support_paths = map #path (#supports spec)
+    val input_paths = map #path (#inputs spec)
+    fun source_path path =
+      path = normalize_path path andalso
+      case String.fields (fn c => c = #"/") path of
+          ".holbuild" :: "action-src" :: pkg :: relative => pkg <> "" andalso not (null relative)
+        | _ => false
+    fun check_file ({path, sha256, ...} : spec_file, seen) =
+      case Binarymap.peek (seen, path) of
+          NONE => Binarymap.insert (seen, path, sha256)
+        | SOME previous =>
+            if previous = sha256 then seen
+            else reject_spec ("conflicting files at " ^ path)
   in
+    check (List.all source_path input_paths) "an input is not a canonical action-src path";
+    check (length (unique_strings input_paths) = length input_paths) "duplicate input paths";
+    ignore (List.foldl check_file (Binarymap.mkDict String.compare)
+              (libraries @ #context_scripts spec @ #inputs spec));
     check (#version spec = HolbuildVersion.version)
       ("spec is for holbuild " ^ #version spec ^ ", this is " ^ HolbuildVersion.version);
     check (#runtime spec = runtime_identity ()) "spec is for different holbuild runtime sources";
@@ -8844,7 +8898,7 @@ fun verify_run_spec (spec : run_spec) =
     List.app (fn path => check (not (escapes path)) ("path " ^ path ^ " leaves the action root"))
       (map (#1 o target_name o #target) (deps @ (case #context_theory spec of SOME t => [t] | NONE => [])) @
        map (#1 o target_name o #target) libs @
-       map #path (libraries @ #context_scripts spec) @ support_paths @
+       map #path (libraries @ #context_scripts spec @ #inputs spec) @ support_paths @
        map #stem deps @ map #stem libs @
        (case #context_theory spec of SOME {stem, ...} => [stem] | NONE => []) @
        List.filter (CharVector.exists (fn c => c = #"/")) (List.concat (map #loads libs)))
@@ -8874,7 +8928,7 @@ fun exec_run remote root tc (spec : run_spec) log =
     val files =
       {hash = #sha256 (#script spec), dst = script} ::
       map (fn {path, sha256, ...} => {hash = sha256, dst = Path.concat (src, path)}) (#supports spec) @
-      map (fn {path, sha256, ...} => {hash = sha256, dst = in_root root path}) (#context_scripts spec)
+      map (fn {path, sha256, ...} => {hash = sha256, dst = in_root root path}) (#context_scripts spec @ #inputs spec)
     val deps = run_spec_deps spec
     val _ = hydrate_spec_deps remote root files deps (fn _ => false)
     val _ = (ensure_dir output_dir; ensure_dir scratch)
