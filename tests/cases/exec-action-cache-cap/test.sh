@@ -257,14 +257,14 @@ cp "$state" "$tmpdir/small-state"
 sweep4 100 50
 ! cmp -s "$state" "$tmpdir/small-state" || { echo "increased reserve reused a measurement" >&2; exit 1; }
 cp "$state" "$tmpdir/reserve-state"
-# Old shared data can be removed without dropping the new private checkpoint.
+# Private checkpoint bytes count towards the target, so old shared data is
+# evicted; the private checkpoint itself is cleared after the action anyway.
 at 2000 "$cache4/blobs/first"
 sparse "$cache4/checkpoints/pkg/PrivateScript.deps/key/deps_loaded.save" 97
 sweep4 100 1
 evicted "$state" "the measurement after private checkpoint growth caused eviction"
 evicted "$cache4/blobs/first" "old shared data before a new private checkpoint"
-kept "$cache4/checkpoints/pkg/PrivateScript.deps/key/deps_loaded.save" "the private checkpoint under the target"
-rm "$cache4/checkpoints/pkg/PrivateScript.deps/key/deps_loaded.save"
+evicted "$cache4/checkpoints/pkg/PrivateScript.deps" "private checkpoints after the action"
 sparse "$cache4/blobs/first" 1
 sweep4 100 1
 # Expired, future-dated and malformed state must all fall back to a scan.
