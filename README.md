@@ -84,7 +84,7 @@ The executable includes the Poly/ML runtime, so running it does not require
 an installed Poly/ML. Building HOL toolchains still requires `poly` and
 `polyc`, plus HOL's other build dependencies. Archives include holbuild's
 `LICENSE`, the SML/NJ notice, and Poly/ML's license in `share/holbuild`.
-The same release also offers `polyml-v5.9.2-seq3-source.tar.gz`, the exact
+The same release also offers `polyml-v5.9.2-seq4-source.tar.gz`, the exact
 Poly/ML sources used for both binaries. Poly/ML is built with
 `--disable-shared --without-gmp`; the holbuild sources for rebuilding/relinking
 are available at the release tag.
