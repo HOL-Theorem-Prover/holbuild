@@ -130,7 +130,9 @@ if grep -q '^spec:CTheory ' "$tmpdir/unbuilt.out"; then
   exit 1
 fi
 
-hb build CTheory > /dev/null
+hb build --skip-proof-steps CTheory > /dev/null
+metadata=$project/.holbuild/dep/spec/src/CScript.sml.key
+require_grep '^proof_timeout=none$' "$metadata"
 hb build --dry-run CTheory > "$tmpdir/plan.txt"
 plan_key() {
   awk -v want="$1" '/^[^ ]/ { name = $1 } $1 == "input_key:" && name == want { print $2 }' "$tmpdir/plan.txt"
@@ -138,10 +140,12 @@ plan_key() {
 key_c=$(plan_key CTheory)
 key_helper=$(plan_key helperLib)
 [[ -n "$key_c" && -n "$key_helper" ]] || { cat "$tmpdir/plan.txt" >&2; exit 1; }
+require_grep "^input_key=$key_c$" "$metadata"
 
 run_export --support "$runner/data/conf.txt" --load helperLib --load bossLib \
   --output result --output manifest --option timeout=60 spec:CTheory hol:arithmetic \
   > "$tmpdir/export1.txt"
+require_grep '^proof_timeout=none$' "$metadata"
 
 # Checks the export's specs: each is in the remote CAS under its hash, with
 # every file it names; its run text hashes to its run key, and is the one

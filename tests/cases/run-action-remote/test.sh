@@ -142,11 +142,15 @@ ac_file() {
     "$(printf 'holbuild-remote-ac-v1\n%s\n' "$1" | sha256sum | awk '{ print $1 }')"
 }
 
-# C is built here only: the remote cache lacks it until a run needs it.
-(cd "$project" && "$HOLBUILD_BIN" build CTheory > /dev/null)
+# Untimed root artifacts are valid run contexts. C is built here only:
+# the remote cache lacks it until a run needs it.
+(cd "$project" && "$HOLBUILD_BIN" build --skip-proof-steps CTheory > /dev/null)
+metadata=$project/.holbuild/dep/rr/src/CScript.sml.key
+require_grep '^proof_timeout=none$' "$metadata"
 (cd "$project" && "$HOLBUILD_BIN" build --dry-run CTheory) > "$tmpdir/plan.txt"
 key_c=$(awk '/^[^ ]/ { name = $1 } $1 == "input_key:" && name == "CTheory" { print $2 }' "$tmpdir/plan.txt")
 [[ -n "$key_c" ]] || { cat "$tmpdir/plan.txt" >&2; exit 1; }
+require_grep "^input_key=$key_c$" "$metadata"
 require_no_file "$(ac_file "$key_c")"
 
 # A toolchain context, run and fetched.
@@ -173,6 +177,7 @@ require_file "$(ac_file "$key_c")"
 [[ $(< "$out/rr/CTheory/CONTEXT") == "rr:CTheory@$key_c" ]]
 [[ $(< "$out/rr/CTheory/first") == rr:CTheory ]]
 [[ $(< "$out/rr/CTheory/second") == "$key_c" ]]
+require_grep '^proof_timeout=none$' "$metadata"
 
 # --fetch-only fetches what the cache holds and submits nothing, without a
 # coordinator; what it lacks is missing.
@@ -185,6 +190,7 @@ script other.sml other
 run fetch-missing 0 --fetch-only --script "$runner/other.sml" rr:CTheory
 line fetch-missing rr:CTheory missing > /dev/null
 [[ $(posts) == "$before" ]]
+require_grep '^proof_timeout=none$' "$metadata"
 
 # Outputs that can't be written are an error, not a missing run; every
 # target still gets its line.
@@ -274,6 +280,8 @@ hb build CTheory > "$tmpdir/concurrent-build.log" 2>&1 || {
   cat "$tmpdir/concurrent-build.log" >&2
   exit 1
 }
+require_grep '^proof_timeout=2.5$' "$metadata"
+require_grep "^input_key=$key_c$" "$metadata"
 kill -0 "$run_pid"
 rm "$state/hold"
 wait "$run_pid"
@@ -281,3 +289,7 @@ unset run_pid
 concurrent_key=$(line concurrent rr:CTheory done)
 [[ $(< "$out/rr/CTheory/KEY") == "$concurrent_key" ]]
 [[ $(< "$out/rr/CTheory/first") == rr:CTheory ]]
+
+# Strengthening the build's timeout contract leaves existing run keys valid.
+run fetch-timed 0 --fetch-only --script "$runner/run.sml" rr:CTheory
+[[ $(line fetch-timed rr:CTheory cached) == "$c_run" ]]

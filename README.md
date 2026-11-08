@@ -1848,6 +1848,11 @@ The project write lock covers planning, cache checks, and spec export. It
 is released before submitting or following the batch and fetching outputs,
 so another command can build the same project while the remote run is in flight.
 
+Contexts reuse artifacts built with any proof-step timeout, including
+`build --skip-proof-steps`, in remote, fetch-only and export-only modes.
+`run-action` consumes these artifacts without rechecking proof-step timing;
+ordinary `build` still checks its requested timeout contract.
+
 The targets, the script, its support files, `--load` libraries, outputs,
 timeout and `--closure` are those of `run-action --export-only` (see
 "Exporting script runs for remote execution"), as is the run key: the
