@@ -9,6 +9,10 @@ source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
 cleanup() {
+  if [[ -n "${mutation_pid:-}" ]]; then
+    kill "$mutation_pid" 2>/dev/null || true
+    wait "$mutation_pid" 2>/dev/null || true
+  fi
   if [[ -n "${server_pid:-}" ]]; then
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
@@ -19,7 +23,8 @@ trap cleanup EXIT
 unset HOLBUILD_REMOTE_CACHE_URL
 
 remote_root=$tmpdir/remote
-start_remote_cache_server "$remote_root" "$tmpdir/server"
+control=$tmpdir/control
+start_remote_cache_server "$remote_root" "$tmpdir/server" "$control"
 use_case_cache "$tmpdir/cache"
 
 project=$tmpdir/project
@@ -45,6 +50,12 @@ SML
 cat > "$project/src/helperLib.sml" <<'SML'
 structure helperLib = struct val helper_value = 1 end
 SML
+# Make repeated export hashing observable through the external hasher.
+python3 - "$project/src/helperLib.sml" <<'PY'
+import pathlib, sys
+with pathlib.Path(sys.argv[1]).open("a") as out:
+    out.write("(*" + " " * 70000 + "*)\n")
+PY
 cat > "$project/src/BScript.sml" <<'SML'
 Theory B
 Ancestors A
@@ -216,6 +227,35 @@ run_export --support "$runner/data/conf.txt" --load helperLib --load bossLib \
 [[ $(key_of spec:CTheory "$tmpdir/export2.txt") == "$c_run_key" ]]
 [[ $(awk '{ print $3 }' "$tmpdir/export2.txt") != $(awk '$1 == "spec:CTheory" { print $3 }' "$tmpdir/export1.txt") ]]
 
+# Fetch-only computes identities without export-only library hashes. An
+# export hashes the shared library once across all contexts and uploads.
+real_sha256sum=$(command -v sha256sum)
+mkdir -p "$tmpdir/bin"
+cat > "$tmpdir/bin/sha256sum" <<SH
+#!/bin/sh
+if [ "\$#" = 1 ] && [ "\$1" = "$project/src/helperLib.sml" ]; then
+  echo hash >> "$tmpdir/library-hashes"
+fi
+exec "$real_sha256sum" "\$@"
+SH
+chmod +x "$tmpdir/bin/sha256sum"
+: > "$tmpdir/library-hashes"
+PATH="$tmpdir/bin:$PATH" hb run-action --fetch-only --closure \
+  --script "$runner/run.sml" --load helperLib --output result \
+  --outputs-dir "$tmpdir/fetched" spec:CTheory spec:BTheory spec:CTheory spec:ATheory \
+  > "$tmpdir/fetch.txt"
+[[ ! -s "$tmpdir/library-hashes" ]] || { echo 'fetch-only hashed export libraries' >&2; exit 1; }
+awk '{print $1}' "$tmpdir/fetch.txt" > "$tmpdir/order.txt"
+printf '%s\n' spec:CTheory spec:BTheory spec:ATheory > "$tmpdir/expected-order.txt"
+cmp "$tmpdir/expected-order.txt" "$tmpdir/order.txt"
+PATH="$tmpdir/bin:$PATH" run_export --closure --load helperLib --output result \
+  spec:CTheory spec:BTheory spec:CTheory spec:ATheory > "$tmpdir/shared.txt"
+[[ $(wc -l < "$tmpdir/library-hashes") -eq 1 ]] || {
+  echo 'shared library was hashed more than once during export' >&2; exit 1;
+}
+awk '{print $1}' "$tmpdir/shared.txt" > "$tmpdir/order.txt"
+cmp "$tmpdir/expected-order.txt" "$tmpdir/order.txt"
+
 # A renamed output is a different run.
 run_export --support "$runner/data/conf.txt" --load helperLib --load bossLib \
   --output result --output status spec:CTheory > "$tmpdir/export3.txt"
@@ -272,3 +312,31 @@ for option in --tactic-timeout=5 --proof-scope=all --new-ir; do
   fi
   require_grep 'run-action does not check proof steps' "$tmpdir/proof-option.err"
 done
+
+# A same-size edit with restored mtime between planning and spec writing
+# must still be rejected. Gate the availability lookup after planning.
+touch "$control/action-get-enable"
+run_export --output mutation spec:CTheory > "$tmpdir/mutation.out" 2> "$tmpdir/mutation.err" &
+mutation_pid=$!
+for _ in {1..1000}; do
+  [[ -s "$control/action-get-count" ]] && break
+  sleep 0.01
+done
+[[ -s "$control/action-get-count" ]] || { echo 'export never reached availability check' >&2; exit 1; }
+python3 - "$project/src/AScript.sml" <<'PY'
+import os, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+before = path.stat()
+data = path.read_bytes()
+changed = data.replace(b"a_thm", b"z_thm")
+assert changed != data and len(changed) == len(data)
+path.write_bytes(changed)
+os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+PY
+touch "$control/action-get-release"
+if wait "$mutation_pid"; then
+  echo 'export accepted a context script changed after planning' >&2
+  exit 1
+fi
+mutation_pid=
+require_grep 'theory script changed since the build was planned' "$tmpdir/mutation.err"
