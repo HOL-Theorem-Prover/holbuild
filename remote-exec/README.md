@@ -80,6 +80,7 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_EVENTS_KEEPALIVE_SECONDS` | how long an event stream stays quiet before it sends an empty line | 15 |
 | `REMOTE_EXEC_SWEEP_SECONDS` | period of the sweep (lease expiry, releases, retention, scaling) | 5 |
 | `REMOTE_EXEC_RUN_SLOTS` | fleet-wide running run-action cap; 0 pauses new run claims | 30 |
+| `REMOTE_EXEC_RUN_FLOOR` | running run actions allowed ahead of ready builds, clamped to `REMOTE_EXEC_RUN_SLOTS` | 0 |
 | `REMOTE_EXEC_WARM_WORKERS` | always-on standard-tier workers | 0 |
 | `REMOTE_EXEC_MAX_BURST_WORKERS` | most burst workers to ask for | 0 |
 | `REMOTE_EXEC_SCALE_DOWN_HOLD_S` | how long a higher burst worker count is kept after demand drops | 900 |
@@ -234,9 +235,14 @@ a run batch and cancels its unfinished actions.
   after the cache evicted it reports `input-missing` the same way; any
   `input-missing` result makes the coordinator process that gets it forget
   every entry it found, so its next release asks again.
-- **Claims** take builds before runs across all tiers the worker accepts,
-  then prefer the worker's tier over its `also_claim` tiers, in order. A
-  burst worker takes a standard-tier build before a high-tier run.
+- **Claims** take builds before runs across all tiers the worker accepts
+  by default. To prevent runs from starving behind a continuously ready
+  build queue, set `REMOTE_EXEC_RUN_FLOOR` above 0: while fewer than that
+  many runs are running fleet-wide, a ready run in the worker's accepted
+  tiers takes priority. The floor is clamped to `REMOTE_EXEC_RUN_SLOTS`;
+  above it, builds take priority and runs use idle capacity up to the cap.
+  Within the selected class, claims prefer the worker's tier over its
+  `also_claim` tiers, in order.
   Within each coordinator process, waiting claims prefer standard-primary
   workers for standard work, then hosts in ascending host-id order, with
   FIFO ties. Claims without a host report follow known hosts of the same
@@ -247,8 +253,11 @@ a run batch and cancels its unfinished actions.
   moves running actions nor coordinates host preference across replicas.
   Run admission is serialized across coordinator replicas and permits at
   most `REMOTE_EXEC_RUN_SLOTS` running run actions fleet-wide; 0 pauses new
-  runs without stopping actions already running. Build claims never wait
-  for run admission. Claims select with `FOR UPDATE SKIP LOCKED`,
+  runs without stopping actions already running. An unlocked precheck
+  bypasses run admission when the floor is full or no compatible run is
+  ready, keeping build claims concurrent. Capacity is checked again under
+  the admission lock. Set the floor back to 0 and restart the coordinator
+  to restore strict build priority. Claims select with `FOR UPDATE SKIP LOCKED`,
   write a lease with an expiry and commit; no transaction stays open while
   the worker builds. Among the running batches, the claim picks the one with
   the fewest running actions, then the one that least recently had an action

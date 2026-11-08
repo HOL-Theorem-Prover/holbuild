@@ -770,9 +770,9 @@ async def test_a_waiting_claim_ends_empty_after_its_wait(http: httpx.AsyncClient
     assert (await http.post("/v1/work/claim", json=body, headers=WORKER)).status_code == 422
 
 
-@pytest.mark.parametrize("allow_run", [False, True])
+@pytest.mark.parametrize("classes", [["build"], ["build", "run"], ["run"]])
 async def test_a_claim_reads_no_finished_actions(
-    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any, allow_run: bool
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any, classes: list[str]
 ) -> None:
     """A claim reads the same few pages however many finished actions running and retained batches hold, so
     claims stay cheap on a busy fleet."""
@@ -783,7 +783,7 @@ async def test_a_claim_reads_no_finished_actions(
             await connection.execute(sa.text("ANALYZE"))
             plan = await connection.scalar(
                 sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {coordinator_module.CLAIM.text}"),
-                {"tiers": ["standard"], "allow_run": allow_run, "run_slots": 30},
+                {"tiers": ["standard"], "classes": classes, "run_slots": 30},
             )
             await connection.rollback()
         return plan[0]["Plan"]["Shared Hit Blocks"] + plan[0]["Plan"]["Shared Read Blocks"]
@@ -1356,6 +1356,77 @@ async def test_run_slots_span_batches_and_free_on_completion(http: httpx.AsyncCl
     assert await claim(http) is None
     assert (await complete(http, token, result("a", "built"))).status_code == 200
     await claim_named(http, "c")
+
+
+async def test_run_floor_precedes_builds_then_keeps_the_idle_run_fallback(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.run_floor = 1
+    coordinator.settings.run_slots = 2
+    await submit(http, ["build"])
+    await submit(http, ["run-a", "run-b", "run-c"], **{"class": "run"})
+    token = await claim_named(http, "run-a")
+    await claim_named(http, "build")
+    await claim_named(http, "run-b")
+    assert await claim(http) is None
+    await complete(http, token, result("run-a", "built"))
+    await claim_named(http, "run-c")
+
+
+@pytest.mark.parametrize("run_slots", [0, 2])
+async def test_run_floor_is_clamped_to_run_slots(
+    http: httpx.AsyncClient, coordinator: Coordinator, run_slots: int
+) -> None:
+    coordinator.settings.run_floor = 5
+    coordinator.settings.run_slots = run_slots
+    await submit(http, ["build"])
+    await submit(http, ["run-a", "run-b", "run-c"], **{"class": "run"})
+    for name in ["run-a", "run-b"][:run_slots]:
+        await claim_named(http, name)
+    await claim_named(http, "build")
+    assert await claim(http) is None
+
+
+@pytest.mark.parametrize("floor", [1, 5])
+async def test_concurrent_coordinators_recheck_the_run_floor_under_the_admission_lock(
+    http: httpx.AsyncClient, coordinator: Coordinator, floor: int
+) -> None:
+    coordinator.settings.run_floor = floor
+    coordinator.settings.run_slots = 2
+    replica = Coordinator(coordinator.engine, coordinator.cache, coordinator.settings)
+    await submit(http, [f"build{i}" for i in range(24)])
+    for i in range(4):
+        await submit(http, [f"run{i}"], **{"class": "run"})
+    claims = await asyncio.gather(*((coordinator, replica)[i % 2].claim(["standard"], f"w{i}") for i in range(12)))
+    assert all(c is not None for c in claims)
+    assert sum(c.theory.startswith("pkg:run") for c in claims if c is not None) == min(floor, 2)
+
+
+@pytest.mark.parametrize("runs", ["absent", "other-tier", "floor-full"])
+async def test_run_floor_precheck_keeps_build_claims_off_the_admission_lock(
+    http: httpx.AsyncClient, coordinator: Coordinator, runs: str
+) -> None:
+    coordinator.settings.run_floor = 4
+    if runs != "absent":
+        await submit(http, [f"run{i:03}" for i in range(200)], **{"class": "run"})
+        if runs == "other-tier":
+            async with coordinator.engine.begin() as connection:
+                await connection.execute(sa.text("UPDATE actions SET tier = 'high'"))
+        else:
+            for i in range(4):
+                await claim_named(http, f"run{i:03}")
+    await submit(http, ["build"])
+
+    def before_execute(_: object, __: object, statement: str, *args: object) -> None:
+        assert "pg_advisory_xact_lock" not in statement
+
+    async with coordinator.engine.begin() as blocker:
+        await blocker.execute(sa.text("SELECT pg_advisory_xact_lock(1752132706, 1)"))
+        sa.event.listen(coordinator.engine.sync_engine, "before_cursor_execute", before_execute)
+        try:
+            await asyncio.wait_for(claim_named(http, "build"), 2)
+        finally:
+            sa.event.remove(coordinator.engine.sync_engine, "before_cursor_execute", before_execute)
 
 
 async def test_zero_run_slots_pauses_runs_and_keeps_builds_claimable(
