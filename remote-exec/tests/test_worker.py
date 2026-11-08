@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import tarfile
 import threading
 import time
@@ -44,6 +45,13 @@ RECORD = f"holbuild-action-result-v1\nspec={SPEC}\ninput-key={'6' * 64}\nstatus=
 # A stand-in holbuild source tree: `make bin/holbuild` installs a script that logs its arguments and environment and
 # writes RECORD (or HOLBUILD_FAKE_RECORD) to its --result file, or crashes without one when HOLBUILD_FAKE_CRASH is set.
 FAKE_HOLBUILD = f"""#!/bin/sh
+echo $$ > "$HOLBUILD_FAKE_LOG.pid"
+if [ -n "$HOLBUILD_FAKE_HANG" ]; then
+  trap '' TERM
+  (while :; do sleep 1; done) &
+  echo $! > "$HOLBUILD_FAKE_LOG.child"
+  wait
+fi
 echo "$@" >> "$HOLBUILD_FAKE_LOG"
 env > "$HOLBUILD_FAKE_LOG.env"
 # long enough for a heartbeat at the 1 s interval of a 3 s lease; HOLBUILD_FAKE_LEASE: in a child holding that file
@@ -84,6 +92,10 @@ class Server:
     heartbeats: list[dict[str, object]] = field(default_factory=list)
     unavailable: int = 0  # how many more completes answer 502, as a proxy does while the coordinator restarts
     cut_short: bool = False  # whether /cas/ answers close the connection before the body they announce is sent
+    next_claim: dict[str, object] | None = None
+    claim_started: threading.Event = field(default_factory=threading.Event)
+    hold_claim: threading.Event | None = None
+    protection_reply: dict[str, object] = field(default_factory=dict)
 
 
 @pytest.fixture
@@ -97,8 +109,9 @@ def server() -> Iterator[Server]:
         def reply(self, status: int, body: str = "") -> None:
             self.send_response(status)
             self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body.encode())
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                self.end_headers()
+                self.wfile.write(body.encode())
 
         def do_GET(self) -> None:
             if state.cut_short:
@@ -121,7 +134,11 @@ def server() -> Iterator[Server]:
                 return
             if self.path == "/v1/work/claim":
                 state.claims.append(json.loads(body))
-                return self.reply(204)
+                state.claim_started.set()
+                if state.hold_claim is not None:
+                    state.hold_claim.wait(15)
+                claimed, state.next_claim = state.next_claim, None
+                return self.reply(204) if claimed is None else self.reply(200, json.dumps(claimed))
             if self.path.endswith("/complete"):
                 if state.unavailable > 0:
                     state.unavailable -= 1
@@ -133,7 +150,7 @@ def server() -> Iterator[Server]:
 
         def do_PUT(self) -> None:
             state.protection.append(json.loads(self.body()))
-            self.reply(200, "{}")
+            self.reply(200, json.dumps(state.protection_reply))
 
         def log_message(self, format: str, *args: object) -> None:
             pass
@@ -231,6 +248,137 @@ def worker_args(tmp_path: Path, server: Server, *extra: str) -> argparse.Namespa
 
 def claim() -> dict[str, object]:
     return {"attempt_token": "t1", "spec_sha256": SPEC, "input_key": "6" * 64, "theory": "pkg:A", "lease_s": 3}
+
+
+@contextlib.contextmanager
+def running_worker(tmp_path: Path, server: Server, drain: str) -> Iterator[subprocess.Popen[bytes]]:
+    env = {**os.environ, "REMOTE_EXEC_WORKER_TOKEN": "w", "HOLBUILD_CACHE": str(tmp_path / "cache")}
+    with (tmp_path / "worker.log").open("wb") as log:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "remote_exec.worker", "--coordinator", server.url, "--remote-cache", server.url,
+             "--cache-limit-gb", "50", "--holbuild-releases-dir", str(tmp_path / "releases"),
+             "--holbuild-source-url", f"file://{tmp_path}/holbuild-{{version}}.tar.gz", "--drain-seconds", drain],
+            env=env, stdout=log, stderr=log, start_new_session=True,
+        )
+        try:
+            yield process
+        finally:
+            if process.poll() is None:
+                worker.stop_group(process)
+
+
+def wait_for_file(path: Path) -> None:
+    deadline = time.monotonic() + 10
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert path.exists(), f"worker did not create {path}"
+
+
+@pytest.mark.parametrize(("drain", "expected"), [("5", RECORD), ("0", failed_record(SPEC, "unavailable"))])
+def test_sigterm_finishes_or_releases_the_action_without_claiming_again(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], drain: str, expected: str,
+) -> None:
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+    server.next_claim = claim()
+    with running_worker(tmp_path, server, drain) as process:
+        wait_for_file(logs[1])
+        process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=10) == 0, (tmp_path / "worker.log").read_text()
+    assert server.completed == [expected]
+    assert len(server.claims) == 1
+
+
+def test_sigterm_kills_descendants_that_ignore_term_and_repeated_signals_do_not_reset_the_drain(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+    server.next_claim = claim()
+    monkeypatch.setenv("HOLBUILD_FAKE_HANG", "1")
+    child_file = Path(f"{logs[1]}.child")
+    with running_worker(tmp_path, server, "0.1") as process:
+        wait_for_file(child_file)
+        group = int(Path(f"{logs[1]}.pid").read_text())
+        try:
+            process.send_signal(signal.SIGTERM)
+            time.sleep(0.2)
+            process.send_signal(signal.SIGTERM)
+            assert process.wait(timeout=8) == 0, (tmp_path / "worker.log").read_text()
+            child = Path(f"/proc/{int(child_file.read_text())}/stat")
+            assert not child.exists() or child.read_text().split()[2] == "Z"
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(group, signal.SIGKILL)
+    assert server.completed == [failed_record(SPEC, "unavailable")]
+    assert len(server.claims) == 1
+
+
+def test_sigterm_interrupts_an_idle_long_poll(tmp_path: Path, server: Server) -> None:
+    server.hold_claim = threading.Event()
+    try:
+        with running_worker(tmp_path, server, "0") as process:
+            assert server.claim_started.wait(10)
+            process.send_signal(signal.SIGTERM)
+            assert process.wait(timeout=3) == 0, (tmp_path / "worker.log").read_text()
+        assert server.completed == []
+        assert len(server.claims) == 1
+    finally:
+        server.hold_claim.set()
+
+
+def test_sigterm_interrupts_release_make_and_releases_the_lease(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "making"
+    makefile = f"bin/holbuild:\n\ttouch {marker}\n\tsleep 60\n" + FAKE_MAKEFILE.split("bin/holbuild:\n")[1]
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3", makefile)
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+    server.next_claim = claim()
+    monkeypatch.setenv("ECS_AGENT_URI", server.url)
+    with running_worker(tmp_path, server, "20") as process:
+        wait_for_file(marker)
+        process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=8) == 0, (tmp_path / "worker.log").read_text()
+    assert server.completed == [failed_record(SPEC, "unavailable")]
+    assert server.protection[-1] == {"ProtectionEnabled": False}
+    assert not (tmp_path / "releases/v1.2.3/.complete").exists()
+    assert not logs[1].exists()
+    with (tmp_path / "releases/v1.2.3.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+@pytest.mark.parametrize("field", ["failure", "error"])
+def test_ecs_protection_rejection_in_a_success_response_is_logged(
+    server: Server, capsys: pytest.CaptureFixture[str], field: str,
+) -> None:
+    server.protection_reply = {field: {"Reason": "DEPLOYMENT_BLOCKED"}}
+    Protection(None, server.url).set(enabled=True)
+    assert "DEPLOYMENT_BLOCKED" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("text", ["-1", "nan", "inf"])
+def test_drain_seconds_must_be_finite_and_nonnegative(tmp_path: Path, server: Server, text: str) -> None:
+    with pytest.raises(SystemExit):
+        worker_args(tmp_path, server, f"--drain-seconds={text}")
+
+
+def test_shutdown_while_entering_an_interruptible_wait_does_not_enter_the_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    drain = worker.Drain()
+    is_set = drain.stop.is_set
+
+    def check() -> bool:
+        stopped = is_set()
+        if not stopped:
+            drain.request()
+        return stopped
+
+    monkeypatch.setattr(drain.stop, "is_set", check)
+    with pytest.raises(worker.DrainStopped), drain.interruptible():
+        pytest.fail("entered a blocking call after shutdown")
+    assert not drain.interrupt
 
 
 @pytest.mark.parametrize(
@@ -347,13 +495,15 @@ def test_worker_waits_before_claiming_again_after_the_cache_was_unavailable(
             raise KeyboardInterrupt from None
 
     monkeypatch.setattr(worker, "run_one", run)
-    monkeypatch.setattr(worker.time, "sleep", lambda seconds: events.append(f"sleep {seconds}"))
+    drain = worker.Drain()
+    monkeypatch.setattr(drain.stop, "wait", lambda seconds: events.append(f"wait {seconds}"))
+    monkeypatch.setattr(worker, "Drain", lambda *_: drain)
 
     with pytest.raises(KeyboardInterrupt):
         worker.main()
 
     # Only the unavailable action is followed by a wait.
-    assert events == ["claim", f"sleep {worker.CLAIM_RETRY_SECONDS}", "claim", "claim", "claim"]
+    assert events == ["claim", f"wait {worker.CLAIM_RETRY_SECONDS}", "claim", "claim", "claim"]
 
 
 def test_action_that_ends_without_a_record_is_reported_for_a_retry(

@@ -14,6 +14,7 @@ import fcntl
 import http.client
 import itertools
 import json
+import math
 import os
 import re
 import shlex
@@ -63,6 +64,73 @@ COORDINATOR_ERRORS = (OSError, RuntimeError, http.client.HTTPException, ValueErr
 COMPLETE_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0)
 
 
+class DrainStopped(BaseException):
+    """Stop an idle wait or preparation without treating shutdown as an action failure."""
+
+
+class Drain:
+    """One SIGTERM stops claims and gives the running action a fixed grace period."""
+
+    def __init__(self, seconds: float = 20) -> None:
+        self.seconds = seconds
+        self.stop = threading.Event()
+        self.wake = threading.Event()
+        self.deadline: float | None = None
+        self.interrupt = False
+
+    def request(self, *_: object) -> None:
+        if self.deadline is not None:
+            return
+        self.deadline = time.monotonic() + self.seconds
+        self.stop.set()
+        self.wake.set()
+        if self.interrupt:
+            self.interrupt = False
+            raise DrainStopped
+
+    def remaining(self) -> float:
+        return float("inf") if self.deadline is None else max(0.0, self.deadline - time.monotonic())
+
+    @contextlib.contextmanager
+    def interruptible(self) -> Iterator[None]:
+        """Interrupt a blocking leaf call; cleanup outside this scope cannot be interrupted."""
+        try:
+            self.interrupt = True
+            if self.stop.is_set():
+                raise DrainStopped
+            yield
+        finally:
+            self.interrupt = False
+
+    @contextlib.contextmanager
+    def installed(self) -> Iterator[None]:
+        previous = signal.signal(signal.SIGTERM, self.request)
+        try:
+            yield
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+
+
+def stop_group(process: subprocess.Popen[Any]) -> None:
+    """Terminate and reap our session, including descendants that outlive its leader."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        process.wait()
+        return
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        process.poll()
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+    process.wait()
+
+
 class ClaimRefused(RuntimeError):
     """The coordinator answered a claim with an error status."""
 
@@ -87,10 +155,11 @@ class Coordinator:
 
     opener = urllib.request.build_opener(NoRedirect)
 
-    def __init__(self, url: str, token: str, host: "HostTelemetry | None" = None) -> None:
+    def __init__(self, url: str, token: str, host: "HostTelemetry | None" = None, drain: Drain | None = None) -> None:
         self.url = url.rstrip("/")
         self.token = token
         self.host = host
+        self.drain = drain or Drain()
 
     def post(self, path: str, body: bytes, content_type: str, timeout: float = 30) -> tuple[int, Any]:
         request = urllib.request.Request(
@@ -100,11 +169,21 @@ class Coordinator:
             headers={"Authorization": f"Bearer {self.token}", "Content-Type": content_type},
         )
         try:
-            with self.opener.open(request, timeout=timeout) as response:
-                payload = response.read()
-                return response.status, json.loads(payload) if payload else None
+            if path == "/v1/work/claim":
+                with self.drain.interruptible():
+                    response = self.opener.open(request, timeout=timeout)
+            else:
+                response = self.opener.open(request, timeout=timeout)
         except urllib.error.HTTPError as error:
-            return error.code, error.read().decode(errors="replace")
+            response = error
+        with response:
+            # Long-poll timeout applies to headers only; a partially sent claim must not strand shutdown.
+            http_response = response.fp if isinstance(response, urllib.error.HTTPError) else response
+            http_response.fp.raw._sock.settimeout(min(timeout, 5))
+            payload = response.read()
+            if isinstance(response, urllib.error.HTTPError):
+                return response.code, payload.decode(errors="replace")
+            return response.status, json.loads(payload) if payload else None
 
     def post_reporting(self, path: str, body: dict[str, Any], timeout: float = 30) -> tuple[int, Any]:
         """``post`` a JSON body with the host's report in it, or none when there is none."""
@@ -124,7 +203,7 @@ class Coordinator:
         return response
 
     def heartbeat(self, token: str) -> bool:
-        status, body = self.post_reporting(f"/v1/work/{token}/heartbeat", {})
+        status, body = self.post_reporting(f"/v1/work/{token}/heartbeat", {}, timeout=5)
         if status not in (200, 409):
             raise RuntimeError(f"heartbeat answered {status}: {body}")
         return status == 200
@@ -135,8 +214,12 @@ class Coordinator:
         deadline = time.monotonic() + retry_s
         delays = itertools.chain(COMPLETE_RETRY_DELAYS, itertools.repeat(COMPLETE_RETRY_DELAYS[-1]))
         while True:
+            effective = deadline if self.drain.deadline is None else min(deadline, self.drain.deadline + 7)
             try:
-                status, body = self.post(f"/v1/work/{token}/complete", record.encode(), "text/plain")
+                status, body = self.post(
+                    f"/v1/work/{token}/complete", record.encode(), "text/plain",
+                    min(5.0, max(0.1, effective - time.monotonic())),
+                )
             except COORDINATOR_ERRORS as error:
                 status, body = None, error
             if status == 200:
@@ -146,10 +229,14 @@ class Coordinator:
                 return
             failure = f"complete failed: {body}" if status is None else f"complete answered {status}: {body}"
             delay = next(delays)
-            if (status is not None and status < 500) or time.monotonic() + delay > deadline:
+            effective = deadline if self.drain.deadline is None else min(deadline, self.drain.deadline + 7)
+            if (status is not None and status < 500) or time.monotonic() + delay > effective:
                 raise RuntimeError(failure)
             print(f"{failure}; retrying in {delay:g} s", file=sys.stderr)
-            time.sleep(delay)
+            if self.drain.stop.is_set():
+                time.sleep(delay)
+            else:
+                self.drain.stop.wait(delay)
 
 
 class Protection:
@@ -160,10 +247,10 @@ class Protection:
         self.command = command
         self.ecs_agent_uri = ecs_agent_uri
 
-    def set(self, *, enabled: bool) -> None:
+    def set(self, *, enabled: bool, timeout: float = 30) -> None:
         try:
             if self.command is not None:
-                subprocess.run([*shlex.split(self.command), "on" if enabled else "off"], check=True, timeout=60)
+                subprocess.run([*shlex.split(self.command), "on" if enabled else "off"], check=True, timeout=timeout)
             elif self.ecs_agent_uri is not None:
                 body: dict[str, Any] = {"ProtectionEnabled": enabled}
                 if enabled:
@@ -174,8 +261,10 @@ class Protection:
                     method="PUT",
                     headers={"Content-Type": "application/json"},
                 )
-                with urllib.request.urlopen(request, timeout=30):
-                    pass
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    payload = json.load(response)
+                if failure := payload.get("failure") or payload.get("error"):
+                    raise RuntimeError(str(failure))
         except Exception as error:  # noqa: BLE001  # protection is best effort and must never stop an action
             print(f"setting scale-in protection to {enabled} failed: {error}", file=sys.stderr)
 
@@ -190,6 +279,7 @@ class Releases:
     remote_cache: str
     curl_config: str | None
     joining: bool = field(default=False, kw_only=True)
+    drain: Drain = field(default_factory=Drain, kw_only=True, compare=False)
 
     def spec_version(self, spec_sha256: str) -> str:
         """The ``holbuild-version`` of the action spec stored in the remote cache's ``/cas/``."""
@@ -211,9 +301,10 @@ class Releases:
                 raise RuntimeError(missing)
             # Not check=True: its error would print credentials in the command line.
             try:
-                fetched = subprocess.run(
-                    [*command, f"{node}/cas/{spec_sha256}"], check=False, capture_output=True, text=True, timeout=120
-                )
+                with self.drain.interruptible():
+                    fetched = subprocess.run(
+                        [*command, f"{node}/cas/{spec_sha256}"], check=False, capture_output=True, text=True, timeout=120
+                    )
             except subprocess.TimeoutExpired:
                 unavailable = f"fetching spec {spec_sha256} from the remote cache timed out"
                 continue
@@ -253,7 +344,8 @@ class Releases:
             return executable
         os.makedirs(self.root, exist_ok=True)
         with open(os.path.join(self.root, f"v{version}.lock"), "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            with self.drain.interruptible():
+                fcntl.flock(lock, fcntl.LOCK_EX)
             if not os.path.exists(os.path.join(directory, COMPLETE)):
                 self._build(version, directory)
         return executable
@@ -266,7 +358,11 @@ class Releases:
         with tempfile.TemporaryDirectory(dir=self.root) as scratch:
             archive = os.path.join(scratch, "source.tar.gz")
             try:
-                with urllib.request.urlopen(url, timeout=300) as response, open(archive, "wb") as file:
+                with (
+                    self.drain.interruptible(),
+                    urllib.request.urlopen(url, timeout=300) as response,
+                    open(archive, "wb") as file,
+                ):
                     shutil.copyfileobj(response, file)
             except urllib.error.HTTPError as error:
                 if error.code == 404:
@@ -276,11 +372,19 @@ class Releases:
                 if isinstance(error.reason, FileNotFoundError):
                     raise Unreleased(f"holbuild {version} has no release at {url}") from error
                 raise
-            with tarfile.open(archive) as tar:
+            with self.drain.interruptible(), tarfile.open(archive) as tar:
                 tar.extractall(scratch, filter="data")
             (top,) = [entry for entry in os.listdir(scratch) if entry != "source.tar.gz"]
             os.rename(os.path.join(scratch, top), directory)
-        subprocess.run(["make", "bin/holbuild"], cwd=directory, check=True, stdout=2)
+        if self.drain.stop.is_set():
+            raise DrainStopped
+        process = subprocess.Popen(["make", "bin/holbuild"], cwd=directory, stdout=2, start_new_session=True)
+        try:
+            with self.drain.interruptible():
+                if process.wait() != 0:
+                    raise subprocess.CalledProcessError(process.returncode, process.args)
+        finally:
+            stop_group(process)
         with open(os.path.join(directory, COMPLETE), "w"):
             pass
 
@@ -364,18 +468,23 @@ def child_charge(max_heap: int | None) -> int:
     return min(max_heap or DEFAULT_CHARGE_MIB, DEFAULT_CHARGE_MIB) * MIB
 
 
-def wait_for_memory(directory: str, charge: int) -> bool:
+def wait_for_memory(directory: str, charge: int, drain: Drain | None = None) -> bool:
     """Return once holbuild's admission in ``directory`` would start a child charged ``charge`` bytes, so that a
     worker on a host whose memory is taken doesn't claim an action only to wait on it while other hosts could run it.
     A check, not a reservation: workers racing past it still wait in exec-action's own admission.
 
     Returns whether it waited."""
     logged = False
+    if drain is not None and drain.stop.is_set():
+        return False
     while (why := HostMemory.read(directory).shortfall(charge)) is not None:
         if not logged:
             print(f"waiting for memory before claiming: {why}", file=sys.stderr, flush=True)
             logged = True
-        time.sleep(MEMORY_POLL_SECONDS)
+        if drain is None:
+            time.sleep(MEMORY_POLL_SECONDS)
+        elif drain.stop.wait(MEMORY_POLL_SECONDS):
+            break
     return logged
 
 
@@ -576,15 +685,17 @@ class Lease:
     def held(self, phases: Phases) -> Iterator["Lease"]:
         """Holds the lease, adding the time taking and giving it up blocks for to ``phases``' ``lease``."""
         with phases.timed("lease"):
-            self.protection.set(enabled=True)
+            if not self.coordinator.drain.stop.is_set():
+                self.protection.set(enabled=True, timeout=5)
             self.thread.start()
         try:
             yield self
         finally:
             self.done.set()
             with phases.timed("lease"):
-                self.thread.join()
-                self.protection.set(enabled=False)
+                deadline = self.coordinator.drain.deadline
+                self.thread.join(timeout=None if deadline is None else max(0.0, deadline + 7 - time.monotonic()))
+                self.protection.set(enabled=False, timeout=30 if deadline is None else 2)
 
     def _beat(self) -> None:
         while not self.done.wait(self.interval):
@@ -596,8 +707,10 @@ class Lease:
             if not alive:
                 print("lease lost; stopping the action", file=sys.stderr)
                 self.lost.set()
+                self.coordinator.drain.wake.set()
                 return
-            self.protection.set(enabled=True)
+            if not self.done.is_set() and not self.coordinator.drain.stop.is_set():
+                self.protection.set(enabled=True, timeout=5)
 
 
 def claim_reporting(
@@ -614,6 +727,8 @@ def claim_reporting(
         if not isinstance(error, ClaimRefused):
             phases.put_back(report)
         return None
+    except DrainStopped:
+        return None
 
 
 def run_one(
@@ -629,6 +744,8 @@ def run_one(
     claims again. True when exec-action reported the remote cache ``unavailable``, after which ``main`` waits too."""
     token = claim["attempt_token"]
     spec = claim["spec_sha256"]
+    drain = coordinator.drain
+    releases = replace(releases, drain=drain)
     print(f"running {claim['theory']} ({claim['input_key']})", file=sys.stderr, flush=True)
     with Lease(coordinator, token, claim["lease_s"], protection).held(phases) as lease:
         try:
@@ -655,14 +772,24 @@ def execute(
 ) -> str | None:
     """The result record of the claimed action, or None once its lease is lost."""
     spec = claim["spec_sha256"]
+    drain = releases.drain
+    if drain.stop.is_set():
+        return failed_record(spec, "unavailable")
     try:
         with phases.timed("release"):
-            holbuild = releases.holbuild(releases.spec_version(spec))
+            version = releases.spec_version(spec)
+            if drain.stop.is_set():
+                return failed_record(spec, "unavailable")
+            holbuild = releases.holbuild(version)
+    except DrainStopped:
+        return failed_record(spec, "unavailable")
     except Unreleased as error:
         print(f"refusing {spec}: {error}", file=sys.stderr)
         return failed_record(spec, "spec-rejected")
     if lease.lost.is_set():
         return None
+    if drain.stop.is_set():
+        return failed_record(spec, "unavailable")
     with tempfile.TemporaryDirectory() as scratch:
         result = os.path.join(scratch, "result")
         # Its own session, so a lost lease stops holbuild's HOL children with it.
@@ -674,21 +801,23 @@ def execute(
             env=exec_action_env(),
             start_new_session=True
         )
+        drained_out = False
         try:
             while process.poll() is None:
-                if lease.lost.wait(1):
+                if lease.lost.is_set():
                     return None
+                if drain.remaining() == 0:
+                    drained_out = process.poll() is None
+                    break
+                drain.wake.clear()
+                drain.wake.wait(min(1.0, drain.remaining()))
                 if cooperate_dir is not None:
                     hol = runs_hol(process.pid, cooperate_dir)
                     now = time.monotonic()
                     spans.step(now - stepped, hol=hol)
                     stepped = now
         finally:
-            # A lost lease, Ctrl-C or SIGTERM (see main) stops the action rather than leaving it running
-            # unreported. The group outlives holbuild while a HOL child is still in it.
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGTERM)
-            process.wait()
+            stop_group(process)
             if cooperate_dir is None:
                 phases.add("exec", time.monotonic() - stepped)
             else:
@@ -696,6 +825,8 @@ def execute(
                 phases.add("before_hol", spans.before_hol)
                 phases.add("hol", spans.hol)
                 phases.add("after_hol", spans.after_hol)
+        if drained_out:
+            return failed_record(spec, "unavailable")
         if not os.path.exists(result) or os.path.getsize(result) == 0:
             raise RuntimeError(f"exec-action exited {process.returncode} without a result record")
         with open(result) as file:
@@ -716,6 +847,13 @@ def claim_wait_seconds(text: str) -> float:
     seconds = float(text)
     if not 0 <= seconds <= 50:
         raise argparse.ArgumentTypeError(f"{text} is not between 0 and 50")
+    return seconds
+
+
+def drain_seconds(text: str) -> float:
+    seconds = float(text)
+    if not math.isfinite(seconds) or seconds < 0:
+        raise argparse.ArgumentTypeError(f"{text} must be finite and nonnegative")
     return seconds
 
 
@@ -754,6 +892,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "finishes, to keep a scaler from stopping a busy worker",
     )
     parser.add_argument("--name", default=f"{socket.gethostname()}:{os.getpid()}", help="worker name in leases")
+    parser.add_argument(
+        "--drain-seconds", type=drain_seconds, default=20.0,
+        help="time for a running action to finish after SIGTERM (default: %(default)s); leave at least 10s "
+        "before the container stop timeout for cleanup and reporting",
+    )
     parser.add_argument(
         "--claim-wait-seconds",
         type=claim_wait_seconds,
@@ -800,21 +943,22 @@ def main() -> None:
     except OSError as error:
         print(f"not reporting the host to the coordinator: {error}", file=sys.stderr)
         host = None
-    coordinator = Coordinator(args.coordinator, token, host)
+    drain = Drain(args.drain_seconds)
+    coordinator = Coordinator(args.coordinator, token, host, drain)
     releases = Releases(
         args.holbuild_releases_dir,
         args.holbuild_source_url,
         args.remote_cache,
         os.environ.get("HOLBUILD_REMOTE_CACHE_CURL_CONFIG"),
+        drain=drain,
     )
     protection = Protection(args.protection_cmd, os.environ.get("ECS_AGENT_URI"))
     tiers = list(dict.fromkeys([args.tier, *args.also_claim]))
-    # Exit through Python on SIGTERM, so run_one's cleanup stops the running action.
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
     phases = Phases()
     discovery_url = os.environ.get("HOLBUILD_REMOTE_CACHE_DISCOVERY_URL")
     membership = None
     with contextlib.ExitStack() as resources:
+        resources.enter_context(drain.installed())
         if discovery_url:
             if discovery_url != coordinator.url + "/v1/cache/members":
                 sys.exit("cache discovery must use this worker's coordinator /v1/cache/members endpoint")
@@ -828,20 +972,25 @@ def main() -> None:
             with open(config, "x", opener=lambda path, flags: os.open(path, flags, 0o600)) as out:
                 out.write('header = "' + header + '"\n')
             os.environ["HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG"] = config
-        while True:
+        while not drain.stop.is_set():
             if args.cooperate_dir is not None:
-                with phases.timed("memory_wait"):
-                    waited = wait_for_memory(args.cooperate_dir, charge)
+                try:
+                    with phases.timed("memory_wait"), drain.interruptible():
+                        waited = wait_for_memory(args.cooperate_dir, charge, drain)
+                except DrainStopped:
+                    break
                 if waited and host is not None:
                     host.waited = True
+            if drain.stop.is_set():
+                break
             started = time.monotonic()
             claim = claim_reporting(coordinator, tiers, args.name, args.claim_wait_seconds, phases)
             if claim is None:
                 # A claim that failed at once, or a coordinator that doesn't wait, isn't retried in a tight loop.
                 with phases.timed("idle"):
-                    time.sleep(max(0.0, CLAIM_RETRY_SECONDS - (time.monotonic() - started)))
+                    drain.stop.wait(max(0.0, CLAIM_RETRY_SECONDS - (time.monotonic() - started)))
                 continue
-            if membership is not None and discovery_url is not None:
+            if not drain.stop.is_set() and membership is not None and discovery_url is not None:
                 now = time.monotonic()
                 nodes = refresh_cache_members(coordinator, membership, discovery_url, now)
                 releases = replace(releases, remote_cache=",".join(nodes), joining=membership.joining(now))
@@ -852,13 +1001,13 @@ def main() -> None:
                 # keeps a worker from failing ready action after ready action while the cache or the coordinator is down.
                 print(f"action failed in the worker: {error}", file=sys.stderr)
                 with phases.timed("idle"):
-                    time.sleep(CLAIM_RETRY_SECONDS)
+                    drain.stop.wait(CLAIM_RETRY_SECONDS)
                 continue
             if unavailable:
                 # The coordinator readies the action again at once, so without the wait the worker would claim it
                 # straight back while the cache is still down.
                 with phases.timed("idle"):
-                    time.sleep(CLAIM_RETRY_SECONDS)
+                    drain.stop.wait(CLAIM_RETRY_SECONDS)
 
 
 if __name__ == "__main__":
