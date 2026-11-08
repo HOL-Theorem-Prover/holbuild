@@ -177,6 +177,12 @@ fun ca_options () =
              Option.map (fn value => (name, option, value)) (OS.Process.getEnv variable))
           [("SSL_CERT_DIR", "CAPATH", CURLOPT_CAPATH), ("SSL_CERT_FILE", "CAINFO", CURLOPT_CAINFO)]
 
+(* The CA options a new handle gets: NONE clears an option.  The default CA
+   directory is cleared first, so a directory the environment names stays. *)
+fun connection_ca_options no_ca_directory =
+  (if no_ca_directory then [("CAPATH", CURLOPT_CAPATH, NONE)] else []) @
+  map (fn (name, option, value) => (name, option, SOME value)) (ca_options ())
+
 type connection = {easy : Foreign.Memory.voidStar, multi : Foreign.Memory.voidStar,
                errors : Foreign.Memory.voidStar, no_ca_directory : bool}
 
@@ -202,11 +208,11 @@ fun new_connection () : connection =
      check "SOCKOPTFUNCTION" (setopt_fn (easy, CURLOPT_SOCKOPTFUNCTION, sockopt_cloexec));
      check "ERRORBUFFER" (setopt_ptr (easy, CURLOPT_ERRORBUFFER, errors));
      Option.app (fn user => check "USERPWD" (setopt_str (easy, CURLOPT_USERPWD, user))) (!userpwd);
-     (* Before the environment's CA settings, which may name a directory.  A
-        TLS backend without CA directories refuses the option, which is fine. *)
-     if no_ca_directory then ignore (setopt_ptr (easy, CURLOPT_CAPATH, Foreign.Memory.null))
-     else ();
-     List.app (fn (name, option, value) => check name (setopt_str (easy, option, value))) (ca_options ());
+     (* A TLS backend without CA directories refuses to clear CAPATH, which
+        only leaves the handle without the cached CA store. *)
+     List.app (fn (_, option, NONE) => ignore (setopt_ptr (easy, option, Foreign.Memory.null))
+                | (name, option, SOME value) => check name (setopt_str (easy, option, value)))
+              (connection_ca_options no_ca_directory);
      connection)
     handle e => (close connection; raise e)
   end

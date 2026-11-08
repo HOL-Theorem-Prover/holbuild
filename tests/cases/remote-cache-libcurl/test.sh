@@ -419,6 +419,20 @@ val _ = assert "SSL_CERT_DIR and SSL_CERT_FILE"
 val _ = assert "SSL_CERT_FILE alone" (ca_options_with [("SSL_CERT_DIR", NONE)] = [("CAINFO", "/file")])
 val _ = assert "no CA settings" (ca_options_with [("SSL_CERT_FILE", NONE)] = [])
 
+(* A handle made while the default CA directory is cleared clears it before
+   applying the environment's settings; one made after the fallback doesn't. *)
+fun connection_ca_options no_ca_directory =
+  map (fn (name, _, value) => (name, value)) (HolbuildHttp.connection_ca_options no_ca_directory)
+val _ = assert "the default CA directory is cleared"
+               (connection_ca_options true = [("CAPATH", NONE)])
+val _ = assert "the default CA directory is kept" (connection_ca_options false = [])
+val _ = ca_options_with [("SSL_CERT_DIR", SOME "/dir")]
+val _ = assert "a CA directory the environment names is set after the default is cleared"
+               (connection_ca_options true = [("CAPATH", NONE), ("CAPATH", SOME "/dir")])
+val _ = assert "a CA directory the environment names is set"
+               (connection_ca_options false = [("CAPATH", SOME "/dir")])
+val _ = ca_options_with [("SSL_CERT_DIR", NONE)]
+
 (* HTTPS to a server whose self-signed certificate only CURL_CA_BUNDLE names.
    With a libcurl that caches the parsed CA bundle, new handles start without
    libcurl's default CA directory; the bundle alone verifies the server. *)
@@ -437,6 +451,15 @@ val _ = wait_for_empty_pool ()
 val _ = ca_options_with [("CURL_CA_BUNDLE", SOME (dir ^ "/cert.pem"))]
 val _ = assert "HTTPS verifies the server against the CA bundle" (tls_get () = HolbuildHttp.Response 200)
 val _ = assert "a verified server keeps the CA directory cleared" (!HolbuildHttp.clear_ca_directory = clearing)
+
+(* After the fallback, a pooled handle made without the default CA directory
+   is closed rather than reused. *)
+val accepted_before = tls_accepted ()
+val _ = HolbuildHttp.clear_ca_directory := false
+val _ = assert "a request after the fallback succeeds" (tls_get () = HolbuildHttp.Response 200)
+val _ = assert "it doesn't reuse a handle made without the default CA directory"
+               (tls_accepted () = accepted_before + (if clearing then 1 else 0))
+val _ = HolbuildHttp.clear_ca_directory := clearing
 
 (* Once the pool has closed that handle, a certificate the default CAs don't
    verify fails, after one retry on a handle with libcurl's default CA
