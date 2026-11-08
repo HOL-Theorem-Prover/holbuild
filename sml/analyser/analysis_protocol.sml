@@ -39,7 +39,7 @@ fun unescape s =
   end
 
 fun join fields = String.concatWith " " (map escape fields)
-fun split line = map unescape (String.tokens (fn c => c = #" ") line)
+fun split line = map unescape (String.fields (fn c => c = #" ") line)
 
 (* Nested fields use the same escaping, with separators that preserve empty
    values. The tag keeps an empty attribute list a nonempty outer field. *)

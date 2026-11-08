@@ -32,6 +32,15 @@ fun fail message = (TextIO.output (TextIO.stdErr, message ^ "\n");
                     OS.Process.exit OS.Process.failure)
 fun assert message condition = if condition then () else fail message
 
+val empty_tactic_boundary =
+  ["boundary", "theorem", "marker", "marker", "29", "64", "64", "64", "64",
+   P.encode_proof_attrs [], "prefix", ""]
+val _ = assert "recovered boundary retains its empty tactic field"
+  (P.split (P.join empty_tactic_boundary) = empty_tactic_boundary)
+val _ = assert "empty recovered tactic can be read"
+  (#tactic_text (HolbuildTheorySpans.parse_boundary
+    (P.split (P.join empty_tactic_boundary))) = "")
+
 fun join (a, b) = OS.Path.concat(a, b)
 
 fun write_text path text =
