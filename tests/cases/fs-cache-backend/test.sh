@@ -62,6 +62,46 @@ val _ =
       HolbuildCacheBackend.Hit => ()
     | _ => fail "valid cache blob was not fetched";
 val _ = assert "materialized blob hash mismatch" (HolbuildHash.file_sha256 dst = hash);
+
+(* Hydrating a new action can reuse blobs already held for another action. *)
+val source_cache = HolbuildFSCacheBackend.filesystem (join (tmp, "source-cache"));
+val _ = HolbuildFSCacheBackend.ensure_layout source_cache;
+val _ = HolbuildFSCacheBackend.publish_blob source_cache {hash = hash, src = source};
+val fetches = ref 0;
+val transferred_inode = ref NONE;
+val transfer_source : HolbuildCacheTransfer.source =
+  {get_action = HolbuildFSCacheBackend.get_action source_cache,
+   fetch_blob = fn request as {hash, dst} =>
+     (fetches := !fetches + 1;
+      case HolbuildFSCacheBackend.fetch_blob source_cache request of
+          HolbuildCacheBackend.Hit =>
+            (transferred_inode := SOME (Posix.FileSys.ST.ino (Posix.FileSys.stat dst));
+             HolbuildCacheBackend.Hit)
+        | result => result)};
+fun transfer () = HolbuildCacheTransfer.copy_blob transfer_source
+  (HolbuildBuildExec.fs_cache_destination cache)
+  (HolbuildFSCacheBackend.tmp_dir cache) hash (0, 0);
+val _ = assert "resident blob was not reused" (transfer () = (0, 1));
+val _ = assert "resident blob was downloaded again" (!fetches = 0);
+val _ = write_text (HolbuildFSCacheBackend.blob_path cache hash) "corrupt\n";
+val _ = assert "corrupt resident blob was not replaced" (transfer () = (1, 0));
+val _ = assert "repair did not fetch exactly once" (!fetches = 1);
+val _ = assert "repair left corrupt bytes" (HolbuildFSCacheBackend.verify_blob cache hash);
+val _ = assert "verified temporary blob was copied again"
+  (!transferred_inode = SOME (Posix.FileSys.ST.ino
+    (Posix.FileSys.stat (HolbuildFSCacheBackend.blob_path cache hash))));
+val _ = OS.FileSys.remove (HolbuildFSCacheBackend.blob_path cache hash);
+val _ = assert "missing blob was not transferred" (transfer () = (1, 0));
+val _ = write_text source "invalid upload\n";
+val _ = case HolbuildFSCacheBackend.publish_blob cache {hash = hash, src = source} of
+    HolbuildCacheBackend.Conflict _ => ()
+  | _ => fail "ordinary publication accepted an unverified source";
+val _ = OS.FileSys.remove (HolbuildFSCacheBackend.blob_path cache hash);
+val _ = write_text (HolbuildFSCacheBackend.blob_path source_cache hash) "corrupt source\n";
+val _ = assert "corrupt transfer source was accepted"
+  ((transfer (); false) handle HolbuildCacheTransfer.Error _ => true);
+val _ = assert "failed transfer published a blob" (not (HolbuildFSCacheBackend.has_blob cache hash));
+
 val key = HolbuildHash.string_sha256 "timeout theory";
 fun manifest timeout =
   HolbuildBuildExec.cache_manifest_text

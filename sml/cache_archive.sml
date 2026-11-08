@@ -81,8 +81,9 @@ fun fs_source cache : HolbuildCacheTransfer.source =
    fetch_blob = HolbuildFSCacheBackend.fetch_blob cache}
 
 fun fs_destination cache : HolbuildCacheTransfer.destination =
-  {put_action = HolbuildFSCacheBackend.put_action cache,
-   publish_blob = HolbuildFSCacheBackend.publish_blob cache}
+  {has_blob = HolbuildFSCacheBackend.verify_blob cache,
+   put_action = HolbuildFSCacheBackend.put_action cache,
+   publish_blob = HolbuildFSCacheBackend.consume_verified_blob cache}
 
 fun manifest_value text =
   String.translate (fn #"\n" => " " | #"\r" => " " | c => str c) text

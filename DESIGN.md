@@ -703,6 +703,18 @@ Cache blobs are materialized by an in-process copy. Reflink clones only help on
 copy-on-write filesystems and cost a `cp` process per blob, which is slower than
 copying small theory files.
 
+Cache-to-cache transfers verify a resident filesystem blob before fetching it
+again. A missing or corrupt blob is fetched into a transfer-owned temporary
+file, verified by the source backend, and renamed into the destination cache.
+When the filesystems differ, publication falls back to a validated copy.
+Ordinary publication still validates its input; only transfer-owned, verified
+temporary files use the consuming operation.
+
+Action-spec export shares file hashes across specs and source uploads within
+that export. Reuse requires unchanged device, inode, size, mtime and ctime;
+files timestamped within a second of the export's start are rehashed. Library
+hashes must still match the plan. The table is not persisted between exports.
+
 Avoid hardlinking cache blobs into project `.holbuild/`: even if cache blobs are meant
 to be immutable, project outputs are the local materialized build view and should
 not be able to mutate global cache contents by accident. Build actions must never
