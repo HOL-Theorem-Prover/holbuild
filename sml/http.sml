@@ -63,6 +63,16 @@ in
   val fopen = buildCall2 (libc "fopen", (cString, cString), cPointer)
   val fclose = buildCall1 (libc "fclose", cPointer, cInt)
 
+  (* The OpenSSL 3 libcurl uses, if it does: not among `symbols`, since
+     setup goes on without it. *)
+  val crypto = getSymbol (loadLibraryIndirect (fn () => "libcrypto.so.3"))
+  val openssl_fetches =
+    map (fn name => buildCall3 (crypto name, (cPointer, cPointer, cPointer), cPointer))
+      ["EVP_MD_fetch", "EVP_CIPHER_fetch", "EVP_MAC_fetch", "EVP_KDF_fetch", "EVP_RAND_fetch",
+       "EVP_KEYMGMT_fetch", "EVP_KEYEXCH_fetch", "EVP_SIGNATURE_fetch", "EVP_ASYM_CIPHER_fetch",
+       "EVP_KEM_fetch", "OSSL_DECODER_fetch", "OSSL_ENCODER_fetch", "OSSL_STORE_LOADER_fetch"]
+  val openssl_clear_errors = buildCall0 (crypto "ERR_clear_error", (), cVoid)
+
   fun resolve_symbols () = List.app (ignore o symbolAsAddress) (!symbols)
 
   (* libcurl's connection sockets are not close-on-exec, so without this
@@ -127,15 +137,29 @@ val clear_ca_directory = ref false
    server's certificate. *)
 exception CaDirectoryNeeded
 
+(* OpenSSL 3 before 3.0.15 walks its method stores without a lock while
+   another thread may be adding to them (openssl#24672), and parsing any
+   certificate walks one, so threads making their first TLS connections at
+   once can crash.  A store gains methods only on an operation's first
+   fetch, so this fetches each operation once, before any other thread
+   starts.  A NULL name finds nothing but constructs all of the operation's
+   methods, as OpenSSL's own *_do_all_provided do; the errors those fetches
+   leave are cleared.  Without libcrypto.so.3 there is nothing to fill. *)
+fun fill_openssl_method_stores () =
+  (List.app (fn fetch => ignore (fetch (Foreign.Memory.null, Foreign.Memory.null, Foreign.Memory.null)))
+     openssl_fetches;
+   openssl_clear_errors ())
+  handle Foreign.Foreign _ => ()
+
 fun version_text number =
   String.concatWith "." (map (fn unit => Int.toString (number div unit mod 256)) [65536, 256, 1])
 
 (* Loads libcurl, checks that it can run transfers without blocking the GC,
    and initialises it.  Must run before the process starts any other
-   thread: it resolves every foreign symbol this structure calls, and
-   before libcurl 7.84 curl_global_init is not thread-safe even against
-   threads that never use curl.  Raises Error, or Foreign.Foreign if
-   libcurl can't be loaded. *)
+   thread: it resolves every foreign symbol this structure calls, fills
+   OpenSSL's method stores, and before libcurl 7.84 curl_global_init is not
+   thread-safe even against threads that never use curl.  Raises Error, or
+   Foreign.Foreign if libcurl can't be loaded. *)
 fun setup {user} =
   let
     val _ = HolbuildOffline.require_online "initialize the HTTP client"
@@ -157,7 +181,8 @@ fun setup {user} =
     else
       (resolve_symbols ();
        if global_init CURL_GLOBAL_DEFAULT <> 0 then raise Error "curl_global_init failed"
-       else (userpwd := user; clear_ca_directory := number >= 0x075700))
+       else (fill_openssl_method_stores ();
+             userpwd := user; clear_ca_directory := number >= 0x075700))
   end
 
 fun check what code =
