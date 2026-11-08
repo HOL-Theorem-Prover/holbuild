@@ -42,7 +42,7 @@ from remote_exec.membership import REFRESH_SECONDS, Membership, check_plain_http
 DEFAULT_SOURCE_URL = "https://github.com/HOL-Theorem-Prover/holbuild/archive/refs/tags/v{version}.tar.gz"
 RELEASE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 COMPLETE = ".complete"  # stamp file of a finished release build
-MIN_SANDBOX_RELEASE = (0, 13, 57)
+MIN_SANDBOX_RELEASE = (0, 13, 58)
 
 
 @functools.cache

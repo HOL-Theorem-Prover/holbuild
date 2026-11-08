@@ -205,7 +205,7 @@ and lock securebits; non-root workers need no added capabilities. The supplied
 image includes the userspace dependencies. The container's seccomp profile must permit Landlock and
 stacking a notifying seccomp filter. `holbuild sandbox-check` exercises these
 requirements; workers reject a release whose check fails. Releases before
-0.13.57 are rejected because their HOL launch path has no mandatory sandbox.
+0.13.58 are rejected because their HOL launch path has no mandatory sandbox.
 Upgrade submitting clients before replacing workers with this version.
 
 The worker and `exec-action` remain trusted: they fetch inputs, manage memory
