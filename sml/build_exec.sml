@@ -8062,7 +8062,9 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
       let
         (* gc.lock is also shared by explicit cache gc. The action-root
            lock lives outside locks/ and can be container-private. *)
-        val lock = HolbuildFileLock.acquire_exclusive_path_wait {path = HolbuildCache.gc_lock_path cache}
+        val lock_path = HolbuildCache.gc_lock_path cache
+        val _ = HolbuildFileLock.remove_obsolete_lock_dir "cache gc" lock_path
+        val lock = HolbuildFileLock.acquire_exclusive_path_wait {path = lock_path}
       in
         (scan () before HolbuildFileLock.release lock)
         handle e => (HolbuildFileLock.release lock; raise e)

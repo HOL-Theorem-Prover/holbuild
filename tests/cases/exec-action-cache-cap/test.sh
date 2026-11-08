@@ -359,6 +359,17 @@ set -e
 evicted "$state" "a pre-eviction size stamp"
 evicted "$cache6/blobs/private" "a private blob over the cap"
 
+# Existing caches may still have the old directory-shaped GC lock.
+cache7=$tmpdir/cache7
+mkdir -p "$cache7/locks/gc.lock"
+sparse "$cache7/blobs/old" 2
+set +e
+HOLBUILD_CACHE=$cache7 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
+  --result "$tmpdir/result" --cache-limit-gb 1 --cache-reserve-gb 0 > "$tmpdir/legacy-lock.log" 2>&1
+set -e
+[[ -f "$cache7/locks/gc.lock" ]] || { echo "legacy GC lock directory not migrated" >&2; exit 1; }
+evicted "$cache7/blobs/old" "an oversized blob with a legacy GC lock"
+
 # An error outside the action, here no remote cache, is an infrastructure
 # failure (exit 3), never the final exit 1.
 set +e
