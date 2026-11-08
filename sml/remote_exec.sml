@@ -30,14 +30,15 @@ val connect_timeout_seconds = 10
 val request_max_time_seconds = 60
 (* Waits before each retry of a request the coordinator couldn't answer (a
    submission answered 5xx or 429, an event stream that broke without
-   delivering a state change): doubling up to 8 seconds, about two and a half
-   minutes in all, long enough to ride out a coordinator restart such as an
-   image upgrade.  Tests shorten them with HOLBUILD_TEST_RETRY_DELAYS,
-   comma-separated seconds. *)
+   delivering a state change): doubling up to 8 seconds, almost six minutes
+   in all, long enough to ride out a coordinator restart such as an image
+   upgrade (which pulls the new image first), or the move to a replacement
+   instance.  Tests shorten them
+   with HOLBUILD_TEST_RETRY_DELAYS, comma-separated seconds. *)
 fun retry_delays_seconds () =
   case OS.Process.getEnv "HOLBUILD_TEST_RETRY_DELAYS" of
       SOME text => List.mapPartial Int.fromString (String.tokens (fn c => c = #",") text)
-    | NONE => [1, 2, 4] @ List.tabulate (18, fn _ => 8)
+    | NONE => [1, 2, 4] @ List.tabulate (43, fn _ => 8)
 
 fun retry_after delay = OS.Process.sleep (Time.fromSeconds (Int.toLarge delay))
 
@@ -97,12 +98,14 @@ fun write_text path text =
 (* Submits a batch, with QUERY ("" or "?...") after the path; Ok carries
    its id.  A 5xx answer (a proxy's 502-504 while the coordinator restarts,
    or the coordinator's own 500 while it's overloaded) or a 429 is retried after each of retry_delays_seconds, since
-   it passes like a restart; other 4xx errors aren't, and an unreachable
-   coordinator is refused at once.  A gateway error that comes after the
+   it passes like a restart; other 4xx errors aren't.  An unreachable
+   coordinator is retried the same way when WAIT_UNREACHABLE (the caller has
+   nothing to fall back to, as under --remote-only), and refused at once
+   otherwise, so that a build that can go on locally does.  A gateway error that comes after the
    coordinator stored the batch (it was stopped between storing and
    answering) leaves a copy that nobody follows: it runs to its end or
    deadline, repeating work whose results the cache dedupes. *)
-fun submit_with_query url query maxheap batch_text : attempt =
+fun submit_with_query wait_unreachable url query maxheap batch_text : attempt =
   let
     val _ = HolbuildOffline.require_online "submit a remote batch"
     val query = query ^ (case maxheap of
@@ -122,16 +125,17 @@ fun submit_with_query url query maxheap batch_text : attempt =
              stderr = HolbuildSpawn.Merge}
         val (lines, status) = split_status (#output result)
         val text = String.concatWith "\n" lines
-        val refusal = "coordinator refused the batch (HTTP " ^ Int.toString status ^ "): " ^ text
+        val refusal =
+          if status = 0 then
+            "could not reach the coordinator at " ^ HolbuildRemoteCache.redact_userinfo url ^
+            (if text = "" then "" else ": " ^ text)
+          else "coordinator refused the batch (HTTP " ^ Int.toString status ^ "): " ^ text
       in
         if status = 201 then
           case json_string_field "batch_id" text of
               SOME id => Ok id
             | NONE => Refused ("coordinator answered without a batch_id: " ^ text)
-        else if status = 0 then
-          Refused ("could not reach the coordinator at " ^ HolbuildRemoteCache.redact_userinfo url ^
-                   (if text = "" then "" else ": " ^ text))
-        else if status = 429 orelse status >= 500 then
+        else if (status = 0 andalso wait_unreachable) orelse status = 429 orelse status >= 500 then
           case delays of
               [] => Refused refusal
             | delay :: rest =>
@@ -147,7 +151,8 @@ fun submit_with_query url query maxheap batch_text : attempt =
     outcome
   end
 
-fun submit url maxheap batch_text = submit_with_query url "" maxheap batch_text
+fun submit wait_unreachable url maxheap batch_text =
+  submit_with_query wait_unreachable url "" maxheap batch_text
 
 (* The input key of the theory a failed batch's workers could not use, when
    the coordinator failed it for resubmission naming the theory as

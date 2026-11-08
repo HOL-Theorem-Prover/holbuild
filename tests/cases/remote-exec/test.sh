@@ -167,12 +167,17 @@ refute_grep "Theory built" "$tmpdir/attach.log"
 
 # A coordinator that can't be reached, refuses the batch, or loses the
 # event stream: the build goes on locally, or fails with --remote-only (exit
-# status 75, so a caller can build locally) or --detach (1).
+# status 75, so a caller can build locally) or --detach (1).  With
+# --remote-only an unreachable coordinator is retried first, as one moving
+# to a new instance is; without it the build falls back at once.
 write_theories three
 run unreachable-only 75 build --remote-exec "$unreachable" --remote-only BTheory
 require_grep "remote execution: could not reach the coordinator at $unreachable" "$tmpdir/unreachable-only.log"
+[[ $(grep -c "could not reach the coordinator at $unreachable.*; retrying" "$tmpdir/unreachable-only.log") -eq 4 ]] ||
+  { cat "$tmpdir/unreachable-only.log" >&2; exit 1; }
 refute_grep "Theory built" "$tmpdir/unreachable-only.log"
 run unreachable 0 build --remote-exec "$unreachable" BTheory
+refute_grep "retrying" "$tmpdir/unreachable.log"
 require_grep "building locally" "$tmpdir/unreachable.log"
 require_grep "BTheory built" "$tmpdir/unreachable.log"
 
