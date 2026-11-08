@@ -1742,7 +1742,9 @@ The coordinator's protocol, in what holbuild uses of it:
   `{"type": "action", "input_key", "theory", "state", "last_failure",
   "log_sha256", ...}` when an action changes, and last `{"type": "batch",
   "state": "done"|"failed"|"cancelled", "failure"}`. A failed action's log is
-  at `/cas/<log_sha256>` in the remote cache. A stream may start over: it
+  at `/cas/<log_sha256>` in the remote cache. The log includes the action's
+  failure diagnostic even when it failed before starting HOL, provided the
+  worker can write and upload the log. A stream may start over: it
   sends every action's current state first.
 - `POST /v1/batches/<id>/cancel` cancels a running batch and answers
   `{"state": "<state>"}`: `cancelled`, or the end a batch that already

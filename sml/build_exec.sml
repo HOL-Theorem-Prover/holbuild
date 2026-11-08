@@ -8840,6 +8840,19 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                        limit_bytes = limit_bytes, reserve_bytes = reserve_bytes})
                 end
               val (status, failure) = attempt ()
+              val _ =
+                case failure of
+                    NONE => ()
+                  | SOME (_, msg) =>
+                      (let
+                         val path = build_log ()
+                         val _ = ensure_parent path
+                         val out = TextIO.openAppend path
+                       in
+                         TextIO.output (out, "\nholbuild: exec-action failed: " ^ msg ^ "\n");
+                         TextIO.closeOut out
+                       end
+                       handle e => warn ("could not write the action diagnostic: " ^ General.exnMessage e))
               val log = phase "log" upload_log
               (* A final failure's log is its only diagnostic and nothing
                  retries the action to recover it. *)
