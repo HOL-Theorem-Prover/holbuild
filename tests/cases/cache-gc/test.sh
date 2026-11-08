@@ -45,8 +45,9 @@ require_grep "removing obsolete directory cache gc lock" "$tmpdir/obsolete-gc.lo
 
 # Pause a real migrator on its warning, then replace the old directory with a
 # sibling's held lock. Migration must leave that file and its inode alone.
+# The PID probe needs the binary itself, not the suite's timing wrapper.
 if [[ $(uname -s) == Linux ]]; then
-  python3 "$SCRIPT_DIR/migration-race.py" "$HOLBUILD_BIN"
+  python3 "$SCRIPT_DIR/migration-race.py" "${REAL_HOLBUILD_BIN:-$HOLBUILD_BIN}"
 fi
 
 # Checkpoint-store GC must also respect a worker's shared sweep lock.
