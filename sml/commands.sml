@@ -1465,7 +1465,9 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
     fun remote_run {request, url, fetch_only, outputs_dir, profile} () =
       let
         val outputs = #outputs request
-        fun has keys ({run_key, ...} : HolbuildBuildExec.run) = List.exists (fn key => key = run_key) keys
+        fun run_keys runs = Binaryset.addList (Binaryset.empty String.compare,
+                                               map (fn ({run_key, ...} : HolbuildBuildExec.run) => run_key) runs)
+        fun has keys ({run_key, ...} : HolbuildBuildExec.run) = Binaryset.member (keys, run_key)
         (* Why the runs didn't all end, and whether a later try may succeed. *)
         val stopped : (string * bool) option ref = ref NONE
         val (remote, runs, uncached, {exported, refused}) =
@@ -1492,7 +1494,9 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                           (stopped := SOME (reason, true); {exported = [], refused = []})
               in (remote, runs, uncached, exported) end))
         (* The latest state and failure of each run in the batch. *)
-        val states : (string * (string * string option)) list ref = ref []
+        val uncached_keys = run_keys uncached
+        val refused_keys = run_keys refused
+        val states = ref (Redblackmap.mkDict String.compare)
         fun submit_and_follow url exported =
           let
             val batch =
@@ -1503,7 +1507,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                            ["action", run_key, HolbuildRemoteCache.remote_action_key run_key, spec_sha256, name])
                      exported) ^ "\n"
             val query = "?class=run" ^ (case profile of SOME p => "&profile=" ^ p | NONE => "")
-            fun on_change (key, state, failure, _) = states := (key, (state, failure)) :: !states
+            fun on_change (key, state, failure, _) = states := Redblackmap.insert (!states, key, (state, failure))
           in
             (* A run never runs here, so an unreachable coordinator is waited for. *)
             case HolbuildRemoteExec.submit_with_query true url query (#maxheap tc) batch of
@@ -1535,15 +1539,15 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             | (_, SOME url) => submit_and_follow url exported
             | (_, NONE) => raise Error "internal error: run-action has runs to submit but no coordinator"
         fun ended_as ({run_key, ...} : HolbuildBuildExec.run) =
-          case List.find (fn (key, _) => key = run_key) (!states) of
-              SOME (_, ("done", _)) => "done"
-            | SOME (_, ("failed", failure)) => "failed " ^ Option.getOpt (failure, "unknown")
+          case Redblackmap.peek (!states, run_key) of
+              SOME ("done", _) => "done"
+            | SOME ("failed", failure) => "failed " ^ Option.getOpt (failure, "unknown")
             | _ => "missing"
         val ended =
           map (fn run =>
                   (run,
-                   if fetch_only orelse not (has (map #run_key uncached) run) then "cached"
-                   else if has (map #run_key refused) run then "missing"
+                   if fetch_only orelse not (has uncached_keys run) then "cached"
+                   else if has refused_keys run then "missing"
                    else ended_as run))
               runs
         val to_fetch = List.mapPartial (fn (run, status) =>
@@ -1558,6 +1562,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                         HolbuildBuildExec.fetch_run remote outputs_dir outputs run
                         handle e => (error := SOME e; false))
                     fetches)
+        val not_fetched_keys = run_keys not_fetched
         val fetch_error = List.find Option.isSome (map (! o #2) fetches)
         (* Without --fetch-only every run listed ended, so one that didn't
            fetch was lost on the way, which a later try may not lose. *)
@@ -1571,7 +1576,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       in
         List.app (fn (run as {name, run_key, ...} : HolbuildBuildExec.run, status) =>
                      print (String.concatWith " "
-                              [name, run_key, if has (map #run_key not_fetched) run then "missing" else status] ^ "\n"))
+                              [name, run_key, if has not_fetched_keys run then "missing" else status] ^ "\n"))
                  ended;
         (case fetch_error of SOME (SOME e) => raise e | _ => ());
         case !stopped of
