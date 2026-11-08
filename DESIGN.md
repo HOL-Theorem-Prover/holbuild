@@ -598,6 +598,15 @@ from the heap and checkpoints shared before it. These hashes cover files
 that name the action root, so they hold for one cache root, as shared heaps
 do; local builds publish no pairs.
 
+Forced and traced specs skip whole-action cache reuse and early cutoff.
+They still compute the dependency-output context key, so valid dependency
+heaps and proof checkpoints remain reusable. Tracing replays proof steps
+rather than resuming theorem checkpoints. These execution options change
+neither the action key nor its outputs; their logs belong to the batch's
+execution and return separately through the result record's CAS log hash.
+The client's final restore clears force and tracing to avoid executing the
+same work again.
+
 A build may also record output hashes for diagnostics (`--emit-output-hashes`).
 
 Different absolute paths under the same declared root may normalize to the same
