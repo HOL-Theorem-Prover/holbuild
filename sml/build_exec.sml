@@ -2190,7 +2190,9 @@ fun put_remote_theory_action remote _ (request as {key, text}) =
        | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
 fun remote_cache_destination remote : HolbuildCacheTransfer.destination =
-  {has_blob = HolbuildRemoteCache.blob_confirmed_present remote,
+  (* Publishing also records the blob size needed by action metadata.  A
+     remote HEAD alone cannot replace that step. *)
+  {has_blob = fn _ => false,
    put_action = put_remote_theory_action remote,
    publish_blob = HolbuildRemoteCache.publish_hashed_blob remote}
 
