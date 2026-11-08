@@ -9,6 +9,8 @@ from pathlib import Path
 import resource
 import runpy
 import shutil
+import signal
+import threading
 import subprocess
 import sys
 import tempfile
@@ -33,6 +35,19 @@ def attack(root: Path, worker: int, secret: Path, shared: Path) -> None:
     refuses("output symlink", lambda: (root / "stolen").symlink_to(secret))
     refuses("output hardlink", lambda: os.link(secret, root / "stolen"))
     refuses("worker signals", lambda: os.kill(worker, 0))
+    refuses("worker group signals", lambda: os.killpg(os.getpgid(worker), 0))
+    (root / "future-ready").write_text("ready")
+    deadline = time.monotonic() + 10
+    while not (root / "future.pid").exists():
+        assert time.monotonic() < deadline, "future sibling did not start"
+        time.sleep(0.01)
+    sibling = int((root / "future.pid").read_text())
+    refuses("future sibling signals", lambda: os.kill(sibling, 0))
+    libc = ctypes.CDLL(None, use_errno=True)
+    for option in (22, (1 << 32) | 22):
+        result = libc.prctl(ctypes.c_ulong(option), 2, 0, 0, 0)
+        assert result == -1 and ctypes.get_errno() == errno.EPERM, "replacement filter accepted"
+    refuses("join worker group", lambda: os.setpgid(0, os.getpgid(worker)))
     refuses("worker limits", lambda: resource.prlimit(worker, resource.RLIMIT_NOFILE))
     refuses("signal owner", lambda: fcntl.fcntl(1, fcntl.F_SETOWN, worker))
     for directory in ("actions", "blobs", "locks", "cooperate"):
@@ -50,7 +65,8 @@ def attack(root: Path, worker: int, secret: Path, shared: Path) -> None:
             descriptors.append(os.readlink(fd))
         except FileNotFoundError:
             pass
-    assert not any("lease" in target or "cache.curl" in target for target in descriptors), descriptors
+    assert not any("lease" in target or "cache.curl" in target or "seccomp" in target
+                   for target in descriptors), descriptors
     status = Path("/proc/self/status").read_text()
     assert "CapEff:\t0000000000000000" in status
     (root / "ordinary-output").write_text("ok")
@@ -60,12 +76,66 @@ def attack(root: Path, worker: int, secret: Path, shared: Path) -> None:
         problem.write_text("fof(a,axiom,p).\nfof(c,conjecture,p).\n")
         result = subprocess.run([prover, "--auto", str(problem)], check=True, capture_output=True, text=True)
         assert "SZS status Theorem" in result.stdout, result.stdout
+    started = time.monotonic()
+    timeout = subprocess.run(["/usr/bin/timeout", "0.1", "/bin/sleep", "2"])
+    elapsed = time.monotonic() - started
+    assert timeout.returncode == 124 and elapsed < 1.5, (timeout.returncode, elapsed)
+    (root / "timeout-seconds").write_text(str(elapsed))
+    for session in (False, True):
+        read_fd, write_fd = os.pipe()
+        child = os.fork()
+        if child == 0:
+            os.close(read_fd)
+            if session:
+                os.setsid()
+            else:
+                os.setpgid(0, 0)
+            # Forked multi-threaded children need their own TGID, rather than
+            # the original HOL PID, to work with pthread_kill.
+            ready = threading.Event()
+            release = threading.Event()
+            thread = threading.Thread(target=lambda: (ready.set(), release.wait()))
+            thread.start()
+            ready.wait()
+            signal.pthread_kill(thread.ident, 0)
+            release.set()
+            thread.join()
+            os.write(write_fd, b"R")
+            os.close(write_fd)
+            signal.pause()
+            os._exit(1)
+        os.close(write_fd)
+        assert os.read(read_fd, 1) == b"R"
+        os.close(read_fd)
+        os.killpg(child, signal.SIGKILL)
+        _, status = os.waitpid(child, 0)
+        assert os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL, status
     child = os.fork()
     if child == 0:
+        os.setsid()
+        if os.fork():
+            os._exit(0)
+        (root / "linger.pid").write_text(str(os.getpid()))
         time.sleep(1)
         (root / "survived").write_text("bad")
         os._exit(0)
     (root / "report.json").write_text(json.dumps(denied))
+
+
+def linger(root: Path) -> None:
+    child = os.fork()
+    if child == 0:
+        os.setsid()
+        if os.fork():
+            os._exit(0)
+        (root / "detached.pid").write_text(str(os.getpid()))
+        time.sleep(20)
+        os._exit(0)
+    os.waitpid(child, 0)
+    while not (root / "detached.pid").exists():
+        time.sleep(0.01)
+    (root / "cancel-ready").write_text(str(os.getpid()))
+    time.sleep(20)
 
 
 def worker(helper: Path, root: Path) -> None:
@@ -99,7 +169,21 @@ def worker(helper: Path, root: Path) -> None:
     with (shared / "cooperate/lease-sentinel").open("w") as lease:
         fcntl.flock(lease, fcntl.LOCK_EX)
         os.set_inheritable(lease.fileno(), True)
-        status = module["run"](linux, policy, [sys.executable, str(probe), "--attack", str(private), str(os.getpid()), str(secret), str(shared)])
+        command = [sys.executable, str(probe), "--attack", str(private), str(os.getpid()), str(secret), str(shared)]
+        if os.environ.get("HOLBUILD_RUN_CANCEL"):
+            command = [sys.executable, str(probe), "--linger", str(private)]
+        status = module["run"](linux, policy, command)
+    if os.environ.get("HOLBUILD_RUN_CANCEL"):
+        assert status == 128 + signal.SIGKILL, status
+        for file in ("cancel-ready", "detached.pid"):
+            try:
+                os.kill(int((private / file).read_text()), 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise AssertionError("cancelled descendant survived")
+        print("supervisor cancellation reaped detached descendants")
+        return
     assert status == 0, status
     assert (private / "ordinary-output").read_text() == "ok"
     assert (private / "descendant-output").read_text().strip() == "child"
@@ -108,15 +192,65 @@ def worker(helper: Path, root: Path) -> None:
         assert (shared / directory / "other").stat().st_mode & 0o777 == 0o644
     time.sleep(1.1)
     assert not (private / "survived").exists()
-    print(f"{len(json.loads((private / 'report.json').read_text()))} credential/cache/process attacks denied; normal child and cleanup passed; prover={'passed' if prover else 'unavailable'}")
+    if (private / "linger.pid").exists():
+        try:
+            os.kill(int((private / "linger.pid").read_text()), 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise AssertionError("detached descendant survived cleanup")
+    print(f"{len(json.loads((private / 'report.json').read_text()))} credential/cache/process attacks denied; "
+          f"timeout={float((private / 'timeout-seconds').read_text()):.3f}s; "
+          f"process groups, sessions, threads and cleanup passed; prover={'passed' if prover else 'unavailable'}")
 
 
 if __name__ == "__main__":
     if sys.argv[1] == "--attack":
         attack(Path(sys.argv[2]), int(sys.argv[3]), Path(sys.argv[4]), Path(sys.argv[5]))
+    elif sys.argv[1] == "--linger":
+        linger(Path(sys.argv[2]))
     elif sys.argv[1] == "--worker":
         worker(Path(sys.argv[2]), Path(sys.argv[3]))
     else:
         with tempfile.TemporaryDirectory(prefix="holbuild-sandbox-probe-") as directory:
             env = {**os.environ, "REMOTE_EXEC_WORKER_TOKEN": "worker-token-sentinel", "HOLBUILD_REMOTE_CACHE_CURL_CONFIG": f"{directory}/cache.curl"}
-            subprocess.run([sys.executable, __file__, "--worker", sys.argv[1], directory], env=env, check=True)
+            process = subprocess.Popen([sys.executable, __file__, "--worker", sys.argv[1], directory], env=env)
+            sibling = None
+            try:
+                deadline = time.monotonic() + 10
+                while not (Path(directory) / "action/future-ready").exists():
+                    assert process.poll() is None, process.returncode
+                    assert time.monotonic() < deadline, "action did not start"
+                    time.sleep(0.01)
+                # This same-UID process is outside the dedicated subreaper,
+                # and is born AFTER the sandbox's signal policy was installed.
+                sibling = subprocess.Popen(["/bin/sleep", "20"])
+                (Path(directory) / "action/future.pid").write_text(str(sibling.pid))
+                assert process.wait(timeout=15) == 0, process.returncode
+                assert sibling.poll() is None, "action killed its future sibling"
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=5)
+                if sibling is not None:
+                    sibling.terminate()
+                    sibling.wait()
+
+            cancel_root = Path(directory) / "cancel"
+            cancel_root.mkdir()
+            cancelled = subprocess.Popen(
+                [sys.executable, __file__, "--worker", sys.argv[1], str(cancel_root)],
+                env={**env, "HOLBUILD_RUN_CANCEL": "1"},
+            )
+            try:
+                deadline = time.monotonic() + 10
+                while not (cancel_root / "action/cancel-ready").exists():
+                    assert cancelled.poll() is None, cancelled.returncode
+                    assert time.monotonic() < deadline, "cancellation action did not start"
+                    time.sleep(0.01)
+                cancelled.terminate()
+                assert cancelled.wait(timeout=5) == 0, cancelled.returncode
+            finally:
+                if cancelled.poll() is None:
+                    cancelled.terminate()
+                    cancelled.wait(timeout=5)

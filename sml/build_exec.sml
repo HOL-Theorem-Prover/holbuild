@@ -2731,7 +2731,7 @@ fun declaration_checkpoint_specs proof_engine proof_timeout base deps_key inputs
 val runtime_source_files =
   HolbuildToolchain.runtime_files @
   ["sml/checkpoint_save_runtime.sml", "sml/proof_runtime.sml", "sml/tactic_compat_runtime.sml",
-   "sml/diagnostic_limits.sml", "sml/action_sandbox.py"] @
+   "sml/diagnostic_limits.sml"] @
   map (fn file => normalize_path (Path.concat("sml/analyser", file)))
       HolbuildHolSharedCache.analyser_source_files
 

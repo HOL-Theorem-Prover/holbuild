@@ -139,9 +139,8 @@ locale, and curl's certificate and proxy settings. It excludes
 `HOLBUILD_REMOTE_EXEC_*`, `HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN` and inherited
 discovery curl configs; with discovery enabled it receives only the worker's
 generated read-only discovery config (see below). The worker token stays out
-of the builds' environment and discovery files. A
-build runs as the worker's user, so one that goes looking can still read the
-token from the worker's `/proc/<pid>/environ`. Outside the image,
+of the builds' environment and discovery files. Submitted HOL code is confined
+separately from trusted worker processes, as described below. Outside the image,
 `python3 -m remote_exec.worker` runs the worker; it uses only the standard
 library and `curl`. A batch can override the worker's `--max-heap` default
 (12000 MB); `--also-claim standard` lets them take standard-tier work when no
@@ -181,11 +180,12 @@ workers do when they aren't running HOL:
 ## Action isolation
 
 Workers require Linux on x86_64 or aarch64, Landlock ABI 1 or newer,
-Python 3, and `libseccomp.so.2`. The supplied image includes the userspace
+Python 3, pidfds, `/proc` child lists and `libseccomp.so.2` with notification
+support. The supplied image includes the userspace
 dependencies. The container's seccomp profile must permit Landlock and
-stacking another seccomp filter. `holbuild sandbox-check` exercises these
+stacking a notifying seccomp filter. `holbuild sandbox-check` exercises these
 requirements; workers reject a release whose check fails. Releases before
-0.13.53 are rejected because their HOL launch path has no mandatory sandbox.
+0.13.54 are rejected because their HOL launch path has no mandatory sandbox.
 Upgrade submitting clients before replacing workers with this version.
 
 The worker and `exec-action` remain trusted: they fetch inputs, manage memory
@@ -196,10 +196,17 @@ access to fresh action, checkpoint, home and temporary directories. Shared
 cache files are copied into these directories. The directories are removed
 after the action, including when shared heaps are disabled. The child receives
 no cache credentials, worker token, inherited lease descriptors or Linux
-capabilities. Cross-process inspection, signals to other processes, metadata
-changes, links and special-file creation are denied. The supervisor kills
-and reaps descendants before validating and harvesting regular, unlinked
-output files. Unsupported confinement fails closed.
+capabilities. Cross-process inspection, metadata changes, links and special-file
+creation are denied. A trusted signal supervisor permits process and group
+signals only to verified descendants of the current action, using pidfds;
+thread signals stay within the requesting process. Subprocess groups, sessions
+and timeouts work without granting access to worker or sibling processes.
+The supervisor stops descendants to a fixed point, then kills and reaps them
+before validating and harvesting regular, unlinked output files. Cleanup uses
+bounded process-tree scans rather than one atomic process-group signal; failure
+to complete cleanup fails the action and does not harvest outputs. This does
+not provide resource isolation against fork storms. Unsupported confinement
+fails closed.
 
 HOL toolchain bootstrap executes trusted source. Before using a toolchain,
 workers require its revision to be a commit ancestor of an approved branch.

@@ -194,10 +194,11 @@ def test_baked_release_needs_no_writable_cache_or_download(tmp_path: Path, serve
         release.holbuild("../1.2.3")
 
 
-def test_old_release_is_rejected_before_baked_lookup(tmp_path: Path, server: Server) -> None:
+@pytest.mark.parametrize("version", ["0.13.52", "0.13.53"])
+def test_old_release_is_rejected_before_baked_lookup(tmp_path: Path, server: Server, version: str) -> None:
     release = releases(tmp_path, server)
     with pytest.raises(Unreleased, match="mandatory action isolation"):
-        release.holbuild("0.13.52")
+        release.holbuild(version)
     assert not (tmp_path / "releases").exists()
 
 

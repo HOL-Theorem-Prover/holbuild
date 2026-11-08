@@ -47,6 +47,13 @@ val _ = List.app (fn dir =>
   end) ["actions", "blobs", "locks", "cooperate"];
 val _ = refuses "symlink output" (fn () => Posix.FileSys.symlink {old = "$tmpdir/cache.curl", new = "stolen"});
 val _ = if OS.Process.isSuccess (OS.Process.system "/bin/sh -c 'exit 0'") then () else raise Fail "child failed";
+val timer = Timer.startRealTimer ();
+val timeout = OS.Process.system "/usr/bin/timeout 0.1 /bin/sleep 2";
+val _ = case Posix.Process.fromStatus timeout of
+            Posix.Process.W_EXITSTATUS 0wx7c => ()
+          | _ => raise Fail "subprocess timeout failed";
+val _ = if Time.toReal (Timer.checkRealTimer timer) < 1.5 then ()
+        else raise Fail "subprocess timeout did not stop its child";
 val _ = print "credential and cache attacks denied\n";
 Theorem checked: T
 Proof
