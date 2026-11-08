@@ -197,7 +197,7 @@ def test_baked_release_needs_no_writable_cache_or_download(tmp_path: Path, serve
 def test_old_release_is_rejected_before_baked_lookup(tmp_path: Path, server: Server) -> None:
     release = releases(tmp_path, server)
     with pytest.raises(Unreleased, match="mandatory action isolation"):
-        release.holbuild("0.13.51")
+        release.holbuild("0.13.52")
     assert not (tmp_path / "releases").exists()
 
 

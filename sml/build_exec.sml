@@ -8948,6 +8948,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
             val tc =
               toolchain (#toolchain spec)
               handle e as HolbuildRemoteCache.Unavailable _ => raise e
+                   | e as ActionFailed _ => raise e
                    | e => raise action_failed ToolchainFailure (General.exnMessage e)
             val _ =
               if HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key =
@@ -8973,6 +8974,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
         val tc =
           phase "toolchain" (fn () => toolchain (#toolchain spec))
           handle e as HolbuildRemoteCache.Unavailable _ => raise e
+               | e as ActionFailed _ => raise e
                | e => raise action_failed ToolchainFailure (General.exnMessage e)
         val _ =
           if HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key =

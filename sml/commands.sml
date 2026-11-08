@@ -3234,7 +3234,9 @@ fun exec_action_command maxheap jobs args =
         | NONE => raise Error "exec-action requires --cache-limit-gb N"
     fun toolchain {git, rev, kernel = _} =
       let
-        val _ = HolbuildActionSandbox.require_trusted_repository git
+        val _ = HolbuildActionSandbox.require_trusted_repository {git = git, rev = rev}
+                handle HolbuildActionSandbox.Rejected msg =>
+                  raise HolbuildBuildExec.ActionFailed (HolbuildBuildExec.SpecRejected, msg)
         (* Every worker must run the published archive's bytes, so a build
            whose own publish lost is replaced by the stored archive. *)
         val _ = HolbuildHolSharedCache.adopt_published_archive := true

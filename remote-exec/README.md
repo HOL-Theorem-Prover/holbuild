@@ -185,7 +185,7 @@ Python 3, and `libseccomp.so.2`. The supplied image includes the userspace
 dependencies. The container's seccomp profile must permit Landlock and
 stacking another seccomp filter. `holbuild sandbox-check` exercises these
 requirements; workers reject a release whose check fails. Releases before
-0.13.52 are rejected because their HOL launch path has no mandatory sandbox.
+0.13.53 are rejected because their HOL launch path has no mandatory sandbox.
 Upgrade submitting clients before replacing workers with this version.
 
 The worker and `exec-action` remain trusted: they fetch inputs, manage memory
@@ -201,9 +201,16 @@ changes, links and special-file creation are denied. The supervisor kills
 and reaps descendants before validating and harvesting regular, unlinked
 output files. Unsupported confinement fails closed.
 
-HOL toolchain bootstrap executes trusted source. Workers accept the canonical
-HOL repository URLs by default; administrators may set the whitespace-separated
-`HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES` list for trusted mirrors or forks.
+HOL toolchain bootstrap executes trusted source. Before using a toolchain,
+workers require its revision to be a commit ancestor of an approved branch.
+The default approves `develop` and `master` in the canonical HOL repository.
+Administrators may replace these defaults with whitespace-separated
+`HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES` entries of the form
+`https://example.org/HOL.git=develop,master` for trusted mirrors or forks.
+Only these branch refs are fetched, never pull-request refs or arbitrary
+revision objects. Proven ancestry is reused from a worker-owned Git graph;
+a branch history rewrite takes effect when the next unknown revision triggers
+a refresh. Use protected branches for these trust roots.
 Bootstrap compiler/build children also have credential settings removed from
 their environment. This restriction is worker configuration, not an action
 spec option. Administrators can grant additional read-only runtime directories
