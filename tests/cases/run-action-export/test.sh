@@ -28,7 +28,8 @@ start_remote_cache_server "$remote_root" "$tmpdir/server" "$control"
 use_case_cache "$tmpdir/cache"
 
 project=$tmpdir/project
-mkdir -p "$project/src"
+mkdir -p "$project/src" "$project/testdata"
+printf 'input\n' > "$project/testdata/value.txt"
 cat > "$project/holproject.toml" <<TOML
 $(write_schema2_prelude)
 [project]
@@ -70,6 +71,9 @@ SML
 cat > "$project/src/CScript.sml" <<'SML'
 Theory C
 Ancestors B
+
+fun holbuild_extra_deps (_ : string list) = ()
+val _ = holbuild_extra_deps ["../testdata"]
 
 Theorem c_thm:
   T
@@ -312,6 +316,26 @@ for option in --tactic-timeout=5 --proof-scope=all --new-ir; do
   fi
   require_grep 'run-action does not check proof steps' "$tmpdir/proof-option.err"
 done
+
+# Declared runtime files must still have the contents used by the plan.
+touch "$control/action-get-enable"
+run_export --output input-mutation spec:CTheory > "$tmpdir/input-mutation.out" 2> "$tmpdir/input-mutation.err" &
+mutation_pid=$!
+for _ in {1..1000}; do
+  [[ -s "$control/action-get-count" ]] && break
+  sleep 0.01
+done
+[[ -s "$control/action-get-count" ]] || { echo 'export never reached availability check' >&2; exit 1; }
+printf 'other\n' > "$project/testdata/value.txt"
+touch "$control/action-get-release"
+if wait "$mutation_pid"; then
+  echo 'export accepted a runtime input changed after planning' >&2
+  exit 1
+fi
+mutation_pid=
+require_grep 'extra input changed since the build was planned' "$tmpdir/input-mutation.err"
+printf 'input\n' > "$project/testdata/value.txt"
+rm "$control/action-get-enable" "$control/action-get-release" "$control/action-get-count"
 
 # A same-size edit with restored mtime between planning and spec writing
 # must still be rejected. Gate the availability lookup after planning.

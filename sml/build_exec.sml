@@ -6990,6 +6990,19 @@ fun plan_runs tc project planned jobs
                         case excluded_reason action node of
                             SOME reason => raise Error ("run-action: " ^ name ^ " can't run remotely: " ^ reason)
                           | NONE => ()
+                      val planned_inputs = List.concat
+                        (map (fn (_, base, decl) =>
+                                map #2 (#files (HolbuildBuildPlan.input_expansion plan base decl)))
+                             (HolbuildBuildPlan.extra_input_decls plan node))
+                      val _ =
+                        if sort_strings (unique_strings planned_inputs) =
+                           sort_strings (unique_strings (map #from (#inputs action))) then ()
+                        else raise Error ("extra input files changed since the build was planned: " ^ name)
+                      val planned_hashes = HolbuildBuildPlan.input_hashes plan
+                      fun planned_hash from =
+                        case List.find (fn (path, _) => path = from) planned_hashes of
+                            SOME (_, hash) => hash
+                          | NONE => raise Error ("extra input was not hashed by the plan: " ^ from)
                       val deps = HolbuildBuildPlan.transitive_project_deps plan node
                       val closure = node :: deps
                       val in_closure = Binaryset.addList (Binaryset.empty String.compare, map HolbuildBuildPlan.key closure)
@@ -7006,7 +7019,8 @@ fun plan_runs tc project planned jobs
                        node :: List.filter is_theory_node (deps @ extras),
                        map (fn {path, from} =>
                               {path = normalize_path (String.concatWith "/"
-                                        [".holbuild/action-src", package node, path]), from = from})
+                                        [".holbuild/action-src", package node, path]),
+                               from = from, hash = planned_hash from})
                            (#inputs action))
                     end
             fun write () =
@@ -7022,9 +7036,9 @@ fun plan_runs tc project planned jobs
                     then line
                     else raise Error ("theory script changed since the build was planned: " ^ source_file node)
                   end
-                fun input_line {path, from} =
+                fun input_line {path, from, hash} =
                   let
-                    val expected = HolbuildBuildPlan.input_hash (#plan (the_plan ())) from
+                    val expected = hash
                     val line = file_line hash_file "input" (token path) from
                   in
                     if List.nth (String.tokens Char.isSpace line, 3) = expected then line
