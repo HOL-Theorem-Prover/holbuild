@@ -2,6 +2,7 @@
 
 import re
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 from remote_exec.cache import cache_nodes, node_identity
 
@@ -18,6 +19,16 @@ def credentialed_nodes(defaults: list[str], allowed: list[str]) -> dict[str, str
         full = re.sub(r'^(.*?://)', lambda m: m[1] + auth[2], url, count=1) if auth and identity == url else url
         by_identity.setdefault(identity, full)
     return by_identity
+
+
+def check_plain_http(defaults: list[str], allowed: list[str], curl_config: bool) -> None:
+    """Credentials, inline or from a curl config, reach a new endpoint only over HTTPS."""
+    if not curl_config and not any(urlsplit(url).username or urlsplit(url).password for url in defaults):
+        return
+    permanent = {node_identity(url) for url in defaults}
+    for url in allowed:
+        if urlsplit(url).scheme != 'https' and node_identity(url) not in permanent:
+            raise ValueError(f'cache credentials must not reach plain-HTTP endpoint {node_identity(url)}')
 
 
 def parse_members(text: str, defaults: list[str], allowed: list[str]) -> list[str]:

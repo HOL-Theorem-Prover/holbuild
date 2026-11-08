@@ -261,10 +261,16 @@ def test_worker_mapping_is_bounded_and_zero_ratio_disables_capacity(workers: int
     assert cache_target(workers, ratio, 4) == expected
 
 
-@pytest.mark.parametrize("url", ["http://cache.example", "https://u:p@cache.example", "https://cache.example#fragment"])
-def test_slot_identity_requires_credential_free_https(url: str) -> None:
+@pytest.mark.parametrize("url", ["ftp://cache.example", "http://u:p@cache.example", "https://u:p@cache.example",
+                                 "https://cache.example#fragment"])
+def test_slot_identity_requires_credential_free_http_or_https(url: str) -> None:
     with pytest.raises(ValueError):
         CacheSlot(name="slot", url=url)
+
+
+@pytest.mark.parametrize("url", ["http://cache.internal:8080", "https://cache.example"])
+def test_slot_identity_accepts_http_and_https(url: str) -> None:
+    assert CacheSlot(name="slot", url=url + "/").url == url
 
 
 async def test_failed_readiness_deadline_drains_before_releasing_failed_launch(pool: CachePool) -> None:

@@ -9,7 +9,7 @@ from conftest import CLIENT_TOKEN, WORKER_TOKEN
 from test_cache_pool import Provider
 
 from remote_exec.cache_pool import CachePool, CacheSlot
-from remote_exec.membership import Membership, parse_members
+from remote_exec.membership import Membership, check_plain_http, parse_members
 from remote_exec.worker import Coordinator, refresh_cache_members
 
 DEFAULTS = ['https://ci:password@cache-a.example', 'https://ci:password@cache-b.example']
@@ -25,6 +25,17 @@ def test_discovery_reuses_local_credentials_only_for_configured_endpoints() -> N
         parse_members(SNAPSHOT.replace('https://cache-c', 'https://bad:secret@cache-c'), DEFAULTS, ALLOWED)
     with pytest.raises(ValueError, match='omitted'):
         parse_members(SNAPSHOT.replace('https://cache-a.example\n', ''), DEFAULTS, ALLOWED)
+
+
+def test_credentials_reach_new_endpoints_only_over_https() -> None:
+    plain = ['http://cache-a.example', 'http://cache-c.example']
+    with pytest.raises(ValueError, match='plain-HTTP endpoint http://cache-c.example'):
+        check_plain_http(DEFAULTS, [*ALLOWED, 'http://cache-c.example'], curl_config=False)
+    with pytest.raises(ValueError, match='plain-HTTP'):
+        check_plain_http(['http://cache-a.example'], plain, curl_config=True)
+    check_plain_http(DEFAULTS, ALLOWED, curl_config=True)
+    check_plain_http(['http://cache-a.example'], plain, curl_config=False)
+    check_plain_http(['http://ci:password@cache-a.example'], ['http://cache-a.example'], curl_config=False)
 
 
 def test_discovery_keeps_complete_snapshots_and_expires_to_permanent_nodes() -> None:

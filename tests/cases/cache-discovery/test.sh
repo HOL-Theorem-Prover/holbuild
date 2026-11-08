@@ -22,5 +22,5 @@ printf '%s\n' 'header = "Authorization: Bearer fixture-token"' > "$tmpdir/discov
 DISCOVERY_DIR="$tmpdir" \
 HOLBUILD_REMOTE_CACHE_DISCOVERY_URL="http://127.0.0.1:$(cat "$tmpdir/port")/members" \
 HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG="$tmpdir/discovery.curl" \
-HOLBUILD_REMOTE_CACHE_ALLOWED_URLS='http://c.example,http://d.example,http://e.example,http://f.example' \
+HOLBUILD_REMOTE_CACHE_ALLOWED_URLS='https://c.example,https://d.example,https://e.example,https://f.example' \
 poly --script "$SCRIPT_DIR/check.sml"

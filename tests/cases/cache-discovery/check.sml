@@ -4,8 +4,8 @@ structure D = HolbuildCacheDiscovery;
 structure RC = HolbuildRemoteCache;
 fun assert message ok = if ok then () else raise Fail message;
 val dir = valOf (OS.Process.getEnv "DISCOVERY_DIR");
-val defaults = ["http://ci:password@a.example", "http://ci:password@b.example"];
-val identities = map (fn letter => "http://" ^ letter ^ ".example") ["a","b","c","d","e","f"];
+val defaults = ["https://ci:password@a.example", "https://ci:password@b.example"];
+val identities = map (fn letter => "https://" ^ letter ^ ".example") ["a","b","c","d","e","f"];
 val header = "holbuild-cache-members-v1\n";
 val snapshot = header ^ String.concatWith "\n" identities ^ "\n";
 val cache = RC.remote (String.concatWith "," defaults);
@@ -16,7 +16,7 @@ val _ = assert "credentials come from local config" (List.all (String.isSubstrin
 val _ = assert "one snapshot per thirty seconds" (D.urls defaults = nodes andalso
   RC.read_text (dir ^ "/requests") = "Bearer fixture-token\n");
 val _ = assert "reject a new credential recipient"
-  ((ignore (D.parse defaults (D.allowed defaults) (snapshot ^ "http://attacker.example\n")); false)
+  ((ignore (D.parse defaults (D.allowed defaults) (snapshot ^ "https://attacker.example\n")); false)
    handle D.Error _ => true);
 val _ = assert "reject API credentials"
   ((ignore (D.parse defaults (D.allowed defaults) (header ^ String.concatWith "\n" nodes)); false)
@@ -24,6 +24,17 @@ val _ = assert "reject API credentials"
 val _ = assert "reject missing permanent member"
   ((ignore (D.parse defaults (D.allowed defaults) (header ^ String.concatWith "\n" (tl identities))); false)
    handle D.Error _ => true);
+fun refused f = (ignore (f ()); false) handle D.Error _ => true;
+val _ = assert "credentials never reach a plain-HTTP endpoint"
+  (refused (fn () => D.check_plain_http defaults "http://g.example"));
+val plain = ["http://a.example"];
+val _ = assert "a credential-free pool may use plain HTTP"
+  (D.check_plain_http plain "http://g.example" = "http://g.example");
+val _ = HolbuildRemoteCacheConfig.set_local_curl_config (SOME (dir ^ "/cache.curl"));
+val _ = assert "a cache curl config counts as credentials"
+  (refused (fn () => D.check_plain_http plain "http://g.example") andalso
+   D.check_plain_http plain "http://a.example" = "http://a.example");
+val _ = HolbuildRemoteCacheConfig.set_local_curl_config NONE;
 val digest = HolbuildHash.string_sha256 "join-window";
 val ranked = RC.ranked_urls cache digest;
 val former = List.last ranked;
