@@ -42,6 +42,9 @@ awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec the
   HOLBUILD_CACHE="$tmpdir/worker-cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" \
     exec-action "\$spec" --cache-limit-gb 1000 --result "$state/result-\$key" \
     >> "$tmpdir/worker.log" 2>&1 || true
+  if [[ -e "$state/drop-log" ]]; then
+    rm -f "$remote_root/cas/\$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$state/result-\$key")"
+  fi
 done
 SH
 chmod +x "$tmpdir/run-batch"
@@ -159,6 +162,7 @@ hol_key=$(line hol HOL:boolTheory done)
 [[ $(< "$out/HOL/boolTheory/KEY") == "$hol_key" ]]
 [[ $(< "$out/HOL/boolTheory/CONTEXT") == HOL:boolTheory ]]
 [[ $(< "$out/HOL/boolTheory/first") == HOL:boolTheory ]]
+require_no_file "$out/HOL/boolTheory/LOG"
 require_grep '^POST /v1/batches?class=run ' "$state/requests.log"
 
 # Two targets, one cached: only the other is submitted, with the profile;
@@ -203,13 +207,18 @@ require_grep 'could not create' "$tmpdir/unwritable.err"
 line unwritable HOL:boolTheory cached > /dev/null
 line unwritable rr:CTheory missing > /dev/null
 [[ $(< "$out/HOL/boolTheory/first") == HOL:boolTheory ]]
+require_no_file "$out/HOL/boolTheory/LOG"
 out=$saved_out
 
 # One run of a batch fails its script: the other is done all the same, and
 # the command ends 0. --closure adds C's ancestry, A.
 script mixed.sml 2
 run mixed 0 --remote-exec "$coordinator" --closure --script "$runner/mixed.sml" rr:CTheory
-line mixed rr:ATheory "failed script" > /dev/null
+mixed_failed=$(line mixed rr:ATheory "failed script")
+[[ $(< "$out/rr/ATheory/KEY") == "$mixed_failed" ]]
+[[ $(< "$out/rr/ATheory/CONTEXT") == rr:ATheory@* ]]
+require_grep 'no A' "$out/rr/ATheory/LOG"
+require_grep 'holbuild: exec-action failed:' "$out/rr/ATheory/LOG"
 line mixed rr:CTheory done > /dev/null
 [[ $(wc -l < "$tmpdir/mixed.out") -eq 2 ]]
 
@@ -293,3 +302,33 @@ concurrent_key=$(line concurrent rr:CTheory done)
 # Strengthening the build's timeout contract leaves existing run keys valid.
 run fetch-timed 0 --fetch-only --script "$runner/run.sml" rr:CTheory
 [[ $(line fetch-timed rr:CTheory cached) == "$c_run" ]]
+
+# A failed run replaces earlier successful outputs in the same directory.
+cat > "$runner/fails.sml" <<'SML'
+raise Fail "failed after success";
+SML
+run failed 0 --remote-exec "$coordinator" --script "$runner/fails.sml" rr:CTheory hol:bool
+for context in rr:CTheory HOL:boolTheory; do
+  failed_key=$(line failed "$context" "failed script")
+  dir=$out/${context/:/\/}
+  [[ $(< "$dir/KEY") == "$failed_key" ]]
+  [[ $(< "$dir/CONTEXT") == "$context" || $(< "$dir/CONTEXT") == "$context@$key_c" ]]
+  require_grep 'failed after success' "$dir/LOG"
+  require_no_file "$dir/first"
+  require_no_file "$dir/second"
+done
+
+# Losing the diagnostic preserves the known failure, clears stale files,
+# and warns rather than reporting fleet unavailability.
+run before-missing-log 0 --fetch-only --script "$runner/run.sml" rr:CTheory
+require_file "$out/rr/CTheory/first"
+touch "$state/drop-log"
+run missing-log 0 --remote-exec "$coordinator" --script "$runner/fails.sml" rr:CTheory
+rm "$state/drop-log"
+missing_key=$(line missing-log rr:CTheory "failed script")
+[[ $(< "$out/rr/CTheory/KEY") == "$missing_key" ]]
+[[ $(< "$out/rr/CTheory/CONTEXT") == "rr:CTheory@$key_c" ]]
+require_grep 'could not fetch the log of failed run rr:CTheory' "$tmpdir/missing-log.err"
+require_no_file "$out/rr/CTheory/LOG"
+require_no_file "$out/rr/CTheory/first"
+require_no_file "$out/rr/CTheory/second"

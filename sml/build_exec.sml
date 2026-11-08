@@ -6756,10 +6756,10 @@ fun qualified_name text =
         else raise Error ("run-action: expected NAME or PACKAGE:NAME, got " ^ HolbuildHash.quote text)
     | _ => raise Error ("run-action: expected NAME or PACKAGE:NAME, got " ^ HolbuildHash.quote text)
 
-(* A fetched run's directory holds KEY and CONTEXT beside its outputs. *)
+(* A fetched run's directory holds KEY, CONTEXT and LOG beside its outputs. *)
 fun output_name text =
-  if text = "KEY" orelse text = "CONTEXT" then
-    raise Error ("run-action: KEY and CONTEXT are not output names: a fetched run's directory holds them")
+  if text = "KEY" orelse text = "CONTEXT" orelse text = "LOG" then
+    raise Error ("run-action: KEY, CONTEXT and LOG are not output names: a fetched run's directory holds them")
   else if text <> "" andalso String.sub (text, 0) <> #"." andalso
      CharVector.all (fn c => Char.isAlphaNum c orelse c = #"." orelse c = #"_" orelse c = #"-") text
   then text
@@ -7179,6 +7179,35 @@ fun fetch_run remote dir outputs ({name, context, run_key} : run) =
              true)
           else (remove_tree tmp; false)
         end
+
+(* Replaces a failed run's outputs with its identity and optional worker log.
+   An unavailable diagnostic must not hide the known run failure. *)
+fun fetch_failed_run remote dir ({name, context, run_key} : run) log_sha256 =
+  let
+    val (package, theory) =
+      case String.fields (fn c => c = #":") name of
+          [package, theory] => (package, theory)
+        | _ => raise Error ("internal error: run context " ^ name)
+    val final = Path.concat (Path.concat (dir, package), theory)
+    val tmp = HolbuildTempPath.near final ".fetch"
+    val log = Path.concat (tmp, "LOG")
+    val _ = (remove_tree tmp; ensure_dir tmp)
+    val _ = if (FS.isDir tmp handle OS.SysErr _ => false) then ()
+            else raise Error ("run-action: could not create " ^ tmp)
+    val _ =
+      case log_sha256 of
+          NONE => ()
+        | SOME hash =>
+            if (HolbuildRemoteCache.fetch_unlisted_blob remote {hash = hash, dst = log} =
+                HolbuildCacheBackend.Hit
+                handle HolbuildRemoteCache.Unavailable _ => false) then ()
+            else (remove_tree log; warn ("could not fetch the log of failed run " ^ name))
+  in
+    write_text (Path.concat (tmp, "KEY")) (run_key ^ "\n");
+    write_text (Path.concat (tmp, "CONTEXT")) (context ^ "\n");
+    remove_tree final;
+    FS.rename {old = tmp, new = final}
+  end
 
 (* holbuild exec-action: a remote worker builds one ActionSpec in a fixed
    action root under the cache root, with only the remote cache as input, and
