@@ -1411,7 +1411,7 @@ those the `--load` libraries need from the remote cache, so each must be
 there or in the local cache for its current inputs, from where it is
 published to the remote cache first. A target with one in neither is
 refused with `build it first`, the others are still exported, and the
-command exits 1. A fetched run's directory holds `KEY` and `CONTEXT`, so
+command exits 1. A fetched run's directory holds `KEY`, `CONTEXT` and `LOG`, so
 those aren't output names. `--support` files must lie under the
 script's directory and are named by their given path relative to it, without
 resolving symbolic links. `--load` names a library: one
@@ -1908,7 +1908,11 @@ output names, so the same run is done once. The command:
    `D/<package>/<theory>/` (`D/HOL/<theory>/` for a toolchain theory),
    replacing what was there: `KEY` holds the run key, `CONTEXT` the run
    text's context (`<package>:<theory>@<input_key>` or `HOL:<theory>`), and
-   each declared output its file.
+   each declared output its file. For a `failed` run, replaces the same
+   directory with `KEY`, `CONTEXT` and, when available, `LOG` containing the
+   worker's diagnostic. If a reported log cannot be fetched, warns on stderr
+   and leaves `LOG` absent; the run stays `failed` and still counts toward
+   exit status 0. Successful and cached runs have no `LOG`.
 6. Prints one line per run on stdout, in the targets' order:
 
    ```text
