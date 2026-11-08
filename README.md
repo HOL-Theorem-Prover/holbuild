@@ -1426,6 +1426,7 @@ The spec is written to `.holbuild/run-specs/<spec-sha256>` and uploaded to
 holbuild-run-v1
 toolchain=<semantic toolchain key>
 context=<package>:<logical>@<input_key>   (or context=HOL:<logical>)
+context-input-layout=package-v1          (only contexts declaring extra inputs)
 script=<sha256>
 support=<relpath>@<sha256>                  (sorted)
 load=<package>:<logical>@<input_key>        (a project library; in order)
@@ -1435,7 +1436,9 @@ output=<name>                               (sorted)
 
 The toolchain key fixes HOL's own theories and libraries, so they carry no
 key of their own. Options such as the timeout stay out of the key: a longer
-timeout doesn't make a new run. A run's result is stored, like a theory's,
+timeout doesn't make a new run. The input-layout marker distinguishes runs
+with staged declared inputs from earlier runs that could not read those files.
+Input-free and HOL context run keys are unchanged. A run's result is stored, like a theory's,
 under `ac-key = sha256("holbuild-remote-ac-v1\n" ^ run_key ^ "\n")`.
 
 A run spec names no path on the exporting machine:
@@ -1452,6 +1455,7 @@ dep theory <package>:<logical> <stem> <input_key>
 lib <package>:<logical> <stem> <suffix> <load>...
 load theory|library|object <name-or-stem>
 file context-script <relpath> <sha256> <size>
+file input <relpath> <sha256> <size>
 script <sha256> <size>
 file support <relpath> <sha256> <size>
 run-load <package>:<logical>|HOLLIB:<name>
@@ -1470,6 +1474,13 @@ run-text
   every theory it depends on, under `.holbuild/action-src/<package>/`, for
   scripts that read their ancestry's sources. For a project context the
   first is the context theory's own.
+- `file input` lines carry the context theory's declared runtime files
+  (`holbuild_extra_deps` and manifest `extra_inputs`) under that same
+  package-relative source tree. A script replaying the context can run from
+  the directory of `HOLBUILD_RUN_SOURCE` so source-relative reads resolve.
+  Ancestors are restored as objects; their runtime inputs are not inherited.
+  Undeclared files are not copied, and inputs outside the package are refused.
+  These contents already contribute to the context input key and run key.
 - `run-load` lines are the libraries to load, in order: a project library by
   its `lib` line's name, a toolchain library as `HOLLIB:<name>`.
 - `output` lines are the file names the script must write.
@@ -1618,10 +1629,10 @@ analysers, and a toolchain another holbuild process is using is kept.
 
 Workers sharing a host coordinate sweeps through `<cache root>/locks/gc.lock`;
 share `locks/` along with the cache directories. Private checkpoints and theory modules are sized
-on every action. Shared sizes can be reused for up to 60 seconds when the last
-measurement, current checkpoints and an extra cushion of the larger of 32 GiB
-or the reserve still fit under the target. Small caps and caches near their
-target are scanned live. This is a housekeeping limit: shared growth during
+on every action. With a positive reserve and a target of at least 64 GiB,
+shared sizes can be reused for up to 60 seconds when the last measurement plus
+current private sizes fit under the target. Smaller targets and zero-reserve
+runs are scanned live. This is a housekeeping limit: shared growth during
 that interval is accounted for at the next scan, rather than reserved on each
 write. Each cached root's device and inode must match the measurement; roots
 that differ are sized live, so partial directory sharing remains safe without
