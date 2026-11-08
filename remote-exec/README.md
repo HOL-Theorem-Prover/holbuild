@@ -215,6 +215,10 @@ to complete cleanup fails the action and does not harvest outputs. This does
 not provide resource isolation against fork storms. Unsupported confinement
 fails closed.
 
+`--share-heaps` publishes heaps by dependency context and checkpoints by script
+prefix in the remote cache; use it only with a single tenant or trusted cache
+submitters. It does not provide tenant authorization for shared cache entries.
+
 The supervisor confirms cleanup and output validation through a completion
 file outside the child's filesystem grants. Without that confirmation, the
 worker treats the run as an infrastructure failure and publishes no checkpoints.

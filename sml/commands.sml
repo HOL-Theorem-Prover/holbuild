@@ -3250,8 +3250,7 @@ fun exec_action_command maxheap jobs args =
                        {git = git, rev = rev, kernel_variant = kernel_variant}
         val tc = {holdir = holdir, maxheap = maxheap, kernel_variant = kernel_variant}
         val _ = HolbuildActionSandbox.toolchain_root := holdir
-        val _ = HolbuildActionSandbox.poly_root :=
-                  OS.Path.dir (OS.Path.dir (HolbuildHolSharedCache.poly_executable_path ()))
+        val _ = HolbuildActionSandbox.poly_executable := HolbuildHolSharedCache.poly_executable_path ()
       in
         configure_analyser_for_toolchain tc; tc
       end

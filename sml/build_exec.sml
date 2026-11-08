@@ -9016,6 +9016,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
           SOME path => path
         | NONE => current_build_log (current_log_dir root (#1 (!target)) (#2 (!target)))
     fun upload_log () =
+      if not (!HolbuildActionSandbox.outputs_validated) then NONE else
       let val path = build_log ()
       in
         if not (file_exists path) then NONE
@@ -9164,6 +9165,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                 remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints)
               end
               handle Error msg =>
+                if not (!HolbuildActionSandbox.outputs_validated) then
+                  raise ActionFailed (InternalFailure, msg)
+                else
                 let val log_text = read_text (build_log ()) handle _ => ""
                 in
                   raise ActionFailed
@@ -9204,6 +9208,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                 end
               val (status, failure) = attempt ()
               val _ =
+                if not (!HolbuildActionSandbox.outputs_validated) then () else
                 case failure of
                     NONE => ()
                   | SOME (_, msg) =>

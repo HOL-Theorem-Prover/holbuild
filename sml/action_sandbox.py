@@ -281,8 +281,9 @@ def process_info(pid: int) -> tuple[int, int]:
 
 
 def thread_group(tid: int) -> int:
-    for line in Path(f"/proc/{tid}/status").read_bytes().splitlines():
-        if line.startswith(b"Tgid:"):
+    # comm may contain carriage returns, so only kernel LF boundaries count.
+    for line in Path(f"/proc/{tid}/status").read_bytes().split(b"\n"):
+        if line.startswith(b"Tgid:\t"):
             return int(line.split()[1])
     raise SandboxError("missing process thread group")
 
@@ -665,7 +666,9 @@ def main() -> int:
             # an action, including CONFIG_PROC_CHILDREN and pidfd support.
             with tempfile.TemporaryDirectory(prefix="holbuild-sandbox-") as directory:
                 root = Path(directory)
-                readable = [Path(path).resolve() for path in ("/usr", "/bin", "/lib", "/lib64") if Path(path).exists()]
+                readable = [Path(path).resolve() for path in
+                            ("/usr", "/bin", "/lib", "/lib64", "/etc/ld.so.cache", sys.prefix, sys.base_prefix)
+                            if Path(path).exists()]
                 return run(linux, Policy([root], readable, []),
                            [sys.executable, "-I", "-c", "import os; os.kill(os.getpid(), 0)"])
         policy = Policy(
@@ -685,7 +688,7 @@ def main() -> int:
         if args.completed is not None:
             args.completed.write_text("validated\n")
         return status
-    except (OSError, SandboxError) as error:
+    except Exception as error:
         print(f"holbuild sandbox: {error}", file=sys.stderr)
         if args.completed is not None:
             try:

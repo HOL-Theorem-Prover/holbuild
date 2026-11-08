@@ -6,7 +6,7 @@ exception Rejected of string
 
 val private_roots : (string * string) option ref = ref NONE
 val toolchain_root = ref ""
-val poly_root = ref ""
+val poly_executable = ref ""
 val outputs_validated = ref false
 
 fun active () = Option.isSome (!private_roots)
@@ -153,13 +153,15 @@ fun wrap completed argv =
         fun full path = OS.FileSys.fullPath path
         fun fields name =
           case OS.Process.getEnv name of SOME text => String.tokens (fn c => c = #":") text | NONE => []
-        val poly_prefix = !poly_root
+        val poly_prefix = OS.Path.dir (OS.Path.dir (!poly_executable))
+        val poly_libraries = map (fn path => OS.Path.concat(poly_prefix, path))
+                              ["lib", "lib64"]
         val readable = List.filter exists
-          ([!toolchain_root, HolbuildRuntimePaths.runtime_root (), poly_prefix,
+          ([!toolchain_root, HolbuildRuntimePaths.runtime_root (), !poly_executable,
             "/usr", "/bin", "/sbin", "/lib", "/lib64", "/dev/urandom", "/dev/zero", "/proc/meminfo",
             "/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d", "/etc/localtime",
             "/etc/ssl/certs", "/etc/nsswitch.conf", "/etc/hosts", "/etc/resolv.conf", "/etc/gai.conf"] @
-           fields "HOLBUILD_ACTION_READ_DIRS")
+           poly_libraries @ fields "HOLBUILD_ACTION_READ_DIRS")
         val cache = full (HolbuildCacheConfig.cache_root ())
         val protected_paths =
           map (fn part => OS.Path.concat (cache, part))

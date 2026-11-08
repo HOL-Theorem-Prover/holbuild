@@ -76,6 +76,10 @@ setup_status=$?
 set -e
 [[ $setup_status == 3 ]] || { cat "$tmpdir/setup.log" "$tmpdir/setup.result" >&2; exit 1; }
 require_grep '^failure=internal$' "$tmpdir/setup.result"
+if grep -q '^log=' "$tmpdir/setup.result"; then
+  echo 'failed confinement harvested an unvalidated log' >&2
+  exit 1
+fi
 require_grep 'sandbox did not complete cleanup and output validation' "$tmpdir/setup.log"
 # A trusted parent process starts with sentinel credentials in its original
 # environment, so /proc/PID/environ tests the actual leak rather than setenv.

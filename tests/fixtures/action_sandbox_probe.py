@@ -46,6 +46,12 @@ def attack(root: Path, worker: int, secret: Path, shared: Path) -> None:
     sibling = int((root / "future.pid").read_text())
     refuses("future sibling signals", lambda: os.kill(sibling, 0))
     libc = ctypes.CDLL(None, use_errno=True)
+    tgkill = 131 if platform.machine() == "aarch64" else 234
+    for name in (f"\rTgid: {worker}".encode(), b"\rTgid:", b"\rTgid: x"):
+        assert libc.prctl(15, name, 0, 0, 0) == 0
+        refuses("forged caller signals", lambda: os.kill(worker, 0))
+        result = libc.syscall(tgkill, worker, worker, 0)
+        assert result == -1 and ctypes.get_errno() == errno.EPERM, "forged caller thread signal accepted"
     assert libc.prctl(15, b"\xff-action", 0, 0, 0) == 0  # /proc task names are bytes, not UTF-8.
     for option in (22, (1 << 32) | 22):
         result = libc.prctl(ctypes.c_ulong(option), 2, 0, 0, 0)
