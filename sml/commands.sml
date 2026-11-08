@@ -301,7 +301,8 @@ fun run_action_help () = print
   \PACKAGE:NAME), a theory of the HOL toolchain (hol:bool or hol:boolTheory),\n\
   \or hol:* for every theory of the toolchain. A project theory must be built\n\
   \(in the local or remote cache) first; one only the local cache holds is\n\
-  \published to the remote cache.\n\n\
+  \published to the remote cache. Contexts reuse timed and untimed artifacts;\n\
+  \proof-step timeouts are checked by build, not by run-action.\n\n\
   \--support F     A file the script reads, under the script's directory.\n\
   \--load L        A library to load before the script, in order.\n\
   \--output N      A file the script writes; at least one.\n\
@@ -316,7 +317,7 @@ fun run_action_help () = print
   \missing), 75 when the coordinator can't take or finish the batch or an\n\
   \ended run can't be fetched, and 1 on errors, a cancelled batch, or a\n\
   \TARGET that isn't built.\n\n\
-  \Takes build's cache and proof options. Needs --remote-cache.\n\n\
+  \Takes build's cache options. Needs --remote-cache.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun export_help () = print
@@ -1909,13 +1910,16 @@ fun run_action_command tc cli_jobs args =
             then raise Error ("run-action: " ^ flag ^ " requires a value")
             else [flag]
     val rest = parse args
-    val (flags as {dry_run, watch, trace_steps, repl_on_failure, execution_plan, use_cache, ...}, targets) =
-      split_flags rest
+    val (flags as {dry_run, watch, trace_steps, repl_on_failure, execution_plan, use_cache,
+                   tactic_timeout_set, proof_scope, new_ir, ...}, targets) =
+      split_flags ("--skip-proof-steps" :: rest)
     val _ =
       if dry_run orelse watch orelse trace_steps orelse repl_on_failure orelse Option.isSome execution_plan then
         raise Error "run-action does not run builds: remove --dry-run, --watch, --trace-steps and --repl-on-failure"
       else if not use_cache then
         raise Error "run-action: a run's context comes from the cache, so --no-cache can't apply"
+      else if tactic_timeout_set orelse proof_scope = HolbuildTacticTimeoutPolicy.ProofAll orelse new_ir then
+        raise Error "run-action does not check proof steps: remove --tactic-timeout, --proof-scope=all and --new-ir"
       else if !export_only andalso
               (!fetch_only orelse !remote_only orelse Option.isSome (!url) orelse
                Option.isSome (!outputs_dir) orelse Option.isSome (!profile)) then
