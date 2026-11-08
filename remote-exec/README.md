@@ -452,8 +452,9 @@ An unknown class returns 422.
 
 `GET /v1/queue`
 
-- 200 `{"waiting": 0, "ready_standard": 0, "ready_high": 0, "running_standard": 0, "running_high": 0, "ready_run": 0, "running_run": 0, "desired_burst_workers": 0, "hosts": [<host>, …], "phases": <phases>, "scaler": <scaler>}`:
-  the unfinished actions of running batches, the burst worker target, the
+- 200 `{"waiting": 0, "ready_standard": 0, "ready_high": 0, "running_standard": 0, "running_high": 0, "ready_run": 0, "running_run": 0, "run_slots": 30, "run_floor": 0, "desired_burst_workers": 0, "hosts": [<host>, …], "phases": <phases>, "scaler": <scaler>}`:
+  the unfinished actions of running batches, the configured run cap (`run_slots`)
+  and effective reserved floor (`run_floor`, clamped to that cap), the burst worker target, the
   hosts whose workers reported to this coordinator process in the last 2
   minutes, by id, the sums of the phase reports it got in the last 10
   minutes (see "Running"), and the last run of `REMOTE_EXEC_SCALE_CMD` in

@@ -137,6 +137,8 @@ async def test_queue_reports_counts_and_the_desired_burst_workers(
         "running_high": 1,
         "ready_run": 2,
         "running_run": 1,
+        "run_slots": 30,
+        "run_floor": 0,
         "desired_burst_workers": 0,  # the route's coordinator has no burst workers to ask for
         "hosts": [],
         "phases": None,  # see test_queue_sums_the_phases_workers_reported_in_the_last_ten_minutes
@@ -148,6 +150,20 @@ async def test_queue_reports_counts_and_the_desired_burst_workers(
     response = await http.get("/v1/queue", headers=CLIENT)
     assert response.json()["scaler"] == {"workers": 4, "at": "2026-01-01T12:00:00+00:00", "error": "scale 4 exited 1"}
     assert (await http.get("/v1/queue", headers=WORKER)).status_code == 401
+
+
+@pytest.mark.parametrize(("slots", "floor", "effective"), [(30, 4, 4), (2, 8, 2), (0, 4, 0)])
+async def test_queue_reports_effective_run_capacity(
+    http: httpx.AsyncClient, coordinator: Coordinator, slots: int, floor: int, effective: int
+) -> None:
+    coordinator.settings.run_slots = slots
+    coordinator.settings.run_floor = floor
+
+    response = await http.get("/v1/queue", headers=CLIENT)
+
+    assert response.status_code == 200
+    assert response.json()["run_slots"] == slots
+    assert response.json()["run_floor"] == effective
 
 
 async def test_failing_scale_command_neither_stops_the_sweep_nor_counts_as_applied(
