@@ -33,6 +33,7 @@ from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
+from remote_exec.auth import cache_discovery_token
 from remote_exec.cache import cache_nodes, ranked_nodes
 from remote_exec.membership import REFRESH_SECONDS, Membership, check_plain_http
 
@@ -278,6 +279,7 @@ class Releases:
     source_url: str
     remote_cache: str
     curl_config: str | None
+    discovery_config: str | None = field(default=None, kw_only=True)
     joining: bool = field(default=False, kw_only=True)
     drain: Drain = field(default_factory=Drain, kw_only=True, compare=False)
 
@@ -647,13 +649,17 @@ def failed_record(spec_sha256: str, failure: str) -> str:
     return f"holbuild-action-result-v1\nspec={spec_sha256}\ninput-key=\nstatus=failed\nfailure={failure}\n"
 
 
-def exec_action_env() -> dict[str, str]:
-    return {
+def exec_action_env(*, discovery_config: str | None = None) -> dict[str, str]:
+    env = {
         name: value
         for name, value in os.environ.items()
         if (name in EXEC_ACTION_ENV or name.lower() in PROXY_ENV or name.startswith("HOLBUILD_"))
-        and name != "HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN"
+        and name not in ("HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN", "HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG")
+        and not name.startswith("HOLBUILD_REMOTE_EXEC_")
     }
+    if discovery_config is not None:
+        env["HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG"] = discovery_config
+    return env
 
 
 def exec_action_command(
@@ -798,7 +804,7 @@ def execute(
         stepped = time.monotonic()
         process = subprocess.Popen(
             exec_action_command(args, holbuild, spec, result, claim.get("max_heap_mb")),
-            env=exec_action_env(),
+            env=exec_action_env(discovery_config=releases.discovery_config),
             start_new_session=True
         )
         drained_out = False
@@ -934,6 +940,8 @@ def main() -> None:
     token = os.environ.get("REMOTE_EXEC_WORKER_TOKEN")
     if not token:
         sys.exit("REMOTE_EXEC_WORKER_TOKEN is not set")
+    if "\r" in token or "\n" in token:
+        sys.exit("worker token must not contain a newline")
     # exec-action's --cache-limit-gb sweeps the whole cache root, so it must be the worker's own.
     if not os.environ.get("HOLBUILD_CACHE"):
         sys.exit("HOLBUILD_CACHE is not set; give the worker its own cache root")
@@ -971,12 +979,11 @@ def main() -> None:
             membership = Membership(defaults, allowed)
             directory = resources.enter_context(tempfile.TemporaryDirectory(prefix="holbuild-cache-discovery-"))
             config = os.path.join(directory, "auth.curl")
-            if "\r" in token or "\n" in token:
-                sys.exit("worker token must not contain a newline")
-            header = ("Authorization: Bearer " + token).replace("\\", "\\\\").replace('"', '\\"')
+            # Builds share our uid, so file permissions cannot protect the worker bearer from them.
+            header = "Authorization: Bearer " + cache_discovery_token(token)
             with open(config, "x", opener=lambda path, flags: os.open(path, flags, 0o600)) as out:
                 out.write('header = "' + header + '"\n')
-            os.environ["HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG"] = config
+            releases = replace(releases, discovery_config=config)
         while not drain.stop.is_set():
             if args.cooperate_dir is not None:
                 try:
