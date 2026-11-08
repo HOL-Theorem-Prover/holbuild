@@ -191,7 +191,7 @@ support. The supplied image includes the userspace
 dependencies. The container's seccomp profile must permit Landlock and
 stacking a notifying seccomp filter. `holbuild sandbox-check` exercises these
 requirements; workers reject a release whose check fails. Releases before
-0.13.54 are rejected because their HOL launch path has no mandatory sandbox.
+0.13.56 are rejected because their HOL launch path has no mandatory sandbox.
 Upgrade submitting clients before replacing workers with this version.
 
 The worker and `exec-action` remain trusted: they fetch inputs, manage memory
@@ -200,7 +200,8 @@ policy and a seccomp syscall filter. It receives read access to its selected
 HOL toolchain, holbuild runtime, Poly/ML and system runtime files, and write
 access to fresh action, checkpoint, home and temporary directories. Shared
 cache files are copied into these directories. The directories are removed
-after the action, including when shared heaps are disabled. The child receives
+after the action, including when shared heaps are disabled. Worker-private
+checkpoint and compiled-module state is not retained across actions. The child receives
 no cache credentials, worker token, inherited lease descriptors or Linux
 capabilities. Cross-process inspection, metadata changes, links and special-file
 creation are denied. A trusted signal supervisor permits process and group

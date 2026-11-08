@@ -21,8 +21,10 @@ name = "isolation"
 members = ["src"]
 TOML
 for dir in actions blobs locks cooperate; do
-  mkdir -p "$tmpdir/shared/$dir"
-  echo original > "$tmpdir/shared/$dir/other"
+  for base in "$tmpdir/shared" "$tmpdir/worker"; do
+    mkdir -p "$base/$dir"
+    echo original > "$base/$dir/other"
+  done
 done
 printf 'user = "sentinel:credential"\n' > "$tmpdir/cache.curl"
 chmod 600 "$tmpdir/cache.curl"
@@ -40,11 +42,11 @@ val _ = if Option.isSome (OS.Process.getEnv "HOLBUILD_REMOTE_CACHE_CURL_CONFIG")
 val pid = valOf (OS.Process.getEnv "HOLBUILD_RUN_PROBE_PID");
 val _ = refuses "worker environ" (read ("/proc/" ^ pid ^ "/environ"));
 val _ = refuses "cache credential" (read "$tmpdir/cache.curl");
-val _ = List.app (fn dir =>
-  let val path = "$tmpdir/shared/" ^ dir ^ "/other"
+val _ = List.app (fn base => List.app (fn dir =>
+  let val path = base ^ "/" ^ dir ^ "/other"
   in refuses "shared write" (fn () => TextIO.closeOut (TextIO.openOut path));
      refuses "shared delete" (fn () => OS.FileSys.remove path)
-  end) ["actions", "blobs", "locks", "cooperate"];
+  end) ["actions", "blobs", "locks", "cooperate"]) ["$tmpdir/shared", "$tmpdir/worker"];
 val _ = refuses "symlink output" (fn () => Posix.FileSys.symlink {old = "$tmpdir/cache.curl", new = "stolen"});
 val _ = if OS.Process.isSuccess (OS.Process.system "/bin/sh -c 'exit 0'") then () else raise Fail "child failed";
 val timer = Timer.startRealTimer ();
@@ -86,7 +88,9 @@ require_grep 'sandbox did not complete cleanup and output validation' "$tmpdir/s
 require_grep '^status=built$' "$tmpdir/result"
 log=$(sed -n 's/^log=\([^ ]*\) .*/\1/p' "$tmpdir/result")
 require_grep 'credential and cache attacks denied' "$tmpdir/remote/cas/$log"
-for dir in actions blobs locks cooperate; do require_grep '^original$' "$tmpdir/shared/$dir/other"; done
+for dir in actions blobs locks cooperate; do
+  for base in "$tmpdir/shared" "$tmpdir/worker"; do require_grep '^original$' "$base/$dir/other"; done
+done
 [[ ! -e "$tmpdir/worker/action" && ! -e "$tmpdir/worker/checkpoints" ]]
 
 # Trust rejection is final, even for a warm/cached action. No source from an
