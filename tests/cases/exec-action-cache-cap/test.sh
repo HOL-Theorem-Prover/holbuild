@@ -199,6 +199,109 @@ evicted "$cache2/blobs/$own" "a blob only an evicted entry named"
 kept "$cache2/actions/newer" "an entry once the cache fits"
 kept "$cache2/blobs/$shared" "a blob a surviving entry names"
 
+# Young unpublished blobs are last even when a newer manifest can free space.
+cache3=$tmpdir/cache3
+young=$(printf young | sha256sum | cut -d' ' -f1)
+referenced=$(printf referenced | sha256sum | cut -d' ' -f1)
+sparse "$cache3/blobs/$young" 1
+sparse "$cache3/blobs/$referenced" 2
+mkdir -p "$cache3/actions/newer"
+printf 'blob dat %s\n' "$referenced" > "$cache3/actions/newer/manifest"
+python3 - "$cache3/blobs/$young" <<'YOUNG'
+import os, sys, time
+when = time.time() - 10
+os.utime(sys.argv[1], (when, when))
+YOUNG
+set +e
+HOLBUILD_CACHE=$cache3 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
+  --result "$tmpdir/result" --cache-limit-gb 2 --cache-reserve-gb 0 > "$tmpdir/young.log" 2>&1
+set -e
+kept "$cache3/blobs/$young" "an in-flight orphan while another family could free space"
+evicted "$cache3/actions/newer" "a published family before a young orphan"
+# Grace never overrides the requested target.
+set +e
+HOLBUILD_CACHE=$cache3 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
+  --result "$tmpdir/result" --cache-limit-gb 1 --cache-reserve-gb 1 > "$tmpdir/grace.log" 2>&1
+set -e
+evicted "$cache3/blobs/$young" "a young orphan when nothing else could reach the target"
+
+# Reuse only a recent shared measurement with enough extra headroom.
+cache4=$tmpdir/cache4
+sparse "$cache4/blobs/first" 1
+sweep4() {
+  local status=0
+  HOLBUILD_CACHE=$cache4 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
+    --result "$tmpdir/result" --cache-limit-gb "$1" --cache-reserve-gb "$2" \
+    > "$tmpdir/stamp.log" 2>&1 || status=$?
+  [[ $status -eq 4 ]] || { cat "$tmpdir/stamp.log" >&2; exit 1; }
+}
+sweep4 100 1
+state=$cache4/locks/worker-cache-cap.state
+[[ -s "$state" ]] || { echo "no shared sweep measurement" >&2; exit 1; }
+cp "$state" "$tmpdir/first-state"
+sparse "$cache4/blobs/second" 1
+sweep4 100 1
+cmp "$state" "$tmpdir/first-state" || { echo "fresh roomy measurement was not reused" >&2; exit 1; }
+# A small cap scans apparent bytes, including nested sparse growth.
+mkdir -p "$cache4/checkpoint-store/family/nested"
+sparse "$cache4/checkpoint-store/family/nested/heap" 1
+sweep4 7 1
+! cmp -s "$state" "$tmpdir/first-state" || { echo "small cap reused a measurement" >&2; exit 1; }
+python3 - "$state" <<'BYTES'
+import pathlib, sys
+assert int(pathlib.Path(sys.argv[1]).read_text().split()[2]) >= 3 * 1024 ** 3
+BYTES
+cp "$state" "$tmpdir/small-state"
+# Current reserve and private checkpoints participate in the headroom gate.
+sweep4 100 50
+! cmp -s "$state" "$tmpdir/small-state" || { echo "increased reserve reused a measurement" >&2; exit 1; }
+cp "$state" "$tmpdir/reserve-state"
+sparse "$cache4/checkpoints/pkg/PrivateScript.deps/key/deps_loaded.save" 70
+sweep4 100 1
+! cmp -s "$state" "$tmpdir/reserve-state" || { echo "private checkpoints were omitted from headroom" >&2; exit 1; }
+# Expired, future-dated and malformed state must all fall back to a scan.
+for measured in 0 999999999999999999999999 broken; do
+  printf 'holbuild-worker-cache-cap-v1\n%s\n0\n' "$measured" > "$state"
+  cp "$state" "$tmpdir/invalid-state"
+  sweep4 100 1
+  ! cmp -s "$state" "$tmpdir/invalid-state" || { echo "invalid measurement reused" >&2; exit 1; }
+done
+
+# Distinct container roots coordinate through host-shared locks/. A waiter
+# rechecks the stamp after locking, so a sibling's scan satisfies it.
+cache5=$tmpdir/cache5
+mkdir -p "$cache5"
+ln -s "$cache4/locks" "$cache5/locks"
+printf 'holbuild-worker-cache-cap-v1\n0\n0\n' > "$state"
+python3 - "$HOLBUILD_BIN" "$cache5" "$state" "$remote_url" "$absent" "$tmpdir" <<'LOCK'
+import fcntl, os, pathlib, subprocess, sys, time
+binary, cache, state, remote, absent, tmp = sys.argv[1:]
+with open(pathlib.Path(state).parent / "gc.lock", "a") as lock:
+    fcntl.lockf(lock, fcntl.LOCK_EX)
+    with open(pathlib.Path(tmp) / "waiter.log", "w") as log:
+        child = subprocess.Popen(
+            [binary, "--remote-cache", remote, "exec-action", absent,
+             "--result", str(pathlib.Path(tmp) / "waiter-result"),
+             "--cache-limit-gb", "100", "--cache-reserve-gb", "1"],
+            env={**os.environ, "HOLBUILD_CACHE": cache}, stdout=log, stderr=log)
+        try:
+            try:
+                child.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+            else:
+                raise AssertionError("sweep did not wait on the host-shared lock")
+            fresh = f"holbuild-worker-cache-cap-v1\n{time.time_ns()}\n12345\n"
+            pathlib.Path(state).write_text(fresh)
+            fcntl.lockf(lock, fcntl.LOCK_UN)
+            assert child.wait(timeout=30) == 4
+            assert pathlib.Path(state).read_text() == fresh, "waiter repeated sibling's scan"
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+LOCK
+
 # An error outside the action, here no remote cache, is an infrastructure
 # failure (exit 3), never the final exit 1.
 set +e
