@@ -433,6 +433,7 @@ def test_action_runs_without_the_worker_token(
     server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
     monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", "worker-secret")
     monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN", "worker-secret")
+    monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG", str(tmp_path / "worker.curl"))
     monkeypatch.setenv("UNRELATED", "1")
     monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
     monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_CURL_CONFIG", str(tmp_path / "cache.curl"))
@@ -450,6 +451,7 @@ def test_action_runs_without_the_worker_token(
     env = dict(line.split("=", 1) for line in Path(f"{logs[1]}.env").read_text().splitlines() if "=" in line)
     assert "REMOTE_EXEC_WORKER_TOKEN" not in env
     assert "HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN" not in env
+    assert "HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG" not in env
     assert "worker-secret" not in env.values()
     assert "UNRELATED" not in env
     assert env["HTTPS_PROXY"] == "http://proxy.test:3128"
@@ -1151,11 +1153,12 @@ def test_worker_discovery_exposes_only_a_scoped_token_to_the_action_and_cleans_i
     ))
     monkeypatch.setattr(worker, "refresh_cache_members", lambda _c, membership, _url, now: membership.current(now))
     paths: list[Path] = []
+    claims = iter([claim()])
 
     def claim_then_exit(*_: object) -> dict[str, object]:
-        if not paths:
-            paths.append(Path(os.environ["HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG"]))
-            return claim()
+        claimed = next(claims, None)
+        if claimed is not None:
+            return claimed
         env = dict(line.split("=", 1) for line in Path(f"{logs[1]}.env").read_text().splitlines() if "=" in line)
         assert "REMOTE_EXEC_WORKER_TOKEN" not in env
         assert "HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN" not in env
@@ -1167,8 +1170,8 @@ def test_worker_discovery_exposes_only_a_scoped_token_to_the_action_and_cleans_i
                 assert token.encode() not in path.read_bytes()
         assert env["HOLBUILD_REMOTE_CACHE_DISCOVERY_URL"] == server.url + "/v1/cache/members"
         assert env["HOLBUILD_REMOTE_CACHE_CURL_CONFIG"] == str(cache_config)
-        config = Path(os.environ["HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG"])
-        assert env["HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG"] == str(config)
+        config = Path(env["HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG"])
+        paths.append(config)
         assert config != inherited_config
         assert config.stat().st_mode & 0o777 == 0o600
         assert config.parent.stat().st_mode & 0o777 == 0o700
@@ -1181,6 +1184,20 @@ def test_worker_discovery_exposes_only_a_scoped_token_to_the_action_and_cleans_i
     assert server.completed == [RECORD]
     assert logs[1].read_text().split()[:2] == ["--remote-cache", server.url]
     assert len(paths) == 1 and not paths[0].exists()
+
+
+@pytest.mark.parametrize("newline", ["\r", "\n", "\r\n"])
+def test_worker_rejects_newlines_before_an_http_error_can_print_its_token(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], newline: str
+) -> None:
+    token = "worker-secret" + newline
+    monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", token)
+    monkeypatch.setattr(worker, "parse_args", lambda: worker_args(tmp_path, server))
+    with pytest.raises(SystemExit) as error:
+        worker.main()
+    assert str(error.value) == "worker token must not contain a newline"
+    captured = capsys.readouterr()
+    assert "worker-secret" not in captured.out + captured.err
 
 
 def test_worker_refreshes_bootstrap_membership_after_memory_and_claim_waits(

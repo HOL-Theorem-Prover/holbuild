@@ -134,9 +134,12 @@ its user, so the credentials can come from the environment. `HOLBUILD_CACHE`
 is `/var/cache/holbuild` in the image. It must be the worker's own cache root:
 `exec-action --cache-limit-gb` sweeps the whole root before each action, so a
 root shared with ordinary builds would lose their cache. `exec-action` runs
-with only the worker's `HOLBUILD_*` variables, `PATH`, `HOME`, `TMPDIR`, the
-locale, and curl's certificate and proxy settings, so the worker token stays
-out of the builds' environment (and out of what they log or pass on). A
+with the worker's `HOLBUILD_*` build settings, `PATH`, `HOME`, `TMPDIR`, the
+locale, and curl's certificate and proxy settings. It excludes
+`HOLBUILD_REMOTE_EXEC_*`, `HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN` and inherited
+discovery curl configs; with discovery enabled it receives only the worker's
+generated read-only discovery config (see below). The worker token stays out
+of the builds' environment and discovery files. A
 build runs as the worker's user, so one that goes looking can still read the
 token from the worker's `/proc/<pid>/environ`. Outside the image,
 `python3 -m remote_exec.worker` runs the worker; it uses only the standard
