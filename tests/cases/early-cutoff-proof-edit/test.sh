@@ -161,23 +161,23 @@ build "$tmpdir/precedence-edit.log"
 require_no_cutoff BTheory "$tmpdir/precedence-edit.log"
 require_grep "BTheory built" "$tmpdir/precedence-edit.log"
 
-# Data of a codec holbuild doesn't know keeps A hashed as written, so a
-# change to the note, which the data stores as a string-table index,
-# rebuilds B.
-write_a $'(* a comment\n   of three\n   lines *)' "simp[helper2]" "(1:num) + 1 = 2" 501 note
-build "$tmpdir/note.log"
-grep -q "ATheory.dat as written: theory data note" "$project"/.holbuild/logs/current/*/ATheory/build.log ||
-  { echo "ATheory's build log has no warning that it is hashed as written" >&2
-    cat "$project"/.holbuild/logs/current/*/ATheory/build.log >&2; exit 1; }
-write_a $'(* a comment\n   of three\n   lines *)' "simp[helper2]" "(1:num) + 1 = 2" 501 other
-build "$tmpdir/note-edit.log"
-require_no_cutoff BTheory "$tmpdir/note-edit.log"
-require_grep "BTheory built" "$tmpdir/note-edit.log"
-
-# A statement change in A rebuilds B and C.
-write_a $'(* a comment\n   of three\n   lines *)' "simp[]" "(2:num) + 2 = 4"
+# A statement change in A, with the precedence kept, rebuilds B and C.
+write_a $'(* a comment\n   of three\n   lines *)' "simp[]" "(2:num) + 2 = 4" 501
 build "$tmpdir/statement-edit.log"
 require_no_cutoff BTheory "$tmpdir/statement-edit.log"
 require_no_cutoff CTheory "$tmpdir/statement-edit.log"
 require_grep "BTheory built" "$tmpdir/statement-edit.log"
 require_grep "CTheory built" "$tmpdir/statement-edit.log"
+
+# Data of a codec holbuild doesn't know keeps A hashed as written, so a
+# change to the note, which the data stores as a string-table index,
+# rebuilds B.
+write_a $'(* a comment\n   of three\n   lines *)' "simp[]" "(2:num) + 2 = 4" 501 note
+build "$tmpdir/note.log"
+grep -q "ATheory.dat as written: theory data note" "$project"/.holbuild/logs/current/*/ATheory/build.log ||
+  { echo "ATheory's build log has no warning that it is hashed as written" >&2
+    cat "$project"/.holbuild/logs/current/*/ATheory/build.log >&2; exit 1; }
+write_a $'(* a comment\n   of three\n   lines *)' "simp[]" "(2:num) + 2 = 4" 501 other
+build "$tmpdir/note-edit.log"
+require_no_cutoff BTheory "$tmpdir/note-edit.log"
+require_grep "BTheory built" "$tmpdir/note-edit.log"
