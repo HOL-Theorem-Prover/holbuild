@@ -323,7 +323,10 @@ expect_refusal() {
   fi
   grep -q -- "$pattern" "$tmpdir/refused.log" || { cat "$tmpdir/refused.log" >&2; require_grep "$pattern" "$tmpdir/refused.log"; }
 }
-expect_refusal "spec:ATheory can't run remotely: it is forced" --force CTheory
+hb action-spec --force=theory CTheory > "$tmpdir/batch-forced.txt"
+require_grep '^action .* spec:CTheory$' "$tmpdir/batch-forced.txt"
+forced_spec=$(awk '$1 == "action" && $5 == "spec:CTheory" { print $4 }' "$tmpdir/batch-forced.txt")
+require_grep '^option force=true$' "$project/.holbuild/action-specs/$forced_spec"
 
 echo outside > "$tmpdir/outside.txt"
 cat > "$project/src/DScript.sml" <<'SML'

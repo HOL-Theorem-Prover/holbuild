@@ -1147,7 +1147,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       else if HolbuildStatus.json_mode () andalso trace_steps then
         raise Error "--json does not support --trace-steps until structured proof-step trace events exist"
       else if dry_run andalso trace_steps then
-        raise Error "--trace-steps requires build execution; use --force to inspect up-to-date targets"
+        raise Error "--trace-steps requires build execution; remove --dry-run"
       else if dry_run andalso repl_on_failure then
         raise Error "--repl-on-failure requires build execution"
       else if HolbuildStatus.json_mode () andalso repl_on_failure then
@@ -1505,7 +1505,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                            ["action", run_key, HolbuildRemoteCache.remote_action_key run_key, spec_sha256, name])
                      exported) ^ "\n"
             val query = "?class=run" ^ (case profile of SOME p => "&profile=" ^ p | NONE => "")
-            fun on_change (key, state, failure) = states := (key, (state, failure)) :: !states
+            fun on_change (key, state, failure, _) = states := (key, (state, failure)) :: !states
           in
             (* A run never runs here, so an unreachable coordinator is waited for. *)
             case HolbuildRemoteExec.submit_with_query true url query (#maxheap tc) batch of
@@ -1650,7 +1650,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 val no_log = "could not fetch the failed theory's build log"
               in
                 HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "\n");
-                HolbuildBuildExec.build (HolbuildBuildExec.restore_only_options build_options)
+                HolbuildBuildExec.build (HolbuildBuildExec.remote_restore_options true build_options)
                   tc project plan toolchain_key jobs
                 handle HolbuildBuildExec.Error _ => ()
                      | HolbuildBuildExec.ErrorWithDebugArtifacts _ => ();
@@ -1679,10 +1679,17 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               let
                 val {add, stop} =
                   HolbuildBuildExec.start_remote_exec_prefetch build_options tc project plan toolchain_key jobs in_batch
+                val logs = ref []
+                fun on_change (key, state, _, log) =
+                  (logs := List.filter (fn (k, _) => k <> key) (!logs);
+                   if state = "done" then (add key; logs := (key, log) :: !logs) else ())
                 fun follow_batch () =
-                  (HolbuildRemoteExec.follow url batch_id
-                     (fn (key, state, _) => if state = "done" then add key else ())
-                   before stop ())
+                  let
+                    val result = HolbuildRemoteExec.follow url batch_id on_change
+                    val _ = stop ()
+                  in
+                    (result, rev (!logs))
+                  end
                   handle e => (stop (); raise e)
               in
                 HolbuildRemoteExec.while_followed url batch_id follow_batch
@@ -1698,12 +1705,25 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                resubmitted once, for the export to upload it again. *)
             fun finish resubmit in_batch batch_id =
               case follow in_batch batch_id of
-                  (HolbuildRemoteExec.Done, progress) =>
-                    (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ finished progress ^ "\n");
-                     build_locally ())
-                | (HolbuildRemoteExec.Failed (reason, SOME failure), progress) =>
+                  ((HolbuildRemoteExec.Done, progress), logs) =>
+                    let
+                      val log_error =
+                        (HolbuildBuildExec.restore_remote_build_logs build_options tc project plan toolchain_key logs; NONE)
+                        handle HolbuildBuildExec.Error reason => SOME reason
+                             | HolbuildRemoteCache.Unavailable reason => SOME reason
+                    in
+                      case log_error of
+                          SOME reason => fall_back reason
+                        | NONE =>
+                            (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ finished progress ^ "\n");
+                             timed_phase "build.execute"
+                               (fn () => HolbuildBuildExec.build
+                                 (HolbuildBuildExec.remote_restore_options (#restore_only build_options) build_options)
+                                 tc project plan toolchain_key jobs))
+                    end
+                | ((HolbuildRemoteExec.Failed (reason, SOME failure), progress), _) =>
                     proof_failed ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress) failure
-                | (HolbuildRemoteExec.Failed (reason, NONE), progress) =>
+                | ((HolbuildRemoteExec.Failed (reason, NONE), progress), _) =>
                     let
                       val reason = "batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress
                       val forced =
@@ -1724,16 +1744,16 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                          HolbuildBuildExec.drop_local_cache_entries forced;
                          export_and_submit false forced)
                     end
-                | (HolbuildRemoteExec.Cancelled, progress) =>
+                | ((HolbuildRemoteExec.Cancelled, progress), _) =>
                     let val reason = "batch " ^ batch_id ^ " cancelled; " ^ finished progress
                     in
                       (* Whoever cancelled it stopped this work, so a --remote-only
                          build doesn't ask for it to be built locally instead. *)
                       if remote_only then raise Error ("remote execution: " ^ reason) else fall_back reason
                     end
-                | (HolbuildRemoteExec.Unfollowable reason, progress) =>
+                | ((HolbuildRemoteExec.Unfollowable reason, progress), _) =>
                     abandon batch_id ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress)
-                | (HolbuildRemoteExec.Unreachable reason, progress) =>
+                | ((HolbuildRemoteExec.Unreachable reason, progress), _) =>
                     if remote_only
                     then fall_back (reason ^ "; " ^ finished progress ^ "; reattach with --attach " ^ batch_id)
                     else abandon batch_id (reason ^ "; " ^ finished progress)
@@ -1811,11 +1831,11 @@ fun build_once tc cli_jobs parsed = build_once_with_prepared tc cli_jobs NONE pa
 fun action_spec_command tc cli_jobs args =
   let
     val upload = List.exists (fn arg => arg = "--upload") args
-    val parsed as ({dry_run, watch, trace_steps, repl_on_failure, execution_plan, ...}, _) =
+    val parsed as ({dry_run, watch, repl_on_failure, execution_plan, ...}, _) =
       split_flags (List.filter (fn arg => arg <> "--upload") args)
     val _ =
-      if dry_run orelse watch orelse trace_steps orelse repl_on_failure orelse Option.isSome execution_plan then
-        raise Error "action-spec does not run builds: remove --dry-run, --watch, --trace-steps and --repl-on-failure"
+      if dry_run orelse watch orelse repl_on_failure orelse Option.isSome execution_plan then
+        raise Error "action-spec does not run builds: remove --dry-run, --watch and --repl-on-failure"
       else ()
   in
     build_once_with_prepared_mode (ExportActionSpecs {upload = upload}) tc cli_jobs NONE parsed
@@ -2038,8 +2058,8 @@ fun build tc cli_jobs args =
       else if not (Option.isSome url) andalso (remote_only orelse detach orelse Option.isSome attach) then
         raise Error "--remote-only, --detach and --attach need --remote-exec URL"
       else if Option.isSome url andalso
-              (watch orelse dry_run orelse trace_steps orelse repl_on_failure orelse Option.isSome execution_plan) then
-        raise Error "--remote-exec does not support --watch, --dry-run, --trace-steps, --execution-plan or --repl-on-failure"
+              (watch orelse dry_run orelse repl_on_failure orelse Option.isSome execution_plan) then
+        raise Error "--remote-exec does not support --watch, --dry-run, --execution-plan or --repl-on-failure"
       else if Option.isSome url andalso HolbuildStatus.json_mode () then
         raise Error "--json does not support --remote-exec yet"
       else if detach andalso Option.isSome attach then

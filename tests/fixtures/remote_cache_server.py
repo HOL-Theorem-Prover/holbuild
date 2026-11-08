@@ -108,6 +108,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_response(int((control / name).read_text()))
                     self.end_headers()
                     return
+        if control is not None and self.path.startswith("/cas/"):
+            digest = urllib.parse.urlparse(self.path).path.rsplit("/", 1)[-1]
+            status = control / f"cas-get-status-{digest}"
+            if status.exists():
+                self.send_response(int(status.read_text()))
+                self.end_headers()
+                return
         path = self.object_path()
         if path is None:
             return
@@ -173,6 +180,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if self.headers.get("Content-Encoding") == "zstd":
             data = subprocess.check_output(["zstd", "-q", "-d", "-c"], input=data)
+        if (
+            control is not None
+            and self.path.startswith("/cas/")
+            and (control / "cas-put-reject-text").exists()
+            and (control / "cas-put-reject-text").read_bytes() in data
+        ):
+            self.send_response(500)
+            self.end_headers()
+            return
         action_sequence = (
             next_action_put()
             if urllib.parse.urlparse(self.path).path.startswith("/ac/")
