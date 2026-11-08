@@ -656,16 +656,17 @@ name = "rxc"
 [build]
 members = ["src"]
 TOML
-# write_cutoff A-STAMP B-STAMP [A-EXTRA]
+# write_cutoff A-STAMP B-STAMP [A-EXTRA] [A-PREFIX] [A-PROOF]: A-PREFIX goes
+# before a_thm, whose proof is A-PROOF (simp[] by default).
 write_cutoff() {
   cat > "$project/src/AScript.sml" <<SML
 Theory A
 Ancestors bool
-
+${4:-}
 Theorem a_thm:
   T
 Proof
-  simp[] (* $1 *)
+  ${5:-simp[]} (* $1 *)
 QED
 ${3:-}
 SML
@@ -712,6 +713,18 @@ write_cutoff two one
 run cutoff-proof 0 build --remote-exec "$coordinator" CTheory
 require_grep "remote workers finished 3 of 3 theories" "$tmpdir/cutoff-proof.log"
 refute_grep "Theory built" "$tmpdir/cutoff-proof.log"
+require_grep "early cutoff: rxc:BTheory reuses" "$tmpdir/worker.log"
+require_grep "early cutoff: rxc:CTheory reuses" "$tmpdir/worker.log"
+results built cached cached
+
+# A proof edit that moves a_thm down the file and proves it from another
+# lemma changes ATheory.dat (its source locations and dependency records)
+# but not what dependents load from it.
+a_dat=$project/.holbuild/obj/src/ATheory.dat
+a_dat_hash=$(sha256sum "$a_dat")
+write_cutoff two one "" $'(* a comment\n   of three\n   lines *)' "ACCEPT_TAC TRUTH"
+run cutoff-proof-moved 0 build --remote-exec "$coordinator" CTheory
+[[ "$(sha256sum "$a_dat")" != "$a_dat_hash" ]] || { echo "the proof edit left ATheory.dat unchanged" >&2; exit 1; }
 require_grep "early cutoff: rxc:BTheory reuses" "$tmpdir/worker.log"
 require_grep "early cutoff: rxc:CTheory reuses" "$tmpdir/worker.log"
 results built cached cached

@@ -1139,10 +1139,12 @@ entries or HOL toolchains that earlier releases wrote: its first build of a
 project builds the toolchain and every theory again (or restores what other
 0.13.0 builds have published), and is never served an old entry. `holbuild gc`
 removes the old entries once they age out. Two uses of SHA-1 remain. A
-theory's `.dat` names each parent by the SHA-1 of the parent's `.dat` (HOL's
-format), and holbuild checks those names. Git dependency mirrors under the
-cache's `git/remotes/` keep their SHA-1-of-URL names, so existing mirrors
-stay in use.
+theory's `.dat` names each parent by a SHA-1 (HOL's format): the hash in the
+parent's `Theory.sml`, which holbuild's exporter takes over the parent's data
+without its proof-dependent parts, so a proof-only edit of the parent keeps
+it (see `DESIGN.md`, early cutoff); holbuild checks those names. Git
+dependency mirrors under the cache's `git/remotes/` keep their SHA-1-of-URL
+names, so existing mirrors stay in use.
 
 Completed theory artifacts are reused only when their recorded proof timeout
 satisfies the requested timeout. `--allow-cache-timeout-discrepancy` waives that

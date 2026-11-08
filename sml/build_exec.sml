@@ -1515,15 +1515,44 @@ fun checkpoint_exists path = file_exists path andalso file_exists (checkpoint_ok
 
 fun file_hash path = HolbuildStatCache.file_sha256 (HolbuildStatCache.current_instance ()) path
 
-(* HOL records each parent theory as the SHA-1 of the parent's .dat file
-   (Theory.sml's export), so checking those records needs HOL's hash, not
-   holbuild's own. *)
-fun hol_dat_hash path =
+fun hol_file_sha1 path =
   if HolbuildHash.large_file path then
     case HolbuildHash.external_hash "sha1sum" (HolbuildHash.valid_hex 40) path of
         SOME hash => hash
       | NONE => SHA1_ML.sha1_file {filename = path}
   else SHA1_ML.sha1_file {filename = path}
+
+(* The hash literal of a generated Theory.sml: `hash =` and a quoted
+   SHA-1, the only such literal in the file. *)
+fun theory_sml_hash_literal text =
+  let
+    val (_, rest) = Substring.position "hash =" (Substring.full text)
+    val quoted = Substring.dropl Char.isSpace (Substring.triml (size "hash =") rest)
+  in
+    if Substring.isEmpty rest then NONE
+    else if Substring.size quoted > 41 andalso Substring.sub (quoted, 0) = #"\"" andalso
+            Substring.sub (quoted, 41) = #"\"" andalso
+            HolbuildTheoryCacheManifest.valid_sha1_text
+              (Substring.string (Substring.slice (quoted, 1, SOME 40)))
+    then SOME (Substring.string (Substring.slice (quoted, 1, SOME 40)))
+    else NONE
+  end
+
+(* A theory's .dat is known by the hash its Theory.sml carries, which is
+   what its children record for it and what HOL's link_parents compares:
+   the digest of the data without its proof-dependent parts (the runtime's
+   normalize_theory_export), or the file's SHA-1 for a theory exported
+   without it.  Any other file hashes as it is. *)
+fun hol_dat_hash path =
+  let
+    val literal =
+      if has_suffix ".dat" path then
+        theory_sml_hash_literal (read_text (drop_suffix ".dat" path ^ ".sml"))
+        handle IO.Io _ => NONE
+      else NONE
+  in
+    case literal of SOME hash => hash | NONE => hol_file_sha1 path
+  end
 
 type file_hash_cache = {entries : (string, string) Binarymap.dict ref, mutex : Mutex.mutex}
 
@@ -2934,8 +2963,12 @@ fun bool_text true = "true"
 
 (* 2: before 0.13.11 a theory's .dat listed its parents in load order, so one
    key could name several outputs, and a cached child could disagree with the
-   cached parent under its parent's key. *)
-val theory_manifest_version = "2"
+   cached parent under its parent's key.
+   3: the hash literal in Theory.sml, which children record for the parent,
+   is the digest of the .dat without its proof-dependent parts, not the
+   file's SHA-1, so an entry from before disagrees with every child built
+   after. *)
+val theory_manifest_version = "3"
 
 (* Final theory artifacts are semantic products of source bytes, resolved deps,
    toolchain, and declared action policy. Execution strategy is deliberately not
@@ -2995,18 +3028,30 @@ fun remember_output_digests toolchain_key plan nodes =
             end
             handle _ => NONE)
         nodes
-    val hashes = HolbuildHash.files_sha256 (List.concat (map (fn (_, _, files) => map #2 files) parts))
+    (* A .dat by the hash its children record (hol_dat_hash), the rest by content. *)
+    fun is_dat (role, _) = role = "dat" orelse role = "remapped dat"
+    val hashes =
+      HolbuildHash.files_sha256
+        (List.concat (map (fn (_, _, files) => map #2 (List.filter (not o is_dat) files)) parts))
+    fun file_lines [] hashes = ([], hashes)
+      | file_lines ((file as (role, path)) :: files) hashes =
+          let
+            val (hash, hashes) =
+              if is_dat file then (hol_dat_hash path, hashes)
+              else (hd hashes, tl hashes)
+            val (lines, hashes) = file_lines files hashes
+          in
+            ((role ^ " " ^ hash) :: lines, hashes)
+          end
     fun digest [] _ = ()
       | digest ((node, lines, files) :: rest) hashes =
           let
-            val n = length files
-            val file_lines =
-              ListPair.map (fn ((role, _), hash) => role ^ " " ^ hash) (files, List.take(hashes, n))
+            val (file_lines, hashes) = file_lines files hashes
           in
             HolbuildBuildPlan.remember_output_digest plan node
               (HolbuildToolchain.hash_text
                  (String.concatWith "\n" ("holbuild-output-digest-v1" :: lines @ file_lines) ^ "\n"));
-            digest rest (List.drop(hashes, n))
+            digest rest hashes
           end
   in
     digest parts hashes
@@ -8387,14 +8432,15 @@ fun spec_early_cutoff root (spec : action_spec) : early_cutoff option =
     val self_key =
       HolbuildHash.string_sha256
         (String.concatWith "\n" ("holbuild-remote-self-input-v1" :: map unkeyed_dep_line text_lines))
-    val theory_files =
+    (* Each .dat by the hash its children record (hol_dat_hash), the rest by content. *)
+    val dat_files = map (fn {stem, ...} => in_root root stem ^ ".dat") (#deps spec)
+    val other_files =
       List.concat
-        (map (fn {stem, ...} => map (fn suffix => in_root root stem ^ suffix)
-                                    [".dat", ".sig", ".sml", ".ui", ".uo"])
+        (map (fn {stem, ...} => map (fn suffix => in_root root stem ^ suffix) [".sig", ".sml", ".ui", ".uo"])
              (#deps spec))
     val theory_lines =
       ListPair.map (fn (path, hash) => "theory-file " ^ path ^ " " ^ hash)
-        (theory_files, HolbuildHash.files_sha256 theory_files)
+        (dat_files @ other_files, map hol_dat_hash dat_files @ HolbuildHash.files_sha256 other_files)
     val library_lines = map (fn {path, sha256, ...} => "library " ^ path ^ " " ^ sha256) (#libraries spec)
     val lib_lines =
       map (fn {target, stem, suffix, loads} => String.concatWith " " ("lib" :: target :: stem :: suffix :: loads))

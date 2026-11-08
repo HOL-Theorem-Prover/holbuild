@@ -39,8 +39,133 @@ struct
 
   fun write_mldeps_report path = write_lines path (Theory.current_ML_deps())
 
-  (* Graph.fringe follows load order. Canonicalize only the parent header,
-     preserving the potentially large theory payload byte for byte. *)
+  fun string_byte_reader text (offset, requested) =
+    let val count = Int.max(0, Int.min(requested, size text - offset))
+    in (Byte.stringToBytes (String.substring(text, offset, count)), offset + count) end
+
+  fun sha1_string text = SHA1.sha1String (string_byte_reader text) 0
+
+  (* The view of a theory's exported data that its digest covers: the data
+     without the parts a proof edit changes (each theorem's dependency
+     record and source location, the parents' hashes), so that children
+     built on it stay reusable after a proof-only edit of the theory
+     (DESIGN.md, "Early cutoff").  The string table is dropped, with every
+     reference to it resolved, since those parts shift its indices; the
+     type and term tables index only each other and the id table.  Raises
+     Fail on data of another shape. *)
+  local
+    open HOLsexp
+    fun fail what = raise Fail ("unexpected " ^ what ^ " in the exported theory data")
+    fun items what s = case strip_list s of (l, NONE) => l | _ => fail what
+    fun tagged tag s =
+      case s of
+          Cons(Symbol t, rest) => if t = tag then rest else fail tag
+        | _ => fail tag
+  in
+  fun normalized_theory_data {sexp_coded : string -> bool} data =
+    let
+      val (header, core, incorporate, loadable) =
+        case items "theory" data of
+            [Symbol "theory", header, core, incorporate, loadable] =>
+              (header, core, incorporate, loadable)
+          | _ => fail "theory"
+      val (name, parents) =
+        case header of
+            Cons(name, parents) =>
+              (name, map (fn Cons(parent, _) => parent | _ => fail "parent") (items "parents" parents))
+          | _ => fail "header"
+      val (tables, exports) =
+        case tagged "core-data" core of Cons(tables, exports) => (tables, exports) | _ => fail "core-data"
+      val (strings, ids, types, terms) =
+        case items "tables" (tagged "tables" tables) of
+            [strings, ids, types, terms] => (strings, ids, types, terms)
+          | _ => fail "tables"
+      val string_table =
+        Vector.fromList (map (fn String s => s | _ => fail "string")
+                             (items "string-table" (tagged "string-table" strings)))
+      fun str (Integer i) = String (Vector.sub(string_table, i))
+        | str _ = fail "string index"
+      val ids' = List (map (fn Cons(i, j) => Cons(str i, str j) | _ => fail "id")
+                           (items "id-table" (tagged "id-table" ids)))
+      val (tys, tms, thms) =
+        case items "exports" (tagged "exports" exports) of [tys, tms, thms] => (tys, tms, thms) | _ => fail "exports"
+      (* (name-index ((dependencies...) oracles...) (class private location...) terms...) *)
+      fun thm (Cons(i, Cons(Cons(_, oracles), Cons(info, Cons(terms, Symbol "nil"))))) =
+            (case items "theorem info" info of
+                 class :: private :: _ => List [str i, oracles, class, private, terms]
+               | _ => fail "theorem info")
+        | thm _ = fail "theorem"
+      (* ThyDataSexp's encoding: shared strings and names by index, an integer
+         as itself, and a theorem as
+         (tag-th (theory save-index dependencies oracles) terms theory anonymous-index). *)
+      fun thydata (Cons(Symbol "tag-str", i as Integer _)) = Cons(Symbol "tag-str", str i)
+        | thydata (Cons(Symbol "tag-knm", Cons(i as Integer _, j as Integer _))) =
+            Cons(Symbol "tag-knm", Cons(str i, str j))
+        | thydata (Cons(Symbol "tag-th",
+                        Cons(Cons(thy, Cons(Integer _, Cons(_, Cons(oracles, Symbol "nil")))),
+                             Cons(terms, Cons(saved, Cons(Integer _, Symbol "nil")))))) =
+            Cons(Symbol "tag-th", List [thy, oracles, terms, saved])
+        | thydata (Cons(a, b)) = Cons(thydata a, thydata b)
+        | thydata atom = atom
+      (* GrammarAncestry's: theory names as bare string indices. *)
+      fun indexed (i as Integer _) = str i
+        | indexed (Cons(a, b)) = Cons(indexed a, indexed b)
+        | indexed atom = atom
+      (* A codec of its own writes what it likes, so a bare integer may name
+         a string whose index the proofs decide: only data of a known
+         encoding is normalized, and the rest keeps the theory hashed as
+         written. *)
+      fun entry (Cons(key as String k, data)) =
+            Cons(key,
+                 if sexp_coded k then thydata data
+                 else if k = "GrammarAncestry" then indexed data
+                 else if k = "OpenTheoryMap" orelse k = "TexTokenMap" then data
+                 else raise Fail ("theory data " ^ k ^ " has an encoding holbuild doesn't know"))
+        | entry _ = fail "loadable data"
+      val loadable' = List (map entry (items "loadable-thydata" (tagged "loadable-thydata" loadable)))
+    in
+      List [name, List parents, ids', types, terms, tys, tms,
+            List (map thm (items "theorems" thms)), incorporate, loadable']
+    end
+
+  (* An unambiguous flat text of DATA: atoms are length-prefixed. *)
+  fun serialize_sexp data =
+    let
+      fun atom prefix text = prefix ^ Int.toString (size text) ^ ":" ^ text
+      fun go (Symbol s, acc) = atom "s" s :: acc
+        | go (String s, acc) = atom "\"" s :: acc
+        | go (Integer i, acc) = ("i" ^ Int.toString i ^ ";") :: acc
+        | go (Cons(a, b), acc) = ")" :: go (b, go (a, "(" :: acc))
+    in
+      String.concat (List.rev (go (data, [])))
+    end
+  end
+
+  (* The digest of the theory data at DAT_PATH that dependents compare and
+     that children record for the parent: SHA-1 of the normalized view, or
+     of the file when the data has an unexpected shape. *)
+  fun theory_data_digest dat_path =
+    let
+      fun as_written why =
+        (TextIO.output (TextIO.stdErr,
+                        "holbuild: warning: hashing " ^ dat_path ^ " as written: " ^ why ^ "\n");
+         SHA1.sha1_file {filename = dat_path})
+      (* Not HOLsexp.fromFile: HOLFileSys would remap the path again. *)
+      fun read_data () =
+        let val input = TextIO.openIn dat_path
+        in HOLsexp.fromStream input before TextIO.closeIn input end
+      (* ThyDataSexp.new registers each key's load hook under this name. *)
+      val hooks = map #1 (Listener.listeners Theory.delta_hook)
+      fun sexp_coded key = List.exists (fn h => h = "ThmSetData.onload." ^ key) hooks
+    in
+      sha1_string (serialize_sexp (normalized_theory_data {sexp_coded = sexp_coded} (read_data ())))
+      handle Fail why => as_written why
+           | Subscript => as_written "a string index is out of range"
+    end
+
+  (* Graph.fringe follows load order.  Canonicalize only the parent header,
+     preserving the potentially large theory payload byte for byte, and
+     make the hash literal in Theory.sml the data's digest. *)
   fun normalize_theory_export sig_path =
     let
       val stem = OS.Path.base sig_path
@@ -88,22 +213,17 @@ struct
       val normalized = prefix ^ "\n " ^
         String.translate (fn #"\n" => "\n " | c => str c) printed ^
         String.extract(text, stop, NONE)
+      val old_hash = "\"" ^ sha1_string text ^ "\""
+      val sml = read_text sml_path
+      val (before_hash, hash_and_rest) = Substring.position old_hash (Substring.full sml)
+      val _ = if Substring.isEmpty hash_and_rest then
+                raise Fail "exported theory source does not contain its data hash"
+              else ()
+      val _ = if text = normalized then () else write_text dat_path normalized
+      val new_hash = "\"" ^ theory_data_digest dat_path ^ "\""
     in
-      if text = normalized then ()
-      else
-        let
-          val old_hash = "\"" ^ SHA1.sha1_file {filename = dat_path} ^ "\""
-          val sml = read_text sml_path
-          val (before_hash, hash_and_rest) = Substring.position old_hash (Substring.full sml)
-          val _ = if Substring.isEmpty hash_and_rest then
-                    raise Fail "exported theory source does not contain its data hash"
-                  else ()
-          val _ = write_text dat_path normalized
-          val new_hash = "\"" ^ SHA1.sha1_file {filename = dat_path} ^ "\""
-        in
-          write_text sml_path (Substring.string before_hash ^ new_hash ^
-                              Substring.string (Substring.triml (size old_hash) hash_and_rest))
-        end
+      write_text sml_path (Substring.string before_hash ^ new_hash ^
+                          Substring.string (Substring.triml (size old_hash) hash_and_rest))
     end
 
   fun export_theory_if_needed sig_path =
