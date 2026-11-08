@@ -226,6 +226,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         claimed = await coordinator.claim(
             tiers, body.worker, body.wait_s, request.is_disconnected,
             host_id=None if body.host is None else body.host.id,
+            host_rank=0 if body.host is None else body.host.rank,
         )
         if claimed is None:
             return Response(status_code=204)
