@@ -102,6 +102,13 @@ fun begin_termination_line ({name, definition_start, ...} : termination) =
      Int.toString definition_start,
      ";\n"]
 
+fun end_termination_line ({name, definition_start, ...} : termination) =
+  String.concat
+    ["\nval _ = HolbuildTerminationDiagnosticsRuntime.end_definition ",
+     HolbuildToolchain.sml_string name, " ",
+     Int.toString definition_start,
+     ";\n"]
+
 fun termination_tactic_prefix ({name, definition_start, tactic_text, proof_ir_plan, ...} : termination) =
   String.concat
     ["(HolbuildTerminationDiagnosticsRuntime.report_goal ",
@@ -136,7 +143,8 @@ val runtime_load_lines = []
    second Defn.Hol_defn would advance HOL's theorem numbering, so the theory
    would differ from an uninstrumented build.  A definition that fails before
    HOL runs its tactic prints no goal, so each definition first prints a start
-   marker; an earlier definition's goal is then not reported for it. *)
+   marker; an earlier definition's goal is then not reported for it. The end
+   marker clears the goal once the definition returns successfully. *)
 val termination_runtime_lines =
   ["structure HolbuildTerminationDiagnosticsRuntime = struct",
    "fun print_line text = (TextIO.output(TextIO.stdOut, text ^ \"\\n\"); TextIO.flushOut TextIO.stdOut)",
@@ -146,6 +154,7 @@ val termination_runtime_lines =
    "fun marker name start = String.concat [\"holbuild termination condition goal for \", name, \" at \", Int.toString start, \":\"]",
    "fun print_goal name start text = (print_line (marker name start); print_line text; print_line \"holbuild termination condition goal end\")",
    "fun begin_definition name start = print_line (String.concat [\"holbuild termination definition start for \", name, \" at \", Int.toString start])",
+   "fun end_definition name start = print_line (String.concat [\"holbuild termination definition end for \", name, \" at \", Int.toString start])",
    "fun report_goal name start tac =",
    "  HolbuildTacticCompat.lift_context_tactic (fn ctxt => fn g =>",
    "    (print_goal name start (goal_text g); HolbuildTacticCompat.run_tactic ctxt tac g))",
@@ -353,18 +362,26 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
                  save_declaration_context_line declaration_checkpoint ::
                  source_slice pos boundary ::
                  acc)
-        | TerminationEvent (termination as {definition_start, tactic_start, tactic_end, ...}) :: rest =>
+        | TerminationEvent (termination as {definition_start, boundary, tactic_start, tactic_end, ...}) :: rest =>
             if definition_start < pos then loop pos rest acc
             else
-              loop tactic_end rest
-                (termination_tactic_suffix termination ::
+              let
+                val definition_pragma = resume_at definition_start
+                val boundary_pragma = resume_at boundary
+              in
+                loop boundary rest
+                (boundary_pragma ::
+                 end_termination_line termination ::
+                 source_slice tactic_end boundary ::
+                 termination_tactic_suffix termination ::
                  source_slice tactic_start tactic_end ::
                  termination_tactic_prefix termination ::
                  source_slice definition_start tactic_start ::
-                 resume_at definition_start ::
+                 definition_pragma ::
                  begin_termination_line termination ::
                  source_slice pos definition_start ::
                  acc)
+              end
     val prelude_text = prelude ()
     val start_pragma = resume_at start_offset
   in

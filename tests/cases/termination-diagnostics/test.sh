@@ -201,6 +201,39 @@ if grep -q "termination: first_def" "$early_log"; then
   exit 1
 fi
 
+# A successful termination must not mask a later ordinary SML failure.
+late_project=$tmpdir/late-failure-project
+mkdir -p "$late_project/src"
+cp "$project/holproject.toml" "$late_project/holproject.toml"
+cat > "$late_project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+
+Definition first_def:
+  first n = if n = 0 then 0 else first (n - 1)
+Termination
+  WF_REL_TAC `measure I` >> simp[]
+End
+
+val _ = raise Fail "expected ordinary failure after termination";
+
+val _ = export_theory();
+SML
+
+late_log=$tmpdir/late-failure.log
+if (cd "$late_project" && "$HOLBUILD_BIN" build ATheory) > "$late_log" 2>&1; then
+  echo "expected ordinary failure after successful termination" >&2
+  exit 1
+fi
+late_child_log="$late_project/.holbuild/logs/current/termination-diagnostics/ATheory/build.log"
+require_grep "Saved definition.*first_def" "$late_child_log"
+require_grep "expected ordinary failure after termination" "$late_log"
+if grep -q "termination: first_def\|termination condition goal:" "$late_log"; then
+  echo "reported a completed termination proof for a later ordinary failure" >&2
+  exit 1
+fi
+require_grep "holbuild termination definition end for first_def at " "$late_child_log"
+
 timeout_project=$tmpdir/timeout-project
 mkdir -p "$timeout_project/src"
 cp "$project/holproject.toml" "$timeout_project/holproject.toml"
