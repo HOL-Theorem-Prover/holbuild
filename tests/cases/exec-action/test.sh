@@ -329,10 +329,10 @@ worker_status=$?
 set -e
 expect budget 3 "status=failed" "failure=internal"
 require_grep "exceeds the machine budget" "$tmpdir/budget.log"
-log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/budget.result")
-[[ -n "$log_sha" ]] || { echo "pre-HOL failure has no action log" >&2; exit 1; }
-curl -fsS "$remote_url/cas/$log_sha" > "$tmpdir/budget-action.log"
-require_grep "exceeds the machine budget" "$tmpdir/budget-action.log"
+if grep -q '^log=' "$tmpdir/budget.result"; then
+  echo "pre-HOL failure published an unvalidated action log" >&2
+  exit 1
+fi
 
 # A malformed one-line theorem recovers a boundary with an empty tactic.
 # Its source diagnostic must survive protocol parsing and proof planning.
