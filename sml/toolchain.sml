@@ -165,7 +165,9 @@ fun run_in_dir_to_file dir argv output =
           (fn () =>
               HolbuildActionSandbox.launch argv (fn confined =>
                 HolbuildProcessGroup.run_shell_inheriting lease
-                  ("cd " ^ quote dir ^ " && " ^ command confined ^ " > " ^ quote output ^ " 2>&1"))))
+                  ("cd " ^ quote dir ^ " && " ^
+                   (if HolbuildActionSandbox.active () then "HOLBUILD_SANDBOX_PARENT=$$ " else "") ^
+                   command confined ^ " > " ^ quote output ^ " 2>&1"))))
   handle HolbuildMachineMemory.Error msg => raise Error msg
        | HolbuildActionSandbox.Error msg => raise Error msg
 
@@ -183,7 +185,9 @@ fun run_in_dir_to_file_until dir argv output limit =
                     val result =
                       HolbuildActionSandbox.launch argv (fn confined =>
                         HolbuildProcessGroup.run_shell_inheriting_until lease (Time.+ (Time.now (), limit))
-                          ("cd " ^ quote dir ^ " && " ^ command confined ^ " > " ^ quote output ^ " 2>&1"))
+                          ("cd " ^ quote dir ^ " && " ^
+                           (if HolbuildActionSandbox.active () then "HOLBUILD_SANDBOX_PARENT=$$ " else "") ^
+                           command confined ^ " > " ^ quote output ^ " 2>&1"))
                   in
                     timed_out := #timed_out result;
                     #status result

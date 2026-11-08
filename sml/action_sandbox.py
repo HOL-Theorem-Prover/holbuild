@@ -527,7 +527,7 @@ class SignalBroker:
             close_processes(processes)
 
 
-def run(linux: Linux, policy: Policy, argv: list[str]) -> int:
+def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = None) -> int:
     policy.validate()
     policy.validate_outputs()
     # CONFIG_PROC_CHILDREN is required by the verified descendant walk.
@@ -544,7 +544,13 @@ def run(linux: Linux, policy: Policy, argv: list[str]) -> int:
             env[key] = value
     if not argv:
         raise SandboxError("missing action command")
-    parent_fd = os.pidfd_open(os.getppid())
+    expected_parent = os.getppid() if parent is None else parent
+    if os.getppid() != expected_parent:
+        raise SandboxError("sandbox launcher exited before startup")
+    parent_fd = os.pidfd_open(expected_parent)
+    if os.getppid() != expected_parent or select.select([parent_fd], [], [], 0)[0]:
+        os.close(parent_fd)
+        raise SandboxError("sandbox launcher exited before startup")
     # The outer shell's watcher escalates to group SIGKILL after 200 ms.
     # Keep this trusted reaper outside that group and watch its parent by
     # pidfd, so cancellation still permits the bounded descendant cleanup.
@@ -600,7 +606,9 @@ def run(linux: Linux, policy: Policy, argv: list[str]) -> int:
         poller.register(parent_socket, select.POLLIN)
         done = False
         while not done:
-            for fd, _ in poller.poll():
+            # A short-lived child can finish before we are scheduled. Consume
+            # its setup handoff before acting on simultaneous leader exit.
+            for fd, _ in sorted(poller.poll(), key=lambda event: event[0] != parent_socket.fileno()):
                 if fd in (wake_read, leader_fd, parent_fd):
                     done = True
                     break
@@ -634,8 +642,10 @@ def run(linux: Linux, policy: Policy, argv: list[str]) -> int:
             os.close(wake_read)
             os.close(wake_write)
             signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-    policy.validate_outputs()
     code = os.waitstatus_to_exitcode(status)
+    if broker is None or code == 125:
+        raise SandboxError("HOL child setup or execution failed before confirmed completion")
+    policy.validate_outputs()
     return code if code >= 0 else 128 - code
 
 
@@ -666,8 +676,12 @@ def main() -> int:
         )
         if not policy.writable:
             raise SandboxError("missing private action directory")
+        parent = os.environ.get("HOLBUILD_SANDBOX_PARENT")
+        if args.completed is not None and (parent is None or not parent.isascii() or
+                                           not parent.isdecimal() or int(parent) <= 0):
+            raise SandboxError("missing trusted sandbox launcher identity")
         argv = args.command[1:] if args.command[:1] == ["--"] else args.command
-        status = run(linux, policy, argv)
+        status = run(linux, policy, argv, parent=int(parent) if parent is not None else None)
         if args.completed is not None:
             args.completed.write_text("validated\n")
         return status

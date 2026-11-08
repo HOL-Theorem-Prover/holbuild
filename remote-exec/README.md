@@ -218,8 +218,12 @@ fails closed.
 The supervisor confirms cleanup and output validation through a completion
 file outside the child's filesystem grants. Without that confirmation, the
 worker treats the run as an infrastructure failure and publishes no checkpoints.
+The child must confirm confinement setup; exit status 125 is reserved for
+infrastructure failures, including a failure to execute HOL.
 The supervisor watches its parent through a pidfd and runs in its own process
 group, so an outer timeout's forced group shutdown does not interrupt cleanup.
+The launcher supplies its identity before starting the supervisor, which
+refuses to start HOL if it has already lost that parent.
 
 HOL toolchain bootstrap executes trusted source. Before using a toolchain,
 workers require its revision to be a commit ancestor of an approved branch.

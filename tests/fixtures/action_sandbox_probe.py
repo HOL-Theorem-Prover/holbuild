@@ -164,6 +164,7 @@ def linger(root: Path) -> None:
 
 
 def worker(helper: Path, root: Path) -> None:
+    expected_parent = int(os.environ.get("HOLBUILD_SANDBOX_PARENT", str(os.getppid())))
     private = root / "action"
     checkpoints = root / "checkpoints"
     private.mkdir()
@@ -207,7 +208,19 @@ def worker(helper: Path, root: Path) -> None:
         command = [sys.executable, str(probe), "--attack", str(private), str(os.getpid()), str(secret), str(shared)]
         if os.environ.get("HOLBUILD_RUN_CANCEL"):
             command = [sys.executable, str(probe), "--linger", str(private)]
-        status = module["run"](linux, policy, command)
+        if os.environ.get("HOLBUILD_RUN_ORPHAN_START"):
+            (private / "startup-ready").write_text("ready")
+            while not (private / "release-startup").exists():
+                time.sleep(0.01)
+            try:
+                module["run"](linux, policy, command, parent=expected_parent)
+            except module["SandboxError"] as error:
+                assert "launcher exited before startup" in str(error), error
+            else:
+                raise AssertionError("orphaned supervisor launched HOL")
+            (private / "orphan-rejected").write_text("rejected")
+            return
+        status = module["run"](linux, policy, command, parent=expected_parent)
     if os.environ.get("HOLBUILD_RUN_CANCEL"):
         assert status == 128 + signal.SIGKILL, status
         for file in ("cancel-ready", "detached.pid"):
@@ -246,15 +259,20 @@ def completion_probe(helper: Path) -> None:
         private = root / "private"
         private.mkdir()
         completed = root / "completion"
-        for child_status, cleanup_failure in ((0, False), (1, False), (0, True)):
+        for child_status, fault in ((0, ""), (1, ""), (0, "cleanup"), (125, ""),
+                                    (0, "setup"), (0, "exec")):
             completed.write_text("pending\n")
             module = runpy.run_path(str(helper), run_name="sandbox")
-            if cleanup_failure:
+            if fault == "cleanup":
                 original = module["finish_children"]
                 def failed_cleanup(leader: int) -> int:
                     original(leader)
                     raise module["SandboxError"]("injected cleanup failure")
                 module["run"].__globals__["finish_children"] = failed_cleanup
+            if fault == "setup":
+                def failed_setup(self: object) -> None:
+                    raise module["SandboxError"]("injected child setup failure")
+                module["Linux"].drop_privileges = failed_setup
             code = (
                 "from pathlib import Path\n"
                 f"try: Path({str(completed)!r}).write_text('forged')\n"
@@ -264,18 +282,26 @@ def completion_probe(helper: Path) -> None:
                 f"raise SystemExit({child_status})\n"
             )
             previous = sys.argv
+            previous_parent = os.environ.get("HOLBUILD_SANDBOX_PARENT")
             try:
+                os.environ["HOLBUILD_SANDBOX_PARENT"] = str(os.getppid())
                 sys.argv = [str(helper), "--write", str(private), "--completed", str(completed)]
                 for path in ("/usr", "/bin", "/lib", "/lib64"):
                     if Path(path).exists():
                         sys.argv += ["--read", path]
-                sys.argv += ["--", sys.executable, "-I", "-c", code]
+                command = [str(private / "missing-executable")] if fault == "exec" else [sys.executable, "-I", "-c", code]
+                sys.argv += ["--", *command]
                 status = module["main"]()
             finally:
                 sys.argv = previous
-            assert status == (125 if cleanup_failure else child_status), status
-            assert completed.read_text() == ("failed\n" if cleanup_failure else "validated\n")
-        print("completion protected from HOL; proof failure validated; cleanup failure withheld completion")
+                if previous_parent is None:
+                    os.environ.pop("HOLBUILD_SANDBOX_PARENT", None)
+                else:
+                    os.environ["HOLBUILD_SANDBOX_PARENT"] = previous_parent
+            failed = bool(fault) or child_status == 125
+            assert status == (125 if failed else child_status), status
+            assert completed.read_text() == ("failed\n" if failed else "validated\n")
+        print("completion protected from HOL; proof failure validated; setup/exec/cleanup failures withheld completion")
 
 
 if __name__ == "__main__":
@@ -334,7 +360,7 @@ if __name__ == "__main__":
             outer_root.mkdir()
             with (outer_root / "log").open("w") as log:
                 outer = subprocess.Popen(
-                    ["/bin/sh", "-c", "trap ':' EXIT; \"$@\"", "outer", sys.executable,
+                    ["/bin/sh", "-c", "trap ':' EXIT; HOLBUILD_SANDBOX_PARENT=$$ \"$@\"", "outer", sys.executable,
                      __file__, "--worker", sys.argv[1], str(outer_root)],
                     env={**env, "HOLBUILD_RUN_CANCEL": "1", "HOLBUILD_RUN_SLOW_CLEANUP": "1"},
                     start_new_session=True, stdout=log, stderr=subprocess.STDOUT,
@@ -372,3 +398,43 @@ if __name__ == "__main__":
                         outer.kill()
                     outer.wait()
             print("outer cancellation escalation preserved slow descendant cleanup")
+
+            orphan_root = Path(directory) / "orphan-startup"
+            orphan_root.mkdir()
+            with (orphan_root / "log").open("w") as log:
+                outer = subprocess.Popen(
+                    ["/bin/sh", "-c", "trap ':' EXIT; HOLBUILD_SANDBOX_PARENT=$$ \"$@\"", "outer", sys.executable,
+                     __file__, "--worker", sys.argv[1], str(orphan_root)],
+                    env={**env, "HOLBUILD_RUN_ORPHAN_START": "1"},
+                    start_new_session=True, stdout=log, stderr=subprocess.STDOUT,
+                )
+                supervisor = None
+                try:
+                    deadline = time.monotonic() + 10
+                    while not (orphan_root / "action/startup-ready").exists():
+                        assert outer.poll() is None, outer.returncode
+                        assert time.monotonic() < deadline, "startup action did not start"
+                        time.sleep(0.01)
+                    pid = int((orphan_root / "action/supervisor.pid").read_text())
+                    supervisor = os.pidfd_open(pid)
+                    outer.terminate()
+                    outer.wait(timeout=5)
+                    (orphan_root / "action/release-startup").write_text("continue")
+                    assert select.select([supervisor], [], [], 5)[0], "orphaned startup did not exit"
+                    assert (orphan_root / "action/orphan-rejected").read_text() == "rejected"
+                    assert not (orphan_root / "action/ordinary-output").exists()
+                    try:
+                        os.waitpid(pid, 0)
+                    except ChildProcessError:
+                        pass
+                finally:
+                    if supervisor is not None:
+                        try:
+                            signal.pidfd_send_signal(supervisor, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        os.close(supervisor)
+                    if outer.poll() is None:
+                        outer.kill()
+                    outer.wait()
+            print("launcher death before setup rejected without starting HOL")
