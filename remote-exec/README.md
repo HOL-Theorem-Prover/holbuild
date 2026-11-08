@@ -135,11 +135,12 @@ is `/var/cache/holbuild` in the image. It must be the worker's own cache root:
 `exec-action --cache-limit-gb` sweeps the whole root before each action, so a
 root shared with ordinary builds would lose their cache. Containers on one host
 may share cache directories, provided they also share `locks/`: cap sweeps and
-explicit cache GC use its `gc.lock`. With ample headroom, actions reuse shared
-byte measurements for up to 60 seconds while sizing private checkpoints and
-theory modules on each call. A cached directory must match the recorded device
-and inode; other directories are sized live. Small caps and near-target caches
-always scan live. `exec-action` runs
+explicit cache GC use its `gc.lock`. With a positive reserve and a target of at least 64 GiB, actions
+reuse shared byte measurements for up to 60 seconds when shared and private
+sizes fit the target, while sizing private checkpoints and theory modules on
+each call. A cached directory must match the recorded device
+and inode; other directories are sized live. Smaller targets and zero-reserve runs always scan live. Shared writes
+during the reuse interval are accounted for at the next scan. `exec-action` runs
 with the worker's `HOLBUILD_*` build settings, `PATH`, `HOME`, `TMPDIR`, the
 locale, and curl's certificate and proxy settings. It excludes
 `HOLBUILD_REMOTE_EXEC_*`, `HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN` and inherited
