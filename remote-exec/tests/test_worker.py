@@ -363,6 +363,24 @@ def test_drain_seconds_must_be_finite_and_nonnegative(tmp_path: Path, server: Se
         worker_args(tmp_path, server, f"--drain-seconds={text}")
 
 
+def test_shutdown_while_entering_an_interruptible_wait_does_not_enter_the_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    drain = worker.Drain()
+    is_set = drain.stop.is_set
+
+    def check() -> bool:
+        stopped = is_set()
+        if not stopped:
+            drain.request()
+        return stopped
+
+    monkeypatch.setattr(drain.stop, "is_set", check)
+    with pytest.raises(worker.DrainStopped), drain.interruptible():
+        pytest.fail("entered a blocking call after shutdown")
+    assert not drain.interrupt
+
+
 @pytest.mark.parametrize(
     ("worker_heap", "batch_heap", "expected_heap"),
     [(None, None, 12000), (14000, None, 14000), (14000, 4096, 4096), (None, 16000, 16000)],

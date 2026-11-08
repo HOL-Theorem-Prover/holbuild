@@ -94,10 +94,10 @@ class Drain:
     @contextlib.contextmanager
     def interruptible(self) -> Iterator[None]:
         """Interrupt a blocking leaf call; cleanup outside this scope cannot be interrupted."""
-        if self.stop.is_set():
-            raise DrainStopped
-        self.interrupt = True
         try:
+            self.interrupt = True
+            if self.stop.is_set():
+                raise DrainStopped
             yield
         finally:
             self.interrupt = False
