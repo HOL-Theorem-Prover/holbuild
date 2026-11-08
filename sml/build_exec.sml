@@ -189,10 +189,20 @@ fun load_stem dep =
     | HolbuildSourceIndex.Sml => object_stem_with_suffix ".uo" dep
     | HolbuildSourceIndex.Sig => object_stem_with_suffix ".ui" dep
 
-fun add_unique_string (value, values) =
-  if List.exists (fn existing => existing = value) values then values else value :: values
+(* Preserve first appearance while testing membership by a string key. *)
+fun unique_by key values =
+  let
+    fun add (value, (seen, acc)) =
+      let val k = key value
+      in
+        if Binaryset.member (seen, k) then (seen, acc)
+        else (Binaryset.add (seen, k), value :: acc)
+      end
+  in
+    rev (#2 (List.foldl add (Binaryset.empty String.compare, []) values))
+  end
 
-fun unique_strings values = rev (List.foldl add_unique_string [] values)
+fun unique_strings values = unique_by (fn value => value) values
 
 fun project_load_stems deps =
   unique_strings (map load_stem (List.filter loadable_project_dep deps))
@@ -801,10 +811,14 @@ fun children dir =
 fun file_size path = FS.fileSize path handle OS.SysErr _ => 0
 
 fun tree_bytes path =
-  if (FS.isLink path handle OS.SysErr _ => false) then 0
-  else if (FS.isDir path handle OS.SysErr _ => false) then
-    List.foldl (fn (child, total) => total + tree_bytes child) (0 : Position.int) (children path)
-  else file_size path
+  let val st = Posix.FileSys.lstat path
+  in
+    if Posix.FileSys.ST.isLink st then 0
+    else if Posix.FileSys.ST.isDir st then
+      List.foldl (fn (child, total) => total + tree_bytes child) (0 : Position.int) (children path)
+    else Posix.FileSys.ST.size st
+  end
+  handle OS.SysErr _ => 0
 
 fun modified_time path = FS.modTime path handle OS.SysErr _ => Time.zeroTime
 
@@ -6840,10 +6854,7 @@ fun run_files script supports =
   end
 
 (* Nodes in order of first appearance. *)
-fun unique_nodes nodes =
-  rev (List.foldl (fn (node, acc) =>
-                      if List.exists (fn n => HolbuildBuildPlan.key n = HolbuildBuildPlan.key node) acc then acc
-                      else node :: acc) [] nodes)
+fun unique_nodes nodes = unique_by HolbuildBuildPlan.key nodes
 
 (* A run's entry in the remote cache, if it has one with exactly the
    declared OUTPUTS: its text and its (name, sha256) outputs. *)
@@ -6884,12 +6895,13 @@ fun plan_runs tc project planned jobs
       if HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc) then
         raise Error "run-action: tracing-kernel actions key on the exact HOL executable and stay local"
       else ()
+    val hash_file = export_file_hash ()
     val root = project_artifact_root project
     val action_toolchain_key = HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key
     val toolchain_line = spec_toolchain_line tc project
     val runtime = runtime_identity ()
     val {script, supports} = run_files script supports
-    val script_sha256 = HolbuildHash.file_sha256 script
+    val script_sha256 = hash_file script
     val planned =
       Option.map (fn {options, plan, toolchain_key} =>
                      {options = options, plan = plan, toolchain_key = toolchain_key,
@@ -6915,14 +6927,14 @@ fun plan_runs tc project planned jobs
                HolbuildBuildPlan.input_key_for (#keys (the_plan ())) node
     fun run_load_line (NONE, name) = "run-load HOLLIB:" ^ name
       | run_load_line (SOME node, _) = "run-load " ^ package node ^ ":" ^ logical_name node
-    val load_closure =
-      List.concat (List.mapPartial
+    fun load_closure () =
+      unique_nodes (List.concat (List.mapPartial
                      (fn (SOME node, _) => SOME (HolbuildBuildPlan.transitive_project_deps (#plan (the_plan ())) node @ [node])
                        | (NONE, _) => NONE)
-                   loads)
+                   loads))
     val run_text_tail =
       ["script=" ^ script_sha256] @
-      map (fn {rel, path} => "support=" ^ rel ^ "@" ^ HolbuildHash.file_sha256 path) supports @
+      map (fn {rel, path} => "support=" ^ rel ^ "@" ^ hash_file path) supports @
       map load_key_line loads @
       map (fn name => "output=" ^ name) outputs
     val spec_dir = Path.concat (root, ".holbuild/run-specs")
@@ -6942,108 +6954,113 @@ fun plan_runs tc project planned jobs
       else named
     fun context_name (ToolchainContext theory) = "HOL:" ^ theory
       | context_name (PlannedContext node) = package node ^ ":" ^ logical_name node
-    val expanded =
-      rev (List.foldl (fn (c, acc) =>
-                          if List.exists (fn c' => context_name c' = context_name c) acc then acc else c :: acc)
-                      [] expanded)
+    val expanded = unique_by context_name expanded
     fun run context =
       let
-        (* THEORIES are restored by the worker and have their scripts shipped. *)
-        val (name, key_line, context_line, {library_lines, dep_lines, lib_lines, library_files}, load_lines,
-             theories) =
-          case context of
-              ToolchainContext theory =>
-                let
-                  val name = "HOL:" ^ theory
-                  val extras = unique_nodes load_closure
-                in
-                  case planned of
-                      SOME {plan, keys, ...} =>
-                        (name, "context=" ^ name, "context " ^ name,
-                         dependency_spec_lines HolbuildHash.file_sha256 root plan keys (spec_token name) extras, [],
-                         List.filter is_theory_node extras)
-                    | NONE =>
-                        (name, "context=" ^ name, "context " ^ name,
-                         {library_lines = [], dep_lines = [], lib_lines = [], library_files = []}, [], [])
-                end
-            | PlannedContext node =>
-                let
-                  val {options, plan, keys, toolchain_key} = the_plan ()
-                  val name = package node ^ ":" ^ logical_name node
-                  val token = spec_token name
-                  val action = theory_action root plan keys toolchain_key
-                                 (dependency_input_context_key toolchain_key plan keys node) node
-                  val _ =
-                    case excluded_reason action node of
-                        SOME reason => raise Error ("run-action: " ^ name ^ " can't run remotely: " ^ reason)
-                      | NONE => ()
-                  val deps = HolbuildBuildPlan.transitive_project_deps plan node
-                  val closure = node :: deps
-                  fun in_closure n = List.exists (fn c => HolbuildBuildPlan.key c = HolbuildBuildPlan.key n) closure
-                  val extras = List.filter (not o in_closure) (unique_nodes load_closure)
-                  val context_lines = dependency_spec_lines HolbuildHash.file_sha256 root plan keys token deps
-                  val extra_lines = dependency_spec_lines HolbuildHash.file_sha256 root plan keys token extras
-                in
-                  (name, "context=" ^ name ^ "@" ^ #input_key action,
-                   dep_theory_line root keys token "context" node,
-                   {library_lines = #library_lines context_lines @ #library_lines extra_lines,
-                    dep_lines = #dep_lines context_lines @ #dep_lines extra_lines,
-                    lib_lines = #lib_lines context_lines @ #lib_lines extra_lines,
-                    library_files = #library_files context_lines @ #library_files extra_lines},
-                   map (theory_load_spec_line token) (#loads action),
-                   node :: List.filter is_theory_node (deps @ extras))
-                end
+        val name = context_name context
+        val key_line = "context=" ^ name ^
+          (case context of ToolchainContext _ => ""
+             | PlannedContext node => "@" ^ HolbuildBuildPlan.input_key_for (#keys (the_plan ())) node)
         val run_text =
           String.concatWith "\n"
             (["holbuild-run-v1", "toolchain=" ^ action_toolchain_key, key_line] @ run_text_tail) ^ "\n"
         val run_key = HolbuildToolchain.hash_text run_text
-        fun write () =
+        fun prepare load_closure =
           let
-            val token = spec_token name
-            (* The context's key names each script's planned hash, so the
-               file shipped must be the one planned. *)
-            fun script_line node =
-              let val line = file_line HolbuildHash.file_sha256 "context-script" (token (library_source_path node)) (source_file node)
+            (* THEORIES are restored by the worker and have their scripts shipped. *)
+            val (context_line, {library_lines, dep_lines, lib_lines, library_files}, load_lines,
+                 theories) =
+              case context of
+                  ToolchainContext theory =>
+                    let
+                      val name = "HOL:" ^ theory
+                      val extras = load_closure
+                    in
+                      case planned of
+                          SOME {plan, keys, ...} =>
+                            ("context " ^ name,
+                             dependency_spec_lines hash_file root plan keys (spec_token name) extras, [],
+                             List.filter is_theory_node extras)
+                        | NONE =>
+                            ("context " ^ name,
+                             {library_lines = [], dep_lines = [], lib_lines = [], library_files = []}, [], [])
+                    end
+                | PlannedContext node =>
+                    let
+                      val {plan, keys, toolchain_key, ...} = the_plan ()
+                      val name = package node ^ ":" ^ logical_name node
+                      val token = spec_token name
+                      (* Run specs need the action's staging and loads, not its deps key. *)
+                      val action = theory_action root plan keys toolchain_key "" node
+                      val _ =
+                        case excluded_reason action node of
+                            SOME reason => raise Error ("run-action: " ^ name ^ " can't run remotely: " ^ reason)
+                          | NONE => ()
+                      val deps = HolbuildBuildPlan.transitive_project_deps plan node
+                      val closure = node :: deps
+                      val in_closure = Binaryset.addList (Binaryset.empty String.compare, map HolbuildBuildPlan.key closure)
+                      val extras = List.filter (fn n => not (Binaryset.member (in_closure, HolbuildBuildPlan.key n))) load_closure
+                      val context_lines = dependency_spec_lines hash_file root plan keys token deps
+                      val extra_lines = dependency_spec_lines hash_file root plan keys token extras
+                    in
+                      (dep_theory_line root keys token "context" node,
+                       {library_lines = #library_lines context_lines @ #library_lines extra_lines,
+                        dep_lines = #dep_lines context_lines @ #dep_lines extra_lines,
+                        lib_lines = #lib_lines context_lines @ #lib_lines extra_lines,
+                        library_files = #library_files context_lines @ #library_files extra_lines},
+                       map (theory_load_spec_line token) (#loads action),
+                       node :: List.filter is_theory_node (deps @ extras))
+                    end
+            fun write () =
+              let
+                val token = spec_token name
+                (* The context's key names each script's planned hash, so the
+                   file shipped must be the one planned. *)
+                fun script_line node =
+                  let val line = file_line hash_file "context-script" (token (library_source_path node)) (source_file node)
+                  in
+                    if List.nth (String.tokens Char.isSpace line, 3) =
+                       HolbuildBuildPlan.source_hash (#plan (the_plan ())) node
+                    then line
+                    else raise Error ("theory script changed since the build was planned: " ^ source_file node)
+                  end
+                val lines =
+                  [run_spec_header,
+                   "holbuild-version=" ^ HolbuildVersion.version,
+                   "holbuild-runtime=" ^ runtime,
+                   toolchain_line,
+                   "run-key=" ^ run_key,
+                   context_line] @
+                  library_lines @ dep_lines @ lib_lines @ load_lines @ map script_line theories @
+                  ["script " ^ script_sha256 ^ " " ^ Position.toString (FS.fileSize script)] @
+                  map (fn {rel, path} => file_line hash_file "support" rel path) supports @
+                  map run_load_line loads @
+                  map (fn output => "output " ^ output) outputs @
+                  (case timeout of SOME seconds => ["option timeout=" ^ Int.toString seconds] | NONE => []) @
+                  ["run-text"]
+                val text = String.concatWith "\n" lines ^ "\n" ^ run_text
+                val spec_sha256 = HolbuildHash.string_sha256 text
+                val path = Path.concat (spec_dir, spec_sha256)
+                val _ = (ensure_dir spec_dir; write_text path text)
               in
-                if List.nth (String.tokens Char.isSpace line, 3) =
-                   HolbuildBuildPlan.source_hash (#plan (the_plan ())) node
-                then line
-                else raise Error ("theory script changed since the build was planned: " ^ source_file node)
+                {spec_sha256 = spec_sha256,
+                 files = script :: map #path supports @ map source_file theories @ library_files @ [path]}
               end
-            val lines =
-              [run_spec_header,
-               "holbuild-version=" ^ HolbuildVersion.version,
-               "holbuild-runtime=" ^ runtime,
-               toolchain_line,
-               "run-key=" ^ run_key,
-               context_line] @
-              library_lines @ dep_lines @ lib_lines @ load_lines @ map script_line theories @
-              ["script " ^ script_sha256 ^ " " ^ Position.toString (FS.fileSize script)] @
-              map (fn {rel, path} => file_line HolbuildHash.file_sha256 "support" rel path) supports @
-              map run_load_line loads @
-              map (fn output => "output " ^ output) outputs @
-              (case timeout of SOME seconds => ["option timeout=" ^ Int.toString seconds] | NONE => []) @
-              ["run-text"]
-            val text = String.concatWith "\n" lines ^ "\n" ^ run_text
-            val spec_sha256 = HolbuildHash.string_sha256 text
-            val path = Path.concat (spec_dir, spec_sha256)
-            val _ = (ensure_dir spec_dir; write_text path text)
-          in
-            {spec_sha256 = spec_sha256,
-             files = script :: map #path supports @ map source_file theories @ library_files @ [path]}
-          end
+          in {theories = theories, write = write} end
       in
         {run = {name = name, context = String.extract (key_line, size "context=", NONE), run_key = run_key},
-         theories = theories, write = write}
+         prepare = prepare}
       end
     val runs = map run expanded
     fun key_of node = HolbuildBuildPlan.input_key_for (#keys (the_plan ())) node
     fun export wanted =
       let
-        fun chosen ({run, ...} : {run : run, theories : HolbuildBuildPlan.node list,
-                                  write : unit -> {spec_sha256 : string, files : string list}}) =
-          List.exists (fn (r : run) => #run_key r = #run_key run) wanted
-        val runs = List.filter chosen runs
+        val wanted_keys = Binaryset.addList (Binaryset.empty String.compare, map #run_key wanted)
+        val chosen = List.filter (fn {run = {run_key, ...}, ...} => Binaryset.member (wanted_keys, run_key)) runs
+        val load_closure = if null chosen then [] else load_closure ()
+        val runs = map (fn {run, prepare} =>
+                          let val {theories, write} = prepare load_closure
+                          in {run = run, theories = theories, write = write} end) chosen
         val theories = unique_nodes (List.concat (map #theories runs))
         (* A theory the remote cache still lacks though the local cache
            holds it failed to publish, which a later try may not. *)
@@ -7064,8 +7081,8 @@ fun plan_runs tc project planned jobs
                                      " to the remote cache")
                     | NONE => unavailable
                 end
-        fun is_unavailable node =
-          List.exists (fn n => HolbuildBuildPlan.key n = HolbuildBuildPlan.key node) unavailable
+        val unavailable_keys = Binaryset.addList (Binaryset.empty String.compare, map HolbuildBuildPlan.key unavailable)
+        fun is_unavailable node = Binaryset.member (unavailable_keys, HolbuildBuildPlan.key node)
         fun refuse (run : run) node =
           let val needed = package node ^ ":" ^ logical_name node
           in
@@ -7079,7 +7096,7 @@ fun plan_runs tc project planned jobs
         val _ =
           List.app (fn {run, theories, ...} => refuse run (valOf (List.find is_unavailable theories))) refused
         val written = map (fn {run, write, ...} => (run, write ())) ready
-        val _ = upload_spec_files HolbuildHash.file_sha256 remote jobs {known = fn _ => false, learn = fn _ => ()}
+        val _ = upload_spec_files hash_file remote jobs {known = fn _ => false, learn = fn _ => ()}
                     (List.concat (map (#files o #2) written))
       in
         {exported = map (fn (run, {spec_sha256, ...}) => (run, spec_sha256)) written,
@@ -7823,7 +7840,7 @@ fun classify_run_failure stage log_text oom_before msg =
     else ProofFailure
   end
 
-(* The worker cache cap: one LRU over everything a worker keeps between
+(* The worker cache cap covers everything a worker keeps between
    actions (its checkpoint tree, the toolchains with their analysers, and the
    local cache), swept before each action.  It extends the checkpoint budget
    sweep's family eviction to the whole cache root: a family goes whole, and a
@@ -7831,13 +7848,13 @@ fun classify_run_failure stage log_text oom_before msg =
 (* A family's eviction returns the bytes it freed, or NONE if it was kept. *)
 type cache_family = {mtime : Time.time, evict : unit -> Position.int option}
 
-fun checkpoint_cache_families checkpoint_root =
+fun checkpoint_cache_families families =
   List.map
     (fn ({base, mtime, bytes} : checkpoint_family) =>
         {mtime = mtime,
          evict = fn () => (remove_checkpoint_family_base base;
                            if checkpoint_family_root_exists base then NONE else SOME bytes)})
-    (collect_checkpoint_families checkpoint_root)
+    families
 
 fun toolchain_cache_families () =
   let
@@ -7889,14 +7906,16 @@ fun local_cache_families cache =
            if path_exists dir then NONE
            else SOME (freed + remove_paths (List.concat (map release (Redblackset.listItems blobs))))
          end}
-    (* A blob no entry names, such as a spec's source, goes when it was
-       last used. *)
+    (* An unpublished blob may belong to a sibling's in-flight transfer.
+       Prefer all other families until its five-minute grace has elapsed. *)
     fun orphan_family path = {mtime = modified_time path, evict = fn () => SOME (remove_paths [path])}
     val orphans =
       List.filter (fn path => not (Option.isSome (Redblackmap.peek (!users, Path.file path))))
                   (HolbuildCache.children blobs_dir)
+    val cutoff = Time.-(Time.now (), Time.fromSeconds 300)
+    val (young, old) = List.partition (fn path => Time.>=(modified_time path, cutoff)) orphans
   in
-    List.map orphan_family orphans @ List.map entry_family entries
+    (List.map orphan_family old @ List.map entry_family entries, List.map orphan_family young)
   end
 
 fun store_cache_families cache =
@@ -7908,18 +7927,24 @@ fun store_cache_families cache =
    nothing. *)
 fun gc_checkpoint_store days =
   let
+    val cache = HolbuildCache.cache_root ()
     val cutoff = retention_cutoff days
     fun removable dir = Time.<(modified_time dir, cutoff) andalso store_heap_links dir <= 1
-    val removed =
-      List.foldl
-        (fn (dir, n) =>
-            if removable dir andalso Option.isSome (try_evict_store_family_if (fn () => removable dir) dir)
-            then n + 1 else n)
-        0 (store_families (share_store (HolbuildCache.cache_root ())))
+    fun run () =
+      let
+        val removed =
+          List.foldl
+            (fn (dir, n) =>
+                if removable dir andalso Option.isSome (try_evict_store_family_if (fn () => removable dir) dir)
+                then n + 1 else n)
+            0 (store_families (share_store cache))
+      in
+        (* stderr: gc's stdout is its one summary line. *)
+        if removed = 0 then ()
+        else TextIO.output (TextIO.stdErr, "checkpoint store gc: removed families=" ^ Int.toString removed ^ "\n")
+      end
   in
-    (* stderr: gc's stdout is its one summary line. *)
-    if removed = 0 then ()
-    else TextIO.output (TextIO.stdErr, "checkpoint store gc: removed families=" ^ Int.toString removed ^ "\n")
+    if path_exists (share_store cache) then HolbuildCache.with_lock cache run else ()
   end
 
 (* Factory modules have no on-disk module parents.  Once loaded their code
@@ -7955,30 +7980,77 @@ fun toolchains_owned_by_cache () =
   in path_exists dir andalso not (Posix.FileSys.ST.isLink (Posix.FileSys.lstat dir)) end
   handle OS.SysErr _ => false
 
-fun worker_cache_bytes {cache, checkpoint_root} =
-  total_checkpoint_bytes (collect_checkpoint_families checkpoint_root) +
-  tree_bytes (share_store cache) +
-  tree_bytes (HolbuildCache.theory_modules_dir cache) +
-  (if toolchains_owned_by_cache () then
-   List.foldl (fn (path, total) => total + tree_bytes path)
-             (0 : Position.int) (HolbuildHolSharedCache.toolchain_trash ()) +
-  List.foldl (fn (k, total) => total + tree_bytes (HolbuildHolSharedCache.entry_dir_for_key k))
-             (0 : Position.int) (HolbuildHolSharedCache.toolchain_keys ())
-   else 0) +
-  tree_bytes (HolbuildCache.actions_dir cache) + tree_bytes (HolbuildCache.blobs_dir cache)
+(* Follow other configured root aliases, but never links found inside a tree. *)
+fun cache_root_bytes path = tree_bytes (FS.fullPath path) handle OS.SysErr _ => 0
+
+fun cache_root_id path =
+  case file_id path of
+      NONE => "-"
+    | SOME (dev, ino) =>
+        SysWord.toString (Posix.FileSys.devToWord dev) ^ ":" ^
+        SysWord.toString (Posix.FileSys.inoToWord ino)
+
+fun worker_cache_roots cache =
+  let
+    fun tree path = {id = fn () => cache_root_id path, measure = fn () => cache_root_bytes path}
+    fun toolchain_id () =
+      let val path = HolbuildHolSharedCache.toolchains_dir ()
+      in
+        if (Posix.FileSys.ST.isLink (Posix.FileSys.lstat path) handle OS.SysErr _ => false)
+        then "excluded" else cache_root_id path
+      end
+    fun toolchain_bytes () =
+      if not (toolchains_owned_by_cache ()) then 0 else
+        List.foldl (fn (path, total) => total + tree_bytes path)
+                   (0 : Position.int) (HolbuildHolSharedCache.toolchain_trash ()) +
+        List.foldl (fn (k, total) => total + tree_bytes (HolbuildHolSharedCache.entry_dir_for_key k))
+                   (0 : Position.int) (HolbuildHolSharedCache.toolchain_keys ())
+  in
+    [tree (share_store cache), {id = toolchain_id, measure = toolchain_bytes},
+     tree (HolbuildCache.actions_dir cache), tree (HolbuildCache.blobs_dir cache)]
+  end
 
 (* Evict least recently used families until the cache leaves reserve_bytes of
-   room under limit_bytes. *)
+   room under limit_bytes. Reuse a recent shared scan only with ample extra
+   headroom; private checkpoints and modules are always measured locally. *)
 fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes} =
   let
-    val families =
-      sort_by_mtime_ascending (fn ({mtime, ...} : cache_family) => mtime)
-        ((if toolchains_owned_by_cache () then
-            toolchain_trash_family () :: toolchain_cache_families () else []) @
-         checkpoint_cache_families checkpoint_root @
-         store_cache_families cache @ module_cache_families cache @
-         local_cache_families cache)
+    fun private_cache () =
+      let val checkpoints = collect_checkpoint_families checkpoint_root
+      in (checkpoints, total_checkpoint_bytes checkpoints +
+                       cache_root_bytes (HolbuildCache.theory_modules_dir cache)) end
+    val roots = worker_cache_roots cache
+    fun root_ids () = map (fn {id, ...} => id ()) roots
+    fun sum sizes = List.foldl (op +) (0 : Position.int) sizes
     val target = limit_bytes - reserve_bytes
+    val state_path = Path.concat(HolbuildCache.locks_dir cache, "worker-cache-cap.state")
+    val headroom = IntInf.max(reserve_bytes, gb_to_bytes 32)
+    fun parse_sizes [] = SOME []
+      | parse_sizes (id :: bytes :: rest) =
+          (case (IntInf.fromString bytes, parse_sizes rest) of
+               (SOME bytes, SOME entries) => if bytes >= 0 then SOME ((id, bytes) :: entries) else NONE
+             | _ => NONE)
+      | parse_sizes _ = NONE
+    fun recent_scan_fits private_bytes =
+      (case String.tokens Char.isSpace (read_text state_path) of
+           "holbuild-worker-cache-cap-v2" :: measured :: entries =>
+             (case (LargeInt.fromString measured, parse_sizes entries) of
+                  (SOME measured, SOME entries) =>
+                    let val age = Time.toNanoseconds (Time.now ()) - measured
+                    in
+                      age >= 0 andalso age < 60000000000 andalso length entries = length roots andalso
+                      sum (ListPair.map
+                             (* A private root can differ while its siblings
+                                are shared. Keep their hits without stamp churn. *)
+                             (fn (({id = identify, measure}), (id, bytes)) =>
+                                 if identify () = id then bytes else measure ())
+                             (roots, entries)) + private_bytes + headroom <= target
+                    end
+                | _ => false)
+         | _ => false)
+      handle IO.Io _ => false
+           | OS.SysErr _ => false
+    fun by_age families = sort_by_mtime_ascending (fn ({mtime, ...} : cache_family) => mtime) families
     fun sweep total remaining =
       if total <= target then total
       else
@@ -7991,11 +8063,55 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
               in
                 sweep (total - Option.getOpt (freed, 0)) rest
               end
-    val after = sweep (worker_cache_bytes {cache = cache, checkpoint_root = checkpoint_root}) families
+    fun scan () =
+      let val (checkpoints, private_bytes) = private_cache ()
+      in
+        if recent_scan_fits private_bytes then ()
+        else
+          let
+            val measured = Time.toNanoseconds (Time.now ())
+            val ids = root_ids ()
+            val sizes = map (fn {measure, ...} => measure ()) roots
+            val total = sum sizes + private_bytes
+          in
+            if total <= target then
+              if ids <> root_ids () then remove_file state_path
+              else write_text state_path
+                ("holbuild-worker-cache-cap-v2\n" ^ LargeInt.toString measured ^ "\n" ^
+                 String.concat (ListPair.map (fn (id, bytes) => id ^ " " ^ IntInf.toString bytes ^ "\n")
+                                            (ids, sizes)))
+            else
+              let
+                (* Eviction mixes private and shared families. Do not publish a
+                   shared-byte estimate derived from the mixed freed total. *)
+                val _ = remove_file state_path
+                val (local_families, young_orphans) = local_cache_families cache
+                val families =
+                  by_age ((if toolchains_owned_by_cache () then
+                             toolchain_trash_family () :: toolchain_cache_families () else []) @
+                          checkpoint_cache_families checkpoints @ store_cache_families cache @
+                          module_cache_families cache @ local_families) @ by_age young_orphans
+                val after = sweep total families
+              in
+                if after <= target then ()
+                else warn ("worker cache holds " ^ gb_decimal_text after ^ " GB of entries in use, over the " ^
+                           gb_decimal_text target ^ " GB left under the cap after its reserve")
+              end
+          end
+      end
   in
-    if after <= target then ()
-    else warn ("worker cache holds " ^ gb_decimal_text after ^ " GB of entries in use, over the " ^
-               gb_decimal_text target ^ " GB left under the cap after its reserve")
+    if recent_scan_fits (#2 (private_cache ())) then ()
+    else
+      let
+        (* gc.lock is also shared by explicit cache gc. The action-root
+           lock lives outside locks/ and can be container-private. *)
+        val lock_path = HolbuildCache.gc_lock_path cache
+        val _ = HolbuildFileLock.remove_obsolete_lock_dir "cache gc" lock_path
+        val lock = HolbuildFileLock.acquire_exclusive_path_wait {path = lock_path}
+      in
+        (scan () before HolbuildFileLock.release lock)
+        handle e => (HolbuildFileLock.release lock; raise e)
+      end
   end
   handle e => warn ("worker cache sweep failed: " ^ General.exnMessage e)
 

@@ -200,18 +200,222 @@ evicted "$cache2/blobs/$own" "a blob only an evicted entry named"
 kept "$cache2/actions/newer" "an entry once the cache fits"
 kept "$cache2/blobs/$shared" "a blob a surviving entry names"
 
+# Young unpublished blobs are last even when a newer manifest can free space.
+cache3=$tmpdir/cache3
+young=$(printf young | sha256sum | cut -d' ' -f1)
+referenced=$(printf referenced | sha256sum | cut -d' ' -f1)
+sparse "$cache3/blobs/$young" 1
+sparse "$cache3/blobs/$referenced" 2
+mkdir -p "$cache3/actions/newer"
+printf 'blob dat %s\n' "$referenced" > "$cache3/actions/newer/manifest"
+python3 - "$cache3/blobs/$young" <<'YOUNG'
+import os, sys, time
+when = time.time() - 10
+os.utime(sys.argv[1], (when, when))
+YOUNG
+set +e
+HOLBUILD_CACHE=$cache3 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
+  --result "$tmpdir/result" --cache-limit-gb 2 --cache-reserve-gb 0 > "$tmpdir/young.log" 2>&1
+set -e
+kept "$cache3/blobs/$young" "an in-flight orphan while another family could free space"
+evicted "$cache3/actions/newer" "a published family before a young orphan"
+# Grace never overrides the requested target.
+set +e
+HOLBUILD_CACHE=$cache3 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
+  --result "$tmpdir/result" --cache-limit-gb 1 --cache-reserve-gb 1 > "$tmpdir/grace.log" 2>&1
+set -e
+evicted "$cache3/blobs/$young" "a young orphan when nothing else could reach the target"
+
+# Reuse only a recent shared measurement with enough extra headroom.
+cache4=$tmpdir/cache4
+sparse "$cache4/blobs/first" 1
+sweep4() {
+  local status=0
+  HOLBUILD_CACHE=$cache4 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
+    --result "$tmpdir/result" --cache-limit-gb "$1" --cache-reserve-gb "$2" \
+    > "$tmpdir/stamp.log" 2>&1 || status=$?
+  [[ $status -eq 4 ]] || { cat "$tmpdir/stamp.log" >&2; exit 1; }
+}
+sweep4 100 1
+state=$cache4/locks/worker-cache-cap.state
+[[ -s "$state" ]] || { echo "no shared sweep measurement" >&2; exit 1; }
+cp "$state" "$tmpdir/first-state"
+sparse "$cache4/blobs/second" 1
+sweep4 100 1
+cmp "$state" "$tmpdir/first-state" || { echo "fresh roomy measurement was not reused" >&2; exit 1; }
+# A small cap scans apparent bytes, including nested sparse growth.
+mkdir -p "$cache4/checkpoint-store/family/nested"
+sparse "$cache4/checkpoint-store/family/nested/heap" 1
+sweep4 7 1
+! cmp -s "$state" "$tmpdir/first-state" || { echo "small cap reused a measurement" >&2; exit 1; }
+python3 - "$state" <<'BYTES'
+import pathlib, sys
+assert sum(map(int, pathlib.Path(sys.argv[1]).read_text().split()[3::2])) >= 3 * 1024 ** 3
+BYTES
+cp "$state" "$tmpdir/small-state"
+# Current reserve and private checkpoints participate in the headroom gate.
+sweep4 100 50
+! cmp -s "$state" "$tmpdir/small-state" || { echo "increased reserve reused a measurement" >&2; exit 1; }
+cp "$state" "$tmpdir/reserve-state"
+sparse "$cache4/checkpoints/pkg/PrivateScript.deps/key/deps_loaded.save" 70
+sweep4 100 1
+! cmp -s "$state" "$tmpdir/reserve-state" || { echo "private checkpoints were omitted from headroom" >&2; exit 1; }
+# Expired, future-dated and malformed state must all fall back to a scan.
+for measured in 0 999999999999999999999999 broken; do
+  python3 - "$state" "$measured" <<'STAMP'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+lines = path.read_text().splitlines()
+lines[1] = sys.argv[2]
+path.write_text("\n".join(lines) + "\n")
+STAMP
+  cp "$state" "$tmpdir/invalid-state"
+  sweep4 200 1
+  ! cmp -s "$state" "$tmpdir/invalid-state" || { echo "invalid measurement reused" >&2; exit 1; }
+done
+
+# Distinct container roots coordinate through host-shared locks/. A waiter
+# rechecks the stamp after locking, so a sibling's scan satisfies it.
+cache5=$tmpdir/cache5
+mkdir -p "$cache5"
+for shared_dir in locks checkpoint-store hol-toolchains actions blobs; do
+  ln -s "$cache4/$shared_dir" "$cache5/$shared_dir"
+done
+python3 - "$state" <<'EXPIRE'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+lines = path.read_text().splitlines()
+lines[1] = "0"
+path.write_text("\n".join(lines) + "\n")
+EXPIRE
+python3 - "$HOLBUILD_BIN" "$cache5" "$state" "$remote_url" "$absent" "$tmpdir" <<'LOCK'
+import fcntl, os, pathlib, subprocess, sys, time
+binary, cache, state, remote, absent, tmp = sys.argv[1:]
+with open(pathlib.Path(state).parent / "gc.lock", "a") as lock:
+    fcntl.lockf(lock, fcntl.LOCK_EX)
+    with open(pathlib.Path(tmp) / "waiter.log", "w") as log:
+        child = subprocess.Popen(
+            [binary, "--remote-cache", remote, "exec-action", absent,
+             "--result", str(pathlib.Path(tmp) / "waiter-result"),
+             "--cache-limit-gb", "100", "--cache-reserve-gb", "1"],
+            env={**os.environ, "HOLBUILD_CACHE": cache}, stdout=log, stderr=log)
+        try:
+            try:
+                child.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+            else:
+                raise AssertionError("sweep did not wait on the host-shared lock")
+            lines = pathlib.Path(state).read_text().splitlines()
+            lines[1] = str(time.time_ns())
+            fresh = "\n".join(lines) + "\n"
+            pathlib.Path(state).write_text(fresh)
+            fcntl.lockf(lock, fcntl.LOCK_UN)
+            assert child.wait(timeout=30) == 4
+            assert pathlib.Path(state).read_text() == fresh, "waiter repeated sibling's scan"
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+LOCK
+
+# A sibling's shared stamp must not omit this container's private modules.
+cp "$state" "$tmpdir/pre-module-state"
+sparse "$cache5/theory-modules/large.pmo" 70
+set +e
+HOLBUILD_CACHE=$cache5 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
+  --result "$tmpdir/result" --cache-limit-gb 100 --cache-reserve-gb 1 > "$tmpdir/modules.log" 2>&1
+set -e
+! cmp -s "$state" "$tmpdir/pre-module-state" || { echo "private modules omitted from headroom" >&2; exit 1; }
+kept "$cache5/theory-modules/large.pmo" "private modules under the target"
+python3 - "$state" <<'ALIASES'
+import pathlib, sys
+assert sum(map(int, pathlib.Path(sys.argv[1]).read_text().split()[3::2])) >= 3 * 1024 ** 3
+ALIASES
+
+# Partial sharing on the same filesystem: differing roots are measured live,
+# while matching roots reuse their bytes without rewriting the shared stamp.
+cache6=$tmpdir/cache6
+mkdir -p "$cache6"
+ln -s "$cache4/locks" "$cache6/locks"
+sparse "$cache6/blobs/private" 1
+cp "$state" "$tmpdir/pre-partial-state"
+set +e
+HOLBUILD_CACHE=$cache6 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
+  --result "$tmpdir/result" --cache-limit-gb 100 --cache-reserve-gb 1 > "$tmpdir/partial.log" 2>&1
+set -e
+cmp "$state" "$tmpdir/pre-partial-state" || { echo "partial sharing thrashed the stamp" >&2; exit 1; }
+# Growing the private root near the target must force a live scan.
+sparse "$cache6/blobs/private" 80
+set +e
+HOLBUILD_CACHE=$cache6 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
+  --result "$tmpdir/result" --cache-limit-gb 100 --cache-reserve-gb 1 > "$tmpdir/partial-large.log" 2>&1
+set -e
+! cmp -s "$state" "$tmpdir/pre-partial-state" || { echo "private root growth omitted from headroom" >&2; exit 1; }
+# A real eviction must invalidate, rather than publish pre-eviction totals.
+set +e
+HOLBUILD_CACHE=$cache6 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
+  --result "$tmpdir/result" --cache-limit-gb 1 --cache-reserve-gb 0 > "$tmpdir/invalidate.log" 2>&1
+set -e
+evicted "$state" "a pre-eviction size stamp"
+evicted "$cache6/blobs/private" "a private blob over the cap"
+
+# Existing caches may still have the old directory-shaped GC lock.
+cache7=$tmpdir/cache7
+mkdir -p "$cache7/locks/gc.lock"
+sparse "$cache7/blobs/old" 2
+set +e
+HOLBUILD_CACHE=$cache7 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
+  --result "$tmpdir/result" --cache-limit-gb 1 --cache-reserve-gb 0 > "$tmpdir/legacy-lock.log" 2>&1
+set -e
+[[ -f "$cache7/locks/gc.lock" ]] || { echo "legacy GC lock directory not migrated" >&2; exit 1; }
+evicted "$cache7/blobs/old" "an oversized blob with a legacy GC lock"
+
+# GC may remove private modules while a cap sweep waits for its shared lock.
+cache8=$tmpdir/cache8
+sparse "$cache8/theory-modules/removed.pmo" 3
+sparse "$cache8/blobs/keep" 1
+mkdir -p "$cache8/locks"
+python3 - "$HOLBUILD_BIN" "$cache8" "$remote_url" "$absent" "$tmpdir" <<'PRIVATE'
+import fcntl, os, pathlib, subprocess, sys
+binary, cache, remote, absent, tmp = sys.argv[1:]
+with open(pathlib.Path(cache) / "locks/gc.lock", "a") as lock:
+    fcntl.lockf(lock, fcntl.LOCK_EX)
+    with open(pathlib.Path(tmp) / "private-wait.log", "w") as log:
+        child = subprocess.Popen(
+            [binary, "--remote-cache", remote, "exec-action", absent,
+             "--result", str(pathlib.Path(tmp) / "private-result"),
+             "--cache-limit-gb", "2", "--cache-reserve-gb", "0"],
+            env={**os.environ, "HOLBUILD_CACHE": cache}, stdout=log, stderr=log)
+        try:
+            try:
+                child.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+            else:
+                raise AssertionError("sweep did not wait for GC")
+            (pathlib.Path(cache) / "theory-modules/removed.pmo").unlink()
+            fcntl.lockf(lock, fcntl.LOCK_UN)
+            assert child.wait(timeout=30) == 4
+            assert (pathlib.Path(cache) / "blobs/keep").exists(), "stale private bytes caused eviction"
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+PRIVATE
+
 # A linked toolchain cache is owned elsewhere. Neither its entries nor its
 # trash count towards this worker's cap, and the sweep must leave both alone.
-cache3=$tmpdir/cache3
+cache9=$tmpdir/cache9
 external=$tmpdir/external-toolchains
-mkdir -p "$cache3" "$external/.trash/retired"
+mkdir -p "$cache9" "$external/.trash/retired"
 mv "$entry_pinned" "$external/$(basename "$entry_pinned")"
 external_entry=$external/$(basename "$entry_pinned")
 sparse "$external/.trash/retired/weight" 3
-ln -s "$external" "$cache3/hol-toolchains"
-printf owned > "$cache3/own-sentinel"
+ln -s "$external" "$cache9/hol-toolchains"
+printf owned > "$cache9/own-sentinel"
 set +e
-HOLBUILD_CACHE=$cache3 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
+HOLBUILD_CACHE=$cache9 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
   --result "$tmpdir/result" --cache-limit-gb 1 --cache-reserve-gb 0 > "$tmpdir/linked.log" 2>&1
 status=$?
 set -e

@@ -133,7 +133,13 @@ the file `HOLBUILD_REMOTE_CACHE_CURL_CONFIG` names; the entrypoint writes
 its user, so the credentials can come from the environment. `HOLBUILD_CACHE`
 is `/var/cache/holbuild` in the image. It must be the worker's own cache root:
 `exec-action --cache-limit-gb` sweeps the whole root before each action, so a
-root shared with ordinary builds would lose their cache. `exec-action` runs
+root shared with ordinary builds would lose their cache. Containers on one host
+may share cache directories, provided they also share `locks/`: cap sweeps and
+explicit cache GC use its `gc.lock`. With ample headroom, actions reuse shared
+byte measurements for up to 60 seconds while sizing private checkpoints and
+theory modules on each call. A cached directory must match the recorded device
+and inode; other directories are sized live. Small caps and near-target caches
+always scan live. `exec-action` runs
 with the worker's `HOLBUILD_*` build settings, `PATH`, `HOME`, `TMPDIR`, the
 locale, and curl's certificate and proxy settings. It excludes
 `HOLBUILD_REMOTE_EXEC_*`, `HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN` and inherited

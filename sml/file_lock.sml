@@ -11,9 +11,24 @@ fun write_text path text = let val f = TextIO.openOut path fun close () = TextIO
 fun remove_file path = FS.remove path handle OS.SysErr _ => ()
 fun remove_tree path = HolbuildRemoveTree.remove path handle HolbuildRemoveTree.Error msg => raise Error msg
 fun remove_obsolete_lock_dir kind path =
-  if (FS.isDir path handle OS.SysErr _ => false) then
-    (TextIO.output(TextIO.stdErr, "holbuild: warning: removing obsolete directory " ^ kind ^ " lock: " ^ path ^ "\n"); remove_tree path)
-  else ()
+  case HolbuildRemoveTree.lstat path of
+      NONE => ()
+    | SOME st =>
+        if Posix.FileSys.ST.isDir st then
+          ((TextIO.output(TextIO.stdErr, "holbuild: warning: removing obsolete directory " ^ kind ^ " lock: " ^ path ^ "\n");
+            let
+              val dir = FS.openDir path
+              fun names acc = case FS.readDir dir of NONE => acc | SOME name => names (name :: acc)
+              val entries = (names [] handle e => (FS.closeDir dir; raise e)) before FS.closeDir dir
+            in
+              List.app (fn name => remove_tree (Path.concat(path, name))) entries;
+              (* Another migrator may already have replaced the directory with
+                 a held lock file. Never unlink the lock path itself. *)
+              FS.rmDir path
+            end)
+           handle e as OS.SysErr (_, SOME err) =>
+             if err = Posix.Error.noent orelse err = Posix.Error.notdir then () else raise e)
+        else ()
 fun pid_text pid = LargeInt.toString (SysWord.toLargeInt (Posix.Process.pidToWord pid))
 fun current_pid_text () = pid_text (Posix.ProcEnv.getpid ())
 fun trim text = if size text > 0 andalso String.sub(text, size text - 1) = #"\n" then String.substring(text, 0, size text - 1) else text

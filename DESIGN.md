@@ -710,10 +710,14 @@ When the filesystems differ, publication falls back to a validated copy.
 Ordinary publication still validates its input; only transfer-owned, verified
 temporary files use the consuming operation.
 
-Action-spec export shares file hashes across specs and source uploads within
-that export. Reuse requires unchanged device, inode, size, mtime and ctime;
+Action-spec and run-spec export share file hashes across specs and source uploads
+within that export. Reuse requires unchanged device, inode, size, mtime and ctime;
 files timestamped within a second of the export's start are rehashed. Library
-hashes must still match the plan. The table is not persisted between exports.
+and context-script hashes must still match the plan. The table is not persisted
+between exports. Run planning computes identities first; only runs selected for
+export construct context metadata. Fetch-only calls and cache hits avoid that
+work. Run exports check remote source availability on every call rather than
+using the persistent upload ledger, since they have no missing-input resubmission.
 
 Avoid hardlinking cache blobs into project `.holbuild/`: even if cache blobs are meant
 to be immutable, project outputs are the local materialized build view and should
