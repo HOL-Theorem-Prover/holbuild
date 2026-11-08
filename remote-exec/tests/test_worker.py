@@ -920,6 +920,18 @@ def test_claims_and_heartbeats_carry_the_host_report(telemetry: tuple[HostTeleme
     assert (claimed["id"], claimed["mem_total"], beat["id"]) == ("b0a7", 64 * GIB, "b0a7")
 
 
+def test_host_rank_is_bounded_and_reported(telemetry: tuple[HostTelemetry, Path]) -> None:
+    args = ["--coordinator", "http://coordinator.test", "--remote-cache", "http://cache.test", "--cache-limit-gb", "1"]
+    assert parse_args(args).host_rank == 0
+    assert parse_args([*args, "--host-rank", "1"]).host_rank == 1
+    for bad in ("-1", "1001", "x"):
+        with pytest.raises(SystemExit):
+            parse_args([*args, "--host-rank", bad])
+    reporter, _ = telemetry
+    reporter.rank = 1
+    assert (report := reporter.report()) is not None and report.rank == 1
+
+
 def test_cpu_counters_going_backwards_give_no_idle_share(telemetry: tuple[HostTelemetry, Path]) -> None:
     reporter, stat = telemetry
     stat.write_text("cpu  100 0 0 100 50 0 0 0 0 0\n")

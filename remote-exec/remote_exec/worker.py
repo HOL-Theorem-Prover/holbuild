@@ -53,6 +53,7 @@ DEFAULT_CHARGE_MIB = 3072
 STARTUP_SECONDS = 30
 MEMORY_POLL_SECONDS = 2  # between two looks at the host's memory while waiting to claim
 BOOT_ID = "/proc/sys/kernel/random/boot_id"  # one per host and boot, the same in every container on the host
+MAX_HOST_RANK = 1000  # the coordinator's bound on a host's rank
 PROC_STAT = "/proc/stat"
 CPU_SAMPLE_SECONDS = 1.0  # least time a worker measures the host's idle CPU over
 MIB = 2**20
@@ -506,8 +507,9 @@ def cpu_times(stat_line: str) -> tuple[int, int]:
 
 @dataclass(frozen=True)
 class HostReport:
-    """A worker's report of its host to the coordinator; memory in bytes as in HostMemory, and ``memory_short`` when
-    admission would hold a child back now or held this worker back since its last report."""
+    """A worker's report of its host to the coordinator; memory in bytes as in HostMemory, ``memory_short`` when
+    admission would hold a child back now or held this worker back since its last report, and the host's ``rank``
+    (``--host-rank``)."""
 
     id: str
     cpu_idle_pct: float | None  # since the CPU sample it was last measured from, None under CPU_SAMPLE_SECONDS ago
@@ -517,14 +519,16 @@ class HostReport:
     reserved: int
     leases: int
     memory_short: bool
+    rank: int
 
 
 class HostTelemetry:
     """What a worker reports of its host with each claim and heartbeat, which come from two threads."""
 
-    def __init__(self, cooperate_dir: str | None, charge: int) -> None:
+    def __init__(self, cooperate_dir: str | None, charge: int, rank: int = 0) -> None:
         with open(BOOT_ID) as file:
             self.id = file.read().strip()
+        self.rank = rank
         self.cooperate_dir = cooperate_dir
         self.charge = charge
         self.lock = threading.Lock()
@@ -562,6 +566,7 @@ class HostTelemetry:
             memory.reserved,
             memory.leases,
             memory.shortfall(self.charge) is not None or waited,
+            self.rank,
         )
 
 
@@ -860,6 +865,13 @@ def claim_wait_seconds(text: str) -> float:
     return seconds
 
 
+def host_rank(text: str) -> int:
+    rank = int(text)
+    if not 0 <= rank <= MAX_HOST_RANK:
+        raise argparse.ArgumentTypeError(f"{text} must be between 0 and {MAX_HOST_RANK}")
+    return rank
+
+
 def drain_seconds(text: str) -> float:
     seconds = float(text)
     if not math.isfinite(seconds) or seconds < 0:
@@ -882,6 +894,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="extend",
         default=[],
         help="tiers to claim from when --tier has nothing ready, in order (repeatable or comma-separated)",
+    )
+    parser.add_argument(
+        "--host-rank", type=host_rank, default=0,
+        help="claims pack onto hosts of lower rank first, so hosts of higher rank empty first and scale in "
+        "(default: %(default)s)",
     )
     parser.add_argument("--max-heap", type=int, default=12000, help="default holbuild --max-heap MB (default: %(default)s)")
     parser.add_argument("--cooperate-dir", help="holbuild --cooperate-dir, shared by a host's workers")
@@ -956,7 +973,7 @@ def main() -> None:
         sys.exit("HOLBUILD_CACHE is not set; give the worker its own cache root")
     charge = child_charge(args.max_heap)
     try:
-        host: HostTelemetry | None = HostTelemetry(args.cooperate_dir, charge)
+        host: HostTelemetry | None = HostTelemetry(args.cooperate_dir, charge, args.host_rank)
     except OSError as error:
         print(f"not reporting the host to the coordinator: {error}", file=sys.stderr)
         host = None

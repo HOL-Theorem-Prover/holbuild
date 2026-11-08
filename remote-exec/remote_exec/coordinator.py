@@ -53,6 +53,8 @@ SCALE_CMD_TIMEOUT_S = 60
 HOST_REPORT_SECONDS = 120
 # Hosts the coordinator remembers at most; a report from another host beyond them is dropped.
 MAX_HOSTS = 1000
+# The highest --host-rank a worker may report (worker.py checks the same bound at start).
+MAX_HOST_RANK = 1000
 # The queue sums the phase reports of workers' last this many seconds; at most MAX_PHASE_REPORTS are kept.
 PHASE_WINDOW_SECONDS = 600
 MAX_PHASE_REPORTS = 100_000
@@ -71,6 +73,9 @@ class Settings(BaseSettings):
 
     lease_seconds: int = 120
     max_attempts: int = 3
+    # Refunded "unavailable" results per action (a worker drained or its cache was out); past this they count as
+    # attempts, so an action that never fits a drain window can't loop forever.
+    max_interruptions: int = 5
     # A theory whose peak hint reaches this goes to the high-memory tier; set it to what a standard worker holds.
     standard_tier_mb: int = 16000
     retention_hours: int = 168
@@ -174,7 +179,8 @@ Amount = Annotated[int, Field(ge=0, le=2**53)]
 class HostReport:
     """What a worker reports of its host with a claim or heartbeat (``HostReport`` in worker.py): the share of CPU
     time idle lately, memory in bytes as holbuild's ``--cooperate-dir`` admission sees it, and whether that
-    admission would hold a child back now or held the worker back since its last report."""
+    admission would hold a child back now or held the worker back since its last report. Claims pack onto hosts of
+    lower ``rank`` first (the worker's ``--host-rank``)."""
 
     id: Annotated[str, Field(max_length=64)]  # the host's boot_id
     cpu_idle_pct: Annotated[float, Field(ge=0, le=100)] | None
@@ -184,6 +190,7 @@ class HostReport:
     reserved: Amount
     leases: Amount
     memory_short: bool
+    rank: Annotated[int, Field(ge=0, le=MAX_HOST_RANK)] = 0
 
 
 # Seconds of a worker's time in one phase since its last report. No upper bound: a worker that couldn't report
@@ -383,9 +390,12 @@ LIMIT 1 FOR UPDATE OF a SKIP LOCKED
 """)
 
 
-def _claim_rank(tiers: list[str], host_id: str | None) -> tuple[bool, bool, str]:
-    """Pack standard work onto warm workers first, then hosts in a stable order."""
-    return tiers[0] != "standard", host_id is None, host_id or ""
+ClaimRank = tuple[bool, bool, int, str]
+
+
+def _claim_rank(tiers: list[str], host_id: str | None, host_rank: int = 0) -> ClaimRank:
+    """Pack standard work onto warm workers first, then hosts of lower rank, then hosts in a stable order."""
+    return tiers[0] != "standard", host_id is None, host_rank, host_id or ""
 
 
 class Coordinator:
@@ -409,10 +419,10 @@ class Coordinator:
         self.scale_lock = asyncio.Lock()
         self.scale_pending = False
         self.scale_task: asyncio.Task[None] | None = None
-        # How many actions this process's release has made ready, and waiting claims' tiers, host and wake,
+        # How many actions this process's release has made ready, and waiting claims' tiers, rank and wake,
         # oldest first (the tie-breaker within a host); see claim.
         self.made_ready = 0
-        self.claim_waiters: list[tuple[list[str], str | None, asyncio.Future[str]]] = []
+        self.claim_waiters: list[tuple[list[str], ClaimRank, asyncio.Future[str]]] = []
         # When each cache entry was last found, the checks of the cache under way, and how many times
         # input-missing results forgot both; see _in_cache.
         self.found_in_cache: dict[str, float] = {}
@@ -577,6 +587,7 @@ class Coordinator:
         wait_s: float = 0,
         disconnected: Callable[[], Awaitable[bool]] | None = None,
         host_id: str | None = None,
+        host_rank: int = 0,
     ) -> Claim | None:
         """Lease a ready action to ``worker``, waiting up to ``wait_s`` seconds for one, or None if none became
         ready: of the first of ``tiers`` that has one, the batch with the fewest running actions, then the one
@@ -584,8 +595,8 @@ class Coordinator:
         dependents, then the most dependents.
 
         A wait ends early once ``disconnected`` says the worker has gone, so no action is leased to nobody. Each
-        action this process's ``release`` makes ready wakes one compatible claim, preferring warm workers then
-        hosts in canonical order, with FIFO ties. Unwoken claims defer each tier to better-ranked waiters, so
+        action this process's ``release`` makes ready wakes one compatible claim, preferring warm workers, then
+        hosts of lower ``host_rank``, then hosts in canonical order, with FIFO ties. Unwoken claims defer each tier to better-ranked waiters, so
         polling workers don't spread work back onto tail hosts. Waits recheck every
         ``CLAIM_RECHECK_SECONDS``, for actions another coordinator process made ready and for an action whose
         woken claim took another one or lost it to another claim; a claim woken that leaves without trying wakes
@@ -593,7 +604,7 @@ class Coordinator:
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wait_s
-        rank = _claim_rank(tiers, host_id)
+        rank = _claim_rank(tiers, host_id, host_rank)
         woken: asyncio.Future[str] = loop.create_future()  # done once a wake was handed to this claim
         try:
             while True:
@@ -602,8 +613,8 @@ class Coordinator:
                 eligible_tiers = tiers if woken.done() else [
                     tier for tier in tiers
                     if not any(
-                        tier in w_tiers and not w_woken.done() and _claim_rank(w_tiers, w_host) < rank
-                        for w_tiers, w_host, w_woken in self.claim_waiters
+                        tier in w_tiers and not w_woken.done() and w_rank < rank
+                        for w_tiers, w_rank, w_woken in self.claim_waiters
                     )
                 ]
                 claimed = await self._claim(eligible_tiers, worker) if eligible_tiers else None
@@ -612,7 +623,7 @@ class Coordinator:
                     return claimed
                 woken = loop.create_future()
                 if self.made_ready == made_ready:
-                    waiter = (tiers, host_id, woken)
+                    waiter = (tiers, rank, woken)
                     self.claim_waiters.append(waiter)
                     try:
                         with contextlib.suppress(TimeoutError):
@@ -693,7 +704,7 @@ class Coordinator:
         self.made_ready += 1
         waiter = min(
             (w for w in self.claim_waiters if tier in w[0] and not w[2].done()),
-            key=lambda w: _claim_rank(w[0], w[1]),
+            key=lambda w: w[1],
             default=None,
         )
         if waiter is not None:
@@ -765,7 +776,8 @@ class Coordinator:
             action = (
                 await conn.execute(
                     sa.text(
-                        "SELECT a.input_key, a.spec_sha256, a.theory, a.tier, a.attempts, a.last_failure, a.class AS action_class, b.profile "
+                        "SELECT a.input_key, a.spec_sha256, a.theory, a.tier, a.attempts, a.interruptions, a.last_failure, "
+                        "a.class AS action_class, b.profile "
                         "FROM actions a JOIN batches b ON b.id = a.batch_id "
                         "WHERE a.batch_id = :batch_id AND a.input_key = :input_key"
                     ),
@@ -806,17 +818,18 @@ class Coordinator:
                     {"batch_id": batch_id, "input_key": action.input_key},
                 )
                 await self._retry(conn, batch_id, action.input_key)
-            elif result.failure == "unavailable":
-                # The worker couldn't start it, so it doesn't count as an attempt.
+            elif result.failure == "unavailable" and action.interruptions < self.settings.max_interruptions:
+                # The worker couldn't start or finish it, so it doesn't count as an attempt.
                 await conn.execute(
                     sa.text(
-                        "UPDATE actions SET attempts = attempts - 1 WHERE batch_id = :batch_id AND input_key = :input_key"
+                        "UPDATE actions SET attempts = attempts - 1, interruptions = interruptions + 1 "
+                        "WHERE batch_id = :batch_id AND input_key = :input_key"
                     ),
                     {"batch_id": batch_id, "input_key": action.input_key},
                 )
                 await self._retry(conn, batch_id, action.input_key)
             elif action.attempts < self.settings.max_attempts and (
-                result.failure in ("publish", "toolchain", "internal", "memory")
+                result.failure in ("publish", "toolchain", "internal", "memory", "unavailable")
                 or (result.failure == "disk" and action.last_failure != "disk")
             ):
                 await self._retry(conn, batch_id, action.input_key)

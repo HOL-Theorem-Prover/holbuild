@@ -71,6 +71,7 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_CACHE_URL` | remote cache base URL, for the readiness check of parents' entries; credentials go in its userinfo | required |
 | `REMOTE_EXEC_LEASE_SECONDS` | lease length; a heartbeat renews it | 120 |
 | `REMOTE_EXEC_MAX_ATTEMPTS` | claims of one action before a retryable failure becomes final | 3 |
+| `REMOTE_EXEC_MAX_INTERRUPTIONS` | `unavailable` results of one action retried without counting the claim; later ones count | 5 |
 | `REMOTE_EXEC_STANDARD_TIER_MB` | peak memory from which a theory goes to the high-memory tier | 16000 |
 | `REMOTE_EXEC_RETENTION_HOURS` | age after which a finished batch is deleted | 168 |
 | `REMOTE_EXEC_BATCH_DEADLINE_HOURS` | age at which a batch still running fails | 12 |
@@ -97,7 +98,12 @@ docker run -e REMOTE_EXEC_WORKER_TOKEN=... -e HOLBUILD_REMOTE_CACHE_CURL_CONFIG_
   holbuild-remote-exec worker --coordinator https://exec.example.org --remote-cache https://cache.example.org \
   --cache-limit-gb 200 [--tier standard|high] [--also-claim standard] [--max-heap MB] [--cooperate-dir DIR] \
   [--share-heaps] [--holbuild-releases-dir DIR] [--protection-cmd COMMAND] [--claim-wait-seconds 20] [--drain-seconds 20]
+  [--host-rank 0]
 ```
+
+`--host-rank` (0 to 1000, 0 by default) orders hosts for packing: claims go
+to hosts of lower rank first, so hosts of higher rank (an interruptible spot
+pool, say) empty first and scale in.
 
 On `SIGTERM`, a worker stops claiming and gives its running action up to
 `--drain-seconds` (20 by default) to finish and report its result. At the
@@ -159,8 +165,9 @@ for a worker on another host.
 Each claim and heartbeat also reports the worker's host: its id (the kernel's
 `boot_id`, the same in every container on the host), the share of CPU time
 idle since the worker's previous CPU sample (iowait counts as busy), its
-memory as holbuild's admission sees it, and whether that admission would
-hold a child back now or held the worker back since its last report. A
+memory as holbuild's admission sees it, whether that admission would
+hold a child back now or held the worker back since its last report, and
+its `--host-rank`. A
 report is left out when the host can't be read at once, as while an
 admission holds the cooperate dir's lock. `GET /v1/queue` lists them, so a
 reader can tell whether hosts have CPU to spare or are short of memory.
@@ -253,8 +260,8 @@ a run batch and cancels its unfinished actions.
   Within the selected class, claims prefer the worker's tier over its
   `also_claim` tiers, in order.
   Within each coordinator process, waiting claims prefer standard-primary
-  workers for standard work, then hosts in ascending host-id order, with
-  FIFO ties. Claims without a host report follow known hosts of the same
+  workers for standard work, then hosts in ascending `--host-rank`, then
+  host-id order, with FIFO ties. Claims without a host report follow known hosts of the same
   primary tier. Polling claims defer each tier to better-ranked waiters;
   a waiting standard-only worker still leaves high work available to burst
   workers. This packs work so excess tail hosts can drain for scale-in.
@@ -290,7 +297,7 @@ a run batch and cancels its unfinished actions.
   | `disk` | retried once; a second `disk` in a row, or `MAX_ATTEMPTS` claims, is final |
   | `input-missing` naming a theory of the batch other than the action itself or one that depends on it | that theory is built again and the action waits for it, until the action has been claimed `MAX_ATTEMPTS` times |
   | any other `input-missing` (a blob, a theory cached at export, or one that can't be the action's input) | retried, since a restore that fails on a network error reports its input missing too; after `MAX_ATTEMPTS` claims the batch fails with `resubmit: …`, naming the theory as `theory <input_key>`; the client resubmits once with that theory and every theory that depends on it, and otherwise the next build exports a new batch |
-  | `unavailable` | retried without counting the claim |
+  | `unavailable` | retried without counting the claim, `MAX_INTERRUPTIONS` times; after that like `internal` |
   | `proof`, `tactic-timeout`, `spec-rejected`, `script`, `timeout` | final; `script` means the script failed or omitted an output, `timeout` means it exceeded its time limit |
 
   A worker that gets no answer from the cache for the action's spec, 429,
@@ -492,7 +499,7 @@ An unknown class returns 422.
   `age_s` seconds old,
   except that `cpu_idle_pct` is the latest one measured:
   ```json
-  {"id": "<boot_id>", "cpu_idle_pct": 31.5, "mem_total": 133680000000, "mem_available": 61200000000, "budget": 120800000000, "reserved": 92300000000, "leases": 29, "memory_short": false, "age_s": 1.2}
+  {"id": "<boot_id>", "cpu_idle_pct": 31.5, "mem_total": 133680000000, "mem_available": 61200000000, "budget": 120800000000, "reserved": 92300000000, "leases": 29, "memory_short": false, "rank": 0, "age_s": 1.2}
   ```
   Memory is in bytes: `MemTotal` and `MemAvailable`, the `--cooperate-dir`
   budget, the charges of the leases held there and their number;
