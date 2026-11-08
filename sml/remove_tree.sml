@@ -15,6 +15,11 @@ fun remove_entry path =
      | SOME st =>
          if Posix.FileSys.ST.isDir st then
            let
+             (* Submitted code can create a directory without owner access;
+                restore it so the directory can be listed and emptied. *)
+             val owner = Posix.FileSys.S.irwxu
+             val _ = if Posix.FileSys.S.allSet (owner, Posix.FileSys.ST.mode st) then ()
+                     else Posix.FileSys.chmod (path, owner)
              val dir = FS.openDir path
              fun names acc = case FS.readDir dir of NONE => acc | SOME name => names (name :: acc)
              val entries = (names [] handle e => (FS.closeDir dir; raise e)) before FS.closeDir dir

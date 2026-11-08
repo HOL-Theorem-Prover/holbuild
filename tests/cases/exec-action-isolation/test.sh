@@ -62,10 +62,32 @@ Proof
   simp[]
 QED
 SML
-(cd "$tmpdir/project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload IsolatedTheory) > "$tmpdir/batch"
+# A directory without owner access hides its contents from output
+# validation and from cleanup.
+cat > "$tmpdir/project/src/LockedScript.sml" <<'SML'
+Theory Locked
+Ancestors bool
+
+val _ = Posix.FileSys.mkdir ("locked", Posix.FileSys.S.flags []);
+Theorem locked: T
+Proof
+  simp[]
+QED
+SML
+(cd "$tmpdir/project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload IsolatedTheory LockedTheory) > "$tmpdir/batch"
 spec=$(awk '$1 == "action" && $5 == "isolation:IsolatedTheory" {print $4}' "$tmpdir/batch")
-[[ -n "$spec" ]]
+locked=$(awk '$1 == "action" && $5 == "isolation:LockedTheory" {print $4}' "$tmpdir/batch")
+[[ -n "$spec" && -n "$locked" ]]
 link_hol_toolchain_cache "$tmpdir/worker"
+set +e
+HOLBUILD_CACHE="$tmpdir/worker" "$HOLBUILD_BIN" --max-heap 1024 --remote-cache "$remote_url" \
+  exec-action "$locked" --cache-limit-gb 1000 --result "$tmpdir/locked.result" > "$tmpdir/locked.log" 2>&1
+locked_status=$?
+set -e
+[[ $locked_status == 3 ]] || { cat "$tmpdir/locked.log" "$tmpdir/locked.result" >&2; exit 1; }
+require_grep '^failure=internal$' "$tmpdir/locked.result"
+require_grep 'sandbox did not complete cleanup and output validation' "$tmpdir/locked.log"
+[[ ! -e "$tmpdir/worker/action" ]] || { echo 'an inaccessible directory survived cleanup' >&2; exit 1; }
 # A policy/setup failure is retryable infrastructure failure, never a final
 # failed proof. The protected completion marker is not writable by HOL.
 set +e

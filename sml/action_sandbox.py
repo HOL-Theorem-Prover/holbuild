@@ -265,7 +265,8 @@ class Policy:
         for root in self.writable:
             if not root.is_dir():
                 continue
-            for directory, dirs, files in os.walk(root, followlinks=False):
+            # A directory the walk cannot list hides what is inside it.
+            for directory, dirs, files in os.walk(root, onerror=raise_error, followlinks=False):
                 for name in dirs + files:
                     path = Path(directory) / name
                     info = path.lstat()
@@ -273,6 +274,10 @@ class Policy:
                         continue
                     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                         raise SandboxError(f"action produced a linked or special file: {path}")
+
+
+def raise_error(error: OSError) -> None:
+    raise SandboxError(f"cannot validate action output: {error}")
 
 
 def process_info(pid: int) -> tuple[int, int]:
