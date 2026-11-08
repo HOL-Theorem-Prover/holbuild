@@ -7416,7 +7416,7 @@ fun verify_action_spec (spec : action_spec) =
     List.app (fn path => check (not (escapes path)) ("path " ^ path ^ " leaves the action root"))
       (#package spec :: #logical spec :: map (#1 o target_name o #target) (#deps spec) @
        map (#1 o target_name o #target) (#libs spec) @
-       #path (#source spec) :: map #path (#inputs spec @ #libraries spec) @
+       #path (#source spec) :: #extra_outputs spec @ map #path (#inputs spec @ #libraries spec) @
        map #stem (#deps spec) @ map #stem (#libs spec) @
        List.filter (CharVector.exists (fn c => c = #"/")) (List.concat (map #loads (#libs spec))) @
        [#sig_path (#outputs spec), #sml_path (#outputs spec), #data_path (#outputs spec)])

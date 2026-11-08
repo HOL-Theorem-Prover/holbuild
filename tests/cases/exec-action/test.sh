@@ -183,6 +183,31 @@ curl -fsS -X PUT --data-binary "@$tmpdir/extra-output" "$remote_url/cas/$spec_ex
 worker extra-output "$spec_extra"
 expect extra-output 4 "status=failed" "failure=spec-rejected"
 require_grep "the extra outputs do not match the action text" "$tmpdir/extra-output.log"
+# Matching declarations and action hashes must not let the trusted parent
+# publish files outside the validated stage tree.
+echo 'outside-output-sentinel' > "$tmpdir/outside-output"
+for output in "../../../../../../../../../../../../${tmpdir#/}/outside-output" \
+              /proc/self/environ ../outside-output results/../../../outside-output; do
+  python3 - "$project/.holbuild/action-specs/$spec_a" "$tmpdir/escape-output" "$output" <<'PY'
+import hashlib, sys
+head, text = open(sys.argv[1], "rb").read().split(b"\naction-text\n", 1)
+output = sys.argv[3].encode()
+head += b"\noutput extra " + output
+text += b"source_extra_output=" + output + b"\n"
+key = hashlib.sha256(text).hexdigest().encode()
+lines = []
+for line in head.split(b"\n"):
+    if line.startswith(b"input-key="): line = b"input-key=" + key
+    elif line.startswith(b"action-text-sha256="): line = b"action-text-sha256=" + key
+    lines.append(line)
+open(sys.argv[2], "wb").write(b"\n".join(lines) + b"\naction-text\n" + text)
+PY
+  spec_escape_output=$(sha256sum "$tmpdir/escape-output" | cut -d' ' -f1)
+  curl -fsS -X PUT --data-binary "@$tmpdir/escape-output" "$remote_url/cas/$spec_escape_output"
+  worker escape-output "$spec_escape_output"
+  expect escape-output 4 "status=failed" "failure=spec-rejected"
+  require_grep "leaves the action root" "$tmpdir/escape-output.log"
+done
 # Or one whose package, though consistent with its action text, would put
 # files outside the action root.
 python3 - "$project/.holbuild/action-specs/$spec_a" "$tmpdir/escape" <<'PY'
