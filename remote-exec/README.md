@@ -325,8 +325,8 @@ a run batch and cancels its unfinished actions.
 
 Workers come in two kinds: `REMOTE_EXEC_WARM_WORKERS` warm workers, always
 running on the standard tier so a build starts at once, and burst workers,
-which an external scaler starts and stops. On every sweep the coordinator
-works out how many burst workers the queue needs: every ready or running
+which an external scaler starts and stops. On batch intake and every sweep,
+the coordinator works out how many burst workers the queue needs: every ready or running
 action beyond the warm workers, but at least one per ready or running
 high-tier action, since warm workers take only standard-tier work, and at
 most `REMOTE_EXEC_MAX_BURST_WORKERS`. Runs contribute only up to
@@ -344,8 +344,12 @@ waits on run alone, then many become ready together. Following the queue
 exactly would stop burst workers at every narrow point and start them again
 seconds later. So the target is the highest demand of the last
 `REMOTE_EXEC_SCALE_DOWN_HOLD_S` seconds: it rises at once and falls only after
-demand has stayed lower for that long. Each sweep records its demand in the
-database, so a restarted coordinator keeps holding the target.
+demand has stayed lower for that long. Each scale check records its demand
+in the database, so a restarted coordinator keeps holding the target.
+
+Nonempty batch submissions request a background scale check immediately after
+making root actions ready. Concurrent requests are coalesced, and intake and
+sweep checks share a lock so scale commands never overlap within a coordinator.
 
 `GET /v1/queue` reports the counts and the target. With `REMOTE_EXEC_SCALE_CMD`
 set, the coordinator also runs `<command> <target>` after a start and whenever
@@ -362,7 +366,16 @@ several coordinator replicas, give the command to one of them.
 runtime sources, and clients move to new releases on their own schedule, so a
 worker can't run one fixed holbuild. Before each action it reads the
 `holbuild-version` line of the action's spec (from `/cas/<spec_sha256>` in the
-remote cache) and runs that release, from
+remote cache) and runs that release. It first checks
+`/opt/holbuild-baked/v<version>/bin/holbuild` for an executable file; override
+the root with `--baked-releases DIR` or `REMOTE_EXEC_BAKED_RELEASES`. Derived
+images can preinstall releases here to avoid downloading and compiling them
+on first use. Keep each release's runtime sources with its executable: use
+an installed tree (`bin/holbuild` plus `share/holbuild`) or a source tree built
+at that exact path. A hit needs no writable release cache or lock.
+
+If the baked executable is absent or not executable, the worker automatically
+uses the existing on-demand path, from
 `<--holbuild-releases-dir>/v<version>/bin/holbuild` (by default
 `/opt/holbuild-releases`). A release the directory doesn't have yet is built
 there on first use: the worker downloads its source tarball

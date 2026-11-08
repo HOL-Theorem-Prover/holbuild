@@ -406,6 +406,9 @@ class Coordinator:
                                      launch_timeout_seconds=settings.cache_launch_timeout_seconds)
                            if settings.cache_pool_cmd else None)
         self.scaler: ScaleRun | None = None  # the scale command's last run
+        self.scale_lock = asyncio.Lock()
+        self.scale_pending = False
+        self.scale_task: asyncio.Task[None] | None = None
         # How many actions this process's release has made ready, and waiting claims' tiers, host and wake,
         # oldest first (the tie-breaker within a host); see claim.
         self.made_ready = 0
@@ -451,6 +454,8 @@ class Coordinator:
         )
 
     async def aclose(self) -> None:
+        if self.scale_task is not None:
+            await self.scale_task
         for releaser in self.releasers.values():
             releaser.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -523,6 +528,8 @@ class Coordinator:
                     [{"batch_id": batch_id, "child": child, "parent": parent} for child, parent in batch.edges],
                 )
         await self.release(batch_id)
+        if batch.actions:
+            self.request_scale()
         return batch_id
 
     async def get(self, batch_id: UUID) -> BatchStatus | None:
@@ -1071,31 +1078,52 @@ class Coordinator:
         await self.fail_overdue()
         self.request_release()
         await self.delete_expired()
-        counts = (await self.queue()).counts
-        demand = burst_demand(
-            counts, self.settings.warm_workers, self.settings.max_burst_workers, self.settings.run_slots
-        )
-        now = self.clock()
-        async with self.engine.begin() as conn:
-            await conn.execute(
-                sa.text("DELETE FROM burst_demand WHERE at < CAST(:now AS timestamptz) - make_interval(secs => :hold)"),
-                {"now": now, "hold": self.settings.scale_down_hold_s},
-            )
-            await conn.execute(
-                sa.text("INSERT INTO burst_demand (at, workers) VALUES (:now, :workers)"),
-                {"now": now, "workers": demand},
-            )
-            desired = await conn.scalar(HELD_TARGET, self._held_target_params(now))
-        last = self.scaler
-        if self.settings.scale_cmd is None or (last is not None and last.error is None and last.workers == desired):
+        await self.scale()
+
+    def request_scale(self) -> None:
+        """Coalesce batch intake into background scale checks, without delaying the response on the scaler."""
+        if self.settings.scale_cmd is None:
             return
-        try:
-            await self._scale(self.settings.scale_cmd, desired)
-        except (OSError, ScaleCommandError) as error:
-            logger.warning("scaling to %d burst workers failed: %s", desired, error)
-            self.scaler = ScaleRun(desired, now, str(error))
-            return
-        self.scaler = ScaleRun(desired, now, None)
+        self.scale_pending = True
+        if self.scale_task is None or self.scale_task.done():
+            self.scale_task = asyncio.create_task(self._run_scales())
+
+    async def _run_scales(self) -> None:
+        while self.scale_pending:
+            self.scale_pending = False
+            try:
+                await self.scale()
+            except Exception:
+                logger.exception("background scale check failed")
+
+    async def scale(self) -> None:
+        """Sample demand and apply its held target, serialized with intake and periodic checks."""
+        async with self.scale_lock:
+            counts = (await self.queue()).counts
+            demand = burst_demand(
+                counts, self.settings.warm_workers, self.settings.max_burst_workers, self.settings.run_slots
+            )
+            now = self.clock()
+            async with self.engine.begin() as conn:
+                await conn.execute(
+                    sa.text("DELETE FROM burst_demand WHERE at < CAST(:now AS timestamptz) - make_interval(secs => :hold)"),
+                    {"now": now, "hold": self.settings.scale_down_hold_s},
+                )
+                await conn.execute(
+                    sa.text("INSERT INTO burst_demand (at, workers) VALUES (:now, :workers)"),
+                    {"now": now, "workers": demand},
+                )
+                desired = await conn.scalar(HELD_TARGET, self._held_target_params(now))
+            last = self.scaler
+            if self.settings.scale_cmd is None or (last is not None and last.error is None and last.workers == desired):
+                return
+            try:
+                await self._scale(self.settings.scale_cmd, desired)
+            except (OSError, ScaleCommandError) as error:
+                logger.warning("scaling to %d burst workers failed: %s", desired, error)
+                self.scaler = ScaleRun(desired, now, str(error))
+                return
+            self.scaler = ScaleRun(desired, now, None)
 
     def _held_target_params(self, now: datetime) -> dict[str, object]:
         return {"now": now, "hold": self.settings.scale_down_hold_s, "cap": self.settings.max_burst_workers}
@@ -1104,6 +1132,11 @@ class Coordinator:
         process = await asyncio.create_subprocess_exec(*shlex.split(scale_cmd), str(workers))
         try:
             code = await asyncio.wait_for(process.wait(), SCALE_CMD_TIMEOUT_S)
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            raise
         except TimeoutError:
             process.kill()
             await process.wait()

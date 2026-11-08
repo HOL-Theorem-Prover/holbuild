@@ -272,13 +272,14 @@ class Protection:
 
 @dataclass(frozen=True)
 class Releases:
-    """holbuild releases built on demand, each in ``<root>/v<version>`` from ``source_url`` with ``{version}``
-    filled in. A host's workers can share ``root``; one of them builds a release while the others wait."""
+    """Preinstalled releases from ``baked_root``, falling back to builds in ``<root>/v<version>`` from
+    ``source_url`` with ``{version}`` filled in. Workers sharing ``root`` wait for one build per release."""
 
     root: str
     source_url: str
     remote_cache: str
     curl_config: str | None
+    baked_root: str = field(default="/opt/holbuild-baked", kw_only=True)
     discovery_config: str | None = field(default=None, kw_only=True)
     joining: bool = field(default=False, kw_only=True)
     drain: Drain = field(default_factory=Drain, kw_only=True, compare=False)
@@ -340,6 +341,9 @@ class Releases:
         """
         if not RELEASE.fullmatch(version):
             raise Unreleased(f"holbuild {version!r} is not a release version")
+        baked = os.path.join(self.baked_root, f"v{version}", "bin", "holbuild")
+        if os.path.isfile(baked) and os.access(baked, os.X_OK):
+            return baked
         directory = os.path.join(self.root, f"v{version}")
         executable = os.path.join(directory, "bin", "holbuild")
         if os.path.exists(os.path.join(directory, COMPLETE)):
@@ -888,6 +892,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="where holbuild releases are built, one directory per version; a host's workers can share it",
     )
     parser.add_argument(
+        "--baked-releases",
+        default=os.environ.get("REMOTE_EXEC_BAKED_RELEASES", "/opt/holbuild-baked"),
+        help="preinstalled releases root, checked before downloading (default: %(default)s)",
+    )
+    parser.add_argument(
         "--holbuild-source-url",
         default=DEFAULT_SOURCE_URL,
         help="URL of a release's source tarball, with {version} for the version (default: %(default)s)",
@@ -958,6 +967,7 @@ def main() -> None:
         args.holbuild_source_url,
         args.remote_cache,
         os.environ.get("HOLBUILD_REMOTE_CACHE_CURL_CONFIG"),
+        baked_root=args.baked_releases,
         drain=drain,
     )
     protection = Protection(args.protection_cmd, os.environ.get("ECS_AGENT_URI"))

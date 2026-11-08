@@ -11,7 +11,7 @@ import tarfile
 import threading
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -176,6 +176,48 @@ def logs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
 
 def releases(tmp_path: Path, server: Server) -> Releases:
     return Releases(str(tmp_path / "releases"), f"file://{tmp_path}/holbuild-{{version}}.tar.gz", server.url, None)
+
+
+
+def test_baked_release_needs_no_writable_cache_or_download(tmp_path: Path, server: Server) -> None:
+    baked = tmp_path / "baked/v1.2.3/bin/holbuild"
+    baked.parent.mkdir(parents=True)
+    baked.write_text("#!/bin/sh\nexit 0\n")
+    baked.chmod(0o755)
+    root = tmp_path / "not-a-directory"
+    root.touch()
+    release = replace(releases(tmp_path, server), root=str(root), baked_root=str(tmp_path / "baked"))
+
+    assert release.holbuild("1.2.3") == str(baked)
+    with pytest.raises(Unreleased):
+        release.holbuild("../1.2.3")
+
+
+@pytest.mark.parametrize("candidate", ["missing", "non-executable", "directory"])
+def test_unusable_baked_release_falls_back_to_build(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], candidate: str
+) -> None:
+    baked = tmp_path / "baked/v1.2.3/bin/holbuild"
+    if candidate == "directory":
+        baked.mkdir(parents=True)
+    elif candidate == "non-executable":
+        baked.parent.mkdir(parents=True)
+        baked.write_text("unusable")
+        baked.chmod(0o644)
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
+    release = replace(releases(tmp_path, server), baked_root=str(tmp_path / "baked"))
+
+    assert release.holbuild("1.2.3") == str(tmp_path / "releases/v1.2.3/bin/holbuild")
+    assert logs[0].read_text() == "build\n"
+
+
+def test_baked_releases_option_overrides_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    args = ["--coordinator", "http://coordinator.test", "--remote-cache", "http://cache.test", "--cache-limit-gb", "1"]
+    monkeypatch.delenv("REMOTE_EXEC_BAKED_RELEASES", raising=False)
+    assert parse_args(args).baked_releases == "/opt/holbuild-baked"
+    monkeypatch.setenv("REMOTE_EXEC_BAKED_RELEASES", "/image/releases")
+    assert parse_args(args).baked_releases == "/image/releases"
+    assert parse_args([*args, "--baked-releases", "/override"]).baked_releases == "/override"
 
 
 def test_release_is_built_once_for_concurrent_workers(tmp_path: Path, server: Server, logs: tuple[Path, Path]) -> None:

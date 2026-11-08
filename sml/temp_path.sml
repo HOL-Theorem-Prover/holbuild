@@ -3,16 +3,41 @@ struct
 
 val counter = ref 0
 val mutex = Mutex.mutex ()
+(* Initialize at runtime: PolyML.export preserves compile-time values. *)
+val token = ref NONE
+
+fun new_token () =
+  let
+    fun fallback () = Time.toNanoseconds (Time.now ())
+    val number =
+      (let
+         val input = BinIO.openIn "/dev/urandom"
+         val bytes = (BinIO.inputN (input, 8) before BinIO.closeIn input)
+                     handle e => (BinIO.closeIn input; raise e)
+       in
+         if Word8Vector.length bytes = 8 then
+           Word8Vector.foldl (fn (byte, n) => n * 256 + Word8.toLargeInt byte) 0 bytes
+         else fallback ()
+       end) handle IO.Io _ => fallback () | OS.SysErr _ => fallback ()
+    val hex = IntInf.fmt StringCvt.HEX (number mod 18446744073709551616)
+  in
+    StringCvt.padLeft #"0" 16 hex
+  end
 
 (* Name generation must not create a file or alter the process umask. *)
 fun suffix () =
-  let
-    val _ = Mutex.lock mutex
-    val id = (counter := !counter + 1; !counter) before Mutex.unlock mutex
-  in
-    SysWord.toString (Posix.Process.pidToWord (Posix.ProcEnv.getpid ())) ^
-    "-" ^ Int.toString id
-  end
+  (Mutex.lock mutex;
+   (let
+      val process_token =
+        case !token of
+            SOME value => value
+          | NONE => let val value = new_token () in token := SOME value; value end
+      val _ = counter := !counter + 1
+    in
+      SysWord.toString (Posix.Process.pidToWord (Posix.ProcEnv.getpid ())) ^
+      "-" ^ process_token ^ "-" ^ Int.toString (!counter)
+    end before Mutex.unlock mutex))
+  handle e => (Mutex.unlock mutex; raise e)
 
 fun near path extension =
   OS.Path.concat (OS.Path.dir path,

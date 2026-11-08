@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -466,3 +467,82 @@ def test_run_slots_defaults_to_thirty_and_rejects_negative_values(coordinator: C
     assert Settings(**settings).run_slots == 30
     with pytest.raises(ValidationError):
         Settings(**settings, run_slots=-1)
+
+
+async def test_batch_intake_scales_without_waiting_for_sweep_or_scale_command(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator.settings.scale_cmd = "unused"
+    coordinator.settings.max_burst_workers = 10
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    calls: list[int] = []
+    active = 0
+
+    async def scale(command: str, workers: int) -> None:
+        nonlocal active
+        active += 1
+        assert active == 1
+        calls.append(workers)
+        started.set()
+        try:
+            await finish.wait()
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(coordinator, "_scale", scale)
+    sweep = None
+    try:
+        await asyncio.wait_for(submit(http, ["a"]), 5)
+        await asyncio.wait_for(started.wait(), 5)
+        assert calls == [1]
+        assert coordinator.scale_task is not None and not coordinator.scale_task.done()
+        await submit(http, ["b", "c"])
+        sweep = asyncio.create_task(coordinator.sweep())
+        await asyncio.sleep(0)
+        assert calls == [1]  # intake and sweep both wait for the first command
+    finally:
+        finish.set()
+        if sweep is not None:
+            await sweep
+        if coordinator.scale_task is not None:
+            await coordinator.scale_task
+    assert calls == [1, 3]  # fresh demand is read after acquiring the lock
+
+
+async def test_intake_scale_requests_are_coalesced(coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch) -> None:
+    coordinator.settings.scale_cmd = "unused"
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def scale() -> None:
+        started.set()
+        await finish.wait()
+
+    check = AsyncMock(side_effect=scale)
+    monkeypatch.setattr(coordinator, "scale", check)
+    for _ in range(20):
+        coordinator.request_scale()
+    await asyncio.wait_for(started.wait(), 5)
+    task = coordinator.scale_task
+    try:
+        for _ in range(20):
+            coordinator.request_scale()
+        assert coordinator.scale_task is task
+        assert check.await_count == 1
+    finally:
+        finish.set()
+        assert task is not None
+        await task
+    assert check.await_count == 2
+
+
+async def test_empty_batch_does_not_request_scaling(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    check = AsyncMock()
+    monkeypatch.setattr(coordinator, "scale", check)
+    coordinator.settings.scale_cmd = "unused"
+    await submit(http, [])
+    assert coordinator.scale_task is None
+    check.assert_not_awaited()
