@@ -370,6 +370,39 @@ set -e
 [[ -f "$cache7/locks/gc.lock" ]] || { echo "legacy GC lock directory not migrated" >&2; exit 1; }
 evicted "$cache7/blobs/old" "an oversized blob with a legacy GC lock"
 
+# GC may remove private modules while a cap sweep waits for its shared lock.
+cache8=$tmpdir/cache8
+sparse "$cache8/theory-modules/removed.pmo" 3
+sparse "$cache8/blobs/keep" 1
+mkdir -p "$cache8/locks"
+python3 - "$HOLBUILD_BIN" "$cache8" "$remote_url" "$absent" "$tmpdir" <<'PRIVATE'
+import fcntl, os, pathlib, subprocess, sys
+binary, cache, remote, absent, tmp = sys.argv[1:]
+with open(pathlib.Path(cache) / "locks/gc.lock", "a") as lock:
+    fcntl.lockf(lock, fcntl.LOCK_EX)
+    with open(pathlib.Path(tmp) / "private-wait.log", "w") as log:
+        child = subprocess.Popen(
+            [binary, "--remote-cache", remote, "exec-action", absent,
+             "--result", str(pathlib.Path(tmp) / "private-result"),
+             "--cache-limit-gb", "2", "--cache-reserve-gb", "0"],
+            env={**os.environ, "HOLBUILD_CACHE": cache}, stdout=log, stderr=log)
+        try:
+            try:
+                child.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+            else:
+                raise AssertionError("sweep did not wait for GC")
+            (pathlib.Path(cache) / "theory-modules/removed.pmo").unlink()
+            fcntl.lockf(lock, fcntl.LOCK_UN)
+            assert child.wait(timeout=30) == 4
+            assert (pathlib.Path(cache) / "blobs/keep").exists(), "stale private bytes caused eviction"
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+PRIVATE
+
 # An error outside the action, here no remote cache, is an infrastructure
 # failure (exit 3), never the final exit 1.
 set +e
