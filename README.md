@@ -963,6 +963,10 @@ without proof execution attributes also support failed-prefix checkpoints;
 termination proofs currently replay from the preceding clean
 definition/theorem/dependency checkpoint.
 
+A failed termination proof reports its definition, proof source and termination
+goal. Once the definition succeeds, that goal is cleared so a later error in the
+theory is not attributed to the completed termination proof.
+
 `Proof[...]` attributes such as `exclude_simps` and `exclude_frags`, including
 those on `Resume`, remain active across the entire stepped proof. They retain
 leaf diagnostics, timeouts and traces. Attributed proofs save theorem-context state
