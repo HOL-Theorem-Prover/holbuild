@@ -134,9 +134,12 @@ its user, so the credentials can come from the environment. `HOLBUILD_CACHE`
 is `/var/cache/holbuild` in the image. It must be the worker's own cache root:
 `exec-action --cache-limit-gb` sweeps the whole root before each action, so a
 root shared with ordinary builds would lose their cache. `exec-action` runs
-with only the worker's `HOLBUILD_*` variables, `PATH`, `HOME`, `TMPDIR`, the
-locale, and curl's certificate and proxy settings, so the worker token stays
-out of the builds' environment (and out of what they log or pass on). A
+with the worker's `HOLBUILD_*` build settings, `PATH`, `HOME`, `TMPDIR`, the
+locale, and curl's certificate and proxy settings. It excludes
+`HOLBUILD_REMOTE_EXEC_*`, `HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN` and inherited
+discovery curl configs; with discovery enabled it receives only the worker's
+generated read-only discovery config (see below). The worker token stays out
+of the builds' environment and discovery files. A
 build runs as the worker's user, so one that goes looking can still read the
 token from the worker's `/proc/<pid>/environ`. Outside the image,
 `python3 -m remote_exec.worker` runs the worker; it uses only the standard
@@ -522,8 +525,8 @@ REMOTE_EXEC_TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost/p
 ## Temporary cache members
 
 The coordinator can keep a stable permanent cache ring while adding temporary
-members with worker demand. `GET /v1/cache/members` accepts either the client
-or worker bearer token and returns `text/plain`:
+members with worker demand. `GET /v1/cache/members` accepts the client, worker,
+or derived read-only discovery bearer token and returns `text/plain`:
 
 ```text
 holbuild-cache-members-v1
@@ -552,9 +555,22 @@ cache requests. Discovery uses `HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG`
 bearer header. With credentials, inline or from a cache curl config, every
 allowed endpoint must be `https://`: otherwise clients skip discovery and
 workers refuse to start.
-Workers write their token to a private curl configuration file
-for the child, keeping the bearer value out of build environments; this does
-not isolate builds from files owned by the worker user.
+Workers instead write a derived read-only token to a temporary
+curl configuration file for the child: HMAC-SHA256 of `holbuild-cache-members-v1`
+keyed by the worker token, encoded as lowercase hex. Only the membership
+endpoint accepts this token; it cannot claim work, heartbeat, report results,
+submit batches or inspect the queue. The worker bearer is never written to
+this file, and `HOLBUILD_REMOTE_EXEC_*` settings are excluded from the child
+environment. Cache credentials remain separate. Builds still share the worker
+user and are not sandboxed from its other files or processes.
+
+Upgrade the coordinator before workers so it accepts derived discovery tokens.
+Older coordinators reject them, leaving child discovery on the permanent cache
+ring; workers never fall back to exposing their bearer. Existing clients and
+workers remain compatible with the upgraded coordinator. Workers keep passing
+the permanent ring as `--remote-cache`: it is the child's validation and stale
+fallback baseline, while live discovery updates the effective ring throughout
+an action. Python independently refreshes the ring for release-spec downloads.
 Discovery never follows redirects. If it fails, the last complete ring remains
 usable for 60 seconds, after which requests use the permanent configuration.
 Recovery from permanent fallback counts as a new join.
