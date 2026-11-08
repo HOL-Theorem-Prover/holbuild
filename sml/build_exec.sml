@@ -7390,8 +7390,8 @@ fun action_text_value spec key =
 
 (* Step 1: the spec is for this holbuild, intact, and of an action a worker
    may run. *)
-fun escapes path = Path.isAbsolute path orelse path = ".." orelse String.isPrefix "../" path orelse
-                   String.isSubstring "/../" path
+fun escapes path =
+  Path.isAbsolute path orelse List.exists (fn c => c = "..") (String.fields (fn c => c = #"/") path)
 
 fun sha256_text text =
   size text = 64 andalso CharVector.all (fn c => Char.isDigit c orelse (c >= #"a" andalso c <= #"f")) text
@@ -7433,6 +7433,9 @@ fun verify_action_spec (spec : action_spec) =
     check (not (#trace_steps spec) orelse #proof_steps spec) "trace-steps requires proof-steps";
     check (sha256_text (#deps_key spec)) "deps-key is not a SHA-256";
     check (List.all (sha256_text o #key) (#deps spec)) "a dependency's key is not a SHA-256";
+    (* File hashes name blobs in the cache, so they must not be paths. *)
+    check (List.all (sha256_text o #sha256) (#source spec :: #inputs spec @ #libraries spec))
+      "a file's SHA-256 is malformed";
     check (text_hash = #input_key spec) "the action text does not hash to input-key";
     check (#action_text_sha256 spec = text_hash) "action-text-sha256 does not match the action text";
     check (action_text_value spec "package" = #package spec) "the action text names another package";
@@ -8906,6 +8909,10 @@ fun verify_run_spec (spec : run_spec) =
     check (sort_strings (text_values "output=") = sort_strings (#outputs spec))
       "the outputs do not match the run text";
     check (List.all (sha256_text o #key) deps) "a dependency's key is not a SHA-256";
+    (* File hashes name blobs in the cache, so they must not be paths. *)
+    check (sha256_text (#sha256 (#script spec)) andalso
+           List.all (sha256_text o #sha256) (libraries @ #context_scripts spec @ #inputs spec @ #supports spec))
+      "a file's SHA-256 is malformed";
     check (List.all (fn {suffix, ...} => suffix = ".ui" orelse suffix = ".uo") libs)
       "a library manifest is neither .ui nor .uo";
     check (List.all run_load_ok (#run_loads spec)) "a run-load names no library of the spec";

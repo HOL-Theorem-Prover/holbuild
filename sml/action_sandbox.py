@@ -408,13 +408,17 @@ def finish_children(leader: int) -> int:
                     process.send(signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+            # Check exits before reading this subreaper's children: a dying
+            # process's orphans are adopted before its pidfd reports the exit,
+            # so a child forked after the scan above shows up here.
+            exited = all(not process.alive() for process in processes.values())
             children = set(map(int, Path(f"/proc/self/task/{os.getpid()}/children").read_text().split()))
             for pid in children - {leader}:
                 try:
                     os.waitpid(pid, os.WNOHANG)
                 except ChildProcessError:
                     pass
-            if children <= {leader} and all(not process.alive() for process in processes.values()):
+            if exited and children <= {leader}:
                 _, status = os.waitpid(leader, 0)
                 if not settled:
                     raise SandboxError("action exceeded process cleanup sweep limit")

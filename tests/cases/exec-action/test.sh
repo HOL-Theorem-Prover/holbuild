@@ -187,7 +187,7 @@ require_grep "the extra outputs do not match the action text" "$tmpdir/extra-out
 # publish files outside the validated stage tree.
 echo 'outside-output-sentinel' > "$tmpdir/outside-output"
 for output in "../../../../../../../../../../../../${tmpdir#/}/outside-output" \
-              /proc/self/environ ../outside-output results/../../../outside-output; do
+              /proc/self/environ ../outside-output results/../../../outside-output ./..; do
   python3 - "$project/.holbuild/action-specs/$spec_a" "$tmpdir/escape-output" "$output" <<'PY'
 import hashlib, sys
 head, text = open(sys.argv[1], "rb").read().split(b"\naction-text\n", 1)
@@ -210,26 +210,43 @@ PY
 done
 # Or one whose package, though consistent with its action text, would put
 # files outside the action root.
-python3 - "$project/.holbuild/action-specs/$spec_a" "$tmpdir/escape" <<'PY'
+for package in ../../x ./..; do
+  python3 - "$project/.holbuild/action-specs/$spec_a" "$tmpdir/escape" "$package" <<'PY'
 import hashlib, sys
 head, text = open(sys.argv[1], "rb").read().split(b"\naction-text\n", 1)
+package = sys.argv[3].encode()
 old = [l for l in head.split(b"\n") if l.startswith(b"target ")][0].split(b" ")[1].split(b":")[0]
-text = text.replace(b"\npackage=" + old + b"\n", b"\npackage=../../x\n", 1)
+text = text.replace(b"\npackage=" + old + b"\n", b"\npackage=" + package + b"\n", 1)
 key = hashlib.sha256(text).hexdigest().encode()
 lines = []
 for line in head.split(b"\n"):
     if line.startswith(b"input-key="): line = b"input-key=" + key
     elif line.startswith(b"action-text-sha256="): line = b"action-text-sha256=" + key
-    elif line.startswith(b"target "): line = line.replace(old + b":", b"../../x:", 1)
-    elif line.startswith(b"source "): line = line.replace(b" " + old + b" ", b" ../../x ", 1)
+    elif line.startswith(b"target "): line = line.replace(old + b":", package + b":", 1)
+    elif line.startswith(b"source "): line = line.replace(b" " + old + b" ", b" " + package + b" ", 1)
     lines.append(line)
 open(sys.argv[2], "wb").write(b"\n".join(lines) + b"\naction-text\n" + text)
 PY
-spec_escape=$(sha256sum "$tmpdir/escape" | cut -d' ' -f1)
-curl -fsS -X PUT --data-binary "@$tmpdir/escape" "$remote_url/cas/$spec_escape"
-worker escape "$spec_escape"
-expect escape 4 "status=failed" "failure=spec-rejected"
-require_grep "path ../../x leaves the action root" "$tmpdir/escape.log"
+  spec_escape=$(sha256sum "$tmpdir/escape" | cut -d' ' -f1)
+  curl -fsS -X PUT --data-binary "@$tmpdir/escape" "$remote_url/cas/$spec_escape"
+  worker escape "$spec_escape"
+  expect escape 4 "status=failed" "failure=spec-rejected"
+  require_grep "path $package leaves the action root" "$tmpdir/escape.log"
+done
+# A file hash names a blob in the worker's cache, so a hash that is a path
+# must be rejected before any lookup.
+python3 - "$project/.holbuild/action-specs/$spec_a" "$tmpdir/blob-path" \
+  "../../../../../../../../../../../../${tmpdir#/}/outside-output" <<'PY'
+import sys
+head, text = open(sys.argv[1], "rb").read().split(b"\naction-text\n", 1)
+head += b"\nfile library lib/Outside.sml " + sys.argv[3].encode() + b" 24"
+open(sys.argv[2], "wb").write(head + b"\naction-text\n" + text)
+PY
+spec_blob_path=$(sha256sum "$tmpdir/blob-path" | cut -d' ' -f1)
+curl -fsS -X PUT --data-binary "@$tmpdir/blob-path" "$remote_url/cas/$spec_blob_path"
+worker blob-path "$spec_blob_path"
+expect blob-path 4 "status=failed" "failure=spec-rejected"
+require_grep "a file's SHA-256 is malformed" "$tmpdir/blob-path.log"
 worker absent "$(printf 'absent' | sha256sum | cut -d' ' -f1)"
 expect absent 4 "status=failed" "failure=spec-rejected"
 
