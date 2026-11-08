@@ -1395,13 +1395,17 @@ cat > "$tmpdir/local-cas/src/LocalBaseScript.sml" <<'SML'
 Theory LocalBase
 Ancestors bool
 Theorem local_base: T
-Proof simp[] QED
+Proof
+  simp[]
+QED
 SML
 cat > "$tmpdir/local-cas/src/LocalMidScript.sml" <<'SML'
 Theory LocalMid
 Ancestors LocalBase
 Theorem local_mid: T
-Proof ACCEPT_TAC local_base QED
+Proof
+  ACCEPT_TAC local_base
+QED
 SML
 in_copy local-cas build LocalMidTheory > "$tmpdir/local-cas-seed.log" 2>&1
 in_copy local-cas clean LocalBaseTheory LocalMidTheory > /dev/null
@@ -1417,7 +1421,9 @@ cat > "$tmpdir/local-cas/src/LocalTopScript.sml" <<'SML'
 Theory LocalTop
 Ancestors LocalMid
 Theorem local_top: T
-Proof ACCEPT_TAC local_mid QED
+Proof
+  ACCEPT_TAC local_mid
+QED
 SML
 in_copy local-cas clean LocalBaseTheory LocalMidTheory > /dev/null
 in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
@@ -1439,7 +1445,9 @@ cat > "$tmpdir/local-cas/src/LocalDetachedScript.sml" <<'SML'
 Theory LocalDetached
 Ancestors bool
 Theorem local_detached: T
-Proof simp[] QED
+Proof
+  simp[]
+QED
 SML
 in_copy local-cas build LocalDetachedTheory > "$tmpdir/local-cas-detach-seed.log" 2>&1
 in_copy local-cas clean LocalDetachedTheory > /dev/null
