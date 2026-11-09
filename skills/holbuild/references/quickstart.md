@@ -60,8 +60,8 @@ holbuild build --dry-run FooTheory       # show plan
 holbuild context                         # show manifest info/cache paths
 holbuild buildhol                        # prebuild/reuse dependencies.hol
 holbuild execution-plan FooTheory:thm    # static proof-step plan
-holbuild check FooTheory[:thm]           # report oracles (cheat, ...), non-HOL axioms and kernel-bypass calls; exit 1 if any
-holbuild check --fingerprint FooTheory   # statement fingerprints and oracles of the whole ancestry, for before/after diffs
+holbuild check FooTheory[:thm] [BarTheory ...] # report oracles (cheat, ...), non-HOL axioms and kernel-bypass calls; exit 1 if any
+holbuild check --fingerprint FooTheory [BarTheory ...] # statement fingerprints and oracles of the whole ancestry, for before/after diffs
 holbuild build --force --trace-steps FooTheory
 holbuild --json build FooTheory          # bounded JSON events/errors for build output
 holbuild --json build --retain-debug-artifacts FooTheory  # also retain/report failure logs

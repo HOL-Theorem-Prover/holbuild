@@ -41,6 +41,11 @@ heap=()
 share=
 [[ ! -e "$state/share-heaps" ]] || share=--share-heaps
 rm -f "$state/failed-batch"
+
+
+# A worker that trusts no HOL repository rejects every spec.
+untrusted=()
+[[ ! -e "$state/untrusted" ]] || untrusted=(HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES=/unconfigured=master)
 awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec theory; do
   if [[ -e "$state/keep-going" ]]; then
     blocked=
@@ -57,7 +62,7 @@ awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec the
   fi
   echo "\$theory" >> "$state/ran"
   status=0
-  HOLBUILD_CACHE="$tmpdir/worker-cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" "\${heap[@]}" \
+  env "\${untrusted[@]}" HOLBUILD_CACHE="$tmpdir/worker-cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" "\${heap[@]}" \
     exec-action "\$spec" --cache-limit-gb 1000 --result "$tmpdir/worker.result" \$share \
     >> "$tmpdir/worker.log" 2>&1 || status=\$?
   echo "\$theory \$(grep '^status=' "$tmpdir/worker.result")" >> "$state/results"
@@ -1574,3 +1579,27 @@ refute_grep 'Theory built\|building locally' "$tmpdir/multi-failure-nolog.log"
 in_copy multi-failure --remote-cache "$remote_url" build --remote-exec "$coordinator" \
   --remote-only --detach --fail-fast BadATheory > "$tmpdir/multi-fail-fast.log" 2>&1
 require_grep '^POST /v1/batches?fail_fast=true ' "$state/requests.log"
+
+
+# A spec the worker rejects before any HOL runs has no log; its reason
+# reaches the client with the failure.
+cat > "$tmpdir/local-cas/src/LocalUntrustedScript.sml" <<'SML'
+Theory LocalUntrusted
+Ancestors bool
+Theorem local_untrusted: T
+Proof
+  simp[]
+QED
+SML
+touch "$state/untrusted"
+set +e
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only LocalUntrustedTheory > "$tmpdir/local-cas-untrusted.log" 2>&1
+untrusted_status=$?
+set -e
+rm "$state/untrusted"
+[[ $untrusted_status == 75 ]] || { cat "$tmpdir/local-cas-untrusted.log" "$tmpdir/worker.log" >&2; exit 1; }
+require_grep '^detail=exec-action HOL repository is not trusted by this worker: ' "$tmpdir/worker.result"
+refute_grep '^log=' "$tmpdir/worker.result"
+require_grep 'holbuild: remote rxlocalcas:LocalUntrustedTheory: failed (spec-rejected: exec-action HOL repository is not trusted by this worker: ' \
+  "$tmpdir/local-cas-untrusted.log"

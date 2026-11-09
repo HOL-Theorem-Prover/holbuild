@@ -317,8 +317,8 @@ holbuild repl --from MyTheory
 holbuild context
 holbuild context --trknl
 holbuild execution-plan MyTheory:my_theorem
-holbuild check MyTheory
-holbuild check --fingerprint MyTheory
+holbuild check MyTheory OtherTheory:my_theorem
+holbuild check --fingerprint MyTheory OtherTheory
 holbuild buildhol
 holbuild buildhol --trknl
 holbuild build --trknl MyTheory
@@ -524,18 +524,27 @@ line per use (`mypkg:src/MyScript.sml:12: kernel bypass: disk_thm`). Names in
 comments and string literals don't count; the scan is a backstop, not a
 sandbox. With findings it exits non-zero; otherwise it prints
 `MyTheory: clean (N theorems)` and exits zero. `holbuild check MyTheory:my_theorem` checks one theorem.
-`check` builds the theory, and any `[run].loads`, without proof steps or
+Pass several selectors to share one build of the distinct targets and one HOL
+session: `holbuild check MyTheory OtherTheory:my_theorem`. Each selector keeps
+its own findings or clean line, in argument order (including repeated selectors).
+Findings do not stop later checks; the command exits non-zero if any selector
+has findings. Invalid selectors, missing theorems and load errors abort the
+command.
+
+`check` builds the theories, and any `[run].loads`, without proof steps or
 checkpoints: it applies no step timeout (that is `build`'s check) and reuses
 theories built by `holbuild build --skip-proof-steps`. The tags are those
 recorded in the built theory, which may have been restored from a cache;
 run `holbuild build --no-cache MyTheory` first to check a fresh build. HOL
-always starts from the toolchain's base state here, not from `[run].heap`,
-which may hold an older copy of the theory.
+starts from a valid dependency checkpoint or the toolchain's base state, never
+from `[run].heap`, which may hold an older copy of a theory.
 
 `holbuild check --fingerprint MyTheory` builds and loads the theory the same
 way and prints one tab-separated line per axiom, definition and theorem stored
 in it and in each of its ancestors, HOL's own theories included, sorted
-bytewise so that two runs diff cleanly:
+bytewise so that two runs diff cleanly. Several theories can be passed together
+(`holbuild check --fingerprint MyTheory OtherTheory`); their shared ancestors
+and repeated target theories are emitted only once:
 
 ```text
 fingerprint	DepTheory	axiom	my_axiom	9a02…(64 hex digits)	-
@@ -1125,7 +1134,7 @@ uses it.
 Planning a build discovers every source, analyses its dependencies and
 computes every action key. After it plans, holbuild writes what it found to
 a plan record in `.holbuild/plan/`, and the next build with the same
-non-file inputs (holbuild version, working directory, command line,
+non-file inputs (holbuild version, working directory, command line, requested targets,
 `HOLBUILD_*` environment, manifests and `.holconfig.toml`, package roots)
 starts from it: it checks each recorded file and directory with `stat`,
 hashes again only the files whose size, modification time, change time or
@@ -1615,13 +1624,16 @@ input-key=<input_key>
 status=built|cached|failed
 failure=proof|tactic-timeout|script|timeout|memory|input-missing|publish|toolchain|disk|spec-rejected|internal|unavailable
 missing=theory <input_key> | blob <sha256>
+detail=<message>
 peak-rss-mb=<n>
 wall-ms=<n>
 phase-ms=<phase>:<n>,...
 log=<sha256> <size>
 ```
 
-`failure` appears on failure, and `missing` with `input-missing`.
+`failure` appears on failure, and `missing` with `input-missing`. A failure
+with no `log` (a spec rejected before any HOL ran, say) gives its message in
+`detail`, on one line of printable ASCII of at most 500 characters.
 For a run, `input-key` is its run key and `built` means it ran.
 `phase-ms` gives the wall time of each phase that ran, in order: `cap` (the
 cache cap sweep), `spec`, `toolchain`, `hydrate` (sources, libraries and
@@ -1842,11 +1854,13 @@ The coordinator's protocol, in what holbuild uses of it:
   a final build failure. It defaults to false and does not change run batches.
 - `GET /v1/batches/<id>/events` streams one JSON object per line: an
   `{"type": "action", "input_key", "theory", "state", "last_failure",
-  "log_sha256", ...}` when an action changes, and last `{"type": "batch",
-  "state": "done"|"failed"|"cancelled", "failure"}`. A failed action's log is
-  at `/cas/<log_sha256>` in the remote cache. The log includes the action's
-  failure diagnostic even when it failed before starting HOL, provided the
-  worker can write and upload the log. A stream may start over: it
+  "log_sha256", "failure_detail", ...}` when an action changes, and last
+  `{"type": "batch", "state": "done"|"failed"|"cancelled", "failure"}`. A
+  failed action's log is at `/cas/<log_sha256>` in the remote cache. The log
+  includes the action's failure diagnostic even when it failed before starting
+  HOL, provided the worker can write and upload the log; a failure with no
+  log, such as a spec the worker rejects, says why in `failure_detail`, which
+  holbuild prints with the failure. A stream may start over: it
   sends every action's current state first.
   A skipped dependent uses the existing action state `cancelled` with
   `last_failure` beginning `skipped because of `; its reason names the failed

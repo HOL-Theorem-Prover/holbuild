@@ -38,7 +38,7 @@ fun global_help () = print
   \  context [--trknl]          Show resolved project context\n\n\
   \Inspection and advanced commands:\n\
   \  execution-plan T:THM        Inspect proof-step execution plan\n\
-  \  check THEORY[:THEOREM]      Check for cheats, oracles, axioms and hypotheses\n\
+  \  check SELECTOR ...          Check for cheats, oracles, axioms and hypotheses\n\
   \  buildhol                    Build/reuse declared HOL and print its path\n\
   \  heap NAME                   Build a configured heap\n\
   \  executable NAME             Build a configured executable heap\n\
@@ -185,8 +185,8 @@ fun execution_plan_help () = print
 
 fun check_help () = print
   "Usage:\n\
-  \  holbuild [GLOBAL OPTIONS] check THEORY[:THEOREM] [--remote-exec URL [--remote-only]]\n\
-  \  holbuild [GLOBAL OPTIONS] check --fingerprint THEORY [--remote-exec URL [--remote-only]]\n\n\
+  \  holbuild [GLOBAL OPTIONS] check THEORY[:THEOREM] [THEORY[:THEOREM] ...] [--remote-exec URL [--remote-only]]\n\
+  \  holbuild [GLOBAL OPTIONS] check --fingerprint THEORY [THEORY ...] [--remote-exec URL [--remote-only]]\n\n\
   \Build THEORY if needed, load it in HOL and check the tags and hypotheses of its stored\n\
   \theorems, or of THEOREM alone. Prints one line per theorem that depends on an\n\
   \oracle other than DISK_THM (cheat, for instance), per theorem with\n\
@@ -194,9 +194,11 @@ fun check_help () = print
   \THEORY or its ancestors outside HOL itself, and per use of a kernel-bypass\n\
   \call (Thm.disk_thm, RunCall, ...) in the sources THEORY is built from outside\n\
   \HOL, and exits non-zero if there are any. Otherwise prints a clean line and\n\
-  \exits zero.\n\n\
+  \exits zero. Each selector is checked in order in one HOL session; findings\n\
+  \do not stop later checks. Invalid selectors or load errors abort the command.\n\n\
   \With --fingerprint, print instead one line per axiom, definition and theorem\n\
-  \stored in THEORY and each of its ancestors, HOL's included, sorted:\n\
+  \stored in the selected theories and their ancestors, HOL's included, sorted\n\
+  \and deduplicated:\n\
   \  fingerprint<TAB>THEORY<TAB>KIND<TAB>NAME<TAB>FINGERPRINT<TAB>ORACLES\n\
   \KIND is axiom, definition or theorem; FINGERPRINT is the SHA-256 of the\n\
   \statement's term structure, the same for alpha-equivalent statements;\n\
@@ -1297,7 +1299,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                       (fn () => HolbuildProjectGraph.resolve {project = project, resolution = resolution})
         val record_dir = HolbuildPlanRecord.record_dir project
         val fingerprint = HolbuildPlanRecord.fingerprint
-                            {project = project, graph = graph, holdir = #holdir tc, kernel_variant = #kernel_variant tc}
+                            {project = project, graph = graph, holdir = #holdir tc,
+                             kernel_variant = #kernel_variant tc, targets = targets}
         fun say text = if HolbuildStatus.verbose_mode () then HolbuildStatus.message_stderr ("holbuild: plan: " ^ text ^ "\n") else ()
         val attempt =
           case record_mode of
@@ -2680,24 +2683,18 @@ fun script_args args =
                (OS.FileSys.access (arg, [OS.FileSys.A_READ]) handle OS.SysErr _ => false))
     args
 
-(* Of the root-package theories SCRIPTS depend on, found by the dependency
-   analysis build applies to sources, the one with the most ancestors.  When
-   one of them has all the others as ancestors, that is the one. *)
-fun infer_from_theory tc project scripts =
+(* Of the root-package targets and their ancestors, pick the theory with
+   the most ancestors. *)
+fun infer_from_targets tc project {index, components} targets =
   let
-    val _ = configure_analyser_for_toolchain tc
-    val {index, components} = prepare_source_index "run.infer" (resolution_for_toolchain tc) project
     val root = root_package_name project
-    fun referenced script =
-      let val {loads, holdep_mentions, ...} = HolbuildDependencies.extract script
-      in loads @ holdep_mentions end
     fun root_source name =
       List.exists (fn (source : HolbuildSourceIndex.source) =>
                      #logical_name source = name andalso #package source = root)
                   index
     val targets =
       List.foldr (fn (name, kept) => if List.exists (fn k => k = name) kept then kept else name :: kept)
-        [] (List.filter root_source (List.concat (map referenced scripts)))
+        [] (List.filter root_source targets)
   in
     if null targets then NONE
     else
@@ -2714,6 +2711,18 @@ fun infer_from_theory tc project scripts =
       in
         Option.map HolbuildBuildPlan.logical_name (List.foldl deeper NONE theories)
       end
+  end
+
+(* Infer targets from scripts using the same dependency analysis as builds. *)
+fun infer_from_theory tc project scripts =
+  let
+    val _ = configure_analyser_for_toolchain tc
+    val prepared = prepare_source_index "run.infer" (resolution_for_toolchain tc) project
+    fun referenced script =
+      let val {loads, holdep_mentions, ...} = HolbuildDependencies.extract script
+      in loads @ holdep_mentions end
+  in
+    infer_from_targets tc project prepared (List.concat (map referenced scripts))
   end
 
 (* A usable --from checkpoint takes precedence over [run].heap; without one,
@@ -2996,7 +3005,7 @@ fun check_script {logical_name, theorem, project_theories, source_findings} =
        "      out (subject ^ \": clean (\" ^ count (length checked) \"theorem\" ^ \")\")",
        "    else",
        "      (out (subject ^ \": \" ^ count (length findings) \"finding\");",
-       "       OS.Process.exit OS.Process.failure)",
+       "       HolbuildCheckFailed := true)",
        "end;",
        ""]
   end
@@ -3005,14 +3014,14 @@ fun check_script {logical_name, theorem, project_theories, source_findings} =
    axiom, definition and theorem stored in it and its ancestors.  The lines
    start with "fingerprint" to tell them from build and HOL messages, which
    share stdout. *)
-fun fingerprint_script logical_name =
+fun fingerprint_script logical_names =
   let
-    val sml_string = HolbuildToolchain.sml_string
+    val logical_names = HolbuildBuildPlan.unique_strings logical_names
+    val theories = map HolbuildBuildExec.theory_name_from_logical logical_names
   in
     String.concatWith "\n"
-      [HolbuildToolchain.run_load_line logical_name,
-       "local",
-       "  val theory = " ^ sml_string (HolbuildBuildExec.theory_name_from_logical logical_name),
+      (["local"] @ map HolbuildToolchain.run_load_line logical_names @
+      ["  val theories = " ^ HolbuildToolchain.sml_list theories,
        "  fun oracles th =",
        "    case Listsort.sort String.compare",
        "           (List.filter (fn s => s <> \"DISK_THM\") (#1 (Tag.dest_tag (Thm.tag th)))) of",
@@ -3027,71 +3036,99 @@ fun fingerprint_script logical_name =
        "  fun theory_items thy =",
        "    List.concat (map (items thy)",
        "      [(\"axiom\", DB.axioms), (\"definition\", DB.definitions), (\"theorem\", DB.theorems)])",
-       "  val lines = List.concat (map theory_items (theory :: Theory.ancestry theory))",
+       "  val ancestry = Redblackset.listItems (Redblackset.addList",
+       "    (Redblackset.empty String.compare,",
+       "     List.concat (map (fn thy => thy :: Theory.ancestry thy) theories)))",
+       "  val lines = List.concat (map theory_items ancestry)",
        "in",
        "  val _ = List.app (fn line => TextIO.output (TextIO.stdOut, line))",
        "                   (Listsort.sort String.compare lines)",
        "  val _ = TextIO.flushOut TextIO.stdOut",
        "end;",
-       ""]
+       ""])
   end
 
-(* Builds THEORY if needed, then runs the script make_script writes for it in
+(* Builds the distinct theories, then runs the script make_script writes in
    a fresh HOL session, and exits non-zero if that fails. *)
-fun run_check_script tc cli_jobs build_mode theory make_script =
+fun run_check_script tc cli_jobs build_mode theories make_script =
   let
     val project = timed_phase "project.discover" load_project
     val {index, ...} = prepare_source_index "check" (resolution_for_toolchain tc) project
-    val source = find_theory_source "check" index theory
-    val _ = build_once_with_prepared_mode build_mode tc cli_jobs NONE (plain_build_request [#logical_name source])
+    val logical_names = map (#logical_name o find_theory_source "check" index) theories
+    val targets = HolbuildBuildPlan.unique_strings logical_names
+    val _ = build_once_with_prepared_mode build_mode tc cli_jobs NONE (plain_build_request targets)
     val project = timed_phase "check.project.rediscover" load_project
     val {index, components} = prepare_source_index "check" (resolution_for_toolchain tc) project
+    val from =
+      case targets of
+          [target] => FromTheory target
+        | _ =>
+            (* These targets were just built, so their plan needs no script-analysis fallback. *)
+            (case infer_from_targets tc project {index = index, components = components} targets of
+                 SOME target => FromTheory target
+               | NONE => NoFrom)
     val script_path = HolbuildToolchain.invocation_sml_file project "holbuild-check"
     val _ = write_text_file script_path
               (make_script {project = project, index = index, components = components,
-                            logical_name = #logical_name source})
+                            logical_names = logical_names})
     fun cleanup () = OS.FileSys.remove script_path handle OS.SysErr _ => ()
     val status =
       (* A run heap may hold an older copy of the theory, which load would keep. *)
-      run_hol_status HolbuildToolchain.run tc cli_jobs build_mode plain_build_request false (FromTheory (#logical_name source)) "run" [script_path]
+      run_hol_status HolbuildToolchain.run tc cli_jobs build_mode plain_build_request false from "run" [script_path]
       handle e => (cleanup (); raise e)
   in
     cleanup ();
     if HolbuildToolchain.success status then () else OS.Process.exit OS.Process.failure
   end
 
-fun check_selector tc cli_jobs build_mode selector =
+fun check_selectors tc cli_jobs build_mode selectors =
   let
-    val {theory, theorem} = parse_check_selector selector
-    fun make_script {project, index, components, logical_name} =
-      let val hol = hol_package_id tc project
+    val selections = map parse_check_selector selectors
+    fun make_script {project, index, components, logical_names} =
+      let
+        val hol = hol_package_id tc project
+        val project_theories = project_theory_names hol index
+        fun block (logical_name, {theory, theorem}) =
+          check_script {logical_name = logical_name, theorem = theorem,
+                        project_theories = project_theories,
+                        source_findings = kernel_bypass_findings tc hol components index logical_name}
       in
-        check_script {logical_name = logical_name, theorem = theorem,
-                      project_theories = project_theory_names hol index,
-                      source_findings = kernel_bypass_findings tc hol components index logical_name}
+        "local val HolbuildCheckFailed = ref false in\n" ^
+        String.concat (ListPair.mapEq block (logical_names, selections)) ^
+        "val _ = if !HolbuildCheckFailed then OS.Process.exit OS.Process.failure else ();\nend;\n"
       end
   in
-    run_check_script tc cli_jobs build_mode theory make_script
+    run_check_script tc cli_jobs build_mode (map #theory selections) make_script
   end
 
-fun check_fingerprint tc cli_jobs build_mode theory =
-  case parse_check_selector theory of
-      {theory, theorem = NONE} =>
-        run_check_script tc cli_jobs build_mode theory (fingerprint_script o #logical_name)
-    | _ => raise Error "check --fingerprint takes a theory, not THEORY:THEOREM"
+fun check_fingerprint tc cli_jobs build_mode selectors =
+  let
+    fun theory selector =
+      case parse_check_selector selector of
+          {theory, theorem = NONE} => theory
+        | _ => raise Error "check --fingerprint takes a theory, not THEORY:THEOREM"
+  in
+    run_check_script tc cli_jobs build_mode (map theory selectors) (fingerprint_script o #logical_names)
+  end
 
 fun check_command tc cli_jobs args =
   let
     val ({url, remote_only}, args) = split_remote_prebuild_flags "check" args
+    val selectors = case args of "--fingerprint" :: rest => rest | _ => args
+    val _ =
+      case List.find (String.isPrefix "-") selectors of
+          SOME flag => raise Error ("unknown check option: " ^ flag)
+        | NONE => ()
     val build_mode =
       case url of
           SOME u => RemoteExec {url = u, remote_only = remote_only, detach = false, attach = NONE}
         | NONE => BuildTargets
   in
     case args of
-        ["--fingerprint", theory] => check_fingerprint tc cli_jobs build_mode theory
-      | [selector] => check_selector tc cli_jobs build_mode selector
-      | _ => raise Error "usage: holbuild check THEORY[:THEOREM] | check --fingerprint THEORY"
+        "--fingerprint" :: (theories as _ :: _) => check_fingerprint tc cli_jobs build_mode theories
+      | [] => raise Error "usage: holbuild check THEORY[:THEOREM] [THEORY[:THEOREM] ...] | check --fingerprint THEORY [THEORY ...]"
+      | ["--fingerprint"] => raise Error "check --fingerprint requires at least one theory"
+      | selectors => check_selectors tc cli_jobs build_mode selectors
   end
 
 fun removed_legacy_plan_command _ _ =

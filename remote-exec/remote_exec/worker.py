@@ -37,6 +37,7 @@ from typing import Any
 
 from remote_exec.auth import cache_discovery_token
 from remote_exec.cache import cache_nodes, ranked_nodes
+from remote_exec.formats import sanitize_detail
 from remote_exec.membership import REFRESH_SECONDS, Membership, check_plain_http
 
 DEFAULT_SOURCE_URL = "https://github.com/HOL-Theorem-Prover/holbuild/archive/refs/tags/v{version}.tar.gz"
@@ -676,13 +677,15 @@ def runs_hol(pid: int, cooperate_dir: str) -> bool:
     return False
 
 
-def failed_record(spec_sha256: str, failure: str) -> str:
+def failed_record(spec_sha256: str, failure: str, detail: str | None = None) -> str:
     """A result record the worker writes itself: ``spec-rejected`` for an action it won't run, which fails it
     finally like exec-action's own; ``unavailable`` for one whose spec the cache couldn't give (no answer, 429 or
     5xx, or a transfer cut short) or that was interrupted (``recordless_failure``), which is retried without
     counting the attempt; ``memory`` for one whose exec-action was SIGKILLed; or ``internal`` for any other error in
-    the worker, such as exec-action failing without a record, which is retried."""
-    return f"holbuild-action-result-v1\nspec={spec_sha256}\ninput-key=\nstatus=failed\nfailure={failure}\n"
+    the worker, such as exec-action failing without a record, which is retried. ``detail`` says why, for the client:
+    the record has no log."""
+    record = f"holbuild-action-result-v1\nspec={spec_sha256}\ninput-key=\nstatus=failed\nfailure={failure}\n"
+    return record if detail is None else f"{record}detail={sanitize_detail(detail)}\n"
 
 
 def recordless_failure(returncode: int, draining: bool) -> str | None:
@@ -842,7 +845,7 @@ def execute(
         return failed_record(spec, "unavailable")
     except Unreleased as error:
         print(f"refusing {spec}: {error}", file=sys.stderr)
-        return failed_record(spec, "spec-rejected")
+        return failed_record(spec, "spec-rejected", f"the worker refuses the action: {error}")
     if lease.lost.is_set():
         return None
     if drain.stop.is_set():

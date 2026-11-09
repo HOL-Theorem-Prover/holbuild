@@ -189,7 +189,11 @@ fun report_action line =
     val state = if raw_state = "cancelled" andalso
                    String.isPrefix "skipped because of " (Option.getOpt (field "last_failure", ""))
                 then "skipped" else raw_state
-    val failure = case field "last_failure" of SOME f => " (" ^ f ^ ")" | NONE => ""
+    val failure =
+      case (field "last_failure", field "failure_detail") of
+          (SOME f, SOME detail) => " (" ^ f ^ ": " ^ detail ^ ")"
+        | (SOME f, NONE) => " (" ^ f ^ ")"
+        | (NONE, _) => ""
     val log = case (state, field "log_sha256") of
                   ("failed", SOME sha) => ", log /cas/" ^ sha
                 | _ => ""

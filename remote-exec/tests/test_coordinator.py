@@ -44,7 +44,7 @@ def result(name: str, status: str, failure: str | None = None, **extra: str) -> 
     if failure:
         lines.append(f"failure={failure}")
     lines += [f"{k.replace('_', '-')}={v}" for k, v in extra.items()]
-    lines += ["wall-ms=10", f"log={'a' * 64} 12"]
+    lines += ["wall-ms=10"] + ([] if "detail" in extra else [f"log={'a' * 64} 12"])
     return "\n".join(lines) + "\n"
 
 
@@ -969,6 +969,12 @@ async def test_disk_failure_retries_once(http: httpx.AsyncClient) -> None:
     assert (await batch(http, batch_id))["state"] == "failed"
 
 
+def test_a_result_detail_is_read_as_one_line_of_printable_ascii() -> None:
+    record = result("a", "failed", "spec-rejected", detail="bad\tspec\u00e9" + "x" * 600)
+    assert parse_result(record).detail == "bad spec " + "x" * 491
+    assert parse_result(result("a", "failed", "proof")).detail is None
+
+
 async def test_result_without_an_input_key_is_matched_by_its_spec(http: httpx.AsyncClient) -> None:
     # exec-action leaves input-key empty when it couldn't read the spec.
     batch_id = await submit(http, ["a", "b"], fail_fast="true")
@@ -1058,6 +1064,21 @@ async def test_missing_failed_parent_skips_the_action_instead_of_waiting_forever
     assert await states(http, batch_id) == {"a": "failed", "b": "cancelled", "c": "cancelled"}
     assert (await batch(http, batch_id))["state"] == "failed"
     assert await claim(http) is None
+
+
+async def test_a_final_failure_without_a_log_gives_its_detail_in_the_batch_failure(http: httpx.AsyncClient) -> None:
+    batch_id = await submit(http, ["a"])
+    token = await claim_named(http, "a")
+    assert (await complete(http, token, result("a", "failed", "toolchain", detail="clone failed"))).status_code == 200
+    assert (await batch(http, batch_id))["actions"][0]["failure_detail"] == "clone failed"
+
+    token = await claim_named(http, "a")
+    untrusted = "exec-action HOL repository is not trusted by this worker: https://example.invalid/HOL.git"
+    assert (await complete(http, token, result("a", "failed", "spec-rejected", detail=untrusted))).status_code == 200
+    status = await batch(http, batch_id)
+    assert (status["state"], status["failure"]) == ("failed", f"pkg:a: spec-rejected: {untrusted}")
+    [action] = status["actions"]
+    assert (action["last_failure"], action["log_sha256"], action["failure_detail"]) == ("spec-rejected", None, untrusted)
 
 
 async def test_missing_parent_in_the_batch_is_requeued(http: httpx.AsyncClient, cache: FakeCache) -> None:
@@ -1594,9 +1615,26 @@ async def test_final_run_failure_is_independent_and_visible_in_events(
     assert events[-1] == {"type": "batch", "state": "done", "failure": None}
 
 
+async def test_a_failed_run_without_a_log_gives_its_detail_in_events(http: httpx.AsyncClient) -> None:
+    batch_id = await submit(http, ["a"], **{"class": "run"})
+    token = await claim_named(http, "a")
+    rejected = "the run-loads do not match the run text"
+    assert (await complete(http, token, result("a", "failed", "spec-rejected", detail=rejected))).status_code == 200
+    events = [
+        json.loads(line)
+        for line in (await http.get(f"/v1/batches/{batch_id}/events", headers=CLIENT)).text.splitlines()
+        if line
+    ]
+    action = next(e for e in events if e.get("theory") == "pkg:a")
+    assert (action["state"], action["last_failure"], action["failure_detail"]) == ("failed", "spec-rejected", rejected)
+    assert events[-1] == {"type": "batch", "state": "done", "failure": None}
+
+
 async def test_expired_run_attempt_fails_only_its_action(http: httpx.AsyncClient, coordinator: Coordinator) -> None:
-    coordinator.settings.max_attempts = 1
+    coordinator.settings.max_attempts = 2
     batch_id = await submit(http, ["a", "b"], **{"class": "run"})
+    token = await claim_named(http, "a")
+    assert (await complete(http, token, result("a", "failed", "toolchain", detail="clone failed"))).status_code == 200
     await claim_named(http, "a")
     async with coordinator.engine.begin() as connection:
         await connection.execute(sa.text("UPDATE leases SET expires_at = now() - interval '1 second'"))
@@ -1604,7 +1642,7 @@ async def test_expired_run_attempt_fails_only_its_action(http: httpx.AsyncClient
     status = await batch(http, batch_id)
     assert status["state"] == "running"
     assert await states(http, batch_id) == {"a": "failed", "b": "ready"}
-    assert status["actions"][0]["last_failure"] == "internal"
+    assert (status["actions"][0]["last_failure"], status["actions"][0]["failure_detail"]) == ("internal", None)
     b = await claim_named(http, "b")
     assert (await complete(http, b, result("b", "built"))).status_code == 200
     assert (await batch(http, batch_id))["state"] == "done"
