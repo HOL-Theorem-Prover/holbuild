@@ -550,7 +550,8 @@ def spellings(name: str) -> set[Path]:
     The worker opens the name it was given, so an action able to replace any
     link on the way could redirect it."""
     found = {Path(os.path.abspath(name))}
-    current, parts, links = Path("/"), list(Path(os.path.abspath(name)).parts[1:]), 0
+    # Not normalized first: ".." after a link leaves the link's target.
+    current, parts, links = Path("/"), list((Path.cwd() / name).parts[1:]), 0
     while parts:
         part = parts.pop(0)
         if part == "..":

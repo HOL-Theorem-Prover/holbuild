@@ -168,7 +168,8 @@ fun wrap completed argv =
         val cache = OS.Path.mkAbsolute {path = HolbuildCacheConfig.cache_root (), relativeTo = OS.FileSys.getDir ()}
         val protected_paths =
           map (fn part => OS.Path.concat (cache, part))
-              ["actions", "blobs", "locks", "cooperate", "checkpoint-store", "toolchain-trust"] @
+              ["actions", "blobs", "locks", "cooperate", "checkpoint-store", "toolchain-trust", "git",
+               "hol-toolchains/.locks"] @
           List.mapPartial
             (fn entry =>
                 case String.fields (fn c => c = #"=") entry of
