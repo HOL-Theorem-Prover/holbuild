@@ -303,8 +303,8 @@ holbuild repl --from MyTheory
 holbuild context
 holbuild context --trknl
 holbuild execution-plan MyTheory:my_theorem
-holbuild check MyTheory
-holbuild check --fingerprint MyTheory
+holbuild check MyTheory OtherTheory:my_theorem
+holbuild check --fingerprint MyTheory OtherTheory
 holbuild buildhol
 holbuild buildhol --trknl
 holbuild build --trknl MyTheory
@@ -510,18 +510,27 @@ line per use (`mypkg:src/MyScript.sml:12: kernel bypass: disk_thm`). Names in
 comments and string literals don't count; the scan is a backstop, not a
 sandbox. With findings it exits non-zero; otherwise it prints
 `MyTheory: clean (N theorems)` and exits zero. `holbuild check MyTheory:my_theorem` checks one theorem.
-`check` builds the theory, and any `[run].loads`, without proof steps or
+Pass several selectors to share one build of the distinct targets and one HOL
+session: `holbuild check MyTheory OtherTheory:my_theorem`. Each selector keeps
+its own findings or clean line, in argument order (including repeated selectors).
+Findings do not stop later checks; the command exits non-zero if any selector
+has findings. Invalid selectors, missing theorems and load errors abort the
+command.
+
+`check` builds the theories, and any `[run].loads`, without proof steps or
 checkpoints: it applies no step timeout (that is `build`'s check) and reuses
 theories built by `holbuild build --skip-proof-steps`. The tags are those
 recorded in the built theory, which may have been restored from a cache;
 run `holbuild build --no-cache MyTheory` first to check a fresh build. HOL
-always starts from the toolchain's base state here, not from `[run].heap`,
-which may hold an older copy of the theory.
+starts from a valid dependency checkpoint or the toolchain's base state, never
+from `[run].heap`, which may hold an older copy of a theory.
 
 `holbuild check --fingerprint MyTheory` builds and loads the theory the same
 way and prints one tab-separated line per axiom, definition and theorem stored
 in it and in each of its ancestors, HOL's own theories included, sorted
-bytewise so that two runs diff cleanly:
+bytewise so that two runs diff cleanly. Several theories can be passed together
+(`holbuild check --fingerprint MyTheory OtherTheory`); their shared ancestors
+and repeated target theories are emitted only once:
 
 ```text
 fingerprint	DepTheory	axiom	my_axiom	9a02…(64 hex digits)	-
