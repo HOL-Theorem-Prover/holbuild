@@ -77,10 +77,19 @@ fun drop_selftest s =
     val n = loop 0
   in (n, String.extract(s, n, NONE)) end
 
+(* The toolchain tree may come from an untrusted commit, so nothing it names
+   may lead the trusted reader outside it. *)
+fun escapes rel =
+  Path.isAbsolute rel orelse List.exists (fn arc => arc = "..") (String.fields (fn c => c = #"/") rel)
+
 fun sequence_dirs holdir seq_rel =
   let
-    val tools = Path.concat(holdir, "tools")
-    fun abs_include rel = Path.mkCanonical (Path.concat(tools, rel))
+    fun abs_include rel =
+      let val inside = Path.mkCanonical (Path.concat("tools", rel)) handle Path.Path => "/"
+      in
+        if escapes inside then die ("HOL build sequence include leaves the HOL tree: " ^ rel)
+        else Path.mkCanonical (Path.concat(holdir, inside))
+      end
     fun abs_seq rel = if Path.isAbsolute rel then rel else Path.concat(holdir, rel)
     fun parse_file visited path acc =
       let
@@ -103,6 +112,8 @@ fun sequence_dirs holdir seq_rel =
                     val (mlsys, rest1) = extract_bracket #"[" #"]" body
                     val (kernel, rest2) = extract_bracket #"(" #")" rest1
                     val (selftest, dir0) = drop_selftest rest2
+                    val _ = if escapes dir0 then die ("HOL build sequence directory leaves the HOL tree: " ^ dir0)
+                            else ()
                   in
                     if (mlsys = "" orelse mlsys = "poly") andalso
                        (kernel = "" orelse kernel = "stdknl") andalso
@@ -161,7 +172,12 @@ fun json_target_value line =
 
 fun rel_under root path =
   let val root' = if has_suffix "/" root then root else root ^ "/"
-  in if has_prefix root' path then SOME (String.extract(path, size root', NONE)) else NONE end
+  in
+    if not (has_prefix root' path) then NONE
+    else
+      let val rel = String.extract(path, size root', NONE)
+      in if escapes rel then die ("HOL target leaves the HOL tree: " ^ path) else SOME rel end
+  end
 
 (* HOL records its directory with symlinks resolved, so Holmake names targets
    under the physical path even when holdir is reached through a symlink, such

@@ -54,4 +54,12 @@ HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES="$tmpdir/repo=missing" check "$base" conf
 HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES="$tmpdir/repo=../pull/1/head" check "$base" configuration
 HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES='' check "$base" configuration
 HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES='/unconfigured=master' check "$base" rejected
-printf 'trusted ancestry accepted; unmerged, tag, malformed and unconfigured revisions denied\n'
+# "*" trusts any https repository, but only at an exact commit.
+any=0123456789abcdef0123456789abcdef01234567
+https_repo=https://example.invalid/HOL.git
+HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES='*' HOLBUILD_TRUST_TEST_REPO=$https_repo check "$any" accepted
+HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES='*' HOLBUILD_TRUST_TEST_REPO=$https_repo check 0123456 rejected
+HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES='*' HOLBUILD_TRUST_TEST_REPO=$https_repo check master rejected
+HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES='*' check "$base" rejected
+HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES='*' HOLBUILD_TRUST_TEST_REPO=http://example.invalid/HOL.git check "$any" rejected
+printf 'trusted ancestry accepted; unmerged, tag, malformed and unconfigured revisions denied; * accepts only exact https commits\n'
