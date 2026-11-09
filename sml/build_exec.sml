@@ -5500,7 +5500,13 @@ fun refresh_checkpoint_budget_after_node state project node protected_bases =
    data), its outputs are those a build on the real parents makes, and its
    *commit* installs them as that build would.  A failed attempt or gate
    costs only time: the theory, or what loaded the outline, builds again
-   without pipelining, and the theory's input key goes on a skip list. *)
+   without pipelining, and the theory's input key goes on a skip list.
+
+   Pipelining costs CPU, so it only fills slots that would otherwise sit
+   idle.  A theory whose parents are all built is pipelined only if, when a
+   worker takes it, every other ready node has a free worker too and one
+   is still left over; otherwise it builds plain.  A speculative attempt
+   is the last work a worker takes, after every ready node. *)
 
 fun pipeline_trace line = cache_trace ("pipeline: " ^ line)
 
@@ -5950,7 +5956,8 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
        once its outputs are final.  Each outline and attempt carries a
        generation number, unique in the run, and the set of nodes whose
        outlines it loaded, transitively; an owner is the worker thread
-       running it. *)
+       running it.  An attempt is AQueued while it waits in attempt_queue
+       and ARunning once a worker has it. *)
     val pipelining = pipeline_enabled options
     val root = project_artifact_root project
     val run_dir =
@@ -5962,6 +5969,7 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
       | OReady of int * string * int Binaryset.set
     datatype attempt_state =
         ANone | AOff
+      | AQueued of int * int Binaryset.set
       | ARunning of int * int Binaryset.set
       | ADone of int * int Binaryset.set * speculative_result
     datatype work =
@@ -6127,6 +6135,32 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
                else if !priority_running > 0 then NONE
                else (ready := rest; SOME (id, false)))
 
+    fun is_theory id =
+      #kind (HolbuildBuildPlan.source_of (Vector.sub (nodes, id))) = HolbuildSourceIndex.TheoryScript
+
+    (* A pipelined build saves no checkpoints and writes no proof trace,
+       and runs proof steps only through the proof IR, so a theory that
+       needs more builds only from its committed parents. *)
+    fun speculable id =
+      let
+        val node = Vector.sub (nodes, id)
+        val policy = checkpoint_policy_for_node options project node
+      in
+        context_tactics andalso is_theory id andalso Array.sub (cold, id) <> SOME false andalso
+        not (theorem_checkpoints_enabled policy) andalso
+        (not (proof_steps_enabled policy) orelse proof_ir_enabled policy) andalso
+        not (trace_steps policy) andalso not (Option.isSome (execution_plan policy)) andalso
+        not (repl_on_failure policy) andalso not (trknl_enabled policy) andalso
+        null (source_extra_output_declarations plan node) andalso not (always_reexecute node) andalso
+        not (failed_prefix_priority_node id) andalso
+        not (Binaryset.member (!skipped, HolbuildBuildPlan.input_key_for keys node))
+      end
+
+    fun outlinable id =
+      not (null (Array.sub (dependents, id))) andalso (not (is_theory id) orelse speculable id)
+
+    fun new_gen () = (next_gen := !next_gen + 1; !next_gen)
+
     fun view_of consumed =
       map (fn id =>
               case Array.sub (outline, id) of
@@ -6152,25 +6186,49 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
                    else pop_outline ()
                | _ => pop_outline ())
 
+    fun start_attempt id gen consumed =
+      (Array.update (attempt, id, ARunning (gen, consumed));
+       if outlinable id then Array.update (outline, id, ORunning (gen, consumed)) else ();
+       Array.update (attempt_owner, id, SOME (gen, Thread.self ()));
+       SOME (AttemptWork (id, gen, view_of consumed)))
+
     fun pop_attempt () =
       case !attempt_queue of
           [] => NONE
         | (id, gen) :: rest =>
             (attempt_queue := rest;
              case Array.sub (attempt, id) of
-                 ARunning (current, consumed) =>
+                 AQueued (current, consumed) =>
                    if current = gen andalso not (Array.sub (committed, id)) then
-                     (Array.update (attempt_owner, id, SOME (gen, Thread.self ()));
-                      SOME (AttemptWork (id, gen, view_of consumed)))
+                     start_attempt id gen consumed
                    else pop_attempt ()
                | _ => pop_attempt ())
 
+    (* A speculable theory is pipelined only if a worker would still be
+       left idle once every ready node had one (see "Pipelined builds").
+       The commit and outline queues are empty here, and running doesn't
+       count this worker yet. *)
     fun pop_plain () =
       case pop_ready () of
           SOME (id, priority) =>
-            (mark_active_node id;
-             if priority then priority_running := !priority_running + 1 else ();
-             SOME (PlainWork id))
+            if pipelining andalso speculable id then
+              let
+                val pending = length (!ready) + 1
+                val free = jobs - !running
+                val pipelined = pending < free
+              in
+                pipeline_trace ("dispatch " ^ (if pipelined then "pipelined" else "plain") ^ ": " ^
+                                node_name id ^ " (pending " ^ Int.toString pending ^
+                                ", free " ^ Int.toString free ^ ")");
+                if pipelined then
+                  (Array.update (plain_started, id, false);
+                   start_attempt id (new_gen ()) (Binaryset.empty int_compare))
+                else (mark_active_node id; SOME (PlainWork id))
+              end
+            else
+              (mark_active_node id;
+               if priority then priority_running := !priority_running + 1 else ();
+               SOME (PlainWork id))
         | NONE => NONE
 
     fun pop_work () =
@@ -6201,30 +6259,6 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
 
     fun next_work () = with_lock next_work_locked
 
-    fun is_theory id =
-      #kind (HolbuildBuildPlan.source_of (Vector.sub (nodes, id))) = HolbuildSourceIndex.TheoryScript
-
-    (* A pipelined build saves no checkpoints and writes no proof trace,
-       and runs proof steps only through the proof IR, so a theory that
-       needs more builds only from its committed parents. *)
-    fun speculable id =
-      let
-        val node = Vector.sub (nodes, id)
-        val policy = checkpoint_policy_for_node options project node
-      in
-        context_tactics andalso is_theory id andalso Array.sub (cold, id) <> SOME false andalso
-        not (theorem_checkpoints_enabled policy) andalso
-        (not (proof_steps_enabled policy) orelse proof_ir_enabled policy) andalso
-        not (trace_steps policy) andalso not (Option.isSome (execution_plan policy)) andalso
-        not (repl_on_failure policy) andalso not (trknl_enabled policy) andalso
-        null (source_extra_output_declarations plan node) andalso not (always_reexecute node) andalso
-        not (failed_prefix_priority_node id) andalso
-        not (Binaryset.member (!skipped, HolbuildBuildPlan.input_key_for keys node))
-      end
-
-    fun outlinable id =
-      not (null (Array.sub (dependents, id))) andalso (not (is_theory id) orelse speculable id)
-
     fun available id =
       Array.sub (committed, id) orelse (case Array.sub (outline, id) of OReady _ => true | _ => false)
 
@@ -6237,8 +6271,6 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
                    | _ => acc)
         (Binaryset.empty int_compare) deps
 
-    fun new_gen () = (next_gen := !next_gen + 1; !next_gen)
-
     fun stop_owner owners id gen =
       case Array.sub (owners, id) of
           SOME (owner_gen, thread) =>
@@ -6248,9 +6280,11 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
         | NONE => ()
 
     (* Starts what node ID can do now, once its dependencies are committed
-       or outlined: a library's outline; a theory's pipelined build, which
-       publishes its outline as it goes.  Once they are all committed, its
-       build: a commit of its pipelined build, if it has one. *)
+       or outlined: a library's outline; while some are only outlined, a
+       theory's speculative attempt, queued.  Once they are all committed,
+       its build: a commit of its attempt, if it has one, or the ready
+       queue, where pop_plain decides whether to pipeline it.  An attempt
+       still queued then is withdrawn. *)
     fun consider_locked id =
       if Array.sub (committed, id) then ()
       else
@@ -6271,12 +6305,11 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
           val _ =
             case Array.sub (attempt, id) of
                 ANone =>
-                  if not (Array.sub (plain_started, id)) andalso all_available andalso speculable id then
+                  if not (Array.sub (plain_started, id)) andalso Array.sub (remaining_deps, id) > 0 andalso
+                     all_available andalso speculable id then
                     let val gen = new_gen ()
-                        val consumed = consumed_by deps
                     in
-                      Array.update (attempt, id, ARunning (gen, consumed));
-                      if outlinable id then Array.update (outline, id, ORunning (gen, consumed)) else ();
+                      Array.update (attempt, id, AQueued (gen, consumed_by deps));
                       attempt_queue := !attempt_queue @ [(id, gen)]
                     end
                   else ()
@@ -6289,6 +6322,10 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
                   (Array.update (plain_started, id, true);
                    commit_queue := !commit_queue @ [(id, result)])
               | ARunning _ => ()
+              | AQueued _ =>
+                  (Array.update (attempt, id, ANone);
+                   Array.update (plain_started, id, true);
+                   add_ready id)
               | _ => (Array.update (plain_started, id, true); add_ready id)
         end
 
@@ -6307,7 +6344,8 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
                 | _ => false
             val attempt_hit =
               case Array.sub (attempt, id) of
-                  ARunning (gen, consumed) =>
+                  AQueued (_, consumed) => uses consumed
+                | ARunning (gen, consumed) =>
                     uses consumed andalso (stop_owner attempt_owner id gen; true)
                 | ADone (_, consumed, {stage_root, ...}) =>
                     uses consumed andalso (remove_tree stage_root; true)

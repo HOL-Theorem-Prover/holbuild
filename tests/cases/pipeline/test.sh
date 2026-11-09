@@ -523,3 +523,58 @@ log=$tmpdir/retry.log
 require_no_grep "attempt failed" "$log"
 require_grep "pipeline: gate passed: ATheory" "$log"
 require_grep "pipeline: committed: CTheory" "$log"
+
+# Pipelining only fills slots that would otherwise sit idle.  At -j2, A is
+# the only ready theory, so a worker is left over and A is pipelined; B and
+# C then run as speculative attempts on the outlines.
+new_project idle
+cat > "$tmpdir/idle/src/AScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Theorem a_thm:
+  T
+Proof
+  $slow_truth
+QED
+val _ = export_theory();
+SML
+write_b_and_c idle
+(cd "$tmpdir/idle" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j2 build --no-cache --skip-checkpoints --skip-proof-steps CTheory) \
+  > "$tmpdir/idle.log" 2>&1
+log=$tmpdir/idle.log
+require_grep "pipeline: dispatch pipelined: ATheory (pending 1, free 2)" "$log"
+require_grep "pipeline: attempt done: BTheory" "$log"
+require_grep "pipeline: attempt done: CTheory" "$log"
+require_grep "pipeline: committed: CTheory" "$log"
+require_no_grep "dispatch plain" "$log"
+require_same_as_unpipelined idle CTheory A B C
+
+# Under a backlog nothing is pipelined: six independent theories at -j2.
+# Each worker that takes one leaves at least as many ready as free, so each
+# builds plain, but for the last if both workers are free then.
+new_project backlog
+for t in R1 R2 R3 R4 R5 R6; do
+  cat > "$tmpdir/backlog/src/${t}Script.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "$t";
+Theorem ${t}_thm:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+val _ = export_theory();
+SML
+done
+(cd "$tmpdir/backlog" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j2 build --no-cache --skip-checkpoints --skip-proof-steps) \
+  > "$tmpdir/backlog.log" 2>&1
+log=$tmpdir/backlog.log
+plain=$(grep -c "pipeline: dispatch plain: R" "$log" || true)
+pipelined=$(grep -c "pipeline: dispatch pipelined: R" "$log" || true)
+if (( plain < 5 || plain + pipelined != 6 )); then
+  echo "expected at least 5 of the 6 theories dispatched plain, got $plain plain and $pipelined pipelined" >&2
+  cat "$log" >&2
+  exit 1
+fi
+for t in $(sed -n 's/.*pipeline: dispatch plain: \([A-Za-z0-9]*\)Theory .*/\1/p' "$log"); do
+  require_no_grep "attempt done: ${t}Theory" "$log"
+done
