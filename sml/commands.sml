@@ -698,23 +698,14 @@ fun run_analyser_for_proof_ir_text {name, tactic_start, tactic_end, tactic_text}
       NONE => raise Error "internal error: HOL analyser is not configured"
     | SOME analyser =>
         let
-          val req = HolbuildTempPath.temporary "analyser-request"
-          val resp = HolbuildTempPath.temporary "analyser-response"
           val request = String.concatWith "\n"
             [HolbuildAnalysisProtocol.join ["version", HolbuildAnalysisProtocol.protocol_version],
              HolbuildAnalysisProtocol.join ["command", "proof-ir-plan"],
              HolbuildAnalysisProtocol.join ["theorem", "0", name, Int.toString tactic_start, Int.toString tactic_end, tactic_text],
              HolbuildAnalysisProtocol.join ["end"]] ^ "\n"
-          val _ = write_text_file req request
-          val status = OS.Process.system (HolbuildHash.quote analyser ^ " " ^
-                                          String.concatWith " " (HolbuildDependencies.analyser_min_heap_args ()) ^
-                                          " --request " ^ HolbuildHash.quote req ^
-                                          " --response " ^ HolbuildHash.quote resp)
-          val _ = OS.FileSys.remove req handle OS.SysErr _ => ()
-          val text = if OS.Process.isSuccess status then read_text resp
-                     else (OS.FileSys.remove resp handle OS.SysErr _ => ();
-                           raise Error "holbuild-hol-analyser failed")
-          val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
+          val text = case HolbuildDependencies.analyser_response analyser request of
+                         SOME text => text
+                       | NONE => raise Error "holbuild-hol-analyser failed"
         in text end
 
 fun int_field s =
@@ -3286,12 +3277,13 @@ fun exec_action_command maxheap jobs args =
         (* Every worker must run the published archive's bytes, so a build
            whose own publish lost is replaced by the stored archive. *)
         val _ = HolbuildHolSharedCache.adopt_published_archive := true
+        (* The toolchain's own steps run confined too, and read this runtime. *)
+        val _ = HolbuildActionSandbox.poly_executable := HolbuildHolSharedCache.poly_executable_path ()
         val kernel_variant = HolbuildHolToolchainConfig.StandardKernel
         val holdir = HolbuildHolSharedCache.ensure_built_with_kernel jobs
                        {git = git, rev = rev, kernel_variant = kernel_variant}
         val tc = {holdir = holdir, maxheap = maxheap, kernel_variant = kernel_variant}
         val _ = HolbuildActionSandbox.toolchain_root := holdir
-        val _ = HolbuildActionSandbox.poly_executable := HolbuildHolSharedCache.poly_executable_path ()
       in
         configure_analyser_for_toolchain tc; tc
       end
