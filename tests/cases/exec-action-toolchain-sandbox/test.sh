@@ -85,6 +85,9 @@ cat >> "$hol/bin/build" <<'SH'
 sh tools/attack.sh build >> attack-report
 # Modes change only within the tree, and never to setuid or setgid.
 if chmod 4755 bin/build 2>/dev/null; then echo 'ALLOWED build setuid' >> attack-report; fi
+# The repository is out of reach: a .git planted here is discarded, never run.
+mkdir -p .git
+printf '[core]\n\tfsmonitor = planted-monitor\n' > .git/config
 # Scratch space is for files, not links.
 if [ -d /tmp ] && ln -s /etc/passwd "/tmp/holbuild-toolchain-link.$$" 2>/dev/null; then
   rm -f "/tmp/holbuild-toolchain-link.$$"
@@ -188,6 +191,8 @@ report=$(find "$entry/analysers" -name polyc-report)
 if grep -h ALLOWED "$entry/hol/attack-report" "$report" "$tmpdir/build.log"; then exit 1; fi
 damage "$outside_mode"
 [[ ! -e "$entry/.git-bootstrap" ]]
+if grep -q planted-monitor "$entry/hol/.git/config"; then echo 'a planted .git survived the build' >&2; exit 1; fi
+[[ $(git -C "$entry/hol" rev-parse HEAD) == "$hol_rev" ]]
 detached=$(cat "$entry/hol/detached.pid")
 sleep 4
 if kill -0 "$detached" 2>/dev/null; then echo 'detached child outlived the build' >&2; exit 1; fi
