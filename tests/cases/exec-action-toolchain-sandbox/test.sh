@@ -146,6 +146,11 @@ ANALYSER
 chmod +x "$out"
 SH
 chmod +x "$fakebin/polyc"
+# This one leaves a link out of its output directory and tries to vouch for
+# the build itself.
+sed 's|^chmod +x "\$out"$|&\nln -s /etc "$(dirname "$out")/up"\nif : > "$(dirname "$(dirname "$out")")/build.ok"; then echo ALLOWED polyc build.ok; fi 2>/dev/null|' \
+  "$fakebin/polyc" > "$fakebin/polyc-bad"
+chmod +x "$fakebin/polyc-bad"
 
 retarget() {
   local rev=$1 hash
@@ -157,7 +162,7 @@ retarget() {
 run_worker() {
   local cache=$1 target=$2 log=$3
   set +e
-  HOLBUILD_CACHE=$cache HOLBUILD_POLY=$fakebin/poly HOLBUILD_POLYC=$fakebin/polyc \
+  HOLBUILD_CACHE=$cache HOLBUILD_POLY=$fakebin/poly HOLBUILD_POLYC=${POLYC:-$fakebin/polyc} \
     HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES="$hol=master" HOLBUILD_REMOTE_CACHE_CURL_CONFIG=$secret \
     HOLBUILD_COOPERATE_DIR= "$HOLBUILD_BIN" --max-heap 1024 --remote-cache "$remote_url" \
     exec-action "$target" --cache-limit-gb 1000 --result "$log.result" > "$log" 2>&1
@@ -206,6 +211,17 @@ require_grep "the toolchain's identity does not match the action text" "$tmpdir/
 [[ $(cat "$entry/hol/detached.pid") == "$detached" ]] || { echo 'the toolchain was rebuilt, not restored' >&2; exit 1; }
 if grep ALLOWED "$tmpdir/restore.log"; then exit 1; fi
 damage "$outside_mode"
+
+# A rejected analyser build leaves nothing behind, so the next one starts
+# afresh.
+rm -rf "$entry/analysers"
+POLYC=$fakebin/polyc-bad run_worker "$worker" "$(retarget "$hol_rev")" "$tmpdir/bad-analyser.log"
+require_grep '^failure=internal$' "$tmpdir/bad-analyser.log.result"
+if grep ALLOWED "$tmpdir/bad-analyser.log"; then exit 1; fi
+[[ -z $(ls -A "$entry/analysers") ]] || { find "$entry/analysers" >&2; cat "$tmpdir/bad-analyser.log" >&2; exit 1; }
+run_worker "$worker" "$(retarget "$hol_rev")" "$tmpdir/analyser-retry.log"
+require_grep "the toolchain's identity does not match the action text" "$tmpdir/analyser-retry.log"
+[[ -n $(find "$entry/analysers" -name build.ok) ]]
 
 # A build that links out of its tree fails, and leaves nothing behind.
 printf '%s\n' "$secret" > "$hol/escape"

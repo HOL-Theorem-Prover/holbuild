@@ -545,20 +545,27 @@ fun build_analyser k =
     val bindir = Path.concat(dir, "bin")
     val out = analyser_bin_for_key k ak
     val hol = holdir_for_key k
-    (* polyc links against the toolchain's sources and chmods its output. *)
-    val run_command = confine {writable = [dir], readable = [entry_dir_for_key k], toolchain = true} (run_mutation k)
+    (* polyc links against the toolchain's sources and chmods its output.
+       Confined, it may write only bin/, never build.ok or the manifest. *)
+    val run_command = confine {writable = [bindir], readable = [entry_dir_for_key k], toolchain = true} (run_mutation k)
     val src = analyser_source_dir ()
     val material = analyser_key_material ()
-  in
-    if analyser_built k ak then out
-    else
-      (ensure_dir bindir;
-       run_in_dir run_command hol
+    (* A failed confined build may leave output its next run would refuse. *)
+    fun discard () =
+      if HolbuildActionSandbox.active () andalso path_exists dir then remove_tree (run_mutation k) dir else ()
+    fun compile () =
+      (run_in_dir run_command hol
          ("HOLBUILD_HOLDIR=" ^ quote hol ^ " " ^
           "HOLBUILD_ANALYSER_SRC=" ^ quote src ^ " " ^
           quote (polyc_command ()) ^ " -o " ^ quote out ^ " " ^
           quote (Path.concat(src, "holbuild-hol-analyser-script.sml")));
-       if executable out then () else die ("analyser build did not produce executable: " ^ out);
+       if executable out then () else die ("analyser build did not produce executable: " ^ out))
+  in
+    if analyser_built k ak then out
+    else
+      (discard ();
+       ensure_dir bindir;
+       compile () handle e => (discard (); raise e);
        write_file (analyser_manifest_for_key k ak) (material ^ "\nkey=" ^ ak ^ "\n");
        write_file (analyser_ok_for_key k ak) "ok\n";
        out)
