@@ -963,6 +963,7 @@ SML
 cat > "$priority_project/src/CScript.sml" <<SML
 open HolKernel Parse boolLib bossLib;
 val _ = new_theory "C";
+val build_phase = "seed";
 val out = TextIO.openAppend "$priority_counter";
 val _ = (TextIO.output(out, "x"); TextIO.closeOut out);
 Theorem c_thm:
@@ -987,12 +988,25 @@ fi
 priority_count=$(wc -c < "$priority_counter" | tr -d ' ')
 [[ "$priority_count" = "0" ]] || { echo "scheduler ran unrelated always-reexecute target before failed_prefix; count $priority_count" >&2; exit 1; }
 require_grep "from: failed-prefix checkpoint in b_fail" "$priority_again_log"
+# A first fail-fast run can checkpoint C before B fails. Seed that state
+# explicitly after the early-stop checks so the final check is deterministic.
+(cd "$priority_project" && "$HOLBUILD_BIN" build CTheory) > "$tmpdir/priority-seed-c.log" 2>&1
+require_file "$(find "$priority_project/.holbuild/checkpoints" -name '*c_thm_context.save' -print -quit)"
+: > "$priority_counter"
+# Checkpoints omit earlier side effects. Give C a fresh prefix so its counter
+# measures execution after the retained B failure, rather than checkpoint reuse.
+python3 - <<PYTHON
+from pathlib import Path
+path = Path("$priority_project/src/CScript.sml")
+path.write_text(path.read_text().replace('val build_phase = "seed";', 'val build_phase = "keep-going";'))
+PYTHON
 if (cd "$priority_project" && "$HOLBUILD_BIN" -j2 build BTheory CTheory) > "$tmpdir/priority-keep-going.log" 2>&1; then
   echo "expected retained priority failure with keep-going" >&2
   exit 1
 fi
-[[ $(wc -c < "$priority_counter" | tr -d ' ') == 1 ]] ||
-  { echo "keep-going did not release unrelated work after the failed prefix" >&2; exit 1; }
+priority_count=$(wc -c < "$priority_counter" | tr -d ' ')
+[[ "$priority_count" = "1" ]] ||
+  { echo "keep-going did not release unrelated work after the failed prefix; count $priority_count" >&2; exit 1; }
 require_grep 'CTheory built' "$tmpdir/priority-keep-going.log"
 
 always_context_project=$tmpdir/always-context-project
