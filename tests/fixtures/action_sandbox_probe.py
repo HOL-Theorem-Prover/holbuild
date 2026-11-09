@@ -170,11 +170,11 @@ def kill_forking_groups(root: Path) -> None:
         leader = os.fork()
         if leader == 0:
             os.setpgid(0, 0)
+            parent = os.getpid()
             workers = 0
             while True:
                 if workers < 16:
                     if os.fork() == 0:
-                        parent = os.getppid()
                         time.sleep(0.005)
                         if os.getppid() != parent:  # orphaned by the kill
                             time.sleep(0.5)
