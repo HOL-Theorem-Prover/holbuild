@@ -27,6 +27,9 @@ unset HOLBUILD_REMOTE_CACHE_URL
 
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
 
+# sortingTheory is built from HOL's sources (package hol, src/sort) but sits
+# in sigobj in a Holmake build, so it sorts with sumTheory by name.
+#
 # Package dep keeps its theory in a/, which sorts before HOL's sigobj but
 # loads after it: dep is a package, HOL comes first.
 dep=$tmpdir/dep
@@ -107,7 +110,7 @@ struct
 end
 SML
 # The header names its dependencies out of order.
-header='Ancestors b countchars y dep arithmetic
+header='Ancestors b countchars y sum dep sorting arithmetic
 Libs aLib'
 cat > "$project/src/top/useScript.sml" <<SML
 Theory use
@@ -130,6 +133,8 @@ SML
 
 expected='countcharsTheory
 arithmeticTheory
+sortingTheory
+sumTheory
 depTheory
 yTheory
 aLib
@@ -157,10 +162,10 @@ link_hol_toolchain_cache "$tmpdir/local"
   { cat "$tmpdir/local.log" >&2; exit 1; }
 
 # The object manifests: the script's direct loads, and the generated
-# theory's project parents (HOL drops arithmetic, an ancestor of the others).
+# theory's parents (HOL drops the ones that are ancestors of others).
 check_order "useScript.uo" "$(manifest_names "$project/.holbuild/obj/src/top/useScript.uo")"
-check_order "useTheory.uo" "$(manifest_names "$project/.holbuild/obj/src/top/useTheory.uo")" \
-  "$(grep -vxE 'arithmeticTheory|aLib' <<< "$expected")"
+theory_uo=$(manifest_names "$project/.holbuild/obj/src/top/useTheory.uo")
+check_order "useTheory.uo" "$theory_uo" "$(grep -xF -f <(printf '%s\n' "$theory_uo") <<< "$expected")"
 
 # The preload a theory's stage loads.
 if (cd "$project" && HOLBUILD_CACHE=$tmpdir/local "$HOLBUILD_BIN" build --skip-checkpoints failTheory) \
@@ -183,6 +188,7 @@ spec_path=$project/.holbuild/action-specs/$spec
 require_file "$spec_path"
 check_order "the spec's preload" "$(loaded_names '^load [a-z]* .*' "$spec_path")"
 require_grep '^order holexamples:countcharsTheory 0 \. examples/countchars$' "$spec_path"
+require_grep '^order hol:sortingTheory 0 \. sigobj$' "$spec_path"
 require_grep '^order dep:depTheory 1 dep a$' "$spec_path"
 require_grep '^order order:bTheory 2 order src/b$' "$spec_path"
 require_grep '^order order:aLib 2 order src/b$' "$spec_path"

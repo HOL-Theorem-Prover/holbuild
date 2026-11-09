@@ -1290,18 +1290,22 @@ fun compare_load_order ({tier, package, dir, file} : load_order, b : load_order)
 (* A HOL theory or library named without a node: it is in $(HOLDIR)/sigobj. *)
 fun external_load_order name : load_order = {tier = 0, package = "", dir = "sigobj", file = name}
 
+(* Package hol's modules are installed in sigobj, so they sort with the
+   external ones; other packages from the HOL tree keep their directory. *)
 fun load_order (plan as {package_tiers, ...} : t) node : load_order =
-  case toolchain_source_name plan node of
-      SOME name =>
-        {tier = 0, package = "",
-         dir = HolbuildSourceIndex.dirname (String.extract (name, size "$(HOLDIR)/", NONE)),
-         file = logical_name node}
-    | NONE =>
-        {tier = case List.find (fn (name, _) => name = package node) package_tiers of
-                    SOME (_, tier) => tier
-                  | NONE => 1,
-         package = package node, dir = HolbuildSourceIndex.dirname (relative_path node),
-         file = logical_name node}
+  if package node = "hol" then external_load_order (logical_name node)
+  else
+    case toolchain_source_name plan node of
+        SOME name =>
+          {tier = 0, package = "",
+           dir = HolbuildSourceIndex.dirname (String.extract (name, size "$(HOLDIR)/", NONE)),
+           file = logical_name node}
+      | NONE =>
+          {tier = case List.find (fn (name, _) => name = package node) package_tiers of
+                      SOME (_, tier) => tier
+                    | NONE => 1,
+           package = package node, dir = HolbuildSourceIndex.dirname (relative_path node),
+           file = logical_name node}
 
 fun sort_by_load_order order values =
   map #2 (sort_pairs (fn ((a, _), (b, _)) => compare_load_order (a, b))
