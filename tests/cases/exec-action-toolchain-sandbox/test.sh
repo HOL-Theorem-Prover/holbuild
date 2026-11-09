@@ -98,7 +98,8 @@ setsid sh -c 'echo $$ > detached.pid; sleep 3; echo late > late-marker' </dev/nu
 while [ ! -s detached.pid ]; do sleep 0.05; done
 for tool in hol Holmake; do
   mv "bin/$tool" "bin/$tool.real"
-  printf '#!/bin/sh\nsh "$(dirname "$0")/../tools/attack.sh" %s >&2\nexec "$0.real" "$@"\n' "$tool" > "bin/$tool"
+  # Its output may be discarded, so an attack that lands fails the tool.
+  printf '#!/bin/sh\nr=$(sh "$(dirname "$0")/../tools/attack.sh" %s)\nprintf "%%s\\n" "$r" >&2\ncase "$r" in *ALLOWED*) exit 99 ;; esac\nexec "$0.real" "$@"\n' "$tool" > "bin/$tool"
   chmod +x "bin/$tool"
 done
 if [ -e escape ]; then ln -s "$(cat escape)" leak; fi
