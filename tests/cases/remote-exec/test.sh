@@ -1581,6 +1581,26 @@ require_grep 'failed (memory)' "$tmpdir/multi-failure-memory.log"
 require_file "$tmpdir/multi-failure/.holbuild/obj/src/HealthyTheory.dat"
 refute_grep 'Theory built\|building locally' "$tmpdir/multi-failure-memory.log"
 
+# A reported non-proof log can disappear from the cache before the client
+# fetches it. Keep the remote failure and report the missing local copy.
+while read -r tag key ac spec theory; do
+  if [[ $tag == action && $theory == rxmultifailure:Bad* ]]; then
+    printf 'log=%064d\n' 0 >> "$state/result-$key"
+  fi
+done < "$state/$batch.batch"
+touch "$state/fail"
+in_copy multi-failure clean HealthyTheory > /dev/null
+status=0
+in_copy multi-failure --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only --attach "$batch" BadATheory BadBTheory HealthyTheory BlockedTheory \
+  > "$tmpdir/multi-failure-memory-missing-log.log" 2>&1 || status=$?
+rm "$state/fail"
+[[ $status -eq 75 ]] || { cat "$tmpdir/multi-failure-memory-missing-log.log" >&2; exit 1; }
+require_grep "could not fetch the failed theory's build log: BadATheory" "$tmpdir/multi-failure-memory-missing-log.log"
+require_grep "could not fetch the failed theory's build log: BadBTheory" "$tmpdir/multi-failure-memory-missing-log.log"
+require_file "$tmpdir/multi-failure/.holbuild/obj/src/HealthyTheory.dat"
+refute_grep 'Theory built\|building locally' "$tmpdir/multi-failure-memory-missing-log.log"
+
 in_copy multi-failure --remote-cache "$remote_url" build --remote-exec "$coordinator" \
   --remote-only --detach --fail-fast BadATheory > "$tmpdir/multi-fail-fast.log" 2>&1
 require_grep '^POST /v1/batches?fail_fast=true ' "$state/requests.log"
