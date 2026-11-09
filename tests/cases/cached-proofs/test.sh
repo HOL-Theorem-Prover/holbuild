@@ -112,12 +112,38 @@ val _ = export_theory();
 SML
 }
 write_q ""
+# A hook a library installed before the theory started keeps the kernel's
+# defining theorem, which a proof can use with no saved dependency.
+cat > "$project/src/stashLib.sml" <<'SML'
+structure stashLib =
+struct
+open HolKernel boolLib
+val kept = ref ([] : thm list)
+val _ = let val (d, p) = !Definition.new_definition_hook
+        in Definition.new_definition_hook := (d, fn (V, th) => (kept := th :: !kept; p (V, th))) end
+end
+SML
+write_r() {
+  cat > "$project/src/RScript.sml" <<SML
+open HolKernel Parse boolLib bossLib stashLib;
+val _ = new_theory "R";
+val k_def = new_definition ("k_def", \`\`k = ($2:num)\`\`);
+$1
+Theorem r1:
+  k + 0 = 1
+Proof
+  simp[hd (!stashLib.kept)]
+QED
+val _ = export_theory();
+SML
+}
+write_r "" 1
 
 build() {
   local log=$1
   shift
   sleep 1.1
-  (cd "$project" && "$HOLBUILD_BIN" build "$@" BTheory PTheory QTheory) > "$log" 2>&1 ||
+  (cd "$project" && "$HOLBUILD_BIN" build "$@" BTheory PTheory QTheory RTheory) > "$log" 2>&1 ||
     { cat "$log" >&2; exit 1; }
 }
 theory_log() { cat "$project"/.holbuild/logs/current/*/"$1"/build.log; }
@@ -154,6 +180,9 @@ write_q $'Theorem q0:\n  (2:num) = 2\nProof\n  simp[]\nQED'
 build "$tmpdir/hook.log" --cached-proofs
 require_grep "QTheory built" "$tmpdir/hook.log"
 require_not_reused QTheory q1
+write_r $'Theorem r0:\n  (2:num) = 2\nProof\n  simp[]\nQED' 1
+build "$tmpdir/stash.log" --cached-proofs
+require_reused RTheory r1
 
 # A build without the flag doesn't take the cached build's outputs, cache
 # entries or checkpoints: it replays every proof, and the outputs are the
@@ -198,3 +227,13 @@ if (cd "$project" && "$HOLBUILD_BIN" build --cached-proofs ATheory) > "$tmpdir/r
 fi
 require_grep "l1" "$tmpdir/redefined.log"
 require_not_reused ATheory l1
+
+# Redefining a constant whose kernel definition a proof used directly
+# misses that proof too.
+write_r "" 2
+sleep 1.1
+if (cd "$project" && "$HOLBUILD_BIN" build --cached-proofs RTheory) > "$tmpdir/stash-redefined.log" 2>&1; then
+  echo "the build reused a proof about the old definition of k" >&2; cat "$tmpdir/stash-redefined.log" >&2; exit 1
+fi
+require_grep "r1" "$tmpdir/stash-redefined.log"
+require_not_reused RTheory r1

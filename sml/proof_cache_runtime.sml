@@ -13,8 +13,8 @@
    dependencies only through their defining theorems.  The listener below
    certifies each one the definition principles announce right after storing
    a defining theorem that mentions it; one made any other way (a raw kernel
-   primitive, or a definition hook the theory installed) leaves the theory
-   uncertified, and then no proof in it is
+   primitive, or under a definition hook installed after this runtime)
+   leaves the theory uncertified, and then no proof in it is
    reused or recorded. *)
 structure HolbuildProofCacheRuntime =
 struct
@@ -64,14 +64,25 @@ fun certifies mentions knm =
       NONE => true
     | SOME th => Theory.uptodate_thm th andalso mentions knm th
 
-(* `new_definition` stores what its hook makes of the kernel's defining
-   theorem.  The hooks in effect when the ancestors were loaded store a
-   theorem equivalent to it and keep nothing else; a hook installed since
-   could keep the kernel's theorem and store a weaker one, so constants
-   defined under it aren't certified. *)
-val ancestors_definition_hook = !Theory.Definition.new_definition_hook
+(* `new_definition` passes the kernel's defining theorem to its hook, which
+   stores what it makes of it and could keep the theorem itself too, where a
+   proof can use it with no saved dependency.  So the hook is wrapped here,
+   and every record's key covers the conclusions of the theory's defining
+   theorems so far: a changed definition misses every proof below it.  A
+   hook installed after this one isn't wrapped, so constants defined under
+   it aren't certified. *)
+val kernel_definitions_ref = ref ([] : string list)
+val _ =
+  let val (dest, post) = !Theory.Definition.new_definition_hook
+  in
+    Theory.Definition.new_definition_hook :=
+      (dest, fn (V, th) =>
+                (kernel_definitions_ref := HolbuildFingerprint.term (Thm.concl th) :: !kernel_definitions_ref;
+                 post (V, th)))
+  end
+val wrapped_definition_hook = !Theory.Definition.new_definition_hook
 fun definition_hook_unchanged () =
-  PolyML.pointerEq (!Theory.Definition.new_definition_hook, ancestors_definition_hook)
+  PolyML.pointerEq (!Theory.Definition.new_definition_hook, wrapped_definition_hook)
 
 fun generic_type ({Thy, Name} : KernelSig.kernelname) =
   case Type.op_arity {Thy = Thy, Tyop = Name} of
@@ -124,7 +135,9 @@ fun lookup_key toolchain_key name tactic_text proof_attrs concl =
     (String.concat
        (map field
           (["holbuild-proof-record-v1", toolchain_key, Theory.current_theory (), name,
-            HolbuildFingerprint.term concl, tactic_text, Int.toString (length proof_attrs)] @
+            HolbuildFingerprint.term concl, tactic_text,
+            Int.toString (length (!kernel_definitions_ref))] @ !kernel_definitions_ref @
+           [Int.toString (length proof_attrs)] @
            List.concat
              (map (fn (key, values) => key :: Int.toString (length values) :: values) proof_attrs))))
 

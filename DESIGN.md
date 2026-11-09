@@ -697,11 +697,15 @@ definition changes a saved theorem a dependent record names, or the
 proof that used it is replayed. A listener on theory events certifies each
 new constant and type that comes with such a binding; a constant or type
 from a raw kernel primitive leaves the theory uncertified, and an
-uncertified theory neither reuses nor records. `new_definition` stores what
-its hook makes of the kernel's defining theorem; the hooks the ancestors
-installed store an equivalent theorem, but one the theory installs could keep
-the kernel's theorem and store a weaker one, so constants defined under a
-hook other than the ancestors' aren't certified.
+uncertified theory neither reuses nor records. `new_definition` passes the
+kernel's defining theorem to a hook (`Definition.new_definition_hook`) that
+stores what it makes of it, and the hook can also keep the theorem itself,
+where a proof can use it without a saved dependency. So the runtime wraps the
+hook in effect when it loads, and every lookup key covers the conclusions of
+the defining theorems `new_definition` made so far in the theory: a changed
+definition misses every proof below it. Constants defined under a hook
+installed after the runtime, which the wrapper doesn't see, aren't
+certified.
 
 Records live outside action entries, in
 `$HOLBUILD_CACHE/proof-records/v1/<key>`, keyed on the theory toolchain key,
