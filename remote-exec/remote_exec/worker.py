@@ -44,6 +44,7 @@ DEFAULT_SOURCE_URL = "https://github.com/HOL-Theorem-Prover/holbuild/archive/ref
 RELEASE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 COMPLETE = ".complete"  # stamp file of a finished release build
 MIN_SANDBOX_RELEASE = (0, 13, 58)
+MIN_TOOLCHAIN_SANDBOX_RELEASE = (0, 14, 0)
 
 
 @functools.cache
@@ -704,7 +705,7 @@ def recordless_failure(returncode: int, draining: bool) -> str | None:
     return None
 
 
-def exec_action_env(*, discovery_config: str | None = None) -> dict[str, str]:
+def exec_action_env(*, version: str, discovery_config: str | None = None) -> dict[str, str]:
     env = {
         name: value
         for name, value in os.environ.items()
@@ -714,6 +715,16 @@ def exec_action_env(*, discovery_config: str | None = None) -> dict[str, str]:
     }
     if discovery_config is not None:
         env["HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG"] = discovery_config
+    if tuple(map(int, version.split("."))) < MIN_TOOLCHAIN_SANDBOX_RELEASE:
+        name = "HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES"
+        entries = env.get(name, "").split()
+        if "*" in entries:
+            remaining = [entry for entry in entries if entry != "*"]
+            if remaining:
+                env[name] = " ".join(remaining)
+            else:
+                # Older clients lack toolchain confinement; retain their canonical HOL default.
+                del env[name]
     return env
 
 
@@ -859,7 +870,7 @@ def execute(
         stepped = time.monotonic()
         process = subprocess.Popen(
             exec_action_command(args, holbuild, spec, result, claim.get("max_heap_mb")),
-            env=exec_action_env(discovery_config=releases.discovery_config),
+            env=exec_action_env(version=version, discovery_config=releases.discovery_config),
             start_new_session=True
         )
         drained_out = False

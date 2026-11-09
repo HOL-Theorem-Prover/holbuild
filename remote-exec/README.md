@@ -310,6 +310,10 @@ a refresh. Use protected branches for these trust roots. The entry `*`
 accepts any `https://` repository at a full commit hash, with no branch
 check, since no step runs the toolchain's code outside the sandbox; such
 toolchains still cost worker time to build.
+The worker enables `*` only for clients from 0.14.0 onward, which confine
+toolchain execution. For older clients it removes `*`, preserving any explicit
+repository entries. If only `*` was configured, older clients use their
+canonical HOL defaults. Empty values remain invalid.
 Trust is worker configuration, not an action spec option. Administrators can grant additional read-only runtime directories
 with colon-separated `HOLBUILD_ACTION_READ_DIRS`; do not include credentials
 or shared writable state in these directories.
