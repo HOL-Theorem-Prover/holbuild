@@ -692,7 +692,9 @@ def main() -> int:
         policy = Policy(
             [Path(path).resolve(strict=True) for path in args.write],
             [Path(path).resolve(strict=True) for path in args.read],
-            [Path(path).resolve() for path in args.forbid] +
+            # Both the name and its target: the action could replace a link
+            # it can write to, and the worker later opens the name.
+            [path for name in args.forbid for path in (Path(os.path.abspath(name)), Path(name).resolve())] +
             ([args.completed.resolve()] if args.completed is not None else []),
         )
         # A scratch directory holding protected state, or a read-only grant

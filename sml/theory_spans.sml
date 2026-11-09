@@ -23,9 +23,9 @@ fun analyser () =
 
 fun run wants source_path =
   let
-    val req = OS.FileSys.tmpName ()
-    val resp = OS.FileSys.tmpName ()
-    val err = OS.FileSys.tmpName ()
+    val req = HolbuildTempPath.temporary "spans-request"
+    val resp = HolbuildTempPath.temporary "spans-response"
+    val err = HolbuildTempPath.temporary "spans-error"
     val request = String.concatWith "\n"
       [P.join ["version", P.protocol_version],
        P.join ["command", "analyse"],

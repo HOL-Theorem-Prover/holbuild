@@ -37,7 +37,7 @@ fun validate_rev rev =
 
 fun command_output command =
   let
-    val tmp = FS.tmpName ()
+    val tmp = HolbuildTempPath.temporary "git-output"
     val status = OS.Process.system (command ^ " > " ^ quote tmp ^ " 2>&1")
     val input = TextIO.openIn tmp
     val text = TextIO.inputAll input before TextIO.closeIn input

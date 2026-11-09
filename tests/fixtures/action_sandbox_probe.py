@@ -329,11 +329,13 @@ def scratch_probe(helper: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="holbuild-scratch-probe-") as directory:
         root = Path(directory)
         private, scratch, holding = root / "private", root / "scratch", root / "holding"
-        reading = root / "reading"
-        for path in (private, scratch, holding, reading, reading / "runtime"):
+        reading, linked, elsewhere = root / "reading", root / "linked", root / "elsewhere"
+        for path in (private, scratch, holding, reading, reading / "runtime", linked, elsewhere):
             path.mkdir()
         (holding / "secret").write_text("secret")
         (reading / "runtime" / "helper").write_text("trusted")
+        (elsewhere / "credential").write_text("secret")
+        (linked / "credential").symlink_to(elsewhere / "credential")
         completed = root / "completion"
         code = (
             "from pathlib import Path\n"
@@ -344,6 +346,9 @@ def scratch_probe(helper: Path) -> None:
             f"try: Path({str(reading / 'runtime' / 'helper')!r}).write_text('forged')\n"
             "except PermissionError: pass\n"
             "else: raise AssertionError('scratch made a read-only grant writable')\n"
+            f"try: Path({str(linked / 'temp')!r}).write_text('temp')\n"
+            "except PermissionError: pass\n"
+            "else: raise AssertionError('scratch holding a link to protected state was granted')\n"
         )
         module = runpy.run_path(str(helper), run_name="sandbox")
         previous = sys.argv
@@ -352,7 +357,8 @@ def scratch_probe(helper: Path) -> None:
             os.environ["HOLBUILD_SANDBOX_PARENT"] = str(os.getppid())
             sys.argv = [str(helper), "--write", str(private), "--scratch", str(scratch), "--scratch", str(holding),
                         "--scratch", str(reading), "--read", str(reading / "runtime"),
-                        "--forbid", str(holding / "secret"), "--completed", str(completed)]
+                        "--scratch", str(linked), "--forbid", str(holding / "secret"),
+                        "--forbid", str(linked / "credential"), "--completed", str(completed)]
             for path in ("/usr", "/bin", "/lib", "/lib64"):
                 if Path(path).exists():
                     sys.argv += ["--read", path]
@@ -368,6 +374,7 @@ def scratch_probe(helper: Path) -> None:
         assert (scratch / "temp").read_text() == "temp"
         assert not (holding / "temp").exists()
         assert (reading / "runtime" / "helper").read_text() == "trusted"
+        assert not (linked / "temp").exists()
     print("scratch directory writable; scratch holding protected state or read-only grants withheld")
 
 

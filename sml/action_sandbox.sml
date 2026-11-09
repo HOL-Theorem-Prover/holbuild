@@ -178,7 +178,10 @@ fun wrap completed argv =
                   | [] => NONE)
             (Posix.ProcEnv.environ ()) @
           (case !(HolbuildMachineMemory.settings) of SOME {dir, ...} => [dir] | NONE => []) @
-          (case !result_file of SOME file => [file] | NONE => [])
+          (case !result_file of SOME file => [file] | NONE => []) @
+          (* holbuild's own temporary files, which it hashes and publishes;
+             every holbuild process on the host keeps them under TMPDIR. *)
+          [HolbuildTempPath.private_temporary_dir ()]
         val forbidden = List.mapPartial
           (fn path => if path = "" then NONE else
              SOME (OS.Path.mkAbsolute {path = path, relativeTo = OS.FileSys.getDir ()})) protected_paths
@@ -188,7 +191,7 @@ fun wrap completed argv =
         options "--read" (map full readable) @ options "--forbid" forbidden @
         (* Poly/ML's OS.FileSys.tmpName always creates files in /tmp, ignoring
            TMPDIR; HolSat and HolSmt need it.  The helper leaves it out if
-           protected worker state lies beneath it. *)
+           protected worker state, holbuild's TMPDIR included, lies beneath it. *)
         options "--scratch" (List.filter exists ["/tmp"]) @
         ["--completed", completed, "--"] @ argv
       end

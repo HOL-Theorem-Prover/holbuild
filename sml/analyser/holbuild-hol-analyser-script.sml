@@ -55,6 +55,7 @@ use_hol("tools/Holmake/deps/Holdep.sml");
 
 use_root "sml/sha256.sml";
 use_root "sml/spawn.sml";
+use_root "sml/temp_path.sml";
 use_root "sml/hash.sml";
 use_root "sml/proof_ir_types.sml";
 use_root "sml/proof_ir.sml";

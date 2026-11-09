@@ -66,7 +66,7 @@ fun string_sha256_large text =
   if size text < small_file_limit then string_sha256 text
   else
     let
-      val path = OS.FileSys.tmpName ()
+      val path = HolbuildTempPath.temporary "hash-input"
       val result =
         (let
            val output = BinIO.openOut path
@@ -107,7 +107,7 @@ fun files_sha256 paths =
       end
     fun external chunk =
       let
-        val out = OS.FileSys.tmpName ()
+        val out = HolbuildTempPath.temporary "sha256sum-output"
         val command =
           "sha256sum -- " ^ String.concatWith " " (map quote chunk) ^
           " > " ^ quote out ^ " 2>/dev/null"

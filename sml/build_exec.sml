@@ -1653,7 +1653,7 @@ fun tail_text path =
   if not (file_exists path) then ""
   else
     let
-      val tmp = FS.tmpName ()
+      val tmp = HolbuildTempPath.temporary "log-tail"
       val _ = OS.Process.system ("tail -n 80 " ^ HolbuildToolchain.quote path ^
                                  " > " ^ HolbuildToolchain.quote tmp ^ " 2>/dev/null")
       val text = read_text tmp handle _ => ""
@@ -4357,8 +4357,8 @@ fun analyser_proof_ir_plan_sml (inputs : proof_ir_input list) =
           fun proof_line (i, {name, tactic_start, tactic_end, tactic_text} : proof_ir_input) =
             HolbuildAnalysisProtocol.join ["theorem", Int.toString i, name,
                                            Int.toString tactic_start, Int.toString tactic_end, tactic_text]
-          val req = OS.FileSys.tmpName ()
-          val resp = OS.FileSys.tmpName ()
+          val req = HolbuildTempPath.temporary "analyser-request"
+          val resp = HolbuildTempPath.temporary "analyser-response"
           val request = String.concatWith "\n"
             ([HolbuildAnalysisProtocol.join ["version", HolbuildAnalysisProtocol.protocol_version],
               HolbuildAnalysisProtocol.join ["command", "proof-ir-plan"]] @

@@ -696,8 +696,8 @@ fun run_analyser_for_proof_ir_text {name, tactic_start, tactic_end, tactic_text}
       NONE => raise Error "internal error: HOL analyser is not configured"
     | SOME analyser =>
         let
-          val req = OS.FileSys.tmpName ()
-          val resp = OS.FileSys.tmpName ()
+          val req = HolbuildTempPath.temporary "analyser-request"
+          val resp = HolbuildTempPath.temporary "analyser-response"
           val request = String.concatWith "\n"
             [HolbuildAnalysisProtocol.join ["version", HolbuildAnalysisProtocol.protocol_version],
              HolbuildAnalysisProtocol.join ["command", "proof-ir-plan"],
@@ -2099,7 +2099,7 @@ fun chomp text =
 
 fun command_output command =
   let
-    val output = OS.FileSys.tmpName ()
+    val output = HolbuildTempPath.temporary "command-output"
     val status = OS.Process.system (command ^ " > " ^ HolbuildHash.quote output ^ " 2>/dev/null")
     val text = if OS.Process.isSuccess status then chomp (read_text output) else ""
     val _ = OS.FileSys.remove output handle OS.SysErr _ => ()
