@@ -1596,11 +1596,13 @@ sha256("holbuild-tool-cache-v1\nname=" ^ NAME ^ "\ndeps_key=" ^ <deps_key> ^ "\n
 and gives the theory's HOL processes that directory as
 `HOLBUILD_TOOL_CACHE_DIR`. The key leaves out the theory's own source, so
 every theory with the same dependencies and toolchain shares the entry, on
-any worker. After HOL exits, built or failed, the worker publishes the
-directory again if its files changed: at most 16 regular files, 64 MiB in
-all, with names of letters, digits, `.`, `_` and `-`. An entry that can't
-be restored, or a directory that breaks these limits, only warns: the
-action goes on without the tool cache. The newest publication replaces the
+any worker. The worker keeps the entry's files in its host store
+(`<cache root>/checkpoint-store`), so it fetches each from the remote cache
+once. After HOL exits, built or failed, the worker publishes the directory
+again if its files changed: at most 16 regular files, 64 MiB in all, with
+names of letters, digits, `.`, `_` and `-`. An entry that can't be restored,
+or a directory that breaks these limits, only warns: the action goes on
+without the tool cache. The newest publication replaces the
 entry, so a tool should write each file whole (to a temporary name, then
 renamed) and treat the directory as a cache it may find empty.
 

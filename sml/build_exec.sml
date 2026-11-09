@@ -9248,6 +9248,7 @@ fun tool_cache_key (spec : action_spec) name =
                     "\ntoolchain=", action_text_value spec "toolchain"])
 
 fun tool_cache_failure (Error msg) = msg
+  | tool_cache_failure (MissingSharedBlob sha) = "the remote cache has no blob " ^ sha
   | tool_cache_failure e = General.exnMessage e
 
 fun tool_cache_listing dir =
@@ -9264,22 +9265,23 @@ fun tool_cache_listing dir =
 
 (* The files the remote cache holds under KEY, placed in DIR, as
    (name, sha256) pairs in name order. *)
-fun restore_tool_cache remote key dir =
+fun restore_tool_cache remote store key dir =
   let
+    (* The host store keeps the files under family KEY, so a worker fetches
+       each blob from the remote cache once. *)
     fun place (role, sha, name) =
       if role <> "file" orelse not (plain_file_name name) then
         raise Error ("malformed tool cache entry: " ^ role ^ " " ^ HolbuildHash.quote name)
       else
-        case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = sha, dst = Path.concat(dir, name)} of
-            HolbuildCacheBackend.Hit => (name, sha)
-          | HolbuildCacheBackend.Miss => raise Error ("the remote cache has no blob " ^ sha)
-          | HolbuildCacheBackend.Corrupt msg => raise Error ("could not fetch blob " ^ sha ^ ": " ^ msg)
+        (place_shared_blob remote store key {sha = sha, dst = Path.concat(dir, name), save = false};
+         (name, sha))
   in
     case HolbuildRemoteCache.get_action remote key of
         NONE => []
       | SOME text =>
           let val placed = map place (shared_manifest_entries text)
           in
+            touch_dir (Path.concat(store, key));
             HolbuildStatus.message_stdout
               ("restored tool cache (" ^ Int.toString (length placed) ^ " files)\n");
             placed
@@ -9289,7 +9291,7 @@ fun restore_tool_cache remote key dir =
                remove_tree dir; ensure_dir dir; [])
 
 (* Publishes DIR's files under KEY unless they are the RESTORED ones. *)
-fun publish_tool_cache remote key dir restored =
+fun publish_tool_cache remote store key dir restored =
   let
     fun file name =
       let val path = Path.concat(dir, name)
@@ -9310,10 +9312,11 @@ fun publish_tool_cache remote key dir restored =
     fun upload (name, path, sha) =
       if List.exists (fn entry => entry = (name, sha)) restored then ()
       else
-        case HolbuildRemoteCache.publish_hashed_blob remote {hash = sha, src = path} of
-            HolbuildCacheBackend.Published => ()
-          | HolbuildCacheBackend.AlreadyPresent => ()
-          | _ => raise Error ("could not upload " ^ name)
+        (case HolbuildRemoteCache.publish_hashed_blob remote {hash = sha, src = path} of
+             HolbuildCacheBackend.Published => ()
+           | HolbuildCacheBackend.AlreadyPresent => ()
+           | _ => raise Error ("could not upload " ^ name);
+         store_add store key {sha = sha, src = path, save = false})
     val manifest = shared_manifest tool_cache_header NONE (map (fn (name, _, sha) => ("file", sha, name)) entries)
   in
     if map (fn (name, _, sha) => (name, sha)) entries = restored then ()
@@ -9520,13 +9523,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                         in
                           ensure_dir dir;
                           tool_cache_dir := SOME dir;
-                          SOME (key, dir, phase "toolrestore" (fn () => restore_tool_cache remote key dir))
+                          SOME (key, dir, phase "toolrestore" (fn () => restore_tool_cache remote (share_store cache) key dir))
                         end
                 fun publish_tools () =
                   if not (!HolbuildActionSandbox.outputs_validated) then () else
                   case tool_cache of
                       SOME (key, dir, restored) =>
-                        phase "toolpublish" (fn () => publish_tool_cache remote key dir restored)
+                        phase "toolpublish" (fn () => publish_tool_cache remote (share_store cache) key dir restored)
                     | NONE => ()
               in
                 (ignore (phase "hol" (fn () =>

@@ -80,11 +80,11 @@ SML
 
 field() { awk -v want="$2" -v col="$3" '$1 == "action" && $5 == want { print $col }' "$1"; }
 
-# worker NAME SPEC: exec-action of SPEC on a fresh cache root, as on another
-# host; the record goes to $tmpdir/NAME.result and HOL's log to
-# $tmpdir/NAME.hol.
+# worker NAME SPEC [HOST]: exec-action of SPEC on a fresh cache root, as on
+# another host, or on HOST's; the record goes to $tmpdir/NAME.result and HOL's
+# log to $tmpdir/NAME.hol.
 worker() {
-  local name=$1 spec=$2 cache=$tmpdir/worker-$1
+  local name=$1 spec=$2 cache=$tmpdir/worker-${3:-$1}
   link_hol_toolchain_cache "$cache"
   set +e
   HOLBUILD_CACHE=$cache "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$spec" \
@@ -192,6 +192,39 @@ export_t v6
 worker v6 "$spec_t"
 [[ "$worker_status" != 0 ]] && ! grep -q "tool cache held" "$tmpdir/v6.hol" || {
   echo "T found a tool cache without --tool-cache" >&2; exit 1; }
+
+# A worker keeps the files in its host store: it restores them there after
+# the remote cache has lost them.
+write_t v7 'val _ = tool_put "seen" "v7";'
+export_t v7 --tool-cache probe
+worker v7 "$spec_t"
+expect v7 0 v3
+v7_blob=$tmpdir/remote/cas/$(printf v7 | sha256sum | cut -d' ' -f1)
+[[ -f "$v7_blob" ]] || { echo "v7's file is not in the remote cache" >&2; exit 1; }
+rm "$v7_blob"
+write_t v8 'val _ = tool_put "seen" "v8";'
+export_t v8 --tool-cache probe
+worker v8 "$spec_t" v7
+expect v8 0 v7
+require_grep "restored tool cache (1 files)" "$tmpdir/v8.log"
+cp "$tmpdir/remote/ac/$tool_ac" "$tmpdir/entry-v8"
+
+# A directory or a symbolic link is not published, and the entry stays as it
+# was.  The sandbox may refuse the link; the directory it allows.
+write_t v9 'val _ = tool_put "seen" "v9"; val _ = OS.FileSys.mkDir (OS.Path.concat (tool_dir, "sub")); val _ = Posix.FileSys.symlink {old = "seen", new = OS.Path.concat (tool_dir, "link")} handle OS.SysErr _ => ();'
+export_t v9 --tool-cache probe
+worker v9 "$spec_t"
+expect v9 0 v8
+require_grep "not publishing the tool cache: not a plain file" "$tmpdir/v9.log"
+cmp -s "$tmpdir/entry-v8" "$tmpdir/remote/ac/$tool_ac" || { echo "the v9 action changed the entry" >&2; exit 1; }
+
+# Nor are files over the size limit.
+write_t v10 'val _ = tool_put "seen" "v10"; val _ = tool_put "big" (CharVector.tabulate (64 * 1024 * 1024, fn _ => #"x"));'
+export_t v10 --tool-cache probe
+worker v10 "$spec_t"
+expect v10 0 v8
+require_grep "not publishing the tool cache: 2 files of 67108867 bytes exceed" "$tmpdir/v10.log"
+cmp -s "$tmpdir/entry-v8" "$tmpdir/remote/ac/$tool_ac" || { echo "the v10 action changed the entry" >&2; exit 1; }
 
 # The option leaves checkpoint reuse alone: a worker sharing heaps resumes a
 # --tool-cache build of U from the theorem context a build without it shared.
