@@ -156,7 +156,8 @@ with the worker's `HOLBUILD_*` build settings, `PATH`, `HOME`, `TMPDIR`, the
 locale, curl's certificate and proxy settings, and the solver locations HOL's
 libraries read (`HOL4_Z3_EXECUTABLE`, `HOL4_CVC_EXECUTABLE`,
 `HOL4_CSDP_EXECUTABLE`, `HOL4_EPROVER_EXECUTABLE`, `HOL4_VAMPIRE_EXECUTABLE`,
-`HOL4_ZIPPERPOSITION_EXECUTABLE`, `HOL4_JAVA_EXECUTABLE`). It excludes
+`HOL4_ZIPPERPOSITION_EXECUTABLE`, `HOL4_JAVA_EXECUTABLE`, and HolRefute's
+`HOL4_KODKODI` and `MINISAT_HOME`). It excludes
 `HOLBUILD_REMOTE_EXEC_*`, `HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN` and inherited
 discovery curl configs; with discovery enabled it receives only the worker's
 generated read-only discovery config (see below). The worker token stays out
