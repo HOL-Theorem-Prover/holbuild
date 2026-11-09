@@ -710,10 +710,12 @@ def main() -> int:
             [Path(path).resolve() for path in args.forbid] +
             ([args.completed.resolve()] if args.completed is not None else []),
         )
-        # A scratch directory holding protected state is left out rather than
-        # failing the action: only tools needing it then fail.
+        # A scratch directory holding protected state, or a read-only grant
+        # (Landlock grants are a union, so it would become writable), is
+        # left out rather than failing the action: only tools needing it fail.
         policy.scratch = [path for path in (Path(path).resolve(strict=True) for path in args.scratch)
-                          if not policy.exposes(path)]
+                          if not policy.exposes(path) and
+                          not any(read == path or path in read.parents for read in policy.readable)]
         if not policy.writable:
             raise SandboxError("missing private action directory")
         parent = os.environ.get("HOLBUILD_SANDBOX_PARENT")

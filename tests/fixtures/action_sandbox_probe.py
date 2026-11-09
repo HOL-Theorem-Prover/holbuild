@@ -326,9 +326,11 @@ def scratch_probe(helper: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="holbuild-scratch-probe-") as directory:
         root = Path(directory)
         private, scratch, holding = root / "private", root / "scratch", root / "holding"
-        for path in (private, scratch, holding):
+        reading = root / "reading"
+        for path in (private, scratch, holding, reading, reading / "runtime"):
             path.mkdir()
         (holding / "secret").write_text("secret")
+        (reading / "runtime" / "helper").write_text("trusted")
         completed = root / "completion"
         code = (
             "from pathlib import Path\n"
@@ -336,6 +338,9 @@ def scratch_probe(helper: Path) -> None:
             f"try: Path({str(holding / 'temp')!r}).write_text('temp')\n"
             "except PermissionError: pass\n"
             "else: raise AssertionError('scratch holding protected state was granted')\n"
+            f"try: Path({str(reading / 'runtime' / 'helper')!r}).write_text('forged')\n"
+            "except PermissionError: pass\n"
+            "else: raise AssertionError('scratch made a read-only grant writable')\n"
         )
         module = runpy.run_path(str(helper), run_name="sandbox")
         previous = sys.argv
@@ -343,6 +348,7 @@ def scratch_probe(helper: Path) -> None:
         try:
             os.environ["HOLBUILD_SANDBOX_PARENT"] = str(os.getppid())
             sys.argv = [str(helper), "--write", str(private), "--scratch", str(scratch), "--scratch", str(holding),
+                        "--scratch", str(reading), "--read", str(reading / "runtime"),
                         "--forbid", str(holding / "secret"), "--completed", str(completed)]
             for path in ("/usr", "/bin", "/lib", "/lib64"):
                 if Path(path).exists():
@@ -358,7 +364,8 @@ def scratch_probe(helper: Path) -> None:
         assert status == 0, status
         assert (scratch / "temp").read_text() == "temp"
         assert not (holding / "temp").exists()
-    print("scratch directory writable; scratch holding protected state withheld")
+        assert (reading / "runtime" / "helper").read_text() == "trusted"
+    print("scratch directory writable; scratch holding protected state or read-only grants withheld")
 
 
 if __name__ == "__main__":
