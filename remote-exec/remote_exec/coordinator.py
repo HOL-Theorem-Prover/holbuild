@@ -146,6 +146,7 @@ class ActionStatus:
     attempts: int
     last_failure: str | None
     log_sha256: str | None
+    failure_detail: str | None  # the last result's detail: why it failed when it has no log
     timings: dict[str, int] | None  # the last result's, in milliseconds; see formats.Result
 
 
@@ -346,7 +347,8 @@ AND (CAST(:batch_id AS uuid) IS NULL OR a.batch_id = :batch_id)
 
 # The actions of a batch written by transactions numbered :since or later; see Coordinator.changes.
 CHANGED_ACTIONS = sa.text("""
-SELECT input_key, theory, state, tier, attempts, last_failure, log_sha256, CAST(timings AS text) FROM actions
+SELECT input_key, theory, state, tier, attempts, last_failure, log_sha256, failure_detail, CAST(timings AS text)
+FROM actions
 WHERE batch_id = :batch_id AND changed_xid >= CAST(CAST(:since AS text) AS xid8)
 ORDER BY theory, input_key
 """)
@@ -791,13 +793,14 @@ class Coordinator:
                 )
             await conn.execute(
                 sa.text(
-                    "UPDATE actions SET log_sha256 = :log, last_failure = :failure, "
+                    "UPDATE actions SET log_sha256 = :log, last_failure = :failure, failure_detail = :detail, "
                     "timings = CAST(CAST(:timings AS text) AS jsonb) "
                     "WHERE batch_id = :batch_id AND input_key = :input_key"
                 ),
                 {
                     "log": result.log_sha256,
                     "failure": result.failure,
+                    "detail": result.detail,
                     "timings": json.dumps(result.timings) if result.timings is not None else None,
                     "batch_id": batch_id,
                     "input_key": lease.input_key,
@@ -837,8 +840,9 @@ class Coordinator:
                 self._forget_cache_findings()
                 await self._input_missing(conn, batch_id, action.input_key, action.theory, action.attempts, result)
             else:
+                detail = f": {result.detail}" if result.detail else ""
                 await self._fail(
-                    conn, batch_id, action.input_key, action.action_class, f"{action.theory}: {result.failure}"
+                    conn, batch_id, action.input_key, action.action_class, f"{action.theory}: {result.failure}{detail}"
                 )
         self.request_release(batch_id)
         return True
@@ -974,7 +978,7 @@ class Coordinator:
                 if action.attempts >= self.settings.max_attempts:
                     await conn.execute(
                         sa.text(
-                            "UPDATE actions SET last_failure = 'internal' "
+                            "UPDATE actions SET last_failure = 'internal', failure_detail = NULL "
                             "WHERE batch_id = :batch_id AND input_key = :input_key AND class = 'run'"
                         ),
                         {"batch_id": batch_id, "input_key": lease.input_key},

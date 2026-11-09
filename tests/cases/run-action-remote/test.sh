@@ -37,9 +37,12 @@ cat > "$tmpdir/run-batch" <<SH
 #!/usr/bin/env bash
 set -eu
 cd "$tmpdir/worker-cwd"
+# A worker that trusts no HOL repository rejects every spec.
+untrusted=()
+[[ ! -e "$state/untrusted" ]] || untrusted=(HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES=/unconfigured=master)
 awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec theory; do
   echo "\$theory" >> "$state/ran"
-  HOLBUILD_CACHE="$tmpdir/worker-cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" \
+  env "\${untrusted[@]}" HOLBUILD_CACHE="$tmpdir/worker-cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" \
     exec-action "\$spec" --cache-limit-gb 1000 --result "$state/result-\$key" \
     >> "$tmpdir/worker.log" 2>&1 || true
   if [[ -e "$state/drop-log" ]]; then
@@ -332,3 +335,20 @@ require_grep 'could not fetch the log of failed run rr:CTheory' "$tmpdir/missing
 require_no_file "$out/rr/CTheory/LOG"
 require_no_file "$out/rr/CTheory/first"
 require_no_file "$out/rr/CTheory/second"
+
+# A run the worker rejects before any HOL runs has no log; its reason
+# reaches the client with the failure.
+cat > "$runner/untrusted.sml" <<'SML'
+val _ = "a run no worker trusts";
+SML
+touch "$state/untrusted"
+run untrusted 0 --remote-exec "$coordinator" --script "$runner/untrusted.sml" rr:CTheory
+rm "$state/untrusted"
+untrusted_key=$(line untrusted rr:CTheory "failed spec-rejected")
+require_grep '^detail=exec-action HOL repository is not trusted by this worker: ' "$state/result-$untrusted_key"
+if grep -q '^log=' "$state/result-$untrusted_key"; then
+  echo 'a rejected run uploaded a log' >&2
+  exit 1
+fi
+require_grep 'holbuild: remote rr:CTheory: failed (spec-rejected: exec-action HOL repository is not trusted by this worker: ' \
+  "$tmpdir/untrusted.err"
