@@ -9204,7 +9204,7 @@ val tool_cache_max_bytes = 64 * 1024 * 1024
 fun tool_cache_key (spec : action_spec) name =
   HolbuildHash.string_sha256
     (String.concat [tool_cache_header, "\nname=", name, "\ndeps_key=", #deps_key spec,
-                    "\ntoolchain=", action_text_value spec "toolchain", "\n"])
+                    "\ntoolchain=", action_text_value spec "toolchain"])
 
 fun tool_cache_failure (Error msg) = msg
   | tool_cache_failure e = General.exnMessage e
