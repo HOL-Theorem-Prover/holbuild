@@ -544,6 +544,33 @@ class SignalBroker:
             close_processes(processes)
 
 
+def spellings(name: str) -> set[Path]:
+    """The path as given, each link met while resolving it, and its target.
+
+    The worker opens the name it was given, so an action able to replace any
+    link on the way could redirect it."""
+    found = {Path(os.path.abspath(name))}
+    current, parts, links = Path("/"), list(Path(os.path.abspath(name)).parts[1:]), 0
+    while parts:
+        part = parts.pop(0)
+        if part == "..":
+            current = current.parent
+        elif part not in ("", "."):
+            candidate = current / part
+            if candidate.is_symlink() and links < 40:
+                links += 1
+                found.add(candidate)
+                target = Path(os.readlink(candidate))
+                if target.is_absolute():
+                    current, parts = Path("/"), list(target.parts[1:]) + parts
+                else:
+                    parts = list(target.parts) + parts
+            else:
+                current = candidate
+    found.add(current)
+    return found
+
+
 def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = None) -> int:
     policy.validate()
     policy.validate_outputs()
@@ -692,9 +719,7 @@ def main() -> int:
         policy = Policy(
             [Path(path).resolve(strict=True) for path in args.write],
             [Path(path).resolve(strict=True) for path in args.read],
-            # Both the name and its target: the action could replace a link
-            # it can write to, and the worker later opens the name.
-            [path for name in args.forbid for path in (Path(os.path.abspath(name)), Path(name).resolve())] +
+            [path for name in args.forbid for path in spellings(name)] +
             ([args.completed.resolve()] if args.completed is not None else []),
         )
         # A scratch directory holding protected state, or a read-only grant

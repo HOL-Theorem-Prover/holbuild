@@ -106,7 +106,7 @@ granted=$(awk '$1 == "action" && $5 == "isolation:TmpGrantedTheory" {print $4}' 
 run_tmp_action() {
   local worker=$1 tmp_spec=$2
   link_hol_toolchain_cache "$worker/cache"
-  HOLBUILD_COOPERATE_DIR= HOLBUILD_CACHE="$worker/cache" "$HOLBUILD_BIN" --max-heap 1024 \
+  TMPDIR=$worker HOLBUILD_COOPERATE_DIR= HOLBUILD_CACHE="$worker/cache" "$HOLBUILD_BIN" --max-heap 1024 \
     --remote-cache "$remote_url" exec-action "$tmp_spec" --cache-limit-gb 1000 --result "$worker/result" \
     > "$worker/log" 2>&1 || { cat "$worker/log" "$worker/result" >&2; exit 1; }
   grep -q "^status=built$" "$worker/result" || { cat "$worker/log" "$worker/result" >&2; exit 1; }

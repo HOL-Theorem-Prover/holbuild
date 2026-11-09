@@ -334,8 +334,10 @@ def scratch_probe(helper: Path) -> None:
             path.mkdir()
         (holding / "secret").write_text("secret")
         (reading / "runtime" / "helper").write_text("trusted")
+        # A protected name outside scratch reached through a link inside it.
         (elsewhere / "credential").write_text("secret")
-        (linked / "credential").symlink_to(elsewhere / "credential")
+        (linked / "hop").symlink_to(elsewhere / "credential")
+        (elsewhere / "configured").symlink_to(linked / "hop")
         completed = root / "completion"
         code = (
             "from pathlib import Path\n"
@@ -358,7 +360,7 @@ def scratch_probe(helper: Path) -> None:
             sys.argv = [str(helper), "--write", str(private), "--scratch", str(scratch), "--scratch", str(holding),
                         "--scratch", str(reading), "--read", str(reading / "runtime"),
                         "--scratch", str(linked), "--forbid", str(holding / "secret"),
-                        "--forbid", str(linked / "credential"), "--completed", str(completed)]
+                        "--forbid", str(elsewhere / "configured"), "--completed", str(completed)]
             for path in ("/usr", "/bin", "/lib", "/lib64"):
                 if Path(path).exists():
                     sys.argv += ["--read", path]

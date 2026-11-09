@@ -164,7 +164,8 @@ fun wrap completed argv =
             "/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d", "/etc/localtime",
             "/etc/ssl/certs", "/etc/nsswitch.conf", "/etc/hosts", "/etc/resolv.conf", "/etc/gai.conf"] @
            poly_libraries @ fields "HOLBUILD_ACTION_READ_DIRS")
-        val cache = full (HolbuildCacheConfig.cache_root ())
+        (* As configured: the helper also forbids each link on the way to it. *)
+        val cache = OS.Path.mkAbsolute {path = HolbuildCacheConfig.cache_root (), relativeTo = OS.FileSys.getDir ()}
         val protected_paths =
           map (fn part => OS.Path.concat (cache, part))
               ["actions", "blobs", "locks", "cooperate", "checkpoint-store", "toolchain-trust"] @
