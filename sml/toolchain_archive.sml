@@ -21,7 +21,8 @@ fun path_exists path = FS.access(path, []) handle OS.SysErr _ => false
 fun is_dir path = FS.isDir path handle OS.SysErr _ => false
 
 val remove_file = HolbuildFileLock.remove_file
-val remove_tree = HolbuildFileLock.remove_tree
+(* Extracted archives are untrusted: a directory may lack owner access. *)
+fun remove_tree path = HolbuildRemoveTree.remove_untrusted path handle HolbuildRemoveTree.Error msg => raise Error msg
 val read_text = HolbuildFileLock.read_text
 val write_text = HolbuildFileLock.write_text
 
@@ -38,7 +39,9 @@ fun require_manifest identity text =
 fun validate_extracted_manifest {staging_dir, identity} =
   let val path = Path.concat(staging_dir, internal_manifest_path)
   in
-    if not (path_exists path) orelse is_dir path orelse FS.isLink path then
+    (* Only a regular file: opening a FIFO from the archive would block. *)
+    if not (path_exists path) orelse
+       not (Posix.FileSys.ST.isReg (Posix.FileSys.lstat path) handle OS.SysErr _ => false) then
       die "extracted toolchain archive manifest is missing"
     else if FS.fileSize path > Position.fromInt max_manifest_size then
       die "toolchain archive manifest is too large"

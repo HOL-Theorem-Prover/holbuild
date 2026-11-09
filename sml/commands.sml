@@ -185,7 +185,8 @@ fun execution_plan_help () = print
 fun check_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] check THEORY[:THEOREM] [THEORY[:THEOREM] ...] [--remote-exec URL [--remote-only]]\n\
-  \  holbuild [GLOBAL OPTIONS] check --fingerprint THEORY [THEORY ...] [--remote-exec URL [--remote-only]]\n\n\
+  \  holbuild [GLOBAL OPTIONS] check --fingerprint THEORY [THEORY ...] [--remote-exec URL [--remote-only]]\n\
+  \  holbuild [GLOBAL OPTIONS] check --with-fingerprints THEORY[:THEOREM] [...] [--remote-exec URL [--remote-only]]\n\n\
   \Build THEORY if needed, load it in HOL and check the tags and hypotheses of its stored\n\
   \theorems, or of THEOREM alone. Prints one line per theorem that depends on an\n\
   \oracle other than DISK_THM (cheat, for instance), per theorem with\n\
@@ -204,6 +205,9 @@ fun check_help () = print
   \ORACLES lists the oracles other than DISK_THM, comma-separated, or is -.\n\
   \A script computes the same fingerprint with HolbuildFingerprint.thm or\n\
   \HolbuildFingerprint.term.\n\n\
+  \With --with-fingerprints, check the selectors and also print the fingerprint\n\
+  \lines of their theories, in the same HOL session; the exit status is the\n\
+  \check's.\n\n\
   \The build runs without proof steps or checkpoints, so it reuses theories\n\
   \built by build --skip-proof-steps and applies no step timeout. With\n\
   \--remote-exec URL [--remote-only], uncached theories are built on the\n\
@@ -697,23 +701,14 @@ fun run_analyser_for_proof_ir_text {name, tactic_start, tactic_end, tactic_text}
       NONE => raise Error "internal error: HOL analyser is not configured"
     | SOME analyser =>
         let
-          val req = HolbuildTempPath.temporary "analyser-request"
-          val resp = HolbuildTempPath.temporary "analyser-response"
           val request = String.concatWith "\n"
             [HolbuildAnalysisProtocol.join ["version", HolbuildAnalysisProtocol.protocol_version],
              HolbuildAnalysisProtocol.join ["command", "proof-ir-plan"],
              HolbuildAnalysisProtocol.join ["theorem", "0", name, Int.toString tactic_start, Int.toString tactic_end, tactic_text],
              HolbuildAnalysisProtocol.join ["end"]] ^ "\n"
-          val _ = write_text_file req request
-          val status = OS.Process.system (HolbuildHash.quote analyser ^ " " ^
-                                          String.concatWith " " (HolbuildDependencies.analyser_min_heap_args ()) ^
-                                          " --request " ^ HolbuildHash.quote req ^
-                                          " --response " ^ HolbuildHash.quote resp)
-          val _ = OS.FileSys.remove req handle OS.SysErr _ => ()
-          val text = if OS.Process.isSuccess status then read_text resp
-                     else (OS.FileSys.remove resp handle OS.SysErr _ => ();
-                           raise Error "holbuild-hol-analyser failed")
-          val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
+          val text = case HolbuildDependencies.analyser_response analyser request of
+                         SOME text => text
+                       | NONE => raise Error "holbuild-hol-analyser failed"
         in text end
 
 fun int_field s =
@@ -3027,7 +3022,9 @@ fun run_check_script tc cli_jobs build_mode theories make_script =
     if HolbuildToolchain.success status then () else OS.Process.exit OS.Process.failure
   end
 
-fun check_selectors tc cli_jobs build_mode selectors =
+(* with_fingerprints also prints the fingerprint listing of the selected
+   theories, in the same HOL session, before the exit status is decided. *)
+fun check_selectors tc cli_jobs build_mode {with_fingerprints} selectors =
   let
     val selections = map parse_check_selector selectors
     fun make_script {project, index, components, logical_names} =
@@ -3041,6 +3038,7 @@ fun check_selectors tc cli_jobs build_mode selectors =
       in
         "local val HolbuildCheckFailed = ref false in\n" ^
         String.concat (ListPair.mapEq block (logical_names, selections)) ^
+        (if with_fingerprints then fingerprint_script logical_names else "") ^
         "val _ = if !HolbuildCheckFailed then OS.Process.exit OS.Process.failure else ();\nend;\n"
       end
   in
@@ -3060,7 +3058,11 @@ fun check_fingerprint tc cli_jobs build_mode selectors =
 fun check_command tc cli_jobs args =
   let
     val ({url, remote_only}, args) = split_remote_prebuild_flags "check" args
-    val selectors = case args of "--fingerprint" :: rest => rest | _ => args
+    val selectors =
+      case args of
+          "--fingerprint" :: rest => rest
+        | "--with-fingerprints" :: rest => rest
+        | _ => args
     val _ =
       case List.find (String.isPrefix "-") selectors of
           SOME flag => raise Error ("unknown check option: " ^ flag)
@@ -3074,7 +3076,10 @@ fun check_command tc cli_jobs args =
         "--fingerprint" :: (theories as _ :: _) => check_fingerprint tc cli_jobs build_mode theories
       | [] => raise Error "usage: holbuild check THEORY[:THEOREM] [THEORY[:THEOREM] ...] | check --fingerprint THEORY [THEORY ...]"
       | ["--fingerprint"] => raise Error "check --fingerprint requires at least one theory"
-      | selectors => check_selectors tc cli_jobs build_mode selectors
+      | "--with-fingerprints" :: (selectors as _ :: _) =>
+          check_selectors tc cli_jobs build_mode {with_fingerprints = true} selectors
+      | ["--with-fingerprints"] => raise Error "check --with-fingerprints requires at least one selector"
+      | selectors => check_selectors tc cli_jobs build_mode {with_fingerprints = false} selectors
   end
 
 fun removed_legacy_plan_command _ _ =
@@ -3275,12 +3280,13 @@ fun exec_action_command maxheap jobs args =
         (* Every worker must run the published archive's bytes, so a build
            whose own publish lost is replaced by the stored archive. *)
         val _ = HolbuildHolSharedCache.adopt_published_archive := true
+        (* The toolchain's own steps run confined too, and read this runtime. *)
+        val _ = HolbuildActionSandbox.poly_executable := HolbuildHolSharedCache.poly_executable_path ()
         val kernel_variant = HolbuildHolToolchainConfig.StandardKernel
         val holdir = HolbuildHolSharedCache.ensure_built_with_kernel jobs
                        {git = git, rev = rev, kernel_variant = kernel_variant}
         val tc = {holdir = holdir, maxheap = maxheap, kernel_variant = kernel_variant}
         val _ = HolbuildActionSandbox.toolchain_root := holdir
-        val _ = HolbuildActionSandbox.poly_executable := HolbuildHolSharedCache.poly_executable_path ()
       in
         configure_analyser_for_toolchain tc; tc
       end
