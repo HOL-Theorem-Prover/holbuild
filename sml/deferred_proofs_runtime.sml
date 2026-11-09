@@ -122,7 +122,9 @@ struct
       fun failure name msg = Fail ("deferred proof of " ^ name ^ " failed: " ^ msg)
       fun run item =
         prove item
-        handle e => locked (fn () => failed := (item, Feedback.exn_to_string e) :: !failed)
+        handle e =>
+          let val msg = Feedback.exn_to_string e handle Interrupt => "interrupted"
+          in locked (fn () => failed := (item, msg) :: !failed) end
       val count = Int.max (0, Int.min (threads, length (!items)))
       (* With several threads a proof can fail because another one raced it
          on some library's own cache (blastLib's compset, say), so each
