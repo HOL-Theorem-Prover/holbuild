@@ -354,7 +354,7 @@ write_b_and_c hidden
 build_pipelined hidden CTheory
 log=$tmpdir/hidden.log
 require_grep "pipeline: attempt failed: ATheory" "$log"
-require_grep "as a suspended subgoal does" "$log"
+require_grep "the proof left a hypothesis its goal lacks: suspendlabel" "$log"
 require_grep "pipeline: gate failed: ATheory (digest differs)" "$log"
 require_same_as_unpipelined hidden CTheory A B C
 

@@ -80,11 +80,11 @@ struct
           val initial = thydata_of types
           val th = Tactical.TAC_PROOF_in ctxt (goal, make ())
         in
-          (* A proof that suspends a subgoal (markerLib.suspend) proves the
-             goal under a hypothesis; the stub's theorem has none. *)
+          (* A proof that suspends a subgoal (markerLib.suspend), or cites a
+             still-suspended theorem, proves the goal under a hypothesis the
+             stub's theorem lacks. *)
           case List.find (fn h => not (List.exists (fn a => Term.aconv a h) (#1 goal))) (Thm.hyp th) of
-              SOME h => raise Fail ("the proof left the hypothesis " ^ Parse.term_to_string h ^
-                                    ", as a suspended subgoal does")
+              SOME h => raise Fail ("the proof left a hypothesis its goal lacks: " ^ Parse.term_to_string h)
             | NONE =>
           case changed_thydata initial of
               NONE => th
