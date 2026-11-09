@@ -46,6 +46,7 @@ RECORD = f"holbuild-action-result-v1\nspec={SPEC}\ninput-key={'6' * 64}\nstatus=
 # A stand-in holbuild source tree: `make bin/holbuild` installs a script that logs its arguments and environment and
 # writes RECORD (or HOLBUILD_FAKE_RECORD) to its --result file, or crashes without one when HOLBUILD_FAKE_CRASH is set.
 FAKE_HOLBUILD = f"""#!/bin/sh
+[ "$1" != sandbox-check ] || exit 0
 echo $$ > "$HOLBUILD_FAKE_LOG.pid"
 if [ -n "$HOLBUILD_FAKE_HANG" ]; then
   trap '' TERM
@@ -191,6 +192,24 @@ def test_baked_release_needs_no_writable_cache_or_download(tmp_path: Path, serve
     assert release.holbuild("1.2.3") == str(baked)
     with pytest.raises(Unreleased):
         release.holbuild("../1.2.3")
+
+
+@pytest.mark.parametrize("version", ["0.13.52", "0.13.53", "0.13.54", "0.13.55", "0.13.56", "0.13.57"])
+def test_old_release_is_rejected_before_baked_lookup(tmp_path: Path, server: Server, version: str) -> None:
+    release = releases(tmp_path, server)
+    with pytest.raises(Unreleased, match="mandatory action isolation"):
+        release.holbuild(version)
+    assert not (tmp_path / "releases").exists()
+
+
+def test_baked_release_must_support_sandbox(tmp_path: Path, server: Server) -> None:
+    baked = tmp_path / "baked/v1.2.3/bin/holbuild"
+    baked.parent.mkdir(parents=True)
+    baked.write_text("#!/bin/sh\nexit 125\n")
+    baked.chmod(0o755)
+    release = replace(releases(tmp_path, server), baked_root=str(tmp_path / "baked"))
+    with pytest.raises(subprocess.CalledProcessError):
+        release.holbuild("1.2.3")
 
 
 @pytest.mark.parametrize("candidate", ["missing", "non-executable", "directory"])

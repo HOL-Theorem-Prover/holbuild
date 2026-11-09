@@ -152,6 +152,7 @@ jobs:
     timeout-minutes: 120
     env:
       HOLBUILD_TEST_HOL_GIT: https://github.com/SequentAI/HOL.git
+      HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES: https://github.com/SequentAI/HOL.git=sequent
     steps:
       - uses: actions/checkout@v6
 

@@ -10,7 +10,9 @@ Each action runs on the holbuild release that exported it, which the worker buil
 
 import argparse
 import contextlib
+import ctypes
 import fcntl
+import functools
 import http.client
 import itertools
 import json
@@ -40,6 +42,15 @@ from remote_exec.membership import REFRESH_SECONDS, Membership, check_plain_http
 DEFAULT_SOURCE_URL = "https://github.com/HOL-Theorem-Prover/holbuild/archive/refs/tags/v{version}.tar.gz"
 RELEASE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 COMPLETE = ".complete"  # stamp file of a finished release build
+MIN_SANDBOX_RELEASE = (0, 13, 58)
+
+
+@functools.cache
+def check_sandbox(executable: str) -> None:
+    """Fail closed before a release can execute submitted code."""
+    subprocess.run([executable, "sandbox-check"], check=True, stdin=subprocess.DEVNULL, timeout=30)
+
+
 # ECS task scale-in protection lasts this long unless a heartbeat renews it, so a dead worker loses it.
 PROTECTION_MINUTES = 10
 CLAIM_RETRY_SECONDS = 5  # least time between two claims that found nothing
@@ -342,12 +353,16 @@ class Releases:
         """
         if not RELEASE.fullmatch(version):
             raise Unreleased(f"holbuild {version!r} is not a release version")
+        if tuple(map(int, version.split("."))) < MIN_SANDBOX_RELEASE:
+            raise Unreleased(f"holbuild {version} predates mandatory action isolation")
         baked = os.path.join(self.baked_root, f"v{version}", "bin", "holbuild")
         if os.path.isfile(baked) and os.access(baked, os.X_OK):
+            check_sandbox(baked)
             return baked
         directory = os.path.join(self.root, f"v{version}")
         executable = os.path.join(directory, "bin", "holbuild")
         if os.path.exists(os.path.join(directory, COMPLETE)):
+            check_sandbox(executable)
             return executable
         os.makedirs(self.root, exist_ok=True)
         with open(os.path.join(self.root, f"v{version}.lock"), "a") as lock:
@@ -355,6 +370,7 @@ class Releases:
                 fcntl.flock(lock, fcntl.LOCK_EX)
             if not os.path.exists(os.path.join(directory, COMPLETE)):
                 self._build(version, directory)
+        check_sandbox(executable)
         return executable
 
     def _build(self, version: str, directory: str) -> None:
@@ -962,6 +978,8 @@ def refresh_cache_members(coordinator: Coordinator, membership: Membership, url:
 
 
 def main() -> None:
+    if ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0) != 0:
+        sys.exit("cannot protect worker process")
     args = parse_args()
     token = os.environ.get("REMOTE_EXEC_WORKER_TOKEN")
     if not token:

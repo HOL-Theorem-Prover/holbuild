@@ -351,7 +351,11 @@ val child_policy_traces = ["TheoryPP.include_docs", "TheoryPP.include_html_docs"
 
 fun write_child_policy tc path =
   let
-    val directory = HolbuildCache.theory_modules_dir
+    val directory = if HolbuildActionSandbox.active () then
+                      (case !(HolbuildActionSandbox.private_roots) of
+                           SOME (root, _) => Path.concat(root, ".holbuild/theory-modules")
+                         | NONE => raise Error "missing sandbox root")
+                    else HolbuildCache.theory_modules_dir
                       (Path.mkAbsolute {path = HolbuildCacheConfig.cache_root (),
                                         relativeTo = FS.getDir ()})
     val configure =
@@ -1662,7 +1666,7 @@ fun current_logs_enabled () = not (HolbuildStatus.json_mode ())
 
 fun create_current_log_link src NONE = ()
   | create_current_log_link src (SOME dst) =
-      if not (current_logs_enabled ()) then ()
+      if HolbuildActionSandbox.active () orelse not (current_logs_enabled ()) then ()
       else
         (ensure_parent dst;
          remove_file dst;
@@ -1732,7 +1736,10 @@ fun run_hol_files_to_log tc stage workdir context files log_name current_log err
       HolbuildToolchain.run_in_dir_to_file workdir
         (HolbuildToolchain.theory_run_argv tc @ ["--noconfig"] @ hol_context_args context @ file_args)
         log
-      handle HolbuildToolchain.Error msg => raise Error msg
+      handle HolbuildToolchain.Error msg =>
+        if HolbuildActionSandbox.active () andalso not (!HolbuildActionSandbox.outputs_validated) then
+          raise HolbuildActionSandbox.Error msg
+        else raise Error msg
     val _ = last_child_status := SOME status
     val detail_log = finalize_current_log log current_log
   in
@@ -3385,7 +3392,8 @@ fun store_temp path =
 fun link_or_copy_file src dst =
   (ensure_parent dst;
    remove_file dst;
-   Posix.FileSys.link {old = src, new = dst}
+   if HolbuildActionSandbox.active () then copy_binary src dst
+   else Posix.FileSys.link {old = src, new = dst}
    handle OS.SysErr _ => copy_binary src dst)
 
 fun touch_dir dir = Posix.FileSys.utime (dir, NONE) handle OS.SysErr _ => ()
@@ -3414,7 +3422,8 @@ val noted_store_mount = ref false
    store on its own mount puts it, symbolically linked, which is safe while
    this process leases the state's family. *)
 fun place_state stored dst =
-  (remove_file dst;
+  if HolbuildActionSandbox.active () then copy_binary stored dst
+  else (remove_file dst;
    Posix.FileSys.link {old = stored, new = dst}
    handle OS.SysErr (_, err) =>
      if err <> SOME Posix.Error.xdev then copy_binary stored dst
@@ -7410,8 +7419,8 @@ fun action_text_value spec key =
 
 (* Step 1: the spec is for this holbuild, intact, and of an action a worker
    may run. *)
-fun escapes path = Path.isAbsolute path orelse path = ".." orelse String.isPrefix "../" path orelse
-                   String.isSubstring "/../" path
+fun escapes path =
+  Path.isAbsolute path orelse List.exists (fn c => c = "..") (String.fields (fn c => c = #"/") path)
 
 fun sha256_text text =
   size text = 64 andalso CharVector.all (fn c => Char.isDigit c orelse (c >= #"a" andalso c <= #"f")) text
@@ -7453,6 +7462,9 @@ fun verify_action_spec (spec : action_spec) =
     check (not (#trace_steps spec) orelse #proof_steps spec) "trace-steps requires proof-steps";
     check (sha256_text (#deps_key spec)) "deps-key is not a SHA-256";
     check (List.all (sha256_text o #key) (#deps spec)) "a dependency's key is not a SHA-256";
+    (* File hashes name blobs in the cache, so they must not be paths. *)
+    check (List.all (sha256_text o #sha256) (#source spec :: #inputs spec @ #libraries spec))
+      "a file's SHA-256 is malformed";
     check (text_hash = #input_key spec) "the action text does not hash to input-key";
     check (#action_text_sha256 spec = text_hash) "action-text-sha256 does not match the action text";
     check (action_text_value spec "package" = #package spec) "the action text names another package";
@@ -7472,7 +7484,7 @@ fun verify_action_spec (spec : action_spec) =
     List.app (fn path => check (not (escapes path)) ("path " ^ path ^ " leaves the action root"))
       (#package spec :: #logical spec :: map (#1 o target_name o #target) (#deps spec) @
        map (#1 o target_name o #target) (#libs spec) @
-       #path (#source spec) :: map #path (#inputs spec @ #libraries spec) @
+       #path (#source spec) :: #extra_outputs spec @ map #path (#inputs spec @ #libraries spec) @
        map #stem (#deps spec) @ map #stem (#libs spec) @
        List.filter (CharVector.exists (fn c => c = #"/")) (List.concat (map #loads (#libs spec))) @
        [#sig_path (#outputs spec), #sml_path (#outputs spec), #data_path (#outputs spec)])
@@ -8033,21 +8045,14 @@ fun toolchain_trash_family () =
                  end)
              (0 : Position.int) (HolbuildHolSharedCache.toolchain_trash ()))}
 
-(* Follow a configured root alias, but never links found inside its tree. *)
-fun cache_root_bytes path = tree_bytes (FS.fullPath path) handle OS.SysErr _ => 0
+(* A linked toolchain cache belongs to its target's owner, not this cap. *)
+fun toolchains_owned_by_cache () =
+  let val dir = HolbuildHolSharedCache.toolchains_dir ()
+  in path_exists dir andalso not (Posix.FileSys.ST.isLink (Posix.FileSys.lstat dir)) end
+  handle OS.SysErr _ => false
 
-fun worker_cache_roots cache =
-  let fun tree path = (path, fn () => cache_root_bytes path)
-  in
-    [tree (share_store cache),
-     (HolbuildHolSharedCache.toolchains_dir (),
-      fn () =>
-        List.foldl (fn (path, total) => total + tree_bytes path)
-                   (0 : Position.int) (HolbuildHolSharedCache.toolchain_trash ()) +
-        List.foldl (fn (k, total) => total + tree_bytes (HolbuildHolSharedCache.entry_dir_for_key k))
-                   (0 : Position.int) (HolbuildHolSharedCache.toolchain_keys ())),
-     tree (HolbuildCache.actions_dir cache), tree (HolbuildCache.blobs_dir cache)]
-  end
+(* Follow other configured root aliases, but never links found inside a tree. *)
+fun cache_root_bytes path = tree_bytes (FS.fullPath path) handle OS.SysErr _ => 0
 
 fun cache_root_id path =
   case file_id path of
@@ -8055,6 +8060,26 @@ fun cache_root_id path =
     | SOME (dev, ino) =>
         SysWord.toString (Posix.FileSys.devToWord dev) ^ ":" ^
         SysWord.toString (Posix.FileSys.inoToWord ino)
+
+fun worker_cache_roots cache =
+  let
+    fun tree path = {id = fn () => cache_root_id path, measure = fn () => cache_root_bytes path}
+    fun toolchain_id () =
+      let val path = HolbuildHolSharedCache.toolchains_dir ()
+      in
+        if (Posix.FileSys.ST.isLink (Posix.FileSys.lstat path) handle OS.SysErr _ => false)
+        then "excluded" else cache_root_id path
+      end
+    fun toolchain_bytes () =
+      if not (toolchains_owned_by_cache ()) then 0 else
+        List.foldl (fn (path, total) => total + tree_bytes path)
+                   (0 : Position.int) (HolbuildHolSharedCache.toolchain_trash ()) +
+        List.foldl (fn (k, total) => total + tree_bytes (HolbuildHolSharedCache.entry_dir_for_key k))
+                   (0 : Position.int) (HolbuildHolSharedCache.toolchain_keys ())
+  in
+    [tree (share_store cache), {id = toolchain_id, measure = toolchain_bytes},
+     tree (HolbuildCache.actions_dir cache), tree (HolbuildCache.blobs_dir cache)]
+  end
 
 (* Evict least recently used families until the cache leaves reserve_bytes of
    room under limit_bytes. Reuse a recent shared scan within the target;
@@ -8065,7 +8090,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
     fun private_bytes () =
       cache_root_bytes checkpoint_root + cache_root_bytes (HolbuildCache.theory_modules_dir cache)
     val roots = worker_cache_roots cache
-    fun root_ids () = map (fn (path, _) => cache_root_id path) roots
+    fun root_ids () = map (fn {id, ...} => id ()) roots
     fun sum sizes = List.foldl (op +) (0 : Position.int) sizes
     val target = limit_bytes - reserve_bytes
     val state_path = Path.concat(HolbuildCache.locks_dir cache, "worker-cache-cap.state")
@@ -8087,8 +8112,8 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                       sum (ListPair.map
                              (* A private root can differ while its siblings
                                 are shared. Keep their hits without stamp churn. *)
-                             (fn ((path, measure), (id, bytes)) =>
-                                 if cache_root_id path = id then bytes else measure ())
+                             (fn (({id = identify, measure}), (id, bytes)) =>
+                                 if identify () = id then bytes else measure ())
                              (roots, entries)) + private_bytes () <= target
                     end
                 | _ => false)
@@ -8116,7 +8141,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
           let
             val measured = Time.toNanoseconds (Time.now ())
             val ids = root_ids ()
-            val sizes = map (fn (_, measure) => measure ()) roots
+            val sizes = map (fn {measure, ...} => measure ()) roots
             val total = sum sizes + private_size
           in
             if total <= target then
@@ -8132,10 +8157,11 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                 val _ = remove_file state_path
                 val (local_families, young_orphans) = local_cache_families cache
                 val families =
-                  by_age (toolchain_trash_family () ::
+                  by_age ((if toolchains_owned_by_cache () then
+                             toolchain_trash_family () :: toolchain_cache_families () else []) @
                           checkpoint_cache_families (collect_checkpoint_families checkpoint_root) @
                           store_cache_families cache @ module_cache_families cache @
-                          toolchain_cache_families () @ local_families) @ by_age young_orphans
+                          local_families) @ by_age young_orphans
                 val after = sweep total families
               in
                 if after <= target then ()
@@ -8209,13 +8235,8 @@ fun exception_failure e =
    each published heap and the checkpoints built on it, one directory per
    heap, and never writes one in place.  The action's checkpoint tree is its
    own: emptied before and after the action and filled from the store, its
-   Poly/ML states by hard links where both are on one mount and by symbolic
-   links otherwise, its records by copies.  A save over a linked file can't
-   write through the link because checkpoint saving unlinks the old file
-   first (HolbuildCheckpointSaveRuntime.begin_replacement).  A store file
-   stays readable through the action's own link: a hard link outlives an
-   eviction, and a symbolic one points into a family the action leases until
-   it exits, which no cap sweep evicts. *)
+   Poly/ML states and records by copies. The sandbox never receives writable
+   inodes belonging to the store or another action. *)
 
 (* A blob a shared entry names that the remote cache no longer holds. *)
 exception MissingSharedBlob of string
@@ -8917,6 +8938,10 @@ fun verify_run_spec (spec : run_spec) =
     check (sort_strings (text_values "output=") = sort_strings (#outputs spec))
       "the outputs do not match the run text";
     check (List.all (sha256_text o #key) deps) "a dependency's key is not a SHA-256";
+    (* File hashes name blobs in the cache, so they must not be paths. *)
+    check (sha256_text (#sha256 (#script spec)) andalso
+           List.all (sha256_text o #sha256) (libraries @ #context_scripts spec @ #inputs spec @ #supports spec))
+      "a file's SHA-256 is malformed";
     check (List.all (fn {suffix, ...} => suffix = ".ui" orelse suffix = ".uo") libs)
       "a library manifest is neither .ui nor .uo";
     check (List.all run_load_ok (#run_loads spec)) "a run-load names no library of the spec";
@@ -9060,6 +9085,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
     val cache = cache_root ()
     val root = Path.concat(cache, "action")
     val checkpoint_root = Path.concat(cache, "checkpoints")
+    val _ = HolbuildActionSandbox.enable (root, checkpoint_root)
     val input_key = ref ""
     val target = ref ("", "")
     val peak = ref NONE
@@ -9074,17 +9100,16 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
       end
     val log_unavailable = ref NONE
     val log_required = ref false
-    (* Without shared heaps the checkpoint tree outlives the action root, so
-       a rerun after an edit resumes from the checkpoints before it; the
-       worker cache cap bounds it.  With them it is the action's own, filled
-       from the store. *)
-    fun empty_root () = (remove_tree root; if share_heaps then remove_tree checkpoint_root else ())
+    (* Never reuse a writable directory inode across actions. Shared heaps are
+       copied into this action's tree, not exposed as writable store inodes. *)
+    fun empty_root () = (HolbuildRemoveTree.remove_untrusted root; HolbuildRemoveTree.remove_untrusted checkpoint_root)
     val run_log = ref NONE
     fun build_log () =
       case !run_log of
           SOME path => path
         | NONE => current_build_log (current_log_dir root (#1 (!target)) (#2 (!target)))
     fun upload_log () =
+      if not (!HolbuildActionSandbox.outputs_validated) then NONE else
       let val path = build_log ()
       in
         if not (file_exists path) then NONE
@@ -9102,8 +9127,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
            | e => (warn ("could not upload the action log: " ^ General.exnMessage e); NONE)
     fun run () =
       let
-        val _ = (HolbuildRemoveTree.remove_strict root; ensure_dir root)
-        val _ = if share_heaps then HolbuildRemoveTree.remove_strict checkpoint_root else ()
+        val _ = (HolbuildRemoveTree.remove_untrusted_strict root; ensure_dir root)
+        val _ = (HolbuildRemoveTree.remove_untrusted_strict checkpoint_root; ensure_dir checkpoint_root)
         val spec_path = Path.concat(root, ".holbuild/action-spec")
         (* Only a spec the cache doesn't have is rejected; a failed fetch is
            retryable. *)
@@ -9133,6 +9158,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
             val tc =
               toolchain (#toolchain spec)
               handle e as HolbuildRemoteCache.Unavailable _ => raise e
+                   | e as ActionFailed _ => raise e
                    | e => raise action_failed ToolchainFailure (General.exnMessage e)
             val _ =
               if HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key =
@@ -9158,6 +9184,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
         val tc =
           phase "toolchain" (fn () => toolchain (#toolchain spec))
           handle e as HolbuildRemoteCache.Unavailable _ => raise e
+               | e as ActionFailed _ => raise e
                | e => raise action_failed ToolchainFailure (General.exnMessage e)
         val _ =
           if HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key =
@@ -9216,6 +9243,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                       SOME ctx => phase "restore" (fn () => restore_shared_checkpoints remote ctx)
                     | NONE => nothing_restored
                 fun publish_shared () =
+                  if not (!HolbuildActionSandbox.outputs_validated) then () else
                   case shared of
                       SOME ctx => phase "publish" (fn () => publish_shared_checkpoints remote ctx restored)
                     | NONE => ()
@@ -9230,6 +9258,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                 remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints)
               end
               handle Error msg =>
+                if not (!HolbuildActionSandbox.outputs_validated) then
+                  raise ActionFailed (InternalFailure, msg)
+                else
                 let val log_text = read_text (build_log ()) handle _ => ""
                 in
                   raise ActionFailed
@@ -9270,6 +9301,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                 end
               val (status, failure) = attempt ()
               val _ =
+                if not (!HolbuildActionSandbox.outputs_validated) then () else
                 case failure of
                     NONE => ()
                   | SOME (_, msg) =>

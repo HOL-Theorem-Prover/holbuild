@@ -158,7 +158,7 @@ background=()
 kept() { [[ -e "$1" ]] || { echo "the cache cap evicted $2" >&2; exit 1; }; }
 evicted() { [[ ! -e "$1" ]] || { echo "the cache cap kept $2" >&2; exit 1; }; }
 kept "$entry_pinned/weight" "a toolchain in use"
-kept "$checkpoints/NewScript.deps" "the most recent checkpoint family"
+evicted "$checkpoints/NewScript.deps" "private checkpoints after the action"
 evicted "$entry_idle" "the idle toolchain"
 evicted "$checkpoints/OldScript.deps" "an old checkpoint family"
 evicted "$cache/actions/entry1" "an old cache entry"
@@ -169,14 +169,15 @@ evicted "$cache/blobs/$orphan" "an old unreferenced blob"
 kept "$cache/blobs/$recent_orphan" "a recently used unreferenced blob"
 evicted "$cache/theory-modules/old.pmo" "an old compiled theory module"
 
-# Under the cap (5 GB and a little, with 6 GB of room), nothing is evicted.
+# Under the cap, the toolchain remains. Private checkpoints are still cleared
+# after the action, independently of the cap.
 sparse "$checkpoints/OldScript.deps/key/deps_loaded.save" 1
 at 2001 "$checkpoints/OldScript.deps/key/deps_loaded.save"
 set +e
 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" --result "$tmpdir/result" \
   --cache-limit-gb 7 --cache-reserve-gb 1 > "$tmpdir/exec2.log" 2>&1
 set -e
-kept "$checkpoints/OldScript.deps" "a checkpoint family under the cap"
+evicted "$checkpoints/OldScript.deps" "private checkpoints under the cap"
 kept "$entry_pinned/weight" "an idle toolchain under the cap"
 
 # An evicted entry leaves the blobs a surviving entry still names.
@@ -256,14 +257,14 @@ cp "$state" "$tmpdir/small-state"
 sweep4 100 50
 ! cmp -s "$state" "$tmpdir/small-state" || { echo "increased reserve reused a measurement" >&2; exit 1; }
 cp "$state" "$tmpdir/reserve-state"
-# Old shared data can be removed without dropping the new private checkpoint.
+# Private checkpoint bytes count towards the target, so old shared data is
+# evicted; the private checkpoint itself is cleared after the action anyway.
 at 2000 "$cache4/blobs/first"
 sparse "$cache4/checkpoints/pkg/PrivateScript.deps/key/deps_loaded.save" 97
 sweep4 100 1
 evicted "$state" "the measurement after private checkpoint growth caused eviction"
 evicted "$cache4/blobs/first" "old shared data before a new private checkpoint"
-kept "$cache4/checkpoints/pkg/PrivateScript.deps/key/deps_loaded.save" "the private checkpoint under the target"
-rm "$cache4/checkpoints/pkg/PrivateScript.deps/key/deps_loaded.save"
+evicted "$cache4/checkpoints/pkg/PrivateScript.deps" "private checkpoints after the action"
 sparse "$cache4/blobs/first" 1
 sweep4 100 1
 # Expired, future-dated and malformed state must all fall back to a scan.
@@ -426,6 +427,29 @@ with open(pathlib.Path(cache) / "locks/gc.lock", "a") as lock:
                 child.kill()
                 child.wait()
 PRIVATE
+
+# A linked toolchain cache is owned elsewhere. Neither its entries nor its
+# trash count towards this worker's cap, and the sweep must leave both alone.
+cache9=$tmpdir/cache9
+external=$tmpdir/external-toolchains
+mkdir -p "$cache9" "$external/.trash/retired"
+mv "$entry_pinned" "$external/$(basename "$entry_pinned")"
+external_entry=$external/$(basename "$entry_pinned")
+sparse "$external/.trash/retired/weight" 3
+ln -s "$external" "$cache9/hol-toolchains"
+printf owned > "$cache9/own-sentinel"
+set +e
+HOLBUILD_CACHE=$cache9 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
+  --result "$tmpdir/result" --cache-limit-gb 1 --cache-reserve-gb 0 > "$tmpdir/linked.log" 2>&1
+status=$?
+set -e
+[[ $status -eq 4 ]] || { cat "$tmpdir/linked.log" >&2; exit 1; }
+kept "$external_entry/weight" "an external toolchain through a symlink"
+kept "$external/.trash/retired/weight" "external toolchain trash through a symlink"
+if grep -q 'over the .*cap' "$tmpdir/linked.log"; then
+  echo 'external toolchains were counted towards the worker cap' >&2
+  exit 1
+fi
 
 # An error outside the action, here no remote cache, is an infrastructure
 # failure (exit 3), never the final exit 1.

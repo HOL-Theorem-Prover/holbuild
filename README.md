@@ -52,6 +52,11 @@ or remote cache keys. Checkpoint-free builds also produce and use them. Cache
 garbage collection and worker cache limits include the module files; deleting
 them only causes source loading and regeneration.
 
+Remote execution isolates submitted HOL code from worker credentials and shared
+writable caches. Worker hosts need Linux Landlock and libseccomp; see
+[action isolation](remote-exec/README.md#action-isolation) for prerequisites,
+the trust boundary and the client upgrade requirement.
+
 ## Install
 
 ### Download a release
@@ -1498,9 +1503,9 @@ HOLBUILD_CACHE=/var/cache/holbuild holbuild --remote-cache https://cache.example
 ```
 
 It runs in `<cache root>/action`, which it locks and empties before and after
-each action, and, without `--share-heaps` (below), keeps the theory's
-dependency heap and checkpoints in `<cache root>/checkpoints`, so a later run
-of an edited theory resumes from them as a local build does. A saved heap records the absolute paths it was
+each action. Dependency heaps and checkpoints in `<cache root>/checkpoints`
+are private to the action and are also emptied before and after it; reuse
+across worker actions requires `--share-heaps` (below). A saved heap records the absolute paths it was
 built at, so every worker should use the same cache root. One `exec-action`
 runs per cache root at a time; a second waits for the first. The cache root
 is the worker's own: other holbuild commands shouldn't share it, since the
@@ -1658,13 +1663,10 @@ the host store `<cache root>/checkpoint-store` keeps the shared files, one
 directory per heap, which the cache cap and `holbuild gc` evict as a unit,
 unless an action on the host is using it. Worker containers on one host can share
 `checkpoint-store/` and `hol-toolchains/`, mounted from host directories, and
-keep the rest of the cache root to themselves. A restored Poly/ML state is
-hard-linked from the store when the store and `checkpoints/` are on one
-mount, and otherwise symbolically linked, which the action's lease on the
-heap's directory keeps valid until it exits; a bind mount counts as another
-mount even on the same filesystem. The small records beside the states are
-copied, and so are the files an action adds to the store when the store is
-on another mount, since its own tree is emptied after it.
+keep the rest of the cache root to themselves. Restored Poly/ML states and
+their records are copied into the private checkpoint tree, so submitted HOL
+code cannot change the shared files through a link. Files published back to
+the store are also copied, after cleanup and output validation.
 
 ### Building on remote workers
 

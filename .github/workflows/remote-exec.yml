@@ -2,10 +2,10 @@ name: remote-exec
 
 on:
   pull_request:
-    paths: ['remote-exec/**', '.github/workflows/remote-exec.yml']
+    paths: ['remote-exec/**', '.github/workflows/remote-exec.yml', 'sml/action_sandbox.*', 'tests/fixtures/action_sandbox_probe.py', 'Makefile']
   push:
     branches: [master]
-    paths: ['remote-exec/**', '.github/workflows/remote-exec.yml']
+    paths: ['remote-exec/**', '.github/workflows/remote-exec.yml', 'sml/action_sandbox.*', 'tests/fixtures/action_sandbox_probe.py', 'Makefile']
   workflow_dispatch:
 
 concurrency:
@@ -77,6 +77,16 @@ jobs:
           assert not zombies, zombies'
       - name: Build a holbuild release the way a worker does
         run: |
-          docker run --rm -v releases:/opt/holbuild-releases holbuild-remote-exec python3 -c \
-            'from remote_exec.worker import DEFAULT_SOURCE_URL, Releases; print(Releases("/opt/holbuild-releases", DEFAULT_SOURCE_URL, "", None).holbuild("0.13.1"))'
-          docker run --rm -v releases:/opt/holbuild-releases holbuild-remote-exec /opt/holbuild-releases/v0.13.1/bin/holbuild --version
+          git archive --format=tar.gz --prefix=holbuild/ HEAD > "$RUNNER_TEMP/holbuild-source.tar.gz"
+          version=$(sed -n 's/.*version = "\([^"]*\)".*/\1/p' sml/version.sml)
+          docker run --rm -v releases:/opt/holbuild-releases \
+            -v "$RUNNER_TEMP/holbuild-source.tar.gz:/source.tar.gz:ro" holbuild-remote-exec python3 -c \
+            'import sys; from remote_exec.worker import Releases; print(Releases("/opt/holbuild-releases", "file:///source.tar.gz", "", None).holbuild(sys.argv[1]))' "$version"
+          docker run --rm -v releases:/opt/holbuild-releases holbuild-remote-exec \
+            "/opt/holbuild-releases/v$version/bin/holbuild" --version
+      - name: Probe action isolation as root and as a worker user
+        run: |
+          for user in 0:0 10001:10001; do
+            docker run --rm --user "$user" -v "$PWD:/source:ro" holbuild-remote-exec \
+              python3 /source/tests/fixtures/action_sandbox_probe.py /source/sml/action_sandbox.py
+          done

@@ -183,28 +183,70 @@ curl -fsS -X PUT --data-binary "@$tmpdir/extra-output" "$remote_url/cas/$spec_ex
 worker extra-output "$spec_extra"
 expect extra-output 4 "status=failed" "failure=spec-rejected"
 require_grep "the extra outputs do not match the action text" "$tmpdir/extra-output.log"
-# Or one whose package, though consistent with its action text, would put
-# files outside the action root.
-python3 - "$project/.holbuild/action-specs/$spec_a" "$tmpdir/escape" <<'PY'
+# Matching declarations and action hashes must not let the trusted parent
+# publish files outside the validated stage tree.
+echo 'outside-output-sentinel' > "$tmpdir/outside-output"
+for output in "../../../../../../../../../../../../${tmpdir#/}/outside-output" \
+              /proc/self/environ ../outside-output results/../../../outside-output ./..; do
+  python3 - "$project/.holbuild/action-specs/$spec_a" "$tmpdir/escape-output" "$output" <<'PY'
 import hashlib, sys
 head, text = open(sys.argv[1], "rb").read().split(b"\naction-text\n", 1)
-old = [l for l in head.split(b"\n") if l.startswith(b"target ")][0].split(b" ")[1].split(b":")[0]
-text = text.replace(b"\npackage=" + old + b"\n", b"\npackage=../../x\n", 1)
+output = sys.argv[3].encode()
+head += b"\noutput extra " + output
+text += b"source_extra_output=" + output + b"\n"
 key = hashlib.sha256(text).hexdigest().encode()
 lines = []
 for line in head.split(b"\n"):
     if line.startswith(b"input-key="): line = b"input-key=" + key
     elif line.startswith(b"action-text-sha256="): line = b"action-text-sha256=" + key
-    elif line.startswith(b"target "): line = line.replace(old + b":", b"../../x:", 1)
-    elif line.startswith(b"source "): line = line.replace(b" " + old + b" ", b" ../../x ", 1)
     lines.append(line)
 open(sys.argv[2], "wb").write(b"\n".join(lines) + b"\naction-text\n" + text)
 PY
-spec_escape=$(sha256sum "$tmpdir/escape" | cut -d' ' -f1)
-curl -fsS -X PUT --data-binary "@$tmpdir/escape" "$remote_url/cas/$spec_escape"
-worker escape "$spec_escape"
-expect escape 4 "status=failed" "failure=spec-rejected"
-require_grep "path ../../x leaves the action root" "$tmpdir/escape.log"
+  spec_escape_output=$(sha256sum "$tmpdir/escape-output" | cut -d' ' -f1)
+  curl -fsS -X PUT --data-binary "@$tmpdir/escape-output" "$remote_url/cas/$spec_escape_output"
+  worker escape-output "$spec_escape_output"
+  expect escape-output 4 "status=failed" "failure=spec-rejected"
+  require_grep "leaves the action root" "$tmpdir/escape-output.log"
+done
+# Or one whose package, though consistent with its action text, would put
+# files outside the action root.
+for package in ../../x ./..; do
+  python3 - "$project/.holbuild/action-specs/$spec_a" "$tmpdir/escape" "$package" <<'PY'
+import hashlib, sys
+head, text = open(sys.argv[1], "rb").read().split(b"\naction-text\n", 1)
+package = sys.argv[3].encode()
+old = [l for l in head.split(b"\n") if l.startswith(b"target ")][0].split(b" ")[1].split(b":")[0]
+text = text.replace(b"\npackage=" + old + b"\n", b"\npackage=" + package + b"\n", 1)
+key = hashlib.sha256(text).hexdigest().encode()
+lines = []
+for line in head.split(b"\n"):
+    if line.startswith(b"input-key="): line = b"input-key=" + key
+    elif line.startswith(b"action-text-sha256="): line = b"action-text-sha256=" + key
+    elif line.startswith(b"target "): line = line.replace(old + b":", package + b":", 1)
+    elif line.startswith(b"source "): line = line.replace(b" " + old + b" ", b" " + package + b" ", 1)
+    lines.append(line)
+open(sys.argv[2], "wb").write(b"\n".join(lines) + b"\naction-text\n" + text)
+PY
+  spec_escape=$(sha256sum "$tmpdir/escape" | cut -d' ' -f1)
+  curl -fsS -X PUT --data-binary "@$tmpdir/escape" "$remote_url/cas/$spec_escape"
+  worker escape "$spec_escape"
+  expect escape 4 "status=failed" "failure=spec-rejected"
+  require_grep "path $package leaves the action root" "$tmpdir/escape.log"
+done
+# A file hash names a blob in the worker's cache, so a hash that is a path
+# must be rejected before any lookup.
+python3 - "$project/.holbuild/action-specs/$spec_a" "$tmpdir/blob-path" \
+  "../../../../../../../../../../../../${tmpdir#/}/outside-output" <<'PY'
+import sys
+head, text = open(sys.argv[1], "rb").read().split(b"\naction-text\n", 1)
+head += b"\nfile library lib/Outside.sml " + sys.argv[3].encode() + b" 24"
+open(sys.argv[2], "wb").write(head + b"\naction-text\n" + text)
+PY
+spec_blob_path=$(sha256sum "$tmpdir/blob-path" | cut -d' ' -f1)
+curl -fsS -X PUT --data-binary "@$tmpdir/blob-path" "$remote_url/cas/$spec_blob_path"
+worker blob-path "$spec_blob_path"
+expect blob-path 4 "status=failed" "failure=spec-rejected"
+require_grep "a file's SHA-256 is malformed" "$tmpdir/blob-path.log"
 worker absent "$(printf 'absent' | sha256sum | cut -d' ' -f1)"
 expect absent 4 "status=failed" "failure=spec-rejected"
 
@@ -229,12 +271,9 @@ built_worker=$tmpdir/worker-$(basename "$built" .result)
 ac_a=$(awk '$1 == "action" && $5 == "worker:ATheory" { print $3 }' "$tmpdir/batch.txt")
 require_file "$remote_root/ac/$ac_a"
 
-# The action root is emptied after the run; the checkpoints are kept.
+# Both writable trees are discarded: another tenant must not inherit them.
 [[ ! -e "$built_worker/action" ]] || { echo "the action root was not emptied" >&2; exit 1; }
-find "$built_worker/checkpoints" -name 'deps_loaded.save' | grep -q . ||
-  { echo "the worker kept no deps heap" >&2; find "$built_worker" -maxdepth 3 >&2; exit 1; }
-find "$built_worker/checkpoints" -path '*.theorems*' -type f | grep -q . ||
-  { echo "the worker kept no theorem checkpoints" >&2; exit 1; }
+[[ ! -e "$built_worker/checkpoints" ]] || { echo "the worker retained private checkpoints" >&2; exit 1; }
 
 # A successful build reports its peak memory and uploads its log.
 require_grep '^peak-rss-mb=[1-9][0-9]*$' "$built"
@@ -332,10 +371,10 @@ worker_status=$?
 set -e
 expect budget 3 "status=failed" "failure=internal"
 require_grep "exceeds the machine budget" "$tmpdir/budget.log"
-log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/budget.result")
-[[ -n "$log_sha" ]] || { echo "pre-HOL failure has no action log" >&2; exit 1; }
-curl -fsS "$remote_url/cas/$log_sha" > "$tmpdir/budget-action.log"
-require_grep "exceeds the machine budget" "$tmpdir/budget-action.log"
+if grep -q '^log=' "$tmpdir/budget.result"; then
+  echo "pre-HOL failure published an unvalidated action log" >&2
+  exit 1
+fi
 
 # A malformed one-line theorem recovers a boundary with an empty tactic.
 # Its source diagnostic must survive protocol parsing and proof planning.
@@ -399,12 +438,7 @@ for spec in "$spec_g" "$spec_a" "$spec_d"; do
 done
 worker f "$spec_f"
 expect f 0 "spec=$spec_f" "status=built"
-find "$tmpdir/worker-f/checkpoints" -name 'deps_loaded.save' | grep -q . ||
-  { echo "the non-target worker kept no deps heap" >&2; exit 1; }
-if find "$tmpdir/worker-f/checkpoints" -path '*.theorems*' -type f | grep -q .; then
-  echo "the non-target worker saved theorem checkpoints" >&2
-  exit 1
-fi
+[[ ! -e "$tmpdir/worker-f/checkpoints" ]] || { echo "the non-target worker retained private checkpoints" >&2; exit 1; }
 
 # A warm worker's local copies go out of date when the remote's entries for
 # their keys change, as for a nondeterministic theory built twice: the worker
