@@ -1038,12 +1038,14 @@ but local metadata/cache records the timeout a successful build satisfied; a suc
 
 A step that exceeds its timeout runs once more, at once and in the same process, with
 half the timeout. Each timed call computes its result from the proof state it was given
-and keeps it only on success, so the first attempt leaves nothing behind. If the second
+and commits it to the proof history only on success, so the first attempt leaves the
+proof history unchanged; side effects the tactic itself made before it was stopped (a
+reference, a memo table) remain. If the second
 attempt finishes, the step passes and the theory's build log gets one line,
 `holbuild tactic timeout retry passed: <step> (budget <s>s; retry <ms> ms wall; GC during
 first attempt <ms> ms)`. If it times out too, the step fails as a timeout, reported with
-the full timeout. A step that stalled once (on a loaded host, say) passes, while one that
-needs about the timeout of real work still fails. A step that Poly/ML interrupts before
+the full timeout. The intent is that a step that stalled once (on a loaded host, say)
+passes, while one that needs about the timeout of real work still fails. A step that Poly/ML interrupts before
 the timeout is not run again.
 
 A timeout is not a tactic failure: inside `TRY`, an `ORELSE`/`FIRST` alternative or a

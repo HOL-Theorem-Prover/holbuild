@@ -218,10 +218,11 @@ fun display_label label =
 fun tactic_interrupted label =
   TacticInterrupted ("holbuild tactic interrupted by Poly/ML (stack overflow or out of memory): " ^ label)
 
-(* A step that times out runs once more with half the budget: a cheap step
-   that stalled passes, while one that needs about the budget still fails.
-   Callers compute the step from unchanged state and keep its result only
-   when it returns, so the first attempt leaves nothing behind.  A retry that
+(* A step that times out runs once more with half the budget, meant to let a
+   cheap step that stalled pass while one that needs about the budget still
+   fails.  Callers compute the step from unchanged proof state and commit it
+   to the history only when it returns, so the first attempt leaves the proof
+   history unchanged (side effects of the tactic itself remain).  A retry that
    passes is reported on stderr, which is the theory's build log; one that
    times out fails as the first attempt would have, with the full budget in
    the marker and the message. *)
