@@ -2,6 +2,7 @@
 
 
 import http.client
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -9,9 +10,10 @@ import sqlalchemy as sa
 from conftest import CLIENT_TOKEN, WORKER_TOKEN
 from test_cache_pool import Provider
 
+from remote_exec import membership as membership_module
 from remote_exec.auth import cache_discovery_token
 from remote_exec.cache_pool import CachePool, CacheSlot
-from remote_exec.membership import Membership, check_plain_http, parse_members
+from remote_exec.membership import Membership, check_plain_http, parse_members, resolves
 from remote_exec.worker import Coordinator, refresh_cache_members
 
 DEFAULTS = ['https://ci:password@cache-a.example', 'https://ci:password@cache-b.example']
@@ -54,9 +56,30 @@ def test_discovery_keeps_complete_snapshots_and_expires_to_permanent_nodes() -> 
     assert membership.current(80) == DEFAULTS
 
 
+def test_resolution_checks_the_name_and_accepts_ip_literals() -> None:
+    assert resolves('https://ci:password@localhost:8443/cache')
+    assert resolves('https://127.0.0.1:1')
+    assert resolves('https://[::1]:1')
+    assert not resolves('https://cache-c.invalid')
+
+
+def test_unresolvable_members_wait_for_a_later_refresh_and_then_join(monkeypatch) -> None:
+    unresolvable = {'cache-a.example', 'cache-c.example'}
+    monkeypatch.setattr(membership_module, 'resolves', lambda url: urlsplit(url).hostname not in unresolvable)
+    membership = Membership(DEFAULTS, ALLOWED)
+    membership.update(SNAPSHOT, 0, resolve=True)
+    assert membership.current(0) == DEFAULTS  # permanent nodes stay, resolvable or not
+    assert not membership.joining(0)
+    unresolvable.clear()
+    membership.update(SNAPSHOT, 30, resolve=True)
+    assert membership.current(30) == [*DEFAULTS, 'https://ci:password@cache-c.example']
+    assert membership.joining(30)
+
+
 def test_worker_discovery_is_rate_limited_and_a_failure_does_not_disable_the_cache(monkeypatch) -> None:
     from unittest.mock import Mock
 
+    monkeypatch.setattr(membership_module, 'resolves', lambda _url: True)
     coordinator = Coordinator('https://coordinator.example', 'worker-token')
     response = Mock()
     response.status = 200
