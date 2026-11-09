@@ -1681,8 +1681,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                       (name ^ " failed on a remote worker: " ^ kind)
                                       (SOME (HolbuildBuildExec.RetainedLog path)))
                                       (HolbuildBuildExec.fetch_remote_build_log project node sha)
-                        in
-                          (name,
+                          val diagnosed =
                            case error of
                                SOME e => e
                              | NONE =>
@@ -1694,9 +1693,21 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                      (HolbuildBuildExec.warn ("remote execution: could not fetch the failed theory's build log; building " ^ name ^ " locally");
                                       (build_theory_locally name;
                                        HolbuildBuildExec.Error (name ^ " failed remotely: " ^ kind))
-                                      handle e => e)
+                                      handle Thread.Interrupt => raise Thread.Interrupt
+                                           | e => e)
                                    else HolbuildBuildExec.Error msg
-                                 end)
+                                 end
+                          val _ =
+                            if HolbuildStatus.json_mode () then
+                              HolbuildStatus.emit_json "node_failed"
+                                (HolbuildStatus.json_node_fields (HolbuildBuildPlan.key node) name @
+                                 HolbuildStatus.json_failure_field_for_node (HolbuildBuildPlan.key node)
+                                   (HolbuildBuildExec.build_error_message diagnosed) @
+                                 HolbuildStatus.json_debug_artifacts_fields
+                                   (HolbuildBuildExec.build_error_debug_artifacts diagnosed))
+                            else ()
+                        in
+                          (name, diagnosed)
                         end
                 val errors = map diagnose failures
               in
@@ -1756,8 +1767,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                  tc project plan toolchain_key jobs))
                     end
                 | ((HolbuildRemoteExec.Failed (reason, failures), progress), _) =>
-                    if List.exists (fn {kind, log_sha256, ...} =>
-                         (kind = "proof" orelse kind = "tactic-timeout") andalso Option.isSome log_sha256) failures then
+                    if List.exists (fn {kind, ...} => kind = "proof" orelse kind = "tactic-timeout") failures then
                       proof_failed ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress) failures
                     else let
                       val _ = List.app (fn {input_key, log_sha256, ...} =>

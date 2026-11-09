@@ -254,14 +254,16 @@ require_grep "ATheory is not in the remote cache, and --remote-only builds nothi
 refute_grep "Theory built" "$tmpdir/skipped-only.log"
 rm "$state/skip"
 
-# A failed batch falls back too.
+# A proof failure with no log stays a failure even if its local diagnostic
+# retry succeeds. --remote-only requests diagnostics without running HOL.
 write_theories six
 touch "$state/fail"
 run failed-only 75 build --remote-exec "$coordinator" --remote-only BTheory
 require_grep "remote rx:ATheory: failed (proof)" "$tmpdir/failed-only.log"
 require_grep "remote execution: batch b7 failed: an action failed; remote workers finished 0 of 2 theories" "$tmpdir/failed-only.log"
-run failed 0 build --remote-exec "$coordinator" BTheory
-require_grep "batch b8 failed: an action failed; remote workers finished 0 of 2 theories; building locally" "$tmpdir/failed.log"
+run failed 1 build --remote-exec "$coordinator" BTheory
+require_grep "could not fetch the failed theory's build log; building ATheory locally" "$tmpdir/failed.log"
+require_grep "ATheory failed remotely: proof" "$tmpdir/failed.log"
 require_grep "BTheory built" "$tmpdir/failed.log"
 refute_grep "^POST /v1/batches/b8/cancel " "$state/requests.log"
 rm "$state/fail"
@@ -1530,6 +1532,45 @@ while read -r tag key ac spec theory; do
     [[ ! -e "$remote_root/ac/$ac" ]] || { echo "$theory published failed or skipped outputs" >&2; exit 1; }
   fi
 done < "$state/$batch.batch"
+
+# Reattaching reports each retained log in a structured per-node failure.
+status=0
+in_copy multi-failure --json --retain-debug-artifacts --remote-cache "$remote_url" build \
+  --remote-exec "$coordinator" --remote-only --attach "$batch" \
+  BadATheory BadBTheory HealthyTheory BlockedTheory > "$tmpdir/multi-failure.jsonl" 2>&1 || status=$?
+[[ $status -eq 1 ]] || { cat "$tmpdir/multi-failure.jsonl" >&2; exit 1; }
+python3 - "$tmpdir/multi-failure.jsonl" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+events = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+logs = {e["target"]: e["debug_artifacts"]["log"] for e in events
+        if e["event"] == "node_failed" and "debug_artifacts" in e}
+for name in ("BadATheory", "BadBTheory"):
+    assert name in logs, logs
+    assert Path(logs[name]).is_file(), logs[name]
+PY
+
+# A coordinator may omit all failure log hashes. Successful independent
+# outputs are still restored before requesting a local diagnostic retry.
+while read -r tag key ac spec theory; do
+  if [[ $tag == action && $theory == rxmultifailure:Bad* ]]; then
+    sed -i '/^log=/d' "$state/result-$key"
+  fi
+done < "$state/$batch.batch"
+in_copy multi-failure clean HealthyTheory > /dev/null
+[[ ! -e "$tmpdir/multi-failure/.holbuild/obj/src/HealthyTheory.dat" ]]
+status=0
+in_copy multi-failure --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only --attach "$batch" BadATheory BadBTheory HealthyTheory BlockedTheory \
+  > "$tmpdir/multi-failure-nolog.log" 2>&1 || status=$?
+[[ $status -eq 75 ]] || { cat "$tmpdir/multi-failure-nolog.log" >&2; exit 1; }
+require_file "$tmpdir/multi-failure/.holbuild/obj/src/HealthyTheory.dat"
+require_grep "could not fetch the failed theory's build log: BadATheory" "$tmpdir/multi-failure-nolog.log"
+require_grep "could not fetch the failed theory's build log: BadBTheory" "$tmpdir/multi-failure-nolog.log"
+refute_grep 'Theory built\|building locally' "$tmpdir/multi-failure-nolog.log"
+
 in_copy multi-failure --remote-cache "$remote_url" build --remote-exec "$coordinator" \
   --remote-only --detach --fail-fast BadATheory > "$tmpdir/multi-fail-fast.log" 2>&1
 require_grep '^POST /v1/batches?fail_fast=true ' "$state/requests.log"
