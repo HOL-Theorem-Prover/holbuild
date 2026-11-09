@@ -586,10 +586,14 @@ def signal_late_members(group: int, sig: int, signaled: dict[int, Process]) -> N
     not. A member can fork after the scan and before its own signal, and that
     child joins the group unsignaled. Rescan until a scan finds no new member.
     A dying member's children reach this subreaper only at its exit, so for
-    SIGKILL also wait until every signaled member has exited."""
+    SIGKILL that last scan must start after every signaled member exited."""
     deadline = time.monotonic() + 2
     try:
         while True:
+            # A scan is complete only if every signaled member had exited
+            # before it began: until then a dying member's child can be in
+            # neither its list nor this subreaper's as the scan reads them.
+            settled = sig != signal.SIGKILL or not any(process.alive() for process in signaled.values())
             processes = descendants()
             try:
                 late = [process for process in group_members(processes, group)
@@ -605,13 +609,13 @@ def signal_late_members(group: int, sig: int, signaled: dict[int, Process]) -> N
                     signaled[process.pid] = processes.pop(process.pid)
             finally:
                 close_processes(processes)
-            dying = [process for process in signaled.values() if process.alive()] if sig == signal.SIGKILL else []
-            if not late and not dying:
+            if not late and settled:
                 return
             if time.monotonic() > deadline:
                 return  # bounded: a fork storm or a stuck exit ends the follow-up
-            for process in dying:
-                process.alive(deadline - time.monotonic())
+            if sig == signal.SIGKILL:
+                for process in signaled.values():
+                    process.alive(deadline - time.monotonic())
     finally:
         close_processes(signaled)
 
