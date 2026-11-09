@@ -8,7 +8,13 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
-cleanup() { rm -rf "$tmpdir"; }
+cleanup() {
+  if [[ -n "${server_pid:-}" ]]; then
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+  fi
+  rm -rf "$tmpdir"
+}
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 unset HOLBUILD_REMOTE_CACHE_URL
@@ -89,7 +95,7 @@ require_same_as_unpipelined() {
   local theory
   for theory in "$@"; do
     local ext
-    for ext in dat sml; do
+    for ext in dat sml sig; do
       cmp "$tmpdir/$name/.holbuild/obj/src/${theory}Theory.$ext" \
           "$tmpdir/$name-off/.holbuild/obj/src/${theory}Theory.$ext"
     done
@@ -171,8 +177,12 @@ Proof
 QED
 val _ = export_theory();
 SML
-build_pipelined pass CTheory
+# A pipelined build isn't published to the remote cache: a deferred proof
+# can record other dependencies than the plain build would.
+start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
+HOLBUILD_REMOTE_CACHE_URL=$remote_url build_pipelined pass CTheory
 log=$tmpdir/pass.log
+require_no_grep "remote cache published" "$log"
 require_grep "pipeline: outline ready: ATheory" "$log"
 require_grep "pipeline: outline ready: BTheory" "$log"
 require_grep "pipeline: gate passed: ATheory" "$log"
@@ -184,6 +194,14 @@ if [[ -n "$(ls -A "$tmpdir/pass/.holbuild/outline")" ]]; then
   exit 1
 fi
 require_same_as_unpipelined pass CTheory A B C
+# The same build with pipelining off, on an empty cache, is published.
+cp -r "$tmpdir/pass" "$tmpdir/pass-plain"
+rm -rf "$tmpdir/pass-plain/.holbuild"
+link_hol_toolchain_cache "$tmpdir/cache-plain"
+(cd "$tmpdir/pass-plain" && HOLBUILD_CACHE="$tmpdir/cache-plain" HOLBUILD_PIPELINE=off HOLBUILD_CACHE_TRACE=1 \
+  HOLBUILD_REMOTE_CACHE_URL=$remote_url "$HOLBUILD_BIN" -j4 build --skip-checkpoints --skip-proof-steps CTheory) \
+  > "$tmpdir/pass-plain.log" 2>&1
+require_grep "remote cache published" "$tmpdir/pass-plain.log"
 (cd "$tmpdir/pass" && "$HOLBUILD_BIN" --verbose build --skip-checkpoints --skip-proof-steps CTheory) > "$tmpdir/pass-again.log"
 require_grep "CTheory is up to date" "$tmpdir/pass-again.log"
 
@@ -264,3 +282,30 @@ require_before "dropped attempt: BTheory" "committed: BTheory" "$log"
 # transitively.
 require_grep "pipeline: dropped attempt: CTheory" "$log"
 require_same_as_unpipelined numbering CTheory A B C
+
+# A deferred proof that writes theory data (here a simp set entry) would
+# write it to its own context only, so A's deferred build fails and A
+# builds again with its proofs in place; its outline lacked the entry.
+new_project thydata
+cat > "$tmpdir/thydata/src/AScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Theorem a_thm:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+Theorem a_slow:
+  T
+Proof
+  (fn g => (BasicProvers.export_rewrites ["a_thm"]; ALL_TAC g)) >> $slow_truth
+QED
+val _ = export_theory();
+SML
+write_b_and_c thydata
+build_pipelined thydata CTheory
+log=$tmpdir/thydata.log
+require_grep "pipeline: attempt failed: ATheory" "$log"
+require_grep "wrote theory data of type simp.deltas" "$log"
+require_grep "pipeline: gate failed: ATheory (digest differs)" "$log"
+require_same_as_unpipelined thydata CTheory A B C

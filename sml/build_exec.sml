@@ -2369,8 +2369,8 @@ fun publish_cache_manifest root cache_key subject staged_sig published_sml stage
    itself once it has checked it. *)
 val publish_builds_remotely = ref true
 
-fun publish_theory_cache subject input_key proof_timeout staged_sig published_sml staged_dat
-                         staged_trace staged_extras {parents, mldeps} =
+fun publish_theory_cache publish_remote subject input_key proof_timeout staged_sig published_sml
+                         staged_dat staged_trace staged_extras {parents, mldeps} =
   let
     val root = cache_root ()
     val _ = HolbuildCache.ensure_layout root
@@ -2381,7 +2381,7 @@ fun publish_theory_cache subject input_key proof_timeout staged_sig published_sm
     fun skip_locked_publish () = ()
   in
     (HolbuildCache.with_action_publish_lock root input_key publish skip_locked_publish;
-     if !publish_builds_remotely then publish_remote_cache_key_if_usable root input_key else ())
+     if publish_remote andalso !publish_builds_remotely then publish_remote_cache_key_if_usable root input_key else ())
     handle e => warn ("could not publish cache entry: " ^ General.exnMessage e)
   end
 
@@ -3577,7 +3577,7 @@ fun failure_detail policy source_file source_text theorem_checkpoints terminatio
    caller. *)
 (* Puts a theory build's outputs, staged in STAGE, where the build plan
    wants them, and publishes them to the cache when CACHE_ALLOWED. *)
-fun install_theory_stage cache_allowed policy {stage, logical, source_file, input_key, outputs,
+fun install_theory_stage cache_allowed publish_remote policy {stage, logical, source_file, input_key, outputs,
                                                 staged_extra_outputs, generated_metadata, log_dir} =
   let
     val {sig_path, sml_path, data_path} = outputs
@@ -3604,7 +3604,7 @@ fun install_theory_stage cache_allowed policy {stage, logical, source_file, inpu
     val _ =
       if cache_allowed then
         detail_time_phase "build.exec.publish_cache"
-          (fn () => publish_theory_cache (cache_warning_subject logical source_file)
+          (fn () => publish_theory_cache publish_remote (cache_warning_subject logical source_file)
                                       input_key (tactic_timeout policy)
                                       staged_sig sml_path staged_dat
                                       (if trknl_enabled policy then SOME staged_trace else NONE)
@@ -3837,7 +3837,7 @@ fun run_theory_action speculative_log cache_allowed policy tc root checkpoint_ro
     val _ =
       if speculative then ()
       else
-        install_theory_stage cache_allowed policy
+        install_theory_stage cache_allowed true policy
           {stage = stage, logical = logical, source_file = source_file, input_key = input_key,
            outputs = {sig_path = sig_path, sml_path = sml_path, data_path = data_path},
            staged_extra_outputs = staged_extra_outputs,
@@ -4873,7 +4873,10 @@ fun commit_speculative dat_hash_cache (options : build_options) project plan key
     val current_log = current_log_dir root (package node) logical
     val {sig_path, sml_path, data_path, ...} = theory_outputs node
   in
-    install_theory_stage (#use_cache options andalso cache_enabled node) policy
+    (* Not published to the remote cache: a deferred proof can record other
+       dependencies than the same proof run in place, and the shared cache
+       should keep the plain build's outputs. *)
+    install_theory_stage (#use_cache options andalso cache_enabled node) false policy
       {stage = stage, logical = logical, source_file = source_file node, input_key = input_key,
        outputs = {sig_path = sig_path, sml_path = sml_path, data_path = data_path},
        staged_extra_outputs = [], generated_metadata = generated_metadata, log_dir = current_log};
@@ -6114,8 +6117,9 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
     fun is_theory id =
       #kind (HolbuildBuildPlan.source_of (Vector.sub (nodes, id))) = HolbuildSourceIndex.TheoryScript
 
-    (* A pipelined build saves no checkpoints and runs no proof steps, so a
-       theory that keeps either builds only from its committed parents. *)
+    (* A pipelined build saves no checkpoints, runs no proof steps and
+       writes no proof trace, so a theory that needs any of them builds only
+       from its committed parents. *)
     fun speculable id =
       let
         val node = Vector.sub (nodes, id)
@@ -6123,6 +6127,7 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
       in
         context_tactics andalso is_theory id andalso Array.sub (cold, id) <> SOME false andalso
         not (checkpoint_enabled policy) andalso not (proof_steps_enabled policy) andalso
+        not (trknl_enabled policy) andalso
         null (source_extra_output_declarations plan node) andalso not (always_reexecute node) andalso
         not (failed_prefix_priority_node id) andalso
         not (Binaryset.member (!skipped, HolbuildBuildPlan.input_key_for keys node))

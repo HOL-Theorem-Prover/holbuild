@@ -43,10 +43,49 @@ struct
       Tactic.ACCEPT_TAC stub goal ctxt
     end
 
+  fun segment_data ty = Theory.LoadableThyData.segment_data {thy = Theory.current_theory (), thydataty = ty}
+
+  (* The theory data types whose encoding holbuild knows
+     (HolbuildRuntime.normalized_theory_data) and the current theory holds
+     no pending load of. *)
+  fun thydata_types () =
+    List.filter (fn ty => (ignore (segment_data ty); true) handle Feedback.HOL_ERR _ => false)
+      (List.mapPartial
+         (fn (h, _) => if String.isPrefix "ThmSetData.onload." h
+                       then SOME (String.extract (h, size "ThmSetData.onload.", NONE)) else NONE)
+         (Listener.listeners Theory.delta_hook) @
+       ["GrammarAncestry", "OpenTheoryMap", "TexTokenMap"])
+
+  fun same_data (NONE, NONE) = true
+    | same_data (SOME a, SOME b) = PolyML.pointerEq (a, b)
+    | same_data _ = false
+
+  (* The current theory's data of each of TYPES, to compare with later. *)
+  fun thydata_of types = map (fn ty => (ty, segment_data ty)) types
+
+  (* A type whose data has changed since INITIAL was taken, if any. *)
+  fun changed_thydata initial =
+    Option.map #1 (List.find (fn (ty, d) => not (same_data (d, segment_data ty))) initial)
+
   (* As the LSP replays a deferred proof: in the context its goal was
-     stated in, pinned for every read the tactic makes. *)
-  fun prove_one ({ctxt, goal, make, ...} : item) =
-    Context.with_context ctxt (fn () => Tactical.TAC_PROOF_in ctxt (goal, make ())) ()
+     stated in, pinned for every read the tactic makes.  The theory's data
+     is checked as it stands in the pin, where a HOL whose pins take
+     writes keeps (and so loses) what the proof writes; prove_all checks
+     the live context too. *)
+  fun prove_one types ({ctxt, goal, make, ...} : item) =
+    let
+      fun prove () =
+        let
+          val initial = thydata_of types
+          val th = Tactical.TAC_PROOF_in ctxt (goal, make ())
+        in
+          case changed_thydata initial of
+              NONE => th
+            | SOME ty => raise Fail ("the proof wrote theory data of type " ^ ty)
+        end
+    in
+      Context.with_context ctxt prove ()
+    end
 
   fun describe_delta delta =
     case delta of
@@ -63,6 +102,7 @@ struct
 
   fun prove_all threads =
     let
+      val types = thydata_types ()
       val items = ref (rev (!queue))
       val _ = queue := []
       val mutex = Mutex.mutex ()
@@ -76,7 +116,7 @@ struct
                              (NONE, item :: rest) => (items := rest; SOME item)
                            | _ => NONE)
       fun run (item as {k, name, ...} : item) =
-        let val tag = Thm.tag (prove_one item)
+        let val tag = Thm.tag (prove_one types item)
         in locked (fn () => results := (k, (Dep.transfer_thydepl (Tag.dep_of tag), #1 (Tag.dest_tag tag))) :: !results) end
         handle e => locked (fn () => if Option.isSome (!failure) then ()
                                      else failure := SOME (name, Feedback.exn_to_string e))
@@ -93,15 +133,17 @@ struct
       fun record delta =
         locked (fn () => if Option.isSome (!change) then () else change := SOME (describe_delta delta))
       val listener = "HolbuildDeferred.prove_all"
+      val live = thydata_of types
     in
       Theory.register_hook (listener, record);
       List.app (fn _ => ignore (Thread.fork (worker, []))) (List.tabulate (count, fn i => i));
       Mutex.lock mutex; wait (); Mutex.unlock mutex;
       ignore (Listener.remove_listener Theory.delta_hook listener);
-      case (!failure, !change) of
-          (SOME (name, msg), _) => raise Fail ("deferred proof of " ^ name ^ " failed: " ^ msg)
-        | (NONE, SOME what) => raise Fail ("a deferred proof changed the theory: " ^ what)
-        | (NONE, NONE) => proved := !results
+      case (!failure, !change, changed_thydata live) of
+          (SOME (name, msg), _, _) => raise Fail ("deferred proof of " ^ name ^ " failed: " ^ msg)
+        | (NONE, SOME what, _) => raise Fail ("a deferred proof changed the theory: " ^ what)
+        | (NONE, NONE, SOME ty) => raise Fail ("a deferred proof wrote theory data of type " ^ ty)
+        | (NONE, NONE, NONE) => proved := !results
     end
 
   fun merge_strings [] ys = ys
