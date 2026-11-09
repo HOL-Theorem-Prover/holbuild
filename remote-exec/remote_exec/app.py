@@ -210,13 +210,18 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
                         return
                     # Read again once this process wrote to the batch, but not more often than events_poll_seconds,
                     # or after events_fallback_seconds, for other processes' writes.
-                    while (now := time.monotonic()) < (read_at := last_read + (
-                        settings.events_poll_seconds if written.is_set() else settings.events_fallback_seconds
-                    )):
-                        # A blank line, which clients skip, keeps a proxy from closing a quiet stream as idle.
+                    while True:
+                        now = time.monotonic()
+                        # A blank line, which clients skip, keeps a proxy from closing a quiet stream as idle; also
+                        # between reads that take longer than the keepalive, such as failing ones.
                         if now - last_line >= settings.events_keepalive_seconds:
                             yield "\n"
                             last_line = now
+                        read_at = last_read + (
+                            settings.events_poll_seconds if written.is_set() else settings.events_fallback_seconds
+                        )
+                        if now >= read_at:
+                            break
                         wait = min(read_at, last_line + settings.events_keepalive_seconds) - now
                         if written.is_set():
                             await asyncio.sleep(wait)

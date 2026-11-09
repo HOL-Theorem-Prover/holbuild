@@ -858,15 +858,48 @@ async def test_releasing_reads_each_selected_actions_edges_by_key(
         for query, parameters in [
             # Leaves the roots' children releasable, so RELEASABLE looks up their parents.
             (coordinator_module.REFRESH_CHILDREN, {"batch_id": new, "keys": roots}),
-            (coordinator_module.RELEASABLE, {"batch_id": new}),
+            (coordinator_module.RELEASABLE_BATCH, {"batch_id": new}),
         ]:
             plan = await connection.scalar(sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {query.text}"), parameters)
             pages = plan[0]["Plan"]["Shared Hit Blocks"] + plan[0]["Plan"]["Shared Read Blocks"]
             assert pages < 50 * width, query.text
-        releasable = await connection.execute(coordinator_module.RELEASABLE, {"batch_id": new})
+        releasable = await connection.execute(coordinator_module.RELEASABLE_BATCH, {"batch_id": new})
         children = {f"k{i}": parents for i in range(width, 2 * width)}
         assert {row.input_key: len(row.parents) for row in releasable} == children
         await connection.rollback()
+
+
+async def test_a_release_pass_over_many_batches_holds_few_transactions_at_once(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, remote_exec_engine: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pass over every batch writes each batch's releases in its own transaction, but holds at most
+    RELEASE_TRANSACTIONS of them at once, so the pass doesn't take every pooled connection."""
+    monkeypatch.setattr(coordinator_module, "RELEASE_TRANSACTIONS", 2)
+    batch_ids = [await submit(http, ["a", "b"], [("b", "a")]) for _ in range(12)]
+    cache.keys.add(ac_key("a"))
+    async with remote_exec_engine.begin() as connection:  # every a built, so every b is releasable
+        await connection.execute(sa.text("UPDATE actions SET state = 'done' WHERE theory = 'pkg:a'"))
+        await connection.execute(sa.text("UPDATE actions SET remaining_deps = 0 WHERE theory = 'pkg:b'"))
+    open_now = peak = 0
+    lock_batch = coordinator._lock_batch
+
+    async def counted(conn: Any, batch_id: UUID) -> str | None:
+        nonlocal open_now, peak
+        open_now += 1
+        peak = max(peak, open_now)
+        try:
+            await asyncio.sleep(0.01)
+            return await lock_batch(conn, batch_id)
+        finally:
+            open_now -= 1
+
+    monkeypatch.setattr(coordinator, "_lock_batch", counted)
+    await coordinator.release()
+
+    assert peak == 2
+    for batch_id in batch_ids:
+        assert (await states(http, batch_id))["b"] == "ready"
 
 
 async def test_memory_failure_moves_to_the_high_tier_and_retries_up_to_max_attempts(
@@ -1404,6 +1437,48 @@ async def test_an_event_stream_outlives_a_failed_read_and_resumes_where_it_was(
         ("action", "done"),
         ("batch", "done"),
     ]
+
+
+async def test_an_event_stream_keeps_alive_while_its_reads_keep_failing(
+    coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reads that each fail after longer than the fallback interval, as pool timeouts do while the database is
+    overloaded, still leave room for the keepalive lines, so a proxy doesn't close the stream as idle."""
+    settings = coordinator.settings.model_copy(
+        update={"events_fallback_seconds": 0.05, "events_keepalive_seconds": 0.1}
+    )
+    failing = True
+    changes = coordinator.changes
+    calls = 0
+
+    async def slow_failure(batch: UUID, since: int) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls > 1 and failing:
+            await asyncio.sleep(0.06)
+            raise sa.exc.TimeoutError("QueuePool limit of size 50 overflow 0 reached")
+        return await changes(batch, since)
+
+    monkeypatch.setattr(coordinator, "changes", slow_failure)
+    async with httpx.AsyncClient(
+        transport=Settled(create_app(coordinator, settings), coordinator), base_url="http://coordinator.test"
+    ) as http:
+        batch_id = await submit(http, ["a"])
+        received: list[str] = []
+
+        async def follow() -> None:
+            async with http.stream("GET", f"/v1/batches/{batch_id}/events", headers=CLIENT) as response:
+                async for line in response.aiter_lines():
+                    received.append(line)
+
+        stream = asyncio.create_task(follow())
+        await asyncio.sleep(0.6)
+        failing = False
+        await build(http, cache, "a")
+        await asyncio.wait_for(stream, 5)
+
+    assert received.count("") >= 3
+    assert json.loads(received[-1]) == {"type": "batch", "state": "done", "failure": None}
 
 
 async def test_a_write_wakes_its_batchs_event_streams_and_idle_streams_wait_for_the_fallback(

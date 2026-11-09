@@ -40,6 +40,8 @@ IN_CACHE_TRUST_SECONDS = 60
 # How many requests a release has in flight to the cache at once. At most two releases run at once (a pass over every
 # batch and one of single batches), so together they stay within the cache client's 100 connections.
 RELEASE_CACHE_CHECKS = 48
+# Transactions a release pass holds at once, so a pass over many batches leaves pooled connections to the rest.
+RELEASE_TRANSACTIONS = 8
 RELEASE_SLOW_SECONDS = 5.0  # a release pass that takes this long is logged
 
 # A statement, or a transaction left idle, that runs longer than this is ended by the database, so one stuck
@@ -333,9 +335,9 @@ REFRESH_CHILDREN = sa.text(
     )
 )
 
-# The waiting actions whose parents are all done, with each parent's input and action-cache keys; see
-# Coordinator.release.
-RELEASABLE = sa.text("""
+# The waiting actions whose parents are all done, with each parent's input and action-cache keys, of every batch
+# or of one; see Coordinator.release. Two statements, so the database plans the one-batch read by its batch.
+RELEASABLE = """
 SELECT a.batch_id, a.input_key, ARRAY(
     SELECT ROW(e.parent_key, (
         SELECT p.ac_key FROM actions p WHERE p.batch_id = e.batch_id AND p.input_key = e.parent_key
@@ -343,9 +345,10 @@ SELECT a.batch_id, a.input_key, ARRAY(
     FROM edges e WHERE e.batch_id = a.batch_id AND e.input_key = a.input_key
 ) AS parents
 FROM actions a JOIN batches b ON b.id = a.batch_id
-WHERE a.state = 'waiting' AND a.remaining_deps = 0 AND b.state = 'running'
-AND (CAST(:batch_id AS uuid) IS NULL OR a.batch_id = :batch_id)
-""")
+WHERE a.state = 'waiting' AND a.remaining_deps = 0 AND b.state = 'running'{batch}
+"""
+RELEASABLE_ALL = sa.text(RELEASABLE.format(batch=""))
+RELEASABLE_BATCH = sa.text(RELEASABLE.format(batch=" AND a.batch_id = :batch_id"))
 
 
 # The actions of a batch written by transactions numbered :since or later; see Coordinator.changes.
@@ -916,13 +919,17 @@ class Coordinator:
         while True:
             started = time.monotonic()
             async with self.engine.connect() as conn:
-                rows = await conn.execute(RELEASABLE, {"batch_id": batch_id})
+                if batch_id is None:
+                    rows = await conn.execute(RELEASABLE_ALL)
+                else:
+                    rows = await conn.execute(RELEASABLE_BATCH, {"batch_id": batch_id})
                 candidates: defaultdict[UUID, dict[str, list[tuple[str, str]]]] = defaultdict(dict)
                 for row in rows:
                     candidates[row.batch_id][row.input_key] = list(row.parents)
             limit = asyncio.Semaphore(RELEASE_CACHE_CHECKS)
+            transactions = asyncio.Semaphore(RELEASE_TRANSACTIONS)
             results = await asyncio.gather(
-                *(self._release_batch(batch, actions, limit) for batch, actions in candidates.items()),
+                *(self._release_batch(batch, actions, limit, transactions) for batch, actions in candidates.items()),
                 return_exceptions=True,  # one batch's failure doesn't cut the others' releases short
             )
             for batch, result in zip(candidates, results, strict=True):
@@ -942,15 +949,19 @@ class Coordinator:
                 return
 
     async def _release_batch(
-        self, batch_id: UUID, candidates: dict[str, list[tuple[str, str]]], limit: asyncio.Semaphore
+        self,
+        batch_id: UUID,
+        candidates: dict[str, list[tuple[str, str]]],
+        limit: asyncio.Semaphore,
+        transactions: asyncio.Semaphore,
     ) -> bool:
-        """``release`` of the ``candidates`` of one batch, their parents' cache checks ``limit`` at a time with the
-        other batches' of the pass. Whether it re-queued a parent."""
+        """``release`` of the ``candidates`` of one batch, their parents' cache checks ``limit`` and its
+        transactions ``transactions`` at a time with the other batches' of the pass. Whether it re-queued a parent."""
         present = await self._in_cache_all({ac_key for parents in candidates.values() for _, ac_key in parents}, limit)
         ready = [key for key, parents in candidates.items() if all(present[ac_key] for _, ac_key in parents)]
         if ready:
             # Taking the batch's lock before its actions', as every other writer does.
-            async with self.engine.begin() as conn:
+            async with transactions, self.engine.begin() as conn:
                 if await self._lock_batch(conn, batch_id) != "running":
                     return False
                 tiers = await conn.scalars(
@@ -968,7 +979,8 @@ class Coordinator:
         for parents in candidates.values():
             for parent, ac_key in parents:
                 if present[ac_key] is False:
-                    requeued |= await self._requeue_evicted(batch_id, parent)
+                    async with transactions:
+                        requeued |= await self._requeue_evicted(batch_id, parent)
         return requeued
 
     async def expire_leases(self) -> None:
