@@ -8268,6 +8268,14 @@ fun with_action_root_lock cache f =
 fun phases_text sep unit phases =
   String.concatWith sep (map (fn (name, ms) => name ^ unit ^ LargeInt.toString ms) phases)
 
+(* A failure message as one line of a result record: printable ASCII, every
+   other character a space, at most 500 characters. *)
+fun result_detail msg =
+  String.map (fn c => if #" " <= c andalso c <= #"~" then c else #" ")
+    (if size msg > 500 then String.substring (msg, 0, 500) else msg)
+
+(* A failure without a log says why in detail=, the client's only
+   diagnostic of it; one with a log has the message in the log. *)
 fun result_text (spec_sha256, input_key) {status, failure, wall_ms, phases, peak, log} =
   String.concatWith "\n"
     ([action_result_header,
@@ -8276,9 +8284,10 @@ fun result_text (spec_sha256, input_key) {status, failure, wall_ms, phases, peak
       "status=" ^ status] @
      (case failure of
           NONE => []
-        | SOME (kind, _) =>
+        | SOME (kind, msg) =>
             ("failure=" ^ failure_name kind) ::
-            (case kind of InputMissing missing => ["missing=" ^ missing] | _ => [])) @
+            (case kind of InputMissing missing => ["missing=" ^ missing] | _ => []) @
+            (case log of NONE => ["detail=" ^ result_detail msg] | SOME _ => [])) @
      (case peak of SOME mb => ["peak-rss-mb=" ^ Int.toString mb] | NONE => []) @
      ["wall-ms=" ^ LargeInt.toString wall_ms] @
      (if null phases then [] else ["phase-ms=" ^ phases_text "," ":" phases]) @

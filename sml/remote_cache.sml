@@ -171,7 +171,7 @@ fun head_status url =
   if HolbuildRemoteCacheConfig.uses_libcurl () then
     HolbuildHttp.head {url = url, timeout = stall_timeout_seconds}
   else
-    cli_status ["-I", "-o", "/dev/null"] url
+    cli_status ["-I", "--ignore-content-length", "-o", "/dev/null"] url
 
 fun put_status headers {url, src} =
   if HolbuildRemoteCacheConfig.uses_libcurl () then

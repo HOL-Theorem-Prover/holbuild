@@ -325,6 +325,11 @@ cp "$tmpdir/tampered-spec" "$remote_root/cas/$tampered"
 worker tampered "$tampered"
 expect tampered 4 status=failed failure=spec-rejected
 require_grep 'the run-loads do not match the run text' "$tmpdir/tampered.log"
+require_grep '^detail=.*the run-loads do not match the run text' "$tmpdir/tampered.result"
+if grep -q '^log=' "$tmpdir/tampered.result"; then
+  echo 'a rejected run spec uploaded a log' >&2
+  exit 1
+fi
 
 # Runtime inputs stay in the staged package and cannot alias another input.
 for malformed in escape duplicate; do
