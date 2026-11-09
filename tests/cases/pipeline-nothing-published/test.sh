@@ -13,8 +13,9 @@ trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 unset HOLBUILD_REMOTE_CACHE_URL
 
-# C proves against B's outline and finishes, then B fails: nothing of C's
-# may be published anywhere, since only a commit after B's gate may.
+# C proves against B's outline and finishes, then B fails, deferring its
+# proof and again without: nothing of C's may be published anywhere, since
+# only a commit after B's gate may.
 project=$tmpdir/project
 mkdir -p "$project/src"
 cat > "$project/holproject.toml" <<TOML
@@ -55,12 +56,13 @@ val _ = export_theory();
 SML
 
 log=$tmpdir/build.log
-if (cd "$project" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j4 build --skip-checkpoints CTheory) > "$log" 2>&1; then
+if (cd "$project" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j4 build --skip-checkpoints --skip-proof-steps CTheory) > "$log" 2>&1; then
   echo "build of a failing theory succeeded" >&2
   cat "$log" >&2
   exit 1
 fi
 require_grep "pipeline: attempt done: CTheory" "$log"
+require_grep "pipeline: attempt failed: BTheory" "$log"
 require_grep "slow failure" "$log"
 # The planner's dependency analysis of the script (CScript.uo.deps) is no
 # build output.

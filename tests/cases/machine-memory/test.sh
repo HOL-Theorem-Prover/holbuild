@@ -322,7 +322,8 @@ wait "$hold_pid" || { cat "$tmpdir/hold2.out" >&2; exit 1; }
 # When a node fails, a worker still waiting for memory gives up instead of
 # starting its child once the failed child's reservation frees up.  Fail and
 # Q compete for a one-child budget, and Other waits on Q, so some worker is
-# waiting whichever starts first.
+# waiting whichever starts first.  Pipelining is off: a failed pipelined
+# build runs again without it.
 : > "$events"
 make_project failing 0 Q
 cat > "$tmpdir/failing/src/FailScript.sml" <<SML
@@ -342,7 +343,7 @@ val _ = (TextIO.output (out, "START Other\\n"); TextIO.closeOut out);
 val _ = new_theory "Other";
 val _ = export_theory();
 SML
-if holbuild_in "$tmpdir/failing" --cooperate-dir "$tmpdir/failing-coop" --machine-max-mem 3072 -j2 \
+if HOLBUILD_PIPELINE=off holbuild_in "$tmpdir/failing" --cooperate-dir "$tmpdir/failing-coop" --machine-max-mem 3072 -j2 \
      build --skip-checkpoints --skip-proof-steps > "$tmpdir/failing.out" 2>&1; then
   echo "build with a failing theory succeeded" >&2
   exit 1

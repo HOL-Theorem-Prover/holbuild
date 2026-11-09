@@ -13,11 +13,12 @@ trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 unset HOLBUILD_REMOTE_CACHE_URL
 
-# Pipelined builds (here of theories without checkpoints): a child proves
-# against its parent's outline while the parent proves, and is committed
-# only once every outline it loaded passed the gate.  Each project is also
-# built with pipelining off, and both builds must produce the same theory
-# data.
+# Pipelined builds (here of theories without checkpoints or proof steps):
+# a theory's build defers its proofs and publishes its outline before
+# proving them, a child proves against that outline meanwhile, and is
+# committed only once every outline it loaded passed the gate.  Each
+# project is also built with pipelining off, and both builds must produce
+# the same theory data.
 
 new_project() {
   local project=$tmpdir/$1
@@ -71,24 +72,41 @@ SML
 
 build_pipelined() {
   local name=$1 target=$2
-  (cd "$tmpdir/$name" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j4 build --skip-checkpoints "$target") > "$tmpdir/$name.log" 2>&1
+  (cd "$tmpdir/$name" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j4 build --skip-checkpoints --skip-proof-steps "$target") > "$tmpdir/$name.log" 2>&1
 }
 
 # Builds a copy of project NAME with pipelining off and compares the theory
-# data of each theory in THEORIES.
+# data of each theory in THEORIES: the patched data of a deferred build is
+# byte for byte what the plain build exports.
 require_same_as_unpipelined() {
   local name=$1 target=$2
   shift 2
   rm -rf "$tmpdir/$name-off"
   cp -r "$tmpdir/$name" "$tmpdir/$name-off"
   rm -rf "$tmpdir/$name-off/.holbuild"
-  (cd "$tmpdir/$name-off" && HOLBUILD_PIPELINE=off "$HOLBUILD_BIN" -j4 build --no-cache --skip-checkpoints "$target") \
+  (cd "$tmpdir/$name-off" && HOLBUILD_PIPELINE=off "$HOLBUILD_BIN" -j4 build --no-cache --skip-checkpoints --skip-proof-steps "$target") \
     > "$tmpdir/$name-off.log" 2>&1
   local theory
   for theory in "$@"; do
-    cmp "$tmpdir/$name/.holbuild/obj/src/${theory}Theory.dat" \
-        "$tmpdir/$name-off/.holbuild/obj/src/${theory}Theory.dat"
+    local ext
+    for ext in dat sml; do
+      cmp "$tmpdir/$name/.holbuild/obj/src/${theory}Theory.$ext" \
+          "$tmpdir/$name-off/.holbuild/obj/src/${theory}Theory.$ext"
+    done
   done
+}
+
+# Requires the first line matching FIRST to come before the first matching
+# SECOND.
+require_before() {
+  local first=$1 second=$2 file=$3 a b
+  a=$(grep -n -m1 -- "$first" "$file" | cut -d: -f1)
+  b=$(grep -n -m1 -- "$second" "$file" | cut -d: -f1)
+  if [[ -z "$a" || -z "$b" || "$a" -ge "$b" ]]; then
+    echo "expected '$first' before '$second' in $file" >&2
+    cat "$file" >&2
+    exit 1
+  fi
 }
 
 require_no_grep() {
@@ -131,6 +149,28 @@ Finalise a_split[simp]
 val _ = export_theory();
 SML
 write_b_and_c pass
+# B's local lemma depends on a theory no other string of B names, and its
+# users, one a simp theorem, inherit that dependency once it is proved.
+cat > "$tmpdir/pass/src/BScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib ATheory;
+val _ = new_theory "B";
+Triviality b_local:
+  T
+Proof
+  ACCEPT_TAC (EQ_MP (EQT_INTRO (SPEC_ALL combinTheory.I_THM)) (SPEC_ALL combinTheory.I_THM))
+QED
+Theorem b_simp[simp]:
+  T
+Proof
+  ACCEPT_TAC b_local
+QED
+Theorem b_thm:
+  T /\ T
+Proof
+  CONJ_TAC >> ACCEPT_TAC b_local
+QED
+val _ = export_theory();
+SML
 build_pipelined pass CTheory
 log=$tmpdir/pass.log
 require_grep "pipeline: outline ready: ATheory" "$log"
@@ -144,7 +184,7 @@ if [[ -n "$(ls -A "$tmpdir/pass/.holbuild/outline")" ]]; then
   exit 1
 fi
 require_same_as_unpipelined pass CTheory A B C
-(cd "$tmpdir/pass" && "$HOLBUILD_BIN" --verbose build --skip-checkpoints CTheory) > "$tmpdir/pass-again.log"
+(cd "$tmpdir/pass" && "$HOLBUILD_BIN" --verbose build --skip-checkpoints --skip-proof-steps CTheory) > "$tmpdir/pass-again.log"
 require_grep "CTheory is up to date" "$tmpdir/pass-again.log"
 
 # A speculative proof saves no checkpoints, so theories that keep them
@@ -187,13 +227,15 @@ require_grep "pipeline: gate passed: ATheory" "$log"
 require_grep "pipeline: gate failed: BTheory (digest differs)" "$log"
 require_grep "pipeline: attempt done: CTheory" "$log"
 require_grep "pipeline: dropped attempt: CTheory" "$log"
-require_no_grep "committed: CTheory" "$log"
+# C then builds again, on the committed B.
+require_before "dropped attempt: CTheory" "committed: CTheory" "$log"
 require_file "$tmpdir/digest/.holbuild/plan/outline-skip"
 require_same_as_unpipelined digest CTheory B C
 
 # Only the numbering differs: A's proof saves a temporary theorem through an
-# alias the outline can't see, which shifts the save index of each later
-# theorem but exports nothing.
+# alias, which shifts the save index of each later theorem but exports
+# nothing.  Deferred, the proof would save it after the export, so A's
+# deferred build fails and A builds again with its proofs in place.
 new_project numbering
 cat > "$tmpdir/numbering/src/AScript.sml" <<SML
 open HolKernel Parse boolLib bossLib;
@@ -214,8 +256,10 @@ SML
 write_b_and_c numbering
 build_pipelined numbering CTheory
 log=$tmpdir/numbering.log
+require_grep "pipeline: attempt failed: ATheory" "$log"
+require_grep "a deferred proof changed the theory: saved @tempx" "$log"
 require_grep "pipeline: gate failed: ATheory (theorem numbering differs)" "$log"
-require_no_grep "committed: BTheory" "$log"
+require_before "dropped attempt: BTheory" "committed: BTheory" "$log"
 # C's attempt loaded A's outline only through B's, so the fallback reaches it
 # transitively.
 require_grep "pipeline: dropped attempt: CTheory" "$log"
