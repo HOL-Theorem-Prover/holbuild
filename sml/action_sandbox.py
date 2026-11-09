@@ -544,12 +544,13 @@ class SignalBroker:
             close_processes(processes)
 
 
-def spellings(name: str) -> set[Path]:
-    """The path as given, each link met while resolving it, and its target.
+def spellings(name: str) -> tuple[set[Path], set[Path]]:
+    """The path as given, each link met while resolving it, and its target;
+    and every directory passed through on the way.
 
     The worker opens the name it was given, so an action able to replace any
-    link on the way could redirect it."""
-    found = {Path(os.path.abspath(name))}
+    link or directory on the way could redirect it."""
+    found, passed = {Path(os.path.abspath(name))}, set()
     # Not normalized first: ".." after a link leaves the link's target.
     current, parts, links = Path("/"), list((Path.cwd() / name).parts[1:]), 0
     while parts:
@@ -558,6 +559,7 @@ def spellings(name: str) -> set[Path]:
             current = current.parent
         elif part not in ("", "."):
             candidate = current / part
+            passed.add(candidate)
             if candidate.is_symlink() and links < 40:
                 links += 1
                 found.add(candidate)
@@ -569,7 +571,7 @@ def spellings(name: str) -> set[Path]:
             else:
                 current = candidate
     found.add(current)
-    return found
+    return found, passed
 
 
 def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = None) -> int:
@@ -720,15 +722,16 @@ def main() -> int:
         policy = Policy(
             [Path(path).resolve(strict=True) for path in args.write],
             [Path(path).resolve(strict=True) for path in args.read],
-            [path for name in args.forbid for path in spellings(name)] +
+            [path for name in args.forbid for path in spellings(name)[0]] +
             ([args.completed.resolve()] if args.completed is not None else []),
         )
         # A scratch directory holding protected state, or a read-only grant
         # (Landlock grants are a union, so it would become writable), is
         # left out rather than failing the action: only tools needing it fail.
+        passed = {path for name in args.forbid for path in spellings(name)[1]}
         policy.scratch = [path for path in (Path(path).resolve(strict=True) for path in args.scratch)
                           if not policy.exposes(path) and
-                          not any(read == path or path in read.parents for read in policy.readable)]
+                          not any(read == path or path in read.parents for read in [*policy.readable, *passed])]
         if not policy.writable:
             raise SandboxError("missing private action directory")
         parent = os.environ.get("HOLBUILD_SANDBOX_PARENT")

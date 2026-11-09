@@ -344,6 +344,9 @@ def scratch_probe(helper: Path) -> None:
             path.mkdir()
         (dotted / "credential").write_text("secret")
         (root / "safe" / "link").symlink_to(dotted / "deep")
+        # And one that passes through a scratch directory and leaves it by "..".
+        bridged = root / "bridged"
+        (bridged / "bridge").mkdir(parents=True)
         completed = root / "completion"
         code = (
             "from pathlib import Path\n"
@@ -360,6 +363,9 @@ def scratch_probe(helper: Path) -> None:
             f"try: Path({str(dotted / 'temp')!r}).write_text('temp')\n"
             "except PermissionError: pass\n"
             "else: raise AssertionError('scratch reached by .. after a link was granted')\n"
+            f"try: Path({str(bridged / 'temp')!r}).write_text('temp')\n"
+            "except PermissionError: pass\n"
+            "else: raise AssertionError('scratch a protected path passes through was granted')\n"
         )
         module = runpy.run_path(str(helper), run_name="sandbox")
         previous = sys.argv
@@ -371,6 +377,7 @@ def scratch_probe(helper: Path) -> None:
                         "--scratch", str(linked), "--forbid", str(holding / "secret"),
                         "--forbid", str(elsewhere / "configured"),
                         "--scratch", str(dotted), "--forbid", str(root / "safe" / "link" / ".." / "credential"),
+                        "--scratch", str(bridged), "--forbid", str(bridged / "bridge" / ".." / ".." / "holding" / "secret"),
                         "--completed", str(completed)]
             for path in ("/usr", "/bin", "/lib", "/lib64"):
                 if Path(path).exists():
@@ -389,6 +396,7 @@ def scratch_probe(helper: Path) -> None:
         assert (reading / "runtime" / "helper").read_text() == "trusted"
         assert not (linked / "temp").exists()
         assert not (dotted / "temp").exists()
+        assert not (bridged / "temp").exists()
     print("scratch directory writable; scratch holding protected state or read-only grants withheld")
 
 
