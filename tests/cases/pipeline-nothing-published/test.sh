@@ -74,3 +74,11 @@ if [[ -d "$tmpdir/cache/actions" ]] && grep -rl "CTheory" "$tmpdir/cache/actions
   echo "the cache has an entry for C" >&2
   exit 1
 fi
+# No build here saves checkpoints, so no heap may appear, shared or local.
+heaps=$(find "$project/.holbuild" "$tmpdir/cache" -path "$tmpdir/cache/hol-toolchains" -prune -o \
+          \( -name 'deps_loaded.save' -o -path "$tmpdir/cache/checkpoint-store/*" \) -print)
+if [[ -n "$heaps" ]]; then
+  echo "checkpoints were published:" >&2
+  echo "$heaps" >&2
+  exit 1
+fi
