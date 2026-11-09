@@ -547,6 +547,7 @@ require_grep "pipeline: attempt done: BTheory" "$log"
 require_grep "pipeline: attempt done: CTheory" "$log"
 require_grep "pipeline: committed: CTheory" "$log"
 require_no_grep "dispatch plain" "$log"
+require_no_grep "dispatch pipelined: [BC]Theory" "$log"
 require_same_as_unpipelined idle CTheory A B C
 
 # Under a backlog nothing is pipelined: six independent theories at -j2.
@@ -575,6 +576,7 @@ if (( plain < 5 || plain + pipelined != 6 )); then
   cat "$log" >&2
   exit 1
 fi
+require_no_grep "dispatch pipelined: .*free 1)" "$log"
 for t in $(sed -n 's/.*pipeline: dispatch plain: \([A-Za-z0-9]*\)Theory .*/\1/p' "$log"); do
   require_no_grep "attempt done: ${t}Theory" "$log"
 done
