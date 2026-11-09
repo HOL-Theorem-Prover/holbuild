@@ -66,6 +66,29 @@ coordinator reads when an action completes, so run it before the new image
 serves. To roll back to an image predating `0009`, use the current image to
 run `alembic downgrade 0008` first.
 
+Migration `0011` adds `batches.fail_fast` (default false). New build batches
+finish independent actions after a final failure, cancelling only its blocked
+descendants. Their action events retain the `cancelled` state with a
+`skipped because of ...` reason, so existing clients and workers remain
+compatible. No action-spec or minimum client version changes are needed.
+Clients can request `?fail_fast=true` on submission to retain early stopping.
+Run batches still finish `done` with independent per-action failures.
+
+Apply the migration before serving with the new coordinator. An image whose
+migration code predates `0011` cannot run `alembic upgrade head` against a
+database already at `0011`, even though the added columns are compatible with
+its queries. Deployments that migrate on every service start must account for
+this before pinning an older image.
+
+For a rollback that preserves the schema, deploy a reviewed forward patch
+release restoring fail-fast dispatch while retaining migrations `0010` and
+`0011` and terminal-state aggregation for already-running keep-going batches.
+Clients can use `--fail-fast` for immediate early stopping
+on new submissions. To deploy a pre-`0011` image instead, first drain or cancel
+running batches, since an older coordinator does not implement their
+keep-going completion rules, then use the current image to downgrade to the
+older image's migration head. Existing action states need no conversion.
+
 The coordinator reads its settings from the environment:
 
 | Variable | Meaning | Default |
@@ -300,6 +323,10 @@ a refresh. Use protected branches for these trust roots. The entry `*`
 accepts any `https://` repository at a full commit hash, with no branch
 check, since no step runs the toolchain's code outside the sandbox; such
 toolchains still cost worker time to build.
+The worker enables `*` only for clients from 0.14.0 onward, which confine
+toolchain execution. For older clients it removes `*`, preserving any explicit
+repository entries. If only `*` was configured, older clients use their
+canonical HOL defaults. Empty values remain invalid.
 Trust is worker configuration, not an action spec option. Administrators can grant additional read-only runtime directories
 with colon-separated `HOLBUILD_ACTION_READ_DIRS`; do not include credentials
 or shared writable state in these directories.

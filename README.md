@@ -284,6 +284,20 @@ outputs are unaffected. An explicit debugging flag turns back on what it needs:
 
 ## Common commands
 
+Builds finish independent work after a theory or library fails. Nodes that
+depend on a failure are skipped, with the failed dependency named in the
+diagnostic. Successful outputs are cached normally; failed or skipped nodes
+publish no successful outputs. Every failure is reported as it happens and in
+the final diagnostic, and the build exits nonzero. Pass `build --fail-fast`
+to stop after the first failure and cancel unfinished work instead.
+
+Keep-going applies within a resolved build plan. Setup or dependency-planning
+errors still stop the command. A theory that generates SML sources must finish
+before those sources and their consumers can be planned: if that preliminary
+phase fails, independent actions already in its plan finish, but the later
+phase does not start. Planning from missing or stale generated sources could
+otherwise miss dependencies or compute incorrect input keys.
+
 `build` is the default command, so it can usually be omitted:
 
 ```sh
@@ -1114,6 +1128,21 @@ the analyser is built against, so another checkout of the same sources on the
 machine reads it instead of analysing again, and a different HOL pin never
 uses it.
 
+### Keeping a tool's files between builds
+
+A tool run from theory scripts (a proof search with an index of the
+ancestry's theorems, say) can keep files from one build to the next in a
+tool cache. `holbuild build --tool-cache NAME` gives each theory's HOL
+processes the environment variable `HOLBUILD_TOOL_CACHE_DIR`, naming a
+directory the tool may read and write. NAME is letters, digits, `.`, `_` and
+`-`. Locally the directory is `$HOLBUILD_CACHE/tool-cache/NAME`, shared by
+every build that names it and never cleaned by holbuild. A theory built on a
+remote worker (`--remote-exec`) gets a directory filled from the remote cache
+and saved back to it after the build, keyed by the theory's dependencies and
+toolchain (see "Running one theory action as a remote worker"). The flag
+doesn't change a theory's cache key: a theory built or cached without it is
+reused as is.
+
 ### The plan record
 
 Planning a build discovers every source, analyses its dependencies and
@@ -1562,6 +1591,28 @@ cooldown after requests got no response, whatever the worker was fetching or
 publishing, the action fails as `unavailable` rather than reading that as a
 miss or a conflict: the cache failed, not the action.
 
+A theory exported with `--tool-cache NAME` (see "Keeping a tool's files
+between builds" below) gets a tool cache: before HOL starts, the worker
+fills `.holbuild/tool-cache/NAME` under the action root from the remote
+cache's entry for the key
+
+```text
+sha256("holbuild-tool-cache-v1\nname=" ^ NAME ^ "\ndeps_key=" ^ <deps_key> ^ "\ntoolchain=" ^ <toolchain key>)
+```
+
+and gives the theory's HOL processes that directory as
+`HOLBUILD_TOOL_CACHE_DIR`. The key leaves out the theory's own source, so
+every theory with the same dependencies and toolchain shares the entry, on
+any worker. The worker keeps the entry's files in its host store
+(`<cache root>/checkpoint-store`), so it fetches each from the remote cache
+once. After HOL exits, built or failed, the worker publishes the directory
+again if its files changed: at most 16 regular files, 64 MiB in all, with
+names of letters, digits, `.`, `_` and `-`. An entry that can't be restored,
+or a directory that breaks these limits, only warns: the action goes on
+without the tool cache. The newest publication replaces the
+entry, so a tool should write each file whole (to a temporary name, then
+renamed) and treat the directory as a cache it may find empty.
+
 A run spec (`holbuild-run-spec-v1`, see "Exporting script runs for remote
 execution") is checked the same way, its run text against its `run-key`,
 and reported `cached`, without installing the toolchain or starting HOL, if
@@ -1631,8 +1682,9 @@ For a run, `input-key` is its run key and `built` means it ran.
 `phase-ms` gives the wall time of each phase that ran, in order: `cap` (the
 cache cap sweep), `spec`, `toolchain`, `hydrate` (sources, libraries and
 dependencies), `cutoff` (whether an earlier build stands), `restore` (shared
-checkpoints), `hol`, `publish` (shared checkpoints), `check` (the
-publication checks) and `log`; stderr ends with the same times and `wall`.
+checkpoints), `toolrestore` (the tool cache), `hol`, `publish` (shared
+checkpoints), `toolpublish` (the tool cache), `check` (the publication
+checks) and `log`; stderr ends with the same times and `wall`.
 `peak-rss-mb` is the HOL process's peak resident memory, reported once the
 theory has been exported.
 `log` is the build log, or the run's HOL output, uploaded to `/cas/`. `memory` means Poly/ML ran out
@@ -1809,12 +1861,18 @@ only restores from the cache, and with `--detach` it fails.
 
 A batch that fails because a theory's proof failed on a worker (failure
 `proof` or `tactic-timeout`) isn't built locally, since a local build would
-fail the same way. The build restores what the cache holds, as `--remote-only`
-does, fetches the worker's build log from the remote cache into
+fail the same way. Independent theories finish first, and dependents of failed
+theories are reported as skipped. The build restores successful branches from
+the cache, as `--remote-only` does, fetches each failed worker's build log into
 `.holbuild/logs/current/<package>/<theory>/build.log`, prints the diagnostic a
 local build would, and exits with status 1, with or without `--remote-only`.
-If that log can't be fetched, the build builds just the failed theory locally,
+If a log can't be fetched, the build builds just that failed theory locally,
 for its diagnostic; with `--remote-only` it fails with status 75 instead.
+The event stream reports each failure when it occurs and repeats the full list
+of failures and skips when following ends. `--fail-fast` asks the coordinator
+to stop the batch on its first final failure. Older coordinators retain their
+fail-fast behavior until upgraded; older clients can follow new coordinators
+using the existing event format, without the new client's full diagnostics.
 
 `--detach` submits the batch, prints its id (`holbuild: remote batch <id>`)
 and exits; if the batch can't be submitted, it fails rather than building
@@ -1837,6 +1895,8 @@ The coordinator's protocol, in what holbuild uses of it:
 
 - `POST /v1/batches` with the batch text as the body answers 201 and
   `{"batch_id": "<id>"}`; any other status refuses the batch.
+  The optional query parameter `fail_fast=true` stops independent actions after
+  a final build failure. It defaults to false and does not change run batches.
 - `GET /v1/batches/<id>/events` streams one JSON object per line: an
   `{"type": "action", "input_key", "theory", "state", "last_failure",
   "log_sha256", "failure_detail", ...}` when an action changes, and last
@@ -1847,6 +1907,12 @@ The coordinator's protocol, in what holbuild uses of it:
   log, such as a spec the worker rejects, says why in `failure_detail`, which
   holbuild prints with the failure. A stream may start over: it
   sends every action's current state first.
+  A skipped dependent uses the existing action state `cancelled` with
+  `last_failure` beginning `skipped because of `; its reason names the failed
+  ancestor. A build batch stays `running` while independent actions remain,
+  then ends `failed` with the failed actions listed in `failure`. Batch-wide
+  cancellation, deadlines and input-cache resubmission errors still abort the
+  batch immediately.
 - `POST /v1/batches/<id>/cancel` cancels a running batch and answers
   `{"state": "<state>"}`: `cancelled`, or the end a batch that already
   ended reached.

@@ -523,11 +523,43 @@ def test_worker_runs_the_action_on_the_release_that_exported_it(
     assert len(held) >= 2  # renewed on a heartbeat
 
 
-def test_action_runs_without_the_worker_token(
-    tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("version", ["0.13.58", "0.13.68", "0.14.0", "0.14.1"])
+@pytest.mark.parametrize(
+    ("trusted", "legacy"),
+    [
+        (None, None),
+        ("*", None),
+        (" *\t* ", None),
+        ("https://example.org/HOL.git=main *", "https://example.org/HOL.git=main"),
+        ("https://example.org/HOL.git=main", "https://example.org/HOL.git=main"),
+        ("", ""),
+        ("   ", "   "),
+    ],
+)
+def test_action_trust_matches_the_client_version(
+    monkeypatch: pytest.MonkeyPatch, version: str, trusted: str | None, legacy: str | None
 ) -> None:
-    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
-    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+    name = "HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES"
+    if trusted is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, trusted)
+    env = worker.exec_action_env(version=version)
+    expected = legacy if version in ("0.13.58", "0.13.68") else trusted
+    if expected is None:
+        assert name not in env
+    else:
+        assert env[name] == expected
+
+
+@pytest.mark.parametrize(("version", "trusted"), [("0.13.68", None), ("0.14.0", "*")])
+def test_action_runs_without_the_worker_token(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
+    version: str, trusted: str | None,
+) -> None:
+    release_tarball(tmp_path / f"holbuild-{version}.tar.gz", version)
+    server.specs[SPEC] = f"holbuild-action-spec-v1\nholbuild-version={version}\n"
+    monkeypatch.setenv("HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES", "*")
     monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", "worker-secret")
     monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN", "worker-secret")
     monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG", str(tmp_path / "worker.curl"))
@@ -553,6 +585,7 @@ def test_action_runs_without_the_worker_token(
     assert "HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN" not in env
     assert "HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG" not in env
     assert "worker-secret" not in env.values()
+    assert env.get("HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES") == trusted
     assert "UNRELATED" not in env
     assert env["HTTPS_PROXY"] == "http://proxy.test:3128"
     assert env["HOLBUILD_CACHE"] == str(tmp_path / "cache")
