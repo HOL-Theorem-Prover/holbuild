@@ -239,11 +239,13 @@ class Linux:
 
 
 # Where HOL's libraries find external solvers (HolSmt's z3 and cvc5, SOSLib's
-# csdp, HolRefute's java, hammer provers). They name programs, not secrets.
+# csdp, HolRefute's java, Kodkodi and MiniSat, hammer provers). They name
+# programs and directories, not secrets.
 # remote-exec's worker forwards the same names (SOLVER_ENV in remote_exec/worker.py).
 SOLVER_ENV = frozenset({
     "HOL4_Z3_EXECUTABLE", "HOL4_CVC_EXECUTABLE", "HOL4_CSDP_EXECUTABLE", "HOL4_EPROVER_EXECUTABLE",
-    "HOL4_VAMPIRE_EXECUTABLE", "HOL4_ZIPPERPOSITION_EXECUTABLE", "HOL4_JAVA_EXECUTABLE",
+    "HOL4_VAMPIRE_EXECUTABLE", "HOL4_ZIPPERPOSITION_EXECUTABLE", "HOL4_JAVA_EXECUTABLE", "HOL4_KODKODI",
+    "MINISAT_HOME",
 })
 
 
