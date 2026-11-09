@@ -173,6 +173,11 @@ spec_tampered=$(sha256sum "$tmpdir/tampered" | cut -d' ' -f1)
 curl -fsS -X PUT --data-binary "@$tmpdir/tampered" "$remote_url/cas/$spec_tampered"
 worker tampered "$spec_tampered"
 expect tampered 4 "status=failed" "failure=spec-rejected"
+require_grep '^detail=.' "$tmpdir/tampered.result"
+if grep -q '^log=' "$tmpdir/tampered.result"; then
+  echo 'a rejected spec uploaded a log' >&2
+  exit 1
+fi
 # So is one whose extra input isn't the file its action text names.
 python3 - "$project/.holbuild/action-specs/$spec_b" "$tmpdir/other-input" <<'PY'
 import hashlib, sys

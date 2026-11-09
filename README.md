@@ -1601,13 +1601,16 @@ input-key=<input_key>
 status=built|cached|failed
 failure=proof|tactic-timeout|script|timeout|memory|input-missing|publish|toolchain|disk|spec-rejected|internal|unavailable
 missing=theory <input_key> | blob <sha256>
+detail=<message>
 peak-rss-mb=<n>
 wall-ms=<n>
 phase-ms=<phase>:<n>,...
 log=<sha256> <size>
 ```
 
-`failure` appears on failure, and `missing` with `input-missing`.
+`failure` appears on failure, and `missing` with `input-missing`. A failure
+with no `log` (a spec rejected before any HOL ran, say) gives its message in
+`detail`, on one line of printable ASCII of at most 500 characters.
 For a run, `input-key` is its run key and `built` means it ran.
 `phase-ms` gives the wall time of each phase that ran, in order: `cap` (the
 cache cap sweep), `spec`, `toolchain`, `hydrate` (sources, libraries and
@@ -1820,11 +1823,13 @@ The coordinator's protocol, in what holbuild uses of it:
   `{"batch_id": "<id>"}`; any other status refuses the batch.
 - `GET /v1/batches/<id>/events` streams one JSON object per line: an
   `{"type": "action", "input_key", "theory", "state", "last_failure",
-  "log_sha256", ...}` when an action changes, and last `{"type": "batch",
-  "state": "done"|"failed"|"cancelled", "failure"}`. A failed action's log is
-  at `/cas/<log_sha256>` in the remote cache. The log includes the action's
-  failure diagnostic even when it failed before starting HOL, provided the
-  worker can write and upload the log. A stream may start over: it
+  "log_sha256", "failure_detail", ...}` when an action changes, and last
+  `{"type": "batch", "state": "done"|"failed"|"cancelled", "failure"}`. A
+  failed action's log is at `/cas/<log_sha256>` in the remote cache. The log
+  includes the action's failure diagnostic even when it failed before starting
+  HOL, provided the worker can write and upload the log; a failure with no
+  log, such as a spec the worker rejects, says why in `failure_detail`, which
+  holbuild prints with the failure. A stream may start over: it
   sends every action's current state first.
 - `POST /v1/batches/<id>/cancel` cancels a running batch and answers
   `{"state": "<state>"}`: `cancelled`, or the end a batch that already

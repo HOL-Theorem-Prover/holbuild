@@ -209,3 +209,9 @@ set -e
 [[ $status == 4 ]] || { cat "$tmpdir/rejected.log" "$tmpdir/rejected.result" >&2; exit 1; }
 require_grep '^failure=spec-rejected$' "$tmpdir/rejected.result"
 require_grep 'HOL repository is not trusted' "$tmpdir/rejected.log"
+require_grep '^detail=exec-action HOL repository is not trusted by this worker: https://untrusted.invalid/HOL.git$' \
+  "$tmpdir/rejected.result"
+if grep -q '^log=' "$tmpdir/rejected.result"; then
+  echo 'a rejected spec uploaded a log' >&2
+  exit 1
+fi
