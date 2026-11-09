@@ -153,7 +153,10 @@ each call. A cached directory must match the recorded device
 and inode; other directories are sized live. Smaller targets and zero-reserve runs always scan live. Shared writes
 during the reuse interval are accounted for at the next scan. `exec-action` runs
 with the worker's `HOLBUILD_*` build settings, `PATH`, `HOME`, `TMPDIR`, the
-locale, and curl's certificate and proxy settings. It excludes
+locale, curl's certificate and proxy settings, and the solver locations HOL's
+libraries read (`HOL4_Z3_EXECUTABLE`, `HOL4_CVC_EXECUTABLE`,
+`HOL4_CSDP_EXECUTABLE`, `HOL4_EPROVER_EXECUTABLE`, `HOL4_VAMPIRE_EXECUTABLE`,
+`HOL4_ZIPPERPOSITION_EXECUTABLE`, `HOL4_JAVA_EXECUTABLE`). It excludes
 `HOLBUILD_REMOTE_EXEC_*`, `HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN` and inherited
 discovery curl configs; with discovery enabled it receives only the worker's
 generated read-only discovery config (see below). The worker token stays out
@@ -238,9 +241,10 @@ to complete cleanup fails the action and does not harvest outputs. This does
 not provide resource isolation against fork storms. Unsupported confinement
 fails closed.
 
-The child inherits only executable lookup, locale, timezone, certificate lookup
-and `HOLBUILD_RUN_*` settings. Other operator environment overrides use their
-runtime defaults. Cancellation kills the owned process tree, so buffered log
+The child inherits only executable lookup, locale, timezone, certificate lookup,
+those solver locations and `HOLBUILD_RUN_*` settings; a solver outside the
+system directories needs its directory in `HOLBUILD_ACTION_READ_DIRS`. Other
+operator environment overrides use their runtime defaults. Cancellation kills the owned process tree, so buffered log
 tails may be lost. Mediated signals identify the supervisor as their sender.
 
 `--share-heaps` publishes heaps by dependency context and checkpoints by script

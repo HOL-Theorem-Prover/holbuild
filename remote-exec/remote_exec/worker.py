@@ -57,9 +57,16 @@ def check_sandbox(executable: str) -> None:
 # essential one, so the task stops with it, and the worker clears protection when an action ends or loses its lease.
 PROTECTION_MINUTES = 180
 CLAIM_RETRY_SECONDS = 5  # least time between two claims that found nothing
-# What exec-action runs with besides holbuild's own HOLBUILD_* settings: what curl, git and the locale read. The rest
-# of the worker's environment, its coordinator token above all, stays out of the builds' environment.
-EXEC_ACTION_ENV = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR")
+# What exec-action runs with besides holbuild's own HOLBUILD_* settings: what curl, git and the locale read, and where
+# HOL's libraries find external solvers (the action sandbox passes the same SOLVER_ENV on to HOL). The rest of the
+# worker's environment, its coordinator token above all, stays out of the builds' environment.
+SOLVER_ENV = (
+    "HOL4_Z3_EXECUTABLE", "HOL4_CVC_EXECUTABLE", "HOL4_CSDP_EXECUTABLE", "HOL4_EPROVER_EXECUTABLE",
+    "HOL4_VAMPIRE_EXECUTABLE", "HOL4_ZIPPERPOSITION_EXECUTABLE", "HOL4_JAVA_EXECUTABLE",
+)
+EXEC_ACTION_ENV = (
+    "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR", *SOLVER_ENV
+)
 PROXY_ENV = ("http_proxy", "https_proxy", "all_proxy", "no_proxy")  # in either case
 # holbuild's --cooperate-dir admission, as in sml/machine_memory.sml: the --child-charge default caps a child's charge
 # at this many MiB (default_charge_mb), and a lease this young still counts against MemAvailable (startup_seconds).

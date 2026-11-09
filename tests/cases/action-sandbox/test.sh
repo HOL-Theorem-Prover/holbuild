@@ -54,4 +54,18 @@ PATH="$tmpdir/worker-venv/bin:$tmpdir/venv-bin:/usr/local/bin:/usr/bin:/bin:" \
     --write "$tmpdir/action" "${grants[@]}" --forbid "$tmpdir/worker-venv" \
     -- /bin/sh -c 'python3 "$@"' sh "$tmpdir/action/python-probe.py" "$tmpdir/worker-venv/pyvenv.cfg"
 
+# HOL's solver locations reach the action; other variables, credentials above all, don't.
+solvers=(HOL4_Z3_EXECUTABLE HOL4_CVC_EXECUTABLE HOL4_CSDP_EXECUTABLE HOL4_EPROVER_EXECUTABLE
+         HOL4_VAMPIRE_EXECUTABLE HOL4_ZIPPERPOSITION_EXECUTABLE HOL4_JAVA_EXECUTABLE)
+solver_env=()
+for name in "${solvers[@]}"; do solver_env+=("$name=/opt/provers/$name"); done
+env "${solver_env[@]}" HOL4_YICES_EXECUTABLE=/opt/yices REMOTE_EXEC_WORKER_TOKEN=secret \
+  python3 -I "$ROOT/sml/action_sandbox.py" --write "$tmpdir/action" "${grants[@]}" \
+    -- /bin/sh -c 'env > "$1"' sh "$tmpdir/action/env"
+for name in "${solvers[@]}"; do require_grep "^$name=/opt/provers/$name\$" "$tmpdir/action/env"; done
+if grep -E '^(HOL4_YICES_EXECUTABLE|REMOTE_EXEC_WORKER_TOKEN)=' "$tmpdir/action/env"; then
+  echo "action inherited a variable outside the allowlist" >&2
+  exit 1
+fi
+
 python3 "$ROOT/tests/fixtures/action_sandbox_probe.py" "$ROOT/sml/action_sandbox.py"
