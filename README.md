@@ -1000,7 +1000,6 @@ holbuild build --trace-steps MyTheory
 holbuild build --repl-on-failure MyTheory
 holbuild build --skip-proof-steps MyTheory
 holbuild build --skip-checkpoints MyTheory
-holbuild build --all-checkpoints MyTheory
 ```
 
 - `execution-plan THEORY:NAME` prints the proof-step plan for one theorem or

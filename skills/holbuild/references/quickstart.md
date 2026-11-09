@@ -87,7 +87,7 @@ holbuild --json build --retain-debug-artifacts FooTheory  # also retain/report f
 - `--force=full` / `--force-full` / `--force` — rebuild the whole requested plan from source; forced nodes still publish cache unless `--no-cache`
 - `--no-cache` — skip global cache restore/publish; local `.holbuild/` up-to-date checks still work
 - `--skip-checkpoints` — no `.save`/`.ok` checkpoint files; theorem instrumentation still runs
-- `--all-checkpoints` — theorem checkpoints in every root theory; by default only the requested targets save them, others keep `deps_loaded` and step timeouts
+- `--all-checkpoints` — accepted compatibility alias; every root-package theory saves checkpoints by default
 - `--skip-proof-steps` — no proof-step execution, hence no tactic timeout/trace-step/repl-on-failure support
 - `--trknl` — tracing kernel; root theories default to `--skip-checkpoints --skip-proof-steps`; `--trace-steps`/`--tactic-timeout` turn proof steps back on, `--repl-on-failure` proof steps and checkpoints
 - `--trace-steps` — record detailed proof-step execution logs; use with `--force` to inspect up-to-date targets

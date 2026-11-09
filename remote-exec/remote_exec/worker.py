@@ -843,6 +843,7 @@ def execute(
     """The result record of the claimed action, or None once its lease is lost."""
     spec = claim["spec_sha256"]
     drain = releases.drain
+    drain.publish_seconds = 0.0
     if drain.stop.is_set():
         return failed_record(spec, "unavailable")
     try:

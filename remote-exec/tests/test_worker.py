@@ -62,7 +62,7 @@ env > "$HOLBUILD_FAKE_LOG.env"
 if [ -n "$HOLBUILD_FAKE_PUBLISH" ]; then
   sleep 120 &
   child=$!
-  trap 'kill "$child"; wait "$child" || true; sleep 3; echo published > "$HOLBUILD_FAKE_LOG.published"; exit 1' TERM
+  trap 'sleep 0.1; kill -0 "$child" || exit 1; kill "$child"; wait "$child" || true; sleep 3; echo published > "$HOLBUILD_FAKE_LOG.published"; exit 1' TERM
   echo ready > "$HOLBUILD_FAKE_LOG.ready"
   wait
 fi
