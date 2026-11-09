@@ -40,10 +40,26 @@ heap=()
 [[ ! -e "\${1%.batch}.heap" ]] || heap=(--max-heap "\$(cat "\${1%.batch}.heap")")
 share=
 [[ ! -e "$state/share-heaps" ]] || share=--share-heaps
+rm -f "$state/failed-batch"
+
+
 # A worker that trusts no HOL repository rejects every spec.
 untrusted=()
 [[ ! -e "$state/untrusted" ]] || untrusted=(HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES=/unconfigured=master)
 awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec theory; do
+  if [[ -e "$state/keep-going" ]]; then
+    blocked=
+    for parent in \$(awk -v key="\$key" '\$1 == "edge" && \$2 == key { print \$3 }' "\$1"); do
+      if grep -Eq '^status=(failed|skipped)$' "$state/result-\$parent"; then
+        blocked=\$parent
+        break
+      fi
+    done
+    if [[ -n \$blocked ]]; then
+      printf 'holbuild-action-result-v1\\nstatus=skipped\\nfailure=skipped because of %s\\n' "\$blocked" > "$state/result-\$key"
+      continue
+    fi
+  fi
   echo "\$theory" >> "$state/ran"
   status=0
   env "\${untrusted[@]}" HOLBUILD_CACHE="$tmpdir/worker-cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" "\${heap[@]}" \
@@ -59,9 +75,16 @@ awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec the
   fi
   # A failed action fails the batch, naming the theory or blob it found
   # missing.
-  [[ \$status -eq 0 ]] ||
-    { sed -n 's/^missing=//p' "$tmpdir/worker.result" > "$state/missing"; exit 1; }
+  if [[ \$status -ne 0 ]]; then
+    if [[ -e "$state/keep-going" ]]; then
+      touch "$state/failed-batch"
+    else
+      sed -n 's/^missing=//p' "$tmpdir/worker.result" > "$state/missing"
+      exit 1
+    fi
+  fi
 done
+[[ ! -e "$state/failed-batch" ]]
 SH
 chmod +x "$tmpdir/run-batch"
 python3 "$SCRIPT_DIR/../../fixtures/remote_exec_coordinator.py" \
@@ -236,14 +259,16 @@ require_grep "ATheory is not in the remote cache, and --remote-only builds nothi
 refute_grep "Theory built" "$tmpdir/skipped-only.log"
 rm "$state/skip"
 
-# A failed batch falls back too.
+# A proof failure with no log stays a failure even if its local diagnostic
+# retry succeeds. --remote-only requests diagnostics without running HOL.
 write_theories six
 touch "$state/fail"
 run failed-only 75 build --remote-exec "$coordinator" --remote-only BTheory
 require_grep "remote rx:ATheory: failed (proof)" "$tmpdir/failed-only.log"
 require_grep "remote execution: batch b7 failed: an action failed; remote workers finished 0 of 2 theories" "$tmpdir/failed-only.log"
-run failed 0 build --remote-exec "$coordinator" BTheory
-require_grep "batch b8 failed: an action failed; remote workers finished 0 of 2 theories; building locally" "$tmpdir/failed.log"
+run failed 1 build --remote-exec "$coordinator" BTheory
+require_grep "could not fetch the failed theory's build log; building ATheory locally" "$tmpdir/failed.log"
+require_grep "ATheory failed remotely: proof" "$tmpdir/failed.log"
 require_grep "BTheory built" "$tmpdir/failed.log"
 refute_grep "^POST /v1/batches/b8/cancel " "$state/requests.log"
 rm "$state/fail"
@@ -1461,6 +1486,104 @@ require_grep '^action .* rxlocalcas:LocalDetachedTheory$' "$state/$batch.batch"
 in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
   --remote-only --attach "$batch" LocalDetachedTheory > "$tmpdir/local-cas-attach.log" 2>&1 ||
   { cat "$tmpdir/local-cas-attach.log" "$tmpdir/worker.log" >&2; exit 1; }
+
+# Two independent proof failures retain both logs and restore the healthy
+# branch; descendants are skipped rather than reported as extra failures.
+copy_nondet multi-failure rxmultifailure
+for name in BadA BadB; do
+  cat > "$tmpdir/multi-failure/src/${name}Script.sml" <<SML
+Theory $name
+Ancestors bool
+val _ = raise Fail "independent remote failure $name";
+SML
+done
+cat > "$tmpdir/multi-failure/src/HealthyScript.sml" <<'SML'
+Theory Healthy
+Ancestors bool
+Theorem healthy: T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+SML
+cat > "$tmpdir/multi-failure/src/BlockedScript.sml" <<'SML'
+Theory Blocked
+Ancestors BadA
+val _ = raise Fail "BLOCKED_REMOTE_MUST_NOT_RUN";
+SML
+: > "$state/keep-going"
+: > "$state/ran"
+status=0
+in_copy multi-failure --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only BadATheory BadBTheory HealthyTheory BlockedTheory \
+  > "$tmpdir/multi-failure.log" 2>&1 || status=$?
+[[ $status -eq 1 ]] || { cat "$tmpdir/multi-failure.log" >&2; exit 1; }
+require_grep 'remote failure summary: 2 failed, 1 skipped' "$tmpdir/multi-failure.log"
+require_grep 'independent remote failure BadA' "$tmpdir/multi-failure.log"
+require_grep 'independent remote failure BadB' "$tmpdir/multi-failure.log"
+require_grep 'remote rxmultifailure:BlockedTheory: skipped' "$tmpdir/multi-failure.log"
+require_grep 'HealthyTheory restored from cache' "$tmpdir/multi-failure.log"
+refute_grep 'BlockedTheory' "$state/ran"
+refute_grep 'BLOCKED_REMOTE_MUST_NOT_RUN' "$tmpdir/multi-failure.log"
+for name in BadA BadB; do
+  require_file "$tmpdir/multi-failure/.holbuild/logs/current/rxmultifailure/${name}Theory/build.log"
+done
+require_file "$tmpdir/multi-failure/.holbuild/obj/src/HealthyTheory.dat"
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/multi-failure.log")
+while read -r tag key ac spec theory; do
+  [[ $tag == action ]] || continue
+  if [[ $theory == rxmultifailure:HealthyTheory ]]; then
+    require_file "$remote_root/ac/$ac"
+  else
+    [[ ! -e "$remote_root/ac/$ac" ]] || { echo "$theory published failed or skipped outputs" >&2; exit 1; }
+  fi
+done < "$state/$batch.batch"
+
+# A coordinator may omit all failure log hashes. Successful independent
+# outputs are still restored before requesting a local diagnostic retry.
+while read -r tag key ac spec theory; do
+  if [[ $tag == action && $theory == rxmultifailure:Bad* ]]; then
+    sed -i '/^log=/d' "$state/result-$key"
+  fi
+done < "$state/$batch.batch"
+# Reattach to the recorded failure without rerunning the stand-in workers.
+touch "$state/fail"
+in_copy multi-failure clean HealthyTheory > /dev/null
+[[ ! -e "$tmpdir/multi-failure/.holbuild/obj/src/HealthyTheory.dat" ]]
+status=0
+in_copy multi-failure --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only --attach "$batch" BadATheory BadBTheory HealthyTheory BlockedTheory \
+  > "$tmpdir/multi-failure-nolog.log" 2>&1 || status=$?
+rm "$state/fail"
+[[ $status -eq 75 ]] || { cat "$tmpdir/multi-failure-nolog.log" >&2; exit 1; }
+require_file "$tmpdir/multi-failure/.holbuild/obj/src/HealthyTheory.dat"
+require_grep "could not fetch the failed theory's build log: BadATheory" "$tmpdir/multi-failure-nolog.log"
+require_grep "could not fetch the failed theory's build log: BadBTheory" "$tmpdir/multi-failure-nolog.log"
+refute_grep 'Theory built\|building locally' "$tmpdir/multi-failure-nolog.log"
+
+# A non-proof final failure must install the healthy branch too, even though
+# --remote-only requests a local retry rather than diagnosing the proof.
+while read -r tag key ac spec theory; do
+  if [[ $tag == action && $theory == rxmultifailure:Bad* ]]; then
+    sed -i 's/^failure=.*/failure=memory/' "$state/result-$key"
+  fi
+done < "$state/$batch.batch"
+touch "$state/fail"
+in_copy multi-failure clean HealthyTheory > /dev/null
+status=0
+in_copy multi-failure --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only --attach "$batch" BadATheory BadBTheory HealthyTheory BlockedTheory \
+  > "$tmpdir/multi-failure-memory.log" 2>&1 || status=$?
+rm "$state/fail"
+[[ $status -eq 75 ]] || { cat "$tmpdir/multi-failure-memory.log" >&2; exit 1; }
+require_grep 'remote failure summary: 2 failed, 1 skipped' "$tmpdir/multi-failure-memory.log"
+require_grep 'failed (memory)' "$tmpdir/multi-failure-memory.log"
+require_file "$tmpdir/multi-failure/.holbuild/obj/src/HealthyTheory.dat"
+refute_grep 'Theory built\|building locally' "$tmpdir/multi-failure-memory.log"
+
+in_copy multi-failure --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only --detach --fail-fast BadATheory > "$tmpdir/multi-fail-fast.log" 2>&1
+require_grep '^POST /v1/batches?fail_fast=true ' "$state/requests.log"
+
 
 # A spec the worker rejects before any HOL runs has no log; its reason
 # reaches the client with the failure.

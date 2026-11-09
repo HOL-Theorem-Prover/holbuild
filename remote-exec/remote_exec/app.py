@@ -149,6 +149,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         request: Request,
         profile: str = "default",
         max_heap_mb: int | None = Query(default=None, gt=0, le=2147483647),
+        fail_fast: bool = False,
         action_class: Literal["build", "run"] = Query(default="build", alias="class"),
     ) -> dict[str, UUID]:
         try:
@@ -157,7 +158,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             raise HTTPException(400, str(error)) from error
         if action_class == "run" and batch.edges:
             raise HTTPException(400, "run batches require independent actions: dependency edges are not allowed")
-        return {"batch_id": await coordinator.submit(batch, profile, action_class, max_heap_mb)}
+        return {"batch_id": await coordinator.submit(batch, profile, action_class, max_heap_mb, fail_fast=fail_fast)}
 
     @app.get("/v1/batches/{batch_id}", dependencies=client)
     async def status(batch_id: UUID) -> dict[str, object]:

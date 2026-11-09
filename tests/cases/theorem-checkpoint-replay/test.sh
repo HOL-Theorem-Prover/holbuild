@@ -973,20 +973,27 @@ QED
 val _ = export_theory();
 SML
 priority_first_log=$tmpdir/priority-first.log
-if (cd "$priority_project" && "$HOLBUILD_BIN" -j2 build BTheory CTheory) > "$priority_first_log" 2>&1; then
+if (cd "$priority_project" && "$HOLBUILD_BIN" -j2 build --fail-fast BTheory CTheory) > "$priority_first_log" 2>&1; then
   echo "expected priority project first build to fail" >&2
   exit 1
 fi
 require_file "$(find "$priority_project/.holbuild/checkpoints" -name '*b_fail_failed_prefix.save' -print -quit)"
 : > "$priority_counter"
 priority_again_log=$tmpdir/priority-again.log
-if (cd "$priority_project" && "$HOLBUILD_BIN" -j2 build BTheory CTheory) > "$priority_again_log" 2>&1; then
+if (cd "$priority_project" && "$HOLBUILD_BIN" -j2 build --fail-fast BTheory CTheory) > "$priority_again_log" 2>&1; then
   echo "expected priority project repeated build to fail" >&2
   exit 1
 fi
 priority_count=$(wc -c < "$priority_counter" | tr -d ' ')
 [[ "$priority_count" = "0" ]] || { echo "scheduler ran unrelated always-reexecute target before failed_prefix; count $priority_count" >&2; exit 1; }
 require_grep "from: failed-prefix checkpoint in b_fail" "$priority_again_log"
+if (cd "$priority_project" && "$HOLBUILD_BIN" -j2 build BTheory CTheory) > "$tmpdir/priority-keep-going.log" 2>&1; then
+  echo "expected retained priority failure with keep-going" >&2
+  exit 1
+fi
+[[ $(wc -c < "$priority_counter" | tr -d ' ') == 1 ]] ||
+  { echo "keep-going did not release unrelated work after the failed prefix" >&2; exit 1; }
+require_grep 'CTheory built' "$tmpdir/priority-keep-going.log"
 
 always_context_project=$tmpdir/always-context-project
 always_context_counter=$tmpdir/always-context-counter.txt
