@@ -323,8 +323,11 @@ class Process:
     fd: int
     group: int
 
-    def alive(self) -> bool:
-        return not select.select([self.fd], [], [], 0)[0]
+    def alive(self, wait: float = 0) -> bool:
+        """Whether it is still running after waiting up to wait seconds."""
+        poller = select.poll()  # select() rejects descriptors past FD_SETSIZE
+        poller.register(self.fd, select.POLLIN)
+        return not poller.poll(max(0, int(wait * 1000)))
 
     def exists(self) -> bool:
         try:
@@ -389,6 +392,11 @@ def descendants() -> dict[int, Process]:
                         pass
                     except FileNotFoundError:
                         pass
+                    except OSError as error:
+                        # Older kernels (6.1) report a child reaped since the
+                        # read as EINVAL while its PID still names a group.
+                        if error.errno != errno.EINVAL:
+                            raise
                     finally:
                         if candidate is not None:
                             os.close(candidate.fd)
@@ -530,14 +538,7 @@ class SignalBroker:
                     raise PermissionError(errno.EPERM, "signal outside action")
             else:
                 group = process_info(request.pid)[1] if target == 0 else -target
-                selected = []
-                for process in processes.values():
-                    try:
-                        _, process.group = process_info(process.pid)
-                        if process.exists() and process.group == group:
-                            selected.append(process)
-                    except (FileNotFoundError, ProcessLookupError):
-                        pass
+                selected = group_members(processes, group)
                 if not selected:
                     # Probe with signal zero only; never send a real group
                     # signal from this privileged side of the boundary.
@@ -557,8 +558,66 @@ class SignalBroker:
                     pass
             if not delivered:
                 raise ProcessLookupError(errno.ESRCH, "signal target exited")
+            signaled = {process.pid: processes.pop(process.pid) for process in selected}
         finally:
             close_processes(processes)
+        if target <= 0 and sig != 0:
+            signal_late_members(group, sig, signaled)
+        else:
+            close_processes(signaled)
+
+
+def group_members(processes: dict[int, Process], group: int) -> list[Process]:
+    selected = []
+    for process in processes.values():
+        try:
+            _, process.group = process_info(process.pid)
+            if process.exists() and process.group == group:
+                selected.append(process)
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+    return selected
+
+
+def signal_late_members(group: int, sig: int, signaled: dict[int, Process]) -> None:
+    """Signal members that joined the group after the first scan.
+
+    The kernel's kill(-group) is atomic with fork; signaling a scanned list is
+    not. A member can fork after the scan and before its own signal, and that
+    child joins the group unsignaled. Rescan until a scan finds no new member.
+    A dying member's children reach this subreaper only at its exit, so for
+    SIGKILL that last scan must start after every signaled member exited."""
+    deadline = time.monotonic() + 2
+    try:
+        while True:
+            # A scan is complete only if every signaled member had exited
+            # before it began: until then a dying member's child can be in
+            # neither its list nor this subreaper's as the scan reads them.
+            settled = sig != signal.SIGKILL or not any(process.alive() for process in signaled.values())
+            processes = descendants()
+            try:
+                late = [process for process in group_members(processes, group)
+                        if process.pid not in signaled or
+                        (not signaled[process.pid].alive() and process.alive())]  # PID reused
+                for process in late:
+                    try:
+                        process.send(sig)
+                    except ProcessLookupError:
+                        continue
+                    if process.pid in signaled:
+                        os.close(signaled[process.pid].fd)
+                    signaled[process.pid] = processes.pop(process.pid)
+            finally:
+                close_processes(processes)
+            if not late and settled:
+                return
+            if time.monotonic() > deadline:
+                return  # bounded: a fork storm or a stuck exit ends the follow-up
+            if sig == signal.SIGKILL:
+                for process in signaled.values():
+                    process.alive(deadline - time.monotonic())
+    finally:
+        close_processes(signaled)
 
 
 def spellings(name: str) -> tuple[set[Path], set[Path]]:
