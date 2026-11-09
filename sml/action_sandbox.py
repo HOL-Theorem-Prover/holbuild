@@ -264,6 +264,21 @@ class Policy:
     def exposes(self, grant: Path) -> bool:
         return any(path == grant or grant in path.parents or path in grant.parents for path in self.forbidden)
 
+    def poly_temporaries(self) -> set[Path]:
+        # Poly/ML's OS.FileSys.tmpName names: /tmp/MLTEMPxxxxxx and files
+        # named after them.
+        return {path for scratch in self.scratch for path in scratch.glob("MLTEMP*")}
+
+    def remove_temporaries(self, before: set[Path]) -> None:
+        # Only files this action created, so a later action can't read them.
+        for path in self.poly_temporaries() - before:
+            try:
+                info = path.lstat()
+                if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid():
+                    path.unlink()
+            except FileNotFoundError:
+                pass
+
     def validate_outputs(self) -> None:
         # With all descendants reaped, one no-follow walk validates every file
         # the trusted caller can harvest without a check/read race.
@@ -545,6 +560,7 @@ class SignalBroker:
 def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = None) -> int:
     policy.validate()
     policy.validate_outputs()
+    temporaries = policy.poly_temporaries()
     # CONFIG_PROC_CHILDREN is required by the verified descendant walk.
     Path(f"/proc/self/task/{os.getpid()}/children").read_text()
     home = policy.writable[0] / ".holbuild/sandbox-home"
@@ -645,6 +661,7 @@ def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = N
     finally:
         try:
             status = finish_children(child)
+            policy.remove_temporaries(temporaries)
         finally:
             if broker is not None:
                 broker.close()

@@ -6,6 +6,7 @@ source "$SCRIPT_DIR/../../lib.sh"
 tmpdir=$(make_temp_dir)
 cleanup() {
   if [[ -n "${server_pid:-}" ]]; then kill "$server_pid"; wait "$server_pid" 2>/dev/null || true; fi
+  for dir in "${tmp_worker:-}" "${var_tmp_worker:-}"; do [[ -z "$dir" ]] || rm -rf "$dir"; done
   cleanup_temp_dir "$tmpdir"
 }
 trap cleanup EXIT
@@ -74,10 +75,47 @@ Proof
   simp[]
 QED
 SML
-(cd "$tmpdir/project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload IsolatedTheory LockedTheory) > "$tmpdir/batch"
+# Poly/ML creates OS.FileSys.tmpName files in /tmp whatever TMPDIR says.
+# Two copies, since the first one's result would be reused.
+for name in TmpWithheld TmpGranted; do
+  cat > "$tmpdir/project/src/${name}Script.sml" <<SML
+Theory $name
+Ancestors bool
+
+val _ = print ("tmpName " ^ OS.FileSys.tmpName () ^ "\\n")
+        handle OS.SysErr _ => print "tmpName withheld\\n";
+Theorem tmp: T
+Proof
+  simp[]
+QED
+SML
+done
+(cd "$tmpdir/project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload \
+  IsolatedTheory LockedTheory TmpWithheldTheory TmpGrantedTheory) > "$tmpdir/batch"
 spec=$(awk '$1 == "action" && $5 == "isolation:IsolatedTheory" {print $4}' "$tmpdir/batch")
 locked=$(awk '$1 == "action" && $5 == "isolation:LockedTheory" {print $4}' "$tmpdir/batch")
-[[ -n "$spec" && -n "$locked" ]]
+withheld=$(awk '$1 == "action" && $5 == "isolation:TmpWithheldTheory" {print $4}' "$tmpdir/batch")
+granted=$(awk '$1 == "action" && $5 == "isolation:TmpGrantedTheory" {print $4}' "$tmpdir/batch")
+[[ -n "$spec" && -n "$locked" && -n "$withheld" && -n "$granted" ]]
+# /tmp is granted only when no worker state lies beneath it; the action's own
+# temporary files are removed after it.
+run_tmp_action() {
+  local worker=$1 tmp_spec=$2
+  link_hol_toolchain_cache "$worker/cache"
+  HOLBUILD_COOPERATE_DIR= HOLBUILD_CACHE="$worker/cache" "$HOLBUILD_BIN" --max-heap 1024 \
+    --remote-cache "$remote_url" exec-action "$tmp_spec" --cache-limit-gb 1000 --result "$worker/result" \
+    > "$worker/log" 2>&1 || { cat "$worker/log" "$worker/result" >&2; exit 1; }
+  grep -q "^status=built$" "$worker/result" || { cat "$worker/log" "$worker/result" >&2; exit 1; }
+  local log
+  log=$(sed -n 's/^log=\([^ ]*\) .*/\1/p' "$worker/result")
+  grep '^tmpName ' "$tmpdir/remote/cas/$log"
+}
+tmp_worker=$(mktemp -d /tmp/holbuild-test-tmp.XXXXXX)
+[[ $(run_tmp_action "$tmp_worker" "$withheld") == "tmpName withheld" ]] || { echo '/tmp granted over worker state' >&2; exit 1; }
+var_tmp_worker=$(mktemp -d /var/tmp/holbuild-test-tmp.XXXXXX)
+granted=$(run_tmp_action "$var_tmp_worker" "$granted")
+[[ $granted == "tmpName /tmp/MLTEMP"* ]] || { echo "/tmp not granted: $granted" >&2; exit 1; }
+[[ ! -e ${granted#tmpName } ]] || { echo "action temporary survived: ${granted#tmpName }" >&2; exit 1; }
 link_hol_toolchain_cache "$tmpdir/worker"
 set +e
 HOLBUILD_CACHE="$tmpdir/worker" "$HOLBUILD_BIN" --max-heap 1024 --remote-cache "$remote_url" \
