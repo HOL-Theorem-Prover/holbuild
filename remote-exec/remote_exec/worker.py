@@ -51,8 +51,11 @@ def check_sandbox(executable: str) -> None:
     subprocess.run([executable, "sandbox-check"], check=True, stdin=subprocess.DEVNULL, timeout=30)
 
 
-# ECS task scale-in protection lasts this long unless a heartbeat renews it, so a dead worker loses it.
-PROTECTION_MINUTES = 10
+# How long each ECS scale-in protection call protects the task. ECS refuses renewals with DEPLOYMENT_BLOCKED once a
+# service has more protected tasks than it wants (a scale-in or a rolling deployment), so the window set when the
+# action was claimed must outlast the longest action. A dead worker still loses it: its container is the task's
+# essential one, so the task stops with it, and the worker clears protection when an action ends or loses its lease.
+PROTECTION_MINUTES = 180
 CLAIM_RETRY_SECONDS = 5  # least time between two claims that found nothing
 # What exec-action runs with besides holbuild's own HOLBUILD_* settings: what curl, git and the locale read. The rest
 # of the worker's environment, its coordinator token above all, stays out of the builds' environment.
