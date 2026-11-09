@@ -4831,7 +4831,39 @@ fun alias_cache_entry old_key new_key =
   end
   handle e => warn ("could not alias cache entry: " ^ General.exnMessage e)
 
-fun build_theory_node dat_hash_cache (options : build_options) tc project base_context plan keys toolchain_key node input_key =
+type speculative_result =
+  {stage_root : string, stage : string, log_dir : string,
+   generated_metadata : {parents : string list, mldeps : string list}}
+
+(* Installs a speculative proof of theory NODE (see "Pipelined builds"
+   below) whose parents have all built and passed the gate, as building it
+   from source would. *)
+fun commit_speculative dat_hash_cache (options : build_options) project plan keys toolchain_key node
+      ({stage_root, stage, log_dir, generated_metadata} : speculative_result) =
+  let
+    val policy = checkpoint_policy_for_node options project node
+    val input_key = HolbuildBuildPlan.input_key_for keys node
+    val root = project_artifact_root project
+    val logical = logical_name node
+    val current_log = current_log_dir root (package node) logical
+    val {sig_path, sml_path, data_path, ...} = theory_outputs node
+  in
+    install_theory_stage (#use_cache options andalso cache_enabled node) policy
+      {stage = stage, logical = logical, source_file = source_file node, input_key = input_key,
+       outputs = {sig_path = sig_path, sml_path = sml_path, data_path = data_path},
+       staged_extra_outputs = [], generated_metadata = generated_metadata, log_dir = current_log};
+    if file_exists (current_build_log log_dir) then
+      (ensure_dir current_log; copy_binary (current_build_log log_dir) (current_build_log current_log))
+    else ();
+    write_local_theory_manifests plan node generated_metadata;
+    remove_tree stage_root;
+    invalidate_cached_file_hash dat_hash_cache data_path;
+    write_metadata (#emit_output_hashes options) policy (tactic_timeout policy) project plan keys
+      input_key toolchain_key node;
+    cache_trace ("pipeline: committed: " ^ logical)
+  end
+
+fun build_theory_node speculated dat_hash_cache (options : build_options) tc project base_context plan keys toolchain_key node input_key =
   let
     val policy = checkpoint_policy_for_node options project node
     val stage = stage_dir project input_key
@@ -4907,6 +4939,11 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
         (HolbuildHolSharedCache.local_build_needed := true;
          raise Error (logical_name node ^ " is not in the remote cache, and --remote-only builds nothing locally"))
       else
+      case speculated of
+          SOME result =>
+            (commit_speculative dat_hash_cache options project plan keys toolchain_key node result;
+             HolbuildStatus.Built)
+        | NONE =>
       (build_theory dat_hash_cache cache_allowed policy tc project base_context plan keys toolchain_key node;
        invalidate_node_dat_hash ();
        write_metadata (#emit_output_hashes options) policy (tactic_timeout policy) project plan keys input_key toolchain_key node;
@@ -4970,12 +5007,14 @@ fun build_theory_node dat_hash_cache (options : build_options) tc project base_c
         | NONE => restore_or_build ()
   end
 
-fun build_node dat_hash_cache options tc project base_context plan keys toolchain_key node =
+(* SPECULATED: a speculative proof of the theory NODE to install in place of
+   building it from source. *)
+fun build_node speculated dat_hash_cache options tc project base_context plan keys toolchain_key node =
   let val input_key = HolbuildBuildPlan.input_key_for keys node
   in
     case #kind (HolbuildBuildPlan.source_of node) of
         HolbuildSourceIndex.TheoryScript =>
-          build_theory_node dat_hash_cache options tc project base_context plan keys toolchain_key node input_key
+          build_theory_node speculated dat_hash_cache options tc project base_context plan keys toolchain_key node input_key
       | HolbuildSourceIndex.Sml =>
           if not (force_node options project node) andalso not (always_reexecute node) andalso
              up_to_date dat_hash_cache (#emit_output_hashes options) (#allow_cache_timeout_discrepancy options)
@@ -5027,12 +5066,12 @@ fun all_nodes_up_to_date options project plan keys toolchain_key =
 fun report_all_up_to_date status project keys plan =
   List.app (report_up_to_date_node status project keys) (HolbuildBuildPlan.selected_nodes plan)
 
-fun build_one dat_hash_cache status options tc project base_context plan keys toolchain_key node =
+fun build_one speculated dat_hash_cache status options tc project base_context plan keys toolchain_key node =
   let
     val key = HolbuildBuildPlan.key node
     val label = HolbuildBuildPlan.logical_name node
     val _ = HolbuildStatus.start_node status key label
-    val outcome = build_node dat_hash_cache options tc project base_context plan keys toolchain_key node
+    val outcome = build_node speculated dat_hash_cache options tc project base_context plan keys toolchain_key node
   in
     (* Its outputs are final now; a digest taken earlier may be stale. *)
     HolbuildBuildPlan.forget_output_digest plan node;
@@ -5385,11 +5424,6 @@ fun mentions_at_identifier_start text word =
     search 0
   end
 
-(* Proofs that may do more than prove their goal stay in the outline. *)
-val outline_inline_words =
-  ["cv_", "suspend", "Resume", "save_thm", "new_", "export_", "overload", "set_", "cheat",
-   "store_thm", "Define", "xDefine", "tDefine", "Datatype", "Hol_defn", "mk_thm", "mk_oracle_thm"]
-
 (* Accepts any goal with a theorem that carries no dependency record, so
    saving it numbers it as saving the proved theorem would. *)
 val outline_stub_tactic =
@@ -5398,32 +5432,37 @@ val outline_stub_tactic =
   "((((\"bool\", 0), []), []), w :: asl))) (asl, w))"
 
 (* The outline of the theory script SOURCE_TEXT, with BOUNDARIES its
-   theorem spans; NONE where the script must not be outlined.  Each stub
-   keeps the newlines of the proof it replaces, so line numbers stay. *)
+   theorem spans: every proof replaced by the stub, keeping the newlines of
+   the proof it replaces so line numbers stay.  A proof that is just
+   `cheat` stays, so its oracle stays.  A proof that suspends goals stays
+   too, so they are still suspended for its `Resume` blocks (whose proofs
+   are stubbed) and its `Finalise` saves the theorem where the real build
+   does.  Anything a stubbed proof did besides proving its goal shows up
+   at the gate. *)
 fun outline_source source_text boundaries =
-  if List.exists (fn word => String.isSubstring word source_text) ["cheat", "mk_oracle_thm", "mk_thm"]
-  then NONE
-  else
-    let
-      fun newlines text = String.implode (List.filter (fn c => c = #"\n") (String.explode text))
-      fun splice [] pos acc = String.concat (rev (String.extract (source_text, pos, NONE) :: acc))
-        | splice ({kind, tactic_start, tactic_end, ...} :: rest) pos acc =
-            if kind <> "theorem" then splice rest pos acc
-            else if tactic_start < pos orelse tactic_end < tactic_start then
-              raise Error "theorem spans out of order"
-            else
-              let val tactic = String.substring (source_text, tactic_start, tactic_end - tactic_start)
-              in
-                if List.exists (mentions_at_identifier_start tactic) outline_inline_words then
-                  splice rest pos acc
-                else
-                  splice rest tactic_end
-                    (outline_stub_tactic ^ newlines tactic ::
-                     String.substring (source_text, pos, tactic_start - pos) :: acc)
-              end
-    in
-      SOME (splice boundaries 0 [])
-    end
+  let
+    fun newlines text = String.implode (List.filter (fn c => c = #"\n") (String.explode text))
+    fun stubbed kind tactic =
+      kind = "resume" orelse
+      (kind = "theorem" andalso
+       Substring.string (Substring.dropr Char.isSpace (Substring.dropl Char.isSpace (Substring.full tactic))) <> "cheat" andalso
+       not (mentions_at_identifier_start tactic "suspend"))
+    fun splice [] pos acc = String.concat (rev (String.extract (source_text, pos, NONE) :: acc))
+      | splice ({kind, tactic_start, tactic_end, ...} :: rest) pos acc =
+          if tactic_start < pos orelse tactic_end < tactic_start then
+            raise Error "theorem spans out of order"
+          else
+            let val tactic = String.substring (source_text, tactic_start, tactic_end - tactic_start)
+            in
+              if not (stubbed kind tactic) then splice rest pos acc
+              else
+                splice rest tactic_end
+                  (outline_stub_tactic ^ newlines tactic ::
+                   String.substring (source_text, pos, tactic_start - pos) :: acc)
+            end
+  in
+    splice boundaries 0 []
+  end
 
 (* Theory data as HOLsexp prints it: symbols, strings (as written, escapes
    included), integers, and lists, dotted or not, as Cons cells ending in
@@ -5573,8 +5612,13 @@ fun view_stem view stem = getOpt (view stem, stem)
 
 fun outline_view root (outlined : (HolbuildBuildPlan.node * string) list) =
   let
+    (* A signature shares its library's load stem, and the library's
+       outline has both manifests. *)
+    fun is_signature (node, _) = #kind (HolbuildBuildPlan.source_of node) = HolbuildSourceIndex.Sig
+    val (signatures, others) = List.partition is_signature outlined
     val table =
-      map (fn (node, base) => (load_stem node, outline_path root base (load_stem node))) outlined
+      map (fn (node, base) => (load_stem node, outline_path root base (load_stem node)))
+          (others @ signatures)
   in
     fn stem => Option.map #2 (List.find (fn (s, _) => s = stem) table)
   end
@@ -5600,8 +5644,6 @@ fun speculative_policy (CheckpointPolicy {proof_steps, new_ir, tactic_timeout, .
                     new_ir = new_ir, tactic_timeout = tactic_timeout, execution_plan = NONE,
                     trace_steps = false, repl_on_failure = false, trknl = false}
 
-exception NotOutlined
-
 fun signature_companion plan node =
   List.find
     (fn candidate => same_package_logical candidate node andalso
@@ -5611,8 +5653,7 @@ fun signature_companion plan node =
 (* Builds the outline of NODE under BASE, its dependencies loaded through
    VIEW, in run directory RUN_DIR (for its stage name, the unique BASE's
    name).  A library or signature's outline is its load manifests; a
-   theory's is its outlined script's outputs and manifests.  Raises
-   NotOutlined for a script that must not be outlined. *)
+   theory's is its outlined script's outputs and manifests. *)
 fun build_outline tc project base_context plan keys toolchain_key run_dir view base node =
   let
     val root = project_artifact_root project
@@ -5632,10 +5673,7 @@ fun build_outline tc project base_context plan keys toolchain_key run_dir view b
           let
             val source = source_file node
             val source_text = read_text source
-            val outlined =
-              case outline_source source_text (discover_theorem_boundaries_strict source source_text) of
-                  SOME text => text
-                | NONE => raise NotOutlined
+            val outlined = outline_source source_text (discover_theorem_boundaries_strict source source_text)
             val name = Path.file base
             val key = HolbuildBuildPlan.input_key_for keys node ^ ".outline" ^ name
             val action = speculative_action root plan keys toolchain_key view key node
@@ -5664,10 +5702,6 @@ fun build_outline tc project base_context plan keys toolchain_key run_dir view b
           end
   end
 
-type speculative_result =
-  {stage_root : string, stage : string, log_dir : string,
-   generated_metadata : {parents : string list, mldeps : string list}}
-
 (* Proves theory NODE with its dependencies loaded through VIEW, staged
    under run name NAME, and leaves its outputs in the stage. *)
 fun build_speculative options tc project base_context plan keys toolchain_key run_dir view name node =
@@ -5688,34 +5722,6 @@ fun build_speculative options tc project base_context plan keys toolchain_key ru
      generated_metadata = generated_metadata}
   end
 
-(* Installs a speculative proof of theory NODE whose parents have all
-   built and passed the gate, as building it from source would. *)
-fun commit_speculative dat_hash_cache (options : build_options) project plan keys toolchain_key node
-      ({stage_root, stage, log_dir, generated_metadata} : speculative_result) =
-  let
-    val policy = checkpoint_policy_for_node options project node
-    val input_key = HolbuildBuildPlan.input_key_for keys node
-    val root = project_artifact_root project
-    val logical = logical_name node
-    val current_log = current_log_dir root (package node) logical
-    val {sig_path, sml_path, data_path, ...} = theory_outputs node
-  in
-    remove_file (metadata_path project node);
-    install_theory_stage (#use_cache options andalso cache_enabled node) policy
-      {stage = stage, logical = logical, source_file = source_file node, input_key = input_key,
-       outputs = {sig_path = sig_path, sml_path = sml_path, data_path = data_path},
-       staged_extra_outputs = [], generated_metadata = generated_metadata, log_dir = current_log};
-    if file_exists (current_build_log log_dir) then
-      (ensure_dir current_log; copy_binary (current_build_log log_dir) (current_build_log current_log))
-    else ();
-    write_local_theory_manifests plan node generated_metadata;
-    remove_tree stage_root;
-    invalidate_cached_file_hash dat_hash_cache data_path;
-    write_metadata (#emit_output_hashes options) policy (tactic_timeout policy) project plan keys
-      input_key toolchain_key node;
-    HolbuildStatus.Built
-  end
-
 fun build_serial dat_hash_cache status options tc project base_context plan keys toolchain_key budget_state =
   let
     fun error_message e =
@@ -5728,7 +5734,7 @@ fun build_serial dat_hash_cache status options tc project base_context plan keys
           ErrorWithDebugArtifacts (_, artifacts) => artifacts
         | _ => HolbuildStatus.no_debug_artifacts
     fun one node =
-      build_one dat_hash_cache status options tc project base_context plan keys toolchain_key node
+      build_one NONE dat_hash_cache status options tc project base_context plan keys toolchain_key node
       handle e =>
         let
           val msg = error_message e
@@ -5820,7 +5826,7 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
       | CommitWork of int * speculative_result
       | OutlineWork of int * int * (HolbuildBuildPlan.node * string) list
       | AttemptWork of int * int * (HolbuildBuildPlan.node * string) list
-    datatype 'a speculation = Succeeded of 'a | NotCold | NotOutlinable | Failed of string
+    datatype 'a speculation = Succeeded of 'a | NotCold | Failed of string
     val deps_of = Array.array (node_count, [] : int list)
     val committed = Array.array (node_count, false)
     val plain_started = Array.array (node_count, false)
@@ -5836,7 +5842,7 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
     val attempt_queue = ref ([] : (int * int) list)
     val commit_queue = ref ([] : (int * speculative_result) list)
     val counts = {outlines = ref 0, outline_failures = ref 0, gate_failures = ref 0,
-                  attempt_failures = ref 0, commits = ref 0}
+                  attempt_failures = ref 0}
     val _ = if pipelining then remove_tree (Path.concat(root, ".holbuild/outline")) else ()
 
     fun node_name id = HolbuildBuildPlan.logical_name (Vector.sub (nodes, id))
@@ -6044,10 +6050,13 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
     fun is_theory id =
       #kind (HolbuildBuildPlan.source_of (Vector.sub (nodes, id))) = HolbuildSourceIndex.TheoryScript
 
+    (* A speculative proof saves no checkpoints, so a theory that keeps them
+       builds only from its committed parents. *)
     fun speculable id =
       let val node = Vector.sub (nodes, id)
       in
         is_theory id andalso Array.sub (cold, id) <> SOME false andalso
+        not (checkpoint_enabled (checkpoint_policy_for_node options project node)) andalso
         null (source_extra_output_declarations plan node) andalso not (always_reexecute node) andalso
         not (failed_prefix_priority_node id)
       end
@@ -6310,7 +6319,7 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
             in with_lock (fn () => Array.update (cold, id, SOME value)); value end
 
     fun speculate run =
-      run () handle NotOutlined => NotOutlinable | e => Failed (build_error_message e)
+      run () handle e => Failed (build_error_message e)
 
     fun finish_outline_locked id gen base outcome =
       (running := !running - 1;
@@ -6326,7 +6335,6 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
                         pipeline_trace ("outline ready: " ^ node_name id);
                         List.app consider_locked (Array.sub (dependents, id)))
                    | NotCold => (Array.update (cold, id, SOME false); Array.update (outline, id, OOff))
-                   | NotOutlinable => Array.update (outline, id, OOff)
                    | Failed msg =>
                        (Array.update (outline, id, OOff);
                         #outline_failures counts := !(#outline_failures counts) + 1;
@@ -6351,7 +6359,6 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
                         (Array.update (attempt, id, ADone (gen, consumed, result));
                          pipeline_trace ("attempt done: " ^ node_name id))
                     | NotCold => (Array.update (cold, id, SOME false); Array.update (attempt, id, AOff))
-                    | NotOutlinable => Array.update (attempt, id, AOff)
                     | Failed msg =>
                         (Array.update (attempt, id, AOff);
                          #attempt_failures counts := !(#attempt_failures counts) + 1;
@@ -6422,21 +6429,6 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
                         signal ())))
       end
 
-    fun commit_one id result =
-      let
-        val node = Vector.sub (nodes, id)
-        val key = HolbuildBuildPlan.key node
-        val label = HolbuildBuildPlan.logical_name node
-        val _ = HolbuildStatus.start_node status key label
-        val outcome = commit_speculative dat_hash_cache options project plan keys toolchain_key node result
-      in
-        HolbuildBuildPlan.forget_output_digest plan node;
-        HolbuildStatus.finish_node status key label outcome;
-        with_lock (fn () => #commits counts := !(#commits counts) + 1);
-        pipeline_trace ("committed: " ^ label);
-        outcome
-      end
-
     fun worker () =
       let
         fun loop () =
@@ -6445,9 +6437,13 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
             | SOME (OutlineWork (id, gen, view)) => (run_outline id gen view; loop ())
             | SOME (AttemptWork (id, gen, view)) => (run_attempt id gen view; loop ())
             | SOME (CommitWork (id, result)) =>
-                build id (fn node => commit_one id result)
+                build id
+                  (fn node =>
+                      build_one (SOME result) dat_hash_cache status options tc project base_context plan keys
+                        toolchain_key node
+                      before remove_tree (#stage_root result))
             | SOME (PlainWork id) =>
-                build id (fn node => build_one dat_hash_cache status options tc project base_context plan keys toolchain_key node)
+                build id (fn node => build_one NONE dat_hash_cache status options tc project base_context plan keys toolchain_key node)
         and build id run =
                 let val node = Vector.sub (nodes, id)
                 in
@@ -6519,15 +6515,14 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
       val threads = List.tabulate (jobs, fn _ => Thread.fork (worker, []))
       val result = wait_workers_result ()
       val _ = wait_worker_threads threads
-      val {outlines, outline_failures, gate_failures, attempt_failures, commits} = counts
+      val {outlines, outline_failures, gate_failures, attempt_failures} = counts
     in
       if pipelining then
         (remove_speculation ();
          pipeline_trace ("summary: outlines=" ^ Int.toString (!outlines) ^
                          " outline_failures=" ^ Int.toString (!outline_failures) ^
                          " gate_failures=" ^ Int.toString (!gate_failures) ^
-                         " attempt_failures=" ^ Int.toString (!attempt_failures) ^
-                         " commits=" ^ Int.toString (!commits)))
+                         " attempt_failures=" ^ Int.toString (!attempt_failures)))
       else ();
       raise_failure result
     end

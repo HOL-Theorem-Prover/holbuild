@@ -12,10 +12,11 @@ cleanup() { rm -rf "$tmpdir"; }
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
-# Pipelined builds: a child proves against its parent's outline while the
-# parent proves, and is committed only once every outline it loaded passed
-# the gate.  Each project is also built with pipelining off, and both builds
-# must produce the same theory data.
+# Pipelined builds (here of theories without checkpoints): a child proves
+# against its parent's outline while the parent proves, and is committed
+# only once every outline it loaded passed the gate.  Each project is also
+# built with pipelining off, and both builds must produce the same theory
+# data.
 
 new_project() {
   local project=$tmpdir/$1
@@ -69,7 +70,7 @@ SML
 
 build_pipelined() {
   local name=$1 target=$2
-  (cd "$tmpdir/$name" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j4 build "$target") > "$tmpdir/$name.log" 2>&1
+  (cd "$tmpdir/$name" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j4 build --skip-checkpoints "$target") > "$tmpdir/$name.log" 2>&1
 }
 
 # Builds a copy of project NAME with pipelining off and compares the theory
@@ -80,7 +81,7 @@ require_same_as_unpipelined() {
   rm -rf "$tmpdir/$name-off"
   cp -r "$tmpdir/$name" "$tmpdir/$name-off"
   rm -rf "$tmpdir/$name-off/.holbuild"
-  (cd "$tmpdir/$name-off" && HOLBUILD_PIPELINE=off "$HOLBUILD_BIN" -j4 build --no-cache "$target") \
+  (cd "$tmpdir/$name-off" && HOLBUILD_PIPELINE=off "$HOLBUILD_BIN" -j4 build --no-cache --skip-checkpoints "$target") \
     > "$tmpdir/$name-off.log" 2>&1
   local theory
   for theory in "$@"; do
@@ -99,6 +100,8 @@ require_no_grep() {
 }
 
 # The gate passes: B and C are committed from their speculative attempts.
+# A's suspended theorem keeps its proof up to the suspensions in the outline,
+# so its Finalise still saves it in place, with its attributes.
 new_project pass
 cat > "$tmpdir/pass/src/AScript.sml" <<SML
 open HolKernel Parse boolLib bossLib;
@@ -108,6 +111,18 @@ Theorem a_thm:
 Proof
   $slow_truth
 QED
+Theorem a_split:
+  T /\\ T
+Proof
+  CONJ_TAC >- suspend "left" >> suspend "right"
+QED
+Resume a_split[left]:
+  ACCEPT_TAC TRUTH
+QED
+Resume a_split[right]:
+  ACCEPT_TAC TRUTH
+QED
+Finalise a_split[simp]
 val _ = export_theory();
 SML
 write_b_and_c pass
@@ -124,11 +139,20 @@ if [[ -n "$(ls -A "$tmpdir/pass/.holbuild/outline")" ]]; then
   exit 1
 fi
 require_same_as_unpipelined pass CTheory A B C
-(cd "$tmpdir/pass" && "$HOLBUILD_BIN" --verbose build CTheory) > "$tmpdir/pass-again.log"
+(cd "$tmpdir/pass" && "$HOLBUILD_BIN" --verbose build --skip-checkpoints CTheory) > "$tmpdir/pass-again.log"
 require_grep "CTheory is up to date" "$tmpdir/pass-again.log"
 
+# A speculative proof saves no checkpoints, so theories that keep them
+# build only on committed parents.
+cp -r "$tmpdir/pass" "$tmpdir/checkpointed"
+rm -rf "$tmpdir/checkpointed/.holbuild"
+(cd "$tmpdir/checkpointed" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j4 build --no-cache CTheory) \
+  > "$tmpdir/checkpointed.log" 2>&1
+require_no_grep "attempt done" "$tmpdir/checkpointed.log"
+
 # The digest differs: B's theorem comes from A's cheat, its stub doesn't, so
-# C's attempt on B's outline is dropped and C builds on the real B.
+# C's attempt on B's outline is dropped and C builds on the real B.  A's
+# proof is just `cheat`, which its outline keeps, so A passes.
 new_project digest
 cat > "$tmpdir/digest/src/AScript.sml" <<'SML'
 open HolKernel Parse boolLib bossLib;
@@ -154,7 +178,7 @@ SML
 sed -i 's/T \/\\ T/T/' "$tmpdir/digest/src/CScript.sml"
 build_pipelined digest CTheory
 log=$tmpdir/digest.log
-require_no_grep "outline ready: ATheory" "$log"
+require_grep "pipeline: gate passed: ATheory" "$log"
 require_grep "pipeline: gate failed: BTheory (digest differs)" "$log"
 require_no_grep "committed: CTheory" "$log"
 require_file "$tmpdir/digest/.holbuild/plan/outline-skip"

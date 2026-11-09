@@ -54,7 +54,7 @@ val _ = export_theory();
 SML
 
 log=$tmpdir/build.log
-if (cd "$project" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j4 build CTheory) > "$log" 2>&1; then
+if (cd "$project" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j4 build --skip-checkpoints CTheory) > "$log" 2>&1; then
   echo "build of a failing theory succeeded" >&2
   cat "$log" >&2
   exit 1

@@ -12,6 +12,8 @@ cleanup() { rm -rf "$tmpdir"; }
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 export HOLBUILD_FORCE_COUNTER_DIR="$tmpdir/counters"
+# Counts script runs; a pipelined build also runs a script for its outline.
+export HOLBUILD_PIPELINE=off
 mkdir -p "$HOLBUILD_FORCE_COUNTER_DIR"
 
 count_file() {
