@@ -165,7 +165,7 @@ run_worker() {
   set +e
   HOLBUILD_CACHE=$cache HOLBUILD_POLY=$fakebin/poly HOLBUILD_POLYC=${POLYC:-$fakebin/polyc} \
     HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES="$hol=master" HOLBUILD_REMOTE_CACHE_CURL_CONFIG=$secret \
-    HOLBUILD_COOPERATE_DIR= "$HOLBUILD_BIN" --max-heap 1024 --remote-cache "$remote_url" \
+    HOLBUILD_COOPERATE_DIR= timeout 300 "$HOLBUILD_BIN" --max-heap 1024 --remote-cache "$remote_url" \
     exec-action "$target" --cache-limit-gb 1000 --result "$log.result" > "$log" 2>&1
   set -e
 }
@@ -223,6 +223,48 @@ if grep ALLOWED "$tmpdir/bad-analyser.log"; then exit 1; fi
 run_worker "$worker" "$(retarget "$hol_rev")" "$tmpdir/analyser-retry.log"
 require_grep "the toolchain's identity does not match the action text" "$tmpdir/analyser-retry.log"
 [[ -n $(find "$entry/analysers" -name build.ok) ]]
+
+# A published archive whose manifest is not a regular file is refused before
+# anything reads it (a FIFO would block the reader for good).
+python3 - "$tmpdir/remote" <<'PY'
+import hashlib, io, pathlib, re, sys, tarfile
+root = pathlib.Path(sys.argv[1])
+name = ".holbuild-toolchain-archive-manifest"
+for record in (root / "ac").rglob("*"):
+    if not record.is_file():
+        continue
+    text = record.read_text(errors="replace")
+    for old in set(re.findall(r"[0-9a-f]{64}", text)):
+        blob = root / "cas" / old
+        if not blob.is_file() or not tarfile.is_tarfile(blob):
+            continue
+        with tarfile.open(blob) as src:
+            members = [(m, src.extractfile(m).read() if m.isreg() else None) for m in src.getmembers()]
+        if not any(m.name.removeprefix("./") == name for m, _ in members):
+            continue
+        out = io.BytesIO()
+        with tarfile.open(fileobj=out, mode="w") as dst:
+            for member, data in members:
+                if member.name.removeprefix("./") == name:
+                    fifo = tarfile.TarInfo(member.name)
+                    fifo.type = tarfile.FIFOTYPE
+                    dst.addfile(fifo)
+                else:
+                    dst.addfile(member, None if data is None else io.BytesIO(data))
+        data = out.getvalue()
+        new = hashlib.sha256(data).hexdigest()
+        (root / "cas" / new).write_bytes(data)
+        text = text.replace(f"{old} {blob.stat().st_size}", f"{new} {len(data)}").replace(old, new)
+        head, marker, manifest = text.partition("manifest-text-v1\n")
+        head = re.sub(r"manifest-sha256 \S+", "manifest-sha256 " + hashlib.sha256(manifest.encode()).hexdigest(), head)
+        head = re.sub(r"manifest-size \S+", f"manifest-size {len(manifest.encode())}", head)
+        record.write_text(head + marker + manifest)
+        print("fifo manifest in", record.name)
+PY
+rm -rf "$entry"
+run_worker "$worker" "$(retarget "$hol_rev")" "$tmpdir/fifo.log"
+require_grep 'extracted toolchain archive manifest is missing' "$tmpdir/fifo.log"
+require_grep "the toolchain's identity does not match the action text" "$tmpdir/fifo.log"
 
 # A build that links out of its tree fails, and leaves nothing behind.
 printf '%s\n' "$secret" > "$hol/escape"
