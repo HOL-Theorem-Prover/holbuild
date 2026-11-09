@@ -7869,9 +7869,9 @@ fun cgroup_oom_kills () =
   handle _ => []
 
 fun peak_rss_mb stage =
-  case String.tokens Char.isSpace (read_text (Path.concat(stage, peak_rss_report_name))) of
+  (case String.tokens Char.isSpace (read_text (Path.concat(stage, peak_rss_report_name))) of
       ["VmHWM:", kb, "kB"] => Option.map (fn n => n div 1024) (Int.fromString kb)
-    | _ => NONE
+    | _ => NONE)
   handle _ => NONE
 
 (* The child's own report of a full disk; a checkpoint write that failed
