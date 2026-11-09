@@ -295,7 +295,8 @@ cp "$hol/tools/attack.sh" "$tmpdir/analysers/key/attack.sh"
 cat > "$analyser" <<SH
 #!/bin/sh
 sh '$tmpdir/analysers/key/attack.sh' analyser
-setsid sh -c 'echo "detached \$\$"; exec sleep 30 > /dev/null' &
+setsid sleep 30 > /dev/null &
+echo "detached \$!"
 while [ "\$#" -gt 0 ]; do
   case "\$1" in
     --response) response=\$2; shift 2 ;;
