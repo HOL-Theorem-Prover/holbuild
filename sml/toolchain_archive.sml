@@ -47,12 +47,7 @@ fun validate_extracted_manifest {staging_dir, identity} =
        remove_file path)
   end
 
-fun fresh_temp_name () =
-  let val placeholder = FS.tmpName ()
-  in
-    remove_file placeholder;
-    placeholder
-  end
+fun fresh_temp_name () = HolbuildTempPath.temporary "archive"
 
 fun temp_path label =
   let val unique = fresh_temp_name ()

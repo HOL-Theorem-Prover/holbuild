@@ -1653,7 +1653,7 @@ fun tail_text path =
   if not (file_exists path) then ""
   else
     let
-      val tmp = FS.tmpName ()
+      val tmp = HolbuildTempPath.temporary "log-tail"
       val _ = OS.Process.system ("tail -n 80 " ^ HolbuildToolchain.quote path ^
                                  " > " ^ HolbuildToolchain.quote tmp ^ " 2>/dev/null")
       val text = read_text tmp handle _ => ""
@@ -4357,8 +4357,8 @@ fun analyser_proof_ir_plan_sml (inputs : proof_ir_input list) =
           fun proof_line (i, {name, tactic_start, tactic_end, tactic_text} : proof_ir_input) =
             HolbuildAnalysisProtocol.join ["theorem", Int.toString i, name,
                                            Int.toString tactic_start, Int.toString tactic_end, tactic_text]
-          val req = OS.FileSys.tmpName ()
-          val resp = OS.FileSys.tmpName ()
+          val req = HolbuildTempPath.temporary "analyser-request"
+          val resp = HolbuildTempPath.temporary "analyser-response"
           val request = String.concatWith "\n"
             ([HolbuildAnalysisProtocol.join ["version", HolbuildAnalysisProtocol.protocol_version],
               HolbuildAnalysisProtocol.join ["command", "proof-ir-plan"]] @
@@ -9086,6 +9086,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
     val root = Path.concat(cache, "action")
     val checkpoint_root = Path.concat(cache, "checkpoints")
     val _ = HolbuildActionSandbox.enable (root, checkpoint_root)
+    val _ = HolbuildActionSandbox.result_file :=
+              (* Not normalized: the sandbox resolves ".." after links as open does. *)
+              Option.map (fn file => if Path.isAbsolute file then file else FS.getDir () ^ "/" ^ file) result_file
     val input_key = ref ""
     val target = ref ("", "")
     val peak = ref NONE

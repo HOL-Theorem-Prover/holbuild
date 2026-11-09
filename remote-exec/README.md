@@ -217,8 +217,13 @@ cache files are copied into these directories. The directories are removed
 after the action, including when shared heaps are disabled. Worker-private
 checkpoint and compiled-module state is not retained across actions. The child receives
 no cache credentials, worker token, inherited lease descriptors or Linux
-capabilities. Cross-process inspection, metadata changes, links and special-file
-creation are denied. A trusted signal supervisor permits process and group
+capabilities. It may also write `/tmp`, where Poly/ML creates temporary files
+whatever `TMPDIR` says (HOL's SAT and SMT interfaces use them), unless
+protected worker state lies beneath it, holbuild's own temporary files
+under `TMPDIR` included; the image therefore sets `TMPDIR` to `/var/tmp` so
+the worker keeps its credential, result and temporary files elsewhere.
+Actions on one worker may see each other's files in `/tmp`. Cross-process
+inspection, metadata changes, links and special-file creation are denied. A trusted signal supervisor permits process and group
 signals only to verified descendants of the current action, using pidfds;
 thread signals stay within the requesting process. Subprocess groups, sessions
 and timeouts work without granting access to worker or sibling processes.

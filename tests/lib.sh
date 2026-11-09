@@ -17,7 +17,8 @@ require_grep() {
   local pattern=$1
   local path=$2
   grep -q "$pattern" "$path" || {
-    echo "missing expected pattern '$pattern' in $path" >&2
+    echo "missing expected pattern '$pattern' in $path:" >&2
+    tail -n 40 "$path" >&2 || true
     exit 1
   }
 }

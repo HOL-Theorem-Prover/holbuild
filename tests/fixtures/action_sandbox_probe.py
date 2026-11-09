@@ -42,6 +42,9 @@ def attack(root: Path, worker: int, secret: Path, shared: Path) -> None:
     refuses("output hardlink", lambda: os.link(secret, root / "stolen"))
     refuses("worker signals", lambda: os.kill(worker, 0))
     refuses("worker group signals", lambda: os.killpg(os.getpgid(worker), 0))
+    with (root / "lock").open("w") as lock:  # HOL's own tools lock private files.
+        fcntl.lockf(lock, fcntl.LOCK_EX)
+        fcntl.flock(lock, fcntl.LOCK_EX)
     (root / "future-ready").write_text("ready")
     deadline = time.monotonic() + 10
     while not (root / "future.pid").exists():
@@ -321,6 +324,82 @@ def completion_probe(helper: Path) -> None:
         print("completion protected from HOL; proof failure validated; setup/exec/cleanup failures withheld completion")
 
 
+def scratch_probe(helper: Path) -> None:
+    """Scratch directories are writable, unless protected state lies beneath them."""
+    with tempfile.TemporaryDirectory(prefix="holbuild-scratch-probe-") as directory:
+        root = Path(directory)
+        private, scratch, holding = root / "private", root / "scratch", root / "holding"
+        reading, linked, elsewhere = root / "reading", root / "linked", root / "elsewhere"
+        for path in (private, scratch, holding, reading, reading / "runtime", linked, elsewhere):
+            path.mkdir()
+        (holding / "secret").write_text("secret")
+        (reading / "runtime" / "helper").write_text("trusted")
+        # A protected name outside scratch reached through a link inside it.
+        (elsewhere / "credential").write_text("secret")
+        (linked / "hop").symlink_to(elsewhere / "credential")
+        (elsewhere / "configured").symlink_to(linked / "hop")
+        # And one whose ".." follows a link into scratch.
+        dotted = root / "dotted"
+        for path in (dotted, dotted / "deep", root / "safe"):
+            path.mkdir()
+        (dotted / "credential").write_text("secret")
+        (root / "safe" / "link").symlink_to(dotted / "deep")
+        # And one that passes through a scratch directory and leaves it by "..".
+        bridged = root / "bridged"
+        (bridged / "bridge").mkdir(parents=True)
+        completed = root / "completion"
+        code = (
+            "from pathlib import Path\n"
+            f"Path({str(scratch / 'temp')!r}).write_text('temp')\n"
+            f"try: Path({str(holding / 'temp')!r}).write_text('temp')\n"
+            "except PermissionError: pass\n"
+            "else: raise AssertionError('scratch holding protected state was granted')\n"
+            f"try: Path({str(reading / 'runtime' / 'helper')!r}).write_text('forged')\n"
+            "except PermissionError: pass\n"
+            "else: raise AssertionError('scratch made a read-only grant writable')\n"
+            f"try: Path({str(linked / 'temp')!r}).write_text('temp')\n"
+            "except PermissionError: pass\n"
+            "else: raise AssertionError('scratch holding a link to protected state was granted')\n"
+            f"try: Path({str(dotted / 'temp')!r}).write_text('temp')\n"
+            "except PermissionError: pass\n"
+            "else: raise AssertionError('scratch reached by .. after a link was granted')\n"
+            f"try: Path({str(bridged / 'temp')!r}).write_text('temp')\n"
+            "except PermissionError: pass\n"
+            "else: raise AssertionError('scratch a protected path passes through was granted')\n"
+        )
+        module = runpy.run_path(str(helper), run_name="sandbox")
+        previous = sys.argv
+        previous_parent = os.environ.get("HOLBUILD_SANDBOX_PARENT")
+        try:
+            os.environ["HOLBUILD_SANDBOX_PARENT"] = str(os.getppid())
+            sys.argv = [str(helper), "--write", str(private), "--scratch", str(scratch), "--scratch", str(holding),
+                        "--scratch", str(reading), "--read", str(reading / "runtime"),
+                        "--scratch", str(linked), "--forbid", str(holding / "secret"),
+                        "--forbid", str(elsewhere / "configured"),
+                        "--scratch", str(dotted), "--forbid", str(root / "safe" / "link" / ".." / "credential"),
+                        "--scratch", str(bridged), "--forbid", str(bridged / "bridge" / ".." / ".." / "holding" / "secret"),
+                        "--completed", str(completed)]
+            for path in ("/usr", "/bin", "/lib", "/lib64"):
+                if Path(path).exists():
+                    sys.argv += ["--read", path]
+            sys.argv += ["--", SANDBOXED_PYTHON, "-I", "-c", code]
+            status = module["main"]()
+        finally:
+            sys.argv = previous
+            if previous_parent is None:
+                os.environ.pop("HOLBUILD_SANDBOX_PARENT", None)
+            else:
+                os.environ["HOLBUILD_SANDBOX_PARENT"] = previous_parent
+        assert status == 0, status
+        assert (scratch / "temp").read_text() == "temp"
+        assert not (holding / "temp").exists()
+        assert (reading / "runtime" / "helper").read_text() == "trusted"
+        assert not (linked / "temp").exists()
+        assert not (dotted / "temp").exists()
+        assert not (bridged / "temp").exists()
+    print("scratch directory writable; scratch holding protected state or read-only grants withheld")
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "--attack":
         attack(Path(sys.argv[2]), int(sys.argv[3]), Path(sys.argv[4]), Path(sys.argv[5]))
@@ -330,6 +409,7 @@ if __name__ == "__main__":
         worker(Path(sys.argv[2]), Path(sys.argv[3]))
     else:
         completion_probe(Path(sys.argv[1]))
+        scratch_probe(Path(sys.argv[1]))
         with tempfile.TemporaryDirectory(prefix="holbuild-sandbox-probe-") as directory:
             env = {**os.environ, "REMOTE_EXEC_WORKER_TOKEN": "worker-token-sentinel", "HOLBUILD_REMOTE_CACHE_CURL_CONFIG": f"{directory}/cache.curl"}
             process = subprocess.Popen([sys.executable, __file__, "--worker", sys.argv[1], directory], env=env)

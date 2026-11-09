@@ -8,7 +8,7 @@ DATADIR ?= $(PREFIX)/share/holbuild
 VENDORED_HOL_FILES := $(shell sed 's|^|vendor/hol/|' vendor/hol/FILES)
 RUNTIME_SOURCES := sml/action_sandbox.py sml/checkpoint_save_runtime.sml sml/holbuild_runtime.sml \
 	sml/fingerprint_runtime.sml sml/proof_runtime.sml sml/tactic_compat_runtime.sml sml/diagnostic_limits.sml sml/sha256.sml \
-	sml/spawn.sml sml/hash.sml sml/proof_ir_types.sml sml/proof_ir.sml \
+	sml/spawn.sml sml/temp_path.sml sml/hash.sml sml/proof_ir_types.sml sml/proof_ir.sml \
 	$(wildcard sml/analyser/*.sml)
 
 .PHONY: all check-vendored-hol install uninstall test golden-key-dump-check clean

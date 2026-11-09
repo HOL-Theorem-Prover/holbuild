@@ -6,6 +6,7 @@ source "$SCRIPT_DIR/../../lib.sh"
 tmpdir=$(make_temp_dir)
 cleanup() {
   if [[ -n "${server_pid:-}" ]]; then kill "$server_pid"; wait "$server_pid" 2>/dev/null || true; fi
+  for dir in "${tmp_worker:-}" "${var_tmp_worker:-}"; do [[ -z "$dir" ]] || rm -rf "$dir"; done
   cleanup_temp_dir "$tmpdir"
 }
 trap cleanup EXIT
@@ -47,6 +48,11 @@ val _ = List.app (fn base => List.app (fn dir =>
   in refuses "shared write" (fn () => TextIO.closeOut (TextIO.openOut path));
      refuses "shared delete" (fn () => OS.FileSys.remove path)
   end) ["actions", "blobs", "locks", "cooperate"]) ["$tmpdir/shared", "$tmpdir/worker"];
+val lock = Posix.FileSys.createf ("lock", Posix.FileSys.O_WRONLY, Posix.FileSys.O.flags [],
+                                  Posix.FileSys.S.flags [Posix.FileSys.S.irusr, Posix.FileSys.S.iwusr]);
+val _ = Posix.IO.setlkw (lock, Posix.IO.FLock.flock {ltype = Posix.IO.F_WRLCK, whence = Posix.IO.SEEK_SET,
+                                                     start = 0, len = 0, pid = NONE});
+val _ = Posix.IO.close lock;
 val _ = refuses "symlink output" (fn () => Posix.FileSys.symlink {old = "$tmpdir/cache.curl", new = "stolen"});
 val _ = if OS.Process.isSuccess (OS.Process.system "/bin/sh -c 'exit 0'") then () else raise Fail "child failed";
 val timer = Timer.startRealTimer ();
@@ -74,10 +80,45 @@ Proof
   simp[]
 QED
 SML
-(cd "$tmpdir/project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload IsolatedTheory LockedTheory) > "$tmpdir/batch"
+# Poly/ML creates OS.FileSys.tmpName files in /tmp whatever TMPDIR says.
+# Two copies, since the first one's result would be reused.
+for name in TmpWithheld TmpGranted; do
+  cat > "$tmpdir/project/src/${name}Script.sml" <<SML
+Theory $name
+Ancestors bool
+
+val _ = print ("tmpName " ^ OS.FileSys.tmpName () ^ "\\n")
+        handle OS.SysErr _ => print "tmpName withheld\\n";
+Theorem tmp: T
+Proof
+  simp[]
+QED
+SML
+done
+(cd "$tmpdir/project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload \
+  IsolatedTheory LockedTheory TmpWithheldTheory TmpGrantedTheory) > "$tmpdir/batch"
 spec=$(awk '$1 == "action" && $5 == "isolation:IsolatedTheory" {print $4}' "$tmpdir/batch")
 locked=$(awk '$1 == "action" && $5 == "isolation:LockedTheory" {print $4}' "$tmpdir/batch")
-[[ -n "$spec" && -n "$locked" ]]
+withheld=$(awk '$1 == "action" && $5 == "isolation:TmpWithheldTheory" {print $4}' "$tmpdir/batch")
+granted=$(awk '$1 == "action" && $5 == "isolation:TmpGrantedTheory" {print $4}' "$tmpdir/batch")
+[[ -n "$spec" && -n "$locked" && -n "$withheld" && -n "$granted" ]]
+# /tmp is granted only when no worker state lies beneath it.
+run_tmp_action() {
+  local worker=$1 tmp_spec=$2
+  link_hol_toolchain_cache "$worker/cache"
+  TMPDIR=$worker HOLBUILD_COOPERATE_DIR= HOLBUILD_CACHE="$worker/cache" "$HOLBUILD_BIN" --max-heap 1024 \
+    --remote-cache "$remote_url" exec-action "$tmp_spec" --cache-limit-gb 1000 --result "$worker/result" \
+    > "$worker/log" 2>&1 || { cat "$worker/log" "$worker/result" >&2; exit 1; }
+  grep -q "^status=built$" "$worker/result" || { cat "$worker/log" "$worker/result" >&2; exit 1; }
+  local log
+  log=$(sed -n 's/^log=\([^ ]*\) .*/\1/p' "$worker/result")
+  grep '^tmpName ' "$tmpdir/remote/cas/$log"
+}
+tmp_worker=$(mktemp -d /tmp/holbuild-test-tmp.XXXXXX)
+[[ $(run_tmp_action "$tmp_worker" "$withheld") == "tmpName withheld" ]] || { echo '/tmp granted over worker state' >&2; exit 1; }
+var_tmp_worker=$(mktemp -d /var/tmp/holbuild-test-tmp.XXXXXX)
+granted=$(run_tmp_action "$var_tmp_worker" "$granted")
+[[ $granted == "tmpName /tmp/MLTEMP"* ]] || { echo "/tmp not granted: $granted" >&2; exit 1; }
 link_hol_toolchain_cache "$tmpdir/worker"
 set +e
 HOLBUILD_CACHE="$tmpdir/worker" "$HOLBUILD_BIN" --max-heap 1024 --remote-cache "$remote_url" \

@@ -16,6 +16,7 @@ val analyser_protocol_version = "1"
 val analyser_source_files =
   ["../sha256.sml",
    "../spawn.sml",
+   "../temp_path.sml",
    "../hash.sml",
    "analysis_protocol.sml",
    "dependency_extract.sml",

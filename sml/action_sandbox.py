@@ -19,7 +19,7 @@ import stat
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 class SandboxError(Exception):
@@ -182,7 +182,7 @@ class Linux:
                 chmod fchmod fchmodat fchmodat2 chown fchown lchown fchownat
                 utime utimes futimesat utimensat setxattr lsetxattr fsetxattr
                 removexattr lremovexattr fremovexattr setxattrat removexattrat file_setattr
-                truncate ftruncate flock io_uring_setup io_uring_enter io_uring_register
+                truncate ftruncate io_uring_setup io_uring_enter io_uring_register
                 ptrace process_vm_readv process_vm_writev process_madvise process_mrelease
                 pidfd_open pidfd_getfd pidfd_send_signal kcmp perf_event_open bpf userfaultfd
                 tkill rt_sigqueueinfo rt_tgsigqueueinfo seccomp
@@ -208,8 +208,10 @@ class Linux:
             deny("prctl", [Comparison(0, 7, 0xFFFFFFFF, 22)])  # PR_SET_SECCOMP
             for name in ("prlimit64", "sched_setaffinity", "sched_setattr", "sched_setscheduler", "sched_setparam"):
                 deny(name, [Comparison(0, 1, 0, 0)])
-            for cmd in (5, 6, 7, 8, 9, 10, 15, 36, 37, 38):
-                deny("fcntl", [Comparison(1, 7, 0xFFFFFFFF, cmd)])  # 32-bit command: locks and signal ownership
+            # Record locks stay allowed: every lock the worker takes is on a
+            # path Landlock already keeps the action from opening.
+            for cmd in (8, 9, 10, 15, 1024):
+                deny("fcntl", [Comparison(1, 7, 0xFFFFFFFF, cmd)])  # 32-bit command: signal ownership and leases
             deny("ioctl", error=errno.ENOTTY)
             for name, argument in (("open", 1), ("openat", 2)):
                 for access in (0, 3):
@@ -251,13 +253,18 @@ class Policy:
     writable: list[Path]
     readable: list[Path]
     forbidden: list[Path]
+    # Writable like the private roots, but never harvested, so not validated as outputs.
+    scratch: list[Path] = field(default_factory=list)
 
     def validate(self) -> None:
-        for grant in self.readable + self.writable:
+        for grant in self.readable + self.writable + self.scratch:
             if not grant.exists():
                 raise SandboxError(f"sandbox grant does not exist: {grant}")
-            if any(path == grant or grant in path.parents or path in grant.parents for path in self.forbidden):
+            if self.exposes(grant):
                 raise SandboxError(f"sandbox grant contains protected worker state: {grant}")
+
+    def exposes(self, grant: Path) -> bool:
+        return any(path == grant or grant in path.parents or path in grant.parents for path in self.forbidden)
 
     def validate_outputs(self) -> None:
         # With all descendants reaped, one no-follow walk validates every file
@@ -537,6 +544,36 @@ class SignalBroker:
             close_processes(processes)
 
 
+def spellings(name: str) -> tuple[set[Path], set[Path]]:
+    """The path as given, each link met while resolving it, and its target;
+    and every directory passed through on the way.
+
+    The worker opens the name it was given, so an action able to replace any
+    link or directory on the way could redirect it."""
+    found, passed = {Path(os.path.abspath(name))}, set()
+    # Not normalized first: ".." after a link leaves the link's target.
+    current, parts, links = Path("/"), list((Path.cwd() / name).parts[1:]), 0
+    while parts:
+        part = parts.pop(0)
+        if part == "..":
+            current = current.parent
+        elif part not in ("", "."):
+            candidate = current / part
+            passed.add(candidate)
+            if candidate.is_symlink() and links < 40:
+                links += 1
+                found.add(candidate)
+                target = Path(os.readlink(candidate))
+                if target.is_absolute():
+                    current, parts = Path("/"), list(target.parts[1:]) + parts
+                else:
+                    parts = list(target.parts) + parts
+            else:
+                current = candidate
+    found.add(current)
+    return found, passed
+
+
 def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = None) -> int:
     policy.validate()
     policy.validate_outputs()
@@ -595,7 +632,8 @@ def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = N
                         if error.errno != errno.EBADF:
                             raise
             linux.drop_privileges()
-            linux.confine_paths(policy.readable + [Path(f"/proc/{os.getpid()}")], policy.writable + [Path("/dev/null")])
+            linux.confine_paths(policy.readable + [Path(f"/proc/{os.getpid()}")],
+                                policy.writable + policy.scratch + [Path("/dev/null")])
             listener = linux.confine_syscalls()
             socket.send_fds(child_socket, [b"N"], [listener])
             os.close(listener)
@@ -665,6 +703,7 @@ def main() -> int:
     parser.add_argument("--write", action="append", default=[])
     parser.add_argument("--read", action="append", default=[])
     parser.add_argument("--forbid", action="append", default=[])
+    parser.add_argument("--scratch", action="append", default=[])
     parser.add_argument("--completed", type=Path)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -683,9 +722,16 @@ def main() -> int:
         policy = Policy(
             [Path(path).resolve(strict=True) for path in args.write],
             [Path(path).resolve(strict=True) for path in args.read],
-            [Path(path).resolve() for path in args.forbid] +
+            [path for name in args.forbid for path in spellings(name)[0]] +
             ([args.completed.resolve()] if args.completed is not None else []),
         )
+        # A scratch directory holding protected state, or a read-only grant
+        # (Landlock grants are a union, so it would become writable), is
+        # left out rather than failing the action: only tools needing it fail.
+        passed = {path for name in args.forbid for path in spellings(name)[1]}
+        policy.scratch = [path for path in (Path(path).resolve(strict=True) for path in args.scratch)
+                          if not policy.exposes(path) and
+                          not any(read == path or path in read.parents for read in [*policy.readable, *passed])]
         if not policy.writable:
             raise SandboxError("missing private action directory")
         parent = os.environ.get("HOLBUILD_SANDBOX_PARENT")
