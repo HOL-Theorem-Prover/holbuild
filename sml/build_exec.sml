@@ -5434,19 +5434,18 @@ val outline_stub_tactic =
 (* The outline of the theory script SOURCE_TEXT, with BOUNDARIES its
    theorem spans: every proof replaced by the stub, keeping the newlines of
    the proof it replaces so line numbers stay.  A proof that is just
-   `cheat` stays, so its oracle stays.  A proof that suspends goals stays
-   too, so they are still suspended for its `Resume` blocks (whose proofs
-   are stubbed) and its `Finalise` saves the theorem where the real build
-   does.  Anything a stubbed proof did besides proving its goal shows up
+   `cheat` stays, so its oracle stays.  A proof (or `Resume` block) that
+   suspends goals stays too, so they are still suspended for the `Resume`
+   blocks that prove them and its `Finalise` saves the theorem where the
+   real build does.  Anything a stubbed proof did besides proving its goal shows up
    at the gate. *)
 fun outline_source source_text boundaries =
   let
     fun newlines text = String.implode (List.filter (fn c => c = #"\n") (String.explode text))
     fun stubbed kind tactic =
-      kind = "resume" orelse
-      (kind = "theorem" andalso
-       Substring.string (Substring.dropr Char.isSpace (Substring.dropl Char.isSpace (Substring.full tactic))) <> "cheat" andalso
-       not (mentions_at_identifier_start tactic "suspend"))
+      (kind = "theorem" orelse kind = "resume") andalso
+      Substring.string (Substring.dropr Char.isSpace (Substring.dropl Char.isSpace (Substring.full tactic))) <> "cheat" andalso
+      not (mentions_at_identifier_start tactic "suspend")
     fun splice [] pos acc = String.concat (rev (String.extract (source_text, pos, NONE) :: acc))
       | splice ({kind, tactic_start, tactic_end, ...} :: rest) pos acc =
           if tactic_start < pos orelse tactic_end < tactic_start then
@@ -6152,8 +6151,12 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
                     uses consumed andalso (remove_tree stage_root; true)
                 | _ => false
           in
-            if outline_hit then Array.update (outline, id, ONone) else ();
-            if attempt_hit then Array.update (attempt, id, ANone) else ();
+            if outline_hit then
+              (Array.update (outline, id, ONone); pipeline_trace ("dropped outline: " ^ node_name id))
+            else ();
+            if attempt_hit then
+              (Array.update (attempt, id, ANone); pipeline_trace ("dropped attempt: " ^ node_name id))
+            else ();
             outline_hit orelse attempt_hit
           end
       in

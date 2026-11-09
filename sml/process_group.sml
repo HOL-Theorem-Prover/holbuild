@@ -5,8 +5,10 @@ exception Error of string
 
 type child_process = (TextIO.instream, unit) Unix.proc
 (* owner: the thread that launched the child, so a scheduler can stop the
-   children of one piece of work (kill_thread_children). *)
-type active_child = {id : int, owner : Thread.thread, process : child_process}
+   children of one piece of work (kill_thread_children).  reaped: set, under
+   the registry lock, before the child is reaped; nothing signals it after,
+   since its pid may then belong to another process. *)
+type active_child = {id : int, owner : Thread.thread, process : child_process, reaped : bool ref}
 
 val active_child_groups = ref ([] : active_child list)
 val next_child_id = ref 0
@@ -31,11 +33,12 @@ fun register_child_group launch =
              window, then release the registry lock while the child runs. *)
           val process = HolbuildSpawn.with_launch_lock launch
           val id = !next_child_id
+          val reaped = ref false
         in
           next_child_id := id + 1;
-          active_child_groups := {id = id, owner = Thread.self (), process = process} ::
+          active_child_groups := {id = id, owner = Thread.self (), process = process, reaped = reaped} ::
                                  !active_child_groups;
-          {id = id, process = process}
+          {id = id, process = process, reaped = reaped}
         end)
 
 fun unregister_child_group id =
@@ -52,7 +55,11 @@ fun kill_process_forcefully process =
    OS.Process.sleep (Time.fromReal 0.2);
    kill_child Posix.Signal.kill process)
 
-fun kill_group_forcefully ({process, ...} : active_child) = kill_process_forcefully process
+(* As kill_process_forcefully, for a registered child that another thread
+   reaps: each signal goes only while the child is still unreaped. *)
+fun kill_group_forcefully ({process, reaped, ...} : active_child) =
+  let fun signal s = with_active_child_lock (fn () => if !reaped then () else kill_child s process)
+  in signal Posix.Signal.term; OS.Process.sleep (Time.fromReal 0.2); signal Posix.Signal.kill end
 
 fun kill_active_child_groups () = List.app kill_group_forcefully (active_child_group_snapshot ())
 
@@ -60,12 +67,11 @@ fun kill_active_child_groups () = List.app kill_group_forcefully (active_child_g
    snapshot is taken here, so a child the thread launches later lives. *)
 fun kill_thread_children thread =
   let
-    val processes =
-      map #process (List.filter (fn {owner, ...} => Thread.equal (owner, thread))
-                                (active_child_group_snapshot ()))
+    val children =
+      List.filter (fn {owner, ...} => Thread.equal (owner, thread)) (active_child_group_snapshot ())
   in
-    if null processes then ()
-    else ignore (Thread.fork (fn () => List.app kill_process_forcefully processes, []))
+    if null children then ()
+    else ignore (Thread.fork (fn () => List.app kill_group_forcefully children, []))
   end
 
 (* Counts cleanups, so code waiting to launch a child (for machine memory)
@@ -191,25 +197,28 @@ fun with_inherited NONE launch = launch ()
         (launch () before restore ()) handle e => (restore (); raise e)
       end
 
+(* Runs SCRIPT and returns CONSUME (process, reap), where reap () reaps the
+   child; consumers reap only through it. *)
 fun run_shell_process mutation_lease inherit script consume =
   let
-    val {id, process} =
+    val {id, process, reaped} =
       register_child_group
         (fn () => with_inherited inherit
                     (fn () => launch_shell (Posix.ProcEnv.getpid ()) mutation_lease script))
     fun cleanup () = unregister_child_group id
+    fun reap () = (with_active_child_lock (fn () => reaped := true); Unix.reap process)
     fun abort () =
-      (kill_process_forcefully process;
-       ignore (Unix.reap process) handle OS.SysErr _ => ();
+      (if with_active_child_lock (fn () => !reaped) then () else kill_process_forcefully process;
+       ignore (reap ()) handle OS.SysErr _ => ();
        cleanup ())
   in
-    (consume process before cleanup ()) handle e => (abort (); raise e)
+    (consume (process, reap) before cleanup ()) handle e => (abort (); raise e)
   end
 
-fun reap_with_output process =
+fun reap_with_output (process, reap) =
   let
     val output = TextIO.inputAll (Unix.textInstreamOf process)
-    val status = Unix.reap process
+    val status = reap ()
   in
     {status = status, output = output}
   end
@@ -218,7 +227,7 @@ fun reap_with_output process =
    a machine memory lease. *)
 fun run_shell_inheriting inherit script =
   run_shell_process NONE inherit script
-    (fn process => (copy_child_stdout process; Unix.reap process))
+    (fn (process, reap) => (copy_child_stdout process; reap ()))
 
 fun run_shell script = run_shell_inheriting NONE script
 
@@ -234,7 +243,7 @@ fun run_shell_inheriting_until inherit deadline script =
     fun locked f =
       (Mutex.lock mutex; f () before Mutex.unlock mutex)
       handle e => (Mutex.unlock mutex; raise e)
-    fun consume process =
+    fun consume (process, reap) =
       let
         fun watch () =
           if locked (fn () =>
@@ -250,7 +259,7 @@ fun run_shell_inheriting_until inherit deadline script =
       in
         (copy_child_stdout process handle e => (finish (); raise e));
         finish ();
-        Unix.reap process
+        reap ()
       end
     val status = run_shell_process NONE inherit script consume
   in
@@ -261,7 +270,7 @@ fun run_shell_output script = run_shell_process NONE NONE script reap_with_outpu
 
 fun run_shell_with_mutation_lease {lease_path, script} =
   run_shell_process (SOME lease_path) NONE script
-    (fn process => (copy_child_stdout process; Unix.reap process))
+    (fn (process, reap) => (copy_child_stdout process; reap ()))
 
 fun run_shell_output_with_mutation_lease {lease_path, script} =
   run_shell_process (SOME lease_path) NONE script reap_with_output

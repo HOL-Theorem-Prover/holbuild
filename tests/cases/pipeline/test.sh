@@ -100,8 +100,9 @@ require_no_grep() {
 }
 
 # The gate passes: B and C are committed from their speculative attempts.
-# A's suspended theorem keeps its proof up to the suspensions in the outline,
-# so its Finalise still saves it in place, with its attributes.
+# A's suspended theorem, and its Resume block that suspends again, keep
+# their proofs in the outline, so its Finalise still saves it in place, with
+# its attributes.
 new_project pass
 cat > "$tmpdir/pass/src/AScript.sml" <<SML
 open HolKernel Parse boolLib bossLib;
@@ -120,6 +121,9 @@ Resume a_split[left]:
   ACCEPT_TAC TRUTH
 QED
 Resume a_split[right]:
+  suspend "inner"
+QED
+Resume a_split[inner]:
   ACCEPT_TAC TRUTH
 QED
 Finalise a_split[simp]
@@ -180,6 +184,8 @@ build_pipelined digest CTheory
 log=$tmpdir/digest.log
 require_grep "pipeline: gate passed: ATheory" "$log"
 require_grep "pipeline: gate failed: BTheory (digest differs)" "$log"
+require_grep "pipeline: attempt done: CTheory" "$log"
+require_grep "pipeline: dropped attempt: CTheory" "$log"
 require_no_grep "committed: CTheory" "$log"
 require_file "$tmpdir/digest/.holbuild/plan/outline-skip"
 require_same_as_unpipelined digest CTheory B C
@@ -209,4 +215,7 @@ build_pipelined numbering CTheory
 log=$tmpdir/numbering.log
 require_grep "pipeline: gate failed: ATheory (theorem numbering differs)" "$log"
 require_no_grep "committed: BTheory" "$log"
+# C's attempt loaded A's outline only through B's, so the fallback reaches it
+# transitively.
+require_grep "pipeline: dropped attempt: CTheory" "$log"
 require_same_as_unpipelined numbering CTheory A B C
