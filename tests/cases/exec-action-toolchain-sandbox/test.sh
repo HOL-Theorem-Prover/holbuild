@@ -85,6 +85,11 @@ cat >> "$hol/bin/build" <<'SH'
 sh tools/attack.sh build >> attack-report
 # Modes change only within the tree, and never to setuid or setgid.
 if chmod 4755 bin/build 2>/dev/null; then echo 'ALLOWED build setuid' >> attack-report; fi
+# Scratch space is for files, not links.
+if [ -d /tmp ] && ln -s /etc/passwd "/tmp/holbuild-toolchain-link.$$" 2>/dev/null; then
+  rm -f "/tmp/holbuild-toolchain-link.$$"
+  echo 'ALLOWED build scratch link' >> attack-report
+fi
 # A child that leaves the build's process group must still die with it.
 setsid sh -c 'echo $$ > detached.pid; sleep 3; echo late > late-marker' </dev/null >/dev/null 2>&1 &
 while [ ! -s detached.pid ]; do sleep 0.05; done
@@ -94,6 +99,8 @@ for tool in hol Holmake; do
   chmod +x "bin/$tool"
 done
 if [ -e escape ]; then ln -s "$(cat escape)" leak; fi
+# Creating a file setuid needs no chmod; the tree check catches it.
+if [ -e setuid ]; then python3 -c 'import os; os.close(os.open("bin/suid", os.O_CREAT | os.O_WRONLY, 0o4755))'; fi
 SH
 hol_rev=$(init_git_repo "$hol")
 
@@ -205,6 +212,17 @@ require_grep '^failure=internal$' "$tmpdir/escape.log.result"
 [[ $(find "$worker/hol-toolchains" -mindepth 1 -maxdepth 1 -type d | wc -l) == 3 ]] ||
   { ls -la "$worker/hol-toolchains" >&2; cat "$tmpdir/escape.log" >&2; exit 1; }
 damage "$outside_mode"
+
+# So does one that creates a setuid file.
+git -C "$hol" rm -q escape
+: > "$hol/setuid"
+git -C "$hol" add setuid
+git -C "$hol" commit -qm setuid
+run_worker "$worker" "$(retarget "$(git -C "$hol" rev-parse HEAD)")" "$tmpdir/setuid.log"
+require_grep '^failure=internal$' "$tmpdir/setuid.log.result"
+require_grep 'linked or special file: .*/bin/suid' "$tmpdir/setuid.log"
+[[ $(find "$worker/hol-toolchains" -mindepth 1 -maxdepth 1 -type d | wc -l) == 3 ]] ||
+  { ls -la "$worker/hol-toolchains" >&2; cat "$tmpdir/setuid.log" >&2; exit 1; }
 
 # The analyser runs confined to a fresh directory, read only once checked.
 analyser=$tmpdir/analysers/key/bin/holbuild-hol-analyser
