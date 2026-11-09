@@ -250,8 +250,10 @@ fun generate_hol_source_manifest k =
     (* generate reports a failing command as its own Error; a sandbox
        failure must still reach exec-action as one. *)
     val sandbox_failure = ref NONE
+    (* Holmake creates the .hol directories it lists, links included. *)
+    val grants = {writable = [holdir_for_key k], readable = [entry_dir_for_key k], toolchain = true}
     fun run command =
-      confine (reading k) (run_mutation_output k) command
+      confine grants (run_mutation_output k) command
       handle e as HolbuildActionSandbox.Error _ => (sandbox_failure := SOME e; raise e)
   in
     HolbuildHolSourceManifest.generate
