@@ -148,6 +148,7 @@ def attack(root: Path, worker: int, secret: Path, shared: Path) -> None:
         os.killpg(child, signal.SIGKILL)
         _, status = os.waitpid(child, 0)
         assert os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL, status
+    kill_forking_groups(root)
     child = os.fork()
     if child == 0:
         os.setsid()
@@ -158,6 +159,73 @@ def attack(root: Path, worker: int, secret: Path, shared: Path) -> None:
         (root / "survived").write_text("bad")
         os._exit(0)
     (root / "report.json").write_text(json.dumps(denied))
+
+
+def kill_forking_groups(root: Path) -> None:
+    """Kill, from another thread, groups whose leader keeps forking short-lived
+    workers, as a portfolio prover does. A worker forked while the group is
+    being signaled must die with it, as with the kernel's own kill(-group)."""
+    survivor = root / "group-kill-survived"
+    for _ in range(20):
+        leader = os.fork()
+        if leader == 0:
+            os.setpgid(0, 0)
+            parent = os.getpid()
+            workers = 0
+            while True:
+                if workers < 16:
+                    if os.fork() == 0:
+                        time.sleep(0.005)
+                        if os.getppid() != parent:  # orphaned by the kill
+                            time.sleep(0.5)
+                            survivor.write_text(str(os.getpid()))
+                        os._exit(0)
+                    workers += 1
+                while workers and os.waitpid(-1, os.WNOHANG)[0]:
+                    workers -= 1
+        try:
+            os.setpgid(leader, leader)
+        except PermissionError:
+            pass  # the leader already did
+        time.sleep(0.01)
+        errors: list[OSError] = []
+        def kill() -> None:
+            try:
+                os.kill(-leader, signal.SIGKILL)
+            except OSError as error:
+                errors.append(error)
+        killer = threading.Thread(target=kill)
+        killer.start()
+        killer.join()
+        assert not errors, errors
+        os.waitpid(leader, 0)
+    time.sleep(0.6)
+    assert not survivor.exists(), "a process group member survived its group's SIGKILL"
+
+
+def descendants_skip_reaped(module: dict) -> None:
+    """Kernel 6.1's pidfd_open reports EINVAL for a child reaped since its
+    PID was read while the PID still names a process group."""
+    child = os.fork()
+    if child == 0:
+        time.sleep(5)
+        os._exit(0)
+    real = os.pidfd_open
+    def pidfd_open(pid: int, *args: int) -> int:
+        if pid == child:
+            raise OSError(errno.EINVAL, os.strerror(errno.EINVAL))
+        return real(pid, *args)
+    os.pidfd_open = pidfd_open
+    try:
+        found = module["descendants"]()
+    finally:
+        os.pidfd_open = real
+    try:
+        assert child not in found, "descendants kept a child it could not pin"
+    finally:
+        module["close_processes"](found)
+        os.kill(child, signal.SIGKILL)
+        os.waitpid(child, 0)
 
 
 def linger(root: Path) -> None:
@@ -195,6 +263,7 @@ def worker(helper: Path, root: Path) -> None:
     probe = private / "probe.py"
     probe.write_bytes(Path(__file__).read_bytes())
     module = runpy.run_path(str(helper), run_name="sandbox")
+    descendants_skip_reaped(module)
     if os.environ.get("HOLBUILD_RUN_SLOW_CLEANUP"):
         finish = module["finish_children"]
         def slow_cleanup(leader: int) -> int:
