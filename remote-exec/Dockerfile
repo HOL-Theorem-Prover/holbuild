@@ -24,8 +24,11 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=polyml /opt/polyml /opt/polyml
 COPY --from=ghcr.io/astral-sh/uv:0.13.4 /uv /usr/local/bin/uv
+# The worker's temporary files (the cache credential, action results) stay out
+# of /tmp, which sandboxed HOL processes may write: Poly/ML puts its own there.
 ENV PATH=/opt/remote-exec/.venv/bin:/opt/polyml/bin:$PATH \
     HOLBUILD_CACHE=/var/cache/holbuild \
+    TMPDIR=/var/tmp \
     UV_PYTHON_DOWNLOADS=never
 
 WORKDIR /opt/remote-exec

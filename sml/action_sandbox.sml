@@ -8,6 +8,8 @@ val private_roots : (string * string) option ref = ref NONE
 val toolchain_root = ref ""
 val poly_executable = ref ""
 val outputs_validated = ref false
+(* exec-action's --result file: the worker's, so never exposed to the action. *)
+val result_file : string option ref = ref NONE
 
 fun active () = Option.isSome (!private_roots)
 fun enable roots = (outputs_validated := false; private_roots := SOME roots)
@@ -175,7 +177,8 @@ fun wrap completed argv =
                       then SOME (String.concatWith "=" rest) else NONE
                   | [] => NONE)
             (Posix.ProcEnv.environ ()) @
-          (case !(HolbuildMachineMemory.settings) of SOME {dir, ...} => [dir] | NONE => [])
+          (case !(HolbuildMachineMemory.settings) of SOME {dir, ...} => [dir] | NONE => []) @
+          (case !result_file of SOME file => [file] | NONE => [])
         val forbidden = List.mapPartial
           (fn path => if path = "" then NONE else
              SOME (OS.Path.mkAbsolute {path = path, relativeTo = OS.FileSys.getDir ()})) protected_paths
@@ -183,6 +186,10 @@ fun wrap completed argv =
       in
         ["python3", "-I", helper ()] @ options "--write" [full root, full checkpoints] @
         options "--read" (map full readable) @ options "--forbid" forbidden @
+        (* Poly/ML's OS.FileSys.tmpName always creates files in /tmp, ignoring
+           TMPDIR; HolSat and HolSmt need it.  The helper leaves it out if
+           protected worker state lies beneath it. *)
+        options "--scratch" (List.filter exists ["/tmp"]) @
         ["--completed", completed, "--"] @ argv
       end
 

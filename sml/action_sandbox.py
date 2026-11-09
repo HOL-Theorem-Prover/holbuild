@@ -19,7 +19,7 @@ import stat
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 class SandboxError(Exception):
@@ -251,13 +251,18 @@ class Policy:
     writable: list[Path]
     readable: list[Path]
     forbidden: list[Path]
+    # Writable like the private roots, but never harvested, so not validated as outputs.
+    scratch: list[Path] = field(default_factory=list)
 
     def validate(self) -> None:
-        for grant in self.readable + self.writable:
+        for grant in self.readable + self.writable + self.scratch:
             if not grant.exists():
                 raise SandboxError(f"sandbox grant does not exist: {grant}")
-            if any(path == grant or grant in path.parents or path in grant.parents for path in self.forbidden):
+            if self.exposes(grant):
                 raise SandboxError(f"sandbox grant contains protected worker state: {grant}")
+
+    def exposes(self, grant: Path) -> bool:
+        return any(path == grant or grant in path.parents or path in grant.parents for path in self.forbidden)
 
     def validate_outputs(self) -> None:
         # With all descendants reaped, one no-follow walk validates every file
@@ -595,7 +600,8 @@ def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = N
                         if error.errno != errno.EBADF:
                             raise
             linux.drop_privileges()
-            linux.confine_paths(policy.readable + [Path(f"/proc/{os.getpid()}")], policy.writable + [Path("/dev/null")])
+            linux.confine_paths(policy.readable + [Path(f"/proc/{os.getpid()}")],
+                                policy.writable + policy.scratch + [Path("/dev/null")])
             listener = linux.confine_syscalls()
             socket.send_fds(child_socket, [b"N"], [listener])
             os.close(listener)
@@ -665,6 +671,7 @@ def main() -> int:
     parser.add_argument("--write", action="append", default=[])
     parser.add_argument("--read", action="append", default=[])
     parser.add_argument("--forbid", action="append", default=[])
+    parser.add_argument("--scratch", action="append", default=[])
     parser.add_argument("--completed", type=Path)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -686,6 +693,10 @@ def main() -> int:
             [Path(path).resolve() for path in args.forbid] +
             ([args.completed.resolve()] if args.completed is not None else []),
         )
+        # A scratch directory holding protected state is left out rather than
+        # failing the action: only tools needing it then fail.
+        policy.scratch = [path for path in (Path(path).resolve(strict=True) for path in args.scratch)
+                          if not policy.exposes(path)]
         if not policy.writable:
             raise SandboxError("missing private action directory")
         parent = os.environ.get("HOLBUILD_SANDBOX_PARENT")
