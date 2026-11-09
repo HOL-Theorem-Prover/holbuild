@@ -312,12 +312,17 @@ require_same_as_unpipelined thydata CTheory A B C
 
 # A deferred proof that fails, as one racing another thread on a library's
 # cache can, runs again alone before it fails the build.  This one fails
-# only the first time it runs.
+# only the first time it runs; a_other gives the proofs a second thread.
 new_project retry
 cat > "$tmpdir/retry/src/AScript.sml" <<SML
 open HolKernel Parse boolLib bossLib;
 val _ = new_theory "A";
 val tries = ref 0;
+Theorem a_other:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
 Theorem a_flaky:
   T
 Proof

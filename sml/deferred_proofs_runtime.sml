@@ -119,14 +119,20 @@ struct
       fun prove (item as {k, ...} : item) =
         let val tag = Thm.tag (prove_one types item)
         in locked (fn () => results := (k, (Dep.transfer_thydepl (Tag.dep_of tag), #1 (Tag.dest_tag tag))) :: !results) end
-      fun run item = prove item handle _ => locked (fn () => failed := item :: !failed)
-      (* A proof can fail because another thread raced it on some library's
-         own cache (blastLib's compset, say), so each failed proof runs
-         again alone before it fails the build. *)
-      fun retry (item as {name, ...} : item) =
+      fun failure name msg = Fail ("deferred proof of " ^ name ^ " failed: " ^ msg)
+      fun run item =
         prove item
-        handle e => raise Fail ("deferred proof of " ^ name ^ " failed: " ^ Feedback.exn_to_string e)
+        handle e => locked (fn () => failed := (item, Feedback.exn_to_string e) :: !failed)
       val count = Int.max (0, Int.min (threads, length (!items)))
+      (* With several threads a proof can fail because another one raced it
+         on some library's own cache (blastLib's compset, say), so each
+         failed proof runs again alone before it fails the build. *)
+      fun retry (item as {name, ...} : item, msg) =
+        if count <= 1 then raise failure name msg
+        else
+          (TextIO.output (TextIO.stdErr, "deferred proof of " ^ name ^ " failed, retrying alone: " ^ msg ^ "\n");
+           prove item
+           handle e => raise failure name (Feedback.exn_to_string e ^ " (first run: " ^ msg ^ ")"))
       val running = ref count
       fun worker () =
         case take () of
