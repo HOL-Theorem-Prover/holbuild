@@ -1111,7 +1111,7 @@ uses it.
 Planning a build discovers every source, analyses its dependencies and
 computes every action key. After it plans, holbuild writes what it found to
 a plan record in `.holbuild/plan/`, and the next build with the same
-non-file inputs (holbuild version, working directory, command line,
+non-file inputs (holbuild version, working directory, command line, requested targets,
 `HOLBUILD_*` environment, manifests and `.holconfig.toml`, package roots)
 starts from it: it checks each recorded file and directory with `stat`,
 hashes again only the files whose size, modification time, change time or

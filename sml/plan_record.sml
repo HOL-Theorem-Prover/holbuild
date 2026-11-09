@@ -494,7 +494,7 @@ fun argument_text arg =
 (* Every planning input that is not a scanned file.  Packages are named by
    their resolved roots and identities, after $VAR expansion, and by their
    manifests' text. *)
-fun fingerprint {project : HolbuildProject.t, graph, holdir, kernel_variant} =
+fun fingerprint {project : HolbuildProject.t, graph, holdir, kernel_variant, targets} =
   let
     fun package_text package =
       [HolbuildProject.package_name package, HolbuildProject.package_root package,
@@ -512,6 +512,7 @@ fun fingerprint {project : HolbuildProject.t, graph, holdir, kernel_variant} =
           HolbuildHolToolchainConfig.kernel_variant_name kernel_variant,
           getOpt (read_optional (OS.Path.concat (#root project, ".holconfig.toml")), "\001")] @
          BP.canonical_list "argv" (map argument_text (CommandLine.arguments ())) @
+         BP.canonical_list "targets" (map argument_text targets) @
          BP.canonical_list "env" (BP.sort_strings (List.filter recorded_env_var (Posix.ProcEnv.environ ()))) @
          List.concat (map (fn package => BP.canonical_list "package" (package_text package))
                           (HolbuildProjectGraph.packages graph))))
