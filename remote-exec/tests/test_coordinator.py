@@ -1034,6 +1034,40 @@ async def test_rollback_finishes_an_existing_keep_going_failure(
     assert await states(http, batch_id) == expected
 
 
+@pytest.mark.parametrize("missing_parent", ["a", "c"])
+async def test_rollback_skips_an_in_flight_action_missing_a_terminal_parent(
+    http: httpx.AsyncClient, coordinator: Coordinator, missing_parent: str
+) -> None:
+    batch_id = await submit(http, ["a", "b", "c", "d"], [("c", "a"), ("d", "b")])
+    tokens = await claim_all(http, 2)
+    async with coordinator.engine.begin() as conn:
+        await conn.execute(
+            sa.text(
+                "UPDATE actions SET state = 'failed', last_failure = 'proof' "
+                "WHERE batch_id = :id AND input_key = :key"
+            ),
+            {"id": UUID(batch_id), "key": input_key("a")},
+        )
+        await conn.execute(
+            sa.text(
+                "UPDATE actions SET state = 'cancelled', last_failure = 'skipped because of pkg:a' "
+                "WHERE batch_id = :id AND input_key = :key"
+            ),
+            {"id": UUID(batch_id), "key": input_key("c")},
+        )
+        await conn.execute(
+            sa.text("DELETE FROM leases WHERE attempt_token = :token"), {"token": UUID(tokens["a"])}
+        )
+    response = await complete(
+        http, tokens["b"], result("b", "failed", "input-missing", missing=f"theory {input_key(missing_parent)}")
+    )
+    assert response.status_code == 200
+    assert await states(http, batch_id) == {"a": "failed", "b": "cancelled", "c": "cancelled", "d": "cancelled"}
+    status = await batch(http, batch_id)
+    assert (status["state"], status["failure"]) == ("failed", "pkg:a: proof")
+    assert await claim(http) is None
+
+
 async def test_a_final_failure_without_a_log_gives_its_detail_in_the_batch_failure(http: httpx.AsyncClient) -> None:
     batch_id = await submit(http, ["a"])
     token = await claim_named(http, "a")

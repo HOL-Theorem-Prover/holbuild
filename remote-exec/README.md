@@ -775,12 +775,16 @@ was lost, reconciliation resumes admission even after the launch deadline.
 ## Schema-preserving execution-policy rollback
 
 This service revision restores fail-fast build batches while retaining migration
-`0011_batch_fail_fast`. Its added column is unused by this coordinator. The
+`0011_batch_fail_fast`. Its added column does not change this coordinator’s fail-fast dispatch decision. The
 revision remains in the migration history so startup can recognize databases
 that already applied it. New clients continue to follow the existing action
-and batch states; their `fail_fast` query parameter is ignored by this service.
+and batch states; the `fail_fast` query parameter remains accepted, but every build batch stops on its next final failure.
 
 Batches already running when this revision starts retain their failed and
 skipped action records. Once their remaining actions finish, terminal-state
 aggregation reports those failures instead of leaving the batch running or
 marking it successful. New build-action failures stop their batch immediately.
+
+Terminal-parent checks also remain active: an in-flight action that discovers
+a failed or skipped parent is skipped with its descendants, preserving the
+original failure and allowing the batch to finish.
