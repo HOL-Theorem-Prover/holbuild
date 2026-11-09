@@ -1717,13 +1717,41 @@ val last_child_status : OS.Process.status option ref = ref NONE
    signal (the shell's 128 + n) is not. *)
 val hol_silent_exit_marker = "HOL exited without output"
 
-fun silent_exit_detail status log =
+(* A child that dies by signal prints nothing about it, and an OOM kill or a
+   kill from outside often leaves a log with nothing after the preload.  The
+   failure says how it died, with this marker. *)
+val hol_signal_marker = "HOL was killed by signal"
+
+(* The shell running the child reports its death by signal n as 128 + n. *)
+fun death_signal status =
   case Posix.Process.fromStatus status of
-      Posix.Process.W_EXITSTATUS w =>
-        if w <= 0w128 andalso file_size log = 0 then
-          [hol_silent_exit_marker ^ " (exit status " ^ Word8.fmt StringCvt.DEC w ^ ")"]
-        else []
-    | _ => []
+      Posix.Process.W_SIGNALED s => SOME s
+    | Posix.Process.W_EXITSTATUS w =>
+        if w > 0w128 then SOME (Posix.Signal.fromWord (SysWord.fromInt (Word8.toInt w - 128))) else NONE
+    | _ => NONE
+
+fun signal_text s =
+  let
+    val names = [(Posix.Signal.kill, "SIGKILL"), (Posix.Signal.term, "SIGTERM"),
+                 (Posix.Signal.int, "SIGINT"), (Posix.Signal.segv, "SIGSEGV"),
+                 (Posix.Signal.abrt, "SIGABRT"), (Posix.Signal.bus, "SIGBUS")]
+    val number = SysWord.fmt StringCvt.DEC (Posix.Signal.toWord s)
+  in
+    case List.find (fn (signal, _) => signal = s) names of
+        SOME (_, name) => number ^ " (" ^ name ^ ")"
+      | NONE => number
+  end
+
+fun exit_detail status log =
+  case death_signal status of
+      SOME s => [hol_signal_marker ^ " " ^ signal_text s]
+    | NONE =>
+        case Posix.Process.fromStatus status of
+            Posix.Process.W_EXITSTATUS w =>
+              if file_size log = 0 then
+                [hol_silent_exit_marker ^ " (exit status " ^ Word8.fmt StringCvt.DEC w ^ ")"]
+              else []
+          | _ => []
 
 fun run_hol_files_to_log tc stage workdir context files log_name current_log error_message =
   let
@@ -1747,7 +1775,7 @@ fun run_hol_files_to_log tc stage workdir context files log_name current_log err
       if echo_child_logs () then HolbuildStatus.message_stdout (read_text log handle _ => "") else ()
     else
       raise Error (String.concatWith "\n"
-        ([error_message] @ silent_exit_detail status log @ [child_log_detail detail_log]))
+        ([error_message] @ exit_detail status log @ [child_log_detail detail_log]))
   end
 
 fun toolchain_base_context tc = HolState (HolbuildToolchain.base_state tc)
@@ -1784,13 +1812,16 @@ fun holbuild_runtime_missing_failure text =
 fun hol_static_error_failure text =
   Option.isSome (find_substring "Static Errors" text)
 
-(* The marker is the line after the first, where run_hol_files_to_log puts
-   it; the child's own output comes later, after "--- child log tail ---". *)
-fun hol_silent_exit_line text =
+(* The markers are on the line after the first, where run_hol_files_to_log
+   puts them; the child's own output comes later, after
+   "--- child log tail ---". *)
+fun hol_exit_line marker text =
   case String.fields (fn c => c = #"\n") text of
       _ :: second :: _ =>
-        if String.isPrefix hol_silent_exit_marker second then SOME second else NONE
+        if String.isPrefix marker second then SOME second else NONE
     | _ => NONE
+
+val hol_silent_exit_line = hol_exit_line hol_silent_exit_marker
 
 fun hol_silent_exit_failure text = Option.isSome (hol_silent_exit_line text)
 
@@ -1888,8 +1919,10 @@ fun retained_log_warning path =
                  " bytes (>64 KiB); do not read the whole log. Use the summary above; ",
                  "only read targeted ranges if explicitly needed.\n"]
 
+(* An action's root is emptied when it ends, and its log goes back as the
+   action's log, so a path inside it means nothing to the reader. *)
 fun retained_log_reference output =
-  if HolbuildStatus.json_mode () then ""
+  if HolbuildStatus.json_mode () orelse HolbuildActionSandbox.active () then ""
   else
     case output of
         SOME (RetainedLog path) =>
@@ -3556,6 +3589,7 @@ fun failure_detail policy source_file source_text theorem_checkpoints terminatio
        case plan_position of NONE => "" | SOME text => text,
        case goal_state of NONE => "" | SOME text => text,
        case child_failure of NONE => fallback | SOME text => text,
+       case hol_exit_line hol_signal_marker msg of NONE => "" | SOME line => line ^ "\n",
        retained_log_reference failure_output]
   end
 
@@ -7868,6 +7902,36 @@ fun cgroup_oom_kills () =
   end
   handle _ => []
 
+(* Linux's getrusage(RUSAGE_CHILDREN) ru_maxrss, in KiB: the largest
+   resident set of any child this process waited for, or of their children
+   they waited for, as the shell around each HOL child does.  Only
+   exec-action calls it, once, from one thread: Foreign resolves the symbol
+   on the first call without synchronising (HolbuildHttp has the details). *)
+local
+  open Foreign
+  val getrusage = buildCall2 (getSymbol (loadExecutable ()) "getrusage", (cInt, cPointer), cInt)
+  val rusage_children = ~1
+  (* struct rusage on LP64: two struct timevals, then ru_maxrss. *)
+  val rusage_bytes = 0w144
+  val maxrss_index = 0w4
+in
+  fun children_peak_rss_mb () =
+    if not (file_exists "/proc/self/status") then NONE
+    else
+      let
+        val buffer = Memory.malloc rusage_bytes
+        val kb =
+          (if getrusage (rusage_children, buffer) = 0
+           then SOME (SysWord.toInt (Memory.get64 (buffer, maxrss_index)))
+           else NONE)
+          handle e => (Memory.free buffer; raise e)
+      in
+        Memory.free buffer;
+        Option.map (fn n => n div 1024) kb
+      end
+      handle _ => NONE
+end
+
 fun peak_rss_mb stage =
   (case String.tokens Char.isSpace (read_text (Path.concat(stage, peak_rss_report_name))) of
       ["VmHWM:", kb, "kB"] => Option.map (fn n => n div 1024) (Int.fromString kb)
@@ -7882,33 +7946,44 @@ fun child_reports_no_space log_text =
                 not (String.isPrefix "holbuild: warning: dropping checkpoint" line))
     (String.fields (fn c => c = #"\n") log_text)
 
-(* The shell running the child reports its death by signal n as 128 + n. *)
-fun death_signal status =
-  case Posix.Process.fromStatus status of
-      Posix.Process.W_SIGNALED s => SOME s
-    | Posix.Process.W_EXITSTATUS w =>
-        if w > 0w128 then SOME (Posix.Signal.fromWord (SysWord.fromInt (Word8.toInt w - 128))) else NONE
-    | _ => NONE
-
+(* The failure kind of a run that raised `msg`, and `msg` with what the
+   kernel did to the child: a SIGKILL with the cgroup's OOM kill count
+   raised is the OOM killer's, which the child can't report itself.  The
+   peak is that of the largest child this process waited for so far, which a
+   killed child, unlike the exporter's report, still has. *)
 fun classify_run_failure stage log_text oom_before msg =
   let
     val (child_failed, signal) =
       case !last_child_status of
           SOME status => (not (OS.Process.isSuccess status), death_signal status)
         | NONE => (false, NONE)
-    val oom_killed =
-      signal = SOME Posix.Signal.kill andalso
-      (case (oom_before, cgroup_oom_kills ()) of
-           ([earlier], [later]) => later > earlier
-         | _ => false)
+    val oom_kills =
+      if signal <> SOME Posix.Signal.kill then NONE
+      else
+        case (oom_before, cgroup_oom_kills ()) of
+            ([earlier], [later]) => if later > earlier then SOME (earlier, later) else NONE
+          | _ => NONE
+    val kill_notes =
+      (case oom_kills of
+           SOME (earlier, later) =>
+             ["the kernel's OOM killer killed it (cgroup oom_kill count " ^ Int.toString earlier ^
+              " -> " ^ Int.toString later ^ ")"]
+         | NONE => []) @
+      (if Option.isSome signal then
+         case children_peak_rss_mb () of
+             SOME mb => ["largest child resident set so far: " ^ Int.toString mb ^ " MB"]
+           | NONE => []
+       else [])
+    val failure =
+      if Option.isSome oom_kills orelse String.isSubstring "Run out of store" (msg ^ "\n" ^ log_text) then MemoryFailure
+      else if (if child_failed then child_reports_no_space log_text orelse out_of_space stage
+               else String.isSubstring no_space msg) then DiskFailure
+      else if not child_failed then InternalFailure
+      else if String.isPrefix "tactic timed out" msg then TacticTimeoutFailure
+      else if Option.isSome signal then InternalFailure
+      else ProofFailure
   in
-    if oom_killed orelse String.isSubstring "Run out of store" (msg ^ "\n" ^ log_text) then MemoryFailure
-    else if (if child_failed then child_reports_no_space log_text orelse out_of_space stage
-             else String.isSubstring no_space msg) then DiskFailure
-    else if not child_failed then InternalFailure
-    else if String.isPrefix "tactic timed out" msg then TacticTimeoutFailure
-    else if Option.isSome signal then InternalFailure
-    else ProofFailure
+    (failure, String.concatWith "\n" (msg :: kill_notes))
   end
 
 (* The worker cache cap covers everything a worker keeps between
@@ -9032,13 +9107,13 @@ fun exec_run remote root tc (spec : run_spec) log =
       else if HolbuildToolchain.success status then ()
       else
         let
-          val msg = "the script failed"
+          val msg = String.concatWith "\n" ("the script failed" :: exit_detail status log)
           val failure =
             case classify_run_failure root (read_text log handle _ => "") oom_before msg of
-                ProofFailure => ScriptFailure
-              | failure => failure
+                (ProofFailure, msg) => (ScriptFailure, msg)
+              | classified => classified
         in
-          raise ActionFailed (failure, msg ^ "\n" ^ child_log_detail log)
+          raise ActionFailed (#1 failure, #2 failure ^ "\n" ^ child_log_detail log)
         end
     fun output name =
       let val path = Path.concat (output_dir, name)
@@ -9261,14 +9336,16 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                 remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints)
               end
               handle Error msg =>
-                if not (!HolbuildActionSandbox.outputs_validated) then
-                  raise ActionFailed (InternalFailure, msg)
-                else
-                let val log_text = read_text (build_log ()) handle _ => ""
-                in
-                  raise ActionFailed
-                    (classify_run_failure stage log_text oom_before msg, msg)
-                end
+                (* The child's exporter may have recorded its peak before
+                   a later step failed. *)
+                (peak := peak_rss_mb stage;
+                 if not (!HolbuildActionSandbox.outputs_validated) then
+                   raise ActionFailed (InternalFailure, msg)
+                 else
+                 let val log_text = read_text (build_log ()) handle _ => ""
+                 in
+                   raise ActionFailed (classify_run_failure stage log_text oom_before msg)
+                 end)
             val _ = peak := peak_rss_mb stage
             val _ =
               phase "check" (fn () =>
@@ -9345,7 +9422,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
     val text =
       result_text (spec_sha256, !input_key)
         {status = status, failure = failure, wall_ms = wall_ms, phases = phases,
-         peak = if status = "built" then !peak else NONE, log = log}
+         peak = !peak, log = log}
   in
     (case failure of
          SOME (_, msg) => HolbuildStatus.message_stderr ("holbuild: exec-action failed: " ^ msg ^ "\n")

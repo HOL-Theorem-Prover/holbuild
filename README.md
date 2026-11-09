@@ -1614,10 +1614,13 @@ cache cap sweep), `spec`, `toolchain`, `hydrate` (sources, libraries and
 dependencies), `cutoff` (whether an earlier build stands), `restore` (shared
 checkpoints), `hol`, `publish` (shared checkpoints), `check` (the
 publication checks) and `log`; stderr ends with the same times and `wall`.
-`peak-rss-mb` is the HOL process's peak resident memory on a successful build.
+`peak-rss-mb` is the HOL process's peak resident memory, reported once the
+theory has been exported.
 `log` is the build log, or the run's HOL output, uploaded to `/cas/`. `memory` means Poly/ML ran out
 of heap or the container's cgroup `memory.events` counted an OOM kill during
-the run; `disk` means the disk filled. The exit status summarizes the record:
+the run; `disk` means the disk filled. When the HOL process dies by a
+signal, the log's last lines say which, whether the OOM killer's count rose,
+and the largest resident set of any child process of the action so far. The exit status summarizes the record:
 
 | Exit | Meaning |
 |---|---|

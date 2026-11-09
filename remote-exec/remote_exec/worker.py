@@ -672,9 +672,25 @@ def runs_hol(pid: int, cooperate_dir: str) -> bool:
 def failed_record(spec_sha256: str, failure: str) -> str:
     """A result record the worker writes itself: ``spec-rejected`` for an action it won't run, which fails it
     finally like exec-action's own; ``unavailable`` for one whose spec the cache couldn't give (no answer, 429 or
-    5xx, or a transfer cut short), which is retried without counting the attempt; or ``internal`` for any other
-    error in the worker, such as exec-action ending without a record, which is retried."""
+    5xx, or a transfer cut short) or that was interrupted (``recordless_failure``), which is retried without
+    counting the attempt; ``memory`` for one whose exec-action was SIGKILLed; or ``internal`` for any other error in
+    the worker, such as exec-action failing without a record, which is retried."""
     return f"holbuild-action-result-v1\nspec={spec_sha256}\ninput-key=\nstatus=failed\nfailure={failure}\n"
+
+
+def recordless_failure(returncode: int, draining: bool) -> str | None:
+    """The failure to report for an exec-action that exited ``returncode`` without writing its result record, or
+    None for an error in the worker (``internal``). One stopped while the worker drains, or by SIGTERM or SIGINT
+    (a host shutting down, as on a Spot reclaim), was interrupted: ``unavailable`` refunds the attempt. One killed by
+    SIGKILL otherwise is what the kernel's OOM killer does: ``memory``."""
+    def by(*signals: int) -> bool:
+        return any(returncode in (-s, 128 + s) for s in signals)
+
+    if draining or by(signal.SIGTERM, signal.SIGINT):
+        return "unavailable"
+    if by(signal.SIGKILL):
+        return "memory"
+    return None
 
 
 def exec_action_env(*, discovery_config: str | None = None) -> dict[str, str]:
@@ -862,6 +878,10 @@ def execute(
         if drained_out:
             return failed_record(spec, "unavailable")
         if not os.path.exists(result) or os.path.getsize(result) == 0:
+            if failure := recordless_failure(process.returncode, drain.stop.is_set()):
+                print(f"{claim['theory']}: exec-action exited {process.returncode} without a result record, "
+                      f"reporting {failure}", file=sys.stderr, flush=True)
+                return failed_record(spec, failure)
             raise RuntimeError(f"exec-action exited {process.returncode} without a result record")
         with open(result) as file:
             record = file.read()
