@@ -473,7 +473,9 @@ worker unwritten "$(spec_for "$tmpdir/batch-unwritten.txt" worker:UnwrittenTheor
 expect unwritten 3 "status=failed"
 require_grep '^peak-rss-mb=[1-9][0-9]*$' "$tmpdir/unwritten.result"
 
-# Default action specs enable theorem checkpoints for dependencies too.
+# Target-only theorem checkpoints reach the worker: a theory that isn't a
+# target keeps its deps heap but saves no theorem checkpoints. A target's
+# spec, and every spec under --all-checkpoints, doesn't mention them.
 cat > "$project/src/FScript.sml" <<'SML'
 Theory F
 
@@ -496,9 +498,10 @@ SML
 hb action-spec --upload GTheory > "$tmpdir/batch-g.txt"
 spec_f=$(spec_for "$tmpdir/batch-g.txt" worker:FTheory)
 spec_g=$(spec_for "$tmpdir/batch-g.txt" worker:GTheory)
-for spec in "$spec_f" "$spec_g" "$spec_a" "$spec_d"; do
+require_grep '^option theorem-checkpoints=false$' "$project/.holbuild/action-specs/$spec_f"
+for spec in "$spec_g" "$spec_a" "$spec_d"; do
   if grep -q 'theorem-checkpoints' "$project/.holbuild/action-specs/$spec"; then
-    echo "a default spec disables theorem checkpoints" >&2
+    echo "a target's or an --all-checkpoints spec names theorem-checkpoints" >&2
     exit 1
   fi
 done
