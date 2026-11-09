@@ -4,7 +4,9 @@ struct
 exception Error of string
 
 type child_process = (TextIO.instream, unit) Unix.proc
-type active_child = {id : int, process : child_process}
+(* owner: the thread that launched the child, so a scheduler can stop the
+   children of one piece of work (kill_thread_children). *)
+type active_child = {id : int, owner : Thread.thread, process : child_process}
 
 val active_child_groups = ref ([] : active_child list)
 val next_child_id = ref 0
@@ -31,7 +33,8 @@ fun register_child_group launch =
           val id = !next_child_id
         in
           next_child_id := id + 1;
-          active_child_groups := {id = id, process = process} :: !active_child_groups;
+          active_child_groups := {id = id, owner = Thread.self (), process = process} ::
+                                 !active_child_groups;
           {id = id, process = process}
         end)
 
@@ -44,12 +47,26 @@ fun active_child_group_snapshot () = with_active_child_lock (fn () => !active_ch
 
 fun kill_child signal process = Unix.kill (process, signal) handle OS.SysErr _ => ()
 
-fun kill_group_forcefully ({process, ...} : active_child) =
+fun kill_process_forcefully process =
   (kill_child Posix.Signal.term process;
    OS.Process.sleep (Time.fromReal 0.2);
    kill_child Posix.Signal.kill process)
 
+fun kill_group_forcefully ({process, ...} : active_child) = kill_process_forcefully process
+
 fun kill_active_child_groups () = List.app kill_group_forcefully (active_child_group_snapshot ())
+
+(* Stops, in the background, the children THREAD has running now: the
+   snapshot is taken here, so a child the thread launches later lives. *)
+fun kill_thread_children thread =
+  let
+    val processes =
+      map #process (List.filter (fn {owner, ...} => Thread.equal (owner, thread))
+                                (active_child_group_snapshot ()))
+  in
+    if null processes then ()
+    else ignore (Thread.fork (fn () => List.app kill_process_forcefully processes, []))
+  end
 
 (* Counts cleanups, so code waiting to launch a child (for machine memory)
    can tell that the build stopped while it waited. *)
@@ -182,7 +199,7 @@ fun run_shell_process mutation_lease inherit script consume =
                     (fn () => launch_shell (Posix.ProcEnv.getpid ()) mutation_lease script))
     fun cleanup () = unregister_child_group id
     fun abort () =
-      (kill_group_forcefully {id = id, process = process};
+      (kill_process_forcefully process;
        ignore (Unix.reap process) handle OS.SysErr _ => ();
        cleanup ())
   in
@@ -224,7 +241,7 @@ fun run_shell_inheriting_until inherit deadline script =
                        !finished orelse
                        (Time.>= (Time.now (), deadline) andalso
                         (timed_out := true;
-                         kill_group_forcefully {id = ~1, process = process};
+                         kill_process_forcefully process;
                          true)))
           then ()
           else (OS.Process.sleep (Time.fromReal 0.1); watch ())
