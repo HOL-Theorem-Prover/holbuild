@@ -1545,12 +1545,15 @@ while read -r tag key ac spec theory; do
     sed -i '/^log=/d' "$state/result-$key"
   fi
 done < "$state/$batch.batch"
+# Reattach to the recorded failure without rerunning the stand-in workers.
+touch "$state/fail"
 in_copy multi-failure clean HealthyTheory > /dev/null
 [[ ! -e "$tmpdir/multi-failure/.holbuild/obj/src/HealthyTheory.dat" ]]
 status=0
 in_copy multi-failure --remote-cache "$remote_url" build --remote-exec "$coordinator" \
   --remote-only --attach "$batch" BadATheory BadBTheory HealthyTheory BlockedTheory \
   > "$tmpdir/multi-failure-nolog.log" 2>&1 || status=$?
+rm "$state/fail"
 [[ $status -eq 75 ]] || { cat "$tmpdir/multi-failure-nolog.log" >&2; exit 1; }
 require_file "$tmpdir/multi-failure/.holbuild/obj/src/HealthyTheory.dat"
 require_grep "could not fetch the failed theory's build log: BadATheory" "$tmpdir/multi-failure-nolog.log"
