@@ -90,6 +90,7 @@ fun build_help () = print
   \Build project targets. With no TARGET, build the project's default targets.\n\n\
   \Options:\n\
   \  --watch\n\
+  \  --fail-fast  Stop after the first failure (default: finish independent work).\n\
   \  --dry-run\n\
   \  --force[=theory|project|full]\n\
   \      Bypass cached outputs; valid checkpoints, including failed prefixes, may resume.\n\
@@ -427,15 +428,16 @@ fun split_flags args =
       extract_flag "--emit-output-hashes" args
     val (allow_cache_timeout_discrepancy, args_without_allow_discrepancy) =
       extract_flag "--allow-cache-timeout-discrepancy" args_without_emit_output_hashes
-    val (all_checkpoints, build_args) =
+    val (all_checkpoints, args_without_all_checkpoints) =
       extract_flag "--all-checkpoints" args_without_allow_discrepancy
+    val (fail_fast, build_args) = extract_flag "--fail-fast" args_without_all_checkpoints
     fun loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable rest =
       case rest of
           [] => ({dry_run = dry, watch = watch, force = force, use_cache = use_cache,
                   verify_cache = verify_cache,
                   no_stat_cache = no_stat_cache,
                   skip_checkpoints = skip_checkpoints,
-                  all_checkpoints = all_checkpoints,
+                  all_checkpoints = all_checkpoints, fail_fast = fail_fast,
                   proof_steps = proof_steps, new_ir = new_ir, proof_scope = proof_scope,
                   tactic_timeout = tactic_timeout,
                   tactic_timeout_set = tactic_timeout_set,
@@ -526,7 +528,7 @@ fun split_flags args =
 fun plain_build_request targets =
   ({dry_run = false, watch = false, force = HolbuildBuildExec.ForceNone,
     use_cache = true, verify_cache = true, no_stat_cache = false,
-    skip_checkpoints = true, all_checkpoints = false, proof_steps = false, new_ir = false,
+    skip_checkpoints = true, all_checkpoints = false, fail_fast = false, proof_steps = false, new_ir = false,
     proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,
     tactic_timeout = NONE, tactic_timeout_set = false, execution_plan = NONE,
     trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
@@ -541,7 +543,7 @@ fun plain_build_request targets =
 fun heap_build_request targets =
   ({dry_run = false, watch = false, force = HolbuildBuildExec.ForceNone,
     use_cache = true, verify_cache = true, no_stat_cache = false,
-    skip_checkpoints = false, all_checkpoints = false, proof_steps = false, new_ir = false,
+    skip_checkpoints = false, all_checkpoints = false, fail_fast = false, proof_steps = false, new_ir = false,
     proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,
     tactic_timeout = NONE, tactic_timeout_set = false, execution_plan = NONE,
     trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
@@ -1115,7 +1117,7 @@ datatype build_mode =
                   outputs_dir : string, profile : string option}
   | RemoteExec of {url : string, remote_only : bool, detach : bool, attach : string option}
 
-fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, all_checkpoints, proof_steps, new_ir, proof_scope, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy}, targets) =
+fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, all_checkpoints, fail_fast, proof_steps, new_ir, proof_scope, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy}, targets) =
   let
     val project =
       case prepared of
@@ -1179,6 +1181,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
        verify_cache = verify_cache,
        force = force,
        force_targets = force_targets,
+       fail_fast = fail_fast,
        skip_checkpoints = skip_checkpoints,
        checkpoint_targets = checkpoint_targets,
        proof_steps = proof_steps,
@@ -1645,34 +1648,53 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                                        (#checkpoint_targets build_options))
                               tc project theory_plan toolchain_key jobs)
               end
-            (* A batch that failed because a proof did: a local build would fail
-               the same way, so the build restores what the cache holds, reports
-               the failure from the worker's build log and stops, building nothing
-               locally.  Without the log, it builds the failed theory locally
-               for its diagnostic. *)
-            fun proof_failed reason ({input_key, kind, log_sha256} : HolbuildRemoteExec.proof_failure) =
+            (* Diagnose every final failure. A missing proof log retains the
+               single-theory diagnostic fallback. *)
+            fun proof_failed reason (failures : HolbuildRemoteExec.action_failure list) =
               let
-                val no_log = "could not fetch the failed theory's build log"
+                val _ = HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "\n")
+                val needs_local = ref false
+                fun diagnose ({input_key, kind, log_sha256} : HolbuildRemoteExec.action_failure) =
+                  case HolbuildBuildExec.node_with_input_key build_options tc project plan toolchain_key input_key of
+                      NONE => (input_key, HolbuildBuildExec.Error ("failed remote action " ^ input_key ^ ": " ^ kind))
+                    | SOME node =>
+                        let
+                          val name = HolbuildBuildPlan.logical_name node
+                          val is_proof = kind = "proof" orelse kind = "tactic-timeout"
+                          val error =
+                            case log_sha256 of
+                                NONE => NONE
+                              | SOME sha =>
+                                  if is_proof then
+                                    HolbuildBuildExec.remote_proof_failure build_options tc project plan toolchain_key node
+                                      {kind = kind, log_sha256 = sha}
+                                  else
+                                    Option.map (fn path => HolbuildBuildExec.error_with_captured_output
+                                      (name ^ " failed on a remote worker: " ^ kind)
+                                      (SOME (HolbuildBuildExec.RetainedLog path)))
+                                      (HolbuildBuildExec.fetch_remote_build_log project node sha)
+                        in
+                          (name,
+                           case error of
+                               SOME e => e
+                             | NONE =>
+                                 let val msg = "could not fetch the failed theory's build log: " ^ name ^ " (" ^ kind ^ ")"
+                                 in
+                                   if remote_only then
+                                     (needs_local := true; HolbuildBuildExec.Error msg)
+                                   else if is_proof then
+                                     (HolbuildBuildExec.warn ("remote execution: could not fetch the failed theory's build log; building " ^ name ^ " locally");
+                                      (build_theory_locally name;
+                                       HolbuildBuildExec.Error (name ^ " failed remotely: " ^ kind))
+                                      handle Thread.Interrupt => raise Thread.Interrupt
+                                           | e => e)
+                                   else HolbuildBuildExec.Error msg
+                                 end)
+                        end
+                val errors = map diagnose failures
               in
-                HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "\n");
-                HolbuildBuildExec.build (HolbuildBuildExec.remote_restore_options true build_options)
-                  tc project plan toolchain_key jobs
-                handle HolbuildBuildExec.Error _ => ()
-                     | HolbuildBuildExec.ErrorWithDebugArtifacts _ => ();
-                (* The restore stops at a theory the cache lacks, the failed one if
-                   no other, which isn't why this build fails. *)
-                HolbuildHolSharedCache.local_build_needed := false;
-                case HolbuildBuildExec.node_with_input_key build_options tc project plan toolchain_key input_key of
-                    NONE => fall_back no_log
-                  | SOME node =>
-                      case HolbuildBuildExec.remote_proof_failure build_options tc project plan toolchain_key node
-                             {kind = kind, log_sha256 = log_sha256} of
-                          SOME error => raise error
-                        | NONE =>
-                            if remote_only then fall_back no_log
-                            else (HolbuildBuildExec.warn ("remote execution: " ^ no_log ^ "; building " ^
-                                                          HolbuildBuildPlan.logical_name node ^ " locally");
-                                  build_theory_locally (HolbuildBuildPlan.logical_name node))
+                HolbuildHolSharedCache.local_build_needed := !needs_local;
+                HolbuildBuildExec.raise_build_failures errors
               end
             (* A batch that abandon would cancel is cancelled on an interrupt too.
                While it runs, the entries of the theories it finishes, and of a
@@ -1726,17 +1748,39 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                  (HolbuildBuildExec.remote_restore_options (#restore_only build_options) build_options)
                                  tc project plan toolchain_key jobs))
                     end
-                | ((HolbuildRemoteExec.Failed (reason, SOME failure), progress), _) =>
-                    proof_failed ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress) failure
-                | ((HolbuildRemoteExec.Failed (reason, NONE), progress), _) =>
-                    let
-                      val reason = "batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress
-                      val forced =
-                        case (resubmit, HolbuildRemoteExec.resubmit_theory_key reason) of
-                            (true, SOME missing) =>
-                              HolbuildBuildExec.theory_keys_depending_on build_options tc project plan toolchain_key missing
-                          | _ => []
-                      val missing_blob = resubmit andalso HolbuildRemoteExec.resubmit_missing_blob reason
+                | ((HolbuildRemoteExec.Failed (reason, failures), progress), _) =>
+                  let
+                    val proof_failure = List.exists (fn {kind, ...} => kind = "proof" orelse kind = "tactic-timeout") failures
+                    val reason = "batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress
+                    val forced =
+                      case (resubmit andalso not proof_failure, HolbuildRemoteExec.resubmit_theory_key reason) of
+                          (true, SOME missing) =>
+                            HolbuildBuildExec.theory_keys_depending_on build_options tc project plan toolchain_key missing
+                        | _ => []
+                    val missing_blob = resubmit andalso not proof_failure andalso
+                                       HolbuildRemoteExec.resubmit_missing_blob reason
+                    (* Restore before a terminal failure. A resubmission must first
+                       repair its inputs, without installing stale cached outputs. *)
+                    val _ =
+                      if null forced andalso not missing_blob then
+                        (HolbuildBuildExec.build (HolbuildBuildExec.remote_restore_options true build_options)
+                           tc project plan toolchain_key jobs
+                         handle HolbuildBuildExec.Error _ => ()
+                              | HolbuildBuildExec.ErrorWithDebugArtifacts _ => ())
+                      else ()
+                    val _ = HolbuildHolSharedCache.local_build_needed := false
+                  in
+                    if proof_failure then proof_failed reason failures
+                    else let
+                      val _ = List.app (fn {input_key, log_sha256, ...} =>
+                        case (log_sha256, HolbuildBuildExec.node_with_input_key build_options tc project plan toolchain_key input_key) of
+                            (SOME sha, SOME node) =>
+                              (case HolbuildBuildExec.fetch_remote_build_log project node sha of
+                                   SOME _ => ()
+                                 | NONE => HolbuildBuildExec.warn
+                                     ("remote execution: could not fetch the failed theory's build log: " ^
+                                      HolbuildBuildPlan.logical_name node))
+                          | _ => ()) failures
                     in
                       if null forced andalso not missing_blob then fall_back reason
                       else
@@ -1749,6 +1793,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                          HolbuildBuildExec.drop_local_cache_entries forced;
                          export_and_submit false forced)
                     end
+                  end
                 | ((HolbuildRemoteExec.Cancelled, progress), _) =>
                     let val reason = "batch " ^ batch_id ^ " cancelled; " ^ finished progress
                     in
@@ -1767,7 +1812,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 (HolbuildStatus.message_stderr "holbuild: remote execution: nothing to build remotely\n";
                  build_locally ())
               else
-                case HolbuildRemoteExec.submit (remote_only orelse detach) url (#maxheap tc) batch of
+                case HolbuildRemoteExec.submit_with_query (remote_only orelse detach) url
+                       (if fail_fast then "?fail_fast=true" else "") (#maxheap tc) batch of
                     HolbuildRemoteExec.Refused reason => fall_back reason
                   | HolbuildRemoteExec.Ok batch_id =>
                       (HolbuildStatus.message_stderr ("holbuild: remote batch " ^ batch_id ^ "\n");
@@ -2198,7 +2244,7 @@ fun default_build_options trknl project index entry_plan plan =
      emit_output_hashes = false,
      allow_cache_timeout_discrepancy = false,
      trknl = trknl,
-     restore_only = false}
+     restore_only = false, fail_fast = false}
   end
 
 (* Input keys a plain `holbuild build` uses for PLAN's nodes; they name the
@@ -2237,7 +2283,7 @@ fun heap_build_options trknl =
    emit_output_hashes = false,
    allow_cache_timeout_discrepancy = false,
    trknl = trknl,
-   restore_only = false}
+   restore_only = false, fail_fast = false}
 
 fun theory_node node =
   #kind (HolbuildBuildPlan.source_of node) = HolbuildSourceIndex.TheoryScript

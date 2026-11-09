@@ -977,7 +977,7 @@ def test_a_result_detail_is_read_as_one_line_of_printable_ascii() -> None:
 
 async def test_result_without_an_input_key_is_matched_by_its_spec(http: httpx.AsyncClient) -> None:
     # exec-action leaves input-key empty when it couldn't read the spec.
-    batch_id = await submit(http, ["a", "b"])
+    batch_id = await submit(http, ["a", "b"], fail_fast="true")
     token = await claim_named(http, "a")
     unread = result("a", "failed", "spec-rejected").replace(f"input-key={input_key('a')}", "input-key=")
     wrong_spec = unread.replace(f"spec={spec('a')}", f"spec={spec('b')}")
@@ -988,8 +988,8 @@ async def test_result_without_an_input_key_is_matched_by_its_spec(http: httpx.As
 
 
 @pytest.mark.parametrize("failure", ["proof", "tactic-timeout", "spec-rejected"])
-async def test_final_failures_fail_the_batch_and_cancel_the_rest(http: httpx.AsyncClient, failure: str) -> None:
-    batch_id = await submit(http, ["a", "b", "c"], [("c", "a")])
+async def test_fail_fast_cancels_the_rest(http: httpx.AsyncClient, failure: str) -> None:
+    batch_id = await submit(http, ["a", "b", "c"], [("c", "a")], fail_fast="true")
     token_a = await claim_named(http, "a")
     token_b = await claim_named(http, "b")
     assert (await complete(http, token_a, result("a", "failed", failure))).status_code == 200
@@ -998,6 +998,72 @@ async def test_final_failures_fail_the_batch_and_cancel_the_rest(http: httpx.Asy
     assert (status["state"], status["failure"]) == ("failed", f"pkg:a: {failure}")
     assert await states(http, batch_id) == {"a": "failed", "b": "cancelled", "c": "cancelled"}
     assert (await http.post(f"/v1/work/{token_b}/heartbeat", headers=WORKER)).status_code == 409
+
+
+async def test_independent_failures_and_success_finish_before_the_batch_fails(
+    http: httpx.AsyncClient, cache: FakeCache,
+) -> None:
+    batch_id = await submit(http, ["a", "b", "c", "d", "e", "f"], [("c", "a"), ("d", "c"), ("f", "e")])
+    tokens = await claim_all(http, 3)
+    assert set(tokens) == {"a", "b", "e"}
+    assert (await complete(http, tokens["a"], result("a", "failed", "proof"))).status_code == 200
+    assert (await batch(http, batch_id))["state"] == "running"
+    assert await states(http, batch_id) == {
+        "a": "failed", "b": "running", "c": "cancelled", "d": "cancelled", "e": "running", "f": "waiting",
+    }
+    assert (await http.post(f"/v1/work/{tokens['b']}/heartbeat", headers=WORKER)).status_code == 200
+    assert (await complete(http, tokens["b"], result("b", "failed", "tactic-timeout"))).status_code == 200
+    assert (await batch(http, batch_id))["state"] == "running"
+    cache.keys.add(ac_key("e"))
+    assert (await complete(http, tokens["e"], result("e", "built"))).status_code == 200
+    assert (await batch(http, batch_id))["state"] == "running"
+    await build(http, cache, "f")
+    status = await batch(http, batch_id)
+    assert (status["state"], status["failure"]) == ("failed", "pkg:a: proof; pkg:b: tactic-timeout")
+    assert await claim(http) is None
+    events = [json.loads(line) for line in
+              (await http.get(f"/v1/batches/{batch_id}/events", headers=CLIENT)).text.splitlines() if line]
+    actions = {e["theory"]: e for e in events if e["type"] == "action"}
+    for name in ("a", "b"):
+        assert actions[f"pkg:{name}"]["state"] == "failed"
+        assert actions[f"pkg:{name}"]["log_sha256"] == "a" * 64
+    for name in ("c", "d"):
+        assert actions[f"pkg:{name}"]["attempts"] == 0
+        assert actions[f"pkg:{name}"]["last_failure"].startswith("skipped because of pkg:a:")
+    assert actions["pkg:e"]["state"] == "done"
+    assert actions["pkg:f"]["state"] == "done"
+    assert cache.keys == {ac_key("e"), ac_key("f")}
+    assert events[-1]["state"] == "failed"
+
+
+async def test_failed_requeued_parent_revokes_running_descendants(
+    http: httpx.AsyncClient, cache: FakeCache,
+) -> None:
+    batch_id = await submit(http, ["a", "b", "c"], [("b", "a"), ("c", "a")])
+    await build(http, cache, "a")
+    tokens = await claim_all(http, 2)
+    cache.keys.discard(ac_key("a"))
+    assert (await complete(http, tokens["c"], result("c", "failed", "input-missing",
+                           missing=f"theory {input_key('a')}"))).status_code == 200
+    retry = await claim_named(http, "a")
+    assert (await complete(http, retry, result("a", "failed", "proof"))).status_code == 200
+    assert await states(http, batch_id) == {"a": "failed", "b": "cancelled", "c": "cancelled"}
+    assert (await http.post(f"/v1/work/{tokens['b']}/heartbeat", headers=WORKER)).status_code == 409
+    assert (await complete(http, tokens["b"], result("b", "built"))).status_code == 409
+    assert (await batch(http, batch_id))["state"] == "failed"
+
+
+async def test_missing_failed_parent_skips_the_action_instead_of_waiting_forever(
+    http: httpx.AsyncClient,
+) -> None:
+    batch_id = await submit(http, ["a", "b", "c"], [("c", "b")])
+    tokens = await claim_all(http, 2)
+    assert (await complete(http, tokens["a"], result("a", "failed", "proof"))).status_code == 200
+    assert (await complete(http, tokens["b"], result("b", "failed", "input-missing",
+                           missing=f"theory {input_key('a')}"))).status_code == 200
+    assert await states(http, batch_id) == {"a": "failed", "b": "cancelled", "c": "cancelled"}
+    assert (await batch(http, batch_id))["state"] == "failed"
+    assert await claim(http) is None
 
 
 async def test_a_final_failure_without_a_log_gives_its_detail_in_the_batch_failure(http: httpx.AsyncClient) -> None:

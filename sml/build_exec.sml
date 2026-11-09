@@ -3009,7 +3009,7 @@ fun best_failed_prefix_checkpoint requested_timeout checkpoints =
 
 datatype force_level = ForceNone | ForceTargets | ForceProject | ForceAll
 
-type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, checkpoint_targets : string list option, proof_steps : bool, new_ir : bool, proof_scope : HolbuildTacticTimeoutPolicy.proof_scope, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool}
+type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, checkpoint_targets : string list option, proof_steps : bool, new_ir : bool, proof_scope : HolbuildTacticTimeoutPolicy.proof_scope, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool, fail_fast : bool}
 
 (* checkpoint: the theory saves checkpoints at all, its deps_loaded state
    included.  theorem_checkpoints: it also saves them per theorem and
@@ -5327,42 +5327,6 @@ fun refresh_checkpoint_budget_after_node state project node protected_bases =
          end)
         handle e => warn_checkpoint_budget_error e)
 
-fun build_serial dat_hash_cache status options tc project base_context plan keys toolchain_key budget_state =
-  let
-    fun error_message e =
-      case e of
-          Error msg => msg
-        | ErrorWithDebugArtifacts (msg, _) => msg
-        | _ => General.exnMessage e
-    fun error_debug_artifacts e =
-      case e of
-          ErrorWithDebugArtifacts (_, artifacts) => artifacts
-        | _ => HolbuildStatus.no_debug_artifacts
-    fun one node =
-      build_one dat_hash_cache status options tc project base_context plan keys toolchain_key node
-      handle e =>
-        let
-          val msg = error_message e
-          val artifacts = error_debug_artifacts e
-        in
-          HolbuildStatus.fail_with_debug_artifacts
-            status (HolbuildBuildPlan.key node) (HolbuildBuildPlan.logical_name node)
-            msg artifacts;
-          raise e
-        end
-    fun loop [] = ()
-      | loop (node :: rest) =
-          case one node of
-              HolbuildStatus.Inspected => mark_checkpoint_budget_refresh_needed budget_state
-            | outcome =>
-                (if outcome_may_create_checkpoints options project node outcome then
-                   refresh_checkpoint_budget_after_node budget_state project node []
-                 else ();
-                 loop rest)
-  in
-    loop (HolbuildBuildPlan.selected_nodes plan)
-  end
-
 fun build_error_message e =
   case e of
       Error msg => msg
@@ -5373,6 +5337,63 @@ fun build_error_debug_artifacts e =
   case e of
       ErrorWithDebugArtifacts (_, artifacts) => artifacts
     | _ => HolbuildStatus.no_debug_artifacts
+
+fun raise_build_failures failures =
+  case failures of
+      [] => ()
+    | [(_, e)] => raise e
+    | (_, first) :: _ =>
+        let
+          val msg = Int.toString (length failures) ^ " build failures:\n\n" ^
+                    String.concatWith "\n\n" (map (fn (name, e) => name ^ ": " ^ build_error_message e) failures)
+          val artifacts = build_error_debug_artifacts first
+        in
+          if HolbuildStatus.debug_artifacts_empty artifacts then raise Error msg
+          else raise ErrorWithDebugArtifacts (msg, artifacts)
+        end
+
+fun build_serial dat_hash_cache status (options : build_options) tc project base_context plan keys toolchain_key budget_state =
+  let
+    val blocked = ref (Redblackmap.mkDict String.compare)
+    val failures = ref []
+    fun one node =
+      let
+        val key = HolbuildBuildPlan.key node
+        val name = HolbuildBuildPlan.logical_name node
+        val reason = List.mapPartial (fn dep => Redblackmap.peek (!blocked, HolbuildBuildPlan.key dep))
+                       (HolbuildBuildPlan.direct_project_deps plan node)
+      in
+        case reason of
+            cause :: _ =>
+              (blocked := Redblackmap.insert (!blocked, key, cause);
+               HolbuildStatus.skip status key name cause;
+               SOME HolbuildStatus.UpToDate)
+          | [] =>
+              SOME (build_one dat_hash_cache status options tc project base_context plan keys toolchain_key node)
+              handle Thread.Interrupt => raise Thread.Interrupt
+                   | e =>
+                       (HolbuildStatus.fail_with_debug_artifacts status key name
+                          (build_error_message e) (build_error_debug_artifacts e);
+                        if #fail_fast options then raise e
+                        else (blocked := Redblackmap.insert (!blocked, key, name);
+                              failures := (name, e) :: !failures; NONE))
+      end
+    fun loop [] = ()
+      | loop (node :: rest) =
+          case one node of
+              SOME HolbuildStatus.Inspected => mark_checkpoint_budget_refresh_needed budget_state
+            | outcome =>
+                (case outcome of
+                     SOME outcome =>
+                       if outcome_may_create_checkpoints options project node outcome then
+                         refresh_checkpoint_budget_after_node budget_state project node []
+                       else ()
+                   | NONE => ();
+                 loop rest)
+  in
+    loop (HolbuildBuildPlan.selected_nodes plan);
+    raise_build_failures (rev (!failures))
+  end
 
 fun build_parallel dat_hash_cache status options tc project base_context plan keys toolchain_key jobs budget_state =
   let
@@ -5405,7 +5426,8 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
     val checkpoint_maintenance_owner = ref (NONE : int option)
     val checkpoint_maintenance_queue = ref ([] : int list)
     val stopped = ref false
-    val failure = ref (NONE : (string * HolbuildStatus.debug_artifacts) option)
+    val failures = ref ([] : (string * exn) list)
+    val skipped = Array.array (node_count, false)
     val failed_prefix_priority = Array.array (node_count, NONE : bool option)
 
     fun node_id node = HolbuildBuildPlan.indexed_key_id key_index (HolbuildBuildPlan.key node)
@@ -5535,10 +5557,7 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
                else (ready := rest; SOME (id, false)))
 
     fun next_work_locked () =
-      case !failure of
-          SOME _ => NONE
-        | NONE =>
-            if !stopped then NONE
+            if !stopped orelse (#fail_fast options andalso not (null (!failures))) then NONE
             else if Option.isSome (!checkpoint_maintenance_owner) then
               (ConditionVar.wait (cv, mutex); next_work_locked ())
             else
@@ -5562,7 +5581,7 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
       let val remaining = Array.sub (remaining_deps, child_id) - 1
       in
         Array.update (remaining_deps, child_id, remaining);
-        if remaining = 0 then add_ready child_id else ()
+        if remaining = 0 andalso not (Array.sub (skipped, child_id)) then add_ready child_id else ()
       end
 
     fun stop_requested () = with_lock (fn () => !stopped)
@@ -5681,7 +5700,19 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
     fun finish_cancelled_after_stop id =
       with_lock (fn () => (running := !running - 1; clear_active_node id; finish_priority id; signal ()))
 
-    fun finish_failure id msg artifacts =
+    fun skip_descendants cause id =
+      if Array.sub (skipped, id) then ()
+      else
+        let val node = Vector.sub (nodes, id)
+        in
+          Array.update (skipped, id, true);
+          completed := !completed + 1;
+          finish_priority_focus id;
+          HolbuildStatus.skip status (HolbuildBuildPlan.key node) (HolbuildBuildPlan.logical_name node) cause;
+          List.app (skip_descendants cause) (Array.sub (dependents, id))
+        end
+
+    fun finish_failure id e =
       let
         val first_failure =
           with_lock
@@ -5690,18 +5721,18 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
                   val _ = running := !running - 1
                   val _ = clear_active_node id
                   val _ = finish_priority id
-                  val first =
-                    if !stopped then false
-                    else
-                      case !failure of
-                          SOME _ => false
-                        | NONE => (failure := SOME (msg, artifacts); true)
+                  val _ = completed := !completed + 1
+                  val first = null (!failures)
+                  val name = HolbuildBuildPlan.logical_name (Vector.sub (nodes, id))
+                  val _ = failures := (name, e) :: !failures
+                  val _ = if #fail_fast options then ()
+                          else List.app (skip_descendants name) (Array.sub (dependents, id))
                 in
                   signal ();
                   first
                 end)
       in
-        if first_failure then HolbuildToolchain.cleanup_active_children () else ()
+        if first_failure andalso #fail_fast options then HolbuildToolchain.cleanup_active_children () else ()
       end
 
     fun worker_exit () =
@@ -5745,8 +5776,8 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
                            status (HolbuildBuildPlan.key node) (HolbuildBuildPlan.logical_name node)
                            msg artifacts
                           handle IO.Io _ => ());
-                         finish_failure id msg artifacts;
-                         worker_exit ()
+                         finish_failure id e;
+                         loop ()
                        end)
                 end
       in
@@ -5758,7 +5789,7 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
       else (ConditionVar.wait (cv, mutex); wait_workers_locked ())
 
     fun wait_workers_result () =
-      (lock (); wait_workers_locked (); !failure before unlock ())
+      (lock (); wait_workers_locked (); rev (!failures) before unlock ())
       handle e => (unlock (); raise e)
 
     fun wait_worker_threads threads =
@@ -5766,19 +5797,13 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
         (OS.Process.sleep (Time.fromReal 0.05); wait_worker_threads threads)
       else ()
 
-    fun raise_failure result =
-      case result of
-          NONE => ()
-        | SOME (msg, artifacts) =>
-            if HolbuildStatus.debug_artifacts_empty artifacts then raise Error msg
-            else raise ErrorWithDebugArtifacts (msg, artifacts)
   in
     let
       val threads = List.tabulate (jobs, fn _ => Thread.fork (worker, []))
       val result = wait_workers_result ()
       val _ = wait_worker_threads threads
     in
-      raise_failure result
+      raise_build_failures result
     end
   end
 
@@ -6064,7 +6089,7 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
 (* After remote execution, force and tracing have already been fulfilled. *)
 fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets, skip_checkpoints, checkpoint_targets, proof_steps,
                            new_ir, proof_scope, node_tactic_timeouts, execution_plan, repl_on_failure,
-                           emit_output_hashes, allow_cache_timeout_discrepancy, trknl, ...} : build_options)
+                           emit_output_hashes, allow_cache_timeout_discrepancy, trknl, fail_fast, ...} : build_options)
     : build_options =
   {use_cache = use_cache, verify_cache = verify_cache, force = ForceNone, force_targets = force_targets,
    skip_checkpoints = skip_checkpoints, checkpoint_targets = checkpoint_targets,
@@ -6073,7 +6098,7 @@ fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets
    trace_steps = false, repl_on_failure = repl_on_failure,
    emit_output_hashes = emit_output_hashes,
    allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy, trknl = trknl,
-   restore_only = restore_only}
+   restore_only = restore_only, fail_fast = if restore_only then false else fail_fast}
 
 (* The plan's node whose action has input key `input_key`. *)
 fun node_with_input_key (options : build_options) tc project plan toolchain_key input_key =

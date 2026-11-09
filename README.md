@@ -284,6 +284,20 @@ outputs are unaffected. An explicit debugging flag turns back on what it needs:
 
 ## Common commands
 
+Builds finish independent work after a theory or library fails. Nodes that
+depend on a failure are skipped, with the failed dependency named in the
+diagnostic. Successful outputs are cached normally; failed or skipped nodes
+publish no successful outputs. Every failure is reported as it happens and in
+the final diagnostic, and the build exits nonzero. Pass `build --fail-fast`
+to stop after the first failure and cancel unfinished work instead.
+
+Keep-going applies within a resolved build plan. Setup or dependency-planning
+errors still stop the command. A theory that generates SML sources must finish
+before those sources and their consumers can be planned: if that preliminary
+phase fails, independent actions already in its plan finish, but the later
+phase does not start. Planning from missing or stale generated sources could
+otherwise miss dependencies or compute incorrect input keys.
+
 `build` is the default command, so it can usually be omitted:
 
 ```sh
@@ -1816,12 +1830,18 @@ only restores from the cache, and with `--detach` it fails.
 
 A batch that fails because a theory's proof failed on a worker (failure
 `proof` or `tactic-timeout`) isn't built locally, since a local build would
-fail the same way. The build restores what the cache holds, as `--remote-only`
-does, fetches the worker's build log from the remote cache into
+fail the same way. Independent theories finish first, and dependents of failed
+theories are reported as skipped. The build restores successful branches from
+the cache, as `--remote-only` does, fetches each failed worker's build log into
 `.holbuild/logs/current/<package>/<theory>/build.log`, prints the diagnostic a
 local build would, and exits with status 1, with or without `--remote-only`.
-If that log can't be fetched, the build builds just the failed theory locally,
+If a log can't be fetched, the build builds just that failed theory locally,
 for its diagnostic; with `--remote-only` it fails with status 75 instead.
+The event stream reports each failure when it occurs and repeats the full list
+of failures and skips when following ends. `--fail-fast` asks the coordinator
+to stop the batch on its first final failure. Older coordinators retain their
+fail-fast behavior until upgraded; older clients can follow new coordinators
+using the existing event format, without the new client's full diagnostics.
 
 `--detach` submits the batch, prints its id (`holbuild: remote batch <id>`)
 and exits; if the batch can't be submitted, it fails rather than building
@@ -1844,6 +1864,8 @@ The coordinator's protocol, in what holbuild uses of it:
 
 - `POST /v1/batches` with the batch text as the body answers 201 and
   `{"batch_id": "<id>"}`; any other status refuses the batch.
+  The optional query parameter `fail_fast=true` stops independent actions after
+  a final build failure. It defaults to false and does not change run batches.
 - `GET /v1/batches/<id>/events` streams one JSON object per line: an
   `{"type": "action", "input_key", "theory", "state", "last_failure",
   "log_sha256", "failure_detail", ...}` when an action changes, and last
@@ -1854,6 +1876,12 @@ The coordinator's protocol, in what holbuild uses of it:
   log, such as a spec the worker rejects, says why in `failure_detail`, which
   holbuild prints with the failure. A stream may start over: it
   sends every action's current state first.
+  A skipped dependent uses the existing action state `cancelled` with
+  `last_failure` beginning `skipped because of `; its reason names the failed
+  ancestor. A build batch stays `running` while independent actions remain,
+  then ends `failed` with the failed actions listed in `failure`. Batch-wide
+  cancellation, deadlines and input-cache resubmission errors still abort the
+  batch immediately.
 - `POST /v1/batches/<id>/cancel` cancels a running batch and answers
   `{"state": "<state>"}`: `cancelled`, or the end a batch that already
   ended reached.
