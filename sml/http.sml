@@ -99,6 +99,7 @@ val CURLOPT_LOW_SPEED_TIME = 20
 val CURLOPT_CONNECTTIMEOUT = 78
 val CURLOPT_HTTPHEADER = 10023
 val CURLOPT_NOBODY = 44
+val CURLOPT_IGNORE_CONTENT_LENGTH = 136
 val CURLOPT_UPLOAD = 46
 val CURLOPT_FOLLOWLOCATION = 52
 val CURLOPT_HTTPGET = 80
@@ -388,6 +389,7 @@ fun request_once {url, timeout, output, set_options} =
      check "LOW_SPEED_TIME" (setopt_long (easy, CURLOPT_LOW_SPEED_TIME, timeout));
      check "URL" (setopt_str (easy, CURLOPT_URL, url));
      check "WRITEDATA" (setopt_ptr (easy, CURLOPT_WRITEDATA, output));
+     check "IGNORE_CONTENT_LENGTH" (setopt_long (easy, CURLOPT_IGNORE_CONTENT_LENGTH, 0));
      set_options easy;
      transfer connection
      before List.app (fn option => ignore (setopt_ptr (easy, option, Foreign.Memory.null)))
@@ -407,12 +409,17 @@ fun get {url, dst, timeout} =
 
 (* Asks for url with HEAD.  HTTPGET first clears a pooled handle's upload
    from an earlier put, which NOBODY alone leaves in place before libcurl
-   7.72; the next get or put, setting HTTPGET or UPLOAD, turns NOBODY off. *)
+   7.72; the next get or put, setting HTTPGET or UPLOAD, turns NOBODY off.
+   A HEAD's Content-Length is ignored: only the status matters, and
+   bazel-remote answers -1 for a blob it has only in its S3 backend, which
+   libcurl otherwise rejects. *)
 fun head {url, timeout} =
   with_file "/dev/null" "wb" (fn sink =>
     request {url = url, timeout = timeout, output = sink,
              set_options = fn easy => (check "HTTPGET" (setopt_long (easy, CURLOPT_HTTPGET, 1));
-                                       check "NOBODY" (setopt_long (easy, CURLOPT_NOBODY, 1)))})
+                                       check "NOBODY" (setopt_long (easy, CURLOPT_NOBODY, 1));
+                                       check "IGNORE_CONTENT_LENGTH"
+                                         (setopt_long (easy, CURLOPT_IGNORE_CONTENT_LENGTH, 1)))})
 
 (* Uploads src to url with PUT and the given extra request headers; the
    response body is discarded. *)
