@@ -7933,9 +7933,9 @@ in
 end
 
 fun peak_rss_mb stage =
-  case String.tokens Char.isSpace (read_text (Path.concat(stage, peak_rss_report_name))) of
-      ["VmHWM:", kb, "kB"] => Option.map (fn n => n div 1024) (Int.fromString kb)
-    | _ => NONE
+  (case String.tokens Char.isSpace (read_text (Path.concat(stage, peak_rss_report_name))) of
+       ["VmHWM:", kb, "kB"] => Option.map (fn n => n div 1024) (Int.fromString kb)
+     | _ => NONE)
   handle _ => NONE
 
 (* The child's own report of a full disk; a checkpoint write that failed
@@ -9336,13 +9336,16 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                 remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints)
               end
               handle Error msg =>
-                if not (!HolbuildActionSandbox.outputs_validated) then
-                  raise ActionFailed (InternalFailure, msg)
-                else
-                let val log_text = read_text (build_log ()) handle _ => ""
-                in
-                  raise ActionFailed (classify_run_failure stage log_text oom_before msg)
-                end
+                (* The child's exporter may have recorded its peak before
+                   a later step failed. *)
+                (peak := peak_rss_mb stage;
+                 if not (!HolbuildActionSandbox.outputs_validated) then
+                   raise ActionFailed (InternalFailure, msg)
+                 else
+                 let val log_text = read_text (build_log ()) handle _ => ""
+                 in
+                   raise ActionFailed (classify_run_failure stage log_text oom_before msg)
+                 end)
             val _ = peak := peak_rss_mb stage
             val _ =
               phase "check" (fn () =>

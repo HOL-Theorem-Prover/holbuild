@@ -427,6 +427,19 @@ if grep -q "instrumented log:" "$tmpdir/killed-action.log"; then
   exit 1
 fi
 
+# A failure after the export still reports the peak the exporter measured.
+cat > "$project/src/UnwrittenScript.sml" <<'SML'
+Theory Unwritten
+Ancestors bool
+
+fun holbuild_extra_outputs (_ : string list) = ()
+val _ = holbuild_extra_outputs ["results/unwritten.txt"]
+SML
+hb action-spec --upload UnwrittenTheory > "$tmpdir/batch-unwritten.txt"
+worker unwritten "$(spec_for "$tmpdir/batch-unwritten.txt" worker:UnwrittenTheory)"
+expect unwritten 3 "status=failed"
+require_grep '^peak-rss-mb=[1-9][0-9]*$' "$tmpdir/unwritten.result"
+
 # Target-only theorem checkpoints reach the worker: a theory that isn't a
 # target keeps its deps heap but saves no theorem checkpoints. A target's
 # spec, and every spec under --all-checkpoints, doesn't mention them.
