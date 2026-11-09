@@ -768,7 +768,13 @@ def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = N
         argv = argv[1:]
         while argv and "=" in argv[0]:
             key, value = argv.pop(0).split("=", 1)
-            if not key.startswith("HOLBUILD_RUN_"):
+            # A tool cache directory the action could not write would be
+            # no tool cache; one elsewhere would expose worker state.
+            if key == "HOLBUILD_TOOL_CACHE_DIR":
+                directory = Path(value).resolve(strict=True)
+                if not any(root == directory or root in directory.parents for root in policy.writable):
+                    raise SandboxError(f"tool cache directory outside the action tree: {value}")
+            elif not key.startswith("HOLBUILD_RUN_"):
                 raise SandboxError(f"unexpected action environment assignment: {key}")
             env[key] = value
     if not argv:
