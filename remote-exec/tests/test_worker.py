@@ -59,6 +59,13 @@ if [ -n "$HOLBUILD_FAKE_HANG" ]; then
 fi
 echo "$@" >> "$HOLBUILD_FAKE_LOG"
 env > "$HOLBUILD_FAKE_LOG.env"
+if [ -n "$HOLBUILD_FAKE_PUBLISH" ]; then
+  sleep 120 &
+  child=$!
+  trap 'kill "$child"; wait "$child" || true; sleep 3; echo published > "$HOLBUILD_FAKE_LOG.published"; exit 1' TERM
+  echo ready > "$HOLBUILD_FAKE_LOG.ready"
+  wait
+fi
 # long enough for a heartbeat at the 1 s interval of a 3 s lease; HOLBUILD_FAKE_LEASE: in a child holding that file
 # open, as a HOL child holds its admission lease
 if [ -n "$HOLBUILD_FAKE_LEASE" ]; then sleep 1; (exec 3>"$HOLBUILD_FAKE_LEASE"; sleep 2); sleep 1; else sleep 2; fi
@@ -96,6 +103,7 @@ class Server:
     protection: list[dict[str, object]] = field(default_factory=list)
     claims: list[dict[str, object]] = field(default_factory=list)
     heartbeats: list[dict[str, object]] = field(default_factory=list)
+    lease_lost: bool = False
     unavailable: int = 0  # how many more completes answer 502, as a proxy does while the coordinator restarts
     cut_short: bool = False  # whether /cas/ answers close the connection before the body they announce is sent
     next_claim: dict[str, object] | None = None
@@ -152,6 +160,8 @@ def server() -> Iterator[Server]:
                 state.completed.append(body)
             if self.path.endswith("/heartbeat"):
                 state.heartbeats.append(json.loads(body))
+                if state.lease_lost:
+                    return self.reply(409)
             self.reply(200, json.dumps({"accepted": True}) if self.path.endswith("/complete") else '{"lease_s": 3}')
 
         def do_PUT(self) -> None:
@@ -317,13 +327,13 @@ def claim() -> dict[str, object]:
 
 
 @contextlib.contextmanager
-def running_worker(tmp_path: Path, server: Server, drain: str) -> Iterator[subprocess.Popen[bytes]]:
+def running_worker(tmp_path: Path, server: Server, drain: str, *extra: str) -> Iterator[subprocess.Popen[bytes]]:
     env = {**os.environ, "REMOTE_EXEC_WORKER_TOKEN": "w", "HOLBUILD_CACHE": str(tmp_path / "cache")}
     with (tmp_path / "worker.log").open("wb") as log:
         process = subprocess.Popen(
             [sys.executable, "-m", "remote_exec.worker", "--coordinator", server.url, "--remote-cache", server.url,
              "--cache-limit-gb", "50", "--holbuild-releases-dir", str(tmp_path / "releases"),
-             "--holbuild-source-url", f"file://{tmp_path}/holbuild-{{version}}.tar.gz", "--drain-seconds", drain],
+             "--holbuild-source-url", f"file://{tmp_path}/holbuild-{{version}}.tar.gz", "--drain-seconds", drain, *extra],
             env=env, stdout=log, stderr=log, start_new_session=True,
         )
         try:
@@ -355,22 +365,23 @@ def test_sigterm_finishes_or_releases_the_action_without_claiming_again(
     assert len(server.claims) == 1
 
 
+@pytest.mark.parametrize("share_heaps", [False, True])
 def test_sigterm_kills_descendants_that_ignore_term_and_repeated_signals_do_not_reset_the_drain(
-    tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, share_heaps: bool,
 ) -> None:
     release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
     server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
     server.next_claim = claim()
     monkeypatch.setenv("HOLBUILD_FAKE_HANG", "1")
     child_file = Path(f"{logs[1]}.child")
-    with running_worker(tmp_path, server, "0.1") as process:
+    with running_worker(tmp_path, server, "0.1", *(["--share-heaps"] if share_heaps else [])) as process:
         wait_for_file(child_file)
         group = int(Path(f"{logs[1]}.pid").read_text())
         try:
             process.send_signal(signal.SIGTERM)
             time.sleep(0.2)
             process.send_signal(signal.SIGTERM)
-            assert process.wait(timeout=8) == 0, (tmp_path / "worker.log").read_text()
+            assert process.wait(timeout=15 if share_heaps else 8) == 0, (tmp_path / "worker.log").read_text()
             child = Path(f"/proc/{int(child_file.read_text())}/stat")
             assert not child.exists() or child.read_text().split()[2] == "Z"
         finally:
@@ -378,6 +389,27 @@ def test_sigterm_kills_descendants_that_ignore_term_and_repeated_signals_do_not_
                 os.killpg(group, signal.SIGKILL)
     assert server.completed == [failed_record(SPEC, "unavailable")]
     assert len(server.claims) == 1
+
+
+@pytest.mark.parametrize("stop", ["drain", "lease-loss"])
+def test_interruption_allows_checkpoint_publication_before_teardown(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, stop: str,
+) -> None:
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+    server.next_claim = claim()
+    monkeypatch.setenv("HOLBUILD_FAKE_PUBLISH", "1")
+    with running_worker(tmp_path, server, "0", "--share-heaps") as process:
+        wait_for_file(Path(f"{logs[1]}.ready"))
+        if stop == "drain":
+            process.send_signal(signal.SIGTERM)
+        else:
+            server.lease_lost = True
+        wait_for_file(Path(f"{logs[1]}.published"))
+        if stop == "lease-loss":
+            process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=10) == 0, (tmp_path / "worker.log").read_text()
+    assert server.completed == ([failed_record(SPEC, "unavailable")] if stop == "drain" else [])
 
 
 def test_sigterm_interrupts_an_idle_long_poll(tmp_path: Path, server: Server) -> None:
