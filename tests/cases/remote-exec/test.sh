@@ -1560,6 +1560,26 @@ require_grep "could not fetch the failed theory's build log: BadATheory" "$tmpdi
 require_grep "could not fetch the failed theory's build log: BadBTheory" "$tmpdir/multi-failure-nolog.log"
 refute_grep 'Theory built\|building locally' "$tmpdir/multi-failure-nolog.log"
 
+# A non-proof final failure must install the healthy branch too, even though
+# --remote-only requests a local retry rather than diagnosing the proof.
+while read -r tag key ac spec theory; do
+  if [[ $tag == action && $theory == rxmultifailure:Bad* ]]; then
+    sed -i 's/^failure=.*/failure=memory/' "$state/result-$key"
+  fi
+done < "$state/$batch.batch"
+touch "$state/fail"
+in_copy multi-failure clean HealthyTheory > /dev/null
+status=0
+in_copy multi-failure --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only --attach "$batch" BadATheory BadBTheory HealthyTheory BlockedTheory \
+  > "$tmpdir/multi-failure-memory.log" 2>&1 || status=$?
+rm "$state/fail"
+[[ $status -eq 75 ]] || { cat "$tmpdir/multi-failure-memory.log" >&2; exit 1; }
+require_grep 'remote failure summary: 2 failed, 1 skipped' "$tmpdir/multi-failure-memory.log"
+require_grep 'failed (memory)' "$tmpdir/multi-failure-memory.log"
+require_file "$tmpdir/multi-failure/.holbuild/obj/src/HealthyTheory.dat"
+refute_grep 'Theory built\|building locally' "$tmpdir/multi-failure-memory.log"
+
 in_copy multi-failure --remote-cache "$remote_url" build --remote-exec "$coordinator" \
   --remote-only --detach --fail-fast BadATheory > "$tmpdir/multi-fail-fast.log" 2>&1
 require_grep '^POST /v1/batches?fail_fast=true ' "$state/requests.log"

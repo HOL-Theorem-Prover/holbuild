@@ -81,8 +81,9 @@ its queries. Deployments that migrate on every service start must account for
 this before pinning an older image.
 
 For a rollback that preserves the schema, deploy a reviewed forward patch
-release restoring the previous execution policy while retaining migrations
-`0010` and `0011`. Clients can use `--fail-fast` for immediate early stopping
+release restoring fail-fast dispatch while retaining migrations `0010` and
+`0011` and terminal-state aggregation for already-running keep-going batches.
+Clients can use `--fail-fast` for immediate early stopping
 on new submissions. To deploy a pre-`0011` image instead, first drain or cancel
 running batches, since an older coordinator does not implement their
 keep-going completion rules, then use the current image to downgrade to the

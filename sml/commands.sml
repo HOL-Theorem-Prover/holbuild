@@ -1653,17 +1653,11 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                                        (#checkpoint_targets build_options))
                               tc project theory_plan toolchain_key jobs)
               end
-            (* Restore independent successes, then diagnose every final failure.
-               A missing proof log retains the single-theory diagnostic fallback. *)
+            (* Diagnose every final failure. A missing proof log retains the
+               single-theory diagnostic fallback. *)
             fun proof_failed reason (failures : HolbuildRemoteExec.action_failure list) =
               let
                 val _ = HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "\n")
-                val _ =
-                  HolbuildBuildExec.build (HolbuildBuildExec.remote_restore_options true build_options)
-                    tc project plan toolchain_key jobs
-                  handle HolbuildBuildExec.Error _ => ()
-                       | HolbuildBuildExec.ErrorWithDebugArtifacts _ => ()
-                val _ = HolbuildHolSharedCache.local_build_needed := false
                 val needs_local = ref false
                 fun diagnose ({input_key, kind, log_sha256} : HolbuildRemoteExec.action_failure) =
                   case HolbuildBuildExec.node_with_input_key build_options tc project plan toolchain_key input_key of
@@ -1760,20 +1754,33 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                  tc project plan toolchain_key jobs))
                     end
                 | ((HolbuildRemoteExec.Failed (reason, failures), progress), _) =>
-                    if List.exists (fn {kind, ...} => kind = "proof" orelse kind = "tactic-timeout") failures then
-                      proof_failed ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress) failures
+                  let
+                    val proof_failure = List.exists (fn {kind, ...} => kind = "proof" orelse kind = "tactic-timeout") failures
+                    val reason = "batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress
+                    val forced =
+                      case (resubmit andalso not proof_failure, HolbuildRemoteExec.resubmit_theory_key reason) of
+                          (true, SOME missing) =>
+                            HolbuildBuildExec.theory_keys_depending_on build_options tc project plan toolchain_key missing
+                        | _ => []
+                    val missing_blob = resubmit andalso not proof_failure andalso
+                                       HolbuildRemoteExec.resubmit_missing_blob reason
+                    (* Restore before a terminal failure. A resubmission must first
+                       repair its inputs, without installing stale cached outputs. *)
+                    val _ =
+                      if null forced andalso not missing_blob then
+                        (HolbuildBuildExec.build (HolbuildBuildExec.remote_restore_options true build_options)
+                           tc project plan toolchain_key jobs
+                         handle HolbuildBuildExec.Error _ => ()
+                              | HolbuildBuildExec.ErrorWithDebugArtifacts _ => ())
+                      else ()
+                    val _ = HolbuildHolSharedCache.local_build_needed := false
+                  in
+                    if proof_failure then proof_failed reason failures
                     else let
                       val _ = List.app (fn {input_key, log_sha256, ...} =>
                         case (log_sha256, HolbuildBuildExec.node_with_input_key build_options tc project plan toolchain_key input_key) of
                             (SOME sha, SOME node) => ignore (HolbuildBuildExec.fetch_remote_build_log project node sha)
                           | _ => ()) failures
-                      val reason = "batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress
-                      val forced =
-                        case (resubmit, HolbuildRemoteExec.resubmit_theory_key reason) of
-                            (true, SOME missing) =>
-                              HolbuildBuildExec.theory_keys_depending_on build_options tc project plan toolchain_key missing
-                          | _ => []
-                      val missing_blob = resubmit andalso HolbuildRemoteExec.resubmit_missing_blob reason
                     in
                       if null forced andalso not missing_blob then fall_back reason
                       else
@@ -1786,6 +1793,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                          HolbuildBuildExec.drop_local_cache_entries forced;
                          export_and_submit false forced)
                     end
+                  end
                 | ((HolbuildRemoteExec.Cancelled, progress), _) =>
                     let val reason = "batch " ^ batch_id ^ " cancelled; " ^ finished progress
                     in
