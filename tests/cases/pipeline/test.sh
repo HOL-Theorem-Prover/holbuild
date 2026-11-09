@@ -309,3 +309,25 @@ require_grep "pipeline: attempt failed: ATheory" "$log"
 require_grep "wrote theory data of type simp.deltas" "$log"
 require_grep "pipeline: gate failed: ATheory (digest differs)" "$log"
 require_same_as_unpipelined thydata CTheory A B C
+
+# A deferred proof that fails, as one racing another thread on a library's
+# cache can, runs again alone before it fails the build.  This one fails
+# only the first time it runs.
+new_project retry
+cat > "$tmpdir/retry/src/AScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+val tries = ref 0;
+Theorem a_flaky:
+  T
+Proof
+  (fn g => (tries := !tries + 1; if !tries = 1 then NO_TAC g else ALL_TAC g)) >> $slow_truth
+QED
+val _ = export_theory();
+SML
+write_b_and_c retry
+build_pipelined retry CTheory
+log=$tmpdir/retry.log
+require_no_grep "attempt failed" "$log"
+require_grep "pipeline: gate passed: ATheory" "$log"
+require_grep "pipeline: committed: CTheory" "$log"

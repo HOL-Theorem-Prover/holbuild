@@ -47,7 +47,8 @@ struct
 
   (* The theory data types whose encoding holbuild knows
      (HolbuildRuntime.normalized_theory_data) and the current theory holds
-     no pending load of. *)
+     no pending load of.  A type registered with LoadableThyData.new and its
+     own codec, other than the three named here, isn't checked. *)
   fun thydata_types () =
     List.filter (fn ty => (ignore (segment_data ty); true) handle Feedback.HOL_ERR _ => false)
       (List.mapPartial
@@ -108,18 +109,23 @@ struct
       val mutex = Mutex.mutex ()
       val cv = ConditionVar.conditionVar ()
       val results = ref []
-      val failure = ref NONE
+      val failed = ref []
       fun locked f = (Mutex.lock mutex; f () before Mutex.unlock mutex)
                      handle e => (Mutex.unlock mutex; raise e)
       fun take () =
-        locked (fn () => case (!failure, !items) of
-                             (NONE, item :: rest) => (items := rest; SOME item)
-                           | _ => NONE)
-      fun run (item as {k, name, ...} : item) =
+        locked (fn () => case !items of
+                             item :: rest => (items := rest; SOME item)
+                           | [] => NONE)
+      fun prove (item as {k, ...} : item) =
         let val tag = Thm.tag (prove_one types item)
         in locked (fn () => results := (k, (Dep.transfer_thydepl (Tag.dep_of tag), #1 (Tag.dest_tag tag))) :: !results) end
-        handle e => locked (fn () => if Option.isSome (!failure) then ()
-                                     else failure := SOME (name, Feedback.exn_to_string e))
+      fun run item = prove item handle _ => locked (fn () => failed := item :: !failed)
+      (* A proof can fail because another thread raced it on some library's
+         own cache (blastLib's compset, say), so each failed proof runs
+         again alone before it fails the build. *)
+      fun retry (item as {name, ...} : item) =
+        prove item
+        handle e => raise Fail ("deferred proof of " ^ name ^ " failed: " ^ Feedback.exn_to_string e)
       val count = Int.max (0, Int.min (threads, length (!items)))
       val running = ref count
       fun worker () =
@@ -138,12 +144,12 @@ struct
       Theory.register_hook (listener, record);
       List.app (fn _ => ignore (Thread.fork (worker, []))) (List.tabulate (count, fn i => i));
       Mutex.lock mutex; wait (); Mutex.unlock mutex;
+      List.app retry (rev (!failed));
       ignore (Listener.remove_listener Theory.delta_hook listener);
-      case (!failure, !change, changed_thydata live) of
-          (SOME (name, msg), _, _) => raise Fail ("deferred proof of " ^ name ^ " failed: " ^ msg)
-        | (NONE, SOME what, _) => raise Fail ("a deferred proof changed the theory: " ^ what)
-        | (NONE, NONE, SOME ty) => raise Fail ("a deferred proof wrote theory data of type " ^ ty)
-        | (NONE, NONE, NONE) => proved := !results
+      case (!change, changed_thydata live) of
+          (SOME what, _) => raise Fail ("a deferred proof changed the theory: " ^ what)
+        | (NONE, SOME ty) => raise Fail ("a deferred proof wrote theory data of type " ^ ty)
+        | (NONE, NONE) => proved := !results
     end
 
   fun merge_strings [] ys = ys

@@ -4873,9 +4873,11 @@ fun commit_speculative dat_hash_cache (options : build_options) project plan key
     val current_log = current_log_dir root (package node) logical
     val {sig_path, sml_path, data_path, ...} = theory_outputs node
   in
-    (* Not published to the remote cache: a deferred proof can record other
-       dependencies than the same proof run in place, and the shared cache
-       should keep the plain build's outputs. *)
+    (* Not published to the remote cache here: a deferred proof can record
+       other dependencies than the same proof run in place.  The local entry
+       can still reach it later by key (early cutoff's alias, a remote-exec
+       batch's dependency upload); its theorems and digest are a plain
+       build's. *)
     install_theory_stage (#use_cache options andalso cache_enabled node) false policy
       {stage = stage, logical = logical, source_file = source_file node, input_key = input_key,
        outputs = {sig_path = sig_path, sml_path = sml_path, data_path = data_path},
