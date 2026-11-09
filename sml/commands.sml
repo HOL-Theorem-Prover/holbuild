@@ -110,6 +110,11 @@ fun build_help () = print
   \  --emit-output-hashes\n\
   \  --warn-unreachable\n\
   \  --trknl\n\
+  \  --tool-cache NAME\n\
+  \      Give theory children HOLBUILD_TOOL_CACHE_DIR, a directory a tool keeps\n\
+  \      files in from one build to the next: the cache root's tool-cache/NAME\n\
+  \      here; on a remote worker, one the remote cache fills and saves per\n\
+  \      theory dependencies.\n\
   \  --remote-exec URL [--remote-only] [--priority N] [--detach | --attach BATCH-ID]\n\n\
   \With --remote-exec, theories the remote cache lacks and that aren't\n\
   \built here for their current inputs (except with --detach) are built\n\
@@ -266,7 +271,8 @@ fun action_spec_help () = print
   \Plan TARGETs as build would and write the ActionSpec of every theory the\n\
   \remote cache can't satisfy to .holbuild/action-specs/SHA256, then print the\n\
   \action batch. With --upload, also upload the specs and their sources to the\n\
-  \remote cache. Takes build's cache and proof options. Needs --remote-cache.\n\n\
+  \remote cache. Takes build's cache and proof options and --tool-cache. Needs\n\
+  \--remote-cache.\n\n\
   \Global options: see `holbuild --help`.\n"
 
 fun exec_action_help () = print
@@ -1882,11 +1888,34 @@ fun build_once_with_prepared tc = build_once_with_prepared_mode BuildTargets tc
 
 fun build_once tc cli_jobs parsed = build_once_with_prepared tc cli_jobs NONE parsed
 
+(* Takes build's --tool-cache NAME out of its arguments and sets it up. *)
+fun split_tool_cache_flag args =
+  let
+    fun loop acc xs =
+      case xs of
+          [] => rev acc
+        | "--tool-cache" :: name :: rest =>
+            if HolbuildBuildExec.plain_file_name name then
+              let val dir = OS.Path.concat (HolbuildBuildExec.cache_root (), "tool-cache/" ^ name)
+              in
+                HolbuildBuildExec.ensure_dir dir;
+                HolbuildBuildExec.tool_cache_name := SOME name;
+                HolbuildBuildExec.tool_cache_dir := SOME (OS.FileSys.fullPath dir);
+                loop acc rest
+              end
+            else raise Error ("--tool-cache NAME takes letters, digits, '.', '_' and '-', not " ^
+                              HolbuildHash.quote name)
+        | ["--tool-cache"] => raise Error "--tool-cache requires NAME"
+        | x :: rest => loop (x :: acc) rest
+  in
+    loop [] args
+  end
+
 fun action_spec_command tc cli_jobs args =
   let
     val upload = List.exists (fn arg => arg = "--upload") args
     val parsed as ({dry_run, watch, repl_on_failure, execution_plan, ...}, _) =
-      split_flags (List.filter (fn arg => arg <> "--upload") args)
+      split_flags (split_tool_cache_flag (List.filter (fn arg => arg <> "--upload") args))
     val _ =
       if dry_run orelse watch orelse repl_on_failure orelse Option.isSome execution_plan then
         raise Error "action-spec does not run builds: remove --dry-run, --watch and --repl-on-failure"
@@ -2126,6 +2155,7 @@ fun build tc cli_jobs args =
     val _ = HolbuildDiagnosticLimits.validate ()
     val (batch_priority, args) = split_build_priority args
     val priority = Option.getOpt (batch_priority, 0)
+    val args = split_tool_cache_flag args
     val ({url, remote_only, detach, attach}, args) = split_remote_exec_flags args
     val parsed as ({dry_run, watch, repl_on_failure, trace_steps, execution_plan, ...}, _) = split_flags args
     val _ =
