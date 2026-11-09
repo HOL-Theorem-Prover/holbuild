@@ -14,7 +14,7 @@ from remote_exec import coordinator as coordinator_module
 from remote_exec.app import create_app
 from remote_exec.coordinator import Coordinator, _claim_rank
 from remote_exec.formats import parse_result
-from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache
+from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache, Settled
 
 CLIENT = {"Authorization": f"Bearer {CLIENT_TOKEN}"}
 WORKER = {"Authorization": f"Bearer {WORKER_TOKEN}"}
@@ -1367,6 +1367,93 @@ async def test_event_streams_of_a_large_batch_poll_only_its_changes(
         assert events[-1] == {"type": "batch", "state": "done", "failure": None}
     assert sorted(reads)[-3:] == [10002] * 3  # one full read per stream
     assert sorted(reads)[-4] <= 2  # the rest read a and b at most
+
+
+async def test_an_event_stream_outlives_a_failed_read_and_resumes_where_it_was(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read that finds no free database connection doesn't end the stream, which would make its client follow
+    the batch again from the start; the next read starts where the failed one would have and gets what changed."""
+    sinces: list[int] = []
+    changes = coordinator.changes
+
+    async def flaky(batch: UUID, since: int) -> Any:
+        sinces.append(since)
+        if len(sinces) == 2:  # the stream's first read after the response started
+            raise sa.exc.TimeoutError("QueuePool limit of size 50 overflow 0 reached")
+        return await changes(batch, since)
+
+    monkeypatch.setattr(coordinator, "changes", flaky)
+    batch_id = await submit(http, ["a"])
+
+    async def follow() -> list[dict[str, Any]]:
+        async with http.stream("GET", f"/v1/batches/{batch_id}/events", headers=CLIENT) as response:
+            assert response.status_code == 200
+            return [json.loads(line) async for line in response.aiter_lines() if line]
+
+    stream = asyncio.create_task(follow())
+    async with asyncio.timeout(5):
+        while len(sinces) < 3:
+            assert not stream.done(), stream.exception()
+            await asyncio.sleep(0.01)
+    await build(http, cache, "a")
+    events = await asyncio.wait_for(stream, 5)
+
+    assert sinces[0] == 0 and sinces[1] == sinces[2] != 0
+    assert [(e["type"], e["state"]) for e in events if e["type"] == "batch" or e["state"] == "done"] == [
+        ("action", "done"),
+        ("batch", "done"),
+    ]
+
+
+async def test_a_write_wakes_its_batchs_event_streams_and_idle_streams_wait_for_the_fallback(
+    coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stream reads its batch again as soon as this process writes to it; while nothing is written it waits for
+    the fallback read, for other processes' writes, instead of reading every events_poll_seconds."""
+    settings = coordinator.settings.model_copy(update={"events_fallback_seconds": 60.0})
+    reads = 0
+    changes = coordinator.changes
+
+    async def counted(batch: UUID, since: int) -> Any:
+        nonlocal reads
+        reads += 1
+        return await changes(batch, since)
+
+    monkeypatch.setattr(coordinator, "changes", counted)
+    async with httpx.AsyncClient(
+        transport=Settled(create_app(coordinator, settings), coordinator), base_url="http://coordinator.test"
+    ) as http:
+        batch_id = await submit(http, ["a"])
+
+        async def follow() -> list[dict[str, Any]]:
+            async with http.stream("GET", f"/v1/batches/{batch_id}/events", headers=CLIENT) as response:
+                return [json.loads(line) async for line in response.aiter_lines() if line]
+
+        stream = asyncio.create_task(follow())
+        async with asyncio.timeout(5):
+            while reads < 2:  # the full read, then the one that covers a write before the stream began watching
+                await asyncio.sleep(0.01)
+        await asyncio.sleep(0.5)
+        assert reads == 2
+        await build(http, cache, "a")
+        events = await asyncio.wait_for(stream, 5)
+
+    assert events[-1] == {"type": "batch", "state": "done", "failure": None}
+    assert coordinator.batch_watchers == {}
+
+
+async def test_a_request_that_finds_no_free_database_connection_answers_503(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def busy(batch: UUID, since: int) -> Any:
+        raise sa.exc.TimeoutError("QueuePool limit of size 50 overflow 0 reached")
+
+    monkeypatch.setattr(coordinator, "changes", busy)
+    response = await http.get(f"/v1/batches/{uuid4()}/events", headers=CLIENT)
+
+    assert (response.status_code, response.json()) == (503, {"detail": "database busy"})
+    assert response.headers["Retry-After"] == "5"
 
 
 async def test_retention_deletes_old_terminal_batches_and_stale_hints(
