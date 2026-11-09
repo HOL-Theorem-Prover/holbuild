@@ -1538,25 +1538,6 @@ while read -r tag key ac spec theory; do
   fi
 done < "$state/$batch.batch"
 
-# Reattaching reports each retained log in a structured per-node failure.
-status=0
-in_copy multi-failure --json --retain-debug-artifacts --remote-cache "$remote_url" build \
-  --remote-exec "$coordinator" --remote-only --attach "$batch" \
-  BadATheory BadBTheory HealthyTheory BlockedTheory > "$tmpdir/multi-failure.jsonl" 2>&1 || status=$?
-[[ $status -eq 1 ]] || { cat "$tmpdir/multi-failure.jsonl" >&2; exit 1; }
-python3 - "$tmpdir/multi-failure.jsonl" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-events = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
-logs = {e["target"]: e["debug_artifacts"]["log"] for e in events
-        if e["event"] == "node_failed" and "debug_artifacts" in e}
-for name in ("BadATheory", "BadBTheory"):
-    assert name in logs, logs
-    assert Path(logs[name]).is_file(), logs[name]
-PY
-
 # A coordinator may omit all failure log hashes. Successful independent
 # outputs are still restored before requesting a local diagnostic retry.
 while read -r tag key ac spec theory; do

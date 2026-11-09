@@ -1684,7 +1684,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                       (name ^ " failed on a remote worker: " ^ kind)
                                       (SOME (HolbuildBuildExec.RetainedLog path)))
                                       (HolbuildBuildExec.fetch_remote_build_log project node sha)
-                          val diagnosed =
+                        in
+                          (name,
                            case error of
                                SOME e => e
                              | NONE =>
@@ -1699,18 +1700,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                       handle Thread.Interrupt => raise Thread.Interrupt
                                            | e => e)
                                    else HolbuildBuildExec.Error msg
-                                 end
-                          val _ =
-                            if HolbuildStatus.json_mode () then
-                              HolbuildStatus.emit_json "node_failed"
-                                (HolbuildStatus.json_node_fields (HolbuildBuildPlan.key node) name @
-                                 HolbuildStatus.json_failure_field_for_node (HolbuildBuildPlan.key node)
-                                   (HolbuildBuildExec.build_error_message diagnosed) @
-                                 HolbuildStatus.json_debug_artifacts_fields
-                                   (HolbuildBuildExec.build_error_debug_artifacts diagnosed))
-                            else ()
-                        in
-                          (name, diagnosed)
+                                 end)
                         end
                 val errors = map diagnose failures
               in
