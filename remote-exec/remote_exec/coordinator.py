@@ -169,6 +169,8 @@ class QueueCounts:
     running_high: int
     ready_run: int = 0
     running_run: int = 0
+    ready_priority: int = 0
+    running_priority: int = 0
     high_run: int = 0  # internal: ready or running high-tier runs, for capped burst demand
 
 
@@ -362,7 +364,7 @@ WITH run_capacity AS MATERIALIZED (
         SELECT count(*) FROM actions WHERE state = 'running' AND class = 'run'
     ) < :run_slots AS available
 ), ready_batches AS MATERIALIZED (
-    SELECT b.id, b.created_at, b.max_heap_mb,
+    SELECT b.id, b.created_at, b.max_heap_mb, b.priority,
         (SELECT count(*) FROM actions r WHERE r.batch_id = b.id AND r.state = 'running') AS running_count,
         (SELECT max(c.last_claimed_at) FROM actions c WHERE c.batch_id = b.id) AS last_claimed_at
     FROM batches b
@@ -381,6 +383,7 @@ AND (a.class = 'build' OR (SELECT available FROM run_capacity))
 ORDER BY
     a.class,
     array_position(CAST(:tiers AS text[]), a.tier),
+    b.priority DESC,
     b.running_count,
     b.last_claimed_at NULLS FIRST,
     b.created_at,
@@ -477,14 +480,14 @@ class Coordinator:
 
     async def submit(
         self, batch: Batch, profile: str, action_class: str = "build", max_heap_mb: int | None = None,
-        *, fail_fast: bool = False,
+        *, fail_fast: bool = False, priority: int = 0,
     ) -> UUID:
         """Store a batch; its actions without uncached parents become ready."""
         batch_id = uuid4()
         parents: defaultdict[str, int] = defaultdict(int)
         for child, _ in batch.edges:
             parents[child] += 1
-        priority = dag_priorities([a.input_key for a in batch.actions], batch.edges)
+        dag_priority = dag_priorities([a.input_key for a in batch.actions], batch.edges)
         packages = [a.theory.split(":", 1)[0] for a in batch.actions]
         names = [a.theory.split(":", 1)[1] for a in batch.actions]
         async with self.engine.begin() as conn:
@@ -500,8 +503,8 @@ class Coordinator:
             high = {theory for theory, peak in hints if peak >= self.settings.standard_tier_mb}
             await conn.execute(
                 sa.text(
-                    "INSERT INTO batches (id, state, profile, max_heap_mb, fail_fast) "
-                    "VALUES (:id, :state, :profile, :max_heap_mb, :fail_fast)"
+                    "INSERT INTO batches (id, state, profile, max_heap_mb, fail_fast, priority) "
+                    "VALUES (:id, :state, :profile, :max_heap_mb, :fail_fast, :priority)"
                 ),
                 {
                     "id": batch_id,
@@ -509,6 +512,7 @@ class Coordinator:
                     "profile": profile,
                     "max_heap_mb": max_heap_mb,
                     "fail_fast": fail_fast,
+                    "priority": priority,
                 },
             )
             if batch.actions:
@@ -529,8 +533,8 @@ class Coordinator:
                             "theory": a.theory,
                             "remaining": parents[a.input_key],
                             "tier": "high" if a.theory in high else "standard",
-                            "depth": priority[a.input_key].critical_depth,
-                            "descendants": priority[a.input_key].descendant_count,
+                            "depth": dag_priority[a.input_key].critical_depth,
+                            "descendants": dag_priority[a.input_key].descendant_count,
                             "class": action_class,
                         }
                         for a in batch.actions
@@ -1044,14 +1048,19 @@ class Coordinator:
             desired = await conn.scalar(HELD_TARGET, self._held_target_params(self.clock()))
             rows = await conn.execute(
                 sa.text(
-                    "SELECT state, tier, class, count(*) FROM actions "
-                    "WHERE state IN ('waiting', 'ready', 'running') GROUP BY state, tier, class"
+                    "SELECT a.state, a.tier, a.class, b.priority > 0, count(*) FROM actions a "
+                    "JOIN batches b ON b.id = a.batch_id "
+                    "WHERE a.state IN ('waiting', 'ready', 'running') "
+                    "GROUP BY a.state, a.tier, a.class, b.priority > 0"
                 )
             )
             count: defaultdict[tuple[str, str], int] = defaultdict(int)
             runs: defaultdict[str, int] = defaultdict(int)
             high_run = 0
-            for state, tier, action_class, n in rows:
+            priorities: defaultdict[str, int] = defaultdict(int)
+            for state, tier, action_class, prioritized, n in rows:
+                if prioritized:
+                    priorities[state] += n
                 count[state, tier] += n
                 if action_class == "run":
                     runs[state] += n
@@ -1066,6 +1075,8 @@ class Coordinator:
             ready_run=runs["ready"],
             running_run=runs["running"],
             high_run=high_run,
+            ready_priority=priorities["ready"],
+            running_priority=priorities["running"],
         )
         demand = burst_demand(
             counts, self.settings.warm_workers, self.settings.max_burst_workers, self.settings.run_slots

@@ -1253,9 +1253,10 @@ val _ = if Use2Lib.v = 8 then () else raise Fail "bad Use2Lib.v";
 val after_gen_thm = save_thm("after_gen_thm", TRUTH);
 SML
 (cd "$gen2" && HOLBUILD_CACHE=$tmpdir/generated-two-phase-cache "$HOLBUILD_BIN" --remote-cache "$remote_url" \
-  build --remote-exec "$coordinator" --remote-only AfterGenTheory) > "$tmpdir/gen2.log" 2>&1 ||
+  build --remote-exec "$coordinator" --remote-only --priority=3 AfterGenTheory) > "$tmpdir/gen2.log" 2>&1 ||
   { cat "$tmpdir/gen2.log" "$tmpdir/worker.log" >&2; exit 1; }
 require_grep "Gen2Theory restored from cache" "$tmpdir/gen2.log"
+[[ $(grep -c '^POST /v1/batches?priority=3 ' "$state/requests.log") -ge 2 ]] || { cat "$state/requests.log" >&2; exit 1; }
 require_grep "Use2Lib built" "$tmpdir/gen2.log"
 require_grep "AfterGenTheory restored from cache" "$tmpdir/gen2.log"
 refute_grep "Theory built" "$tmpdir/gen2.log"
@@ -1607,3 +1608,33 @@ require_grep '^detail=exec-action HOL repository is not trusted by this worker: 
 refute_grep '^log=' "$tmpdir/worker.result"
 require_grep 'holbuild: remote rxlocalcas:LocalUntrustedTheory: failed (spec-rejected: exec-action HOL repository is not trusted by this worker: ' \
   "$tmpdir/local-cas-untrusted.log"
+
+
+# Batch priority is scheduling metadata; it reaches submit together with the other batch options.
+cat > "$tmpdir/local-cas/src/PriorityScript.sml" <<'SML'
+Theory Priority
+Ancestors bool
+Theorem priority_test: T
+Proof
+  simp[]
+QED
+SML
+in_copy local-cas --remote-cache "$remote_url" --max-heap 4096 build --remote-exec "$coordinator" \
+  --remote-only --priority 7 --fail-fast PriorityTheory > "$tmpdir/priority.log" 2>&1
+require_grep '^POST /v1/batches?fail_fast=true&priority=7&max_heap_mb=4096 ' "$state/requests.log"
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --detach --priority=2147483647 LocalUntrustedTheory > "$tmpdir/priority-equals.log" 2>&1
+require_grep '^POST /v1/batches?priority=2147483647 ' "$state/requests.log"
+
+for value in -1 1.5 urgent 2147483648; do
+  if in_copy local-cas build --priority "$value" PriorityTheory > "$tmpdir/priority-invalid.log" 2>&1; then
+    echo "accepted invalid priority $value" >&2
+    exit 1
+  fi
+  require_grep 'priority' "$tmpdir/priority-invalid.log"
+done
+if in_copy local-cas build --priority 1 PriorityTheory > "$tmpdir/priority-no-exec.log" 2>&1; then
+  echo 'accepted priority without remote execution' >&2
+  exit 1
+fi
+require_grep 'priority needs --remote-exec URL' "$tmpdir/priority-no-exec.log"
