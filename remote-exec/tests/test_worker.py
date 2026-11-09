@@ -19,6 +19,7 @@ import pytest
 
 from remote_exec import worker
 from remote_exec.auth import cache_discovery_token
+from remote_exec.formats import parse_result
 from remote_exec.worker import (
     CacheUnavailable,
     Coordinator,
@@ -713,8 +714,14 @@ def test_action_whose_release_does_not_build_is_reported_for_a_retry(
     assert not logs[1].exists()
 
 
-def test_action_of_an_unreleased_holbuild_is_rejected(tmp_path: Path, server: Server, logs: tuple[Path, Path]) -> None:
-    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.4\n"
+@pytest.mark.parametrize(
+    ("version", "reason"),
+    [("1.2.4", "holbuild 1.2.4 has no release at "), ("0.13.57", "holbuild 0.13.57 predates mandatory action isolation")],
+)
+def test_action_of_an_unreleased_holbuild_is_rejected_saying_why(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], version: str, reason: str
+) -> None:
+    server.specs[SPEC] = f"holbuild-action-spec-v1\nholbuild-version={version}\n"
 
     run_one(
         Coordinator(server.url, "w"),
@@ -725,8 +732,18 @@ def test_action_of_an_unreleased_holbuild_is_rejected(tmp_path: Path, server: Se
         Phases(),
     )
 
-    assert server.completed == [failed_record(SPEC, "spec-rejected")]
+    [record] = server.completed
+    assert record.startswith(failed_record(SPEC, "spec-rejected"))
+    result = parse_result(record)
+    assert (result.failure, result.log_sha256) == ("spec-rejected", None)
+    assert result.detail is not None and result.detail.startswith(f"the worker refuses the action: {reason}")
     assert not logs[1].exists()
+
+
+def test_a_failure_detail_is_one_line_of_printable_ascii() -> None:
+    record = failed_record(SPEC, "spec-rejected", "bad\nspec=\x00\u00e9" + "x" * 600)
+    assert record.endswith(f"\nfailure=spec-rejected\ndetail=bad spec=  {'x' * 489}\n")
+    assert parse_result(record).detail == f"bad spec=  {'x' * 489}"
 
 
 def test_a_result_is_reported_again_while_the_coordinator_restarts(

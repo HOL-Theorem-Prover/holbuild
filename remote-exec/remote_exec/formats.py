@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 SHA256 = re.compile(r"[0-9a-f]{64}")
 THEORY = re.compile(r"[^\s:]+:\S+")
 PHASE = re.compile(r"[a-z]+")
+DETAIL_MAX = 500
 
 FAILURES = frozenset(
     {
@@ -60,6 +61,13 @@ class Result:
     peak_rss_mb: int | None
     log_sha256: str | None
     timings: dict[str, int] | None = None  # milliseconds: each phase's, and the whole run's as "wall"
+    detail: str | None = None  # why a failure with no log failed, as sanitize_detail leaves it
+
+
+def sanitize_detail(text: str) -> str:
+    """``text`` as a result record's ``detail``: one line of printable ASCII, every other character a space,
+    cut to ``DETAIL_MAX`` characters, as ``holbuild exec-action`` writes it."""
+    return "".join(c if " " <= c <= "~" else " " for c in text[:DETAIL_MAX])
 
 
 def _expect(pattern: re.Pattern[str], value: str, what: str) -> str:
@@ -162,4 +170,5 @@ def parse_result(text: str) -> Result:
         peak_rss_mb=int(peak) if peak is not None else None,
         log_sha256=_expect(SHA256, log.split(" ")[0], "log") if log else None,
         timings=timings or None,
+        detail=sanitize_detail(fields["detail"]) if fields.get("detail") else None,
     )

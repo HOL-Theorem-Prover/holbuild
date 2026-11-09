@@ -323,8 +323,10 @@ An action moves through these states:
 A batch is `running` until every action is `done` (then `done`), one fails
 finally (`failed`, with a `failure` message), or the client cancels it
 (`cancelled`). A run batch instead finishes `done` once every action is
-`done` or `failed`; each failed action retains its `last_failure` and log in
-status and events. A batch-level `deadline` or `resubmit` failure still ends
+`done` or `failed`; each failed action retains its `last_failure` and log (or,
+without a log, its `failure_detail`) in status and events. A build batch that
+fails with an action whose result has a `detail` gives it in its `failure`:
+`<package>:<theory>: <failure class>: <detail>`. A batch-level `deadline` or `resubmit` failure still ends
 a run batch and cancels its unfinished actions.
 
 ## Scheduling rules
@@ -494,8 +496,8 @@ share the directory: they build a release under an `flock` on its
 other versions build alongside.
 
 An action from a version with no release (a development build, or a tarball
-that doesn't exist) is refused: the worker reports a `spec-rejected` result,
-which fails the batch, and the client builds locally. A development build that
+that doesn't exist) is refused: the worker reports a `spec-rejected` result
+whose `detail` says why, which fails the batch, and the client builds locally. A development build that
 reuses a release's version number is refused by `exec-action` itself, since
 its runtime sources differ.
 
@@ -546,6 +548,7 @@ An unknown class returns 422.
         "attempts": 1,
         "last_failure": "<failure class>|null",
         "log_sha256": "<sha256 of the last run's build log in /cas/>|null",
+        "failure_detail": "<the last result's detail: why it failed without a log>|null",
         "timings": {"<phase>": <ms>, ..., "wall": <ms>}|null
       }
     ]
@@ -567,7 +570,7 @@ An unknown class returns 422.
   stream with nothing to send for `REMOTE_EXEC_EVENTS_KEEPALIVE_SECONDS` sends
   an empty line, which clients skip, so a proxy doesn't close it as idle:
   ```json
-  {"type": "action", "input_key": "…", "theory": "…", "state": "…", "tier": "…", "attempts": 1, "last_failure": null, "log_sha256": null, "timings": null}
+  {"type": "action", "input_key": "…", "theory": "…", "state": "…", "tier": "…", "attempts": 1, "last_failure": null, "log_sha256": null, "failure_detail": null, "timings": null}
   {"type": "batch", "state": "done|failed|cancelled", "failure": "<message>|null"}
   ```
   A client detaches by closing the connection and reattaches by opening the
