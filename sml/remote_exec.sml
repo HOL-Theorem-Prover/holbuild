@@ -11,13 +11,11 @@ struct
 (* A step that yields text (a batch, a batch id) or says why it couldn't. *)
 datatype attempt = Ok of string | Refused of string
 
-(* An action that failed for good because its proof did, and the cache
-   blob that holds its worker's build log. *)
-type proof_failure = {input_key : string, kind : string, log_sha256 : string}
+(* A final action failure and its worker log, when one was uploaded. *)
+type action_failure = {input_key : string, kind : string, log_sha256 : string option}
 
 datatype outcome = Done
-                 | Failed of string * proof_failure option
-                                          (* the batch failed, and the proof that failed it *)
+                 | Failed of string * action_failure list
                  | Cancelled              (* someone cancelled the batch *)
                  | Unfollowable of string (* the coordinator won't stream it; it may still run *)
                  | Unreachable of string  (* the coordinator couldn't be asked *)
@@ -187,7 +185,10 @@ fun report_action line =
   let
     val field = fn name => json_string_field name line
     val theory = Option.getOpt (field "theory", "?")
-    val state = Option.getOpt (field "state", "?")
+    val raw_state = Option.getOpt (field "state", "?")
+    val state = if raw_state = "cancelled" andalso
+                   String.isPrefix "skipped because of " (Option.getOpt (field "last_failure", ""))
+                then "skipped" else raw_state
     val failure = case field "last_failure" of SOME f => " (" ^ f ^ ")" | NONE => ""
     val log = case (state, field "log_sha256") of
                   ("failed", SOME sha) => ", log /cas/" ^ sha
@@ -212,7 +213,12 @@ fun follow url batch_id (on_change : string * string * string option * string op
   let
     val _ = HolbuildOffline.require_online "follow a remote batch"
     val states : (string * (string * string option * string option)) list ref = ref []
-    val proof_failure : proof_failure option ref = ref NONE
+    val names = ref ([] : (string * string) list)
+    fun failures () =
+      List.mapPartial (fn (key, (state, kind, log)) =>
+        if state = "failed" then
+          SOME {input_key = key, kind = Option.getOpt (kind, "internal"), log_sha256 = log}
+        else NONE) (rev (!states))
     (* A line cut off by a dropped connection, perhaps with curl's error
        after it, is no event. *)
     fun complete line = Substring.isSuffix "}" (Substring.dropr Char.isSpace (Substring.full line))
@@ -227,12 +233,8 @@ fun follow url batch_id (on_change : string * string * string option * string op
               val previous = List.find (fn (k, _) => k = key) (!states)
               val status = (state, failure, log)
             in
-              (case (state, json_string_field "last_failure" line, json_string_field "log_sha256" line) of
-                   ("failed", SOME kind, SOME log_sha256) =>
-                     if kind = "proof" orelse kind = "tactic-timeout" then
-                       proof_failure := SOME {input_key = key, kind = kind, log_sha256 = log_sha256}
-                     else ()
-                 | _ => ());
+              names := (key, Option.getOpt (json_string_field "theory" line, key)) ::
+                       List.filter (fn (k, _) => k <> key) (!names);
               if previous = SOME (key, status) then ()
               else
                 (states := (key, status) :: List.filter (fn (k, _) => k <> key) (!states);
@@ -251,8 +253,8 @@ fun follow url batch_id (on_change : string * string * string option * string op
                           Failed (state ^ (case json_string_field "failure" line of
                                                SOME failure => ": " ^ failure
                                              | NONE => ""),
-                                  !proof_failure)
-                      | NONE => Failed ("finished in an unknown state", !proof_failure))
+                                  failures ())
+                      | NONE => Failed ("finished in an unknown state", failures ()))
         | _ => others := line :: !others
     fun attach delays =
       let
@@ -289,6 +291,20 @@ fun follow url batch_id (on_change : string * string * string option * string op
                   | delay :: rest => again delay rest
       end
     val outcome = attach (retry_delays_seconds ())
+    val skipped = List.filter (fn (_, (state, reason, _)) =>
+      state = "cancelled" andalso String.isPrefix "skipped because of " (Option.getOpt (reason, ""))) (!states)
+    fun name key = Option.getOpt (Option.map #2 (List.find (fn (k, _) => k = key) (!names)), key)
+    val _ =
+      if null (failures ()) andalso null skipped then ()
+      else
+        (HolbuildStatus.message_stderr ("holbuild: remote failure summary: " ^
+           Int.toString (length (failures ())) ^ " failed, " ^ Int.toString (length skipped) ^ " skipped\n");
+         List.app (fn {input_key, kind, log_sha256} =>
+           HolbuildStatus.message_stderr ("holbuild: remote " ^ name input_key ^ ": failed (" ^ kind ^ ")" ^
+             (case log_sha256 of SOME sha => ", log /cas/" ^ sha | NONE => ", no worker log") ^ "\n")) (failures ());
+         List.app (fn (key, (_, reason, _)) =>
+           HolbuildStatus.message_stderr ("holbuild: remote " ^ name key ^ ": " ^ Option.getOpt (reason, "skipped") ^ "\n"))
+           (rev skipped))
   in
     (outcome,
      {built = length (List.filter (fn (_, (state, _, _)) => state = "done") (!states)),

@@ -598,11 +598,12 @@ fun cache_trace line =
 fun fail_with_debug_artifacts status key label msg artifacts =
   (with_lock status
      (fn () =>
-         let val {enabled, active, ended, ...} = status
+         let val {enabled, active, ended, finished, ...} = status
          in
            if !ended then ()
            else
              (active := remove_active key (!active);
+              finished := !finished + 1;
               if json_mode () then
                 emit_json "node_failed"
                   (json_node_fields key label @
@@ -611,12 +612,17 @@ fun fail_with_debug_artifacts status key label msg artifacts =
               else if enabled then
                 (TextIO.output (TextIO.stdOut, "\r" ^ clear_to_eol);
                  TextIO.flushOut TextIO.stdOut)
-              else ();
-              ended := true)
+              else ())
          end);
-   current_status := NONE)
+   if json_mode () then () else message_stderr (label ^ " failed: " ^ msg ^ "\n"))
 
 fun fail status key label msg =
   fail_with_debug_artifacts status key label msg no_debug_artifacts
+
+fun skip status key label reason =
+  (with_lock status (fn () => #finished status := !(#finished status) + 1);
+   if json_mode () then
+     emit_json "node_skipped" (json_node_fields key label @ [json_string_field "reason" reason])
+   else message_stderr (label ^ " skipped because of " ^ reason ^ "\n"))
 
 end

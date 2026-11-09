@@ -162,11 +162,15 @@ class Handler(BaseHTTPRequestHandler):
                         event["state"], event["last_failure"] = "done", None
                 elif not ok and result.exists():
                     record = dict(line.split("=", 1) for line in result.read_text().splitlines()[1:])
-                    if record["status"] == "failed":
+                    if record["status"] == "skipped":
+                        event["state"], event["last_failure"] = "cancelled", record["failure"]
+                    elif record["status"] == "failed":
                         event["last_failure"] = record["failure"]
                         event["log_sha256"] = record["log"].split()[0] if "log" in record else None
                     else:
                         event["state"], event["last_failure"] = "done", None
+                elif not ok and not (state / "fail").exists():
+                    event["state"], event["last_failure"] = "cancelled", None
                 if event["state"] == "done" and result.exists() and not cancelled:
                     record = dict(line.split("=", 1) for line in result.read_text().splitlines()[1:])
                     event["log_sha256"] = record["log"].split()[0] if "log" in record else None

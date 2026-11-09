@@ -66,6 +66,20 @@ coordinator reads when an action completes, so run it before the new image
 serves. To roll back to an image predating `0009`, use the current image to
 run `alembic downgrade 0008` first.
 
+Migration `0010` adds `batches.fail_fast` (default false). New build batches
+finish independent actions after a final failure, cancelling only its blocked
+descendants. Their action events retain the `cancelled` state with a
+`skipped because of ...` reason, so existing clients and workers remain
+compatible. No action-spec or minimum client version changes are needed.
+Clients can request `?fail_fast=true` on submission to retain early stopping.
+Run batches still finish `done` with independent per-action failures.
+
+Apply the migration before serving with the new coordinator. Before rolling
+back to an older coordinator, drain or cancel running batches first: an older
+coordinator does not implement their keep-going completion rules. Then use
+the current image to run `alembic downgrade 0009` before starting the older
+image. Existing action states need no conversion.
+
 The coordinator reads its settings from the environment:
 
 | Variable | Meaning | Default |
