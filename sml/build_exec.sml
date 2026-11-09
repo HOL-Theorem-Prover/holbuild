@@ -1767,6 +1767,17 @@ fun exit_detail status log =
               else []
           | _ => []
 
+(* build --tool-cache NAME: the name, which exported specs carry, and the
+   directory theory children see as HOLBUILD_TOOL_CACHE_DIR, where a tool
+   keeps files that live longer than one build. *)
+val tool_cache_name : string option ref = ref NONE
+val tool_cache_dir : string option ref = ref NONE
+
+(* A name safe as one path component: a tool cache's, or a file's in it. *)
+fun plain_file_name name =
+  name <> "" andalso name <> "." andalso name <> ".." andalso
+  CharVector.all (fn c => Char.isAlphaNum c orelse c = #"." orelse c = #"_" orelse c = #"-") name
+
 fun run_hol_files_to_log tc stage workdir context files log_name current_log error_message =
   let
     val log = Path.concat(stage, log_name)
@@ -1774,9 +1785,14 @@ fun run_hol_files_to_log tc stage workdir context files log_name current_log err
     val _ = ensure_parent log
     val _ = create_current_log_link log current_log
     val _ = last_child_status := NONE
+    val tool_cache_env =
+      case !tool_cache_dir of
+          SOME dir => ["env", "HOLBUILD_TOOL_CACHE_DIR=" ^ dir]
+        | NONE => []
     val status =
       HolbuildToolchain.run_in_dir_to_file workdir
-        (HolbuildToolchain.theory_run_argv tc @ ["--noconfig"] @ hol_context_args context @ file_args)
+        (tool_cache_env @ HolbuildToolchain.theory_run_argv tc @ ["--noconfig"] @
+         hol_context_args context @ file_args)
         log
       handle HolbuildToolchain.Error msg =>
         if HolbuildActionSandbox.active () andalso not (!HolbuildActionSandbox.outputs_validated) then
@@ -6474,6 +6490,7 @@ fun action_spec_text hash_file {root, plan, keys, action_toolchain_key, runtime,
       (if skip_checkpoints then [bool_option "skip-checkpoints" true] else []) @
       (if forced then [bool_option "force" true] else []) @
       (if trace_steps policy then [bool_option "trace-steps" true] else []) @
+      (case !tool_cache_name of SOME name => ["option tool-cache=" ^ name] | NONE => []) @
       ["action-text"]
   in
     {text = String.concatWith "\n" lines ^ "\n" ^ action_text,
@@ -7358,7 +7375,8 @@ type action_spec =
    outputs : {sig_path : string, sml_path : string, data_path : string},
    extra_outputs : string list,
    proof_steps : bool, tactic_timeout : real option, new_ir : bool,
-   theorem_checkpoints : bool, skip_checkpoints : bool, force : bool, trace_steps : bool, action_text : string}
+   theorem_checkpoints : bool, skip_checkpoints : bool, force : bool, trace_steps : bool,
+   tool_cache : string option, action_text : string}
 
 (* A spec's lines, and the text after its SECTION line. *)
 fun split_spec_text section text =
@@ -7493,6 +7511,12 @@ fun parse_action_spec text : action_spec =
        (case List.find (fn (k, _) => k = "option trace-steps") (!values) of
             SOME (_, v) => spec_bool "trace-steps" v
           | NONE => false),
+     tool_cache =
+       (case List.find (fn (k, _) => k = "option tool-cache") (!values) of
+            SOME (_, name) =>
+              if plain_file_name name then SOME name
+              else reject_spec ("malformed option tool-cache: " ^ HolbuildHash.quote name)
+          | NONE => NONE),
      action_text = action_text}
   end
 
@@ -9229,6 +9253,109 @@ fun exec_run remote root tc (spec : run_spec) log =
           else raise ActionFailed (PublishFailure, "the remote cache holds different outputs for the run")
   end
 
+(* Tool caches (build --tool-cache NAME).  A theory child may keep files in
+   HOLBUILD_TOOL_CACHE_DIR that a later action with the same dependencies and
+   toolchain can reuse on any worker: the worker restores them from the
+   remote cache before the child runs, and publishes them after it, whether
+   or not the build succeeded.  The directory is flat and holds at most
+   tool_cache_max_files files of tool_cache_max_bytes in all; a tool writes
+   each file whole (to a temporary name, then renamed), as a failed build's
+   files are published too.  The sandbox's output validation has already
+   failed the action if the child left a link or special file.  Neither step
+   fails the action: the child starts empty, or the cache keeps its entry. *)
+val tool_cache_header = "holbuild-tool-cache-v1"
+val tool_cache_max_files = 16
+val tool_cache_max_bytes = 64 * 1024 * 1024
+
+fun tool_cache_key (spec : action_spec) name =
+  HolbuildHash.string_sha256
+    (String.concat [tool_cache_header, "\nname=", name, "\ndeps_key=", #deps_key spec,
+                    "\ntoolchain=", action_text_value spec "toolchain"])
+
+fun tool_cache_failure (Error msg) = msg
+  | tool_cache_failure (MissingSharedBlob sha) = "the remote cache has no blob " ^ sha
+  | tool_cache_failure e = General.exnMessage e
+
+fun tool_cache_listing dir =
+  let
+    val stream = FS.openDir dir
+    fun loop acc =
+      case FS.readDir stream of
+          NONE => acc
+        | SOME name => loop (name :: acc)
+  in
+    sort_strings (loop [] before FS.closeDir stream)
+    handle e => (FS.closeDir stream; raise e)
+  end
+
+(* The files the remote cache holds under KEY, placed in DIR, as
+   (name, sha256) pairs in name order. *)
+fun restore_tool_cache remote store key dir =
+  let
+    (* The host store keeps the files under family KEY, so a worker fetches
+       each blob from the remote cache once. *)
+    fun place (role, sha, name) =
+      if role <> "file" orelse not (plain_file_name name) then
+        raise Error ("malformed tool cache entry: " ^ role ^ " " ^ HolbuildHash.quote name)
+      else
+        (place_shared_blob remote store key {sha = sha, dst = Path.concat(dir, name), save = false};
+         (name, sha))
+  in
+    case HolbuildRemoteCache.get_action remote key of
+        NONE => []
+      | SOME text =>
+          let val placed = map place (shared_manifest_entries text)
+          in
+            touch_dir (Path.concat(store, key));
+            HolbuildStatus.message_stdout
+              ("restored tool cache (" ^ Int.toString (length placed) ^ " files)\n");
+            placed
+          end
+  end
+  handle e => (warn ("not restoring the tool cache: " ^ tool_cache_failure e);
+               remove_tree dir; ensure_dir dir; [])
+
+(* Publishes DIR's files under KEY unless they are the RESTORED ones. *)
+fun publish_tool_cache remote store key dir restored =
+  let
+    fun file name =
+      let val path = Path.concat(dir, name)
+      in
+        if not (plain_file_name name) orelse not (Posix.FileSys.ST.isReg (Posix.FileSys.lstat path)) then
+          raise Error ("not a plain file: " ^ HolbuildHash.quote name)
+        else (name, path, Position.toInt (FS.fileSize path))
+      end
+    val files = map file (tool_cache_listing dir)
+    val bytes = List.foldl (fn ((_, _, size), total) => total + size) 0 files
+    val _ =
+      if length files > tool_cache_max_files orelse bytes > tool_cache_max_bytes then
+        raise Error (Int.toString (length files) ^ " files of " ^ Int.toString bytes ^
+                     " bytes exceed the limit of " ^ Int.toString tool_cache_max_files ^ " files of " ^
+                     Int.toString tool_cache_max_bytes ^ " bytes")
+      else ()
+    val entries = map (fn (name, path, _) => (name, path, HolbuildHash.file_sha256 path)) files
+    fun upload (name, path, sha) =
+      if List.exists (fn entry => entry = (name, sha)) restored then ()
+      else
+        (case HolbuildRemoteCache.publish_hashed_blob remote {hash = sha, src = path} of
+             HolbuildCacheBackend.Published => ()
+           | HolbuildCacheBackend.AlreadyPresent => ()
+           | _ => raise Error ("could not upload " ^ name);
+         store_add store key {sha = sha, src = path, save = false})
+    val manifest = shared_manifest tool_cache_header NONE (map (fn (name, _, sha) => ("file", sha, name)) entries)
+  in
+    if map (fn (name, _, sha) => (name, sha)) entries = restored then ()
+    else
+      (List.app upload entries;
+       case HolbuildRemoteCache.replace_action_unconditionally remote {key = key, text = manifest} of
+           HolbuildCacheBackend.Published =>
+             HolbuildStatus.message_stdout
+               ("published tool cache (" ^ Int.toString (length entries) ^ " files)\n")
+         | HolbuildCacheBackend.AlreadyPresent => ()
+         | _ => raise Error "could not publish the entry")
+  end
+  handle e => warn ("not publishing the tool cache: " ^ tool_cache_failure e)
+
 (* Runs one ActionSpec, writes its result record and returns the exit code.
    `toolchain` ensures the spec's HOL toolchain and returns it. *)
 fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
@@ -9411,14 +9538,33 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                   case shared of
                       SOME ctx => phase "publish" (fn () => publish_shared_checkpoints remote ctx restored)
                     | NONE => ()
+                val tool_cache =
+                  case #tool_cache spec of
+                      NONE => NONE
+                    | SOME name =>
+                        let
+                          val key = tool_cache_key spec name
+                          val dir = FS.fullPath root ^ "/.holbuild/tool-cache/" ^ name
+                        in
+                          ensure_dir dir;
+                          tool_cache_dir := SOME dir;
+                          SOME (key, dir, phase "toolrestore" (fn () => restore_tool_cache remote (share_store cache) key dir))
+                        end
+                fun publish_tools () =
+                  if not (!HolbuildActionSandbox.outputs_validated) then () else
+                  case tool_cache of
+                      SOME (key, dir, restored) =>
+                        phase "toolpublish" (fn () => publish_tool_cache remote (share_store cache) key dir restored)
+                    | NONE => ()
               in
                 (ignore (phase "hol" (fn () =>
                            run_theory_action_checkpoints true policy tc root checkpoint_root
                              (toolchain_base_context tc) action source_text checkpoints))
-                 handle e => (publish_shared (); raise e));
+                 handle e => (publish_shared (); publish_tools (); raise e));
                 (* After the publish: the checkpoints saved after resuming
                    from a failed prefix are its children. *)
                 publish_shared ();
+                publish_tools ();
                 remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints)
               end
               handle Error msg =>
