@@ -10,6 +10,9 @@ source "$SCRIPT_DIR/../../lib.sh"
 tmpdir=$(make_temp_dir)
 cleanup() { rm -rf "$tmpdir"; }
 trap cleanup EXIT
+# This checks the checkpoint policy of a plain build; a pipelined theory saves
+# no deps_loaded checkpoint.
+export HOLBUILD_PIPELINE=off
 use_case_cache "$tmpdir/cache"
 
 project=$tmpdir/project

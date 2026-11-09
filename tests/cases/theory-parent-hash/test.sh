@@ -16,6 +16,8 @@ cleanup() {
   rm -rf "$tmpdir"
 }
 trap cleanup EXIT
+# These builds publish to the remote cache; pipelined builds publish nothing.
+export HOLBUILD_PIPELINE=off
 use_case_cache "$tmpdir/cache"
 
 cat > "$tmpdir/parent-hash-parser-test.sml" <<'SML'
