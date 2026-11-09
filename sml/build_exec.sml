@@ -7887,12 +7887,16 @@ fun check_remote_publication remote root (spec : action_spec) =
 (* The OOM killer's count for this process's cgroup (v2), if readable. *)
 fun cgroup_oom_kills () =
   let
-    val cgroup_line =
-      List.find (String.isPrefix "0::") (String.fields (fn c => c = #"\n") (read_text "/proc/self/cgroup"))
-    val path =
-      case cgroup_line of
+    fun own_events () =
+      case List.find (String.isPrefix "0::")
+                     (String.fields (fn c => c = #"\n") (read_text "/proc/self/cgroup")) of
           SOME line => "/sys/fs/cgroup" ^ String.extract(line, 3, NONE) ^ "/memory.events"
         | NONE => raise Fail "no cgroup v2"
+    (* Tests point HOLBUILD_TEST_MEMORY_EVENTS at a stand-in file. *)
+    val path =
+      case OS.Process.getEnv "HOLBUILD_TEST_MEMORY_EVENTS" of
+          SOME path => path
+        | NONE => own_events ()
     fun count line =
       case String.tokens Char.isSpace line of
           ["oom_kill", n] => Int.fromString n
@@ -7947,18 +7951,22 @@ fun child_reports_no_space log_text =
     (String.fields (fn c => c = #"\n") log_text)
 
 (* The failure kind of a run that raised `msg`, and `msg` with what the
-   kernel did to the child: a SIGKILL with the cgroup's OOM kill count
-   raised is the OOM killer's, which the child can't report itself.  The
-   peak is that of the largest child this process waited for so far, which a
-   killed child, unlike the exporter's report, still has. *)
+   kernel did to the child: a failed child with the cgroup's OOM kill count
+   raised lost a process to the OOM killer, which the child can't report
+   itself.  The peak is that of the largest child this process waited for so
+   far, which a killed child, unlike the exporter's report, still has. *)
 fun classify_run_failure stage log_text oom_before msg =
   let
     val (child_failed, signal) =
       case !last_child_status of
           SOME status => (not (OS.Process.isSuccess status), death_signal status)
         | NONE => (false, NONE)
+    (* The victim need not be the child itself: a process it started (a
+       nested HOL, a prover) can be killed while the child catches the error
+       and exits 1.  A worker runs one action at a time in its container, so
+       a rise in the container's count during a failed run is this action's. *)
     val oom_kills =
-      if signal <> SOME Posix.Signal.kill then NONE
+      if not child_failed then NONE
       else
         case (oom_before, cgroup_oom_kills ()) of
             ([earlier], [later]) => if later > earlier then SOME (earlier, later) else NONE
@@ -7966,10 +7974,10 @@ fun classify_run_failure stage log_text oom_before msg =
     val kill_notes =
       (case oom_kills of
            SOME (earlier, later) =>
-             ["the kernel's OOM killer killed it (cgroup oom_kill count " ^ Int.toString earlier ^
-              " -> " ^ Int.toString later ^ ")"]
+             ["the kernel's OOM killer killed a process of the action (cgroup oom_kill count " ^
+              Int.toString earlier ^ " -> " ^ Int.toString later ^ ")"]
          | NONE => []) @
-      (if Option.isSome signal then
+      (if Option.isSome signal orelse Option.isSome oom_kills then
          case children_peak_rss_mb () of
              SOME mb => ["largest child resident set so far: " ^ Int.toString mb ^ " MB"]
            | NONE => []

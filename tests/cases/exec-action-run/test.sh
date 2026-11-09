@@ -117,6 +117,18 @@ val out = TextIO.openOut (OS.Path.concat (valOf (OS.Process.getEnv "HOLBUILD_RUN
 val _ = (TextIO.output (out, "only\n"); TextIO.closeOut out);
 SML
 echo 'val _ = OS.Process.sleep (Time.fromSeconds 300);' > "$runner/sleep.sml"
+# Says it started, waits for the test's go, then fails as a script whose
+# nested HOL was killed fails: it catches the error and exits 1.
+cat > "$runner/oom.sml" <<'SML'
+val dir = valOf (OS.Process.getEnv "HOLBUILD_RUN_OUTPUT_DIR");
+val _ = TextIO.closeOut (TextIO.openOut (OS.Path.concat (dir, "oom-ready")));
+fun wait 0 = raise Fail "no go from the test"
+  | wait n =
+      if OS.FileSys.access (OS.Path.concat (dir, "oom-go"), []) then ()
+      else (OS.Process.sleep (Time.fromMilliseconds 100); wait (n - 1));
+val _ = wait 1200;
+val _ = raise Fail "the nested HOL child failed";
+SML
 cat > "$runner/fifo.sml" <<'SML'
 val dir = valOf (OS.Process.getEnv "HOLBUILD_RUN_OUTPUT_DIR");
 val _ = Posix.FileSys.mkfifo (OS.Path.concat (dir, "first"), Posix.FileSys.S.irwxu);
@@ -263,6 +275,39 @@ for script in raise one; do
   require_no_file "$(ac_file "$key")"
 done
 require_grep 'did not write its declared output second' "$tmpdir/one.log"
+
+# A failed script during which the cgroup's OOM kill count rose lost a
+# process to the OOM killer, as when a nested HOL it waits for is killed:
+# memory, retried with more.  A count that stays put, however high, leaves
+# the failure the script's.
+events=$tmpdir/memory.events
+printf 'oom 5\noom_kill 5\n' > "$events"
+read -r key spec < <(export_run raise.sml hol:bool)
+HOLBUILD_TEST_MEMORY_EVENTS=$events worker raise-counted "$spec"
+expect raise-counted 1 status=failed failure=script
+if grep -q 'OOM killer' "$tmpdir/raise-counted.log"; then
+  echo "a script failure with no new OOM kill was blamed on the OOM killer" >&2
+  exit 1
+fi
+
+printf 'oom 0\noom_kill 0\n' > "$events"
+read -r key spec < <(export_run oom.sml hol:bool)
+( HOLBUILD_TEST_MEMORY_EVENTS=$events worker oom "$spec"; echo "$worker_status" > "$tmpdir/oom.status" ) &
+oomer=$!
+oom_output=$tmpdir/worker-oom/action/.holbuild/run-output
+for _ in {1..1200}; do
+  [[ -e "$oom_output/oom-ready" ]] && break
+  sleep 0.1
+done
+[[ -e "$oom_output/oom-ready" ]] || { echo "the oom run never started" >&2; exit 1; }
+printf 'oom 1\noom_kill 1\n' > "$events"
+touch "$oom_output/oom-go"
+wait "$oomer"
+worker_status=$(< "$tmpdir/oom.status")
+expect oom 2 status=failed failure=memory
+require_no_file "$(ac_file "$key")"
+require_grep 'OOM killer killed a process of the action (cgroup oom_kill count 0 -> 1)' "$tmpdir/oom.log"
+require_grep 'the nested HOL child failed' "$tmpdir/oom.log"
 
 # An output that is not a regular file fails as script rather than blocking
 # the worker on it.

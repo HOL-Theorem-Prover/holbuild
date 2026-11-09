@@ -1618,9 +1618,11 @@ publication checks) and `log`; stderr ends with the same times and `wall`.
 theory has been exported.
 `log` is the build log, or the run's HOL output, uploaded to `/cas/`. `memory` means Poly/ML ran out
 of heap or the container's cgroup `memory.events` counted an OOM kill during
-the run; `disk` means the disk filled. When the HOL process dies by a
-signal, the log's last lines say which, whether the OOM killer's count rose,
-and the largest resident set of any child process of the action so far. The exit status summarizes the record:
+a failed run, whether the OOM killer took the HOL process or a process it
+started (a nested HOL whose failure it caught, say); `disk` means the disk
+filled. When the HOL process dies by a signal or the OOM killer's count
+rose, the log's last lines say which, and the largest resident set of any
+child process of the action so far. The exit status summarizes the record:
 
 | Exit | Meaning |
 |---|---|
