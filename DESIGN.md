@@ -509,6 +509,20 @@ their implementation. HOL's current
 need auxiliary internal load paths or rewritten non-semantic load copies while
 preserving canonical artifacts.
 
+Every load list holbuild writes (a theory's preload, a `.uo` manifest, the
+manifests a remote worker restores) is in Holmake's order. Holmake's `.uo`
+lists a target's direct dependencies sorted by directory, then file name, and
+HOL loads them depth first; the order of names in a script's header doesn't
+reach it. Load order is observable: a library that registers data as each
+theory loads (cv_compute's `cv_rep` theorems, say) keeps the last
+registration. holbuild sorts by `(tier, package, directory, file)`. Tier 0 is
+HOL's own tree: `sigobj` for HOL's theories and libraries, and the source
+directory for a package taken from HOL's repository. Each other package comes
+after, by its depth in the package graph, then by its name and the directory
+relative to its root. That is Holmake's order when HOL and the packages are
+checked out side by side with HOL sorting first, and unlike Holmake's it
+doesn't depend on where the trees are checked out.
+
 ## Invalidation and action keys
 
 Each build action has an input key derived from resolved facts, not raw paths:

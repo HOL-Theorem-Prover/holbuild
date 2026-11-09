@@ -1350,6 +1350,7 @@ file input <relpath> <sha256> <size>
 file library <relpath> <sha256> <size>
 dep theory <package>:<logical> <stem> <input_key>
 lib <package>:<logical> <stem> <suffix> <load>...
+order <package>:<logical> <tier> <package-or-.> <dir-or-.>
 load theory|library|object <name-or-stem>
 output sig|sml|dat <relpath>
 output extra <declaration>
@@ -1378,6 +1379,11 @@ action-text
   `.holbuild/action-src/<package>/`.
 - `dep theory` lines list every theory the target depends on, directly or not,
   with the object stem its outputs restore to.
+- `order` lines give each `dep theory` and `lib` target's load-order key (see
+  "Artifacts and local materialization" in DESIGN.md); a worker sorts the `.uo`
+  manifests it writes for restored theories by them. `.` stands for an empty
+  package or directory. `load` lines and a `lib` line's loads are already in
+  that order.
 - `deps-key` identifies the target's dependency context with the toolchain's
   semantic identity, for naming a saved dependency heap.
 - The `option` lines are how the theory is run, which the action key leaves
@@ -1460,6 +1466,7 @@ context <package>:<logical> <stem> <input_key>   (or context HOL:<logical>)
 file library <relpath> <sha256> <size>
 dep theory <package>:<logical> <stem> <input_key>
 lib <package>:<logical> <stem> <suffix> <load>...
+order <package>:<logical> <tier> <package-or-.> <dir-or-.>
 load theory|library|object <name-or-stem>
 file context-script <relpath> <sha256> <size>
 file input <relpath> <sha256> <size>
@@ -1476,7 +1483,8 @@ run-text
   and `load` lines are the context theory's ActionSpec lines, followed by the
   `file library`, `lib` and `dep theory` lines of what the `--load` libraries
   need beyond them. A HOL context has only the latter.
-- `context` names the theory to restore, as a `dep theory` line does.
+- `context` names the theory to restore, as a `dep theory` line does, and
+  an `order` line gives its load-order key.
 - `file context-script` lines are the scripts of the context theory and of
   every theory it depends on, under `.holbuild/action-src/<package>/`, for
   scripts that read their ancestry's sources. For a project context the
