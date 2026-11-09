@@ -3598,8 +3598,9 @@ fun failure_detail policy source_file source_text theorem_checkpoints terminatio
    publishes them to the cache.  Returns the generated theory's load metadata,
    and leaves the stage, which holds the declared extra outputs, to the
    caller. *)
-fun run_theory_action cache_allowed policy tc root checkpoint_root base_context (action : theory_action) source_text theorem_checkpoints declaration_checkpoints termination_diagnostics =
+fun run_theory_action check_cancelled cache_allowed policy tc root checkpoint_root base_context (action : theory_action) source_text theorem_checkpoints declaration_checkpoints termination_diagnostics =
   let
+    val _ = check_cancelled ()
     val input_key = #input_key action
     val logical = #logical action
     val source_file = #source_file action
@@ -3729,7 +3730,8 @@ fun run_theory_action cache_allowed policy tc root checkpoint_root base_context 
       end
     val build_log = Path.concat(stage, "holbuild-build.log")
     val _ =
-      (validate_hol_context (#context run_spec);
+      (check_cancelled ();
+       validate_hol_context (#context run_spec);
        detail_time_phase "build.exec.node.child_run"
          (fn () =>
              run_hol_files_to_log tc stage stage
@@ -3739,6 +3741,7 @@ fun run_theory_action cache_allowed policy tc root checkpoint_root base_context 
                (SOME (current_build_log log_dir))
                "hol run failed while building theory script"))
       handle Error msg =>
+        (check_cancelled ();
         if invalid_checkpoint_retryable base_context (#context run_spec) msg then
           let
             val invalid = hol_context_path (#context run_spec)
@@ -3779,7 +3782,8 @@ fun run_theory_action cache_allowed policy tc root checkpoint_root base_context 
               in
                 raise failure_error
               end
-          end
+          end)
+    val _ = check_cancelled ()
     val _ =
       if execution_plan_only policy andalso file_exists plan_only_marker then
         (HolbuildStatus.message_stdout (read_text build_log handle _ => "");
@@ -3822,6 +3826,7 @@ fun run_theory_action cache_allowed policy tc root checkpoint_root base_context 
     val _ = copy_rewriting_path {src = staged_sml, dst = sml_path,
                                  replacements = dat_replacements}
     val _ = link_or_copy {src = sml_path, dst = hfs_remapped_path sml_path}
+    val _ = check_cancelled ()
     val _ =
       if cache_allowed then
         detail_time_phase "build.exec.publish_cache"
@@ -4569,11 +4574,11 @@ fun action_checkpoints policy checkpoint_root (action : theory_action) source_te
    `run_theory_action`, and the failed-prefix checkpoints a successful run
    made obsolete too: checkpoints saved after resuming from one are its
    children. *)
-fun run_theory_action_checkpoints cache_allowed policy tc root checkpoint_root base_context (action : theory_action) source_text
+fun run_theory_action_checkpoints check_cancelled cache_allowed policy tc root checkpoint_root base_context (action : theory_action) source_text
       {theorem_checkpoints, declaration_checkpoints, termination_diagnostics} =
   let
     fun run retries_left =
-      run_theory_action cache_allowed policy tc root checkpoint_root base_context action source_text
+      run_theory_action check_cancelled cache_allowed policy tc root checkpoint_root base_context action source_text
                         theorem_checkpoints declaration_checkpoints termination_diagnostics
       handle RetryInvalidCheckpoint =>
         if retries_left <= 0 then raise RetryInvalidCheckpoint
@@ -4587,7 +4592,7 @@ fun build_theory_action cache_allowed policy tc root checkpoint_root base_contex
     val source_text = read_text (#source_file action)
     val checkpoints = action_checkpoints policy checkpoint_root action source_text
     val generated_metadata =
-      run_theory_action_checkpoints cache_allowed policy tc root checkpoint_root base_context action source_text
+      run_theory_action_checkpoints (fn () => ()) cache_allowed policy tc root checkpoint_root base_context action source_text
         checkpoints
   in
     remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints);
@@ -9051,7 +9056,7 @@ fun toolchain_theory_script holdir theory =
   handle OS.SysErr _ => ""
 
 (* Steps 3 to 6 for a run: hydrate the root, run the script, publish. *)
-fun exec_run remote root tc (spec : run_spec) log =
+fun exec_run check_cancelled remote root tc (spec : run_spec) log =
   let
     val src = in_root root run_source_dir
     val output_dir = in_root root ".holbuild/run-output"
@@ -9062,7 +9067,9 @@ fun exec_run remote root tc (spec : run_spec) log =
       map (fn {path, sha256, ...} => {hash = sha256, dst = Path.concat (src, path)}) (#supports spec) @
       map (fn {path, sha256, ...} => {hash = sha256, dst = in_root root path}) (#context_scripts spec @ #inputs spec)
     val deps = run_spec_deps spec
+    val _ = check_cancelled ()
     val _ = hydrate_spec_deps remote root files deps (fn _ => false)
+    val _ = check_cancelled ()
     val _ = (ensure_dir output_dir; ensure_dir scratch)
     fun load name =
       if String.isPrefix "HOLLIB:" name then String.extract (name, size "HOLLIB:", NONE)
@@ -9094,6 +9101,7 @@ fun exec_run remote root tc (spec : run_spec) log =
       ["--noconfig", "--holstate", HolbuildToolchain.base_state tc, prelude, run_script_name]
     val oom_before = cgroup_oom_kills ()
     val _ = last_child_status := NONE
+    val _ = check_cancelled ()
     val {status, timed_out} =
       (case #timeout spec of
            SOME seconds =>
@@ -9102,6 +9110,7 @@ fun exec_run remote root tc (spec : run_spec) log =
          | NONE => {status = HolbuildToolchain.run_in_dir_to_file src argv log, timed_out = false})
       handle HolbuildToolchain.Error msg => raise action_failed InternalFailure msg
     val _ = last_child_status := SOME status
+    val _ = check_cancelled ()
     val _ =
       if timed_out then
         raise ActionFailed (TimeoutFailure,
@@ -9127,7 +9136,9 @@ fun exec_run remote root tc (spec : run_spec) log =
       end
     val files = map output (sort_strings (#outputs spec))
     fun publish (name, path) =
-      let val hash = HolbuildHash.file_sha256 path
+      let
+        val hash = HolbuildHash.file_sha256 path
+        val _ = check_cancelled ()
       in
         case HolbuildRemoteCache.publish_blob remote {hash = hash, src = path} of
             HolbuildCacheBackend.Published => (name, hash)
@@ -9138,6 +9149,7 @@ fun exec_run remote root tc (spec : run_spec) log =
     val manifest =
       run_manifest_text {input_key = #run_key spec, parent = Option.map #key (#context_theory spec),
                          outputs = outputs}
+    val _ = check_cancelled ()
     val _ =
       HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsentOrSame
         {key = #run_key spec, text = manifest}
@@ -9240,6 +9252,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
       end
     and run_script spec_text =
       let
+        val _ = check_cancelled ()
         val spec = parse_run_spec spec_text
         val _ = input_key := #run_key spec
         val _ = verify_run_spec spec
@@ -9249,6 +9262,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
         if run_already_done remote (#run_key spec) (#outputs spec) then "cached"
         else
           let
+            val _ = check_cancelled ()
             val tc =
               toolchain (#toolchain spec)
               handle e as HolbuildRemoteCache.Unavailable _ => raise e
@@ -9261,7 +9275,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
             val log = Path.concat(root, ".holbuild/run.log")
           in
             run_log := SOME log;
-            exec_run remote root tc spec log;
+            exec_run check_cancelled remote root tc spec log;
             "built"
           end
       end
@@ -9347,7 +9361,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                     | NONE => ()
               in
                 (ignore (phase "hol" (fn () =>
-                           run_theory_action_checkpoints true policy tc root checkpoint_root
+                           run_theory_action_checkpoints check_cancelled true policy tc root checkpoint_root
                              (toolchain_base_context tc) action source_text checkpoints))
                  handle e => (publish_shared (); check_cancelled (); raise e));
                 (* After the publish: the checkpoints saved after resuming
