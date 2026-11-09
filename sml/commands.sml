@@ -1779,7 +1779,12 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     else let
                       val _ = List.app (fn {input_key, log_sha256, ...} =>
                         case (log_sha256, HolbuildBuildExec.node_with_input_key build_options tc project plan toolchain_key input_key) of
-                            (SOME sha, SOME node) => ignore (HolbuildBuildExec.fetch_remote_build_log project node sha)
+                            (SOME sha, SOME node) =>
+                              (case HolbuildBuildExec.fetch_remote_build_log project node sha of
+                                   SOME _ => ()
+                                 | NONE => HolbuildBuildExec.warn
+                                     ("remote execution: could not fetch the failed theory's build log: " ^
+                                      HolbuildBuildPlan.logical_name node))
                           | _ => ()) failures
                     in
                       if null forced andalso not missing_blob then fall_back reason
