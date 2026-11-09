@@ -3042,8 +3042,11 @@ fun bool_text true = "true"
    3: the hash literal in Theory.sml, which children record for the parent,
    is the digest of the .dat without its proof-dependent parts, not the
    file's SHA-1, so an entry from before disagrees with every child built
-   after. *)
-val theory_manifest_version = "3"
+   after.
+   4: a theory's generated .uo lists its parents and ML dependencies in
+   Holmake's load order, not parents by name and then ML dependencies, so a
+   dependent's entry from before was built loading them in another order. *)
+val theory_manifest_version = "4"
 
 (* Final theory artifacts are semantic products of source bytes, resolved deps,
    toolchain, and declared action policy. Execution strategy is deliberately not
