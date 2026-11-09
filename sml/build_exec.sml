@@ -9087,7 +9087,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
     val checkpoint_root = Path.concat(cache, "checkpoints")
     val _ = HolbuildActionSandbox.enable (root, checkpoint_root)
     val _ = HolbuildActionSandbox.result_file :=
-              Option.map (fn file => Path.mkAbsolute {path = file, relativeTo = FS.getDir ()}) result_file
+              (* Not normalized: the sandbox resolves ".." after links as open does. *)
+              Option.map (fn file => if Path.isAbsolute file then file else FS.getDir () ^ "/" ^ file) result_file
     val input_key = ref ""
     val target = ref ("", "")
     val peak = ref NONE
