@@ -681,14 +681,19 @@ workers remain compatible with the upgraded coordinator. Workers keep passing
 the permanent ring as `--remote-cache`: it is the child's validation and stale
 fallback baseline, while live discovery updates the effective ring throughout
 an action. Python independently refreshes the ring for release-spec downloads.
-Discovery never follows redirects. If it fails, the last complete ring remains
+Discovery never follows redirects. A listed temporary member whose name does
+not resolve on that host yet is left out until a later refresh finds it (a
+resolver may cache the name's earlier NXDOMAIN for minutes); its joining then
+starts the join grace. Permanent members are always kept.
+If discovery fails, the last complete ring remains
 usable for 60 seconds, after which requests use the permanent configuration.
 Recovery from permanent fallback counts as a new join.
 For 60 seconds after observing a joined member, GET/HEAD can try every ready
 member to find an object whose former owner has not uploaded it yet. Outside
 that join grace, a miss tries at most two nodes. If both nodes fail with
 transport errors, 429 or 5xx, reads can continue through the snapshot so stale
-readers can bypass concurrent drains. Writes always keep the two-node bound.
+readers can bypass concurrent drains. Writes keep the two-node bound unless
+neither node gave an HTTP response; then they go on until one does.
 
 ### Capacity adapter
 

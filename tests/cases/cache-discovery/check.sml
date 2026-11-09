@@ -5,7 +5,9 @@ structure RC = HolbuildRemoteCache;
 fun assert message ok = if ok then () else raise Fail message;
 val dir = valOf (OS.Process.getEnv "DISCOVERY_DIR");
 val defaults = ["https://ci:password@a.example", "https://ci:password@b.example"];
-val identities = map (fn letter => "https://" ^ letter ^ ".example") ["a","b","c","d","e","f"];
+(* Discovered members must resolve here; permanent ones are kept even when they don't. *)
+val identities = ["https://a.example", "https://b.example"] @
+  map (fn port => "https://localhost:" ^ port) ["4403", "4404", "4405", "4406"];
 val header = "holbuild-cache-members-v1\n";
 val snapshot = header ^ String.concatWith "\n" identities ^ "\n";
 val cache = RC.remote (String.concatWith "," defaults);
@@ -51,6 +53,16 @@ val _ = asked := [];
 fun unavailable url = (asked := !asked @ [url]; HolbuildHttp.Response 503);
 val _ = ignore (RC.routed_status "PUT" ranked "" unavailable);
 val _ = assert "writes retain two-node bound during joins" (length (!asked) = 2);
+val _ = asked := [];
+fun unresolved url = (asked := !asked @ [url];
+  if url = List.nth (ranked, 2) then HolbuildHttp.Response 201 else HolbuildHttp.Failed "Couldn't resolve host name");
+val _ = assert "writes pass nodes that never answered"
+  (#2 (RC.routed_status "PUT" ranked "" unresolved) = HolbuildHttp.Response 201 andalso length (!asked) = 3);
+val _ = asked := [];
+fun answered url = (asked := !asked @ [url];
+  if url = hd ranked then HolbuildHttp.Failed "Couldn't resolve host name" else HolbuildHttp.Response 503);
+val _ = ignore (RC.routed_status "PUT" ranked "" answered);
+val _ = assert "writes stop at two nodes once one answered" (length (!asked) = 2);
 val _ = D.joined := Time.- (Time.now (), Time.fromSeconds 61);
 val _ = asked := [];
 val _ = ignore (RC.routed_status "GET" ranked "" request);
@@ -71,4 +83,7 @@ val _ = assert "recovery from permanent fallback starts join grace" (D.urls defa
 val _ = D.attempted := Time.zeroTime;
 val _ = RC.write_text (dir ^ "/body") (header ^ String.concatWith "\n" (List.take (identities, 2)));
 val _ = assert "scale-in withdraws burst members" (D.urls defaults = defaults);
+val _ = D.attempted := Time.zeroTime;
+val _ = RC.write_text (dir ^ "/body") (snapshot ^ "https://g.invalid\n");
+val _ = assert "a member whose name does not resolve is left out" (D.urls defaults = nodes);
 val _ = print "cache discovery passed\n";

@@ -971,7 +971,7 @@ def refresh_cache_members(coordinator: Coordinator, membership: Membership, url:
                 data = response.read(16385)
                 if response.status != 200 or len(data) > 16384:
                     raise ValueError("invalid cache membership response")
-                membership.update(data.decode(), now)
+                membership.update(data.decode(), now, resolve=True)
         except (OSError, ValueError, http.client.HTTPException):
             pass
     return membership.current(now)
