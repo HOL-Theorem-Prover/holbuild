@@ -5466,11 +5466,17 @@ fun mentions_at_identifier_start text word =
    stays, so its oracle stays.  A proof (or `Resume` block) that suspends
    goals stays too, so they are still suspended for the `Resume` blocks
    that prove them and its `Finalise` saves the theorem where the real
-   build does. *)
+   build does.  A theorem the script resumes suspends, whether or not its
+   proof names `suspend` (a helper tactic can call it), so it stays as
+   well; HolbuildDeferred fails any other deferred proof that suspends. *)
 fun deferred_source source_text boundaries =
   let
-    fun deferred kind tactic =
-      (kind = "theorem" orelse kind = "resume") andalso
+    fun resumed {kind, name, ...} =
+      if kind = "resume" then SOME (Substring.string (#1 (Substring.splitl (fn c => c <> #"[") (Substring.full name))))
+      else NONE
+    val resumed = List.mapPartial resumed boundaries
+    fun deferred kind name tactic =
+      (kind = "resume" orelse (kind = "theorem" andalso not (List.exists (fn r => r = name) resumed))) andalso
       Substring.string (Substring.dropr Char.isSpace (Substring.dropl Char.isSpace (Substring.full tactic))) <> "cheat" andalso
       not (mentions_at_identifier_start tactic "suspend")
     fun splice [] _ pos acc = String.concat (rev (String.extract (source_text, pos, NONE) :: acc))
@@ -5480,7 +5486,7 @@ fun deferred_source source_text boundaries =
           else
             let val tactic = String.substring (source_text, tactic_start, tactic_end - tactic_start)
             in
-              if not (deferred kind tactic) then splice rest k pos acc
+              if not (deferred kind name tactic) then splice rest k pos acc
               else
                 splice rest (k + 1) tactic_end
                   (String.concat ["HolbuildDeferred.defer ", Int.toString k, " ",

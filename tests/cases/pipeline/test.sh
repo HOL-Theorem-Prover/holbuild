@@ -127,7 +127,8 @@ require_no_grep() {
 # The gate passes: B and C are committed from their speculative attempts.
 # A's suspended theorem, and its Resume block that suspends again, keep
 # their proofs in the outline, so its Finalise still saves it in place, with
-# its attributes.
+# its attributes.  So does a_hidden, whose proof suspends through a helper
+# tactic, and its Finalise keeps it local.
 new_project pass
 cat > "$tmpdir/pass/src/AScript.sml" <<SML
 open HolKernel Parse boolLib bossLib;
@@ -152,6 +153,19 @@ Resume a_split[inner]:
   ACCEPT_TAC TRUTH
 QED
 Finalise a_split[simp]
+fun split_tac () = CONJ_TAC >- suspend "left" >> suspend "right";
+Theorem a_hidden:
+  T /\\ T
+Proof
+  split_tac ()
+QED
+Resume a_hidden[left]:
+  ACCEPT_TAC TRUTH
+QED
+Resume a_hidden[right]:
+  ACCEPT_TAC TRUTH
+QED
+Finalise a_hidden[local]
 val _ = export_theory();
 SML
 write_b_and_c pass
@@ -309,6 +323,40 @@ require_grep "pipeline: attempt failed: ATheory" "$log"
 require_grep "wrote theory data of type simp.deltas" "$log"
 require_grep "pipeline: gate failed: ATheory (digest differs)" "$log"
 require_same_as_unpipelined thydata CTheory A B C
+
+# A deferred proof that suspends a subgoal through a helper tactic, with no
+# Resume in the script to show it, proves its goal only under the suspended
+# subgoal, so A's deferred build fails and A builds again with its proofs
+# in place, where the theorem is stashed rather than saved.
+new_project hidden
+cat > "$tmpdir/hidden/src/AScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+fun later_tac () = suspend "later";
+Theorem a_thm:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+Theorem a_hidden:
+  T
+Proof
+  later_tac ()
+QED
+Theorem a_slow:
+  T
+Proof
+  $slow_truth
+QED
+val _ = export_theory();
+SML
+write_b_and_c hidden
+build_pipelined hidden CTheory
+log=$tmpdir/hidden.log
+require_grep "pipeline: attempt failed: ATheory" "$log"
+require_grep "as a suspended subgoal does" "$log"
+require_grep "pipeline: gate failed: ATheory (digest differs)" "$log"
+require_same_as_unpipelined hidden CTheory A B C
 
 # A deferred proof that fails, as one racing another thread on a library's
 # cache can, runs again alone before it fails the build.  This one fails
