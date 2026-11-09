@@ -11,6 +11,7 @@ tmpdir=$(make_temp_dir)
 cleanup() { rm -rf "$tmpdir"; }
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
+unset HOLBUILD_REMOTE_CACHE_URL
 
 # C proves against B's outline and finishes, then B fails: nothing of C's
 # may be published anywhere, since only a commit after B's gate may.

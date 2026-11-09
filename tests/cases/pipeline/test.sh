@@ -11,6 +11,7 @@ tmpdir=$(make_temp_dir)
 cleanup() { rm -rf "$tmpdir"; }
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
+unset HOLBUILD_REMOTE_CACHE_URL
 
 # Pipelined builds (here of theories without checkpoints): a child proves
 # against its parent's outline while the parent proves, and is committed
