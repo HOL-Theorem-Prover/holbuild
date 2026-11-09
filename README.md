@@ -1115,6 +1115,21 @@ the analyser is built against, so another checkout of the same sources on the
 machine reads it instead of analysing again, and a different HOL pin never
 uses it.
 
+### Keeping a tool's files between builds
+
+A tool run from theory scripts (a proof search with an index of the
+ancestry's theorems, say) can keep files from one build to the next in a
+tool cache. `holbuild build --tool-cache NAME` gives each theory's HOL
+processes the environment variable `HOLBUILD_TOOL_CACHE_DIR`, naming a
+directory the tool may read and write. NAME is letters, digits, `.`, `_` and
+`-`. Locally the directory is `$HOLBUILD_CACHE/tool-cache/NAME`, shared by
+every build that names it and never cleaned by holbuild. A theory built on a
+remote worker (`--remote-exec`) gets a directory filled from the remote cache
+and saved back to it after the build, keyed by the theory's dependencies and
+toolchain (see "Running one theory action as a remote worker"). The flag
+doesn't change a theory's cache key: a theory built or cached without it is
+reused as is.
+
 ### The plan record
 
 Planning a build discovers every source, analyses its dependencies and
@@ -1555,6 +1570,26 @@ cooldown after requests got no response, whatever the worker was fetching or
 publishing, the action fails as `unavailable` rather than reading that as a
 miss or a conflict: the cache failed, not the action.
 
+A theory exported with `--tool-cache NAME` (see "Keeping a tool's files
+between builds" below) gets a tool cache: before HOL starts, the worker
+fills `.holbuild/tool-cache/NAME` under the action root from the remote
+cache's entry for the key
+
+```text
+sha256("holbuild-tool-cache-v1\nname=" ^ NAME ^ "\ndeps_key=" ^ <deps_key> ^ "\ntoolchain=" ^ <toolchain key>)
+```
+
+and gives the theory's HOL processes that directory as
+`HOLBUILD_TOOL_CACHE_DIR`. The key leaves out the theory's own source, so
+every theory with the same dependencies and toolchain shares the entry, on
+any worker. After HOL exits, built or failed, the worker publishes the
+directory again if its files changed: at most 16 regular files, 64 MiB in
+all, with names of letters, digits, `.`, `_` and `-`. An entry that can't
+be restored, or a directory that breaks these limits, only warns: the
+action goes on without the tool cache. The newest publication replaces the
+entry, so a tool should write each file whole (to a temporary name, then
+renamed) and treat the directory as a cache it may find empty.
+
 A run spec (`holbuild-run-spec-v1`, see "Exporting script runs for remote
 execution") is checked the same way, its run text against its `run-key`,
 and reported `cached`, without installing the toolchain or starting HOL, if
@@ -1624,8 +1659,9 @@ For a run, `input-key` is its run key and `built` means it ran.
 `phase-ms` gives the wall time of each phase that ran, in order: `cap` (the
 cache cap sweep), `spec`, `toolchain`, `hydrate` (sources, libraries and
 dependencies), `cutoff` (whether an earlier build stands), `restore` (shared
-checkpoints), `hol`, `publish` (shared checkpoints), `check` (the
-publication checks) and `log`; stderr ends with the same times and `wall`.
+checkpoints), `toolrestore` (the tool cache), `hol`, `publish` (shared
+checkpoints), `toolpublish` (the tool cache), `check` (the publication
+checks) and `log`; stderr ends with the same times and `wall`.
 `peak-rss-mb` is the HOL process's peak resident memory, reported once the
 theory has been exported.
 `log` is the build log, or the run's HOL output, uploaded to `/cas/`. `memory` means Poly/ML ran out
