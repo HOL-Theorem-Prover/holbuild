@@ -11,6 +11,13 @@ val outputs_validated = ref false
 (* exec-action's --result file: the worker's, so never exposed to the action. *)
 val result_file : string option ref = ref NONE
 
+(* Directories every sandboxed child may read, such as the host's store of
+   HOL theory modules, which no child writes. *)
+val shared_reads : string list ref = ref []
+(* While set, a child writes only these directories and may read, but not
+   write, the private roots. *)
+val output_dirs : string list option ref = ref NONE
+
 fun active () = Option.isSome (!private_roots)
 fun enable roots = (outputs_validated := false; private_roots := SOME roots)
 fun disable () = private_roots := NONE
@@ -151,6 +158,10 @@ fun wrap completed argv =
       NONE => argv
     | SOME (root, checkpoints) =>
       let
+        val (writable, private_reads) =
+          case !output_dirs of
+              NONE => ([root, checkpoints], [])
+            | SOME dirs => (dirs, [root, checkpoints])
         fun exists path = OS.FileSys.access (path, []) handle OS.SysErr _ => false
         fun full path = OS.FileSys.fullPath path
         fun fields name =
@@ -163,7 +174,7 @@ fun wrap completed argv =
             "/usr", "/bin", "/sbin", "/lib", "/lib64", "/dev/urandom", "/dev/zero", "/proc/meminfo",
             "/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d", "/etc/localtime",
             "/etc/ssl/certs", "/etc/nsswitch.conf", "/etc/hosts", "/etc/resolv.conf", "/etc/gai.conf"] @
-           poly_libraries @ fields "HOLBUILD_ACTION_READ_DIRS")
+           poly_libraries @ private_reads @ !shared_reads @ fields "HOLBUILD_ACTION_READ_DIRS")
         (* As configured, not normalized: the helper also forbids each link on
            the way, and resolves ".." after a link the way open does. *)
         fun absolute path = if OS.Path.isAbsolute path then path else OS.FileSys.getDir () ^ "/" ^ path
@@ -191,7 +202,7 @@ fun wrap completed argv =
              SOME (absolute path)) protected_paths
         fun options flag paths = List.concat (map (fn path => [flag, path]) paths)
       in
-        ["python3", "-I", helper ()] @ options "--write" [full root, full checkpoints] @
+        ["python3", "-I", helper ()] @ options "--write" (map full writable) @
         options "--read" (map full readable) @ options "--forbid" forbidden @
         (* Poly/ML's OS.FileSys.tmpName always creates files in /tmp, ignoring
            TMPDIR; HolSat and HolSmt need it.  The helper leaves it out if
@@ -199,6 +210,10 @@ fun wrap completed argv =
         options "--scratch" (List.filter exists ["/tmp"]) @
         ["--completed", completed, "--"] @ argv
       end
+
+fun with_output_dirs dirs f =
+  (output_dirs := SOME dirs;
+   (f () before output_dirs := NONE) handle e => (output_dirs := NONE; raise e))
 
 (* Only the trusted supervisor can write this sibling of the private roots.
    A child exit status alone cannot attest to cleanup or output validation. *)

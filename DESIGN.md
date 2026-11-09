@@ -160,14 +160,22 @@ user removes it manually. The cache key includes the HOL revision, the Poly/ML
 runtime (release and architecture variant), the resolved `poly` executable
 path, build arguments other than `-j`, and cache format version.
 
-Compiled theory initializers are an optional local cache under
+Theory modules are an optional local cache under
 `$HOLBUILD_CACHE/theory-modules`. When the installed HOL exposes the loader
-API, each child configures it with its exact base saved state and caches the
-initializer after normalizing exported theory files. Consumers apply cached
-code in their current kernel, replaying registration and load hooks in the
-source loader's order. Missing or incompatible code uses the source loader.
-These runtime-specific files are outside portable theory artifacts and action
-keys; cache GC and remote-worker byte limits account for them separately.
+API, each child configures it with its exact base saved state. A child that
+loads a theory from its `.dat` file saves the decoded theory as a module (a
+few per process, since each save costs more the more is loaded), and later
+loads use it, still registering the theory and running its load hooks in the
+usual order. Missing or incompatible modules fall back to the `.dat` file.
+Modules depend on the host's base saved state, so they stay outside portable
+theory artifacts, action keys and the remote cache; cache GC and
+remote-worker byte limits account for them separately.
+
+On a remote worker an action only reads the store, so that no action can
+plant a module another one loads. Before an action runs, the worker has a
+sandboxed child that runs no project code write the missing modules of the
+theories the action loads, from their restored `.dat` files alone, and moves
+into the store only the files named for those theories' `.dat` files.
 
 ## Main binary and project-HOL helper direction
 

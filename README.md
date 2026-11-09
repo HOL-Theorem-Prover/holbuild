@@ -39,12 +39,13 @@ constructor shapes, before and after HOL added combinator-token spans. Small
 adapter tests cover both shapes without adding a third HOL toolchain to CI.
 The new token annotations do not change existing proof-step labels or extents.
 
-On HOL and Poly/ML versions supporting compiled theory initializers, holbuild
-automatically caches their compiled code under `<cache root>/theory-modules`.
-Loading a cached initializer still reads the theory data, registers its types,
-constants and theorems, and runs its load hooks in the usual dependency order.
-ML libraries retain their usual source-loading behavior. Older toolchains and
-missing or incompatible module files use the source loader automatically.
+On HOL and Poly/ML versions supporting theory modules, holbuild
+automatically keeps each loaded theory's decoded data in a module under
+`<cache root>/theory-modules`, so later loads skip reading its `.dat` file.
+Loading a module still registers the theory's types, constants and theorems
+and runs its load hooks in the usual dependency order. ML libraries retain
+their usual source-loading behavior. Older toolchains and missing or
+incompatible module files load from the `.dat` file automatically.
 
 These module files belong to one exact HOL saved state. They stay in the local
 cache, including on remote workers, and do not change portable theory artifacts
