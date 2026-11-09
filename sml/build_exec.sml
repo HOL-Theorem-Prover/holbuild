@@ -9102,7 +9102,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
     val log_required = ref false
     (* Never reuse a writable directory inode across actions. Shared heaps are
        copied into this action's tree, not exposed as writable store inodes. *)
-    fun empty_root () = (remove_tree root; remove_tree checkpoint_root)
+    fun empty_root () = (HolbuildRemoveTree.remove_untrusted root; HolbuildRemoveTree.remove_untrusted checkpoint_root)
     val run_log = ref NONE
     fun build_log () =
       case !run_log of
@@ -9127,8 +9127,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
            | e => (warn ("could not upload the action log: " ^ General.exnMessage e); NONE)
     fun run () =
       let
-        val _ = (HolbuildRemoveTree.remove_strict root; ensure_dir root)
-        val _ = (HolbuildRemoveTree.remove_strict checkpoint_root; ensure_dir checkpoint_root)
+        val _ = (HolbuildRemoveTree.remove_untrusted_strict root; ensure_dir root)
+        val _ = (HolbuildRemoveTree.remove_untrusted_strict checkpoint_root; ensure_dir checkpoint_root)
         val spec_path = Path.concat(root, ".holbuild/action-spec")
         (* Only a spec the cache doesn't have is rejected; a failed fetch is
            retryable. *)

@@ -18,6 +18,10 @@ import sys
 import tempfile
 import time
 
+# The sandbox grants only system paths, so a virtualenv's interpreter (whose
+# pyvenv.cfg lives beside it) can't start there; use the one it links to.
+SANDBOXED_PYTHON = os.path.realpath(sys.executable)
+
 
 def attack(root: Path, worker: int, secret: Path, shared: Path) -> None:
     denied: list[str] = []
@@ -218,9 +222,9 @@ def worker(helper: Path, root: Path) -> None:
     with (shared / "cooperate/lease-sentinel").open("w") as lease:
         fcntl.flock(lease, fcntl.LOCK_EX)
         os.set_inheritable(lease.fileno(), True)
-        command = [sys.executable, str(probe), "--attack", str(private), str(os.getpid()), str(secret), str(shared)]
+        command = [SANDBOXED_PYTHON, str(probe), "--attack", str(private), str(os.getpid()), str(secret), str(shared)]
         if os.environ.get("HOLBUILD_RUN_CANCEL"):
-            command = [sys.executable, str(probe), "--linger", str(private)]
+            command = [SANDBOXED_PYTHON, str(probe), "--linger", str(private)]
         if os.environ.get("HOLBUILD_RUN_ORPHAN_START"):
             (private / "startup-ready").write_text("ready")
             while not (private / "release-startup").exists():
@@ -302,7 +306,7 @@ def completion_probe(helper: Path) -> None:
                 for path in ("/usr", "/bin", "/lib", "/lib64"):
                     if Path(path).exists():
                         sys.argv += ["--read", path]
-                command = [str(private / "missing-executable")] if fault == "exec" else [sys.executable, "-I", "-c", code]
+                command = [str(private / "missing-executable")] if fault == "exec" else [SANDBOXED_PYTHON, "-I", "-c", code]
                 sys.argv += ["--", *command]
                 status = module["main"]()
             finally:
