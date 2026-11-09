@@ -305,6 +305,7 @@ holbuild context --trknl
 holbuild execution-plan MyTheory:my_theorem
 holbuild check MyTheory OtherTheory:my_theorem
 holbuild check --fingerprint MyTheory OtherTheory
+holbuild check --with-fingerprints MyTheory:my_theorem
 holbuild buildhol
 holbuild buildhol --trknl
 holbuild build --trknl MyTheory
@@ -537,6 +538,11 @@ fingerprint	DepTheory	axiom	my_axiom	9a02…(64 hex digits)	-
 fingerprint	MyTheory	theorem	my_theorem	3f1c…	-
 fingerprint	MyTheory	theorem	other_theorem	77d0…	cheat
 ```
+
+`holbuild check --with-fingerprints MyTheory:my_theorem` does both in one HOL
+session: it checks the selectors as plain `check` does and prints the
+fingerprint lines of their theories, and exits with the check's status. A
+tool that wants both pays for one theory load instead of two.
 
 Build progress and HOL's own messages share stdout, so keep the lines that
 start with `fingerprint` and a tab (`grep '^fingerprint'`). After that column
@@ -1359,6 +1365,7 @@ file input <relpath> <sha256> <size>
 file library <relpath> <sha256> <size>
 dep theory <package>:<logical> <stem> <input_key>
 lib <package>:<logical> <stem> <suffix> <load>...
+order <package>:<logical> <tier> <package-or-.> <dir-or-.>
 load theory|library|object <name-or-stem>
 output sig|sml|dat <relpath>
 output extra <declaration>
@@ -1387,6 +1394,11 @@ action-text
   `.holbuild/action-src/<package>/`.
 - `dep theory` lines list every theory the target depends on, directly or not,
   with the object stem its outputs restore to.
+- `order` lines give each `dep theory` and `lib` target's load-order key (see
+  "Artifacts and local materialization" in DESIGN.md); a worker sorts the `.uo`
+  manifests it writes for restored theories by them. `.` stands for an empty
+  package or directory. `load` lines and a `lib` line's loads are already in
+  that order.
 - `deps-key` identifies the target's dependency context with the toolchain's
   semantic identity, for naming a saved dependency heap.
 - The `option` lines are how the theory is run, which the action key leaves
@@ -1469,6 +1481,7 @@ context <package>:<logical> <stem> <input_key>   (or context HOL:<logical>)
 file library <relpath> <sha256> <size>
 dep theory <package>:<logical> <stem> <input_key>
 lib <package>:<logical> <stem> <suffix> <load>...
+order <package>:<logical> <tier> <package-or-.> <dir-or-.>
 load theory|library|object <name-or-stem>
 file context-script <relpath> <sha256> <size>
 file input <relpath> <sha256> <size>
@@ -1485,7 +1498,8 @@ run-text
   and `load` lines are the context theory's ActionSpec lines, followed by the
   `file library`, `lib` and `dep theory` lines of what the `--load` libraries
   need beyond them. A HOL context has only the latter.
-- `context` names the theory to restore, as a `dep theory` line does.
+- `context` names the theory to restore, as a `dep theory` line does, and
+  an `order` line gives its load-order key.
 - `file context-script` lines are the scripts of the context theory and of
   every theory it depends on, under `.holbuild/action-src/<package>/`, for
   scripts that read their ancestry's sources. For a project context the

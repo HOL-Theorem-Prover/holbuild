@@ -77,6 +77,14 @@ def checked(result: int, operation: str) -> int:
     return result
 
 
+# The mode-changing system calls and their mode argument.
+CHMOD = {"chmod": 1, "fchmod": 1, "fchmodat": 2, "fchmodat2": 2}
+
+
+class OpenHow(ctypes.Structure):
+    _fields_ = [("flags", ctypes.c_uint64), ("mode", ctypes.c_uint64), ("resolve", ctypes.c_uint64)]
+
+
 class Linux:
     def __init__(self) -> None:
         if sys.platform != "linux" or platform.machine() not in ("aarch64", "x86_64"):
@@ -125,7 +133,8 @@ class Linux:
         self.prctl(38, 1)  # PR_SET_NO_NEW_PRIVS
         self.prctl(4, 0)  # PR_SET_DUMPABLE
 
-    def confine_paths(self, readable: list[Path], writable: list[Path]) -> None:
+    def confine_paths(self, readable: list[Path], writable: list[Path], scratch: list[Path],
+                      toolchain: bool = False) -> None:
         # Handle every filesystem right supported by this kernel. In particular,
         # never grant link creation, special files, or cross-directory REFER.
         handled = (1 << 13) - 1
@@ -142,8 +151,11 @@ class Linux:
         write = read | 2 | 16 | 32 | 128 | 256  # write, remove dir/file, make dir/regular
         if self.abi >= 3:
             write |= 1 << 14
+        # A toolchain build links within its own tree, never in shared scratch,
+        # where a planted link could redirect another same-user process.
+        tree = write | (1 << 12 if toolchain else 0)  # make symlinks
         try:
-            for paths, access in ((readable, read), (writable, write)):
+            for paths, access in ((readable, read), (writable, tree), (scratch, write)):
                 for path in paths:
                     parent = os.open(path, os.O_PATH | os.O_CLOEXEC)
                     try:
@@ -156,7 +168,7 @@ class Linux:
         finally:
             os.close(fd)
 
-    def confine_syscalls(self) -> int:
+    def confine_syscalls(self, toolchain: bool = False) -> int:
         lib = self.seccomp
         ctx = lib.seccomp_init(0x7FFF0000)  # SCMP_ACT_ALLOW
         if not ctx:
@@ -178,6 +190,11 @@ class Linux:
                 raise SandboxError(f"seccomp rule {name}: {os.strerror(-result)}")
 
         try:
+            # Landlock does not cover chmod, so a toolchain build's mode
+            # changes go to the supervisor, which confines them to its tree.
+            relaxed = set(CHMOD) | {"symlink", "symlinkat"} if toolchain else set()
+            for name in CHMOD if toolchain else ():
+                deny(name, action=0x7FC00000)  # SCMP_ACT_NOTIFY
             for name in """
                 chmod fchmod fchmodat fchmodat2 chown fchown lchown fchownat
                 utime utimes futimesat utimensat setxattr lsetxattr fsetxattr
@@ -197,7 +214,8 @@ class Linux:
                 reboot kexec_load kexec_file_load init_module finit_module delete_module swapon swapoff
                 acct quotactl settimeofday clock_settime adjtimex clock_adjtime sethostname setdomainname
             """.split():
-                deny(name)
+                if name not in relaxed:
+                    deny(name)
             deny("clone3", error=errno.ENOSYS)
             # A clone with a new namespace could evade process-group cleanup.
             for flag in (0x80, 0x20000, 0x2000000, 0x4000000, 0x8000000, 0x10000000, 0x20000000, 0x40000000):
@@ -272,6 +290,7 @@ class Policy:
     forbidden: list[Path]
     # Writable like the private roots, but never harvested, so not validated as outputs.
     scratch: list[Path] = field(default_factory=list)
+    toolchain: bool = False
 
     def validate(self) -> None:
         for grant in self.readable + self.writable + self.scratch:
@@ -296,7 +315,14 @@ class Policy:
                     info = path.lstat()
                     if stat.S_ISDIR(info.st_mode):
                         continue
-                    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    if self.toolchain and stat.S_ISLNK(info.st_mode):
+                        # A toolchain tree stays closed under its links, so
+                        # nothing that later reads it is redirected outside.
+                        target = Path(os.path.realpath(path))
+                        if target != root and root not in target.parents:
+                            raise SandboxError(f"toolchain link leaves its tree: {path}")
+                        continue
+                    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o6000:
                         raise SandboxError(f"action produced a linked or special file: {path}")
 
 
@@ -323,8 +349,11 @@ class Process:
     fd: int
     group: int
 
-    def alive(self) -> bool:
-        return not select.select([self.fd], [], [], 0)[0]
+    def alive(self, wait: float = 0) -> bool:
+        """Whether it is still running after waiting up to wait seconds."""
+        poller = select.poll()  # select() rejects descriptors past FD_SETSIZE
+        poller.register(self.fd, select.POLLIN)
+        return not poller.poll(max(0, int(wait * 1000)))
 
     def exists(self) -> bool:
         try:
@@ -389,6 +418,11 @@ def descendants() -> dict[int, Process]:
                         pass
                     except FileNotFoundError:
                         pass
+                    except OSError as error:
+                        # Older kernels (6.1) report a child reaped since the
+                        # read as EINVAL while its PID still names a group.
+                        if error.errno != errno.EINVAL:
+                            raise
                     finally:
                         if candidate is not None:
                             os.close(candidate.fd)
@@ -459,7 +493,7 @@ def finish_children(leader: int) -> int:
 
 
 class SignalBroker:
-    def __init__(self, linux: Linux, fd: int) -> None:
+    def __init__(self, linux: Linux, fd: int, roots: list[Path]) -> None:
         self.linux = linux
         self.fd = fd
         self.request = ctypes.POINTER(Notification)()
@@ -468,6 +502,10 @@ class SignalBroker:
         if result != 0:
             raise SandboxError(f"allocate notifications: {os.strerror(-result)}")
         self.tgkill = linux.seccomp.seccomp_syscall_resolve_name(b"tgkill")
+        self.chmod = {number: name for name, number in
+                      ((name, {"fchmodat2": 452}.get(name, linux.seccomp.seccomp_syscall_resolve_name(name.encode())))
+                       for name in CHMOD) if number >= 0}
+        self.roots = roots
 
     def close(self) -> None:
         self.linux.seccomp.seccomp_notify_free(self.request, self.response)
@@ -493,6 +531,17 @@ class SignalBroker:
         ctypes.memset(self.response, 0, self.linux.sizes.response)
         response = self.response.contents
         response.id = request.id
+        if request.data.number in self.chmod:
+            try:
+                if not self.change_mode(request):
+                    return
+            except OSError as error:
+                response.error = -(error.errno or errno.EPERM)
+            except (OverflowError, ValueError):
+                # A wild pointer must not choose how the supervisor fails.
+                response.error = -errno.EPERM
+            self.respond()
+            return
         try:
             target = ctypes.c_int32(request.data.args[0]).value
             caller = thread_group(request.pid)
@@ -510,9 +559,74 @@ class SignalBroker:
                 self.send(request, target, caller)
         except OSError as error:
             response.error = -(errno.ESRCH if error.errno == errno.ENOENT else error.errno or errno.EPERM)
-        result = lib.seccomp_notify_respond(self.fd, self.response)
+        self.respond()
+
+    def respond(self) -> None:
+        result = self.linux.seccomp.seccomp_notify_respond(self.fd, self.response)
         if result not in (0, -errno.ENOENT, -errno.ECANCELED, -errno.EINTR):
             raise SandboxError(f"respond to notification: {os.strerror(-result)}")
+
+    def change_mode(self, request: Notification) -> bool:
+        """Apply a chmod for the blocked caller if its target lies in a
+        writable tree; False if the caller is gone.
+
+        The path is resolved from the supervisor's own copy, without magic
+        links, against the caller's working or directory descriptor, and the
+        mode is applied to the resolved inode, so no later change by the caller
+        can redirect it."""
+        name = self.chmod[request.data.number]
+        args = request.data.args
+        mode = args[CHMOD[name]]
+        if mode & ~0o777:
+            raise PermissionError(errno.EPERM, "special mode bits")
+        if name == "fchmodat2" and args[3] != 0:
+            raise OSError(errno.EOPNOTSUPP, "chmod flags")
+        pid = request.pid
+        if name == "fchmod":
+            target = os.open(f"/proc/{pid}/fd/{ctypes.c_int32(args[0]).value}", os.O_PATH | os.O_CLOEXEC)
+        else:
+            path = self.read_path(pid, args[0] if name == "chmod" else args[1])
+            dirfd = -100 if name == "chmod" else ctypes.c_int32(args[0]).value
+            base = os.open(f"/proc/{pid}/cwd" if dirfd == -100 else f"/proc/{pid}/fd/{dirfd}",
+                           os.O_PATH | os.O_CLOEXEC)
+            try:
+                how = OpenHow(os.O_PATH | os.O_CLOEXEC, 0, 0x02)  # RESOLVE_NO_MAGICLINKS
+                target = self.linux.libc.syscall(437, base, path, ctypes.byref(how), ctypes.sizeof(how))
+                if target < 0:
+                    error = ctypes.get_errno()
+                    raise OSError(error, os.strerror(error))
+            finally:
+                os.close(base)
+        try:
+            resolved = Path(os.readlink(f"/proc/self/fd/{target}"))
+            kind = os.stat(f"/proc/self/fd/{target}").st_mode
+            if not (stat.S_ISREG(kind) or stat.S_ISDIR(kind)) or not any(
+                    resolved == root or root in resolved.parents for root in self.roots):
+                raise PermissionError(errno.EPERM, "chmod outside the action")
+            if not self.valid(request.id):
+                return False
+            os.chmod(f"/proc/self/fd/{target}", mode)
+            return True
+        finally:
+            os.close(target)
+
+    @staticmethod
+    def read_path(pid: int, address: int) -> bytes:
+        # Page by page: the string may end just before an unmapped page.
+        data = b""
+        with open(f"/proc/{pid}/mem", "rb", buffering=0) as memory:
+            while b"\0" not in data:
+                if len(data) >= 4096:
+                    raise OSError(errno.ENAMETOOLONG, "path")
+                memory.seek(address + len(data))
+                try:
+                    chunk = memory.read(4096 - (address + len(data)) % 4096)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    raise OSError(errno.EFAULT, "path")
+                data += chunk
+        return data.split(b"\0", 1)[0]
 
     def send(self, request: Notification, target: int, caller: int) -> None:
         sig = ctypes.c_int32(request.data.args[1]).value
@@ -530,14 +644,7 @@ class SignalBroker:
                     raise PermissionError(errno.EPERM, "signal outside action")
             else:
                 group = process_info(request.pid)[1] if target == 0 else -target
-                selected = []
-                for process in processes.values():
-                    try:
-                        _, process.group = process_info(process.pid)
-                        if process.exists() and process.group == group:
-                            selected.append(process)
-                    except (FileNotFoundError, ProcessLookupError):
-                        pass
+                selected = group_members(processes, group)
                 if not selected:
                     # Probe with signal zero only; never send a real group
                     # signal from this privileged side of the boundary.
@@ -557,8 +664,66 @@ class SignalBroker:
                     pass
             if not delivered:
                 raise ProcessLookupError(errno.ESRCH, "signal target exited")
+            signaled = {process.pid: processes.pop(process.pid) for process in selected}
         finally:
             close_processes(processes)
+        if target <= 0 and sig != 0:
+            signal_late_members(group, sig, signaled)
+        else:
+            close_processes(signaled)
+
+
+def group_members(processes: dict[int, Process], group: int) -> list[Process]:
+    selected = []
+    for process in processes.values():
+        try:
+            _, process.group = process_info(process.pid)
+            if process.exists() and process.group == group:
+                selected.append(process)
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+    return selected
+
+
+def signal_late_members(group: int, sig: int, signaled: dict[int, Process]) -> None:
+    """Signal members that joined the group after the first scan.
+
+    The kernel's kill(-group) is atomic with fork; signaling a scanned list is
+    not. A member can fork after the scan and before its own signal, and that
+    child joins the group unsignaled. Rescan until a scan finds no new member.
+    A dying member's children reach this subreaper only at its exit, so for
+    SIGKILL that last scan must start after every signaled member exited."""
+    deadline = time.monotonic() + 2
+    try:
+        while True:
+            # A scan is complete only if every signaled member had exited
+            # before it began: until then a dying member's child can be in
+            # neither its list nor this subreaper's as the scan reads them.
+            settled = sig != signal.SIGKILL or not any(process.alive() for process in signaled.values())
+            processes = descendants()
+            try:
+                late = [process for process in group_members(processes, group)
+                        if process.pid not in signaled or
+                        (not signaled[process.pid].alive() and process.alive())]  # PID reused
+                for process in late:
+                    try:
+                        process.send(sig)
+                    except ProcessLookupError:
+                        continue
+                    if process.pid in signaled:
+                        os.close(signaled[process.pid].fd)
+                    signaled[process.pid] = processes.pop(process.pid)
+            finally:
+                close_processes(processes)
+            if not late and settled:
+                return
+            if time.monotonic() > deadline:
+                return  # bounded: a fork storm or a stuck exit ends the follow-up
+            if sig == signal.SIGKILL:
+                for process in signaled.values():
+                    process.alive(deadline - time.monotonic())
+    finally:
+        close_processes(signaled)
 
 
 def spellings(name: str) -> tuple[set[Path], set[Path]]:
@@ -650,8 +815,8 @@ def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = N
                             raise
             linux.drop_privileges()
             linux.confine_paths(policy.readable + [Path(f"/proc/{os.getpid()}")],
-                                policy.writable + policy.scratch + [Path("/dev/null")])
-            listener = linux.confine_syscalls()
+                                policy.writable, policy.scratch + [Path("/dev/null")], policy.toolchain)
+            listener = linux.confine_syscalls(policy.toolchain)
             socket.send_fds(child_socket, [b"N"], [listener])
             os.close(listener)
             child_socket.close()
@@ -683,7 +848,7 @@ def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = N
                         for descriptor in descriptors:
                             os.close(descriptor)
                         raise SandboxError("missing seccomp listener handshake")
-                    broker = SignalBroker(linux, descriptors[0])
+                    broker = SignalBroker(linux, descriptors[0], policy.writable)
                     poller.unregister(parent_socket)
                     parent_socket.close()
                     poller.register(broker.fd, select.POLLIN)
@@ -722,9 +887,15 @@ def main() -> int:
     parser.add_argument("--forbid", action="append", default=[])
     parser.add_argument("--scratch", action="append", default=[])
     parser.add_argument("--completed", type=Path)
+    parser.add_argument("--toolchain", action="store_true")
+    parser.add_argument("--validate-tree", type=Path)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     try:
+        if args.validate_tree is not None:
+            # A restored toolchain must be as closed as one built here.
+            Policy([args.validate_tree.resolve(strict=True)], [], [], toolchain=True).validate_outputs()
+            return 0
         linux = Linux()
         if args.check:
             # Exercise the same FD handoff, notification and cleanup path as
@@ -741,6 +912,7 @@ def main() -> int:
             [Path(path).resolve(strict=True) for path in args.read],
             [path for name in args.forbid for path in spellings(name)[0]] +
             ([args.completed.resolve()] if args.completed is not None else []),
+            toolchain=args.toolchain,
         )
         # A scratch directory holding protected state, or a read-only grant
         # (Landlock grants are a union, so it would become writable), is

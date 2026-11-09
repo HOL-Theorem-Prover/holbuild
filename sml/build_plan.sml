@@ -148,16 +148,10 @@ fun nodes_named nodes name = List.filter (has_logical_name name) nodes
 
 type name_index = (string * node list) Vector.vector
 
+(* Halving by position keeps sort_pairs stable: equal keys stay in input order. *)
 fun split_pairs xs =
-  let
-    fun loop left right rest =
-      case rest of
-          [] => (left, right)
-        | [x] => (x :: left, right)
-        | x :: y :: zs => loop (x :: left) (y :: right) zs
-  in
-    loop [] [] xs
-  end
+  let val half = length xs div 2
+  in (List.take (xs, half), List.drop (xs, half)) end
 
 fun merge_pairs compare left right =
   case (left, right) of
@@ -261,6 +255,7 @@ type t =
    input_expansions : (string, input_expansion) Binarymap.dict ref,
    input_hashes : (string, string) Binarymap.dict ref,
    known_input_keys : known_input_key option array,
+   package_tiers : (string * int) list,
    holdir : string}
 
 fun universe_nodes ({universe, ...} : t) = universe
@@ -942,6 +937,36 @@ fun write_test_dependency_graph graph_id plan_id resolved_id (graph : resolved_d
           val _ = each_vector unresolved (#unresolved graph)
         in TextIO.closeOut output end
 
+(* Each package's load-order tier, by name: 1 for a package that depends on
+   no package but HOL, else one more than its deepest dependency.  HOL's own
+   directories, and the packages taken from them (`from = "hol"`), are tier 0,
+   so dependencies load before what depends on them, as they do under Holmake
+   when HOL and the packages sit side by side. *)
+fun package_tiers graph =
+  let
+    fun from_hol package =
+      case HolbuildPackageProvenance.snapshot (HolbuildProject.package_provenance package) of
+          HolbuildPackageProvenance.ToolchainSnapshot _ => true
+        | _ => false
+    val packages =
+      map (fn package => (HolbuildProjectGraph.package_id package, HolbuildProject.package_name package))
+          (HolbuildProjectGraph.packages graph)
+    val hol_ids =
+      map HolbuildProjectGraph.package_id (List.filter from_hol (HolbuildProjectGraph.packages graph))
+    val edges = HolbuildProjectGraph.edges graph
+    fun dependencies id =
+      List.mapPartial
+        (fn {declaring_package, dependency_package, ...} =>
+           if declaring_package = id andalso not (member dependency_package hol_ids)
+           then SOME dependency_package else NONE)
+        edges
+    fun tier visiting id =
+      if member id visiting then 1
+      else 1 + List.foldl Int.max 0 (map (tier (id :: visiting)) (dependencies id))
+  in
+    map (fn (id, name) => (name, tier [] id)) packages
+  end
+
 fun assemble {nodes, name_index, roots, selected, analysis, dependency_graph, resolution_context_id,
               selected_graph_id, selected_plan_id, resolved_plan_id, holdir} : t =
   let
@@ -964,6 +989,8 @@ fun assemble {nodes, name_index, roots, selected, analysis, dependency_graph, re
      input_expansions = ref (Binarymap.mkDict String.compare),
      input_hashes = ref (Binarymap.mkDict String.compare),
      known_input_keys = Array.array(length selected, NONE),
+     package_tiers =
+       package_tiers (HolbuildPackagePrepare.graph (#preparation (analysis : HolbuildComponentProvider.analysis_state))),
      holdir = holdir}
   end
 
@@ -1250,6 +1277,47 @@ fun toolchain_source_name ({holdir, ...} : t) node =
     else NONE
   end
 
+(* Where an object sits in the order Holmake loads a target's dependencies:
+   sorted by directory, then file name.  HOL's directories come first, then
+   each package's, by tier and then name, so the order doesn't depend on
+   where the trees are checked out.  Equal keys keep their input order. *)
+type load_order = {tier : int, package : string, dir : string, file : string}
+
+fun compare_load_order ({tier, package, dir, file} : load_order, b : load_order) =
+  case Int.compare (tier, #tier b) of
+      EQUAL =>
+        (case String.compare (package, #package b) of
+             EQUAL =>
+               (case String.compare (dir, #dir b) of
+                    EQUAL => String.compare (file, #file b)
+                  | order => order)
+           | order => order)
+    | order => order
+
+(* A HOL theory or library named without a node: it is in $(HOLDIR)/sigobj. *)
+fun external_load_order name : load_order = {tier = 0, package = "", dir = "sigobj", file = name}
+
+(* Package hol's modules are installed in sigobj, so they sort with the
+   external ones; other packages from the HOL tree keep their directory. *)
+fun load_order (plan as {package_tiers, ...} : t) node : load_order =
+  if package node = "hol" then external_load_order (logical_name node)
+  else
+    case toolchain_source_name plan node of
+        SOME name =>
+          {tier = 0, package = "",
+           dir = HolbuildSourceIndex.dirname (String.extract (name, size "$(HOLDIR)/", NONE)),
+           file = logical_name node}
+      | NONE =>
+          {tier = case List.find (fn (name, _) => name = package node) package_tiers of
+                      SOME (_, tier) => tier
+                    | NONE => 1,
+           package = package node, dir = HolbuildSourceIndex.dirname (relative_path node),
+           file = logical_name node}
+
+fun sort_by_load_order order values =
+  map #2 (sort_pairs (fn ((a, _), (b, _)) => compare_load_order (a, b))
+                     (map (fn value => (order value, value)) values))
+
 fun source_name plan node =
   case toolchain_source_name plan node of
       SOME name => name
@@ -1262,11 +1330,14 @@ fun action_lines_with plan config_lines_for_node toolchain_key dep_text input_li
     val source = source_of node
     val analysis = analysis_state plan
     val source_hash = source_hash_of analysis node
-    val project_deps = map dep_text (direct_project_deps plan node)
+    (* In load order, so a change of order changes the key. *)
+    val project_deps = map (fn dep => (load_order plan dep, dep_text dep)) (direct_project_deps plan node)
     (* Toolchain objects are a function of the theory toolchain identity, so
        they are named but not hashed: their files carry the install path. *)
-    val external_deps = map (fn name => "HOL:" ^ name) (direct_external_theories plan node)
-    val external_libs = map (fn name => "HOLLIB:" ^ name) (direct_external_libs plan node)
+    val external_deps =
+      map (fn name => (external_load_order name, "HOL:" ^ name)) (direct_external_theories plan node)
+    val external_libs =
+      map (fn name => (external_load_order name, "HOLLIB:" ^ name)) (direct_external_libs plan node)
     val policy = #policy source
     val declared_deps = HolbuildProject.action_deps policy
     val declared_loads = HolbuildProject.action_loads policy
@@ -1293,7 +1364,7 @@ fun action_lines_with plan config_lines_for_node toolchain_key dep_text input_li
     declared_load_lines @
     input_lines @
     source_extra_output_lines @
-    map (fn dep => "dep=" ^ dep) (project_deps @ external_deps @ external_libs)
+    map (fn (_, dep) => "dep=" ^ dep) (sort_by_load_order #1 (project_deps @ external_deps @ external_libs))
   end
 
 fun action_text_with plan config_lines_for_node toolchain_key keys node =
