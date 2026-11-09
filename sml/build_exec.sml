@@ -3213,7 +3213,49 @@ fun plain_source_from_checkpoint source_name source_text start_offset =
      HolbuildTheoryCheckpoints.source_line_pragma source_text start_offset,
      String.extract(source_text, Int.max(0, start_offset), NONE)]
 
-fun instrumented_source policy timeout_marker plan_only_marker source_name source_text start_offset checkpoints declaration_checkpoints terminations =
+fun mentions_at_identifier_start text word =
+  let
+    fun identifier c = Char.isAlphaNum c orelse c = #"_" orelse c = #"'"
+    fun search start =
+      let val (prefix, rest) = Substring.position word (Substring.extract (text, start, NONE))
+      in
+        if Substring.isEmpty rest then false
+        else
+          let val i = start + Substring.size prefix
+          in (i = 0 orelse not (identifier (String.sub (text, i - 1)))) orelse search (i + 1) end
+      end
+  in
+    search 0
+  end
+
+(* The base names of the theorems that `Resume` blocks, of KIND and NAME
+   each, resume. *)
+fun resumed_theorems kinds_names =
+  List.mapPartial
+    (fn (kind, name) =>
+        if kind = "resume" then SOME (Substring.string (#1 (Substring.splitl (fn c => c <> #"[") (Substring.full name))))
+        else NONE)
+    kinds_names
+
+(* Whether a pipelined build defers the proof TACTIC of a theorem or
+   `Resume` block (KIND) named NAME, given the theorems RESUMED: see
+   deferred_source. *)
+fun deferrable_proof resumed kind name tactic =
+  (kind = "resume" orelse (kind = "theorem" andalso not (List.exists (fn r => r = name) resumed))) andalso
+  not (mentions_at_identifier_start tactic "cheat") andalso
+  not (mentions_at_identifier_start tactic "suspend")
+
+(* For a pipelined build, which of CHECKPOINTS the instrumented script
+   defers (HolbuildTheoryCheckpoints.instrument). *)
+fun deferrable_checkpoint (checkpoints : HolbuildTheoryCheckpoints.checkpoint list) =
+  let val resumed = resumed_theorems (map (fn {kind, name, ...} => (kind, name)) checkpoints)
+  in fn ({kind, name, tactic_text, ...} : HolbuildTheoryCheckpoints.checkpoint) =>
+          deferrable_proof resumed kind name tactic_text
+  end
+
+(* DEFER_PROOFS: the script is a pipelined build's, which defers what
+   proofs it can. *)
+fun instrumented_source defer_proofs policy timeout_marker plan_only_marker source_name source_text start_offset checkpoints declaration_checkpoints terminations =
   if proof_steps_enabled policy then
     HolbuildTheoryCheckpoints.instrument
       {source = source_text, source_name = source_name, start_offset = start_offset, checkpoints = checkpoints,
@@ -3225,7 +3267,8 @@ fun instrumented_source policy timeout_marker plan_only_marker source_name sourc
        plan_theorem = execution_plan policy,
        trace_all = trace_steps policy,
        plan_only_marker = plan_only_marker,
-       new_ir = proof_ir_enabled policy}
+       new_ir = proof_ir_enabled policy,
+       defer = if defer_proofs then deferrable_checkpoint checkpoints else (fn _ => false)}
   else plain_source_from_checkpoint source_name source_text start_offset
 
 fun replay_candidate policy base theorem_checkpoints declaration_checkpoints =
@@ -3326,7 +3369,8 @@ fun failed_prefix_resume_source policy timeout_marker plan_only_marker source_na
          plan_theorem = execution_plan policy,
          trace_all = trace_steps policy,
          plan_only_marker = plan_only_marker,
-         new_ir = proof_ir_enabled policy}
+         new_ir = proof_ir_enabled policy,
+         defer = fn _ => false}
   in
     String.concat
       [HolbuildTheoryCheckpoints.generated_code_pragma source, prelude,
@@ -3499,7 +3543,7 @@ fun place_state stored dst =
 
 fun saved_parent path = PolyML.SaveState.showParent path handle _ => NONE
 
-fun write_theory_script policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
+fun write_theory_script defer_proofs policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
   let
     val source_name = #source_name action
     val logical = #logical action
@@ -3507,7 +3551,7 @@ fun write_theory_script policy root checkpoint_root base_context (action : theor
   in
   if not (checkpoint_enabled policy) then
     (write_plain_preload load_lines preload;
-     write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints [] terminations);
+     write_text staged_script (instrumented_source defer_proofs policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints [] terminations);
      {context = base_context, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
   else
     let
@@ -3524,14 +3568,14 @@ fun write_theory_script policy root checkpoint_root base_context (action : theor
            List.app (fn {context_path, ...} => ensure_parent context_path) declaration_checkpoints)
       fun run_from_deps_checkpoint () =
         (ensure_source_checkpoint_parents ();
-         write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
+         write_text staged_script (instrumented_source false policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
          deps_loaded_resume_message logical;
          {context = HolState deps_loaded, files = [staged_script], failure_checkpoints = [deps_loaded], failed_prefix_context = NONE})
       fun run_from_fresh_preload () =
         (remove_deps_checkpoint_descendants base deps_key;
          ensure_source_checkpoint_parents ();
          write_preload load_lines deps_loaded deps_ok preload;
-         write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
+         write_text staged_script (instrumented_source false policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
          {context = base_context, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
       fun run_from_failed_prefix {checkpoint, step_count, metadata_text} =
         let
@@ -3545,7 +3589,7 @@ fun write_theory_script policy root checkpoint_root base_context (action : theor
       fun run_from_replay {boundary, path, safe_name, kind, failure_checkpoints} =
         let
           val _ = ensure_source_checkpoint_parents ()
-          val _ = write_text staged_script (instrumented_source policy (SOME timeout_marker) plan_only_marker source_name source_text boundary checkpoints declaration_checkpoints terminations)
+          val _ = write_text staged_script (instrumented_source false policy (SOME timeout_marker) plan_only_marker source_name source_text boundary checkpoints declaration_checkpoints terminations)
           val _ = source_context_resume_message logical (#source_file action) source_text kind safe_name boundary
         in
           {context = HolState path, files = [staged_script], failure_checkpoints = failure_checkpoints @ [deps_loaded], failed_prefix_context = NONE}
@@ -3721,7 +3765,7 @@ fun run_theory_action speculative_log cache_allowed policy tc root checkpoint_ro
     val _ = remove_file timeout_marker
     val _ = remove_file plan_only_marker
     val _ = List.app (ensure_parent o #2) staged_extra_outputs
-    val run_spec = write_theory_script policy root checkpoint_root base_context action source_text
+    val run_spec = write_theory_script (speculative andalso proof_steps_enabled policy) policy root checkpoint_root base_context action source_text
                                     theorem_checkpoints declaration_checkpoints termination_diagnostics staged_script preload timeout_marker
                                     (if execution_plan_only policy then SOME plan_only_marker else NONE)
     (* A speculative child runs no checkpoints, so it starts from the
@@ -5497,21 +5541,6 @@ fun unoutline_path root run_dir path =
   end
 
 (* Whether TEXT has WORD where an identifier starts. *)
-fun mentions_at_identifier_start text word =
-  let
-    fun identifier c = Char.isAlphaNum c orelse c = #"_" orelse c = #"'"
-    fun search start =
-      let val (prefix, rest) = Substring.position word (Substring.extract (text, start, NONE))
-      in
-        if Substring.isEmpty rest then false
-        else
-          let val i = start + Substring.size prefix
-          in (i = 0 orelse not (identifier (String.sub (text, i - 1)))) orelse search (i + 1) end
-      end
-  in
-    search 0
-  end
-
 (* The theory script SOURCE_TEXT, with BOUNDARIES its theorem spans, for a
    pipelined build: every proof deferred, in `HolbuildDeferred.defer`
    (sml/deferred_proofs_runtime.sml), which accepts its goal at once and
@@ -5525,14 +5554,7 @@ fun mentions_at_identifier_start text word =
    well; HolbuildDeferred fails any other deferred proof that suspends. *)
 fun deferred_source source_text boundaries =
   let
-    fun resumed {kind, name, ...} =
-      if kind = "resume" then SOME (Substring.string (#1 (Substring.splitl (fn c => c <> #"[") (Substring.full name))))
-      else NONE
-    val resumed = List.mapPartial resumed boundaries
-    fun deferred kind name tactic =
-      (kind = "resume" orelse (kind = "theorem" andalso not (List.exists (fn r => r = name) resumed))) andalso
-      not (mentions_at_identifier_start tactic "cheat") andalso
-      not (mentions_at_identifier_start tactic "suspend")
+    val deferred = deferrable_proof (resumed_theorems (map (fn {kind, name, ...} => (kind, name)) boundaries))
     fun splice [] _ pos acc = String.concat (rev (String.extract (source_text, pos, NONE) :: acc))
       | splice ({kind, name, tactic_start, tactic_end, ...} :: rest) k pos acc =
           if tactic_start < pos orelse tactic_end < tactic_start then
@@ -5828,7 +5850,10 @@ fun build_speculative options tc project base_context plan keys toolchain_key ru
     val log_dir = Path.concat(run_dir, "logs/" ^ name)
     val source = source_file node
     val source_text = read_text source
-    val deferred = deferred_source source_text (discover_theorem_boundaries_strict source source_text)
+    (* With proof steps on, the instrumented script defers the proofs. *)
+    val deferred =
+      if proof_steps_enabled policy then source_text
+      else deferred_source source_text (discover_theorem_boundaries_strict source source_text)
     val generated_metadata =
       with_outline_watch stage (fn () => on_outline stage)
         (fn () =>
@@ -6179,17 +6204,19 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
     fun is_theory id =
       #kind (HolbuildBuildPlan.source_of (Vector.sub (nodes, id))) = HolbuildSourceIndex.TheoryScript
 
-    (* A pipelined build saves no checkpoints, runs no proof steps and
-       writes no proof trace, so a theory that needs any of them builds only
-       from its committed parents. *)
+    (* A pipelined build saves no checkpoints and writes no proof trace,
+       and runs proof steps only through the proof IR, so a theory that
+       needs more builds only from its committed parents. *)
     fun speculable id =
       let
         val node = Vector.sub (nodes, id)
         val policy = checkpoint_policy_for_node options project node
       in
         context_tactics andalso is_theory id andalso Array.sub (cold, id) <> SOME false andalso
-        not (checkpoint_enabled policy) andalso not (proof_steps_enabled policy) andalso
-        not (trknl_enabled policy) andalso
+        not (theorem_checkpoints_enabled policy) andalso
+        (not (proof_steps_enabled policy) orelse proof_ir_enabled policy) andalso
+        not (trace_steps policy) andalso not (Option.isSome (execution_plan policy)) andalso
+        not (repl_on_failure policy) andalso not (trknl_enabled policy) andalso
         null (source_extra_output_declarations plan node) andalso not (always_reexecute node) andalso
         not (failed_prefix_priority_node id) andalso
         not (Binaryset.member (!skipped, HolbuildBuildPlan.input_key_for keys node))

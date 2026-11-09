@@ -24,24 +24,29 @@ struct
   val marker_base = 1000000
   val oracle_prefix = "holbuild_deferred_"
 
+  (* SETUP, for a proof run by holbuild's proof runtime (proof steps on),
+     tells the runtime which theorem the proof is before it runs. *)
   type item = {k : int, name : string, ctxt : Context.t, goal : Tactical.goal,
-               make : unit -> Tactical.tactic}
+               make : unit -> Tactical.tactic, setup : (unit -> unit) option}
 
   (* Elaboration runs on one thread; prove_all drains these. *)
   val queue = ref ([] : item list)
   val marker_data = ref (NONE : HOLsexp.t option)
   val proved = ref ([] : (int * ((string * int list) list * string list)) list)
 
-  fun defer k name make : Tactical.tactic = fn goal => fn ctxt =>
+  fun defer_with setup k name make : Tactical.tactic = fn goal => fn ctxt =>
     let
       val empty_tag = Thm.tag (Thm.REFL boolSyntax.T)
       val dep = Dep.DEP_UNSAVED [(Theory.current_theory (), [marker_base + k])]
       val stub = Thm.add_tag (Tag.set_dep dep empty_tag,
                               Thm.mk_oracle_thm (oracle_prefix ^ Int.toString k) goal)
     in
-      queue := {k = k, name = name, ctxt = ctxt, goal = goal, make = make} :: !queue;
+      queue := {k = k, name = name, ctxt = ctxt, goal = goal, make = make, setup = setup} :: !queue;
       Tactic.ACCEPT_TAC stub goal ctxt
     end
+
+  fun defer k name make = defer_with NONE k name make
+  fun defer_steps k name setup make = defer_with (SOME setup) k name make
 
   fun segment_data ty = Theory.LoadableThyData.segment_data {thy = Theory.current_theory (), thydataty = ty}
 
@@ -73,25 +78,52 @@ struct
      is checked as it stands in the pin, where a HOL whose pins take
      writes keeps (and so loses) what the proof writes; prove_all checks
      the live context too. *)
+  (* TH, proved for GOAL with the theory data INITIAL before the proof. *)
+  fun checked goal initial th =
+    (* A proof that suspends a subgoal (markerLib.suspend), or cites a
+       still-suspended theorem, proves the goal under a hypothesis the
+       stub's theorem lacks. *)
+    case List.find (fn h => not (List.exists (fn a => Term.aconv a h) (#1 goal))) (Thm.hyp th) of
+        SOME h => raise Fail ("the proof left a hypothesis its goal lacks: " ^ Parse.term_to_string h)
+      | NONE =>
+    case changed_thydata initial of
+        NONE => th
+      | SOME ty => raise Fail ("the proof wrote theory data of type " ^ ty)
+
   fun prove_one types ({ctxt, goal, make, ...} : item) =
+    Context.with_context ctxt
+      (fn () => let val initial = thydata_of types
+                in checked goal initial (Tactical.TAC_PROOF_in ctxt (goal, make ())) end) ()
+
+  fun result k th =
+    let val tag = Thm.tag th
+    in (k, (Dep.transfer_thydepl (Tag.dep_of tag), #1 (Tag.dest_tag tag))) end
+
+  (* With proof steps on, the proof runtime runs each step on a thread of
+     its own, which a pin would not reach, and keeps its state in globals.
+     So the proofs run one at a time on this thread, unpinned, each with
+     the live context set back to its goal's, as when the script ran it in
+     place; a step can write the context as it would there.  The first
+     failure ends the phase: a step worker killed on a timeout can hold the
+     context's lock, so nothing touches the context after it. *)
+  fun prove_in_place types items =
     let
-      fun prove () =
+      val after_export = Context.snapshot ()
+      fun prove ({k, name, ctxt, goal, make, setup} : item) =
         let
+          val _ = Context.restore ctxt
           val initial = thydata_of types
-          val th = Tactical.TAC_PROOF_in ctxt (goal, make ())
+          val th = (Option.app (fn f => f ()) setup;
+                    checked goal initial (Tactical.prove_goal_in ctxt (goal, make ())))
+                   handle e => raise Fail ("deferred proof of " ^ name ^ " failed: " ^
+                                           (Feedback.exn_to_string e handle Interrupt => "interrupted"))
         in
-          (* A proof that suspends a subgoal (markerLib.suspend), or cites a
-             still-suspended theorem, proves the goal under a hypothesis the
-             stub's theorem lacks. *)
-          case List.find (fn h => not (List.exists (fn a => Term.aconv a h) (#1 goal))) (Thm.hyp th) of
-              SOME h => raise Fail ("the proof left a hypothesis its goal lacks: " ^ Parse.term_to_string h)
-            | NONE =>
-          case changed_thydata initial of
-              NONE => th
-            | SOME ty => raise Fail ("the proof wrote theory data of type " ^ ty)
+          result k th
         end
+      val results = map prove items
     in
-      Context.with_context ctxt prove ()
+      Context.restore after_export;
+      results
     end
 
   fun describe_delta delta =
@@ -112,6 +144,7 @@ struct
       val types = thydata_types ()
       val items = ref (rev (!queue))
       val _ = queue := []
+      val in_place = List.exists (fn {setup, ...} : item => Option.isSome setup) (!items)
       val mutex = Mutex.mutex ()
       val cv = ConditionVar.conditionVar ()
       val results = ref []
@@ -123,8 +156,8 @@ struct
                              item :: rest => (items := rest; SOME item)
                            | [] => NONE)
       fun prove (item as {k, ...} : item) =
-        let val tag = Thm.tag (prove_one types item)
-        in locked (fn () => results := (k, (Dep.transfer_thydepl (Tag.dep_of tag), #1 (Tag.dest_tag tag))) :: !results) end
+        let val r = result k (prove_one types item)
+        in locked (fn () => results := r :: !results) end
       fun failure name msg = Fail ("deferred proof of " ^ name ^ " failed: " ^ msg)
       fun run item =
         prove item
@@ -156,11 +189,14 @@ struct
       val live = thydata_of types
     in
       Theory.register_hook (listener, record);
-      List.app (fn _ => ignore (Thread.fork (worker, []))) (List.tabulate (count, fn i => i));
-      Mutex.lock mutex; wait (); Mutex.unlock mutex;
-      List.app retry (rev (!failed));
+      if in_place then results := prove_in_place types (!items)
+      else
+        (List.app (fn _ => ignore (Thread.fork (worker, []))) (List.tabulate (count, fn i => i));
+         Mutex.lock mutex; wait (); Mutex.unlock mutex;
+         List.app retry (rev (!failed)));
       ignore (Listener.remove_listener Theory.delta_hook listener);
-      case (!change, changed_thydata live) of
+      (* In place, each proof's writes were checked before the next restore. *)
+      case (!change, if in_place then NONE else changed_thydata live) of
           (SOME what, _) => raise Fail ("a deferred proof changed the theory: " ^ what)
         | (NONE, SOME ty) => raise Fail ("a deferred proof wrote theory data of type " ^ ty)
         | (NONE, NONE) => proved := !results

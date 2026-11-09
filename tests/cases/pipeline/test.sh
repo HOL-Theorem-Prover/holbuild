@@ -13,7 +13,7 @@ cleanup() {
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
   fi
-  rm -rf "$tmpdir"
+  cleanup_temp_dir "$tmpdir"
 }
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
@@ -81,16 +81,27 @@ build_pipelined() {
   (cd "$tmpdir/$name" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j4 build --skip-checkpoints --skip-proof-steps "$target") > "$tmpdir/$name.log" 2>&1
 }
 
+# Builds project NAME with default flags (checkpoints and proof steps on).
+build_pipelined_steps() {
+  local name=$1
+  shift
+  (cd "$tmpdir/$name" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j4 build --no-cache "$@") > "$tmpdir/$name.log" 2>&1 ||
+    { tail -n 60 "$tmpdir/$name.log" >&2; return 1; }
+}
+
 # Builds a copy of project NAME with pipelining off and compares the theory
 # data of each theory in THEORIES: the patched data of a deferred build is
-# byte for byte what the plain build exports.
+# byte for byte what the plain build exports.  The plain build takes the
+# flags in UNPIPELINED_FLAGS, by default those of build_pipelined.
 require_same_as_unpipelined() {
   local name=$1 target=$2
   shift 2
+  local flags
+  read -r -a flags <<< "${UNPIPELINED_FLAGS:---skip-checkpoints --skip-proof-steps}"
   rm -rf "$tmpdir/$name-off"
   cp -r "$tmpdir/$name" "$tmpdir/$name-off"
   rm -rf "$tmpdir/$name-off/.holbuild"
-  (cd "$tmpdir/$name-off" && HOLBUILD_PIPELINE=off "$HOLBUILD_BIN" -j4 build --no-cache --skip-checkpoints --skip-proof-steps "$target") \
+  (cd "$tmpdir/$name-off" && HOLBUILD_PIPELINE=off "$HOLBUILD_BIN" -j4 build --no-cache "${flags[@]}" "$target") \
     > "$tmpdir/$name-off.log" 2>&1
   local theory
   for theory in "$@"; do
@@ -219,13 +230,81 @@ require_grep "remote cache published" "$tmpdir/pass-plain.log"
 (cd "$tmpdir/pass" && "$HOLBUILD_BIN" --verbose build --skip-checkpoints --skip-proof-steps CTheory) > "$tmpdir/pass-again.log"
 require_grep "CTheory is up to date" "$tmpdir/pass-again.log"
 
-# A speculative proof saves no checkpoints, so theories that keep them
-# build only on committed parents.
-cp -r "$tmpdir/pass" "$tmpdir/checkpointed"
-rm -rf "$tmpdir/checkpointed/.holbuild"
-(cd "$tmpdir/checkpointed" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j4 build --no-cache CTheory) \
-  > "$tmpdir/checkpointed.log" 2>&1
-require_no_grep "attempt done" "$tmpdir/checkpointed.log"
+# With default flags, proof steps on, the proof runtime runs the deferred
+# proofs.  A bare build's targets are the project's roots, here C, which
+# saves theorem checkpoints, which a speculative proof doesn't, so C builds
+# only on the committed B.
+cp -r "$tmpdir/pass" "$tmpdir/steps"
+rm -rf "$tmpdir/steps/.holbuild"
+sed -i 's|^members = \["src"\]$|&\nroots = ["src/CScript.sml"]|' "$tmpdir/steps/holproject.toml"
+require_grep '^roots = \["src/CScript.sml"\]$' "$tmpdir/steps/holproject.toml"
+build_pipelined_steps steps
+log=$tmpdir/steps.log
+require_grep "pipeline: outline ready: ATheory" "$log"
+require_grep "pipeline: gate passed: ATheory" "$log"
+require_grep "pipeline: attempt done: BTheory" "$log"
+require_no_grep "attempt done: CTheory" "$log"
+require_no_grep "attempt failed" "$log"
+require_before "pipeline: committed: BTheory" "CTheory built" "$log"
+UNPIPELINED_FLAGS="" require_same_as_unpipelined steps CTheory A B C
+
+# Each deferred proof runs in its goal's context, though the script changed
+# it later: a_use needs a_const_simp, which the script then removes from the
+# simp set.  Its tactic reads the simp set from the live context, not the
+# one HOL passes it, as a tactic defined outside a theorem can.  (Every
+# proof here uses a theorem of an ancestor, so carries DISK_THM, as the
+# outline has it.)
+new_project restore
+cat > "$tmpdir/restore/src/AScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Definition a_const_def:
+  a_const = T
+End
+Theorem a_const_simp[simp]:
+  a_const = T
+Proof
+  ACCEPT_TAC (CONJUNCT1 (CONJ a_const_def TRUTH))
+QED
+fun live_simp g = SIMP_TAC (BasicProvers.srw_ss ()) [] g;
+Theorem a_use:
+  a_const
+Proof
+  $pause >> live_simp
+QED
+val _ = temp_delsimps ["a_const_simp"];
+val _ = export_theory();
+SML
+write_b_and_c restore
+build_pipelined_steps restore CTheory
+log=$tmpdir/restore.log
+require_grep "pipeline: gate passed: ATheory" "$log"
+require_grep "pipeline: committed: BTheory" "$log"
+require_no_grep "attempt failed" "$log"
+UNPIPELINED_FLAGS="" require_same_as_unpipelined restore CTheory A B C
+
+# A deferred proof's step that runs out of time fails A's deferred build,
+# and A's build with its proofs in place fails the same way.
+new_project timeout
+cat > "$tmpdir/timeout/src/AScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Theorem a_slow:
+  T
+Proof
+  $pause >> ACCEPT_TAC TRUTH
+QED
+val _ = export_theory();
+SML
+write_b_and_c timeout
+if (cd "$tmpdir/timeout" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j4 build --no-cache --tactic-timeout 1 BTheory) > "$tmpdir/timeout.log" 2>&1; then
+  echo "expected the tactic timeout to fail the build" >&2
+  cat "$tmpdir/timeout.log" >&2
+  exit 1
+fi
+log=$tmpdir/timeout.log
+require_grep "pipeline: attempt failed: ATheory" "$log"
+require_grep "holbuild tactic timeout after" "$log"
 
 # A cheat in scope: B's proof uses A's cheated theorem, so it carries the
 # cheat once proved, which an outline can't predict.  B publishes no outline,
