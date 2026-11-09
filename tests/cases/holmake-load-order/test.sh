@@ -162,10 +162,13 @@ link_hol_toolchain_cache "$tmpdir/local"
   { cat "$tmpdir/local.log" >&2; exit 1; }
 
 # The object manifests: the script's direct loads, and the generated
-# theory's parents (HOL drops the ones that are ancestors of others).
+# theory's parents (HOL drops the ones that are ancestors of others, here
+# arithmetic, sorting and sum; aLib is only the script's).
 check_order "useScript.uo" "$(manifest_names "$project/.holbuild/obj/src/top/useScript.uo")"
-theory_uo=$(manifest_names "$project/.holbuild/obj/src/top/useTheory.uo")
-check_order "useTheory.uo" "$theory_uo" "$(grep -xF -f <(printf '%s\n' "$theory_uo") <<< "$expected")"
+check_order "useTheory.uo" "$(manifest_names "$project/.holbuild/obj/src/top/useTheory.uo")" 'countcharsTheory
+depTheory
+yTheory
+bTheory'
 
 # The preload a theory's stage loads.
 if (cd "$project" && HOLBUILD_CACHE=$tmpdir/local "$HOLBUILD_BIN" build --skip-checkpoints failTheory) \
