@@ -9194,12 +9194,21 @@ fun fill_module_store cache root tc (spec : action_spec) =
     val theories = rev (#2 (List.foldl visit ([], []) (map #1 project)))
     val expected =
       map (fn (name, b) => name ^ "-" ^ hol_file_sha1 (b ^ ".dat") ^ ".pmo") theories
+    (* HOL maps <dir>/xTheory.sml to <dir>/.hol/objs/xTheory.sml itself,
+       so it is given the unmapped name of a toolchain theory. *)
+    fun hol_name b =
+      let val dir = Path.dir b
+      in
+        if Path.file dir = "objs" andalso Path.file (Path.dir dir) = ".hol"
+        then Path.concat (Path.dir (Path.dir dir), Path.file b)
+        else b
+      end
     val output = Path.concat (cache, "theory-modules-writer")
     val script = in_root root ".holbuild/theory-module-writer.sml"
     val log = in_root root ".holbuild/theory-module-writer.log"
     val call =
       "val _ = Meta.writeTheoryModules {theories = [" ^
-      String.concatWith ", " (map (fn (_, b) => HolbuildToolchain.sml_string (b ^ ".sml")) theories) ^
+      String.concatWith ", " (map (fn (_, b) => HolbuildToolchain.sml_string (hol_name b ^ ".sml")) theories) ^
       "], directory = " ^ HolbuildToolchain.sml_string store ^
       ", base_state = " ^ HolbuildToolchain.sml_string (HolbuildToolchain.base_state tc) ^
       ", output = " ^ HolbuildToolchain.sml_string output ^
