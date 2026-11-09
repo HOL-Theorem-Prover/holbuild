@@ -1294,7 +1294,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                       (fn () => HolbuildProjectGraph.resolve {project = project, resolution = resolution})
         val record_dir = HolbuildPlanRecord.record_dir project
         val fingerprint = HolbuildPlanRecord.fingerprint
-                            {project = project, graph = graph, holdir = #holdir tc, kernel_variant = #kernel_variant tc}
+                            {project = project, graph = graph, holdir = #holdir tc,
+                             kernel_variant = #kernel_variant tc, targets = targets}
         fun say text = if HolbuildStatus.verbose_mode () then HolbuildStatus.message_stderr ("holbuild: plan: " ^ text ^ "\n") else ()
         val attempt =
           case record_mode of
