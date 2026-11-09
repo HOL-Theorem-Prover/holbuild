@@ -1768,8 +1768,9 @@ only when the cache confirms it is already present.
 `build --remote-exec URL --priority N` records a batch priority between 0 and
 2147483647 (default 0). The coordinator currently schedules batches by fair
 share regardless of the recorded priority. The option does not change cache
-keys. `--priority` requires `--remote-exec` and cannot change a batch followed
-with `--attach`.
+keys. `--priority` requires `--remote-exec`. With `--attach`, it applies to
+replacement batches needed for missing inputs; it does not change the batch
+being followed. The recovery hint retains a positive priority.
 
 `build --remote-exec URL` hands the theories the remote cache lacks, and
 that aren't already built here, to a remote-execution coordinator, which runs them on its workers with
