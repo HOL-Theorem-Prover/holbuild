@@ -164,12 +164,14 @@ fun wrap completed argv =
             "/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d", "/etc/localtime",
             "/etc/ssl/certs", "/etc/nsswitch.conf", "/etc/hosts", "/etc/resolv.conf", "/etc/gai.conf"] @
            poly_libraries @ fields "HOLBUILD_ACTION_READ_DIRS")
-        (* As configured: the helper also forbids each link on the way to it. *)
-        val cache = OS.Path.mkAbsolute {path = HolbuildCacheConfig.cache_root (), relativeTo = OS.FileSys.getDir ()}
+        (* As configured, not normalized: the helper also forbids each link on
+           the way, and resolves ".." after a link the way open does. *)
+        fun absolute path = if OS.Path.isAbsolute path then path else OS.FileSys.getDir () ^ "/" ^ path
+        val cache = absolute (HolbuildCacheConfig.cache_root ())
         val protected_paths =
           map (fn part => OS.Path.concat (cache, part))
               ["actions", "blobs", "locks", "cooperate", "checkpoint-store", "toolchain-trust", "git",
-               "hol-toolchains/.locks"] @
+               "hol-toolchains/.locks", "action.lock"] @
           List.mapPartial
             (fn entry =>
                 case String.fields (fn c => c = #"=") entry of
@@ -186,7 +188,7 @@ fun wrap completed argv =
           [HolbuildTempPath.private_temporary_dir ()]
         val forbidden = List.mapPartial
           (fn path => if path = "" then NONE else
-             SOME (OS.Path.mkAbsolute {path = path, relativeTo = OS.FileSys.getDir ()})) protected_paths
+             SOME (absolute path)) protected_paths
         fun options flag paths = List.concat (map (fn path => [flag, path]) paths)
       in
         ["python3", "-I", helper ()] @ options "--write" [full root, full checkpoints] @
