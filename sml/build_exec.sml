@@ -204,9 +204,6 @@ fun unique_by key values =
 
 fun unique_strings values = unique_by (fn value => value) values
 
-fun project_load_stems deps =
-  unique_strings (map load_stem (List.filter loadable_project_dep deps))
-
 fun theory_project_dep dep =
   #kind (HolbuildBuildPlan.source_of dep) = HolbuildSourceIndex.TheoryScript
 
@@ -317,11 +314,28 @@ fun project_preload_deps plan node =
     List.filter needed (HolbuildBuildPlan.direct_project_deps plan node)
   end
 
+(* A node's HOL loads and those of DEPS, in Holmake's load order, each
+   project object named by OBJECT. *)
+fun ordered_loads plan node object deps =
+  map #2
+    (HolbuildBuildPlan.sort_by_load_order #1
+       (map (fn name => (HolbuildBuildPlan.external_load_order name, LoadTheory name))
+            (HolbuildBuildPlan.direct_external_theories plan node) @
+        map (fn name => (HolbuildBuildPlan.external_load_order name, LoadLibrary name))
+            (HolbuildBuildPlan.direct_external_libs plan node) @
+        map (fn dep => (HolbuildBuildPlan.load_order plan dep, LoadObject (object dep)))
+            (List.filter loadable_project_dep deps)))
+
 fun preload_loads root plan node =
-  map LoadTheory (HolbuildBuildPlan.direct_external_theories plan node) @
-  map LoadLibrary (HolbuildBuildPlan.direct_external_libs plan node) @
-  map (fn dep => LoadObject (root_relative root (load_stem dep)))
-      (List.filter loadable_project_dep (project_preload_deps plan node))
+  ordered_loads plan node (fn dep => root_relative root (load_stem dep)) (project_preload_deps plan node)
+
+fun load_name (LoadTheory name) = name
+  | load_name (LoadLibrary name) = name
+  | load_name (LoadObject stem) = stem
+
+(* What an object manifest loads before the node's own source. *)
+fun manifest_loads plan node =
+  map load_name (ordered_loads plan node load_stem (HolbuildBuildPlan.direct_project_deps plan node))
 
 (* The deps heap keeps only the toolchain's load path, not the project's
    directories HOL put there: other trees of the project resume from it. *)
@@ -2405,14 +2419,12 @@ fun publish_theory_cache subject input_key proof_timeout staged_sig published_sm
     handle e => warn ("could not publish cache entry: " ^ General.exnMessage e)
   end
 
-(* A generated theory's parents and ML dependencies are names; a load stem
-   resolver maps the project's to their object stems, and the rest stay names
-   for HOL to find. *)
-fun plan_load_stem plan name = Option.map load_stem (HolbuildBuildPlan.node_named plan name)
-
-fun mldep_load_stem resolve dep = getOpt (resolve dep, dep)
-
-fun mldep_load_stems resolve mldeps = unique_strings (map (mldep_load_stem resolve) mldeps)
+(* A generated theory's parents and ML dependencies are names; a resolver
+   maps the project's to their object stems and load orders, and the rest stay
+   names for HOL to find in its sigobj. *)
+fun plan_load_stem plan name =
+  Option.map (fn node => (load_stem node, HolbuildBuildPlan.load_order plan node))
+             (HolbuildBuildPlan.node_named plan name)
 
 fun stable_generated_mldeps mldeps =
   List.filter (not o transient_stage_mldep) mldeps
@@ -2433,22 +2445,22 @@ fun read_generated_load_metadata {parents_report, mldeps_report} =
   {parents = read_name_report "parent" parents_report,
    mldeps = read_name_report "ML dependency" mldeps_report}
 
-fun parent_theory_load_stem resolve parent =
-  let val theory_name = parent ^ "Theory"
-  in getOpt (resolve theory_name, theory_name) end
-
-fun parent_load_stems resolve parents = unique_strings (map (parent_theory_load_stem resolve) parents)
-
 fun generated_theory_loads resolve {parents, mldeps} =
-  parent_load_stems resolve parents @
-  mldep_load_stems resolve (stable_generated_mldeps mldeps)
+  let
+    fun load name =
+      case resolve name of
+          SOME (stem, order) => (order, stem)
+        | NONE => (HolbuildBuildPlan.external_load_order name, name)
+    val names = map (fn parent => parent ^ "Theory") parents @ stable_generated_mldeps mldeps
+  in
+    map #2 (HolbuildBuildPlan.sort_by_load_order #1 (unique_by #2 (map load names)))
+  end
 
 fun write_local_theory_manifests plan node generated_metadata =
   let
     val {sig_path, sml_path, script_uo, theory_ui, theory_uo, ...} = theory_outputs node
-    val deps = HolbuildBuildPlan.direct_project_deps plan node
     val theory_loads = generated_theory_loads (plan_load_stem plan) generated_metadata
-    val script_loads = direct_external_loads plan node @ project_load_stems deps
+    val script_loads = manifest_loads plan node
   in
     write_object_manifest theory_ui [sig_path];
     write_object_manifest theory_uo (theory_loads @ [sml_path]);
@@ -2803,6 +2815,15 @@ fun runtime_identity () =
           identity
         end
 
+(* What a theory's preload loads, in order, named the same wherever the
+   project is checked out. *)
+fun preload_order_lines plan node =
+  map (fn LoadTheory name => "external_theory " ^ name
+        | LoadLibrary name => "external_lib " ^ name
+        | LoadObject name => "project_load " ^ name)
+      (ordered_loads plan node (fn dep => package dep ^ ":" ^ HolbuildBuildPlan.relative_path dep)
+                     (project_preload_deps plan node))
+
 (* The dependency context keyed on the dependencies' input keys.  Remote
    action specs and key dumps use this one: it is known before anything is
    built. *)
@@ -2820,18 +2841,14 @@ fun dependency_input_context_key toolchain_key plan keys node =
         SOME key => key
       | NONE =>
           let
-            val external_theories = HolbuildBuildPlan.direct_external_theories plan node
-            val external_libs = HolbuildBuildPlan.direct_external_libs plan node
-            val theory_lines = map (fn dep => "external_theory " ^ dep) external_theories
-            val lib_lines = map (fn dep => "external_lib " ^ dep) external_libs
             val key =
               HolbuildToolchain.hash_text
                 (String.concatWith "\n"
                    (* Local heaps contain the runtime, so they are keyed on it.
                       Artifact action keys don't depend on it. *)
-                   (["holbuild-dependency-context-v2",
+                   (["holbuild-dependency-context-v4",
                      "toolchain_key=" ^ toolchain_key,
-                     "runtime=" ^ runtime_identity ()] @ project_lines @ theory_lines @ lib_lines) ^ "\n")
+                     "runtime=" ^ runtime_identity ()] @ project_lines @ preload_order_lines plan node) ^ "\n")
           in
             HolbuildBuildPlan.remember_dependency_context_key plan node context_id key;
             key
@@ -3025,8 +3042,11 @@ fun bool_text true = "true"
    3: the hash literal in Theory.sml, which children record for the parent,
    is the digest of the .dat without its proof-dependent parts, not the
    file's SHA-1, so an entry from before disagrees with every child built
-   after. *)
-val theory_manifest_version = "3"
+   after.
+   4: a theory's generated .uo lists its parents and ML dependencies in
+   Holmake's load order, not parents by name and then ML dependencies, so a
+   dependent's entry from before was built loading them in another order. *)
+val theory_manifest_version = "4"
 
 (* Final theory artifacts are semantic products of source bytes, resolved deps,
    toolchain, and declared action policy. Execution strategy is deliberately not
@@ -3155,19 +3175,13 @@ fun dependency_context_key toolchain_key plan keys node =
               SOME key => key
             | NONE =>
                 let
-                  val theory_lines =
-                    map (fn dep => "external_theory " ^ dep)
-                        (HolbuildBuildPlan.direct_external_theories plan node)
-                  val lib_lines =
-                    map (fn dep => "external_lib " ^ dep)
-                        (HolbuildBuildPlan.direct_external_libs plan node)
                   val key =
                     HolbuildToolchain.hash_text
                       (String.concatWith "\n"
-                         (["holbuild-dependency-context-v3",
+                         (["holbuild-dependency-context-v5",
                            "toolchain_key=" ^ toolchain_key,
                            "runtime=" ^ runtime_identity (),
-                           "deps_output_key=" ^ outputs_key] @ theory_lines @ lib_lines) ^ "\n")
+                           "deps_output_key=" ^ outputs_key] @ preload_order_lines plan node) ^ "\n")
                 in
                   HolbuildBuildPlan.remember_dependency_context_key plan node context_id key;
                   key
@@ -3853,10 +3867,8 @@ fun write_empty_ui_if_needed plan node =
 fun build_sml_like plan node output_suffix =
   let
     val output = one_with_suffix output_suffix (#objects (source_artifacts node))
-    val deps = HolbuildBuildPlan.direct_project_deps plan node
-    val external_loads = direct_external_loads plan node
   in
-    write_object_manifest output (external_loads @ project_load_stems deps @ [source_file node]);
+    write_object_manifest output (manifest_loads plan node @ [source_file node]);
     if output_suffix = ".uo" then write_empty_ui_if_needed plan node else ()
   end
 
@@ -6297,10 +6309,10 @@ fun library_manifest root plan node =
         raise Error ("action-spec: " ^ context ^ " can't run remotely: it loads " ^ text ^ " by path")
       else spec_token context text
     fun rooted path = spec_token context (root_relative root path)
-    val deps = HolbuildBuildPlan.direct_project_deps plan node
+    fun load (LoadObject stem) = rooted stem
+      | load other = name (load_name other)
     val loads =
-      map name (direct_external_loads plan node) @
-      map rooted (project_load_stems deps) @
+      map load (ordered_loads plan node load_stem (HolbuildBuildPlan.direct_project_deps plan node)) @
       [spec_token context (library_source_path node)]
     fun line suffix loads =
       String.concatWith " "
@@ -6363,6 +6375,19 @@ fun dep_theory_line root keys token label dep =
     [label, token (package dep ^ ":" ^ logical_name dep),
      token (root_relative root (load_stem dep)), HolbuildBuildPlan.input_key_for keys dep]
 
+(* A dependency's load order, which a worker sorts restored manifests by;
+   "." stands for an empty package or directory. *)
+fun load_order_spec_line plan token dep =
+  let
+    val {tier, package, dir, ...} = HolbuildBuildPlan.load_order plan dep
+    fun field "" = "."
+      | field text = token text
+  in
+    String.concatWith " "
+      ["order", token (HolbuildBuildPlan.package dep ^ ":" ^ logical_name dep), Int.toString tier,
+       field package, field dir]
+  end
+
 fun theory_load_spec_line token (LoadTheory name) = "load theory " ^ token name
   | theory_load_spec_line token (LoadLibrary name) = "load library " ^ token name
   | theory_load_spec_line token (LoadObject stem) = "load object " ^ token stem
@@ -6385,8 +6410,13 @@ fun dependency_spec_lines hash_file root plan keys token deps =
       end
   in
     {library_lines = map library_line libraries,
-     dep_lines = map (dep_theory_line root keys token "dep theory") theory_deps,
-     lib_lines = List.concat (map (library_manifest root plan) libraries),
+     dep_lines =
+       List.concat
+         (map (fn dep => [dep_theory_line root keys token "dep theory" dep, load_order_spec_line plan token dep])
+              theory_deps),
+     lib_lines =
+       List.concat (map (library_manifest root plan) libraries) @
+       map (load_order_spec_line plan token) libraries,
      library_files = map source_file libraries}
   end
 
@@ -7061,7 +7091,8 @@ fun plan_runs tc project planned jobs
                     in
                       (dep_theory_line root keys token "context" node,
                        {library_lines = #library_lines context_lines @ #library_lines extra_lines,
-                        dep_lines = #dep_lines context_lines @ #dep_lines extra_lines,
+                        dep_lines = #dep_lines context_lines @ #dep_lines extra_lines @
+                                    [load_order_spec_line plan token node],
                         lib_lines = #lib_lines context_lines @ #lib_lines extra_lines,
                         library_files = #library_files context_lines @ #library_files extra_lines},
                        map (theory_load_spec_line token) (#loads action),
@@ -7310,6 +7341,7 @@ type action_spec =
    inputs : spec_file list, libraries : spec_file list,
    deps : {target : string, stem : string, key : string} list,
    libs : {target : string, stem : string, suffix : string, loads : string list} list,
+   orders : {target : string, order : HolbuildBuildPlan.load_order} list,
    loads : theory_load list,
    outputs : {sig_path : string, sml_path : string, data_path : string},
    extra_outputs : string list,
@@ -7343,6 +7375,18 @@ fun spec_toolchain line (git, rev, kernel) =
       (("git", g), ("rev", r), ("kernel", k)) => {git = g, rev = r, kernel = k}
     | _ => reject_spec ("malformed toolchain line: " ^ line)
 
+fun spec_load_order text (tier, package, dir) =
+  let fun field "." = "" | field value = value
+  in
+    case Int.fromString tier of
+        SOME n =>
+          if n >= 0 andalso Int.toString n = tier then
+            {target = text, order = {tier = n, package = field package, dir = field dir,
+                                     file = #2 (target_name text)}}
+          else reject_spec ("malformed load order tier: " ^ tier)
+      | NONE => reject_spec ("malformed load order tier: " ^ tier)
+  end
+
 fun spec_bool name text =
   case text of "true" => true | "false" => false
      | _ => reject_spec ("option " ^ name ^ " is not a boolean: " ^ text)
@@ -7364,6 +7408,7 @@ fun parse_action_spec text : action_spec =
     val libraries = ref []
     val deps = ref []
     val libs = ref []
+    val orders = ref []
     val loads = ref []
     val outputs = ref ([] : (string * string) list)
     val extra_outputs = ref []
@@ -7380,6 +7425,7 @@ fun parse_action_spec text : action_spec =
         | ["dep", "theory", t, stem, key] => push deps {target = t, stem = stem, key = key}
         | "lib" :: t :: stem :: suffix :: lib_loads =>
             push libs {target = t, stem = stem, suffix = suffix, loads = lib_loads}
+        | ["order", t, tier, package, dir] => push orders (spec_load_order t (tier, package, dir))
         | ["load", "theory", name] => push loads (LoadTheory name)
         | ["load", "library", name] => push loads (LoadLibrary name)
         | ["load", "object", stem] => push loads (LoadObject stem)
@@ -7413,7 +7459,7 @@ fun parse_action_spec text : action_spec =
      input_key = value "input-key", action_text_sha256 = value "action-text-sha256",
      deps_key = value "deps-key", package = package, logical = logical,
      source = source_file, inputs = rev (!inputs), libraries = rev (!libraries),
-     deps = rev (!deps), libs = rev (!libs), loads = rev (!loads),
+     deps = rev (!deps), libs = rev (!libs), orders = rev (!orders), loads = rev (!loads),
      outputs = {sig_path = output "sig", sml_path = output "sml", data_path = output "dat"},
      extra_outputs = rev (!extra_outputs),
      proof_steps = spec_bool "proof-steps" (value "option proof-steps"),
@@ -7548,10 +7594,11 @@ fun action_source_path package path =
 type spec_deps =
   {libraries : spec_file list,
    deps : {target : string, stem : string, key : string} list,
-   libs : {target : string, stem : string, suffix : string, loads : string list} list}
+   libs : {target : string, stem : string, suffix : string, loads : string list} list,
+   orders : {target : string, order : HolbuildBuildPlan.load_order} list}
 
 fun theory_spec_deps (spec : action_spec) : spec_deps =
-  {libraries = #libraries spec, deps = #deps spec, libs = #libs spec}
+  {libraries = #libraries spec, deps = #deps spec, libs = #libs spec, orders = #orders spec}
 
 fun spec_load_stems (spec : spec_deps) =
   let
@@ -7651,7 +7698,12 @@ fun restore_spec_theory root (spec : spec_deps) {key, subject, stem, extra_outpu
          expected_extra_outputs = extra_outputs,
          requested_timeout = requested_timeout, require_trace = false}
     val stems = spec_load_stems spec
-    fun resolve name = Option.map (fn (_, s) => in_root root s) (List.find (fn (n, _) => n = name) stems)
+    fun order name =
+      case List.find (fn {target, ...} => #2 (target_name target) = name) (#orders spec) of
+          SOME {order, ...} => order
+        | NONE => reject_spec ("spec has no load order for " ^ name)
+    fun resolve name =
+      Option.map (fn (_, s) => (in_root root s, order name)) (List.find (fn (n, _) => n = name) stems)
     val stem_path = in_root root stem
     val sig_path = stem_path ^ ".sig"
     val sml_path = stem_path ^ ".sml"
@@ -8792,7 +8844,7 @@ fun spec_early_cutoff root (spec : action_spec) : early_cutoff option =
           deps_key =
             HolbuildHash.string_sha256
               (String.concatWith "\n"
-                 (["holbuild-remote-dependency-context-v1",
+                 (["holbuild-remote-dependency-context-v2",
                    "toolchain=" ^ action_text_value spec "toolchain",
                    "deps-output=" ^ deps_output_key] @ dep_lines) ^ "\n")}
   end
@@ -8885,6 +8937,7 @@ fun parse_run_spec text : run_spec =
     val libraries = ref []
     val deps = ref []
     val libs = ref []
+    val orders = ref []
     val context_scripts = ref []
     val inputs = ref []
     val supports = ref []
@@ -8905,6 +8958,7 @@ fun parse_run_spec text : run_spec =
         | ["dep", "theory", t, stem, key] => push deps {target = t, stem = stem, key = key}
         | "lib" :: t :: stem :: suffix :: lib_loads =>
             push libs {target = t, stem = stem, suffix = suffix, loads = lib_loads}
+        | ["order", t, tier, package, dir] => push orders (spec_load_order t (tier, package, dir))
         (* The context theory's own preload: the script loads the context. *)
         | ["load", kind, _] =>
             if List.exists (fn k => k = kind) ["theory", "library", "object"] then ()
@@ -8937,7 +8991,7 @@ fun parse_run_spec text : run_spec =
     {version = value "holbuild-version", runtime = value "holbuild-runtime",
      toolchain = (case !toolchain of SOME t => t | NONE => reject_spec "spec has no toolchain"),
      run_key = value "run-key", context = context, context_theory = context_theory,
-     deps = {libraries = rev (!libraries), deps = rev (!deps), libs = rev (!libs)},
+     deps = {libraries = rev (!libraries), deps = rev (!deps), libs = rev (!libs), orders = rev (!orders)},
      context_scripts = rev (!context_scripts), inputs = rev (!inputs),
      script = (case !script of SOME s => s | NONE => reject_spec "spec has no script"),
      supports = rev (!supports), run_loads = rev (!run_loads), outputs = rev (!outputs),
@@ -8950,9 +9004,9 @@ val run_script_name = "holbuild-run-script.sml"
 
 (* The theories a run restores: its dependencies and a project context. *)
 fun run_spec_deps (spec : run_spec) : spec_deps =
-  let val {libraries, deps, libs} = #deps spec
+  let val {libraries, deps, libs, orders} = #deps spec
   in
-    {libraries = libraries, libs = libs,
+    {libraries = libraries, libs = libs, orders = orders,
      deps = deps @ (case #context_theory spec of SOME theory => [theory] | NONE => [])}
   end
 
@@ -8972,7 +9026,7 @@ fun verify_run_spec (spec : run_spec) =
     fun check ok msg = if ok then () else reject_spec msg
     val text_values = text_values (#run_text spec)
     val single = run_text_value spec
-    val {libraries, deps, libs} = #deps spec
+    val {libraries, deps, libs, ...} = #deps spec
     fun valid_output name = (ignore (output_name name); true) handle Error _ => false
     fun run_load_ok name =
       if String.isPrefix "HOLLIB:" name then
