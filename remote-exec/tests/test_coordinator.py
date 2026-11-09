@@ -1000,6 +1000,40 @@ async def test_final_failures_fail_the_batch_and_cancel_the_rest(http: httpx.Asy
     assert (await http.post(f"/v1/work/{token_b}/heartbeat", headers=WORKER)).status_code == 409
 
 
+@pytest.mark.parametrize("skipped_child", [False, True])
+async def test_rollback_finishes_an_existing_keep_going_failure(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, skipped_child: bool
+) -> None:
+    names = ["a", "b", "c"] if skipped_child else ["a", "b"]
+    batch_id = await submit(http, names, [("c", "a")] if skipped_child else [])
+    token = await claim_named(http, "a")
+    # Recreate the persisted state of a keep-going batch before the rollback.
+    async with coordinator.engine.begin() as conn:
+        await conn.execute(
+            sa.text(
+                "UPDATE actions SET state = 'failed', last_failure = 'proof' "
+                "WHERE batch_id = :id AND input_key = :key"
+            ),
+            {"id": UUID(batch_id), "key": input_key("a")},
+        )
+        await conn.execute(sa.text("DELETE FROM leases WHERE attempt_token = :token"), {"token": UUID(token)})
+        if skipped_child:
+            await conn.execute(
+                sa.text(
+                    "UPDATE actions SET state = 'cancelled', last_failure = 'skipped because of pkg:a' "
+                    "WHERE batch_id = :id AND input_key = :key"
+                ),
+                {"id": UUID(batch_id), "key": input_key("c")},
+            )
+    await build(http, cache, "b")
+    status = await batch(http, batch_id)
+    assert (status["state"], status["failure"]) == ("failed", "pkg:a: proof")
+    expected = {"a": "failed", "b": "done"}
+    if skipped_child:
+        expected["c"] = "cancelled"
+    assert await states(http, batch_id) == expected
+
+
 async def test_a_final_failure_without_a_log_gives_its_detail_in_the_batch_failure(http: httpx.AsyncClient) -> None:
     batch_id = await submit(http, ["a"])
     token = await claim_named(http, "a")

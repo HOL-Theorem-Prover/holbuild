@@ -779,3 +779,8 @@ This service revision restores fail-fast build batches while retaining migration
 revision remains in the migration history so startup can recognize databases
 that already applied it. New clients continue to follow the existing action
 and batch states; their `fail_fast` query parameter is ignored by this service.
+
+Batches already running when this revision starts retain their failed and
+skipped action records. Once their remaining actions finish, terminal-state
+aggregation reports those failures instead of leaving the batch running or
+marking it successful. New build-action failures stop their batch immediately.

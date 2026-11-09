@@ -1392,8 +1392,13 @@ class Coordinator:
     async def _finish_if_done(self, conn: AsyncConnection, batch_id: UUID) -> None:
         await conn.execute(
             sa.text(
-                "UPDATE batches SET state = 'done' WHERE id = :id AND NOT EXISTS "
-                "(SELECT 1 FROM actions WHERE batch_id = :id AND state NOT IN ('done', 'failed'))"
+                "UPDATE batches SET (state, failure) = (SELECT "
+                "CASE WHEN count(*) = 0 THEN 'done' ELSE 'failed' END, "
+                "string_agg(theory || ': ' || COALESCE(last_failure, 'internal') || "
+                "COALESCE(': ' || failure_detail, ''), '; ' ORDER BY theory, input_key) "
+                "FROM actions WHERE batch_id = :id AND class = 'build' AND state = 'failed') "
+                "WHERE id = :id AND state = 'running' AND NOT EXISTS "
+                "(SELECT 1 FROM actions WHERE batch_id = :id AND state IN ('waiting', 'ready', 'running'))"
             ),
             {"id": batch_id},
         )
