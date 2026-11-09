@@ -305,6 +305,7 @@ holbuild context --trknl
 holbuild execution-plan MyTheory:my_theorem
 holbuild check MyTheory OtherTheory:my_theorem
 holbuild check --fingerprint MyTheory OtherTheory
+holbuild check --with-fingerprints MyTheory:my_theorem
 holbuild buildhol
 holbuild buildhol --trknl
 holbuild build --trknl MyTheory
@@ -537,6 +538,11 @@ fingerprint	DepTheory	axiom	my_axiom	9a02…(64 hex digits)	-
 fingerprint	MyTheory	theorem	my_theorem	3f1c…	-
 fingerprint	MyTheory	theorem	other_theorem	77d0…	cheat
 ```
+
+`holbuild check --with-fingerprints MyTheory:my_theorem` does both in one HOL
+session: it checks the selectors as plain `check` does and prints the
+fingerprint lines of their theories, and exits with the check's status. A
+tool that wants both pays for one theory load instead of two.
 
 Build progress and HOL's own messages share stdout, so keep the lines that
 start with `fingerprint` and a tab (`grep '^fingerprint'`). After that column

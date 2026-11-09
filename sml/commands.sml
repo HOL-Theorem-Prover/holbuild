@@ -185,7 +185,8 @@ fun execution_plan_help () = print
 fun check_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] check THEORY[:THEOREM] [THEORY[:THEOREM] ...] [--remote-exec URL [--remote-only]]\n\
-  \  holbuild [GLOBAL OPTIONS] check --fingerprint THEORY [THEORY ...] [--remote-exec URL [--remote-only]]\n\n\
+  \  holbuild [GLOBAL OPTIONS] check --fingerprint THEORY [THEORY ...] [--remote-exec URL [--remote-only]]\n\
+  \  holbuild [GLOBAL OPTIONS] check --with-fingerprints THEORY[:THEOREM] [...] [--remote-exec URL [--remote-only]]\n\n\
   \Build THEORY if needed, load it in HOL and check the tags and hypotheses of its stored\n\
   \theorems, or of THEOREM alone. Prints one line per theorem that depends on an\n\
   \oracle other than DISK_THM (cheat, for instance), per theorem with\n\
@@ -204,6 +205,9 @@ fun check_help () = print
   \ORACLES lists the oracles other than DISK_THM, comma-separated, or is -.\n\
   \A script computes the same fingerprint with HolbuildFingerprint.thm or\n\
   \HolbuildFingerprint.term.\n\n\
+  \With --with-fingerprints, check the selectors and also print the fingerprint\n\
+  \lines of their theories, in the same HOL session; the exit status is the\n\
+  \check's.\n\n\
   \The build runs without proof steps or checkpoints, so it reuses theories\n\
   \built by build --skip-proof-steps and applies no step timeout. With\n\
   \--remote-exec URL [--remote-only], uncached theories are built on the\n\
@@ -3038,7 +3042,9 @@ fun run_check_script tc cli_jobs build_mode theories make_script =
     if HolbuildToolchain.success status then () else OS.Process.exit OS.Process.failure
   end
 
-fun check_selectors tc cli_jobs build_mode selectors =
+(* with_fingerprints also prints the fingerprint listing of the selected
+   theories, in the same HOL session, before the exit status is decided. *)
+fun check_selectors tc cli_jobs build_mode {with_fingerprints} selectors =
   let
     val selections = map parse_check_selector selectors
     fun make_script {project, index, components, logical_names} =
@@ -3052,6 +3058,7 @@ fun check_selectors tc cli_jobs build_mode selectors =
       in
         "local val HolbuildCheckFailed = ref false in\n" ^
         String.concat (ListPair.mapEq block (logical_names, selections)) ^
+        (if with_fingerprints then fingerprint_script logical_names else "") ^
         "val _ = if !HolbuildCheckFailed then OS.Process.exit OS.Process.failure else ();\nend;\n"
       end
   in
@@ -3071,7 +3078,11 @@ fun check_fingerprint tc cli_jobs build_mode selectors =
 fun check_command tc cli_jobs args =
   let
     val ({url, remote_only}, args) = split_remote_prebuild_flags "check" args
-    val selectors = case args of "--fingerprint" :: rest => rest | _ => args
+    val selectors =
+      case args of
+          "--fingerprint" :: rest => rest
+        | "--with-fingerprints" :: rest => rest
+        | _ => args
     val _ =
       case List.find (String.isPrefix "-") selectors of
           SOME flag => raise Error ("unknown check option: " ^ flag)
@@ -3085,7 +3096,10 @@ fun check_command tc cli_jobs args =
         "--fingerprint" :: (theories as _ :: _) => check_fingerprint tc cli_jobs build_mode theories
       | [] => raise Error "usage: holbuild check THEORY[:THEOREM] [THEORY[:THEOREM] ...] | check --fingerprint THEORY [THEORY ...]"
       | ["--fingerprint"] => raise Error "check --fingerprint requires at least one theory"
-      | selectors => check_selectors tc cli_jobs build_mode selectors
+      | "--with-fingerprints" :: (selectors as _ :: _) =>
+          check_selectors tc cli_jobs build_mode {with_fingerprints = true} selectors
+      | ["--with-fingerprints"] => raise Error "check --with-fingerprints requires at least one selector"
+      | selectors => check_selectors tc cli_jobs build_mode {with_fingerprints = false} selectors
   end
 
 fun removed_legacy_plan_command _ _ =
