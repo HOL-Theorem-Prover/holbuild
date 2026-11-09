@@ -740,7 +740,7 @@ def test_ecs_task_protection_is_set_and_cleared(server: Server) -> None:
     protection.set(enabled=True)
     protection.set(enabled=False)
 
-    assert server.protection == [{"ProtectionEnabled": True, "ExpiresInMinutes": 10}, {"ProtectionEnabled": False}]
+    assert server.protection == [{"ProtectionEnabled": True, "ExpiresInMinutes": 180}, {"ProtectionEnabled": False}]
 
 
 def test_also_claim_accepts_repeats_and_commas(tmp_path: Path, server: Server) -> None:

@@ -499,8 +499,12 @@ action. With `--protection-cmd COMMAND`, the worker runs `COMMAND on` when it
 takes an action and on each heartbeat, and `COMMAND off` when the action ends.
 Without it, when `ECS_AGENT_URI` is set (as on Amazon ECS), it sets the task's
 scale-in protection through the agent's `task-protection/v1/state` endpoint,
-for 10 minutes at a time, so a worker that dies loses it. Failures are logged
-and the action carries on.
+for 180 minutes at a time. ECS refuses to renew protection with
+`DEPLOYMENT_BLOCKED` while a scale-in or rolling deployment wants the task
+gone, so the window set when the action is claimed has to outlast the longest
+action. The worker clears protection when the action ends or loses its lease,
+and a worker that dies takes its task down with it. Failures are logged and
+the action carries on.
 
 ## Wire format
 
