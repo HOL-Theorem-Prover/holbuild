@@ -456,7 +456,9 @@ require_grep '^failure=unavailable$' "$tmpdir/interrupted.result"
 sed -i 's/OS.Process.sleep (Time.fromSeconds 120)/()/' "$project/src/InterruptedScript.sml"
 (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$shared_url" action-spec --upload ConsumerTheory) > "$tmpdir/resume.batch"
 spec_interrupt=$(field "$tmpdir/resume.batch" share:InterruptedTheory 4)
-worker interrupted-resume "$shared_url" "$tmpdir/worker-resumed" "$spec_interrupt" --share-heaps
+# A replacement worker uses the same canonical paths but has no local store.
+rm -rf "$interrupted/checkpoint-store"
+worker interrupted-resume "$shared_url" "$interrupted" "$spec_interrupt" --share-heaps
 expect interrupted-resume 0 "status=built"
 require_grep 'restored shared .* checkpoint' "$tmpdir/interrupted-resume.log"
 require_grep 'checkpoint after completed' "$tmpdir/interrupted-resume.log"
