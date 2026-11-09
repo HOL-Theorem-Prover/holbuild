@@ -244,6 +244,12 @@ def sanitized_environment(home: Path) -> dict[str, str]:
         if key in {"PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR"}
         or key.startswith("HOLBUILD_RUN_")
     }
+    if sys.prefix != sys.base_prefix and "PATH" in env:
+        venv_bin = os.path.realpath(os.path.join(sys.prefix, "bin"))
+        env["PATH"] = os.pathsep.join(
+            directory for directory in env["PATH"].split(os.pathsep)
+            if not directory or os.path.realpath(directory) != venv_bin
+        )
     env.update(HOME=str(home), TMPDIR=str(home / "tmp"))
     return env
 

@@ -7934,8 +7934,8 @@ end
 
 fun peak_rss_mb stage =
   (case String.tokens Char.isSpace (read_text (Path.concat(stage, peak_rss_report_name))) of
-       ["VmHWM:", kb, "kB"] => Option.map (fn n => n div 1024) (Int.fromString kb)
-     | _ => NONE)
+      ["VmHWM:", kb, "kB"] => Option.map (fn n => n div 1024) (Int.fromString kb)
+    | _ => NONE)
   handle _ => NONE
 
 (* The child's own report of a full disk; a checkpoint write that failed

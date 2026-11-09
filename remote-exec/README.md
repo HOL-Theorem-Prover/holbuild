@@ -217,7 +217,11 @@ cache files are copied into these directories. The directories are removed
 after the action, including when shared heaps are disabled. Worker-private
 checkpoint and compiled-module state is not retained across actions. The child receives
 no cache credentials, worker token, inherited lease descriptors or Linux
-capabilities. It may also write `/tmp`, where Poly/ML creates temporary files
+capabilities. Its `PATH` excludes the worker Python virtualenv's `bin`
+directory, including directory aliases, so `python3` can use the system
+installation while the worker virtualenv stays inaccessible. Other `PATH`
+entries are preserved and remain subject to the filesystem read policy.
+It may also write `/tmp`, where Poly/ML creates temporary files
 whatever `TMPDIR` says (HOL's SAT and SMT interfaces use them), unless
 protected worker state lies beneath it, holbuild's own temporary files
 under `TMPDIR` included; the image therefore sets `TMPDIR` to `/var/tmp` so

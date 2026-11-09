@@ -88,6 +88,25 @@ Proof
   ACCEPT_TAC b_thm
 QED
 SML
+cat > "$project/src/MissingRssScript.sml" <<'SML'
+Theory MissingRss
+Ancestors bool
+
+Theorem checked: T
+Proof
+  simp[]
+QED
+
+(* The exporter tolerates unavailable process status, so its report is optional. *)
+structure TextIO = struct
+  open TextIO
+  fun openIn path =
+    if path = "/proc/self/status" then
+      raise IO.Io {name = path, function = "openIn",
+                   cause = OS.SysErr ("process status unavailable", SOME Posix.Error.acces)}
+    else TextIO.openIn path
+end
+SML
 
 hb() {
   (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" "$@")
@@ -131,12 +150,13 @@ expect() {
 spec_for() { awk -v want="$2" '$1 == "action" && $5 == want { print $4 }' "$1"; }
 key_for() { awk -v want="$2" '$1 == "action" && $5 == want { print $2 }' "$1"; }
 
-hb action-spec --upload --all-checkpoints CTheory > "$tmpdir/batch.txt"
+hb action-spec --upload --all-checkpoints CTheory MissingRssTheory > "$tmpdir/batch.txt"
 spec_a=$(spec_for "$tmpdir/batch.txt" worker:ATheory)
 spec_b=$(spec_for "$tmpdir/batch.txt" worker:BTheory)
 spec_c=$(spec_for "$tmpdir/batch.txt" worker:CTheory)
+spec_missing_rss=$(spec_for "$tmpdir/batch.txt" worker:MissingRssTheory)
 key_a=$(key_for "$tmpdir/batch.txt" worker:ATheory)
-[[ -n "$spec_a" && -n "$spec_b" && -n "$spec_c" ]] || { cat "$tmpdir/batch.txt" >&2; exit 1; }
+[[ -n "$spec_a" && -n "$spec_b" && -n "$spec_c" && -n "$spec_missing_rss" ]] || { cat "$tmpdir/batch.txt" >&2; exit 1; }
 
 # A theory whose parent isn't in the cache yet fails without building it.
 worker early "$spec_c"
@@ -281,6 +301,14 @@ require_grep '^log=[0-9a-f]\{64\} [0-9][0-9]*$' "$built"
 log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$built")
 curl -fsS "$remote_url/cas/$log_sha" > "$tmpdir/a-build.log"
 [[ -s "$tmpdir/a-build.log" ]] || { echo "the uploaded log is empty" >&2; exit 1; }
+
+# A subdirectory theory still publishes when the exporter could not record RSS.
+worker missing-rss "$spec_missing_rss"
+expect missing-rss 0 "status=built"
+if grep -q '^peak-rss-mb=' "$tmpdir/missing-rss.result"; then
+  echo 'unavailable process status produced a peak RSS report' >&2
+  exit 1
+fi
 
 # Rerunning a done action reports it cached.
 worker again "$spec_a"
