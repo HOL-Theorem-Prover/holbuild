@@ -1630,6 +1630,9 @@ require_grep 'holbuild: remote rxlocalcas:LocalUntrustedTheory: failed (spec-rej
   "$tmpdir/local-cas-untrusted.log"
 
 
+# The missing-input replay below needs the worker's normal resubmit signal.
+rm "$state/keep-going"
+
 # Batch priority is scheduling metadata; it reaches submit together with the other batch options.
 cat > "$tmpdir/local-cas/src/PriorityScript.sml" <<'SML'
 Theory Priority
