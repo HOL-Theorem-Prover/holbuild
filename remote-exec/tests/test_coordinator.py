@@ -1867,24 +1867,23 @@ async def test_submit_rejects_invalid_heap_limit(http: httpx.AsyncClient, value:
     assert await claim(http) is None
 
 
-async def test_priority_precedes_batch_fair_share_and_preserves_equal_priority_turns(http: httpx.AsyncClient) -> None:
+async def test_priorities_are_recorded_without_overriding_batch_fair_share(http: httpx.AsyncClient) -> None:
     await submit(http, ["normal"])
     await submit(http, ["p11", "p12", "p13"], priority="1")
     await submit(http, ["p21", "p22"], priority="1")
+    await claim_named(http, "normal")
     await claim_named(http, "p11")
     await claim_named(http, "p21")
     await claim_named(http, "p12")
     await claim_named(http, "p22")
-    # Priority still wins with three running actions, ahead of a normal batch with none.
     await claim_named(http, "p13")
-    await claim_named(http, "normal")
 
 
 async def test_normal_build_progresses_while_priority_chain_waits_for_its_parent(http: httpx.AsyncClient) -> None:
     await submit(http, ["normal1", "normal2"])
     await submit(http, ["parent", "child"], [("child", "parent")], priority="1")
-    await claim_named(http, "parent")
     await claim_named(http, "normal1")
+    await claim_named(http, "parent")
     await claim_named(http, "normal2")
     assert await claim(http) is None
 
@@ -1926,7 +1925,8 @@ async def test_invalid_priority_is_rejected(http: httpx.AsyncClient, value: str)
 async def test_queue_reports_priority_subsets_without_double_counting(http: httpx.AsyncClient) -> None:
     await submit(http, ["normal"])
     await submit(http, ["p1", "p2", "child"], [("child", "p1")], priority="1")
+    await claim_named(http, "normal")
     await claim_named(http, "p1")
     queue = (await http.get("/v1/queue", headers=CLIENT)).json()
     assert (queue["ready_priority"], queue["running_priority"]) == (1, 1)
-    assert (queue["ready_standard"], queue["running_standard"], queue["waiting"]) == (2, 1, 1)
+    assert (queue["ready_standard"], queue["running_standard"], queue["waiting"]) == (1, 2, 1)

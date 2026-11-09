@@ -383,7 +383,6 @@ AND (a.class = 'build' OR (SELECT available FROM run_capacity))
 ORDER BY
     a.class,
     array_position(CAST(:tiers AS text[]), a.tier),
-    b.priority DESC,
     b.running_count,
     b.last_claimed_at NULLS FIRST,
     b.created_at,

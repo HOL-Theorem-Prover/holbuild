@@ -1713,13 +1713,11 @@ upload that fails, the rest are skipped and the build falls back (below).
 Before compressing and uploading a file, it checks the CAS and skips the file
 only when the cache confirms it is already present.
 
-`build --remote-exec URL --priority N` assigns a batch scheduling priority
-between 0 and 2147483647 (default 0). Higher values are claimed before lower
-values within the same action class and worker memory tier; equal priorities
-share workers fairly. Priority does not preempt running actions or change cache
-keys. Use it for a limited number of finite builds: continuously ready higher
-priority work can delay lower priority batches. `--priority` requires
-`--remote-exec` and cannot change a batch followed with `--attach`.
+`build --remote-exec URL --priority N` records a batch priority between 0 and
+2147483647 (default 0). The coordinator currently schedules batches by fair
+share regardless of the recorded priority. The option does not change cache
+keys. `--priority` requires `--remote-exec` and cannot change a batch followed
+with `--attach`.
 
 `build --remote-exec URL` hands the theories the remote cache lacks, and
 that aren't already built here, to a remote-execution coordinator, which runs them on its workers with

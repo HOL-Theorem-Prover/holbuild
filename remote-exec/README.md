@@ -393,11 +393,11 @@ a run batch and cancels its unfinished actions.
   to restore strict build priority. Claims select with `FOR UPDATE SKIP LOCKED`,
   write a lease with an expiry and commit; no transaction stays open while
   the worker builds. Among running batches of the selected class and tier,
-  the claim picks the highest scheduling priority first, then the fewest running actions among
-  equal priorities, then the one that least recently had an action
-  claimed (one that never had goes first), then the oldest: a new batch gets
-  the next free worker among equal-priority batches even while a wide one holds
-  the rest, and those batches take turns when there are more of them than workers. Within the batch, it
+  the claim picks the fewest running actions, then the one that least
+  recently had an action claimed (one that never had goes first), then the
+  oldest. Recorded batch priorities do not affect claim order. A new batch
+  gets the next free worker even while a wide one holds the rest, and batches
+  take turns when there are more of them than workers. Within the batch, it
   picks the action with the longest chain of dependents in the batch, then
   the one with the most dependents, then by theory name, so the critical
   path starts first and the ready frontier widens fastest. An expired lease returns the
@@ -676,9 +676,7 @@ scheduling metadata; action inputs, outputs and leases are unchanged.
 `GET /v1/queue` includes `ready_priority` and `running_priority`: subsets of
 the tier counts for actions whose batch has a positive priority. Do not add
 these subsets to the tier totals. Priority does not change burst demand.
-Strict priority suits occasional finite batches; there is no aging or reserved
-normal share. Normal work can use workers for which no priority action is ready,
-including while a priority batch waits on dependencies.
+Positive priorities remain visible in queue subsets but do not affect claim order.
 
 ## Tests
 
