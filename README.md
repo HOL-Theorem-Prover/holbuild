@@ -1771,7 +1771,9 @@ values within the same action class and worker memory tier; equal priorities
 share workers fairly. Priority does not preempt running actions or change cache
 keys. Use it for a limited number of finite builds: continuously ready higher
 priority work can delay lower priority batches. `--priority` requires
-`--remote-exec` and cannot change a batch followed with `--attach`.
+`--remote-exec`. With `--attach`, it applies to any replacement batch needed
+for missing inputs; it does not change the batch being followed. Retain the
+same priority when reattaching; the recovery hint includes it.
 
 `build --remote-exec URL` hands the theories the remote cache lacks, and
 that aren't already built here, to a remote-execution coordinator, which runs them on its workers with

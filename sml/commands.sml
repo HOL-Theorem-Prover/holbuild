@@ -1811,7 +1811,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     abandon batch_id ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress)
                 | ((HolbuildRemoteExec.Unreachable reason, progress), _) =>
                     if remote_only
-                    then fall_back (reason ^ "; " ^ finished progress ^ "; reattach with --attach " ^ batch_id)
+                    then fall_back (reason ^ "; " ^ finished progress ^ "; reattach with --attach " ^ batch_id ^
+                                    (if priority = 0 then "" else " --priority " ^ Int.toString priority))
                     else abandon batch_id (reason ^ "; " ^ finished progress)
             and submit resubmit batch =
               if null (batch_keys batch) then
@@ -2167,8 +2168,6 @@ fun build tc cli_jobs args =
         raise Error "--watch does not support --repl-on-failure"
       else if Option.isSome batch_priority andalso not (Option.isSome url) then
         raise Error "--priority needs --remote-exec URL"
-      else if Option.isSome batch_priority andalso Option.isSome attach then
-        raise Error "--priority cannot change an attached batch"
       else if not (Option.isSome url) andalso (remote_only orelse detach orelse Option.isSome attach) then
         raise Error "--remote-only, --detach and --attach need --remote-exec URL"
       else if Option.isSome url andalso
