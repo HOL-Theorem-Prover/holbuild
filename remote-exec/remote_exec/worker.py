@@ -10,7 +10,9 @@ Each action runs on the holbuild release that exported it, which the worker buil
 
 import argparse
 import contextlib
+import ctypes
 import fcntl
+import functools
 import http.client
 import itertools
 import json
@@ -40,12 +42,31 @@ from remote_exec.membership import REFRESH_SECONDS, Membership, check_plain_http
 DEFAULT_SOURCE_URL = "https://github.com/HOL-Theorem-Prover/holbuild/archive/refs/tags/v{version}.tar.gz"
 RELEASE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 COMPLETE = ".complete"  # stamp file of a finished release build
-# ECS task scale-in protection lasts this long unless a heartbeat renews it, so a dead worker loses it.
-PROTECTION_MINUTES = 10
+MIN_SANDBOX_RELEASE = (0, 13, 58)
+
+
+@functools.cache
+def check_sandbox(executable: str) -> None:
+    """Fail closed before a release can execute submitted code."""
+    subprocess.run([executable, "sandbox-check"], check=True, stdin=subprocess.DEVNULL, timeout=30)
+
+
+# How long each ECS scale-in protection call protects the task. ECS refuses renewals with DEPLOYMENT_BLOCKED once a
+# service has more protected tasks than it wants (a scale-in or a rolling deployment), so the window set when the
+# action was claimed must outlast the longest action. A dead worker still loses it: its container is the task's
+# essential one, so the task stops with it, and the worker clears protection when an action ends or loses its lease.
+PROTECTION_MINUTES = 180
 CLAIM_RETRY_SECONDS = 5  # least time between two claims that found nothing
-# What exec-action runs with besides holbuild's own HOLBUILD_* settings: what curl, git and the locale read. The rest
-# of the worker's environment, its coordinator token above all, stays out of the builds' environment.
-EXEC_ACTION_ENV = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR")
+# What exec-action runs with besides holbuild's own HOLBUILD_* settings: what curl, git and the locale read, and where
+# HOL's libraries find external solvers (the action sandbox passes the same SOLVER_ENV on to HOL). The rest of the
+# worker's environment, its coordinator token above all, stays out of the builds' environment.
+SOLVER_ENV = (
+    "HOL4_Z3_EXECUTABLE", "HOL4_CVC_EXECUTABLE", "HOL4_CSDP_EXECUTABLE", "HOL4_EPROVER_EXECUTABLE",
+    "HOL4_VAMPIRE_EXECUTABLE", "HOL4_ZIPPERPOSITION_EXECUTABLE", "HOL4_JAVA_EXECUTABLE",
+)
+EXEC_ACTION_ENV = (
+    "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR", *SOLVER_ENV
+)
 PROXY_ENV = ("http_proxy", "https_proxy", "all_proxy", "no_proxy")  # in either case
 # holbuild's --cooperate-dir admission, as in sml/machine_memory.sml: the --child-charge default caps a child's charge
 # at this many MiB (default_charge_mb), and a lease this young still counts against MemAvailable (startup_seconds).
@@ -342,12 +363,16 @@ class Releases:
         """
         if not RELEASE.fullmatch(version):
             raise Unreleased(f"holbuild {version!r} is not a release version")
+        if tuple(map(int, version.split("."))) < MIN_SANDBOX_RELEASE:
+            raise Unreleased(f"holbuild {version} predates mandatory action isolation")
         baked = os.path.join(self.baked_root, f"v{version}", "bin", "holbuild")
         if os.path.isfile(baked) and os.access(baked, os.X_OK):
+            check_sandbox(baked)
             return baked
         directory = os.path.join(self.root, f"v{version}")
         executable = os.path.join(directory, "bin", "holbuild")
         if os.path.exists(os.path.join(directory, COMPLETE)):
+            check_sandbox(executable)
             return executable
         os.makedirs(self.root, exist_ok=True)
         with open(os.path.join(self.root, f"v{version}.lock"), "a") as lock:
@@ -355,6 +380,7 @@ class Releases:
                 fcntl.flock(lock, fcntl.LOCK_EX)
             if not os.path.exists(os.path.join(directory, COMPLETE)):
                 self._build(version, directory)
+        check_sandbox(executable)
         return executable
 
     def _build(self, version: str, directory: str) -> None:
@@ -653,9 +679,25 @@ def runs_hol(pid: int, cooperate_dir: str) -> bool:
 def failed_record(spec_sha256: str, failure: str) -> str:
     """A result record the worker writes itself: ``spec-rejected`` for an action it won't run, which fails it
     finally like exec-action's own; ``unavailable`` for one whose spec the cache couldn't give (no answer, 429 or
-    5xx, or a transfer cut short), which is retried without counting the attempt; or ``internal`` for any other
-    error in the worker, such as exec-action ending without a record, which is retried."""
+    5xx, or a transfer cut short) or that was interrupted (``recordless_failure``), which is retried without
+    counting the attempt; ``memory`` for one whose exec-action was SIGKILLed; or ``internal`` for any other error in
+    the worker, such as exec-action failing without a record, which is retried."""
     return f"holbuild-action-result-v1\nspec={spec_sha256}\ninput-key=\nstatus=failed\nfailure={failure}\n"
+
+
+def recordless_failure(returncode: int, draining: bool) -> str | None:
+    """The failure to report for an exec-action that exited ``returncode`` without writing its result record, or
+    None for an error in the worker (``internal``). One stopped while the worker drains, or by SIGTERM or SIGINT
+    (a host shutting down, as on a Spot reclaim), was interrupted: ``unavailable`` refunds the attempt. One killed by
+    SIGKILL otherwise is what the kernel's OOM killer does: ``memory``."""
+    def by(*signals: int) -> bool:
+        return any(returncode in (-s, 128 + s) for s in signals)
+
+    if draining or by(signal.SIGTERM, signal.SIGINT):
+        return "unavailable"
+    if by(signal.SIGKILL):
+        return "memory"
+    return None
 
 
 def exec_action_env(*, discovery_config: str | None = None) -> dict[str, str]:
@@ -843,6 +885,10 @@ def execute(
         if drained_out:
             return failed_record(spec, "unavailable")
         if not os.path.exists(result) or os.path.getsize(result) == 0:
+            if failure := recordless_failure(process.returncode, drain.stop.is_set()):
+                print(f"{claim['theory']}: exec-action exited {process.returncode} without a result record, "
+                      f"reporting {failure}", file=sys.stderr, flush=True)
+                return failed_record(spec, failure)
             raise RuntimeError(f"exec-action exited {process.returncode} without a result record")
         with open(result) as file:
             record = file.read()
@@ -955,13 +1001,15 @@ def refresh_cache_members(coordinator: Coordinator, membership: Membership, url:
                 data = response.read(16385)
                 if response.status != 200 or len(data) > 16384:
                     raise ValueError("invalid cache membership response")
-                membership.update(data.decode(), now)
+                membership.update(data.decode(), now, resolve=True)
         except (OSError, ValueError, http.client.HTTPException):
             pass
     return membership.current(now)
 
 
 def main() -> None:
+    if ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0) != 0:
+        sys.exit("cannot protect worker process")
     args = parse_args()
     token = os.environ.get("REMOTE_EXEC_WORKER_TOKEN")
     if not token:

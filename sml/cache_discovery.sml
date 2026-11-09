@@ -77,18 +77,34 @@ fun config_args () =
       SOME path => ["--config", path]
     | NONE => (case env "HOLBUILD_REMOTE_EXEC_CURL_CONFIG" of SOME path => ["--config", path] | NONE => [])
 
+(* An IP literal needs no lookup; IPv6 literals are bracketed. *)
+fun resolves url =
+  let
+    val (_, rest) = Substring.position "://" (Substring.full (HolbuildRemoteCacheConfig.node_identity url))
+    val authority = Substring.takel (fn c => c <> #"/" andalso c <> #"?" andalso c <> #"#") (Substring.triml 3 rest)
+    val host = Substring.string (Substring.takel (fn c => c <> #":") authority)
+  in
+    Substring.isPrefix "[" authority orelse
+    (Option.isSome (NetHostDB.getByName host) handle OS.SysErr _ => false)
+  end
+
+(* A member published before its name resolves here (a resolver can cache the
+   empty name's NXDOMAIN for minutes) is left out until a later refresh finds it.
+   The permanent endpoints are always kept. *)
 fun fetch url defaults =
   let
-    fun get () =
-      let
-        val result = HolbuildSpawn.run {
-          program = "curl", stderr = HolbuildSpawn.Discard,
-          args = ["-q", "-fsSg", "--connect-timeout", "2", "--max-time", "5", "--max-filesize", "16384"] @
-            config_args () @ [url]}
-      in
-        if HolbuildSpawn.succeeded result then SOME (parse defaults (allowed defaults) (#output result)) else NONE
-      end
-  in get () end
+    val identity = HolbuildRemoteCacheConfig.node_identity
+    fun permanent node = List.exists (fn default => identity default = identity node) defaults
+    val result = HolbuildSpawn.run {
+      program = "curl", stderr = HolbuildSpawn.Discard,
+      args = ["-q", "-fsSg", "--connect-timeout", "2", "--max-time", "5", "--max-filesize", "16384"] @
+        config_args () @ [url]}
+  in
+    if HolbuildSpawn.succeeded result then
+      SOME (List.filter (fn node => permanent node orelse resolves node)
+        (parse defaults (allowed defaults) (#output result)))
+    else NONE
+  end
 
 (* Only the refresher waits for HTTP. Other cache threads keep using the most recent complete ring. *)
 fun urls defaults =

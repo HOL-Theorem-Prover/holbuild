@@ -78,9 +78,9 @@ use_hol("src/portableML/Redblackmap.sml");
 use "sml/sha256.sml";
 
 use "sml/spawn.sml";
+use "sml/temp_path.sml";
 use "sml/hash.sml";
 use "sml/process_group.sml";
-use "sml/temp_path.sml";
 use "sml/remove_tree.sml";
 use "sml/stat_cache.sml";
 use "sml/version.sml";
@@ -107,6 +107,7 @@ use "sml/remote_cache.sml";
 use "sml/tar_archive.sml";
 use "sml/cache_archive.sml";
 use "sml/toolchain_archive.sml";
+use "sml/action_sandbox.sml";
 use "sml/hol_shared_cache.sml";
 use "sml/manifest_util.sml";
 use "sml/package_definition.sml";

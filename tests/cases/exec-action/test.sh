@@ -88,6 +88,25 @@ Proof
   ACCEPT_TAC b_thm
 QED
 SML
+cat > "$project/src/MissingRssScript.sml" <<'SML'
+Theory MissingRss
+Ancestors bool
+
+Theorem checked: T
+Proof
+  simp[]
+QED
+
+(* The exporter tolerates unavailable process status, so its report is optional. *)
+structure TextIO = struct
+  open TextIO
+  fun openIn path =
+    if path = "/proc/self/status" then
+      raise IO.Io {name = path, function = "openIn",
+                   cause = OS.SysErr ("process status unavailable", SOME Posix.Error.acces)}
+    else TextIO.openIn path
+end
+SML
 
 hb() {
   (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" "$@")
@@ -131,12 +150,13 @@ expect() {
 spec_for() { awk -v want="$2" '$1 == "action" && $5 == want { print $4 }' "$1"; }
 key_for() { awk -v want="$2" '$1 == "action" && $5 == want { print $2 }' "$1"; }
 
-hb action-spec --upload --all-checkpoints CTheory > "$tmpdir/batch.txt"
+hb action-spec --upload --all-checkpoints CTheory MissingRssTheory > "$tmpdir/batch.txt"
 spec_a=$(spec_for "$tmpdir/batch.txt" worker:ATheory)
 spec_b=$(spec_for "$tmpdir/batch.txt" worker:BTheory)
 spec_c=$(spec_for "$tmpdir/batch.txt" worker:CTheory)
+spec_missing_rss=$(spec_for "$tmpdir/batch.txt" worker:MissingRssTheory)
 key_a=$(key_for "$tmpdir/batch.txt" worker:ATheory)
-[[ -n "$spec_a" && -n "$spec_b" && -n "$spec_c" ]] || { cat "$tmpdir/batch.txt" >&2; exit 1; }
+[[ -n "$spec_a" && -n "$spec_b" && -n "$spec_c" && -n "$spec_missing_rss" ]] || { cat "$tmpdir/batch.txt" >&2; exit 1; }
 
 # A theory whose parent isn't in the cache yet fails without building it.
 worker early "$spec_c"
@@ -183,28 +203,70 @@ curl -fsS -X PUT --data-binary "@$tmpdir/extra-output" "$remote_url/cas/$spec_ex
 worker extra-output "$spec_extra"
 expect extra-output 4 "status=failed" "failure=spec-rejected"
 require_grep "the extra outputs do not match the action text" "$tmpdir/extra-output.log"
-# Or one whose package, though consistent with its action text, would put
-# files outside the action root.
-python3 - "$project/.holbuild/action-specs/$spec_a" "$tmpdir/escape" <<'PY'
+# Matching declarations and action hashes must not let the trusted parent
+# publish files outside the validated stage tree.
+echo 'outside-output-sentinel' > "$tmpdir/outside-output"
+for output in "../../../../../../../../../../../../${tmpdir#/}/outside-output" \
+              /proc/self/environ ../outside-output results/../../../outside-output ./..; do
+  python3 - "$project/.holbuild/action-specs/$spec_a" "$tmpdir/escape-output" "$output" <<'PY'
 import hashlib, sys
 head, text = open(sys.argv[1], "rb").read().split(b"\naction-text\n", 1)
-old = [l for l in head.split(b"\n") if l.startswith(b"target ")][0].split(b" ")[1].split(b":")[0]
-text = text.replace(b"\npackage=" + old + b"\n", b"\npackage=../../x\n", 1)
+output = sys.argv[3].encode()
+head += b"\noutput extra " + output
+text += b"source_extra_output=" + output + b"\n"
 key = hashlib.sha256(text).hexdigest().encode()
 lines = []
 for line in head.split(b"\n"):
     if line.startswith(b"input-key="): line = b"input-key=" + key
     elif line.startswith(b"action-text-sha256="): line = b"action-text-sha256=" + key
-    elif line.startswith(b"target "): line = line.replace(old + b":", b"../../x:", 1)
-    elif line.startswith(b"source "): line = line.replace(b" " + old + b" ", b" ../../x ", 1)
     lines.append(line)
 open(sys.argv[2], "wb").write(b"\n".join(lines) + b"\naction-text\n" + text)
 PY
-spec_escape=$(sha256sum "$tmpdir/escape" | cut -d' ' -f1)
-curl -fsS -X PUT --data-binary "@$tmpdir/escape" "$remote_url/cas/$spec_escape"
-worker escape "$spec_escape"
-expect escape 4 "status=failed" "failure=spec-rejected"
-require_grep "path ../../x leaves the action root" "$tmpdir/escape.log"
+  spec_escape_output=$(sha256sum "$tmpdir/escape-output" | cut -d' ' -f1)
+  curl -fsS -X PUT --data-binary "@$tmpdir/escape-output" "$remote_url/cas/$spec_escape_output"
+  worker escape-output "$spec_escape_output"
+  expect escape-output 4 "status=failed" "failure=spec-rejected"
+  require_grep "leaves the action root" "$tmpdir/escape-output.log"
+done
+# Or one whose package, though consistent with its action text, would put
+# files outside the action root.
+for package in ../../x ./..; do
+  python3 - "$project/.holbuild/action-specs/$spec_a" "$tmpdir/escape" "$package" <<'PY'
+import hashlib, sys
+head, text = open(sys.argv[1], "rb").read().split(b"\naction-text\n", 1)
+package = sys.argv[3].encode()
+old = [l for l in head.split(b"\n") if l.startswith(b"target ")][0].split(b" ")[1].split(b":")[0]
+text = text.replace(b"\npackage=" + old + b"\n", b"\npackage=" + package + b"\n", 1)
+key = hashlib.sha256(text).hexdigest().encode()
+lines = []
+for line in head.split(b"\n"):
+    if line.startswith(b"input-key="): line = b"input-key=" + key
+    elif line.startswith(b"action-text-sha256="): line = b"action-text-sha256=" + key
+    elif line.startswith(b"target "): line = line.replace(old + b":", package + b":", 1)
+    elif line.startswith(b"source "): line = line.replace(b" " + old + b" ", b" " + package + b" ", 1)
+    lines.append(line)
+open(sys.argv[2], "wb").write(b"\n".join(lines) + b"\naction-text\n" + text)
+PY
+  spec_escape=$(sha256sum "$tmpdir/escape" | cut -d' ' -f1)
+  curl -fsS -X PUT --data-binary "@$tmpdir/escape" "$remote_url/cas/$spec_escape"
+  worker escape "$spec_escape"
+  expect escape 4 "status=failed" "failure=spec-rejected"
+  require_grep "path $package leaves the action root" "$tmpdir/escape.log"
+done
+# A file hash names a blob in the worker's cache, so a hash that is a path
+# must be rejected before any lookup.
+python3 - "$project/.holbuild/action-specs/$spec_a" "$tmpdir/blob-path" \
+  "../../../../../../../../../../../../${tmpdir#/}/outside-output" <<'PY'
+import sys
+head, text = open(sys.argv[1], "rb").read().split(b"\naction-text\n", 1)
+head += b"\nfile library lib/Outside.sml " + sys.argv[3].encode() + b" 24"
+open(sys.argv[2], "wb").write(head + b"\naction-text\n" + text)
+PY
+spec_blob_path=$(sha256sum "$tmpdir/blob-path" | cut -d' ' -f1)
+curl -fsS -X PUT --data-binary "@$tmpdir/blob-path" "$remote_url/cas/$spec_blob_path"
+worker blob-path "$spec_blob_path"
+expect blob-path 4 "status=failed" "failure=spec-rejected"
+require_grep "a file's SHA-256 is malformed" "$tmpdir/blob-path.log"
 worker absent "$(printf 'absent' | sha256sum | cut -d' ' -f1)"
 expect absent 4 "status=failed" "failure=spec-rejected"
 
@@ -229,12 +291,9 @@ built_worker=$tmpdir/worker-$(basename "$built" .result)
 ac_a=$(awk '$1 == "action" && $5 == "worker:ATheory" { print $3 }' "$tmpdir/batch.txt")
 require_file "$remote_root/ac/$ac_a"
 
-# The action root is emptied after the run; the checkpoints are kept.
+# Both writable trees are discarded: another tenant must not inherit them.
 [[ ! -e "$built_worker/action" ]] || { echo "the action root was not emptied" >&2; exit 1; }
-find "$built_worker/checkpoints" -name 'deps_loaded.save' | grep -q . ||
-  { echo "the worker kept no deps heap" >&2; find "$built_worker" -maxdepth 3 >&2; exit 1; }
-find "$built_worker/checkpoints" -path '*.theorems*' -type f | grep -q . ||
-  { echo "the worker kept no theorem checkpoints" >&2; exit 1; }
+[[ ! -e "$built_worker/checkpoints" ]] || { echo "the worker retained private checkpoints" >&2; exit 1; }
 
 # A successful build reports its peak memory and uploads its log.
 require_grep '^peak-rss-mb=[1-9][0-9]*$' "$built"
@@ -242,6 +301,14 @@ require_grep '^log=[0-9a-f]\{64\} [0-9][0-9]*$' "$built"
 log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$built")
 curl -fsS "$remote_url/cas/$log_sha" > "$tmpdir/a-build.log"
 [[ -s "$tmpdir/a-build.log" ]] || { echo "the uploaded log is empty" >&2; exit 1; }
+
+# A subdirectory theory still publishes when the exporter could not record RSS.
+worker missing-rss "$spec_missing_rss"
+expect missing-rss 0 "status=built"
+if grep -q '^peak-rss-mb=' "$tmpdir/missing-rss.result"; then
+  echo 'unavailable process status produced a peak RSS report' >&2
+  exit 1
+fi
 
 # Rerunning a done action reports it cached.
 worker again "$spec_a"
@@ -332,10 +399,10 @@ worker_status=$?
 set -e
 expect budget 3 "status=failed" "failure=internal"
 require_grep "exceeds the machine budget" "$tmpdir/budget.log"
-log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/budget.result")
-[[ -n "$log_sha" ]] || { echo "pre-HOL failure has no action log" >&2; exit 1; }
-curl -fsS "$remote_url/cas/$log_sha" > "$tmpdir/budget-action.log"
-require_grep "exceeds the machine budget" "$tmpdir/budget-action.log"
+if grep -q '^log=' "$tmpdir/budget.result"; then
+  echo "pre-HOL failure published an unvalidated action log" >&2
+  exit 1
+fi
 
 # A malformed one-line theorem recovers a boundary with an empty tactic.
 # Its source diagnostic must survive protocol parsing and proof planning.
@@ -364,6 +431,42 @@ curl -fsS "$remote_url/cas/$log_sha" > "$tmpdir/d-action.log"
 require_grep "d_bad" "$tmpdir/d-action.log"
 worker e "$(spec_for "$tmpdir/batch-e.txt" worker:ETheory)"
 expect e 1 "status=failed" "failure=tactic-timeout"
+
+# A HOL child killed by a signal leaves no diagnostic of its own: the action's
+# log says how it died and how large the child grew, and names no path in the
+# action root, which is emptied.
+cat > "$project/src/KilledScript.sml" <<'SML'
+Theory Killed
+Ancestors bool
+
+val _ = Posix.Process.kill (Posix.Process.K_PROC (Posix.ProcEnv.getpid ()), Posix.Signal.kill);
+SML
+hb action-spec --upload KilledTheory > "$tmpdir/batch-killed.txt"
+worker killed "$(spec_for "$tmpdir/batch-killed.txt" worker:KilledTheory)"
+expect killed 3 "status=failed" "failure=internal"
+log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/killed.result")
+[[ -n "$log_sha" ]] || { echo "the killed action has no log" >&2; cat "$tmpdir/killed.result" >&2; exit 1; }
+curl -fsS "$remote_url/cas/$log_sha" > "$tmpdir/killed-action.log"
+require_grep "HOL was killed by signal 9 (SIGKILL)" "$tmpdir/killed-action.log"
+require_grep "largest child resident set so far: [1-9][0-9]* MB" "$tmpdir/killed-action.log"
+if grep -q "instrumented log:" "$tmpdir/killed-action.log"; then
+  echo "the action log names a path in the emptied action root" >&2
+  cat "$tmpdir/killed-action.log" >&2
+  exit 1
+fi
+
+# A failure after the export still reports the peak the exporter measured.
+cat > "$project/src/UnwrittenScript.sml" <<'SML'
+Theory Unwritten
+Ancestors bool
+
+fun holbuild_extra_outputs (_ : string list) = ()
+val _ = holbuild_extra_outputs ["results/unwritten.txt"]
+SML
+hb action-spec --upload UnwrittenTheory > "$tmpdir/batch-unwritten.txt"
+worker unwritten "$(spec_for "$tmpdir/batch-unwritten.txt" worker:UnwrittenTheory)"
+expect unwritten 3 "status=failed"
+require_grep '^peak-rss-mb=[1-9][0-9]*$' "$tmpdir/unwritten.result"
 
 # Target-only theorem checkpoints reach the worker: a theory that isn't a
 # target keeps its deps heap but saves no theorem checkpoints. A target's
@@ -399,12 +502,7 @@ for spec in "$spec_g" "$spec_a" "$spec_d"; do
 done
 worker f "$spec_f"
 expect f 0 "spec=$spec_f" "status=built"
-find "$tmpdir/worker-f/checkpoints" -name 'deps_loaded.save' | grep -q . ||
-  { echo "the non-target worker kept no deps heap" >&2; exit 1; }
-if find "$tmpdir/worker-f/checkpoints" -path '*.theorems*' -type f | grep -q .; then
-  echo "the non-target worker saved theorem checkpoints" >&2
-  exit 1
-fi
+[[ ! -e "$tmpdir/worker-f/checkpoints" ]] || { echo "the non-target worker retained private checkpoints" >&2; exit 1; }
 
 # A warm worker's local copies go out of date when the remote's entries for
 # their keys change, as for a nondeterministic theory built twice: the worker

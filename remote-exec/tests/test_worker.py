@@ -36,6 +36,7 @@ from remote_exec.worker import (
     failed_record,
     parse_args,
     run_one,
+    recordless_failure,
     runs_hol,
     wait_for_memory,
 )
@@ -44,8 +45,10 @@ SPEC = "5" * 64
 RECORD = f"holbuild-action-result-v1\nspec={SPEC}\ninput-key={'6' * 64}\nstatus=built\n"
 
 # A stand-in holbuild source tree: `make bin/holbuild` installs a script that logs its arguments and environment and
-# writes RECORD (or HOLBUILD_FAKE_RECORD) to its --result file, or crashes without one when HOLBUILD_FAKE_CRASH is set.
+# writes RECORD (or HOLBUILD_FAKE_RECORD) to its --result file, or ends without one when HOLBUILD_FAKE_CRASH is set:
+# exit 70 for 1, else killed by the signal it names.
 FAKE_HOLBUILD = f"""#!/bin/sh
+[ "$1" != sandbox-check ] || exit 0
 echo $$ > "$HOLBUILD_FAKE_LOG.pid"
 if [ -n "$HOLBUILD_FAKE_HANG" ]; then
   trap '' TERM
@@ -58,7 +61,8 @@ env > "$HOLBUILD_FAKE_LOG.env"
 # long enough for a heartbeat at the 1 s interval of a 3 s lease; HOLBUILD_FAKE_LEASE: in a child holding that file
 # open, as a HOL child holds its admission lease
 if [ -n "$HOLBUILD_FAKE_LEASE" ]; then sleep 1; (exec 3>"$HOLBUILD_FAKE_LEASE"; sleep 2); sleep 1; else sleep 2; fi
-[ -z "$HOLBUILD_FAKE_CRASH" ] || exit 70
+[ -z "$HOLBUILD_FAKE_CRASH" ] || [ "$HOLBUILD_FAKE_CRASH" != 1 ] || exit 70
+[ -z "$HOLBUILD_FAKE_CRASH" ] || kill -s "$HOLBUILD_FAKE_CRASH" $$
 while [ "$#" -gt 0 ]; do
   if [ "$1" = --result ]; then printf '%s' "${{HOLBUILD_FAKE_RECORD:-{RECORD}}}" > "$2"; fi
   shift
@@ -191,6 +195,24 @@ def test_baked_release_needs_no_writable_cache_or_download(tmp_path: Path, serve
     assert release.holbuild("1.2.3") == str(baked)
     with pytest.raises(Unreleased):
         release.holbuild("../1.2.3")
+
+
+@pytest.mark.parametrize("version", ["0.13.52", "0.13.53", "0.13.54", "0.13.55", "0.13.56", "0.13.57"])
+def test_old_release_is_rejected_before_baked_lookup(tmp_path: Path, server: Server, version: str) -> None:
+    release = releases(tmp_path, server)
+    with pytest.raises(Unreleased, match="mandatory action isolation"):
+        release.holbuild(version)
+    assert not (tmp_path / "releases").exists()
+
+
+def test_baked_release_must_support_sandbox(tmp_path: Path, server: Server) -> None:
+    baked = tmp_path / "baked/v1.2.3/bin/holbuild"
+    baked.parent.mkdir(parents=True)
+    baked.write_text("#!/bin/sh\nexit 125\n")
+    baked.chmod(0o755)
+    release = replace(releases(tmp_path, server), baked_root=str(tmp_path / "baked"))
+    with pytest.raises(subprocess.CalledProcessError):
+        release.holbuild("1.2.3")
 
 
 @pytest.mark.parametrize("candidate", ["missing", "non-executable", "directory"])
@@ -480,6 +502,9 @@ def test_action_runs_without_the_worker_token(
     monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
     monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_CURL_CONFIG", str(tmp_path / "cache.curl"))
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.test:3128")
+    for name in worker.SOLVER_ENV:
+        monkeypatch.setenv(name, f"/opt/{name}")
+    monkeypatch.setenv("HOL4_YICES_EXECUTABLE", "/opt/yices")
 
     run_one(
         Coordinator(server.url, "w"),
@@ -500,6 +525,8 @@ def test_action_runs_without_the_worker_token(
     assert env["HOLBUILD_CACHE"] == str(tmp_path / "cache")
     assert env["HOLBUILD_REMOTE_CACHE_CURL_CONFIG"] == str(tmp_path / "cache.curl")
     assert env["PATH"]
+    assert all(env[name] == f"/opt/{name}" for name in worker.SOLVER_ENV)
+    assert "HOL4_YICES_EXECUTABLE" not in env
 
 
 def test_action_exec_action_found_the_cache_unavailable_for_is_reported_as_it_said(
@@ -569,6 +596,47 @@ def test_action_that_ends_without_a_record_is_reported_for_a_retry(
         )
 
     assert server.completed == [failed_record(SPEC, "internal")]
+
+
+@pytest.mark.parametrize(("crash", "failure"), [("KILL", "memory"), ("TERM", "unavailable"), ("INT", "unavailable")])
+def test_action_killed_by_a_signal_without_a_record_is_reported_by_the_signal(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, crash: str, failure: str
+) -> None:
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+    monkeypatch.setenv("HOLBUILD_FAKE_CRASH", crash)
+
+    unavailable = run_one(
+        Coordinator(server.url, "w"),
+        worker_args(tmp_path, server),
+        releases(tmp_path, server),
+        Protection(None, None),
+        claim(),
+        Phases(),
+    )
+
+    assert unavailable == (failure == "unavailable")
+    assert server.completed == [failed_record(SPEC, failure)]
+
+
+@pytest.mark.parametrize(
+    ("returncode", "draining", "failure"),
+    [
+        (-signal.SIGKILL, False, "memory"),
+        (128 + signal.SIGKILL, False, "memory"),
+        (-signal.SIGTERM, False, "unavailable"),
+        (128 + signal.SIGTERM, False, "unavailable"),
+        (-signal.SIGINT, False, "unavailable"),
+        (128 + signal.SIGINT, False, "unavailable"),
+        # Draining, whatever stopped it, the attempt is refunded.
+        (-signal.SIGKILL, True, "unavailable"),
+        (70, True, "unavailable"),
+        (70, False, None),
+        (1, False, None),
+    ],
+)
+def test_recordless_failure_names_interruptions_and_kills(returncode: int, draining: bool, failure: str | None) -> None:
+    assert recordless_failure(returncode, draining) == failure
 
 
 def test_action_whose_spec_an_unreachable_cache_does_not_give_is_reported_unavailable(
@@ -721,7 +789,7 @@ def test_ecs_task_protection_is_set_and_cleared(server: Server) -> None:
     protection.set(enabled=True)
     protection.set(enabled=False)
 
-    assert server.protection == [{"ProtectionEnabled": True, "ExpiresInMinutes": 10}, {"ProtectionEnabled": False}]
+    assert server.protection == [{"ProtectionEnabled": True, "ExpiresInMinutes": 180}, {"ProtectionEnabled": False}]
 
 
 def test_also_claim_accepts_repeats_and_commas(tmp_path: Path, server: Server) -> None:

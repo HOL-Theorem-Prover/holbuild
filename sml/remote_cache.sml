@@ -297,14 +297,19 @@ fun require_answer method url result =
 fun transient (HolbuildHttp.Failed _) = true
   | transient (HolbuildHttp.Response code) = code = 429 orelse (code >= 500 andalso code < 600)
 
-(* The breaker observes the whole request: a dead primary must not disable a healthy backup. *)
+(* The breaker observes the whole request: a dead primary must not disable a healthy backup.
+   A write goes past the first two nodes only while none of them answered at all
+   (a member whose name doesn't resolve yet, say), and stops at the first answer. *)
 fun routed_status method urls path request =
   let
     val read = method = "GET" orelse method = "HEAD"
     val grace = read andalso HolbuildCacheDiscovery.joining ()
-    fun loop [] _ missing last = Option.getOpt (missing, last)
-      | loop (node :: rest) count missing last =
-          if count >= 2 andalso not grace andalso (not read orelse (count = 2 andalso Option.isSome missing)) then
+    fun unanswered (HolbuildHttp.Failed _) = true
+      | unanswered (HolbuildHttp.Response _) = false
+    fun loop [] _ _ missing last = Option.getOpt (missing, last)
+      | loop (node :: rest) count silent missing last =
+          if count >= 2 andalso not grace andalso
+             (if read then count = 2 andalso Option.isSome missing else not silent) then
             Option.getOpt (missing, last)
           else
             let
@@ -312,10 +317,10 @@ fun routed_status method urls path request =
               val missing = if read andalso result = HolbuildHttp.Response 404 then SOME (node, result) else missing
             in
               if transient result orelse (read andalso result = HolbuildHttp.Response 404) then
-                loop rest (count + 1) missing (node, result)
+                loop rest (count + 1) (silent andalso unanswered result) missing (node, result)
               else (node, result)
             end
-  in loop urls 0 NONE (hd urls, HolbuildHttp.Failed "no cache response") end
+  in loop urls 0 true NONE (hd urls, HolbuildHttp.Failed "no cache response") end
 
 (* NONE when the remote cache is disabled, without a request.  With
    fail_closed, raises Unavailable instead, and for no answer, 429 or 5xx. *)

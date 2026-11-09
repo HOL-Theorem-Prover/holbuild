@@ -20,12 +20,15 @@ RUN git clone -b "$POLYML_TAG" --depth 1 "$POLYML_REPO" /src/polyml \
 FROM ${PYTHON_IMAGE}
 # A C toolchain and GMP for polyc, which builds holbuild and HOL; git, curl and zstd for holbuild itself.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends build-essential ca-certificates curl git libgmp-dev tini zstd \
+ && apt-get install -y --no-install-recommends build-essential ca-certificates curl git libgmp-dev libseccomp2 tini zstd \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=polyml /opt/polyml /opt/polyml
 COPY --from=ghcr.io/astral-sh/uv:0.13.4 /uv /usr/local/bin/uv
+# The worker's temporary files (the cache credential, action results) stay out
+# of /tmp, which sandboxed HOL processes may write: Poly/ML puts its own there.
 ENV PATH=/opt/remote-exec/.venv/bin:/opt/polyml/bin:$PATH \
     HOLBUILD_CACHE=/var/cache/holbuild \
+    TMPDIR=/var/tmp \
     UV_PYTHON_DOWNLOADS=never
 
 WORKDIR /opt/remote-exec

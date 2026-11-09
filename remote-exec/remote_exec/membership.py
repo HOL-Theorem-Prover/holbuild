@@ -1,6 +1,7 @@
 """Validated discovery snapshots: endpoints come from configuration, never from API-supplied credentials."""
 
 import re
+import socket
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
@@ -44,6 +45,15 @@ def parse_members(text: str, defaults: list[str], allowed: list[str]) -> list[st
     return cache_nodes(','.join(configured[url] for url in identities))
 
 
+def resolves(url: str) -> bool:
+    """Whether this host can look up the endpoint's name now; IP literals always can."""
+    try:
+        socket.getaddrinfo(urlsplit(url).hostname, None)
+    except (OSError, UnicodeError):
+        return False
+    return True
+
+
 @dataclass
 class Membership:
     """The last complete membership snapshot; a stale API falls back to the permanent configuration."""
@@ -55,8 +65,13 @@ class Membership:
     members: list[str] = field(default_factory=list)
     joined: float = float('-inf')
 
-    def update(self, text: str, now: float) -> None:
+    def update(self, text: str, now: float, resolve: bool = False) -> None:
+        """With resolve, leave out a member this host can't resolve yet (its resolver may cache the empty
+        slot's NXDOMAIN for minutes after the member is published); a later refresh adds it as a join."""
         members = parse_members(text, self.defaults, self.allowed)
+        if resolve:
+            permanent = {node_identity(url) for url in self.defaults}
+            members = [url for url in members if node_identity(url) in permanent or resolves(url)]
         if set(members) - set(self.current(now)):
             self.joined = now
         self.members = members

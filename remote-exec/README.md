@@ -153,13 +153,15 @@ each call. A cached directory must match the recorded device
 and inode; other directories are sized live. Smaller targets and zero-reserve runs always scan live. Shared writes
 during the reuse interval are accounted for at the next scan. `exec-action` runs
 with the worker's `HOLBUILD_*` build settings, `PATH`, `HOME`, `TMPDIR`, the
-locale, and curl's certificate and proxy settings. It excludes
+locale, curl's certificate and proxy settings, and the solver locations HOL's
+libraries read (`HOL4_Z3_EXECUTABLE`, `HOL4_CVC_EXECUTABLE`,
+`HOL4_CSDP_EXECUTABLE`, `HOL4_EPROVER_EXECUTABLE`, `HOL4_VAMPIRE_EXECUTABLE`,
+`HOL4_ZIPPERPOSITION_EXECUTABLE`, `HOL4_JAVA_EXECUTABLE`). It excludes
 `HOLBUILD_REMOTE_EXEC_*`, `HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN` and inherited
 discovery curl configs; with discovery enabled it receives only the worker's
 generated read-only discovery config (see below). The worker token stays out
-of the builds' environment and discovery files. A
-build runs as the worker's user, so one that goes looking can still read the
-token from the worker's `/proc/<pid>/environ`. Outside the image,
+of the builds' environment and discovery files. Submitted HOL code is confined
+separately from trusted worker processes, as described below. Outside the image,
 `python3 -m remote_exec.worker` runs the worker; it uses only the standard
 library and `curl`. A batch can override the worker's `--max-heap` default
 (12000 MB); `--also-claim standard` lets them take standard-tier work when no
@@ -196,6 +198,89 @@ workers do when they aren't running HOL:
   worker looks for every second;
 - `exec`: all of `exec-action`, for a worker without `--cooperate-dir`;
 - `complete`: reporting the result.
+
+## Action isolation
+
+Workers require Linux on x86_64 or aarch64, Landlock ABI 1 or newer,
+Python 3, pidfds, `/proc` child lists and `libseccomp.so.2` with notification
+support. Root workers need `CAP_SETPCAP` to drop their bounding capabilities
+and lock securebits; non-root workers need no added capabilities. The supplied
+image includes the userspace dependencies. The container's seccomp profile must permit Landlock and
+stacking a notifying seccomp filter. `holbuild sandbox-check` exercises these
+requirements; workers reject a release whose check fails. Releases before
+0.13.58 are rejected because their HOL launch path has no mandatory sandbox.
+Upgrade submitting clients before replacing workers with this version.
+
+The worker and `exec-action` remain trusted: they fetch inputs, manage memory
+leases and publish results. Each HOL process runs with a Landlock filesystem
+policy and a seccomp syscall filter. It receives read access to its selected
+HOL toolchain, holbuild runtime, Poly/ML and system runtime files, and write
+access to fresh action, checkpoint, home and temporary directories. Shared
+cache files are copied into these directories. The directories are removed
+after the action, including when shared heaps are disabled. Worker-private
+checkpoint and compiled-module state is not retained across actions. The child receives
+no cache credentials, worker token, inherited lease descriptors or Linux
+capabilities. Its `PATH` excludes the worker Python virtualenv's `bin`
+directory, including directory aliases, so `python3` can use the system
+installation while the worker virtualenv stays inaccessible. Other `PATH`
+entries are preserved and remain subject to the filesystem read policy.
+It may also write `/tmp`, where Poly/ML creates temporary files
+whatever `TMPDIR` says (HOL's SAT and SMT interfaces use them), unless
+protected worker state lies beneath it, holbuild's own temporary files
+under `TMPDIR` included; the image therefore sets `TMPDIR` to `/var/tmp` so
+the worker keeps its credential, result and temporary files elsewhere.
+Actions on one worker may see each other's files in `/tmp`. Cross-process
+inspection, metadata changes, links and special-file creation are denied. A trusted signal supervisor permits process and group
+signals only to verified descendants of the current action, using pidfds;
+thread signals stay within the requesting process. Subprocess groups, sessions
+and timeouts work without granting access to worker or sibling processes.
+The supervisor stops descendants to a fixed point, then kills and reaps them
+before validating and harvesting regular, unlinked output files. Cleanup uses
+bounded process-tree scans rather than one atomic process-group signal; failure
+to complete cleanup fails the action and does not harvest outputs. This does
+not provide resource isolation against fork storms. Unsupported confinement
+fails closed.
+
+The child inherits only executable lookup, locale, timezone, certificate lookup,
+those solver locations and `HOLBUILD_RUN_*` settings; a solver outside the
+system directories needs its directory in `HOLBUILD_ACTION_READ_DIRS`. Other
+operator environment overrides use their runtime defaults. Cancellation kills the owned process tree, so buffered log
+tails may be lost. Mediated signals identify the supervisor as their sender.
+
+`--share-heaps` publishes heaps by dependency context and checkpoints by script
+prefix in the remote cache; use it only with a single tenant or trusted cache
+submitters. It does not provide tenant authorization for shared cache entries.
+
+The supervisor confirms cleanup and output validation through a completion
+file outside the child's filesystem grants. Without that confirmation, the
+worker treats the run as an infrastructure failure and publishes no checkpoints.
+The child must confirm confinement setup; exit status 125 is reserved for
+infrastructure failures, including a failure to execute HOL.
+The supervisor watches its parent through a pidfd and runs in its own process
+group, so an outer timeout's forced group shutdown does not interrupt cleanup.
+The launcher supplies its identity before starting the supervisor, which
+refuses to start HOL if it has already lost that parent.
+
+HOL toolchain bootstrap executes trusted source. Before using a toolchain,
+workers require its revision to be a commit ancestor of an approved branch.
+The default approves `develop` and `master` in the canonical HOL repository.
+Administrators may replace these defaults with whitespace-separated
+`HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES` entries of the form
+`https://example.org/HOL.git=develop,master` for trusted mirrors or forks.
+Only these branch refs are fetched, never pull-request refs or arbitrary
+revision objects. Proven ancestry is reused from a worker-owned Git graph;
+a branch history rewrite takes effect when the next unknown revision triggers
+a refresh. Use protected branches for these trust roots.
+Bootstrap compiler/build children also have credential settings removed from
+their environment. This restriction is worker configuration, not an action
+spec option. Administrators can grant additional read-only runtime directories
+with colon-separated `HOLBUILD_ACTION_READ_DIRS`; do not include credentials
+or shared writable state in these directories.
+
+This boundary protects worker credentials and shared filesystem state. It
+does not restrict network egress or replace authorization on the remote cache.
+The trusted HOL parser and compiler used before execution remain part of the
+worker's trusted code.
 
 ## Batches and actions
 
@@ -309,9 +394,12 @@ a run batch and cancels its unfinished actions.
   A worker that gets no answer from the cache for the action's spec, 429,
   5xx or a transfer cut short, as while the cache restarts, reports
   `unavailable`, as `exec-action` does when the cache fails it so while
-  fetching the action's inputs or publishing its result. Any other error
-  in the worker (`exec-action` ended without a result record because it
-  crashed or was killed, the release didn't build, the cache doesn't have the
+  fetching the action's inputs or publishing its result. An `exec-action`
+  that ends without a result record while the worker drains, or killed by
+  SIGTERM or SIGINT (a host shutting down), is reported `unavailable` too;
+  one killed by SIGKILL otherwise, as the kernel's OOM killer does, is
+  reported `memory`. Any other error in the worker (`exec-action` crashed
+  without a record, the release didn't build, the cache doesn't have the
   spec) is reported as `internal`, so the action is retried at once rather
   than when its lease expires. After either, the worker waits before it
   claims again, so a cache outage doesn't run it through the ready actions.
@@ -418,8 +506,12 @@ action. With `--protection-cmd COMMAND`, the worker runs `COMMAND on` when it
 takes an action and on each heartbeat, and `COMMAND off` when the action ends.
 Without it, when `ECS_AGENT_URI` is set (as on Amazon ECS), it sets the task's
 scale-in protection through the agent's `task-protection/v1/state` endpoint,
-for 10 minutes at a time, so a worker that dies loses it. Failures are logged
-and the action carries on.
+for 180 minutes at a time. ECS refuses to renew protection with
+`DEPLOYMENT_BLOCKED` while a scale-in or rolling deployment wants the task
+gone, so the window set when the action is claimed has to outlast the longest
+action. The worker clears protection when the action ends or loses its lease,
+and a worker that dies takes its task down with it. Failures are logged and
+the action carries on.
 
 ## Wire format
 
@@ -594,8 +686,8 @@ keyed by the worker token, encoded as lowercase hex. Only the membership
 endpoint accepts this token; it cannot claim work, heartbeat, report results,
 submit batches or inspect the queue. The worker bearer is never written to
 this file, and `HOLBUILD_REMOTE_EXEC_*` settings are excluded from the child
-environment. Cache credentials remain separate. Builds still share the worker
-user and are not sandboxed from its other files or processes.
+environment. Cache credentials remain separate and stay in trusted worker and
+`exec-action` processes; the HOL sandbox does not receive them.
 
 Upgrade the coordinator before workers so it accepts derived discovery tokens.
 Older coordinators reject them, leaving child discovery on the permanent cache
@@ -604,14 +696,19 @@ workers remain compatible with the upgraded coordinator. Workers keep passing
 the permanent ring as `--remote-cache`: it is the child's validation and stale
 fallback baseline, while live discovery updates the effective ring throughout
 an action. Python independently refreshes the ring for release-spec downloads.
-Discovery never follows redirects. If it fails, the last complete ring remains
+Discovery never follows redirects. A listed temporary member whose name does
+not resolve on that host yet is left out until a later refresh finds it (a
+resolver may cache the name's earlier NXDOMAIN for minutes); its joining then
+starts the join grace. Permanent members are always kept.
+If discovery fails, the last complete ring remains
 usable for 60 seconds, after which requests use the permanent configuration.
 Recovery from permanent fallback counts as a new join.
 For 60 seconds after observing a joined member, GET/HEAD can try every ready
 member to find an object whose former owner has not uploaded it yet. Outside
 that join grace, a miss tries at most two nodes. If both nodes fail with
 transport errors, 429 or 5xx, reads can continue through the snapshot so stale
-readers can bypass concurrent drains. Writes always keep the two-node bound.
+readers can bypass concurrent drains. Writes keep the two-node bound unless
+neither node gave an HTTP response; then they go on until one does.
 
 ### Capacity adapter
 

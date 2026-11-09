@@ -17,7 +17,8 @@ require_grep() {
   local pattern=$1
   local path=$2
   grep -q "$pattern" "$path" || {
-    echo "missing expected pattern '$pattern' in $path" >&2
+    echo "missing expected pattern '$pattern' in $path:" >&2
+    tail -n 40 "$path" >&2 || true
     exit 1
   }
 }
@@ -85,6 +86,7 @@ TOML
 init_git_repo() {
   local dir=$1
   git -C "$dir" init -q
+  git -C "$dir" symbolic-ref HEAD refs/heads/master
   git -C "$dir" config user.email test@example.invalid
   git -C "$dir" config user.name "holbuild test"
   git -C "$dir" config commit.gpgsign false
@@ -98,6 +100,10 @@ link_hol_toolchain_cache() {
   mkdir -p "$cache"
   if [[ -n "${HOLBUILD_TEST_GLOBAL_CACHE:-}" && -d "$HOLBUILD_TEST_GLOBAL_CACHE/hol-toolchains" && ! -e "$cache/hol-toolchains" ]]; then
     ln -s "$HOLBUILD_TEST_GLOBAL_CACHE/hol-toolchains" "$cache/hol-toolchains"
+  fi
+  if [[ -n "${HOLBUILD_TEST_GLOBAL_CACHE:-}" && ! -e "$cache/toolchain-trust" ]]; then
+    mkdir -p "$HOLBUILD_TEST_GLOBAL_CACHE/toolchain-trust"
+    ln -s "$HOLBUILD_TEST_GLOBAL_CACHE/toolchain-trust" "$cache/toolchain-trust"
   fi
 }
 
