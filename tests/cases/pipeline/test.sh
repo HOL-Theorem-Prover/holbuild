@@ -97,11 +97,11 @@ require_same_as_unpipelined() {
   local name=$1 target=$2
   shift 2
   local flags
-  read -r -a flags <<< "${UNPIPELINED_FLAGS:---skip-checkpoints --skip-proof-steps}"
+  read -r -a flags <<< "${UNPIPELINED_FLAGS---skip-checkpoints --skip-proof-steps}"
   rm -rf "$tmpdir/$name-off"
   cp -r "$tmpdir/$name" "$tmpdir/$name-off"
   rm -rf "$tmpdir/$name-off/.holbuild"
-  (cd "$tmpdir/$name-off" && HOLBUILD_PIPELINE=off "$HOLBUILD_BIN" -j4 build --no-cache "${flags[@]}" "$target") \
+  (cd "$tmpdir/$name-off" && HOLBUILD_PIPELINE=off "$HOLBUILD_BIN" -j4 build --no-cache ${flags[@]+"${flags[@]}"} "$target") \
     > "$tmpdir/$name-off.log" 2>&1
   local theory
   for theory in "$@"; do

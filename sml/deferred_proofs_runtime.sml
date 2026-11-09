@@ -471,15 +471,29 @@ struct
             val raw = List.foldl (fn ((k, r), d) => Binarymap.insert (d, k, r))
                                  (Binarymap.mkDict Int.compare) (!proved)
             val memo = ref (Binarymap.mkDict Int.compare)
+            (* Proofs that used each other's stubs (through a registry
+               outside the context, say) have no order a build in place
+               could have run them in. *)
+            val resolving = ref ([] : int list)
             fun lookup k =
               case Binarymap.peek (!memo, k) of
                   SOME resolved => resolved
                 | NONE =>
+                    if List.exists (fn j => j = k) (!resolving) then
+                      raise Fail ("deferred proofs depend on each other: goals " ^
+                                  String.concatWith ", " (map Int.toString (!resolving)))
+                    else
                     case Binarymap.peek (raw, k) of
                         NONE => raise Fail ("no proof recorded for deferred goal " ^ Int.toString k)
                       | SOME r =>
-                          let val resolved = resolve thy lookup r
-                          in memo := Binarymap.insert (!memo, k, resolved); resolved end
+                          let
+                            val _ = resolving := k :: !resolving
+                            val resolved = resolve thy lookup r
+                          in
+                            resolving := tl (!resolving);
+                            memo := Binarymap.insert (!memo, k, resolved);
+                            resolved
+                          end
           in
             write_data sig_path (rewrite_data lookup data)
           end
