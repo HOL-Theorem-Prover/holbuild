@@ -6143,6 +6143,30 @@ fun fetch_remote_build_log project node log_sha256 =
     handle e => (remove_file log; raise e)
   end
 
+(* The logs of the theories a failed batch finished, for what they report
+   (such as a proof step that passed on its retry).  They are optional: one
+   that can't be fetched is skipped. *)
+fun restore_finished_build_logs (options : build_options) tc project plan toolchain_key logs =
+  let
+    val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
+                 (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
+    val theories = List.filter
+      (fn node => #kind (HolbuildBuildPlan.source_of node) = HolbuildSourceIndex.TheoryScript)
+      (HolbuildBuildPlan.selected_nodes plan)
+    val nodes = List.foldl
+      (fn (node, table) => Redblackmap.insert (table, HolbuildBuildPlan.input_key_for keys node, node))
+      (Redblackmap.mkDict String.compare) theories
+    fun restore (key, SOME sha) =
+          ((case Redblackmap.peek (nodes, key) of
+                SOME node => ignore (fetch_remote_build_log project node sha)
+              | NONE => ())
+           handle Thread.Interrupt => raise Thread.Interrupt
+                | _ => ())
+      | restore (_, NONE) = ()
+  in
+    List.app restore logs
+  end
+
 (* Logs belong to this execution, not the cached theory entry. *)
 fun restore_remote_build_logs (options : build_options) tc project plan toolchain_key logs =
   let

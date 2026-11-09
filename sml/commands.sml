@@ -1656,7 +1656,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               end
             (* Diagnose every final failure. A missing proof log retains the
                single-theory diagnostic fallback. *)
-            fun proof_failed reason (failures : HolbuildRemoteExec.action_failure list) =
+            fun proof_failed reason (failures : HolbuildRemoteExec.action_failure list) restore_finished_logs =
               let
                 val _ = HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "\n")
                 val needs_local = ref false
@@ -1698,6 +1698,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                  end)
                         end
                 val errors = map diagnose failures
+                val _ = restore_finished_logs ()
               in
                 HolbuildHolSharedCache.local_build_needed := !needs_local;
                 HolbuildBuildExec.raise_build_failures errors
@@ -1754,7 +1755,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                  (HolbuildBuildExec.remote_restore_options (#restore_only build_options) build_options)
                                  tc project plan toolchain_key jobs))
                     end
-                | ((HolbuildRemoteExec.Failed (reason, failures), progress), _) =>
+                | ((HolbuildRemoteExec.Failed (reason, failures), progress), logs) =>
                   let
                     val proof_failure = List.exists (fn {kind, ...} => kind = "proof" orelse kind = "tactic-timeout") failures
                     val reason = "batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress
@@ -1765,10 +1766,16 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                         | _ => []
                     val missing_blob = resubmit andalso not proof_failure andalso
                                        HolbuildRemoteExec.resubmit_missing_blob reason
+                    val final = null forced andalso not missing_blob
+                    (* Last, after the required restores and failure logs. *)
+                    fun restore_finished_logs () =
+                      if final then
+                        HolbuildBuildExec.restore_finished_build_logs build_options tc project plan toolchain_key logs
+                      else ()
                     (* Restore before a terminal failure. A resubmission must first
                        repair its inputs, without installing stale cached outputs. *)
                     val _ =
-                      if null forced andalso not missing_blob then
+                      if final then
                         (HolbuildBuildExec.build (HolbuildBuildExec.remote_restore_options true build_options)
                            tc project plan toolchain_key jobs
                          handle HolbuildBuildExec.Error _ => ()
@@ -1776,7 +1783,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                       else ()
                     val _ = HolbuildHolSharedCache.local_build_needed := false
                   in
-                    if proof_failure then proof_failed reason failures
+                    if proof_failure then proof_failed reason failures restore_finished_logs
                     else let
                       val _ = List.app (fn {input_key, log_sha256, ...} =>
                         case (log_sha256, HolbuildBuildExec.node_with_input_key build_options tc project plan toolchain_key input_key) of
@@ -1787,8 +1794,9 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                      ("remote execution: could not fetch the failed theory's build log: " ^
                                       HolbuildBuildPlan.logical_name node))
                           | _ => ()) failures
+                      val _ = restore_finished_logs ()
                     in
-                      if null forced andalso not missing_blob then fall_back reason
+                      if final then fall_back reason
                       else
                         (HolbuildStatus.message_stderr
                            ("holbuild: remote execution: " ^ reason ^ "; resubmitting" ^
