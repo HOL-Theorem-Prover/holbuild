@@ -404,6 +404,29 @@ require_grep "d_bad" "$tmpdir/d-action.log"
 worker e "$(spec_for "$tmpdir/batch-e.txt" worker:ETheory)"
 expect e 1 "status=failed" "failure=tactic-timeout"
 
+# A HOL child killed by a signal leaves no diagnostic of its own: the action's
+# log says how it died and how large the child grew, and names no path in the
+# action root, which is emptied.
+cat > "$project/src/KilledScript.sml" <<'SML'
+Theory Killed
+Ancestors bool
+
+val _ = Posix.Process.kill (Posix.Process.K_PROC (Posix.ProcEnv.getpid ()), Posix.Signal.kill);
+SML
+hb action-spec --upload KilledTheory > "$tmpdir/batch-killed.txt"
+worker killed "$(spec_for "$tmpdir/batch-killed.txt" worker:KilledTheory)"
+expect killed 3 "status=failed" "failure=internal"
+log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/killed.result")
+[[ -n "$log_sha" ]] || { echo "the killed action has no log" >&2; cat "$tmpdir/killed.result" >&2; exit 1; }
+curl -fsS "$remote_url/cas/$log_sha" > "$tmpdir/killed-action.log"
+require_grep "HOL was killed by signal 9 (SIGKILL)" "$tmpdir/killed-action.log"
+require_grep "largest child resident set so far: [1-9][0-9]* MB" "$tmpdir/killed-action.log"
+if grep -q "instrumented log:" "$tmpdir/killed-action.log"; then
+  echo "the action log names a path in the emptied action root" >&2
+  cat "$tmpdir/killed-action.log" >&2
+  exit 1
+fi
+
 # Target-only theorem checkpoints reach the worker: a theory that isn't a
 # target keeps its deps heap but saves no theorem checkpoints. A target's
 # spec, and every spec under --all-checkpoints, doesn't mention them.

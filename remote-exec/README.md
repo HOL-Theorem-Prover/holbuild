@@ -386,9 +386,12 @@ a run batch and cancels its unfinished actions.
   A worker that gets no answer from the cache for the action's spec, 429,
   5xx or a transfer cut short, as while the cache restarts, reports
   `unavailable`, as `exec-action` does when the cache fails it so while
-  fetching the action's inputs or publishing its result. Any other error
-  in the worker (`exec-action` ended without a result record because it
-  crashed or was killed, the release didn't build, the cache doesn't have the
+  fetching the action's inputs or publishing its result. An `exec-action`
+  that ends without a result record while the worker drains, or killed by
+  SIGTERM or SIGINT (a host shutting down), is reported `unavailable` too;
+  one killed by SIGKILL otherwise, as the kernel's OOM killer does, is
+  reported `memory`. Any other error in the worker (`exec-action` crashed
+  without a record, the release didn't build, the cache doesn't have the
   spec) is reported as `internal`, so the action is retried at once rather
   than when its lease expires. After either, the worker waits before it
   claims again, so a cache outage doesn't run it through the ready actions.
