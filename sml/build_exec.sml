@@ -362,19 +362,27 @@ fun if_meta_has values code =
   "[" ^ String.concatWith ", " (map HolbuildToolchain.sml_string values) ^ "] then " ^
   "CompilerSpecific.quietbind " ^ HolbuildToolchain.sml_string code ^ " else ();"
 
-fun write_child_policy tc path =
+(* The child policy's theory-module lines.  A sandboxed (remote) action
+   only reads the host's modules: the worker writes them
+   (fill_module_store). *)
+fun module_policy {sandboxed, store, base_state} =
   let
     val configure =
       "val _ = Meta.configureTheoryModuleCache {directory = " ^
-      HolbuildToolchain.sml_string (module_store ()) ^ ", base_state = " ^
-      HolbuildToolchain.sml_string (HolbuildToolchain.base_state tc) ^ "};"
-    (* A remote action only reads the host's modules: the worker writes
-       them (fill_module_store). *)
+      HolbuildToolchain.sml_string store ^ ", base_state = " ^
+      HolbuildToolchain.sml_string base_state ^ "};"
+  in
+    if sandboxed then
+      if_meta_has ["configureTheoryModuleCache", "theoryModuleWriteLimit"]
+        ("val _ = Meta.theoryModuleWriteLimit := 0; " ^ configure)
+    else if_meta_has ["configureTheoryModuleCache"] configure
+  end
+
+fun write_child_policy tc path =
+  let
     val module_cache =
-      if HolbuildActionSandbox.active () then
-        if_meta_has ["configureTheoryModuleCache", "theoryModuleWriteLimit"]
-          ("val _ = Meta.theoryModuleWriteLimit := 0; " ^ configure)
-      else if_meta_has ["configureTheoryModuleCache"] configure
+      module_policy {sandboxed = HolbuildActionSandbox.active (), store = module_store (),
+                     base_state = HolbuildToolchain.base_state tc}
   in
     write_text path
       (String.concat
@@ -9147,8 +9155,17 @@ fun exec_run remote root tc (spec : run_spec) log =
           else raise ActionFailed (PublishFailure, "the remote cache holds different outputs for the run")
   end
 
-(* Runs one ActionSpec, writes its result record and returns the exit code.
-   `toolchain` ensures the spec's HOL toolchain and returns it. *)
+(* Whether the writer's output [file] is one of the [expected] modules,
+   each `<theory>-<.dat SHA-1>.pmo`: HOL names them
+   `<base id>-<theory>-<.dat SHA-1>.pmo`, the base id in hex. *)
+fun module_file_wanted expected file =
+  let val (id, rest) = Substring.position "-" (Substring.full file)
+  in
+    Substring.size id > 0 andalso Substring.size rest > 0 andalso
+    CharVector.all Char.isHexDigit (Substring.string id) andalso
+    List.exists (fn e => e = Substring.string (Substring.triml 1 rest)) expected
+  end
+
 (* The most theory modules one worker-run writer saves. *)
 val module_writer_limit = 32
 
@@ -9191,7 +9208,14 @@ fun fill_module_store cache root tc (spec : action_spec) =
               in
                 (seen', (name, b) :: order')
               end
-    val theories = rev (#2 (List.foldl visit ([], []) (map #1 project)))
+    (* The action's direct HOL theory imports, and its project theories. *)
+    val roots =
+      List.mapPartial
+        (fn LoadTheory name =>
+              if has_suffix "Theory" name then SOME (drop_suffix "Theory" name) else NONE
+          | _ => NONE)
+        (#loads spec) @ map #1 project
+    val theories = rev (#2 (List.foldl visit ([], []) roots))
     val expected =
       map (fn (name, b) => name ^ "-" ^ hol_file_sha1 (b ^ ".dat") ^ ".pmo") theories
     (* HOL maps <dir>/xTheory.sml to <dir>/.hol/objs/xTheory.sml itself,
@@ -9213,15 +9237,8 @@ fun fill_module_store cache root tc (spec : action_spec) =
       ", base_state = " ^ HolbuildToolchain.sml_string (HolbuildToolchain.base_state tc) ^
       ", output = " ^ HolbuildToolchain.sml_string output ^
       ", limit = " ^ Int.toString module_writer_limit ^ "};"
-    (* <base id>-<theory>-<.dat SHA-1>.pmo, as HOL names them. *)
-    fun wanted file =
-      case Substring.position "-" (Substring.full file) of
-          (id, rest) =>
-            Substring.size id > 0 andalso Substring.size rest > 0 andalso
-            CharVector.all Char.isHexDigit (Substring.string id) andalso
-            List.exists (fn e => e = Substring.string (Substring.triml 1 rest)) expected
     fun move file =
-      if wanted file then
+      if module_file_wanted expected file then
         FS.rename {old = Path.concat (output, file), new = Path.concat (store, file)}
       else ()
   in
@@ -9240,6 +9257,8 @@ fun fill_module_store cache root tc (spec : action_spec) =
   end
   handle e => warn ("theory modules not written: " ^ General.exnMessage e)
 
+(* Runs one ActionSpec, writes its result record and returns the exit code.
+   `toolchain` ensures the spec's HOL toolchain and returns it. *)
 fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
   let
     val _ = HolbuildOffline.require_online "execute a remote action"
