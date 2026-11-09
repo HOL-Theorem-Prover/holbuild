@@ -502,6 +502,9 @@ def test_action_runs_without_the_worker_token(
     monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
     monkeypatch.setenv("HOLBUILD_REMOTE_CACHE_CURL_CONFIG", str(tmp_path / "cache.curl"))
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.test:3128")
+    for name in worker.SOLVER_ENV:
+        monkeypatch.setenv(name, f"/opt/{name}")
+    monkeypatch.setenv("HOL4_YICES_EXECUTABLE", "/opt/yices")
 
     run_one(
         Coordinator(server.url, "w"),
@@ -522,6 +525,8 @@ def test_action_runs_without_the_worker_token(
     assert env["HOLBUILD_CACHE"] == str(tmp_path / "cache")
     assert env["HOLBUILD_REMOTE_CACHE_CURL_CONFIG"] == str(tmp_path / "cache.curl")
     assert env["PATH"]
+    assert all(env[name] == f"/opt/{name}" for name in worker.SOLVER_ENV)
+    assert "HOL4_YICES_EXECUTABLE" not in env
 
 
 def test_action_exec_action_found_the_cache_unavailable_for_is_reported_as_it_said(

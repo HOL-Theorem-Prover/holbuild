@@ -238,11 +238,20 @@ class Linux:
             lib.seccomp_release(ctx)
 
 
+# Where HOL's libraries find external solvers (HolSmt's z3 and cvc5, SOSLib's
+# csdp, HolRefute's java, hammer provers). They name programs, not secrets.
+# remote-exec's worker forwards the same names (SOLVER_ENV in remote_exec/worker.py).
+SOLVER_ENV = frozenset({
+    "HOL4_Z3_EXECUTABLE", "HOL4_CVC_EXECUTABLE", "HOL4_CSDP_EXECUTABLE", "HOL4_EPROVER_EXECUTABLE",
+    "HOL4_VAMPIRE_EXECUTABLE", "HOL4_ZIPPERPOSITION_EXECUTABLE", "HOL4_JAVA_EXECUTABLE",
+})
+
+
 def sanitized_environment(home: Path) -> dict[str, str]:
     env = {
         key: value for key, value in os.environ.items()
         if key in {"PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR"}
-        or key.startswith("HOLBUILD_RUN_")
+        or key in SOLVER_ENV or key.startswith("HOLBUILD_RUN_")
     }
     if sys.prefix != sys.base_prefix and "PATH" in env:
         venv_bin = os.path.realpath(os.path.join(sys.prefix, "bin"))
