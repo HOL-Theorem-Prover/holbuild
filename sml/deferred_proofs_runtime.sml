@@ -204,7 +204,7 @@ struct
      and source location, then the strings of the theory data; the last
      theorem name ends the first part.  Raises Fail on theory data of an
      encoding whose string references holbuild can't find. *)
-  fun rewrite_data lookup data =
+  fun rewrite_data_observing observe lookup data =
     let
       open HOLsexp
       fun fail what = raise Fail ("unexpected " ^ what ^ " in the exported theory data")
@@ -263,7 +263,7 @@ struct
       val theorems' =
         map (fn {name, self, deps, oracles, info, terms} =>
                 let val (deps', oracles') = resolve thy lookup (deps, oracles)
-                in {name = name, self = self, deps = deps', oracles = oracles', info = info, terms = terms} end)
+                in observe oracles'; {name = name, self = self, deps = deps', oracles = oracles', info = info, terms = terms} end)
             theorems
       val (_, index, rev_table) =
         interned start (List.concat (map thm_strings theorems') @
@@ -293,6 +293,7 @@ struct
                        resolve thy lookup (map tagged_group (items deps),
                                            map (fn String s => s | _ => fail "oracle") (items oracles))
                      fun named_group (t, ns) = List (String t :: map Integer ns)
+                     val _ = observe oracles'
                    in
                      Cons (Symbol "tag-th",
                            Cons (List [thy_name, save, List (map named_group deps'), List (map String oracles')], rest))
@@ -325,6 +326,8 @@ struct
                   Cons (tables', List [Symbol "exports", tys, tms, List (map encode theorems')])),
             incorporate, loadable']
     end
+
+  fun rewrite_data lookup data = rewrite_data_observing (fn _ => ()) lookup data
 
   fun read_text path =
     let val input = TextIO.openIn path
@@ -360,25 +363,63 @@ struct
      dependencies, and the oracle every theorem loaded from disk carries. *)
   fun outline_lookup _ = ([], ["DISK_THM"])
 
+  (* An oracle other than DISK_THM that a theorem in scope carries: one of
+     the theory's own, as exported with each deferred proof as the outline
+     sees it, or one of an ancestor's.  A deferred proof that uses such a
+     theorem carries its oracle, which the outline can't predict; an
+     ancestor's [local] theorem reaches this theory only through exported
+     ones, which carry its oracles. *)
+  fun oracle_in_scope data =
+    let
+      val found = ref NONE
+      fun note thy oracles =
+        case (!found, List.find (fn s => s <> "DISK_THM" andalso
+                                         not (String.isPrefix "holbuild_deferred_" s)) oracles) of
+            (NONE, SOME oracle) => found := SOME (oracle, thy)
+          | _ => ()
+      val outline = rewrite_data_observing (note (Theory.current_theory ())) outline_lookup data
+      fun oracles th = #1 (Tag.dest_tag (Thm.tag th))
+      fun ancestor thy = List.app (fn (_, th) => note thy (oracles th)) (DB.thms thy)
+      (* Local theorems (Triviality) are not exported but a deferred proof
+         may use them. *)
+      fun locals () =
+        List.app (fn (_, (th, _, _)) => note (Theory.current_theory ()) (oracles th))
+                 (DB.matchp (fn _ => true) ["-"])
+    in
+      if isSome (!found) then () else locals ();
+      if isSome (!found) then () else List.app ancestor (Theory.ancestry "-");
+      (outline, !found)
+    end
+
   (* Writes the theory data with every deferred proof as the outline sees
      it to the export of SIG_PATH and copies the export to OUTLINE_DIR,
-     ending with the file `ready`. *)
+     ending with the file `ready`.  With an oracle in scope it publishes
+     nothing but the file `withheld`, saying which: children then wait for
+     the theory's final outputs. *)
   fun publish_outline {sig_path, outline_dir} =
     let
       val stem = OS.Path.base sig_path
       fun copy ext = HolbuildRuntime.write_text (OS.Path.concat (outline_dir, OS.Path.file stem ^ ext))
                                                 (read_text (stem ^ ext))
+      fun publish () =
+        (OS.FileSys.mkDir outline_dir handle OS.SysErr _ => ();
+         List.app copy [".dat", ".sml", ".sig"];
+         HolbuildRuntime.write_text (OS.Path.concat (outline_dir, "ready")) "")
     in
-      if null (!queue) then HolbuildRuntime.normalize_theory_export sig_path
+      if null (!queue) then (HolbuildRuntime.normalize_theory_export sig_path; publish ())
       else
-        let val data = HOLsexp.fromString (read_text (stem ^ ".dat"))
+        let
+          val data = valOf (HOLsexp.fromString (read_text (stem ^ ".dat")))
+          val _ = marker_data := SOME data
+          val (outline, oracle) = oracle_in_scope data
         in
-          marker_data := data;
-          write_data sig_path (rewrite_data outline_lookup (valOf data))
-        end;
-      OS.FileSys.mkDir outline_dir handle OS.SysErr _ => ();
-      List.app copy [".dat", ".sml", ".sig"];
-      HolbuildRuntime.write_text (OS.Path.concat (outline_dir, "ready")) ""
+          case oracle of
+              NONE => (write_data sig_path outline; publish ())
+            | SOME (name, thy) =>
+                (OS.FileSys.mkDir outline_dir handle OS.SysErr _ => ();
+                 HolbuildRuntime.write_text (OS.Path.concat (outline_dir, "withheld"))
+                   ("oracle " ^ name ^ " in theory " ^ thy ^ "\n"))
+        end
     end
 
   (* Writes the theory data with each deferred proof's dependencies and

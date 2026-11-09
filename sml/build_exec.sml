@@ -438,6 +438,16 @@ fun peak_rss_report_line path =
    the file `ready` (HolbuildDeferred.publish_outline). *)
 fun stage_outline_dir stage = Path.concat(stage, "holbuild-outline")
 
+(* Why the pipelined theory child in STAGE published no outline, if it
+   withheld it (an oracle in scope). *)
+fun withheld_outline stage =
+  let val path = Path.concat(stage_outline_dir stage, "withheld")
+  in
+    if FS.access (path, []) handle OS.SysErr _ => false
+    then SOME (String.translate (fn #"\n" => "" | c => String.str c) (read_text path))
+    else NONE
+  end
+
 (* How many threads a pipelined theory child proves its deferred proofs
    on: HOLBUILD_PROOF_THREADS, or else up to 4 of the build's jobs. *)
 val pipeline_proof_threads = ref 1
@@ -5505,8 +5515,9 @@ fun mentions_at_identifier_start text word =
 (* The theory script SOURCE_TEXT, with BOUNDARIES its theorem spans, for a
    pipelined build: every proof deferred, in `HolbuildDeferred.defer`
    (sml/deferred_proofs_runtime.sml), which accepts its goal at once and
-   proves it after the theory is exported.  A proof that is just `cheat`
-   stays, so its oracle stays.  A proof (or `Resume` block) that suspends
+   proves it after the theory is exported.  A proof that mentions `cheat`
+   stays, so its oracle is there when the theory decides whether to publish
+   its outline (HolbuildDeferred.publish_outline).  A proof (or `Resume` block) that suspends
    goals stays too, so they are still suspended for the `Resume` blocks
    that prove them and its `Finalise` saves the theorem where the real
    build does.  A theorem the script resumes suspends, whether or not its
@@ -5520,7 +5531,7 @@ fun deferred_source source_text boundaries =
     val resumed = List.mapPartial resumed boundaries
     fun deferred kind name tactic =
       (kind = "resume" orelse (kind = "theorem" andalso not (List.exists (fn r => r = name) resumed))) andalso
-      Substring.string (Substring.dropr Char.isSpace (Substring.dropl Char.isSpace (Substring.full tactic))) <> "cheat" andalso
+      not (mentions_at_identifier_start tactic "cheat") andalso
       not (mentions_at_identifier_start tactic "suspend")
     fun splice [] _ pos acc = String.concat (rev (String.extract (source_text, pos, NONE) :: acc))
       | splice ({kind, name, tactic_start, tactic_end, ...} :: rest) k pos acc =
@@ -5949,7 +5960,7 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
     val attempt_queue = ref ([] : (int * int) list)
     val commit_queue = ref ([] : (int * speculative_result) list)
     val counts = {outlines = ref 0, outline_failures = ref 0, gate_failures = ref 0,
-                  attempt_failures = ref 0}
+                  attempt_failures = ref 0, withheld = ref 0}
     val _ = if pipelining then remove_tree (Path.concat(root, ".holbuild/outline")) else ()
     val _ = pipeline_proof_threads :=
               (case Option.mapPartial Int.fromString (OS.Process.getEnv "HOLBUILD_PROOF_THREADS") of
@@ -6486,6 +6497,11 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
                   case outcome of
                       Succeeded result =>
                         (Array.update (attempt, id, ADone (gen, consumed, result));
+                         (case withheld_outline (#stage result) of
+                              SOME reason =>
+                                (#withheld counts := !(#withheld counts) + 1;
+                                 pipeline_trace ("outline withheld: " ^ node_name id ^ " (" ^ reason ^ ")"))
+                            | NONE => ());
                          pipeline_trace ("attempt done: " ^ node_name id))
                     | NotCold => (Array.update (cold, id, SOME false); Array.update (attempt, id, AOff))
                     | Failed msg =>
@@ -6603,14 +6619,16 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
             | SOME (OutlineWork (id, gen, view)) => (run_outline id gen view; loop ())
             | SOME (AttemptWork (id, gen, view)) => (run_attempt id gen view; loop ())
             | SOME (CommitWork (id, result)) =>
-                build id
+                build id false
                   (fn node =>
                       build_one (SOME result) dat_hash_cache status options tc project base_context plan keys
                         toolchain_key node
                       before remove_tree (#stage_root result))
             | SOME (PlainWork id) =>
-                build id (fn node => build_one NONE dat_hash_cache status options tc project base_context plan keys toolchain_key node)
-        and build id run =
+                build id true (fn node => build_one NONE dat_hash_cache status options tc project base_context plan keys toolchain_key node)
+        (* A pipelined build's commit saves no checkpoints, so it needs no
+           checkpoint maintenance. *)
+        and build id may_checkpoint run =
                 let val node = Vector.sub (nodes, id)
                 in
                   ((case run node of
@@ -6619,7 +6637,7 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
                           let
                             val _ = if pipelining then check_gate id else ()
                             val collect_protected =
-                              checkpoints_possible andalso
+                              may_checkpoint andalso checkpoints_possible andalso
                               outcome_may_create_checkpoints options project node outcome
                           in
                             if collect_protected then
@@ -6681,14 +6699,15 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
       val threads = List.tabulate (jobs, fn _ => Thread.fork (worker, []))
       val result = wait_workers_result ()
       val _ = wait_worker_threads threads
-      val {outlines, outline_failures, gate_failures, attempt_failures} = counts
+      val {outlines, outline_failures, gate_failures, attempt_failures, withheld} = counts
     in
       if pipelining then
         (remove_speculation ();
          pipeline_trace ("summary: outlines=" ^ Int.toString (!outlines) ^
                          " outline_failures=" ^ Int.toString (!outline_failures) ^
                          " gate_failures=" ^ Int.toString (!gate_failures) ^
-                         " attempt_failures=" ^ Int.toString (!attempt_failures)))
+                         " attempt_failures=" ^ Int.toString (!attempt_failures) ^
+                         " withheld=" ^ Int.toString (!withheld)))
       else ();
       raise_failure result
     end

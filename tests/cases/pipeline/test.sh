@@ -227,9 +227,69 @@ rm -rf "$tmpdir/checkpointed/.holbuild"
   > "$tmpdir/checkpointed.log" 2>&1
 require_no_grep "attempt done" "$tmpdir/checkpointed.log"
 
-# The digest differs: B's theorem comes from A's cheat, its stub doesn't, so
-# C's attempt on B's outline is dropped and C builds on the real B.  A's
-# proof is just `cheat`, which its outline keeps, so A passes.
+# A cheat in scope: B's proof uses A's cheated theorem, so it carries the
+# cheat once proved, which an outline can't predict.  B publishes no outline,
+# and C builds on the committed B.
+new_project withheld
+cat > "$tmpdir/withheld/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Theorem a_lemma:
+  T
+Proof
+  cheat
+QED
+val _ = export_theory();
+SML
+write_b_and_c withheld
+cat > "$tmpdir/withheld/src/BScript.sml" <<SML
+open HolKernel Parse boolLib bossLib ATheory;
+val _ = new_theory "B";
+Theorem b_thm:
+  T
+Proof
+  $pause >> $pause >> $pause >> ACCEPT_TAC ATheory.a_lemma
+QED
+val _ = export_theory();
+SML
+sed -i 's/T \/\\ T/T/' "$tmpdir/withheld/src/CScript.sml"
+build_pipelined withheld CTheory
+log=$tmpdir/withheld.log
+require_grep "pipeline: gate passed: ATheory" "$log"
+require_grep "pipeline: outline withheld: BTheory (oracle cheat in theory A)" "$log"
+require_no_grep "outline ready: BTheory" "$log"
+require_no_grep "gate failed" "$log"
+require_before "committed: BTheory" "attempt done: CTheory" "$log"
+require_same_as_unpipelined withheld CTheory A B C
+
+# The same from a cheat in A itself, in a [local] lemma whose proof does more
+# than cheat (so it stays in place) and that a deferred proof uses.
+new_project withheld-local
+cat > "$tmpdir/withheld-local/src/AScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Triviality a_lemma:
+  T
+Proof
+  ALL_TAC >> cheat
+QED
+Theorem a_thm:
+  T
+Proof
+  $pause >> $pause >> ACCEPT_TAC a_lemma
+QED
+val _ = export_theory();
+SML
+write_b_and_c withheld-local
+build_pipelined withheld-local CTheory
+log=$tmpdir/withheld-local.log
+require_grep "pipeline: outline withheld: ATheory (oracle cheat in theory A)" "$log"
+require_no_grep "gate failed" "$log"
+require_same_as_unpipelined withheld-local CTheory A B C
+
+# The digest differs: B's proof makes an oracle itself, which nothing in
+# scope shows, so B's outline is published without it; C's attempt on it is
+# dropped and C builds on the real B.
 new_project digest
 cat > "$tmpdir/digest/src/AScript.sml" <<'SML'
 open HolKernel Parse boolLib bossLib;
@@ -237,7 +297,7 @@ val _ = new_theory "A";
 Theorem a_lemma:
   T
 Proof
-  cheat
+  ACCEPT_TAC TRUTH
 QED
 val _ = export_theory();
 SML
@@ -248,7 +308,7 @@ val _ = new_theory "B";
 Theorem b_thm:
   T
 Proof
-  $pause >> $pause >> $pause >> ACCEPT_TAC ATheory.a_lemma
+  $pause >> $pause >> $pause >> (fn (asl, w) => ACCEPT_TAC (mk_oracle_thm "made_here" (asl, w)) (asl, w))
 QED
 val _ = export_theory();
 SML
