@@ -3,14 +3,6 @@ struct
 
 structure P = HolbuildAnalysisProtocol
 
-fun read_all path =
-  let val input = TextIO.openIn path
-  in TextIO.inputAll input before TextIO.closeIn input end
-
-fun write_file path text =
-  let val out = TextIO.openOut path
-  in TextIO.output(out, text); TextIO.closeOut out end
-
 fun int field text =
   case Int.fromString text of
       SOME n => n
@@ -23,31 +15,19 @@ fun analyser () =
 
 fun run wants source_path =
   let
-    val req = HolbuildTempPath.temporary "spans-request"
-    val resp = HolbuildTempPath.temporary "spans-response"
-    val err = HolbuildTempPath.temporary "spans-error"
     val request = String.concatWith "\n"
       [P.join ["version", P.protocol_version],
        P.join ["command", "analyse"],
        P.join (["file", "1", source_path] @ wants),
        P.join ["end"]] ^ "\n"
-    val _ = write_file req request
-    val status = OS.Process.system (HolbuildHash.quote (analyser ()) ^ " " ^
-                                    String.concatWith " " (HolbuildDependencies.analyser_min_heap_args ()) ^
-                                    " --request " ^ HolbuildHash.quote req ^
-                                    " --response " ^ HolbuildHash.quote resp ^ " 2> " ^ HolbuildHash.quote err)
-    val stderr = read_all err handle _ => ""
-    val _ = OS.FileSys.remove req handle OS.SysErr _ => ()
-    val _ = OS.FileSys.remove err handle OS.SysErr _ => ()
+    val {output, stderr, response} =
+      HolbuildDependencies.run_analyser {analyser = analyser (), request = request, capture_stderr = true}
   in
-    if OS.Process.isSuccess status then
-      let val lines = String.tokens (fn c => c = #"\n") (read_all resp)
-          val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
-      in lines end
-    else
-      let val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
-      in raise HolbuildTheoryCheckpoints.Error ("holbuild-hol-analyser failed for " ^ source_path ^
-                                                (if stderr = "" then "" else "\n" ^ stderr)) end
+    print output;
+    case response of
+        SOME text => String.tokens (fn c => c = #"\n") text
+      | NONE => raise HolbuildTheoryCheckpoints.Error ("holbuild-hol-analyser failed for " ^ source_path ^
+                                                       (if stderr = "" then "" else "\n" ^ stderr))
   end
 
 fun parse_boundary fields =
