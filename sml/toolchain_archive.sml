@@ -21,7 +21,8 @@ fun path_exists path = FS.access(path, []) handle OS.SysErr _ => false
 fun is_dir path = FS.isDir path handle OS.SysErr _ => false
 
 val remove_file = HolbuildFileLock.remove_file
-val remove_tree = HolbuildFileLock.remove_tree
+(* Extracted archives are untrusted: a directory may lack owner access. *)
+fun remove_tree path = HolbuildRemoveTree.remove_untrusted path handle HolbuildRemoveTree.Error msg => raise Error msg
 val read_text = HolbuildFileLock.read_text
 val write_text = HolbuildFileLock.write_text
 

@@ -13,7 +13,8 @@ val home = root ^ "/home";
 val _ = HolbuildActionSandbox.enable (root ^ "/action", root ^ "/checkpoints");
 val _ = HolbuildActionSandbox.toolchain_root := root ^ "/toolchain";
 val _ = HolbuildActionSandbox.poly_executable := home ^ "/bin/poly";
-val args = HolbuildActionSandbox.wrap (root ^ "/completed") ["true"];
+val args = HolbuildActionSandbox.wrap (root ^ "/completed")
+             {writable = [root ^ "/action", root ^ "/checkpoints"], readable = [], toolchain = false} ["true"];
 fun reads ("--read" :: path :: rest) = path :: reads rest
   | reads (_ :: rest) = reads rest
   | reads [] = [];

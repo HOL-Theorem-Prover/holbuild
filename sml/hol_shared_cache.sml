@@ -43,8 +43,15 @@ fun ensure_dir path =
   else if path_exists path then ()
   else (ensure_dir (Path.dir path); FS.mkDir path handle OS.SysErr _ => ())
 
+(* Under exec-action a confined build may have left directories without owner
+   access, which rm -rf cannot empty; once no command holds the mutation lease
+   (RUN_COMMAND waits for it), the entry is removed restoring that access. *)
 fun remove_tree run_command path =
   if path = "" orelse path = "." orelse path = "/" then die ("refusing to remove unsafe path: " ^ path)
+  else if HolbuildActionSandbox.active () then
+    (ignore (run_command ":");
+     HolbuildRemoveTree.remove_untrusted_strict path
+     handle HolbuildRemoveTree.Error msg => die msg)
   else ignore (run_command ("rm -rf " ^ quote path))
 
 fun cache_root () =
@@ -60,6 +67,7 @@ fun command_output_using run_command command =
   end
   handle e as Error _ => raise e
        | e as HolbuildProcessGroup.Error _ => raise e
+       | e as HolbuildActionSandbox.Error _ => raise e
        | e => die ("command failed: " ^ command ^ ": " ^ General.exnMessage e)
 
 fun command_output command =
@@ -172,12 +180,29 @@ fun last_used_for_key k = Path.concat(entry_dir_for_key k, "last-used")
 fun trash_dir () = Path.concat(toolchains_dir (), ".trash")
 
 fun run_mutation k script =
-  HolbuildProcessGroup.run_shell_with_mutation_lease
-    {lease_path = mutation_lease_path k, script = HolbuildActionSandbox.bootstrap_command script}
+  HolbuildProcessGroup.run_shell_with_mutation_lease {lease_path = mutation_lease_path k, script = script}
 
 fun run_mutation_output k script =
-  HolbuildProcessGroup.run_shell_output_with_mutation_lease
-    {lease_path = mutation_lease_path k, script = HolbuildActionSandbox.bootstrap_command script}
+  HolbuildProcessGroup.run_shell_output_with_mutation_lease {lease_path = mutation_lease_path k, script = script}
+
+(* Under exec-action the toolchain may come from any commit, so every command
+   that runs or reads it through its own code (configure, bin/build, bin/hol,
+   Holmake, polyc on its sources, git on its checkout) runs confined with
+   GRANTS; elsewhere RUN runs SCRIPT as it is. *)
+fun confine grants run script =
+  if HolbuildActionSandbox.active () then HolbuildActionSandbox.shell grants (fn _ => script) run #2
+  else run script
+
+(* Reads the entry, writes nothing of it. *)
+fun reading k = {writable = [], readable = [entry_dir_for_key k], toolchain = false}
+
+(* git over a toolchain checkout: under exec-action the build could have
+   written its configuration, so none of it may run a program. *)
+fun checkout_git () =
+  if HolbuildActionSandbox.active () then
+    "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_OPTIONAL_LOCKS=0 " ^ HolbuildOffline.git_command () ^
+    " -c core.fsmonitor=false -c core.hooksPath=/dev/null -c protocol.file.allow=never"
+  else HolbuildOffline.git_command ()
 
 fun await_mutation_quiescence k =
   if OS.Process.isSuccess (run_mutation k ":") then ()
@@ -199,8 +224,9 @@ fun built holdir =
 
 fun dirty_status k holdir =
   trim
-    (command_output_using (run_mutation_output k)
-       (HolbuildOffline.git_command () ^ " -C " ^ quote holdir ^ " status --porcelain --ignored=no"))
+    (command_output_using (confine (reading k) (run_mutation_output k))
+       (checkout_git () ^ " -C " ^ quote holdir ^ " status --porcelain --ignored=no" ^
+        (if HolbuildActionSandbox.active () then " --ignore-submodules=all" else "")))
 fun clean k holdir = dirty_status k holdir = ""
 
 fun effective_build_args kernel_variant holdir =
@@ -220,12 +246,22 @@ fun effective_build_args kernel_variant holdir =
   end
 
 fun generate_hol_source_manifest k =
-  HolbuildHolSourceManifest.generate
-    {holdir = holdir_for_key k,
-     manifest_path = hol_source_manifest_for_key k,
-     members_path = hol_source_members_for_key k,
-     run_command = run_mutation_output k}
-  handle HolbuildHolSourceManifest.Error msg => die msg
+  let
+    (* generate reports a failing command as its own Error; a sandbox
+       failure must still reach exec-action as one. *)
+    val sandbox_failure = ref NONE
+    fun run command =
+      confine (reading k) (run_mutation_output k) command
+      handle e as HolbuildActionSandbox.Error _ => (sandbox_failure := SOME e; raise e)
+  in
+    HolbuildHolSourceManifest.generate
+      {holdir = holdir_for_key k,
+       manifest_path = hol_source_manifest_for_key k,
+       members_path = hol_source_members_for_key k,
+       run_command = run}
+    handle HolbuildHolSourceManifest.Error msg =>
+      (case !sandbox_failure of SOME e => raise e | NONE => die msg)
+  end
 
 fun hol_source_manifest_built k =
   let
@@ -275,7 +311,7 @@ fun legacy_hol_source_files k holdir =
   let
     (* Not command_output_using: git's stderr must not mix with the paths. *)
     val {status, output} =
-      run_mutation_output k (HolbuildOffline.git_command () ^ " -C " ^ quote holdir ^ " ls-files -z 2>/dev/null")
+      confine (reading k) (run_mutation_output k) (checkout_git () ^ " -C " ^ quote holdir ^ " ls-files -z 2>/dev/null")
   in
     if OS.Process.isSuccess status then SOME (String.tokens (fn c => c = #"\000") output)
     else NONE
@@ -509,7 +545,8 @@ fun build_analyser k =
     val bindir = Path.concat(dir, "bin")
     val out = analyser_bin_for_key k ak
     val hol = holdir_for_key k
-    val run_command = run_mutation k
+    (* polyc links against the toolchain's sources and chmods its output. *)
+    val run_command = confine {writable = [dir], readable = [entry_dir_for_key k], toolchain = true} (run_mutation k)
     val src = analyser_source_dir ()
     val material = analyser_key_material ()
   in
@@ -549,20 +586,55 @@ fun build_entry jobs req k =
     val run_command = run_mutation k
     (* -j only sets bin/build's concurrency; it stays out of the key. *)
     val jobs_arg = case jobs of NONE => "" | SOME n => "-j " ^ Int.toString n ^ " "
+    (* exec-action fetches the exact commit with the worker's hardened git,
+       never the user's configuration, and checks out nothing else first. *)
+    fun hardened_fetch () =
+      let
+        fun git args =
+          let val result = HolbuildActionSandbox.hardened_git {home = "/nonexistent", protocol = "https:file"} args
+          in
+            if HolbuildSpawn.succeeded result then trim (#output result)
+            else die ("could not fetch HOL " ^ #rev req ^ " from " ^ #git req ^ ":\n" ^ #output result)
+          end
+      in
+        ignore (git ["clone", "--quiet", "--no-checkout", "--no-hardlinks", "--no-recurse-submodules",
+                     "--", #git req, hol]);
+        ignore (git ["-C", hol, "checkout", "--quiet", "--detach", #rev req]);
+        if git ["-C", hol, "rev-parse", "--verify", "HEAD^{commit}"] = #rev req then ()
+        else die ("HOL checkout is not commit " ^ #rev req ^ ": " ^ hol);
+        (* Later status checks run read-only and cannot refresh the index. *)
+        ignore (git ["-C", hol, "update-index", "-q", "--refresh"])
+      end
     fun fetch () =
       (ensure_dir (toolchains_dir ());
        if path_exists final then remove_tree run_command final else ();
        ensure_dir final;
-       run_in_dir run_command final (HolbuildOffline.git_command () ^ " clone " ^ quote (#git req) ^ " " ^ quote hol);
-       run_in_dir run_command hol (HolbuildOffline.git_command () ^ " checkout --detach " ^ quote (#rev req)))
+       if HolbuildActionSandbox.active () then hardened_fetch ()
+       else
+         (run_in_dir run_command final (HolbuildOffline.git_command () ^ " clone " ^ quote (#git req) ^ " " ^ quote hol);
+          run_in_dir run_command hol (HolbuildOffline.git_command () ^ " checkout --detach " ^ quote (#rev req))))
+    (* Under exec-action the build writes only its tree and never sees the
+       repository: .git waits beside it, and whatever the build put in its
+       place is discarded before it returns. *)
+    val git_dir = Path.concat(hol, ".git")
+    val git_aside = Path.concat(final, ".git-bootstrap")
+    val build_command = confine {writable = [hol], readable = [], toolchain = true} run_command
+    fun bootstrap f =
+      if not (HolbuildActionSandbox.active ()) then f ()
+      else
+        (FS.rename {old = git_dir, new = git_aside};
+         f ();
+         HolbuildRemoveTree.remove_untrusted_strict git_dir;
+         FS.rename {old = git_aside, new = git_dir})
     fun build () =
       let
         val _ = fetch ()
         val hol_source = hol_source_identity hol (hol_source_files hol)
       in
-        run_in_dir run_command hol (quote (poly_command ()) ^ " --script tools/smart-configure.sml");
-        run_in_dir run_command hol
-          ("bin/build " ^ jobs_arg ^ effective_build_args (#kernel_variant req) hol);
+        bootstrap (fn () =>
+          (run_in_dir build_command hol (quote (poly_command ()) ^ " --script tools/smart-configure.sml");
+           run_in_dir build_command hol
+             ("bin/build " ^ jobs_arg ^ effective_build_args (#kernel_variant req) hol)));
         if built hol then () else die ("HOL build did not produce bin/hol, bin/Holmake, bin/build, and bin/hol.state in " ^ hol);
         generate_hol_source_manifest k;
         if clean k hol then () else die ("HOL build left dirty checkout: " ^ hol ^ "\n" ^ dirty_status k hol);
@@ -621,7 +693,7 @@ fun heap_loads k =
       quote hol ^ " --noconfig --holstate " ^ quote state ^
       " </dev/null >/dev/null 2>&1"
   in
-    OS.Process.isSuccess (OS.Process.system command)
+    OS.Process.isSuccess (confine (reading k) HolbuildProcessGroup.run_shell command)
   end
 
 (* What a toolchain archive must hold: a working HOL build.  The source
@@ -678,7 +750,13 @@ fun restore_entry k =
       in
         if HolbuildToolchainArchive.restore
              {remote = remote, identity = archive_identity k, final_dir = final} then
-          (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_RENAMED";
+          ((* Anyone who can publish could have built it, so under exec-action
+              it must be as closed as a confined build's before anything runs it. *)
+           if not (HolbuildActionSandbox.active ()) then () else
+             (case HolbuildActionSandbox.closed_tree final of
+                  NONE => ()
+                | SOME why => raise HolbuildToolchainArchive.Rejected ("restored HOL toolchain is not closed: " ^ why));
+           signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_RENAMED";
            wait_test_gate "HOLBUILD_TEST_TOOLCHAIN_RENAMED_GATE";
            if complete_toolchain_contents k then
              (write_file (ok_for_key k) "ok\n"; Restored)
@@ -694,6 +772,8 @@ fun restore_entry k =
       | SOME url =>
           (restore url
            handle error as HolbuildRemoteCache.Unavailable _ => (cleanup_restore_state k; raise error)
+                (* The sandbox failing says nothing about the archive. *)
+                | error as HolbuildActionSandbox.Error _ => (cleanup_restore_state k; raise error)
                 | error =>
              (cleanup_restore_state k;
               warn_restore (archive_error_message error);
@@ -728,6 +808,7 @@ fun publish_entry {replace} k =
                      remove_tree (run_mutation k) (entry_dir_for_key k)
                    else ();
                    raise error)
+              | error as HolbuildActionSandbox.Error _ => raise error
               | error => (warn_publish (archive_error_message error); false))
 
 fun adopt_published_entry k =

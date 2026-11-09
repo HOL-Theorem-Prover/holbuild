@@ -261,19 +261,32 @@ group, so an outer timeout's forced group shutdown does not interrupt cleanup.
 The launcher supplies its identity before starting the supervisor, which
 refuses to start HOL if it has already lost that parent.
 
-HOL toolchain bootstrap executes trusted source. Before using a toolchain,
-workers require its revision to be a commit ancestor of an approved branch.
-The default approves `develop` and `master` in the canonical HOL repository.
+Everything the selected HOL toolchain runs is confined the same way:
+configuring and building HOL, loading its heap, listing its sources with
+Holmake and `git`, and compiling and running the dependency analyser. A HOL
+build may write only its own tree. Within it, the supervisor applies its mode
+changes, never setuid or setgid, and its links may not point outside. The
+repository's `.git` directory is out of its reach while it builds. The worker
+clones the exact commit without user or system Git configuration, hooks,
+submodules or credential prompts, and checks that the checkout is that
+commit. A built toolchain is checked like action outputs before it is used:
+no links out of the tree, hard links, special or setuid files, and every
+directory listable. A toolchain restored from the remote cache is checked the
+same way before anything in it runs.
+
+Workers accept a toolchain only from a trusted repository. The default
+approves commits on `develop` and `master` in the canonical HOL repository.
 Administrators may replace these defaults with whitespace-separated
 `HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES` entries of the form
 `https://example.org/HOL.git=develop,master` for trusted mirrors or forks.
 Only these branch refs are fetched, never pull-request refs or arbitrary
 revision objects. Proven ancestry is reused from a worker-owned Git graph;
 a branch history rewrite takes effect when the next unknown revision triggers
-a refresh. Use protected branches for these trust roots.
-Bootstrap compiler/build children also have credential settings removed from
-their environment. This restriction is worker configuration, not an action
-spec option. Administrators can grant additional read-only runtime directories
+a refresh. Use protected branches for these trust roots. The entry `*`
+accepts any `https://` repository at a full commit hash, with no branch
+check, since no step runs the toolchain's code outside the sandbox; such
+toolchains still cost worker time to build.
+Trust is worker configuration, not an action spec option. Administrators can grant additional read-only runtime directories
 with colon-separated `HOLBUILD_ACTION_READ_DIRS`; do not include credentials
 or shared writable state in these directories.
 

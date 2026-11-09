@@ -4377,10 +4377,6 @@ fun run_from_state tc project plan keys node =
                       "built with --skip-checkpoints, or removed by gc)")
   end
 
-fun write_temp_text path text =
-  let val out = TextIO.openOut path
-  in TextIO.output(out, text); TextIO.closeOut out end
-
 type proof_ir_input = {name : string, tactic_start : int, tactic_end : int, tactic_text : string}
 
 fun analyser_proof_ir_plan_sml (inputs : proof_ir_input list) =
@@ -4391,23 +4387,14 @@ fun analyser_proof_ir_plan_sml (inputs : proof_ir_input list) =
           fun proof_line (i, {name, tactic_start, tactic_end, tactic_text} : proof_ir_input) =
             HolbuildAnalysisProtocol.join ["theorem", Int.toString i, name,
                                            Int.toString tactic_start, Int.toString tactic_end, tactic_text]
-          val req = HolbuildTempPath.temporary "analyser-request"
-          val resp = HolbuildTempPath.temporary "analyser-response"
           val request = String.concatWith "\n"
             ([HolbuildAnalysisProtocol.join ["version", HolbuildAnalysisProtocol.protocol_version],
               HolbuildAnalysisProtocol.join ["command", "proof-ir-plan"]] @
              map proof_line (ListPair.zip (List.tabulate(length inputs, fn i => i), inputs)) @
              [HolbuildAnalysisProtocol.join ["end"]]) ^ "\n"
-          val _ = write_temp_text req request
-          val status = OS.Process.system (HolbuildHash.quote analyser ^ " " ^
-                                          String.concatWith " " (HolbuildDependencies.analyser_min_heap_args ()) ^
-                                          " --request " ^ HolbuildHash.quote req ^
-                                          " --response " ^ HolbuildHash.quote resp)
-          val _ = OS.FileSys.remove req handle OS.SysErr _ => ()
-          val text = if OS.Process.isSuccess status then read_text resp
-                     else (OS.FileSys.remove resp handle OS.SysErr _ => ();
-                           raise Error "holbuild-hol-analyser failed")
-          val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
+          val text = case HolbuildDependencies.analyser_response analyser request of
+                         SOME text => text
+                       | NONE => raise Error "holbuild-hol-analyser failed"
           val expected = length inputs
           val result = Array.array(expected, NONE : (string * string) option)
           fun store id expr =
@@ -9245,6 +9232,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
               toolchain (#toolchain spec)
               handle e as HolbuildRemoteCache.Unavailable _ => raise e
                    | e as ActionFailed _ => raise e
+                   | HolbuildActionSandbox.Error msg => raise action_failed InternalFailure msg
                    | e => raise action_failed ToolchainFailure (General.exnMessage e)
             val _ =
               if HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key =
@@ -9271,6 +9259,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
           phase "toolchain" (fn () => toolchain (#toolchain spec))
           handle e as HolbuildRemoteCache.Unavailable _ => raise e
                | e as ActionFailed _ => raise e
+               (* The sandbox, not the toolchain, failed: retryable. *)
+               | HolbuildActionSandbox.Error msg => raise action_failed InternalFailure msg
                | e => raise action_failed ToolchainFailure (General.exnMessage e)
         val _ =
           if HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key =
