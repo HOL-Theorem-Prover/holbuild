@@ -13,7 +13,8 @@
    dependencies only through their defining theorems.  The listener below
    certifies each one the definition principles announce right after storing
    a defining theorem that mentions it; one made any other way (a raw kernel
-   primitive) leaves the theory uncertified, and then no proof in it is
+   primitive, or a definition hook the theory installed) leaves the theory
+   uncertified, and then no proof in it is
    reused or recorded. *)
 structure HolbuildProofCacheRuntime =
 struct
@@ -63,6 +64,15 @@ fun certifies mentions knm =
       NONE => true
     | SOME th => Theory.uptodate_thm th andalso mentions knm th
 
+(* `new_definition` stores what its hook makes of the kernel's defining
+   theorem.  The hooks in effect when the ancestors were loaded store a
+   theorem equivalent to it and keep nothing else; a hook installed since
+   could keep the kernel's theorem and store a weaker one, so constants
+   defined under it aren't certified. *)
+val ancestors_definition_hook = !Theory.Definition.new_definition_hook
+fun definition_hook_unchanged () =
+  PolyML.pointerEq (!Theory.Definition.new_definition_hook, ancestors_definition_hook)
+
 fun generic_type ({Thy, Name} : KernelSig.kernelname) =
   case Type.op_arity {Thy = Thy, Tyop = Name} of
       SOME arity =>
@@ -75,7 +85,7 @@ fun note_theory_event event =
    case event of
        TheoryDelta.NewBinding (_, (th, {class = DB.Def, ...})) => pending_definition_ref := SOME th
      | TheoryDelta.NewConstant knm =>
-         if certifies mentions_const knm then
+         if definition_hook_unchanged () andalso certifies mentions_const knm then
            certified_consts_ref := Redblackmap.insert (!certified_consts_ref, knm, Term.prim_mk_const knm)
          else ()
      | TheoryDelta.NewTypeOp knm =>

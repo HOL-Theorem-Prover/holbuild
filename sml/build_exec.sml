@@ -8087,10 +8087,20 @@ fun resident_misfits_parents remote root (spec : action_spec) resident =
   let
     val {dat_hash, ...} = cache_manifest_blobs_from_lines (spec_publish_key spec) (cache_manifest_lines resident)
     val path = in_root root ".holbuild/resident.dat"
-    fun as_remote key =
-      case (HolbuildCache.get_action (cache_root ()) key, HolbuildRemoteCache.get_action remote key) of
-          (SOME mine, SOME theirs) => cache_manifest_outputs_equal key mine theirs
-        | _ => false
+    (* The dependency restored from the first of its keys with a local
+       entry, as hydrate_spec_deps tries them; it came from the remote cache
+       when that entry matches the remote's. *)
+    fun as_remote dep_key =
+      let
+        fun local_entry key = Option.map (fn mine => (key, mine)) (HolbuildCache.get_action (cache_root ()) key)
+      in
+        case List.mapPartial local_entry (spec_dep_keys spec dep_key) of
+            (key, mine) :: _ =>
+              (case HolbuildRemoteCache.get_action remote key of
+                   SOME theirs => cache_manifest_outputs_equal key mine theirs
+                 | NONE => false)
+          | [] => false
+      end
   in
     ensure_parent path;
     case HolbuildRemoteCache.fetch_blob remote {hash = dat_hash, dst = path} of

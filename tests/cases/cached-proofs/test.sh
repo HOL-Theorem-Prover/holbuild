@@ -94,12 +94,30 @@ val _ = export_theory();
 SML
 }
 write_p ""
+# So does a definition hook installed by the theory itself.
+write_q() {
+  cat > "$project/src/QScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Q";
+val _ = let val (d, p) = !Definition.new_definition_hook
+        in Definition.new_definition_hook := (d, fn x => p x) end;
+val h_def = new_definition ("h_def", \`\`h = (1:num)\`\`);
+$1
+Theorem q1:
+  h + 0 = 1
+Proof
+  simp[h_def]
+QED
+val _ = export_theory();
+SML
+}
+write_q ""
 
 build() {
   local log=$1
   shift
   sleep 1.1
-  (cd "$project" && "$HOLBUILD_BIN" build "$@" BTheory PTheory) > "$log" 2>&1 ||
+  (cd "$project" && "$HOLBUILD_BIN" build "$@" BTheory PTheory QTheory) > "$log" 2>&1 ||
     { cat "$log" >&2; exit 1; }
 }
 theory_log() { cat "$project"/.holbuild/logs/current/*/"$1"/build.log; }
@@ -132,6 +150,10 @@ write_p $'Theorem p0:\n  (2:num) = 2\nProof\n  simp[]\nQED'
 build "$tmpdir/raw.log" --cached-proofs
 require_grep "PTheory built" "$tmpdir/raw.log"
 require_not_reused PTheory p1
+write_q $'Theorem q0:\n  (2:num) = 2\nProof\n  simp[]\nQED'
+build "$tmpdir/hook.log" --cached-proofs
+require_grep "QTheory built" "$tmpdir/hook.log"
+require_not_reused QTheory q1
 
 # A build without the flag doesn't take the cached build's outputs, cache
 # entries or checkpoints: it replays every proof, and the outputs are the

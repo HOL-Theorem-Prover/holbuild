@@ -697,7 +697,11 @@ definition changes a saved theorem a dependent record names, or the
 proof that used it is replayed. A listener on theory events certifies each
 new constant and type that comes with such a binding; a constant or type
 from a raw kernel primitive leaves the theory uncertified, and an
-uncertified theory neither reuses nor records.
+uncertified theory neither reuses nor records. `new_definition` stores what
+its hook makes of the kernel's defining theorem; the hooks the ancestors
+installed store an equivalent theorem, but one the theory installs could keep
+the kernel's theorem and store a weaker one, so constants defined under a
+hook other than the ancestors' aren't certified.
 
 Records live outside action entries, in
 `$HOLBUILD_CACHE/proof-records/v1/<key>`, keyed on the theory toolchain key,

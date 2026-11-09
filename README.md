@@ -1133,7 +1133,8 @@ NAME` for each reuse.
 A theory's own constants and types reach those records only through their
 defining theorems. A theory that makes a constant or type without a stored
 defining theorem (a raw `Thm.prim_specification`, `prim_type_definition` or
-`gen_prim_specification`) reuses and records nothing. Proofs with hypotheses,
+`gen_prim_specification`), or that defines a constant under a
+`new_definition` hook it installed itself, reuses and records nothing. Proofs with hypotheses,
 `Resume` blocks, proofs that `suspend`, proofs that change the theory while
 they run (a definition inside a tactic), and theorems proved from ML
 (`store_thm`, `prove`) always run.
