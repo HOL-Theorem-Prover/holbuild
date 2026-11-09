@@ -48,6 +48,11 @@ val _ = List.app (fn base => List.app (fn dir =>
   in refuses "shared write" (fn () => TextIO.closeOut (TextIO.openOut path));
      refuses "shared delete" (fn () => OS.FileSys.remove path)
   end) ["actions", "blobs", "locks", "cooperate"]) ["$tmpdir/shared", "$tmpdir/worker"];
+val lock = Posix.FileSys.createf ("lock", Posix.FileSys.O_WRONLY, Posix.FileSys.O.flags [],
+                                  Posix.FileSys.S.flags [Posix.FileSys.S.irusr, Posix.FileSys.S.iwusr]);
+val _ = Posix.IO.setlkw (lock, Posix.IO.FLock.flock {ltype = Posix.IO.F_WRLCK, whence = Posix.IO.SEEK_SET,
+                                                     start = 0, len = 0, pid = NONE});
+val _ = Posix.IO.close lock;
 val _ = refuses "symlink output" (fn () => Posix.FileSys.symlink {old = "$tmpdir/cache.curl", new = "stolen"});
 val _ = if OS.Process.isSuccess (OS.Process.system "/bin/sh -c 'exit 0'") then () else raise Fail "child failed";
 val timer = Timer.startRealTimer ();
@@ -97,8 +102,7 @@ locked=$(awk '$1 == "action" && $5 == "isolation:LockedTheory" {print $4}' "$tmp
 withheld=$(awk '$1 == "action" && $5 == "isolation:TmpWithheldTheory" {print $4}' "$tmpdir/batch")
 granted=$(awk '$1 == "action" && $5 == "isolation:TmpGrantedTheory" {print $4}' "$tmpdir/batch")
 [[ -n "$spec" && -n "$locked" && -n "$withheld" && -n "$granted" ]]
-# /tmp is granted only when no worker state lies beneath it; the action's own
-# temporary files are removed after it.
+# /tmp is granted only when no worker state lies beneath it.
 run_tmp_action() {
   local worker=$1 tmp_spec=$2
   link_hol_toolchain_cache "$worker/cache"
@@ -115,7 +119,6 @@ tmp_worker=$(mktemp -d /tmp/holbuild-test-tmp.XXXXXX)
 var_tmp_worker=$(mktemp -d /var/tmp/holbuild-test-tmp.XXXXXX)
 granted=$(run_tmp_action "$var_tmp_worker" "$granted")
 [[ $granted == "tmpName /tmp/MLTEMP"* ]] || { echo "/tmp not granted: $granted" >&2; exit 1; }
-[[ ! -e ${granted#tmpName } ]] || { echo "action temporary survived: ${granted#tmpName }" >&2; exit 1; }
 link_hol_toolchain_cache "$tmpdir/worker"
 set +e
 HOLBUILD_CACHE="$tmpdir/worker" "$HOLBUILD_BIN" --max-heap 1024 --remote-cache "$remote_url" \

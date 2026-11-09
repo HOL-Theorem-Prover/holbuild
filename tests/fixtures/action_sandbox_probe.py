@@ -42,6 +42,9 @@ def attack(root: Path, worker: int, secret: Path, shared: Path) -> None:
     refuses("output hardlink", lambda: os.link(secret, root / "stolen"))
     refuses("worker signals", lambda: os.kill(worker, 0))
     refuses("worker group signals", lambda: os.killpg(os.getpgid(worker), 0))
+    with (root / "lock").open("w") as lock:  # HOL's own tools lock private files.
+        fcntl.lockf(lock, fcntl.LOCK_EX)
+        fcntl.flock(lock, fcntl.LOCK_EX)
     (root / "future-ready").write_text("ready")
     deadline = time.monotonic() + 10
     while not (root / "future.pid").exists():

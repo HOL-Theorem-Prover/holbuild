@@ -182,7 +182,7 @@ class Linux:
                 chmod fchmod fchmodat fchmodat2 chown fchown lchown fchownat
                 utime utimes futimesat utimensat setxattr lsetxattr fsetxattr
                 removexattr lremovexattr fremovexattr setxattrat removexattrat file_setattr
-                truncate ftruncate flock io_uring_setup io_uring_enter io_uring_register
+                truncate ftruncate io_uring_setup io_uring_enter io_uring_register
                 ptrace process_vm_readv process_vm_writev process_madvise process_mrelease
                 pidfd_open pidfd_getfd pidfd_send_signal kcmp perf_event_open bpf userfaultfd
                 tkill rt_sigqueueinfo rt_tgsigqueueinfo seccomp
@@ -208,8 +208,10 @@ class Linux:
             deny("prctl", [Comparison(0, 7, 0xFFFFFFFF, 22)])  # PR_SET_SECCOMP
             for name in ("prlimit64", "sched_setaffinity", "sched_setattr", "sched_setscheduler", "sched_setparam"):
                 deny(name, [Comparison(0, 1, 0, 0)])
-            for cmd in (5, 6, 7, 8, 9, 10, 15, 36, 37, 38):
-                deny("fcntl", [Comparison(1, 7, 0xFFFFFFFF, cmd)])  # 32-bit command: locks and signal ownership
+            # Record locks stay allowed: every lock the worker takes is on a
+            # path Landlock already keeps the action from opening.
+            for cmd in (8, 9, 10, 15, 1024):
+                deny("fcntl", [Comparison(1, 7, 0xFFFFFFFF, cmd)])  # 32-bit command: signal ownership and leases
             deny("ioctl", error=errno.ENOTTY)
             for name, argument in (("open", 1), ("openat", 2)):
                 for access in (0, 3):
@@ -263,21 +265,6 @@ class Policy:
 
     def exposes(self, grant: Path) -> bool:
         return any(path == grant or grant in path.parents or path in grant.parents for path in self.forbidden)
-
-    def poly_temporaries(self) -> set[Path]:
-        # Poly/ML's OS.FileSys.tmpName names: /tmp/MLTEMPxxxxxx and files
-        # named after them.
-        return {path for scratch in self.scratch for path in scratch.glob("MLTEMP*")}
-
-    def remove_temporaries(self, before: set[Path]) -> None:
-        # Only files this action created, so a later action can't read them.
-        for path in self.poly_temporaries() - before:
-            try:
-                info = path.lstat()
-                if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid():
-                    path.unlink()
-            except FileNotFoundError:
-                pass
 
     def validate_outputs(self) -> None:
         # With all descendants reaped, one no-follow walk validates every file
@@ -560,7 +547,6 @@ class SignalBroker:
 def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = None) -> int:
     policy.validate()
     policy.validate_outputs()
-    temporaries = policy.poly_temporaries()
     # CONFIG_PROC_CHILDREN is required by the verified descendant walk.
     Path(f"/proc/self/task/{os.getpid()}/children").read_text()
     home = policy.writable[0] / ".holbuild/sandbox-home"
@@ -661,7 +647,6 @@ def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = N
     finally:
         try:
             status = finish_children(child)
-            policy.remove_temporaries(temporaries)
         finally:
             if broker is not None:
                 broker.close()
