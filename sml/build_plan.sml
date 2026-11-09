@@ -939,19 +939,26 @@ fun write_test_dependency_graph graph_id plan_id resolved_id (graph : resolved_d
 
 (* Each package's load-order tier, by name: 1 for a package that depends on
    no package but HOL, else one more than its deepest dependency.  HOL's own
-   directories are tier 0, so dependencies load before what depends on them,
-   as they do under Holmake when HOL and the packages sit side by side. *)
+   directories, and the packages taken from them (`from = "hol"`), are tier 0,
+   so dependencies load before what depends on them, as they do under Holmake
+   when HOL and the packages sit side by side. *)
 fun package_tiers graph =
   let
-    val hol = HolbuildProjectGraph.hol graph
+    fun from_hol package =
+      case HolbuildPackageProvenance.snapshot (HolbuildProject.package_provenance package) of
+          HolbuildPackageProvenance.ToolchainSnapshot _ => true
+        | _ => false
     val packages =
       map (fn package => (HolbuildProjectGraph.package_id package, HolbuildProject.package_name package))
           (HolbuildProjectGraph.packages graph)
+    val hol_ids =
+      map HolbuildProjectGraph.package_id (List.filter from_hol (HolbuildProjectGraph.packages graph))
     val edges = HolbuildProjectGraph.edges graph
     fun dependencies id =
       List.mapPartial
         (fn {declaring_package, dependency_package, ...} =>
-           if declaring_package = id andalso dependency_package <> hol then SOME dependency_package else NONE)
+           if declaring_package = id andalso not (member dependency_package hol_ids)
+           then SOME dependency_package else NONE)
         edges
     fun tier visiting id =
       if member id visiting then 1

@@ -31,9 +31,11 @@ start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
 # in sigobj in a Holmake build, so it sorts with sumTheory by name.
 #
 # Package dep keeps its theory in a/, which sorts before HOL's sigobj but
-# loads after it: dep is a package, HOL comes first.
+# loads after it: dep is a package, HOL comes first.  dep and zdep are both
+# one level above HOL, as packages taken from HOL's tree count as HOL, so
+# they load by name.
 dep=$tmpdir/dep
-mkdir -p "$dep/a"
+mkdir -p "$dep/a" "$dep/shims"
 cat > "$dep/holproject.toml" <<TOML
 $(write_schema2_prelude)
 [project]
@@ -41,11 +43,35 @@ name = "dep"
 
 [build]
 members = ["a"]
+
+[dependencies.holexamples]
+from = "hol"
+path = "."
+manifest = "shims/holexamples.toml"
 TOML
 cat > "$dep/a/depScript.sml" <<'SML'
 Theory dep
 
 Theorem dep_thm:
+  T
+Proof
+  simp[]
+QED
+SML
+zdep=$tmpdir/zdep
+mkdir -p "$zdep/a"
+cat > "$zdep/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "zdep"
+
+[build]
+members = ["a"]
+TOML
+cat > "$zdep/a/zdepScript.sml" <<'SML'
+Theory zdep
+
+Theorem zdep_thm:
   T
 Proof
   simp[]
@@ -66,6 +92,10 @@ members = ["src"]
 git = "https://example.invalid/dep.git"
 rev = "1111111111111111111111111111111111111111"
 
+[dependencies.zdep]
+git = "https://example.invalid/zdep.git"
+rev = "2222222222222222222222222222222222222222"
+
 [dependencies.holexamples]
 from = "hol"
 path = "."
@@ -74,6 +104,9 @@ TOML
 cat > "$project/.holconfig.toml" <<'TOML'
 [overrides.dep]
 path = "../dep"
+
+[overrides.zdep]
+path = "../zdep"
 TOML
 cat > "$project/shims/holexamples.toml" <<'TOML'
 [holbuild]
@@ -85,6 +118,7 @@ name = "holexamples"
 [build]
 members = ["examples/countchars"]
 TOML
+cp "$project/shims/holexamples.toml" "$dep/shims/holexamples.toml"
 cat > "$project/src/a/yScript.sml" <<'SML'
 Theory y
 
@@ -110,7 +144,7 @@ struct
 end
 SML
 # The header names its dependencies out of order.
-header='Ancestors b countchars y sum dep sorting arithmetic
+header='Ancestors b countchars y zdep sum dep sorting arithmetic
 Libs aLib'
 cat > "$project/src/top/useScript.sml" <<SML
 Theory use
@@ -136,6 +170,7 @@ arithmeticTheory
 sortingTheory
 sumTheory
 depTheory
+zdepTheory
 yTheory
 aLib
 bTheory'
@@ -167,6 +202,7 @@ link_hol_toolchain_cache "$tmpdir/local"
 check_order "useScript.uo" "$(manifest_names "$project/.holbuild/obj/src/top/useScript.uo")"
 check_order "useTheory.uo" "$(manifest_names "$project/.holbuild/obj/src/top/useTheory.uo")" 'countcharsTheory
 depTheory
+zdepTheory
 yTheory
 bTheory'
 
@@ -193,6 +229,7 @@ check_order "the spec's preload" "$(loaded_names '^load [a-z]* .*' "$spec_path")
 require_grep '^order holexamples:countcharsTheory 0 \. examples/countchars$' "$spec_path"
 require_grep '^order hol:sortingTheory 0 \. sigobj$' "$spec_path"
 require_grep '^order dep:depTheory 1 dep a$' "$spec_path"
+require_grep '^order zdep:zdepTheory 1 zdep a$' "$spec_path"
 require_grep '^order order:bTheory 2 order src/b$' "$spec_path"
 require_grep '^order order:aLib 2 order src/b$' "$spec_path"
 
