@@ -817,6 +817,11 @@ start: script checkpoints retain ML state, not the files the script wrote.
 The dependency-loaded checkpoint remains reusable, and proof checkpoints remain
 available for diagnostics.
 
+Extra outputs must be byte-identical for the same inputs, including during a
+forced rebuild. Put elapsed times and other execution-specific data in the
+build log instead. A remote worker rejects a conflicting publication, keeping
+the existing cache entry, and reports both sets of output hashes.
+
 A theory may write SML sources (`.sml` or `.sig`) as extra outputs, as EmitML
 code does. A plan made before the theory runs has no node for such a source, so
 when a planned theory declares one, holbuild builds the planned theories that
@@ -1808,6 +1813,11 @@ does, fetches the worker's build log from the remote cache into
 local build would, and exits with status 1, with or without `--remote-only`.
 If that log can't be fetched, the build builds just the failed theory locally,
 for its diagnostic; with `--remote-only` it fails with status 75 instead.
+
+For other action failures, including `publish`, a failed batch also saves the
+worker's log at the same local path and prints its tail. If the log cannot be
+fetched, holbuild warns and preserves the batch's normal failure or fallback
+behavior. A batch being resubmitted does not fetch failure logs first.
 
 `--detach` submits the batch, prints its id (`holbuild: remote batch <id>`)
 and exits; if the batch can't be submitted, it fails rather than building

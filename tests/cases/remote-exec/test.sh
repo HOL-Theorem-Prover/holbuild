@@ -988,8 +988,10 @@ cat >> "$project/src/BScript.sml" <<'SML'
 val _ = print helperLib.verdict
 SML
 run force-seed 0 build --remote-exec "$coordinator" --remote-only BTheory
+run force-clean 0 clean BTheory
 : > "$state/results"
 HOLBUILD_TIMING_LOG=$tmpdir/force-target.timing run force-target 0 build --remote-exec "$coordinator" --remote-only --force=theory BTheory
+require_grep 'BTheory restored from cache' "$tmpdir/force-target.log"
 require_grep "^rxf:BTheory status=built$" "$state/results"
 [[ $(wc -l < "$state/results") -eq 1 ]] || { cat "$state/results" >&2; exit 1; }
 refute_grep "Theory built\|building locally" "$tmpdir/force-target.log"
@@ -1484,3 +1486,53 @@ require_grep '^detail=exec-action HOL repository is not trusted by this worker: 
 refute_grep '^log=' "$tmpdir/worker.result"
 require_grep 'holbuild: remote rxlocalcas:LocalUntrustedTheory: failed (spec-rejected: exec-action HOL repository is not trusted by this worker: ' \
   "$tmpdir/local-cas-untrusted.log"
+
+# Timings are execution results, not deterministic cached outputs. A forced
+# rebuild must keep the resident entry and return the worker's diagnostic.
+project=$tmpdir/publish-project
+mkdir -p "$project/src"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxpublish"
+[build]
+members = ["src"]
+TOML
+write_theories publish-log
+cat >> "$project/src/BScript.sml" <<'SML'
+fun holbuild_extra_outputs (_ : string list) = ()
+val _ = holbuild_extra_outputs ["timing.txt"]
+val _ =
+  let val out = TextIO.openOut "timing.txt"
+  in TextIO.output (out, Time.toString (Time.now ()) ^ "\n"); TextIO.closeOut out end
+SML
+run publish-seed 0 build --remote-exec "$coordinator" --remote-only BTheory
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/publish-seed.log")
+ac=$(awk '$1 == "action" && $5 == "rxpublish:BTheory" { print $3 }' "$state/$batch.batch")
+cp "$remote_root/ac/$ac" "$tmpdir/publish-resident"
+run publish-conflict 75 build --remote-exec "$coordinator" --remote-only --force=theory BTheory
+require_grep 'the remote cache holds different outputs for the action' "$tmpdir/publish-conflict.log"
+require_grep 'existing outputs: .*extra:timing.txt=' "$tmpdir/publish-conflict.log"
+require_grep 'new outputs: .*extra:timing.txt=' "$tmpdir/publish-conflict.log"
+require_grep 'The same inputs must produce identical outputs' "$tmpdir/publish-conflict.log"
+require_grep 'put timings in the build log instead' "$tmpdir/publish-conflict.log"
+local_log=$project/.holbuild/logs/current/rxpublish/BTheory/build.log
+require_grep "child log: $local_log" "$tmpdir/publish-conflict.log"
+require_grep 'the remote cache holds different outputs for the action' "$local_log"
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/publish-conflict.log")
+key=$(awk '$1 == "action" && $5 == "rxpublish:BTheory" { print $2 }' "$state/$batch.batch")
+log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$state/result-$key")
+[[ -n $log_sha && $(sha256sum < "$local_log" | cut -d' ' -f1) == "$log_sha" ]] ||
+  { echo 'publish failure log is not the worker log' >&2; exit 1; }
+cmp "$remote_root/ac/$ac" "$tmpdir/publish-resident"
+refute_grep 'Theory built\|building locally' "$tmpdir/publish-conflict.log"
+
+# A lost log warns and removes the previous execution's log, without hiding
+# the batch failure or changing its exit status.
+touch "$state/drop-log"
+run publish-missing-log 75 build --remote-exec "$coordinator" --remote-only --force=theory BTheory
+rm "$state/drop-log"
+require_grep "could not fetch the failed remote action's build log" "$tmpdir/publish-missing-log.log"
+require_grep 'remote execution: batch .* failed' "$tmpdir/publish-missing-log.log"
+require_no_file "$local_log"
+cmp "$remote_root/ac/$ac" "$tmpdir/publish-resident"
