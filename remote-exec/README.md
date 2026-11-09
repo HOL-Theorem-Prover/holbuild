@@ -74,11 +74,19 @@ compatible. No action-spec or minimum client version changes are needed.
 Clients can request `?fail_fast=true` on submission to retain early stopping.
 Run batches still finish `done` with independent per-action failures.
 
-Apply the migration before serving with the new coordinator. Before rolling
-back to an older coordinator, drain or cancel running batches first: an older
-coordinator does not implement their keep-going completion rules. Then use
-the current image to run `alembic downgrade 0009` before starting the older
-image. Existing action states need no conversion.
+Apply the migration before serving with the new coordinator. An image whose
+migration code predates `0011` cannot run `alembic upgrade head` against a
+database already at `0011`, even though the added columns are compatible with
+its queries. Deployments that migrate on every service start must account for
+this before pinning an older image.
+
+For a rollback that preserves the schema, deploy a reviewed forward patch
+release restoring the previous execution policy while retaining migrations
+`0010` and `0011`. Clients can use `--fail-fast` for immediate early stopping
+on new submissions. To deploy a pre-`0011` image instead, first drain or cancel
+running batches, since an older coordinator does not implement their
+keep-going completion rules, then use the current image to downgrade to the
+older image's migration head. Existing action states need no conversion.
 
 The coordinator reads its settings from the environment:
 
