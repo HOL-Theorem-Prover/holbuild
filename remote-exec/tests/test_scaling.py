@@ -116,6 +116,13 @@ async def test_sweep_runs_the_scale_command_when_the_held_target_changes_and_kee
     assert calls.read_text().split() == ["0", "2", "2", "0"]
 
 
+async def test_queue_reports_the_burst_worker_cap(http: httpx.AsyncClient, coordinator: Coordinator) -> None:
+    coordinator.settings.max_burst_workers = 420
+    response = await http.get("/v1/queue", headers=CLIENT)
+    assert response.status_code == 200
+    assert response.json()["max_burst_workers"] == 420
+
+
 async def test_queue_reports_counts_and_the_desired_burst_workers(
     http: httpx.AsyncClient, coordinator: Coordinator, tmp_path: Path
 ) -> None:
@@ -143,6 +150,7 @@ async def test_queue_reports_counts_and_the_desired_burst_workers(
         "run_slots": 30,
         "run_floor": 0,
         "desired_burst_workers": 0,  # the route's coordinator has no burst workers to ask for
+        "max_burst_workers": 0,
         "hosts": [],
         "phases": None,  # see test_queue_sums_the_phases_workers_reported_in_the_last_ten_minutes
         "scaler": None,  # nor a scale command
