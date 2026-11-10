@@ -12,7 +12,7 @@ source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
 cleanup() {
-  for pid in ${server_pid:-} ${coordinator_pid:-}; do
+  for pid in ${server_pid:-} ${coordinator_pid:-} ${ring_server_pid:-}; do
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
@@ -1742,3 +1742,66 @@ require_grep 'remote execution: batch .* failed' "$tmpdir/publish-missing-log.lo
 require_no_file "$local_log"
 cmp "$remote_root/ac/$ac" "$tmpdir/publish-resident"
 
+
+# Cache ring replicas can disagree on an entry's timeout contract.  With the
+# weaker copy on the node ranked first, batch export and restore must find the
+# stronger one on the next node, also after this build copied the weaker one.
+write_ring_timeout() {
+  copy_nondet "$1" rxring
+  cat > "$tmpdir/$1/src/TimeoutScript.sml" <<'SML'
+Theory Timeout
+Ancestors bool
+
+Theorem ring_timeout_thm:
+  T
+Proof
+  simp[]
+QED
+SML
+}
+write_ring_timeout ring-seed
+in_copy ring-seed --remote-cache "$remote_url" build --tactic-timeout 0 TimeoutTheory \
+  > "$tmpdir/ring-weak.log" 2>&1 || { cat "$tmpdir/ring-weak.log" >&2; exit 1; }
+ring_key=$(sed -n 's/^input_key=//p' "$tmpdir/ring-seed/.holbuild/dep/rxring/src/TimeoutScript.sml.key")
+ring_ac=$(printf 'holbuild-remote-ac-v1\n%s\n' "$ring_key" | sha256sum | cut -d' ' -f1)
+require_grep '^proof-timeout=none$' "$remote_root/ac/$ring_ac"
+cp "$remote_root/ac/$ring_ac" "$tmpdir/ring-weak-ac"
+in_copy ring-seed --remote-cache "$remote_url" build --tactic-timeout 2.5 TimeoutTheory \
+  > "$tmpdir/ring-strong.log" 2>&1 || { cat "$tmpdir/ring-strong.log" >&2; exit 1; }
+require_grep '^proof-timeout=2.5$' "$remote_root/ac/$ring_ac"
+cp "$remote_root/ac/$ring_ac" "$tmpdir/ring-strong-ac"
+
+first_server_pid=$server_pid
+first_url=$remote_url
+first_request_log=$request_log
+second_root=$tmpdir/remote-2
+start_remote_cache_server "$second_root" "$tmpdir/server-2"
+ring_server_pid=$server_pid
+second_url=$remote_url
+server_pid=$first_server_pid
+remote_url=$first_url
+request_log=$first_request_log
+mkdir -p "$second_root/ac" "$second_root/cas"
+for blob in $(awk '$1 == "blob" && length($2) == 64 { print $2 }' "$tmpdir/ring-strong-ac"); do
+  cp "$remote_root/cas/$blob" "$second_root/cas/$blob"
+done
+ring_rank() { printf '%s:%s' "$1" "$ring_ac" | sha256sum | cut -d' ' -f1; }
+if [[ $(ring_rank "$first_url") > $(ring_rank "$second_url") ]]; then
+  ranked_roots=("$remote_root" "$second_root")
+else
+  ranked_roots=("$second_root" "$remote_root")
+fi
+cp "$tmpdir/ring-weak-ac" "${ranked_roots[0]}/ac/$ring_ac"
+cp "$tmpdir/ring-strong-ac" "${ranked_roots[1]}/ac/$ring_ac"
+
+write_ring_timeout ring-client
+(cd "$tmpdir/ring-client" && HOLBUILD_CACHE=$tmpdir/ring-client-cache HOLBUILD_CACHE_TRACE=1 \
+  "$HOLBUILD_BIN" --remote-cache "$first_url,$second_url" build --remote-exec "$coordinator" \
+  --remote-only --tactic-timeout 2.5 TimeoutTheory) > "$tmpdir/ring-client.log" 2>&1 ||
+  { cat "$tmpdir/ring-client.log" >&2; exit 1; }
+require_grep 'remote execution: nothing to build remotely' "$tmpdir/ring-client.log"
+require_grep 'entry passed over' "$tmpdir/ring-client.log"
+require_grep 'TimeoutTheory restored from cache' "$tmpdir/ring-client.log"
+refute_grep 'remote batch\|Theory built' "$tmpdir/ring-client.log"
+require_grep '^proof-timeout=2.5$' "$tmpdir/ring-client-cache/actions/$ring_key/manifest"
+cmp "${ranked_roots[0]}/ac/$ring_ac" "$tmpdir/ring-weak-ac"

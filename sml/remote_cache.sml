@@ -299,8 +299,10 @@ fun transient (HolbuildHttp.Failed _) = true
 
 (* The breaker observes the whole request: a dead primary must not disable a healthy backup.
    A write goes past the first two nodes only while none of them answered at all
-   (a member whose name doesn't resolve yet, say), and stops at the first answer. *)
-fun routed_status method urls path request =
+   (a member whose name doesn't resolve yet, say), and stops at the first answer.
+   A read whose 200 body fails `usable` counts as that node's 404, so a replica
+   holding a weaker copy does not hide a better one on the next node. *)
+fun routed_status_using usable method urls path request =
   let
     val read = method = "GET" orelse method = "HEAD"
     val grace = read andalso HolbuildCacheDiscovery.joining ()
@@ -314,6 +316,12 @@ fun routed_status method urls path request =
           else
             let
               val result = traced method node path (fn () => request node)
+              val result =
+                if read andalso result = HolbuildHttp.Response 200 andalso not (usable path) then
+                  (HolbuildStatus.cache_trace ("remote cache " ^ method ^ " " ^ redact_userinfo node ^
+                                               ": entry passed over");
+                   HolbuildHttp.Response 404)
+                else result
               val missing = if read andalso result = HolbuildHttp.Response 404 then SOME (node, result) else missing
             in
               if transient result orelse (read andalso result = HolbuildHttp.Response 404) then
@@ -321,6 +329,8 @@ fun routed_status method urls path request =
               else (node, result)
             end
   in loop urls 0 true NONE (hd urls, HolbuildHttp.Failed "no cache response") end
+
+fun routed_status method urls path request = routed_status_using (fn _ => true) method urls path request
 
 (* NONE when the remote cache is disabled, without a request.  With
    fail_closed, raises Unavailable instead, and for no answer, 429 or 5xx. *)
@@ -347,11 +357,13 @@ fun send_result method url request =
 fun send method url path request =
   Option.map #2 (send_result method url (fn () => (url, traced method url path request)))
 
-fun send_urls method urls path request =
-  send_result method (hd urls) (fn () => routed_status method urls path request)
+fun send_urls_using usable method urls path request =
+  send_result method (hd urls) (fn () => routed_status_using usable method urls path request)
 
-fun curl_get_urls {urls, dst} =
-  (case send_urls "GET" urls dst (fn url => get_status {url = url, dst = dst}) of
+fun send_urls method urls path request = send_urls_using (fn _ => true) method urls path request
+
+fun curl_get_urls_using usable {urls, dst} =
+  (case send_urls_using usable "GET" urls dst (fn url => get_status {url = url, dst = dst}) of
         NONE => HolbuildCacheBackend.Miss
       | SOME (url, HolbuildHttp.Failed message) =>
           HolbuildCacheBackend.Corrupt ("GET " ^ redact_userinfo url ^ " failed: " ^ message)
@@ -361,6 +373,8 @@ fun curl_get_urls {urls, dst} =
           HolbuildCacheBackend.Corrupt ("HTTP " ^ Int.toString code ^ " from " ^ redact_userinfo url))
   handle e as Unavailable _ => raise e
        | e => (HolbuildCacheBackend.Corrupt (General.exnMessage e))
+
+fun curl_get_urls request = curl_get_urls_using (fn _ => true) request
 
 fun curl_get {url, dst} = curl_get_urls {urls = [url], dst = dst}
 
@@ -492,13 +506,15 @@ fun metadata_text manifest blobs =
      [manifest_marker ^ manifest])
 
 (* An action's metadata, without recording its blobs as present: a caller
-   that may not use the manifest records them with remember_action. *)
-fun fetch_action cache key =
+   that may not use the manifest records them with remember_action.  The
+   lookup passes over a node whose manifest fails `usable`, as for a 404. *)
+fun fetch_action_using usable cache key =
   let
     val tmp = temp_path "action"
     fun cleanup () = remove_file tmp
+    fun usable_body path = usable (#manifest (metadata_manifest (read_text path))) handle _ => true
   in
-    case curl_get_urls {urls = action_urls cache key, dst = tmp} of
+    case curl_get_urls_using usable_body {urls = action_urls cache key, dst = tmp} of
         HolbuildCacheBackend.Hit =>
           let val action = metadata_manifest (read_text tmp)
           in
@@ -515,7 +531,11 @@ fun fetch_action cache key =
 fun remember_action cache {blobs, manifest} =
   (List.app (remember_blob cache) blobs; manifest)
 
-fun get_action cache key = Option.map (remember_action cache) (fetch_action cache key)
+fun fetch_action cache key = fetch_action_using (fn _ => true) cache key
+
+fun get_action_using usable cache key = Option.map (remember_action cache) (fetch_action_using usable cache key)
+
+fun get_action cache key = get_action_using (fn _ => true) cache key
 
 fun action_metadata cache key text =
   let

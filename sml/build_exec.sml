@@ -2167,6 +2167,12 @@ fun cache_manifest_proof_timeout_text key text =
   HolbuildTheoryCacheManifest.cache_manifest_proof_timeout_text key text
   handle HolbuildTheoryCacheManifest.Error msg => raise Error msg
 
+(* For picking a remote replica: an entry whose timeout contract cannot be
+   read is left to the checks that restore it. *)
+fun manifest_timeout_satisfies allow_discrepancy requested text =
+  cache_timeout_satisfies allow_discrepancy requested (cache_manifest_proof_timeout (cache_manifest_lines text))
+  handle _ => true
+
 fun cache_manifest_contract key text =
   HolbuildTheoryCacheManifest.cache_manifest_contract key text
   handle HolbuildTheoryCacheManifest.Error msg => raise Error msg
@@ -2337,14 +2343,15 @@ fun copied_from_remote key =
    Redblackset.member (!remote_copied_keys, key)
    before Mutex.unlock remote_copied_mutex)
 
-(* Copies the remote entry for key into the local cache.  Returns false on a
-   remote miss and raises if the entry is unusable. *)
-fun copy_remote_cache_entry root url key =
+(* Copies the remote entry for key into the local cache, from the first node
+   whose manifest passes `usable`.  Returns false on a remote miss and raises
+   if the entry is unusable. *)
+fun copy_remote_cache_entry_using usable root url key =
   let
     val remote = HolbuildRemoteCache.remote url
     val local_cache = HolbuildFSCacheBackend.filesystem root
   in
-    case HolbuildRemoteCache.get_action remote key of
+    case HolbuildRemoteCache.get_action_using usable remote key of
         NONE => false
       | SOME manifest =>
           (HolbuildFSCacheBackend.ensure_layout local_cache;
@@ -2359,11 +2366,13 @@ fun copy_remote_cache_entry root url key =
            true)
   end
 
-fun hydrate_remote_cache_key root key =
+fun copy_remote_cache_entry root url key = copy_remote_cache_entry_using (fn _ => true) root url key
+
+fun hydrate_remote_cache_key_using usable root key =
   case HolbuildRemoteCacheConfig.url () of
       NONE => false
     | SOME url =>
-        (if copy_remote_cache_entry root url key then
+        (if copy_remote_cache_entry_using usable root url key then
            (cache_trace ("remote cache hydrated: " ^ key); true)
          else
            (cache_trace ("remote cache miss: " ^ key); false))
@@ -2375,6 +2384,8 @@ fun hydrate_remote_cache_key root key =
           else
             (warn ("remote cache entry unusable for " ^ key ^ ": " ^ General.exnMessage e);
              false)
+
+fun hydrate_remote_cache_key root key = hydrate_remote_cache_key_using (fn _ => true) root key
 
 fun prefetch_remote_cache_key root url key =
   if Option.isSome (HolbuildCache.get_action root key) then ()
@@ -5015,14 +5026,17 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
            one retry either way. *)
         fun materialize retry existing =
           let
+            (* Passes over replicas whose timeout contract is too weak for this build. *)
+            fun hydrate () =
+              (ignore (hydrate_remote_cache_key_using
+                         (manifest_timeout_satisfies allow_timeout_discrepancy (tactic_timeout policy))
+                         root input_key);
+               case HolbuildCache.get_action root input_key of
+                   SOME text => if text = existing then CacheMiss else materialize false text
+                 | NONE => CacheMiss)
             (* A failed copy may have met an entry another build just published. *)
             fun from_remote () =
-              if copied_from_remote input_key then CacheMiss
-              else
-                (ignore (hydrate_remote_cache_key root input_key);
-                 case HolbuildCache.get_action root input_key of
-                     SOME text => if text = existing then CacheMiss else materialize false text
-                   | NONE => CacheMiss)
+              if copied_from_remote input_key then CacheMiss else hydrate ()
             fun reject_parents () =
               (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
                             input_key ^ " (parent outputs differ)");
@@ -5036,11 +5050,13 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
           in
             case materialize_theory_cache (#verify_cache options) allow_timeout_discrepancy
                    project plan input_key (tactic_timeout policy) (trknl_enabled policy) node of
-                (* A worker may have strengthened the remote timeout contract.
+                (* A worker may have strengthened the remote timeout contract,
+                   or another replica may hold a stronger one, also when the
+                   weaker local entry was copied from the remote cache.
                    Refresh without dropping the usable weaker local entry. *)
                 CacheMiss =>
                   if not (cached_parents_match existing) then reject_parents ()
-                  else if retry then from_remote () else CacheMiss
+                  else if retry then hydrate () else CacheMiss
               | restored as CacheRestored _ =>
                   if theory_parent_hashes_match dat_hash_cache plan node NONE then restored
                   else reject_parents ()
@@ -7322,11 +7338,17 @@ fun entry_satisfies (options : build_options) project plan node input_key blob_p
   end
   handle _ => false
 
-fun remote_entry_satisfies remote options project plan node input_key =
-  case HolbuildRemoteCache.get_action remote input_key of
-      NONE => false
-    | SOME text =>
-        entry_satisfies options project plan node input_key (HolbuildRemoteCache.blob_present remote) text
+(* Passes over replicas whose timeout contract is too weak, as a restore does. *)
+fun remote_entry_satisfies remote (options : build_options) project plan node input_key =
+  let
+    val requested = tactic_timeout (checkpoint_policy_for_node options project node)
+    val usable = manifest_timeout_satisfies (#allow_cache_timeout_discrepancy options) requested
+  in
+    case HolbuildRemoteCache.get_action_using usable remote input_key of
+        NONE => false
+      | SOME text =>
+          entry_satisfies options project plan node input_key (HolbuildRemoteCache.blob_present remote) text
+  end
 
 (* The same for the local cache, whose blobs must also be intact. *)
 fun local_entry_satisfies options project plan node input_key =
