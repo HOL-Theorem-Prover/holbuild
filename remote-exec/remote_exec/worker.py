@@ -31,7 +31,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
@@ -70,6 +70,12 @@ CLAIM_RETRY_SECONDS = 5  # least time between two claims that found nothing
 # a request it accepted is answered rather than given up on and repeated.
 REQUEST_TIMEOUT_S = 15.0
 CHECKPOINT_PUBLISH_SECONDS = 15
+# How often a running exec-action is checked for exit and for its result, and how often its HOL children are.
+POLL_SECONDS = 0.1
+HOL_SAMPLE_SECONDS = 1.0
+# How long exec-action may go on publishing checkpoints for later actions after its result is reported. A large
+# theory's publish takes up to ~30 s; past this a hung upload stops parking the worker.
+POST_RESULT_SECONDS = 120.0
 DRAIN_CHECKPOINT_PUBLISH_SECONDS = 8
 # What exec-action runs with besides holbuild's own HOLBUILD_* settings: what curl, git and the locale read, and where
 # HOL's libraries find external solvers (the action sandbox passes the same SOLVER_ENV on to HOL). The rest of the
@@ -168,6 +174,12 @@ def stop_group(process: subprocess.Popen[Any]) -> None:
     with contextlib.suppress(ProcessLookupError):
         os.killpg(process.pid, signal.SIGKILL)
     process.wait()
+
+
+def kill_group(process: subprocess.Popen[Any]) -> None:
+    """Kill our session at once, from another thread; the worker reaps it with ``stop_group``."""
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
 
 
 class ClaimRefused(RuntimeError):
@@ -622,7 +634,7 @@ class Phases:
     nothing or an action failed in the worker, finding the action's release, running exec-action (before, while
     and after it has HOL children, or all of it as ``exec`` when they can't be seen) and reporting the result."""
 
-    NAMES = ("memory_wait", "claim", "idle", "lease", "release", "before_hol", "hol", "after_hol", "exec", "complete")
+    NAMES = ("memory_wait", "claim", "idle", "lease", "release", "before_hol", "hol", "after_hol", "exec", "complete", "after_result")
 
     def __init__(self) -> None:
         self.seconds = dict.fromkeys(self.NAMES, 0.0)
@@ -839,29 +851,56 @@ def run_one(
     releases = replace(releases, drain=drain)
     print(f"running {claim['theory']} ({claim['input_key']})", file=sys.stderr, flush=True)
     with Lease(coordinator, token, claim["lease_s"], protection).held(phases) as lease:
+        completed = False
+
+        def report(record: str) -> None:
+            """Completes the action once, even if posting it fails: the coordinator then retries it when the
+            lease expires. Its token is stale from then, so the heartbeat stops first: a 409 would mark the
+            lease lost and stop exec-action. Scale-in protection stays on until it exits."""
+            nonlocal completed
+            completed = True
+            lease.done.set()
+            with phases.timed("complete"):
+                coordinator.complete(token, record, claim["lease_s"])
+
         try:
-            record = execute(args, releases, lease, claim, phases)
+            record = execute(args, releases, lease, claim, phases, report)
         except CacheUnavailable:
             # The cache couldn't give the spec, as while it restarts: the action is retried without counting it.
-            with phases.timed("complete"):
-                coordinator.complete(token, failed_record(spec, "unavailable"), claim["lease_s"])
+            if not completed:
+                report(failed_record(spec, "unavailable"))
             raise
         except Exception:
             # The coordinator retries the action now rather than when the lease expires.
-            with phases.timed("complete"):
-                coordinator.complete(token, failed_record(spec, "internal"), claim["lease_s"])
+            if not completed:
+                report(failed_record(spec, "internal"))
             raise
         if record is None:
             return False
-        with phases.timed("complete"):
-            coordinator.complete(token, record, claim["lease_s"])
+        if not completed:
+            report(record)
         return "failure=unavailable" in record.splitlines()
 
 
+def read_result(path: str) -> str | None:
+    """exec-action's result record, once it has written one; it renames it into place whole."""
+    try:
+        with open(path) as file:
+            return file.read() or None
+    except FileNotFoundError:
+        return None
+
+
 def execute(
-    args: argparse.Namespace, releases: Releases, lease: Lease, claim: dict[str, Any], phases: Phases
+    args: argparse.Namespace,
+    releases: Releases,
+    lease: Lease,
+    claim: dict[str, Any],
+    phases: Phases,
+    report: Callable[[str], None],
 ) -> str | None:
-    """The result record of the claimed action, or None once its lease is lost."""
+    """The result record of the claimed action, or None once its lease is lost. A record exec-action writes
+    while it runs is passed to ``report`` at once; the record returned is then that one."""
     spec = claim["spec_sha256"]
     drain = releases.drain
     drain.publish_seconds = 0.0
@@ -894,22 +933,51 @@ def execute(
             start_new_session=True
         )
         drained_out = False
+        # exec-action writes its result (atomically) before publishing for later actions; it is reported then,
+        # and the worker waits for the rest without the lease, at most POST_RESULT_SECONDS.
+        reported: str | None = None
+        seen = after_result = 0.0
+        # The bound holds while the result is being posted too, which retries for as long as the lease.
+        hard_stop: threading.Timer | None = None
+        sampled = stepped
         try:
             while process.poll() is None:
-                if lease.lost.is_set():
-                    return None
+                if reported is None:
+                    if lease.lost.is_set():
+                        return None
+                    if (record := read_result(result)) is not None:
+                        now = time.monotonic()
+                        if cooperate_dir is None:
+                            phases.add("exec", now - stepped)
+                        else:
+                            spans.step(now - stepped, hol=False)
+                        stepped = seen = now
+                        hard_stop = threading.Timer(POST_RESULT_SECONDS, kill_group, (process,))
+                        hard_stop.daemon = True
+                        hard_stop.start()
+                        report(record)
+                        reported = record
+                        stepped = after_result = time.monotonic()
+                        continue
+                elif time.monotonic() - seen >= POST_RESULT_SECONDS:
+                    print(f"{claim['theory']}: exec-action still running {POST_RESULT_SECONDS:.0f} s after its result; "
+                          "stopping it", file=sys.stderr, flush=True)
+                    break
                 if drain.remaining() == 0:
-                    drained_out = process.poll() is None
+                    drained_out = reported is None and process.poll() is None
                     break
                 drain.wake.clear()
-                drain.wake.wait(min(1.0, drain.remaining()))
-                if cooperate_dir is not None:
-                    hol = runs_hol(process.pid, cooperate_dir)
-                    now = time.monotonic()
-                    spans.step(now - stepped, hol=hol)
-                    stepped = now
+                drain.wake.wait(min(POLL_SECONDS, drain.remaining()))
+                # HOL is sampled once a second, as walking /proc each poll would cost more than it tells.
+                now = time.monotonic()
+                if reported is None and cooperate_dir is not None and now - sampled >= HOL_SAMPLE_SECONDS:
+                    spans.step(now - stepped, hol=runs_hol(process.pid, cooperate_dir))
+                    stepped = sampled = now
         finally:
-            if args.share_heaps and process.poll() is None:
+            if hard_stop is not None:
+                hard_stop.cancel()
+            timed_out = seen > 0 and time.monotonic() - seen >= POST_RESULT_SECONDS
+            if args.share_heaps and process.poll() is None and not timed_out:
                 drain.publish_seconds = DRAIN_CHECKPOINT_PUBLISH_SECONDS
                 # Signal only the driver: it stops HOL, then publishes the
                 # sandbox-validated saves. Killing its group here loses them.
@@ -928,23 +996,28 @@ def execute(
                     except subprocess.TimeoutExpired:
                         pass
             stop_group(process)
-            if cooperate_dir is None:
+            if reported is not None:
+                phases.add("after_result", time.monotonic() - after_result)
+            elif cooperate_dir is None:
                 phases.add("exec", time.monotonic() - stepped)
-            else:
-                spans.step(time.monotonic() - stepped, hol=False)
+            if cooperate_dir is not None:
+                if reported is None:
+                    spans.step(time.monotonic() - stepped, hol=False)
                 phases.add("before_hol", spans.before_hol)
                 phases.add("hol", spans.hol)
                 phases.add("after_hol", spans.after_hol)
+        if reported is not None:
+            # Reported already: whatever the driver did after its result changes nothing for the client.
+            print(f"{claim['theory']}: exit {process.returncode} after the result", file=sys.stderr, flush=True)
+            return reported
         if drained_out:
             return failed_record(spec, "unavailable")
-        if not os.path.exists(result) or os.path.getsize(result) == 0:
+        if (record := read_result(result)) is None:
             if failure := recordless_failure(process.returncode, drain.stop.is_set()):
                 print(f"{claim['theory']}: exec-action exited {process.returncode} without a result record, "
                       f"reporting {failure}", file=sys.stderr, flush=True)
                 return failed_record(spec, failure)
             raise RuntimeError(f"exec-action exited {process.returncode} without a result record")
-        with open(result) as file:
-            record = file.read()
     print(f"{claim['theory']}: exit {process.returncode}", file=sys.stderr, flush=True)
     return record
 

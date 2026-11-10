@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import time
 from collections.abc import Callable
 from typing import Any
 from uuid import UUID, uuid4
@@ -1760,6 +1761,50 @@ async def test_a_write_wakes_its_batchs_event_streams_and_idle_streams_wait_for_
 
     assert events[-1] == {"type": "batch", "state": "done", "failure": None}
     assert coordinator.batch_watchers == {}
+
+
+async def test_a_stream_reads_a_burst_of_writes_at_once_but_steady_writes_at_the_poll_rate(
+    coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first few writes to a batch reach its stream at once; a batch written to without pause, as a wide build
+    is, is read about once every events_poll_seconds, not once per write."""
+    settings = coordinator.settings.model_copy(update={
+        "events_poll_seconds": 0.5, "events_burst": 3, "events_burst_spacing_seconds": 0.02,
+        "events_fallback_seconds": 60.0,
+    })
+    reads: list[float] = []
+    changes = coordinator.changes
+
+    async def counted(batch: UUID, since: int) -> Any:
+        reads.append(time.monotonic())
+        return await changes(batch, since)
+
+    monkeypatch.setattr(coordinator, "changes", counted)
+    async with httpx.AsyncClient(
+        transport=Settled(create_app(coordinator, settings), coordinator), base_url="http://coordinator.test"
+    ) as http:
+        batch_id = await submit(http, ["a"])
+
+        async def follow() -> None:
+            async with http.stream("GET", f"/v1/batches/{batch_id}/events", headers=CLIENT) as response:
+                async for _ in response.aiter_lines():
+                    pass
+
+        stream = asyncio.create_task(follow())
+        async with asyncio.timeout(5):
+            while len(reads) < 2:  # the full read, then the one for a write before the stream began watching
+                await asyncio.sleep(0.005)
+        started = time.monotonic()
+        while time.monotonic() - started < 2.0:
+            coordinator._batch_changed(UUID(batch_id))
+            await asyncio.sleep(0.005)
+        during = [t for t in reads[2:] if t >= started]
+        # The bucket held one read after the first two: then one every 0.5 s.
+        assert during and during[0] - started < 0.2
+        assert len(during) <= 1 + 2.0 / 0.5 + 1
+        stream.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await stream
 
 
 async def test_a_request_that_finds_no_free_database_connection_answers_503(

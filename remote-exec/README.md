@@ -241,11 +241,17 @@ workers do when they aren't running HOL:
 - `release`: finding and, on first use, building the action's holbuild release;
 - `before_hol`, `hol`, `after_hol`: running `exec-action`, split at the start
   of its first HOL child and the end of its last (fetching and restoring
-  inputs before, publishing outputs and checkpoints after). A HOL child is a
+  inputs before, publishing outputs and uploading the log after, until its
+  result). A HOL child is a
   descendant of `exec-action` holding a `--cooperate-dir` lease, which the
   worker looks for every second;
-- `exec`: all of `exec-action`, for a worker without `--cooperate-dir`;
-- `complete`: reporting the result.
+- `exec`: all of `exec-action` until its result, for a worker without
+  `--cooperate-dir`;
+- `complete`: reporting the result;
+- `after_result`: `exec-action` after its result is reported, publishing
+  shared checkpoints and tools for later actions, emptying the action's
+  directory and refreshing the cache-cap measurement. The worker stops it
+  120 s after the result.
 
 ## Action isolation
 
@@ -673,7 +679,7 @@ from 0 to 2147483647; invalid values return 422. Existing batches retain priorit
   ```
   The phases:
   ```json
-  {"window_s": 600, "reports": 4210, "seconds": {"memory_wait": 0.0, "claim": 812.4, "idle": 0.0, "lease": 12.5, "release": 31.0, "before_hol": 40210.7, "hol": 52300.2, "after_hol": 44102.9, "exec": 0.0, "complete": 950.3}}
+  {"window_s": 600, "reports": 4210, "seconds": {"memory_wait": 0.0, "claim": 812.4, "idle": 0.0, "lease": 12.5, "release": 31.0, "before_hol": 40210.7, "hol": 52300.2, "after_hol": 44102.9, "exec": 0.0, "complete": 950.3, "after_result": 3020.4}}
   ```
   Tier counts include both classes; `ready_run` and `running_run` are the
   run subsets across tiers. A phase's share of the workers' time is its

@@ -191,6 +191,8 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             batch, since = first
             actions = batch.actions
             last_line = last_read = time.monotonic()
+            # Reads in hand, a token bucket: it refills one every events_poll_seconds, up to events_burst.
+            credit = settings.events_burst - 1.0
             with coordinator.watch(batch_id) as written:
                 while True:
                     for action in actions:
@@ -201,8 +203,8 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
                     if batch.state != "running":
                         yield json.dumps({"type": "batch", "state": batch.state, "failure": batch.failure}) + "\n"
                         return
-                    # Read again once this process wrote to the batch, but not more often than events_poll_seconds,
-                    # or after events_fallback_seconds, for other processes' writes.
+                    # Read again once this process wrote to the batch, as soon as the bucket holds a read, or after
+                    # events_fallback_seconds, for other processes' writes.
                     while True:
                         now = time.monotonic()
                         # A blank line, which clients skip, keeps a proxy from closing a quiet stream as idle; also
@@ -211,7 +213,8 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
                             yield "\n"
                             last_line = now
                         read_at = last_read + (
-                            settings.events_poll_seconds if written.is_set() else settings.events_fallback_seconds
+                            max(settings.events_burst_spacing_seconds, (1.0 - credit) * settings.events_poll_seconds)
+                            if written.is_set() else settings.events_fallback_seconds
                         )
                         if now >= read_at:
                             break
@@ -222,7 +225,10 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
                             with contextlib.suppress(TimeoutError):
                                 await asyncio.wait_for(written.wait(), wait)
                     written.clear()
-                    last_read = time.monotonic()
+                    now = time.monotonic()
+                    credit = max(0.0, min(float(settings.events_burst),
+                                          credit + (now - last_read) / settings.events_poll_seconds) - 1.0)
+                    last_read = now
                     try:
                         changed = await coordinator.changes(batch_id, since)
                     except DATABASE_UNAVAILABLE as error:
