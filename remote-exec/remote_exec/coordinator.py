@@ -133,6 +133,11 @@ class ScaleCommandError(RuntimeError):
     """The scale command failed or timed out."""
 
 
+# What a read raises while the database is out of reach or overloaded: no pooled connection came free, a statement
+# timed out or lost its connection (wrapped by SQLAlchemy), or a new connection failed to open (not wrapped).
+DATABASE_UNAVAILABLE = (sa.exc.TimeoutError, sa.exc.DBAPIError, asyncpg.PostgresError, asyncpg.InterfaceError, OSError)
+
+
 class ResultMismatch(ValueError):
     """A result record for another action than the one its attempt token leases."""
 
@@ -1321,16 +1326,17 @@ class Coordinator:
         permanent = [node_identity(url) for url in cache_nodes(self.settings.cache_url)]
         if self.cache_pool is None:
             return permanent
+        loop = asyncio.get_running_loop()
         async with self.serving_lock:
-            now = asyncio.get_running_loop().time()
-            if self.serving is None or now - self.serving[0] >= self.settings.cache_members_ttl_seconds:
+            if self.serving is None or loop.time() - self.serving[0] >= self.settings.cache_members_ttl_seconds:
                 try:
                     serving = await self.cache_pool.ready_urls()
-                except sa.exc.SQLAlchemyError as error:
+                except DATABASE_UNAVAILABLE as error:
                     logger.warning("reading the serving cache slots failed; keeping the last read: %s", error)
                     serving = [] if self.serving is None else self.serving[1]
-                # Stamped on failure too, so callers don't each wait out the pool in turn.
-                self.serving = (now, serving)
+                # Stamped when the read ends, failed or not, so the callers that waited for it don't each wait out
+                # the pool in turn.
+                self.serving = (loop.time(), serving)
         return list(dict.fromkeys(permanent + self.serving[1]))
 
     async def cache_read_nodes(self, digest: str) -> list[str]:

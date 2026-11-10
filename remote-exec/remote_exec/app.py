@@ -13,7 +13,6 @@ from dataclasses import asdict
 from typing import Literal
 from uuid import UUID
 
-import asyncpg
 import sqlalchemy as sa
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -21,6 +20,7 @@ from pydantic import BaseModel, Field, SecretStr
 
 from remote_exec.auth import cache_discovery_token
 from remote_exec.coordinator import (
+    DATABASE_UNAVAILABLE,
     ActionStatus,
     Coordinator,
     HostReport,
@@ -34,10 +34,6 @@ from remote_exec.formats import FormatError, parse_batch, parse_result
 logger = logging.getLogger(__name__)
 
 Tier = Literal["standard", "high"]
-
-# What a read raises while the database is out of reach or overloaded: no pooled connection came free, a statement
-# timed out or lost its connection (wrapped by SQLAlchemy), or a new connection failed to open (not wrapped).
-DATABASE_UNAVAILABLE = (sa.exc.TimeoutError, sa.exc.DBAPIError, asyncpg.PostgresError, asyncpg.InterfaceError, OSError)
 
 
 class ClaimRequest(BaseModel):

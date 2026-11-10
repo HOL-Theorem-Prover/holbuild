@@ -154,13 +154,16 @@ async def test_members_endpoint_reuses_a_recent_read_and_survives_a_database_fai
         await conn.execute(sa.text("UPDATE cache_slots SET phase='drain' WHERE slot='c'"))
     assert (await http.get('/v1/cache/members', headers=headers)).text == SNAPSHOT
 
-    async def unavailable() -> list[str]:
-        raise sa.exc.TimeoutError('QueuePool limit reached')
-
-    coordinator.cache_pool.ready_urls = unavailable
     coordinator.settings.cache_members_ttl_seconds = 0
-    response = await http.get('/v1/cache/members', headers=headers)
-    assert response.status_code == 200 and response.text == SNAPSHOT
+    # The pool ran dry, then a new connection was refused, which SQLAlchemy doesn't wrap.
+    for error in [sa.exc.TimeoutError('QueuePool limit reached'), ConnectionRefusedError('refused')]:
+
+        async def unavailable(error: Exception = error) -> list[str]:
+            raise error
+
+        coordinator.cache_pool.ready_urls = unavailable
+        response = await http.get('/v1/cache/members', headers=headers)
+        assert response.status_code == 200 and response.text == SNAPSHOT
 
 
 @pytest.mark.parametrize(("method", "path"), [
