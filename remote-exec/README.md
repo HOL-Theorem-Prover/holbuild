@@ -80,6 +80,13 @@ database already at `0011`, even though the added columns are compatible with
 its queries. Deployments that migrate on every service start must account for
 this before pinning an older image.
 
+Migration `0012` adds the index `actions_ready_order` over each batch's ready
+actions in claim order; it changes no table. A coordinator before it keeps
+working on a database at `0012`, but its migration code does not know the
+revision, so roll back by deploying a forward patch release that restores the
+older coordinator code and keeps `0012`, or use the current image to run
+`alembic downgrade 0011` before starting an older image.
+
 For a rollback that preserves the schema, deploy a reviewed forward patch
 release restoring fail-fast dispatch while retaining migrations `0010` and
 `0011` and terminal-state aggregation for already-running keep-going batches.
