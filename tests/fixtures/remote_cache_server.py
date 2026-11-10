@@ -160,6 +160,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = self.object_path()
         if path is None:
             return
+        if control is not None and self.path.startswith("/cas/") and (control / "cas-put-max-size").exists():
+            declared = int(self.headers.get("X-Digest-SizeBytes", self.headers.get("Content-Length", "0")))
+            if declared > int((control / "cas-put-max-size").read_text()):
+                self.send_response(507)
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                return
         data = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         self.gate_cas_put()
         if (
@@ -186,7 +194,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             and (control / "cas-put-reject-text").exists()
             and (control / "cas-put-reject-text").read_bytes() in data
         ):
-            self.send_response(500)
+            status = control / "cas-put-reject-status"
+            self.send_response(int(status.read_text()) if status.exists() else 500)
             self.end_headers()
             return
         action_sequence = (

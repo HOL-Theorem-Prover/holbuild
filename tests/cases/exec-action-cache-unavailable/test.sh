@@ -57,6 +57,26 @@ Proof
   simp[]
 QED
 SML
+cat > "$project/src/LogUploadScript.sml" <<'SML'
+Theory LogUpload
+Ancestors bool
+val _ = print "action-log-upload-marker\n";
+Theorem log_thm:
+  T
+Proof
+  simp[]
+QED
+SML
+cat > "$project/src/FailLogUploadScript.sml" <<'SML'
+Theory FailLogUpload
+Ancestors bool
+val _ = print "failed-action-log-upload-marker\n";
+Theorem false_thm:
+  F
+Proof
+  simp[]
+QED
+SML
 
 (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload ATheory) > "$tmpdir/batch.txt"
 spec=$(awk '$1 == "action" && $5 == "worker:ATheory" { print $4 }' "$tmpdir/batch.txt")
@@ -166,6 +186,27 @@ expect b 3 unavailable "remote cache server error: HTTP 500 for GET .*/ac/$ac"
 rm "$control/ac-get-status-$ac"
 spec=$spec_a
 
+# An ordinary successful action stays successful, but reports a 507 on its log.
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload LogUploadTheory) > "$tmpdir/batch-log.txt"
+spec=$(awk '$1 == "action" && $5 == "worker:LogUploadTheory" { print $4 }' "$tmpdir/batch-log.txt")
+printf 'action-log-upload-marker' > "$control/cas-put-reject-text"
+echo 507 > "$control/cas-put-reject-status"
+worker optional-log
+[[ "$worker_status" == 0 ]] || { cat "$tmpdir/optional-log.result" "$tmpdir/optional-log.log" >&2; exit 1; }
+require_grep '^status=built$' "$tmpdir/optional-log.result"
+require_grep '^log-error=cache rejected log (HTTP 507)$' "$tmpdir/optional-log.result"
+rm "$control/cas-put-reject-text" "$control/cas-put-reject-status"
+
+# A final proof failure without its log is retryable and reports the upload error.
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload FailLogUploadTheory) > "$tmpdir/batch-fail-log.txt"
+spec=$(awk '$1 == "action" && $5 == "worker:FailLogUploadTheory" { print $4 }' "$tmpdir/batch-fail-log.txt")
+printf 'failed-action-log-upload-marker' > "$control/cas-put-reject-text"
+echo 507 > "$control/cas-put-reject-status"
+worker failed-log
+expect failed-log 3 unavailable "could not upload the build log of a proof failure"
+require_grep '^log-error=cache rejected log (HTTP 507)$' "$tmpdir/failed-log.result"
+rm "$control/cas-put-reject-text" "$control/cas-put-reject-status"
+
 # A traced rerun must return its new log even though the theory outputs are
 # already published. An outage during that upload retries the action.
 (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --trace-steps --upload ATheory) > "$tmpdir/batch-traced.txt"
@@ -175,6 +216,7 @@ printf 'holbuild proof-ir before theorem=a_thm ' > "$control/cas-put-reject-text
 worker traced-log
 expect traced-log 3 unavailable "could not upload the required build log"
 require_grep '^status=failed$' "$tmpdir/traced-log.result"
+require_grep '^log-error=cache unavailable$' "$tmpdir/traced-log.result"
 rm "$control/cas-put-reject-text"
 worker traced-log
 [[ "$worker_status" == 0 ]] || { cat "$tmpdir/traced-log.log" >&2; exit 1; }

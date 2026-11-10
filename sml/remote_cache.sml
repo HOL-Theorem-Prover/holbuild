@@ -17,6 +17,8 @@ exception Unavailable of string
 val fail_closed = ref false
 
 type blob_entry = {sha256 : string, size : string}
+datatype action_log = RawLog of string
+                    | CompressedLog of {sha256 : string, size : string, raw_sha256 : string, raw_size : string}
 type blob_map = (string, blob_entry) Redblackmap.dict
 datatype t = RemoteCache of {urls : string list, blobs : blob_map ref}
 
@@ -678,5 +680,114 @@ fun publish_blob cache {hash, src} =
 (* For a src the caller hashed in this process and has not changed since:
    the upload skips hashing it again. *)
 val publish_hashed_blob = put_blob
+
+(* An already compressed action log is an opaque CAS object, not a
+   transport-encoded copy of the raw log. *)
+fun publish_opaque_blob cache {hash, src} =
+  if HolbuildHash.file_sha256 src <> hash then HolbuildCacheBackend.Conflict "blob SHA256 mismatch"
+  else curl_put_urls [] {urls = cas_urls cache hash, src = src}
+
+fun publish_action_log cache path =
+  let
+    val sha = HolbuildHash.file_sha256 path
+    val bytes = Position.toString (FS.fileSize path)
+    fun raw () = (publish_blob cache {hash = sha, src = path}, RawLog sha)
+    fun compressed () =
+      let
+        val tmp = HolbuildTempPath.temporary "action-log-zstd"
+        fun publish () =
+          if zstd_compress (base_url cache) path tmp then
+            let
+              val compressed_sha = HolbuildHash.file_sha256 tmp
+              val ref_ = CompressedLog {sha256 = compressed_sha, size = Position.toString (FS.fileSize tmp),
+                                        raw_sha256 = sha, raw_size = bytes}
+            in (publish_opaque_blob cache {hash = compressed_sha, src = tmp}, ref_) end
+          else raw ()
+      in
+        (publish () before remove_file tmp) handle e => (remove_file tmp; raise e)
+      end
+    val (result, ref_) = if FS.fileSize path >= Position.fromInt (256 * 1024 * 1024)
+                        then compressed () else raw ()
+  in
+    (result, ref_, bytes)
+  end
+
+(* A best-effort check; another writer can consume the space afterwards. *)
+fun enough_log_space dir bytes =
+  let
+    val result = HolbuildSpawn.run {program = "df", args = ["-Pk", dir], stderr = HolbuildSpawn.Discard}
+    val lines = String.tokens (fn c => c = #"\n") (#output result)
+    val fields = String.tokens Char.isSpace (List.last lines)
+  in
+    case LargeInt.fromString (List.nth (fields, 3)) of
+        SOME blocks => blocks * 1024 >= bytes
+      | NONE => true
+  end handle _ => true
+
+(* Reconstruct into a sibling temporary file, with a hard output bound. *)
+fun fetch_action_log cache {log, dst} =
+  case log of
+      RawLog hash => fetch_unlisted_blob cache {hash = hash, dst = dst}
+    | CompressedLog {sha256, size, raw_sha256, raw_size} =>
+        let
+          val compressed = HolbuildTempPath.near dst ".zst"
+          val expanded = HolbuildTempPath.near dst ".log"
+          fun cleanup () = (remove_file compressed; remove_file expanded)
+          fun unpack expected =
+            let
+              val (fd, child) = HolbuildSpawn.launch
+                {program = "zstd", args = ["-q", "-d", "-c", compressed], stderr = HolbuildSpawn.Discard}
+            in
+              case child of
+                  NONE => (Posix.IO.close fd; false)
+                | SOME pid =>
+                    let
+                      val out = BinIO.openOut expanded
+                        handle e => (Posix.IO.close fd; Posix.Process.kill (Posix.Process.K_PROC pid, Posix.Signal.term)
+                                     handle _ => (); ignore (HolbuildSpawn.reap pid); raise e)
+                      fun stop () =
+                        (Posix.IO.close fd handle _ => ();
+                         BinIO.closeOut out handle _ => ();
+                         Posix.Process.kill (Posix.Process.K_PROC pid, Posix.Signal.term) handle _ => ();
+                         ignore (HolbuildSpawn.reap pid))
+                      fun copy count =
+                        let val chunk = Posix.IO.readVec (fd, 65536)
+                            val n = Word8Vector.length chunk
+                            val next = count + LargeInt.fromInt n
+                        in
+                          if next > expected then raise Fail "action log exceeds declared size"
+                          else if n = 0 then count
+                          else (BinIO.output (out, chunk); copy next)
+                        end
+                      val count =
+                        (let val count = copy 0
+                         in Posix.IO.close fd; BinIO.closeOut out; count end)
+                        handle e => (stop (); raise e)
+                      val status = HolbuildSpawn.reap pid
+                    in
+                      status = Posix.Process.W_EXITED andalso count = expected
+                    end
+            end
+          fun fetch () =
+            case LargeInt.fromString raw_size of
+                NONE => HolbuildCacheBackend.Corrupt "invalid action log size"
+              | SOME expected =>
+                  if expected < 0 orelse not (enough_log_space (Path.dir dst) expected) then
+                    HolbuildCacheBackend.Corrupt "insufficient space for action log"
+                  else case fetch_unlisted_blob cache {hash = sha256, dst = compressed} of
+                      HolbuildCacheBackend.Hit =>
+                        if not (enough_log_space (Path.dir dst) expected) then
+                          HolbuildCacheBackend.Corrupt "insufficient space for action log"
+                        else if Position.toString (FS.fileSize compressed) <> size orelse
+                           not (unpack expected) orelse HolbuildHash.file_sha256 expanded <> raw_sha256 then
+                          HolbuildCacheBackend.Corrupt "invalid compressed action log"
+                        else (FS.rename {old = expanded, new = dst}; HolbuildCacheBackend.Hit)
+                    | other => other
+        in
+          (fetch () before cleanup ())
+          handle e as Thread.Interrupt => (cleanup (); raise e)
+               | e as Unavailable _ => (cleanup (); raise e)
+               | _ => (cleanup (); HolbuildCacheBackend.Corrupt "could not restore compressed action log")
+        end
 
 end
