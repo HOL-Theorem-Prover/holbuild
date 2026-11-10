@@ -1525,7 +1525,7 @@ require_grep 'remote rxmultifailure:BlockedTheory: skipped' "$tmpdir/multi-failu
 require_grep 'HealthyTheory restored from cache' "$tmpdir/multi-failure.log"
 refute_grep 'BlockedTheory' "$state/ran"
 refute_grep 'BLOCKED_REMOTE_MUST_NOT_RUN' "$tmpdir/multi-failure.log"
-for name in BadA BadB; do
+for name in BadA BadB Healthy; do
   require_file "$tmpdir/multi-failure/.holbuild/logs/current/rxmultifailure/${name}Theory/build.log"
 done
 require_file "$tmpdir/multi-failure/.holbuild/obj/src/HealthyTheory.dat"

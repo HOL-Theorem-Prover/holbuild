@@ -1026,8 +1026,10 @@ holbuild build --skip-checkpoints MyTheory
   explicit termination proof. If a theorem and terminating definition have the
   same name, the theorem takes precedence.
 - `--tactic-timeout SECONDS` changes the per-step timeout; `0` disables it.
-  A step that times out fails the build even inside `TRY` or an `ORELSE`
-  alternative.
+  A step that times out runs once more with half the timeout; if that
+  finishes, the step passes and the theory's build log says so
+  (`holbuild tactic timeout retry passed: ...`). Otherwise it fails the build,
+  even inside `TRY` or an `ORELSE` alternative.
 - `--proof-scope root|all` (also `--proof-scope=root|all`) selects which
   theories receive proof instrumentation and the invocation's timeout. `root`
   is the default. `all` includes dependency theories in the selected build
@@ -1916,6 +1918,8 @@ theories are reported as skipped. The build restores successful branches from
 the cache, as `--remote-only` does, fetches each failed worker's build log into
 `.holbuild/logs/current/<package>/<theory>/build.log`, prints the diagnostic a
 local build would, and exits with status 1, with or without `--remote-only`.
+The logs of the theories the batch finished are fetched to the same place
+last; one that can't be fetched is skipped.
 If a log can't be fetched, the build builds just that failed theory locally,
 for its diagnostic; with `--remote-only` it fails with status 75 instead.
 The event stream reports each failure when it occurs and repeats the full list

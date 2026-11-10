@@ -92,8 +92,13 @@ class Settings(BaseSettings):
     # An event stream with nothing to send this long sends a blank line, shorter than proxies' idle timeouts.
     events_keepalive_seconds: float = 15.0
     # Database connections the coordinator holds at most, and how long a request waits for one before it fails.
+    # Kept well under the workers' request timeouts, so an overloaded coordinator answers 503 rather than doing the
+    # work of a heartbeat or completion its worker has already given up on and is retrying.
     database_pool_size: int = 50
-    database_pool_timeout_s: float = 10.0
+    database_pool_timeout_s: float = 3.0
+    # /v1/cache/members reuses the serving slots it read for this long: workers ask about as often as they claim.
+    # Clients keep the list REFRESH_SECONDS more, which together stay under cache_drain_seconds.
+    cache_members_ttl_seconds: float = Field(default=2.0, ge=0, allow_inf_nan=False)
     # Burst workers: workers that a scaler starts and stops on top of `warm_workers` always-on ones.
     run_slots: int = Field(default=30, ge=0)
     run_floor: int = Field(default=0, ge=0)
@@ -124,8 +129,23 @@ class Settings(BaseSettings):
                 raise ValueError("cache slots and the cache URL must not mix http:// and https://")
         return self
 
+    @model_validator(mode="after")
+    def members_kept_under_drain(self) -> Self:
+        """A slot's drain must outlast every list that still names it: the coordinator's and then a client's."""
+        if self.cache_members_ttl_seconds + REFRESH_SECONDS >= self.cache_drain_seconds:
+            raise ValueError(
+                f"cache_members_ttl_seconds plus the clients' {REFRESH_SECONDS} s refresh must stay under "
+                "cache_drain_seconds"
+            )
+        return self
+
 class ScaleCommandError(RuntimeError):
     """The scale command failed or timed out."""
+
+
+# What a read raises while the database is out of reach or overloaded: no pooled connection came free, a statement
+# timed out or lost its connection (wrapped by SQLAlchemy), or a new connection failed to open (not wrapped).
+DATABASE_UNAVAILABLE = (sa.exc.TimeoutError, sa.exc.DBAPIError, asyncpg.PostgresError, asyncpg.InterfaceError, OSError)
 
 
 class ResultMismatch(ValueError):
@@ -413,6 +433,21 @@ class _Claimed:
     max_heap_mb: int | None
 
 
+# End a running batch that has no unfinished action left: done, or failed with its failed builds. Run after every
+# completion, so the check is one entry of actions_batch_unfinished however many actions the batch finished. It looks
+# for the batch's first unfinished action in the index's order rather than for any: with no order asked for, the
+# database scans the table for one whenever unfinished actions look common, and reads every row a batch near its end
+# finished.
+FINISH_IF_DONE = sa.text(
+    "UPDATE batches SET (state, failure) = (SELECT "
+    "CASE WHEN count(*) = 0 THEN 'done' ELSE 'failed' END, "
+    "string_agg(theory || ': ' || COALESCE(last_failure, 'internal') || "
+    "COALESCE(': ' || failure_detail, ''), '; ' ORDER BY theory, input_key) "
+    "FROM actions WHERE batch_id = :id AND class = 'build' AND state = 'failed') "
+    "WHERE id = :id AND state = 'running' AND (SELECT input_key FROM actions "
+    "WHERE batch_id = :id AND state IN ('waiting', 'ready', 'running') ORDER BY input_key LIMIT 1) IS NULL"
+)
+
 # The unfinished actions by state, tier and class, for the queue counts, and only the ready and running ones, which
 # are all burst demand needs: the scale check runs every sweep, and waiting actions can outnumber the others many
 # times over. Literal states, so the partial index actions_unfinished serves both.
@@ -446,6 +481,8 @@ class Coordinator:
         self.cache_nodes = cache_nodes(settings.cache_url)
         self.membership = Membership(self.cache_nodes, [slot.url for slot in settings.cache_slots])
         self.membership_lock = asyncio.Lock()
+        self.serving_lock = asyncio.Lock()
+        self.serving: tuple[float, list[str]] | None = None  # when the serving slots were last read, and them
         self.clock: Callable[[], datetime] = lambda: datetime.now(UTC)
         self.cache_pool = (CachePool(engine, settings.cache_slots, CommandAdapter(settings.cache_pool_cmd),
                                      drain_seconds=settings.cache_drain_seconds, hold_seconds=settings.scale_down_hold_s,
@@ -1302,6 +1339,28 @@ class Coordinator:
         self.cache_checks.clear()
         self.cache_forgotten += 1
 
+    async def cache_members(self) -> list[str]:
+        """The cache nodes for clients: the permanent ones, then the serving slots'.
+
+        The slots read are reused for ``cache_members_ttl_seconds``, and concurrent calls wait for one read. While
+        the database can't answer, the slots last read are kept, so the endpoint answers rather than failing.
+        """
+        permanent = [node_identity(url) for url in cache_nodes(self.settings.cache_url)]
+        if self.cache_pool is None:
+            return permanent
+        loop = asyncio.get_running_loop()
+        async with self.serving_lock:
+            if self.serving is None or loop.time() - self.serving[0] >= self.settings.cache_members_ttl_seconds:
+                try:
+                    serving = await self.cache_pool.ready_urls()
+                except DATABASE_UNAVAILABLE as error:
+                    logger.warning("reading the serving cache slots failed; keeping the last read: %s", error)
+                    serving = [] if self.serving is None else self.serving[1]
+                # Stamped when the read ends, failed or not, so the callers that waited for it don't each wait out
+                # the pool in turn.
+                self.serving = (loop.time(), serving)
+        return list(dict.fromkeys(permanent + self.serving[1]))
+
     async def cache_read_nodes(self, digest: str) -> list[str]:
         """Refresh ready slots at most once per thirty seconds, retaining the permanent fallback."""
         if self.cache_pool is None:
@@ -1501,18 +1560,7 @@ class Coordinator:
         )
 
     async def _finish_if_done(self, conn: AsyncConnection, batch_id: UUID) -> None:
-        await conn.execute(
-            sa.text(
-                "UPDATE batches SET (state, failure) = (SELECT "
-                "CASE WHEN count(*) = 0 THEN 'done' ELSE 'failed' END, "
-                "string_agg(theory || ': ' || COALESCE(last_failure, 'internal') || "
-                "COALESCE(': ' || failure_detail, ''), '; ' ORDER BY theory, input_key) "
-                "FROM actions WHERE batch_id = :id AND class = 'build' AND state = 'failed') "
-                "WHERE id = :id AND state = 'running' AND NOT EXISTS "
-                "(SELECT 1 FROM actions WHERE batch_id = :id AND state IN ('waiting', 'ready', 'running'))"
-            ),
-            {"id": batch_id},
-        )
+        await conn.execute(FINISH_IF_DONE, {"id": batch_id})
 
     async def _fail(
         self, conn: AsyncConnection, batch_id: UUID, input_key: str, action_class: str, failure: str
