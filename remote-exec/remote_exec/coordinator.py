@@ -7,6 +7,7 @@ is a batch row first, then its actions and leases, so a completion, an expiry an
 import asyncio
 import contextlib
 import graphlib
+import heapq
 import json
 import logging
 import os
@@ -99,6 +100,8 @@ class Settings(BaseSettings):
     # /v1/cache/members reuses the serving slots it read for this long: workers ask about as often as they claim.
     # Clients keep the list REFRESH_SECONDS more, which together stay under cache_drain_seconds.
     cache_members_ttl_seconds: float = 2.0
+    # Build claims share one ranking of the batches for this long; see Coordinator._claim_build. 0 ranks per claim.
+    claim_ranking_seconds: float = 0.5
     # Burst workers: workers that a scaler starts and stops on top of `warm_workers` always-on ones.
     run_slots: int = Field(default=30, ge=0)
     run_floor: int = Field(default=0, ge=0)
@@ -382,7 +385,10 @@ WITH run_capacity AS MATERIALIZED (
         SELECT count(*) FROM actions WHERE state = 'running' AND class = 'run'
     ) < :run_slots AS available
 )
-SELECT b.id AS batch_id, c.class AS action_class, t.tier, b.max_heap_mb
+SELECT b.id AS batch_id, c.class AS action_class, t.tier, b.max_heap_mb,
+    (SELECT count(*) FROM actions r WHERE r.batch_id = b.id AND r.state = 'running') AS running,
+    (SELECT max(l.last_claimed_at) FROM actions l WHERE l.batch_id = b.id) AS last_claimed_at,
+    b.created_at
 FROM batches b
 CROSS JOIN (SELECT DISTINCT unnest(CAST(:classes AS text[]))) c (class)
 CROSS JOIN (SELECT DISTINCT unnest(CAST(:tiers AS text[]))) t (tier)
@@ -393,13 +399,7 @@ CROSS JOIN LATERAL (
 ) ready
 WHERE b.state = 'running'
 AND (c.class = 'build' OR (SELECT available FROM run_capacity))
-ORDER BY
-    c.class,
-    array_position(CAST(:tiers AS text[]), t.tier),
-    (SELECT count(*) FROM actions r WHERE r.batch_id = b.id AND r.state = 'running'),
-    (SELECT max(l.last_claimed_at) FROM actions l WHERE l.batch_id = b.id) NULLS FIRST,
-    b.created_at,
-    b.id
+ORDER BY c.class, array_position(CAST(:tiers AS text[]), t.tier), running, last_claimed_at NULLS FIRST, b.created_at, b.id
 """)
 CLAIM_ACTION = sa.text("""
 SELECT input_key, spec_sha256, theory FROM actions
@@ -407,6 +407,21 @@ WHERE batch_id = :batch_id AND state = 'ready' AND class = :class AND tier = :ti
 ORDER BY critical_depth DESC, descendant_count DESC, theory, input_key
 LIMIT 1 FOR UPDATE SKIP LOCKED
 """)
+
+
+@dataclass
+class _Ranking:
+    """The running batches with ready build actions, as CLAIM_CANDIDATES ranks them, read at ``at``: a heap of
+    (tier position, running actions, ever claimed, last claim, created, batch, tier, heap limit), the batches and
+    tiers it ranked, and those found without an unlocked ready action since."""
+
+    at: float
+    heap: list[tuple[int, int, bool, datetime, datetime, UUID, str, int | None]]
+    ranked: set[tuple[UUID, str]]  # the batches and tiers it ranked
+    exhausted: set[tuple[UUID, str]]
+
+
+_NEVER = datetime.min.replace(tzinfo=UTC)  # the last claim of a batch never claimed from, for ordering
 
 
 @dataclass(frozen=True)
@@ -482,6 +497,8 @@ class Coordinator:
         # oldest first (the tie-breaker within a host); see claim.
         self.made_ready = 0
         self.claim_waiters: list[tuple[list[str], ClaimRank, asyncio.Future[str]]] = []
+        self.rankings: dict[tuple[str, ...], _Ranking] = {}  # the build claims' shared rankings, by tiers
+        self.ranking_reads: dict[tuple[str, ...], asyncio.Task[_Ranking]] = {}
         # When each cache entry was last found, the checks of the cache under way, and how many times
         # input-missing results forgot both; see _in_cache.
         self.found_in_cache: dict[str, float] = {}
@@ -722,6 +739,10 @@ class Coordinator:
             raise
 
     async def _claim(self, tiers: list[str], worker: str) -> Claim | None:
+        # Waited for before taking a connection: claims waiting on a ranking while holding one could leave none
+        # for the ranking's read.
+        started = asyncio.get_running_loop().time()
+        ranking = await self._current_ranking(tuple(tiers))
         async with self.engine.begin() as conn:
             # A batch's running count and last claim are read without locking its row, so concurrent claims see
             # only each other's committed leases, which at worst lets workers waking together pick the same
@@ -742,7 +763,7 @@ class Coordinator:
                 await conn.execute(sa.text("SELECT pg_advisory_xact_lock(1752132706, 1)"))
                 row = await self._claim_first(conn, {**params, "classes": ["run"], "run_slots": floor})
             if row is None:
-                row = await self._claim_first(conn, params)
+                row = await self._claim_build(conn, tiers, ranking, started)
             if row is None:
                 if self.settings.run_slots == 0 or not await conn.scalar(
                     sa.text(
@@ -796,6 +817,89 @@ class Coordinator:
             if row is not None:
                 return _Claimed(candidate.batch_id, row.input_key, row.spec_sha256, row.theory, candidate.max_heap_mb)
         return None
+
+    async def _claim_build(
+        self, conn: AsyncConnection, tiers: list[str], ranking: "_Ranking", started: float
+    ) -> _Claimed | None:
+        """Lock a ready build action of ``tiers`` in the order of CLAIM_CANDIDATES, taken from ``ranking``, which
+        the build claims of ``claim_ranking_seconds`` share, so that the ranking, which probes every running batch,
+        isn't repeated by every claim.
+
+        Each claim takes the best batch of the ranking and puts it back as if it had one more running action and
+        had just had one claimed, before it tries the batch, so concurrent claims spread over the batches as fresh
+        rankings would spread them. A batch and tier found without an unlocked ready action are skipped until the
+        next ranking; when every one is, and the ranking is older than the claim, which ``started`` then, the claim
+        ranks again on ``conn``, for actions made ready since.
+        """
+        while True:
+            while ranking.heap:
+                entry = heapq.heappop(ranking.heap)
+                tier_position, running, _, _, created_at, batch_id, tier, max_heap_mb = entry
+                if (batch_id, tier) in ranking.exhausted:
+                    continue
+                heapq.heappush(
+                    ranking.heap,
+                    (tier_position, running + 1, True, self.clock(), created_at, batch_id, tier, max_heap_mb),
+                )
+                row = (
+                    await conn.execute(CLAIM_ACTION, {"batch_id": batch_id, "class": "build", "tier": tier})
+                ).first()
+                if row is not None:
+                    return _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, max_heap_mb)
+                ranking.exhausted.add((batch_id, tier))
+            if ranking.at >= started:
+                return None
+            ranking = await self._rank(conn, tuple(tiers))
+            self.rankings[tuple(tiers)] = ranking
+
+    async def _current_ranking(self, key: tuple[str, ...]) -> "_Ranking":
+        """The build claims' ranking for the tiers ``key``: the last one if younger than ``claim_ranking_seconds``,
+        else a new one, which concurrent callers wait for together."""
+        ranking = self.rankings.get(key)
+        if ranking is not None and asyncio.get_running_loop().time() - ranking.at < self.settings.claim_ranking_seconds:
+            return ranking
+        read = self.ranking_reads.get(key)
+        if read is None:
+
+            async def rank() -> _Ranking:
+                async with self.engine.connect() as conn:
+                    return await self._rank(conn, key)
+
+            read = asyncio.get_running_loop().create_task(rank())
+            self.ranking_reads[key] = read
+
+            def done(_: object) -> None:
+                if self.ranking_reads.get(key) is read:
+                    del self.ranking_reads[key]
+                if not read.cancelled() and read.exception() is None:
+                    self.rankings[key] = read.result()
+
+            read.add_done_callback(done)
+        # Shielded, so a caller cancelled leaves the read to the others.
+        return await asyncio.shield(read)
+
+    async def _rank(self, conn: AsyncConnection, key: tuple[str, ...]) -> "_Ranking":
+        at = asyncio.get_running_loop().time()
+        params = {"tiers": list(key), "classes": ["build"], "run_slots": self.settings.run_slots}
+        rows = (await conn.execute(CLAIM_CANDIDATES, params)).all()
+        heap = [
+            (key.index(row.tier), row.running, row.last_claimed_at is not None, row.last_claimed_at or _NEVER,
+             row.created_at, row.batch_id, row.tier, row.max_heap_mb)
+            for row in rows
+        ]
+        heapq.heapify(heap)
+        return _Ranking(at, heap, {(row.batch_id, row.tier) for row in rows}, set())
+
+    def _forget_rankings(self, batch_id: UUID, tiers: set[str]) -> None:
+        """Drop the rankings that would pass over actions of ``tiers`` made ready in ``batch_id``: those that didn't
+        have it with a ready action of one of them, or have since found it without one."""
+        self.rankings = {
+            key: ranking for key, ranking in self.rankings.items()
+            if all(
+                (batch_id, tier) in ranking.ranked and (batch_id, tier) not in ranking.exhausted
+                for tier in tiers if tier in key
+            )
+        }
 
     def _wake_claim(self, tier: str) -> None:
         """Count an action of ``tier`` made ready, and wake its best-ranked compatible claim, with FIFO ties."""
@@ -1038,6 +1142,7 @@ class Coordinator:
                 )
                 made_ready = list(tiers)
             self._batch_changed(batch_id)
+            self._forget_rankings(batch_id, set(made_ready))
             for tier in made_ready:
                 self._wake_claim(tier)
         requeued = False

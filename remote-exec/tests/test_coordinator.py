@@ -164,6 +164,36 @@ async def test_a_new_batch_goes_ahead_of_a_wide_one_holding_workers(http: httpx.
     await claim_named(http, "w4")
 
 
+async def test_build_claims_share_one_ranking_and_still_spread_over_batches(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claims within claim_ranking_seconds of a ranking take turns over its batches, as fresh rankings would
+    have them, without ranking again; once every batch it ranked is out of ready actions, a claim ranks again, and
+    finds the actions made ready since."""
+    coordinator.settings.claim_ranking_seconds = 3600
+    rankings = 0
+    rank = coordinator._rank
+
+    async def counted(conn: Any, key: tuple[str, ...]) -> Any:
+        nonlocal rankings
+        rankings += 1
+        return await rank(conn, key)
+
+    monkeypatch.setattr(coordinator, "_rank", counted)
+    await submit(http, ["a1", "a2", "a3"])
+    await submit(http, ["b1", "b2"])
+    claimed = [(await claim(http))["theory"] for _ in range(5)]
+    assert claimed == ["pkg:a1", "pkg:b1", "pkg:a2", "pkg:b2", "pkg:a3"]
+    assert rankings == 1
+    assert await claim(http) is None
+    assert rankings == 2
+
+    # A batch that wasn't ranked drops the ranking as soon as it has a ready action.
+    await submit(http, ["c1"])
+    assert (await claim(http))["theory"] == "pkg:c1"
+    assert rankings == 3
+
+
 async def test_claims_take_the_deepest_then_the_widest_action_of_a_batch_first(
     http: httpx.AsyncClient, remote_exec_engine: Any
 ) -> None:
