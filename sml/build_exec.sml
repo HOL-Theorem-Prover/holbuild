@@ -6964,10 +6964,10 @@ fun start_background_pool limit work =
     {add = add, drain = wait, stop = stop}
   end
 
-(* Runs work on each of items, up to 4 at a time, for a worker's transfers,
-   and raises what a serial loop would: the failure of the first item that
-   fails.  Items after a failed one are skipped if not yet started. *)
-fun transfer_all work items =
+(* Runs work on each of items, up to width at a time, and raises what a
+   serial loop would: the failure of the first item that fails.  Items after
+   a failed one are skipped if not yet started. *)
+fun parallel_all width work items =
   case items of
       [] => ()
     | [item] => work item
@@ -6984,12 +6984,18 @@ fun transfer_all work items =
                   SOME (j, _) => if j < i then () else failure := SOME (i, e)
                 | NONE => failure := SOME (i, e))
           fun run (i, item) = if after_failure i then () else work item handle e => note i e
-          val {add, drain, stop} = start_background_pool 4 run
+          val {add, drain, stop} = start_background_pool width run
         in
           (List.app add (ListPair.zip (List.tabulate (length items, fn i => i), items)); drain ())
           handle e => (stop (); raise e);
           case !failure of SOME (_, e) => raise e | NONE => ()
         end
+
+(* For a worker's transfers. *)
+fun transfer_all work items = parallel_all 4 work items
+
+(* For remote cache lookups, which are mostly latency. *)
+val remote_probe_width = 16
 
 fun prefetch_limit jobs =
   Option.getOpt (!HolbuildRemoteCacheConfig.prefetch_concurrency, Int.max (50, 2 * jobs))
@@ -8807,8 +8813,12 @@ fun records_parent recorded ({target, ...} : {target : string, stem : string, ke
    dependencies selected by wanted whose outputs differ from the remote's,
    so that the next restore takes the remote's; true when it dropped one. *)
 fun drop_stale_dep_copies remote (spec : spec_deps) wanted =
-  List.foldl (fn (dep, dropped) => (wanted dep andalso drop_local_copy_if_stale remote (#key dep)) orelse dropped)
-             false (#deps spec)
+  let val checks = map (fn dep => (dep, ref false)) (List.filter wanted (#deps spec))
+  in
+    parallel_all remote_probe_width (fn (dep, dropped) => dropped := drop_local_copy_if_stale remote (#key dep))
+                 checks;
+    List.exists (fn (_, dropped) => !dropped) checks
+  end
 
 (* The dependencies a restored or built .dat records as parents. *)
 fun dat_records_parent path = records_parent (parse_dat_parent_hashes (read_text path))
@@ -8868,18 +8878,22 @@ fun hydrate_spec_deps remote root files (spec : spec_deps) direct =
           (fn {stem, ...} => not (spec_parent_hashes_match_in dat_hashes root spec (in_root root (stem ^ ".dat"))))
           (#deps spec)
       end
-    fun refresh wanted = if drop_stale_dep_copies remote spec wanted then transfer_all restore_dep (#deps spec) else ()
+    fun refresh wanted =
+      drop_stale_dep_copies remote spec wanted andalso (transfer_all restore_dep (#deps spec); true)
   in
     transfer_all (fetch_spec_blob remote) (last_per_dst (files @ map library (#libraries spec)));
     List.app write_lib (#libs spec);
     transfer_all restore_dep (#deps spec);
-    refresh direct;
-    if Option.isSome (misfit ()) then refresh (fn _ => true) else ();
+    ignore (refresh direct);
     case misfit () of
         NONE => ()
-      | SOME {target, key, ...} =>
-          raise ActionFailed (InputMissing ("theory " ^ key),
-                              "dependency " ^ target ^ " does not match its parents in the cache")
+      | SOME first =>
+          (* The files change only if the refresh drops a copy. *)
+          case (if refresh (fn _ => true) then misfit () else SOME first) of
+              NONE => ()
+            | SOME {target, key, ...} =>
+                raise ActionFailed (InputMissing ("theory " ^ key),
+                                    "dependency " ^ target ^ " does not match its parents in the cache")
   end
 
 (* The stems of the project objects the build loads: the ones its preload
@@ -9349,23 +9363,29 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
               in
                 sweep (total - Option.getOpt (freed, 0)) rest
               end
+    fun measure_shared () =
+      let
+        val measured = Time.toNanoseconds (Time.now ())
+        val ids = root_ids ()
+      in
+        {measured = measured, ids = ids, sizes = map (fn {measure, ...} => measure ()) roots}
+      end
+    fun publish {measured, ids, sizes} =
+      if ids <> root_ids () then remove_file state_path
+      else write_text state_path
+        ("holbuild-worker-cache-cap-v2\n" ^ LargeInt.toString measured ^ "\n" ^
+         String.concat (ListPair.map (fn (id, bytes) => id ^ " " ^ IntInf.toString bytes ^ "\n")
+                                    (ids, sizes)))
     fun scan () =
       let val private_size = private_bytes ()
       in
         if recent_scan_fits (fn () => private_size) then ()
         else
           let
-            val measured = Time.toNanoseconds (Time.now ())
-            val ids = root_ids ()
-            val sizes = map (fn {measure, ...} => measure ()) roots
-            val total = sum sizes + private_size
+            val shared = measure_shared ()
+            val total = sum (#sizes shared) + private_size
           in
-            if total <= target then
-              if ids <> root_ids () then remove_file state_path
-              else write_text state_path
-                ("holbuild-worker-cache-cap-v2\n" ^ LargeInt.toString measured ^ "\n" ^
-                 String.concat (ListPair.map (fn (id, bytes) => id ^ " " ^ IntInf.toString bytes ^ "\n")
-                                            (ids, sizes)))
+            if total <= target then publish shared
             else
               let
                 (* Eviction mixes private and shared families. Do not publish a
@@ -9380,7 +9400,9 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                           local_families) @ by_age young_orphans
                 val after = sweep total families
               in
-                if after <= target then ()
+                (* Measure again, so a waiter on gc.lock reuses the result
+                   rather than repeating the scan. *)
+                if after <= target then publish (measure_shared ())
                 else warn ("worker cache holds " ^ gb_decimal_text after ^ " GB of entries in use, over the " ^
                            gb_decimal_text target ^ " GB left under the cap after its reserve")
               end
@@ -9644,14 +9666,15 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
         | p :: (rest as q :: _) => saved_parent p = SOME q andalso chain_ok rest
     (* A checkpoint is chained to the heap its manifest names, so only those
        on the heap now published under heap_key are restored. *)
-    fun try_candidate published_heap (c : shared_candidate) =
-      let val key = shared_checkpoint_key heap_key (#kind c) (#key c)
+    fun candidate_key (c : shared_candidate) = shared_checkpoint_key heap_key (#kind c) (#key c)
+    fun try_candidate published_heap (c : shared_candidate, fetched) =
+      let val key = candidate_key c
       in
-        case HolbuildRemoteCache.get_action remote key of
+        case fetched of
             NONE => NONE
-          | SOME text =>
+          | SOME action =>
               (let
-                 val entries = shared_manifest_entries text
+                 val entries = shared_manifest_entries (HolbuildRemoteCache.remember_action remote action)
                  val (heap, _) = single "heap" entries
                  val (leaf, leaf_rel) = single "leaf" entries
                  val _ = if tree_path checkpoint_root leaf_rel = #path c then ()
@@ -9704,6 +9727,24 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                     | e => (warn ("could not restore shared checkpoint: " ^ General.exnMessage e);
                             wipe (); NONE))
       end
+    (* Fetch a window of manifests at once, then try them in order. Every
+       fetch has ended before a window is tried, and only a manifest that is
+       tried records its blobs as present. *)
+    fun first_window heap candidates =
+      case candidates of
+          [] => NONE
+        | _ =>
+            let
+              val n = Int.min (remote_probe_width, length candidates)
+              val window = map (fn c => (c, ref NONE)) (List.take (candidates, n))
+              val _ = parallel_all n (fn (c, fetched) =>
+                                        fetched := HolbuildRemoteCache.fetch_action remote (candidate_key c))
+                                     window
+            in
+              case first_some (try_candidate heap) (map (fn (c, fetched) => (c, !fetched)) window) of
+                  SOME restored => SOME restored
+                | NONE => first_window heap (List.drop (candidates, n))
+            end
     fun try_heap heap =
       (place_heap heap;
        if shared_heap_parent_ok ctx andalso deps_checkpoint_exists deps_loaded deps_key then
@@ -9723,7 +9764,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                   handle e => (warn ("could not restore the shared heap: " ^ General.exnMessage e); NONE)) of
                 NONE => no_files
               | SOME heap =>
-                  case first_some (try_candidate heap) candidates of
+                  case first_window heap candidates of
                       SOME restored => restored
                     | NONE => try_heap heap
   in
