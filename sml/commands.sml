@@ -1734,6 +1734,28 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               in
                 HolbuildRemoteExec.while_followed url batch_id follow_batch
               end
+            fun report_failed_log ({input_key, log_sha256, ...} : HolbuildRemoteExec.action_failure) =
+              case log_sha256 of
+                  NONE => ()
+                | SOME sha =>
+                    let
+                      fun warn_log reason =
+                        HolbuildBuildExec.warn ("remote execution: could not fetch the failed theory's build log: " ^
+                          input_key ^ ": " ^ reason)
+                    in
+                      (case HolbuildBuildExec.node_with_input_key build_options tc project plan toolchain_key input_key of
+                           NONE => warn_log "the action is not in the current plan"
+                         | SOME node =>
+                             case HolbuildBuildExec.fetch_remote_build_log project node sha of
+                                 NONE => HolbuildBuildExec.warn
+                                   ("remote execution: could not fetch the failed theory's build log: " ^
+                                    HolbuildBuildPlan.logical_name node)
+                               | SOME path => HolbuildStatus.message_stderr (HolbuildBuildExec.child_log_detail path ^ "\n"))
+                      handle HolbuildRemoteCache.Unavailable reason => warn_log reason
+                           | HolbuildBuildExec.Error reason => warn_log reason
+                           | OS.SysErr (reason, _) => warn_log reason
+                           | e as IO.Io _ => warn_log (General.exnMessage e)
+                    end
             (* A theory the remote cache holds may not fit the parents it holds,
                as when a nondeterministic theory was built twice; the workers
                then can't use it, and the coordinator fails the batch for
@@ -1790,19 +1812,11 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     val _ = HolbuildHolSharedCache.local_build_needed := false
                   in
                     if proof_failure then proof_failed reason failures restore_finished_logs
-                    else let
-                      val _ = List.app (fn {input_key, log_sha256, ...} =>
-                        case (log_sha256, HolbuildBuildExec.node_with_input_key build_options tc project plan toolchain_key input_key) of
-                            (SOME sha, SOME node) =>
-                              (case HolbuildBuildExec.fetch_remote_build_log project node sha of
-                                   SOME _ => ()
-                                 | NONE => HolbuildBuildExec.warn
-                                     ("remote execution: could not fetch the failed theory's build log: " ^
-                                      HolbuildBuildPlan.logical_name node))
-                          | _ => ()) failures
-                      val _ = restore_finished_logs ()
-                    in
-                      if final then fall_back reason
+                    else
+                      if final then
+                        (List.app report_failed_log failures;
+                         restore_finished_logs ();
+                         fall_back reason)
                       else
                         (HolbuildStatus.message_stderr
                            ("holbuild: remote execution: " ^ reason ^ "; resubmitting" ^
@@ -1812,7 +1826,6 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                          (* Their local entries may be the ones that don't fit. *)
                          HolbuildBuildExec.drop_local_cache_entries forced;
                          export_and_submit false forced)
-                    end
                   end
                 | ((HolbuildRemoteExec.Cancelled, progress), _) =>
                     let val reason = "batch " ^ batch_id ^ " cancelled; " ^ finished progress
