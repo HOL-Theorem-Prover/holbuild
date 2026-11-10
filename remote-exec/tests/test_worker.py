@@ -47,9 +47,9 @@ RECORD = f"holbuild-action-result-v1\nspec={SPEC}\ninput-key={'6' * 64}\nstatus=
 
 # A stand-in holbuild source tree: `make bin/holbuild` installs a script that logs its arguments and environment and
 # writes RECORD (or HOLBUILD_FAKE_RECORD) to its --result file, or ends without one when HOLBUILD_FAKE_CRASH is set:
-# exit 70 for 1, else killed by the signal it names.
+# exit 70 for 1, else killed by the signal it names. Its `sandbox-check` logs its environment and passes.
 FAKE_HOLBUILD = f"""#!/bin/sh
-[ "$1" != sandbox-check ] || exit 0
+if [ "$1" = sandbox-check ]; then [ -z "$HOLBUILD_FAKE_LOG" ] || env > "$HOLBUILD_FAKE_LOG.sandbox-env"; exit 0; fi
 echo $$ > "$HOLBUILD_FAKE_LOG.pid"
 if [ -n "$HOLBUILD_FAKE_HANG" ]; then
   trap '' TERM
@@ -548,6 +548,10 @@ def test_action_runs_without_the_worker_token(
         Phases(),
     )
 
+    sandbox_env = Path(f"{logs[1]}.sandbox-env").read_text().splitlines()
+    assert "REMOTE_EXEC_WORKER_TOKEN=worker-secret" not in sandbox_env
+    trust = [line for line in sandbox_env if line.startswith("HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES=")]
+    assert trust == ([] if trusted is None else [f"HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES={trusted}"])
     env = dict(line.split("=", 1) for line in Path(f"{logs[1]}.env").read_text().splitlines() if "=" in line)
     assert "REMOTE_EXEC_WORKER_TOKEN" not in env
     assert "HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN" not in env

@@ -104,9 +104,11 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_RETENTION_HOURS` | age after which a finished batch is deleted | 168 |
 | `REMOTE_EXEC_BATCH_DEADLINE_HOURS` | age at which a batch still running fails | 12 |
 | `REMOTE_EXEC_HINT_TTL_DAYS` | age after which an unused peak hint is deleted | 30 |
-| `REMOTE_EXEC_DATABASE_POOL_SIZE` | database connections the coordinator holds at most | 20 |
+| `REMOTE_EXEC_DATABASE_POOL_SIZE` | database connections the coordinator holds at most | 50 |
 | `REMOTE_EXEC_DATABASE_POOL_TIMEOUT_S` | how long a request waits for a free connection before it fails | 10 |
 | `REMOTE_EXEC_EVENTS_KEEPALIVE_SECONDS` | how long an event stream stays quiet before it sends an empty line | 15 |
+| `REMOTE_EXEC_EVENTS_POLL_SECONDS` | least time between an event stream's reads of its batch, which a write to it by the same coordinator process starts | 1 |
+| `REMOTE_EXEC_EVENTS_FALLBACK_SECONDS` | most time between an event stream's reads, for other coordinator processes' writes | 10 |
 | `REMOTE_EXEC_SWEEP_SECONDS` | period of the sweep (lease expiry, releases, retention, scaling) | 5 |
 | `REMOTE_EXEC_RUN_SLOTS` | fleet-wide running run-action cap; 0 pauses new run claims | 30 |
 | `REMOTE_EXEC_RUN_FLOOR` | running run actions allowed ahead of ready builds, clamped to `REMOTE_EXEC_RUN_SLOTS` | 0 |
@@ -560,7 +562,9 @@ the action carries on.
 
 Every request carries `Authorization: Bearer <token>`: the client token for
 `/v1/batches…` and `/v1/queue`, the worker token for `/v1/work…`. A wrong or missing token
-gets 401. Errors are JSON `{"detail": "<message>"}`.
+gets 401. Errors are JSON `{"detail": "<message>"}`. Any route answers 503
+`{"detail": "database busy"}`, with `Retry-After`, when no database connection
+came free within `REMOTE_EXEC_DATABASE_POOL_TIMEOUT_S`.
 
 ### Client
 
@@ -615,7 +619,8 @@ An unknown class returns 422.
   {"type": "batch", "state": "done|failed|cancelled", "failure": "<message>|null"}
   ```
   A client detaches by closing the connection and reattaches by opening the
-  stream again with the same `batch_id`.
+  stream again with the same `batch_id`. A read of the batch that fails while
+  the database is out of reach is retried; the stream stays open.
 - 404 when there is no such batch
 
 `GET /v1/queue`
