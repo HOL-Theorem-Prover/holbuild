@@ -120,7 +120,7 @@ fun build_help () = print
   \      files in from one build to the next: the cache root's tool-cache/NAME\n\
   \      here; on a remote worker, one the remote cache fills and saves per\n\
   \      theory dependencies.\n\
-  \  --remote-exec URL [--remote-only] [--detach | --attach BATCH-ID]\n\n\
+  \  --remote-exec URL [--remote-only] [--priority N] [--detach | --attach BATCH-ID]\n\n\
   \With --remote-exec, theories the remote cache lacks and that aren't\n\
   \built here for their current inputs (except with --detach) are built\n\
   \by the coordinator's workers and restored from the remote cache. Needs\n\
@@ -1128,7 +1128,7 @@ datatype build_mode =
   | ExportRunSpecs of HolbuildBuildExec.run_request
   | RemoteRun of {request : HolbuildBuildExec.run_request, url : string option, fetch_only : bool,
                   outputs_dir : string, profile : string option}
-  | RemoteExec of {url : string, remote_only : bool, detach : bool, attach : string option}
+  | RemoteExec of {url : string, remote_only : bool, detach : bool, attach : string option, priority : int}
 
 fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, fail_fast, proof_steps, new_ir, proof_scope, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy, cached_proofs}, targets) =
   let
@@ -1608,7 +1608,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       end
     (* Theories the remote cache lacks go to the coordinator as a batch; once
        it finishes, the ordinary build restores them from the remote cache. *)
-    fun remote_build {url, remote_only, detach, attach} =
+    fun remote_build {url, remote_only, detach, attach, priority} =
       let
         val _ =
           if Option.isSome (HolbuildRemoteCacheConfig.url ()) then ()
@@ -1662,7 +1662,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               end
             (* Diagnose every final failure. A missing proof log retains the
                single-theory diagnostic fallback. *)
-            fun proof_failed reason (failures : HolbuildRemoteExec.action_failure list) =
+            fun proof_failed reason (failures : HolbuildRemoteExec.action_failure list) restore_finished_logs =
               let
                 val _ = HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "\n")
                 val needs_local = ref false
@@ -1704,6 +1704,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                  end)
                         end
                 val errors = map diagnose failures
+                val _ = restore_finished_logs ()
               in
                 HolbuildHolSharedCache.local_build_needed := !needs_local;
                 HolbuildBuildExec.raise_build_failures errors
@@ -1782,7 +1783,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                  (HolbuildBuildExec.remote_restore_options (#restore_only build_options) build_options)
                                  tc project plan toolchain_key jobs))
                     end
-                | ((HolbuildRemoteExec.Failed (reason, failures), progress), _) =>
+                | ((HolbuildRemoteExec.Failed (reason, failures), progress), logs) =>
                   let
                     val proof_failure = List.exists (fn {kind, ...} => kind = "proof" orelse kind = "tactic-timeout") failures
                     val reason = "batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress
@@ -1793,10 +1794,16 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                         | _ => []
                     val missing_blob = resubmit andalso not proof_failure andalso
                                        HolbuildRemoteExec.resubmit_missing_blob reason
+                    val final = null forced andalso not missing_blob
+                    (* Last, after the required restores and failure logs. *)
+                    fun restore_finished_logs () =
+                      if final then
+                        HolbuildBuildExec.restore_finished_build_logs build_options tc project plan toolchain_key logs
+                      else ()
                     (* Restore before a terminal failure. A resubmission must first
                        repair its inputs, without installing stale cached outputs. *)
                     val _ =
-                      if null forced andalso not missing_blob then
+                      if final then
                         (HolbuildBuildExec.build (HolbuildBuildExec.remote_restore_options true build_options)
                            tc project plan toolchain_key jobs
                          handle HolbuildBuildExec.Error _ => ()
@@ -1804,10 +1811,12 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                       else ()
                     val _ = HolbuildHolSharedCache.local_build_needed := false
                   in
-                    if proof_failure then proof_failed reason failures
+                    if proof_failure then proof_failed reason failures restore_finished_logs
                     else
-                      if null forced andalso not missing_blob then
-                        (List.app report_failed_log failures; fall_back reason)
+                      if final then
+                        (List.app report_failed_log failures;
+                         restore_finished_logs ();
+                         fall_back reason)
                       else
                         (HolbuildStatus.message_stderr
                            ("holbuild: remote execution: " ^ reason ^ "; resubmitting" ^
@@ -1829,7 +1838,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     abandon batch_id ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress)
                 | ((HolbuildRemoteExec.Unreachable reason, progress), _) =>
                     if remote_only
-                    then fall_back (reason ^ "; " ^ finished progress ^ "; reattach with --attach " ^ batch_id)
+                    then fall_back (reason ^ "; " ^ finished progress ^ "; reattach with --attach " ^ batch_id ^
+                                    (if priority = 0 then "" else " --priority " ^ Int.toString priority))
                     else abandon batch_id (reason ^ "; " ^ finished progress)
             and submit resubmit batch =
               if null (batch_keys batch) then
@@ -1837,7 +1847,10 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                  build_locally ())
               else
                 case HolbuildRemoteExec.submit_with_query (remote_only orelse detach) url
-                       (if fail_fast then "?fail_fast=true" else "") (#maxheap tc) batch of
+                       ((if fail_fast then "?fail_fast=true" else "") ^
+                        (if priority = 0 then "" else
+                         (if fail_fast then "&" else "?") ^ "priority=" ^ Int.toString priority))
+                       (#maxheap tc) batch of
                     HolbuildRemoteExec.Refused reason => fall_back reason
                   | HolbuildRemoteExec.Ok batch_id =>
                       (HolbuildStatus.message_stderr ("holbuild: remote batch " ^ batch_id ^ "\n");
@@ -2148,9 +2161,32 @@ fun split_remote_exec_flags args =
     loop (NONE, false, false, NONE) [] args
   end
 
+fun split_build_priority args =
+  let
+    fun parse value =
+      if size value > 0 andalso List.all Char.isDigit (String.explode value) then
+        (case Int.fromString value of
+             SOME n => if n <= 2147483647 then n else raise Error "--priority must be between 0 and 2147483647"
+           | NONE => raise Error "--priority must be between 0 and 2147483647")
+      else raise Error ("invalid --priority: " ^ value ^ "; expected an integer between 0 and 2147483647")
+    fun loop priority acc xs =
+      case xs of
+          [] => (priority, rev acc)
+        | "--priority" :: value :: rest => loop (SOME (parse value)) acc rest
+        | ["--priority"] => raise Error "--priority requires an integer between 0 and 2147483647"
+        | arg :: rest =>
+            if String.isPrefix "--priority=" arg then
+              loop (SOME (parse (String.extract (arg, size "--priority=", NONE)))) acc rest
+            else loop priority (arg :: acc) rest
+  in
+    loop NONE [] args
+  end
+
 fun build tc cli_jobs args =
   let
     val _ = HolbuildDiagnosticLimits.validate ()
+    val (batch_priority, args) = split_build_priority args
+    val priority = Option.getOpt (batch_priority, 0)
     val args = split_tool_cache_flag args
     val ({url, remote_only, detach, attach}, args) = split_remote_exec_flags args
     val parsed as ({dry_run, watch, repl_on_failure, trace_steps, execution_plan, ...}, _) = split_flags args
@@ -2161,6 +2197,8 @@ fun build tc cli_jobs args =
         raise Error "--watch does not support --dry-run"
       else if watch andalso repl_on_failure then
         raise Error "--watch does not support --repl-on-failure"
+      else if Option.isSome batch_priority andalso not (Option.isSome url) then
+        raise Error "--priority needs --remote-exec URL"
       else if not (Option.isSome url) andalso (remote_only orelse detach orelse Option.isSome attach) then
         raise Error "--remote-only, --detach and --attach need --remote-exec URL"
       else if Option.isSome url andalso
@@ -2175,7 +2213,7 @@ fun build tc cli_jobs args =
     case url of
         SOME url =>
           build_once_with_prepared_mode
-            (RemoteExec {url = url, remote_only = remote_only, detach = detach, attach = attach})
+            (RemoteExec {url = url, remote_only = remote_only, detach = detach, attach = attach, priority = priority})
             tc cli_jobs NONE parsed
       | NONE =>
           if watch then build_watch tc cli_jobs parsed
@@ -2602,7 +2640,7 @@ fun build_heap_kind tc cli_jobs command args =
               val _ = if null expanded then raise Error (command ^ " target has no objects: " ^ target) else ()
             in
               build_once_with_prepared_mode
-                (RemoteExec {url = u, remote_only = remote_only, detach = false, attach = NONE})
+                (RemoteExec {url = u, remote_only = remote_only, detach = false, attach = NONE, priority = 0})
                 tc cli_jobs NONE (heap_build_request objects)
             end
     fun execute_heap () =
@@ -2873,7 +2911,7 @@ fun run_hol_with runner tc cli_jobs subcommand args =
     val ({from, url, remote_only}, user_args) = split_run_options args
     val build_mode =
       case url of
-          SOME url => RemoteExec {url = url, remote_only = remote_only, detach = false, attach = NONE}
+          SOME url => RemoteExec {url = url, remote_only = remote_only, detach = false, attach = NONE, priority = 0}
         | NONE =>
             if remote_only then raise Error "--remote-only needs --remote-exec URL"
             else BuildTargets
@@ -3178,7 +3216,7 @@ fun check_command tc cli_jobs args =
         | NONE => ()
     val build_mode =
       case url of
-          SOME u => RemoteExec {url = u, remote_only = remote_only, detach = false, attach = NONE}
+          SOME u => RemoteExec {url = u, remote_only = remote_only, detach = false, attach = NONE, priority = 0}
         | NONE => BuildTargets
   in
     case args of

@@ -87,6 +87,11 @@ revision, so roll back by deploying a forward patch release that restores the
 older coordinator code and keeps `0012`, or use the current image to run
 `alembic downgrade 0011` before starting an older image.
 
+Migration `0013` adds the index `actions_batch_unfinished` over each batch's
+unfinished actions, which the check after every completion reads; it changes
+no table. Roll back the same way: a forward patch release that keeps `0013`,
+or `alembic downgrade 0012` with the current image.
+
 For a rollback that preserves the schema, deploy a reviewed forward patch
 release restoring fail-fast dispatch while retaining migrations `0010` and
 `0011` and terminal-state aggregation for already-running keep-going batches.
@@ -431,11 +436,12 @@ a run batch and cancels its unfinished actions.
   the admission lock. Set the floor back to 0 and restart the coordinator
   to restore strict build priority. Claims select with `FOR UPDATE SKIP LOCKED`,
   write a lease with an expiry and commit; no transaction stays open while
-  the worker builds. Among the running batches, the claim picks the one with
-  the fewest running actions, then the one that least recently had an action
+  the worker builds. Among running batches of the selected class and tier,
+  the claim picks the highest scheduling priority first, then the fewest running actions among
+  equal priorities, then the one that least recently had an action
   claimed (one that never had goes first), then the oldest: a new batch gets
-  the next free worker even while a wide one holds the rest, and batches
-  take turns when there are more of them than workers. Within the batch, it
+  the next free worker among equal-priority batches even while a wide one holds
+  the rest, and those batches take turns when there are more of them than workers. Within the batch, it
   picks the action with the longest chain of dependents in the batch, then
   the one with the most dependents, then by theory name, so the critical
   path starts first and the ready frontier widens fastest. An expired lease returns the
@@ -584,13 +590,16 @@ Every request carries `Authorization: Bearer <token>`: the client token for
 `/v1/batches…` and `/v1/queue`, the worker token for `/v1/work…`. A wrong or missing token
 gets 401. Errors are JSON `{"detail": "<message>"}`. Any route answers 503
 `{"detail": "database busy"}`, with `Retry-After`, when no database connection
-came free within `REMOTE_EXEC_DATABASE_POOL_TIMEOUT_S`.
+came free within `REMOTE_EXEC_DATABASE_POOL_TIMEOUT_S` (3 s). Keep it under the
+workers' 15 s wait for a heartbeat or completion answer: past that a worker
+retries, and a request still queued for a connection would be done twice.
 
 ### Client
 
-`POST /v1/batches?profile=<name>&class=build|run` with the batch text as the body
+`POST /v1/batches?profile=<name>&class=build|run&priority=<integer>` with the batch text as the body
 (`text/plain`). `profile` defaults to `default`; `class` defaults to `build`.
-An unknown class returns 422.
+An unknown class returns 422. `priority` defaults to 0 and accepts integers
+from 0 to 2147483647; invalid values return 422. Existing batches retain priority 0.
 
 - 201 `{"batch_id": "<uuid>"}`
 - 400 when the batch is malformed (bad header or line, duplicate action, an
@@ -708,6 +717,18 @@ A worker that can't reach the coordinator or gets a 5xx, as while the
 coordinator restarts, retries a `complete` until the action's lease would run
 out.
 
+Migration `0014` adds `batches.priority`, with default 0. Before rolling back
+to a coordinator image predating it, stop the coordinator and use the new image
+to run `alembic downgrade 0013`, then start the older image. This removes only
+scheduling metadata; action inputs, outputs and leases are unchanged.
+
+`GET /v1/queue` includes `ready_priority` and `running_priority`: subsets of
+the tier counts for actions whose batch has a positive priority. Do not add
+these subsets to the tier totals. Priority does not change burst demand.
+Strict priority suits occasional finite batches; there is no aging or reserved
+normal share. Normal work can use workers for which no priority action is ready,
+including while a priority batch waits on dependencies.
+
 ## Tests
 
 The tests need a Postgres role that may create databases:
@@ -737,7 +758,10 @@ phase and last operation error; it omits provider operation tokens. A successful
 heartbeat clears a transient error even while a member is serving or waiting
 for its drain interval.
 
-Clients refresh membership every 30 seconds when the deployment sets
+The coordinator reuses the serving slots it read for
+`REMOTE_EXEC_CACHE_MEMBERS_TTL_SECONDS` (2 s), since workers ask about as often
+as they claim, and answers with the slots it last read while the database can't
+answer. Clients refresh membership every 30 seconds when the deployment sets
 `HOLBUILD_REMOTE_CACHE_DISCOVERY_URL`. Set `HOLBUILD_REMOTE_CACHE_ALLOWED_URLS`
 to the comma-separated identities allowed to receive the cache credential,
 including the permanent pair and every reserved temporary identity. Discovery

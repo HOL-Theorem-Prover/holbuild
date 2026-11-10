@@ -1031,8 +1031,10 @@ holbuild build --skip-checkpoints MyTheory
   explicit termination proof. If a theorem and terminating definition have the
   same name, the theorem takes precedence.
 - `--tactic-timeout SECONDS` changes the per-step timeout; `0` disables it.
-  A step that times out fails the build even inside `TRY` or an `ORELSE`
-  alternative.
+  A step that times out runs once more with half the timeout; if that
+  finishes, the step passes and the theory's build log says so
+  (`holbuild tactic timeout retry passed: ...`). Otherwise it fails the build,
+  even inside `TRY` or an `ORELSE` alternative.
 - `--proof-scope root|all` (also `--proof-scope=root|all`) selects which
   theories receive proof instrumentation and the invocation's timeout. `root`
   is the default. `all` includes dependency theories in the selected build
@@ -1803,6 +1805,16 @@ upload that fails, the rest are skipped and the build falls back (below).
 Before compressing and uploading a file, it checks the CAS and skips the file
 only when the cache confirms it is already present.
 
+`build --remote-exec URL --priority N` assigns a batch scheduling priority
+between 0 and 2147483647 (default 0). Higher values are claimed before lower
+values within the same action class and worker memory tier; equal priorities
+share workers fairly. Priority does not preempt running actions or change cache
+keys. Use it for a limited number of finite builds: continuously ready higher
+priority work can delay lower priority batches. `--priority` requires
+`--remote-exec`. With `--attach`, it applies to any replacement batch needed
+for missing inputs; it does not change the batch being followed. Retain the
+same priority when reattaching; the recovery hint includes it.
+
 `build --remote-exec URL` hands the theories the remote cache lacks, and
 that aren't already built here, to a remote-execution coordinator, which runs them on its workers with
 `exec-action`, then restores them as an ordinary build would:
@@ -1911,6 +1923,8 @@ theories are reported as skipped. The build restores successful branches from
 the cache, as `--remote-only` does, fetches each failed worker's build log into
 `.holbuild/logs/current/<package>/<theory>/build.log`, prints the diagnostic a
 local build would, and exits with status 1, with or without `--remote-only`.
+The logs of the theories the batch finished are fetched to the same place
+last; one that can't be fetched is skipped.
 If a log can't be fetched, the build builds just that failed theory locally,
 for its diagnostic; with `--remote-only` it fails with status 75 instead.
 The event stream reports each failure when it occurs and repeats the full list
