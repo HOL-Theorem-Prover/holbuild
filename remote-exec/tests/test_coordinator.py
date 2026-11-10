@@ -835,6 +835,58 @@ async def test_a_claim_reads_no_finished_actions(
     assert (await claim(http))["theory"] == "pkg:a"
 
 
+async def test_the_finished_check_reads_no_finished_actions(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any
+) -> None:
+    """The check after each completion that its batch has nothing unfinished left reads the same few pages however
+    many actions the batch finished, wherever its last unfinished action lies, and however many unfinished actions
+    other batches hold."""
+    batch_id = await submit(http, ["a"])
+    other = await submit(http, ["b"])
+
+    async def pages_read() -> int:
+        async with remote_exec_engine.begin() as connection:
+            await connection.execute(sa.text("ANALYZE"))
+            plan = await connection.scalar(
+                sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {coordinator_module.FINISH_IF_DONE.text}"),
+                {"id": batch_id},
+            )
+            await connection.rollback()
+        return plan[0]["Plan"]["Shared Hit Blocks"] + plan[0]["Plan"]["Shared Read Blocks"]
+
+    before = await pages_read()
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(
+            sa.text(
+                "INSERT INTO actions (batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier) "
+                "SELECT :id, '00000000' || g, 'ac', 's', 'pkg:d' || g, 0, 'done', 'standard' "
+                "FROM generate_series(1, 20000) g"
+            ),
+            {"id": batch_id},
+        )
+        await connection.execute(
+            sa.text(
+                "INSERT INTO actions (batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier) "
+                "SELECT :id, 'waiting' || g, 'ac', 's', 'pkg:w' || g, 1, 'waiting', 'standard' "
+                "FROM generate_series(1, 20000) g"
+            ),
+            {"id": other},
+        )
+    async with remote_exec_engine.begin() as connection:
+        # Its one unfinished action now last in every order: the newest row, written last, with the greatest key.
+        await connection.execute(
+            sa.text("UPDATE actions SET state = 'done' WHERE batch_id = :id AND theory = 'pkg:a'"), {"id": batch_id}
+        )
+        await connection.execute(
+            sa.text(
+                "INSERT INTO actions (batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier) "
+                "VALUES (:id, 'zzzzzzzz', 'ac', 's', 'pkg:z', 0, 'ready', 'standard')"
+            ),
+            {"id": batch_id},
+        )
+    assert await pages_read() < before + 20
+
+
 async def test_releasing_reads_each_selected_actions_edges_by_key(
     coordinator: Coordinator, remote_exec_engine: Any
 ) -> None:
