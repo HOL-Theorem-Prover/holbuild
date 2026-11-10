@@ -192,8 +192,11 @@ manifest_names() {
   xargs -n1 basename < "$1" | sed 's/\.sml$//' | grep -xF -f <(printf '%s\n' "$expected") || true
 }
 
+# A pipelined build's data can differ from a plain build's in its proofs'
+# dependencies (metis's search), so the local build compared below with the
+# worker's builds plainly.
 link_hol_toolchain_cache "$tmpdir/local"
-(cd "$project" && HOLBUILD_CACHE=$tmpdir/local "$HOLBUILD_BIN" build useTheory) > "$tmpdir/local.log" 2>&1 ||
+(cd "$project" && HOLBUILD_CACHE=$tmpdir/local HOLBUILD_PIPELINE=off "$HOLBUILD_BIN" build useTheory) > "$tmpdir/local.log" 2>&1 ||
   { cat "$tmpdir/local.log" >&2; exit 1; }
 
 # The object manifests: the script's direct loads, and the generated

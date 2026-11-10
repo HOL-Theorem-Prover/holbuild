@@ -92,6 +92,9 @@ cache_miss_and_force() {
   # An edit the cache has never seen, which changes A's outputs: both
   # theories rebuild from the record.
   sed -i 's/^val _ = export_theory/val a2_thm = store_thm("a2_thm", ``T``, ACCEPT_TAC TRUTH);\n&/' "$p/src/AScript.sml"
+  # Older than a second when the next build starts, so that its record
+  # doesn't mark the edit racy, whatever the build's speed.
+  sleep 1.1
   expect_build "from record (1 files rehashed, 2 keys changed)" "$p" "$tmpdir/edit.log"
   require_no_grep "ATheory is up to date" "$tmpdir/edit.log"
   require_no_grep "BTheory is up to date" "$tmpdir/edit.log"

@@ -73,7 +73,7 @@ if [[ -n "$leaks" ]]; then
   echo "$leaks" >&2
   exit 1
 fi
-if [[ -d "$tmpdir/cache/actions" ]] && grep -rl "CTheory" "$tmpdir/cache/actions" >/dev/null; then
+if [[ -d "$tmpdir/cache/blobs" ]] && grep -rl "CTheory" "$tmpdir/cache/blobs" >/dev/null; then
   echo "the cache has an entry for C" >&2
   exit 1
 fi

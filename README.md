@@ -1131,7 +1131,11 @@ real export: the same digest, theorem numbering, and save and tag indices.
 A child built on the outline is committed only after every outline it loaded
 has passed its gate. A committed theory's outputs are those of a plain build
 on its real parents, and they go to the local and remote caches as a plain
-build's do. Any failure costs only time. A deferred proof that fails, leaves
+build's do. One difference: a proof that runs after the export can record
+other dependencies than it would in place (metis's search depends on a
+global variable counter), so a theory's data can differ from a plain build's
+in the dependencies of its theorems, though not in what its digest covers.
+Any failure costs only time. A deferred proof that fails, leaves
 an extra hypothesis, changes the theory, or writes theory data makes the
 theory build again with its proofs in place. A failed gate drops everything
 that loaded the outline. Either way the theory's input key is remembered

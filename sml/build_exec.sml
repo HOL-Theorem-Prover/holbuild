@@ -5630,7 +5630,7 @@ fun refresh_checkpoint_budget_after_node state project node protected_bases =
         handle e => warn_checkpoint_budget_error e)
 
 (* Pipelined builds (on unless HOLBUILD_PIPELINE=off), for cold theories
-   that save no checkpoints (--skip-checkpoints).  A theory's children need its
+   (see speculable for which).  A theory's children need its
    declarations, not its proofs.  So a cold theory builds in one HOL
    process that defers its plain `Theorem ... Proof ... QED` proofs
    (deferred_source), exports, publishes that export as the theory's
