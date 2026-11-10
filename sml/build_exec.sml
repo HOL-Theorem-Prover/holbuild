@@ -2205,6 +2205,7 @@ fun cache_manifest_output_summary {sig_hash, sml_hash, dat_hash, trace_hash, ext
      " dat=", dat_hash,
      " trace=", Option.getOpt(trace_hash, "none"),
      " extras=", Int.toString (length extra_hashes),
+     String.concat (map (fn (path, hash) => " " ^ extra_blob_role path ^ "=" ^ hash) extra_hashes),
      " parents=", Int.toString (length parents),
      " mldeps=", Int.toString (length mldeps)]
 
@@ -9180,7 +9181,13 @@ fun check_remote_publication remote root (spec : action_spec) =
       | (_, NONE) => fail "the remote cache holds no entry for the action after publishing"
       | (SOME mine, SOME theirs) =>
           if not (cache_manifest_outputs_equal key mine theirs) then
-            fail "the remote cache holds different outputs for the action"
+            fail ("the remote cache holds different outputs for the action" ^
+                  "\n  existing outputs: " ^
+                  cache_manifest_output_summary (cache_manifest_blobs_from_lines key (cache_manifest_lines theirs)) ^
+                  "\n  new outputs: " ^
+                  cache_manifest_output_summary (cache_manifest_blobs_from_lines key (cache_manifest_lines mine)) ^
+                  "\nThe same inputs must produce identical outputs, including declared extra outputs; " ^
+                  "put timings in the build log instead.")
           else if not (timeout_satisfies (#tactic_timeout spec)
                          (cache_manifest_proof_timeout (cache_manifest_lines theirs))) then
             fail "the remote cache's entry has a weaker timeout contract than requested"
