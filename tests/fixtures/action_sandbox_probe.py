@@ -12,6 +12,7 @@ import runpy
 import select
 import shutil
 import signal
+import socket
 import threading
 import subprocess
 import sys
@@ -96,7 +97,7 @@ def attack(root: Path, worker: int, secret: Path, shared: Path) -> None:
         except FileNotFoundError:
             pass
     assert not any("lease" in target or "cache.curl" in target or "seccomp" in target
-                   for target in descriptors), descriptors
+                   or target == f"/proc/{os.getpid()}" for target in descriptors), descriptors
     status = Path("/proc/self/status").read_bytes()
     assert b"CapEff:\t0000000000000000" in status
     (root / "ordinary-output").write_text("ok")
@@ -362,8 +363,30 @@ def completion_probe(helper: Path) -> None:
                 def failed_setup(self: object) -> None:
                     raise module["SandboxError"]("injected child setup failure")
                 module["Linux"].drop_privileges = failed_setup
+            received: list[int] = []
+            original_receive = socket.recv_fds
+            def receive(*args: object, **kwargs: object) -> tuple:
+                result = original_receive(*args, **kwargs)
+                received.extend(result[1])
+                return result
+            socket.recv_fds = receive
+            finish = module["finish_children"]
+            def pinned_cleanup(leader: int) -> int:
+                try:
+                    if received:
+                        assert len(received) == 2, "supervisor did not retain the proc grant"
+                        pin = received[1]
+                        assert os.readlink(f"/proc/self/fd/{pin}") == f"/proc/{leader}"
+                        assert fcntl.fcntl(pin, fcntl.F_GETFL) & os.O_PATH
+                        if fault != "exec":
+                            assert os.fstat(pin).st_ino == int((private / "proc-inode").read_text())
+                finally:
+                    status = finish(leader)
+                return status
+            module["run"].__globals__["finish_children"] = pinned_cleanup
             code = (
                 "from pathlib import Path\n"
+                f"Path({str(private / 'proc-inode')!r}).write_text(str(Path('/proc/self').stat().st_ino))\n"
                 f"try: Path({str(completed)!r}).write_text('forged')\n"
                 "except PermissionError: pass\n"
                 "else: raise AssertionError('HOL could forge completion')\n"
@@ -382,6 +405,7 @@ def completion_probe(helper: Path) -> None:
                 sys.argv += ["--", *command]
                 status = module["main"]()
             finally:
+                socket.recv_fds = original_receive
                 sys.argv = previous
                 if previous_parent is None:
                     os.environ.pop("HOLBUILD_SANDBOX_PARENT", None)
@@ -390,6 +414,13 @@ def completion_probe(helper: Path) -> None:
             failed = bool(fault) or child_status == 125
             assert status == (125 if failed else child_status), status
             assert completed.read_text() == ("failed\n" if failed else "validated\n")
+            for descriptor in received:
+                try:
+                    os.fstat(descriptor)
+                except OSError as error:
+                    assert error.errno == errno.EBADF, error
+                else:
+                    raise AssertionError("supervisor leaked a handoff descriptor")
         print("completion protected from HOL; proof failure validated; setup/exec/cleanup failures withheld completion")
 
 
