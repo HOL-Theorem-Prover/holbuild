@@ -1154,7 +1154,11 @@ extra outputs, or under `--trace-steps`, `--repl-on-failure`,
 
 A pipelined theory saves no checkpoints, not even `deps_loaded`, so the first
 rebuild after editing it reloads its ancestors. Remote-exec workers never
-pipeline. `HOLBUILD_PIPELINE=off` turns pipelining off.
+pipeline. `HOLBUILD_PIPELINE=off` turns pipelining off. Tools that read
+theorems' dependency lists (holyhammer's exports, say) and need a plain
+build's should rebuild with `HOLBUILD_PIPELINE=off holbuild build
+--force=project --no-cache`: a pipelined theory's data has the same input key
+as a plain build's, so it is reused from the local build and the caches.
 `HOLBUILD_CACHE_TRACE=1` prints a `pipeline:` line for each step and a
 summary of failures.
 
