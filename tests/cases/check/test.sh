@@ -366,6 +366,21 @@ require_no_grep 'could not infer\|MissingAuditModule' "$log"
 run_fingerprint FpTheory 1 CheatTheory:fine_thm
 require_grep "holbuild: check --fingerprint takes a theory, not THEORY:THEOREM" "$log"
 
+# --with-fingerprints checks the selectors and prints their theories' listing
+# in the same HOL session; the exit status is the check's.
+run_check --with-fingerprints 0 FpTheory CheatTheory:fine_thm
+[[ $(grep -c $'^tool\tkind=run\t.*argv0=.*/bin/hol$' "$timing") -eq 1 ]]
+require_grep "^CheatTheory.fine_thm: clean (1 theorem)$" "$log"
+grep '^fingerprint	' "$log" > "$log.lines" || true
+require_grep "^FpTheory: clean" "$log"
+LC_ALL=C sort -u "$fp_lines" "$tmpdir/fingerprint-CheatTheory.log.lines" > "$tmpdir/with-fingerprints.expected"
+cmp "$tmpdir/with-fingerprints.expected" "$log.lines"
+run_check --with-fingerprints 1 CheatTheory:cheated_thm
+require_grep "^CheatTheory.cheated_thm: 1 finding$" "$log"
+require_grep "^fingerprint	CheatTheory	theorem	cheated_thm	[0-9a-f]*	cheat$" "$log"
+run_check --with-fingerprints 1
+require_grep "holbuild: check --with-fingerprints requires at least one selector" "$log"
+
 run_fingerprint CheatTheory:fine_thm 1
 require_grep "holbuild: check --fingerprint takes a theory, not THEORY:THEOREM" "$log"
 

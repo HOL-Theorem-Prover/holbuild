@@ -238,9 +238,9 @@ fun assoc id pairs =
       [] => NONE
     | (k, v) :: rest => if k = id then SOME v else assoc id rest
 
-fun parse_analyser_response response_path id_paths =
+fun parse_analyser_response response id_paths =
   let
-    val lines = String.tokens (fn c => c = #"\n") (read_all response_path)
+    val lines = String.tokens (fn c => c = #"\n") response
     fun add_source ((id, path), dict) =
       case Binarymap.peek(dict, id) of
           NONE => Binarymap.insert(dict, id, path)
@@ -315,6 +315,57 @@ fun write_file path text =
   let val out = TextIO.openOut path
   in TextIO.output(out, text); TextIO.closeOut out end
 
+(* Runs the analyser on REQUEST, returning its stdout and, if it succeeded,
+   its response; ERRORS is where its stderr goes.  Under exec-action it was
+   built from the action's toolchain, so it runs confined: it reads that
+   analyser, the action tree and checkpoints, writes only a fresh work
+   directory, and its response counts once the sandbox has validated it. *)
+(* Runs ANALYSER on REQUEST.  Under exec-action it runs confined, in a
+   fresh work directory that alone is writable, and the response (and the
+   stderr, when CAPTURE_STDERR) is read only after the sandbox has checked
+   that work directory. *)
+fun run_analyser {analyser, request, capture_stderr} =
+  let
+    fun command dir =
+      String.concatWith " "
+        (map HolbuildHash.quote
+           (analyser :: analyser_min_heap_args () @
+            ["--request", OS.Path.concat(dir, "request"), "--response", OS.Path.concat(dir, "response")])) ^
+      (if capture_stderr then " 2> " ^ HolbuildHash.quote (OS.Path.concat(dir, "stderr")) else "")
+    fun result dir {status, output} =
+      {output = output,
+       stderr = if capture_stderr then read_all (OS.Path.concat(dir, "stderr")) handle _ => "" else "",
+       response = if OS.Process.isSuccess status then SOME (read_all (OS.Path.concat(dir, "response")))
+                  else NONE}
+  in
+    case !HolbuildActionSandbox.private_roots of
+        SOME (root, checkpoints) =>
+          HolbuildActionSandbox.shell
+            {writable = [], readable = [OS.Path.dir (OS.Path.dir analyser), root, checkpoints], toolchain = false}
+            (fn work => (write_file (OS.Path.concat(work, "request")) request; command work))
+            HolbuildProcessGroup.run_shell_output
+            (fn (work, outcome) => result work outcome)
+      | NONE =>
+          let
+            (* Not OS.FileSys.tmpName: it swaps the process umask, which races
+               when several analysers start at once. *)
+            val dir = HolbuildTempPath.temporary "analyser"
+            fun remove () = HolbuildRemoveTree.remove_untrusted dir handle _ => ()
+            fun go () =
+              (OS.FileSys.mkDir dir;
+               write_file (OS.Path.concat(dir, "request")) request;
+               result dir (HolbuildProcessGroup.run_shell_output (command dir)))
+          in
+            (go () before remove ()) handle e => (remove (); raise e)
+          end
+  end
+
+(* The response to REQUEST, or NONE if the analyser failed; its stdout is
+   printed. *)
+fun analyser_response analyser request =
+  let val {output, response, ...} = run_analyser {analyser = analyser, request = request, capture_stderr = false}
+  in print output; response end
+
 datatype 'a outcome = Done of 'a | Failed of exn
 
 fun outcome_value outcome =
@@ -326,29 +377,20 @@ fun outcome_value outcome =
    parsed response, or the error the response or exit status gives. *)
 fun analyse_files analyser files =
   let
-    (* Not OS.FileSys.tmpName: it swaps the process umask, which races
-       when several analysers start at once. *)
-    val req = HolbuildTempPath.temporary "analyser-request"
-    val resp = HolbuildTempPath.temporary "analyser-response"
     fun file_line (id, path) = HolbuildAnalysisProtocol.join ["file", id, path, "deps"]
     val request = String.concatWith "\n"
       ([HolbuildAnalysisProtocol.join ["version", HolbuildAnalysisProtocol.protocol_version],
         HolbuildAnalysisProtocol.join ["command", "analyse"]] @
        map file_line files @
        [HolbuildAnalysisProtocol.join ["end"]]) ^ "\n"
-    val _ = write_file req request
-    val run = HolbuildSpawn.run {program = analyser,
-                                 args = analyser_min_heap_args () @
-                                        ["--request", req, "--response", resp],
-                                 stderr = HolbuildSpawn.Inherit}
-    val _ = OS.FileSys.remove req handle OS.SysErr _ => ()
+    val {output, response, ...} = run_analyser {analyser = analyser, request = request, capture_stderr = false}
     val outcome =
-      (if HolbuildSpawn.succeeded run then Done (parse_analyser_response resp files)
-       else raise Error "holbuild-hol-analyser failed")
+      (case response of
+           SOME text => Done (parse_analyser_response text files)
+         | NONE => raise Error "holbuild-hol-analyser failed")
       handle e => Failed e
-    val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
   in
-    (#output run, outcome)
+    (output, outcome)
   end
 
 fun run_analyser_batch analyser files =

@@ -22,7 +22,7 @@ structure SC = HolbuildStatCache
 
 exception Error of string
 
-val format = "holbuild-plan-record-v2"
+val format = "holbuild-plan-record-v3"
 val kept_records = 4
 
 datatype mode = Off | On | Check

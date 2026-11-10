@@ -66,6 +66,36 @@ coordinator reads when an action completes, so run it before the new image
 serves. To roll back to an image predating `0009`, use the current image to
 run `alembic downgrade 0008` first.
 
+Migration `0011` adds `batches.fail_fast` (default false). New build batches
+finish independent actions after a final failure, cancelling only its blocked
+descendants. Their action events retain the `cancelled` state with a
+`skipped because of ...` reason, so existing clients and workers remain
+compatible. No action-spec or minimum client version changes are needed.
+Clients can request `?fail_fast=true` on submission to retain early stopping.
+Run batches still finish `done` with independent per-action failures.
+
+Apply the migration before serving with the new coordinator. An image whose
+migration code predates `0011` cannot run `alembic upgrade head` against a
+database already at `0011`, even though the added columns are compatible with
+its queries. Deployments that migrate on every service start must account for
+this before pinning an older image.
+
+Migration `0012` adds the index `actions_ready_order` over each batch's ready
+actions in claim order; it changes no table. A coordinator before it keeps
+working on a database at `0012`, but its migration code does not know the
+revision, so roll back by deploying a forward patch release that restores the
+older coordinator code and keeps `0012`, or use the current image to run
+`alembic downgrade 0011` before starting an older image.
+
+For a rollback that preserves the schema, deploy a reviewed forward patch
+release restoring fail-fast dispatch while retaining migrations `0010` and
+`0011` and terminal-state aggregation for already-running keep-going batches.
+Clients can use `--fail-fast` for immediate early stopping
+on new submissions. To deploy a pre-`0011` image instead, first drain or cancel
+running batches, since an older coordinator does not implement their
+keep-going completion rules, then use the current image to downgrade to the
+older image's migration head. Existing action states need no conversion.
+
 The coordinator reads its settings from the environment:
 
 | Variable | Meaning | Default |
@@ -81,9 +111,11 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_RETENTION_HOURS` | age after which a finished batch is deleted | 168 |
 | `REMOTE_EXEC_BATCH_DEADLINE_HOURS` | age at which a batch still running fails | 12 |
 | `REMOTE_EXEC_HINT_TTL_DAYS` | age after which an unused peak hint is deleted | 30 |
-| `REMOTE_EXEC_DATABASE_POOL_SIZE` | database connections the coordinator holds at most | 20 |
+| `REMOTE_EXEC_DATABASE_POOL_SIZE` | database connections the coordinator holds at most | 50 |
 | `REMOTE_EXEC_DATABASE_POOL_TIMEOUT_S` | how long a request waits for a free connection before it fails | 10 |
 | `REMOTE_EXEC_EVENTS_KEEPALIVE_SECONDS` | how long an event stream stays quiet before it sends an empty line | 15 |
+| `REMOTE_EXEC_EVENTS_POLL_SECONDS` | least time between an event stream's reads of its batch, which a write to it by the same coordinator process starts | 1 |
+| `REMOTE_EXEC_EVENTS_FALLBACK_SECONDS` | most time between an event stream's reads, for other coordinator processes' writes | 10 |
 | `REMOTE_EXEC_SWEEP_SECONDS` | period of the sweep (lease expiry, releases, retention, scaling) | 5 |
 | `REMOTE_EXEC_RUN_SLOTS` | fleet-wide running run-action cap; 0 pauses new run claims | 30 |
 | `REMOTE_EXEC_RUN_FLOOR` | running run actions allowed ahead of ready builds, clamped to `REMOTE_EXEC_RUN_SLOTS` | 0 |
@@ -112,13 +144,23 @@ pool, say) empty first and scale in.
 
 On `SIGTERM`, a worker stops claiming and gives its running action up to
 `--drain-seconds` (20 by default) to finish and report its result. At the
-deadline it stops the action's process group and reports `unavailable`, so
+deadline it stops HOL and reports `unavailable`, so
 the coordinator retries immediately without counting the interrupted attempt.
 Waiting for work or preparing a release stops immediately. Repeated `SIGTERM`
 does not extend the deadline; interactive Ctrl-C retains its usual behavior.
-Leave at least 10 seconds between the drain window and the container's stop
-timeout for process cleanup and result reporting. For example, a 120-second
-container stop timeout allows `--drain-seconds 95`. An unreachable coordinator
+With `--share-heaps`, the driver gets up to 8 additional seconds after the
+natural-finish drain window to publish completed checkpoints. Lease loss gives
+it up to 15 seconds, also bounded by the drain deadline plus 8 seconds if a
+drain starts meanwhile. Only the driver receives the initial termination signal:
+it stops HOL, waits for sandbox cleanup and output validation, and publishes
+committed checkpoints. Repeated signals do not interrupt publication. The worker
+then terminates the remaining process group, escalating to SIGKILL after 2 seconds.
+Interrupted actions never report `built`; a lost lease reports no result.
+Without `--share-heaps`, the worker stops the process group immediately.
+Leave at least 20 seconds between the drain window and the container's stop
+timeout when sharing heaps (10 otherwise), for publication, process cleanup,
+result reporting and release of task protection. For example, a 120-second
+container stop timeout allows `--drain-seconds 100` with shared heaps. An unreachable coordinator
 can still prevent reporting before the container is forcibly killed; its lease
 then expires normally. ECS protection is best effort, and a rejection in an
 HTTP-success response is logged along with transport failures.
@@ -249,7 +291,10 @@ operator environment overrides use their runtime defaults. Cancellation kills th
 tails may be lost. Mediated signals identify the supervisor as their sender.
 
 `--share-heaps` publishes heaps by dependency context and checkpoints by script
-prefix in the remote cache; use it only with a single tenant or trusted cache
+prefix in the remote cache. Dependency heaps are shared even for older action
+specs that disable theorem checkpoints; `skip-checkpoints` disables both. Only
+completed saves with valid metadata are published, including after interruption.
+Use shared heaps only with a single tenant or trusted cache
 submitters. It does not provide tenant authorization for shared cache entries.
 
 The supervisor confirms cleanup and output validation through a completion
@@ -262,19 +307,36 @@ group, so an outer timeout's forced group shutdown does not interrupt cleanup.
 The launcher supplies its identity before starting the supervisor, which
 refuses to start HOL if it has already lost that parent.
 
-HOL toolchain bootstrap executes trusted source. Before using a toolchain,
-workers require its revision to be a commit ancestor of an approved branch.
-The default approves `develop` and `master` in the canonical HOL repository.
+Everything the selected HOL toolchain runs is confined the same way:
+configuring and building HOL, loading its heap, listing its sources with
+Holmake and `git`, and compiling and running the dependency analyser. A HOL
+build may write only its own tree. Within it, the supervisor applies its mode
+changes, never setuid or setgid, and its links may not point outside. The
+repository's `.git` directory is out of its reach while it builds. The worker
+clones the exact commit without user or system Git configuration, hooks,
+submodules or credential prompts, and checks that the checkout is that
+commit. A built toolchain is checked like action outputs before it is used:
+no links out of the tree, hard links, special or setuid files, and every
+directory listable. A toolchain restored from the remote cache is checked the
+same way before anything in it runs.
+
+Workers accept a toolchain only from a trusted repository. The default
+approves commits on `develop` and `master` in the canonical HOL repository.
 Administrators may replace these defaults with whitespace-separated
 `HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES` entries of the form
 `https://example.org/HOL.git=develop,master` for trusted mirrors or forks.
 Only these branch refs are fetched, never pull-request refs or arbitrary
 revision objects. Proven ancestry is reused from a worker-owned Git graph;
 a branch history rewrite takes effect when the next unknown revision triggers
-a refresh. Use protected branches for these trust roots.
-Bootstrap compiler/build children also have credential settings removed from
-their environment. This restriction is worker configuration, not an action
-spec option. Administrators can grant additional read-only runtime directories
+a refresh. Use protected branches for these trust roots. The entry `*`
+accepts any `https://` repository at a full commit hash, with no branch
+check, since no step runs the toolchain's code outside the sandbox; such
+toolchains still cost worker time to build.
+The worker enables `*` only for clients from 0.14.0 onward, which confine
+toolchain execution. For older clients it removes `*`, preserving any explicit
+repository entries. If only `*` was configured, older clients use their
+canonical HOL defaults. Empty values remain invalid.
+Trust is worker configuration, not an action spec option. Administrators can grant additional read-only runtime directories
 with colon-separated `HOLBUILD_ACTION_READ_DIRS`; do not include credentials
 or shared writable state in these directories.
 
@@ -520,7 +582,9 @@ the action carries on.
 
 Every request carries `Authorization: Bearer <token>`: the client token for
 `/v1/batches…` and `/v1/queue`, the worker token for `/v1/work…`. A wrong or missing token
-gets 401. Errors are JSON `{"detail": "<message>"}`.
+gets 401. Errors are JSON `{"detail": "<message>"}`. Any route answers 503
+`{"detail": "database busy"}`, with `Retry-After`, when no database connection
+came free within `REMOTE_EXEC_DATABASE_POOL_TIMEOUT_S`.
 
 ### Client
 
@@ -575,7 +639,8 @@ An unknown class returns 422.
   {"type": "batch", "state": "done|failed|cancelled", "failure": "<message>|null"}
   ```
   A client detaches by closing the connection and reattaches by opening the
-  stream again with the same `batch_id`.
+  stream again with the same `batch_id`. A read of the batch that fails while
+  the database is out of reach is retried; the stream stays open.
 - 404 when there is no such batch
 
 `GET /v1/queue`

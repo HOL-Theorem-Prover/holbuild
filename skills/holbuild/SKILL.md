@@ -57,7 +57,7 @@ members = ["src"]
 | `--force=full` / `--force-full` / `--force` | Rebuild the whole requested plan from source; forced nodes still publish cache unless `--no-cache` |
 | `--no-cache` | Skip global cache restore/publish; local up-to-date checks still work |
 | `--skip-checkpoints` | No `.save`/`.ok` checkpoint files; theorem instrumentation still runs |
-| `--all-checkpoints` | Theorem checkpoints in every root theory; by default only requested targets save them (others keep `deps_loaded` and step timeouts) |
+| `--all-checkpoints` | Accepted compatibility alias; every root-package theory saves checkpoints by default |
 | `--skip-proof-steps` | No proof-step execution; incompatible with timeout/trace-step/repl-on-failure flags |
 | `--trknl` | Tracing kernel; root theories default to `--skip-checkpoints --skip-proof-steps` unless `--trace-steps`/`--tactic-timeout`/`--repl-on-failure` asks for proof steps (and checkpoints, for repl) |
 | `--trace-steps` | Record detailed proof-step execution logs; use with `--force` to inspect up-to-date targets |

@@ -509,6 +509,20 @@ their implementation. HOL's current
 need auxiliary internal load paths or rewritten non-semantic load copies while
 preserving canonical artifacts.
 
+Every load list holbuild writes (a theory's preload, a `.uo` manifest, the
+manifests a remote worker restores) is in Holmake's order. Holmake's `.uo`
+lists a target's direct dependencies sorted by directory, then file name, and
+HOL loads them depth first; the order of names in a script's header doesn't
+reach it. Load order is observable: a library that registers data as each
+theory loads (cv_compute's `cv_rep` theorems, say) keeps the last
+registration. holbuild sorts by `(tier, package, directory, file)`. Tier 0 is
+HOL's own tree: `sigobj` for HOL's theories and libraries, and the source
+directory for a package taken from HOL's repository. Each other package comes
+after, by its depth in the package graph counting only packages outside HOL's
+tree, then by its name and the directory relative to its root. That is Holmake's order when HOL and the packages are
+checked out side by side with HOL sorting first, and unlike Holmake's it
+doesn't depend on where the trees are checked out.
+
 ## Invalidation and action keys
 
 Each build action has an input key derived from resolved facts, not raw paths:
@@ -658,6 +672,61 @@ conflicts still keep the first entry; remote publication and archive import
 still reject conflicts, except that a remote-exec worker replaces a remote
 entry whose recorded parents differ from the parents it restored from the
 remote cache, since no build can use it.
+
+### Cached proofs
+
+`build --cached-proofs` lets a theory build reinstate a theorem from a record
+of an earlier proof instead of running its tactic. The runtime hooks the
+outer proof of each `Theorem` with proof steps. A record is keyed on the
+theory, the theorem name, its statement, its tactic text and its proof
+attributes, and holds the saved theorems (theory, name, statement, oracles)
+the proof depended on, its oracles, and the tactic timeout it ran under. On a
+hit, every named dependency must still be saved with the recorded statement
+and oracles, and the record's timeout must be at most the requested one; the
+runtime then makes the theorem with `Thm.disk_thm` and gives it the recorded
+dependencies and oracles, so the exported theory is what a replay would
+write. Proofs with hypotheses, axioms in their dependencies, `Resume`,
+`suspend`, or a theory change while they run are neither reused nor
+recorded.
+
+Statements name a theory's constants and types without their definitions,
+so a record is sound only while each constant it mentions means what it
+meant. Constants and types made by `Definition`, `Datatype` and the other
+derived principles come with a stored defining theorem, so a changed
+definition changes a saved theorem a dependent record names, or the
+proof that used it is replayed. A listener on theory events certifies each
+new constant and type that comes with such a binding; a constant or type
+from a raw kernel primitive leaves the theory uncertified, and an
+uncertified theory neither reuses nor records. `new_definition` passes the
+kernel's defining theorem to a hook (`Definition.new_definition_hook`) that
+stores what it makes of it, and the hook can also keep the theorem itself,
+where a proof can use it without a saved dependency. So the runtime wraps the
+hook in effect when it loads, and every lookup key covers the conclusions of
+the defining theorems `new_definition` made so far in the theory: a changed
+definition misses every proof below it. Constants defined under a hook
+installed after the runtime, which the wrapper doesn't see, aren't
+certified.
+
+Records live outside action entries, in
+`$HOLBUILD_CACHE/proof-records/v1/<key>`, keyed on the theory toolchain key,
+the package and the theory's logical name. A build copies the file into the
+action's work area and merges what the child appends back under a lock,
+keeping the newest three records per theorem, also when the build fails. A
+remote worker shares the file as a remote action manifest under the same
+key, replaced unconditionally after each build.
+
+A cached build's outputs carry theorems no proof checked in that build. The
+contract keeps them away from builds that didn't ask for them:
+
+- its cache entries are published under `K' = hash("holbuild-cached-proofs-action-v1", K)`
+  rather than the input key `K`; a cached build looks up `K` first, then `K'`,
+  and a default build only `K`;
+- its theory metadata says `proofs=cached`, and only a cached build treats
+  such a theory as up to date, cuts off to it, or aliases its entry;
+- its checkpoints are made by a proof engine of their own (`proof_ir_cached`),
+  so their keys differ from a default build's;
+- a remote spec carries the option `cached-proofs`, and the worker resolves
+  dependencies and early-cutoff pairs the same way.
 
 ## Global cache
 
@@ -982,10 +1051,9 @@ opts out of theorem instrumentation: with checkpoints still enabled, the build c
 still save and consult `deps_loaded`, but there are no
 theorem-context/failed-prefix proof-navigation checkpoints and no
 tactic timeout enforcement for that build.
-Theorem, declaration and failed-prefix checkpoints are saved only in the
-requested targets (with none given, the default targets, or every root-package
-theory when there are none); every theory keeps `deps_loaded` and proof steps.
-`--all-checkpoints` saves them in every root-package theory.
+Theorem, declaration and failed-prefix checkpoints are saved in every theory
+included by the proof scope (root-package theories by default).
+`--all-checkpoints` is a compatibility alias for this default.
 `holbuild run --from THEORY` and `repl --from THEORY` start interactive sessions
 from THEORY's `deps_loaded` while it is current, and load THEORY on top when its
 metadata matches its current input key. `run` takes no project lock, so `--from`
