@@ -783,19 +783,29 @@ async def test_a_waiting_claim_ends_empty_after_its_wait(http: httpx.AsyncClient
 async def test_a_claim_reads_no_finished_actions(
     http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any, classes: list[str]
 ) -> None:
-    """Ranking a claim's batches reads the same few pages however many finished actions running and retained
-    batches hold, and however many ready actions a batch holds, so claims stay cheap on a busy fleet."""
+    """A claim reads the same few pages however many finished actions running and retained batches hold, and
+    however many ready actions a batch holds, so claims stay cheap on a busy fleet."""
     await submit(http, ["a"])
 
     async def pages_read() -> int:
+        """Pages read ranking the candidates and locking the first one's first ready action."""
+        params = {"tiers": ["standard"], "classes": classes, "run_slots": 30}
+
+        async def explained(statement: sa.TextClause, values: dict[str, object]) -> int:
+            plan = await connection.scalar(sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {statement.text}"), values)
+            return plan[0]["Plan"]["Shared Hit Blocks"] + plan[0]["Plan"]["Shared Read Blocks"]
+
         async with remote_exec_engine.begin() as connection:
             await connection.execute(sa.text("ANALYZE"))
-            plan = await connection.scalar(
-                sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {coordinator_module.CLAIM_CANDIDATES.text}"),
-                {"tiers": ["standard"], "classes": classes, "run_slots": 30},
-            )
+            pages = await explained(coordinator_module.CLAIM_CANDIDATES, params)
+            first = (await connection.execute(coordinator_module.CLAIM_CANDIDATES, params)).first()
+            if first is not None:
+                pages += await explained(
+                    coordinator_module.CLAIM_ACTION,
+                    {"batch_id": first.batch_id, "class": first.action_class, "tier": first.tier},
+                )
             await connection.rollback()
-        return plan[0]["Plan"]["Shared Hit Blocks"] + plan[0]["Plan"]["Shared Read Blocks"]
+        return pages
 
     before = await pages_read()
     async with remote_exec_engine.begin() as connection:
