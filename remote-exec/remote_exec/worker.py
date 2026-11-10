@@ -176,6 +176,12 @@ def stop_group(process: subprocess.Popen[Any]) -> None:
     process.wait()
 
 
+def kill_group(process: subprocess.Popen[Any]) -> None:
+    """Kill our session at once, from another thread; the worker reaps it with ``stop_group``."""
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+
+
 class ClaimRefused(RuntimeError):
     """The coordinator answered a claim with an error status."""
 
@@ -848,13 +854,14 @@ def run_one(
         completed = False
 
         def report(record: str) -> None:
-            """Completes the action once. Its token is stale from then, so the heartbeat stops first: a 409
-            would mark the lease lost and stop exec-action. Scale-in protection stays on until it exits."""
+            """Completes the action once, even if posting it fails: the coordinator then retries it when the
+            lease expires. Its token is stale from then, so the heartbeat stops first: a 409 would mark the
+            lease lost and stop exec-action. Scale-in protection stays on until it exits."""
             nonlocal completed
+            completed = True
             lease.done.set()
             with phases.timed("complete"):
                 coordinator.complete(token, record, claim["lease_s"])
-            completed = True
 
         try:
             record = execute(args, releases, lease, claim, phases, report)
@@ -929,7 +936,9 @@ def execute(
         # exec-action writes its result (atomically) before publishing for later actions; it is reported then,
         # and the worker waits for the rest without the lease, at most POST_RESULT_SECONDS.
         reported: str | None = None
-        after_result = 0.0
+        seen = after_result = 0.0
+        # The bound holds while the result is being posted too, which retries for as long as the lease.
+        hard_stop: threading.Timer | None = None
         sampled = stepped
         try:
             while process.poll() is None:
@@ -942,11 +951,15 @@ def execute(
                             phases.add("exec", now - stepped)
                         else:
                             spans.step(now - stepped, hol=False)
-                        stepped = after_result = now
+                        stepped = seen = now
+                        hard_stop = threading.Timer(POST_RESULT_SECONDS, kill_group, (process,))
+                        hard_stop.daemon = True
+                        hard_stop.start()
                         report(record)
                         reported = record
+                        stepped = after_result = time.monotonic()
                         continue
-                elif time.monotonic() - after_result >= POST_RESULT_SECONDS:
+                elif time.monotonic() - seen >= POST_RESULT_SECONDS:
                     print(f"{claim['theory']}: exec-action still running {POST_RESULT_SECONDS:.0f} s after its result; "
                           "stopping it", file=sys.stderr, flush=True)
                     break
@@ -961,7 +974,9 @@ def execute(
                     spans.step(now - stepped, hol=runs_hol(process.pid, cooperate_dir))
                     stepped = sampled = now
         finally:
-            timed_out = reported is not None and time.monotonic() - after_result >= POST_RESULT_SECONDS
+            if hard_stop is not None:
+                hard_stop.cancel()
+            timed_out = seen > 0 and time.monotonic() - seen >= POST_RESULT_SECONDS
             if args.share_heaps and process.poll() is None and not timed_out:
                 drain.publish_seconds = DRAIN_CHECKPOINT_PUBLISH_SECONDS
                 # Signal only the driver: it stops HOL, then publishes the
