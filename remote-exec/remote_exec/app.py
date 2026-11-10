@@ -13,6 +13,8 @@ from dataclasses import asdict
 from typing import Literal
 from uuid import UUID
 
+import asyncpg
+import sqlalchemy as sa
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, SecretStr
@@ -20,7 +22,6 @@ from pydantic import BaseModel, Field, SecretStr
 from remote_exec.auth import cache_discovery_token
 from remote_exec.coordinator import (
     ActionStatus,
-    BatchStatus,
     Coordinator,
     HostReport,
     PhaseReport,
@@ -33,6 +34,10 @@ from remote_exec.formats import FormatError, parse_batch, parse_result
 logger = logging.getLogger(__name__)
 
 Tier = Literal["standard", "high"]
+
+# What a read raises while the database is out of reach or overloaded: no pooled connection came free, a statement
+# timed out or lost its connection (wrapped by SQLAlchemy), or a new connection failed to open (not wrapped).
+DATABASE_UNAVAILABLE = (sa.exc.TimeoutError, sa.exc.DBAPIError, asyncpg.PostgresError, asyncpg.InterfaceError, OSError)
 
 
 class ClaimRequest(BaseModel):
@@ -140,9 +145,16 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
 
     # A refused login reaches requests as asyncpg's own error when a new connection opens, so check every error.
     @app.exception_handler(Exception)
-    async def unhandled(_: Request, error: Exception) -> JSONResponse:
+    async def unhandled(request: Request, error: Exception) -> JSONResponse:
         exit_on_auth_failure(error)
+        logger.exception("%s %s failed", request.method, request.url.path)
         return JSONResponse({"detail": "internal error"}, status_code=500)
+
+    # Every pooled connection stayed busy for database_pool_timeout_s: the coordinator is overloaded, not broken.
+    @app.exception_handler(sa.exc.TimeoutError)
+    async def database_busy(request: Request, error: Exception) -> JSONResponse:
+        logger.warning("%s %s: no database connection came free: %s", request.method, request.url.path, error)
+        return JSONResponse({"detail": "database busy"}, status_code=503, headers={"Retry-After": "5"})
 
     @app.post("/v1/batches", status_code=201, dependencies=client)
     async def submit(
@@ -182,26 +194,56 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             raise HTTPException(404, f"no batch {batch_id}")
 
         async def lines() -> AsyncIterator[str]:
-            # Each poll reads only the actions written since the last one, maybe some again, so `seen` drops repeats.
+            # Each read gets only the actions written since the last one, maybe some again, so `seen` drops repeats.
             seen: dict[str, ActionStatus] = {}
-            changed: tuple[BatchStatus, int] | None = first
-            last_line = time.monotonic()
-            while changed is not None:
-                batch, since = changed
-                for action in batch.actions:
-                    if seen.get(action.input_key) != action:
-                        seen[action.input_key] = action
-                        yield json.dumps({"type": "action", **asdict(action)}) + "\n"
-                        last_line = time.monotonic()
-                if batch.state != "running":
-                    yield json.dumps({"type": "batch", "state": batch.state, "failure": batch.failure}) + "\n"
-                    return
-                # A blank line, which clients skip, keeps a proxy from closing a quiet stream as idle.
-                if time.monotonic() - last_line >= settings.events_keepalive_seconds:
-                    yield "\n"
-                    last_line = time.monotonic()
-                await asyncio.sleep(settings.events_poll_seconds)
-                changed = await coordinator.changes(batch_id, since)
+            batch, since = first
+            actions = batch.actions
+            last_line = last_read = time.monotonic()
+            with coordinator.watch(batch_id) as written:
+                while True:
+                    for action in actions:
+                        if seen.get(action.input_key) != action:
+                            seen[action.input_key] = action
+                            yield json.dumps({"type": "action", **asdict(action)}) + "\n"
+                            last_line = time.monotonic()
+                    if batch.state != "running":
+                        yield json.dumps({"type": "batch", "state": batch.state, "failure": batch.failure}) + "\n"
+                        return
+                    # Read again once this process wrote to the batch, but not more often than events_poll_seconds,
+                    # or after events_fallback_seconds, for other processes' writes.
+                    while True:
+                        now = time.monotonic()
+                        # A blank line, which clients skip, keeps a proxy from closing a quiet stream as idle; also
+                        # between reads that take longer than the keepalive, such as failing ones.
+                        if now - last_line >= settings.events_keepalive_seconds:
+                            yield "\n"
+                            last_line = now
+                        read_at = last_read + (
+                            settings.events_poll_seconds if written.is_set() else settings.events_fallback_seconds
+                        )
+                        if now >= read_at:
+                            break
+                        wait = min(read_at, last_line + settings.events_keepalive_seconds) - now
+                        if written.is_set():
+                            await asyncio.sleep(wait)
+                        else:
+                            with contextlib.suppress(TimeoutError):
+                                await asyncio.wait_for(written.wait(), wait)
+                    written.clear()
+                    last_read = time.monotonic()
+                    try:
+                        changed = await coordinator.changes(batch_id, since)
+                    except DATABASE_UNAVAILABLE as error:
+                        # Ending the stream would make its client follow the batch again from the start; the next
+                        # read from the same `since` gets what this one missed.
+                        exit_on_auth_failure(error)
+                        logger.warning("reading the events of batch %s failed; retrying: %s", batch_id, error)
+                        actions = []
+                        continue
+                    if changed is None:
+                        return
+                    batch, since = changed
+                    actions = batch.actions
 
         return StreamingResponse(lines(), media_type="application/x-ndjson")
 
