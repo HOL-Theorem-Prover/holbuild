@@ -7757,12 +7757,15 @@ fun upload_spec_files hash_file remote jobs {known, learn} files =
    not forced, stays out unchecked, unless a theory in the batch depends on
    it and it can't be published from the local cache.
    A theory whose input key is in skip, or that depends on one, stays out.
+   A theory built here whose key is in publish joins the batch unless it is
+   or can be published to the remote cache, as one a theory in the batch
+   depends on does.
    With defer, so do the theories early cutoff may reuse once their
    dependencies are built, and those that depend on them; deferred holds
    their keys, for settle_deferred.  Deferring only schedules: whether a
    theory's outputs are reused is decided by early cutoff alone. *)
 fun export_action_specs (options : build_options) tc project plan toolchain_key jobs
-      {upload, local_resumable, forced, skip, defer, ledger} =
+      {upload, local_resumable, forced, skip, defer, publish, ledger} =
   let
     val hash_file = export_file_hash ()
     val _ = if upload then HolbuildOffline.require_online "upload action specs" else ()
@@ -7856,7 +7859,7 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
     val batch_deps =
       List.foldl (fn ((node, _), set) =>
                      Binaryset.addList (set, map HolbuildBuildPlan.key (HolbuildBuildPlan.transitive_project_deps plan node)))
-                 (Binaryset.empty String.compare) uncached_actions
+                 (key_set publish) uncached_actions
     fun available remote (node, action) =
       let val key = #input_key action
       in

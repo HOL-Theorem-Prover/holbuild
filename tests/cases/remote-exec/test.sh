@@ -820,6 +820,18 @@ refute_grep "Theory built" "$tmpdir/client-cutoff-output.log"
 [[ "$(< "$state/ran")" == $'rxk:ATheory\nrxk:BTheory\nrxk:CTheory' ]] ||
   { echo "workers ran:" >&2; cat "$state/ran" >&2; exit 1; }
 
+# Reused theories whose entries can't reach the remote cache, here because
+# the local cache lost them, go to the workers all the same.
+: > "$state/ran"
+for theory in B C; do
+  rm -r "$HOLBUILD_CACHE/actions/$(sed -n 's/^input_key=//p' "$project/.holbuild/dep/rxk/src/${theory}Script.sml.key")"
+done
+write_cutoff four one "$a2"
+run client-cutoff-unpublished 0 build --remote-exec "$coordinator" CTheory
+require_grep "early cutoff reused 2 of 2 deferred theories" "$tmpdir/client-cutoff-unpublished.log"
+[[ "$(< "$state/ran")" == $'rxk:ATheory\nrxk:BTheory\nrxk:CTheory' ]] ||
+  { echo "workers ran:" >&2; cat "$state/ran" >&2; exit 1; }
+
 # A theory is cut off only once everything it depends on has settled: X <- V
 # <- W <- Y, with a proof edit to X and a statement edit to W.  V is reused;
 # Y, whose own inputs are unchanged, builds on a worker against the new W.

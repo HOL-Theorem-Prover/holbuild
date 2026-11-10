@@ -1443,7 +1443,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         timed_phase "action_spec.export"
           (fn () => print (#batch (HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key jobs
                              {upload = upload, local_resumable = false, forced = [], skip = [], defer = false,
-                              ledger = false})))
+                              publish = [], ledger = false})))
       end
     fun run_with_stat_cache f =
       let val result = f ()
@@ -1608,13 +1608,16 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             (* The theories the last export deferred: they wait for their
                dependencies' batch, then for early cutoff to settle them. *)
             val deferred = ref []
+            (* The theories an earlier pass deferred: whatever settled them,
+               a later batch makes sure the remote cache has them. *)
+            val held_back = ref []
             fun export defer skip forced =
               let
                 val {batch, deferred = held} =
                   timed_phase "action_spec.export"
                     (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key jobs
                                 {upload = true, local_resumable = not detach, forced = forced, skip = skip,
-                                 defer = defer, ledger = true})
+                                 defer = defer, publish = !held_back, ledger = true})
               in
                 deferred := held;
                 batch
@@ -1873,11 +1876,13 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                        if detach then () else finish resubmit skip (SOME (batch_keys batch)) batch_id)
             (* Settles the deferred theories; those early cutoff can't reuse, and
                those that depend on them, go in the next batch, except those
-               that are or depend on a theory with its input key in skip. *)
+               that are or depend on a theory with its input key in skip.  So
+               do those it reused whose entries the remote cache lacks and
+               can't take from the local cache. *)
             and submit_deferred resubmit skip =
               let
                 val held = !deferred
-                val _ = deferred := []
+                val _ = (deferred := []; held_back := held)
                 val settled =
                   timed_phase "early_cutoff.settle"
                     (fn () => HolbuildBuildExec.settle_deferred build_options tc project plan toolchain_key held)
