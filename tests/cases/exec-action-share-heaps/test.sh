@@ -181,8 +181,8 @@ resumed() {
 
 write_t "T" "simp[]"
 export_t v1
-# A, a dependency of the target, has no theorem checkpoints: nothing to share.
-[[ ! -e "$shared/checkpoint-store" ]] || { echo "the dependency A shared a heap" >&2; exit 1; }
+# The dependency shares its checkpoints by default, before the target runs.
+[[ -d "$shared/checkpoint-store" ]] || { echo "the dependency A shared no heap" >&2; exit 1; }
 requests=$tmpdir/server/requests.log
 before_v1=$(wc -l < "$requests")
 worker v1 "$shared_url" "$shared" "$spec_t" --share-heaps
@@ -339,3 +339,126 @@ if [[ -d /dev/shm && -w /dev/shm && $(stat -c %d /dev/shm) != $(stat -c %d "$tmp
 else
   echo "skipping the cross-file-system store: no /dev/shm on another file system"
 fi
+
+
+# Older clients can explicitly disable theorem saves. Their dependency heap
+# must still be shared and reusable after a proof edit.
+cat > "$project/src/LegacyScript.sml" <<'SML'
+Theory Legacy
+Ancestors A
+Theorem legacy_thm:
+  T
+Proof
+  ACCEPT_TAC a_thm
+QED
+SML
+export_legacy() {
+  (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$shared_url" action-spec --upload LegacyTheory) > "$tmpdir/legacy.batch"
+  spec_legacy=$(field "$tmpdir/legacy.batch" share:LegacyTheory 4)
+  sed '/^action-text$/i option theorem-checkpoints=false' "$project/.holbuild/action-specs/$spec_legacy" > "$tmpdir/legacy.spec"
+  spec_legacy=$(sha256sum "$tmpdir/legacy.spec" | cut -d' ' -f1)
+  curl -fsS -X PUT --data-binary "@$tmpdir/legacy.spec" "$shared_url/cas/$spec_legacy"
+}
+legacy=$tmpdir/worker-legacy
+export_legacy
+worker legacy1 "$shared_url" "$legacy" "$spec_legacy" --share-heaps
+expect legacy1 0 "status=built"
+[[ -d "$legacy/checkpoint-store" ]] || { echo "old spec shared no dependency heap" >&2; exit 1; }
+sed -i 's/ACCEPT_TAC a_thm/MATCH_ACCEPT_TAC a_thm/' "$project/src/LegacyScript.sml"
+export_legacy
+rm -rf "$legacy/checkpoint-store"
+worker legacy2 "$shared_url" "$legacy" "$spec_legacy" --share-heaps
+expect legacy2 0 "status=built"
+resumed legacy2 "deps-loaded checkpoint" "deps-loaded heap"
+
+# Interrupt a dependency, not the requested target, after completed saves.
+# A fresh worker must resume those saves without ever caching a built result
+# for the interrupted action.
+cat > "$project/src/InterruptedScript.sml" <<'SML'
+Theory Interrupted
+Ancestors A
+Theorem completed:
+  T
+Proof
+  ACCEPT_TAC a_thm
+QED
+Definition completed_def:
+  completed_value = T
+End
+Theorem uncommitted:
+  T
+Proof
+  simp[]
+QED
+val _ = (print "checkpoint-cancel-ready\n"; TextIO.flushOut TextIO.stdOut;
+         OS.Process.sleep (Time.fromSeconds 120))
+Theorem unfinished:
+  completed_value
+Proof
+  simp[completed_def]
+QED
+SML
+cat > "$project/src/ConsumerScript.sml" <<'SML'
+Theory Consumer
+Ancestors Interrupted
+SML
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$shared_url" action-spec --upload ConsumerTheory) > "$tmpdir/cancel.batch"
+spec_interrupt=$(field "$tmpdir/cancel.batch" share:InterruptedTheory 4)
+key_interrupt=$(field "$tmpdir/cancel.batch" share:InterruptedTheory 3)
+interrupted=$tmpdir/worker-interrupted
+link_hol_toolchain_cache "$interrupted"
+python3 - "$HOLBUILD_BIN" "$shared_url" "$spec_interrupt" "$interrupted" "$tmpdir" <<'PYTEST'
+import hashlib
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+binary, url, spec, cache, temp = sys.argv[1:]
+# The suite timing wrapper is a shell; signal the driver itself.
+binary = os.environ.get("REAL_HOLBUILD_BIN", binary)
+root = Path(cache)
+with open(f"{temp}/interrupted.log", "w") as log:
+    process = subprocess.Popen(
+        [binary, "--remote-cache", url, "exec-action", spec, "--share-heaps",
+         "--cache-limit-gb", "1000", "--result", f"{temp}/interrupted.result"],
+        env={**os.environ, "HOLBUILD_CACHE": cache}, stdout=log, stderr=log,
+    )
+    try:
+        deadline = time.monotonic() + 90
+        while not any("checkpoint-cancel-ready" in p.read_text(errors="replace")
+                      for p in root.glob("action/.holbuild/stage/**/holbuild-build.log")):
+            if process.poll() is not None or time.monotonic() >= deadline:
+                raise AssertionError("HOL never reached the interruption point")
+            time.sleep(0.05)
+        assert list(root.glob("checkpoints/**/*_context.save.ok")), "no completed theorem save"
+        # Model a save interrupted before its atomic .ok commit. It is a
+        # real candidate, but neither its partial bytes nor .ok.tmp may publish.
+        incomplete = next(root.glob("checkpoints/**/uncommitted_context.save"))
+        ok = Path(str(incomplete) + ".ok")
+        ok.rename(str(ok) + ".tmp")
+        partial = b"interrupted-checkpoint-save"
+        incomplete.write_bytes(partial)
+        process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=15) != 0, "interrupted action succeeded"
+        assert not (Path(temp) / "remote/cas" / hashlib.sha256(partial).hexdigest()).exists()
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+PYTEST
+require_grep '^status=failed$' "$tmpdir/interrupted.result"
+require_grep '^failure=unavailable$' "$tmpdir/interrupted.result"
+[[ ! -e "$tmpdir/remote/ac/$key_interrupt" ]] || { echo "interrupted action published a built result" >&2; exit 1; }
+[[ ! -e "$interrupted/checkpoints" ]] || { echo "interrupted action kept private checkpoints" >&2; exit 1; }
+sed -i 's/OS.Process.sleep (Time.fromSeconds 120)/()/' "$project/src/InterruptedScript.sml"
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$shared_url" action-spec --upload ConsumerTheory) > "$tmpdir/resume.batch"
+spec_interrupt=$(field "$tmpdir/resume.batch" share:InterruptedTheory 4)
+# A replacement worker uses the same canonical paths but has no local store.
+rm -rf "$interrupted/checkpoint-store"
+worker interrupted-resume "$shared_url" "$interrupted" "$spec_interrupt" --share-heaps
+expect interrupted-resume 0 "status=built"
+require_grep 'restored shared .* checkpoint' "$tmpdir/interrupted-resume.log"
+require_grep 'checkpoint after completed' "$tmpdir/interrupted-resume.log"
