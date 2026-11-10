@@ -2593,7 +2593,7 @@ fun checked_cache_entry allow_timeout_discrepancy {root, input_key, subject, exp
       else raise Error ("cache entry built with insufficient tactic-timeout contract: built " ^
                         timeout_text proof_timeout ^ ", requested " ^ timeout_text requested_timeout)
   in
-    {blobs = blobs, proof_timeout = proof_timeout}
+    {blobs = blobs, proof_timeout = proof_timeout, manifest_text = manifest_text}
   end
 
 (* Installs a checked cache entry's outputs at the given paths, its extra
@@ -2601,7 +2601,7 @@ fun checked_cache_entry allow_timeout_discrepancy {root, input_key, subject, exp
    manifests with `write_manifests`. *)
 fun install_cache_entry copy root input_key subject
                         {blobs = {sig_hash, sml_hash, dat_hash, trace_hash, extra_hashes, parents, mldeps},
-                         proof_timeout}
+                         proof_timeout, manifest_text = _}
                         {outputs = {sig_path, sml_path, data_path}, extra_destination, write_manifests} =
   let
     val trace_path = drop_suffix ".dat" data_path ^ ".tr.gz"
@@ -8779,7 +8779,7 @@ fun restore_spec_theory remote root (spec : spec_deps) {key, subject, stem, extr
         {root = cache, input_key = key, subject = subject,
          expected_extra_outputs = extra_outputs,
          requested_timeout = requested_timeout, require_trace = false}
-    val resident = HolbuildCache.get_action cache key
+    val resident = #manifest_text entry
     val stems = spec_load_stems spec
     fun order name =
       case List.find (fn {target, ...} => #2 (target_name target) = name) (#orders spec) of
@@ -8805,7 +8805,7 @@ fun restore_spec_theory remote root (spec : spec_deps) {key, subject, stem, extr
             else in_root root (normalize_path (String.concatWith "/" [".holbuild/action-extra", key, decl])),
           write_manifests = write_manifests})
       handle e as ActionFailed (InputMissing _, _) =>
-        (Option.app (fn text => ignore (drop_cache_manifest_if_unchanged cache key text)) resident;
+        (ignore (drop_cache_manifest_if_unchanged cache key resident);
          raise e)
   end
 
