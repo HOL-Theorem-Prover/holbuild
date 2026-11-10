@@ -1153,8 +1153,8 @@ in `.holbuild/plan/outline-skip`, and that input is never pipelined again.
 Proofs that use `cheat` or `suspend`, and theorems the script `Resume`s,
 run in place. A theory is not pipelined if it saves checkpoints and is a
 requested target or the build passes `--all-checkpoints`, if it declares
-extra outputs, or under `--trace-steps`, `--repl-on-failure`,
-`--cached-proofs`, a tracing kernel or an execution plan.
+extra outputs, or under `--trace-steps`, `--repl-on-failure`, a tracing
+kernel or an execution plan.
 
 A pipelined theory saves no checkpoints, not even `deps_loaded`, so the first
 rebuild after editing it reloads its ancestors. Remote-exec workers never
@@ -1166,45 +1166,6 @@ as a plain build's, so it is reused from the local build and the caches.
 `HOLBUILD_CACHE_TRACE=1` prints a `pipeline:` line for each step and a
 summary of failures.
 
-### Reusing recorded proofs
-
-`holbuild build --cached-proofs` reuses the proofs of unchanged theorems
-instead of running their tactics, in every theory the build runs, the edited
-one included. Each `Theorem`/`Triviality` proved with proof steps looks for a
-record of an earlier proof with the same theory, name, statement, tactic text
-and proof attributes. A record names the saved theorems the proof used; it is
-reused when each of them is still saved under that name with the same
-statement and oracles, it carries no axiom, and the record's tactic timeout
-was at most the requested one. The theorem then gets the dependencies and
-oracles the proof gave it, so the theory's outputs are the same bytes a
-replay of the same proofs would write. Otherwise the tactic runs and its
-proof is recorded. The build log says `holbuild reused the cached proof of
-NAME` for each reuse.
-
-A theory's own constants and types reach those records only through their
-defining theorems. A theory that makes a constant or type without a stored
-defining theorem (a raw `Thm.prim_specification`, `prim_type_definition` or
-`gen_prim_specification`), or that defines a constant under a
-`new_definition` hook it installed itself, reuses and records nothing. A
-`new_definition` hook can keep the kernel's defining theorem, which a proof
-can use without a saved dependency, so a changed `new_definition` misses
-every proof below it in its theory. Proofs with hypotheses,
-`Resume` blocks, proofs that `suspend`, proofs that change the theory while
-they run (a definition inside a tactic), and theorems proved from ML
-(`store_thm`, `prove`) always run.
-
-Records live in `$HOLBUILD_CACHE/proof-records/v1/`, one file per theory and
-toolchain, keeping the newest three per theorem. Under `--remote-exec` each
-worker shares a theory's records through the remote cache.
-
-A cached build's outputs hold theorems no proof checked in that build, so
-they are kept apart: its cache entries and theorem checkpoints have keys of
-their own, and its theories' metadata says `proofs=cached`. A build without
-the flag never restores, cuts off to, or resumes from them; it builds such
-theories again. CI, `export`, `check` and proof traces don't take the flag,
-so they always replay. `--cached-proofs` needs proof steps and rejects
-`--skip-proof-steps`, `--trace-steps`, `--trknl` and `execution-plan`.
-
 ## Caches and cleanup
 
 Important paths:
@@ -1215,7 +1176,6 @@ Important paths:
 .holbuild/plan/<fingerprint>          # plan records
 $HOLBUILD_CACHE/hol-toolchains/       # built HOL toolchains and analysers
 $HOLBUILD_CACHE/analysis/             # sources' dependency analyses
-$HOLBUILD_CACHE/proof-records/        # build --cached-proofs's proof records
 ```
 
 Planning analyses each source for its dependencies (its `load`s, `use`s,

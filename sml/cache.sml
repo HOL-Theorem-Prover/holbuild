@@ -30,8 +30,6 @@ fun tmp_dir root = HolbuildFSCacheBackend.tmp_dir (filesystem_cache root)
 fun locks_dir root = HolbuildFSCacheBackend.locks_dir (filesystem_cache root)
 fun theory_modules_dir root = Path.concat(root, "theory-modules")
 fun analysis_dir root = Path.concat(root, "analysis")
-(* A --cached-proofs build's records of a theory's proofs, one file per theory. *)
-fun proof_records_dir root = Path.concat(Path.concat(root, "proof-records"), "v1")
 fun action_dir root key = HolbuildFSCacheBackend.action_dir (filesystem_cache root) key
 fun action_manifest root key = HolbuildFSCacheBackend.action_manifest (filesystem_cache root) key
 fun blob_path root hash = HolbuildFSCacheBackend.blob_path (filesystem_cache root) hash
@@ -380,7 +378,6 @@ fun gc_root root days =
           val modules_removed = remove_stale_children "theory modules" cutoff
                                   (theory_modules_dir root)
           val analysis_removed = remove_stale_children "analysis" cutoff (analysis_dir root)
-          val proof_records_removed = remove_stale_children "proof records" cutoff (proof_records_dir root)
           val lock_removed = remove_obsolete_action_lock_dirs cutoff (locks_dir root)
           val (live_blobs, actions_removed) = collect_live_actions cutoff actions_dir
           val blobs_removed = sweep_blobs cutoff live_blobs blobs_dir
@@ -392,7 +389,6 @@ fun gc_root root days =
                  " blobs=" ^ Int.toString blobs_removed ^
                  " modules=" ^ Int.toString modules_removed ^
                  " analysis=" ^ Int.toString analysis_removed ^
-                 " proof-records=" ^ Int.toString proof_records_removed ^
                  " toolchains=" ^ Int.toString toolchains_removed ^
                  " toolchains-busy=" ^ Int.toString toolchains_busy ^ "\n")
         end
