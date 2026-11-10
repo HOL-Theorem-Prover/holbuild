@@ -820,10 +820,15 @@ def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = N
                         if error.errno != errno.EBADF:
                             raise
             linux.drop_privileges()
-            linux.confine_paths(policy.readable + [Path(f"/proc/{os.getpid()}")],
+            proc = Path(f"/proc/{os.getpid()}")
+            # Landlock holds the inode, but procfs recreates it if its dentry
+            # is evicted. Pin the granted directory until the action is reaped.
+            proc_fd = os.open(proc, os.O_PATH | os.O_CLOEXEC)
+            linux.confine_paths(policy.readable + [proc],
                                 policy.writable, policy.scratch + [Path("/dev/null")], policy.toolchain)
             listener = linux.confine_syscalls(policy.toolchain)
-            socket.send_fds(child_socket, [b"N"], [listener])
+            socket.send_fds(child_socket, [b"N"], [listener, proc_fd])
+            os.close(proc_fd)
             os.close(listener)
             child_socket.close()
             os.execvpe(argv[0], argv, env)
@@ -833,6 +838,7 @@ def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = N
     child_socket.close()
     leader_fd = os.pidfd_open(child)
     broker = None
+    proc_fd = None
     signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
     try:
         poller = select.poll()
@@ -849,11 +855,12 @@ def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = N
                     done = True
                     break
                 if fd == parent_socket.fileno():
-                    data, descriptors, _, _ = socket.recv_fds(parent_socket, 1, 1)
-                    if data != b"N" or len(descriptors) != 1:
+                    data, descriptors, _, _ = socket.recv_fds(parent_socket, 1, 2)
+                    if data != b"N" or len(descriptors) != 2:
                         for descriptor in descriptors:
                             os.close(descriptor)
                         raise SandboxError("missing seccomp listener handshake")
+                    proc_fd = descriptors[1]
                     broker = SignalBroker(linux, descriptors[0], policy.writable)
                     poller.unregister(parent_socket)
                     parent_socket.close()
@@ -868,6 +875,8 @@ def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = N
         finally:
             if broker is not None:
                 broker.close()
+            if proc_fd is not None:
+                os.close(proc_fd)
             parent_socket.close()
             os.close(leader_fd)
             os.close(parent_fd)

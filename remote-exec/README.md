@@ -289,6 +289,11 @@ to complete cleanup fails the action and does not harvest outputs. This does
 not provide resource isolation against fork storms. Unsupported confinement
 fails closed.
 
+The action can read its own process directory under `/proc`, without a general
+`/proc` grant. The supervisor holds that directory open through cleanup because
+procfs can otherwise recreate its inode after dentry eviction, losing the
+inode-based Landlock grant. The action inherits no descriptor for this pin.
+
 The child inherits only executable lookup, locale, timezone, certificate lookup,
 those solver locations and `HOLBUILD_RUN_*` settings; a solver outside the
 system directories needs its directory in `HOLBUILD_ACTION_READ_DIRS`. Other
