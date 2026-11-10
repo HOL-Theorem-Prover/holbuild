@@ -237,8 +237,8 @@ require_grep "could not cancel remote batch b4 (HTTP 503)" "$tmpdir/down.log"
 require_grep "the coordinator reported no theories; building locally" "$tmpdir/down.log"
 require_grep "BTheory built" "$tmpdir/down.log"
 write_theories five-down-only
-run down-only 75 build --remote-exec "$coordinator" --remote-only BTheory
-require_grep "the coordinator reported no theories; reattach with --attach b5" "$tmpdir/down-only.log"
+run down-only 75 build --remote-exec "$coordinator" --remote-only --priority 17 BTheory
+require_grep "the coordinator reported no theories; reattach with --attach b5 --priority 17$" "$tmpdir/down-only.log"
 refute_grep "^POST /v1/batches/b5/cancel " "$state/requests.log"
 rm "$state/down"
 run unknown-only 75 build --remote-exec "$coordinator" --remote-only --attach nope BTheory
@@ -1253,9 +1253,10 @@ val _ = if Use2Lib.v = 8 then () else raise Fail "bad Use2Lib.v";
 val after_gen_thm = save_thm("after_gen_thm", TRUTH);
 SML
 (cd "$gen2" && HOLBUILD_CACHE=$tmpdir/generated-two-phase-cache "$HOLBUILD_BIN" --remote-cache "$remote_url" \
-  build --remote-exec "$coordinator" --remote-only AfterGenTheory) > "$tmpdir/gen2.log" 2>&1 ||
+  build --remote-exec "$coordinator" --remote-only --priority=3 AfterGenTheory) > "$tmpdir/gen2.log" 2>&1 ||
   { cat "$tmpdir/gen2.log" "$tmpdir/worker.log" >&2; exit 1; }
 require_grep "Gen2Theory restored from cache" "$tmpdir/gen2.log"
+[[ $(grep -c '^POST /v1/batches?priority=3 ' "$state/requests.log") -ge 2 ]] || { cat "$state/requests.log" >&2; exit 1; }
 require_grep "Use2Lib built" "$tmpdir/gen2.log"
 require_grep "AfterGenTheory restored from cache" "$tmpdir/gen2.log"
 refute_grep "Theory built" "$tmpdir/gen2.log"
@@ -1627,3 +1628,64 @@ require_grep '^detail=exec-action HOL repository is not trusted by this worker: 
 refute_grep '^log=' "$tmpdir/worker.result"
 require_grep 'holbuild: remote rxlocalcas:LocalUntrustedTheory: failed (spec-rejected: exec-action HOL repository is not trusted by this worker: ' \
   "$tmpdir/local-cas-untrusted.log"
+
+
+# The missing-input replay below needs the worker's normal resubmit signal.
+rm "$state/keep-going"
+
+# Batch priority is scheduling metadata; it reaches submit together with the other batch options.
+cat > "$tmpdir/local-cas/src/PriorityScript.sml" <<'SML'
+Theory Priority
+Ancestors bool
+Theorem priority_test: T
+Proof
+  simp[]
+QED
+SML
+in_copy local-cas --remote-cache "$remote_url" --max-heap 4096 build --remote-exec "$coordinator" \
+  --remote-only --priority 7 --fail-fast PriorityTheory > "$tmpdir/priority.log" 2>&1
+require_grep '^POST /v1/batches?fail_fast=true&priority=7&max_heap_mb=4096 ' "$state/requests.log"
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --detach --priority=2147483647 LocalUntrustedTheory > "$tmpdir/priority-equals.log" 2>&1
+require_grep '^POST /v1/batches?priority=2147483647 ' "$state/requests.log"
+
+for value in -1 1.5 urgent 2147483648; do
+  if in_copy local-cas build --remote-exec "$coordinator" --priority "$value" PriorityTheory > "$tmpdir/priority-invalid.log" 2>&1; then
+    echo "accepted invalid priority $value" >&2
+    exit 1
+  fi
+  if [[ $value == 2147483648 ]]; then
+    require_grep '^holbuild: --priority must be between 0 and 2147483647$' "$tmpdir/priority-invalid.log"
+  else
+    require_grep "^holbuild: invalid --priority: $value; expected an integer between 0 and 2147483647$" "$tmpdir/priority-invalid.log"
+  fi
+done
+if in_copy local-cas build --priority 1 PriorityTheory > "$tmpdir/priority-no-exec.log" 2>&1; then
+  echo 'accepted priority without remote execution' >&2
+  exit 1
+fi
+require_grep 'priority needs --remote-exec URL' "$tmpdir/priority-no-exec.log"
+
+# Reattaching can need a replacement batch after an input disappears.
+cat > "$tmpdir/local-cas/src/PriorityChildScript.sml" <<'SML'
+Theory PriorityChild
+Ancestors Priority
+Theorem priority_child_test: T
+Proof
+  simp[]
+QED
+SML
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only PriorityChildTheory > "$tmpdir/priority-attach-seed.log" 2>&1
+printf '\n(* changed parent *)\n' >> "$tmpdir/local-cas/src/PriorityScript.sml"
+child_source=$(sha256sum "$tmpdir/local-cas/src/PriorityChildScript.sml" | cut -d' ' -f1)
+rm "$remote_root/cas/$child_source" "$tmpdir/worker-cache/blobs/$child_source"
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --detach --priority 9 PriorityChildTheory > "$tmpdir/priority-attach-detach.log" 2>&1
+priority_batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/priority-attach-detach.log")
+[[ -n $priority_batch ]] || { cat "$tmpdir/priority-attach-detach.log" >&2; exit 1; }
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only --attach "$priority_batch" --priority 9 PriorityChildTheory > "$tmpdir/priority-attach.log" 2>&1
+require_grep "still missing blob $child_source after 3 attempts; .*; resubmitting$" "$tmpdir/priority-attach.log"
+[[ $(grep -c '^POST /v1/batches?priority=9 ' "$state/requests.log") -eq 2 ]] || { cat "$state/requests.log" >&2; exit 1; }
+require_grep 'remote rxlocalcas:PriorityChildTheory: done' "$tmpdir/priority-attach.log"

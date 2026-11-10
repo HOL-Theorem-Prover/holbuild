@@ -194,6 +194,8 @@ class QueueCounts:
     running_high: int
     ready_run: int = 0
     running_run: int = 0
+    ready_priority: int = 0
+    running_priority: int = 0
     high_run: int = 0  # internal: ready or running high-tier runs, for capped burst demand
 
 
@@ -406,6 +408,7 @@ AND (c.class = 'build' OR (SELECT available FROM run_capacity))
 ORDER BY
     c.class,
     array_position(CAST(:tiers AS text[]), t.tier),
+    b.priority DESC,
     (SELECT count(*) FROM actions r WHERE r.batch_id = b.id AND r.state = 'running'),
     (SELECT max(l.last_claimed_at) FROM actions l WHERE l.batch_id = b.id) NULLS FIRST,
     b.created_at,
@@ -449,11 +452,14 @@ FINISH_IF_DONE = sa.text(
 # are all burst demand needs: the scale check runs every sweep, and waiting actions can outnumber the others many
 # times over. Literal states, so the partial index actions_unfinished serves both.
 COUNT_UNFINISHED = sa.text(
-    "SELECT state, tier, class, count(*) FROM actions "
-    "WHERE state IN ('waiting', 'ready', 'running') GROUP BY state, tier, class"
+    "SELECT a.state, a.tier, a.class, b.priority > 0, count(*) FROM actions a "
+    "JOIN batches b ON b.id = a.batch_id "
+    "WHERE a.state IN ('waiting', 'ready', 'running') "
+    "GROUP BY a.state, a.tier, a.class, b.priority > 0"
 )
 COUNT_ACTIVE = sa.text(
-    "SELECT state, tier, class, count(*) FROM actions WHERE state IN ('ready', 'running') GROUP BY state, tier, class"
+    "SELECT state, tier, class, false, count(*) FROM actions "
+    "WHERE state IN ('ready', 'running') GROUP BY state, tier, class"
 )
 
 
@@ -546,14 +552,14 @@ class Coordinator:
 
     async def submit(
         self, batch: Batch, profile: str, action_class: str = "build", max_heap_mb: int | None = None,
-        *, fail_fast: bool = False,
+        *, fail_fast: bool = False, priority: int = 0,
     ) -> UUID:
         """Store a batch; its actions without uncached parents become ready."""
         batch_id = uuid4()
         parents: defaultdict[str, int] = defaultdict(int)
         for child, _ in batch.edges:
             parents[child] += 1
-        priority = dag_priorities([a.input_key for a in batch.actions], batch.edges)
+        dag_priority = dag_priorities([a.input_key for a in batch.actions], batch.edges)
         packages = [a.theory.split(":", 1)[0] for a in batch.actions]
         names = [a.theory.split(":", 1)[1] for a in batch.actions]
         async with self.engine.begin() as conn:
@@ -569,8 +575,8 @@ class Coordinator:
             high = {theory for theory, peak in hints if peak >= self.settings.standard_tier_mb}
             await conn.execute(
                 sa.text(
-                    "INSERT INTO batches (id, state, profile, max_heap_mb, fail_fast) "
-                    "VALUES (:id, :state, :profile, :max_heap_mb, :fail_fast)"
+                    "INSERT INTO batches (id, state, profile, max_heap_mb, fail_fast, priority) "
+                    "VALUES (:id, :state, :profile, :max_heap_mb, :fail_fast, :priority)"
                 ),
                 {
                     "id": batch_id,
@@ -578,6 +584,7 @@ class Coordinator:
                     "profile": profile,
                     "max_heap_mb": max_heap_mb,
                     "fail_fast": fail_fast,
+                    "priority": priority,
                 },
             )
             if batch.actions:
@@ -598,8 +605,8 @@ class Coordinator:
                             "theory": a.theory,
                             "remaining": parents[a.input_key],
                             "tier": "high" if a.theory in high else "standard",
-                            "depth": priority[a.input_key].critical_depth,
-                            "descendants": priority[a.input_key].descendant_count,
+                            "depth": dag_priority[a.input_key].critical_depth,
+                            "descendants": dag_priority[a.input_key].descendant_count,
                             "class": action_class,
                         }
                         for a in batch.actions
@@ -1188,7 +1195,10 @@ class Coordinator:
         count: defaultdict[tuple[str, str], int] = defaultdict(int)
         runs: defaultdict[str, int] = defaultdict(int)
         high_run = 0
-        for state, tier, action_class, n in await conn.execute(statement):
+        priorities: defaultdict[str, int] = defaultdict(int)
+        for state, tier, action_class, prioritized, n in await conn.execute(statement):
+            if prioritized:
+                priorities[state] += n
             count[state, tier] += n
             if action_class == "run":
                 runs[state] += n
@@ -1203,6 +1213,8 @@ class Coordinator:
             ready_run=runs["ready"],
             running_run=runs["running"],
             high_run=high_run,
+            ready_priority=priorities["ready"],
+            running_priority=priorities["running"],
         )
 
     async def sweep(self) -> None:

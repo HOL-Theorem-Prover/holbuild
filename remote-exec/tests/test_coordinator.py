@@ -2099,3 +2099,68 @@ async def test_submit_rejects_invalid_heap_limit(http: httpx.AsyncClient, value:
     )
     assert response.status_code == 422
     assert await claim(http) is None
+
+
+async def test_priority_precedes_batch_fair_share_and_preserves_equal_priority_turns(http: httpx.AsyncClient) -> None:
+    await submit(http, ["normal"])
+    await submit(http, ["p11", "p12", "p13"], priority="1")
+    await submit(http, ["p21", "p22"], priority="1")
+    await claim_named(http, "p11")
+    await claim_named(http, "p21")
+    await claim_named(http, "p12")
+    await claim_named(http, "p22")
+    # Priority still wins with three running actions, ahead of a normal batch with none.
+    await claim_named(http, "p13")
+    await claim_named(http, "normal")
+
+
+async def test_normal_build_progresses_while_priority_chain_waits_for_its_parent(http: httpx.AsyncClient) -> None:
+    await submit(http, ["normal1", "normal2"])
+    await submit(http, ["parent", "child"], [("child", "parent")], priority="1")
+    await claim_named(http, "parent")
+    await claim_named(http, "normal1")
+    await claim_named(http, "normal2")
+    assert await claim(http) is None
+
+
+async def test_priority_does_not_override_memory_tier_or_action_class(
+    http: httpx.AsyncClient, remote_exec_engine: Any
+) -> None:
+    await submit(http, ["high"])
+    await submit(http, ["priority"], priority="1")
+    await submit(http, ["run"], **{"class": "run", "priority": "100"})
+    async with remote_exec_engine.begin() as conn:
+        await conn.execute(sa.text("UPDATE actions SET tier = 'high' WHERE theory = 'pkg:high'"))
+    response = await http.post(
+        "/v1/work/claim", headers=WORKER,
+        json={"tier": "high", "also_claim": ["standard"], "worker": "w1"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["theory"] == "pkg:high"
+    await claim_named(http, "priority")
+    await claim_named(http, "run")
+
+
+@pytest.mark.parametrize("value", [None, "0", "2147483647"])
+async def test_missing_priority_defaults_to_zero_and_valid_values_are_stored(
+    http: httpx.AsyncClient, remote_exec_engine: Any, value: str | None
+) -> None:
+    batch_id = await submit(http, ["a"], **({} if value is None else {"priority": value}))
+    async with remote_exec_engine.connect() as conn:
+        actual = await conn.scalar(sa.text("SELECT priority FROM batches WHERE id = :id"), {"id": UUID(batch_id)})
+    assert actual == (0 if value is None else int(value))
+
+
+@pytest.mark.parametrize("value", ["-1", "2147483648", "1.5", "urgent", ""])
+async def test_invalid_priority_is_rejected(http: httpx.AsyncClient, value: str) -> None:
+    response = await http.post("/v1/batches", headers=CLIENT, content=batch_text(["a"]), params={"priority": value})
+    assert response.status_code == 422
+
+
+async def test_queue_reports_priority_subsets_without_double_counting(http: httpx.AsyncClient) -> None:
+    await submit(http, ["normal"])
+    await submit(http, ["p1", "p2", "child"], [("child", "p1")], priority="1")
+    await claim_named(http, "p1")
+    queue = (await http.get("/v1/queue", headers=CLIENT)).json()
+    assert (queue["ready_priority"], queue["running_priority"]) == (1, 1)
+    assert (queue["ready_standard"], queue["running_standard"], queue["waiting"]) == (2, 1, 1)

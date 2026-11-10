@@ -436,11 +436,12 @@ a run batch and cancels its unfinished actions.
   the admission lock. Set the floor back to 0 and restart the coordinator
   to restore strict build priority. Claims select with `FOR UPDATE SKIP LOCKED`,
   write a lease with an expiry and commit; no transaction stays open while
-  the worker builds. Among the running batches, the claim picks the one with
-  the fewest running actions, then the one that least recently had an action
+  the worker builds. Among running batches of the selected class and tier,
+  the claim picks the highest scheduling priority first, then the fewest running actions among
+  equal priorities, then the one that least recently had an action
   claimed (one that never had goes first), then the oldest: a new batch gets
-  the next free worker even while a wide one holds the rest, and batches
-  take turns when there are more of them than workers. Within the batch, it
+  the next free worker among equal-priority batches even while a wide one holds
+  the rest, and those batches take turns when there are more of them than workers. Within the batch, it
   picks the action with the longest chain of dependents in the batch, then
   the one with the most dependents, then by theory name, so the critical
   path starts first and the ready frontier widens fastest. An expired lease returns the
@@ -595,9 +596,10 @@ retries, and a request still queued for a connection would be done twice.
 
 ### Client
 
-`POST /v1/batches?profile=<name>&class=build|run` with the batch text as the body
+`POST /v1/batches?profile=<name>&class=build|run&priority=<integer>` with the batch text as the body
 (`text/plain`). `profile` defaults to `default`; `class` defaults to `build`.
-An unknown class returns 422.
+An unknown class returns 422. `priority` defaults to 0 and accepts integers
+from 0 to 2147483647; invalid values return 422. Existing batches retain priority 0.
 
 - 201 `{"batch_id": "<uuid>"}`
 - 400 when the batch is malformed (bad header or line, duplicate action, an
@@ -714,6 +716,18 @@ record `exec-action --result` wrote as the body (`text/plain`)
 A worker that can't reach the coordinator or gets a 5xx, as while the
 coordinator restarts, retries a `complete` until the action's lease would run
 out.
+
+Migration `0014` adds `batches.priority`, with default 0. Before rolling back
+to a coordinator image predating it, stop the coordinator and use the new image
+to run `alembic downgrade 0013`, then start the older image. This removes only
+scheduling metadata; action inputs, outputs and leases are unchanged.
+
+`GET /v1/queue` includes `ready_priority` and `running_priority`: subsets of
+the tier counts for actions whose batch has a positive priority. Do not add
+these subsets to the tier totals. Priority does not change burst demand.
+Strict priority suits occasional finite batches; there is no aging or reserved
+normal share. Normal work can use workers for which no priority action is ready,
+including while a priority batch waits on dependencies.
 
 ## Tests
 
