@@ -783,15 +783,15 @@ async def test_a_waiting_claim_ends_empty_after_its_wait(http: httpx.AsyncClient
 async def test_a_claim_reads_no_finished_actions(
     http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any, classes: list[str]
 ) -> None:
-    """A claim reads the same few pages however many finished actions running and retained batches hold, so
-    claims stay cheap on a busy fleet."""
+    """Ranking a claim's batches reads the same few pages however many finished actions running and retained
+    batches hold, and however many ready actions a batch holds, so claims stay cheap on a busy fleet."""
     await submit(http, ["a"])
 
     async def pages_read() -> int:
         async with remote_exec_engine.begin() as connection:
             await connection.execute(sa.text("ANALYZE"))
             plan = await connection.scalar(
-                sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {coordinator_module.CLAIM.text}"),
+                sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {coordinator_module.CLAIM_CANDIDATES.text}"),
                 {"tiers": ["standard"], "classes": classes, "run_slots": 30},
             )
             await connection.rollback()
@@ -809,6 +809,16 @@ async def test_a_claim_reads_no_finished_actions(
                 "last_claimed_at) "
                 "SELECT b.id, b.state || g, 'ac', 's', 'pkg:t' || g, 0, 'done', 'standard', now() "
                 "FROM batches b, generate_series(1, 20000) g"
+            )
+        )
+        # Many more ready actions of the running batch, of every class.
+        await connection.execute(
+            sa.text(
+                "INSERT INTO actions (batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier, "
+                "class) "
+                "SELECT b.id, 'ready' || g, 'ac', 's', 'pkg:r' || g, 0, 'ready', 'standard', "
+                "CASE WHEN g % 2 = 0 THEN 'build' ELSE 'run' END "
+                "FROM batches b, generate_series(1, 20000) g WHERE b.state = 'running'"
             )
         )
     assert await pages_read() < before + 20
