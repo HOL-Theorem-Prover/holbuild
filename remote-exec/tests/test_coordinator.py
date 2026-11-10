@@ -1404,7 +1404,11 @@ async def test_missing_failed_parent_skips_the_action_instead_of_waiting_forever
     assert (await complete(http, tokens["b"], result("b", "failed", "input-missing",
                            missing=f"theory {input_key('a')}"))).status_code == 200
     assert await states(http, batch_id) == {"a": "failed", "b": "cancelled", "c": "cancelled"}
-    assert (await batch(http, batch_id))["state"] == "failed"
+    status = await batch(http, batch_id)
+    assert status["state"] == "failed"
+    actions = {a["theory"]: a for a in status["actions"]}
+    assert actions["pkg:b"]["log_sha256"] == "a" * 64
+    assert actions["pkg:c"]["log_sha256"] is None
     assert await claim(http) is None
 
 
