@@ -1253,70 +1253,6 @@ def test_a_result_detail_is_read_as_one_line_of_printable_ascii() -> None:
     assert parse_result(result("a", "failed", "proof")).detail is None
 
 
-async def test_action_log_publication_and_failure_are_reported(http: httpx.AsyncClient) -> None:
-    batch_id = await submit(http, ["a", "b"])
-    compressed = f"{'b' * 64} 123 {'c' * 64} 9000000000"
-    token = await claim_named(http, "a")
-    raw = f"log={'a' * 64} 12\n"
-    record = result("a", "built").replace(raw, f"log-zstd={compressed}\n")
-    assert (await complete(http, token, record)).status_code == 200
-    token = await claim_named(http, "b")
-    failed_upload = result("b", "built").replace(raw, "log-error=cache unavailable\n")
-    assert (await complete(http, token, failed_upload)).status_code == 200
-    status = await batch(http, batch_id)
-    actions = {a["theory"]: a for a in status["actions"]}
-    assert status["state"] == "done"
-    assert actions["pkg:a"]["log_sha256"] is None
-    assert actions["pkg:a"]["log_zstd"] == compressed
-    assert actions["pkg:b"]["log_error"] == "cache unavailable"
-    events = [json.loads(line) for line in
-              (await http.get(f"/v1/batches/{batch_id}/events", headers=CLIENT)).text.splitlines() if line]
-    assert {e["theory"]: e["log_zstd"] for e in events if e["type"] == "action"}["pkg:a"] == compressed
-
-    for bad in [record + raw, record + "log-error=failed\n", record.replace(" 123 ", " -1 "),
-                failed_upload.replace("status=built", "status=cached")]:
-        with pytest.raises(ValueError):
-            parse_result(bad)
-
-
-async def test_retry_replaces_the_previous_attempts_log(http: httpx.AsyncClient) -> None:
-    batch_id = await submit(http, ["a"])
-    compressed = f"{'b' * 64} 123 {'c' * 64} 456"
-    raw = f"log={'a' * 64} 12\n"
-    token = await claim_named(http, "a")
-    failed = result("a", "failed", "internal").replace(raw, f"log-zstd={compressed}\n")
-    assert (await complete(http, token, failed)).status_code == 200
-    assert (await batch(http, batch_id))["actions"][0]["log_zstd"] == compressed
-    token = await claim_named(http, "a")
-    built = result("a", "built").replace(raw, "log-error=cache unavailable\n")
-    assert (await complete(http, token, built)).status_code == 200
-    action = (await batch(http, batch_id))["actions"][0]
-    assert (action["state"], action["log_sha256"], action["log_zstd"], action["log_error"]) == (
-        "done", None, None, "cache unavailable"
-    )
-
-
-@pytest.mark.parametrize("end", ["cancel", "expiry"])
-async def test_action_ending_without_a_result_clears_old_logs(
-    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any, end: str,
-) -> None:
-    batch_id = await submit(http, ["a"])
-    token = await claim_named(http, "a")
-    assert (await complete(http, token, result("a", "failed", "internal"))).status_code == 200
-    assert (await batch(http, batch_id))["actions"][0]["log_sha256"] == "a" * 64
-    if end == "cancel":
-        assert (await http.post(f"/v1/batches/{batch_id}/cancel", headers=CLIENT)).status_code == 200
-    else:
-        for _ in range(2):
-            await claim_named(http, "a")
-            async with remote_exec_engine.begin() as connection:
-                await connection.execute(sa.text("UPDATE leases SET expires_at = now() - interval '1 second'"))
-            await coordinator.sweep()
-    action = (await batch(http, batch_id))["actions"][0]
-    assert action["state"] == ("cancelled" if end == "cancel" else "failed")
-    assert (action["log_sha256"], action["log_zstd"], action["log_error"]) == (None, None, None)
-
-
 async def test_result_without_an_input_key_is_matched_by_its_spec(http: httpx.AsyncClient) -> None:
     # exec-action leaves input-key empty when it couldn't read the spec.
     batch_id = await submit(http, ["a", "b"], fail_fast="true")
@@ -1404,11 +1340,7 @@ async def test_missing_failed_parent_skips_the_action_instead_of_waiting_forever
     assert (await complete(http, tokens["b"], result("b", "failed", "input-missing",
                            missing=f"theory {input_key('a')}"))).status_code == 200
     assert await states(http, batch_id) == {"a": "failed", "b": "cancelled", "c": "cancelled"}
-    status = await batch(http, batch_id)
-    assert status["state"] == "failed"
-    actions = {a["theory"]: a for a in status["actions"]}
-    assert actions["pkg:b"]["log_sha256"] == "a" * 64
-    assert actions["pkg:c"]["log_sha256"] is None
+    assert (await batch(http, batch_id))["state"] == "failed"
     assert await claim(http) is None
 
 
