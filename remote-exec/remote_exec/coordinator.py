@@ -101,7 +101,8 @@ class Settings(BaseSettings):
     # /v1/cache/members reuses the serving slots it read for this long: workers ask about as often as they claim.
     # Clients keep the list REFRESH_SECONDS more, which together stay under cache_drain_seconds.
     cache_members_ttl_seconds: float = Field(default=2.0, ge=0, allow_inf_nan=False)
-    # Build claims share one ranking of the batches for this long; see Coordinator._claim_build. 0 ranks per claim.
+    # Build claims share one ranking of the batches for this long; see Coordinator._claim_build. With 0, only claims
+    # that arrive while a ranking is being read share it.
     claim_ranking_seconds: float = Field(default=0.5, ge=0, allow_inf_nan=False)
     # Burst workers: workers that a scaler starts and stops on top of `warm_workers` always-on ones.
     run_slots: int = Field(default=30, ge=0)
