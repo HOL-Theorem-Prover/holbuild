@@ -48,9 +48,16 @@ MIN_TOOLCHAIN_SANDBOX_RELEASE = (0, 14, 0)
 
 
 @functools.cache
-def check_sandbox(executable: str) -> None:
-    """Fail closed before a release can execute submitted code."""
-    subprocess.run([executable, "sandbox-check"], check=True, stdin=subprocess.DEVNULL, timeout=30)
+def check_sandbox(executable: str, version: str) -> None:
+    """Fail closed before a release can execute submitted code. Runs with the environment its actions get, which
+    release ``version`` validates."""
+    subprocess.run(
+        [executable, "sandbox-check"],
+        check=True,
+        stdin=subprocess.DEVNULL,
+        timeout=30,
+        env=exec_action_env(version=version),
+    )
 
 
 # How long each ECS scale-in protection call protects the task. ECS refuses renewals with DEPLOYMENT_BLOCKED once a
@@ -377,12 +384,12 @@ class Releases:
             raise Unreleased(f"holbuild {version} predates mandatory action isolation")
         baked = os.path.join(self.baked_root, f"v{version}", "bin", "holbuild")
         if os.path.isfile(baked) and os.access(baked, os.X_OK):
-            check_sandbox(baked)
+            check_sandbox(baked, version)
             return baked
         directory = os.path.join(self.root, f"v{version}")
         executable = os.path.join(directory, "bin", "holbuild")
         if os.path.exists(os.path.join(directory, COMPLETE)):
-            check_sandbox(executable)
+            check_sandbox(executable, version)
             return executable
         os.makedirs(self.root, exist_ok=True)
         with open(os.path.join(self.root, f"v{version}.lock"), "a") as lock:
@@ -390,7 +397,7 @@ class Releases:
                 fcntl.flock(lock, fcntl.LOCK_EX)
             if not os.path.exists(os.path.join(directory, COMPLETE)):
                 self._build(version, directory)
-        check_sandbox(executable)
+        check_sandbox(executable, version)
         return executable
 
     def _build(self, version: str, directory: str) -> None:
