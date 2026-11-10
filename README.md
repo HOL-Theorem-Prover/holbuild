@@ -1062,10 +1062,11 @@ holbuild build --skip-checkpoints MyTheory
 - `--skip-proof-steps` opts out of proof-step execution.
 - `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation.
 - Theorem, declaration and failed-prefix checkpoints are saved in every theory
-  included by `--proof-scope` (root-package theories by default).
-  `--all-checkpoints` remains an accepted no-op alias. Checkpoint policy does
-  not change theory outputs or cache keys. Remote action specs carry this
-  policy to the workers.
+  included by `--proof-scope` (root-package theories by default), except one
+  that a local parallel build pipelines (below) because it isn't a requested
+  target. `--all-checkpoints` keeps every such theory unpipelined, so all of
+  them save checkpoints. Checkpoint policy does not change theory outputs or
+  cache keys. Remote action specs carry this policy to the workers.
 
 A theory's `deps_loaded` checkpoint, its dependencies loaded into the
 toolchain's base state, is also kept once per host in
@@ -1114,6 +1115,56 @@ Removed legacy interfaces:
 - `goalfrag-plan`
 - `--goalfrag`
 - `--goalfrag-plan`
+
+### Pipelined builds
+
+A theory's children need its declarations, not its proofs. So when a local
+build with `-j` greater than 1 would otherwise leave a job slot idle, a cold
+theory builds *pipelined*:
+
+1. Its HOL process runs the script with each `Theorem ... Proof ... QED` proof
+   deferred, and exports the theory. That export is the theory's *outline*.
+2. The theory's cold children start at once, loading the outline in place of
+   the finished theory.
+3. Meanwhile the deferred proofs run on up to 4 threads (at most `-j`;
+   `HOLBUILD_PROOF_THREADS` overrides), each in the context its goal was
+   stated in. The theory's data is then written with their dependencies and
+   oracles.
+
+Once the theory has built, a *gate* checks that its outline matches the
+real export: the same digest, theorem numbering, and save and tag indices.
+A child built on the outline is committed only after every outline it loaded
+has passed its gate. A committed theory's outputs are those of a plain build
+on its real parents, and they go to the local and remote caches as a plain
+build's do. One difference: a proof that runs after the export can record
+other dependencies than it would in place (metis's search depends on a
+global variable counter), so a theory's data can differ from a plain build's
+in the dependencies of its theorems, though not in what its digest covers.
+Any failure costs only time. A deferred proof that fails, leaves
+an extra hypothesis, changes the theory, or writes theory data makes the
+theory build again with its proofs in place. "Changes the theory" means a
+theory change HOL reports (a new constant, type or saved theorem) or a write
+to theory data of a type holbuild knows; a proof that changes some other ML
+state that a later declaration reads isn't caught, since the declaration
+already ran with the state as it was. A failed gate drops everything
+that loaded the outline. Either way the theory's input key is remembered
+in `.holbuild/plan/outline-skip`, and that input is never pipelined again.
+
+Proofs that use `cheat` or `suspend`, and theorems the script `Resume`s,
+run in place. A theory is not pipelined if it saves checkpoints and is a
+requested target or the build passes `--all-checkpoints`, if it declares
+extra outputs, or under `--trace-steps`, `--repl-on-failure`, a tracing
+kernel or an execution plan.
+
+A pipelined theory saves no checkpoints, not even `deps_loaded`, so the first
+rebuild after editing it reloads its ancestors. Remote-exec workers never
+pipeline. `HOLBUILD_PIPELINE=off` turns pipelining off. Tools that read
+theorems' dependency lists (holyhammer's exports, say) and need a plain
+build's should rebuild with `HOLBUILD_PIPELINE=off holbuild build
+--force=full --no-cache`: a pipelined theory's data has the same input key
+as a plain build's, so it is reused from the local build and the caches.
+`HOLBUILD_CACHE_TRACE=1` prints a `pipeline:` line for each step and a
+summary of failures.
 
 ## Caches and cleanup
 

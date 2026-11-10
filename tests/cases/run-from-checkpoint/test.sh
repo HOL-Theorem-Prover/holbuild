@@ -28,6 +28,9 @@ run_from() {
 tmpdir=$(make_temp_dir)
 cleanup() { cleanup_temp_dir "$tmpdir"; }
 trap cleanup EXIT
+# These runs start from the deps_loaded checkpoints of a plain build; a
+# pipelined theory saves none.
+export HOLBUILD_PIPELINE=off
 use_case_cache "$tmpdir/cache"
 
 # A dependency package with a theory, and a .sig/.sml pair sharing one name.
