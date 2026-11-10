@@ -452,6 +452,12 @@ fun peak_rss_report_line path =
    the file `ready` (HolbuildDeferred.publish_outline). *)
 fun stage_outline_dir stage = Path.concat(stage, "holbuild-outline")
 
+(* The file a pipelined theory child in STAGE writes once it has rewritten
+   its theory data with its deferred proofs' dependencies
+   (HolbuildDeferred.finalize).  Until then the stage holds the outline's
+   data, which no commit may take. *)
+fun stage_finalized_marker stage = Path.concat(stage_outline_dir stage, "finalized")
+
 (* Why the pipelined theory child in STAGE published no outline, if it
    withheld it (an oracle in scope). *)
 fun withheld_outline stage =
@@ -487,7 +493,9 @@ fun write_theory_exporter {sig_path, path, parents_report, mldeps_report, pipeli
          ["val _ = HolbuildDeferred.publish_outline {sig_path = " ^ HolbuildToolchain.sml_string sig_path ^
           ", outline_dir = " ^ HolbuildToolchain.sml_string (stage_outline_dir (Path.dir path)) ^ "};",
           "val _ = HolbuildDeferred.prove_all " ^ Int.toString (!pipeline_proof_threads) ^ ";",
-          "val _ = HolbuildDeferred.finalize " ^ HolbuildToolchain.sml_string sig_path ^ ";"]
+          "val _ = HolbuildDeferred.finalize " ^ HolbuildToolchain.sml_string sig_path ^ ";",
+          "val _ = HolbuildRuntime.write_text " ^
+            HolbuildToolchain.sml_string (stage_finalized_marker (Path.dir path)) ^ " \"\";"]
        else
          ["val _ = HolbuildRuntime.normalize_theory_export " ^ HolbuildToolchain.sml_string sig_path ^ ";",
           module_producer]) @
@@ -6013,6 +6021,11 @@ fun build_speculative options tc project base_context plan keys toolchain_key ru
             run_theory_action_checkpoints (fn () => ()) (SOME log_dir) false policy tc root checkpoint_root base_context
               action deferred (action_checkpoints policy checkpoint_root action deferred))
       handle e => (remove_tree (stage_root_at root key); raise e)
+    val _ =
+      if path_exists (stage_finalized_marker stage) then ()
+      else
+        (remove_tree (stage_root_at root key);
+         raise Error (logical_name node ^ ": the pipelined build ended before its deferred proofs were finalized"))
   in
     {stage_root = stage_root_at root key, stage = stage, log_dir = log_dir,
      generated_metadata = generated_metadata}

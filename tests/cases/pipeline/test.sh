@@ -331,6 +331,30 @@ log=$tmpdir/timeout.log
 require_grep "pipeline: attempt failed: ATheory" "$log"
 require_grep "holbuild tactic timeout after" "$log"
 
+# Deferred proofs whose theorems depend on each other's stubs, here through
+# a reference the script sets after the theorem, have no order a build in
+# place could run them in: A's finalize fails, and A builds again with its
+# proofs in place, where the reference still holds TRUTH.
+new_project cycle
+cat > "$tmpdir/cycle/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+val r = ref TRUTH;
+Theorem a_thm:
+  T
+Proof
+  (fn g => ACCEPT_TAC (!r) g)
+QED
+val _ = r := a_thm;
+val _ = export_theory();
+SML
+write_b_and_c cycle
+build_pipelined cycle CTheory || { tail -n 60 "$tmpdir/cycle.log" >&2; exit 1; }
+log=$tmpdir/cycle.log
+require_grep "pipeline: attempt failed: ATheory" "$log"
+require_grep "deferred proofs depend on each other" "$log"
+require_same_as_unpipelined cycle CTheory A B C
+
 # A cheat in scope: B's proof uses A's cheated theorem, so it carries the
 # cheat once proved, which an outline can't predict.  B publishes no outline,
 # and C builds on the committed B.

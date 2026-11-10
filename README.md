@@ -1142,7 +1142,11 @@ global variable counter), so a theory's data can differ from a plain build's
 in the dependencies of its theorems, though not in what its digest covers.
 Any failure costs only time. A deferred proof that fails, leaves
 an extra hypothesis, changes the theory, or writes theory data makes the
-theory build again with its proofs in place. A failed gate drops everything
+theory build again with its proofs in place. "Changes the theory" means a
+theory change HOL reports (a new constant, type or saved theorem) or a write
+to theory data of a type holbuild knows; a proof that changes some other ML
+state that a later declaration reads isn't caught, since the declaration
+already ran with the state as it was. A failed gate drops everything
 that loaded the outline. Either way the theory's input key is remembered
 in `.holbuild/plan/outline-skip`, and that input is never pipelined again.
 

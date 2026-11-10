@@ -41,6 +41,11 @@ struct
       val stub = Thm.add_tag (Tag.set_dep dep empty_tag,
                               Thm.mk_oracle_thm (oracle_prefix ^ Int.toString k) goal)
     in
+      (* Each goal number names one theorem's proof; a second stub for it
+         would share the first one's markers. *)
+      if List.exists (fn {k = queued, ...} : item => queued = k) (!queue) then
+        raise Fail ("deferred goal " ^ Int.toString k ^ " (" ^ name ^ ") queued twice")
+      else ();
       queue := {k = k, name = name, ctxt = ctxt, goal = goal, make = make, setup = setup} :: !queue;
       Tactic.ACCEPT_TAC stub goal ctxt
     end
