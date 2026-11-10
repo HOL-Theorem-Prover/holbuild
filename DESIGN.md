@@ -1090,6 +1090,18 @@ but local metadata/cache records the timeout a successful build satisfied; a suc
 60s may satisfy a later 180s request, while a success under 180s does not satisfy a later
 60s request.
 
+A step that exceeds its timeout runs once more, at once and in the same process, with
+half the timeout. Each timed call computes its result from the proof state it was given
+and commits it to the proof history only on success, so the first attempt leaves the
+proof history unchanged; side effects the tactic itself made before it was stopped (a
+reference, a memo table) remain. If the second
+attempt finishes, the step passes and the theory's build log gets one line,
+`holbuild tactic timeout retry passed: <step> (budget <s>s; retry <ms> ms wall; GC during
+first attempt <ms> ms)`. If it times out too, the step fails as a timeout, reported with
+the full timeout. The intent is that a step that stalled once (on a loaded host, say)
+passes, while one that needs about the timeout of real work still fails. A step that Poly/ML interrupts before
+the timeout is not run again.
+
 A timeout is not a tactic failure: inside `TRY`, an `ORELSE`/`FIRST` alternative or a
 structural repeat body it fails the build at that step instead of taking the combinator's
 failure branch. It records no try, choice or repeat event for that body. The failed-prefix

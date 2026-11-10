@@ -87,6 +87,11 @@ revision, so roll back by deploying a forward patch release that restores the
 older coordinator code and keeps `0012`, or use the current image to run
 `alembic downgrade 0011` before starting an older image.
 
+Migration `0013` adds the index `actions_batch_unfinished` over each batch's
+unfinished actions, which the check after every completion reads; it changes
+no table. Roll back the same way: a forward patch release that keeps `0013`,
+or `alembic downgrade 0012` with the current image.
+
 For a rollback that preserves the schema, deploy a reviewed forward patch
 release restoring fail-fast dispatch while retaining migrations `0010` and
 `0011` and terminal-state aggregation for already-running keep-going batches.
@@ -585,7 +590,9 @@ Every request carries `Authorization: Bearer <token>`: the client token for
 `/v1/batches…` and `/v1/queue`, the worker token for `/v1/work…`. A wrong or missing token
 gets 401. Errors are JSON `{"detail": "<message>"}`. Any route answers 503
 `{"detail": "database busy"}`, with `Retry-After`, when no database connection
-came free within `REMOTE_EXEC_DATABASE_POOL_TIMEOUT_S`.
+came free within `REMOTE_EXEC_DATABASE_POOL_TIMEOUT_S` (3 s). Keep it under the
+workers' 15 s wait for a heartbeat or completion answer: past that a worker
+retries, and a request still queued for a connection would be done twice.
 
 ### Client
 
@@ -710,9 +717,9 @@ A worker that can't reach the coordinator or gets a 5xx, as while the
 coordinator restarts, retries a `complete` until the action's lease would run
 out.
 
-Migration `0013` adds `batches.priority`, with default 0. Before rolling back
+Migration `0014` adds `batches.priority`, with default 0. Before rolling back
 to a coordinator image predating it, stop the coordinator and use the new image
-to run `alembic downgrade 0012`, then start the older image. This removes only
+to run `alembic downgrade 0013`, then start the older image. This removes only
 scheduling metadata; action inputs, outputs and leases are unchanged.
 
 `GET /v1/queue` includes `ready_priority` and `running_priority`: subsets of
@@ -749,7 +756,10 @@ phase and last operation error; it omits provider operation tokens. A successful
 heartbeat clears a transient error even while a member is serving or waiting
 for its drain interval.
 
-Clients refresh membership every 30 seconds when the deployment sets
+The coordinator reuses the serving slots it read for
+`REMOTE_EXEC_CACHE_MEMBERS_TTL_SECONDS` (2 s), since workers ask about as often
+as they claim, and answers with the slots it last read while the database can't
+answer. Clients refresh membership every 30 seconds when the deployment sets
 `HOLBUILD_REMOTE_CACHE_DISCOVERY_URL`. Set `HOLBUILD_REMOTE_CACHE_ALLOWED_URLS`
 to the comma-separated identities allowed to receive the cache credential,
 including the permanent pair and every reserved temporary identity. Discovery

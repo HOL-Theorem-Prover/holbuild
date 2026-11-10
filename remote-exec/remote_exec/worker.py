@@ -66,6 +66,9 @@ def check_sandbox(executable: str, version: str) -> None:
 # essential one, so the task stops with it, and the worker clears protection when an action ends or loses its lease.
 PROTECTION_MINUTES = 180
 CLAIM_RETRY_SECONDS = 5  # least time between two claims that found nothing
+# Longest wait for a heartbeat or completion answer: above the coordinator's database pool timeout plus the work, so
+# a request it accepted is answered rather than given up on and repeated.
+REQUEST_TIMEOUT_S = 15.0
 CHECKPOINT_PUBLISH_SECONDS = 15
 DRAIN_CHECKPOINT_PUBLISH_SECONDS = 8
 # What exec-action runs with besides holbuild's own HOLBUILD_* settings: what curl, git and the locale read, and where
@@ -239,7 +242,7 @@ class Coordinator:
         return response
 
     def heartbeat(self, token: str) -> bool:
-        status, body = self.post_reporting(f"/v1/work/{token}/heartbeat", {}, timeout=5)
+        status, body = self.post_reporting(f"/v1/work/{token}/heartbeat", {}, timeout=REQUEST_TIMEOUT_S)
         if status not in (200, 409):
             raise RuntimeError(f"heartbeat answered {status}: {body}")
         return status == 200
@@ -256,7 +259,7 @@ class Coordinator:
             try:
                 status, body = self.post(
                     f"/v1/work/{token}/complete", record.encode(), "text/plain",
-                    min(5.0, max(0.1, effective - time.monotonic())),
+                    min(REQUEST_TIMEOUT_S, max(0.1, effective - time.monotonic())),
                 )
             except COORDINATOR_ERRORS as error:
                 status, body = None, error
