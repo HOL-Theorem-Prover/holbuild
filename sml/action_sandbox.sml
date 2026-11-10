@@ -180,7 +180,7 @@ fun wrap completed ({writable, readable = extra, toolchain} : grants) argv =
     val protected_paths =
       map (fn part => OS.Path.concat (cache, part))
           ["actions", "blobs", "locks", "cooperate", "checkpoint-store", "toolchain-trust", "git",
-           "hol-toolchains/.locks", "action.lock", "proof-records"] @
+           "hol-toolchains/.locks", "action.lock"] @
       List.mapPartial
         (fn entry =>
             case String.fields (fn c => c = #"=") entry of
