@@ -13,6 +13,7 @@ from test_cache_pool import Provider
 from remote_exec import membership as membership_module
 from remote_exec.auth import cache_discovery_token
 from remote_exec.cache_pool import CachePool, CacheSlot
+from remote_exec.coordinator import Settings
 from remote_exec.membership import Membership, check_plain_http, parse_members, resolves
 from remote_exec.worker import Coordinator, refresh_cache_members
 
@@ -135,6 +136,12 @@ async def test_members_endpoint_auth_and_no_credentials_before_or_after_ready(ht
     assert len(response.text.splitlines()) == 3
     slots = await http.get('/v1/cache/slots', headers={'Authorization': f'Bearer {CLIENT_TOKEN}'})
     assert slots.json() == [{'slot': 'c', 'url': 'https://cache-c.example', 'owner': 'instance', 'phase': 'drain', 'error': None}]
+
+
+@pytest.mark.parametrize('ttl', ['30', 'nan', 'inf', '-1'])
+def test_members_ttl_must_end_within_the_drain(ttl: str) -> None:
+    with pytest.raises(ValueError):
+        Settings(database_url='unused', client_token='c', worker_token='w', cache_members_ttl_seconds=ttl)
 
 
 async def test_members_endpoint_reuses_a_recent_read_and_survives_a_database_failure(http, coordinator) -> None:

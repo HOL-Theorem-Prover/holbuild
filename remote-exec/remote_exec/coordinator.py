@@ -98,7 +98,7 @@ class Settings(BaseSettings):
     database_pool_timeout_s: float = 3.0
     # /v1/cache/members reuses the serving slots it read for this long: workers ask about as often as they claim.
     # Clients keep the list REFRESH_SECONDS more, which together stay under cache_drain_seconds.
-    cache_members_ttl_seconds: float = 2.0
+    cache_members_ttl_seconds: float = Field(default=2.0, ge=0, allow_inf_nan=False)
     # Burst workers: workers that a scaler starts and stops on top of `warm_workers` always-on ones.
     run_slots: int = Field(default=30, ge=0)
     run_floor: int = Field(default=0, ge=0)
@@ -127,6 +127,16 @@ class Settings(BaseSettings):
                 raise ValueError("http:// cache slots need a cache URL without credentials")
             if len({part.scheme for part in parts}) > 1:
                 raise ValueError("cache slots and the cache URL must not mix http:// and https://")
+        return self
+
+    @model_validator(mode="after")
+    def members_kept_under_drain(self) -> Self:
+        """A slot's drain must outlast every list that still names it: the coordinator's and then a client's."""
+        if self.cache_members_ttl_seconds + REFRESH_SECONDS >= self.cache_drain_seconds:
+            raise ValueError(
+                f"cache_members_ttl_seconds plus the clients' {REFRESH_SECONDS} s refresh must stay under "
+                "cache_drain_seconds"
+            )
         return self
 
 class ScaleCommandError(RuntimeError):
