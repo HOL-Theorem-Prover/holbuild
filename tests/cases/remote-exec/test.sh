@@ -40,7 +40,7 @@ heap=()
 [[ ! -e "\${1%.batch}.heap" ]] || heap=(--max-heap "\$(cat "\${1%.batch}.heap")")
 share=
 [[ ! -e "$state/share-heaps" ]] || share=--share-heaps
-rm -f "$state/failed-batch"
+rm -f "$state/failed-batch" "$tmpdir/cache-control/ac-put-status"
 
 
 # A worker that trusts no HOL repository rejects every spec.
@@ -67,6 +67,7 @@ awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec the
     >> "$tmpdir/worker.log" 2>&1 || status=\$?
   echo "\$theory \$(grep '^status=' "$tmpdir/worker.result")" >> "$state/results"
   cp "$tmpdir/worker.result" "$state/result-\$key"
+  [[ ! -e "$state/memory-failure" ]] || sed -i 's/^failure=.*/failure=memory/' "$state/result-\$key"
   if [[ -e "$state/drop-log" ]] || { [[ -e "$state/drop-success-log" ]] && [[ \$status -eq 0 ]]; }; then
     rm -f "$remote_root/cas/\$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/worker.result")"
   fi
@@ -84,6 +85,8 @@ awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec the
     fi
   fi
 done
+# Until the next batch, the remote cache takes no entries.
+[[ ! -e "$state/refuse-ac-put" ]] || echo 503 > "$tmpdir/cache-control/ac-put-status"
 [[ ! -e "$state/failed-batch" ]]
 SH
 chmod +x "$tmpdir/run-batch"
@@ -820,15 +823,26 @@ refute_grep "Theory built" "$tmpdir/client-cutoff-output.log"
 [[ "$(< "$state/ran")" == $'rxk:ATheory\nrxk:BTheory\nrxk:CTheory' ]] ||
   { echo "workers ran:" >&2; cat "$state/ran" >&2; exit 1; }
 
-# Reused theories whose entries can't reach the remote cache, here because
-# the local cache lost them, go to the workers all the same.
+# A theory whose last build's entry the local cache lost has nothing for
+# early cutoff to reuse, so it doesn't wait.
 : > "$state/ran"
 for theory in B C; do
   rm -r "$HOLBUILD_CACHE/actions/$(sed -n 's/^input_key=//p' "$project/.holbuild/dep/rxk/src/${theory}Script.sml.key")"
 done
 write_cutoff four one "$a2"
+run client-cutoff-lost 0 build --remote-exec "$coordinator" CTheory
+refute_grep "deferred theories" "$tmpdir/client-cutoff-lost.log"
+require_grep "remote workers finished 3 of 3 theories" "$tmpdir/client-cutoff-lost.log"
+
+# Reused theories whose entries don't reach the remote cache go to the
+# workers all the same.
+: > "$state/ran"
+touch "$state/refuse-ac-put"
+write_cutoff five one "$a2"
 run client-cutoff-unpublished 0 build --remote-exec "$coordinator" CTheory
+rm "$state/refuse-ac-put" "$tmpdir/cache-control/ac-put-status"
 require_grep "early cutoff reused 2 of 2 deferred theories" "$tmpdir/client-cutoff-unpublished.log"
+require_grep "could not publish remote cache entry" "$tmpdir/client-cutoff-unpublished.log"
 [[ "$(< "$state/ran")" == $'rxk:ATheory\nrxk:BTheory\nrxk:CTheory' ]] ||
   { echo "workers ran:" >&2; cat "$state/ran" >&2; exit 1; }
 
@@ -901,6 +915,18 @@ run client-keep-going 1 build --remote-exec "$coordinator" QTheory ZTheory
 require_grep "early cutoff reused 0 of 2 deferred theories" "$tmpdir/client-keep-going.log"
 require_grep "proof failed on a remote worker while building XTheory" "$tmpdir/client-keep-going.log"
 require_grep "QTheory restored from cache" "$tmpdir/client-keep-going.log"
+refute_grep "QTheory is not in the remote cache" "$tmpdir/client-keep-going.log"
+[[ "$(sort "$state/ran")" == $'rxg:PTheory\nrxg:QTheory\nrxg:XTheory' ]] ||
+  { echo "workers ran:" >&2; cat "$state/ran" >&2; exit 1; }
+
+# So does a failure other than a proof's, after which --remote-only asks for
+# a local build.
+: > "$state/ran"
+touch "$state/memory-failure"
+write_keep_going "$a2"$'\nTheorem p3_thm: T\nProof\n  simp[]\nQED' F
+run client-keep-going-memory 75 build --remote-exec "$coordinator" --remote-only QTheory ZTheory
+rm "$state/memory-failure"
+require_grep "early cutoff reused 0 of 2 deferred theories" "$tmpdir/client-keep-going-memory.log"
 [[ "$(sort "$state/ran")" == $'rxg:PTheory\nrxg:QTheory\nrxg:XTheory' ]] ||
   { echo "workers ran:" >&2; cat "$state/ran" >&2; exit 1; }
 rm "$state/keep-going"

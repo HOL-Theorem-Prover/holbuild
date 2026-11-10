@@ -7838,10 +7838,19 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       List.exists (fn node => Binaryset.member (set, HolbuildBuildPlan.input_key_for keys node))
         (node :: HolbuildBuildPlan.transitive_project_deps plan node)
     val uncached_actions = List.filter (not o meets (key_set skip)) uncached_actions
+    (* Early cutoff aliases the entry of the theory's last build, so one
+       without a usable entry gains nothing from waiting. *)
     fun cutoff_candidate (node, _) =
       case early_cutoff_own_metadata (#allow_cache_timeout_discrepancy options)
              (checkpoint_policy_for_node options project node) project plan toolchain_key node of
-          SOME text => Option.isSome (metadata_value "deps_output_key" (metadata_lines text))
+          SOME text =>
+            let val lines = metadata_lines text
+            in
+              Option.isSome (metadata_value "deps_output_key" lines) andalso
+              (case metadata_value "input_key" lines of
+                   SOME old_key => local_entry_satisfies options project plan node old_key
+                 | NONE => false)
+            end
         | NONE => false
     (* Settling runs without force, so a forced theory must not wait for it. *)
     val candidates =

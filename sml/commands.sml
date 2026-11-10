@@ -1706,8 +1706,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                  end)
                         end
                 val errors = map diagnose failures
-                val _ = restore_finished_logs ()
                 val later_errors = later ()
+                val _ = restore_finished_logs ()
               in
                 HolbuildHolSharedCache.local_build_needed :=
                   (!needs_local orelse !HolbuildHolSharedCache.local_build_needed);
@@ -1815,23 +1815,27 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                       if final then
                         HolbuildBuildExec.restore_finished_build_logs build_options tc project plan toolchain_key logs
                       else ()
+                    (* With keep-going, the deferred theories that don't depend
+                       on a failed one still go to the workers, after which the
+                       restore below runs once, for both batches. *)
+                    val build_deferred = final andalso not fail_fast andalso not (null (!deferred))
                     (* Restore before a terminal failure. A resubmission must first
                        repair its inputs, without installing stale cached outputs. *)
-                    val _ = if final then restore_after_failures () else ()
+                    val _ = if final andalso not build_deferred then restore_after_failures () else ()
                     val _ = HolbuildHolSharedCache.local_build_needed := false
-                    (* With keep-going, the deferred theories that don't depend
-                       on a failed one still build. *)
-                    fun build_deferred () =
-                      if null (!deferred) orelse fail_fast then []
+                    fun deferred_errors () =
+                      if not build_deferred then []
                       else
                         (submit_deferred resubmit (skip @ map #input_key failures); [])
                         handle Thread.Interrupt => raise Thread.Interrupt
                              | e => [("theories deferred for early cutoff", e)]
                   in
-                    if proof_failure then proof_failed reason failures restore_finished_logs build_deferred
+                    if proof_failure then proof_failed reason failures restore_finished_logs deferred_errors
                     else
                       if final then
                         (List.app report_failed_log failures;
+                         (* What fails among them, the fallback meets again. *)
+                         ignore (deferred_errors ());
                          restore_finished_logs ();
                          fall_back reason)
                       else
