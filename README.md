@@ -1897,7 +1897,8 @@ theory in the batch depends on one, holbuild publishes its local cache entry
 there first; it goes in the batch only when it has no usable local entry or
 the publish fails. `--detach` follows no local build, so it checks and
 submits such theories like any other. What these checks and the source
-uploads find the remote cache to hold is kept in `.holbuild/remote-ledger/`,
+uploads find the remote cache to hold is kept in the cache root's
+`remote-ledger/`, shared by every project and worktree using that cache root,
 so a later build doesn't ask again.
 
 The build never waits on remote execution alone. If the closure can't run
