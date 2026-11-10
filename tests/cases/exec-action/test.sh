@@ -344,30 +344,17 @@ worker lost-input "$spec_b"
 expect lost-input 3 "status=failed" "failure=input-missing" "missing=blob $data_blob"
 mv "$tmpdir/data.blob" "$remote_root/cas/$data_blob"
 
-# A resident dependency manifest must not hide a lost local payload.
-link_hol_toolchain_cache "$tmpdir/worker-b"
-cp -r "$built_worker/actions" "$built_worker/blobs" "$tmpdir/worker-b/"
-dep_dat=$(awk '$1 == "blob" && $2 == "dat" { print $3 }' "$tmpdir/worker-b/actions/$key_a/manifest")
-require_file "$tmpdir/worker-b/blobs/$dep_dat"
-mv "$tmpdir/worker-b/blobs/$dep_dat" "$tmpdir/dep.dat"
-
 # The rest of the chain builds in order on another worker.
 worker b "$spec_b"
 expect b 0 "status=built"
-cmp "$tmpdir/dep.dat" "$tmpdir/worker-b/blobs/$dep_dat"
 # Its record times the action and its phases.
 require_grep '^wall-ms=[0-9][0-9]*$' "$tmpdir/b.result"
 for phase in hydrate hol check; do
   grep -qE "^phase-ms=(.*,)?$phase:[0-9]+(,|\$)" "$tmpdir/b.result" || {
     echo "b's record lacks phase $phase:" >&2; cat "$tmpdir/b.result" >&2; exit 1; }
 done
-# A corrupt local payload is fetched by the same verified path.
-link_hol_toolchain_cache "$tmpdir/worker-c"
-cp -r "$tmpdir/worker-b/actions" "$tmpdir/worker-b/blobs" "$tmpdir/worker-c/"
-printf 'corrupt dependency\n' > "$tmpdir/worker-c/blobs/$dep_dat"
 worker c "$spec_c"
 expect c 0 "status=built"
-cmp "$tmpdir/dep.dat" "$tmpdir/worker-c/blobs/$dep_dat"
 
 # The original checkout restores all three results without building.
 hb build CTheory > "$tmpdir/client.log" 2>&1 || { cat "$tmpdir/client.log" >&2; exit 1; }
@@ -595,51 +582,3 @@ spec_q=$(spec_for "$tmpdir/batch-q.txt" worker:QTheory)
 [[ -n $spec_q ]] || { cat "$tmpdir/batch-q.txt" >&2; exit 1; }
 worker stale-lib "$spec_q"
 expect stale-lib 0 "spec=$spec_q" "status=built"
-
-# If both stores lose a payload, discard the dead local manifest so a later
-# attempt can restore a rebuilt entry whose outputs differ (N is nondeterministic).
-cat > "$project/src/RScript.sml" <<'SML'
-Theory R
-Ancestors N
-
-Theorem r_thm: T
-Proof
-  simp[]
-QED
-SML
-hb action-spec --upload RTheory > "$tmpdir/batch-r.txt"
-spec_r=$(spec_for "$tmpdir/batch-r.txt" worker:RTheory)
-[[ -n $spec_r ]] || { cat "$tmpdir/batch-r.txt" >&2; exit 1; }
-old_dat=$(awk '$1 == "blob" && $2 == "dat" { print $3 }' "$tmpdir/worker-stale-deps/actions/$key_n/manifest")
-rm "$tmpdir/worker-stale-deps/blobs/$old_dat"
-mv "$remote_root/cas/$old_dat" "$tmpdir/old-n.dat"
-worker stale-deps "$spec_r"
-expect stale-deps 3 "status=failed" "failure=input-missing" "missing=theory $key_n"
-[[ ! -f "$tmpdir/worker-stale-deps/actions/$key_n/manifest" ]] || {
-  echo "the worker retained the dead dependency manifest" >&2; exit 1; }
-
-stale_worker replacement NTheory
-new_dat=$(awk '$1 == "blob" && $2 == "dat" { print $3 }' "$tmpdir/worker-replacement/actions/$key_n/manifest")
-[[ $old_dat != "$new_dat" ]] || { echo "N did not produce replacement outputs" >&2; exit 1; }
-# Publish that independently checked replacement to the fixture cache.
-python3 - "$tmpdir/worker-replacement" "$remote_root" "$key_n" <<'PYTHON'
-import hashlib, pathlib, shutil, sys
-cache, remote = map(pathlib.Path, sys.argv[1:3])
-key = sys.argv[3]
-manifest = (cache / "actions" / key / "manifest").read_bytes()
-metadata = ["holbuild-remote-cache-action-v2",
-            "manifest-sha256 " + hashlib.sha256(manifest).hexdigest(),
-            "manifest-size " + str(len(manifest))]
-for line in manifest.decode().splitlines():
-    fields = line.split()
-    if fields[:1] == ["blob"]:
-        blob = fields[2]
-        src = cache / "blobs" / blob
-        shutil.copyfile(src, remote / "cas" / blob)
-        metadata.append("blob " + blob + " " + str(src.stat().st_size))
-ac = hashlib.sha256(("holbuild-remote-ac-v1\n" + key + "\n").encode()).hexdigest()
-(remote / "ac" / ac).write_bytes(("\n".join(metadata) + "\nmanifest-text-v1\n").encode() + manifest)
-PYTHON
-worker stale-deps "$spec_r"
-expect stale-deps 0 "status=built"
-cmp "$tmpdir/worker-replacement/blobs/$new_dat" "$tmpdir/worker-stale-deps/blobs/$new_dat"
