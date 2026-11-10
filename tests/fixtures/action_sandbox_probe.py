@@ -370,7 +370,7 @@ def completion_probe(helper: Path) -> None:
                 received.extend(result[1])
                 return result
             socket.recv_fds = receive
-            finish = module["finish_children"]
+            finish = module["run"].__globals__["finish_children"]
             def pinned_cleanup(leader: int) -> int:
                 try:
                     if received:
