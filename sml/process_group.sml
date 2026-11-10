@@ -6,8 +6,10 @@ exception Error of string
 type child_process = (TextIO.instream, unit) Unix.proc
 (* owner: the thread that launched the child, so a scheduler can stop the
    children of one piece of work (kill_thread_children).  reaped: set, under
-   the registry lock, before the child is reaped; nothing signals it after,
-   since its pid may then belong to another process. *)
+   the registry lock, once the child is reaped; nothing signals it after,
+   since its pid may then belong to another process.  It is set after the
+   reap, not before, so a child that closed its output but runs on can
+   still be stopped while its owner waits for it. *)
 type active_child = {id : int, owner : Thread.thread, process : child_process, reaped : bool ref}
 
 val active_child_groups = ref ([] : active_child list)
@@ -208,7 +210,8 @@ fun run_shell_process mutation_lease inherit script consume =
         (fn () => with_inherited inherit
                     (fn () => launch_shell (Posix.ProcEnv.getpid ()) mutation_lease script))
     fun cleanup () = unregister_child_group id
-    fun reap () = (with_active_child_lock (fn () => reaped := true); Unix.reap process)
+    fun mark_reaped () = with_active_child_lock (fn () => reaped := true)
+    fun reap () = (Unix.reap process handle e => (mark_reaped (); raise e)) before mark_reaped ()
     fun abort () =
       (if with_active_child_lock (fn () => !reaped) then () else kill_process_forcefully process;
        ignore (reap ()) handle OS.SysErr _ => ();

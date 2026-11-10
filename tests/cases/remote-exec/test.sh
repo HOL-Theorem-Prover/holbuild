@@ -19,8 +19,6 @@ cleanup() {
   cleanup_temp_dir "$tmpdir"
 }
 trap cleanup EXIT
-# These builds publish to the remote cache; pipelined builds publish nothing.
-export HOLBUILD_PIPELINE=off
 
 remote_root=$tmpdir/remote
 start_remote_cache_server "$remote_root" "$tmpdir/server" "$tmpdir/cache-control"

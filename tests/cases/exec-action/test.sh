@@ -28,9 +28,6 @@ trap cleanup EXIT
 remote_root=$tmpdir/remote
 start_remote_cache_server "$remote_root" "$tmpdir/server"
 use_case_cache "$tmpdir/cache"
-# The remote must hold what these builds make, and a pipelined build
-# publishes nothing to it.
-export HOLBUILD_PIPELINE=off
 
 project=$tmpdir/project
 mkdir -p "$project/src"

@@ -202,12 +202,11 @@ Proof
 QED
 val _ = export_theory();
 SML
-# A pipelined build isn't published to the remote cache: a deferred proof
-# can record other dependencies than the plain build would.
+# A pipelined build publishes its committed theories to the remote cache as
+# a plain build does.
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
 HOLBUILD_REMOTE_CACHE_URL=$remote_url build_pipelined pass CTheory
 log=$tmpdir/pass.log
-require_no_grep "remote cache published" "$log"
 require_grep "pipeline: outline ready: ATheory" "$log"
 require_grep "pipeline: outline ready: BTheory" "$log"
 require_grep "pipeline: gate passed: ATheory" "$log"
@@ -218,15 +217,29 @@ if [[ -n "$(ls -A "$tmpdir/pass/.holbuild/outline")" ]]; then
   echo "outlines left behind in $tmpdir/pass/.holbuild/outline" >&2
   exit 1
 fi
+published=$(grep -c "remote cache published: " "$log" || true)
+if [[ "$published" -ne 3 ]]; then
+  echo "expected A, B and C published to the remote cache, saw $published:" >&2
+  cat "$log" >&2
+  exit 1
+fi
 require_same_as_unpipelined pass CTheory A B C
-# The same build with pipelining off, on an empty cache, is published.
-cp -r "$tmpdir/pass" "$tmpdir/pass-plain"
-rm -rf "$tmpdir/pass-plain/.holbuild"
-link_hol_toolchain_cache "$tmpdir/cache-plain"
-(cd "$tmpdir/pass-plain" && HOLBUILD_CACHE="$tmpdir/cache-plain" HOLBUILD_PIPELINE=off HOLBUILD_CACHE_TRACE=1 \
-  HOLBUILD_REMOTE_CACHE_URL=$remote_url "$HOLBUILD_BIN" -j4 build --skip-checkpoints --skip-proof-steps CTheory) \
-  > "$tmpdir/pass-plain.log" 2>&1
-require_grep "remote cache published" "$tmpdir/pass-plain.log"
+# A copy of the project with an empty local cache restores all three from the
+# remote cache, the pipelined build's outputs byte for byte.
+cp -r "$tmpdir/pass" "$tmpdir/pass-remote"
+rm -rf "$tmpdir/pass-remote/.holbuild"
+link_hol_toolchain_cache "$tmpdir/cache-remote"
+(cd "$tmpdir/pass-remote" && HOLBUILD_CACHE="$tmpdir/cache-remote" HOLBUILD_REMOTE_CACHE_URL=$remote_url \
+  "$HOLBUILD_BIN" -j4 build --skip-checkpoints --skip-proof-steps CTheory) > "$tmpdir/pass-remote.log" 2>&1 ||
+  { cat "$tmpdir/pass-remote.log" >&2; exit 1; }
+for theory in A B C; do
+  require_grep "${theory}Theory restored from cache" "$tmpdir/pass-remote.log"
+  for ext in dat sml sig; do
+    cmp "$tmpdir/pass/.holbuild/obj/src/${theory}Theory.$ext" \
+        "$tmpdir/pass-remote/.holbuild/obj/src/${theory}Theory.$ext"
+  done
+done
+require_no_grep "Theory built" "$tmpdir/pass-remote.log"
 (cd "$tmpdir/pass" && "$HOLBUILD_BIN" --verbose build --skip-checkpoints --skip-proof-steps CTheory) > "$tmpdir/pass-again.log"
 require_grep "CTheory is up to date" "$tmpdir/pass-again.log"
 
@@ -247,6 +260,18 @@ require_no_grep "attempt done: CTheory" "$log"
 require_no_grep "attempt failed" "$log"
 require_before "pipeline: committed: BTheory" "CTheory built" "$log"
 UNPIPELINED_FLAGS="" require_same_as_unpipelined steps CTheory A B C
+
+# With --all-checkpoints every theory saves checkpoints, so none is
+# pipelined.
+cp -r "$tmpdir/pass" "$tmpdir/checkpointed"
+rm -rf "$tmpdir/checkpointed/.holbuild"
+build_pipelined_steps checkpointed --all-checkpoints
+log=$tmpdir/checkpointed.log
+require_grep "CTheory built" "$log"
+require_no_grep "pipeline: dispatch pipelined" "$log"
+require_no_grep "pipeline: outline ready" "$log"
+require_no_grep "pipeline: attempt" "$log"
+require_grep "pipeline: summary: outlines=0 " "$log"
 
 # Each deferred proof runs in its goal's context, though the script changed
 # it later: a_use needs a_const_simp, which the script then removes from the

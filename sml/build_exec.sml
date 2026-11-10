@@ -2468,7 +2468,7 @@ fun publish_key cached_proofs input_key =
 fun lookup_keys cached_proofs input_key =
   if cached_proofs then [input_key, cached_proofs_key input_key] else [input_key]
 
-fun publish_theory_cache publish_remote subject input_key proof_timeout staged_sig published_sml
+fun publish_theory_cache subject input_key proof_timeout staged_sig published_sml
                          staged_dat staged_trace staged_extras {parents, mldeps} =
   let
     val root = cache_root ()
@@ -2480,7 +2480,7 @@ fun publish_theory_cache publish_remote subject input_key proof_timeout staged_s
     fun skip_locked_publish () = ()
   in
     (HolbuildCache.with_action_publish_lock root input_key publish skip_locked_publish;
-     if publish_remote andalso !publish_builds_remotely then publish_remote_cache_key_if_usable root input_key else ())
+     if !publish_builds_remotely then publish_remote_cache_key_if_usable root input_key else ())
     handle e => warn ("could not publish cache entry: " ^ General.exnMessage e)
   end
 
@@ -3074,7 +3074,7 @@ fun best_failed_prefix_checkpoint requested_timeout checkpoints =
 
 datatype force_level = ForceNone | ForceTargets | ForceProject | ForceAll
 
-type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, proof_steps : bool, new_ir : bool, proof_scope : HolbuildTacticTimeoutPolicy.proof_scope, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, cached_proofs : bool, trknl : bool, restore_only : bool, fail_fast : bool}
+type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, proof_steps : bool, new_ir : bool, proof_scope : HolbuildTacticTimeoutPolicy.proof_scope, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, cached_proofs : bool, trknl : bool, restore_only : bool, fail_fast : bool, all_checkpoints : bool}
 
 (* checkpoint: the theory saves checkpoints at all, its deps_loaded state
    included.  theorem_checkpoints: it also saves them per theorem and
@@ -3789,8 +3789,8 @@ fun merge_proof_records_file store new_path =
    caller. *)
 (* Puts a theory build's outputs, staged in STAGE, where the build plan
    wants them, and publishes them to the cache when CACHE_ALLOWED. *)
-fun install_theory_stage check_cancelled cache_allowed publish_remote policy {stage, logical, source_file, input_key, outputs,
-                                                staged_extra_outputs, generated_metadata, log_dir} =
+fun install_theory_stage check_cancelled cache_allowed policy {stage, logical, source_file, input_key, outputs,
+                                                              staged_extra_outputs, generated_metadata, log_dir} =
   let
     val {sig_path, sml_path, data_path} = outputs
     val staged_sig = staged_theory_file stage logical ".sig"
@@ -3817,7 +3817,7 @@ fun install_theory_stage check_cancelled cache_allowed publish_remote policy {st
     val _ =
       if cache_allowed then
         detail_time_phase "build.exec.publish_cache"
-          (fn () => publish_theory_cache publish_remote (cache_warning_subject logical source_file)
+          (fn () => publish_theory_cache (cache_warning_subject logical source_file)
                                       (publish_key (cached_proofs_enabled policy) input_key)
                                       (tactic_timeout policy)
                                       staged_sig sml_path staged_dat
@@ -4082,7 +4082,7 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
     val _ =
       if speculative then ()
       else
-        install_theory_stage check_cancelled cache_allowed true policy
+        install_theory_stage check_cancelled cache_allowed policy
           {stage = stage, logical = logical, source_file = source_file, input_key = input_key,
            outputs = {sig_path = sig_path, sml_path = sml_path, data_path = data_path},
            staged_extra_outputs = staged_extra_outputs,
@@ -5109,12 +5109,7 @@ fun commit_speculative dat_hash_cache (options : build_options) project plan key
     val current_log = current_log_dir root (package node) logical
     val {sig_path, sml_path, data_path, ...} = theory_outputs node
   in
-    (* Not published to the remote cache here: a deferred proof can record
-       other dependencies than the same proof run in place.  The local entry
-       can still reach it later by key (early cutoff's alias, a remote-exec
-       batch's dependency upload); its theorems and digest are a plain
-       build's. *)
-    install_theory_stage (fn () => ()) (#use_cache options andalso cache_enabled node) false policy
+    install_theory_stage (fn () => ()) (#use_cache options andalso cache_enabled node) policy
       {stage = stage, logical = logical, source_file = source_file node, input_key = input_key,
        outputs = {sig_path = sig_path, sml_path = sml_path, data_path = data_path},
        staged_extra_outputs = [], generated_metadata = generated_metadata, log_dir = current_log};
@@ -5635,7 +5630,7 @@ fun refresh_checkpoint_budget_after_node state project node protected_bases =
         handle e => warn_checkpoint_budget_error e)
 
 (* Pipelined builds (on unless HOLBUILD_PIPELINE=off), for cold theories
-   built without checkpoints or proof steps.  A theory's children need its
+   that save no checkpoints (--skip-checkpoints).  A theory's children need its
    declarations, not its proofs.  So a cold theory builds in one HOL
    process that defers its plain `Theorem ... Proof ... QED` proofs
    (deferred_source), exports, publishes that export as the theory's
@@ -5647,7 +5642,8 @@ fun refresh_checkpoint_budget_after_node state project node protected_bases =
    outline it loaded has built for real and passed the *gate* (the outline
    and the real export have the same digest, theorem numbering and theorem
    data), its outputs are those a build on the real parents makes, and its
-   *commit* installs them as that build would.  A failed attempt or gate
+   *commit* installs them, and publishes them to the local and remote
+   caches, as that build would.  A failed attempt or gate
    costs only time: the theory, or what loaded the outline, builds again
    without pipelining, and the theory's input key goes on a skip list.
 
@@ -6312,14 +6308,17 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
 
     (* A pipelined build saves no checkpoints and writes no proof trace,
        and runs proof steps only through the proof IR, so a theory that
-       needs more builds only from its committed parents. *)
+       needs more builds only from its committed parents.  Of the theories
+       that save checkpoints by default, only those the build doesn't
+       name as targets are pipelined, and none with --all-checkpoints. *)
     fun speculable id =
       let
         val node = Vector.sub (nodes, id)
         val policy = checkpoint_policy_for_node options project node
       in
         context_tactics andalso is_theory id andalso Array.sub (cold, id) <> SOME false andalso
-        not (theorem_checkpoints_enabled policy) andalso
+        (not (theorem_checkpoints_enabled policy) orelse
+         not (#all_checkpoints options orelse force_target_node (#force_targets options) node)) andalso
         (not (proof_steps_enabled policy) orelse proof_ir_enabled policy) andalso
         not (trace_steps policy) andalso not (Option.isSome (execution_plan policy)) andalso
         not (repl_on_failure policy) andalso not (trknl_enabled policy) andalso
@@ -7241,7 +7240,7 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
 (* After remote execution, force and tracing have already been fulfilled. *)
 fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets, skip_checkpoints, proof_steps,
                            new_ir, proof_scope, node_tactic_timeouts, execution_plan, repl_on_failure,
-                           emit_output_hashes, allow_cache_timeout_discrepancy, cached_proofs, trknl, fail_fast, ...} : build_options)
+                           emit_output_hashes, allow_cache_timeout_discrepancy, cached_proofs, trknl, fail_fast, all_checkpoints, ...} : build_options)
     : build_options =
   {use_cache = use_cache, verify_cache = verify_cache, force = ForceNone, force_targets = force_targets,
    skip_checkpoints = skip_checkpoints,
@@ -7250,7 +7249,8 @@ fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets
    trace_steps = false, repl_on_failure = repl_on_failure,
    emit_output_hashes = emit_output_hashes,
    allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy, cached_proofs = cached_proofs, trknl = trknl,
-   restore_only = restore_only, fail_fast = if restore_only then false else fail_fast}
+   restore_only = restore_only, fail_fast = if restore_only then false else fail_fast,
+   all_checkpoints = all_checkpoints}
 
 (* The plan's node whose action has input key `input_key`. *)
 fun node_with_input_key (options : build_options) tc project plan toolchain_key input_key =
