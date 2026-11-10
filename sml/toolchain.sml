@@ -29,8 +29,23 @@ fun hol_subcommand_argv tc subcommand =
 
 (* Holmake deliberately confines Poly/ML to one GC thread while playing theory
    scripts.  Keep that build policy separate from interactive run/repl use. *)
-fun theory_run_argv tc =
-  hol tc :: "--gcthreads=1" :: poly_runtime_args tc @ ["run"]
+fun theory_run_argv tc initial_heap =
+  hol tc :: "--gcthreads=1" ::
+  (case initial_heap of NONE => [] | SOME mb => ["-H", Int.toString mb]) @
+  poly_runtime_args tc @ ["run"]
+
+(* Loading a theory's ancestors builds about 1 MB of live heap per ancestor.
+   Poly/ML starts at 8 MB and reaches that size only through many small
+   collections, so a child that loads its ancestors starts with an initial heap
+   (Poly's -H, which leaves the heap free to shrink later) of that size, at most
+   a quarter of the heap cap.  Small loads keep Poly's default. *)
+fun load_initial_heap ({maxheap, ...} : t) ancestors =
+  let
+    val cap = case maxheap of SOME n => n div 4 | NONE => 2048
+    val mb = Int.min (ancestors, cap)
+  in
+    if mb < 64 then NONE else SOME mb
+  end
 
 fun quote s =
   "'" ^ String.translate (fn #"'" => "'\\''" | c => str c) s ^ "'"

@@ -242,6 +242,7 @@ type theory_action =
    script_dir : string,
    inputs : {path : string, from : string} list,
    loads : theory_load list,
+   ancestors : int,
    outputs : {sig_path : string, sml_path : string, data_path : string},
    extra_outputs : string list}
 
@@ -1816,7 +1817,7 @@ fun plain_file_name name =
   name <> "" andalso name <> "." andalso name <> ".." andalso
   CharVector.all (fn c => Char.isAlphaNum c orelse c = #"." orelse c = #"_" orelse c = #"-") name
 
-fun run_hol_files_to_log tc stage workdir context files log_name current_log error_message =
+fun run_hol_files_to_log tc initial_heap stage workdir context files log_name current_log error_message =
   let
     val log = Path.concat(stage, log_name)
     val file_args = map (hol_run_file_arg workdir) files
@@ -1829,7 +1830,7 @@ fun run_hol_files_to_log tc stage workdir context files log_name current_log err
         | NONE => []
     val status =
       HolbuildToolchain.run_in_dir_to_file workdir
-        (tool_cache_env @ HolbuildToolchain.theory_run_argv tc @ ["--noconfig"] @
+        (tool_cache_env @ HolbuildToolchain.theory_run_argv tc initial_heap @ ["--noconfig"] @
          hol_context_args context @ file_args)
         log
       handle HolbuildToolchain.Error msg =>
@@ -3508,6 +3509,8 @@ fun theory_action root plan keys toolchain_key deps_key node : theory_action =
      script_dir = stage_script_dir,
      inputs = source_inputs @ manifest_inputs,
      loads = preload_loads root plan node,
+     ancestors = length (HolbuildBuildPlan.transitive_project_deps plan node) +
+                 length (HolbuildBuildPlan.closure_external_theories plan node),
      outputs = {sig_path = root_relative root sig_path,
                 sml_path = root_relative root sml_path,
                 data_path = root_relative root data_path},
@@ -3898,7 +3901,11 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
        validate_hol_context (#context run_spec);
        detail_time_phase "build.exec.node.child_run"
          (fn () =>
-             run_hol_files_to_log tc stage stage
+             run_hol_files_to_log tc
+               (if #context run_spec = base_context
+                then HolbuildToolchain.load_initial_heap tc (#ancestors action)
+                else NONE)
+               stage stage
                (#context run_spec)
                (child_policy :: (#files run_spec @ [theory_exporter]))
                "holbuild-build.log"
@@ -5771,7 +5778,7 @@ fun speculative_action root plan keys toolchain_key view key node : theory_actio
      package = #package action, logical = #logical action, relative_path = #relative_path action,
      source_file = #source_file action, source_name = #source_name action,
      script_dir = #script_dir action, inputs = #inputs action, loads = map load (#loads action),
-     outputs = #outputs action, extra_outputs = #extra_outputs action}
+     ancestors = #ancestors action, outputs = #outputs action, extra_outputs = #extra_outputs action}
   end
 
 fun speculative_policy (CheckpointPolicy {proof_steps, new_ir, tactic_timeout, ...}) =
@@ -8711,6 +8718,7 @@ fun spec_theory_action root (spec : action_spec) deps_key : theory_action =
      script_dir = script_dir,
      inputs = map (fn {path, ...} => {path = path, from = in_root root (action_source_path package path)}) (#inputs spec),
      loads = #loads spec,
+     ancestors = length (#deps spec),
      outputs = #outputs spec,
      extra_outputs = #extra_outputs spec}
   end
