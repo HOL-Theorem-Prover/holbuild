@@ -1834,8 +1834,11 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     else
                       if final then
                         (List.app report_failed_log failures;
-                         (* What fails among them, the fallback meets again. *)
-                         ignore (deferred_errors ());
+                         (* A --remote-only fallback builds nothing, so their
+                            failures are reported here. *)
+                         List.app (fn (_, e) => HolbuildStatus.message_stderr
+                                     ("holbuild: remote execution: " ^ HolbuildBuildExec.build_error_message e ^ "\n"))
+                           (deferred_errors ());
                          restore_finished_logs ();
                          fall_back reason)
                       else

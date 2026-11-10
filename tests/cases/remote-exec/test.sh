@@ -67,7 +67,8 @@ awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec the
     >> "$tmpdir/worker.log" 2>&1 || status=\$?
   echo "\$theory \$(grep '^status=' "$tmpdir/worker.result")" >> "$state/results"
   cp "$tmpdir/worker.result" "$state/result-\$key"
-  [[ ! -e "$state/memory-failure" ]] || sed -i 's/^failure=.*/failure=memory/' "$state/result-\$key"
+  [[ "\$(cat "$state/memory-failure" 2>/dev/null)" != "\$theory" ]] ||
+    sed -i 's/^failure=.*/failure=memory/' "$state/result-\$key"
   if [[ -e "$state/drop-log" ]] || { [[ -e "$state/drop-success-log" ]] && [[ \$status -eq 0 ]]; }; then
     rm -f "$remote_root/cas/\$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/worker.result")"
   fi
@@ -896,10 +897,11 @@ name = "rxg"
 members = ["src"]
 TOML
 # write_keep_going P-EXTRA X-STATEMENT
+# Q's proof fails once P has p3_thm, which leaves Q's own source unchanged.
 write_keep_going() {
   printf 'Theory P\nAncestors bool\n\nTheorem p_thm:\n  T\nProof\n  simp[]\nQED\n%s\n' "$1" \
     > "$project/src/PScript.sml"
-  printf 'Theory Q\nAncestors P\n\nTheorem q_thm:\n  T\nProof\n  simp[]\nQED\n' \
+  printf 'Theory Q\nAncestors P\n\nTheorem q_thm:\n  T\nProof\n  if can (DB.fetch "P") "p3_thm" then NO_TAC else simp[]\nQED\n' \
     > "$project/src/QScript.sml"
   printf 'Theory X\nAncestors bool\n\nTheorem x_thm:\n  %s\nProof\n  simp[]\nQED\n' "$2" \
     > "$project/src/XScript.sml"
@@ -920,13 +922,14 @@ refute_grep "QTheory is not in the remote cache" "$tmpdir/client-keep-going.log"
   { echo "workers ran:" >&2; cat "$state/ran" >&2; exit 1; }
 
 # So does a failure other than a proof's, after which --remote-only asks for
-# a local build.
+# a local build and still reports the deferred theories' failures.
 : > "$state/ran"
-touch "$state/memory-failure"
+echo rxg:XTheory > "$state/memory-failure"
 write_keep_going "$a2"$'\nTheorem p3_thm: T\nProof\n  simp[]\nQED' F
 run client-keep-going-memory 75 build --remote-exec "$coordinator" --remote-only QTheory ZTheory
 rm "$state/memory-failure"
 require_grep "early cutoff reused 0 of 2 deferred theories" "$tmpdir/client-keep-going-memory.log"
+require_grep "proof failed on a remote worker while building QTheory" "$tmpdir/client-keep-going-memory.log"
 [[ "$(sort "$state/ran")" == $'rxg:PTheory\nrxg:QTheory\nrxg:XTheory' ]] ||
   { echo "workers ran:" >&2; cat "$state/ran" >&2; exit 1; }
 rm "$state/keep-going"
