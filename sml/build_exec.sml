@@ -9317,10 +9317,13 @@ fun worker_cache_roots cache =
      tree (HolbuildCache.actions_dir cache), tree (HolbuildCache.blobs_dir cache)]
   end
 
-(* Small caps and zero reserves scan live. Larger caps reuse a shared scan;
-   stale estimates get a bounded grace starting when work resumes, under
-   gc.lock. Post-result read-only refreshes use a separate single-flight lock
-   so actions need not wait for the directory walk. *)
+(* Evict least recently used families until the cache leaves reserve_bytes of
+   room under limit_bytes. Reuse a recent shared scan within the target;
+   private checkpoints and modules are always measured locally. Small caps
+   and zero reserves scan live.  With refresh, as after an action's result,
+   scan only when the stamp is past half its life and no other process holds
+   gc.lock, so that busy hosts keep the stamp fresh and actions seldom wait
+   on a scan. *)
 fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes, refresh} =
   let
     fun private_bytes () =
@@ -9330,9 +9333,6 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
     fun sum sizes = List.foldl (op +) (0 : Position.int) sizes
     val target = limit_bytes - reserve_bytes
     val state_path = Path.concat(HolbuildCache.locks_dir cache, "worker-cache-cap.state")
-    val grace_path = Path.concat(HolbuildCache.locks_dir cache, "worker-cache-cap.grace")
-    val scan_path = Path.concat(HolbuildCache.locks_dir cache, "worker-cache-cap-scan.lock")
-    fun state_text () = read_text state_path handle IO.Io _ => "" | OS.SysErr _ => ""
     fun parse_sizes [] = SOME []
       | parse_sizes (id :: bytes :: rest) =
           (case (IntInf.fromString bytes, parse_sizes rest) of
@@ -9340,7 +9340,6 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
              | _ => NONE)
       | parse_sizes _ = NONE
     val stamp_life = 60000000000 : LargeInt.int
-    val grace_life = 300000000000 : LargeInt.int
     fun stamp_age () =
       case String.tokens Char.isSpace (read_text state_path) of
           "holbuild-worker-cache-cap-v2" :: measured :: _ =>
@@ -9348,54 +9347,26 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
         | _ => NONE
       handle IO.Io _ => NONE
            | OS.SysErr _ => NONE
-    fun fitting_scan max_age private_bytes =
-      if target < gb_to_bytes 64 orelse reserve_bytes <= 0 then NONE else
-      let val text = state_text ()
-      in
-        case String.tokens Char.isSpace text of
+    fun recent_scan_fits private_bytes =
+      target >= gb_to_bytes 64 andalso reserve_bytes > 0 andalso
+      (case String.tokens Char.isSpace (read_text state_path) of
            "holbuild-worker-cache-cap-v2" :: measured :: entries =>
              (case (LargeInt.fromString measured, parse_sizes entries) of
                   (SOME measured, SOME entries) =>
                     let val age = Time.toNanoseconds (Time.now ()) - measured
                     in
-                      if measured > 0 andalso age >= 0 andalso
-                      (case max_age of NONE => true | SOME limit => age < limit) andalso
-                      length entries = length roots andalso
+                      age >= 0 andalso age < stamp_life andalso length entries = length roots andalso
                       sum (ListPair.map
                              (* A private root can differ while its siblings
                                 are shared. Keep their hits without stamp churn. *)
                              (fn (({id = identify, measure}), (id, bytes)) =>
                                  if identify () = id then bytes else measure ())
                              (roots, entries)) + private_bytes () <= target
-                      then SOME {text = text, age = age} else NONE
                     end
-                | _ => NONE)
-         | _ => NONE
-      end
-      handle IO.Io _ => NONE
-           | OS.SysErr _ => NONE
-    fun recent_scan_fits private_bytes =
-      Option.isSome (fitting_scan (SOME stamp_life) private_bytes)
-    (* Called only under gc.lock. Bind the grace to the exact measurement:
-       an old client can replace v2 state without knowing about this file. *)
-    fun deferred_scan_fits () =
-      case fitting_scan NONE private_bytes of
-          NONE => false
-        | SOME {text, age} =>
-            if age < stamp_life then true else
-            let
-              val now = Time.toNanoseconds (Time.now ())
-              val grace = read_text grace_path handle IO.Io _ => "" | OS.SysErr _ => ""
-              fun start () = (write_text grace_path (LargeInt.toString now ^ "\n" ^ text); true)
-            in
-              case String.fields (fn c => c = #"\n") grace of
-                  started :: saved =>
-                    if String.concatWith "\n" saved <> text then start () else
-                    (case LargeInt.fromString started of
-                         SOME started => started > 0 andalso now >= started andalso now - started < grace_life
-                       | NONE => false)
-                | [] => start ()
-            end
+                | _ => false)
+         | _ => false)
+      handle IO.Io _ => false
+           | OS.SysErr _ => false
     fun by_age families = sort_by_mtime_ascending (fn ({mtime, ...} : cache_family) => mtime) families
     fun sweep total remaining =
       if total <= target then total
@@ -9411,18 +9382,17 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
               end
     fun measure_shared () =
       let
+        val measured = Time.toNanoseconds (Time.now ())
         val ids = root_ids ()
-        val sizes = map (fn {measure, ...} => measure ()) roots
       in
-        {measured = Time.toNanoseconds (Time.now ()), ids = ids, sizes = sizes}
+        {measured = measured, ids = ids, sizes = map (fn {measure, ...} => measure ()) roots}
       end
     fun publish {measured, ids, sizes} =
       if ids <> root_ids () then remove_file state_path
-      else (write_text state_path
+      else write_text state_path
         ("holbuild-worker-cache-cap-v2\n" ^ LargeInt.toString measured ^ "\n" ^
          String.concat (ListPair.map (fn (id, bytes) => id ^ " " ^ IntInf.toString bytes ^ "\n")
-                                    (ids, sizes)));
-            remove_file grace_path)
+                                    (ids, sizes)))
     fun scan reuse =
       let val private_size = private_bytes ()
       in
@@ -9458,45 +9428,29 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
     (* gc.lock is also shared by explicit cache gc. The action-root
        lock lives outside locks/ and can be container-private. *)
     val lock_path = HolbuildCache.gc_lock_path cache
-    fun locked lock work =
-      (work () before HolbuildFileLock.release lock)
+    fun locked lock reuse =
+      (scan reuse before HolbuildFileLock.release lock)
       handle e => (HolbuildFileLock.release lock; raise e)
-    fun with_gc work =
+  in
+    if refresh then
+      let
+        val fresh =
+          case stamp_age () of SOME age => age >= 0 andalso age < stamp_life div 2 | NONE => false
+      in
+        (* Only caps that reuse a stamp gain from refreshing it. *)
+        if fresh orelse target < gb_to_bytes 64 orelse reserve_bytes <= 0 then ()
+        else
+          Option.app (fn lock => locked lock false)
+            (HolbuildFileLock.try_acquire_path {path = lock_path, obsolete_kind = SOME "cache gc"})
+      end
+    else if recent_scan_fits private_bytes then ()
+    else
       let
         val _ = HolbuildFileLock.remove_obsolete_lock_dir "cache gc" lock_path
         val lock = HolbuildFileLock.acquire_exclusive_path_wait {path = lock_path}
-      in locked lock work end
-    fun fresh () =
-      case stamp_age () of SOME age => age >= 0 andalso age < stamp_life div 2 | NONE => false
-    fun refresh_scan () =
-      if fresh () then NONE else
-      let
-        val original = state_text ()
-        val shared = measure_shared ()
       in
-        if sum (#sizes shared) + private_bytes () > target then SOME original
-        else
-          (Option.app
-             (fn lock => locked lock (fn () => if state_text () = original then publish shared else ()))
-             (HolbuildFileLock.try_acquire_path {path = lock_path, obsolete_kind = SOME "cache gc"});
-           NONE)
+        locked lock true
       end
-  in
-    if refresh then
-      if fresh () orelse target < gb_to_bytes 64 orelse reserve_bytes <= 0 then ()
-      else
-        (case HolbuildFileLock.try_acquire_path {path = scan_path, obsolete_kind = NONE} of
-             NONE => ()
-           | SOME lock =>
-               case locked lock refresh_scan of
-                   NONE => ()
-                 | SOME original => with_gc (fn () =>
-                     (* The unlocked walk saw an over-cap cache. Do not let
-                        its original under-cap estimate satisfy this sweep. *)
-                     (if state_text () = original then remove_file state_path else ();
-                      scan true)))
-    else if recent_scan_fits private_bytes then ()
-    else with_gc (fn () => if deferred_scan_fits () then () else scan true)
   end
   handle e => warn ("worker cache sweep failed: " ^ General.exnMessage e)
 
