@@ -1051,10 +1051,9 @@ opts out of theorem instrumentation: with checkpoints still enabled, the build c
 still save and consult `deps_loaded`, but there are no
 theorem-context/failed-prefix proof-navigation checkpoints and no
 tactic timeout enforcement for that build.
-Theorem, declaration and failed-prefix checkpoints are saved only in the
-requested targets (with none given, the default targets, or every root-package
-theory when there are none); every theory keeps `deps_loaded` and proof steps.
-`--all-checkpoints` saves them in every root-package theory.
+Theorem, declaration and failed-prefix checkpoints are saved in every theory
+included by the proof scope (root-package theories by default).
+`--all-checkpoints` is a compatibility alias for this default.
 `holbuild run --from THEORY` and `repl --from THEORY` start interactive sessions
 from THEORY's `deps_loaded` while it is current, and load THEORY on top when its
 metadata matches its current input key. `run` takes no project lock, so `--from`

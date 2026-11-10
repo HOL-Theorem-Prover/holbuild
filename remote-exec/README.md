@@ -144,13 +144,23 @@ pool, say) empty first and scale in.
 
 On `SIGTERM`, a worker stops claiming and gives its running action up to
 `--drain-seconds` (20 by default) to finish and report its result. At the
-deadline it stops the action's process group and reports `unavailable`, so
+deadline it stops HOL and reports `unavailable`, so
 the coordinator retries immediately without counting the interrupted attempt.
 Waiting for work or preparing a release stops immediately. Repeated `SIGTERM`
 does not extend the deadline; interactive Ctrl-C retains its usual behavior.
-Leave at least 10 seconds between the drain window and the container's stop
-timeout for process cleanup and result reporting. For example, a 120-second
-container stop timeout allows `--drain-seconds 95`. An unreachable coordinator
+With `--share-heaps`, the driver gets up to 8 additional seconds after the
+natural-finish drain window to publish completed checkpoints. Lease loss gives
+it up to 15 seconds, also bounded by the drain deadline plus 8 seconds if a
+drain starts meanwhile. Only the driver receives the initial termination signal:
+it stops HOL, waits for sandbox cleanup and output validation, and publishes
+committed checkpoints. Repeated signals do not interrupt publication. The worker
+then terminates the remaining process group, escalating to SIGKILL after 2 seconds.
+Interrupted actions never report `built`; a lost lease reports no result.
+Without `--share-heaps`, the worker stops the process group immediately.
+Leave at least 20 seconds between the drain window and the container's stop
+timeout when sharing heaps (10 otherwise), for publication, process cleanup,
+result reporting and release of task protection. For example, a 120-second
+container stop timeout allows `--drain-seconds 100` with shared heaps. An unreachable coordinator
 can still prevent reporting before the container is forcibly killed; its lease
 then expires normally. ECS protection is best effort, and a rejection in an
 HTTP-success response is logged along with transport failures.
@@ -281,7 +291,10 @@ operator environment overrides use their runtime defaults. Cancellation kills th
 tails may be lost. Mediated signals identify the supervisor as their sender.
 
 `--share-heaps` publishes heaps by dependency context and checkpoints by script
-prefix in the remote cache; use it only with a single tenant or trusted cache
+prefix in the remote cache. Dependency heaps are shared even for older action
+specs that disable theorem checkpoints; `skip-checkpoints` disables both. Only
+completed saves with valid metadata are published, including after interruption.
+Use shared heaps only with a single tenant or trusted cache
 submitters. It does not provide tenant authorization for shared cache entries.
 
 The supervisor confirms cleanup and output validation through a completion

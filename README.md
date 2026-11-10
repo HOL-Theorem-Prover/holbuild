@@ -1020,7 +1020,6 @@ holbuild build --trace-steps MyTheory
 holbuild build --repl-on-failure MyTheory
 holbuild build --skip-proof-steps MyTheory
 holbuild build --skip-checkpoints MyTheory
-holbuild build --all-checkpoints MyTheory
 ```
 
 - `execution-plan THEORY:NAME` prints the proof-step plan for one theorem or
@@ -1055,17 +1054,11 @@ holbuild build --all-checkpoints MyTheory
   remote execution, the log limit uses the worker's environment.
 - `--skip-proof-steps` opts out of proof-step execution.
 - `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation.
-- `--all-checkpoints` saves theorem checkpoints in every theory included by
-  `--proof-scope` (root-package theories by default) that
-  the build runs. By default only the requested targets save them (the default
-  targets when none are given, or every root-package theory when there are
-  none); the other theories still save their `deps_loaded` checkpoint and run
-  with proof steps and step timeouts, so a cold build writes far fewer `.save`
-  files. An edit to such a theory starts from its `deps_loaded` checkpoint, and
-  rebuilding it as a target (after an edit, or with `--force=theory`) saves its
-  theorem checkpoints. `--repl-on-failure` saves them everywhere. Theory outputs and
-  cache keys are the same either way. Under `--remote-exec`, the action specs
-  carry the choice to the workers.
+- Theorem, declaration and failed-prefix checkpoints are saved in every theory
+  included by `--proof-scope` (root-package theories by default).
+  `--all-checkpoints` remains an accepted no-op alias. Checkpoint policy does
+  not change theory outputs or cache keys. Remote action specs carry this
+  policy to the workers.
 
 A theory's `deps_loaded` checkpoint, its dependencies loaded into the
 toolchain's base state, is also kept once per host in

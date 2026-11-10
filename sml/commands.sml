@@ -99,8 +99,8 @@ fun build_help () = print
   \  --no-stat-cache\n\
   \  --skip-checkpoints\n\
   \  --all-checkpoints\n\
-  \      Save theorem checkpoints in every root-package theory, not only in\n\
-  \      the requested targets.\n\
+  \      Compatibility alias: all root-package theories save checkpoints by\n\
+  \      default.\n\
   \  --skip-proof-steps\n\
   \  --proof-scope root|all (default: root)\n\
   \  --tactic-timeout SECONDS\n\
@@ -439,7 +439,7 @@ fun split_flags args =
       extract_flag "--emit-output-hashes" args
     val (allow_cache_timeout_discrepancy, args_without_allow_discrepancy) =
       extract_flag "--allow-cache-timeout-discrepancy" args_without_emit_output_hashes
-    val (all_checkpoints, args_without_all_checkpoints) =
+    val (_, args_without_all_checkpoints) =
       extract_flag "--all-checkpoints" args_without_allow_discrepancy
     val (fail_fast, args_without_fail_fast) = extract_flag "--fail-fast" args_without_all_checkpoints
     val (cached_proofs, build_args) = extract_flag "--cached-proofs" args_without_fail_fast
@@ -449,7 +449,7 @@ fun split_flags args =
                   verify_cache = verify_cache,
                   no_stat_cache = no_stat_cache,
                   skip_checkpoints = skip_checkpoints,
-                  all_checkpoints = all_checkpoints, fail_fast = fail_fast,
+                  fail_fast = fail_fast,
                   proof_steps = proof_steps, new_ir = new_ir, proof_scope = proof_scope,
                   tactic_timeout = tactic_timeout,
                   tactic_timeout_set = tactic_timeout_set,
@@ -541,7 +541,7 @@ fun split_flags args =
 fun plain_build_request targets =
   ({dry_run = false, watch = false, force = HolbuildBuildExec.ForceNone,
     use_cache = true, verify_cache = true, no_stat_cache = false,
-    skip_checkpoints = true, all_checkpoints = false, fail_fast = false, proof_steps = false, new_ir = false,
+    skip_checkpoints = true, fail_fast = false, proof_steps = false, new_ir = false,
     proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,
     tactic_timeout = NONE, tactic_timeout_set = false, execution_plan = NONE,
     trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
@@ -556,7 +556,7 @@ fun plain_build_request targets =
 fun heap_build_request targets =
   ({dry_run = false, watch = false, force = HolbuildBuildExec.ForceNone,
     use_cache = true, verify_cache = true, no_stat_cache = false,
-    skip_checkpoints = false, all_checkpoints = false, fail_fast = false, proof_steps = false, new_ir = false,
+    skip_checkpoints = false, fail_fast = false, proof_steps = false, new_ir = false,
     proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,
     tactic_timeout = NONE, tactic_timeout_set = false, execution_plan = NONE,
     trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
@@ -1130,7 +1130,7 @@ datatype build_mode =
                   outputs_dir : string, profile : string option}
   | RemoteExec of {url : string, remote_only : bool, detach : bool, attach : string option}
 
-fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, all_checkpoints, fail_fast, proof_steps, new_ir, proof_scope, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy, cached_proofs}, targets) =
+fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, fail_fast, proof_steps, new_ir, proof_scope, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy, cached_proofs}, targets) =
   let
     val project =
       case prepared of
@@ -1192,17 +1192,13 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       case #build_tactic_timeout project of
           NONE => SOME 2.5
         | SOME timeout => timeout
-    (* The theories that save theorem checkpoints: the requested targets,
-       or with --all-checkpoints every root-package theory. *)
-    fun checkpoint_targets targets = if all_checkpoints then NONE else SOME targets
-    fun build_options_for index entry_plan plan force_targets checkpoint_targets =
+    fun build_options_for index entry_plan plan force_targets =
       {use_cache = use_cache,
        verify_cache = verify_cache,
        force = force,
        force_targets = force_targets,
        fail_fast = fail_fast,
        skip_checkpoints = skip_checkpoints,
-       checkpoint_targets = checkpoint_targets,
        proof_steps = proof_steps,
        new_ir = new_ir,
        proof_scope = proof_scope,
@@ -1273,10 +1269,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
     fun action_toolchain_key toolchain_key = HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)
     fun with_options (planned as {index, targets, entry_plan, plan, ...}) =
       (planned,
-       build_options_for index entry_plan plan targets
-         (* No targets and no default targets plans the root package. *)
-         (checkpoint_targets
-            (if null targets then HolbuildSourceIndex.root_package_targets index project else targets)))
+       build_options_for index entry_plan plan targets)
     (* The input keys of a plan, which the plan keeps for execution.  Only
        for plans whose theories that write SML sources are up to date: until
        those run, an extra input naming such a source may not exist. *)
@@ -1440,7 +1433,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             (fn () => HolbuildBuildExec.build options tc project plan toolchain_key jobs)
         val ({index, entry_plan, plan, toolchain_key, components, ...}, options) = plan_build ()
         fun build_owners owner_plan =
-          execute (build_options_for index entry_plan owner_plan [] (#checkpoint_targets options), owner_plan, toolchain_key)
+          execute (build_options_for index entry_plan owner_plan [], owner_plan, toolchain_key)
         fun replan () =
           if Option.isSome prepared orelse watch
           then with_options (prepare_plan (prepare_source_index "build" resolution project))
@@ -1664,8 +1657,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     | entry_targets => SOME (HolbuildBuildPlan.plan_targets components (#holdir tc) index entry_targets)
               in
                 timed_phase "build.execute"
-                  (fn () => HolbuildBuildExec.build (build_options_for index entry_plan theory_plan targets
-                                                       (#checkpoint_targets build_options))
+                  (fn () => HolbuildBuildExec.build (build_options_for index entry_plan theory_plan targets)
                               tc project theory_plan toolchain_key jobs)
               end
             (* Diagnose every final failure. A missing proof log retains the
@@ -1850,7 +1842,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           end
         fun build_owners owner_plan =
           remote_build_plan
-            (build_options_for index entry_plan owner_plan [] (#checkpoint_targets build_options),
+            (build_options_for index entry_plan owner_plan [],
              owner_plan, toolchain_key)
             NONE
         fun replan () =
@@ -2268,7 +2260,6 @@ fun default_build_options trknl project index entry_plan plan =
      force = HolbuildBuildExec.ForceNone,
      force_targets = [],
      skip_checkpoints = false,
-     checkpoint_targets = NONE,
      proof_steps = true,
      new_ir = true,
      proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,
@@ -2321,7 +2312,6 @@ fun heap_build_options trknl =
    force = HolbuildBuildExec.ForceNone,
    force_targets = [],
    skip_checkpoints = false,
-   checkpoint_targets = NONE,
    proof_steps = false,
    new_ir = false,
    proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,

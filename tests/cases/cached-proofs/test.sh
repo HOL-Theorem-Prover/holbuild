@@ -203,6 +203,8 @@ require_not_reused ATheory t1
 write_a $'Theorem extra:\n  (3:num) = 3\nProof\n  simp[]\nQED'
 build "$tmpdir/timeout.log" --cached-proofs --tactic-timeout 1
 require_not_reused ATheory t1
+# Change the prefix so the dependency's checkpoint cannot skip t1 entirely.
+write_a $'Theorem extra:\n  (4:num) = 4\nProof\n  simp[]\nQED'
 build "$tmpdir/timeout-relaxed.log" --cached-proofs --tactic-timeout 1 --force
 require_reused ATheory t1
 

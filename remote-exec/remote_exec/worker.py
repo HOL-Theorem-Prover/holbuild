@@ -66,6 +66,8 @@ def check_sandbox(executable: str, version: str) -> None:
 # essential one, so the task stops with it, and the worker clears protection when an action ends or loses its lease.
 PROTECTION_MINUTES = 180
 CLAIM_RETRY_SECONDS = 5  # least time between two claims that found nothing
+CHECKPOINT_PUBLISH_SECONDS = 15
+DRAIN_CHECKPOINT_PUBLISH_SECONDS = 8
 # What exec-action runs with besides holbuild's own HOLBUILD_* settings: what curl, git and the locale read, and where
 # HOL's libraries find external solvers (the action sandbox passes the same SOLVER_ENV on to HOL). The rest of the
 # worker's environment, its coordinator token above all, stays out of the builds' environment.
@@ -110,6 +112,7 @@ class Drain:
         self.wake = threading.Event()
         self.deadline: float | None = None
         self.interrupt = False
+        self.publish_seconds = 0.0
 
     def request(self, *_: object) -> None:
         if self.deadline is not None:
@@ -247,7 +250,9 @@ class Coordinator:
         deadline = time.monotonic() + retry_s
         delays = itertools.chain(COMPLETE_RETRY_DELAYS, itertools.repeat(COMPLETE_RETRY_DELAYS[-1]))
         while True:
-            effective = deadline if self.drain.deadline is None else min(deadline, self.drain.deadline + 7)
+            effective = deadline if self.drain.deadline is None else min(
+                deadline, self.drain.deadline + self.drain.publish_seconds + 7
+            )
             try:
                 status, body = self.post(
                     f"/v1/work/{token}/complete", record.encode(), "text/plain",
@@ -262,7 +267,9 @@ class Coordinator:
                 return
             failure = f"complete failed: {body}" if status is None else f"complete answered {status}: {body}"
             delay = next(delays)
-            effective = deadline if self.drain.deadline is None else min(deadline, self.drain.deadline + 7)
+            effective = deadline if self.drain.deadline is None else min(
+                deadline, self.drain.deadline + self.drain.publish_seconds + 7
+            )
             if (status is not None and status < 500) or time.monotonic() + delay > effective:
                 raise RuntimeError(failure)
             print(f"{failure}; retrying in {delay:g} s", file=sys.stderr)
@@ -773,7 +780,9 @@ class Lease:
             self.done.set()
             with phases.timed("lease"):
                 deadline = self.coordinator.drain.deadline
-                self.thread.join(timeout=None if deadline is None else max(0.0, deadline + 7 - time.monotonic()))
+                self.thread.join(timeout=None if deadline is None else max(
+                    0.0, deadline + self.coordinator.drain.publish_seconds + 7 - time.monotonic()
+                ))
                 self.protection.set(enabled=False, timeout=30 if deadline is None else 2)
 
     def _beat(self) -> None:
@@ -852,6 +861,7 @@ def execute(
     """The result record of the claimed action, or None once its lease is lost."""
     spec = claim["spec_sha256"]
     drain = releases.drain
+    drain.publish_seconds = 0.0
     if drain.stop.is_set():
         return failed_record(spec, "unavailable")
     try:
@@ -896,6 +906,24 @@ def execute(
                     spans.step(now - stepped, hol=hol)
                     stepped = now
         finally:
+            if args.share_heaps and process.poll() is None:
+                drain.publish_seconds = DRAIN_CHECKPOINT_PUBLISH_SECONDS
+                # Signal only the driver: it stops HOL, then publishes the
+                # sandbox-validated saves. Killing its group here loses them.
+                with contextlib.suppress(ProcessLookupError):
+                    process.send_signal(signal.SIGTERM)
+                deadline = time.monotonic() + CHECKPOINT_PUBLISH_SECONDS
+                while process.poll() is None:
+                    effective = deadline if drain.deadline is None else min(
+                        deadline, drain.deadline + drain.publish_seconds
+                    )
+                    remaining = effective - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        process.wait(timeout=min(0.1, remaining))
+                    except subprocess.TimeoutExpired:
+                        pass
             stop_group(process)
             if cooperate_dir is None:
                 phases.add("exec", time.monotonic() - stepped)
