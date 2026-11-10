@@ -243,6 +243,25 @@ async def test_a_ranking_read_while_a_release_drops_rankings_is_not_shared(
     assert coordinator.rankings == {}
 
 
+async def test_a_claim_ranks_for_itself_when_the_shared_ranking_read_fails(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+    rank = coordinator._rank
+
+    async def failing_once(conn: Any, key: tuple[str, ...]) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("pool")
+        return await rank(conn, key)
+
+    monkeypatch.setattr(coordinator, "_rank", failing_once)
+    await submit(http, ["a"])
+    await claim_named(http, "a")
+    assert calls == 2
+
+
 async def test_claims_take_the_deepest_then_the_widest_action_of_a_batch_first(
     http: httpx.AsyncClient, remote_exec_engine: Any
 ) -> None:

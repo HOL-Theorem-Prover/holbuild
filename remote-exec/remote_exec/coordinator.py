@@ -10,6 +10,7 @@ import graphlib
 import heapq
 import json
 import logging
+import math
 import os
 import shlex
 import time
@@ -767,7 +768,12 @@ class Coordinator:
         # Waited for before taking a connection: claims waiting on a ranking while holding one could leave none
         # for the ranking's read.
         started = asyncio.get_running_loop().time()
-        ranking = await self._current_ranking(tuple(tiers))
+        try:
+            ranking = await self._current_ranking(tuple(tiers))
+        except Exception:
+            # The shared read failed (say the pool timed out): this claim ranks for itself, as if it had found the
+            # ranking used up, rather than every claim that waited for the read failing with it.
+            ranking = _Ranking(-math.inf, self.rankings_forgotten, [], set(), set())
         async with self.engine.begin() as conn:
             # A batch's running count and last claim are read without locking its row, so concurrent claims see
             # only each other's committed leases, which at worst lets workers waking together pick the same
