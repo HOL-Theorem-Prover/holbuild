@@ -524,6 +524,7 @@ class Coordinator:
         self.claim_waiters: list[tuple[list[str], ClaimRank, asyncio.Future[str]]] = []
         self.rankings: dict[tuple[str, ...], _Ranking] = {}  # the build claims' shared rankings, by tiers
         self.ranking_reads: dict[tuple[str, ...], asyncio.Task[_Ranking]] = {}
+        self.rankings_reading: defaultdict[tuple[str, ...], int] = defaultdict(int)  # _rank calls under way, by tiers
         self.rankings_forgotten = 0  # how many times _forget_rankings dropped one, so reads begun before keep none
         # When each cache entry was last found, the checks of the cache under way, and how many times
         # input-missing results forgot both; see _in_cache.
@@ -914,7 +915,13 @@ class Coordinator:
         at = asyncio.get_running_loop().time()
         forgotten = self.rankings_forgotten
         params = {"tiers": list(key), "classes": ["build"], "run_slots": self.settings.run_slots}
-        rows = (await conn.execute(CLAIM_CANDIDATES, params)).all()
+        self.rankings_reading[key] += 1
+        try:
+            rows = (await conn.execute(CLAIM_CANDIDATES, params)).all()
+        finally:
+            self.rankings_reading[key] -= 1
+            if not self.rankings_reading[key]:
+                del self.rankings_reading[key]
         heap = [
             (
                 key.index(row.tier), -row.priority, row.running, row.last_claimed_at is not None,
@@ -933,12 +940,14 @@ class Coordinator:
 
     def _forget_rankings(self, batch_id: UUID, tiers: set[str]) -> None:
         """Drop the rankings that would pass over actions of ``tiers`` made ready in ``batch_id``: those that didn't
-        have it with a ready action of one of them, or have since found it without one. Rankings being read when
-        there was none to drop, or one was dropped, are neither joined by later claims nor kept; see _keep_ranking."""
-        keys = {key for key in [*self.rankings, *self.ranking_reads] if tiers.intersection(key)}
+        have it with a ready action of one of them, or have since found it without one. Rankings being read then,
+        shared or by one claim, may predate those actions, so they are neither joined by later claims nor kept; see
+        _keep_ranking."""
+        keys = {key for key in [*self.rankings, *self.ranking_reads, *self.rankings_reading] if tiers.intersection(key)}
         stale = {
             key for key in keys
-            if (ranking := self.rankings.get(key)) is None or not all(
+            if key in self.ranking_reads or key in self.rankings_reading
+            or (ranking := self.rankings.get(key)) is None or not all(
                 (batch_id, tier) in ranking.ranked and (batch_id, tier) not in ranking.exhausted
                 for tier in tiers if tier in key
             )

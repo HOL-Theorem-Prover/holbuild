@@ -277,6 +277,46 @@ async def test_a_claim_after_a_release_does_not_join_a_ranking_read_begun_before
     assert calls == 2
 
 
+async def test_a_claims_own_ranking_read_while_a_release_makes_a_priority_batch_ready_is_not_shared(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ranking a claim reads for itself, here after the shared read failed, may predate the actions a release
+    made ready meanwhile even with no ranking kept to drop, so later claims don't share it and claim the priority
+    batch."""
+    coordinator.settings.claim_ranking_seconds = 3600
+    entered, go = asyncio.Event(), asyncio.Event()
+    calls = 0
+    rank = coordinator._rank
+
+    async def failing_then_held(conn: Any, key: tuple[str, ...]) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("pool")
+        if calls > 2:
+            return await rank(conn, key)
+
+        class Slow:
+            """The connection, but a statement's result arrives only once go is set, after its snapshot."""
+
+            async def execute(self, *args: Any) -> Any:
+                result = await conn.execute(*args)
+                entered.set()
+                await go.wait()
+                return result
+
+        return await rank(Slow(), key)
+
+    await submit(http, ["n1", "n2"])
+    monkeypatch.setattr(coordinator, "_rank", failing_then_held)
+    early = asyncio.create_task(claim(http))
+    await entered.wait()
+    await submit(http, ["p1"], priority="1")
+    go.set()
+    assert (await early)["theory"] == "pkg:n1"
+    await claim_named(http, "p1")
+
+
 async def test_a_claim_ranks_for_itself_when_the_shared_ranking_read_fails(
     http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
