@@ -164,6 +164,85 @@ async def test_a_new_batch_goes_ahead_of_a_wide_one_holding_workers(http: httpx.
     await claim_named(http, "w4")
 
 
+async def test_build_claims_share_one_ranking_and_still_spread_over_batches(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claims within claim_ranking_seconds of a ranking take turns over its batches, as fresh rankings would
+    have them, without ranking again; once every batch it ranked is out of ready actions, a claim ranks again, and
+    finds the actions made ready since."""
+    coordinator.settings.claim_ranking_seconds = 3600
+    rankings = 0
+    rank = coordinator._rank
+
+    async def counted(conn: Any, key: tuple[str, ...]) -> Any:
+        nonlocal rankings
+        rankings += 1
+        return await rank(conn, key)
+
+    monkeypatch.setattr(coordinator, "_rank", counted)
+    await submit(http, ["a1", "a2", "a3"])
+    await submit(http, ["b1", "b2"])
+    claimed = [(await claim(http))["theory"] for _ in range(5)]
+    assert claimed == ["pkg:a1", "pkg:b1", "pkg:a2", "pkg:b2", "pkg:a3"]
+    assert rankings == 1
+    assert await claim(http) is None
+    assert rankings == 2
+
+    # A batch that wasn't ranked drops the ranking as soon as it has a ready action.
+    await submit(http, ["c1"])
+    assert (await claim(http))["theory"] == "pkg:c1"
+    assert rankings == 3
+
+
+async def test_a_priority_batch_submitted_while_a_ranking_is_shared_is_claimed_next(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Making a batch the shared ranking lacks ready drops the ranking at once, so a priority batch submitted while
+    claims share one goes first on the next claim, not once the ranking expires."""
+    coordinator.settings.claim_ranking_seconds = 3600
+    rankings = 0
+    rank = coordinator._rank
+
+    async def counted(conn: Any, key: tuple[str, ...]) -> Any:
+        nonlocal rankings
+        rankings += 1
+        return await rank(conn, key)
+
+    monkeypatch.setattr(coordinator, "_rank", counted)
+    await submit(http, ["n1", "n2", "n3"])
+    await claim_named(http, "n1")
+    await submit(http, ["p1", "p2"], priority="1")
+    await claim_named(http, "p1")
+    await claim_named(http, "p2")
+    await claim_named(http, "n2")
+    assert rankings == 2
+
+
+async def test_a_ranking_read_while_a_release_drops_rankings_is_not_shared(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ranking whose read overlapped a release that made an unranked batch ready may predate that batch's
+    actions, so the claims waiting for it use it once and later claims read again."""
+    coordinator.settings.claim_ranking_seconds = 3600
+    entered, go = asyncio.Event(), asyncio.Event()
+    rank = coordinator._rank
+
+    async def held(conn: Any, key: tuple[str, ...]) -> Any:
+        ranking = await rank(conn, key)
+        entered.set()
+        await go.wait()
+        return ranking
+
+    await submit(http, ["a1", "a2"])
+    monkeypatch.setattr(coordinator, "_rank", held)
+    claiming = asyncio.create_task(claim(http))
+    await entered.wait()
+    await submit(http, ["b1"])
+    go.set()
+    assert (await claiming) is not None
+    assert coordinator.rankings == {}
+
+
 async def test_claims_take_the_deepest_then_the_widest_action_of_a_batch_first(
     http: httpx.AsyncClient, remote_exec_engine: Any
 ) -> None:
