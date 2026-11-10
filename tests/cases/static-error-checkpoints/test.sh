@@ -47,7 +47,7 @@ QED
 SML
 }
 
-for resume in context failed-prefix deps; do
+for resume in context failed-prefix deps deps-only; do
   rm -rf "$project/.holbuild/checkpoints"
   if [[ "$resume" == failed-prefix ]]; then
     write_source 'ACCEPT_TAC TRUTH' 'FAIL_TAC "seed failed prefix"' seed
@@ -64,12 +64,19 @@ for resume in context failed-prefix deps; do
   context=$(find "$project/.holbuild/checkpoints" -name first_context.save -print -quit)
   require_file "$deps"
   require_file "$context"
+  if [[ "$resume" == deps-only ]]; then
+    # Only the dependency context is left, as when no proof of the theory
+    # has run from this context yet.
+    find "$project/.holbuild/checkpoints" -type f ! -name 'deps_loaded.save*' -delete
+  fi
   cp "$deps" "$tmpdir/deps.save"
   cp "$deps.ok" "$tmpdir/deps.save.ok"
-  cp "$context" "$tmpdir/context.save"
-  cp "$context.ok" "$tmpdir/context.save.ok"
+  if [[ "$resume" != deps-only ]]; then
+    cp "$context" "$tmpdir/context.save"
+    cp "$context.ok" "$tmpdir/context.save.ok"
+  fi
   for typo in missing_lemma_one missing_lemma_two; do
-    if [[ "$resume" == deps ]]; then
+    if [[ "$resume" == deps* ]]; then
       write_source "ACCEPT_TAC $typo" 'ACCEPT_TAC first' broken
     else
       write_source 'ACCEPT_TAC TRUTH' "ACCEPT_TAC $typo" broken
@@ -85,10 +92,16 @@ for resume in context failed-prefix deps; do
       echo "source static error discarded a checkpoint" >&2
       exit 1
     fi
+    if [[ $(grep -c '^resuming ATheory' "$log") -gt 1 ]]; then
+      echo "source static error was retried from an earlier context" >&2
+      exit 1
+    fi
     cmp "$tmpdir/deps.save" "$deps"
     cmp "$tmpdir/deps.save.ok" "$deps.ok"
-    cmp "$tmpdir/context.save" "$context"
-    cmp "$tmpdir/context.save.ok" "$context.ok"
+    if [[ "$resume" != deps-only ]]; then
+      cmp "$tmpdir/context.save" "$context"
+      cmp "$tmpdir/context.save.ok" "$context.ok"
+    fi
   done
   write_source 'ACCEPT_TAC TRUTH' 'ACCEPT_TAC first' corrected
   log=$tmpdir/$resume-corrected.log
