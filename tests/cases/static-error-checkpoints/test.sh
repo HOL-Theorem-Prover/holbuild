@@ -92,8 +92,14 @@ for resume in context failed-prefix deps deps-only; do
       echo "source static error discarded a checkpoint" >&2
       exit 1
     fi
-    if [[ $(grep -c '^resuming ATheory' "$log") -gt 1 ]]; then
-      echo "source static error was retried from an earlier context" >&2
+    case "$resume" in
+      context) resumed_from='theorem-context checkpoint after first' ;;
+      failed-prefix) resumed_from='failed-prefix checkpoint in second' ;;
+      deps*) resumed_from='deps-loaded checkpoint' ;;
+    esac
+    require_grep "from: $resumed_from" "$log"
+    if [[ $(grep -c '^resuming ATheory' "$log") -ne 1 ]]; then
+      echo "source static error was not reported from exactly one resume" >&2
       exit 1
     fi
     cmp "$tmpdir/deps.save" "$deps"
