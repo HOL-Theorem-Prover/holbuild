@@ -2599,29 +2599,29 @@ fun checked_cache_entry allow_timeout_discrepancy {root, input_key, subject, exp
 (* Installs a checked cache entry's outputs at the given paths, its extra
    outputs where `extra_destination` puts each declaration, and its load
    manifests with `write_manifests`. *)
-fun install_cache_entry verify_cache root input_key subject
+fun install_cache_entry copy root input_key subject
                         {blobs = {sig_hash, sml_hash, dat_hash, trace_hash, extra_hashes, parents, mldeps},
                          proof_timeout}
                         {outputs = {sig_path, sml_path, data_path}, extra_destination, write_manifests} =
   let
     val trace_path = drop_suffix ".dat" data_path ^ ".tr.gz"
   in
-    copy_blob verify_cache root dat_hash data_path;
+    copy dat_hash data_path;
     link_or_copy {src = data_path, dst = hfs_remapped_path data_path};
-    copy_blob verify_cache root sig_hash sig_path;
+    copy sig_hash sig_path;
     link_or_copy {src = sig_path, dst = hfs_remapped_path sig_path};
-    copy_blob verify_cache root sml_hash sml_path;
+    copy sml_hash sml_path;
     write_text sml_path (replace_all cache_sml_token data_path (read_text sml_path));
     link_or_copy {src = sml_path, dst = hfs_remapped_path sml_path};
     (case trace_hash of
          NONE => ()
        | SOME hash =>
-           (copy_blob verify_cache root hash trace_path;
+           (copy hash trace_path;
             link_or_copy {src = trace_path, dst = hfs_remapped_path trace_path}));
     List.app
       (fn (declaration, hash) =>
           let val destination = extra_destination declaration
-          in ensure_parent destination; copy_blob verify_cache root hash destination end)
+          in ensure_parent destination; copy hash destination end)
       extra_hashes;
     write_manifests {parents = parents, mldeps = mldeps};
     HolbuildCache.touch_action root input_key;
@@ -2646,7 +2646,7 @@ fun materialize_theory_cache verify_cache allow_timeout_discrepancy project plan
        write_local_theory_manifests plan node metadata)
   in
     CacheRestored
-      (install_cache_entry verify_cache root input_key subject entry
+      (install_cache_entry (copy_blob verify_cache root) root input_key subject entry
          {outputs = {sig_path = sig_path, sml_path = sml_path, data_path = data_path},
           extra_destination = source_extra_output_path node,
           write_manifests = write_manifests})
@@ -8771,7 +8771,7 @@ fun fetch_spec_blob remote {hash, dst} =
 
 (* Restores a theory the action depends on, or the action's own entry, into
    the action root, writing its load manifests with the spec's stems. *)
-fun restore_spec_theory root (spec : spec_deps) {key, subject, stem, extra_outputs, requested_timeout} =
+fun restore_spec_theory remote root (spec : spec_deps) {key, subject, stem, extra_outputs, requested_timeout} =
   let
     val cache = cache_root ()
     val entry =
@@ -8779,6 +8779,7 @@ fun restore_spec_theory root (spec : spec_deps) {key, subject, stem, extra_outpu
         {root = cache, input_key = key, subject = subject,
          expected_extra_outputs = extra_outputs,
          requested_timeout = requested_timeout, require_trace = false}
+    val resident = HolbuildCache.get_action cache key
     val stems = spec_load_stems spec
     fun order name =
       case List.find (fn {target, ...} => #2 (target_name target) = name) (#orders spec) of
@@ -8794,7 +8795,8 @@ fun restore_spec_theory root (spec : spec_deps) {key, subject, stem, extra_outpu
        write_object_manifest (stem_path ^ ".uo") (generated_theory_loads resolve metadata @ [sml_path]))
   in
     ignore
-      (install_cache_entry false cache key subject entry
+      (install_cache_entry (fn hash => fn dst => fetch_spec_blob remote {hash = hash, dst = dst})
+         cache key subject entry
          {outputs = {sig_path = sig_path, sml_path = sml_path, data_path = stem_path ^ ".dat"},
           (* Apart from the sources, so a restored output never replaces an
              input the action fetched by its hash; the build reads none. *)
@@ -8802,6 +8804,9 @@ fun restore_spec_theory root (spec : spec_deps) {key, subject, stem, extra_outpu
             if escapes decl then raise Error ("cache entry " ^ key ^ " has an extra output outside the action root: " ^ decl)
             else in_root root (normalize_path (String.concatWith "/" [".holbuild/action-extra", key, decl])),
           write_manifests = write_manifests})
+      handle e as ActionFailed (InputMissing _, _) =>
+        (Option.app (fn text => ignore (drop_cache_manifest_if_unchanged cache key text)) resident;
+         raise e)
   end
 
 (* Whether a theory's .dat, given by the parent hashes it records, records
@@ -8865,7 +8870,7 @@ fun hydrate_spec_deps remote root files (spec : spec_deps) direct =
        write_object_manifest (in_root root (stem ^ suffix)) (map lib_load loads))
     fun restore_dep {target, stem, key} =
       (ensure_parent (in_root root stem);
-       restore_spec_theory root spec
+       restore_spec_theory remote root spec
          {key = key, subject = target, stem = stem, extra_outputs = NONE, requested_timeout = NONE})
       handle e as HolbuildRemoteCache.Unavailable _ => raise e
            | e => raise action_failed (InputMissing ("theory " ^ key))
@@ -8929,7 +8934,7 @@ fun action_already_done remote root (spec : action_spec) =
     val {sig_path, sml_path, data_path} = #outputs spec
     val stem = drop_suffix ".dat" data_path
     fun restored () =
-      (restore_spec_theory root (theory_spec_deps spec)
+      (restore_spec_theory remote root (theory_spec_deps spec)
          {key = #input_key spec, subject = #package spec ^ ":" ^ #logical spec, stem = stem,
           extra_outputs = SOME (#extra_outputs spec), requested_timeout = #tactic_timeout spec};
        spec_parent_hashes_match root (theory_spec_deps spec) (in_root root data_path))
@@ -10064,7 +10069,7 @@ fun reuse_earlier_build remote root (spec : action_spec) pair_key =
           val data_path = #data_path (#outputs spec)
         in
           sha256_text old_key andalso old_key <> new_key andalso
-          (restore_spec_theory root (theory_spec_deps spec)
+          (restore_spec_theory remote root (theory_spec_deps spec)
              {key = old_key, subject = #package spec ^ ":" ^ #logical spec,
               stem = drop_suffix ".dat" data_path, extra_outputs = SOME (#extra_outputs spec),
               requested_timeout = #tactic_timeout spec};
