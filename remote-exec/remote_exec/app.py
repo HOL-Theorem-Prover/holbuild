@@ -131,11 +131,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
 
     @app.get("/v1/cache/members", dependencies=[Depends(cache_reader)], response_class=Response)
     async def cache_members() -> Response:
-        from remote_exec.cache import cache_nodes, node_identity
-
-        permanent = [node_identity(url) for url in cache_nodes(settings.cache_url)]
-        dynamic = await coordinator.cache_pool.ready_urls() if coordinator.cache_pool is not None else []
-        urls = list(dict.fromkeys(permanent + dynamic))
+        urls = await coordinator.cache_members()
         return Response("holbuild-cache-members-v1\n" + "\n".join(urls) + "\n", media_type="text/plain",
                         headers={"Cache-Control": "no-store"})
 

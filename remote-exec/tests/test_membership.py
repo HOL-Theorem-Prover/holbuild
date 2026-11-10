@@ -103,6 +103,7 @@ def test_worker_discovery_is_rate_limited_and_a_failure_does_not_disable_the_cac
 
 async def test_members_endpoint_auth_and_no_credentials_before_or_after_ready(http, coordinator) -> None:
     coordinator.settings.cache_url = ','.join(DEFAULTS)
+    coordinator.settings.cache_members_ttl_seconds = 0  # each request below reads the slots it changed
     for token in [None, 'wrong', cache_discovery_token('wrong-worker'), cache_discovery_token(CLIENT_TOKEN)]:
         response = await http.get('/v1/cache/members', headers={'Authorization': f'Bearer {token}'})
         assert response.status_code == 401
@@ -134,6 +135,32 @@ async def test_members_endpoint_auth_and_no_credentials_before_or_after_ready(ht
     assert len(response.text.splitlines()) == 3
     slots = await http.get('/v1/cache/slots', headers={'Authorization': f'Bearer {CLIENT_TOKEN}'})
     assert slots.json() == [{'slot': 'c', 'url': 'https://cache-c.example', 'owner': 'instance', 'phase': 'drain', 'error': None}]
+
+
+async def test_members_endpoint_reuses_a_recent_read_and_survives_a_database_failure(http, coordinator) -> None:
+    """Workers ask for the members about as often as they claim: within the TTL they share one read of the slots,
+    and while the database can't answer they get the slots last read instead of an error."""
+    coordinator.settings.cache_url = ','.join(DEFAULTS)
+    coordinator.settings.cache_members_ttl_seconds = 60
+    coordinator.cache_pool = CachePool(coordinator.engine, [CacheSlot(name='c', url='https://cache-c.example')],
+                                       Provider(), drain_seconds=60)
+    async with coordinator.engine.begin() as conn:
+        await conn.execute(sa.text('DELETE FROM cache_slots'))
+        await conn.execute(sa.text("INSERT INTO cache_slots(slot,url,owner,phase) VALUES ('c',:url,'instance','serving')"),
+                           {'url': 'https://cache-c.example'})
+    headers = {'Authorization': f'Bearer {WORKER_TOKEN}'}
+    assert (await http.get('/v1/cache/members', headers=headers)).text == SNAPSHOT
+    async with coordinator.engine.begin() as conn:
+        await conn.execute(sa.text("UPDATE cache_slots SET phase='drain' WHERE slot='c'"))
+    assert (await http.get('/v1/cache/members', headers=headers)).text == SNAPSHOT
+
+    async def unavailable() -> list[str]:
+        raise sa.exc.TimeoutError('QueuePool limit reached')
+
+    coordinator.cache_pool.ready_urls = unavailable
+    coordinator.settings.cache_members_ttl_seconds = 0
+    response = await http.get('/v1/cache/members', headers=headers)
+    assert response.status_code == 200 and response.text == SNAPSHOT
 
 
 @pytest.mark.parametrize(("method", "path"), [
