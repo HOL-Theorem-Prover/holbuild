@@ -2072,14 +2072,27 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
     result
   end
 
-fun prove_outer_theorem ctxt (g, tac) (_, name, tactic_text, _, _, _, _, _, _) =
+(* Set in `build --cached-proofs` to HolbuildProofCacheRuntime.prove, which
+   either rebuilds the theorem from a record of an earlier proof or runs the
+   proof it is given. *)
+val proof_cache_ref =
+  ref (NONE : ({kind : string, name : string, tactic_text : string,
+                proof_attrs : (string * string list) list} ->
+               Tactical.goal -> (unit -> Thm.thm) -> Thm.thm) option)
+
+fun prove_outer_theorem ctxt (g, tac) (kind, name, tactic_text, _, _, _, _, proof_attrs, _) =
   let
     val atomic = tactic_text = ""
-    val th =
+    fun run () =
       with_proof_ir_execution ctxt (fn () =>
         with_theorem_trace name (fn () =>
           if atomic then atomic_prove name g tac
           else proof_ir_prove name g tac tactic_text))
+    val th =
+      case !proof_cache_ref of
+          NONE => run ()
+        | SOME cached =>
+            cached {kind = kind, name = name, tactic_text = tactic_text, proof_attrs = proof_attrs} g run
     val _ = theorem_info_ref := NONE
   in
     th
