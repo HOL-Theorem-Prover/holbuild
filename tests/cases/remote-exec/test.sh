@@ -359,8 +359,10 @@ require_grep "^POST /v1/batches Bearer stub-token$" "$state/requests.log"
 write_theories ledger
 run ledger-seed 0 build --remote-exec "$coordinator" --remote-only BTheory
 [[ -n $(ls "$project/.holbuild/remote-ledger") ]] || { echo "the export left no remote ledger" >&2; exit 1; }
-# ATheory changes and BScript.sml doesn't, so its blob is remembered.
+# ATheory changes and BScript.sml doesn't, so its blob is remembered.  Without
+# its metadata, the client can't cut BTheory off itself.
 sed -i 's/(\* ledger \*)/(* ledger-a *)/' "$project/src/AScript.sml"
+rm -r "$project/.holbuild/dep"
 b_source=$(sha256sum "$project/src/BScript.sml" | cut -d' ' -f1)
 rm "$remote_root/cas/$b_source" "$tmpdir/worker-cache/blobs/$b_source"
 run ledger 0 build --remote-exec "$coordinator" --remote-only BTheory
@@ -673,7 +675,9 @@ rm "$state/unavailable" "$state/unavailable-status"
 # whose dependencies' outputs are unchanged; an edit that changes A's
 # outputs rebuilds them; and an edited B, on unchanged dependency outputs,
 # resumes from the deps heap its last build shared.  Only targets share
-# heaps, so those builds name B as a target.
+# heaps, so those builds name B as a target.  Each edit runs in a checkout
+# without the metadata of its last build, where the client can't cut off
+# itself (see below).
 project=$tmpdir/cutoff
 mkdir -p "$project/src"
 cat > "$project/holproject.toml" <<TOML
@@ -738,6 +742,7 @@ run cutoff-v1 0 build --remote-exec "$coordinator" CTheory
 results built built built
 
 write_cutoff two one
+rm -r "$project/.holbuild/dep"
 run cutoff-proof 0 build --remote-exec "$coordinator" CTheory
 require_grep "remote workers finished 3 of 3 theories" "$tmpdir/cutoff-proof.log"
 refute_grep "Theory built" "$tmpdir/cutoff-proof.log"
@@ -751,6 +756,7 @@ results built cached cached
 a_dat=$project/.holbuild/obj/src/ATheory.dat
 a_dat_hash=$(sha256sum "$a_dat")
 write_cutoff two one "" $'(* a comment\n   of three\n   lines *)' "ACCEPT_TAC TRUTH"
+rm -r "$project/.holbuild/dep"
 run cutoff-proof-moved 0 build --remote-exec "$coordinator" CTheory
 [[ "$(sha256sum "$a_dat")" != "$a_dat_hash" ]] || { echo "the proof edit left ATheory.dat unchanged" >&2; exit 1; }
 require_grep "early cutoff: rxc:BTheory reuses" "$tmpdir/worker.log"
@@ -759,11 +765,13 @@ results built cached cached
 
 a2=$'Theorem a2_thm:\n  T\nProof\n  simp[]\nQED'
 write_cutoff three one "$a2"
+rm -r "$project/.holbuild/dep"
 run cutoff-output 0 build --remote-exec "$coordinator" BTheory CTheory
 refute_grep "early cutoff" "$tmpdir/worker.log"
 results built built built
 
 write_cutoff four four "$a2"
+rm -r "$project/.holbuild/dep"
 run cutoff-dependent 0 build --remote-exec "$coordinator" BTheory CTheory
 require_grep "BTheory restored from cache" "$tmpdir/cutoff-dependent.log"
 refute_grep "Theory built" "$tmpdir/cutoff-dependent.log"
@@ -772,6 +780,120 @@ grep -A1 "^resuming BTheory$" "$tmpdir/worker.log" | grep -q "from: deps-loaded 
 require_grep "early cutoff: rxc:CTheory reuses" "$tmpdir/worker.log"
 results built built cached
 rm "$state/share-heaps"
+
+# Early cutoff on the client.  A theory whose own inputs are as at the build
+# its outputs come from waits for the batch of what it depends on; the
+# client then reuses its outputs where what it loads is unchanged, and sends
+# the rest in another batch.  A <- B <- C, restored from entries built
+# locally, which leave the workers no early-cutoff record.
+project=$tmpdir/client-cutoff
+mkdir -p "$project/src"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxk"
+
+[build]
+members = ["src"]
+TOML
+write_cutoff one one
+run client-cutoff-local 0 build CTheory
+rm -r "$project/.holbuild"
+run client-cutoff-restore 0 build CTheory
+require_grep "CTheory restored from cache" "$tmpdir/client-cutoff-restore.log"
+: > "$state/ran"
+write_cutoff two one
+run client-cutoff-proof 0 build --remote-exec "$coordinator" CTheory
+require_grep "remote workers finished 1 of 1 theories" "$tmpdir/client-cutoff-proof.log"
+require_grep "early cutoff reused 2 of 2 deferred theories" "$tmpdir/client-cutoff-proof.log"
+refute_grep "Theory built" "$tmpdir/client-cutoff-proof.log"
+[[ "$(< "$state/ran")" == "rxk:ATheory" ]] || { echo "workers ran:" >&2; cat "$state/ran" >&2; exit 1; }
+
+# An edit that changes what A produces: B and C go to the workers next.
+: > "$state/ran"
+write_cutoff three one "$a2"
+run client-cutoff-output 0 build --remote-exec "$coordinator" CTheory
+require_grep "early cutoff reused 0 of 2 deferred theories" "$tmpdir/client-cutoff-output.log"
+[[ $(grep -c "^holbuild: remote batch " "$tmpdir/client-cutoff-output.log") -eq 2 ]] ||
+  { cat "$tmpdir/client-cutoff-output.log" >&2; exit 1; }
+refute_grep "Theory built" "$tmpdir/client-cutoff-output.log"
+[[ "$(< "$state/ran")" == $'rxk:ATheory\nrxk:BTheory\nrxk:CTheory' ]] ||
+  { echo "workers ran:" >&2; cat "$state/ran" >&2; exit 1; }
+
+# A theory is cut off only once everything it depends on has settled: X <- V
+# <- W <- Y, with a proof edit to X and a statement edit to W.  V is reused;
+# Y, whose own inputs are unchanged, builds on a worker against the new W.
+project=$tmpdir/client-settle
+mkdir -p "$project/src"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxs"
+
+[build]
+members = ["src"]
+TOML
+# write_settle X-STAMP W-STATEMENT
+write_settle() {
+  printf 'Theory X\nAncestors bool\n\nTheorem x_thm:\n  T\nProof\n  simp[] (* %s *)\nQED\n' "$1" \
+    > "$project/src/XScript.sml"
+  printf 'Theory V\nAncestors X\n\nTheorem v_thm:\n  T\nProof\n  ACCEPT_TAC x_thm\nQED\n' \
+    > "$project/src/VScript.sml"
+  printf 'Theory W\nAncestors V\n\nTheorem w_thm:\n  %s\nProof\n  simp[]\nQED\n' "$2" \
+    > "$project/src/WScript.sml"
+  printf 'Theory Y\nAncestors W\n\nTheorem y_thm:\n  T\nProof\n  simp[]\nQED\n' \
+    > "$project/src/YScript.sml"
+}
+write_settle one T
+run client-settle-v1 0 build --remote-exec "$coordinator" YTheory
+: > "$state/ran"
+: > "$state/results"
+write_settle two 'T /\ T'
+run client-settle 0 build --remote-exec "$coordinator" YTheory
+require_grep "early cutoff reused 1 of 3 deferred theories" "$tmpdir/client-settle.log"
+[[ "$(< "$state/results")" == $'rxs:XTheory status=built\nrxs:WTheory status=built\nrxs:YTheory status=built' ]] ||
+  { echo "worker results:" >&2; cat "$state/results" >&2; exit 1; }
+: > "$state/results"
+: > "$tmpdir/worker.log"
+
+# With keep-going, a failure in the first batch holds back only what depends
+# on it: P <- Q and X <- Z, with P's outputs changed and X's statement made
+# false.  Q goes to the workers after the first batch; Z never does.
+project=$tmpdir/client-keep-going
+mkdir -p "$project/src"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxg"
+
+[build]
+members = ["src"]
+TOML
+# write_keep_going P-EXTRA X-STATEMENT
+write_keep_going() {
+  printf 'Theory P\nAncestors bool\n\nTheorem p_thm:\n  T\nProof\n  simp[]\nQED\n%s\n' "$1" \
+    > "$project/src/PScript.sml"
+  printf 'Theory Q\nAncestors P\n\nTheorem q_thm:\n  T\nProof\n  simp[]\nQED\n' \
+    > "$project/src/QScript.sml"
+  printf 'Theory X\nAncestors bool\n\nTheorem x_thm:\n  %s\nProof\n  simp[]\nQED\n' "$2" \
+    > "$project/src/XScript.sml"
+  printf 'Theory Z\nAncestors X\n\nTheorem z_thm:\n  T\nProof\n  simp[]\nQED\n' \
+    > "$project/src/ZScript.sml"
+}
+: > "$state/keep-going"
+write_keep_going "" T
+run client-keep-going-v1 0 build --remote-exec "$coordinator" QTheory ZTheory
+: > "$state/ran"
+write_keep_going "$a2" F
+run client-keep-going 1 build --remote-exec "$coordinator" QTheory ZTheory
+require_grep "early cutoff reused 0 of 2 deferred theories" "$tmpdir/client-keep-going.log"
+require_grep "proof failed on a remote worker while building XTheory" "$tmpdir/client-keep-going.log"
+require_grep "QTheory restored from cache" "$tmpdir/client-keep-going.log"
+[[ "$(sort "$state/ran")" == $'rxg:PTheory\nrxg:QTheory\nrxg:XTheory' ]] ||
+  { echo "workers ran:" >&2; cat "$state/ran" >&2; exit 1; }
+rm "$state/keep-going"
+: > "$state/results"
+: > "$tmpdir/worker.log"
 
 # A proof that fails on a worker: the build restores what the workers
 # finished, reports the failure from the worker's build log, and exits 1

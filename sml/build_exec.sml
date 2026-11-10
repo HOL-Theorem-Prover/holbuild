@@ -4998,6 +4998,23 @@ fun commit_speculative dat_hash_cache (options : build_options) project plan key
     cache_trace ("pipeline: committed: " ^ logical)
   end
 
+(* The metadata of NODE's last build when its outputs, its own inputs and its
+   timeout still allow early cutoff: what early cutoff checks before it looks
+   at what NODE's dependencies produced. *)
+fun early_cutoff_own_metadata allow_timeout_discrepancy policy project plan toolchain_key node =
+  if List.all (output_exists_for_node node) (output_paths policy plan node) andalso
+     List.all file_exists (source_extra_output_paths plan node) then
+    case current_metadata (metadata_path project node) of
+        NONE => NONE
+      | SOME text =>
+          if metadata_serves text andalso
+             metadata_value "self_input_key" (metadata_lines text) =
+               SOME (node_self_input_key policy plan toolchain_key node) andalso
+             metadata_timeout_satisfies allow_timeout_discrepancy policy node text
+          then SOME text
+          else NONE
+  else NONE
+
 fun build_theory_node speculated dat_hash_cache (options : build_options) tc project base_context plan keys toolchain_key node input_key =
   let
     val policy = checkpoint_policy_for_node options project node
@@ -5105,25 +5122,15 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
        its dependencies produced are as they were at its last build.  Returns
        that build's metadata. *)
     fun early_cutoff_metadata () =
-      if List.all (output_exists_for_node node) (output_paths policy plan node) andalso
-         List.all file_exists (source_extra_output_paths plan node) then
-        case current_metadata (metadata_path project node) of
-            NONE => NONE
-          | SOME text =>
-              let val lines = metadata_lines text
-              in
-                if metadata_serves text andalso
-                   metadata_value "self_input_key" lines =
-                     SOME (node_self_input_key policy plan toolchain_key node) andalso
-                   (case deps_output_key toolchain_key plan node of
-                        SOME key => metadata_value "deps_output_key" lines = SOME key
-                      | NONE => false) andalso
-                   metadata_timeout_satisfies allow_timeout_discrepancy policy node text andalso
-                   theory_parent_hashes_match dat_hash_cache plan node (SOME text)
-                then SOME text
-                else NONE
-              end
-      else NONE
+      case early_cutoff_own_metadata allow_timeout_discrepancy policy project plan toolchain_key node of
+          NONE => NONE
+        | SOME text =>
+            if (case deps_output_key toolchain_key plan node of
+                    SOME key => metadata_value "deps_output_key" (metadata_lines text) = SOME key
+                  | NONE => false) andalso
+               theory_parent_hashes_match dat_hash_cache plan node (SOME text)
+            then SOME text
+            else NONE
     fun reuse_outputs text =
       (remove_tree stage;
        if cache_allowed then
@@ -7130,6 +7137,51 @@ fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets
    restore_only = restore_only, fail_fast = if restore_only then false else fail_fast,
    all_checkpoints = all_checkpoints}
 
+(* Early cutoff for the theories export_action_specs deferred, once what they
+   depend on is in the cache: restores (or builds, if not theories) the
+   nodes they depend on, and runs each deferred theory's early cutoff, as
+   restore_only does, without reporting progress.  As in build, a node is
+   tried only when every dependency settled, so its dependencies' outputs
+   are final; the rest are left for the next batch.  Returns how many
+   deferred theories settled. *)
+fun settle_deferred (options : build_options) tc project plan toolchain_key deferred =
+  let
+    val options = remote_restore_options true options
+    val base_context = toolchain_base_context tc
+    val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
+                 (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
+    val dat_hash_cache = new_file_hash_cache ()
+    val deferred = Binaryset.addList (Binaryset.empty String.compare, deferred)
+    val nodes = List.filter (fn node => Binaryset.member (deferred, HolbuildBuildPlan.key node))
+                  (HolbuildBuildPlan.selected_nodes plan)
+    val needed =
+      Binaryset.addList (deferred, map HolbuildBuildPlan.key (List.concat
+        (map (HolbuildBuildPlan.transitive_project_deps plan) nodes)))
+    val unsettled = ref (Binaryset.empty String.compare)
+    val local_build_needed = !HolbuildHolSharedCache.local_build_needed
+    fun settle node =
+      let val key = HolbuildBuildPlan.key node
+      in
+        if not (Binaryset.member (needed, key)) then false
+        else if List.exists (fn dep => Binaryset.member (!unsettled, HolbuildBuildPlan.key dep))
+                  (HolbuildBuildPlan.direct_project_deps plan node) then
+          (unsettled := Binaryset.add (!unsettled, key); false)
+        else
+          (ignore (build_node NONE dat_hash_cache options tc project base_context plan keys toolchain_key node);
+           HolbuildBuildPlan.forget_output_digest plan node;
+           Binaryset.member (deferred, key))
+          handle Error _ => (unsettled := Binaryset.add (!unsettled, key); false)
+               | ErrorWithDebugArtifacts _ => (unsettled := Binaryset.add (!unsettled, key); false)
+      end
+    val _ = HolbuildBuildPlan.forget_output_digests plan
+    val settled = length (List.filter settle (HolbuildBuildPlan.selected_nodes plan))
+  in
+    (* Digests taken here go stale once the next batch's outputs land. *)
+    HolbuildBuildPlan.forget_output_digests plan;
+    HolbuildHolSharedCache.local_build_needed := local_build_needed;
+    settled
+  end
+
 (* The plan's node whose action has input key `input_key`. *)
 fun node_with_input_key (options : build_options) tc project plan toolchain_key input_key =
   let
@@ -7703,8 +7755,14 @@ fun upload_spec_files hash_file remote jobs {known, learn} files =
    with upload, and returns the batch.
    With local_resumable, a theory built here for its current input key, and
    not forced, stays out unchecked, unless a theory in the batch depends on
-   it and it can't be published from the local cache. *)
-fun export_action_specs (options : build_options) tc project plan toolchain_key jobs {upload, local_resumable, forced, ledger} =
+   it and it can't be published from the local cache.
+   A theory whose input key is in skip, or that depends on one, stays out.
+   With defer, so do the theories early cutoff may reuse once their
+   dependencies are built, and those that depend on them; deferred holds
+   their keys, for settle_deferred.  Deferring only schedules: whether a
+   theory's outputs are reused is decided by early cutoff alone. *)
+fun export_action_specs (options : build_options) tc project plan toolchain_key jobs
+      {upload, local_resumable, forced, skip, defer, ledger} =
   let
     val hash_file = export_file_hash ()
     val _ = if upload then HolbuildOffline.require_online "upload action specs" else ()
@@ -7770,6 +7828,24 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
                   not (is_forced (node, action)) andalso
                   remote_entry_satisfies remote options project plan node (#input_key action))
               other_actions
+    fun key_set list = Binaryset.addList (Binaryset.empty String.compare, list)
+    (* Whether the theory, or one it depends on, has its input key in SET. *)
+    fun meets set (node, _) =
+      Binaryset.numItems set > 0 andalso
+      List.exists (fn node => Binaryset.member (set, HolbuildBuildPlan.input_key_for keys node))
+        (node :: HolbuildBuildPlan.transitive_project_deps plan node)
+    val uncached_actions = List.filter (not o meets (key_set skip)) uncached_actions
+    fun cutoff_candidate (node, _) =
+      case early_cutoff_own_metadata (#allow_cache_timeout_discrepancy options)
+             (checkpoint_policy_for_node options project node) project plan toolchain_key node of
+          SOME text => Option.isSome (metadata_value "deps_output_key" (metadata_lines text))
+        | NONE => false
+    (* Settling runs without force, so a forced theory must not wait for it. *)
+    val candidates =
+      if defer andalso not (List.exists is_forced actions) then List.filter cutoff_candidate uncached_actions
+      else []
+    val (deferred, uncached_actions) =
+      List.partition (meets (key_set (map (#input_key o #2) candidates))) uncached_actions
     fun uncached_in actions node =
       List.exists (fn (n, _) => HolbuildBuildPlan.key n = HolbuildBuildPlan.key node) actions
     (* The workers restore from the remote cache what the batch's theories
@@ -7841,7 +7917,8 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
          write_text_atomic ledger_path
            (String.concat (map (fn line => line ^ "\n") (Binaryset.listItems (!learned)))))
   in
-    String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n"
+    {batch = String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n",
+     deferred = map (HolbuildBuildPlan.key o #1) deferred}
   end
 
 (* Run specs: a caller's script to run in the context of a built theory, or
