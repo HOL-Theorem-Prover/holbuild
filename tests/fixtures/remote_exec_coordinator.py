@@ -176,10 +176,6 @@ class Handler(BaseHTTPRequestHandler):
                 if event["state"] == "done" and result.exists() and not cancelled:
                     record = dict(line.split("=", 1) for line in result.read_text().splitlines()[1:])
                     event["log_sha256"] = record["log"].split()[0] if "log" in record else None
-                if result.exists() and not cancelled:
-                    record = dict(line.split("=", 1) for line in result.read_text().splitlines()[1:])
-                    event["log_zstd"] = record.get("log-zstd")
-                    event["log_error"] = record.get("log-error")
                 if event["state"] == "done" and (state / "requeue-log").exists():
                     # The first execution's log was evicted; only the final
                     # execution's log is usable after the action is requeued.

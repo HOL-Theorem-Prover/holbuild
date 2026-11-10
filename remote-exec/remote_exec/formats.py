@@ -60,8 +60,6 @@ class Result:
     missing: Missing | None
     peak_rss_mb: int | None
     log_sha256: str | None
-    log_zstd: str | None = None
-    log_error: str | None = None
     timings: dict[str, int] | None = None  # milliseconds: each phase's, and the whole run's as "wall"
     detail: str | None = None  # why a failure with no log failed, as sanitize_detail leaves it
 
@@ -152,16 +150,6 @@ def parse_result(text: str) -> Result:
     if peak is not None and not peak.isdigit():
         raise FormatError(f"bad peak-rss-mb: {peak!r}")
     log = fields.get("log")
-    log_zstd = fields.get("log-zstd")
-    log_error = fields.get("log-error")
-    if log_zstd is not None:
-        parts = log_zstd.split(" ")
-        if (len(parts) != 4 or not SHA256.fullmatch(parts[0]) or not SHA256.fullmatch(parts[2])
-                or not all(p.isascii() and p.isdigit() and len(p) <= 19 and int(p) <= 2**63 - 1
-                           for p in (parts[1], parts[3]))):
-            raise FormatError("bad log-zstd")
-    if (log and log_zstd is not None) or (log_error is not None and (log or log_zstd is not None or status == "cached")):
-        raise FormatError("conflicting log fields")
     timings: dict[str, int] = {}
     for item in fields["phase-ms"].split(",") if "phase-ms" in fields else []:
         name, sep, ms = item.partition(":")
@@ -181,8 +169,6 @@ def parse_result(text: str) -> Result:
         missing=missing,
         peak_rss_mb=int(peak) if peak is not None else None,
         log_sha256=_expect(SHA256, log.split(" ")[0], "log") if log else None,
-        log_zstd=log_zstd,
-        log_error=sanitize_detail(log_error) if log_error else None,
         timings=timings or None,
         detail=sanitize_detail(fields["detail"]) if fields.get("detail") else None,
     )

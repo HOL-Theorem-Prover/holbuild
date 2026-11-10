@@ -180,8 +180,6 @@ class ActionStatus:
     attempts: int
     last_failure: str | None
     log_sha256: str | None
-    log_zstd: str | None
-    log_error: str | None
     failure_detail: str | None  # the last result's detail: why it failed when it has no log
     timings: dict[str, int] | None  # the last result's, in milliseconds; see formats.Result
 
@@ -388,7 +386,7 @@ RELEASABLE_BATCH = sa.text(RELEASABLE.format(batch=" AND a.batch_id = :batch_id"
 
 # The actions of a batch written by transactions numbered :since or later; see Coordinator.changes.
 CHANGED_ACTIONS = sa.text("""
-SELECT input_key, theory, state, tier, attempts, last_failure, log_sha256, log_zstd, log_error, failure_detail, CAST(timings AS text)
+SELECT input_key, theory, state, tier, attempts, last_failure, log_sha256, failure_detail, CAST(timings AS text)
 FROM actions
 WHERE batch_id = :batch_id AND changed_xid >= CAST(CAST(:since AS text) AS xid8)
 ORDER BY theory, input_key
@@ -1059,15 +1057,12 @@ class Coordinator:
                 )
             await conn.execute(
                 sa.text(
-                    "UPDATE actions SET log_sha256 = :log, log_zstd = :log_zstd, log_error = :log_error, "
-                    "last_failure = :failure, failure_detail = :detail, "
+                    "UPDATE actions SET log_sha256 = :log, last_failure = :failure, failure_detail = :detail, "
                     "timings = CAST(CAST(:timings AS text) AS jsonb) "
                     "WHERE batch_id = :batch_id AND input_key = :input_key"
                 ),
                 {
                     "log": result.log_sha256,
-                    "log_zstd": result.log_zstd,
-                    "log_error": result.log_error,
                     "failure": result.failure,
                     "detail": result.detail,
                     "timings": json.dumps(result.timings) if result.timings is not None else None,
@@ -1260,7 +1255,7 @@ class Coordinator:
                     await conn.execute(
                         sa.text(
                             "UPDATE actions SET last_failure = CASE WHEN class = 'run' THEN 'internal' "
-                            "ELSE :failure END, failure_detail = NULL, log_sha256 = NULL, log_zstd = NULL, log_error = NULL "
+                            "ELSE :failure END, failure_detail = NULL "
                             "WHERE batch_id = :batch_id AND input_key = :input_key"
                         ),
                         {"batch_id": batch_id, "input_key": lease.input_key,
@@ -1620,8 +1615,7 @@ class Coordinator:
                 {"batch_id": batch_id, "key": missing.key},
             )
             if parent_state in ("failed", "cancelled"):
-                await self._skip(conn, batch_id, input_key, f"skipped because of {rebuilt} ({missing.key})",
-                                 keep_result=True)
+                await self._skip(conn, batch_id, input_key, f"skipped because of {rebuilt} ({missing.key})")
                 await self._finish_if_done(conn, batch_id)
                 return
         if attempts >= self.settings.max_attempts:
@@ -1733,25 +1727,19 @@ class Coordinator:
             await self._skip(conn, batch_id, input_key, f"skipped because of {failure} ({input_key})")
         await self._finish_if_done(conn, batch_id)
 
-    async def _skip(
-        self, conn: AsyncConnection, batch_id: UUID, input_key: str, reason: str, *, keep_result: bool = False,
-    ) -> None:
+    async def _skip(self, conn: AsyncConnection, batch_id: UUID, input_key: str, reason: str) -> None:
         """Skip a blocked action and its descendants, revoking any leases left by a requeued parent."""
         await conn.execute(
             sa.text(
                 "WITH RECURSIVE blocked(input_key) AS (SELECT CAST(:key AS text) UNION "
                 "SELECT e.input_key FROM edges e JOIN blocked p ON e.parent_key = p.input_key "
                 "WHERE e.batch_id = :id), skipped AS ("
-                "UPDATE actions SET state = 'cancelled', last_failure = :reason, "
-                "failure_detail = CASE WHEN :keep_result AND input_key = :key THEN failure_detail END, "
-                "log_sha256 = CASE WHEN :keep_result AND input_key = :key THEN log_sha256 END, "
-                "log_zstd = CASE WHEN :keep_result AND input_key = :key THEN log_zstd END, "
-                "log_error = CASE WHEN :keep_result AND input_key = :key THEN log_error END "
+                "UPDATE actions SET state = 'cancelled', last_failure = :reason, failure_detail = NULL "
                 "WHERE batch_id = :id AND input_key IN (SELECT input_key FROM blocked) "
                 "AND state IN ('waiting', 'ready', 'running') RETURNING input_key) "
                 "DELETE FROM leases WHERE batch_id = :id AND input_key IN (SELECT input_key FROM skipped)"
             ),
-            {"id": batch_id, "key": input_key, "reason": reason, "keep_result": keep_result},
+            {"id": batch_id, "key": input_key, "reason": reason},
         )
 
     async def _fail_batch(self, conn: AsyncConnection, batch_id: UUID, input_key: str, failure: str) -> None:
@@ -1767,8 +1755,7 @@ class Coordinator:
         )
         await conn.execute(
             sa.text(
-                "UPDATE actions SET state = 'cancelled', failure_detail = NULL, "
-                "log_sha256 = NULL, log_zstd = NULL, log_error = NULL "
+                "UPDATE actions SET state = 'cancelled' "
                 "WHERE batch_id = :id AND state IN ('waiting', 'ready', 'running')"
             ),
             {"id": batch_id},
