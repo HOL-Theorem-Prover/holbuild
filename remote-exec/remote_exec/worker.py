@@ -37,18 +37,27 @@ from typing import Any
 
 from remote_exec.auth import cache_discovery_token
 from remote_exec.cache import cache_nodes, ranked_nodes
+from remote_exec.formats import sanitize_detail
 from remote_exec.membership import REFRESH_SECONDS, Membership, check_plain_http
 
 DEFAULT_SOURCE_URL = "https://github.com/HOL-Theorem-Prover/holbuild/archive/refs/tags/v{version}.tar.gz"
 RELEASE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 COMPLETE = ".complete"  # stamp file of a finished release build
 MIN_SANDBOX_RELEASE = (0, 13, 58)
+MIN_TOOLCHAIN_SANDBOX_RELEASE = (0, 14, 0)
 
 
 @functools.cache
-def check_sandbox(executable: str) -> None:
-    """Fail closed before a release can execute submitted code."""
-    subprocess.run([executable, "sandbox-check"], check=True, stdin=subprocess.DEVNULL, timeout=30)
+def check_sandbox(executable: str, version: str) -> None:
+    """Fail closed before a release can execute submitted code. Runs with the environment its actions get, which
+    release ``version`` validates."""
+    subprocess.run(
+        [executable, "sandbox-check"],
+        check=True,
+        stdin=subprocess.DEVNULL,
+        timeout=30,
+        env=exec_action_env(version=version),
+    )
 
 
 # How long each ECS scale-in protection call protects the task. ECS refuses renewals with DEPLOYMENT_BLOCKED once a
@@ -57,12 +66,18 @@ def check_sandbox(executable: str) -> None:
 # essential one, so the task stops with it, and the worker clears protection when an action ends or loses its lease.
 PROTECTION_MINUTES = 180
 CLAIM_RETRY_SECONDS = 5  # least time between two claims that found nothing
+# Longest wait for a heartbeat or completion answer: above the coordinator's database pool timeout plus the work, so
+# a request it accepted is answered rather than given up on and repeated.
+REQUEST_TIMEOUT_S = 15.0
+CHECKPOINT_PUBLISH_SECONDS = 15
+DRAIN_CHECKPOINT_PUBLISH_SECONDS = 8
 # What exec-action runs with besides holbuild's own HOLBUILD_* settings: what curl, git and the locale read, and where
 # HOL's libraries find external solvers (the action sandbox passes the same SOLVER_ENV on to HOL). The rest of the
 # worker's environment, its coordinator token above all, stays out of the builds' environment.
 SOLVER_ENV = (
     "HOL4_Z3_EXECUTABLE", "HOL4_CVC_EXECUTABLE", "HOL4_CSDP_EXECUTABLE", "HOL4_EPROVER_EXECUTABLE",
-    "HOL4_VAMPIRE_EXECUTABLE", "HOL4_ZIPPERPOSITION_EXECUTABLE", "HOL4_JAVA_EXECUTABLE",
+    "HOL4_VAMPIRE_EXECUTABLE", "HOL4_ZIPPERPOSITION_EXECUTABLE", "HOL4_JAVA_EXECUTABLE", "HOL4_KODKODI",
+    "MINISAT_HOME",
 )
 EXEC_ACTION_ENV = (
     "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR", *SOLVER_ENV
@@ -100,6 +115,7 @@ class Drain:
         self.wake = threading.Event()
         self.deadline: float | None = None
         self.interrupt = False
+        self.publish_seconds = 0.0
 
     def request(self, *_: object) -> None:
         if self.deadline is not None:
@@ -226,7 +242,7 @@ class Coordinator:
         return response
 
     def heartbeat(self, token: str) -> bool:
-        status, body = self.post_reporting(f"/v1/work/{token}/heartbeat", {}, timeout=5)
+        status, body = self.post_reporting(f"/v1/work/{token}/heartbeat", {}, timeout=REQUEST_TIMEOUT_S)
         if status not in (200, 409):
             raise RuntimeError(f"heartbeat answered {status}: {body}")
         return status == 200
@@ -237,11 +253,13 @@ class Coordinator:
         deadline = time.monotonic() + retry_s
         delays = itertools.chain(COMPLETE_RETRY_DELAYS, itertools.repeat(COMPLETE_RETRY_DELAYS[-1]))
         while True:
-            effective = deadline if self.drain.deadline is None else min(deadline, self.drain.deadline + 7)
+            effective = deadline if self.drain.deadline is None else min(
+                deadline, self.drain.deadline + self.drain.publish_seconds + 7
+            )
             try:
                 status, body = self.post(
                     f"/v1/work/{token}/complete", record.encode(), "text/plain",
-                    min(5.0, max(0.1, effective - time.monotonic())),
+                    min(REQUEST_TIMEOUT_S, max(0.1, effective - time.monotonic())),
                 )
             except COORDINATOR_ERRORS as error:
                 status, body = None, error
@@ -252,7 +270,9 @@ class Coordinator:
                 return
             failure = f"complete failed: {body}" if status is None else f"complete answered {status}: {body}"
             delay = next(delays)
-            effective = deadline if self.drain.deadline is None else min(deadline, self.drain.deadline + 7)
+            effective = deadline if self.drain.deadline is None else min(
+                deadline, self.drain.deadline + self.drain.publish_seconds + 7
+            )
             if (status is not None and status < 500) or time.monotonic() + delay > effective:
                 raise RuntimeError(failure)
             print(f"{failure}; retrying in {delay:g} s", file=sys.stderr)
@@ -367,12 +387,12 @@ class Releases:
             raise Unreleased(f"holbuild {version} predates mandatory action isolation")
         baked = os.path.join(self.baked_root, f"v{version}", "bin", "holbuild")
         if os.path.isfile(baked) and os.access(baked, os.X_OK):
-            check_sandbox(baked)
+            check_sandbox(baked, version)
             return baked
         directory = os.path.join(self.root, f"v{version}")
         executable = os.path.join(directory, "bin", "holbuild")
         if os.path.exists(os.path.join(directory, COMPLETE)):
-            check_sandbox(executable)
+            check_sandbox(executable, version)
             return executable
         os.makedirs(self.root, exist_ok=True)
         with open(os.path.join(self.root, f"v{version}.lock"), "a") as lock:
@@ -380,7 +400,7 @@ class Releases:
                 fcntl.flock(lock, fcntl.LOCK_EX)
             if not os.path.exists(os.path.join(directory, COMPLETE)):
                 self._build(version, directory)
-        check_sandbox(executable)
+        check_sandbox(executable, version)
         return executable
 
     def _build(self, version: str, directory: str) -> None:
@@ -676,13 +696,15 @@ def runs_hol(pid: int, cooperate_dir: str) -> bool:
     return False
 
 
-def failed_record(spec_sha256: str, failure: str) -> str:
+def failed_record(spec_sha256: str, failure: str, detail: str | None = None) -> str:
     """A result record the worker writes itself: ``spec-rejected`` for an action it won't run, which fails it
     finally like exec-action's own; ``unavailable`` for one whose spec the cache couldn't give (no answer, 429 or
     5xx, or a transfer cut short) or that was interrupted (``recordless_failure``), which is retried without
     counting the attempt; ``memory`` for one whose exec-action was SIGKILLed; or ``internal`` for any other error in
-    the worker, such as exec-action failing without a record, which is retried."""
-    return f"holbuild-action-result-v1\nspec={spec_sha256}\ninput-key=\nstatus=failed\nfailure={failure}\n"
+    the worker, such as exec-action failing without a record, which is retried. ``detail`` says why, for the client:
+    the record has no log."""
+    record = f"holbuild-action-result-v1\nspec={spec_sha256}\ninput-key=\nstatus=failed\nfailure={failure}\n"
+    return record if detail is None else f"{record}detail={sanitize_detail(detail)}\n"
 
 
 def recordless_failure(returncode: int, draining: bool) -> str | None:
@@ -700,7 +722,7 @@ def recordless_failure(returncode: int, draining: bool) -> str | None:
     return None
 
 
-def exec_action_env(*, discovery_config: str | None = None) -> dict[str, str]:
+def exec_action_env(*, version: str, discovery_config: str | None = None) -> dict[str, str]:
     env = {
         name: value
         for name, value in os.environ.items()
@@ -710,6 +732,16 @@ def exec_action_env(*, discovery_config: str | None = None) -> dict[str, str]:
     }
     if discovery_config is not None:
         env["HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG"] = discovery_config
+    if tuple(map(int, version.split("."))) < MIN_TOOLCHAIN_SANDBOX_RELEASE:
+        name = "HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES"
+        entries = env.get(name, "").split()
+        if "*" in entries:
+            remaining = [entry for entry in entries if entry != "*"]
+            if remaining:
+                env[name] = " ".join(remaining)
+            else:
+                # Older clients lack toolchain confinement; retain their canonical HOL default.
+                del env[name]
     return env
 
 
@@ -751,7 +783,9 @@ class Lease:
             self.done.set()
             with phases.timed("lease"):
                 deadline = self.coordinator.drain.deadline
-                self.thread.join(timeout=None if deadline is None else max(0.0, deadline + 7 - time.monotonic()))
+                self.thread.join(timeout=None if deadline is None else max(
+                    0.0, deadline + self.coordinator.drain.publish_seconds + 7 - time.monotonic()
+                ))
                 self.protection.set(enabled=False, timeout=30 if deadline is None else 2)
 
     def _beat(self) -> None:
@@ -830,6 +864,7 @@ def execute(
     """The result record of the claimed action, or None once its lease is lost."""
     spec = claim["spec_sha256"]
     drain = releases.drain
+    drain.publish_seconds = 0.0
     if drain.stop.is_set():
         return failed_record(spec, "unavailable")
     try:
@@ -842,7 +877,7 @@ def execute(
         return failed_record(spec, "unavailable")
     except Unreleased as error:
         print(f"refusing {spec}: {error}", file=sys.stderr)
-        return failed_record(spec, "spec-rejected")
+        return failed_record(spec, "spec-rejected", f"the worker refuses the action: {error}")
     if lease.lost.is_set():
         return None
     if drain.stop.is_set():
@@ -855,7 +890,7 @@ def execute(
         stepped = time.monotonic()
         process = subprocess.Popen(
             exec_action_command(args, holbuild, spec, result, claim.get("max_heap_mb")),
-            env=exec_action_env(discovery_config=releases.discovery_config),
+            env=exec_action_env(version=version, discovery_config=releases.discovery_config),
             start_new_session=True
         )
         drained_out = False
@@ -874,6 +909,24 @@ def execute(
                     spans.step(now - stepped, hol=hol)
                     stepped = now
         finally:
+            if args.share_heaps and process.poll() is None:
+                drain.publish_seconds = DRAIN_CHECKPOINT_PUBLISH_SECONDS
+                # Signal only the driver: it stops HOL, then publishes the
+                # sandbox-validated saves. Killing its group here loses them.
+                with contextlib.suppress(ProcessLookupError):
+                    process.send_signal(signal.SIGTERM)
+                deadline = time.monotonic() + CHECKPOINT_PUBLISH_SECONDS
+                while process.poll() is None:
+                    effective = deadline if drain.deadline is None else min(
+                        deadline, drain.deadline + drain.publish_seconds
+                    )
+                    remaining = effective - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        process.wait(timeout=min(0.1, remaining))
+                    except subprocess.TimeoutExpired:
+                        pass
             stop_group(process)
             if cooperate_dir is None:
                 phases.add("exec", time.monotonic() - stepped)

@@ -212,16 +212,48 @@ exception TacticTimeout of string
    Combinators propagate it like TacticTimeout. *)
 exception TacticInterrupted of string
 
+fun display_label label =
+  String.translate (fn #"\n" => "\\n" | #"\t" => "\\t" | c => String.str c) label
+
+fun tactic_interrupted label =
+  TacticInterrupted ("holbuild tactic interrupted by Poly/ML (stack overflow or out of memory): " ^ label)
+
+(* A step that times out runs once more with half the budget, meant to let a
+   cheap step that stalled pass while one that needs about the budget still
+   fails.  Callers compute the step from unchanged proof state and commit it
+   to the history only when it returns, so the first attempt leaves the proof
+   history unchanged (side effects of the tactic itself remain).  A retry that
+   passes is reported on stderr, which is the theory's build log; one that
+   times out fails as the first attempt would have, with the full budget in
+   the marker and the message. *)
+fun retry_after_timeout label seconds first_attempt f x =
+  let
+    val gc = Timer.checkGCTime first_attempt
+    val retry = Timer.startRealTimer ()
+    val y = timeout (seconds / 2.0) f x
+      handle FunctionTimeout =>
+               (write_timeout_marker label seconds;
+                raise TacticTimeout (timeout_message label seconds))
+           | FunctionInterrupted => raise tactic_interrupted label
+  in
+    TextIO.output (TextIO.stdErr,
+      String.concat ["holbuild tactic timeout retry passed: ", display_label label,
+                     " (budget ", Real.toString seconds, "s; retry ",
+                     fmt_ms (Time.toReal (Timer.checkRealTimer retry)), " ms wall; GC during first attempt ",
+                     fmt_ms (Time.toReal gc), " ms)\n"]);
+    y
+  end
+
 fun with_tactic_timeout label f x =
   case !tactic_timeout_ref of
       NONE => f x
     | SOME seconds =>
-        (timeout seconds f x
-         handle FunctionTimeout =>
-           (write_timeout_marker label seconds;
-            raise TacticTimeout (timeout_message label seconds))
-              | FunctionInterrupted =>
-           raise TacticInterrupted ("holbuild tactic interrupted by Poly/ML (stack overflow or out of memory): " ^ label))
+        let val first_attempt = Timer.startCPUTimer ()
+        in
+          timeout seconds f x
+          handle FunctionTimeout => retry_after_timeout label seconds first_attempt f x
+               | FunctionInterrupted => raise tactic_interrupted label
+        end
 
 fun save_checkpoint label default_share path ok_text depth =
   if not (!checkpoint_enabled_ref) then ()
@@ -676,9 +708,6 @@ fun failed_step_span_line () =
     | SOME (start_pos, end_pos) =>
         String.concat ["\nholbuild failed fragment span: ", Int.toString start_pos,
                        " ", Int.toString end_pos]
-
-fun display_label label =
-  String.translate (fn #"\n" => "\\n" | #"\t" => "\\t" | c => String.str c) label
 
 fun failed_plan_position_line () =
   case !failed_plan_position_ref of
@@ -2043,14 +2072,27 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
     result
   end
 
-fun prove_outer_theorem ctxt (g, tac) (_, name, tactic_text, _, _, _, _, _, _) =
+(* Set in `build --cached-proofs` to HolbuildProofCacheRuntime.prove, which
+   either rebuilds the theorem from a record of an earlier proof or runs the
+   proof it is given. *)
+val proof_cache_ref =
+  ref (NONE : ({kind : string, name : string, tactic_text : string,
+                proof_attrs : (string * string list) list} ->
+               Tactical.goal -> (unit -> Thm.thm) -> Thm.thm) option)
+
+fun prove_outer_theorem ctxt (g, tac) (kind, name, tactic_text, _, _, _, _, proof_attrs, _) =
   let
     val atomic = tactic_text = ""
-    val th =
+    fun run () =
       with_proof_ir_execution ctxt (fn () =>
         with_theorem_trace name (fn () =>
           if atomic then atomic_prove name g tac
           else proof_ir_prove name g tac tactic_text))
+    val th =
+      case !proof_cache_ref of
+          NONE => run ()
+        | SOME cached =>
+            cached {kind = kind, name = name, tactic_text = tactic_text, proof_attrs = proof_attrs} g run
     val _ = theorem_info_ref := NONE
   in
     th

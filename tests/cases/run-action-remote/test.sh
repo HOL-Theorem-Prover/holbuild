@@ -23,7 +23,7 @@ trap cleanup EXIT
 unset HOLBUILD_REMOTE_CACHE_URL
 
 remote_root=$tmpdir/remote
-start_remote_cache_server "$remote_root" "$tmpdir/server"
+start_remote_cache_server "$remote_root" "$tmpdir/server" "$tmpdir/control"
 use_case_cache "$tmpdir/cache"
 
 # The stand-in for the workers: runs every action of the batch in a cache
@@ -37,9 +37,12 @@ cat > "$tmpdir/run-batch" <<SH
 #!/usr/bin/env bash
 set -eu
 cd "$tmpdir/worker-cwd"
+# A worker that trusts no HOL repository rejects every spec.
+untrusted=()
+[[ ! -e "$state/untrusted" ]] || untrusted=(HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES=/unconfigured=master)
 awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec theory; do
   echo "\$theory" >> "$state/ran"
-  HOLBUILD_CACHE="$tmpdir/worker-cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" \
+  env "\${untrusted[@]}" HOLBUILD_CACHE="$tmpdir/worker-cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" \
     exec-action "\$spec" --cache-limit-gb 1000 --result "$state/result-\$key" \
     >> "$tmpdir/worker.log" 2>&1 || true
   if [[ -e "$state/drop-log" ]]; then
@@ -332,3 +335,70 @@ require_grep 'could not fetch the log of failed run rr:CTheory' "$tmpdir/missing
 require_no_file "$out/rr/CTheory/LOG"
 require_no_file "$out/rr/CTheory/first"
 require_no_file "$out/rr/CTheory/second"
+
+# A run the worker rejects before any HOL runs has no log; its reason
+# reaches the client with the failure.
+cat > "$runner/untrusted.sml" <<'SML'
+val _ = "a run no worker trusts";
+SML
+touch "$state/untrusted"
+run untrusted 0 --remote-exec "$coordinator" --script "$runner/untrusted.sml" rr:CTheory
+rm "$state/untrusted"
+untrusted_key=$(line untrusted rr:CTheory "failed spec-rejected")
+require_grep '^detail=exec-action HOL repository is not trusted by this worker: ' "$state/result-$untrusted_key"
+if grep -q '^log=' "$state/result-$untrusted_key"; then
+  echo 'a rejected run uploaded a log' >&2
+  exit 1
+fi
+require_grep 'holbuild: remote rr:CTheory: failed (spec-rejected: exec-action HOL repository is not trusted by this worker: ' \
+  "$tmpdir/untrusted.err"
+
+# Stop during input hydration, before HOL exists. The driver must not
+# launch the script or publish its result after the transfer finishes.
+script interrupted.sml interrupted
+hb run-action --export-only --script "$runner/interrupted.sml" --output first --output second hol:bool \
+  > "$tmpdir/interrupted-spec.txt"
+read -r context interrupted_key interrupted_spec < "$tmpdir/interrupted-spec.txt"
+python3 - "$HOLBUILD_BIN" "$remote_url" "$interrupted_spec" "$tmpdir" <<'PYTEST'
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+binary, url, spec, temp = sys.argv[1:]
+binary = os.environ.get("REAL_HOLBUILD_BIN", binary)
+root = Path(temp)
+control = root / "control"
+(control / "action-get-enable").touch()
+with (root / "interrupted.log").open("w") as log:
+    process = subprocess.Popen(
+        [binary, "--remote-cache", url, "exec-action", spec, "--share-heaps",
+         "--cache-limit-gb", "1000", "--result", str(root / "interrupted.result")],
+        env={**os.environ, "HOLBUILD_CACHE": str(root / "worker-cache")},
+        stdout=log, stderr=log,
+    )
+    try:
+        for event in ["action-get-count", "download-event"]:
+            deadline = time.monotonic() + 60
+            while not (control / event).exists():
+                if process.poll() is not None or time.monotonic() > deadline:
+                    raise AssertionError(f"run never reached {event}")
+                time.sleep(0.01)
+            if event == "action-get-count":
+                (control / "download-enable").touch()
+                (control / "action-get-release").touch()
+        process.send_signal(signal.SIGTERM)
+        (control / "download-release").touch()
+        assert process.wait(timeout=15) != 0, "cancelled run succeeded"
+    finally:
+        (control / "download-release").touch()
+        (control / "action-get-release").touch()
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+PYTEST
+require_grep '^status=failed$' "$tmpdir/interrupted.result"
+require_grep '^failure=unavailable$' "$tmpdir/interrupted.result"
+require_no_file "$(ac_file "$interrupted_key")"

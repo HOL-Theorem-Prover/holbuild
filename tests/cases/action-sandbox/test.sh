@@ -13,7 +13,8 @@ val home = root ^ "/home";
 val _ = HolbuildActionSandbox.enable (root ^ "/action", root ^ "/checkpoints");
 val _ = HolbuildActionSandbox.toolchain_root := root ^ "/toolchain";
 val _ = HolbuildActionSandbox.poly_executable := home ^ "/bin/poly";
-val args = HolbuildActionSandbox.wrap (root ^ "/completed") ["true"];
+val args = HolbuildActionSandbox.wrap (root ^ "/completed")
+             {writable = [root ^ "/action", root ^ "/checkpoints"], readable = [], toolchain = false} ["true"];
 fun reads ("--read" :: path :: rest) = path :: reads rest
   | reads (_ :: rest) = reads rest
   | reads [] = [];
@@ -56,7 +57,7 @@ PATH="$tmpdir/worker-venv/bin:$tmpdir/venv-bin:/usr/local/bin:/usr/bin:/bin:" \
 
 # HOL's solver locations reach the action; other variables, credentials above all, don't.
 solvers=(HOL4_Z3_EXECUTABLE HOL4_CVC_EXECUTABLE HOL4_CSDP_EXECUTABLE HOL4_EPROVER_EXECUTABLE
-         HOL4_VAMPIRE_EXECUTABLE HOL4_ZIPPERPOSITION_EXECUTABLE HOL4_JAVA_EXECUTABLE)
+         HOL4_VAMPIRE_EXECUTABLE HOL4_ZIPPERPOSITION_EXECUTABLE HOL4_JAVA_EXECUTABLE HOL4_KODKODI MINISAT_HOME)
 solver_env=()
 for name in "${solvers[@]}"; do solver_env+=("$name=/opt/provers/$name"); done
 env "${solver_env[@]}" HOL4_YICES_EXECUTABLE=/opt/yices REMOTE_EXEC_WORKER_TOKEN=secret \

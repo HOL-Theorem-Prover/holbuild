@@ -319,7 +319,7 @@ if sed -n '/^START Live3/q;p' "$events" | grep -q '^END Hold2'; then
 fi
 wait "$hold_pid" || { cat "$tmpdir/hold2.out" >&2; exit 1; }
 
-# When a node fails, a worker still waiting for memory gives up instead of
+# With --fail-fast, a worker still waiting for memory gives up instead of
 # starting its child once the failed child's reservation frees up.  Fail and
 # Q compete for a one-child budget, and Other waits on Q, so some worker is
 # waiting whichever starts first.  Pipelining is off: a failed pipelined
@@ -344,7 +344,7 @@ val _ = new_theory "Other";
 val _ = export_theory();
 SML
 if HOLBUILD_PIPELINE=off holbuild_in "$tmpdir/failing" --cooperate-dir "$tmpdir/failing-coop" --machine-max-mem 3072 -j2 \
-     build --skip-checkpoints --skip-proof-steps > "$tmpdir/failing.out" 2>&1; then
+     build --fail-fast --skip-checkpoints --skip-proof-steps > "$tmpdir/failing.out" 2>&1; then
   echo "build with a failing theory succeeded" >&2
   exit 1
 fi

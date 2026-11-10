@@ -6,7 +6,7 @@ id.  GET /v1/batches/<id>/events runs `RUN <batch file>` (a stand-in for the
 workers), then streams one action event per action and the batch's final
 event: done when RUN exits 0, failed otherwise.  In a failed batch, an action
 RUN left a result for (STATE/result-<input key>, as exec-action writes it) is
-reported as that result says: done, or failed with its failure and log.  Each
+reported as that result says: done, or failed with its failure, log and detail.  Each
 action is reported running twice first, as a coordinator repeats unchanged
 states.  A batch submitted with `?class=run` is a run batch: each action is
 reported from its result (failed `internal` without one) and the batch ends
@@ -158,15 +158,21 @@ class Handler(BaseHTTPRequestHandler):
                     if record["status"] == "failed":
                         event["state"], event["last_failure"] = "failed", record["failure"]
                         event["log_sha256"] = record["log"].split()[0] if "log" in record else None
+                        event["failure_detail"] = record.get("detail")
                     else:
                         event["state"], event["last_failure"] = "done", None
                 elif not ok and result.exists():
                     record = dict(line.split("=", 1) for line in result.read_text().splitlines()[1:])
-                    if record["status"] == "failed":
+                    if record["status"] == "skipped":
+                        event["state"], event["last_failure"] = "cancelled", record["failure"]
+                    elif record["status"] == "failed":
                         event["last_failure"] = record["failure"]
                         event["log_sha256"] = record["log"].split()[0] if "log" in record else None
+                        event["failure_detail"] = record.get("detail")
                     else:
                         event["state"], event["last_failure"] = "done", None
+                elif not ok and not (state / "fail").exists():
+                    event["state"], event["last_failure"] = "cancelled", None
                 if event["state"] == "done" and result.exists() and not cancelled:
                     record = dict(line.split("=", 1) for line in result.read_text().splitlines()[1:])
                     event["log_sha256"] = record["log"].split()[0] if "log" in record else None

@@ -20,8 +20,9 @@ trap cleanup EXIT
 # /trickle sends its 6-byte body a byte every 0.5 s,
 # /gated once the file gate-release exists in the test directory (writing
 # gate-event there on arrival), /missing with 404 and /error with 500, and
-# PUT /store/<name> keeps a body that GET /store/<name> returns, and
-# /connections returns how many connections the server has accepted.
+# PUT /store/<name> keeps a body that GET /store/<name> returns,
+# /connections returns how many connections the server has accepted, and
+# HEAD answers 200 with Content-Length -1.
 cat > "$tmpdir/server.py" <<'PY'
 import base64
 import http.server
@@ -88,6 +89,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(200, stored[self.path])
         else:
             self.reply(200, b"ok\n")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        # What bazel-remote answers for a blob only in its S3 backend.
+        self.send_header("Content-Length", "-1")
+        self.end_headers()
 
     def do_PUT(self):
         body = self.rfile.read(int(self.headers["Content-Length"]))
@@ -228,6 +235,9 @@ val _ = assert "an unsupported option is reported by name"
 val url = valOf (OS.Process.getEnv "HTTP_TEST_URL")
 val dir = valOf (OS.Process.getEnv "HTTP_TEST_DIR")
 val _ = HolbuildRemoteCacheConfig.set_url url
+(* Until the client is set up, requests go through the curl command. *)
+val _ = assert "the curl command takes a HEAD answered with Content-Length -1"
+               (HolbuildRemoteCache.head_status (url ^ "/negative-length") = HolbuildHttp.Response 200)
 val _ = HolbuildRemoteCacheConfig.setup_client ()
 val _ = assert "libcurl is set up with the configured user" (HolbuildRemoteCacheConfig.uses_libcurl ())
 
@@ -335,6 +345,16 @@ fun accepted () =
           (HolbuildHttp.get {url = url ^ "/connections", dst = dir ^ "/connections.out", timeout = 30}
            = HolbuildHttp.Response 200);
    valOf (Int.fromString (read_file (dir ^ "/connections.out"))))
+
+val accepted_before = accepted ()
+val _ = assert "a HEAD answered with Content-Length -1 returns its status"
+               (HolbuildHttp.head {url = url ^ "/negative-length", timeout = 30} = HolbuildHttp.Response 200)
+val _ = assert "a GET after it on the same handle reads its body by its length"
+               (HolbuildHttp.get {url = url ^ "/fast", dst = dir ^ "/after-head.out", timeout = 30}
+                = HolbuildHttp.Response 200
+                andalso read_file (dir ^ "/after-head.out") = "ok\n")
+val _ = assert "the HEAD and the GET kept the connection" (accepted () = accepted_before)
+
 val accepted_before = accepted ()
 val _ = burst ()
 val opened = accepted () - accepted_before

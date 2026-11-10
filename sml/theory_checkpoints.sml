@@ -187,11 +187,25 @@ fun tactic_compat_runtime_helper_path () =
 fun checkpoint_save_runtime_helper_path () =
   OS.Path.concat(HolbuildRuntimePaths.runtime_root (), "sml/checkpoint_save_runtime.sml")
 
+fun proof_cache_runtime_helper_path () = source_helper_path "sml/proof_cache_runtime.sml"
+
+(* `build --cached-proofs` loads the proof cache once, at the start of the
+   script, so that its listener sees every definition; a run resumed from a
+   checkpoint only gives it this run's records. *)
+fun proof_cache_runtime_lines start_offset tactic_timeout {toolchain_key, records_in, records_out} =
+  (if start_offset <= 0 then
+     ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (proof_cache_runtime_helper_path ()) ^ ";"]
+   else []) @
+  ["val _ = HolbuildProofCacheRuntime.install {toolchain_key = " ^ HolbuildToolchain.sml_string toolchain_key ^
+     ", records_in = " ^ HolbuildToolchain.sml_string records_in ^
+     ", records_out = " ^ HolbuildToolchain.sml_string records_out ^
+     ", tactic_timeout = " ^ option_real_sml tactic_timeout ^ "};"]
+
 fun declaration_checkpoint_runtime_prelude [] = ""
   | declaration_checkpoint_runtime_prelude _ =
       runtime_lines ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";"]
 
-fun runtime_install_lines {checkpoint_enabled, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} =
+fun runtime_install_lines {checkpoint_enabled, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir, cached_proofs} =
   ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (source_helper_path "sml/diagnostic_limits.sml") ^ ";",
    "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (sha256_runtime_helper_path ()) ^ ";",
    "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (proof_ir_helper_path ()) ^ ";",
@@ -206,8 +220,10 @@ fun runtime_install_lines {checkpoint_enabled, tactic_timeout, timeout_marker, p
      ", trace_all = " ^ (if trace_all then "true" else "false") ^
      ", plan_only_marker = " ^ option_string_sml plan_only_marker ^ "};",
    "val holbuild_begin_theorem = HolbuildProofRuntime.begin_theorem;",
-   "val holbuild_save_theorem_context = HolbuildProofRuntime.save_theorem_context;"]
-
+   "val holbuild_save_theorem_context = HolbuildProofRuntime.save_theorem_context;"] @
+  (case cached_proofs of
+       SOME _ => ["val _ = HolbuildProofRuntime.proof_cache_ref := SOME HolbuildProofCacheRuntime.prove;"]
+     | NONE => [])
 
 fun runtime_prelude _ [] = ""
   | runtime_prelude config _ = runtime_lines (runtime_load_lines @ runtime_install_lines config)
@@ -282,13 +298,14 @@ datatype instrument_event =
    factories), so no step is compiled after the script has run, where
    later bindings would shadow the theorem's; a theorem without them is
    not deferred. *)
-fun instrument ({source, source_name, start_offset, checkpoints, declaration_checkpoints, terminations, save_checkpoints, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir, defer} :
+fun instrument ({source, source_name, start_offset, checkpoints, declaration_checkpoints, terminations, save_checkpoints, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir, defer, cached_proofs} :
                 {source : string, source_name : string, start_offset : int, checkpoints : checkpoint list,
                  declaration_checkpoints : declaration_checkpoint list,
                  terminations : termination list, save_checkpoints : bool,
                  tactic_timeout : real option, timeout_marker : string option,
                  plan_theorem : string option, trace_all : bool,
                  plan_only_marker : string option, new_ir : bool,
+                 cached_proofs : {toolchain_key : string, records_in : string, records_out : string} option,
                  defer : checkpoint -> bool}) =
   let
     val n = size source
@@ -320,8 +337,12 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
        plan_theorem = plan_theorem,
        trace_all = trace_all,
        plan_only_marker = plan_only_marker,
-       new_ir = new_ir}
+       new_ir = new_ir,
+       cached_proofs = cached_proofs}
     fun prelude () =
+      (case cached_proofs of
+           SOME cache => runtime_lines (proof_cache_runtime_lines start_offset tactic_timeout cache)
+         | NONE => "") ^
       runtime_prelude (runtime_config ())
         (if null active_checkpoints andalso null active_terminations then [] else [()]) ^
       declaration_checkpoint_runtime_prelude

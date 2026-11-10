@@ -131,16 +131,20 @@ val forge = Thm.disk_thm;
 val _ = export_theory();
 SML
 
-# Expects the check of $1 to exit with status $2; leaves its output in $log.
+# Expects the check of $1 and any selectors after $2 to exit with status $2.
 run_check() {
-  local selector=$1 expected=$2 status
-  log=$tmpdir/check-${selector//:/-}.log
+  local expected=$2 status
+  local selectors=("$1" "${@:3}")
+  local label=${selectors[*]}
+  log=$tmpdir/check-${label//:/-}.log
+  timing=$log.timing
+  : > "$timing"
   set +e
-  (cd "$project" && "$HOLBUILD_BIN" check "$selector") > "$log" 2>&1
+  (cd "$project" && HOLBUILD_TIMING_LOG="$timing" "$HOLBUILD_BIN" check "${selectors[@]}") > "$log" 2>&1
   status=$?
   set -e
   if [[ $status -ne $expected ]]; then
-    echo "check $selector exited $status, expected $expected" >&2
+    echo "check ${selectors[*]} exited $status, expected $expected" >&2
     cat "$log" >&2
     exit 1
   fi
@@ -207,18 +211,91 @@ require_grep "^consumer:src/BypassScript.sml:5: kernel bypass: disk_thm$" "$log"
 require_grep "^BypassTheory: 1 finding$" "$log"
 require_no_grep "RunCall\|unsafeCast\|PolyML" "$log"
 
+# Reports are the same as separate checks, in selector order, even after a finding.
+selectors=(CheatTheory CleanTheory UsesTheory HypothesesTheory BypassTheory CleanTheory)
+expected=$tmpdir/batch-expected
+: > "$expected"
+for selector in "${selectors[@]}"; do
+  grep -E '^(Cheat|Clean|Uses|Base|Hypotheses|Bypass)Theory[.:]|^consumer:src/' \
+    "$tmpdir/check-$selector.log" >> "$expected"
+done
+run_check "${selectors[0]}" 1 "${selectors[@]:1}"
+grep -E '^(Cheat|Clean|Uses|Base|Hypotheses|Bypass)Theory[.:]|^consumer:src/' "$log" > "$log.reports"
+diff -u "$expected" "$log.reports"
+# Count the real HOL invocation, using existing command timing instrumentation.
+[[ $(grep -c $'^tool\tkind=run\t.*argv0=.*/bin/hol$' "$timing") -eq 1 ]]
+[[ $(grep -c $'^phase\tname=build.plan\t' "$timing") -eq 1 ]]
+
+run_check CleanTheory 1 CheatTheory
+require_grep "^CleanTheory: clean (1 theorem)$" "$log"
+require_grep "^CheatTheory: 1 finding$" "$log"
+run_check CleanTheory 0 CheatTheory:fine_thm
+require_grep "^CleanTheory: clean (1 theorem)$" "$log"
+require_grep "^CheatTheory.fine_thm: clean (1 theorem)$" "$log"
+run_check CheatTheory:cheated_thm 1 CheatTheory:fine_thm
+require_grep "^CheatTheory.cheated_thm: 1 finding$" "$log"
+require_grep "^CheatTheory.fine_thm: clean (1 theorem)$" "$log"
+
+# Resolve every selector before building, and fail closed on a missing theorem.
+run_check CleanTheory 1 MissingTheory
+require_grep "holbuild: theory not found for check: MissingTheory" "$log"
+require_no_grep 'name=build.plan' "$timing"
+run_check CleanTheory 1 CheatTheory:
+require_grep "holbuild: check requires THEORY or THEORY:THEOREM" "$log"
+require_no_grep 'name=build.plan' "$timing"
+run_check CleanTheory 1 CheatTheory:missing_thm
+require_grep "holbuild: theorem not found: CheatTheory.missing_thm" "$log"
+
+# A later ML load must not replace the accumulated failure flag.
+cat > "$project/src/ResetAudit.sml" <<'SML'
+val HolbuildCheckFailed = ref false;
+structure ResetAudit = struct end;
+SML
+cat > "$project/src/ResetCheckScript.sml" <<'SML'
+Theory ResetCheck
+Libs ResetAudit
+val _ = Theory.add_ML_dependency "ResetAudit";
+Theorem clean_reset: T
+Proof simp[]
+QED
+SML
+run_check CheatTheory 1 ResetCheckTheory CleanTheory
+require_grep "^CheatTheory: 1 finding$" "$log"
+require_grep "^ResetCheckTheory: clean (1 theorem)$" "$log"
+require_grep "^CleanTheory: clean (1 theorem)$" "$log"
+
+# Audit helper names must not pull unrelated project modules into inference.
+cat > "$project/src/Tag.sml" <<'SML'
+val _ = load "MissingAuditModule";
+SML
+run_check CleanTheory 0 CheatTheory:fine_thm
+require_no_grep 'could not infer\|MissingAuditModule' "$log"
+
+for flag in --fingerprint --no-cache --bogus; do
+  run_check CleanTheory 1 "$flag"
+  require_grep "holbuild: unknown check option: $flag" "$log"
+  require_no_grep 'name=check\.\|name=build.plan' "$timing"
+done
+run_check CheatTheory:missing_thm 1 CleanTheory
+require_grep "holbuild: theorem not found: CheatTheory.missing_thm" "$log"
+require_no_grep '^CleanTheory: clean' "$log"
+
 # Expects check --fingerprint $1 to exit with status $2; leaves its output in
 # $log and the fingerprint lines alone in $lines.
 run_fingerprint() {
-  local theory=$1 expected=$2 status
-  log=$tmpdir/fingerprint-${theory//:/-}.log
+  local expected=$2 status
+  local theories=("$1" "${@:3}")
+  local label=${theories[*]}
+  log=$tmpdir/fingerprint-${label//:/-}.log
   lines=$log.lines
+  timing=$log.timing
+  : > "$timing"
   set +e
-  (cd "$project" && "$HOLBUILD_BIN" check --fingerprint "$theory") > "$log" 2>&1
+  (cd "$project" && HOLBUILD_TIMING_LOG="$timing" "$HOLBUILD_BIN" check --fingerprint "${theories[@]}") > "$log" 2>&1
   status=$?
   set -e
   if [[ $status -ne $expected ]]; then
-    echo "check --fingerprint $theory exited $status, expected $expected" >&2
+    echo "check --fingerprint ${theories[*]} exited $status, expected $expected" >&2
     cat "$log" >&2
     exit 1
   fi
@@ -278,6 +355,31 @@ require_grep "^fingerprint	CheatTheory	theorem	fine_thm	[0-9a-f]*	-$" "$lines"
 
 run_fingerprint UsesTheory 0
 require_grep "^fingerprint	BaseTheory	axiom	magic_ax	[0-9a-f]*	-$" "$lines"
+
+# Shared ancestors and repeated targets appear once in the sorted union.
+LC_ALL=C sort -u "$fp_lines" "$tmpdir/fingerprint-CheatTheory.log.lines" \
+  "$tmpdir/fingerprint-UsesTheory.log.lines" > "$tmpdir/fingerprint-union.lines"
+run_fingerprint UsesTheory 0 CheatTheory FpTheory UsesTheory
+cmp "$tmpdir/fingerprint-union.lines" "$lines"
+[[ $(grep -c $'^tool\tkind=run\t.*argv0=.*/bin/hol$' "$timing") -eq 1 ]]
+require_no_grep 'could not infer\|MissingAuditModule' "$log"
+run_fingerprint FpTheory 1 CheatTheory:fine_thm
+require_grep "holbuild: check --fingerprint takes a theory, not THEORY:THEOREM" "$log"
+
+# --with-fingerprints checks the selectors and prints their theories' listing
+# in the same HOL session; the exit status is the check's.
+run_check --with-fingerprints 0 FpTheory CheatTheory:fine_thm
+[[ $(grep -c $'^tool\tkind=run\t.*argv0=.*/bin/hol$' "$timing") -eq 1 ]]
+require_grep "^CheatTheory.fine_thm: clean (1 theorem)$" "$log"
+grep '^fingerprint	' "$log" > "$log.lines" || true
+require_grep "^FpTheory: clean" "$log"
+LC_ALL=C sort -u "$fp_lines" "$tmpdir/fingerprint-CheatTheory.log.lines" > "$tmpdir/with-fingerprints.expected"
+cmp "$tmpdir/with-fingerprints.expected" "$log.lines"
+run_check --with-fingerprints 1 CheatTheory:cheated_thm
+require_grep "^CheatTheory.cheated_thm: 1 finding$" "$log"
+require_grep "^fingerprint	CheatTheory	theorem	cheated_thm	[0-9a-f]*	cheat$" "$log"
+run_check --with-fingerprints 1
+require_grep "holbuild: check --with-fingerprints requires at least one selector" "$log"
 
 run_fingerprint CheatTheory:fine_thm 1
 require_grep "holbuild: check --fingerprint takes a theory, not THEORY:THEOREM" "$log"
@@ -377,3 +479,51 @@ if find "$slow/.holbuild" -name '*.save' -print -quit | grep -q .; then
   echo "check left checkpoints behind building [run].loads" >&2
   exit 1
 fi
+
+# A cold batch builds both targets; a later batch reuses the deepest checkpoint.
+project=$tmpdir/batch-checkpoint
+mkdir -p "$project/src"
+{
+  write_schema2_prelude
+  cat <<'TOML'
+[project]
+name = "batch-checkpoint"
+[build]
+members = ["src"]
+TOML
+} > "$project/holproject.toml"
+cat > "$project/src/BatchParentScript.sml" <<'SML'
+Theory BatchParent
+Theorem parent_thm: T
+Proof simp[]
+QED
+SML
+cat > "$project/src/BatchChildScript.sml" <<'SML'
+Theory BatchChild
+Ancestors BatchParent
+Theorem child_thm: T
+Proof ACCEPT_TAC parent_thm
+QED
+SML
+run_check BatchParentTheory 0 BatchChildTheory
+require_grep '^BatchParentTheory built$' "$log"
+require_grep '^BatchChildTheory built$' "$log"
+require_grep '^BatchParentTheory: clean (1 theorem)$' "$log"
+require_grep '^BatchChildTheory: clean (1 theorem)$' "$log"
+cat > "$project/src/StateProbe.sml" <<SML
+val _ =
+  let val out = TextIO.openOut "$tmpdir/check-hierarchy"
+  in
+    TextIO.output (out, String.concatWith "\\n" (PolyML.SaveState.showHierarchy ()));
+    TextIO.closeOut out
+  end;
+structure StateProbe = struct end;
+SML
+cat >> "$project/src/BatchChildScript.sml" <<'SML'
+val _ = Theory.add_ML_dependency "StateProbe";
+SML
+(cd "$project" && "$HOLBUILD_BIN" build StateProbe BatchChildTheory) > "$tmpdir/batch-checkpoint-build.log" 2>&1
+run_check BatchParentTheory 0 BatchChildTheory
+require_grep 'BatchChildScript.sml.deps/.*/deps_loaded.save' "$tmpdir/check-hierarchy"
+require_grep '^BatchParentTheory: clean (1 theorem)$' "$log"
+require_grep '^BatchChildTheory: clean (1 theorem)$' "$log"
