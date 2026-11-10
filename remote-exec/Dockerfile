@@ -7,7 +7,7 @@ ARG PYTHON_IMAGE=python:3.14-slim-trixie
 FROM ${PYTHON_IMAGE} AS polyml
 # The same Poly/ML as holbuild's CI.
 ARG POLYML_REPO=https://github.com/sequent-dev-bot/polyml.git
-ARG POLYML_TAG=v5.9.2-seq5
+ARG POLYML_TAG=v5.9.2-seq6
 RUN apt-get update \
  && apt-get install -y --no-install-recommends build-essential ca-certificates git libgmp-dev \
  && rm -rf /var/lib/apt/lists/*
