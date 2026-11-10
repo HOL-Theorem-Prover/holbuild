@@ -896,6 +896,16 @@ incrementality work should make this opportunistic reuse fire in more structural
 contexts, especially around dynamic choices and richer structural frame/event
 snapshots, while preserving the same fallback-on-mismatch contract.
 
+A checkpoint that cannot be loaded (an unreadable or missing heap, or a heap
+without holbuild's runtime) is discarded together with the checkpoints saved
+after it, and the build retries from the next earlier context. An ML static
+error, such as an undeclared identifier, in the source run after a checkpoint
+is a source error: the build fails with it at once and keeps the checkpoint.
+holbuild does not try to detect a checkpoint that loads but holds the wrong
+state. Checkpoint paths are keyed on the dependency and source-prefix keys,
+and every passing build and every tactic failure already trusts the loaded
+state, so retrying only when a static error appears would protect nothing.
+
 The prototype currently instruments AST `HOLTheoremDecl` declarations, i.e.
 modern goal/proof forms such as `Theorem ... Proof ... QED`. It parses the HOL
 source AST before expansion to ML, uses theorem/tactic spans to insert a theorem
