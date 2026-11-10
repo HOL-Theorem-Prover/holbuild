@@ -360,42 +360,66 @@ ORDER BY theory, input_key
 """)
 
 
-# The ready action to claim next; see Coordinator.claim. Only the batches with a ready action of the tiers are
-# ranked, each from its own index entries, so a claim reads neither finished batches nor finished actions.
-CLAIM = sa.text("""
+# The ready action to claim next is found in two steps; see Coordinator.claim. CLAIM_CANDIDATES ranks the running
+# batches with a ready action of an accepted class and tier, one row per batch, class and tier, best first; each
+# batch's running count and last claim come from its own index entries, so a claim reads neither finished batches
+# nor finished actions, nor every ready action: a LIMIT 1 probe per batch, class and tier looks for a ready one. CLAIM_ACTION then locks a candidate's first ready action in the
+# order of actions_ready_order, skipping those other claims hold; the first candidate with one wins. Together they
+# take the first unlocked action in the order (class, tier, batch rank, critical depth, descendants, theory, key).
+CLAIM_CANDIDATES = sa.text("""
 WITH run_capacity AS MATERIALIZED (
     SELECT 'run' = ANY(CAST(:classes AS text[])) AND (
         SELECT count(*) FROM actions WHERE state = 'running' AND class = 'run'
     ) < :run_slots AS available
-), ready_batches AS MATERIALIZED (
-    SELECT b.id, b.created_at, b.max_heap_mb,
-        (SELECT count(*) FROM actions r WHERE r.batch_id = b.id AND r.state = 'running') AS running_count,
-        (SELECT max(c.last_claimed_at) FROM actions c WHERE c.batch_id = b.id) AS last_claimed_at
-    FROM batches b
-    WHERE b.state = 'running' AND b.id IN (
-        SELECT batch_id FROM actions WHERE state = 'ready' AND tier = ANY(CAST(:tiers AS text[]))
-        AND class = ANY(CAST(:classes AS text[]))
-        AND (class = 'build' OR (SELECT available FROM run_capacity))
-    )
 )
-SELECT a.batch_id, a.input_key, a.spec_sha256, a.theory, b.max_heap_mb
-FROM actions a
-JOIN ready_batches b ON b.id = a.batch_id
-WHERE a.state = 'ready' AND a.tier = ANY(CAST(:tiers AS text[]))
-AND a.class = ANY(CAST(:classes AS text[]))
-AND (a.class = 'build' OR (SELECT available FROM run_capacity))
+SELECT b.id AS batch_id, c.class AS action_class, t.tier, b.max_heap_mb
+FROM batches b
+CROSS JOIN (SELECT DISTINCT unnest(CAST(:classes AS text[]))) c (class)
+CROSS JOIN (SELECT DISTINCT unnest(CAST(:tiers AS text[]))) t (tier)
+CROSS JOIN LATERAL (
+    SELECT FROM actions a WHERE a.batch_id = b.id AND a.state = 'ready' AND a.class = c.class AND a.tier = t.tier
+    ORDER BY a.critical_depth DESC, a.descendant_count DESC, a.theory, a.input_key
+    LIMIT 1
+) ready
+WHERE b.state = 'running'
+AND (c.class = 'build' OR (SELECT available FROM run_capacity))
 ORDER BY
-    a.class,
-    array_position(CAST(:tiers AS text[]), a.tier),
-    b.running_count,
-    b.last_claimed_at NULLS FIRST,
+    c.class,
+    array_position(CAST(:tiers AS text[]), t.tier),
+    (SELECT count(*) FROM actions r WHERE r.batch_id = b.id AND r.state = 'running'),
+    (SELECT max(l.last_claimed_at) FROM actions l WHERE l.batch_id = b.id) NULLS FIRST,
     b.created_at,
-    a.critical_depth DESC,
-    a.descendant_count DESC,
-    a.theory,
-    a.input_key
-LIMIT 1 FOR UPDATE OF a SKIP LOCKED
+    b.id
 """)
+CLAIM_ACTION = sa.text("""
+SELECT input_key, spec_sha256, theory FROM actions
+WHERE batch_id = :batch_id AND state = 'ready' AND class = :class AND tier = :tier
+ORDER BY critical_depth DESC, descendant_count DESC, theory, input_key
+LIMIT 1 FOR UPDATE SKIP LOCKED
+""")
+
+
+@dataclass(frozen=True)
+class _Claimed:
+    """The action a claim locked, and its batch's heap limit."""
+
+    batch_id: UUID
+    input_key: str
+    spec_sha256: str
+    theory: str
+    max_heap_mb: int | None
+
+
+# The unfinished actions by state, tier and class, for the queue counts, and only the ready and running ones, which
+# are all burst demand needs: the scale check runs every sweep, and waiting actions can outnumber the others many
+# times over. Literal states, so the partial index actions_unfinished serves both.
+COUNT_UNFINISHED = sa.text(
+    "SELECT state, tier, class, count(*) FROM actions "
+    "WHERE state IN ('waiting', 'ready', 'running') GROUP BY state, tier, class"
+)
+COUNT_ACTIVE = sa.text(
+    "SELECT state, tier, class, count(*) FROM actions WHERE state IN ('ready', 'running') GROUP BY state, tier, class"
+)
 
 
 ClaimRank = tuple[bool, bool, int, str]
@@ -687,11 +711,11 @@ class Coordinator:
                 {"tiers": tiers, "floor": floor},
             ):
                 # Build claims bypass this lock when the floor is full or no compatible run is ready.
-                # CLAIM rechecks capacity in a fresh snapshot after any preceding run admission commits.
+                # CLAIM_CANDIDATES rechecks capacity in a fresh snapshot after any preceding run admission commits.
                 await conn.execute(sa.text("SELECT pg_advisory_xact_lock(1752132706, 1)"))
-                row = (await conn.execute(CLAIM, {**params, "classes": ["run"], "run_slots": floor})).first()
+                row = await self._claim_first(conn, {**params, "classes": ["run"], "run_slots": floor})
             if row is None:
-                row = (await conn.execute(CLAIM, params)).first()
+                row = await self._claim_first(conn, params)
             if row is None:
                 if self.settings.run_slots == 0 or not await conn.scalar(
                     sa.text(
@@ -705,7 +729,7 @@ class Coordinator:
                 # after the preceding claimant commits, so its running run counts against the cap.
                 # This advisory key is reserved for run admission; no batch writer takes it.
                 await conn.execute(sa.text("SELECT pg_advisory_xact_lock(1752132706, 1)"))
-                row = (await conn.execute(CLAIM, {**params, "classes": ["build", "run"]})).first()
+                row = await self._claim_first(conn, {**params, "classes": ["build", "run"]})
                 if row is None:
                     return None
             token = uuid4()
@@ -731,6 +755,20 @@ class Coordinator:
             )
         self._batch_changed(row.batch_id)
         return Claim(token, row.spec_sha256, row.input_key, row.theory, self.settings.lease_seconds, row.max_heap_mb)
+
+    @staticmethod
+    async def _claim_first(conn: AsyncConnection, params: dict[str, object]) -> _Claimed | None:
+        """Lock the first ready action ``params`` accept that no other claim holds; see CLAIM_CANDIDATES."""
+        for candidate in (await conn.execute(CLAIM_CANDIDATES, params)).all():
+            row = (
+                await conn.execute(
+                    CLAIM_ACTION,
+                    {"batch_id": candidate.batch_id, "class": candidate.action_class, "tier": candidate.tier},
+                )
+            ).first()
+            if row is not None:
+                return _Claimed(candidate.batch_id, row.input_key, row.spec_sha256, row.theory, candidate.max_heap_mb)
+        return None
 
     def _wake_claim(self, tier: str) -> None:
         """Count an action of ``tier`` made ready, and wake its best-ranked compatible claim, with FIFO ties."""
@@ -1084,22 +1122,42 @@ class Coordinator:
         process in the last ``HOST_REPORT_SECONDS``, by id, and this process's last run of the scale command."""
         async with self.engine.connect() as conn:
             desired = await conn.scalar(HELD_TARGET, self._held_target_params(self.clock()))
-            rows = await conn.execute(
-                sa.text(
-                    "SELECT state, tier, class, count(*) FROM actions "
-                    "WHERE state IN ('waiting', 'ready', 'running') GROUP BY state, tier, class"
-                )
-            )
-            count: defaultdict[tuple[str, str], int] = defaultdict(int)
-            runs: defaultdict[str, int] = defaultdict(int)
-            high_run = 0
-            for state, tier, action_class, n in rows:
-                count[state, tier] += n
-                if action_class == "run":
-                    runs[state] += n
-                    if tier == "high" and state in ("ready", "running"):
-                        high_run += n
-        counts = QueueCounts(
+            counts = await self._counts(conn, COUNT_UNFINISHED)
+        demand = burst_demand(
+            counts, self.settings.warm_workers, self.settings.max_burst_workers, self.settings.run_slots
+        )
+        now = self.clock()
+        self._forget_silent_hosts(now)
+        hosts = [HostStatus(report, round((now - at).total_seconds(), 1)) for at, report in self.hosts.values()]
+        return QueueStatus(
+            counts,
+            max(desired, demand),
+            sorted(hosts, key=lambda h: h.report.id),
+            self._phase_totals(now),
+            self.scaler,
+        )
+
+    def _forget_silent_hosts(self, now: datetime) -> None:
+        """Drop the hosts no worker reported for in the last ``HOST_REPORT_SECONDS``, making room for new ones."""
+        self.hosts = {
+            host: (at, report)
+            for host, (at, report) in self.hosts.items()
+            if (now - at).total_seconds() < HOST_REPORT_SECONDS
+        }
+
+    @staticmethod
+    async def _counts(conn: AsyncConnection, statement: sa.TextClause) -> QueueCounts:
+        """The actions ``statement`` counts, by state and tier; see COUNT_UNFINISHED."""
+        count: defaultdict[tuple[str, str], int] = defaultdict(int)
+        runs: defaultdict[str, int] = defaultdict(int)
+        high_run = 0
+        for state, tier, action_class, n in await conn.execute(statement):
+            count[state, tier] += n
+            if action_class == "run":
+                runs[state] += n
+                if tier == "high" and state in ("ready", "running"):
+                    high_run += n
+        return QueueCounts(
             waiting=count["waiting", "standard"] + count["waiting", "high"],
             ready_standard=count["ready", "standard"],
             ready_high=count["ready", "high"],
@@ -1108,23 +1166,6 @@ class Coordinator:
             ready_run=runs["ready"],
             running_run=runs["running"],
             high_run=high_run,
-        )
-        demand = burst_demand(
-            counts, self.settings.warm_workers, self.settings.max_burst_workers, self.settings.run_slots
-        )
-        now = self.clock()
-        self.hosts = {
-            host: (at, report)
-            for host, (at, report) in self.hosts.items()
-            if (now - at).total_seconds() < HOST_REPORT_SECONDS
-        }
-        hosts = [HostStatus(report, round((now - at).total_seconds(), 1)) for at, report in self.hosts.values()]
-        return QueueStatus(
-            counts,
-            max(desired, demand),
-            sorted(hosts, key=lambda h: h.report.id),
-            self._phase_totals(now),
-            self.scaler,
         )
 
     async def sweep(self) -> None:
@@ -1162,11 +1203,13 @@ class Coordinator:
     async def scale(self) -> None:
         """Sample demand and apply its held target, serialized with intake and periodic checks."""
         async with self.scale_lock:
-            counts = (await self.queue()).counts
+            async with self.engine.connect() as conn:
+                counts = await self._counts(conn, COUNT_ACTIVE)
             demand = burst_demand(
                 counts, self.settings.warm_workers, self.settings.max_burst_workers, self.settings.run_slots
             )
             now = self.clock()
+            self._forget_silent_hosts(now)
             async with self.engine.begin() as conn:
                 await conn.execute(
                     sa.text("DELETE FROM burst_demand WHERE at < CAST(:now AS timestamptz) - make_interval(secs => :hold)"),
