@@ -111,6 +111,7 @@ async def coordinator(remote_exec_engine: AsyncEngine, cache: FakeCache) -> Asyn
         max_attempts=3,
         standard_tier_mb=1000,
         events_poll_seconds=0.01,
+        events_fallback_seconds=0.01,
     )
     async with httpx.AsyncClient(base_url=settings.cache_url, transport=httpx.MockTransport(cache.handle_async)) as client:
         coordinator = Coordinator(remote_exec_engine, client, settings)

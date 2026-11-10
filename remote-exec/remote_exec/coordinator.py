@@ -13,7 +13,7 @@ import os
 import shlex
 import time
 from collections import defaultdict, deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from typing import Annotated, Self
@@ -40,6 +40,8 @@ IN_CACHE_TRUST_SECONDS = 60
 # How many requests a release has in flight to the cache at once. At most two releases run at once (a pass over every
 # batch and one of single batches), so together they stay within the cache client's 100 connections.
 RELEASE_CACHE_CHECKS = 48
+# Transactions a release pass holds at once, so a pass over many batches leaves pooled connections to the rest.
+RELEASE_TRANSACTIONS = 8
 RELEASE_SLOW_SECONDS = 5.0  # a release pass that takes this long is logged
 
 # A statement, or a transaction left idle, that runs longer than this is ended by the database, so one stuck
@@ -83,11 +85,14 @@ class Settings(BaseSettings):
     batch_deadline_hours: float = 12.0
     hint_ttl_days: int = 30
     sweep_seconds: float = 5.0
+    # An event stream reads its batch at most this often, when a write of this process to the batch wakes it, and
+    # at least every events_fallback_seconds, for the writes of other coordinator processes.
     events_poll_seconds: float = 1.0
+    events_fallback_seconds: float = 10.0
     # An event stream with nothing to send this long sends a blank line, shorter than proxies' idle timeouts.
     events_keepalive_seconds: float = 15.0
     # Database connections the coordinator holds at most, and how long a request waits for one before it fails.
-    database_pool_size: int = 20
+    database_pool_size: int = 50
     database_pool_timeout_s: float = 10.0
     # Burst workers: workers that a scaler starts and stops on top of `warm_workers` always-on ones.
     run_slots: int = Field(default=30, ge=0)
@@ -330,9 +335,9 @@ REFRESH_CHILDREN = sa.text(
     )
 )
 
-# The waiting actions whose parents are all done, with each parent's input and action-cache keys; see
-# Coordinator.release.
-RELEASABLE = sa.text("""
+# The waiting actions whose parents are all done, with each parent's input and action-cache keys, of every batch
+# or of one; see Coordinator.release. Two statements, so the database plans the one-batch read by its batch.
+RELEASABLE = """
 SELECT a.batch_id, a.input_key, ARRAY(
     SELECT ROW(e.parent_key, (
         SELECT p.ac_key FROM actions p WHERE p.batch_id = e.batch_id AND p.input_key = e.parent_key
@@ -340,9 +345,10 @@ SELECT a.batch_id, a.input_key, ARRAY(
     FROM edges e WHERE e.batch_id = a.batch_id AND e.input_key = a.input_key
 ) AS parents
 FROM actions a JOIN batches b ON b.id = a.batch_id
-WHERE a.state = 'waiting' AND a.remaining_deps = 0 AND b.state = 'running'
-AND (CAST(:batch_id AS uuid) IS NULL OR a.batch_id = :batch_id)
-""")
+WHERE a.state = 'waiting' AND a.remaining_deps = 0 AND b.state = 'running'{batch}
+"""
+RELEASABLE_ALL = sa.text(RELEASABLE.format(batch=""))
+RELEASABLE_BATCH = sa.text(RELEASABLE.format(batch=" AND a.batch_id = :batch_id"))
 
 
 # The actions of a batch written by transactions numbered :since or later; see Coordinator.changes.
@@ -439,6 +445,8 @@ class Coordinator:
         self.hosts: dict[str, tuple[datetime, HostReport]] = {}
         # The phase reports of the last PHASE_WINDOW_SECONDS, oldest first, and when each came; also in memory.
         self.phase_reports: deque[tuple[datetime, PhaseReport]] = deque(maxlen=MAX_PHASE_REPORTS)
+        # The wakes of the event streams following each batch; see watch.
+        self.batch_watchers: dict[UUID, set[asyncio.Event]] = {}
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "Coordinator":
@@ -575,6 +583,25 @@ class Coordinator:
             status = BatchStatus(batch_id, batch.state, batch.failure, [ActionStatus(*row[:-1], json.loads(row[-1]) if row[-1] is not None else None) for row in actions])
             return status, int(batch.xmin)
 
+    @contextlib.contextmanager
+    def watch(self, batch_id: UUID) -> Iterator[asyncio.Event]:
+        """An event, set from the start and again after each write of this process to ``batch_id``'s actions or
+        state commits, for one follower of the batch to clear before each read of its changes."""
+        event = asyncio.Event()
+        event.set()
+        watchers = self.batch_watchers.setdefault(batch_id, set())
+        watchers.add(event)
+        try:
+            yield event
+        finally:
+            watchers.discard(event)
+            if not watchers:
+                del self.batch_watchers[batch_id]
+
+    def _batch_changed(self, batch_id: UUID) -> None:
+        for event in self.batch_watchers.get(batch_id, ()):
+            event.set()
+
     async def cancel(self, batch_id: UUID) -> str | None:
         """Cancel a running batch; its leases go, so its workers' heartbeats and completions are refused."""
         async with self.engine.begin() as conn:
@@ -582,7 +609,8 @@ class Coordinator:
             if state != "running":
                 return state
             await self._end_batch(conn, batch_id, "cancelled", None)
-            return "cancelled"
+        self._batch_changed(batch_id)
+        return "cancelled"
 
     async def claim(
         self,
@@ -701,6 +729,7 @@ class Coordinator:
                     "lease": self.settings.lease_seconds,
                 },
             )
+        self._batch_changed(row.batch_id)
         return Claim(token, row.spec_sha256, row.input_key, row.theory, self.settings.lease_seconds, row.max_heap_mb)
 
     def _wake_claim(self, tier: str) -> None:
@@ -846,6 +875,7 @@ class Coordinator:
                 await self._fail(
                     conn, batch_id, action.input_key, action.action_class, f"{action.theory}: {result.failure}{detail}"
                 )
+        self._batch_changed(batch_id)
         self.request_release(batch_id)
         return True
 
@@ -889,13 +919,17 @@ class Coordinator:
         while True:
             started = time.monotonic()
             async with self.engine.connect() as conn:
-                rows = await conn.execute(RELEASABLE, {"batch_id": batch_id})
+                if batch_id is None:
+                    rows = await conn.execute(RELEASABLE_ALL)
+                else:
+                    rows = await conn.execute(RELEASABLE_BATCH, {"batch_id": batch_id})
                 candidates: defaultdict[UUID, dict[str, list[tuple[str, str]]]] = defaultdict(dict)
                 for row in rows:
                     candidates[row.batch_id][row.input_key] = list(row.parents)
             limit = asyncio.Semaphore(RELEASE_CACHE_CHECKS)
+            transactions = asyncio.Semaphore(RELEASE_TRANSACTIONS)
             results = await asyncio.gather(
-                *(self._release_batch(batch, actions, limit) for batch, actions in candidates.items()),
+                *(self._release_batch(batch, actions, limit, transactions) for batch, actions in candidates.items()),
                 return_exceptions=True,  # one batch's failure doesn't cut the others' releases short
             )
             for batch, result in zip(candidates, results, strict=True):
@@ -915,15 +949,19 @@ class Coordinator:
                 return
 
     async def _release_batch(
-        self, batch_id: UUID, candidates: dict[str, list[tuple[str, str]]], limit: asyncio.Semaphore
+        self,
+        batch_id: UUID,
+        candidates: dict[str, list[tuple[str, str]]],
+        limit: asyncio.Semaphore,
+        transactions: asyncio.Semaphore,
     ) -> bool:
-        """``release`` of the ``candidates`` of one batch, their parents' cache checks ``limit`` at a time with the
-        other batches' of the pass. Whether it re-queued a parent."""
+        """``release`` of the ``candidates`` of one batch, their parents' cache checks ``limit`` and its
+        transactions ``transactions`` at a time with the other batches' of the pass. Whether it re-queued a parent."""
         present = await self._in_cache_all({ac_key for parents in candidates.values() for _, ac_key in parents}, limit)
         ready = [key for key, parents in candidates.items() if all(present[ac_key] for _, ac_key in parents)]
         if ready:
             # Taking the batch's lock before its actions', as every other writer does.
-            async with self.engine.begin() as conn:
+            async with transactions, self.engine.begin() as conn:
                 if await self._lock_batch(conn, batch_id) != "running":
                     return False
                 tiers = await conn.scalars(
@@ -934,13 +972,15 @@ class Coordinator:
                     {"batch_id": batch_id, "keys": ready},
                 )
                 made_ready = list(tiers)
+            self._batch_changed(batch_id)
             for tier in made_ready:
                 self._wake_claim(tier)
         requeued = False
         for parents in candidates.values():
             for parent, ac_key in parents:
                 if present[ac_key] is False:
-                    requeued |= await self._requeue_evicted(batch_id, parent)
+                    async with transactions:
+                        requeued |= await self._requeue_evicted(batch_id, parent)
         return requeued
 
     async def expire_leases(self) -> None:
@@ -996,6 +1036,7 @@ class Coordinator:
                     )
                 else:
                     await self._retry(conn, batch_id, lease.input_key)
+            self._batch_changed(batch_id)
 
     async def fail_overdue(self) -> None:
         """Fail the batches still running ``batch_deadline_hours`` after their submission: one that can't finish,
@@ -1016,6 +1057,7 @@ class Coordinator:
             async with self.engine.begin() as conn:
                 if await self._lock_batch(conn, batch_id) == "running":
                     await self._end_batch(conn, batch_id, "failed", f"deadline: still running after {hours:g} h")
+            self._batch_changed(batch_id)
 
     async def delete_expired(self) -> None:
         """Delete terminal batches past the retention period, a bounded number at a time, and stale peak hints."""
@@ -1275,13 +1317,15 @@ class Coordinator:
             ).one()
             if action.state != "done":
                 return False
-            if action.attempts >= self.settings.max_attempts:
+            requeued = action.attempts < self.settings.max_attempts
+            if requeued:
+                await self._requeue(conn, batch_id, parent)
+            else:
                 await self._fail_batch(
                     conn, batch_id, parent, f"resubmit: {action.theory} (theory {parent}) is not in the cache after it built"
                 )
-                return False
-            await self._requeue(conn, batch_id, parent)
-            return True
+        self._batch_changed(batch_id)
+        return requeued
 
     async def _input_missing(
         self, conn: AsyncConnection, batch_id: UUID, input_key: str, theory: str, attempts: int, result: Result
