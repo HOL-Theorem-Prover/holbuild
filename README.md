@@ -1773,11 +1773,21 @@ analysers, and a toolchain another holbuild process is using is kept.
 Workers sharing a host coordinate sweeps through `<cache root>/locks/gc.lock`;
 share `locks/` along with the cache directories. Private checkpoints and theory modules are sized
 on every action. With a positive reserve and a target of at least 64 GiB,
-shared sizes can be reused for up to 60 seconds when the last measurement plus
-current private sizes fit under the target. Smaller targets and zero-reserve
-runs are scanned live. This is a housekeeping limit: shared growth during
-that interval is accounted for at the next scan, rather than reserved on each
-write. Each cached root's device and inode must match the measurement; roots
+shared sizes can be reused for 60 seconds when the last measurement plus
+current private sizes fit under the target. An expired fitting estimate is
+rechecked under `gc.lock` and may defer scanning for five minutes from its
+first reuse. Its grace is bound to that exact measurement in
+`locks/worker-cache-cap.grace`; replacing the measurement resets the grace.
+Idle time does not consume it. After the result, a measurement older than
+30 seconds is refreshed under a separate single-flight scan lock. The
+read-only walk leaves `gc.lock` available; publication briefly tries that
+lock and checks that the old stamp and root identities have not changed.
+An over-target refresh waits for `gc.lock` and enforces the cap.
+
+Smaller targets and zero-reserve runs are scanned live. Measurements are
+dated at scan completion. This is a housekeeping limit: concurrent writes
+during scans and reuse are accounted for by later scans, rather than
+reserved on each write. Each cached root's device and inode must match the measurement; roots
 that differ are sized live, so partial directory sharing remains safe without
 repeatedly replacing a sibling's measurement. Eviction lists are built only
 when the measured cache exceeds its target.
