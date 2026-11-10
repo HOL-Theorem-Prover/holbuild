@@ -934,7 +934,7 @@ class Coordinator:
     def _forget_rankings(self, batch_id: UUID, tiers: set[str]) -> None:
         """Drop the rankings that would pass over actions of ``tiers`` made ready in ``batch_id``: those that didn't
         have it with a ready action of one of them, or have since found it without one. Rankings being read when
-        there was none to drop, or one was dropped, are not kept either; see _keep_ranking."""
+        there was none to drop, or one was dropped, are neither joined by later claims nor kept; see _keep_ranking."""
         keys = {key for key in [*self.rankings, *self.ranking_reads] if tiers.intersection(key)}
         stale = {
             key for key in keys
@@ -947,6 +947,8 @@ class Coordinator:
             self.rankings_forgotten += 1
             for key in stale:
                 self.rankings.pop(key, None)
+                # Claims already waiting for a read still get it; later ones start their own.
+                self.ranking_reads.pop(key, None)
 
     def _wake_claim(self, tier: str) -> None:
         """Count an action of ``tier`` made ready, and wake its best-ranked compatible claim, with FIFO ties."""
