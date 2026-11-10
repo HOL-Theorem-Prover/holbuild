@@ -268,6 +268,9 @@ fun follow url batch_id (on_change : string * string * string option * HolbuildR
                       ("done", SOME reason) => HolbuildStatus.message_stderr
                         ("holbuild: warning: remote " ^ Option.getOpt (json_string_field "theory" line, key) ^
                          " action log unavailable: " ^ reason ^ "\n")
+                    | ("failed", SOME reason) => HolbuildStatus.message_stderr
+                        ("holbuild: warning: remote " ^ Option.getOpt (json_string_field "theory" line, key) ^
+                         " action log unavailable: " ^ reason ^ "\n")
                     | _ => ());
                  on_change (key, state, failure, log))
             end

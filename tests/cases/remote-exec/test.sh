@@ -263,7 +263,10 @@ rm "$state/skip"
 # retry succeeds. --remote-only requests diagnostics without running HOL.
 write_theories six
 touch "$state/fail"
+mkdir -p "$project/.holbuild/logs/current/rx/ATheory"
+echo stale > "$project/.holbuild/logs/current/rx/ATheory/build.log"
 run failed-only 75 build --remote-exec "$coordinator" --remote-only BTheory
+[[ ! -e "$project/.holbuild/logs/current/rx/ATheory/build.log" ]] || { echo 'stale failed-action log survived' >&2; exit 1; }
 require_grep "remote rx:ATheory: failed (proof)" "$tmpdir/failed-only.log"
 require_grep "remote execution: batch b7 failed: an action failed; remote workers finished 0 of 2 theories" "$tmpdir/failed-only.log"
 run failed 1 build --remote-exec "$coordinator" BTheory
@@ -1805,3 +1808,47 @@ require_grep 'TimeoutTheory restored from cache' "$tmpdir/ring-client.log"
 refute_grep 'remote batch\|Theory built' "$tmpdir/ring-client.log"
 require_grep '^proof-timeout=2.5$' "$tmpdir/ring-client-cache/actions/$ring_key/manifest"
 cmp "${ranked_roots[0]}/ac/$ring_ac" "$tmpdir/ring-weak-ac"
+
+# Large action logs use the compressed representation end to end, including
+# required logs and failed proofs. Each restored file must be the worker log.
+project=$tmpdir/large-log-project
+mkdir -p "$project/src"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxlarge"
+[build]
+members = ["src"]
+TOML
+write_large_log() {
+  local theory=$1 conclusion=$2
+  cat > "$project/src/${theory}Script.sml" <<SML
+Theory $theory
+Ancestors bool
+val block = String.implode (List.tabulate (1048576, fn _ => #"x"));
+val _ = List.app (fn _ => print block) (List.tabulate (257, fn i => i));
+val _ = print "\\nlarge-action-log-marker\\n";
+Theorem log_thm:
+  $conclusion
+Proof
+  simp[]
+QED
+SML
+}
+check_large_log() {
+  local run_name=$1 theory=$2 batch key raw_hash local_log
+  batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/$run_name.log")
+  key=$(awk -v name="rxlarge:${theory}Theory" '$1 == "action" && $5 == name { print $2 }' "$state/$batch.batch")
+  raw_hash=$(awk '/^log-zstd=/ { print $3 }' "$state/result-$key")
+  [[ "$raw_hash" =~ ^[0-9a-f]{64}$ ]] || { echo 'missing compressed log reference' >&2; exit 1; }
+  local_log="$project/.holbuild/logs/current/rxlarge/${theory}Theory/build.log"
+  [[ $(sha256sum "$local_log" | cut -d' ' -f1) == "$raw_hash" ]] || { echo 'restored log digest mismatch' >&2; exit 1; }
+}
+write_large_log Large T
+run large-log 0 build --remote-exec "$coordinator" --remote-only LargeTheory
+check_large_log large-log Large
+run large-log-required 0 build --remote-exec "$coordinator" --remote-only --force=theory LargeTheory
+check_large_log large-log-required Large
+write_large_log LargeFail F
+run large-log-failure 1 build --remote-exec "$coordinator" --remote-only LargeFailTheory
+check_large_log large-log-failure LargeFail

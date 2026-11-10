@@ -7140,6 +7140,10 @@ fun node_with_input_key (options : build_options) tc project plan toolchain_key 
               (HolbuildBuildPlan.selected_nodes plan)
   end
 
+fun clear_remote_build_log project node =
+  remove_file (current_build_log (current_log_dir (project_artifact_root project)
+    (package node) (logical_name node)))
+
 (* Fetch a worker's log to the same location as a local theory build. *)
 fun fetch_remote_build_log project node log_ref =
   let

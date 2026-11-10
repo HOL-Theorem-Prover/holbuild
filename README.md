@@ -1859,6 +1859,11 @@ write `proof-trace.log` there and print a trace summary and its log path.
 If an optional log could not be uploaded, the client warns and does not retain
 a previous execution's log as the new one. A prolonged cache outage or worker
 loss can still prevent recovery of a log.
+A forced or traced action or a final proof failure is retried if its required
+log cannot be uploaded; compression cannot guarantee that the log fits.
+Deploy a coordinator supporting compressed log metadata before clients and
+workers that produce it. Rolling the coordinator back makes compressed logs
+and publication errors unavailable until that support is restored.
 A forced or traced build falls back locally if its required log cannot be
 returned; with `--remote-only` it fails with status 75. It never reports
 success with an old or absent log. The client restores the

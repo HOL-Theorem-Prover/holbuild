@@ -1660,6 +1660,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     | SOME node =>
                         let
                           val name = HolbuildBuildPlan.logical_name node
+                          val _ = HolbuildBuildExec.clear_remote_build_log project node
                           val is_proof = kind = "proof" orelse kind = "tactic-timeout"
                           val error =
                             case log_sha256 of
@@ -1723,7 +1724,10 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 HolbuildRemoteExec.while_followed url batch_id follow_batch
               end
             fun report_failed_log ({input_key, log_sha256, ...} : HolbuildRemoteExec.action_failure) =
-              case log_sha256 of
+              let
+                val node = HolbuildBuildExec.node_with_input_key build_options tc project plan toolchain_key input_key
+                val _ = Option.app (HolbuildBuildExec.clear_remote_build_log project) node
+              in case log_sha256 of
                   NONE => ()
                 | SOME sha =>
                     let
@@ -1731,7 +1735,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                         HolbuildBuildExec.warn ("remote execution: could not fetch the failed theory's build log: " ^
                           input_key ^ ": " ^ reason)
                     in
-                      (case HolbuildBuildExec.node_with_input_key build_options tc project plan toolchain_key input_key of
+                      (case node of
                            NONE => warn_log "the action is not in the current plan"
                          | SOME node =>
                              case HolbuildBuildExec.fetch_remote_build_log project node sha of
@@ -1744,6 +1748,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                            | OS.SysErr (reason, _) => warn_log reason
                            | e as IO.Io _ => warn_log (General.exnMessage e)
                     end
+              end
             (* A theory the remote cache holds may not fit the parents it holds,
                as when a nondeterministic theory was built twice; the workers
                then can't use it, and the coordinator fails the batch for
