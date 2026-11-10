@@ -106,11 +106,6 @@ fun build_help () = print
   \  --tactic-timeout SECONDS\n\
   \  --trace-steps\n\
   \  --repl-on-failure\n\
-  \  --cached-proofs\n\
-  \      Reuse a theorem proved by an earlier --cached-proofs build when its\n\
-  \      statement, proof text and the saved theorems it used are unchanged,\n\
-  \      instead of running its proof. Outputs it builds serve only other\n\
-  \      --cached-proofs builds.\n\
   \  --retain-debug-artifacts\n\
   \  --emit-output-hashes\n\
   \  --warn-unreachable\n\
@@ -441,8 +436,7 @@ fun split_flags args =
       extract_flag "--allow-cache-timeout-discrepancy" args_without_emit_output_hashes
     val (_, args_without_all_checkpoints) =
       extract_flag "--all-checkpoints" args_without_allow_discrepancy
-    val (fail_fast, args_without_fail_fast) = extract_flag "--fail-fast" args_without_all_checkpoints
-    val (cached_proofs, build_args) = extract_flag "--cached-proofs" args_without_fail_fast
+    val (fail_fast, build_args) = extract_flag "--fail-fast" args_without_all_checkpoints
     fun loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable rest =
       case rest of
           [] => ({dry_run = dry, watch = watch, force = force, use_cache = use_cache,
@@ -459,8 +453,7 @@ fun split_flags args =
                   retain_debug_artifacts = retain_debug_artifacts,
                   warn_unreachable = warn_unreachable,
                   emit_output_hashes = emit_output_hashes,
-                  allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy,
-                  cached_proofs = cached_proofs}, [])
+                  allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy}, [])
         | "--dry-run" :: xs =>
             loop true watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
         | "--watch" :: xs =>
@@ -546,7 +539,7 @@ fun plain_build_request targets =
     tactic_timeout = NONE, tactic_timeout_set = false, execution_plan = NONE,
     trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
     warn_unreachable = false, emit_output_hashes = false,
-    allow_cache_timeout_discrepancy = false, cached_proofs = false},
+    allow_cache_timeout_discrepancy = false},
    targets)
 
 (* heap, executable, run and repl build without proof steps, so no step
@@ -561,7 +554,7 @@ fun heap_build_request targets =
     tactic_timeout = NONE, tactic_timeout_set = false, execution_plan = NONE,
     trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
     warn_unreachable = false, emit_output_hashes = false,
-    allow_cache_timeout_discrepancy = false, cached_proofs = false},
+    allow_cache_timeout_discrepancy = false},
    targets)
 
 fun has_suffix suffix s =
@@ -1130,7 +1123,7 @@ datatype build_mode =
                   outputs_dir : string, profile : string option}
   | RemoteExec of {url : string, remote_only : bool, detach : bool, attach : string option, priority : int}
 
-fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, fail_fast, proof_steps, new_ir, proof_scope, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy, cached_proofs}, targets) =
+fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, fail_fast, proof_steps, new_ir, proof_scope, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy}, targets) =
   let
     val project =
       case prepared of
@@ -1175,12 +1168,6 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         raise Error "--trace-steps requires proof steps; remove --skip-proof-steps"
       else if not proof_steps andalso repl_on_failure then
         raise Error "--repl-on-failure requires proof steps; remove --skip-proof-steps"
-      else if cached_proofs andalso trknl then
-        raise Error "--cached-proofs does not support the tracing kernel"
-      else if cached_proofs andalso not proof_steps then
-        raise Error "--cached-proofs requires proof steps; remove --skip-proof-steps"
-      else if cached_proofs andalso (trace_steps orelse Option.isSome execution_plan) then
-        raise Error "--cached-proofs does not support --trace-steps or --execution-plan"
       else ()
     val _ =
       if proof_scope = HolbuildTacticTimeoutPolicy.ProofAll andalso
@@ -1236,7 +1223,6 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
        repl_on_failure = repl_on_failure,
        emit_output_hashes = emit_output_hashes,
        allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy,
-       cached_proofs = cached_proofs,
        trknl = trknl,
        restore_only = (case mode of RemoteExec {remote_only, ...} => remote_only | _ => false)}
     fun prepared_sources () =
@@ -1942,13 +1928,11 @@ fun split_tool_cache_flag args =
 fun action_spec_command tc cli_jobs args =
   let
     val upload = List.exists (fn arg => arg = "--upload") args
-    val parsed as ({dry_run, watch, repl_on_failure, execution_plan, cached_proofs, ...}, _) =
+    val parsed as ({dry_run, watch, repl_on_failure, execution_plan, ...}, _) =
       split_flags (split_tool_cache_flag (List.filter (fn arg => arg <> "--upload") args))
     val _ =
       if dry_run orelse watch orelse repl_on_failure orelse Option.isSome execution_plan then
         raise Error "action-spec does not run builds: remove --dry-run, --watch and --repl-on-failure"
-      else if cached_proofs then
-        raise Error "--cached-proofs is a build option"
       else ()
   in
     build_once_with_prepared_mode (ExportActionSpecs {upload = upload}) tc cli_jobs NONE parsed
@@ -2026,13 +2010,11 @@ fun run_action_command tc cli_jobs args =
             else [flag]
     val rest = parse args
     val (flags as {dry_run, watch, trace_steps, repl_on_failure, execution_plan, use_cache,
-                   tactic_timeout_set, proof_scope, new_ir, cached_proofs, ...}, targets) =
+                   tactic_timeout_set, proof_scope, new_ir, ...}, targets) =
       split_flags ("--skip-proof-steps" :: rest)
     val _ =
       if dry_run orelse watch orelse trace_steps orelse repl_on_failure orelse Option.isSome execution_plan then
         raise Error "run-action does not run builds: remove --dry-run, --watch, --trace-steps and --repl-on-failure"
-      else if cached_proofs then
-        raise Error "--cached-proofs is a build option"
       else if not use_cache then
         raise Error "run-action: a run's context comes from the cache, so --no-cache can't apply"
       else if tactic_timeout_set orelse proof_scope = HolbuildTacticTimeoutPolicy.ProofAll orelse new_ir then
@@ -2332,7 +2314,6 @@ fun default_build_options trknl project index entry_plan plan =
      repl_on_failure = false,
      emit_output_hashes = false,
      allow_cache_timeout_discrepancy = false,
-     cached_proofs = false,
      trknl = trknl,
      restore_only = false, fail_fast = false}
   end
@@ -2371,7 +2352,6 @@ fun heap_build_options trknl =
    repl_on_failure = false,
    emit_output_hashes = false,
    allow_cache_timeout_discrepancy = false,
-   cached_proofs = false,
    trknl = trknl,
    restore_only = false, fail_fast = false}
 
