@@ -97,10 +97,13 @@ consumers. An explicit CLI `--tactic-timeout` takes precedence; `0` disables the
 timeout for the named theory.
 
 On timeout:
-1. Runtime timeout wrapper raises the timeout marker/failure
-2. Child log records tactic label/plan position, source span, and input goal evidence where available
-3. holbuild reports the timed-out tactic and **does not retry** through the plain non-instrumented fallback
-4. Build fails
+1. The step runs once more with half the timeout; if that finishes, the step passes and the build log gets a `holbuild tactic timeout retry passed: <step> (...)` line
+2. Otherwise the runtime timeout wrapper raises the timeout marker/failure, with the full timeout
+3. Child log records tactic label/plan position, source span, and input goal evidence where available
+4. holbuild reports the timed-out tactic and **does not retry** through the plain non-instrumented fallback
+5. Build fails
+
+To list the steps that passed only on their retry in the last build: `grep -h "tactic timeout retry passed" .holbuild/logs/current/*/*/build.log`.
 
 For full semantic production builds of large projects, use `--tactic-timeout 0`.
 
