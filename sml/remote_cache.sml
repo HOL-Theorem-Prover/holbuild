@@ -491,19 +491,19 @@ fun metadata_text manifest blobs =
      map (fn {sha256, size} => "blob " ^ sha256 ^ " " ^ size) blobs @
      [manifest_marker ^ manifest])
 
-fun get_action cache key =
+(* An action's metadata, without recording its blobs as present: a caller
+   that may not use the manifest records them with remember_action. *)
+fun fetch_action cache key =
   let
     val tmp = temp_path "action"
     fun cleanup () = remove_file tmp
   in
     case curl_get_urls {urls = action_urls cache key, dst = tmp} of
         HolbuildCacheBackend.Hit =>
-          let
-            val {blobs, manifest} = metadata_manifest (read_text tmp)
-            val _ = List.app (remember_blob cache) blobs
+          let val action = metadata_manifest (read_text tmp)
           in
             cleanup ();
-            SOME manifest
+            SOME action
           end
       | HolbuildCacheBackend.Miss => (cleanup (); NONE)
       | HolbuildCacheBackend.Corrupt message =>
@@ -511,6 +511,11 @@ fun get_action cache key =
   end
   handle e as Unavailable _ => raise e
        | _ => NONE
+
+fun remember_action cache {blobs, manifest} =
+  (List.app (remember_blob cache) blobs; manifest)
+
+fun get_action cache key = Option.map (remember_action cache) (fetch_action cache key)
 
 fun action_metadata cache key text =
   let

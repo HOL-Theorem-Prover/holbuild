@@ -157,6 +157,17 @@ background=()
 
 kept() { [[ -e "$1" ]] || { echo "the cache cap evicted $2" >&2; exit 1; }; }
 evicted() { [[ ! -e "$1" ]] || { echo "the cache cap kept $2" >&2; exit 1; }; }
+# stamped_within STATE GB WHAT: an eviction re-measured the shared roots,
+# rather than leaving no stamp or publishing pre-eviction totals.
+stamped_within() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import pathlib, sys
+path, gb, what = sys.argv[1:]
+assert pathlib.Path(path).exists(), f"no stamp after {what}"
+total = sum(map(int, pathlib.Path(path).read_text().split()[3::2]))
+assert total <= int(gb) * 1024 ** 3, f"stamp after {what} holds {total} bytes, over {gb} GiB"
+PY
+}
 kept "$entry_pinned/weight" "a toolchain in use"
 evicted "$checkpoints/NewScript.deps" "private checkpoints after the action"
 evicted "$entry_idle" "the idle toolchain"
@@ -262,7 +273,7 @@ cp "$state" "$tmpdir/reserve-state"
 at 2000 "$cache4/blobs/first"
 sparse "$cache4/checkpoints/pkg/PrivateScript.deps/key/deps_loaded.save" 97
 sweep4 100 1
-evicted "$state" "the measurement after private checkpoint growth caused eviction"
+stamped_within "$state" 2 "private checkpoint growth caused eviction"
 evicted "$cache4/blobs/first" "old shared data before a new private checkpoint"
 evicted "$cache4/checkpoints/pkg/PrivateScript.deps" "private checkpoints after the action"
 sparse "$cache4/blobs/first" 1
@@ -334,12 +345,19 @@ set +e
 HOLBUILD_CACHE=$cache5 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
   --result "$tmpdir/result" --cache-limit-gb 100 --cache-reserve-gb 1 > "$tmpdir/modules.log" 2>&1
 set -e
-evicted "$state" "the measurement after private module growth caused eviction"
+stamped_within "$state" 2 "private module growth caused eviction"
 evicted "$cache4/blobs/first" "old shared data before a new private module"
 kept "$cache5/theory-modules/large.pmo" "private modules under the target"
 rm "$cache5/theory-modules/large.pmo"
 sparse "$cache4/blobs/first" 1
 # Refresh through the aliases, preserving coverage of their apparent bytes.
+python3 - "$state" <<'EXPIRE'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+lines = path.read_text().splitlines()
+lines[1] = "0"
+path.write_text("\n".join(lines) + "\n")
+EXPIRE
 set +e
 HOLBUILD_CACHE=$cache5 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
   --result "$tmpdir/result" --cache-limit-gb 100 --cache-reserve-gb 1 > "$tmpdir/modules-refresh.log" 2>&1
@@ -367,8 +385,15 @@ set +e
 HOLBUILD_CACHE=$cache6 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
   --result "$tmpdir/result" --cache-limit-gb 100 --cache-reserve-gb 1 > "$tmpdir/partial-large.log" 2>&1
 set -e
-evicted "$state" "the measurement after a differing private root exceeded the target"
+stamped_within "$state" 99 "a differing private root exceeded the target"
 evicted "$cache6/blobs/private" "the differing private root over the target"
+# The next action reuses the post-eviction stamp instead of scanning again.
+cp "$state" "$tmpdir/post-eviction-state"
+set +e
+HOLBUILD_CACHE=$cache6 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
+  --result "$tmpdir/result" --cache-limit-gb 100 --cache-reserve-gb 1 > "$tmpdir/post-eviction.log" 2>&1
+set -e
+cmp "$state" "$tmpdir/post-eviction-state" || { echo "the action after an eviction scanned again" >&2; exit 1; }
 # Seed a reusable stamp, then perform a separate small-cap eviction.
 sparse "$cache6/blobs/private" 2
 set +e
@@ -376,12 +401,12 @@ HOLBUILD_CACHE=$cache6 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action 
   --result "$tmpdir/result" --cache-limit-gb 100 --cache-reserve-gb 1 > "$tmpdir/partial-refresh.log" 2>&1
 set -e
 [[ -s "$state" ]] || { echo "no refreshed shared measurement" >&2; exit 1; }
-# A real eviction must invalidate, rather than publish pre-eviction totals.
+# A real eviction must re-measure, rather than publish pre-eviction totals.
 set +e
 HOLBUILD_CACHE=$cache6 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
   --result "$tmpdir/result" --cache-limit-gb 1 --cache-reserve-gb 0 > "$tmpdir/invalidate.log" 2>&1
 set -e
-evicted "$state" "a pre-eviction size stamp"
+stamped_within "$state" 1 "a small-cap eviction"
 evicted "$cache6/blobs/private" "a private blob over the cap"
 
 # Existing caches may still have the old directory-shaped GC lock.

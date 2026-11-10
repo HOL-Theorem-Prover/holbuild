@@ -142,12 +142,11 @@ fun fetch_blob cache {hash, dst} =
     fun corrupt detail = HolbuildCacheBackend.Corrupt (detail ^ ": " ^ hash)
   in
     if not (path_exists blob) then HolbuildCacheBackend.Miss
-    else if not (file_hash_matches blob hash) then
-      corrupt "cache blob SHA256 mismatch"
     else
+      (* Hashing the copy alone checks the cached blob as well. *)
       (link_or_copy {src = blob, dst = dst};
        if file_hash_matches dst hash then HolbuildCacheBackend.Hit
-       else (remove_file dst; corrupt "materialized blob SHA256 mismatch"))
+       else (remove_file dst; corrupt "cache blob SHA256 mismatch"))
   end
   handle Error msg => HolbuildCacheBackend.Corrupt msg
        | e => HolbuildCacheBackend.Corrupt (General.exnMessage e)
