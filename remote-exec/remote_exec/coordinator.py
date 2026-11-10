@@ -87,9 +87,13 @@ class Settings(BaseSettings):
     batch_deadline_hours: float = 12.0
     hint_ttl_days: int = 30
     sweep_seconds: float = 5.0
-    # An event stream reads its batch at most this often, when a write of this process to the batch wakes it, and
-    # at least every events_fallback_seconds, for the writes of other coordinator processes.
+    # An event stream reads its batch when a write of this process to the batch wakes it, on average at most once
+    # every events_poll_seconds, and at least every events_fallback_seconds, for the writes of other coordinator
+    # processes. Up to events_burst reads, events_burst_spacing_seconds apart, may come sooner, so that a short
+    # batch's few changes (ready, running, done) reach its client at once.
     events_poll_seconds: float = 1.0
+    events_burst: int = 3
+    events_burst_spacing_seconds: float = 0.1
     events_fallback_seconds: float = 10.0
     # An event stream with nothing to send this long sends a blank line, shorter than proxies' idle timeouts.
     events_keepalive_seconds: float = 15.0
@@ -237,7 +241,8 @@ class PhaseReport:
     before a claim, in claim requests, sleeping after a claim got nothing, taking and giving up an action's lease
     (scale-in protection, the heartbeat thread), finding the action's holbuild release,
     in exec-action before its first HOL child, from then to its last HOL child's end, after it, all of exec-action
-    when the worker can't see HOL children, and reporting the result."""
+    when the worker can't see HOL children, reporting the result, and in exec-action after its result, as it
+    publishes for later actions."""
 
     memory_wait: PhaseSeconds = 0
     claim: PhaseSeconds = 0
@@ -249,6 +254,7 @@ class PhaseReport:
     after_hol: PhaseSeconds = 0
     exec: PhaseSeconds = 0
     complete: PhaseSeconds = 0
+    after_result: PhaseSeconds = 0
 
 
 @dataclass(frozen=True)

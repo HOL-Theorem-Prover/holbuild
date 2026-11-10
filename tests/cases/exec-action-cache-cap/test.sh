@@ -254,6 +254,44 @@ cp "$state" "$tmpdir/first-state"
 sparse "$cache4/blobs/second" 1
 sweep4 100 1
 cmp "$state" "$tmpdir/first-state" || { echo "fresh roomy measurement was not reused" >&2; exit 1; }
+# After its result an action refreshes a stamp past half its life, without
+# waiting for gc.lock, so that busy hosts keep it fresh.
+python3 - "$state" <<'AGE'
+import sys, time
+lines = open(sys.argv[1]).read().splitlines()
+lines[1] = str(time.time_ns() - 40 * 10**9)
+open(sys.argv[1], "w").write("\n".join(lines) + "\n")
+AGE
+cp "$state" "$tmpdir/aged-state"
+sweep4 100 1
+! cmp -s "$state" "$tmpdir/aged-state" || { echo "a stamp past half its life was not refreshed" >&2; exit 1; }
+python3 - "$state" "$tmpdir/aged-state" <<'NEWER'
+import sys
+new, old = (int(open(p).read().splitlines()[1]) for p in sys.argv[1:])
+sys.exit(0 if new > old else "the refreshed stamp is not newer")
+NEWER
+cp "$state" "$tmpdir/aged-state"
+python3 - "$state" <<'AGE'
+import sys, time
+lines = open(sys.argv[1]).read().splitlines()
+lines[1] = str(time.time_ns() - 40 * 10**9)
+open(sys.argv[1], "w").write("\n".join(lines) + "\n")
+AGE
+cp "$state" "$tmpdir/aged-state"
+python3 - "$cache4/locks/gc.lock" "$tmpdir/hold.ready" <<'HOLD' &
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.lockf(fd, fcntl.LOCK_EX)
+open(sys.argv[2], "w").close()
+time.sleep(30)
+HOLD
+holder=$!
+for _ in $(seq 100); do [[ -e "$tmpdir/hold.ready" ]] && break; sleep 0.1; done
+started=$(date +%s)
+sweep4 100 1
+(( $(date +%s) - started < 20 )) || { echo "the refresh waited for gc.lock" >&2; exit 1; }
+kill "$holder"; wait "$holder" 2>/dev/null || true
+cmp "$state" "$tmpdir/aged-state" || { echo "the refresh scanned while gc.lock was held" >&2; exit 1; }
 # A small cap scans apparent bytes, including nested sparse growth.
 mkdir -p "$cache4/checkpoint-store/family/nested"
 sparse "$cache4/checkpoint-store/family/nested/heap" 1

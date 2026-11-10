@@ -403,7 +403,7 @@ async def test_queue_sums_the_phases_workers_reported_in_the_last_ten_minutes(
         assert response.status_code == 204
         now += timedelta(seconds=300)
 
-    seconds = dict.fromkeys(["memory_wait", "claim", "idle", "lease", "release", "before_hol", "exec", "complete"], 0.0)
+    seconds = dict.fromkeys(["memory_wait", "claim", "idle", "lease", "release", "before_hol", "exec", "complete", "after_result"], 0.0)
     totals = (await http.get("/v1/queue", headers=CLIENT)).json()["phases"]
     assert totals == {"window_s": 600, "reports": 1, "seconds": {**seconds, "hol": 10.0, "after_hol": 12.0}}
 

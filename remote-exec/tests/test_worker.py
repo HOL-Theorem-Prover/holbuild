@@ -72,9 +72,16 @@ if [ -n "$HOLBUILD_FAKE_LEASE" ]; then sleep 1; (exec 3>"$HOLBUILD_FAKE_LEASE"; 
 [ -z "$HOLBUILD_FAKE_CRASH" ] || [ "$HOLBUILD_FAKE_CRASH" != 1 ] || exit 70
 [ -z "$HOLBUILD_FAKE_CRASH" ] || kill -s "$HOLBUILD_FAKE_CRASH" $$
 while [ "$#" -gt 0 ]; do
-  if [ "$1" = --result ]; then printf '%s' "${{HOLBUILD_FAKE_RECORD:-{RECORD}}}" > "$2"; fi
+  if [ "$1" = --result ]; then printf '%s' "${{HOLBUILD_FAKE_RECORD:-{RECORD}}}" > "$2.tmp"; mv "$2.tmp" "$2"; fi
   shift
 done
+# HOLBUILD_FAKE_AFTER: go on for that many seconds after the result, as exec-action publishes for later actions
+if [ -n "$HOLBUILD_FAKE_AFTER" ]; then
+  trap 'echo termed > "$HOLBUILD_FAKE_LOG.termed"; exit 1' TERM
+  sleep "$HOLBUILD_FAKE_AFTER" &
+  wait
+  echo done > "$HOLBUILD_FAKE_LOG.after"
+fi
 """
 FAKE_MAKEFILE = """bin/holbuild:
 \techo build >> "$$FAKE_BUILD_LOG"
@@ -410,6 +417,45 @@ def test_interruption_allows_checkpoint_publication_before_teardown(
             process.send_signal(signal.SIGTERM)
         assert process.wait(timeout=10) == 0, (tmp_path / "worker.log").read_text()
     assert server.completed == ([failed_record(SPEC, "unavailable")] if stop == "drain" else [])
+
+
+def test_the_result_is_reported_before_exec_action_exits_and_a_lost_lease_then_stops_nothing(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+    server.next_claim = claim()
+    monkeypatch.setenv("HOLBUILD_FAKE_AFTER", "4")
+    with running_worker(tmp_path, server, "0", "--share-heaps") as process:
+        deadline = time.monotonic() + 20
+        while not server.completed and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert server.completed == [RECORD], (tmp_path / "worker.log").read_text()
+        assert not Path(f"{logs[1]}.after").exists()
+        # The token is stale once completed; the worker no longer heartbeats, so this is never seen.
+        server.lease_lost = True
+        wait_for_file(Path(f"{logs[1]}.after"))
+        process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=10) == 0, (tmp_path / "worker.log").read_text()
+    assert server.completed == [RECORD]
+    assert not Path(f"{logs[1]}.termed").exists()
+
+
+def test_a_drain_after_the_result_completes_the_action_once(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+    server.next_claim = claim()
+    monkeypatch.setenv("HOLBUILD_FAKE_AFTER", "60")
+    with running_worker(tmp_path, server, "0", "--share-heaps") as process:
+        deadline = time.monotonic() + 20
+        while not server.completed and time.monotonic() < deadline:
+            time.sleep(0.05)
+        process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=20) == 0, (tmp_path / "worker.log").read_text()
+    assert server.completed == [RECORD]
+    assert Path(f"{logs[1]}.termed").exists()
 
 
 def test_sigterm_interrupts_an_idle_long_poll(tmp_path: Path, server: Server) -> None:

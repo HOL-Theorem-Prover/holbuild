@@ -9293,8 +9293,11 @@ fun worker_cache_roots cache =
 (* Evict least recently used families until the cache leaves reserve_bytes of
    room under limit_bytes. Reuse a recent shared scan within the target;
    private checkpoints and modules are always measured locally. Small caps
-   and zero reserves scan live. *)
-fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes} =
+   and zero reserves scan live.  With refresh, as after an action's result,
+   scan only when the stamp is past half its life and no other process holds
+   gc.lock, so that busy hosts keep the stamp fresh and actions seldom wait
+   on a scan. *)
+fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes, refresh} =
   let
     fun private_bytes () =
       cache_root_bytes checkpoint_root + cache_root_bytes (HolbuildCache.theory_modules_dir cache)
@@ -9309,6 +9312,14 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                (SOME bytes, SOME entries) => if bytes >= 0 then SOME ((id, bytes) :: entries) else NONE
              | _ => NONE)
       | parse_sizes _ = NONE
+    val stamp_life = 60000000000 : LargeInt.int
+    fun stamp_age () =
+      case String.tokens Char.isSpace (read_text state_path) of
+          "holbuild-worker-cache-cap-v2" :: measured :: _ =>
+            Option.map (fn measured => Time.toNanoseconds (Time.now ()) - measured) (LargeInt.fromString measured)
+        | _ => NONE
+      handle IO.Io _ => NONE
+           | OS.SysErr _ => NONE
     fun recent_scan_fits private_bytes =
       target >= gb_to_bytes 64 andalso reserve_bytes > 0 andalso
       (case String.tokens Char.isSpace (read_text state_path) of
@@ -9317,7 +9328,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                   (SOME measured, SOME entries) =>
                     let val age = Time.toNanoseconds (Time.now ()) - measured
                     in
-                      age >= 0 andalso age < 60000000000 andalso length entries = length roots andalso
+                      age >= 0 andalso age < stamp_life andalso length entries = length roots andalso
                       sum (ListPair.map
                              (* A private root can differ while its siblings
                                 are shared. Keep their hits without stamp churn. *)
@@ -9355,10 +9366,10 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
         ("holbuild-worker-cache-cap-v2\n" ^ LargeInt.toString measured ^ "\n" ^
          String.concat (ListPair.map (fn (id, bytes) => id ^ " " ^ IntInf.toString bytes ^ "\n")
                                     (ids, sizes)))
-    fun scan () =
+    fun scan reuse =
       let val private_size = private_bytes ()
       in
-        if recent_scan_fits (fn () => private_size) then ()
+        if reuse andalso recent_scan_fits (fn () => private_size) then ()
         else
           let
             val shared = measure_shared ()
@@ -9387,18 +9398,31 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
               end
           end
       end
+    (* gc.lock is also shared by explicit cache gc. The action-root
+       lock lives outside locks/ and can be container-private. *)
+    val lock_path = HolbuildCache.gc_lock_path cache
+    fun locked lock reuse =
+      (scan reuse before HolbuildFileLock.release lock)
+      handle e => (HolbuildFileLock.release lock; raise e)
   in
-    if recent_scan_fits private_bytes then ()
+    if refresh then
+      let
+        val fresh =
+          case stamp_age () of SOME age => age >= 0 andalso age < stamp_life div 2 | NONE => false
+      in
+        (* Only caps that reuse a stamp gain from refreshing it. *)
+        if fresh orelse target < gb_to_bytes 64 orelse reserve_bytes <= 0 then ()
+        else
+          Option.app (fn lock => locked lock false)
+            (HolbuildFileLock.try_acquire_path {path = lock_path, obsolete_kind = SOME "cache gc"})
+      end
+    else if recent_scan_fits private_bytes then ()
     else
       let
-        (* gc.lock is also shared by explicit cache gc. The action-root
-           lock lives outside locks/ and can be container-private. *)
-        val lock_path = HolbuildCache.gc_lock_path cache
         val _ = HolbuildFileLock.remove_obsolete_lock_dir "cache gc" lock_path
         val lock = HolbuildFileLock.acquire_exclusive_path_wait {path = lock_path}
       in
-        (scan () before HolbuildFileLock.release lock)
-        handle e => (HolbuildFileLock.release lock; raise e)
+        locked lock true
       end
   end
   handle e => warn ("worker cache sweep failed: " ^ General.exnMessage e)
@@ -10434,6 +10458,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
   let
     val cancelled = ref false
     val publishing_checkpoints = ref false
+    (* Publishing for later actions: shared checkpoints and the tool cache.
+       It runs after the result is written, since the client fetches
+       neither. *)
+    val deferred = ref (fn () => ())
     fun cancel _ =
       if !cancelled then () else
       (cancelled := true;
@@ -10651,13 +10679,17 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                 (ignore (phase "hol" (fn () =>
                            run_theory_action_checkpoints check_cancelled NONE true policy tc root checkpoint_root
                              (toolchain_base_context tc) action source_text checkpoints))
-                 handle e => (publish_shared (); check_cancelled (); publish_tools (); raise e));
-                (* After the publish: the checkpoints saved after resuming
-                   from a failed prefix are its children. *)
-                publish_shared ();
-                check_cancelled ();
-                publish_tools ();
-                remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints)
+                 handle e =>
+                   (deferred := (fn () => (publish_shared (); if !cancelled then () else publish_tools ()));
+                    raise e));
+                deferred :=
+                  (fn () =>
+                     (publish_shared ();
+                      if !cancelled then () else
+                      (publish_tools ();
+                       (* After the publish: the checkpoints saved after
+                          resuming from a failed prefix are its children. *)
+                       remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints))))
               end
               handle Error msg =>
                 (* The child's exporter may have recorded its peak before
@@ -10706,7 +10738,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                   phase "cap" (fn () =>
                     enforce_worker_cache_cap
                       {cache = cache, checkpoint_root = checkpoint_root,
-                       limit_bytes = limit_bytes, reserve_bytes = reserve_bytes})
+                       limit_bytes = limit_bytes, reserve_bytes = reserve_bytes, refresh = false})
                 end
               val (status, failure) = attempt ()
               val _ =
@@ -10742,25 +10774,43 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
                       else NONE
                   | _ => failure
               val status = if Option.isSome failure then "failed" else status
+              val wall_ms = Time.toMilliseconds (Time.-(Time.now (), start))
+              val phases = rev (!phases)
+              val text =
+                result_text (spec_sha256, !input_key)
+                  {status = status, failure = failure, wall_ms = wall_ms, phases = phases,
+                   peak = !peak, log = log}
             in
-              empty_root ();
+              (case failure of
+                   SOME (_, msg) => HolbuildStatus.message_stderr ("holbuild: exec-action failed: " ^ msg ^ "\n")
+                 | NONE => ());
+              HolbuildStatus.message_stderr
+                ("holbuild: exec-action phases (ms): " ^ phases_text " " "=" (phases @ [("wall", wall_ms)]) ^ "\n");
+              (* The worker reports the result as soon as it is written, so
+                 what follows is off the client's path. *)
+              (case result_file of
+                   SOME path => write_text path text
+                 | NONE => print text);
+              let val t0 = Time.now ()
+              in
+                !deferred () handle e => warn ("deferred publishing failed: " ^ General.exnMessage e);
+                empty_root ();
+                (* A worker draining after the result has a few seconds left
+                   for the publish, not for a cache scan. *)
+                if !cancelled then () else
+                  let val {limit_bytes, reserve_bytes} = cache_cap
+                  in
+                    enforce_worker_cache_cap
+                      {cache = cache, checkpoint_root = checkpoint_root,
+                       limit_bytes = limit_bytes, reserve_bytes = reserve_bytes, refresh = true}
+                  end;
+                HolbuildStatus.message_stderr
+                  ("holbuild: exec-action after the result (ms): " ^
+                   LargeInt.toString (Time.toMilliseconds (Time.-(Time.now (), t0))) ^ "\n")
+              end;
               (status, failure, log)
             end)
-    val wall_ms = Time.toMilliseconds (Time.-(Time.now (), start))
-    val phases = rev (!phases)
-    val text =
-      result_text (spec_sha256, !input_key)
-        {status = status, failure = failure, wall_ms = wall_ms, phases = phases,
-         peak = !peak, log = log}
   in
-    (case failure of
-         SOME (_, msg) => HolbuildStatus.message_stderr ("holbuild: exec-action failed: " ^ msg ^ "\n")
-       | NONE => ());
-    HolbuildStatus.message_stderr
-      ("holbuild: exec-action phases (ms): " ^ phases_text " " "=" (phases @ [("wall", wall_ms)]) ^ "\n");
-    (case result_file of
-         SOME path => write_text path text
-       | NONE => print text);
     case failure of
         NONE => 0
       | SOME (kind, _) => failure_exit_code kind
