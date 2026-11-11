@@ -597,12 +597,16 @@ class Coordinator:
         packages = [a.theory.split(":", 1)[0] for a in batch.actions]
         names = [a.theory.split(":", 1)[1] for a in batch.actions]
         async with self.engine.begin() as conn:
+            # Retention takes the same key order: heap/index scan order can otherwise deadlock overlapping writes.
             hints = await conn.execute(
                 sa.text(
-                    "UPDATE peak_hints SET updated_at = now() WHERE profile = :profile "
+                    "WITH locked AS (SELECT package, theory, profile FROM peak_hints WHERE profile = :profile "
                     "AND (package, theory) IN "
                     "(SELECT * FROM unnest(CAST(:packages AS text[]), CAST(:names AS text[]))) "
-                    "RETURNING package || ':' || theory, peak_rss_mb"
+                    "ORDER BY package, theory, profile FOR UPDATE) "
+                    "UPDATE peak_hints h SET updated_at = now() FROM locked l "
+                    "WHERE (h.package, h.theory, h.profile) = (l.package, l.theory, l.profile) "
+                    "RETURNING h.package || ':' || h.theory, h.peak_rss_mb"
                 ),
                 {"profile": profile, "packages": packages, "names": names},
             )
@@ -1307,7 +1311,13 @@ class Coordinator:
                 break
         async with self.engine.begin() as conn:
             await conn.execute(
-                sa.text("DELETE FROM peak_hints WHERE updated_at < now() - make_interval(days => :days)"),
+                sa.text(
+                    "WITH locked AS (SELECT package, theory, profile FROM peak_hints "
+                    "WHERE updated_at < now() - make_interval(days => :days) "
+                    "ORDER BY package, theory, profile FOR UPDATE) "
+                    "DELETE FROM peak_hints h USING locked l "
+                    "WHERE (h.package, h.theory, h.profile) = (l.package, l.theory, l.profile)"
+                ),
                 {"days": self.settings.hint_ttl_days},
             )
 

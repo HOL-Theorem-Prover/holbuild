@@ -150,6 +150,8 @@ fun growth_since_gc cache =
     journal + with_growth (fn () => Option.getOpt (Redblackmap.peek (!growth, root cache), 0))
   end
 
+fun discard_growth cache = ignore (take_growth (root cache))
+
 fun reset_growth cache =
   (ignore (take_growth (root cache)); write_text (growth_journal cache) "0\n")
 
