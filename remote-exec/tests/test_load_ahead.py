@@ -28,8 +28,10 @@ from test_coordinator import (
 )
 
 
-async def claim_ahead(http: httpx.AsyncClient, tier: str = "standard", wait_s: float = 0) -> dict[str, Any] | None:
-    body = {"tier": tier, "worker": "w2", "ahead": True, "wait_s": wait_s}
+async def claim_ahead(
+    http: httpx.AsyncClient, tier: str = "standard", wait_s: float = 0, also_claim: list[str] | None = None
+) -> dict[str, Any] | None:
+    body = {"tier": tier, "also_claim": also_claim or [], "worker": "w2", "ahead": True, "wait_s": wait_s}
     response = await http.post("/v1/work/claim", json=body, headers=WORKER)
     if response.status_code == 204:
         return None
@@ -245,3 +247,22 @@ async def test_claims_ahead_sharing_a_read_take_the_deepest_child_of_any_batch_n
 
     claimed = [await claim_ahead(http) for _ in range(3)]
     assert [c["theory"] for c in claimed if c is not None] == ["pkg:x", "pkg:z", "pkg:y"]
+
+
+async def test_a_claim_ahead_of_several_tiers_takes_the_deepest_child_whatever_its_tier(
+    http: httpx.AsyncClient, remote_exec_engine: AsyncEngine
+) -> None:
+    await submit(
+        http, ["a", "x", "x2", "x3", "y"], [("x", "a"), ("x2", "x"), ("x3", "x2"), ("y", "a")], speculative_loading="4"
+    )
+    await submit(http, ["b", "z", "z2"], [("z", "b"), ("z2", "z")], speculative_loading="4")
+    async with remote_exec_engine.begin() as conn:
+        await conn.execute(
+            sa.text("UPDATE actions SET tier = 'high' WHERE input_key = ANY(CAST(:keys AS text[]))"),
+            {"keys": [input_key("y"), input_key("z")]},
+        )
+    await claim_named(http, "a")
+    await claim_named(http, "b")
+
+    claimed = await claim_ahead(http, "high", also_claim=["standard"])
+    assert claimed is not None and claimed["theory"] == "pkg:x"

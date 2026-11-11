@@ -473,13 +473,13 @@ CROSS JOIN LATERAL (
 WHERE b.state = 'running' AND b.ahead_cap IS NOT NULL
 ORDER BY b.priority DESC, a.critical_depth DESC, a.descendant_count DESC, a.theory, a.input_key
 """)
-# Lock the best of a batch's candidates ``keys`` that may still be claimed ahead, its tier in the order of ``tiers``.
+# Lock the best of a batch's candidates ``keys`` that may still be claimed ahead, in AHEAD_CANDIDATES' order, of
+# any of ``tiers``.
 CLAIM_AHEAD_ACTION = sa.text(f"""
 SELECT a.input_key, a.spec_sha256, a.theory, a.tier FROM actions a
 WHERE a.batch_id = :batch_id AND a.input_key = ANY(CAST(:keys AS text[])) AND a.tier = ANY(CAST(:tiers AS text[]))
 AND {AHEAD_ELIGIBLE}
-ORDER BY array_position(CAST(:tiers AS text[]), a.tier), a.critical_depth DESC, a.descendant_count DESC, a.theory,
-    a.input_key
+ORDER BY a.critical_depth DESC, a.descendant_count DESC, a.theory, a.input_key
 LIMIT 1 FOR UPDATE SKIP LOCKED
 """)
 # The actions of a batch claimed ahead and still waiting for a parent, which count against its ``ahead_cap``.
