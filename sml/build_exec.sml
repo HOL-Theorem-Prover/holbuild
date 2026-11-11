@@ -11661,49 +11661,55 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                     late;
            length (!arrived) = length late)
         and cached key = Option.isSome (HolbuildRemoteCache.get_action remote key)
-        val cutoff =
-          (wait_until (fn () => file_exists (marker "base-loaded")) (Time.fromMilliseconds 50);
-           let
-             val base = read_base_report (marker "base-loaded")
-             val parents_memo = ref (Binarymap.mkDict String.compare)
-           in
-             List.app (fn parent => stand_in parent base parents_memo) late
-           end;
-           drop "stand-ins";
-           wait_until poll ahead_poll_interval;
-           spec_early_cutoff_with {dat_hash = hash_of, file_hashes = map hash_of} root spec)
-          handle e => (stop_child (); raise e)
-        val built_action =
-          spec_theory_action root spec (case cutoff of SOME {deps_key, ...} => deps_key | NONE => #deps_key spec)
-        (* What a plain build would take instead of running the script:
-           the action's own entry, an earlier build's, or a shared heap
-           (whose checkpoints may resume inside the script).  A plain run
-           starts over from an empty root. *)
-        val hit =
-          cached (#input_key spec) orelse
-          (case cutoff of SOME {pair_key, ...} => cached pair_key | NONE => false) orelse
-          (share_heaps andalso checkpoint_enabled (spec_policy spec) andalso
-           cached (shared_heap_key tc root built_action))
+        fun continue_ahead () =
+          let
+            val cutoff =
+              (wait_until (fn () => file_exists (marker "base-loaded")) (Time.fromMilliseconds 50);
+               let
+                 val base = read_base_report (marker "base-loaded")
+                 val parents_memo = ref (Binarymap.mkDict String.compare)
+               in
+                 List.app (fn parent => stand_in parent base parents_memo) late
+               end;
+               drop "stand-ins";
+               wait_until poll ahead_poll_interval;
+               spec_early_cutoff_with {dat_hash = hash_of, file_hashes = map hash_of} root spec)
+            val built_action =
+              spec_theory_action root spec (case cutoff of SOME {deps_key, ...} => deps_key | NONE => #deps_key spec)
+            (* What a plain build would take instead of running the script:
+               the action's own entry, an earlier build's, or a shared heap
+               (whose checkpoints may resume inside the script).  A plain run
+               starts over from an empty root. *)
+            val hit =
+              cached (#input_key spec) orelse
+              (case cutoff of SOME {pair_key, ...} => cached pair_key | NONE => false) orelse
+              (share_heaps andalso checkpoint_enabled (spec_policy spec) andalso
+               cached (shared_heap_key tc root built_action))
+          in
+            if hit then
+              (stop_child ();
+               record_timings ();
+               HolbuildStatus.message_stderr "holbuild: loading ahead found a build to reuse; building plain\n";
+               empty_root ();
+               ensure_dir root;
+               ensure_dir checkpoint_root;
+               run_plain spec tc false)
+            else
+              build spec tc false cutoff
+                (SOME {source_text = source_text, tool_cache = tool_cache,
+                       join = fn () =>
+                         (drop "ready";
+                          await_child ();
+                          record_timings ();
+                          case (abandoned (), !outcome) of
+                              (SOME reason, _) => abandon reason
+                            | (NONE, SOME (SOME e)) => raise e
+                            | _ => ())})
+          end
       in
-        if hit then
-          (stop_child ();
-           record_timings ();
-           HolbuildStatus.message_stderr "holbuild: loading ahead found a build to reuse; building plain\n";
-           empty_root ();
-           ensure_dir root;
-           ensure_dir checkpoint_root;
-           run_plain spec tc false)
-        else
-          build spec tc false cutoff
-            (SOME {source_text = source_text, tool_cache = tool_cache,
-                   join = fn () =>
-                     (drop "ready";
-                      await_child ();
-                      record_timings ();
-                      case (abandoned (), !outcome) of
-                          (SOME reason, _) => abandon reason
-                        | (NONE, SOME (SOME e)) => raise e
-                        | _ => ())})
+        (* The child never outlives the run, whatever stops it before the
+           build joins the child; after that, stopping it does nothing. *)
+        continue_ahead () handle e => (stop_child (); raise e)
       end
     fun attempt () =
       let
