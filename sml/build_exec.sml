@@ -10593,7 +10593,8 @@ val module_store_base_theories = "base-theories"
 
 (* The writer script: records whether the toolchain can write modules,
    the base state's theories when [base_theories], and then writes the
-   modules missing from the store. *)
+   modules missing from the store.  quietbind runs only the first
+   declaration of its text, so the recording and the call share one. *)
 fun module_writer_script {output, base_theories, call} =
   let
     fun out file = HolbuildToolchain.sml_string (Path.concat (output, file))
@@ -10614,7 +10615,7 @@ fun module_writer_script {output, base_theories, call} =
     "has [\"showHierarchyWithIds\", \"saveDependentModuleBasic\"] " ^
     "(Option.mapPartial (fn ns => sub ns \"SaveState\") (sub PolyML.globalNameSpace \"PolyML\")) " ^
     "in if supported then CompilerSpecific.quietbind " ^
-    HolbuildToolchain.sml_string (record_base ^ call) ^
+    HolbuildToolchain.sml_string ("val _ = let " ^ record_base ^ call ^ " in () end;") ^
     " else TextIO.closeOut (TextIO.openOut " ^ out module_store_unsupported ^ ") end;\n"
   end
 
