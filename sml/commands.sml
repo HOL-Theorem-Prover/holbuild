@@ -2718,7 +2718,10 @@ fun import_archive args =
               result_count := length results
             end
         in
-          HolbuildCacheArchive.with_entries {archive_path = archive_path, f = copy};
+          HolbuildCacheArchive.with_entries
+            {archive_path = archive_path,
+             stage_parent = HolbuildFSCacheBackend.tmp_dir destination,
+             f = copy};
           print ("imported " ^ Int.toString (!result_count) ^ " cache action(s) from " ^ archive_path ^ "\n");
           (* Run inside a project, its [gc] settings apply; one that does not
              load skips automatic GC rather than falling back to the defaults. *)
