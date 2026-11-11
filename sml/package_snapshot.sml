@@ -67,9 +67,11 @@ fun keep (context : context) rel =
   else (reject_symlinks (#root context) rel; [rel])
 
 (* A file at a known package-relative path, such as a source or a generator
-   input. *)
-fun file (context : context) label rel =
-  let val abs = HolbuildSourceIndex.join (#root context) rel
+   input, which may be spelled with `.` components. *)
+fun file (context : context) label declared_rel =
+  let
+    val abs = HolbuildSourceIndex.join (#root context) declared_rel
+    val rel = relative (#root context) abs
   in
     if ignored rel orelse is_output context rel then []
     else
@@ -92,7 +94,10 @@ fun declared (context : context) base decl =
     fun walk () =
       let val {files, dirs} = HolbuildBuildPlan.expand_extra_dep_walk base decl
       in
-        List.app (fn dir => ignore (keep context (relative root dir))) dirs;
+        (* A glob walks all of BASE but selects only some of it, so only the
+           selected files' own paths matter. *)
+        if glob then ()
+        else List.app (fn dir => ignore (keep context (relative root dir))) dirs;
         List.concat (map (fn (_, path) => keep context (relative root path)) files)
       end
   in

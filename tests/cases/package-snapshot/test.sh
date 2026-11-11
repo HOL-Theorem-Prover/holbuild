@@ -43,6 +43,12 @@ name = "gen"
 command = ["true"]
 inputs = ["gen/input.txt"]
 outputs = ["src/Generated.sml", "data/dir/gen.out", "gendata/out.txt"]
+
+[[generate]]
+name = "chained"
+command = ["true"]
+inputs = ["./data/dir/gen.out"]
+outputs = ["gendata/chained.txt"]
 TOML
 cat > "$base/src/AScript.sml" <<'SML'
 open HolKernel Parse boolLib bossLib;
@@ -93,6 +99,12 @@ mkdir -p "$tmpdir/built/gendata"
 printf 'val () = holbuild_extra_deps ["../notes/other.txt"];\n' > "$tmpdir/built/src/Generated.sml"
 printf 'x\n' > "$tmpdir/built/data/dir/gen.out"
 printf 'x\n' > "$tmpdir/built/gendata/out.txt"
+printf 'x\n' > "$tmpdir/built/gendata/chained.txt"
+
+# Links the glob walk passes but its matches do not contain.
+cp -a "$base" "$tmpdir/glob-links"
+ln -s ../data "$tmpdir/glob-links/src/linkdir"
+ln -s nowhere "$tmpdir/glob-links/src/dangling"
 
 # Errors: a symlink in an expanded directory, a symlinked declared file, a
 # dangling one, and a declaration outside the package.
@@ -109,7 +121,7 @@ printf 'val () = holbuild_extra_deps ["../../escape.txt"];\n' >> "$tmpdir/outsid
 cp -a "$base" "$tmpdir/missing"
 rm "$tmpdir/missing/data/manifest-input.txt"
 
-for name in base copy configured built link-in-dir link-declared link-dangling outside missing; do
+for name in base copy configured built glob-links link-in-dir link-declared link-dangling outside missing; do
   printf '%s %s\n' "$name" "$tmpdir/$name"
 done > "$tmpdir/projects"
 
@@ -158,7 +170,7 @@ section() {
 
 # The declared files, and nothing else, wherever the package is checked out,
 # whatever the local configuration says and whether or not generators ran.
-for name in base copy configured built; do
+for name in base copy configured built glob-links; do
   section "$name" > "$tmpdir/$name.list"
   if ! diff -u "$tmpdir/expected" "$tmpdir/$name.list"; then
     echo "snapshot of $name differs from the declared files" >&2
