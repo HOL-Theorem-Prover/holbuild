@@ -183,6 +183,9 @@ class ActionStatus:
     log_zstd: str | None
     log_error: str | None
     failure_detail: str | None  # the last result's detail: why it failed when it has no log
+    last_claimed_at: datetime | None
+    finished_at: datetime | None  # accepted result time for the latest claim, not lease expiry or cancellation
+    worker: str | None
     timings: dict[str, int] | None  # the last result's, in milliseconds; see formats.Result
 
 
@@ -388,7 +391,8 @@ RELEASABLE_BATCH = sa.text(RELEASABLE.format(batch=" AND a.batch_id = :batch_id"
 
 # The actions of a batch written by transactions numbered :since or later; see Coordinator.changes.
 CHANGED_ACTIONS = sa.text("""
-SELECT input_key, theory, state, tier, attempts, last_failure, log_sha256, log_zstd, log_error, failure_detail, CAST(timings AS text)
+SELECT input_key, theory, state, tier, attempts, last_failure, log_sha256, log_zstd, log_error, failure_detail,
+       last_claimed_at, finished_at, worker, CAST(timings AS text)
 FROM actions
 WHERE batch_id = :batch_id AND changed_xid >= CAST(CAST(:since AS text) AS xid8)
 ORDER BY theory, input_key
@@ -824,10 +828,11 @@ class Coordinator:
             token = uuid4()
             await conn.execute(
                 sa.text(
-                    "UPDATE actions SET state = 'running', attempts = attempts + 1, last_claimed_at = now() "
+                    "UPDATE actions SET state = 'running', attempts = attempts + 1, last_claimed_at = now(), "
+                    "finished_at = NULL, worker = :worker "
                     "WHERE batch_id = :batch_id AND input_key = :input_key"
                 ),
-                {"batch_id": row.batch_id, "input_key": row.input_key},
+                {"batch_id": row.batch_id, "input_key": row.input_key, "worker": worker},
             )
             await conn.execute(
                 sa.text(
@@ -1061,7 +1066,7 @@ class Coordinator:
                 sa.text(
                     "UPDATE actions SET log_sha256 = :log, log_zstd = :log_zstd, log_error = :log_error, "
                     "last_failure = :failure, failure_detail = :detail, "
-                    "timings = CAST(CAST(:timings AS text) AS jsonb) "
+                    "timings = CAST(CAST(:timings AS text) AS jsonb), finished_at = now() "
                     "WHERE batch_id = :batch_id AND input_key = :input_key"
                 ),
                 {
