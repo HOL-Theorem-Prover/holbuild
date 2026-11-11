@@ -10784,9 +10784,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
              action_text_value spec "toolchain" then ()
           else raise ActionFailed (ToolchainFailure, "the toolchain's identity does not match the action text")
         val _ = hydrate_steps := []
-        val _ = phase "hydrate" (fn () => hydrate_action_root remote root spec)
-        (* Its steps, after it in the report. *)
-        val _ = phases := !hydrate_steps @ !phases
+        (* Its steps, after it in the report, also when it fails. *)
+        fun add_steps () = phases := !hydrate_steps @ !phases
+        val _ = (phase "hydrate" (fn () => hydrate_action_root remote root spec) before add_steps ())
+                handle e => (add_steps (); raise e)
         val (done, cutoff) =
           phase "cutoff" (fn () =>
             let
