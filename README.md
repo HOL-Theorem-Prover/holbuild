@@ -2343,15 +2343,62 @@ fallback remains valid.
 
 ## Release process
 
-Maintainer checklist:
+Publishing a GitHub release is what makes it live: installs and deployments
+that follow the latest release pick it up, while a pushed tag or a draft
+release changes nothing for them. A release that would break its consumers
+is therefore created as a draft and published only once they are ready.
+
+### Breaking releases
+
+A release is breaking if, compared with the latest published release:
+
+- the golden key dump (`tests/golden/key-dumps`) changed, so cache keys
+  changed and consumers on the old release share no cache entries with it;
+- a commit in it carries a `Breaking-change:` trailer, which a pull request
+  that changes a default, a command-line option or the `holproject.toml`
+  schema in a way consumers must adapt to adds to one of its commits:
+
+  ```text
+  Breaking-change: export writes a full source capsule unless given --closure
+  ```
+
+  The value says what consumers must change; it goes in the release notes.
+
+`tools/release-breaking.sh BASE TAG` applies these two checks and prints the
+reasons. Because it compares with the latest published release rather than
+the previous tag, every release tagged while a breaking draft is pending is
+a draft too.
+
+The golden key dump covers one small fixture project. Before tagging, run
+`tools/release-key-inventory.sh` against your consumers to catch key changes
+it misses. In a scratch checkout of each consumer's default branch, with its
+remote cache configured as for its builds:
+
+```sh
+tools/release-key-inventory.sh /path/to/published/holbuild \
+  /path/to/candidate/bin/holbuild [action-spec arguments...]
+```
+
+It plans the project with `action-spec` under both binaries, building
+nothing, and lists the theories the published release can restore from the
+remote cache but the candidate can't. Pass the consumer's own build flags
+and targets (`--skip-proof-steps`, say), since they select the cache entries.
+If it lists any theory, the release is breaking: record that with a
+`Breaking-change:` trailer on a commit of the release before tagging (the
+version bump, or an empty commit), so that this release and every later one
+tagged before it is published are drafts.
+
+### Steps
 
 1. Bump `HolbuildVersion.version` in `sml/version.sml` if needed and merge
    the change to `master`.
-2. On the exact `master` commit to be tagged, ensure **CI** and **Release
+2. Run the key inventory above against your consumers, with holbuild built
+   at the commit to be tagged.
+3. On the exact `master` commit to be tagged, ensure **CI** and **Release
    binaries** have passed. The latter must include both platform builds and
    their smoke checks. If the version bump changed the commit, wait for the
    checks on the new commit.
-3. Create and push an annotated tag on that checked commit:
+4. Create and push an annotated tag on that checked commit:
 
    ```sh
    version=X.Y.Z
@@ -2360,18 +2407,38 @@ Maintainer checklist:
    git push origin "v$version"
    ```
 
-4. The **Release binaries** workflow builds Linux x86_64 and macOS arm64
+5. The **Release binaries** workflow builds Linux x86_64 and macOS arm64
    archives, then tests downloaded copies on fresh runners without Poly/ML.
    Only after both platforms pass does it attach the archives and
-   `SHA256SUMS`, plus the shared Poly/ML source archive, to the release. It
-   creates a release with generated notes if none exists for the tag; an existing release (including a draft) retains
-   its notes and publication state. Summarise user-visible changes in those
-   notes, and publish the draft if you prepared one.
+   `SHA256SUMS`, plus the shared Poly/ML source archive, to the release. If
+   no release exists for the tag, it creates one with generated notes: a
+   draft, with the reasons first in its notes, if the release is breaking;
+   otherwise published. An existing release (including a draft) retains its
+   notes and publication state.
 
 The workflow also checks packaging on every `master` push and relevant pull
 requests without publishing anything. To rebuild assets, rerun the tag's
 workflow; uploads replace assets with the same names. A manual workflow run
 only builds and tests; publication requires a version-tag push.
+
+### Publishing a breaking release
+
+While the release is a draft, its tag already exists, so consumers can test
+against it:
+
+1. Warm the remote cache with the new release's keys: build each consumer's
+   default branch with it, with the flags its CI uses.
+2. In each consumer, open a pull request that moves its pinned holbuild to
+   the new tag, with whatever else the breaking change needs (a workflow
+   edit for a changed option, say), and wait for its CI to pass.
+3. Then, in one go: publish the newest draft (`gh release edit vX.Y.Z
+   --draft=false --latest`; publish older pending drafts first with
+   `--latest=false`, or delete them), merge every consumer's pull request,
+   and update the installs and deployments that follow the latest release.
+
+If a breaking release was published by mistake, turn it back into a draft
+(`gh release edit vX.Y.Z --draft=true`) so that nothing else adopts it, then
+roll back whatever already did, or finish the steps above at once.
 
 ## More detail
 
