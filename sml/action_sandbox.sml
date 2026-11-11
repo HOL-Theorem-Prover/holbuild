@@ -11,6 +11,13 @@ val outputs_validated = ref false
 (* exec-action's --result file: the worker's, so never exposed to the action. *)
 val result_file : string option ref = ref NONE
 
+(* Directories every sandboxed child may read, such as the host's store of
+   HOL theory modules, which no child writes. *)
+val shared_reads : string list ref = ref []
+(* While set, a child writes only these directories and may read, but not
+   write, the private roots. *)
+val output_dirs : string list option ref = ref NONE
+
 fun active () = Option.isSome (!private_roots)
 fun enable roots = (outputs_validated := false; private_roots := SOME roots)
 fun disable () = private_roots := NONE
@@ -171,7 +178,7 @@ fun wrap completed ({writable, readable = extra, toolchain} : grants) argv =
         "/usr", "/bin", "/sbin", "/lib", "/lib64", "/dev/urandom", "/dev/zero", "/proc/meminfo",
         "/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d", "/etc/localtime",
         "/etc/ssl/certs", "/etc/nsswitch.conf", "/etc/hosts", "/etc/resolv.conf", "/etc/gai.conf"] @
-       poly_libraries @ extra @ fields "HOLBUILD_ACTION_READ_DIRS" @
+       poly_libraries @ extra @ !shared_reads @ fields "HOLBUILD_ACTION_READ_DIRS" @
        List.mapPartial OS.Process.getEnv ["HOLBUILD_POLYC", "HOLBUILD_ANALYSER_SRC"])
     (* As configured, not normalized: the helper also forbids each link on
        the way, and resolves ".." after a link the way open does. *)
@@ -209,6 +216,10 @@ fun wrap completed ({writable, readable = extra, toolchain} : grants) argv =
     options "--scratch" (List.filter exists ["/tmp"]) @
     ["--completed", completed, "--"] @ argv
   end
+
+fun with_output_dirs dirs f =
+  (output_dirs := SOME dirs;
+   (f () before output_dirs := NONE) handle e => (output_dirs := NONE; raise e))
 
 (* Only the trusted supervisor can write this sibling of the private roots.
    A child exit status alone cannot attest to cleanup or output validation,
@@ -249,14 +260,20 @@ fun confined grants argv execute =
     (run () before remove ()) handle e => (remove (); raise e)
   end
 
-(* The theory action: its private roots are what the worker harvests. *)
+(* The theory action: its private roots are what the worker harvests.
+   Under with_output_dirs (the worker's module writer), the child writes
+   only those directories and reads the roots. *)
+fun action_grants (root, checkpoints) : grants =
+  case !output_dirs of
+      NONE => {writable = [root, checkpoints], readable = [], toolchain = false}
+    | SOME dirs => {writable = dirs, readable = [root, checkpoints], toolchain = false}
+
 fun launch argv execute =
   case !private_roots of
       NONE => execute argv
-    | SOME (root, checkpoints) =>
+    | SOME roots =>
         (outputs_validated := false;
-         confined {writable = [root, checkpoints], readable = [], toolchain = false} argv execute
-         before outputs_validated := true)
+         confined (action_grants roots) argv execute before outputs_validated := true)
 
 (* Runs the shell script SCRIPT work, with a fresh work directory WORK as its
    first writable root (its HOME and TMPDIR), through RUN, a runner of trusted
