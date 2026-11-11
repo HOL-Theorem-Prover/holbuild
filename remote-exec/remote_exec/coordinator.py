@@ -464,24 +464,33 @@ AND NOT EXISTS (
 )
 """
 # The actions that may be claimed ahead, best first: the children of running actions of running batches below
-# their ``ahead_cap``. See Coordinator._claim_ahead.
-AHEAD_CANDIDATES = sa.text(f"""
+# their ``ahead_cap``. See Coordinator._claim_ahead. Read from the running parents down (edges_parent) rather than
+# per waiting action, since a gate's batch has thousands of those: a child is a candidate when its running parents
+# that wait for no parent are all its unfinished ones, by ``remaining_deps``. CLAIM_AHEAD_ACTION checks the rule
+# itself under the batch's lock. The CTEs are materialized so the children are counted once whatever the planner
+# guesses of a batch inserted since its last statistics.
+AHEAD_CANDIDATES = sa.text("""
+WITH ahead_batches AS MATERIALIZED (
+    SELECT b.id, b.priority FROM batches b
+    WHERE b.state = 'running' AND b.ahead_cap IS NOT NULL AND (
+        SELECT count(*) FROM actions w
+        WHERE w.batch_id = b.id AND w.state = 'running' AND w.ahead = 'ahead' AND w.remaining_deps > 0
+    ) < b.ahead_cap
+), children AS MATERIALIZED (
+    SELECT r.batch_id, e.input_key, count(*) AS running_parents
+    FROM ahead_batches b
+    JOIN actions r ON r.batch_id = b.id AND r.state = 'running' AND r.remaining_deps = 0
+    JOIN edges e ON e.batch_id = r.batch_id AND e.parent_key = r.input_key
+    GROUP BY r.batch_id, e.input_key
+)
 SELECT a.batch_id, a.input_key, a.tier
-FROM batches b
-CROSS JOIN LATERAL (
-    SELECT a.batch_id, a.input_key, a.tier, a.critical_depth, a.descendant_count, a.theory FROM actions a
-    WHERE a.batch_id = b.id AND a.input_key IN (
-        SELECT e.input_key FROM edges e WHERE e.batch_id = b.id AND e.parent_key IN (
-            SELECT r.input_key FROM actions r WHERE r.batch_id = b.id AND r.state = 'running' AND r.remaining_deps = 0
-        )
-    ) AND {AHEAD_ELIGIBLE}
-) a
-WHERE b.state = 'running' AND b.ahead_cap IS NOT NULL AND (
-    SELECT count(*) FROM actions w
-    WHERE w.batch_id = b.id AND w.state = 'running' AND w.ahead = 'ahead' AND w.remaining_deps > 0
-) < b.ahead_cap
+FROM children c
+JOIN ahead_batches b ON b.id = c.batch_id
+JOIN actions a ON a.batch_id = c.batch_id AND a.input_key = c.input_key
+WHERE a.state = 'waiting' AND a.class = 'build' AND a.ahead <> 'abandoned' AND a.remaining_deps = c.running_parents
 ORDER BY b.priority DESC, a.critical_depth DESC, a.descendant_count DESC, a.theory, a.input_key
 """)
+
 # Lock the best of a batch's candidates ``keys`` that may still be claimed ahead, its tier in the order of ``tiers``,
 # as _claim_ahead orders the batches.
 CLAIM_AHEAD_ACTION = sa.text(f"""
