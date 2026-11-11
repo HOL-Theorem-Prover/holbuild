@@ -50,6 +50,8 @@ sig
   val action_dir : t -> string -> string
   val action_manifest : t -> string -> string
   val blob_path : t -> string -> string
+  (* The blob hash a manifest line references, if any. *)
+  val blob_ref : string -> string option
 
   val copy_binary : string -> string -> unit
   val link_or_copy : {src : string, dst : string} -> unit

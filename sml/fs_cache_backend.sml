@@ -99,11 +99,41 @@ fun blob_path cache hash = Path.concat(blobs_dir cache, hash)
 fun ensure_layout cache =
   (ensure_dir (actions_dir cache); ensure_dir (blobs_dir cache); ensure_dir (tmp_dir cache))
 
-fun write_action cache {key, text} = write_text (action_manifest cache key) text
+fun take_token s =
+  let
+    fun loop i =
+      if i >= size s then i
+      else
+        case String.sub(s, i) of
+            #" " => i
+          | #"\t" => i
+          | #"\n" => i
+          | _ => loop (i + 1)
+  in
+    String.substring(s, 0, loop 0)
+  end
+
+fun blob_ref line =
+  case String.tokens Char.isSpace line of
+      ["blob", _, hash] => SOME hash
+    | _ =>
+        if String.isPrefix "blob=" line then SOME (take_token (String.extract(line, 5, NONE)))
+        else NONE
+
+fun touch path = FS.setTime(path, NONE) handle OS.SysErr _ => ()
+
+(* GC snapshots the blobs live manifests reference, then sweeps unreferenced
+   blobs older than its cutoff. A build that reuses an old blob does not
+   rewrite it, so its manifest, if written after the snapshot, would not keep
+   the blob from the sweep. Refreshing each referenced blob first does. *)
+fun write_action cache {key, text} =
+  (List.app (fn line => Option.app (touch o blob_path cache) (blob_ref line))
+            (String.tokens (fn c => c = #"\n") text);
+   write_text (action_manifest cache key) text)
 
 fun remove_action cache key = remove_file (action_manifest cache key)
 
-fun touch_action cache key = FS.setTime(action_manifest cache key, NONE) handle OS.SysErr _ => ()
+fun touch_action cache key = touch (action_manifest cache key)
 
 fun get_action cache key =
   SOME (read_text (action_manifest cache key)) handle _ => NONE
