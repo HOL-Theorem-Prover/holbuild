@@ -63,6 +63,15 @@ expect_lines "$(bash_complete "$project" "holbuild repl --from=Al" holbuild repl
   AlphaTheory AlpineTheory
 expect_lines "$(bash_complete "$project" "holbuild repl --from=" holbuild repl --from =)" \
   =AlphaTheory =AlpineTheory =BetaTheory
+# Quoted and escaped words reach holbuild as the shell would pass them.
+spaced=$tmpdir/my\ project
+cp -R "$project" "$tmpdir/my project"
+expect_lines "$(bash_complete "$tmpdir" "holbuild --source-dir \"$tmpdir/my project\" clean A" \
+                 holbuild --source-dir "\"$tmpdir/my project\"" clean A)" AlphaTheory AlpineTheory
+expect_lines "$(bash_complete "$tmpdir" "holbuild --source-dir $spaced clean A" \
+                 holbuild --source-dir "$spaced" clean A)" AlphaTheory AlpineTheory
+expect_lines "$(bash_complete "$tmpdir" "holbuild --source-dir='$tmpdir/my project' clean 'Al" \
+                 holbuild --source-dir = "'$tmpdir/my project'" clean "'Al")" AlphaTheory AlpineTheory
 # Nothing to offer: bash completes file names instead.
 expect_lines "$(bash_complete "$project" "holbuild build --tactic-timeout " holbuild build --tactic-timeout "")"
 require_no_file "$HOLBUILD_CACHE"

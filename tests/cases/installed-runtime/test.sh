@@ -56,11 +56,14 @@ for file in "${completions[@]}"; do require_file "$tmpdir/relocated/$file"; done
 use_case_cache "$tmpdir/custom-cache"
 (cd "$tmpdir/project" && "$tmpdir/custom-bin/holbuild" build --force=full ATheory) > "$tmpdir/custom-build.log" 2>&1
 require_file "$tmpdir/custom-data/sml/holbuild_runtime.sml"
+for file in "${completions[@]}"; do require_file "$tmpdir/custom-prefix/$file"; done
 
 make -C "$HOLBUILD_ROOT" uninstall PREFIX="$tmpdir/relocated" > "$tmpdir/uninstall.log" 2>&1
 require_no_file "$tmpdir/relocated/bin/holbuild"
 require_no_file "$tmpdir/relocated/share/holbuild/sml/holbuild_runtime.sml"
 for file in "${completions[@]}"; do require_no_file "$tmpdir/relocated/$file"; done
-make -C "$HOLBUILD_ROOT" uninstall BINDIR="$tmpdir/custom-bin" DATADIR="$tmpdir/custom-data" > "$tmpdir/custom-uninstall.log" 2>&1
+make -C "$HOLBUILD_ROOT" uninstall PREFIX="$tmpdir/custom-prefix" \
+  BINDIR="$tmpdir/custom-bin" DATADIR="$tmpdir/custom-data" > "$tmpdir/custom-uninstall.log" 2>&1
 require_no_file "$tmpdir/custom-bin/holbuild"
 require_no_file "$tmpdir/custom-data/sml/holbuild_runtime.sml"
+for file in "${completions[@]}"; do require_no_file "$tmpdir/custom-prefix/$file"; done
