@@ -108,12 +108,14 @@ fun completed_line text =
       SOME line => Substring.string (#2 (Substring.position "Completed in" (Substring.full line)))
     | NONE => "no zstd completion line"
 
-(* Under HOLBUILD_CACHE_TRACE, zstd runs verbosely so its wall time and CPU
-   load show how much the -T0 threads compete with the build. *)
+(* One thread per blob: the transfer pools already compress many blobs at
+   once, and -T0 would start a thread per host core in each, whatever the
+   process's CPU allowance.  Under HOLBUILD_CACHE_TRACE, zstd runs verbosely
+   so its wall time and CPU load show how it competes with the build. *)
 fun zstd_compress url src dst =
   if HolbuildStatus.cache_trace_enabled () then
     let
-      val result = HolbuildSpawn.run {program = "zstd", args = ["-vv", "-f", "-T0", "-o", dst, src],
+      val result = HolbuildSpawn.run {program = "zstd", args = ["-vv", "-f", "-T1", "-o", dst, src],
                                       stderr = HolbuildSpawn.Merge}
       val ok = HolbuildSpawn.succeeded result
     in
@@ -123,7 +125,7 @@ fun zstd_compress url src dst =
       ok
     end
   else
-    HolbuildSpawn.succeeded (run "zstd" ["-q", "-f", "-T0", "-o", dst, src])
+    HolbuildSpawn.succeeded (run "zstd" ["-q", "-f", "-T1", "-o", dst, src])
 
 fun zstd_content_headers size =
   ["Content-Encoding: zstd", "X-Digest-SizeBytes: " ^ size]

@@ -361,7 +361,23 @@ require_grep "^POST /v1/batches Bearer stub-token$" "$state/requests.log"
 # it remembered, and the resubmitted batch builds.
 write_theories ledger
 run ledger-seed 0 build --remote-exec "$coordinator" --remote-only BTheory
-[[ -n $(ls "$project/.holbuild/remote-ledger") ]] || { echo "the export left no remote ledger" >&2; exit 1; }
+[[ -n $(ls "$HOLBUILD_CACHE/remote-ledger") ]] || { echo "the export left no remote ledger" >&2; exit 1; }
+# The ledger is the cache root's, so another directory of the project, as a
+# fresh worktree is, doesn't ask about the blob of the unchanged BScript.sml
+# again; the changed AScript.sml it uploads.
+copy=$tmpdir/project-copy
+mkdir -p "$copy"
+cp -r "$project/holproject.toml" "$project/src" "$copy/"
+sed -i 's/(\* ledger \*)/(* ledger-copy *)/' "$copy/src/AScript.sml"
+b_source=$(sha256sum "$copy/src/BScript.sml" | cut -d' ' -f1)
+a_copy_source=$(sha256sum "$copy/src/AScript.sml" | cut -d' ' -f1)
+: > "$tmpdir/server/requests.log"
+(cd "$copy" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only BTheory) \
+  > "$tmpdir/ledger-copy.log" 2>&1 || { cat "$tmpdir/ledger-copy.log" >&2; exit 1; }
+require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/ledger-copy.log"
+refute_grep "^\(HEAD\|PUT\) /cas/$b_source$" "$tmpdir/server/requests.log"
+require_grep "^PUT /cas/$a_copy_source$" "$tmpdir/server/requests.log"
+[[ ! -e "$copy/.holbuild/remote-ledger" ]] || { echo "the copy kept a ledger of its own" >&2; exit 1; }
 # ATheory changes and BScript.sml doesn't, so its blob is remembered.
 sed -i 's/(\* ledger \*)/(* ledger-a *)/' "$project/src/AScript.sml"
 b_source=$(sha256sum "$project/src/BScript.sml" | cut -d' ' -f1)
@@ -623,7 +639,7 @@ require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdi
 # Without a local cache entry to publish, it goes to the workers.  The
 # remote ledger, which says the remote has it, goes too.
 rm "$remote_root/ac/$ac_a"
-rm -r "$project/.holbuild/remote-ledger"
+rm -r "$HOLBUILD_CACHE/remote-ledger"
 rm -r "$HOLBUILD_CACHE/actions/$key_a"
 sed -i 's/(\* built-here-alone \*)/(* built-here-unpublished *)/' "$project/src/BScript.sml"
 sed -i 's/simp\[\]$/simp[] (* unpublished *)/' "$project/src/CScript.sml"
