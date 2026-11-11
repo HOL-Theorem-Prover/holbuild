@@ -9,14 +9,53 @@ can carry a JSON metadata sidecar plus checksum.
 Publish these files together:
 
 ```text
-<TARGET>.hbx         # archive produced by holbuild export
+<TARGET>.hbx         # capsule produced by holbuild export
 <TARGET>.hbx.json    # metadata sidecar produced by --metadata-out
 <TARGET>.hbx.sha256  # sha256sum checksum file
 ```
 
 The sidecar is for discovery before downloading the archive. Treat it as
-advisory until the archive checksum has been verified; the archive still carries
-its internal `holbuild-cache/manifest`.
+advisory until the archive checksum has been verified; the archive carries its
+own manifests (see below).
+
+## Capsule layout
+
+`holbuild export` writes the root package as a capsule: one tar with up to two
+parts.
+
+```text
+holbuild-package/manifest   # holbuild-hbx-capsule-v1: name, version, toolchain_key, holbuild_version
+holbuild-package/source/    # the package's source snapshot
+holbuild-cache/             # holbuild-hbx-v2: cached build outputs of the package's theories
+```
+
+The snapshot is the package's `holproject.toml`, the sources it discovers (with
+the committed manifest's own `exclude` and `exclude_globs`), and the files it
+declares as inputs: action `extra_inputs`, `holbuild_extra_deps` of its
+sources, generator inputs and shim manifests. It never holds `.git`,
+`.holbuild`, `.holconfig.toml` or generator outputs; a consumer reruns
+generators. Export fails on a symlink in the snapshot, a missing declared file
+or a declared path outside the package root. Directory entries are 755 and
+files 755 (executable) or 644, whatever the publisher's umask, so the archive's
+bytes do not depend on the checkout beyond the snapshot's content. A package's
+dependencies are not stored beside the snapshot; they are the declarations in
+the snapshot's `holproject.toml`, and dependencies' capsules are never bundled.
+
+`toolchain_key` is the identity of the toolchain's theory-building semantics that
+action keys carry. Cache entries in the capsule match only builds on the same
+toolchain; on another toolchain holbuild builds from source.
+
+| Command | Package part | Cache part |
+|---|---|---|
+| `export -o F [TARGET ...]` | yes | the root package's theories among the targets' closure |
+| `export --closure -o F [TARGET ...]` | no | every theory in the targets' closure, dependencies included |
+| `export --sources-only -o F` | yes | none; no targets, no build |
+
+A target in another package is left out of the default export. An unbuilt
+dependency theory fails only `--closure`.
+
+`holbuild import F` imports the cache part only, and nothing from a capsule
+without one.
 
 HBX archives are trusted build inputs, not sandboxed packages. Their cached
 Poly/ML outputs may be loaded by a later build. Import only from a trusted
@@ -35,7 +74,7 @@ steps:
   - uses: actions/checkout@v4
   - name: Build target
     run: holbuild build MyTheory
-  - name: Export HBX archive
+  - name: Export capsule
     run: |
       holbuild export \
         -o MyTheory.hbx \
@@ -68,6 +107,11 @@ holbuild import MyTheory.hbx
 holbuild build MyTheory
 ```
 
+A capsule's cache part holds only the package's own outputs, so a build after
+`import` restores those and gets the dependencies' outputs from the cache or
+builds them. Publish with `--closure` for an archive whose `import` and `build`
+need nothing else.
+
 Private repositories use normal GitHub authentication (`GH_TOKEN` or `gh auth
 login`). Public repositories need no download token.
 
@@ -79,9 +123,17 @@ login`). Public repositories need no download token.
 {
   "format": "holbuild-hbx-metadata-v1",
   "archive_format": "holbuild-hbx-v2",
+  "capsule_format": "holbuild-hbx-capsule-v1",
   "archive": "MyTheory.hbx",
   "sha256": "...",
   "size": "123456",
+  "name": "mypackage",
+  "version": "1.2.3",
+  "toolchain_key": "...",
+  "dependencies": [
+    {"name": "hol", "git": "https://github.com/HOL-Theorem-Prover/HOL.git", "rev": "..."},
+    {"name": "dep", "git": "https://github.com/example/dep.git", "rev": "..."}
+  ],
   "targets": ["MyTheory"],
   "action_count": 1,
   "holbuild_version": "0.8.1",
@@ -92,3 +144,10 @@ login`). Public repositories need no download token.
   "hol_rev": "..."
 }
 ```
+
+`archive_format` is present when the archive has a cache part, `capsule_format`
+when it has a package part; `version` when the package declares one.
+`dependencies` copies the declarations in the package's manifest (`git` and
+`rev`, or `from`, `path` and `manifest`). `targets` are the targets whose
+theories the cache part holds. Repository URLs (`source_repo`, `hol_repo` and
+dependencies' `git`) are written without any credentials that the URL carried.

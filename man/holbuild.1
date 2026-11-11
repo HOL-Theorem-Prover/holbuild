@@ -221,8 +221,10 @@ theory from the beginning, run
 and then
 .BR "build \-\-force=theory" .
 .TP
-.B export \fR[\fB\-\-build\fR [\fB\-\-remote\-exec \fIURL\fR [\fB\-\-remote\-only\fR]]] \fB\-o \fIFILE\fR [\fB\-\-metadata\-out \fIFILE\fR] [\fITARGET\fR ...]
-Export the cached build outputs of the targets as an hbx archive.
+.B export \fR[\fB\-\-build\fR [\fB\-\-remote\-exec \fIURL\fR [\fB\-\-remote\-only\fR]]] [\fB\-\-closure\fR | \fB\-\-sources\-only\fR] \fB\-o \fIFILE\fR [\fB\-\-metadata\-out \fIFILE\fR] [\fITARGET\fR ...]
+Write the root package as an hbx capsule: its source snapshot and the cached
+build outputs of its own theories among the targets.
+Targets in other packages are left out.
 .RS
 .TP
 .B \-o \fIFILE\fR, \-\-output \fIFILE\fR
@@ -239,6 +241,14 @@ With
 as
 .B build
 does.
+.TP
+.B \-\-closure
+Write the cached outputs of the whole target closure, dependencies included,
+and no source snapshot.
+.TP
+.B \-\-sources\-only
+Write the source snapshot only.
+Takes no targets and builds nothing.
 .RE
 .TP
 .BI import " FILE"
