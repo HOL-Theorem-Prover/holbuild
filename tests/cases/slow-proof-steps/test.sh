@@ -56,3 +56,41 @@ python3 "$collector" "$tmpdir/old.log" --batch "$tmpdir/batch.json" \
 [[ $(wc -l < "$tmpdir/old.tsv") -eq 1 ]]
 require_grep 'timings unavailable: slow:ATheory@old' "$tmpdir/old-coverage.log"
 require_grep '0/2 logs instrumented' "$tmpdir/old-coverage.log"
+
+# An evicted log blob must not discard earlier rows or skip later actions.
+mkdir -p "$tmpdir/bin"
+cat > "$tmpdir/bin/curl" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+out=
+url=
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --output) out=$2; shift 2 ;;
+    *) url=$1; shift ;;
+  esac
+done
+if [[ $url == */cas/000* ]]; then
+  echo 'curl: (22) The requested URL returned error: 404' >&2
+  exit 22
+fi
+cp "$HOLBUILD_TEST_STEP_LOG" "$out"
+SH
+chmod +x "$tmpdir/bin/curl"
+python3 - "$tmpdir/batch-fetch.json" <<'PY'
+import json
+import sys
+actions = [dict(theory=name, input_key=name, log_sha256=sha)
+           for name, sha in (("before", "1" * 64), ("missing", "0" * 64),
+                             ("cached", None), ("after", "2" * 64))]
+with open(sys.argv[1], "w") as output:
+    json.dump(dict(state="done", actions=actions), output)
+PY
+PATH="$tmpdir/bin:$PATH" HOLBUILD_TEST_STEP_LOG="$log" python3 "$collector" \
+  --batch "$tmpdir/batch-fetch.json" --cache-url https://unused.example.org \
+  > "$tmpdir/fetched.tsv" 2> "$tmpdir/fetched-coverage.log"
+require_grep '^before@before' "$tmpdir/fetched.tsv"
+require_grep '^after@after' "$tmpdir/fetched.tsv"
+require_grep 'timings unavailable: missing@missing (curl exited 22:' "$tmpdir/fetched-coverage.log"
+require_grep 'timings unavailable: cached@cached' "$tmpdir/fetched-coverage.log"
+require_grep '2/4 logs instrumented' "$tmpdir/fetched-coverage.log"

@@ -1073,7 +1073,8 @@ separate rows.
 This is a report of executed work, not a complete profile: checkpoint resumes
 omit their restored prefix, and a batch lists only actions submitted to it.
 The collector explicitly reports unavailable timings for old or untimed logs
-and for cached actions whose original log was not retained. Such actions are
+and for cached actions whose original log was not retained. A blob-fetch error
+names the affected theory and leaves the rest of the collection running. Such actions are
 not counted as having zero slow steps. A fully cached build may contribute no
 new timing data. Existing log files can be from an earlier invocation; pass
 only logs belonging to the execution you want, or use its saved batch records.

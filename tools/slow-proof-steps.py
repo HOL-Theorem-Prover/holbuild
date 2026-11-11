@@ -29,6 +29,7 @@ class Execution:
     name: str
     available: bool
     steps: list[Step]
+    error: str | None = None
 
 
 def parse_log(name: str, lines: Iterable[str]) -> Execution:
@@ -74,8 +75,12 @@ def read_batches(paths: list[Path], cache_url: str, curl_config: Path | None) ->
             if curl_config is not None:
                 command += ["--config", str(curl_config)]
             command += ["--output", str(log_path), cache_url.rstrip("/") + "/cas/" + sha]
-            subprocess.run(command, check=True)
-            results.append(read_log(f"{name}@{key}", log_path))
+            fetched = subprocess.run(command, capture_output=True, text=True)
+            if fetched.returncode:
+                results.append(Execution(f"{name}@{key}", False, [],
+                                         f"curl exited {fetched.returncode}: {fetched.stderr.strip()}"))
+            else:
+                results.append(read_log(f"{name}@{key}", log_path))
     return results
 
 
@@ -88,7 +93,8 @@ def report(executions: list[Execution]) -> None:
               f"\t{step.elapsed_ms:.3f}\t{step.limit_ms:.3f}\t{step.label}")
     for execution in executions:
         if not execution.available:
-            print(f"timings unavailable: {execution.name}", file=sys.stderr)
+            reason = f" ({execution.error})" if execution.error else ""
+            print(f"timings unavailable: {execution.name}{reason}", file=sys.stderr)
     covered = sum(execution.available for execution in executions)
     print(f"{len(steps)} recorded half-budget steps; {covered}/{len(executions)} logs instrumented; "
           "executed work only (checkpoint prefixes and pre-submission cache hits are not covered)",
@@ -111,7 +117,7 @@ def main() -> None:
         if args.batch:
             executions += read_batches(args.batch, args.cache_url, args.curl_config)
         report(executions)
-    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+    except (OSError, ValueError, KeyError) as error:
         parser.exit(1, f"{error}\n")
 
 
