@@ -44,14 +44,20 @@ SML
 # A dry run runs generators, so it must not start while another holbuild
 # holds the project lock.
 mkdir -p "$project/.holbuild/locks"
-python3 - "$project/.holbuild/locks/project.lock" <<'PY' &
+ready=$tmpdir/holder.ready
+python3 - "$project/.holbuild/locks/project.lock" "$ready" <<'PY' &
 import fcntl, sys, time
 f = open(sys.argv[1], "a+")
 fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+open(sys.argv[2], "w").close()
 time.sleep(25)
 PY
 holder=$!
-sleep 1
+for _ in $(seq 1 100); do
+  [[ -f "$ready" ]] && break
+  sleep 0.05
+done
+require_file "$ready"
 
 dry_log=$tmpdir/dry.log
 if (cd "$project" && "$HOLBUILD_BIN" build --dry-run GTheory) > "$dry_log" 2>&1; then
