@@ -495,16 +495,23 @@ child that fits the budget starts whatever `MemAvailable` says, so a build
 never waits on memory none of its children use. Where `/proc/meminfo` has no
 `MemAvailable` (outside Linux), only the reservations count, and the default
 charge is `--max-heap` + 1 GiB, what a child can reach. `/proc/meminfo` shows
-the whole machine, not a container's memory limit, so inside a
-memory-limited container set `--child-charge` to what a child can reach. A child
+the whole machine, not a container's memory limit. Where cgroup v2 limits the
+memory of holbuild's group or of a group enclosing it (a container, a systemd
+or Slurm scope), a child also starts only while the tightest of those groups
+has its charge left (`memory.max` less `memory.current`, plus its reclaimable
+`inactive_file` page cache, less the charges of children still starting),
+whether or not any reservation is held, and a charge larger than the least
+`memory.max` fails at once. Under cgroup v1, or another memory limit holbuild
+can't read, set `--child-charge` to what a child can reach. A child
 that waits shows as `(waiting for memory)` in the status line, as a
 `waiting for machine memory` line otherwise, and as a `waiting_for_memory`
 event with `--json`. A charge larger than the whole budget fails at once.
 
 This bounds admission; it does not enforce RSS: children already running can
 still grow together, up to their `--max-heap`, past what the machine has left,
-since nothing re-checks a child once it has started. It covers neither HOL
-toolchain builds nor `check`, `run` or `repl`.
+since nothing re-checks a child once it has started. The HOL session of
+fingerprint checks and `run` takes a reservation like a theory child; HOL toolchain
+builds and `repl` take none.
 
 - The budget is the byte count in `DIR/budget`, which `--machine-max-mem`
   creates on first use. Without that file, it is the default, recomputed from
