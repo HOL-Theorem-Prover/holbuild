@@ -124,6 +124,10 @@ require_grep '^target ATheory$' "$tmpdir/archive.manifest"
 import_log=$tmpdir/import.log
 HOLBUILD_CACHE="$import_cache" "$HOLBUILD_BIN" import "$archive" > "$import_log" 2>&1
 require_grep "imported 2 cache action" "$import_log"
+# Two new manifests at 1 MiB each, plus their blobs.
+journal=$(cat "$import_cache/locks/gc-growth.journal")
+[[ $journal =~ ^[0-9]+$ ]] && (( journal > 2097152 )) ||
+  { echo "import did not record its cache growth: '$journal'" >&2; exit 1; }
 
 # Same-output archives can carry different successfully checked timeout contracts.
 timeout_cache=$tmpdir/timeout-cache

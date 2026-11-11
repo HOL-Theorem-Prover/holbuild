@@ -3599,6 +3599,9 @@ fun main raw_args =
   (let
      val _ = HolbuildOffline.initialize ()
      val _ = install_signal_handlers ()
+     (* exec-action leaves through Posix.Process.exit, which skips this, so
+        fleet workers, whose cache their cap sweep bounds, keep no journal. *)
+     val _ = OS.Process.atExit HolbuildFSCacheBackend.flush_growth
      val _ = HolbuildStatus.set_json_mode (List.exists (fn s => s = "--json") raw_args)
      val runtime_options = runtime_options raw_args
      val _ =
