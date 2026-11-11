@@ -12,9 +12,10 @@ cleanup() { chmod -R u+w "$tmpdir" 2>/dev/null || true; rm -rf "$tmpdir"; }
 trap cleanup EXIT
 
 cache=$tmpdir/cache
-mkdir -p "$cache/tmp/oldtmp" "$cache/blobs" "$cache/actions/live" "$cache/actions/old" "$cache/actions/nomani" "$cache/locks/action-stale.lock"
+mkdir -p "$cache/tmp/oldtmp" "$cache/blobs" "$cache/actions/live" "$cache/actions/old" "$cache/actions/nomani" "$cache/actions/fresh-nomani" "$cache/actions/old/nested/dir" "$cache/locks/action-stale.lock"
 : > "$cache/blobs/live"
 : > "$cache/blobs/dead"
+: > "$cache/actions/stray-file"
 printf 'holbuild-cache-action-v2\nblob sig live\n' > "$cache/actions/live/manifest"
 printf 'holbuild-cache-action-v2\nblob=old\n' > "$cache/actions/old/manifest"
 touch -d '10 days ago' \
@@ -30,11 +31,43 @@ env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$cache" "$HOLBUILD_BIN" gc --ca
 require_file "$cache/blobs/live"
 [[ ! -e "$cache/blobs/dead" ]] || { echo "unreferenced blob survived" >&2; exit 1; }
 [[ ! -e "$cache/actions/old" ]] || { echo "old action survived" >&2; exit 1; }
+[[ -d "$cache/actions/live" ]] || { echo "live action was removed" >&2; exit 1; }
+[[ -f "$cache/actions/stray-file" ]] || { echo "fresh non-directory action entry was removed" >&2; exit 1; }
+[[ -d "$cache/actions/fresh-nomani" ]] || { echo "fresh incomplete action was removed" >&2; exit 1; }
 [[ ! -e "$cache/actions/nomani" ]] || { echo "stale incomplete action survived" >&2; exit 1; }
 [[ ! -e "$cache/tmp/oldtmp" ]] || { echo "stale tmp survived" >&2; exit 1; }
 [[ ! -e "$cache/locks/action-stale.lock" ]] || { echo "stale action lock survived" >&2; exit 1; }
 [[ -f "$cache/locks/gc.lock" ]] || { echo "cache gc lock file missing" >&2; exit 1; }
 [[ ! -e "$cache/locks/gc.lock.owner" ]] || { echo "cache gc lock owner survived" >&2; exit 1; }
+
+# A fresh manifest GC cannot read stops GC before any blob it names is swept.
+unreadable_cache=$tmpdir/unreadable-cache
+mkdir -p "$unreadable_cache/actions/live" "$unreadable_cache/blobs" "$unreadable_cache/tmp"
+: > "$unreadable_cache/blobs/live"
+printf 'holbuild-cache-action-v2\nblob sig live\n' > "$unreadable_cache/actions/live/manifest"
+touch -d '10 days ago' "$unreadable_cache/blobs/live"
+chmod a-r "$unreadable_cache/actions/live/manifest"
+if [[ -r "$unreadable_cache/actions/live/manifest" ]]; then
+  :  # running as a user that ignores file permissions
+elif env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$unreadable_cache" "$HOLBUILD_BIN" gc --cache-only > /dev/null 2>&1; then
+  echo "GC succeeded despite an unreadable manifest" >&2; exit 1
+fi
+require_file "$unreadable_cache/blobs/live"
+
+# More stale actions than one removal batch holds are all removed.
+batch_cache=$tmpdir/batch-cache
+mkdir -p "$batch_cache/actions" "$batch_cache/blobs" "$batch_cache/tmp"
+for i in $(seq 1 1100); do
+  mkdir "$batch_cache/actions/stale$i"
+  printf 'holbuild-cache-action-v2\n' > "$batch_cache/actions/stale$i/manifest"
+done
+mkdir "$batch_cache/actions/fresh"
+printf 'holbuild-cache-action-v2\n' > "$batch_cache/actions/fresh/manifest"
+touch -d '10 days ago' "$batch_cache"/actions/stale*/manifest
+env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$batch_cache" "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/batch-gc.log"
+require_grep "actions=1100 " "$tmpdir/batch-gc.log"
+[[ -d "$batch_cache/actions/fresh" ]] || { echo "fresh action was removed" >&2; exit 1; }
+[[ $(ls "$batch_cache/actions" | wc -l) -eq 1 ]] || { echo "stale actions survived" >&2; exit 1; }
 
 obsolete_cache=$tmpdir/obsolete-cache
 mkdir -p "$obsolete_cache/locks/gc.lock" "$obsolete_cache/actions" "$obsolete_cache/blobs" "$obsolete_cache/tmp"
