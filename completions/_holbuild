@@ -13,5 +13,7 @@ candidates=(${candidates:#})
 if (( ${#candidates} )); then
   compadd -- "${candidates[@]}"
 else
+  # A value given as `--option=VALUE`: complete the file name after the `=`.
+  [[ $PREFIX == -*=* ]] && compset -P '*='
   _files
 fi

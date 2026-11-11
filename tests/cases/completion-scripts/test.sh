@@ -87,7 +87,8 @@ zsh_complete() {
     fpath=("$1" $fpath)
     autoload -Uz _holbuild
     compadd() { shift; print -l -- "$@"; }
-    _files() { print "<files>"; }
+    compset() { IPREFIX=${PREFIX%%=*}=; PREFIX=${PREFIX#*=}; }
+    _files() { print "<files${IPREFIX:+ after $IPREFIX} for $PREFIX>"; }
     shift
     words=("$@")
     CURRENT=$#
@@ -102,12 +103,27 @@ if command -v zsh > /dev/null; then
   expect_lines "$(zsh_complete "$tmpdir" --source-dir "\"$tmpdir/my project\"" clean A)" \
     AlphaTheory AlpineTheory
   expect_lines "$(zsh_complete "$tmpdir" --source-dir="$spaced" clean A)" AlphaTheory AlpineTheory
-  expect_lines "$(zsh_complete "$project" build --tactic-timeout "")" "<files>"
+  expect_lines "$(zsh_complete "$project" build --tactic-timeout "")" "<files for >"
+  expect_lines "$(zsh_complete "$project" --source-dir=sr)" "<files after --source-dir= for sr>"
 else
-  echo "zsh not installed; skipping its syntax check" >&2
+  echo "zsh not installed; skipping its checks" >&2
 fi
+# fish_complete DIR LINE: what Fish offers for LINE, typed in DIR.
+fish_complete() {
+  (cd "$1" && PATH=$tmpdir/fish-bin:$PATH fish --no-config -c \
+     'source $argv[1]; complete -C $argv[2]' "$completions/holbuild.fish" "$2")
+}
+
 if command -v fish > /dev/null; then
   fish -n "$completions/holbuild.fish"
+  mkdir "$tmpdir/fish-bin" "$project/srcdir"
+  ln -s "$HOLBUILD_BIN" "$tmpdir/fish-bin/holbuild"
+  expect_lines "$(fish_complete "$project" "holbuild clean A")" AlphaTheory AlpineTheory
+  expect_lines "$(fish_complete "$tmpdir" "holbuild --source-dir \"$tmpdir/my project\" clean A")" \
+    AlphaTheory AlpineTheory
+  expect_lines "$(fish_complete "$project" "holbuild repl --from=Alp")" \
+    --from=AlphaTheory --from=AlpineTheory
+  expect_lines "$(fish_complete "$project" "holbuild --source-dir=srcd")" --source-dir=srcdir/
 else
-  echo "fish not installed; skipping its syntax check" >&2
+  echo "fish not installed; skipping its checks" >&2
 fi
