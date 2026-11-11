@@ -1172,14 +1172,24 @@ Any failure costs only time. A deferred proof that fails, leaves
 an extra hypothesis, changes the theory, or writes theory data makes the
 theory build again with its proofs in place. "Changes the theory" means a
 theory change HOL reports (a new constant, type or saved theorem) or a write
-to theory data of a type holbuild knows; a proof that changes some other ML
+to theory data of a type holbuild knows. A proof that changes some other ML
 state that a later declaration reads isn't caught, since the declaration
-already ran with the state as it was. A failed gate drops everything
-that loaded the outline. Either way the theory's input key is remembered
+already ran with the state as it was: a tactic that writes a `ref`, directly or
+through a helper, still runs deferred (Poly has no write barrier, and a
+helper's writes can't be seen), and the theory is built as if that were fine.
+A script that relies on this must build with `HOLBUILD_PIPELINE=off`, or not
+use the pattern. Likewise, until the script ends a deferred theorem's ML value
+is the stub, so top-level code that reads `Thm.tag` of its own theorem and
+branches without failing (prints, or saves a theorem conditionally, rather than
+raising) sees the `holbuild_deferred_<k>` oracle and marker dependency in the
+tag, and what it outputs goes to the caches under the ordinary key. A failed
+gate drops everything that loaded the outline. Either way the theory's input key is remembered
 in `.holbuild/plan/outline-skip`, and that input is never pipelined again.
 
-Proofs that use `cheat` or `suspend`, and theorems the script `Resume`s,
-run in place. A theory is not pipelined if it saves checkpoints and is a
+Proofs that use `cheat` or `suspend`, theorems the script `Resume`s, and
+`Resume` blocks whose header names `smlname` (the stub would give the name a
+theorem with the subgoal's assumptions as hypotheses) run in place; a label
+that only contains the word `smlname` is run in place too. A theory is not pipelined if it saves checkpoints and is a
 requested target or the build passes `--all-checkpoints`, if it declares
 extra outputs, or under `--trace-steps`, `--repl-on-failure`, a tracing
 kernel or an execution plan.
