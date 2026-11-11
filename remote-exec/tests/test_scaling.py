@@ -37,6 +37,8 @@ def counts(
     ready_run: int = 0,
     running_run: int = 0,
     high_run: int = 0,
+    ahead: int = 0,
+    ahead_high: int = 0,
 ) -> QueueCounts:
     return QueueCounts(
         waiting=0,
@@ -47,6 +49,8 @@ def counts(
         ready_run=ready_run,
         running_run=running_run,
         high_run=high_run,
+        waiting_ahead_standard=ahead,
+        waiting_ahead_high=ahead_high,
     )
 
 
@@ -59,6 +63,12 @@ def counts(
         (counts(ready_high=1), 1),  # warm workers are standard-tier, so a high action needs a burst worker
         (counts(running=2, ready_high=1, running_high=1), 2),
         (counts(ready=30, running=10), 16),  # capped
+        # Of the running actions, those waiting ahead beyond the tier's ready work ask for no worker...
+        (counts(running=6, ahead=4), 0),
+        (counts(running_high=3, ahead_high=3), 0),
+        # ...but those that keep ready work off the workers they hold do.
+        (counts(ready=2, running=4, ahead=3), 3),
+        (counts(ready=4, running=4, ahead=3), 6),
     ],
 )
 def test_burst_demand(queue: QueueCounts, expected: int) -> None:
@@ -147,7 +157,8 @@ async def test_queue_reports_counts_and_the_desired_burst_workers(
         "running_run": 1,
         "ready_priority": 0,
         "running_priority": 0,
-        "waiting_ahead": 0,
+        "waiting_ahead_standard": 0,
+        "waiting_ahead_high": 0,
         "run_slots": 30,
         "run_floor": 0,
         "desired_burst_workers": 0,  # the route's coordinator has no burst workers to ask for

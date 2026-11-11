@@ -26,9 +26,12 @@ def upgrade() -> None:
         "CREATE INDEX actions_waiting_ahead ON actions (batch_id, tier) "
         "WHERE state = 'running' AND ahead = 'ahead' AND remaining_deps > 0"
     )
+    # The claims ahead read only these, so with no batch loading ahead their read finds nothing at once.
+    op.execute("CREATE INDEX batches_running_ahead ON batches (id) WHERE state = 'running' AND ahead_cap IS NOT NULL")
 
 
 def downgrade() -> None:
+    op.execute("DROP INDEX batches_running_ahead")
     op.execute("DROP INDEX actions_waiting_ahead")
     op.execute("ALTER TABLE actions DROP COLUMN ahead")
     op.execute("ALTER TABLE batches DROP COLUMN ahead_cap")

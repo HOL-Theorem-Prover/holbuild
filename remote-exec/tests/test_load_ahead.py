@@ -28,8 +28,10 @@ from test_coordinator import (
 )
 
 
-async def claim_ahead(http: httpx.AsyncClient, tier: str = "standard", wait_s: float = 0) -> dict[str, Any] | None:
-    body = {"tier": tier, "worker": "w2", "ahead": True, "wait_s": wait_s}
+async def claim_ahead(
+    http: httpx.AsyncClient, tier: str = "standard", wait_s: float = 0, also_claim: list[str] | None = None
+) -> dict[str, Any] | None:
+    body = {"tier": tier, "also_claim": also_claim or [], "worker": "w2", "ahead": True, "wait_s": wait_s}
     response = await http.post("/v1/work/claim", json=body, headers=WORKER)
     if response.status_code == 204:
         return None
@@ -53,11 +55,16 @@ async def ahead_state(engine: AsyncEngine, name: str) -> tuple[str, str, int, in
 
 
 async def test_speculative_loading_is_checked_at_submit(http: httpx.AsyncClient) -> None:
-    for value in ["0", "65", "x"]:
+    for value in ["0", "17", "x"]:
         response = await http.post(
             "/v1/batches", content="holbuild-action-batch-v1\n", headers=CLIENT, params={"speculative_loading": value}
         )
         assert response.status_code == 422, value
+    response = await http.post(
+        "/v1/batches", content="holbuild-action-batch-v1\n", headers=CLIENT,
+        params={"speculative_loading": "4", "class": "run"},
+    )
+    assert response.status_code == 400 and "speculative_loading" in response.text
 
 
 async def test_a_batch_without_speculative_loading_is_never_claimed_ahead(http: httpx.AsyncClient) -> None:
@@ -191,14 +198,16 @@ async def test_actions_waiting_ahead_ask_for_no_burst_worker_until_their_parents
     assert await claim_ahead(http) is not None
 
     queue = (await http.get("/v1/queue", headers=CLIENT)).json()
-    assert (queue["running_standard"], queue["waiting_ahead"]) == (1, 1)
+    assert (queue["running_standard"], queue["waiting_ahead_standard"]) == (2, 1)
     async with coordinator.engine.connect() as conn:
-        assert (await coordinator._counts(conn, coordinator_module.COUNT_ACTIVE)).running_standard == 1
+        active = await coordinator._counts(conn, coordinator_module.COUNT_ACTIVE)
+    assert (active.running_standard, active.waiting_ahead_standard) == (2, 1)
+    assert coordinator_module.burst_demand(active, warm_workers=1, max_burst_workers=16) == 0
 
     cache.keys.add(ac_key("a"))
     assert (await complete(http, a, result("a", "built"))).status_code == 200
     queue = (await http.get("/v1/queue", headers=CLIENT)).json()
-    assert (queue["running_standard"], queue["waiting_ahead"]) == (1, 0)
+    assert (queue["running_standard"], queue["waiting_ahead_standard"]) == (1, 0)
 
 
 async def test_a_parent_claimed_wakes_a_waiting_claim_ahead(
@@ -245,3 +254,84 @@ async def test_claims_ahead_sharing_a_read_take_the_deepest_child_of_any_batch_n
 
     claimed = [await claim_ahead(http) for _ in range(3)]
     assert [c["theory"] for c in claimed if c is not None] == ["pkg:x", "pkg:z", "pkg:y"]
+
+
+async def test_a_claim_ahead_of_several_tiers_takes_the_deepest_child_of_its_first_tier_with_one(
+    http: httpx.AsyncClient, remote_exec_engine: AsyncEngine
+) -> None:
+    await submit(
+        http, ["a", "x", "x2", "x3", "y"], [("x", "a"), ("x2", "x"), ("x3", "x2"), ("y", "a")], speculative_loading="4"
+    )
+    await submit(http, ["b", "z", "z2"], [("z", "b"), ("z2", "z")], speculative_loading="4")
+    async with remote_exec_engine.begin() as conn:
+        await conn.execute(
+            sa.text("UPDATE actions SET tier = 'high' WHERE input_key = ANY(CAST(:keys AS text[]))"),
+            {"keys": [input_key("y"), input_key("z")]},
+        )
+    await claim_named(http, "a")
+    await claim_named(http, "b")
+
+    claimed = [await claim_ahead(http, "high", also_claim=["standard"]) for _ in range(3)]
+    assert [c["theory"] for c in claimed if c is not None] == ["pkg:z", "pkg:y", "pkg:x"]
+
+
+async def test_a_batch_at_its_cap_is_left_out_of_the_read_of_candidates(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    await submit(http, ["a", "b", "c"], [("b", "a"), ("c", "a")], speculative_loading="1")
+    await claim_named(http, "a")
+    assert await claim_ahead(http) is not None
+
+    coordinator.ahead_read = None
+    assert (await coordinator._ahead_candidates()).candidates == []
+
+
+async def test_a_parent_back_to_waiting_revokes_what_was_claimed_ahead_of_it_and_of_that(
+    http: httpx.AsyncClient, cache: FakeCache, remote_exec_engine: AsyncEngine
+) -> None:
+    await submit(http, ["a", "b", "c"], [("b", "a"), ("c", "b")], speculative_loading="4")
+    a = await claim_named(http, "a")
+    b = await claim_ahead(http)
+    assert b is not None
+    cache.keys.add(ac_key("a"))
+    assert (await complete(http, a, result("a", "built"))).status_code == 200
+    c = await claim_ahead(http)
+    assert c is not None and c["theory"] == "pkg:c"
+
+    # "b" gives up loading ahead; "c" can't get its parent's outputs before "b" is claimed again.
+    assert (await complete(http, b["attempt_token"], result("b", "failed", "ahead-abandoned"))).status_code == 200
+    assert await ahead_state(remote_exec_engine, "c") == ("waiting", "abandoned", 0, 1)
+    assert (await http.post(f"/v1/work/{c['attempt_token']}/heartbeat", headers=WORKER)).status_code == 409
+
+
+async def test_a_lease_lost_while_waiting_ahead_costs_no_attempt(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: AsyncEngine
+) -> None:
+    await submit(http, ["a", "b"], [("b", "a")], speculative_loading="4")
+    await claim_named(http, "a")
+    b = await claim_ahead(http)
+    assert b is not None
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(
+            sa.text("UPDATE leases SET expires_at = now() - interval '1 second' WHERE input_key = :key"),
+            {"key": input_key("b")},
+        )
+
+    await coordinator.expire_leases()
+    assert await ahead_state(remote_exec_engine, "b") == ("waiting", "abandoned", 0, 1)
+    assert await ahead_state(remote_exec_engine, "a") == ("running", "no", 1, 0)
+
+
+async def test_input_missing_from_a_claim_ahead_counts_its_attempt_and_makes_it_plain(
+    http: httpx.AsyncClient, cache: FakeCache, remote_exec_engine: AsyncEngine
+) -> None:
+    await submit(http, ["p", "q", "b"], [("b", "p"), ("b", "q")], speculative_loading="4")
+    await build(http, cache, "p")
+    await claim_named(http, "q")
+    b = await claim_ahead(http)
+    assert b is not None and b["ahead_parents"] == parents("q")
+
+    cache.keys.discard(ac_key("p"))
+    missing = result("b", "failed", "input-missing", missing=f"theory {input_key('p')}")
+    assert (await complete(http, b["attempt_token"], missing)).status_code == 200
+    assert await ahead_state(remote_exec_engine, "b") == ("waiting", "no", 1, 2)

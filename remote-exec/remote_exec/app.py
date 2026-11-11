@@ -157,7 +157,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         fail_fast: bool = False,
         priority: int = Query(default=0, ge=0, le=2147483647),
         action_class: Literal["build", "run"] = Query(default="build", alias="class"),
-        speculative_loading: int | None = Query(default=None, ge=1, le=64),
+        speculative_loading: int | None = Query(default=None, ge=1, le=16),
     ) -> dict[str, UUID]:
         try:
             batch = parse_batch(await text_body(request))
@@ -165,6 +165,8 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             raise HTTPException(400, str(error)) from error
         if action_class == "run" and batch.edges:
             raise HTTPException(400, "run batches require independent actions: dependency edges are not allowed")
+        if action_class == "run" and speculative_loading is not None:
+            raise HTTPException(400, "run batches have no parents to load ahead of: speculative_loading is not allowed")
         return {"batch_id": await coordinator.submit(
             batch, profile, action_class, max_heap_mb, fail_fast=fail_fast, priority=priority,
             ahead_cap=speculative_loading,
