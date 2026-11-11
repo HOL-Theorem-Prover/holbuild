@@ -196,6 +196,11 @@ done
   exit 1
 }
 
+# A parent named twice is refused before anything runs.
+worker twice "$spec_B" --ahead-parent "$key_A:$spec_A" --ahead-parent "$key_A:$spec_A"
+[[ "$worker_status" != 0 ]] || { echo "accepted a parent named twice" >&2; exit 1; }
+require_grep "ahead-parent names $key_A twice" "$tmpdir/twice.log"
+
 # A parent that never arrives gives the run up once the wait runs out.
 worker never "$spec_B" --ahead-parent "$key_A:$spec_A" --ahead-wait-seconds 3
 expect never 3 "status=failed" "failure=ahead-abandoned"
