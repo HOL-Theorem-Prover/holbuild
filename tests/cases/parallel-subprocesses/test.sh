@@ -31,17 +31,30 @@ members = ["src"]
 TOML
 child_log=$project/child.log
 : > "$child_log"
+cat > "$project/src/stagePathLib.sml" <<'SML'
+structure stagePathLib =
+struct
+  fun check () =
+    case List.find (fn dir => String.isSubstring "/.holbuild/stage/" (dir ^ "/"))
+                   (!Meta.loadPath) of
+        NONE => ()
+      | SOME dir => raise Fail ("transient stage on load path: " ^ dir)
+  val _ = check ()
+end
+SML
 for i in 1 2 3 4 5 6; do
   cat > "$project/src/T${i}Script.sml" <<SML
-open HolKernel Parse boolLib bossLib;
+open HolKernel Parse boolLib bossLib intLib JSONUtil stagePathLib;
+val _ = stagePathLib.check ();
 fun append msg =
   let val out = TextIO.openAppend "$child_log"
   in TextIO.output(out, msg ^ "\\n"); TextIO.closeOut out end;
 val _ = append "START T${i}";
 val _ = OS.Process.system "sleep 2";
 val _ = append "END T${i}";
+val _ = stagePathLib.check ();
 val _ = new_theory "T${i}";
-val t${i}_thm = store_thm("t${i}_thm", ``T``, ACCEPT_TAC TRUTH);
+val t${i}_thm = store_thm("t${i}_thm", \`\`!x:int. x < x + 1\`\`, intLib.ARITH_TAC);
 val _ = export_theory();
 SML
 done
