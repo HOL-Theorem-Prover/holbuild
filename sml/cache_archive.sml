@@ -351,15 +351,31 @@ fun is_package_only stage_dir =
   (String.isPrefix (capsule_format ^ "\n") (read_text (capsule_manifest_path stage_dir))
    handle _ => false)
 
+(* The members of an archive that holds `part` itself or anything under it. *)
+fun has_part names part =
+  List.exists (fn name => name = part orelse String.isPrefix (part ^ "/") name) names
+
+fun checked_names archive_path =
+  tar_operation (fn () => HolbuildTar.checked_names archive_path)
+
+(* Only the cache part and the capsule manifest are unpacked, so a capsule's
+   source files are never written. *)
 fun with_entries {archive_path, f} =
   let
+    val names = checked_names archive_path
+    val manifest_member = Path.concat(package_part, "manifest")
+    val wanted =
+      (if has_part names payload_dir then [payload_dir] else []) @
+      (if has_part names manifest_member then [manifest_member] else [])
     val stage_dir = temp_dir_near archive_path
     val payload = Path.concat(stage_dir, payload_dir)
     val cache = HolbuildFSCacheBackend.filesystem payload
     fun cleanup () = remove_tree stage_dir handle _ => ()
   in
     (ensure_dir stage_dir;
-     tar_extract {archive_path = archive_path, stage_dir = stage_dir};
+     if null wanted then ()
+     else tar_operation (fn () => HolbuildTar.extract_members
+            {archive_path = archive_path, destination = stage_dir, members = wanted});
      let
        val keys =
          if is_package_only stage_dir then []
@@ -372,5 +388,90 @@ fun with_entries {archive_path, f} =
 
 fun with_reader {archive_path, f} =
   with_entries {archive_path = archive_path, f = fn {source, ...} => f source}
+
+type capsule_identity =
+  {name : string,
+   version : string option,
+   toolchain_key : string}
+
+fun manifest_field lines key =
+  let
+    val prefix = key ^ "="
+    fun value line =
+      if String.isPrefix prefix line then SOME (String.extract (line, size prefix, NONE)) else NONE
+  in
+    List.mapPartial value lines
+  end
+
+fun nonempty_manifest_field lines key =
+  case manifest_field lines key of
+      value :: _ => if value = "" then NONE else SOME value
+    | [] => NONE
+
+(* The identity a capsule's manifest names; anything else is not a capsule. *)
+fun capsule_identity archive_path text =
+  let
+    val lines = String.tokens (fn c => c = #"\n") text
+    fun required key =
+      case nonempty_manifest_field lines key of
+          SOME value => value
+        | NONE => raise Error ("capsule manifest in " ^ archive_path ^ " has no " ^ key)
+  in
+    case lines of
+        first :: _ =>
+          if first = capsule_format then
+            {name = required "name",
+             version = nonempty_manifest_field lines "version",
+             toolchain_key = required "toolchain_key"}
+          else raise Error ("unsupported capsule format in " ^ archive_path ^ ": " ^ first)
+      | [] => raise Error ("empty capsule manifest in " ^ archive_path)
+  end
+
+fun require_free_destination destination =
+  if not (path_exists destination) then ()
+  else if FS.isDir destination andalso
+          (let val dir = FS.openDir destination
+               val empty = not (Option.isSome (FS.readDir dir))
+           in FS.closeDir dir; empty end)
+  then ()
+  else raise Error ("capsule source destination is not empty: " ^ destination)
+
+(* Unpacks the source snapshot of a capsule into `destination`, which must be
+   absent or an empty directory, and returns the identity its manifest names.
+   Every member is checked before anything is written, and only the manifest
+   and `source/` are unpacked, into a sibling directory that is renamed into
+   place, so a failure leaves nothing at `destination`. *)
+fun extract_sources {archive_path, destination} =
+  let
+    val names = checked_names archive_path
+    val manifest_member = Path.concat(package_part, "manifest")
+    val source_member = Path.concat(package_part, source_dir)
+    val _ = if has_part names manifest_member andalso has_part names source_member then ()
+            else raise Error ("archive has no source snapshot: " ^ archive_path)
+    val _ = require_free_destination destination
+    val stage_dir = temp_dir_near destination
+    fun cleanup () = remove_tree stage_dir handle _ => ()
+  in
+    (ensure_dir (Path.dir destination);
+     ensure_dir stage_dir;
+     tar_operation (fn () => HolbuildTar.extract_members
+       {archive_path = archive_path, destination = stage_dir,
+        members = [manifest_member, source_member]});
+     let
+       val manifest = read_text (Path.concat(stage_dir, manifest_member))
+         handle IO.Io _ => raise Error ("could not read capsule manifest in " ^ archive_path)
+       val identity = capsule_identity archive_path manifest
+       val unpacked = Path.concat(stage_dir, source_member)
+     in
+       if FS.isDir unpacked then ()
+       else raise Error ("capsule source is not a directory: " ^ archive_path);
+       FS.rename {old = unpacked, new = destination}
+         handle OS.SysErr (msg, _) =>
+           raise Error ("could not install capsule source at " ^ destination ^ ": " ^ msg);
+       cleanup ();
+       identity
+     end)
+    handle e => (cleanup (); raise e)
+  end
 
 end
