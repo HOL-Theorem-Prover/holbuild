@@ -1056,6 +1056,28 @@ run proof-only-again 1 build --remote-exec "$coordinator" --remote-only BTheory
 require_grep "proof failed on a remote worker while building BTheory" "$tmpdir/proof-only-again.log"
 [[ -f "$remote_root/cas/$b_spec" ]] || { echo "the export did not upload the spec again" >&2; exit 1; }
 
+# A static error and a tactic timeout are reported from the worker's log too.
+write_failing_b() {
+  cat > "$project/src/BScript.sml" <<SML
+Theory B
+Ancestors A
+
+Theorem b_thm:
+  T
+Proof
+  $1
+QED
+SML
+}
+write_failing_b "simp[] >> no_such_tactic"
+run proof-static 1 build --remote-exec "$coordinator" --remote-only BTheory
+require_grep "proof failed on a remote worker while building BTheory" "$tmpdir/proof-static.log"
+require_grep "no_such_tactic" "$tmpdir/proof-static.log"
+write_failing_b "REPEAT ALL_TAC"
+run proof-timeout 1 build --remote-exec "$coordinator" --remote-only --tactic-timeout 1 BTheory
+require_grep "tactic timed out on a remote worker while building BTheory" "$tmpdir/proof-timeout.log"
+require_grep "^theorem: b_thm (line 4)$" "$tmpdir/proof-timeout.log"
+
 # Without the log in the cache (the workers drop it), the build builds only
 # the failed theory locally, which fails on the same proof: not C, which
 # doesn't need B and which the batch, failed at B, didn't finish.

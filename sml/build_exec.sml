@@ -7240,7 +7240,8 @@ fun restore_finished_build_logs (options : build_options) tc project plan toolch
                 | _ => ())
       | restore (_, NONE) = ()
   in
-    parallel_all remote_probe_width restore logs
+    detail_time_phase "build.remote_failure.finished_logs"
+      (fn () => parallel_all remote_probe_width restore logs)
   end
 
 (* Logs belong to this execution, not the cached theory entry. *)
@@ -7322,11 +7323,18 @@ fun remote_proof_failure (options : build_options) tc project plan toolchain_key
     val root = project_artifact_root project
     fun diagnose node =
       let
+        (* The diagnosis reads only the script's proof units, not where their
+           checkpoints would live, so the action is keyed on its
+           dependencies' input keys: keying it on their outputs would hash
+           every file of the closure. *)
         val action = theory_action root plan keys toolchain_key
-                       (dependency_context_key toolchain_key plan keys node) node
+                       (dependency_input_context_key toolchain_key plan keys node) node
         val log = current_build_log (current_log_dir root (#package action) (#logical action))
+        val fetched =
+          detail_time_phase "build.remote_failure.log"
+            (fn () => fetch_remote_build_log project node log_sha256)
       in
-        if not (Option.isSome (fetch_remote_build_log project node log_sha256)) then NONE
+        if not (Option.isSome fetched) then NONE
         else
           let
             val policy = checkpoint_policy_for_node options project node
@@ -7350,7 +7358,7 @@ fun remote_proof_failure (options : build_options) tc project plan toolchain_key
           end
       end
   in
-    diagnose node handle Error _ => NONE
+    detail_time_phase "build.remote_failure.report" (fn () => diagnose node handle Error _ => NONE)
   end
 
 (* ActionSpecs: a theory action serialized for a remote worker, and the batch
@@ -7838,9 +7846,10 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
     val keys = HolbuildBuildPlan.input_keys config_lines action_toolchain_key plan
     val theories = List.filter is_theory_node (HolbuildBuildPlan.selected_nodes plan)
     val actions =
-      map (fn node => (node, theory_action root plan keys toolchain_key
-                               (dependency_input_context_key toolchain_key plan keys node) node))
-          theories
+      detail_time_phase "action_spec.export.actions" (fn () =>
+        map (fn node => (node, theory_action root plan keys toolchain_key
+                                 (dependency_input_context_key toolchain_key plan keys node) node))
+            theories)
     val _ =
       List.app
         (fn (node, action) =>
@@ -7866,12 +7875,14 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
                (checkpoint_policy_for_node options project node) node text
          | NONE => false)
        orelse local_entry_satisfies options project plan node (#input_key action))
-    val (here_actions, other_actions) = List.partition built_here actions
+    val (here_actions, other_actions) =
+      detail_time_phase "action_spec.export.built_here" (fn () => List.partition built_here actions)
     val uncached_actions =
-      failing "checking remote cache" "theories" (fn remote => fn (node, action) =>
-                  not (is_forced (node, action)) andalso
-                  remote_entry_satisfies remote options project plan node (#input_key action))
-              other_actions
+      detail_time_phase "action_spec.export.remote_check" (fn () =>
+        failing "checking remote cache" "theories" (fn remote => fn (node, action) =>
+                    not (is_forced (node, action)) andalso
+                    remote_entry_satisfies remote options project plan node (#input_key action))
+                other_actions)
     fun key_set list = Binaryset.addList (Binaryset.empty String.compare, list)
     (* Whether the theory, or one it depends on, has its input key in SET. *)
     fun meets set (node, _) =
@@ -7920,8 +7931,9 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
          (learn ("theory " ^ key); true))
       end
     val unavailable =
-      failing "checking remote cache" "theories" available
-        (List.filter (fn (node, _) => Binaryset.member (batch_deps, HolbuildBuildPlan.key node)) here_actions)
+      detail_time_phase "action_spec.export.publish_deps" (fn () =>
+        failing "checking remote cache" "theories" available
+          (List.filter (fn (node, _) => Binaryset.member (batch_deps, HolbuildBuildPlan.key node)) here_actions))
     val uncached_actions =
       if null unavailable then uncached_actions
       else List.filter (fn (node, _) => uncached_in (uncached_actions @ unavailable) node) actions
@@ -7952,7 +7964,7 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
         map (fn parent => "edge " ^ #input_key action ^ " " ^ HolbuildBuildPlan.input_key_for keys parent)
             (uncached_parents plan uncached node)}
       end
-    val exported = map export uncached_actions
+    val exported = detail_time_phase "action_spec.export.specs" (fn () => map export uncached_actions)
     val action_lines = List.concat (map #lines exported)
     (* A worker rejects a spec it can't fetch rather than reporting it
        missing, so a spec the ledger hid would never be uploaded again: specs
