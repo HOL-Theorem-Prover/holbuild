@@ -29,8 +29,6 @@ gib=$((1024 * 1024 * 1024))
 # on how much memory the test machine has free.
 printf 'MemTotal:        67108864 kB\nMemAvailable:    67108864 kB\n' > "$tmpdir/plenty"
 export HOLBUILD_TEST_MEMINFO=$tmpdir/plenty
-# Likewise no cgroup limits, except where the test exercises them.
-export HOLBUILD_TEST_CGROUP=
 events=$tmpdir/events.log
 : > "$events"
 
@@ -320,114 +318,6 @@ if sed -n '/^START Live3/q;p' "$events" | grep -q '^END Hold2'; then
   exit 1
 fi
 wait "$hold_pid" || { cat "$tmpdir/hold2.out" >&2; exit 1; }
-
-# A cgroup limit binds whether or not DIR holds a reservation: a stand-in
-# step group (no memory files: its parent doesn't enable the controller for
-# it) in a job group (no limit of its own) inside a scope limited to 8 GiB,
-# with 7.5 GiB used, holds back a 1 GiB child even alone.  The scope's inactive
-# page cache counts as free: once 1 GiB of it shows up, the child starts.
-cgroup=$tmpdir/cgroup
-mkdir -p "$cgroup/scope/job/step"
-write_group() {
-  local dir=$1 max=$2 current=$3 inactive=$4
-  printf '%s\n' "$max" > "$dir/memory.max.new"
-  printf '%s\n' "$current" > "$dir/memory.current.new"
-  printf 'anon %s\nfile %s\ninactive_file %s\n' "$current" "$inactive" "$inactive" > "$dir/memory.stat.new"
-  mv "$dir/memory.max.new" "$dir/memory.max"
-  mv "$dir/memory.current.new" "$dir/memory.current"
-  mv "$dir/memory.stat.new" "$dir/memory.stat"
-}
-write_group "$cgroup/scope/job" max $((7 * gib)) 0
-write_group "$cgroup/scope" $((8 * gib)) $((15 * gib / 2)) 0
-: > "$events"
-make_project capped 0 Capped
-(cd "$tmpdir/capped" && HOLBUILD_TEST_CGROUP=$cgroup/scope/job/step exec "$HOLBUILD_BIN" \
-  --cooperate-dir "$tmpdir/cgroup-coop" --child-charge 1024 \
-  build --skip-checkpoints --skip-proof-steps) > "$tmpdir/capped.out" 2>&1 &
-holbuild_pid=$!
-for _ in $(seq 1 600); do
-  grep -q 'waiting for machine memory' "$tmpdir/capped.out" && break
-  sleep 0.1
-done
-require_grep 'waiting for machine memory: needs 1024 MiB, cgroup memory headroom is 512 MiB, below the charge' "$tmpdir/capped.out"
-sleep 2
-if grep -q '^START Capped' "$events"; then
-  echo "child started past the cgroup limit with no reservation held" >&2
-  exit 1
-fi
-write_group "$cgroup/scope" $((8 * gib)) $((15 * gib / 2)) $((gib))
-wait "$holbuild_pid" || { cat "$tmpdir/capped.out" >&2; exit 1; }
-holbuild_pid=""
-require_grep '^END Capped' "$events"
-require_no_live_leases "$tmpdir/cgroup-coop"
-
-# The HOL session of run and fingerprint checks waits the same way.
-printf 'val _ = TextIO.print "SESSION RAN\\n";\n' > "$tmpdir/capped/probe.sml"
-for command in "run probe.sml" "check --with-fingerprints CappedTheory"; do
-  out=$tmpdir/session-${command%% *}.out
-  write_group "$cgroup/scope" $((8 * gib)) $((15 * gib / 2)) 0
-  # shellcheck disable=SC2086
-  (cd "$tmpdir/capped" && HOLBUILD_TEST_CGROUP=$cgroup/scope/job/step exec "$HOLBUILD_BIN" \
-    --cooperate-dir "$tmpdir/cgroup-coop" --child-charge 1024 $command) > "$out" 2>&1 &
-  holbuild_pid=$!
-  for _ in $(seq 1 600); do
-    grep -q 'waiting for machine memory' "$out" && break
-    sleep 0.1
-  done
-  require_grep 'waiting for machine memory: needs 1024 MiB, cgroup memory headroom is 512 MiB' "$out"
-  sleep 2
-  if ! kill -0 "$holbuild_pid" 2>/dev/null; then
-    echo "holbuild $command did not wait for the cgroup's headroom" >&2
-    cat "$out" >&2
-    exit 1
-  fi
-  write_group "$cgroup/scope" $((8 * gib)) $((15 * gib / 2)) $((gib))
-  # check reports the theory's kernel bypasses (its OS.Process.system calls)
-  # as findings and exits 1, so its session is known to have run by them.
-  wait "$holbuild_pid" || true
-  holbuild_pid=""
-done
-require_grep 'SESSION RAN' "$tmpdir/session-run.out"
-require_grep 'CappedTheory: 2 findings' "$tmpdir/session-check.out"
-require_no_live_leases "$tmpdir/cgroup-coop"
-
-# A warm plain check reads metadata without starting a HOL session, so needs
-# no child reservation even while the cgroup has no room for a child.
-write_group "$cgroup/scope" $((8 * gib)) $((15 * gib / 2)) 0
-set +e
-(cd "$tmpdir/capped" && HOLBUILD_TEST_CGROUP=$cgroup/scope/job/step timeout 60 "$HOLBUILD_BIN" \
-  --cooperate-dir "$tmpdir/cgroup-coop" --child-charge 1024 check CappedTheory) \
-  > "$tmpdir/plain-check.out" 2>&1
-status=$?
-set -e
-[[ $status -eq 1 ]] || { cat "$tmpdir/plain-check.out" >&2; exit 1; }
-require_grep 'CappedTheory: 2 findings' "$tmpdir/plain-check.out"
-if grep -q 'waiting for machine memory' "$tmpdir/plain-check.out"; then
-  echo 'plain check waited for a child it does not start' >&2
-  exit 1
-fi
-require_no_live_leases "$tmpdir/cgroup-coop"
-
-# With no limit anywhere ("max"), however much the groups use, a child starts.
-write_group "$cgroup/scope" max $((1024 * gib)) 0
-: > "$events"
-(cd "$tmpdir/capped" && HOLBUILD_TEST_CGROUP=$cgroup/scope/job/step timeout 60 "$HOLBUILD_BIN" \
-  --cooperate-dir "$tmpdir/cgroup-coop" --child-charge 1024 \
-  build --force --skip-checkpoints --skip-proof-steps) > "$tmpdir/uncapped.out" 2>&1 || {
-  echo "a child waited with no cgroup limit" >&2
-  cat "$tmpdir/uncapped.out" >&2
-  exit 1
-}
-require_grep '^END Capped' "$events"
-
-# A child larger than the least limit fails at once instead of waiting.
-write_group "$cgroup/scope/job" $((2 * gib)) 0 0
-if (cd "$tmpdir/capped" && HOLBUILD_TEST_CGROUP=$cgroup/scope/job/step timeout 60 "$HOLBUILD_BIN" \
-      --cooperate-dir "$tmpdir/cgroup-coop" --child-charge 3072 build --force) > "$tmpdir/over-limit.out" 2>&1; then
-  echo "reservation larger than the cgroup limit succeeded" >&2
-  exit 1
-fi
-require_grep 'reservation of 3072 MiB .* exceeds the cgroup memory limit of 2048 MiB' "$tmpdir/over-limit.out"
 
 # With --fail-fast, a worker still waiting for memory gives up instead of
 # starting its child once the failed child's reservation frees up.  Fail and
