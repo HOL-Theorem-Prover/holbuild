@@ -3,7 +3,9 @@
 
 function __holbuild_complete
     set -l words (commandline -opc)
-    set -l current (commandline -ct)
+    # The token under the cursor as typed: pass it on without its quotes.
+    set -l token (commandline -ct)
+    set -l current (string unescape -- "$token")
     set -l candidates (command $words[1] __complete $words[2..-1] "$current" 2>/dev/null)
     if set -q candidates[1]
         printf '%s\n' $candidates

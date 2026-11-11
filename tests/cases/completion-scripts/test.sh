@@ -124,6 +124,9 @@ if command -v fish > /dev/null; then
   expect_lines "$(fish_complete "$project" "holbuild repl --from=Alp")" \
     --from=AlphaTheory --from=AlpineTheory
   expect_lines "$(fish_complete "$project" "holbuild --source-dir=srcd")" --source-dir=srcdir/
+  expect_lines "$(fish_complete "$project" "holbuild clean 'Al")" AlphaTheory AlpineTheory
+  expect_lines "$(fish_complete "$project" "holbuild repl --from='Alp")" \
+    --from=AlphaTheory --from=AlpineTheory
 else
   echo "fish not installed; skipping its checks" >&2
 fi
