@@ -36,8 +36,9 @@ Proof ACCEPT_TAC TRUTH
 QED
 SML
 
-# One abandoned staging directory older than the retention: it alone reaches a
-# threshold of one, so every command that runs automatic GC collects it.
+# With a threshold of one, a build counted since the last GC makes every
+# command that runs automatic GC collect; the residue is an abandoned staging
+# directory older than the retention, which a collection removes.
 write_config() {
   printf '[gc]\nproject_builds = 1\n%s\n' "${1:-}" > "$project/.holconfig.toml"
 }
@@ -45,6 +46,7 @@ plant_residue() {
   mkdir -p "$project/.holbuild/stage/abandoned"
   : > "$project/.holbuild/stage/abandoned/leftover"
   touch -d '10 days ago' "$project/.holbuild/stage/abandoned"
+  printf '1\n' > "$project/.holbuild/gc.state"
 }
 run_holbuild() {
   local log=$1
@@ -85,7 +87,8 @@ printf '[gc]\nproject_builds = 5\n' > "$project/.holconfig.toml"
 echo "(* edit *)" >> "$project/src/AScript.sml"
 run_holbuild "$tmpdir/counted.log" build ATheory
 require_untouched "$tmpdir/counted.log"
-[[ $(cat "$project/.holbuild/gc.state") == 1 ]] || { echo "gc.state did not count the build" >&2; exit 1; }
+# gc.state held the planted count of one, plus this build.
+[[ $(cat "$project/.holbuild/gc.state") == 2 ]] || { echo "gc.state did not count the build" >&2; exit 1; }
 
 write_config 'auto = false'
 echo "(* edit *)" >> "$project/src/AScript.sml"
@@ -104,9 +107,22 @@ plant_residue
 run_holbuild "$tmpdir/import.log" import "$tmpdir/a.hbx"
 require_collected "$tmpdir/import.log"
 
+# Staging directories within the retention survive a collection and are not
+# counted, so with no new work the next command does not collect again.
+mkdir -p "$project/.holbuild/stage/young"
+run_holbuild "$tmpdir/reimport.log" import "$tmpdir/a.hbx"
+[[ -d $project/.holbuild/stage/young ]] || { echo "young staging directory removed" >&2; exit 1; }
+! grep -q "automatic" "$tmpdir/reimport.log" || { echo "automatic gc ran again without new work:" >&2; cat "$tmpdir/reimport.log" >&2; exit 1; }
+
 # --quiet collects without the report.
 plant_residue
 echo "(* edit *)" >> "$project/src/AScript.sml"
 run_holbuild "$tmpdir/quiet.log" --quiet build ATheory
 require_no_file "$project/.holbuild/stage/abandoned"
 ! grep -q "automatic" "$tmpdir/quiet.log" || { echo "--quiet printed the gc report" >&2; exit 1; }
+
+# A project whose configuration does not load skips automatic GC with a
+# warning; the import itself still succeeds.
+printf '[gc]\ncache_gb = 0\n' > "$project/.holconfig.toml"
+run_holbuild "$tmpdir/bad-config.log" import "$tmpdir/a.hbx"
+require_grep "holbuild: warning: automatic gc skipped: " "$tmpdir/bad-config.log"

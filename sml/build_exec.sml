@@ -9470,8 +9470,8 @@ fun read_gc_state project =
 
 (* After a command that built in PROJECT: the collection `holbuild gc` runs on
    the project, once THRESHOLD theories were built, restored or exported there
-   since its last GC, counting each abandoned staging directory as one. The
-   count since the last GC is kept in .holbuild/gc.state. Skipped while another
+   since its last GC. The count since the last GC is kept in
+   .holbuild/gc.state. Skipped while another
    process holds the project lock, as auto_cache_gc is for the GC lock. *)
 fun auto_project_gc project threshold =
   let
@@ -9483,7 +9483,7 @@ fun auto_project_gc project threshold =
       stage + logs + checkpoints + #evicted eviction > 0
   in
     HolbuildStatus.project_work := 0;
-    if since_gc + length (children (project_state_dir project "stage")) < threshold then
+    if since_gc < threshold then
       (if work > 0 then write_text (gc_state_path project) (Int.toString since_gc ^ "\n") else ())
     else
       case HolbuildProjectLock.try_with_lock project "automatic gc" collect of

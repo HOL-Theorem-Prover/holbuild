@@ -2615,7 +2615,12 @@ fun import_archive args =
         in
           HolbuildCacheArchive.with_entries {archive_path = archive_path, f = copy};
           print ("imported " ^ Int.toString (!result_count) ^ " cache action(s) from " ^ archive_path ^ "\n");
-          auto_gc (SOME (load_project ()) handle Error _ => NONE)
+          (* Run inside a project, its [gc] settings apply; one that does not
+             load skips automatic GC rather than falling back to the defaults. *)
+          (case HolbuildProject.find_manifest_from (HolbuildProject.source_dir ()) of
+               NONE => auto_gc NONE
+             | SOME _ => auto_gc (SOME (load_project ())))
+          handle Error msg => warn ("automatic gc skipped: " ^ msg)
         end
     | _ => raise Error "usage: holbuild import FILE"
 

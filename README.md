@@ -2005,8 +2005,7 @@ Builds collect old project and cache state themselves. After a successful
 collection as `holbuild gc` in the foreground when a threshold is passed:
 
 - project GC, once 1000 theories were built, restored from a cache or exported
-  as heaps in the project since its last GC (each leftover staging directory
-  also counts as one);
+  as heaps in the project since its last GC;
 - cache GC, once 10 GiB were written into the cache since its last GC (a new
   action entry counts as 1 MiB, so entries that reuse cached files still
   count).
