@@ -74,11 +74,8 @@ fun global_help () = print
   \The reserve is a quarter of MemTotal, at least 1 GiB and at most 30 GiB; the\n\
   \margin is the reserve, or what the budget leaves out of MemTotal if that is\n\
   \less (at least 1 GiB).\n\
-  \Where cgroup v2 limits the memory of holbuild's group or of a group enclosing\n\
-  \it, a child also starts only while the tightest of them has its charge left,\n\
-  \reservations or none. The HOL session of check and run reserves too.\n\
-  \This bounds admission; it does not enforce RSS. HOL toolchain builds and repl\n\
-  \reserve nothing.\n\
+  \This bounds admission; it does not enforce RSS. HOL toolchain builds, check,\n\
+  \run and repl reserve nothing.\n\
   \To set or resize the budget, write DIR/budget (a byte count) while holding\n\
   \DIR/lock:\n\
   \  flock DIR/lock sh -c 'echo BYTES > DIR/budget.new && mv DIR/budget.new DIR/budget'\n\
@@ -1733,11 +1730,6 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                unknown, so none of the others are copied before it ends. *)
             fun follow in_batch batch_id =
               let
-                (* Planning, export and early cutoff leave garbage that a
-                   major collection would only reclaim once the heap grows
-                   again; following waits on the coordinator for as long as
-                   the batch runs, so collect it now rather than hold it. *)
-                val _ = PolyML.fullGC ()
                 val {add, stop} =
                   HolbuildBuildExec.start_remote_exec_prefetch build_options tc project plan toolchain_key jobs in_batch
                 val logs = ref []
@@ -3110,7 +3102,7 @@ fun run_hol_with runner tc cli_jobs subcommand args =
   end
 
 fun run_hol tc cli_jobs subcommand user_args =
-  run_hol_with HolbuildToolchain.run_reserved tc cli_jobs subcommand user_args
+  run_hol_with HolbuildToolchain.run tc cli_jobs subcommand user_args
 
 fun repl_hol tc cli_jobs user_args =
   run_hol_with HolbuildToolchain.run_interactive tc cli_jobs "repl" user_args
@@ -3344,7 +3336,7 @@ fun run_check_script tc cli_jobs build_mode theories make_script =
     fun cleanup () = OS.FileSys.remove script_path handle OS.SysErr _ => ()
     val status =
       (* A run heap may hold an older copy of the theory, which load would keep. *)
-      run_hol_status HolbuildToolchain.run_reserved tc cli_jobs build_mode plain_build_request false from "run" [script_path]
+      run_hol_status HolbuildToolchain.run tc cli_jobs build_mode plain_build_request false from "run" [script_path]
       handle e => (cleanup (); raise e)
   in
     cleanup ();

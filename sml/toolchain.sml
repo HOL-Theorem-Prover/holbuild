@@ -150,15 +150,6 @@ fun timed_shell kind argv output script =
 fun run argv =
   timed_shell "run" argv NONE (command argv)
 
-(* As run, under a machine memory reservation (--cooperate-dir), for the HOL
-   session of check and run. *)
-fun run_reserved argv =
-  HolbuildMachineMemory.with_reservation
-    (fn lease =>
-        timed_system "run" argv NONE
-          (fn () => HolbuildProcessGroup.run_shell_inheriting lease (command argv)))
-  handle HolbuildMachineMemory.Error msg => raise Error msg
-
 fun run_interactive argv =
   timed_system "run_interactive" argv NONE (fn () => OS.Process.system (command argv))
 
