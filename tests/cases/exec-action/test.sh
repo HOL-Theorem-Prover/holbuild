@@ -342,6 +342,9 @@ require_file "$remote_root/cas/$data_blob"
 mv "$remote_root/cas/$data_blob" "$tmpdir/data.blob"
 worker lost-input "$spec_b"
 expect lost-input 3 "status=failed" "failure=input-missing" "missing=blob $data_blob"
+# A failed hydrate still reports the steps it ran.
+grep -qE "^phase-ms=(.*,)?hydrate:[0-9]+,hydfiles:[0-9]+(,|\$)" "$tmpdir/lost-input.result" || {
+  echo "lost-input's record lacks hydrate's steps:" >&2; cat "$tmpdir/lost-input.result" >&2; exit 1; }
 mv "$tmpdir/data.blob" "$remote_root/cas/$data_blob"
 
 # The rest of the chain builds in order on another worker.
@@ -349,7 +352,7 @@ worker b "$spec_b"
 expect b 0 "status=built"
 # Its record times the action and its phases.
 require_grep '^wall-ms=[0-9][0-9]*$' "$tmpdir/b.result"
-for phase in hydrate hol check; do
+for phase in hydrate hydfiles hyddeps hydstale hydmisfit hol check; do
   grep -qE "^phase-ms=(.*,)?$phase:[0-9]+(,|\$)" "$tmpdir/b.result" || {
     echo "b's record lacks phase $phase:" >&2; cat "$tmpdir/b.result" >&2; exit 1; }
 done
