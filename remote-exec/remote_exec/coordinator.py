@@ -1592,6 +1592,13 @@ class Coordinator:
             if requeued:
                 await self._requeue(conn, batch_id, parent)
             else:
+                await conn.execute(
+                    sa.text(
+                        "UPDATE actions SET failure_detail = NULL, log_sha256 = NULL, "
+                        "log_zstd = NULL, log_error = NULL WHERE batch_id = :batch_id AND input_key = :input_key"
+                    ),
+                    {"batch_id": batch_id, "input_key": parent},
+                )
                 await self._fail_batch(
                     conn, batch_id, parent, f"resubmit: {action.theory} (theory {parent}) is not in the cache after it built"
                 )
