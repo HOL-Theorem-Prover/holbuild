@@ -38,6 +38,35 @@ require_file "$cache/blobs/live"
 [[ -f "$cache/locks/gc.lock" ]] || { echo "cache gc lock file missing" >&2; exit 1; }
 [[ ! -e "$cache/locks/gc.lock.owner" ]] || { echo "cache gc lock owner survived" >&2; exit 1; }
 
+# A fresh manifest GC cannot read stops GC before any blob it names is swept.
+unreadable_cache=$tmpdir/unreadable-cache
+mkdir -p "$unreadable_cache/actions/live" "$unreadable_cache/blobs" "$unreadable_cache/tmp"
+: > "$unreadable_cache/blobs/live"
+printf 'holbuild-cache-action-v2\nblob sig live\n' > "$unreadable_cache/actions/live/manifest"
+touch -d '10 days ago' "$unreadable_cache/blobs/live"
+chmod a-r "$unreadable_cache/actions/live/manifest"
+if [[ -r "$unreadable_cache/actions/live/manifest" ]]; then
+  :  # running as a user that ignores file permissions
+elif env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$unreadable_cache" "$HOLBUILD_BIN" gc --cache-only > /dev/null 2>&1; then
+  echo "GC succeeded despite an unreadable manifest" >&2; exit 1
+fi
+require_file "$unreadable_cache/blobs/live"
+
+# More stale actions than one removal batch holds are all removed.
+batch_cache=$tmpdir/batch-cache
+mkdir -p "$batch_cache/actions" "$batch_cache/blobs" "$batch_cache/tmp"
+for i in $(seq 1 1100); do
+  mkdir "$batch_cache/actions/stale$i"
+  printf 'holbuild-cache-action-v2\n' > "$batch_cache/actions/stale$i/manifest"
+done
+mkdir "$batch_cache/actions/fresh"
+printf 'holbuild-cache-action-v2\n' > "$batch_cache/actions/fresh/manifest"
+touch -d '10 days ago' "$batch_cache"/actions/stale*/manifest
+env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$batch_cache" "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/batch-gc.log"
+require_grep "actions=1100 " "$tmpdir/batch-gc.log"
+[[ -d "$batch_cache/actions/fresh" ]] || { echo "fresh action was removed" >&2; exit 1; }
+[[ $(ls "$batch_cache/actions" | wc -l) -eq 1 ]] || { echo "stale actions survived" >&2; exit 1; }
+
 obsolete_cache=$tmpdir/obsolete-cache
 mkdir -p "$obsolete_cache/locks/gc.lock" "$obsolete_cache/actions" "$obsolete_cache/blobs" "$obsolete_cache/tmp"
 env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$obsolete_cache" "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/obsolete-gc.log" 2>&1
@@ -157,7 +186,7 @@ env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$progress_cache" \
   "$HOLBUILD_BIN" gc --cache-only > /dev/null 2> "$tmpdir/quiet.err"
 [[ ! -s "$tmpdir/quiet.err" ]] || { echo "fast GC printed progress:" >&2; cat "$tmpdir/quiet.err" >&2; exit 1; }
 
-# An entry that cannot be removed fails GC with its path,
+# An entry that cannot be removed fails GC with the path that failed inside it,
 # and releases the GC lock.
 fail_cache=$tmpdir/fail-cache
 mkdir -p "$fail_cache/tmp/stuck/ro" "$fail_cache/actions" "$fail_cache/blobs"
@@ -169,7 +198,7 @@ if env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$fail_cache" \
   echo "GC succeeded despite an undeletable entry" >&2; exit 1
 fi
 chmod u+w "$fail_cache/tmp/stuck/ro"
-require_grep "failed to remove path: .*$fail_cache/tmp/stuck" "$tmpdir/fail.err"
+require_grep "failed to remove cache path: .*$fail_cache/tmp/stuck/ro/file" "$tmpdir/fail.err"
 [[ ! -e "$fail_cache/locks/gc.lock.owner" ]] || { echo "failed cache gc kept its lock owner" >&2; exit 1; }
 env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$fail_cache" "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/fail-retry.log"
 require_grep "removed tmp=1 " "$tmpdir/fail-retry.log"
@@ -209,7 +238,7 @@ if script -qec true /dev/null > /dev/null 2>&1; then
     echo "GC succeeded despite an undeletable entry" >&2; exit 1
   fi
   chmod u+w "$fail_cache/tmp/stuck/ro"
-  require_grep "^holbuild: failed to remove path: " "$tmpdir/fail-ansi.log"
+  require_grep "^holbuild: failed to remove cache path: " "$tmpdir/fail-ansi.log"
 
   # Toolchain removal can warn on stderr mid-stage, here about legacy
   # directory locks, so its reports are not redrawn in place.

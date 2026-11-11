@@ -95,7 +95,7 @@ failing=$tmpdir/failing
 make_cache "$failing" 20
 chmod a-w "$failing/blobs"
 auto_gc "$failing" 10 "$tmpdir/failing.log"
-require_grep "holbuild: warning: automatic gc failed: failed to remove path" "$tmpdir/failing.log"
+require_grep "holbuild: warning: automatic gc failed: failed to remove cache path" "$tmpdir/failing.log"
 
 # Manual gc resets the journal too.
 manual=$tmpdir/manual

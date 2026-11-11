@@ -63,11 +63,68 @@ fun children dir =
       result
     end
 
+fun is_link path = FS.isLink path handle OS.SysErr _ => false
 fun is_dir path = FS.isDir path handle OS.SysErr _ => false
 
-(* A symlink is unlinked, never followed. *)
+fun missing_entry (OS.SysErr (_, SOME err)) = err = Posix.Error.noent
+  | missing_entry _ = false
+
+fun remove_error path msg = Error ("failed to remove cache path: " ^ path ^ ": " ^ msg)
+
+fun trim_newline s =
+  if size s > 0 andalso String.sub(s, size s - 1) = #"\n" then
+    String.substring(s, 0, size s - 1)
+  else s
+
+(* One `rm -rf` for all of dirs, which descends through directories it has
+   opened, so a subdirectory swapped for a symlink while it runs cannot
+   redirect it outside the cache; its messages name the paths that failed. *)
+fun remove_dir_trees dirs =
+  let
+    val proc = Unix.execute ("/bin/sh", ["-c", "exec rm -rf -- \"$@\" 2>&1", "sh"] @ dirs)
+    val output = TextIO.inputAll (Unix.textInstreamOf proc)
+  in
+    if OS.Process.isSuccess (Unix.reap proc) then ()
+    else raise Error ("failed to remove cache path: " ^ trim_newline output)
+  end
+
+fun check_safe path =
+  if path = "" orelse path = "." orelse path = "/" then
+    raise Error ("refusing to remove unsafe cache path: " ^ path)
+  else ()
+
+fun is_dir_entry path = not (is_link path) andalso is_dir path
+
+(* Regular files and symlinks, which include every blob, are unlinked
+   in-process, since spawning a process per entry dominated GC time on large
+   caches. An entry that has already disappeared counts as removed. *)
+fun remove_file path =
+  FS.remove path
+  handle e as OS.SysErr (msg, _) => if missing_entry e then () else raise remove_error path msg
+
 fun remove_tree path =
-  HolbuildRemoveTree.remove_strict path handle HolbuildRemoveTree.Error msg => raise Error msg
+  (check_safe path;
+   if is_dir_entry path then remove_dir_trees [path] else remove_file path)
+
+(* Directories GC found stale wait here and go to one `rm -rf` per batch, since
+   a process per action directory took tens of minutes on a large cache. A GC
+   stage empties the queue before it returns. *)
+val max_batch = 1000
+val pending : string list ref = ref []
+val pending_count = ref 0
+
+fun flush_pending () =
+  case !pending of
+      [] => ()
+    | dirs => (pending := []; pending_count := 0; remove_dir_trees (rev dirs))
+
+fun defer_tree path =
+  (check_safe path;
+   if is_dir_entry path then
+     (pending := path :: !pending;
+      pending_count := !pending_count + 1;
+      if !pending_count >= max_batch then flush_pending () else ())
+   else remove_file path)
 
 (* Progress for long GC stages goes to stderr, leaving stdout to the summary,
    and is off under --quiet. A stage reports only after running for one
@@ -126,18 +183,24 @@ fun finish_progress (progress as Progress {shown, ...}) =
    write to stderr themselves, so each report gets a line of its own rather
    than one redrawn in place that their output would be appended to. *)
 fun run_gc_stage steps_print stage paths step init =
-  if HolbuildStatus.quiet_mode () orelse HolbuildStatus.json_mode () then
-    List.foldl (fn (path, acc) => #1 (step (path, acc))) init paths
-  else
-    let
-      val progress = start_progress steps_print stage (length paths)
-      fun one (path, acc) =
-        let val (acc, was_removed) = step (path, acc)
-        in tick progress was_removed; acc end
-    in
-      (List.foldl one init paths before finish_progress progress)
-      handle e => (finish_progress progress; raise e)
-    end
+  let
+    fun finished acc = (flush_pending (); acc)
+    fun abandon e = (pending := []; pending_count := 0; raise e)
+  in
+    if HolbuildStatus.quiet_mode () orelse HolbuildStatus.json_mode () then
+      finished (List.foldl (fn (path, acc) => #1 (step (path, acc))) init paths)
+      handle e => abandon e
+    else
+      let
+        val progress = start_progress steps_print stage (length paths)
+        fun one (path, acc) =
+          let val (acc, was_removed) = step (path, acc)
+          in tick progress was_removed; acc end
+      in
+        (finished (List.foldl one init paths) before finish_progress progress)
+        handle e => (finish_progress progress; abandon e)
+      end
+  end
 
 fun gc_stage stage = run_gc_stage false stage
 
@@ -158,9 +221,14 @@ fun add_blob (blob, blobs) = Redblackset.add(blobs, blob)
 
 fun manifest_path action_dir = Path.concat(action_dir, "manifest")
 
-(* Adds the blobs a manifest names; a manifest that is missing adds none. *)
+fun missing_file (IO.Io {cause = OS.SysErr (_, SOME err), ...}) = err = Posix.Error.noent
+  | missing_file _ = false
+
+(* Adds the blobs a manifest names; a missing manifest adds none, and any other
+   failure to read it stops GC, which would otherwise delete the blobs it names. *)
 fun add_manifest_blobs (action_dir, live_blobs) =
-  case SOME (TextIO.openIn (manifest_path action_dir)) handle IO.Io _ => NONE of
+  case SOME (TextIO.openIn (manifest_path action_dir))
+       handle e => if missing_file e then NONE else raise e of
       NONE => live_blobs
     | SOME input =>
         let
@@ -189,7 +257,7 @@ fun collect_live_actions cutoff actions_dir =
       case action_modified action_dir of
           SOME time =>
             if Time.< (time, cutoff) then
-              (remove_tree action_dir; ((live_blobs, removed + 1), true))
+              (defer_tree action_dir; ((live_blobs, removed + 1), true))
             else
               ((add_manifest_blobs (action_dir, live_blobs), removed), false)
         | NONE => ((live_blobs, removed), false)
@@ -200,14 +268,14 @@ fun collect_live_actions cutoff actions_dir =
 fun remove_stale_children stage cutoff dir =
   gc_stage stage (children dir)
     (fn (path, removed) =>
-        if stale cutoff path then (remove_tree path; (removed + 1, true)) else (removed, false))
+        if stale cutoff path then (defer_tree path; (removed + 1, true)) else (removed, false))
     0
 
 fun remove_obsolete_action_lock_dirs cutoff dir =
   gc_stage "locks" (children dir)
     (fn (path, removed) =>
         if has_prefix "action-" (Path.file path) andalso is_dir path andalso stale cutoff path then
-          (remove_tree path; (removed + 1, true))
+          (defer_tree path; (removed + 1, true))
         else (removed, false))
     0
 
