@@ -286,6 +286,43 @@ async def test_a_batch_at_its_cap_is_left_out_of_the_read_of_candidates(
     assert (await coordinator._ahead_candidates()).candidates == []
 
 
+async def test_a_claim_ahead_given_up_wakes_a_claim_waiting_for_its_slot_of_the_cap(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.claim_ranking_seconds = 3600
+    await submit(http, ["a", "b", "c"], [("b", "a"), ("c", "a")], speculative_loading="1")
+    await claim_named(http, "a")
+    b = await claim_ahead(http)
+    assert b is not None and b["theory"] == "pkg:b"
+
+    started = time.monotonic()
+    waiting = asyncio.create_task(claim_ahead(http, wait_s=CLAIM_RECHECK_SECONDS * 2))
+    await asyncio.sleep(0.2)
+    assert (await complete(http, b["attempt_token"], result("b", "failed", "ahead-abandoned"))).status_code == 200
+    claimed = await waiting
+    assert claimed is not None and claimed["theory"] == "pkg:c"
+    assert time.monotonic() - started < CLAIM_RECHECK_SECONDS
+
+
+async def test_a_lease_lost_while_waiting_ahead_frees_its_slot_of_the_cap(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: AsyncEngine
+) -> None:
+    coordinator.settings.claim_ranking_seconds = 3600
+    await submit(http, ["a", "b", "c"], [("b", "a"), ("c", "a")], speculative_loading="1")
+    await claim_named(http, "a")
+    assert await claim_ahead(http) is not None
+    assert await claim_ahead(http) is None
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(
+            sa.text("UPDATE leases SET expires_at = now() - interval '1 second' WHERE input_key = :key"),
+            {"key": input_key("b")},
+        )
+
+    await coordinator.expire_leases()
+    c = await claim_ahead(http)
+    assert c is not None and c["theory"] == "pkg:c"
+
+
 async def test_a_parent_back_to_waiting_revokes_what_was_claimed_ahead_of_it_and_of_that(
     http: httpx.AsyncClient, cache: FakeCache, remote_exec_engine: AsyncEngine
 ) -> None:

@@ -11599,7 +11599,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                 | _ => abandon ("the cache has no spec " ^ parent_sha ^ " for " ^ name)
             val parent = parse_action_spec (read_text parent_spec)
             val parent_source = Path.concat (staging, name ^ ".source")
-            val _ = fetch_spec_blob remote {hash = #sha256 (#source parent), dst = parent_source}
+            (* Missing only for loading ahead: a plain run never fetches it. *)
+            val _ =
+              fetch_spec_blob remote {hash = #sha256 (#source parent), dst = parent_source}
+              handle ActionFailed (InputMissing _, msg) => abandon ("cannot fetch the source of " ^ name ^ ": " ^ msg)
             val predicted =
               predicted_theory_loads
                 {root = root, cwd = FS.fullPath stage, holdir = FS.fullPath (#holdir tc), base = base,
@@ -11621,6 +11624,21 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
           handle e as ActionFailed _ => raise e
                | e as HolbuildRemoteCache.Unavailable _ => raise e
                | e => abandon ("cannot predict the load manifest of " ^ Path.file stem ^ ": " ^ General.exnMessage e)
+        (* Each late parent's own manifests in place of its stand-in's, once
+           the preload is past the stand-ins, for a script that loads a late
+           parent itself. *)
+        fun replace_stand_ins () =
+          List.app
+            (fn ({stem, ...}, _) =>
+               List.app
+                 (fn suffix =>
+                    let val staged = in_root staging stem ^ suffix and base = in_root root stem ^ suffix
+                    in copy_binary staged base; copy_binary staged (hfs_remapped_path base) end)
+                 [".ui", ".uo"])
+            late
+        fun await_preload () =
+          if file_exists (marker "finishing") orelse child_done () then ()
+          else (check_cancelled (); OS.Process.sleep (Time.fromMilliseconds 50); await_preload ())
         val arrived = ref ([] : string list)
         (* A late parent's entry: restored in the staging directory, checked
            against its parents, then put in the action root. *)
@@ -11701,15 +11719,19 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               (stop_child ();
                record_timings ();
                HolbuildStatus.message_stderr "holbuild: loading ahead found a build to reuse; building plain\n";
-               empty_root ();
+               HolbuildRemoveTree.remove_untrusted_strict ahead_staging;
+               HolbuildRemoveTree.remove_untrusted_strict root;
                ensure_dir root;
+               HolbuildRemoveTree.remove_untrusted_strict checkpoint_root;
                ensure_dir checkpoint_root;
                run_plain spec tc false)
             else
               build spec tc false cutoff
                 (SOME {source_text = source_text, tool_cache = tool_cache,
                        join = fn () =>
-                         (drop "ready";
+                         (await_preload ();
+                          if child_done () then () else replace_stand_ins ();
+                          drop "ready";
                           released := SOME (Time.now ());
                           await_child ();
                           record_timings ();

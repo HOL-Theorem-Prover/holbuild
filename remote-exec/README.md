@@ -485,10 +485,12 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   among the candidates of the batches below their cap, the claim takes the
   highest batch priority, then the longest chain of dependents. A parent
   finishing recounts its running children's unfinished parents; a parent that
-  fails for good cancels them as it does every descendant, and a done parent
-  built again (an evicted entry) revokes their leases and sends them back to
-  waiting without counting the claim. Batches without the parameter are
-  never claimed ahead.
+  fails for good cancels them as it does every descendant. A parent that goes
+  back to waiting (a retry, an expired lease, a done parent built again)
+  revokes the leases of the actions claimed ahead of it, and of those claimed
+  ahead of them, and sends them back to waiting without counting the claim; so
+  does a lease that expires while its action waits ahead. Batches without the
+  parameter are never claimed ahead.
 - **Retries** by the result's failure class:
 
   | `failure` | What happens |
@@ -549,14 +551,18 @@ action beyond the warm workers, but at least one per ready or running
 high-tier action, since warm workers take only standard-tier work, and at
 most `REMOTE_EXEC_MAX_BURST_WORKERS`. Runs contribute only up to
 `REMOTE_EXEC_RUN_SLOTS` in both the total and high-tier demand terms;
-high-tier builds remain uncapped except by `MAX_BURST_WORKERS`. An action
-claimed ahead counts as running only once its parents are done: no burst
-worker starts for an action that waits.
+high-tier builds remain uncapped except by `MAX_BURST_WORKERS`. Actions
+claimed ahead and still waiting for a parent hold burst workers, since only
+burst workers load ahead, but ask for none of their own: they are left out of
+both terms, and added back only once ready work needs a burst worker, since
+they don't take it.
 
 ```text
-active = ready_build + running_build + min(RUN_SLOTS, ready_run + running_run)
-high = ready_high_build + running_high_build + min(RUN_SLOTS, ready_high_run + running_high_run)
-demand = min(MAX_BURST_WORKERS, max(0, active - WARM_WORKERS, high))
+active = ready_build + running_build - waiting_ahead + min(RUN_SLOTS, ready_run + running_run)
+high = ready_high_build + running_high_build - waiting_ahead_high + min(RUN_SLOTS, ready_high_run + running_high_run)
+plain = max(0, active - WARM_WORKERS, high)
+demand = min(MAX_BURST_WORKERS, plain + waiting_ahead)   if ready_high > 0 or (ready_standard > 0 and active > WARM_WORKERS)
+demand = min(MAX_BURST_WORKERS, plain)                   otherwise
 ```
 
 A build's dependency graph narrows and widens: a few theories everything else
@@ -642,13 +648,14 @@ retries, and a request still queued for a connection would be done twice.
 text as the body (`text/plain`). `profile` defaults to `default`; `class` defaults to `build`.
 An unknown class returns 422. `priority` defaults to 0 and accepts integers
 from 0 to 2147483647; invalid values return 422. Existing batches retain priority 0.
-`speculative_loading`, from 1 to 64, lets that many of the batch's actions
+`speculative_loading`, from 1 to 16, lets that many of the batch's actions
 at once be claimed ahead of their parents (see "Loading ahead"); without it
-none is.
+none is. A run batch with it returns 400.
 
 - 201 `{"batch_id": "<uuid>"}`
 - 400 when the batch is malformed (bad header or line, duplicate action, an
-  edge to a theory outside the batch)
+  edge to a theory outside the batch), or is a run batch with edges or
+  `speculative_loading`
 
 `GET /v1/batches/<batch_id>`
 
@@ -699,7 +706,7 @@ none is.
 
 `GET /v1/queue`
 
-- 200 `{"waiting": 0, "ready_standard": 0, "ready_high": 0, "running_standard": 0, "running_high": 0, "ready_run": 0, "running_run": 0, "waiting_ahead": 0, "run_slots": 30, "run_floor": 0, "desired_burst_workers": 0, "max_burst_workers": 0, "hosts": [<host>, …], "phases": <phases>, "scaler": <scaler>}`:
+- 200 `{"waiting": 0, "ready_standard": 0, "ready_high": 0, "running_standard": 0, "running_high": 0, "ready_run": 0, "running_run": 0, "waiting_ahead_standard": 0, "waiting_ahead_high": 0, "run_slots": 30, "run_floor": 0, "desired_burst_workers": 0, "max_burst_workers": 0, "hosts": [<host>, …], "phases": <phases>, "scaler": <scaler>}`:
   the unfinished actions of running batches, the configured run cap (`run_slots`)
   and effective reserved floor (`run_floor`, clamped to that cap), the burst worker target and its cap
   (`max_burst_workers`), the
@@ -716,8 +723,8 @@ none is.
   {"window_s": 600, "reports": 4210, "seconds": {"memory_wait": 0.0, "claim": 812.4, "idle": 0.0, "lease": 12.5, "release": 31.0, "before_hol": 40210.7, "hol": 52300.2, "after_hol": 44102.9, "exec": 0.0, "complete": 950.3, "after_result": 3020.4}}
   ```
   Tier counts include both classes; `ready_run` and `running_run` are the
-  run subsets across tiers. `waiting_ahead` counts the actions claimed ahead
-  that still wait for a parent, which the running counts leave out. A phase's share of the workers' time is its
+  run subsets across tiers. `waiting_ahead_standard` and `waiting_ahead_high`
+  count the running actions claimed ahead that still wait for a parent. A phase's share of the workers' time is its
   seconds over the sum of all. A host is its workers' latest report,
   `age_s` seconds old,
   except that `cpu_idle_pct` is the latest one measured:

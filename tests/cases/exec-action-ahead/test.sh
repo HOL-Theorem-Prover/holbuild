@@ -37,7 +37,7 @@ name = "ahead"
 [build]
 members = ["src"]
 
-# G is ordered after A without loading it.
+# G is ordered after A, and its preload doesn't load it.
 [actions.GTheory]
 deps = ["ATheory"]
 TOML
@@ -116,14 +116,20 @@ Proof
 QED
 SML
 
+# G loads A only once its script runs, by its path in the action root, which
+# no scan sees.
 cat > "$project/src/GScript.sml" <<'SML'
 Theory G
 Ancestors bool
 
+val _ =
+  let val (root, _) = Substring.position "/.holbuild/stage/" (Substring.full (OS.FileSys.getDir ()))
+  in Meta.load (Substring.string root ^ "/.holbuild/obj/src/ATheory") end
+
 Theorem g_thm:
-  T
+  T /\ T
 Proof
-  simp[]
+  ACCEPT_TAC (DB.fetch "A" "a_thm")
 QED
 SML
 # Each build of X differs, so Y can be built on another X than Z loads.
@@ -248,9 +254,18 @@ worker never "$spec_B" --ahead-parent "$key_A:$spec_A" --ahead-wait-seconds 3
 expect never 3 "status=failed" "failure=ahead-abandoned"
 require_grep 'did not arrive in time' "$tmpdir/never.log"
 
+# A late parent's source, which only loading ahead fetches, missing from the
+# cache gives the run up rather than reporting a missing input.
+source_A=$(awk '$1 == "source" { print $4 }' "$tmpdir/remote/cas/$spec_A")
+mv "$tmpdir/remote/cas/$source_A" "$tmpdir/source-A"
+worker nosource "$spec_B" --ahead-parent "$key_A:$spec_A"
+expect nosource 3 "status=failed" "failure=ahead-abandoned"
+require_grep 'cannot fetch the source of ATheory' "$tmpdir/nosource.log"
+mv "$tmpdir/source-A" "$tmpdir/remote/cas/$source_A"
+
 # The parent arrives while the children wait for it, and they build, also
 # the one that loads it through a library and the one that only waits for
-# it, at the end of its preload.
+# it, at the end of its preload, then loads it from its script.
 worker_start ahead "$spec_B" --ahead-parent "$key_A:$spec_A"
 worker_start ahead-lib "$spec_F" --ahead-parent "$key_A:$spec_A"
 worker_start ahead-order "$spec_G" --ahead-parent "$key_A:$spec_A"
@@ -265,6 +280,9 @@ kill -0 "${worker_pid[ahead-order]}" 2>/dev/null || {
 }
 worker a "$spec_A"
 expect a 0 "status=built"
+# G's script loads A in a plain build too.
+worker plain-g "$spec_G"
+expect plain-g 0 "status=built"
 for name in ahead ahead-lib ahead-order; do
   worker_wait "$name"
   expect "$name" 0 "status=built"
