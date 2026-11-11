@@ -165,7 +165,7 @@ val _ = assert "PUT goes to the preferred node"
    RC.path_exists (stored third "cas" preferred_hash) andalso
    not (RC.path_exists (stored first "cas" preferred_hash)) andalso
    not (RC.path_exists (stored second "cas" preferred_hash)));
-val _ = HolbuildRemoteCacheConfig.set_preferred_urls (one ^ "," ^ two);
+val _ = HolbuildRemoteCacheConfig.set_preferred_urls (authenticated first ^ "," ^ authenticated second);
 val _ = assert "a reader preferring other nodes still finds it"
   (fetch replicas preferred_hash = CB.Hit andalso RC.read_text dst = preferred_text);
 val _ = HolbuildRemoteCacheConfig.set_preferred_urls "";
