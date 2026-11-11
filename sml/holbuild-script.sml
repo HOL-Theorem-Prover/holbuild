@@ -119,6 +119,7 @@ use "sml/toolchain.sml";
 use "sml/generators.sml";
 use "sml/package_prepare.sml";
 use "sml/source_index.sml";
+use "sml/names.sml";
 use "sml/package_component.sml";
 use "sml/dependencies.sml";
 use "sml/component_provider.sml";
@@ -136,5 +137,9 @@ use "sml/proof_ir_types.sml";
 use "sml/watch.sml";
 use "sml/remote_exec.sml";
 use "sml/commands.sml";
+use "sml/complete.sml";
 
-fun main () = HolbuildCommands.main (CommandLine.arguments())
+fun main () =
+  case CommandLine.arguments () of
+      "__complete" :: words => HolbuildComplete.main words
+    | args => HolbuildCommands.main args

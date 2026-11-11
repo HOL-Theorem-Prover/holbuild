@@ -350,9 +350,7 @@ fun import_help () = print
 fun help_arg arg = arg = "--help" orelse arg = "-h"
 fun has_help_arg args = List.exists help_arg args
 
-val command_names =
-  ["build", "context", "repl", "run", "execution-plan", "check", "buildhol", "heap", "executable",
-   "clean", "export", "import", "gc", "cache", "action-spec", "exec-action", "run-action"]
+val command_names = HolbuildNames.command_names
 
 fun known_command command =
   List.exists (fn name => name = command) command_names orelse command = "goalfrag-plan"
@@ -844,8 +842,7 @@ fun find_theory_source command index theory =
       [source] => source
     | [] =>
         raise Error ("theory not found for " ^ command ^ ": " ^ theory ^
-                     HolbuildSuggest.did_you_mean theory
-                       (map #logical_name (List.filter theory_source index)))
+                     HolbuildSuggest.did_you_mean theory (HolbuildNames.theory_names index))
     | matches =>
         raise Error ("ambiguous theory for " ^ command ^ ": " ^ theory ^ " in " ^
                      String.concatWith ", " (map describe_source matches))
@@ -2636,9 +2633,7 @@ fun clean_targets args =
 fun heap_kind_name HolbuildProject.HeapImage = "heap"
   | heap_kind_name (HolbuildProject.ExecutableImage _) = "executable"
 
-fun heap_kind_matches "heap" HolbuildProject.HeapImage = true
-  | heap_kind_matches "executable" (HolbuildProject.ExecutableImage _) = true
-  | heap_kind_matches _ _ = false
+val heap_kind_matches = HolbuildNames.heap_kind_matches
 
 fun heap_named project command target =
   let
@@ -2651,10 +2646,7 @@ fun heap_named project command target =
       | NONE =>
           raise Error ("unknown " ^ command ^ " target: " ^ target ^
                        HolbuildSuggest.did_you_mean target
-                         (List.mapPartial
-                            (fn HolbuildProject.Heap {name, kind, ...} =>
-                                if heap_kind_matches command kind then SOME name else NONE)
-                            (#heaps project)))
+                         (HolbuildNames.heap_names command (#heaps project)))
   end
 
 fun build_heap_kind tc cli_jobs command args =
