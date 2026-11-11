@@ -43,6 +43,14 @@ the snapshot's `holproject.toml`, and dependencies' capsules are never bundled.
 The snapshot holds the files as committed, `holproject.toml` included, so a
 dependency URL in it must not carry credentials.
 
+A snapshot builds like the checkout it was taken from. Extracted into a
+directory (`tar -xf F --strip-components=2 holbuild-package/source`), it gives
+the same action keys as the checkout, so cache entries made from one restore
+the other, and a dependency can point at the extracted directory with a
+`.holconfig.toml` path override. Only declared files are in it: a script that
+reads an undeclared file out of its action stage works in a checkout, which has
+the file, and fails from the snapshot.
+
 `toolchain_key` is the identity of the toolchain's theory-building semantics that
 action keys carry. Cache entries in the capsule match only builds on the same
 toolchain; on another toolchain holbuild builds from source.

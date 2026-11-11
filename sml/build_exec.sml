@@ -410,7 +410,10 @@ fun write_child_policy_with {module_cache = use_module_cache} tc path =
                      base_state = HolbuildToolchain.base_state tc}
   in
     write_text path
-      (String.concat
+      ("(* HOL discovers sibling stages at startup; they can disappear during a load. *)\n" ^
+       "val _ = Meta.loadPath := List.filter (fn dir => not " ^
+       "(String.isSubstring \"/.holbuild/stage/\" (dir ^ \"/\"))) (!Meta.loadPath);\n" ^
+       String.concat
          (map (fn trace => "val _ = (Feedback.set_trace " ^ HolbuildToolchain.sml_string trace ^
                            " 0 handle _ => ());\n")
               child_policy_traces) ^ (if use_module_cache then module_cache else "") ^ "\n")
@@ -3323,20 +3326,56 @@ fun resumed_theorems kinds_names =
         else NONE)
     kinds_names
 
+(* Whether the header of the `Resume` block that starts at THEORY_START in
+   SOURCE_TEXT, up to its tactic at TACTIC_START, names `smlname` among its
+   attributes, which follow the first `[`.  (The boundary's and the
+   checkpoint's name has the attributes stripped, so the header is read
+   here.)  A label that merely contains the word counts too, which only
+   keeps that proof in place. *)
+fun resume_header_names_smlname source_text theorem_start tactic_start =
+  tactic_start < theorem_start orelse tactic_start > size source_text orelse
+  let
+    val header = String.substring (source_text, theorem_start, tactic_start - theorem_start)
+  in
+    case CharVector.findi (fn (_, c) => c = #"[") header of
+        NONE => false
+      | SOME (i, _) => mentions_at_identifier_start (String.extract (header, i + 1, NONE)) "smlname"
+  end
+
 (* Whether a pipelined build defers the proof TACTIC of a theorem or
    `Resume` block (KIND) named NAME, given the theorems RESUMED: see
-   deferred_source. *)
-fun deferrable_proof resumed kind name tactic =
+   deferred_source.  NAMES_SMLNAME says the block's header names `smlname`
+   (resume_header_names_smlname).
+
+   A `Resume` block whose header names `smlname` stays in place, since its
+   deferred stub would give `smlname` a theorem the real proof doesn't:
+   the stub is an oracle theorem of the goal, whose assumptions include
+   the subgoal's, while a proof that doesn't use them has none.  That is
+   the only way the stub's extra hypotheses reach the script.  The theorem
+   markerLib.resume proves goes to exactly three places: the check that no
+   suspendlabel hypothesis of it belongs to a still-suspended theorem
+   (which looks only at those hypotheses); build_suspendlabel_thms, which
+   discharges the goal's assumptions (so a stub `p |- T` and a real
+   `|- T` record the same resumption); and the value of the declaration,
+   which the expansion of `Resume` binds to the `smlname` name, or to `_`
+   without one.  So without `smlname` the stub's extra hypotheses go no
+   further, and HolbuildDeferred accepts a deferred proof whose theorem
+   has fewer hypotheses than its goal's assumptions.  Only that Resume
+   block stays in place; the other proofs of the theory stay deferred. *)
+fun deferrable_proof resumed kind name names_smlname tactic =
   (kind = "resume" orelse (kind = "theorem" andalso not (List.exists (fn r => r = name) resumed))) andalso
+  not (kind = "resume" andalso names_smlname) andalso
   not (mentions_at_identifier_start tactic "cheat") andalso
   not (mentions_at_identifier_start tactic "suspend")
 
-(* For a pipelined build, which of CHECKPOINTS the instrumented script
-   defers (HolbuildTheoryCheckpoints.instrument). *)
-fun deferrable_checkpoint (checkpoints : HolbuildTheoryCheckpoints.checkpoint list) =
+(* For a pipelined build, which of CHECKPOINTS, of the script SOURCE_TEXT,
+   the instrumented script defers (HolbuildTheoryCheckpoints.instrument). *)
+fun deferrable_checkpoint source_text (checkpoints : HolbuildTheoryCheckpoints.checkpoint list) =
   let val resumed = resumed_theorems (map (fn {kind, name, ...} => (kind, name)) checkpoints)
-  in fn ({kind, name, tactic_text, ...} : HolbuildTheoryCheckpoints.checkpoint) =>
-          deferrable_proof resumed kind name tactic_text
+  in fn ({kind, name, theorem_start, tactic_start, tactic_text, ...} : HolbuildTheoryCheckpoints.checkpoint) =>
+          deferrable_proof resumed kind name
+            (kind = "resume" andalso resume_header_names_smlname source_text theorem_start tactic_start)
+            tactic_text
   end
 
 (* DEFER_PROOFS: the script is a pipelined build's, which defers what
@@ -3354,7 +3393,7 @@ fun instrumented_source defer_proofs policy timeout_marker plan_only_marker sour
        trace_all = trace_steps policy,
        plan_only_marker = plan_only_marker,
        new_ir = proof_ir_enabled policy,
-       defer = if defer_proofs then deferrable_checkpoint checkpoints else (fn _ => false)}
+       defer = if defer_proofs then deferrable_checkpoint source_text checkpoints else (fn _ => false)}
   else plain_source_from_checkpoint source_name source_text start_offset
 
 fun replay_candidate policy base theorem_checkpoints declaration_checkpoints =
@@ -5623,18 +5662,22 @@ fun unoutline_path root run_dir path =
    that prove them and its `Finalise` saves the theorem where the real
    build does.  A theorem the script resumes suspends, whether or not its
    proof names `suspend` (a helper tactic can call it), so it stays as
-   well; HolbuildDeferred fails any other deferred proof that suspends. *)
+   well; HolbuildDeferred fails any other deferred proof that suspends.  A
+   `Resume` block that names `smlname` stays too (deferrable_proof). *)
 fun deferred_source source_text boundaries =
   let
     val deferred = deferrable_proof (resumed_theorems (map (fn {kind, name, ...} => (kind, name)) boundaries))
     fun splice [] _ pos acc = String.concat (rev (String.extract (source_text, pos, NONE) :: acc))
-      | splice ({kind, name, tactic_start, tactic_end, ...} :: rest) k pos acc =
+      | splice ({kind, name, theorem_start, tactic_start, tactic_end, ...} :: rest) k pos acc =
           if tactic_start < pos orelse tactic_end < tactic_start then
             raise Error "theorem spans out of order"
           else
             let val tactic = String.substring (source_text, tactic_start, tactic_end - tactic_start)
             in
-              if not (deferred kind name tactic) then splice rest k pos acc
+              if not (deferred kind name
+                        (kind = "resume" andalso resume_header_names_smlname source_text theorem_start tactic_start)
+                        tactic)
+              then splice rest k pos acc
               else
                 splice rest (k + 1) tactic_end
                   (String.concat ["HolbuildDeferred.defer ", Int.toString k, " ",
@@ -8915,14 +8958,24 @@ type spec_deps =
 fun theory_spec_deps (spec : action_spec) : spec_deps =
   {libraries = #libraries spec, deps = #deps spec, libs = #libs spec, orders = #orders spec}
 
-fun spec_load_stems (spec : spec_deps) =
+(* The stem and load order of a theory or library the spec names, the first
+   stem given for a name winning.  Built once per spec: a hydrate resolves
+   every dependency's parents in it. *)
+fun spec_resolver (spec : spec_deps) =
   let
-    fun add ((name, stem), acc) =
-      if List.exists (fn (n, _) => n = name) acc then acc else acc @ [(name, stem)]
+    fun lookup pairs =
+      List.foldl (fn ((name, value), dict) => insert_first_string_dict (dict, name, value))
+        (Binarymap.mkDict String.compare) pairs
+    val stems =
+      lookup (map (fn {target, stem, ...} => (#2 (target_name target), stem)) (#deps spec) @
+              map (fn {target, stem, ...} => (#2 (target_name target), stem)) (#libs spec))
+    val orders = lookup (map (fn {target, order} => (#2 (target_name target), order)) (#orders spec))
+    fun order name =
+      case Binarymap.peek (orders, name) of
+          SOME order => order
+        | NONE => reject_spec ("spec has no load order for " ^ name)
   in
-    List.foldl add []
-      (map (fn {target, stem, ...} => (#2 (target_name target), stem)) (#deps spec) @
-       map (fn {target, stem, ...} => (#2 (target_name target), stem)) (#libs spec))
+    fn name => Option.map (fn stem => (stem, order name)) (Binarymap.peek (stems, name))
   end
 
 (* The spec's theory action, its checkpoints keyed on DEPS_KEY. *)
@@ -9000,7 +9053,7 @@ fun fetch_spec_blob remote {hash, dst} =
 
 (* Restores a theory the action depends on, or the action's own entry, into
    the action root, writing its load manifests with the spec's stems. *)
-fun restore_spec_theory remote root (spec : spec_deps) {key, subject, stem, extra_outputs, requested_timeout} =
+fun restore_spec_theory remote root resolver {key, subject, stem, extra_outputs, requested_timeout} =
   let
     val cache = cache_root ()
     val entry =
@@ -9009,13 +9062,7 @@ fun restore_spec_theory remote root (spec : spec_deps) {key, subject, stem, extr
          expected_extra_outputs = extra_outputs,
          requested_timeout = requested_timeout, require_trace = false}
     val resident = #manifest_text entry
-    val stems = spec_load_stems spec
-    fun order name =
-      case List.find (fn {target, ...} => #2 (target_name target) = name) (#orders spec) of
-          SOME {order, ...} => order
-        | NONE => reject_spec ("spec has no load order for " ^ name)
-    fun resolve name =
-      Option.map (fn (_, s) => (in_root root s, order name)) (List.find (fn (n, _) => n = name) stems)
+    fun resolve name = Option.map (fn (s, order) => (in_root root s, order)) (resolver name)
     val stem_path = in_root root stem
     val sig_path = stem_path ^ ".sig"
     val sml_path = stem_path ^ ".sml"
@@ -9115,9 +9162,10 @@ fun hydrate_spec_deps remote root files (spec : spec_deps) direct =
     fun write_lib {stem, suffix, loads, ...} =
       (ensure_parent (in_root root stem);
        write_object_manifest (in_root root (stem ^ suffix)) (map lib_load loads))
+    val resolver = spec_resolver spec
     fun restore_dep {target, stem, key} =
       (ensure_parent (in_root root stem);
-       restore_spec_theory remote root spec
+       restore_spec_theory remote root resolver
          {key = key, subject = target, stem = stem, extra_outputs = NONE, requested_timeout = NONE})
       handle e as HolbuildRemoteCache.Unavailable _ => raise e
            | e => raise action_failed (InputMissing ("theory " ^ key))
@@ -9184,7 +9232,7 @@ fun action_already_done remote root (spec : action_spec) =
     val {sig_path, sml_path, data_path} = #outputs spec
     val stem = drop_suffix ".dat" data_path
     fun restored () =
-      (restore_spec_theory remote root (theory_spec_deps spec)
+      (restore_spec_theory remote root (spec_resolver (theory_spec_deps spec))
          {key = #input_key spec, subject = #package spec ^ ":" ^ #logical spec, stem = stem,
           extra_outputs = SOME (#extra_outputs spec), requested_timeout = #tactic_timeout spec};
        spec_parent_hashes_match root (theory_spec_deps spec) (in_root root data_path))
@@ -10337,7 +10385,7 @@ fun reuse_earlier_build remote root (spec : action_spec) pair_key =
           val data_path = #data_path (#outputs spec)
         in
           sha256_text old_key andalso old_key <> new_key andalso
-          (restore_spec_theory remote root (theory_spec_deps spec)
+          (restore_spec_theory remote root (spec_resolver (theory_spec_deps spec))
              {key = old_key, subject = #package spec ^ ":" ^ #logical spec,
               stem = drop_suffix ".dat" data_path, extra_outputs = SOME (#extra_outputs spec),
               requested_timeout = #tactic_timeout spec};

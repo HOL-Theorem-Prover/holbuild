@@ -77,4 +77,7 @@ sig
   val flush_growth : unit -> unit
   (* Called by every cache GC: the cache counts as just collected. *)
   val reset_growth : t -> unit
+  (* Drops this process's unflushed writes, for a throwaway cache that is
+     removed before the process exits. *)
+  val discard_growth : t -> unit
 end

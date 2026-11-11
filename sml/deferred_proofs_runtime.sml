@@ -83,7 +83,21 @@ struct
      is checked as it stands in the pin, where a HOL whose pins take
      writes keeps (and so loses) what the proof writes; prove_all checks
      the live context too. *)
-  (* TH, proved for GOAL with the theory data INITIAL before the proof. *)
+  (* TH, proved for GOAL with the theory data INITIAL before the proof.
+
+     A theorem with fewer hypotheses than its goal's assumptions is
+     accepted: the stub, an oracle theorem of GOAL, has all of them, and a
+     proof that doesn't use an assumption leaves it out.  That is exact for
+     a `Resume` block only because the theorem markerLib.resume proves
+     goes nowhere a missing hypothesis shows: the check that its
+     suspendlabel hypotheses aren't owned by a still-suspended theorem,
+     build_suspendlabel_thms (which discharges the goal's assumptions, so
+     stub and real theorem record the same resumption), and the value of
+     the declaration, bound to `smlname` or to `_`.  A `Resume` that names
+     `smlname` is therefore never deferred (deferrable_proof in
+     build_exec.sml).  Don't tighten this to equal hypotheses: most
+     proofs leave an assumption unused, and each would fail its attempt
+     and build twice. *)
   fun checked goal initial th =
     (* A proof that suspends a subgoal (markerLib.suspend), or cites a
        still-suspended theorem, proves the goal under a hypothesis the
