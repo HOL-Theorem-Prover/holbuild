@@ -128,4 +128,43 @@ fun save_checkpoint ({label, default_share, path, ok_text, depth} :
       else raise e
   end
 
+
+(* Each context checkpoint (after a theorem or a definition) forces a full GC,
+   which costs from 0.1 s to over 1 s per save on large theories.  So a context
+   is saved only once the time since the last context save ended reaches
+   max(2 s, 10 x that save's duration): saving costs at most about a tenth of
+   the proof time, and a resumed build replays at most that much finished work
+   before reaching the failure.  A skipped context is removed, so no checkpoint
+   from an earlier run survives whose parent this run has replaced.  Tests that
+   need every context saved set HOLBUILD_CHECKPOINT_EVERY_CONTEXT=1. *)
+val last_context_save_end = ref (Time.now())
+val last_context_save_seconds = ref 0.0
+
+(* Starts the gate for a theory script: called once the dependencies are loaded,
+   so the deps_loaded save (with its compaction) doesn't count as a context save. *)
+fun reset_context_checkpoint_gate () =
+  (last_context_save_end := Time.now();
+   last_context_save_seconds := 0.0)
+
+fun save_context_checkpoint (args as {path, ...} :
+                             {label : string, default_share : bool, path : string,
+                              ok_text : string, depth : int}) =
+  let
+    val start = Time.now()
+    val due =
+      Option.getOpt(env_bool "HOLBUILD_CHECKPOINT_EVERY_CONTEXT", false) orelse
+      seconds (!last_context_save_end, start) >=
+        Real.max (2.0, 10.0 * !last_context_save_seconds)
+  in
+    if due then
+      let
+        val _ = save_checkpoint args
+        val finish = Time.now()
+      in
+        last_context_save_seconds := seconds (start, finish);
+        last_context_save_end := finish
+      end
+    else discard_checkpoint path
+  end
+
 end

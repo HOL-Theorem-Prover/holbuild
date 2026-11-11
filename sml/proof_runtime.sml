@@ -655,7 +655,11 @@ fun save_theorem_context () =
       NONE => ()
     | SOME (context_path, context_ok, depth) =>
         (context_info_ref := NONE;
-         save_checkpoint "theorem_context" false context_path context_ok depth)
+         if not (!checkpoint_enabled_ref) then ()
+         else
+           HolbuildCheckpointSaveRuntime.save_context_checkpoint
+             {label = "theorem_context", default_share = false, path = context_path,
+              ok_text = context_ok, depth = depth})
 
 fun goal_text goal = PP.pp_to_string 100 goalStack.std_pp_goal goal ^ "\n"
 
@@ -2121,6 +2125,7 @@ fun install ({checkpoint_enabled, tactic_timeout, timeout_marker, plan_theorem, 
    failed_prefix_resume_active_ref := false;
    failed_prefix_resumed_step_count_ref := NONE;
    proving_with_proof_ir_ref := false;
+   HolbuildCheckpointSaveRuntime.reset_context_checkpoint_gate ();
    HolbuildTacticCompat.install_prover proof_ir_prover)
 
 end

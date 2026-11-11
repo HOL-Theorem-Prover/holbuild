@@ -272,6 +272,8 @@ def sanitized_environment(home: Path) -> dict[str, str]:
         key: value for key, value in os.environ.items()
         if key in {"PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR"}
         or key in SOLVER_ENV or key.startswith("HOLBUILD_RUN_")
+        # The test suite's switch that saves every context checkpoint.
+        or key == "HOLBUILD_CHECKPOINT_EVERY_CONTEXT"
     }
     if sys.prefix != sys.base_prefix and "PATH" in env:
         venv_bin = os.path.realpath(os.path.join(sys.prefix, "bin"))

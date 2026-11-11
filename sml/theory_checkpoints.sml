@@ -128,7 +128,7 @@ fun termination_tactic_suffix ({proof_ir_plan, ...} : termination) =
 
 fun save_declaration_context_line ({safe_name, context_path, context_ok, ...} : declaration_checkpoint) =
   String.concat
-    ["\nval _ = HolbuildCheckpointSaveRuntime.save_checkpoint {label = ",
+    ["\nval _ = HolbuildCheckpointSaveRuntime.save_context_checkpoint {label = ",
      HolbuildToolchain.sml_string ("definition_context:" ^ safe_name),
      ", default_share = false, path = ", HolbuildToolchain.sml_string context_path,
      ", ok_text = ", HolbuildToolchain.sml_string context_ok,
