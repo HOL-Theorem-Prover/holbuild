@@ -265,7 +265,8 @@ fun gc_help () = print
   \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun cache_help () = print
-  "`holbuild cache gc` is deprecated; use `holbuild gc --cache-only`.\n"
+  "`holbuild cache gc` is deprecated; use `holbuild gc --cache-only`.\n\
+  \Full reference: man holbuild.\n"
 
 fun action_spec_help () = print
   "Usage:\n\

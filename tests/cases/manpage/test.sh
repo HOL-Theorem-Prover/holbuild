@@ -57,7 +57,6 @@ fi
 
 # Every command's help points at the page.
 for command in $commands; do
-  [[ "$command" = cache ]] && continue
   "$HOLBUILD_BIN" "$command" --help | grep -q 'man holbuild' ||
     { echo "holbuild $command --help does not mention man holbuild" >&2; exit 1; }
 done

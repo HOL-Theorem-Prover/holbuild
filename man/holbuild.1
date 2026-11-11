@@ -482,6 +482,13 @@ and
 .TP
 .B \-j \fIN\fR, \-j\fIN\fR, \-\-jobs \fIN
 Build parallelism.
+Without it, the
+.B jobs
+of the
+.B [build]
+table in
+.I .holconfig.toml
+applies, and otherwise half the detected processors (at least 1).
 When holbuild builds a HOL toolchain it also passes
 .BI \-j " N"
 to HOL's
@@ -641,6 +648,13 @@ Also accepted as
 Per-step timeout for proof steps;
 .B 0
 disables it.
+Without the option, the
+.B tactic_timeout
+of the
+.B [build]
+table in
+.I .holconfig.toml
+or the manifest applies, and otherwise 2.5 seconds.
 A step that times out runs once more with half the timeout; if that finishes,
 the step passes, and otherwise it fails the build, even inside
 .B TRY
