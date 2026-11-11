@@ -307,16 +307,21 @@ def burst_demand(counts: QueueCounts, warm_workers: int, max_burst_workers: int,
     one per high-tier action, since warm workers are standard-tier. Runs contribute at most ``run_slots``
     in each term; the total is at most ``max_burst_workers``.
 
-    Actions waiting ahead of their parents ask for no worker of their own: of each tier, those beyond its ready
-    work are left out, so they only keep ready work from going short of the workers they hold."""
+    Actions waiting ahead of their parents hold burst workers (only burst workers load ahead) but ask for none
+    of their own: the demand is the other actions', plus the workers those hold once ready work needs a burst
+    worker, since they don't take it."""
     ready = counts.ready_standard + counts.ready_high
     running = counts.running_standard + counts.running_high
     runs = counts.ready_run + counts.running_run
-    idle_standard = max(0, counts.waiting_ahead_standard - counts.ready_standard)
-    idle_high = max(0, counts.waiting_ahead_high - counts.ready_high)
-    active = ready + running - runs + min(run_slots, runs) - idle_standard - idle_high
-    high = counts.ready_high + counts.running_high - counts.high_run + min(run_slots, counts.high_run) - idle_high
+    ahead = counts.waiting_ahead_standard + counts.waiting_ahead_high
+    active = ready + running - ahead - runs + min(run_slots, runs)
+    high = (
+        counts.ready_high + counts.running_high - counts.waiting_ahead_high
+        - counts.high_run + min(run_slots, counts.high_run)
+    )
     demand = max(0, active - warm_workers, high)
+    if counts.ready_high > 0 or (counts.ready_standard > 0 and active > warm_workers):
+        demand += ahead
     return min(demand, max_burst_workers)
 
 
@@ -1356,6 +1361,7 @@ class Coordinator:
                     {"batch_id": batch_id, "input_key": action.input_key},
                 )
                 await self._retry(conn, batch_id, action.input_key, ahead_batch=action.ahead_batch)
+                unblocked = True  # a slot of the batch's cap is free
             elif result.failure == "unavailable" and action.interruptions < self.settings.max_interruptions:
                 # The worker couldn't start or finish it, so it doesn't count as an attempt.
                 await conn.execute(
@@ -1541,6 +1547,7 @@ class Coordinator:
                         {"batch_id": batch_id, "input_key": lease.input_key},
                     )
                     await self._retry(conn, batch_id, lease.input_key, ahead_batch=True)
+                    self._ahead_changed()  # a slot of the batch's cap is free
                 elif action.attempts >= self.settings.max_attempts:
                     await conn.execute(
                         sa.text(

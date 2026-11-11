@@ -63,12 +63,14 @@ def counts(
         (counts(ready_high=1), 1),  # warm workers are standard-tier, so a high action needs a burst worker
         (counts(running=2, ready_high=1, running_high=1), 2),
         (counts(ready=30, running=10), 16),  # capped
-        # Of the running actions, those waiting ahead beyond the tier's ready work ask for no worker...
+        # Running actions waiting ahead ask for no worker while no ready work needs a burst worker...
         (counts(running=6, ahead=4), 0),
         (counts(running_high=3, ahead_high=3), 0),
-        # ...but those that keep ready work off the workers they hold do.
-        (counts(ready=2, running=4, ahead=3), 3),
-        (counts(ready=4, running=4, ahead=3), 6),
+        (counts(ready=1, running=4, ahead=3), 0),  # the warm workers take the rest
+        # ...and count once some does, since they don't take it, whatever their tier.
+        (counts(ready_high=2, running_high=6, ahead_high=4), 4 + 4),
+        (counts(ready_high=1, running=4, running_high=3, ahead=4), 4 + 4),
+        (counts(ready=2, running=4, ahead=3), 1 + 3),
     ],
 )
 def test_burst_demand(queue: QueueCounts, expected: int) -> None:

@@ -552,14 +552,17 @@ high-tier action, since warm workers take only standard-tier work, and at
 most `REMOTE_EXEC_MAX_BURST_WORKERS`. Runs contribute only up to
 `REMOTE_EXEC_RUN_SLOTS` in both the total and high-tier demand terms;
 high-tier builds remain uncapped except by `MAX_BURST_WORKERS`. Actions
-claimed ahead and still waiting for a parent count only as far as their tier
-has ready work they keep off the workers they hold: no burst worker starts for
-the waiting alone.
+claimed ahead and still waiting for a parent hold burst workers, since only
+burst workers load ahead, but ask for none of their own: they are left out of
+both terms, and added back only once ready work needs a burst worker, since
+they don't take it.
 
 ```text
-active = ready_build + running_build + min(RUN_SLOTS, ready_run + running_run)
-high = ready_high_build + running_high_build + min(RUN_SLOTS, ready_high_run + running_high_run)
-demand = min(MAX_BURST_WORKERS, max(0, active - WARM_WORKERS, high))
+active = ready_build + running_build - waiting_ahead + min(RUN_SLOTS, ready_run + running_run)
+high = ready_high_build + running_high_build - waiting_ahead_high + min(RUN_SLOTS, ready_high_run + running_high_run)
+plain = max(0, active - WARM_WORKERS, high)
+demand = min(MAX_BURST_WORKERS, plain + waiting_ahead)   if ready_high > 0 or (ready_standard > 0 and active > WARM_WORKERS)
+demand = min(MAX_BURST_WORKERS, plain)                   otherwise
 ```
 
 A build's dependency graph narrows and widens: a few theories everything else
