@@ -36,6 +36,10 @@ name = "ahead"
 
 [build]
 members = ["src"]
+
+# G is ordered after A without loading it.
+[actions.GTheory]
+deps = ["ATheory"]
 TOML
 cat > "$project/src/AScript.sml" <<'SML'
 Theory A
@@ -109,6 +113,44 @@ Theorem e_thm:
   T
 Proof
   ACCEPT_TAC d_thm
+QED
+SML
+
+cat > "$project/src/GScript.sml" <<'SML'
+Theory G
+Ancestors bool
+
+Theorem g_thm:
+  T
+Proof
+  simp[]
+QED
+SML
+# Each build of X differs, so Y can be built on another X than Z loads.
+cat > "$project/src/XScript.sml" <<'SML'
+Theory X
+Ancestors bool
+
+val x_thm = save_thm ("x_thm", REFL (mk_var ("x" ^ LargeInt.toString (Time.toNanoseconds (Time.now ())), bool)))
+SML
+cat > "$project/src/YScript.sml" <<'SML'
+Theory Y
+Ancestors X
+
+Theorem y_thm:
+  T
+Proof
+  simp[]
+QED
+SML
+cat > "$project/src/ZScript.sml" <<'SML'
+Theory Z
+Ancestors X Y
+
+Theorem z_thm:
+  T
+Proof
+  simp[]
 QED
 SML
 
@@ -186,8 +228,8 @@ spec_for() { awk -v want="$2" '$1 == "action" && $5 == want { print $4 }' "$1"; 
 key_for() { awk -v want="$2" '$1 == "action" && $5 == want { print $2 }' "$1"; }
 
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
-hb action-spec --upload CTheory ETheory FTheory > "$tmpdir/batch.txt"
-for theory in A B C D E F; do
+hb action-spec --upload CTheory ETheory FTheory GTheory ZTheory > "$tmpdir/batch.txt"
+for theory in A B C D E F G X Y Z; do
   declare "spec_$theory=$(spec_for "$tmpdir/batch.txt" "ahead:${theory}Theory")"
   declare "key_$theory=$(key_for "$tmpdir/batch.txt" "ahead:${theory}Theory")"
 done
@@ -207,14 +249,23 @@ expect never 3 "status=failed" "failure=ahead-abandoned"
 require_grep 'did not arrive in time' "$tmpdir/never.log"
 
 # The parent arrives while the children wait for it, and they build, also
-# the one that loads it through a library.
+# the one that loads it through a library and the one that only waits for
+# it, at the end of its preload.
 worker_start ahead "$spec_B" --ahead-parent "$key_A:$spec_A"
 worker_start ahead-lib "$spec_F" --ahead-parent "$key_A:$spec_A"
+worker_start ahead-order "$spec_G" --ahead-parent "$key_A:$spec_A"
 await_marker ahead waiting-ATheory
 await_marker ahead-lib waiting-ATheory
+await_marker ahead-order finishing
+sleep 3
+kill -0 "${worker_pid[ahead-order]}" 2>/dev/null || {
+  echo "the run went past its preload before its parent arrived" >&2
+  cat "$tmpdir/ahead-order.log" "$tmpdir/ahead-order.result" >&2 || true
+  exit 1
+}
 worker a "$spec_A"
 expect a 0 "status=built"
-for name in ahead ahead-lib; do
+for name in ahead ahead-lib ahead-order; do
   worker_wait "$name"
   expect "$name" 0 "status=built"
   ahead_phases "$name" || { echo "no load-ahead timings:" >&2; cat "$tmpdir/$name.result" >&2; exit 1; }
@@ -240,6 +291,22 @@ expect mismatch 3 "status=failed" "failure=ahead-abandoned"
 require_grep 'evaluated other files than its manifest names' "$tmpdir/mismatch.log"
 worker plain-e "$spec_E"
 expect plain-e 0 "status=built"
+
+# A late parent built on another build of a parent than the one the run
+# loaded gives the run up.
+worker x1 "$spec_X"
+expect x1 0 "status=built"
+worker_start other-x "$spec_Z" --ahead-parent "$key_Y:$spec_Y"
+await_marker other-x waiting-YTheory
+ac_X=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key_X" | sha256sum | cut -d' ' -f1)
+rm "$tmpdir/remote/ac/$ac_X"
+worker x2 "$spec_X"
+expect x2 0 "status=built"
+worker y "$spec_Y"
+expect y 0 "status=built"
+worker_wait other-x
+expect other-x 3 "status=failed" "failure=ahead-abandoned"
+require_grep 'does not match its parents' "$tmpdir/other-x.log"
 
 # A plain build of B against a second cache publishes the same entry.
 first_remote=$tmpdir/remote
