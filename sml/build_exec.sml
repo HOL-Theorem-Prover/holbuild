@@ -9392,30 +9392,61 @@ fun store_cache_families cache =
   List.map (fn dir => {mtime = modified_time dir, evict = fn () => evict_store_family dir})
            (store_families (share_store cache))
 
-(* holbuild gc: the store's families no build used within DAYS, except one
-   a running process leases or a heap a tree still links: removing that frees
-   nothing. *)
-fun gc_checkpoint_store days =
+(* The store's families no build used within DAYS, except one a running
+   process leases or a heap a tree still links: removing that frees nothing.
+   The caller holds the cache's GC lock. *)
+fun collect_checkpoint_store cache days =
   let
-    val cache = HolbuildCache.cache_root ()
     val cutoff = retention_cutoff days
     fun removable dir = Time.<(modified_time dir, cutoff) andalso store_heap_links dir <= 1
-    fun run () =
-      let
-        val removed =
-          List.foldl
-            (fn (dir, n) =>
-                if removable dir andalso Option.isSome (try_evict_store_family_if (fn () => removable dir) dir)
-                then n + 1 else n)
-            0 (store_families (share_store cache))
-      in
-        (* stderr: gc's stdout is its one summary line. *)
-        if removed = 0 then ()
-        else TextIO.output (TextIO.stdErr, "checkpoint store gc: removed families=" ^ Int.toString removed ^ "\n")
-      end
   in
-    if path_exists (share_store cache) then HolbuildCache.with_lock cache run else ()
+    if not (path_exists (share_store cache)) then 0
+    else
+      List.foldl
+        (fn (dir, n) =>
+            if removable dir andalso Option.isSome (try_evict_store_family_if (fn () => removable dir) dir)
+            then n + 1 else n)
+        0 (store_families (share_store cache))
   end
+
+fun gc_checkpoint_store days =
+  let val cache = HolbuildCache.cache_root ()
+  in
+    if path_exists (share_store cache) then
+      HolbuildCache.with_lock cache (fn () =>
+        let val removed = collect_checkpoint_store cache days
+        in
+          (* stderr: gc's stdout is its one summary line. *)
+          if removed = 0 then ()
+          else TextIO.output (TextIO.stdErr, "checkpoint store gc: removed families=" ^
+                                             Int.toString removed ^ "\n")
+        end)
+    else ()
+  end
+
+(* After a command that wrote to the cache: the collections `holbuild gc`
+   runs on the cache and its checkpoint store, once THRESHOLD bytes were
+   written since the last cache GC. Skipped while another process holds the
+   GC lock; a failure only warns. Reports on stderr, only what it removed. *)
+fun auto_cache_gc threshold =
+  let val cache = HolbuildCache.cache_root ()
+  in
+    if not (path_exists cache) orelse HolbuildCache.growth_since_gc cache < threshold then ()
+    else
+      case HolbuildCache.try_with_lock cache (fn () =>
+             (HolbuildCache.collect_root cache HolbuildCache.default_retention_days,
+              collect_checkpoint_store cache HolbuildCache.default_retention_days)) of
+          SOME (counts, families) =>
+            if HolbuildCache.gc_counts_removed counts orelse families > 0 then
+              (if HolbuildStatus.quiet_mode () orelse HolbuildStatus.json_mode () then ()
+               else HolbuildStatus.message_stderr
+                      ("holbuild: automatic cache gc: " ^ HolbuildCache.gc_counts_text counts ^
+                       " checkpoint-families=" ^ Int.toString families ^ "\n"))
+            else ()
+        | NONE => ()
+  end
+  handle HolbuildCache.Error msg => warn ("automatic gc failed: " ^ msg)
+       | e => warn ("automatic gc failed: " ^ General.exnMessage e)
 
 (* Factory modules have no on-disk module parents.  Once loaded their code
    is resident, so concurrent eviction only makes a later load use source. *)
