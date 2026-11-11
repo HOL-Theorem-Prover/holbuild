@@ -1540,17 +1540,26 @@ async def test_a_rebuilt_theory_still_missing_fails_the_batch_naming_its_key(
     assert status["failure"] == f"resubmit: pkg:b is still missing pkg:a (theory {input_key('a')}) after 3 attempts"
 
 
+@pytest.mark.parametrize("log", ["raw", "compressed", "error"])
 async def test_a_theory_never_in_the_cache_after_it_built_fails_the_batch_naming_its_key(
-    http: httpx.AsyncClient,
+    http: httpx.AsyncClient, log: str,
 ) -> None:
     batch_id = await submit(http, ["a", "b"], [("b", "a")])
+    raw = f"log={'a' * 64} 12\n"
+    logs = {"raw": raw, "compressed": f"log-zstd={'b' * 64} 123 {'c' * 64} 456\n",
+            "error": "log-error=cache unavailable\n"}
     for _ in range(3):
         token = await claim_named(http, "a")
-        assert (await complete(http, token, result("a", "built"))).status_code == 200
+        record = result("a", "built").replace(raw, logs[log])
+        assert (await complete(http, token, record)).status_code == 200
 
     status = await batch(http, batch_id)
     assert status["state"] == "failed"
     assert status["failure"] == f"resubmit: pkg:a (theory {input_key('a')}) is not in the cache after it built"
+    action = next(a for a in status["actions"] if a["theory"] == "pkg:a")
+    assert (action["log_sha256"], action["log_zstd"], action["log_error"], action["failure_detail"]) == (
+        None, None, None, None
+    )
 
 
 async def test_cancel_revokes_leases_and_stops_claims(http: httpx.AsyncClient) -> None:
