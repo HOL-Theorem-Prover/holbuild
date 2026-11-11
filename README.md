@@ -2467,14 +2467,24 @@ against it:
 2. In each consumer, open a pull request that moves its pinned holbuild to
    the new tag, with whatever else the breaking change needs (a workflow
    edit for a changed option, say), and wait for its CI to pass.
-3. Then, in one go: publish the newest draft (`gh release edit vX.Y.Z
-   --draft=false --latest`; publish older pending drafts first with
-   `--latest=false`, or delete them), merge every consumer's pull request,
-   and update the installs and deployments that follow the latest release.
+3. Then, in one go: publish the newest draft, adding a line that starts
+   with `Consumers ready:` to its notes (`gh release edit vX.Y.Z
+   --draft=false --latest --notes-file notes.md`; publish older pending
+   drafts first the same way with `--latest=false`, or delete them), merge
+   every consumer's pull request, and update the installs and deployments
+   that follow the latest release.
 
-If a breaking release was published by mistake, turn it back into a draft
-(`gh release edit vX.Y.Z --draft=true`) so that nothing else adopts it, then
-roll back whatever already did, or finish the steps above at once.
+Publishing a release by hand runs a check of its own: a breaking release
+whose notes have no `Consumers ready:` line is turned back into a draft,
+with the reasons added to its notes, and the **Release binaries** run
+fails. It compares against the newest earlier release that was published
+more than an hour before it or carries that line, not one published
+moments ago whose own check may not have run yet. This covers drafts made
+before the tag was pushed, which the tag's run leaves as they are.
+
+If a breaking release was published by mistake anyway, turn it back into a
+draft (`gh release edit vX.Y.Z --draft=true`) so that nothing else adopts
+it, then roll back whatever already did, or finish the steps above at once.
 
 ## More detail
 
