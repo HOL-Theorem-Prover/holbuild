@@ -199,31 +199,6 @@ fun read_lines path =
     lines
   end
 
-fun take_token s =
-  let
-    fun loop i =
-      if i >= size s then i
-      else
-        case String.sub(s, i) of
-            #" " => i
-          | #"\t" => i
-          | #"\n" => i
-          | _ => loop (i + 1)
-    val n = loop 0
-  in
-    String.substring(s, 0, n)
-  end
-
-fun blob_ref line =
-  let val clean = trim_newline line
-  in
-    case String.tokens Char.isSpace clean of
-        ["blob", _, hash] => SOME hash
-      | _ =>
-          if has_prefix "blob=" clean then SOME (take_token (String.extract(clean, 5, NONE)))
-          else NONE
-  end
-
 fun empty_blob_set () = Redblackset.empty String.compare
 
 fun add_blob (blob, blobs) = Redblackset.add(blobs, blob)
@@ -236,7 +211,7 @@ fun action_live_blobs action_dir =
     if path_exists manifest then
       List.foldl
         (fn (line, blobs) =>
-            case blob_ref line of
+            case HolbuildFSCacheBackend.blob_ref line of
                 NONE => blobs
               | SOME blob => add_blob (blob, blobs))
         (empty_blob_set ())
