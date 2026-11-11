@@ -1975,6 +1975,19 @@ priority work can delay lower priority batches. `--priority` requires
 for missing inputs; it does not change the batch being followed. Retain the
 same priority when reattaching; the recovery hint includes it.
 
+`build --remote-exec URL --speculative-loading[=N]` lets a theory load ahead
+of its parents. A worker with nothing ready to build may take a theory whose
+unbuilt parents are all running on other workers and have no unbuilt parents
+of their own. It loads everything else the theory needs, waits for those
+parents, and then builds (`exec-action --ahead-parent`). At most N theories of
+the batch wait like this at a time (1 to 64, default 16). Workers wait only
+when they have nothing else to do, so the batch never adds workers for them.
+A theory whose load ahead can't go on is built normally once its parents are
+built. That covers a parent that fails, a predicted parent manifest that
+doesn't match, or a parent that is late. The option costs worker time when a
+parent fails, and changes no cache keys. Like `--priority`, it applies to
+replacement batches with `--attach`, and the recovery hint includes it.
+
 `build --remote-exec URL` hands the theories the remote cache lacks, and
 that aren't already built here, to a remote-execution coordinator, which runs them on its workers with
 `exec-action`, then restores them as an ordinary build would:

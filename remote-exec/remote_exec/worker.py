@@ -45,6 +45,7 @@ RELEASE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 COMPLETE = ".complete"  # stamp file of a finished release build
 MIN_SANDBOX_RELEASE = (0, 13, 58)
 MIN_TOOLCHAIN_SANDBOX_RELEASE = (0, 14, 0)
+MIN_AHEAD_RELEASE = (0, 14, 26)  # the first whose exec-action takes --ahead-parent
 
 
 @functools.cache
@@ -245,7 +246,10 @@ class Coordinator:
     def claim(self, tiers: list[str], worker: str, wait_s: float, phases: dict[str, float]) -> dict[str, Any] | None:
         """An action, waiting up to ``wait_s`` seconds for one, or None. ``phases`` reports where the worker's time
         went since its last claim."""
-        body = {"tier": tiers[0], "also_claim": tiers[1:], "worker": worker, "wait_s": wait_s, "phases": phases}
+        body = {
+            "tier": tiers[0], "also_claim": tiers[1:], "worker": worker, "wait_s": wait_s, "phases": phases,
+            "ahead": True,
+        }
         status, response = self.post_reporting("/v1/work/claim", body, 30 + wait_s)
         if status == 204:
             return None
@@ -758,7 +762,8 @@ def exec_action_env(*, version: str, discovery_config: str | None = None) -> dic
 
 
 def exec_action_command(
-    args: argparse.Namespace, holbuild: str, spec: str, result: str, max_heap_mb: int | None
+    args: argparse.Namespace, holbuild: str, spec: str, result: str, max_heap_mb: int | None,
+    ahead_parents: list[dict[str, str]],
 ) -> list[str]:
     command = [holbuild, "--remote-cache", args.remote_cache]
     command += ["--max-heap", str(args.max_heap if max_heap_mb is None else max_heap_mb)]
@@ -767,6 +772,8 @@ def exec_action_command(
     command += ["exec-action", spec, "--cache-limit-gb", str(args.cache_limit_gb), "--result", result]
     if args.share_heaps:
         command.append("--share-heaps")
+    for parent in ahead_parents:
+        command += ["--ahead-parent", f"{parent['input_key']}:{parent['spec_sha256']}"]
     return command
 
 
@@ -906,11 +913,14 @@ def execute(
     drain.publish_seconds = 0.0
     if drain.stop.is_set():
         return failed_record(spec, "unavailable")
+    ahead_parents = claim.get("ahead_parents", [])
     try:
         with phases.timed("release"):
             version = releases.spec_version(spec)
             if drain.stop.is_set():
                 return failed_record(spec, "unavailable")
+            if ahead_parents and RELEASE.fullmatch(version) and tuple(map(int, version.split("."))) < MIN_AHEAD_RELEASE:
+                return failed_record(spec, "ahead-abandoned", f"holbuild {version} predates loading ahead")
             holbuild = releases.holbuild(version)
     except DrainStopped:
         return failed_record(spec, "unavailable")
@@ -928,7 +938,7 @@ def execute(
         spans = ExecSpans()
         stepped = time.monotonic()
         process = subprocess.Popen(
-            exec_action_command(args, holbuild, spec, result, claim.get("max_heap_mb")),
+            exec_action_command(args, holbuild, spec, result, claim.get("max_heap_mb"), ahead_parents),
             env=exec_action_env(version=version, discovery_config=releases.discovery_config),
             start_new_session=True
         )

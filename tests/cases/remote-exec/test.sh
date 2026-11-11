@@ -241,8 +241,9 @@ require_grep "could not cancel remote batch b4 (HTTP 503)" "$tmpdir/down.log"
 require_grep "the coordinator reported no theories; building locally" "$tmpdir/down.log"
 require_grep "BTheory built" "$tmpdir/down.log"
 write_theories five-down-only
-run down-only 75 build --remote-exec "$coordinator" --remote-only --priority 17 BTheory
-require_grep "the coordinator reported no theories; reattach with --attach b5 --priority 17$" "$tmpdir/down-only.log"
+run down-only 75 build --remote-exec "$coordinator" --remote-only --priority 17 --speculative-loading=5 BTheory
+require_grep "the coordinator reported no theories; reattach with --attach b5 --priority 17 --speculative-loading=5$" \
+  "$tmpdir/down-only.log"
 refute_grep "^POST /v1/batches/b5/cancel " "$state/requests.log"
 rm "$state/down"
 run unknown-only 75 build --remote-exec "$coordinator" --remote-only --attach nope BTheory
@@ -2004,6 +2005,28 @@ if in_copy local-cas build --priority 1 PriorityTheory > "$tmpdir/priority-no-ex
   exit 1
 fi
 require_grep 'priority needs --remote-exec URL' "$tmpdir/priority-no-exec.log"
+
+# So is the cap on theories loading ahead of their parents, 16 when not given.
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --detach --speculative-loading LocalUntrustedTheory > "$tmpdir/speculative-default.log" 2>&1
+require_grep '^POST /v1/batches?speculative_loading=16 ' "$state/requests.log"
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --detach --priority 2 --speculative-loading=4 LocalUntrustedTheory > "$tmpdir/speculative.log" 2>&1
+require_grep '^POST /v1/batches?priority=2&speculative_loading=4 ' "$state/requests.log"
+for value in 0 65 1.5 x ''; do
+  if in_copy local-cas build --remote-exec "$coordinator" "--speculative-loading=$value" PriorityTheory \
+       > "$tmpdir/speculative-invalid.log" 2>&1; then
+    echo "accepted invalid --speculative-loading=$value" >&2
+    exit 1
+  fi
+  require_grep "^holbuild: invalid --speculative-loading: $value; expected an integer between 1 and 64$" \
+    "$tmpdir/speculative-invalid.log"
+done
+if in_copy local-cas build --speculative-loading PriorityTheory > "$tmpdir/speculative-no-exec.log" 2>&1; then
+  echo 'accepted --speculative-loading without remote execution' >&2
+  exit 1
+fi
+require_grep 'speculative-loading needs --remote-exec URL' "$tmpdir/speculative-no-exec.log"
 
 # Reattaching can need a replacement batch after an input disappears.
 cat > "$tmpdir/local-cas/src/PriorityChildScript.sml" <<'SML'
