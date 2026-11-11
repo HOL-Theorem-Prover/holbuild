@@ -2430,10 +2430,7 @@ tagged before it is published are drafts.
    the change to `master`.
 2. Run the key inventory above against your consumers, with holbuild built
    at the commit to be tagged.
-3. On the exact `master` commit to be tagged, ensure **CI** and **Release
-   binaries** have passed. The latter must include both platform builds and
-   their smoke checks. If the version bump changed the commit, wait for the
-   checks on the new commit.
+3. Ensure **CI** has passed on the exact `master` commit to be tagged.
 4. Create and push an annotated tag on that checked commit:
 
    ```sh
@@ -2452,8 +2449,8 @@ tagged before it is published are drafts.
    otherwise published. An existing release (including a draft) retains its
    notes and publication state.
 
-The workflow also checks packaging on every `master` push and relevant pull
-requests without publishing anything. To rebuild assets, rerun the tag's
+The workflow also checks packaging on relevant pull requests without
+publishing anything. To rebuild assets, rerun the tag's
 workflow; uploads replace assets with the same names. A manual workflow run
 only builds and tests; publication requires a version-tag push.
 
