@@ -233,11 +233,15 @@ fun stage_cache stage_dir {source, entries, targets, metadata} =
   in
     ensure_dir payload;
     HolbuildFSCacheBackend.ensure_layout cache;
-    ignore (HolbuildCacheTransfer.copy_entries
-              {source = source,
-               destination = fs_destination cache,
-               tmp_dir = HolbuildFSCacheBackend.tmp_dir cache}
-              keys);
+    (* The stage is removed whether or not the copy finishes; a growth
+       journal appended at exit would recreate it. *)
+    (ignore (HolbuildCacheTransfer.copy_entries
+               {source = source,
+                destination = fs_destination cache,
+                tmp_dir = HolbuildFSCacheBackend.tmp_dir cache}
+               keys)
+     handle e => (HolbuildFSCacheBackend.discard_growth cache; raise e));
+    HolbuildFSCacheBackend.discard_growth cache;
     write_package_index payload entries;
     write_text (manifest_path payload) (manifest_text {keys = keys, targets = targets, metadata = metadata})
   end
@@ -364,21 +368,31 @@ fun part_members names part =
 fun checked_names archive_path =
   tar_operation (fn () => HolbuildTar.checked_names archive_path)
 
+(* A fresh staging directory under `parent`; unlike ensure_dir, a failure to
+   make it is reported, since it is not the archive's fault. *)
+fun make_stage_dir parent =
+  let val dir = HolbuildTempPath.near (Path.concat(parent, "import")) ".d"
+  in
+    (ensure_dir parent; FS.mkDir dir; dir)
+    handle OS.SysErr (msg, _) =>
+      raise Error ("could not create staging directory " ^ dir ^ ": " ^ msg)
+  end
+
 (* Only the cache part and the capsule manifest are unpacked, so a capsule's
-   source files are never written. *)
-fun with_entries {archive_path, f} =
+   source files are never written. They are staged under `stage_parent`, not
+   beside the archive, which may be in a read-only directory. *)
+fun with_entries {archive_path, stage_parent, f} =
   let
     val names = checked_names archive_path
     val manifest_member = Path.concat(package_part, "manifest")
     val cache_members = part_members names payload_dir
     val wanted = cache_members @ part_members names manifest_member
-    val stage_dir = temp_dir_near archive_path
+    val stage_dir = make_stage_dir stage_parent
     val payload = Path.concat(stage_dir, payload_dir)
     val cache = HolbuildFSCacheBackend.filesystem payload
     fun cleanup () = remove_tree stage_dir handle _ => ()
   in
-    (ensure_dir stage_dir;
-     if null wanted then ()
+    (if null wanted then ()
      else tar_operation (fn () => HolbuildTar.extract_members
             {archive_path = archive_path, destination = stage_dir, members = wanted});
      let
@@ -392,8 +406,9 @@ fun with_entries {archive_path, f} =
     handle e => (cleanup (); raise e)
   end
 
-fun with_reader {archive_path, f} =
-  with_entries {archive_path = archive_path, f = fn {source, ...} => f source}
+fun with_reader {archive_path, stage_parent, f} =
+  with_entries {archive_path = archive_path, stage_parent = stage_parent,
+                f = fn {source, ...} => f source}
 
 type capsule_identity =
   {name : string,
