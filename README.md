@@ -563,7 +563,8 @@ command.
 
 `check` builds the theories, and any `[run].loads`, without proof steps or
 checkpoints: it applies no step timeout (that is `build`'s check) and reuses
-theories built by `holbuild build --skip-proof-steps`. The tags are those
+theories built by `holbuild build --skip-proof-steps`. Plain checks do not execute
+`[run].loads`; fingerprint modes load them in HOL. The tags are those
 recorded in the built theory, which may have been restored from a cache;
 run `holbuild build --no-cache MyTheory` first to check a fresh build.
 
