@@ -49,34 +49,44 @@ fun unavailable_owner () =
      "pid=unknown",
      "cwd=unknown"] ^ "\n"
 
-fun acquire project command =
+fun try_acquire project command =
   let
     val lock_path = project_lock_path project
   in
     case HolbuildFileLock.try_acquire_path {path = lock_path, obsolete_kind = SOME "project"} of
         SOME lock =>
           ((write_text (project_lock_owner_path lock_path) (project_lock_owner command);
-            ProjectLock lock)
+            SOME (ProjectLock lock))
            handle e => (HolbuildFileLock.release lock; raise e))
-      | NONE =>
-          let val owner = Option.getOpt(current_lock_owner lock_path, unavailable_owner ())
-          in raise project_lock_error lock_path owner end
+      | NONE => NONE
   end
   handle HolbuildFileLock.Error msg =>
     raise Error ("could not acquire project lock for " ^ command ^ ": " ^ msg)
+
+fun acquire project command =
+  case try_acquire project command of
+      SOME lock => lock
+    | NONE =>
+        let
+          val lock_path = project_lock_path project
+          val owner = Option.getOpt(current_lock_owner lock_path, unavailable_owner ())
+        in raise project_lock_error lock_path owner end
 
 fun release (ProjectLock lock) =
   (remove_file (project_lock_owner_path (HolbuildFileLock.path lock));
    HolbuildFileLock.release lock)
 
-fun with_lock project command f =
-  let val lock = acquire project command
-  in
-    (f () before release lock)
-    handle e =>
-      (HolbuildToolchain.cleanup_active_children ();
-       release lock;
-       raise e)
-  end
+fun with_held_lock lock f =
+  (f () before release lock)
+  handle e =>
+    (HolbuildToolchain.cleanup_active_children ();
+     release lock;
+     raise e)
+
+fun with_lock project command f = with_held_lock (acquire project command) f
+
+(* NONE, without running f, while another process holds the lock. *)
+fun try_with_lock project command f =
+  Option.map (fn lock => with_held_lock lock f) (try_acquire project command)
 
 end

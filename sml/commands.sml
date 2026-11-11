@@ -2221,6 +2221,26 @@ fun split_build_priority args =
     loop NONE [] args
   end
 
+(* After a command that built or imported, outside its project lock: the
+   project's automatic GC (when FIND_PROJECT finds one), then the cache's. The
+   command has already succeeded, so a project that no longer loads only
+   skips automatic GC with a warning. *)
+fun auto_gc find_project =
+  let
+    val project_option = find_project ()
+    val {auto, cache_gb, project_builds} =
+      case project_option of
+          SOME project => HolbuildLocalConfig.gc (HolbuildProject.local_config project)
+        | NONE => HolbuildLocalConfig.default_gc
+  in
+    if not auto orelse OS.Process.getEnv "HOLBUILD_AUTO_GC" = SOME "0" then ()
+    else
+      (Option.app (fn project => HolbuildBuildExec.auto_project_gc project project_builds) project_option;
+       HolbuildBuildExec.auto_cache_gc (Position.fromInt cache_gb * 1073741824))
+  end
+  handle Error msg => warn ("automatic gc skipped: " ^ msg)
+       | e => warn ("automatic gc skipped: " ^ General.exnMessage e)
+
 fun build tc cli_jobs args =
   let
     val _ = HolbuildDiagnosticLimits.validate ()
@@ -2251,12 +2271,15 @@ fun build tc cli_jobs args =
   in
     case url of
         SOME url =>
-          build_once_with_prepared_mode
-            (RemoteExec {url = url, remote_only = remote_only, detach = detach, attach = attach, priority = priority})
-            tc cli_jobs NONE parsed
+          (build_once_with_prepared_mode
+             (RemoteExec {url = url, remote_only = remote_only, detach = detach, attach = attach, priority = priority})
+             tc cli_jobs NONE parsed;
+           if detach then () else auto_gc (SOME o load_project))
       | NONE =>
           if watch then build_watch tc cli_jobs parsed
-          else build_once tc cli_jobs parsed
+          else
+            (build_once tc cli_jobs parsed;
+             if dry_run orelse Option.isSome execution_plan then () else auto_gc (SOME o load_project))
   end
 
 fun chomp text =
@@ -2596,7 +2619,13 @@ fun import_archive args =
             end
         in
           HolbuildCacheArchive.with_entries {archive_path = archive_path, f = copy};
-          print ("imported " ^ Int.toString (!result_count) ^ " cache action(s) from " ^ archive_path ^ "\n")
+          print ("imported " ^ Int.toString (!result_count) ^ " cache action(s) from " ^ archive_path ^ "\n");
+          (* Run inside a project, its [gc] settings apply; one that does not
+             load skips automatic GC rather than falling back to the defaults. *)
+          auto_gc (fn () =>
+                     case HolbuildProject.find_manifest_from (HolbuildProject.source_dir ()) of
+                         NONE => NONE
+                       | SOME _ => SOME (load_project ()))
         end
     | _ => raise Error "usage: holbuild import FILE"
 
@@ -2706,7 +2735,8 @@ fun build_heap_kind tc cli_jobs command args =
         HolbuildBuildExec.export_heap tc project plan output_path kind
       end
   in
-    HolbuildBuildExec.with_project_lock project (command ^ " " ^ target) execute_heap
+    HolbuildBuildExec.with_project_lock project (command ^ " " ^ target) execute_heap;
+    auto_gc (fn () => SOME project)
   end
 
 fun build_heap tc cli_jobs args = build_heap_kind tc cli_jobs "heap" args
