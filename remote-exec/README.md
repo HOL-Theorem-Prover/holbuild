@@ -408,6 +408,14 @@ fails with an action whose result has a `detail` gives it in its `failure`:
 `<package>:<theory>: <failure class>: <detail>`. A batch-level `deadline` or `resubmit` failure still ends
 a run batch and cancels its unfinished actions.
 
+A worker-local action manifest can outlive one of its payload blobs. During
+restoration, workers fetch a missing or corrupt local payload from the remote
+cache by the hash already named in the validated manifest, then verify and
+store those bytes locally. If the remote also lacks the blob, the unchanged
+local manifest is discarded and the dependency is reported as `input-missing`
+with its theory key. A later attempt can then hydrate a replacement entry.
+This recovery preserves manifest, timeout, parent-hash and load-order checks.
+
 ## Scheduling rules
 
 - **Release.** When all of an action's parents are done, the coordinator
