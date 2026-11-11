@@ -1742,7 +1742,10 @@ with no `log` (a spec rejected before any HOL ran, say) gives its message in
 For a run, `input-key` is its run key and `built` means it ran.
 `phase-ms` gives the wall time of each phase that ran, in order: `cap` (the
 cache cap sweep), `spec`, `toolchain`, `hydrate` (sources, libraries and
-dependencies), `cutoff` (whether an earlier build stands), `restore` (shared
+dependencies; its steps follow it, and are part of it: `hydfiles` the
+sources and libraries, `hyddeps` restoring the dependencies, `hydstale`
+probing the remote cache for stale dependency copies, `hydmisfit` checking
+the dependencies against their parents), `cutoff` (whether an earlier build stands), `restore` (shared
 checkpoints), `toolrestore` (the tool cache), `hol`, `publish` (shared
 checkpoints), `toolpublish` (the tool cache), `check` (the publication
 checks) and `log`; stderr ends with the same times and `wall`.
