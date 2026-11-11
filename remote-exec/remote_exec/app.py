@@ -15,7 +15,6 @@ from uuid import UUID
 
 import sqlalchemy as sa
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
-from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, SecretStr
 
@@ -199,7 +198,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
                     for action in actions:
                         if seen.get(action.input_key) != action:
                             seen[action.input_key] = action
-                            yield json.dumps(jsonable_encoder({"type": "action", **asdict(action)})) + "\n"
+                            yield json.dumps({"type": "action", **asdict(action)}) + "\n"
                             last_line = time.monotonic()
                     if batch.state != "running":
                         yield json.dumps({"type": "batch", "state": batch.state, "failure": batch.failure}) + "\n"
