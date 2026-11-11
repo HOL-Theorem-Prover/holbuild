@@ -2329,13 +2329,18 @@ fallback remains valid.
 
 Maintainer checklist:
 
-1. Ensure CI is green on `master`.
-2. Bump `HolbuildVersion.version` in `sml/version.sml` if needed.
-3. Create and push an annotated tag:
+1. Bump `HolbuildVersion.version` in `sml/version.sml` if needed and merge
+   the change to `master`.
+2. On the exact `master` commit to be tagged, ensure **CI** and **Release
+   binaries** have passed. The latter must include both platform builds and
+   their smoke checks. If the version bump changed the commit, wait for the
+   checks on the new commit.
+3. Create and push an annotated tag on that checked commit:
 
    ```sh
    version=X.Y.Z
-   git tag -a "v$version" -m "holbuild v$version"
+   commit=FULL_CHECKED_MASTER_COMMIT_SHA
+   git tag -a "v$version" "$commit" -m "holbuild v$version"
    git push origin "v$version"
    ```
 
@@ -2347,10 +2352,10 @@ Maintainer checklist:
    its notes and publication state. Summarise user-visible changes in those
    notes, and publish the draft if you prepared one.
 
-The workflow also checks packaging on relevant pull requests without
-publishing anything. To rebuild assets, rerun the tag's workflow; uploads
-replace assets with the same names. A manual workflow run only builds and
-tests; publication requires a version-tag push.
+The workflow also checks packaging on every `master` push and relevant pull
+requests without publishing anything. To rebuild assets, rerun the tag's
+workflow; uploads replace assets with the same names. A manual workflow run
+only builds and tests; publication requires a version-tag push.
 
 ## More detail
 
