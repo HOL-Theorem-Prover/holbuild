@@ -142,10 +142,6 @@ fun validate_extra_output_ownership analysis selected =
     ()
   end
 
-fun has_logical_name name node = logical_name node = name
-
-fun nodes_named nodes name = List.filter (has_logical_name name) nodes
-
 type name_index = (string * node list) Vector.vector
 
 (* Halving by position keeps sort_pairs stable: equal keys stay in input order. *)
@@ -401,9 +397,6 @@ fun signature_companion_deps_with lookup node =
           (lookup (logical_name node))
     | _ => []
 
-fun signature_companion_deps nodes node =
-  signature_companion_deps_with (nodes_named nodes) node
-
 fun bootstrap_project_deps components analysis lookup nodes node =
   let
     fun not_self candidate = key candidate <> key node
@@ -623,16 +616,6 @@ fun forget_output_digest (plan as {output_digest_cache, ...} : t) node =
 
 fun forget_output_digests ({output_digest_cache, ...} : t) =
   Array.modify (fn _ => NONE) output_digest_cache
-
-fun closure_external_theories plan node =
-  unique_strings
-    (List.concat (map (direct_external_theories plan)
-       (transitive_project_deps plan node @ [node])))
-
-fun closure_external_libs plan node =
-  unique_strings
-    (List.concat (map (direct_external_libs plan)
-       (transitive_project_deps plan node @ [node])))
 
 fun make_node external_dirs source =
   {source = source, external_dirs = external_dirs}
@@ -879,11 +862,6 @@ fun selected_plan_text graph_id roots selected =
 
 fun selected_plan_identity graph_id roots selected =
   HolbuildHash.string_sha256 (selected_plan_text graph_id roots selected)
-
-fun selected_graph_canonical_text plan =
-  selected_graph_text (selected_nodes plan) (dependency_graph plan)
-fun selected_plan_canonical_text plan =
-  selected_plan_text (selected_graph_id plan) (root_nodes plan) (selected_nodes plan)
 
 fun reject_graph_unresolved (graph : resolved_dependency_graph) selected =
   let
