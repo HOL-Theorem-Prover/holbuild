@@ -2367,9 +2367,10 @@ It plans the project with `action-spec` under both binaries, building
 nothing, and lists the theories the published release can restore from the
 remote cache but the candidate can't. Pass the consumer's own build flags
 and targets (`--skip-proof-steps`, say), since they select the cache entries.
-If it lists any theory, the release is breaking: create its draft before
-pushing the tag (`gh release create vX.Y.Z --draft --target <commit>
---title vX.Y.Z --notes '...'`), and the workflow keeps it a draft.
+If it lists any theory, the release is breaking: record that with a
+`Breaking-change:` trailer on a commit of the release before tagging (the
+version bump, or an empty commit), so that this release and every later one
+tagged before it is published are drafts.
 
 ### Steps
 
