@@ -193,22 +193,12 @@ is `/var/cache/holbuild` in the image. It must be the worker's own cache root:
 `exec-action --cache-limit-gb` sweeps the whole root before each action, so a
 root shared with ordinary builds would lose their cache. Containers on one host
 may share cache directories, provided they also share `locks/`: cap sweeps and
-explicit cache GC use its `gc.lock`. With a positive reserve and a target of
-at least 64 GiB, actions reuse shared byte measurements for 60 seconds when
-shared and private sizes fit the target. An older fitting estimate can defer
-the scan for five minutes from its first reuse, after waiting for `gc.lock`
-and rechecking the estimate. Idle time does not consume this grace. Private
-checkpoints and theory modules are sized on every call; a cached directory
-must match its recorded device and inode, and differing directories are
-sized live. Smaller targets and zero-reserve runs always scan live.
-
-After reporting its result, an action refreshes a measurement older than
-30 seconds. Read-only refreshes share a separate single-flight lock and
-briefly try `gc.lock` to publish only if the previous stamp and root
-identities still match. A refresh that finds an over-target cache waits for
-`gc.lock` and enforces the cap. Measurements are dated at scan completion;
-concurrent writes during scans and reuse are accounted for by later scans,
-so the cap is not a hard bound on transient growth. `exec-action` runs
+explicit cache GC use its `gc.lock`. With a positive reserve and a target of at least 64 GiB, actions
+reuse shared byte measurements for up to 60 seconds when shared and private
+sizes fit the target, while sizing private checkpoints and theory modules on
+each call. A cached directory must match the recorded device
+and inode; other directories are sized live. Smaller targets and zero-reserve runs always scan live. Shared writes
+during the reuse interval are accounted for at the next scan. `exec-action` runs
 with the worker's `HOLBUILD_*` build settings, `PATH`, `HOME`, `TMPDIR`, the
 locale, curl's certificate and proxy settings, and the solver locations HOL's
 libraries read (`HOL4_Z3_EXECUTABLE`, `HOL4_CVC_EXECUTABLE`,

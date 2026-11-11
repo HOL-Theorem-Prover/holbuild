@@ -1810,7 +1810,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                            ("holbuild: remote execution: " ^ reason ^ "; resubmitting" ^
                             (if null forced then ""
                              else " with " ^ Int.toString (length forced) ^ " theories rebuilt or rechecked") ^ "\n");
-                         HolbuildBuildExec.forget_remote_ledger project;
+                         HolbuildBuildExec.forget_remote_ledger ();
                          (* Their local entries may be the ones that don't fit. *)
                          HolbuildBuildExec.drop_local_cache_entries forced;
                          export_and_submit false forced)
