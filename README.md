@@ -1281,9 +1281,16 @@ For each `/ac/<digest>` or `/cas/<digest>` request, nodes rank by descending
 SHA256 of `node identity + ":" + digest` (ascending identity breaks a tie). Only the first two
 nodes are tried. Reads try the second node after a 404, connection failure,
 timeout, 429 or 5xx; writes do so after a connection failure, timeout, 429 or
-5xx. A theory's `/ac` read also tries the second node when the first one's
+5xx. A theory's `/ac` read also tries the next node when the first one's
 entry was built under a weaker tactic-timeout contract than the build asks for,
-so a stale replica can't hide a stronger entry on the other node. A write whose nodes all failed without an HTTP response (an unresolvable
+continuing through the current ring after such a rejected entry. Ordinary
+404 misses remain bounded to two nodes. When publishing or confirming an
+existing timed theory, workers also strengthen older compatible manifests on
+reachable replicas, so a reader with a narrower cache view can restore the
+result. This repair preserves stronger contracts, does not create missing
+replicas, and never changes manifests whose outputs differ. Secondary repair
+failures warn without failing successful primary publication; timeout checks
+still apply on every restore. A write whose nodes all failed without an HTTP response (an unresolvable
 name, no connection, a timeout) goes on down the ranking until a node answers,
 so one more healthy node takes it. A single-node list keeps the ordinary single-cache behavior. A successful
 backup keeps the ring available; the circuit breaker below counts the final
