@@ -450,15 +450,9 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   Run admission is serialized across coordinator replicas and permits at
   most `REMOTE_EXEC_RUN_SLOTS` running run actions fleet-wide; 0 pauses new
   runs without stopping actions already running. An unlocked precheck
-  bypasses run admission when its floor or cap is full or no compatible run
-  is ready. Within one process, run claims queue before taking a database
-  connection, so at most one connection waits for the cross-replica
-  admission lock. Capacity is checked again under that lock before ranking
-  run candidates. Build claims share a ranking read per accepted tier list;
-  empty rankings remain valid for `REMOTE_EXEC_CLAIM_RANKING_SECONDS`
-  (0.5 s), and releases invalidate rankings that miss newly ready work.
-  Refreshing an exhausted ranking waits outside the claim transaction.
-  Set the floor back to 0 and restart the coordinator
+  bypasses run admission when the floor is full or no compatible run is
+  ready, keeping build claims concurrent. Capacity is checked again under
+  the admission lock. Set the floor back to 0 and restart the coordinator
   to restore strict build priority. Claims select with `FOR UPDATE SKIP LOCKED`,
   write a lease with an expiry and commit; no transaction stays open while
   the worker builds. Among running batches of the selected class and tier,

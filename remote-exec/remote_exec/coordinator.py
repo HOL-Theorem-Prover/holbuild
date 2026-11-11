@@ -10,6 +10,7 @@ import graphlib
 import heapq
 import json
 import logging
+import math
 import os
 import shlex
 import time
@@ -529,7 +530,7 @@ class Coordinator:
         self.claim_waiters: list[tuple[list[str], ClaimRank, asyncio.Future[str]]] = []
         self.rankings: dict[tuple[str, ...], _Ranking] = {}  # the build claims' shared rankings, by tiers
         self.ranking_reads: dict[tuple[str, ...], asyncio.Task[_Ranking]] = {}
-        self.run_admission = asyncio.Lock()  # wait before checkout; the DB advisory lock still spans replicas
+        self.rankings_reading: defaultdict[tuple[str, ...], int] = defaultdict(int)  # _rank calls under way, by tiers
         self.rankings_forgotten = 0  # how many times _forget_rankings dropped one, so reads begun before keep none
         # When each cache entry was last found, the checks of the cache under way, and how many times
         # input-missing results forgot both; see _in_cache.
@@ -776,78 +777,74 @@ class Coordinator:
             raise
 
     async def _claim(self, tiers: list[str], worker: str) -> Claim | None:
+        # Waited for before taking a connection: claims waiting on a ranking while holding one could leave none
+        # for the ranking's read.
         started = asyncio.get_running_loop().time()
-        key = tuple(tiers)
-        ranking = await self._current_ranking(key)
-        floor = min(self.settings.run_floor, self.settings.run_slots)
-        if floor > 0 and (claimed := await self._claim_run(tiers, worker, floor)) is not None:
-            return claimed
-        while True:
-            async with self.engine.begin() as conn:
-                # Never lock a batch after an action: batch writers take those locks in the opposite order.
-                row = await self._claim_build(conn, ranking)
-                if row is not None:
-                    claimed = await self._lease(conn, row, worker)
-            if row is not None:
-                self._batch_changed(row.batch_id)
-                return claimed
-            if not ranking.ranked or ranking.at >= started:
-                break
-            # Refresh outside the transaction: waiting here with a connection could starve the shared read.
-            if self.rankings.get(key) is ranking:
-                self.rankings.pop(key)
-            ranking = await self._current_ranking(key, after=started)
-        return await self._claim_run(tiers, worker, self.settings.run_slots)
-
-    async def _claim_run(self, tiers: list[str], worker: str, slots: int) -> Claim | None:
-        """Admit a run below ``slots``, queuing in this process before taking a pooled connection."""
-        if slots == 0:
-            return None
-        available = sa.text(
-            "SELECT EXISTS (SELECT 1 FROM actions WHERE state = 'ready' AND class = 'run' "
-            "AND tier = ANY(CAST(:tiers AS text[]))) AND "
-            "(SELECT count(*) FROM actions WHERE state = 'running' AND class = 'run') < :run_slots"
-        )
-        params = {"tiers": tiers, "classes": ["run"], "run_slots": slots}
-        async with self.engine.connect() as conn:
-            if not await conn.scalar(available, params):
-                return None
-        # Only one connection per process may wait for cross-replica run admission. Builds bypass this gate.
-        async with self.run_admission, self.engine.begin() as conn:
-            await conn.execute(sa.text("SELECT pg_advisory_xact_lock(1752132706, 1)"))
-            # A preceding admission may have filled the floor/cap; don't rank every batch again in that case.
-            if not await conn.scalar(available, params):
-                return None
-            row = await self._claim_first(conn, params)
+        try:
+            ranking = await self._current_ranking(tuple(tiers))
+        except Exception:
+            # The shared read failed (say the pool timed out): this claim ranks for itself, as if it had found the
+            # ranking used up, rather than every claim that waited for the read failing with it.
+            ranking = _Ranking(-math.inf, self.rankings_forgotten, [], set(), set())
+        async with self.engine.begin() as conn:
+            # A batch's running count and last claim are read without locking its row, so concurrent claims see
+            # only each other's committed leases, which at worst lets workers waking together pick the same
+            # batch. Locking or updating the batch row here, after the action row, would invert the lock order.
+            params = {"tiers": tiers, "classes": ["build"], "run_slots": self.settings.run_slots}
+            floor = min(self.settings.run_floor, self.settings.run_slots)
+            row = None
+            if floor > 0 and await conn.scalar(
+                sa.text(
+                    "SELECT EXISTS (SELECT 1 FROM actions WHERE state = 'ready' AND class = 'run' "
+                    "AND tier = ANY(CAST(:tiers AS text[]))) AND "
+                    "(SELECT count(*) FROM actions WHERE state = 'running' AND class = 'run') < :floor"
+                ),
+                {"tiers": tiers, "floor": floor},
+            ):
+                # Build claims bypass this lock when the floor is full or no compatible run is ready.
+                # CLAIM_CANDIDATES rechecks capacity in a fresh snapshot after any preceding run admission commits.
+                await conn.execute(sa.text("SELECT pg_advisory_xact_lock(1752132706, 1)"))
+                row = await self._claim_first(conn, {**params, "classes": ["run"], "run_slots": floor})
             if row is None:
-                return None
-            claimed = await self._lease(conn, row, worker)
+                row = await self._claim_build(conn, tiers, ranking, started)
+            if row is None:
+                if self.settings.run_slots == 0 or not await conn.scalar(
+                    sa.text(
+                        "SELECT EXISTS (SELECT 1 FROM actions WHERE state = 'ready' AND class = 'run' "
+                        "AND tier = ANY(CAST(:tiers AS text[])))"
+                    ),
+                    {"tiers": tiers},
+                ):
+                    return None
+                # Serialize only run admission, across replicas. The next statement gets a fresh snapshot
+                # after the preceding claimant commits, so its running run counts against the cap.
+                # This advisory key is reserved for run admission; no batch writer takes it.
+                await conn.execute(sa.text("SELECT pg_advisory_xact_lock(1752132706, 1)"))
+                row = await self._claim_first(conn, {**params, "classes": ["build", "run"]})
+                if row is None:
+                    return None
+            token = uuid4()
+            await conn.execute(
+                sa.text(
+                    "UPDATE actions SET state = 'running', attempts = attempts + 1, last_claimed_at = now() "
+                    "WHERE batch_id = :batch_id AND input_key = :input_key"
+                ),
+                {"batch_id": row.batch_id, "input_key": row.input_key},
+            )
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO leases (attempt_token, batch_id, input_key, worker, expires_at) "
+                    "VALUES (:token, :batch_id, :input_key, :worker, now() + make_interval(secs => :lease))"
+                ),
+                {
+                    "token": token,
+                    "batch_id": row.batch_id,
+                    "input_key": row.input_key,
+                    "worker": worker,
+                    "lease": self.settings.lease_seconds,
+                },
+            )
         self._batch_changed(row.batch_id)
-        return claimed
-
-    async def _lease(self, conn: AsyncConnection, row: _Claimed, worker: str) -> Claim:
-        """Record a lease for the action locked by this transaction."""
-        token = uuid4()
-        await conn.execute(
-            sa.text(
-                "UPDATE actions SET state = 'running', attempts = attempts + 1, last_claimed_at = now() "
-                "WHERE batch_id = :batch_id AND input_key = :input_key"
-            ),
-            {"batch_id": row.batch_id, "input_key": row.input_key},
-        )
-        await conn.execute(
-            sa.text(
-                "INSERT INTO leases (attempt_token, batch_id, input_key, worker, expires_at) "
-                "VALUES (:token, :batch_id, :input_key, :worker, now() + make_interval(secs => :lease))"
-            ),
-            {
-                "token": token,
-                "batch_id": row.batch_id,
-                "input_key": row.input_key,
-                "worker": worker,
-                "lease": self.settings.lease_seconds,
-            },
-        )
         return Claim(token, row.spec_sha256, row.input_key, row.theory, self.settings.lease_seconds, row.max_heap_mb)
 
     @staticmethod
@@ -864,72 +861,77 @@ class Coordinator:
                 return _Claimed(candidate.batch_id, row.input_key, row.spec_sha256, row.theory, candidate.max_heap_mb)
         return None
 
-    async def _claim_build(self, conn: AsyncConnection, ranking: "_Ranking") -> _Claimed | None:
-        """Lock a ready build from the shared ranking, without refreshing it inside the transaction.
+    async def _claim_build(
+        self, conn: AsyncConnection, tiers: list[str], ranking: "_Ranking", started: float
+    ) -> _Claimed | None:
+        """Lock a ready build action of ``tiers`` in the order of CLAIM_CANDIDATES, taken from ``ranking``, which
+        the build claims of ``claim_ranking_seconds`` share, so that the ranking, which probes every running batch,
+        isn't repeated by every claim.
 
-        Put each candidate back with one more running action before trying it, so concurrent claims spread over
-        batches as fresh rankings would. Exhausted batch/tier pairs are skipped until the next shared read.
+        Each claim takes the best batch of the ranking and puts it back as if it had one more running action and
+        had just had one claimed, before it tries the batch, so concurrent claims spread over the batches as fresh
+        rankings would spread them. A batch and tier found without an unlocked ready action are skipped until the
+        next ranking; when every one is, and the ranking is older than the claim, which ``started`` then, the claim
+        ranks again on ``conn``, for actions made ready since.
         """
-        while ranking.heap:
-            entry = heapq.heappop(ranking.heap)
-            tier_position, priority, running, _, _, created_at, batch_id, tier, max_heap_mb = entry
-            if (batch_id, tier) in ranking.exhausted:
-                continue
-            heapq.heappush(
-                ranking.heap,
-                (tier_position, priority, running + 1, True, self.clock(), created_at, batch_id, tier, max_heap_mb),
-            )
-            row = (
-                await conn.execute(CLAIM_ACTION, {"batch_id": batch_id, "class": "build", "tier": tier})
-            ).first()
-            if row is not None:
-                return _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, max_heap_mb)
-            ranking.exhausted.add((batch_id, tier))
-        return None
-
-    async def _current_ranking(self, key: tuple[str, ...], *, after: float = 0) -> "_Ranking":
-        """Share one read per tier key, fresh enough for invalidations seen on entry and ``after``.
-
-        An empty ranking stays valid for the TTL, until a release invalidates it. An exhausted nonempty ranking
-        needs a new read. A release during a read leaves it shared, but callers arriving after the release wait
-        for it outside the pool and then share another read that includes the newly ready actions.
-        """
-        forgotten = self.rankings_forgotten
         while True:
-            ranking = self.rankings.get(key)
-            if (
-                ranking is not None and ranking.forgotten >= forgotten
-                and asyncio.get_running_loop().time() - ranking.at < self.settings.claim_ranking_seconds
-                and (ranking.heap or not ranking.ranked) and (ranking.at >= after or not ranking.ranked)
-            ):
-                return ranking
-            read = self.ranking_reads.get(key)
-            if read is None:
+            while ranking.heap:
+                entry = heapq.heappop(ranking.heap)
+                tier_position, priority, running, _, _, created_at, batch_id, tier, max_heap_mb = entry
+                if (batch_id, tier) in ranking.exhausted:
+                    continue
+                heapq.heappush(
+                    ranking.heap,
+                    (tier_position, priority, running + 1, True, self.clock(), created_at, batch_id, tier, max_heap_mb),
+                )
+                row = (
+                    await conn.execute(CLAIM_ACTION, {"batch_id": batch_id, "class": "build", "tier": tier})
+                ).first()
+                if row is not None:
+                    return _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, max_heap_mb)
+                ranking.exhausted.add((batch_id, tier))
+            if ranking.at >= started:
+                return None
+            ranking = await self._rank(conn, tuple(tiers))
+            self._keep_ranking(tuple(tiers), ranking)
 
-                async def rank() -> _Ranking:
-                    async with self.engine.connect() as conn:
-                        return await self._rank(conn, key)
+    async def _current_ranking(self, key: tuple[str, ...]) -> "_Ranking":
+        """The build claims' ranking for the tiers ``key``: the last one if younger than ``claim_ranking_seconds``,
+        else a new one, which concurrent callers wait for together."""
+        ranking = self.rankings.get(key)
+        if ranking is not None and asyncio.get_running_loop().time() - ranking.at < self.settings.claim_ranking_seconds:
+            return ranking
+        read = self.ranking_reads.get(key)
+        if read is None:
 
-                read = asyncio.get_running_loop().create_task(rank())
-                self.ranking_reads[key] = read
+            async def rank() -> _Ranking:
+                async with self.engine.connect() as conn:
+                    return await self._rank(conn, key)
 
-                def done(task: asyncio.Task[_Ranking]) -> None:
-                    if self.ranking_reads.get(key) is task:
-                        del self.ranking_reads[key]
-                    if not task.cancelled() and task.exception() is None:
-                        self._keep_ranking(key, task.result())
+            read = asyncio.get_running_loop().create_task(rank())
+            self.ranking_reads[key] = read
 
-                read.add_done_callback(done)
-            # Cancellation belongs to the caller; the read still serves other claims.
-            ranking = await asyncio.shield(read)
-            if ranking.forgotten >= forgotten and (ranking.at >= after or not ranking.ranked):
-                return ranking
+            def done(_: object) -> None:
+                if self.ranking_reads.get(key) is read:
+                    del self.ranking_reads[key]
+                if not read.cancelled() and read.exception() is None:
+                    self._keep_ranking(key, read.result())
+
+            read.add_done_callback(done)
+        # Shielded, so a caller cancelled leaves the read to the others.
+        return await asyncio.shield(read)
 
     async def _rank(self, conn: AsyncConnection, key: tuple[str, ...]) -> "_Ranking":
         at = asyncio.get_running_loop().time()
         forgotten = self.rankings_forgotten
         params = {"tiers": list(key), "classes": ["build"], "run_slots": self.settings.run_slots}
-        rows = (await conn.execute(CLAIM_CANDIDATES, params)).all()
+        self.rankings_reading[key] += 1
+        try:
+            rows = (await conn.execute(CLAIM_CANDIDATES, params)).all()
+        finally:
+            self.rankings_reading[key] -= 1
+            if not self.rankings_reading[key]:
+                del self.rankings_reading[key]
         heap = [
             (
                 key.index(row.tier), -row.priority, row.running, row.last_claimed_at is not None,
@@ -949,12 +951,12 @@ class Coordinator:
     def _forget_rankings(self, batch_id: UUID, tiers: set[str]) -> None:
         """Drop the rankings that would pass over actions of ``tiers`` made ready in ``batch_id``: those that didn't
         have it with a ready action of one of them, or have since found it without one. Rankings being read then,
-        may predate those actions. Keep the in-flight read shared; later callers require a post-release read
-        after it finishes, and _keep_ranking discards its stale result."""
-        keys = {key for key in [*self.rankings, *self.ranking_reads] if tiers.intersection(key)}
+        shared or by one claim, may predate those actions, so they are neither joined by later claims nor kept; see
+        _keep_ranking."""
+        keys = {key for key in [*self.rankings, *self.ranking_reads, *self.rankings_reading] if tiers.intersection(key)}
         stale = {
             key for key in keys
-            if key in self.ranking_reads
+            if key in self.ranking_reads or key in self.rankings_reading
             or (ranking := self.rankings.get(key)) is None or not all(
                 (batch_id, tier) in ranking.ranked and (batch_id, tier) not in ranking.exhausted
                 for tier in tiers if tier in key
@@ -964,6 +966,8 @@ class Coordinator:
             self.rankings_forgotten += 1
             for key in stale:
                 self.rankings.pop(key, None)
+                # Claims already waiting for a read still get it; later ones start their own.
+                self.ranking_reads.pop(key, None)
 
     def _wake_claim(self, tier: str) -> None:
         """Count an action of ``tier`` made ready, and wake its best-ranked compatible claim, with FIFO ties."""
