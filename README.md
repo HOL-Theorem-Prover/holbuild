@@ -2009,8 +2009,9 @@ the publish fails. `--detach` follows no local build, so it checks and
 submits such theories like any other. What these checks and the source
 uploads find the remote cache to hold is kept in the cache root's
 `remote-ledger/`, shared by every project and worktree using that cache root,
-so a later build doesn't ask again. It holds at most 100000 entries: a build
-that would take it past that keeps only the entries it used or learned.
+so a later build doesn't ask again. A build that would take it past 100000
+entries keeps only the entries it used or learned, so it grows past that only
+as far as one build's own entries.
 
 The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the

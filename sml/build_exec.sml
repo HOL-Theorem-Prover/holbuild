@@ -7734,8 +7734,9 @@ fun publish_spec_blob remote {hash, path} =
    shares it.  The remote cache can lose either; a worker that finds one
    missing fails its batch, and the build then forgets the ledger
    (forget_remote_ledger) and resubmits.  Builds change it under its lock,
-   rewriting it whole, so it holds at most max_remote_ledger_entries
-   entries: a build that would pass that keeps only those it used. *)
+   rewriting it whole; a build that would take it past
+   max_remote_ledger_entries keeps only those it used or learned, so it
+   grows past that bound only as far as one build's own entries. *)
 fun remote_ledger_path remote =
   Path.concat(Path.concat(cache_root (), "remote-ledger"),
               HolbuildHash.string_sha256 (HolbuildRemoteCache.base_url remote))
