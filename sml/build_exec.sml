@@ -10560,19 +10560,63 @@ fun exec_run check_cancelled remote root tc (spec : run_spec) log =
           else raise ActionFailed (PublishFailure, "the remote cache holds different outputs for the run")
   end
 
-(* Whether the writer's output [file] is one of the [expected] modules,
-   each `<theory>-<.dat SHA-1>.pmo`: HOL names them
-   `<base id>-<theory>-<.dat SHA-1>.pmo`, the base id in hex. *)
-fun module_file_wanted expected file =
+(* The theory part `<theory>-<.dat SHA-1>.pmo` of a module file name: HOL
+   names modules `<base id>-<theory>-<.dat SHA-1>.pmo`, the base id in hex. *)
+fun module_file_theory_part file =
   let val (id, rest) = Substring.position "-" (Substring.full file)
   in
-    Substring.size id > 0 andalso Substring.size rest > 0 andalso
-    CharVector.all Char.isHexDigit (Substring.string id) andalso
-    List.exists (fn e => e = Substring.string (Substring.triml 1 rest)) expected
+    if Substring.size id > 0 andalso Substring.size rest > 1 andalso
+       CharVector.all Char.isHexDigit (Substring.string id)
+    then SOME (Substring.string (Substring.triml 1 rest))
+    else NONE
   end
+
+(* Whether the writer's output [file] is one of the [expected] modules,
+   each `<theory>-<.dat SHA-1>.pmo`. *)
+fun module_file_wanted expected file =
+  case module_file_theory_part file of
+      SOME part => List.exists (fn e => e = part) expected
+    | NONE => false
 
 (* The most theory modules one worker-run writer saves. *)
 val module_writer_limit = 32
+
+(* Files the module writer leaves in a toolchain's store beside its
+   modules.  [module_store_unsupported]: the toolchain has HOL's module
+   helper but its runtime or Meta cannot write modules, so no writer runs
+   again for it (the store, named by the HOL directory, is per Poly/ML
+   runtime).  [module_store_base_theories]: the theories of the toolchain's
+   base state, one per line; they are in the state, so HOL writes no
+   module for them. *)
+val module_store_unsupported = "unsupported"
+val module_store_base_theories = "base-theories"
+
+(* The writer script: records whether the toolchain can write modules,
+   the base state's theories when [base_theories], and then writes the
+   modules missing from the store. *)
+fun module_writer_script {output, base_theories, call} =
+  let
+    fun out file = HolbuildToolchain.sml_string (Path.concat (output, file))
+    val record_base =
+      if base_theories then
+        "val _ = let val out = TextIO.openOut " ^ out module_store_base_theories ^
+        " in List.app (fn thy => TextIO.output (out, thy ^ \"\\n\")) " ^
+        "(List.filter TheoryReader.is_canonical (Theory.ancestry \"-\")); " ^
+        "TextIO.closeOut out end; "
+      else ""
+  in
+    "val _ = let " ^
+    "fun sub (ns : PolyML.NameSpace.nameSpace) name = " ^
+    "Option.map PolyML.NameSpace.Structures.contents (#lookupStruct ns name); " ^
+    "fun has values NONE = false | has values (SOME (ns : PolyML.NameSpace.nameSpace)) = " ^
+    "List.all (Option.isSome o #lookupVal ns) values; " ^
+    "val supported = has [\"writeTheoryModules\"] (sub PolyML.globalNameSpace \"Meta\") andalso " ^
+    "has [\"showHierarchyWithIds\", \"saveDependentModuleBasic\"] " ^
+    "(Option.mapPartial (fn ns => sub ns \"SaveState\") (sub PolyML.globalNameSpace \"PolyML\")) " ^
+    "in if supported then CompilerSpecific.quietbind " ^
+    HolbuildToolchain.sml_string (record_base ^ call) ^
+    " else TextIO.closeOut (TextIO.openOut " ^ out module_store_unsupported ^ ") end;\n"
+  end
 
 (* A remote action only reads the host's HOL theory modules (the child
    policy), so that no action can plant one another loads.  Before the
@@ -10582,10 +10626,14 @@ val module_writer_limit = 32
    worker moves into the store only modules named for those theories'
    current .dat files.  Each theory is given after its parents: the
    project's from the spec, the toolchain's beside their objects in its
-   sigobj.  A failure leaves the action to load from .dat files. *)
-fun fill_module_store cache root tc (spec : action_spec) =
+   sigobj.  No writer starts when the toolchain's HOL has no module helper,
+   when an earlier writer found it cannot write modules, or when the store
+   has every module wanted.  A failure leaves the action to load from .dat
+   files. *)
+fun write_missing_modules cache root tc (spec : action_spec) =
   let
     val store = module_store (#holdir tc)
+    val base_theories_file = Path.concat (store, module_store_base_theories)
     val project =
       map (fn {target, stem, ...} =>
               (theory_name_from_logical (#2 (target_name target)), in_root root stem))
@@ -10599,17 +10647,22 @@ fun fill_module_store cache root tc (spec : action_spec) =
       case List.find (fn (n, _) => n = name) project of
           SOME (_, stem) => SOME stem
         | NONE => toolchain_base name
+    (* The base state's theories have no modules, so they count as seen. *)
+    val base_theories =
+      if file_exists base_theories_file
+      then SOME (String.tokens Char.isSpace (read_text base_theories_file))
+      else NONE
     (* Parents first; a name with no files is no theory of this build. *)
     fun visit (name, (seen, order)) =
-      if List.exists (fn n => n = name) seen then (seen, order)
+      if Binaryset.member (seen, name) then (seen, order)
       else
         case base name of
-            NONE => (name :: seen, order)
+            NONE => (Binaryset.add (seen, name), order)
           | SOME b =>
               let
                 val parents =
                   map #1 (Binarymap.listItems (parse_dat_parent_hashes (read_text (b ^ ".dat"))))
-                val (seen', order') = List.foldl visit (name :: seen, order) parents
+                val (seen', order') = List.foldl visit (Binaryset.add (seen, name), order) parents
               in
                 (seen', (name, b) :: order')
               end
@@ -10620,9 +10673,14 @@ fun fill_module_store cache root tc (spec : action_spec) =
               if has_suffix "Theory" name then SOME (drop_suffix "Theory" name) else NONE
           | _ => NONE)
         (#loads spec) @ map #1 project
-    val theories = rev (#2 (List.foldl visit ([], []) roots))
+    val seen0 = Binaryset.addList (Binaryset.empty String.compare, getOpt (base_theories, []))
+    val theories = rev (#2 (List.foldl visit (seen0, []) roots))
     val expected =
       map (fn (name, b) => name ^ "-" ^ hol_file_sha1 (b ^ ".dat") ^ ".pmo") theories
+    val stored =
+      Binaryset.addList (Binaryset.empty String.compare,
+                         List.mapPartial (module_file_theory_part o Path.file)
+                           (HolbuildCache.children store))
     (* HOL maps <dir>/xTheory.sml to <dir>/.hol/objs/xTheory.sml itself,
        so it is given the unmapped name of a toolchain theory. *)
     fun hol_name b =
@@ -10643,15 +10701,19 @@ fun fill_module_store cache root tc (spec : action_spec) =
       ", output = " ^ HolbuildToolchain.sml_string output ^
       ", limit = " ^ Int.toString module_writer_limit ^ "};"
     fun move file =
-      if module_file_wanted expected file then
-        FS.rename {old = Path.concat (output, file), new = Path.concat (store, file)}
+      if module_file_wanted expected file orelse
+         file = module_store_unsupported orelse
+         (file = module_store_base_theories andalso not (isSome base_theories))
+      then FS.rename {old = Path.concat (output, file), new = Path.concat (store, file)}
       else ()
   in
-    if null theories then () else
+    if List.all (fn e => Binaryset.member (stored, e)) expected then () else
     (HolbuildRemoveTree.remove_untrusted output;
      ensure_dir output;
      ensure_dir store;
-     write_text script (if_meta_has ["writeTheoryModules"] call ^ "\n");
+     write_text script
+       (module_writer_script {output = output, base_theories = not (isSome base_theories),
+                              call = call});
      HolbuildActionSandbox.with_output_dirs [output] (fn () =>
        ignore (HolbuildToolchain.run_in_dir_to_file root
                  (HolbuildToolchain.hol_subcommand_argv tc "run" @
@@ -10659,6 +10721,15 @@ fun fill_module_store cache root tc (spec : action_spec) =
                  log));
      List.app (move o Path.file) (HolbuildCache.children output);
      HolbuildRemoveTree.remove_untrusted output)
+  end
+
+fun fill_module_store cache root tc spec =
+  let val holdir = #holdir tc
+  in
+    if file_exists (Path.concat (holdir, "tools-poly/poly/theory_modules.ML")) andalso
+       not (path_exists (Path.concat (module_store holdir, module_store_unsupported)))
+    then write_missing_modules cache root tc spec
+    else ()
   end
   handle e => warn ("theory modules not written: " ^ General.exnMessage e)
 
