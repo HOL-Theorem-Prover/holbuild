@@ -155,6 +155,28 @@ SML
   { cat "$tmpdir/run-load.log" >&2; exit 1; }
 require_grep "CTheory loaded" "$tmpdir/run-load.log"
 
+# Oracle tags survive normalization: admitting the same statement changes
+# A's digest and rebuilds every dependent, as does removing the admission.
+write_a $'(* a comment\n   of three\n   lines *)' "cheat" "(1:num) + 1 = 2"
+build "$tmpdir/cheat-edit.log"
+a_cheat_literal=$(a_hash_literal)
+[[ "$a_cheat_literal" != "$a_literal" ]] || { echo "cheat left ATheory's digest unchanged" >&2; exit 1; }
+require_grep "ATheory built" "$tmpdir/cheat-edit.log"
+require_no_cutoff BTheory "$tmpdir/cheat-edit.log"
+require_no_cutoff CTheory "$tmpdir/cheat-edit.log"
+require_grep "BTheory built" "$tmpdir/cheat-edit.log"
+require_grep "CTheory built" "$tmpdir/cheat-edit.log"
+
+# Use a new real proof so this edit cannot restore the old cached action.
+write_a $'(* a comment\n   of three\n   lines *)' "ACCEPT_TAC helper2" "(1:num) + 1 = 2"
+build "$tmpdir/cheat-removed.log"
+[[ "$(a_hash_literal)" == "$a_literal" ]] || { echo "removing cheat did not restore ATheory's digest" >&2; exit 1; }
+require_grep "ATheory built" "$tmpdir/cheat-removed.log"
+require_no_cutoff BTheory "$tmpdir/cheat-removed.log"
+require_no_cutoff CTheory "$tmpdir/cheat-removed.log"
+require_grep "BTheory built" "$tmpdir/cheat-removed.log"
+require_grep "CTheory built" "$tmpdir/cheat-removed.log"
+
 # A precedence change, an integer among the theory data, rebuilds B.
 write_a $'(* a comment\n   of three\n   lines *)' "simp[helper2]" "(1:num) + 1 = 2" 501
 build "$tmpdir/precedence-edit.log"
