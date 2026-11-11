@@ -351,9 +351,17 @@ fun is_capsule stage_dir =
   String.isPrefix (capsule_format ^ "\n") (read_text (capsule_manifest_path stage_dir))
   handle _ => false
 
-(* The members of an archive that holds `part` itself or anything under it. *)
-fun has_part names part =
-  List.exists (fn name => name = part orelse String.isPrefix (part ^ "/") name) names
+(* The spelling an archive uses for `part` (a bare name, or one with a leading
+   `./`) when it holds that part itself or anything under it. *)
+fun part_member names part =
+  let
+    fun holds spelling =
+      List.exists (fn name => name = spelling orelse String.isPrefix (spelling ^ "/") name) names
+  in
+    if holds part then SOME part
+    else if holds ("./" ^ part) then SOME ("./" ^ part)
+    else NONE
+  end
 
 fun checked_names archive_path =
   tar_operation (fn () => HolbuildTar.checked_names archive_path)
@@ -364,9 +372,8 @@ fun with_entries {archive_path, f} =
   let
     val names = checked_names archive_path
     val manifest_member = Path.concat(package_part, "manifest")
-    val wanted =
-      (if has_part names payload_dir then [payload_dir] else []) @
-      (if has_part names manifest_member then [manifest_member] else [])
+    val cache_member = part_member names payload_dir
+    val wanted = List.mapPartial (part_member names) [payload_dir, manifest_member]
     val stage_dir = temp_dir_near archive_path
     val payload = Path.concat(stage_dir, payload_dir)
     val cache = HolbuildFSCacheBackend.filesystem payload
@@ -379,7 +386,7 @@ fun with_entries {archive_path, f} =
      let
        (* A capsule without a cache part holds no actions. *)
        val keys =
-         if not (has_part names payload_dir) andalso is_capsule stage_dir then []
+         if not (Option.isSome cache_member) andalso is_capsule stage_dir then []
          else action_keys_from_manifest (require_manifest payload)
      in
        f {source = fs_source cache, keys = keys} before cleanup ()
@@ -417,11 +424,17 @@ fun capsule_identity archive_path text =
       case nonempty_manifest_field lines key of
           SOME value => value
         | NONE => raise Error ("capsule manifest in " ^ archive_path ^ " has no " ^ key)
+    fun package_name () =
+      let val name = required "name"
+      in
+        if HolbuildManifestUtil.safe_materialized_dependency_name name then name
+        else raise Error ("capsule manifest in " ^ archive_path ^ " has an unsafe package name: " ^ name)
+      end
   in
     case lines of
         first :: _ =>
           if first = capsule_format then
-            {name = required "name",
+            {name = package_name (),
              version = nonempty_manifest_field lines "version",
              toolchain_key = required "toolchain_key"}
           else raise Error ("unsupported capsule format in " ^ archive_path ^ ": " ^ first)
@@ -447,8 +460,10 @@ fun extract_sources {archive_path, destination} =
     val names = checked_names archive_path
     val manifest_member = Path.concat(package_part, "manifest")
     val source_member = Path.concat(package_part, source_dir)
-    val _ = if has_part names manifest_member andalso has_part names source_member then ()
-            else raise Error ("archive has no source snapshot: " ^ archive_path)
+    val members =
+      case (part_member names manifest_member, part_member names source_member) of
+          (SOME manifest, SOME source) => [manifest, source]
+        | _ => raise Error ("archive has no source snapshot: " ^ archive_path)
     val _ = require_free_destination destination
     val stage_dir = temp_dir_near destination
     fun cleanup () = remove_tree stage_dir handle _ => ()
@@ -457,7 +472,7 @@ fun extract_sources {archive_path, destination} =
      ensure_dir stage_dir;
      tar_operation (fn () => HolbuildTar.extract_members
        {archive_path = archive_path, destination = stage_dir,
-        members = [manifest_member, source_member]});
+        members = members});
      let
        val manifest = read_text (Path.concat(stage_dir, manifest_member))
          handle IO.Io _ => raise Error ("could not read capsule manifest in " ^ archive_path)

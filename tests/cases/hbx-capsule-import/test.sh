@@ -70,8 +70,16 @@ with tarfile.open(base) as src, tarfile.open(out, "w", format=tarfile.PAX_FORMAT
     for member in src.getmembers():
         if member.name == locked.get(kind):
             member.mode = 0
-        dst.addfile(member, src.extractfile(member) if member.isfile() else None)
-    if kind in locked:
+        data = src.extractfile(member) if member.isfile() else None
+        if kind == "badname" and member.name == "holbuild-package/manifest":
+            content = data.read().replace(b"name=capsule", b"name=../outside")
+            member.size = len(content)
+            data = io.BytesIO(content)
+        if kind == "dotslash":
+            member.name = "./" + member.name
+            member.pax_headers.pop("path", None)
+        dst.addfile(member, data)
+    if kind in locked or kind in ("badname", "dotslash"):
         sys.exit(0)
     extra = tarfile.TarInfo()
     extra.mode = 0o644
@@ -105,9 +113,10 @@ with tarfile.open(base) as src, tarfile.open(out, "w", format=tarfile.PAX_FORMAT
     else:
         dst.addfile(extra)
 PY
-for kind in dotdot absolute symlink hardlink device fifo decoy lockedsource lockedcache; do
+for kind in dotdot absolute symlink hardlink device fifo decoy lockedsource lockedcache badname dotslash; do
   python3 -I "$tmpdir/make-archive.py" "$archives/capsule.hbx" "$archives/$kind.hbx" "$kind"
 done
+python3 -I "$tmpdir/make-archive.py" "$archives/sources.hbx" "$archives/dotslashsources.hbx" dotslash
 
 # Import reads the cache part only: the tar it runs never names the source
 # snapshot, and the working directory and the archive's directory stay as
@@ -158,6 +167,12 @@ require_grep "imported 1 cache action(s) from" "$tmpdir/import-closure.log"
 # A capsule without a cache part imports nothing, and that is no error.
 import_into sources "$archives/sources.hbx" "$tmpdir/import-sources-cache"
 require_grep "imported 0 cache action(s) from" "$tmpdir/import-sources.log"
+
+# Archives assembled with `./` member names import like the exporter's.
+import_into dotslash "$archives/dotslash.hbx" "$tmpdir/import-dotslash-cache"
+require_grep "imported 1 cache action(s) from" "$tmpdir/import-dotslash.log"
+import_into dotslashsources "$archives/dotslashsources.hbx" "$tmpdir/import-dotslashsources-cache"
+require_grep "imported 0 cache action(s) from" "$tmpdir/import-dotslashsources.log"
 
 # Hostile members fail the import too, naming the member.
 member_pattern() {
@@ -226,6 +241,9 @@ val _ = extract "closure" "closure";
 val _ = List.app (fn kind => extract kind kind)
   ["dotdot", "absolute", "symlink", "hardlink", "device", "fifo"];
 val _ = extract "lockedsource" "lockedsource";
+val _ = extract "badname" "badname";
+val _ = extract "dotslash" "dotslash";
+val _ = extract "dotslashsources" "dotslashsources";
 val _ = print "== done\n";
 SML
 work=$tmpdir/extract
@@ -240,7 +258,7 @@ require_grep '^== done$' "$tmpdir/extract.log"
 
 # The snapshot, and only the snapshot, lands in the destination.
 expected_files=$(cd "$project" && find holproject.toml src -type f | LC_ALL=C sort)
-for dest in fresh sources-only decoy empty nested/parent/fresh; do
+for dest in fresh sources-only decoy empty nested/parent/fresh dotslash dotslashsources; do
   actual_files=$(cd "$work/$dest" && find . -type f | sed 's|^\./||' | LC_ALL=C sort)
   if [[ "$actual_files" != "$expected_files" ]]; then
     echo "extracted $dest holds unexpected files:" >&2
@@ -269,6 +287,8 @@ for kind in dotdot absolute symlink hardlink device fifo; do
 done
 require_grep "^error lockedsource: could not install capsule source at " "$tmpdir/extract.log"
 require_no_file "$work/lockedsource"
+require_grep "^error badname: capsule manifest in .* has an unsafe package name: \.\./outside\$" "$tmpdir/extract.log"
+require_no_file "$work/badname"
 require_no_file /tmp/holbuild-absolute-escape.txt
 require_no_file "$work/escape.txt"
 tree "$archives" | diff -u "$tmpdir/archives.before" -
