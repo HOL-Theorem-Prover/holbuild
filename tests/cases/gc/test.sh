@@ -603,9 +603,11 @@ val _ =
   else raise Fail "dependent checkpoint family was evicted while active";
 val _ = export_theory();
 SML
+# Trigger must build plainly: a pipelined commit saves no checkpoints and so
+# runs no checkpoint maintenance.
 (
   cd "$gate_project"
-  HOLBUILD_TEST_CHECKPOINT_BUDGET_GATE="$gate_sync" \
+  HOLBUILD_PIPELINE=off HOLBUILD_TEST_CHECKPOINT_BUDGET_GATE="$gate_sync" \
     "$HOLBUILD_BIN" build --force=project --no-cache
 ) > "$tmpdir/checkpoint-maintenance-gate.log" 2>&1 &
 gate_pid=$!

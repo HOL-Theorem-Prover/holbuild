@@ -12,7 +12,7 @@ source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
 cleanup() {
-  for pid in ${server_pid:-} ${coordinator_pid:-}; do
+  for pid in ${server_pid:-} ${coordinator_pid:-} ${ring_server_pid:-}; do
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
@@ -40,10 +40,26 @@ heap=()
 [[ ! -e "\${1%.batch}.heap" ]] || heap=(--max-heap "\$(cat "\${1%.batch}.heap")")
 share=
 [[ ! -e "$state/share-heaps" ]] || share=--share-heaps
+rm -f "$state/failed-batch"
+
+
 # A worker that trusts no HOL repository rejects every spec.
 untrusted=()
 [[ ! -e "$state/untrusted" ]] || untrusted=(HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES=/unconfigured=master)
 awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec theory; do
+  if [[ -e "$state/keep-going" ]]; then
+    blocked=
+    for parent in \$(awk -v key="\$key" '\$1 == "edge" && \$2 == key { print \$3 }' "\$1"); do
+      if grep -Eq '^status=(failed|skipped)$' "$state/result-\$parent"; then
+        blocked=\$parent
+        break
+      fi
+    done
+    if [[ -n \$blocked ]]; then
+      printf 'holbuild-action-result-v1\\nstatus=skipped\\nfailure=skipped because of %s\\n' "\$blocked" > "$state/result-\$key"
+      continue
+    fi
+  fi
   echo "\$theory" >> "$state/ran"
   status=0
   env "\${untrusted[@]}" HOLBUILD_CACHE="$tmpdir/worker-cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" "\${heap[@]}" \
@@ -59,9 +75,16 @@ awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec the
   fi
   # A failed action fails the batch, naming the theory or blob it found
   # missing.
-  [[ \$status -eq 0 ]] ||
-    { sed -n 's/^missing=//p' "$tmpdir/worker.result" > "$state/missing"; exit 1; }
+  if [[ \$status -ne 0 ]]; then
+    if [[ -e "$state/keep-going" ]]; then
+      touch "$state/failed-batch"
+    else
+      sed -n 's/^missing=//p' "$tmpdir/worker.result" > "$state/missing"
+      exit 1
+    fi
+  fi
 done
+[[ ! -e "$state/failed-batch" ]]
 SH
 chmod +x "$tmpdir/run-batch"
 python3 "$SCRIPT_DIR/../../fixtures/remote_exec_coordinator.py" \
@@ -214,8 +237,8 @@ require_grep "could not cancel remote batch b4 (HTTP 503)" "$tmpdir/down.log"
 require_grep "the coordinator reported no theories; building locally" "$tmpdir/down.log"
 require_grep "BTheory built" "$tmpdir/down.log"
 write_theories five-down-only
-run down-only 75 build --remote-exec "$coordinator" --remote-only BTheory
-require_grep "the coordinator reported no theories; reattach with --attach b5" "$tmpdir/down-only.log"
+run down-only 75 build --remote-exec "$coordinator" --remote-only --priority 17 BTheory
+require_grep "the coordinator reported no theories; reattach with --attach b5 --priority 17$" "$tmpdir/down-only.log"
 refute_grep "^POST /v1/batches/b5/cancel " "$state/requests.log"
 rm "$state/down"
 run unknown-only 75 build --remote-exec "$coordinator" --remote-only --attach nope BTheory
@@ -236,14 +259,16 @@ require_grep "ATheory is not in the remote cache, and --remote-only builds nothi
 refute_grep "Theory built" "$tmpdir/skipped-only.log"
 rm "$state/skip"
 
-# A failed batch falls back too.
+# A proof failure with no log stays a failure even if its local diagnostic
+# retry succeeds. --remote-only requests diagnostics without running HOL.
 write_theories six
 touch "$state/fail"
 run failed-only 75 build --remote-exec "$coordinator" --remote-only BTheory
 require_grep "remote rx:ATheory: failed (proof)" "$tmpdir/failed-only.log"
 require_grep "remote execution: batch b7 failed: an action failed; remote workers finished 0 of 2 theories" "$tmpdir/failed-only.log"
-run failed 0 build --remote-exec "$coordinator" BTheory
-require_grep "batch b8 failed: an action failed; remote workers finished 0 of 2 theories; building locally" "$tmpdir/failed.log"
+run failed 1 build --remote-exec "$coordinator" BTheory
+require_grep "could not fetch the failed theory's build log; building ATheory locally" "$tmpdir/failed.log"
+require_grep "ATheory failed remotely: proof" "$tmpdir/failed.log"
 require_grep "BTheory built" "$tmpdir/failed.log"
 refute_grep "^POST /v1/batches/b8/cancel " "$state/requests.log"
 rm "$state/fail"
@@ -333,7 +358,23 @@ require_grep "^POST /v1/batches Bearer stub-token$" "$state/requests.log"
 # it remembered, and the resubmitted batch builds.
 write_theories ledger
 run ledger-seed 0 build --remote-exec "$coordinator" --remote-only BTheory
-[[ -n $(ls "$project/.holbuild/remote-ledger") ]] || { echo "the export left no remote ledger" >&2; exit 1; }
+[[ -n $(ls "$HOLBUILD_CACHE/remote-ledger") ]] || { echo "the export left no remote ledger" >&2; exit 1; }
+# The ledger is the cache root's, so another directory of the project, as a
+# fresh worktree is, doesn't ask about the blob of the unchanged BScript.sml
+# again; the changed AScript.sml it uploads.
+copy=$tmpdir/project-copy
+mkdir -p "$copy"
+cp -r "$project/holproject.toml" "$project/src" "$copy/"
+sed -i 's/(\* ledger \*)/(* ledger-copy *)/' "$copy/src/AScript.sml"
+b_source=$(sha256sum "$copy/src/BScript.sml" | cut -d' ' -f1)
+a_copy_source=$(sha256sum "$copy/src/AScript.sml" | cut -d' ' -f1)
+: > "$tmpdir/server/requests.log"
+(cd "$copy" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only BTheory) \
+  > "$tmpdir/ledger-copy.log" 2>&1 || { cat "$tmpdir/ledger-copy.log" >&2; exit 1; }
+require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/ledger-copy.log"
+refute_grep "^\(HEAD\|PUT\) /cas/$b_source$" "$tmpdir/server/requests.log"
+require_grep "^PUT /cas/$a_copy_source$" "$tmpdir/server/requests.log"
+[[ ! -e "$copy/.holbuild/remote-ledger" ]] || { echo "the copy kept a ledger of its own" >&2; exit 1; }
 # ATheory changes and BScript.sml doesn't, so its blob is remembered.
 sed -i 's/(\* ledger \*)/(* ledger-a *)/' "$project/src/AScript.sml"
 b_source=$(sha256sum "$project/src/BScript.sml" | cut -d' ' -f1)
@@ -595,7 +636,7 @@ require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdi
 # Without a local cache entry to publish, it goes to the workers.  The
 # remote ledger, which says the remote has it, goes too.
 rm "$remote_root/ac/$ac_a"
-rm -r "$project/.holbuild/remote-ledger"
+rm -r "$HOLBUILD_CACHE/remote-ledger"
 rm -r "$HOLBUILD_CACHE/actions/$key_a"
 sed -i 's/(\* built-here-alone \*)/(* built-here-unpublished *)/' "$project/src/BScript.sml"
 sed -i 's/simp\[\]$/simp[] (* unpublished *)/' "$project/src/CScript.sml"
@@ -988,8 +1029,10 @@ cat >> "$project/src/BScript.sml" <<'SML'
 val _ = print helperLib.verdict
 SML
 run force-seed 0 build --remote-exec "$coordinator" --remote-only BTheory
+run force-clean 0 clean BTheory
 : > "$state/results"
 HOLBUILD_TIMING_LOG=$tmpdir/force-target.timing run force-target 0 build --remote-exec "$coordinator" --remote-only --force=theory BTheory
+require_grep 'BTheory restored from cache' "$tmpdir/force-target.log"
 require_grep "^rxf:BTheory status=built$" "$state/results"
 [[ $(wc -l < "$state/results") -eq 1 ]] || { cat "$state/results" >&2; exit 1; }
 refute_grep "Theory built\|building locally" "$tmpdir/force-target.log"
@@ -1228,9 +1271,10 @@ val _ = if Use2Lib.v = 8 then () else raise Fail "bad Use2Lib.v";
 val after_gen_thm = save_thm("after_gen_thm", TRUTH);
 SML
 (cd "$gen2" && HOLBUILD_CACHE=$tmpdir/generated-two-phase-cache "$HOLBUILD_BIN" --remote-cache "$remote_url" \
-  build --remote-exec "$coordinator" --remote-only AfterGenTheory) > "$tmpdir/gen2.log" 2>&1 ||
+  build --remote-exec "$coordinator" --remote-only --priority=3 AfterGenTheory) > "$tmpdir/gen2.log" 2>&1 ||
   { cat "$tmpdir/gen2.log" "$tmpdir/worker.log" >&2; exit 1; }
 require_grep "Gen2Theory restored from cache" "$tmpdir/gen2.log"
+[[ $(grep -c '^POST /v1/batches?priority=3 ' "$state/requests.log") -ge 2 ]] || { cat "$state/requests.log" >&2; exit 1; }
 require_grep "Use2Lib built" "$tmpdir/gen2.log"
 require_grep "AfterGenTheory restored from cache" "$tmpdir/gen2.log"
 refute_grep "Theory built" "$tmpdir/gen2.log"
@@ -1462,6 +1506,124 @@ in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator
   --remote-only --attach "$batch" LocalDetachedTheory > "$tmpdir/local-cas-attach.log" 2>&1 ||
   { cat "$tmpdir/local-cas-attach.log" "$tmpdir/worker.log" >&2; exit 1; }
 
+# Two independent proof failures retain both logs and restore the healthy
+# branch; descendants are skipped rather than reported as extra failures.
+copy_nondet multi-failure rxmultifailure
+for name in BadA BadB; do
+  cat > "$tmpdir/multi-failure/src/${name}Script.sml" <<SML
+Theory $name
+Ancestors bool
+val _ = raise Fail "independent remote failure $name";
+SML
+done
+cat > "$tmpdir/multi-failure/src/HealthyScript.sml" <<'SML'
+Theory Healthy
+Ancestors bool
+Theorem healthy: T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+SML
+cat > "$tmpdir/multi-failure/src/BlockedScript.sml" <<'SML'
+Theory Blocked
+Ancestors BadA
+val _ = raise Fail "BLOCKED_REMOTE_MUST_NOT_RUN";
+SML
+: > "$state/keep-going"
+: > "$state/ran"
+status=0
+in_copy multi-failure --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only BadATheory BadBTheory HealthyTheory BlockedTheory \
+  > "$tmpdir/multi-failure.log" 2>&1 || status=$?
+[[ $status -eq 1 ]] || { cat "$tmpdir/multi-failure.log" >&2; exit 1; }
+require_grep 'remote failure summary: 2 failed, 1 skipped' "$tmpdir/multi-failure.log"
+require_grep 'independent remote failure BadA' "$tmpdir/multi-failure.log"
+require_grep 'independent remote failure BadB' "$tmpdir/multi-failure.log"
+require_grep 'remote rxmultifailure:BlockedTheory: skipped' "$tmpdir/multi-failure.log"
+require_grep 'HealthyTheory restored from cache' "$tmpdir/multi-failure.log"
+refute_grep 'BlockedTheory' "$state/ran"
+refute_grep 'BLOCKED_REMOTE_MUST_NOT_RUN' "$tmpdir/multi-failure.log"
+for name in BadA BadB Healthy; do
+  require_file "$tmpdir/multi-failure/.holbuild/logs/current/rxmultifailure/${name}Theory/build.log"
+done
+require_file "$tmpdir/multi-failure/.holbuild/obj/src/HealthyTheory.dat"
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/multi-failure.log")
+while read -r tag key ac spec theory; do
+  [[ $tag == action ]] || continue
+  if [[ $theory == rxmultifailure:HealthyTheory ]]; then
+    require_file "$remote_root/ac/$ac"
+  else
+    [[ ! -e "$remote_root/ac/$ac" ]] || { echo "$theory published failed or skipped outputs" >&2; exit 1; }
+  fi
+done < "$state/$batch.batch"
+
+# A coordinator may omit all failure log hashes. Successful independent
+# outputs are still restored before requesting a local diagnostic retry.
+while read -r tag key ac spec theory; do
+  if [[ $tag == action && $theory == rxmultifailure:Bad* ]]; then
+    sed -i '/^log=/d' "$state/result-$key"
+  fi
+done < "$state/$batch.batch"
+# Reattach to the recorded failure without rerunning the stand-in workers.
+touch "$state/fail"
+in_copy multi-failure clean HealthyTheory > /dev/null
+[[ ! -e "$tmpdir/multi-failure/.holbuild/obj/src/HealthyTheory.dat" ]]
+status=0
+in_copy multi-failure --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only --attach "$batch" BadATheory BadBTheory HealthyTheory BlockedTheory \
+  > "$tmpdir/multi-failure-nolog.log" 2>&1 || status=$?
+rm "$state/fail"
+[[ $status -eq 75 ]] || { cat "$tmpdir/multi-failure-nolog.log" >&2; exit 1; }
+require_file "$tmpdir/multi-failure/.holbuild/obj/src/HealthyTheory.dat"
+require_grep "could not fetch the failed theory's build log: BadATheory" "$tmpdir/multi-failure-nolog.log"
+require_grep "could not fetch the failed theory's build log: BadBTheory" "$tmpdir/multi-failure-nolog.log"
+refute_grep 'Theory built\|building locally' "$tmpdir/multi-failure-nolog.log"
+
+# A non-proof final failure must install the healthy branch too, even though
+# --remote-only requests a local retry rather than diagnosing the proof.
+while read -r tag key ac spec theory; do
+  if [[ $tag == action && $theory == rxmultifailure:Bad* ]]; then
+    sed -i 's/^failure=.*/failure=memory/' "$state/result-$key"
+  fi
+done < "$state/$batch.batch"
+touch "$state/fail"
+in_copy multi-failure clean HealthyTheory > /dev/null
+status=0
+in_copy multi-failure --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only --attach "$batch" BadATheory BadBTheory HealthyTheory BlockedTheory \
+  > "$tmpdir/multi-failure-memory.log" 2>&1 || status=$?
+rm "$state/fail"
+[[ $status -eq 75 ]] || { cat "$tmpdir/multi-failure-memory.log" >&2; exit 1; }
+require_grep 'remote failure summary: 2 failed, 1 skipped' "$tmpdir/multi-failure-memory.log"
+require_grep 'failed (memory)' "$tmpdir/multi-failure-memory.log"
+require_file "$tmpdir/multi-failure/.holbuild/obj/src/HealthyTheory.dat"
+refute_grep 'Theory built\|building locally' "$tmpdir/multi-failure-memory.log"
+
+# A reported non-proof log can disappear from the cache before the client
+# fetches it. Keep the remote failure and report the missing local copy.
+while read -r tag key ac spec theory; do
+  if [[ $tag == action && $theory == rxmultifailure:Bad* ]]; then
+    printf 'log=%064d\n' 0 >> "$state/result-$key"
+  fi
+done < "$state/$batch.batch"
+touch "$state/fail"
+in_copy multi-failure clean HealthyTheory > /dev/null
+status=0
+in_copy multi-failure --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only --attach "$batch" BadATheory BadBTheory HealthyTheory BlockedTheory \
+  > "$tmpdir/multi-failure-memory-missing-log.log" 2>&1 || status=$?
+rm "$state/fail"
+[[ $status -eq 75 ]] || { cat "$tmpdir/multi-failure-memory-missing-log.log" >&2; exit 1; }
+require_grep "could not fetch the failed theory's build log: BadATheory" "$tmpdir/multi-failure-memory-missing-log.log"
+require_grep "could not fetch the failed theory's build log: BadBTheory" "$tmpdir/multi-failure-memory-missing-log.log"
+require_file "$tmpdir/multi-failure/.holbuild/obj/src/HealthyTheory.dat"
+refute_grep 'Theory built\|building locally' "$tmpdir/multi-failure-memory-missing-log.log"
+
+in_copy multi-failure --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only --detach --fail-fast BadATheory > "$tmpdir/multi-fail-fast.log" 2>&1
+require_grep '^POST /v1/batches?fail_fast=true ' "$state/requests.log"
+
+
 # A spec the worker rejects before any HOL runs has no log; its reason
 # reaches the client with the failure.
 cat > "$tmpdir/local-cas/src/LocalUntrustedScript.sml" <<'SML'
@@ -1484,3 +1646,178 @@ require_grep '^detail=exec-action HOL repository is not trusted by this worker: 
 refute_grep '^log=' "$tmpdir/worker.result"
 require_grep 'holbuild: remote rxlocalcas:LocalUntrustedTheory: failed (spec-rejected: exec-action HOL repository is not trusted by this worker: ' \
   "$tmpdir/local-cas-untrusted.log"
+
+
+# The missing-input replay below needs the worker's normal resubmit signal.
+rm "$state/keep-going"
+
+# Batch priority is scheduling metadata; it reaches submit together with the other batch options.
+cat > "$tmpdir/local-cas/src/PriorityScript.sml" <<'SML'
+Theory Priority
+Ancestors bool
+Theorem priority_test: T
+Proof
+  simp[]
+QED
+SML
+in_copy local-cas --remote-cache "$remote_url" --max-heap 4096 build --remote-exec "$coordinator" \
+  --remote-only --priority 7 --fail-fast PriorityTheory > "$tmpdir/priority.log" 2>&1
+require_grep '^POST /v1/batches?fail_fast=true&priority=7&max_heap_mb=4096 ' "$state/requests.log"
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --detach --priority=2147483647 LocalUntrustedTheory > "$tmpdir/priority-equals.log" 2>&1
+require_grep '^POST /v1/batches?priority=2147483647 ' "$state/requests.log"
+
+for value in -1 1.5 urgent 2147483648; do
+  if in_copy local-cas build --remote-exec "$coordinator" --priority "$value" PriorityTheory > "$tmpdir/priority-invalid.log" 2>&1; then
+    echo "accepted invalid priority $value" >&2
+    exit 1
+  fi
+  if [[ $value == 2147483648 ]]; then
+    require_grep '^holbuild: --priority must be between 0 and 2147483647$' "$tmpdir/priority-invalid.log"
+  else
+    require_grep "^holbuild: invalid --priority: $value; expected an integer between 0 and 2147483647$" "$tmpdir/priority-invalid.log"
+  fi
+done
+if in_copy local-cas build --priority 1 PriorityTheory > "$tmpdir/priority-no-exec.log" 2>&1; then
+  echo 'accepted priority without remote execution' >&2
+  exit 1
+fi
+require_grep 'priority needs --remote-exec URL' "$tmpdir/priority-no-exec.log"
+
+# Reattaching can need a replacement batch after an input disappears.
+cat > "$tmpdir/local-cas/src/PriorityChildScript.sml" <<'SML'
+Theory PriorityChild
+Ancestors Priority
+Theorem priority_child_test: T
+Proof
+  simp[]
+QED
+SML
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only PriorityChildTheory > "$tmpdir/priority-attach-seed.log" 2>&1
+printf '\n(* changed parent *)\n' >> "$tmpdir/local-cas/src/PriorityScript.sml"
+child_source=$(sha256sum "$tmpdir/local-cas/src/PriorityChildScript.sml" | cut -d' ' -f1)
+rm "$remote_root/cas/$child_source" "$tmpdir/worker-cache/blobs/$child_source"
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --detach --priority 9 PriorityChildTheory > "$tmpdir/priority-attach-detach.log" 2>&1
+priority_batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/priority-attach-detach.log")
+[[ -n $priority_batch ]] || { cat "$tmpdir/priority-attach-detach.log" >&2; exit 1; }
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only --attach "$priority_batch" --priority 9 PriorityChildTheory > "$tmpdir/priority-attach.log" 2>&1
+require_grep "still missing blob $child_source after 3 attempts; .*; resubmitting$" "$tmpdir/priority-attach.log"
+[[ $(grep -c '^POST /v1/batches?priority=9 ' "$state/requests.log") -eq 2 ]] || { cat "$state/requests.log" >&2; exit 1; }
+require_grep 'remote rxlocalcas:PriorityChildTheory: done' "$tmpdir/priority-attach.log"
+
+# Timings are execution results, not deterministic cached outputs. A forced
+# rebuild must keep the resident entry and return the worker's diagnostic.
+project=$tmpdir/publish-project
+mkdir -p "$project/src"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxpublish"
+[build]
+members = ["src"]
+TOML
+write_theories publish-log
+cat >> "$project/src/BScript.sml" <<'SML'
+fun holbuild_extra_outputs (_ : string list) = ()
+val _ = holbuild_extra_outputs ["timing.txt"]
+val _ =
+  let val out = TextIO.openOut "timing.txt"
+  in TextIO.output (out, Time.toString (Time.now ()) ^ "\n"); TextIO.closeOut out end
+SML
+run publish-seed 0 build --remote-exec "$coordinator" --remote-only BTheory
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/publish-seed.log")
+ac=$(awk '$1 == "action" && $5 == "rxpublish:BTheory" { print $3 }' "$state/$batch.batch")
+cp "$remote_root/ac/$ac" "$tmpdir/publish-resident"
+run publish-conflict 75 build --remote-exec "$coordinator" --remote-only --force=theory BTheory
+require_grep 'the remote cache holds different outputs for the action' "$tmpdir/publish-conflict.log"
+require_grep 'existing outputs: .*extra:timing.txt=' "$tmpdir/publish-conflict.log"
+require_grep 'new outputs: .*extra:timing.txt=' "$tmpdir/publish-conflict.log"
+require_grep 'The same inputs must produce identical outputs' "$tmpdir/publish-conflict.log"
+require_grep 'put timings in the build log instead' "$tmpdir/publish-conflict.log"
+local_log=$project/.holbuild/logs/current/rxpublish/BTheory/build.log
+require_grep "child log: $local_log" "$tmpdir/publish-conflict.log"
+require_grep 'the remote cache holds different outputs for the action' "$local_log"
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/publish-conflict.log")
+key=$(awk '$1 == "action" && $5 == "rxpublish:BTheory" { print $2 }' "$state/$batch.batch")
+log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$state/result-$key")
+[[ -n $log_sha && $(sha256sum < "$local_log" | cut -d' ' -f1) == "$log_sha" ]] ||
+  { echo 'publish failure log is not the worker log' >&2; exit 1; }
+cmp "$remote_root/ac/$ac" "$tmpdir/publish-resident"
+refute_grep 'Theory built\|building locally' "$tmpdir/publish-conflict.log"
+
+# A lost log warns and removes the previous execution's log, without hiding
+# the batch failure or changing its exit status.
+touch "$state/drop-log"
+run publish-missing-log 75 build --remote-exec "$coordinator" --remote-only --force=theory BTheory
+rm "$state/drop-log"
+require_grep "could not fetch the failed theory's build log: BTheory" "$tmpdir/publish-missing-log.log"
+require_grep 'remote execution: batch .* failed' "$tmpdir/publish-missing-log.log"
+require_no_file "$local_log"
+cmp "$remote_root/ac/$ac" "$tmpdir/publish-resident"
+
+
+# Cache ring replicas can disagree on an entry's timeout contract.  With the
+# weaker copy on the node ranked first, batch export and restore must find the
+# stronger one on the next node, also after this build copied the weaker one.
+write_ring_timeout() {
+  copy_nondet "$1" rxring
+  cat > "$tmpdir/$1/src/TimeoutScript.sml" <<'SML'
+Theory Timeout
+Ancestors bool
+
+Theorem ring_timeout_thm:
+  T
+Proof
+  simp[]
+QED
+SML
+}
+write_ring_timeout ring-seed
+in_copy ring-seed --remote-cache "$remote_url" build --tactic-timeout 0 TimeoutTheory \
+  > "$tmpdir/ring-weak.log" 2>&1 || { cat "$tmpdir/ring-weak.log" >&2; exit 1; }
+ring_key=$(sed -n 's/^input_key=//p' "$tmpdir/ring-seed/.holbuild/dep/rxring/src/TimeoutScript.sml.key")
+ring_ac=$(printf 'holbuild-remote-ac-v1\n%s\n' "$ring_key" | sha256sum | cut -d' ' -f1)
+require_grep '^proof-timeout=none$' "$remote_root/ac/$ring_ac"
+cp "$remote_root/ac/$ring_ac" "$tmpdir/ring-weak-ac"
+in_copy ring-seed --remote-cache "$remote_url" build --tactic-timeout 2.5 TimeoutTheory \
+  > "$tmpdir/ring-strong.log" 2>&1 || { cat "$tmpdir/ring-strong.log" >&2; exit 1; }
+require_grep '^proof-timeout=2.5$' "$remote_root/ac/$ring_ac"
+cp "$remote_root/ac/$ring_ac" "$tmpdir/ring-strong-ac"
+
+first_server_pid=$server_pid
+first_url=$remote_url
+first_request_log=$request_log
+second_root=$tmpdir/remote-2
+start_remote_cache_server "$second_root" "$tmpdir/server-2"
+ring_server_pid=$server_pid
+second_url=$remote_url
+server_pid=$first_server_pid
+remote_url=$first_url
+request_log=$first_request_log
+mkdir -p "$second_root/ac" "$second_root/cas"
+for blob in $(awk '$1 == "blob" && length($2) == 64 { print $2 }' "$tmpdir/ring-strong-ac"); do
+  cp "$remote_root/cas/$blob" "$second_root/cas/$blob"
+done
+ring_rank() { printf '%s:%s' "$1" "$ring_ac" | sha256sum | cut -d' ' -f1; }
+if [[ $(ring_rank "$first_url") > $(ring_rank "$second_url") ]]; then
+  ranked_roots=("$remote_root" "$second_root")
+else
+  ranked_roots=("$second_root" "$remote_root")
+fi
+cp "$tmpdir/ring-weak-ac" "${ranked_roots[0]}/ac/$ring_ac"
+cp "$tmpdir/ring-strong-ac" "${ranked_roots[1]}/ac/$ring_ac"
+
+write_ring_timeout ring-client
+(cd "$tmpdir/ring-client" && HOLBUILD_CACHE=$tmpdir/ring-client-cache HOLBUILD_CACHE_TRACE=1 \
+  "$HOLBUILD_BIN" --remote-cache "$first_url,$second_url" build --remote-exec "$coordinator" \
+  --remote-only --tactic-timeout 2.5 TimeoutTheory) > "$tmpdir/ring-client.log" 2>&1 ||
+  { cat "$tmpdir/ring-client.log" >&2; exit 1; }
+require_grep 'remote execution: nothing to build remotely' "$tmpdir/ring-client.log"
+require_grep 'entry passed over' "$tmpdir/ring-client.log"
+require_grep 'TimeoutTheory restored from cache' "$tmpdir/ring-client.log"
+refute_grep 'remote batch\|Theory built' "$tmpdir/ring-client.log"
+require_grep '^proof-timeout=2.5$' "$tmpdir/ring-client-cache/actions/$ring_key/manifest"
+cmp "${ranked_roots[0]}/ac/$ring_ac" "$tmpdir/ring-weak-ac"

@@ -141,6 +141,11 @@ struct
     end
   end
 
+  (* Whether theory data of type KEY is in ThyDataSexp's encoding:
+     ThyDataSexp.new registers each key's load hook under this name. *)
+  fun sexp_coded_thydata key =
+    List.exists (fn (h, _) => h = "ThmSetData.onload." ^ key) (Listener.listeners Theory.delta_hook)
+
   (* The digest of the theory data at DAT_PATH that dependents compare and
      that children record for the parent: SHA-1 of the normalized view, or
      of the file when the data has an unexpected shape. *)
@@ -154,11 +159,8 @@ struct
       fun read_data () =
         let val input = TextIO.openIn dat_path
         in HOLsexp.fromStream input before TextIO.closeIn input end
-      (* ThyDataSexp.new registers each key's load hook under this name. *)
-      val hooks = map #1 (Listener.listeners Theory.delta_hook)
-      fun sexp_coded key = List.exists (fn h => h = "ThmSetData.onload." ^ key) hooks
     in
-      sha1_string (serialize_sexp (normalized_theory_data {sexp_coded = sexp_coded} (read_data ())))
+      sha1_string (serialize_sexp (normalized_theory_data {sexp_coded = sexp_coded_thydata} (read_data ())))
       handle Fail why => as_written why
            | Subscript => as_written "a string index is out of range"
     end

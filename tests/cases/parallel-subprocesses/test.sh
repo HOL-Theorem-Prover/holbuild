@@ -103,7 +103,7 @@ val _ = export_theory();
 SML
 
 start_seconds=$SECONDS
-if (cd "$fail_project" && "$HOLBUILD_BIN" -j2 build --skip-checkpoints --skip-proof-steps) > "$tmpdir/fail-build.log" 2>&1; then
+if (cd "$fail_project" && "$HOLBUILD_BIN" -j2 build --fail-fast --skip-checkpoints --skip-proof-steps) > "$tmpdir/fail-build.log" 2>&1; then
   echo "expected parallel build failure" >&2
   exit 1
 fi

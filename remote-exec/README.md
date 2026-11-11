@@ -66,6 +66,41 @@ coordinator reads when an action completes, so run it before the new image
 serves. To roll back to an image predating `0009`, use the current image to
 run `alembic downgrade 0008` first.
 
+Migration `0011` adds `batches.fail_fast` (default false). New build batches
+finish independent actions after a final failure, cancelling only its blocked
+descendants. Their action events retain the `cancelled` state with a
+`skipped because of ...` reason, so existing clients and workers remain
+compatible. No action-spec or minimum client version changes are needed.
+Clients can request `?fail_fast=true` on submission to retain early stopping.
+Run batches still finish `done` with independent per-action failures.
+
+Apply the migration before serving with the new coordinator. An image whose
+migration code predates `0011` cannot run `alembic upgrade head` against a
+database already at `0011`, even though the added columns are compatible with
+its queries. Deployments that migrate on every service start must account for
+this before pinning an older image.
+
+Migration `0012` adds the index `actions_ready_order` over each batch's ready
+actions in claim order; it changes no table. A coordinator before it keeps
+working on a database at `0012`, but its migration code does not know the
+revision, so roll back by deploying a forward patch release that restores the
+older coordinator code and keeps `0012`, or use the current image to run
+`alembic downgrade 0011` before starting an older image.
+
+Migration `0013` adds the index `actions_batch_unfinished` over each batch's
+unfinished actions, which the check after every completion reads; it changes
+no table. Roll back the same way: a forward patch release that keeps `0013`,
+or `alembic downgrade 0012` with the current image.
+
+For a rollback that preserves the schema, deploy a reviewed forward patch
+release restoring fail-fast dispatch while retaining migrations `0010` and
+`0011` and terminal-state aggregation for already-running keep-going batches.
+Clients can use `--fail-fast` for immediate early stopping
+on new submissions. To deploy a pre-`0011` image instead, first drain or cancel
+running batches, since an older coordinator does not implement their
+keep-going completion rules, then use the current image to downgrade to the
+older image's migration head. Existing action states need no conversion.
+
 The coordinator reads its settings from the environment:
 
 | Variable | Meaning | Default |
@@ -81,9 +116,11 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_RETENTION_HOURS` | age after which a finished batch is deleted | 168 |
 | `REMOTE_EXEC_BATCH_DEADLINE_HOURS` | age at which a batch still running fails | 12 |
 | `REMOTE_EXEC_HINT_TTL_DAYS` | age after which an unused peak hint is deleted | 30 |
-| `REMOTE_EXEC_DATABASE_POOL_SIZE` | database connections the coordinator holds at most | 20 |
+| `REMOTE_EXEC_DATABASE_POOL_SIZE` | database connections the coordinator holds at most | 50 |
 | `REMOTE_EXEC_DATABASE_POOL_TIMEOUT_S` | how long a request waits for a free connection before it fails | 10 |
 | `REMOTE_EXEC_EVENTS_KEEPALIVE_SECONDS` | how long an event stream stays quiet before it sends an empty line | 15 |
+| `REMOTE_EXEC_EVENTS_POLL_SECONDS` | least time between an event stream's reads of its batch, which a write to it by the same coordinator process starts | 1 |
+| `REMOTE_EXEC_EVENTS_FALLBACK_SECONDS` | most time between an event stream's reads, for other coordinator processes' writes | 10 |
 | `REMOTE_EXEC_SWEEP_SECONDS` | period of the sweep (lease expiry, releases, retention, scaling) | 5 |
 | `REMOTE_EXEC_RUN_SLOTS` | fleet-wide running run-action cap; 0 pauses new run claims | 30 |
 | `REMOTE_EXEC_RUN_FLOOR` | running run actions allowed ahead of ready builds, clamped to `REMOTE_EXEC_RUN_SLOTS` | 0 |
@@ -112,13 +149,23 @@ pool, say) empty first and scale in.
 
 On `SIGTERM`, a worker stops claiming and gives its running action up to
 `--drain-seconds` (20 by default) to finish and report its result. At the
-deadline it stops the action's process group and reports `unavailable`, so
+deadline it stops HOL and reports `unavailable`, so
 the coordinator retries immediately without counting the interrupted attempt.
 Waiting for work or preparing a release stops immediately. Repeated `SIGTERM`
 does not extend the deadline; interactive Ctrl-C retains its usual behavior.
-Leave at least 10 seconds between the drain window and the container's stop
-timeout for process cleanup and result reporting. For example, a 120-second
-container stop timeout allows `--drain-seconds 95`. An unreachable coordinator
+With `--share-heaps`, the driver gets up to 8 additional seconds after the
+natural-finish drain window to publish completed checkpoints. Lease loss gives
+it up to 15 seconds, also bounded by the drain deadline plus 8 seconds if a
+drain starts meanwhile. Only the driver receives the initial termination signal:
+it stops HOL, waits for sandbox cleanup and output validation, and publishes
+committed checkpoints. Repeated signals do not interrupt publication. The worker
+then terminates the remaining process group, escalating to SIGKILL after 2 seconds.
+Interrupted actions never report `built`; a lost lease reports no result.
+Without `--share-heaps`, the worker stops the process group immediately.
+Leave at least 20 seconds between the drain window and the container's stop
+timeout when sharing heaps (10 otherwise), for publication, process cleanup,
+result reporting and release of task protection. For example, a 120-second
+container stop timeout allows `--drain-seconds 100` with shared heaps. An unreachable coordinator
 can still prevent reporting before the container is forcibly killed; its lease
 then expires normally. ECS protection is best effort, and a rejection in an
 HTTP-success response is logged along with transport failures.
@@ -194,11 +241,17 @@ workers do when they aren't running HOL:
 - `release`: finding and, on first use, building the action's holbuild release;
 - `before_hol`, `hol`, `after_hol`: running `exec-action`, split at the start
   of its first HOL child and the end of its last (fetching and restoring
-  inputs before, publishing outputs and checkpoints after). A HOL child is a
+  inputs before, publishing outputs and uploading the log after, until its
+  result). A HOL child is a
   descendant of `exec-action` holding a `--cooperate-dir` lease, which the
   worker looks for every second;
-- `exec`: all of `exec-action`, for a worker without `--cooperate-dir`;
-- `complete`: reporting the result.
+- `exec`: all of `exec-action` until its result, for a worker without
+  `--cooperate-dir`;
+- `complete`: reporting the result;
+- `after_result`: `exec-action` after its result is reported, publishing
+  shared checkpoints and tools for later actions, emptying the action's
+  directory and refreshing the cache-cap measurement. The worker stops it
+  120 s after the result.
 
 ## Action isolation
 
@@ -242,6 +295,11 @@ to complete cleanup fails the action and does not harvest outputs. This does
 not provide resource isolation against fork storms. Unsupported confinement
 fails closed.
 
+The action can read its own process directory under `/proc`, without a general
+`/proc` grant. The supervisor holds that directory open through cleanup because
+procfs can otherwise recreate its inode after dentry eviction, losing the
+inode-based Landlock grant. The action inherits no descriptor for this pin.
+
 The child inherits only executable lookup, locale, timezone, certificate lookup,
 those solver locations and `HOLBUILD_RUN_*` settings; a solver outside the
 system directories needs its directory in `HOLBUILD_ACTION_READ_DIRS`. Other
@@ -249,7 +307,10 @@ operator environment overrides use their runtime defaults. Cancellation kills th
 tails may be lost. Mediated signals identify the supervisor as their sender.
 
 `--share-heaps` publishes heaps by dependency context and checkpoints by script
-prefix in the remote cache; use it only with a single tenant or trusted cache
+prefix in the remote cache. Dependency heaps are shared even for older action
+specs that disable theorem checkpoints; `skip-checkpoints` disables both. Only
+completed saves with valid metadata are published, including after interruption.
+Use shared heaps only with a single tenant or trusted cache
 submitters. It does not provide tenant authorization for shared cache entries.
 
 The supervisor confirms cleanup and output validation through a completion
@@ -262,19 +323,36 @@ group, so an outer timeout's forced group shutdown does not interrupt cleanup.
 The launcher supplies its identity before starting the supervisor, which
 refuses to start HOL if it has already lost that parent.
 
-HOL toolchain bootstrap executes trusted source. Before using a toolchain,
-workers require its revision to be a commit ancestor of an approved branch.
-The default approves `develop` and `master` in the canonical HOL repository.
+Everything the selected HOL toolchain runs is confined the same way:
+configuring and building HOL, loading its heap, listing its sources with
+Holmake and `git`, and compiling and running the dependency analyser. A HOL
+build may write only its own tree. Within it, the supervisor applies its mode
+changes, never setuid or setgid, and its links may not point outside. The
+repository's `.git` directory is out of its reach while it builds. The worker
+clones the exact commit without user or system Git configuration, hooks,
+submodules or credential prompts, and checks that the checkout is that
+commit. A built toolchain is checked like action outputs before it is used:
+no links out of the tree, hard links, special or setuid files, and every
+directory listable. A toolchain restored from the remote cache is checked the
+same way before anything in it runs.
+
+Workers accept a toolchain only from a trusted repository. The default
+approves commits on `develop` and `master` in the canonical HOL repository.
 Administrators may replace these defaults with whitespace-separated
 `HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES` entries of the form
 `https://example.org/HOL.git=develop,master` for trusted mirrors or forks.
 Only these branch refs are fetched, never pull-request refs or arbitrary
 revision objects. Proven ancestry is reused from a worker-owned Git graph;
 a branch history rewrite takes effect when the next unknown revision triggers
-a refresh. Use protected branches for these trust roots.
-Bootstrap compiler/build children also have credential settings removed from
-their environment. This restriction is worker configuration, not an action
-spec option. Administrators can grant additional read-only runtime directories
+a refresh. Use protected branches for these trust roots. The entry `*`
+accepts any `https://` repository at a full commit hash, with no branch
+check, since no step runs the toolchain's code outside the sandbox; such
+toolchains still cost worker time to build.
+The worker enables `*` only for clients from 0.14.0 onward, which confine
+toolchain execution. For older clients it removes `*`, preserving any explicit
+repository entries. If only `*` was configured, older clients use their
+canonical HOL defaults. Empty values remain invalid.
+Trust is worker configuration, not an action spec option. Administrators can grant additional read-only runtime directories
 with colon-separated `HOLBUILD_ACTION_READ_DIRS`; do not include credentials
 or shared writable state in these directories.
 
@@ -369,11 +447,12 @@ a run batch and cancels its unfinished actions.
   the admission lock. Set the floor back to 0 and restart the coordinator
   to restore strict build priority. Claims select with `FOR UPDATE SKIP LOCKED`,
   write a lease with an expiry and commit; no transaction stays open while
-  the worker builds. Among the running batches, the claim picks the one with
-  the fewest running actions, then the one that least recently had an action
+  the worker builds. Among running batches of the selected class and tier,
+  the claim picks the highest scheduling priority first, then the fewest running actions among
+  equal priorities, then the one that least recently had an action
   claimed (one that never had goes first), then the oldest: a new batch gets
-  the next free worker even while a wide one holds the rest, and batches
-  take turns when there are more of them than workers. Within the batch, it
+  the next free worker among equal-priority batches even while a wide one holds
+  the rest, and those batches take turns when there are more of them than workers. Within the batch, it
   picks the action with the longest chain of dependents in the batch, then
   the one with the most dependents, then by theory name, so the critical
   path starts first and the ready frontier widens fastest. An expired lease returns the
@@ -520,13 +599,18 @@ the action carries on.
 
 Every request carries `Authorization: Bearer <token>`: the client token for
 `/v1/batches…` and `/v1/queue`, the worker token for `/v1/work…`. A wrong or missing token
-gets 401. Errors are JSON `{"detail": "<message>"}`.
+gets 401. Errors are JSON `{"detail": "<message>"}`. Any route answers 503
+`{"detail": "database busy"}`, with `Retry-After`, when no database connection
+came free within `REMOTE_EXEC_DATABASE_POOL_TIMEOUT_S` (3 s). Keep it under the
+workers' 15 s wait for a heartbeat or completion answer: past that a worker
+retries, and a request still queued for a connection would be done twice.
 
 ### Client
 
-`POST /v1/batches?profile=<name>&class=build|run` with the batch text as the body
+`POST /v1/batches?profile=<name>&class=build|run&priority=<integer>` with the batch text as the body
 (`text/plain`). `profile` defaults to `default`; `class` defaults to `build`.
-An unknown class returns 422.
+An unknown class returns 422. `priority` defaults to 0 and accepts integers
+from 0 to 2147483647; invalid values return 422. Existing batches retain priority 0.
 
 - 201 `{"batch_id": "<uuid>"}`
 - 400 when the batch is malformed (bad header or line, duplicate action, an
@@ -575,14 +659,16 @@ An unknown class returns 422.
   {"type": "batch", "state": "done|failed|cancelled", "failure": "<message>|null"}
   ```
   A client detaches by closing the connection and reattaches by opening the
-  stream again with the same `batch_id`.
+  stream again with the same `batch_id`. A read of the batch that fails while
+  the database is out of reach is retried; the stream stays open.
 - 404 when there is no such batch
 
 `GET /v1/queue`
 
-- 200 `{"waiting": 0, "ready_standard": 0, "ready_high": 0, "running_standard": 0, "running_high": 0, "ready_run": 0, "running_run": 0, "run_slots": 30, "run_floor": 0, "desired_burst_workers": 0, "hosts": [<host>, …], "phases": <phases>, "scaler": <scaler>}`:
+- 200 `{"waiting": 0, "ready_standard": 0, "ready_high": 0, "running_standard": 0, "running_high": 0, "ready_run": 0, "running_run": 0, "run_slots": 30, "run_floor": 0, "desired_burst_workers": 0, "max_burst_workers": 0, "hosts": [<host>, …], "phases": <phases>, "scaler": <scaler>}`:
   the unfinished actions of running batches, the configured run cap (`run_slots`)
-  and effective reserved floor (`run_floor`, clamped to that cap), the burst worker target, the
+  and effective reserved floor (`run_floor`, clamped to that cap), the burst worker target and its cap
+  (`max_burst_workers`), the
   hosts whose workers reported to this coordinator process in the last 2
   minutes, by id, the sums of the phase reports it got in the last 10
   minutes (see "Running"), and the last run of `REMOTE_EXEC_SCALE_CMD` in
@@ -593,7 +679,7 @@ An unknown class returns 422.
   ```
   The phases:
   ```json
-  {"window_s": 600, "reports": 4210, "seconds": {"memory_wait": 0.0, "claim": 812.4, "idle": 0.0, "lease": 12.5, "release": 31.0, "before_hol": 40210.7, "hol": 52300.2, "after_hol": 44102.9, "exec": 0.0, "complete": 950.3}}
+  {"window_s": 600, "reports": 4210, "seconds": {"memory_wait": 0.0, "claim": 812.4, "idle": 0.0, "lease": 12.5, "release": 31.0, "before_hol": 40210.7, "hol": 52300.2, "after_hol": 44102.9, "exec": 0.0, "complete": 950.3, "after_result": 3020.4}}
   ```
   Tier counts include both classes; `ready_run` and `running_run` are the
   run subsets across tiers. A phase's share of the workers' time is its
@@ -643,6 +729,18 @@ A worker that can't reach the coordinator or gets a 5xx, as while the
 coordinator restarts, retries a `complete` until the action's lease would run
 out.
 
+Migration `0014` adds `batches.priority`, with default 0. Before rolling back
+to a coordinator image predating it, stop the coordinator and use the new image
+to run `alembic downgrade 0013`, then start the older image. This removes only
+scheduling metadata; action inputs, outputs and leases are unchanged.
+
+`GET /v1/queue` includes `ready_priority` and `running_priority`: subsets of
+the tier counts for actions whose batch has a positive priority. Do not add
+these subsets to the tier totals. Priority does not change burst demand.
+Strict priority suits occasional finite batches; there is no aging or reserved
+normal share. Normal work can use workers for which no priority action is ready,
+including while a priority batch waits on dependencies.
+
 ## Tests
 
 The tests need a Postgres role that may create databases:
@@ -672,7 +770,10 @@ phase and last operation error; it omits provider operation tokens. A successful
 heartbeat clears a transient error even while a member is serving or waiting
 for its drain interval.
 
-Clients refresh membership every 30 seconds when the deployment sets
+The coordinator reuses the serving slots it read for
+`REMOTE_EXEC_CACHE_MEMBERS_TTL_SECONDS` (2 s), since workers ask about as often
+as they claim, and answers with the slots it last read while the database can't
+answer. Clients refresh membership every 30 seconds when the deployment sets
 `HOLBUILD_REMOTE_CACHE_DISCOVERY_URL`. Set `HOLBUILD_REMOTE_CACHE_ALLOWED_URLS`
 to the comma-separated identities allowed to receive the cache credential,
 including the permanent pair and every reserved temporary identity. Discovery

@@ -116,6 +116,13 @@ async def test_sweep_runs_the_scale_command_when_the_held_target_changes_and_kee
     assert calls.read_text().split() == ["0", "2", "2", "0"]
 
 
+async def test_queue_reports_the_burst_worker_cap(http: httpx.AsyncClient, coordinator: Coordinator) -> None:
+    coordinator.settings.max_burst_workers = 420
+    response = await http.get("/v1/queue", headers=CLIENT)
+    assert response.status_code == 200
+    assert response.json()["max_burst_workers"] == 420
+
+
 async def test_queue_reports_counts_and_the_desired_burst_workers(
     http: httpx.AsyncClient, coordinator: Coordinator, tmp_path: Path
 ) -> None:
@@ -138,9 +145,12 @@ async def test_queue_reports_counts_and_the_desired_burst_workers(
         "running_high": 1,
         "ready_run": 2,
         "running_run": 1,
+        "ready_priority": 0,
+        "running_priority": 0,
         "run_slots": 30,
         "run_floor": 0,
         "desired_burst_workers": 0,  # the route's coordinator has no burst workers to ask for
+        "max_burst_workers": 0,
         "hosts": [],
         "phases": None,  # see test_queue_sums_the_phases_workers_reported_in_the_last_ten_minutes
         "scaler": None,  # nor a scale command
@@ -393,7 +403,7 @@ async def test_queue_sums_the_phases_workers_reported_in_the_last_ten_minutes(
         assert response.status_code == 204
         now += timedelta(seconds=300)
 
-    seconds = dict.fromkeys(["memory_wait", "claim", "idle", "lease", "release", "before_hol", "exec", "complete"], 0.0)
+    seconds = dict.fromkeys(["memory_wait", "claim", "idle", "lease", "release", "before_hol", "exec", "complete", "after_result"], 0.0)
     totals = (await http.get("/v1/queue", headers=CLIENT)).json()["phases"]
     assert totals == {"window_s": 600, "reports": 1, "seconds": {**seconds, "hol": 10.0, "after_hol": 12.0}}
 

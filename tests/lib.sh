@@ -115,8 +115,8 @@ use_case_cache() {
 
 # A fake HOL checkout whose bin/build produces a minimal toolchain without
 # Poly/ML. Gates: HOLBUILD_TEST_BUILD_EVENT/GATE pause the build, and
-# HOLBUILD_TEST_FAKE_HOL_EVENT/GATE pause the built bin/hol. Requires
-# HOLBUILD_TEST_BUILD_COUNT.
+# HOLBUILD_TEST_FAKE_HOL_EVENT/GATE pause the built bin/hol.
+# HOLBUILD_TEST_BUILD_COUNT, if set, counts the builds.
 write_fake_hol() {
   local hol=$1
   mkdir -p "$hol"
@@ -141,7 +141,10 @@ EOF
   cat > "$hol/bin/build" <<'SH'
 #!/usr/bin/env sh
 set -eu
-printf 'build %s\n' "$*" >> "${HOLBUILD_TEST_BUILD_COUNT:?}"
+# exec-action builds confined, without the test's environment or files.
+if [ -n "${HOLBUILD_TEST_BUILD_COUNT:-}" ]; then
+  printf 'build %s\n' "$*" >> "$HOLBUILD_TEST_BUILD_COUNT"
+fi
 if [ "${HOLBUILD_TEST_FAIL_LOCAL_BUILD:-}" = 1 ]; then
   exit 71
 fi
@@ -151,7 +154,8 @@ fi
 if [ -n "${HOLBUILD_TEST_BUILD_GATE:-}" ]; then
   cat "$HOLBUILD_TEST_BUILD_GATE" >/dev/null
 fi
-touch built
+# Not touch: a confined build cannot set file times.
+: > built
 mkdir -p bin sigobj src/runtime/.hol/locks
 printf 'fake-state\n' > bin/hol.state
 printf 'volatile\n' > src/runtime/.hol/locks/owner

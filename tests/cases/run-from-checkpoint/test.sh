@@ -28,6 +28,9 @@ run_from() {
 tmpdir=$(make_temp_dir)
 cleanup() { cleanup_temp_dir "$tmpdir"; }
 trap cleanup EXIT
+# These runs start from the deps_loaded checkpoints of a plain build; a
+# pipelined theory saves none.
+export HOLBUILD_PIPELINE=off
 use_case_cache "$tmpdir/cache"
 
 # A dependency package with a theory, and a .sig/.sml pair sharing one name.
@@ -256,8 +259,8 @@ rm -rf "$project/.holbuild"
   { cat "$tmpdir/cache-hit.log" >&2; exit 1; }
 require_heap_fallback cache "$no_checkpoint_reason"
 
-# A static error discards and rewrites deps_loaded; once the source is
-# reverted, a session starts from the rewritten one.
+# A static error keeps deps_loaded; once the source is reverted, a session
+# starts from it.
 sed -i 's/^val _ = export_theory();$/val b3_thm = store_thm("b3_thm", ``T``, ACCEPT_TAC TRUTH);\nval _ = export_theory();/' \
   "$project/src/BScript.sml"
 (cd "$project" && "$HOLBUILD_BIN" build BTheory) > "$tmpdir/fresh.log" 2>&1 ||

@@ -28,6 +28,10 @@ use "sml/holbuild-script.sml";
 structure D = HolbuildDependencies
 structure P = HolbuildAnalysisProtocol
 
+fun parse_response path requested =
+  let val input = TextIO.openIn path
+  in D.parse_analyser_response (TextIO.inputAll input before TextIO.closeIn input) requested end
+
 fun fail message = (TextIO.output (TextIO.stdErr, message ^ "\n");
                     OS.Process.exit OS.Process.failure)
 fun assert message condition = if condition then () else fail message
@@ -72,7 +76,7 @@ val _ =
         P.join ["end"]])
 
 val parsed =
-  D.parse_analyser_response response_path
+  parse_response response_path
     [("1", "AScript.sml"), ("2", "EmptyScript.sml"), ("3", "BScript.sml")]
 
 fun require_deps label deps loads uses extra_deps extra_outputs mentions =
@@ -101,7 +105,7 @@ val _ =
         P.join ["end-file", "1"]])
 
 val _ =
-  (D.parse_analyser_response missing_end_path [("1", "AScript.sml")];
+  (parse_response missing_end_path [("1", "AScript.sml")];
    fail "missing analyser response end was accepted")
   handle D.Error msg =>
     assert "missing end error should mention end" (String.isSubstring "missing end" msg)
@@ -116,7 +120,7 @@ val _ =
         P.join ["load", "A"],
         P.join ["end"]])
 val _ =
-  (D.parse_analyser_response truncated_file_path [("1", "AScript.sml")];
+  (parse_response truncated_file_path [("1", "AScript.sml")];
    fail "truncated analyser response was accepted")
   handle D.Error msg =>
     assert "truncated response should identify missing end-file"
@@ -126,7 +130,7 @@ fun malformed_response name requested lines expected =
   let val path = join(tmp, name)
       val _ = write_text path (response_text lines)
   in
-    (D.parse_analyser_response path requested;
+    (parse_response path requested;
      fail (name ^ " was accepted"))
     handle D.Error msg => assert (name ^ " error") (String.isSubstring expected msg)
   end

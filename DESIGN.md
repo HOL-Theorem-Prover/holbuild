@@ -517,6 +517,20 @@ their implementation. HOL's current
 need auxiliary internal load paths or rewritten non-semantic load copies while
 preserving canonical artifacts.
 
+Every load list holbuild writes (a theory's preload, a `.uo` manifest, the
+manifests a remote worker restores) is in Holmake's order. Holmake's `.uo`
+lists a target's direct dependencies sorted by directory, then file name, and
+HOL loads them depth first; the order of names in a script's header doesn't
+reach it. Load order is observable: a library that registers data as each
+theory loads (cv_compute's `cv_rep` theorems, say) keeps the last
+registration. holbuild sorts by `(tier, package, directory, file)`. Tier 0 is
+HOL's own tree: `sigobj` for HOL's theories and libraries, and the source
+directory for a package taken from HOL's repository. Each other package comes
+after, by its depth in the package graph counting only packages outside HOL's
+tree, then by its name and the directory relative to its root. That is Holmake's order when HOL and the packages are
+checked out side by side with HOL sorting first, and unlike Holmake's it
+doesn't depend on where the trees are checked out.
+
 ## Invalidation and action keys
 
 Each build action has an input key derived from resolved facts, not raw paths:
@@ -890,6 +904,16 @@ incrementality work should make this opportunistic reuse fire in more structural
 contexts, especially around dynamic choices and richer structural frame/event
 snapshots, while preserving the same fallback-on-mismatch contract.
 
+A checkpoint that cannot be loaded (an unreadable or missing heap, or a heap
+without holbuild's runtime) is discarded together with the checkpoints saved
+after it, and the build retries from the next earlier context. An ML static
+error, such as an undeclared identifier, in the source run after a checkpoint
+is a source error: the build fails with it at once and keeps the checkpoint.
+holbuild does not try to detect a checkpoint that loads but holds the wrong
+state. Checkpoint paths are keyed on the dependency and source-prefix keys,
+and every passing build and every tactic failure already trusts the loaded
+state, so retrying only when a static error appears would protect nothing.
+
 The prototype currently instruments AST `HOLTheoremDecl` declarations, i.e.
 modern goal/proof forms such as `Theorem ... Proof ... QED`. It parses the HOL
 source AST before expansion to ML, uses theorem/tactic spans to insert a theorem
@@ -990,10 +1014,9 @@ opts out of theorem instrumentation: with checkpoints still enabled, the build c
 still save and consult `deps_loaded`, but there are no
 theorem-context/failed-prefix proof-navigation checkpoints and no
 tactic timeout enforcement for that build.
-Theorem, declaration and failed-prefix checkpoints are saved only in the
-requested targets (with none given, the default targets, or every root-package
-theory when there are none); every theory keeps `deps_loaded` and proof steps.
-`--all-checkpoints` saves them in every root-package theory.
+Theorem, declaration and failed-prefix checkpoints are saved in every theory
+included by the proof scope (root-package theories by default).
+`--all-checkpoints` is a compatibility alias for this default.
 `holbuild run --from THEORY` and `repl --from THEORY` start interactive sessions
 from THEORY's `deps_loaded` while it is current, and load THEORY on top when its
 metadata matches its current input key. `run` takes no project lock, so `--from`
@@ -1029,6 +1052,18 @@ property of the declared entry point graph, not of the current request, except t
 but local metadata/cache records the timeout a successful build satisfied; a success under
 60s may satisfy a later 180s request, while a success under 180s does not satisfy a later
 60s request.
+
+A step that exceeds its timeout runs once more, at once and in the same process, with
+half the timeout. Each timed call computes its result from the proof state it was given
+and commits it to the proof history only on success, so the first attempt leaves the
+proof history unchanged; side effects the tactic itself made before it was stopped (a
+reference, a memo table) remain. If the second
+attempt finishes, the step passes and the theory's build log gets one line,
+`holbuild tactic timeout retry passed: <step> (budget <s>s; retry <ms> ms wall; GC during
+first attempt <ms> ms)`. If it times out too, the step fails as a timeout, reported with
+the full timeout. The intent is that a step that stalled once (on a loaded host, say)
+passes, while one that needs about the timeout of real work still fails. A step that Poly/ML interrupts before
+the timeout is not run again.
 
 A timeout is not a tactic failure: inside `TRY`, an `ORELSE`/`FIRST` alternative or a
 structural repeat body it fails the build at that step instead of taking the combinator's

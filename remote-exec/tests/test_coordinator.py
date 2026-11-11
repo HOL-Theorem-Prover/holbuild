@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import time
 from collections.abc import Callable
 from typing import Any
 from uuid import UUID, uuid4
@@ -14,7 +15,7 @@ from remote_exec import coordinator as coordinator_module
 from remote_exec.app import create_app
 from remote_exec.coordinator import Coordinator, _claim_rank
 from remote_exec.formats import parse_result
-from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache
+from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache, Settled
 
 CLIENT = {"Authorization": f"Bearer {CLIENT_TOKEN}"}
 WORKER = {"Authorization": f"Bearer {WORKER_TOKEN}"}
@@ -162,6 +163,178 @@ async def test_a_new_batch_goes_ahead_of_a_wide_one_holding_workers(http: httpx.
     # The new batch was claimed from last, but it still runs fewer actions.
     await claim_named(http, "n2")
     await claim_named(http, "w4")
+
+
+async def test_build_claims_share_one_ranking_and_still_spread_over_batches(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claims within claim_ranking_seconds of a ranking take turns over its batches, as fresh rankings would
+    have them, without ranking again; once every batch it ranked is out of ready actions, a claim ranks again, and
+    finds the actions made ready since."""
+    coordinator.settings.claim_ranking_seconds = 3600
+    rankings = 0
+    rank = coordinator._rank
+
+    async def counted(conn: Any, key: tuple[str, ...]) -> Any:
+        nonlocal rankings
+        rankings += 1
+        return await rank(conn, key)
+
+    monkeypatch.setattr(coordinator, "_rank", counted)
+    await submit(http, ["a1", "a2", "a3"])
+    await submit(http, ["b1", "b2"])
+    claimed = [(await claim(http))["theory"] for _ in range(5)]
+    assert claimed == ["pkg:a1", "pkg:b1", "pkg:a2", "pkg:b2", "pkg:a3"]
+    assert rankings == 1
+    assert await claim(http) is None
+    assert rankings == 2
+
+    # A batch that wasn't ranked drops the ranking as soon as it has a ready action.
+    await submit(http, ["c1"])
+    assert (await claim(http))["theory"] == "pkg:c1"
+    assert rankings == 3
+
+
+async def test_a_priority_batch_submitted_while_a_ranking_is_shared_is_claimed_next(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Making a batch the shared ranking lacks ready drops the ranking at once, so a priority batch submitted while
+    claims share one goes first on the next claim, not once the ranking expires."""
+    coordinator.settings.claim_ranking_seconds = 3600
+    rankings = 0
+    rank = coordinator._rank
+
+    async def counted(conn: Any, key: tuple[str, ...]) -> Any:
+        nonlocal rankings
+        rankings += 1
+        return await rank(conn, key)
+
+    monkeypatch.setattr(coordinator, "_rank", counted)
+    await submit(http, ["n1", "n2", "n3"])
+    await claim_named(http, "n1")
+    await submit(http, ["p1", "p2"], priority="1")
+    await claim_named(http, "p1")
+    await claim_named(http, "p2")
+    await claim_named(http, "n2")
+    assert rankings == 2
+
+
+async def test_a_ranking_read_while_a_release_drops_rankings_is_not_shared(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ranking whose read overlapped a release that made an unranked batch ready may predate that batch's
+    actions, so the claims waiting for it use it once and later claims read again."""
+    coordinator.settings.claim_ranking_seconds = 3600
+    entered, go = asyncio.Event(), asyncio.Event()
+    rank = coordinator._rank
+
+    async def held(conn: Any, key: tuple[str, ...]) -> Any:
+        ranking = await rank(conn, key)
+        entered.set()
+        await go.wait()
+        return ranking
+
+    await submit(http, ["a1", "a2"])
+    monkeypatch.setattr(coordinator, "_rank", held)
+    claiming = asyncio.create_task(claim(http))
+    await entered.wait()
+    await submit(http, ["b1"])
+    go.set()
+    assert (await claiming) is not None
+    assert coordinator.rankings == {}
+
+
+async def test_a_claim_after_a_release_does_not_join_a_ranking_read_begun_before_it(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A claim that starts after a release made a priority batch ready reads a ranking of its own rather than
+    joining one whose snapshot predates the batch, and so claims the priority batch."""
+    coordinator.settings.claim_ranking_seconds = 3600
+    entered, go = asyncio.Event(), asyncio.Event()
+    calls = 0
+    rank = coordinator._rank
+
+    async def first_held(conn: Any, key: tuple[str, ...]) -> Any:
+        nonlocal calls
+        calls += 1
+        ranking = await rank(conn, key)
+        if calls == 1:
+            entered.set()
+            await go.wait()
+        return ranking
+
+    await submit(http, ["n1", "n2"])
+    monkeypatch.setattr(coordinator, "_rank", first_held)
+    early = asyncio.create_task(claim(http))
+    await entered.wait()
+    await submit(http, ["p1"], priority="1")
+    try:
+        # Joining the held read would wait for it.
+        async with asyncio.timeout(5):
+            await claim_named(http, "p1")
+    finally:
+        go.set()
+    assert (await early)["theory"] == "pkg:n1"
+    assert calls == 2
+
+
+async def test_a_claims_own_ranking_read_while_a_release_makes_a_priority_batch_ready_is_not_shared(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ranking a claim reads for itself, here after the shared read failed, may predate the actions a release
+    made ready meanwhile even with no ranking kept to drop, so later claims don't share it and claim the priority
+    batch."""
+    coordinator.settings.claim_ranking_seconds = 3600
+    entered, go = asyncio.Event(), asyncio.Event()
+    calls = 0
+    rank = coordinator._rank
+
+    async def failing_then_held(conn: Any, key: tuple[str, ...]) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("pool")
+        if calls > 2:
+            return await rank(conn, key)
+
+        class Slow:
+            """The connection, but a statement's result arrives only once go is set, after its snapshot."""
+
+            async def execute(self, *args: Any) -> Any:
+                result = await conn.execute(*args)
+                entered.set()
+                await go.wait()
+                return result
+
+        return await rank(Slow(), key)
+
+    await submit(http, ["n1", "n2"])
+    monkeypatch.setattr(coordinator, "_rank", failing_then_held)
+    early = asyncio.create_task(claim(http))
+    await entered.wait()
+    await submit(http, ["p1"], priority="1")
+    go.set()
+    assert (await early)["theory"] == "pkg:n1"
+    await claim_named(http, "p1")
+
+
+async def test_a_claim_ranks_for_itself_when_the_shared_ranking_read_fails(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+    rank = coordinator._rank
+
+    async def failing_once(conn: Any, key: tuple[str, ...]) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("pool")
+        return await rank(conn, key)
+
+    monkeypatch.setattr(coordinator, "_rank", failing_once)
+    await submit(http, ["a"])
+    await claim_named(http, "a")
+    assert calls == 2
 
 
 async def test_claims_take_the_deepest_then_the_widest_action_of_a_batch_first(
@@ -783,19 +956,29 @@ async def test_a_waiting_claim_ends_empty_after_its_wait(http: httpx.AsyncClient
 async def test_a_claim_reads_no_finished_actions(
     http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any, classes: list[str]
 ) -> None:
-    """A claim reads the same few pages however many finished actions running and retained batches hold, so
-    claims stay cheap on a busy fleet."""
+    """A claim reads the same few pages however many finished actions running and retained batches hold, and
+    however many ready actions a batch holds, so claims stay cheap on a busy fleet."""
     await submit(http, ["a"])
 
     async def pages_read() -> int:
+        """Pages read ranking the candidates and locking the first one's first ready action."""
+        params = {"tiers": ["standard"], "classes": classes, "run_slots": 30}
+
+        async def explained(statement: sa.TextClause, values: dict[str, object]) -> int:
+            plan = await connection.scalar(sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {statement.text}"), values)
+            return plan[0]["Plan"]["Shared Hit Blocks"] + plan[0]["Plan"]["Shared Read Blocks"]
+
         async with remote_exec_engine.begin() as connection:
             await connection.execute(sa.text("ANALYZE"))
-            plan = await connection.scalar(
-                sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {coordinator_module.CLAIM.text}"),
-                {"tiers": ["standard"], "classes": classes, "run_slots": 30},
-            )
+            pages = await explained(coordinator_module.CLAIM_CANDIDATES, params)
+            first = (await connection.execute(coordinator_module.CLAIM_CANDIDATES, params)).first()
+            if first is not None:
+                pages += await explained(
+                    coordinator_module.CLAIM_ACTION,
+                    {"batch_id": first.batch_id, "class": first.action_class, "tier": first.tier},
+                )
             await connection.rollback()
-        return plan[0]["Plan"]["Shared Hit Blocks"] + plan[0]["Plan"]["Shared Read Blocks"]
+        return pages
 
     before = await pages_read()
     async with remote_exec_engine.begin() as connection:
@@ -811,8 +994,70 @@ async def test_a_claim_reads_no_finished_actions(
                 "FROM batches b, generate_series(1, 20000) g"
             )
         )
+        # Many more ready actions of the running batch, of every class.
+        await connection.execute(
+            sa.text(
+                "INSERT INTO actions (batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier, "
+                "class) "
+                "SELECT b.id, 'ready' || g, 'ac', 's', 'pkg:r' || g, 0, 'ready', 'standard', "
+                "CASE WHEN g % 2 = 0 THEN 'build' ELSE 'run' END "
+                "FROM batches b, generate_series(1, 20000) g WHERE b.state = 'running'"
+            )
+        )
     assert await pages_read() < before + 20
     assert (await claim(http))["theory"] == "pkg:a"
+
+
+async def test_the_finished_check_reads_no_finished_actions(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any
+) -> None:
+    """The check after each completion that its batch has nothing unfinished left reads the same few pages however
+    many actions the batch finished, wherever its last unfinished action lies, and however many unfinished actions
+    other batches hold."""
+    batch_id = await submit(http, ["a"])
+    other = await submit(http, ["b"])
+
+    async def pages_read() -> int:
+        async with remote_exec_engine.begin() as connection:
+            await connection.execute(sa.text("ANALYZE"))
+            plan = await connection.scalar(
+                sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {coordinator_module.FINISH_IF_DONE.text}"),
+                {"id": batch_id},
+            )
+            await connection.rollback()
+        return plan[0]["Plan"]["Shared Hit Blocks"] + plan[0]["Plan"]["Shared Read Blocks"]
+
+    before = await pages_read()
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(
+            sa.text(
+                "INSERT INTO actions (batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier) "
+                "SELECT :id, '00000000' || g, 'ac', 's', 'pkg:d' || g, 0, 'done', 'standard' "
+                "FROM generate_series(1, 20000) g"
+            ),
+            {"id": batch_id},
+        )
+        await connection.execute(
+            sa.text(
+                "INSERT INTO actions (batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier) "
+                "SELECT :id, 'waiting' || g, 'ac', 's', 'pkg:w' || g, 1, 'waiting', 'standard' "
+                "FROM generate_series(1, 20000) g"
+            ),
+            {"id": other},
+        )
+    async with remote_exec_engine.begin() as connection:
+        # Its one unfinished action now last in every order: the newest row, written last, with the greatest key.
+        await connection.execute(
+            sa.text("UPDATE actions SET state = 'done' WHERE batch_id = :id AND theory = 'pkg:a'"), {"id": batch_id}
+        )
+        await connection.execute(
+            sa.text(
+                "INSERT INTO actions (batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier) "
+                "VALUES (:id, 'zzzzzzzz', 'ac', 's', 'pkg:z', 0, 'ready', 'standard')"
+            ),
+            {"id": batch_id},
+        )
+    assert await pages_read() < before + 20
 
 
 async def test_releasing_reads_each_selected_actions_edges_by_key(
@@ -858,15 +1103,48 @@ async def test_releasing_reads_each_selected_actions_edges_by_key(
         for query, parameters in [
             # Leaves the roots' children releasable, so RELEASABLE looks up their parents.
             (coordinator_module.REFRESH_CHILDREN, {"batch_id": new, "keys": roots}),
-            (coordinator_module.RELEASABLE, {"batch_id": new}),
+            (coordinator_module.RELEASABLE_BATCH, {"batch_id": new}),
         ]:
             plan = await connection.scalar(sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {query.text}"), parameters)
             pages = plan[0]["Plan"]["Shared Hit Blocks"] + plan[0]["Plan"]["Shared Read Blocks"]
             assert pages < 50 * width, query.text
-        releasable = await connection.execute(coordinator_module.RELEASABLE, {"batch_id": new})
+        releasable = await connection.execute(coordinator_module.RELEASABLE_BATCH, {"batch_id": new})
         children = {f"k{i}": parents for i in range(width, 2 * width)}
         assert {row.input_key: len(row.parents) for row in releasable} == children
         await connection.rollback()
+
+
+async def test_a_release_pass_over_many_batches_holds_few_transactions_at_once(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, remote_exec_engine: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pass over every batch writes each batch's releases in its own transaction, but holds at most
+    RELEASE_TRANSACTIONS of them at once, so the pass doesn't take every pooled connection."""
+    monkeypatch.setattr(coordinator_module, "RELEASE_TRANSACTIONS", 2)
+    batch_ids = [await submit(http, ["a", "b"], [("b", "a")]) for _ in range(12)]
+    cache.keys.add(ac_key("a"))
+    async with remote_exec_engine.begin() as connection:  # every a built, so every b is releasable
+        await connection.execute(sa.text("UPDATE actions SET state = 'done' WHERE theory = 'pkg:a'"))
+        await connection.execute(sa.text("UPDATE actions SET remaining_deps = 0 WHERE theory = 'pkg:b'"))
+    open_now = peak = 0
+    lock_batch = coordinator._lock_batch
+
+    async def counted(conn: Any, batch_id: UUID) -> str | None:
+        nonlocal open_now, peak
+        open_now += 1
+        peak = max(peak, open_now)
+        try:
+            await asyncio.sleep(0.01)
+            return await lock_batch(conn, batch_id)
+        finally:
+            open_now -= 1
+
+    monkeypatch.setattr(coordinator, "_lock_batch", counted)
+    await coordinator.release()
+
+    assert peak == 2
+    for batch_id in batch_ids:
+        assert (await states(http, batch_id))["b"] == "ready"
 
 
 async def test_memory_failure_moves_to_the_high_tier_and_retries_up_to_max_attempts(
@@ -977,7 +1255,7 @@ def test_a_result_detail_is_read_as_one_line_of_printable_ascii() -> None:
 
 async def test_result_without_an_input_key_is_matched_by_its_spec(http: httpx.AsyncClient) -> None:
     # exec-action leaves input-key empty when it couldn't read the spec.
-    batch_id = await submit(http, ["a", "b"])
+    batch_id = await submit(http, ["a", "b"], fail_fast="true")
     token = await claim_named(http, "a")
     unread = result("a", "failed", "spec-rejected").replace(f"input-key={input_key('a')}", "input-key=")
     wrong_spec = unread.replace(f"spec={spec('a')}", f"spec={spec('b')}")
@@ -988,8 +1266,8 @@ async def test_result_without_an_input_key_is_matched_by_its_spec(http: httpx.As
 
 
 @pytest.mark.parametrize("failure", ["proof", "tactic-timeout", "spec-rejected"])
-async def test_final_failures_fail_the_batch_and_cancel_the_rest(http: httpx.AsyncClient, failure: str) -> None:
-    batch_id = await submit(http, ["a", "b", "c"], [("c", "a")])
+async def test_fail_fast_cancels_the_rest(http: httpx.AsyncClient, failure: str) -> None:
+    batch_id = await submit(http, ["a", "b", "c"], [("c", "a")], fail_fast="true")
     token_a = await claim_named(http, "a")
     token_b = await claim_named(http, "b")
     assert (await complete(http, token_a, result("a", "failed", failure))).status_code == 200
@@ -998,6 +1276,72 @@ async def test_final_failures_fail_the_batch_and_cancel_the_rest(http: httpx.Asy
     assert (status["state"], status["failure"]) == ("failed", f"pkg:a: {failure}")
     assert await states(http, batch_id) == {"a": "failed", "b": "cancelled", "c": "cancelled"}
     assert (await http.post(f"/v1/work/{token_b}/heartbeat", headers=WORKER)).status_code == 409
+
+
+async def test_independent_failures_and_success_finish_before_the_batch_fails(
+    http: httpx.AsyncClient, cache: FakeCache,
+) -> None:
+    batch_id = await submit(http, ["a", "b", "c", "d", "e", "f"], [("c", "a"), ("d", "c"), ("f", "e")])
+    tokens = await claim_all(http, 3)
+    assert set(tokens) == {"a", "b", "e"}
+    assert (await complete(http, tokens["a"], result("a", "failed", "proof"))).status_code == 200
+    assert (await batch(http, batch_id))["state"] == "running"
+    assert await states(http, batch_id) == {
+        "a": "failed", "b": "running", "c": "cancelled", "d": "cancelled", "e": "running", "f": "waiting",
+    }
+    assert (await http.post(f"/v1/work/{tokens['b']}/heartbeat", headers=WORKER)).status_code == 200
+    assert (await complete(http, tokens["b"], result("b", "failed", "tactic-timeout"))).status_code == 200
+    assert (await batch(http, batch_id))["state"] == "running"
+    cache.keys.add(ac_key("e"))
+    assert (await complete(http, tokens["e"], result("e", "built"))).status_code == 200
+    assert (await batch(http, batch_id))["state"] == "running"
+    await build(http, cache, "f")
+    status = await batch(http, batch_id)
+    assert (status["state"], status["failure"]) == ("failed", "pkg:a: proof; pkg:b: tactic-timeout")
+    assert await claim(http) is None
+    events = [json.loads(line) for line in
+              (await http.get(f"/v1/batches/{batch_id}/events", headers=CLIENT)).text.splitlines() if line]
+    actions = {e["theory"]: e for e in events if e["type"] == "action"}
+    for name in ("a", "b"):
+        assert actions[f"pkg:{name}"]["state"] == "failed"
+        assert actions[f"pkg:{name}"]["log_sha256"] == "a" * 64
+    for name in ("c", "d"):
+        assert actions[f"pkg:{name}"]["attempts"] == 0
+        assert actions[f"pkg:{name}"]["last_failure"].startswith("skipped because of pkg:a:")
+    assert actions["pkg:e"]["state"] == "done"
+    assert actions["pkg:f"]["state"] == "done"
+    assert cache.keys == {ac_key("e"), ac_key("f")}
+    assert events[-1]["state"] == "failed"
+
+
+async def test_failed_requeued_parent_revokes_running_descendants(
+    http: httpx.AsyncClient, cache: FakeCache,
+) -> None:
+    batch_id = await submit(http, ["a", "b", "c"], [("b", "a"), ("c", "a")])
+    await build(http, cache, "a")
+    tokens = await claim_all(http, 2)
+    cache.keys.discard(ac_key("a"))
+    assert (await complete(http, tokens["c"], result("c", "failed", "input-missing",
+                           missing=f"theory {input_key('a')}"))).status_code == 200
+    retry = await claim_named(http, "a")
+    assert (await complete(http, retry, result("a", "failed", "proof"))).status_code == 200
+    assert await states(http, batch_id) == {"a": "failed", "b": "cancelled", "c": "cancelled"}
+    assert (await http.post(f"/v1/work/{tokens['b']}/heartbeat", headers=WORKER)).status_code == 409
+    assert (await complete(http, tokens["b"], result("b", "built"))).status_code == 409
+    assert (await batch(http, batch_id))["state"] == "failed"
+
+
+async def test_missing_failed_parent_skips_the_action_instead_of_waiting_forever(
+    http: httpx.AsyncClient,
+) -> None:
+    batch_id = await submit(http, ["a", "b", "c"], [("c", "b")])
+    tokens = await claim_all(http, 2)
+    assert (await complete(http, tokens["a"], result("a", "failed", "proof"))).status_code == 200
+    assert (await complete(http, tokens["b"], result("b", "failed", "input-missing",
+                           missing=f"theory {input_key('a')}"))).status_code == 200
+    assert await states(http, batch_id) == {"a": "failed", "b": "cancelled", "c": "cancelled"}
+    assert (await batch(http, batch_id))["state"] == "failed"
+    assert await claim(http) is None
 
 
 async def test_a_final_failure_without_a_log_gives_its_detail_in_the_batch_failure(http: httpx.AsyncClient) -> None:
@@ -1301,6 +1645,179 @@ async def test_event_streams_of_a_large_batch_poll_only_its_changes(
         assert events[-1] == {"type": "batch", "state": "done", "failure": None}
     assert sorted(reads)[-3:] == [10002] * 3  # one full read per stream
     assert sorted(reads)[-4] <= 2  # the rest read a and b at most
+
+
+async def test_an_event_stream_outlives_a_failed_read_and_resumes_where_it_was(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read that finds no free database connection doesn't end the stream, which would make its client follow
+    the batch again from the start; the next read starts where the failed one would have and gets what changed."""
+    sinces: list[int] = []
+    changes = coordinator.changes
+
+    async def flaky(batch: UUID, since: int) -> Any:
+        sinces.append(since)
+        if len(sinces) == 2:  # the stream's first read after the response started
+            raise sa.exc.TimeoutError("QueuePool limit of size 50 overflow 0 reached")
+        return await changes(batch, since)
+
+    monkeypatch.setattr(coordinator, "changes", flaky)
+    batch_id = await submit(http, ["a"])
+
+    async def follow() -> list[dict[str, Any]]:
+        async with http.stream("GET", f"/v1/batches/{batch_id}/events", headers=CLIENT) as response:
+            assert response.status_code == 200
+            return [json.loads(line) async for line in response.aiter_lines() if line]
+
+    stream = asyncio.create_task(follow())
+    async with asyncio.timeout(5):
+        while len(sinces) < 3:
+            assert not stream.done(), stream.exception()
+            await asyncio.sleep(0.01)
+    await build(http, cache, "a")
+    events = await asyncio.wait_for(stream, 5)
+
+    assert sinces[0] == 0 and sinces[1] == sinces[2] != 0
+    assert [(e["type"], e["state"]) for e in events if e["type"] == "batch" or e["state"] == "done"] == [
+        ("action", "done"),
+        ("batch", "done"),
+    ]
+
+
+async def test_an_event_stream_keeps_alive_while_its_reads_keep_failing(
+    coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reads that each fail after longer than the fallback interval, as pool timeouts do while the database is
+    overloaded, still leave room for the keepalive lines, so a proxy doesn't close the stream as idle."""
+    settings = coordinator.settings.model_copy(
+        update={"events_fallback_seconds": 0.05, "events_keepalive_seconds": 0.1}
+    )
+    failing = True
+    changes = coordinator.changes
+    calls = 0
+
+    async def slow_failure(batch: UUID, since: int) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls > 1 and failing:
+            await asyncio.sleep(0.06)
+            raise sa.exc.TimeoutError("QueuePool limit of size 50 overflow 0 reached")
+        return await changes(batch, since)
+
+    monkeypatch.setattr(coordinator, "changes", slow_failure)
+    async with httpx.AsyncClient(
+        transport=Settled(create_app(coordinator, settings), coordinator), base_url="http://coordinator.test"
+    ) as http:
+        batch_id = await submit(http, ["a"])
+        received: list[str] = []
+
+        async def follow() -> None:
+            async with http.stream("GET", f"/v1/batches/{batch_id}/events", headers=CLIENT) as response:
+                async for line in response.aiter_lines():
+                    received.append(line)
+
+        stream = asyncio.create_task(follow())
+        await asyncio.sleep(0.6)
+        failing = False
+        await build(http, cache, "a")
+        await asyncio.wait_for(stream, 5)
+
+    assert received.count("") >= 3
+    assert json.loads(received[-1]) == {"type": "batch", "state": "done", "failure": None}
+
+
+async def test_a_write_wakes_its_batchs_event_streams_and_idle_streams_wait_for_the_fallback(
+    coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stream reads its batch again as soon as this process writes to it; while nothing is written it waits for
+    the fallback read, for other processes' writes, instead of reading every events_poll_seconds."""
+    settings = coordinator.settings.model_copy(update={"events_fallback_seconds": 60.0})
+    reads = 0
+    changes = coordinator.changes
+
+    async def counted(batch: UUID, since: int) -> Any:
+        nonlocal reads
+        reads += 1
+        return await changes(batch, since)
+
+    monkeypatch.setattr(coordinator, "changes", counted)
+    async with httpx.AsyncClient(
+        transport=Settled(create_app(coordinator, settings), coordinator), base_url="http://coordinator.test"
+    ) as http:
+        batch_id = await submit(http, ["a"])
+
+        async def follow() -> list[dict[str, Any]]:
+            async with http.stream("GET", f"/v1/batches/{batch_id}/events", headers=CLIENT) as response:
+                return [json.loads(line) async for line in response.aiter_lines() if line]
+
+        stream = asyncio.create_task(follow())
+        async with asyncio.timeout(5):
+            while reads < 2:  # the full read, then the one that covers a write before the stream began watching
+                await asyncio.sleep(0.01)
+        await asyncio.sleep(0.5)
+        assert reads == 2
+        await build(http, cache, "a")
+        events = await asyncio.wait_for(stream, 5)
+
+    assert events[-1] == {"type": "batch", "state": "done", "failure": None}
+    assert coordinator.batch_watchers == {}
+
+
+async def test_a_stream_reads_a_burst_of_writes_at_once_but_steady_writes_at_the_poll_rate(
+    coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first few writes to a batch reach its stream at once; a batch written to without pause, as a wide build
+    is, is read about once every events_poll_seconds, not once per write."""
+    settings = coordinator.settings.model_copy(update={
+        "events_poll_seconds": 0.5, "events_burst": 3, "events_burst_spacing_seconds": 0.02,
+        "events_fallback_seconds": 60.0,
+    })
+    reads: list[float] = []
+    changes = coordinator.changes
+
+    async def counted(batch: UUID, since: int) -> Any:
+        reads.append(time.monotonic())
+        return await changes(batch, since)
+
+    monkeypatch.setattr(coordinator, "changes", counted)
+    async with httpx.AsyncClient(
+        transport=Settled(create_app(coordinator, settings), coordinator), base_url="http://coordinator.test"
+    ) as http:
+        batch_id = await submit(http, ["a"])
+
+        async def follow() -> None:
+            async with http.stream("GET", f"/v1/batches/{batch_id}/events", headers=CLIENT) as response:
+                async for _ in response.aiter_lines():
+                    pass
+
+        stream = asyncio.create_task(follow())
+        async with asyncio.timeout(5):
+            while len(reads) < 2:  # the full read, then the one for a write before the stream began watching
+                await asyncio.sleep(0.005)
+        started = time.monotonic()
+        while time.monotonic() - started < 2.0:
+            coordinator._batch_changed(UUID(batch_id))
+            await asyncio.sleep(0.005)
+        during = [t for t in reads[2:] if t >= started]
+        # The bucket held one read after the first two: then one every 0.5 s.
+        assert during and during[0] - started < 0.2
+        assert len(during) <= 1 + 2.0 / 0.5 + 1
+        stream.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await stream
+
+
+async def test_a_request_that_finds_no_free_database_connection_answers_503(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def busy(batch: UUID, since: int) -> Any:
+        raise sa.exc.TimeoutError("QueuePool limit of size 50 overflow 0 reached")
+
+    monkeypatch.setattr(coordinator, "changes", busy)
+    response = await http.get(f"/v1/batches/{uuid4()}/events", headers=CLIENT)
+
+    assert (response.status_code, response.json()) == (503, {"detail": "database busy"})
+    assert response.headers["Retry-After"] == "5"
 
 
 async def test_retention_deletes_old_terminal_batches_and_stale_hints(
@@ -1799,3 +2316,68 @@ async def test_submit_rejects_invalid_heap_limit(http: httpx.AsyncClient, value:
     )
     assert response.status_code == 422
     assert await claim(http) is None
+
+
+async def test_priority_precedes_batch_fair_share_and_preserves_equal_priority_turns(http: httpx.AsyncClient) -> None:
+    await submit(http, ["normal"])
+    await submit(http, ["p11", "p12", "p13"], priority="1")
+    await submit(http, ["p21", "p22"], priority="1")
+    await claim_named(http, "p11")
+    await claim_named(http, "p21")
+    await claim_named(http, "p12")
+    await claim_named(http, "p22")
+    # Priority still wins with three running actions, ahead of a normal batch with none.
+    await claim_named(http, "p13")
+    await claim_named(http, "normal")
+
+
+async def test_normal_build_progresses_while_priority_chain_waits_for_its_parent(http: httpx.AsyncClient) -> None:
+    await submit(http, ["normal1", "normal2"])
+    await submit(http, ["parent", "child"], [("child", "parent")], priority="1")
+    await claim_named(http, "parent")
+    await claim_named(http, "normal1")
+    await claim_named(http, "normal2")
+    assert await claim(http) is None
+
+
+async def test_priority_does_not_override_memory_tier_or_action_class(
+    http: httpx.AsyncClient, remote_exec_engine: Any
+) -> None:
+    await submit(http, ["high"])
+    await submit(http, ["priority"], priority="1")
+    await submit(http, ["run"], **{"class": "run", "priority": "100"})
+    async with remote_exec_engine.begin() as conn:
+        await conn.execute(sa.text("UPDATE actions SET tier = 'high' WHERE theory = 'pkg:high'"))
+    response = await http.post(
+        "/v1/work/claim", headers=WORKER,
+        json={"tier": "high", "also_claim": ["standard"], "worker": "w1"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["theory"] == "pkg:high"
+    await claim_named(http, "priority")
+    await claim_named(http, "run")
+
+
+@pytest.mark.parametrize("value", [None, "0", "2147483647"])
+async def test_missing_priority_defaults_to_zero_and_valid_values_are_stored(
+    http: httpx.AsyncClient, remote_exec_engine: Any, value: str | None
+) -> None:
+    batch_id = await submit(http, ["a"], **({} if value is None else {"priority": value}))
+    async with remote_exec_engine.connect() as conn:
+        actual = await conn.scalar(sa.text("SELECT priority FROM batches WHERE id = :id"), {"id": UUID(batch_id)})
+    assert actual == (0 if value is None else int(value))
+
+
+@pytest.mark.parametrize("value", ["-1", "2147483648", "1.5", "urgent", ""])
+async def test_invalid_priority_is_rejected(http: httpx.AsyncClient, value: str) -> None:
+    response = await http.post("/v1/batches", headers=CLIENT, content=batch_text(["a"]), params={"priority": value})
+    assert response.status_code == 422
+
+
+async def test_queue_reports_priority_subsets_without_double_counting(http: httpx.AsyncClient) -> None:
+    await submit(http, ["normal"])
+    await submit(http, ["p1", "p2", "child"], [("child", "p1")], priority="1")
+    await claim_named(http, "p1")
+    queue = (await http.get("/v1/queue", headers=CLIENT)).json()
+    assert (queue["ready_priority"], queue["running_priority"]) == (1, 1)
+    assert (queue["ready_standard"], queue["running_standard"], queue["waiting"]) == (2, 1, 1)
