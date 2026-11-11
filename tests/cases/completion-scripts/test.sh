@@ -77,8 +77,32 @@ expect_lines "$(bash_complete "$project" "holbuild build --tactic-timeout " holb
 require_no_file "$HOLBUILD_CACHE"
 require_no_file "$project/.holbuild"
 
+# zsh_complete DIR WORD...: what the Zsh function offers for WORD..., the
+# last being the one under the cursor, typed in DIR; compadd and _files are
+# stubbed to print what they were given.
+zsh_complete() {
+  local dir=$1
+  shift
+  (cd "$dir" && zsh -f -c '
+    fpath=("$1" $fpath)
+    autoload -Uz _holbuild
+    compadd() { shift; print -l -- "$@"; }
+    _files() { print "<files>"; }
+    shift
+    words=("$@")
+    CURRENT=$#
+    PREFIX=${words[CURRENT]}
+    _holbuild' zsh "$completions" "$HOLBUILD_BIN" "$@")
+}
+
 if command -v zsh > /dev/null; then
   zsh -n "$completions/_holbuild"
+  expect_lines "$(zsh_complete "$project" clean A)" AlphaTheory AlpineTheory
+  expect_lines "$(zsh_complete "$project" repl --from=Al)" --from=AlphaTheory --from=AlpineTheory
+  expect_lines "$(zsh_complete "$tmpdir" --source-dir "\"$tmpdir/my project\"" clean A)" \
+    AlphaTheory AlpineTheory
+  expect_lines "$(zsh_complete "$tmpdir" --source-dir="$spaced" clean A)" AlphaTheory AlpineTheory
+  expect_lines "$(zsh_complete "$project" build --tactic-timeout "")" "<files>"
 else
   echo "zsh not installed; skipping its syntax check" >&2
 fi

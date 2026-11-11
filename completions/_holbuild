@@ -2,8 +2,13 @@
 # Zsh completion for holbuild. Candidates come from `holbuild __complete`;
 # when it offers none (a file argument, say), zsh completes file names.
 
-local -a candidates
-candidates=("${(@f)$(${words[1]} __complete "${(@)words[2,CURRENT-1]}" "$PREFIX" 2>/dev/null)}")
+# The words as typed, quotes and backslashes included; pass them on as the
+# shell would, with one level of quoting removed and a leading `~/`
+# expanded. Nothing else is expanded: the line is never run.
+local -a args candidates
+args=("${(@Q)words[2,CURRENT-1]}" "${(Q)PREFIX}")
+args=("${(@)args/#\~\//$HOME/}")
+candidates=("${(@f)$(${words[1]} __complete "${args[@]}" 2>/dev/null)}")
 candidates=(${candidates:#})
 if (( ${#candidates} )); then
   compadd -- "${candidates[@]}"
