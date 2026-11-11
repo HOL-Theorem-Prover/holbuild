@@ -1560,25 +1560,41 @@ fun checkpoint_eviction_text ({before_bytes, after_bytes, max_bytes, evicted} : 
   " checkpoint_max_bytes=" ^ bytes_text max_bytes ^
   " evicted=" ^ Int.toString evicted
 
-fun clean_project project days max_checkpoints_gb =
+fun gc_state_path project = project_state_dir project "gc.state"
+
+type project_gc_counts =
+  {stage : int, logs : int, checkpoints : int, checkpoint_bytes_initial : Position.int,
+   eviction : checkpoint_eviction}
+
+(* One full project collection; the caller holds the project lock. Work done
+   while it runs counts towards the next automatic GC. *)
+fun collect_project project days max_checkpoints_gb : project_gc_counts =
   let
+    val _ = write_text (gc_state_path project) "0\n"
     val cutoff = retention_cutoff days
     val checkpoint_dir = project_state_dir project "checkpoints"
     val checkpoint_bytes_initial = checkpoint_bytes checkpoint_dir
-    val stage_removed = remove_stale_children cutoff (project_state_dir project "stage")
-    val log_removed = remove_stale_children cutoff (project_state_dir project "logs")
-    val checkpoint_removed = remove_stale_checkpoint_families cutoff checkpoint_dir
+    val stage = remove_stale_children cutoff (project_state_dir project "stage")
+    val logs = remove_stale_children cutoff (project_state_dir project "logs")
+    val checkpoints = remove_stale_checkpoint_families cutoff checkpoint_dir
     val eviction = evict_oldest_checkpoints_with_stats checkpoint_dir (gb_to_bytes max_checkpoints_gb)
     val _ = write_checkpoint_index_atomically (rebuild_checkpoint_index checkpoint_dir)
     val _ = remove_file (checkpoint_index_dirty_path checkpoint_dir)
   in
-    print ("project clean: removed stage=" ^ Int.toString stage_removed ^
-           " logs=" ^ Int.toString log_removed ^
-           " checkpoints=" ^ Int.toString checkpoint_removed ^
-           " checkpoint_gb_initial=" ^ gb_decimal_text checkpoint_bytes_initial ^
-           " checkpoint_bytes_initial=" ^ bytes_text checkpoint_bytes_initial ^
-           " " ^ checkpoint_eviction_text eviction ^ "\n")
+    {stage = stage, logs = logs, checkpoints = checkpoints,
+     checkpoint_bytes_initial = checkpoint_bytes_initial, eviction = eviction}
   end
+
+fun project_gc_text ({stage, logs, checkpoints, checkpoint_bytes_initial, eviction} : project_gc_counts) =
+  "removed stage=" ^ Int.toString stage ^
+  " logs=" ^ Int.toString logs ^
+  " checkpoints=" ^ Int.toString checkpoints ^
+  " checkpoint_gb_initial=" ^ gb_decimal_text checkpoint_bytes_initial ^
+  " checkpoint_bytes_initial=" ^ bytes_text checkpoint_bytes_initial ^
+  " " ^ checkpoint_eviction_text eviction
+
+fun clean_project project days max_checkpoints_gb =
+  print ("project clean: " ^ project_gc_text (collect_project project days max_checkpoints_gb) ^ "\n")
 
 fun file_exists path = FS.access(path, [FS.A_READ]) handle OS.SysErr _ => false
 
@@ -9448,6 +9464,39 @@ fun auto_cache_gc threshold =
   handle HolbuildCache.Error msg => warn ("automatic gc failed: " ^ msg)
        | e => warn ("automatic gc failed: " ^ General.exnMessage e)
 
+fun read_gc_state project =
+  Option.getOpt (Int.fromString (read_text (gc_state_path project)), 0)
+  handle IO.Io _ => 0
+
+(* After a command that built in PROJECT: the collection `holbuild gc` runs on
+   the project, once THRESHOLD theories were built, restored or exported there
+   since its last GC, counting each abandoned staging directory as one. The
+   count since the last GC is kept in .holbuild/gc.state. Skipped while another
+   process holds the project lock, as auto_cache_gc is for the GC lock. *)
+fun auto_project_gc project threshold =
+  let
+    val work = !HolbuildStatus.project_work
+    val since_gc = read_gc_state project + work
+    fun collect () =
+      collect_project project HolbuildCache.default_retention_days (project_checkpoint_limit_gb project)
+    fun removed_any ({stage, logs, checkpoints, eviction, ...} : project_gc_counts) =
+      stage + logs + checkpoints + #evicted eviction > 0
+  in
+    HolbuildStatus.project_work := 0;
+    if since_gc + length (children (project_state_dir project "stage")) < threshold then
+      (if work > 0 then write_text (gc_state_path project) (Int.toString since_gc ^ "\n") else ())
+    else
+      case HolbuildProjectLock.try_with_lock project "automatic gc" collect of
+          SOME counts =>
+            if removed_any counts andalso
+               not (HolbuildStatus.quiet_mode () orelse HolbuildStatus.json_mode ()) then
+              HolbuildStatus.message_stderr ("holbuild: automatic project gc: " ^ project_gc_text counts ^ "\n")
+            else ()
+        | NONE => write_text (gc_state_path project) (Int.toString since_gc ^ "\n")
+  end
+  handle HolbuildProjectLock.Error msg => warn ("automatic gc failed: " ^ msg)
+       | e => warn ("automatic gc failed: " ^ General.exnMessage e)
+
 (* Factory modules have no on-disk module parents.  Once loaded their code
    is resident, so concurrent eviction only makes a later load use source. *)
 fun module_cache_families cache =
@@ -11184,7 +11233,8 @@ fun export_heap tc (project : HolbuildProject.t) plan output heap_kind =
   in
     if HolbuildToolchain.success status then
       (if echo_child_logs () then HolbuildStatus.message_stdout (read_text log handle _ => "") else ();
-       remove_tree stage)
+       remove_tree stage;
+       HolbuildStatus.count_project_work ())
     else
       raise Error (String.concatWith "\n"
         ["hol buildheap failed while exporting heap: " ^ output,

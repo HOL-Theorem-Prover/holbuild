@@ -1999,7 +1999,34 @@ The coordinator's protocol, in what holbuild uses of it:
   `{"state": "<state>"}`: `cancelled`, or the end a batch that already
   ended reached.
 
-Clean old project and cache state with:
+Builds collect old project and cache state themselves. After a successful
+`build` (including `export --build`, and `build --remote-exec` unless
+`--detach`ed), `heap`, `executable` or `import`, holbuild runs the same
+collection as `holbuild gc` in the foreground when a threshold is passed:
+
+- project GC, once 1000 theories were built, restored from a cache or exported
+  as heaps in the project since its last GC (each leftover staging directory
+  also counts as one);
+- cache GC, once 10 GiB were written into the cache since its last GC (a new
+  action entry counts as 1 MiB, so entries that reuse cached files still
+  count).
+
+Every GC, automatic or `holbuild gc`, restarts its count from zero, so a
+collection that cannot free much (entries used within the retention period
+stay) does not run again until a threshold's worth of new work arrives. The
+counts are kept in `.holbuild/gc.state` and `<cache>/locks/gc-growth.journal`.
+Automatic GC keeps the default 7-day retention, skips a GC another process is
+running (or a project another holbuild is modifying), prints one line on
+stderr only when it removed something, prints nothing under `--quiet` or
+`--json`, and turns a failure into a warning without changing the command's
+exit status. `build --dry-run`, `--execution-plan`, `--watch`, `check`, `run`,
+`repl` and fleet workers never run it. Change the thresholds or turn it off in
+`.holconfig.toml`'s `[gc]` (see Local configuration), or set
+`HOLBUILD_AUTO_GC=0`.
+
+Run `holbuild gc` by hand for a different retention period
+(`--retention-days`), to remove only stale toolchains (`--toolchains-only`), or
+for a one-off cleanup now:
 
 ```sh
 holbuild gc
@@ -2147,6 +2174,11 @@ tactic_timeout = 10.0
 url = "https://cache.example.org"
 curl_config = "/path/to/holbuild-remote-cache.curl"
 
+[gc]
+auto = true
+cache_gb = 10
+project_builds = 1000
+
 [overrides.foo]
 path = "../foo"
 
@@ -2156,7 +2188,12 @@ git = "$BAR_REPO"
 
 `build.jobs` sets local default parallelism, and `build.checkpoint_limit_gb`
 sets the local checkpoint storage budget in GiB; the built-in checkpoint budget
-default is 5. Local `exclude` and `exclude_globs` apply only to the root package.
+default is 5. `[gc]` configures automatic GC (described with `holbuild gc`): `auto =
+false` turns it off, `cache_gb` is the GiB written into the cache that trigger
+a cache GC, `project_builds` the theories built, restored or exported that
+trigger a project GC; the values shown are the defaults. The cache thresholds
+come from the configuration of the project the command runs in, or the
+defaults outside a project. Local `exclude` and `exclude_globs` apply only to the root package.
 Dependency discovery is controlled by each dependency's committed manifest.
 
 `[overrides.NAME]` maps a declared dependency to local workstation source. Use
