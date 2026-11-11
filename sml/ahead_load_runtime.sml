@@ -60,7 +60,14 @@ struct
                        map (fn d => "path " ^ d ^ "\n") (!Meta.loadPath)));
      await "stand-ins")
 
-  fun finish () = (write "finishing" ""; await "ready"; !restore ())
+  (* The plain preload saves its heap after this, so nothing of the load
+     ahead is left in it. *)
+  fun finish () =
+    (write "finishing" "";
+     await "ready";
+     !restore ();
+     dir := ""; recorded := []; count := 0; entries := [];
+     loader := (fn _ => ()); restore := (fn () => ()))
 
   fun enter parent = entries := (parent, Meta.loaded (), !count - 1) :: !entries
 

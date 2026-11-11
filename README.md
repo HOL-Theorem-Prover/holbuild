@@ -1803,12 +1803,15 @@ where HOL stood must load exactly the files the stand-in loaded. Once every
 parent has arrived, the worker takes a plain run's reuse checks: the theory's
 own entry, an earlier build on the same dependency outputs, or with
 `--share-heaps` a shared dependency heap. If one applies, it stops HOL and
-runs as without the option. Otherwise HOL goes on to build the theory, and
-everything after is as in a plain run. A forced or traced action, or one
+runs as without the option. Otherwise the parents' real manifests replace
+the stand-ins, so a parent the script loads itself is the real one, and HOL
+goes on to build the theory; everything after is as in a plain run. A forced or traced action, or one
 whose late parents are all in the remote cache by the time it starts, runs
 as without the option. The action fails as `ahead-abandoned` (exit status 3)
 when it can't go on as a plain run would:
 * its own entry is in the remote cache already;
+* a late parent's spec or source, which only the prediction reads, isn't in
+  the remote cache;
 * a stand-in doesn't match;
 * a restored dependency was built on another build of a late parent;
 * HOL stops early;
