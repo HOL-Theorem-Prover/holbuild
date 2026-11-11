@@ -1075,20 +1075,19 @@ class Coordinator:
                 },
             )
             package, theory = action.theory.split(":", 1)
-            if result.status != "failed":
-                await self._set_state(conn, batch_id, action.input_key, "done")
-                if result.peak_rss_mb is not None:
-                    await self._record_peak(conn, package, theory, action.profile, result.peak_rss_mb)
-                await conn.execute(REFRESH_CHILDREN, {"batch_id": batch_id, "keys": [action.input_key]})
-                await self._finish_if_done(conn, batch_id)
-            elif result.failure == "memory" and action.tier == "standard":
+            if result.failure == "memory" and action.tier == "standard":
                 # The tier it failed on is the hint: future batches place this theory on the high tier.
                 await self._record_peak(conn, package, theory, action.profile, self.settings.standard_tier_mb)
                 await conn.execute(
                     sa.text("UPDATE actions SET tier = 'high' WHERE batch_id = :batch_id AND input_key = :input_key"),
                     {"batch_id": batch_id, "input_key": action.input_key},
                 )
-                await self._retry(conn, batch_id, action.input_key)
+            if result.status != "failed":
+                await self._set_state(conn, batch_id, action.input_key, "done")
+                if result.peak_rss_mb is not None:
+                    await self._record_peak(conn, package, theory, action.profile, result.peak_rss_mb)
+                await conn.execute(REFRESH_CHILDREN, {"batch_id": batch_id, "keys": [action.input_key]})
+                await self._finish_if_done(conn, batch_id)
             elif result.failure == "unavailable" and action.interruptions < self.settings.max_interruptions:
                 # The worker couldn't start or finish it, so it doesn't count as an attempt.
                 await conn.execute(

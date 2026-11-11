@@ -12,6 +12,13 @@ datatype override =
     OverridePath of {name : string, path : string}
   | OverrideGit of {name : string, git : string}
 
+(* Automatic GC after commands that build or import: a project GC once
+   project_builds theories were built, restored or exported since the last
+   one, a cache GC once cache_gb GiB were written into the cache. *)
+type gc_config = {auto : bool, cache_gb : int, project_builds : int}
+
+val default_gc : gc_config = {auto = true, cache_gb = 10, project_builds = 1000}
+
 datatype t =
   LocalConfig of
     { overrides : override list,
@@ -21,13 +28,14 @@ datatype t =
       build_tactic_timeout : real option option,
       checkpoint_limit_gb : int option,
       remote_cache_url : string option,
-      remote_cache_curl_config : string option }
+      remote_cache_curl_config : string option,
+      gc : gc_config }
 
 fun make fields = LocalConfig fields
 val empty = make {overrides = [], build_excludes = [], build_exclude_globs = [],
                   build_jobs = NONE, build_tactic_timeout = NONE,
                   checkpoint_limit_gb = NONE, remote_cache_url = NONE,
-                  remote_cache_curl_config = NONE}
+                  remote_cache_curl_config = NONE, gc = default_gc}
 
 fun override_abs root path =
   let val raw = if Path.isAbsolute path then path else Path.concat(root, path)
@@ -53,12 +61,14 @@ fun validate_override_table (name, table) =
      | (NONE, NONE) => die ("overrides." ^ name ^ " requires path or git"))
 
 fun validate table =
-  (require_known_fields ".holconfig.toml" ["overrides", "build", "remote_cache"] table;
+  (require_known_fields ".holconfig.toml" ["overrides", "build", "remote_cache", "gc"] table;
    Option.app (require_known_fields ".holconfig.toml build"
      ["exclude", "exclude_globs", "jobs", "tactic_timeout", "checkpoint_limit_gb"])
      (table_field table ["build"]);
    Option.app (require_known_fields ".holconfig.toml remote_cache" ["url", "curl_config"])
      (table_field table ["remote_cache"]);
+   Option.app (require_known_fields ".holconfig.toml gc" ["auto", "cache_gb", "project_builds"])
+     (table_field table ["gc"]);
    List.app validate_override_table (named_table_entries table ["overrides"]))
 
 fun parse_override root (name, table) =
@@ -85,6 +95,20 @@ fun positive_build_int table name =
       NONE => NONE
     | SOME build => Option.map (positive_int_field (".holconfig.toml build." ^ name)) (int_at build [name])
 
+fun gc_config table =
+  case table_field table ["gc"] of
+      NONE => default_gc
+    | SOME gc =>
+        let
+          fun positive name default =
+            Option.getOpt (Option.map (positive_int_field (".holconfig.toml gc." ^ name)) (int_at gc [name]),
+                           default)
+        in
+          {auto = Option.getOpt (bool_at gc ["auto"], #auto default_gc),
+           cache_gb = positive "cache_gb" (#cache_gb default_gc),
+           project_builds = positive "project_builds" (#project_builds default_gc)}
+        end
+
 fun parse root =
   let val path = Path.concat(root, ".holconfig.toml")
   in
@@ -105,14 +129,15 @@ fun parse root =
              (case build of NONE => NONE | SOME value => tactic_timeout_at ".holconfig.toml build.tactic_timeout" value ["tactic_timeout"]),
            checkpoint_limit_gb = positive_build_int table "checkpoint_limit_gb",
            remote_cache_url = (case remote of NONE => NONE | SOME value => string_at value ["url"]),
-           remote_cache_curl_config = (case remote of NONE => NONE | SOME value => string_at value ["curl_config"])}
+           remote_cache_curl_config = (case remote of NONE => NONE | SOME value => string_at value ["curl_config"]),
+           gc = gc_config table}
       end
   end
 
 fun for_dependency
       (LocalConfig {overrides, build_jobs, build_tactic_timeout,
                     checkpoint_limit_gb, remote_cache_url,
-                    remote_cache_curl_config, ...}) =
+                    remote_cache_curl_config, gc, ...}) =
   LocalConfig
     {overrides = overrides,
      build_excludes = [],
@@ -121,7 +146,8 @@ fun for_dependency
      build_tactic_timeout = build_tactic_timeout,
      checkpoint_limit_gb = checkpoint_limit_gb,
      remote_cache_url = remote_cache_url,
-     remote_cache_curl_config = remote_cache_curl_config}
+     remote_cache_curl_config = remote_cache_curl_config,
+     gc = gc}
 
 fun overrides (LocalConfig {overrides, ...}) = overrides
 fun build_excludes (LocalConfig {build_excludes, ...}) = build_excludes
@@ -131,5 +157,6 @@ fun build_tactic_timeout (LocalConfig {build_tactic_timeout, ...}) = build_tacti
 fun checkpoint_limit_gb (LocalConfig {checkpoint_limit_gb, ...}) = checkpoint_limit_gb
 fun remote_cache_url (LocalConfig {remote_cache_url, ...}) = remote_cache_url
 fun remote_cache_curl_config (LocalConfig {remote_cache_curl_config, ...}) = remote_cache_curl_config
+fun gc (LocalConfig {gc, ...}) = gc
 
 end

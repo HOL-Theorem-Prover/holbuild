@@ -1175,6 +1175,26 @@ async def test_memory_failure_moves_to_the_high_tier_and_retries_up_to_max_attem
     await claim_named(http, "a", "high")
 
 
+async def test_memory_failure_on_the_last_standard_attempt_fails_the_batch(
+    http: httpx.AsyncClient, cache: FakeCache
+) -> None:
+    batch_id = await submit(http, ["a"])
+    for _ in range(2):
+        token = await claim_named(http, "a")
+        assert (await complete(http, token, result("a", "failed", "internal"))).status_code == 200
+    token = await claim_named(http, "a")
+    assert (await complete(http, token, result("a", "failed", "memory"))).status_code == 200
+
+    status = await batch(http, batch_id)
+    assert (status["state"], status["failure"]) == ("failed", "pkg:a: memory")
+    assert await claim(http, "high") is None
+
+    # The failure still places the theory on the high tier for the next batch.
+    await submit(http, ["a"])
+    assert await claim(http, "standard") is None
+    await claim_named(http, "a", "high")
+
+
 async def test_peak_above_the_standard_tier_places_the_next_batch_high(
     http: httpx.AsyncClient, cache: FakeCache
 ) -> None:

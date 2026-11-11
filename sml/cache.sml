@@ -160,7 +160,7 @@ fun finish_progress (progress as Progress {shown, ...}) =
    write to stderr themselves, so each report gets a line of its own rather
    than one redrawn in place that their output would be appended to. *)
 fun run_gc_stage steps_print stage paths step init =
-  if HolbuildStatus.quiet_mode () then
+  if HolbuildStatus.quiet_mode () orelse HolbuildStatus.json_mode () then
     List.foldl (fn (path, acc) => #1 (step (path, acc))) init paths
   else
     let
@@ -199,31 +199,6 @@ fun read_lines path =
     lines
   end
 
-fun take_token s =
-  let
-    fun loop i =
-      if i >= size s then i
-      else
-        case String.sub(s, i) of
-            #" " => i
-          | #"\t" => i
-          | #"\n" => i
-          | _ => loop (i + 1)
-    val n = loop 0
-  in
-    String.substring(s, 0, n)
-  end
-
-fun blob_ref line =
-  let val clean = trim_newline line
-  in
-    case String.tokens Char.isSpace clean of
-        ["blob", _, hash] => SOME hash
-      | _ =>
-          if has_prefix "blob=" clean then SOME (take_token (String.extract(clean, 5, NONE)))
-          else NONE
-  end
-
 fun empty_blob_set () = Redblackset.empty String.compare
 
 fun add_blob (blob, blobs) = Redblackset.add(blobs, blob)
@@ -236,7 +211,7 @@ fun action_live_blobs action_dir =
     if path_exists manifest then
       List.foldl
         (fn (line, blobs) =>
-            case blob_ref line of
+            case HolbuildFSCacheBackend.blob_ref line of
                 NONE => blobs
               | SOME blob => add_blob (blob, blobs))
         (empty_blob_set ())
@@ -332,30 +307,39 @@ fun cache_gc_lock_error lock owner =
          "lock: " ^ lock ^ "\n" ^
          "owner: " ^ HolbuildFileLock.owner_summary owner)
 
-fun acquire_lock root =
+fun try_acquire_lock root =
   let val lock_path = gc_lock_path root
   in
     case HolbuildFileLock.try_acquire_path {path = lock_path, obsolete_kind = SOME "cache gc"} of
         SOME lock =>
           ((HolbuildFileLock.write_text (gc_lock_owner_path lock_path) (gc_lock_owner ());
-            GcLock lock)
+            SOME (GcLock lock))
            handle e => (HolbuildFileLock.release lock; raise e))
-      | NONE =>
-          let val owner = Option.getOpt(current_gc_lock_owner lock_path, unavailable_gc_lock_owner ())
-          in raise cache_gc_lock_error lock_path owner end
+      | NONE => NONE
   end
   handle HolbuildFileLock.Error msg => raise Error ("could not acquire cache gc lock: " ^ msg)
+
+fun acquire_lock root =
+  case try_acquire_lock root of
+      SOME lock => lock
+    | NONE =>
+        let
+          val lock_path = gc_lock_path root
+          val owner = Option.getOpt(current_gc_lock_owner lock_path, unavailable_gc_lock_owner ())
+        in raise cache_gc_lock_error lock_path owner end
 
 fun release_gc_lock (GcLock lock) =
   (HolbuildFileLock.remove_file (gc_lock_owner_path (HolbuildFileLock.path lock));
    HolbuildFileLock.release lock)
 
-fun with_lock root f =
-  let val lock = acquire_lock root
-  in
-    (f () before release_gc_lock lock)
-    handle e => (release_gc_lock lock; raise e)
-  end
+fun with_gc_lock lock f =
+  (f () before release_gc_lock lock)
+  handle e => (release_gc_lock lock; raise e)
+
+fun with_lock root f = with_gc_lock (acquire_lock root) f
+
+(* NONE, without running f, while another process holds the lock. *)
+fun try_with_lock root f = Option.map (fn lock => with_gc_lock lock f) (try_acquire_lock root)
 
 fun with_action_publish_lock root key publish skip =
   HolbuildFSCacheBackend.with_action_publish_lock (filesystem_cache root) key publish skip
@@ -363,38 +347,48 @@ fun with_action_publish_lock root key publish skip =
 fun with_action_publish_lock_wait root key publish =
   HolbuildFSCacheBackend.with_action_publish_lock_wait (filesystem_cache root) key publish
 
+fun growth_since_gc root = HolbuildFSCacheBackend.growth_since_gc (filesystem_cache root)
+
+type gc_counts =
+  {tmp : int, locks : int, actions : int, blobs : int, modules : int, analysis : int,
+   toolchains : int, toolchains_busy : int}
+
+(* One full collection; the caller holds the GC lock. Writes made while it runs
+   count towards the next automatic GC. *)
+fun collect_root root days : gc_counts =
+  let
+    val cutoff = retention_cutoff days
+    val _ = HolbuildFSCacheBackend.reset_growth (filesystem_cache root)
+    val tmp = remove_stale_children "tmp" cutoff (tmp_dir root)
+    val modules = remove_stale_children "theory modules" cutoff (theory_modules_dir root)
+    val analysis = remove_stale_children "analysis" cutoff (analysis_dir root)
+    val locks = remove_obsolete_action_lock_dirs cutoff (locks_dir root)
+    val (live_blobs, actions) = collect_live_actions cutoff (actions_dir root)
+    val blobs = sweep_blobs cutoff live_blobs (blobs_dir root)
+    val {removed = toolchains, busy = toolchains_busy} = gc_toolchains cutoff
+  in
+    {tmp = tmp, locks = locks, actions = actions, blobs = blobs, modules = modules,
+     analysis = analysis, toolchains = toolchains, toolchains_busy = toolchains_busy}
+  end
+
+fun gc_counts_removed ({tmp, locks, actions, blobs, modules, analysis, toolchains, ...} : gc_counts) =
+  tmp + locks + actions + blobs + modules + analysis + toolchains > 0
+
+fun gc_counts_text ({tmp, locks, actions, blobs, modules, analysis, toolchains, toolchains_busy} : gc_counts) =
+  "removed tmp=" ^ Int.toString tmp ^
+  " locks=" ^ Int.toString locks ^
+  " actions=" ^ Int.toString actions ^
+  " blobs=" ^ Int.toString blobs ^
+  " modules=" ^ Int.toString modules ^
+  " analysis=" ^ Int.toString analysis ^
+  " toolchains=" ^ Int.toString toolchains ^
+  " toolchains-busy=" ^ Int.toString toolchains_busy
+
 fun gc_root root days =
   if not (path_exists root) then
     print ("cache not found: " ^ root ^ "\n")
   else
-    let
-      val cutoff = retention_cutoff days
-      val actions_dir = Path.concat(root, "actions")
-      val blobs_dir = Path.concat(root, "blobs")
-      val tmp_dir = Path.concat(root, "tmp")
-      fun run () =
-        let
-          val tmp_removed = remove_stale_children "tmp" cutoff tmp_dir
-          val modules_removed = remove_stale_children "theory modules" cutoff
-                                  (theory_modules_dir root)
-          val analysis_removed = remove_stale_children "analysis" cutoff (analysis_dir root)
-          val lock_removed = remove_obsolete_action_lock_dirs cutoff (locks_dir root)
-          val (live_blobs, actions_removed) = collect_live_actions cutoff actions_dir
-          val blobs_removed = sweep_blobs cutoff live_blobs blobs_dir
-          val {removed = toolchains_removed, busy = toolchains_busy} = gc_toolchains cutoff
-        in
-          print ("cache gc: removed tmp=" ^ Int.toString tmp_removed ^
-                 " locks=" ^ Int.toString lock_removed ^
-                 " actions=" ^ Int.toString actions_removed ^
-                 " blobs=" ^ Int.toString blobs_removed ^
-                 " modules=" ^ Int.toString modules_removed ^
-                 " analysis=" ^ Int.toString analysis_removed ^
-                 " toolchains=" ^ Int.toString toolchains_removed ^
-                 " toolchains-busy=" ^ Int.toString toolchains_busy ^ "\n")
-        end
-    in
-      with_lock root run
-    end
+    with_lock root (fn () => print ("cache gc: " ^ gc_counts_text (collect_root root days) ^ "\n"))
 
 (* Toolchain-only GC: gc_root's lock and toolchain stages, without the tmp,
    locks, actions, or blobs stages. *)
