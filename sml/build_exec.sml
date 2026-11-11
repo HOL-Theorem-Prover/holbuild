@@ -8854,11 +8854,9 @@ fun theory_spec_deps (spec : action_spec) : spec_deps =
    every dependency's parents in it. *)
 fun spec_resolver (spec : spec_deps) =
   let
-    fun first ((name, value), dict) =
-      case Binarymap.peek (dict, name) of
-          SOME _ => dict
-        | NONE => Binarymap.insert (dict, name, value)
-    fun lookup pairs = List.foldl first (Binarymap.mkDict String.compare) pairs
+    fun lookup pairs =
+      List.foldl (fn ((name, value), dict) => insert_first_string_dict (dict, name, value))
+        (Binarymap.mkDict String.compare) pairs
     val stems =
       lookup (map (fn {target, stem, ...} => (#2 (target_name target), stem)) (#deps spec) @
               map (fn {target, stem, ...} => (#2 (target_name target), stem)) (#libs spec))
