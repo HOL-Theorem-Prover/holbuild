@@ -109,6 +109,9 @@ ln -s nowhere "$tmpdir/glob-links/src/dangling"
 cp -a "$base" "$tmpdir/glob-dangling"
 ln -s nowhere "$tmpdir/glob-dangling/src/globdata/g3.txt"
 
+cp -a "$base" "$tmpdir/manifest-output"
+sed -i 's|^outputs = \["gendata/chained.txt"\]|outputs = ["gendata/chained.txt", "src/sub/holproject.toml"]|' "$tmpdir/manifest-output/holproject.toml"
+
 # Errors: a symlink in an expanded directory, a symlinked declared file, a
 # dangling one, and a declaration outside the package.
 cp -a "$base" "$tmpdir/link-in-dir"
@@ -124,7 +127,7 @@ printf 'val () = holbuild_extra_deps ["../../escape.txt"];\n' >> "$tmpdir/outsid
 cp -a "$base" "$tmpdir/missing"
 rm "$tmpdir/missing/data/manifest-input.txt"
 
-for name in base copy configured built glob-links glob-dangling link-in-dir link-declared link-dangling outside missing; do
+for name in base copy configured built glob-links glob-dangling manifest-output link-in-dir link-declared link-dangling outside missing; do
   printf '%s %s\n' "$name" "$tmpdir/$name"
 done > "$tmpdir/projects"
 
@@ -187,6 +190,7 @@ expect_error() {
 }
 expect_error link-in-dir 'symlink in package snapshot: data/dir/link.txt'
 expect_error link-declared 'symlink in package snapshot: data/manifest-input.txt'
+expect_error manifest-output 'generator output is named like a manifest: src/sub/holproject.toml'
 expect_error glob-dangling 'symlink in package snapshot: src/globdata/g3.txt'
 expect_error link-dangling 'symlink in package snapshot: gen/input.txt'
 expect_error outside 'snapshot path is outside the package root: .*/escape.txt'

@@ -168,6 +168,16 @@ fun files package =
     val outputs =
       map (fn output => relative root (HolbuildSourceIndex.join root output))
         (List.concat (map HolbuildProject.generator_outputs generators))
+    (* Discovery treats a directory holding a manifest as another package, so
+       a generated manifest would change which sources the package has once
+       built. *)
+    val _ =
+      List.app
+        (fn output =>
+           if List.exists (fn name => name = Path.file output) HolbuildManifestUtil.manifest_filenames
+           then die ("generator output is named like a manifest: " ^ output)
+           else ())
+        outputs
     val context = {root = root, outputs = outputs} : context
     val sources = discovered_sources context package
     fun inline_decls (source : HolbuildSourceIndex.source) =
