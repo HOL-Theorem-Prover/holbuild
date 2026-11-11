@@ -56,7 +56,7 @@ fun command name : command =
     | "executable" => {flags = ["--remote-only"], valued = remote_valued, operands = Executables}
     | "clean" => {flags = [], valued = [], operands = Theories}
     | "export" =>
-        {flags = ["--build", "--remote-only"],
+        {flags = ["--build", "--closure", "--sources-only", "--remote-only"],
          valued = [("-o", Nothing), ("--metadata-out", Nothing)] @ remote_valued, operands = Targets}
     | "import" => {flags = [], valued = [], operands = Nothing}
     | "gc" =>

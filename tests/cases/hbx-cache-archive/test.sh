@@ -78,7 +78,7 @@ require_grep "ATheory built" "$build_log"
 archive=$tmpdir/a.hbx
 metadata=$tmpdir/a.hbx.json
 export_log=$tmpdir/export.log
-(cd "$project" && HOLBUILD_CACHE="$source_cache" "$HOLBUILD_BIN" export -o "$archive" --metadata-out "$metadata" ATheory) > "$export_log" 2>&1
+(cd "$project" && HOLBUILD_CACHE="$source_cache" "$HOLBUILD_BIN" export --closure -o "$archive" --metadata-out "$metadata" ATheory) > "$export_log" 2>&1
 require_file "$archive"
 require_file "$metadata"
 require_grep "exported 2 cache action" "$export_log"
@@ -104,7 +104,7 @@ PY
 
 build_archive=$tmpdir/build.hbx
 build_export_log=$tmpdir/export-build.log
-(cd "$project" && HOLBUILD_CACHE="$source_cache" "$HOLBUILD_BIN" export --build -o "$build_archive" ATheory) > "$build_export_log" 2>&1
+(cd "$project" && HOLBUILD_CACHE="$source_cache" "$HOLBUILD_BIN" export --build --closure -o "$build_archive" ATheory) > "$build_export_log" 2>&1
 require_file "$build_archive"
 require_grep "exported 2 cache action" "$build_export_log"
 
@@ -112,6 +112,10 @@ tar -tf "$archive" > "$tmpdir/archive.list"
 require_grep '^holbuild-cache/project/manifest$' "$tmpdir/archive.list"
 require_grep '^holbuild-cache/deps/dep-' "$tmpdir/archive.list"
 require_grep '^holbuild-cache/actions/.*/manifest$' "$tmpdir/archive.list"
+if grep -q '^holbuild-package' "$tmpdir/archive.list"; then
+  echo "a closure archive carries a package part" >&2
+  exit 1
+fi
 
 tar -xOf "$archive" holbuild-cache/manifest > "$tmpdir/archive.manifest"
 require_grep '^holbuild-hbx-v2$' "$tmpdir/archive.manifest"
@@ -172,9 +176,11 @@ for pid in "${import_pids[@]}"; do
 done
 assert_strong_timeout "$concurrent_cache"
 
-rm -rf "$project/.holbuild"
+# Offline, from the imported archive alone: the dependency checkout stays, as
+# `--offline` cannot fetch it; every build output goes.
+find "$project/.holbuild" -mindepth 1 -maxdepth 1 ! -name src -exec rm -rf {} +
 restore_log=$tmpdir/restore.log
-(cd "$project" && HOLBUILD_CACHE="$import_cache" HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" build \
+(cd "$project" && HOLBUILD_CACHE="$import_cache" HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" --offline build \
   --allow-cache-timeout-discrepancy --tactic-timeout 60 ATheory) > "$restore_log" 2>&1
 require_grep "cache hit: BTheory" "$restore_log"
 require_grep "cache hit: ATheory" "$restore_log"

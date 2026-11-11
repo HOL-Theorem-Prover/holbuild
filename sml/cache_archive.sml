@@ -8,6 +8,9 @@ exception Error of string
 
 val format = "holbuild-hbx-v2"
 val payload_dir = "holbuild-cache"
+val capsule_format = "holbuild-hbx-capsule-v1"
+val package_part = "holbuild-package"
+val source_dir = "source"
 
 type metadata =
   {created_at : string option,
@@ -59,11 +62,11 @@ fun temp_file_near path =
 fun tar_operation operation =
   operation () handle HolbuildTar.Error msg => raise Error msg
 
-fun tar_create {stage_dir, archive_tmp} =
+fun tar_create {stage_dir, archive_tmp, members} =
   tar_operation
     (fn () => HolbuildTar.create
       {archive_path = archive_tmp,
-       sources = [(stage_dir, [payload_dir])],
+       sources = [(stage_dir, members)],
        excludes = [],
        hard_dereference = false})
 
@@ -136,7 +139,7 @@ fun safe_package_dir package =
     base ^ "-" ^ String.substring(hash, 0, 12)
   end
 
-fun package_dir payload {root, package} =
+fun package_view_dir payload {root, package} =
   if root then Path.concat(payload, "project")
   else Path.concat(Path.concat(payload, "deps"), safe_package_dir package)
 
@@ -197,7 +200,7 @@ fun write_package_action_ref payload package_path key =
 
 fun write_package_group payload (representative, entries) =
   let
-    val dir = package_dir payload {root = entry_root representative, package = entry_package representative}
+    val dir = package_view_dir payload {root = entry_root representative, package = entry_package representative}
     val _ = write_text (Path.concat(dir, "manifest")) (package_manifest_text representative entries)
   in
     List.app (write_package_action_ref payload dir o entry_key) entries
@@ -218,32 +221,117 @@ fun require_manifest payload =
     else raise Error ("unsupported cache archive format in " ^ path)
   end
 
-fun create_export {archive_path, source, entries, targets, metadata} =
+(* The cache part of an archive: the entries' blobs and manifests, the
+   package views and the manifest naming the actions. *)
+fun stage_cache stage_dir {source, entries, targets, metadata} =
+  let
+    val keys = unique_strings (map entry_key entries)
+    val payload = Path.concat(stage_dir, payload_dir)
+    val cache = HolbuildFSCacheBackend.filesystem payload
+  in
+    ensure_dir payload;
+    HolbuildFSCacheBackend.ensure_layout cache;
+    ignore (HolbuildCacheTransfer.copy_entries
+              {source = source,
+               destination = fs_destination cache,
+               tmp_dir = HolbuildFSCacheBackend.tmp_dir cache}
+              keys);
+    write_package_index payload entries;
+    write_text (manifest_path payload) (manifest_text {keys = keys, targets = targets, metadata = metadata})
+  end
+
+type capsule_package =
+  {name : string,
+   version : string option,
+   toolchain_key : string,
+   root : string,
+   files : string list}
+
+fun capsule_manifest_text ({name, version, toolchain_key, ...} : capsule_package) =
+  String.concatWith "\n"
+    ([capsule_format,
+      "name=" ^ manifest_value name] @
+     optional_manifest_line "version" version @
+     ["toolchain_key=" ^ manifest_value toolchain_key,
+      "holbuild_version=" ^ HolbuildVersion.version]) ^ "\n"
+
+(* The staged tree, not the publisher's umask or file modes, decides the
+   archive's bytes: directories are 755, files 755 when executable and 644
+   otherwise. *)
+fun mode_flags flags = Posix.FileSys.S.flags flags
+val dir_mode =
+  mode_flags [Posix.FileSys.S.irwxu, Posix.FileSys.S.irgrp, Posix.FileSys.S.ixgrp,
+              Posix.FileSys.S.iroth, Posix.FileSys.S.ixoth]
+val executable_mode = dir_mode
+val plain_mode =
+  mode_flags [Posix.FileSys.S.irusr, Posix.FileSys.S.iwusr, Posix.FileSys.S.irgrp, Posix.FileSys.S.iroth]
+
+fun ensure_stage_dir path =
+  if path_exists path then ()
+  else
+    (ensure_stage_dir (Path.dir path);
+     FS.mkDir path;
+     Posix.FileSys.chmod (path, dir_mode))
+
+fun is_executable path =
+  Posix.FileSys.S.anySet
+    (mode_flags [Posix.FileSys.S.ixusr, Posix.FileSys.S.ixgrp, Posix.FileSys.S.ixoth],
+     Posix.FileSys.ST.mode (Posix.FileSys.stat path))
+
+fun stage_source_file root source_root rel =
+  let
+    val src = Path.concat(root, rel)
+    val dst = Path.concat(source_root, rel)
+    val _ = ensure_stage_dir (Path.dir dst)
+    val executable = is_executable src
+  in
+    HolbuildFSCacheBackend.copy_binary src dst;
+    Posix.FileSys.chmod (dst, if executable then executable_mode else plain_mode)
+  end
+  handle HolbuildFSCacheBackend.Error msg => raise Error msg
+       | OS.SysErr (msg, _) => raise Error ("could not stage snapshot file: " ^ msg)
+
+(* The package part: the manifest and the snapshot's files under source/. *)
+fun stage_package stage_dir (package : capsule_package) =
+  let
+    val dir = Path.concat(stage_dir, package_part)
+    val source_root = Path.concat(dir, source_dir)
+  in
+    ensure_stage_dir source_root;
+    List.app (stage_source_file (#root package) source_root) (#files package);
+    write_text (Path.concat(dir, "manifest")) (capsule_manifest_text package);
+    Posix.FileSys.chmod (Path.concat(dir, "manifest"), plain_mode)
+  end
+
+(* An archive of a cache part (the entries of a build), a package part (a
+   source snapshot), or both. *)
+fun create_capsule {archive_path, cache, package} =
   if path_exists archive_path then
     raise Error ("cache archive already exists: " ^ archive_path)
+  else if not (Option.isSome cache) andalso not (Option.isSome package) then
+    raise Error "archive has neither a cache part nor a package part"
   else
     let
-      val keys = unique_strings (map entry_key entries)
       val stage_dir = temp_dir_near archive_path
       val archive_tmp = temp_file_near archive_path
-      val payload = Path.concat(stage_dir, payload_dir)
-      val cache = HolbuildFSCacheBackend.filesystem payload
       fun cleanup () = (remove_file archive_tmp; remove_tree stage_dir handle _ => ())
+      val members =
+        (if Option.isSome cache then [payload_dir] else []) @
+        (if Option.isSome package then [package_part] else [])
     in
-      (ensure_dir payload;
-       HolbuildFSCacheBackend.ensure_layout cache;
-       ignore (HolbuildCacheTransfer.copy_entries
-                 {source = source,
-                  destination = fs_destination cache,
-                  tmp_dir = HolbuildFSCacheBackend.tmp_dir cache}
-                 keys);
-       write_package_index payload entries;
-       write_text (manifest_path payload) (manifest_text {keys = keys, targets = targets, metadata = metadata});
-       tar_create {stage_dir = stage_dir, archive_tmp = archive_tmp};
+      (ensure_dir stage_dir;
+       Option.app (stage_cache stage_dir) cache;
+       Option.app (stage_package stage_dir) package;
+       tar_create {stage_dir = stage_dir, archive_tmp = archive_tmp, members = members};
        rename_new {old = archive_tmp, new = archive_path};
        remove_tree stage_dir)
       handle e => (cleanup (); raise e)
     end
+
+fun create_export {archive_path, source, entries, targets, metadata} =
+  create_capsule {archive_path = archive_path,
+                  cache = SOME {source = source, entries = entries, targets = targets, metadata = metadata},
+                  package = NONE}
 
 fun create_with_targets {archive_path, source, keys, targets} =
   create_export {archive_path = archive_path,
@@ -255,6 +343,14 @@ fun create_with_targets {archive_path, source, keys, targets} =
 fun create {archive_path, source, keys} =
   create_with_targets {archive_path = archive_path, source = source, keys = keys, targets = []}
 
+fun capsule_manifest_path stage_dir = Path.concat(Path.concat(stage_dir, package_part), "manifest")
+
+(* A capsule without a cache part holds no actions. *)
+fun is_package_only stage_dir =
+  not (path_exists (manifest_path (Path.concat(stage_dir, payload_dir)))) andalso
+  (String.isPrefix (capsule_format ^ "\n") (read_text (capsule_manifest_path stage_dir))
+   handle _ => false)
+
 fun with_entries {archive_path, f} =
   let
     val stage_dir = temp_dir_near archive_path
@@ -265,8 +361,9 @@ fun with_entries {archive_path, f} =
     (ensure_dir stage_dir;
      tar_extract {archive_path = archive_path, stage_dir = stage_dir};
      let
-       val manifest = require_manifest payload
-       val keys = action_keys_from_manifest manifest
+       val keys =
+         if is_package_only stage_dir then []
+         else action_keys_from_manifest (require_manifest payload)
      in
        f {source = fs_source cache, keys = keys} before cleanup ()
      end)

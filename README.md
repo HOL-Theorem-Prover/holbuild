@@ -1406,7 +1406,7 @@ file form for CI and shared machines. holbuild redacts URL userinfo in its own
 remote-cache diagnostics, but it cannot hide secrets from the operating system if
 they are passed as command-line arguments.
 
-Portable build-output archives use the same cache representation:
+Portable build-output archives (`.hbx`) use the same cache representation:
 
 ```sh
 holbuild build MyTheory
@@ -1414,13 +1414,39 @@ holbuild export -o my-build.hbx MyTheory
 holbuild --cache-dir /path/to/other/cache import my-build.hbx
 ```
 
-`export` includes the selected target closure by default and does not run a
-build unless `--build` is passed. The archive stores a global deduplicated blob
-area plus `project/` and `deps/<package>/` package views for the exported action
-manifests. `import` hydrates the global cache; a later `holbuild build MyTheory`
-materialises outputs through the normal cache-restore path. Import HBX archives
-only from trusted publishers because those cached build outputs may later be
-loaded by Poly/ML.
+`export` writes the root package as a capsule, an archive of two parts. The
+package part (`holbuild-package/`) is the package's source snapshot: its
+manifest, the sources its manifest discovers (with the committed manifest's own
+`exclude` and `exclude_globs`), the extra inputs, `holbuild_extra_deps`
+files, generator inputs and shim manifests that it declares. It never holds
+`.git`, `.holbuild`, `.holconfig.toml` or generator outputs, so its bytes do
+not depend on the publisher's checkout, local configuration, or whether
+generators have run. A symlink in the snapshot, a declared file that is
+missing, or a declared path outside the package root fails the export. Beside
+the files, `holbuild-package/manifest` (`holbuild-hbx-capsule-v1`) names the
+package, its version if declared, the `toolchain_key` of the toolchain that
+exported it and the holbuild version. Dependencies are not stored beside the
+snapshot: they are the declarations in the snapshot's `holproject.toml`. The
+snapshot holds the files as committed, `holproject.toml` included, so a
+dependency URL in it must not carry credentials.
+
+The cache part (`holbuild-cache/`, format `holbuild-hbx-v2`) holds the cached
+build outputs of the root package's theories among the selected targets. Targets
+in other packages are left out, not an error, and an unbuilt dependency theory
+does not fail the export. It stores a global deduplicated blob area plus
+`project/` package views of the exported action manifests. `export` does not run
+a build unless `--build` is passed.
+
+- `--closure` writes the cache part of the whole selected target closure,
+  dependencies included (`deps/<package>/` views), and no package part.
+- `--sources-only` writes the package part alone. It takes no targets and builds
+  no theories.
+
+`import` hydrates the global cache from the cache part (a capsule without one
+imports no actions); a later `holbuild build MyTheory` materialises outputs
+through the normal cache-restore path, offline too, when every needed output is
+in the archive (use `--closure` for that). Import HBX archives only from trusted
+publishers because those cached build outputs may later be loaded by Poly/ML.
 
 Use `holbuild export --metadata-out MyTheory.hbx.json` to write a registry
 metadata sidecar for static hosting or GitHub Releases; see
