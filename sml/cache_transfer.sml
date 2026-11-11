@@ -28,45 +28,12 @@ type entry_result =
     reused_blobs : int,
     action : HolbuildCacheBackend.publish_result }
 
-fun has_prefix prefix s =
-  size s >= size prefix andalso String.substring(s, 0, size prefix) = prefix
-
-fun trim_newline s =
-  if size s > 0 andalso String.sub(s, size s - 1) = #"\n" then
-    String.substring(s, 0, size s - 1)
-  else s
-
-fun take_token s =
-  let
-    fun loop i =
-      if i >= size s then i
-      else
-        case String.sub(s, i) of
-            #" " => i
-          | #"\t" => i
-          | #"\n" => i
-          | _ => loop (i + 1)
-    val n = loop 0
-  in
-    String.substring(s, 0, n)
-  end
-
-fun blob_ref line =
-  let val clean = trim_newline line
-  in
-    case String.tokens Char.isSpace clean of
-        ["blob", _, hash] => SOME hash
-      | _ =>
-          if has_prefix "blob=" clean then SOME (take_token (String.extract(clean, 5, NONE)))
-          else NONE
-  end
-
 fun unique_blobs manifest_text =
   let
     fun add (hash, hashes) =
       if List.exists (fn existing => existing = hash) hashes then hashes else hash :: hashes
     fun line (text, hashes) =
-      case blob_ref text of
+      case HolbuildFSCacheBackend.blob_ref text of
           SOME hash => add (hash, hashes)
         | NONE => hashes
   in

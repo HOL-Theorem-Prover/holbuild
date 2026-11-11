@@ -2039,3 +2039,60 @@ require_grep 'TimeoutTheory restored from cache' "$tmpdir/ring-client.log"
 refute_grep 'remote batch\|Theory built' "$tmpdir/ring-client.log"
 require_grep '^proof-timeout=2.5$' "$tmpdir/ring-client-cache/actions/$ring_key/manifest"
 cmp "${ranked_roots[0]}/ac/$ring_ac" "$tmpdir/ring-weak-ac"
+
+# A worker sees both replicas, while a reader sees only the weaker one.
+# Export the action before restoring the fixture entries so the worker can
+# confirm a cached result without rebuilding it.
+rm "${ranked_roots[0]}/ac/$ring_ac" "${ranked_roots[1]}/ac/$ring_ac"
+write_ring_timeout ring-spec
+in_copy ring-spec --remote-cache "$first_url" action-spec --upload --tactic-timeout 2.5 TimeoutTheory \
+  > "$tmpdir/ring-spec.batch" 2> "$tmpdir/ring-spec.log" ||
+  { cat "$tmpdir/ring-spec.log" >&2; exit 1; }
+ring_spec=$(awk '$1 == "action" && $5 == "rxring:TimeoutTheory" { print $4 }' "$tmpdir/ring-spec.batch")
+[[ -n "$ring_spec" ]]
+if [[ ${ranked_roots[1]} == "$remote_root" ]]; then
+  single_url=$first_url
+else
+  single_url=$second_url
+fi
+
+ring_worker() {
+  local name=$1 expected=${2:-cached}
+  link_hol_toolchain_cache "$tmpdir/$name-cache"
+  mkdir -p "$tmpdir/$name"
+  (cd "$tmpdir/$name" && HOLBUILD_CACHE="$tmpdir/$name-cache" \
+    "$HOLBUILD_BIN" --remote-cache "$first_url,$second_url" exec-action "$ring_spec" \
+      --cache-limit-gb 1000 --result "$tmpdir/$name.result") > "$tmpdir/$name.log" 2>&1 ||
+    { cat "$tmpdir/$name.log" "$tmpdir/$name.result" >&2; exit 1; }
+  require_grep "^status=$expected\$" "$tmpdir/$name.result"
+  if [[ $expected == cached ]]; then
+    refute_grep 'phase-ms=.*hol:' "$tmpdir/$name.result"
+  else
+    require_grep 'phase-ms=.*hol:' "$tmpdir/$name.result"
+  fi
+}
+
+cp "$tmpdir/ring-strong-ac" "${ranked_roots[0]}/ac/$ring_ac"
+cp "$tmpdir/ring-weak-ac" "${ranked_roots[1]}/ac/$ring_ac"
+ring_worker ring-cached-worker
+require_grep '^proof-timeout=2.5$' "${ranked_roots[1]}/ac/$ring_ac"
+write_ring_timeout ring-single-reader
+in_copy ring-single-reader --remote-cache "$single_url" build --remote-exec "$unreachable" \
+  --remote-only --tactic-timeout 2.5 TimeoutTheory > "$tmpdir/ring-single-reader.log" 2>&1 ||
+  { cat "$tmpdir/ring-single-reader.log" >&2; exit 1; }
+require_grep 'remote execution: nothing to build remotely' "$tmpdir/ring-single-reader.log"
+require_grep 'TimeoutTheory restored from cache' "$tmpdir/ring-single-reader.log"
+
+# The first hydrate must filter a weak primary instead of rebuilding a
+# theory already checked on the second replica.
+cp "$tmpdir/ring-weak-ac" "${ranked_roots[0]}/ac/$ring_ac"
+cp "$tmpdir/ring-strong-ac" "${ranked_roots[1]}/ac/$ring_ac"
+ring_worker ring-filtered-worker
+require_grep '^proof-timeout=2.5$' "${ranked_roots[0]}/ac/$ring_ac"
+
+# A source build strengthens both existing copies too.
+cp "$tmpdir/ring-weak-ac" "${ranked_roots[0]}/ac/$ring_ac"
+cp "$tmpdir/ring-weak-ac" "${ranked_roots[1]}/ac/$ring_ac"
+ring_worker ring-built-worker built
+require_grep '^proof-timeout=2.5$' "${ranked_roots[0]}/ac/$ring_ac"
+require_grep '^proof-timeout=2.5$' "${ranked_roots[1]}/ac/$ring_ac"

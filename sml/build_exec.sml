@@ -1560,25 +1560,41 @@ fun checkpoint_eviction_text ({before_bytes, after_bytes, max_bytes, evicted} : 
   " checkpoint_max_bytes=" ^ bytes_text max_bytes ^
   " evicted=" ^ Int.toString evicted
 
-fun clean_project project days max_checkpoints_gb =
+fun gc_state_path project = project_state_dir project "gc.state"
+
+type project_gc_counts =
+  {stage : int, logs : int, checkpoints : int, checkpoint_bytes_initial : Position.int,
+   eviction : checkpoint_eviction}
+
+(* One full project collection; the caller holds the project lock. Work done
+   while it runs counts towards the next automatic GC. *)
+fun collect_project project days max_checkpoints_gb : project_gc_counts =
   let
+    val _ = write_text (gc_state_path project) "0\n"
     val cutoff = retention_cutoff days
     val checkpoint_dir = project_state_dir project "checkpoints"
     val checkpoint_bytes_initial = checkpoint_bytes checkpoint_dir
-    val stage_removed = remove_stale_children cutoff (project_state_dir project "stage")
-    val log_removed = remove_stale_children cutoff (project_state_dir project "logs")
-    val checkpoint_removed = remove_stale_checkpoint_families cutoff checkpoint_dir
+    val stage = remove_stale_children cutoff (project_state_dir project "stage")
+    val logs = remove_stale_children cutoff (project_state_dir project "logs")
+    val checkpoints = remove_stale_checkpoint_families cutoff checkpoint_dir
     val eviction = evict_oldest_checkpoints_with_stats checkpoint_dir (gb_to_bytes max_checkpoints_gb)
     val _ = write_checkpoint_index_atomically (rebuild_checkpoint_index checkpoint_dir)
     val _ = remove_file (checkpoint_index_dirty_path checkpoint_dir)
   in
-    print ("project clean: removed stage=" ^ Int.toString stage_removed ^
-           " logs=" ^ Int.toString log_removed ^
-           " checkpoints=" ^ Int.toString checkpoint_removed ^
-           " checkpoint_gb_initial=" ^ gb_decimal_text checkpoint_bytes_initial ^
-           " checkpoint_bytes_initial=" ^ bytes_text checkpoint_bytes_initial ^
-           " " ^ checkpoint_eviction_text eviction ^ "\n")
+    {stage = stage, logs = logs, checkpoints = checkpoints,
+     checkpoint_bytes_initial = checkpoint_bytes_initial, eviction = eviction}
   end
+
+fun project_gc_text ({stage, logs, checkpoints, checkpoint_bytes_initial, eviction} : project_gc_counts) =
+  "removed stage=" ^ Int.toString stage ^
+  " logs=" ^ Int.toString logs ^
+  " checkpoints=" ^ Int.toString checkpoints ^
+  " checkpoint_gb_initial=" ^ gb_decimal_text checkpoint_bytes_initial ^
+  " checkpoint_bytes_initial=" ^ bytes_text checkpoint_bytes_initial ^
+  " " ^ checkpoint_eviction_text eviction
+
+fun clean_project project days max_checkpoints_gb =
+  print ("project clean: " ^ project_gc_text (collect_project project days max_checkpoints_gb) ^ "\n")
 
 fun file_exists path = FS.access(path, [FS.A_READ]) handle OS.SysErr _ => false
 
@@ -2266,6 +2282,7 @@ val remote_theory_publish_attempts = 3
 fun put_remote_theory_action remote _ (request as {key, text}) =
   let
     val incoming = cache_manifest_contract key text
+    val initial_resident = HolbuildRemoteCache.get_action remote key
     fun conflict detail = HolbuildCacheBackend.Conflict ("remote theory action " ^ key ^ ": " ^ detail)
     fun compatible_contract resident_text =
       let val resident = cache_manifest_contract key resident_text
@@ -2273,10 +2290,11 @@ fun put_remote_theory_action remote _ (request as {key, text}) =
         if #non_timeout_text resident = #non_timeout_text incoming then resident
         else raise Error "resident manifest differs outside proof-timeout"
       end
-    fun attempt attempts =
+    fun attempt attempts resident =
       let
         fun retry detail =
-          if attempts > 1 then attempt (attempts - 1) else conflict detail
+          if attempts > 1 then attempt (attempts - 1) (HolbuildRemoteCache.get_action remote key)
+          else conflict detail
         fun verify result =
           case HolbuildRemoteCache.get_action remote key of
               NONE => retry "action missing after publication"
@@ -2299,7 +2317,7 @@ fun put_remote_theory_action remote _ (request as {key, text}) =
             | result as HolbuildCacheBackend.AlreadyPresent => verify result
             | HolbuildCacheBackend.Skipped => HolbuildCacheBackend.Skipped
       in
-        case HolbuildRemoteCache.get_action remote key of
+        case resident of
             NONE => publish_missing ()
           | SOME resident_text =>
               let val resident = compatible_contract resident_text
@@ -2312,8 +2330,21 @@ fun put_remote_theory_action remote _ (request as {key, text}) =
                   conflict "proof-timeout contracts are incomparable"
               end
       end
+    val result = attempt remote_theory_publish_attempts initial_resident
+    fun weaker resident_text =
+      let val resident = compatible_contract resident_text
+      in not (timeout_at_least_as_strong (#proof_timeout resident) (#proof_timeout incoming)) end
+      handle Error detail => raise HolbuildRemoteCache.Error detail
+           | HolbuildTheoryCacheManifest.Error detail => raise HolbuildRemoteCache.Error detail
+    val _ =
+      if Option.isSome initial_resident andalso Option.isSome (#proof_timeout incoming) andalso
+         (case result of HolbuildCacheBackend.Published => true
+                       | HolbuildCacheBackend.AlreadyPresent => true | _ => false) then
+        HolbuildRemoteCache.repair_action_replicas remote
+          {key = key, text = text, attempts = remote_theory_publish_attempts, should_replace = weaker}
+      else ()
   in
-    attempt remote_theory_publish_attempts
+    result
   end
   handle e as HolbuildRemoteCache.Unavailable _ => raise e
        | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
@@ -2394,10 +2425,15 @@ fun prefetch_remote_cache_key root url key =
     cache_trace ("remote cache prefetched: " ^ key)
   else ()
 
-fun ensure_local_cache_entry root key =
+fun ensure_local_cache_entry_using usable root key =
   case HolbuildCache.get_action root key of
-      SOME text => SOME text
-    | NONE => if hydrate_remote_cache_key root key then HolbuildCache.get_action root key else NONE
+      SOME text =>
+        if usable text then SOME text
+        else if hydrate_remote_cache_key_using usable root key then HolbuildCache.get_action root key
+        else SOME text
+    | NONE => if hydrate_remote_cache_key_using usable root key then HolbuildCache.get_action root key else NONE
+
+fun ensure_local_cache_entry root key = ensure_local_cache_entry_using (fn _ => true) root key
 
 fun publish_remote_cache_key root key =
   case HolbuildRemoteCacheConfig.url () of
@@ -2568,7 +2604,8 @@ fun checked_cache_entry allow_timeout_discrepancy {root, input_key, subject, exp
   let
     val manifest = HolbuildCache.action_manifest root input_key
     val manifest_text =
-      case ensure_local_cache_entry root input_key of
+      case ensure_local_cache_entry_using
+             (manifest_timeout_satisfies allow_timeout_discrepancy requested_timeout) root input_key of
           SOME text => text
         | NONE => (cache_trace ("cache miss: " ^ subject ^ " " ^ cache_key_role ^ "=" ^ input_key ^ " (no manifest)");
                    raise Error "cache entry not found")
@@ -2594,35 +2631,35 @@ fun checked_cache_entry allow_timeout_discrepancy {root, input_key, subject, exp
       else raise Error ("cache entry built with insufficient tactic-timeout contract: built " ^
                         timeout_text proof_timeout ^ ", requested " ^ timeout_text requested_timeout)
   in
-    {blobs = blobs, proof_timeout = proof_timeout}
+    {blobs = blobs, proof_timeout = proof_timeout, manifest_text = manifest_text}
   end
 
 (* Installs a checked cache entry's outputs at the given paths, its extra
    outputs where `extra_destination` puts each declaration, and its load
    manifests with `write_manifests`. *)
-fun install_cache_entry verify_cache root input_key subject
+fun install_cache_entry copy root input_key subject
                         {blobs = {sig_hash, sml_hash, dat_hash, trace_hash, extra_hashes, parents, mldeps},
-                         proof_timeout}
+                         proof_timeout, manifest_text = _}
                         {outputs = {sig_path, sml_path, data_path}, extra_destination, write_manifests} =
   let
     val trace_path = drop_suffix ".dat" data_path ^ ".tr.gz"
   in
-    copy_blob verify_cache root dat_hash data_path;
+    copy dat_hash data_path;
     link_or_copy {src = data_path, dst = hfs_remapped_path data_path};
-    copy_blob verify_cache root sig_hash sig_path;
+    copy sig_hash sig_path;
     link_or_copy {src = sig_path, dst = hfs_remapped_path sig_path};
-    copy_blob verify_cache root sml_hash sml_path;
+    copy sml_hash sml_path;
     write_text sml_path (replace_all cache_sml_token data_path (read_text sml_path));
     link_or_copy {src = sml_path, dst = hfs_remapped_path sml_path};
     (case trace_hash of
          NONE => ()
        | SOME hash =>
-           (copy_blob verify_cache root hash trace_path;
+           (copy hash trace_path;
             link_or_copy {src = trace_path, dst = hfs_remapped_path trace_path}));
     List.app
       (fn (declaration, hash) =>
           let val destination = extra_destination declaration
-          in ensure_parent destination; copy_blob verify_cache root hash destination end)
+          in ensure_parent destination; copy hash destination end)
       extra_hashes;
     write_manifests {parents = parents, mldeps = mldeps};
     HolbuildCache.touch_action root input_key;
@@ -2647,7 +2684,7 @@ fun materialize_theory_cache verify_cache allow_timeout_discrepancy project plan
        write_local_theory_manifests plan node metadata)
   in
     CacheRestored
-      (install_cache_entry verify_cache root input_key subject entry
+      (install_cache_entry (copy_blob verify_cache root) root input_key subject entry
          {outputs = {sig_path = sig_path, sml_path = sml_path, data_path = data_path},
           extra_destination = source_extra_output_path node,
           write_manifests = write_manifests})
@@ -8913,7 +8950,7 @@ fun fetch_spec_blob remote {hash, dst} =
 
 (* Restores a theory the action depends on, or the action's own entry, into
    the action root, writing its load manifests with the spec's stems. *)
-fun restore_spec_theory root (spec : spec_deps) {key, subject, stem, extra_outputs, requested_timeout} =
+fun restore_spec_theory remote root (spec : spec_deps) {key, subject, stem, extra_outputs, requested_timeout} =
   let
     val cache = cache_root ()
     val entry =
@@ -8921,6 +8958,7 @@ fun restore_spec_theory root (spec : spec_deps) {key, subject, stem, extra_outpu
         {root = cache, input_key = key, subject = subject,
          expected_extra_outputs = extra_outputs,
          requested_timeout = requested_timeout, require_trace = false}
+    val resident = #manifest_text entry
     val stems = spec_load_stems spec
     fun order name =
       case List.find (fn {target, ...} => #2 (target_name target) = name) (#orders spec) of
@@ -8936,7 +8974,8 @@ fun restore_spec_theory root (spec : spec_deps) {key, subject, stem, extra_outpu
        write_object_manifest (stem_path ^ ".uo") (generated_theory_loads resolve metadata @ [sml_path]))
   in
     ignore
-      (install_cache_entry false cache key subject entry
+      (install_cache_entry (fn hash => fn dst => fetch_spec_blob remote {hash = hash, dst = dst})
+         cache key subject entry
          {outputs = {sig_path = sig_path, sml_path = sml_path, data_path = stem_path ^ ".dat"},
           (* Apart from the sources, so a restored output never replaces an
              input the action fetched by its hash; the build reads none. *)
@@ -8944,6 +8983,9 @@ fun restore_spec_theory root (spec : spec_deps) {key, subject, stem, extra_outpu
             if escapes decl then raise Error ("cache entry " ^ key ^ " has an extra output outside the action root: " ^ decl)
             else in_root root (normalize_path (String.concatWith "/" [".holbuild/action-extra", key, decl])),
           write_manifests = write_manifests})
+      handle e as ActionFailed (InputMissing _, _) =>
+        (ignore (drop_cache_manifest_if_unchanged cache key resident);
+         raise e)
   end
 
 (* Whether a theory's .dat, given by the parent hashes it records, records
@@ -9025,7 +9067,7 @@ fun hydrate_spec_deps remote root files (spec : spec_deps) direct =
        write_object_manifest (in_root root (stem ^ suffix)) (map lib_load loads))
     fun restore_dep {target, stem, key} =
       (ensure_parent (in_root root stem);
-       restore_spec_theory root spec
+       restore_spec_theory remote root spec
          {key = key, subject = target, stem = stem, extra_outputs = NONE, requested_timeout = NONE})
       handle e as HolbuildRemoteCache.Unavailable _ => raise e
            | e => raise action_failed (InputMissing ("theory " ^ key))
@@ -9092,7 +9134,7 @@ fun action_already_done remote root (spec : action_spec) =
     val {sig_path, sml_path, data_path} = #outputs spec
     val stem = drop_suffix ".dat" data_path
     fun restored () =
-      (restore_spec_theory root (theory_spec_deps spec)
+      (restore_spec_theory remote root (theory_spec_deps spec)
          {key = #input_key spec, subject = #package spec ^ ":" ^ #logical spec, stem = stem,
           extra_outputs = SOME (#extra_outputs spec), requested_timeout = #tactic_timeout spec};
        spec_parent_hashes_match root (theory_spec_deps spec) (in_root root data_path))
@@ -9387,30 +9429,94 @@ fun store_cache_families cache =
   List.map (fn dir => {mtime = modified_time dir, evict = fn () => evict_store_family dir})
            (store_families (share_store cache))
 
-(* holbuild gc: the store's families no build used within DAYS, except one
-   a running process leases or a heap a tree still links: removing that frees
-   nothing. *)
-fun gc_checkpoint_store days =
+(* The store's families no build used within DAYS, except one a running
+   process leases or a heap a tree still links: removing that frees nothing.
+   The caller holds the cache's GC lock. *)
+fun collect_checkpoint_store cache days =
   let
-    val cache = HolbuildCache.cache_root ()
     val cutoff = retention_cutoff days
     fun removable dir = Time.<(modified_time dir, cutoff) andalso store_heap_links dir <= 1
-    fun run () =
-      let
-        val removed =
-          List.foldl
-            (fn (dir, n) =>
-                if removable dir andalso Option.isSome (try_evict_store_family_if (fn () => removable dir) dir)
-                then n + 1 else n)
-            0 (store_families (share_store cache))
-      in
-        (* stderr: gc's stdout is its one summary line. *)
-        if removed = 0 then ()
-        else TextIO.output (TextIO.stdErr, "checkpoint store gc: removed families=" ^ Int.toString removed ^ "\n")
-      end
   in
-    if path_exists (share_store cache) then HolbuildCache.with_lock cache run else ()
+    if not (path_exists (share_store cache)) then 0
+    else
+      List.foldl
+        (fn (dir, n) =>
+            if removable dir andalso Option.isSome (try_evict_store_family_if (fn () => removable dir) dir)
+            then n + 1 else n)
+        0 (store_families (share_store cache))
   end
+
+fun gc_checkpoint_store days =
+  let val cache = HolbuildCache.cache_root ()
+  in
+    if path_exists (share_store cache) then
+      HolbuildCache.with_lock cache (fn () =>
+        let val removed = collect_checkpoint_store cache days
+        in
+          (* stderr: gc's stdout is its one summary line. *)
+          if removed = 0 then ()
+          else TextIO.output (TextIO.stdErr, "checkpoint store gc: removed families=" ^
+                                             Int.toString removed ^ "\n")
+        end)
+    else ()
+  end
+
+(* After a command that wrote to the cache: the collections `holbuild gc`
+   runs on the cache and its checkpoint store, once THRESHOLD bytes were
+   written since the last cache GC. Skipped while another process holds the
+   GC lock; a failure only warns. Reports on stderr, only what it removed. *)
+fun auto_cache_gc threshold =
+  let val cache = HolbuildCache.cache_root ()
+  in
+    if not (path_exists cache) orelse HolbuildCache.growth_since_gc cache < threshold then ()
+    else
+      case HolbuildCache.try_with_lock cache (fn () =>
+             (HolbuildCache.collect_root cache HolbuildCache.default_retention_days,
+              collect_checkpoint_store cache HolbuildCache.default_retention_days)) of
+          SOME (counts, families) =>
+            if HolbuildCache.gc_counts_removed counts orelse families > 0 then
+              (if HolbuildStatus.quiet_mode () orelse HolbuildStatus.json_mode () then ()
+               else HolbuildStatus.message_stderr
+                      ("holbuild: automatic cache gc: " ^ HolbuildCache.gc_counts_text counts ^
+                       " checkpoint-families=" ^ Int.toString families ^ "\n"))
+            else ()
+        | NONE => ()
+  end
+  handle HolbuildCache.Error msg => warn ("automatic gc failed: " ^ msg)
+       | e => warn ("automatic gc failed: " ^ General.exnMessage e)
+
+fun read_gc_state project =
+  Option.getOpt (Int.fromString (read_text (gc_state_path project)), 0)
+  handle IO.Io _ => 0
+
+(* After a command that built in PROJECT: the collection `holbuild gc` runs on
+   the project, once THRESHOLD theories were built, restored or exported there
+   since its last GC. The count since the last GC is kept in
+   .holbuild/gc.state. Skipped while another
+   process holds the project lock, as auto_cache_gc is for the GC lock. *)
+fun auto_project_gc project threshold =
+  let
+    val work = !HolbuildStatus.project_work
+    val since_gc = read_gc_state project + work
+    fun collect () =
+      collect_project project HolbuildCache.default_retention_days (project_checkpoint_limit_gb project)
+    fun removed_any ({stage, logs, checkpoints, eviction, ...} : project_gc_counts) =
+      stage + logs + checkpoints + #evicted eviction > 0
+  in
+    HolbuildStatus.project_work := 0;
+    if since_gc < threshold then
+      (if work > 0 then write_text (gc_state_path project) (Int.toString since_gc ^ "\n") else ())
+    else
+      case HolbuildProjectLock.try_with_lock project "automatic gc" collect of
+          SOME counts =>
+            if removed_any counts andalso
+               not (HolbuildStatus.quiet_mode () orelse HolbuildStatus.json_mode ()) then
+              HolbuildStatus.message_stderr ("holbuild: automatic project gc: " ^ project_gc_text counts ^ "\n")
+            else ()
+        | NONE => write_text (gc_state_path project) (Int.toString since_gc ^ "\n")
+  end
+  handle HolbuildProjectLock.Error msg => warn ("automatic gc failed: " ^ msg)
+       | e => warn ("automatic gc failed: " ^ General.exnMessage e)
 
 (* Factory modules have no on-disk module parents.  Once loaded their code
    is resident, so concurrent eviction only makes a later load use source. *)
@@ -10181,7 +10287,7 @@ fun reuse_earlier_build remote root (spec : action_spec) pair_key =
           val data_path = #data_path (#outputs spec)
         in
           sha256_text old_key andalso old_key <> new_key andalso
-          (restore_spec_theory root (theory_spec_deps spec)
+          (restore_spec_theory remote root (theory_spec_deps spec)
              {key = old_key, subject = #package spec ^ ":" ^ #logical spec,
               stem = drop_suffix ".dat" data_path, extra_outputs = SOME (#extra_outputs spec),
               requested_timeout = #tactic_timeout spec};
@@ -11148,7 +11254,8 @@ fun export_heap tc (project : HolbuildProject.t) plan output heap_kind =
   in
     if HolbuildToolchain.success status then
       (if echo_child_logs () then HolbuildStatus.message_stdout (read_text log handle _ => "") else ();
-       remove_tree stage)
+       remove_tree stage;
+       HolbuildStatus.count_project_work ())
     else
       raise Error (String.concatWith "\n"
         ["hol buildheap failed while exporting heap: " ^ output,
