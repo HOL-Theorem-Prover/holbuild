@@ -310,17 +310,16 @@ fun routed_status_using usable method urls path request =
     val grace = read andalso HolbuildCacheDiscovery.joining ()
     fun unanswered (HolbuildHttp.Failed _) = true
       | unanswered (HolbuildHttp.Response _) = false
-    fun loop [] _ _ _ missing last = Option.getOpt (missing, last)
-      | loop (node :: rest) count silent passed_over missing last =
-          if count >= 2 andalso not grace andalso not passed_over andalso
+    fun loop [] _ _ missing last = Option.getOpt (missing, last)
+      | loop (node :: rest) count silent missing last =
+          if count >= 2 andalso not grace andalso
              (if read then count = 2 andalso Option.isSome missing else not silent) then
             Option.getOpt (missing, last)
           else
             let
               val result = traced method node path (fn () => request node)
-              val rejected = read andalso result = HolbuildHttp.Response 200 andalso not (usable path)
               val result =
-                if rejected then
+                if read andalso result = HolbuildHttp.Response 200 andalso not (usable path) then
                   (HolbuildStatus.cache_trace ("remote cache " ^ method ^ " " ^ redact_userinfo node ^
                                                ": entry passed over");
                    HolbuildHttp.Response 404)
@@ -328,11 +327,10 @@ fun routed_status_using usable method urls path request =
               val missing = if read andalso result = HolbuildHttp.Response 404 then SOME (node, result) else missing
             in
               if transient result orelse (read andalso result = HolbuildHttp.Response 404) then
-                loop rest (count + 1) (silent andalso unanswered result)
-                     (passed_over orelse rejected) missing (node, result)
+                loop rest (count + 1) (silent andalso unanswered result) missing (node, result)
               else (node, result)
             end
-  in loop urls 0 true false NONE (hd urls, HolbuildHttp.Failed "no cache response") end
+  in loop urls 0 true NONE (hd urls, HolbuildHttp.Failed "no cache response") end
 
 fun routed_status method urls path request = routed_status_using (fn _ => true) method urls path request
 
@@ -551,53 +549,6 @@ fun action_metadata cache key text =
   in
     metadata_text text known_blobs
   end
-
-(* Repair only resident entries the caller identifies as weaker compatible
-   copies. Optional replica maintenance must not trip the primary's breaker. *)
-fun repair_action_replicas cache {key, text, attempts, should_replace} =
-  if tripped () then ()
-  else
-    let
-      val download = temp_path "action-repair-get"
-      val upload = temp_path "action-repair-put"
-      fun cleanup () = (remove_file download; remove_file upload)
-      fun repair url =
-        let
-          fun warning detail =
-            warn_restore_once ("could not reconcile cache replica " ^ redact_userinfo url ^ ": " ^ detail)
-          fun request method path call = traced method url path call
-          fun loop remaining =
-            case request "GET" download (fn () => get_status {url = url, dst = download}) of
-                HolbuildHttp.Response 404 => ()
-              | HolbuildHttp.Response 200 =>
-                  if not (should_replace (#manifest (metadata_manifest (read_text download)))) then ()
-                  else if remaining = 0 then warning "weaker timeout contract remains after repair"
-                  else
-                    (case request "PUT" upload (fn () => put_status [] {url = url, src = upload}) of
-                         HolbuildHttp.Response code =>
-                           if successful_put_code code then loop (remaining - 1)
-                           else if remaining > 1 then loop (remaining - 1)
-                           else warning ("HTTP " ^ Int.toString code ^ " during repair")
-                       | HolbuildHttp.Failed message =>
-                           if remaining > 1 then loop (remaining - 1) else warning message)
-              | result =>
-                  HolbuildStatus.cache_trace
-                    ("cache replica repair skipped: " ^ redact_userinfo url ^
-                     (case result of HolbuildHttp.Failed message => ": " ^ message
-                                   | HolbuildHttp.Response code => ": HTTP " ^ Int.toString code))
-        in
-          loop attempts handle Error detail => warning detail
-                             | IO.Io {name, function, ...} => warning (function ^ ": " ^ name)
-                             | OS.SysErr (detail, _) => warning detail
-        end
-    in
-      (write_text upload (action_metadata cache key text);
-       List.app repair (action_urls cache key);
-       cleanup ())
-      handle Error detail => (cleanup (); warn_restore_once detail)
-           | IO.Io {name, function, ...} => (cleanup (); warn_restore_once (function ^ ": " ^ name))
-           | OS.SysErr (detail, _) => (cleanup (); warn_restore_once detail)
-    end
 
 fun publish_action_metadata cache key metadata =
   let
