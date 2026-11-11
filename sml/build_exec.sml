@@ -7240,7 +7240,7 @@ fun restore_finished_build_logs (options : build_options) tc project plan toolch
                 | _ => ())
       | restore (_, NONE) = ()
   in
-    List.app restore logs
+    parallel_all remote_probe_width restore logs
   end
 
 (* Logs belong to this execution, not the cached theory entry. *)
@@ -7283,10 +7283,19 @@ fun restore_remote_build_logs (options : build_options) tc project plan toolchai
         let val dir = current_log_dir (project_artifact_root project) (package node) (logical_name node)
         in remove_file (current_build_log dir); remove_file (current_proof_trace_log dir) end
       else ()) theories
-    (* An optional log outage must not put the transport into cooldown before
-       the required logs have been fetched. *)
-    val restored = List.mapPartial restore
-      (List.filter required_log theories @ List.filter (not o required_log) theories)
+    (* Fetched in parallel, keeping the order of the theories.  An optional
+       log outage must not put the transport into cooldown before the
+       required logs have been fetched, so those go first. *)
+    fun restore_all nodes =
+      let
+        val results = Array.array (length nodes, NONE)
+        val indexed = ListPair.zip (List.tabulate (length nodes, fn i => i), nodes)
+      in
+        parallel_all remote_probe_width (fn (i, node) => Array.update (results, i, restore node)) indexed;
+        Array.foldr (fn (SOME r, acc) => r :: acc | (NONE, acc) => acc) [] results
+      end
+    val restored = restore_all (List.filter required_log theories)
+    val restored = restored @ restore_all (List.filter (not o required_log) theories)
     fun report (node, traced, path) =
       if not traced then ()
       else
@@ -7629,21 +7638,43 @@ fun publish_spec_blob remote {hash, path} =
       | HolbuildCacheBackend.Conflict message => raise Error ("could not upload " ^ path ^ ": " ^ message)
       | HolbuildCacheBackend.Skipped => raise Error ("could not upload " ^ path ^ ": skipped")
 
-(* The remote ledger: what an earlier export from this project found the
-   remote cache at a URL to hold, one "theory <input key>" or "blob <sha256>"
-   per line, so that the next export doesn't ask again.  The remote cache can
-   lose either; a worker that finds one missing fails its batch, and the
-   build then forgets the ledger (forget_remote_ledger) and resubmits. *)
-fun remote_ledger_dir project = Path.concat(project_artifact_root project, ".holbuild/remote-ledger")
-
-fun remote_ledger_path project remote =
-  Path.concat(remote_ledger_dir project, HolbuildHash.string_sha256 (HolbuildRemoteCache.base_url remote))
+(* The remote ledger: what earlier exports found the remote cache at a URL
+   to hold, one "theory <input key>" or "blob <sha256>" per line, so that the
+   next export doesn't ask again.  Its entries are content-addressed, so it
+   lives in the cache root and every project and worktree using that root
+   shares it.  The remote cache can lose either; a worker that finds one
+   missing fails its batch, and the build then forgets the ledger
+   (forget_remote_ledger) and resubmits.  Builds change it under its lock. *)
+fun remote_ledger_path remote =
+  Path.concat(Path.concat(cache_root (), "remote-ledger"),
+              HolbuildHash.string_sha256 (HolbuildRemoteCache.base_url remote))
 
 fun read_remote_ledger path =
   Binaryset.addList (Binaryset.empty String.compare, String.tokens (fn c => c = #"\n") (read_text path))
   handle IO.Io _ => Binaryset.empty String.compare
 
-fun forget_remote_ledger project = remove_tree (remote_ledger_dir project)
+fun with_remote_ledger_lock path f =
+  let val lock = HolbuildFileLock.acquire_exclusive_path_wait {path = path ^ ".lock"}
+  in (f () before HolbuildFileLock.release lock) handle e => (HolbuildFileLock.release lock; raise e) end
+
+(* Adds entries to the ledger, keeping those other builds added meanwhile,
+   but not entries this build read before a concurrent forget dropped them. *)
+fun record_remote_ledger_entries path entries =
+  with_remote_ledger_lock path (fn () =>
+    write_text path
+      (String.concat (map (fn line => line ^ "\n")
+                          (Binaryset.listItems (Binaryset.addList (read_remote_ledger path, entries))))))
+  handle e => warn ("could not record the remote ledger " ^ path ^ ": " ^ General.exnMessage e)
+
+fun forget_remote_ledger () =
+  case HolbuildRemoteCacheConfig.url () of
+      NONE => ()
+    | SOME url =>
+        let val path = remote_ledger_path (HolbuildRemoteCache.remote url)
+        in
+          with_remote_ledger_lock path (fn () => remove_file path)
+          handle e => warn ("could not forget the remote ledger " ^ path ^ ": " ^ General.exnMessage e)
+        end
 
 (* The input keys of the plan's theories whose input key is missing or that
    depend on that theory. *)
@@ -7789,10 +7820,10 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       else if not (#use_cache options) then
         raise Error "action-spec: a remote action's result is its cache entry, so --no-cache can't apply"
       else ()
-    val ledger_path = remote_ledger_path project remote
+    val ledger_path = remote_ledger_path remote
     val ledger_known =
       if ledger then read_remote_ledger ledger_path else Binaryset.empty String.compare
-    val learned = ref ledger_known
+    val learned = ref (Binaryset.empty String.compare)
     val ledger_mutex = Mutex.mutex ()
     fun known item = Binaryset.member (ledger_known, item)
     fun learn item =
@@ -7935,11 +7966,8 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
           (List.concat (map #files exported))
       else ()
     val _ =
-      if not ledger orelse Binaryset.numItems (!learned) = Binaryset.numItems ledger_known then ()
-      else
-        (ensure_parent ledger_path;
-         write_text_atomic ledger_path
-           (String.concat (map (fn line => line ^ "\n") (Binaryset.listItems (!learned)))))
+      if not ledger orelse Binaryset.isEmpty (!learned) then ()
+      else record_remote_ledger_entries ledger_path (Binaryset.listItems (!learned))
   in
     {batch = String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n",
      deferred = map (HolbuildBuildPlan.key o #1) deferred}
