@@ -339,8 +339,13 @@ fun run_action_help () = print
 
 fun export_help () = print
   "Usage:\n\
-  \  holbuild [GLOBAL OPTIONS] export [--build [--remote-exec URL [--remote-only]]] -o FILE [--metadata-out FILE] [TARGET ...]\n\n\
-  \Export cached build outputs for targets. With --build, build targets first.\n\n\
+  \  holbuild [GLOBAL OPTIONS] export [--build [--remote-exec URL [--remote-only]]] [--closure | --sources-only] -o FILE [--metadata-out FILE] [TARGET ...]\n\n\
+  \Write the root package as a capsule: its source snapshot and the cached build\n\
+  \outputs of its own theories among the targets. Targets in other packages are\n\
+  \left out. With --build, build targets first.\n\n\
+  \  --closure       Write the cached outputs of the whole target closure, dependencies\n\
+  \                  included, and no source snapshot.\n\
+  \  --sources-only  Write the source snapshot only. Takes no targets and builds no theories.\n\n\
   \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun import_help () = print
@@ -2328,34 +2333,51 @@ fun hbx_export_metadata project =
      hol_rev = hol_rev} : HolbuildCacheArchive.metadata
   end
 
-datatype export_args = ExportArgs of {build_first : bool, output : string, metadata_out : string option, targets : string list}
+datatype export_mode = PackageCut | Closure | SourcesOnly
+
+datatype export_args = ExportArgs of {build_first : bool, mode : export_mode, output : string, metadata_out : string option, targets : string list}
 
 fun parse_export_args args =
   let
-    fun done build_first output metadata_out targets =
-      case output of
-          SOME path => ExportArgs {build_first = build_first, output = path, metadata_out = metadata_out, targets = rev targets}
-        | NONE => raise Error "usage: holbuild export [--build] -o FILE [--metadata-out FILE] [TARGET ...]"
-    fun loop build_first output metadata_out targets rest =
+    val usage = "usage: holbuild export [--build] [--closure | --sources-only] -o FILE [--metadata-out FILE] [TARGET ...]"
+    fun done build_first closure sources_only output metadata_out targets =
+      let
+        val mode =
+          if closure andalso sources_only then raise Error "export --closure and --sources-only are exclusive"
+          else if closure then Closure
+          else if sources_only then SourcesOnly
+          else PackageCut
+        val _ =
+          if sources_only andalso build_first then raise Error "export --sources-only does not build; drop --build"
+          else if sources_only andalso not (null targets) then raise Error "export --sources-only takes no targets"
+          else ()
+      in
+        case output of
+            SOME path => ExportArgs {build_first = build_first, mode = mode, output = path, metadata_out = metadata_out, targets = rev targets}
+          | NONE => raise Error usage
+      end
+    fun loop build_first closure sources_only output metadata_out targets rest =
       case rest of
-          [] => done build_first output metadata_out targets
-        | "--build" :: xs => loop true output metadata_out targets xs
-        | "-o" :: path :: xs => loop build_first (SOME path) metadata_out targets xs
-        | "--output" :: path :: xs => loop build_first (SOME path) metadata_out targets xs
-        | "--metadata-out" :: path :: xs => loop build_first output (SOME path) targets xs
+          [] => done build_first closure sources_only output metadata_out targets
+        | "--build" :: xs => loop true closure sources_only output metadata_out targets xs
+        | "--closure" :: xs => loop build_first true sources_only output metadata_out targets xs
+        | "--sources-only" :: xs => loop build_first closure true output metadata_out targets xs
+        | "-o" :: path :: xs => loop build_first closure sources_only (SOME path) metadata_out targets xs
+        | "--output" :: path :: xs => loop build_first closure sources_only (SOME path) metadata_out targets xs
+        | "--metadata-out" :: path :: xs => loop build_first closure sources_only output (SOME path) targets xs
         | "-o" :: [] => raise Error "export -o requires FILE"
         | "--output" :: [] => raise Error "export --output requires FILE"
         | "--metadata-out" :: [] => raise Error "export --metadata-out requires FILE"
         | arg :: xs =>
             if String.isPrefix "--output=" arg then
-              loop build_first (SOME (String.extract(arg, size "--output=", NONE))) metadata_out targets xs
+              loop build_first closure sources_only (SOME (String.extract(arg, size "--output=", NONE))) metadata_out targets xs
             else if String.isPrefix "--metadata-out=" arg then
-              loop build_first output (SOME (String.extract(arg, size "--metadata-out=", NONE))) targets xs
+              loop build_first closure sources_only output (SOME (String.extract(arg, size "--metadata-out=", NONE))) targets xs
             else if String.isPrefix "--" arg then
               raise Error ("unknown export option: " ^ arg)
-            else loop build_first output metadata_out (arg :: targets) xs
+            else loop build_first closure sources_only output metadata_out (arg :: targets) xs
   in
-    loop false NONE NONE [] args
+    loop false false false NONE NONE [] args
   end
 
 fun root_package_name project =
@@ -2469,15 +2491,30 @@ fun export_entry_for_node project root keys node =
      root = package = root_package_name project}
   end
 
-fun export_entries project plan keys =
+(* The theory outputs an export of the selected targets carries.  A capsule
+   keeps the root package's own theories; the others are dropped before their
+   keys are asked for, so an unbuilt dependency does not fail it. *)
+fun export_entries project mode plan keys =
   let
     val root = HolbuildCache.cache_root ()
     val theory_nodes = List.filter theory_node (HolbuildBuildPlan.selected_nodes plan)
     val _ = if null theory_nodes then raise Error "export found no theory build outputs in the selected targets" else ()
+    val kept =
+      case mode of
+          Closure => theory_nodes
+        | _ => List.filter (fn node => HolbuildBuildPlan.package node = root_package_name project) theory_nodes
   in
-    map (export_entry_for_node project root keys) theory_nodes
+    map (export_entry_for_node project root keys) kept
   end
   handle HolbuildBuildExec.Error msg => raise Error msg
+
+(* The requested targets a capsule keeps: those naming a root-package node. *)
+fun root_package_targets project plan targets =
+  List.filter
+    (fn target =>
+        List.exists (fn node => HolbuildBuildPlan.package node = root_package_name project)
+                    (HolbuildBuildPlan.lookup plan target))
+    targets
 
 fun fs_cache_source cache : HolbuildCacheTransfer.source =
   {get_action = HolbuildFSCacheBackend.get_action cache,
@@ -2510,16 +2547,45 @@ fun optional_json_string_field name value =
       SOME text => [json_string_field name text]
     | NONE => []
 
-fun export_metadata_json {archive_path, targets, action_count, metadata} =
+(* What a sidecar says about the root package, whichever parts the archive has. *)
+type package_info =
+  {name : string,
+   version : string option,
+   toolchain_key : string,
+   dependencies : HolbuildPackageDefinition.dependency list}
+
+fun json_object fields = "{" ^ String.concatWith ", " fields ^ "}"
+
+(* A dependency as its manifest declares it; a git URL loses any userinfo,
+   as the repository URLs of the cache manifest do. *)
+fun dependency_json (HolbuildPackageDefinition.Dependency {name, source, ...}) =
+  json_object
+    (json_string_field "name" name ::
+     (case source of
+          HolbuildPackageDefinition.GitSource {git, rev} =>
+            [json_string_field "git" (HolbuildRemoteCacheConfig.node_identity git),
+             json_string_field "rev" rev]
+        | HolbuildPackageDefinition.FromSource {from, path, manifest} =>
+            [json_string_field "from" from,
+             json_string_field "path" path,
+             json_string_field "manifest" manifest]))
+
+fun export_metadata_json {archive_path, targets, action_count, metadata, package, has_cache, has_package} =
   let
     val sha256 = HolbuildHash.file_sha256 archive_path
     val {created_at, source_repo, source_rev, hol_repo, hol_rev} : HolbuildCacheArchive.metadata = metadata
+    val {name, version, toolchain_key, dependencies} : package_info = package
     val fields =
-      [json_string_field "format" "holbuild-hbx-metadata-v1",
-       json_string_field "archive_format" HolbuildCacheArchive.format,
-       json_string_field "archive" (OS.Path.file archive_path),
+      [json_string_field "format" "holbuild-hbx-metadata-v1"] @
+      (if has_cache then [json_string_field "archive_format" HolbuildCacheArchive.format] else []) @
+      (if has_package then [json_string_field "capsule_format" HolbuildCacheArchive.capsule_format] else []) @
+      [json_string_field "archive" (OS.Path.file archive_path),
        json_string_field "sha256" sha256,
        json_raw_field "size" (file_size_string archive_path),
+       json_string_field "name" name] @
+      optional_json_string_field "version" version @
+      [json_string_field "toolchain_key" toolchain_key,
+       json_raw_field "dependencies" ("[" ^ String.concatWith ", " (map dependency_json dependencies) ^ "]"),
        json_array_field "targets" targets,
        json_int_field "action_count" action_count,
        json_string_field "holbuild_version" HolbuildVersion.version] @
@@ -2532,11 +2598,14 @@ fun export_metadata_json {archive_path, targets, action_count, metadata} =
     "{\n  " ^ String.concatWith ",\n  " fields ^ "\n}\n"
   end
 
-fun write_export_metadata {path, archive_path, targets, action_count, metadata} =
+fun write_export_metadata {path, archive_path, targets, action_count, metadata, package, has_cache, has_package} =
   write_text_file path (export_metadata_json {archive_path = archive_path,
                                               targets = targets,
                                               action_count = action_count,
-                                              metadata = metadata})
+                                              metadata = metadata,
+                                              package = package,
+                                              has_cache = has_cache,
+                                              has_package = has_package})
 
 fun split_remote_prebuild_flags command args =
   let
@@ -2554,7 +2623,7 @@ fun split_remote_prebuild_flags command args =
 fun export_archive tc jobs args =
   let
     val ({url, remote_only}, args) = split_remote_prebuild_flags "export" args
-    val ExportArgs {build_first, output, metadata_out, targets = requested_targets} = parse_export_args args
+    val ExportArgs {build_first, mode, output, metadata_out, targets = requested_targets} = parse_export_args args
     val _ =
       if Option.isSome url andalso not build_first then
         raise Error "export --remote-exec requires --build"
@@ -2565,27 +2634,58 @@ fun export_archive tc jobs args =
         | SOME u => "--remote-exec" :: u :: (if remote_only then ["--remote-only"] else [])
     val _ = if build_first then build tc jobs (remote_args @ requested_targets) else ()
     val project = timed_phase "project.discover" load_project
-    val resolution = resolution_for_toolchain tc
-    val {index, components} = prepare_source_index "export" resolution project
-    val targets = timed_phase "targets.default" (fn () => default_build_targets resolution project index requested_targets)
-    val _ = reject_object_targets targets
-    val plan = timed_phase "build.plan" (fn () => build_target_plan resolution components (#holdir tc) project index requested_targets targets)
-    val keys = default_build_input_keys tc project index components plan
-    val entries = export_entries project plan keys
-    val cache = HolbuildFSCacheBackend.default () handle HolbuildFSCacheBackend.Error msg => raise Error msg
+    val package_info =
+      {name = root_package_name project,
+       version = #version project,
+       toolchain_key = HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key,
+       dependencies = HolbuildPackageDefinition.dependencies (HolbuildProject.package_definition project)} : package_info
     val metadata = hbx_export_metadata project
+    (* The cache part: the entries of the selected targets, none for --sources-only. *)
+    val cache_part =
+      case mode of
+          SourcesOnly => NONE
+        | _ =>
+            let
+              val resolution = resolution_for_toolchain tc
+              val {index, components} = prepare_source_index "export" resolution project
+              val targets = timed_phase "targets.default" (fn () => default_build_targets resolution project index requested_targets)
+              val _ = reject_object_targets targets
+              val plan = timed_phase "build.plan" (fn () => build_target_plan resolution components (#holdir tc) project index requested_targets targets)
+              val keys = default_build_input_keys tc project index components plan
+              val entries = export_entries project mode plan keys
+              val cache = HolbuildFSCacheBackend.default () handle HolbuildFSCacheBackend.Error msg => raise Error msg
+              val kept_targets = if mode = Closure then targets else root_package_targets project plan targets
+            in
+              SOME {source = fs_cache_source cache, entries = entries, targets = kept_targets, metadata = metadata}
+            end
+    (* The package part: the root package's source snapshot, none for --closure. *)
+    val package_part =
+      case mode of
+          Closure => NONE
+        | _ =>
+            SOME {name = #name package_info,
+                  version = #version package_info,
+                  toolchain_key = #toolchain_key package_info,
+                  root = #root project,
+                  files = HolbuildPackageSnapshot.files (HolbuildProject.project_package project)
+                          handle HolbuildPackageSnapshot.Error msg => raise Error msg}
+    val entries = case cache_part of SOME {entries, ...} => entries | NONE => []
+    val targets = case cache_part of SOME {targets, ...} => targets | NONE => []
   in
-    HolbuildCacheArchive.create_export {archive_path = output,
-                                        source = fs_cache_source cache,
-                                        entries = entries,
-                                        targets = targets,
-                                        metadata = metadata};
+    HolbuildCacheArchive.create_capsule {archive_path = output, cache = cache_part, package = package_part};
     Option.app (fn path => write_export_metadata {path = path,
                                                   archive_path = output,
                                                   targets = targets,
                                                   action_count = length entries,
-                                                  metadata = metadata}) metadata_out;
-    print ("exported " ^ Int.toString (length entries) ^ " cache action(s) to " ^ output ^ "\n")
+                                                  metadata = metadata,
+                                                  package = package_info,
+                                                  has_cache = Option.isSome cache_part,
+                                                  has_package = Option.isSome package_part}) metadata_out;
+    print ("exported " ^
+           String.concatWith " and "
+             ((if Option.isSome cache_part then [Int.toString (length entries) ^ " cache action(s)"] else []) @
+              (if Option.isSome package_part then ["the source snapshot of " ^ #name package_info] else [])) ^
+           " to " ^ output ^ "\n")
   end
 
 fun fs_cache_destination cache : HolbuildCacheTransfer.destination =
