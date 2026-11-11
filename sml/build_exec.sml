@@ -139,6 +139,7 @@ fun logical_name node = HolbuildBuildPlan.logical_name node
 fun package node = HolbuildBuildPlan.package node
 fun cache_enabled node = HolbuildProject.action_cache_enabled (source_policy node)
 fun always_reexecute node = HolbuildProject.action_always_reexecute (source_policy node)
+fun impure node = HolbuildProject.action_impure (source_policy node)
 
 fun one_with_suffix suffix paths =
   case List.filter (has_suffix suffix) paths of
@@ -4495,10 +4496,13 @@ fun assoc_timeout _ [] = NONE
 fun effective_tactic_timeout proof_steps node_timeout =
   if proof_steps then node_timeout else NONE
 
+(* An impure action never replays checkpoints: its script may compute
+   different values on each run (a timestamp, a version string), and
+   resuming past that code would restore the values of an earlier run. *)
 fun checkpoint_policy_for_node ({skip_checkpoints, proof_steps, new_ir, proof_scope, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure, trknl, ...} : build_options) project node =
   if HolbuildTacticTimeoutPolicy.includes_node proof_scope project node then
-    CheckpointPolicy {checkpoint = not skip_checkpoints,
-                      theorem_checkpoints = not skip_checkpoints,
+    CheckpointPolicy {checkpoint = not skip_checkpoints andalso not (impure node),
+                      theorem_checkpoints = not skip_checkpoints andalso not (impure node),
                       proof_steps = proof_steps,
                       new_ir = new_ir,
                       tactic_timeout = effective_tactic_timeout proof_steps
