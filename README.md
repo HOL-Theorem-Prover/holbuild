@@ -1443,7 +1443,11 @@ a build unless `--build` is passed.
   no theories.
 
 `import` hydrates the global cache from the cache part (a capsule without one
-imports no actions); a later `holbuild build MyTheory` materialises outputs
+imports no actions, which is not an error). It never unpacks the source
+snapshot. Before unpacking anything it lists the archive and refuses one that
+holds a member other than a regular file or directory (a symbolic or hard link,
+a device, a FIFO), a `..` component or an absolute path, naming the member. A
+later `holbuild build MyTheory` materialises outputs
 through the normal cache-restore path, offline too, when every needed output is
 in the archive (use `--closure` for that). Import HBX archives only from trusted
 publishers because those cached build outputs may later be loaded by Poly/ML.
