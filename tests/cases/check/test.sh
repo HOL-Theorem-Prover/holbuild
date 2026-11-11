@@ -222,9 +222,59 @@ done
 run_check "${selectors[0]}" 1 "${selectors[@]:1}"
 grep -E '^(Cheat|Clean|Uses|Base|Hypotheses|Bypass)Theory[.:]|^consumer:src/' "$log" > "$log.reports"
 diff -u "$expected" "$log.reports"
-# Count the real HOL invocation, using existing command timing instrumentation.
-[[ $(grep -c $'^tool\tkind=run\t.*argv0=.*/bin/hol$' "$timing") -eq 1 ]]
+# Plain checks inspect the restored data without launching HOL.
+[[ $(grep -c $'^tool\tkind=run\t.*argv0=.*/bin/hol$' "$timing") -eq 0 ]]
 [[ $(grep -c $'^phase\tname=build.plan\t' "$timing") -eq 1 ]]
+
+# The retained HOL path must give exactly the same reports, including order,
+# repeated selectors, dependency axioms and undischarged hypotheses.
+plain_reports=$log.reports
+run_check --with-fingerprints 1 "${selectors[@]}"
+grep -E '^(Cheat|Clean|Uses|Base|Hypotheses|Bypass)Theory[.:]|^consumer:src/' "$log" > "$log.reports"
+diff -u "$plain_reports" "$log.reports"
+[[ $(grep -c $'^tool\tkind=run\t.*argv0=.*/bin/hol$' "$timing") -eq 1 ]]
+
+# Warm fingerprint checks still need a memory reservation; the data-only path
+# needs none. The budget deliberately cannot admit a child.
+for mode in --fingerprint --with-fingerprints; do
+  admission_log=$tmpdir/admission-$mode.log
+  if (cd "$project" && "$HOLBUILD_BIN" --cooperate-dir "$tmpdir/coop" \
+      --machine-max-mem 1 --child-charge 2 check "$mode" CleanTheory) > "$admission_log" 2>&1; then
+    echo "$mode ignored memory admission" >&2
+    exit 1
+  fi
+  require_grep 'exceeds the machine budget' "$admission_log"
+done
+(cd "$project" && "$HOLBUILD_BIN" --cooperate-dir "$tmpdir/coop" \
+  --machine-max-mem 1 --child-charge 2 check CleanTheory) > "$tmpdir/admission-plain.log" 2>&1
+require_grep '^CleanTheory: clean (1 theorem)$' "$tmpdir/admission-plain.log"
+
+cat > "$project/src/MetadataScript.sml" <<'SML'
+Theory Metadata
+val _ = save_thm ("rebound", ASSUME ``F``);
+val _ = Theory.delete_binding "rebound";
+val _ = save_thm ("rebound", TRUTH);
+val _ = Theory.save_private_thm ("private_hyp", ASSUME ``T``);
+val _ = save_thm ("oracle_thm", Thm.mk_oracle_thm "quote\"back\\slash" ([], ``T``));
+SML
+for side in Left Right; do
+  cat > "$project/src/${side}Script.sml" <<SML
+Theory $side
+Ancestors Base
+val _ = new_axiom ("${side}_ax", \`\`T\`\`);
+SML
+done
+cat > "$project/src/DiamondScript.sml" <<'SML'
+Theory Diamond
+Ancestors Left Right Metadata
+SML
+run_check MetadataTheory 1 MetadataTheory:rebound DiamondTheory MetadataTheory
+require_grep '^MetadataTheory.rebound: clean (1 theorem)$' "$log"
+metadata_reports=$tmpdir/metadata.reports
+grep -E '^(Metadata|Diamond|Left|Right|Base)Theory[.:]' "$log" > "$metadata_reports"
+run_check --with-fingerprints 1 MetadataTheory MetadataTheory:rebound DiamondTheory MetadataTheory
+grep -E '^(Metadata|Diamond|Left|Right|Base)Theory[.:]' "$log" > "$log.reports"
+diff -u "$metadata_reports" "$log.reports"
 
 run_check CleanTheory 1 CheatTheory
 require_grep "^CleanTheory: clean (1 theorem)$" "$log"
@@ -523,7 +573,7 @@ cat >> "$project/src/BatchChildScript.sml" <<'SML'
 val _ = Theory.add_ML_dependency "StateProbe";
 SML
 (cd "$project" && "$HOLBUILD_BIN" build StateProbe BatchChildTheory) > "$tmpdir/batch-checkpoint-build.log" 2>&1
-run_check BatchParentTheory 0 BatchChildTheory
+run_check --with-fingerprints 0 BatchParentTheory BatchChildTheory
 require_grep 'BatchChildScript.sml.deps/.*/deps_loaded.save' "$tmpdir/check-hierarchy"
 require_grep '^BatchParentTheory: clean (1 theorem)$' "$log"
 require_grep '^BatchChildTheory: clean (1 theorem)$' "$log"
