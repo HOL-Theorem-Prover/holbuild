@@ -2291,7 +2291,7 @@ fun current_utc_timestamp () =
 fun hol_dependency_metadata project =
   case HolbuildProject.resolved_hol_dependency project of
       SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev}, ...}) =>
-        {hol_repo = SOME git, hol_rev = SOME rev}
+        {hol_repo = SOME (HolbuildRemoteCacheConfig.node_identity git), hol_rev = SOME rev}
     | _ => {hol_repo = NONE, hol_rev = NONE}
 
 fun hbx_export_metadata project =
@@ -2299,7 +2299,8 @@ fun hbx_export_metadata project =
     val {hol_repo, hol_rev} = hol_dependency_metadata project
   in
     {created_at = SOME (current_utc_timestamp ()),
-     source_repo = git_output (#root project) "config --get remote.origin.url",
+     source_repo = Option.map HolbuildRemoteCacheConfig.node_identity
+                     (git_output (#root project) "config --get remote.origin.url"),
      source_rev = git_output (#root project) "rev-parse HEAD",
      hol_repo = hol_repo,
      hol_rev = hol_rev} : HolbuildCacheArchive.metadata
