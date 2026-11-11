@@ -2265,6 +2265,7 @@ val remote_theory_publish_attempts = 3
 fun put_remote_theory_action remote _ (request as {key, text}) =
   let
     val incoming = cache_manifest_contract key text
+    val initial_resident = HolbuildRemoteCache.get_action remote key
     fun conflict detail = HolbuildCacheBackend.Conflict ("remote theory action " ^ key ^ ": " ^ detail)
     fun compatible_contract resident_text =
       let val resident = cache_manifest_contract key resident_text
@@ -2272,10 +2273,11 @@ fun put_remote_theory_action remote _ (request as {key, text}) =
         if #non_timeout_text resident = #non_timeout_text incoming then resident
         else raise Error "resident manifest differs outside proof-timeout"
       end
-    fun attempt attempts =
+    fun attempt attempts resident =
       let
         fun retry detail =
-          if attempts > 1 then attempt (attempts - 1) else conflict detail
+          if attempts > 1 then attempt (attempts - 1) (HolbuildRemoteCache.get_action remote key)
+          else conflict detail
         fun verify result =
           case HolbuildRemoteCache.get_action remote key of
               NONE => retry "action missing after publication"
@@ -2298,7 +2300,7 @@ fun put_remote_theory_action remote _ (request as {key, text}) =
             | result as HolbuildCacheBackend.AlreadyPresent => verify result
             | HolbuildCacheBackend.Skipped => HolbuildCacheBackend.Skipped
       in
-        case HolbuildRemoteCache.get_action remote key of
+        case resident of
             NONE => publish_missing ()
           | SOME resident_text =>
               let val resident = compatible_contract resident_text
@@ -2311,8 +2313,21 @@ fun put_remote_theory_action remote _ (request as {key, text}) =
                   conflict "proof-timeout contracts are incomparable"
               end
       end
+    val result = attempt remote_theory_publish_attempts initial_resident
+    fun weaker resident_text =
+      let val resident = compatible_contract resident_text
+      in not (timeout_at_least_as_strong (#proof_timeout resident) (#proof_timeout incoming)) end
+      handle Error detail => raise HolbuildRemoteCache.Error detail
+           | HolbuildTheoryCacheManifest.Error detail => raise HolbuildRemoteCache.Error detail
+    val _ =
+      if Option.isSome initial_resident andalso Option.isSome (#proof_timeout incoming) andalso
+         (case result of HolbuildCacheBackend.Published => true
+                       | HolbuildCacheBackend.AlreadyPresent => true | _ => false) then
+        HolbuildRemoteCache.repair_action_replicas remote
+          {key = key, text = text, attempts = remote_theory_publish_attempts, should_replace = weaker}
+      else ()
   in
-    attempt remote_theory_publish_attempts
+    result
   end
   handle e as HolbuildRemoteCache.Unavailable _ => raise e
        | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
@@ -2393,10 +2408,15 @@ fun prefetch_remote_cache_key root url key =
     cache_trace ("remote cache prefetched: " ^ key)
   else ()
 
-fun ensure_local_cache_entry root key =
+fun ensure_local_cache_entry_using usable root key =
   case HolbuildCache.get_action root key of
-      SOME text => SOME text
-    | NONE => if hydrate_remote_cache_key root key then HolbuildCache.get_action root key else NONE
+      SOME text =>
+        if usable text then SOME text
+        else if hydrate_remote_cache_key_using usable root key then HolbuildCache.get_action root key
+        else SOME text
+    | NONE => if hydrate_remote_cache_key_using usable root key then HolbuildCache.get_action root key else NONE
+
+fun ensure_local_cache_entry root key = ensure_local_cache_entry_using (fn _ => true) root key
 
 fun publish_remote_cache_key root key =
   case HolbuildRemoteCacheConfig.url () of
@@ -2567,7 +2587,8 @@ fun checked_cache_entry allow_timeout_discrepancy {root, input_key, subject, exp
   let
     val manifest = HolbuildCache.action_manifest root input_key
     val manifest_text =
-      case ensure_local_cache_entry root input_key of
+      case ensure_local_cache_entry_using
+             (manifest_timeout_satisfies allow_timeout_discrepancy requested_timeout) root input_key of
           SOME text => text
         | NONE => (cache_trace ("cache miss: " ^ subject ^ " " ^ cache_key_role ^ "=" ^ input_key ^ " (no manifest)");
                    raise Error "cache entry not found")
