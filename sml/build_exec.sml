@@ -8883,13 +8883,6 @@ fun spec_parent_hashes_match_in dat_hashes root (spec : spec_deps) data_path =
 fun spec_parent_hashes_match root spec data_path =
   spec_parent_hashes_match_in (new_file_hash_cache ()) root spec data_path
 
-(* Step 3: the caller's files, given as {hash, dst}, the spec's libraries
-   and library manifests from the spec, dependency theories from the cache;
-   the transfers run in parallel.  A worker's local copy of an entry goes
-   out of date when the remote's entry for its key changes; the remote's
-   replaces it for the dependencies selected by direct, which a build
-   records as parents even when their copies fit the rest, and for all of
-   them when one doesn't fit the others. *)
 (* The time each step of a hydrate took, summed over repeats; exec-action
    reports them beside its hydrate phase. *)
 val hydrate_steps = ref ([] : (string * LargeInt.int) list)
@@ -8908,6 +8901,13 @@ fun hydrate_step name f =
     (f () before record ()) handle e => (record (); raise e)
   end
 
+(* Step 3: the caller's files, given as {hash, dst}, the spec's libraries
+   and library manifests from the spec, dependency theories from the cache;
+   the transfers run in parallel.  A worker's local copy of an entry goes
+   out of date when the remote's entry for its key changes; the remote's
+   replaces it for the dependencies selected by direct, which a build
+   records as parents even when their copies fit the rest, and for all of
+   them when one doesn't fit the others. *)
 fun hydrate_spec_deps remote root files (spec : spec_deps) direct =
   let
     fun library {path, sha256, ...} = {hash = sha256, dst = in_root root path}
