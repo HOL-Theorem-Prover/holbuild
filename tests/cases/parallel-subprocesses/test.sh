@@ -50,7 +50,7 @@ fun append msg =
   let val out = TextIO.openAppend "$child_log"
   in TextIO.output(out, msg ^ "\\n"); TextIO.closeOut out end;
 val _ = append "START T${i}";
-val _ = OS.Process.system "sleep 2";
+val _ = OS.Process.system "sleep $((i + 1))";
 val _ = append "END T${i}";
 val _ = stagePathLib.check ();
 val _ = new_theory "T${i}";
