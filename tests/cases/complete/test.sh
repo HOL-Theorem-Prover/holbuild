@@ -77,6 +77,12 @@ complete "$outside" value build --proof-scope ""
 expect value all root
 complete "$outside" global-value --verbosity ""
 expect global-value normal quiet verbose
+complete "$outside" joined-value --verbosity=q
+expect joined-value --verbosity=quiet
+complete "$outside" implicit-build --proof-scope ""
+expect implicit-build all root
+complete "$outside" implicit-build-joined --proof-scope=
+expect implicit-build-joined --proof-scope=all --proof-scope=root
 complete "$outside" global-anywhere build --jobs 4 --verbosity q
 expect global-anywhere quiet
 complete "$outside" file-value build --tactic-timeout ""
@@ -200,6 +206,8 @@ for command in clean execution-plan check; do
 done
 complete "$project" from run --from A
 expect from AlphaTheory AlpineTheory
+complete "$project" from-joined repl --from=Al
+expect from-joined --from=AlphaTheory --from=AlpineTheory
 complete "$project" heap heap ""
 expect heap mainheap
 complete "$project" executable executable ""

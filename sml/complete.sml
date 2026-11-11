@@ -77,13 +77,11 @@ fun command name : command =
 
 fun lookup key pairs = Option.map #2 (List.find (fn (k, _) => k = key) pairs)
 
+(* Options before any command word are build's: holbuild runs `build` then. *)
 fun valued_option command_opt word =
   case lookup word (global_valued @ hidden_valued) of
       SOME names => SOME names
-    | NONE =>
-        (case command_opt of
-             SOME name => lookup word (#valued (command name))
-           | NONE => NONE)
+    | NONE => lookup word (#valued (command (Option.getOpt (command_opt, "build"))))
 
 (* The command the finished words select (a first operand that is no command
    is a build target), what the last of them leaves to complete if it is an
@@ -183,7 +181,16 @@ fun candidates words =
       case pending of
           SOME option => names_for (Option.getOpt (valued_option command_opt option, Nothing))
         | NONE =>
-            if String.isPrefix "-" current then options command_opt
+            if String.isPrefix "-" current then
+              (* `--option=VALUE` completes the value after the `=`. *)
+              let
+                val (option, value) = Substring.position "=" (Substring.full current)
+                val option = Substring.string option
+              in
+                case if Substring.isEmpty value then NONE else valued_option command_opt option of
+                    SOME names => map (fn name => option ^ "=" ^ name) (names_for names)
+                  | NONE => options command_opt
+              end
             else
               case command_opt of
                   NONE => names_for Commands @ names_for Targets
