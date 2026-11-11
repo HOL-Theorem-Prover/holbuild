@@ -9607,6 +9607,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
     val state_path = Path.concat(HolbuildCache.locks_dir cache, "worker-cache-cap.state")
     val grace_path = Path.concat(HolbuildCache.locks_dir cache, "worker-cache-cap.grace")
     val scan_path = Path.concat(HolbuildCache.locks_dir cache, "worker-cache-cap-scan.lock")
+    val refresh_path = Path.concat(HolbuildCache.locks_dir cache, "worker-cache-cap.refresh")
     fun state_text () = read_text state_path handle IO.Io _ => "" | OS.SysErr _ => ""
     fun parse_sizes [] = SOME []
       | parse_sizes (id :: bytes :: rest) =
@@ -9616,11 +9617,17 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
       | parse_sizes _ = NONE
     val stamp_life = 60000000000 : LargeInt.int
     val grace_life = 300000000000 : LargeInt.int
-    fun stamp_age () =
-      case String.tokens Char.isSpace (state_text ()) of
-          "holbuild-worker-cache-cap-v2" :: measured :: _ =>
-            Option.map (fn measured => Time.toNanoseconds (Time.now ()) - measured) (LargeInt.fromString measured)
-        | _ => NONE
+    fun refreshed () =
+      write_text refresh_path (LargeInt.toString (Time.toNanoseconds (Time.now ())) ^ "\n")
+    fun recent_refresh () =
+      let val text = read_text refresh_path handle IO.Io _ => "" | OS.SysErr _ => ""
+      in
+        case LargeInt.fromString text of
+            SOME completed =>
+              let val age = Time.toNanoseconds (Time.now ()) - completed
+              in completed > 0 andalso age >= 0 andalso age < stamp_life div 2 end
+          | NONE => false
+      end
     fun fitting_scan ceiling max_age private_bytes =
       if target < gb_to_bytes 64 orelse reserve_bytes <= 0 then NONE else
       let val text = state_text ()
@@ -9732,10 +9739,11 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
           in
             (* Measure again, so a waiter on gc.lock reuses the result
                rather than repeating the scan. *)
-            if after <= target then publish (measure_shared ())
-            else (remove_file state_path; remove_file grace_path;
-                  warn ("worker cache holds " ^ gb_decimal_text after ^ " GB of entries in use, over the " ^
-                        gb_decimal_text target ^ " GB left under the cap after its reserve"))
+            (if after <= target then publish (measure_shared ())
+             else (remove_file state_path; remove_file grace_path;
+                   warn ("worker cache holds " ^ gb_decimal_text after ^ " GB of entries in use, over the " ^
+                         gb_decimal_text target ^ " GB left under the cap after its reserve")));
+            refreshed ()
           end
       end
     fun scan ceiling reuse =
@@ -9755,8 +9763,11 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
         val _ = HolbuildFileLock.remove_obsolete_lock_dir "cache gc" lock_path
         val lock = HolbuildFileLock.acquire_exclusive_path_wait {path = lock_path}
       in locked lock work end
+    (* Legacy workers can keep publishing near-target measurements. Only
+       our completed maintenance, or actual headroom, postpones another try. *)
     fun fresh () =
-      case stamp_age () of SOME age => age >= 0 andalso age < stamp_life div 2 | NONE => false
+      recent_refresh () orelse
+      Option.isSome (fitting_scan high_target (SOME (stamp_life div 2)) private_bytes)
     fun refresh_scan () =
       if fresh () then NONE else
       let
@@ -9768,6 +9779,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
           (Option.app
              (fn lock => locked lock (fn () => if state_text () = original then publish shared else ()))
              (HolbuildFileLock.try_acquire_path {path = lock_path, obsolete_kind = SOME "cache gc"});
+           refreshed ();
            NONE)
       end
   in
@@ -9780,8 +9792,8 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                case locked lock refresh_scan of
                    NONE => ()
                  | SOME (original, shared) => with_gc (fn () =>
-                     (* The unlocked walk saw an over-cap cache. Do not let
-                        its original under-cap estimate satisfy this sweep. *)
+                     (* The unlocked walk exceeded the background threshold. Do not let
+                        its original fitting estimate satisfy this sweep. *)
                      if state_text () = original andalso #ids shared = root_ids () then
                        enforce high_target shared (private_bytes ())
                      else scan high_target true))

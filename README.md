@@ -1847,9 +1847,15 @@ rechecked under `gc.lock` and may defer scanning for five minutes from its
 first reuse; subsequent actions reuse an already-active grace without waiting
 on the sweep lock again. Its grace is bound to that exact measurement in
 `locks/worker-cache-cap.grace`; replacing the measurement resets the grace.
-Idle time does not consume it. After the result, a measurement older than
-30 seconds is refreshed under a separate single-flight scan lock. The
-read-only walk leaves `gc.lock` available; publication briefly tries that
+Idle time does not consume it. After the result, background maintenance
+uses a separate single-flight scan lock. It skips a measurement younger than
+30 seconds only when it fits the lower background threshold, or when this
+worker implementation completed maintenance within 30 seconds. Completed
+refresh walks and eviction sweeps record this separate cooldown in
+`locks/worker-cache-cap.refresh`, so older workers publishing near-target
+measurements cannot postpone trimming. This cooldown also prevents repeated
+scans of entries still in use; it never permits foreground estimate reuse.
+The read-only walk leaves `gc.lock` available; publication briefly tries that
 lock and checks that the old stamp and root identities have not changed.
 A background refresh above a quarter-reserve below the target waits for
 `gc.lock` and trims the cache, reusing its

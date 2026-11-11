@@ -213,9 +213,14 @@ Estimate reuse still permits the full 360 GiB;
 if leased entries prevent reaching 340 GiB, a total under 360 GiB can still
 publish a measurement.
 
-After reporting its result, an action refreshes a measurement older than
-30 seconds. Read-only refreshes share a separate single-flight lock and
-briefly try `gc.lock` to publish only if the previous stamp and root
+After reporting its result, an action starts background maintenance unless
+a measurement younger than 30 seconds fits the background threshold, or a
+completed maintenance attempt is younger than 30 seconds. Refresh walks and
+eviction sweeps record that independent cooldown in
+`locks/worker-cache-cap.refresh`: legacy workers refreshing a near-target
+estimate cannot suppress trimming, and pinned entries do not cause repeated
+background scans. The cooldown never authorizes foreground estimate reuse.
+Read-only refreshes share a separate single-flight lock and briefly try `gc.lock` to publish only if the previous stamp and root
 identities still match. A refresh above the background threshold waits for
 `gc.lock` and enforces the cap. It reuses its walk only while the original
 stamp and root identities still match; otherwise it rechecks a sibling's

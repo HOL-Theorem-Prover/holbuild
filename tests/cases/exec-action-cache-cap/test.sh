@@ -612,14 +612,31 @@ sweep_mature() {
     > "$tmpdir/mature.log" 2>&1 || status=$?
   [[ $status -eq 4 ]] || { cat "$tmpdir/mature.log" >&2; exit 1; }
 }
+# Seed or inspect foreground reuse without running background maintenance.
+seed_mature() {
+  python3 - "$HOLBUILD_BIN" "$mature_cache" "$remote_url" "$absent" \
+    "$tmpdir/mature-result" "$1" "$2" <<'SEED'
+import fcntl, os, pathlib, subprocess, sys
+binary, cache, remote, absent, result, limit, reserve = sys.argv[1:]
+locks = pathlib.Path(cache) / "locks"
+locks.mkdir(parents=True, exist_ok=True)
+with open(locks / "worker-cache-cap-scan.lock", "a") as scanner:
+    fcntl.lockf(scanner, fcntl.LOCK_EX)
+    completed = subprocess.run(
+        [binary, "--remote-cache", remote, "exec-action", absent, "--result", result,
+         "--cache-limit-gb", limit, "--cache-reserve-gb", reserve],
+        env={**os.environ, "HOLBUILD_CACHE": cache}, capture_output=True, text=True)
+    assert completed.returncode == 4, completed.stderr
+SEED
+}
 for limits in "100 10 89" "400 40 359"; do
   read -r limit reserve bytes <<< "$limits"
   mature_cache=$tmpdir/mature-$limit
   sparse "$mature_cache/checkpoint-store/family/heap" "$bytes"
-  sweep_mature "$limit" "$reserve"
+  seed_mature "$limit" "$reserve"
   mature_state=$mature_cache/locks/worker-cache-cap.state
   cp "$mature_state" "$tmpdir/mature-state"
-  sweep_mature "$limit" "$reserve"
+  seed_mature "$limit" "$reserve"
   cmp "$mature_state" "$tmpdir/mature-state" || { echo "mature cache repeated a shared scan" >&2; exit 1; }
   kept "$mature_cache/checkpoint-store/family/heap" "mature cached data under the target"
   # An explicit zero reserve cannot safely reuse even a large cache's estimate.
@@ -627,8 +644,8 @@ for limits in "100 10 89" "400 40 359"; do
   ! cmp -s "$mature_state" "$tmpdir/mature-state" || { echo "zero-reserve cache reused a measurement" >&2; exit 1; }
 done
 
-# Background maintenance must trim a mature cache before it crosses the
-# foreground ceiling; fresh stamps still retain the thirty-second cooldown.
+# A fresh near-target stamp from a foreground or legacy worker must not
+# suppress preemptive maintenance. Only our separate cooldown can do that.
 for limits in "100 10 89" "400 40 359"; do
   read -r limit reserve bytes <<< "$limits"
   mature_cache=$tmpdir/preemptive-$limit
@@ -639,15 +656,8 @@ for limits in "100 10 89" "400 40 359"; do
     sparse "$mature_cache/blobs/old-$n" "$chunk"
     at 2000 "$mature_cache/blobs/old-$n"
   done
-  sweep_mature "$limit" "$reserve"
+  seed_mature "$limit" "$reserve"
   mature_state=$mature_cache/locks/worker-cache-cap.state
-  python3 - "$mature_state" <<'AGE'
-import pathlib, sys, time
-state = pathlib.Path(sys.argv[1])
-lines = state.read_text().splitlines()
-lines[1] = str(time.time_ns() - 40 * 10**9)
-state.write_text("\n".join(lines) + "\n")
-AGE
   sweep_mature "$limit" "$reserve"
   python3 - "$mature_state" "$limit" "$reserve" <<'TRIM'
 import pathlib, sys
@@ -657,6 +667,34 @@ low = int(limit) - int(reserve) - int(reserve) // 2
 assert shared <= low * 1024**3, "background refresh did not leave headroom"
 TRIM
   kept "$mature_cache/blobs/base" "retained data after preemptive trimming"
+done
+
+# A completed candidate maintenance attempt throttles retries independently
+# of v2 stamp churn. Invalid, future and expired cooldowns must not suppress it.
+for cooldown in fresh corrupt future expired; do
+  mature_cache=$tmpdir/refresh-cooldown-$cooldown
+  sparse "$mature_cache/blobs/base" 79
+  at 2010 "$mature_cache/blobs/base"
+  for n in 1 2 3 4 5; do
+    sparse "$mature_cache/blobs/old-$n" 2
+    at 2000 "$mature_cache/blobs/old-$n"
+  done
+  seed_mature 100 10
+  python3 - "$mature_cache/locks/worker-cache-cap.refresh" "$cooldown" <<'COOLDOWN'
+import pathlib, sys, time
+path = pathlib.Path(sys.argv[1])
+kind = sys.argv[2]
+stamp = {"fresh": str(time.time_ns()), "corrupt": "invalid",
+         "future": str(time.time_ns() + 60 * 10**9),
+         "expired": str(time.time_ns() - 40 * 10**9)}[kind]
+path.write_text(stamp + "\n")
+COOLDOWN
+  sweep_mature 100 10
+  python3 - "$mature_cache/locks/worker-cache-cap.state" "$cooldown" <<'RESULT'
+import pathlib, sys
+shared = sum(map(int, pathlib.Path(sys.argv[1]).read_text().split()[3::2]))
+assert shared == 89 * 1024**3 if sys.argv[2] == "fresh" else shared <= 85 * 1024**3
+RESULT
 done
 
 # A legacy sibling can publish a fresh, near-target stamp while background
@@ -669,7 +707,7 @@ if [[ $(uname -s) == Linux ]]; then
     sparse "$mature_cache/blobs/old-$n" 2
     at 2000 "$mature_cache/blobs/old-$n"
   done
-  sweep_mature 100 10
+  seed_mature 100 10
   python3 - "$HOLBUILD_BIN" "$mature_cache" "$remote_url" "$absent" "$tmpdir" <<'SIBLING'
 import ctypes, fcntl, os, pathlib, select, subprocess, sys, time
 binary, cache, remote, absent, tmp = sys.argv[1:]
@@ -715,7 +753,7 @@ root = pathlib.Path(sys.argv[1])
 for index in range(20000):
     (root / str(index)).touch()
 FILES
-sweep_mature 100 10
+seed_mature 100 10
 python3 - "$HOLBUILD_BIN" "$mature_cache" "$remote_url" "$absent" "$tmpdir" <<'PUBLICATION'
 import fcntl, os, pathlib, subprocess, sys, time
 binary, cache, remote, absent, tmp = sys.argv[1:]
@@ -771,7 +809,7 @@ for limits in "100 10 89" "400 40 359"; do
     sparse "$mature_cache/blobs/old-$n" "$chunk"
     at 2000 "$mature_cache/blobs/old-$n"
   done
-  sweep_mature "$limit" "$reserve"
+  seed_mature "$limit" "$reserve"
   sparse "$mature_cache/theory-modules/private.pmo" "$chunk"
   sweep_mature "$limit" "$reserve"
   mature_state=$mature_cache/locks/worker-cache-cap.state
