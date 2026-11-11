@@ -839,17 +839,17 @@ fallback baseline, while live discovery updates the effective ring throughout
 an action. Python independently refreshes the ring for release-spec downloads.
 Discovery never follows redirects. A listed temporary member whose name does
 not resolve on that host yet is left out until a later refresh finds it (a
-resolver may cache the name's earlier NXDOMAIN for minutes); its joining then
-starts the join grace. Permanent members are always kept.
-If discovery fails, the last complete ring remains
-usable for 60 seconds, after which requests use the permanent configuration.
-Recovery from permanent fallback counts as a new join.
-For 60 seconds after observing a joined member, GET/HEAD can try every ready
-member to find an object whose former owner has not uploaded it yet. Outside
-that join grace, a miss tries at most two nodes. If both nodes fail with
-transport errors, 429 or 5xx, reads can continue through the snapshot so stale
-readers can bypass concurrent drains. Writes keep the two-node bound unless
-neither node gave an HTTP response; then they go on until one does.
+resolver may cache the name's earlier NXDOMAIN for minutes). Permanent members
+are always kept. If discovery fails, the last complete ring remains usable for
+60 seconds, after which requests use the permanent configuration.
+GET/HEAD, from clients, workers and the coordinator's completion check alike,
+ask every member before reporting a miss, so an object a node has not yet
+uploaded to the shared store is still found on that node, and stale readers
+can bypass concurrent drains. Writes keep the two-node bound unless neither
+node gave an HTTP response; then they go on until one does. A worker started
+with `HOLBUILD_REMOTE_CACHE_PREFERRED_URLS` (see the main README) passes it to
+its builds and uses it for its own spec downloads, so a deployment spread over
+several data centers can point each worker at its nearest members.
 
 ### Capacity adapter
 
@@ -864,7 +864,10 @@ provider ownership data is persisted separately from operation tokens, before
 any DNS publication.
 
 Configure one to four `REMOTE_EXEC_CACHE_SLOTS` as a JSON list of
-`{"name":"slot-c","url":"https://cache-c.example"}`. A slot URL may be
+`{"name":"slot-c","url":"https://cache-c.example"}`. A slot may also name a
+`"zone"`: it then goes only to an instance whose inventory entry reports that
+`zone`, so workers in that zone can list the slot's URL among their preferred
+members. An instance in a zone whose slot is taken waits for it. A slot URL may be
 `http://` only for a credential-free cache on a private network: the
 coordinator then requires `REMOTE_EXEC_CACHE_URL` to be `http://` and carry no
 credentials, since discovery hands those to every slot. The existing Postgres

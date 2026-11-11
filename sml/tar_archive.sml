@@ -57,7 +57,8 @@ fun parse_listing_line line =
 
 fun list_listing archive_path =
   let
-    val listing = HolbuildTempPath.near archive_path ".list"
+    (* Not beside the archive, whose directory may be read-only. *)
+    val listing = HolbuildTempPath.temporary "tar-list"
     fun cleanup () = OS.FileSys.remove listing handle OS.SysErr _ => ()
     fun read () =
       let val input = TextIO.openIn listing

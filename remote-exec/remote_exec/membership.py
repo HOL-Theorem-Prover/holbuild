@@ -63,23 +63,16 @@ class Membership:
     attempted: float = float('-inf')
     succeeded: float = float('-inf')
     members: list[str] = field(default_factory=list)
-    joined: float = float('-inf')
 
     def update(self, text: str, now: float, resolve: bool = False) -> None:
         """With resolve, leave out a member this host can't resolve yet (its resolver may cache the empty
-        slot's NXDOMAIN for minutes after the member is published); a later refresh adds it as a join."""
+        slot's NXDOMAIN for minutes after the member is published); a later refresh adds it."""
         members = parse_members(text, self.defaults, self.allowed)
         if resolve:
             permanent = {node_identity(url) for url in self.defaults}
             members = [url for url in members if node_identity(url) in permanent or resolves(url)]
-        if set(members) - set(self.current(now)):
-            self.joined = now
         self.members = members
         self.succeeded = now
 
     def current(self, now: float) -> list[str]:
         return self.members if self.members and now - self.succeeded < STALE_SECONDS else self.defaults
-
-    def joining(self, now: float) -> bool:
-        """Cover async write-back to a former owner for sixty seconds after observing a join."""
-        return now - self.joined < STALE_SECONDS

@@ -1175,6 +1175,26 @@ async def test_memory_failure_moves_to_the_high_tier_and_retries_up_to_max_attem
     await claim_named(http, "a", "high")
 
 
+async def test_memory_failure_on_the_last_standard_attempt_fails_the_batch(
+    http: httpx.AsyncClient, cache: FakeCache
+) -> None:
+    batch_id = await submit(http, ["a"])
+    for _ in range(2):
+        token = await claim_named(http, "a")
+        assert (await complete(http, token, result("a", "failed", "internal"))).status_code == 200
+    token = await claim_named(http, "a")
+    assert (await complete(http, token, result("a", "failed", "memory"))).status_code == 200
+
+    status = await batch(http, batch_id)
+    assert (status["state"], status["failure"]) == ("failed", "pkg:a: memory")
+    assert await claim(http, "high") is None
+
+    # The failure still places the theory on the high tier for the next batch.
+    await submit(http, ["a"])
+    assert await claim(http, "standard") is None
+    await claim_named(http, "a", "high")
+
+
 async def test_peak_above_the_standard_tier_places_the_next_batch_high(
     http: httpx.AsyncClient, cache: FakeCache
 ) -> None:
@@ -1820,6 +1840,68 @@ async def test_a_request_that_finds_no_free_database_connection_answers_503(
     assert response.headers["Retry-After"] == "5"
 
 
+@pytest.mark.parametrize("operation", ["submit", "retention"])
+async def test_peak_hint_writers_lock_in_key_order(
+    http: httpx.AsyncClient, coordinator: Coordinator, operation: str,
+) -> None:
+    # A heap scan meets b before a; another transaction holds a and then needs b.
+    async with coordinator.engine.begin() as connection:
+        await connection.execute(sa.text(
+            "INSERT INTO peak_hints (package, theory, profile, peak_rss_mb, updated_at) VALUES "
+            "('pkg', 'b', 'p', 100, now() - interval '90 days'), "
+            "('pkg', 'a', 'p', 100, now() - interval '90 days'), "
+            "('pkg', 'a', 'other', 9000, now() - interval '2 days')"
+        ))
+
+    def heap_scan(connection: Any) -> None:
+        connection.exec_driver_sql("SET LOCAL enable_indexscan = off")
+        connection.exec_driver_sql("SET LOCAL enable_bitmapscan = off")
+
+    sa.event.listen(coordinator.engine.sync_engine, "begin", heap_scan)
+    writer: asyncio.Task[Any] | None = None
+    try:
+        async with coordinator.engine.begin() as blocker:
+            pid = await blocker.scalar(sa.text("SELECT pg_backend_pid()"))
+            await blocker.execute(sa.text(
+                "SELECT 1 FROM peak_hints WHERE package = 'pkg' AND theory = 'a' AND profile = 'p' FOR UPDATE"
+            ))
+            writer = asyncio.create_task(
+                submit(http, ["b", "a"], profile="p") if operation == "submit" else coordinator.delete_expired()
+            )
+            async with asyncio.timeout(5):
+                async with coordinator.engine.connect() as observer:
+                    while not await observer.scalar(sa.text(
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE :pid = ANY(pg_blocking_pids(pid)))"
+                    ), {"pid": pid}):
+                        await asyncio.sleep(0.01)
+            # This forms a deadlock if the writer locked b before waiting for a.
+            await blocker.execute(sa.text(
+                "UPDATE peak_hints SET peak_rss_mb = 6000, updated_at = now() "
+                "WHERE package = 'pkg' AND theory = 'b' AND profile = 'p'"
+            ))
+            if operation == "retention":
+                await blocker.execute(sa.text(
+                    "UPDATE peak_hints SET updated_at = now() "
+                    "WHERE package = 'pkg' AND theory = 'a' AND profile = 'p'"
+                ))
+        await asyncio.wait_for(writer, 5)
+    finally:
+        sa.event.remove(coordinator.engine.sync_engine, "begin", heap_scan)
+        if writer is not None:
+            writer.cancel()
+            await asyncio.gather(writer, return_exceptions=True)
+
+    async with coordinator.engine.connect() as connection:
+        hints = await connection.execute(sa.text(
+            "SELECT theory, profile, peak_rss_mb, updated_at > now() - interval '1 day' "
+            "FROM peak_hints ORDER BY theory, profile"
+        ))
+        assert list(hints) == [("a", "other", 9000, False), ("a", "p", 100, True), ("b", "p", 6000, True)]
+        if operation == "submit":
+            tiers = await connection.execute(sa.text("SELECT theory, tier FROM actions ORDER BY theory"))
+            assert list(tiers) == [("pkg:a", "standard"), ("pkg:b", "high")]
+
+
 async def test_retention_deletes_old_terminal_batches_and_stale_hints(
     http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, remote_exec_engine: Any
 ) -> None:
@@ -2215,7 +2297,8 @@ async def test_cache_ring_read_fallback(
     expected = (True if secondary == 200 else None if secondary == 403
                 else False if 404 in (primary, secondary) else None)
     assert result is expected
-    assert asked == ranked[:2]
+    # A miss asks every node; a hit or a refusal stops the walk.
+    assert asked == (ranked[:2] if secondary in (200, 403) else ranked)
     if expected is not None:
         assert not caplog.records
     else:

@@ -139,6 +139,7 @@ fun logical_name node = HolbuildBuildPlan.logical_name node
 fun package node = HolbuildBuildPlan.package node
 fun cache_enabled node = HolbuildProject.action_cache_enabled (source_policy node)
 fun always_reexecute node = HolbuildProject.action_always_reexecute (source_policy node)
+fun impure node = HolbuildProject.action_impure (source_policy node)
 
 fun one_with_suffix suffix paths =
   case List.filter (has_suffix suffix) paths of
@@ -3326,20 +3327,56 @@ fun resumed_theorems kinds_names =
         else NONE)
     kinds_names
 
+(* Whether the header of the `Resume` block that starts at THEORY_START in
+   SOURCE_TEXT, up to its tactic at TACTIC_START, names `smlname` among its
+   attributes, which follow the first `[`.  (The boundary's and the
+   checkpoint's name has the attributes stripped, so the header is read
+   here.)  A label that merely contains the word counts too, which only
+   keeps that proof in place. *)
+fun resume_header_names_smlname source_text theorem_start tactic_start =
+  tactic_start < theorem_start orelse tactic_start > size source_text orelse
+  let
+    val header = String.substring (source_text, theorem_start, tactic_start - theorem_start)
+  in
+    case CharVector.findi (fn (_, c) => c = #"[") header of
+        NONE => false
+      | SOME (i, _) => mentions_at_identifier_start (String.extract (header, i + 1, NONE)) "smlname"
+  end
+
 (* Whether a pipelined build defers the proof TACTIC of a theorem or
    `Resume` block (KIND) named NAME, given the theorems RESUMED: see
-   deferred_source. *)
-fun deferrable_proof resumed kind name tactic =
+   deferred_source.  NAMES_SMLNAME says the block's header names `smlname`
+   (resume_header_names_smlname).
+
+   A `Resume` block whose header names `smlname` stays in place, since its
+   deferred stub would give `smlname` a theorem the real proof doesn't:
+   the stub is an oracle theorem of the goal, whose assumptions include
+   the subgoal's, while a proof that doesn't use them has none.  That is
+   the only way the stub's extra hypotheses reach the script.  The theorem
+   markerLib.resume proves goes to exactly three places: the check that no
+   suspendlabel hypothesis of it belongs to a still-suspended theorem
+   (which looks only at those hypotheses); build_suspendlabel_thms, which
+   discharges the goal's assumptions (so a stub `p |- T` and a real
+   `|- T` record the same resumption); and the value of the declaration,
+   which the expansion of `Resume` binds to the `smlname` name, or to `_`
+   without one.  So without `smlname` the stub's extra hypotheses go no
+   further, and HolbuildDeferred accepts a deferred proof whose theorem
+   has fewer hypotheses than its goal's assumptions.  Only that Resume
+   block stays in place; the other proofs of the theory stay deferred. *)
+fun deferrable_proof resumed kind name names_smlname tactic =
   (kind = "resume" orelse (kind = "theorem" andalso not (List.exists (fn r => r = name) resumed))) andalso
+  not (kind = "resume" andalso names_smlname) andalso
   not (mentions_at_identifier_start tactic "cheat") andalso
   not (mentions_at_identifier_start tactic "suspend")
 
-(* For a pipelined build, which of CHECKPOINTS the instrumented script
-   defers (HolbuildTheoryCheckpoints.instrument). *)
-fun deferrable_checkpoint (checkpoints : HolbuildTheoryCheckpoints.checkpoint list) =
+(* For a pipelined build, which of CHECKPOINTS, of the script SOURCE_TEXT,
+   the instrumented script defers (HolbuildTheoryCheckpoints.instrument). *)
+fun deferrable_checkpoint source_text (checkpoints : HolbuildTheoryCheckpoints.checkpoint list) =
   let val resumed = resumed_theorems (map (fn {kind, name, ...} => (kind, name)) checkpoints)
-  in fn ({kind, name, tactic_text, ...} : HolbuildTheoryCheckpoints.checkpoint) =>
-          deferrable_proof resumed kind name tactic_text
+  in fn ({kind, name, theorem_start, tactic_start, tactic_text, ...} : HolbuildTheoryCheckpoints.checkpoint) =>
+          deferrable_proof resumed kind name
+            (kind = "resume" andalso resume_header_names_smlname source_text theorem_start tactic_start)
+            tactic_text
   end
 
 (* DEFER_PROOFS: the script is a pipelined build's, which defers what
@@ -3357,7 +3394,7 @@ fun instrumented_source defer_proofs policy timeout_marker plan_only_marker sour
        trace_all = trace_steps policy,
        plan_only_marker = plan_only_marker,
        new_ir = proof_ir_enabled policy,
-       defer = if defer_proofs then deferrable_checkpoint checkpoints else (fn _ => false)}
+       defer = if defer_proofs then deferrable_checkpoint source_text checkpoints else (fn _ => false)}
   else plain_source_from_checkpoint source_name source_text start_offset
 
 fun replay_candidate policy base theorem_checkpoints declaration_checkpoints =
@@ -4459,10 +4496,13 @@ fun assoc_timeout _ [] = NONE
 fun effective_tactic_timeout proof_steps node_timeout =
   if proof_steps then node_timeout else NONE
 
+(* An impure action never replays checkpoints: its script may compute
+   different values on each run (a timestamp, a version string), and
+   resuming past that code would restore the values of an earlier run. *)
 fun checkpoint_policy_for_node ({skip_checkpoints, proof_steps, new_ir, proof_scope, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure, trknl, ...} : build_options) project node =
   if HolbuildTacticTimeoutPolicy.includes_node proof_scope project node then
-    CheckpointPolicy {checkpoint = not skip_checkpoints,
-                      theorem_checkpoints = not skip_checkpoints,
+    CheckpointPolicy {checkpoint = not skip_checkpoints andalso not (impure node),
+                      theorem_checkpoints = not skip_checkpoints andalso not (impure node),
                       proof_steps = proof_steps,
                       new_ir = new_ir,
                       tactic_timeout = effective_tactic_timeout proof_steps
@@ -5626,18 +5666,22 @@ fun unoutline_path root run_dir path =
    that prove them and its `Finalise` saves the theorem where the real
    build does.  A theorem the script resumes suspends, whether or not its
    proof names `suspend` (a helper tactic can call it), so it stays as
-   well; HolbuildDeferred fails any other deferred proof that suspends. *)
+   well; HolbuildDeferred fails any other deferred proof that suspends.  A
+   `Resume` block that names `smlname` stays too (deferrable_proof). *)
 fun deferred_source source_text boundaries =
   let
     val deferred = deferrable_proof (resumed_theorems (map (fn {kind, name, ...} => (kind, name)) boundaries))
     fun splice [] _ pos acc = String.concat (rev (String.extract (source_text, pos, NONE) :: acc))
-      | splice ({kind, name, tactic_start, tactic_end, ...} :: rest) k pos acc =
+      | splice ({kind, name, theorem_start, tactic_start, tactic_end, ...} :: rest) k pos acc =
           if tactic_start < pos orelse tactic_end < tactic_start then
             raise Error "theorem spans out of order"
           else
             let val tactic = String.substring (source_text, tactic_start, tactic_end - tactic_start)
             in
-              if not (deferred kind name tactic) then splice rest k pos acc
+              if not (deferred kind name
+                        (kind = "resume" andalso resume_header_names_smlname source_text theorem_start tactic_start)
+                        tactic)
+              then splice rest k pos acc
               else
                 splice rest (k + 1) tactic_end
                   (String.concat ["HolbuildDeferred.defer ", Int.toString k, " ",
@@ -7693,26 +7737,66 @@ fun publish_spec_blob remote {hash, path} =
    lives in the cache root and every project and worktree using that root
    shares it.  The remote cache can lose either; a worker that finds one
    missing fails its batch, and the build then forgets the ledger
-   (forget_remote_ledger) and resubmits.  Builds change it under its lock. *)
+   (forget_remote_ledger) and resubmits.  Builds change it under its lock,
+   rewriting it whole; a build that would take it past
+   max_remote_ledger_entries keeps only those it used or learned, so it
+   grows past that bound only as far as one build's own entries. *)
 fun remote_ledger_path remote =
   Path.concat(Path.concat(cache_root (), "remote-ledger"),
               HolbuildHash.string_sha256 (HolbuildRemoteCache.base_url remote))
+
+val max_remote_ledger_entries = 100000
 
 fun read_remote_ledger path =
   Binaryset.addList (Binaryset.empty String.compare, String.tokens (fn c => c = #"\n") (read_text path))
   handle IO.Io _ => Binaryset.empty String.compare
 
+(* Whether ITEM is a whole line of TEXT, by binary search: the ledger is
+   written sorted by String.compare.  Only an exact whole line matches, so a
+   ledger out of order can only hide entries, which costs a check or an
+   upload, never claim one. *)
+fun sorted_lines_member text item =
+  let
+    val n = size text
+    fun line_start i = if i > 0 andalso String.sub (text, i - 1) <> #"\n" then line_start (i - 1) else i
+    fun line_end i = if i < n andalso String.sub (text, i) <> #"\n" then line_end (i + 1) else i
+    (* LO and HI are line starts, or HI is the end of TEXT. *)
+    fun search lo hi =
+      if lo >= hi then false
+      else
+        let
+          val start = line_start ((lo + hi) div 2)
+          val stop = line_end start
+        in
+          case String.compare (item, String.substring (text, start, stop - start)) of
+              EQUAL => true
+            | LESS => search lo start
+            | GREATER => search (stop + 1) hi
+        end
+  in
+    search 0 n
+  end
+
 fun with_remote_ledger_lock path f =
-  let val lock = HolbuildFileLock.acquire_exclusive_path_wait {path = path ^ ".lock"}
+  let val lock = detail_time_phase "action_spec.ledger.lock" (fn () =>
+                   HolbuildFileLock.acquire_exclusive_path_wait {path = path ^ ".lock"})
   in (f () before HolbuildFileLock.release lock) handle e => (HolbuildFileLock.release lock; raise e) end
 
-(* Adds entries to the ledger, keeping those other builds added meanwhile,
-   but not entries this build read before a concurrent forget dropped them. *)
-fun record_remote_ledger_entries path entries =
+(* Adds LEARNED to the ledger, keeping the entries other builds added
+   meanwhile, but not those a concurrent forget dropped.  When that would
+   pass max_remote_ledger_entries, it keeps of the others only those in USED. *)
+fun record_remote_ledger_entries path {learned, used} =
   with_remote_ledger_lock path (fn () =>
-    write_text path
-      (String.concat (map (fn line => line ^ "\n")
-                          (Binaryset.listItems (Binaryset.addList (read_remote_ledger path, entries))))))
+    let
+      val existing = detail_time_phase "action_spec.ledger.parse" (fn () => read_remote_ledger path)
+      val merged = Binaryset.addList (existing, learned)
+      val entries =
+        if Binaryset.numItems merged <= max_remote_ledger_entries then merged
+        else Binaryset.addList (Binaryset.intersection (existing, used), learned)
+    in
+      detail_time_phase "action_spec.ledger.write" (fn () =>
+        write_text path (String.concat (map (fn line => line ^ "\n") (Binaryset.listItems entries))))
+    end)
   handle e => warn ("could not record the remote ledger " ^ path ^ ": " ^ General.exnMessage e)
 
 fun forget_remote_ledger () =
@@ -7816,7 +7900,8 @@ fun failing_on_pool remote jobs doing items_name pred items =
    pool.  Specs share their sources, so each file goes up once.  After the
    first failure the uploads not yet started are skipped, for the caller to
    fall back at once.  A file whose (path, sha256) known holds is taken as
-   present; learn is told each sha256 uploaded or found present. *)
+   present; learn is told the (path, sha256) of each one uploaded or found
+   present. *)
 fun upload_spec_files hash_file remote jobs {known, learn} files =
   let
     val upload_failed = ref false
@@ -7829,7 +7914,7 @@ fun upload_spec_files hash_file remote jobs {known, learn} files =
       (let val hash = hash_file path
        in
          if known (path, hash) then ()
-         else (publish_spec_blob remote {hash = hash, path = path}; learn hash)
+         else (publish_spec_blob remote {hash = hash, path = path}; learn (path, hash))
        end;
        true)
       handle e => (with_failure_lock (fn () => upload_failed := true); raise e)
@@ -7870,27 +7955,26 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
         raise Error "action-spec: a remote action's result is its cache entry, so --no-cache can't apply"
       else ()
     val ledger_path = remote_ledger_path remote
-    val ledger_known =
-      if ledger then read_remote_ledger ledger_path else Binaryset.empty String.compare
+    (* The ledger's entries this export found it to hold, and those it
+       learned the remote cache to hold. *)
+    val used = ref (Binaryset.empty String.compare)
     val learned = ref (Binaryset.empty String.compare)
     val ledger_mutex = Mutex.mutex ()
-    fun known item = Binaryset.member (ledger_known, item)
-    fun learn item =
-      if not ledger then ()
-      else
-        (Mutex.lock ledger_mutex;
-         (learned := Binaryset.add (!learned, item); Mutex.unlock ledger_mutex)
-         handle e => (Mutex.unlock ledger_mutex; raise e))
+    fun add set item =
+      (Mutex.lock ledger_mutex;
+       (set := Binaryset.add (!set, item); Mutex.unlock ledger_mutex)
+       handle e => (Mutex.unlock ledger_mutex; raise e))
+    fun learn item = if ledger then add learned item else ()
     val root = project_artifact_root project
     val config_lines = build_config_lines_for_node options project
     val action_toolchain_key = HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)
     val keys = HolbuildBuildPlan.input_keys config_lines action_toolchain_key plan
     val theories = List.filter is_theory_node (HolbuildBuildPlan.selected_nodes plan)
+    (* No deps key: nothing here reads it, and action_spec_text writes the
+       spec's own.  Computing it for every theory is quadratic in the plan. *)
     val actions =
       detail_time_phase "action_spec.export.actions" (fn () =>
-        map (fn node => (node, theory_action root plan keys toolchain_key
-                                 (dependency_input_context_key toolchain_key plan keys node) node))
-            theories)
+        map (fn node => (node, theory_action root plan keys toolchain_key "" node)) theories)
     val _ =
       List.app
         (fn (node, action) =>
@@ -7964,6 +8048,15 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       List.foldl (fn ((node, _), set) =>
                      Binaryset.addList (set, map HolbuildBuildPlan.key (HolbuildBuildPlan.transitive_project_deps plan node)))
                  held uncached_actions
+    val deps_actions = List.filter (fn (node, _) => Binaryset.member (batch_deps, HolbuildBuildPlan.key node)) here_actions
+    (* Read once, without the lock, as writers replace the file by rename;
+       and only by an export with something to look up, so a build with
+       nothing to do reads none of it. *)
+    val ledger_text =
+      if ledger andalso not (null uncached_actions andalso null deps_actions) then
+        (read_text ledger_path handle IO.Io _ => "")
+      else ""
+    fun known item = sorted_lines_member ledger_text item andalso (add used item; true)
     fun available remote (node, action) =
       let val key = #input_key action
       in
@@ -7973,8 +8066,7 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       end
     val unavailable =
       detail_time_phase "action_spec.export.publish_deps" (fn () =>
-        failing "checking remote cache" "theories" available
-          (List.filter (fn (node, _) => Binaryset.member (batch_deps, HolbuildBuildPlan.key node)) here_actions))
+        failing "checking remote cache" "theories" available deps_actions)
     val uncached_actions =
       if null unavailable then uncached_actions
       else List.filter (fn (node, _) => uncached_in (uncached_actions @ unavailable) node) actions
@@ -8009,21 +8101,24 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
     val action_lines = List.concat (map #lines exported)
     (* A worker rejects a spec it can't fetch rather than reporting it
        missing, so a spec the ledger hid would never be uploaded again: specs
-       skip the ledger. *)
+       skip the ledger, and as no lookup would read them, the ledger doesn't
+       learn them. *)
     fun is_spec path = String.isPrefix (spec_dir ^ "/") path
     val _ =
       if upload then
         upload_spec_files hash_file remote jobs
           {known = fn (path, hash) => not (is_spec path) andalso known ("blob " ^ hash),
-           learn = fn hash => learn ("blob " ^ hash)}
+           learn = fn (path, hash) => if is_spec path then () else learn ("blob " ^ hash)}
           (List.concat (map #files exported))
       else ()
-    val _ =
+    (* The caller records the ledger once the batch is submitted: it waits
+       for the ledger's lock, which other builds hold to rewrite it. *)
+    fun record () =
       if not ledger orelse Binaryset.isEmpty (!learned) then ()
-      else record_remote_ledger_entries ledger_path (Binaryset.listItems (!learned))
+      else record_remote_ledger_entries ledger_path {learned = Binaryset.listItems (!learned), used = !used}
   in
     {batch = String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n",
-     deferred = map (HolbuildBuildPlan.key o #1) deferred}
+     deferred = map (HolbuildBuildPlan.key o #1) deferred, record = record}
   end
 
 (* Run specs: a caller's script to run in the context of a built theory, or
@@ -8868,14 +8963,24 @@ type spec_deps =
 fun theory_spec_deps (spec : action_spec) : spec_deps =
   {libraries = #libraries spec, deps = #deps spec, libs = #libs spec, orders = #orders spec}
 
-fun spec_load_stems (spec : spec_deps) =
+(* The stem and load order of a theory or library the spec names, the first
+   stem given for a name winning.  Built once per spec: a hydrate resolves
+   every dependency's parents in it. *)
+fun spec_resolver (spec : spec_deps) =
   let
-    fun add ((name, stem), acc) =
-      if List.exists (fn (n, _) => n = name) acc then acc else acc @ [(name, stem)]
+    fun lookup pairs =
+      List.foldl (fn ((name, value), dict) => insert_first_string_dict (dict, name, value))
+        (Binarymap.mkDict String.compare) pairs
+    val stems =
+      lookup (map (fn {target, stem, ...} => (#2 (target_name target), stem)) (#deps spec) @
+              map (fn {target, stem, ...} => (#2 (target_name target), stem)) (#libs spec))
+    val orders = lookup (map (fn {target, order} => (#2 (target_name target), order)) (#orders spec))
+    fun order name =
+      case Binarymap.peek (orders, name) of
+          SOME order => order
+        | NONE => reject_spec ("spec has no load order for " ^ name)
   in
-    List.foldl add []
-      (map (fn {target, stem, ...} => (#2 (target_name target), stem)) (#deps spec) @
-       map (fn {target, stem, ...} => (#2 (target_name target), stem)) (#libs spec))
+    fn name => Option.map (fn stem => (stem, order name)) (Binarymap.peek (stems, name))
   end
 
 (* The spec's theory action, its checkpoints keyed on DEPS_KEY. *)
@@ -8953,7 +9058,7 @@ fun fetch_spec_blob remote {hash, dst} =
 
 (* Restores a theory the action depends on, or the action's own entry, into
    the action root, writing its load manifests with the spec's stems. *)
-fun restore_spec_theory remote root (spec : spec_deps) {key, subject, stem, extra_outputs, requested_timeout} =
+fun restore_spec_theory remote root resolver {key, subject, stem, extra_outputs, requested_timeout} =
   let
     val cache = cache_root ()
     val entry =
@@ -8962,13 +9067,7 @@ fun restore_spec_theory remote root (spec : spec_deps) {key, subject, stem, extr
          expected_extra_outputs = extra_outputs,
          requested_timeout = requested_timeout, require_trace = false}
     val resident = #manifest_text entry
-    val stems = spec_load_stems spec
-    fun order name =
-      case List.find (fn {target, ...} => #2 (target_name target) = name) (#orders spec) of
-          SOME {order, ...} => order
-        | NONE => reject_spec ("spec has no load order for " ^ name)
-    fun resolve name =
-      Option.map (fn (_, s) => (in_root root s, order name)) (List.find (fn (n, _) => n = name) stems)
+    fun resolve name = Option.map (fn (s, order) => (in_root root s, order)) (resolver name)
     val stem_path = in_root root stem
     val sig_path = stem_path ^ ".sig"
     val sml_path = stem_path ^ ".sml"
@@ -9068,9 +9167,10 @@ fun hydrate_spec_deps remote root files (spec : spec_deps) direct =
     fun write_lib {stem, suffix, loads, ...} =
       (ensure_parent (in_root root stem);
        write_object_manifest (in_root root (stem ^ suffix)) (map lib_load loads))
+    val resolver = spec_resolver spec
     fun restore_dep {target, stem, key} =
       (ensure_parent (in_root root stem);
-       restore_spec_theory remote root spec
+       restore_spec_theory remote root resolver
          {key = key, subject = target, stem = stem, extra_outputs = NONE, requested_timeout = NONE})
       handle e as HolbuildRemoteCache.Unavailable _ => raise e
            | e => raise action_failed (InputMissing ("theory " ^ key))
@@ -9137,7 +9237,7 @@ fun action_already_done remote root (spec : action_spec) =
     val {sig_path, sml_path, data_path} = #outputs spec
     val stem = drop_suffix ".dat" data_path
     fun restored () =
-      (restore_spec_theory remote root (theory_spec_deps spec)
+      (restore_spec_theory remote root (spec_resolver (theory_spec_deps spec))
          {key = #input_key spec, subject = #package spec ^ ":" ^ #logical spec, stem = stem,
           extra_outputs = SOME (#extra_outputs spec), requested_timeout = #tactic_timeout spec};
        spec_parent_hashes_match root (theory_spec_deps spec) (in_root root data_path))
@@ -10371,7 +10471,7 @@ fun reuse_earlier_build remote root (spec : action_spec) pair_key =
           val data_path = #data_path (#outputs spec)
         in
           sha256_text old_key andalso old_key <> new_key andalso
-          (restore_spec_theory remote root (theory_spec_deps spec)
+          (restore_spec_theory remote root (spec_resolver (theory_spec_deps spec))
              {key = old_key, subject = #package spec ^ ":" ^ #logical spec,
               stem = drop_suffix ".dat" data_path, extra_outputs = SOME (#extra_outputs spec),
               requested_timeout = #tactic_timeout spec};

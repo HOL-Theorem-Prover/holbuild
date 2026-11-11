@@ -70,8 +70,8 @@ deps = ["OtherTheory"]            # extra logical project dependencies
 loads = ["ExternalLib"]           # extra loadable modules (project or HOL toolchain)
 extra_deps = ["data/table.txt"]   # package-root-relative filesystem deps
 cache = false                     # disable global cache for this action
-always_reexecute = true           # never skip, never replay checkpoints
-impure = true                     # shorthand: cache=false + always_reexecute=true
+always_reexecute = true           # never skip up-to-date; checkpoint replay still allowed
+impure = true                     # cache=false + always_reexecute=true + no checkpoints
 ```
 
 ## Schema validation
@@ -232,8 +232,8 @@ Default policy for any target: `cache = true`, `always_reexecute = false`, `impu
 | `loads` | `[]` | Additional loadable module stems |
 | `extra_deps` | `[]` | Extra filesystem dependencies hashed into action key; files, directories, or simple globs |
 | `cache` | `true` | Enable/disable global cache |
-| `always_reexecute` | `false` | Never skip up-to-date check or checkpoint replay |
-| `impure` | `false` | Shorthand for `cache=false, always_reexecute=true` |
+| `always_reexecute` | `false` | Never skip the up-to-date check (checkpoint replay stays allowed) |
+| `impure` | `false` | `cache=false, always_reexecute=true`, and no checkpoint saving or replay, so run-time values (timestamps) are recomputed |
 
 `impure = true` overrides both `cache` and `always_reexecute` — don't set them separately when using `impure`.
 

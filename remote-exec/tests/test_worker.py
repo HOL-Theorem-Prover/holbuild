@@ -66,9 +66,20 @@ if [ -n "$HOLBUILD_FAKE_PUBLISH" ]; then
   echo ready > "$HOLBUILD_FAKE_LOG.ready"
   wait
 fi
-# long enough for a heartbeat at the 1 s interval of a 3 s lease; HOLBUILD_FAKE_LEASE: in a child holding that file
-# open, as a HOL child holds its admission lease
-if [ -n "$HOLBUILD_FAKE_LEASE" ]; then sleep 1; (exec 3>"$HOLBUILD_FAKE_LEASE"; sleep 2); sleep 1; else sleep 2; fi
+# Keep each lease state until the worker has sampled it; bound waits so a broken worker fails the test.
+if [ -n "$HOLBUILD_FAKE_LEASE" ]; then
+  wait_sample() {{
+    n=0
+    while [ ! -e "$HOLBUILD_FAKE_LEASE.$1" ]; do
+      [ "$n" -lt 300 ] || exit 1
+      n=$((n + 1))
+      sleep 0.1
+    done
+  }}
+  wait_sample before
+  (exec 3>"$HOLBUILD_FAKE_LEASE"; wait_sample hol) || exit 1
+  wait_sample after
+else sleep 2; fi
 [ -z "$HOLBUILD_FAKE_CRASH" ] || [ "$HOLBUILD_FAKE_CRASH" != 1 ] || exit 70
 [ -z "$HOLBUILD_FAKE_CRASH" ] || kill -s "$HOLBUILD_FAKE_CRASH" $$
 while [ "$#" -gt 0 ]; do
@@ -1328,6 +1339,18 @@ def test_an_action_s_time_is_split_around_its_hol_child(
     cooperate = tmp_path / "cooperate"
     cooperate.mkdir()
     monkeypatch.setenv("HOLBUILD_FAKE_LEASE", str(cooperate / "lease-1"))
+    samples = iter(("before", "hol", "after"))
+    expected = next(samples, None)
+
+    def sample(pid: int, cooperate_dir: str) -> bool:
+        nonlocal expected
+        hol = runs_hol(pid, cooperate_dir)
+        if expected is not None and hol == (expected == "hol"):
+            (cooperate / f"lease-1.{expected}").touch()
+            expected = next(samples, None)
+        return hol
+
+    monkeypatch.setattr(worker, "runs_hol", sample)
     phases = Phases()
     timed_phases: list[str] = []
     original_timed = phases.timed
@@ -1547,7 +1570,6 @@ def test_worker_refreshes_bootstrap_membership_after_memory_and_claim_waits(
 
     def run(_coordinator, _args, releases, *_rest):
         assert "https://joined.example" in releases.remote_cache
-        assert releases.joining
         events.append("run")
         raise KeyboardInterrupt
 

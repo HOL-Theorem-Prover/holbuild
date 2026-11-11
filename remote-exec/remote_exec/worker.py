@@ -36,7 +36,7 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from remote_exec.auth import cache_discovery_token
-from remote_exec.cache import cache_nodes, ranked_nodes
+from remote_exec.cache import cache_nodes, preferred_identities, ranked_nodes
 from remote_exec.formats import sanitize_detail
 from remote_exec.membership import REFRESH_SECONDS, Membership, check_plain_http
 
@@ -335,7 +335,6 @@ class Releases:
     curl_config: str | None
     baked_root: str = field(default="/opt/holbuild-baked", kw_only=True)
     discovery_config: str | None = field(default=None, kw_only=True)
-    joining: bool = field(default=False, kw_only=True)
     drain: Drain = field(default_factory=Drain, kw_only=True, compare=False)
 
     def spec_version(self, spec_sha256: str) -> str:
@@ -353,9 +352,10 @@ class Releases:
         unavailable: str | None = None
         missing: str | None = None
         failure = f"spec {spec_sha256} is missing from the remote cache"
-        for attempt, node in enumerate(ranked_nodes(nodes, spec_sha256), 1):
-            if attempt == 3 and not self.joining and missing is not None:
-                raise RuntimeError(missing)
+        preferred = preferred_identities(os.environ.get("HOLBUILD_REMOTE_CACHE_PREFERRED_URLS"))
+        # Every node is asked before a miss: until a node has written a new spec through to the shared store, only
+        # that node holds it.
+        for node in ranked_nodes(nodes, spec_sha256, preferred):
             # Not check=True: its error would print credentials in the command line.
             try:
                 with self.drain.interruptible():
@@ -1206,7 +1206,7 @@ def main() -> None:
             if not drain.stop.is_set() and membership is not None and discovery_url is not None:
                 now = time.monotonic()
                 nodes = refresh_cache_members(coordinator, membership, discovery_url, now)
-                releases = replace(releases, remote_cache=",".join(nodes), joining=membership.joining(now))
+                releases = replace(releases, remote_cache=",".join(nodes))
             try:
                 unavailable = run_one(coordinator, args, releases, protection, claim, phases)
             except Exception as error:  # noqa: BLE001  # run_one reported it where it could; the worker goes on

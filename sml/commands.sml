@@ -74,8 +74,11 @@ fun global_help () = print
   \The reserve is a quarter of MemTotal, at least 1 GiB and at most 30 GiB; the\n\
   \margin is the reserve, or what the budget leaves out of MemTotal if that is\n\
   \less (at least 1 GiB).\n\
-  \This bounds admission; it does not enforce RSS. HOL toolchain builds, check,\n\
-  \run and repl reserve nothing.\n\
+  \Where cgroup v2 limits the memory of holbuild's group or of a group enclosing\n\
+  \it, a child also starts only while the tightest of them has its charge left,\n\
+  \reservations or none. The HOL session of check and run reserves too.\n\
+  \This bounds admission; it does not enforce RSS. HOL toolchain builds and repl\n\
+  \reserve nothing.\n\
   \To set or resize the budget, write DIR/budget (a byte count) while holding\n\
   \DIR/lock:\n\
   \  flock DIR/lock sh -c 'echo BYTES > DIR/budget.new && mv DIR/budget.new DIR/budget'\n\
@@ -1615,15 +1618,20 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             (* The theories an earlier pass deferred: whatever settled them,
                a later batch makes sure the remote cache has them. *)
             val held_back = ref []
+            (* Records in the ledger what the last export learned: submit runs
+               it once the batch is submitted, or found empty. *)
+            val pending_record = ref (fn () => ())
+            fun record_pending () = (!pending_record ()) before pending_record := (fn () => ())
             fun export defer skip forced =
               let
-                val {batch, deferred = held} =
+                val {batch, deferred = held, record} =
                   timed_phase "action_spec.export"
                     (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key jobs
                                 {upload = true, local_resumable = not detach, forced = forced, skip = skip,
                                  defer = defer, publish = !held_back, ledger = true})
               in
                 deferred := held;
+                pending_record := record;
                 batch
               end
             fun batch_keys batch =
@@ -1725,6 +1733,11 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                unknown, so none of the others are copied before it ends. *)
             fun follow in_batch batch_id =
               let
+                (* Planning, export and early cutoff leave garbage that a
+                   major collection would only reclaim once the heap grows
+                   again; following waits on the coordinator for as long as
+                   the batch runs, so collect it now rather than hold it. *)
+                val _ = PolyML.fullGC ()
                 val {add, stop} =
                   HolbuildBuildExec.start_remote_exec_prefetch build_options tc project plan toolchain_key jobs in_batch
                 val logs = ref []
@@ -1870,20 +1883,23 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                     (if priority = 0 then "" else " --priority " ^ Int.toString priority))
                     else abandon batch_id (reason ^ "; " ^ finished progress)
             and submit resubmit skip batch =
-              if null (batch_keys batch) andalso not (null (!deferred)) then submit_deferred resubmit skip
-              else if null (batch_keys batch) andalso not (null skip) then restore_after_failures ()
-              else if null (batch_keys batch) then
-                (HolbuildStatus.message_stderr "holbuild: remote execution: nothing to build remotely\n";
-                 build_locally ())
+              if null (batch_keys batch) then
+                (record_pending ();
+                 if not (null (!deferred)) then submit_deferred resubmit skip
+                 else if not (null skip) then restore_after_failures ()
+                 else
+                   (HolbuildStatus.message_stderr "holbuild: remote execution: nothing to build remotely\n";
+                    build_locally ()))
               else
                 case HolbuildRemoteExec.submit_with_query (remote_only orelse detach) url
                        ((if fail_fast then "?fail_fast=true" else "") ^
                         (if priority = 0 then "" else
                          (if fail_fast then "&" else "?") ^ "priority=" ^ Int.toString priority))
                        (#maxheap tc) batch of
-                    HolbuildRemoteExec.Refused reason => fall_back reason
+                    HolbuildRemoteExec.Refused reason => (record_pending (); fall_back reason)
                   | HolbuildRemoteExec.Ok batch_id =>
                       (HolbuildStatus.message_stderr ("holbuild: remote batch " ^ batch_id ^ "\n");
+                       record_pending ();
                        if detach then () else finish resubmit skip (SOME (batch_keys batch)) batch_id)
             (* Settles the deferred theories; those early cutoff can't reuse, and
                those that depend on them, go in the next batch, except those
@@ -2718,7 +2734,10 @@ fun import_archive args =
               result_count := length results
             end
         in
-          HolbuildCacheArchive.with_entries {archive_path = archive_path, f = copy};
+          HolbuildCacheArchive.with_entries
+            {archive_path = archive_path,
+             stage_parent = HolbuildFSCacheBackend.tmp_dir destination,
+             f = copy};
           print ("imported " ^ Int.toString (!result_count) ^ " cache action(s) from " ^ archive_path ^ "\n");
           (* Run inside a project, its [gc] settings apply; one that does not
              load skips automatic GC rather than falling back to the defaults. *)
@@ -3091,7 +3110,7 @@ fun run_hol_with runner tc cli_jobs subcommand args =
   end
 
 fun run_hol tc cli_jobs subcommand user_args =
-  run_hol_with HolbuildToolchain.run tc cli_jobs subcommand user_args
+  run_hol_with HolbuildToolchain.run_reserved tc cli_jobs subcommand user_args
 
 fun repl_hol tc cli_jobs user_args =
   run_hol_with HolbuildToolchain.run_interactive tc cli_jobs "repl" user_args
@@ -3325,7 +3344,7 @@ fun run_check_script tc cli_jobs build_mode theories make_script =
     fun cleanup () = OS.FileSys.remove script_path handle OS.SysErr _ => ()
     val status =
       (* A run heap may hold an older copy of the theory, which load would keep. *)
-      run_hol_status HolbuildToolchain.run tc cli_jobs build_mode plain_build_request false from "run" [script_path]
+      run_hol_status HolbuildToolchain.run_reserved tc cli_jobs build_mode plain_build_request false from "run" [script_path]
       handle e => (cleanup (); raise e)
   in
     cleanup ();
