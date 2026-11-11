@@ -238,6 +238,9 @@ fun stage_cache stage_dir {source, entries, targets, metadata} =
                destination = fs_destination cache,
                tmp_dir = HolbuildFSCacheBackend.tmp_dir cache}
               keys);
+    (* The stage is removed after the archive is built; its growth journal
+       would recreate it at exit. *)
+    HolbuildFSCacheBackend.discard_growth cache;
     write_package_index payload entries;
     write_text (manifest_path payload) (manifest_text {keys = keys, targets = targets, metadata = metadata})
   end
