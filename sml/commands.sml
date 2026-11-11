@@ -401,11 +401,9 @@ fun maybe_handle_command_help args =
         else false
 
 fun nonnegative_real label text =
-  case Real.fromString text of
-      SOME n =>
-        if n >= 0.0 then n
-        else raise Error (label ^ " must be a non-negative number")
-    | NONE => raise Error (label ^ " must be a non-negative number")
+  case HolbuildTheoryCacheManifest.parse_nonnegative_finite_real_text text of
+      SOME n => n
+    | NONE => raise Error (label ^ " must be a non-negative number, got " ^ HolbuildHash.quote text)
 
 fun tactic_timeout_value text =
   let val seconds = nonnegative_real "--tactic-timeout" text

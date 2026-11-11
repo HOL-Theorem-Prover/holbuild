@@ -149,3 +149,41 @@ if (cd "$project" && "$HOLBUILD_BIN" build --checkpoint-seconds -1 ATheory) > "$
   exit 1
 fi
 require_grep "checkpoint-seconds must be a non-negative number" "$tmpdir/negative.log"
+
+# Definition contexts (after a termination proof) follow the option too.
+cat > "$project/src/DScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+
+val _ = new_theory "D";
+
+Definition d_one_def:
+  d_one n = if n = 0 then 0 else d_one (n - 1)
+Termination
+  WF_REL_TAC `measure I` >> simp[]
+End
+
+Definition d_two_def:
+  d_two n = if n = 0 then 0 else d_two (n - 1)
+Termination
+  WF_REL_TAC `measure I` >> simp[]
+End
+
+val _ = raise Fail "expected failure";
+
+val _ = export_theory ();
+SML
+definition_saves() {
+  find "$project/.holbuild/checkpoints" -path '*DScript.sml.decls/*' -name 'd_*_def_context.save' | wc -l
+}
+rm -rf "$project/.holbuild/checkpoints"
+if (cd "$project" && "$HOLBUILD_BIN" build --checkpoint-seconds 0 DTheory) > "$tmpdir/d-every.log" 2>&1; then
+  echo "expected D to fail" >&2; exit 1
+fi
+[[ "$(definition_saves)" == 2 ]] || {
+  echo "--checkpoint-seconds 0 saved $(definition_saves) definition contexts, wanted 2" >&2; exit 1; }
+rm -rf "$project/.holbuild/checkpoints"
+if (cd "$project" && "$HOLBUILD_BIN" build DTheory) > "$tmpdir/d-default.log" 2>&1; then
+  echo "expected D to fail" >&2; exit 1
+fi
+[[ "$(definition_saves)" == 0 ]] || {
+  echo "a default build saved $(definition_saves) definition contexts under 2 s" >&2; exit 1; }

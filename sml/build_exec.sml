@@ -8749,9 +8749,8 @@ fun parse_action_spec text : action_spec =
      checkpoint_seconds =
        (case List.find (fn (k, _) => k = "option checkpoint-seconds") (!values) of
             SOME (_, v) =>
-              (case Real.fromString v of
-                   SOME seconds => if seconds >= 0.0 then seconds
-                                   else reject_spec ("negative option checkpoint-seconds: " ^ v)
+              (case HolbuildTheoryCacheManifest.parse_nonnegative_finite_real_text v of
+                   SOME seconds => seconds
                  | NONE => reject_spec ("malformed option checkpoint-seconds: " ^ v))
           | NONE => default_checkpoint_seconds),
      force =

@@ -96,6 +96,26 @@ diff "$specs/$(field "$tmpdir/batch-default.txt" ck:ATheory 4)" \
 [[ "$(field "$tmpdir/batch-default.txt" ck:ATheory 3)" == "$(field "$tmpdir/batch-every.txt" ck:ATheory 3)" ]] || {
   echo "--checkpoint-seconds changed the action's input key" >&2; exit 1; }
 
+# A spec value that isn't wholly a finite number >= 0 is rejected, as the
+# flag's would be.
+for bad in 2x inf 1e999 -1; do
+  sed "s/^option checkpoint-seconds=0.0\$/option checkpoint-seconds=$bad/" \
+    "$specs/$(field "$tmpdir/batch-every.txt" ck:ATheory 4)" > "$tmpdir/bad-spec"
+  bad_sha=$(sha256sum "$tmpdir/bad-spec" | cut -d' ' -f1)
+  curl -fsS -X PUT --data-binary "@$tmpdir/bad-spec" "$remote_url/cas/$bad_sha"
+  link_hol_toolchain_cache "$tmpdir/worker-bad"
+  if HOLBUILD_CACHE=$tmpdir/worker-bad "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$bad_sha" \
+       --cache-limit-gb 1000 --result "$tmpdir/bad.result" > "$tmpdir/bad.log" 2>&1; then
+    echo "a worker accepted checkpoint-seconds=$bad" >&2; exit 1
+  fi
+  require_grep "^failure=spec-rejected" "$tmpdir/bad.result"
+  require_grep "malformed option checkpoint-seconds: $bad" "$tmpdir/bad.log"
+  if (cd "$project" && "$HOLBUILD_BIN" build --checkpoint-seconds="$bad" ATheory) > "$tmpdir/bad-flag.log" 2>&1; then
+    echo "build accepted --checkpoint-seconds=$bad" >&2; exit 1
+  fi
+  require_grep "checkpoint-seconds must be a non-negative number" "$tmpdir/bad-flag.log"
+done
+
 # The theorems take well under the default 2 s, so after a default failed run
 # a fix resumes from the dependencies; after a run given 0, from the context
 # after the last theorem.  The default run goes first, as the shared

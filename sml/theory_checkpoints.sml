@@ -187,9 +187,15 @@ fun tactic_compat_runtime_helper_path () =
 fun checkpoint_save_runtime_helper_path () =
   OS.Path.concat(HolbuildRuntimePaths.runtime_root (), "sml/checkpoint_save_runtime.sml")
 
-fun declaration_checkpoint_runtime_prelude [] = ""
-  | declaration_checkpoint_runtime_prelude _ =
-      runtime_lines ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";"]
+(* For a script with definition checkpoints but no theorem ones, which
+   doesn't install the proof runtime: the save runtime alone, its context gate
+   started at the build's checkpoint_seconds. *)
+fun declaration_checkpoint_runtime_prelude _ [] = ""
+  | declaration_checkpoint_runtime_prelude checkpoint_seconds _ =
+      runtime_lines
+        ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";",
+         "val _ = HolbuildCheckpointSaveRuntime.reset_context_checkpoint_gate " ^
+           Real.toString checkpoint_seconds ^ ";"]
 
 fun runtime_install_lines {checkpoint_enabled, checkpoint_seconds, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} =
   ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (source_helper_path "sml/diagnostic_limits.sml") ^ ";",
@@ -328,7 +334,7 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
     fun prelude () =
       runtime_prelude (runtime_config ())
         (if null active_checkpoints andalso null active_terminations then [] else [()]) ^
-      declaration_checkpoint_runtime_prelude
+      declaration_checkpoint_runtime_prelude checkpoint_seconds
         (if null active_checkpoints andalso null active_terminations then active_declaration_checkpoints else []) ^
       termination_runtime_prelude active_terminations
     val position = ref start_position
