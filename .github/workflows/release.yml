@@ -32,6 +32,8 @@ on:
       - tests/lib.sh
       - tests/cases/installed-runtime/**
   workflow_dispatch:
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -45,6 +47,7 @@ env:
 
 jobs:
   build:
+    if: github.event_name != 'release'
     strategy:
       fail-fast: false
       matrix:
@@ -204,3 +207,62 @@ jobs:
           cd dist
           cat ./*.sha256 > SHA256SUMS
           gh release upload "$TAG" ./*.tar.gz SHA256SUMS --clobber
+
+  # A release published by hand (a draft made before the tag, say) skips the
+  # check in `publish`; this one turns a breaking release back into a draft
+  # unless its notes say its consumers are ready. Releases the workflow itself
+  # creates use GITHUB_TOKEN, so they don't trigger it.
+  guard:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Hold a breaking release back as a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+          BODY: ${{ github.event.release.body }}
+          PUBLISHED_AT: ${{ github.event.release.published_at }}
+        run: |
+          if grep -q '^Consumers ready:' <<< "$BODY"; then
+            echo "$TAG: consumers marked ready, published on purpose"
+            exit 0
+          fi
+          # The base is the newest earlier release that was already trusted
+          # when this one was published: out for more than an hour, or marked
+          # "Consumers ready:". A release published moments ago may itself be
+          # an unchecked breaking one whose own guard hasn't run yet. A failed
+          # listing fails the step, so an empty base always means there is no
+          # such release.
+          list=$(gh api --paginate "repos/$GH_REPO/releases" \
+                   --jq '.[] | select(.draft or .prerelease | not)
+                         | "\(.tag_name) \(if (.body // "") | test("(?m)^Consumers ready:") then "ready" else "-" end) \(.published_at | fromdateiso8601)"')
+          since=$(( $(date -d "$PUBLISHED_AT" +%s) - 3600 ))
+          base=$({ awk -v t="$TAG" -v since="$since" \
+                     'NF && $1 != t && ($2 == "ready" || $3 <= since) { print $1 }' <<< "$list"
+                   echo "$TAG"; } |
+                 sort -V | awk -v t="$TAG" '$0 == t { print prev; exit } { prev = $0 }')
+          if [[ -z "$base" ]]; then
+            reasons="no earlier published release to compare with"
+          else
+            status=0
+            reasons=$(tools/release-breaking.sh "$base" "$TAG") || status=$?
+            case $status in
+              0) exit 0 ;;
+              1) ;;
+              *) exit "$status" ;;
+            esac
+          fi
+          notes=$(printf 'Breaking release:\n\n%s\n\nHeld as a draft: published without `Consumers ready:` in its notes.\n' \
+                    "$(sed 's/^/- /' <<< "$reasons")")
+          gh release edit "$TAG" --draft=true --notes "$(printf '%s\n\n%s\n' "$notes" "$BODY")"
+          printf '%s\n' "$notes" >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::$TAG is breaking and was published without 'Consumers ready:'; turned back into a draft"
+          exit 1
