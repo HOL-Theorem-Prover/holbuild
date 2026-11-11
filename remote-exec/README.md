@@ -61,6 +61,13 @@ To roll back to an image predating `0006`, use the current image to run
 `alembic downgrade 0005` first, then run the older image's `migrate` and
 `coordinator`; that image's migration code does not know revision `0006`.
 
+Migration `0016` adds nullable `actions.finished_at` and `actions.worker`.
+Apply it before serving the new coordinator; existing rows are left null.
+For rollback, deploy a forward patch retaining `0016` and restoring the
+previous runtime. An older image cannot migrate a database at `0016`;
+to use it, stop the coordinator and use the new image to downgrade to that
+image's migration head first. Downgrading `0016` removes only this telemetry.
+
 Migration `0009` adds `actions.interruptions` (default 0), which the
 coordinator reads when an action completes, so run it before the new image
 serves. To roll back to an image predating `0009`, use the current image to
@@ -636,12 +643,24 @@ from 0 to 2147483647; invalid values return 422. Existing batches retain priorit
         "log_zstd": "<compressed-sha256> <compressed-size> <raw-sha256> <raw-size>|null",
         "log_error": "<why the log could not be published>|null",
         "failure_detail": "<the last result's detail: why it failed without a log>|null",
+        "last_claimed_at": "<ISO 8601 timestamp>|null",
+        "finished_at": "<ISO 8601 timestamp>|null",
+        "worker": "<worker name>|null",
         "timings": {"<phase>": <ms>, ..., "wall": <ms>}|null
       }
     ]
   }
   ```
 - 404 when there is no such batch (or it was deleted by retention)
+
+`last_claimed_at` and `worker` describe the latest claim; a new claim clears
+`finished_at`. An accepted worker result sets `finished_at`, including a
+failure that will be retried. Times come from the coordinator database.
+Expired leases and cancellations without a result have no finish time.
+Unclaimed actions have null fields; historical claims may have a timestamp
+without a worker or finish time. Worker names are supplied by the worker,
+defaulting to its hostname and process ID. These fields retain only the latest
+attempt, not its retry history. Action events carry the same fields.
 
 `log_sha256` identifies a raw log. `log_zstd` identifies an opaque compressed
 log and records both the compressed and raw sizes and hashes. `log_error`
