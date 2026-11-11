@@ -446,7 +446,9 @@ or the current working directory.
 The global cache directory.
 Overrides
 .B HOLBUILD_CACHE
-and the platform default, normally
+and the default,
+.I $XDG_CACHE_HOME/holbuild
+or, when that is unset,
 .IR $HOME/.cache/holbuild .
 .TP
 .B \-\-offline
@@ -799,10 +801,14 @@ seconds.
 .SH ENVIRONMENT
 .TP
 .B HOLBUILD_CACHE
-The global cache directory (default
-.IR $HOME/.cache/holbuild ;
-overridden by
+The global cache directory (overridden by
 .BR \-\-cache\-dir ).
+Without it, the default is
+.I $XDG_CACHE_HOME/holbuild
+or, when
+.B XDG_CACHE_HOME
+is unset,
+.IR $HOME/.cache/holbuild .
 .TP
 .B HOLBUILD_SOURCE_DIR
 The project source directory (overridden by
