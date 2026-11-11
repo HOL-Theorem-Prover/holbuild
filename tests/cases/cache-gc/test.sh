@@ -12,7 +12,7 @@ cleanup() { chmod -R u+w "$tmpdir" 2>/dev/null || true; rm -rf "$tmpdir"; }
 trap cleanup EXIT
 
 cache=$tmpdir/cache
-mkdir -p "$cache/tmp/oldtmp" "$cache/blobs" "$cache/actions/live" "$cache/actions/old" "$cache/actions/nomani" "$cache/locks/action-stale.lock"
+mkdir -p "$cache/tmp/oldtmp" "$cache/blobs" "$cache/actions/live" "$cache/actions/old" "$cache/actions/nomani" "$cache/actions/fresh-nomani" "$cache/actions/old/nested/dir" "$cache/locks/action-stale.lock"
 : > "$cache/blobs/live"
 : > "$cache/blobs/dead"
 printf 'holbuild-cache-action-v2\nblob sig live\n' > "$cache/actions/live/manifest"
@@ -30,6 +30,8 @@ env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$cache" "$HOLBUILD_BIN" gc --ca
 require_file "$cache/blobs/live"
 [[ ! -e "$cache/blobs/dead" ]] || { echo "unreferenced blob survived" >&2; exit 1; }
 [[ ! -e "$cache/actions/old" ]] || { echo "old action survived" >&2; exit 1; }
+[[ -d "$cache/actions/live" ]] || { echo "live action was removed" >&2; exit 1; }
+[[ -d "$cache/actions/fresh-nomani" ]] || { echo "fresh incomplete action was removed" >&2; exit 1; }
 [[ ! -e "$cache/actions/nomani" ]] || { echo "stale incomplete action survived" >&2; exit 1; }
 [[ ! -e "$cache/tmp/oldtmp" ]] || { echo "stale tmp survived" >&2; exit 1; }
 [[ ! -e "$cache/locks/action-stale.lock" ]] || { echo "stale action lock survived" >&2; exit 1; }
@@ -155,7 +157,7 @@ env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$progress_cache" \
   "$HOLBUILD_BIN" gc --cache-only > /dev/null 2> "$tmpdir/quiet.err"
 [[ ! -s "$tmpdir/quiet.err" ]] || { echo "fast GC printed progress:" >&2; cat "$tmpdir/quiet.err" >&2; exit 1; }
 
-# An entry that cannot be removed fails GC with the path that failed inside it,
+# An entry that cannot be removed fails GC with its path,
 # and releases the GC lock.
 fail_cache=$tmpdir/fail-cache
 mkdir -p "$fail_cache/tmp/stuck/ro" "$fail_cache/actions" "$fail_cache/blobs"
@@ -167,7 +169,7 @@ if env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$fail_cache" \
   echo "GC succeeded despite an undeletable entry" >&2; exit 1
 fi
 chmod u+w "$fail_cache/tmp/stuck/ro"
-require_grep "failed to remove cache path: .*$fail_cache/tmp/stuck/ro/file" "$tmpdir/fail.err"
+require_grep "failed to remove path: .*$fail_cache/tmp/stuck" "$tmpdir/fail.err"
 [[ ! -e "$fail_cache/locks/gc.lock.owner" ]] || { echo "failed cache gc kept its lock owner" >&2; exit 1; }
 env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$fail_cache" "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/fail-retry.log"
 require_grep "removed tmp=1 " "$tmpdir/fail-retry.log"
@@ -207,7 +209,7 @@ if script -qec true /dev/null > /dev/null 2>&1; then
     echo "GC succeeded despite an undeletable entry" >&2; exit 1
   fi
   chmod u+w "$fail_cache/tmp/stuck/ro"
-  require_grep "^holbuild: failed to remove cache path: " "$tmpdir/fail-ansi.log"
+  require_grep "^holbuild: failed to remove path: " "$tmpdir/fail-ansi.log"
 
   # Toolchain removal can warn on stderr mid-stage, here about legacy
   # directory locks, so its reports are not redrawn in place.

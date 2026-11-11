@@ -11,9 +11,6 @@ val default_retention_days = 7
 fun has_prefix prefix s =
   size s >= size prefix andalso String.substring(s, 0, size prefix) = prefix
 
-fun quote s =
-  "'" ^ String.translate (fn #"'" => "'\\''" | c => str c) s ^ "'"
-
 fun path_exists path = FS.access(path, []) handle OS.SysErr _ => false
 
 fun filesystem_cache root = HolbuildFSCacheBackend.filesystem root
@@ -66,42 +63,11 @@ fun children dir =
       result
     end
 
-fun is_link path = FS.isLink path handle OS.SysErr _ => false
 fun is_dir path = FS.isDir path handle OS.SysErr _ => false
 
-fun missing_entry (OS.SysErr (_, SOME err)) = err = Posix.Error.noent
-  | missing_entry _ = false
-
-fun remove_error path msg = Error ("failed to remove cache path: " ^ path ^ ": " ^ msg)
-
-fun trim_newline s =
-  if size s > 0 andalso String.sub(s, size s - 1) = #"\n" then
-    String.substring(s, 0, size s - 1)
-  else s
-
-(* `rm -rf` descends through directories it has opened, so a subdirectory
-   swapped for a symlink while it runs cannot redirect it outside the cache;
-   its messages name the path that failed. *)
-fun remove_dir_tree path =
-  let
-    val proc = Unix.execute ("/bin/sh", ["-c", "rm -rf -- " ^ quote path ^ " 2>&1"])
-    val output = TextIO.inputAll (Unix.textInstreamOf proc)
-  in
-    if OS.Process.isSuccess (Unix.reap proc) then ()
-    else raise remove_error path (trim_newline output)
-  end
-
-(* Regular files and symlinks, which include every blob, are unlinked
-   in-process, since spawning a process per entry dominated GC time on large
-   caches. An entry that has already disappeared counts as removed. *)
+(* A symlink is unlinked, never followed. *)
 fun remove_tree path =
-  if path = "" orelse path = "." orelse path = "/" then
-    raise Error ("refusing to remove unsafe cache path: " ^ path)
-  else if not (is_link path) andalso is_dir path then
-    remove_dir_tree path
-  else
-    FS.remove path
-    handle e as OS.SysErr (msg, _) => if missing_entry e then () else raise remove_error path msg
+  HolbuildRemoveTree.remove_strict path handle HolbuildRemoveTree.Error msg => raise Error msg
 
 (* Progress for long GC stages goes to stderr, leaving stdout to the summary,
    and is off under --quiet. A stage reports only after running for one
@@ -186,54 +152,47 @@ fun retention_cutoff days =
   if days < 0 then raise Error "retention days must be non-negative"
   else Time.-(Time.now(), Time.fromSeconds (IntInf.fromInt (days * 86400)))
 
-fun read_lines path =
-  let
-    val input = TextIO.openIn path
-    fun loop acc =
-      case TextIO.inputLine input of
-          NONE => rev acc
-        | SOME line => loop (line :: acc)
-      val lines = loop [] handle e => (TextIO.closeIn input; raise e)
-  in
-    TextIO.closeIn input;
-    lines
-  end
-
 fun empty_blob_set () = Redblackset.empty String.compare
 
 fun add_blob (blob, blobs) = Redblackset.add(blobs, blob)
 
 fun manifest_path action_dir = Path.concat(action_dir, "manifest")
 
-fun action_live_blobs action_dir =
-  let val manifest = manifest_path action_dir
-  in
-    if path_exists manifest then
-      List.foldl
-        (fn (line, blobs) =>
-            case HolbuildFSCacheBackend.blob_ref line of
+(* Adds the blobs a manifest names; a manifest that is missing adds none. *)
+fun add_manifest_blobs (action_dir, live_blobs) =
+  case SOME (TextIO.openIn (manifest_path action_dir)) handle IO.Io _ => NONE of
+      NONE => live_blobs
+    | SOME input =>
+        let
+          fun loop blobs =
+            case TextIO.inputLine input of
                 NONE => blobs
-              | SOME blob => add_blob (blob, blobs))
-        (empty_blob_set ())
-        (read_lines manifest)
-    else empty_blob_set ()
-  end
+              | SOME line =>
+                  loop (case HolbuildFSCacheBackend.blob_ref line of
+                            NONE => blobs
+                          | SOME blob => add_blob (blob, blobs))
+        in
+          loop live_blobs before TextIO.closeIn input
+          handle e => (TextIO.closeIn input; raise e)
+        end
+
+fun action_live_blobs action_dir = add_manifest_blobs (action_dir, empty_blob_set ())
+
+(* An action's age is its manifest's, or its directory's when it has none. *)
+fun action_modified action_dir =
+  SOME (FS.modTime (manifest_path action_dir))
+  handle OS.SysErr _ => (SOME (FS.modTime action_dir) handle OS.SysErr _ => NONE)
 
 fun collect_live_actions cutoff actions_dir =
   let
     fun one (action_dir, (live_blobs, removed)) =
-      let val manifest = manifest_path action_dir
-      in
-        if path_exists manifest then
-          if stale cutoff manifest then
-            (remove_tree action_dir; ((live_blobs, removed + 1), true))
-          else
-            ((Redblackset.union(live_blobs, action_live_blobs action_dir), removed), false)
-        else if stale cutoff action_dir then
-          (remove_tree action_dir; ((live_blobs, removed + 1), true))
-        else
-          ((live_blobs, removed), false)
-      end
+      case action_modified action_dir of
+          SOME time =>
+            if Time.< (time, cutoff) then
+              (remove_tree action_dir; ((live_blobs, removed + 1), true))
+            else
+              ((add_manifest_blobs (action_dir, live_blobs), removed), false)
+        | NONE => ((live_blobs, removed), false)
   in
     gc_stage "actions" (children actions_dir) one (empty_blob_set (), 0)
   end
