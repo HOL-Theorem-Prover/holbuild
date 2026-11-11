@@ -2,6 +2,7 @@ structure HolbuildProofRuntime =
 struct
 
 type config = {checkpoint_enabled : bool,
+               checkpoint_seconds : real,
                tactic_timeout : real option,
                timeout_marker : string option,
                plan_theorem : string option,
@@ -2104,7 +2105,7 @@ fun proof_ir_prover ctxt (g, tac) =
              drop_all();
              raise e)
 
-fun install ({checkpoint_enabled, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker} : config) =
+fun install ({checkpoint_enabled, checkpoint_seconds, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker} : config) =
   (checkpoint_enabled_ref := checkpoint_enabled;
    tactic_timeout_ref := tactic_timeout;
    tactic_timeout_marker_ref := timeout_marker;
@@ -2125,7 +2126,7 @@ fun install ({checkpoint_enabled, tactic_timeout, timeout_marker, plan_theorem, 
    failed_prefix_resume_active_ref := false;
    failed_prefix_resumed_step_count_ref := NONE;
    proving_with_proof_ir_ref := false;
-   HolbuildCheckpointSaveRuntime.reset_context_checkpoint_gate ();
+   HolbuildCheckpointSaveRuntime.reset_context_checkpoint_gate checkpoint_seconds;
    HolbuildTacticCompat.install_prover proof_ir_prover)
 
 end

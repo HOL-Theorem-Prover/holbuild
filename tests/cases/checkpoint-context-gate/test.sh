@@ -109,3 +109,43 @@ prefix_fixed_log=$tmpdir/prefix-fixed.log
 (cd "$project" && "$HOLBUILD_BIN" build ATheory) > "$prefix_fixed_log" 2>&1
 require_grep "from: failed-prefix checkpoint in last_one" "$prefix_fixed_log"
 require_grep "ATheory built" "$prefix_fixed_log"
+
+# --checkpoint-seconds sets the least time between context saves: 0 saves
+# every context, and a long one saves none.  Each build starts without
+# checkpoints, so it runs every theorem rather than resuming.
+rm -rf "$project/.holbuild/checkpoints"
+write_script 'ACCEPT_TAC TRUTH' 'raise Fail "expected failure"'
+every_log=$tmpdir/every.log
+if (cd "$project" && "$HOLBUILD_BIN" build --checkpoint-seconds 0 ATheory) > "$every_log" 2>&1; then
+  echo "expected the failing declaration to fail the build" >&2
+  exit 1
+fi
+for name in quick_one quick_two after_pause quick_three last_one; do
+  require_file "$(context_save "$name")"
+done
+rm -rf "$project/.holbuild/checkpoints"
+none_log=$tmpdir/none.log
+if (cd "$project" && "$HOLBUILD_BIN" build --checkpoint-seconds=1000 ATheory) > "$none_log" 2>&1; then
+  echo "expected the failing declaration to fail the build" >&2
+  exit 1
+fi
+for name in quick_one quick_two after_pause quick_three last_one; do
+  if [[ -n "$(context_save "$name")" ]]; then
+    echo "saved the context after $name with --checkpoint-seconds=1000" >&2
+    exit 1
+  fi
+done
+
+# The option is in no cache key: a theory cached under the default is
+# restored under another value.
+write_script 'ACCEPT_TAC TRUTH' '()'
+(cd "$project" && "$HOLBUILD_BIN" build ATheory) > "$tmpdir/default.log" 2>&1
+rm -rf "$project/.holbuild"
+(cd "$project" && "$HOLBUILD_BIN" build --checkpoint-seconds 10 ATheory) > "$tmpdir/ten.log" 2>&1
+require_grep "ATheory restored from cache" "$tmpdir/ten.log"
+
+if (cd "$project" && "$HOLBUILD_BIN" build --checkpoint-seconds -1 ATheory) > "$tmpdir/negative.log" 2>&1; then
+  echo "accepted a negative --checkpoint-seconds" >&2
+  exit 1
+fi
+require_grep "checkpoint-seconds must be a non-negative number" "$tmpdir/negative.log"
