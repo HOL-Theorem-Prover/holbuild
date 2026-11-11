@@ -7140,8 +7140,12 @@ fun node_with_input_key (options : build_options) tc project plan toolchain_key 
               (HolbuildBuildPlan.selected_nodes plan)
   end
 
+fun clear_remote_build_log project node =
+  remove_file (current_build_log (current_log_dir (project_artifact_root project)
+    (package node) (logical_name node)))
+
 (* Fetch a worker's log to the same location as a local theory build. *)
-fun fetch_remote_build_log project node log_sha256 =
+fun fetch_remote_build_log project node log_ref =
   let
     val log = current_build_log (current_log_dir (project_artifact_root project) (package node) (logical_name node))
   in
@@ -7150,8 +7154,8 @@ fun fetch_remote_build_log project node log_sha256 =
     (case HolbuildRemoteCacheConfig.url () of
          NONE => NONE
        | SOME url =>
-           case HolbuildRemoteCache.fetch_unlisted_blob (HolbuildRemoteCache.remote url)
-                  {hash = log_sha256, dst = log} of
+           case HolbuildRemoteCache.fetch_action_log (HolbuildRemoteCache.remote url)
+                  {log = log_ref, dst = log} of
                HolbuildCacheBackend.Hit => SOME log
              | _ => (remove_file log; NONE))
     handle e => (remove_file log; raise e)
@@ -7170,13 +7174,15 @@ fun restore_finished_build_logs (options : build_options) tc project plan toolch
     val nodes = List.foldl
       (fn (node, table) => Redblackmap.insert (table, HolbuildBuildPlan.input_key_for keys node, node))
       (Redblackmap.mkDict String.compare) theories
-    fun restore (key, SOME sha) =
+    fun restore (key, log_ref) =
           ((case Redblackmap.peek (nodes, key) of
-                SOME node => ignore (fetch_remote_build_log project node sha)
+                SOME node =>
+                  (remove_file (current_build_log (current_log_dir (project_artifact_root project)
+                    (package node) (logical_name node)));
+                   Option.app (fn ref_ => ignore (fetch_remote_build_log project node ref_)) log_ref)
               | NONE => ())
            handle Thread.Interrupt => raise Thread.Interrupt
                 | _ => ())
-      | restore (_, NONE) = ()
   in
     parallel_all remote_probe_width restore logs
   end
@@ -7215,9 +7221,10 @@ fun restore_remote_build_logs (options : build_options) tc project plan toolchai
     val theories = List.filter
       (fn node => #kind (HolbuildBuildPlan.source_of node) = HolbuildSourceIndex.TheoryScript)
       (HolbuildBuildPlan.selected_nodes plan)
-    (* Clear every required target first, even if an earlier log is missing. *)
+    (* Clear logs from this batch and every required target before fetching. *)
     val _ = List.app (fn node =>
-      if force_node options project node orelse trace_steps (checkpoint_policy_for_node options project node) then
+      if Option.isSome (Redblackmap.peek (log_table, HolbuildBuildPlan.input_key_for keys node)) orelse
+         force_node options project node orelse trace_steps (checkpoint_policy_for_node options project node) then
         let val dir = current_log_dir (project_artifact_root project) (package node) (logical_name node)
         in remove_file (current_build_log dir); remove_file (current_proof_trace_log dir) end
       else ()) theories
@@ -8373,7 +8380,7 @@ fun fetch_failed_run remote dir ({name, context, run_key} : run) log_sha256 =
       case log_sha256 of
           NONE => ()
         | SOME hash =>
-            if (HolbuildRemoteCache.fetch_unlisted_blob remote {hash = hash, dst = log} =
+            if (HolbuildRemoteCache.fetch_action_log remote {log = hash, dst = log} =
                 HolbuildCacheBackend.Hit
                 handle HolbuildRemoteCache.Unavailable _ => false) then ()
             else (remove_tree log; warn ("could not fetch the log of failed run " ^ name))
@@ -9497,7 +9504,7 @@ fun result_detail msg =
 
 (* A failure without a log says why in detail=, the client's only
    diagnostic of it; one with a log has the message in the log. *)
-fun result_text (spec_sha256, input_key) {status, failure, wall_ms, phases, peak, log} =
+fun result_text (spec_sha256, input_key) {status, failure, wall_ms, phases, peak, log, log_error} =
   String.concatWith "\n"
     ([action_result_header,
       "spec=" ^ spec_sha256,
@@ -9512,7 +9519,11 @@ fun result_text (spec_sha256, input_key) {status, failure, wall_ms, phases, peak
      (case peak of SOME mb => ["peak-rss-mb=" ^ Int.toString mb] | NONE => []) @
      ["wall-ms=" ^ LargeInt.toString wall_ms] @
      (if null phases then [] else ["phase-ms=" ^ phases_text "," ":" phases]) @
-     (case log of SOME (sha, bytes) => ["log=" ^ sha ^ " " ^ bytes] | NONE => [])) ^ "\n"
+     (case log of
+          SOME (HolbuildRemoteCache.RawLog sha, bytes) => ["log=" ^ sha ^ " " ^ bytes]
+        | SOME (HolbuildRemoteCache.CompressedLog {sha256, size, raw_sha256, raw_size}, _) =>
+            ["log-zstd=" ^ String.concatWith " " [sha256, size, raw_sha256, raw_size]]
+        | NONE => (case log_error of SOME reason => ["log-error=" ^ result_detail reason] | NONE => []))) ^ "\n"
 
 fun exception_failure e =
   let val msg = General.exnMessage e
@@ -10550,6 +10561,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
         (f () before record ()) handle e => (record (); raise e)
       end
     val log_unavailable = ref NONE
+    val log_error = ref NONE
     val log_required = ref false
     (* Never reuse a writable directory inode across actions. Shared heaps are
        copied into this action's tree, not exposed as writable store inodes. *)
@@ -10565,17 +10577,20 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
       in
         if not (file_exists path) then NONE
         else
-          let val sha = HolbuildHash.file_sha256 path
+          let val (published, ref_, bytes) = HolbuildRemoteCache.publish_action_log remote path
           in
-            case HolbuildRemoteCache.publish_blob remote {hash = sha, src = path} of
-                HolbuildCacheBackend.Published => SOME (sha, Position.toString (FS.fileSize path))
-              | HolbuildCacheBackend.AlreadyPresent => SOME (sha, Position.toString (FS.fileSize path))
-              | _ => (warn "could not upload the action log"; NONE)
+            case published of
+                HolbuildCacheBackend.Published => SOME (ref_, bytes)
+              | HolbuildCacheBackend.AlreadyPresent => SOME (ref_, bytes)
+              | _ => (log_error := SOME "cache rejected action log"; warn "could not upload the action log"; NONE)
           end
       end
       handle HolbuildRemoteCache.Unavailable msg =>
-               (warn ("could not upload the action log: " ^ msg); log_unavailable := SOME msg; NONE)
-           | e => (warn ("could not upload the action log: " ^ General.exnMessage e); NONE)
+               (warn ("could not upload the action log: " ^ msg); log_unavailable := SOME msg;
+                log_error := SOME (if String.isSubstring "HTTP 507" msg then "cache rejected log (HTTP 507)"
+                                   else "cache unavailable"); NONE)
+           | e => (warn ("could not upload the action log: " ^ General.exnMessage e);
+                   log_error := SOME "action log upload failed"; NONE)
     fun run () =
       let
         val _ = (HolbuildRemoveTree.remove_untrusted_strict root; ensure_dir root)
@@ -10829,7 +10844,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
               val text =
                 result_text (spec_sha256, !input_key)
                   {status = status, failure = failure, wall_ms = wall_ms, phases = phases,
-                   peak = !peak, log = log}
+                   peak = !peak, log = log, log_error = !log_error}
             in
               (case failure of
                    SOME (_, msg) => HolbuildStatus.message_stderr ("holbuild: exec-action failed: " ^ msg ^ "\n")

@@ -1733,6 +1733,8 @@ peak-rss-mb=<n>
 wall-ms=<n>
 phase-ms=<phase>:<n>,...
 log=<sha256> <size>
+log-zstd=<compressed-sha256> <compressed-size> <raw-sha256> <raw-size>
+log-error=<message>
 ```
 
 `failure` appears on failure, and `missing` with `input-missing`. A failure
@@ -1747,7 +1749,12 @@ checkpoints), `toolpublish` (the tool cache), `check` (the publication
 checks) and `log`; stderr ends with the same times and `wall`.
 `peak-rss-mb` is the HOL process's peak resident memory, reported once the
 theory has been exported.
-`log` is the build log, or the run's HOL output, uploaded to `/cas/`. `memory` means Poly/ML ran out
+`log` is the build log, or the run's HOL output, uploaded to `/cas/`. Logs of
+at least 256 MiB are instead uploaded as opaque zstd blobs and described by
+`log-zstd`; clients check both hashes and sizes when restoring them. If zstd
+is unavailable the worker attempts the raw upload. `log-error` reports an
+upload failure even when the action otherwise succeeds; a worker lost before
+reporting its result cannot provide that warning. `memory` means Poly/ML ran out
 of heap or the container's cgroup `memory.events` counted an OOM kill during
 a failed run, whether the OOM killer took the HOL process or a process it
 started (a nested HOL whose failure it caught, say); `disk` means the disk
@@ -1849,6 +1856,14 @@ The worker executes its proof steps without theorem-checkpoint replay.
 Completed actions' build logs are fetched into
 `.holbuild/logs/current/<package>/<theory>/build.log`. Traced theories also
 write `proof-trace.log` there and print a trace summary and its log path.
+If an optional log could not be uploaded, the client warns and does not retain
+a previous execution's log as the new one. A prolonged cache outage or worker
+loss can still prevent recovery of a log.
+A forced or traced action or a final proof failure is retried if its required
+log cannot be uploaded; compression cannot guarantee that the log fits.
+Deploy a coordinator supporting compressed log metadata before clients and
+workers that produce it. Rolling the coordinator back makes compressed logs
+and publication errors unavailable until that support is restored.
 A forced or traced build falls back locally if its required log cannot be
 returned; with `--remote-only` it fails with status 75. It never reports
 success with an old or absent log. The client restores the
@@ -1977,9 +1992,10 @@ The coordinator's protocol, in what holbuild uses of it:
   a final build failure. It defaults to false and does not change run batches.
 - `GET /v1/batches/<id>/events` streams one JSON object per line: an
   `{"type": "action", "input_key", "theory", "state", "last_failure",
-  "log_sha256", "failure_detail", ...}` when an action changes, and last
+  "log_sha256", "log_zstd", "log_error", "failure_detail", ...}` when an action changes, and last
   `{"type": "batch", "state": "done"|"failed"|"cancelled", "failure"}`. A
-  failed action's log is at `/cas/<log_sha256>` in the remote cache. The log
+  raw log is at `/cas/<log_sha256>`; `log_zstd` describes a compressed log
+  instead. `log_error` reports an unsuccessful log publication. The log
   includes the action's failure diagnostic even when it failed before starting
   HOL, provided the worker can write and upload the log; a failure with no
   log, such as a spec the worker rejects, says why in `failure_detail`, which

@@ -12,7 +12,7 @@ struct
 datatype attempt = Ok of string | Refused of string
 
 (* A final action failure and its worker log, when one was uploaded. *)
-type action_failure = {input_key : string, kind : string, log_sha256 : string option}
+type action_failure = {input_key : string, kind : string, log_sha256 : HolbuildRemoteCache.action_log option}
 
 datatype outcome = Done
                  | Failed of string * action_failure list
@@ -181,6 +181,23 @@ fun resubmit_missing_blob reason =
       NONE => false
     | SOME start => Option.isSome (HolbuildStatus.find_substring "missing blob " (String.extract (reason, start, NONE)))
 
+fun action_log line =
+  case json_string_field "log_sha256" line of
+      SOME sha => if HolbuildHash.valid_sha256 sha then SOME (HolbuildRemoteCache.RawLog sha) else NONE
+    | NONE =>
+        (case Option.map (String.tokens Char.isSpace) (json_string_field "log_zstd" line) of
+             SOME [sha, bytes, raw_sha, raw_bytes] =>
+               if HolbuildHash.valid_sha256 sha andalso HolbuildHash.valid_sha256 raw_sha andalso
+                  size bytes > 0 andalso size raw_bytes > 0 andalso
+                  List.all Char.isDigit (String.explode bytes) andalso List.all Char.isDigit (String.explode raw_bytes)
+               then SOME (HolbuildRemoteCache.CompressedLog
+                 {sha256 = sha, size = bytes, raw_sha256 = raw_sha, raw_size = raw_bytes})
+               else NONE
+           | _ => NONE)
+
+fun log_hash (HolbuildRemoteCache.RawLog sha) = sha
+  | log_hash (HolbuildRemoteCache.CompressedLog {sha256, ...}) = sha256
+
 fun report_action line =
   let
     val field = fn name => json_string_field name line
@@ -194,8 +211,8 @@ fun report_action line =
           (SOME f, SOME detail) => " (" ^ f ^ ": " ^ detail ^ ")"
         | (SOME f, NONE) => " (" ^ f ^ ")"
         | (NONE, _) => ""
-    val log = case (state, field "log_sha256") of
-                  ("failed", SOME sha) => ", log /cas/" ^ sha
+    val log = case (state, action_log line) of
+                  ("failed", SOME ref_) => ", log /cas/" ^ log_hash ref_
                 | _ => ""
   in
     HolbuildStatus.message_stderr ("holbuild: remote " ^ theory ^ ": " ^ state ^ failure ^ log ^ "\n")
@@ -213,13 +230,13 @@ fun report_action line =
    on a quiet stream, so a proxy doesn't close a healthy one for being
    idle.  The coordinator ends a batch at its deadline, so this ends too.  A failed
    batch comes with the action whose proof failed, when one did. *)
-fun follow url batch_id (on_change : string * string * string option * string option -> unit) : outcome * progress =
+fun follow url batch_id (on_change : string * string * string option * HolbuildRemoteCache.action_log option -> unit) : outcome * progress =
   let
     val _ = HolbuildOffline.require_online "follow a remote batch"
-    val states : (string * (string * string option * string option)) list ref = ref []
+    val states : (string * (string * string option * HolbuildRemoteCache.action_log option * string option)) list ref = ref []
     val names = ref ([] : (string * string) list)
     fun failures () =
-      List.mapPartial (fn (key, (state, kind, log)) =>
+      List.mapPartial (fn (key, (state, kind, log, _)) =>
         if state = "failed" then
           SOME {input_key = key, kind = Option.getOpt (kind, "internal"), log_sha256 = log}
         else NONE) (rev (!states))
@@ -233,9 +250,10 @@ fun follow url batch_id (on_change : string * string * string option * string op
               val key = Option.getOpt (json_string_field "input_key" line, "")
               val state = Option.getOpt (json_string_field "state" line, "")
               val failure = json_string_field "last_failure" line
-              val log = json_string_field "log_sha256" line
+              val log = action_log line
+              val log_error = json_string_field "log_error" line
               val previous = List.find (fn (k, _) => k = key) (!states)
-              val status = (state, failure, log)
+              val status = (state, failure, log, log_error)
             in
               names := (key, Option.getOpt (json_string_field "theory" line, key)) ::
                        List.filter (fn (k, _) => k <> key) (!names);
@@ -244,8 +262,16 @@ fun follow url batch_id (on_change : string * string * string option * string op
                 (states := (key, status) :: List.filter (fn (k, _) => k <> key) (!states);
                  (* A new log can arrive in a repeated done snapshot after a
                     missed requeue. Only state progress resets stream retries. *)
-                 if Option.map (fn (_, (s, _, _)) => s) previous = SOME state then ()
+                 if Option.map (fn (_, (s, _, _, _)) => s) previous = SOME state then ()
                  else (changed := true; report_action line);
+                 (case (state, log_error) of
+                      ("done", SOME reason) => HolbuildStatus.message_stderr
+                        ("holbuild: warning: remote " ^ Option.getOpt (json_string_field "theory" line, key) ^
+                         " action log unavailable: " ^ reason ^ "\n")
+                    | ("failed", SOME reason) => HolbuildStatus.message_stderr
+                        ("holbuild: warning: remote " ^ Option.getOpt (json_string_field "theory" line, key) ^
+                         " action log unavailable: " ^ reason ^ "\n")
+                    | _ => ());
                  on_change (key, state, failure, log))
             end
         | SOME "batch" =>
@@ -295,7 +321,7 @@ fun follow url batch_id (on_change : string * string * string option * string op
                   | delay :: rest => again delay rest
       end
     val outcome = attach (retry_delays_seconds ())
-    val skipped = List.filter (fn (_, (state, reason, _)) =>
+    val skipped = List.filter (fn (_, (state, reason, _, _)) =>
       state = "cancelled" andalso String.isPrefix "skipped because of " (Option.getOpt (reason, ""))) (!states)
     fun name key = Option.getOpt (Option.map #2 (List.find (fn (k, _) => k = key) (!names)), key)
     val _ =
@@ -305,13 +331,13 @@ fun follow url batch_id (on_change : string * string * string option * string op
            Int.toString (length (failures ())) ^ " failed, " ^ Int.toString (length skipped) ^ " skipped\n");
          List.app (fn {input_key, kind, log_sha256} =>
            HolbuildStatus.message_stderr ("holbuild: remote " ^ name input_key ^ ": failed (" ^ kind ^ ")" ^
-             (case log_sha256 of SOME sha => ", log /cas/" ^ sha | NONE => ", no worker log") ^ "\n")) (failures ());
-         List.app (fn (key, (_, reason, _)) =>
+             (case log_sha256 of SOME ref_ => ", log /cas/" ^ log_hash ref_ | NONE => ", no worker log") ^ "\n")) (failures ());
+         List.app (fn (key, (_, reason, _, _)) =>
            HolbuildStatus.message_stderr ("holbuild: remote " ^ name key ^ ": " ^ Option.getOpt (reason, "skipped") ^ "\n"))
            (rev skipped))
   in
     (outcome,
-     {built = length (List.filter (fn (_, (state, _, _)) => state = "done") (!states)),
+     {built = length (List.filter (fn (_, (state, _, _, _)) => state = "done") (!states)),
       total = length (!states)})
   end
 
